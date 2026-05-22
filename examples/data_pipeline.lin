@@ -1,0 +1,54 @@
+import { trim, toUpper } from "std/string"
+import { isInt32, parseInt32 } from "std/number"
+
+// A data processing pipeline demonstrating:
+// - Pattern matching with tagged unions
+// - Chaining with map/filter/reduce
+// - Closures and partial application
+// - Safe bracket access and null propagation
+
+val parseRecord = (raw: Json): Json =>
+  if raw["name"] is Null
+    then { "type": "failure", "error": "missing name" }
+    else if raw["age"] is Null
+      then { "type": "failure", "error": "missing age" }
+      else { "type": "success", "value": { "name": raw["name"], "age": raw["age"] } }
+
+val formatResult = (result: Json): String =>
+  match result
+    has { "type": "success", value } =>
+      val name = value["name"]
+      val age = value["age"]
+      "${name} (${toString(age)})"
+    has { "type": "failure", error } => "ERROR: ${error}"
+    else => "unknown"
+
+val records = [
+  { "name": "Alice", "age": 30 },
+  { "name": "Bob", "age": 17 },
+  { "age": 25 },
+  { "name": "Charlie", "age": 45 },
+  { "name": "Diana", "age": 22 }
+]
+
+// Parse all records
+val parsed = records.map(r => parseRecord(r))
+
+// Show all results
+parsed.for(r => print(formatResult(r)))
+
+print("---")
+
+// Filter to successful adults only
+val adults = parsed
+  .filter(r => r["type"] == "success")
+  .filter(r => r["value"]["age"] >= 18)
+  .map(r => r["value"]["name"])
+
+adults.for(name => print(name))
+
+print("---")
+
+// Count adults using reduce
+val count = adults.reduce(0, (n, name) => n + 1)
+print("Total adults: ${toString(count)}")
