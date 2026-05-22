@@ -191,6 +191,15 @@ impl Interpreter {
             }
         });
 
+        self.define_native("__stringRepeat", 2, |args| {
+            match (&args[0], &args[1]) {
+                (Value::String(s), Value::Int(n)) => {
+                    Ok(Value::String(Rc::new(s.repeat(*n as usize))))
+                }
+                _ => Err("__stringRepeat: expected (String, Int)".to_string()),
+            }
+        });
+
         self.define_native("__parseInt32", 1, |args| {
             match &args[0] {
                 Value::String(s) => {
@@ -523,7 +532,7 @@ impl Interpreter {
             "__stringSlice", "__stringIndexOf", "__stringToUpper",
             "__stringToLower", "__stringTrim", "__stringLength",
             "__stringContains", "__stringStartsWith", "__stringEndsWith",
-            "__stringSplit", "__stringJoin", "__stringReplace",
+            "__stringSplit", "__stringJoin", "__stringReplace", "__stringRepeat",
             "__parseInt32", "__parseFloat64", "__isInt32", "__toInt32", "__toFloat64",
         ] {
             if let Some(val) = self.global_env.get(name) {

@@ -33,3 +33,9 @@ export val join = (arr: String[], separator: String): String =>
 
 export val replace = (s: String, pattern: String, replacement: String): String =>
   __stringReplace(s, pattern, replacement)
+
+export val charAt = (s: String, index: Int32): String =>
+  __stringSlice(s, index, index + 1)
+
+export val repeat = (s: String, count: Int32): String =>
+  __stringRepeat(s, count)
