@@ -766,6 +766,30 @@ print(toString(data["users"][1]["scores"][2]))
 }
 
 #[test]
+fn test_tail_call_optimization() {
+    let output = run(r#"
+val sum = (n: Int32, acc: Int32): Int32 =>
+  if n == 0 then acc else sum(n - 1, acc + n)
+
+print(toString(sum(100000, 0)))
+"#);
+    assert_eq!(output, vec!["5000050000"]);
+}
+
+#[test]
+fn test_tco_in_match() {
+    let output = run(r#"
+val countdown = (n: Int32): String =>
+  match n
+    is 0 => "done"
+    else => countdown(n - 1)
+
+print(countdown(50000))
+"#);
+    assert_eq!(output, vec!["done"]);
+}
+
+#[test]
 fn test_continuation_lines_and() {
     let output = run(r#"
 val person = { "age": 25, "name": "Bob", "active": true }

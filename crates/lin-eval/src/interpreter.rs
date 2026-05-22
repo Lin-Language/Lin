@@ -9,6 +9,11 @@ use lin_parse::Parser;
 use crate::value::*;
 use crate::env::Env;
 
+enum TailResult {
+    Return(Value),
+    TailCall(Vec<Value>),
+}
+
 pub struct Interpreter {
     pub global_env: Env,
     pub output: Vec<String>,
@@ -788,20 +793,87 @@ impl Interpreter {
     }
 
     fn call_function(&mut self, func: &Rc<Function>, args: Vec<Value>) -> Result<Value, String> {
-        let mut call_env = Env::child(&func.closure);
+        let mut current_args = args;
 
-        // Bind params
-        for (i, param) in func.params.iter().enumerate() {
-            let val = args.get(i).cloned().unwrap_or(Value::Null);
-            self.bind_pattern_in_env(&param.pattern, &val, &mut call_env)?;
+        loop {
+            let mut call_env = Env::child(&func.closure);
+
+            for (i, param) in func.params.iter().enumerate() {
+                let val = current_args.get(i).cloned().unwrap_or(Value::Null);
+                self.bind_pattern_in_env(&param.pattern, &val, &mut call_env)?;
+            }
+
+            if let Some(name) = &func.name {
+                call_env.define(name.clone(), Value::Function(func.clone()));
+            }
+
+            match self.eval_tail_expr(&func.body, &mut call_env, func.name.as_deref())? {
+                TailResult::Return(val) => return Ok(val),
+                TailResult::TailCall(new_args) => {
+                    current_args = new_args;
+                }
+            }
         }
+    }
 
-        // If function has a name, make it available for recursion
-        if let Some(name) = &func.name {
-            call_env.define(name.clone(), Value::Function(func.clone()));
+    fn eval_tail_expr(&mut self, expr: &Expr, env: &mut Env, self_name: Option<&str>) -> Result<TailResult, String> {
+        match expr {
+            Expr::Call { func, args, .. } => {
+                if let Some(name) = self_name {
+                    if let Expr::Ident(fn_name, _) = func.as_ref() {
+                        if fn_name == name {
+                            let mut arg_vals = Vec::new();
+                            for arg in args {
+                                arg_vals.push(self.eval_expr_in_env(arg, env)?);
+                            }
+                            return Ok(TailResult::TailCall(arg_vals));
+                        }
+                    }
+                }
+                let val = self.eval_expr_in_env(expr, env)?;
+                Ok(TailResult::Return(val))
+            }
+            Expr::If { condition, then_branch, else_branch, .. } => {
+                let cond = self.eval_expr_in_env(condition, env)?;
+                if cond.is_truthy() {
+                    self.eval_tail_expr(then_branch, env, self_name)
+                } else {
+                    self.eval_tail_expr(else_branch, env, self_name)
+                }
+            }
+            Expr::Block(stmts, final_expr, _) => {
+                let mut block_env = Env::child(env);
+                for stmt in stmts {
+                    self.eval_stmt_in_env(stmt, &mut block_env)?;
+                }
+                self.eval_tail_expr(final_expr, &mut block_env, self_name)
+            }
+            Expr::Match { scrutinee, arms, .. } => {
+                let val = self.eval_expr_in_env(scrutinee, env)?;
+                for arm in arms {
+                    let mut arm_env = Env::child(env);
+                    let matched = match &arm.pattern {
+                        MatchPattern::Is(pattern) => self.match_is(&val, pattern, &mut arm_env),
+                        MatchPattern::Has(pattern) => self.match_has(&val, pattern, &mut arm_env),
+                        MatchPattern::Else => true,
+                    };
+                    if matched {
+                        if let Some(guard) = &arm.guard {
+                            let guard_val = self.eval_expr_in_env(guard, &mut arm_env)?;
+                            if !guard_val.is_truthy() {
+                                continue;
+                            }
+                        }
+                        return self.eval_tail_expr(&arm.body, &mut arm_env, self_name);
+                    }
+                }
+                Err("Runtime error: non-exhaustive match (no arm matched)".to_string())
+            }
+            _ => {
+                let val = self.eval_expr_in_env(expr, env)?;
+                Ok(TailResult::Return(val))
+            }
         }
-
-        self.eval_expr_in_env(&func.body, &mut call_env)
     }
 
     fn eval_for_iterator(&mut self, iter_val: &Rc<RefCell<IteratorValue>>, callback: &Value) -> Result<Value, String> {
