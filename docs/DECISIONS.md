@@ -79,3 +79,11 @@
 **Rationale**: When `if` condition is on one line and `then`/`else` are indented on subsequent lines, the lexer produces INDENT/DEDENT pairs. The parser must explicitly handle these to avoid confusing them with block boundaries.
 
 **Consequence**: All three spec-defined if layouts (single-line, multi-line same indent, multi-line with block branches) parse correctly.
+
+## ADR-011: Postfix suppression after DEDENT
+
+**Decision**: The parser's postfix expression loop (`[` and `(`) is suppressed when the immediately preceding consumed token was a DEDENT. Dot-chaining (`.`) is still allowed (as it handles cross-line chaining via a separate lookahead mechanism).
+
+**Rationale**: After a block-bodied function expression like `() => \n  42`, the lexer produces `... IntLit(42) Newline Dedent LBracket ...` — the inner block's `skip_newlines` consumes the Newline, so after the Dedent is consumed, no Newline separates the function from the next line's `[`. Without this guard, `[x]` at the outer block level is incorrectly parsed as index access on the function expression.
+
+**Consequence**: Array/object literals at block level after indented function definitions parse correctly as separate expressions. Same-line index access (`f()[0]`) still works because no DEDENT intervenes.

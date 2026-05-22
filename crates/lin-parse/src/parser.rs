@@ -323,16 +323,17 @@ impl Parser {
 
     fn parse_postfix_expr(&mut self) -> Expr {
         let mut expr = self.parse_primary_expr();
+        let mut after_block = self.prev_was_dedent();
         loop {
             match self.peek_kind() {
-                TokenKind::LBracket => {
+                TokenKind::LBracket if !after_block => {
                     let span = self.current_span();
                     self.advance(); // [
                     let key = self.parse_expr();
                     self.expect(TokenKind::RBracket);
                     expr = Expr::Index { object: Box::new(expr), key: Box::new(key), span };
                 }
-                TokenKind::LParen => {
+                TokenKind::LParen if !after_block => {
                     let span = self.current_span();
                     self.advance(); // (
                     let args = self.parse_call_args();
@@ -340,6 +341,7 @@ impl Parser {
                     expr = Expr::Call { func: Box::new(expr), args, span };
                 }
                 TokenKind::Dot => {
+                    after_block = false;
                     let span = self.current_span();
                     self.advance(); // .
                     self.skip_newlines();
@@ -359,6 +361,7 @@ impl Parser {
                     let saved = self.pos;
                     self.skip_newlines_and_indent();
                     if self.check(TokenKind::Dot) {
+                        after_block = false;
                         continue; // The Dot case above will handle it
                     } else {
                         self.pos = saved;
@@ -1164,6 +1167,11 @@ impl Parser {
     }
 
     // --- Helpers ---
+
+    fn prev_was_dedent(&self) -> bool {
+        if self.pos == 0 { return false; }
+        matches!(self.tokens[self.pos - 1].kind, TokenKind::Dedent)
+    }
 
     fn peek_kind(&self) -> TokenKind {
         if self.pos < self.tokens.len() {
