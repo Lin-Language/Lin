@@ -1,6 +1,6 @@
 use std::env;
-use std::fs;
 use std::io::{self, Read};
+use std::path::Path;
 use std::process;
 
 use lin_eval::Interpreter;
@@ -14,28 +14,23 @@ fn main() {
         process::exit(1);
     }
 
-    let (filename, source) = if args[1] == "-" {
+    let mut interpreter = Interpreter::new();
+
+    let result = if args[1] == "-" {
         let mut buf = String::new();
         io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
             eprintln!("Error reading stdin: {}", e);
             process::exit(1);
         });
-        ("<stdin>".to_string(), buf)
+        interpreter.run(&buf).map_err(|e| format!("error[<stdin>]: {}", e))
     } else {
-        let name = args[1].clone();
-        let src = fs::read_to_string(&name).unwrap_or_else(|e| {
-            eprintln!("Error reading {}: {}", name, e);
-            process::exit(1);
-        });
-        (name, src)
+        let path = Path::new(&args[1]);
+        interpreter.run_file(path)
+            .map_err(|e| format!("error[{}]: {}", args[1], e))
     };
 
-    let mut interpreter = Interpreter::new();
-    match interpreter.run(&source) {
-        Ok(_) => {}
-        Err(e) => {
-            eprintln!("error[{}]: {}", filename, e);
-            process::exit(1);
-        }
+    if let Err(e) = result {
+        eprintln!("{}", e);
+        process::exit(1);
     }
 }

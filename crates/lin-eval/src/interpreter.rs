@@ -19,6 +19,7 @@ pub struct Interpreter {
     pub output: Vec<String>,
     module_cache: HashMap<String, HashMap<String, Value>>,
     stdlib_sources: HashMap<String, &'static str>,
+    base_path: Option<std::path::PathBuf>,
 }
 
 impl Interpreter {
@@ -28,10 +29,18 @@ impl Interpreter {
             output: Vec::new(),
             module_cache: HashMap::new(),
             stdlib_sources: HashMap::new(),
+            base_path: None,
         };
         interp.register_intrinsics();
         interp.register_stdlib_sources();
         interp
+    }
+
+    pub fn run_file(&mut self, path: &std::path::Path) -> Result<Value, String> {
+        let source = std::fs::read_to_string(path)
+            .map_err(|e| format!("Cannot read {}: {}", path.display(), e))?;
+        self.base_path = path.parent().map(|p| p.to_path_buf());
+        self.run(&source)
     }
 
     fn register_stdlib_sources(&mut self) {
@@ -357,11 +366,45 @@ impl Interpreter {
 
     fn eval_module(&mut self, module: &Module) -> Result<Value, String> {
         let stmts = module.statements.clone();
+
+        // Pre-scan: register top-level function bindings as mutable cells
+        // so that forward references between functions work.
+        let mut forward_declared: Vec<String> = Vec::new();
+        for stmt in &stmts {
+            if let Stmt::Val { pattern: Pattern::Ident(name, _), value, .. } = stmt {
+                if matches!(value, Expr::Function { .. }) {
+                    self.global_env.define_mut(name.clone(), Value::Null);
+                    forward_declared.push(name.clone());
+                }
+            }
+        }
+
         let mut last = Value::Null;
         for stmt in &stmts {
-            last = self.eval_top_stmt(stmt)?;
+            last = self.eval_top_stmt_with_forwards(stmt, &forward_declared)?;
         }
         Ok(last)
+    }
+
+    fn eval_top_stmt_with_forwards(&mut self, stmt: &Stmt, forward_declared: &[String]) -> Result<Value, String> {
+        match stmt {
+            Stmt::Val { pattern: Pattern::Ident(name, _), value, .. } if forward_declared.contains(name) => {
+                let val = self.eval_expr_in_global(value)?;
+                // Give the function its name (for TCO self-call detection)
+                let named_val = match val {
+                    Value::Function(f) if f.name.is_none() => {
+                        let mut named = (*f).clone();
+                        named.name = Some(name.clone());
+                        Value::Function(Rc::new(named))
+                    }
+                    _ => val,
+                };
+                // Update the mutable cell that was pre-registered
+                self.global_env.set(name, named_val.clone());
+                Ok(named_val)
+            }
+            _ => self.eval_top_stmt(stmt),
+        }
     }
 
     fn eval_top_stmt(&mut self, stmt: &Stmt) -> Result<Value, String> {
@@ -443,6 +486,10 @@ impl Interpreter {
 
         let source = if let Some(src) = self.stdlib_sources.get(path) {
             src.to_string()
+        } else if let Some(base) = &self.base_path {
+            let file_path = base.join(format!("{}.lin", path));
+            std::fs::read_to_string(&file_path)
+                .map_err(|_| format!("Module not found: {} (tried {})", path, file_path.display()))?
         } else {
             return Err(format!("Module not found: {}", path));
         };
@@ -475,6 +522,17 @@ impl Interpreter {
 
         let mut exports = HashMap::new();
 
+        // Pre-scan: forward-declare function bindings in module scope
+        let mut mod_forward: Vec<String> = Vec::new();
+        for stmt in &module.statements {
+            if let Stmt::Val { pattern: Pattern::Ident(name, _), value, .. } = stmt {
+                if matches!(value, Expr::Function { .. }) {
+                    module_env.define_mut(name.clone(), Value::Null);
+                    mod_forward.push(name.clone());
+                }
+            }
+        }
+
         for stmt in &module.statements {
             match stmt {
                 Stmt::Import { bindings, path: imp_path, .. } => {
@@ -484,6 +542,21 @@ impl Interpreter {
                         if let Some(val) = imp_exports.get(&binding.name) {
                             module_env.define(name.clone(), val.clone());
                         }
+                    }
+                }
+                Stmt::Val { pattern: Pattern::Ident(name, _), value, exported, .. } if mod_forward.contains(name) => {
+                    let val = self.eval_expr_in_env(value, &mut module_env)?;
+                    let named_val = match val {
+                        Value::Function(f) if f.name.is_none() => {
+                            let mut named = (*f).clone();
+                            named.name = Some(name.clone());
+                            Value::Function(Rc::new(named))
+                        }
+                        _ => val,
+                    };
+                    module_env.set(name, named_val.clone());
+                    if *exported {
+                        exports.insert(name.clone(), named_val);
                     }
                 }
                 Stmt::Val { pattern, value, exported, .. } => {

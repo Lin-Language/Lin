@@ -14,3 +14,50 @@ export val reduce = (arr: Json, init: Json, f: Function): Json =>
   var acc = init
   arr.for(item => acc = f(acc, item))
   acc
+
+export val find = (arr: Json, f: Function): Json =>
+  var found = null
+  arr.for(item =>
+    if found == null && f(item) then found = item else null
+  )
+  found
+
+export val some = (arr: Json, f: Function): Boolean =>
+  var result = false
+  arr.for(item =>
+    if f(item) then result = true else null
+  )
+  result
+
+export val every = (arr: Json, f: Function): Boolean =>
+  var result = true
+  arr.for(item =>
+    if f(item) == false then result = false else null
+  )
+  result
+
+export val flatMap = (arr: Json, f: Function): Json =>
+  val result = []
+  arr.for(item =>
+    val inner = f(item)
+    inner.for(x => push(result, x))
+  )
+  result
+
+export val indexOf = (arr: Json, target: Json): Int32 =>
+  var result = -1
+  var i = 0
+  arr.for(item =>
+    val dummy = if result == -1 && item == target then result = i else null
+    i = i + 1
+  )
+  result
+
+export val reverse = (arr: Json): Json =>
+  val result = []
+  var i = length(arr) - 1
+  range(0, length(arr)).for(x =>
+    val dummy = push(result, arr[i])
+    i = i - 1
+  )
+  result

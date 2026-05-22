@@ -964,3 +964,95 @@ vs.for(v => print(toString(v)))
 "#);
     assert_eq!(output, vec!["a", "b", "1", "2"]);
 }
+
+#[test]
+fn test_stdlib_array_find_some_every() {
+    let output = run(r#"
+import { find, some, every } from "std/array"
+val nums = [1, 2, 3, 4, 5]
+print(toString(nums.find(x => x > 3)))
+print(toString(nums.find(x => x > 10)))
+print(toString(nums.some(x => x == 3)))
+print(toString(nums.some(x => x == 99)))
+print(toString(nums.every(x => x > 0)))
+print(toString(nums.every(x => x > 2)))
+"#);
+    assert_eq!(output, vec!["4", "null", "true", "false", "true", "false"]);
+}
+
+#[test]
+fn test_stdlib_array_flatmap_indexof_reverse() {
+    let output = run(r#"
+import { flatMap, indexOf, reverse } from "std/array"
+val nums = [1, 2, 3]
+val pairs = nums.flatMap(x => [x, x * 10])
+pairs.for(x => print(toString(x)))
+print(toString(nums.indexOf(2)))
+print(toString(nums.indexOf(99)))
+val rev = nums.reverse()
+rev.for(x => print(toString(x)))
+"#);
+    assert_eq!(output, vec!["1", "10", "2", "20", "3", "30", "1", "-1", "3", "2", "1"]);
+}
+
+#[test]
+fn test_forward_reference_between_functions() {
+    let output = run(r#"
+val isEvenDesc = (n: Int32): String =>
+  if n == 0
+    then "even"
+    else isOddDesc(n - 1)
+
+val isOddDesc = (n: Int32): String =>
+  if n == 0
+    then "odd"
+    else isEvenDesc(n - 1)
+
+print(isEvenDesc(4))
+print(isOddDesc(4))
+print(isEvenDesc(3))
+"#);
+    assert_eq!(output, vec!["even", "odd", "odd"]);
+}
+
+#[test]
+fn test_forward_reference_in_closure() {
+    let output = run(r#"
+val process = (items: Json): Json =>
+  items.map(x => transform(x))
+
+val transform = (x: Int32): Int32 => x * 10
+
+val result = process([1, 2, 3])
+result.for(x => print(toString(x)))
+"#);
+    assert_eq!(output, vec!["10", "20", "30"]);
+}
+
+#[test]
+fn test_tostring_objects_and_arrays() {
+    let output = run(r#"
+val obj = { "name": "Bob", "age": 25 }
+print(toString(obj))
+val arr = [1, "two", true, null]
+print(toString(arr))
+"#);
+    assert_eq!(output, vec![
+        r#"{"name": "Bob", "age": 25}"#,
+        r#"[1, "two", true, null]"#,
+    ]);
+}
+
+#[test]
+fn test_showcase_example() {
+    let mut interp = Interpreter::new();
+    let source = std::fs::read_to_string("../../examples/showcase.lin").unwrap();
+    interp.run(&source).unwrap();
+    assert_eq!(interp.output[0], "=== Student Report ===");
+    assert_eq!(interp.output[1], "Alice: 85 (B)");
+    assert_eq!(interp.output[2], "Bob: 91 (A)");
+    assert_eq!(interp.output[3], "Charlie: 69 (F)");
+    assert_eq!(interp.output[4], "Diana: 97 (A)");
+    assert!(interp.output.contains(&"Honors: Bob, Diana".to_string()));
+    assert!(interp.output.contains(&"fib(9) = 34".to_string()));
+}

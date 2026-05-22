@@ -111,3 +111,19 @@
 **Rationale**: Inside parentheses, the lexer suppresses all INDENT/DEDENT and Newline tokens (ADR-004). A lambda like `x => val y = x * 2; y` inside `.for(...)` has no indentation markers, so `parse_expr_or_block` cannot detect the block. The inline block parser handles this by treating `val`/`var` as the signal for multi-statement body.
 
 **Consequence**: Multi-statement lambdas work correctly inside `.for()`, `.map()`, and other callback-accepting function calls. Single-expression lambdas are unaffected.
+
+## ADR-015: Forward references between top-level functions via mutable cells
+
+**Decision**: Before evaluating a module's statements, a pre-scan registers all `val name = (...) => ...` bindings (function expressions with named pattern) as mutable cells holding `Null`. During evaluation, each function's closure captures the environment containing these cells. When the actual definition is reached, the cell is updated with the real function value.
+
+**Rationale**: The spec (§7.3) expects mutual recursion between top-level functions. Without forward declaration, functions must be defined before use, which prevents mutual recursion and requires careful ordering. The mutable-cell approach solves this without changing evaluation semantics — a function that calls another function reads the cell at call time, by which point the definition has been evaluated.
+
+**Consequence**: Forward references work between functions (e.g., `isEven` calling `isOdd` and vice versa). However, eager top-level evaluation that *immediately* calls a forward-referenced function (before its definition is evaluated) will still fail with "Cannot call value of type Null". This is inherent to sequential evaluation and matches the behavior of languages like JavaScript (`let` before initialization).
+
+## ADR-016: User module loading from filesystem
+
+**Decision**: When an import path does not match a `std/` prefix, the interpreter resolves it relative to the importing file's directory by appending `.lin` to the path.
+
+**Rationale**: Multi-file programs need to import user-defined modules. The resolution strategy mirrors Node.js-style relative imports without requiring a leading `./` — the `std/` prefix is the only special case, everything else is relative.
+
+**Consequence**: `import { x } from "lib/math"` in `examples/main.lin` loads `examples/lib/math.lin`. Absolute paths and `..` traversal work naturally via the filesystem.

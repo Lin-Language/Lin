@@ -1,0 +1,7 @@
+import { square, cube, abs, clamp } from "lib/math"
+
+print(toString(square(5)))
+print(toString(cube(3)))
+print(toString(abs(-7)))
+print(toString(clamp(15, 0, 10)))
+print(toString(clamp(-5, 0, 10)))
