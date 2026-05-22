@@ -226,6 +226,67 @@ impl Interpreter {
             }
         });
 
+        self.define_native("push", 2, |args| {
+            match &args[0] {
+                Value::Array(arr) => {
+                    arr.borrow_mut().push(args[1].clone());
+                    Ok(args[0].clone())
+                }
+                _ => Err("push: expected Array as first argument".to_string()),
+            }
+        });
+
+        self.define_native("concat", 2, |args| {
+            match (&args[0], &args[1]) {
+                (Value::Array(a), Value::Array(b)) => {
+                    let mut result = a.borrow().clone();
+                    result.extend(b.borrow().iter().cloned());
+                    Ok(Value::Array(Rc::new(RefCell::new(result))))
+                }
+                _ => Err("concat: expected two Arrays".to_string()),
+            }
+        });
+
+        self.define_native("keys", 1, |args| {
+            match &args[0] {
+                Value::Object(obj) => {
+                    let ks: Vec<Value> = obj.borrow().keys()
+                        .map(|k| Value::String(Rc::new(k.clone())))
+                        .collect();
+                    Ok(Value::Array(Rc::new(RefCell::new(ks))))
+                }
+                _ => Err("keys: expected Object".to_string()),
+            }
+        });
+
+        self.define_native("values", 1, |args| {
+            match &args[0] {
+                Value::Object(obj) => {
+                    let vs: Vec<Value> = obj.borrow().values().cloned().collect();
+                    Ok(Value::Array(Rc::new(RefCell::new(vs))))
+                }
+                _ => Err("values: expected Object".to_string()),
+            }
+        });
+
+        self.define_native("entries", 1, |args| {
+            match &args[0] {
+                Value::Object(obj) => {
+                    let es: Vec<Value> = obj.borrow().iter()
+                        .map(|(k, v)| {
+                            let pair = vec![
+                                Value::String(Rc::new(k.clone())),
+                                v.clone(),
+                            ];
+                            Value::Array(Rc::new(RefCell::new(pair)))
+                        })
+                        .collect();
+                    Ok(Value::Array(Rc::new(RefCell::new(es))))
+                }
+                _ => Err("entries: expected Object".to_string()),
+            }
+        });
+
         // Placeholder natives for functions that need interpreter callback
         // These are handled specially in call_value
         self.define_native("for", 2, |_args| Ok(Value::Null));

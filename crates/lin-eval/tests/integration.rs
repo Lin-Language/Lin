@@ -915,3 +915,28 @@ print(classify(5))
 "#);
     assert_eq!(output, vec!["big", "medium", "small"]);
 }
+
+#[test]
+fn test_push_and_concat() {
+    let output = run(r#"
+val arr = [1, 2]
+push(arr, 3)
+print(toString(length(arr)))
+
+val combined = concat([1], [2, 3])
+combined.for(x => print(toString(x)))
+"#);
+    assert_eq!(output, vec!["3", "1", "2", "3"]);
+}
+
+#[test]
+fn test_keys_values_entries() {
+    let output = run(r#"
+val obj = { "a": 1, "b": 2 }
+val ks = keys(obj)
+ks.for(k => print(k))
+val vs = values(obj)
+vs.for(v => print(toString(v)))
+"#);
+    assert_eq!(output, vec!["a", "b", "1", "2"]);
+}
