@@ -1,5 +1,6 @@
 import { trim, toUpper } from "std/string"
 import { print } from "std/io"
+import { isInt32, parseInt32 } from "std/number"
 
 val describeName = (input: Json): String =>
   match input
@@ -17,7 +18,7 @@ print(describeName("Jane"))
 
 val parseAge = (input: String): Json =>
   if input.isInt32()
-    then { "type": "success", "value": input.toInt32() }
+    then { "type": "success", "value": input.parseInt32() }
     else { "type": "failure", "error": "Invalid age" }
 
 val result = parseAge("42")

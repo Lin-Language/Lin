@@ -4,7 +4,12 @@ members = [
     "crates/lin-lex",
     "crates/lin-parse",
     "crates/lin-eval",
+    "crates/lin-check",
+    "crates/lin-codegen",
+    "crates/lin-runtime",
+    "crates/lin-compile",
     "crates/lin",
+    "crates/lin-lsp",
 ]
 resolver = "2"
 

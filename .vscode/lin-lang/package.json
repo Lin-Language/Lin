@@ -1,0 +1,41 @@
+{
+  "name": "lin-lang",
+  "displayName": "Lin Language",
+  "description": "Syntax highlighting and diagnostics for the Lin programming language (.lin files)",
+  "version": "0.2.0",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:lin"
+  ],
+  "main": "./client.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "lin",
+        "aliases": [
+          "Lin",
+          "lin"
+        ],
+        "extensions": [
+          ".lin"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "lin",
+        "scopeName": "source.lin",
+        "path": "./syntaxes/lin.tmLanguage.json"
+      }
+    ]
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

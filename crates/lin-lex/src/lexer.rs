@@ -358,7 +358,7 @@ impl Lexer {
             }
         }
 
-        // Skip type suffixes (i8, u32, f32, uf64, etc.) - we just consume them
+        // Skip type suffixes (i8, u32, f32, etc.) - we just consume them
         while self.pos < self.source.len() && (self.source[self.pos].is_alphabetic() || self.source[self.pos].is_ascii_digit()) {
             let c = self.source[self.pos];
             if c == 'i' || c == 'u' || c == 'f' {

@@ -69,6 +69,7 @@ By convention, built-in and named types use `CamelCase`:
 String
 Boolean
 Null
+Number
 Json
 Int32
 Float64
@@ -177,7 +178,7 @@ A literal may carry an explicit type suffix to override default inference:
 42i8       Int8
 42u32      UInt32
 3.14f32    Float32
-12.5uf64   UFloat64
+3.14f64    Float64
 ```
 
 Without a suffix, integer literals default to `Int32` and floating-point literals default to `Float64`, subject to context-driven inference (see §26).
@@ -217,21 +218,32 @@ val missing: Null = null
 val count: Int32 = 42
 val total: UInt64 = 9000000000
 val ratio: Float64 = 3.14
-val positiveRatio: UFloat32 = 12.5
 ```
 
 The value `null` has type `Null`.
 
 ### 4.2 Numeric Types
 
-The language has explicit numeric families rather than a single `Number` type.
+The language has explicit numeric families:
 
 ```txt
 Int8   Int16   Int32   Int64
 UInt8  UInt16  UInt32  UInt64
 Float8 Float16 Float32 Float64
-UFloat8 UFloat16 UFloat32 UFloat64
 ```
+
+Floating-point families follow IEEE 754 and are always signed; there is no `UFloat`. Non-negativity of a float is a runtime invariant, not a type-level one — enforce it with validation if needed.
+
+The built-in name `Number` is a union alias covering every numeric family:
+
+```txt
+type Number =
+  | Int8 | Int16 | Int32 | Int64
+  | UInt8 | UInt16 | UInt32 | UInt64
+  | Float8 | Float16 | Float32 | Float64
+```
+
+`Number` is purely a static name — it has no distinct runtime representation (§27.4). Every numeric value remains tagged with its specific family, and `is Int32`, widening (§26), and arithmetic dispatch all work exactly as if the union had been written out by hand. `Number` exists so that signatures accepting any numeric and the definition of `Json` (§5) have a concise spelling.
 
 See §26 for coercion and inference rules.
 
@@ -245,6 +257,7 @@ Rules:
 2. Commas are required between fields.
 3. Trailing commas are not allowed.
 4. Runtime object values must be JSON-compatible.
+5. An object literal may include spread elements of the form `...expr`. `expr` must evaluate to an object at runtime; otherwise an error is raised. Fields and spreads are processed left-to-right. When the same key is written more than once (by spread or explicitly), the later value replaces the earlier one and the key keeps its first-occurrence position in iteration order.
 
 ```txt
 val person = {
@@ -253,6 +266,8 @@ val person = {
   "active": true,
   "spouse": null
 }
+
+val older = { ...person, "age": 43 }
 ```
 
 ### 4.4 Arrays
@@ -272,18 +287,32 @@ Two distinct *type* forms describe arrays — see §8.2 and §8.3.
 String
 Boolean
 Null
+Number
 Json
 Error
 Int8 Int16 Int32 Int64
 UInt8 UInt16 UInt32 UInt64
 Float8 Float16 Float32 Float64
-UFloat8 UFloat16 UFloat32 UFloat64
 Function
 Iterator<T>
 Iterable<T>
 ```
 
-`Json` represents arbitrary JSON data.
+`Number` is a union alias covering every numeric family (§4.2).
+
+`Json` represents arbitrary JSON data. It is the recursive union of every JSON-shaped value:
+
+```txt
+type Json =
+  | String
+  | Boolean
+  | Null
+  | Number
+  | Json[]
+  | { ...Json }      // any object whose values are Json
+```
+
+The last form is informal: there is no general index-signature syntax in v1; in practice a `Json`-valued object is any object whose fields are themselves `Json`.
 
 `Function`, `Iterator<T>`, and `Iterable<T>` are opaque runtime types. They are not JSON values and are not described using JSON-shaped object types.
 
@@ -872,6 +901,8 @@ Object rest spread:
 val { name, ...remaining } = person
 ```
 
+Object spread is also valid in object *expressions*; see §4.3.
+
 ### 15.7 Function Parameter Destructuring
 
 ```txt
@@ -1390,7 +1421,7 @@ Runtime values include:
 String
 Boolean
 Null
-Int*  UInt*  Float*  UFloat*
+Int*  UInt*  Float*
 Array
 Object
 Function
@@ -1415,11 +1446,13 @@ The compiler is required to perform tail call optimisation for **direct self-rec
 
 ### 27.4 Numbers
 
-Each numeric family has a distinct runtime representation. There is no single "Number" type. Numeric values carry their family tag at runtime so that operations can dispatch on the correct width and signedness.
+Each numeric family has a distinct runtime representation. `Number` (§4.2) is a static union alias, not a runtime kind — there is no single runtime "Number" representation. Numeric values carry their family tag at runtime so that operations can dispatch on the correct width and signedness.
 
 ### 27.5 Objects
 
 JSON objects are stored as insertion-ordered key/value maps. Iteration order matches insertion order. Equality is order-independent (§14).
+
+Object spread in literals (§4.3) inserts each source entry in source-iteration order. If a key was already present, the value is replaced but its original position is preserved.
 
 ### 27.6 Iterators
 
@@ -1539,7 +1572,7 @@ Deferred — not required to begin implementation:
 2. **Concurrency model.** v1 is single-threaded and synchronous.
 3. **Exact stdlib API.** Module layout is fixed (§20.6); precise signatures within each module are still being filled in incrementally.
 4. **Tooling.** Formatter, LSP, test runner as a first-class command are deferred.
-5. **Object rest destructuring iteration order.** Object iteration order matches insertion (§27.5); whether rest-spread preserves that exact order is unspecified.
+5. **Object rest destructuring iteration order.** Specified — see §4.3 and §27.5. Spread inserts source entries in source-iteration order; repeated keys keep their first-occurrence position.
 6. **`Iterable<T>` mechanism.** Whether it is a true protocol-like type, a compiler-known structural capability, or purely a built-in opaque interface.
 7. **Full numeric widening matrix.** §26 specifies the principle; the complete pairwise table is deferred.
 8. **Multi-error reporting.** First-error-then-halt policy for v1; recoverable parsing/checking is deferred.
@@ -1547,7 +1580,7 @@ Deferred — not required to begin implementation:
 Decided:
 
 1. `export` may be used on `val`, `var`, and `type` declarations.
-2. `Json` is a built-in type.
+2. `Json` is a built-in type; `Number` is a built-in union alias covering every numeric family (§4.2).
 3. `Unknown` and `Never` are not built-in types initially.
 4. `is Person` is exact; `has Person` or `has { ... }` matches shape and allows extra fields.
 5. `is` on generic type applications is unsupported in v1.

@@ -1,5 +1,5 @@
 [package]
-name = "lin"
+name = "lin-compile"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,6 +7,7 @@ edition = "2021"
 lin-common = { path = "../lin-common" }
 lin-lex = { path = "../lin-lex" }
 lin-parse = { path = "../lin-parse" }
-lin-eval = { path = "../lin-eval" }
 lin-check = { path = "../lin-check" }
-lin-compile = { path = "../lin-compile" }
+lin-codegen = { path = "../lin-codegen" }
+lin-runtime = { path = "../lin-runtime" }
+inkwell = { version = "0.9", features = ["llvm22-1-prefer-dynamic"] }

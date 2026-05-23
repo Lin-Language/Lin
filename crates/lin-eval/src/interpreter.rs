@@ -35,6 +35,7 @@ impl Interpreter {
         };
         interp.register_intrinsics();
         interp.register_stdlib_sources();
+        interp.preload_stdlib();
         interp
     }
 
@@ -52,6 +53,17 @@ impl Interpreter {
         self.stdlib_sources.insert("std/array".to_string(), include_str!("../../../stdlib/array.lin"));
         self.stdlib_sources.insert("std/iter".to_string(), include_str!("../../../stdlib/iter.lin"));
         self.stdlib_sources.insert("std/result".to_string(), include_str!("../../../stdlib/result.lin"));
+    }
+
+    fn preload_stdlib(&mut self) {
+        let iter_exports = self.load_module("std/iter").expect("Failed to load std/iter");
+        for (name, value) in &iter_exports {
+            self.global_env.define(name.clone(), value.clone());
+        }
+        let array_exports = self.load_module("std/array").expect("Failed to load std/array");
+        for (name, value) in &array_exports {
+            self.global_env.define(name.clone(), value.clone());
+        }
     }
 
     fn register_intrinsics(&mut self) {
@@ -307,14 +319,9 @@ impl Interpreter {
             }
         });
 
-        // Placeholder natives for functions that need interpreter callback
-        // These are handled specially in call_value
+        // Placeholder natives for functions that need interpreter access
+        // (actual logic is handled specially in call_value)
         self.define_native("for", 2, |_args| Ok(Value::Null));
-        self.define_native("range", 2, |_args| Ok(Value::Null));
-        self.define_native("iterOf", 1, |_args| Ok(Value::Null));
-        self.define_native("map", 2, |_args| Ok(Value::Null));
-        self.define_native("filter", 2, |_args| Ok(Value::Null));
-        self.define_native("reduce", 3, |_args| Ok(Value::Null));
         self.define_native("iter", 4, |_args| Ok(Value::Null));
         self.define_native("toFloat64", 1, |args| {
             match &args[0] {
@@ -523,20 +530,9 @@ impl Interpreter {
         let module = parser.parse_module();
 
         let mut module_env = Env::new();
-        // Copy intrinsics into module env
-        for name in &[
-            "print", "length", "toString",
-            "push", "concat", "keys", "values", "entries",
-            "for", "range", "iterOf", "map", "filter", "reduce", "iter",
-            "toFloat64", "isInt32", "toInt32",
-            "__stringSlice", "__stringIndexOf", "__stringToUpper",
-            "__stringToLower", "__stringTrim", "__stringLength",
-            "__stringContains", "__stringStartsWith", "__stringEndsWith",
-            "__stringSplit", "__stringJoin", "__stringReplace", "__stringRepeat",
-            "__parseInt32", "__parseFloat64", "__isInt32", "__toInt32", "__toFloat64",
-        ] {
-            if let Some(val) = self.global_env.get(name) {
-                module_env.define(name.to_string(), val);
+        for name in self.global_env.keys() {
+            if let Some(val) = self.global_env.get(&name) {
+                module_env.define(name, val);
             }
         }
 
@@ -745,13 +741,30 @@ impl Interpreter {
 
             Expr::Object(fields, _) => {
                 let mut map = IndexMap::new();
-                for (key_expr, val_expr) in fields {
-                    let key = match self.eval_expr_in_env(key_expr, env)? {
-                        Value::String(s) => (*s).clone(),
-                        other => other.to_display_string(),
-                    };
-                    let val = self.eval_expr_in_env(val_expr, env)?;
-                    map.insert(key, val);
+                for field in fields {
+                    match field {
+                        ObjectField::Pair(key_expr, val_expr) => {
+                            let key = match self.eval_expr_in_env(key_expr, env)? {
+                                Value::String(s) => (*s).clone(),
+                                other => other.to_display_string(),
+                            };
+                            let val = self.eval_expr_in_env(val_expr, env)?;
+                            map.insert(key, val);
+                        }
+                        ObjectField::Spread(expr) => {
+                            match self.eval_expr_in_env(expr, env)? {
+                                Value::Object(src) => {
+                                    for (k, v) in src.borrow().iter() {
+                                        map.insert(k.clone(), v.clone());
+                                    }
+                                }
+                                other => return Err(format!(
+                                    "Object spread: expected Object, got {}",
+                                    other.type_name(),
+                                )),
+                            }
+                        }
+                    }
                 }
                 Ok(Value::Object(Rc::new(RefCell::new(map))))
             }
@@ -974,21 +987,6 @@ impl Interpreter {
                     "for" => {
                         return self.builtin_for(&args[0], &args[1]);
                     }
-                    "range" => {
-                        return self.builtin_range(&args[0], &args[1]);
-                    }
-                    "iterOf" => {
-                        return self.builtin_iter_of(&args[0]);
-                    }
-                    "map" => {
-                        return self.builtin_map(&args[0], &args[1]);
-                    }
-                    "filter" => {
-                        return self.builtin_filter(&args[0], &args[1]);
-                    }
-                    "reduce" => {
-                        return self.builtin_reduce(&args[0], &args[1], &args[2]);
-                    }
                     "iter" => {
                         return self.builtin_iter(&args[0], &args[1], &args[2], &args[3]);
                     }
@@ -1140,23 +1138,6 @@ impl Interpreter {
         }
     }
 
-    fn builtin_range(&mut self, start: &Value, end: &Value) -> Result<Value, String> {
-        let s = match start { Value::Int(i) => *i, _ => 0 };
-        let e = match end { Value::Int(i) => *i, _ => 0 };
-
-        // Materialize range as an array for simplicity
-        let mut items = Vec::new();
-        for i in s..e {
-            items.push(Value::Int(i));
-        }
-        Ok(Value::Array(Rc::new(RefCell::new(items))))
-    }
-
-    fn builtin_iter_of(&mut self, arr: &Value) -> Result<Value, String> {
-        // Just return the array itself — for/map/filter/reduce all handle arrays directly
-        Ok(arr.clone())
-    }
-
     fn builtin_iter(&mut self, init: &Value, cont: &Value, next: &Value, current: &Value) -> Result<Value, String> {
         let iter_val = IteratorValue {
             init: init.clone(),
@@ -1167,113 +1148,6 @@ impl Interpreter {
             started: false,
         };
         Ok(Value::Iterator(Rc::new(RefCell::new(iter_val))))
-    }
-
-    fn builtin_map(&mut self, iterable: &Value, func: &Value) -> Result<Value, String> {
-        match iterable {
-            Value::Array(arr) => {
-                let items: Vec<Value> = arr.borrow().clone();
-                let mut result = Vec::new();
-                for item in items {
-                    let mapped = self.call_value(func, vec![item], &mut Env::new())?;
-                    result.push(mapped);
-                }
-                Ok(Value::Array(Rc::new(RefCell::new(result))))
-            }
-            Value::Iterator(iter_val) => {
-                let mut results = Vec::new();
-                let iter = iter_val.borrow();
-                let init_fn = iter.init.clone();
-                let cont_fn = iter.cont.clone();
-                let next_fn = iter.next.clone();
-                let curr_fn = iter.current.clone();
-                drop(iter);
-
-                let mut state = self.call_value(&init_fn, vec![], &mut Env::new())?;
-                loop {
-                    let cont = self.call_value(&cont_fn, vec![state.clone()], &mut Env::new())?;
-                    if !cont.is_truthy() { break; }
-                    let current = self.call_value(&curr_fn, vec![state.clone()], &mut Env::new())?;
-                    let mapped = self.call_value(func, vec![current], &mut Env::new())?;
-                    results.push(mapped);
-                    state = self.call_value(&next_fn, vec![state], &mut Env::new())?;
-                }
-                Ok(Value::Array(Rc::new(RefCell::new(results))))
-            }
-            _ => Err(format!("map: expected Array or Iterator, got {}", iterable.type_name())),
-        }
-    }
-
-    fn builtin_filter(&mut self, iterable: &Value, func: &Value) -> Result<Value, String> {
-        match iterable {
-            Value::Array(arr) => {
-                let items: Vec<Value> = arr.borrow().clone();
-                let mut result = Vec::new();
-                for item in items {
-                    let keep = self.call_value(func, vec![item.clone()], &mut Env::new())?;
-                    if keep.is_truthy() {
-                        result.push(item);
-                    }
-                }
-                Ok(Value::Array(Rc::new(RefCell::new(result))))
-            }
-            Value::Iterator(iter_val) => {
-                let mut results = Vec::new();
-                let iter = iter_val.borrow();
-                let init_fn = iter.init.clone();
-                let cont_fn = iter.cont.clone();
-                let next_fn = iter.next.clone();
-                let curr_fn = iter.current.clone();
-                drop(iter);
-
-                let mut state = self.call_value(&init_fn, vec![], &mut Env::new())?;
-                loop {
-                    let cont = self.call_value(&cont_fn, vec![state.clone()], &mut Env::new())?;
-                    if !cont.is_truthy() { break; }
-                    let current = self.call_value(&curr_fn, vec![state.clone()], &mut Env::new())?;
-                    let keep = self.call_value(func, vec![current.clone()], &mut Env::new())?;
-                    if keep.is_truthy() {
-                        results.push(current);
-                    }
-                    state = self.call_value(&next_fn, vec![state], &mut Env::new())?;
-                }
-                Ok(Value::Array(Rc::new(RefCell::new(results))))
-            }
-            _ => Err(format!("filter: expected Array or Iterator, got {}", iterable.type_name())),
-        }
-    }
-
-    fn builtin_reduce(&mut self, iterable: &Value, init: &Value, func: &Value) -> Result<Value, String> {
-        match iterable {
-            Value::Array(arr) => {
-                let items: Vec<Value> = arr.borrow().clone();
-                let mut acc = init.clone();
-                for item in items {
-                    acc = self.call_value(func, vec![acc, item], &mut Env::new())?;
-                }
-                Ok(acc)
-            }
-            Value::Iterator(iter_val) => {
-                let iter = iter_val.borrow();
-                let init_fn = iter.init.clone();
-                let cont_fn = iter.cont.clone();
-                let next_fn = iter.next.clone();
-                let curr_fn = iter.current.clone();
-                drop(iter);
-
-                let mut acc = init.clone();
-                let mut state = self.call_value(&init_fn, vec![], &mut Env::new())?;
-                loop {
-                    let cont = self.call_value(&cont_fn, vec![state.clone()], &mut Env::new())?;
-                    if !cont.is_truthy() { break; }
-                    let current = self.call_value(&curr_fn, vec![state.clone()], &mut Env::new())?;
-                    acc = self.call_value(func, vec![acc, current], &mut Env::new())?;
-                    state = self.call_value(&next_fn, vec![state], &mut Env::new())?;
-                }
-                Ok(acc)
-            }
-            _ => Err(format!("reduce: expected Array or Iterator, got {}", iterable.type_name())),
-        }
     }
 
     fn eval_match(&mut self, val: &Value, arms: &[MatchArm], env: &mut Env) -> Result<Value, String> {

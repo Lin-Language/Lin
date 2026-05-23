@@ -92,7 +92,7 @@ pub enum Expr {
         body: Box<Expr>,
         span: Span,
     },
-    Object(Vec<(Expr, Expr)>, Span),
+    Object(Vec<ObjectField>, Span),
     Array(Vec<Expr>, Span),
     Assign {
         target: String,
@@ -138,6 +138,12 @@ impl Expr {
             Expr::TupleArgs(_, s) => *s,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum ObjectField {
+    Pair(Expr, Expr),
+    Spread(Expr),
 }
 
 #[derive(Debug, Clone)]

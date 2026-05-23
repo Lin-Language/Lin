@@ -1068,3 +1068,88 @@ print("  hello  ".trim().toUpper())
 "#);
     assert_eq!(output, vec!["HELLO"]);
 }
+
+#[test]
+fn test_object_spread_basic() {
+    let output = run(r#"
+val src = { "a": 1, "b": 2 }
+val merged = { ...src, "c": 3 }
+print(toString(merged["a"]))
+print(toString(merged["b"]))
+print(toString(merged["c"]))
+print(toString(keys(merged)))
+"#);
+    assert_eq!(output, vec!["1", "2", "3", "[\"a\", \"b\", \"c\"]"]);
+}
+
+#[test]
+fn test_object_spread_override_explicit_after_spread() {
+    let output = run(r#"
+val src = { "a": 1, "b": 2 }
+val merged = { ...src, "a": 99 }
+print(toString(merged["a"]))
+print(toString(merged["b"]))
+print(toString(keys(merged)))
+"#);
+    assert_eq!(output, vec!["99", "2", "[\"a\", \"b\"]"]);
+}
+
+#[test]
+fn test_object_spread_override_spread_after_explicit() {
+    let output = run(r#"
+val src = { "a": 99 }
+val merged = { "a": 1, "b": 2, ...src }
+print(toString(merged["a"]))
+print(toString(merged["b"]))
+print(toString(keys(merged)))
+"#);
+    assert_eq!(output, vec!["99", "2", "[\"a\", \"b\"]"]);
+}
+
+#[test]
+fn test_object_spread_multiple() {
+    let output = run(r#"
+val a = { "x": 1, "y": 2 }
+val b = { "y": 20, "z": 30 }
+val merged = { ...a, ...b }
+print(toString(merged["x"]))
+print(toString(merged["y"]))
+print(toString(merged["z"]))
+print(toString(keys(merged)))
+"#);
+    assert_eq!(output, vec!["1", "20", "30", "[\"x\", \"y\", \"z\"]"]);
+}
+
+#[test]
+fn test_object_spread_empty_source() {
+    let output = run(r#"
+val merged = { ...{}, "a": 1 }
+print(toString(merged["a"]))
+print(toString(keys(merged)))
+"#);
+    assert_eq!(output, vec!["1", "[\"a\"]"]);
+}
+
+#[test]
+fn test_object_spread_null_error() {
+    let err = run_expect_err(r#"
+val merged = { ...null, "a": 1 }
+"#);
+    assert!(err.contains("expected Object"), "got error: {}", err);
+}
+
+#[test]
+fn test_object_spread_array_error() {
+    let err = run_expect_err(r#"
+val merged = { ...[1, 2], "a": 1 }
+"#);
+    assert!(err.contains("expected Object"), "got error: {}", err);
+}
+
+#[test]
+fn test_object_spread_string_error() {
+    let err = run_expect_err(r#"
+val merged = { ..."hello", "a": 1 }
+"#);
+    assert!(err.contains("expected Object"), "got error: {}", err);
+}

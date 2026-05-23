@@ -50,8 +50,6 @@ val normalFloat: Float32 = 3.14
 val largeFloat: Float64 = 3.141592653589793
 val avogadro: Float64 = 6.022e23
 
-val positiveFloat: UFloat32 = 12.5
-
 // Literals can use hex, binary, octal, and underscore separators
 
 val hex: Int32 = 0xFF

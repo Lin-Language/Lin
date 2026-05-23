@@ -8,21 +8,13 @@
 
 **Consequence**: All type annotations are parsed and stored in the AST but ignored at runtime.
 
-## ADR-002: Built-in iteration functions instead of .lin stdlib
+## ADR-002: Minimal built-ins, stdlib for iteration
 
-**Decision**: `for`, `map`, `filter`, `reduce`, `range`, `iterOf`, and `iter` are implemented as built-in functions in the Rust interpreter rather than in .lin stdlib files.
+**Decision**: Only `for` and `iter` remain as Rust built-ins. Higher-level functions (`map`, `filter`, `reduce`, `range`, `iterOf`) are implemented in .lin stdlib files (`std/array`, `std/iter`) and preloaded as globals at interpreter startup.
 
-**Rationale**: These functions need to invoke user callbacks (closures), which requires access to the interpreter's `call_value` method. Rust's `fn` pointer type cannot capture state, so native functions registered with a simple `fn(&[Value]) -> Result<Value, String>` signature cannot call back into the interpreter. Making them built-ins avoids this architectural constraint.
+**Rationale**: `for` needs `call_value` to drive the iterator state machine. `iter` constructs the opaque `IteratorValue` struct. All other iteration functions can be expressed in .lin using these two primitives — e.g., `map` calls `arr.for(item => ...)`. Since .lin supports higher-order functions (passing and calling function arguments), no special interpreter access is needed.
 
-**Consequence**: The stdlib .lin files for `std/array` and `std/iter` are thin re-export wrappers (or unused). The built-ins are registered directly in the global environment.
-
-## ADR-003: Range materializes as array
-
-**Decision**: `range(start, end)` immediately materializes all values into a `Vec<Value>` (an Array) rather than producing a lazy iterator.
-
-**Rationale**: Creating a true lazy iterator requires closures that capture the end-bound, which conflicts with the `fn` pointer approach used for native functions. Materializing as an array is simple and correct for v0. For typical ranges in test programs (< 10000 elements), this is not a performance concern.
-
-**Consequence**: Very large ranges will allocate proportionally. A lazy implementation can be added in v1 when the iterator infrastructure is more mature.
+**Consequence**: ~120 lines of Rust removed. `std/iter` and `std/array` are loaded during `Interpreter::new()` via `preload_stdlib()`, making their exports available as globals without explicit imports. `range()` now returns an `Iterator` (lazy) rather than an `Array` (eager), which is transparent to consumers since all use `.for()`/`.map()`/etc.
 
 ## ADR-004: Objects suppress indentation tracking
 
@@ -135,3 +127,75 @@
 **Rationale**: Previously, `at_line_start` was only cleared when entering `handle_indentation()` (which requires `!inside_balanced()`). This left the flag true when a newline occurred inside braces (e.g., multi-line imports). When the closing brace brought depth back to 0, the stale `at_line_start = true` triggered spurious INDENT tokens on the next call. Always clearing the flag eliminates this class of bugs.
 
 **Consequence**: Multi-line `import { ... } from "path"` statements work correctly. No change in behavior for other constructs since the flag is still set to true on `\n` when appropriate.
+
+## ADR-018: `Number` as a built-in union alias
+
+**Decision**: Add `Number` to the built-in types as a union alias for every numeric family (`Int8 | … | Float64`), and use it in the definition of `Json`. `Number` does not introduce a new runtime kind, a new subtype relation, or any new narrowing rule — it is exactly the union it expands to.
+
+**Rationale**: Without a name for "any numeric," the `Json` type has to enumerate all sixteen numeric families to be accurate, and signatures that accept any numeric have no concise spelling. A true supertype with subtype assignability would introduce a third kind of type relation alongside structural typing and unions, and would force decisions about `is Number` narrowing, arithmetic on a `Number`-typed operand, and how widening (§26) interacts with the supertype. A union alias avoids all of that: `is Int32`, widening, and operator dispatch keep working exactly as they did, because under the hood there is still only a concrete numeric family at every site.
+
+**Consequence**: Spec-only change in v0 (no type checker exists yet — `Number` already parses as a `TypeExpr::Named`). The future type checker treats `Number` as a union alias when resolving assignability and exhaustiveness. Runtime is unchanged: §27.4 still says every numeric value carries its specific family tag and there is no single `Number` representation.
+
+## ADR-019: LLVM 22 via inkwell with dynamic linking
+
+**Decision**: The compiler backend uses LLVM 22 (the latest stable release) via the `inkwell` 0.9.0 Rust wrapper, with the `llvm22-1-prefer-dynamic` feature flag for dynamic linking.
+
+**Rationale**: LLVM 22 is the latest release with the best optimizations and codegen quality. The `prefer-dynamic` flag is required because Debian/Ubuntu package `LLVMPolly.so` as a dynamic library only — no `.a` static archive is provided. Without dynamic linking, the linker fails with "could not find native static library 'Polly'". The `inkwell` wrapper provides a safe, idiomatic Rust API over the LLVM C API and supports LLVM 22.
+
+**Consequence**: The devcontainer installs LLVM 22 from `apt.llvm.org/bookworm` and sets `LLVM_SYS_221_PREFIX=/usr/lib/llvm-22`. The compiled binary dynamically links against `libLLVM-22.so` at runtime, which is available on the devcontainer but would need to be present on deployment targets.
+
+## ADR-020: Unboxed primitive value representation in LLVM IR
+
+**Decision**: Numeric and boolean types are represented as bare LLVM primitives: `Int32` → `i32`, `Float64` → `double`, `Bool` → `i1`. Strings are represented as `ptr` to a heap-allocated `LinString` struct (refcount + len + bytes). Closures are represented as `ptr` to a `{ fn_ptr, env_ptr }` struct. Union types use a heap-allocated tagged representation.
+
+**Rationale**: The type checker produces `TypedIR` with a concrete `Type` for every expression. This means we know at compile time whether a value is `i32` or `f64`, enabling LLVM to treat them as first-class register-width values rather than tagged `Value` boxes. The performance difference versus the tree-walker interpreter (which boxes everything in a `Value` enum) is typically 50–200×. Strings cannot be unboxed (variable-length), so they remain as pointers.
+
+**Consequence**: No boxing for arithmetic, comparisons, boolean operations, or function calls on primitive types. LLVM's optimizer can treat these as register values and apply standard scalar optimizations. Union types and unknown-typed values (TypeVar) fall back to pointer representation.
+
+## ADR-021: TCO via alloca/loop transform (not trampoline)
+
+**Decision**: Tail-recursive functions are compiled using the "loop transform": parameters are stored in `alloca` slots, the function body is wrapped in a `tco_loop` basic block, and tail self-calls store updated argument values into the alloca slots and branch back to `tco_loop` rather than making a recursive call.
+
+**Rationale**: The alloca/loop approach produces standard LLVM IR that LLVM's optimizer understands — it can apply `mem2reg` to promote the alloca slots to phi nodes, yielding optimal machine code. A trampoline approach (returning a thunk and looping externally) requires a heap allocation per tail call and more complex call-site machinery. The loop transform produces a native loop with no allocation overhead.
+
+**Consequence**: Tail self-calls are identified by `is_tail: bool` in `TypedExpr::Call`, set by the checker when the call is in tail position and the callee is the current function. Non-tail recursive calls and mutual recursion still use normal stack frames. `mem2reg` (run as part of `default<O2>`) eliminates all alloca slots from the final machine code.
+
+## ADR-022: Forward-declaration for top-level mutual recursion in codegen
+
+**Decision**: Before compiling the body of any top-level function, `compile_module` pre-scans all `TypedStmt::Val` statements to LLVM-declare any function whose `TypedExpr::Function` has a `name`. These forward declarations are stored in `global_fn_slots` (slot → `FunctionValue`). Function bodies are compiled in a second pass. Direct calls look up `global_fn_slots` first, enabling sibling functions to call each other.
+
+**Rationale**: LLVM requires a function to be declared before it is called. Without a pre-scan, a function `f` that calls `g` (defined later in the source) would not find `g`'s `FunctionValue` in the IR. The pre-scan mirrors ADR-015 (mutable cells for forward refs in the interpreter) but at the LLVM level. The checker's `forward_declare_functions` also pre-registers function types so the body's recursive references type-check correctly and reuse the same slot.
+
+**Consequence**: Top-level mutual recursion works. The slot assigned during type-check pre-scan is reused (via `update_type`) when the actual `val` binding is processed, ensuring the codegen's `global_fn_slots` entry aligns with the slot referenced in call expressions.
+
+## ADR-023: Runtime library as a static archive linked into every binary
+
+**Decision**: `lin-runtime` is compiled as a Rust `staticlib` (`crate-type = ["staticlib", "rlib"]`) that provides C-ABI functions (`lin_print`, `lin_string_concat`, `lin_int_to_string`, `lin_array_alloc`, `lin_panic`, etc.). The compile pipeline locates the `.a` file and passes it to the system linker (`cc`) alongside the LLVM-emitted `.o` file.
+
+**Rationale**: LLVM IR cannot express Rust-level operations like `write!` or `alloc::alloc`. The runtime provides these as well-known C symbols that LLVM IR can `declare` and call. A static archive avoids a runtime shared-library dependency on deployed binaries. Using the Rust `staticlib` crate type ensures `rustc` links in all needed Rust stdlib code (allocator, panic handler, etc.).
+
+**Consequence**: Compiled Lin binaries are self-contained: they link against `libc` (via `cc`) plus the runtime `.a`, with no Lin-specific shared libraries required. The runtime is small (~10KB stripped) since it only contains the functions LLVM IR references.
+
+## ADR-024: Binding name propagation for function identity
+
+**Decision**: When the checker processes `Stmt::Val { pattern: Ident("f"), value: Function { ... } }`, the resulting `TypedExpr::Function { name: Some("f"), ... }` carries the binding name. This is done by detecting the pattern name in `check_stmt` and either calling `infer_function` with the name (enabling tail-call tracking via `current_function`) or patching `name` after inference.
+
+**Rationale**: `TypedExpr::Function` has an optional `name` field used by the codegen to (a) emit a named LLVM function rather than an anonymous `__closure_N` and (b) enable `global_fn_slots` lookup for direct calls. The parser does not embed the binding name into the function expression (names come from the `val`/`var` statement's pattern), so the checker must propagate it. Setting `current_function` during body compilation is also required for tail-call detection (`is_tail_call` only fires when in tail position of the same function).
+
+**Consequence**: Named top-level functions emit named LLVM functions (e.g., `@factorial`) rather than anonymous closures (`@__closure_0`). Recursive calls to the function are recognized as tail calls when in tail position, enabling the TCO loop transform (ADR-021).
+
+## ADR-025: Closure capture analysis via scope depth tracking
+
+**Decision**: Capture analysis is performed inline during type-checking. When `infer_function` is entered, the current scope depth is pushed onto `function_scope_depths`. During `LocalGet` inference, if the variable's scope depth is less than the innermost function's entry depth, it is recorded as a capture in `capture_stack`. The captures are sorted by `outer_slot` for deterministic codegen.
+
+**Rationale**: A separate capture-analysis pass would need to traverse the typed IR a second time. Doing it inline avoids this while the scope information is naturally available. Scope depth (not slot number) is the right discriminant: variables from the current function's scope are parameters/locals; variables from outer scopes are captures. Stable sorting by slot ensures codegen produces deterministic env struct layouts.
+
+**Consequence**: Closures that capture variables now correctly carry a `captures: Vec<Capture>` list in `TypedExpr::Function`. The codegen heap-allocates environment structs for captured variables and packs `{fn_ptr, env_ptr}` closure values on the heap (not the stack) to support closures that outlive their creating scope.
+
+## ADR-026: Iterator representation as heap-allocated struct; inline for-loop codegen
+
+**Decision**: `range(a, b)` returns a heap-allocated `{i32 start, i32 end}` struct. `for(iterable, body)` is compiled to an inline LLVM loop: for arrays, an i64 index loop with `lin_array_get` element access; for `Iterator<Int32>` (range result), a counted `i32` loop. The `body` closure is inlined — the codegen recognizes `TypedExpr::Function` and `TypedExpr::LocalGet` to avoid creating/calling a closure struct when the body is a literal lambda.
+
+**Rationale**: General iterators need function-pointer dispatch. For the common `range(...).for(i => ...)` pattern, generating a direct counted loop is equivalent to a C `for` loop with no overhead. Array iteration avoids boxing by loading `LinArrayElem.payload` directly. `TypeVar` substitution was added to `infer_call` and `infer_dot_call` to propagate the element type into the body lambda's parameter when the `for` intrinsic's parameter types use `TypeVar`.
+
+**Consequence**: `range(0, n).for(i => ...)` and `arr.for(x => ...)` compile to native loops. The `iter` intrinsic is supported but `map`/`filter`/`reduce` are not yet compiled (runtime panic). Bidirectional type checking was extended (`check_expr` now guides function argument inference using expected parameter types from the call site).

@@ -1,0 +1,24 @@
+// missing getAuth and get imports, this is a hypothetical example
+// type HttpConfig = {
+//   "url": String,
+//   "headers": {
+//     "authorization": String
+//   }
+// }
+// 
+// val getClient = () => {
+//   "url": "https://myurl.com",
+//   "headers": {
+//     "authorization": "${getAuth()}"
+//   }
+// }
+// 
+// val getCase = (config: HttpConfig, caseId: String) => 
+//   val httpConfig = { 
+//     ...config, 
+//     "url": "${config.url}/case/${caseId}"
+//   }
+// 
+//   get(httpConfig)
+// 
+// getClient().getCase("ABCD-1234")

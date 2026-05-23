@@ -1,15 +1,16 @@
-use lin_common::Span;
+use lin_common::{Diagnostic, Span};
 use lin_lex::{Token, TokenKind};
 use crate::ast::*;
 
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0 }
+        Self { tokens, pos: 0, diagnostics: Vec::new() }
     }
 
     pub fn parse_module(&mut self) -> Module {
@@ -532,11 +533,17 @@ impl Parser {
         self.skip_newlines();
         let mut fields = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.is_at_end() {
-            let key = self.parse_expr();
-            self.expect(TokenKind::Colon);
-            self.skip_newlines();
-            let value = self.parse_expr();
-            fields.push((key, value));
+            if self.check(TokenKind::DotDotDot) {
+                self.advance();
+                let expr = self.parse_expr();
+                fields.push(ObjectField::Spread(expr));
+            } else {
+                let key = self.parse_expr();
+                self.expect(TokenKind::Colon);
+                self.skip_newlines();
+                let value = self.parse_expr();
+                fields.push(ObjectField::Pair(key, value));
+            }
             if self.check(TokenKind::Comma) {
                 self.advance();
             }
@@ -1285,10 +1292,16 @@ impl Parser {
     }
 
     fn expect(&mut self, kind: TokenKind) {
-        if self.check(kind) {
+        if self.check(kind.clone()) {
             self.advance();
+        } else {
+            let span = self.current_span();
+            let got = self.peek_kind();
+            self.diagnostics.push(Diagnostic::error(
+                span,
+                format!("expected {:?}, got {:?}", kind, got),
+            ));
         }
-        // silently skip if not found (error recovery)
     }
 
     fn expect_keyword(&mut self, kind: TokenKind) {
@@ -1300,7 +1313,12 @@ impl Parser {
             self.advance();
             name
         } else {
-            self.advance();
+            let span = self.current_span();
+            let got = self.peek_kind();
+            self.diagnostics.push(Diagnostic::error(
+                span,
+                format!("expected identifier, got {:?}", got),
+            ));
             String::new()
         }
     }
@@ -1310,7 +1328,12 @@ impl Parser {
             self.advance();
             s
         } else {
-            self.advance();
+            let span = self.current_span();
+            let got = self.peek_kind();
+            self.diagnostics.push(Diagnostic::error(
+                span,
+                format!("expected string literal, got {:?}", got),
+            ));
             String::new()
         }
     }

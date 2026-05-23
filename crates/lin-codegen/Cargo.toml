@@ -1,0 +1,13 @@
+[package]
+name = "lin-codegen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lin-common = { path = "../lin-common" }
+lin-parse = { path = "../lin-parse" }
+lin-check = { path = "../lin-check" }
+inkwell = { version = "0.9", features = ["llvm22-1-prefer-dynamic"] }
+
+[build-dependencies]
+# nothing needed — llvm-sys finds LLVM via LLVM_SYS_221_PREFIX

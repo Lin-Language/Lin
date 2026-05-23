@@ -1,0 +1,30 @@
+{
+  "name": "lin-lang",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "workspaceMount": "source=/home/linus/Work/linusnorton/lin-lang,target=/home/linus/Work/linusnorton/lin-lang,type=bind",
+  "workspaceFolder": "/home/linus/Work/linusnorton/lin-lang",
+  "mounts": [
+    "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind"
+  ],
+  "features": {
+    "ghcr.io/devcontainers/features/git:1": {},
+    "ghcr.io/devcontainers/features/node:1": {}
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "tamasfe.even-better-toml",
+        "serayuzgur.crates"
+      ],
+      "settings": {
+        "rust-analyzer.check.command": "clippy"
+      }
+    }
+  },
+  "postCreateCommand": "npm install -g @anthropic-ai/claude-code && cargo build --workspace",
+  "remoteUser": "vscode"
+}

@@ -1,0 +1,12 @@
+[package]
+name = "lin-check"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lin-common = { path = "../lin-common" }
+lin-parse = { path = "../lin-parse" }
+indexmap = { workspace = true }
+
+[dev-dependencies]
+lin-lex = { path = "../lin-lex" }

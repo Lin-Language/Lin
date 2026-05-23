@@ -1,0 +1,17 @@
+[package]
+name = "lin-lsp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "lin-lsp"
+path = "src/main.rs"
+
+[dependencies]
+lin-common = { path = "../lin-common" }
+lin-lex    = { path = "../lin-lex" }
+lin-parse  = { path = "../lin-parse" }
+lin-check  = { path = "../lin-check" }
+tower-lsp  = "0.20"
+tokio      = { version = "1", features = ["full"] }
+serde_json = "1"

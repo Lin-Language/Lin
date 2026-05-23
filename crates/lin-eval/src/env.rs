@@ -102,6 +102,10 @@ impl Env {
         false
     }
 
+    pub fn keys(&self) -> Vec<String> {
+        self.bindings.keys().cloned().collect()
+    }
+
     pub fn get_mutable_cell(&self, name: &str) -> Option<Rc<RefCell<Value>>> {
         if let Some(Binding::Mutable(cell)) = self.bindings.get(name) {
             return Some(cell.clone());

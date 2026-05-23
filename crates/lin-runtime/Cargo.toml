@@ -1,0 +1,8 @@
+[package]
+name = "lin-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "lin_runtime"
+crate-type = ["staticlib", "rlib"]
