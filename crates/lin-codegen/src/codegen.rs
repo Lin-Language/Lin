@@ -352,9 +352,11 @@ impl<'ctx> Codegen<'ctx> {
         for stmt in &module.statements {
             if let TypedStmt::Import { path: import_path, bindings, .. } = stmt {
                 let known_intrinsics = ["lin_print", "lin_to_string", "lin_length", "lin_push",
-                    "lin_keys", "lin_for", "lin_iter", "lin_range", "lin_map", "lin_filter", "lin_reduce",
+                    "lin_array_set", "lin_keys", "lin_object_set", "lin_for", "lin_iter", "lin_range", "lin_map",
+                    "lin_filter", "lin_reduce",
                     "lin_async", "lin_await", "lin_parallel", "lin_race", "lin_timeout", "lin_retry",
-                    "lin_thread_pool", "lin_worker", "lin_request", "lin_message", "lin_close"];
+                    "lin_thread_pool", "lin_worker", "lin_request", "lin_message", "lin_close",
+                    "lin_exit"];
                 for binding in bindings.iter() {
                     let key = (import_path.clone(), binding.name.clone());
                     if let Some(&llvm_fn) = self.imported_fns.get(&key) {
@@ -1296,9 +1298,11 @@ impl<'ctx> Codegen<'ctx> {
                     } else {
                         // Check if it's a known intrinsic by name (e.g. `print` re-exported from std/io).
                         let known_intrinsics = ["lin_print", "lin_to_string", "lin_length", "lin_push",
-                            "lin_keys", "lin_for", "lin_iter", "lin_range", "lin_map", "lin_filter", "lin_reduce",
+                            "lin_array_set", "lin_keys", "lin_object_set", "lin_for", "lin_iter", "lin_range",
+                            "lin_map", "lin_filter", "lin_reduce",
                             "lin_async", "lin_await", "lin_parallel", "lin_race", "lin_timeout", "lin_retry",
-                            "lin_thread_pool", "lin_worker", "lin_request", "lin_message", "lin_close"];
+                            "lin_thread_pool", "lin_worker", "lin_request", "lin_message", "lin_close",
+                            "lin_exit"];
                         if known_intrinsics.contains(&binding.name.as_str()) {
                             self.intrinsic_slots.insert(binding.slot, binding.name.clone());
                         } else {
@@ -2687,6 +2691,43 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 null_val()
             }
+            "lin_array_set" => {
+                // set(arr: T[], idx: Int32, val: T) => Null
+                // Unbox the array arg to LinArray*, box the element to TaggedVal*, call lin_array_set.
+                let arr_raw = self.compile_expr(&args[0], fn_ctx);
+                let arr_ty = args[0].ty();
+                let idx_raw = self.compile_expr(&args[1], fn_ctx);
+                let elem_raw = self.compile_expr(&args[2], fn_ctx);
+                let elem_ty = args[2].ty();
+
+                let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                let i64_ty = self.context.i64_type();
+
+                // Get the LinArray* — either unbox from TaggedVal* or use directly.
+                let arr_ptr = if matches!(arr_ty, Type::TypeVar(_) | Type::Union(_)) {
+                    self.builder.build_call(self.rt_unbox_ptr, &[arr_raw.into()], "set_arr")
+                        .unwrap().try_as_basic_value().unwrap_basic()
+                } else {
+                    arr_raw
+                };
+
+                // Sign-extend index to i64.
+                let idx_i64 = self.builder
+                    .build_int_s_extend_or_bit_cast(idx_raw.into_int_value(), i64_ty, "set_idx")
+                    .unwrap();
+
+                // Box the element into a TaggedVal*.
+                let elem_tagged = if matches!(elem_ty, Type::TypeVar(_) | Type::Union(_)) {
+                    elem_raw
+                } else {
+                    self.box_value(elem_raw, &elem_ty)
+                };
+
+                let set_fn = self.get_or_declare_fn("lin_array_set",
+                    self.context.void_type().fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
+                self.builder.build_call(set_fn, &[arr_ptr.into(), idx_i64.into(), elem_tagged.into()], "").unwrap();
+                null_val()
+            }
             "lin_range" => {
                 // range(start: Int32, end: Int32) => Iterator<Int32>
                 // Eagerly create a flat i32 LinArray so the `for` loop can use
@@ -2924,6 +2965,49 @@ impl<'ctx> Codegen<'ctx> {
                 };
                 self.builder.build_call(f, &[obj_ptr.into()], "keys")
                     .unwrap().try_as_basic_value().unwrap_basic()
+            }
+
+            "lin_object_set" => {
+                // lin_object_set(obj: Object, key: String, val: Json) => Null
+                // Unbox obj to LinObject*, unbox key to LinString*, box val to TaggedVal*, call rt.
+                let obj_raw = self.compile_expr(&args[0], fn_ctx);
+                let key_raw = self.compile_expr(&args[1], fn_ctx);
+                let val_raw = self.compile_expr(&args[2], fn_ctx);
+                let val_ty = args[2].ty();
+
+                let obj_ptr = if obj_raw.is_pointer_value() {
+                    obj_raw.into_pointer_value()
+                } else {
+                    self.builder.build_call(self.rt_unbox_ptr, &[obj_raw.into()], "oset_obj")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value()
+                };
+                let key_ptr = if key_raw.is_pointer_value() {
+                    key_raw.into_pointer_value()
+                } else {
+                    self.builder.build_call(self.rt_unbox_ptr, &[key_raw.into()], "oset_key")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value()
+                };
+                let val_tagged = if matches!(val_ty, Type::TypeVar(_) | Type::Union(_)) {
+                    val_raw.into_pointer_value()
+                } else {
+                    self.box_value(val_raw, &val_ty).into_pointer_value()
+                };
+                self.builder.build_call(self.rt_object_set, &[obj_ptr.into(), key_ptr.into(), val_tagged.into()], "").unwrap();
+                null_val()
+            }
+
+            "lin_exit" => {
+                // exit(code: Int32) — terminate the process
+                let code = self.compile_expr(&args[0], fn_ctx);
+                let exit_fn = self.module.get_function("exit").unwrap_or_else(|| {
+                    self.module.add_function(
+                        "exit",
+                        self.context.void_type().fn_type(&[self.context.i32_type().into()], false),
+                        None,
+                    )
+                });
+                self.builder.build_call(exit_fn, &[code.into_int_value().into()], "").unwrap();
+                null_val()
             }
 
             // --- async/await/parallel/threadPool/worker ---

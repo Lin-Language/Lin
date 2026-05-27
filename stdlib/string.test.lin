@@ -1,0 +1,194 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { toString, trim, trimStart, trimEnd, toUpper, toLower, substring, indexOf, lastIndexOf, isBlank, contains, startsWith, endsWith, split, join, replace, replaceAll, repeat, at, lines, codePointAt, fromCodePoints, padStart, padEnd } from "std/string"
+
+val s = suite("std/string", [
+  test("toString of int", () =>
+    expect(toString(42)).toBe("42")
+  ),
+
+  test("toString of null", () =>
+    expect(toString(null)).toBe("null")
+  ),
+
+  test("toString of bool", () =>
+    expect(toString(true)).toBe("true")
+  ),
+
+  test("trim removes whitespace", () =>
+    expect("  hello  ".trim()).toBe("hello")
+  ),
+
+  test("trimStart removes leading whitespace", () =>
+    expect("  hello  ".trimStart()).toBe("hello  ")
+  ),
+
+  test("trimStart leaves trailing whitespace unchanged", () =>
+    expect("hello  ".trimStart()).toBe("hello  ")
+  ),
+
+  test("trimEnd removes trailing whitespace", () =>
+    expect("  hello  ".trimEnd()).toBe("  hello")
+  ),
+
+  test("trimEnd leaves leading whitespace unchanged", () =>
+    expect("  hello".trimEnd()).toBe("  hello")
+  ),
+
+  test("toUpper converts to uppercase", () =>
+    expect("hello".toUpper()).toBe("HELLO")
+  ),
+
+  test("toLower converts to lowercase", () =>
+    expect("HELLO".toLower()).toBe("hello")
+  ),
+
+  test("substring extracts slice", () =>
+    expect("hello world".substring(6, 11)).toBe("world")
+  ),
+
+  test("indexOf finds needle position", () =>
+    expect("hello world".indexOf("world")).toBe(6)
+  ),
+
+  test("indexOf returns -1 when not found", () =>
+    expect("hello".indexOf("xyz")).toBe(-1)
+  ),
+
+  test("lastIndexOf finds last occurrence", () =>
+    expect("hello".lastIndexOf("l")).toBe(3)
+  ),
+
+  test("lastIndexOf returns -1 when not found", () =>
+    expect("hello".lastIndexOf("x")).toBe(-1)
+  ),
+
+  test("isBlank returns true for empty string", () =>
+    expect(isBlank("")).toBe(true)
+  ),
+
+  test("isBlank returns true for whitespace-only string", () =>
+    expect(isBlank("  ")).toBe(true)
+  ),
+
+  test("isBlank returns false for non-blank string", () =>
+    expect(isBlank("hi")).toBe(false)
+  ),
+
+  test("contains returns true when present", () =>
+    expect("hello world".contains("world")).toBe(true)
+  ),
+
+  test("contains returns false when absent", () =>
+    expect("hello".contains("xyz")).toBe(false)
+  ),
+
+  test("startsWith matches prefix", () =>
+    expect("hello world".startsWith("hello")).toBe(true)
+  ),
+
+  test("startsWith false for non-prefix", () =>
+    expect("hello world".startsWith("world")).toBe(false)
+  ),
+
+  test("endsWith matches suffix", () =>
+    expect("hello world".endsWith("world")).toBe(true)
+  ),
+
+  test("endsWith false for non-suffix", () =>
+    expect("hello world".endsWith("hello")).toBe(false)
+  ),
+
+  test("split splits on delimiter", () =>
+    val parts = "a,b,c".split(",")
+    expect(parts[0]).toBe("a")
+  ),
+
+  test("join joins with separator", () =>
+    val result = ["a", "b", "c"].join("-")
+    expect(result).toBe("a-b-c")
+  ),
+
+  test("replace substitutes first match", () =>
+    expect("foo bar foo".replace("foo", "baz")).toBe("baz bar foo")
+  ),
+
+  test("replaceAll replaces all occurrences", () =>
+    expect("aaa".replaceAll("a", "b")).toBe("bbb")
+  ),
+
+  test("replaceAll replaces multiple non-adjacent occurrences", () =>
+    expect("hello world".replaceAll("o", "0")).toBe("hell0 w0rld")
+  ),
+
+  test("replaceAll returns original string when pattern not found", () =>
+    expect("hello".replaceAll("x", "y")).toBe("hello")
+  ),
+
+  test("replaceAll returns original string when pattern is empty", () =>
+    expect("hello".replaceAll("", "x")).toBe("hello")
+  ),
+
+  test("repeat repeats string", () =>
+    expect("ab".repeat(3)).toBe("ababab")
+  ),
+
+  test("at returns character at index", () =>
+    expect("hello".at(1)).toBe("e")
+  ),
+
+  test("at supports negative index", () =>
+    expect("hello".at(-1)).toBe("o")
+  ),
+
+  test("lines splits on newline", () =>
+    val parts = lines("a\nb\nc")
+    expect(parts[0]).toBe("a")
+  ),
+
+  test("lines returns single line when no newline", () =>
+    val parts = lines("hello")
+    expect(parts[0]).toBe("hello")
+  ),
+
+  test("codePointAt returns code point", () =>
+    expect(codePointAt("A", 0)).toBe(65)
+  ),
+
+  test("codePointAt returns -1 for out of bounds", () =>
+    expect(codePointAt("A", 5)).toBe(-1)
+  ),
+
+  test("fromCodePoints builds string from code points", () =>
+    expect(fromCodePoints([72, 101, 108, 108, 111])).toBe("Hello")
+  ),
+
+  test("fromCodePoints returns empty string for empty array", () =>
+    expect(fromCodePoints([])).toBe("")
+  ),
+
+  test("padStart pads left with character", () =>
+    expect("5".padStart(3, "0")).toBe("005")
+  ),
+
+  test("padStart returns string unchanged when already wide enough", () =>
+    expect("hello".padStart(3, "0")).toBe("hello")
+  ),
+
+  test("padStart handles multi-char pad with truncation", () =>
+    expect("x".padStart(5, "ab")).toBe("abab" + "x")
+  ),
+
+  test("padEnd pads right with character", () =>
+    expect("hi".padEnd(5, ".")).toBe("hi...")
+  ),
+
+  test("padEnd returns string unchanged when already wide enough", () =>
+    expect("hello".padEnd(3, ".")).toBe("hello")
+  ),
+
+  test("padEnd handles multi-char pad with truncation", () =>
+    expect("ab".padEnd(5, "xy")).toBe("abxyx")
+  ),
+])
+
+run(s)

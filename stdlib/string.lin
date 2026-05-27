@@ -1,21 +1,27 @@
 import foreign "lin-runtime"
   val lin_string_trim: (String) => String
+  val lin_string_trim_start: (String) => String
+  val lin_string_trim_end: (String) => String
   val lin_string_to_upper: (String) => String
   val lin_string_to_lower: (String) => String
   val lin_string_length: (String) => Int32
   val lin_string_slice: (String, Int32, Int32) => String
   val lin_string_index_of: (String, String) => Int32
-  val lin_string_contains: (String, String) => Boolean
-  val lin_string_starts_with: (String, String) => Boolean
-  val lin_string_ends_with: (String, String) => Boolean
   val lin_string_split: (String, String) => String[]
-  val lin_string_join: (String[], String) => String
-  val lin_string_replace: (String, String, String) => String
   val lin_string_repeat: (String, Int32) => String
   val lin_string_char_at: (String, Int32) => String
+  val lin_string_char_code: (String, Int32) => Int32
+  val lin_string_from_char_code: (Int32) => String
+  val lin_string_last_index_of: (String, String) => Int32
 
 export val trim = (s: String): String =>
   lin_string_trim(s)
+
+export val trimStart = (s: String): String =>
+  lin_string_trim_start(s)
+
+export val trimEnd = (s: String): String =>
+  lin_string_trim_end(s)
 
 export val toUpper = (s: String): String =>
   lin_string_to_upper(s)
@@ -26,26 +32,79 @@ export val toLower = (s: String): String =>
 export val substring = (s: String, start: Int32, end: Int32): String =>
   lin_string_slice(s, start, end)
 
+val _length = (s: String): Int32 =>
+  lin_string_length(s)
+
+val _substring = (s: String, start: Int32, end: Int32): String =>
+  lin_string_slice(s, start, end)
+
 export val indexOf = (s: String, needle: String): Int32 =>
   lin_string_index_of(s, needle)
 
+export val lastIndexOf = (s: String, needle: String): Int32 =>
+  lin_string_last_index_of(s, needle)
+
+export val isBlank = (s: String): Boolean =>
+  lin_string_trim(s) == ""
+
 export val contains = (s: String, needle: String): Boolean =>
-  lin_string_contains(s, needle)
+  lin_string_index_of(s, needle) != -1
 
 export val startsWith = (s: String, prefix: String): Boolean =>
-  lin_string_starts_with(s, prefix)
+  _substring(s, 0, _length(prefix)) == prefix
 
 export val endsWith = (s: String, suffix: String): Boolean =>
-  lin_string_ends_with(s, suffix)
+  val sl = _length(s)
+  val pl = _length(suffix)
+  if pl > sl
+    then false
+    else _substring(s, sl - pl, sl) == suffix
 
 export val split = (s: String, delimiter: String): String[] =>
   lin_string_split(s, delimiter)
 
 export val join = (arr: String[], separator: String): String =>
-  lin_string_join(arr, separator)
+  val n = lin_length(arr)
+  if n == 0
+    then ""
+    else
+      var result = arr[0]
+      var i = 1
+      lin_for(lin_range(1, n), _ =>
+        result = "${result}${separator}${arr[i]}"
+        i = i + 1
+      )
+      result
 
 export val replace = (s: String, pattern: String, replacement: String): String =>
-  lin_string_replace(s, pattern, replacement)
+  val idx = lin_string_index_of(s, pattern)
+  if idx == -1
+    then s
+    else
+      val before = _substring(s, 0, idx)
+      val after = _substring(s, idx + _length(pattern), _length(s))
+      "${before}${replacement}${after}"
+
+export val replaceAll = (s: String, pattern: String, replacement: String): String =>
+  val patLen = _length(pattern)
+  if patLen == 0
+    then s
+    else
+      var result = ""
+      var remaining = s
+      var idx = lin_string_index_of(remaining, pattern)
+      var done = idx == -1
+      lin_for(lin_range(0, _length(s)), _ =>
+        var proceed = done == false
+        val before = if proceed then _substring(remaining, 0, idx) else ""
+        val newRemaining = if proceed then _substring(remaining, idx + patLen, _length(remaining)) else remaining
+        val newIdx = if proceed then lin_string_index_of(newRemaining, pattern) else -1
+        result = if proceed then "${result}${before}${replacement}" else result
+        remaining = newRemaining
+        idx = newIdx
+        done = if proceed then newIdx == -1 else done
+      )
+      "${result}${remaining}"
 
 export val repeat = (s: String, count: Int32): String =>
   lin_string_repeat(s, count)
@@ -53,6 +112,46 @@ export val repeat = (s: String, count: Int32): String =>
 export val at = (s: String, index: Int32): String =>
   val i = if index < 0 then lin_string_length(s) + index else index
   lin_string_char_at(s, i)
+
+export val charCode = (s: String, index: Int32): Int32 =>
+  lin_string_char_code(s, index)
+
+export val fromCharCode = (code: Int32): String =>
+  lin_string_from_char_code(code)
+
+export val lines = (s: String): String[] =>
+  lin_string_split(s, "\n")
+
+export val codePointAt = (s: String, index: Int32): Int32 =>
+  lin_string_char_code(s, index)
+
+export val fromCodePoints = (codes: Int32[]): String =>
+  var result = ""
+  lin_for(codes, code =>
+    val ch = lin_string_from_char_code(code)
+    result = "${result}${ch}"
+  )
+  result
+
+export val padStart = (s: String, width: Int32, pad: String): String =>
+  val len = _length(s)
+  if len >= width
+    then s
+    else
+      val needed = width - len
+      val padLen = _length(pad)
+      val padded = lin_string_repeat(pad, (needed / padLen) + 1)
+      "${_substring(padded, 0, needed)}${s}"
+
+export val padEnd = (s: String, width: Int32, pad: String): String =>
+  val len = _length(s)
+  if len >= width
+    then s
+    else
+      val needed = width - len
+      val padLen = _length(pad)
+      val padded = lin_string_repeat(pad, (needed / padLen) + 1)
+      "${s}${_substring(padded, 0, needed)}"
 
 export val toString = (x: Json): String =>
   lin_to_string(x)

@@ -1,0 +1,46 @@
+import { expect, toBe, toBeNull, toSatisfy, toSucceed, toFail, toFailWith, test, suite, run } from "std/test"
+import { toString } from "std/string"
+
+val s = suite("std/test", [
+  test("toBe passes when equal", () =>
+    expect(42).toBe(42)
+  ),
+
+  test("toBe passes for strings", () =>
+    expect("hello").toBe("hello")
+  ),
+
+  test("toBe passes for booleans", () =>
+    expect(true).toBe(true)
+  ),
+
+  test("toBeNull passes for null", () =>
+    expect(null).toBeNull()
+  ),
+
+  test("toSatisfy passes when predicate holds", () =>
+    expect(10).toSatisfy(x => x > 5)
+  ),
+
+  test("toSucceed passes for success tagged value", () =>
+    expect({ "type": "success", "value": 1 }).toSucceed()
+  ),
+
+  test("toFail passes for failure tagged value", () =>
+    expect({ "type": "failure", "error": "oops" }).toFail()
+  ),
+
+  test("toFailWith passes when error message matches", () =>
+    expect({ "type": "failure", "error": "oops" }).toFailWith("oops")
+  ),
+
+  test("multiple assertions in one test via array", () =>
+    [
+      expect(1).toBe(1),
+      expect(2).toBe(2),
+      expect(3).toBe(3)
+    ]
+  ),
+])
+
+run(s)

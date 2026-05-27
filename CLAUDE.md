@@ -6,22 +6,20 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `lin-lang` is the reference implementation of **Lin**, a small expression-based language built around strict JSON data, structural typing, first-argument function application (dot syntax), destructuring, pattern matching, opaque iterator/runtime types, and value-based error handling. The full language design is in `docs/SPECIFICATION.md`.
 
-The project has two backends:
+The project has one backend:
 
-- **`lin-eval`** — a tree-walking interpreter (`lin run`). The v0 backend; types are parsed and stored in the AST but not enforced at runtime (see ADR-001 in `docs/DECISIONS.md`).
 - **`lin-codegen`** — an LLVM native-code compiler (`lin build`). Goes through a full type-checking pass (`lin-check`), lowers to flat 3-address IR (`lin-ir`), then to LLVM IR via `inkwell`. Links with a small Rust static library (`lin-runtime`) to produce a standalone binary.
+
+Note: `lin-eval` (the tree-walking interpreter) still exists in the workspace as a test harness but is no longer a supported `lin` subcommand.
 
 ## Build / run / test
 
 ```bash
 cargo build --workspace
 cargo test --workspace                          # runs all unit + integration tests
-cargo test -p lin-eval test_hello_world         # run a single test
-cargo run -p lin -- examples/hello.lin          # interpret a .lin program (lin run)
-cargo run -p lin -- run examples/hello.lin      # same, explicit subcommand
 cargo run -p lin -- build examples/hello.lin -o hello  # compile to native binary
 cargo run -p lin -- check examples/hello.lin    # type check only
-cargo run -p lin -- -                           # read source from stdin
+cargo run -p lin -- test stdlib/                # run stdlib test suite (*.test.lin)
 ```
 
 Environment variables for `lin build`:
@@ -42,8 +40,8 @@ Cargo workspace with ten crates (`crates/`):
 - **`lin-codegen`** — LLVM backend via `inkwell`. Compiles `TypedModule` directly to LLVM IR today; `lin-ir` is available as an optional pre-pass. Handles functions, closures, objects, arrays, strings, union tagged dispatch, pattern matching, TCO, and unboxed scalar arrays.
 - **`lin-runtime`** — small static library linked into every compiled binary. Provides refcounted strings/arrays/objects, intrinsics (`lin_print`, `lin_string_concat`, etc.), and flat scalar array variants (`lin_flat_array_alloc_i32`, etc.).
 - **`lin-compile`** — orchestrates the full compilation pipeline: source → lex → parse → type check → codegen → link. Includes a module cache (`.lin-cache/<sha256>.typed`) and module signature files (`.lin-cache/<sha256>.sig`) to skip re-checking unchanged imports.
-- **`lin-eval`** — tree-walking interpreter (the `lin run` backend). Owns `Value`, `Env`, `Interpreter`.
-- **`lin`** — CLI binary. Dispatches `run`, `build`, `check` subcommands.
+- **`lin-eval`** — tree-walking interpreter (legacy; no longer a CLI subcommand). Owns `Value`, `Env`, `Interpreter`. Used as a test harness only.
+- **`lin`** — CLI binary. Dispatches `build`, `check`, `test` subcommands.
 - **`lin-lsp`** — language server (in progress).
 
 Stdlib lives in `stdlib/*.lin` and is loaded via `include_str!` in both `lin-eval` and `lin-compile`. Current stdlib modules: `std/io`, `std/string`, `std/number`, `std/array`, `std/iter`, `std/object`, `std/async`, `std/fs`, `std/http`, `std/server`, `std/template`, `std/test`.
@@ -112,7 +110,7 @@ There is no desugaring pass — the interpreter consumes the surface AST directl
 
 ## Adding a stdlib function
 
-Make sure it is included in the `docs/STDLIB.md` documentation.
+Make sure it is included in the `docs/STDLIB.md` documentation. Add a test case to the colocated `stdlib/<module>.test.lin` file.
 
 ## Where things live by topic
 

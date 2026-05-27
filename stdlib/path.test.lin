@@ -1,0 +1,100 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { basename, dirname, extname, stem, isAbsolute, normalize, join, split } from "std/path"
+
+val s = suite("std/path", [
+  test("basename returns filename from absolute path", () =>
+    expect(basename("/foo/bar.txt")).toBe("bar.txt")
+  ),
+
+  test("basename returns filename from relative path", () =>
+    expect(basename("a/b/c.lin")).toBe("c.lin")
+  ),
+
+  test("basename returns name when no directory component", () =>
+    expect(basename("file.txt")).toBe("file.txt")
+  ),
+
+  test("dirname returns parent directory of absolute path", () =>
+    expect(dirname("/foo/bar.txt")).toBe("/foo")
+  ),
+
+  test("dirname returns parent directory of nested path", () =>
+    expect(dirname("a/b/c")).toBe("a/b")
+  ),
+
+  test("dirname returns dot for bare filename", () =>
+    expect(dirname("file.txt")).toBe(".")
+  ),
+
+  test("extname returns extension with dot", () =>
+    expect(extname("file.txt")).toBe(".txt")
+  ),
+
+  test("extname returns extension for dotfile", () =>
+    expect(extname("archive.tar.gz")).toBe(".gz")
+  ),
+
+  test("extname returns empty string when no extension", () =>
+    expect(extname("Makefile")).toBe("")
+  ),
+
+  test("stem returns filename without extension", () =>
+    expect(stem("file.txt")).toBe("file")
+  ),
+
+  test("stem returns full name when no extension", () =>
+    expect(stem("Makefile")).toBe("Makefile")
+  ),
+
+  test("isAbsolute returns true for absolute path", () =>
+    expect(isAbsolute("/foo/bar")).toBe(true)
+  ),
+
+  test("isAbsolute returns false for relative path", () =>
+    expect(isAbsolute("foo/bar")).toBe(false)
+  ),
+
+  test("isAbsolute returns false for bare filename", () =>
+    expect(isAbsolute("file.txt")).toBe(false)
+  ),
+
+  test("normalize resolves double dot", () =>
+    expect(normalize("/foo/../bar")).toBe("/bar")
+  ),
+
+  test("normalize resolves single dot", () =>
+    expect(normalize("/foo/./bar")).toBe("/foo/bar")
+  ),
+
+  test("normalize collapses double slashes", () =>
+    expect(normalize("a//b")).toBe("a/b")
+  ),
+
+  test("normalize returns dot for empty relative result", () =>
+    expect(normalize("a/..")).toBe(".")
+  ),
+
+  test("join joins array of path segments", () =>
+    expect(join(["a", "b", "c"])).toBe("a/b/c")
+  ),
+
+  test("join returns empty string for empty array", () =>
+    expect(join([])).toBe("")
+  ),
+
+  test("join handles single segment", () =>
+    expect(join(["foo"])).toBe("foo")
+  ),
+
+  test("split splits path on slash", () =>
+    val parts = split("a/b/c")
+    expect(parts[1]).toBe("b")
+  ),
+
+  test("split returns array with one element for bare name", () =>
+    val parts = split("file.txt")
+    expect(parts[0]).toBe("file.txt")
+  ),
+])
+
+run(s)

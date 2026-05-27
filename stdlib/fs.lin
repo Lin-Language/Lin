@@ -6,6 +6,14 @@ import foreign "lin-runtime"
   val lin_fs_read_json: (String) => Json
   val lin_fs_write_json: (String, Json) => Json
   val lin_fs_exists: (String) => Boolean
+  val lin_fs_is_file: (String) => Boolean
+  val lin_fs_is_dir: (String) => Boolean
+  val lin_fs_stat: (String) => Json
+  val lin_fs_list_dir: (String) => Json
+  val lin_fs_mkdir: (String) => Json
+  val lin_fs_mkdir_all: (String) => Json
+  val lin_fs_delete_file: (String) => Json
+  val lin_fs_rename: (String, String) => Json
 
 export val readFile = (path: String): Json =>
   lin_fs_read_file(path)
@@ -27,3 +35,27 @@ export val writeJson = (path: String, value: Json): Json =>
 
 export val exists = (path: String): Boolean =>
   lin_fs_exists(path)
+
+export val isFile = (path: String): Boolean =>
+  lin_fs_is_file(path)
+
+export val isDir = (path: String): Boolean =>
+  lin_fs_is_dir(path)
+
+export val stat = (path: String): Json =>
+  lin_fs_stat(path)
+
+export val listDir = (path: String): Json =>
+  lin_fs_list_dir(path)
+
+export val mkdir = (path: String): Json =>
+  lin_fs_mkdir(path)
+
+export val mkdirAll = (path: String): Json =>
+  lin_fs_mkdir_all(path)
+
+export val deleteFile = (path: String): Json =>
+  lin_fs_delete_file(path)
+
+export val rename = (src: String, dest: String): Json =>
+  lin_fs_rename(src, dest)

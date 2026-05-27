@@ -1729,12 +1729,34 @@ impl Checker {
             },
         );
 
+        // set: (T[], Int32, T) => Null — in-place array element mutation
+        self.define_intrinsic(
+            "lin_array_set",
+            Type::Function {
+                params: vec![
+                    Type::Array(Box::new(Type::TypeVar(9200))),
+                    Type::Int32,
+                    Type::TypeVar(9200),
+                ],
+                ret: Box::new(Type::Null),
+            },
+        );
+
         // keys: (Object) => String[]
         self.define_intrinsic(
             "lin_keys",
             Type::Function {
                 params: vec![Type::Object(IndexMap::new())],
                 ret: Box::new(Type::Array(Box::new(Type::Str))),
+            },
+        );
+
+        // lin_object_set: (Object, String, Json) => Null — in-place object key mutation
+        self.define_intrinsic(
+            "lin_object_set",
+            Type::Function {
+                params: vec![Type::Object(IndexMap::new()), Type::Str, Type::TypeVar(u32::MAX)],
+                ret: Box::new(Type::Null),
             },
         );
 
@@ -1915,6 +1937,12 @@ impl Checker {
         // worker.close(): (Worker) => Null
         self.define_intrinsic("lin_close", Type::Function {
             params: vec![Type::TypeVar(9109)],
+            ret: Box::new(Type::Null),
+        });
+
+        // exit: (Int32) => Null — terminates the process with a status code
+        self.define_intrinsic("lin_exit", Type::Function {
+            params: vec![Type::Int32],
             ret: Box::new(Type::Null),
         });
     }

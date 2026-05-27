@@ -1,0 +1,142 @@
+import { expect, toBe, toSucceed, toFail, test, suite, run } from "std/test"
+import { toString } from "std/string"
+import { length } from "std/array"
+import { readFile, writeFile, appendFile, readLines, readJson, writeJson, exists, isFile, isDir, stat, listDir, mkdir, mkdirAll, deleteFile, rename } from "std/fs"
+
+val tmpRead   = "/tmp/lin_test_fs_read.txt"
+val tmpAppend = "/tmp/lin_test_fs_append.txt"
+val tmpJson   = "/tmp/lin_test_fs_json.json"
+val tmpStat   = "/tmp/lin_test_fs_stat.txt"
+val tmpDir    = "/tmp/lin_test_fs_dir"
+val tmpRename = "/tmp/lin_test_fs_rename_src.txt"
+val tmpRenameDst = "/tmp/lin_test_fs_rename_dst.txt"
+
+val s = suite("std/fs", [
+  test("writeFile then readFile round-trips", () =>
+    writeFile(tmpRead, "hello lin")
+    val content = readFile(tmpRead)
+    expect(content).toBe("hello lin")
+  ),
+
+  test("readFile missing path returns error", () =>
+    val result = readFile("/nonexistent/path/does/not/exist.txt")
+    expect(result["type"]).toBe("error")
+  ),
+
+  test("exists false before write, true after", () =>
+    val before = exists(tmpRead)
+    writeFile(tmpRead, "x")
+    val after = exists(tmpRead)
+    [
+      expect(before).toBe(false),
+      expect(after).toBe(true)
+    ]
+  ),
+
+  test("appendFile accumulates content", () =>
+    writeFile(tmpAppend, "line1\n")
+    appendFile(tmpAppend, "line2\n")
+    val content = readFile(tmpAppend)
+    expect(content).toBe("line1\nline2\n")
+  ),
+
+  test("readLines splits on newlines", () =>
+    writeFile(tmpRead, "alpha\nbeta\ngamma")
+    val lines = readLines(tmpRead)
+    expect(length(lines)).toBe(3)
+  ),
+
+  test("writeJson then readJson round-trips", () =>
+    val data = { "name": "lin", "version": 1 }
+    writeJson(tmpJson, data)
+    val loaded = readJson(tmpJson)
+    expect(loaded["name"]).toBe("lin")
+  ),
+
+  test("isFile false before write, true after", () =>
+    val before = isFile(tmpRead)
+    writeFile(tmpRead, "hello")
+    val after = isFile(tmpRead)
+    [
+      expect(before).toBe(false),
+      expect(after).toBe(true)
+    ]
+  ),
+
+  test("isDir returns true for temp dir, false for file", () =>
+    writeFile(tmpRead, "x")
+    [
+      expect(isDir("/tmp")).toBe(true),
+      expect(isDir(tmpRead)).toBe(false)
+    ]
+  ),
+
+  test("stat returns metadata for existing file", () =>
+    writeFile(tmpStat, "hello lin")
+    val s = stat(tmpStat)
+    [
+      expect(s["size"]).toBe(9),
+      expect(s["isFile"]).toBe(true),
+      expect(s["isDir"]).toBe(false)
+    ]
+  ),
+
+  test("stat returns error for missing path", () =>
+    val s = stat("/nonexistent/path/that/does/not/exist.txt")
+    expect(s["type"]).toBe("error")
+  ),
+
+  test("mkdir creates directory", () =>
+    val mkdirPath = "/tmp/lin_test_fs_mkdir_once"
+    val r = mkdir(mkdirPath)
+    expect(isDir(mkdirPath)).toBe(true)
+  ),
+
+  test("mkdirAll creates nested directories", () =>
+    val nested = "/tmp/lin_test_fs_mkdirall/a/b"
+    mkdirAll(nested)
+    expect(isDir(nested)).toBe(true)
+  ),
+
+  test("listDir returns entries in a directory", () =>
+    val listTmpDir = "/tmp/lin_test_fs_listdir"
+    mkdirAll(listTmpDir)
+    writeFile("/tmp/lin_test_fs_listdir/x.txt", "x")
+    writeFile("/tmp/lin_test_fs_listdir/y.txt", "y")
+    val entries = listDir(listTmpDir)
+    expect(length(entries)).toBe(2)
+  ),
+
+  test("listDir returns error for missing directory", () =>
+    val result = listDir("/nonexistent/path/that/does/not/exist")
+    expect(result["type"]).toBe("error")
+  ),
+
+  test("deleteFile removes a file", () =>
+    writeFile(tmpRename, "to delete")
+    val before = exists(tmpRename)
+    deleteFile(tmpRename)
+    val after = exists(tmpRename)
+    [
+      expect(before).toBe(true),
+      expect(after).toBe(false)
+    ]
+  ),
+
+  test("deleteFile returns error for missing file", () =>
+    val result = deleteFile("/nonexistent/path/that/does/not/exist.txt")
+    expect(result["type"]).toBe("error")
+  ),
+
+  test("rename moves a file", () =>
+    writeFile(tmpRename, "hello rename")
+    rename(tmpRename, tmpRenameDst)
+    [
+      expect(exists(tmpRename)).toBe(false),
+      expect(exists(tmpRenameDst)).toBe(true),
+      expect(readFile(tmpRenameDst)).toBe("hello rename")
+    ]
+  ),
+])
+
+run(s)

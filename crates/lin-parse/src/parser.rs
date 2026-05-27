@@ -936,20 +936,24 @@ impl Parser {
             self.parse_expr()
         };
 
-        // else branch
+        // else branch (optional — implicit `else null` widens result to T | Null)
         self.skip_newlines();
         if self.check(TokenKind::Dedent) && !then_indented {
             self.advance();
         }
         self.skip_newlines();
-        self.expect_with_help(TokenKind::Else, "if expressions must have an else branch — Lin has no unit/void type");
-        self.skip_newlines();
-        let else_branch = if self.check(TokenKind::Indent) {
-            self.parse_block()
-        } else if self.check(TokenKind::If) {
-            self.parse_if_expr()
+        let else_branch = if self.check(TokenKind::Else) {
+            self.advance();
+            self.skip_newlines();
+            if self.check(TokenKind::Indent) {
+                self.parse_block()
+            } else if self.check(TokenKind::If) {
+                self.parse_if_expr()
+            } else {
+                self.parse_expr()
+            }
         } else {
-            self.parse_expr()
+            Expr::NullLit(span)
         };
 
         // Consume trailing dedent if we consumed a leading indent
@@ -1396,18 +1400,6 @@ impl Parser {
         }
     }
 
-    fn expect_with_help(&mut self, kind: TokenKind, help: &str) {
-        if self.check(kind.clone()) {
-            self.advance();
-        } else {
-            let span = self.current_span();
-            let got = self.peek_kind();
-            self.diagnostics.push(
-                Diagnostic::error(span, format!("expected {:?}, got {:?}", kind, got))
-                    .with_help(help)
-            );
-        }
-    }
 
     fn expect_keyword(&mut self, kind: TokenKind) {
         self.expect(kind);

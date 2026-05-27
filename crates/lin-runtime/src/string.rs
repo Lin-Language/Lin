@@ -133,6 +133,30 @@ pub unsafe extern "C" fn lin_string_char_at(s: *const LinString, index: i32) -> 
     ptr
 }
 
+/// Return the Unicode code point at char index `index`. Returns -1 if OOB or negative index.
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_char_code(s: *const LinString, index: i32) -> i32 {
+    if index < 0 { return -1; }
+    let st = (*s).as_str();
+    st.chars().nth(index as usize).map(|c| c as i32).unwrap_or(-1)
+}
+
+/// Create a single-character string from a Unicode code point. Returns "" for invalid code points.
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_from_char_code(code: i32) -> *mut LinString {
+    if code < 0 {
+        return lin_string_from_bytes(b"".as_ptr(), 0);
+    }
+    match char::from_u32(code as u32) {
+        None => lin_string_from_bytes(b"".as_ptr(), 0),
+        Some(c) => {
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            lin_string_from_bytes(s.as_ptr(), s.len() as u32)
+        }
+    }
+}
+
 /// Lexicographic comparison. Returns -1, 0, or 1.
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_cmp(a: *const LinString, b: *const LinString) -> i32 {
@@ -184,6 +208,20 @@ pub unsafe extern "C" fn lin_string_trim(s: *const LinString) -> *mut LinString 
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn lin_string_trim_start(s: *const LinString) -> *mut LinString {
+    let st = (*s).as_str();
+    let trimmed = st.trim_start();
+    lin_string_from_bytes(trimmed.as_ptr(), trimmed.len() as u32)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_trim_end(s: *const LinString) -> *mut LinString {
+    let st = (*s).as_str();
+    let trimmed = st.trim_end();
+    lin_string_from_bytes(trimmed.as_ptr(), trimmed.len() as u32)
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn lin_string_to_upper(s: *const LinString) -> *mut LinString {
     let st = (*s).as_str();
     let upper = st.to_uppercase();
@@ -203,6 +241,16 @@ pub unsafe extern "C" fn lin_string_index_of(s: *const LinString, needle: *const
     let nd = (*needle).as_str();
     match st.find(nd) {
         Some(i) => i as i32,
+        None => -1,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_last_index_of(s: *const LinString, needle: *const LinString) -> i32 {
+    let st = (*s).as_str();
+    let nd = (*needle).as_str();
+    match st.rfind(nd) {
+        Some(byte_pos) => st[..byte_pos].chars().count() as i32,
         None => -1,
     }
 }

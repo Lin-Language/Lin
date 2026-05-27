@@ -1,0 +1,161 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { toString } from "std/string"
+import { keys, values, entries, fromEntries, merge, pick, omit, mapValues, isEmpty } from "std/object"
+import { length } from "std/array"
+
+val s = suite("std/object", [
+  test("keys returns object keys", () =>
+    val k = keys({ "a": 1, "b": 2 })
+    expect(length(k)).toBe(2)
+  ),
+
+  test("keys order is insertion order", () =>
+    val k = keys({ "x": 1, "y": 2 })
+    expect(k[0]).toBe("x")
+  ),
+
+  test("values returns object values", () =>
+    val obj = { "a": 10, "b": 20 }
+    val v = values(obj)
+    expect(length(v)).toBe(2)
+  ),
+
+  test("entries returns key-value pairs", () =>
+    val obj = { "a": 1 }
+    val e = entries(obj)
+    expect(e[0][0]).toBe("a")
+  ),
+
+  test("missing key returns null", () =>
+    val obj = { "a": 1 }
+    expect(obj["missing"]).toBe(null)
+  ),
+
+  test("spread merges objects", () =>
+    val a = { "x": 1 }
+    val b = { ...a, "y": 2 }
+    expect(b["x"]).toBe(1)
+  ),
+
+  test("spread override takes last value", () =>
+    val a = { "x": 1 }
+    val b = { ...a, "x": 99 }
+    expect(b["x"]).toBe(99)
+  ),
+
+  test("fromEntries builds object from pairs", () =>
+    val obj = fromEntries([["a", 1], ["b", 2]])
+    expect(obj["a"]).toBe(1)
+  ),
+
+  test("fromEntries second value is correct", () =>
+    val obj = fromEntries([["a", 1], ["b", 2]])
+    expect(obj["b"]).toBe(2)
+  ),
+
+  test("fromEntries empty array produces empty object", () =>
+    val obj = fromEntries([])
+    expect(length(keys(obj))).toBe(0)
+  ),
+
+  test("merge combines two objects", () =>
+    val merged = merge({ "a": 1, "b": 2 }, { "c": 3 })
+    expect(merged["a"]).toBe(1)
+  ),
+
+  test("merge right wins on conflict", () =>
+    val merged = merge({ "a": 1, "b": 2 }, { "b": 3, "c": 4 })
+    expect(merged["b"]).toBe(3)
+  ),
+
+  test("merge includes all keys", () =>
+    val merged = merge({ "a": 1 }, { "b": 2 })
+    expect(length(keys(merged))).toBe(2)
+  ),
+
+  test("pick returns only specified keys", () =>
+    val obj = { "a": 1, "b": 2, "c": 3 }
+    val p = pick(obj, ["a", "c"])
+    expect(length(keys(p))).toBe(2)
+  ),
+
+  test("pick includes correct values", () =>
+    val obj = { "a": 1, "b": 2, "c": 3 }
+    val p = pick(obj, ["a", "c"])
+    expect(p["a"]).toBe(1)
+  ),
+
+  test("pick second included value is correct", () =>
+    val obj = { "a": 1, "b": 2, "c": 3 }
+    val p = pick(obj, ["a", "c"])
+    expect(p["c"]).toBe(3)
+  ),
+
+  test("pick excludes unspecified keys", () =>
+    val obj = { "a": 1, "b": 2, "c": 3 }
+    val p = pick(obj, ["a", "c"])
+    expect(p["b"]).toBe(null)
+  ),
+
+  test("omit returns object without specified keys", () =>
+    val obj = { "a": 1, "b": 2, "c": 3 }
+    val o = omit(obj, ["b"])
+    expect(length(keys(o))).toBe(2)
+  ),
+
+  test("omit excluded key is absent", () =>
+    val obj = { "a": 1, "b": 2, "c": 3 }
+    val o = omit(obj, ["b"])
+    expect(o["b"]).toBe(null)
+  ),
+
+  test("omit keeps remaining keys", () =>
+    val obj = { "a": 1, "b": 2, "c": 3 }
+    val o = omit(obj, ["b"])
+    expect(o["a"]).toBe(1)
+  ),
+
+  test("mapValues transforms all values", () =>
+    val obj = { "a": 1, "b": 2 }
+    val m = mapValues(obj, x => x * 2)
+    expect(m["a"]).toBe(2)
+  ),
+
+  test("mapValues second value is transformed", () =>
+    val obj = { "a": 1, "b": 2 }
+    val m = mapValues(obj, x => x * 2)
+    expect(m["b"]).toBe(4)
+  ),
+
+  test("mapValues preserves all keys", () =>
+    val obj = { "a": 1, "b": 2 }
+    val m = mapValues(obj, x => x * 2)
+    expect(length(keys(m))).toBe(2)
+  ),
+
+  test("isEmpty returns true for empty object", () =>
+    expect(isEmpty({})).toBe(true)
+  ),
+
+  test("isEmpty returns true for empty array", () =>
+    expect(isEmpty([])).toBe(true)
+  ),
+
+  test("isEmpty returns true for empty string", () =>
+    expect(isEmpty("")).toBe(true)
+  ),
+
+  test("isEmpty returns false for non-empty object", () =>
+    expect(isEmpty({ "a": 1 })).toBe(false)
+  ),
+
+  test("isEmpty returns false for non-empty array", () =>
+    expect(isEmpty([1])).toBe(false)
+  ),
+
+  test("isEmpty returns false for non-empty string", () =>
+    expect(isEmpty("hi")).toBe(false)
+  ),
+])
+
+run(s)

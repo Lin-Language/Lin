@@ -227,6 +227,11 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/object"   => Some(include_str!("../../../stdlib/object.lin")),
         "std/template" => Some(include_str!("../../../stdlib/template.lin")),
         "std/async"    => Some(include_str!("../../../stdlib/async.lin")),
+        "std/env"      => Some(include_str!("../../../stdlib/env.lin")),
+        "std/test"     => Some(include_str!("../../../stdlib/test.lin")),
+        "std/time"     => Some(include_str!("../../../stdlib/time.lin")),
+        "std/path"     => Some(include_str!("../../../stdlib/path.lin")),
+        "std/math"     => Some(include_str!("../../../stdlib/math.lin")),
         _ => None,
     }
 }
@@ -313,7 +318,8 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String]) -> Result<
         }
     }
 
-    // Link system libraries needed by lin-runtime (libc via cc).
+    // Link system libraries needed by lin-runtime (libc via cc, libm for math).
+    cmd.arg("-lm");
     let status = cmd.status().map_err(|e| CompileError::Link(e.to_string()))?;
 
     if !status.success() {

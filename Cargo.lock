@@ -643,19 +643,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lin-eval"
-version = "0.1.0"
-dependencies = [
- "indexmap",
- "lin-common",
- "lin-lex",
- "lin-parse",
- "serde_json",
- "tiny_http",
- "ureq",
-]
-
-[[package]]
 name = "lin-ir"
 version = "0.1.0"
 dependencies = [

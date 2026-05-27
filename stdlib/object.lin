@@ -2,7 +2,55 @@ export val keys = (obj: Json): String[] =>
   lin_keys(obj)
 
 export val values = (obj: Json): Json =>
-  lin_map(lin_keys(obj), k => obj[k])
+  val ks = lin_keys(obj)
+  val result = []
+  lin_for(ks, k => lin_push(result, obj[k]))
+  result
 
 export val entries = (obj: Json): Json =>
-  lin_map(lin_keys(obj), k => [k, obj[k]])
+  val ks = lin_keys(obj)
+  val result = []
+  lin_for(ks, k => lin_push(result, [k, obj[k]]))
+  result
+
+export val fromEntries = (pairs: Json): Json =>
+  var result = {}
+  lin_for(pairs, pair =>
+    lin_object_set(result, pair[0], pair[1])
+  )
+  result
+
+export val merge = (a: Json, b: Json): Json =>
+  { ...a, ...b }
+
+export val pick = (obj: Json, ks: String[]): Json =>
+  var result = {}
+  lin_for(ks, k =>
+    if obj[k] != null
+      then lin_object_set(result, k, obj[k])
+  )
+  result
+
+export val omit = (obj: Json, ks: String[]): Json =>
+  val allKeys = lin_keys(obj)
+  var result = {}
+  lin_for(allKeys, k =>
+    var inOmitList = false
+    lin_for(ks, omitKey =>
+      if omitKey == k then inOmitList = true
+    )
+    if inOmitList == false
+      then lin_object_set(result, k, obj[k])
+  )
+  result
+
+export val mapValues = (obj: Json, f: (Json) => Json): Json =>
+  val ks = lin_keys(obj)
+  var result = {}
+  lin_for(ks, k =>
+    lin_object_set(result, k, f(obj[k]))
+  )
+  result
+
+export val isEmpty = (x: Json): Boolean =>
+  lin_length(x) == 0

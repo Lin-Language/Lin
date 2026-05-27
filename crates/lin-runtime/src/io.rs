@@ -60,6 +60,32 @@ pub unsafe extern "C" fn lin_print(s: *const LinString) {
 }
 
 #[no_mangle]
+pub unsafe extern "C" fn lin_io_print_err(s: *const LinString) {
+    let slice = std::slice::from_raw_parts((*s).data.as_ptr(), (*s).len as usize);
+    let string = std::str::from_utf8_unchecked(slice);
+    eprintln!("{}", string);
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_io_args() -> *mut u8 {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let arr = crate::array::lin_array_alloc(args.len().max(4) as u64);
+    for arg in &args {
+        let s = crate::string::lin_string_from_bytes(arg.as_ptr(), arg.len() as u32);
+        let mut tv: crate::tagged::TaggedVal = std::mem::zeroed();
+        tv.tag = crate::tagged::TAG_STR;
+        tv.payload = s as u64;
+        crate::array::lin_array_push_tagged(arr, &tv as *const crate::tagged::TaggedVal as *const u8);
+    }
+    arr as *mut u8
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_exit(code: i32) -> ! {
+    std::process::exit(code);
+}
+
+#[no_mangle]
 pub unsafe extern "C" fn lin_panic(msg: *const LinString, file_id: i32, offset: i32) {
     let slice = std::slice::from_raw_parts((*msg).data.as_ptr(), (*msg).len as usize);
     let string = std::str::from_utf8_unchecked(slice);

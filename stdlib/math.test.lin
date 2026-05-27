@@ -1,0 +1,187 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { PI, E, INFINITY, NAN, floor, ceil, round, trunc, sqrt, pow, exp, log, log2, log10, sin, cos, tan, asin, acos, atan, atan2, abs, min, max, clamp, sign, isNaN, isFinite, random, toFixed } from "std/math"
+
+val s = suite("std/math", [
+  test("PI is approximately 3.14159", () =>
+    expect(floor(PI * 100000.0) / 100000.0).toBe(3.14159)
+  ),
+
+  test("E is approximately 2.71828", () =>
+    expect(floor(E * 100000.0) / 100000.0).toBe(2.71828)
+  ),
+
+  test("INFINITY is positive infinity", () =>
+    expect(isFinite(INFINITY)).toBe(false)
+  ),
+
+  test("NAN is not a number", () =>
+    expect(isNaN(NAN)).toBe(true)
+  ),
+
+  test("floor rounds down", () =>
+    expect(floor(3.7)).toBe(3.0)
+  ),
+
+  test("floor rounds down negative", () =>
+    expect(floor(-3.2)).toBe(-4.0)
+  ),
+
+  test("ceil rounds up", () =>
+    expect(ceil(3.2)).toBe(4.0)
+  ),
+
+  test("ceil rounds up negative", () =>
+    expect(ceil(-3.7)).toBe(-3.0)
+  ),
+
+  test("round rounds to nearest", () =>
+    expect(round(3.5)).toBe(4.0)
+  ),
+
+  test("round rounds down when below 0.5", () =>
+    expect(round(3.4)).toBe(3.0)
+  ),
+
+  test("trunc truncates toward zero", () =>
+    expect(trunc(3.9)).toBe(3.0)
+  ),
+
+  test("trunc truncates negative toward zero", () =>
+    expect(trunc(-3.9)).toBe(-3.0)
+  ),
+
+  test("sqrt of 4 is 2", () =>
+    expect(sqrt(4.0)).toBe(2.0)
+  ),
+
+  test("sqrt of 9 is 3", () =>
+    expect(sqrt(9.0)).toBe(3.0)
+  ),
+
+  test("pow 2 to the 10", () =>
+    expect(pow(2.0, 10.0)).toBe(1024.0)
+  ),
+
+  test("pow 3 squared is 9", () =>
+    expect(pow(3.0, 2.0)).toBe(9.0)
+  ),
+
+  test("log of e is 1", () =>
+    expect(round(log(E))).toBe(1.0)
+  ),
+
+  test("log2 of 8 is 3", () =>
+    expect(log2(8.0)).toBe(3.0)
+  ),
+
+  test("log10 of 1000 is 3", () =>
+    expect(log10(1000.0)).toBe(3.0)
+  ),
+
+  test("sin of 0 is 0", () =>
+    expect(sin(0.0)).toBe(0.0)
+  ),
+
+  test("cos of 0 is 1", () =>
+    expect(cos(0.0)).toBe(1.0)
+  ),
+
+  test("tan of 0 is 0", () =>
+    expect(tan(0.0)).toBe(0.0)
+  ),
+
+  test("asin of 0 is 0", () =>
+    expect(asin(0.0)).toBe(0.0)
+  ),
+
+  test("acos of 1 is 0", () =>
+    expect(acos(1.0)).toBe(0.0)
+  ),
+
+  test("atan of 0 is 0", () =>
+    expect(atan(0.0)).toBe(0.0)
+  ),
+
+  test("atan2 of (0, 1) is 0", () =>
+    expect(atan2(0.0, 1.0)).toBe(0.0)
+  ),
+
+  test("abs of -5 is 5", () =>
+    expect(abs(-5.0)).toBe(5.0)
+  ),
+
+  test("abs of 5 is 5", () =>
+    expect(abs(5.0)).toBe(5.0)
+  ),
+
+  test("min of 3 and 5 is 3", () =>
+    expect(min(3.0, 5.0)).toBe(3.0)
+  ),
+
+  test("min of 5 and 3 is 3", () =>
+    expect(min(5.0, 3.0)).toBe(3.0)
+  ),
+
+  test("max of 3 and 5 is 5", () =>
+    expect(max(3.0, 5.0)).toBe(5.0)
+  ),
+
+  test("max of 5 and 3 is 5", () =>
+    expect(max(5.0, 3.0)).toBe(5.0)
+  ),
+
+  test("clamp in range returns value", () =>
+    expect(clamp(5.0, 1.0, 10.0)).toBe(5.0)
+  ),
+
+  test("clamp below lo returns lo", () =>
+    expect(clamp(-5.0, 1.0, 10.0)).toBe(1.0)
+  ),
+
+  test("clamp above hi returns hi", () =>
+    expect(clamp(15.0, 1.0, 10.0)).toBe(10.0)
+  ),
+
+  test("sign of positive is 1", () =>
+    expect(sign(5.0)).toBe(1)
+  ),
+
+  test("sign of negative is -1", () =>
+    expect(sign(-5.0)).toBe(-1)
+  ),
+
+  test("sign of zero is 0", () =>
+    expect(sign(0.0)).toBe(0)
+  ),
+
+  test("isNaN of NAN is true", () =>
+    expect(isNaN(NAN)).toBe(true)
+  ),
+
+  test("isNaN of 1.0 is false", () =>
+    expect(isNaN(1.0)).toBe(false)
+  ),
+
+  test("isFinite of 1.0 is true", () =>
+    expect(isFinite(1.0)).toBe(true)
+  ),
+
+  test("isFinite of INFINITY is false", () =>
+    expect(isFinite(INFINITY)).toBe(false)
+  ),
+
+  test("random returns value in [0, 1)", () =>
+    val r = random()
+    expect(r >= 0.0 && r < 1.0).toBe(true)
+  ),
+
+  test("toFixed formats to 2 decimal places", () =>
+    expect(toFixed(3.14159, 2)).toBe("3.14")
+  ),
+
+  test("toFixed formats to 0 decimal places", () =>
+    expect(toFixed(3.7, 0)).toBe("4")
+  ),
+])
+
+run(s)

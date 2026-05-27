@@ -8,7 +8,6 @@ members = [
     "crates/lin-codegen",
     "crates/lin-runtime",
     "crates/lin-compile",
-    "crates/lin-eval",
     "crates/lin",
     "crates/lin-lsp",
 ]

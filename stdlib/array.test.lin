@@ -1,0 +1,425 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { toString } from "std/string"
+import { map, filter, reduce, find, some, every, flatMap, indexOf, reverse, concat, push, length, range, rangeStep, for, partition, zip, unique, take, drop, takeWhile, dropWhile, flatten, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy } from "std/array"
+
+val s = suite("std/array", [
+  test("length of array", () =>
+    expect(length([1, 2, 3])).toBe(3)
+  ),
+
+  test("length of empty array", () =>
+    expect(length([])).toBe(0)
+  ),
+
+  test("push mutates array", () =>
+    val arr = [1, 2]
+    push(arr, 3)
+    expect(length(arr)).toBe(3)
+  ),
+
+  test("concat two arrays", () =>
+    val result = concat([1, 2], [3, 4])
+    expect(length(result)).toBe(4)
+  ),
+
+  test("range produces correct values", () =>
+    val result = []
+    range(0, 3).for(i => push(result, i))
+    expect(toString(result)).toBe("[0, 1, 2]")
+  ),
+
+  test("map doubles values", () =>
+    val result = [1, 2, 3].map(x => x * 2)
+    expect(toString(result)).toBe("[2, 4, 6]")
+  ),
+
+  test("filter keeps evens", () =>
+    val result = [1, 2, 3, 4].filter(x => x % 2 == 0)
+    expect(toString(result)).toBe("[2, 4]")
+  ),
+
+  test("reduce sums values", () =>
+    val result = [1, 2, 3, 4].reduce(0, (acc, x) => acc + x)
+    expect(result).toBe(10)
+  ),
+
+  test("find returns first match", () =>
+    val result = [1, 2, 3, 4].find(x => x > 2)
+    expect(result).toBe(3)
+  ),
+
+  test("find returns null when no match", () =>
+    val result = [1, 2, 3].find(x => x > 10)
+    expect(result).toBe(null)
+  ),
+
+  test("some returns true when any match", () =>
+    val result = [1, 2, 3].some(x => x == 2)
+    expect(result).toBe(true)
+  ),
+
+  test("some returns false when none match", () =>
+    val result = [1, 2, 3].some(x => x == 99)
+    expect(result).toBe(false)
+  ),
+
+  test("every returns true when all match", () =>
+    val result = [2, 4, 6].every(x => x % 2 == 0)
+    expect(result).toBe(true)
+  ),
+
+  test("every returns false when any fail", () =>
+    val result = [2, 3, 6].every(x => x % 2 == 0)
+    expect(result).toBe(false)
+  ),
+
+  test("flatMap flattens one level", () =>
+    val result = [1, 2, 3].flatMap(x => [x, x * 10])
+    expect(toString(result)).toBe("[1, 10, 2, 20, 3, 30]")
+  ),
+
+  test("indexOf returns index of found element", () =>
+    val result = [10, 20, 30].indexOf(20)
+    expect(result).toBe(1)
+  ),
+
+  test("indexOf returns -1 when not found", () =>
+    val result = [10, 20, 30].indexOf(99)
+    expect(result).toBe(-1)
+  ),
+
+  test("reverse reverses array", () =>
+    val result = [1, 2, 3].reverse()
+    expect(toString(result)).toBe("[3, 2, 1]")
+  ),
+
+  test("partition splits into passing and failing", () =>
+    val result = [1, 2, 3, 4, 5].partition(x => x % 2 == 0)
+    expect(toString(result[0])).toBe("[2, 4]")
+    expect(toString(result[1])).toBe("[1, 3, 5]")
+  ),
+
+  test("partition with empty array", () =>
+    val result = [].partition(x => x == 1)
+    expect(length(result[0])).toBe(0)
+    expect(length(result[1])).toBe(0)
+  ),
+
+  test("zip pairs elements at same index", () =>
+    val result = zip([1, 2, 3], ["a", "b", "c"])
+    expect(toString(result)).toBe("[[1, \"a\"], [2, \"b\"], [3, \"c\"]]")
+  ),
+
+  test("zip truncates to shortest array", () =>
+    val result = zip([1, 2], [3, 4, 5])
+    expect(toString(result)).toBe("[[1, 3], [2, 4]]")
+  ),
+
+  test("unique removes duplicates preserving order", () =>
+    val result = [1, 2, 1, 3, 2].unique()
+    expect(toString(result)).toBe("[1, 2, 3]")
+  ),
+
+  test("unique on array with no duplicates", () =>
+    val result = [1, 2, 3].unique()
+    expect(toString(result)).toBe("[1, 2, 3]")
+  ),
+
+  test("take returns first n elements", () =>
+    val result = [1, 2, 3, 4, 5].take(3)
+    expect(toString(result)).toBe("[1, 2, 3]")
+  ),
+
+  test("take when n exceeds length returns whole array", () =>
+    val result = [1, 2].take(10)
+    expect(toString(result)).toBe("[1, 2]")
+  ),
+
+  test("drop removes first n elements", () =>
+    val result = [1, 2, 3, 4, 5].drop(2)
+    expect(toString(result)).toBe("[3, 4, 5]")
+  ),
+
+  test("drop when n exceeds length returns empty array", () =>
+    val result = [1, 2].drop(10)
+    expect(length(result)).toBe(0)
+  ),
+
+  test("takeWhile returns elements while predicate holds", () =>
+    val result = [1, 2, 3, 4].takeWhile(x => x < 3)
+    expect(toString(result)).toBe("[1, 2]")
+  ),
+
+  test("takeWhile stops at first false", () =>
+    val result = [1, 3, 2, 4].takeWhile(x => x < 3)
+    expect(toString(result)).toBe("[1]")
+  ),
+
+  test("dropWhile skips elements while predicate holds", () =>
+    val result = [1, 2, 3, 4].dropWhile(x => x < 3)
+    expect(toString(result)).toBe("[3, 4]")
+  ),
+
+  test("dropWhile returns all when predicate is immediately false", () =>
+    val result = [3, 4, 5].dropWhile(x => x < 3)
+    expect(toString(result)).toBe("[3, 4, 5]")
+  ),
+
+  test("sort numbers ascending", () =>
+    val result = [3, 1, 2].sort((a, b) => a - b)
+    expect(toString(result)).toBe("[1, 2, 3]")
+  ),
+
+  test("sort numbers descending", () =>
+    val result = [3, 1, 2].sort((a, b) => b - a)
+    expect(toString(result)).toBe("[3, 2, 1]")
+  ),
+
+  test("sort strings lexicographically", () =>
+    val result = ["banana", "apple", "cherry"].sort((a, b) =>
+      if a < b then -1 else if a > b then 1 else 0
+    )
+    expect(toString(result)).toBe("[\"apple\", \"banana\", \"cherry\"]")
+  ),
+
+  test("sort does not mutate original array", () =>
+    val original = [3, 1, 2]
+    val result = original.sort((a, b) => a - b)
+    expect(toString(original)).toBe("[3, 1, 2]")
+    expect(toString(result)).toBe("[1, 2, 3]")
+  ),
+
+  test("sort empty array returns empty array", () =>
+    val result = [].sort((a, b) => a - b)
+    expect(length(result)).toBe(0)
+  ),
+
+  test("sort single element returns copy", () =>
+    val result = [42].sort((a, b) => a - b)
+    expect(toString(result)).toBe("[42]")
+  ),
+
+  test("sortBy numbers by value", () =>
+    val result = [3, 1, 2].sortBy(x => x)
+    expect(toString(result)).toBe("[1, 2, 3]")
+  ),
+
+  test("sortBy objects by field", () =>
+    val result = [{"name": "Bob"}, {"name": "Alice"}, {"name": "Charlie"}].sortBy(x => x["name"])
+    expect(result[0]["name"]).toBe("Alice")
+    expect(result[1]["name"]).toBe("Bob")
+    expect(result[2]["name"]).toBe("Charlie")
+  ),
+
+  test("sortBy does not mutate original array", () =>
+    val original = [3, 1, 2]
+    val result = original.sortBy(x => x)
+    expect(toString(original)).toBe("[3, 1, 2]")
+  ),
+
+  test("sum of integers", () =>
+    val result = [1, 2, 3, 4].sum()
+    expect(result).toBe(10)
+  ),
+
+  test("sum of empty array returns 0", () =>
+    val result = [].sum()
+    expect(result).toBe(0)
+  ),
+
+  test("product of integers", () =>
+    val result = [1, 2, 3, 4].product()
+    expect(result).toBe(24)
+  ),
+
+  test("product of empty array returns 1", () =>
+    val result = [].product()
+    expect(result).toBe(1)
+  ),
+
+  test("min returns smallest value", () =>
+    val result = [3, 1, 4, 1, 5].min()
+    expect(result).toBe(1)
+  ),
+
+  test("max returns largest value", () =>
+    val result = [3, 1, 4, 1, 5].max()
+    expect(result).toBe(5)
+  ),
+
+  test("minBy returns element with smallest key", () =>
+    val result = [{"n": 3}, {"n": 1}, {"n": 2}].minBy(x => x["n"])
+    expect(result["n"]).toBe(1)
+  ),
+
+  test("maxBy returns element with largest key", () =>
+    val result = [{"n": 3}, {"n": 1}, {"n": 2}].maxBy(x => x["n"])
+    expect(result["n"]).toBe(3)
+  ),
+
+  test("rangeStep with positive step 2", () =>
+    val result = []
+    for(rangeStep(0, 6, 2), x => push(result, x))
+    expect(toString(result)).toBe("[0, 2, 4]")
+  ),
+
+  test("rangeStep with positive step 3", () =>
+    val result = []
+    for(rangeStep(0, 10, 3), x => push(result, x))
+    expect(toString(result)).toBe("[0, 3, 6, 9]")
+  ),
+
+  test("rangeStep with negative step", () =>
+    val result = []
+    for(rangeStep(5, 0, -1), x => push(result, x))
+    expect(toString(result)).toBe("[5, 4, 3, 2, 1]")
+  ),
+
+  test("rangeStep with negative step -2", () =>
+    val result = []
+    for(rangeStep(10, 0, -2), x => push(result, x))
+    expect(toString(result)).toBe("[10, 8, 6, 4, 2]")
+  ),
+
+  test("rangeStep with step 0 returns empty iterator", () =>
+    val result = []
+    for(rangeStep(0, 10, 0), x => push(result, x))
+    expect(length(result)).toBe(0)
+  ),
+
+  test("rangeStep with step 1 matches range", () =>
+    val result = []
+    for(rangeStep(0, 4, 1), x => push(result, x))
+    expect(toString(result)).toBe("[0, 1, 2, 3]")
+  ),
+
+  test("flatten flattens one level of nesting", () =>
+    val result = flatten([[1, 2], [3, 4]])
+    expect(toString(result)).toBe("[1, 2, 3, 4]")
+  ),
+
+  test("flatten with empty inner arrays", () =>
+    val result = flatten([[], [1], []])
+    expect(toString(result)).toBe("[1]")
+  ),
+
+  test("chunk splits into equal-sized pieces", () =>
+    val result = chunk([1, 2, 3, 4], 2)
+    expect(toString(result)).toBe("[[1, 2], [3, 4]]")
+  ),
+
+  test("chunk last piece may be shorter", () =>
+    val result = chunk([1, 2, 3, 4, 5], 2)
+    expect(toString(result)).toBe("[[1, 2], [3, 4], [5]]")
+  ),
+
+  test("chunk whole array in one piece", () =>
+    val result = chunk([1, 2, 3], 3)
+    expect(toString(result)).toBe("[[1, 2, 3]]")
+  ),
+
+  test("chunk empty array returns empty array", () =>
+    val result = chunk([], 2)
+    expect(length(result)).toBe(0)
+  ),
+
+  test("compact removes nulls", () =>
+    val result = compact([1, null, 2, null, 3])
+    expect(toString(result)).toBe("[1, 2, 3]")
+  ),
+
+  test("compact all nulls returns empty array", () =>
+    val result = compact([null, null])
+    expect(length(result)).toBe(0)
+  ),
+
+  test("compact with no nulls returns unchanged array", () =>
+    val result = compact([1, 2, 3])
+    expect(toString(result)).toBe("[1, 2, 3]")
+  ),
+
+  test("append adds item to end of array", () =>
+    val result = [1, 2, 3].append(4)
+    expect(toString(result)).toBe("[1, 2, 3, 4]")
+  ),
+
+  test("append does not mutate original array", () =>
+    val original = [1, 2, 3]
+    val result = original.append(4)
+    expect(toString(original)).toBe("[1, 2, 3]")
+    expect(toString(result)).toBe("[1, 2, 3, 4]")
+  ),
+
+  test("append on empty array returns single-element array", () =>
+    val result = [].append(1)
+    expect(toString(result)).toBe("[1]")
+  ),
+
+  test("prepend adds item to front of array", () =>
+    val result = [2, 3].prepend(1)
+    expect(toString(result)).toBe("[1, 2, 3]")
+  ),
+
+  test("prepend does not mutate original array", () =>
+    val original = [2, 3]
+    val result = original.prepend(1)
+    expect(toString(original)).toBe("[2, 3]")
+    expect(toString(result)).toBe("[1, 2, 3]")
+  ),
+
+  test("prepend on empty array returns single-element array", () =>
+    val result = [].prepend(1)
+    expect(toString(result)).toBe("[1]")
+  ),
+
+  test("scan returns all intermediate accumulator values including initial", () =>
+    val result = [1, 2, 3].scan(0, (acc, x) => acc + x)
+    expect(toString(result)).toBe("[0, 1, 3, 6]")
+  ),
+
+  test("scan on empty array returns array with only initial value", () =>
+    val result = [].scan(0, (acc, x) => acc + x)
+    expect(toString(result)).toBe("[0]")
+  ),
+
+  test("scan with multiplication", () =>
+    val result = [1, 2, 3, 4].scan(1, (acc, x) => acc * x)
+    expect(toString(result)).toBe("[1, 1, 2, 6, 24]")
+  ),
+
+  test("groupBy groups elements by key function", () =>
+    val result = [1, 2, 3, 4].groupBy(x => if x % 2 == 0 then "even" else "odd")
+    expect(toString(result["odd"])).toBe("[1, 3]")
+    expect(toString(result["even"])).toBe("[2, 4]")
+  ),
+
+  test("groupBy with single key puts all in one group", () =>
+    val result = [1, 2, 3].groupBy(x => "all")
+    expect(toString(result["all"])).toBe("[1, 2, 3]")
+  ),
+
+  test("groupBy empty array returns empty object", () =>
+    val result = [].groupBy(x => "k")
+    expect(result["k"]).toBe(null)
+  ),
+
+  test("countBy counts occurrences of each key", () =>
+    val result = ["a", "b", "a", "c", "b", "a"].countBy(x => x)
+    expect(result["a"]).toBe(3)
+    expect(result["b"]).toBe(2)
+    expect(result["c"]).toBe(1)
+  ),
+
+  test("countBy groups even and odd counts", () =>
+    val result = [1, 2, 3, 4, 5].countBy(x => if x % 2 == 0 then "even" else "odd")
+    expect(result["odd"]).toBe(3)
+    expect(result["even"]).toBe(2)
+  ),
+
+  test("countBy empty array returns empty object", () =>
+    val result = [].countBy(x => x)
+    expect(result["anything"]).toBe(null)
+  ),
+])
+
+run(s)

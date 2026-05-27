@@ -307,3 +307,11 @@ Implementation:
 **Rationale**: The interpreter stub is meant to give a clear diagnostic when FFI functions are called. If the arity doesn't match the declared signature, the interpreter would error before reaching the stub's message, creating confusing diagnostics.
 
 **Consequence**: `import foreign "lib.a"\n  val add: (Int32, Int32) => Int32\nadd(1, 2)` now correctly produces "Foreign functions are not available in the interpreter" rather than "Too many arguments".
+
+## ADR-038: Optional `else` in `if` expressions — implicit `else null`
+
+**Decision**: The `else` branch of an `if` expression is optional. When omitted, the parser synthesizes `Expr::NullLit` at the `if` expression's span as the implicit else branch. The type checker then unions the then-branch type with `Null`, yielding `T | Null` as the expression's type.
+
+**Rationale**: Side-effect-only patterns like `if cond then push(arr, item)` are idiomatic and common in the stdlib. Requiring `else null` is pure noise in these cases — the intent is clear and the result is always discarded. The `else null` pattern also appeared in predicate-style code (`if found == null && f(item) then found = item else null`) where the explicit null was a placeholder with no meaning. Synthesizing `NullLit` at parse time means the AST shape is unchanged — no `Option<Box<Expr>>` needed in `Expr::If` or anywhere downstream.
+
+**Consequence**: The result type widens to `T | Null` when `else` is absent. Code that uses the result of an `else`-less `if` without handling the `Null` case will pass type-checking silently (the union just grows). This is an acceptable tradeoff: the common case (result discarded) gets cleaner syntax, and the footgun (accidentally using a `T | Null` result as `T`) is the same class of error already present whenever any function returns `Null`.

@@ -418,6 +418,18 @@ print(c)
 }
 
 #[test]
+fn test_if_without_else() {
+    let output = run(r#"import { print } from "std/io"
+
+val arr = []
+if true then print("ran")
+if false then print("skipped")
+print("done")
+"#);
+    assert_eq!(output, vec!["ran", "done"]);
+}
+
+#[test]
 fn test_stdlib_imports() {
     let output = run(r#"
 import { trim, toUpper } from "std/string"
@@ -1657,6 +1669,188 @@ print(toString(loaded["version"]))
 "#));
     let _ = fs::remove_file(&tmp);
     assert_eq!(output, vec!["Lin", "1"]);
+}
+
+#[test]
+fn test_fs_is_file() {
+    let tmp = std::env::temp_dir().join("lin_ctest_isfile.txt");
+    let _ = fs::remove_file(&tmp);
+    let path = tmp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+
+import {{ writeFile, isFile, isDir }} from "std/fs"
+print(toString(isFile("{path}")))
+print(toString(isDir("{path}")))
+writeFile("{path}", "hello")
+print(toString(isFile("{path}")))
+print(toString(isDir("{path}")))
+"#));
+    let _ = fs::remove_file(&tmp);
+    assert_eq!(output, vec!["false", "false", "true", "false"]);
+}
+
+#[test]
+fn test_fs_is_dir() {
+    let tmp_dir = std::env::temp_dir();
+    let dir_path = tmp_dir.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+
+import {{ isFile, isDir }} from "std/fs"
+print(toString(isDir("{dir_path}")))
+print(toString(isFile("{dir_path}")))
+"#));
+    assert_eq!(output, vec!["true", "false"]);
+}
+
+#[test]
+fn test_fs_stat() {
+    let tmp = std::env::temp_dir().join("lin_ctest_stat.txt");
+    let _ = fs::remove_file(&tmp);
+    let path = tmp.display().to_string();
+    fs::write(&tmp, "hello lin").unwrap();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+
+import {{ stat }} from "std/fs"
+val s = stat("{path}")
+print(toString(s["size"]))
+print(toString(s["isFile"]))
+print(toString(s["isDir"]))
+"#));
+    let _ = fs::remove_file(&tmp);
+    assert_eq!(output, vec!["9", "true", "false"]);
+}
+
+#[test]
+fn test_fs_stat_missing_returns_error() {
+    let output = run(r#"import { print } from "std/io"
+
+import { stat } from "std/fs"
+val s = stat("/nonexistent/path/that/does/not/exist.txt")
+print(s["type"])
+"#);
+    assert_eq!(output, vec!["error"]);
+}
+
+#[test]
+fn test_fs_list_dir() {
+    let tmp_dir = std::env::temp_dir().join("lin_ctest_listdir");
+    let _ = fs::remove_dir_all(&tmp_dir);
+    fs::create_dir_all(&tmp_dir).unwrap();
+    fs::write(tmp_dir.join("a.txt"), "").unwrap();
+    fs::write(tmp_dir.join("b.txt"), "").unwrap();
+    let dir_path = tmp_dir.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ length }} from "std/array"
+
+import {{ listDir }} from "std/fs"
+val entries = listDir("{dir_path}")
+print(toString(length(entries)))
+"#));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    assert_eq!(output, vec!["2"]);
+}
+
+#[test]
+fn test_fs_list_dir_missing_returns_error() {
+    let output = run(r#"import { print } from "std/io"
+
+import { listDir } from "std/fs"
+val result = listDir("/nonexistent/path/that/does/not/exist")
+print(result["type"])
+"#);
+    assert_eq!(output, vec!["error"]);
+}
+
+#[test]
+fn test_fs_mkdir() {
+    let tmp_dir = std::env::temp_dir().join("lin_ctest_mkdir");
+    let _ = fs::remove_dir_all(&tmp_dir);
+    let dir_path = tmp_dir.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+
+import {{ mkdir, isDir }} from "std/fs"
+val before = isDir("{dir_path}")
+mkdir("{dir_path}")
+val after = isDir("{dir_path}")
+print(toString(before))
+print(toString(after))
+"#));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    assert_eq!(output, vec!["false", "true"]);
+}
+
+#[test]
+fn test_fs_mkdir_all() {
+    let tmp_dir = std::env::temp_dir().join("lin_ctest_mkdirall").join("a").join("b");
+    let _ = fs::remove_dir_all(std::env::temp_dir().join("lin_ctest_mkdirall"));
+    let dir_path = tmp_dir.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+
+import {{ mkdirAll, isDir }} from "std/fs"
+mkdirAll("{dir_path}")
+print(toString(isDir("{dir_path}")))
+"#));
+    let _ = fs::remove_dir_all(std::env::temp_dir().join("lin_ctest_mkdirall"));
+    assert_eq!(output, vec!["true"]);
+}
+
+#[test]
+fn test_fs_delete_file() {
+    let tmp = std::env::temp_dir().join("lin_ctest_deletefile.txt");
+    fs::write(&tmp, "hello").unwrap();
+    let path = tmp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+
+import {{ deleteFile, exists }} from "std/fs"
+val before = exists("{path}")
+deleteFile("{path}")
+val after = exists("{path}")
+print(toString(before))
+print(toString(after))
+"#));
+    let _ = fs::remove_file(&tmp);
+    assert_eq!(output, vec!["true", "false"]);
+}
+
+#[test]
+fn test_fs_delete_file_missing_returns_error() {
+    let output = run(r#"import { print } from "std/io"
+
+import { deleteFile } from "std/fs"
+val result = deleteFile("/nonexistent/path/that/does/not/exist.txt")
+print(result["type"])
+"#);
+    assert_eq!(output, vec!["error"]);
+}
+
+#[test]
+fn test_fs_rename() {
+    let src = std::env::temp_dir().join("lin_ctest_rename_src.txt");
+    let dst = std::env::temp_dir().join("lin_ctest_rename_dst.txt");
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(&dst);
+    fs::write(&src, "hello rename").unwrap();
+    let src_path = src.display().to_string();
+    let dst_path = dst.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+
+import {{ rename, exists, readFile }} from "std/fs"
+rename("{src_path}", "{dst_path}")
+print(toString(exists("{src_path}")))
+print(toString(exists("{dst_path}")))
+print(readFile("{dst_path}"))
+"#));
+    let _ = fs::remove_file(&src);
+    let _ = fs::remove_file(&dst);
+    assert_eq!(output, vec!["false", "true", "hello rename"]);
 }
 
 #[test]

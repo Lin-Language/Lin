@@ -1,6 +1,7 @@
 import { print } from "std/io"
 import { toString } from "std/string"
 import { filter, length, for, map } from "std/array"
+import { exit } from "std/io"
 
 val _pass = { "type": "pass" }
 
@@ -84,4 +85,4 @@ export val run = (s: Json): Null =>
     then print("${toString(passCount)} passed")
     else
       print("${toString(failCount)} failed, ${toString(passCount)} passed")
-      __exit(1)
+      exit(1)

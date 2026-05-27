@@ -1,0 +1,12 @@
+import foreign "lin-runtime"
+  val lin_time_now: () => Int64
+  val lin_time_sleep: (Int64) => Null
+  val lin_time_start_timer: () => Int64
+  val lin_time_elapsed: (Int64) => Int64
+  val lin_time_to_iso: (Int64) => String
+
+export val now = (): Int64 => lin_time_now()
+export val sleep = (ms: Int64): Null => lin_time_sleep(ms)
+export val startTimer = (): Int64 => lin_time_start_timer()
+export val elapsed = (timer: Int64): Int64 => lin_time_elapsed(timer)
+export val toIso = (ms: Int64): String => lin_time_to_iso(ms)

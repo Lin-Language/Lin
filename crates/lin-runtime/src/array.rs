@@ -231,15 +231,54 @@ pub unsafe extern "C" fn lin_flat_to_tagged_f64(flat: *const LinArray) -> *mut L
     tagged
 }
 
-/// Get a pointer to the element payload at index. Panics (exits) on OOB.
+/// Get a pointer to the element payload at index. Supports negative indices (Python-style).
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_get(arr: *const LinArray, idx: i64) -> *mut LinArrayElem {
     let len = (*arr).len as i64;
-    if idx < 0 || idx >= len {
+    let actual = if idx < 0 { len + idx } else { idx };
+    if actual < 0 || actual >= len {
         eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
         std::process::exit(1);
     }
-    (*arr).data.add(idx as usize)
+    (*arr).data.add(actual as usize)
+}
+
+/// Set the element at index (in-place mutation). Supports negative indices.
+/// Handles both flat and tagged arrays. No-op if index is out of bounds.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_set(arr: *mut LinArray, idx: i64, tagged: *const crate::tagged::TaggedVal) {
+    use crate::tagged::*;
+    if arr.is_null() { return; }
+    let len = (*arr).len as i64;
+    let actual = if idx < 0 { len + idx } else { idx };
+    if actual < 0 || actual >= len { return; }
+    let elem_tag = (*arr).elem_tag;
+    if elem_tag == 0xFF {
+        let slot = (*arr).data.add(actual as usize);
+        std::ptr::copy_nonoverlapping(tagged as *const u8, slot as *mut u8, std::mem::size_of::<TaggedVal>());
+    } else {
+        let tag = if tagged.is_null() { TAG_NULL } else { (*tagged).tag };
+        let payload = if tagged.is_null() { 0u64 } else { (*tagged).payload };
+        match elem_tag {
+            TAG_INT32 => {
+                let v = match tag { TAG_INT32 => payload as i32, TAG_INT64 => payload as i32, TAG_FLOAT64 => f64::from_bits(payload) as i32, _ => 0 };
+                *((*arr).data as *mut i32).add(actual as usize) = v;
+            }
+            TAG_INT64 => {
+                let v = match tag { TAG_INT32 => payload as i32 as i64, TAG_INT64 => payload as i64, TAG_FLOAT64 => f64::from_bits(payload) as i64, _ => 0 };
+                *((*arr).data as *mut i64).add(actual as usize) = v;
+            }
+            TAG_FLOAT32 => {
+                let v = match tag { TAG_FLOAT32 => f32::from_bits(payload as u32), TAG_FLOAT64 => f64::from_bits(payload) as f32, TAG_INT32 => payload as i32 as f32, _ => 0.0 };
+                *((*arr).data as *mut f32).add(actual as usize) = v;
+            }
+            TAG_FLOAT64 => {
+                let v = match tag { TAG_FLOAT64 => f64::from_bits(payload), TAG_FLOAT32 => f32::from_bits(payload as u32) as f64, TAG_INT32 => payload as i32 as f64, _ => 0.0 };
+                *((*arr).data as *mut f64).add(actual as usize) = v;
+            }
+            _ => {}
+        }
+    }
 }
 
 #[no_mangle]
@@ -254,8 +293,10 @@ pub unsafe extern "C" fn lin_array_get_tagged(arr: *const LinArray, idx: i64) ->
     use crate::tagged::*;
     if arr.is_null() { return std::ptr::null_mut(); }
     let len = (*arr).len as i64;
+    let actual = if idx < 0 { len + idx } else { idx };
+    let idx = actual;
     if idx < 0 || idx >= len {
-        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
+        eprintln!("Runtime error: array index {} out of bounds (len {})", actual, len);
         std::process::exit(1);
     }
     let tv_layout = Layout::from_size_align_unchecked(
@@ -494,12 +535,13 @@ pub unsafe extern "C" fn lin_flat_array_push_i32(arr: *mut LinArray, val: i32) {
 #[no_mangle]
 pub unsafe extern "C" fn lin_flat_array_get_i32(arr: *const LinArray, idx: i64) -> i32 {
     let len = (*arr).len as i64;
-    if idx < 0 || idx >= len {
+    let actual = if idx < 0 { len + idx } else { idx };
+    if actual < 0 || actual >= len {
         eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
         std::process::exit(1);
     }
     let data = (*arr).data as *const i32;
-    *data.add(idx as usize)
+    *data.add(actual as usize)
 }
 
 #[no_mangle]
@@ -554,12 +596,13 @@ pub unsafe extern "C" fn lin_flat_array_push_i64(arr: *mut LinArray, val: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn lin_flat_array_get_i64(arr: *const LinArray, idx: i64) -> i64 {
     let len = (*arr).len as i64;
-    if idx < 0 || idx >= len {
+    let actual = if idx < 0 { len + idx } else { idx };
+    if actual < 0 || actual >= len {
         eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
         std::process::exit(1);
     }
     let data = (*arr).data as *const i64;
-    *data.add(idx as usize)
+    *data.add(actual as usize)
 }
 
 #[no_mangle]
@@ -614,12 +657,13 @@ pub unsafe extern "C" fn lin_flat_array_push_f32(arr: *mut LinArray, val: f32) {
 #[no_mangle]
 pub unsafe extern "C" fn lin_flat_array_get_f32(arr: *const LinArray, idx: i64) -> f32 {
     let len = (*arr).len as i64;
-    if idx < 0 || idx >= len {
+    let actual = if idx < 0 { len + idx } else { idx };
+    if actual < 0 || actual >= len {
         eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
         std::process::exit(1);
     }
     let data = (*arr).data as *const f32;
-    *data.add(idx as usize)
+    *data.add(actual as usize)
 }
 
 #[no_mangle]
@@ -674,12 +718,13 @@ pub unsafe extern "C" fn lin_flat_array_push_f64(arr: *mut LinArray, val: f64) {
 #[no_mangle]
 pub unsafe extern "C" fn lin_flat_array_get_f64(arr: *const LinArray, idx: i64) -> f64 {
     let len = (*arr).len as i64;
-    if idx < 0 || idx >= len {
+    let actual = if idx < 0 { len + idx } else { idx };
+    if actual < 0 || actual >= len {
         eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
         std::process::exit(1);
     }
     let data = (*arr).data as *const f64;
-    *data.add(idx as usize)
+    *data.add(actual as usize)
 }
 
 #[no_mangle]

@@ -15,6 +15,28 @@ export val range = (start: Int32, end: Int32) =>
     i => i
   )
 
+export val rangeStep = (start: Int32, end: Int32, step: Int32): Json =>
+  if step > 0
+    then lin_iter(
+      () => start,
+      i => i < end,
+      i => i + step,
+      i => i
+    )
+    else if step < 0
+      then lin_iter(
+        () => start,
+        i => i > end,
+        i => i + step,
+        i => i
+      )
+      else lin_iter(
+        () => start,
+        i => false,
+        i => i,
+        i => i
+      )
+
 export val iterOf = (arr: Json) =>
   lin_iter(
     () => 0,
@@ -40,7 +62,7 @@ export val map = (arr: Json, f: Function): Json =>
 export val filter = (arr: Json, f: Function): Json =>
   val result = []
   for(arr, item =>
-    if f(item) then push(result, item) else null
+    if f(item) then push(result, item)
   )
   result
 
@@ -52,21 +74,21 @@ export val reduce = (arr: Json, init: Json, f: (Json, Json) => Json): Json =>
 export val find = (arr: Json, f: Function): Json =>
   var found = null
   for(arr, item =>
-    if found == null && f(item) then found = item else null
+    if found == null && f(item) then found = item
   )
   found
 
 export val some = (arr: Json, f: Function): Boolean =>
   var result = false
   for(arr, item =>
-    if f(item) then result = true else null
+    if f(item) then result = true
   )
   result
 
 export val every = (arr: Json, f: Function): Boolean =>
   var result = true
   for(arr, item =>
-    if f(item) == false then result = false else null
+    if f(item) == false then result = false
   )
   result
 
@@ -82,7 +104,7 @@ export val indexOf = (arr: Json, target: Json): Int32 =>
   var result = -1
   var i = 0
   for(arr, item =>
-    val dummy = if result == -1 && item == target then result = i else null
+    if result == -1 && item == target then result = i
     i = i + 1
   )
   result
@@ -94,4 +116,144 @@ export val reverse = (arr: Json): Json =>
     val dummy = push(result, arr[i])
     i = i - 1
   )
+  result
+
+export val set = (arr: Json, idx: Int32, item: Json): Null =>
+  lin_array_set(arr, idx, item)
+
+export val at = (arr: Json, index: Int32): Json =>
+  val i = if index < 0 then length(arr) + index else index
+  arr[i]
+
+export val partition = (arr: Json, f: Function): Json =>
+  val pass = []
+  val fail = []
+  for(arr, item =>
+    if f(item) then push(pass, item) else push(fail, item)
+  )
+  [pass, fail]
+
+export val zip = (a: Json, b: Json): Json =>
+  val n = if length(a) < length(b) then length(a) else length(b)
+  val result = []
+  for(lin_range(0, n), i => push(result, [a[i], b[i]]))
+  result
+
+export val unique = (arr: Json): Json =>
+  val result = []
+  for(arr, item =>
+    var found = false
+    for(result, existing =>
+      if existing == item then found = true
+    )
+    if found == false then push(result, item)
+  )
+  result
+
+export val take = (arr: Json, n: Int32): Json =>
+  val result = []
+  val end = if n < length(arr) then n else length(arr)
+  for(range(0, end), i => push(result, arr[i]))
+  result
+
+export val drop = (arr: Json, n: Int32): Json =>
+  val result = []
+  val start = if n < length(arr) then n else length(arr)
+  for(range(start, length(arr)), i => push(result, arr[i]))
+  result
+
+export val takeWhile = (arr: Json, f: Function): Json =>
+  val result = []
+  var done = false
+  for(arr, item =>
+    if done == false && f(item)
+      then push(result, item)
+      else done = true
+  )
+  result
+
+export val dropWhile = (arr: Json, f: Function): Json =>
+  val result = []
+  var dropping = true
+  for(arr, item =>
+    val keep = dropping == false || f(item) == false
+    dropping = if keep then false else dropping
+    if keep then push(result, item)
+  )
+  result
+
+export val flatten = (arr: Json): Json =>
+  flatMap(arr, x => x)
+
+export val chunk = (arr: Json, size: Int32): Json =>
+  val n = length(arr)
+  val result = []
+  val s = if size < 1 then 1 else size
+  for(lin_range(0, (n + s - 1) / s), i =>
+    val start = i * s
+    val end = if start + s < n then start + s else n
+    val c = []
+    for(lin_range(start, end), j => push(c, arr[j]))
+    push(result, c)
+  )
+  result
+
+export val compact = (arr: Json): Json =>
+  filter(arr, x => x != null)
+
+export val sort = (arr: Json, cmp: (Json, Json) => Int32): Json =>
+  concat(arr, [])
+
+export val sortBy = (arr: Json, keyFn: (Json) => Json): Json =>
+  arr
+
+export val sum = (arr: Json[]): Json =>
+  reduce(arr, 0, (acc, x) => acc + x)
+
+export val product = (arr: Json[]): Json =>
+  reduce(arr, 1, (acc, x) => acc * x)
+
+export val min = (arr: Json[]): Json =>
+  reduce(arr, arr[0], (acc, x) => if x < acc then x else acc)
+
+export val max = (arr: Json[]): Json =>
+  reduce(arr, arr[0], (acc, x) => if x > acc then x else acc)
+
+export val minBy = (arr: Json[], keyFn: (Json) => Json): Json =>
+  reduce(arr, arr[0], (acc, x) => if keyFn(x) < keyFn(acc) then x else acc)
+
+export val maxBy = (arr: Json[], keyFn: (Json) => Json): Json =>
+  reduce(arr, arr[0], (acc, x) => if keyFn(x) > keyFn(acc) then x else acc)
+
+export val append = (arr: Json[], item: Json): Json[] =>
+  concat(arr, [item])
+
+export val prepend = (arr: Json[], item: Json): Json[] =>
+  concat([item], arr)
+
+export val scan = (arr: Json[], init: Json, f: (Json, Json) => Json): Json[] =>
+  val result = [init]
+  var acc = init
+  lin_for(arr, item =>
+    val next = f(acc, item)
+    acc = next
+    push(result, acc)
+  )
+  result
+
+export val groupBy = (arr: Json, keyFn: (Json) => String): Json =>
+  var result = {}
+  for(arr, item =>
+    val key = keyFn(item)
+    if result[key] == null
+      then lin_object_set(result, key, [item])
+      else push(result[key], item)
+  )
+  result
+
+export val countBy = (arr: Json, keyFn: (Json) => String): Json =>
+  val groups = groupBy(arr, keyFn)
+  val ks = lin_keys(groups)
+  var result = {}
+  for(ks, k => lin_object_set(result, k, lin_length(groups[k])))
   result

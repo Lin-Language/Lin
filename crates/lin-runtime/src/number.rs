@@ -33,3 +33,9 @@ pub extern "C" fn lin_is_int32(s: *const LinString) -> bool {
         st.trim().parse::<i32>().is_ok()
     }
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn lin_is_float64(s: *const LinString) -> bool {
+    let st = (*s).as_str();
+    st.trim().parse::<f64>().is_ok()
+}
