@@ -1,3 +1,6 @@
+import { print } from "std/io"
+import { toString } from "std/string"
+
 val person = {
   "name": "Bob",
   "age": 42,

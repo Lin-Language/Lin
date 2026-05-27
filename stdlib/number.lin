@@ -1,14 +1,21 @@
+import foreign "lin-runtime"
+  val lin_parse_int32: (String) => Int32
+  val lin_parse_float64: (String) => Float64
+  val lin_to_int32: (Float64) => Int32
+  val lin_to_float64: (Int32) => Float64
+  val lin_is_int32: (String) => Boolean
+
 export val parseInt32 = (s: String): Int32 =>
-  __parseInt32(s)
+  lin_parse_int32(s)
 
 export val parseFloat64 = (s: String): Float64 =>
-  __parseFloat64(s)
+  lin_parse_float64(s)
 
 export val toInt32 = (v: Float64): Int32 =>
-  __toInt32(v)
+  lin_to_int32(v)
 
 export val toFloat64 = (v: Int32): Float64 =>
-  __toFloat64(v)
+  lin_to_float64(v)
 
 export val isInt32 = (s: String): Boolean =>
-  __isInt32(s)
+  lin_is_int32(s)

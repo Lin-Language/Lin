@@ -1,0 +1,32 @@
+export val async = (f: Json): Json =>
+  lin_async(f)
+
+export val await = (p: Json): Json =>
+  lin_await(p)
+
+export val parallel = (tasks: Json): Json[] =>
+  lin_parallel(tasks)
+
+export val race = (promises: Json): Json =>
+  lin_race(promises)
+
+export val timeout = (p: Json, ms: Int32): Json =>
+  lin_timeout(p, ms)
+
+export val retry = (f: Json, times: Int32): Json =>
+  lin_retry(f, times)
+
+export val threadPool = (size: Int32): Json =>
+  lin_thread_pool(size)
+
+export val worker = (handler: Json, onClose: Json): Json =>
+  lin_worker(handler, onClose)
+
+export val request = (w: Json, msg: Json): Json =>
+  lin_request(w, msg)
+
+export val message = (w: Json, msg: Json): Null =>
+  lin_message(w, msg)
+
+export val close = (w: Json): Null =>
+  lin_close(w)

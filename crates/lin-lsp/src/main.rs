@@ -295,8 +295,6 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/string" => Some(include_str!("../../../stdlib/string.lin")),
         "std/number" => Some(include_str!("../../../stdlib/number.lin")),
         "std/array"  => Some(include_str!("../../../stdlib/array.lin")),
-        "std/iter"   => Some(include_str!("../../../stdlib/iter.lin")),
-        "std/result" => Some(include_str!("../../../stdlib/result.lin")),
         _ => None,
     }
 }
@@ -395,8 +393,9 @@ fn stdlib_completion_items() -> Vec<CompletionItem> {
         ("every",  "(Iterable<T>, (T) => Boolean) => Boolean",       "std/array"),
         ("flatMap","(Iterable<T>, (T) => Iterable<U>) => Iterator<U>","std/array"),
         ("reverse","(T[]) => T[]",                                   "std/array"),
-        ("range",  "(Int32, Int32) => Iterator<Int32>", "std/iter"),
-        ("iterOf", "(T[]) => Iterator<T>",              "std/iter"),
+        ("range",  "(Int32, Int32) => Iterator<Int32>", "std/array"),
+        ("iterOf", "(T[]) => Iterator<T>",              "std/array"),
+        ("iter",   "(Json, Json, Json, Json) => Iterator<Json>", "std/array"),
         ("print",  "(T) => Null",                       "std/io"),
     ];
 

@@ -9,14 +9,13 @@ This document specifies the standard library for the Lin language. All modules a
 | Module | Description |
 | --- | --- |
 | [`std/string`](#stdstring) | String manipulation functions |
-| [`std/array`](#stdarray) | Array transformation and query functions |
-| [`std/iter`](#stditer) | Iterator constructors (auto-imported as globals) |
+| [`std/array`](#stdarray) | Array and iterator functions |
 | [`std/number`](#stdnumber) | Numeric parsing and conversion functions |
-| [`std/result`](#stdresult) | Result type for error handling |
+| [`std/object`](#stdobject) | Object introspection functions |
 | [`std/io`](#stdio) | stdin/stdout and terminal input |
 | [`std/fs`](#stdfs) | Filesystem read and write |
-| [`std/http`](#stdhttp) | HTTP client |
-| [`std/server`](#stdserver) | HTTP server |
+| [`std/http`](#stdhttp) | HTTP client and server |
+| [`std/async`](#stdasync) | Async, concurrency and workers |
 | [`std/template`](#stdtemplate) | String template rendering |
 | [`std/test`](#stdtest) | Test framework |
 
@@ -30,7 +29,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`toUpper`](#toUpper) | `(String) -> String` | Convert to uppercase |
 | [`toLower`](#toLower) | `(String) -> String` | Convert to lowercase |
 | [`substring`](#substring) | `(String, Int32, Int32) -> String` | Extract a slice by codepoint indices |
-| [`charAt`](#charAt) | `(String, Int32) -> String` | Single-codepoint string at index |
+| [`at`](#at) | `(String, Int32) -> String` | Character at index; negative indices count from end |
 | [`indexOf`](#indexOf-string) | `(String, String) -> Int32` | First occurrence of needle, or -1 |
 | [`length`](#length-string) | `(String) -> Int32` | Codepoint count |
 | [`contains`](#contains) | `(String, String) -> Boolean` | Test whether needle is a substring |
@@ -40,11 +39,19 @@ This document specifies the standard library for the Lin language. All modules a
 | [`join`](#join) | `(String[], String) -> String` | Join array of strings with separator |
 | [`replace`](#replace) | `(String, String, String) -> String` | Replace first occurrence |
 | [`repeat`](#repeat) | `(String, Int32) -> String` | Repeat a string n times |
+| [`toString`](#toString) | `(Json) -> String` | Convert any value to its string representation |
 
 **std/array**
 
 | Function | Signature | Summary |
 | --- | --- | --- |
+| [`for`](#for) | `(Iterable, (Json) -> Json) -> Null` | Iterate over array or iterator |
+| [`push`](#push) | `(Json[], Json) -> Null` | Append an element to an array in place |
+| [`length`](#length-array) | `(Json) -> Int32` | Length of array, string, or object |
+| [`range`](#range) | `(Int32, Int32) -> Iterator` | Integer range [start, end) |
+| [`iterOf`](#iterOf) | `(Json[]) -> Iterator` | Iterator over an array |
+| [`iter`](#iter) | `(() -> S, (S) -> Boolean, (S) -> S, (S) -> T) -> Iterator` | Build a custom iterator |
+| [`concat`](#concat) | `(Json[], Json[]) -> Json[]` | Concatenate two arrays |
 | [`map`](#map) | `(Json[], (Json) -> Json) -> Json[]` | Transform each element |
 | [`filter`](#filter) | `(Json[], (Json) -> Boolean) -> Json[]` | Keep elements matching predicate |
 | [`reduce`](#reduce) | `(Json[], Json, (Json, Json) -> Json) -> Json` | Fold left with an accumulator |
@@ -54,13 +61,6 @@ This document specifies the standard library for the Lin language. All modules a
 | [`flatMap`](#flatMap) | `(Json[], (Json) -> Json[]) -> Json[]` | Map then flatten one level |
 | [`indexOf`](#indexOf-array) | `(Json[], Json) -> Int32` | First index of value, or -1 |
 | [`reverse`](#reverse) | `(Json[]) -> Json[]` | Return a reversed copy |
-
-**std/iter**
-
-| Function | Signature | Summary |
-| --- | --- | --- |
-| [`range`](#range) | `(Int32, Int32) -> Iterator` | Integer range [start, end) |
-| [`iterOf`](#iterOf) | `(Json[]) -> Iterator` | Iterator over an array |
 
 **std/number**
 
@@ -72,11 +72,13 @@ This document specifies the standard library for the Lin language. All modules a
 | [`toFloat64`](#toFloat64) | `(Int32) -> Float64` | Widen Int32 to Float64 |
 | [`isInt32`](#isInt32) | `(String) -> Boolean` | Test whether a string parses as Int32 |
 
-**std/result**
+**std/object**
 
-| Name | Kind | Summary |
+| Function | Signature | Summary |
 | --- | --- | --- |
-| [`Result`](#Result) | type | Union of success and failure shapes |
+| [`keys`](#keys) | `(Json) -> String[]` | Array of object keys |
+| [`values`](#values) | `(Json) -> Json[]` | Array of object values |
+| [`entries`](#entries) | `(Json) -> [String, Json][]` | Array of `[key, value]` pairs |
 
 **std/io**
 
@@ -99,7 +101,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`writeJson`](#writeJson) | `(String, Json) -> Null \| Error` | Serialise value to JSON and write to file |
 | [`exists`](#exists) | `(String) -> Boolean` | Test whether a file or directory exists |
 
-**std/http**
+**std/http** — client
 
 | Function | Signature | Summary |
 | --- | --- | --- |
@@ -108,7 +110,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`fetchJson`](#fetchJson) | `(String) -> Json \| Error` | GET a URL and parse the body as JSON |
 | [`postJson`](#postJson) | `(String, Json) -> HttpResponse \| Error` | POST a JSON body to a URL |
 
-**std/server**
+**std/http** — server
 
 | Function | Signature | Summary |
 | --- | --- | --- |
@@ -116,10 +118,26 @@ This document specifies the standard library for the Lin language. All modules a
 | [`json`](#json-helper) | `(Int32, Json) -> HttpResponse` | Build a JSON response |
 | [`text`](#text-helper) | `(Int32, String) -> HttpResponse` | Build a plain-text response |
 | [`redirect`](#redirect) | `(String) -> HttpResponse` | Build a 302 redirect response |
-| [`notFound`](#notFound) | `() -> HttpResponse` | Build a 404 response |
+| [`notFound`](#notFound) | `HttpResponse` | 404 response value |
 | [`badRequest`](#badRequest) | `(String) -> HttpResponse` | Build a 400 response with a message |
 | [`pathMatch`](#pathMatch) | `(String, String) -> { ...String } \| Null` | Match a path pattern, returning captured params |
 | [`parseBody`](#parseBody) | `(HttpRequest) -> Json \| Error` | Parse the request body as JSON |
+
+**std/async**
+
+| Function | Signature | Summary |
+| --- | --- | --- |
+| [`async`](#async) | `(() -> T) -> Promise` | Run a thunk asynchronously |
+| [`await`](#await) | `(Promise) -> T` | Block until a promise resolves |
+| [`parallel`](#parallel) | `((() -> T)[]) -> T[]` | Run an array of thunks concurrently, collect results |
+| [`race`](#race) | `(Promise[]) -> T` | Resolve with the first promise to complete |
+| [`timeout`](#timeout) | `(Promise, Int32) -> T` | Add a millisecond timeout to a promise |
+| [`retry`](#retry) | `(() -> T, Int32) -> T` | Retry a thunk up to n times on failure |
+| [`threadPool`](#threadPool) | `(Int32) -> ThreadPool` | Create a thread pool with n workers |
+| [`worker`](#worker) | `((Msg) -> Reply, () -> Null) -> Worker` | Create a background worker |
+| [`request`](#request) | `(Worker, Msg) -> Reply` | Send a request to a worker and wait for reply |
+| [`message`](#message) | `(Worker, Msg) -> Null` | Send a fire-and-forget message to a worker |
+| [`close`](#close) | `(Worker) -> Null` | Shut down a worker |
 
 **std/template**
 
@@ -141,7 +159,7 @@ This document specifies the standard library for the Lin language. All modules a
 
 ## std/string
 
-String operations are codepoint-aware. All indices and lengths count Unicode codepoints, not bytes. Byte-level access is not part of this module.
+String operations are codepoint-aware. All indices and lengths count Unicode codepoints, not bytes.
 
 Import:
 
@@ -157,12 +175,11 @@ import { trim, toUpper, indexOf } from "std/string"
 val trim: (s: String) -> String
 ```
 
-Returns a copy of `s` with all leading and trailing ASCII whitespace characters (`' '`, `'\t'`, `'\n'`, `'\r'`) removed. Interior whitespace is unchanged.
+Returns a copy of `s` with all leading and trailing ASCII whitespace characters (`' '`, `'\t'`, `'\n'`, `'\r'`) removed.
 
 ```txt
 trim("  hello  ")   // "hello"
 trim("\t\n")        // ""
-trim("no change")   // "no change"
 ```
 
 ---
@@ -203,27 +220,27 @@ toLower("CAFÉ")    // "café"
 val substring: (s: String, start: Int32, end: Int32) -> String
 ```
 
-Returns the slice of `s` covering codepoint indices `[start, end)`. Both `start` and `end` are zero-based codepoint offsets. If `end` exceeds the codepoint count of `s`, it is clamped to the end of the string. If `start >= end`, returns `""`.
+Returns the slice of `s` covering codepoint indices `[start, end)`. If `end` exceeds the codepoint count it is clamped. If `start >= end`, returns `""`.
 
 ```txt
 substring("hello", 1, 3)   // "el"
 substring("hello", 0, 5)   // "hello"
-substring("hello", 2, 2)   // ""
 ```
 
 ---
 
-### charAt
+### at
 
 ```txt
-val charAt: (s: String, index: Int32) -> String
+val at: (s: String, index: Int32) -> String
 ```
 
-Returns a single-codepoint string at zero-based codepoint `index`. Equivalent to `substring(s, index, index + 1)`.
+Returns the single-codepoint string at `index`. Negative indices count from the end: `-1` is the last character, `-2` is second-to-last. If the resolved index is out of bounds, returns `""`.
 
 ```txt
-charAt("hello", 0)   // "h"
-charAt("hello", 4)   // "o"
+at("hello", 0)    // "h"
+at("hello", -1)   // "o"
+at("hello", -2)   // "l"
 ```
 
 ---
@@ -239,7 +256,6 @@ Returns the zero-based codepoint index of the first occurrence of `needle` withi
 ```txt
 indexOf("hello world", "world")   // 6
 indexOf("hello", "xyz")           // -1
-indexOf("abcabc", "bc")           // 1
 ```
 
 ---
@@ -250,11 +266,10 @@ indexOf("abcabc", "bc")           // 1
 val length: (s: String) -> Int32
 ```
 
-Returns the number of Unicode codepoints in `s`. This is distinct from the byte length, which may be larger for non-ASCII strings.
+Returns the number of Unicode codepoints in `s`.
 
 ```txt
 length("hello")   // 5
-length("")        // 0
 length("café")    // 4
 ```
 
@@ -271,7 +286,6 @@ Returns `true` if `needle` appears anywhere within `s`.
 ```txt
 contains("hello world", "world")   // true
 contains("hello", "xyz")           // false
-contains("", "")                   // true
 ```
 
 ---
@@ -287,7 +301,6 @@ Returns `true` if `s` begins with `prefix`.
 ```txt
 startsWith("hello", "hel")   // true
 startsWith("hello", "llo")   // false
-startsWith("hello", "")      // true
 ```
 
 ---
@@ -303,7 +316,6 @@ Returns `true` if `s` ends with `suffix`.
 ```txt
 endsWith("hello", "llo")   // true
 endsWith("hello", "hel")   // false
-endsWith("hello", "")      // true
 ```
 
 ---
@@ -314,12 +326,11 @@ endsWith("hello", "")      // true
 val split: (s: String, delimiter: String) -> String[]
 ```
 
-Splits `s` at each occurrence of `delimiter` and returns the resulting parts as an array. The delimiter is not included in any part. If `s` does not contain `delimiter`, returns a single-element array containing `s`. If `delimiter` is `""`, the behaviour is implementation-defined in v0; callers should avoid splitting on the empty string.
+Splits `s` at each occurrence of `delimiter` and returns the resulting parts as an array.
 
 ```txt
-split("a,b,c", ",")      // ["a", "b", "c"]
-split("hello", "x")      // ["hello"]
-split("a,,b", ",")       // ["a", "", "b"]
+split("a,b,c", ",")   // ["a", "b", "c"]
+split("hello", "x")   // ["hello"]
 ```
 
 ---
@@ -330,12 +341,11 @@ split("a,,b", ",")       // ["a", "", "b"]
 val join: (arr: String[], separator: String) -> String
 ```
 
-Concatenates the elements of `arr` into a single string, with `separator` inserted between each pair of adjacent elements.
+Concatenates the elements of `arr` into a single string, with `separator` inserted between each pair.
 
 ```txt
-join(["a", "b", "c"], ",")    // "a,b,c"
-join(["hello"], "-")           // "hello"
-join([], "-")                  // ""
+join(["a", "b", "c"], ",")   // "a,b,c"
+join([], "-")                 // ""
 ```
 
 ---
@@ -346,12 +356,11 @@ join([], "-")                  // ""
 val replace: (s: String, pattern: String, replacement: String) -> String
 ```
 
-Returns a copy of `s` with the **first** occurrence of `pattern` replaced by `replacement`. If `pattern` does not appear in `s`, returns `s` unchanged.
+Returns a copy of `s` with the **first** occurrence of `pattern` replaced by `replacement`.
 
 ```txt
 replace("hello world", "world", "Lin")   // "hello Lin"
 replace("aaa", "a", "b")                 // "baa"
-replace("hello", "xyz", "!")             // "hello"
 ```
 
 ---
@@ -362,24 +371,154 @@ replace("hello", "xyz", "!")             // "hello"
 val repeat: (s: String, count: Int32) -> String
 ```
 
-Returns a string consisting of `s` repeated `count` times. If `count` is `0`, returns `""`. If `count` is negative, behaviour is a runtime error.
+Returns a string consisting of `s` repeated `count` times. If `count` is `0`, returns `""`.
 
 ```txt
 repeat("ab", 3)   // "ababab"
-repeat("x", 0)    // ""
 repeat("-", 5)    // "-----"
+```
+
+---
+
+### toString
+
+```txt
+val toString: (value: Json) -> String
+```
+
+Converts any value to its string representation. Strings are returned as-is. Numbers, booleans, `null`, arrays, and objects are formatted as JSON.
+
+```txt
+toString(42)           // "42"
+toString(true)         // "true"
+toString([1, 2])       // "[1, 2]"
+toString("hello")      // "hello"
 ```
 
 ---
 
 ## std/array
 
-Array functions operate on `Json[]` values. All functions are non-mutating: they return new arrays and do not modify their inputs.
+Array and iterator functions. All transformation functions are non-mutating and return new values.
 
 Import:
 
 ```txt
-import { map, filter, reduce } from "std/array"
+import { map, filter, for, range } from "std/array"
+```
+
+---
+
+### for
+
+```txt
+val for: (iterable: Json[] | Iterator, f: (Json) -> Json) -> Null
+```
+
+Iterates over each element of `iterable`, calling `f` with each element. The return value of `f` is discarded. Works on arrays and iterators.
+
+```txt
+[1, 2, 3].for(x => print(toString(x)))
+range(0, 5).for(i => print(toString(i)))
+```
+
+---
+
+### push
+
+```txt
+val push: (arr: Json[], item: Json) -> Null
+```
+
+Appends `item` to `arr` in place. This is one of the few mutating operations in Lin — it modifies the array that was passed in.
+
+```txt
+val xs = []
+push(xs, 1)
+push(xs, 2)
+// xs is now [1, 2]
+```
+
+---
+
+### length (array) {#length-array}
+
+```txt
+val length: (x: Json) -> Int32
+```
+
+Returns the length of an array, string, or object (number of keys).
+
+```txt
+length([1, 2, 3])        // 3
+length("hello")          // 5
+length({ "a": 1 })       // 1
+```
+
+---
+
+### range
+
+```txt
+val range: (start: Int32, end: Int32) -> Iterator
+```
+
+Returns an iterator that yields the integers `start, start+1, ..., end-1`. If `start >= end`, the iterator is empty.
+
+```txt
+range(0, 3).for(i => print(toString(i)))   // prints 0, 1, 2
+range(1, 4).map(i => i * 2)               // [2, 4, 6]
+```
+
+---
+
+### iterOf
+
+```txt
+val iterOf: (arr: Json[]) -> Iterator
+```
+
+Returns an iterator that yields each element of `arr` in order. Produces a first-class iterator value that can be passed around before consumption.
+
+```txt
+val it = iterOf([10, 20, 30])
+it.for(x => print(toString(x)))   // prints 10, 20, 30
+```
+
+---
+
+### iter
+
+```txt
+val iter: (init: () -> S, hasNext: (S) -> Boolean, next: (S) -> S, value: (S) -> T) -> Iterator
+```
+
+Constructs a custom iterator from four functions: `init` produces the initial state, `hasNext` tests whether to continue, `next` advances the state, and `value` extracts the current element.
+
+```txt
+// Fibonacci iterator
+val fibs = iter(
+  () => { "a": 0, "b": 1 },
+  s => s["a"] < 100,
+  s => { "a": s["b"], "b": s["a"] + s["b"] },
+  s => s["a"]
+)
+fibs.for(n => print(toString(n)))
+```
+
+---
+
+### concat
+
+```txt
+val concat: (a: Json[], b: Json[]) -> Json[]
+```
+
+Returns a new array containing all elements of `a` followed by all elements of `b`.
+
+```txt
+concat([1, 2], [3, 4])   // [1, 2, 3, 4]
+concat([], [1])           // [1]
 ```
 
 ---
@@ -405,11 +544,10 @@ Returns a new array formed by applying `f` to each element of `arr` in order.
 val filter: (arr: Json[], f: (Json) -> Boolean) -> Json[]
 ```
 
-Returns a new array containing only the elements of `arr` for which `f` returns `true`, in their original order.
+Returns a new array containing only the elements for which `f` returns `true`.
 
 ```txt
 [1, 2, 3, 4].filter(x => x > 2)   // [3, 4]
-[1, 2, 3].filter(x => x == 2)     // [2]
 ```
 
 ---
@@ -420,12 +558,10 @@ Returns a new array containing only the elements of `arr` for which `f` returns 
 val reduce: (arr: Json[], init: Json, f: (Json, Json) -> Json) -> Json
 ```
 
-Folds `arr` left-to-right, starting from `init`. `f` receives the running accumulator as its first argument and the current element as its second.
+Folds `arr` left-to-right starting from `init`. `f` receives the accumulator as its first argument and the current element as its second.
 
 ```txt
 [1, 2, 3, 4].reduce(0, (acc, x) => acc + x)   // 10
-[1, 2, 3].reduce(1, (acc, x) => acc * x)       // 6
-[].reduce(0, (acc, x) => acc + x)              // 0
 ```
 
 ---
@@ -436,7 +572,7 @@ Folds `arr` left-to-right, starting from `init`. `f` receives the running accumu
 val find: (arr: Json[], f: (Json) -> Boolean) -> Json
 ```
 
-Returns the first element of `arr` for which `f` returns `true`, or `null` if no such element exists.
+Returns the first element for which `f` returns `true`, or `null` if none.
 
 ```txt
 [1, 2, 3].find(x => x > 1)   // 2
@@ -451,12 +587,11 @@ Returns the first element of `arr` for which `f` returns `true`, or `null` if no
 val some: (arr: Json[], f: (Json) -> Boolean) -> Boolean
 ```
 
-Returns `true` if `f` returns `true` for at least one element of `arr`. Returns `false` for an empty array. Note: `some` does not short-circuit in the current implementation — it visits every element even after a match.
+Returns `true` if `f` returns `true` for at least one element. Returns `false` for an empty array.
 
 ```txt
 [1, 2, 3].some(x => x > 2)   // true
 [1, 2, 3].some(x => x > 9)   // false
-[].some(x => true)            // false
 ```
 
 ---
@@ -467,12 +602,11 @@ Returns `true` if `f` returns `true` for at least one element of `arr`. Returns 
 val every: (arr: Json[], f: (Json) -> Boolean) -> Boolean
 ```
 
-Returns `true` if `f` returns `true` for every element of `arr`. Returns `true` for an empty array. Note: `every` does not short-circuit in the current implementation — it visits every element even after a mismatch.
+Returns `true` if `f` returns `true` for every element. Returns `true` for an empty array.
 
 ```txt
 [1, 2, 3].every(x => x > 0)   // true
 [1, 2, 3].every(x => x > 1)   // false
-[].every(x => false)           // true
 ```
 
 ---
@@ -483,11 +617,10 @@ Returns `true` if `f` returns `true` for every element of `arr`. Returns `true` 
 val flatMap: (arr: Json[], f: (Json) -> Json[]) -> Json[]
 ```
 
-Applies `f` to each element of `arr` and concatenates the resulting arrays into a single flat array. Equivalent to mapping then flattening exactly one level.
+Applies `f` to each element and concatenates the resulting arrays into a single flat array.
 
 ```txt
 [1, 2, 3].flatMap(x => [x, x * 2])   // [1, 2, 2, 4, 3, 6]
-[[1, 2], [3]].flatMap(x => x)         // [1, 2, 3]
 ```
 
 ---
@@ -498,12 +631,11 @@ Applies `f` to each element of `arr` and concatenates the resulting arrays into 
 val indexOf: (arr: Json[], target: Json) -> Int32
 ```
 
-Returns the zero-based index of the first element in `arr` that is deeply equal to `target`, or `-1` if not found. Equality uses the same semantics as the `==` operator (see §24.5 of the specification).
+Returns the zero-based index of the first element deeply equal to `target`, or `-1` if not found.
 
 ```txt
-[10, 20, 30].indexOf(20)       // 1
-["a", "b", "c"].indexOf("b")   // 1
-[1, 2, 3].indexOf(9)           // -1
+[10, 20, 30].indexOf(20)   // 1
+[1, 2, 3].indexOf(9)       // -1
 ```
 
 ---
@@ -514,57 +646,10 @@ Returns the zero-based index of the first element in `arr` that is deeply equal 
 val reverse: (arr: Json[]) -> Json[]
 ```
 
-Returns a new array with the elements of `arr` in reversed order. Does not modify `arr`.
+Returns a new array with the elements in reversed order.
 
 ```txt
-[1, 2, 3].reverse()     // [3, 2, 1]
-["a"].reverse()          // ["a"]
-[].reverse()             // []
-```
-
----
-
-## std/iter
-
-The `range` and `iterOf` functions from `std/iter` are automatically imported into the global scope — programs can use them without an explicit import. They are also re-importable explicitly if desired.
-
-Import (explicit, optional):
-
-```txt
-import { range, iterOf } from "std/iter"
-```
-
-Iterators are opaque runtime values. They can be consumed once with the built-in `for` function (or the `.for(f)` dot-call form) and cannot be reset or iterated multiple times.
-
----
-
-### range
-
-```txt
-val range: (start: Int32, end: Int32) -> Iterator
-```
-
-Returns an iterator that yields the integers `start, start+1, ..., end-1`. The range is half-open: `start` is included, `end` is excluded. If `start >= end`, the iterator is empty and yields nothing.
-
-```txt
-range(0, 3).for(i => print(i))   // prints 0, 1, 2
-range(5, 5).for(i => print(i))   // prints nothing
-range(1, 4).for(i => print(i))   // prints 1, 2, 3
-```
-
----
-
-### iterOf
-
-```txt
-val iterOf: (arr: Json[]) -> Iterator
-```
-
-Returns an iterator that yields each element of `arr` in order. Unlike calling `.for(f)` directly on an array, `iterOf` produces a first-class iterator value that can be passed around before consumption.
-
-```txt
-val it = iterOf([10, 20, 30])
-it.for(x => print(x))   // prints 10, 20, 30
+[1, 2, 3].reverse()   // [3, 2, 1]
 ```
 
 ---
@@ -585,14 +670,11 @@ import { parseInt32, parseFloat64 } from "std/number"
 val parseInt32: (s: String) -> Int32
 ```
 
-Parses `s` as a base-10 integer and returns the result as an `Int32`. Leading and trailing whitespace in `s` is not trimmed — callers should `trim` if needed. If `s` cannot be parsed as a valid integer (contains non-digit characters, is empty, or the value overflows `Int32`), the behaviour is a runtime error.
-
-Use `isInt32` to guard the call if the input is untrusted.
+Parses `s` as a base-10 integer. If `s` cannot be parsed or the value overflows `Int32`, the result is a runtime error. Use `isInt32` to guard untrusted input.
 
 ```txt
-parseInt32("42")     // 42
-parseInt32("-7")     // -7
-parseInt32("0")      // 0
+parseInt32("42")   // 42
+parseInt32("-7")   // -7
 ```
 
 ---
@@ -603,12 +685,11 @@ parseInt32("0")      // 0
 val parseFloat64: (s: String) -> Float64
 ```
 
-Parses `s` as a base-10 floating-point number and returns the result as a `Float64`. Supports integer strings, decimal strings, and scientific notation (e.g. `"3.14"`, `"1e10"`). Leading and trailing whitespace is not trimmed. If `s` cannot be parsed, the behaviour is a runtime error.
+Parses `s` as a base-10 floating-point number.
 
 ```txt
 parseFloat64("3.14")   // 3.14
 parseFloat64("1e10")   // 10000000000.0
-parseFloat64("42")     // 42.0
 ```
 
 ---
@@ -619,12 +700,11 @@ parseFloat64("42")     // 42.0
 val toInt32: (v: Float64) -> Int32
 ```
 
-Converts a `Float64` to `Int32` by truncating toward zero (dropping the fractional part). If the truncated value cannot be represented as an `Int32`, the behaviour is a runtime error.
+Converts a `Float64` to `Int32` by truncating toward zero.
 
 ```txt
 toInt32(3.9)    // 3
 toInt32(-2.1)   // -2
-toInt32(0.0)    // 0
 ```
 
 ---
@@ -635,11 +715,10 @@ toInt32(0.0)    // 0
 val toFloat64: (v: Int32) -> Float64
 ```
 
-Widens an `Int32` to `Float64`. This conversion is always exact.
+Widens an `Int32` to `Float64`. Always exact.
 
 ```txt
-toFloat64(42)    // 42.0
-toFloat64(-1)    // -1.0
+toFloat64(42)   // 42.0
 ```
 
 ---
@@ -650,83 +729,75 @@ toFloat64(-1)    // -1.0
 val isInt32: (s: String) -> Boolean
 ```
 
-Returns `true` if `s` can be successfully parsed as an `Int32` by `parseInt32`. Use this to guard calls to `parseInt32` on untrusted input.
+Returns `true` if `s` can be successfully parsed as an `Int32`.
 
 ```txt
 isInt32("42")      // true
-isInt32("-7")      // true
 isInt32("3.14")    // false
-isInt32("hello")   // false
 isInt32("")        // false
 ```
 
 ---
 
-## std/result
-
-The `Result` type is a structural convention — it has no runtime representation beyond ordinary JSON objects. No import is needed to use the shape; import from `std/result` if you want the type alias by name.
+## std/object
 
 Import:
 
 ```txt
-import { Result } from "std/result"
+import { keys, values, entries } from "std/object"
 ```
 
 ---
 
-### Result
+### keys
 
 ```txt
-type Result<T, E> =
-  | { "type": "success", "value": T }
-  | { "type": "failure", "error": E }
+val keys: (obj: Json) -> String[]
 ```
 
-`Result<T, E>` represents an operation that either succeeds with a value of type `T`, or fails with an error of type `E`. The two variants are distinguished by the `"type"` field.
-
-Because `Result` is structural, any code that produces an object with `"type": "success"` and a `"value"` field is already compatible with `Result`. No constructor functions are required.
-
-**Constructing results:**
+Returns an array of the object's keys in insertion order.
 
 ```txt
-val success = { "type": "success", "value": 42 }
-val failure = { "type": "failure", "error": "not found" }
+keys({ "a": 1, "b": 2 })   // ["a", "b"]
 ```
 
-**Consuming results with pattern matching:**
+---
+
+### values
 
 ```txt
-val outcome = computeSomething()
-
-match outcome
-  is { "type": "success", "value": v } => print("got ${v}")
-  is { "type": "failure", "error": e } => print("failed: ${e}")
+val values: (obj: Json) -> Json[]
 ```
 
-**Chaining results:**
-
-Because results are plain objects, you can use `map` over arrays of results or write your own combinators.
+Returns an array of the object's values in insertion order.
 
 ```txt
-val handleResult = (r: Result<Int32, String>) =>
-  match r
-    is { "type": "success", "value": v } => v * 2
-    is { "type": "failure", "error": _ } => 0
+values({ "a": 1, "b": 2 })   // [1, 2]
+```
+
+---
+
+### entries
+
+```txt
+val entries: (obj: Json) -> [String, Json][]
+```
+
+Returns an array of `[key, value]` pairs in insertion order.
+
+```txt
+entries({ "a": 1, "b": 2 })   // [["a", 1], ["b", 2]]
 ```
 
 ---
 
 ## std/io
 
-Functions for reading from standard input and writing to standard output.
-
 Import:
 
 ```txt
 import { print, readLine, lines } from "std/io"
 ```
-
-`print` is also available as a global without importing.
 
 ---
 
@@ -736,16 +807,12 @@ import { print, readLine, lines } from "std/io"
 val print: (value: Json) -> Null
 ```
 
-Writes `value` to standard output followed by a newline. The value is formatted as a human-readable string: strings are printed without surrounding quotes, numbers are printed in their natural decimal form, booleans as `true`/`false`, `null` as `null`, arrays and objects as JSON.
-
-Returns `null`.
+Writes `value` to standard output followed by a newline. Strings are printed without quotes; other values are formatted as JSON.
 
 ```txt
 print("hello")       // hello
 print(42)            // 42
-print(true)          // true
 print([1, 2, 3])     // [1, 2, 3]
-print({"a": 1})      // {"a": 1}
 ```
 
 ---
@@ -756,15 +823,13 @@ print({"a": 1})      // {"a": 1}
 val readLine: () -> String | Null
 ```
 
-Reads one line from standard input and returns it as a string, with the trailing newline stripped. Returns `Null` when standard input is exhausted (EOF).
-
-This is a blocking call: it waits until the user presses Enter or the input stream closes.
+Reads one line from stdin, stripping the trailing newline. Returns `Null` on EOF.
 
 ```txt
-val name = readLine()   // blocks until Enter
+val name = readLine()
 match name
-  is Null   => print("no input")
-  else      => print("hello ${name}")
+  is Null => print("no input")
+  else    => print("hello ${name}")
 ```
 
 ---
@@ -775,15 +840,10 @@ match name
 val lines: () -> Iterator
 ```
 
-Returns an iterator that yields one `String` per line from standard input, with trailing newlines stripped. The iterator terminates when EOF is reached. Each step blocks until the next line is available.
-
-The canonical form for reading stdin line-by-line:
+Returns an iterator that yields one `String` per line from stdin. Terminates at EOF.
 
 ```txt
-lines().for(line =>
-  val result = process(line.trim())
-  print(result)
-)
+lines().for(line => print(line.trim()))
 ```
 
 ---
@@ -794,20 +854,15 @@ lines().for(line =>
 val readAll: () -> String
 ```
 
-Reads all of standard input and returns it as a single string. The string includes embedded newlines. This is a blocking call that returns only when EOF is reached.
+Reads all of stdin and returns it as a single string including embedded newlines.
 
 ```txt
 val raw = readAll()
-val trimmed = raw.trim()
 ```
 
 ---
 
 ## std/fs
-
-Filesystem functions for reading and writing files. All functions accept paths as strings. Relative paths are resolved relative to the process working directory.
-
-Fallible functions return `T | Error`. The `Error` value carries a message describing the OS-level failure (file not found, permission denied, etc.).
 
 Import:
 
@@ -823,7 +878,7 @@ import { readFile, writeFile, readLines } from "std/fs"
 val readFile: (path: String) -> String | Error
 ```
 
-Reads the entire contents of the file at `path` and returns it as a `String`. The file is read as UTF-8; a decoding error produces an `Error`.
+Reads the entire contents of the file at `path` as a UTF-8 string.
 
 ```txt
 match readFile("config.txt")
@@ -839,13 +894,7 @@ match readFile("config.txt")
 val writeFile: (path: String, content: String) -> Null | Error
 ```
 
-Writes `content` to the file at `path`, creating the file if it does not exist and replacing its contents if it does. Returns `Null` on success or an `Error` on failure.
-
-```txt
-match writeFile("out.txt", "hello\n")
-  is { "type": "failure", "error": e } => print("write failed: ${e}")
-  else                                  => null
-```
+Writes `content` to the file at `path`, replacing existing contents.
 
 ---
 
@@ -855,11 +904,7 @@ match writeFile("out.txt", "hello\n")
 val appendFile: (path: String, content: String) -> Null | Error
 ```
 
-Appends `content` to the end of the file at `path`, creating the file if it does not exist. Returns `Null` on success or an `Error` on failure.
-
-```txt
-appendFile("log.txt", "[INFO] started\n")
-```
+Appends `content` to the end of the file at `path`.
 
 ---
 
@@ -869,13 +914,11 @@ appendFile("log.txt", "[INFO] started\n")
 val readLines: (path: String) -> Iterator | Error
 ```
 
-Opens the file at `path` and returns an iterator that yields one `String` per line, with trailing newlines stripped. Returns an `Error` immediately if the file cannot be opened. Lines are read lazily — each step reads the next line from the OS buffer.
-
-The iterator must be fully consumed or the underlying file handle will not be closed until the program exits.
+Returns an iterator that yields one `String` per line from the file.
 
 ```txt
 match readLines("data.csv")
-  is { "type": "failure", "error": e } => print("cannot open: ${e}")
+  is { "type": "failure", "error": e }         => print("cannot open: ${e}")
   is { "type": "success", "value": it } =>
     it.for(line => process(line))
 ```
@@ -888,13 +931,7 @@ match readLines("data.csv")
 val readJson: (path: String) -> Json | Error
 ```
 
-Reads the file at `path` and parses its contents as JSON. Returns the parsed `Json` value on success, or an `Error` if the file cannot be read or the contents are not valid JSON.
-
-```txt
-match readJson("config.json")
-  is { "type": "success", "value": cfg } => run(cfg)
-  is { "type": "failure", "error": e }   => print("bad config: ${e}")
-```
+Reads and parses the file at `path` as JSON.
 
 ---
 
@@ -904,12 +941,7 @@ match readJson("config.json")
 val writeJson: (path: String, value: Json) -> Null | Error
 ```
 
-Serialises `value` to a JSON string and writes it to the file at `path`, replacing any existing contents. The output is compact (no added whitespace). Returns `Null` on success or an `Error` on failure.
-
-```txt
-val record = { "name": "Alice", "score": 99 }
-writeJson("result.json", record)
-```
+Serialises `value` to compact JSON and writes it to `path`.
 
 ---
 
@@ -919,152 +951,18 @@ writeJson("result.json", record)
 val exists: (path: String) -> Boolean
 ```
 
-Returns `true` if a file or directory exists at `path`, `false` otherwise. Does not distinguish between files and directories; use `readFile` or other operations to detect the kind.
-
-```txt
-if exists("config.json")
-  then readJson("config.json")
-  else { "debug": false }
-```
+Returns `true` if a file or directory exists at `path`.
 
 ---
 
 ## std/http
 
-HTTP client functions for making outbound requests. All functions are synchronous and blocking. Use `async` at the call site when concurrency is needed.
-
-Fallible functions return `T | Error`. The `Error` value carries a message describing the failure (network error, DNS failure, TLS error, etc.). HTTP error status codes (4xx, 5xx) are **not** errors — they are returned as `HttpResponse` values with the appropriate `"status"` field. Only transport-level failures produce `Error`.
+HTTP client functions and server helpers. All client functions are synchronous and blocking.
 
 Import:
 
 ```txt
-import { fetch, fetchJson, postJson } from "std/http"
-```
-
-### Types
-
-```txt
-type HttpResponse = {
-  "status": Int32,
-  "headers": { ...String },
-  "body": String
-}
-
-type HttpOptions = {
-  "method": String,
-  "headers": { ...String },
-  "body": String
-}
-```
-
-`HttpResponse` and `HttpOptions` are structural types. All fields of `HttpOptions` are optional at the call site — omitted fields fall back to defaults (`"GET"`, empty headers, empty body).
-
----
-
-### fetch
-
-```txt
-val fetch: (url: String) -> HttpResponse | Error
-```
-
-Sends a GET request to `url` and returns the response. On a transport-level failure, returns an `Error`.
-
-HTTP error status codes are returned as successful `HttpResponse` values; callers must inspect `"status"` to detect application-level errors.
-
-```txt
-match fetch("https://api.example.com/ping")
-  is { "type": "failure", "error": e }      => print("network error: ${e}")
-  is { "type": "success", "value": resp } =>
-    if resp["status"] == 200
-      then print("ok")
-      else print("unexpected status: ${resp["status"]}")
-```
-
----
-
-### fetchWith
-
-```txt
-val fetchWith: (url: String, options: HttpOptions) -> HttpResponse | Error
-```
-
-Sends a request to `url` using the method, headers, and body specified in `options`. Use this for non-GET methods, custom headers, or request bodies. Fields not provided in `options` use defaults.
-
-```txt
-val resp = fetchWith("https://api.example.com/items", {
-  "method": "DELETE",
-  "headers": { "Authorization": "Bearer ${token}" },
-  "body": ""
-})
-```
-
----
-
-### fetchJson
-
-```txt
-val fetchJson: (url: String) -> Json | Error
-```
-
-Sends a GET request to `url`, parses the response body as JSON, and returns the parsed value. Returns an `Error` if there is a transport failure, the response status is not 2xx, or the body is not valid JSON.
-
-This is the idiomatic function for consuming JSON APIs:
-
-```txt
-match fetchJson("https://api.example.com/users")
-  is { "type": "success", "value": users } =>
-    users.map(u => u["name"]).for(name => print(name))
-  is { "type": "failure", "error": e }     =>
-    print("failed: ${e}")
-```
-
-Concurrent requests use `async` at the call site:
-
-```txt
-val [users, posts] = await([
-  async(() => fetchJson("https://api.example.com/users")),
-  async(() => fetchJson("https://api.example.com/posts"))
-])
-```
-
----
-
-### postJson
-
-```txt
-val postJson: (url: String, body: Json) -> HttpResponse | Error
-```
-
-Serialises `body` as JSON and sends it as a POST request to `url` with `Content-Type: application/json`. Returns the full `HttpResponse` (rather than a parsed body) so the caller can inspect the status code and headers. Returns an `Error` on transport failure.
-
-```txt
-val resp = postJson("https://api.example.com/users", {
-  "name": "Alice",
-  "email": "alice@example.com"
-})
-
-match resp
-  is { "type": "success", "value": r } =>
-    print("created with status ${r["status"]}")
-  is { "type": "failure", "error": e } =>
-    print("post failed: ${e}")
-```
-
----
-
-## std/server
-
-HTTP server functions. The module provides two modes with the same handler signature:
-
-- **`serve`** — single-threaded, sequential. The handler processes one request at a time. `var` state is safe without any locking. The natural choice for most servers.
-- **`threadPool.serve`** — multi-threaded. `ThreadPool` is the existing concurrency primitive from §32.5; `.serve` is an additional method on it. The handler is called concurrently on the pool's threads. The same `var`-capture restriction as `pool.async` applies — the handler must not close over `var` bindings.
-
-Both forms block the calling thread. Wrap in `async` if the server should run in the background alongside other work.
-
-Import:
-
-```txt
-import { serve, json, notFound, pathMatch } from "std/server"
+import { fetch, fetchJson, serve, json, notFound } from "std/http"
 ```
 
 ### Types
@@ -1077,17 +975,83 @@ type HttpRequest = {
   "headers": { ...String },
   "body":    String
 }
-```
 
-`HttpResponse` is the same type as in `std/http`:
-
-```txt
 type HttpResponse = {
   "status":  Int32,
   "headers": { ...String },
   "body":    String
 }
+
+type HttpOptions = {
+  "method":  String,
+  "headers": { ...String },
+  "body":    String
+}
 ```
+
+`HttpOptions` fields are all optional — omitted fields use defaults (`"GET"`, empty headers, empty body).
+
+---
+
+### fetch
+
+```txt
+val fetch: (url: String) -> HttpResponse | Error
+```
+
+Sends a GET request to `url`. Returns an `Error` only on transport-level failure; HTTP error status codes (4xx, 5xx) are returned as `HttpResponse` values.
+
+```txt
+match fetch("https://api.example.com/ping")
+  is { "type": "failure", "error": e }        => print("network error: ${e}")
+  is { "type": "success", "value": resp } =>
+    print(toString(resp["status"]))
+```
+
+---
+
+### fetchWith
+
+```txt
+val fetchWith: (url: String, options: HttpOptions) -> HttpResponse | Error
+```
+
+Sends a request using the method, headers, and body in `options`.
+
+```txt
+val resp = fetchWith("https://api.example.com/items", {
+  "method": "DELETE",
+  "headers": { "Authorization": "Bearer ${token}" }
+})
+```
+
+---
+
+### fetchJson
+
+```txt
+val fetchJson: (url: String) -> Json | Error
+```
+
+GET `url`, parse the body as JSON. Returns an `Error` if transport fails, the status is not 2xx, or the body is not valid JSON.
+
+```txt
+match fetchJson("https://api.example.com/users")
+  is { "type": "success", "value": users } =>
+    users.map(u => u["name"]).for(name => print(name))
+  is { "type": "failure", "error": e }     =>
+    print("failed: ${e}")
+```
+
+---
+
+### postJson
+
+```txt
+val postJson: (url: String, body: Json) -> HttpResponse | Error
+```
+
+POST `body` as JSON to `url` with `Content-Type: application/json`.
 
 ---
 
@@ -1097,88 +1061,13 @@ type HttpResponse = {
 val serve: (port: Int32, handler: (HttpRequest) -> HttpResponse) -> Null
 ```
 
-Starts an HTTP server on `port` and calls `handler` for each incoming request, **sequentially** — one request at a time. Blocks the calling thread indefinitely.
-
-Because the handler runs on a single thread, closing over `var` bindings is safe.
+Starts an HTTP server on `port` and calls `handler` for each incoming request **sequentially** — one request at a time. Blocks indefinitely.
 
 ```txt
-serve(3000, req =>
-  { "status": 200, "headers": {}, "body": "hello" }
-)
-```
-
-Routing with pattern matching:
-
-```txt
-import { serve, json, notFound } from "std/server"
-
 serve(3000, req =>
   match req
-    has { "method": "GET",  "path": "/users" } => json(200, getUsers())
-    has { "method": "POST", "path": "/users" } =>
-      match parseBody(req)
-        is { "type": "failure", "error": e }    => badRequest(e)
-        is { "type": "success", "value": body } => createUser(body)
+    has { "method": "GET", "path": "/ping" } => text(200, "pong")
     else => notFound()
-)
-```
-
-Stateful server — `var` is safe because `serve` is sequential:
-
-```txt
-var store = []
-
-serve(3000, req =>
-  match req
-    has { "method": "GET",  "path": "/items" } => json(200, store)
-    has { "method": "POST", "path": "/items" } =>
-      match parseBody(req)
-        is { "type": "failure", "error": e }    => badRequest(e)
-        is { "type": "success", "value": item } =>
-          push(store, item)
-          json(201, item)
-    else => notFound()
-)
-```
-
-To run the server non-blocking alongside other work:
-
-```txt
-val server = async(() => serve(3000, handler))
-doOtherWork()
-await(server)
-```
-
----
-
-### ThreadPool.serve
-
-```txt
-// called as: pool.serve(port, handler)
-// pool is a ThreadPool constructed with threadPool(n)
-```
-
-Starts an HTTP server on `port` and dispatches each incoming request to the pool's threads. Multiple requests are handled concurrently up to the pool's thread count. Blocks the calling thread indefinitely.
-
-Because handlers run concurrently, the **same `var`-capture restriction as `pool.async` applies** — the handler must not close over `var` bindings. This is a compile-time error where statically detectable.
-
-```txt
-threadPool(8).serve(3000, req =>
-  match req
-    has { "method": "GET", "path": "/users" } => json(200, getUsers())
-    else                                       => notFound()
-)
-```
-
-The handler may use `async` internally for per-request fan-out:
-
-```txt
-threadPool(8).serve(3000, req =>
-  val [users, posts] = await([
-    async(() => fetchJson("https://db/users")),
-    async(() => fetchJson("https://db/posts"))
-  ])
-  json(200, { "users": users, "posts": posts })
 )
 ```
 
@@ -1190,11 +1079,10 @@ threadPool(8).serve(3000, req =>
 val json: (status: Int32, body: Json) -> HttpResponse
 ```
 
-Builds an `HttpResponse` with the given status, the JSON serialisation of `body` as the response body, and `Content-Type: application/json` set automatically.
+Builds an `HttpResponse` with the JSON serialisation of `body` and `Content-Type: application/json`.
 
 ```txt
 json(200, { "users": ["Alice", "Bob"] })
-json(201, { "id": 42 })
 json(404, { "error": "not found" })
 ```
 
@@ -1206,7 +1094,7 @@ json(404, { "error": "not found" })
 val text: (status: Int32, body: String) -> HttpResponse
 ```
 
-Builds an `HttpResponse` with the given status, `body` as the response body, and `Content-Type: text/plain`.
+Builds an `HttpResponse` with `Content-Type: text/plain`.
 
 ```txt
 text(200, "pong")
@@ -1220,11 +1108,10 @@ text(200, "pong")
 val redirect: (url: String) -> HttpResponse
 ```
 
-Builds a 302 response with a `Location` header pointing to `url` and an empty body.
+Builds a 302 response with a `Location` header.
 
 ```txt
 redirect("/login")
-redirect("https://example.com/new-path")
 ```
 
 ---
@@ -1232,13 +1119,13 @@ redirect("https://example.com/new-path")
 ### notFound
 
 ```txt
-val notFound: () -> HttpResponse
+val notFound: HttpResponse
 ```
 
-Builds a 404 response with a plain-text body of `"Not Found"`.
+A pre-built 404 response with body `"Not Found"`. Used as a value, not called.
 
 ```txt
-else => notFound()
+else => notFound
 ```
 
 ---
@@ -1263,22 +1150,13 @@ badRequest("missing required field: name")
 val pathMatch: (pattern: String, path: String) -> { ...String } | Null
 ```
 
-Matches `path` against `pattern`. Returns an object of captured named parameters if the match succeeds, or `Null` if it does not. Pattern segments beginning with `:` are named captures; all other segments must match literally.
+Matches `path` against `pattern`. Pattern segments beginning with `:` are named captures. Returns an object of captured parameters on match, or `Null`.
 
 ```txt
-pathMatch("/users/:id",         "/users/42")       // { "id": "42" }
-pathMatch("/users/:id/posts",   "/users/42/posts") // { "id": "42" }
-pathMatch("/users/:id",         "/items/42")       // null
-pathMatch("/static",            "/static")         // {}
-```
-
-Typical usage inside a handler:
-
-```txt
-val params = pathMatch("/users/:id", req["path"])
-match params
-  is Null => notFound()
-  else    => json(200, getUser(params["id"]))
+pathMatch("/users/:id",       "/users/42")       // { "id": "42" }
+pathMatch("/users/:id/posts", "/users/42/posts") // { "id": "42" }
+pathMatch("/users/:id",       "/items/42")       // null
+pathMatch("/static",          "/static")         // {}
 ```
 
 ---
@@ -1289,7 +1167,7 @@ match params
 val parseBody: (req: HttpRequest) -> Json | Error
 ```
 
-Parses `req["body"]` as JSON. Returns the parsed value on success, or an `Error` if the body is not valid JSON. Equivalent to calling `parseJson(req["body"])` from `std/http` but reads more naturally inside a handler.
+Parses `req["body"]` as JSON.
 
 ```txt
 match parseBody(req)
@@ -1299,15 +1177,171 @@ match parseBody(req)
 
 ---
 
-## std/template
+## std/async
 
-Functions for rendering template strings. Template syntax uses `${key}` holes where `key` is either a top-level field name or a dot-separated path into the data record. Everything outside a `${}` hole is emitted verbatim, including newlines.
+Concurrency primitives. Import what you need:
+
+```txt
+import { async, await, parallel } from "std/async"
+import { worker, request, close } from "std/async"
+import { threadPool } from "std/async"
+```
+
+---
+
+### async
+
+```txt
+val async: (() -> T) -> Promise
+```
+
+Runs a zero-argument thunk asynchronously on a background thread. Returns a `Promise` that resolves to the thunk's return value.
+
+```txt
+val p = async(() => fetchJson("https://api.example.com/data"))
+val result = await(p)
+```
+
+---
+
+### await
+
+```txt
+val await: (Promise) -> T
+```
+
+Blocks the current thread until the promise resolves, then returns its value. Can also await an array of promises — returns an array of results.
+
+```txt
+val [users, posts] = await([
+  async(() => fetchJson("https://db/users")),
+  async(() => fetchJson("https://db/posts"))
+])
+```
+
+---
+
+### parallel
+
+```txt
+val parallel: ((() -> T)[]) -> T[]
+```
+
+Runs an array of zero-argument thunks concurrently and returns an array of their results in the same order. Blocks until all thunks complete.
+
+```txt
+val results = parallel([
+  () => heavyComputation(1),
+  () => heavyComputation(2),
+  () => heavyComputation(3)
+])
+```
+
+---
+
+### race
+
+```txt
+val race: (Promise[]) -> T
+```
+
+Resolves with the value of the first promise in the array to complete.
+
+---
+
+### timeout
+
+```txt
+val timeout: (Promise, Int32) -> T
+```
+
+Adds a millisecond timeout to `promise`. If the promise does not resolve within `ms` milliseconds, the result is an error.
+
+---
+
+### retry
+
+```txt
+val retry: (() -> T, Int32) -> T
+```
+
+Runs the thunk up to `n` times, returning the first successful result. If all attempts fail, returns the last error.
+
+---
+
+### threadPool
+
+```txt
+val threadPool: (Int32) -> ThreadPool
+```
+
+Creates a thread pool with `n` worker threads. The pool can be used with `pool.async(thunk)` for submitting work, or `pool.serve(port, handler)` for a multi-threaded HTTP server.
+
+```txt
+val pool = threadPool(8)
+val p = pool.async(() => heavyWork())
+```
+
+---
+
+### worker
+
+```txt
+val worker: (handler: (Msg) -> Reply, onClose: () -> Null) -> Worker
+```
+
+Creates a background worker thread. `handler` is called for each message received via `request` or `message`. `onClose` is called when the worker is shut down via `close`.
+
+```txt
+val w = worker(
+  msg => msg * 2,
+  () => null
+)
+val result = request(w, 21)   // 42
+close(w)
+```
+
+---
+
+### request
+
+```txt
+val request: (w: Worker, msg: Msg) -> Reply
+```
+
+Sends `msg` to worker `w` and blocks until the handler returns a reply.
+
+---
+
+### message
+
+```txt
+val message: (w: Worker, msg: Msg) -> Null
+```
+
+Sends `msg` to worker `w` without waiting for a reply (fire-and-forget).
+
+---
+
+### close
+
+```txt
+val close: (w: Worker) -> Null
+```
+
+Shuts down worker `w`, calling its `onClose` function and terminating its thread.
+
+---
+
+## std/template
 
 Import:
 
 ```txt
 import { render, renderWith } from "std/template"
 ```
+
+Template syntax uses `${key}` holes where `key` is a field name or dot-separated path into the data record.
 
 ---
 
@@ -1317,18 +1351,12 @@ import { render, renderWith } from "std/template"
 val render: (path: String, data: {}) -> String | Error
 ```
 
-Reads the file at `path` and renders it as a template against `data`. Returns the rendered `String` on success, or an `Error` if the file cannot be read. Intended for use with `.lint` template files.
+Reads the file at `path` and renders it as a template against `data`. Intended for `.lint` template files.
 
 ```txt
-// greet.lint:
-// Hello, ${name}! Your score is ${stats.score}.
-
-import { render } from "std/template"
-
-match render("greet.lint", { "name": "Alice", "stats": { "score": 42 } })
-  is { "type": "error", "message": e } => print("error: ${e}")
-  else => val output = render("greet.lint", { "name": "Alice", "stats": { "score": 42 } })
-          print(output)
+match render("greet.lint", { "name": "Alice", "score": 42 })
+  is { "type": "failure", "error": e } => print("error: ${e}")
+  is { "type": "success", "value": s } => print(s)
 ```
 
 ---
@@ -1339,24 +1367,18 @@ match render("greet.lint", { "name": "Alice", "stats": { "score": 42 } })
 val renderWith: (template: String, data: {}) -> String
 ```
 
-Renders a template string directly against `data`. Holes are `${key}` where `key` is a field name or dot-separated path. Missing keys render as `"null"`.
+Renders a template string directly against `data`. Missing keys render as `"null"`.
 
 ```txt
 renderWith("Hello, ${name}!", { "name": "Alice" })
 // "Hello, Alice!"
-
-renderWith("${user.name} scored ${user.score}", { "user": { "name": "Bob", "score": 99 } })
-// "Bob scored 99"
-
-renderWith("x = ${x}, y = ${y}", { "x": 1, "y": 2 })
-// "x = 1, y = 2"
 ```
 
 ---
 
 ## std/test
 
-A lightweight test framework. Tests are plain Lin values — `test` returns a `Test` record, `suite` groups them, `run` executes and reports. A test file is a regular `.lin` file run with `lin run`; no special runner binary is required.
+A lightweight test framework. Tests are plain Lin values.
 
 Import:
 
@@ -1364,32 +1386,23 @@ Import:
 import { suite, test, run, expect } from "std/test"
 ```
 
-**Conventions:** name test files `*.test.lin` or `*_test.lin`. A future `lin test` subcommand will discover and run them automatically; until then `lin run my_test.lin` works.
-
 **Basic usage:**
 
 ```txt
 import { suite, test, run, expect } from "std/test"
 
-val add = (a: Int32, b: Int32): Int32 => a + b
-
 val arithmetic = suite("arithmetic", [
   test("adds two positives", () =>
-    expect(add(1, 2)).toBe(3)
-  ),
-  test("adds negatives", () =>
-    expect(add(-1, -1)).toBe(-2)
+    expect(1 + 2).toBe(3)
   ),
   test("multiple assertions", () =>
-    expect(add(0, 0)).toBe(0)
-    expect(add(10, -10)).toBe(0)
+    expect(0 + 0).toBe(0)
+    expect(10 + -10).toBe(0)
   )
 ])
 
 run([arithmetic])
 ```
-
-**Multi-assertion tests** use bare expression statements in the lambda body. Each `expect(...).toX()` call is evaluated in order; the test collects all failures before reporting rather than stopping at the first.
 
 ---
 
@@ -1409,19 +1422,7 @@ type Suite = {
   "name": String,
   "tests": Test[]
 }
-
-type Asserter = {
-  "value": Json,
-  "toBe":       (Json) -> Assertion,
-  "toBeNull":   () -> Assertion,
-  "toSatisfy":  ((Json) -> Boolean) -> Assertion,
-  "toSucceed":  () -> Assertion,
-  "toFail":     () -> Assertion,
-  "toFailWith": (String) -> Assertion
-}
 ```
-
-`Assertion`, `Test`, `Suite`, and `Asserter` are structural — they have no special runtime representation. The type names are exported for documentation purposes only; you do not need to import them to use the framework.
 
 ---
 
@@ -1431,23 +1432,12 @@ type Asserter = {
 val suite: (name: String, tests: Test[]) -> Suite
 ```
 
-Groups a list of `Test` values under a name. The name is printed as a heading when `run` executes the suite.
+Groups a list of `Test` values under a name.
 
 ```txt
 val myTests = suite("math", [
   test("one plus one", () => expect(1 + 1).toBe(2))
 ])
-```
-
-Suites are plain data and can be composed, filtered, or built programmatically:
-
-```txt
-val cases = range(1, 5).map(n =>
-  test("double of ${toString(n)}", () =>
-    expect(n * 2).toBe(n + n)
-  )
-)
-val generated = suite("doubles", cases)
 ```
 
 ---
@@ -1458,33 +1448,12 @@ val generated = suite("doubles", cases)
 val test: (name: String, body: () -> Assertion | Assertion[]) -> Test
 ```
 
-Declares a single test case. `body` is a zero-argument lambda that returns either one `Assertion` or an array of `Assertion` values. All assertions in the body are evaluated; the test fails if any of them fail.
-
-**Single assertion:**
-
-```txt
-test("empty array has length zero", () =>
-  expect(length([])).toBe(0)
-)
-```
-
-**Multiple assertions** — write bare expression statements; each is evaluated in order:
+Declares a single test case. All assertions in the body are evaluated before the test is marked failed.
 
 ```txt
 test("string conversions", () =>
   expect(toString(42)).toBe("42")
   expect(toString(true)).toBe("true")
-  expect(toString(null)).toBe("null")
-)
-```
-
-**Using `val` bindings inside a test:**
-
-```txt
-test("pipeline result", () =>
-  val xs = [1, 2, 3].map(x => x * 2)
-  expect(xs[0]).toBe(2)
-  expect(length(xs)).toBe(3)
 )
 ```
 
@@ -1496,26 +1465,23 @@ test("pipeline result", () =>
 val run: (suites: Suite[]) -> Null
 ```
 
-Executes all suites in order, prints a summary to stdout, and exits the process with a non-zero code if any test failed. Each passing test prints a line beginning with `ok`; each failing test prints the failure message with the test name. A final line reports total passed and failed counts.
+Executes all suites, prints results to stdout, and exits non-zero if any test failed.
 
 ```txt
 run([unitTests, integrationTests])
 ```
 
-Output format (illustrative):
+Output format:
 
 ```txt
 arithmetic
   ok  adds two positives
-  ok  adds negatives
   FAIL  identity element
     expected: 1
     actual:   0
 
 1 failed, 2 passed
 ```
-
-`run` always executes all tests — it does not short-circuit on the first failure.
 
 ---
 
@@ -1525,95 +1491,34 @@ arithmetic
 val expect: (value: Json) -> Asserter
 ```
 
-Wraps `value` in an `Asserter`. Call one assertion method on the returned object to produce an `Assertion`.
+Wraps `value` in an `Asserter`. Call one assertion method to produce an `Assertion`.
 
 ```txt
-expect(add(1, 2)).toBe(3)
+expect(1 + 1).toBe(2)
 expect(result).toSucceed()
 expect(name).toSatisfy(s => length(s) > 0)
 ```
 
 #### .toBe
 
-```txt
-.toBe: (expected: Json) -> Assertion
-```
-
-Passes when `value` is deeply structurally equal to `expected` (same semantics as `==`). Works for all JSON-compatible values. Object comparison is order-independent; array comparison is ordered.
-
-```txt
-expect([1, 2, 3]).toBe([1, 2, 3])    // pass
-expect({ "a": 1 }).toBe({ "a": 1 }) // pass
-expect([1, 2]).toBe([2, 1])          // fail
-```
-
-Failure message: `expected: <expected>\nactual:   <actual>`
+Passes when `value` is deeply equal to `expected`.
 
 #### .toBeNull
 
-```txt
-.toBeNull: () -> Assertion
-```
-
 Passes when `value` is `null`.
-
-```txt
-expect(obj["missing"]).toBeNull()
-```
 
 #### .toSatisfy
 
-```txt
-.toSatisfy: (pred: (Json) -> Boolean) -> Assertion
-```
-
-Passes when `pred(value)` returns `true`. The general escape hatch for structural assertions that cannot be expressed with `.toBe`, including inspecting union shapes:
-
-```txt
-expect(name).toSatisfy(s => length(s) > 0)
-expect(result).toSatisfy(r => r has { "type": "success" })
-```
-
-Failure message: `value did not satisfy predicate: <value>`
+Passes when `pred(value)` returns `true`.
 
 #### .toSucceed
 
-```txt
-.toSucceed: () -> Assertion
-```
-
 Passes when `value` has shape `{ "type": "success", ... }`.
-
-```txt
-expect(parseAge("42")).toSucceed()
-```
-
-Failure message: `expected success, got: <value>`
 
 #### .toFail
 
-```txt
-.toFail: () -> Assertion
-```
-
 Passes when `value` has shape `{ "type": "failure", ... }`.
-
-```txt
-expect(parseAge("not-a-number")).toFail()
-```
-
-Failure message: `expected failure, got: <value>`
 
 #### .toFailWith
 
-```txt
-.toFailWith: (message: String) -> Assertion
-```
-
 Passes when `value` has shape `{ "type": "failure", "error": e }` and `e == message`.
-
-```txt
-expect(divide(1.0, 0.0)).toFailWith("Cannot divide by zero")
-```
-
-Failure message: `expected failure with "${message}", got: <value>`

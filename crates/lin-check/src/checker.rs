@@ -353,11 +353,14 @@ impl Checker {
                 })
             }
             Stmt::ForeignImport { path, bindings, span } => {
+                let is_runtime = path == "lin-runtime";
                 let mut foreign_slots = Vec::new();
                 for binding in bindings {
                     let ty = resolve_type(&binding.type_ann, &self.env)
                         .map_err(|e| Diagnostic::error(binding.span, e))?;
-                    let valid = is_legal_ffi_type(&ty);
+                    // "lin-runtime" is a reserved internal path — skip FFI type validation
+                    // since runtime functions use Array/Object which aren't valid in user FFI.
+                    let valid = is_runtime || is_legal_ffi_type(&ty);
                     if !valid {
                         self.diagnostics.push(Diagnostic::error(
                             binding.span,
@@ -875,7 +878,7 @@ impl Checker {
 
         // var-capture check and transferability check for `async(f)` / `async(fs)`.
         if let Expr::Ident(name, _) = func {
-            if name == "async" {
+            if name == "lin_async" {
                 let globals = self.mutable_global_slots.clone();
                 for arg in &typed_args {
                     if let Some(var_name) = first_mutable_capture(arg, &globals) {
@@ -1007,7 +1010,7 @@ impl Checker {
                 };
 
                 // var-capture check for pool.async(f) / pool.async(fs).
-                if method == "async" {
+                if method == "lin_async" {
                     let globals = self.mutable_global_slots.clone();
                     for arg in &all_args[1..] {
                         if let Some(var_name) = first_mutable_capture(arg, &globals) {
@@ -1042,7 +1045,7 @@ impl Checker {
             }
         }
         // var-capture check for pool.async(f) / pool.async(fs) (fallback path).
-        if method == "async" {
+        if method == "lin_async" {
             let globals = self.mutable_global_slots.clone();
             for arg in &all_args[1..] {
                 if let Some(var_name) = first_mutable_capture(arg, &globals) {
@@ -1682,7 +1685,7 @@ impl Checker {
         // print: (T) => Null — accepts any value, converts to string at runtime
         let print_param = self.env.fresh_type_var();
         self.define_intrinsic(
-            "print",
+            "lin_print",
             Type::Function {
                 params: vec![print_param],
                 ret: Box::new(Type::Null),
@@ -1692,7 +1695,7 @@ impl Checker {
         // toString: (T) => String — accepts any value
         let to_string_param = self.env.fresh_type_var();
         self.define_intrinsic(
-            "toString",
+            "lin_to_string",
             Type::Function {
                 params: vec![to_string_param],
                 ret: Box::new(Type::Str),
@@ -1702,7 +1705,7 @@ impl Checker {
         // length: (String | Array<T> | Iterator<T> | Object) => Int32
         // Uses TypeVar(u32::MAX) as the "any" Json type for the object case.
         self.define_intrinsic(
-            "length",
+            "lin_length",
             Type::Function {
                 params: vec![Type::Union(vec![
                     Type::Str,
@@ -1716,7 +1719,7 @@ impl Checker {
 
         // push: (T[], T) => Null
         self.define_intrinsic(
-            "push",
+            "lin_push",
             Type::Function {
                 params: vec![
                     Type::Array(Box::new(Type::TypeVar(9001))),
@@ -1726,39 +1729,18 @@ impl Checker {
             },
         );
 
-        // concat: (T[], T[]) => T[]
-        self.define_intrinsic(
-            "concat",
-            Type::Function {
-                params: vec![
-                    Type::Array(Box::new(Type::TypeVar(9002))),
-                    Type::Array(Box::new(Type::TypeVar(9002))),
-                ],
-                ret: Box::new(Type::Array(Box::new(Type::TypeVar(9002)))),
-            },
-        );
-
         // keys: (Object) => String[]
         self.define_intrinsic(
-            "keys",
+            "lin_keys",
             Type::Function {
                 params: vec![Type::Object(IndexMap::new())],
                 ret: Box::new(Type::Array(Box::new(Type::Str))),
             },
         );
 
-        // values: (Object) => Json[]
+        // for: (Iterable<T>, (T) => Json) => Null  — callback return type is ignored
         self.define_intrinsic(
-            "values",
-            Type::Function {
-                params: vec![Type::Object(IndexMap::new())],
-                ret: Box::new(Type::Array(Box::new(Type::TypeVar(9003)))),
-            },
-        );
-
-        // for: (Iterable<T>, (T) => Null) => Null
-        self.define_intrinsic(
-            "for",
+            "lin_for",
             Type::Function {
                 params: vec![
                     Type::Union(vec![
@@ -1767,7 +1749,7 @@ impl Checker {
                     ]),
                     Type::Function {
                         params: vec![Type::TypeVar(9010)],
-                        ret: Box::new(Type::Null),
+                        ret: Box::new(Type::TypeVar(u32::MAX)),
                     },
                 ],
                 ret: Box::new(Type::Null),
@@ -1776,7 +1758,7 @@ impl Checker {
 
         // iter: (() => State, (State) => Boolean, (State) => State, (State) => T) => Iterator<T>
         self.define_intrinsic(
-            "iter",
+            "lin_iter",
             Type::Function {
                 params: vec![
                     Type::Function {
@@ -1802,7 +1784,7 @@ impl Checker {
 
         // range: (Int32, Int32) => Iterator<Int32>
         self.define_intrinsic(
-            "range",
+            "lin_range",
             Type::Function {
                 params: vec![Type::Int32, Type::Int32],
                 ret: Box::new(Type::Iterator(Box::new(Type::Int32))),
@@ -1811,7 +1793,7 @@ impl Checker {
 
         // map: (Iterable<T>, (T) => U) => Iterator<U>
         self.define_intrinsic(
-            "map",
+            "lin_map",
             Type::Function {
                 params: vec![
                     Type::Union(vec![
@@ -1829,7 +1811,7 @@ impl Checker {
 
         // filter: (Iterable<T>, (T) => Boolean) => Iterator<T>
         self.define_intrinsic(
-            "filter",
+            "lin_filter",
             Type::Function {
                 params: vec![
                     Type::Union(vec![
@@ -1847,7 +1829,7 @@ impl Checker {
 
         // reduce: (Iterable<T>, U, (U, T) => U) => U
         self.define_intrinsic(
-            "reduce",
+            "lin_reduce",
             Type::Function {
                 params: vec![
                     Type::Union(vec![
@@ -1864,35 +1846,10 @@ impl Checker {
             },
         );
 
-        // --- stdlib intrinsics (called by std/*.lin wrappers) ---
-
-        // String intrinsics
-        self.define_intrinsic("__stringTrim",       Type::Function { params: vec![Type::Str], ret: Box::new(Type::Str) });
-        self.define_intrinsic("__stringToUpper",    Type::Function { params: vec![Type::Str], ret: Box::new(Type::Str) });
-        self.define_intrinsic("__stringToLower",    Type::Function { params: vec![Type::Str], ret: Box::new(Type::Str) });
-        self.define_intrinsic("__stringLength",     Type::Function { params: vec![Type::Str], ret: Box::new(Type::Int32) });
-        self.define_intrinsic("__stringSlice",      Type::Function { params: vec![Type::Str, Type::Int32, Type::Int32], ret: Box::new(Type::Str) });
-        self.define_intrinsic("__stringIndexOf",    Type::Function { params: vec![Type::Str, Type::Str], ret: Box::new(Type::Int32) });
-        self.define_intrinsic("__stringContains",   Type::Function { params: vec![Type::Str, Type::Str], ret: Box::new(Type::Bool) });
-        self.define_intrinsic("__stringStartsWith", Type::Function { params: vec![Type::Str, Type::Str], ret: Box::new(Type::Bool) });
-        self.define_intrinsic("__stringEndsWith",   Type::Function { params: vec![Type::Str, Type::Str], ret: Box::new(Type::Bool) });
-        self.define_intrinsic("__stringSplit",      Type::Function { params: vec![Type::Str, Type::Str], ret: Box::new(Type::Array(Box::new(Type::Str))) });
-        self.define_intrinsic("__stringJoin",       Type::Function { params: vec![Type::Array(Box::new(Type::Str)), Type::Str], ret: Box::new(Type::Str) });
-        self.define_intrinsic("__stringReplace",    Type::Function { params: vec![Type::Str, Type::Str, Type::Str], ret: Box::new(Type::Str) });
-        self.define_intrinsic("__stringRepeat",     Type::Function { params: vec![Type::Str, Type::Int32], ret: Box::new(Type::Str) });
-        self.define_intrinsic("__stringCharAt",     Type::Function { params: vec![Type::Str, Type::Int32], ret: Box::new(Type::Str) });
-
-        // Number intrinsics
-        self.define_intrinsic("__parseInt32",  Type::Function { params: vec![Type::Str], ret: Box::new(Type::Int32) });
-        self.define_intrinsic("__parseFloat64",Type::Function { params: vec![Type::Str], ret: Box::new(Type::Float64) });
-        self.define_intrinsic("__toInt32",     Type::Function { params: vec![Type::Float64], ret: Box::new(Type::Int32) });
-        self.define_intrinsic("__toFloat64",   Type::Function { params: vec![Type::Int32], ret: Box::new(Type::Float64) });
-        self.define_intrinsic("__isInt32",     Type::Function { params: vec![Type::Str], ret: Box::new(Type::Bool) });
-
         // Concurrency intrinsics (spec §32)
         // async: (() => T) => Promise<T>  (TypeVar-based, overloaded: also accepts T[])
         let promise_t = Type::TypeVar(9100);
-        self.define_intrinsic("async", Type::Function {
+        self.define_intrinsic("lin_async", Type::Function {
             params: vec![Type::Union(vec![
                 Type::Function { params: vec![], ret: Box::new(promise_t.clone()) },
                 Type::Array(Box::new(Type::Function { params: vec![], ret: Box::new(promise_t.clone()) })),
@@ -1900,14 +1857,14 @@ impl Checker {
             ret: Box::new(Type::TypeVar(9100)),
         });
         // await: accepts a promise or array of promises
-        self.define_intrinsic("await", Type::Function {
+        self.define_intrinsic("lin_await", Type::Function {
             params: vec![Type::TypeVar(9101)],
             ret: Box::new(Type::TypeVar(9101)),
         });
         // parallel: variadic — always returns a tagged array (TypeVar(u32::MAX) = Json/any).
         // Using u32::MAX prevents zonking from resolving the element type to a flat scalar,
         // which would cause codegen to use a flat array representation for a tagged array.
-        self.define_intrinsic("parallel", Type::Function {
+        self.define_intrinsic("lin_parallel", Type::Function {
             params: vec![Type::Array(Box::new(Type::Function {
                 params: vec![],
                 ret: Box::new(Type::TypeVar(9102)),
@@ -1915,17 +1872,17 @@ impl Checker {
             ret: Box::new(Type::Array(Box::new(Type::TypeVar(u32::MAX)))),
         });
         // race: Promise[] => Promise
-        self.define_intrinsic("race", Type::Function {
+        self.define_intrinsic("lin_race", Type::Function {
             params: vec![Type::Array(Box::new(Type::TypeVar(9103)))],
             ret: Box::new(Type::TypeVar(9103)),
         });
         // timeout: (Promise, Int32) => Promise
-        self.define_intrinsic("timeout", Type::Function {
+        self.define_intrinsic("lin_timeout", Type::Function {
             params: vec![Type::TypeVar(9104), Type::Int32],
             ret: Box::new(Type::TypeVar(9104)),
         });
         // retry: (() => T, Int32) => Promise<T>
-        self.define_intrinsic("retry", Type::Function {
+        self.define_intrinsic("lin_retry", Type::Function {
             params: vec![
                 Type::Function { params: vec![], ret: Box::new(Type::TypeVar(9105)) },
                 Type::Int32,
@@ -1933,12 +1890,12 @@ impl Checker {
             ret: Box::new(Type::TypeVar(9105)),
         });
         // threadPool: (Int32) => ThreadPool
-        self.define_intrinsic("threadPool", Type::Function {
+        self.define_intrinsic("lin_thread_pool", Type::Function {
             params: vec![Type::Int32],
             ret: Box::new(Type::TypeVar(9106)),
         });
         // worker: ((Msg) => Reply, () => Null) => Worker
-        self.define_intrinsic("worker", Type::Function {
+        self.define_intrinsic("lin_worker", Type::Function {
             params: vec![
                 Type::Function { params: vec![Type::TypeVar(9107)], ret: Box::new(Type::TypeVar(9108)) },
                 Type::Function { params: vec![], ret: Box::new(Type::Null) },
@@ -1946,37 +1903,20 @@ impl Checker {
             ret: Box::new(Type::TypeVar(9109)),
         });
         // worker.request(msg): (Worker, Msg) => Reply
-        self.define_intrinsic("request", Type::Function {
+        self.define_intrinsic("lin_request", Type::Function {
             params: vec![Type::TypeVar(9109), Type::TypeVar(9107)],
             ret: Box::new(Type::TypeVar(9108)),
         });
         // worker.message(msg): (Worker, Msg) => Null
-        self.define_intrinsic("message", Type::Function {
+        self.define_intrinsic("lin_message", Type::Function {
             params: vec![Type::TypeVar(9109), Type::TypeVar(9107)],
             ret: Box::new(Type::Null),
         });
         // worker.close(): (Worker) => Null
-        self.define_intrinsic("close", Type::Function {
+        self.define_intrinsic("lin_close", Type::Function {
             params: vec![Type::TypeVar(9109)],
             ret: Box::new(Type::Null),
         });
-        // IO/fs/http/server intrinsics
-        self.define_intrinsic("__ioReadLine",    Type::Function { params: vec![], ret: Box::new(Type::Union(vec![Type::Str, Type::Null])) });
-        self.define_intrinsic("__ioReadAll",     Type::Function { params: vec![], ret: Box::new(Type::Str) });
-        self.define_intrinsic("__ioLines",       Type::Function { params: vec![], ret: Box::new(Type::Array(Box::new(Type::Str))) });
-        self.define_intrinsic("__fsReadFile",    Type::Function { params: vec![Type::Str], ret: Box::new(Type::TypeVar(u32::MAX)) });
-        self.define_intrinsic("__fsWriteFile",   Type::Function { params: vec![Type::Str, Type::Str], ret: Box::new(Type::Null) });
-        self.define_intrinsic("__fsAppendFile",  Type::Function { params: vec![Type::Str, Type::Str], ret: Box::new(Type::Null) });
-        self.define_intrinsic("__fsReadLines",   Type::Function { params: vec![Type::Str], ret: Box::new(Type::Array(Box::new(Type::Str))) });
-        self.define_intrinsic("__fsReadJson",    Type::Function { params: vec![Type::Str], ret: Box::new(Type::TypeVar(u32::MAX)) });
-        self.define_intrinsic("__fsWriteJson",   Type::Function { params: vec![Type::Str, Type::TypeVar(u32::MAX)], ret: Box::new(Type::Null) });
-        self.define_intrinsic("__fsExists",      Type::Function { params: vec![Type::Str], ret: Box::new(Type::Bool) });
-        self.define_intrinsic("__parseJson",     Type::Function { params: vec![Type::Str], ret: Box::new(Type::TypeVar(u32::MAX)) });
-        self.define_intrinsic("__httpFetch",     Type::Function { params: vec![Type::Str], ret: Box::new(Type::TypeVar(u32::MAX)) });
-        self.define_intrinsic("__httpFetchWith", Type::Function { params: vec![Type::Str, Type::TypeVar(u32::MAX)], ret: Box::new(Type::TypeVar(u32::MAX)) });
-        self.define_intrinsic("__serverServe",           Type::Function { params: vec![Type::Int32, Type::TypeVar(u32::MAX)], ret: Box::new(Type::Null) });
-        self.define_intrinsic("__serverServeWithPool",   Type::Function { params: vec![Type::Int32, Type::TypeVar(u32::MAX), Type::TypeVar(u32::MAX)], ret: Box::new(Type::Null) });
-        self.define_intrinsic("__serverPathMatch",       Type::Function { params: vec![Type::Str, Type::Str], ret: Box::new(Type::TypeVar(u32::MAX)) });
     }
 }
 

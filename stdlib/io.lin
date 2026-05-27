@@ -1,7 +1,16 @@
-export val print = print
+import foreign "lin-runtime"
+  val lin_io_read_line: () => Json
+  val lin_io_read_all: () => String
+  val lin_io_lines: () => String[]
 
-export val readLine = () => __ioReadLine()
+export val readLine = (): Json =>
+  lin_io_read_line()
 
-export val readAll = () => __ioReadAll()
+export val readAll = (): String =>
+  lin_io_read_all()
 
-export val lines = () => __ioLines()
+export val lines = (): String[] =>
+  lin_io_lines()
+
+export val print = (x: Json): Null =>
+  lin_print(x)

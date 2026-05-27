@@ -1,6 +1,8 @@
 import { trim, toUpper } from "std/string"
+import { toString } from "std/string"
 import { print } from "std/io"
 import { isInt32, parseInt32 } from "std/number"
+import { map, filter, for } from "std/array"
 
 val describeName = (input: Json): String =>
   match input

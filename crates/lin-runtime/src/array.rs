@@ -109,6 +109,63 @@ pub unsafe extern "C" fn lin_array_push_tagged(arr: *mut LinArray, tagged: *cons
     (*arr).len = len + 1;
 }
 
+/// Dynamic push: push a TaggedVal* element into an array of any format (flat or tagged).
+/// Handles flat arrays (elem_tag != 0xFF) by converting the TaggedVal to the flat element type.
+/// For tagged arrays (elem_tag == 0xFF), copies the TaggedVal inline.
+#[no_mangle]
+pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::tagged::TaggedVal) {
+    use crate::tagged::*;
+    if arr.is_null() { return; }
+    let elem_tag = (*arr).elem_tag;
+    if elem_tag == 0xFF {
+        // Tagged array: store TaggedVal inline.
+        lin_array_push_tagged(arr, tagged as *const u8);
+    } else {
+        // Flat array: extract the scalar value and push it.
+        let tag = if tagged.is_null() { TAG_NULL } else { (*tagged).tag };
+        let payload = if tagged.is_null() { 0u64 } else { (*tagged).payload };
+        match elem_tag {
+            TAG_INT32 => {
+                let v = match tag {
+                    TAG_INT32 => payload as i32,
+                    TAG_INT64 => payload as i32,
+                    TAG_FLOAT64 => f64::from_bits(payload) as i32,
+                    _ => 0,
+                };
+                lin_flat_array_push_i32(arr, v);
+            }
+            TAG_INT64 => {
+                let v = match tag {
+                    TAG_INT32 => payload as i32 as i64,
+                    TAG_INT64 => payload as i64,
+                    TAG_FLOAT64 => f64::from_bits(payload) as i64,
+                    _ => 0,
+                };
+                lin_flat_array_push_i64(arr, v);
+            }
+            TAG_FLOAT32 => {
+                let v = match tag {
+                    TAG_FLOAT32 => f32::from_bits(payload as u32),
+                    TAG_FLOAT64 => f64::from_bits(payload) as f32,
+                    TAG_INT32 => payload as i32 as f32,
+                    _ => 0.0,
+                };
+                lin_flat_array_push_f32(arr, v);
+            }
+            TAG_FLOAT64 => {
+                let v = match tag {
+                    TAG_FLOAT64 => f64::from_bits(payload),
+                    TAG_FLOAT32 => f32::from_bits(payload as u32) as f64,
+                    TAG_INT32 => payload as i32 as f64,
+                    _ => 0.0,
+                };
+                lin_flat_array_push_f64(arr, v);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Convert a flat i32 array to a tagged LinArray (each element tagged as TAG_INT32).
 /// Used when passing a flat array into a Json-typed context.
 #[no_mangle]

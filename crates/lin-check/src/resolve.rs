@@ -83,6 +83,8 @@ fn resolve_named_cycle(
             params: vec![json_type()],
             ret: Box::new(json_type()),
         }),
+        // Iterator without type argument: use Json wildcard element type
+        "Iterator" => Ok(Type::Iterator(Box::new(json_type()))),
         _ => {
             // Cycle detected: return Named(name) as an opaque reference instead of expanding.
             if visiting.contains(name) {

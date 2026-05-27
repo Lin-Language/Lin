@@ -8,6 +8,7 @@
   "mounts": [
     "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind"
   ],
+  "runArgs": ["--memory=32g", "--memory-swap=32g", "--oom-kill-disable=false"],
   "features": {
     "ghcr.io/devcontainers/features/git:1": {},
     "ghcr.io/devcontainers/features/node:1": {}

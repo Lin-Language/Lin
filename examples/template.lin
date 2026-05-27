@@ -1,0 +1,17 @@
+import { render } from "std/template"
+import { print } from "std/io"
+
+// Template text lives in .lint files where ${ } holes are plain text,
+// not Lin string interpolation. See examples/template.lint.
+
+val data = {
+  "name": "Bob",
+  "stats": {
+    "messages": 5,
+    "active": "enabled"
+  }
+}
+
+match render("examples/template.lint", data)
+  is { "type": "error", "message": e } => print("template error: ${e}")
+  is output => print(output)

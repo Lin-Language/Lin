@@ -1,3 +1,8 @@
+import { print } from "std/io"
+import { toString } from "std/string"
+import { iter, range } from "std/array"
+import { map, filter, reduce, for } from "std/array"
+
 // Custom iterator example: Fibonacci sequence
 
 val fibIter = (limit: Int32) =>

@@ -1,13 +1,29 @@
-export val readFile = (path) => __fsReadFile(path)
+import foreign "lin-runtime"
+  val lin_fs_read_file: (String) => Json
+  val lin_fs_write_file: (String, String) => Json
+  val lin_fs_append_file: (String, String) => Json
+  val lin_fs_read_lines: (String) => String[]
+  val lin_fs_read_json: (String) => Json
+  val lin_fs_write_json: (String, Json) => Json
+  val lin_fs_exists: (String) => Boolean
 
-export val writeFile = (path, content) => __fsWriteFile(path, content)
+export val readFile = (path: String): Json =>
+  lin_fs_read_file(path)
 
-export val appendFile = (path, content) => __fsAppendFile(path, content)
+export val writeFile = (path: String, content: String): Json =>
+  lin_fs_write_file(path, content)
 
-export val readLines = (path) => __fsReadLines(path)
+export val appendFile = (path: String, content: String): Json =>
+  lin_fs_append_file(path, content)
 
-export val readJson = (path) => __fsReadJson(path)
+export val readLines = (path: String): String[] =>
+  lin_fs_read_lines(path)
 
-export val writeJson = (path, value) => __fsWriteJson(path, value)
+export val readJson = (path: String): Json =>
+  lin_fs_read_json(path)
 
-export val exists = (path) => __fsExists(path)
+export val writeJson = (path: String, value: Json): Json =>
+  lin_fs_write_json(path, value)
+
+export val exists = (path: String): Boolean =>
+  lin_fs_exists(path)

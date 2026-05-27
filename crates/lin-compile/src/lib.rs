@@ -143,30 +143,36 @@ fn load_cache(source: &str, base_dir: &Path) -> Option<TypedModule> {
 }
 
 /// Save a `TypedModule` to `.lin-cache/` keyed by the SHA-256 of `source`.
-/// Silently ignores write errors so cache failures never break the build.
+/// Uses write-to-temp-then-rename for atomic, concurrent-safe cache writes.
 fn save_cache(source: &str, module: &TypedModule, base_dir: &Path) {
     let hash = source_hash(source);
     let cache_dir = base_dir.join(".lin-cache");
     if std::fs::create_dir_all(&cache_dir).is_err() {
         return;
     }
-    let cache_path = cache_dir.join(format!("{}.typed", hash));
+    let final_path = cache_dir.join(format!("{}.typed", hash));
+    let tmp_path = cache_dir.join(format!("{}.typed.tmp.{}", hash, std::process::id()));
     if let Ok(bytes) = bincode::serialize(module) {
-        let _ = std::fs::write(&cache_path, bytes);
+        if std::fs::write(&tmp_path, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp_path, &final_path);
+        }
     }
 }
 
 /// Save the `ModuleSignature` for a module alongside its TypedModule cache.
-/// Keyed by the same source hash; stored as `<hash>.sig`.
+/// Uses write-to-temp-then-rename for atomic, concurrent-safe cache writes.
 fn save_signature(source: &str, sig: &ModuleSignature, base_dir: &Path) {
     let hash = source_hash(source);
     let cache_dir = base_dir.join(".lin-cache");
     if std::fs::create_dir_all(&cache_dir).is_err() {
         return;
     }
-    let sig_path = cache_dir.join(format!("{}.sig", hash));
+    let final_path = cache_dir.join(format!("{}.sig", hash));
+    let tmp_path = cache_dir.join(format!("{}.sig.tmp.{}", hash, std::process::id()));
     if let Some(bytes) = sig.to_bytes() {
-        let _ = std::fs::write(&sig_path, bytes);
+        if std::fs::write(&tmp_path, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp_path, &final_path);
+        }
     }
 }
 
@@ -216,11 +222,11 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/string" => Some(include_str!("../../../stdlib/string.lin")),
         "std/number" => Some(include_str!("../../../stdlib/number.lin")),
         "std/array"  => Some(include_str!("../../../stdlib/array.lin")),
-        "std/iter"   => Some(include_str!("../../../stdlib/iter.lin")),
-        "std/result" => Some(include_str!("../../../stdlib/result.lin")),
         "std/fs"     => Some(include_str!("../../../stdlib/fs.lin")),
         "std/http"   => Some(include_str!("../../../stdlib/http.lin")),
-        "std/server" => Some(include_str!("../../../stdlib/server.lin")),
+        "std/object"   => Some(include_str!("../../../stdlib/object.lin")),
+        "std/template" => Some(include_str!("../../../stdlib/template.lin")),
+        "std/async"    => Some(include_str!("../../../stdlib/async.lin")),
         _ => None,
     }
 }

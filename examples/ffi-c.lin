@@ -3,9 +3,11 @@
 // Build and run with:
 //   cc -c examples/lib/mathlib.c -o examples/lib/mathlib.o
 //   ar rcs examples/lib/libmathlib.a examples/lib/mathlib.o
-//   lin build examples/ffi_c.lin -o ffi_c && ./ffi_c
+//   lin build examples/ffi-c.lin -o ffi_c && ./ffi_c
 //
 // See crates/lin-runtime/lin.h for the C/C++ interop header.
+
+import { print } from "std/io"
 
 import foreign "examples/lib/libmathlib.a"
   val add: (Int32, Int32) => Int32

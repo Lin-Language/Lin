@@ -1,53 +1,87 @@
+export val push = (arr: Json, item: Json): Null =>
+  lin_push(arr, item)
+
+export val length = (x: Json): Int32 =>
+  lin_length(x)
+
+export val for = (iterable: Json, f: Function): Null =>
+  lin_for(iterable, f)
+
+export val range = (start: Int32, end: Int32) =>
+  lin_iter(
+    () => start,
+    i => i < end,
+    i => i + 1,
+    i => i
+  )
+
+export val iterOf = (arr: Json) =>
+  lin_iter(
+    () => 0,
+    i => i < length(arr),
+    i => i + 1,
+    i => arr[i]
+  )
+
+export val iter = (init: Json, hasNext: Json, next: Json, value: Json) =>
+  lin_iter(init, hasNext, next, value)
+
+export val concat = (a: Json, b: Json): Json =>
+  val result = []
+  for(a, x => push(result, x))
+  for(b, x => push(result, x))
+  result
+
 export val map = (arr: Json, f: Function): Json =>
   val result = []
-  arr.for(item => push(result, f(item)))
+  for(arr, item => push(result, f(item)))
   result
 
 export val filter = (arr: Json, f: Function): Json =>
   val result = []
-  arr.for(item =>
+  for(arr, item =>
     if f(item) then push(result, item) else null
   )
   result
 
 export val reduce = (arr: Json, init: Json, f: (Json, Json) => Json): Json =>
   var acc = init
-  arr.for(item => acc = f(acc, item))
+  for(arr, item => acc = f(acc, item))
   acc
 
 export val find = (arr: Json, f: Function): Json =>
   var found = null
-  arr.for(item =>
+  for(arr, item =>
     if found == null && f(item) then found = item else null
   )
   found
 
 export val some = (arr: Json, f: Function): Boolean =>
   var result = false
-  arr.for(item =>
+  for(arr, item =>
     if f(item) then result = true else null
   )
   result
 
 export val every = (arr: Json, f: Function): Boolean =>
   var result = true
-  arr.for(item =>
+  for(arr, item =>
     if f(item) == false then result = false else null
   )
   result
 
 export val flatMap = (arr: Json, f: Function): Json =>
   val result = []
-  arr.for(item =>
+  for(arr, item =>
     val inner = f(item)
-    inner.for(x => push(result, x))
+    for(inner, x => push(result, x))
   )
   result
 
 export val indexOf = (arr: Json, target: Json): Int32 =>
   var result = -1
   var i = 0
-  arr.for(item =>
+  for(arr, item =>
     val dummy = if result == -1 && item == target then result = i else null
     i = i + 1
   )
@@ -56,7 +90,7 @@ export val indexOf = (arr: Json, target: Json): Int32 =>
 export val reverse = (arr: Json): Json =>
   val result = []
   var i = length(arr) - 1
-  range(0, length(arr)).for(x =>
+  for(lin_range(0, length(arr)), x =>
     val dummy = push(result, arr[i])
     i = i - 1
   )

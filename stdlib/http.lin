@@ -1,3 +1,17 @@
+import foreign "lin-runtime"
+  val lin_http_fetch: (String) => Json
+  val lin_http_fetch_with: (String, Json) => Json
+  val lin_parse_json: (String) => Json
+  val lin_server_path_match: (String, String) => Json
+
+export type HttpRequest = {
+  "method": String,
+  "path": String,
+  "query": String,
+  "headers": Json,
+  "body": String
+}
+
 export type HttpResponse = {
   "status": Int32,
   "headers": Json,
@@ -10,15 +24,37 @@ export type HttpOptions = {
   "body": String
 }
 
-export val fetch = (url) => __httpFetch(url)
+export val fetch = (url: String): Json =>
+  lin_http_fetch(url)
 
-export val fetchWith = (url, options) => __httpFetchWith(url, options)
+export val fetchWith = (url: String, options: Json): Json =>
+  lin_http_fetch_with(url, options)
 
-export val fetchJson = (url) =>
-  val response = __httpFetch(url)
+export val fetchJson = (url: String): Json =>
+  val response = lin_http_fetch(url)
   if response["type"] == "error"
   then response
-  else __parseJson(response["body"])
+  else lin_parse_json(response["body"])
 
-export val postJson = (url, body) =>
-  __httpFetchWith(url, { "method": "POST", "headers": { "Content-Type": "application/json" }, "body": body.toString() })
+export val postJson = (url: String, body: Json): Json =>
+  lin_http_fetch_with(url, { "method": "POST", "headers": { "Content-Type": "application/json" }, "body": lin_to_string(body) })
+
+export val json = (status: Int32, data: Json): Json =>
+  { "status": status, "headers": { "Content-Type": "application/json" }, "body": lin_to_string(data) }
+
+export val text = (status: Int32, body: String): Json =>
+  { "status": status, "headers": { "Content-Type": "text/plain; charset=utf-8" }, "body": body }
+
+export val redirect = (location: String): Json =>
+  { "status": 302, "headers": { "Location": location }, "body": "" }
+
+export val notFound = { "status": 404, "headers": {}, "body": "Not Found" }
+
+export val badRequest = (message: String): Json =>
+  { "status": 400, "headers": {}, "body": message }
+
+export val parseBody = (req: Json): Json =>
+  lin_parse_json(req["body"])
+
+export val pathMatch = (pattern: String, path: String): Json =>
+  lin_server_path_match(pattern, path)

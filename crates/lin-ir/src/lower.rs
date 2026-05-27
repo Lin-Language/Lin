@@ -586,10 +586,10 @@ fn lower_intrinsic_call(
     ctx: &mut LowerCtx,
 ) -> Temp {
     let intrinsic = match name {
-        "print" => Intrinsic::Print,
-        "toString" => Intrinsic::ToString,
-        "length" => Intrinsic::Length,
-        "push" => Intrinsic::Push,
+        "lin_print" => Intrinsic::Print,
+        "lin_to_string" => Intrinsic::ToString,
+        "lin_length" => Intrinsic::Length,
+        "lin_push" => Intrinsic::Push,
         "concat" => Intrinsic::Concat,
         _ => {
             // Unknown intrinsic: lower as indirect call fallback.

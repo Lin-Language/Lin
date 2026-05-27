@@ -14,3 +14,4 @@ pub mod object;
 pub mod server;
 pub mod string;
 pub mod tagged;
+pub mod template;

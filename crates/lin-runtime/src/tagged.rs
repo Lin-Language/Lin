@@ -168,6 +168,30 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
     }
 }
 
+/// Dynamic length dispatch: returns length of string, array, or object TaggedVal*.
+/// Returns 0 for null/bool/numeric types (no meaningful length).
+#[no_mangle]
+pub unsafe extern "C" fn lin_length_dyn(p: *const u8) -> i32 {
+    if p.is_null() {
+        return 0;
+    }
+    let tv = p as *const TaggedVal;
+    let tag = (*tv).tag;
+    let payload = (*tv).payload as *mut u8;
+    match tag {
+        TAG_STR => crate::string::lin_string_length(payload as *const crate::string::LinString),
+        TAG_ARRAY => {
+            let n = crate::array::lin_array_length(payload as *const crate::array::LinArray);
+            n as i32
+        }
+        TAG_OBJECT => {
+            let n = crate::object::lin_object_length(payload as *const crate::object::LinObject);
+            n as i32
+        }
+        _ => 0,
+    }
+}
+
 /// Release a TaggedVal*: release the pointed-to heap value (if pointer type), then free the box.
 /// Safe to call with null (treated as null — no-op).
 #[no_mangle]

@@ -1,5 +1,8 @@
 import { trim, toUpper } from "std/string"
 import { isInt32, parseInt32 } from "std/number"
+import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter, reduce, for } from "std/array"
 
 // A data processing pipeline demonstrating:
 // - Pattern matching with tagged unions

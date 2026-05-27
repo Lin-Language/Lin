@@ -54,32 +54,29 @@ impl Interpreter {
         self.stdlib_sources.insert("std/string".to_string(), include_str!("../../../stdlib/string.lin"));
         self.stdlib_sources.insert("std/number".to_string(), include_str!("../../../stdlib/number.lin"));
         self.stdlib_sources.insert("std/array".to_string(), include_str!("../../../stdlib/array.lin"));
-        self.stdlib_sources.insert("std/iter".to_string(), include_str!("../../../stdlib/iter.lin"));
-        self.stdlib_sources.insert("std/result".to_string(), include_str!("../../../stdlib/result.lin"));
         self.stdlib_sources.insert("std/fs".to_string(), include_str!("../../../stdlib/fs.lin"));
         self.stdlib_sources.insert("std/http".to_string(), include_str!("../../../stdlib/http.lin"));
-        self.stdlib_sources.insert("std/server".to_string(), include_str!("../../../stdlib/server.lin"));
-        self.stdlib_sources.insert("std/template".to_string(), include_str!("../../../stdlib/template.lin"));
         self.stdlib_sources.insert("std/test".to_string(), include_str!("../../../stdlib/test.lin"));
+        self.stdlib_sources.insert("std/object".to_string(), include_str!("../../../stdlib/object.lin"));
+        self.stdlib_sources.insert("std/template".to_string(), include_str!("../../../stdlib/template.lin"));
+        self.stdlib_sources.insert("std/async".to_string(), include_str!("../../../stdlib/async.lin"));
     }
 
     fn preload_stdlib(&mut self) {
-        let iter_exports = self.load_module("std/iter").expect("Failed to load std/iter");
-        for (name, value) in &iter_exports {
-            self.global_env.define(name.clone(), value.clone());
-        }
-        let array_exports = self.load_module("std/array").expect("Failed to load std/array");
-        for (name, value) in &array_exports {
-            self.global_env.define(name.clone(), value.clone());
+        for module in &["std/io", "std/string", "std/array", "std/object", "std/async"] {
+            let exports = self.load_module(module).unwrap_or_default();
+            for (name, value) in &exports {
+                self.global_env.define(name.clone(), value.clone());
+            }
         }
     }
 
     fn register_intrinsics(&mut self) {
-        self.define_native("print", 1, |args| {
+        self.define_native("lin_print", 1, |args| {
             Ok(args[0].clone())
         });
 
-        self.define_native("length", 1, |args| {
+        self.define_native("lin_length", 1, |args| {
             match &args[0] {
                 Value::String(s) => Ok(Value::Int(s.chars().count() as i64)),
                 Value::Array(a) => Ok(Value::Int(a.borrow().len() as i64)),
@@ -88,7 +85,7 @@ impl Interpreter {
             }
         });
 
-        self.define_native("toString", 1, |args| {
+        self.define_native("lin_to_string", 1, |args| {
             Ok(Value::String(Rc::new(args[0].to_display_string())))
         });
 
@@ -266,7 +263,7 @@ impl Interpreter {
             }
         });
 
-        self.define_native("push", 2, |args| {
+        self.define_native("lin_push", 2, |args| {
             match &args[0] {
                 Value::Array(arr) => {
                     arr.borrow_mut().push(args[1].clone());
@@ -287,7 +284,7 @@ impl Interpreter {
             }
         });
 
-        self.define_native("keys", 1, |args| {
+        self.define_native("lin_keys", 1, |args| {
             match &args[0] {
                 Value::Object(obj) => {
                     let ks: Vec<Value> = obj.borrow().keys()
@@ -329,8 +326,8 @@ impl Interpreter {
 
         // Placeholder natives for functions that need interpreter access
         // (actual logic is handled specially in call_value)
-        self.define_native("for", 2, |_args| Ok(Value::Null));
-        self.define_native("iter", 4, |_args| Ok(Value::Null));
+        self.define_native("lin_for", 2, |_args| Ok(Value::Null));
+        self.define_native("lin_iter", 4, |_args| Ok(Value::Null));
         self.define_native("toFloat64", 1, |args| {
             match &args[0] {
                 Value::Int(v) => Ok(Value::Float(*v as f64)),
@@ -372,14 +369,14 @@ impl Interpreter {
 
         // Concurrency intrinsics — the actual implementation is in call_value dispatch above.
         // We register them as 1-arg stubs so they are callable; the real dispatch intercepts them.
-        self.define_native("async", 1, |_| Ok(Value::Null));
-        self.define_native("await", 1, |_| Ok(Value::Null));
-        self.define_native("parallel", 1, |_| Ok(Value::Null));
-        self.define_native("race", 1, |_| Ok(Value::Null));
-        self.define_native("timeout", 2, |_| Ok(Value::Null));
-        self.define_native("retry", 2, |_| Ok(Value::Null));
-        self.define_native("threadPool", 1, |_| Ok(Value::Null));
-        self.define_native("worker", 2, |_| Ok(Value::Null));
+        self.define_native("lin_async", 1, |_| Ok(Value::Null));
+        self.define_native("lin_await", 1, |_| Ok(Value::Null));
+        self.define_native("lin_parallel", 1, |_| Ok(Value::Null));
+        self.define_native("lin_race", 1, |_| Ok(Value::Null));
+        self.define_native("lin_timeout", 2, |_| Ok(Value::Null));
+        self.define_native("lin_retry", 2, |_| Ok(Value::Null));
+        self.define_native("lin_thread_pool", 1, |_| Ok(Value::Null));
+        self.define_native("lin_worker", 2, |_| Ok(Value::Null));
 
         // IO intrinsics
         self.define_native("__ioReadLine", 0, |_| {
@@ -535,40 +532,6 @@ impl Interpreter {
                     }
                 }
                 _ => Err("__parseJson: expected String".to_string()),
-            }
-        });
-
-        self.define_native("__templateRender", 2, |args| {
-            match (&args[0], &args[1]) {
-                (Value::String(template), Value::Object(data)) => {
-                    let s = template.as_str();
-                    let mut result = String::with_capacity(s.len());
-                    let mut rest = s;
-                    while let Some(start) = rest.find("${") {
-                        result.push_str(&rest[..start]);
-                        rest = &rest[start + 2..];
-                        let end = rest.find('}').ok_or("__templateRender: unclosed '${'".to_string())?;
-                        let path = &rest[..end];
-                        rest = &rest[end + 1..];
-                        // Walk dot-separated path; clone at each step to avoid nested Ref borrows
-                        let segments: Vec<&str> = path.split('.').collect();
-                        let mut cur: Option<Value> = segments.first()
-                            .and_then(|seg| data.borrow().get(*seg).cloned());
-                        for seg in segments.iter().skip(1) {
-                            cur = match cur {
-                                Some(Value::Object(inner)) => inner.borrow().get(*seg).cloned(),
-                                _ => None,
-                            };
-                        }
-                        match cur {
-                            Some(ref v) => result.push_str(&v.to_display_string()),
-                            None => result.push_str("null"),
-                        }
-                    }
-                    result.push_str(rest);
-                    Ok(Value::String(Rc::new(result)))
-                }
-                _ => Err("__templateRender: expected (String, {})".to_string()),
             }
         });
 
@@ -1427,7 +1390,7 @@ impl Interpreter {
 
                 // Handle special built-ins that need interpreter access
                 match name.as_str() {
-                    "print" => {
+                    "lin_print" => {
                         let output = args[0].to_display_string();
                         self.output.push(output.clone());
                         println!("{}", output);
@@ -1441,34 +1404,34 @@ impl Interpreter {
                         self.exit_code = Some(code);
                         return Err(format!("__exit:{}", code));
                     }
-                    "for" => {
+                    "lin_for" => {
                         return self.builtin_for(&args[0], &args[1]);
                     }
-                    "iter" => {
+                    "lin_iter" => {
                         return self.builtin_iter(&args[0], &args[1], &args[2], &args[3]);
                     }
-                    "async" => {
+                    "lin_async" => {
                         return self.builtin_async(&args[0]);
                     }
-                    "await" => {
+                    "lin_await" => {
                         return self.builtin_await(&args[0]);
                     }
-                    "parallel" => {
+                    "lin_parallel" => {
                         return self.builtin_parallel(&args[0]);
                     }
-                    "race" => {
+                    "lin_race" => {
                         return self.builtin_race(&args[0]);
                     }
-                    "timeout" => {
+                    "lin_timeout" => {
                         return self.builtin_timeout(&args[0], &args[1]);
                     }
-                    "retry" => {
+                    "lin_retry" => {
                         return self.builtin_retry(&args[0], &args[1]);
                     }
-                    "threadPool" => {
+                    "lin_thread_pool" => {
                         return self.builtin_thread_pool(&args[0]);
                     }
-                    "worker" => {
+                    "lin_worker" => {
                         return self.builtin_worker(&args[0], &args[1]);
                     }
                     "__ioLines" => {

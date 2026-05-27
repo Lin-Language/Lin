@@ -223,7 +223,7 @@ import foreign "libfoo.a"
 fn test_async_var_capture_rejected() {
     let src = r#"
 var counter = 0
-val p = async(() =>
+val p = lin_async(() =>
   counter = counter + 1
   counter
 )
@@ -240,7 +240,7 @@ val p = async(() =>
 fn test_async_val_capture_allowed() {
     let src = r#"
 val message = "hello"
-val p = async(() => message)
+val p = lin_async(() => message)
 "#;
     let result = parse_and_check(src);
     assert!(result.is_ok(), "async capturing val should be allowed: {:?}", result.err());
@@ -250,7 +250,7 @@ val p = async(() => message)
 fn test_async_array_of_thunks_var_capture_rejected() {
     let src = r#"
 var x = 10
-val ps = async([() => x, () => 42])
+val ps = lin_async([() => x, () => 42])
 "#;
     let result = parse_and_check(src);
     assert!(result.is_err(), "async([...]) capturing var should be rejected");
@@ -322,7 +322,7 @@ fn test_async_function_return_type_rejected() {
     // async thunk that returns a Function value — non-transferable
     let src = r#"
 val makeAdder = (n: Int32) => (x: Int32) => x + n
-val p = async(() => makeAdder(5))
+val p = lin_async(() => makeAdder(5))
 "#;
     let result = parse_and_check(src);
     assert!(result.is_err(), "async returning Function should be rejected");
@@ -335,7 +335,7 @@ val p = async(() => makeAdder(5))
 fn test_async_json_return_type_allowed() {
     // async thunk returning a plain Int32 — transferable
     let src = r#"
-val p = async(() => 42)
+val p = lin_async(() => 42)
 "#;
     let result = parse_and_check(src);
     assert!(result.is_ok(), "async returning Int32 should be allowed: {:?}", result.err());

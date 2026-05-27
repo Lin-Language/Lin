@@ -1,0 +1,8 @@
+export val keys = (obj: Json): String[] =>
+  lin_keys(obj)
+
+export val values = (obj: Json): Json =>
+  lin_map(lin_keys(obj), k => obj[k])
+
+export val entries = (obj: Json): Json =>
+  lin_map(lin_keys(obj), k => [k, obj[k]])

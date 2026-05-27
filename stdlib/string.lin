@@ -1,41 +1,58 @@
+import foreign "lin-runtime"
+  val lin_string_trim: (String) => String
+  val lin_string_to_upper: (String) => String
+  val lin_string_to_lower: (String) => String
+  val lin_string_length: (String) => Int32
+  val lin_string_slice: (String, Int32, Int32) => String
+  val lin_string_index_of: (String, String) => Int32
+  val lin_string_contains: (String, String) => Boolean
+  val lin_string_starts_with: (String, String) => Boolean
+  val lin_string_ends_with: (String, String) => Boolean
+  val lin_string_split: (String, String) => String[]
+  val lin_string_join: (String[], String) => String
+  val lin_string_replace: (String, String, String) => String
+  val lin_string_repeat: (String, Int32) => String
+  val lin_string_char_at: (String, Int32) => String
+
 export val trim = (s: String): String =>
-  __stringTrim(s)
+  lin_string_trim(s)
 
 export val toUpper = (s: String): String =>
-  __stringToUpper(s)
+  lin_string_to_upper(s)
 
 export val toLower = (s: String): String =>
-  __stringToLower(s)
+  lin_string_to_lower(s)
 
 export val substring = (s: String, start: Int32, end: Int32): String =>
-  __stringSlice(s, start, end)
+  lin_string_slice(s, start, end)
 
 export val indexOf = (s: String, needle: String): Int32 =>
-  __stringIndexOf(s, needle)
-
-export val length = (s: String): Int32 =>
-  __stringLength(s)
+  lin_string_index_of(s, needle)
 
 export val contains = (s: String, needle: String): Boolean =>
-  __stringContains(s, needle)
+  lin_string_contains(s, needle)
 
 export val startsWith = (s: String, prefix: String): Boolean =>
-  __stringStartsWith(s, prefix)
+  lin_string_starts_with(s, prefix)
 
 export val endsWith = (s: String, suffix: String): Boolean =>
-  __stringEndsWith(s, suffix)
+  lin_string_ends_with(s, suffix)
 
 export val split = (s: String, delimiter: String): String[] =>
-  __stringSplit(s, delimiter)
+  lin_string_split(s, delimiter)
 
 export val join = (arr: String[], separator: String): String =>
-  __stringJoin(arr, separator)
+  lin_string_join(arr, separator)
 
 export val replace = (s: String, pattern: String, replacement: String): String =>
-  __stringReplace(s, pattern, replacement)
-
-export val charAt = (s: String, index: Int32): String =>
-  __stringSlice(s, index, index + 1)
+  lin_string_replace(s, pattern, replacement)
 
 export val repeat = (s: String, count: Int32): String =>
-  __stringRepeat(s, count)
+  lin_string_repeat(s, count)
+
+export val at = (s: String, index: Int32): String =>
+  val i = if index < 0 then lin_string_length(s) + index else index
+  lin_string_char_at(s, i)
+
+export val toString = (x: Json): String =>
+  lin_to_string(x)

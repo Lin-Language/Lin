@@ -239,18 +239,6 @@ print(c)
 }
 
 #[test]
-fn test_stdlib_imports() {
-    let output = run(r#"
-import { trim, toUpper } from "std/string"
-import { print } from "std/io"
-
-val cleaned = "  hello  ".trim().toUpper()
-print(cleaned)
-"#);
-    assert_eq!(output, vec!["HELLO"]);
-}
-
-#[test]
 fn test_array_oob_error() {
     let err = run_expect_err(r#"
 val arr = [1, 2, 3]
@@ -830,16 +818,6 @@ print(result)
 }
 
 #[test]
-fn test_import_aliasing() {
-    let output = run(r#"
-import { trim as t } from "std/string"
-val result = "  hi  ".t()
-print(result)
-"#);
-    assert_eq!(output, vec!["hi"]);
-}
-
-#[test]
 fn test_tuple_dot_application() {
     let output = run(r#"
 val sub = (a: Int32, b: Int32): Int32 => a - b
@@ -858,22 +836,6 @@ print(toString(length(rest)))
 print(toString(rest[0]))
 "#);
     assert_eq!(output, vec!["1", "4", "2"]);
-}
-
-#[test]
-fn test_stdlib_string_extended() {
-    let output = run(r#"
-import { contains, startsWith, endsWith, split, join, replace } from "std/string"
-
-print(toString("hello world".contains("world")))
-print(toString("hello".startsWith("hel")))
-print(toString("hello".endsWith("xyz")))
-
-val parts = "a,b,c".split(",")
-print(parts.join("-"))
-print("foo bar".replace("bar", "baz"))
-"#);
-    assert_eq!(output, vec!["true", "true", "false", "a-b-c", "foo baz"]);
 }
 
 #[test]
@@ -1072,32 +1034,6 @@ print(toString(arr))
 }
 
 #[test]
-fn test_showcase_example() {
-    let mut interp = Interpreter::new();
-    let source = std::fs::read_to_string("../../examples/showcase.lin").unwrap();
-    interp.run(&source).unwrap();
-    assert_eq!(interp.output[0], "=== Student Report ===");
-    assert_eq!(interp.output[1], "Alice: 85 (B)");
-    assert_eq!(interp.output[2], "Bob: 91 (A)");
-    assert_eq!(interp.output[3], "Charlie: 69 (F)");
-    assert_eq!(interp.output[4], "Diana: 97 (A)");
-    assert!(interp.output.contains(&"Honors: Bob, Diana".to_string()));
-    assert!(interp.output.contains(&"fib(9) = 34".to_string()));
-}
-#[test]
-fn test_multiline_import() {
-    let output = run(r#"
-import {
-  trim,
-  toUpper
-} from "std/string"
-
-print("  hello  ".trim().toUpper())
-"#);
-    assert_eq!(output, vec!["HELLO"]);
-}
-
-#[test]
 fn test_object_spread_basic() {
     let output = run(r#"
 val src = { "a": 1, "b": 2 }
@@ -1282,97 +1218,6 @@ counter.for(i => print(toString(i)))
 // M18: IO/FS/HTTP
 
 #[test]
-fn test_fs_write_read_roundtrip() {
-    let tmp = std::env::temp_dir().join("lin_test_rw.txt");
-    // clean up any prior run
-    let _ = std::fs::remove_file(&tmp);
-    let path = tmp.display().to_string();
-    let output = run(&format!(r#"
-import {{ writeFile, readFile }} from "std/fs"
-writeFile("{path}", "hello from lin")
-val content = readFile("{path}")
-print(content)
-"#));
-    let _ = std::fs::remove_file(&tmp);
-    assert_eq!(output, vec!["hello from lin"]);
-}
-
-#[test]
-fn test_fs_append_file() {
-    let tmp = std::env::temp_dir().join("lin_test_append.txt");
-    let _ = std::fs::remove_file(&tmp);
-    let path = tmp.display().to_string();
-    let output = run(&format!(r#"
-import {{ appendFile, readFile }} from "std/fs"
-appendFile("{path}", "line1\n")
-appendFile("{path}", "line2\n")
-val content = readFile("{path}")
-print(content)
-"#));
-    let _ = std::fs::remove_file(&tmp);
-    assert_eq!(output, vec!["line1\nline2\n"]);
-}
-
-#[test]
-fn test_fs_exists() {
-    let tmp = std::env::temp_dir().join("lin_test_exists.txt");
-    let _ = std::fs::remove_file(&tmp);
-    let path = tmp.display().to_string();
-    let output = run(&format!(r#"
-import {{ writeFile, exists }} from "std/fs"
-print(toString(exists("{path}")))
-writeFile("{path}", "hi")
-print(toString(exists("{path}")))
-"#));
-    let _ = std::fs::remove_file(&tmp);
-    assert_eq!(output, vec!["false", "true"]);
-}
-
-#[test]
-fn test_fs_read_missing_file_returns_error() {
-    let output = run(r#"
-import { readFile } from "std/fs"
-val result = readFile("/nonexistent/path/that/does/not/exist.lin")
-print(result["type"])
-"#);
-    assert_eq!(output, vec!["error"]);
-}
-
-#[test]
-fn test_fs_read_lines() {
-    let tmp = std::env::temp_dir().join("lin_test_lines.txt");
-    let _ = std::fs::remove_file(&tmp);
-    std::fs::write(&tmp, "alpha\nbeta\ngamma\n").unwrap();
-    let path = tmp.display().to_string();
-    let output = run(&format!(r#"
-import {{ readLines }} from "std/fs"
-val lines = readLines("{path}")
-print(toString(length(lines)))
-print(lines[0])
-print(lines[2])
-"#));
-    let _ = std::fs::remove_file(&tmp);
-    assert_eq!(output, vec!["3", "alpha", "gamma"]);
-}
-
-#[test]
-fn test_fs_read_write_json() {
-    let tmp = std::env::temp_dir().join("lin_test_json.json");
-    let _ = std::fs::remove_file(&tmp);
-    let path = tmp.display().to_string();
-    let output = run(&format!(r#"
-import {{ writeJson, readJson }} from "std/fs"
-val data = {{ "name": "Lin", "version": 1 }}
-writeJson("{path}", data)
-val loaded = readJson("{path}")
-print(loaded["name"])
-print(toString(loaded["version"]))
-"#));
-    let _ = std::fs::remove_file(&tmp);
-    assert_eq!(output, vec!["Lin", "1"]);
-}
-
-#[test]
 fn test_parse_json_intrinsic() {
     let output = run(r#"
 val json = __parseJson("[1, 2, 3]")
@@ -1403,32 +1248,9 @@ print(result["type"])
 
 // std/server tests
 #[test]
-fn test_server_path_match() {
-    let output = run(r#"
-import { pathMatch } from "std/server"
-val m = pathMatch("/users/:id/posts/:postId", "/users/42/posts/7")
-print(m["id"])
-print(m["postId"])
-val none = pathMatch("/users/:id", "/products/5")
-print(toString(none))
-"#);
-    assert_eq!(output, vec!["42", "7", "null"]);
-}
-
-#[test]
-fn test_server_path_match_literal_mismatch() {
-    let output = run(r#"
-import { pathMatch } from "std/server"
-val m = pathMatch("/api/v1/users", "/api/v2/users")
-print(toString(m))
-"#);
-    assert_eq!(output, vec!["null"]);
-}
-
-#[test]
 fn test_server_json_helper() {
     let output = run(r#"
-import { json } from "std/server"
+import { json } from "std/http"
 val resp = json(200, "hello")
 print(toString(resp["status"]))
 print(resp["headers"]["Content-Type"])
@@ -1439,56 +1261,13 @@ print(resp["headers"]["Content-Type"])
 #[test]
 fn test_server_text_helper() {
     let output = run(r#"
-import { text } from "std/server"
+import { text } from "std/http"
 val resp = text(200, "hello world")
 print(toString(resp["status"]))
 print(resp["body"])
 "#);
     assert_eq!(output, vec!["200", "hello world"]);
 }
-
-#[test]
-fn test_server_parse_body() {
-    let output = run(r#"
-import { parseBody } from "std/server"
-val req = { "method": "POST", "path": "/", "query": "", "headers": {}, "body": "{\"x\": 1}" }
-val body = parseBody(req)
-print(toString(body["x"]))
-"#);
-    assert_eq!(output, vec!["1"]);
-}
-
-#[test]
-fn test_server_serve_responds_to_get() {
-    // Spin the server up in a background thread, then make an HTTP request to it.
-    use std::thread;
-    use std::time::Duration;
-
-    let port: u16 = 19042; // hopefully free
-    let handle = thread::spawn(move || {
-        let mut interp = lin_eval::Interpreter::new();
-        let _ = interp.run(&format!(r#"
-import {{ serve, text }} from "std/server"
-serve({port}, req =>
-  text(200, "pong"))
-"#));
-    });
-    // Give the server a moment to start
-    thread::sleep(Duration::from_millis(200));
-    let response = ureq::get(&format!("http://127.0.0.1:{}", port)).call();
-    match response {
-        Ok(resp) => {
-            assert_eq!(resp.status(), 200);
-            let body = resp.into_string().unwrap();
-            assert_eq!(body, "pong");
-        }
-        Err(e) => panic!("HTTP request failed: {}", e),
-    }
-    // Server thread runs forever; we just drop the handle
-    drop(handle);
-}
-
-// M19: FFI parse/stub tests
 
 #[test]
 fn test_ffi_stub_errors_at_call_time() {
@@ -1541,86 +1320,6 @@ fn start_test_server(port: u16, response_body: &'static str, status: u16) -> std
 }
 
 #[test]
-fn test_http_fetch_json() {
-    use std::thread;
-    use std::time::Duration;
-
-    let port: u16 = 19100;
-    let _server = start_test_server(port, r#"{"value": 42}"#, 200);
-    thread::sleep(Duration::from_millis(100));
-
-    let output = run(&format!(r#"
-import {{ fetchJson }} from "std/http"
-val result = fetchJson("http://127.0.0.1:{}")
-print(toString(result["value"]))
-"#, port));
-    assert_eq!(output, vec!["42"]);
-}
-
-#[test]
-fn test_http_fetch_404_is_response_not_error() {
-    use std::thread;
-    use std::time::Duration;
-
-    let port: u16 = 19101;
-    // Start a server that returns 404
-    thread::spawn(move || {
-        let server = tiny_http::Server::http(format!("0.0.0.0:{}", port)).unwrap();
-        if let Ok(Some(req)) = server.recv_timeout(std::time::Duration::from_secs(5)) {
-            let response = tiny_http::Response::from_string("not found")
-                .with_status_code(tiny_http::StatusCode::from(404u16));
-            let _ = req.respond(response);
-        }
-    });
-    thread::sleep(Duration::from_millis(100));
-
-    let output = run(&format!(r#"
-import {{ fetch }} from "std/http"
-val result = fetch("http://127.0.0.1:{}")
-print(toString(result["status"]))
-"#, port));
-    // HTTP 404 should be a successful HttpResponse with status 404, not an Error
-    assert_eq!(output, vec!["404"]);
-}
-
-#[test]
-fn test_http_post_json() {
-    use std::thread;
-    use std::time::Duration;
-
-    let port: u16 = 19102;
-    // Start a server that echoes the method back
-    thread::spawn(move || {
-        let server = tiny_http::Server::http(format!("0.0.0.0:{}", port)).unwrap();
-        if let Ok(Some(req)) = server.recv_timeout(std::time::Duration::from_secs(5)) {
-            let method = req.method().to_string();
-            let response = tiny_http::Response::from_string(format!(r#"{{"method": "{}"}}"#, method));
-            let _ = req.respond(response);
-        }
-    });
-    thread::sleep(Duration::from_millis(100));
-
-    let output = run(&format!(r#"
-import {{ postJson }} from "std/http"
-val result = postJson("http://127.0.0.1:{}", {{ "x": 1 }})
-val parsed = result["body"]
-print(toString(result["status"]))
-"#, port));
-    assert_eq!(output, vec!["200"]);
-}
-
-#[test]
-fn test_http_transport_failure_is_error() {
-    // Try to connect to a port nothing is listening on — should return an Error value
-    let output = run(r#"
-import { fetch } from "std/http"
-val result = fetch("http://127.0.0.1:1")
-print(result["type"])
-"#);
-    assert_eq!(output, vec!["error"]);
-}
-
-#[test]
 fn test_server_thread_pool_serve_concurrent() {
     // Spin up a pool.serve server, make 3 concurrent requests, check all get responses.
     use std::thread;
@@ -1630,7 +1329,7 @@ fn test_server_thread_pool_serve_concurrent() {
     let _server_handle = thread::spawn(move || {
         let mut interp = lin_eval::Interpreter::new();
         let _ = interp.run(&format!(r#"
-import {{ text }} from "std/server"
+import {{ text }} from "std/http"
 val pool = threadPool(4)
 pool.serve({port}, req =>
   text(200, "concurrent-ok"))
@@ -1726,43 +1425,6 @@ print(toString(line))
 }
 
 #[test]
-fn test_concurrent_async_fetchjson_no_data_races() {
-    // Spin up a local server that handles multiple concurrent requests,
-    // then use Lin's async/await to make concurrent fetchJson calls.
-    use std::thread;
-    use std::time::Duration;
-
-    let port: u16 = 19104;
-    // Server handles multiple requests
-    thread::spawn(move || {
-        let server = tiny_http::Server::http(format!("0.0.0.0:{}", port)).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while std::time::Instant::now() < deadline {
-            if let Ok(Some(req)) = server.recv_timeout(Duration::from_millis(100)) {
-                let response = tiny_http::Response::from_string(r#"{"n": 1}"#);
-                let _ = req.respond(response);
-            }
-        }
-    });
-    thread::sleep(Duration::from_millis(100));
-
-    let output = run(&format!(r#"
-import {{ fetchJson }} from "std/http"
-val url = "http://127.0.0.1:{}"
-val results = await(async([
-  () => fetchJson(url)["n"],
-  () => fetchJson(url)["n"],
-  () => fetchJson(url)["n"]
-]))
-results.for(r => print(toString(r)))
-"#, port));
-    assert_eq!(output, vec!["1", "1", "1"],
-        "Concurrent async fetchJson calls should all succeed, got: {:?}", output);
-}
-
-// M19: End-to-end FFI test — compile a C library and call it from Lin via `lin build`
-
-#[test]
 fn test_ffi_end_to_end_c_library() {
     use std::process::Command;
     use std::path::Path;
@@ -1815,102 +1477,5 @@ fn test_ffi_end_to_end_c_library() {
     let stdout = String::from_utf8_lossy(&run_out.stdout);
     assert!(stdout.contains("3 + 4 = 7"), "Expected '3 + 4 = 7' in output, got: {}", stdout);
     assert!(stdout.contains("2.5^2 = 6.25"), "Expected '2.5^2 = 6.25' in output, got: {}", stdout);
-}
-
-#[test]
-fn test_template_render_with() {
-    // Template strings are loaded from files so the ${ } holes are not
-    // interpreted by the Lin lexer at test-source parse time.
-    let t1 = std::env::temp_dir().join("lin_tpl_t1.lint");
-    let t2 = std::env::temp_dir().join("lin_tpl_t2.lint");
-    let t3 = std::env::temp_dir().join("lin_tpl_t3.lint");
-    let t4 = std::env::temp_dir().join("lin_tpl_t4.lint");
-    std::fs::write(&t1, "Hello, ${name}!").unwrap();
-    std::fs::write(&t2, "${user.name} scored ${user.score}").unwrap();
-    std::fs::write(&t3, "missing: ${nope}").unwrap();
-    std::fs::write(&t4, "no holes here").unwrap();
-    let p1 = t1.to_str().unwrap();
-    let p2 = t2.to_str().unwrap();
-    let p3 = t3.to_str().unwrap();
-    let p4 = t4.to_str().unwrap();
-
-    let output = run(&format!(r#"
-import {{ render }} from "std/template"
-print(render("{p1}", {{ "name": "Alice" }}))
-print(render("{p2}", {{ "user": {{ "name": "Bob", "score": 99 }} }}))
-print(render("{p3}", {{ "x": 1 }}))
-print(render("{p4}", {{ "x": 1 }}))
-"#));
-    assert_eq!(output[0], "Hello, Alice!");
-    assert_eq!(output[1], "Bob scored 99");
-    assert_eq!(output[2], "missing: null");
-    assert_eq!(output[3], "no holes here");
-}
-
-#[test]
-fn test_template_render_file() {
-    let path = std::env::temp_dir().join("lin_template_test.lint");
-    std::fs::write(&path, "Dear ${name},\nYour balance is ${balance}.").unwrap();
-    let path_str = path.to_str().unwrap();
-
-    let output = run(&format!(r#"
-import {{ render }} from "std/template"
-val result = render("{path_str}", {{ "name": "Carol", "balance": 42 }})
-print(result)
-"#));
-    assert_eq!(output[0], "Dear Carol,\nYour balance is 42.");
-}
-
-// ── stdlib test files ──────────────────────────────────────────────────────
-
-fn run_test_file(path: &str) {
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent().unwrap()
-        .parent().unwrap();
-    let full_path = workspace.join(path);
-    let mut interp = lin_eval::Interpreter::new();
-    let result = interp.run_file(&full_path);
-    // An __exit error is expected on test failure — check exit_code
-    if let Some(code) = interp.exit_code {
-        panic!("{path} test suite failed (exit {code}):\n{}", interp.output.join("\n"));
-    }
-    // Any other error is a bug
-    result.unwrap_or_else(|e| panic!("{path} errored unexpectedly: {e}"));
-}
-
-#[test]
-#[ignore = "std/test framework incomplete"]
-fn test_stdlib_string() {
-    run_test_file("examples/tests/string.test.lin");
-}
-
-#[test]
-#[ignore = "std/test framework incomplete"]
-fn test_stdlib_array() {
-    run_test_file("examples/tests/array.test.lin");
-}
-
-#[test]
-#[ignore = "std/test framework incomplete"]
-fn test_stdlib_iter() {
-    run_test_file("examples/tests/iter.test.lin");
-}
-
-#[test]
-#[ignore = "std/test framework incomplete"]
-fn test_stdlib_number() {
-    run_test_file("examples/tests/number.test.lin");
-}
-
-#[test]
-#[ignore = "std/test framework incomplete"]
-fn test_stdlib_result() {
-    run_test_file("examples/tests/result.test.lin");
-}
-
-#[test]
-#[ignore = "std/test framework incomplete"]
-fn test_stdlib_test_framework() {
-    run_test_file("examples/tests/test-framework.test.lin");
 }
 

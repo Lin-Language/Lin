@@ -1,3 +1,6 @@
+import { print } from "std/io"
+import { toString } from "std/string"
+
 val x = 1 + 2
 print(toString(x))
 

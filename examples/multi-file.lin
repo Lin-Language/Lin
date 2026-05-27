@@ -1,4 +1,6 @@
 import { square, cube, abs, clamp } from "lib/math"
+import { print } from "std/io"
+import { toString } from "std/string"
 
 print(toString(square(5)))
 print(toString(cube(3)))

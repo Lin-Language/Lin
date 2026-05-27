@@ -46,7 +46,7 @@ Cargo workspace with ten crates (`crates/`):
 - **`lin`** — CLI binary. Dispatches `run`, `build`, `check` subcommands.
 - **`lin-lsp`** — language server (in progress).
 
-Stdlib lives in `stdlib/*.lin` and is loaded via `include_str!` in both `lin-eval` and `lin-compile`. Current stdlib modules: `std/io`, `std/string`, `std/number`, `std/array`, `std/iter`, `std/result`, `std/fs`, `std/http`, `std/server`.
+Stdlib lives in `stdlib/*.lin` and is loaded via `include_str!` in both `lin-eval` and `lin-compile`. Current stdlib modules: `std/io`, `std/string`, `std/number`, `std/array`, `std/iter`, `std/object`, `std/async`, `std/fs`, `std/http`, `std/server`, `std/template`, `std/test`.
 
 ## Pipeline shapes
 
@@ -57,7 +57,7 @@ source (.lin) → Lexer → Tokens → Parser → AST → Interpreter::eval → 
 
 Everything happens in `lin-eval::Interpreter`:
 
-1. `Interpreter::new()` calls `register_intrinsics()` (native Rust functions like `print`, `length`, `toString`, `__stringTrim`, `iter`, `for`, `push`, ...) then `register_stdlib_sources()` (embeds the `stdlib/*.lin` files via `include_str!`) then `preload_stdlib()` (loads `std/iter` and `std/array` into the global env so `range`, `map`, `filter`, etc. are globally available).
+1. `Interpreter::new()` calls `register_intrinsics()` (Rust-implemented primitives named `lin_print`, `lin_length`, `lin_to_string`, `lin_for`, `lin_iter`, `lin_push`, `lin_keys`, etc.) then `register_stdlib_sources()` (embeds the `stdlib/*.lin` files via `include_str!`) then `preload_stdlib()` (loads `std/io`, `std/string`, `std/iter`, `std/array`, `std/object`, `std/async` into the global env so `print`, `toString`, `range`, `map`, etc. are globally available in the interpreter).
 2. `run_file(path)` sets `base_path` (used for resolving user imports) and calls `run(source)`.
 3. `run(source)` lexes, parses, then evaluates statements top-to-bottom in `global_env`.
 
@@ -90,12 +90,13 @@ These are non-obvious and easy to break. Full rationale lives in `docs/DECISIONS
 - **TCO uses a `TailResult` trampoline.** `eval_tail_expr` recognises direct self-recursive calls in tail position (function body, if branches, block tails, match arm bodies) and returns `TailCall(args)` instead of recursing. Only `call_function` loops on it. Mutual TCO is not implemented (ADR-012, spec §27.3).
 - **`var` is captured by reference via shared `Rc<RefCell<Value>>` cells.** Two closures over the same `var` see the same storage (spec §27.2, ADR-015).
 - **Bracket access is safe by default.** Missing object key → `Null`; `Null` propagates through chains; array OOB is a runtime error (spec §6.1).
-- **Stdlib split: `for` and `iter` are Rust intrinsics, everything else is .lin.** `range`, `iterOf`, `map`, `filter`, `reduce` live in `stdlib/{iter,array}.lin` and are preloaded as globals (ADR-002). String functions are .lin wrappers around `__stringFoo` Rust intrinsics (ADR-009).
+- **Compiler builtins use `lin_*` names; user-facing names come from stdlib.** All polymorphic primitives (`lin_print`, `lin_for`, `lin_iter`, `lin_length`, `lin_to_string`, `lin_push`, `lin_keys`, `lin_range`, `lin_map`, `lin_filter`, `lin_reduce`, and all concurrency: `lin_async` etc.) are registered in `register_intrinsics()` and dispatched specially in codegen. They are not visible to user code. Stdlib files re-export them under their clean names: `std/io` exports `print`, `std/iter` exports `for`/`iter`/`range`, `std/array` exports `map`/`filter`/`reduce`/`push`/`length`, `std/object` exports `keys`, `std/string` exports `toString`/`length`, `std/async` exports `async`/`await` etc. In the interpreter, `preload_stdlib()` injects all these into the global env so they are available without an import. In the compiler, user code must import them explicitly (ADR-002, ADR-009).
 - **Inline blocks inside parentheses.** Lambdas like `x => val y = x*2; y` passed to `.for(...)` have no INDENT/DEDENT (suppressed by ADR-004). `parse_function_body` detects `val`/`var` as the multi-statement-body signal (ADR-014).
 - **Imports: `std/...` resolves into the embedded stdlib sources; everything else is resolved relative to the importing file's directory with `.lin` appended** (ADR-016). Module init is lazy; cycles within a single init chain are a runtime error.
 - **`async(f)` thunks must not capture `var` bindings** and must not return `Function` or `Iterator` values. Both are compile-time errors in `lin-check`. The checker tracks mutable global slots separately (`mutable_global_slots`) because global vars are not recorded as captures (ADR-034).
 - **`import foreign "path"` registers stubs in the interpreter** that error at call time. The stub arity is derived from the declared type so call-site arity checks pass (ADR-033, ADR-037). Real FFI calls work only via `lin build`.
-- **IO/FS/HTTP/server intrinsics use the call-dispatch pattern** (same as `for`, `async`, `worker`) so they can call interpreter methods with `&mut self`. They are registered as stub natives that are intercepted by name in `call_value` (ADR-030).
+- **`import foreign "lin-runtime"` is a reserved internal path** used by stdlib files to declare their FFI dependencies on `lin-runtime.a` symbols (e.g. `lin_string_trim`, `lin_fs_read`). The compiler recognises this path, skips normal FFI type validation (to allow Array/Object return types), and doesn't add it to `foreign_lib_paths` (it's always linked). User code cannot use this path meaningfully — the runtime symbols are only accessible through the stdlib wrappers.
+- **IO/FS/HTTP/server intrinsics use the call-dispatch pattern** (same as `lin_for`, `lin_async`, `lin_worker`) so they can call interpreter methods with `&mut self`. They are registered as stub natives that are intercepted by name in `call_value` (ADR-030).
 
 ## Adding a language feature
 

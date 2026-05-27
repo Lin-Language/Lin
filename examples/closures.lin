@@ -1,3 +1,6 @@
+import { print } from "std/io"
+import { toString } from "std/string"
+
 // Mutable bindings
 var count = 0
 count = count + 1

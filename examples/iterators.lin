@@ -1,3 +1,8 @@
+import { print } from "std/io"
+import { toString } from "std/string"
+import { range } from "std/array"
+import { map, filter, reduce, for } from "std/array"
+
 // for over array
 val nums = [1, 2, 3]
 nums.for(n =>

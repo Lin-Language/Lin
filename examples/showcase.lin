@@ -1,13 +1,11 @@
-import { trim, toUpper, split, join, contains, replace } from "std/string"
+import { trim, toUpper, split, join, contains, replace, toString, length } from "std/string"
 import { isInt32, parseInt32 } from "std/number"
+import { print } from "std/io"
+import { map, filter, reduce, for } from "std/array"
+import { range } from "std/array"
 
 // ===== Data Processing Pipeline =====
 
-// Types (documentation only, not checked at runtime)
-// Student = { "name": String, "scores": Int32[] }
-// Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
-
-// Parse raw CSV-like input into student records
 val parseStudent = (line: String): Json =>
   val parts = line.split(",")
   if length(parts) < 2
