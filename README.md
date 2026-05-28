@@ -41,6 +41,27 @@ lin --version
 
 ---
 
+## VS Code Extension
+
+Download `lin-lang.vsix` from the [latest release](https://github.com/linusnorton/lin-lang/releases/tag/latest) and install it:
+
+```bash
+code --install-extension lin-lang.vsix
+```
+
+The extension includes:
+
+- **Syntax highlighting** for `.lin` files
+- **Diagnostics** — type errors and parse errors shown inline as you type
+- **Hover types** — hover over any expression to see its inferred type
+- **Go to definition** — jump to where a binding is declared
+- **Dot-completion with auto-import** — type `myArr.` and the completion list shows only functions that accept an array as their first argument (`map`, `filter`, `reduce`, …). Selecting one automatically inserts the `import` at the top of the file if it isn't there yet.
+- **Lin: Build / Run / Test** commands — open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and search for "Lin" to compile, run, or test the active file without leaving the editor.
+
+The extension bundles the `lin` compiler and `lin-lsp` language server — no separate installation required.
+
+---
+
 ## Quick Start
 
 ```bash
