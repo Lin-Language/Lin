@@ -26,6 +26,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed for git rev-list --count
 
       - name: Install LLVM 22 (Linux)
         if: runner.os == 'Linux'
@@ -79,48 +81,48 @@ jobs:
           cp target/${{ matrix.target }}/release/lin-lsp dist/lin-lsp
           cd dist && tar -czf ../${{ matrix.artifact }}.tar.gz lin lin-lsp
 
+      - name: Package platform-specific VSIX
+        run: |
+          PATCH=$(git rev-list --count HEAD)
+          mkdir -p editors/vscode/bin/${{ matrix.vsix_platform }}
+          cp target/${{ matrix.target }}/release/lin     editors/vscode/bin/${{ matrix.vsix_platform }}/lin
+          cp target/${{ matrix.target }}/release/lin-lsp editors/vscode/bin/${{ matrix.vsix_platform }}/lin-lsp
+          cd editors/vscode
+          npm install
+          # Stamp patch version from commit count so marketplace never sees a duplicate.
+          node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('package.json'));
+            const [maj, min] = p.version.split('.');
+            p.version = \`\${maj}.\${min}.\${process.env.PATCH}\`;
+            fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
+          " PATCH=$PATCH
+          npx @vscode/vsce package \
+            --target ${{ matrix.vsix_platform }} \
+            --no-dependencies \
+            -o ../../lin-lang-${{ matrix.vsix_platform }}.vsix
+
+      - name: Publish to VS Code Marketplace
+        if: env.VSCE_PAT != ''
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        working-directory: editors/vscode
+        run: |
+          npx @vscode/vsce publish \
+            --target ${{ matrix.vsix_platform }} \
+            --no-dependencies \
+            --packagePath ../../lin-lang-${{ matrix.vsix_platform }}.vsix
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.tar.gz
-
-  vsix:
-    name: Package VSIX
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          merge-multiple: true
-          path: dist/
-
-      - name: Place binaries into extension
-        run: |
-          mkdir -p editors/vscode/bin/linux-x64
-          tar -xzf dist/lin-linux-x86_64.tar.gz -C editors/vscode/bin/linux-x64
-          mkdir -p editors/vscode/bin/darwin-arm64
-          tar -xzf dist/lin-macos-arm64.tar.gz -C editors/vscode/bin/darwin-arm64
-          chmod +x editors/vscode/bin/linux-x64/lin \
-                   editors/vscode/bin/linux-x64/lin-lsp \
-                   editors/vscode/bin/darwin-arm64/lin \
-                   editors/vscode/bin/darwin-arm64/lin-lsp
-
-      - name: Package VSIX
-        working-directory: editors/vscode
-        run: |
-          npm install
-          npx @vscode/vsce package --no-dependencies -o ../../lin-lang.vsix
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: lin-lang-vsix
-          path: lin-lang.vsix
+          path: |
+            ${{ matrix.artifact }}.tar.gz
+            lin-lang-${{ matrix.vsix_platform }}.vsix
 
   release:
     name: Publish "latest" pre-release
-    needs: [build, vsix]
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -156,8 +158,10 @@ jobs:
 
             ## VS Code Extension
 
-            Download `lin-lang.vsix` and install with:
+            Download the `.vsix` for your platform and install with:
             ```bash
-            code --install-extension lin-lang.vsix
+            code --install-extension lin-lang-<platform>.vsix
             ```
+
+            Or install directly from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=linusnorton.lin-lang).
           files: dist/*
