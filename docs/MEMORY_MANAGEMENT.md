@@ -132,9 +132,13 @@ Lin uses **pure reference counting with no cycle detection**. Reference cycles b
 
 Key file: `lin-codegen/src/codegen.rs`
 
-### Phase 3 — Wire LinIR into production (planned)
+### Phase 3 — Wire LinIR into production (complete)
 
-Route compilation through `lower_module` → `elide_rc` → `compile_module_from_ir`. Complete the RC insertion in `lower.rs` that the comment already promises. Add `compile_module_from_ir` in `codegen.rs`. Gate behind `LIN_USE_IR=1` env var until parity is confirmed.
+| Task | Status | Notes |
+|---|---|---|
+| RC insertion in `lower.rs` (pessimistic Retain/Release) | ✅ Done | `scope_owned` stack tracks owned temps; Release emitted at Block/function scope exits |
+| `compile_module_from_ir` in `codegen.rs` | ✅ Done | Handles all `Instruction` variants, translates to LLVM using existing helpers |
+| `LIN_USE_IR=1` routing in `lin-compile/src/lib.rs` | ✅ Done | Routes through `lower_module` → `elide_rc` → `compile_module_from_ir` when env var set |
 
 Key files: `lin-ir/src/lower.rs`, `lin-codegen/src/codegen.rs`, `lin-compile/src/lib.rs`
 

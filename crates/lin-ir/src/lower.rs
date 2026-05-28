@@ -38,9 +38,13 @@ pub fn lower_module(module: &TypedModule) -> LinModule {
     let main_id = ctx.alloc_func_id();
     let mut builder = FuncBuilder::new(main_id, None, vec![], false, Type::Int32, ctx.intrinsics.clone());
 
+    builder.push_scope();
     for stmt in &module.statements {
         lower_stmt(stmt, &mut builder, &mut ctx);
     }
+    // Release module-level owned temps (main exits, nothing to return).
+    let sentinel = Temp(u32::MAX);
+    builder.pop_scope_releasing(sentinel);
 
     // Return 0 from main.
     let zero = builder.const_temp(Const::Int(0, Type::Int32));
@@ -110,6 +114,10 @@ struct FuncBuilder {
     /// Lin slot → temp mapping for the current scope.
     slots: HashMap<usize, Temp>,
     intrinsic_slots: HashMap<usize, String>,
+    /// Stack of owned-temp frames for scope-exit release.
+    /// Each frame holds (temp, type) pairs for freshly-allocated heap values
+    /// introduced in the current scope that must be released on exit.
+    scope_owned: Vec<Vec<(Temp, Type)>>,
 }
 
 impl FuncBuilder {
@@ -149,6 +157,7 @@ impl FuncBuilder {
             block_counter: 1,
             slots: HashMap::new(),
             intrinsic_slots,
+            scope_owned: Vec::new(),
         }
     }
 
@@ -221,6 +230,31 @@ impl FuncBuilder {
         dst
     }
 
+    /// Push a new ownership scope frame.
+    fn push_scope(&mut self) {
+        self.scope_owned.push(Vec::new());
+    }
+
+    /// Register an owned temp in the current scope frame.
+    fn register_owned(&mut self, t: Temp, ty: Type) {
+        if is_rc_type(&ty) {
+            if let Some(frame) = self.scope_owned.last_mut() {
+                frame.push((t, ty));
+            }
+        }
+    }
+
+    /// Pop the current scope frame and emit Release for all owned temps except `keep`.
+    fn pop_scope_releasing(&mut self, keep: Temp) {
+        if let Some(frame) = self.scope_owned.pop() {
+            for (t, ty) in frame {
+                if t != keep {
+                    self.emit(Instruction::Release { val: t, ty });
+                }
+            }
+        }
+    }
+
     fn is_current_block_terminated(&self) -> bool {
         let id = self.current_block;
         self.blocks
@@ -229,6 +263,13 @@ impl FuncBuilder {
             .map(|b| !matches!(b.terminator, Terminator::Unreachable))
             .unwrap_or(false)
     }
+}
+
+fn is_rc_type(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Str | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. }
+    )
 }
 
 fn const_type(c: &Const) -> Type {
@@ -344,7 +385,9 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             builder.const_temp(Const::Float(*v, ty.clone()))
         }
         TypedExpr::StringLit(s, _) => {
-            builder.const_temp(Const::Str(s.clone()))
+            let t = builder.const_temp(Const::Str(s.clone()));
+            builder.register_owned(t, Type::Str);
+            t
         }
         TypedExpr::BoolLit(b, _) => {
             builder.const_temp(Const::Bool(*b))
@@ -355,6 +398,11 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
 
         TypedExpr::LocalGet { slot, ty, .. } => {
             if let Some(&t) = builder.slots.get(slot) {
+                // Pessimistically retain heap values on every read — rc_elide removes redundant pairs.
+                if is_rc_type(ty) {
+                    builder.emit(Instruction::Retain { val: t, ty: ty.clone() });
+                    builder.register_owned(t, ty.clone());
+                }
                 t
             } else {
                 // Slot not yet in scope — emit a placeholder null temp.
@@ -410,10 +458,13 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
 
         TypedExpr::Block { stmts, expr, .. } => {
             let outer_slots = builder.slots.clone();
+            builder.push_scope();
             for stmt in stmts {
                 lower_stmt(stmt, builder, ctx);
             }
             let result = lower_expr(expr, builder, ctx);
+            // Release all owned temps in this scope except the result.
+            builder.pop_scope_releasing(result);
             // Restore outer scope (block-local bindings don't leak).
             // But keep slots that were already present (var updates).
             for (k, v) in &outer_slots {
@@ -444,6 +495,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 spreads: lowered_spreads,
                 ty: ty.clone(),
             });
+            builder.register_owned(dst, ty.clone());
             dst
         }
 
@@ -462,6 +514,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 elements: lowered,
                 elem_ty,
             });
+            builder.register_owned(dst, ty.clone());
             dst
         }
 
@@ -559,6 +612,7 @@ fn lower_call(
                 args: lowered_args,
                 ret_ty: result_type.clone(),
             });
+            builder.register_owned(dst, result_type.clone());
             return dst;
         }
     }
@@ -580,6 +634,7 @@ fn lower_call(
         args: lowered_args,
         ret_ty: result_type.clone(),
     });
+    builder.register_owned(dst, result_type.clone());
     dst
 }
 
@@ -606,6 +661,7 @@ fn lower_intrinsic_call(
                 args: lowered_args,
                 ret_ty: result_type.clone(),
             });
+            builder.register_owned(dst, result_type.clone());
             return dst;
         }
     };
@@ -617,6 +673,7 @@ fn lower_intrinsic_call(
         args: lowered_args,
         ret_ty: result_type.clone(),
     });
+    builder.register_owned(dst, result_type.clone());
     dst
 }
 
@@ -909,6 +966,7 @@ fn lower_function_expr(
         block_counter: 1,
         slots: slot_to_temp,
         intrinsic_slots: builder.intrinsic_slots.clone(),
+        scope_owned: Vec::new(),
     };
 
     // Add entry block.
@@ -935,7 +993,10 @@ fn lower_function_expr(
         }
     }
 
+    inner_builder.push_scope();
     let ret_temp = lower_expr(body, &mut inner_builder, ctx);
+    // Release owned temps in function scope except the return value.
+    inner_builder.pop_scope_releasing(ret_temp);
     if !inner_builder.is_current_block_terminated() {
         inner_builder.terminate(Terminator::Return(Some(ret_temp)));
     }
@@ -962,8 +1023,9 @@ fn lower_function_expr(
         dst,
         func: fid,
         captures: capture_temps,
-        ret_ty: closure_ty,
+        ret_ty: closure_ty.clone(),
     });
+    builder.register_owned(dst, closure_ty);
     dst
 }
 

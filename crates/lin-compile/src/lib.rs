@@ -13,6 +13,7 @@ use lin_codegen::Codegen;
 use lin_lex::Lexer;
 use lin_parse::ast::{Module, Stmt};
 use lin_parse::Parser;
+use lin_ir::{lower_module, rc_elide};
 
 #[derive(Debug)]
 pub struct CompileOptions {
@@ -98,7 +99,14 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         cg.register_import(path, imp_module);
     }
 
-    cg.compile_module(&typed_module);
+    // Route through LinIR when LIN_USE_IR=1 (experimental; defaults to TypedAST path).
+    if std::env::var("LIN_USE_IR").as_deref() == Ok("1") {
+        let mut ir_module = lower_module(&typed_module);
+        rc_elide::elide_rc(&mut ir_module);
+        cg.compile_module_from_ir(&ir_module);
+    } else {
+        cg.compile_module(&typed_module);
+    }
 
     // 5. Emit LLVM IR if requested (before verify so we can inspect broken IR)
     if opts.emit_ir {

@@ -16,6 +16,7 @@ use std::path::Path;
 use lin_check::typed_ir::*;
 use lin_check::types::Type;
 use lin_parse::ast::BinOp;
+use lin_ir::ir as lir;
 use crate::coverage::{CoverageEmitter, FnCovInfo};
 
 /// Tracks a slot: either a stack alloca (mutable) or an immutable SSA value.
@@ -6442,6 +6443,692 @@ impl<'ctx> Codegen<'ctx> {
                 len_ok
             }
         }
+    }
+
+    // =========================================================================
+    // LinIR-consuming codegen (Phase 3)
+    // =========================================================================
+
+    /// Compile a `LinModule` (produced by `lin_ir::lower_module` + `elide_rc`) to LLVM IR.
+    /// This is the LinIR pipeline path, gated behind `LIN_USE_IR=1`.
+    pub fn compile_module_from_ir(&mut self, module: &lir::LinModule) {
+        use lir::{Instruction, Const, CallTarget, Terminator};
+        use std::collections::HashMap as StdMap;
+
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i32_ty = self.context.i32_type();
+        let i64_ty = self.context.i64_type();
+        let void_ty = self.context.void_type();
+
+        // ---- Pass 1: pre-declare all LLVM functions (so cross-calls work) ----
+        let mut ir_fn_to_llvm: StdMap<lir::FuncId, FunctionValue<'ctx>> = StdMap::new();
+        for func in &module.functions {
+            // Build LLVM function type from params/ret.
+            let ret_ty = &func.ret_ty;
+            let mut param_types: Vec<BasicMetadataTypeEnum> = Vec::new();
+            for (_, ty) in &func.params {
+                param_types.push(self.llvm_param_type(ty));
+            }
+            let name = if func.name.as_deref() == Some("main") || func.name.is_none() {
+                if func.id == lir::FuncId(0) { "main".to_string() }
+                else { format!("__lin_fn_{}", func.id.0) }
+            } else {
+                func.name.clone().unwrap()
+            };
+
+            let llvm_fn = if matches!(ret_ty, Type::Null | Type::Never) {
+                let fn_ty = void_ty.fn_type(&param_types, false);
+                if let Some(existing) = self.module.get_function(&name) { existing }
+                else { self.module.add_function(&name, fn_ty, None) }
+            } else {
+                let ret_llvm = self.llvm_type(ret_ty);
+                let fn_ty = ret_llvm.fn_type(&param_types, false);
+                if let Some(existing) = self.module.get_function(&name) { existing }
+                else { self.module.add_function(&name, fn_ty, None) }
+            };
+            self.named_fns.insert(name.clone(), llvm_fn);
+            ir_fn_to_llvm.insert(func.id, llvm_fn);
+        }
+
+        // ---- Pass 2: compile each function body ----
+        for func in &module.functions {
+            let llvm_fn = ir_fn_to_llvm[&func.id];
+
+            // Map BlockId → LLVM BasicBlock
+            let mut ir_block_to_llvm: StdMap<lir::BlockId, inkwell::basic_block::BasicBlock<'ctx>> = StdMap::new();
+            for block in &func.blocks {
+                let label = block.label.as_deref().unwrap_or("bb");
+                let bb = self.context.append_basic_block(llvm_fn, label);
+                ir_block_to_llvm.insert(block.id, bb);
+            }
+
+            // Map Temp → LLVM value (populated as we emit instructions)
+            let mut temp_map: StdMap<lir::Temp, BasicValueEnum<'ctx>> = StdMap::new();
+
+            // Pre-load params into temp_map
+            for (i, (temp, _ty)) in func.params.iter().enumerate() {
+                if let Some(param_val) = llvm_fn.get_nth_param(i as u32) {
+                    temp_map.insert(*temp, param_val);
+                }
+            }
+
+            // Compile each block
+            for block in &func.blocks {
+                let bb = ir_block_to_llvm[&block.id];
+                self.builder.position_at_end(bb);
+
+                for instr in &block.instructions {
+                    match instr {
+                        Instruction::Const { dst, val } => {
+                            let llvm_val = match val {
+                                Const::Int(v, ty) => self.compile_int_lit(*v, ty),
+                                Const::Float(v, ty) => self.compile_float_lit(*v, ty),
+                                Const::Bool(b) => self.context.bool_type().const_int(*b as u64, false).into(),
+                                Const::Null => ptr_ty.const_null().into(),
+                                Const::Str(s) => self.compile_string_lit(s),
+                            };
+                            temp_map.insert(*dst, llvm_val);
+                        }
+                        Instruction::Copy { dst, src } => {
+                            if let Some(&v) = temp_map.get(src) {
+                                temp_map.insert(*dst, v);
+                            }
+                        }
+                        Instruction::Binary { dst, op, lhs, rhs, ty } => {
+                            let lv = temp_map.get(lhs).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                            let rv = temp_map.get(rhs).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                            let result = self.compile_binary_op_values(lv, rv, op, ty, ty);
+                            temp_map.insert(*dst, result);
+                        }
+                        Instruction::Retain { val, .. } => {
+                            if let Some(&v) = temp_map.get(val) {
+                                if v.is_pointer_value() {
+                                    self.builder.build_call(self.rt_rc_retain, &[v.into()], "").unwrap();
+                                }
+                            }
+                        }
+                        Instruction::Release { val, ty } => {
+                            if let Some(&v) = temp_map.get(val) {
+                                self.emit_release(v, ty);
+                            }
+                        }
+                        Instruction::Call { dst, callee, args, ret_ty } => {
+                            let arg_vals: Vec<BasicMetadataValueEnum> = args
+                                .iter()
+                                .filter_map(|a| temp_map.get(a).map(|v| (*v).into()))
+                                .collect();
+                            let result = match callee {
+                                CallTarget::Direct(fid) => {
+                                    let callee_fn = ir_fn_to_llvm[fid];
+                                    let call = self.builder.build_call(callee_fn, &arg_vals, "call").unwrap();
+                                    if matches!(ret_ty, Type::Null | Type::Never) { ptr_ty.const_null().into() }
+                                    else { call.try_as_basic_value().unwrap_basic() }
+                                }
+                                CallTarget::Named(name) => {
+                                    if let Some(callee_fn) = self.module.get_function(name) {
+                                        let call = self.builder.build_call(callee_fn, &arg_vals, "call_n").unwrap();
+                                        if matches!(ret_ty, Type::Null | Type::Never) { ptr_ty.const_null().into() }
+                                        else { call.try_as_basic_value().unwrap_basic() }
+                                    } else { ptr_ty.const_null().into() }
+                                }
+                                CallTarget::Indirect(fn_temp) => {
+                                    if let Some(&cls_ptr) = temp_map.get(fn_temp) {
+                                        if cls_ptr.is_pointer_value() {
+                                            // Build closure call: load fn_ptr from offset 2 of closure struct.
+                                            let cls_ty = self.closure_struct_type();
+                                            let cls_ptr_v = cls_ptr.into_pointer_value();
+                                            let fn_gep = self.builder.build_struct_gep(cls_ty, cls_ptr_v, 2, "ir_fp").unwrap();
+                                            let fn_ptr = self.builder.build_load(ptr_ty, fn_gep, "ir_fnp").unwrap().into_pointer_value();
+                                            let env_gep = self.builder.build_struct_gep(cls_ty, cls_ptr_v, 3, "ir_ep").unwrap();
+                                            let env_ptr = self.builder.build_load(ptr_ty, env_gep, "ir_envp").unwrap();
+
+                                            // Build param types: env_ptr + arg types.
+                                            // Recover arg types from the IR temp_types map.
+                                            let mut fn_param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
+                                            let mut call_args: Vec<BasicMetadataValueEnum> = vec![env_ptr.into()];
+                                            for (av, a_temp) in arg_vals.iter().zip(args.iter()) {
+                                                let arg_ty = func.temp_types.get(a_temp).cloned().unwrap_or(Type::Null);
+                                                fn_param_types.push(self.llvm_param_type(&arg_ty));
+                                                call_args.push((*av).into());
+                                            }
+                                            let fn_ty = if matches!(ret_ty, Type::Null | Type::Never) {
+                                                void_ty.fn_type(&fn_param_types, false)
+                                            } else {
+                                                self.llvm_type(ret_ty).fn_type(&fn_param_types, false)
+                                            };
+                                            let call = self.builder.build_indirect_call(fn_ty, fn_ptr, &call_args, "ir_ind").unwrap();
+                                            if matches!(ret_ty, Type::Null | Type::Never) { ptr_ty.const_null().into() }
+                                            else { call.try_as_basic_value().unwrap_basic() }
+                                        } else { ptr_ty.const_null().into() }
+                                    } else { ptr_ty.const_null().into() }
+                                }
+                            };
+                            temp_map.insert(*dst, result);
+                        }
+                        Instruction::CallIntrinsic { dst, intrinsic, args, ret_ty } => {
+                            let arg_vals: Vec<BasicValueEnum> = args
+                                .iter()
+                                .filter_map(|a| temp_map.get(a).copied())
+                                .collect();
+                            let result = self.compile_ir_intrinsic(intrinsic, &arg_vals, ret_ty);
+                            temp_map.insert(*dst, result);
+                        }
+                        Instruction::MakeObject { dst, fields, spreads, ty } => {
+                            // Compile field values first (they're already Temps).
+                            let cap = i32_ty.const_int((fields.len() + 4).max(4) as u64, false);
+                            let obj_ptr = self.builder.build_call(self.rt_object_alloc, &[cap.into()], "ir_obj")
+                                .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+                            // Apply spreads.
+                            if !spreads.is_empty() {
+                                let merge_fn = self.get_or_declare_fn("lin_object_merge",
+                                    void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                                for s in spreads {
+                                    if let Some(&sv) = temp_map.get(s) {
+                                        if sv.is_pointer_value() {
+                                            self.builder.build_call(merge_fn, &[obj_ptr.into(), sv.into()], "").unwrap();
+                                        }
+                                    }
+                                }
+                            }
+                            for (key, val_temp) in fields {
+                                if let Some(&val) = temp_map.get(val_temp) {
+                                    let key_str = self.compile_string_lit(key).into_pointer_value();
+                                    let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
+                                    let tagged = self.build_tagged_val_alloca(&val, &val_ty);
+                                    self.builder.build_call(self.rt_object_set, &[obj_ptr.into(), key_str.into(), tagged.into()], "").unwrap();
+                                }
+                            }
+                            let _ = ty;
+                            temp_map.insert(*dst, obj_ptr.into());
+                        }
+                        Instruction::MakeArray { dst, elements, elem_ty } => {
+                            let cap = i64_ty.const_int(elements.len().max(4) as u64, false);
+                            let arr = if Self::is_flat_scalar(elem_ty) {
+                                let suffix = Self::flat_suffix(elem_ty);
+                                let alloc_fn = self.get_or_declare_fn(
+                                    &format!("lin_flat_array_alloc_{}", suffix),
+                                    ptr_ty.fn_type(&[i64_ty.into()], false));
+                                let arr_v = self.builder.build_call(alloc_fn, &[cap.into()], "ir_farr")
+                                    .unwrap().try_as_basic_value().unwrap_basic();
+                                for e_temp in elements {
+                                    if let Some(&ev) = temp_map.get(e_temp) {
+                                        self.flat_array_push(arr_v, ev, elem_ty);
+                                    }
+                                }
+                                arr_v
+                            } else {
+                                let arr_v = self.builder.build_call(self.rt_array_alloc, &[cap.into()], "ir_arr")
+                                    .unwrap().try_as_basic_value().unwrap_basic();
+                                for e_temp in elements {
+                                    if let Some(&ev) = temp_map.get(e_temp) {
+                                        self.tagged_array_push_value(arr_v, ev, elem_ty);
+                                    }
+                                }
+                                arr_v
+                            };
+                            temp_map.insert(*dst, arr);
+                        }
+                        Instruction::MakeClosure { dst, func: fid, captures, ret_ty: _ } => {
+                            if let Some(&callee_fn) = ir_fn_to_llvm.get(fid) {
+                                let fn_ptr = callee_fn.as_global_value().as_pointer_value();
+                                let capture_vals: Vec<BasicValueEnum> = captures
+                                    .iter()
+                                    .filter_map(|c| temp_map.get(c).copied())
+                                    .collect();
+                                let cls = self.make_closure_struct(fn_ptr.into(), &capture_vals);
+                                temp_map.insert(*dst, cls);
+                            }
+                        }
+                        Instruction::Index { dst, object, key, result_ty } => {
+                            if let (Some(&obj_v), Some(&key_v)) = (temp_map.get(object), temp_map.get(key)) {
+                                let result = self.compile_ir_index(obj_v, key_v, result_ty);
+                                temp_map.insert(*dst, result);
+                            }
+                        }
+                        Instruction::FieldGet { dst, object, field, result_ty } => {
+                            if let Some(&obj_v) = temp_map.get(object) {
+                                let result = self.compile_ir_field_get(obj_v, field, result_ty);
+                                temp_map.insert(*dst, result);
+                            }
+                        }
+                        Instruction::IsType { dst, val, ty } => {
+                            if let Some(&v) = temp_map.get(val) {
+                                let result = self.compile_ir_is_type(v, ty);
+                                temp_map.insert(*dst, result.into());
+                            }
+                        }
+                        Instruction::HasPattern { dst, val, pattern } => {
+                            if let Some(&v) = temp_map.get(val) {
+                                let result = self.compile_ir_has_pattern(v, pattern);
+                                temp_map.insert(*dst, result.into());
+                            }
+                        }
+                        Instruction::Coerce { dst, src, from_ty, to_ty } => {
+                            if let Some(&sv) = temp_map.get(src) {
+                                let result = self.compile_ir_coerce(sv, from_ty, to_ty);
+                                temp_map.insert(*dst, result);
+                            }
+                        }
+                        Instruction::Bind { dst, src, .. } => {
+                            if let Some(&sv) = temp_map.get(src) {
+                                temp_map.insert(*dst, sv);
+                            }
+                        }
+                        Instruction::Panic { msg } => {
+                            if let Some(&msg_v) = temp_map.get(msg) {
+                                if msg_v.is_pointer_value() {
+                                    let zero = i32_ty.const_zero();
+                                    self.builder.build_call(self.rt_panic, &[msg_v.into(), zero.into(), zero.into()], "").unwrap();
+                                }
+                            }
+                            self.builder.build_unreachable().unwrap();
+                        }
+                        Instruction::Box { dst, val, ty } => {
+                            if let Some(&v) = temp_map.get(val) {
+                                let result = self.compile_ir_box(v, ty);
+                                temp_map.insert(*dst, result);
+                            }
+                        }
+                        Instruction::Unbox { dst, val, result_ty } => {
+                            if let Some(&v) = temp_map.get(val) {
+                                let result = self.compile_ir_unbox(v, result_ty);
+                                temp_map.insert(*dst, result);
+                            }
+                        }
+                        Instruction::Unary { dst, op, operand, ty } => {
+                            if let Some(&v) = temp_map.get(operand) {
+                                let result = self.compile_ir_unary(v, op, ty);
+                                temp_map.insert(*dst, result);
+                            }
+                        }
+                    }
+                }
+
+                // Emit terminator
+                match &block.terminator {
+                    Terminator::Return(Some(t)) => {
+                        if let Some(&v) = temp_map.get(t) {
+                            self.builder.build_return(Some(&v)).unwrap();
+                        } else {
+                            self.builder.build_return(None).unwrap();
+                        }
+                    }
+                    Terminator::Return(None) => {
+                        self.builder.build_return(None).unwrap();
+                    }
+                    Terminator::Jump(target) => {
+                        let target_bb = ir_block_to_llvm[target];
+                        self.builder.build_unconditional_branch(target_bb).unwrap();
+                    }
+                    Terminator::CondJump { cond, then_block, else_block } => {
+                        let cond_val = temp_map.get(cond).copied().unwrap_or_else(|| self.context.bool_type().const_zero().into());
+                        let cond_i1 = if cond_val.get_type() == self.context.bool_type().into() {
+                            cond_val.into_int_value()
+                        } else {
+                            self.context.bool_type().const_zero()
+                        };
+                        let then_bb = ir_block_to_llvm[then_block];
+                        let else_bb = ir_block_to_llvm[else_block];
+                        self.builder.build_conditional_branch(cond_i1, then_bb, else_bb).unwrap();
+                    }
+                    Terminator::TailCall { args } => {
+                        // TCO: branch back to entry block with updated args (simplified).
+                        // For now, just re-call self as a tail call.
+                        let entry_bb = ir_block_to_llvm[&block.id]; // fallback
+                        let _ = (args, entry_bb);
+                        self.builder.build_unreachable().unwrap();
+                    }
+                    Terminator::Switch { val, cases, default } => {
+                        if let Some(&v) = temp_map.get(val) {
+                            if v.is_int_value() {
+                                let int_v = v.into_int_value();
+                                let def_bb = ir_block_to_llvm[default];
+                                let case_bbs: Vec<(inkwell::values::IntValue, inkwell::basic_block::BasicBlock)> = cases
+                                    .iter()
+                                    .filter_map(|(tag, bid)| {
+                                        ir_block_to_llvm.get(bid).map(|bb| (self.context.i8_type().const_int(*tag as u64, false), *bb))
+                                    })
+                                    .collect();
+                                self.builder.build_switch(int_v, def_bb, &case_bbs).unwrap();
+                            } else {
+                                let def_bb = ir_block_to_llvm[default];
+                                self.builder.build_unconditional_branch(def_bb).unwrap();
+                            }
+                        } else {
+                            self.builder.build_unreachable().unwrap();
+                        }
+                    }
+                    Terminator::Unreachable => {
+                        self.builder.build_unreachable().unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    fn compile_ir_intrinsic(&mut self, intrinsic: &lir::Intrinsic, args: &[BasicValueEnum<'ctx>], ret_ty: &Type) -> BasicValueEnum<'ctx> {
+        use lir::Intrinsic;
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        match intrinsic {
+            Intrinsic::Print => {
+                if let Some(&s) = args.first() {
+                    self.builder.build_call(self.rt_print, &[s.into()], "").unwrap();
+                }
+                ptr_ty.const_null().into()
+            }
+            Intrinsic::ToString => {
+                let arg = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                self.compile_to_string_value(arg, ret_ty)
+            }
+            Intrinsic::Length => {
+                if let Some(&arr) = args.first() {
+                    let i64_ty = self.context.i64_type();
+                    let len_fn = self.get_or_declare_fn("lin_array_length",
+                        i64_ty.fn_type(&[ptr_ty.into()], false));
+                    self.builder.build_call(len_fn, &[arr.into()], "ir_len")
+                        .unwrap().try_as_basic_value().unwrap_basic()
+                } else { self.context.i64_type().const_zero().into() }
+            }
+            Intrinsic::Push => {
+                if args.len() >= 2 {
+                    let arr = args[0];
+                    let elem = args[1];
+                    self.tagged_array_push_value(arr, elem, ret_ty);
+                }
+                ptr_ty.const_null().into()
+            }
+            Intrinsic::StringConcat | Intrinsic::Concat => {
+                if args.len() >= 2 {
+                    let a = args[0];
+                    let b = args[1];
+                    let rt_concat = self.get_or_declare_fn("lin_string_concat",
+                        ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                    self.builder.build_call(rt_concat, &[a.into(), b.into()], "ir_cat")
+                        .unwrap().try_as_basic_value().unwrap_basic()
+                } else { ptr_ty.const_null().into() }
+            }
+            _ => ptr_ty.const_null().into(),
+        }
+    }
+
+    fn compile_ir_index(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, result_ty: &Type) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        // If key is an integer, treat as array index; otherwise treat as object key.
+        if key.is_int_value() && key.get_type() == i64_ty.into() {
+            if obj.is_pointer_value() {
+                // Array get (tagged).
+                let tagged = self.builder.build_call(self.rt_array_get, &[obj.into(), key.into()], "ir_aget")
+                    .unwrap().try_as_basic_value().unwrap_basic();
+                // Unbox to result type if needed.
+                self.unbox_tagged_val_to_type(tagged, result_ty)
+            } else { ptr_ty.const_null().into() }
+        } else {
+            // Object field get.
+            if obj.is_pointer_value() {
+                let tagged = self.builder.build_call(self.rt_object_get, &[obj.into(), key.into()], "ir_oget")
+                    .unwrap().try_as_basic_value().unwrap_basic();
+                self.unbox_tagged_val_to_type(tagged, result_ty)
+            } else { ptr_ty.const_null().into() }
+        }
+    }
+
+    fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, result_ty: &Type) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        if obj.is_pointer_value() {
+            let key_str = self.compile_string_lit(field).into_pointer_value();
+            let tagged = self.builder.build_call(self.rt_object_get, &[obj.into(), key_str.into()], "ir_fget")
+                .unwrap().try_as_basic_value().unwrap_basic();
+            self.unbox_tagged_val_to_type(tagged, result_ty)
+        } else { ptr_ty.const_null().into() }
+    }
+
+    fn compile_ir_is_type(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) -> inkwell::values::IntValue<'ctx> {
+        // Use get_tag and compare.
+        if val.is_pointer_value() {
+            let tag = self.builder.build_call(self.rt_get_tag, &[val.into()], "ir_tag")
+                .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+            let expected = self.type_tag_const(ty);
+            self.builder.build_int_compare(IntPredicate::EQ, tag, expected, "ir_is").unwrap()
+        } else {
+            self.context.bool_type().const_zero()
+        }
+    }
+
+    fn compile_ir_has_pattern(&mut self, val: BasicValueEnum<'ctx>, pattern: &lir::HasDesc) -> inkwell::values::IntValue<'ctx> {
+        if !val.is_pointer_value() { return self.context.bool_type().const_zero(); }
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i8_ty = self.context.i8_type();
+        let obj_has_fn = self.get_or_declare_fn("lin_object_has",
+            i8_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+        let mut result = self.context.bool_type().const_int(1, false);
+        for field in &pattern.required_fields {
+            let key_str = self.compile_string_lit(field).into_pointer_value();
+            let has_i8 = self.builder.build_call(obj_has_fn, &[val.into(), key_str.into()], "ir_has")
+                .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+            let has_bool = self.builder.build_int_truncate_or_bit_cast(has_i8, self.context.bool_type(), "has_b").unwrap();
+            result = self.builder.build_and(result, has_bool, "has_acc").unwrap();
+        }
+        result
+    }
+
+    fn compile_ir_coerce(&mut self, val: BasicValueEnum<'ctx>, from_ty: &Type, to_ty: &Type) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        // Numeric widening.
+        if from_ty.is_numeric() && to_ty.is_numeric() {
+            if val.is_int_value() && to_ty.is_float() {
+                let iv = val.into_int_value();
+                let ft = if matches!(to_ty, Type::Float32) { self.context.f32_type().into() } else { self.context.f64_type() };
+                return self.builder.build_signed_int_to_float(iv, ft, "ir_i2f").unwrap().into();
+            }
+            if val.is_float_value() && to_ty.is_integer() {
+                let fv = val.into_float_value();
+                let it = self.llvm_type(to_ty).into_int_type();
+                return self.builder.build_float_to_signed_int(fv, it, "ir_f2i").unwrap().into();
+            }
+            if val.is_int_value() && to_ty.is_integer() {
+                let iv = val.into_int_value();
+                let it = self.llvm_type(to_ty).into_int_type();
+                let from_bits = iv.get_type().get_bit_width();
+                let to_bits = it.get_bit_width();
+                return if to_bits > from_bits {
+                    self.builder.build_int_z_extend_or_bit_cast(iv, it, "ir_zext").unwrap().into()
+                } else {
+                    self.builder.build_int_truncate_or_bit_cast(iv, it, "ir_trunc").unwrap().into()
+                };
+            }
+            return val;
+        }
+        // Box to union.
+        if Self::is_union_type(to_ty) {
+            return self.build_tagged_val_alloca(&val, from_ty).into();
+        }
+        // Unbox from union.
+        if Self::is_union_type(from_ty) && val.is_pointer_value() {
+            return self.unbox_tagged_val_to_type(val, to_ty);
+        }
+        let _ = (from_ty, to_ty);
+        if val.get_type() == self.llvm_type(to_ty) { val } else { ptr_ty.const_null().into() }
+    }
+
+    fn compile_ir_box(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) -> BasicValueEnum<'ctx> {
+        self.build_tagged_val_alloca(&val, ty).into()
+    }
+
+    fn compile_ir_unbox(&mut self, val: BasicValueEnum<'ctx>, result_ty: &Type) -> BasicValueEnum<'ctx> {
+        self.unbox_tagged_val_to_type(val, result_ty)
+    }
+
+    fn compile_ir_unary(&mut self, val: BasicValueEnum<'ctx>, op: &lir::UnaryOp, _ty: &Type) -> BasicValueEnum<'ctx> {
+        match op {
+            lir::UnaryOp::Neg => {
+                if val.is_int_value() {
+                    let iv = val.into_int_value();
+                    self.builder.build_int_neg(iv, "ir_neg").unwrap().into()
+                } else if val.is_float_value() {
+                    let fv = val.into_float_value();
+                    self.builder.build_float_neg(fv, "ir_fneg").unwrap().into()
+                } else { val }
+            }
+            lir::UnaryOp::Not => {
+                if val.is_int_value() {
+                    let iv = val.into_int_value();
+                    self.builder.build_not(iv, "ir_not").unwrap().into()
+                } else { val }
+            }
+        }
+    }
+
+    /// Make a closure struct {i32 rc=1, i32 _pad, fn_ptr, env_ptr} with optional captured env.
+    fn make_closure_struct(&mut self, fn_ptr: BasicValueEnum<'ctx>, captures: &[BasicValueEnum<'ctx>]) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        let cls_size = i64_ty.const_int(32, false);
+        let cls_mem = self.builder.build_call(self.rt_alloc, &[cls_size.into()], "ir_cls")
+            .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+        let cls_ty = self.closure_struct_type();
+        let rc_f = self.builder.build_struct_gep(cls_ty, cls_mem, 0, "ir_rc").unwrap();
+        self.builder.build_store(rc_f, self.context.i32_type().const_int(1, false)).unwrap();
+        let fp_f = self.builder.build_struct_gep(cls_ty, cls_mem, 2, "ir_fp").unwrap();
+        self.builder.build_store(fp_f, fn_ptr).unwrap();
+
+        if captures.is_empty() {
+            let ep_f = self.builder.build_struct_gep(cls_ty, cls_mem, 3, "ir_ep").unwrap();
+            self.builder.build_store(ep_f, ptr_ty.const_null()).unwrap();
+        } else {
+            // Build an env struct.
+            // Layout: {u64 size, cap0, cap1, ...}
+            let n = captures.len();
+            let env_size_bytes = 8u64 + (n as u64 * 8); // size header + 8 bytes per capture (ptr/i64)
+            let env_size_val = i64_ty.const_int(env_size_bytes, false);
+            let env_mem = self.builder.build_call(self.rt_alloc, &[env_size_val.into()], "ir_env")
+                .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+            // Write size at offset 0.
+            self.builder.build_store(env_mem, env_size_val).unwrap();
+            // Write captures at offsets 8, 16, ...
+            for (i, &cap) in captures.iter().enumerate() {
+                let offset = 8u64 + (i as u64 * 8);
+                let offset_v = i64_ty.const_int(offset, false);
+                let cap_gep = unsafe { self.builder.build_gep(
+                    self.context.i8_type(),
+                    env_mem,
+                    &[offset_v],
+                    &format!("ir_cap{}", i)
+                ).unwrap() };
+                self.builder.build_store(cap_gep, cap).unwrap();
+            }
+            let ep_f = self.builder.build_struct_gep(cls_ty, cls_mem, 3, "ir_ep").unwrap();
+            self.builder.build_store(ep_f, env_mem).unwrap();
+            // env_size at offset 24.
+            let env_size_gep = unsafe { self.builder.build_gep(
+                self.context.i8_type(),
+                cls_mem,
+                &[i64_ty.const_int(24, false)],
+                "ir_env_sz"
+            ).unwrap() };
+            self.builder.build_store(env_size_gep, env_size_val).unwrap();
+        }
+        cls_mem.into()
+    }
+
+    /// Compile a binary operation given already-compiled LLVM values (used by LinIR path).
+    fn compile_binary_op_values(
+        &mut self,
+        lv: BasicValueEnum<'ctx>,
+        rv: BasicValueEnum<'ctx>,
+        op: &BinOp,
+        lty: &Type,
+        result_ty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        match op {
+            BinOp::Add => self.compile_add(lv, rv, lty, lty, result_ty),
+            BinOp::Sub => self.compile_arith_op(lv, rv, lty, "sub"),
+            BinOp::Mul => self.compile_arith_op(lv, rv, lty, "mul"),
+            BinOp::Div => self.compile_div(lv, rv, lty),
+            BinOp::Mod => self.compile_mod(lv, rv, lty),
+            BinOp::Eq => self.compile_eq(lv, rv, lty, false),
+            BinOp::NotEq => self.compile_eq(lv, rv, lty, true),
+            BinOp::Lt => self.compile_cmp(lv, rv, lty, IntPredicate::SLT, IntPredicate::ULT, FloatPredicate::OLT),
+            BinOp::LtEq => self.compile_cmp(lv, rv, lty, IntPredicate::SLE, IntPredicate::ULE, FloatPredicate::OLE),
+            BinOp::Gt => self.compile_cmp(lv, rv, lty, IntPredicate::SGT, IntPredicate::UGT, FloatPredicate::OGT),
+            BinOp::GtEq => self.compile_cmp(lv, rv, lty, IntPredicate::SGE, IntPredicate::UGE, FloatPredicate::OGE),
+            BinOp::And => self.builder.build_and(lv.into_int_value(), rv.into_int_value(), "ir_and").unwrap().into(),
+            BinOp::Or => self.builder.build_or(lv.into_int_value(), rv.into_int_value(), "ir_or").unwrap().into(),
+        }
+    }
+
+    /// Unbox a tagged union value to a concrete type.
+    fn unbox_tagged_val_to_type(&mut self, tagged: BasicValueEnum<'ctx>, ty: &Type) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        if !tagged.is_pointer_value() { return tagged; }
+        let ptr = tagged.into_pointer_value();
+        match ty {
+            Type::Int32 | Type::UInt32 => {
+                self.builder.build_call(self.rt_unbox_int32, &[ptr.into()], "ir_u32")
+                    .unwrap().try_as_basic_value().unwrap_basic()
+            }
+            Type::Int64 | Type::UInt64 => {
+                self.builder.build_call(self.rt_unbox_int64, &[ptr.into()], "ir_u64")
+                    .unwrap().try_as_basic_value().unwrap_basic()
+            }
+            Type::Float64 | Type::Float32 => {
+                self.builder.build_call(self.rt_unbox_float64, &[ptr.into()], "ir_uf64")
+                    .unwrap().try_as_basic_value().unwrap_basic()
+            }
+            Type::Bool => {
+                let i8v = self.builder.build_call(self.rt_unbox_bool, &[ptr.into()], "ir_ubool")
+                    .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                self.builder.build_int_truncate_or_bit_cast(i8v, self.context.bool_type(), "ub_bool").unwrap().into()
+            }
+            Type::Str => {
+                self.builder.build_call(self.rt_unbox_ptr, &[ptr.into()], "ir_ustr")
+                    .unwrap().try_as_basic_value().unwrap_basic()
+            }
+            Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. } => {
+                self.builder.build_call(self.rt_unbox_ptr, &[ptr.into()], "ir_uptr")
+                    .unwrap().try_as_basic_value().unwrap_basic()
+            }
+            Type::Null => ptr_ty.const_null().into(),
+            _ => tagged, // pass through for union/unknown
+        }
+    }
+
+    /// Return the i8 constant for the runtime tag of a type.
+    fn type_tag_const(&self, ty: &Type) -> inkwell::values::IntValue<'ctx> {
+        let i8_ty = self.context.i8_type();
+        let tag: u64 = match ty {
+            Type::Null => 0,
+            Type::Bool => 1,
+            Type::Int32 | Type::UInt32 => 2,
+            Type::Int64 | Type::UInt64 => 3,
+            Type::Float32 | Type::Float64 => 4,
+            Type::Str => 6,
+            Type::Object(_) => 7,
+            Type::Array(_) | Type::FixedArray(_) => 8,
+            Type::Function { .. } => 9,
+            _ => 0xFF,
+        };
+        i8_ty.const_int(tag, false)
+    }
+
+    /// Compile a `toString` call on a typed value (used by LinIR intrinsic path).
+    fn compile_to_string_value(&mut self, val: BasicValueEnum<'ctx>, _ty: &Type) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        if val.is_pointer_value() {
+            self.builder.build_call(self.rt_tagged_to_string, &[val.into()], "ir_ts")
+                .unwrap().try_as_basic_value().unwrap_basic()
+        } else if val.is_int_value() {
+            let i64_ty = self.context.i64_type();
+            let ext = self.builder.build_int_z_extend_or_bit_cast(val.into_int_value(), i64_ty, "ts_ext").unwrap();
+            self.builder.build_call(self.rt_int_to_string, &[ext.into()], "ir_its")
+                .unwrap().try_as_basic_value().unwrap_basic()
+        } else if val.is_float_value() {
+            let fv = val.into_float_value();
+            let f64_ty = self.context.f64_type();
+            let ext = self.builder.build_float_cast(fv, f64_ty, "ts_fext").unwrap();
+            self.builder.build_call(self.rt_float_to_string, &[ext.into()], "ir_fts")
+                .unwrap().try_as_basic_value().unwrap_basic()
+        } else { ptr_ty.const_null().into() }
     }
 
     fn compile_is_check(

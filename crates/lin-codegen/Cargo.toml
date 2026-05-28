@@ -7,6 +7,7 @@ edition = "2021"
 lin-common = { path = "../lin-common" }
 lin-parse = { path = "../lin-parse" }
 lin-check = { path = "../lin-check" }
+lin-ir = { path = "../lin-ir" }
 inkwell = { version = "0.9", features = ["llvm22-1"] }
 md5 = "0.7"
 flate2 = "1"

@@ -829,6 +829,7 @@ dependencies = [
  "inkwell",
  "lin-check",
  "lin-common",
+ "lin-ir",
  "lin-parse",
  "md5",
 ]
@@ -850,6 +851,7 @@ dependencies = [
  "lin-check",
  "lin-codegen",
  "lin-common",
+ "lin-ir",
  "lin-lex",
  "lin-parse",
  "lin-runtime",
