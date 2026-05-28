@@ -134,31 +134,39 @@ jobs:
       - name: Publish "latest" release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT_SHA: ${{ github.sha }}
+          BUILT_AT: ${{ github.event.head_commit.timestamp }}
         run: |
-          # Delete old release and tag, then recreate.
+          cat > /tmp/release-notes.md << 'NOTES'
+          Automated build from `master`.
+
+          **Commit:** ${COMMIT_SHA}
+          **Built:** ${BUILT_AT}
+
+          ## Installation
+
+          Download the archive for your platform, extract, and place `lin` on your `$PATH`.
+
+          > **Note:** The Linux binary requires `clang` (or any C linker) to link compiled programs.
+          > No LLVM installation needed — LLVM is bundled inside `lin`.
+
+          ## VS Code Extension
+
+          Download the `.vsix` for your platform and install with:
+          ```bash
+          code --install-extension lin-lang-<platform>.vsix
+          ```
+
+          Or install directly from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=linusnorton.lin-lang).
+          NOTES
+
+          # Substitute env vars into the notes file
+          sed -i "s|\${COMMIT_SHA}|${COMMIT_SHA}|g; s|\${BUILT_AT}|${BUILT_AT}|g" /tmp/release-notes.md
+
           gh release delete latest --repo ${{ github.repository }} --yes || true
           sleep 3
           gh release create latest dist/* \
             --repo ${{ github.repository }} \
             --title "Latest build" \
             --prerelease \
-            --notes "Automated build from \`master\`.
-
-**Commit:** ${{ github.sha }}
-**Built:** ${{ github.event.head_commit.timestamp }}
-
-## Installation
-
-Download the archive for your platform, extract, and place \`lin\` on your \`\$PATH\`.
-
-> **Note:** The Linux binary requires \`clang\` (or any C linker) to link compiled programs.
-> No LLVM installation needed — LLVM is bundled inside \`lin\`.
-
-## VS Code Extension
-
-Download the \`.vsix\` for your platform and install with:
-\`\`\`bash
-code --install-extension lin-lang-<platform>.vsix
-\`\`\`
-
-Or install directly from the [VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=linusnorton.lin-lang)."
+            --notes-file /tmp/release-notes.md
