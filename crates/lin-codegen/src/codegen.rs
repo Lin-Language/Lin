@@ -896,6 +896,17 @@ impl<'ctx> Codegen<'ctx> {
         )
     }
 
+    /// Returns the slot number if the expression's "final value" comes directly from a LocalGet.
+    /// Used to identify when a function param is being returned (to skip releasing it at exit).
+    /// Recurses into Block to find the final expression.
+    fn body_return_slot(expr: &TypedExpr) -> Option<usize> {
+        match expr {
+            TypedExpr::LocalGet { slot, .. } => Some(*slot),
+            TypedExpr::Block { expr, .. } => Self::body_return_slot(expr),
+            _ => None,
+        }
+    }
+
     /// True if a type is heap-allocated (has a refcount) and needs a release call.
     fn ty_is_heap(ty: &Type) -> bool {
         matches!(ty, Type::Str | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. })
@@ -1415,11 +1426,45 @@ impl<'ctx> Codegen<'ctx> {
             });
         }
 
+        // Collect Function-typed params that need to be released at function return.
+        // A fresh lambda (owned alloc) arrives with rc=1; we release it here so the caller
+        // doesn't leak it. A non-owned closure was retained at the call site (rc incremented),
+        // so releasing here restores the original rc.
+        let fn_params_to_release: Vec<(usize, Type)> = params.iter()
+            .filter(|p| matches!(p.ty, Type::Function { .. }))
+            .map(|p| (p.slot, p.ty.clone()))
+            .collect();
+        // Find which slot (if any) is directly returned by the body — that param must not be
+        // released here because the return value ownership transfers to the caller.
+        let body_return_slot = Self::body_return_slot(body);
+
         let result = self.compile_expr(body, &mut fn_ctx);
+
+        // Emit releases for Function-typed params (except the one being returned).
+        // Helper closure to load param value from current slot storage.
+        let emit_fn_param_releases = |codegen: &mut Self, fn_ctx: &FnCtx<'ctx, '_>| {
+            let ptr_ty = codegen.context.ptr_type(AddressSpace::default());
+            for (slot, ty) in &fn_params_to_release {
+                if Some(*slot) == body_return_slot { continue; }
+                let val_opt: Option<BasicValueEnum<'ctx>> = match fn_ctx.slots.get(slot) {
+                    Some(SlotStorage::Value(v)) => Some(*v),
+                    Some(SlotStorage::Closure(p)) => Some((*p).into()),
+                    Some(SlotStorage::Alloca(alloca)) => {
+                        Some(codegen.builder.build_load(ptr_ty, *alloca, "fn_param_rel")
+                            .unwrap())
+                    }
+                    _ => None,
+                };
+                if let Some(v) = val_opt {
+                    codegen.emit_release(v, ty);
+                }
+            }
+        };
 
         match ret_type {
             Type::Never => {
                 // Void-returning function: discard body result and return void.
+                emit_fn_param_releases(self, &fn_ctx);
                 self.builder.build_return(None).unwrap();
             }
             _ => {
@@ -1444,6 +1489,7 @@ impl<'ctx> Codegen<'ctx> {
                 } else {
                     result
                 };
+                emit_fn_param_releases(self, &fn_ctx);
                 self.builder.build_return(Some(&final_result)).unwrap();
             }
         }
@@ -2603,6 +2649,22 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
         let lin_param_types = Self::fn_param_types(func);
+        // Pre-compute which Function-typed args are "owned" (fresh alloc, no retain needed).
+        // An arg is owned if it is a fresh alloc expression OR if it is a named global function
+        // that will be wrapped in a new closure struct by wrap_named_fn_as_closure.
+        let arg_is_fn_owned: Vec<bool> = args.iter().enumerate().map(|(i, a)| {
+            let param_ty = lin_param_types.get(i).cloned().unwrap_or_else(|| a.ty());
+            if !matches!(param_ty, Type::Function { .. }) {
+                return true; // Not a Function param — retain not needed here.
+            }
+            // Function literal → fresh closure alloc.
+            if Self::expr_is_owned_alloc(a) { return true; }
+            // Named global function → wrap_named_fn_as_closure creates a fresh alloc.
+            if let TypedExpr::LocalGet { slot, .. } = a {
+                if self.global_fn_slots.contains_key(slot) { return true; }
+            }
+            false // Non-owned local closure slot — needs retain.
+        }).collect();
         let compiled_args: Vec<BasicMetadataValueEnum> = args
             .iter()
             .enumerate()
@@ -2713,6 +2775,16 @@ impl<'ctx> Codegen<'ctx> {
                 }
             })
             .collect();
+        // Retain non-owned Function-typed args so the callee can safely release them at return.
+        // Without this, the callee's release would decrement rc to 0 on a value the caller
+        // still holds (use-after-free on subsequent calls with the same closure).
+        for (i, is_owned) in arg_is_fn_owned.iter().enumerate() {
+            if !is_owned {
+                if let Some(BasicMetadataValueEnum::PointerValue(ptr)) = compiled_args.get(i) {
+                    self.builder.build_call(self.rt_rc_retain, &[(*ptr).into()], "").unwrap();
+                }
+            }
+        }
         self.builder.build_call(llvm_fn, &compiled_args, "call")
             .unwrap()
             .try_as_basic_value()
