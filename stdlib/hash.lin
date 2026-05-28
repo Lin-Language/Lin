@@ -1,0 +1,2 @@
+export val hash = (val: Json): String =>
+  lin_value_key(val)
