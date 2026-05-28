@@ -72,3 +72,6 @@ jobs:
             echo "==> $f"
             cargo run -p lin --quiet -- run "$f" || exit 1
           done
+
+      - name: Run stdlib tests
+        run: cargo run -p lin --quiet -- test stdlib/
