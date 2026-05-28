@@ -18,9 +18,11 @@ jobs:
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             artifact: lin-linux-x86_64
+            vsix_platform: linux-x64
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: lin-macos-arm64
+            vsix_platform: darwin-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -60,26 +62,65 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-release-
 
-      - name: Build release binary
-        run: cargo build --release -p lin --target ${{ matrix.target }}
+      - name: Build release binaries
+        run: |
+          cargo build --release -p lin --target ${{ matrix.target }}
+          cargo build --release -p lin-lsp --target ${{ matrix.target }}
 
-      - name: Strip binary
-        run: strip target/${{ matrix.target }}/release/lin
+      - name: Strip binaries
+        run: |
+          strip target/${{ matrix.target }}/release/lin
+          strip target/${{ matrix.target }}/release/lin-lsp
 
-      - name: Package
+      - name: Package compiler tarball
         run: |
           mkdir dist
           cp target/${{ matrix.target }}/release/lin dist/lin
-          cd dist && tar -czf ../${{ matrix.artifact }}.tar.gz lin
+          cp target/${{ matrix.target }}/release/lin-lsp dist/lin-lsp
+          cd dist && tar -czf ../${{ matrix.artifact }}.tar.gz lin lin-lsp
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.tar.gz
 
+  vsix:
+    name: Package VSIX
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist/
+
+      - name: Place binaries into extension
+        run: |
+          mkdir -p editors/vscode/bin/linux-x64
+          tar -xzf dist/lin-linux-x86_64.tar.gz -C editors/vscode/bin/linux-x64
+          mkdir -p editors/vscode/bin/darwin-arm64
+          tar -xzf dist/lin-macos-arm64.tar.gz -C editors/vscode/bin/darwin-arm64
+          chmod +x editors/vscode/bin/linux-x64/lin \
+                   editors/vscode/bin/linux-x64/lin-lsp \
+                   editors/vscode/bin/darwin-arm64/lin \
+                   editors/vscode/bin/darwin-arm64/lin-lsp
+
+      - name: Package VSIX
+        working-directory: editors/vscode
+        run: |
+          npm install
+          npx @vscode/vsce package --no-dependencies -o ../../lin-lang.vsix
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lin-lang-vsix
+          path: lin-lang.vsix
+
   release:
     name: Publish "latest" pre-release
-    needs: build
+    needs: [build, vsix]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -112,4 +153,13 @@ jobs:
 
             > **Note:** The Linux binary requires `clang` (or any C linker) to link compiled programs.
             > No LLVM installation needed — LLVM is bundled inside `lin`.
-          files: dist/*.tar.gz
+
+            ## VS Code Extension
+
+            Download `lin-lang.vsix` and install with:
+            ```bash
+            code --install-extension lin-lang.vsix
+            ```
+          files: |
+            dist/*.tar.gz
+            dist/lin-lang.vsix

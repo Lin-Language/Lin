@@ -1,0 +1,290 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Lin",
+  "scopeName": "source.lin",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#import-statement" },
+    { "include": "#export-keyword" },
+    { "include": "#type-declaration" },
+    { "include": "#binding" },
+    { "include": "#keywords" },
+    { "include": "#string" },
+    { "include": "#number" },
+    { "include": "#builtin-types" },
+    { "include": "#builtin-functions" },
+    { "include": "#operator" },
+    { "include": "#punctuation" },
+    { "include": "#identifier" }
+  ],
+  "repository": {
+
+    "comment": {
+      "name": "comment.line.double-slash.lin",
+      "match": "//.*$"
+    },
+
+    "import-statement": {
+      "comment": "import { foo, bar as baz } from \"path\"",
+      "begin": "\\b(import)\\b",
+      "end": "(?=\")|$",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.import.lin" }
+      },
+      "patterns": [
+        { "include": "#comment" },
+        {
+          "match": "\\b(from)\\b",
+          "captures": { "1": { "name": "keyword.control.from.lin" } }
+        },
+        {
+          "match": "\\b(as)\\b",
+          "captures": { "1": { "name": "keyword.control.as.lin" } }
+        },
+        {
+          "match": "\\b([A-Z][a-zA-Z0-9_]*)\\b",
+          "captures": { "1": { "name": "entity.name.type.lin" } }
+        },
+        {
+          "match": "\\b([a-z_][a-zA-Z0-9_]*)\\b",
+          "captures": { "1": { "name": "variable.other.lin" } }
+        },
+        { "include": "#string" },
+        { "include": "#punctuation" }
+      ]
+    },
+
+    "export-keyword": {
+      "match": "^\\s*(export)\\b",
+      "captures": {
+        "1": { "name": "keyword.other.export.lin" }
+      }
+    },
+
+    "type-declaration": {
+      "comment": "type Foo = ...",
+      "begin": "^\\s*(type)\\s+([A-Z][a-zA-Z0-9_]*)",
+      "end": "$",
+      "beginCaptures": {
+        "1": { "name": "keyword.other.type.lin" },
+        "2": { "name": "entity.name.type.declaration.lin" }
+      },
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#generic-params" },
+        { "include": "#builtin-types" },
+        { "include": "#string" },
+        {
+          "match": "\\b([A-Z][a-zA-Z0-9_]*)\\b",
+          "captures": { "1": { "name": "entity.name.type.lin" } }
+        },
+        { "include": "#operator" },
+        { "include": "#punctuation" }
+      ]
+    },
+
+    "binding": {
+      "comment": "val name = ... or var name = ...",
+      "match": "\\b(val|var)\\s+([a-z_][a-zA-Z0-9_]*|\\{[^=]*\\}|\\[[^=]*\\])",
+      "captures": {
+        "1": { "name": "keyword.other.binding.lin" },
+        "2": { "name": "variable.other.binding.lin" }
+      }
+    },
+
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.lin",
+          "match": "\\b(if|then|else|match|when)\\b"
+        },
+        {
+          "name": "keyword.control.lin",
+          "match": "\\b(is|has)\\b"
+        },
+        {
+          "name": "constant.language.lin",
+          "match": "\\b(true|false|null)\\b"
+        }
+      ]
+    },
+
+    "builtin-types": {
+      "comment": "Built-in and standard types",
+      "match": "\\b(String|Boolean|Null|Number|Json|Error|Function|Int8|Int16|Int32|Int64|UInt8|UInt16|UInt32|UInt64|Float8|Float16|Float32|Float64|Iterator|Iterable)\\b",
+      "name": "support.type.builtin.lin"
+    },
+
+    "builtin-functions": {
+      "comment": "Known stdlib and intrinsic functions",
+      "match": "\\b(print|length|toString|trim|toUpper|toLower|substring|indexOf|parseInt32|parseInt64|parseFloat64|toInt32|toFloat64|isInt32|range|map|filter|reduce|iter|iterOf|for|push|pop|charAt|repeat)\\b",
+      "name": "support.function.builtin.lin"
+    },
+
+    "string": {
+      "patterns": [
+        { "include": "#string-interpolated" },
+        { "include": "#string-plain" }
+      ]
+    },
+
+    "string-plain": {
+      "name": "string.quoted.double.lin",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        { "include": "#string-escape" }
+      ]
+    },
+
+    "string-interpolated": {
+      "comment": "String with ${...} interpolation",
+      "name": "string.quoted.double.interpolated.lin",
+      "begin": "\"(?=[^\"]*\\$\\{)",
+      "end": "\"",
+      "patterns": [
+        { "include": "#string-escape" },
+        { "include": "#interpolation" }
+      ]
+    },
+
+    "string-escape": {
+      "name": "constant.character.escape.lin",
+      "match": "\\\\(?:[nrt0\"\\\\$]|u\\{[0-9a-fA-F]{1,6}\\})"
+    },
+
+    "interpolation": {
+      "name": "meta.embedded.expression.lin",
+      "begin": "\\$\\{",
+      "end": "\\}",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.template-expression.begin.lin" }
+      },
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.template-expression.end.lin" }
+      },
+      "patterns": [
+        { "include": "#comment" },
+        { "include": "#string" },
+        { "include": "#number" },
+        { "include": "#keywords" },
+        { "include": "#builtin-types" },
+        { "include": "#builtin-functions" },
+        { "include": "#operator" },
+        { "include": "#punctuation" },
+        { "include": "#identifier" }
+      ]
+    },
+
+    "number": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.lin",
+          "match": "-?0[xX][0-9a-fA-F][0-9a-fA-F_]*(?:[iu](?:8|16|32|64))?"
+        },
+        {
+          "name": "constant.numeric.binary.lin",
+          "match": "-?0[bB][01][01_]*(?:[iu](?:8|16|32|64))?"
+        },
+        {
+          "name": "constant.numeric.octal.lin",
+          "match": "-?0[oO][0-7][0-7_]*(?:[iu](?:8|16|32|64))?"
+        },
+        {
+          "name": "constant.numeric.float.lin",
+          "match": "-?[0-9][0-9_]*(?:\\.[0-9][0-9_]*)?[eE][+-]?[0-9][0-9_]*(?:f(?:8|16|32|64))?"
+        },
+        {
+          "name": "constant.numeric.float.lin",
+          "match": "-?[0-9][0-9_]*\\.[0-9][0-9_]*(?:f(?:8|16|32|64))?"
+        },
+        {
+          "name": "constant.numeric.integer.lin",
+          "match": "-?[0-9][0-9_]*(?:[iu](?:8|16|32|64))?"
+        }
+      ]
+    },
+
+    "generic-params": {
+      "comment": "Type parameters like <T, U>",
+      "begin": "<",
+      "end": ">",
+      "name": "meta.generic.lin",
+      "patterns": [
+        {
+          "match": "\\b([A-Z][a-zA-Z0-9_]*)\\b",
+          "captures": { "1": { "name": "entity.name.type.parameter.lin" } }
+        },
+        {
+          "match": "\\b([a-z][a-zA-Z0-9_]*)\\b",
+          "captures": { "1": { "name": "entity.name.type.parameter.lin" } }
+        },
+        { "include": "#punctuation" }
+      ]
+    },
+
+    "operator": {
+      "patterns": [
+        {
+          "name": "keyword.operator.arrow.lin",
+          "match": "=>"
+        },
+        {
+          "name": "keyword.operator.comparison.lin",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.logical.lin",
+          "match": "&&|\\|\\|"
+        },
+        {
+          "name": "keyword.operator.arithmetic.lin",
+          "match": "[+\\-*/%]"
+        },
+        {
+          "name": "keyword.operator.assignment.lin",
+          "match": "(?<![=!<>])=(?![=>])"
+        },
+        {
+          "name": "keyword.operator.spread.lin",
+          "match": "\\.\\.\\."
+        },
+        {
+          "name": "keyword.operator.pipe.lin",
+          "match": "(?<![|])\\|(?![|])"
+        }
+      ]
+    },
+
+    "punctuation": {
+      "patterns": [
+        { "name": "punctuation.separator.comma.lin",     "match": "," },
+        { "name": "punctuation.separator.colon.lin",     "match": ":" },
+        { "name": "punctuation.accessor.dot.lin",        "match": "\\." },
+        { "name": "punctuation.bracket.round.lin",       "match": "[()]" },
+        { "name": "punctuation.bracket.square.lin",      "match": "[\\[\\]]" },
+        { "name": "punctuation.bracket.curly.lin",       "match": "[{}]" }
+      ]
+    },
+
+    "identifier": {
+      "patterns": [
+        {
+          "comment": "Type-like identifiers starting with uppercase",
+          "match": "\\b([A-Z][a-zA-Z0-9_]*)\\b",
+          "captures": { "1": { "name": "entity.name.type.lin" } }
+        },
+        {
+          "comment": "Function call: foo(",
+          "match": "\\b([a-z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+          "captures": { "1": { "name": "entity.name.function.lin" } }
+        },
+        {
+          "comment": "Plain identifier",
+          "match": "\\b([a-z_][a-zA-Z0-9_]*)\\b",
+          "captures": { "1": { "name": "variable.other.lin" } }
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "name": "lin-lang",
+  "displayName": "Lin Language",
+  "description": "Syntax highlighting, diagnostics, and type-aware completion for the Lin programming language",
+  "version": "0.3.0",
+  "publisher": "linusnorton",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/linusnorton/lin-lang"
+  },
+  "keywords": ["lin", "programming language", "compiler"],
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:lin"
+  ],
+  "main": "./client.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "lin",
+        "aliases": ["Lin", "lin"],
+        "extensions": [".lin"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "lin",
+        "scopeName": "source.lin",
+        "path": "./syntaxes/lin.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "lin.build",
+        "title": "Lin: Build",
+        "category": "Lin"
+      },
+      {
+        "command": "lin.run",
+        "title": "Lin: Run",
+        "category": "Lin"
+      },
+      {
+        "command": "lin.test",
+        "title": "Lin: Test",
+        "category": "Lin"
+      }
+    ]
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}

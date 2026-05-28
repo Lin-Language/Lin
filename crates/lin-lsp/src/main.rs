@@ -147,75 +147,78 @@ impl LanguageServer for Backend {
         let analysis = analyse(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
 
-        // Work out the partial word the cursor is inside.
         let prefix = word_before(&source, offset);
+
+        // Detect whether cursor is in a dot-completion context and resolve
+        // the receiver's type category (e.g. "array", "string", "object").
+        let receiver_category = dot_receiver_category(&source, offset, &analysis.span_type_map);
+        let in_dot_context = receiver_category.is_some();
 
         let mut items: Vec<CompletionItem> = Vec::new();
 
-        // 1. Bindings visible at the cursor (from span_type_map def_spans).
-        for (_, ty_str, def_span) in &analysis.span_type_map {
-            if let Some(ds) = def_span {
-                // Extract the identifier text from the source at the def_span.
-                let name = &source[ds.start as usize..ds.end as usize];
-                if !name.is_empty() && name.starts_with(|c: char| c.is_alphabetic() || c == '_') {
-                    if name.starts_with(prefix) {
-                        let kind = if ty_str.contains("=>") {
-                            CompletionItemKind::FUNCTION
-                        } else {
-                            CompletionItemKind::VARIABLE
-                        };
-                        items.push(CompletionItem {
-                            label: name.to_string(),
-                            kind: Some(kind),
-                            detail: Some(ty_str.clone()),
-                            ..Default::default()
-                        });
+        // In dot context only show applicable stdlib functions — no keywords/types/bindings.
+        if !in_dot_context {
+            // 1. Bindings visible at the cursor (from span_type_map def_spans).
+            for (_, ty_str, def_span) in &analysis.span_type_map {
+                if let Some(ds) = def_span {
+                    let name = &source[ds.start as usize..ds.end as usize];
+                    if !name.is_empty() && name.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+                        if name.starts_with(prefix) {
+                            let kind = if ty_str.contains("=>") {
+                                CompletionItemKind::FUNCTION
+                            } else {
+                                CompletionItemKind::VARIABLE
+                            };
+                            items.push(CompletionItem {
+                                label: name.to_string(),
+                                kind: Some(kind),
+                                detail: Some(ty_str.clone()),
+                                ..Default::default()
+                            });
+                        }
                     }
                 }
             }
-        }
-        items.dedup_by(|a, b| a.label == b.label);
+            items.dedup_by(|a, b| a.label == b.label);
 
-        // 2. Keywords.
-        let keywords = [
-            "val", "var", "type", "export", "import", "from", "as",
-            "if", "then", "else", "match", "is", "has", "when",
-            "true", "false", "null",
-        ];
-        for kw in keywords {
-            if kw.starts_with(prefix) {
-                items.push(CompletionItem {
-                    label: kw.to_string(),
-                    kind: Some(CompletionItemKind::KEYWORD),
-                    ..Default::default()
-                });
+            // 2. Keywords.
+            let keywords = [
+                "val", "var", "type", "export", "import", "from", "as",
+                "if", "then", "else", "match", "is", "has", "when",
+                "true", "false", "null",
+            ];
+            for kw in keywords {
+                if kw.starts_with(prefix) {
+                    items.push(CompletionItem {
+                        label: kw.to_string(),
+                        kind: Some(CompletionItemKind::KEYWORD),
+                        ..Default::default()
+                    });
+                }
+            }
+
+            // 3. Built-in types.
+            let builtin_types = [
+                "String", "Boolean", "Null", "Number", "Json", "Error",
+                "Int8", "Int16", "Int32", "Int64",
+                "UInt8", "UInt16", "UInt32", "UInt64",
+                "Float32", "Float64",
+                "Iterator", "Iterable", "Function",
+            ];
+            for ty in builtin_types {
+                if ty.starts_with(prefix) {
+                    items.push(CompletionItem {
+                        label: ty.to_string(),
+                        kind: Some(CompletionItemKind::CLASS),
+                        ..Default::default()
+                    });
+                }
             }
         }
 
-        // 3. Built-in types.
-        let builtin_types = [
-            "String", "Boolean", "Null", "Number", "Json", "Error",
-            "Int8", "Int16", "Int32", "Int64",
-            "UInt8", "UInt16", "UInt32", "UInt64",
-            "Float32", "Float64",
-            "Iterator", "Iterable", "Function",
-        ];
-        for ty in builtin_types {
-            if ty.starts_with(prefix) {
-                items.push(CompletionItem {
-                    label: ty.to_string(),
-                    kind: Some(CompletionItemKind::CLASS),
-                    ..Default::default()
-                });
-            }
-        }
-
-        // 4. Stdlib exports — useful when typing import paths.
-        let stdlib_exports = stdlib_completion_items();
-        for item in stdlib_exports {
-            if item.label.starts_with(prefix) {
-                items.push(item);
-            }
+        // 4. Stdlib exports — with auto-import edits and optional dot-filtering.
+        for item in stdlib_completion_items(&source, prefix, receiver_category.as_deref()) {
+            items.push(item);
         }
 
         Ok(Some(CompletionResponse::Array(items)))
@@ -255,7 +258,6 @@ fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
         .map(|d| lsp_diagnostic(source, d))
         .collect();
 
-    // Pre-resolve imports so hover and type errors are accurate for imported names.
     let mut imported: HashMap<String, TypedModule> = HashMap::new();
     let effective_base = base_dir
         .map(|p| p.to_path_buf())
@@ -291,10 +293,20 @@ fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
 
 fn stdlib_source(path: &str) -> Option<&'static str> {
     match path {
-        "std/io"     => Some(include_str!("../../../stdlib/io.lin")),
-        "std/string" => Some(include_str!("../../../stdlib/string.lin")),
-        "std/number" => Some(include_str!("../../../stdlib/number.lin")),
-        "std/array"  => Some(include_str!("../../../stdlib/array.lin")),
+        "std/io"       => Some(include_str!("../../../stdlib/io.lin")),
+        "std/string"   => Some(include_str!("../../../stdlib/string.lin")),
+        "std/number"   => Some(include_str!("../../../stdlib/number.lin")),
+        "std/array"    => Some(include_str!("../../../stdlib/array.lin")),
+        "std/object"   => Some(include_str!("../../../stdlib/object.lin")),
+        "std/fs"       => Some(include_str!("../../../stdlib/fs.lin")),
+        "std/http"     => Some(include_str!("../../../stdlib/http.lin")),
+        "std/template" => Some(include_str!("../../../stdlib/template.lin")),
+        "std/async"    => Some(include_str!("../../../stdlib/async.lin")),
+        "std/test"     => Some(include_str!("../../../stdlib/test.lin")),
+        "std/time"     => Some(include_str!("../../../stdlib/time.lin")),
+        "std/path"     => Some(include_str!("../../../stdlib/path.lin")),
+        "std/math"     => Some(include_str!("../../../stdlib/math.lin")),
+        "std/env"      => Some(include_str!("../../../stdlib/env.lin")),
         _ => None,
     }
 }
@@ -332,7 +344,6 @@ fn pre_resolve_imports(
                 }
             };
 
-            // Recurse depth-first so transitive deps are ready.
             pre_resolve_imports(&ast_mod, &child_base, cache);
 
             let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
@@ -362,53 +373,223 @@ fn extract_exports(module: &TypedModule) -> Vec<(String, Type)> {
         .collect()
 }
 
+// ── dot-completion helpers ────────────────────────────────────────────────────
+
+/// Returns the receiver type category if the cursor is in a dot-completion context,
+/// or `None` if we're not immediately after a `.`.
+fn dot_receiver_category(
+    source: &str,
+    offset: usize,
+    span_type_map: &[(lin_common::Span, String, Option<lin_common::Span>)],
+) -> Option<String> {
+    let prefix_len = word_before(source, offset).len();
+    let dot_offset = offset.checked_sub(prefix_len + 1)?;
+
+    let src_bytes = source.as_bytes();
+    if src_bytes.get(dot_offset) != Some(&b'.') {
+        return None;
+    }
+
+    // Find the type of the expression to the left of the dot.
+    let receiver_offset = dot_offset.checked_sub(1)?;
+    let ty_str = tightest_span(span_type_map, receiver_offset)
+        .map(|(_, s, _)| s.as_str())
+        .unwrap_or("");
+
+    Some(type_to_category(ty_str).to_string())
+}
+
+/// Maps a Lin type string to a broad category used for dot-completion filtering.
+fn type_to_category(ty: &str) -> &'static str {
+    if ty.contains("[]") || ty.to_lowercase().contains("array") || ty.starts_with('[') {
+        "array"
+    } else if ty == "String" {
+        "string"
+    } else if ty == "Int32" || ty == "Float64" || ty == "Int64" || ty == "Float32"
+        || ty == "Int8" || ty == "Int16" || ty == "UInt8" || ty == "UInt16"
+        || ty == "UInt32" || ty == "UInt64"
+    {
+        "number"
+    } else if ty.starts_with('{') || ty == "Object" {
+        "object"
+    } else {
+        "any"
+    }
+}
+
+// ── auto-import helpers ───────────────────────────────────────────────────────
+
+/// Returns true if `name` is already imported from `module` in `source`.
+fn already_imported(source: &str, name: &str, module: &str) -> bool {
+    let from_pattern = format!("from \"{}\"", module);
+    for line in source.lines() {
+        if !line.contains(&from_pattern) {
+            continue;
+        }
+        if let (Some(open), Some(close)) = (line.find('{'), line.rfind('}')) {
+            for n in line[open + 1..close].split(',') {
+                if n.trim() == name {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Builds `additionalTextEdits` to ensure `name` is imported from `module`.
+/// Returns `None` if the import is already present (no edit needed).
+fn make_import_edit(source: &str, name: &str, module: &str) -> Option<Vec<TextEdit>> {
+    if already_imported(source, name, module) {
+        return None;
+    }
+
+    let from_pattern = format!("from \"{}\"", module);
+
+    // Module already imported but this specific name is missing — insert into existing braces.
+    for (line_idx, line) in source.lines().enumerate() {
+        if line.contains(&from_pattern) {
+            if let Some(brace_pos) = line.rfind('}') {
+                let insert_pos = Position {
+                    line: line_idx as u32,
+                    character: brace_pos as u32,
+                };
+                return Some(vec![TextEdit {
+                    range: Range { start: insert_pos, end: insert_pos },
+                    new_text: format!(", {}", name),
+                }]);
+            }
+        }
+    }
+
+    // Module not imported at all — prepend a new import line at the top.
+    Some(vec![TextEdit {
+        range: Range {
+            start: Position { line: 0, character: 0 },
+            end: Position { line: 0, character: 0 },
+        },
+        new_text: format!("import {{ {} }} from \"{}\"\n", name, module),
+    }])
+}
+
 // ── completion helpers ────────────────────────────────────────────────────────
 
-fn stdlib_completion_items() -> Vec<CompletionItem> {
-    let entries: &[(&str, &str, &str)] = &[
-        // (label, detail, module)
-        ("trim",        "(String) => String",  "std/string"),
-        ("toUpper",     "(String) => String",  "std/string"),
-        ("toLower",     "(String) => String",  "std/string"),
-        ("substring",   "(String, Int32, Int32) => String", "std/string"),
-        ("indexOf",     "(String, String) => Int32",        "std/string"),
-        ("contains",    "(String, String) => Boolean",      "std/string"),
-        ("startsWith",  "(String, String) => Boolean",      "std/string"),
-        ("endsWith",    "(String, String) => Boolean",      "std/string"),
-        ("split",       "(String, String) => String[]",     "std/string"),
-        ("join",        "(String[], String) => String",     "std/string"),
-        ("replace",     "(String, String, String) => String", "std/string"),
-        ("charAt",      "(String, Int32) => String",        "std/string"),
-        ("repeat",      "(String, Int32) => String",        "std/string"),
-        ("parseInt32",  "(String) => Int32",   "std/number"),
-        ("parseFloat64","(String) => Float64", "std/number"),
-        ("toInt32",     "(Float64) => Int32",  "std/number"),
-        ("toFloat64",   "(Int32) => Float64",  "std/number"),
-        ("isInt32",     "(String) => Boolean", "std/number"),
-        ("map",    "(Iterable<T>, (T) => U) => Iterator<U>",         "std/array"),
-        ("filter", "(Iterable<T>, (T) => Boolean) => Iterator<T>",   "std/array"),
-        ("reduce", "(Iterable<T>, U, (U, T) => U) => U",             "std/array"),
-        ("find",   "(Iterable<T>, (T) => Boolean) => T | Null",      "std/array"),
-        ("some",   "(Iterable<T>, (T) => Boolean) => Boolean",       "std/array"),
-        ("every",  "(Iterable<T>, (T) => Boolean) => Boolean",       "std/array"),
-        ("flatMap","(Iterable<T>, (T) => Iterable<U>) => Iterator<U>","std/array"),
-        ("reverse","(T[]) => T[]",                                   "std/array"),
-        ("range",  "(Int32, Int32) => Iterator<Int32>", "std/array"),
-        ("iterOf", "(T[]) => Iterator<T>",              "std/array"),
-        ("iter",   "(Json, Json, Json, Json) => Iterator<Json>", "std/array"),
-        ("print",  "(T) => Null",                       "std/io"),
+/// Returns stdlib completion items filtered by `prefix` and optionally by `receiver_category`.
+/// Each item carries `additionalTextEdits` to auto-insert its import if absent.
+///
+/// `receiver_category` is `Some("array"|"string"|"number"|"object"|"any")` when in dot context.
+/// When `None` (not in dot context), all items are returned (filtered only by prefix).
+fn stdlib_completion_items(
+    source: &str,
+    prefix: &str,
+    receiver_category: Option<&str>,
+) -> Vec<CompletionItem> {
+    // (label, detail, module, category)
+    // category: "array" | "string" | "number" | "object" | "any"
+    let entries: &[(&str, &str, &str, &str)] = &[
+        // std/string — category "string"
+        ("trim",          "(String) => String",                       "std/string", "string"),
+        ("trimStart",     "(String) => String",                       "std/string", "string"),
+        ("trimEnd",       "(String) => String",                       "std/string", "string"),
+        ("toUpper",       "(String) => String",                       "std/string", "string"),
+        ("toLower",       "(String) => String",                       "std/string", "string"),
+        ("substring",     "(String, Int32, Int32) => String",         "std/string", "string"),
+        ("indexOf",       "(String, String) => Int32",                "std/string", "string"),
+        ("lastIndexOf",   "(String, String) => Int32",                "std/string", "string"),
+        ("isBlank",       "(String) => Boolean",                      "std/string", "string"),
+        ("contains",      "(String, String) => Boolean",              "std/string", "string"),
+        ("startsWith",    "(String, String) => Boolean",              "std/string", "string"),
+        ("endsWith",      "(String, String) => Boolean",              "std/string", "string"),
+        ("split",         "(String, String) => String[]",             "std/string", "string"),
+        ("replace",       "(String, String, String) => String",       "std/string", "string"),
+        ("replaceAll",    "(String, String, String) => String",       "std/string", "string"),
+        ("charAt",        "(String, Int32) => String",                "std/string", "string"),
+        ("at",            "(String, Int32) => String",                "std/string", "string"),
+        ("repeat",        "(String, Int32) => String",                "std/string", "string"),
+        ("padStart",      "(String, Int32, String) => String",        "std/string", "string"),
+        ("padEnd",        "(String, Int32, String) => String",        "std/string", "string"),
+        ("lines",         "(String) => String[]",                     "std/string", "string"),
+        ("charCode",      "(String, Int32) => Int32",                 "std/string", "string"),
+        ("toString",      "(Json) => String",                         "std/string", "any"),
+        // std/number — category "number"
+        ("parseInt32",    "(String) => Int32",                        "std/number", "number"),
+        ("parseFloat64",  "(String) => Float64",                      "std/number", "number"),
+        ("toInt32",       "(Float64) => Int32",                       "std/number", "number"),
+        ("toFloat64",     "(Int32) => Float64",                       "std/number", "number"),
+        ("isInt32",       "(String) => Boolean",                      "std/number", "number"),
+        // std/array — category "array"
+        ("map",           "(Json, (Json) => Json) => Json",           "std/array",  "array"),
+        ("filter",        "(Json, (Json) => Boolean) => Json",        "std/array",  "array"),
+        ("reduce",        "(Json, Json, (Json, Json) => Json) => Json","std/array", "array"),
+        ("find",          "(Json, (Json) => Boolean) => Json",        "std/array",  "array"),
+        ("some",          "(Json, (Json) => Boolean) => Boolean",     "std/array",  "array"),
+        ("every",         "(Json, (Json) => Boolean) => Boolean",     "std/array",  "array"),
+        ("flatMap",       "(Json, (Json) => Json) => Json",           "std/array",  "array"),
+        ("reverse",       "(Json) => Json",                           "std/array",  "array"),
+        ("indexOf",       "(Json, Json) => Int32",                    "std/array",  "array"),
+        ("length",        "(Json) => Int32",                          "std/array",  "array"),
+        ("push",          "(Json, Json) => Null",                     "std/array",  "array"),
+        ("concat",        "(Json, Json) => Json",                     "std/array",  "array"),
+        ("take",          "(Json, Int32) => Json",                    "std/array",  "array"),
+        ("drop",          "(Json, Int32) => Json",                    "std/array",  "array"),
+        ("takeWhile",     "(Json, (Json) => Boolean) => Json",        "std/array",  "array"),
+        ("dropWhile",     "(Json, (Json) => Boolean) => Json",        "std/array",  "array"),
+        ("flatten",       "(Json) => Json",                           "std/array",  "array"),
+        ("chunk",         "(Json, Int32) => Json",                    "std/array",  "array"),
+        ("partition",     "(Json, (Json) => Boolean) => Json",        "std/array",  "array"),
+        ("zip",           "(Json, Json) => Json",                     "std/array",  "array"),
+        ("unique",        "(Json) => Json",                           "std/array",  "array"),
+        ("compact",       "(Json) => Json",                           "std/array",  "array"),
+        ("at",            "(Json, Int32) => Json",                    "std/array",  "array"),
+        ("set",           "(Json, Int32, Json) => Null",              "std/array",  "array"),
+        ("join",          "(String[], String) => String",             "std/array",  "array"),
+        ("range",         "(Int32, Int32) => Json",                   "std/array",  "array"),
+        ("for",           "(Json, (Json) => Null) => Null",           "std/array",  "array"),
+        // std/object — category "object"
+        ("keys",          "(Json) => String[]",                       "std/object", "object"),
+        ("values",        "(Json) => Json",                           "std/object", "object"),
+        ("entries",       "(Json) => Json",                           "std/object", "object"),
+        ("fromEntries",   "(Json) => Json",                           "std/object", "object"),
+        ("merge",         "(Json, Json) => Json",                     "std/object", "object"),
+        ("pick",          "(Json, String[]) => Json",                 "std/object", "object"),
+        ("omit",          "(Json, String[]) => Json",                 "std/object", "object"),
+        ("mapValues",     "(Json, (Json) => Json) => Json",           "std/object", "object"),
+        ("isEmpty",       "(Json) => Boolean",                        "std/object", "object"),
+        // std/io — category "any"
+        ("print",         "(Json) => Null",                           "std/io",     "any"),
+        ("readLine",      "() => String",                             "std/io",     "any"),
+        ("readAll",       "() => String",                             "std/io",     "any"),
     ];
 
     entries
         .iter()
-        .map(|(label, detail, module)| CompletionItem {
-            label: label.to_string(),
-            kind: Some(CompletionItemKind::FUNCTION),
-            detail: Some(detail.to_string()),
-            documentation: Some(Documentation::String(
-                format!("from {}", module),
-            )),
-            ..Default::default()
+        .filter(|(label, _, _, category)| {
+            // Prefix filter.
+            if !label.starts_with(prefix) {
+                return false;
+            }
+            // In dot context, filter by receiver type compatibility.
+            if let Some(cat) = receiver_category {
+                // "any" items (like `print`) are not useful in dot context.
+                if *category == "any" {
+                    return false;
+                }
+                *category == cat
+            } else {
+                true
+            }
+        })
+        .map(|(label, detail, module, _)| {
+            let edits = make_import_edit(source, label, module)
+                .map(|e| e);
+            CompletionItem {
+                label: label.to_string(),
+                kind: Some(CompletionItemKind::FUNCTION),
+                detail: Some(detail.to_string()),
+                documentation: Some(Documentation::String(format!("from {}", module))),
+                additional_text_edits: edits,
+                ..Default::default()
+            }
         })
         .collect()
 }
