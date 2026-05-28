@@ -3,15 +3,21 @@
   "build": {
     "dockerfile": "Dockerfile"
   },
-  "workspaceMount": "source=/home/linus/Work/linusnorton/lin-lang,target=/home/linus/Work/linusnorton/lin-lang,type=bind",
-  "workspaceFolder": "/home/linus/Work/linusnorton/lin-lang",
+  "workspaceMount": "source=${localWorkspaceFolder},target=${localWorkspaceFolder},type=bind,consistency=cached",
+  "workspaceFolder": "${localWorkspaceFolder}",
   "mounts": [
-    "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind"
+    "source=/var/run/docker.sock,target=/var/run/docker-host.sock,type=bind",
+    "source=${localEnv:HOME}/.claude,target=/home/hmcts/.claude,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.claude.json,target=/home/hmcts/.claude.json,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.zsh_history,target=/home/hmcts/.zsh_history,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.bash_history,target=/home/hmcts/.bash_history,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.config/gh,target=/home/vscode/.config/gh,type=bind"
   ],
   "runArgs": ["--memory=32g", "--memory-swap=32g", "--oom-kill-disable=false"],
   "features": {
     "ghcr.io/devcontainers/features/git:1": {},
-    "ghcr.io/devcontainers/features/node:1": {}
+    "ghcr.io/devcontainers/features/node:1": {},
+    "ghcr.io/devcontainers/features/github-cli:1": {}
   },
   "customizations": {
     "vscode": {
@@ -22,6 +28,19 @@
         "serayuzgur.crates"
       ],
       "settings": {
+        "files.autoSave": "onFocusChange",
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "files.watcherExclude": {
+          "**/node_modules/**": true,
+          "**/dist/**": true,
+          "**/build/**": true,
+          "**/.yarn/**": true,
+          "**/.turbo/**": true,
+          "**/.gradle/**": true,
+          "**/coverage/**": true,
+          "**/.git/objects/**": true,
+          "**/.git/subtree-cache/**": true
+        },
         "rust-analyzer.check.command": "clippy"
       }
     }
