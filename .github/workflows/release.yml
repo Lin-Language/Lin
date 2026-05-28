@@ -87,6 +87,7 @@ jobs:
           mkdir -p editors/vscode/bin/${{ matrix.vsix_platform }}
           cp target/${{ matrix.target }}/release/lin     editors/vscode/bin/${{ matrix.vsix_platform }}/lin
           cp target/${{ matrix.target }}/release/lin-lsp editors/vscode/bin/${{ matrix.vsix_platform }}/lin-lsp
+          cp logo.png editors/vscode/icon.png
           cd editors/vscode
           npm install
           # Stamp patch version from commit count so marketplace never sees a duplicate.
@@ -99,7 +100,6 @@ jobs:
           "
           npx @vscode/vsce package \
             --target ${{ matrix.vsix_platform }} \
-            --no-dependencies \
             -o ../../lin-lang-${{ matrix.vsix_platform }}.vsix
 
       - name: Publish to VS Code Marketplace
