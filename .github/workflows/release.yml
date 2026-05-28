@@ -160,6 +160,4 @@ jobs:
             ```bash
             code --install-extension lin-lang.vsix
             ```
-          files: |
-            dist/*.tar.gz
-            dist/lin-lang.vsix
+          files: dist/*
