@@ -1,19 +1,17 @@
+import foreign "lin-runtime"
+  val lin_object_values: ({}) => Json[]
+  val lin_object_entries: ({}) => Json[]
+
 import { for, push, length, some } from "std/array"
 
 export val keys = (obj: Json): String[] =>
   lin_keys(obj)
 
 export val values = (obj: Json): Json =>
-  val ks = lin_keys(obj)
-  val result = []
-  lin_for(ks, k => lin_push(result, obj[k]))
-  result
+  lin_object_values(obj)
 
 export val entries = (obj: Json): Json =>
-  val ks = lin_keys(obj)
-  val result = []
-  lin_for(ks, k => lin_push(result, [k, obj[k]]))
-  result
+  lin_object_entries(obj)
 
 export val fromEntries = (pairs: Json): Json =>
   var result = {}
