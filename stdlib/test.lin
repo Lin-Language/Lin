@@ -12,17 +12,17 @@ val _fail = (message: String): Json =>
 val _evalResult = (name: String, results: Json): Json =>
   val isArray = results["type"] != "pass" && results["type"] != "fail"
   val assertions = if isArray then results else [results]
-  val failures = filter(assertions, a => a["type"] == "fail")
+  val failures = assertions.filter(a => a["type"] == "fail")
   if length(failures) == 0 then { "type": "pass", "name": name }
   else { "type": "fail", "name": name, "failures": failures }
 
 val _printFail = (r: Json): Null =>
   print("  FAIL  ${r["name"]}")
-  for(r["failures"], f => print("    ${f["message"]}"))
+  r["failures"].for(f => print("    ${f["message"]}"))
 
 val _printSuiteResults = (suiteResult: Json): Null =>
   print(suiteResult["name"])
-  for(suiteResult["results"], r =>
+  suiteResult["results"].for(r =>
     if r["type"] == "pass" then print("  ok  ${r["name"]}")
     else _printFail(r)
   )
@@ -73,7 +73,7 @@ export val suite = (name: String, tests: Json[]): Json =>
   { "name": name, "tests": tests }
 
 export val run = (s: Json): Null =>
-  val failed = filter(s["tests"], r => r["type"] == "fail")
+  val failed = s["tests"].filter(r => r["type"] == "fail")
   val passCount = length(s["tests"]) - length(failed)
   val failCount = length(failed)
   _printSuiteResults({ "name": s["name"], "results": s["tests"] })
