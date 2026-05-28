@@ -2099,3 +2099,60 @@ fn test_ffi_end_to_end_c_library() {
     assert!(stdout.contains("3 + 4 = 7"), "Expected '3 + 4 = 7', got: {}", stdout);
     assert!(stdout.contains("2.5^2 = 6.25"), "Expected '2.5^2 = 6.25', got: {}", stdout);
 }
+
+// ── Formatter idempotency ─────────────────────────────────────────────────────
+
+/// Lex, parse, and format a Lin source string. Panics on parse errors.
+fn fmt(source: &str) -> String {
+    let tokens = lin_lex::Lexer::new(source, 0).tokenize();
+    let mut parser = lin_parse::Parser::new(tokens);
+    let module = parser.parse_module();
+    assert!(
+        parser.diagnostics.is_empty(),
+        "parse errors: {:?}\nsource:\n{}",
+        parser.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+        source
+    );
+    lin_parse::Formatter::new().format_module(&module)
+}
+
+#[test]
+fn test_fmt_idempotent() {
+    // Source with varied constructs: if/match/function/objects/arrays/imports/types.
+    let source = r#"import { print } from "std/io"
+import { map, filter, reduce, for } from "std/array"
+import { toString } from "std/string"
+
+type Point = { "x": Int32, "y": Int32 }
+
+val add = (a: Int32, b: Int32): Int32 => a + b
+
+val describe = (n: Int32): String =>
+  match n
+    has Int32 when n > 0 => "positive"
+    has Int32 when n < 0 => "negative"
+    else => "zero"
+
+val items = [1, 2, 3, 4, 5]
+
+val doubled = items.map(x => x * 2)
+
+val obj = { "name": "Alice", "age": 30 }
+
+if true then
+  print("hello")
+else
+  print("world")
+
+val result = items.filter(x => x > 2).map(x => x * 10).reduce(0, (a, b) => a + b)
+"#;
+
+    let formatted_once = fmt(source);
+    let formatted_twice = fmt(&formatted_once);
+
+    assert_eq!(
+        formatted_once, formatted_twice,
+        "formatter is not idempotent!\nFirst pass:\n{}\nSecond pass:\n{}",
+        formatted_once, formatted_twice
+    );
+}

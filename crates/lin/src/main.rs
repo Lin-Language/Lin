@@ -23,9 +23,8 @@ enum Commands {
     Watch(cmd::watch::WatchArgs),
     /// Remove .lin-cache directories and build artefacts
     Clean(cmd::clean::CleanArgs),
-    /// Format source files (not yet implemented)
-    #[command(hide = true)]
-    Fmt,
+    /// Format .lin source files
+    Fmt(cmd::fmt::FmtArgs),
 }
 
 fn main() {
@@ -37,9 +36,6 @@ fn main() {
         Commands::Test(args) => cmd::test::run(&args),
         Commands::Watch(args) => cmd::watch::run(&args),
         Commands::Clean(args) => cmd::clean::run(&args),
-        Commands::Fmt => {
-            eprintln!("lin fmt: not yet implemented");
-            std::process::exit(1);
-        }
+        Commands::Fmt(args) => cmd::fmt::run(&args),
     }
 }

@@ -43,6 +43,7 @@ impl LanguageServer for Backend {
                     resolve_provider: Some(false),
                     ..Default::default()
                 }),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -228,6 +229,42 @@ impl LanguageServer for Backend {
         }
 
         Ok(Some(CompletionResponse::Array(items)))
+    }
+
+    async fn formatting(
+        &self,
+        params: DocumentFormattingParams,
+    ) -> Result<Option<Vec<TextEdit>>> {
+        let source = match self
+            .docs
+            .read()
+            .unwrap()
+            .get(&params.text_document.uri)
+            .cloned()
+        {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let tokens = lin_lex::Lexer::new(&source, 0).tokenize();
+        let mut parser = lin_parse::Parser::new(tokens);
+        let module = parser.parse_module();
+
+        if !parser.diagnostics.is_empty() {
+            // Don't format files with parse errors.
+            return Ok(None);
+        }
+
+        let formatted = lin_parse::Formatter::new().format_module(&module);
+        let end_pos = offset_to_position(&source, source.len());
+
+        Ok(Some(vec![TextEdit {
+            range: Range {
+                start: Position { line: 0, character: 0 },
+                end: end_pos,
+            },
+            new_text: formatted,
+        }]))
     }
 }
 

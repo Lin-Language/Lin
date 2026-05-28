@@ -323,3 +323,11 @@ Implementation:
 **Rationale**: Side-effect-only patterns like `if cond then push(arr, item)` are idiomatic and common in the stdlib. Requiring `else null` is pure noise in these cases — the intent is clear and the result is always discarded. The `else null` pattern also appeared in predicate-style code (`if found == null && f(item) then found = item else null`) where the explicit null was a placeholder with no meaning. Synthesizing `NullLit` at parse time means the AST shape is unchanged — no `Option<Box<Expr>>` needed in `Expr::If` or anywhere downstream.
 
 **Consequence**: The result type widens to `T | Null` when `else` is absent. Code that uses the result of an `else`-less `if` without handling the `Null` case will pass type-checking silently (the union just grows). This is an acceptable tradeoff: the common case (result discarded) gets cleaner syntax, and the footgun (accidentally using a `T | Null` result as `T`) is the same class of error already present whenever any function returns `Null`.
+
+## ADR-040: Formatter does not preserve comments
+
+**Decision**: The `lin fmt` formatter (`lin-parse/src/formatter.rs`) does not preserve source comments. Comments are stripped by the lexer and are not represented anywhere in the AST. When a file is formatted, all comments are lost.
+
+**Rationale**: Adding comment-preservation would require either (a) threading comment tokens through the AST — significant structural change with no benefit to the compiler — or (b) a separate comment-reattachment pass that heuristically associates comments with nearby AST nodes based on source positions. Both approaches are complex and fragile. The formatter's primary use case (CI canonicality checks, auto-formatting on save) does not require comment preservation. Users who care about comments should commit before formatting.
+
+**Consequence**: Running `lin fmt` on a file that has comments will silently drop them. This is documented behaviour. Future work: a comment-preserving pass that uses `Span` information to reattach comments to the nearest following AST node.
