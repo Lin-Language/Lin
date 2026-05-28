@@ -83,7 +83,7 @@ jobs:
 
       - name: Package platform-specific VSIX
         run: |
-          PATCH=$(git rev-list --count HEAD)
+          export PATCH=$(git rev-list --count HEAD)
           mkdir -p editors/vscode/bin/${{ matrix.vsix_platform }}
           cp target/${{ matrix.target }}/release/lin     editors/vscode/bin/${{ matrix.vsix_platform }}/lin
           cp target/${{ matrix.target }}/release/lin-lsp editors/vscode/bin/${{ matrix.vsix_platform }}/lin-lsp
@@ -93,10 +93,10 @@ jobs:
           node -e "
             const fs = require('fs');
             const p = JSON.parse(fs.readFileSync('package.json'));
-            const [maj, min] = p.version.split('.');
-            p.version = \`\${maj}.\${min}.\${process.env.PATCH}\`;
+            const parts = p.version.split('.');
+            p.version = parts[0] + '.' + parts[1] + '.' + process.env.PATCH;
             fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
-          " PATCH=$PATCH
+          "
           npx @vscode/vsce package \
             --target ${{ matrix.vsix_platform }} \
             --no-dependencies \
