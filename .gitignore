@@ -3,3 +3,5 @@
 /build
 .lin-cache/
 .claude/worktrees/
+examples/lib/*.a
+examples/lib/*.o

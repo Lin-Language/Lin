@@ -2067,22 +2067,22 @@ fn test_ffi_end_to_end_c_library() {
         return;
     }
 
-    if !mathlib_a.exists() {
-        let obj = ws.join("examples/lib/mathlib.o");
-        let cc_status = Command::new("cc")
-            .args(["-c", mathlib_c.to_str().unwrap(), "-o", obj.to_str().unwrap()])
-            .status();
-        if cc_status.map(|s| !s.success()).unwrap_or(true) {
-            eprintln!("SKIP: failed to compile C library");
-            return;
-        }
-        let ar_status = Command::new("ar")
-            .args(["rcs", mathlib_a.to_str().unwrap(), obj.to_str().unwrap()])
-            .status();
-        if ar_status.map(|s| !s.success()).unwrap_or(true) {
-            eprintln!("SKIP: failed to create static archive");
-            return;
-        }
+    // Always rebuild the static library for the current platform — a pre-built .a from
+    // a different arch (e.g. Linux x86_64 checked in, running on macOS ARM64) will fail to link.
+    let obj = ws.join("examples/lib/mathlib.o");
+    let cc_status = Command::new("cc")
+        .args(["-c", mathlib_c.to_str().unwrap(), "-o", obj.to_str().unwrap()])
+        .status();
+    if cc_status.map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP: failed to compile C library");
+        return;
+    }
+    let ar_status = Command::new("ar")
+        .args(["rcs", mathlib_a.to_str().unwrap(), obj.to_str().unwrap()])
+        .status();
+    if ar_status.map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP: failed to create static archive");
+        return;
     }
 
     let compile_out = Command::new(&lin_bin)
