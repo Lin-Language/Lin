@@ -17,7 +17,10 @@
     "Programming Languages"
   ],
   "activationEvents": [
-    "onLanguage:lin"
+    "onLanguage:lin",
+    "onCommand:lin.build",
+    "onCommand:lin.run",
+    "onCommand:lin.test"
   ],
   "main": "./client.js",
   "contributes": {
@@ -39,17 +42,17 @@
     "commands": [
       {
         "command": "lin.build",
-        "title": "Lin: Build",
+        "title": "Build",
         "category": "Lin"
       },
       {
         "command": "lin.run",
-        "title": "Lin: Run",
+        "title": "Run",
         "category": "Lin"
       },
       {
         "command": "lin.test",
-        "title": "Lin: Test",
+        "title": "Test",
         "category": "Lin"
       }
     ]
