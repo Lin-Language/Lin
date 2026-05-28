@@ -111,6 +111,12 @@ pub enum Expr {
         value: Box<Expr>,
         span: Span,
     },
+    IndexAssign {
+        object: Box<Expr>,
+        key: Box<Expr>,
+        value: Box<Expr>,
+        span: Span,
+    },
     Is {
         expr: Box<Expr>,
         pattern: Box<Pattern>,
@@ -145,6 +151,7 @@ impl Expr {
             Expr::Object(_, s) => *s,
             Expr::Array(_, s) => *s,
             Expr::Assign { span, .. } => *span,
+            Expr::IndexAssign { span, .. } => *span,
             Expr::Is { span, .. } => *span,
             Expr::Has { span, .. } => *span,
             Expr::TupleArgs(_, s) => *s,

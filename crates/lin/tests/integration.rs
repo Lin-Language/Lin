@@ -1499,6 +1499,40 @@ print(merged["a"])
 }
 
 #[test]
+fn test_object_shorthand_construction() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val name = "Linus"
+val age = 42
+val json2 = { name }
+val json3 = { "title": "Engineer", name, "age": age }
+print(json2["name"])
+print(toString(json3["title"]))
+print(json3["name"])
+print(toString(json3["age"]))
+"#);
+    assert_eq!(output, vec!["Linus", "Engineer", "Linus", "42"]);
+}
+
+#[test]
+fn test_index_assign() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val hasBeenSeen = { "Linus": false }
+val name = "Linus"
+hasBeenSeen[name] = true
+print(toString(hasBeenSeen[name]))
+
+val arr = [1, 2, 3]
+arr[1] = 99
+print(toString(arr[1]))
+"#);
+    assert_eq!(output, vec!["true", "99"]);
+}
+
+#[test]
 fn test_async_await_basic() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"

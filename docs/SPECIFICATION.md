@@ -251,11 +251,11 @@ See §26 for coercion and inference rules.
 
 ### 4.3 Strict JSON Object Literals
 
-Object literals use strict JSON syntax.
+Object literals use strict JSON syntax, with one shorthand extension.
 
 Rules:
 
-1. Keys must be quoted strings.
+1. Keys must be quoted strings, **or** bare identifiers used as shorthand (see below).
 2. Commas are required between fields.
 3. Trailing commas are not allowed.
 4. Runtime object values must be JSON-compatible.
@@ -271,6 +271,17 @@ val person = {
 
 val older = { ...person, "age": 43 }
 ```
+
+**Shorthand field syntax.** When a field's key and local variable name are identical, a bare identifier may be used:
+
+```txt
+val name = "Bob"
+val age = 42
+val obj = { name }                         // { "name": "Bob" }
+val obj2 = { name, "active": true, age }   // { "name": "Bob", "active": true, "age": 42 }
+```
+
+A bare identifier in an object literal is syntactic sugar for `"ident": ident`. Shorthand fields, explicit key-value pairs, and spread expressions may appear in any order. A bare identifier followed by `:` (e.g. `{ name: "Bob" }`) is a compile-time error — use a quoted key.
 
 ### 4.4 Arrays
 

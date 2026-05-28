@@ -1635,6 +1635,10 @@ impl<'ctx> Codegen<'ctx> {
 
             TypedExpr::Is { expr, pattern, .. } => self.compile_is_check(expr, pattern, fn_ctx),
             TypedExpr::Has { expr, pattern, .. } => self.compile_has_check(expr, pattern, fn_ctx),
+
+            TypedExpr::IndexSet { object, key, value, obj_ty, .. } => {
+                self.compile_index_set(object, key, value, obj_ty, fn_ctx)
+            }
         }
     }
 
@@ -5110,6 +5114,81 @@ impl<'ctx> Codegen<'ctx> {
             BasicValueEnum::PointerValue(_) => Type::TypeVar(0), // still unknown
             _ => Type::TypeVar(0),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Index assignment (obj[key] = val, arr[i] = val)
+    // -------------------------------------------------------------------------
+
+    fn compile_index_set(
+        &mut self,
+        object: &TypedExpr,
+        key: &TypedExpr,
+        value: &TypedExpr,
+        obj_ty: &Type,
+        fn_ctx: &mut FnCtx<'ctx, '_>,
+    ) -> BasicValueEnum<'ctx> {
+        let obj_val = self.compile_expr(object, fn_ctx);
+        let key_val = self.compile_expr(key, fn_ctx);
+        let val_val = self.compile_expr(value, fn_ctx);
+        let val_ty = value.ty();
+        let null_ptr = self.context.ptr_type(AddressSpace::default()).const_null();
+
+        match obj_ty {
+            Type::Object(_) | Type::Named(_) => {
+                let obj_ptr = if obj_val.is_pointer_value() { obj_val.into_pointer_value() } else { return null_ptr.into(); };
+                let key_ptr = if key_val.is_pointer_value() { key_val.into_pointer_value() } else { return null_ptr.into(); };
+                let tagged = self.build_tagged_val_alloca(&val_val, &val_ty);
+                self.builder.build_call(self.rt_object_set, &[obj_ptr.into(), key_ptr.into(), tagged.into()], "").unwrap();
+            }
+            Type::Array(_) | Type::FixedArray(_) => {
+                let arr_ptr = obj_val;
+                let idx = if key_val.is_int_value() {
+                    self.builder.build_int_s_extend_or_bit_cast(key_val.into_int_value(), self.context.i64_type(), "idx").unwrap()
+                } else { self.context.i64_type().const_int(0, false) };
+                let tagged = self.build_tagged_val_alloca(&val_val, &val_ty);
+                let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                let set_fn = self.get_or_declare_fn("lin_array_set",
+                    self.context.void_type().fn_type(&[ptr_ty.into(), self.context.i64_type().into(), ptr_ty.into()], false));
+                self.builder.build_call(set_fn, &[arr_ptr.into(), idx.into(), tagged.into()], "").unwrap();
+            }
+            Type::TypeVar(_) | Type::Union(_) => {
+                // Dynamic dispatch: check if it's an object (string key) or array (int key).
+                if key_val.is_pointer_value() {
+                    // String key → object set
+                    let tagged_ptr = if obj_val.is_pointer_value() { obj_val.into_pointer_value() } else { return null_ptr.into(); };
+                    let key_ptr = key_val.into_pointer_value();
+                    let tag = self.builder.build_call(self.rt_get_tag, &[tagged_ptr.into()], "tv_tag")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                    let is_obj = self.builder.build_int_compare(IntPredicate::EQ, tag,
+                        self.context.i8_type().const_int(7, false), "is_obj").unwrap();
+                    let llvm_fn = fn_ctx.llvm_fn;
+                    let obj_block = self.context.append_basic_block(llvm_fn, "iset_obj");
+                    let skip_block = self.context.append_basic_block(llvm_fn, "iset_skip");
+                    self.builder.build_conditional_branch(is_obj, obj_block, skip_block).unwrap();
+                    self.builder.position_at_end(obj_block);
+                    let obj_ptr = self.builder.build_call(self.rt_unbox_ptr, &[tagged_ptr.into()], "obj_ptr")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+                    let tagged = self.build_tagged_val_alloca(&val_val, &val_ty);
+                    self.builder.build_call(self.rt_object_set, &[obj_ptr.into(), key_ptr.into(), tagged.into()], "").unwrap();
+                    self.builder.build_unconditional_branch(skip_block).unwrap();
+                    self.builder.position_at_end(skip_block);
+                } else if key_val.is_int_value() {
+                    // Int key → array set
+                    let tagged_ptr = if obj_val.is_pointer_value() { obj_val.into_pointer_value() } else { return null_ptr.into(); };
+                    let arr_ptr = self.builder.build_call(self.rt_unbox_ptr, &[tagged_ptr.into()], "arr_ptr")
+                        .unwrap().try_as_basic_value().unwrap_basic();
+                    let idx = self.builder.build_int_s_extend_or_bit_cast(key_val.into_int_value(), self.context.i64_type(), "idx").unwrap();
+                    let tagged = self.build_tagged_val_alloca(&val_val, &val_ty);
+                    let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                    let set_fn = self.get_or_declare_fn("lin_array_set",
+                        self.context.void_type().fn_type(&[ptr_ty.into(), self.context.i64_type().into(), ptr_ty.into()], false));
+                    self.builder.build_call(set_fn, &[arr_ptr.into(), idx.into(), tagged.into()], "").unwrap();
+                }
+            }
+            _ => {}
+        }
+        null_ptr.into()
     }
 
     // -------------------------------------------------------------------------

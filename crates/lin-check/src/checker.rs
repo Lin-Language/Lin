@@ -431,6 +431,7 @@ impl Checker {
             Expr::Object(fields, span)                => self.infer_object(fields, *span),
             Expr::Array(elements, span)               => self.infer_array(elements, *span),
             Expr::Assign { target, value, span }      => self.infer_assign(target, value, *span),
+            Expr::IndexAssign { object, key, value, span } => self.infer_index_assign(object, key, value, *span),
             Expr::StringInterp(parts, span)           => self.infer_string_interp(parts, *span),
             Expr::Is { expr, pattern, span } => {
                 let typed_expr = self.infer_expr(expr)?;
@@ -717,6 +718,46 @@ impl Checker {
         self.span_type_map.push((span, expected_ty.to_string(), def_span));
         self.env.clear_narrowing(target);
         Ok(TypedExpr::LocalSet { slot, value: Box::new(typed_value), ty: expected_ty, span })
+    }
+
+    fn infer_index_assign(&mut self, object: &Expr, key: &Expr, value: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
+        let typed_obj = self.infer_expr(object)?;
+        let typed_key = self.infer_expr(key)?;
+        let obj_ty = typed_obj.ty();
+        let typed_value = match &obj_ty {
+            Type::Object(fields) => {
+                if let TypedExpr::StringLit(ref key_str, _) = typed_key {
+                    if let Some(field_ty) = fields.get(key_str) {
+                        self.check_expr(value, field_ty)?
+                    } else {
+                        self.infer_expr(value)?
+                    }
+                } else {
+                    self.infer_expr(value)?
+                }
+            }
+            Type::Array(elem) => self.check_expr(value, elem)?,
+            Type::FixedArray(elems) => {
+                if let TypedExpr::IntLit(idx, _, _) = typed_key {
+                    if let Some(elem_ty) = elems.get(idx as usize) {
+                        self.check_expr(value, elem_ty)?
+                    } else {
+                        self.infer_expr(value)?
+                    }
+                } else {
+                    self.infer_expr(value)?
+                }
+            }
+            Type::TypeVar(_) | Type::Union(_) | Type::Null => self.infer_expr(value)?,
+            _ => return Err(Diagnostic::error(span, format!("Cannot assign into type {}", obj_ty))),
+        };
+        Ok(TypedExpr::IndexSet {
+            object: Box::new(typed_obj),
+            key: Box::new(typed_key),
+            value: Box::new(typed_value),
+            obj_ty,
+            span,
+        })
     }
 
     fn infer_string_interp(&mut self, parts: &[StringPart], span: Span) -> Result<TypedExpr, Diagnostic> {

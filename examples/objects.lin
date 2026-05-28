@@ -37,3 +37,26 @@ print(myName)
 val { name, age } = person
 print(name)
 print(toString(age))
+
+// Shorthand construction: { ident } is sugar for { "ident": ident }
+val job = "Engineer"
+val card = { name, age, job }
+print(card["name"])
+print(card["job"])
+
+// Mix shorthand, explicit, and spread
+val extra = { "active": true }
+val full = { ...extra, name, "score": 99 }
+print(full["name"])
+print(toString(full["score"]))
+
+// Index assignment: mutate objects and arrays in place
+val settings = { "debug": false, "level": 1 }
+settings["debug"] = true
+settings["level"] = 5
+print(toString(settings["debug"]))
+print(toString(settings["level"]))
+
+val scores = [10, 20, 30]
+scores[1] = 99
+print(toString(scores[1]))

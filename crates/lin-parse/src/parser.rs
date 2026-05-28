@@ -417,6 +417,13 @@ impl Parser {
                     self.advance(); // [
                     let key = self.parse_expr();
                     self.expect(TokenKind::RBracket);
+                    if self.check(TokenKind::Eq) && !self.check_ahead(TokenKind::Eq, 1) {
+                        self.advance(); // =
+                        self.skip_newlines();
+                        let value = self.parse_expr_or_block();
+                        expr = Expr::IndexAssign { object: Box::new(expr), key: Box::new(key), value: Box::new(value), span };
+                        break;
+                    }
                     expr = Expr::Index { object: Box::new(expr), key: Box::new(key), span };
                 }
                 TokenKind::LParen if !after_block => {
@@ -614,19 +621,31 @@ impl Parser {
                 self.advance();
                 let expr = self.parse_expr();
                 fields.push(ObjectField::Spread(expr));
-            } else {
-                // Detect unquoted identifier keys: { name: ... } instead of { "name": ... }
-                if let TokenKind::Ident(ref ident_name) = self.peek_kind() {
+            } else if let TokenKind::Ident(ref ident_name) = self.peek_kind() {
+                if self.check_ahead(TokenKind::Colon, 1) {
+                    // Unquoted key with colon: { name: ... } — error, must use quoted key.
                     let key_span = self.current_span();
                     let name = ident_name.clone();
-                    // Check if the next token after the ident is a colon — that's an unquoted key.
-                    if self.check_ahead(TokenKind::Colon, 1) {
-                        self.diagnostics.push(
-                            Diagnostic::error(key_span, format!("object keys must be quoted strings"))
-                                .with_help(format!("use a quoted key: \"{}\"", name))
-                        );
-                    }
+                    self.diagnostics.push(
+                        Diagnostic::error(key_span, format!("object keys must be quoted strings"))
+                            .with_help(format!("use a quoted key: \"{}\"", name))
+                    );
+                    let key = self.parse_expr();
+                    self.expect(TokenKind::Colon);
+                    self.skip_newlines();
+                    let value = self.parse_expr();
+                    fields.push(ObjectField::Pair(key, value));
+                } else {
+                    // Shorthand field: { name } → { "name": name }
+                    let field_span = self.current_span();
+                    let name = ident_name.clone();
+                    self.advance();
+                    fields.push(ObjectField::Pair(
+                        Expr::StringLit(name.clone(), field_span),
+                        Expr::Ident(name, field_span),
+                    ));
                 }
+            } else {
                 let key = self.parse_expr();
                 self.expect(TokenKind::Colon);
                 self.skip_newlines();

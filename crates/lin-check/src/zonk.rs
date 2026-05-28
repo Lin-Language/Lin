@@ -155,6 +155,12 @@ fn zonk_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
             zonk_expr(object, subs);
             *result_type = zonk_type(result_type, subs);
         }
+        TypedExpr::IndexSet { object, key, value, obj_ty, .. } => {
+            zonk_expr(object, subs);
+            zonk_expr(key, subs);
+            zonk_expr(value, subs);
+            *obj_ty = zonk_type(obj_ty, subs);
+        }
         TypedExpr::StringInterp { parts, .. } => {
             for p in parts {
                 if let TypedStringPart::Expr(e) = p { zonk_expr(e, subs); }

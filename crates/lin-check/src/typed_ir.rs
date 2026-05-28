@@ -167,6 +167,13 @@ pub enum TypedExpr {
         result_type: Type,
         span: Span,
     },
+    IndexSet {
+        object: Box<TypedExpr>,
+        key: Box<TypedExpr>,
+        value: Box<TypedExpr>,
+        obj_ty: Type,
+        span: Span,
+    },
     StringInterp {
         parts: Vec<TypedStringPart>,
         span: Span,
@@ -209,6 +216,7 @@ impl TypedExpr {
             TypedExpr::MakeArray { ty, .. } => ty.clone(),
             TypedExpr::Index { result_type, .. } => result_type.clone(),
             TypedExpr::FieldGet { result_type, .. } => result_type.clone(),
+            TypedExpr::IndexSet { .. } => Type::Null,
             TypedExpr::StringInterp { .. } => Type::Str,
             TypedExpr::Is { .. } => Type::Bool,
             TypedExpr::Has { .. } => Type::Bool,
@@ -238,6 +246,7 @@ impl TypedExpr {
             TypedExpr::StringInterp { span, .. } => *span,
             TypedExpr::Is { span, .. } => *span,
             TypedExpr::Has { span, .. } => *span,
+            TypedExpr::IndexSet { span, .. } => *span,
         }
     }
 }
