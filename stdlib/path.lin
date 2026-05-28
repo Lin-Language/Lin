@@ -1,3 +1,5 @@
+import { for, range } from "std/array"
+
 import foreign "lin-runtime"
   val lin_path_basename: (String) => String
   val lin_path_dirname: (String) => String
@@ -35,7 +37,7 @@ export val join = (parts: String[]): String =>
   if n == 0 then ""
   else
     var result = parts[0]
-    lin_for(lin_range(1, n), i =>
+    range(1, n).for(i =>
       result = lin_path_join2(result, parts[i])
     )
     normalize(result)

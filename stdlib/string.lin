@@ -1,3 +1,5 @@
+import { for } from "std/array"
+
 import foreign "lin-runtime"
   val lin_string_trim: (String) => String
   val lin_string_trim_start: (String) => String
@@ -99,7 +101,7 @@ export val codePointAt = (s: String, index: Int32): Int32 =>
 
 export val fromCodePoints = (codes: Int32[]): String =>
   val chars = []
-  lin_for(codes, code => lin_push(chars, lin_string_from_char_code(code)))
+  codes.for(code => lin_push(chars, lin_string_from_char_code(code)))
   lin_string_join_arr(chars, "")
 
 export val padStart = (s: String, width: Int32, pad: String): String =>
