@@ -112,6 +112,7 @@ jobs:
             --target ${{ matrix.vsix_platform }} \
             --no-dependencies \
             --packagePath ../../lin-lang-${{ matrix.vsix_platform }}.vsix
+        continue-on-error: true
 
       - uses: actions/upload-artifact@v4
         with:
