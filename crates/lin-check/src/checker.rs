@@ -533,6 +533,37 @@ impl Checker {
             }
             Type::Null => Type::Null,
             Type::TypeVar(_) => self.env.fresh_type_var(),
+            Type::Union(variants) => {
+                // Peel Null out, compute result type for the non-null variants, then add Null back.
+                let non_null: Vec<Type> = variants.iter().filter(|t| **t != Type::Null).cloned().collect();
+                if non_null.is_empty() {
+                    Type::Null
+                } else {
+                    let inner = if non_null.len() == 1 {
+                        match &non_null[0] {
+                            Type::Object(fields) => {
+                                if let TypedExpr::StringLit(ref key_str, _) = typed_key {
+                                    fields.get(key_str).cloned().unwrap_or(Type::Null)
+                                } else {
+                                    Type::Union(fields.values().cloned().collect())
+                                }
+                            }
+                            Type::Array(elem) => *elem.clone(),
+                            Type::FixedArray(elems) => {
+                                if let TypedExpr::IntLit(idx, _, _) = typed_key {
+                                    elems.get(idx as usize).cloned().unwrap_or(Type::Null)
+                                } else {
+                                    unify_types(elems)
+                                }
+                            }
+                            _ => self.env.fresh_type_var(),
+                        }
+                    } else {
+                        self.env.fresh_type_var()
+                    };
+                    Type::flatten_union(vec![inner, Type::Null])
+                }
+            }
             _ => return Err(Diagnostic::error(span, format!("Cannot index into type {}", obj_ty))),
         };
         Ok(TypedExpr::Index { object: Box::new(typed_obj), key: Box::new(typed_key), result_type, span })

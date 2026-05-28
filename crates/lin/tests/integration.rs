@@ -702,6 +702,22 @@ print(toString(obj["missing"]["deep"]["chain"]))
 }
 
 #[test]
+fn test_speculative_reads_typed_union() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type MyType = { "level1": { "level2": String } | Null }
+
+val obj1: MyType = { "level1": { "level2": "str" } }
+val obj2: MyType = { }
+
+print(obj1["level1"]["level2"])
+print(toString(obj2["level1"]["level2"]))
+"#);
+    assert_eq!(output, vec!["str", "null"]);
+}
+
+#[test]
 fn test_comments() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"

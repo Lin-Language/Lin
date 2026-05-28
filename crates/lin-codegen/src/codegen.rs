@@ -5324,10 +5324,28 @@ impl<'ctx> Codegen<'ctx> {
                     .build_call(self.rt_object_get, &[obj_ptr.into(), key_ptr.into()], "oindex_p")
                     .unwrap()
                     .try_as_basic_value().unwrap_basic().into_pointer_value();
-                if matches!(result_type, Type::TypeVar(_)) {
+                // For TypeVar/Union result, entry_ptr IS a TaggedVal* — return it directly.
+                // lin_object_get returns null ptr on missing key, which represents Null.
+                if matches!(result_type, Type::TypeVar(_) | Type::Union(_)) {
                     return entry_ptr.into();
                 }
-                self.load_tagged_val_payload(entry_ptr, result_type, &obj_ty)
+                // For concrete types, guard against null before loading payload.
+                let is_null = self.builder.build_is_null(entry_ptr, "entry_is_null").unwrap();
+                let llvm_fn = fn_ctx.llvm_fn;
+                let load_block = self.context.append_basic_block(llvm_fn, "obj_load");
+                let null_block = self.context.append_basic_block(llvm_fn, "obj_enull");
+                let merge_block = self.context.append_basic_block(llvm_fn, "obj_emrg");
+                self.builder.build_conditional_branch(is_null, null_block, load_block).unwrap();
+                self.builder.position_at_end(load_block);
+                let loaded = self.load_tagged_val_payload(entry_ptr, result_type, &obj_ty);
+                self.builder.build_unconditional_branch(merge_block).unwrap();
+                self.builder.position_at_end(null_block);
+                let zero = self.llvm_type(result_type).const_zero();
+                self.builder.build_unconditional_branch(merge_block).unwrap();
+                self.builder.position_at_end(merge_block);
+                let phi = self.builder.build_phi(self.llvm_type(result_type), "obj_ephi").unwrap();
+                phi.add_incoming(&[(&loaded, load_block), (&zero, null_block)]);
+                phi.as_basic_value()
             }
             Type::TypeVar(_) | Type::Union(_) => {
                 let tagged_ptr = if obj_val.is_pointer_value() {
@@ -5335,10 +5353,25 @@ impl<'ctx> Codegen<'ctx> {
                 } else {
                     return self.llvm_type(result_type).const_zero();
                 };
-                // Integer key → array indexing. Unbox TaggedVal* to LinArray*, then get_tagged.
+                // Integer key → array indexing. Check tag is TAG_ARRAY before unboxing.
                 if key_val.is_int_value() {
                     let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
                     let i64_ty = self.context.i64_type();
+                    // Guard: if not TAG_ARRAY (8), return null rather than UB.
+                    let tag = self.builder
+                        .build_call(self.rt_get_tag, &[tagged_ptr.into()], "arr_tag")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                    let is_arr = self.builder
+                        .build_int_compare(IntPredicate::EQ, tag,
+                            self.context.i8_type().const_int(8, false), "is_arr")
+                        .unwrap();
+                    let llvm_fn = fn_ctx.llvm_fn;
+                    let arr_block = self.context.append_basic_block(llvm_fn, "arr_index");
+                    let arr_null_block = self.context.append_basic_block(llvm_fn, "arr_null");
+                    let arr_merge_block = self.context.append_basic_block(llvm_fn, "arr_merge");
+                    self.builder.build_conditional_branch(is_arr, arr_block, arr_null_block).unwrap();
+                    // arr_block: unbox and fetch element
+                    self.builder.position_at_end(arr_block);
                     let arr_ptr = self.builder
                         .build_call(self.rt_unbox_ptr, &[tagged_ptr.into()], "tv_arr")
                         .unwrap().try_as_basic_value().unwrap_basic();
@@ -5350,10 +5383,20 @@ impl<'ctx> Codegen<'ctx> {
                     let elem_tv = self.builder
                         .build_call(get_tagged_fn, &[arr_ptr.into(), idx.into()], "tv_elem")
                         .unwrap().try_as_basic_value().unwrap_basic();
-                    if matches!(result_type, Type::TypeVar(_)) {
-                        return elem_tv;
+                    self.builder.build_unconditional_branch(arr_merge_block).unwrap();
+                    // arr_null_block: return null pointer
+                    self.builder.position_at_end(arr_null_block);
+                    let arr_null_ptr = ptr_ty.const_null();
+                    self.builder.build_unconditional_branch(arr_merge_block).unwrap();
+                    // arr_merge_block: phi
+                    self.builder.position_at_end(arr_merge_block);
+                    let phi = self.builder.build_phi(ptr_ty, "arr_res").unwrap();
+                    phi.add_incoming(&[(&elem_tv, arr_block), (&arr_null_ptr, arr_null_block)]);
+                    let elem_result = phi.as_basic_value();
+                    if matches!(result_type, Type::TypeVar(_) | Type::Union(_)) {
+                        return elem_result;
                     }
-                    return self.load_tagged_val_payload(elem_tv.into_pointer_value(), result_type, &obj_ty);
+                    return self.load_tagged_val_payload(elem_result.into_pointer_value(), result_type, &obj_ty);
                 }
                 // String key → object lookup. Verify tag is TAG_OBJECT before unboxing.
                 let key_ptr = if key_val.is_pointer_value() {
@@ -5393,8 +5436,8 @@ impl<'ctx> Codegen<'ctx> {
                 let phi = self.builder.build_phi(ptr_ty, "obj_res").unwrap();
                 phi.add_incoming(&[(&entry_tv, obj_block), (&null_ptr, null_block)]);
                 let entry_ptr: PointerValue<'ctx> = phi.as_basic_value().into_pointer_value();
-                // For TypeVar result: return the TaggedVal* directly.
-                if matches!(result_type, Type::TypeVar(_)) {
+                // For TypeVar/Union result: return the TaggedVal* directly.
+                if matches!(result_type, Type::TypeVar(_) | Type::Union(_)) {
                     return entry_ptr.into();
                 }
                 self.load_tagged_val_payload(entry_ptr, result_type, &obj_ty)

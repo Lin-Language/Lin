@@ -86,13 +86,14 @@ pub fn is_compatible_env(
                 && a.iter().zip(b.iter()).all(|(av, bv)| is_compatible_env(av, bv, env, depth))
         }
 
-        // Object structural compatibility: value has all target fields with compatible types
+        // Object structural compatibility: value has all target fields with compatible types.
+        // A missing field is allowed when the target field type includes Null.
         (Type::Object(value_fields), Type::Object(target_fields)) => {
             target_fields.iter().all(|(key, target_ty)| {
-                value_fields
-                    .get(key)
-                    .map(|vt| is_compatible_env(vt, target_ty, env, depth))
-                    .unwrap_or(false)
+                match value_fields.get(key) {
+                    Some(vt) => is_compatible_env(vt, target_ty, env, depth),
+                    None => is_compatible_env(&Type::Null, target_ty, env, depth),
+                }
             })
         }
 
