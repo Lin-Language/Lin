@@ -510,8 +510,12 @@ impl Checker {
                 }
             }
             Type::Object(fields) => {
-                if let TypedExpr::StringLit(ref key_str, _) = typed_key {
-                    if !fields.contains_key(key_str) && !fields.is_empty() {
+                if fields.is_empty() {
+                    // Empty schema (e.g. `var result = {}`): object may be populated dynamically,
+                    // so any key access must be a runtime lookup → TypeVar.
+                    self.env.fresh_type_var()
+                } else if let TypedExpr::StringLit(ref key_str, _) = typed_key {
+                    if !fields.contains_key(key_str) {
                         // Key not in the known object type — emit a warning with a "did you mean" hint.
                         let suggestion = lin_common::closest_match(
                             key_str,
@@ -839,6 +843,26 @@ impl Checker {
 
         let (typed_args, result_type) = match &func_ty {
             Type::Function { params, ret } => {
+                // Opaque `Function` annotation: all params and ret are TypeVar.
+                // Accept any number of arguments and return a fresh TypeVar.
+                let is_opaque = params.iter().all(|p| matches!(p, Type::TypeVar(_)))
+                    && matches!(ret.as_ref(), Type::TypeVar(_));
+                if is_opaque {
+                    let mut typed_args = Vec::new();
+                    for arg in args {
+                        typed_args.push(self.infer_expr(arg)?);
+                    }
+                    self.in_tail_position = prev_tail;
+                    let result_type = self.env.fresh_type_var();
+                    return Ok(TypedExpr::Call {
+                        func: Box::new(typed_func),
+                        args: typed_args,
+                        result_type,
+                        is_tail: self.is_tail_call(func),
+                        span,
+                    });
+                }
+
                 if args.len() > params.len() {
                     let extra = args.len() - params.len();
                     return Err(Diagnostic::error(

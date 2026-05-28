@@ -45,17 +45,67 @@ pub unsafe extern "C" fn lin_object_alloc(initial_cap: u32) -> *mut LinObject {
     ptr
 }
 
+/// Release the heap-allocated payload of a TaggedVal (decrement refcount / free).
+/// Does NOT free the TaggedVal box itself (used for inline-stored entries).
+unsafe fn release_tagged_payload(tv: &TaggedVal) {
+    use crate::tagged::*;
+    let payload = tv.payload;
+    match tv.tag {
+        TAG_STR => crate::string::lin_string_release(payload as *mut crate::string::LinString),
+        TAG_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
+        TAG_OBJECT => lin_object_release(payload as *mut LinObject),
+        TAG_FUNCTION => crate::memory::lin_closure_release(payload as *mut u8),
+        _ => {}
+    }
+}
+
+/// Retain the heap-allocated payload of a TaggedVal (increment refcount).
+/// Used when copying a TaggedVal into an object/array slot so the new owner has a reference.
+unsafe fn retain_tagged_payload(tv: &TaggedVal) {
+    use crate::tagged::*;
+    let payload = tv.payload;
+    match tv.tag {
+        TAG_STR => {
+            let s = payload as *mut crate::string::LinString;
+            if !s.is_null() { (*s).refcount += 1; }
+        }
+        TAG_ARRAY => {
+            let a = payload as *mut crate::array::LinArray;
+            if !a.is_null() { (*a).refcount += 1; }
+        }
+        TAG_OBJECT => {
+            let o = payload as *mut LinObject;
+            if !o.is_null() { (*o).refcount += 1; }
+        }
+        _ => {} // scalars: no heap payload
+    }
+}
+
+/// Public wrapper for retain_tagged_payload, used by array.rs when pushing tagged values.
+pub unsafe fn retain_tagged_payload_pub(tv: &TaggedVal) {
+    retain_tagged_payload(tv);
+}
+
 /// Set a field. Key must be a LinString*. Value is a TaggedVal* (pointer to tagged payload).
-/// Copies the 16-byte TaggedVal struct.
+/// Copies the 16-byte TaggedVal struct and retains the inner value (the object owns a reference).
+/// Takes ownership of the key reference (caller must not release it — use lin_object_keys'
+/// retained references or freshly-allocated strings).
 #[no_mangle]
 pub unsafe extern "C" fn lin_object_set(obj: *mut LinObject, key: *mut LinString, val: *const TaggedVal) {
+    use crate::tagged::TAG_NULL;
+    let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
+    // Null pointer represents the null Json value — use a local null TaggedVal instead.
+    let val_ref: &TaggedVal = if val.is_null() { &null_tv } else { &*val };
     let len = (*obj).len;
     // Check if key already exists.
     for i in 0..len {
         let entry = (*obj).entries.add(i as usize);
         if lin_string_key_eq((*entry).key, key) {
-            // Update existing entry.
-            std::ptr::copy_nonoverlapping(val, &mut (*entry).value, 1);
+            // Update existing entry: release old value, copy new, retain new.
+            // The caller is responsible for releasing the new key they passed in.
+            release_tagged_payload(&(*entry).value);
+            std::ptr::copy_nonoverlapping(val_ref, &mut (*entry).value, 1);
+            retain_tagged_payload(val_ref);
             return;
         }
     }
@@ -69,8 +119,13 @@ pub unsafe extern "C" fn lin_object_set(obj: *mut LinObject, key: *mut LinString
         (*obj).cap = new_cap;
     }
     let slot = (*obj).entries.add(len as usize);
+    // Retain the key: the object owns one reference.
+    // Caller retains their own reference and must release it separately.
+    (*key).refcount += 1;
     (*slot).key = key;
-    std::ptr::copy_nonoverlapping(val, &mut (*slot).value, 1);
+    std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
+    // Retain the value's inner payload — the object now owns a reference.
+    retain_tagged_payload(val_ref);
     (*obj).len = len + 1;
 }
 
@@ -106,16 +161,19 @@ pub unsafe extern "C" fn lin_object_merge(dst: *mut LinObject, src: *const LinOb
 }
 
 /// Return a LinArray* containing all keys as LinString* (tagged TAG_STR).
+/// Each key string's refcount is incremented so the array owns a reference.
 #[no_mangle]
 pub unsafe extern "C" fn lin_object_keys(obj: *const LinObject) -> *mut crate::array::LinArray {
     let len = if obj.is_null() { 0 } else { (*obj).len };
     let arr = crate::array::lin_array_alloc(len as u64);
     for i in 0..len {
         let entry = (*obj).entries.add(i as usize);
-        let key_ptr = (*entry).key as u64;
+        let key = (*entry).key;
+        // Retain so the array owns a reference to each key string.
+        (*key).refcount += 1;
         let slot = (*arr).data.add(i as usize);
         (*slot).tag = crate::tagged::TAG_STR;
-        (*slot).payload = key_ptr;
+        (*slot).payload = key as u64;
     }
     (*arr).len = len as u64;
     arr
@@ -128,10 +186,10 @@ pub unsafe extern "C" fn lin_object_values(obj: *const LinObject) -> *mut crate:
     let arr = crate::array::lin_array_alloc(len as u64);
     for i in 0..len {
         let entry = (*obj).entries.add(i as usize);
-        let src = &(*entry).value as *const TaggedVal;
-        let slot = (*arr).data.add(i as usize);
-        // Copy tag+payload from the TaggedVal directly into the array slot.
-        std::ptr::copy_nonoverlapping(src as *const u8, slot as *mut u8, 16);
+        let src = &(*entry).value;
+        let slot = (*arr).data.add(i as usize) as *mut TaggedVal;
+        std::ptr::copy_nonoverlapping(src as *const TaggedVal, slot, 1);
+        retain_tagged_payload(src);
     }
     (*arr).len = len as u64;
     arr
@@ -148,8 +206,10 @@ pub unsafe extern "C" fn lin_object_entries(obj: *const LinObject) -> *mut crate
         let pair = crate::array::lin_array_alloc(2);
         (*(*pair).data.add(0)).tag = crate::tagged::TAG_STR;
         (*(*pair).data.add(0)).payload = (*entry).key as u64;
-        let val_src = &(*entry).value as *const TaggedVal;
-        std::ptr::copy_nonoverlapping(val_src as *const u8, (*pair).data.add(1) as *mut u8, 16);
+        (*(*entry).key).refcount += 1; // array slot owns a reference to the key string
+        let val_src = &(*entry).value;
+        std::ptr::copy_nonoverlapping(val_src as *const TaggedVal, (*pair).data.add(1) as *mut TaggedVal, 1);
+        retain_tagged_payload(val_src);
         (*pair).len = 2;
         // Store pair pointer in output array as TAG_ARRAY
         let slot = (*out).data.add(i as usize);
@@ -227,10 +287,17 @@ unsafe fn tagged_val_eq(a: *const crate::tagged::TaggedVal, b: *const crate::tag
     if a.is_null() || b.is_null() { return false; }
     let at = (*a).tag;
     let bt = (*b).tag;
-    if at != bt { return false; }
     let ap = (*a).payload;
     let bp = (*b).payload;
-    if at == TAG_NULL { return true; }
+    if at == TAG_NULL && bt == TAG_NULL { return true; }
+    if at == TAG_NULL || bt == TAG_NULL { return false; }
+    // Cross-numeric: widen to f64 so Int32(1) == Int64(1).
+    let at_is_num = at >= TAG_INT32 && at <= TAG_FLOAT64;
+    let bt_is_num = bt >= TAG_INT32 && bt <= TAG_FLOAT64;
+    if at_is_num && bt_is_num && at != bt {
+        return tagged_as_f64(at, ap) == tagged_as_f64(bt, bp);
+    }
+    if at != bt { return false; }
     if at == TAG_BOOL { return ap == bp; }
     if at == TAG_INT32 { return (ap as i32) == (bp as i32); }
     if at == TAG_INT64 { return (ap as i64) == (bp as i64); }

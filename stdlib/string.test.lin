@@ -175,7 +175,7 @@ val s = suite("std/string", [
   ),
 
   test("padStart handles multi-char pad with truncation", () =>
-    expect("x".padStart(5, "ab")).toBe("abab" + "x")
+    expect("x".padStart(5, "ab")).toBe("ababx")
   ),
 
   test("padEnd pads right with character", () =>

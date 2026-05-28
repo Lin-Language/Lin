@@ -166,10 +166,8 @@ export val unique = (arr: Json): Json =>
   val result = []
   for(arr, item =>
     val key = lin_value_key(item)
-    if seen[key] == null
-      then
-        seen[key] = true
-        push(result, item)
+    if seen[key] == null then push(result, item)
+    if seen[key] == null then seen[key] = true
   )
   result
 
@@ -233,6 +231,11 @@ export val chunk = (arr: Json, size: Int32): Json =>
 export val compact = (arr: Json): Json =>
   filter(arr, x => x != null)
 
+val _swap = (arr: Json, i: Int32, j: Int32): Null =>
+  val tmp = arr[i]
+  set(arr, i, arr[j])
+  set(arr, j, tmp)
+
 val _qsort = (arr: Json, cmp: (Json, Json) => Int32, lo: Int32, hi: Int32): Null =>
   if lo < hi
     then
@@ -240,19 +243,14 @@ val _qsort = (arr: Json, cmp: (Json, Json) => Int32, lo: Int32, hi: Int32): Null
       var i = lo - 1
       var j = lo
       lin_while(lin_range(lo, hi), _ =>
-        if cmp(arr[j], pivot) <= 0
-          then
-            i = i + 1
-            val tmp = arr[i]
-            set(arr, i, arr[j])
-            set(arr, j, tmp)
+        val should_swap = cmp(arr[j], pivot) <= 0
+        if should_swap then i = i + 1
+        if should_swap then _swap(arr, i, j)
         j = j + 1
         j < hi
       )
       i = i + 1
-      val tmp2 = arr[i]
-      set(arr, i, arr[hi])
-      set(arr, hi, tmp2)
+      _swap(arr, i, hi)
       val p = i
       _qsort(arr, cmp, lo, p - 1)
       _qsort(arr, cmp, p + 1, hi)

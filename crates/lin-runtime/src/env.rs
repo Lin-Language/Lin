@@ -45,10 +45,10 @@ pub unsafe extern "C" fn lin_env_unset(name: *const LinString) {
     }
 }
 
-/// Return all environment variables as a LinObject* (key→string value).
-/// Returns a bare LinObject* (not wrapped in TaggedVal).
+/// Return all environment variables as a TaggedVal*(Object) (key→string value).
 #[no_mangle]
-pub unsafe extern "C" fn lin_env_environ() -> *mut LinObject {
+pub unsafe extern "C" fn lin_env_environ() -> *mut u8 {
+    use crate::tagged::{TAG_OBJECT, alloc_tagged};
     let vars: Vec<(String, String)> = std::env::vars().collect();
     let cap = (vars.len().max(4)) as u32;
     let obj = lin_object_alloc(cap);
@@ -60,5 +60,5 @@ pub unsafe extern "C" fn lin_env_environ() -> *mut LinObject {
         tv.payload = v as u64;
         lin_object_set(obj, k, &tv);
     }
-    obj
+    alloc_tagged(TAG_OBJECT, obj as u64)
 }

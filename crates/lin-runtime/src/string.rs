@@ -369,11 +369,40 @@ pub unsafe fn tagged_to_json_string(tagged: *const TaggedVal) -> String {
 }
 
 unsafe fn array_to_json_string(arr: *const crate::array::LinArray) -> String {
+    use crate::tagged::*;
     let len = (*arr).len as usize;
     let mut parts = Vec::with_capacity(len);
+    let elem_tag = (*arr).elem_tag;
     for i in 0..len {
-        let elem = (*arr).data.add(i);
-        parts.push(tagged_to_json_string(elem as *const TaggedVal));
+        let s = match elem_tag {
+            0xFF => {
+                // Tagged array: elements are TaggedVal structs (16 bytes each).
+                let elem = (*arr).data.add(i);
+                tagged_to_json_string(elem as *const TaggedVal)
+            }
+            TAG_INT32 => {
+                let v = *((*arr).data as *const i32).add(i);
+                format!("{}", v)
+            }
+            TAG_INT64 => {
+                let v = *((*arr).data as *const i64).add(i);
+                format!("{}", v)
+            }
+            TAG_FLOAT32 => {
+                let v = *((*arr).data as *const f32).add(i) as f64;
+                if v.fract() == 0.0 && v.abs() < 1e15 { format!("{:.1}", v) } else { format!("{}", v) }
+            }
+            TAG_FLOAT64 => {
+                let v = *((*arr).data as *const f64).add(i);
+                if v.fract() == 0.0 && v.abs() < 1e15 { format!("{:.1}", v) } else { format!("{}", v) }
+            }
+            TAG_BOOL => {
+                let v = *((*arr).data as *const u8).add(i);
+                if v != 0 { "true".to_string() } else { "false".to_string() }
+            }
+            _ => "null".to_string(),
+        };
+        parts.push(s);
     }
     format!("[{}]", parts.join(", "))
 }

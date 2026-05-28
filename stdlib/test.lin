@@ -3,29 +3,30 @@ import { toString } from "std/string"
 import { filter, length, for, map } from "std/array"
 import { exit } from "std/io"
 
-val _pass = { "type": "pass" }
+val _pass = (): Json =>
+  { "type": "pass" }
 
 val _fail = (message: String): Json =>
   { "type": "fail", "message": message }
 
-val _runTest = (t: Json): Json =>
-  val results = t["run"]()
-  val assertions = if results is Json[]
-    then results
-    else [results]
+val _evalResult = (name: String, results: Json): Json =>
+  val isArray = results["type"] != "pass" && results["type"] != "fail"
+  val assertions = if isArray then results else [results]
   val failures = filter(assertions, a => a["type"] == "fail")
   if length(failures) == 0
-    then { "type": "pass", "name": t["name"] }
-    else { "type": "fail", "name": t["name"], "failures": failures }
+    then { "type": "pass", "name": name }
+    else { "type": "fail", "name": name, "failures": failures }
+
+val _printFail = (r: Json): Null =>
+  print("  FAIL  ${r["name"]}")
+  for(r["failures"], f => print("    ${f["message"]}"))
 
 val _printSuiteResults = (suiteResult: Json): Null =>
   print(suiteResult["name"])
   for(suiteResult["results"], r =>
     if r["type"] == "pass"
       then print("  ok  ${r["name"]}")
-      else
-        print("  FAIL  ${r["name"]}")
-        for(r["failures"], f => print("    ${f["message"]}"))
+      else _printFail(r)
   )
 
 // An Asserter is { "value": Json } — assertion methods take it as first arg via dot-syntax.
@@ -36,51 +37,54 @@ export val expect = (value: Json): Json =>
 export val toBe = (asserter: Json, expected: Json): Json =>
   val value = asserter["value"]
   if value == expected
-    then _pass
+    then _pass()
     else _fail("expected: ${toString(expected)}\n    actual:   ${toString(value)}")
 
 export val toBeNull = (asserter: Json): Json =>
   val value = asserter["value"]
   if value == null
-    then _pass
+    then _pass()
     else _fail("expected null, got: ${toString(value)}")
 
 export val toSatisfy = (asserter: Json, pred: Function): Json =>
   val value = asserter["value"]
   if pred(value)
-    then _pass
+    then _pass()
     else _fail("value did not satisfy predicate: ${toString(value)}")
 
 export val toSucceed = (asserter: Json): Json =>
   val value = asserter["value"]
   if value["type"] == "success"
-    then _pass
+    then _pass()
     else _fail("expected success, got: ${toString(value)}")
 
 export val toFail = (asserter: Json): Json =>
   val value = asserter["value"]
   if value["type"] == "failure"
-    then _pass
+    then _pass()
     else _fail("expected failure, got: ${toString(value)}")
 
 export val toFailWith = (asserter: Json, message: String): Json =>
   val value = asserter["value"]
   if value["type"] == "failure" && value["error"] == message
-    then _pass
+    then _pass()
     else _fail("expected failure with \"${message}\", got: ${toString(value)}")
 
+// A test eagerly runs the body and stores the result alongside the name.
+// This avoids storing function values in containers (which requires uniform
+// closure representation not yet implemented in the codegen).
 export val test = (name: String, body: Function): Json =>
-  { "name": name, "run": body }
+  val result = body()
+  _evalResult(name, result)
 
 export val suite = (name: String, tests: Json[]): Json =>
   { "name": name, "tests": tests }
 
 export val run = (s: Json): Null =>
-  val results = map(s["tests"], t => _runTest(t))
-  val failed = filter(results, r => r["type"] == "fail")
-  val passCount = length(results) - length(failed)
+  val failed = filter(s["tests"], r => r["type"] == "fail")
+  val passCount = length(s["tests"]) - length(failed)
   val failCount = length(failed)
-  _printSuiteResults({ "name": s["name"], "results": results })
+  _printSuiteResults({ "name": s["name"], "results": s["tests"] })
   if failCount == 0
     then print("${toString(passCount)} passed")
     else

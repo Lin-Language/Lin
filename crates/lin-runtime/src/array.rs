@@ -115,7 +115,8 @@ pub unsafe extern "C" fn lin_array_push(arr: *mut LinArray, elem_ptr: *const u8,
 }
 
 /// Push an element that is already a TaggedVal* (copies tag+payload inline).
-/// Avoids double indirection: the element is stored inline, not as a pointer to TaggedVal.
+/// Ownership transfer: caller must NOT release the box after this call.
+/// The array takes ownership of the inner heap value (no retain performed).
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_push_tagged(arr: *mut LinArray, tagged: *const u8) {
     let len = (*arr).len;
@@ -135,15 +136,19 @@ pub unsafe extern "C" fn lin_array_push_tagged(arr: *mut LinArray, tagged: *cons
 
 /// Dynamic push: push a TaggedVal* element into an array of any format (flat or tagged).
 /// Handles flat arrays (elem_tag != 0xFF) by converting the TaggedVal to the flat element type.
-/// For tagged arrays (elem_tag == 0xFF), copies the TaggedVal inline.
+/// For tagged arrays (elem_tag == 0xFF), copies the TaggedVal inline and retains inner refcount.
 #[no_mangle]
 pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::tagged::TaggedVal) {
     use crate::tagged::*;
     if arr.is_null() { return; }
     let elem_tag = (*arr).elem_tag;
     if elem_tag == 0xFF {
-        // Tagged array: store TaggedVal inline.
+        // Tagged array: copy TaggedVal into slot and retain the inner heap value.
         lin_array_push_tagged(arr, tagged as *const u8);
+        // Retain the inner payload so the array slot owns a reference.
+        if !tagged.is_null() {
+            crate::object::retain_tagged_payload_pub(&*tagged);
+        }
     } else {
         // Flat array: extract the scalar value and push it.
         let tag = if tagged.is_null() { TAG_NULL } else { (*tagged).tag };
@@ -358,6 +363,8 @@ pub unsafe extern "C" fn lin_array_get_tagged(arr: *const LinArray, idx: i64) ->
             // Tagged array: elem is already a LinArrayElem (16 bytes) = TaggedVal layout.
             let elem = (*arr).data.add(idx as usize);
             std::ptr::copy_nonoverlapping(elem as *const u8, tv as *mut u8, std::mem::size_of::<TaggedVal>());
+            // Retain the inner payload so the caller owns a reference.
+            crate::object::retain_tagged_payload_pub(&*tv);
         }
     }
     tv

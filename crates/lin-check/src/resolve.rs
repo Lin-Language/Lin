@@ -78,10 +78,11 @@ fn resolve_named_cycle(
         "Float64" => Ok(Type::Float64),
         "String" => Ok(Type::Str),
         "Json" => Ok(json_type()),
-        // Function is used as an opaque type annotation in some programs
+        // Function is an opaque type annotation — any arity is acceptable.
+        // Params and ret use TypeVar(u32::MAX) so compat check treats it as accepting any function.
         "Function" => Ok(Type::Function {
-            params: vec![json_type()],
-            ret: Box::new(json_type()),
+            params: vec![Type::TypeVar(u32::MAX)],
+            ret: Box::new(Type::TypeVar(u32::MAX)),
         }),
         // Iterator without type argument: use Json wildcard element type
         "Iterator" => Ok(Type::Iterator(Box::new(json_type()))),

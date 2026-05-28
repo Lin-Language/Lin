@@ -4,6 +4,7 @@ import { length } from "std/array"
 import { readFile, writeFile, appendFile, readLines, readJson, writeJson, exists, isFile, isDir, stat, listDir, mkdir, mkdirAll, deleteFile, rename } from "std/fs"
 
 val tmpRead   = "/tmp/lin_test_fs_read.txt"
+val tmpExists = "/tmp/lin_test_fs_exists.txt"
 val tmpAppend = "/tmp/lin_test_fs_append.txt"
 val tmpJson   = "/tmp/lin_test_fs_json.json"
 val tmpStat   = "/tmp/lin_test_fs_stat.txt"
@@ -24,13 +25,12 @@ val s = suite("std/fs", [
   ),
 
   test("exists false before write, true after", () =>
-    val before = exists(tmpRead)
-    writeFile(tmpRead, "x")
-    val after = exists(tmpRead)
-    [
-      expect(before).toBe(false),
-      expect(after).toBe(true)
-    ]
+    deleteFile(tmpExists)
+    val before = exists(tmpExists)
+    writeFile(tmpExists, "x")
+    val after = exists(tmpExists)
+    val r = [expect(before).toBe(false), expect(after).toBe(true)]
+    r
   ),
 
   test("appendFile accumulates content", () =>
@@ -54,31 +54,26 @@ val s = suite("std/fs", [
   ),
 
   test("isFile false before write, true after", () =>
-    val before = isFile(tmpRead)
-    writeFile(tmpRead, "hello")
-    val after = isFile(tmpRead)
-    [
-      expect(before).toBe(false),
-      expect(after).toBe(true)
-    ]
+    val tmpIsFile = "/tmp/lin_test_fs_isfile.txt"
+    deleteFile(tmpIsFile)
+    val before = isFile(tmpIsFile)
+    writeFile(tmpIsFile, "hello")
+    val after = isFile(tmpIsFile)
+    val r = [expect(before).toBe(false), expect(after).toBe(true)]
+    r
   ),
 
   test("isDir returns true for temp dir, false for file", () =>
     writeFile(tmpRead, "x")
-    [
-      expect(isDir("/tmp")).toBe(true),
-      expect(isDir(tmpRead)).toBe(false)
-    ]
+    val r = [expect(isDir("/tmp")).toBe(true), expect(isDir(tmpRead)).toBe(false)]
+    r
   ),
 
   test("stat returns metadata for existing file", () =>
     writeFile(tmpStat, "hello lin")
     val s = stat(tmpStat)
-    [
-      expect(s["size"]).toBe(9),
-      expect(s["isFile"]).toBe(true),
-      expect(s["isDir"]).toBe(false)
-    ]
+    val r = [expect(s["size"]).toBe(9), expect(s["isFile"]).toBe(true), expect(s["isDir"]).toBe(false)]
+    r
   ),
 
   test("stat returns error for missing path", () =>
@@ -117,10 +112,8 @@ val s = suite("std/fs", [
     val before = exists(tmpRename)
     deleteFile(tmpRename)
     val after = exists(tmpRename)
-    [
-      expect(before).toBe(true),
-      expect(after).toBe(false)
-    ]
+    val r = [expect(before).toBe(true), expect(after).toBe(false)]
+    r
   ),
 
   test("deleteFile returns error for missing file", () =>
@@ -131,11 +124,8 @@ val s = suite("std/fs", [
   test("rename moves a file", () =>
     writeFile(tmpRename, "hello rename")
     rename(tmpRename, tmpRenameDst)
-    [
-      expect(exists(tmpRename)).toBe(false),
-      expect(exists(tmpRenameDst)).toBe(true),
-      expect(readFile(tmpRenameDst)).toBe("hello rename")
-    ]
+    val r = [expect(exists(tmpRename)).toBe(false), expect(exists(tmpRenameDst)).toBe(true), expect(readFile(tmpRenameDst)).toBe("hello rename")]
+    r
   ),
 ])
 

@@ -5,26 +5,20 @@ import { json, text, redirect, notFound, badRequest, parseBody, pathMatch } from
 val s = suite("std/http", [
   test("json helper sets status and content-type", () =>
     val resp = json(200, { "ok": true })
-    [
-      expect(resp["status"]).toBe(200),
-      expect(resp["headers"]["Content-Type"]).toBe("application/json")
-    ]
+    val r = [expect(resp["status"]).toBe(200), expect(resp["headers"]["Content-Type"]).toBe("application/json")]
+    r
   ),
 
   test("text helper sets status and body", () =>
     val resp = text(200, "hello world")
-    [
-      expect(resp["status"]).toBe(200),
-      expect(resp["body"]).toBe("hello world")
-    ]
+    val r = [expect(resp["status"]).toBe(200), expect(resp["body"]).toBe("hello world")]
+    r
   ),
 
   test("redirect sets 302 and Location header", () =>
     val resp = redirect("/home")
-    [
-      expect(resp["status"]).toBe(302),
-      expect(resp["headers"]["Location"]).toBe("/home")
-    ]
+    val r = [expect(resp["status"]).toBe(302), expect(resp["headers"]["Location"]).toBe("/home")]
+    r
   ),
 
   test("notFound has status 404", () =>
@@ -44,10 +38,8 @@ val s = suite("std/http", [
 
   test("pathMatch extracts named segments", () =>
     val m = pathMatch("/users/:id/posts/:postId", "/users/42/posts/7")
-    [
-      expect(m["id"]).toBe("42"),
-      expect(m["postId"]).toBe("7")
-    ]
+    val r = [expect(m["id"]).toBe("42"), expect(m["postId"]).toBe("7")]
+    r
   ),
 
   test("pathMatch returns null on mismatch", () =>

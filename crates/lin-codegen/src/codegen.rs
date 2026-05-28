@@ -33,6 +33,10 @@ enum SlotStorage<'ctx> {
 /// State carried while compiling a single Lin function.
 struct FnCtx<'ctx, 'a> {
     slots: HashMap<usize, SlotStorage<'ctx>>,
+    /// Module-level function slots (slot → FunctionValue). Checked as fallback when a slot
+    /// is not found in `slots`. Kept separate so local param slots never shadow module slots
+    /// (params and module-level functions share the same slot-number space within a module).
+    module_fn_slots: HashMap<usize, FunctionValue<'ctx>>,
     llvm_fn: FunctionValue<'ctx>,
     /// Pointer to the environment struct for this closure (if any).
     env_ptr: Option<PointerValue<'ctx>>,
@@ -67,6 +71,7 @@ pub struct Codegen<'ctx> {
     rt_array_alloc: FunctionValue<'ctx>,
     rt_array_push: FunctionValue<'ctx>,
     rt_array_get: FunctionValue<'ctx>,
+    rt_array_get_tagged: FunctionValue<'ctx>,
     rt_array_length: FunctionValue<'ctx>,
     rt_int_to_string: FunctionValue<'ctx>,
     rt_float_to_string: FunctionValue<'ctx>,
@@ -119,6 +124,9 @@ pub struct Codegen<'ctx> {
     closure_count: usize,
     // Map from (module_path, export_name) -> FunctionValue for compiled imports
     imported_fns: HashMap<(String, String), FunctionValue<'ctx>>,
+    // Map from (module_path, export_name) -> FunctionValue for non-function exported vals.
+    // Each wrapper is a zero-arg function that computes and returns the val's value.
+    imported_val_wrappers: HashMap<(String, String), FunctionValue<'ctx>>,
     /// Paths to foreign libraries collected from ForeignImport statements (for the linker).
     pub foreign_lib_paths: Vec<String>,
     /// Global val slots: slot -> LLVM GlobalValue (for non-function top-level vals).
@@ -187,6 +195,12 @@ impl<'ctx> Codegen<'ctx> {
         // lin_array_get(arr: ptr, idx: i64) -> ptr (tagged element)
         let rt_array_get = module.add_function(
             "lin_array_get",
+            ptr_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
+            None,
+        );
+        // lin_array_get_tagged(arr: ptr, idx: i64) -> ptr (TaggedVal*) — handles flat + tagged arrays
+        let rt_array_get_tagged = module.add_function(
+            "lin_array_get_tagged",
             ptr_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
             None,
         );
@@ -279,6 +293,7 @@ impl<'ctx> Codegen<'ctx> {
             rt_array_alloc,
             rt_array_push,
             rt_array_get,
+            rt_array_get_tagged,
             rt_array_length,
             rt_int_to_string,
             rt_float_to_string,
@@ -320,6 +335,7 @@ impl<'ctx> Codegen<'ctx> {
             global_fn_slots: HashMap::new(),
             closure_count: 0,
             imported_fns: HashMap::new(),
+            imported_val_wrappers: HashMap::new(),
             foreign_lib_paths: Vec::new(),
             global_val_slots: HashMap::new(),
             current_module_slots: HashMap::new(),
@@ -430,6 +446,43 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
         }
+
+        // Generate wrapper functions for non-function exported vals (e.g. `export val PI = lin_math_pi()`).
+        // Each wrapper is a zero-arg LLVM function `{module_key}_{name}__val()` that computes and returns
+        // the value. The caller (TypedStmt::Import handling) will call the wrapper to get the value.
+        for stmt in &module.statements {
+            if let TypedStmt::Val { slot: _, value, ty, name: Some(name), .. } = stmt {
+                // Skip function vals — already handled above.
+                if matches!(value, TypedExpr::Function { .. }) { continue; }
+                let ret_llvm_ty = self.llvm_type(ty);
+                let wrapper_name = format!("{}_{}__val", module_key, name);
+                // Only generate once.
+                if self.module.get_function(&wrapper_name).is_some() { continue; }
+                let fn_ty = ret_llvm_ty.fn_type(&[], false);
+                let wrapper_fn = self.module.add_function(&wrapper_name, fn_ty, None);
+                let entry_bb = self.context.append_basic_block(wrapper_fn, "entry");
+                let saved_pos = self.builder.get_insert_block();
+                self.builder.position_at_end(entry_bb);
+                // Build a temporary FnCtx for evaluating the val expression.
+                let mut tmp_ctx = FnCtx {
+                    slots: module_slots.iter().map(|(k, v)| (*k, SlotStorage::Value(v.as_global_value().as_pointer_value().into()))).collect(),
+                    module_fn_slots: module_slots.clone(),
+                    llvm_fn: wrapper_fn,
+                    env_ptr: None,
+                    tco: None,
+                    pointer_slots: std::collections::HashSet::new(),
+                    heap_var_slots: std::collections::HashSet::new(),
+                };
+                let result = self.compile_expr(value, &mut tmp_ctx);
+                self.builder.build_return(Some(&result)).unwrap();
+                if let Some(bb) = saved_pos {
+                    self.builder.position_at_end(bb);
+                }
+                // Store the wrapper in imported_val_wrappers so TypedStmt::Import can call it.
+                self.imported_val_wrappers.insert((path.to_string(), name.clone()), wrapper_fn);
+            }
+        }
+
         // Clear current_module_slots now that this module's compilation is done.
         self.current_module_slots.clear();
     }
@@ -540,6 +593,7 @@ impl<'ctx> Codegen<'ctx> {
 
         let mut fn_ctx = FnCtx {
             slots: HashMap::new(),
+            module_fn_slots: HashMap::new(),
             llvm_fn: main_fn,
             env_ptr: None,
             tco: None,
@@ -1229,18 +1283,19 @@ impl<'ctx> Codegen<'ctx> {
         let entry_block = self.context.append_basic_block(llvm_fn, "entry");
         self.builder.position_at_end(entry_block);
 
-        // Pre-populate with module-local slots so intra-module calls resolve.
-        let module_slot_storage: HashMap<usize, SlotStorage<'ctx>> = module_slots
-            .iter()
-            .map(|(&slot, &fn_val)| (slot, SlotStorage::Value(fn_val.as_global_value().as_pointer_value().into())))
-            .collect();
         // Pre-scan to find slots for `var` bindings that are captured mutably by inner closures.
         // These must be heap-allocated so they outlive the creating function's stack frame.
         let mut heap_var_slots = std::collections::HashSet::new();
         Self::collect_mutable_capture_slots(body, &mut heap_var_slots);
 
+        // Module-level function slots are kept separate from local param/val slots.
+        // This prevents local slots (which share the same slot-number space) from shadowing
+        // module-level function references when a param happens to have the same slot number.
+        let module_fn_slots: HashMap<usize, FunctionValue<'ctx>> = module_slots.clone();
+
         let mut fn_ctx = FnCtx {
-            slots: module_slot_storage,
+            slots: HashMap::new(),
+            module_fn_slots,
             llvm_fn,
             env_ptr: None,
             tco: None,
@@ -1368,18 +1423,24 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.build_return(None).unwrap();
             }
             _ => {
-                // If function returns Union/TypeVar, box concrete non-tagged values.
+                // Coerce body result to declared return type.
                 let body_ty = body.ty();
                 let final_result = if Self::is_union_type(ret_type) {
-                    if !matches!(body_ty, Type::TypeVar(_) | Type::Null) {
-                        // Concrete body type (Array, Str, Int32, etc.) — box it
-                        self.box_value(result, &body_ty)
-                    } else if !result.is_pointer_value() {
-                        // TypeVar body but produced a scalar (e.g. int from TypeVar + TypeVar)
-                        self.box_value(result, &body_ty)
+                    if matches!(body_ty, Type::TypeVar(_) | Type::Union(_) | Type::Null) {
+                        // Already a TaggedVal* (or will produce one) — pass through if pointer.
+                        if result.is_pointer_value() {
+                            result
+                        } else {
+                            // Scalar from TypeVar expression (e.g. int from TypeVar + TypeVar)
+                            self.box_value(result, &body_ty)
+                        }
                     } else {
-                        result  // TypeVar body and already a pointer — assume TaggedVal*
+                        // Concrete body type (Array, Str, Int32, Object, etc.) — box it
+                        self.box_value(result, &body_ty)
                     }
+                } else if !Self::is_union_type(ret_type) && Self::is_union_type(&body_ty) && !matches!(body_ty, Type::Never) {
+                    // Concrete return type but body produced TypeVar — unbox/coerce it.
+                    self.coerce_typevar(result, &body_ty, ret_type)
                 } else {
                     result
                 };
@@ -1407,7 +1468,17 @@ impl<'ctx> Codegen<'ctx> {
                         fn_ctx.slots.insert(*slot, SlotStorage::Closure(compiled.into_pointer_value()));
                     }
                     _ => {
-                        let compiled = self.compile_expr(value, fn_ctx);
+                        let compiled_raw = self.compile_expr(value, fn_ctx);
+                        let val_ty = value.ty();
+                        // When the declared slot type is a union (TypeVar/Union) but the expression
+                        // produces a concrete type, box the value so the slot always holds a TaggedVal*.
+                        let compiled = if Self::is_union_type(ty) && !Self::is_union_type(&val_ty)
+                            && !matches!(val_ty, Type::Never)
+                        {
+                            self.box_value(compiled_raw, &val_ty)
+                        } else {
+                            compiled_raw
+                        };
                         // If the type is a function, it may be a closure struct returned from a call.
                         // Check whether the compiled value is a pointer with function type.
                         let storage = if matches!(ty, Type::Function { .. })
@@ -1643,6 +1714,17 @@ impl<'ctx> Codegen<'ctx> {
                             "lin_exit", "lin_value_key", "lin_array_allocate", "lin_array_allocate_filled"];
                         if known_intrinsics.contains(&binding.name.as_str()) {
                             self.intrinsic_slots.insert(binding.slot, binding.name.clone());
+                        } else if let Some(&wrapper_fn) = self.imported_val_wrappers.get(&key) {
+                            // Non-function exported val (e.g. PI, E from std/math) — call the wrapper to get the value.
+                            let result = self.builder.build_call(wrapper_fn, &[], &format!("imp_{}", binding.name))
+                                .unwrap().try_as_basic_value().unwrap_basic();
+                            fn_ctx.slots.insert(binding.slot, SlotStorage::Value(result));
+                            // Store in a module-level global so closures at scope depth 0 can load it.
+                            let llvm_ty = self.llvm_type(&binding.ty);
+                            let glob = self.module.add_global(llvm_ty, None, &format!("_gv_{}", binding.slot));
+                            glob.set_initializer(&llvm_ty.const_zero());
+                            self.builder.build_store(glob.as_pointer_value(), result).unwrap();
+                            self.global_val_slots.insert(binding.slot, glob);
                         } else {
                             // Not found — store null pointer as fallback.
                             fn_ctx.slots.insert(binding.slot, SlotStorage::Value(ptr_ty.const_null().into()));
@@ -1903,6 +1985,12 @@ impl<'ctx> Codegen<'ctx> {
                         .build_load(load_ty, glob.as_pointer_value(), &format!("gv_{}", slot))
                         .unwrap();
                 }
+                // Check module-local fn slots (intra-module calls, e.g. toBe calling _pass).
+                // These are kept separate from fn_ctx.slots to prevent local param slots
+                // (which reuse the same slot-number space) from shadowing them.
+                if let Some(&mfn) = fn_ctx.module_fn_slots.get(&slot) {
+                    return mfn.as_global_value().as_pointer_value().into();
+                }
                 // Check global_fn_slots, then current_module_slots (for stdlib imports).
                 if let Some(&gfn) = self.global_fn_slots.get(&slot) {
                     return gfn.as_global_value().as_pointer_value().into();
@@ -1953,11 +2041,13 @@ impl<'ctx> Codegen<'ctx> {
         let lty_orig = left.ty();
         let rty_orig = right.ty();
 
-        // When either operand is TypeVar, use lin_tagged_eq for equality rather than coercing.
+        // When either operand is TypeVar or Union, use lin_tagged_eq for equality rather than coercing.
         // Coercing a TypeVar pointer to a concrete type crashes when the value is null
         // (e.g. object_get returns null for a missing key, and null["type"] == "error" would
         // deref null at payload offset 8). lin_tagged_eq handles null on either side safely.
-        if (matches!(lty_orig, Type::TypeVar(_)) || matches!(rty_orig, Type::TypeVar(_)))
+        // Union types also produce TaggedVal* (e.g. Object({})[k] returns Union([Union([]),Null])),
+        // so they need the same treatment.
+        if (matches!(lty_orig, Type::TypeVar(_) | Type::Union(_)) || matches!(rty_orig, Type::TypeVar(_) | Type::Union(_)))
             && matches!(op, BinOp::Eq | BinOp::NotEq)
         {
             let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
@@ -1965,12 +2055,12 @@ impl<'ctx> Codegen<'ctx> {
             let tagged_eq_fn = self.get_or_declare_fn("lin_tagged_eq",
                 i8_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
             // Ensure both sides are TaggedVal* (box if concrete).
-            let lv_tagged = if matches!(lty_orig, Type::TypeVar(_)) {
+            let lv_tagged = if matches!(lty_orig, Type::TypeVar(_) | Type::Union(_)) {
                 lv_raw
             } else {
                 self.box_value(lv_raw, &lty_orig)
             };
-            let rv_tagged = if matches!(rty_orig, Type::TypeVar(_)) {
+            let rv_tagged = if matches!(rty_orig, Type::TypeVar(_) | Type::Union(_)) {
                 rv_raw
             } else {
                 self.box_value(rv_raw, &rty_orig)
@@ -1987,11 +2077,45 @@ impl<'ctx> Codegen<'ctx> {
             };
         }
 
+        // For ordering comparisons where either side is TypeVar, use lin_tagged_cmp which handles
+        // strings lexicographically and numerics by value. This avoids comparing raw pointer payloads.
+        let is_ordering_op = matches!(op, BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq);
+        if (matches!(lty_orig, Type::TypeVar(_) | Type::Union(_)) || matches!(rty_orig, Type::TypeVar(_) | Type::Union(_)))
+            && is_ordering_op
+        {
+            let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+            let i32_ty = self.context.i32_type();
+            let tagged_cmp_fn = self.get_or_declare_fn("lin_tagged_cmp",
+                i32_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+            let lv_tagged = if matches!(lty_orig, Type::TypeVar(_) | Type::Union(_)) {
+                lv_raw
+            } else {
+                self.box_value(lv_raw, &lty_orig)
+            };
+            let rv_tagged = if matches!(rty_orig, Type::TypeVar(_) | Type::Union(_)) {
+                rv_raw
+            } else {
+                self.box_value(rv_raw, &rty_orig)
+            };
+            let cmp_i32 = self.builder
+                .build_call(tagged_cmp_fn, &[lv_tagged.into(), rv_tagged.into()], "tcmp")
+                .unwrap()
+                .try_as_basic_value().unwrap_basic().into_int_value();
+            let zero = i32_ty.const_zero();
+            let result = match op {
+                BinOp::Lt    => self.builder.build_int_compare(inkwell::IntPredicate::SLT, cmp_i32, zero, "tclt").unwrap(),
+                BinOp::Gt    => self.builder.build_int_compare(inkwell::IntPredicate::SGT, cmp_i32, zero, "tcgt").unwrap(),
+                BinOp::LtEq  => self.builder.build_int_compare(inkwell::IntPredicate::SLE, cmp_i32, zero, "tcle").unwrap(),
+                BinOp::GtEq  => self.builder.build_int_compare(inkwell::IntPredicate::SGE, cmp_i32, zero, "tcge").unwrap(),
+                _ => unreachable!(),
+            };
+            return result.into();
+        }
+
         // Coerce TypeVar operands to the concrete type of the other operand.
         // When both are TypeVar, use _result_type as the coercion target.
         // For ordering comparisons (< > <= >=) the result_type is Boolean but operands
         // are numeric — fall back to Int32 so we unbox the numeric payload, not the bool byte.
-        let is_ordering_op = matches!(op, BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq);
         let (lv, rv, lty, rty) = if matches!(lty_orig, Type::TypeVar(_)) && matches!(rty_orig, Type::TypeVar(_)) {
             // Both TypeVar: coerce both to result_type (or Int32 as fallback).
             let target = if is_ordering_op || matches!(_result_type, Type::TypeVar(_) | Type::Bool) {
@@ -2388,11 +2512,20 @@ impl<'ctx> Codegen<'ctx> {
                 if let Some(llvm_fn) = self.global_fn_slots.get(slot).copied() {
                     return self.call_global_fn(llvm_fn, func, args, result_type, fn_ctx);
                 }
+                if let Some(llvm_fn) = fn_ctx.module_fn_slots.get(slot).copied() {
+                    return self.call_global_fn(llvm_fn, func, args, result_type, fn_ctx);
+                }
                 if let Some(SlotStorage::Closure(cls)) = fn_ctx.slots.get(slot).cloned() {
-                    return self.build_closure_call(cls, args, result_type, fn_ctx);
+                    return self.build_closure_call_typed(cls, args, result_type, func_ty, fn_ctx);
                 }
                 if let Some(SlotStorage::Value(fn_val)) = fn_ctx.slots.get(slot).cloned() {
                     if let BasicValueEnum::PointerValue(ptr) = fn_val {
+                        // Opaque `Function` type: the param holds a closure struct pointer.
+                        // Use closure call convention (fn_ptr + env_ptr) rather than a raw call.
+                        let is_typed_fn = matches!(func_ty, Type::Function { .. });
+                        if is_typed_fn {
+                            return self.build_closure_call_typed(ptr, args, result_type, func_ty, fn_ctx);
+                        }
                         return self.call_slot_fn(ptr, func, args, result_type, fn_ctx);
                     }
                 }
@@ -2404,14 +2537,25 @@ impl<'ctx> Codegen<'ctx> {
                         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
                         let cls_ptr = self.builder.build_load(ptr_ty, alloc, "fn_alloca_load")
                             .unwrap().into_pointer_value();
-                        return self.build_closure_call(cls_ptr, args, result_type, fn_ctx);
+                        return self.build_closure_call_typed(cls_ptr, args, result_type, func_ty, fn_ctx);
                     }
                 }
                 let fn_val = self.compile_expr(func, fn_ctx);
                 self.build_indirect_call(fn_val, args, result_type, fn_ctx)
             }
             _ => {
+                let func_ty = func.ty();
                 let fn_val = self.compile_expr(func, fn_ctx);
+                // When the callee type is TypeVar/Union/Function-stored-in-Json, the value is a
+                // TaggedVal* containing a boxed closure. Unbox it and dispatch via closure call.
+                if matches!(func_ty, Type::TypeVar(_) | Type::Union(_)) {
+                    if let BasicValueEnum::PointerValue(tagged_ptr) = fn_val {
+                        let cls_ptr = self.builder
+                            .build_call(self.rt_unbox_ptr, &[tagged_ptr.into()], "fn_unbox")
+                            .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+                        return self.build_closure_call(cls_ptr, args, result_type, fn_ctx);
+                    }
+                }
                 self.build_indirect_call(fn_val, args, result_type, fn_ctx)
             }
         }
@@ -2517,8 +2661,17 @@ impl<'ctx> Codegen<'ctx> {
                         }
                     }
                     if let TypedExpr::Function { params, body, captures, ret_type, .. } = a {
-                        // Inline anonymous closure — compile to closure struct.
-                        let cls = self.compile_closure(None, params, body, ret_type, captures, fn_ctx);
+                        // If param expects TypeVar args, compile closure with TypeVar return so the
+                        // call site can safely unbox ptr to the declared concrete return type.
+                        let has_typevar_params = if let Type::Function { params: fn_params, .. } = &param_ty {
+                            fn_params.iter().any(|p| matches!(p, Type::TypeVar(_)))
+                        } else { false };
+                        let effective_ret = if has_typevar_params && !matches!(ret_type, Type::TypeVar(_) | Type::Never) {
+                            &Type::TypeVar(u32::MAX)
+                        } else {
+                            ret_type
+                        };
+                        let cls = self.compile_closure(None, params, body, effective_ret, captures, fn_ctx);
                         return cls.into();
                     }
                 }
@@ -2896,6 +3049,82 @@ impl<'ctx> Codegen<'ctx> {
         call.try_as_basic_value().basic().unwrap_or_else(|| {
             self.llvm_type(result_type).const_zero()
         })
+    }
+
+    /// Call a closure through a statically-typed function parameter.
+    /// Handles type marshalling: boxes concrete args to TaggedVal* if the declared param type is
+    /// TypeVar (the closure was compiled expecting ptr args), and unboxes the return value if the
+    /// declared return type is concrete but the closure returns TaggedVal*.
+    fn build_closure_call_typed(
+        &mut self,
+        closure_ptr: PointerValue<'ctx>,
+        args: &[TypedExpr],
+        result_type: &Type,
+        func_ty: &Type,
+        fn_ctx: &mut FnCtx<'ctx, '_>,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+
+        let (declared_params, declared_ret): (Vec<Type>, &Type) = if let Type::Function { params, ret } = func_ty {
+            (params.clone(), ret.as_ref())
+        } else {
+            return self.build_closure_call(closure_ptr, args, result_type, fn_ctx);
+        };
+
+        let has_typevar_params = declared_params.iter().any(|p| matches!(p, Type::TypeVar(_)));
+
+        if !has_typevar_params {
+            // No TypeVar params — call normally without boxing.
+            return self.build_closure_call(closure_ptr, args, result_type, fn_ctx);
+        }
+
+        // TypeVar params: closure expects all args as TaggedVal*.
+        // Box each arg, call with ptr return, then unbox the result.
+        let closure_struct_type = self.closure_struct_type();
+        let fn_field_ptr = self.builder.build_struct_gep(closure_struct_type, closure_ptr, 2, "tcls_fn_ptr").unwrap();
+        let fn_ptr = self.builder.build_load(ptr_ty, fn_field_ptr, "tcls_fn").unwrap().into_pointer_value();
+        let env_field_ptr = self.builder.build_struct_gep(closure_struct_type, closure_ptr, 3, "tcls_env_ptr").unwrap();
+        let env_ptr = self.builder.build_load(ptr_ty, env_field_ptr, "tcls_env").unwrap();
+
+        let mut compiled_args: Vec<BasicMetadataValueEnum> = vec![env_ptr.into()];
+        for (i, a) in args.iter().enumerate() {
+            let val = self.compile_expr(a, fn_ctx);
+            let arg_ty = a.ty();
+            // If declared param is TypeVar, box arg to TaggedVal*.
+            let boxed = if i < declared_params.len() && matches!(declared_params[i], Type::TypeVar(_)) {
+                if matches!(arg_ty, Type::TypeVar(_) | Type::Union(_)) && val.is_pointer_value() {
+                    val  // already TaggedVal*
+                } else {
+                    self.box_value(val, &arg_ty)
+                }
+            } else {
+                val
+            };
+            compiled_args.push(boxed.into());
+        }
+
+        // Declare call as returning ptr (the closure always returns TaggedVal* for TypeVar ret).
+        let mut param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
+        for _ in args {
+            param_types.push(ptr_ty.into());  // all TypeVar params → ptr
+        }
+        let call_fn_ty = ptr_ty.fn_type(&param_types, false);
+        let raw_result = self.builder.build_indirect_call(call_fn_ty, fn_ptr, &compiled_args, "tcls_call")
+            .unwrap().try_as_basic_value().basic()
+            .unwrap_or_else(|| ptr_ty.const_null().into());
+
+        // The closure was compiled with TypeVar params → it returns TaggedVal* (ptr).
+        // Unbox the result to the declared return type if it's concrete.
+        if !Self::is_union_type(result_type) && raw_result.is_pointer_value() {
+            let tv_ptr = raw_result.into_pointer_value();
+            if !tv_ptr.is_null() {
+                self.load_tagged_val_payload(tv_ptr, result_type, &Type::TypeVar(0))
+            } else {
+                self.llvm_type(result_type).const_zero()
+            }
+        } else {
+            raw_result
+        }
     }
 
     /// Call a closure pointer with pre-compiled args and a known result type.
@@ -3462,16 +3691,34 @@ impl<'ctx> Codegen<'ctx> {
                 let obj_raw = self.compile_expr(&args[0], fn_ctx);
                 let key_raw = self.compile_expr(&args[1], fn_ctx);
                 let val_raw = self.compile_expr(&args[2], fn_ctx);
+                let obj_ty = args[0].ty();
+                let key_ty = args[1].ty();
                 let val_ty = args[2].ty();
 
+                // obj must be a raw *LinObject. If obj_ty is TypeVar/Union, unbox from TaggedVal*.
                 let obj_ptr = if obj_raw.is_pointer_value() {
-                    obj_raw.into_pointer_value()
+                    let op = obj_raw.into_pointer_value();
+                    if matches!(obj_ty, Type::TypeVar(_) | Type::Union(_)) {
+                        self.builder.build_call(self.rt_unbox_ptr, &[op.into()], "oset_obj_ub")
+                            .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value()
+                    } else {
+                        op
+                    }
                 } else {
                     self.builder.build_call(self.rt_unbox_ptr, &[obj_raw.into()], "oset_obj")
                         .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value()
                 };
+                // Key must be a raw LinString*. If key is a tagged pointer (TypeVar/Union),
+                // unbox it to extract the LinString* from the payload.
                 let key_ptr = if key_raw.is_pointer_value() {
-                    key_raw.into_pointer_value()
+                    let kp = key_raw.into_pointer_value();
+                    if matches!(key_ty, Type::TypeVar(_) | Type::Union(_)) {
+                        // Tagged pointer — unbox to get raw LinString*.
+                        self.builder.build_call(self.rt_unbox_ptr, &[kp.into()], "oset_key_ub")
+                            .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value()
+                    } else {
+                        kp
+                    }
                 } else {
                     self.builder.build_call(self.rt_unbox_ptr, &[key_raw.into()], "oset_key")
                         .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value()
@@ -3939,9 +4186,23 @@ impl<'ctx> Codegen<'ctx> {
             .build_conditional_branch(cond_val, then_block, else_block)
             .unwrap();
 
+        // Coerce branch values to the declared result type.
+        // Must happen inside branch blocks (before br to merge) because PHI nodes must be
+        // the first instructions in the merge block.
+        let result_llvm_ty = self.llvm_type(result_type);
+        let result_is_union = Self::is_union_type(result_type);
+
         // Then branch
         self.builder.position_at_end(then_block);
-        let then_val = self.compile_expr(then_br, fn_ctx);
+        let then_val_raw = self.compile_expr(then_br, fn_ctx);
+        let then_ty = then_br.ty();
+        let then_val = if result_is_union && !Self::is_union_type(&then_ty) && !matches!(then_ty, Type::Never) {
+            // Result is TaggedVal* but branch produced a concrete type — box it.
+            self.box_value(then_val_raw, &then_ty)
+        } else if !result_is_union && Self::is_union_type(&then_ty) && !matches!(then_ty, Type::Never) {
+            // Result is concrete but branch produced TaggedVal* — unbox/coerce it.
+            self.coerce_typevar(then_val_raw, &then_ty, result_type)
+        } else if then_val_raw.get_type() == result_llvm_ty { then_val_raw } else { result_llvm_ty.const_zero() };
         let then_end = self.builder.get_insert_block().unwrap();
         if !then_end.get_terminator().is_some() {
             self.builder.build_unconditional_branch(merge_block).unwrap();
@@ -3949,27 +4210,27 @@ impl<'ctx> Codegen<'ctx> {
 
         // Else branch
         self.builder.position_at_end(else_block);
-        let else_val = self.compile_expr(else_br, fn_ctx);
+        let else_val_raw = self.compile_expr(else_br, fn_ctx);
+        let else_ty = else_br.ty();
+        let else_val = if result_is_union && !Self::is_union_type(&else_ty) && !matches!(else_ty, Type::Never) {
+            // Result is TaggedVal* but branch produced a concrete type — box it.
+            self.box_value(else_val_raw, &else_ty)
+        } else if !result_is_union && Self::is_union_type(&else_ty) && !matches!(else_ty, Type::Never) {
+            // Result is concrete but branch produced TaggedVal* — unbox/coerce it.
+            self.coerce_typevar(else_val_raw, &else_ty, result_type)
+        } else if else_val_raw.get_type() == result_llvm_ty { else_val_raw } else { result_llvm_ty.const_zero() };
         let else_end = self.builder.get_insert_block().unwrap();
         if !else_end.get_terminator().is_some() {
             self.builder.build_unconditional_branch(merge_block).unwrap();
         }
 
-        // Merge with phi — coerce branch values to the declared result type.
+        // Merge with phi.
         self.builder.position_at_end(merge_block);
-        let result_llvm_ty = self.llvm_type(result_type);
-        let coerce = |val: BasicValueEnum<'ctx>, ctx: &Self| -> BasicValueEnum<'ctx> {
-            if val.get_type() == result_llvm_ty { return val; }
-            // Mismatch: produce a zero/null of the result type.
-            result_llvm_ty.const_zero()
-        };
-        let tv = coerce(then_val, self);
-        let ev = coerce(else_val, self);
         let phi = self
             .builder
             .build_phi(result_llvm_ty, "iftmp")
             .unwrap();
-        phi.add_incoming(&[(&tv, then_end), (&ev, else_end)]);
+        phi.add_incoming(&[(&then_val, then_end), (&else_val, else_end)]);
         phi.as_basic_value()
     }
 
@@ -4066,11 +4327,23 @@ impl<'ctx> Codegen<'ctx> {
                         (*ptr).into()
                     }
                     None => {
-                        // Check global_fn_slots first, then current_module_slots (for stdlib imports).
-                        if let Some(&gfn) = self.global_fn_slots.get(&cap.outer_slot) {
+                        // Check module_fn_slots first, then global_fn_slots and current_module_slots.
+                        if let Some(&mfn) = fn_ctx.module_fn_slots.get(&cap.outer_slot) {
+                            mfn.as_global_value().as_pointer_value().into()
+                        } else if let Some(&gfn) = self.global_fn_slots.get(&cap.outer_slot) {
                             gfn.as_global_value().as_pointer_value().into()
                         } else if let Some(&mfn) = self.current_module_slots.get(&cap.outer_slot) {
                             mfn.as_global_value().as_pointer_value().into()
+                        } else if let Some(glob) = self.global_val_slots.get(&cap.outer_slot) {
+                            // Module-level val (non-function) — load current value from global.
+                            let load_ty = if matches!(cap.ty, Type::Function { .. } | Type::TypeVar(_) | Type::Union(_) | Type::Null) {
+                                self.context.ptr_type(AddressSpace::default()).as_basic_type_enum()
+                            } else {
+                                self.llvm_type(&cap.ty)
+                            };
+                            self.builder
+                                .build_load(load_ty, glob.as_pointer_value(), &format!("cap_gv_{}", cap.outer_slot))
+                                .unwrap()
                         } else {
                             self.llvm_type(&cap.ty).const_zero()
                         }
@@ -4114,9 +4387,9 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.build_store(env_size_field, env_size_i64).unwrap();
 
             // Compile the function body (deferred — save/restore builder position).
-            // Pass current_module_slots so sibling stdlib functions resolve inside inner closures.
+            // Propagate module_fn_slots so sibling module functions resolve inside inner closures.
             let current_block = self.builder.get_insert_block().unwrap();
-            let mod_slots = self.current_module_slots.clone();
+            let mod_slots: HashMap<usize, FunctionValue<'ctx>> = fn_ctx.module_fn_slots.clone();
             // Adjust compile_function_body: captures now start at env field index 1 (after size header).
             self.compile_function_body(llvm_fn, params, body, ret_type, captures, &closure_name, &mod_slots, true);
             self.builder.position_at_end(current_block);
@@ -4125,7 +4398,7 @@ impl<'ctx> Codegen<'ctx> {
         } else {
             // Non-capturing closure — compile function body (env_ptr is first param but ignored).
             let current_block = self.builder.get_insert_block().unwrap();
-            let mod_slots = self.current_module_slots.clone();
+            let mod_slots: HashMap<usize, FunctionValue<'ctx>> = fn_ctx.module_fn_slots.clone();
             self.compile_function_body(llvm_fn, params, body, ret_type, &[], &closure_name, &mod_slots, true);
             self.builder.position_at_end(current_block);
 
@@ -4778,13 +5051,35 @@ impl<'ctx> Codegen<'ctx> {
             self.load_array_element(elem_ptr_val, &elem_ty)
         };
 
-        // Call body; returns Boolean — false means stop.
-        let cont = self.call_body(body_expr, &[elem_val], &Type::Bool, fn_ctx);
+        // Call body; returns Boolean (or a TypeVar/Json wrapping a bool) — false means stop.
+        // Use the body's actual return type to avoid ABI mismatch between i1 and ptr.
+        let body_ret_ty = match body_expr.ty() {
+            Type::Function { ret, .. } => *ret,
+            other => other,
+        };
+        let cont_raw = self.call_body(body_expr, &[elem_val], &body_ret_ty, fn_ctx);
+        // Coerce result to i1: if it's a pointer (TypeVar), extract the Bool payload.
+        let cont_bool = if cont_raw.is_pointer_value() {
+            let ptr = cont_raw.into_pointer_value();
+            let tag = self.builder.build_call(self.rt_get_tag, &[ptr.into()], "whl_ctag")
+                .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+            let tag_bool = self.context.i8_type().const_int(1u64, false); // TAG_BOOL = 1
+            let is_bool = self.builder.build_int_compare(inkwell::IntPredicate::EQ, tag, tag_bool, "whl_is_bool").unwrap();
+            let bool_payload = self.builder.build_call(self.rt_unbox_bool, &[ptr.into()], "whl_ubool")
+                .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+            let bool_flag = self.builder.build_int_truncate(bool_payload, self.context.bool_type(), "whl_bflag").unwrap();
+            let i64_ty = self.context.i64_type();
+            let as_int = self.builder.build_ptr_to_int(ptr, i64_ty, "whl_cpti").unwrap();
+            let ptr_nonzero = self.builder.build_int_compare(inkwell::IntPredicate::NE, as_int, i64_ty.const_zero(), "whl_pnn").unwrap();
+            self.builder.build_select(is_bool, bool_flag, ptr_nonzero, "whl_cbool").unwrap().into_int_value()
+        } else {
+            cont_raw.into_int_value()
+        };
         let next_i = self.builder
             .build_int_add(cur_i, self.context.i64_type().const_int(1, false), "whl_next")
             .unwrap();
         self.builder.build_store(i_alloc, next_i).unwrap();
-        self.builder.build_conditional_branch(cont.into_int_value(), check_block, exit_block).unwrap();
+        self.builder.build_conditional_branch(cont_bool, check_block, exit_block).unwrap();
 
         self.builder.position_at_end(exit_block);
         null_val()
@@ -4993,6 +5288,15 @@ impl<'ctx> Codegen<'ctx> {
                 // Use flat path for known scalar element types.
                 if Self::is_flat_scalar(elem_ty) {
                     return self.flat_array_get(arr_val, cur_i, elem_ty);
+                }
+                // When element type is TypeVar (array may be flat), use lin_array_get_tagged
+                // which properly boxes flat scalar elements to TaggedVal* before returning.
+                if matches!(elem_ty, Type::TypeVar(_) | Type::Union(_)) {
+                    let elem_ptr = self.builder
+                        .build_call(self.rt_array_get_tagged, &[arr_val.into(), cur_i.into()], "elem_ptr")
+                        .unwrap()
+                        .try_as_basic_value().unwrap_basic().into_pointer_value();
+                    return elem_ptr.into();
                 }
                 let elem_ptr = self.builder
                     .build_call(self.rt_array_get, &[arr_val.into(), cur_i.into()], "elem_ptr")
@@ -5491,10 +5795,19 @@ impl<'ctx> Codegen<'ctx> {
                 self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
             for spread_expr in spreads {
                 let spread_val = self.compile_expr(spread_expr, fn_ctx);
+                let spread_ty = spread_expr.ty();
                 let spread_ptr = if spread_val.is_pointer_value() {
-                    spread_val.into_pointer_value()
+                    let sp = spread_val.into_pointer_value();
+                    if matches!(spread_ty, Type::TypeVar(_) | Type::Union(_)) {
+                        // Boxed TaggedVal* — unbox to get LinObject*.
+                        self.builder
+                            .build_call(self.rt_unbox_ptr, &[sp.into()], "spread_unbox")
+                            .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value()
+                    } else {
+                        sp
+                    }
                 } else {
-                    // TypeVar spread: unbox to get LinObject*.
+                    // Non-pointer scalar: unbox to get LinObject*.
                     self.builder
                         .build_call(self.rt_unbox_ptr, &[spread_val.into()], "spread_unbox")
                         .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value()
@@ -5529,6 +5842,8 @@ impl<'ctx> Codegen<'ctx> {
                 &[obj_ptr.into(), key_str.into(), tagged.into()],
                 "",
             ).unwrap();
+            // lin_object_set retained the key; release our reference from compile_string_lit.
+            self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
         }
 
         obj_ptr.into()
@@ -5619,6 +5934,7 @@ impl<'ctx> Codegen<'ctx> {
             .build_call(self.rt_object_get, &[obj_ptr.into(), key_str.into()], "fget_p")
             .unwrap()
             .try_as_basic_value().unwrap_basic().into_pointer_value();
+        self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
 
         // entry_ptr points to a TaggedVal (or null if not found).
         // For TypeVar result: return the TaggedVal* directly (caller dispatches at runtime).
@@ -5639,6 +5955,7 @@ impl<'ctx> Codegen<'ctx> {
         let obj_val = self.compile_expr(object, fn_ctx);
         let key_val = self.compile_expr(key, fn_ctx);
         let obj_ty = object.ty();
+        let key_ty = key.ty();
 
         match &obj_ty {
             Type::Array(_) | Type::FixedArray(_) => {
@@ -5664,6 +5981,17 @@ impl<'ctx> Codegen<'ctx> {
                 if Self::is_flat_scalar(result_type) {
                     return self.flat_array_get(obj_val, idx, result_type);
                 }
+                // For TypeVar/Union result, use lin_array_get_tagged so the result is always
+                // a valid TaggedVal* regardless of whether the array is flat or tagged.
+                if matches!(result_type, Type::TypeVar(_) | Type::Union(_)) {
+                    let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                    let i64_ty = self.context.i64_type();
+                    let get_tagged_fn = self.get_or_declare_fn("lin_array_get_tagged",
+                        ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+                    return self.builder
+                        .build_call(get_tagged_fn, &[obj_val.into(), idx.into()], "aref_tv")
+                        .unwrap().try_as_basic_value().unwrap_basic();
+                }
 
                 let elem_ptr = self
                     .builder
@@ -5677,8 +6005,17 @@ impl<'ctx> Codegen<'ctx> {
             }
             Type::Object(_) => {
                 // Known object type: obj_val is already a LinObject*.
+                // Key might be a raw *LinString (key_ty=Str) or a TaggedVal* (key_ty=TypeVar/Union).
+                // lin_object_get expects raw *LinString — unbox if needed.
                 let key_ptr = if key_val.is_pointer_value() {
-                    key_val.into_pointer_value()
+                    let kp = key_val.into_pointer_value();
+                    if matches!(key_ty, Type::TypeVar(_) | Type::Union(_)) {
+                        // TaggedVal* — unbox to get raw LinString*
+                        self.builder.build_call(self.rt_unbox_ptr, &[kp.into()], "obj_key_ub")
+                            .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value()
+                    } else {
+                        kp
+                    }
                 } else {
                     return self.llvm_type(result_type).const_zero();
                 };
@@ -5691,10 +6028,30 @@ impl<'ctx> Codegen<'ctx> {
                     .build_call(self.rt_object_get, &[obj_ptr.into(), key_ptr.into()], "oindex_p")
                     .unwrap()
                     .try_as_basic_value().unwrap_basic().into_pointer_value();
-                // For TypeVar/Union result, entry_ptr IS a TaggedVal* — return it directly.
-                // lin_object_get returns null ptr on missing key, which represents Null.
-                if matches!(result_type, Type::TypeVar(_) | Type::Union(_)) {
-                    return entry_ptr.into();
+                // For TypeVar/Union/Null result, entry_ptr IS a TaggedVal*.
+                // lin_object_get returns null for missing keys — box as TAG_NULL so callers
+                // always receive a valid TaggedVal* (null raw ptr causes crashes downstream).
+                // Null result_type means the key was not in the static schema (e.g. Object({})["x"]),
+                // but the object may have been populated dynamically — do a runtime lookup.
+                if matches!(result_type, Type::TypeVar(_) | Type::Union(_) | Type::Null) {
+                    let llvm_fn_inner = fn_ctx.llvm_fn;
+                    let is_null_e = self.builder.build_is_null(entry_ptr, "entry_is_null").unwrap();
+                    let found_block = self.context.append_basic_block(llvm_fn_inner, "obj_load");
+                    let null_block_e = self.context.append_basic_block(llvm_fn_inner, "obj_enull");
+                    let merge_block_e = self.context.append_basic_block(llvm_fn_inner, "obj_emrg");
+                    let ptr_ty_e = self.context.ptr_type(AddressSpace::default());
+                    self.builder.build_conditional_branch(is_null_e, null_block_e, found_block).unwrap();
+                    self.builder.position_at_end(found_block);
+                    self.builder.build_unconditional_branch(merge_block_e).unwrap();
+                    self.builder.position_at_end(null_block_e);
+                    let boxnull = self.builder
+                        .build_call(self.rt_box_null, &[], "boxnull_miss")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+                    self.builder.build_unconditional_branch(merge_block_e).unwrap();
+                    self.builder.position_at_end(merge_block_e);
+                    let phi_e = self.builder.build_phi(ptr_ty_e, "obj_ephi_e").unwrap();
+                    phi_e.add_incoming(&[(&entry_ptr, found_block), (&boxnull, null_block_e)]);
+                    return phi_e.as_basic_value();
                 }
                 // For concrete types, guard against null before loading payload.
                 let is_null = self.builder.build_is_null(entry_ptr, "entry_is_null").unwrap();
@@ -5730,6 +6087,40 @@ impl<'ctx> Codegen<'ctx> {
                 } else {
                     None
                 };
+                // When the key is statically typed as String, it's a raw *LinString (not TaggedVal).
+                // Skip runtime tag dispatch and call lin_object_get directly.
+                if matches!(key_ty, Type::Str) && key_val.is_pointer_value() {
+                    let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                    let llvm_fn = fn_ctx.llvm_fn;
+                    let obj_tag = self.builder
+                        .build_call(self.rt_get_tag, &[tagged_ptr.into()], "tv_obj_tag_s")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                    let is_obj = self.builder
+                        .build_int_compare(IntPredicate::EQ, obj_tag,
+                            self.context.i8_type().const_int(7, false), "tv_is_obj_s").unwrap();
+                    let obj_ok  = self.context.append_basic_block(llvm_fn, "tv_obj_ok_s");
+                    let obj_no  = self.context.append_basic_block(llvm_fn, "tv_obj_no_s");
+                    let obj_mrg = self.context.append_basic_block(llvm_fn, "tv_obj_mrg_s");
+                    self.builder.build_conditional_branch(is_obj, obj_ok, obj_no).unwrap();
+                    self.builder.position_at_end(obj_ok);
+                    let obj_ptr = self.builder.build_call(self.rt_unbox_ptr, &[tagged_ptr.into()], "tv_obj_p_s")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+                    let entry = self.builder
+                        .build_call(self.rt_object_get, &[obj_ptr.into(), key_val.into()], "tv_sentry_s")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+                    self.builder.build_unconditional_branch(obj_mrg).unwrap();
+                    self.builder.position_at_end(obj_no);
+                    let null_res = ptr_ty.const_null();
+                    self.builder.build_unconditional_branch(obj_mrg).unwrap();
+                    self.builder.position_at_end(obj_mrg);
+                    let phi = self.builder.build_phi(ptr_ty, "tv_str_res_s").unwrap();
+                    phi.add_incoming(&[(&entry, obj_ok), (&null_res, obj_no)]);
+                    let result_ptr = phi.as_basic_value().into_pointer_value();
+                    if matches!(result_type, Type::TypeVar(_) | Type::Union(_)) {
+                        return result_ptr.into();
+                    }
+                    return self.load_tagged_val_payload(result_ptr, result_type, &obj_ty);
+                }
                 // Pointer-key case: check key tag at runtime to distinguish int from string.
                 if key_val.is_pointer_value() && int_key_opt.is_none() {
                     let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
@@ -6094,7 +6485,20 @@ impl<'ctx> Codegen<'ctx> {
 
             // Arm body
             self.builder.position_at_end(body_block);
-            let body_val = self.compile_expr(&arm.body, fn_ctx);
+            let body_val_raw = self.compile_expr(&arm.body, fn_ctx);
+            let arm_ty = arm.body.ty();
+            let result_is_union = Self::is_union_type(result_type);
+            let body_val = if result_is_union && !Self::is_union_type(&arm_ty) && !matches!(arm_ty, Type::Never) {
+                // Result is TaggedVal* but arm produced a concrete type — box it.
+                self.box_value(body_val_raw, &arm_ty)
+            } else if !result_is_union && Self::is_union_type(&arm_ty) && !matches!(arm_ty, Type::Never) {
+                // Result is concrete but arm produced TaggedVal* — unbox/coerce.
+                self.coerce_typevar(body_val_raw, &arm_ty, result_type)
+            } else if body_val_raw.get_type() == result_llvm_ty {
+                body_val_raw
+            } else {
+                result_llvm_ty.const_zero()
+            };
             let body_end = self.builder.get_insert_block().unwrap();
             if !body_end.get_terminator().is_some() {
                 self.builder.build_unconditional_branch(merge_block).unwrap();
@@ -6201,6 +6605,18 @@ impl<'ctx> Codegen<'ctx> {
                         .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
                     let is_obj = self.builder.build_int_compare(inkwell::IntPredicate::EQ, actual_tag, tag_obj, "is_obj").unwrap();
                     // Only proceed if tag matches; otherwise return false immediately.
+                    // Pre-allocate allocas for each binding slot BEFORE the branch so they
+                    // dominate all successor blocks (including merge_block where guards run).
+                    // Field values are stored as TaggedVal* (ptr) in the alloca.
+                    let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                    let binding_allocas: std::collections::HashMap<usize, inkwell::values::PointerValue<'ctx>> = fields.iter()
+                        .filter_map(|pf| pf.binding_slot.map(|slot| {
+                            let alloc = self.builder.build_alloca(ptr_ty, "has_bind").unwrap();
+                            self.builder.build_store(alloc, ptr_ty.const_null()).unwrap();
+                            (slot, alloc)
+                        }))
+                        .collect();
+
                     let then_block = self.context.append_basic_block(fn_ctx.llvm_fn, "obj_has_check");
                     let else_block = self.context.append_basic_block(fn_ctx.llvm_fn, "obj_not_obj");
                     let merge_block = self.context.append_basic_block(fn_ctx.llvm_fn, "obj_has_merge");
@@ -6239,25 +6655,22 @@ impl<'ctx> Codegen<'ctx> {
                                 let eq_bool = eq_result.into_int_value();
                                 all_ok = self.builder.build_and(all_ok, eq_bool, "all_ok_v").unwrap();
                             }
+                            self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
                         }
                     }
 
-                    // Bind field values.
+                    // Store field TaggedVal* values into pre-allocated allocas.
                     for pf in fields {
                         if let Some(binding_slot) = pf.binding_slot {
-                            let key_str = self.compile_string_lit(&pf.key).into_pointer_value();
-                            let entry_ptr = self.builder
-                                .build_call(self.rt_object_get, &[unboxed.into(), key_str.into()], "fget_p")
-                                .unwrap()
-                                .try_as_basic_value().unwrap_basic().into_pointer_value();
-                            // For TypeVar-typed bindings, bind the TaggedVal* directly
-                            // so callers can read the tag and dispatch at runtime.
-                            let field_val: BasicValueEnum = if matches!(pf.ty, Type::TypeVar(_)) {
-                                entry_ptr.into()
-                            } else {
-                                self.load_tagged_val_payload(entry_ptr, &pf.ty, scrut_ty)
-                            };
-                            fn_ctx.slots.insert(binding_slot, SlotStorage::Value(field_val));
+                            if let Some(&alloc) = binding_allocas.get(&binding_slot) {
+                                let key_str = self.compile_string_lit(&pf.key).into_pointer_value();
+                                let entry_ptr = self.builder
+                                    .build_call(self.rt_object_get, &[unboxed.into(), key_str.into()], "fget_p")
+                                    .unwrap()
+                                    .try_as_basic_value().unwrap_basic();
+                                self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
+                                self.builder.build_store(alloc, entry_ptr).unwrap();
+                            }
                         }
                     }
 
@@ -6267,6 +6680,16 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.position_at_end(merge_block);
                     let phi = self.builder.build_phi(self.context.bool_type(), "obj_match").unwrap();
                     phi.add_incoming(&[(&all_ok, then_end), (&self.context.bool_type().const_int(0, false), else_block)]);
+                    // Register binding slots as Value(loaded ptr) — load from alloca here so the
+                    // loaded value dominates all uses in merge_block and beyond.
+                    for pf in fields {
+                        if let Some(binding_slot) = pf.binding_slot {
+                            if let Some(&alloc) = binding_allocas.get(&binding_slot) {
+                                let loaded = self.builder.build_load(ptr_ty, alloc, "has_fld").unwrap();
+                                fn_ctx.slots.insert(binding_slot, SlotStorage::Value(loaded));
+                            }
+                        }
+                    }
                     return phi.as_basic_value().into_int_value();
                 } else if scrut_val.is_pointer_value() {
                     scrut_val.into_pointer_value()
@@ -6297,6 +6720,7 @@ impl<'ctx> Codegen<'ctx> {
                             let eq_result = self.compile_eq(field_val, expected_val, &pat_ty, false);
                             all_ok = self.builder.build_and(all_ok, eq_result.into_int_value(), "all_ok_v").unwrap();
                         }
+                        self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
                     }
                 }
 
@@ -6308,6 +6732,7 @@ impl<'ctx> Codegen<'ctx> {
                             .build_call(self.rt_object_get, &[obj_ptr.into(), key_str.into()], "fget_p")
                             .unwrap()
                             .try_as_basic_value().unwrap_basic().into_pointer_value();
+                        self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
                         let field_val: BasicValueEnum = if matches!(pf.ty, Type::TypeVar(_)) {
                             entry_ptr.into()
                         } else {
@@ -6636,6 +7061,7 @@ impl<'ctx> Codegen<'ctx> {
                                     let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
                                     let tagged = self.build_tagged_val_alloca(&val, &val_ty);
                                     self.builder.build_call(self.rt_object_set, &[obj_ptr.into(), key_str.into(), tagged.into()], "").unwrap();
+                                    self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
                                 }
                             }
                             let _ = ty;
@@ -6879,6 +7305,7 @@ impl<'ctx> Codegen<'ctx> {
             let key_str = self.compile_string_lit(field).into_pointer_value();
             let tagged = self.builder.build_call(self.rt_object_get, &[obj.into(), key_str.into()], "ir_fget")
                 .unwrap().try_as_basic_value().unwrap_basic();
+            self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
             self.unbox_tagged_val_to_type(tagged, result_ty)
         } else { ptr_ty.const_null().into() }
     }
@@ -6906,6 +7333,7 @@ impl<'ctx> Codegen<'ctx> {
             let key_str = self.compile_string_lit(field).into_pointer_value();
             let has_i8 = self.builder.build_call(obj_has_fn, &[val.into(), key_str.into()], "ir_has")
                 .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+            self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
             let has_bool = self.builder.build_int_truncate_or_bit_cast(has_i8, self.context.bool_type(), "has_b").unwrap();
             result = self.builder.build_and(result, has_bool, "has_acc").unwrap();
         }

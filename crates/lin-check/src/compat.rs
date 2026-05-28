@@ -99,15 +99,18 @@ pub fn is_compatible_env(
 
         // Function compatibility: contravariant params, covariant return
         (
-            Type::Function {
-                params: vp,
-                ret: vr,
-            },
-            Type::Function {
-                params: tp,
-                ret: tr,
-            },
+            Type::Function { params: vp, ret: vr },
+            Type::Function { params: tp, ret: tr },
         ) => {
+            // Opaque `Function` annotation: all params are TypeVar(MAX) and ret is TypeVar(MAX).
+            // Treat as accepting any function regardless of arity.
+            let is_opaque_target = tp.iter().all(|p| matches!(p, Type::TypeVar(_)))
+                && matches!(tr.as_ref(), Type::TypeVar(_));
+            let is_opaque_value = vp.iter().all(|p| matches!(p, Type::TypeVar(_)))
+                && matches!(vr.as_ref(), Type::TypeVar(_));
+            if is_opaque_target || is_opaque_value {
+                return true;
+            }
             if vp.len() != tp.len() {
                 return false;
             }

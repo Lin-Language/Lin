@@ -139,10 +139,17 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
     let bv = b as *const TaggedVal;
     let at = if av.is_null() { TAG_NULL } else { (*av).tag };
     let bt = if bv.is_null() { TAG_NULL } else { (*bv).tag };
+    if at == TAG_NULL && bt == TAG_NULL { return 1; }
+    if at == TAG_NULL || bt == TAG_NULL { return 0; }
+    let ap = (*av).payload;
+    let bp = (*bv).payload;
+    // Cross-numeric equality: compare numeric types by value (Int32 == Int64 if same numeric value).
+    let at_is_num = at >= TAG_INT32 && at <= TAG_FLOAT64;
+    let bt_is_num = bt >= TAG_INT32 && bt <= TAG_FLOAT64;
+    if at_is_num && bt_is_num && at != bt {
+        return (tagged_as_f64(at, ap) == tagged_as_f64(bt, bp)) as u8;
+    }
     if at != bt { return 0; }
-    if at == TAG_NULL { return 1; }
-    let ap = if av.is_null() { 0u64 } else { (*av).payload };
-    let bp = if bv.is_null() { 0u64 } else { (*bv).payload };
     match at {
         TAG_BOOL => (ap == bp) as u8,
         TAG_INT32 => ((ap as i32) == (bp as i32)) as u8,
@@ -165,6 +172,55 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
             crate::array::lin_array_eq(aa, ba)
         }
         _ => (ap == bp) as u8,
+    }
+}
+
+/// Ordering comparison for two TaggedVal* values. Returns -1, 0, or 1.
+/// Compares strings lexicographically; numeric types by value; other types by tag then payload.
+/// Either pointer may be null (treated as TAG_NULL, which compares less than everything else).
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_cmp(a: *const u8, b: *const u8) -> i32 {
+    let av = a as *const TaggedVal;
+    let bv = b as *const TaggedVal;
+    let at = if av.is_null() { TAG_NULL } else { (*av).tag };
+    let bt = if bv.is_null() { TAG_NULL } else { (*bv).tag };
+    let ap = if av.is_null() { 0u64 } else { (*av).payload };
+    let bp = if bv.is_null() { 0u64 } else { (*bv).payload };
+    match (at, bt) {
+        (TAG_STR, TAG_STR) => {
+            let as_ptr = ap as *const crate::string::LinString;
+            let bs_ptr = bp as *const crate::string::LinString;
+            crate::string::lin_string_cmp(as_ptr, bs_ptr)
+        }
+        (TAG_INT32, TAG_INT32) => (ap as i32).cmp(&(bp as i32)) as i32,
+        (TAG_INT64, TAG_INT64) => (ap as i64).cmp(&(bp as i64)) as i32,
+        (TAG_FLOAT32, TAG_FLOAT32) => {
+            let af = f32::from_bits(ap as u32);
+            let bf = f32::from_bits(bp as u32);
+            af.partial_cmp(&bf).map(|o| o as i32).unwrap_or(0)
+        }
+        (TAG_FLOAT64, TAG_FLOAT64) => {
+            let af = f64::from_bits(ap);
+            let bf = f64::from_bits(bp);
+            af.partial_cmp(&bf).map(|o| o as i32).unwrap_or(0)
+        }
+        // Mixed numeric: widen to f64
+        (a_tag, b_tag) if a_tag >= TAG_INT32 && a_tag <= TAG_FLOAT64 && b_tag >= TAG_INT32 && b_tag <= TAG_FLOAT64 => {
+            let af = tagged_as_f64(at, ap);
+            let bf = tagged_as_f64(bt, bp);
+            af.partial_cmp(&bf).map(|o| o as i32).unwrap_or(0)
+        }
+        _ => at.cmp(&bt) as i32,
+    }
+}
+
+pub(crate) unsafe fn tagged_as_f64(tag: u8, payload: u64) -> f64 {
+    match tag {
+        TAG_INT32 => (payload as i32) as f64,
+        TAG_INT64 => (payload as i64) as f64,
+        TAG_FLOAT32 => f32::from_bits(payload as u32) as f64,
+        TAG_FLOAT64 => f64::from_bits(payload),
+        _ => 0.0,
     }
 }
 

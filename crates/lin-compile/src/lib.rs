@@ -68,10 +68,12 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     let ast_module = parse_source(&source).map_err(CompileError::TypeCheck)?;
 
     // 3a. Pre-resolve imports so we know real export types before checking the main module.
+    // `import_order` preserves DFS insertion order so codegen registers dependencies first.
     let mut imported_modules: HashMap<String, TypedModule> = HashMap::new();
+    let mut import_order: Vec<String> = Vec::new();
     // import_sources holds (abs_source_path, source_text) for user-defined (non-stdlib) imports only.
     let mut import_sources: HashMap<String, (String, String)> = HashMap::new();
-    pre_resolve_imports_from_ast(&ast_module, &base_dir, &mut imported_modules, &mut import_sources)?;
+    pre_resolve_imports_from_ast(&ast_module, &base_dir, &mut imported_modules, &mut import_order, &mut import_sources)?;
 
     // 3b. Type check main module with pre-resolved import types.
     let typed_module = check_module_with_imports(&ast_module, &imported_modules)
@@ -86,10 +88,10 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         .unwrap_or_else(|_| opts.source_path.clone());
     cg.set_source(&source_path_abs.to_string_lossy(), &source);
 
-    // Register imported modules with codegen so import slots get correct function pointers.
-    // When coverage is enabled, use register_import_with_source for user modules so their
-    // functions are instrumented and appear in the lcov report.
-    for (path, imp_module) in &imported_modules {
+    // Register imported modules with codegen in dependency order so cross-module slot
+    // resolution works correctly (dependencies must be registered before dependents).
+    for path in &import_order {
+        let imp_module = imported_modules.get(path).unwrap();
         if opts.coverage {
             if let Some((src_path, src_text)) = import_sources.get(path) {
                 cg.register_import_with_source(path, imp_module, src_path, src_text);
@@ -267,6 +269,7 @@ fn pre_resolve_imports_from_ast(
     ast_module: &Module,
     base_dir: &Path,
     cache: &mut HashMap<String, TypedModule>,
+    order: &mut Vec<String>,
     import_sources: &mut HashMap<String, (String, String)>,
 ) -> Result<(), CompileError> {
     for stmt in &ast_module.statements {
@@ -277,14 +280,14 @@ fn pre_resolve_imports_from_ast(
 
         let (ast_mod, src_text, imported_base, abs_path) = if let Some(src) = stdlib_source(path.as_str()) {
             let ast = parse_source(src).map_err(CompileError::TypeCheck)?;
-            pre_resolve_imports_from_ast(&ast, base_dir, cache, import_sources)?;
+            pre_resolve_imports_from_ast(&ast, base_dir, cache, order, import_sources)?;
             (ast, src.to_string(), base_dir.to_path_buf(), None)
         } else {
             let file_path = base_dir.join(format!("{}.lin", path));
             let src = std::fs::read_to_string(&file_path)?;
             let ast = parse_source(&src).map_err(CompileError::TypeCheck)?;
             let imported_base = file_path.parent().unwrap_or(base_dir).to_path_buf();
-            pre_resolve_imports_from_ast(&ast, &imported_base, cache, import_sources)?;
+            pre_resolve_imports_from_ast(&ast, &imported_base, cache, order, import_sources)?;
             let abs = file_path.canonicalize().unwrap_or(file_path);
             (ast, src, imported_base, Some(abs.to_string_lossy().to_string()))
         };
@@ -299,6 +302,7 @@ fn pre_resolve_imports_from_ast(
             if let Some(ap) = abs_path {
                 import_sources.entry(path.clone()).or_insert((ap, src_text));
             }
+            order.push(path.clone());
             cache.insert(path.clone(), cached);
             continue;
         }
@@ -311,6 +315,7 @@ fn pre_resolve_imports_from_ast(
         if let Some(ap) = abs_path {
             import_sources.entry(path.clone()).or_insert((ap, src_text.clone()));
         }
+        order.push(path.clone());
         cache.insert(path.clone(), typed);
     }
     Ok(())
