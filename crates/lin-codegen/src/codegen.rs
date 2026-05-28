@@ -41,6 +41,10 @@ struct FnCtx<'ctx, 'a> {
     /// Slots whose storage holds a TaggedVal* pointer (not a concrete scalar).
     /// When LocalGet requests a narrowed concrete type from these, we must unbox.
     pointer_slots: std::collections::HashSet<usize>,
+    /// Slots for `var` bindings that are captured mutably by inner closures.
+    /// These are heap-allocated (via lin_alloc) instead of stack-allocated (alloca),
+    /// so the value survives the creating function's stack frame.
+    heap_var_slots: std::collections::HashSet<usize>,
 }
 
 struct TcoState<'ctx, 'a> {
@@ -93,9 +97,12 @@ pub struct Codegen<'ctx> {
     rt_tagged_to_string: FunctionValue<'ctx>,
     // Single-allocation multi-part string build
     rt_string_build_n: FunctionValue<'ctx>,
+    // Retain function (increment refcount)
+    rt_rc_retain: FunctionValue<'ctx>,
     // Release functions (decrement refcount, free if zero)
     rt_string_release: FunctionValue<'ctx>,
     rt_array_release: FunctionValue<'ctx>,
+    rt_object_release: FunctionValue<'ctx>,
     rt_closure_release: FunctionValue<'ctx>,
     rt_tagged_release: FunctionValue<'ctx>,
     // Cached LLVM types
@@ -252,8 +259,10 @@ impl<'ctx> Codegen<'ctx> {
             None,
         );
         // Release functions: decrement refcount, free if zero.
+        let rt_rc_retain = module.add_function("lin_rc_retain", void_type.fn_type(&[ptr_type.into()], false), None);
         let rt_string_release = module.add_function("lin_string_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let rt_array_release = module.add_function("lin_array_release", void_type.fn_type(&[ptr_type.into()], false), None);
+        let rt_object_release = module.add_function("lin_object_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let rt_closure_release = module.add_function("lin_closure_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let rt_tagged_release = module.add_function("lin_tagged_release", void_type.fn_type(&[ptr_type.into()], false), None);
 
@@ -297,8 +306,10 @@ impl<'ctx> Codegen<'ctx> {
             rt_object_eq,
             rt_tagged_to_string,
             rt_string_build_n,
+            rt_rc_retain,
             rt_string_release,
             rt_array_release,
+            rt_object_release,
             rt_closure_release,
             rt_tagged_release,
             string_ptr_type,
@@ -532,6 +543,7 @@ impl<'ctx> Codegen<'ctx> {
             env_ptr: None,
             tco: None,
             pointer_slots: std::collections::HashSet::new(),
+            heap_var_slots: std::collections::HashSet::new(),
         };
 
         // Pre-scan: forward-declare all top-level named functions so mutual
@@ -747,10 +759,106 @@ impl<'ctx> Codegen<'ctx> {
         self.context.struct_type(&[i32_ty.into(), i32_ty.into(), ptr_ty.into(), ptr_ty.into()], false)
     }
 
+    /// Collect all slots captured mutably (`var` captures) within a typed expression tree.
+    /// Stops at nested function boundaries (does not recurse into inner Function nodes
+    /// after collecting their captures, because inner functions have their own scope).
+    fn collect_mutable_capture_slots(expr: &TypedExpr, out: &mut std::collections::HashSet<usize>) {
+        match expr {
+            TypedExpr::Function { captures, body, .. } => {
+                for cap in captures {
+                    if cap.is_mutable {
+                        out.insert(cap.outer_slot);
+                    }
+                }
+                // Don't recurse deeper into the body — inner closures have their own capture lists.
+            }
+            TypedExpr::Block { stmts, expr, .. } => {
+                for s in stmts {
+                    match s {
+                        TypedStmt::Val { value, .. } | TypedStmt::Var { value, .. } => {
+                            Self::collect_mutable_capture_slots(value, out);
+                        }
+                        TypedStmt::Expr(e) => Self::collect_mutable_capture_slots(e, out),
+                        TypedStmt::Destructure { value, .. } => Self::collect_mutable_capture_slots(value, out),
+                        TypedStmt::ArrayDestructure { value, .. } => Self::collect_mutable_capture_slots(value, out),
+                        _ => {}
+                    }
+                }
+                Self::collect_mutable_capture_slots(expr, out);
+            }
+            TypedExpr::If { cond, then_br, else_br, .. } => {
+                Self::collect_mutable_capture_slots(cond, out);
+                Self::collect_mutable_capture_slots(then_br, out);
+                Self::collect_mutable_capture_slots(else_br, out);
+            }
+            TypedExpr::Call { func, args, .. } => {
+                Self::collect_mutable_capture_slots(func, out);
+                for a in args { Self::collect_mutable_capture_slots(a, out); }
+            }
+            TypedExpr::BinaryOp { left, right, .. } => {
+                Self::collect_mutable_capture_slots(left, out);
+                Self::collect_mutable_capture_slots(right, out);
+            }
+            TypedExpr::MakeArray { elements, .. } => {
+                for e in elements { Self::collect_mutable_capture_slots(e, out); }
+            }
+            TypedExpr::MakeObject { fields, spreads, .. } => {
+                for (_, v) in fields { Self::collect_mutable_capture_slots(v, out); }
+                for s in spreads { Self::collect_mutable_capture_slots(s, out); }
+            }
+            TypedExpr::Match { scrutinee, arms, .. } => {
+                Self::collect_mutable_capture_slots(scrutinee, out);
+                for arm in arms { Self::collect_mutable_capture_slots(&arm.body, out); }
+            }
+            TypedExpr::Index { object, key, .. } | TypedExpr::IndexSet { object, key, .. } => {
+                Self::collect_mutable_capture_slots(object, out);
+                Self::collect_mutable_capture_slots(key, out);
+            }
+            TypedExpr::FieldGet { object, .. } => Self::collect_mutable_capture_slots(object, out),
+            TypedExpr::LocalSet { value, .. } => Self::collect_mutable_capture_slots(value, out),
+            TypedExpr::StringInterp { parts, .. } => {
+                for p in parts {
+                    if let TypedStringPart::Expr(e) = p { Self::collect_mutable_capture_slots(e, out); }
+                }
+            }
+            TypedExpr::Is { expr, .. } | TypedExpr::Has { expr, .. } | TypedExpr::Coerce { expr, .. } => {
+                Self::collect_mutable_capture_slots(expr, out);
+            }
+            _ => {}
+        }
+    }
+
     /// True if the expression produces a freshly heap-allocated value that the caller owns.
     /// Used to decide whether to release the value after consuming it.
     fn expr_is_owned_alloc(expr: &TypedExpr) -> bool {
-        matches!(expr, TypedExpr::Call { .. } | TypedExpr::MakeArray { .. } | TypedExpr::MakeObject { .. })
+        matches!(expr,
+            TypedExpr::Call { .. }
+            | TypedExpr::MakeArray { .. }
+            | TypedExpr::MakeObject { .. }
+            | TypedExpr::StringLit { .. }
+            | TypedExpr::StringInterp { .. }
+            | TypedExpr::Function { .. }
+        )
+    }
+
+    /// True if a type is heap-allocated (has a refcount) and needs a release call.
+    fn ty_is_heap(ty: &Type) -> bool {
+        matches!(ty, Type::Str | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. })
+    }
+
+    /// Emit a type-dispatched release call for a heap-allocated value.
+    /// No-op for scalars (non-pointer LLVM values) and null pointers.
+    fn emit_release(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) {
+        if !val.is_pointer_value() { return; }
+        let ptr = val.into_pointer_value();
+        match ty {
+            Type::Str => { self.builder.build_call(self.rt_string_release, &[ptr.into()], "").unwrap(); }
+            Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => { self.builder.build_call(self.rt_array_release, &[ptr.into()], "").unwrap(); }
+            Type::Object(_) => { self.builder.build_call(self.rt_object_release, &[ptr.into()], "").unwrap(); }
+            Type::Function { .. } => { self.builder.build_call(self.rt_closure_release, &[ptr.into()], "").unwrap(); }
+            Type::TypeVar(_) | Type::Union(_) => { self.builder.build_call(self.rt_tagged_release, &[ptr.into()], "").unwrap(); }
+            _ => {} // scalars: nothing to release
+        }
     }
 
     /// Wrap a bare function pointer in a {fn_ptr, null_env} closure struct on the heap.
@@ -1125,12 +1233,18 @@ impl<'ctx> Codegen<'ctx> {
             .iter()
             .map(|(&slot, &fn_val)| (slot, SlotStorage::Value(fn_val.as_global_value().as_pointer_value().into())))
             .collect();
+        // Pre-scan to find slots for `var` bindings that are captured mutably by inner closures.
+        // These must be heap-allocated so they outlive the creating function's stack frame.
+        let mut heap_var_slots = std::collections::HashSet::new();
+        Self::collect_mutable_capture_slots(body, &mut heap_var_slots);
+
         let mut fn_ctx = FnCtx {
             slots: module_slot_storage,
             llvm_fn,
             env_ptr: None,
             tco: None,
             pointer_slots: std::collections::HashSet::new(),
+            heap_var_slots,
         };
 
         // First parameter is env_ptr for any closure (even non-capturing ones, since
@@ -1326,12 +1440,30 @@ impl<'ctx> Codegen<'ctx> {
             TypedStmt::Var { slot, value, ty, .. } => {
                 let compiled = self.compile_expr(value, fn_ctx);
                 let llvm_ty = self.llvm_type(ty);
-                let alloc = self
-                    .builder
-                    .build_alloca(llvm_ty, &format!("var_{}", slot))
-                    .unwrap();
-                self.builder.build_store(alloc, compiled).unwrap();
-                fn_ctx.slots.insert(*slot, SlotStorage::Alloca(alloc));
+                if fn_ctx.heap_var_slots.contains(slot) {
+                    // This var is captured mutably by an inner closure — heap-allocate the cell
+                    // so it outlives this function's stack frame. The Alloca pointer stored in
+                    // the slot is now a heap pointer that closures can safely hold after we return.
+                    let cell_size = llvm_ty.size_of().unwrap();
+                    let cell_size_i64 = self.builder
+                        .build_int_z_extend_or_bit_cast(cell_size, self.context.i64_type(), "cell_size")
+                        .unwrap();
+                    let cell_ptr = self.builder
+                        .build_call(self.rt_alloc, &[cell_size_i64.into()], &format!("var_cell_{}", slot))
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_pointer_value();
+                    self.builder.build_store(cell_ptr, compiled).unwrap();
+                    fn_ctx.slots.insert(*slot, SlotStorage::Alloca(cell_ptr));
+                } else {
+                    let alloc = self
+                        .builder
+                        .build_alloca(llvm_ty, &format!("var_{}", slot))
+                        .unwrap();
+                    self.builder.build_store(alloc, compiled).unwrap();
+                    fn_ctx.slots.insert(*slot, SlotStorage::Alloca(alloc));
+                }
             }
             TypedStmt::Destructure { obj_slot, value, obj_ty, fields, rest, .. } => {
                 let compiled = self.compile_expr(value, fn_ctx);
@@ -1545,7 +1677,11 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
             TypedStmt::Expr(expr) => {
-                self.compile_expr(expr, fn_ctx);
+                let val = self.compile_expr(expr, fn_ctx);
+                // Release owned heap results that are discarded by expression-statements.
+                if Self::expr_is_owned_alloc(expr) && Self::ty_is_heap(&expr.ty()) {
+                    self.emit_release(val, &expr.ty());
+                }
             }
         }
     }
@@ -1601,10 +1737,39 @@ impl<'ctx> Codegen<'ctx> {
             }
 
             TypedExpr::Block { stmts, expr, .. } => {
+                // Collect owned heap vals introduced in this block for scope-exit release.
+                let mut owned_slots: Vec<(usize, Type)> = Vec::new();
                 for s in stmts {
+                    if let TypedStmt::Val { slot, value, ty: val_ty, .. } = s {
+                        if Self::expr_is_owned_alloc(value) && Self::ty_is_heap(val_ty) {
+                            owned_slots.push((*slot, val_ty.clone()));
+                        }
+                    }
                     self.compile_stmt(s, fn_ctx);
                 }
-                self.compile_expr(expr, fn_ctx)
+                let result_slot: Option<usize> = if let TypedExpr::LocalGet { slot, .. } = expr.as_ref() {
+                    Some(*slot)
+                } else {
+                    None
+                };
+                let result = self.compile_expr(expr, fn_ctx);
+                // Release owned heap values that are not being returned.
+                // Safety: array/object construction already retained any shared references
+                // into these values, so releasing the originals here is safe.
+                for (slot, slot_ty) in &owned_slots {
+                    if result_slot == Some(*slot) { continue; }
+                    if let Some(storage) = fn_ctx.slots.get(slot) {
+                        let val = match storage {
+                            SlotStorage::Value(v) => Some(*v),
+                            SlotStorage::Closure(p) => Some((*p).into()),
+                            SlotStorage::Alloca(_) => None,
+                        };
+                        if let Some(v) = val {
+                            self.emit_release(v, slot_ty);
+                        }
+                    }
+                }
+                result
             }
 
             TypedExpr::Function { name, params, body, ret_type, captures, .. } => {
@@ -4232,6 +4397,11 @@ impl<'ctx> Codegen<'ctx> {
                 let et = elem.ty();
                 (val, et)
             };
+            // Retain shared heap values: LocalGet borrows an existing value — retain it so
+            // the array's copy and the original slot can both be released independently.
+            if !Self::expr_is_owned_alloc(elem) && Self::ty_is_heap(&elem_lin_ty) && val.is_pointer_value() {
+                self.builder.build_call(self.rt_rc_retain, &[val.into()], "").unwrap();
+            }
             self.tagged_array_push_value(arr, val, &elem_lin_ty);
         }
 
@@ -5250,6 +5420,11 @@ impl<'ctx> Codegen<'ctx> {
         for (key, val_expr) in fields.iter() {
             let val = self.compile_expr(val_expr, fn_ctx);
             let val_ty = val_expr.ty();
+            // Retain shared heap values: the object will release them in lin_object_release,
+            // so we need a matching retain for each non-fresh (LocalGet) heap value stored.
+            if !Self::expr_is_owned_alloc(val_expr) && Self::ty_is_heap(&val_ty) && val.is_pointer_value() {
+                self.builder.build_call(self.rt_rc_retain, &[val.into()], "").unwrap();
+            }
             // Compile key as a LinString.
             let key_str = self.compile_string_lit(key).into_pointer_value();
             // For TypeVar values that are already TaggedVal* (pointer), pass directly.

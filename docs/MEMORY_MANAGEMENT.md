@@ -115,9 +115,20 @@ Lin uses **pure reference counting with no cycle detection**. Reference cycles b
 | 1.4 Tactical TaggedVal box leak fix | ✅ Done | `lin-codegen/src/codegen.rs` |
 | Option A: Document cycle limitation | ✅ Done | `docs/DECISIONS.md` ADR-039 |
 
-### Phase 2 — Systematic RC emission in codegen (planned)
+### Phase 2 — Systematic RC emission in codegen (in progress)
 
-Replace ad-hoc release calls with a coverage-complete ownership model. Define owned vs. borrowed expression kinds; emit releases at scope-exit points (block end, branch end, function return); emit retains on shared use. Operates in the TypedAST → LLVM path as a foundation before Phase 3 refactors it.
+| Task | Status | Notes |
+|---|---|---|
+| `expr_is_owned_alloc` / `ty_is_heap` / `emit_release` helpers | ✅ Done | Generic dispatch by type |
+| `rt_rc_retain` / `rt_object_release` / `rt_tagged_release` declared | ✅ Done | Available for all use sites |
+| Heap-allocate `var` bindings captured mutably | ✅ Done | Fixes latent use-after-stack-frame bug |
+| Retain on array element store (non-fresh `LocalGet`) | ✅ Done | `compile_make_array` |
+| Retain on object field store (non-fresh `LocalGet`) | ✅ Done | `compile_make_object` |
+| `TypedStmt::Expr` discard release | ✅ Done | Releases discarded owned values |
+| Block scope-exit release for owned `val` bindings | ✅ Done | Releases unused owned bindings at block end |
+| Function-return release (params + locals not in return value) | 🔲 Planned | Requires retain at argument-pass sites |
+| Retain at function call sites for shared args | 🔲 Planned | Needed before function-return release |
+| `if`/`match` branch-exit release | 🔲 Planned | Same pattern as block scope-exit |
 
 Key file: `lin-codegen/src/codegen.rs`
 
