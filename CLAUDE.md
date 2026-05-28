@@ -10,11 +10,14 @@ The project has one backend:
 
 - **`lin-codegen`** — an LLVM native-code compiler (`lin build`). Goes through a full type-checking pass (`lin-check`), lowers to flat 3-address IR (`lin-ir`), then to LLVM IR via `inkwell`. Links with a small Rust static library (`lin-runtime`) to produce a standalone binary.
 
+## Process
+
+Do not work or make changes directly in the codebase. Create a subagent with a git worktree do the work there and then integrate it.
+
 ## Build / run / test
 
 ```bash
-cargo build --workspace
-cargo test --workspace                          # runs all unit + integration tests
+cargo build --workspace && cargo test --workspace   # always build first — integration tests invoke target/debug/lin as a subprocess, so a stale binary causes spurious failures
 cargo run -p lin -- build examples/hello.lin -o hello  # compile to native binary
 cargo run -p lin -- check examples/hello.lin    # type check only
 cargo run -p lin -- test stdlib/                # run stdlib test suite (*.test.lin)
