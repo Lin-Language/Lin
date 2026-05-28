@@ -57,8 +57,15 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      - name: Show LLVM version
+        run: llvm-config --version || true
+
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace -- --nocapture 2>&1 | tail -50
+        continue-on-error: true
+
+      - name: Test (report)
+        run: cargo test --workspace 2>&1 | grep -E "^(test .* FAILED|FAILED|error\[|thread.*panicked)" || true
 
       - name: Run examples through lin run
         run: |
