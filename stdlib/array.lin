@@ -333,8 +333,10 @@ export val groupBy = (arr: Json, keyFn: (Json) => String): Json =>
   for(arr, item =>
     val key = keyFn(item)
     val group = result[key]
-    if group == null then lin_object_set(result, key, [item])
-    else push(group, item)
+    if group == null then
+      lin_object_set(result, key, [item])
+    else
+      push(group, item)
   )
   result
 
@@ -342,7 +344,9 @@ export val countBy = (arr: Json, keyFn: (Json) => String): Json =>
   var result = {}
   for(arr, item =>
     val key = keyFn(item)
-    if result[key] == null then lin_object_set(result, key, 1)
-    else lin_object_set(result, key, result[key] + 1)
+    if result[key] == null then
+      lin_object_set(result, key, 1)
+    else
+      lin_object_set(result, key, result[key] + 1)
   )
   result
