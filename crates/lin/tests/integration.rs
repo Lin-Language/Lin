@@ -418,6 +418,15 @@ print(c)
 }
 
 #[test]
+fn test_if_old_syntax_error() {
+    let err = run_expect_err(r#"val x = if true
+  then "yes"
+  else "no"
+"#);
+    assert!(err.contains("same line"), "got: {}", err);
+}
+
+#[test]
 fn test_if_without_else() {
     let output = run(r#"import { print } from "std/io"
 

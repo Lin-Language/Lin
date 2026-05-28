@@ -941,6 +941,13 @@ impl Parser {
         let condition = self.parse_expr();
 
         self.skip_newlines();
+        if self.check(TokenKind::Indent) {
+            let span = self.current_span();
+            self.diagnostics.push(Diagnostic::error(
+                span,
+                "`then` must appear on the same line as the condition: `if cond then ...`".to_string(),
+            ));
+        }
         self.expect_keyword(TokenKind::Then);
         self.skip_newlines();
         let then_branch = if self.check(TokenKind::Indent) {
