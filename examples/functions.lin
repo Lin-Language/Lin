@@ -27,8 +27,7 @@ print("world".greet())
 
 // Recursion
 val factorial = (n: Int32): Int32 =>
-  if n == 0
-    then 1
-    else n * factorial(n - 1)
+  if n == 0 then 1
+  else n * factorial(n - 1)
 
 print(toString(factorial(5)))

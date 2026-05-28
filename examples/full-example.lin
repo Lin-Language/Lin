@@ -19,9 +19,8 @@ print(describeName({ "name": "Alice", "age": 25 }))
 print(describeName("Jane"))
 
 val parseAge = (input: String): Json =>
-  if input.isInt32()
-    then { "type": "success", "value": input.parseInt32() }
-    else { "type": "failure", "error": "Invalid age" }
+  if input.isInt32() then { "type": "success", "value": input.parseInt32() }
+  else { "type": "failure", "error": "Invalid age" }
 
 val result = parseAge("42")
 val message = match result

@@ -283,9 +283,8 @@ fn test_tagged_unions() {
     let output = run(r#"import { print } from "std/io"
 
 val divide = (a: Float64, b: Float64): Json =>
-  if b == 0.0
-    then { "type": "failure", "error": "div by zero" }
-    else { "type": "success", "value": a / b }
+  if b == 0.0 then { "type": "failure", "error": "div by zero" }
+  else { "type": "success", "value": a / b }
 
 val msg = match divide(10.0, 2.0)
   has { "type": "success", value } => "ok: ${value}"
@@ -409,9 +408,10 @@ val b = if false then "yes" else "no"
 print(b)
 
 val x = 10
-val c = if x > 5
-  then "big"
-  else "small"
+val c = if x > 5 then
+  "big"
+else
+  "small"
 print(c)
 "#);
     assert_eq!(output, vec!["yes", "no", "big"]);
@@ -660,13 +660,12 @@ fn test_if_block_branches() {
     let output = run(r#"import { print } from "std/io"
 
 val x = 10
-val result = if x > 5
-  then
-    val prefix = "bi"
-    "${prefix}g"
-  else
-    val prefix = "sm"
-    "${prefix}all"
+val result = if x > 5 then
+  val prefix = "bi"
+  "${prefix}g"
+else
+  val prefix = "sm"
+  "${prefix}all"
 print(result)
 "#);
     assert_eq!(output, vec!["big"]);
@@ -1119,9 +1118,8 @@ fn test_continuation_in_if_condition() {
 val age = 25
 val active = true
 val result = if age >= 18
-  && active
-  then "active adult"
-  else "other"
+  && active then "active adult"
+else "other"
 print(result)
 "#);
     assert_eq!(output, vec!["active adult"]);
@@ -1216,11 +1214,9 @@ fn test_chained_if_else() {
     let output = run(r#"import { print } from "std/io"
 
 val classify = (x: Int32): String =>
-  if x > 100
-    then "big"
-    else if x > 10
-      then "medium"
-      else "small"
+  if x > 100 then "big"
+  else if x > 10 then "medium"
+  else "small"
 
 print(classify(200))
 print(classify(50))
@@ -1363,14 +1359,12 @@ fn test_forward_reference_between_functions() {
     let output = run(r#"import { print } from "std/io"
 
 val isEvenDesc = (n: Int32): String =>
-  if n == 0
-    then "even"
-    else isOddDesc(n - 1)
+  if n == 0 then "even"
+  else isOddDesc(n - 1)
 
 val isOddDesc = (n: Int32): String =>
-  if n == 0
-    then "odd"
-    else isEvenDesc(n - 1)
+  if n == 0 then "odd"
+  else isEvenDesc(n - 1)
 
 print(isEvenDesc(4))
 print(isOddDesc(4))
@@ -1963,14 +1957,12 @@ fn test_mutual_recursion_via_forward_decl() {
 import { toString } from "std/string"
 
 val isEven = (n: Int32): Boolean =>
-  if n == 0
-    then true
-    else isOdd(n - 1)
+  if n == 0 then true
+  else isOdd(n - 1)
 
 val isOdd = (n: Int32): Boolean =>
-  if n == 0
-    then false
-    else isEven(n - 1)
+  if n == 0 then false
+  else isEven(n - 1)
 
 print(toString(isEven(4)))
 print(toString(isOdd(3)))

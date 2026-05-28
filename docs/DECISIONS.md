@@ -64,13 +64,13 @@
 
 **Consequence**: The stdlib is a mix of pure-Lin logic and thin `lin-runtime` wrappers. Adding a new runtime function requires both a `#[no_mangle] pub unsafe extern "C" fn lin_xxx` in `lin-runtime/src/` and an exported wrapper in the appropriate `stdlib/*.lin` file.
 
-## ADR-010: Multi-line if/then/else with indent consumption
+## ADR-010: Multi-line if/then/else syntax
 
-**Decision**: The parser consumes an INDENT token that may appear before `then`/`else` in multi-line if expressions, and matches a trailing DEDENT.
+**Decision**: `then` always appears on the condition line (or the last continuation line of the condition). The body follows on an indented block (INDENT … DEDENT). `else` appears at the same indent level as `if`. The parser does not consume any INDENT before `then` — it simply expects `then` after the condition expression.
 
-**Rationale**: When `if` condition is on one line and `then`/`else` are indented on subsequent lines, the lexer produces INDENT/DEDENT pairs. The parser must explicitly handle these to avoid confusing them with block boundaries.
+**Rationale**: Placing `then` at the end of the condition line is clearer and more consistent with how block-opening keywords work in other languages. The old approach of allowing `then` on its own indented line required the parser to tentatively consume an INDENT token before `then`, then emit a corresponding DEDENT, making the grammar more complex with three special-case DEDENT guards. The new rule is simpler: condition, `then`, body block, `else` at original indent, else body.
 
-**Consequence**: All three spec-defined if layouts (single-line, multi-line same indent, multi-line with block branches) parse correctly.
+**Consequence**: All spec-defined if layouts (single-line, multi-line with block body, multi-line with inline body) parse correctly. Condition continuation lines with `&&`/`||` end with `then` on the last continuation line. The `then_indented` tracking variable and its three associated DEDENT guards have been removed from `parse_if_expr`.
 
 ## ADR-011: Postfix suppression after DEDENT
 

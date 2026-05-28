@@ -27,9 +27,8 @@ print(describePerson(123))
 
 // Tagged unions
 val divide = (a: Float64, b: Float64): Json =>
-  if b == 0.0
-    then { "type": "failure", "error": "Cannot divide by zero" }
-    else { "type": "success", "value": a / b }
+  if b == 0.0 then { "type": "failure", "error": "Cannot divide by zero" }
+  else { "type": "success", "value": a / b }
 
 val result = divide(10.0, 2.0)
 val message = match result

@@ -32,14 +32,13 @@ export val resolve = (p: String): String =>
 
 export val join = (parts: String[]): String =>
   val n = lin_length(parts)
-  if n == 0
-    then ""
-    else
-      var result = parts[0]
-      lin_for(lin_range(1, n), i =>
-        result = lin_path_join2(result, parts[i])
-      )
-      normalize(result)
+  if n == 0 then ""
+  else
+    var result = parts[0]
+    lin_for(lin_range(1, n), i =>
+      result = lin_path_join2(result, parts[i])
+    )
+    normalize(result)
 
 export val split = (p: String): String[] =>
   lin_string_split(p, "/")

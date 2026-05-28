@@ -8,10 +8,9 @@ import { range } from "std/array"
 
 val parseStudent = (line: String): Json =>
   val parts = line.split(",")
-  if length(parts) < 2
-    then { "type": "failure", "error": "insufficient fields: ${line}" }
-    else
-      val name = parts[0].trim()
+  if length(parts) < 2 then { "type": "failure", "error": "insufficient fields: ${line}" }
+  else
+    val name = parts[0].trim()
       val scoreStrs = parts[1].trim().split(";")
       val scores = scoreStrs.filter(s => s.trim().isInt32()).map(s => s.trim().parseInt32())
       { "type": "success", "value": { "name": name, "scores": scores } }
@@ -66,12 +65,11 @@ val failures = parsed
   .filter(r => r["type"] == "failure")
   .map(r => r["error"])
 
-if length(failures) > 0
-  then
-    print("")
-    print("Warnings:")
-    failures.for(e => print("  - ${e}"))
-  else null
+if length(failures) > 0 then
+  print("")
+  print("Warnings:")
+  failures.for(e => print("  - ${e}"))
+else null
 
 // ===== Functional Composition =====
 print("")

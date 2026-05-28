@@ -723,30 +723,29 @@ Three layout forms are supported:
 // Single-line
 val a = if cond then x else y
 
-// then/else on subsequent lines, one block deeper than `if`
-val b = if cond
-  then x
-  else y
+// then at end of condition line, body indented, else at if-level
+val b = if cond then
+  x
+else
+  y
 
-// Block branches, also one block deeper than `if`
-val c = if cond
-  then
-    val prefix = "ad"
-    "${prefix}ult"
-  else
-    val prefix = "ch"
-    "${prefix}ild"
+// Block branches
+val c = if cond then
+  val prefix = "ad"
+  "${prefix}ult"
+else
+  val prefix = "ch"
+  "${prefix}ild"
 ```
 
-`then` and `else` must be at the same indent level — exactly one indent level deeper than the column of `if`.
+`then` always appears on the condition line (or the last continuation line of the condition). `else` is at the same indent level as `if`.
 
 A logical line that begins an `if` may continue using `&&` or `||` as described in §3.2:
 
 ```txt
 val label = if person["age"] >= 18
-  && person["active"]
-  then "active adult"
-  else "other"
+  && person["active"] then "active adult"
+else "other"
 ```
 
 ### 12.1 Nested `if` Inside `match`
@@ -756,15 +755,14 @@ val label = if person["age"] >= 18
 ```txt
 match input
   has { name } =>
-    if name == "Dave"
-      then "Big Dave!"
-      else "regular ${name}"
+    if name == "Dave" then "Big Dave!"
+    else "regular ${name}"
 
   else =>
     "no name"
 ```
 
-The inner `if`'s `else` is at column 6 (under `then`); the outer `match`'s `else` is at column 2 (under `has`). No ambiguity.
+The inner `if`'s `else` is at the same indent as the `if` itself; the outer `match`'s `else` is at the top match-arm level. No ambiguity.
 
 ## 13. `is` and `has` Expressions
 

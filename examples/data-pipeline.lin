@@ -11,11 +11,9 @@ import { map, filter, reduce, for } from "std/array"
 // - Safe bracket access and null propagation
 
 val parseRecord = (raw: Json): Json =>
-  if raw["name"] is Null
-    then { "type": "failure", "error": "missing name" }
-    else if raw["age"] is Null
-      then { "type": "failure", "error": "missing age" }
-      else { "type": "success", "value": { "name": raw["name"], "age": raw["age"] } }
+  if raw["name"] is Null then { "type": "failure", "error": "missing name" }
+  else if raw["age"] is Null then { "type": "failure", "error": "missing age" }
+  else { "type": "success", "value": { "name": raw["name"], "age": raw["age"] } }
 
 val formatResult = (result: Json): String =>
   match result

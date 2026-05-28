@@ -1,14 +1,12 @@
 import { suite, test, expect, run, toBe, toBeNull, toSatisfy, toSucceed, toFail, toFailWith } from "std/test"
 
 val divide = (a: Float64, b: Float64): Json =>
-  if b == 0.0
-    then { "type": "failure", "error": "division by zero" }
-    else { "type": "success", "value": a / b }
+  if b == 0.0 then { "type": "failure", "error": "division by zero" }
+  else { "type": "success", "value": a / b }
 
 val safeSqrt = (x: Float64): Json =>
-  if x < 0.0
-    then { "type": "failure", "error": "negative input" }
-    else { "type": "success", "value": x }
+  if x < 0.0 then { "type": "failure", "error": "negative input" }
+  else { "type": "success", "value": x }
 
 suite("std/result", [
   test("toSucceed passes on success shape", () =>

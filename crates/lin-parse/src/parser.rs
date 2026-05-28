@@ -940,26 +940,15 @@ impl Parser {
         self.skip_newlines();
         let condition = self.parse_expr();
 
-        // then branch - skip indentation that may precede then/else
-        self.skip_newlines();
-        let then_indented = self.check(TokenKind::Indent);
-        if then_indented {
-            self.advance();
-        }
         self.skip_newlines();
         self.expect_keyword(TokenKind::Then);
         self.skip_newlines();
         let then_branch = if self.check(TokenKind::Indent) {
-            self.parse_block()
+            self.parse_block()   // consumes INDENT … DEDENT
         } else {
             self.parse_expr()
         };
 
-        // else branch (optional — implicit `else null` widens result to T | Null)
-        self.skip_newlines();
-        if self.check(TokenKind::Dedent) && !then_indented {
-            self.advance();
-        }
         self.skip_newlines();
         let else_branch = if self.check(TokenKind::Else) {
             self.advance();
@@ -974,12 +963,6 @@ impl Parser {
         } else {
             Expr::NullLit(span)
         };
-
-        // Consume trailing dedent if we consumed a leading indent
-        self.skip_newlines();
-        if then_indented && self.check(TokenKind::Dedent) {
-            self.advance();
-        }
 
         Expr::If {
             condition: Box::new(condition),

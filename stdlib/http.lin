@@ -32,8 +32,7 @@ export val fetchWith = (url: String, options: Json): Json =>
 
 export val fetchJson = (url: String): Json =>
   val response = lin_http_fetch(url)
-  if response["type"] == "error"
-  then response
+  if response["type"] == "error" then response
   else lin_parse_json(response["body"])
 
 export val postJson = (url: String, body: Json): Json =>
