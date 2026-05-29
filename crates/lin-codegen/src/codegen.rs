@@ -3222,7 +3222,11 @@ impl<'ctx> Codegen<'ctx> {
                     };
                     return self.builder.build_int_compare(pred, ord, zero, "ir_tcmp_b").unwrap().into();
                 }
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                | BinOp::BAnd | BinOp::BOr | BinOp::BXor | BinOp::Shl | BinOp::Shr => {
+                    // Bitwise/shift ops are integer-only (checker-enforced); a boxed union
+                    // operand (e.g. a TypeVar reduce-lambda param) must be unboxed to the
+                    // concrete integer type before the LLVM int op, same as arithmetic.
                     let lconc = self.unbox_tagged_val_to_type(lv, &Type::Int32);
                     let rconc = if rv.is_pointer_value() { self.unbox_tagged_val_to_type(rv, &Type::Int32) } else { rv };
                     let concrete = self.compile_binary_op_values(lconc, rconc, op, &Type::Int32, &Type::Int32, &Type::Int32);

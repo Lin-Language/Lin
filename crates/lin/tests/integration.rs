@@ -2238,6 +2238,22 @@ print(toString(header & 0x1F))
 }
 
 #[test]
+fn test_bitwise_boxed_operands() {
+    // Bitwise ops on reduce-lambda params, which arrive boxed (TypeVar). The boxed
+    // operand must be unboxed before the LLVM int op — regression for a panic where
+    // `.into_int_value()` was called on a pointer value.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { reduce } from "std/array"
+
+print(toString([1, 2, 4, 8].reduce(0, (acc, x) => acc | x)))
+print(toString([15, 7, 3].reduce(255, (acc, x) => acc & x)))
+print(toString([1, 2, 3].reduce(1, (acc, x) => acc << x)))
+"#);
+    assert_eq!(output, vec!["15", "3", "64"]);
+}
+
+#[test]
 fn test_bitwise_xor_precedence() {
     // `^` binds between `&` and `|`:  1 | 6 ^ 3 & 2  ==  1 | (6 ^ (3 & 2))  ==  1 | (6 ^ 2)  ==  1 | 4  ==  5
     let output = run(r#"import { print } from "std/io"
