@@ -8289,6 +8289,22 @@ impl<'ctx> Codegen<'ctx> {
             let rf = to_f(self, rv);
             return self.compile_binary_op_values(lf, rf, op, &Type::Float64, result_ty);
         }
+        // Mismatched integer widths (e.g. Int64 `n` vs an Int32 literal `0`): sign-extend
+        // the narrower operand to the wider so the ICmp/arith operands agree.
+        if lv.is_int_value() && rv.is_int_value() {
+            let lw = lv.into_int_value().get_type().get_bit_width();
+            let rw = rv.into_int_value().get_type().get_bit_width();
+            if lw != rw && lw > 1 && rw > 1 {
+                let wide = if lw > rw { lv.into_int_value().get_type() } else { rv.into_int_value().get_type() };
+                let lext = if lw < wide.get_bit_width() {
+                    self.builder.build_int_s_extend(lv.into_int_value(), wide, "ir_lext").unwrap()
+                } else { lv.into_int_value() };
+                let rext = if rw < wide.get_bit_width() {
+                    self.builder.build_int_s_extend(rv.into_int_value(), wide, "ir_rext").unwrap()
+                } else { rv.into_int_value() };
+                return self.compile_binary_op_values(lext.into(), rext.into(), op, lty, result_ty);
+            }
+        }
         // When operands are boxed (Json/union), use tagged runtime ops for equality and
         // ordering (which tolerate mixed/null payloads), and unbox to a concrete numeric
         // type for arithmetic. Mirrors the AST path's TypeVar handling in compile_binary_op.

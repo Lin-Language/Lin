@@ -439,6 +439,26 @@ fn expr_is_fresh_alloc(expr: &TypedExpr) -> bool {
     matches!(expr, TypedExpr::Function { .. } | TypedExpr::Call { .. })
 }
 
+/// Coerce a call argument to the callee's declared parameter type: box a concrete value
+/// for a Json/union param, OR widen/narrow a numeric mismatch (e.g. an Int32 literal `0`
+/// passed to an Int64 param) so the call signature matches.
+fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: &mut FuncBuilder) -> Temp {
+    let Some(param_ty) = param_ty else { return arg; };
+    // Box/unbox across the union boundary.
+    if is_union_ty(param_ty) != is_union_ty(arg_ty) {
+        let dst = builder.alloc_temp(param_ty.clone());
+        builder.emit(Instruction::Coerce { dst, src: arg, from_ty: arg_ty.clone(), to_ty: param_ty.clone() });
+        return dst;
+    }
+    // Numeric width/kind mismatch between two concrete numeric types.
+    if arg_ty.is_numeric() && param_ty.is_numeric() && arg_ty != param_ty {
+        let dst = builder.alloc_temp(param_ty.clone());
+        builder.emit(Instruction::Coerce { dst, src: arg, from_ty: arg_ty.clone(), to_ty: param_ty.clone() });
+        return dst;
+    }
+    arg
+}
+
 /// Box a concrete argument when the callee's parameter is a Json/union type.
 /// Emits a `Coerce` (which codegen lowers to `build_tagged_val_alloca`) and returns the
 /// boxed temp; otherwise returns the argument temp unchanged. Mirrors the AST path's
@@ -952,10 +972,9 @@ fn lower_call(
                 .enumerate()
                 .map(|(i, a)| {
                     let t = lower_expr(a, builder, ctx);
-                    let param_ty = param_tys.get(i);
-                    let boxed = lower_box_for_param(t, &a.ty(), param_ty, builder);
-                    retain_call_arg(boxed, &a.ty(), expr_is_fresh_alloc(a), builder);
-                    boxed
+                    let arg = lower_coerce_arg(t, &a.ty(), param_tys.get(i), builder);
+                    retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
+                    arg
                 })
                 .collect();
             let dst = builder.alloc_temp(result_type.clone());
@@ -981,10 +1000,9 @@ fn lower_call(
                 .enumerate()
                 .map(|(i, a)| {
                     let t = lower_expr(a, builder, ctx);
-                    let param_ty = param_tys.get(i);
-                    let boxed = lower_box_for_param(t, &a.ty(), param_ty, builder);
-                    retain_call_arg(boxed, &a.ty(), expr_is_fresh_alloc(a), builder);
-                    boxed
+                    let arg = lower_coerce_arg(t, &a.ty(), param_tys.get(i), builder);
+                    retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
+                    arg
                 })
                 .collect();
             if is_tail {
