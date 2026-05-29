@@ -56,6 +56,17 @@ fn binop_symbol(op: &BinOp) -> &'static str {
         BinOp::GtEq => ">=",
         BinOp::And => "&&",
         BinOp::Or => "||",
+        BinOp::BAnd => "&",
+        BinOp::BOr => "|",
+        BinOp::BXor => "^",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
+    }
+}
+
+fn unaryop_symbol(op: &UnaryOp) -> &'static str {
+    match op {
+        UnaryOp::BNot => "~",
     }
 }
 
@@ -205,6 +216,7 @@ fn is_atomic(expr: &Expr) -> bool {
         | Expr::Ident(..)
         | Expr::StringInterp(..) => true,
         Expr::BinaryOp { left, right, .. } => is_atomic(left) && is_atomic(right),
+        Expr::UnaryOp { operand, .. } => is_atomic(operand),
         Expr::Index { object, key, .. } => is_atomic(object) && is_atomic(key),
         Expr::Call { func, args, .. } => {
             is_atomic(func) && args.iter().all(is_atomic)
@@ -247,6 +259,9 @@ fn fmt_inline(expr: &Expr) -> String {
         Expr::StringInterp(parts, _) => fmt_interp(parts),
         Expr::BinaryOp { left, op, right, .. } => {
             format!("{} {} {}", fmt_inline(left), binop_symbol(op), fmt_inline(right))
+        }
+        Expr::UnaryOp { op, operand, .. } => {
+            format!("{}{}", unaryop_symbol(op), fmt_inline(operand))
         }
         Expr::Call { func, args, .. } => {
             let fs = fmt_inline(func);
@@ -450,6 +465,9 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
                 binop_symbol(op),
                 fmt_expr(right, false, ind)
             )
+        }
+        Expr::UnaryOp { op, operand, .. } => {
+            format!("{}{}", unaryop_symbol(op), fmt_expr(operand, false, ind))
         }
         Expr::Assign { target, value, .. } => {
             format!("{} = {}", target, fmt_expr(value, false, ind))

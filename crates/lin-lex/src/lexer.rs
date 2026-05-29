@@ -523,7 +523,7 @@ impl Lexer {
                     self.pos += 1;
                     TokenKind::And
                 } else {
-                    TokenKind::Ident("&".to_string())
+                    TokenKind::Amp
                 }
             }
             '|' => {
@@ -534,6 +534,8 @@ impl Lexer {
                     TokenKind::Pipe
                 }
             }
+            '^' => TokenKind::Caret,
+            '~' => TokenKind::Tilde,
             _ => TokenKind::Ident(ch.to_string()),
         };
         Token::new(kind, self.span(start, self.pos))

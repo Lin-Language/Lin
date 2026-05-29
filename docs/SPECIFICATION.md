@@ -206,7 +206,7 @@ There is no unary minus operator on arbitrary expressions in this version of the
 val negated = 0 - x
 ```
 
-There are no other unary operators in v1.
+The only unary operator is bitwise `~` (§35.2); there is no unary minus.
 
 ## 4. Values
 
@@ -1357,13 +1357,16 @@ Closures capture bindings from their defining scope. Mutable bindings are captur
 +   -   *   /   %
 ==  !=  >   <   >=  <=
 &&  ||
+&   |   ^   <<  >>  ~      (bitwise — see §35.2)
 ```
 
 These are built-in operators, not ordinary functions. They are not available through dot application or partial application.
 
 `+` operates only on numeric types. String building uses interpolation (`"${a}${b}"`) — see §3.5.2.
 
-There are no unary operators in v1 (see §3.7 for negative literals). Boolean negation must be done explicitly:
+The bitwise operators `&`, `|`, `^`, `<<`, `>>` require integer operands; `~` is unary. They are specified in §35.2. In type-expression position `|` remains the union separator (§8.4); the two never overlap syntactically.
+
+The **only** unary operator is bitwise `~` (§35.2). There is no unary minus (see §3.7 for negative literals) and no boolean negation operator; boolean negation must be done explicitly:
 
 ```txt
 val notReady = ready == false
@@ -1374,16 +1377,21 @@ val notReady = ready == false
 Precedence follows the standard convention used by C-family languages, from highest to lowest:
 
 ```txt
-1. ()  []  .          (call, index, dot application)
-2. *  /  %
-3. +  -
-4. <  <=  >  >=
-5. ==  !=
-6. &&
-7. ||
+1.  ()  []  .          (call, index, dot application)
+2.  ~                  (unary bitwise not)
+3.  *  /  %
+4.  +  -
+5.  <<  >>             (bitwise shift)
+6.  <  <=  >  >=
+7.  ==  !=
+8.  &                  (bitwise and)
+9.  ^                  (bitwise xor)
+10. |                  (bitwise or)
+11. &&
+12. ||
 ```
 
-All binary arithmetic and comparison operators are left-associative. `&&` and `||` are left-associative and short-circuiting.
+All binary arithmetic, comparison, and bitwise operators are left-associative. `&&` and `||` are left-associative and short-circuiting.
 
 ## 25. Type Narrowing
 
@@ -2220,3 +2228,142 @@ The `lin build` command must be given the path to the compiled `.a` or `.so` fil
 ### 34.6 Static Analysis
 
 The type checker treats every foreign binding as having the declared type and performs no further checking of the library contents. Foreign signatures participate in the normal type system — the declared argument and return types are enforced at every call site in Lin code.
+
+## 35. Low-Level Primitives
+
+Lin's domain includes low-level systems code (binary protocols, byte parsing, sockets, subprocesses). This section specifies the primitives that make such code expressible: byte buffers, bitwise operators, and a small family of OS intrinsics. They follow the existing conventions — opaque scalar handles, the `T | Error` result shape, and stdlib wrappers over Rust intrinsics — and introduce no new runtime *kinds* beyond what the unboxed-array and FFI machinery already provide.
+
+### 35.1 Byte Buffers and Small-Integer Arrays
+
+The small integer families `Int8`, `UInt8`, `Int16`, `UInt16` have an unboxed, contiguous array representation, exactly like `Int32`/`Int64`/`Float32`/`Float64` (§27.4). An array typed `UInt8[]` is a packed byte buffer — one byte per element, no per-element tag.
+
+```txt
+val packet: UInt8[] = [0u8, 1u8, 255u8]
+val b = packet[0]            // UInt8
+packet[1] = 42u8             // in-place write (§6, index assignment)
+val n = length(packet)       // Int32
+```
+
+These arrays support every array operation (literals, indexing, in-place index assignment, `length`, `push`, the `std/array` combinators, equality). The representation is an implementation detail; semantically they are ordinary `T[]` arrays whose element type happens to be a small integer.
+
+### 35.2 Bitwise Operators
+
+Lin provides the bitwise binary operators and one unary operator:
+
+```txt
+&    bitwise and
+|    bitwise or        (value position; in type position `|` is the union separator)
+^    bitwise xor
+<<   left shift
+>>   right shift       (logical for unsigned types, arithmetic for signed)
+~    bitwise not       (unary)
+```
+
+`~` is the **only** unary operator in the language; it is the single exception to the "no unary operators" rule of §3.7/§24.1.
+
+**Typing.** Bitwise and shift operators require **integer** operands; a floating-point operand is a compile-time error. For `&`, `|`, `^`, the result type is the widened integer type of the two operands (§26). For `<<` and `>>`, the result type is the type of the left operand and the right operand may be any integer. For `~x`, the result type is the type of `x`.
+
+**Precedence.** The new operators slot into the §24.2 ladder as shown there: shifts bind tighter than comparison; `&`, `^`, `|` bind between equality and `&&`, in that order (tightest first). `~` binds tighter than `*`.
+
+```txt
+val nalType = header & 0x1F            // extract low 5 bits
+val fuHeader = nri | 28                // set FU-A type bits
+val flagged = fuHeader | 0x80          // set start bit
+val high = (value >> 24) & 0xFF        // top byte of a UInt32
+val inverted = ~mask                   // bitwise complement
+```
+
+`|` is unambiguous because type expressions and value expressions never overlap syntactically; the parser knows which context it is in.
+
+### 35.3 `std/bytes`
+
+`std/bytes` provides slicing and endian (de)serialization. The endian helpers are written in Lin on top of §35.1 and §35.2; only the float bit-reinterpret functions require intrinsics (a float's bit pattern cannot be obtained by shift-and-mask).
+
+```txt
+slice:       <T>(T[], Int32, Int32) => T[]      // also exported from std/array; sub-buffer copy
+
+u16FromBe / u32FromBe / u64FromBe:  (UInt8[], Int32) => UIntN     // read big-endian at offset
+u16ToBe   / u32ToBe   / u64ToBe:    (UIntN) => UInt8[]            // write big-endian
+// little-endian variants: u16FromLe, u32ToLe, ...
+
+f32ToBits:   (Float32) => UInt32        // intrinsic: bit reinterpret
+f32FromBits: (UInt32) => Float32
+f64ToBits:   (Float64) => UInt64
+f64FromBits: (UInt64) => Float64
+```
+
+Slicing is a function, `slice(buf, start, end)`; there is no range-index syntax (`buf[a..b]`) in this version.
+
+### 35.4 OS Handle Convention
+
+Operating-system resources (sockets, subprocesses) are exposed to Lin as **opaque integer handles**, not as runtime object values. A handle is an `Int32` (or `Int64`) that the runtime interprets; there are no open-handle objects in user code (consistent with §33.1). This is the same convention `std/time` uses for timers.
+
+All fallible operations return the `T | Error` result shape (§33.1). A non-blocking read that has no data available yet returns `Null` rather than `Error`, so a poll loop reads naturally.
+
+### 35.5 `std/net` — Sockets
+
+Both UDP and TCP sockets are exposed via runtime intrinsics. Every socket is an opaque integer fd handle (§35.4), and every fallible call returns the `T | Error` result shape; a non-blocking read with no data available yet returns `Null`.
+
+**UDP** is connectionless — bind, then send/receive datagrams with explicit peer addresses:
+
+```txt
+udpBind:           (port: Int32)                              => Int32 | Error    // fd handle
+udpRecv:           (fd: Int32, buf: UInt8[])                  => Int32 | Null | Error  // bytes read; Null = would-block
+udpRecvFrom:       (fd: Int32, buf: UInt8[])                  => { "len": Int32, "addr": String, "port": Int32 } | Null | Error
+udpSendTo:         (fd: Int32, addr: String, port: Int32, buf: UInt8[]) => Int32 | Error
+udpSetNonblocking: (fd: Int32, on: Boolean)                   => Null | Error
+udpClose:          (fd: Int32)                                => Null | Error
+```
+
+**TCP** is connection-oriented. A listener accepts connections, each of which is itself an fd; a client connects directly. Reads and writes operate on a connected fd:
+
+```txt
+tcpListen:         (port: Int32)                  => Int32 | Error            // listener fd
+tcpAccept:         (fd: Int32)                    => { "fd": Int32, "addr": String, "port": Int32 } | Null | Error  // Null = would-block
+tcpConnect:        (host: String, port: Int32)    => Int32 | Error            // connected fd
+tcpRecv:           (fd: Int32, buf: UInt8[])       => Int32 | Null | Error      // bytes read; 0 = peer closed; Null = would-block
+tcpSend:           (fd: Int32, buf: UInt8[])       => Int32 | Error            // bytes written
+tcpSetNonblocking: (fd: Int32, on: Boolean)       => Null | Error
+tcpClose:          (fd: Int32)                    => Null | Error
+```
+
+`recv` fills a caller-owned `UInt8[]` (§35.1) and returns the number of bytes read; the buffer is never transferred across the boundary. Non-blocking mode plus a `Null`-on-would-block `recv`/`accept` replaces an explicit `poll`.
+
+Note that `std/server` (§33.5) already provides a high-level blocking HTTP server, and `std/http` (§33.4) an HTTP client; `std/net` is the lower-level byte-stream layer beneath them, for non-HTTP protocols and custom framing.
+
+### 35.6 `std/proc` — Subprocesses
+
+```txt
+spawn:       (argv: String[])              => Int64 | Error     // opaque process handle
+readStdout:  (handle: Int64, buf: UInt8[]) => Int32 | Error     // bytes; 0 = EOF
+kill:        (handle: Int64)               => Null | Error
+wait:        (handle: Int64)               => Int32 | Error     // exit code
+```
+
+### 35.7 `std/tty` — Raw Terminal
+
+```txt
+rawMode:  (on: Boolean)  => Null | Error    // enable/disable terminal raw mode
+readKey:  ()             => Int32 | Null    // keycode, or Null if no key available (non-blocking)
+```
+
+### 35.8 Timing and Signals
+
+`std/time` gains microsecond sleep (the existing `sleep` is millisecond-granularity):
+
+```txt
+sleepMicros: (n: Int64) => Null
+```
+
+`std/signal` provides minimal signal handling:
+
+```txt
+waitSignal: (sig: Int32) => Int32           // block until the signal is delivered
+```
+
+### 35.9 What Is Deliberately Absent
+
+Two systems facilities are **not** provided as core primitives, by design:
+
+- **GPIO / hardware register access.** Use the C FFI (§34) to bind a native GPIO library. The only language-level support added for it is `sleepMicros` (§35.8), needed for software PWM timing.
+- **Shared-memory concurrency** (mutexes, atomics, shared mutable cells across threads). Lin's concurrency is share-nothing (§32). Cross-thread mutable state is modelled with a `Worker<Msg, Reply>` (§32.6) that owns the state and serialises access through its message queue. This preserves the share-nothing invariant rather than reintroducing data races.

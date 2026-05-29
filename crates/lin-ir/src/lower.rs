@@ -533,6 +533,9 @@ fn collect_mutable_capture_slots_expr(expr: &TypedExpr, out: &mut std::collectio
             collect_mutable_capture_slots_expr(left, out);
             collect_mutable_capture_slots_expr(right, out);
         }
+        TypedExpr::UnaryOp { operand, .. } => {
+            collect_mutable_capture_slots_expr(operand, out);
+        }
         TypedExpr::Coerce { expr, .. } | TypedExpr::LocalSet { value: expr, .. } => {
             collect_mutable_capture_slots_expr(expr, out);
         }
@@ -998,6 +1001,23 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 lhs,
                 rhs,
                 operand_ty,
+                ty: result_type.clone(),
+            });
+            dst
+        }
+
+        TypedExpr::UnaryOp { op, operand, result_type, .. } => {
+            // The only surface unary op is `~` (bitwise not), which maps to IR `Not`
+            // (codegen emits `build_not`).
+            let ir_op = match op {
+                lin_parse::ast::UnaryOp::BNot => crate::ir::UnaryOp::Not,
+            };
+            let src = lower_expr(operand, builder, ctx);
+            let dst = builder.alloc_temp(result_type.clone());
+            builder.emit(Instruction::Unary {
+                dst,
+                op: ir_op,
+                operand: src,
                 ty: result_type.clone(),
             });
             dst
@@ -2519,7 +2539,20 @@ fn lower_function_expr_with_id(
         }
     }
 
-    inner_builder.push_scope();
+    // Push a param scope so Function-typed params are released on exit even when never
+    // read inside the body. The caller always retains before passing a Function-typed
+    // argument (via retain_call_arg), so the callee owns one reference per Function param
+    // that must be released. The body scope below handles LocalGet retains; this param
+    // scope handles the initial caller-transferred reference.
+    inner_builder.push_scope(); // param scope
+    for param in params {
+        if matches!(param.ty, Type::Function { .. }) {
+            if let Some(&t) = inner_builder.slots.get(&param.slot) {
+                inner_builder.register_owned(t, param.ty.clone());
+            }
+        }
+    }
+    inner_builder.push_scope(); // body scope
     let raw_ret = lower_expr(body, &mut inner_builder, ctx);
     // Use the lowered temp's ACTUAL type for the return coercion, not the surface
     // `body.ty()`. They can disagree when the body reads a mutably-captured `var` whose
@@ -2560,10 +2593,13 @@ fn lower_function_expr_with_id(
     } else {
         raw_ret
     };
-    // Release owned temps in function scope except the return value AND the raw
-    // pre-coercion temp: a box (e.g. lin_box_object) shares the underlying pointer, so
-    // releasing the original would free what the returned box wraps.
-    inner_builder.pop_scope_releasing_keep(&[ret_temp, raw_ret]);
+    // Release owned temps in body scope except the return value AND the raw pre-coercion
+    // temp: a box (e.g. lin_box_object) shares the underlying pointer, so releasing the
+    // original would free what the returned box wraps.
+    inner_builder.pop_scope_releasing_keep(&[ret_temp, raw_ret]); // body scope
+    // Release Function-typed params that are not being returned. This balances the
+    // retain_call_arg retain emitted by every caller for each Function argument.
+    inner_builder.pop_scope_releasing_keep(&[ret_temp, raw_ret]); // param scope
     if !inner_builder.is_current_block_terminated() {
         // Void-returning functions must Return(None) — codegen gives them a void LLVM
         // signature, so returning a value would be a type mismatch.

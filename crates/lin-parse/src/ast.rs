@@ -70,6 +70,11 @@ pub enum Expr {
         right: Box<Expr>,
         span: Span,
     },
+    UnaryOp {
+        op: UnaryOp,
+        operand: Box<Expr>,
+        span: Span,
+    },
     Call {
         func: Box<Expr>,
         args: Vec<Expr>,
@@ -141,6 +146,7 @@ impl Expr {
             Expr::Ident(_, s) => *s,
             Expr::StringInterp(_, s) => *s,
             Expr::BinaryOp { span, .. } => *span,
+            Expr::UnaryOp { span, .. } => *span,
             Expr::Call { span, .. } => *span,
             Expr::DotCall { span, .. } => *span,
             Expr::Index { span, .. } => *span,
@@ -186,6 +192,17 @@ pub enum BinOp {
     GtEq,
     And,
     Or,
+    BAnd,
+    BOr,
+    BXor,
+    Shl,
+    Shr,
+}
+
+/// Unary operators. `~` (bitwise not) is the only unary operator in the language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UnaryOp {
+    BNot,
 }
 
 #[derive(Debug, Clone)]

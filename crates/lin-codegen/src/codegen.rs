@@ -3222,7 +3222,11 @@ impl<'ctx> Codegen<'ctx> {
                     };
                     return self.builder.build_int_compare(pred, ord, zero, "ir_tcmp_b").unwrap().into();
                 }
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                | BinOp::BAnd | BinOp::BOr | BinOp::BXor | BinOp::Shl | BinOp::Shr => {
+                    // Bitwise/shift ops are integer-only (checker-enforced); a boxed union
+                    // operand (e.g. a TypeVar reduce-lambda param) must be unboxed to the
+                    // concrete integer type before the LLVM int op, same as arithmetic.
                     let lconc = self.unbox_tagged_val_to_type(lv, &Type::Int32);
                     let rconc = if rv.is_pointer_value() { self.unbox_tagged_val_to_type(rv, &Type::Int32) } else { rv };
                     let concrete = self.compile_binary_op_values(lconc, rconc, op, &Type::Int32, &Type::Int32, &Type::Int32);
@@ -3251,6 +3255,17 @@ impl<'ctx> Codegen<'ctx> {
             BinOp::GtEq => self.compile_cmp(lv, rv, lty, IntPredicate::SGE, IntPredicate::UGE, FloatPredicate::OGE),
             BinOp::And => self.builder.build_and(lv.into_int_value(), rv.into_int_value(), "ir_and").unwrap().into(),
             BinOp::Or => self.builder.build_or(lv.into_int_value(), rv.into_int_value(), "ir_or").unwrap().into(),
+            // Bitwise integer operators (§35.2). Operands are integers (checker-enforced)
+            // and widths have been reconciled above.
+            BinOp::BAnd => self.builder.build_and(lv.into_int_value(), rv.into_int_value(), "ir_band").unwrap().into(),
+            BinOp::BOr => self.builder.build_or(lv.into_int_value(), rv.into_int_value(), "ir_bor").unwrap().into(),
+            BinOp::BXor => self.builder.build_xor(lv.into_int_value(), rv.into_int_value(), "ir_bxor").unwrap().into(),
+            BinOp::Shl => self.builder.build_left_shift(lv.into_int_value(), rv.into_int_value(), "ir_shl").unwrap().into(),
+            // `>>` is arithmetic for signed types and logical for unsigned types.
+            BinOp::Shr => {
+                let sign_extend = lty.is_signed();
+                self.builder.build_right_shift(lv.into_int_value(), rv.into_int_value(), sign_extend, "ir_shr").unwrap().into()
+            }
         }
     }
 

@@ -105,6 +105,10 @@ fn zonk_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
             zonk_expr(right, subs);
             *result_type = zonk_type(result_type, subs);
         }
+        TypedExpr::UnaryOp { operand, result_type, .. } => {
+            zonk_expr(operand, subs);
+            *result_type = zonk_type(result_type, subs);
+        }
         TypedExpr::Coerce { expr, from, to, .. } => {
             zonk_expr(expr, subs);
             *from = zonk_type(from, subs);

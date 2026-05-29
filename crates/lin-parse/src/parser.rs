@@ -276,17 +276,77 @@ impl Parser {
     }
 
     fn parse_and_expr(&mut self) -> Expr {
-        let mut left = self.parse_equality_expr();
+        let mut left = self.parse_bitor_expr();
         loop {
             self.skip_continuation_newline(TokenKind::And);
             if !self.check(TokenKind::And) { break; }
             let span = self.current_span();
             self.advance();
             self.skip_newlines();
-            let right = self.parse_equality_expr();
+            let right = self.parse_bitor_expr();
             left = Expr::BinaryOp {
                 left: Box::new(left),
                 op: BinOp::And,
+                right: Box::new(right),
+                span,
+            };
+        }
+        left
+    }
+
+    // Bitwise OR `|` (value position only; type-expression `|` is parsed separately).
+    fn parse_bitor_expr(&mut self) -> Expr {
+        let mut left = self.parse_bitxor_expr();
+        loop {
+            self.skip_continuation_newline(TokenKind::Pipe);
+            if !self.check(TokenKind::Pipe) { break; }
+            let span = self.current_span();
+            self.advance();
+            self.skip_newlines();
+            let right = self.parse_bitxor_expr();
+            left = Expr::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::BOr,
+                right: Box::new(right),
+                span,
+            };
+        }
+        left
+    }
+
+    // Bitwise XOR `^`.
+    fn parse_bitxor_expr(&mut self) -> Expr {
+        let mut left = self.parse_bitand_expr();
+        loop {
+            self.skip_continuation_newline(TokenKind::Caret);
+            if !self.check(TokenKind::Caret) { break; }
+            let span = self.current_span();
+            self.advance();
+            self.skip_newlines();
+            let right = self.parse_bitand_expr();
+            left = Expr::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::BXor,
+                right: Box::new(right),
+                span,
+            };
+        }
+        left
+    }
+
+    // Bitwise AND `&`.
+    fn parse_bitand_expr(&mut self) -> Expr {
+        let mut left = self.parse_equality_expr();
+        loop {
+            self.skip_continuation_newline(TokenKind::Amp);
+            if !self.check(TokenKind::Amp) { break; }
+            let span = self.current_span();
+            self.advance();
+            self.skip_newlines();
+            let right = self.parse_equality_expr();
+            left = Expr::BinaryOp {
+                left: Box::new(left),
+                op: BinOp::BAnd,
                 right: Box::new(right),
                 span,
             };
@@ -349,14 +409,14 @@ impl Parser {
             let span = self.current_span();
             self.advance();
             self.skip_newlines();
-            let right = self.parse_additive_expr();
+            let right = self.parse_shift_expr();
             left = Expr::BinaryOp { left: Box::new(left), op, right: Box::new(right), span };
         }
         left
     }
 
     fn parse_is_has_expr(&mut self) -> Expr {
-        let left = self.parse_additive_expr();
+        let left = self.parse_shift_expr();
         if self.check(TokenKind::Is) {
             let span = self.current_span();
             self.advance();
@@ -370,6 +430,45 @@ impl Parser {
             return Expr::Has { expr: Box::new(left), pattern: Box::new(pattern), span };
         }
         left
+    }
+
+    // Bitwise shift `<<` `>>`. The lexer emits single `Lt`/`Gt` tokens so that nested
+    // generic types (`Promise<Promise<Int32>>`) keep closing with `expect(Gt)`. We detect a
+    // shift here, in value position only, by checking for two ADJACENT `Lt`/`Gt` tokens
+    // (the first token's span.end == the second's span.start, same file). Type expressions
+    // are parsed by a separate path, so generics are unaffected.
+    fn parse_shift_expr(&mut self) -> Expr {
+        let mut left = self.parse_additive_expr();
+        loop {
+            let op = if self.adjacent_pair(TokenKind::Lt, TokenKind::Lt) {
+                BinOp::Shl
+            } else if self.adjacent_pair(TokenKind::Gt, TokenKind::Gt) {
+                BinOp::Shr
+            } else {
+                break;
+            };
+            let span = self.current_span();
+            self.advance(); // first < or >
+            self.advance(); // second < or >
+            self.skip_newlines();
+            let right = self.parse_additive_expr();
+            left = Expr::BinaryOp { left: Box::new(left), op, right: Box::new(right), span };
+        }
+        left
+    }
+
+    /// True when the next two tokens have the given kinds AND are adjacent in the source
+    /// (no whitespace between them), so `> >` (generic close) is not mistaken for `>>`.
+    fn adjacent_pair(&self, first: TokenKind, second: TokenKind) -> bool {
+        if self.pos + 1 >= self.tokens.len() {
+            return false;
+        }
+        let a = &self.tokens[self.pos];
+        let b = &self.tokens[self.pos + 1];
+        std::mem::discriminant(&a.kind) == std::mem::discriminant(&first)
+            && std::mem::discriminant(&b.kind) == std::mem::discriminant(&second)
+            && a.span.file_id == b.span.file_id
+            && a.span.end == b.span.start
     }
 
     fn parse_additive_expr(&mut self) -> Expr {
@@ -390,7 +489,7 @@ impl Parser {
     }
 
     fn parse_multiplicative_expr(&mut self) -> Expr {
-        let mut left = self.parse_postfix_expr();
+        let mut left = self.parse_unary_expr();
         loop {
             let op = match self.peek_kind() {
                 TokenKind::Star => BinOp::Mul,
@@ -401,10 +500,27 @@ impl Parser {
             let span = self.current_span();
             self.advance();
             self.skip_newlines();
-            let right = self.parse_postfix_expr();
+            let right = self.parse_unary_expr();
             left = Expr::BinaryOp { left: Box::new(left), op, right: Box::new(right), span };
         }
         left
+    }
+
+    // Unary `~` (bitwise not) — the only unary operator. Binds tighter than `*`, looser
+    // than postfix. Right-associative so `~~x` parses as `~(~x)`.
+    fn parse_unary_expr(&mut self) -> Expr {
+        if self.check(TokenKind::Tilde) {
+            let span = self.current_span();
+            self.advance();
+            self.skip_newlines();
+            let operand = self.parse_unary_expr();
+            return Expr::UnaryOp {
+                op: UnaryOp::BNot,
+                operand: Box::new(operand),
+                span,
+            };
+        }
+        self.parse_postfix_expr()
     }
 
     fn parse_postfix_expr(&mut self) -> Expr {

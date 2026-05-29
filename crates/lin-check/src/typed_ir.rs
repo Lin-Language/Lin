@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use lin_common::Span;
-use lin_parse::ast::BinOp;
+use lin_parse::ast::{BinOp, UnaryOp};
 use crate::types::Type;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -104,6 +104,12 @@ pub enum TypedExpr {
         result_type: Type,
         span: Span,
     },
+    UnaryOp {
+        op: UnaryOp,
+        operand: Box<TypedExpr>,
+        result_type: Type,
+        span: Span,
+    },
     Coerce {
         expr: Box<TypedExpr>,
         from: Type,
@@ -201,6 +207,7 @@ impl TypedExpr {
             TypedExpr::LocalGet { ty, .. } => ty.clone(),
             TypedExpr::LocalSet { ty, .. } => ty.clone(),
             TypedExpr::BinaryOp { result_type, .. } => result_type.clone(),
+            TypedExpr::UnaryOp { result_type, .. } => result_type.clone(),
             TypedExpr::Coerce { to, .. } => to.clone(),
             TypedExpr::Call { result_type, .. } => result_type.clone(),
             TypedExpr::If { result_type, .. } => result_type.clone(),
@@ -233,6 +240,7 @@ impl TypedExpr {
             TypedExpr::LocalGet { span, .. } => *span,
             TypedExpr::LocalSet { span, .. } => *span,
             TypedExpr::BinaryOp { span, .. } => *span,
+            TypedExpr::UnaryOp { span, .. } => *span,
             TypedExpr::Coerce { span, .. } => *span,
             TypedExpr::Call { span, .. } => *span,
             TypedExpr::If { span, .. } => *span,

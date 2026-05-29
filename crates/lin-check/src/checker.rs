@@ -2,6 +2,7 @@ use indexmap::IndexMap;
 use lin_common::{Diagnostic, Span};
 use lin_parse::ast::{
     BinOp, Expr, MatchArm, MatchPattern, Module, ObjectField, Param, Pattern, Stmt, StringPart,
+    UnaryOp,
 };
 
 use crate::compat::is_compatible_env;
@@ -421,6 +422,7 @@ impl Checker {
             Expr::NullLit(span)      => Ok(TypedExpr::NullLit(*span)),
             Expr::Ident(name, span)  => self.infer_ident(name, *span),
             Expr::BinaryOp { left, op, right, span } => self.infer_binary_op(left, *op, right, *span),
+            Expr::UnaryOp { op, operand, span } => self.infer_unary_op(*op, operand, *span),
             Expr::Call { func, args, span }           => self.infer_call(func, args, *span),
             Expr::DotCall { receiver, method, args, span } => self.infer_dot_call(receiver, method, args, *span),
             Expr::Index { object, key, span }         => self.infer_index(object, key, *span),
@@ -818,12 +820,122 @@ impl Checker {
                 Type::Bool
             }
             BinOp::And | BinOp::Or => Type::Bool,
+            // Bitwise and/or/xor (§35.2): both operands must be integer; result is the
+            // widened integer type. A float operand is a compile-time error.
+            BinOp::BAnd | BinOp::BOr | BinOp::BXor => {
+                let left_is_any = matches!(left_ty, Type::TypeVar(_));
+                let right_is_any = matches!(right_ty, Type::TypeVar(_));
+                if left_ty.is_float() {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!("bitwise operator {:?} requires integer operands, got {}", op, left_ty),
+                    ));
+                }
+                if right_ty.is_float() {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!("bitwise operator {:?} requires integer operands, got {}", op, right_ty),
+                    ));
+                }
+                if left_ty.is_integer() && right_ty.is_integer() {
+                    widen_numeric(&left_ty, &right_ty).unwrap_or(Type::Int32)
+                } else if left_is_any && right_is_any {
+                    Type::Int32
+                } else if left_is_any {
+                    right_ty.clone()
+                } else if right_is_any {
+                    left_ty.clone()
+                } else {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!(
+                            "bitwise operator {:?} requires integer operands, got {} and {}",
+                            op, left_ty, right_ty
+                        ),
+                    ));
+                }
+            }
+            // Shifts (§35.2): left operand integer, right operand any integer; result is
+            // the type of the left operand.
+            BinOp::Shl | BinOp::Shr => {
+                let left_is_any = matches!(left_ty, Type::TypeVar(_));
+                let right_is_any = matches!(right_ty, Type::TypeVar(_));
+                if left_ty.is_float() {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!("bitwise operator {:?} requires integer operands, got {}", op, left_ty),
+                    ));
+                }
+                if right_ty.is_float() {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!("bitwise operator {:?} requires integer operands, got {}", op, right_ty),
+                    ));
+                }
+                if !right_is_any && !right_ty.is_integer() {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!("bitwise operator {:?} requires integer operands, got {}", op, right_ty),
+                    ));
+                }
+                if left_ty.is_integer() {
+                    left_ty.clone()
+                } else if left_is_any {
+                    Type::Int32
+                } else {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!("bitwise operator {:?} requires integer operands, got {}", op, left_ty),
+                    ));
+                }
+            }
         };
 
         Ok(TypedExpr::BinaryOp {
             left: Box::new(typed_left),
             op,
             right: Box::new(typed_right),
+            result_type,
+            span,
+        })
+    }
+
+    // Unary `~` (bitwise not, §35.2): operand must be integer; result is the operand's type.
+    fn infer_unary_op(
+        &mut self,
+        op: UnaryOp,
+        operand: &Expr,
+        span: Span,
+    ) -> Result<TypedExpr, Diagnostic> {
+        let prev_tail = std::mem::replace(&mut self.in_tail_position, false);
+        let typed_operand = self.infer_expr(operand)?;
+        self.in_tail_position = prev_tail;
+        let operand_ty = typed_operand.ty();
+
+        let result_type = match op {
+            UnaryOp::BNot => {
+                if operand_ty.is_float() {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!("bitwise operator ~ requires an integer operand, got {}", operand_ty),
+                    ));
+                }
+                if operand_ty.is_integer() {
+                    operand_ty.clone()
+                } else if matches!(operand_ty, Type::TypeVar(_)) {
+                    Type::Int32
+                } else {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!("bitwise operator ~ requires an integer operand, got {}", operand_ty),
+                    ));
+                }
+            }
+        };
+
+        Ok(TypedExpr::UnaryOp {
+            op,
+            operand: Box::new(typed_operand),
             result_type,
             span,
         })
@@ -2155,6 +2267,9 @@ fn first_mutable_global_in_body(
         TypedExpr::BinaryOp { left, right, .. } => {
             first_mutable_global_in_body(left, mutable_globals)
                 .or_else(|| first_mutable_global_in_body(right, mutable_globals))
+        }
+        TypedExpr::UnaryOp { operand, .. } => {
+            first_mutable_global_in_body(operand, mutable_globals)
         }
         TypedExpr::Call { func, args, .. } => {
             first_mutable_global_in_body(func, mutable_globals)

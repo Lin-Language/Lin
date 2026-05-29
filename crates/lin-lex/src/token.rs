@@ -55,6 +55,9 @@ pub enum TokenKind {
     Dot,
     DotDotDot, // ...
     Pipe,     // |
+    Amp,      // & (bitwise and)
+    Caret,    // ^ (bitwise xor)
+    Tilde,    // ~ (bitwise not)
 
     // Delimiters
     LParen,

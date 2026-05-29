@@ -2194,3 +2194,110 @@ val result = items.filter(x => x > 2).map(x => x * 10).reduce(0, (a, b) => a + b
         formatted_once, formatted_twice
     );
 }
+
+#[test]
+fn test_bitwise_basic_ops() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+print(toString(5 & 3))
+print(toString(5 | 2))
+print(toString(5 ^ 1))
+print(toString(1 << 4))
+print(toString(256 >> 2))
+print(toString(~0))
+"#);
+    assert_eq!(output, vec!["1", "7", "4", "16", "64", "-1"]);
+}
+
+#[test]
+fn test_bitwise_precedence() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+// & binds tighter than |  =>  1 | (2 & 3) == 1 | 2 == 3
+print(toString(1 | 2 & 3))
+// shift looser than +  =>  (1 + 1) << 2 == 8
+print(toString(1 + 1 << 2))
+// hex masking
+print(toString(0xFF & 0x0F))
+"#);
+    assert_eq!(output, vec!["3", "8", "15"]);
+}
+
+#[test]
+fn test_bitwise_nal_masking() {
+    // The NAL-type extraction example from spec §35.2.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val header = 0x67
+print(toString(header & 0x1F))
+"#);
+    assert_eq!(output, vec!["7"]);
+}
+
+#[test]
+fn test_bitwise_boxed_operands() {
+    // Bitwise ops on reduce-lambda params, which arrive boxed (TypeVar). The boxed
+    // operand must be unboxed before the LLVM int op — regression for a panic where
+    // `.into_int_value()` was called on a pointer value.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { reduce } from "std/array"
+
+print(toString([1, 2, 4, 8].reduce(0, (acc, x) => acc | x)))
+print(toString([15, 7, 3].reduce(255, (acc, x) => acc & x)))
+print(toString([1, 2, 3].reduce(1, (acc, x) => acc << x)))
+"#);
+    assert_eq!(output, vec!["15", "3", "64"]);
+}
+
+#[test]
+fn test_bitwise_xor_precedence() {
+    // `^` binds between `&` and `|`:  1 | 6 ^ 3 & 2  ==  1 | (6 ^ (3 & 2))  ==  1 | (6 ^ 2)  ==  1 | 4  ==  5
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+print(toString(1 | 6 ^ 3 & 2))
+"#);
+    assert_eq!(output, vec!["5"]);
+}
+
+#[test]
+fn test_bitwise_float_operand_rejected() {
+    // A floating-point operand to a bitwise operator is a compile-time type error.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val x = 3.0 & 1
+print(toString(x))
+"#);
+    assert!(
+        err.contains("requires integer operand"),
+        "expected a bitwise integer-operand type error, got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_nested_generics_still_parse() {
+    // Regression: `>>` shift detection (two ADJACENT `Gt` tokens in VALUE position) must
+    // NOT break nested generic type close `>>` in TYPE position. Generic types are parsed
+    // by a separate path that closes each level with expect(Gt), so the adjacent `> >` of a
+    // nested generic must remain two independent tokens. We assert the parser produces no
+    // diagnostics for several nested-generic annotations.
+    let source = r#"type Box<T> = { "value": T }
+val a: Box<Box<Int32>> = { "value": { "value": 1 } }
+val b: Box<Box<Box<Int32>>> = { "value": { "value": { "value": 2 } } }
+val c: Array<Array<Int32>> = [[1, 2], [3, 4]]
+"#;
+    let tokens = lin_lex::Lexer::new(source, 0).tokenize();
+    let mut parser = lin_parse::Parser::new(tokens);
+    let _module = parser.parse_module();
+    assert!(
+        parser.diagnostics.is_empty(),
+        "nested generics regressed under `>>` shift parsing: {:?}",
+        parser.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
+    );
+}

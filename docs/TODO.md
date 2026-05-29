@@ -603,6 +603,62 @@ End state: O(n log n) sort, O(n) string building, O(n) unique/omit, constant-fac
 
 ---
 
+## Milestone 21 — Low-Level Primitives
+
+End state: binary protocol code (byte parsing, packet (de)serialization), UDP sockets, subprocesses, and raw-terminal input are expressible in Lin. Validated against a real systems target (the `deathbot` UDP/RTP/NAL server and keyboard client).
+
+See spec §35 for the full design. **Gated on the IR switchover landing on master** — all operator and intrinsic-dispatch work targets the post-IR pipeline (operators lowered as `LinIR::Binary`/`Unary` in `lin-ir`; intrinsics dispatched in `lin-ir/src/lower.rs`). Implementing against the old `codegen.rs` path would be thrown away by the migration.
+
+Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything else depends on it, and it alone makes the protocol-parsing core (NAL/RTP, ~480 lines, no OS access) writable in Lin.
+
+### Layer 1 — Bytes and bitwise operators
+
+- [ ] **Small-int flat array variants** (`lin-runtime/src/array.rs`) — add the full flat family (`alloc/push/get/set/free/alloc_filled/concat_into/eq/slice`) for `i8`, `u8`, `i16`, `u16`, mirroring the existing `i32` family. New element tags `TAG_UINT8`, `TAG_INT8`, `TAG_UINT16`, `TAG_INT16` (next free after `TAG_FUNCTION=9`) in `tagged.rs`. Strides 1 byte (`i8`/`u8`) and 2 bytes (`i16`/`u16`).
+- [ ] **Flat-scalar dispatch** (`lin-codegen`) — extend `is_flat_scalar` and `flat_suffix` to cover `Int8/UInt8/Int16/UInt16` (suffixes `i8/u8/i16/u16`). `UInt8[]` then works everywhere flat scalars do (literals, indexing, in-place `buf[i]=x`, `length`, `push`, combinators, `==`).
+- [x] **Bitwise tokens** (`lin-lex`) — new tokens `Amp` (`&`), `Caret` (`^`), `Tilde` (`~`). Maximal-munch: lone `&` → `Amp`, `&&` → existing `And`. Reuse existing `Pipe` (`|`) in value position. NOTE: `<<`/`>>` are deliberately NOT lexed as combined `Shl`/`Shr` tokens — that would break nested generic close `>>` (`Promise<Promise<Int32>>`). Shifts are detected at the parser level from two ADJACENT `Lt`/`Gt` tokens in value position (`parse_shift_expr` / `adjacent_pair`).
+- [x] **Bitwise AST + parser** — `BinOp::{BAnd, BOr, BXor, Shl, Shr}` and surface `UnaryOp::BNot` + `Expr::UnaryOp` (ast.rs). Precedence rungs per spec §24.2: `~` above `*`; `<<`/`>>` between `+`/`-` and comparison; `&`, `^`, `|` between `==`/`!=` and `&&`, in that order (`parse_bitor_expr` → `parse_bitxor_expr` → `parse_bitand_expr` → ... → `parse_shift_expr` → `parse_additive_expr` → ... → `parse_unary_expr`).
+- [x] **Bitwise type rules** (`lin-check`, `infer_binary_op` + new `infer_unary_op`) — integer-only operands; float operand is a compile-time error. `& | ^`: result = widened integer type (reuse `widen_numeric`). `<< >>`: result = left operand's type. `~x`: result = type of `x`. TypeVar/dynamic operands fall back to the other side's type or `Int32`.
+- [x] **Bitwise codegen / IR lowering** (`lin-ir/src/lower.rs`, `lin-codegen`) — `BinOp::{BAnd,BOr,BXor,Shl,Shr}` map to LLVM `build_and/or/xor/left_shift/right_shift` (logical shift for unsigned, arithmetic for signed via `lty.is_signed()`); surface `UnaryOp::BNot` lowers to IR `UnaryOp::Not` → `build_not`.
+- [ ] **`slice` function** — `slice(arr, start, end)` in `std/array` (and re-exported from `std/bytes`), backed by `lin_flat_array_slice_<suffix>` for flat element types and the tagged-array slice path otherwise. No range-index syntax.
+- [ ] **Float bit-reinterpret intrinsics** (`lin-runtime`) — `lin_f32_to_bits`/`lin_f32_from_bits`/`lin_f64_to_bits`/`lin_f64_from_bits` (`f32::to_bits` etc.).
+- [ ] **`std/bytes` module** (pure Lin + the four float intrinsics) — `u16/u32/u64` big- and little-endian read/write via shift-and-mask; `f32/f64` (de)serialization via the bit-reinterpret intrinsics; `slice`.
+
+### Layer 2 — Sockets
+
+- [ ] **UDP intrinsics** (`lin-runtime/src/net.rs`) — `lin_udp_bind`, `lin_udp_recv`, `lin_udp_recv_from`, `lin_udp_send_to`, `lin_udp_set_nonblocking`, `lin_udp_close`. fd returned as opaque `Int32` (spec §35.4); non-blocking would-block surfaces as `Null`, not `Error`.
+- [ ] **TCP intrinsics** (`lin-runtime/src/net.rs`) — `lin_tcp_listen`, `lin_tcp_accept`, `lin_tcp_connect`, `lin_tcp_recv`, `lin_tcp_send`, `lin_tcp_set_nonblocking`, `lin_tcp_close`. `accept` returns a connection fd + peer addr (or `Null` when would-block); `recv` returns `0` on peer-closed.
+- [ ] **`std/net` module** — UDP: `udpBind`, `udpRecv`, `udpRecvFrom`, `udpSendTo`, `udpSetNonblocking`, `udpClose`. TCP: `tcpListen`, `tcpAccept`, `tcpConnect`, `tcpRecv`, `tcpSend`, `tcpSetNonblocking`, `tcpClose`. All wrap intrinsics in the `T | Error` / `Null`-on-would-block convention.
+
+### Layer 3 — Subprocess and raw terminal
+
+- [ ] **Subprocess intrinsics** — `lin_proc_spawn(String[])`, `lin_proc_read_stdout`, `lin_proc_kill`, `lin_proc_wait`; opaque `Int64` handle. **`std/proc`**: `spawn`, `readStdout`, `kill`, `wait`.
+- [ ] **Raw-TTY intrinsics** — `lin_tty_raw_mode(Boolean)`, `lin_tty_read_key()` (non-blocking). **`std/tty`**: `rawMode`, `readKey` (`Int32 | Null`).
+
+### Layer 4 — Timing, signals; FFI and Worker for the rest
+
+- [ ] **`std/time.sleepMicros`** — `lin_time_sleep_micros(Int64)` intrinsic + wrapper.
+- [ ] **`std/signal.waitSignal`** — `lin_signal_wait(Int32)` intrinsic + wrapper. (Open: blocking-wait vs registered-handler form — decide here.)
+- [ ] **GPIO via existing FFI** — no new core primitive; validate `import foreign` against a C GPIO library, using `sleepMicros` for software PWM.
+- [ ] **Cross-thread state via Worker** — no new core primitive; confirm a `Worker<Msg, Reply>` owning shared state (e.g. a discovered client address) replaces `Arc<Mutex<…>>`.
+
+### Spec / docs amendments
+
+- [x] Spec §35 (this section), §24.1/§24.2 (bitwise operators + precedence), §3.7 (`~` is the one unary).
+- [ ] `docs/STDLIB.md` — full signatures for `std/bytes`, `std/net`, `std/proc`, `std/tty`, `std/signal`, and the `std/time.sleepMicros` addition.
+- [ ] `docs/DECISIONS.md` — ADRs for (a) fd-as-opaque-Int handle convention, (b) share-nothing upheld over a Mutex primitive, (c) flat unboxed small-int arrays, (d) `~` as the single sanctioned unary operator.
+
+### Tests
+
+- [ ] `UInt8[]` literals, indexing, in-place write, `length`, `push`, `slice`, `==`.
+- [ ] Each bitwise operator (`& | ^ << >> ~`) with integer fixtures; float-operand rejection is a compile-time error; precedence fixtures.
+- [ ] `std/bytes` round-trips: `u32ToBe`/`u32FromBe`, `f32ToBits`/`f32FromBits`, the 8-byte two-f32 control packet.
+- [ ] `std/net`: UDP loopback send/recv; non-blocking recv returns `Null` when no data.
+- [ ] `std/net`: TCP loopback — listener accepts a connection, echoes bytes back to a connected client; `recv` returns `0` after the peer closes.
+- [ ] `std/proc`: spawn a process, read its stdout to EOF, exit code via `wait`.
+- [ ] `examples/`: a NAL-parser / RTP-packetizer fixture (the protocol core, no OS), plus a UDP echo fixture.
+
+---
+
 ## Next
 
 - Tidy up stdlib, add .at for strings and re-implement into more native Lin
