@@ -364,3 +364,91 @@ the AST-compiled stdlib leaks containers that the IR-compiled caller correctly r
 exposing latent AST use-after-frees (e.g. `std_path_join`'s borrowed `parts[0]`). Those have
 been fixed in the AST path directly (dup-on-projection in `TypedStmt::Var`), so both paths
 are now sound regardless of which compiles the stdlib.
+
+## Checkpoint 8 — IR-compiled imports (Milestone 2 prerequisite, partial)
+
+Imports now compile through the LinIR pipeline (`lower_import_module` +
+`compile_import_from_ir`) instead of the AST path, removing the IR path's dependency on
+`compile_function_body`/`compile_expr` for imported modules. This unblocks Phase 10
+(legacy deletion), which previously could not proceed while `register_import` used the AST.
+
+### Status
+- **Integration: 128/128 on BOTH legs.**
+- **Stdlib: 11/14 on the IR leg** (14/14 on AST). Failing: array, fs, template.
+- All non-skipped examples run on the IR leg. AST leg fully green (no regressions).
+
+### Fixes made for IR-compiled imports
+1. **Cross-module FuncId collision** (root cause of most early crashes): each module's
+   lowering numbers FuncIds from 0, and codegen named anonymous functions `__lin_fn_<id>`.
+   The main module's and each import's identically-numbered anon functions collided, so the
+   second definition's blocks were appended to the first (an orphan `entry2: No predecessors`
+   block bleeding another function's body). Fixed with a per-module `ir_anon_prefix`
+   (`std_test_` etc.) on anonymous-function symbols.
+2. **Length** dispatches on the arg's static type (string/array/object/dyn), matching AST.
+3. **Print** converts its arg to a string first (was passing a boxed Json to lin_print).
+4. **Push / object_set / array_set / keys / value_key / array_allocate(_filled)** intrinsics
+   implemented as value-input ports with correct unbox/box of args.
+5. **Async family** (parallel/race/timeout/retry/threadPool/worker/request/message/close)
+   ported to value-input intrinsic handlers; async thunk unboxed when boxed.
+6. **if/while condition** coerced to Bool (a `Function` predicate returns boxed Json;
+   CondJump needs i1, else codegen defaulted the branch to false).
+7. **Null `var`-cell promotion**: `var x = null` later reassigned is typed `Null` by the
+   checker; the heap cell is promoted to `Json` so writes/reads box/unbox correctly (both at
+   the MakeCell site and the closure-capture site).
+8. **MakeObject union field**: a Json-typed field value is already a TaggedVal* — store it
+   directly (re-boxing tagged it TAG_NULL, so reads saw null).
+9. **Binary tagged_eq/cmp rhs**: box the rhs by its STATIC type, so a raw `LinString*` from
+   a string literal (`x == "pass"`) is boxed before lin_tagged_eq (was read as a TaggedVal).
+10. **Index string-key-on-Json**: guard lin_object_get with a TAG_OBJECT runtime check
+    (`results["type"]` where results is actually an array must return Null, not crash).
+11. **Object spread**: unbox a Json spread source to LinObject* before lin_object_merge.
+12. **push element ownership**: a fresh element transfers its +1 into the array (codegen's
+    push doesn't retain); a borrowed element is retained — mirrors MakeArray.
+
+### Remaining 3 stdlib failures (deferred)
+All are subtle RC/ABI corners in the IR-compiled stdlib, exposed because the IR path's
+(valid) refcount/boxing differs from the AST path:
+- **fs.test**: `resolve_lin_str` in the runtime sniffs `*ptr` to tell a boxed TaggedVal*
+  from a raw LinString* — but offset 0 of a LinString is its `refcount`, so when the rc's
+  low byte == TAG_STR(6) it mis-unboxes and reads the char data as a pointer. The IR path
+  inflates refcounts more than AST (per-read retains), hitting rc≡6. This is a latent
+  runtime design flaw; the proper fix is a non-ambiguous boxed/raw discriminator for
+  `import foreign "lin-runtime"` string params.
+- **array.test**: `array_to_json_string` overflows a Vec — a nested array's `len` field is
+  corrupted (toString of nested arrays), pointing at a container RC/transfer bug.
+- **template.test**: not yet root-caused.
+
+## Checkpoint 9 — IR-compiled imports COMPLETE (full parity)
+
+The import migration is done. Imported modules (the whole stdlib) compile through the LinIR
+pipeline; the IR path no longer depends on the AST `compile_function_body`/`compile_expr`.
+
+### Status
+- **Integration: 128/128 on BOTH legs.**
+- **Stdlib: 14/14 on BOTH legs**, and **all 14 ASan-clean on the IR leg.**
+- Non-skipped examples run on the IR leg; lin-ir unit tests pass; AST leg fully green.
+
+### Final batch of fixes (beyond checkpoint 8)
+- **resolve_lin_str** (runtime): compare the full leading u64 (not byte 0) to tell a boxed
+  TaggedVal from a raw LinString — a string whose refcount low-byte == TAG_STR(6) no longer
+  mis-unboxes (the IR path's deferred releases push refcounts higher than the AST path).
+- **Runtime key-tag Index dispatch**: for `obj[k]` where obj is Json and k is a runtime-boxed
+  value, branch on the key's tag (int → array get, string → object get). Fixes `arr[j]` where
+  arr is a captured Json and j is a boxed loop variable (chunk / nested loops returned nulls).
+- **push / array_set / object_set element ownership**: a fresh element transfers its +1 into
+  the container (codegen doesn't retain / the object_set box-release cancels its retain); a
+  borrowed element is retained. Fixes zip, groupBy, fromCodePoints (`[[null,null],…]` / UAFs).
+- **match arm returning the scrutinee**: transfer the scrutinee's ownership out of the
+  enclosing scope so it isn't released while still live as the match result.
+- **Is(Object) pattern**: `is { "type": "error", .. }` now uses the object field-check path
+  (HasPattern + value constraints), shared with `has`. The generic `Is` arm did a bare tag
+  check against `Type::Never`'s tag (0xFF), so object patterns never matched — `render` on a
+  missing file took the wrong arm and returned garbage.
+- **lin_tagged_retain** + tag-aware IR `Retain` for union temps (lin_rc_retain would corrupt
+  the tag byte at offset 0 of a TaggedVal).
+- **Cross-module FuncId collision** (checkpoint 8): per-module `ir_anon_prefix` on
+  `__lin_fn_<id>` symbols.
+
+### Milestone 2 is now UNBLOCKED
+Phase 10 (delete the legacy AST path) can proceed: `register_import` no longer needs the AST
+compiler. `compile_import_from_ir` is the IR-path import compiler.

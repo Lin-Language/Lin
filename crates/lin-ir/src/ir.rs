@@ -80,12 +80,35 @@ pub enum Intrinsic {
     NullToString,
     Alloc,
     Panic,
+    // Object/array mutation + dynamic helpers exposed to stdlib as `lin_*` builtins.
+    // These dispatch on argument runtime types (flat/tagged, boxed/concrete) and box
+    // value arguments to TaggedVal* where the runtime expects Json, mirroring the AST
+    // path's special-case handlers. Used by std/array, std/object, std/hash.
+    ObjectSetDyn,
+    ArraySetDyn,
+    Keys,
+    ValueKey,
+    ArrayAllocate,
+    ArrayAllocateFilled,
     // Concurrency / process intrinsics (see std/async). In this runtime async is
     // effectively synchronous: a thunk runs immediately and its result is wrapped in a
     // promise; await unwraps it.
     Async,
     Await,
     Exit,
+    // Remaining async/worker family (value-input ports of compile_async_intrinsic). Used by
+    // std/async. In this synchronous runtime: parallel runs each thunk and collects results;
+    // race/timeout/retry are simplified (return/await the given promise); the worker family
+    // maps to lin_worker_* runtime calls.
+    Parallel,
+    Race,
+    Timeout,
+    Retry,
+    ThreadPool,
+    Worker,
+    Request,
+    Message,
+    Close,
 }
 
 /// Element kinds for unboxed (flat) scalar arrays.

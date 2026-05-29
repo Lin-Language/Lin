@@ -84,6 +84,123 @@ pub fn lower_module(module: &TypedModule) -> LinModule {
     }
 }
 
+/// Lower an IMPORTED TypedModule to a LinModule for the IR pipeline.
+///
+/// Unlike `lower_module`, this does NOT emit a `main`; instead it lowers every top-level
+/// exported binding so the importing module can resolve it by mangled symbol name:
+///   - exported FUNCTIONS become `LinFunction`s named `{module_key}_{name}`, compiled with
+///     their declared concrete signature (NOT the uniform boxed closure ABI) — the importer
+///     resolves them via `CallTarget::Named` and builds the call from the declared types.
+///   - exported NON-FUNCTION vals become zero-arg wrapper functions named
+///     `{module_key}_{name}__val` that recompute and return the value on each call (the
+///     importer reads them via a `Named` call). This mirrors the AST `register_import`
+///     contract exactly, so importers are agnostic to which backend compiled the import.
+///
+/// `module_key` is `mangle_module_key(path)`. Sibling references (function→function) resolve
+/// through `global_fn_slots` (Direct calls to the mangled symbols); cross-module imports,
+/// foreign bindings, and intrinsics resolve exactly as in the main lowering.
+pub fn lower_import_module(module: &TypedModule, module_key: &str) -> LinModule {
+    let mut ctx = LowerCtx::new();
+    ctx.intrinsics = module.intrinsics.clone();
+
+    // Pre-assign a FuncId + mangled symbol name to every top-level function so sibling
+    // Direct calls (and the importer's Named calls) resolve to the same symbol.
+    let mut global_fn_slots: HashMap<usize, FuncId> = HashMap::new();
+    let mut fn_names: HashMap<FuncId, String> = HashMap::new();
+    for stmt in &module.statements {
+        if let TypedStmt::Val {
+            slot,
+            value: TypedExpr::Function { name: Some(name), .. },
+            ..
+        } = stmt
+        {
+            let fid = ctx.alloc_func_id();
+            global_fn_slots.insert(*slot, fid);
+            fn_names.insert(fid, format!("{}_{}", module_key, name));
+        }
+    }
+    ctx.global_fn_slots = global_fn_slots.clone();
+
+    // Mutable-capture pre-scan (heap cells) — same as the main lowering.
+    for stmt in &module.statements {
+        collect_mutable_capture_slots_stmt(stmt, &mut ctx.mutable_cell_slots);
+    }
+
+    // Resolve this module's OWN imports/foreign bindings into the slot maps so function
+    // bodies can call them. We run the relevant arms of `lower_stmt` against a throwaway
+    // builder (Import/ForeignImport emit no instructions — they only populate ctx).
+    let mut resolver = FuncBuilder::new(
+        ctx.alloc_func_id(), None, vec![], false, Type::Null, ctx.intrinsics.clone(),
+    );
+    for stmt in &module.statements {
+        if matches!(stmt, TypedStmt::Import { .. } | TypedStmt::ForeignImport { .. }) {
+            lower_stmt(stmt, &mut resolver, &mut ctx);
+        }
+    }
+
+    // Lower each exported top-level function body under its forced mangled symbol name and
+    // pre-assigned FuncId. We need a host builder to call `lower_function_expr_with_id`,
+    // which appends the finished function to `ctx.pending_functions`.
+    let mut host = FuncBuilder::new(
+        ctx.alloc_func_id(), None, vec![], false, Type::Null, ctx.intrinsics.clone(),
+    );
+    host.push_scope();
+    for stmt in &module.statements {
+        if let TypedStmt::Val {
+            slot,
+            value: TypedExpr::Function { params, body, ret_type, captures, .. },
+            ..
+        } = stmt
+        {
+            if let Some(&fid) = ctx.global_fn_slots.get(slot) {
+                let mangled = fn_names.get(&fid).cloned();
+                lower_function_expr_with_id(
+                    Some(fid), None, mangled.as_deref(), params, body, ret_type, captures,
+                    &mut host, &mut ctx,
+                );
+            }
+        }
+    }
+    host.discard_scope();
+
+    // Emit a zero-arg `{module_key}_{name}__val` wrapper for each non-function exported val.
+    for stmt in &module.statements {
+        if let TypedStmt::Val { value, ty, name: Some(name), .. } = stmt {
+            if matches!(value, TypedExpr::Function { .. }) { continue; }
+            let fid = ctx.alloc_func_id();
+            let wrapper_name = format!("{}_{}__val", module_key, name);
+            let mut wb = FuncBuilder::new(
+                fid, Some(wrapper_name), vec![], false, ty.clone(), ctx.intrinsics.clone(),
+            );
+            wb.push_scope();
+            let t = lower_expr(value, &mut wb, &mut ctx);
+            let t = coerce_to_slot_type(t, &value.ty(), ty, &mut wb);
+            // The wrapper hands ownership of the computed value to the caller; keep it.
+            wb.pop_scope_releasing_keep(&[t]);
+            if !wb.is_current_block_terminated() {
+                if matches!(ty, Type::Null | Type::Never) {
+                    wb.terminate(Terminator::Return(None));
+                } else {
+                    wb.terminate(Terminator::Return(Some(t)));
+                }
+            }
+            wb.seal();
+            ctx.functions.push(wb.finish());
+        }
+    }
+
+    // Collect all lifted/nested functions produced during lowering.
+    while let Some(pending) = ctx.pending_functions.pop() {
+        ctx.functions.push(pending);
+    }
+
+    LinModule {
+        functions: ctx.functions,
+        global_fn_slots,
+        intrinsics: ctx.intrinsics,
+    }
+}
+
 // -------------------------------------------------------------------------
 // Context shared across the whole module lowering
 // -------------------------------------------------------------------------
@@ -292,6 +409,19 @@ impl FuncBuilder {
         }
     }
 
+    /// Register an owned temp that may be a boxed union/Json value (whose heap payload still
+    /// needs releasing). Used for projections (`obj[k]` / `obj.field`) whose result type is a
+    /// union: the projected TaggedVal* aliases a value inside the container, so it must be
+    /// dup'd and tracked for release like any other owned heap value. `Release` codegen is
+    /// tag-aware, so releasing a union temp frees its inner payload correctly.
+    fn register_owned_rc_or_union(&mut self, t: Temp, ty: Type) {
+        if is_rc_type(&ty) || is_union_ty(&ty) {
+            if let Some(frame) = self.scope_owned.last_mut() {
+                frame.push((t, ty));
+            }
+        }
+    }
+
     /// Remove a temp from the owned set across all live scope frames. Used when ownership
     /// of a freshly-allocated heap value is *transferred* into a container (array/object)
     /// or a consuming callee: the container now holds the +1, so the originating scope must
@@ -436,7 +566,7 @@ fn collect_mutable_capture_slots_expr(expr: &TypedExpr, out: &mut std::collectio
 
 /// Mangle an import path into the LLVM symbol prefix codegen uses for that module's
 /// exports. Must match `register_import`'s `path.replace("/", "_").replace("-", "_")`.
-fn mangle_module_key(path: &str) -> String {
+pub fn mangle_module_key(path: &str) -> String {
     path.replace('/', "_").replace('-', "_")
 }
 
@@ -577,16 +707,26 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
             }
         }
         TypedStmt::Var { slot, value, ty, .. } => {
-            let t = lower_expr(value, builder, ctx);
-            let t = coerce_to_slot_type(t, &value.ty(), ty, builder);
             if ctx.mutable_cell_slots.contains(slot) {
                 // Mutably captured by a closure: store in a heap cell shared by reference.
                 // The slot maps to the cell-pointer temp; reads/writes go through it.
+                //
+                // Cell type: a `var x = null` is typed `Null` by the checker even when later
+                // reassigned to other types (the checker doesn't widen it). A `Null` cell
+                // would store/read a null pointer and box every read back to null. Promote
+                // such cells to `Json` (TypeVar) so the cell holds boxed values across the
+                // closure boundary — matching the AST path's pointer-cell model. Boxing of
+                // the init and of each reassigned value is handled by coerce_to_slot_type.
+                let cell_ty = if matches!(ty, Type::Null) { Type::TypeVar(u32::MAX) } else { ty.clone() };
+                let t = lower_expr(value, builder, ctx);
+                let t = coerce_to_slot_type(t, &value.ty(), &cell_ty, builder);
                 let cell = builder.alloc_temp(Type::TypeVar(u32::MAX));
-                builder.emit(Instruction::MakeCell { dst: cell, init: t, ty: ty.clone() });
-                builder.cell_slots.insert(*slot, ty.clone());
+                builder.emit(Instruction::MakeCell { dst: cell, init: t, ty: cell_ty.clone() });
+                builder.cell_slots.insert(*slot, cell_ty);
                 builder.slots.insert(*slot, cell);
             } else {
+                let t = lower_expr(value, builder, ctx);
+                let t = coerce_to_slot_type(t, &value.ty(), ty, builder);
                 // Plain mutable temp; tracked per var slot, updated on LocalSet.
                 builder.slots.insert(*slot, t);
             }
@@ -954,7 +1094,10 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // that releases on reassignment, or a scope-exit release, is then balanced and the
             // container's own release stays safe. Without this, releasing the container frees
             // a value still aliased by the projected binding (the AST path masks this by
-            // leaking the container instead).
+            // leaking the container instead). A union/Json result is NOT dup'd here: the
+            // runtime accessor (lin_object_get) returns an INTERIOR pointer to the entry's
+            // TaggedVal, not an ownable heap box — treating it as owned and releasing it would
+            // free an interior address. Concrete heap projections ARE real owned values.
             if is_rc_type(result_type) {
                 builder.emit(Instruction::Retain { val: dst, ty: result_type.clone() });
                 builder.register_owned(dst, result_type.clone());
@@ -974,6 +1117,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 result_ty: result_type.clone(),
             });
             // Dup the projected heap reference — see the Index case above for the rationale.
+            // (Union/Json results are interior pointers — not dup'd; see the Index case.)
             if is_rc_type(result_type) {
                 builder.emit(Instruction::Retain { val: dst, ty: result_type.clone() });
                 builder.register_owned(dst, result_type.clone());
@@ -1181,10 +1325,25 @@ fn lower_intrinsic_call(
         "lin_to_string" => Intrinsic::ToString,
         "lin_length" => Intrinsic::Length,
         "lin_push" => Intrinsic::Push,
+        "lin_object_set" => Intrinsic::ObjectSetDyn,
+        "lin_array_set" => Intrinsic::ArraySetDyn,
+        "lin_keys" => Intrinsic::Keys,
+        "lin_value_key" => Intrinsic::ValueKey,
+        "lin_array_allocate" => Intrinsic::ArrayAllocate,
+        "lin_array_allocate_filled" => Intrinsic::ArrayAllocateFilled,
         "concat" => Intrinsic::Concat,
         "lin_async" => Intrinsic::Async,
         "lin_await" => Intrinsic::Await,
         "lin_exit" => Intrinsic::Exit,
+        "lin_parallel" => Intrinsic::Parallel,
+        "lin_race" => Intrinsic::Race,
+        "lin_timeout" => Intrinsic::Timeout,
+        "lin_retry" => Intrinsic::Retry,
+        "lin_thread_pool" => Intrinsic::ThreadPool,
+        "lin_worker" => Intrinsic::Worker,
+        "lin_request" => Intrinsic::Request,
+        "lin_message" => Intrinsic::Message,
+        "lin_close" => Intrinsic::Close,
         _ => {
             // Unknown intrinsic: lower as indirect call fallback.
             let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();
@@ -1200,6 +1359,31 @@ fn lower_intrinsic_call(
         }
     };
     let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();
+
+    // `push(arr, elem)` / `set(arr, idx, elem)` transfer a reference to the element into the
+    // array, and codegen's push/set do NOT retain (they store the pointer / copy the boxed
+    // value). So manage the element's ownership like a MakeArray element: a fresh allocation
+    // transfers its +1 (drop it from the owning scope so the scope-exit release doesn't free a
+    // value the array now holds); a borrowed heap value is retained so both owners can release.
+    // The element is the LAST argument in all three: push(arr, elem), set(arr, idx, elem),
+    // object_set(obj, key, val). For push/set, codegen does NOT retain (stores the pointer);
+    // for object_set, codegen boxes the value, calls lin_object_set (which retains the inner),
+    // then releases the box (undoing that retain) — so the net effect is also a transfer.
+    // Either way: a fresh allocation transfers its +1 into the container (drop it from the
+    // owning scope so scope-exit doesn't double-free); a borrowed heap value is retained.
+    if matches!(intrinsic, Intrinsic::Push | Intrinsic::ArraySetDyn | Intrinsic::ObjectSetDyn) {
+        if let (Some(elem_expr), Some(&elem_temp)) = (args.last(), lowered_args.last()) {
+            let et = elem_expr.ty();
+            if is_rc_type(&et) {
+                if expr_is_fresh_alloc(elem_expr) {
+                    builder.unregister_owned(elem_temp);
+                } else {
+                    builder.emit(Instruction::Retain { val: elem_temp, ty: et });
+                }
+            }
+        }
+    }
+
     let dst = builder.alloc_temp(result_type.clone());
     builder.emit(Instruction::CallIntrinsic {
         dst,
@@ -1715,6 +1899,24 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
 // If lowering
 // -------------------------------------------------------------------------
 
+/// Lower a condition expression to an i1 Bool temp. A condition whose static type is not
+/// already Bool (e.g. a call to an untyped `f: Function` predicate, which returns a boxed
+/// Json) is coerced — codegen lowers a Json→Bool Coerce via lin_unbox_bool. Without this,
+/// codegen's CondJump sees a non-i1 value and defaults the branch to `false`.
+fn lower_cond_as_bool(cond: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+    let t = lower_expr(cond, builder, ctx);
+    let cond_ty = cond.ty();
+    if matches!(cond_ty, Type::Bool) {
+        t
+    } else {
+        let dst = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Coerce {
+            dst, src: t, from_ty: cond_ty, to_ty: Type::Bool,
+        });
+        dst
+    }
+}
+
 fn lower_if(
     cond: &TypedExpr,
     then_br: &TypedExpr,
@@ -1723,7 +1925,7 @@ fn lower_if(
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> Temp {
-    let cond_temp = lower_expr(cond, builder, ctx);
+    let cond_temp = lower_cond_as_bool(cond, builder, ctx);
 
     let then_block = builder.alloc_block("if_then");
     let else_block = builder.alloc_block("if_else");
@@ -1872,6 +2074,16 @@ fn lower_match(
         let arm_raw = lower_expr(&arm.body, builder, ctx);
         if !builder.is_current_block_terminated() {
             let arm_val = coerce_to_slot_type(arm_raw, &arm.body.ty(), result_type, builder);
+            // If an arm returns the scrutinee itself (e.g. `match x is {..} => x`), the match
+            // result aliases the scrutinee temp. The scrutinee is owned by an ENCLOSING scope
+            // (it's a val/expr lowered before the match); transferring it into the match result
+            // (also registered owned at the merge) would double-own it → the enclosing
+            // scope-exit release frees the still-live result. Drop it from the enclosing scope
+            // so exactly one owner (the match result) remains.
+            if arm_val == scrut_temp || arm_raw == scrut_temp || arm_val == raw_scrut || arm_raw == raw_scrut {
+                builder.unregister_owned(scrut_temp);
+                builder.unregister_owned(raw_scrut);
+            }
             // Release this arm's owned temps, keeping the result and its raw pre-coercion temp.
             builder.pop_scope_releasing_keep(&[arm_val, arm_raw]);
             incomings.push((arm_val, builder.current_block));
@@ -1947,6 +2159,14 @@ fn lower_match_pattern(
             });
             PatternTest::Cond(dst)
         }
+        // Object pattern (`is { "type": "error", "message": _ }`): the value must be an
+        // object that HAS the listed fields, with any value-constrained fields matching.
+        // This mirrors the `has { .. }` object handling below. The generic `Is(tp)` arm's
+        // bare `IsType` is wrong here — `pattern_type_check` maps an object pattern to
+        // `Type::Never`, whose tag constant is 0xFF, so the tag check would never match.
+        TypedMatchPattern::Is(tp @ TypedPattern::Object { .. }) => {
+            lower_object_pattern_test(tp, scrut, builder, ctx)
+        }
         TypedMatchPattern::Is(tp) => {
             let (check_ty, _) = pattern_type_check(tp);
             let dst = builder.alloc_temp(Type::Bool);
@@ -1969,54 +2189,64 @@ fn lower_match_pattern(
             });
             PatternTest::Cond(dst)
         }
-        TypedMatchPattern::Has(tp) => {
-            let required_fields = pattern_required_fields(tp);
-            let mut cond = builder.alloc_temp(Type::Bool);
-            builder.emit(Instruction::HasPattern {
-                dst: cond,
-                val: scrut,
-                pattern: HasDesc { required_fields },
-            });
-            // For object fields with a value constraint (e.g. `has { "type": "success" }`),
-            // also require scrut[key] == literal, AND-ed into the condition. The transient
-            // comparison temps (boxed literal, fetched field) are scoped so they're released
-            // in THIS test block — not at the enclosing scope exit, which a per-arm test
-            // block does not dominate.
-            if let TypedPattern::Object { fields, .. } = tp {
-                let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
-                builder.push_scope();
-                for field in fields {
-                    if let Some(vp) = &field.value_pattern {
-                        let lit_ty = vp.ty();
-                        let lit_raw = lower_expr(vp, builder, ctx);
-                        let lit = box_to_json(lit_raw, &lit_ty, builder);
-                        // got = scrut[key]
-                        let key_temp = builder.const_temp(Const::Str(field.key.clone()));
-                        let got = builder.alloc_temp(Type::TypeVar(u32::MAX));
-                        builder.emit(Instruction::Index {
-                            dst: got, object: scrut, key: key_temp,
-                            obj_ty: scrut_ty.clone(), key_ty: Type::Str, result_ty: Type::TypeVar(u32::MAX),
-                        });
-                        let eq = builder.alloc_temp(Type::Bool);
-                        builder.emit(Instruction::Binary {
-                            dst: eq, op: BinOp::Eq, lhs: got, rhs: lit,
-                            operand_ty: Type::TypeVar(u32::MAX), ty: Type::Bool,
-                        });
-                        let combined = builder.alloc_temp(Type::Bool);
-                        builder.emit(Instruction::Binary {
-                            dst: combined, op: BinOp::And, lhs: cond, rhs: eq,
-                            operand_ty: Type::Bool, ty: Type::Bool,
-                        });
-                        cond = combined;
-                    }
-                }
-                // `cond` is a Bool (not RC), so it survives; only the transient RC temps
-                // (literal strings, fetched fields) are released here.
-                builder.pop_scope_releasing(Temp(u32::MAX));
-            }
-            PatternTest::Cond(cond)
-        }
+        TypedMatchPattern::Has(tp) => lower_object_pattern_test(tp, scrut, builder, ctx),
     }
+}
+
+/// Lower an object pattern test (`is`/`has { k: v, .. }`): the scrutinee must be an object
+/// that HAS the listed fields, with each value-constrained field equal to its literal. Used
+/// by both `Is(Object)` and `Has(Object)` — for an object shape check the two are equivalent
+/// (tag-is-object + required fields + value constraints).
+fn lower_object_pattern_test(
+    tp: &TypedPattern,
+    scrut: Temp,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> PatternTest {
+    let required_fields = pattern_required_fields(tp);
+    let mut cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::HasPattern {
+        dst: cond,
+        val: scrut,
+        pattern: HasDesc { required_fields },
+    });
+    // For object fields with a value constraint (e.g. `{ "type": "success" }`), also require
+    // scrut[key] == literal, AND-ed into the condition. The transient comparison temps (boxed
+    // literal, fetched field) are scoped so they're released in THIS test block — not at the
+    // enclosing scope exit, which a per-arm test block does not dominate.
+    if let TypedPattern::Object { fields, .. } = tp {
+        let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
+        builder.push_scope();
+        for field in fields {
+            if let Some(vp) = &field.value_pattern {
+                let lit_ty = vp.ty();
+                let lit_raw = lower_expr(vp, builder, ctx);
+                let lit = box_to_json(lit_raw, &lit_ty, builder);
+                // got = scrut[key]
+                let key_temp = builder.const_temp(Const::Str(field.key.clone()));
+                let got = builder.alloc_temp(Type::TypeVar(u32::MAX));
+                builder.emit(Instruction::Index {
+                    dst: got, object: scrut, key: key_temp,
+                    obj_ty: scrut_ty.clone(), key_ty: Type::Str, result_ty: Type::TypeVar(u32::MAX),
+                });
+                let eq = builder.alloc_temp(Type::Bool);
+                builder.emit(Instruction::Binary {
+                    dst: eq, op: BinOp::Eq, lhs: got, rhs: lit,
+                    operand_ty: Type::TypeVar(u32::MAX), ty: Type::Bool,
+                });
+                let combined = builder.alloc_temp(Type::Bool);
+                builder.emit(Instruction::Binary {
+                    dst: combined, op: BinOp::And, lhs: cond, rhs: eq,
+                    operand_ty: Type::Bool, ty: Type::Bool,
+                });
+                cond = combined;
+            }
+        }
+        // `cond` is a Bool (not RC), so it survives; only the transient RC temps
+        // (literal strings, fetched fields) are released here.
+        builder.pop_scope_releasing(Temp(u32::MAX));
+    }
+    PatternTest::Cond(cond)
 }
 
 /// After a pattern test succeeds, bind pattern variables into slots.
@@ -2242,14 +2472,23 @@ fn lower_function_expr_with_id(
             inner_builder.slots.insert(cap.outer_slot, cap_t);
             if cap.is_mutable {
                 // Inside the closure, this slot is a cell: reads/writes go through it.
-                inner_builder.cell_slots.insert(cap.outer_slot, cap.ty.clone());
+                // Promote a `Null`-typed cell to `Json` to match the outer MakeCell promotion
+                // (see TypedStmt::Var) — otherwise a `found = item` write would coerce the
+                // value to Null (storing a null pointer) and reads would always see null.
+                let inner_cell_ty = if matches!(cap.ty, Type::Null) { Type::TypeVar(u32::MAX) } else { cap.ty.clone() };
+                inner_builder.cell_slots.insert(cap.outer_slot, inner_cell_ty);
             }
         }
     }
 
     inner_builder.push_scope();
-    let body_ty = body.ty();
     let raw_ret = lower_expr(body, &mut inner_builder, ctx);
+    // Use the lowered temp's ACTUAL type for the return coercion, not the surface
+    // `body.ty()`. They can disagree when the body reads a mutably-captured `var` whose
+    // declared type was widened by reassignment: e.g. `var found = null; ...; found` has
+    // surface type `Null`, but the cell (and the CellGet temp) is `Json`. Trusting the
+    // stale `Null` would coerce the live Json value to a boxed null on return.
+    let body_ty = inner_builder.temp_types.get(&raw_ret).cloned().unwrap_or_else(|| body.ty());
     // Closure return ABI:
     // - `forced_ret` (set when this closure is a callback argument whose parameter declares
     //   a concrete return, e.g. groupBy's `keyFn: (Json) => String`): return exactly that
