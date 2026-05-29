@@ -7574,6 +7574,42 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, result);
                             }
                         }
+                        Instruction::ArrayLenCheck { dst, val, n, at_least } => {
+                            if let Some(&v) = temp_map.get(val) {
+                                let result = if v.is_pointer_value() {
+                                    // is-array (tag 8)?
+                                    let tag = self.builder.build_call(self.rt_get_tag, &[v.into()], "alc_tag")
+                                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                                    let is_arr = self.builder.build_int_compare(IntPredicate::EQ, tag,
+                                        self.context.i8_type().const_int(8, false), "alc_isarr").unwrap();
+                                    // length(unbox(v)) <op> n. Safe to compute even if not an array
+                                    // (unbox of a non-array would be junk), so guard with a select:
+                                    // only call length when is_arr — use a branch to avoid bad reads.
+                                    let cont = self.context.append_basic_block(llvm_fn, "alc_arr");
+                                    let merge = self.context.append_basic_block(llvm_fn, "alc_merge");
+                                    let entry_bb = self.builder.get_insert_block().unwrap();
+                                    self.builder.build_conditional_branch(is_arr, cont, merge).unwrap();
+                                    self.builder.position_at_end(cont);
+                                    let arr = self.builder.build_call(self.rt_unbox_ptr, &[v.into()], "alc_arr_ptr")
+                                        .unwrap().try_as_basic_value().unwrap_basic();
+                                    let len = self.builder.build_call(self.rt_array_length, &[arr.into()], "alc_len")
+                                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                                    let nconst = i64_ty.const_int(*n, false);
+                                    let pred = if *at_least { IntPredicate::SGE } else { IntPredicate::EQ };
+                                    let len_ok = self.builder.build_int_compare(pred, len, nconst, "alc_lenok").unwrap();
+                                    self.builder.build_unconditional_branch(merge).unwrap();
+                                    let cont_end = self.builder.get_insert_block().unwrap();
+                                    self.builder.position_at_end(merge);
+                                    let phi = self.builder.build_phi(self.context.bool_type(), "alc_res").unwrap();
+                                    let f = self.context.bool_type().const_zero();
+                                    phi.add_incoming(&[(&f, entry_bb), (&len_ok, cont_end)]);
+                                    phi.as_basic_value()
+                                } else {
+                                    self.context.bool_type().const_zero().into()
+                                };
+                                temp_map.insert(*dst, result);
+                            }
+                        }
                         Instruction::EnvCapture { dst, env, index, ty } => {
                             if let Some(&env_v) = temp_map.get(env) {
                                 if env_v.is_pointer_value() {

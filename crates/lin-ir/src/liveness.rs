@@ -206,6 +206,7 @@ pub fn instr_use_def(instr: &Instruction) -> (Vec<Temp>, Vec<Temp>) {
         Instruction::IndexSet { object, key, value, .. } => (vec![*object, *key, *value], vec![]),
         Instruction::FieldGet { dst, object, .. } => (vec![*object], vec![*dst]),
         Instruction::EnvCapture { dst, env, .. } => (vec![*env], vec![*dst]),
+        Instruction::ArrayLenCheck { dst, val, .. } => (vec![*val], vec![*dst]),
         Instruction::Retain { val, .. } => (vec![*val], vec![]),
         Instruction::Release { val, .. } => (vec![*val], vec![]),
         Instruction::IsType { dst, val, .. } => (vec![*val], vec![*dst]),

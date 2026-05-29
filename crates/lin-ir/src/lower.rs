@@ -1578,6 +1578,18 @@ fn lower_match_pattern(
             });
             PatternTest::Cond(dst)
         }
+        // Array pattern (`is []`, `is [a, b]`, `is [x, ...rest]`): the value must be an
+        // array of the right length (exact, or >= when a rest binding is present).
+        TypedMatchPattern::Is(TypedPattern::Array { elements, rest, .. }) => {
+            let dst = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::ArrayLenCheck {
+                dst,
+                val: scrut,
+                n: elements.len() as u64,
+                at_least: rest.is_some(),
+            });
+            PatternTest::Cond(dst)
+        }
         TypedMatchPattern::Is(tp) => {
             let (check_ty, _) = pattern_type_check(tp);
             let dst = builder.alloc_temp(Type::Bool);
