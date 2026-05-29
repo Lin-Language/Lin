@@ -135,6 +135,21 @@ pub unsafe extern "C" fn lin_fs_write_json(path: *const u8, val: *const u8) -> *
     }
 }
 
+/// Write a TaggedVal* as compact (single-line) JSON to a file.
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_write_json_compact(path: *const u8, val: *const u8) -> *mut u8 {
+    let path_str = match resolve_lin_str(path) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid path"),
+    };
+    let json_val = tagged_to_json(val);
+    let serialized = serde_json::to_string(&json_val).unwrap_or_default();
+    match std::fs::write(&path_str, &serialized) {
+        Ok(_) => std::ptr::null_mut(),
+        Err(e) => make_error_tagged(&e.to_string()),
+    }
+}
+
 /// Read a file and parse it as JSON. path may be LinString* or TaggedVal*(Str).
 #[no_mangle]
 pub unsafe extern "C" fn lin_fs_read_json(path: *const u8) -> *mut u8 {

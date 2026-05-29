@@ -1715,7 +1715,7 @@ import {{ toString }} from "std/string"
 
 import {{ writeJson, readJson }} from "std/fs"
 val data = {{ "name": "Lin", "version": 1 }}
-writeJson("{path}", data)
+writeJson("{path}", data, {{}})
 val loaded = readJson("{path}")
 print(loaded["name"])
 print(toString(loaded["version"]))
@@ -1799,8 +1799,8 @@ fn test_fs_list_dir() {
 import {{ toString }} from "std/string"
 import {{ length }} from "std/array"
 
-import {{ listDir }} from "std/fs"
-val entries = listDir("{dir_path}")
+import {{ ls }} from "std/fs"
+val entries = ls("{dir_path}", {{}})
 print(toString(length(entries)))
 "#));
     let _ = fs::remove_dir_all(&tmp_dir);
@@ -1811,8 +1811,8 @@ print(toString(length(entries)))
 fn test_fs_list_dir_missing_returns_error() {
     let output = run(r#"import { print } from "std/io"
 
-import { listDir } from "std/fs"
-val result = listDir("/nonexistent/path/that/does/not/exist")
+import { ls } from "std/fs"
+val result = ls("/nonexistent/path/that/does/not/exist", {})
 print(result["type"])
 "#);
     assert_eq!(output, vec!["error"]);
@@ -1828,7 +1828,7 @@ import {{ toString }} from "std/string"
 
 import {{ mkdir, isDir }} from "std/fs"
 val before = isDir("{dir_path}")
-mkdir("{dir_path}")
+mkdir("{dir_path}", {{}})
 val after = isDir("{dir_path}")
 print(toString(before))
 print(toString(after))
@@ -1845,8 +1845,8 @@ fn test_fs_mkdir_all() {
     let output = run(&format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
 
-import {{ mkdirAll, isDir }} from "std/fs"
-mkdirAll("{dir_path}")
+import {{ mkdir, isDir }} from "std/fs"
+mkdir("{dir_path}", {{ "parents": true }})
 print(toString(isDir("{dir_path}")))
 "#));
     let _ = fs::remove_dir_all(std::env::temp_dir().join("lin_ctest_mkdirall"));
@@ -1861,9 +1861,9 @@ fn test_fs_delete_file() {
     let output = run(&format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
 
-import {{ deleteFile, exists }} from "std/fs"
+import {{ rm, exists }} from "std/fs"
 val before = exists("{path}")
-deleteFile("{path}")
+rm("{path}", {{}})
 val after = exists("{path}")
 print(toString(before))
 print(toString(after))
@@ -1876,8 +1876,8 @@ print(toString(after))
 fn test_fs_delete_file_missing_returns_error() {
     let output = run(r#"import { print } from "std/io"
 
-import { deleteFile } from "std/fs"
-val result = deleteFile("/nonexistent/path/that/does/not/exist.txt")
+import { rm } from "std/fs"
+val result = rm("/nonexistent/path/that/does/not/exist.txt", {})
 print(result["type"])
 "#);
     assert_eq!(output, vec!["error"]);
@@ -1895,8 +1895,8 @@ fn test_fs_rename() {
     let output = run(&format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
 
-import {{ rename, exists, readFile }} from "std/fs"
-rename("{src_path}", "{dst_path}")
+import {{ mv, exists, readFile }} from "std/fs"
+mv("{src_path}", "{dst_path}")
 print(toString(exists("{src_path}")))
 print(toString(exists("{dst_path}")))
 print(readFile("{dst_path}"))

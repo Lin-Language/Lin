@@ -30,4 +30,4 @@ match graphData
       print("path: ${join(path, " ")}")
       print("distance: ${toString(d)}")
       if outputPath != null then
-        writeJson(outputPath, { "path": path, "distance": d })
+        writeJson(outputPath, { "path": path, "distance": d }, {})

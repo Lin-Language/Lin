@@ -1,7 +1,7 @@
 import { expect, toBe, toSucceed, toFail, test, suite, run } from "std/test"
 import { toString } from "std/string"
 import { length } from "std/array"
-import { readFile, writeFile, appendFile, readLines, readJson, writeJson, exists, isFile, isDir, stat, listDir, mkdir, mkdirAll, deleteFile, rename } from "std/fs"
+import { readFile, writeFile, appendFile, readLines, readJson, writeJson, exists, isFile, isDir, stat, ls, mkdir, rm, cp, mv, readFileBytes, writeFileBytes, writeLines } from "std/fs"
 
 val tmpRead   = "/tmp/lin_test_fs_read.txt"
 val tmpExists = "/tmp/lin_test_fs_exists.txt"
@@ -25,7 +25,7 @@ val s = suite("std/fs", [
   ),
 
   test("exists false before write, true after", () =>
-    deleteFile(tmpExists)
+    rm(tmpExists, {})
     val before = exists(tmpExists)
     writeFile(tmpExists, "x")
     val after = exists(tmpExists)
@@ -46,16 +46,35 @@ val s = suite("std/fs", [
     expect(length(lines)).toBe(3)
   ),
 
+  test("readLines returns error for missing file", () =>
+    val result = readLines("/nonexistent/path/that/does/not/exist.txt")
+    expect(result["type"]).toBe("error")
+  ),
+
   test("writeJson then readJson round-trips", () =>
     val data = { "name": "lin", "version": 1 }
-    writeJson(tmpJson, data)
+    writeJson(tmpJson, data, {})
     val loaded = readJson(tmpJson)
     expect(loaded["name"]).toBe("lin")
   ),
 
+  test("writeJson default is pretty (multiline)", () =>
+    val data = { "name": "lin" }
+    writeJson(tmpJson, data, {})
+    val content = readFile(tmpJson)
+    expect(isFile(tmpJson)).toBe(true)
+  ),
+
+  test("writeJson compact option writes compact JSON", () =>
+    val data = { "name": "lin", "version": 1 }
+    writeJson(tmpJson, data, { "compact": true })
+    val content = readFile(tmpJson)
+    expect(content).toBe("{\"name\":\"lin\",\"version\":1}")
+  ),
+
   test("isFile false before write, true after", () =>
     val tmpIsFile = "/tmp/lin_test_fs_isfile.txt"
-    deleteFile(tmpIsFile)
+    rm(tmpIsFile, {})
     val before = isFile(tmpIsFile)
     writeFile(tmpIsFile, "hello")
     val after = isFile(tmpIsFile)
@@ -81,51 +100,101 @@ val s = suite("std/fs", [
     expect(s["type"]).toBe("error")
   ),
 
+  test("stat includes mode field", () =>
+    writeFile(tmpStat, "hello")
+    val s = stat(tmpStat)
+    val mode = s["mode"]
+    expect(mode != null).toBe(true)
+  ),
+
   test("mkdir creates directory", () =>
     val mkdirPath = "/tmp/lin_test_fs_mkdir_once"
-    val r = mkdir(mkdirPath)
+    mkdir(mkdirPath, {})
     expect(isDir(mkdirPath)).toBe(true)
   ),
 
-  test("mkdirAll creates nested directories", () =>
+  test("mkdir with parents option creates nested directories", () =>
     val nested = "/tmp/lin_test_fs_mkdirall/a/b"
-    mkdirAll(nested)
+    mkdir(nested, { "parents": true })
     expect(isDir(nested)).toBe(true)
   ),
 
-  test("listDir returns entries in a directory", () =>
+  test("ls returns entries in a directory", () =>
     val listTmpDir = "/tmp/lin_test_fs_listdir"
-    mkdirAll(listTmpDir)
+    mkdir(listTmpDir, { "parents": true })
     writeFile("/tmp/lin_test_fs_listdir/x.txt", "x")
     writeFile("/tmp/lin_test_fs_listdir/y.txt", "y")
-    val entries = listDir(listTmpDir)
+    val entries = ls(listTmpDir, {})
     expect(length(entries)).toBe(2)
   ),
 
-  test("listDir returns error for missing directory", () =>
-    val result = listDir("/nonexistent/path/that/does/not/exist")
+  test("ls returns error for missing directory", () =>
+    val result = ls("/nonexistent/path/that/does/not/exist", {})
     expect(result["type"]).toBe("error")
   ),
 
-  test("deleteFile removes a file", () =>
+  test("ls with recursive option returns nested entries", () =>
+    val recDir = "/tmp/lin_test_fs_ls_recursive"
+    mkdir(recDir, { "parents": true })
+    mkdir("/tmp/lin_test_fs_ls_recursive/sub", { "parents": true })
+    writeFile("/tmp/lin_test_fs_ls_recursive/a.txt", "a")
+    writeFile("/tmp/lin_test_fs_ls_recursive/sub/b.txt", "b")
+    val entries = ls(recDir, { "recursive": true })
+    expect(length(entries) >= 3).toBe(true)
+  ),
+
+  test("rm removes a file", () =>
     writeFile(tmpRename, "to delete")
     val before = exists(tmpRename)
-    deleteFile(tmpRename)
+    rm(tmpRename, {})
     val after = exists(tmpRename)
     val r = [expect(before).toBe(true), expect(after).toBe(false)]
     r
   ),
 
-  test("deleteFile returns error for missing file", () =>
-    val result = deleteFile("/nonexistent/path/that/does/not/exist.txt")
+  test("rm returns error for missing file", () =>
+    val result = rm("/nonexistent/path/that/does/not/exist.txt", {})
     expect(result["type"]).toBe("error")
   ),
 
-  test("rename moves a file", () =>
+  test("rm with recursive option removes directory", () =>
+    val rmDir = "/tmp/lin_test_fs_rm_recursive"
+    mkdir(rmDir, { "parents": true })
+    writeFile("/tmp/lin_test_fs_rm_recursive/file.txt", "x")
+    rm(rmDir, { "recursive": true })
+    expect(exists(rmDir)).toBe(false)
+  ),
+
+  test("mv moves a file", () =>
     writeFile(tmpRename, "hello rename")
-    rename(tmpRename, tmpRenameDst)
+    mv(tmpRename, tmpRenameDst)
     val r = [expect(exists(tmpRename)).toBe(false), expect(exists(tmpRenameDst)).toBe(true), expect(readFile(tmpRenameDst)).toBe("hello rename")]
     r
+  ),
+
+  test("cp copies a file", () =>
+    val cpSrc = "/tmp/lin_test_fs_cp_src.txt"
+    val cpDst = "/tmp/lin_test_fs_cp_dst.txt"
+    writeFile(cpSrc, "copy me")
+    rm(cpDst, {})
+    cp(cpSrc, cpDst)
+    val r = [expect(exists(cpSrc)).toBe(true), expect(exists(cpDst)).toBe(true), expect(readFile(cpDst)).toBe("copy me")]
+    r
+  ),
+
+  test("readFileBytes and writeFileBytes round-trip", () =>
+    val byteFile = "/tmp/lin_test_fs_bytes.bin"
+    val bytesIn = readFileBytes(tmpRead)
+    writeFileBytes(byteFile, bytesIn)
+    val bytesOut = readFileBytes(byteFile)
+    expect(length(bytesIn)).toBe(length(bytesOut))
+  ),
+
+  test("writeLines and readLines round-trip", () =>
+    val linesFile = "/tmp/lin_test_fs_lines_rt.txt"
+    writeLines(linesFile, ["foo", "bar", "baz"])
+    val result = readLines(linesFile)
+    expect(length(result)).toBe(3)
   ),
 ])
 
