@@ -7390,14 +7390,32 @@ impl<'ctx> Codegen<'ctx> {
                                     }
                                 }
                                 CallTarget::Named(name) => {
-                                    if let Some(callee_fn) = self.module.get_function(name) {
-                                        if let Some(p) = partial_app(self, callee_fn) { p }
-                                        else {
-                                            let call = self.builder.build_call(callee_fn, &arg_vals, "call_n").unwrap();
-                                            if matches!(ret_ty, Type::Null | Type::Never) { ptr_ty.const_null().into() }
-                                            else { call.try_as_basic_value().unwrap_basic() }
+                                    // Resolve the callee; if it's an undeclared runtime symbol
+                                    // (e.g. lin_array_slice_tagged), declare it from the actual
+                                    // argument LLVM types + return type so the call links.
+                                    let callee_fn = match self.module.get_function(name) {
+                                        Some(f) => f,
+                                        None => {
+                                            let param_types: Vec<BasicMetadataTypeEnum> = args.iter()
+                                                .map(|a| {
+                                                    let ty = func.temp_types.get(a).cloned().unwrap_or(Type::Null);
+                                                    self.llvm_param_type(&ty)
+                                                })
+                                                .collect();
+                                            let fn_ty = if matches!(ret_ty, Type::Null | Type::Never) {
+                                                void_ty.fn_type(&param_types, false)
+                                            } else {
+                                                self.llvm_type(ret_ty).fn_type(&param_types, false)
+                                            };
+                                            self.module.add_function(name, fn_ty, None)
                                         }
-                                    } else { ptr_ty.const_null().into() }
+                                    };
+                                    if let Some(p) = partial_app(self, callee_fn) { p }
+                                    else {
+                                        let call = self.builder.build_call(callee_fn, &arg_vals, "call_n").unwrap();
+                                        if matches!(ret_ty, Type::Null | Type::Never) { ptr_ty.const_null().into() }
+                                        else { call.try_as_basic_value().unwrap_basic() }
+                                    }
                                 }
                                 CallTarget::Indirect(fn_temp) => {
                                     if let Some(&cls_ptr) = temp_map.get(fn_temp) {

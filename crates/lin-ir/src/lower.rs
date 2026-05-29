@@ -490,9 +490,20 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 builder.slots.insert(*binding_slot, dst);
             }
             if let Some((rest_slot, rest_ty)) = rest {
-                // Rest slicing is handled fully in codegen; emit a copy of the source arr as placeholder.
+                // rest = arr[elements.len() .. length(arr)] via lin_array_slice_tagged.
+                let start = builder.const_temp(Const::Int(elements.len() as i64, Type::Int64));
+                let len = builder.alloc_temp(Type::Int64);
+                builder.emit(Instruction::CallIntrinsic {
+                    dst: len, intrinsic: Intrinsic::Length, args: vec![arr_temp], ret_ty: Type::Int64,
+                });
                 let dst = builder.alloc_temp(rest_ty.clone());
-                builder.emit(Instruction::Copy { dst, src: arr_temp });
+                builder.emit(Instruction::Call {
+                    dst,
+                    callee: CallTarget::Named("lin_array_slice_tagged".to_string()),
+                    args: vec![arr_temp, start, len],
+                    ret_ty: rest_ty.clone(),
+                });
+                builder.register_owned(dst, rest_ty.clone());
                 builder.slots.insert(*rest_slot, dst);
             }
             let _ = elem_ty;
