@@ -170,3 +170,34 @@ AST leg green throughout.
 4. **FFI / fs** — `ffi_end_to_end_c_library`, `fs_read_lines`.
 5. **Misc** — `partial_application_chain`, `pattern_matching_has`,
    `stdlib_array_flatmap_indexof_reverse`, `tail_call_optimization` (a specific shape).
+
+## Checkpoint 3 — 114/128 (stable stopping point)
+
+Net since checkpoint 2: object-return RC fix (function boxing its result kept the raw
+object too), array/object rest, iter, has-value-constraints, mixed numeric widening.
+
+**14 remaining**, dominated by two hard themes — both surfaced as real heap corruption
+(`stdlib/` run reports `malloc(): unaligned tcache chunk`, validating the planned ASan leg):
+
+1. **Mutable `var` captured by a closure** (heap-cell semantics, ADR-015) — not yet
+   modelled in the IR (var is a plain SSA temp). Blocks closures_and_var,
+   multiple_closures_share_var, and stdlib some/every (→ stdlib_array_find_some_every).
+   This is the single largest remaining feature (comparable to the loop/TCO work):
+   needs cell alloc + load/store-through-cell + capture-cell-pointer across lowering,
+   the IR model, and codegen.
+2. **RC ordering for boxed objects flowing through match value-constraints** —
+   tagged_unions, speculative_reads_typed_union (and contributes to the var/async
+   crashes). The has-pattern value-constraint path (Index read + boxed literal compare)
+   leaks/aliases; flaky crash vs empty output indicates a missing release or aliasing read.
+
+Plus: async/concurrency (async_val_capture, worker_request_reply — stdlib async wrappers
+are AST-compiled), FFI/fs (ffi_end_to_end_c_library, fs_read_lines), and one-offs
+(partial_application_chain, pattern_matching_has, tail_call_optimization,
+tostring_objects_and_arrays).
+
+### Recommended next steps (in order)
+- Add the **ASan/LSan CI leg + RC-stress fixtures** (deferred Phase 1 infra) BEFORE
+  further RC work — the long-tail is now clearly memory-safety-bound.
+- Implement mutable-var heap cells (biggest unlock).
+- Resolve the has-value-constraint RC aliasing.
+- Then the parity gate (Phase 8) and milestone-1 merge ask.
