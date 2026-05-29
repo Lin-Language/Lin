@@ -12,7 +12,7 @@ The project has one backend:
 
 ## Process
 
-Do not work or make changes directly in the codebase. Create a subagent with a git worktree do the work there and then integrate it.
+Do not work or make changes directly in the codebase. Create a subagent with a git worktree do the work there, ensure the workstree is up to date with the latest master, make sure the tests pass, then ask before merging back.
 
 ## Build / run / test
 
