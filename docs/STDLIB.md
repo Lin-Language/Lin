@@ -182,20 +182,23 @@ This document specifies the standard library for the Lin language. All modules a
 | Function | Signature | Summary |
 | --- | --- | --- |
 | [`appendFile`](#appendFile) | `(String, String) -> Null \| Error` | Append string to end of file |
-| [`deleteFile`](#deleteFile) | `(String) -> Null \| Error` | Delete a file |
+| [`cp`](#cp) | `(String, String) -> Null \| Error` | Copy a file |
 | [`exists`](#exists) | `(String) -> Boolean` | Test whether a file or directory exists |
 | [`isDir`](#isDir) | `(String) -> Boolean` | True if path is a directory |
 | [`isFile`](#isFile) | `(String) -> Boolean` | True if path is a regular file |
-| [`listDir`](#listDir) | `(String) -> String[] \| Error` | List directory entry names |
-| [`mkdir`](#mkdir) | `(String) -> Null \| Error` | Create a directory (one level) |
-| [`mkdirAll`](#mkdirAll) | `(String) -> Null \| Error` | Create directory and all parents |
+| [`ls`](#ls) | `(String, Json) -> String[] \| Error` | List directory entry names; supports `{ recursive }` |
+| [`mkdir`](#mkdir) | `(String, Json) -> Null \| Error` | Create a directory; supports `{ parents }` option |
+| [`mv`](#mv) | `(String, String) -> Null \| Error` | Move or rename a file |
 | [`readFile`](#readFile) | `(String) -> String \| Error` | Read entire file as a string |
+| [`readFileBytes`](#readFileBytes) | `(String) -> Int32[] \| Error` | Read file as raw bytes (each byte as Int32) |
 | [`readJson`](#readJson) | `(String) -> Json \| Error` | Read and parse file as JSON |
-| [`readLines`](#readLines) | `(String) -> Iterator \| Error` | Iterator over lines of a file |
-| [`rename`](#rename) | `(String, String) -> Null \| Error` | Move or rename a file |
+| [`readLines`](#readLines) | `(String) -> String[] \| Error` | Read lines of a file into an array |
+| [`rm`](#rm) | `(String, Json) -> Null \| Error` | Remove a file or directory; supports `{ recursive }` |
 | [`stat`](#stat) | `(String) -> FileStat \| Error` | File metadata |
 | [`writeFile`](#writeFile) | `(String, String) -> Null \| Error` | Write string to file, replacing contents |
-| [`writeJson`](#writeJson) | `(String, Json) -> Null \| Error` | Serialise value to JSON and write to file |
+| [`writeFileBytes`](#writeFileBytes) | `(String, Int32[]) -> Null \| Error` | Write raw bytes to file |
+| [`writeJson`](#writeJson) | `(String, Json, Json) -> Null \| Error` | Serialise value to pretty JSON; supports `{ compact }` option |
+| [`writeLines`](#writeLines) | `(String, String[]) -> Null \| Error` | Write an array of strings, one per line |
 
 **std/path**
 
@@ -2239,7 +2242,7 @@ match name
 Import:
 
 ```txt
-import { readFile, writeFile, readLines } from "std/fs"
+import { readFile, writeFile, readLines, ls, rm, cp, mv } from "std/fs"
 ```
 
 ### Types
@@ -2250,11 +2253,12 @@ type FileStat = {
   "modified": Int64,
   "created":  Int64,
   "isFile":   Boolean,
-  "isDir":    Boolean
+  "isDir":    Boolean,
+  "mode":     Int32
 }
 ```
 
-`size` is in bytes. `modified` and `created` are Unix timestamps in milliseconds.
+`size` is in bytes. `modified` and `created` are Unix timestamps in milliseconds. `mode` is the Unix file permission bits (0 on non-Unix platforms).
 
 ---
 
@@ -2268,17 +2272,17 @@ Appends `content` to the end of the file at `path`.
 
 ---
 
-### deleteFile
+### cp
 
 ```txt
-val deleteFile: (path: String) -> Null | Error
+val cp: (src: String, dst: String) -> Null | Error
 ```
 
-Deletes the file at `path`. Returns an `Error` if the file does not exist or cannot be removed.
+Copies the file at `src` to `dst`. Returns `Null` on success, `Error` on failure.
 
 ```txt
-match deleteFile("tmp/cache.json")
-  is { "type": "failure", "error": e } => print("could not delete: ${e}")
+match cp("src/main.lin", "backup/main.lin")
+  is { "type": "error", message } => print("copy failed: ${message}")
   else => null
 ```
 
@@ -2326,19 +2330,17 @@ isFile("missing")    // false
 
 ---
 
-### listDir
+### ls
 
 ```txt
-val listDir: (path: String) -> String[] | Error
+val ls: (path: String, opts: Json) -> String[] | Error
 ```
 
-Returns an array of entry names (not full paths) in the directory at `path`, in filesystem order. Returns an `Error` if `path` does not exist or is not a directory.
+Returns an array of entry names in the directory at `path`. Pass `{ "recursive": true }` to walk subdirectories recursively (returns relative paths). Returns an `Error` if `path` does not exist or is not a directory.
 
 ```txt
-match listDir("src")
-  is { "type": "failure", "error": e }         => print("cannot list: ${e}")
-  is { "type": "success", "value": names } =>
-    names.for(name => print(name))
+val entries = ls("src", {})
+val allFiles = ls("src", { "recursive": true })
 ```
 
 ---
@@ -2346,30 +2348,29 @@ match listDir("src")
 ### mkdir
 
 ```txt
-val mkdir: (path: String) -> Null | Error
+val mkdir: (path: String, opts: Json) -> Null | Error
 ```
 
-Creates the directory at `path`. All parent directories must already exist. Returns an `Error` if the path already exists or if a parent is missing.
+Creates the directory at `path`. Pass `{ "parents": true }` to create all missing parent directories (equivalent to `mkdir -p`). Returns an `Error` if the path already exists (without `parents`) or if a parent is missing.
 
 ```txt
-match mkdir("output")
-  is { "type": "failure", "error": e } => print("mkdir failed: ${e}")
-  else => null
+mkdir("output", {})
+mkdir("output/reports/2024", { "parents": true })
 ```
 
 ---
 
-### mkdirAll
+### mv
 
 ```txt
-val mkdirAll: (path: String) -> Null | Error
+val mv: (src: String, dst: String) -> Null | Error
 ```
 
-Creates the directory at `path` and all missing parent directories. Returns `Null` if the directory already exists.
+Moves or renames the file at `src` to `dst`. On most systems this is atomic if both paths are on the same filesystem.
 
 ```txt
-match mkdirAll("output/reports/2024")
-  is { "type": "failure", "error": e } => print("error: ${e}")
+match mv("tmp/output.json", "output.json")
+  is { "type": "error", message } => print("move failed: ${message}")
   else => null
 ```
 
@@ -2385,8 +2386,22 @@ Reads the entire contents of the file at `path` as a UTF-8 string.
 
 ```txt
 match readFile("config.txt")
-  is { "type": "success", "value": contents } => process(contents)
-  is { "type": "failure", "error": e }         => print("read failed: ${e}")
+  is { "type": "error", message } => print("read failed: ${message}")
+  else => process(readFile("config.txt"))
+```
+
+---
+
+### readFileBytes
+
+```txt
+val readFileBytes: (path: String) -> Int32[] | Error
+```
+
+Reads the file at `path` as raw bytes. Each byte is returned as an `Int32` value (0–255). Returns an `Error` if the file cannot be read.
+
+```txt
+val bytes = readFileBytes("image.png")
 ```
 
 ---
@@ -2404,32 +2419,32 @@ Reads and parses the file at `path` as JSON.
 ### readLines
 
 ```txt
-val readLines: (path: String) -> Iterator | Error
+val readLines: (path: String) -> String[] | Error
 ```
 
-Returns an iterator that yields one `String` per line from the file.
+Reads the file at `path` and returns an array of strings, one per line. Returns an `Error` if the file cannot be read.
 
 ```txt
 match readLines("data.csv")
-  is { "type": "failure", "error": e }         => print("cannot open: ${e}")
-  is { "type": "success", "value": it } =>
-    it.for(line => process(line))
+  is { "type": "error", message } => print("cannot open: ${message}")
+  else =>
+    val lines = readLines("data.csv")
+    lines.for(line => process(line))
 ```
 
 ---
 
-### rename
+### rm
 
 ```txt
-val rename: (from: String, to: String) -> Null | Error
+val rm: (path: String, opts: Json) -> Null | Error
 ```
 
-Moves or renames the file at `from` to `to`. On most systems this is atomic if both paths are on the same filesystem.
+Removes the file or directory at `path`. Pass `{ "recursive": true }` to remove a directory and all its contents. Without `recursive`, only files (not directories) can be removed.
 
 ```txt
-match rename("tmp/output.json", "output.json")
-  is { "type": "failure", "error": e } => print("rename failed: ${e}")
-  else => null
+rm("tmp/cache.json", {})
+rm("tmp/old-output", { "recursive": true })
 ```
 
 ---
@@ -2440,13 +2455,11 @@ match rename("tmp/output.json", "output.json")
 val stat: (path: String) -> FileStat | Error
 ```
 
-Returns metadata for the file or directory at `path`.
+Returns metadata for the file or directory at `path`. On success the result object has fields `size`, `modified`, `created`, `isFile`, `isDir`, and `mode`.
 
 ```txt
-match stat("data.csv")
-  is { "type": "failure", "error": e }         => print("stat failed: ${e}")
-  is { "type": "success", "value": info } =>
-    print("size: ${toString(info["size"])} bytes")
+val info = stat("data.csv")
+print("size: ${toString(info["size"])} bytes")
 ```
 
 ---
@@ -2461,13 +2474,42 @@ Writes `content` to the file at `path`, replacing existing contents.
 
 ---
 
+### writeFileBytes
+
+```txt
+val writeFileBytes: (path: String, bytes: Int32[]) -> Null | Error
+```
+
+Writes raw bytes to the file at `path`. Each element of `bytes` is treated as a byte value (0–255). Returns `Null` on success, `Error` on failure.
+
+---
+
 ### writeJson
 
 ```txt
-val writeJson: (path: String, value: Json) -> Null | Error
+val writeJson: (path: String, value: Json, opts: Json) -> Null | Error
 ```
 
-Serialises `value` to compact JSON and writes it to `path`.
+Serialises `value` to JSON and writes it to `path`. By default the output is pretty-printed. Pass `{ "compact": true }` to write compact single-line JSON.
+
+```txt
+writeJson("output.json", data, {})
+writeJson("output.json", data, { "compact": true })
+```
+
+---
+
+### writeLines
+
+```txt
+val writeLines: (path: String, lines: String[]) -> Null | Error
+```
+
+Writes each element of `lines` to the file at `path`, separated and terminated by newlines. Returns `Null` on success, `Error` on failure.
+
+```txt
+writeLines("names.txt", ["alice", "bob", "carol"])
+```
 
 ---
 

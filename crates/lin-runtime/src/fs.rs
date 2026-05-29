@@ -1,7 +1,8 @@
 use crate::string::{LinString, lin_string_from_bytes};
 use crate::object::{LinObject, lin_object_alloc, lin_object_set};
-use crate::array::lin_array_alloc;
-use crate::tagged::{TaggedVal, TAG_STR, TAG_OBJECT, TAG_ARRAY, alloc_tagged, lin_unbox_ptr};
+use crate::array::{lin_array_alloc, LinArray, lin_array_length, lin_array_get_tagged,
+                   lin_flat_array_alloc_i32, lin_flat_array_push_i32};
+use crate::tagged::{TaggedVal, TAG_STR, TAG_INT32, TAG_OBJECT, TAG_ARRAY, alloc_tagged, lin_unbox_ptr};
 
 pub unsafe fn make_string(s: &str) -> *mut LinString {
     lin_string_from_bytes(s.as_ptr(), s.len() as u32)
@@ -193,6 +194,20 @@ pub unsafe extern "C" fn lin_fs_stat(path: *const u8) -> *mut u8 {
             tv_is_dir.payload = is_dir as u64;
             lin_object_set(obj, k_is_dir, &tv_is_dir);
 
+            #[cfg(unix)]
+            let mode: i32 = {
+                use std::os::unix::fs::MetadataExt;
+                meta.mode() as i32
+            };
+            #[cfg(not(unix))]
+            let mode: i32 = 0i32;
+
+            let k_mode = make_string("mode");
+            let mut tv_mode: TaggedVal = std::mem::zeroed();
+            tv_mode.tag = crate::tagged::TAG_INT32;
+            tv_mode.payload = mode as i64 as u64;
+            lin_object_set(obj, k_mode, &tv_mode);
+
             alloc_tagged(TAG_OBJECT, obj as u64)
         }
     }
@@ -278,17 +293,16 @@ pub unsafe extern "C" fn lin_fs_rename(from: *const u8, to: *const u8) -> *mut u
     }
 }
 
-/// Read lines from file into a LinArray of LinString*. Returns bare LinArray* or null on error.
-/// The returned pointer is a raw LinArray* (not a TaggedVal*) for direct use by Array(Str) slots.
+/// Read lines from file. Returns TaggedVal*(Array of Str) on success, TaggedVal*(Object error) on failure.
 #[no_mangle]
 pub unsafe extern "C" fn lin_fs_read_lines(path: *const u8) -> *mut u8 {
     let path_str = match resolve_lin_str(path) {
         Some(s) => s,
-        None => return std::ptr::null_mut(),
+        None => return make_error_tagged("invalid UTF-8 path"),
     };
     let content = match std::fs::read_to_string(&path_str) {
         Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
+        Err(e) => return make_error_tagged(&e.to_string()),
     };
     let lines: Vec<&str> = content.lines().collect();
     let arr = lin_array_alloc(lines.len().max(4) as u64);
@@ -299,5 +313,197 @@ pub unsafe extern "C" fn lin_fs_read_lines(path: *const u8) -> *mut u8 {
         tv.payload = s as u64;
         crate::array::lin_array_push_tagged(arr, &tv as *const TaggedVal as *const u8);
     }
-    arr as *mut u8
+    alloc_tagged(TAG_ARRAY, arr as u64)
+}
+
+/// Copy a file from src to dst. Returns null on success, TaggedVal*(Object error) on failure.
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_cp(src: *const u8, dst: *const u8) -> *mut u8 {
+    let src_str = match resolve_lin_str(src) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid UTF-8 source path"),
+    };
+    let dst_str = match resolve_lin_str(dst) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid UTF-8 destination path"),
+    };
+    match std::fs::copy(&src_str, &dst_str) {
+        Ok(_) => std::ptr::null_mut(),
+        Err(e) => make_error_tagged(&e.to_string()),
+    }
+}
+
+/// Remove a file or directory. recursive!=0 allows removing directories recursively.
+/// Returns null on success, TaggedVal*(Object error) on failure.
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_rm(path: *const u8, recursive: u8) -> *mut u8 {
+    let path_str = match resolve_lin_str(path) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid UTF-8 path"),
+    };
+    let p = std::path::Path::new(&path_str);
+    let result = if recursive != 0 {
+        if p.is_dir() {
+            std::fs::remove_dir_all(p)
+        } else {
+            std::fs::remove_file(p)
+        }
+    } else {
+        std::fs::remove_file(p)
+    };
+    match result {
+        Ok(_) => std::ptr::null_mut(),
+        Err(e) => make_error_tagged(&e.to_string()),
+    }
+}
+
+/// List all files recursively under path. Returns TaggedVal*(Array of Str) on success, error on failure.
+/// Paths are relative to the given root directory.
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_list_dir_all(path: *const u8) -> *mut u8 {
+    let path_str = match resolve_lin_str(path) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid UTF-8 path"),
+    };
+    let arr = lin_array_alloc(8);
+    match collect_dir_recursive(&path_str, "", arr) {
+        Ok(_) => alloc_tagged(TAG_ARRAY, arr as u64),
+        Err(e) => {
+            // arr will leak but this is an error path
+            make_error_tagged(&e)
+        }
+    }
+}
+
+unsafe fn collect_dir_recursive(base: &str, prefix: &str, arr: *mut LinArray) -> Result<(), String> {
+    let read_path = if prefix.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}/{}", base, prefix)
+    };
+    let entries = std::fs::read_dir(&read_path)
+        .map_err(|e| e.to_string())?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let rel = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{}/{}", prefix, name)
+        };
+        let s = make_string(&rel);
+        let mut tv: TaggedVal = std::mem::zeroed();
+        tv.tag = TAG_STR;
+        tv.payload = s as u64;
+        crate::array::lin_array_push_tagged(arr, &tv as *const TaggedVal as *const u8);
+        let ft = entry.file_type().map_err(|e| e.to_string())?;
+        if ft.is_dir() {
+            collect_dir_recursive(base, &rel, arr)?;
+        }
+    }
+    Ok(())
+}
+
+/// Read a file as raw bytes. Returns TaggedVal*(flat Int32 array) on success, error on failure.
+/// Each byte is stored as an Int32 value.
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_read_file_bytes(path: *const u8) -> *mut u8 {
+    let path_str = match resolve_lin_str(path) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid UTF-8 path"),
+    };
+    let bytes = match std::fs::read(&path_str) {
+        Ok(b) => b,
+        Err(e) => return make_error_tagged(&e.to_string()),
+    };
+    let arr = lin_flat_array_alloc_i32(bytes.len().max(4) as u64);
+    for b in &bytes {
+        lin_flat_array_push_i32(arr, *b as i32);
+    }
+    alloc_tagged(TAG_ARRAY, arr as u64)
+}
+
+/// Write a flat Int32 array as raw bytes to a file.
+/// arr is a TaggedVal*(Array) where the inner array is a flat i32 array.
+/// Returns null on success, error on failure.
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_write_file_bytes(path: *const u8, arr: *const u8) -> *mut u8 {
+    let path_str = match resolve_lin_str(path) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid UTF-8 path"),
+    };
+    if arr.is_null() {
+        return make_error_tagged("null array");
+    }
+    // arr may be a TaggedVal*(Array) or a raw LinArray*
+    let tag = *arr;
+    let lin_arr = if tag == TAG_ARRAY {
+        let tv = arr as *const TaggedVal;
+        (*tv).payload as *const LinArray
+    } else {
+        arr as *const LinArray
+    };
+    let len = lin_array_length(lin_arr) as usize;
+    let mut bytes: Vec<u8> = Vec::with_capacity(len);
+    for i in 0..len as i64 {
+        let tv_ptr = lin_array_get_tagged(lin_arr, i);
+        let val = if tv_ptr.is_null() {
+            0u8
+        } else {
+            let tag = (*tv_ptr).tag;
+            let payload = (*tv_ptr).payload;
+            let v = match tag {
+                TAG_INT32 => payload as i32,
+                _ => payload as i32,
+            };
+            // Free the allocated TaggedVal returned by lin_array_get_tagged
+            std::alloc::dealloc(tv_ptr as *mut u8, std::alloc::Layout::new::<TaggedVal>());
+            v as u8
+        };
+        bytes.push(val);
+    }
+    match std::fs::write(&path_str, &bytes) {
+        Ok(_) => std::ptr::null_mut(),
+        Err(e) => make_error_tagged(&e.to_string()),
+    }
+}
+
+/// Write an array of strings to a file, one per line with a trailing newline.
+/// arr is a TaggedVal*(Array of Str).
+/// Returns null on success, error on failure.
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_write_lines(path: *const u8, arr: *const u8) -> *mut u8 {
+    let path_str = match resolve_lin_str(path) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid UTF-8 path"),
+    };
+    if arr.is_null() {
+        return make_error_tagged("null array");
+    }
+    // arr may be a TaggedVal*(Array) or a raw LinArray*
+    let tag = *arr;
+    let lin_arr = if tag == TAG_ARRAY {
+        let tv = arr as *const TaggedVal;
+        (*tv).payload as *const LinArray
+    } else {
+        arr as *const LinArray
+    };
+    let len = lin_array_length(lin_arr) as usize;
+    let mut lines: Vec<String> = Vec::with_capacity(len);
+    for i in 0..len as i64 {
+        let tv_ptr = lin_array_get_tagged(lin_arr, i);
+        let s = if tv_ptr.is_null() {
+            String::new()
+        } else {
+            let line = resolve_lin_str(tv_ptr as *const u8).unwrap_or_default();
+            // Free the allocated TaggedVal returned by lin_array_get_tagged
+            std::alloc::dealloc(tv_ptr as *mut u8, std::alloc::Layout::new::<TaggedVal>());
+            line
+        };
+        lines.push(s);
+    }
+    let content = lines.join("\n") + "\n";
+    match std::fs::write(&path_str, content.as_bytes()) {
+        Ok(_) => std::ptr::null_mut(),
+        Err(e) => make_error_tagged(&e.to_string()),
+    }
 }
