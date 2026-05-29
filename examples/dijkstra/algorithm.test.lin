@@ -1,24 +1,40 @@
-import { suite, test, expect, run, toBe } from "std/test"
-import { arrayAllocate, length } from "std/array"
+import { expect, toBe, test, suite, run } from "std/test"
+import { dijkstra } from "./algorithm"
+import { buildAdj } from "./graph"
 
-// Reproduce the codegen panic: arrayAllocate(n) where n is obtained
-// via chained index access obj["size"], which produces a TypeVar (Json)
-// pointer rather than a concrete Int32. The compiler must unbox it
-// before calling lin_array_alloc_null.
-
-val toInt = (v: Json): Int32 =>
-  match v
-    is Int32 => v
-    else => 0
-
-val allocWithJsonSize = (nodes: Json): Json =>
-  val n = toInt(nodes[0]["size"])
-  arrayAllocate(n)
-
-suite("dijkstra/codegen", [
-  test("chained index used as array size", () =>
-    val nodes: Json = [{"size": 3}]
-    val arr = allocWithJsonSize(nodes)
-    expect(length(arr)).toBe(3)
+val s = suite("dijkstra algorithm", [
+  test("distance from source to itself is 0", () =>
+    val adj = buildAdj([{ "from": "A", "to": "B", "weight": 5 }])
+    val result = dijkstra(adj, "A", ["A", "B"])
+    expect(result["dist"]["A"]).toBe(0)
   ),
-]).run()
+  test("finds direct edge weight", () =>
+    val adj = buildAdj([{ "from": "A", "to": "B", "weight": 7 }])
+    val result = dijkstra(adj, "A", ["A", "B"])
+    expect(result["dist"]["B"]).toBe(7)
+  ),
+  test("picks shortest of two paths", () =>
+    val adj = buildAdj([
+      { "from": "A", "to": "C", "weight": 1 },
+      { "from": "C", "to": "B", "weight": 2 },
+      { "from": "A", "to": "B", "weight": 10 },
+    ])
+    val result = dijkstra(adj, "A", ["A", "B", "C"])
+    expect(result["dist"]["B"]).toBe(3)
+  ),
+  test("unreachable node stays at initial large distance", () =>
+    val adj = buildAdj([{ "from": "A", "to": "B", "weight": 1 }])
+    val result = dijkstra(adj, "A", ["A", "B", "C"])
+    expect(result["dist"]["C"]).toBe(999999999)
+  ),
+  test("records correct prev pointer for path reconstruction", () =>
+    val adj = buildAdj([
+      { "from": "A", "to": "C", "weight": 1 },
+      { "from": "C", "to": "B", "weight": 2 },
+      { "from": "A", "to": "B", "weight": 10 },
+    ])
+    val result = dijkstra(adj, "A", ["A", "B", "C"])
+    expect(result["prev"]["B"]).toBe("C")
+  ),
+])
+run(s)

@@ -1,0 +1,34 @@
+import { matMul, rotation2D, applyToPoint } from "./matrix"
+import { dot2, magnitude2, angleBetween } from "./vector"
+import { sin, cos, atan2, PI, toFixed } from "std/math"
+import { range, for } from "std/array"
+import { print } from "std/io"
+
+// 1. Identity × M = M — print 3 rows formatted to 1dp
+val id = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+val m  = [[2.0, 3.0, 0.0], [4.0, 5.0, 0.0], [0.0, 0.0, 1.0]]
+val p  = matMul(id, m)
+print("matrix multiply identity * M:")
+range(0, 3).for(i =>
+  print("  ${toFixed(p[i][0], 1)} ${toFixed(p[i][1], 1)} ${toFixed(p[i][2], 1)}")
+)
+
+// 2. Rotate (1.0, 0.0) by 90° → print "(0.0000, 1.0000)"
+val rot90 = rotation2D(PI / 2.0)
+val rotated = applyToPoint(rot90, 1.0, 0.0)
+print("rotate (1,0) by 90 deg: (${toFixed(rotated["x"], 4)}, ${toFixed(rotated["y"], 4)})")
+
+// 3. Dot product and magnitude of [3.0, 4.0]
+val v = [3.0, 4.0]
+print("dot [3,4].[3,4] = ${toFixed(dot2(v, v), 1)}")
+print("magnitude [3,4] = ${toFixed(magnitude2(v), 1)}")
+
+// 4. Angle between orthogonal unit vectors
+val angle = angleBetween([1.0, 0.0], [0.0, 1.0])
+print("angle between [1,0] and [0,1] = ${toFixed(angle, 4)}")
+
+// 5. Trig spot-checks
+print("sin(PI/6) = ${toFixed(sin(PI / 6.0), 4)}")
+print("cos(PI/3) = ${toFixed(cos(PI / 3.0), 4)}")
+print("atan2(1,1) = ${toFixed(atan2(1.0, 1.0), 4)}")
+print("PI/4 = ${toFixed(PI / 4.0, 4)}")

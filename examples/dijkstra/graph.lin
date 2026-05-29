@@ -1,0 +1,28 @@
+import { for, push, reverse, length } from "std/array"
+import { toString } from "std/string"
+
+export val buildAdj = (edges: Json): Json =>
+  var adj = {}
+  edges.for(edge =>
+    val src = edge["from"]
+    val existing = adj[src]
+    if existing == null then
+      lin_object_set(adj, src, [{ "to": edge["to"], "weight": edge["weight"] }])
+    else
+      push(existing, { "to": edge["to"], "weight": edge["weight"] })
+  )
+  adj
+
+val walkPath = (prev: Json, source: String, path: Json, current: String): Null =>
+  val pRaw = prev[current]
+  if pRaw != null && current != source then
+    val p = toString(pRaw)
+    push(path, p)
+    walkPath(prev, source, path, p)
+
+export val reconstructPath = (prev: Json, source: String, target: String): Json =>
+  if target == source then [source]
+  else
+    var path = [target]
+    walkPath(prev, source, path, target)
+    reverse(path)

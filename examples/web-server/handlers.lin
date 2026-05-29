@@ -1,0 +1,16 @@
+import { json, text, notFound, badRequest, pathMatch } from "std/http"
+import { render } from "std/template"
+
+export val handleIndex = (req: Json): Json =>
+  val data = { "title": "Lin Web Server", "heading": "Welcome", "status": "running", "version": "1.0" }
+  match render("examples/web-server/views/index.lint", data)
+    has { "type": "error", message } => badRequest("template error: ${message}")
+    else => text(200, "index")
+
+export val handleStatus = (req: Json): Json =>
+  json(200, { "status": "ok", "uptime": 0, "version": "1.0" })
+
+export val handleUser = (req: Json): Json =>
+  val m = pathMatch("/users/:id", req["path"])
+  if m == null then { "status": 404, "headers": {}, "body": "Not Found" }
+  else json(200, { "id": m["id"], "name": "User ${m["id"]}" })
