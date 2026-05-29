@@ -76,6 +76,16 @@ struct LowerCtx {
     func_counter: u32,
     intrinsics: HashMap<usize, String>,
     global_fn_slots: HashMap<usize, FuncId>,
+    /// Import binding slots that resolve to a compiled function in the LLVM module.
+    /// slot → (mangled LLVM symbol name e.g. `std_io_print`, declared param types).
+    /// Imported modules are compiled by codegen's AST `register_import` regardless of
+    /// the IR path, so the symbol already exists; the IR `CallTarget::Named` resolver
+    /// looks it up by name. Param types drive arg boxing (concrete → Json param).
+    import_fn_slots: HashMap<usize, (String, Vec<Type>)>,
+    /// Import binding slots for non-function exported vals. slot → (val-wrapper symbol
+    /// name `{module_key}_{name}__val`, value type). Reading the binding calls the
+    /// zero-arg wrapper to compute the value.
+    import_val_slots: HashMap<usize, (String, Type)>,
 }
 
 impl LowerCtx {
@@ -86,6 +96,8 @@ impl LowerCtx {
             func_counter: 0,
             intrinsics: HashMap::new(),
             global_fn_slots: HashMap::new(),
+            import_fn_slots: HashMap::new(),
+            import_val_slots: HashMap::new(),
         }
     }
 
@@ -272,6 +284,38 @@ fn is_rc_type(ty: &Type) -> bool {
     )
 }
 
+/// Mangle an import path into the LLVM symbol prefix codegen uses for that module's
+/// exports. Must match `register_import`'s `path.replace("/", "_").replace("-", "_")`.
+fn mangle_module_key(path: &str) -> String {
+    path.replace('/', "_").replace('-', "_")
+}
+
+/// A type stored at runtime as a TaggedVal* pointer (Json/union/dynamic).
+/// Mirrors codegen's `Codegen::is_union_type`.
+fn is_union_ty(ty: &Type) -> bool {
+    matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_))
+}
+
+/// Box a concrete argument when the callee's parameter is a Json/union type.
+/// Emits a `Coerce` (which codegen lowers to `build_tagged_val_alloca`) and returns the
+/// boxed temp; otherwise returns the argument temp unchanged. Mirrors the AST path's
+/// arg-boxing rule in `call_global_fn` (concrete arg → union param ⇒ box).
+fn lower_box_for_param(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: &mut FuncBuilder) -> Temp {
+    let Some(param_ty) = param_ty else { return arg; };
+    if is_union_ty(param_ty) && !is_union_ty(arg_ty) {
+        let dst = builder.alloc_temp(param_ty.clone());
+        builder.emit(Instruction::Coerce {
+            dst,
+            src: arg,
+            from_ty: arg_ty.clone(),
+            to_ty: param_ty.clone(),
+        });
+        dst
+    } else {
+        arg
+    }
+}
+
 fn const_type(c: &Const) -> Type {
     match c {
         Const::Int(_, t) => t.clone(),
@@ -300,19 +344,32 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
             builder.slots.insert(*slot, t);
             let _ = ty; // type is in temp_types
         }
-        TypedStmt::Import { bindings, .. } => {
-            // Import bindings are resolved at a higher level; here we just record
-            // placeholder temps so slot references don't panic.
+        TypedStmt::Import { path, bindings, .. } => {
+            // Imported modules are compiled by codegen's AST `register_import` even on
+            // the IR path, so each exported symbol already exists in the LLVM module
+            // under its mangled name `{module_key}_{name}`. Resolve each binding slot to
+            // either a `Named` call target (function exports) or a zero-arg val-wrapper
+            // (non-function exports), matching the AST path's `compile_stmt` Import logic.
+            let module_key = mangle_module_key(path);
             for b in bindings {
-                let t = builder.alloc_temp(b.ty.clone());
-                builder.slots.insert(b.slot, t);
+                if let Type::Function { params, .. } = &b.ty {
+                    let sym = format!("{}_{}", module_key, b.name);
+                    ctx.import_fn_slots.insert(b.slot, (sym, params.clone()));
+                } else {
+                    let wrapper = format!("{}_{}__val", module_key, b.name);
+                    ctx.import_val_slots.insert(b.slot, (wrapper, b.ty.clone()));
+                }
             }
         }
         TypedStmt::ForeignImport { bindings, .. } => {
-            // Foreign bindings are declared external symbols; record placeholder temps.
+            // Foreign (FFI) functions are declared as external LLVM symbols under their
+            // own unmangled name; resolve valid function bindings to a `Named` target.
             for b in bindings {
-                let t = builder.alloc_temp(b.ty.clone());
-                builder.slots.insert(b.slot, t);
+                if let Type::Function { params, .. } = &b.ty {
+                    if b.valid {
+                        ctx.import_fn_slots.insert(b.slot, (b.name.clone(), params.clone()));
+                    }
+                }
             }
         }
         TypedStmt::Destructure {
@@ -404,6 +461,19 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                     builder.register_owned(t, ty.clone());
                 }
                 t
+            } else if let Some((wrapper, val_ty)) = ctx.import_val_slots.get(slot).cloned() {
+                // Imported non-function val: call its zero-arg wrapper to compute the value.
+                let dst = builder.alloc_temp(val_ty.clone());
+                builder.emit(Instruction::Call {
+                    dst,
+                    callee: CallTarget::Named(wrapper),
+                    args: vec![],
+                    ret_ty: val_ty.clone(),
+                });
+                if is_rc_type(&val_ty) {
+                    builder.register_owned(dst, val_ty);
+                }
+                dst
             } else {
                 // Slot not yet in scope — emit a placeholder null temp.
                 // (Can happen for forward-declared functions resolved by codegen.)
@@ -594,6 +664,28 @@ fn lower_call(
     if let TypedExpr::LocalGet { slot, .. } = func {
         if let Some(name) = builder.intrinsic_slots.get(slot).cloned() {
             return lower_intrinsic_call(&name, args, result_type, builder, ctx);
+        }
+        // Imported function: call the compiled symbol by its mangled name, boxing
+        // concrete args passed to Json/union-typed parameters.
+        if let Some((sym, param_tys)) = ctx.import_fn_slots.get(slot).cloned() {
+            let lowered_args: Vec<Temp> = args
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    let t = lower_expr(a, builder, ctx);
+                    let param_ty = param_tys.get(i);
+                    lower_box_for_param(t, &a.ty(), param_ty, builder)
+                })
+                .collect();
+            let dst = builder.alloc_temp(result_type.clone());
+            builder.emit(Instruction::Call {
+                dst,
+                callee: CallTarget::Named(sym),
+                args: lowered_args,
+                ret_ty: result_type.clone(),
+            });
+            builder.register_owned(dst, result_type.clone());
+            return dst;
         }
         // Check global function slots.
         if let Some(&fid) = ctx.global_fn_slots.get(slot) {

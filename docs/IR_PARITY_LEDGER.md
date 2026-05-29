@@ -27,8 +27,35 @@ variants: imported-function call emission and intrinsic dispatch through importe
 wrappers are not wired in the IR path. Phase 1 must address call lowering, not just
 the intrinsic name table.
 
+## Phase 1 discovery — import resolution is a hidden foundational gap
+
+The earlier exploration reported lowering "covers all 7 TypedStmt variants except
+IndexSet." That is misleading: `lower_stmt`'s `Import`/`ForeignImport` arms
+(`lower.rs:303-317`) only allocate **placeholder temps** — they do not connect an
+import binding to the compiled target function. Consequently `lower_call`
+(`lower.rs:594-618`) finds the import slot is neither an `intrinsic_slot` nor a
+`global_fn_slot`, falls through, and emits an **indirect call on a dead placeholder
+temp** — which the IR codegen drops to null. So **every call to an imported symbol
+silently vanishes**, which is why `print` (and therefore essentially every real
+program) produces no output. This is the dominant cause of the 121 failures, and it
+sits *below* the intrinsic-catalogue work the plan scheduled for Phase 1.
+
+`std/io`'s `print` is a normal exported `val` lowered to LLVM `std_io_print`
+(`{module_key}_{name}` mangling, codegen `register_import`). The IR `Call`
+handler's `CallTarget::Named(name)` arm already resolves via
+`self.module.get_function(name)` (codegen.rs:7190) — so the fix is to make lowering
+resolve import slots to `Named("<module_key>_<name>")` (and imported non-fn vals to
+their `{module_key}_{name}__val` wrappers), rather than to placeholder temps.
+`lower_module` will need the import map / module-key info that today only codegen has.
+
+**Revised Phase 1 scope:** (a) thread import resolution into `lower_module` and emit
+real `Named` targets for import/foreign-import slots; (b) THEN the intrinsic-name
+catalogue; (c) CI scaffolding. Item (a) was not in the approved plan's Phase 1 and is
+a prerequisite for any program to run on the IR path.
+
 ## Progress log
 
 | Phase | IR-leg failures | Notes |
 |-------|-----------------|-------|
 | 0 (baseline) | 121 / 128 | starting point |
+| 1a (import resolution) | 83 / 128 | resolve import/foreign slots to `Named` targets + box concrete args to Json params; 45 passing. AST leg still 128/128. |
