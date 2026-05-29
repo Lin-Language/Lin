@@ -11,12 +11,15 @@ env:
 
 jobs:
   test:
-    name: Test (${{ matrix.os }})
+    name: Test (${{ matrix.os }}, IR=${{ matrix.lin_ir }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, macos-latest]
+        # Run the suite on both compilation backends: the legacy TypedAST path
+        # (LIN_USE_IR unset) and the LinIR path (LIN_USE_IR=1). Both must be green.
+        lin_ir: ["0", "1"]
 
     steps:
       - uses: actions/checkout@v4
@@ -43,6 +46,15 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Select compilation backend
+        run: |
+          if [ "${{ matrix.lin_ir }}" = "1" ]; then
+            echo "LIN_USE_IR=1" >> "$GITHUB_ENV"
+            echo "Using LinIR compilation path (LIN_USE_IR=1)"
+          else
+            echo "Using legacy TypedAST compilation path"
+          fi
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -75,3 +87,68 @@ jobs:
 
       - name: Run stdlib tests
         run: cargo run -p lin --quiet -- test stdlib/ --timeout 120
+
+  # AddressSanitizer leg: builds an instrumented lin-runtime and links the compiled
+  # test programs against it on the LinIR path, then runs the stdlib suite under ASan.
+  # This is the standing guard for loop-body / projection / container refcounting on
+  # the new IR backend (the AST path masks several latent leaks; ASan catches the
+  # use-after-frees they hide).
+  asan:
+    name: ASan (LinIR path, Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 22
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-22 llvm-22-dev llvm-22-runtime clang-22 libpolly-22-dev
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+
+      - name: Install Rust nightly (for -Zsanitizer)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: asan-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: asan-cargo-
+
+      - name: Build lin (compiler) and the ASan-instrumented runtime
+        run: |
+          cargo build -p lin
+          RUSTFLAGS="-Zsanitizer=address" cargo +nightly build \
+            -p lin-runtime --target x86_64-unknown-linux-gnu
+
+      - name: Build + run each stdlib test under AddressSanitizer (LinIR path)
+        env:
+          LIN_USE_IR: "1"
+          LIN_EMIT_IR: "1"
+          LIN_NO_OPT: "1"
+        run: |
+          RT="$(find target/x86_64-unknown-linux-gnu/debug -name liblin_runtime.a | head -1)"
+          fail=0
+          for f in stdlib/*.test.lin; do
+            echo "==> $f"
+            cargo run -p lin --quiet -- build "$f" -o /tmp/asan_test || { echo "BUILD FAIL $f"; fail=1; continue; }
+            clang-22 -fsanitize=address -g /tmp/asan_test.ll "$RT" -o /tmp/asan_test_bin
+            # Leak detection off: the stdlib intentionally retains program-lifetime
+            # globals (module init state) that are never released at exit.
+            if ! ASAN_OPTIONS=detect_leaks=0 /tmp/asan_test_bin > /tmp/asan_out 2>&1; then
+              echo "ASAN FAILURE in $f:"; cat /tmp/asan_out; fail=1
+            fi
+            rm -f /tmp/asan_test.ll
+          done
+          exit $fail
