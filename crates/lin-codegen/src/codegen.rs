@@ -7309,9 +7309,9 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, cls);
                             }
                         }
-                        Instruction::Index { dst, object, key, result_ty } => {
+                        Instruction::Index { dst, object, key, obj_ty, key_ty, result_ty } => {
                             if let (Some(&obj_v), Some(&key_v)) = (temp_map.get(object), temp_map.get(key)) {
-                                let result = self.compile_ir_index(obj_v, key_v, result_ty);
+                                let result = self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty);
                                 temp_map.insert(*dst, result);
                             }
                         }
@@ -7482,26 +7482,49 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    fn compile_ir_index(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, result_ty: &Type) -> BasicValueEnum<'ctx> {
+    fn compile_ir_index(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, result_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        let i64_ty = self.context.i64_type();
-        // If key is an integer, treat as array index; otherwise treat as object key.
-        if key.is_int_value() && key.get_type() == i64_ty.into() {
-            if obj.is_pointer_value() {
-                // Array get (tagged).
-                let tagged = self.builder.build_call(self.rt_array_get, &[obj.into(), key.into()], "ir_aget")
-                    .unwrap().try_as_basic_value().unwrap_basic();
-                // Unbox to result type if needed.
-                self.unbox_tagged_val_to_type(tagged, result_ty)
-            } else { ptr_ty.const_null().into() }
-        } else {
-            // Object field get.
-            if obj.is_pointer_value() {
-                let tagged = self.builder.build_call(self.rt_object_get, &[obj.into(), key.into()], "ir_oget")
-                    .unwrap().try_as_basic_value().unwrap_basic();
-                self.unbox_tagged_val_to_type(tagged, result_ty)
-            } else { ptr_ty.const_null().into() }
+        if !obj.is_pointer_value() {
+            return ptr_ty.const_null().into();
         }
+        // When the object is statically Json/union, `obj` is a TaggedVal* wrapping the
+        // real Array/Object pointer — unbox it to the raw container pointer before
+        // calling the runtime accessors (which expect LinArray*/LinObject*).
+        let container = if Self::is_union_type(obj_ty) {
+            self.builder.build_call(self.rt_unbox_ptr, &[obj.into()], "ir_idx_unbox")
+                .unwrap().try_as_basic_value().unwrap_basic()
+        } else {
+            obj
+        };
+        // Array indexing when the object is an array type or the key is a raw integer.
+        let is_array_access = matches!(obj_ty, Type::Array(_) | Type::FixedArray(_))
+            || (key.is_int_value() && key.get_type() == self.context.i64_type().into());
+        if is_array_access {
+            // Key may arrive as a raw int or a boxed TaggedVal* — unbox to i64.
+            let idx = if key.is_int_value() {
+                self.builder.build_int_s_extend_or_bit_cast(key.into_int_value(), self.context.i64_type(), "ir_idx").unwrap()
+            } else if key.is_pointer_value() {
+                let unboxed = self.unbox_value(key, &Type::Int64);
+                unboxed.into_int_value()
+            } else {
+                return ptr_ty.const_null().into();
+            };
+            let tagged = self.builder.build_call(self.rt_array_get, &[container.into(), idx.into()], "ir_aget")
+                .unwrap().try_as_basic_value().unwrap_basic();
+            return self.unbox_tagged_val_to_type(tagged, result_ty);
+        }
+        // Object key access. lin_object_get expects a raw *LinString key; unbox a boxed key.
+        let key_str = if matches!(key_ty, Type::Str) {
+            key
+        } else if Self::is_union_type(key_ty) && key.is_pointer_value() {
+            self.builder.build_call(self.rt_unbox_ptr, &[key.into()], "ir_key_unbox")
+                .unwrap().try_as_basic_value().unwrap_basic()
+        } else {
+            key
+        };
+        let tagged = self.builder.build_call(self.rt_object_get, &[container.into(), key_str.into()], "ir_oget")
+            .unwrap().try_as_basic_value().unwrap_basic();
+        self.unbox_tagged_val_to_type(tagged, result_ty)
     }
 
     fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, result_ty: &Type) -> BasicValueEnum<'ctx> {

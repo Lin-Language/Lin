@@ -418,6 +418,7 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
             rest,
             ..
         } => {
+            let arr_obj_ty = value.ty();
             let arr_temp = lower_expr(value, builder, ctx);
             builder.slots.insert(*arr_slot, arr_temp);
             for (index, binding_slot, field_ty) in elements {
@@ -427,6 +428,8 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                     dst,
                     object: arr_temp,
                     key: idx_temp,
+                    obj_ty: arr_obj_ty.clone(),
+                    key_ty: Type::Int64,
                     result_ty: field_ty.clone(),
                 });
                 builder.slots.insert(*binding_slot, dst);
@@ -605,6 +608,8 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         }
 
         TypedExpr::Index { object, key, result_type, .. } => {
+            let obj_ty = object.ty();
+            let key_ty = key.ty();
             let obj_temp = lower_expr(object, builder, ctx);
             let key_temp = lower_expr(key, builder, ctx);
             let dst = builder.alloc_temp(result_type.clone());
@@ -612,6 +617,8 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 dst,
                 object: obj_temp,
                 key: key_temp,
+                obj_ty,
+                key_ty,
                 result_ty: result_type.clone(),
             });
             dst
@@ -987,6 +994,9 @@ fn lower_typed_pattern_bindings(
             }
         }
         TypedPattern::Array { elements, .. } => {
+            // The scrutinee's static type (often Json/union for match arms) drives whether
+            // codegen must unbox it before indexing.
+            let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
             for (i, elem_pat) in elements.iter().enumerate() {
                 let idx_temp = builder.const_temp(Const::Int(i as i64, Type::Int64));
                 // We need the element type; infer from the pattern.
@@ -996,6 +1006,8 @@ fn lower_typed_pattern_bindings(
                     dst: elem_t,
                     object: scrut,
                     key: idx_temp,
+                    obj_ty: scrut_ty.clone(),
+                    key_ty: Type::Int64,
                     result_ty: elem_ty,
                 });
                 lower_typed_pattern_bindings(elem_pat, elem_t, builder);
