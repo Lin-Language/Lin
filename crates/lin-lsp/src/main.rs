@@ -10,7 +10,7 @@ use lin_check::typed_ir::{TypedModule, TypedStmt};
 use lin_check::types::Type;
 use lin_check::Checker;
 use lin_common::Severity;
-use lin_parse::ast::Stmt;
+use lin_parse::ast::{Stmt, ImportBinding};
 
 // ── server ────────────────────────────────────────────────────────────────────
 
@@ -326,10 +326,81 @@ fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
         }
     }
 
+    // Warn on unused imports.
+    diags.extend(unused_import_warnings(source, &module));
+
     Analysis {
         diagnostics: diags,
         span_type_map: checker.span_type_map,
     }
+}
+
+/// Emit a Warning diagnostic for each imported name that is never used in the file body.
+fn unused_import_warnings(source: &str, module: &lin_parse::ast::Module) -> Vec<Diagnostic> {
+    let mut warnings = Vec::new();
+    for stmt in &module.statements {
+        let Stmt::Import { bindings, path: _, span } = stmt else { continue };
+        // Find the line this import is on so we can exclude it from the usage search.
+        let import_line = offset_to_position(source, span.start as usize).line;
+
+        for binding in bindings {
+            let local_name = binding.alias.as_ref().unwrap_or(&binding.name);
+            // Check if `local_name` appears as a whole word on any non-import line.
+            let used = source.lines().enumerate().any(|(line_idx, line)| {
+                if line_idx as u32 == import_line { return false; }
+                contains_identifier(line, local_name)
+            });
+            if !used {
+                // Highlight the binding name within the import span.
+                let name_offset = find_name_in_import(source, span.start as usize, local_name);
+                let (start, end) = match name_offset {
+                    Some(o) => (
+                        offset_to_position(source, o),
+                        offset_to_position(source, o + local_name.len()),
+                    ),
+                    None => (
+                        offset_to_position(source, span.start as usize),
+                        offset_to_position(source, span.end as usize),
+                    ),
+                };
+                warnings.push(Diagnostic {
+                    range: Range { start, end },
+                    severity: Some(DiagnosticSeverity::HINT),
+                    tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+                    message: format!("'{}' is imported but never used", local_name),
+                    source: Some("lin".to_string()),
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    warnings
+}
+
+/// Returns true if `line` contains `name` as a whole identifier (not as a substring).
+fn contains_identifier(line: &str, name: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = line[start..].find(name) {
+        let abs = start + pos;
+        let before_ok = abs == 0 || !line.as_bytes()[abs - 1].is_ascii_alphanumeric() && line.as_bytes()[abs - 1] != b'_';
+        let after_ok = abs + name.len() >= line.len() || !line.as_bytes()[abs + name.len()].is_ascii_alphanumeric() && line.as_bytes()[abs + name.len()] != b'_';
+        if before_ok && after_ok {
+            return true;
+        }
+        start = abs + 1;
+    }
+    false
+}
+
+/// Finds the byte offset of `name` within the import statement starting at `import_start`.
+fn find_name_in_import(source: &str, import_start: usize, name: &str) -> Option<usize> {
+    let search_area = &source[import_start..];
+    let pos = search_area.find(name)?;
+    let abs = import_start + pos;
+    // Make sure it's a whole identifier.
+    let before_ok = abs == 0 || !source.as_bytes()[abs - 1].is_ascii_alphanumeric() && source.as_bytes()[abs - 1] != b'_';
+    let after_ok = abs + name.len() >= source.len() || !source.as_bytes()[abs + name.len()].is_ascii_alphanumeric() && source.as_bytes()[abs + name.len()] != b'_';
+    if before_ok && after_ok { Some(abs) } else { None }
 }
 
 // ── import resolution (mirrors lin-compile logic) ────────────────────────────

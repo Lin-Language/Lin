@@ -380,9 +380,17 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
 }
 
 fn find_runtime_lib() -> Option<PathBuf> {
-    // Check standard cargo target directories in order.
+    // 1. Next to the running executable (installed / bundled binary).
+    if let Ok(exe) = std::env::current_exe() {
+        let dir = exe.parent()?;
+        let p = dir.join("liblin_runtime.a");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    // 2. Standard cargo target directories (dev / workspace build).
     let candidates = [
-        // Development build (running from workspace)
         "target/debug/liblin_runtime.a",
         "target/release/liblin_runtime.a",
         "../target/debug/liblin_runtime.a",
@@ -396,7 +404,7 @@ fn find_runtime_lib() -> Option<PathBuf> {
         }
     }
 
-    // Try CARGO_MANIFEST_DIR-relative paths (works in tests).
+    // 3. CARGO_MANIFEST_DIR-relative paths (works in tests).
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
         let base = Path::new(&manifest);
         for candidate in &candidates {
@@ -404,7 +412,6 @@ fn find_runtime_lib() -> Option<PathBuf> {
             if path.exists() {
                 return Some(path);
             }
-            // Go up one level (workspace root)
             if let Some(parent) = base.parent() {
                 let path = parent.join(candidate);
                 if path.exists() {

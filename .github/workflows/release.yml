@@ -79,14 +79,16 @@ jobs:
           mkdir dist
           cp target/${{ matrix.target }}/release/lin dist/lin
           cp target/${{ matrix.target }}/release/lin-lsp dist/lin-lsp
-          cd dist && tar -czf ../${{ matrix.artifact }}.tar.gz lin lin-lsp
+          cp target/${{ matrix.target }}/release/liblin_runtime.a dist/liblin_runtime.a
+          cd dist && tar -czf ../${{ matrix.artifact }}.tar.gz lin lin-lsp liblin_runtime.a
 
       - name: Package platform-specific VSIX
         run: |
           export PATCH=$(git rev-list --count HEAD)
           mkdir -p editors/vscode/bin/${{ matrix.vsix_platform }}
-          cp target/${{ matrix.target }}/release/lin     editors/vscode/bin/${{ matrix.vsix_platform }}/lin
-          cp target/${{ matrix.target }}/release/lin-lsp editors/vscode/bin/${{ matrix.vsix_platform }}/lin-lsp
+          cp target/${{ matrix.target }}/release/lin              editors/vscode/bin/${{ matrix.vsix_platform }}/lin
+          cp target/${{ matrix.target }}/release/lin-lsp          editors/vscode/bin/${{ matrix.vsix_platform }}/lin-lsp
+          cp target/${{ matrix.target }}/release/liblin_runtime.a editors/vscode/bin/${{ matrix.vsix_platform }}/liblin_runtime.a
           cp logo.png editors/vscode/icon.png
           cd editors/vscode
           npm install
