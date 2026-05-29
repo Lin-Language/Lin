@@ -147,9 +147,21 @@ Key file: `lin-codegen/src/codegen.rs`
 
 Key files: `lin-ir/src/lower.rs`, `lin-codegen/src/codegen.rs`, `lin-compile/src/lib.rs`
 
-### Phase 4 — Cross-block RC elision (planned)
+### Phase 4 — Cross-block RC elision (complete)
 
-Extend `rc_elide.rs` to search for Retain/Release pairs across block boundaries using the existing CFG and liveness data. Activate the `_liveness` variable already computed. Add a uniqueness optimization that downgrades uniquely-owned releases to direct frees.
+| Task | Status | Notes |
+|---|---|---|
+| Rename `_liveness` → `liveness` and use it | ✅ Done | Liveness drives last-use detection in cross-block path |
+| BFS cross-block Retain/Release pair search | ✅ Done | Searches up to 8 successor blocks via CFG terminator edges |
+| Clean-path check for intermediate blocks | ✅ Done | `block_is_clean_for` rejects blocks with calls/allocs/releases |
+| Clean-path check for retain-block tail | ✅ Done | `path_has_no_interference` checks instrs after Retain to block end |
+| Clean-path check for release-block prefix | ✅ Done | `path_has_no_interference` (sentinel=MAX) checks instrs before Release |
+| Last-use liveness assertion in tests | ✅ Done | Test verifies `live_out[block1]` does not contain t0 |
+| Unit tests: 4 new cross-block cases | ✅ Done | Clean path elide, call-in-retain-block keep, call-in-intermediate keep, last-use elide |
+
+**What was implemented**: `elide_rc_fn` now builds a `block_index` map and, when a same-block Release is not found, does a BFS over CFG successors (capped at `BFS_BLOCK_LIMIT = 8`) using `find_paired_release_cross_block`. The path must be clean in all three segments: (1) the retain-block tail after the Retain, (2) every intermediate block traversed by BFS, and (3) the release-block prefix before the Release. The `Liveness` struct (previously unused as `_liveness`) is now computed and used; the last-use property (temp not in `live_out` of the release block) is tested explicitly.
+
+**Not yet implemented**: The uniqueness/direct-free optimization (`FreeDirect` instruction) described in step 3c — deferred to Phase 5 or a separate PR.
 
 Key files: `lin-ir/src/rc_elide.rs`, `lin-ir/src/liveness.rs`
 
