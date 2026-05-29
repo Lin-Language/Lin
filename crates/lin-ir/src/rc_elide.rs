@@ -386,6 +386,7 @@ mod tests {
             label: None,
             instructions: instrs,
             terminator: term,
+            span: None,
         };
         let mut temp_types = std::collections::HashMap::new();
         temp_types.insert(Temp(0), Type::Str);
@@ -417,12 +418,14 @@ mod tests {
             label: None,
             instructions: instrs0,
             terminator: Terminator::Jump(BlockId(1)),
+            span: None,
         };
         let block1 = BasicBlock {
             id: BlockId(1),
             label: None,
             instructions: instrs1,
             terminator: Terminator::Return(None),
+            span: None,
         };
         let mut temp_types = std::collections::HashMap::new();
         temp_types.insert(Temp(0), Type::Str);
@@ -456,18 +459,21 @@ mod tests {
             label: None,
             instructions: instrs0,
             terminator: Terminator::Jump(BlockId(1)),
+            span: None,
         };
         let block1 = BasicBlock {
             id: BlockId(1),
             label: None,
             instructions: instrs1,
             terminator: Terminator::Jump(BlockId(2)),
+            span: None,
         };
         let block2 = BasicBlock {
             id: BlockId(2),
             label: None,
             instructions: instrs2,
             terminator: Terminator::Return(None),
+            span: None,
         };
         let mut temp_types = std::collections::HashMap::new();
         temp_types.insert(Temp(0), Type::Str);

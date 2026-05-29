@@ -15,19 +15,27 @@ use inkwell::values::GlobalValue;
 use inkwell::AddressSpace;
 use std::io::Write as IoWrite;
 
+/// A single coverage region: a source span mapped to one profile counter.
+pub struct Region {
+    /// Index of the counter (in this function's `__profc` array) that backs this region.
+    pub counter: u32,
+    /// Region start line (1-indexed).
+    pub start_line: u32,
+    /// Region start column (1-indexed).
+    pub start_col: u32,
+    /// Region end line (1-indexed).
+    pub end_line: u32,
+    /// Region end column (1-indexed).
+    pub end_col: u32,
+}
+
 /// Per-function information needed to emit coverage globals.
 pub struct FnCovInfo {
     pub name: String,
     /// Index into the source files list (for multi-file coverage).
     pub file_idx: u32,
-    /// Line of the function body start (1-indexed).
-    pub start_line: u32,
-    /// Column of the function body start (1-indexed).
-    pub start_col: u32,
-    /// Line of the function body end (1-indexed).
-    pub end_line: u32,
-    /// Column of the function body end (1-indexed).
-    pub end_col: u32,
+    /// Coverage regions for this function, one profile counter each.
+    pub regions: Vec<Region>,
 }
 
 /// State accumulated while compiling a coverage-instrumented module.
@@ -84,22 +92,28 @@ impl<'ctx> CoverageEmitter<'ctx> {
         (line, col)
     }
 
-    /// Emit `__profc_<name>` and `__profd_<name>` globals.
-    /// Returns the `__profc` global so the caller can emit counter increments.
+    /// Emit `__profc_<name>` and `__profd_<name>` globals for a function with N regions.
+    /// Returns the `__profc` global so the caller can emit counter increments, or `None`
+    /// if the function has no coverage regions (in which case no globals are emitted).
     pub fn emit_function_globals(
         &mut self,
         context: &'ctx Context,
         module: &Module<'ctx>,
         info: FnCovInfo,
-    ) -> GlobalValue<'ctx> {
+    ) -> Option<GlobalValue<'ctx>> {
+        let n = info.regions.len() as u32;
+        if n == 0 {
+            return None;
+        }
+
         let i64_type = context.i64_type();
         let i32_type = context.i32_type();
         let i16_type = context.i16_type();
         let ptr_type = context.ptr_type(AddressSpace::default());
 
-        // __profc_<name> = [1 x i64] zeroinitializer, section "__llvm_prf_cnts", comdat, align 8
+        // __profc_<name> = [n x i64] zeroinitializer, section "__llvm_prf_cnts", comdat, align 8
         let profc_name = format!("__profc_{}", info.name);
-        let counter_type = i64_type.array_type(1);
+        let counter_type = i64_type.array_type(n);
         let profc = module.add_global(counter_type, None, &profc_name);
         profc.set_initializer(&counter_type.const_zero());
         profc.set_section(Some("__llvm_prf_cnts"));
@@ -158,7 +172,7 @@ impl<'ctx> CoverageEmitter<'ctx> {
             i64_type.const_int(0, false).into(),
             ptr_type.const_null().into(),
             ptr_type.const_null().into(),
-            i32_type.const_int(1, false).into(), // num_counters = 1
+            i32_type.const_int(n as u64, false).into(), // num_counters = n
             i16_type.array_type(3).const_zero().into(),
             i32_type.const_int(0, false).into(),
         ]);
@@ -166,7 +180,7 @@ impl<'ctx> CoverageEmitter<'ctx> {
 
         self.compiler_used.push(profd);
         self.functions.push((info, profc));
-        profc
+        Some(profc)
     }
 
     /// After all functions are compiled, emit the module-level coverage globals.
@@ -189,10 +203,7 @@ impl<'ctx> CoverageEmitter<'ctx> {
             let fn_hash = md5_first_8_le(&info.name);
             let covmap_bytes = encode_fn_covmap(
                 info.file_idx, // global filename index for this function
-                info.start_line,
-                info.start_col,
-                info.end_line,
-                info.end_col,
+                &info.regions,
             );
             let covmap_len = covmap_bytes.len() as u32;
 
@@ -353,27 +364,35 @@ fn encode_filenames(filenames: &[String]) -> Vec<u8> {
     out
 }
 
-/// Encode the coverage mapping bytes for a single function (1 counter, 1 file region).
+/// Encode the coverage mapping bytes for a single function with N counter regions.
 /// Format: [num_vfiles][vfile_0_global_idx][num_expressions][num_regions_for_file_0]
-///         [counter_encoded][delta_start_line][start_col][delta_end_line][end_col]
+///         then per region (sorted by start line/col, with line deltas relative to the
+///         previous region): [counter_encoded][delta_start_line][start_col][delta_end_line][end_col]
 pub fn encode_fn_covmap(
     global_filename_idx: u32,
-    start_line: u32,
-    start_col: u32,
-    end_line: u32,
-    end_col: u32,
+    regions: &[Region],
 ) -> Vec<u8> {
+    // Regions must be emitted in source order (by start line, then column).
+    let mut sorted: Vec<&Region> = regions.iter().collect();
+    sorted.sort_by_key(|r| (r.start_line, r.start_col));
+
     let mut out = Vec::new();
     out.extend_from_slice(&write_uleb128(1));                          // num_virtual_file_ids = 1
     out.extend_from_slice(&write_uleb128(global_filename_idx as u64)); // vfile[0] = global filename index
     out.extend_from_slice(&write_uleb128(0));                          // num_counter_expressions = 0
-    out.extend_from_slice(&write_uleb128(1));                          // num_regions for file 0 = 1
-    out.extend_from_slice(&write_uleb128(1)); // counter = local 0, kind=1: (0 << 2) | 1 = 1
-    out.extend_from_slice(&write_uleb128(start_line as u64)); // delta from line 0
-    out.extend_from_slice(&write_uleb128(start_col as u64));
-    let delta_end = if end_line >= start_line { end_line - start_line } else { 0 };
-    out.extend_from_slice(&write_uleb128(delta_end as u64));
-    out.extend_from_slice(&write_uleb128(end_col as u64));
+    out.extend_from_slice(&write_uleb128(sorted.len() as u64));        // num_regions for file 0
+
+    let mut prev_line: u32 = 0;
+    for r in sorted {
+        // counter = local index `counter`, kind=1: (counter << 2) | 1
+        out.extend_from_slice(&write_uleb128(((r.counter << 2) | 1) as u64));
+        out.extend_from_slice(&write_uleb128((r.start_line - prev_line) as u64)); // delta from prev region's start line
+        out.extend_from_slice(&write_uleb128(r.start_col as u64));
+        let delta_end = r.end_line.saturating_sub(r.start_line);
+        out.extend_from_slice(&write_uleb128(delta_end as u64));
+        out.extend_from_slice(&write_uleb128(r.end_col as u64));
+        prev_line = r.start_line;
+    }
     out
 }
 

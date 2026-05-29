@@ -267,6 +267,10 @@ pub struct BasicBlock {
     pub label: Option<String>,
     pub instructions: Vec<Instruction>,
     pub terminator: Terminator,
+    /// Source span this block corresponds to, used for coverage region emission.
+    /// Only populated for blocks that map to a user-meaningful source region
+    /// (function bodies, if/match arms, loop bodies); `None` for synthetic blocks.
+    pub span: Option<lin_common::Span>,
 }
 
 /// A compiled Lin function in flat IR form.

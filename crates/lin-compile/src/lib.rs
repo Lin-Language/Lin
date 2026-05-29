@@ -80,11 +80,21 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         .map_err(CompileError::TypeCheck)?;
 
     // 4. LLVM codegen via the LinIR pipeline (the sole compilation backend).
-    // `opts.coverage` is always false here — `lin test --coverage` is rejected at the CLI
-    // until coverage instrumentation is ported to the IR path — but the field is threaded
-    // through so the CoverageEmitter scaffolding stays in place for that future work.
+    // When `opts.coverage` is set, the codegen instruments per-block counters and emits the
+    // LLVM coverage-mapping globals; only the main module and user (non-stdlib) imports are
+    // instrumented (stdlib import sources are not tracked, so they pass `None` below).
     let context = Context::create();
     let mut cg = Codegen::new(&context, &module_name, opts.coverage);
+
+    // Point coverage at the main module's source (canonical absolute path so llvm-cov can
+    // locate the file when reporting).
+    if opts.coverage {
+        let abs = std::fs::canonicalize(&opts.source_path)
+            .unwrap_or_else(|_| opts.source_path.clone())
+            .to_string_lossy()
+            .to_string();
+        cg.set_main_source(&abs, &source);
+    }
 
     // Register imported modules with codegen in dependency order so cross-module slot
     // resolution works correctly (dependencies must be registered before dependents). Each
@@ -92,7 +102,8 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     // module (compile_import_from_ir).
     for path in &import_order {
         let imp_module = imported_modules.get(path).unwrap();
-        cg.compile_import_from_ir(path, imp_module);
+        let src = if opts.coverage { import_sources.get(path) } else { None };
+        cg.compile_import_from_ir(path, imp_module, src);
     }
 
     // Compile the main module through LinIR.
@@ -109,6 +120,11 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         let mut ir_module = lower_module(&typed_module);
         rc_elide::elide_rc(&mut ir_module);
         cg.compile_module_from_ir(&ir_module);
+    }
+
+    // Emit the module-level coverage globals once every module has been compiled.
+    if opts.coverage {
+        cg.finalize_coverage();
     }
 
     // 5. Emit LLVM IR if requested (before verify so we can inspect broken IR)

@@ -55,17 +55,6 @@ pub fn run(args: &TestArgs) {
     use std::process;
     use rayon::prelude::*;
 
-    // Coverage instrumentation was implemented only in the legacy TypedAST backend, which has
-    // been removed in favour of the LinIR pipeline. The feature is temporarily unavailable
-    // until reimplemented on the IR path; fail clearly rather than silently producing no data.
-    if args.coverage {
-        eprintln!(
-            "error: `lin test --coverage` is temporarily unavailable — coverage instrumentation \
-             has not yet been ported to the LinIR compilation backend."
-        );
-        process::exit(2);
-    }
-
     let test_files = collect_test_files(&args.paths, args.filter.as_deref());
     if test_files.is_empty() {
         eprintln!("No *.test.lin files found.");
@@ -118,7 +107,11 @@ pub fn run(args: &TestArgs) {
                     run_binary(bin, if coverage { Some(&profraw) } else { None }, timeout);
                 let elapsed = t.elapsed();
 
-                let _ = std::fs::remove_file(bin);
+                // Keep the binary when collecting coverage — llvm-cov needs it to map the
+                // .profraw counters back to source. run_coverage_report cleans it up after.
+                if !coverage {
+                    let _ = std::fs::remove_file(bin);
+                }
 
                 let result = TestResult { path: src.clone(), outcome, elapsed, stdout, stderr };
                 print_result(&result, verbose, &stdout_lock);
@@ -352,9 +345,11 @@ fn run_coverage_report(
         }
     }
 
-    // Cleanup profraw files and profdata.
-    for (src, _) in &pairs {
+    // Cleanup profraw files, profdata, and the instrumented test binaries (the run phase
+    // leaves them in place under coverage so llvm-cov can read them here).
+    for (src, bin) in &pairs {
         let _ = fs::remove_file(src.with_extension("profraw"));
+        let _ = fs::remove_file(bin);
     }
     let _ = fs::remove_file(&profdata_path);
 }

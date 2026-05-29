@@ -312,6 +312,7 @@ impl FuncBuilder {
             label: Some("entry".into()),
             instructions: Vec::new(),
             terminator: Terminator::Unreachable,
+            span: None,
         };
         let mut temp_types = HashMap::new();
         let mut temp_count = 0u32;
@@ -355,8 +356,19 @@ impl FuncBuilder {
             label: Some(label.into()),
             instructions: Vec::new(),
             terminator: Terminator::Unreachable,
+            span: None,
         });
         id
+    }
+
+    /// Record the source span of a block (used for coverage region emission).
+    /// Only sets the span if it has not already been set.
+    fn set_block_span(&mut self, id: BlockId, span: lin_common::Span) {
+        if let Some(b) = self.blocks.iter_mut().find(|b| b.id == id) {
+            if b.span.is_none() {
+                b.span = Some(span);
+            }
+        }
     }
 
     fn current_block_mut(&mut self) -> &mut BasicBlock {
@@ -1989,6 +2001,11 @@ fn lower_if(
     let else_block = builder.alloc_block("if_else");
     let merge_block = builder.alloc_block("if_merge");
 
+    // Tag the branch entry blocks with their source spans for coverage. The merge block
+    // covers no distinct source region, so it stays None.
+    builder.set_block_span(then_block, then_br.span());
+    builder.set_block_span(else_block, else_br.span());
+
     builder.terminate(Terminator::CondJump {
         cond: cond_temp,
         then_block,
@@ -2078,6 +2095,9 @@ fn lower_match(
     for (i, arm) in arms.iter().enumerate() {
         let is_last = i == arms.len() - 1;
         let body_block = builder.alloc_block(format!("arm_{}_body", i));
+        // Tag the arm body block with its source span for coverage. next/nofall blocks
+        // cover no distinct source region and stay None.
+        builder.set_block_span(body_block, arm.body.span());
         let next_block = if is_last {
             // Last arm: no fallthrough needed (compiler ensures exhaustiveness).
             builder.alloc_block("arm_nofall")
@@ -2119,6 +2139,9 @@ fn lower_match(
             let guard_val = lower_expr(guard, builder, ctx);
             let guard_then = builder.alloc_block(format!("arm_{}_guard_ok", i));
             let guard_fail = builder.alloc_block(format!("arm_{}_guard_fail", i));
+            // The guard-ok block is reached only when the guard expression evaluated true,
+            // so it is a distinct coverage region. guard_fail stays None.
+            builder.set_block_span(guard_then, guard.span());
             builder.terminate(Terminator::CondJump {
                 cond: guard_val,
                 then_block: guard_then,
@@ -2504,12 +2527,14 @@ fn lower_function_expr_with_id(
         cell_slots: HashMap::new(),
     };
 
-    // Add entry block.
+    // Add entry block. Tag it with the function body's span so coverage records a
+    // region covering the whole function body (the most important coverage region).
     inner_builder.blocks.push(BasicBlock {
         id: BlockId(0),
         label: Some("entry".into()),
         instructions: Vec::new(),
         terminator: Terminator::Unreachable,
+        span: Some(body.span()),
     });
 
     // Add capture slots: captured variables become FieldGet on the env pointer.

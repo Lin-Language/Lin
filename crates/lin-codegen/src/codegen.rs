@@ -17,7 +17,7 @@ use lin_check::typed_ir::*;
 use lin_check::types::Type;
 use lin_parse::ast::BinOp;
 use lin_ir::ir as lir;
-use crate::coverage::CoverageEmitter;
+use crate::coverage::{self, CoverageEmitter};
 
 pub struct Codegen<'ctx> {
     context: &'ctx Context,
@@ -96,6 +96,11 @@ pub struct Codegen<'ctx> {
     ir_anon_prefix: String,
     /// Coverage emitter: Some if compiling with coverage instrumentation.
     pub coverage: Option<CoverageEmitter<'ctx>>,
+    /// The source file currently being compiled, used to map IR block spans to
+    /// coverage regions: (file index into the coverage emitter, source text). `None`
+    /// when coverage is off or the current module's source isn't tracked (suppresses
+    /// instrumentation, e.g. for stdlib imports).
+    current_source: Option<(u32, std::rc::Rc<str>)>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -277,11 +282,30 @@ impl<'ctx> Codegen<'ctx> {
             foreign_lib_paths: Vec::new(),
             ir_anon_prefix: String::new(),
             coverage: if coverage_enabled {
-                // Source path is set by compile_module; start with empty path.
+                // Source path is set by set_main_source; start with empty path.
                 Some(CoverageEmitter::new(String::new()))
             } else {
                 None
             },
+            current_source: None,
+        }
+    }
+
+    /// Set the main module's source path + text for coverage. Index 0 of the coverage
+    /// emitter's source list is reserved for the main module.
+    pub fn set_main_source(&mut self, path: &str, text: &str) {
+        if let Some(cov) = &mut self.coverage {
+            cov.source_files[0] = path.to_string();
+            cov.source_texts[0] = text.to_string();
+            self.current_source = Some((0, std::rc::Rc::from(text)));
+        }
+    }
+
+    /// Emit the module-level coverage globals (covmap, covfun records, prf names). Call
+    /// once, after every module (main + imports) has been compiled. No-op without coverage.
+    pub fn finalize_coverage(&mut self) {
+        if let Some(cov) = self.coverage.take() {
+            cov.finalize(self.context, &self.module);
         }
     }
 
@@ -291,7 +315,12 @@ impl<'ctx> Codegen<'ctx> {
     /// LLVM functions in `imported_fns` / `imported_val_wrappers` so the importing module's
     /// IR resolves them by mangled symbol name. This removes the IR path's dependency on the
     /// AST `compile_function_body` / `compile_expr` for imports.
-    pub fn compile_import_from_ir(&mut self, path: &str, module: &TypedModule) {
+    pub fn compile_import_from_ir(
+        &mut self,
+        path: &str,
+        module: &TypedModule,
+        src: Option<&(String, String)>,
+    ) {
         // Merge the imported module's intrinsic slot map (same as register_import) so the
         // importer's lowering still recognises re-exported intrinsics.
         for (slot, name) in &module.intrinsics {
@@ -304,8 +333,22 @@ impl<'ctx> Codegen<'ctx> {
         // Prefix this module's anonymous functions so `__lin_fn_<id>` symbols don't collide
         // with the main module's or other imports' (each module numbers FuncIds from 0).
         let saved_prefix = std::mem::replace(&mut self.ir_anon_prefix, format!("{}_", module_key));
+        // Point coverage at this import's source (if any). Stdlib imports pass `None`, which
+        // suppresses instrumentation for them (the compile pre-resolver only tracks
+        // non-stdlib import sources).
+        let saved_source = self.current_source.take();
+        if self.coverage.is_some() {
+            self.current_source = match src {
+                Some((p, text)) => {
+                    let idx = self.coverage.as_mut().unwrap().add_source_file(p, text);
+                    Some((idx, std::rc::Rc::from(text.as_str())))
+                }
+                None => None,
+            };
+        }
         self.compile_module_from_ir(&ir_module);
         self.ir_anon_prefix = saved_prefix;
+        self.current_source = saved_source;
 
         // Register each exported binding's emitted LLVM symbol so importers resolve it.
         // Function exports → `imported_fns[(path, name)]`; non-function vals → the
@@ -1590,6 +1633,8 @@ impl<'ctx> Codegen<'ctx> {
 
         // ---- Pass 1: pre-declare all LLVM functions (so cross-calls work) ----
         let mut ir_fn_to_llvm: StdMap<lir::FuncId, FunctionValue<'ctx>> = StdMap::new();
+        // Exact emitted symbol name per FuncId, used by coverage to name its globals.
+        let mut ir_fn_symbol: StdMap<lir::FuncId, String> = StdMap::new();
         for func in &module.functions {
             // Build LLVM function type from params/ret.
             let ret_ty = &func.ret_ty;
@@ -1619,6 +1664,7 @@ impl<'ctx> Codegen<'ctx> {
             };
             self.named_fns.insert(name.clone(), llvm_fn);
             ir_fn_to_llvm.insert(func.id, llvm_fn);
+            ir_fn_symbol.insert(func.id, name.clone());
         }
 
         // Module globals backing top-level non-function vals (GlobalValSet/Get), shared
@@ -1697,10 +1743,70 @@ impl<'ctx> Codegen<'ctx> {
             // IR block as a predecessor must use that exit block, not the entry block.
             let mut ir_block_exit: StdMap<lir::BlockId, inkwell::basic_block::BasicBlock<'ctx>> = StdMap::new();
 
+            // ---- Coverage: assign one profile counter per span-carrying block ----
+            // `block_counter` maps each instrumented block to its counter index; `profc` is
+            // the `[n x i64]` counter array global (None when this function has no regions
+            // or coverage is off). Only the main module + tracked (non-stdlib) imports are
+            // instrumented (`current_source` is None otherwise).
+            let mut block_counter: StdMap<lir::BlockId, u32> = StdMap::new();
+            let mut profc: Option<inkwell::values::GlobalValue<'ctx>> = None;
+            if self.coverage.is_some() {
+                if let Some((file_idx, _)) = self.current_source {
+                    let mut regions: Vec<coverage::Region> = Vec::new();
+                    let mut next_counter = 0u32;
+                    for block in &func.blocks {
+                        if let Some(span) = block.span {
+                            let counter = next_counter;
+                            next_counter += 1;
+                            block_counter.insert(block.id, counter);
+                            let cov = self.coverage.as_ref().unwrap();
+                            let (start_line, start_col) =
+                                cov.offset_to_line_col_in(file_idx as usize, span.start);
+                            let (end_line, end_col) =
+                                cov.offset_to_line_col_in(file_idx as usize, span.end);
+                            regions.push(coverage::Region {
+                                counter,
+                                start_line,
+                                start_col,
+                                end_line,
+                                end_col,
+                            });
+                        }
+                    }
+                    if !regions.is_empty() {
+                        let name = ir_fn_symbol[&func.id].clone();
+                        let info = coverage::FnCovInfo { name, file_idx, regions };
+                        // GlobalValue is Copy; collect into a local so we don't hold a
+                        // &mut self.coverage borrow across the self.builder calls below.
+                        profc = self.coverage.as_mut().unwrap().emit_function_globals(
+                            self.context,
+                            &self.module,
+                            info,
+                        );
+                    }
+                }
+            }
+
             // Compile each block
             for block in &func.blocks {
                 let bb = ir_block_to_llvm[&block.id];
                 self.builder.position_at_end(bb);
+
+                // Coverage: increment this block's counter on entry.
+                if let (Some(profc), Some(&k)) = (profc, block_counter.get(&block.id)) {
+                    let counter_arr_ty = i64_ty.array_type(block_counter.len() as u32);
+                    let gep = unsafe {
+                        self.builder.build_in_bounds_gep(
+                            counter_arr_ty,
+                            profc.as_pointer_value(),
+                            &[i64_ty.const_zero(), i64_ty.const_int(k as u64, false)],
+                            "covctr_ptr",
+                        ).unwrap()
+                    };
+                    let cur = self.builder.build_load(i64_ty, gep, "covctr").unwrap().into_int_value();
+                    let inc = self.builder.build_int_add(cur, i64_ty.const_int(1, false), "covctr_inc").unwrap();
+                    self.builder.build_store(gep, inc).unwrap();
+                }
 
                 for instr in &block.instructions {
                     match instr {
