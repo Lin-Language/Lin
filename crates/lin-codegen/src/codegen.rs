@@ -7969,9 +7969,11 @@ impl<'ctx> Codegen<'ctx> {
         } else {
             obj
         };
-        // Array indexing when the object is an array type or the key is a raw integer.
+        // Array indexing when the object is an array type or the key is numeric (any int
+        // width — e.g. an Int32 literal index like `lines[0]`, not just i64).
         let is_array_access = matches!(obj_ty, Type::Array(_) | Type::FixedArray(_))
-            || (key.is_int_value() && key.get_type() == self.context.i64_type().into());
+            || key_ty.is_numeric()
+            || (key.is_int_value() && key.get_type() != self.context.bool_type().into());
         if is_array_access {
             // Key may arrive as a raw int or a boxed TaggedVal* — unbox to i64.
             let idx = if key.is_int_value() {
