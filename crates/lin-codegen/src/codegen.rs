@@ -7533,10 +7533,19 @@ impl<'ctx> Codegen<'ctx> {
                             let result = self.compile_binary_op_values(lv, rv, op, operand_ty, &rty, ty);
                             temp_map.insert(*dst, result);
                         }
-                        Instruction::Retain { val, .. } => {
+                        Instruction::Retain { val, ty } => {
                             if let Some(&v) = temp_map.get(val) {
                                 if v.is_pointer_value() {
-                                    self.builder.build_call(self.rt_rc_retain, &[v.into()], "").unwrap();
+                                    if Self::is_union_type(ty) {
+                                        // A boxed TaggedVal*: bump the INNER payload's rc
+                                        // (tag-aware). lin_rc_retain would hit the tag byte at
+                                        // offset 0 and corrupt it.
+                                        let retain_fn = self.get_or_declare_fn("lin_tagged_retain",
+                                            self.context.void_type().fn_type(&[ptr_ty.into()], false));
+                                        self.builder.build_call(retain_fn, &[v.into()], "").unwrap();
+                                    } else {
+                                        self.builder.build_call(self.rt_rc_retain, &[v.into()], "").unwrap();
+                                    }
                                 }
                             }
                         }
@@ -8549,6 +8558,66 @@ impl<'ctx> Codegen<'ctx> {
         } else {
             obj
         };
+        // When the object is Json/union AND the key is a runtime-boxed value whose kind isn't
+        // statically known (e.g. `arr[j]` where j is a closure param typed Json — it could be
+        // an int array-index or a string object-key at runtime), dispatch on the KEY's tag:
+        // int → array get, otherwise → object get. The static `is_array_access` test below
+        // would misclassify this as object access and a runtime array would return null.
+        // Mirrors the AST compile_index pointer-key runtime dispatch.
+        if Self::is_union_type(obj_ty)
+            && Self::is_union_type(key_ty)
+            && key.is_pointer_value()
+        {
+            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+            let k_tag = self.builder.build_call(self.rt_get_tag, &[key.into()], "ir_idxk_tag")
+                .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+            let i8t = self.context.i8_type();
+            let is_i32 = self.builder.build_int_compare(IntPredicate::EQ, k_tag, i8t.const_int(2, false), "ir_k_i32").unwrap();
+            let is_i64 = self.builder.build_int_compare(IntPredicate::EQ, k_tag, i8t.const_int(3, false), "ir_k_i64").unwrap();
+            let is_int = self.builder.build_or(is_i32, is_i64, "ir_k_int").unwrap();
+            let int_b = self.context.append_basic_block(llvm_fn, "ir_idx_intk");
+            let str_b = self.context.append_basic_block(llvm_fn, "ir_idx_strk");
+            let mrg = self.context.append_basic_block(llvm_fn, "ir_idx_kmrg");
+            self.builder.build_conditional_branch(is_int, int_b, str_b).unwrap();
+            // int key → array get (always returns a valid TaggedVal*).
+            self.builder.position_at_end(int_b);
+            let idx = self.unbox_value(key, &Type::Int64).into_int_value();
+            let get_tagged_fn = self.get_or_declare_fn("lin_array_get_tagged",
+                ptr_ty.fn_type(&[ptr_ty.into(), self.context.i64_type().into()], false));
+            let arr_res = self.builder.build_call(get_tagged_fn, &[container.into(), idx.into()], "ir_idx_aget")
+                .unwrap().try_as_basic_value().unwrap_basic();
+            let int_exit = self.builder.get_insert_block().unwrap();
+            self.builder.build_unconditional_branch(mrg).unwrap();
+            // string key → object get, guarded by an object-tag check on the container source.
+            self.builder.position_at_end(str_b);
+            let key_raw = self.builder.build_call(self.rt_unbox_ptr, &[key.into()], "ir_idxk_str")
+                .unwrap().try_as_basic_value().unwrap_basic();
+            let obj_tag = self.builder.build_call(self.rt_get_tag, &[obj.into()], "ir_idx_otag")
+                .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+            let is_obj = self.builder.build_int_compare(IntPredicate::EQ, obj_tag, i8t.const_int(7, false), "ir_idx_isobj").unwrap();
+            let oget_b = self.context.append_basic_block(llvm_fn, "ir_idx_oget");
+            let onull_b = self.context.append_basic_block(llvm_fn, "ir_idx_onull");
+            let omrg = self.context.append_basic_block(llvm_fn, "ir_idx_omrg");
+            self.builder.build_conditional_branch(is_obj, oget_b, onull_b).unwrap();
+            self.builder.position_at_end(oget_b);
+            let oget = self.builder.build_call(self.rt_object_get, &[container.into(), key_raw.into()], "ir_idx_osget")
+                .unwrap().try_as_basic_value().unwrap_basic();
+            let oget_exit = self.builder.get_insert_block().unwrap();
+            self.builder.build_unconditional_branch(omrg).unwrap();
+            self.builder.position_at_end(onull_b);
+            self.builder.build_unconditional_branch(omrg).unwrap();
+            self.builder.position_at_end(omrg);
+            let ophi = self.builder.build_phi(ptr_ty, "ir_idx_ophi").unwrap();
+            ophi.add_incoming(&[(&oget, oget_exit), (&ptr_ty.const_null(), onull_b)]);
+            let str_res = ophi.as_basic_value();
+            let str_exit = self.builder.get_insert_block().unwrap();
+            self.builder.build_unconditional_branch(mrg).unwrap();
+            self.builder.position_at_end(mrg);
+            let phi = self.builder.build_phi(ptr_ty, "ir_idx_kphi").unwrap();
+            phi.add_incoming(&[(&arr_res, int_exit), (&str_res, str_exit)]);
+            let res = phi.as_basic_value();
+            return if Self::is_union_type(result_ty) { res } else { self.unbox_tagged_val_to_type(res, result_ty) };
+        }
         // Array indexing when the object is an array type or the key is numeric (any int
         // width — e.g. an Int32 literal index like `lines[0]`, not just i64).
         let is_array_access = matches!(obj_ty, Type::Array(_) | Type::FixedArray(_))

@@ -409,6 +409,19 @@ impl FuncBuilder {
         }
     }
 
+    /// Register an owned temp that may be a boxed union/Json value (whose heap payload still
+    /// needs releasing). Used for projections (`obj[k]` / `obj.field`) whose result type is a
+    /// union: the projected TaggedVal* aliases a value inside the container, so it must be
+    /// dup'd and tracked for release like any other owned heap value. `Release` codegen is
+    /// tag-aware, so releasing a union temp frees its inner payload correctly.
+    fn register_owned_rc_or_union(&mut self, t: Temp, ty: Type) {
+        if is_rc_type(&ty) || is_union_ty(&ty) {
+            if let Some(frame) = self.scope_owned.last_mut() {
+                frame.push((t, ty));
+            }
+        }
+    }
+
     /// Remove a temp from the owned set across all live scope frames. Used when ownership
     /// of a freshly-allocated heap value is *transferred* into a container (array/object)
     /// or a consuming callee: the container now holds the +1, so the originating scope must
@@ -1081,7 +1094,10 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // that releases on reassignment, or a scope-exit release, is then balanced and the
             // container's own release stays safe. Without this, releasing the container frees
             // a value still aliased by the projected binding (the AST path masks this by
-            // leaking the container instead).
+            // leaking the container instead). A union/Json result is NOT dup'd here: the
+            // runtime accessor (lin_object_get) returns an INTERIOR pointer to the entry's
+            // TaggedVal, not an ownable heap box — treating it as owned and releasing it would
+            // free an interior address. Concrete heap projections ARE real owned values.
             if is_rc_type(result_type) {
                 builder.emit(Instruction::Retain { val: dst, ty: result_type.clone() });
                 builder.register_owned(dst, result_type.clone());
@@ -1101,6 +1117,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 result_ty: result_type.clone(),
             });
             // Dup the projected heap reference — see the Index case above for the rationale.
+            // (Union/Json results are interior pointers — not dup'd; see the Index case.)
             if is_rc_type(result_type) {
                 builder.emit(Instruction::Retain { val: dst, ty: result_type.clone() });
                 builder.register_owned(dst, result_type.clone());
@@ -1343,13 +1360,19 @@ fn lower_intrinsic_call(
     };
     let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();
 
-    // `push(arr, elem)` transfers a reference to `elem` into the array, and codegen's push
-    // does NOT retain (it stores the pointer / copies the boxed value). So manage the
-    // element's ownership like a MakeArray element: a fresh allocation transfers its +1
-    // (drop it from the owning scope so the scope-exit release doesn't free a value the
-    // array now holds); a borrowed heap value is retained so both owners can release.
-    if intrinsic == Intrinsic::Push {
-        if let (Some(elem_expr), Some(&elem_temp)) = (args.get(1), lowered_args.get(1)) {
+    // `push(arr, elem)` / `set(arr, idx, elem)` transfer a reference to the element into the
+    // array, and codegen's push/set do NOT retain (they store the pointer / copy the boxed
+    // value). So manage the element's ownership like a MakeArray element: a fresh allocation
+    // transfers its +1 (drop it from the owning scope so the scope-exit release doesn't free a
+    // value the array now holds); a borrowed heap value is retained so both owners can release.
+    // The element is the LAST argument in all three: push(arr, elem), set(arr, idx, elem),
+    // object_set(obj, key, val). For push/set, codegen does NOT retain (stores the pointer);
+    // for object_set, codegen boxes the value, calls lin_object_set (which retains the inner),
+    // then releases the box (undoing that retain) — so the net effect is also a transfer.
+    // Either way: a fresh allocation transfers its +1 into the container (drop it from the
+    // owning scope so scope-exit doesn't double-free); a borrowed heap value is retained.
+    if matches!(intrinsic, Intrinsic::Push | Intrinsic::ArraySetDyn | Intrinsic::ObjectSetDyn) {
+        if let (Some(elem_expr), Some(&elem_temp)) = (args.last(), lowered_args.last()) {
             let et = elem_expr.ty();
             if is_rc_type(&et) {
                 if expr_is_fresh_alloc(elem_expr) {
@@ -2051,6 +2074,16 @@ fn lower_match(
         let arm_raw = lower_expr(&arm.body, builder, ctx);
         if !builder.is_current_block_terminated() {
             let arm_val = coerce_to_slot_type(arm_raw, &arm.body.ty(), result_type, builder);
+            // If an arm returns the scrutinee itself (e.g. `match x is {..} => x`), the match
+            // result aliases the scrutinee temp. The scrutinee is owned by an ENCLOSING scope
+            // (it's a val/expr lowered before the match); transferring it into the match result
+            // (also registered owned at the merge) would double-own it → the enclosing
+            // scope-exit release frees the still-live result. Drop it from the enclosing scope
+            // so exactly one owner (the match result) remains.
+            if arm_val == scrut_temp || arm_raw == scrut_temp || arm_val == raw_scrut || arm_raw == raw_scrut {
+                builder.unregister_owned(scrut_temp);
+                builder.unregister_owned(raw_scrut);
+            }
             // Release this arm's owned temps, keeping the result and its raw pre-coercion temp.
             builder.pop_scope_releasing_keep(&[arm_val, arm_raw]);
             incomings.push((arm_val, builder.current_block));

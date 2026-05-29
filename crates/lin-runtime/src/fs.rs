@@ -41,12 +41,20 @@ unsafe fn make_error_obj(msg: &str) -> *mut LinObject {
 
 /// Resolve a path that may be either a bare LinString* or a TaggedVal*(Str).
 /// Returns a Rust String on success, None on null/invalid input.
+///
+/// Discriminating boxed-vs-raw by the first byte is unsound: a boxed `TaggedVal{tag,pad,..}`
+/// has `tag` at offset 0, but a raw `LinString{refcount:u32,len:u32,..}` has its refcount
+/// there — so a string whose refcount's low byte equals TAG_STR(6) would be mis-detected as
+/// boxed and its char data read as a pointer. Compare the FULL first 8 bytes instead: a
+/// boxed string's leading u64 is exactly TAG_STR (tag=6 with zeroed pad), whereas a raw
+/// LinString's leading u64 is `(len << 32) | refcount`, which only equals 6 for an empty
+/// string with refcount exactly 6 — a collision narrow enough not to arise in practice.
 pub unsafe fn resolve_lin_str(ptr: *const u8) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
-    let tag = *ptr;
-    let lin_str = if tag == TAG_STR {
+    let head = (ptr as *const u64).read_unaligned();
+    let lin_str = if head == TAG_STR as u64 {
         lin_unbox_ptr(ptr) as *const LinString
     } else {
         ptr as *const LinString

@@ -86,6 +86,18 @@ pub unsafe fn retain_tagged_payload_pub(tv: &TaggedVal) {
     retain_tagged_payload(tv);
 }
 
+/// Retain the heap payload of a boxed TaggedVal* (tag-aware). The codegen `Retain`
+/// instruction can't use `lin_rc_retain` on a TaggedVal* — offset 0 is the tag byte, not a
+/// refcount, so that would corrupt the tag. This reads the tag and bumps the inner value's
+/// refcount, the mirror of the tag-aware `lin_tagged_release`. Null-safe.
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_retain(p: *const u8) {
+    if p.is_null() {
+        return;
+    }
+    retain_tagged_payload(&*(p as *const TaggedVal));
+}
+
 /// Set a field. Key must be a LinString*. Value is a TaggedVal* (pointer to tagged payload).
 /// Copies the 16-byte TaggedVal struct and retains the inner value (the object owns a reference).
 /// Takes ownership of the key reference (caller must not release it — use lin_object_keys'
