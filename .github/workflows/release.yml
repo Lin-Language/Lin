@@ -68,6 +68,7 @@ jobs:
         run: |
           cargo build --release -p lin --target ${{ matrix.target }}
           cargo build --release -p lin-lsp --target ${{ matrix.target }}
+          cargo build --release -p lin-runtime --target ${{ matrix.target }}
 
       - name: Strip binaries
         run: |
