@@ -2201,13 +2201,19 @@ fn lower_function_expr_with_id(
     //   a concrete return, e.g. groupBy's `keyFn: (Json) => String`): return exactly that
     //   type so AST-compiled higher-order callees, which call back with the declared
     //   signature, get a raw (unboxed) value.
-    // - otherwise closures use the uniform boxed (Json) ABI so a Function value is callable
-    //   through an opaque type without its concrete return (IR indirect calls unbox).
+    // - otherwise an ANONYMOUS closure (no pre-assigned FuncId — i.e. not a top-level named
+    //   function) uses the uniform boxed (Json) ABI: it is only ever reached through the
+    //   closure calling convention (incl. AST `build_closure_call_typed`, which reads the
+    //   result's payload at offset 8), so it must always return a boxed TaggedVal*. This
+    //   applies even to capture-less closures (which were previously mis-returning raw).
+    // - top-level named functions (forced_fid set) keep their declared return — they are
+    //   Direct-called with exact signatures.
     // - void (Null/Never) returns stay void.
+    let is_anonymous = forced_fid.is_none();
     let void_ret = matches!(ret_type, Type::Null | Type::Never);
     let effective_ret = if let Some(fr) = forced_ret {
         fr.clone()
-    } else if is_closure && !void_ret {
+    } else if is_anonymous && !void_ret {
         Type::TypeVar(u32::MAX)
     } else {
         ret_type.clone()
