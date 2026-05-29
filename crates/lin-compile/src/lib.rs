@@ -90,11 +90,11 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
 
     // Register imported modules with codegen in dependency order so cross-module slot
     // resolution works correctly (dependencies must be registered before dependents).
-    // On the IR path, imports are compiled through the same LinIR pipeline as the main
-    // module (compile_import_from_ir); the AST path uses register_import. Coverage
-    // instrumentation is only implemented for the AST path, so when coverage is requested
-    // we fall back to register_import_with_source even on the IR path.
-    let use_ir = std::env::var("LIN_USE_IR").as_deref() == Ok("1");
+    // The LinIR pipeline is the default compilation path; imports go through it too
+    // (compile_import_from_ir). The legacy TypedAST path remains as a temporary escape hatch
+    // behind LIN_USE_AST=1 (for bisection during the one-release deprecation window) and is
+    // also used when coverage is requested, since coverage instrumentation is AST-only.
+    let use_ir = std::env::var("LIN_USE_AST").as_deref() != Ok("1") && !opts.coverage;
     for path in &import_order {
         let imp_module = imported_modules.get(path).unwrap();
         if opts.coverage {
@@ -110,7 +110,8 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         }
     }
 
-    // Route through LinIR when LIN_USE_IR=1 (experimental; defaults to TypedAST path).
+    // Compile the main module through LinIR by default; the legacy TypedAST path is the
+    // LIN_USE_AST=1 escape hatch (and the coverage path). See the `use_ir` definition above.
     if use_ir {
         // Collect foreign-library link paths from the main module's ForeignImport stmts —
         // the AST path does this in compile_stmt, which the IR path doesn't run.

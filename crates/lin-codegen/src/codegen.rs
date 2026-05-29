@@ -7376,7 +7376,8 @@ impl<'ctx> Codegen<'ctx> {
     // =========================================================================
 
     /// Compile a `LinModule` (produced by `lin_ir::lower_module` + `elide_rc`) to LLVM IR.
-    /// This is the LinIR pipeline path, gated behind `LIN_USE_IR=1`.
+    /// This is the default compilation path (the legacy TypedAST `compile_module` is the
+    /// LIN_USE_AST=1 escape hatch).
     pub fn compile_module_from_ir(&mut self, module: &lir::LinModule) {
         use lir::{Instruction, Const, CallTarget, Terminator};
         use std::collections::HashMap as StdMap;
