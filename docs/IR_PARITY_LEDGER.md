@@ -289,3 +289,58 @@ with AST `build_closure_call_typed`'s unbox-on-TypeVar-params rule.
 The integration suite — the canonical parity measure — is 127/128 and stable. The stdlib
 suites stress higher-order interop more heavily and surface this one boundary issue plus
 its downstream RC effects.
+
+## Checkpoint 7 — 128/128 integration, 14/14 stdlib, ASan-clean (PARITY REACHED)
+
+Closed out every remaining failure. The IR leg now matches the AST leg exactly on the
+integration suite, the stdlib suite, and the non-skipped examples, and every stdlib test
+file is heap-clean under AddressSanitizer.
+
+### Fixes since checkpoint 6
+
+1. **Array-element ownership (heap corruption).** `MakeArray` lowering retained the *box*
+   (TaggedVal) instead of the underlying heap value, and left fresh-alloc elements in the
+   owning scope so they were released both directly and recursively via the container →
+   double-free. Fixed by managing RC on the raw element value: a *fresh* allocation
+   transfers its +1 into the array (dropped from the scope via `unregister_owned`), a
+   *borrowed* element is retained. `expr_is_fresh_alloc` widened to match AST's
+   `expr_is_owned_alloc` exactly (Call/MakeArray/MakeObject/StringLit/StringInterp/Function
+   + If/Match/Block/Coerce recursion).
+
+2. **Curried partial application of a closure value** (`add3(1)(2)(3)`). Under-applying a
+   closure whose result type is still `Function` now builds a nested partial-application
+   wrapper (`build_closure_partial_application_values`) that captures the inner closure +
+   supplied args and takes the remaining params — mirroring AST `build_closure_call`'s
+   Function-result branch, under the uniform boxed ABI. No closure arity metadata needed:
+   keyed purely on the `ret_ty` being `Function`, exactly like the AST path.
+
+3. **Partial-application closure env_size.** Both partial-application closure builders
+   never wrote `env_size` at offset 24, so `lin_closure_release` read garbage and freed the
+   env with a bogus layout (`malloc unaligned` / heap corruption). Now written explicitly
+   (lin_alloc does not zero).
+
+4. **Dup-on-projection.** `Index`/`FieldGet` of a heap type returns a *borrowed* alias into
+   the container. Binding it to an owned `var`/`val` (which releases on reassignment and at
+   scope exit) freed a value the container still owned. Now retained + registered as owned
+   on projection (IR path), and the analogous borrowed-projection retain added to the AST
+   `TypedStmt::Var` initializer (a latent AST-path UAF that production masked by leaking the
+   container — the IR path's correct array release exposed it).
+
+5. **rc_elide soundness: escapes are interference.** The elision pass only treated
+   calls/allocations as interference, so it removed a retain/release pair straddling an
+   *escape* (`MakeCell`/`CellSet`/`IndexSet`/`GlobalValSet`) — instructions that create an
+   independent owner which releases later. Eliding that retain caused a use-after-free. The
+   interference predicate now includes the escape instructions.
+
+### Known-broken examples (skipped on BOTH legs, pre-existing)
+`showcase.lin` and `template.lin` import `length` (and friends) from `std/string`, which
+does not export them. The AST path silently mis-compiles this to a `call ptr null(...)`
+(no output, exit 0); the IR path fails loudly at link time (`undefined reference to
+std_string_length__val`). These two are already in CI's skip list on both legs, so they are
+outside the parity gate. The IR behaviour here is strictly *more* correct (loud failure vs.
+silent null call).
+
+### Status
+Integration: **128/128** (AST and IR). Stdlib: **14/14** (AST and IR), **all 14 ASan-clean
+on the IR leg**. Non-skipped examples: all run on the IR leg. lin-ir unit tests: pass.
+The Milestone-1 parity gate is met — IR is at parity but still OFF by default.

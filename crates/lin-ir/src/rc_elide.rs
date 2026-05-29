@@ -286,17 +286,37 @@ fn find_release_at_block_start(temp: Temp, block: &BasicBlock) -> Option<usize> 
 /// (i.e., the block is safe to traverse for cross-block elision).
 fn block_is_clean_for(temp: Temp, block: &BasicBlock) -> bool {
     for instr in &block.instructions {
-        match instr {
-            Instruction::Call { .. }
-            | Instruction::CallIntrinsic { .. }
-            | Instruction::MakeObject { .. }
-            | Instruction::MakeArray { .. }
-            | Instruction::MakeClosure { .. } => return false,
-            Instruction::Release { val, .. } if *val == temp => return false,
-            _ => {}
+        if instr_is_interference(temp, instr) {
+            return false;
         }
     }
     true
+}
+
+/// An instruction "interferes" with a Retain/Release pair around `temp` if it could
+/// observe the refcount or create an independent owner — in which case the pair is NOT
+/// redundant and must be kept. This covers two categories:
+///   - calls/allocations that may alias or trigger reuse, and
+///   - *escapes*: instructions that store `temp` (or any value) into a longer-lived
+///     location (a heap cell, an array/object slot, a module global) that will release
+///     its own reference later. A retain balancing such an escape is load-bearing; eliding
+///     it causes a use-after-free when the second owner releases. The escape checks are
+///     value-agnostic (any escape on the path taints it) to stay conservative.
+fn instr_is_interference(temp: Temp, instr: &Instruction) -> bool {
+    match instr {
+        Instruction::Call { .. }
+        | Instruction::CallIntrinsic { .. }
+        | Instruction::MakeObject { .. }
+        | Instruction::MakeArray { .. }
+        | Instruction::MakeClosure { .. }
+        // Escapes — these create an independent owner of a stored value.
+        | Instruction::MakeCell { .. }
+        | Instruction::CellSet { .. }
+        | Instruction::IndexSet { .. }
+        | Instruction::GlobalValSet { .. } => true,
+        Instruction::Release { val, .. } if *val == temp => true,
+        _ => false,
+    }
 }
 
 /// Returns true if `temp` is not redefined or released anywhere in `block`
@@ -344,14 +364,8 @@ fn path_has_no_interference(
     let start = if start_exclusive == usize::MAX { 0 } else { start_exclusive + 1 };
     let end = end_exclusive.min(instrs.len());
     for i in start..end {
-        match &instrs[i] {
-            Instruction::Call { .. }
-            | Instruction::CallIntrinsic { .. }
-            | Instruction::MakeObject { .. }
-            | Instruction::MakeArray { .. }
-            | Instruction::MakeClosure { .. } => return false,
-            Instruction::Release { val, .. } if *val == temp => return false,
-            _ => {}
+        if instr_is_interference(temp, &instrs[i]) {
+            return false;
         }
     }
     true

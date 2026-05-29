@@ -292,6 +292,16 @@ impl FuncBuilder {
         }
     }
 
+    /// Remove a temp from the owned set across all live scope frames. Used when ownership
+    /// of a freshly-allocated heap value is *transferred* into a container (array/object)
+    /// or a consuming callee: the container now holds the +1, so the originating scope must
+    /// NOT also release it (that would double-free, since the container releases it on drop).
+    fn unregister_owned(&mut self, t: Temp) {
+        for frame in self.scope_owned.iter_mut() {
+            frame.retain(|(owned, _)| *owned != t);
+        }
+    }
+
     /// Pop the current scope frame and emit Release for all owned temps except `keep`.
     fn pop_scope_releasing(&mut self, keep: Temp) {
         if let Some(frame) = self.scope_owned.pop() {
@@ -447,9 +457,27 @@ fn retain_call_arg(arg: Temp, ty: &Type, _is_fresh: bool, builder: &mut FuncBuil
 }
 
 /// Whether an argument expression produces a freshly-allocated value (a function/closure
-/// literal or a call result) whose +1 reference can be transferred to a consuming callee.
+/// literal, a literal allocation, or a call result) whose +1 reference can be transferred
+/// to a consuming callee or container. Mirrors AST `expr_is_owned_alloc` exactly.
 fn expr_is_fresh_alloc(expr: &TypedExpr) -> bool {
-    matches!(expr, TypedExpr::Function { .. } | TypedExpr::Call { .. })
+    match expr {
+        TypedExpr::Call { .. }
+        | TypedExpr::MakeArray { .. }
+        | TypedExpr::MakeObject { .. }
+        | TypedExpr::StringLit { .. }
+        | TypedExpr::StringInterp { .. }
+        | TypedExpr::Function { .. } => true,
+        // If/Match are owned iff every branch/arm is owned (exactly one runs per execution).
+        TypedExpr::If { then_br, else_br, .. } => {
+            expr_is_fresh_alloc(then_br) && expr_is_fresh_alloc(else_br)
+        }
+        TypedExpr::Match { arms, .. } => {
+            !arms.is_empty() && arms.iter().all(|a| expr_is_fresh_alloc(&a.body))
+        }
+        TypedExpr::Block { expr, .. } => expr_is_fresh_alloc(expr),
+        TypedExpr::Coerce { expr, .. } => expr_is_fresh_alloc(expr),
+        _ => false,
+    }
 }
 
 /// Coerce a call argument to the callee's declared parameter type: box a concrete value
@@ -876,14 +904,25 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 .iter()
                 .map(|e| {
                     let t = lower_expr(e, builder, ctx);
-                    let c = coerce_to_slot_type(t, &e.ty(), &elem_ty, builder);
-                    // The array takes ownership of heap elements; retain so the element's
-                    // scope-exit release doesn't free a value the array still holds (e.g. a
-                    // closure stored in an array that outlives the constructing function).
-                    if matches!(e.ty(), Type::Function { .. }) {
-                        builder.emit(Instruction::Retain { val: c, ty: e.ty() });
+                    // The array owns a reference to each heap element (lin_array_release
+                    // recursively releases them when the array is freed). Manage ownership on
+                    // the RAW underlying heap value `t`, NOT the boxed TaggedVal — retaining a
+                    // box would bump the wrong refcount and the inner value would still be
+                    // double-freed. Mirrors AST compile_make_array's `!expr_is_owned_alloc`.
+                    let et = e.ty();
+                    if is_rc_type(&et) {
+                        if expr_is_fresh_alloc(e) {
+                            // Fresh allocation: transfer its +1 into the array. Drop it from
+                            // the owning scope so the scope-exit release doesn't double-free
+                            // (the array's recursive release already accounts for it).
+                            builder.unregister_owned(t);
+                        } else {
+                            // Borrowed value (e.g. a LocalGet): retain so the array's copy and
+                            // the original owner can each release independently.
+                            builder.emit(Instruction::Retain { val: t, ty: et.clone() });
+                        }
                     }
-                    c
+                    coerce_to_slot_type(t, &et, &elem_ty, builder)
                 })
                 .collect();
             let dst = builder.alloc_temp(ty.clone());
@@ -910,6 +949,16 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 key_ty,
                 result_ty: result_type.clone(),
             });
+            // A projection returns a BORROWED reference into the container. Dup it (retain +
+            // register as owned) so the result behaves like any owned value: a consuming var
+            // that releases on reassignment, or a scope-exit release, is then balanced and the
+            // container's own release stays safe. Without this, releasing the container frees
+            // a value still aliased by the projected binding (the AST path masks this by
+            // leaking the container instead).
+            if is_rc_type(result_type) {
+                builder.emit(Instruction::Retain { val: dst, ty: result_type.clone() });
+                builder.register_owned(dst, result_type.clone());
+            }
             dst
         }
 
@@ -924,6 +973,11 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 obj_ty,
                 result_ty: result_type.clone(),
             });
+            // Dup the projected heap reference — see the Index case above for the rationale.
+            if is_rc_type(result_type) {
+                builder.emit(Instruction::Retain { val: dst, ty: result_type.clone() });
+                builder.register_owned(dst, result_type.clone());
+            }
             dst
         }
 

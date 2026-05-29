@@ -1632,6 +1632,14 @@ impl<'ctx> Codegen<'ctx> {
             }
             TypedStmt::Var { slot, value, ty, .. } => {
                 let compiled = self.compile_expr(value, fn_ctx);
+                // A `var` releases its old value on every reassignment (compile_local_set).
+                // If it was initialised with a BORROWED heap value (e.g. `var r = parts[0]`,
+                // a projection that aliases the container), that first release would free a
+                // value the container still owns. Dup it so the var owns its own reference and
+                // the reassignment-release is balanced. Owned allocations already transfer +1.
+                if !Self::expr_is_owned_alloc(value) && Self::ty_is_heap(ty) && compiled.is_pointer_value() {
+                    self.builder.build_call(self.rt_rc_retain, &[compiled.into()], "").unwrap();
+                }
                 let llvm_ty = self.llvm_type(ty);
                 if fn_ctx.heap_var_slots.contains(slot) {
                     // This var is captured mutably by an inner closure — heap-allocate the cell
@@ -3020,6 +3028,12 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.build_store(fn_field, wrapper_fn.as_global_value().as_pointer_value()).unwrap();
         let env_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 3, "papp_cls_env").unwrap();
         self.builder.build_store(env_field, env_ptr).unwrap();
+        // env_size at offset 24 so lin_closure_release frees the env with the right layout
+        // (lin_alloc does NOT zero, so this MUST be written explicitly).
+        let env_sz_gep = unsafe { self.builder.build_gep(
+            self.context.i8_type(), cls_ptr, &[self.context.i64_type().const_int(24, false)], "papp_env_sz_f"
+        ).unwrap() };
+        self.builder.build_store(env_sz_gep, env_size_i64).unwrap();
 
         let current_block = self.builder.get_insert_block().unwrap();
         {
@@ -3047,6 +3061,103 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
         self.builder.position_at_end(current_block);
+        cls_ptr.into()
+    }
+
+    /// Value-input port of `build_closure_call`'s partial-application branch (LinIR path).
+    /// Under-applying a closure *value* (`step1(2)` where `step1: (Int,Int)=>Int`) yields a
+    /// new closure capturing the inner closure + the supplied args, taking the remaining
+    /// params. The wrapper uses the uniform boxed ABI (returns a TaggedVal*), and completes
+    /// the call by invoking the inner closure (also boxed ABI) with stored ++ remaining args.
+    fn build_closure_partial_application_values(
+        &mut self,
+        closure_ptr: PointerValue<'ctx>,
+        partial_args: &[BasicValueEnum<'ctx>],
+        remaining_params: &[Type],
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let arg_types: Vec<BasicTypeEnum> = partial_args.iter().map(|v| v.get_type()).collect();
+
+        // Env struct: { ptr (inner closure), arg0, arg1, ... }.
+        let mut env_field_types: Vec<BasicTypeEnum> = vec![ptr_ty.into()];
+        env_field_types.extend_from_slice(&arg_types);
+        let env_struct_ty = self.context.struct_type(&env_field_types, false);
+        let env_size = env_struct_ty.size_of().unwrap();
+        let env_size_i64 = self.builder.build_int_z_extend_or_bit_cast(env_size, self.context.i64_type(), "papp_env_sz").unwrap();
+        let env_ptr2 = self.builder.build_call(self.rt_alloc, &[env_size_i64.into()], "papp_env").unwrap()
+            .try_as_basic_value().unwrap_basic().into_pointer_value();
+        let cls_field = self.builder.build_struct_gep(env_struct_ty, env_ptr2, 0, "papp_cls_f").unwrap();
+        self.builder.build_store(cls_field, closure_ptr).unwrap();
+        // The env borrows the inner closure (does not retain it), mirroring the AST path's
+        // build_closure_call. The inner closure is a longer-lived binding (a top-level val
+        // stored to a module global, retained there), so the borrow stays valid.
+        for (i, val) in partial_args.iter().enumerate() {
+            let f = self.builder.build_struct_gep(env_struct_ty, env_ptr2, (i + 1) as u32, "papp_f").unwrap();
+            self.builder.build_store(f, *val).unwrap();
+        }
+
+        // Wrapper: (env_ptr, ...remaining_params) -> ptr (boxed ABI).
+        let wrapper_name = format!("__papp_cls_ir_{}", self.closure_count);
+        self.closure_count += 1;
+        let mut wrapper_param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
+        for t in remaining_params {
+            wrapper_param_types.push(self.llvm_param_type(t));
+        }
+        let wrapper_fn_ty = ptr_ty.fn_type(&wrapper_param_types, false);
+        let wrapper_fn = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
+
+        let saved_block = self.builder.get_insert_block().unwrap();
+        let wrapper_entry = self.context.append_basic_block(wrapper_fn, "entry");
+        self.builder.position_at_end(wrapper_entry);
+
+        let w_env_ptr = wrapper_fn.get_nth_param(0).unwrap().into_pointer_value();
+        let cls_fp = self.builder.build_struct_gep(env_struct_ty, w_env_ptr, 0, "wcls_p").unwrap();
+        let inner_cls_ptr = self.builder.build_load(ptr_ty, cls_fp, "inner_cls").unwrap().into_pointer_value();
+
+        // Load the inner closure's fn_ptr / env_ptr.
+        let cls_ty = self.closure_struct_type();
+        let inner_fn_gep = self.builder.build_struct_gep(cls_ty, inner_cls_ptr, 2, "inner_fp").unwrap();
+        let inner_fn_ptr = self.builder.build_load(ptr_ty, inner_fn_gep, "inner_fnp").unwrap().into_pointer_value();
+        let inner_env_gep = self.builder.build_struct_gep(cls_ty, inner_cls_ptr, 3, "inner_ep").unwrap();
+        let inner_env_ptr = self.builder.build_load(ptr_ty, inner_env_gep, "inner_envp").unwrap();
+
+        // Complete the call: inner_fn(inner_env, stored_args..., remaining_params...).
+        let mut call_param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
+        let mut call_args: Vec<BasicMetadataValueEnum> = vec![inner_env_ptr.into()];
+        for (i, ty) in arg_types.iter().enumerate() {
+            let fp = self.builder.build_struct_gep(env_struct_ty, w_env_ptr, (i + 1) as u32, "warg_p").unwrap();
+            let v = self.builder.build_load(*ty, fp, "warg").unwrap();
+            call_param_types.push((*ty).into());
+            call_args.push(v.into());
+        }
+        for (i, t) in remaining_params.iter().enumerate() {
+            let p = wrapper_fn.get_nth_param((i + 1) as u32).unwrap();
+            call_param_types.push(self.llvm_param_type(t));
+            call_args.push(p.into());
+        }
+        // Inner closure uses the uniform boxed ABI: returns a TaggedVal* (ptr).
+        let inner_fn_ty = ptr_ty.fn_type(&call_param_types, false);
+        let inner_call = self.builder.build_indirect_call(inner_fn_ty, inner_fn_ptr, &call_args, "papp_inner").unwrap();
+        let inner_result = inner_call.try_as_basic_value().unwrap_basic();
+        self.builder.build_return(Some(&inner_result)).unwrap();
+        self.builder.position_at_end(saved_block);
+
+        // Build the outer closure struct { rc, _pad, fn_ptr, env_ptr }.
+        let cls_struct_ty = self.closure_struct_type();
+        let cls_ptr = self.builder.build_call(self.rt_alloc, &[self.context.i64_type().const_int(32, false).into()], "papp_cls").unwrap()
+            .try_as_basic_value().unwrap_basic().into_pointer_value();
+        let rc_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 0, "papp_cls_rc").unwrap();
+        self.builder.build_store(rc_field, self.context.i32_type().const_int(1, false)).unwrap();
+        let fn_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 2, "papp_cls_fn").unwrap();
+        self.builder.build_store(fn_field, wrapper_fn.as_global_value().as_pointer_value()).unwrap();
+        let env_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 3, "papp_cls_env").unwrap();
+        self.builder.build_store(env_field, env_ptr2).unwrap();
+        // env_size at offset 24 (lin_alloc does NOT zero — must write explicitly so
+        // lin_closure_release frees the env with the correct layout).
+        let env_sz_gep = unsafe { self.builder.build_gep(
+            self.context.i8_type(), cls_ptr, &[self.context.i64_type().const_int(24, false)], "papp_env_sz_f"
+        ).unwrap() };
+        self.builder.build_store(env_sz_gep, env_size_i64).unwrap();
         cls_ptr.into()
     }
 
@@ -7451,6 +7562,22 @@ impl<'ctx> Codegen<'ctx> {
                                                 self.builder.build_call(self.rt_unbox_ptr, &[cls_ptr.into()], "ir_fn_unbox")
                                                     .unwrap().try_as_basic_value().unwrap_basic()
                                             } else { cls_ptr };
+                                            // Under-application of a closure value: the result is
+                                            // still a Function, so bundle the inner closure + the
+                                            // supplied args into a new partial-application closure
+                                            // taking the remaining params (no direct call yet).
+                                            if let Type::Function { params: remaining, .. } = ret_ty {
+                                                let partials: Vec<BasicValueEnum> = arg_vals.iter().map(|a| match a {
+                                                    BasicMetadataValueEnum::IntValue(v) => (*v).into(),
+                                                    BasicMetadataValueEnum::FloatValue(v) => (*v).into(),
+                                                    BasicMetadataValueEnum::PointerValue(v) => (*v).into(),
+                                                    _ => ptr_ty.const_null().into(),
+                                                }).collect();
+                                                let r = self.build_closure_partial_application_values(
+                                                    cls_ptr.into_pointer_value(), &partials, remaining);
+                                                temp_map.insert(*dst, r);
+                                                continue;
+                                            }
                                             // Build closure call: load fn_ptr from offset 2 of closure struct.
                                             let cls_ty = self.closure_struct_type();
                                             let cls_ptr_v = cls_ptr.into_pointer_value();
