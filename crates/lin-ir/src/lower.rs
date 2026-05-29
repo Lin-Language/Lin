@@ -1491,8 +1491,11 @@ fn lower_if(
     // --- then branch ---
     builder.switch_to(then_block);
     builder.push_scope();
-    let then_val = lower_expr(then_br, builder, ctx);
+    let then_raw = lower_expr(then_br, builder, ctx);
     if !builder.is_current_block_terminated() {
+        // Coerce to the if's result representation so both phi inputs agree (e.g. an
+        // `Object` branch value boxed to a `Json` if-result).
+        let then_val = coerce_to_slot_type(then_raw, &then_br.ty(), result_type, builder);
         builder.pop_scope_releasing(then_val);
         incomings.push((then_val, builder.current_block));
         builder.terminate(Terminator::Jump(merge_block));
@@ -1503,8 +1506,9 @@ fn lower_if(
     // --- else branch ---
     builder.switch_to(else_block);
     builder.push_scope();
-    let else_val = lower_expr(else_br, builder, ctx);
+    let else_raw = lower_expr(else_br, builder, ctx);
     if !builder.is_current_block_terminated() {
+        let else_val = coerce_to_slot_type(else_raw, &else_br.ty(), result_type, builder);
         builder.pop_scope_releasing(else_val);
         incomings.push((else_val, builder.current_block));
         builder.terminate(Terminator::Jump(merge_block));
@@ -1692,13 +1696,43 @@ fn lower_match_pattern(
         }
         TypedMatchPattern::Has(tp) => {
             let required_fields = pattern_required_fields(tp);
-            let dst = builder.alloc_temp(Type::Bool);
+            let mut cond = builder.alloc_temp(Type::Bool);
             builder.emit(Instruction::HasPattern {
-                dst,
+                dst: cond,
                 val: scrut,
                 pattern: HasDesc { required_fields },
             });
-            PatternTest::Cond(dst)
+            // For object fields with a value constraint (e.g. `has { "type": "success" }`),
+            // also require scrut[key] == literal, AND-ed into the condition.
+            if let TypedPattern::Object { fields, .. } = tp {
+                let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
+                for field in fields {
+                    if let Some(vp) = &field.value_pattern {
+                        let lit_ty = vp.ty();
+                        let lit_raw = lower_expr(vp, builder, ctx);
+                        let lit = box_to_json(lit_raw, &lit_ty, builder);
+                        // got = scrut[key]
+                        let key_temp = builder.const_temp(Const::Str(field.key.clone()));
+                        let got = builder.alloc_temp(Type::TypeVar(u32::MAX));
+                        builder.emit(Instruction::Index {
+                            dst: got, object: scrut, key: key_temp,
+                            obj_ty: scrut_ty.clone(), key_ty: Type::Str, result_ty: Type::TypeVar(u32::MAX),
+                        });
+                        let eq = builder.alloc_temp(Type::Bool);
+                        builder.emit(Instruction::Binary {
+                            dst: eq, op: BinOp::Eq, lhs: got, rhs: lit,
+                            operand_ty: Type::TypeVar(u32::MAX), ty: Type::Bool,
+                        });
+                        let combined = builder.alloc_temp(Type::Bool);
+                        builder.emit(Instruction::Binary {
+                            dst: combined, op: BinOp::And, lhs: cond, rhs: eq,
+                            operand_ty: Type::Bool, ty: Type::Bool,
+                        });
+                        cond = combined;
+                    }
+                }
+            }
+            PatternTest::Cond(cond)
         }
     }
 }
