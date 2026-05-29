@@ -44,12 +44,20 @@ pub fn lower_module(module: &TypedModule) -> LinModule {
         collect_mutable_capture_slots_stmt(stmt, &mut ctx.mutable_cell_slots);
     }
 
-    // Top-level non-function vals become module globals (so closures can read them).
+    // Top-level non-function vals AND top-level vars become module globals so closures can
+    // read them (closures can't see `main`'s SSA temps). A top-level `var` additionally needs
+    // its writes mirrored to the global — both at its definition and at every reassignment,
+    // including reassignments inside closures (see TypedStmt::Var and LocalSet lowering).
     for stmt in &module.statements {
-        if let TypedStmt::Val { slot, value, ty, .. } = stmt {
-            if !matches!(value, TypedExpr::Function { .. }) {
+        match stmt {
+            TypedStmt::Val { slot, value, ty, .. } if !matches!(value, TypedExpr::Function { .. }) => {
                 ctx.global_val_slots.insert(*slot, ty.clone());
             }
+            TypedStmt::Var { slot, ty, .. } => {
+                ctx.global_val_slots.insert(*slot, ty.clone());
+                ctx.global_var_slots.insert(*slot);
+            }
+            _ => {}
         }
     }
 
@@ -228,6 +236,11 @@ struct LowerCtx {
     /// Top-level non-function `val` slots (with their type). These are emitted as LLVM
     /// globals so closures — which can't see `main`'s SSA temps — can read them.
     global_val_slots: HashMap<usize, Type>,
+    /// The subset of `global_val_slots` that are top-level `var`s (mutable). Reads of these
+    /// MUST always go through `GlobalValGet` (never a cached local SSA temp), because a
+    /// closure call may have mutated the global since the last local write. Writes go through
+    /// `GlobalValSet`.
+    global_var_slots: std::collections::HashSet<usize>,
 }
 
 impl LowerCtx {
@@ -238,6 +251,7 @@ impl LowerCtx {
             func_counter: 0,
             intrinsics: HashMap::new(),
             global_fn_slots: HashMap::new(),
+            global_var_slots: std::collections::HashSet::new(),
             import_fn_slots: HashMap::new(),
             import_val_slots: HashMap::new(),
             mutable_cell_slots: std::collections::HashSet::new(),
@@ -699,6 +713,12 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 let t = coerce_to_slot_type(t, &value.ty(), ty, builder);
                 // Plain mutable temp; tracked per var slot, updated on LocalSet.
                 builder.slots.insert(*slot, t);
+                // A top-level `var` is also published to its module global so closures (which
+                // can't see main's SSA temps) can read/write it. Writes inside closures go
+                // through GlobalValSet (see LocalSet); reads through GlobalValGet (LocalGet).
+                if ctx.global_val_slots.contains_key(slot) {
+                    builder.emit(Instruction::GlobalValSet { slot: *slot, value: t, ty: ty.clone() });
+                }
             }
         }
         TypedStmt::Import { path, bindings, .. } => {
@@ -841,6 +861,26 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         }
 
         TypedExpr::LocalGet { slot, ty, .. } => {
+            // Top-level mutable `var` (module global): ALWAYS load via GlobalValGet, never a
+            // cached local temp — a preceding closure call may have mutated the global. (A
+            // top-level immutable `val` can use the local-temp fast path below.)
+            if ctx.global_var_slots.contains(slot) {
+                let gty = ctx.global_val_slots.get(slot).cloned().unwrap_or_else(|| ty.clone());
+                let dst = builder.alloc_temp(gty.clone());
+                builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty.clone() });
+                // The global holds the var's declared representation; narrow to the requested
+                // concrete type if this use wants one (e.g. a Json global read as Int32).
+                let out = if is_union_ty(&gty) && !is_union_ty(ty) {
+                    let d = builder.alloc_temp(ty.clone());
+                    builder.emit(Instruction::Coerce { dst: d, src: dst, from_ty: gty.clone(), to_ty: ty.clone() });
+                    d
+                } else { dst };
+                if is_rc_type(&gty) {
+                    builder.emit(Instruction::Retain { val: out, ty: gty.clone() });
+                    builder.register_owned(out, gty);
+                }
+                return out;
+            }
             // Heap-cell slot (mutably-captured var): load the current value through the cell.
             if let Some(cell_ty) = builder.cell_slots.get(slot).cloned() {
                 if let Some(&cell) = builder.slots.get(slot) {
@@ -912,6 +952,15 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                     return v;
                 }
             }
+            // Module-global slot (a top-level `var`): write through the global so the update
+            // is visible to closures and to later reads (which load via GlobalValGet). Coerce
+            // to the global's declared representation first.
+            if let Some(gty) = ctx.global_val_slots.get(slot).cloned() {
+                let v = coerce_to_slot_type(val_temp, &value.ty(), &gty, builder);
+                builder.emit(Instruction::GlobalValSet { slot: *slot, value: v, ty: gty });
+                builder.slots.insert(*slot, v);
+                return v;
+            }
             builder.slots.insert(*slot, val_temp);
             // LocalSet returns the value.
             val_temp
@@ -920,9 +969,31 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         TypedExpr::BinaryOp { left, op, right, result_type, .. } => {
             // The operand type drives equality/comparison dispatch (e.g. object/array
             // deep equality); it differs from result_type for comparisons (which yield Bool).
-            let operand_ty = left.ty();
-            let lhs = lower_expr(left, builder, ctx);
-            let rhs = lower_expr(right, builder, ctx);
+            let left_ty = left.ty();
+            let right_ty = right.ty();
+            let mut lhs = lower_expr(left, builder, ctx);
+            let mut rhs = lower_expr(right, builder, ctx);
+            let mut operand_ty = left_ty.clone();
+
+            // ARITHMETIC ops need concrete (unboxed) operands. If a side's STATIC type is a
+            // union (Json/TypeVar) while the other is concrete — e.g. a loop/closure param
+            // typed `TypeVar` used as `Int32` in `total + i` — unbox it to the concrete operand
+            // type first, or codegen runs an integer op on a raw pointer (crash). We do NOT do
+            // this for equality/comparison ops: those have a dedicated union path in codegen
+            // (lin_tagged_eq / lin_tagged_cmp) that tolerates boxed/null operands, and unboxing
+            // a possibly-null Json (e.g. `opts["k"] == true` where the key is absent) would be
+            // unsound.
+            if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod) {
+                operand_ty = if !is_union_ty(&left_ty) { left_ty.clone() }
+                             else if !is_union_ty(&right_ty) { right_ty.clone() }
+                             else { left_ty.clone() };
+                if is_union_ty(&left_ty) && !is_union_ty(&operand_ty) {
+                    lhs = coerce_to_slot_type(lhs, &left_ty, &operand_ty, builder);
+                }
+                if is_union_ty(&right_ty) && !is_union_ty(&operand_ty) {
+                    rhs = coerce_to_slot_type(rhs, &right_ty, &operand_ty, builder);
+                }
+            }
             let dst = builder.alloc_temp(result_type.clone());
             builder.emit(Instruction::Binary {
                 dst,

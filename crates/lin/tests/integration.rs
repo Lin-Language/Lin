@@ -346,6 +346,44 @@ range(1, 4).for(i => print(toString(i)))
     assert_eq!(output, vec!["1", "2", "3"]);
 }
 
+// Regression: a top-level mutable `var` accumulated from inside a `.for` loop body closure.
+// The closure can't see main's SSA temps, so the var must be a module global written via
+// GlobalValSet and read via GlobalValGet; and `acc + i` must unbox the boxed (TypeVar) loop
+// element before the integer add. Previously this crashed in codegen (int op on a null ptr).
+#[test]
+fn test_loop_accumulates_toplevel_var() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/array"
+
+var total = 0
+range(0, 5).for(i => total = total + i)
+print(toString(total))
+"#);
+    assert_eq!(output, vec!["10"]);
+}
+
+// Regression: nested loops where the outer `.for` body mutates a top-level var by calling a
+// helper that itself runs a `.for` over an inner mutable var.
+#[test]
+fn test_nested_loops_with_var_accumulators() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/array"
+
+val work = (n: Int32): Int32 =>
+  var s = 0
+  range(0, n).for(i => s = s + i)
+  s
+
+var total = 0
+range(0, 5).for(i => total = total + work(10))
+print(toString(total))
+"#);
+    // work(10) = 0+1+..+9 = 45; summed 5 times = 225.
+    assert_eq!(output, vec!["225"]);
+}
+
 #[test]
 fn test_map_filter_reduce() {
     let output = run(r#"import { print } from "std/io"
