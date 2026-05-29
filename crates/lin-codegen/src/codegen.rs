@@ -7506,7 +7506,36 @@ impl<'ctx> Codegen<'ctx> {
                 if args.len() >= 2 {
                     let arr = args[0];
                     let elem = args[1];
-                    self.tagged_array_push_value(arr, elem, ret_ty);
+                    // The element's static type (arg 1) decides flat-vs-tagged storage; the
+                    // arrays we push into here (map/filter output, user push) are tagged.
+                    let elem_ty = arg_tys.get(1).cloned().unwrap_or_else(|| Type::TypeVar(u32::MAX));
+                    self.tagged_array_push_value(arr, elem, &elem_ty);
+                }
+                ptr_ty.const_null().into()
+            }
+            Intrinsic::ArrayAlloc => {
+                // Empty tagged array (capacity grows on push).
+                let cap = self.context.i64_type().const_int(4, false);
+                self.builder.build_call(self.rt_array_alloc, &[cap.into()], "ir_arr_alloc")
+                    .unwrap().try_as_basic_value().unwrap_basic()
+            }
+            Intrinsic::FlatArrayAlloc(kind) => {
+                let cap = self.context.i64_type().const_int(4, false);
+                let alloc_fn = self.get_or_declare_fn(
+                    &format!("lin_flat_array_alloc_{}", kind.suffix()),
+                    ptr_ty.fn_type(&[self.context.i64_type().into()], false));
+                self.builder.build_call(alloc_fn, &[cap.into()], "ir_falloc")
+                    .unwrap().try_as_basic_value().unwrap_basic()
+            }
+            Intrinsic::FlatArrayPush(kind) => {
+                if args.len() >= 2 {
+                    let elem_ty = match kind {
+                        lir::FlatElemKind::I32 => Type::Int32,
+                        lir::FlatElemKind::I64 => Type::Int64,
+                        lir::FlatElemKind::F32 => Type::Float32,
+                        lir::FlatElemKind::F64 => Type::Float64,
+                    };
+                    self.flat_array_push(args[0], args[1], &elem_ty);
                 }
                 ptr_ty.const_null().into()
             }
@@ -7704,9 +7733,11 @@ impl<'ctx> Codegen<'ctx> {
             }
             return val;
         }
-        // Box to union.
+        // Box to union. Use heap boxing (lin_box_*) rather than a stack alloca, because
+        // a coerced value may escape its defining function (returned, stored in an array,
+        // captured) — a stack TaggedVal would dangle.
         if Self::is_union_type(to_ty) {
-            return self.build_tagged_val_alloca(&val, from_ty).into();
+            return self.box_value(val, from_ty);
         }
         // Unbox from union.
         if Self::is_union_type(from_ty) && val.is_pointer_value() {
@@ -7717,7 +7748,8 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     fn compile_ir_box(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) -> BasicValueEnum<'ctx> {
-        self.build_tagged_val_alloca(&val, ty).into()
+        // Heap-box (see compile_ir_coerce) so the boxed value can safely escape.
+        self.box_value(val, ty)
     }
 
     fn compile_ir_unbox(&mut self, val: BasicValueEnum<'ctx>, result_ty: &Type) -> BasicValueEnum<'ctx> {
@@ -7805,6 +7837,44 @@ impl<'ctx> Codegen<'ctx> {
         lty: &Type,
         result_ty: &Type,
     ) -> BasicValueEnum<'ctx> {
+        // When operands are boxed (Json/union), use tagged runtime ops for equality and
+        // ordering (which tolerate mixed/null payloads), and unbox to a concrete numeric
+        // type for arithmetic. Mirrors the AST path's TypeVar handling in compile_binary_op.
+        if Self::is_union_type(lty) && lv.is_pointer_value() {
+            match op {
+                BinOp::Eq | BinOp::NotEq => {
+                    let eq_fn = self.get_or_declare_fn("lin_tagged_eq",
+                        self.context.bool_type().fn_type(
+                            &[self.context.ptr_type(AddressSpace::default()).into(),
+                              self.context.ptr_type(AddressSpace::default()).into()], false));
+                    let rv_tagged = if rv.is_pointer_value() { rv } else { self.box_value(rv, result_ty) };
+                    let eq = self.builder.build_call(eq_fn, &[lv.into(), rv_tagged.into()], "ir_teq")
+                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                    return if matches!(op, BinOp::NotEq) {
+                        self.builder.build_not(eq, "ir_tne").unwrap().into()
+                    } else { eq.into() };
+                }
+                BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
+                    // Unbox both operands to the numeric type of the other side / Int32, then compare.
+                    let lconc = self.unbox_tagged_val_to_type(lv, &Type::Int32);
+                    let rconc = if rv.is_pointer_value() { self.unbox_tagged_val_to_type(rv, &Type::Int32) } else { rv };
+                    return self.compile_binary_op_values(lconc, rconc, op, &Type::Int32, result_ty);
+                }
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                    let lconc = self.unbox_tagged_val_to_type(lv, &Type::Int32);
+                    let rconc = if rv.is_pointer_value() { self.unbox_tagged_val_to_type(rv, &Type::Int32) } else { rv };
+                    let concrete = self.compile_binary_op_values(lconc, rconc, op, &Type::Int32, &Type::Int32);
+                    // If the surrounding context expects a union/Json value, re-box the
+                    // concrete result (heap) so it can be stored/returned uniformly.
+                    return if Self::is_union_type(result_ty) {
+                        self.box_value(concrete, &Type::Int32)
+                    } else {
+                        concrete
+                    };
+                }
+                _ => {}
+            }
+        }
         match op {
             BinOp::Add => self.compile_add(lv, rv, lty, lty, result_ty),
             BinOp::Sub => self.compile_arith_op(lv, rv, lty, "sub"),

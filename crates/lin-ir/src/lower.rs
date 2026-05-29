@@ -11,6 +11,7 @@ use std::collections::HashMap;
 
 use lin_check::typed_ir::*;
 use lin_check::types::Type;
+use lin_parse::ast::BinOp;
 
 use crate::ir::*;
 
@@ -784,6 +785,19 @@ fn lower_intrinsic_call(
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> Temp {
+    // Control-flow / iteration intrinsics are lowered to explicit LinIR basic blocks
+    // (Option B) rather than opaque runtime calls, so liveness/rc_elide can see through
+    // them. Each is handled by a dedicated lowering routine.
+    match name {
+        "lin_range" => return lower_range(args, builder, ctx),
+        "lin_for" => return lower_for(args, builder, ctx),
+        "lin_while" => return lower_while(args, builder, ctx),
+        "lin_map" => return lower_map(args, result_type, builder, ctx),
+        "lin_filter" => return lower_filter(args, result_type, builder, ctx),
+        "lin_reduce" => return lower_reduce(args, result_type, builder, ctx),
+        _ => {}
+    }
+
     let intrinsic = match name {
         "lin_print" => Intrinsic::Print,
         "lin_to_string" => Intrinsic::ToString,
@@ -814,6 +828,443 @@ fn lower_intrinsic_call(
     });
     builder.register_owned(dst, result_type.clone());
     dst
+}
+
+// -------------------------------------------------------------------------
+// Control-flow / iteration lowering (Option B: explicit IR blocks)
+// -------------------------------------------------------------------------
+
+/// The element type produced by iterating a value of `iterable_ty`.
+fn iter_elem_type(iterable_ty: &Type) -> Type {
+    match iterable_ty {
+        Type::Array(t) | Type::Iterator(t) => (**t).clone(),
+        Type::FixedArray(ts) => ts.first().cloned().unwrap_or(Type::Null),
+        // Json/union iterables yield dynamically-typed (boxed) elements.
+        _ => Type::TypeVar(u32::MAX),
+    }
+}
+
+/// The declared parameter types and return type of a callback expression, if it has a
+/// statically-known `Function` type. Used to match the closure's compiled ABI when calling it.
+fn callback_signature(expr: &TypedExpr) -> (Vec<Type>, Type) {
+    match expr.ty() {
+        Type::Function { params, ret } => (params, *ret),
+        _ => (vec![], Type::TypeVar(u32::MAX)),
+    }
+}
+
+/// Call a body closure temp with arguments, coercing each argument to the closure's
+/// declared parameter type (e.g. box a concrete element to Json when the callback param
+/// is Json) so the closure ABI lines up. Returns the result temp typed as the closure's
+/// declared return type.
+fn call_body_closure(body: Temp, raw_args: &[(Temp, Type)], param_tys: &[Type], ret_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+    let call_args: Vec<Temp> = raw_args
+        .iter()
+        .enumerate()
+        .map(|(i, (t, ty))| {
+            let pty = param_tys.get(i);
+            coerce_arg_to_param(*t, ty, pty, builder)
+        })
+        .collect();
+    let dst = builder.alloc_temp(ret_ty.clone());
+    builder.emit(Instruction::Call {
+        dst,
+        callee: CallTarget::Indirect(body),
+        args: call_args,
+        ret_ty: ret_ty.clone(),
+    });
+    dst
+}
+
+/// Coerce a concrete argument to a union/Json parameter (box it); pass through otherwise.
+fn coerce_arg_to_param(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: &mut FuncBuilder) -> Temp {
+    match param_ty {
+        Some(pty) if is_union_ty(pty) && !is_union_ty(arg_ty) => box_to_json(arg, arg_ty, builder),
+        _ => arg,
+    }
+}
+
+/// Allocate an output array whose storage matches `elem_ty`: a flat scalar array for
+/// Int32/Int64/Float32/Float64, otherwise a tagged array. Returns (array_temp, is_flat).
+fn alloc_output_array(elem_ty: &Type, result_type: &Type, builder: &mut FuncBuilder) -> (Temp, Option<FlatElemKind>) {
+    let flat = FlatElemKind::from_type(elem_ty);
+    let out = builder.alloc_temp(result_type.clone());
+    let intrinsic = match flat {
+        Some(kind) => Intrinsic::FlatArrayAlloc(kind),
+        None => Intrinsic::ArrayAlloc,
+    };
+    builder.emit(Instruction::CallIntrinsic {
+        dst: out, intrinsic, args: vec![], ret_ty: result_type.clone(),
+    });
+    builder.register_owned(out, result_type.clone());
+    (out, flat)
+}
+
+/// Push `val` (typed `val_ty`) into an output array allocated by `alloc_output_array`.
+/// Flat arrays take the raw scalar; tagged arrays take a Json-boxed value.
+fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp, val_ty: &Type, builder: &mut FuncBuilder) {
+    let push_dst = builder.alloc_temp(Type::Null);
+    match flat {
+        Some(kind) => {
+            // Flat arrays store raw scalars; unbox the value if it arrived boxed (Json).
+            let scalar = if is_union_ty(val_ty) {
+                let dst = builder.alloc_temp(elem_ty.clone());
+                builder.emit(Instruction::Coerce {
+                    dst, src: val, from_ty: val_ty.clone(), to_ty: elem_ty.clone(),
+                });
+                dst
+            } else {
+                val
+            };
+            builder.emit(Instruction::CallIntrinsic {
+                dst: push_dst, intrinsic: Intrinsic::FlatArrayPush(kind), args: vec![out, scalar], ret_ty: Type::Null,
+            });
+        }
+        None => {
+            let boxed = box_to_json(val, val_ty, builder);
+            builder.emit(Instruction::CallIntrinsic {
+                dst: push_dst, intrinsic: Intrinsic::Push, args: vec![out, boxed], ret_ty: Type::Null,
+            });
+        }
+    }
+}
+
+/// True when two types have a different runtime representation such that a value of one
+/// must be coerced (boxed/unboxed) to be used as the other. Specifically: one is a
+/// union/Json (TaggedVal*) and the other is a concrete type.
+fn type_repr_differs(from: &Type, to: &Type) -> bool {
+    is_union_ty(from) != is_union_ty(to)
+}
+
+/// Box a value to Json (TaggedVal*) if it is a concrete (non-union) type.
+fn box_to_json(val: Temp, val_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+    if is_union_ty(val_ty) {
+        return val;
+    }
+    let json = Type::TypeVar(u32::MAX);
+    let dst = builder.alloc_temp(json.clone());
+    builder.emit(Instruction::Coerce {
+        dst, src: val, from_ty: val_ty.clone(), to_ty: json,
+    });
+    dst
+}
+
+/// `range(start, end)` → a flat Int32 array [start, start+1, ..., end-1].
+/// Lowered as: alloc flat array, then a fill loop pushing each value.
+fn lower_range(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+    let start = lower_expr(&args[0], builder, ctx);
+    let end = lower_expr(&args[1], builder, ctx);
+
+    // arr = arrayAllocate-style empty flat i32 array (capacity grows via push).
+    let arr_ty = Type::Array(Box::new(Type::Int32));
+    let arr = builder.alloc_temp(arr_ty.clone());
+    builder.emit(Instruction::CallIntrinsic {
+        dst: arr,
+        intrinsic: Intrinsic::FlatArrayAlloc(FlatElemKind::I32),
+        args: vec![],
+        ret_ty: arr_ty.clone(),
+    });
+    builder.register_owned(arr, arr_ty.clone());
+
+    let preheader = builder.current_block;
+    let header = builder.alloc_block("range_header");
+    let body = builder.alloc_block("range_body");
+    let exit = builder.alloc_block("range_exit");
+
+    // i phi node: [start, preheader], [i_next, body].
+    let i = builder.alloc_temp(Type::Int32);
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(header);
+    // Placeholder phi; incomings filled below once i_next exists.
+    let i_next = builder.alloc_temp(Type::Int32);
+    builder.emit(Instruction::Phi {
+        dst: i,
+        ty: Type::Int32,
+        incomings: vec![(start, preheader), (i_next, body)],
+    });
+    let cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary {
+        dst: cond, op: BinOp::Lt, lhs: i, rhs: end,
+        operand_ty: Type::Int32, ty: Type::Bool,
+    });
+    builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
+
+    builder.switch_to(body);
+    // arr.push(i)
+    let push_dst = builder.alloc_temp(Type::Null);
+    builder.emit(Instruction::CallIntrinsic {
+        dst: push_dst,
+        intrinsic: Intrinsic::FlatArrayPush(FlatElemKind::I32),
+        args: vec![arr, i],
+        ret_ty: Type::Null,
+    });
+    let one = builder.const_temp(Const::Int(1, Type::Int32));
+    builder.emit(Instruction::Binary {
+        dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
+        operand_ty: Type::Int32, ty: Type::Int32,
+    });
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(exit);
+    arr
+}
+
+/// Emit the standard index-loop scaffold over `iterable` (length-bounded), invoking
+/// `body_fn(i, elem)` to build the loop body. `body_fn` runs with the builder positioned
+/// in the body block, receiving the current index temp and the loaded element temp; after
+/// it returns, the increment + back-edge are emitted. Leaves the builder in the exit block.
+fn emit_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
+    iterable: Temp,
+    iterable_ty: &Type,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+    body_fn: F,
+) {
+    let elem_ty = iter_elem_type(iterable_ty);
+
+    // len = length(iterable)
+    let len = builder.alloc_temp(Type::Int64);
+    builder.emit(Instruction::CallIntrinsic {
+        dst: len,
+        intrinsic: Intrinsic::Length,
+        args: vec![iterable],
+        ret_ty: Type::Int64,
+    });
+    let zero = builder.const_temp(Const::Int(0, Type::Int64));
+
+    let preheader = builder.current_block;
+    let header = builder.alloc_block("for_header");
+    let body = builder.alloc_block("for_body");
+    let exit = builder.alloc_block("for_exit");
+
+    let i = builder.alloc_temp(Type::Int64);
+    let i_next = builder.alloc_temp(Type::Int64);
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(header);
+    builder.emit(Instruction::Phi {
+        dst: i, ty: Type::Int64,
+        incomings: vec![(zero, preheader), (i_next, body)],
+    });
+    let cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary {
+        dst: cond, op: BinOp::Lt, lhs: i, rhs: len,
+        operand_ty: Type::Int64, ty: Type::Bool,
+    });
+    builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
+
+    builder.switch_to(body);
+    // elem = iterable[i]
+    let elem = builder.alloc_temp(elem_ty.clone());
+    builder.emit(Instruction::Index {
+        dst: elem, object: iterable, key: i,
+        obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+    });
+    body_fn(i, elem, builder, ctx);
+    let one = builder.const_temp(Const::Int(1, Type::Int64));
+    builder.emit(Instruction::Binary {
+        dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
+        operand_ty: Type::Int64, ty: Type::Int64,
+    });
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(exit);
+}
+
+/// `for(iterable, body)` → index loop calling `body(elem)` for side effects; returns Null.
+fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+    let iterable_ty = args[0].ty();
+    let (param_tys, _) = callback_signature(&args[1]);
+    let iterable = lower_expr(&args[0], builder, ctx);
+    let body = lower_expr(&args[1], builder, ctx);
+    let elem_ty = iter_elem_type(&iterable_ty);
+    emit_index_loop(iterable, &iterable_ty, builder, ctx, |_, elem, b, _| {
+        call_body_closure(body, &[(elem, elem_ty.clone())], &param_tys, &Type::Null, b);
+    });
+    builder.const_temp(Const::Null)
+}
+
+/// `while(iterable, body)` → like `for`, but stops early when `body(elem)` returns false.
+fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+    let iterable_ty = args[0].ty();
+    let (param_tys, _) = callback_signature(&args[1]);
+    let iterable = lower_expr(&args[0], builder, ctx);
+    let body = lower_expr(&args[1], builder, ctx);
+
+    let elem_ty = iter_elem_type(&iterable_ty);
+    let len = builder.alloc_temp(Type::Int64);
+    builder.emit(Instruction::CallIntrinsic {
+        dst: len, intrinsic: Intrinsic::Length, args: vec![iterable], ret_ty: Type::Int64,
+    });
+    let zero = builder.const_temp(Const::Int(0, Type::Int64));
+
+    let preheader = builder.current_block;
+    let header = builder.alloc_block("while_header");
+    let body_block = builder.alloc_block("while_body");
+    let cont_block = builder.alloc_block("while_cont");
+    let exit = builder.alloc_block("while_exit");
+
+    let i = builder.alloc_temp(Type::Int64);
+    let i_next = builder.alloc_temp(Type::Int64);
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(header);
+    builder.emit(Instruction::Phi {
+        dst: i, ty: Type::Int64,
+        incomings: vec![(zero, preheader), (i_next, cont_block)],
+    });
+    let cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary {
+        dst: cond, op: BinOp::Lt, lhs: i, rhs: len, operand_ty: Type::Int64, ty: Type::Bool,
+    });
+    builder.terminate(Terminator::CondJump { cond, then_block: body_block, else_block: exit });
+
+    builder.switch_to(body_block);
+    let elem = builder.alloc_temp(elem_ty.clone());
+    builder.emit(Instruction::Index {
+        dst: elem, object: iterable, key: i,
+        obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+    });
+    // keep = body(elem) : Bool — continue only while true.
+    let keep = call_body_closure(body, &[(elem, elem_ty.clone())], &param_tys, &Type::Bool, builder);
+    builder.terminate(Terminator::CondJump { cond: keep, then_block: cont_block, else_block: exit });
+
+    builder.switch_to(cont_block);
+    let one = builder.const_temp(Const::Int(1, Type::Int64));
+    builder.emit(Instruction::Binary {
+        dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
+    });
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(exit);
+    builder.const_temp(Const::Null)
+}
+
+/// `map(iterable, f)` → new array of `f(elem)` for each element.
+fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+    let iterable_ty = args[0].ty();
+    let (param_tys, cb_ret) = callback_signature(&args[1]);
+    let iterable = lower_expr(&args[0], builder, ctx);
+    let f = lower_expr(&args[1], builder, ctx);
+
+    // Output element type per the map's declared result type; storage matches it.
+    let out_elem_ty = match result_type {
+        Type::Array(t) | Type::Iterator(t) => (**t).clone(),
+        _ => Type::TypeVar(u32::MAX),
+    };
+    let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+    let elem_ty = iter_elem_type(&iterable_ty);
+
+    emit_index_loop(iterable, &iterable_ty, builder, ctx, |_, elem, b, _| {
+        let mapped = call_body_closure(f, &[(elem, elem_ty.clone())], &param_tys, &cb_ret, b);
+        push_output(out, flat, &out_elem_ty, mapped, &cb_ret, b);
+    });
+    out
+}
+
+/// `filter(iterable, pred)` → new array of elements where `pred(elem)` is true.
+fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+    let iterable_ty = args[0].ty();
+    let (param_tys, _) = callback_signature(&args[1]);
+    let iterable = lower_expr(&args[0], builder, ctx);
+    let pred = lower_expr(&args[1], builder, ctx);
+
+    // filter preserves the element type; storage matches it.
+    let out_elem_ty = match result_type {
+        Type::Array(t) | Type::Iterator(t) => (**t).clone(),
+        _ => Type::TypeVar(u32::MAX),
+    };
+    let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+    let elem_ty = iter_elem_type(&iterable_ty);
+
+    emit_index_loop(iterable, &iterable_ty, builder, ctx, |_, elem, b, _| {
+        let keep = call_body_closure(pred, &[(elem, elem_ty.clone())], &param_tys, &Type::Bool, b);
+        let keep_block = b.alloc_block("filter_keep");
+        let skip_block = b.alloc_block("filter_skip");
+        b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: skip_block });
+        b.switch_to(keep_block);
+        push_output(out, flat, &out_elem_ty, elem, &elem_ty, b);
+        b.terminate(Terminator::Jump(skip_block));
+        b.switch_to(skip_block);
+    });
+    out
+}
+
+/// `reduce(iterable, init, f)` → fold `acc = f(acc, elem)` over the elements.
+/// The reducer `f` takes `(Json, Json)`, so the accumulator and element are carried as
+/// Json (boxed); the final accumulator is coerced back to `result_type`.
+fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+    let json = Type::TypeVar(u32::MAX);
+    let iterable_ty = args[0].ty();
+    let (param_tys, _) = callback_signature(&args[2]);
+    let iterable = lower_expr(&args[0], builder, ctx);
+    let init_ty = args[1].ty();
+    let init_raw = lower_expr(&args[1], builder, ctx);
+    let init = box_to_json(init_raw, &init_ty, builder);
+    let f = lower_expr(&args[2], builder, ctx);
+    let elem_ty = iter_elem_type(&iterable_ty);
+
+    let len = builder.alloc_temp(Type::Int64);
+    builder.emit(Instruction::CallIntrinsic {
+        dst: len, intrinsic: Intrinsic::Length, args: vec![iterable], ret_ty: Type::Int64,
+    });
+    let zero = builder.const_temp(Const::Int(0, Type::Int64));
+
+    let preheader = builder.current_block;
+    let header = builder.alloc_block("reduce_header");
+    let body = builder.alloc_block("reduce_body");
+    let exit = builder.alloc_block("reduce_exit");
+
+    let i = builder.alloc_temp(Type::Int64);
+    let i_next = builder.alloc_temp(Type::Int64);
+    let acc = builder.alloc_temp(json.clone());
+    let acc_next = builder.alloc_temp(json.clone());
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(header);
+    builder.emit(Instruction::Phi {
+        dst: i, ty: Type::Int64, incomings: vec![(zero, preheader), (i_next, body)],
+    });
+    builder.emit(Instruction::Phi {
+        dst: acc, ty: json.clone(), incomings: vec![(init, preheader), (acc_next, body)],
+    });
+    let cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary {
+        dst: cond, op: BinOp::Lt, lhs: i, rhs: len, operand_ty: Type::Int64, ty: Type::Bool,
+    });
+    builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
+
+    builder.switch_to(body);
+    let elem = builder.alloc_temp(elem_ty.clone());
+    builder.emit(Instruction::Index {
+        dst: elem, object: iterable, key: i,
+        obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+    });
+    // acc_next = f(acc, elem). acc is carried as Json; coerce both args to the reducer's
+    // declared param types.
+    let acc_arg = coerce_arg_to_param(acc, &json, param_tys.first(), builder);
+    let elem_arg = coerce_arg_to_param(elem, &elem_ty, param_tys.get(1), builder);
+    builder.emit(Instruction::Call {
+        dst: acc_next, callee: CallTarget::Indirect(f), args: vec![acc_arg, elem_arg], ret_ty: json.clone(),
+    });
+    let one = builder.const_temp(Const::Int(1, Type::Int64));
+    builder.emit(Instruction::Binary {
+        dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
+    });
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(exit);
+    // Coerce the Json accumulator back to the declared result type.
+    if is_union_ty(result_type) {
+        acc
+    } else {
+        let out = builder.alloc_temp(result_type.clone());
+        builder.emit(Instruction::Coerce {
+            dst: out, src: acc, from_ty: json, to_ty: result_type.clone(),
+        });
+        out
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -1184,7 +1635,22 @@ fn lower_function_expr_with_id(
     }
 
     inner_builder.push_scope();
-    let ret_temp = lower_expr(body, &mut inner_builder, ctx);
+    let body_ty = body.ty();
+    let raw_ret = lower_expr(body, &mut inner_builder, ctx);
+    // Coerce the body result to the function's declared return type when they differ
+    // (e.g. a body computing a concrete Int in a function declared to return Json must
+    // box, since the LLVM signature uses the declared return type).
+    let ret_temp = if !inner_builder.is_current_block_terminated()
+        && type_repr_differs(&body_ty, ret_type)
+    {
+        let dst = inner_builder.alloc_temp(ret_type.clone());
+        inner_builder.emit(Instruction::Coerce {
+            dst, src: raw_ret, from_ty: body_ty.clone(), to_ty: ret_type.clone(),
+        });
+        dst
+    } else {
+        raw_ret
+    };
     // Release owned temps in function scope except the return value.
     inner_builder.pop_scope_releasing(ret_temp);
     if !inner_builder.is_current_block_terminated() {
