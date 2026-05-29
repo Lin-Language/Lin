@@ -840,23 +840,25 @@ fn lower_if(
         else_block,
     });
 
-    // Allocate result temp in the pre-branch block so it's accessible post-merge.
     let result_dst = builder.alloc_temp(result_type.clone());
-
-    // Each branch gets its own ownership scope so heap temps it allocates are
-    // released at the end of *that branch* — not in the merge block, where only
-    // one branch's temps are actually live (releasing the other branch's temps
-    // there frees undefined values). The branch result is kept (copied to
-    // result_dst) and re-registered as owned in the enclosing scope.
     let result_is_rc = is_rc_type(result_type);
+
+    // Each branch gets its own ownership scope so heap temps it allocates are released
+    // at the end of *that branch* — not in the merge block, where only one branch's
+    // temps are live (releasing the other branch's temps there frees undefined values).
+    // The branch's result value is kept (released as part of the merge's owned set).
+    // We collect (value_temp, predecessor_block) for a Phi in the merge block, recording
+    // the ACTUAL predecessor (the block current at the end of the branch, which may differ
+    // from the branch entry if the branch contained nested control flow).
+    let mut incomings: Vec<(Temp, BlockId)> = Vec::new();
 
     // --- then branch ---
     builder.switch_to(then_block);
     builder.push_scope();
     let then_val = lower_expr(then_br, builder, ctx);
     if !builder.is_current_block_terminated() {
-        builder.emit(Instruction::Copy { dst: result_dst, src: then_val });
         builder.pop_scope_releasing(then_val);
+        incomings.push((then_val, builder.current_block));
         builder.terminate(Terminator::Jump(merge_block));
     } else {
         builder.discard_scope();
@@ -867,16 +869,23 @@ fn lower_if(
     builder.push_scope();
     let else_val = lower_expr(else_br, builder, ctx);
     if !builder.is_current_block_terminated() {
-        builder.emit(Instruction::Copy { dst: result_dst, src: else_val });
         builder.pop_scope_releasing(else_val);
+        incomings.push((else_val, builder.current_block));
         builder.terminate(Terminator::Jump(merge_block));
     } else {
         builder.discard_scope();
     }
 
     builder.switch_to(merge_block);
-    // The kept branch result now lives in result_dst; it is owned by the enclosing
-    // scope so it is released there (or kept if it is the block's return value).
+    // Merge the per-branch results with a Phi. (A plain Copy into a shared temp is wrong:
+    // the single-pass codegen would let the last-compiled branch's value win for both paths.)
+    builder.emit(Instruction::Phi {
+        dst: result_dst,
+        ty: result_type.clone(),
+        incomings,
+    });
+    // The merged result is owned by the enclosing scope (released there, or kept if it is
+    // the block's return value).
     if result_is_rc {
         builder.register_owned(result_dst, result_type.clone());
     }

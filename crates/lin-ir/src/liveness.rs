@@ -179,6 +179,11 @@ pub fn instr_use_def(instr: &Instruction) -> (Vec<Temp>, Vec<Temp>) {
     match instr {
         Instruction::Const { dst, .. } => (vec![], vec![*dst]),
         Instruction::Copy { dst, src } => (vec![*src], vec![*dst]),
+        // Phi operands are conceptually used along the predecessor edges, not at the phi
+        // itself; treating them as used here is a safe over-approximation for RC elision.
+        Instruction::Phi { dst, incomings, .. } => {
+            (incomings.iter().map(|(t, _)| *t).collect(), vec![*dst])
+        }
         Instruction::Unary { dst, operand, .. } => (vec![*operand], vec![*dst]),
         Instruction::Binary { dst, lhs, rhs, .. } => (vec![*lhs, *rhs], vec![*dst]),
         Instruction::Coerce { dst, src, .. } => (vec![*src], vec![*dst]),

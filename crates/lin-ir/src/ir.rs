@@ -119,6 +119,11 @@ pub enum Instruction {
     Const { dst: Temp, val: Const },
     /// result = src (copy / rename)
     Copy { dst: Temp, src: Temp },
+    /// SSA merge: result takes the value of `incomings[i].0` when control arrives from
+    /// predecessor block `incomings[i].1`. Must appear at the start of a merge block.
+    /// This is the only correct way to merge a value computed differently per branch in
+    /// the single-pass codegen (a plain Copy into a shared temp is overwritten per block).
+    Phi { dst: Temp, ty: Type, incomings: Vec<(Temp, BlockId)> },
     /// result = unary op applied to operand
     Unary { dst: Temp, op: UnaryOp, operand: Temp, ty: Type },
     /// result = lhs op rhs. `operand_ty` is the type of the operands (needed for

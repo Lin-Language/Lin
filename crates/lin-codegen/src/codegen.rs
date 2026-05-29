@@ -7157,6 +7157,21 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, v);
                             }
                         }
+                        Instruction::Phi { dst, ty, incomings } => {
+                            // Build an LLVM phi merging each predecessor's incoming value.
+                            // Predecessor blocks precede the merge block in emission order,
+                            // so their values are already in temp_map and their LLVM blocks exist.
+                            let phi_ty = self.llvm_type(ty);
+                            let phi = self.builder.build_phi(phi_ty, "ir_phi").unwrap();
+                            for (val_temp, pred_block) in incomings {
+                                if let (Some(&v), Some(&pred_bb)) =
+                                    (temp_map.get(val_temp), ir_block_to_llvm.get(pred_block))
+                                {
+                                    phi.add_incoming(&[(&v, pred_bb)]);
+                                }
+                            }
+                            temp_map.insert(*dst, phi.as_basic_value());
+                        }
                         Instruction::Binary { dst, op, lhs, rhs, operand_ty, ty } => {
                             let lv = temp_map.get(lhs).copied().unwrap_or_else(|| ptr_ty.const_null().into());
                             let rv = temp_map.get(rhs).copied().unwrap_or_else(|| ptr_ty.const_null().into());
