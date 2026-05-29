@@ -201,3 +201,34 @@ tostring_objects_and_arrays).
 - Implement mutable-var heap cells (biggest unlock).
 - Resolve the has-value-constraint RC aliasing.
 - Then the parity gate (Phase 8) and milestone-1 merge ask.
+
+## Checkpoint 4 — 124/128 (strong stopping point)
+
+Since checkpoint 3 (120): tagged_unions (multi-match + has value-constraints, via per-arm
+ownership scopes + scoped value-constraint temps + branchless has/arraylen helpers),
+stdlib some/every (box `==` rhs by value kind), fs_read_lines (any-width int array index),
+closures-stored-in-arrays + multiple_closures_share_var (retain Function array elements +
+unbox boxed callee), mutable-var-capture heap cells, array/object rest, iter, partial
+application, TCO (incl. Int64), guards. **AST leg green (128/128) throughout; ~30 commits.**
+
+### Final remaining (4) — each needs a distinct, non-trivial feature
+1. **async_val_capture** — root cause found: a closure that references a top-level
+   (module-level) `val` reads a placeholder instead of the value. The IR path lowers
+   module vals into `main`'s slots; closures can't see them. The AST path emits them as
+   LLVM globals (`global_val_slots`) and loads from there. Fix: lower top-level non-fn
+   vals as globals (or capture-by-value into closures). Also blocks any closure over a
+   module val.
+2. **partial_application_chain** — `add3(1)(2)(3)`: a partial-application wrapper called
+   with fewer args than its remaining params must itself partially apply. Indirect closure
+   calls carry no arity, so under-application isn't detected. Needs arity metadata on
+   closures or a curried-wrapper representation.
+3. **ffi_end_to_end_c_library** — FFI: `import foreign` C symbol linkage on the IR path.
+4. **worker_request_reply** — worker-thread concurrency primitives (thread pool / channels).
+
+### Recommended next steps
+- Add the **ASan/LSan CI leg + RC-stress fixtures** (deferred Phase 1 infra). The many
+  RC fixes in checkpoints 2–4 (heap-box escaping values, per-branch/arm scopes,
+  function-arg/array-element retains, null handling) are exactly what a sanitizer leg
+  guards; it should land before the parity gate.
+- Module-global vals in closures (unblocks async_val_capture).
+- Then the Phase 8 parity gate and the Milestone-1 merge **ask** (still off by default).
