@@ -2162,7 +2162,11 @@ fn lower_function_expr_with_id(
     // value can be called through an opaque `Function` type without knowing its concrete
     // return type (the indirect call site unboxes). Non-closure top-level functions keep
     // their declared concrete return (they are only called Direct, with exact signatures).
-    let effective_ret = if is_closure { Type::TypeVar(u32::MAX) } else { ret_type.clone() };
+    // A closure that yields no value keeps a void (Null/Never) return; other closures use
+    // the uniform boxed (Json) ABI so any Function value is callable without its concrete
+    // return type. Non-closure top-level functions keep their declared return.
+    let void_ret = matches!(ret_type, Type::Null | Type::Never);
+    let effective_ret = if is_closure && !void_ret { Type::TypeVar(u32::MAX) } else { ret_type.clone() };
     let ret_temp = if !inner_builder.is_current_block_terminated()
         && type_repr_differs(&body_ty, &effective_ret)
     {
@@ -2179,7 +2183,13 @@ fn lower_function_expr_with_id(
     // releasing the original would free what the returned box wraps.
     inner_builder.pop_scope_releasing_keep(&[ret_temp, raw_ret]);
     if !inner_builder.is_current_block_terminated() {
-        inner_builder.terminate(Terminator::Return(Some(ret_temp)));
+        // Void-returning functions must Return(None) — codegen gives them a void LLVM
+        // signature, so returning a value would be a type mismatch.
+        if void_ret {
+            inner_builder.terminate(Terminator::Return(None));
+        } else {
+            inner_builder.terminate(Terminator::Return(Some(ret_temp)));
+        }
     }
 
     inner_builder.ret_ty = effective_ret;
