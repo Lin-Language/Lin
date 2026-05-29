@@ -514,13 +514,17 @@ impl<'ctx> Codegen<'ctx> {
     /// owns an independent reference (the lowerer retains on store). Boxed Json/union/Named
     /// values are excluded: they follow the legacy borrow model where the value's true owner
     /// frees it, so a cell/global must NOT release them on reassignment (double-free).
+    ///
+    /// This MUST stay in lockstep with `lin_ir::lower::is_rc_type`: codegen releases the old
+    /// value on reassignment only for types the lowerer also retained on store. A type present
+    /// here but absent there would be released without a matching retain — a refcount underflow.
+    /// (`Iterator` is deliberately omitted for that reason: the lowerer does not retain it.)
     fn ty_is_concrete_rc(ty: &Type) -> bool {
         matches!(
             ty,
             Type::Str
                 | Type::Array(_)
                 | Type::FixedArray(_)
-                | Type::Iterator(_)
                 | Type::Object(_)
                 | Type::Function { .. }
         )
