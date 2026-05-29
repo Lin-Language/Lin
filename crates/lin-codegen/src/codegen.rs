@@ -3006,8 +3006,9 @@ impl<'ctx> Codegen<'ctx> {
         for p in remaining_params {
             wrapper_param_tys.push(self.llvm_type(p).into());
         }
-        let ret_llvm = self.llvm_type(final_ret);
-        let wrapper_fn_ty = ret_llvm.fn_type(&wrapper_param_tys, false);
+        // Uniform closure ABI: the wrapper returns a boxed TaggedVal* (ptr), so a partial
+        // application is callable through an opaque Function value like any other closure.
+        let wrapper_fn_ty = ptr_ty.fn_type(&wrapper_param_tys, false);
         let wrapper_fn = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
 
         let cls_struct_ty = self.closure_struct_type();
@@ -3036,9 +3037,13 @@ impl<'ctx> Codegen<'ctx> {
                 call_args.push(p.into());
             }
             let call = self.builder.build_call(llvm_fn, &call_args, "papp_call").unwrap();
+            // Box the concrete result to a TaggedVal* (uniform closure return ABI).
             match call.try_as_basic_value().basic() {
-                Some(v) => { self.builder.build_return(Some(&v)).unwrap(); }
-                None => { self.builder.build_return(None).unwrap(); }
+                Some(v) => {
+                    let boxed = self.box_value(v, final_ret);
+                    self.builder.build_return(Some(&boxed)).unwrap();
+                }
+                None => { self.builder.build_return(Some(&ptr_ty.const_null())).unwrap(); }
             }
         }
         self.builder.position_at_end(current_block);

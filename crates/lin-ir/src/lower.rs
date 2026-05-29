@@ -910,6 +910,7 @@ fn lower_intrinsic_call(
         "lin_range" => return lower_range(args, builder, ctx),
         "lin_for" => return lower_for(args, builder, ctx),
         "lin_while" => return lower_while(args, builder, ctx),
+        "lin_iter" => return lower_iter(args, result_type, builder, ctx),
         "lin_map" => return lower_map(args, result_type, builder, ctx),
         "lin_filter" => return lower_filter(args, result_type, builder, ctx),
         "lin_reduce" => return lower_reduce(args, result_type, builder, ctx),
@@ -1129,6 +1130,69 @@ fn lower_range(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx
 
     builder.switch_to(exit);
     arr
+}
+
+/// `iter(init, cond, next, current)` → eagerly build a Json array by looping:
+/// `s = init(); while cond(s) { push(current(s)); s = next(s) }`. The four callbacks are
+/// closures (uniform boxed ABI), so the state is carried as Json.
+fn lower_iter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+    let json = Type::TypeVar(u32::MAX);
+    let init = lower_expr(&args[0], builder, ctx);
+    let cond = lower_expr(&args[1], builder, ctx);
+    let next = lower_expr(&args[2], builder, ctx);
+    let current = lower_expr(&args[3], builder, ctx);
+
+    // Output is a tagged Json array (elements boxed).
+    let out = builder.alloc_temp(result_type.clone());
+    builder.emit(Instruction::CallIntrinsic {
+        dst: out, intrinsic: Intrinsic::ArrayAlloc, args: vec![], ret_ty: result_type.clone(),
+    });
+    builder.register_owned(out, result_type.clone());
+
+    // s0 = init()
+    let s0 = builder.alloc_temp(json.clone());
+    builder.emit(Instruction::Call {
+        dst: s0, callee: CallTarget::Indirect(init), args: vec![], ret_ty: json.clone(),
+    });
+
+    let preheader = builder.current_block;
+    let header = builder.alloc_block("iter_header");
+    let body = builder.alloc_block("iter_body");
+    let exit = builder.alloc_block("iter_exit");
+
+    let state = builder.alloc_temp(json.clone());
+    let state_next = builder.alloc_temp(json.clone());
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(header);
+    builder.emit(Instruction::Phi {
+        dst: state, ty: json.clone(), incomings: vec![(s0, preheader), (state_next, body)],
+    });
+    // keep = cond(state) : Bool
+    let keep = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Call {
+        dst: keep, callee: CallTarget::Indirect(cond), args: vec![state], ret_ty: Type::Bool,
+    });
+    builder.terminate(Terminator::CondJump { cond: keep, then_block: body, else_block: exit });
+
+    builder.switch_to(body);
+    // push(out, current(state))
+    let cur = builder.alloc_temp(json.clone());
+    builder.emit(Instruction::Call {
+        dst: cur, callee: CallTarget::Indirect(current), args: vec![state], ret_ty: json.clone(),
+    });
+    let push_dst = builder.alloc_temp(Type::Null);
+    builder.emit(Instruction::CallIntrinsic {
+        dst: push_dst, intrinsic: Intrinsic::Push, args: vec![out, cur], ret_ty: Type::Null,
+    });
+    // state_next = next(state)
+    builder.emit(Instruction::Call {
+        dst: state_next, callee: CallTarget::Indirect(next), args: vec![state], ret_ty: json.clone(),
+    });
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(exit);
+    out
 }
 
 /// Emit the standard index-loop scaffold over `iterable` (length-bounded), invoking
