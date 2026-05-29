@@ -103,6 +103,15 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
 
     // Route through LinIR when LIN_USE_IR=1 (experimental; defaults to TypedAST path).
     if std::env::var("LIN_USE_IR").as_deref() == Ok("1") {
+        // Collect foreign-library link paths from the main module's ForeignImport stmts —
+        // the AST path does this in compile_stmt, which the IR path doesn't run.
+        for stmt in &typed_module.statements {
+            if let lin_check::typed_ir::TypedStmt::ForeignImport { path, .. } = stmt {
+                if path != "lin-runtime" && !cg.foreign_lib_paths.contains(path) {
+                    cg.foreign_lib_paths.push(path.clone());
+                }
+            }
+        }
         let mut ir_module = lower_module(&typed_module);
         rc_elide::elide_rc(&mut ir_module);
         cg.compile_module_from_ir(&ir_module);
