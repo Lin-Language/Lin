@@ -126,9 +126,14 @@ Lin uses **pure reference counting with no cycle detection**. Reference cycles b
 | Retain on object field store (non-fresh `LocalGet`) | ✅ Done | `compile_make_object` |
 | `TypedStmt::Expr` discard release | ✅ Done | Releases discarded owned values |
 | Block scope-exit release for owned `val` bindings | ✅ Done | Releases unused owned bindings at block end |
-| Function-return release (params + locals not in return value) | 🔲 Planned | Requires retain at argument-pass sites |
-| Retain at function call sites for shared args | 🔲 Planned | Needed before function-return release |
-| `if`/`match` branch-exit release | 🔲 Planned | Same pattern as block scope-exit |
+| Function-return release for `Function`-typed params | ✅ Done | Only `Function` params released; caller retains before passing non-owned closures |
+| Retain at call sites for non-owned `Function` args | ✅ Done | `call_direct_fn` retains non-owned closure args before passing |
+| `if`/`match` result: release when all branches own (discard + val scope-exit) | ✅ Done | Extended `expr_is_owned_alloc` to recurse into `If`, `Match`, `Block` branches |
+| `var` reassignment release (old value) | ⚠️ Gap | `compile_local_set` overwrites alloca without releasing old heap value; safe fix requires ownership tracking to avoid freeing borrowed `var` values (e.g. `var acc = init`) |
+| `var` scope-exit release | ⚠️ Gap | Block scope-exit only tracks `Val` stmts, not `Var`; heap-typed `var` bindings (e.g. `var result = {}`) are not released at scope exit; most are returned so impact is limited |
+| `if`/`match` result: mixed-ownership branches | ⚠️ Gap | When one branch returns a `LocalGet` and another a fresh alloc, ownership is mixed; emitting a retain for the `LocalGet` branch before the PHI would normalize ownership but is not yet done |
+| Match scrutinee release | ⚠️ Gap | Scrutinees from `Call` (e.g. `match f() { ... }`) are never released; safe only when scrutinee is not bound in any arm |
+| String interp TypeVar part temporaries | ⚠️ Gap | `compile_string_part_owned` marks TypeVar parts as `is_fresh=false`; `lin_tagged_to_string` result is a new `LinString*` but is not released after `string_build_n` |
 
 Key file: `lin-codegen/src/codegen.rs`
 

@@ -886,14 +886,28 @@ impl<'ctx> Codegen<'ctx> {
     /// True if the expression produces a freshly heap-allocated value that the caller owns.
     /// Used to decide whether to release the value after consuming it.
     fn expr_is_owned_alloc(expr: &TypedExpr) -> bool {
-        matches!(expr,
+        match expr {
             TypedExpr::Call { .. }
             | TypedExpr::MakeArray { .. }
             | TypedExpr::MakeObject { .. }
             | TypedExpr::StringLit { .. }
             | TypedExpr::StringInterp { .. }
-            | TypedExpr::Function { .. }
-        )
+            | TypedExpr::Function { .. } => true,
+            // If all branches produce owned values, the if result is also owned.
+            // (Only one branch runs per execution, so there is exactly one owned value at the merge.)
+            TypedExpr::If { then_br, else_br, .. } => {
+                Self::expr_is_owned_alloc(then_br) && Self::expr_is_owned_alloc(else_br)
+            }
+            // Match: owned iff every arm body produces an owned value.
+            TypedExpr::Match { arms, .. } => {
+                !arms.is_empty() && arms.iter().all(|a| Self::expr_is_owned_alloc(&a.body))
+            }
+            // Block: owned iff the final expression is owned (internal releases already handled).
+            TypedExpr::Block { expr, .. } => Self::expr_is_owned_alloc(expr),
+            // Coerce is a numeric-only wrapper (no heap involvement).
+            TypedExpr::Coerce { expr, .. } => Self::expr_is_owned_alloc(expr),
+            _ => false,
+        }
     }
 
     /// Returns the slot number if the expression's "final value" comes directly from a LocalGet.
