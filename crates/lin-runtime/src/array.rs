@@ -129,8 +129,15 @@ pub unsafe extern "C" fn lin_array_push_tagged(arr: *mut LinArray, tagged: *cons
         (*arr).cap = new_cap;
     }
     let slot = (*arr).data.add(len as usize);
-    // Copy 16 bytes (full TaggedVal = LinArrayElem) from tagged into slot.
-    std::ptr::copy_nonoverlapping(tagged, slot as *mut u8, 16);
+    if tagged.is_null() {
+        // A null TaggedVal* IS the Json null value — store a TAG_NULL entry rather than
+        // dereferencing the null pointer.
+        (*slot).tag = crate::tagged::TAG_NULL;
+        (*slot).payload = 0;
+    } else {
+        // Copy 16 bytes (full TaggedVal = LinArrayElem) from tagged into slot.
+        std::ptr::copy_nonoverlapping(tagged, slot as *mut u8, 16);
+    }
     (*arr).len = len + 1;
 }
 

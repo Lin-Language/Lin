@@ -5166,9 +5166,17 @@ impl<'ctx> Codegen<'ctx> {
             _ => {
                 let tag_val = Self::type_tag(val_ty);
                 let tag = i8_ty.const_int(tag_val as u64, false);
-                let (store_val, store_llvm_ty) = match val_ty {
+                // lin_array_push copies a full 8 bytes from the cell into the payload, so the
+                // cell must hold 8 defined bytes. Pointers are 8 bytes; small integers/bools
+                // are zero-extended to i64; f32 is bit-widened via an i64 cell.
+                let (store_val, store_llvm_ty): (BasicValueEnum<'ctx>, BasicTypeEnum<'ctx>) = match val_ty {
                     Type::Str | Type::Array(_) | Type::Object(_) | Type::Iterator(_) | Type::Function { .. } => {
                         (val, self.context.ptr_type(inkwell::AddressSpace::default()).as_basic_type_enum())
+                    }
+                    _ if val.is_int_value() => {
+                        let i64_ty = self.context.i64_type();
+                        let ext = self.builder.build_int_z_extend_or_bit_cast(val.into_int_value(), i64_ty, "arr_cell_ext").unwrap();
+                        (ext.into(), i64_ty.as_basic_type_enum())
                     }
                     _ => (val, self.llvm_type(val_ty)),
                 };
