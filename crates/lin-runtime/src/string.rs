@@ -400,6 +400,22 @@ unsafe fn array_to_json_string(arr: *const crate::array::LinArray) -> String {
                 let v = *((*arr).data as *const u8).add(i);
                 if v != 0 { "true".to_string() } else { "false".to_string() }
             }
+            TAG_UINT8 => {
+                let v = *((*arr).data as *const u8).add(i);
+                format!("{}", v)
+            }
+            TAG_INT8 => {
+                let v = *((*arr).data as *const i8).add(i);
+                format!("{}", v)
+            }
+            TAG_UINT16 => {
+                let v = *((*arr).data as *const u16).add(i);
+                format!("{}", v)
+            }
+            TAG_INT16 => {
+                let v = *((*arr).data as *const i16).add(i);
+                format!("{}", v)
+            }
             _ => "null".to_string(),
         };
         parts.push(s);

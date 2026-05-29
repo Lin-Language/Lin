@@ -1391,6 +1391,8 @@ impl<'ctx> Codegen<'ctx> {
     /// awkward to pack densely), not pointers, not unions.
     fn is_flat_scalar(ty: &Type) -> bool {
         matches!(ty,
+            Type::Int8 | Type::UInt8 |
+            Type::Int16 | Type::UInt16 |
             Type::Int32 | Type::UInt32 |
             Type::Int64 | Type::UInt64 |
             Type::Float32 | Type::Float64
@@ -1400,6 +1402,10 @@ impl<'ctx> Codegen<'ctx> {
     /// Suffix used in runtime function names for flat array variants.
     fn flat_suffix(ty: &Type) -> &'static str {
         match ty {
+            Type::Int8 => "i8",
+            Type::UInt8 => "u8",
+            Type::Int16 => "i16",
+            Type::UInt16 => "u16",
             Type::Int32 | Type::UInt32 => "i32",
             Type::Int64 | Type::UInt64 => "i64",
             Type::Float32 => "f32",
@@ -2395,12 +2401,7 @@ impl<'ctx> Codegen<'ctx> {
             }
             Intrinsic::FlatArrayPush(kind) => {
                 if args.len() >= 2 {
-                    let elem_ty = match kind {
-                        lir::FlatElemKind::I32 => Type::Int32,
-                        lir::FlatElemKind::I64 => Type::Int64,
-                        lir::FlatElemKind::F32 => Type::Float32,
-                        lir::FlatElemKind::F64 => Type::Float64,
-                    };
+                    let elem_ty = kind.elem_type();
                     self.flat_array_push(args[0], args[1], &elem_ty);
                 }
                 ptr_ty.const_null().into()
@@ -3170,14 +3171,22 @@ impl<'ctx> Codegen<'ctx> {
             let lw = lv.into_int_value().get_type().get_bit_width();
             let rw = rv.into_int_value().get_type().get_bit_width();
             if lw != rw && lw > 1 && rw > 1 {
-                let wide = if lw > rw { lv.into_int_value().get_type() } else { rv.into_int_value().get_type() };
-                let lext = if lw < wide.get_bit_width() {
-                    self.builder.build_int_s_extend(lv.into_int_value(), wide, "ir_lext").unwrap()
-                } else { lv.into_int_value() };
-                let rext = if rw < wide.get_bit_width() {
-                    self.builder.build_int_s_extend(rv.into_int_value(), wide, "ir_rext").unwrap()
-                } else { rv.into_int_value() };
-                return self.compile_binary_op_values(lext.into(), rext.into(), op, lty, lty, result_ty);
+                // Extend the narrower operand to the wider width. Choose sign- vs zero-extend
+                // per the SOURCE operand's signedness so an unsigned small int (e.g. UInt8
+                // 250) widens to 250, not -6. Result type is the wider operand's static type.
+                let wide_is_left = lw > rw;
+                let wide = if wide_is_left { lv.into_int_value().get_type() } else { rv.into_int_value().get_type() };
+                let wide_ty = if wide_is_left { lty } else { rty };
+                let ext = |s: &Self, v: BasicValueEnum<'ctx>, src_ty: &Type| -> BasicValueEnum<'ctx> {
+                    if src_ty.is_signed() {
+                        s.builder.build_int_s_extend(v.into_int_value(), wide, "ir_sext").unwrap().into()
+                    } else {
+                        s.builder.build_int_z_extend(v.into_int_value(), wide, "ir_zext").unwrap().into()
+                    }
+                };
+                let lext = if lw < wide.get_bit_width() { ext(self, lv, lty) } else { lv };
+                let rext = if rw < wide.get_bit_width() { ext(self, rv, rty) } else { rv };
+                return self.compile_binary_op_values(lext, rext, op, wide_ty, wide_ty, result_ty);
             }
         }
         // When operands are boxed (Json/union), use tagged runtime ops for equality and

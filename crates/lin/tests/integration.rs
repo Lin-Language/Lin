@@ -2301,3 +2301,181 @@ val c: Array<Array<Int32>> = [[1, 2], [3, 4]]
         parser.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
     );
 }
+
+#[test]
+fn test_uint8_flat_array_roundtrip() {
+    // UInt8[] is an unboxed flat byte array: literals, length, index, push and print all
+    // round-trip values without wrapping (255 stays 255, not -1).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+
+val buf: UInt8[] = [1, 2, 255]
+print(toString(length(buf)))
+print(toString(buf[2]))
+push(buf, 42)
+print(toString(buf[3]))
+print(toString(buf))
+"#);
+    assert_eq!(out, vec!["3", "255", "42", "[1, 2, 255, 42]"]);
+}
+
+#[test]
+fn test_uint8_flat_array_index_assign() {
+    // In-place index assignment on a flat UInt8 array writes through to the raw buffer.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val buf: UInt8[] = [1, 2, 255]
+buf[1] = 200
+print(toString(buf[1]))
+print(toString(buf))
+"#);
+    assert_eq!(out, vec!["200", "[1, 200, 255]"]);
+}
+
+#[test]
+fn test_int8_flat_array_negatives() {
+    // Int8[] stores signed bytes; negative literals (written `-N` with a preceding space so
+    // the lexer treats `-` as part of the literal) round-trip.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val s: Int8[] = [ -1, 127]
+print(toString(s[0]))
+print(toString(s[1]))
+"#);
+    assert_eq!(out, vec!["-1", "127"]);
+}
+
+#[test]
+fn test_uint16_flat_array() {
+    // UInt16[] is a 2-byte-per-element flat array; large values round-trip.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val w: UInt16[] = [1000, 65535]
+print(toString(w[0]))
+print(toString(w[1]))
+"#);
+    assert_eq!(out, vec!["1000", "65535"]);
+}
+
+#[test]
+fn test_uint8_flat_array_equality() {
+    // Structural equality over flat UInt8 arrays (exercises lin_flat_array_eq_u8).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val a: UInt8[] = [1, 2]
+val b: UInt8[] = [1, 2]
+val c: UInt8[] = [1, 3]
+print(toString(a == b))
+print(toString(a == c))
+"#);
+    assert_eq!(out, vec!["true", "false"]);
+}
+
+#[test]
+fn test_uint8_literal_out_of_range_rejected() {
+    // A suffixless integer literal that does not fit the target small-integer type's range
+    // is a compile-time error (spec §26 context-typed literal + range check).
+    let err = run_expect_err(r#"import { print } from "std/io"
+val bad: UInt8[] = [256]
+print("unreachable")
+"#);
+    assert!(
+        err.contains("out of range for type UInt8"),
+        "expected an out-of-range literal error, got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_int8_scalar_out_of_range_rejected() {
+    // Scalar literal range check for a signed small integer.
+    let err = run_expect_err(r#"import { print } from "std/io"
+val bad: Int8 = -129
+print("unreachable")
+"#);
+    assert!(
+        err.contains("out of range for type Int8"),
+        "expected an out-of-range literal error, got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_nonliteral_int32_to_uint8_still_rejected() {
+    // A NON-literal Int32 value assigned to UInt8 is still a narrowing error: literal
+    // context-typing must not loosen the numeric-compatibility rules for computed values.
+    let err = run_expect_err(r#"import { print } from "std/io"
+val x: Int32 = 100
+val y: UInt8 = x
+print("unreachable")
+"#);
+    assert!(
+        err.contains("Expected type UInt8") || err.contains("UInt8"),
+        "expected a narrowing type error, got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_smallint_value_with_bare_literal_arith() {
+    // A small-int value combined with a bare integer literal must keep the small-int width:
+    // the literal adopts the operand's type (spec §26) so no spurious widening crashes codegen
+    // and the arithmetic result is correct.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val a: UInt8 = 250
+print(toString(a + 5))
+val header: UInt8 = 0x67
+print(toString(header & 0x1F))
+"#);
+    assert_eq!(out, vec!["255", "7"]);
+}
+
+#[test]
+fn test_smallint_array_elem_with_bare_literal_bitwise() {
+    // Bitwise/shift ops between a UInt8[] element and a bare literal stay byte-width.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val buf: UInt8[] = [255, 4, 8]
+print(toString(buf[0] & 0x0F))
+print(toString(buf[1] << 1))
+print(toString(buf[2] >> 1))
+"#);
+    assert_eq!(out, vec!["15", "8", "4"]);
+}
+
+#[test]
+fn test_int32_bitwise_with_literal_unchanged() {
+    // Plain Int32 bitwise arithmetic against literals is unaffected by the small-int rule.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+print(toString(255 & 15))
+print(toString(0x3 << 5 | 0x07))
+"#);
+    assert_eq!(out, vec!["15", "103"]);
+}
+
+#[test]
+fn test_smallint_binop_literal_out_of_range_rejected() {
+    // A bare literal operand that doesn't fit the small-int operand's range in an arithmetic
+    // op is a compile-time error (the literal is context-typed to the operand width).
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val a: UInt8 = 250
+print(toString(a + 300))
+"#);
+    assert!(
+        err.contains("out of range for type UInt8"),
+        "expected an out-of-range literal error in a small-int binop, got:\n{}",
+        err
+    );
+}

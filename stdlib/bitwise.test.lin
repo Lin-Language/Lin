@@ -1,0 +1,92 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { push, length } from "std/array"
+
+// Bitwise / low-level operations and small-integer byte arrays.
+// Small-int types (UInt8/Int8/...) and the literal-coercion rule are exercised here.
+
+val s = suite("bitwise", [
+  test("bitwise and", () =>
+    expect(0b1100 & 0b1010).toBe(8)
+    expect(0xFF & 0x0F).toBe(15)
+  ),
+
+  test("bitwise or", () =>
+    expect(0b1100 | 0b1010).toBe(14)
+    expect(0xF0 | 0x0F).toBe(255)
+  ),
+
+  test("bitwise xor", () =>
+    expect(0b1100 ^ 0b1010).toBe(6)
+    expect(0xFF ^ 0xFF).toBe(0)
+  ),
+
+  test("shift left and right", () =>
+    expect(1 << 4).toBe(16)
+    expect(255 >> 4).toBe(15)
+    expect(0xFF00 >> 8).toBe(255)
+  ),
+
+  test("unary bitwise not", () =>
+    expect(~0).toBe(-1)
+    expect(~0x0F).toBe(-16)
+  ),
+
+  test("operator precedence: shift binds tighter than and/or", () =>
+    // 1 << 4 == 16, & 0x18 == 16; without correct precedence this differs.
+    expect(1 << 4 & 0x18).toBe(16)
+    expect(0x0F | 1 << 4).toBe(31)
+  ),
+
+  test("small-int value combined with bare literal stays in range", () =>
+    val a: UInt8 = 250
+    expect(a + 5).toBe(255)
+    val header: UInt8 = 0x67
+    expect(header & 0x1F).toBe(7)
+  ),
+
+  test("UInt8[] round-trips 255 without sign wrap", () =>
+    val buf: UInt8[] = [0, 128, 255]
+    expect(buf[0]).toBe(0)
+    expect(buf[1]).toBe(128)
+    expect(buf[2]).toBe(255)
+  ),
+
+  test("UInt8[] index assignment", () =>
+    var buf: UInt8[] = [1, 2, 3]
+    buf[1] = 200
+    expect(buf[1]).toBe(200)
+  ),
+
+  test("byte buffer push and length", () =>
+    var buf: UInt8[] = [10, 20]
+    push(buf, 255)
+    expect(length(buf)).toBe(3)
+    expect(buf[2]).toBe(255)
+  ),
+
+  test("Int8[] negatives via spaced literal form", () =>
+    val signed: Int8[] = [ -1, -128, 127]
+    expect(signed[0]).toBe(-1)
+    expect(signed[1]).toBe(-128)
+    expect(signed[2]).toBe(127)
+  ),
+
+  test("byte array equality is element-wise", () =>
+    val a: UInt8[] = [1, 2, 255]
+    val b: UInt8[] = [1, 2, 255]
+    expect(a == b).toBe(true)
+    val c: UInt8[] = [1, 2, 254]
+    expect(a == c).toBe(false)
+  ),
+
+  test("nibble pack and unpack", () =>
+    val high: UInt8 = 0xA
+    val low: UInt8 = 0x5
+    val packed = (high << 4) | low
+    expect(packed).toBe(165)
+    expect(packed >> 4).toBe(10)
+    expect(packed & 0x0F).toBe(5)
+  ),
+])
+
+run(s)

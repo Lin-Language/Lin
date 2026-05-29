@@ -114,6 +114,10 @@ pub enum Intrinsic {
 /// Element kinds for unboxed (flat) scalar arrays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FlatElemKind {
+    U8,
+    I8,
+    U16,
+    I16,
     I32,
     I64,
     F32,
@@ -123,6 +127,10 @@ pub enum FlatElemKind {
 impl FlatElemKind {
     pub fn suffix(self) -> &'static str {
         match self {
+            FlatElemKind::U8 => "u8",
+            FlatElemKind::I8 => "i8",
+            FlatElemKind::U16 => "u16",
+            FlatElemKind::I16 => "i16",
             FlatElemKind::I32 => "i32",
             FlatElemKind::I64 => "i64",
             FlatElemKind::F32 => "f32",
@@ -132,11 +140,29 @@ impl FlatElemKind {
 
     pub fn from_type(ty: &Type) -> Option<Self> {
         match ty {
+            Type::UInt8 => Some(FlatElemKind::U8),
+            Type::Int8 => Some(FlatElemKind::I8),
+            Type::UInt16 => Some(FlatElemKind::U16),
+            Type::Int16 => Some(FlatElemKind::I16),
             Type::Int32 | Type::UInt32 => Some(FlatElemKind::I32),
             Type::Int64 | Type::UInt64 => Some(FlatElemKind::I64),
             Type::Float32 => Some(FlatElemKind::F32),
             Type::Float64 => Some(FlatElemKind::F64),
             _ => None,
+        }
+    }
+
+    /// The Lin element type this flat kind corresponds to (for unboxing pushed values).
+    pub fn elem_type(self) -> Type {
+        match self {
+            FlatElemKind::U8 => Type::UInt8,
+            FlatElemKind::I8 => Type::Int8,
+            FlatElemKind::U16 => Type::UInt16,
+            FlatElemKind::I16 => Type::Int16,
+            FlatElemKind::I32 => Type::Int32,
+            FlatElemKind::I64 => Type::Int64,
+            FlatElemKind::F32 => Type::Float32,
+            FlatElemKind::F64 => Type::Float64,
         }
     }
 }

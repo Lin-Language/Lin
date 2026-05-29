@@ -1,0 +1,48 @@
+import { print } from "std/io"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+
+// Low-level / byte-oriented features: bitwise operators, byte buffers, and
+// bit-twiddling driven by small integer types (UInt8/Int8/...).
+
+// --- Bitwise operators on plain integers ---
+print(toString(0b1100 & 0b1010))   // and  -> 8
+print(toString(0b1100 | 0b1010))   // or   -> 14
+print(toString(0b1100 ^ 0b1010))   // xor  -> 6
+print(toString(1 << 4))            // shl  -> 16
+print(toString(255 >> 4))          // shr  -> 15
+print(toString(~0))                // not  -> -1
+
+// --- A byte buffer: UInt8[] holds values 0..255 unboxed ---
+var buf: UInt8[] = [0x48, 0x49, 0xFF]
+print(toString(length(buf)))       // 3
+print(toString(buf[2]))            // 255 (no sign wrap)
+
+// In-place write and push.
+buf[0] = 0x4A
+push(buf, 0x21)
+print(toString(buf[0]))            // 74
+print(toString(buf[3]))            // 33
+print(toString(length(buf)))       // 4
+
+// --- Masking: extract a NAL-unit-type-like field (low 5 bits) ---
+val header: UInt8 = 0x67
+print(toString(header & 0x1F))     // 7
+
+// Arithmetic against a bare literal stays at the byte width.
+val b: UInt8 = 250
+print(toString(b + 5))             // 255
+
+// --- Pack two nibbles into one byte, then unpack ---
+val high: UInt8 = 0xA
+val low: UInt8 = 0x5
+val packed = (high << 4) | low
+print(toString(packed))            // 165
+print(toString(packed >> 4))       // 10  (high nibble)
+print(toString(packed & 0x0F))     // 5   (low nibble)
+
+// --- Signed bytes round-trip their negative values ---
+val signed: Int8[] = [ -1, -128, 127]
+print(toString(signed[0]))         // -1
+print(toString(signed[1]))         // -128
+print(toString(signed[2]))         // 127

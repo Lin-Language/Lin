@@ -25,6 +25,10 @@ pub const TAG_STR: u8 = 6;
 pub const TAG_OBJECT: u8 = 7;
 pub const TAG_ARRAY: u8 = 8;
 pub const TAG_FUNCTION: u8 = 9;
+pub const TAG_UINT8: u8 = 10;
+pub const TAG_INT8: u8 = 11;
+pub const TAG_UINT16: u8 = 12;
+pub const TAG_INT16: u8 = 13;
 
 #[repr(C)]
 pub struct TaggedVal {

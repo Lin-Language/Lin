@@ -50,6 +50,22 @@ fn apply_type_subs(ty: &Type, subs: &std::collections::HashMap<u32, Type>) -> Ty
     }
 }
 
+/// Inclusive [min, max] range of values representable by an integer numeric type.
+/// Returns None for non-integer types.
+fn integer_range(ty: &Type) -> Option<(i128, i128)> {
+    match ty {
+        Type::Int8 => Some((i8::MIN as i128, i8::MAX as i128)),
+        Type::Int16 => Some((i16::MIN as i128, i16::MAX as i128)),
+        Type::Int32 => Some((i32::MIN as i128, i32::MAX as i128)),
+        Type::Int64 => Some((i64::MIN as i128, i64::MAX as i128)),
+        Type::UInt8 => Some((u8::MIN as i128, u8::MAX as i128)),
+        Type::UInt16 => Some((u16::MIN as i128, u16::MAX as i128)),
+        Type::UInt32 => Some((u32::MIN as i128, u32::MAX as i128)),
+        Type::UInt64 => Some((u64::MIN as i128, u64::MAX as i128)),
+        _ => None,
+    }
+}
+
 pub struct Checker {
     env: TypeEnv,
     diagnostics: Vec<Diagnostic>,
@@ -389,6 +405,38 @@ impl Checker {
         // param types to guide inference (bidirectional type checking).
         if let (Expr::Function { params, return_type, body, span }, Type::Function { params: expected_params, ret: expected_ret }) = (expr, expected) {
             return self.infer_function_with_hints(params, return_type, body, *span, None, expected_params, expected_ret);
+        }
+
+        // A suffixless integer literal takes its context type (spec §26). When the expected
+        // type is an integer numeric type, re-type the literal directly at that width — but
+        // only if its value fits the target's range, otherwise it's a compile error.
+        if let Expr::IntLit(v, span) = expr {
+            if expected.is_integer() {
+                if let Some((lo, hi)) = integer_range(expected) {
+                    if (*v as i128) < lo || (*v as i128) > hi {
+                        return Err(Diagnostic::error(
+                            *span,
+                            format!("literal {} is out of range for type {}", v, expected),
+                        ));
+                    }
+                }
+                return Ok(TypedExpr::IntLit(*v, expected.clone(), *span));
+            }
+        }
+
+        // Array literals: push the expected element type into each element so suffixless
+        // integer literals adopt the correct width (and so the produced MakeArray carries the
+        // expected element representation, matching the slot type at codegen). Mirrors the
+        // per-element literal-coercion above for nested literals.
+        if let (Expr::Array(elements, span), Type::Array(expected_elem)) = (expr, expected) {
+            let typed_elements: Result<Vec<_>, _> =
+                elements.iter().map(|e| self.check_expr(e, expected_elem)).collect();
+            let typed_elements = typed_elements?;
+            return Ok(TypedExpr::MakeArray {
+                elements: typed_elements,
+                ty: Type::Array(expected_elem.clone()),
+                span: *span,
+            });
         }
 
         let inferred = self.infer_expr(expr)?;
@@ -777,6 +825,35 @@ impl Checker {
         Ok(TypedExpr::StringInterp { parts: typed_parts, span })
     }
 
+    /// If `cand` is a bare integer literal and `other` has a concrete integer type T, re-type
+    /// `cand` to T (spec §26). Errors if the literal value doesn't fit T's range. `op_span` is
+    /// used for the error location. No-op when `cand` isn't an `IntLit` or `other` isn't a
+    /// concrete integer type.
+    fn retype_literal_operand(
+        &mut self,
+        cand: &mut TypedExpr,
+        other: &TypedExpr,
+        op_span: Span,
+    ) -> Result<(), Diagnostic> {
+        if let TypedExpr::IntLit(v, _, lit_span) = cand {
+            let target = other.ty();
+            // Only re-type against a concrete integer width (not Int32-default unless the
+            // other side genuinely is Int32; widening to the same width is harmless).
+            if let Some((lo, hi)) = integer_range(&target) {
+                let (v, lit_span) = (*v, *lit_span);
+                if (v as i128) < lo || (v as i128) > hi {
+                    let _ = op_span;
+                    return Err(Diagnostic::error(
+                        lit_span,
+                        format!("literal {} is out of range for type {}", v, target),
+                    ));
+                }
+                *cand = TypedExpr::IntLit(v, target, lit_span);
+            }
+        }
+        Ok(())
+    }
+
     fn infer_binary_op(
         &mut self,
         left: &Expr,
@@ -789,6 +866,28 @@ impl Checker {
         let typed_left = self.infer_expr(left)?;
         let typed_right = self.infer_expr(right)?;
         self.in_tail_position = prev_tail;
+
+        // Spec §26: a suffixless integer literal takes its context type. When one operand of
+        // an arithmetic/bitwise op is a bare integer literal (typed Int32 by default) and the
+        // OTHER operand has a concrete integer type T, re-type the literal at width T so both
+        // sides share a width. This avoids a width mismatch between the checker's result type
+        // and the value codegen produces. For shifts, only the LEFT operand drives the result
+        // type, so we only re-type a literal LEFT against a concrete-int RIGHT.
+        let (mut typed_left, mut typed_right) = (typed_left, typed_right);
+        match op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+            | BinOp::BAnd | BinOp::BOr | BinOp::BXor => {
+                self.retype_literal_operand(&mut typed_left, &mut typed_right, span)?;
+                self.retype_literal_operand(&mut typed_right, &mut typed_left, span)?;
+            }
+            BinOp::Shl | BinOp::Shr => {
+                // Only the left operand's type matters for the result; retype a literal LEFT
+                // against a concrete-int RIGHT. A literal RIGHT (shift count) stays Int32.
+                self.retype_literal_operand(&mut typed_left, &mut typed_right, span)?;
+            }
+            _ => {}
+        }
+
         let left_ty = typed_left.ty();
         let right_ty = typed_right.ty();
 
