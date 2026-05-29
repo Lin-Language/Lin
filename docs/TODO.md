@@ -606,9 +606,7 @@ End state: O(n log n) sort, O(n) string building, O(n) unique/omit, constant-fac
 ## Next
 
 - Tidy up stdlib, add .at for strings and re-implement into more native Lin
-- Compiled compiler and release pipeline
 - Implement language server / VS Code support with syntax highlighting.
-- Example with web server and lint
 - More stdlib utilities
 
 ---
