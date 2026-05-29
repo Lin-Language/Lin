@@ -1882,10 +1882,17 @@ impl<'ctx> Codegen<'ctx> {
             TypedExpr::Block { stmts, expr, .. } => {
                 // Collect owned heap vals introduced in this block for scope-exit release.
                 let mut owned_slots: Vec<(usize, Type)> = Vec::new();
+                // Collect heap-typed var slots introduced in this block for scope-exit release.
+                let mut var_slots: Vec<(usize, Type)> = Vec::new();
                 for s in stmts {
                     if let TypedStmt::Val { slot, value, ty: val_ty, .. } = s {
                         if Self::expr_is_owned_alloc(value) && Self::ty_is_heap(val_ty) {
                             owned_slots.push((*slot, val_ty.clone()));
+                        }
+                    }
+                    if let TypedStmt::Var { slot, ty: var_ty, .. } = s {
+                        if Self::ty_is_heap(var_ty) {
+                            var_slots.push((*slot, var_ty.clone()));
                         }
                     }
                     self.compile_stmt(s, fn_ctx);
@@ -1910,6 +1917,33 @@ impl<'ctx> Codegen<'ctx> {
                         if let Some(v) = val {
                             self.emit_release(v, slot_ty);
                         }
+                    }
+                }
+                // Release the current heap value of each var binding at scope exit.
+                // Gap 1 releases intermediate old values on reassignment; here we release
+                // the final value stored in the alloca when the block ends.
+                for (slot, slot_ty) in &var_slots {
+                    if result_slot == Some(*slot) { continue; }
+                    // Skip heap-captured var slots — their lifecycle is managed by the closure.
+                    if fn_ctx.heap_var_slots.contains(slot) { continue; }
+                    if let Some(SlotStorage::Alloca(ptr)) = fn_ctx.slots.get(slot) {
+                        let ptr = *ptr;
+                        let llvm_ty = self.llvm_type(slot_ty);
+                        let current_val = self.builder.build_load(llvm_ty, ptr, "var_scope_val").unwrap();
+                        // Only release if non-null.
+                        let current_ptr = current_val.into_pointer_value();
+                        let i64_ty = self.context.i64_type();
+                        let as_int = self.builder.build_ptr_to_int(current_ptr, i64_ty, "var_scope_pti").unwrap();
+                        let is_nonnull = self.builder.build_int_compare(
+                            inkwell::IntPredicate::NE, as_int, i64_ty.const_zero(), "var_scope_nonnull"
+                        ).unwrap();
+                        let release_block = self.context.append_basic_block(fn_ctx.llvm_fn, "var_scope_release");
+                        let after_block = self.context.append_basic_block(fn_ctx.llvm_fn, "var_scope_after");
+                        self.builder.build_conditional_branch(is_nonnull, release_block, after_block).unwrap();
+                        self.builder.position_at_end(release_block);
+                        self.emit_release(current_val, slot_ty);
+                        self.builder.build_unconditional_branch(after_block).unwrap();
+                        self.builder.position_at_end(after_block);
                     }
                 }
                 result
@@ -2068,13 +2102,31 @@ impl<'ctx> Codegen<'ctx> {
         &mut self,
         slot: usize,
         value: &TypedExpr,
-        _ty: &Type,
+        ty: &Type,
         fn_ctx: &mut FnCtx<'ctx, '_>,
     ) -> BasicValueEnum<'ctx> {
         let compiled = self.compile_expr(value, fn_ctx);
-        match fn_ctx.slots.get(&slot) {
+        match fn_ctx.slots.get(&slot).cloned() {
             Some(SlotStorage::Alloca(ptr)) => {
-                let ptr = *ptr;
+                // Release the old heap value before overwriting.
+                if Self::ty_is_heap(ty) {
+                    let llvm_ty = self.llvm_type(ty);
+                    let old_val = self.builder.build_load(llvm_ty, ptr, "var_old").unwrap();
+                    // Only release if the old pointer is non-null.
+                    let old_ptr = old_val.into_pointer_value();
+                    let i64_ty = self.context.i64_type();
+                    let as_int = self.builder.build_ptr_to_int(old_ptr, i64_ty, "old_pti").unwrap();
+                    let is_nonnull = self.builder.build_int_compare(
+                        inkwell::IntPredicate::NE, as_int, i64_ty.const_zero(), "old_nonnull"
+                    ).unwrap();
+                    let release_block = self.context.append_basic_block(fn_ctx.llvm_fn, "var_release");
+                    let after_block = self.context.append_basic_block(fn_ctx.llvm_fn, "var_after");
+                    self.builder.build_conditional_branch(is_nonnull, release_block, after_block).unwrap();
+                    self.builder.position_at_end(release_block);
+                    self.emit_release(old_val, ty);
+                    self.builder.build_unconditional_branch(after_block).unwrap();
+                    self.builder.position_at_end(after_block);
+                }
                 self.builder.build_store(ptr, compiled).unwrap();
             }
             _ => {
@@ -4292,6 +4344,17 @@ impl<'ctx> Codegen<'ctx> {
         let result_llvm_ty = self.llvm_type(result_type);
         let result_is_union = Self::is_union_type(result_type);
 
+        // Pre-compute ownership of each branch so we can normalise at the merge point.
+        let then_owned = Self::expr_is_owned_alloc(then_br);
+        let else_owned = Self::expr_is_owned_alloc(else_br);
+        // Normalise ownership: if one branch is fresh (rc=1) and the other is borrowed (rc≥1),
+        // retain the borrowed branch so both arrive at the PHI with an extra rc reference.
+        // Skip union/TypeVar results — box_value already allocates a new TaggedVal box.
+        let needs_normalize = Self::ty_is_heap(result_type)
+            && !result_is_union
+            && !matches!(result_type, Type::Never)
+            && (then_owned != else_owned);
+
         // Then branch
         self.builder.position_at_end(then_block);
         let then_val_raw = self.compile_expr(then_br, fn_ctx);
@@ -4305,6 +4368,10 @@ impl<'ctx> Codegen<'ctx> {
         } else if then_val_raw.get_type() == result_llvm_ty { then_val_raw } else { result_llvm_ty.const_zero() };
         let then_end = self.builder.get_insert_block().unwrap();
         if !then_end.get_terminator().is_some() {
+            // Retain borrowed branch value so both branches own a reference at the merge.
+            if needs_normalize && !then_owned && then_val.is_pointer_value() {
+                self.builder.build_call(self.rt_rc_retain, &[then_val.into()], "").unwrap();
+            }
             self.builder.build_unconditional_branch(merge_block).unwrap();
         }
 
@@ -4321,6 +4388,10 @@ impl<'ctx> Codegen<'ctx> {
         } else if else_val_raw.get_type() == result_llvm_ty { else_val_raw } else { result_llvm_ty.const_zero() };
         let else_end = self.builder.get_insert_block().unwrap();
         if !else_end.get_terminator().is_some() {
+            // Retain borrowed branch value so both branches own a reference at the merge.
+            if needs_normalize && !else_owned && else_val.is_pointer_value() {
+                self.builder.build_call(self.rt_rc_retain, &[else_val.into()], "").unwrap();
+            }
             self.builder.build_unconditional_branch(merge_block).unwrap();
         }
 
@@ -4601,12 +4672,15 @@ impl<'ctx> Codegen<'ctx> {
             TypedStringPart::Expr(e) => {
                 let val = self.compile_expr(e, fn_ctx);
                 let ty = e.ty();
-                // Only numeric/bool/null conversions are guaranteed to produce fresh allocations.
-                // Str values are borrowed from slots; TypeVar may or may not allocate.
+                // Numeric/bool/null conversions produce fresh allocations.
+                // TypeVar/Union also produce fresh allocations: value_to_string calls
+                // lin_tagged_to_string which always allocates a new LinString*.
+                // Str values are borrowed from slots (not fresh).
                 let is_fresh = matches!(ty,
                     Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64 |
                     Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 |
-                    Type::Float32 | Type::Float64 | Type::Bool | Type::Null);
+                    Type::Float32 | Type::Float64 | Type::Bool | Type::Null |
+                    Type::TypeVar(_) | Type::Union(_));
                 let str_val = self.value_to_string(val, &ty, fn_ctx);
                 (str_val, is_fresh)
             }
@@ -6547,6 +6621,16 @@ impl<'ctx> Codegen<'ctx> {
         let mut next_check = self.context.append_basic_block(fn_ctx.llvm_fn, "arm_0_check");
         self.builder.build_unconditional_branch(next_check).unwrap();
 
+        // Determine if ownership is mixed across arms so we can normalise at the merge point.
+        // If any arm is non-owned and result is a concrete heap type, retain the non-owned arms.
+        let result_is_union_match = Self::is_union_type(result_type);
+        let all_arms_owned = arms.iter().all(|a| Self::expr_is_owned_alloc(&a.body));
+        let any_arm_owned = arms.iter().any(|a| Self::expr_is_owned_alloc(&a.body));
+        let match_needs_normalize = Self::ty_is_heap(result_type)
+            && !result_is_union_match
+            && !matches!(result_type, Type::Never)
+            && any_arm_owned && !all_arms_owned;
+
         for (arm_idx, arm) in arms.iter().enumerate() {
             self.builder.position_at_end(next_check);
 
@@ -6584,6 +6668,7 @@ impl<'ctx> Codegen<'ctx> {
                 .unwrap();
 
             // Arm body
+            let arm_owned = Self::expr_is_owned_alloc(&arm.body);
             self.builder.position_at_end(body_block);
             let body_val_raw = self.compile_expr(&arm.body, fn_ctx);
             let arm_ty = arm.body.ty();
@@ -6601,6 +6686,10 @@ impl<'ctx> Codegen<'ctx> {
             };
             let body_end = self.builder.get_insert_block().unwrap();
             if !body_end.get_terminator().is_some() {
+                // Retain non-owned arm value to normalise ownership with owned arms at the merge.
+                if match_needs_normalize && !arm_owned && body_val.is_pointer_value() {
+                    self.builder.build_call(self.rt_rc_retain, &[body_val.into()], "").unwrap();
+                }
                 self.builder.build_unconditional_branch(merge_block).unwrap();
                 incoming.push((body_val, body_end));
             }
@@ -6617,21 +6706,30 @@ impl<'ctx> Codegen<'ctx> {
 
         // Merge
         self.builder.position_at_end(merge_block);
-        if incoming.is_empty() {
-            return result_llvm_ty.const_zero();
-        }
-        if incoming.len() == 1 {
-            return incoming[0].0;
+        let match_result = if incoming.is_empty() {
+            result_llvm_ty.const_zero()
+        } else if incoming.len() == 1 {
+            incoming[0].0
+        } else {
+            let phi = self
+                .builder
+                .build_phi(result_llvm_ty, "match_result")
+                .unwrap();
+            for (val, block) in &incoming {
+                phi.add_incoming(&[(val, *block)]);
+            }
+            phi.as_basic_value()
+        };
+
+        // Release a fresh scrutinee allocation after all arms have used it.
+        if Self::expr_is_owned_alloc(scrutinee)
+            && Self::ty_is_heap(&scrut_ty)
+            && !Self::is_union_type(&scrut_ty)
+        {
+            self.emit_release(scrut_val, &scrut_ty);
         }
 
-        let phi = self
-            .builder
-            .build_phi(result_llvm_ty, "match_result")
-            .unwrap();
-        for (val, block) in &incoming {
-            phi.add_incoming(&[(val, *block)]);
-        }
-        phi.as_basic_value()
+        match_result
     }
 
     fn compile_pattern_match(
