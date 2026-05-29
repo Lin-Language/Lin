@@ -17,12 +17,10 @@ export val while = (arr: Json, f: Function): Null =>
   lin_while(arr, f)
 
 export val range = (start: Int32, end: Int32) =>
-  lin_iter(
-    () => start,
-    i => i < end,
-    i => i + 1,
-    i => i
-  )
+  // Delegate to the lin_range builtin, which materialises a flat Int32 array directly with
+  // no per-call closures. The general lin_iter form (4 closures + envs, called per element)
+  // is needlessly expensive for the overwhelmingly common integer-range case.
+  lin_range(start, end)
 
 export val rangeStep = (start: Int32, end: Int32, step: Int32): Json =>
   if step > 0 then lin_iter(
