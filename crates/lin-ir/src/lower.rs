@@ -19,6 +19,10 @@ pub fn lower_module(module: &TypedModule) -> LinModule {
     let mut ctx = LowerCtx::new();
     ctx.intrinsics = module.intrinsics.clone();
 
+    // Allocate the main function id FIRST so it is FuncId(0): codegen names the
+    // FuncId(0) function "main", and everything else `__lin_fn_<id>` or its own name.
+    let main_id = ctx.alloc_func_id();
+
     // Pre-collect global function slot assignments so cross-references work.
     let mut global_fn_slots: HashMap<usize, FuncId> = HashMap::new();
     for stmt in &module.statements {
@@ -35,7 +39,6 @@ pub fn lower_module(module: &TypedModule) -> LinModule {
     ctx.global_fn_slots = global_fn_slots.clone();
 
     // Build the top-level "main" function containing module-level statements.
-    let main_id = ctx.alloc_func_id();
     let mut builder = FuncBuilder::new(main_id, None, vec![], false, Type::Int32, ctx.intrinsics.clone());
 
     builder.push_scope();
@@ -333,8 +336,21 @@ fn const_type(c: &Const) -> Type {
 fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
     match stmt {
         TypedStmt::Val { slot, value, .. } => {
-            let t = lower_expr(value, builder, ctx);
-            builder.slots.insert(*slot, t);
+            // A top-level function val was pre-assigned a FuncId in `global_fn_slots`
+            // during the module pre-scan (so `CallTarget::Direct` references resolve).
+            // Reuse that id when lowering the function body, otherwise a fresh id is
+            // allocated and the Direct call target points at a non-existent function.
+            if let (TypedExpr::Function { name, params, body, ret_type, captures, .. }, Some(&fid)) =
+                (value, ctx.global_fn_slots.get(slot))
+            {
+                let t = lower_function_expr_with_id(
+                    Some(fid), name.as_deref(), params, body, ret_type, captures, builder, ctx,
+                );
+                builder.slots.insert(*slot, t);
+            } else {
+                let t = lower_expr(value, builder, ctx);
+                builder.slots.insert(*slot, t);
+            }
         }
         TypedStmt::Var { slot, value, ty, .. } => {
             let t = lower_expr(value, builder, ctx);
@@ -1012,7 +1028,24 @@ fn lower_function_expr(
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> Temp {
-    let fid = ctx.alloc_func_id();
+    lower_function_expr_with_id(None, name, params, body, ret_type, captures, builder, ctx)
+}
+
+/// Lower a function literal. `forced_fid` reuses a pre-assigned FuncId (for top-level
+/// named functions registered in `global_fn_slots` during the pre-scan, so that
+/// `CallTarget::Direct` references resolve to the actually-emitted function); pass
+/// None to allocate a fresh id (anonymous/nested closures).
+fn lower_function_expr_with_id(
+    forced_fid: Option<FuncId>,
+    name: Option<&str>,
+    params: &[TypedParam],
+    body: &TypedExpr,
+    ret_type: &Type,
+    captures: &[Capture],
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Temp {
+    let fid = forced_fid.unwrap_or_else(|| ctx.alloc_func_id());
 
     // Build param temps for the inner function.
     let mut inner_param_count = 0u32;
