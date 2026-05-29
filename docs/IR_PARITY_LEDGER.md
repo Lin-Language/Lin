@@ -145,3 +145,28 @@ Architecture delivered (Option B):
 - **FFI / fs (2):** ffi_end_to_end_c_library, fs_read_lines.
 - **TCO (1):** tail_call_optimization — a specific shape still failing (basic + deep TCO work).
 - **pattern_matching_has (1).**
+
+## Checkpoint 2 — 113/128 (Phases 1–7 + most edge cases)
+
+Since the last checkpoint (103): uniform closure return ABI completed (curried/HOF
+calls), array rest + array pattern matching, object rest, `iter()` as IR blocks,
+mixed int/float widening, has-pattern value constraints, if-branch result coercion.
+AST leg green throughout.
+
+### Remaining (15) — root causes identified
+1. **Mutable `var` captured by closure (heap cell)** — `closures_and_var`,
+   `multiple_closures_share_var`, and (via stdlib `some`/`every`, which mutate a
+   captured `var` inside a `lin_while` body) `stdlib_array_find_some_every`. The IR
+   models `var` as a plain SSA temp; captured-and-mutated `var` needs a heap cell shared
+   by reference (ADR-015). Largest remaining piece; comparable in size to the loop work.
+2. **RC of an object returned from a function then matched** — `tagged_unions`,
+   `tostring_objects_and_arrays`, `speculative_reads_typed_union`. A `match`/`has` on a
+   freshly-returned object reads a dangling entry key — an RC-ordering bug in how the
+   object's interior is owned across the function-return + match boundary.
+3. **Async/concurrency** — `async_val_capture`, `parallel_three_thunks`,
+   `thread_pool_async`, `worker_request_reply`. IR async/await codegen exists, but the
+   stdlib async wrappers are AST-compiled; full parity needs the IR path to compile
+   imports too (Phase 9 territory) or the wrapper RC interaction resolved.
+4. **FFI / fs** — `ffi_end_to_end_c_library`, `fs_read_lines`.
+5. **Misc** — `partial_application_chain`, `pattern_matching_has`,
+   `stdlib_array_flatmap_indexof_reverse`, `tail_call_optimization` (a specific shape).
