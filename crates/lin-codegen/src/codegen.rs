@@ -7135,6 +7135,11 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
 
+            // Pending phi nodes to backpatch after all blocks are compiled, so that
+            // back-edge incoming values (e.g. a loop's `i+1`, defined in a block emitted
+            // after the header) are available in temp_map when we wire up the edges.
+            let mut pending_phis: Vec<(inkwell::values::PhiValue<'ctx>, Vec<(lir::Temp, lir::BlockId)>)> = Vec::new();
+
             // Compile each block
             for block in &func.blocks {
                 let bb = ir_block_to_llvm[&block.id];
@@ -7158,19 +7163,13 @@ impl<'ctx> Codegen<'ctx> {
                             }
                         }
                         Instruction::Phi { dst, ty, incomings } => {
-                            // Build an LLVM phi merging each predecessor's incoming value.
-                            // Predecessor blocks precede the merge block in emission order,
-                            // so their values are already in temp_map and their LLVM blocks exist.
+                            // Create the phi now so its result is available to later
+                            // instructions, but defer wiring the incoming edges until all
+                            // blocks are compiled (a back-edge value may be defined later).
                             let phi_ty = self.llvm_type(ty);
                             let phi = self.builder.build_phi(phi_ty, "ir_phi").unwrap();
-                            for (val_temp, pred_block) in incomings {
-                                if let (Some(&v), Some(&pred_bb)) =
-                                    (temp_map.get(val_temp), ir_block_to_llvm.get(pred_block))
-                                {
-                                    phi.add_incoming(&[(&v, pred_bb)]);
-                                }
-                            }
                             temp_map.insert(*dst, phi.as_basic_value());
+                            pending_phis.push((phi, incomings.clone()));
                         }
                         Instruction::Binary { dst, op, lhs, rhs, operand_ty, ty } => {
                             let lv = temp_map.get(lhs).copied().unwrap_or_else(|| ptr_ty.const_null().into());
@@ -7315,12 +7314,21 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::MakeClosure { dst, func: fid, captures, ret_ty: _ } => {
                             if let Some(&callee_fn) = ir_fn_to_llvm.get(fid) {
-                                let fn_ptr = callee_fn.as_global_value().as_pointer_value();
-                                let capture_vals: Vec<BasicValueEnum> = captures
-                                    .iter()
-                                    .filter_map(|c| temp_map.get(c).copied())
-                                    .collect();
-                                let cls = self.make_closure_struct(fn_ptr.into(), &capture_vals);
+                                let cls = if captures.is_empty() {
+                                    // The target was lowered as a non-closure (no env param 0),
+                                    // but closure call sites invoke fn_ptr(env, args...). Wrap it
+                                    // in an env-ignoring stub so the closure ABI lines up.
+                                    self.wrap_named_fn_as_closure(callee_fn, &Type::Null)
+                                } else {
+                                    // Captures present ⇒ the function has an env param 0; build
+                                    // the env struct and store the raw fn ptr.
+                                    let fn_ptr = callee_fn.as_global_value().as_pointer_value();
+                                    let capture_vals: Vec<BasicValueEnum> = captures
+                                        .iter()
+                                        .filter_map(|c| temp_map.get(c).copied())
+                                        .collect();
+                                    self.make_closure_struct(fn_ptr.into(), &capture_vals)
+                                };
                                 temp_map.insert(*dst, cls);
                             }
                         }
@@ -7452,6 +7460,18 @@ impl<'ctx> Codegen<'ctx> {
                     }
                     Terminator::Unreachable => {
                         self.builder.build_unreachable().unwrap();
+                    }
+                }
+            }
+
+            // Backpatch phi incoming edges now that every block (including back-edge
+            // sources) has been compiled and all temps are in temp_map.
+            for (phi, incomings) in &pending_phis {
+                for (val_temp, pred_block) in incomings {
+                    if let (Some(&v), Some(&pred_bb)) =
+                        (temp_map.get(val_temp), ir_block_to_llvm.get(pred_block))
+                    {
+                        phi.add_incoming(&[(&v, pred_bb)]);
                     }
                 }
             }
