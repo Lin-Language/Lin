@@ -510,6 +510,18 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
 
         TypedExpr::LocalGet { slot, ty, .. } => {
             if let Some(&t) = builder.slots.get(slot) {
+                // If the slot holds a boxed (Json/union) value but this use wants a concrete
+                // type — e.g. a Json param narrowed to String inside a match arm — unbox it.
+                let stored_ty = builder.temp_types.get(&t).cloned().unwrap_or_else(|| ty.clone());
+                let t = if is_union_ty(&stored_ty) && !is_union_ty(ty) {
+                    let dst = builder.alloc_temp(ty.clone());
+                    builder.emit(Instruction::Coerce {
+                        dst, src: t, from_ty: stored_ty, to_ty: ty.clone(),
+                    });
+                    dst
+                } else {
+                    t
+                };
                 // Pessimistically retain heap values on every read — rc_elide removes redundant pairs.
                 if is_rc_type(ty) {
                     builder.emit(Instruction::Retain { val: t, ty: ty.clone() });
