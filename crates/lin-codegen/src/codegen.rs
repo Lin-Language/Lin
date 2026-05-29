@@ -8095,29 +8095,45 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     fn compile_ir_has_pattern(&mut self, val: BasicValueEnum<'ctx>, pattern: &lir::HasDesc) -> inkwell::values::IntValue<'ctx> {
-        if !val.is_pointer_value() { return self.context.bool_type().const_zero(); }
+        let bool_ty = self.context.bool_type();
+        if !val.is_pointer_value() { return bool_ty.const_zero(); }
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i8_ty = self.context.i8_type();
-        // The value is a boxed TaggedVal*; `lin_object_has` needs a tag check + the raw
-        // LinObject*. If it's not an object, `has` is false. Guard then unbox.
+        // The value is a boxed TaggedVal*. Only objects can match; for non-objects, `has`
+        // is false. Branch on the tag so we never call lin_object_has on a non-object
+        // (which would deref a non-LinObject pointer and crash).
         let tag = self.builder.build_call(self.rt_get_tag, &[val.into()], "ir_has_tag")
             .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
         let is_obj = self.builder.build_int_compare(IntPredicate::EQ, tag,
             i8_ty.const_int(7, false), "ir_has_isobj").unwrap();
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let entry_bb = self.builder.get_insert_block().unwrap();
+        let obj_bb = self.context.append_basic_block(llvm_fn, "has_obj");
+        let merge_bb = self.context.append_basic_block(llvm_fn, "has_merge");
+        self.builder.build_conditional_branch(is_obj, obj_bb, merge_bb).unwrap();
+
+        self.builder.position_at_end(obj_bb);
         let obj_ptr = self.builder.build_call(self.rt_unbox_ptr, &[val.into()], "ir_has_unbox")
             .unwrap().try_as_basic_value().unwrap_basic();
         let obj_has_fn = self.get_or_declare_fn("lin_object_has",
             i8_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
-        let mut result = is_obj;
+        let mut all_present = bool_ty.const_int(1, false);
         for field in &pattern.required_fields {
             let key_str = self.compile_string_lit(field).into_pointer_value();
             let has_i8 = self.builder.build_call(obj_has_fn, &[obj_ptr.into(), key_str.into()], "ir_has")
                 .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
             self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
-            let has_bool = self.builder.build_int_truncate_or_bit_cast(has_i8, self.context.bool_type(), "has_b").unwrap();
-            result = self.builder.build_and(result, has_bool, "has_acc").unwrap();
+            let has_bool = self.builder.build_int_truncate_or_bit_cast(has_i8, bool_ty, "has_b").unwrap();
+            all_present = self.builder.build_and(all_present, has_bool, "has_acc").unwrap();
         }
-        result
+        let obj_end = self.builder.get_insert_block().unwrap();
+        self.builder.build_unconditional_branch(merge_bb).unwrap();
+
+        self.builder.position_at_end(merge_bb);
+        let phi = self.builder.build_phi(bool_ty, "has_res").unwrap();
+        let f = bool_ty.const_zero();
+        phi.add_incoming(&[(&f, entry_bb), (&all_present, obj_end)]);
+        phi.as_basic_value().into_int_value()
     }
 
     fn compile_ir_coerce(&mut self, val: BasicValueEnum<'ctx>, from_ty: &Type, to_ty: &Type) -> BasicValueEnum<'ctx> {

@@ -1717,6 +1717,10 @@ fn lower_match(
         // Emit body.
         builder.switch_to(body_block);
 
+        // Bind pattern variables BEFORE the guard — the guard may reference them
+        // (e.g. `has { name, age } when age > 30`).
+        lower_match_bindings(&arm.pattern, scrut_temp, builder, ctx);
+
         // If there's a guard, test it.
         if let Some(guard) = &arm.guard {
             let guard_val = lower_expr(guard, builder, ctx);
@@ -1728,9 +1732,6 @@ fn lower_match(
             });
             builder.switch_to(guard_then);
         }
-
-        // Emit bindings from the pattern into slots.
-        lower_match_bindings(&arm.pattern, scrut_temp, builder, ctx);
 
         let arm_val = lower_expr(&arm.body, builder, ctx);
         if !builder.is_current_block_terminated() {
