@@ -135,6 +135,11 @@ pub struct Codegen<'ctx> {
     /// Module-level slot map active during register_import. Closures compiled inside
     /// imported module bodies use this to resolve sibling function calls.
     current_module_slots: HashMap<usize, FunctionValue<'ctx>>,
+    /// Symbol prefix for anonymous (`__lin_fn_<id>`) functions emitted by
+    /// `compile_module_from_ir`. Empty for the main module; set to a per-module key (e.g.
+    /// `std_test_`) while compiling an imported module on the IR path, so anonymous-function
+    /// symbols don't collide across modules (each module's lowering numbers FuncIds from 0).
+    ir_anon_prefix: String,
     /// Coverage emitter: Some if compiling with coverage instrumentation.
     pub coverage: Option<CoverageEmitter<'ctx>>,
 }
@@ -337,6 +342,7 @@ impl<'ctx> Codegen<'ctx> {
             imported_fns: HashMap::new(),
             imported_val_wrappers: HashMap::new(),
             foreign_lib_paths: Vec::new(),
+            ir_anon_prefix: String::new(),
             global_val_slots: HashMap::new(),
             current_module_slots: HashMap::new(),
             coverage: if coverage_enabled {
@@ -503,7 +509,11 @@ impl<'ctx> Codegen<'ctx> {
         let module_key = lin_ir::mangle_module_key(path);
         let mut ir_module = lin_ir::lower_import_module(module, &module_key);
         lin_ir::rc_elide::elide_rc(&mut ir_module);
+        // Prefix this module's anonymous functions so `__lin_fn_<id>` symbols don't collide
+        // with the main module's or other imports' (each module numbers FuncIds from 0).
+        let saved_prefix = std::mem::replace(&mut self.ir_anon_prefix, format!("{}_", module_key));
         self.compile_module_from_ir(&ir_module);
+        self.ir_anon_prefix = saved_prefix;
 
         // Register each exported binding's emitted LLVM symbol so importers resolve it.
         // Function exports → `imported_fns[(path, name)]`; non-function vals → the
@@ -7386,8 +7396,11 @@ impl<'ctx> Codegen<'ctx> {
                 param_types.push(self.llvm_param_type(ty));
             }
             let name = if func.name.as_deref() == Some("main") || func.name.is_none() {
-                if func.id == lir::FuncId(0) { "main".to_string() }
-                else { format!("__lin_fn_{}", func.id.0) }
+                if func.id == lir::FuncId(0) && self.ir_anon_prefix.is_empty() { "main".to_string() }
+                // Prefix anonymous functions with the module key when compiling an import, so
+                // `__lin_fn_<id>` symbols don't collide with the main module's (or another
+                // import's) identically-numbered anonymous functions.
+                else { format!("{}__lin_fn_{}", self.ir_anon_prefix, func.id.0) }
             } else {
                 func.name.clone().unwrap()
             };
@@ -7676,14 +7689,21 @@ impl<'ctx> Codegen<'ctx> {
                             let cap = i32_ty.const_int((fields.len() + 4).max(4) as u64, false);
                             let obj_ptr = self.builder.build_call(self.rt_object_alloc, &[cap.into()], "ir_obj")
                                 .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
-                            // Apply spreads.
+                            // Apply spreads. A spread source typed Json/union arrives boxed
+                            // (a TaggedVal*) — unbox to the raw LinObject* before merging, or
+                            // lin_object_merge reads the box as an object and crashes.
                             if !spreads.is_empty() {
                                 let merge_fn = self.get_or_declare_fn("lin_object_merge",
                                     void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                                 for s in spreads {
                                     if let Some(&sv) = temp_map.get(s) {
                                         if sv.is_pointer_value() {
-                                            self.builder.build_call(merge_fn, &[obj_ptr.into(), sv.into()], "").unwrap();
+                                            let s_ty = func.temp_types.get(s).cloned().unwrap_or(Type::Null);
+                                            let src = if Self::is_union_type(&s_ty) {
+                                                self.builder.build_call(self.rt_unbox_ptr, &[sv.into()], "ir_spread_unbox")
+                                                    .unwrap().try_as_basic_value().unwrap_basic()
+                                            } else { sv };
+                                            self.builder.build_call(merge_fn, &[obj_ptr.into(), src.into()], "").unwrap();
                                         }
                                     }
                                 }
@@ -8569,6 +8589,35 @@ impl<'ctx> Codegen<'ctx> {
         } else {
             key
         };
+        // When the object is statically Json/union, its runtime value may NOT be an object
+        // (e.g. `results["type"]` where results is actually an array). Guard the lookup with
+        // a tag check — TAG_OBJECT(7) → look up the key; otherwise return Null. Without this,
+        // lin_object_get would read a LinArray*/scalar as a LinObject* and crash. Mirrors the
+        // AST compile_index string-key-on-Json path.
+        if Self::is_union_type(obj_ty) {
+            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+            let obj_tag = self.builder.build_call(self.rt_get_tag, &[obj.into()], "ir_idx_tag")
+                .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+            let is_obj = self.builder.build_int_compare(
+                IntPredicate::EQ, obj_tag, self.context.i8_type().const_int(7, false), "ir_idx_is_obj").unwrap();
+            let ok = self.context.append_basic_block(llvm_fn, "ir_idx_obj_ok");
+            let no = self.context.append_basic_block(llvm_fn, "ir_idx_obj_no");
+            let mrg = self.context.append_basic_block(llvm_fn, "ir_idx_obj_mrg");
+            self.builder.build_conditional_branch(is_obj, ok, no).unwrap();
+            self.builder.position_at_end(ok);
+            let entry = self.builder.build_call(self.rt_object_get, &[container.into(), key_str.into()], "ir_oget")
+                .unwrap().try_as_basic_value().unwrap_basic();
+            let ok_exit = self.builder.get_insert_block().unwrap();
+            self.builder.build_unconditional_branch(mrg).unwrap();
+            self.builder.position_at_end(no);
+            let null_res = ptr_ty.const_null();
+            self.builder.build_unconditional_branch(mrg).unwrap();
+            self.builder.position_at_end(mrg);
+            let phi = self.builder.build_phi(ptr_ty, "ir_idx_obj_phi").unwrap();
+            phi.add_incoming(&[(&entry, ok_exit), (&null_res, no)]);
+            let result_ptr = phi.as_basic_value();
+            return self.unbox_tagged_val_to_type(result_ptr, result_ty);
+        }
         let tagged = self.builder.build_call(self.rt_object_get, &[container.into(), key_str.into()], "ir_oget")
             .unwrap().try_as_basic_value().unwrap_basic();
         self.unbox_tagged_val_to_type(tagged, result_ty)

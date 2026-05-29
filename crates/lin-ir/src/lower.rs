@@ -1342,6 +1342,25 @@ fn lower_intrinsic_call(
         }
     };
     let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();
+
+    // `push(arr, elem)` transfers a reference to `elem` into the array, and codegen's push
+    // does NOT retain (it stores the pointer / copies the boxed value). So manage the
+    // element's ownership like a MakeArray element: a fresh allocation transfers its +1
+    // (drop it from the owning scope so the scope-exit release doesn't free a value the
+    // array now holds); a borrowed heap value is retained so both owners can release.
+    if intrinsic == Intrinsic::Push {
+        if let (Some(elem_expr), Some(&elem_temp)) = (args.get(1), lowered_args.get(1)) {
+            let et = elem_expr.ty();
+            if is_rc_type(&et) {
+                if expr_is_fresh_alloc(elem_expr) {
+                    builder.unregister_owned(elem_temp);
+                } else {
+                    builder.emit(Instruction::Retain { val: elem_temp, ty: et });
+                }
+            }
+        }
+    }
+
     let dst = builder.alloc_temp(result_type.clone());
     builder.emit(Instruction::CallIntrinsic {
         dst,
