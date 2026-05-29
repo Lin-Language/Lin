@@ -39,6 +39,11 @@ pub fn lower_module(module: &TypedModule) -> LinModule {
     }
     ctx.global_fn_slots = global_fn_slots.clone();
 
+    // Pre-scan for `var` slots mutably captured by closures — these become heap cells.
+    for stmt in &module.statements {
+        collect_mutable_capture_slots_stmt(stmt, &mut ctx.mutable_cell_slots);
+    }
+
     // Build the top-level "main" function containing module-level statements.
     let mut builder = FuncBuilder::new(main_id, None, vec![], false, Type::Int32, ctx.intrinsics.clone());
 
@@ -90,6 +95,10 @@ struct LowerCtx {
     /// name `{module_key}_{name}__val`, value type). Reading the binding calls the
     /// zero-arg wrapper to compute the value.
     import_val_slots: HashMap<usize, (String, Type)>,
+    /// `var` slots that are mutably captured by an inner closure. These are stored as
+    /// heap cells (MakeCell) shared by reference; reads/writes go through CellGet/CellSet
+    /// and closures capture the cell pointer (ADR-015).
+    mutable_cell_slots: std::collections::HashSet<usize>,
 }
 
 impl LowerCtx {
@@ -102,6 +111,7 @@ impl LowerCtx {
             global_fn_slots: HashMap::new(),
             import_fn_slots: HashMap::new(),
             import_val_slots: HashMap::new(),
+            mutable_cell_slots: std::collections::HashSet::new(),
         }
     }
 
@@ -138,6 +148,9 @@ struct FuncBuilder {
     /// temp so `lower_expr` can return one, but control never reaches them; they must not
     /// become phi predecessors of an enclosing if/match merge.
     diverged_blocks: std::collections::HashSet<BlockId>,
+    /// Slots stored as heap cells (mutably-captured `var`s): slot → stored value type.
+    /// `slots[slot]` holds the cell-pointer temp; LocalGet/LocalSet go through the cell.
+    cell_slots: HashMap<usize, Type>,
 }
 
 impl FuncBuilder {
@@ -179,6 +192,7 @@ impl FuncBuilder {
             intrinsic_slots,
             scope_owned: Vec::new(),
             diverged_blocks: std::collections::HashSet::new(),
+            cell_slots: HashMap::new(),
         }
     }
 
@@ -316,6 +330,87 @@ fn is_rc_type(ty: &Type) -> bool {
     )
 }
 
+/// Collect `var` slots that are mutably captured by any (possibly nested) closure within
+/// a statement. Such slots are stored as heap cells shared by reference.
+fn collect_mutable_capture_slots_stmt(stmt: &TypedStmt, out: &mut std::collections::HashSet<usize>) {
+    match stmt {
+        TypedStmt::Val { value, .. } | TypedStmt::Var { value, .. } => {
+            collect_mutable_capture_slots_expr(value, out);
+        }
+        TypedStmt::Expr(e) => collect_mutable_capture_slots_expr(e, out),
+        TypedStmt::Destructure { value, .. } | TypedStmt::ArrayDestructure { value, .. } => {
+            collect_mutable_capture_slots_expr(value, out);
+        }
+        TypedStmt::Import { .. } | TypedStmt::ForeignImport { .. } => {}
+    }
+}
+
+fn collect_mutable_capture_slots_expr(expr: &TypedExpr, out: &mut std::collections::HashSet<usize>) {
+    match expr {
+        TypedExpr::Function { captures, body, .. } => {
+            for cap in captures {
+                if cap.is_mutable {
+                    out.insert(cap.outer_slot);
+                }
+            }
+            collect_mutable_capture_slots_expr(body, out);
+        }
+        TypedExpr::Block { stmts, expr, .. } => {
+            for s in stmts { collect_mutable_capture_slots_stmt(s, out); }
+            collect_mutable_capture_slots_expr(expr, out);
+        }
+        TypedExpr::If { cond, then_br, else_br, .. } => {
+            collect_mutable_capture_slots_expr(cond, out);
+            collect_mutable_capture_slots_expr(then_br, out);
+            collect_mutable_capture_slots_expr(else_br, out);
+        }
+        TypedExpr::Match { scrutinee, arms, .. } => {
+            collect_mutable_capture_slots_expr(scrutinee, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard { collect_mutable_capture_slots_expr(g, out); }
+                collect_mutable_capture_slots_expr(&arm.body, out);
+            }
+        }
+        TypedExpr::Call { func, args, .. } => {
+            collect_mutable_capture_slots_expr(func, out);
+            for a in args { collect_mutable_capture_slots_expr(a, out); }
+        }
+        TypedExpr::BinaryOp { left, right, .. } => {
+            collect_mutable_capture_slots_expr(left, out);
+            collect_mutable_capture_slots_expr(right, out);
+        }
+        TypedExpr::Coerce { expr, .. } | TypedExpr::LocalSet { value: expr, .. } => {
+            collect_mutable_capture_slots_expr(expr, out);
+        }
+        TypedExpr::MakeArray { elements, .. } => {
+            for e in elements { collect_mutable_capture_slots_expr(e, out); }
+        }
+        TypedExpr::MakeObject { fields, spreads, .. } => {
+            for (_, v) in fields { collect_mutable_capture_slots_expr(v, out); }
+            for s in spreads { collect_mutable_capture_slots_expr(s, out); }
+        }
+        TypedExpr::Index { object, key, .. } => {
+            collect_mutable_capture_slots_expr(object, out);
+            collect_mutable_capture_slots_expr(key, out);
+        }
+        TypedExpr::IndexSet { object, key, value, .. } => {
+            collect_mutable_capture_slots_expr(object, out);
+            collect_mutable_capture_slots_expr(key, out);
+            collect_mutable_capture_slots_expr(value, out);
+        }
+        TypedExpr::FieldGet { object, .. } => collect_mutable_capture_slots_expr(object, out),
+        TypedExpr::Is { expr, .. } | TypedExpr::Has { expr, .. } => {
+            collect_mutable_capture_slots_expr(expr, out);
+        }
+        TypedExpr::StringInterp { parts, .. } => {
+            for p in parts {
+                if let TypedStringPart::Expr(e) = p { collect_mutable_capture_slots_expr(e, out); }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Mangle an import path into the LLVM symbol prefix codegen uses for that module's
 /// exports. Must match `register_import`'s `path.replace("/", "_").replace("-", "_")`.
 fn mangle_module_key(path: &str) -> String {
@@ -419,10 +514,17 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
         TypedStmt::Var { slot, value, ty, .. } => {
             let t = lower_expr(value, builder, ctx);
             let t = coerce_to_slot_type(t, &value.ty(), ty, builder);
-            // Var slots are represented as mutable temps. The "cell" indirection
-            // used in codegen (Alloca) is handled by codegen consuming LinIR, not here.
-            // We track the current temp for each var slot, updated on LocalSet.
-            builder.slots.insert(*slot, t);
+            if ctx.mutable_cell_slots.contains(slot) {
+                // Mutably captured by a closure: store in a heap cell shared by reference.
+                // The slot maps to the cell-pointer temp; reads/writes go through it.
+                let cell = builder.alloc_temp(Type::TypeVar(u32::MAX));
+                builder.emit(Instruction::MakeCell { dst: cell, init: t, ty: ty.clone() });
+                builder.cell_slots.insert(*slot, ty.clone());
+                builder.slots.insert(*slot, cell);
+            } else {
+                // Plain mutable temp; tracked per var slot, updated on LocalSet.
+                builder.slots.insert(*slot, t);
+            }
         }
         TypedStmt::Import { path, bindings, .. } => {
             // Imported modules are compiled by codegen's AST `register_import` even on
@@ -564,6 +666,18 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         }
 
         TypedExpr::LocalGet { slot, ty, .. } => {
+            // Heap-cell slot (mutably-captured var): load the current value through the cell.
+            if let Some(cell_ty) = builder.cell_slots.get(slot).cloned() {
+                if let Some(&cell) = builder.slots.get(slot) {
+                    let dst = builder.alloc_temp(cell_ty.clone());
+                    builder.emit(Instruction::CellGet { dst, cell, ty: cell_ty.clone() });
+                    if is_rc_type(&cell_ty) {
+                        builder.emit(Instruction::Retain { val: dst, ty: cell_ty.clone() });
+                        builder.register_owned(dst, cell_ty);
+                    }
+                    return dst;
+                }
+            }
             if let Some(&t) = builder.slots.get(slot) {
                 // If the slot holds a boxed (Json/union) value but this use wants a concrete
                 // type — e.g. a Json param narrowed to String inside a match arm — unbox it.
@@ -605,6 +719,14 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
 
         TypedExpr::LocalSet { slot, value, .. } => {
             let val_temp = lower_expr(value, builder, ctx);
+            // Heap-cell slot: write through the cell so captured closures see the update.
+            if let Some(cell_ty) = builder.cell_slots.get(slot).cloned() {
+                if let Some(&cell) = builder.slots.get(slot) {
+                    let v = coerce_to_slot_type(val_temp, &value.ty(), &cell_ty, builder);
+                    builder.emit(Instruction::CellSet { cell, value: v, ty: cell_ty });
+                    return v;
+                }
+            }
             builder.slots.insert(*slot, val_temp);
             // LocalSet returns the value.
             val_temp
@@ -1924,6 +2046,7 @@ fn lower_function_expr_with_id(
         intrinsic_slots: builder.intrinsic_slots.clone(),
         scope_owned: Vec::new(),
         diverged_blocks: std::collections::HashSet::new(),
+        cell_slots: HashMap::new(),
     };
 
     // Add entry block.
@@ -1938,7 +2061,9 @@ fn lower_function_expr_with_id(
     if is_closure {
         let env_temp = Temp(0);
         for (i, cap) in captures.iter().enumerate() {
-            let cap_ty = cap.ty.clone();
+            // A mutable capture holds a heap-cell POINTER (shared by reference); an
+            // immutable one holds the captured value directly.
+            let cap_ty = if cap.is_mutable { Type::TypeVar(u32::MAX) } else { cap.ty.clone() };
             let cap_t = inner_builder.alloc_temp(cap_ty.clone());
             // Env access is a raw struct load by index, NOT a Lin object field access.
             inner_builder.emit(Instruction::EnvCapture {
@@ -1948,6 +2073,10 @@ fn lower_function_expr_with_id(
                 ty: cap_ty,
             });
             inner_builder.slots.insert(cap.outer_slot, cap_t);
+            if cap.is_mutable {
+                // Inside the closure, this slot is a cell: reads/writes go through it.
+                inner_builder.cell_slots.insert(cap.outer_slot, cap.ty.clone());
+            }
         }
     }
 

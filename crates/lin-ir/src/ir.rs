@@ -163,6 +163,14 @@ pub enum Instruction {
     /// result = a new (boxed) object containing all of `src`'s fields except `exclude`.
     /// Used by object rest destructuring (`val { a, ...rest } = obj`).
     ObjectRest { dst: Temp, src: Temp, src_ty: Type, exclude: Vec<String> },
+    /// dst = heap cell holding `init` (a `var` mutably captured by a closure). The cell
+    /// pointer is shared by reference: closures capture it and read/write the live value
+    /// through CellGet/CellSet (ADR-015). `ty` is the stored value's type.
+    MakeCell { dst: Temp, init: Temp, ty: Type },
+    /// result = *cell  (load the current value of a captured `var` cell).
+    CellGet { dst: Temp, cell: Temp, ty: Type },
+    /// *cell = value  (update a captured `var` cell in place).
+    CellSet { cell: Temp, value: Temp, ty: Type },
     /// Increment refcount of a heap value (string, array, object, closure env).
     Retain { val: Temp, ty: Type },
     /// Decrement refcount; free if zero. Only emitted for owned values.

@@ -7644,6 +7644,35 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, result);
                             }
                         }
+                        Instruction::MakeCell { dst, init, ty } => {
+                            if let Some(&v) = temp_map.get(init) {
+                                let llvm_ty = self.llvm_type(ty);
+                                let size = llvm_ty.size_of().unwrap();
+                                let size_i64 = self.builder.build_int_z_extend_or_bit_cast(size, i64_ty, "cell_sz").unwrap();
+                                let cell = self.builder.build_call(self.rt_alloc, &[size_i64.into()], "ir_cell")
+                                    .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+                                self.builder.build_store(cell, v).unwrap();
+                                temp_map.insert(*dst, cell.into());
+                            }
+                        }
+                        Instruction::CellGet { dst, cell, ty } => {
+                            if let Some(&c) = temp_map.get(cell) {
+                                if c.is_pointer_value() {
+                                    let llvm_ty = self.llvm_type(ty);
+                                    let v = self.builder.build_load(llvm_ty, c.into_pointer_value(), "ir_cellget").unwrap();
+                                    temp_map.insert(*dst, v);
+                                } else {
+                                    temp_map.insert(*dst, self.llvm_type(ty).const_zero());
+                                }
+                            }
+                        }
+                        Instruction::CellSet { cell, value, .. } => {
+                            if let (Some(&c), Some(&v)) = (temp_map.get(cell), temp_map.get(value)) {
+                                if c.is_pointer_value() {
+                                    self.builder.build_store(c.into_pointer_value(), v).unwrap();
+                                }
+                            }
+                        }
                         Instruction::EnvCapture { dst, env, index, ty } => {
                             if let Some(&env_v) = temp_map.get(env) {
                                 if env_v.is_pointer_value() {
