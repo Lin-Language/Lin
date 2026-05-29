@@ -1,0 +1,24 @@
+import { suite, test, expect, run, toBe } from "std/test"
+import { arrayAllocate, length } from "std/array"
+
+// Reproduce the codegen panic: arrayAllocate(n) where n is obtained
+// via chained index access obj["size"], which produces a TypeVar (Json)
+// pointer rather than a concrete Int32. The compiler must unbox it
+// before calling lin_array_alloc_null.
+
+val toInt = (v: Json): Int32 =>
+  match v
+    is Int32 => v
+    else => 0
+
+val allocWithJsonSize = (nodes: Json): Json =>
+  val n = toInt(nodes[0]["size"])
+  arrayAllocate(n)
+
+suite("dijkstra/codegen", [
+  test("chained index used as array size", () =>
+    val nodes: Json = [{"size": 3}]
+    val arr = allocWithJsonSize(nodes)
+    expect(length(arr)).toBe(3)
+  ),
+]).run()

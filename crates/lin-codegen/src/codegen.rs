@@ -3299,7 +3299,14 @@ impl<'ctx> Codegen<'ctx> {
             }
             "lin_array_allocate" => {
                 // arrayAllocate(n: Int32) => Json[] — null-filled tagged array of length n
-                let n_val = self.compile_expr(&args[0], fn_ctx);
+                let n_val_raw = self.compile_expr(&args[0], fn_ctx);
+                // When n comes from a TypeVar/Union context (e.g. chained index access), it
+                // arrives as a TaggedVal* pointer. Unbox it to a concrete Int32 first.
+                let n_val = if n_val_raw.is_pointer_value() {
+                    self.unbox_value(n_val_raw, &Type::Int32)
+                } else {
+                    n_val_raw
+                };
                 let n_i64 = self.builder.build_int_s_extend(
                     n_val.into_int_value(),
                     self.context.i64_type(),
@@ -3319,7 +3326,14 @@ impl<'ctx> Codegen<'ctx> {
             "lin_array_allocate_filled" => {
                 // arrayAllocateFilled(n: Int32, val: T) => T[]
                 // Dispatches to the appropriate flat or tagged runtime function based on val type.
-                let n_val = self.compile_expr(&args[0], fn_ctx);
+                let n_val_raw = self.compile_expr(&args[0], fn_ctx);
+                // When n comes from a TypeVar/Union context (e.g. chained index access), it
+                // arrives as a TaggedVal* pointer. Unbox it to a concrete Int32 first.
+                let n_val = if n_val_raw.is_pointer_value() {
+                    self.unbox_value(n_val_raw, &Type::Int32)
+                } else {
+                    n_val_raw
+                };
                 let n_i64 = self.builder.build_int_s_extend(
                     n_val.into_int_value(),
                     self.context.i64_type(),
