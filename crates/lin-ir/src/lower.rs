@@ -866,6 +866,9 @@ fn lower_intrinsic_call(
         "lin_length" => Intrinsic::Length,
         "lin_push" => Intrinsic::Push,
         "concat" => Intrinsic::Concat,
+        "lin_async" => Intrinsic::Async,
+        "lin_await" => Intrinsic::Await,
+        "lin_exit" => Intrinsic::Exit,
         _ => {
             // Unknown intrinsic: lower as indirect call fallback.
             let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();

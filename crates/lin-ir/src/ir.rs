@@ -80,6 +80,12 @@ pub enum Intrinsic {
     NullToString,
     Alloc,
     Panic,
+    // Concurrency / process intrinsics (see std/async). In this runtime async is
+    // effectively synchronous: a thunk runs immediately and its result is wrapped in a
+    // promise; await unwraps it.
+    Async,
+    Await,
+    Exit,
 }
 
 /// Element kinds for unboxed (flat) scalar arrays.

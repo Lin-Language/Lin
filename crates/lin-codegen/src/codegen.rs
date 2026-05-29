@@ -7707,8 +7707,57 @@ impl<'ctx> Codegen<'ctx> {
                         .unwrap().try_as_basic_value().unwrap_basic()
                 } else { ptr_ty.const_null().into() }
             }
+            Intrinsic::Async => {
+                // async(thunk): call the thunk closure synchronously (it returns a boxed
+                // Json result), then wrap in a LinPromise*.
+                let thunk = args.last().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let result = self.call_thunk_value(thunk);
+                let make_promise = self.get_or_declare_fn("lin_make_promise",
+                    ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.build_call(make_promise, &[result.into()], "ir_promise")
+                    .unwrap().try_as_basic_value().unwrap_basic()
+            }
+            Intrinsic::Await => {
+                let promise = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let await_fn = self.get_or_declare_fn("lin_await_promise",
+                    ptr_ty.fn_type(&[ptr_ty.into()], false));
+                let tagged = self.builder.build_call(await_fn, &[promise.into()], "ir_await")
+                    .unwrap().try_as_basic_value().unwrap_basic();
+                // Unbox to the (concrete) result type if needed.
+                if !Self::is_union_type(ret_ty) && *ret_ty != Type::Null {
+                    self.unbox_tagged_val_to_type(tagged, ret_ty)
+                } else {
+                    tagged
+                }
+            }
+            Intrinsic::Exit => {
+                if let Some(&code) = args.first() {
+                    let exit_fn = self.get_or_declare_fn("exit",
+                        self.context.void_type().fn_type(&[self.context.i32_type().into()], false));
+                    if code.is_int_value() {
+                        self.builder.build_call(exit_fn, &[code.into_int_value().into()], "").unwrap();
+                    }
+                }
+                ptr_ty.const_null().into()
+            }
             _ => ptr_ty.const_null().into(),
         }
+    }
+
+    /// Call a thunk closure value `(env) -> ptr` (closures use the uniform boxed ABI).
+    /// Returns the boxed Json result. Used by the async intrinsics on the IR path.
+    fn call_thunk_value(&mut self, thunk: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        if !thunk.is_pointer_value() { return ptr_ty.const_null().into(); }
+        let cls_ptr = thunk.into_pointer_value();
+        let cls_ty = self.closure_struct_type();
+        let fn_field = self.builder.build_struct_gep(cls_ty, cls_ptr, 2, "thunk_fn_f").unwrap();
+        let fn_ptr = self.builder.build_load(ptr_ty, fn_field, "thunk_fn").unwrap().into_pointer_value();
+        let env_field = self.builder.build_struct_gep(cls_ty, cls_ptr, 3, "thunk_env_f").unwrap();
+        let env_ptr = self.builder.build_load(ptr_ty, env_field, "thunk_env").unwrap();
+        let fn_ty = ptr_ty.fn_type(&[ptr_ty.into()], false);
+        self.builder.build_indirect_call(fn_ty, fn_ptr, &[env_ptr.into()], "thunk_res")
+            .unwrap().try_as_basic_value().unwrap_basic()
     }
 
     fn compile_ir_index(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, result_ty: &Type) -> BasicValueEnum<'ctx> {
