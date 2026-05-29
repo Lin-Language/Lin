@@ -7481,6 +7481,25 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, result);
                             }
                         }
+                        Instruction::EnvCapture { dst, env, index, ty } => {
+                            if let Some(&env_v) = temp_map.get(env) {
+                                if env_v.is_pointer_value() {
+                                    // Captures live at byte offset 8 + index*8 in the env
+                                    // allocation (offset 0 is the size header), matching
+                                    // make_closure_struct's layout.
+                                    let i8_ty = self.context.i8_type();
+                                    let offset = i64_ty.const_int(8 + (*index as u64) * 8, false);
+                                    let gep = unsafe {
+                                        self.builder.build_gep(i8_ty, env_v.into_pointer_value(), &[offset], "ir_capgep").unwrap()
+                                    };
+                                    let load_ty = self.llvm_type(ty);
+                                    let loaded = self.builder.build_load(load_ty, gep, "ir_cap").unwrap();
+                                    temp_map.insert(*dst, loaded);
+                                } else {
+                                    temp_map.insert(*dst, self.llvm_type(ty).const_zero());
+                                }
+                            }
+                        }
                         Instruction::IsType { dst, val, ty } => {
                             if let Some(&v) = temp_map.get(val) {
                                 let result = self.compile_ir_is_type(v, ty);

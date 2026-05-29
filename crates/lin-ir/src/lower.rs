@@ -1725,14 +1725,12 @@ fn lower_function_expr_with_id(
         for (i, cap) in captures.iter().enumerate() {
             let cap_ty = cap.ty.clone();
             let cap_t = inner_builder.alloc_temp(cap_ty.clone());
-            // Env access is a raw struct load by index, NOT a Lin object field — use a
-            // concrete obj_ty so codegen does not attempt to unbox it as Json.
-            inner_builder.emit(Instruction::FieldGet {
+            // Env access is a raw struct load by index, NOT a Lin object field access.
+            inner_builder.emit(Instruction::EnvCapture {
                 dst: cap_t,
-                object: env_temp,
-                field: i.to_string(), // env field by index
-                obj_ty: Type::Null, // non-union sentinel: codegen must not unbox env
-                result_ty: cap_ty,
+                env: env_temp,
+                index: i as u32,
+                ty: cap_ty,
             });
             inner_builder.slots.insert(cap.outer_slot, cap_t);
         }
@@ -1741,15 +1739,17 @@ fn lower_function_expr_with_id(
     inner_builder.push_scope();
     let body_ty = body.ty();
     let raw_ret = lower_expr(body, &mut inner_builder, ctx);
-    // Coerce the body result to the function's declared return type when they differ
-    // (e.g. a body computing a concrete Int in a function declared to return Json must
-    // box, since the LLVM signature uses the declared return type).
+    // Closures use a UNIFORM boxed ABI: they always return Json (TaggedVal*), so a closure
+    // value can be called through an opaque `Function` type without knowing its concrete
+    // return type (the indirect call site unboxes). Non-closure top-level functions keep
+    // their declared concrete return (they are only called Direct, with exact signatures).
+    let effective_ret = if is_closure { Type::TypeVar(u32::MAX) } else { ret_type.clone() };
     let ret_temp = if !inner_builder.is_current_block_terminated()
-        && type_repr_differs(&body_ty, ret_type)
+        && type_repr_differs(&body_ty, &effective_ret)
     {
-        let dst = inner_builder.alloc_temp(ret_type.clone());
+        let dst = inner_builder.alloc_temp(effective_ret.clone());
         inner_builder.emit(Instruction::Coerce {
-            dst, src: raw_ret, from_ty: body_ty.clone(), to_ty: ret_type.clone(),
+            dst, src: raw_ret, from_ty: body_ty.clone(), to_ty: effective_ret.clone(),
         });
         dst
     } else {
@@ -1761,6 +1761,7 @@ fn lower_function_expr_with_id(
         inner_builder.terminate(Terminator::Return(Some(ret_temp)));
     }
 
+    inner_builder.ret_ty = effective_ret;
     let inner_fn = inner_builder.finish();
     ctx.pending_functions.push(inner_fn);
 

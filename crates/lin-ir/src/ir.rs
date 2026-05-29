@@ -148,6 +148,9 @@ pub enum Instruction {
     IndexSet { object: Temp, key: Temp, value: Temp, obj_ty: Type, key_ty: Type, val_ty: Type },
     /// result = object.field  — known-shape field access
     FieldGet { dst: Temp, object: Temp, field: String, obj_ty: Type, result_ty: Type },
+    /// result = env[index]  — load a captured value from a closure's environment struct
+    /// (raw pointer load at byte offset 8 + index*8), NOT a Lin object field access.
+    EnvCapture { dst: Temp, env: Temp, index: u32, ty: Type },
     /// Increment refcount of a heap value (string, array, object, closure env).
     Retain { val: Temp, ty: Type },
     /// Decrement refcount; free if zero. Only emitted for owned values.
