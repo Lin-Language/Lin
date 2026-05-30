@@ -112,16 +112,18 @@ Variables are **slot-indexed** rather than name-indexed. `LocalGet { slot }` ref
 
 ### Key checker passes
 
+The `Checker` is one `impl` split across a `checker/` module tree by concern: `checker/mod.rs` (struct + `check_module` + module-level passes), `stmt.rs`, `expr.rs` (expression inference), `ops.rs` (binary/unary), `call.rs`, `function.rs`, `pattern.rs`, `intrinsics.rs`, `helpers.rs` (free functions). The passes below cross-cut those files.
+
 | Pass | Where | What |
 |------|-------|-------|
 | Type resolution | `resolve.rs` | Converts surface `TypeExpr` → internal `Type`; handles generic substitution |
-| Bidirectional inference | `checker.rs` | `check(expr, expected)` pushes types down; `infer(expr) → Type` synthesises bottom-up |
+| Bidirectional inference | `checker/expr.rs` | `check(expr, expected)` pushes types down; `infer(expr) → Type` synthesises bottom-up |
 | Numeric widening | `widen.rs` | Binary ops emit a `Coerce` node when one operand needs widening |
 | Structural compatibility | `compat.rs` | `is_compatible(value_ty, target_ty)` — used for assignments, call-site checking |
-| Flow-sensitive narrowing | `checker.rs` | After `is`/`has` tests, refines union types in true branches |
+| Flow-sensitive narrowing | `checker/expr.rs` | After `is`/`has` tests, refines union types in true branches |
 | Exhaustiveness checking | `exhaustiveness.rs` | Maranget matrix-decomposition algorithm; produces a counterexample witness if non-exhaustive |
 | TypeVar zonking | `zonk.rs` | Post-inference walk that replaces all solved `TypeVar(id)` with their concrete types; unsolved vars are errors |
-| Closure analysis | `checker.rs` | Identifies free variables; mutable `var` captures become heap cells (`is_mutable: true`) |
+| Closure analysis | `checker/function.rs` | Identifies free variables; mutable `var` captures become heap cells (`is_mutable: true`) |
 
 ### "Did you mean" diagnostics
 
@@ -505,13 +507,13 @@ pub struct CompileOptions {
 
 1. Add a variant to `Type` in `lin-check/src/types.rs`.
 2. Add the `Display` arm and serde derives (already derived).
-3. Handle it in `resolve.rs` (surface `TypeExpr` → `Type`), `compat.rs` (compatibility), `widen.rs` (numeric widening if applicable), and `checker.rs` (infer/check).
+3. Handle it in `resolve.rs` (surface `TypeExpr` → `Type`), `compat.rs` (compatibility), `widen.rs` (numeric widening if applicable), and `checker/expr.rs` (infer/check).
 4. Add the LLVM type mapping in `codegen/types.rs`:`llvm_type()`.
 5. Add runtime support in `lin-runtime` if heap allocation is needed.
 
 ### Adding a new intrinsic
 
-1. Register the name and arity in `lin-check/src/checker.rs`:`register_intrinsics()`.
+1. Register the name and arity in `lin-check/src/checker/intrinsics.rs`:`register_intrinsics()`.
 2. Map its name to an `Intrinsic` variant in `lin-ir/src/lower.rs`:`lower_intrinsic_call` (adding the variant to `lin-ir/src/ir.rs` if new).
 3. Add a `compile_ir_intrinsic` arm in `lin-codegen/src/codegen/intrinsics.rs`.
 4. If it needs a new runtime function: add it to the appropriate `lin-runtime/src/*.rs` module, declare it in `RuntimeFns::new()` (`codegen/runtime.rs`), and call it via `self.rt.<name>`.
