@@ -242,6 +242,14 @@ pub enum Instruction {
     CellGet { dst: Temp, cell: Temp, ty: Type },
     /// *cell = value  (update a captured `var` cell in place).
     CellSet { cell: Temp, value: Temp, ty: Type },
+    /// Release the cell's owned VALUE (`*cell`, tag-aware/concrete per `ty`), then free the
+    /// cell allocation itself (`lin_cell_free`). Emitted ONCE at the creating function's scope
+    /// exit, ONLY for cells the lowerer has PROVEN non-escaping: every closure that captured
+    /// the cell was lowered as a synchronous, non-retained argument to a known consuming
+    /// combinator (for/while/map/filter/reduce). Reclaims the per-call cell + its current value
+    /// (fixing the captured-cell leak). Never emitted for an escaping cell (would be a
+    /// use-after-free when a surviving closure later reads it).
+    FreeCell { cell: Temp, ty: Type },
     /// Increment refcount of a heap value (string, array, object, closure env).
     Retain { val: Temp, ty: Type },
     /// Decrement refcount; free if zero. Only emitted for owned values.

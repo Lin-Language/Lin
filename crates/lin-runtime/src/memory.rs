@@ -17,6 +17,24 @@ pub extern "C" fn lin_alloc(size: usize) -> *mut u8 {
     }
 }
 
+/// Free a captured-`var` heap cell allocated by codegen via `lin_alloc(size)`.
+///
+/// A cell is a raw `size`-byte allocation (8 or 16 bytes, align 8) with NO refcount header:
+/// it just holds the current value of a mutably-captured `var`, shared by reference among
+/// the closures that capture it. The IR-level `FreeCell` instruction releases the cell's
+/// owned VALUE first (via the tag-aware / concrete release path), then calls this to reclaim
+/// the cell allocation itself. Only emitted for cells the lowerer has PROVEN non-escaping
+/// (every capturing closure is a synchronous, non-retained combinator callback argument), so
+/// the pointer is unique and dead at this point. Null- and zero-size-safe.
+#[no_mangle]
+pub unsafe extern "C" fn lin_cell_free(ptr: *mut u8, size: usize) {
+    if ptr.is_null() || size == 0 {
+        return;
+    }
+    let layout = std::alloc::Layout::from_size_align_unchecked(size, 8);
+    std::alloc::dealloc(ptr, layout);
+}
+
 /// Release a closure struct.
 ///
 /// Closure layout (40 bytes, all fields written by compile_closure in codegen):
