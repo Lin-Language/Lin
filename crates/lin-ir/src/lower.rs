@@ -138,6 +138,21 @@ pub fn lower_import_module(module: &TypedModule, module_key: &str) -> LinModule 
     }
     ctx.global_fn_slots = global_fn_slots.clone();
 
+    // Register every top-level NON-FUNCTION `val` so references to it from inside an exported
+    // function body resolve to its zero-arg `{module_key}_{name}__val` wrapper (emitted below),
+    // exactly as a *cross-module* importer would resolve the binding. An imported module has no
+    // `main`, so unlike `lower_module` it cannot publish these to LLVM globals + module-init;
+    // instead each read recomputes the value through its wrapper (cheap, and the same recompute
+    // contract the importing module already relies on). This MUST run before lowering function
+    // bodies (and before emitting the wrappers, whose initialisers may reference sibling vals).
+    for stmt in &module.statements {
+        if let TypedStmt::Val { slot, value, ty, name: Some(name), .. } = stmt {
+            if matches!(value, TypedExpr::Function { .. }) { continue; }
+            let wrapper = format!("{}_{}__val", module_key, name);
+            ctx.import_val_slots.insert(*slot, (wrapper, ty.clone()));
+        }
+    }
+
     // Mutable-capture pre-scan (heap cells) — same as the main lowering.
     for stmt in &module.statements {
         collect_mutable_capture_slots_stmt(stmt, &mut ctx.mutable_cell_slots);
@@ -744,6 +759,31 @@ fn is_union_ty(ty: &Type) -> bool {
     matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_))
 }
 
+/// A concrete heap-allocated value type whose box wraps a refcounted heap pointer
+/// (Str/Array/FixedArray/Object/Iterator). Boxing one of these into a Json/union param
+/// (via Coerce → `lin_box_str`/`lin_box_array`/`lin_box_object`) allocates a FRESH 16-byte
+/// `TaggedVal*` shell whose inner is the (separately owned) heap pointer. Scalars
+/// (int/bool/float/null) are excluded: their boxes may be cached/immutable.
+fn is_heap_ty(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Str | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Iterator(_)
+    )
+}
+
+/// Whether passing an argument of `arg_ty` to a parameter of `param_ty` causes
+/// `lower_coerce_arg` to box a CONCRETE HEAP value into a fresh, caller-owned `TaggedVal*`
+/// shell. The shell's inner heap pointer is owned separately (released by the arg's own
+/// scope-exit release), so after the call the caller must free ONLY the shell.
+/// True iff: param is union, arg is concrete heap. Excludes already-union args (the box
+/// belongs to someone else) and scalar args (cached boxes).
+fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool {
+    match param_ty {
+        Some(p) => is_union_ty(p) && !is_union_ty(arg_ty) && is_heap_ty(arg_ty),
+        None => false,
+    }
+}
+
 /// Retain a Function-typed argument that is NOT a freshly-made closure before passing it
 /// to a call. AST-compiled callees release their Function-typed parameters at return; a
 /// borrowed (non-fresh) closure must be retained to balance that, while a fresh closure's
@@ -775,6 +815,26 @@ fn expr_is_fresh_alloc(expr: &TypedExpr) -> bool {
         TypedExpr::Block { expr, .. } => expr_is_fresh_alloc(expr),
         TypedExpr::Coerce { expr, .. } => expr_is_fresh_alloc(expr),
         _ => false,
+    }
+}
+
+/// After a (non-tail) call, free the 16-byte `TaggedVal*` SHELL of each argument box that
+/// WE freshly allocated by coercing a concrete heap value into a Json/union parameter (see
+/// `arg_box_is_caller_owned_shell`). Json/union params are BORROWED: the callee never
+/// releases them (`lower_function_expr_with_id`'s param scope only registers Function-typed
+/// params for release — the universal convention for every Lin function, incl. stdlib
+/// for/map/filter/reduce), so the caller owns and must reclaim the shell.
+///
+/// Frees only the shell, never the inner heap payload (that pointer is owned separately and
+/// released by the arg's own scope-exit release — freeing it here would double-free).
+///
+/// Uses `FreeBoxShellIfDistinct` against the call result `dst`: a callee that simply returns
+/// its Json param (e.g. an identity/pass-through) hands the very same box back as the result,
+/// which the caller now owns (`register_owned(dst)`) and will release later — freeing that
+/// shell here would corrupt the returned value, so we skip it when the shell == result.
+fn free_arg_box_shells(shell_boxes: &[Temp], dst: Temp, builder: &mut FuncBuilder) {
+    for &shell in shell_boxes {
+        builder.emit(Instruction::FreeBoxShellIfDistinct { val: shell, other: dst });
     }
 }
 
@@ -1133,15 +1193,42 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             if let Some(cell_ty) = builder.cell_slots.get(slot).cloned() {
                 if let Some(&cell) = builder.slots.get(slot) {
                     let v = coerce_to_slot_type(val_temp, &value.ty(), &cell_ty, builder);
+                    // When the slot is a union and the value was concrete, `coerce_to_slot_type`
+                    // allocated a FRESH transient `TaggedVal*` box `v` wrapping the raw value (the
+                    // raw value keeps its own +1, released at scope exit). We clone `v` once for the
+                    // cell's owned reference and once for the assignment result, then free the
+                    // orphaned `v` shell (its inner is owned by the raw value's scope-exit release).
+                    // Mirrors the Var-init path's `coerce_and_own_store` and the global path below.
+                    let made_fresh_box = is_union_ty(&cell_ty)
+                        && !is_union_ty(&value.ty())
+                        && type_repr_differs(&value.ty(), &cell_ty);
                     // The cell owns an INDEPENDENT reference to its value: take an owned copy on
                     // store so it survives the producing scope's own release, and codegen
                     // releases the cell's OLD reference on reassignment (fixing the
                     // per-reassignment leak). Concrete rc: retain `v` in place (the stored
                     // pointer is `v` with rc+1). Union: clone the box (`stored` is a fresh
                     // TaggedVal* the cell exclusively owns) so release-old never frees a
-                    // borrowed box. The LocalSet expression result stays `v` (a borrowed view).
+                    // borrowed box.
                     let stored = own_for_store(v, &cell_ty, builder);
-                    builder.emit(Instruction::CellSet { cell, value: stored, ty: cell_ty });
+                    builder.emit(Instruction::CellSet { cell, value: stored, ty: cell_ty.clone() });
+                    // The assignment EXPRESSION result must be an INDEPENDENTLY-owned value (not the
+                    // transient box `v`): a discarding caller (e.g. the `for` callback-return
+                    // release) can then reclaim it without touching the cell's distinct reference.
+                    // `own_for_read` clones the box (union) / retains (concrete rc) and registers it
+                    // for scope-exit release.
+                    if needs_owning(&cell_ty) {
+                        let result = own_for_read(v, &cell_ty, builder);
+                        // Free the transient coercion box shell AFTER both clones read it (freeing
+                        // earlier would be a use-after-free of the shell). A fresh box implies a
+                        // union slot, so this only runs on the owning path. `result` is a distinct
+                        // box, so freeing `v`'s shell can't touch it.
+                        if made_fresh_box {
+                            builder.emit(Instruction::FreeBoxShell { val: v });
+                        }
+                        return result;
+                    }
+                    // Non-owning cell: `made_fresh_box` is impossible (it requires a union slot),
+                    // so there is no transient box to free and `v` is the raw value itself.
                     return v;
                 }
             }
@@ -1150,6 +1237,16 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // to the global's declared representation first.
             if let Some(gty) = ctx.global_val_slots.get(slot).cloned() {
                 let v = coerce_to_slot_type(val_temp, &value.ty(), &gty, builder);
+                // When the slot is a union and the value was concrete, `coerce_to_slot_type`
+                // allocated a FRESH transient `TaggedVal*` box `v` wrapping the raw value (the
+                // raw value keeps its own +1, released at scope exit). Below we clone `v` once for
+                // the global's owned reference and once for the assignment result; the original
+                // `v` shell is then an orphan and must have its 16-byte shell freed (its inner is
+                // owned by the raw value's scope-exit release, NOT by `v`). Mirrors the Var-init
+                // path's `coerce_and_own_store`. When no fresh box was made (already-union value,
+                // or non-union slot), nothing extra is freed.
+                let made_fresh_box =
+                    is_union_ty(&gty) && !is_union_ty(&value.ty()) && type_repr_differs(&value.ty(), &gty);
                 // The global owns an INDEPENDENT reference to its value (symmetric owning model,
                 // mirroring the captured-cell path above). For unions this CLONES the box
                 // (`own_for_store` → `CloneBox`/`lin_tagged_clone`) so the global gets its OWN
@@ -1165,8 +1262,19 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 // box (union) / retains (concrete rc) and registers it for scope-exit release, so
                 // when the result is NOT discarded by a loop it is still reclaimed at teardown.
                 if needs_owning(&gty) {
-                    return own_for_read(v, &gty, builder);
+                    let result = own_for_read(v, &gty, builder);
+                    // Free the transient coercion box shell AFTER cloning it for both the store
+                    // (`own_for_store`) and the result (`own_for_read`) — freeing it earlier would
+                    // be a use-after-free of the shell those clones read. A fresh box implies a
+                    // union slot, so this only runs on the owning path here. (`result` is a
+                    // distinct, independently-owned box, so freeing `v`'s shell can't touch it.)
+                    if made_fresh_box {
+                        builder.emit(Instruction::FreeBoxShell { val: v });
+                    }
+                    return result;
                 }
+                // Non-owning slot: `made_fresh_box` is impossible (it requires a union slot), so
+                // there is no transient box to free and `v` is the raw value itself.
                 return v;
             }
             builder.slots.insert(*slot, val_temp);
@@ -1481,12 +1589,16 @@ fn lower_call(
         // Imported function: call the compiled symbol by its mangled name, boxing
         // concrete args passed to Json/union-typed parameters.
         if let Some((sym, param_tys)) = ctx.import_fn_slots.get(slot).cloned() {
+            let mut shell_boxes: Vec<Temp> = Vec::new();
             let lowered_args: Vec<Temp> = args
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
                     let arg = lower_call_arg(a, param_tys.get(i), builder, ctx);
                     retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
+                    if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
+                        shell_boxes.push(arg);
+                    }
                     arg
                 })
                 .collect();
@@ -1504,6 +1616,7 @@ fn lower_call(
                 args: lowered_args,
                 ret_ty: result_type.clone(),
             });
+            free_arg_box_shells(&shell_boxes, dst, builder);
             builder.register_owned(dst, result_type.clone());
             return dst;
         }
@@ -1515,12 +1628,16 @@ fn lower_call(
                 Type::Function { params, .. } => params,
                 _ => vec![],
             };
+            let mut shell_boxes: Vec<Temp> = Vec::new();
             let lowered_args: Vec<Temp> = args
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
                     let arg = lower_call_arg(a, param_tys.get(i), builder, ctx);
                     retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
+                    if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
+                        shell_boxes.push(arg);
+                    }
                     arg
                 })
                 .collect();
@@ -1537,6 +1654,10 @@ fn lower_call(
             // than the current function — so it can never use the self-recursive TailCall fast
             // path (which jumps to the current function's entry expecting all parameters).
             if is_tail && !is_default_fill {
+                // A tail call has no "after" block in which to free arg-box shells; the box is
+                // consumed by the jump. A boxed concrete-heap arg in tail position is rare
+                // (would require a self-recursive function taking a Json param a concrete heap
+                // value is passed to), and the small per-tail-call shell leak is left unfixed.
                 builder.terminate(Terminator::TailCall { args: lowered_args.clone() });
                 // Dead block to keep IR valid.
                 let post = builder.alloc_block("tco_post");
@@ -1551,6 +1672,7 @@ fn lower_call(
                 args: lowered_args,
                 ret_ty: result_type.clone(),
             });
+            free_arg_box_shells(&shell_boxes, dst, builder);
             builder.register_owned(dst, result_type.clone());
             return dst;
         }
@@ -2529,6 +2651,14 @@ fn lower_match_pattern(
         TypedMatchPattern::Is(tp @ TypedPattern::Object { .. }) => {
             lower_object_pattern_test(tp, scrut, builder, ctx)
         }
+        // `is <name>` (a binding) and `is _` (wildcard) match ANY value unconditionally —
+        // they are named/anonymous catch-alls, not type checks. The generic arm below would
+        // call pattern_type_check, which returns the binding's declared type (= the
+        // scrutinee's static type, often Json) and emit an `IsType` tag check that can fail
+        // for a concrete value inside a Json scrutinee (e.g. `match req["path"] is p when …`
+        // never matched). Bindings always match; the value is bound in lower_match_bindings.
+        TypedMatchPattern::Is(TypedPattern::Binding(..))
+        | TypedMatchPattern::Is(TypedPattern::Wildcard(..)) => PatternTest::Always,
         TypedMatchPattern::Is(tp) => {
             let (check_ty, _) = pattern_type_check(tp);
             let dst = builder.alloc_temp(Type::Bool);
@@ -2632,8 +2762,22 @@ fn lower_typed_pattern_bindings(
 ) {
     match pattern {
         TypedPattern::Binding(slot, ty, _) => {
+            // The match scrutinee is boxed to Json/union (`box_to_json` at match entry).
+            // If this binding has a CONCRETE type (e.g. `is n` where n: Int32), binding it
+            // directly to the boxed pointer would later reinterpret the pointer as the
+            // scalar (ptrtoint) — so a guard like `when n > 5` compares a heap address, not
+            // the value, and is effectively always true. Unbox via Coerce when the
+            // scrutinee is boxed but the binding is concrete; a plain Bind (alias) is
+            // correct when types already match (e.g. a Json scrutinee bound to Json).
+            let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
             let t = builder.alloc_temp(ty.clone());
-            builder.emit(Instruction::Bind { dst: t, src: scrut, ty: ty.clone() });
+            if is_union_ty(&scrut_ty) && !is_union_ty(ty) {
+                builder.emit(Instruction::Coerce {
+                    dst: t, src: scrut, from_ty: scrut_ty, to_ty: ty.clone(),
+                });
+            } else {
+                builder.emit(Instruction::Bind { dst: t, src: scrut, ty: ty.clone() });
+            }
             builder.slots.insert(*slot, t);
         }
         TypedPattern::Object { fields, .. } => {

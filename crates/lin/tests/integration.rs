@@ -242,6 +242,26 @@ print(toString([1, 2] == [2, 1]))
     assert_eq!(output, vec!["true", "true", "true", "true", "true", "false"]);
 }
 
+// Arrays whose ELEMENTS are heap values (strings, nested arrays, objects) must compare
+// STRUCTURALLY, like the top-level object/array equality above. `lin_array_eq`
+// (lin-runtime/src/array.rs) now recurses via `lin_tagged_eq` per element, so two
+// distinct-but-equal heap elements (e.g. two "a" strings) compare equal. Scalar-element
+// arrays are unaffected (their payloads are inline values, compared by value).
+#[test]
+fn test_array_equality_with_heap_elements() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+print(toString(["a", "b"] == ["a", "b"]))
+print(toString(["a", "b"] == ["a", "c"]))
+print(toString([[1, 2], [3]] == [[1, 2], [3]]))
+print(toString([[1], [2, 3]] == [[1], [2, 4]]))
+print(toString([{ "k": 1 }] == [{ "k": 1 }]))
+print(toString([{ "k": 1 }] == [{ "k": 2 }]))
+"#);
+    assert_eq!(output, vec!["true", "false", "true", "false", "true", "false"]);
+}
+
 #[test]
 fn test_pattern_matching_is() {
     let output = run(r#"import { print } from "std/io"
@@ -382,6 +402,44 @@ print(toString(total))
 "#);
     // work(10) = 0+1+..+9 = 45; summed 5 times = 225.
     assert_eq!(output, vec!["225"]);
+}
+
+// Regression (call-arg-box leak): passing a CONCRETE array to a Json-typed param (`for`'s
+// iterable) inside an outer loop boxes the array into a fresh TaggedVal* shell each outer
+// iteration. The shell was never freed → one-box-per-iteration leak. Caller now frees the
+// shell after the call. This runs the nested loop under churn; correctness here also guards
+// against an over-eager shell free corrupting the borrowed array (double-free / wrong result).
+#[test]
+fn test_nested_for_over_concrete_array_arg_box() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/array"
+
+var k = 0
+val xs = [1, 2, 3]
+range(0, 5000).for(j => xs.for(s => k = k + 1))
+print(toString(k))
+"#);
+    assert_eq!(output, vec!["15000"]);
+}
+
+// Regression (call-arg-box leak): a concrete Object passed to a Json-typed param (`keys`)
+// repeatedly under churn. Each call boxes the object into a fresh shell; the shell free must
+// not touch the object's inner payload (which the object's own scope-exit release owns).
+#[test]
+fn test_object_to_json_param_under_churn() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for, length } from "std/array"
+import { keys } from "std/object"
+
+val o = {"a": 1, "b": 2}
+var n = 0
+range(0, 5000).for(j => n = n + length(keys(o)))
+print(toString(n))
+"#);
+    // keys(o) has 2 entries; summed 5000 times = 10000.
+    assert_eq!(output, vec!["10000"]);
 }
 
 #[test]
@@ -1119,6 +1177,39 @@ print(toString(scale(5, 3)))
     let output = run(&main);
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(output, vec!["10", "15"]);
+}
+
+#[test]
+fn test_imported_fn_uses_module_level_val() {
+    // Regression: a top-level non-function `val` referenced inside an EXPORTED function
+    // mis-lowered in the import path (lower_import_module never registered the val, so the
+    // reference resolved to an unmaterialised temp → codegen panic "undefined rhs temp").
+    // Covers: float val, string val, a val referencing another val, and a val used in
+    // multiple exported functions — all read through their `__val` wrappers.
+    let dir = std::env::temp_dir().join(format!("lin_modval_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "val K = 0.1\n\
+         val GREETING = \"Hi, \"\n\
+         val BASE = 10\n\
+         val DOUBLE = BASE * 2\n\
+         export val f = (x: Float64): Float64 =>\n  \
+           if x == 1.0 then x + K\n  \
+           else x\n\
+         export val greet = (name: String): String => \"${GREETING}${name}\"\n\
+         export val addBase = (x: Int32): Int32 => x + BASE\n\
+         export val addDouble = (x: Int32): Int32 => x + DOUBLE\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ f, greet, addBase, addDouble }} from "{}/lib"
+print(toString(f(1.0)))
+print(greet("World"))
+print(toString(addBase(5)))
+print(toString(addDouble(5)))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["1.1", "Hi, World", "15", "25"]);
 }
 
 #[test]
@@ -2890,6 +2981,36 @@ print(slice(words, 0, 2)[1])   // b
 }
 
 #[test]
+fn test_concat_preserves_flat_element_type() {
+    // concat dispatches on element type: two flat UInt8[] yield a flat UInt8[], so a
+    // byte-level consumer (u32FromBe reads `(*arr).data as *const u8`) sees packed bytes.
+    // Previously concat always built a TAGGED array (16-byte elements), so u32FromBe read
+    // TaggedVal bytes and decoded garbage (e.g. 33554432 instead of 2864434397).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { concat, length } from "std/array"
+import { u32FromBe } from "std/bytes"
+
+val a: UInt8[] = [170, 187]
+val b: UInt8[] = [204, 221]
+val c = concat(a, b)
+print(toString(length(c)))          // 4
+print(toString(c[0]))               // 170 (element access)
+print(toString(u32FromBe(c, 0)))    // 2864434397 = 0xAABBCCDD (byte-level read)
+
+val ia: Int32[] = [10, 20]
+print(toString(concat(ia, [30, 40])[2]))   // 30 (Int32[] stays flat)
+
+val sa = ["x", "y"]
+print(concat(sa, ["z"])[2])         // z (tagged stays tagged)
+
+val flat: UInt8[] = [1, 2]
+print(toString(concat(flat, ["a"])[0]))  // 1 (mixed → tagged, value preserved)
+"#);
+    assert_eq!(out, vec!["4", "170", "2864434397", "30", "z", "1"]);
+}
+
+#[test]
 fn test_u32_be_round_trip() {
     // std/bytes: a UInt32 survives a big-endian write then read.
     let out = run(r#"import { print } from "std/io"
@@ -3217,4 +3338,113 @@ sleepMicros(500)
 print("done")
 "#);
     assert_eq!(out, vec!["done"]);
+}
+
+#[test]
+fn test_concrete_string_into_json_var_loop() {
+    // Regression: reassigning a fresh CONCRETE value (toString -> String) into a Json/union
+    // `var` inside a loop boxes the value via Coerce, producing a transient TaggedVal* shell.
+    // The LocalSet store path used to clone that box for the global/cell AND for the result
+    // but never freed the transient shell, leaking ~36 bytes per iteration. The fix frees the
+    // shell (FreeBoxShell) after both clones. This asserts correctness: the var must hold the
+    // last assigned value and the program must not crash (no use-after-free / double-free).
+    let out = run(r#"import { range, for } from "std/array"
+import { toString } from "std/string"
+import { print } from "std/io"
+
+var last: Json = ""
+range(0, 5).for(i => last = toString(i))
+print(toString(last))
+"#);
+    assert_eq!(out, vec!["4"]);
+}
+
+#[test]
+fn test_concrete_object_into_json_var_loop() {
+    // Regression companion to the String case: a fresh concrete Object boxed into a Json var
+    // each iteration. Exercises the same transient-coercion-box free path with an Object payload
+    // and confirms the final stored value is correct.
+    let out = run(r#"import { range, for } from "std/array"
+import { toString } from "std/string"
+import { print } from "std/io"
+
+var last: Json = null
+range(0, 5).for(i => last = { "n": i })
+print(toString(last))
+"#);
+    assert_eq!(out, vec![r#"{"n": 4}"#]);
+}
+
+#[test]
+fn test_flat_array_arg_used_twice_no_double_free() {
+    // Regression: a flat scalar array (Float64[]) passed in two argument positions, or two
+    // separate flat-array literals, must not be released more times than it was retained.
+    // The callee `dot` reads each heap parameter twice (`a[0]`, `a[1]`); each read lowered to
+    // a Retain + a scope-exit Release. The RC-elision pass paired BOTH Retains to the SAME
+    // first Release (a HashSet deduped the second elision), eliding two Retains but only one
+    // Release — leaving one extra Release and a heap-use-after-free in lin_array_release. The
+    // functional guard here (prints 25.0 instead of crashing) catches it deterministically;
+    // the ASan CI leg surfaces the underlying UAF.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val dot = (a: Float64[], b: Float64[]): Float64 => a[0] * b[0] + a[1] * b[1]
+val v: Float64[] = [3.0, 4.0]
+print(toString(dot(v, v)))
+"#);
+    assert_eq!(out, vec!["25.0"]);
+
+    // Two separate flat-array literals exercise the same balance (each callee param read twice,
+    // distinct caller-owned allocations).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val dot = (a: Float64[], b: Float64[]): Float64 => a[0] * b[0] + a[1] * b[1]
+print(toString(dot([3.0, 4.0], [3.0, 4.0])))
+"#);
+    assert_eq!(out, vec!["25.0"]);
+
+    // A single flat-array argument whose parameter is read more than once is the minimal form
+    // of the same bug (one alloc, callee consumes one extra reference).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val sum2 = (a: Float64[]): Float64 => a[0] + a[1]
+val v: Float64[] = [3.0, 4.0]
+print(toString(sum2(v)))
+"#);
+    assert_eq!(out, vec!["7.0"]);
+}
+
+#[test]
+fn test_match_binding_pattern_matches_and_unboxes() {
+    // Two bugs in `is <binding>` match arms:
+    // (1) the binding was bound to the BOXED scrutinee pointer, so a concrete binding
+    //     (`is n` where n: Int32) used in a guard reinterpreted the pointer as the scalar
+    //     (`ptrtoint`) — `when n > 5` compared a heap address (always true).
+    // (2) the binding pattern was lowered as a type-CHECK (IsType against the binding's
+    //     declared type), so `match req["path"] is p when ...` never matched a concrete
+    //     value inside a Json scrutinee. A binding is a named catch-all: it always matches.
+    let out = run(r#"import { print } from "std/io"
+val f = (x: Int32): String =>
+  match x
+    is n when n > 5 => "big"
+    is m when m > 0 => "pos"
+    else => "other"
+print(f(10))
+print(f(3))
+print(f(0 - 1))
+"#);
+    assert_eq!(out, vec!["big", "pos", "other"]);
+
+    // A binding over a Json scrutinee mixed with a literal arm: the binding must match
+    // unconditionally (it was lowered as a type-check that failed for a concrete value
+    // inside a Json scrutinee, so the literal-or-else path was taken instead).
+    // `examples/web-server/router.test.lin` exercises the full guarded router shape.
+    let out = run(r#"import { print } from "std/io"
+val classify = (req: Json): String =>
+  match req["kind"]
+    is "a" => "is-a"
+    is other => "bound-other"
+print(classify({ "kind": "a" }))
+print(classify({ "kind": "z" }))
+"#);
+    assert_eq!(out, vec!["is-a", "bound-other"]);
 }

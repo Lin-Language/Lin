@@ -688,23 +688,14 @@ Tracked here so they don't get lost:
 - Full pairwise numeric widening matrix and explicit-cast catalogue.
 - Multi-error reporting (recoverable parse/check).
 - Mutual tail-call optimisation.
+- **Real OS-thread concurrency.** The async surface (§32) is fully specified and
+  wired through checker/IR/codegen, but the runtime (`async_rt.rs`) is a
+  synchronous stub — no actual threads. Making it real is gated on catchable
+  faults at the thread boundary, a thread-safe RC story, and deferred thunk
+  evaluation in codegen. Phased design + plan in **`docs/ASYNC_DESIGN.md`**.
 
-## Known bugs (found by the raspberry-controller capstone)
+## CI follow-up
 
-- **Top-level non-function `val` referenced inside an *imported* function mis-lowers.**
-  A module-level `val STEP = 0.1` used in the body of an exported function panics the
-  IR→codegen path ("Binary: undefined rhs temp") when that module is *imported* by
-  another (the main-module path is fine). Minimal repro: a module exporting
-  `val K = 0.1` + `export val f = (x) => if cond then x + K else x`, imported and
-  called from another file. Workaround: inline the constant. Root cause is in
-  `lower_import_module` / import codegen not materialising the top-level val as a temp
-  for imported function bodies. (`examples/raspberry-controller` inlines `0.1` to avoid it.)
-- **`std/array.concat` does not preserve a flat `UInt8[]`'s element width** — it builds
-  a tagged result, so concatenating byte buffers then indexing/decoding reads wrong
-  bytes. Assemble byte buffers with `push` instead. (Flagged earlier; still open.)
-- **`examples/` tests are not run by CI** because two pre-existing example tests fail:
-  `examples/web-server/router.test.lin` (a `:id` path parameter routes to 404 instead
-  of matching) and `examples/matrix/vector.test.lin` (`malloc(): unaligned tcache chunk
-  detected` — a real heap-corruption bug). Once both are fixed, add a
-  `lin test examples/ --timeout 120` step to CI (the other example tests, incl.
-  `raspberry-controller`, already pass).
+- **Wire `examples/` tests into CI.** All example tests now pass; add a
+  `lin test examples/ --timeout 120` step (the two former blockers — the web-server
+  `:id` route and the matrix `vector` heap corruption — are fixed).
