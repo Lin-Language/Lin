@@ -985,6 +985,27 @@ print(toString("z" > "a"))
 }
 
 #[test]
+fn test_string_vs_null_equality() {
+    // Regression: comparing a String to `null` (the ubiquitous `s != null` guard) must be a
+    // plain boolean, not a null-pointer deref. `lin_string_eq` previously dereferenced both
+    // operands unconditionally; a Lin `null` is a null pointer, so `"s" == null` / `s != null`
+    // crashed. Now null-safe (matching lin_object_eq / lin_array_eq).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val s = "hello"
+print(toString(s == null))
+print(toString(s != null))
+print(toString(null == s))
+
+val obj = { "k": "v" }
+print(toString(obj["k"] != null))
+print(toString(obj["missing"] != null))
+"#);
+    assert_eq!(output, vec!["false", "true", "false", "true", "false"]);
+}
+
+#[test]
 fn test_numeric_comparison() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -2627,6 +2648,42 @@ val tasks = parallel([
 print(toString(length(get(box))))
 "#);
     assert_eq!(output, vec!["6"]);
+}
+
+#[test]
+fn test_shared_rejects_non_accessor_op() {
+    // ADR-044: Shared<T> is accessor-only. Passing a Shared value to a non-accessor (here
+    // `push`, which wants an array/Json) is a compile-time type error — the Shared box never
+    // auto-unwraps to its inner type or to Json.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { shared } from "std/async"
+import { push } from "std/array"
+
+val s = shared([1, 2, 3])
+push(s, 7)
+print("unreachable")
+"#);
+    assert!(
+        err.contains("Shared"),
+        "expected a Shared-related type error, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_shared_get_result_is_usable_inner_type() {
+    // The flip side: get(s) yields the inner type, which IS usable with ordinary ops — proving
+    // the guard blocks the Shared box itself, not values copied out of it.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { shared, get } from "std/async"
+import { push, length } from "std/array"
+
+val s = shared([1, 2, 3])
+val snap = get(s)
+push(snap, 4)
+print(toString(length(snap)))
+"#);
+    assert_eq!(output, vec!["4"]);
 }
 
 #[test]

@@ -36,16 +36,20 @@ export val close = (w: Json): Null =>
 
 // Shared<T> — opt-in shared mutable state (ADR-043 §2.3.1). `shared` boxes a private copy;
 // `get` snapshots out, `set` copies in, `withLock` mutates in place under the write lock.
-export val shared = (v: Json): Json =>
+// Shared<T> accessors. Typed against the opaque `Shared` box so `Shared<T>` is preserved to
+// the caller and the accessor-only guard holds: a non-accessor op on a `Shared` value (push,
+// indexing, …) is a compile-time type error (ADR-044). `shared(v)` produces a `Shared`; the
+// other three only accept a `Shared` first argument.
+export val shared = (v: Json): Shared =>
   lin_shared(v)
 
-export val get = (s: Json): Json =>
+export val get = (s: Shared): Json =>
   lin_shared_get(s)
 
-export val set = (s: Json, v: Json): Null =>
+export val set = (s: Shared, v: Json): Null =>
   lin_shared_set(s, v)
 
-export val withLock = (s: Json, f: Json): Json =>
+export val withLock = (s: Shared, f: Function): Json =>
   lin_shared_with_lock(s, f)
 
 // Frozen<T> — opt-in shared READ-ONLY state (ADR-043 §2.3.2). Deep-freezes a transferable

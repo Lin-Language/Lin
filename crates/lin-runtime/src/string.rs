@@ -190,6 +190,11 @@ pub unsafe extern "C" fn lin_string_length(s: *const LinString) -> i32 {
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_eq(a: *const LinString, b: *const LinString) -> bool {
+    // Null-safe, matching lin_object_eq / lin_array_eq: a Lin `null` is a null pointer,
+    // and `"s" == null` / `s != null` must be a plain false — not a deref crash. Two nulls
+    // are equal (both the absent value); a string vs null is unequal.
+    if a == b { return true; }
+    if a.is_null() || b.is_null() { return false; }
     if (*a).len != (*b).len {
         return false;
     }

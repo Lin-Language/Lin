@@ -489,7 +489,10 @@ impl<'ctx> Codegen<'ctx> {
             Type::Str => CAP_STR,
             Type::Array(_) | Type::FixedArray(_) => CAP_ARRAY,
             Type::Object(_) => CAP_OBJECT,
-            Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Null => CAP_TAGGED,
+            // Shared<T> is a boxed TaggedVal*(TAG_SHARED); CAP_TAGGED routes it through
+            // lin_transfer_clone, whose TAG_SHARED arm shares the box by atomic-refcount bump
+            // (the nesting rule) rather than deep-copying through it.
+            Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Null | Type::Shared(_) => CAP_TAGGED,
             Type::Function { .. } | Type::Iterator(_) => CAP_OPAQUE,
             Type::Bool
             | Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64
