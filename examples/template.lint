@@ -1,3 +1,0 @@
-Hello, ${name}!
-You have ${stats.messages} unread messages.
-Your account is ${stats.active}.
