@@ -29,10 +29,15 @@ pub const TAG_UINT8: u8 = 10;
 pub const TAG_INT8: u8 = 11;
 pub const TAG_UINT16: u8 = 12;
 pub const TAG_INT16: u8 = 13;
-/// UInt64 — payload interpreted as `u64` (unsigned). All other unsigned widths
-/// (UInt8/16/32) are zero-extended and boxed as TAG_INT64 (always-positive i64), so
-/// this is the only tag whose payload must be read unsigned.
+/// UInt64 — payload interpreted as `u64` (unsigned). For *boxed scalars* all other unsigned
+/// widths (UInt8/16/32) are zero-extended and boxed as TAG_INT64 (always-positive i64), so
+/// for boxed scalars this is the only tag whose payload must be read unsigned. (As a *flat
+/// array elem_tag* it likewise marks unsigned-64-bit storage — shared numeric space.)
 pub const TAG_UINT64: u8 = 14;
+/// UInt32 flat-array elem_tag — marks a flat array whose raw elements are `u32`, so display/
+/// JSON reads them unsigned. (Boxed UInt32 *scalars* still use TAG_INT64 positive; this tag
+/// only ever appears as a flat-array elem_tag, never on a boxed TaggedVal.)
+pub const TAG_UINT32: u8 = 15;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

@@ -2407,6 +2407,64 @@ print(toString(w[1]))
 }
 
 #[test]
+fn test_uint32_flat_array_unsigned_display() {
+    // Regression: a flat UInt32[] whole-array toString must render elements UNSIGNED
+    // (4294967295), not as a signed -1. Single-element index must also be unsigned.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val a: UInt32[] = [4294967295, 1]
+print(toString(a))       // whole-array JSON
+print(toString(a[0]))    // single element (scalar box path)
+"#);
+    assert_eq!(out, vec!["[4294967295, 1]", "4294967295"]);
+}
+
+#[test]
+fn test_uint64_flat_array_unsigned_display() {
+    // A flat UInt64[] renders its high-bit element unsigned, not negative.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val b: UInt64[] = [18446744073709551615, 0]
+print(toString(b))
+print(toString(b[0]))
+"#);
+    assert_eq!(out, vec!["[18446744073709551615, 0]", "18446744073709551615"]);
+}
+
+#[test]
+fn test_int32_flat_array_signed_display_unchanged() {
+    // Guard: signed Int32[] still renders signed (negative) — the UInt32/UInt64 unsigned
+    // fix must not regress the signed flat families. (Int64 negative-literal display via
+    // `0 - 1` has a separate, pre-existing literal-width bug unrelated to this change, so
+    // it is not asserted here.)
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val s: Int32[] = [0 - 1, 2]
+print(toString(s))
+print(toString(s[0]))
+"#);
+    assert_eq!(out, vec!["[-1, 2]", "-1"]);
+}
+
+#[test]
+fn test_uint32_flat_array_equality() {
+    // Structural equality over flat UInt32 arrays (exercises lin_flat_array_eq_u32).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val a: UInt32[] = [1, 4294967295]
+val b: UInt32[] = [1, 4294967295]
+val c: UInt32[] = [1, 3]
+print(toString(a == b))
+print(toString(a == c))
+"#);
+    assert_eq!(out, vec!["true", "false"]);
+}
+
+#[test]
 fn test_uint8_flat_array_equality() {
     // Structural equality over flat UInt8 arrays (exercises lin_flat_array_eq_u8).
     let out = run(r#"import { print } from "std/io"

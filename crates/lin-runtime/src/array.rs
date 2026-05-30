@@ -47,8 +47,8 @@ unsafe fn array_elem_layout(cap: u64) -> Layout {
 fn flat_elem_size_align(elem_tag: u8) -> (usize, usize) {
     use crate::tagged::*;
     match elem_tag {
-        TAG_INT32 | TAG_FLOAT32 => (4, 4),
-        TAG_INT64 | TAG_FLOAT64 => (8, 8),
+        TAG_INT32 | TAG_UINT32 | TAG_FLOAT32 => (4, 4),
+        TAG_INT64 | TAG_UINT64 | TAG_FLOAT64 => (8, 8),
         TAG_UINT8 | TAG_INT8 | TAG_BOOL => (1, 1),
         TAG_UINT16 | TAG_INT16 => (2, 2),
         // 0xFF and anything else: tagged 16-byte elements.
@@ -255,6 +255,27 @@ pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::
                 if elem_tag == TAG_UINT16 { lin_flat_array_push_u16(arr, v as u16); }
                 else { lin_flat_array_push_i16(arr, v as i16); }
             }
+            TAG_UINT32 => {
+                // A boxed UInt32 scalar is TAG_INT64-positive; read it back unsigned.
+                let v = match tag {
+                    TAG_INT32 => payload as i32 as u32,
+                    TAG_INT64 => payload as u32,
+                    TAG_UINT64 => payload as u32,
+                    TAG_FLOAT64 => f64::from_bits(payload) as u32,
+                    _ => 0,
+                };
+                lin_flat_array_push_u32(arr, v);
+            }
+            TAG_UINT64 => {
+                let v = match tag {
+                    TAG_INT32 => payload as i32 as i64 as u64,
+                    TAG_INT64 => payload,
+                    TAG_UINT64 => payload,
+                    TAG_FLOAT64 => f64::from_bits(payload) as u64,
+                    _ => 0,
+                };
+                lin_flat_array_push_u64(arr, v);
+            }
             _ => {}
         }
     }
@@ -456,6 +477,21 @@ pub unsafe extern "C" fn lin_array_get_tagged(arr: *const LinArray, idx: i64) ->
             (*tv)._pad = [0; 7];
             (*tv).payload = v as i64 as u64;
         }
+        TAG_UINT32 => {
+            // Zero-extend the u32 into a positive i64 box (matches the scalar boxing of
+            // UInt32, which uses TAG_INT64-positive). A raw u32 may exceed i32 range, so
+            // TAG_INT32 would render it signed — TAG_INT64 keeps it positive and exact.
+            let v = *((*arr).data as *const u32).add(idx as usize);
+            (*tv).tag = TAG_INT64;
+            (*tv)._pad = [0; 7];
+            (*tv).payload = v as u64;
+        }
+        TAG_UINT64 => {
+            let v = *((*arr).data as *const u64).add(idx as usize);
+            (*tv).tag = TAG_UINT64;
+            (*tv)._pad = [0; 7];
+            (*tv).payload = v;
+        }
         _ => {
             // Tagged array: elem is already a LinArrayElem (16 bytes) = TaggedVal layout.
             let elem = (*arr).data.add(idx as usize);
@@ -528,6 +564,8 @@ pub unsafe extern "C" fn lin_array_slice_dyn(arr: *const u8, start: i64, end: i6
         TAG_INT8 => lin_flat_array_slice_i8(lin_arr, start, end),
         TAG_UINT16 => lin_flat_array_slice_u16(lin_arr, start, end),
         TAG_INT16 => lin_flat_array_slice_i16(lin_arr, start, end),
+        TAG_UINT32 => lin_flat_array_slice_u32(lin_arr, start, end),
+        TAG_UINT64 => lin_flat_array_slice_u64(lin_arr, start, end),
         // Unknown tag: fall back to a tagged slice (treats elements as 16-byte TaggedVals).
         _ => lin_array_slice_tagged(lin_arr, start, end),
     };
@@ -1217,6 +1255,21 @@ flat_small_int!(i16, crate::tagged::TAG_INT16,
     lin_flat_array_set_i16, lin_flat_array_free_i16, lin_flat_array_alloc_filled_i16,
     lin_flat_array_concat_into_i16, lin_flat_array_eq_i16, lin_flat_array_slice_i16);
 
+// Unsigned 32/64-bit flat families. Same generated shape as the small-int families, but
+// elem_tag carries TAG_UINT32/TAG_UINT64 so display/JSON read the elements UNSIGNED.
+// (Signed i32/i64 keep their own families with TAG_INT32/TAG_INT64.) The macro generates
+// set+slice itself, so there is NO name collision with the flat_set_slice! families (those
+// only cover i32/i64/f32/f64 — distinct symbol names).
+flat_small_int!(u32, crate::tagged::TAG_UINT32,
+    lin_flat_array_alloc_u32, lin_flat_array_push_u32, lin_flat_array_get_u32,
+    lin_flat_array_set_u32, lin_flat_array_free_u32, lin_flat_array_alloc_filled_u32,
+    lin_flat_array_concat_into_u32, lin_flat_array_eq_u32, lin_flat_array_slice_u32);
+
+flat_small_int!(u64, crate::tagged::TAG_UINT64,
+    lin_flat_array_alloc_u64, lin_flat_array_push_u64, lin_flat_array_get_u64,
+    lin_flat_array_set_u64, lin_flat_array_free_u64, lin_flat_array_alloc_filled_u64,
+    lin_flat_array_concat_into_u64, lin_flat_array_eq_u64, lin_flat_array_slice_u64);
+
 /// Convert a flat u8 array to a tagged LinArray (each element tagged as TAG_INT32).
 /// Small integers widen to Int32 in the tagged (Json) representation.
 #[no_mangle]
@@ -1278,6 +1331,39 @@ pub unsafe extern "C" fn lin_flat_to_tagged_i16(flat: *const LinArray) -> *mut L
     tagged
 }
 
+/// Convert a flat u32 array to a tagged LinArray. Each element is zero-extended into a
+/// positive Int64 box (TAG_INT64), matching how a boxed UInt32 scalar is represented, so
+/// values above i32::MAX render unsigned (e.g. 4294967295) instead of negative.
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_to_tagged_u32(flat: *const LinArray) -> *mut LinArray {
+    let len = (*flat).len;
+    let tagged = lin_array_alloc(len.max(4));
+    let src = (*flat).data as *const u32;
+    for i in 0..len as usize {
+        let slot = (*tagged).data.add(i);
+        (*slot).tag = crate::tagged::TAG_INT64;
+        (*slot).payload = *src.add(i) as u64;
+    }
+    (*tagged).len = len;
+    tagged
+}
+
+/// Convert a flat u64 array to a tagged LinArray. Each element is tagged TAG_UINT64 so the
+/// payload is read back unsigned (matching the boxed UInt64 scalar representation).
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_to_tagged_u64(flat: *const LinArray) -> *mut LinArray {
+    let len = (*flat).len;
+    let tagged = lin_array_alloc(len.max(4));
+    let src = (*flat).data as *const u64;
+    for i in 0..len as usize {
+        let slot = (*tagged).data.add(i);
+        (*slot).tag = crate::tagged::TAG_UINT64;
+        (*slot).payload = *src.add(i);
+    }
+    (*tagged).len = len;
+    tagged
+}
+
 #[cfg(test)]
 mod free_layout_tests {
     use super::*;
@@ -1295,8 +1381,10 @@ mod free_layout_tests {
         assert_eq!(flat_elem_size_align(TAG_UINT16), (2, 2));
         assert_eq!(flat_elem_size_align(TAG_INT16), (2, 2));
         assert_eq!(flat_elem_size_align(TAG_INT32), (4, 4));
+        assert_eq!(flat_elem_size_align(TAG_UINT32), (4, 4));
         assert_eq!(flat_elem_size_align(TAG_FLOAT32), (4, 4));
         assert_eq!(flat_elem_size_align(TAG_INT64), (8, 8));
+        assert_eq!(flat_elem_size_align(TAG_UINT64), (8, 8));
         assert_eq!(flat_elem_size_align(TAG_FLOAT64), (8, 8));
         // Tagged arrays (0xFF) and anything unknown use the 16-byte element.
         assert_eq!(

@@ -514,6 +514,14 @@ unsafe fn array_to_json_string(arr: *const crate::array::LinArray) -> String {
                 let v = *((*arr).data as *const i16).add(i);
                 format!("{}", v)
             }
+            TAG_UINT32 => {
+                let v = *((*arr).data as *const u32).add(i);
+                format!("{}", v)
+            }
+            TAG_UINT64 => {
+                let v = *((*arr).data as *const u64).add(i);
+                format!("{}", v)
+            }
             _ => "null".to_string(),
         };
         parts.push(s);
@@ -619,6 +627,9 @@ unsafe fn tagged_to_key_string(tagged: *const TaggedVal) -> String {
                     TAG_INT8 => format!("i:{}", *((*arr).data as *const i8).add(i)),
                     TAG_UINT16 => format!("i:{}", *((*arr).data as *const u16).add(i)),
                     TAG_INT16 => format!("i:{}", *((*arr).data as *const i16).add(i)),
+                    // u32 zero-extends to a positive Int64 (matches flat→tagged boxing).
+                    TAG_UINT32 => format!("I:{}", *((*arr).data as *const u32).add(i) as u64),
+                    TAG_UINT64 => format!("U:{}", *((*arr).data as *const u64).add(i)),
                     _ => "N".to_string(),
                 };
                 parts.push(part);
