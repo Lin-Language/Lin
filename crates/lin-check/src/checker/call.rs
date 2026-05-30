@@ -3,10 +3,127 @@ use lin_parse::ast::Expr;
 
 use super::Checker;
 use super::helpers::{apply_type_subs, first_mutable_capture, integer_range, is_definitely_non_transferable};
+use crate::resolve::{error_type, json_type};
 use crate::typed_ir::*;
 use crate::types::Type;
 
 impl Checker {
+    /// `fromJson` special form (ADR-047). `T.fromJson(value)` desugars to a DotCall and
+    /// `fromJson(T, value)` to a Call; both reach here BEFORE arg0/receiver is inferred as a
+    /// value (a type name like `Person` is not a runtime value). Fires only when:
+    ///   * the callee/method surface name is `fromJson`, AND
+    ///   * arg0/receiver is `Expr::Ident(name)` that resolves in the TYPE namespace, AND
+    ///   * `fromJson` is not shadowed by a *local* (non-global) user binding.
+    /// Returns `None` to defer to the normal call path (so a user 2-arg `fromJson` value, or a
+    /// non-type arg0, behaves normally). Returns `Some(Err(..))` for a genuine misuse.
+    fn try_from_json_special_form(
+        &mut self,
+        type_arg: &Expr,
+        value_arg: &Expr,
+        span: Span,
+    ) -> Option<Result<TypedExpr, Diagnostic>> {
+        // User-shadowing guard: if `fromJson` is bound in a non-global scope, the user has
+        // their own local binding — defer to the normal call path entirely.
+        if let Some((depth, _)) = self.env.lookup_with_depth("fromJson") {
+            if depth > 0 {
+                return None;
+            }
+        }
+        // arg0 must be a bare identifier naming a type.
+        let type_name = match type_arg {
+            Expr::Ident(n, _) => n.as_str(),
+            _ => return None,
+        };
+        // Resolve in the type namespace. If it is not a known type, this is not a fromJson
+        // special form — defer (the normal path will report whatever is appropriate). Built-in
+        // type names (String, Int32, Json, ...) resolve here even without a user `type` decl.
+        let target = match crate::resolve::resolve_type(
+            &lin_parse::ast::TypeExpr::Named(type_name.to_string(), span),
+            &self.env,
+        ) {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
+
+        // Infer the value argument as a value; it must be Json-compatible.
+        let typed_value = match self.infer_expr(value_arg) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(e)),
+        };
+        let value_ty = typed_value.ty();
+        if !self.types_compatible(&value_ty, &json_type()) {
+            return Some(Err(Diagnostic::error(
+                value_arg.span(),
+                format!(
+                    "fromJson expects a Json value, got {}",
+                    value_ty
+                ),
+            )));
+        }
+
+        // Collect the resolved bodies of every Named type reachable from `target`, so codegen
+        // can build the (possibly recursive) schema descriptor without a type environment.
+        let mut named_defs: Vec<(String, Type)> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        self.collect_named_defs(&target, &mut seen, &mut named_defs);
+
+        let result_type = Type::flatten_union(vec![target.clone(), error_type()]);
+        Some(Ok(TypedExpr::FromJson {
+            target,
+            value: Box::new(typed_value),
+            result_type,
+            named_defs,
+            span,
+        }))
+    }
+
+    /// Walk `ty` collecting, for each `Type::Named(n)` reachable, the resolved body of `n` (from
+    /// the type environment) into `out` (deduplicated). Recurses into each collected body so
+    /// mutually-recursive named types are all captured. Recursion is bounded by `seen`.
+    fn collect_named_defs(
+        &self,
+        ty: &Type,
+        seen: &mut std::collections::HashSet<String>,
+        out: &mut Vec<(String, Type)>,
+    ) {
+        match ty {
+            Type::Named(n) => {
+                if seen.insert(n.clone()) {
+                    if let Some(decl) = self.env.lookup_type(n) {
+                        if decl.params.is_empty() {
+                            let body = decl.body.clone();
+                            out.push((n.clone(), body.clone()));
+                            self.collect_named_defs(&body, seen, out);
+                        }
+                    }
+                }
+            }
+            Type::Array(inner) | Type::Iterator(inner) => self.collect_named_defs(inner, seen, out),
+            Type::FixedArray(elems) => {
+                for e in elems {
+                    self.collect_named_defs(e, seen, out);
+                }
+            }
+            Type::Union(vs) => {
+                for v in vs {
+                    self.collect_named_defs(v, seen, out);
+                }
+            }
+            Type::Object(fields) => {
+                for v in fields.values() {
+                    self.collect_named_defs(v, seen, out);
+                }
+            }
+            Type::Function { params, ret, .. } => {
+                for p in params {
+                    self.collect_named_defs(p, seen, out);
+                }
+                self.collect_named_defs(ret, seen, out);
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn infer_call(
         &mut self,
         func: &Expr,
@@ -14,6 +131,15 @@ impl Checker {
         partial: bool,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
+        // fromJson special form: `fromJson(T, value)` (ADR-047). Intercept before the callee
+        // is inferred, since arg0 is a type name, not a value.
+        if let Expr::Ident(name, _) = func {
+            if name == "fromJson" && !partial && args.len() == 2 {
+                if let Some(result) = self.try_from_json_special_form(&args[0], &args[1], span) {
+                    return result;
+                }
+            }
+        }
         // Function expression and arguments are not in tail position.
         let prev_tail = self.in_tail_position;
         self.in_tail_position = false;
@@ -289,6 +415,20 @@ impl Checker {
                     span,
                 };
                 return self.infer_expr(&dummy_call);
+            }
+        }
+
+        // fromJson special form: `T.fromJson(value)` (ADR-047). Intercept before the receiver
+        // is inferred as a value, since `T` is a type name, not a runtime value.
+        if method == "fromJson" && !partial {
+            if let Some(arg_exprs) = args {
+                if arg_exprs.len() == 1 {
+                    if let Some(result) =
+                        self.try_from_json_special_form(receiver, &arg_exprs[0], span)
+                    {
+                        return result;
+                    }
+                }
             }
         }
 

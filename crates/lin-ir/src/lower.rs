@@ -1411,6 +1411,10 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             lower_if(cond, then_br, else_br, result_type, builder, ctx)
         }
 
+        TypedExpr::FromJson { target, value, result_type, named_defs, .. } => {
+            lower_from_json(target, value, result_type, named_defs, builder, ctx)
+        }
+
         TypedExpr::Match { scrutinee, arms, result_type, .. } => {
             lower_match(scrutinee, arms, result_type, builder, ctx)
         }
@@ -2045,6 +2049,37 @@ fn type_repr_differs(from: &Type, to: &Type) -> bool {
 }
 
 /// Box a value to Json (TaggedVal*) if it is a concrete (non-union) type.
+/// `fromJson` decode (ADR-047). Lower the Json value, box it to the tagged representation if
+/// concrete, then emit `CallIntrinsic { FromJson(target) }`. The runtime borrows the input and
+/// returns either the SAME pointer retained (+1) on success or a fresh `Error` object — so the
+/// result is unconditionally +1 owned (register_owned), and the input keeps its own ownership
+/// (released later by normal liveness). `result_type` is `T | Error` (a boxed union), so the
+/// result temp is treated as a union box.
+fn lower_from_json(
+    target: &Type,
+    value: &TypedExpr,
+    result_type: &Type,
+    named_defs: &[(String, Type)],
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Temp {
+    let value_temp = lower_expr(value, builder, ctx);
+    // The runtime walker expects a TaggedVal*; box concrete scalars/strings to Json.
+    let boxed = box_to_json(value_temp, &value.ty(), builder);
+    let dst = builder.alloc_temp(result_type.clone());
+    builder.emit(Instruction::CallIntrinsic {
+        dst,
+        intrinsic: Intrinsic::FromJson {
+            target: Box::new(target.clone()),
+            named_defs: named_defs.to_vec(),
+        },
+        args: vec![boxed],
+        ret_ty: result_type.clone(),
+    });
+    builder.register_owned(dst, result_type.clone());
+    dst
+}
+
 fn box_to_json(val: Temp, val_ty: &Type, builder: &mut FuncBuilder) -> Temp {
     if is_union_ty(val_ty) {
         return val;

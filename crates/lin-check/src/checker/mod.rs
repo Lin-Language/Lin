@@ -44,6 +44,11 @@ pub struct Checker {
     protected_type_vars: std::collections::HashSet<u32>,
     /// Slots of mutable global (`var`) bindings. Used by the async var-capture check.
     mutable_global_slots: std::collections::HashMap<usize, String>,
+    /// When true, a `Json` value is permitted to flow into a fully-concrete target without
+    /// an explicit `fromJson` decode (ADR-046). Set only for the trusted stdlib, whose
+    /// wrappers forward `Json` handles into concrete intrinsic/foreign params by design.
+    /// User modules check with `false`, so `val p: Person = readJson(...)` is a type error.
+    pub lenient_json: bool,
 }
 
 impl Default for Checker {
@@ -68,6 +73,7 @@ impl Checker {
             solved_type_vars: std::collections::HashMap::new(),
             protected_type_vars: std::collections::HashSet::new(),
             mutable_global_slots: std::collections::HashMap::new(),
+            lenient_json: false,
         }
     }
 
@@ -110,7 +116,7 @@ impl Checker {
     }
 
     pub(crate) fn types_compatible(&self, value: &Type, target: &Type) -> bool {
-        is_compatible_env(value, target, Some(&self.env), &mut 0)
+        is_compatible_env(value, target, Some(&self.env), self.lenient_json, &mut 0)
     }
 
     /// Collect all TypeVar IDs recursively from a type into `out`.

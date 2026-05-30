@@ -77,6 +77,11 @@ fn resolve_named_cycle(
         "Float64" => Ok(Type::Float64),
         "String" => Ok(Type::Str),
         "Json" => Ok(json_type()),
+        // `Error` is a structural object alias (ADR-047). The runtime decode-error value is
+        // `{ "type": "error", "message": String, "path": String }`; width subtyping means it
+        // satisfies this open `{type, message}` shape. Modelled as an Object (not a new Type
+        // variant) so the ~20 exhaustive `Type` matches don't have to change (cf. ADR-044).
+        "Error" => Ok(error_type()),
         // Function is an opaque type annotation — any arity is acceptable.
         // Params and ret use TypeVar(u32::MAX) so compat check treats it as accepting any function.
         "Function" => Ok(Type::func(
@@ -224,6 +229,16 @@ fn substitute(
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(substitute(inner, params, args, env, visiting)?))),
         _ => Ok(ty.clone()),
     }
+}
+
+/// The structural shape of a decode `Error` (ADR-047). An open object with the two stable
+/// fields user code can rely on; the runtime value also carries `"path"`, which width
+/// subtyping permits. Used as the second variant of `fromJson`'s `T | Error` result.
+pub fn error_type() -> Type {
+    let mut fields = IndexMap::new();
+    fields.insert("type".to_string(), Type::Str);
+    fields.insert("message".to_string(), Type::Str);
+    Type::Object(fields)
 }
 
 pub fn json_type() -> Type {

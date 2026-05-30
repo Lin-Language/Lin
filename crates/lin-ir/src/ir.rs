@@ -34,7 +34,8 @@ pub enum Const {
 }
 
 /// Known runtime operations that map 1:1 to lin-runtime functions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Note: not `Eq` — `FromJson(Box<Type>)` carries a `Type`, which is only `PartialEq`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Intrinsic {
     Print,
     ToString,
@@ -117,6 +118,15 @@ pub enum Intrinsic {
     Request,
     Message,
     Close,
+    /// `fromJson` type-directed decode (ADR-047). Carries the resolved target `Type` T and the
+    /// resolved bodies of every reachable `Named` type (so codegen can build a recursive schema
+    /// descriptor with no type environment). Runtime: `lin_from_json(value, descriptor) -> ptr`
+    /// returns the input value retained (+1) on success, or a fresh `Error` object on the first
+    /// structural mismatch.
+    FromJson {
+        target: Box<Type>,
+        named_defs: Vec<(String, Type)>,
+    },
 }
 
 /// Element kinds for unboxed (flat) scalar arrays.

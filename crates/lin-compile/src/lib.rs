@@ -76,7 +76,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     pre_resolve_imports_from_ast(&ast_module, &base_dir, &mut imported_modules, &mut import_order, &mut import_sources)?;
 
     // 3b. Type check main module with pre-resolved import types.
-    let typed_module = check_module_with_imports(&ast_module, &imported_modules)
+    let typed_module = check_module_with_imports(&ast_module, &imported_modules, false)
         .map_err(CompileError::TypeCheck)?;
 
     // 4. LLVM codegen via the LinIR pipeline (the sole compilation backend).
@@ -263,6 +263,7 @@ fn parse_source(source: &str) -> Result<Module, Vec<lin_common::Diagnostic>> {
 fn check_module_with_imports(
     ast_module: &Module,
     imported_modules: &HashMap<String, TypedModule>,
+    lenient_json: bool,
 ) -> Result<TypedModule, Vec<lin_common::Diagnostic>> {
     let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
     for (path, imp_module) in imported_modules {
@@ -273,6 +274,9 @@ fn check_module_with_imports(
     }
     let mut checker = Checker::new();
     checker.import_types = import_type_map;
+    // The trusted stdlib forwards Json handles into concrete intrinsic/foreign params by
+    // design, so it checks Json->concrete leniently (ADR-046). User code does not.
+    checker.lenient_json = lenient_json;
     checker.protect_import_typevars();
     checker.check_module(ast_module)
 }
@@ -281,6 +285,7 @@ fn check_module_with_imports(
 fn stdlib_source(path: &str) -> Option<&'static str> {
     match path {
         "std/io"     => Some(include_str!("../../../stdlib/io.lin")),
+        "std/json"   => Some(include_str!("../../../stdlib/json.lin")),
         "std/string" => Some(include_str!("../../../stdlib/string.lin")),
         "std/number" => Some(include_str!("../../../stdlib/number.lin")),
         "std/array"  => Some(include_str!("../../../stdlib/array.lin")),
@@ -348,7 +353,10 @@ fn pre_resolve_imports_from_ast(
             continue;
         }
 
-        let typed = check_module_with_imports(&ast_mod, cache)
+        // Only the embedded stdlib is trusted to forward Json into concrete params (ADR-046);
+        // user-defined imported modules are checked strictly, like the main module.
+        let is_stdlib = stdlib_source(path.as_str()).is_some();
+        let typed = check_module_with_imports(&ast_mod, cache, is_stdlib)
             .map_err(CompileError::TypeCheck)?;
         let sig = ModuleSignature::from_module(&typed);
         save_cache(&src_text, &typed, &imported_base);
