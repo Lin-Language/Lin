@@ -1,6 +1,6 @@
 use super::builder_ext::BuilderExt;
 use inkwell::values::{
-    BasicValueEnum, PointerValue,
+    BasicMetadataValueEnum, BasicValueEnum, PointerValue,
 };
 use inkwell::AddressSpace;
 
@@ -8,6 +8,38 @@ use lin_check::types::Type;
 use super::Codegen;
 
 impl<'ctx> Codegen<'ctx> {
+    /// Box one argument into the uniform boxed closure-call ABI representation: a TaggedVal*
+    /// (ptr). EVERY indirect/closure call passes its args this way, because every function
+    /// value is stored as a boxed-ABI wrapper (`__cls_wrapb_*` / `__papp_*`) that declares all
+    /// params `ptr` and unboxes each to its concrete type.
+    ///
+    /// An argument whose Lin type is already a union/Json is itself a boxed `ptr` — passed
+    /// through unchanged to avoid double-boxing. A concrete scalar / raw String*/Array*/Object*
+    /// value is boxed. This keeps both ends of every indirect call agreeing on the all-ptr ABI
+    /// regardless of which args the IR pre-boxed (the IR only boxes up to the value's *declared*
+    /// param arity, e.g. one for an opaque `Function`, so extra args reach here unboxed — the
+    /// wrapper-ABI bug).
+    pub(crate) fn box_arg_for_closure_abi(
+        &mut self,
+        val: BasicMetadataValueEnum<'ctx>,
+        arg_ty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let basic: BasicValueEnum<'ctx> = match val {
+            BasicMetadataValueEnum::IntValue(v) => v.into(),
+            BasicMetadataValueEnum::FloatValue(v) => v.into(),
+            BasicMetadataValueEnum::PointerValue(v) => v.into(),
+            BasicMetadataValueEnum::ArrayValue(v) => v.into(),
+            BasicMetadataValueEnum::StructValue(v) => v.into(),
+            BasicMetadataValueEnum::VectorValue(v) => v.into(),
+            _ => self.context.ptr_type(AddressSpace::default()).const_null().into(),
+        };
+        // Already a boxed Json/union value (a ptr) — pass through.
+        if Self::is_union_type(arg_ty) {
+            return basic;
+        }
+        self.box_value(basic, arg_ty)
+    }
+
     /// Box a value into a tagged union pointer (TaggedVal*).
     /// For concrete types, allocates and fills a TaggedVal with the appropriate tag.
     /// For TypeVar, dispatches on the actual LLVM type (int/float/pointer) to pick the right box call.

@@ -22,7 +22,7 @@ impl<'ctx> Codegen<'ctx> {
     /// TaggedVal*. This is the uniform calling convention every indirect/closure call uses.
     /// Shared by closure construction and default-argument descriptor entries.
     pub(crate) fn boxed_abi_wrapper(&mut self, named_fn: FunctionValue<'ctx>) -> FunctionValue<'ctx> {
-        self.boxed_abi_wrapper_ret(named_fn, None)
+        self.boxed_abi_wrapper_ret(named_fn, None, None)
     }
 
     /// As `boxed_abi_wrapper`, but with the wrapped function's true Lin return type when known.
@@ -31,14 +31,42 @@ impl<'ctx> Codegen<'ctx> {
     /// is available and every pointer is assumed already-boxed, which crashes the indirect
     /// caller when it unboxes a raw String*. Pass `None` for closures that already use the
     /// uniform boxed (Json) return ABI.
-    pub(crate) fn boxed_abi_wrapper_ret(&mut self, named_fn: FunctionValue<'ctx>, lin_ret_ty: Option<&Type>) -> FunctionValue<'ctx> {
+    pub(crate) fn boxed_abi_wrapper_ret(
+        &mut self,
+        named_fn: FunctionValue<'ctx>,
+        lin_ret_ty: Option<&Type>,
+        lin_param_tys: Option<&[Type]>,
+    ) -> FunctionValue<'ctx> {
+        self.boxed_abi_wrapper_full(named_fn, lin_ret_ty, lin_param_tys, false)
+    }
+
+    /// Core boxed-ABI wrapper builder. `body_is_closure` ⇒ the wrapped function's param 0 is an
+    /// implicit env pointer (a capturing closure body); the wrapper forwards its own env param
+    /// straight through and unboxes only the real arguments. For a non-closure named function
+    /// the wrapper passes a null env to nothing (there is no env param) and unboxes every arg.
+    ///
+    /// Either way the wrapper is `(ptr env, ptr boxedArg...) -> ptr`: the single uniform ABI
+    /// every INDIRECT closure call uses. Args arrive as boxed `TaggedVal*` and are unboxed to
+    /// the body's concrete param types; the concrete return is boxed back. (Previously the
+    /// wrapper copied the body's CONCRETE param types, so a boxed `ptr` arg landing in an `i32`
+    /// slot reinterpreted the pointer bits → garbage / misaligned deref — the wrapper-ABI bug.)
+    pub(crate) fn boxed_abi_wrapper_full(
+        &mut self,
+        named_fn: FunctionValue<'ctx>,
+        lin_ret_ty: Option<&Type>,
+        lin_param_tys: Option<&[Type]>,
+        body_is_closure: bool,
+    ) -> FunctionValue<'ctx> {
         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
         let named_ret_ty = named_fn.get_type().get_return_type();
+        // Real argument params of the body = total params minus the leading env param (if any).
+        let total_body_params = named_fn.count_params() as usize;
+        let n_args = if body_is_closure { total_body_params.saturating_sub(1) } else { total_body_params };
+        // Wrapper signature: (ptr env, ptr boxedArg...) -> ptr.
         let mut wrapper_param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
-        for i in 0..named_fn.count_params() {
-            wrapper_param_types.push(named_fn.get_nth_param(i).unwrap().get_type().into());
+        for _ in 0..n_args {
+            wrapper_param_types.push(ptr_ty.into());
         }
-        // Uniform ABI: always return ptr.
         let wrapper_fn_ty = ptr_ty.fn_type(&wrapper_param_types, false);
         let wrapper_name = format!("__cls_wrapb_{}", named_fn.get_name().to_str().unwrap_or("fn"));
         if let Some(existing) = self.module.get_function(&wrapper_name) {
@@ -51,9 +79,43 @@ impl<'ctx> Codegen<'ctx> {
         let saved_block = self.builder.get_insert_block();
         let entry = self.context.append_basic_block(wf, "entry");
         self.builder.position_at_end(entry);
-        let fwd_args: Vec<BasicMetadataValueEnum> = (1..wf.count_params())
-            .map(|i| wf.get_nth_param(i).unwrap().into())
-            .collect();
+        // Forwarded args to the concrete body. For a closure body, pass the env (wrapper param 0)
+        // as the body's first arg; then unbox each real arg to the body's concrete param type.
+        let mut fwd_args: Vec<BasicMetadataValueEnum> = Vec::with_capacity(total_body_params);
+        if body_is_closure {
+            fwd_args.push(wf.get_nth_param(0).unwrap().into());
+        }
+        for i in 0..n_args {
+            let boxed_arg = wf.get_nth_param((i + 1) as u32).unwrap();
+            // Concrete param type for the body's nth real argument. Prefer the true Lin type;
+            // otherwise infer from the body's concrete LLVM param type (skipping the env slot).
+            let llvm_param_index = if body_is_closure { i + 1 } else { i };
+            let lin_ty: Type = match lin_param_tys.and_then(|tys| tys.get(i)) {
+                Some(t) => t.clone(),
+                None => {
+                    let pt = named_fn.get_nth_param(llvm_param_index as u32).unwrap().get_type();
+                    if pt.is_int_type() {
+                        match pt.into_int_type().get_bit_width() {
+                            1 => Type::Bool,
+                            8 => Type::Int8,
+                            16 => Type::Int16,
+                            64 => Type::Int64,
+                            _ => Type::Int32,
+                        }
+                    } else if pt.is_float_type() {
+                        if pt.into_float_type() == self.context.f32_type() { Type::Float32 } else { Type::Float64 }
+                    } else {
+                        // A pointer param of unknown Lin type — assume already-boxed Json.
+                        Type::TypeVar(u32::MAX)
+                    }
+                }
+            };
+            // Union/Json params are already a boxed `ptr` — pass through (unbox_value returns the
+            // pointer unchanged for these). Concrete types are unboxed to their scalar/raw
+            // pointer representation matching the body's declared param type.
+            let unboxed = self.unbox_value(boxed_arg, &lin_ty);
+            fwd_args.push(unboxed.into());
+        }
         let call = self.builder.call(named_fn, &fwd_args, "wfwd");
         // Box the concrete return to a TaggedVal*. Prefer the true Lin return type; fall back
         // to inferring from the LLVM return kind (scalars only — a bare pointer of unknown Lin
@@ -99,7 +161,7 @@ impl<'ctx> Codegen<'ctx> {
         named_fn: FunctionValue<'ctx>,
         descriptor: Option<PointerValue<'ctx>>,
     ) -> BasicValueEnum<'ctx> {
-        self.wrap_named_fn_as_closure_boxed_desc_ret(named_fn, descriptor, None)
+        self.wrap_named_fn_as_closure_boxed_desc_ret(named_fn, descriptor, None, None)
     }
 
     /// As `wrap_named_fn_as_closure_boxed_desc`, with the wrapped function's true Lin return
@@ -109,8 +171,9 @@ impl<'ctx> Codegen<'ctx> {
         named_fn: FunctionValue<'ctx>,
         descriptor: Option<PointerValue<'ctx>>,
         lin_ret_ty: Option<&Type>,
+        lin_param_tys: Option<&[Type]>,
     ) -> BasicValueEnum<'ctx> {
-        let wrapper_fn = self.boxed_abi_wrapper_ret(named_fn, lin_ret_ty);
+        let wrapper_fn = self.boxed_abi_wrapper_ret(named_fn, lin_ret_ty, lin_param_tys);
         let fn_ptr = wrapper_fn.as_global_value().as_pointer_value();
         // No captures: capture-less closure with a null env, descriptor at offset 32.
         self.make_closure_struct_desc(fn_ptr.into(), &[], descriptor)
@@ -141,12 +204,14 @@ impl<'ctx> Codegen<'ctx> {
 
         let wrapper_name = format!("__papp_ir_{}", self.closure_count);
         self.closure_count += 1;
+        // Uniform closure ABI: each remaining argument arrives as a boxed TaggedVal* (ptr) and
+        // the wrapper returns a boxed TaggedVal* (ptr), so a partial application is callable
+        // through an opaque `Function` value like any other closure. The wrapper unboxes each
+        // remaining arg to its concrete type before forwarding to `llvm_fn`.
         let mut wrapper_param_tys: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
-        for p in remaining_params {
-            wrapper_param_tys.push(self.llvm_type(p).into());
+        for _ in remaining_params {
+            wrapper_param_tys.push(ptr_ty.into());
         }
-        // Uniform closure ABI: the wrapper returns a boxed TaggedVal* (ptr), so a partial
-        // application is callable through an opaque Function value like any other closure.
         let wrapper_fn_ty = ptr_ty.fn_type(&wrapper_param_tys, false);
         let wrapper_fn = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
         self.mark_user_fn_nounwind(wrapper_fn);
@@ -185,9 +250,12 @@ impl<'ctx> Codegen<'ctx> {
                 let v = self.builder.load(*field_ty, fp, "papp_v");
                 call_args.push(v.into());
             }
-            for i in 0..remaining_params.len() {
+            for (i, rp) in remaining_params.iter().enumerate() {
+                // Each remaining arg arrives boxed (ptr); unbox to its concrete type before
+                // forwarding to the direct-ABI `llvm_fn` (union/Json params pass through).
                 let p = wrapper_fn.get_nth_param(1 + i as u32).unwrap();
-                call_args.push(p.into());
+                let unboxed = self.unbox_value(p, rp);
+                call_args.push(unboxed.into());
             }
             let call = self.builder.call(llvm_fn, &call_args, "papp_call");
             // Box the concrete result to a TaggedVal* (uniform closure return ABI).
@@ -235,12 +303,13 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.store(f, *val);
         }
 
-        // Wrapper: (env_ptr, ...remaining_params) -> ptr (boxed ABI).
+        // Wrapper: (env_ptr, ...remaining_args) -> ptr (uniform boxed ABI: every remaining arg
+        // arrives as a boxed TaggedVal* / ptr). The stored partials are already boxed ptrs.
         let wrapper_name = format!("__papp_cls_ir_{}", self.closure_count);
         self.closure_count += 1;
         let mut wrapper_param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
-        for t in remaining_params {
-            wrapper_param_types.push(self.llvm_param_type(t));
+        for _ in remaining_params {
+            wrapper_param_types.push(ptr_ty.into());
         }
         let wrapper_fn_ty = ptr_ty.fn_type(&wrapper_param_types, false);
         let wrapper_fn = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
@@ -270,9 +339,10 @@ impl<'ctx> Codegen<'ctx> {
             call_param_types.push((*ty).into());
             call_args.push(v.into());
         }
-        for (i, t) in remaining_params.iter().enumerate() {
+        for i in 0..remaining_params.len() {
+            // Each remaining arg is already a boxed ptr (uniform ABI) — forward as-is.
             let p = wrapper_fn.get_nth_param((i + 1) as u32).unwrap();
-            call_param_types.push(self.llvm_param_type(t));
+            call_param_types.push(ptr_ty.into());
             call_args.push(p.into());
         }
         // Inner closure uses the uniform boxed ABI: returns a TaggedVal* (ptr).

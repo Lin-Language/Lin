@@ -560,8 +560,17 @@ impl<'ctx> Codegen<'ctx> {
                 let real_ret_ty = module.function(*real_fid).map(|f| f.ret_ty.clone());
                 let entry_ptrs: Vec<inkwell::values::BasicValueEnum<'ctx>> = desc.entries
                     .iter()
-                    .filter_map(|fid| ir_fn_to_llvm.get(fid).copied())
-                    .map(|f| self.boxed_abi_wrapper_ret(f, real_ret_ty.as_ref()).as_global_value().as_pointer_value().into())
+                    .filter_map(|fid| ir_fn_to_llvm.get(fid).copied().map(|f| (*fid, f)))
+                    .map(|(fid, f)| {
+                        // Each entry has its own arity/param types (the default-fill adapters take
+                        // fewer params than the real fn). The boxed closure ABI passes every arg
+                        // boxed, so the wrapper must unbox each to that entry's concrete param type.
+                        let entry_param_tys: Option<Vec<Type>> = module
+                            .function(fid)
+                            .map(|ef| ef.params.iter().map(|(_, t)| t.clone()).collect());
+                        self.boxed_abi_wrapper_ret(f, real_ret_ty.as_ref(), entry_param_tys.as_deref())
+                            .as_global_value().as_pointer_value().into()
+                    })
                     .collect();
                 if entry_ptrs.len() != desc.entries.len() { continue; }
                 let entries_arr = ptr_ty.const_array(
@@ -905,12 +914,19 @@ impl<'ctx> Codegen<'ctx> {
                                             // supplied args into a new partial-application closure
                                             // taking the remaining params (no direct call yet).
                                             if let Type::Function { params: remaining, .. } = ret_ty {
-                                                let partials: Vec<BasicValueEnum> = arg_vals.iter().map(|a| match a {
-                                                    BasicMetadataValueEnum::IntValue(v) => (*v).into(),
-                                                    BasicMetadataValueEnum::FloatValue(v) => (*v).into(),
-                                                    BasicMetadataValueEnum::PointerValue(v) => (*v).into(),
-                                                    _ => ptr_ty.const_null().into(),
-                                                }).collect();
+                                                // Box each supplied partial into a TaggedVal* (ptr)
+                                                // so the partial-application wrapper forwards it to
+                                                // the inner closure under the uniform all-ptr boxed
+                                                // ABI (the inner closure's stored fn_ptr is itself a
+                                                // boxed-ABI wrapper expecting boxed args).
+                                                let partials: Vec<BasicValueEnum> = arg_vals
+                                                    .iter()
+                                                    .zip(args.iter())
+                                                    .map(|(a, a_temp)| {
+                                                        let arg_ty = func.temp_types.get(a_temp).cloned().unwrap_or(Type::Null);
+                                                        self.box_arg_for_closure_abi(*a, &arg_ty)
+                                                    })
+                                                    .collect();
                                                 let r = self.build_closure_partial_application_values(
                                                     cls_ptr.into_pointer_value(), &partials, remaining);
                                                 temp_map.insert(*dst, r);
@@ -948,13 +964,17 @@ impl<'ctx> Codegen<'ctx> {
                                                 let entry_fn = self.builder.load(ptr_ty, entry_gep, "ir_entry").into_pointer_value();
                                                 let env_gep = self.builder.struct_gep(cls_ty, cls_ptr_v, 3, "ir_ep");
                                                 let env_ptr = self.builder.load(ptr_ty, env_gep, "ir_envp");
-                                                // Adapter has the boxed ABI: (env, k supplied args...) -> ptr.
+                                                // Adapter uses the uniform boxed ABI: (env, k boxed
+                                                // TaggedVal* args...) -> ptr. Box each supplied arg
+                                                // (already-boxed union/Json args pass through) so
+                                                // the all-ptr adapter wrapper unboxes them correctly.
                                                 let mut fn_param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
                                                 let mut call_args: Vec<BasicMetadataValueEnum> = vec![env_ptr.into()];
                                                 for (av, a_temp) in arg_vals.iter().zip(args.iter()) {
                                                     let arg_ty = func.temp_types.get(a_temp).cloned().unwrap_or(Type::Null);
-                                                    fn_param_types.push(self.llvm_param_type(&arg_ty));
-                                                    call_args.push((*av).into());
+                                                    let boxed = self.box_arg_for_closure_abi(*av, &arg_ty);
+                                                    fn_param_types.push(ptr_ty.into());
+                                                    call_args.push(boxed.into());
                                                 }
                                                 let returns_void = matches!(ret_ty, Type::Null | Type::Never);
                                                 let fn_ty = if returns_void {
@@ -979,14 +999,26 @@ impl<'ctx> Codegen<'ctx> {
                                             let env_gep = self.builder.struct_gep(cls_ty, cls_ptr_v, 3, "ir_ep");
                                             let env_ptr = self.builder.load(ptr_ty, env_gep, "ir_envp");
 
-                                            // Build param types: env_ptr + arg types.
-                                            // Recover arg types from the IR temp_types map.
+                                            // Uniform boxed closure-call ABI: env_ptr + one boxed
+                                            // TaggedVal* (ptr) per argument. EVERY function value
+                                            // (capture-less named fn, capturing closure, partial
+                                            // application) is stored as a boxed-ABI wrapper that
+                                            // declares all params `ptr` and unboxes them, so each
+                                            // arg MUST arrive boxed. The IR only boxes args up to
+                                            // the value's *declared* arity (an opaque `Function`
+                                            // declares ONE param), so a multi-arg call through such
+                                            // a value reaches here with later args still concrete —
+                                            // box them so the all-ptr wrapper ABI agrees (otherwise
+                                            // raw bits are reinterpreted as a ptr → garbage /
+                                            // misaligned deref — the wrapper-ABI bug). Already-boxed
+                                            // union/Json args pass through (no double-box).
                                             let mut fn_param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
                                             let mut call_args: Vec<BasicMetadataValueEnum> = vec![env_ptr.into()];
                                             for (av, a_temp) in arg_vals.iter().zip(args.iter()) {
                                                 let arg_ty = func.temp_types.get(a_temp).cloned().unwrap_or(Type::Null);
-                                                fn_param_types.push(self.llvm_param_type(&arg_ty));
-                                                call_args.push((*av).into());
+                                                let boxed = self.box_arg_for_closure_abi(*av, &arg_ty);
+                                                fn_param_types.push(ptr_ty.into());
+                                                call_args.push(boxed.into());
                                             }
                                             // Closures use the uniform boxed ABI (return ptr,
                                             // except void). Call with ptr return, then unbox to ret_ty.
@@ -1104,11 +1136,35 @@ impl<'ctx> Codegen<'ctx> {
                                     // real Lin return type so a raw Str/Array/Object return is
                                     // boxed (the indirect caller always unboxes).
                                     let ret = module.function(*fid).map(|f| f.ret_ty.clone());
-                                    self.wrap_named_fn_as_closure_boxed_desc_ret(callee_fn, descriptor, ret.as_ref())
+                                    // The wrapper is called through the uniform boxed closure ABI
+                                    // (every arg a boxed ptr), so it must unbox each arg to the
+                                    // named fn's concrete Lin param type. Thread those types so a
+                                    // scalar/Str/Array param isn't reinterpreted from a boxed ptr
+                                    // (the wrapper-ABI bug).
+                                    let param_tys: Option<Vec<Type>> = module
+                                        .function(*fid)
+                                        .map(|f| f.params.iter().map(|(_, t)| t.clone()).collect());
+                                    self.wrap_named_fn_as_closure_boxed_desc_ret(
+                                        callee_fn, descriptor, ret.as_ref(), param_tys.as_deref())
                                 } else {
-                                    // Captures present ⇒ the function has an env param 0; build
-                                    // the env struct and store the raw fn ptr.
-                                    let fn_ptr = callee_fn.as_global_value().as_pointer_value();
+                                    // Captures present ⇒ the closure body has an env param 0.
+                                    // Its real args are still compiled with CONCRETE param types,
+                                    // but every INDIRECT call uses the uniform boxed ABI (env +
+                                    // boxed ptr args -> ptr). Store a boxed-ABI wrapper that
+                                    // forwards the env, unboxes each arg to the body's concrete
+                                    // param type, and boxes the return — exactly like the
+                                    // capture-less path — so a capturing closure is callable
+                                    // through an opaque `Function` value too (the wrapper-ABI bug
+                                    // otherwise reinterprets a boxed ptr arg as the concrete type).
+                                    let body = module.function(*fid);
+                                    let ret = body.map(|f| f.ret_ty.clone());
+                                    // params[0] is the env; the real arg types are params[1..].
+                                    let arg_tys: Option<Vec<Type>> = body.map(|f| {
+                                        f.params.iter().skip(1).map(|(_, t)| t.clone()).collect()
+                                    });
+                                    let wrapper_fn = self.boxed_abi_wrapper_full(
+                                        callee_fn, ret.as_ref(), arg_tys.as_deref(), true);
+                                    let fn_ptr = wrapper_fn.as_global_value().as_pointer_value();
                                     let capture_vals: Vec<BasicValueEnum> = captures
                                         .iter()
                                         .filter_map(|c| temp_map.get(c).copied())

@@ -1603,6 +1603,47 @@ print(toString(add5(10)))
 }
 
 #[test]
+fn test_named_fn_as_opaque_function_value() {
+    // Regression: passing a TOP-LEVEL NAMED function where an opaque `Function` value is
+    // expected used to produce GARBAGE. The capture-less closure wrapper (`__cls_wrapb_*`)
+    // copied the named fn's CONCRETE param types (e.g. i32), but the uniform closure-call ABI
+    // invokes the wrapper with BOXED (ptr) args — so a TaggedVal* was reinterpreted as a scalar
+    // (or vice-versa) → garbage / misaligned deref. Now the wrapper takes all-`ptr` params and
+    // unboxes each to the body's concrete type, and every indirect call boxes its args uniformly.
+    // Covers: scalar Int32 (1-arg), String, and a 2-param named fn through an opaque `Function`.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val dbl = (x: Int32): Int32 => x * 2
+val apply = (f: Function, x: Int32): Int32 => f(x)
+print(toString(apply(dbl, 5)))
+
+val shout = (s: String): String => "${s}!"
+val applyStr = (f: Function, s: String): String => f(s)
+print(applyStr(shout, "hi"))
+
+val add = (a: Int32, b: Int32): Int32 => a + b
+val combine = (f: Function): Int32 => f(3, 4)
+print(toString(combine(add)))
+"#);
+    assert_eq!(output, vec!["10", "hi!", "7"]);
+}
+
+#[test]
+fn test_named_fn_in_map() {
+    // Regression (wrapper-ABI bug): `[1,2,3].map(namedFn)` passes the named function as a
+    // `Function` value to `map`, hitting the same boxed-vs-concrete closure-wrapper mismatch.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, for } from "std/array"
+
+val dbl = (x: Int32): Int32 => x * 2
+[1, 2, 3].map(dbl).for(v => print(toString(v)))
+"#);
+    assert_eq!(output, vec!["2", "4", "6"]);
+}
+
+#[test]
 fn test_function_param_destructuring() {
     let output = run(r#"import { print } from "std/io"
 
