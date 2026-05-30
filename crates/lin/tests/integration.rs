@@ -320,6 +320,26 @@ print(toString(c()))
     assert_eq!(output, vec!["1", "2", "3"]);
 }
 
+// Regression: an Array (or any heap value) passed as an argument to an INDIRECT call
+// through a closure value must be boxed to Json to match the closure's `Json` parameter,
+// exactly as the named/imported call paths do. Previously the indirect-call lowering passed
+// the raw `LinArray*` instead of a boxed `TaggedVal*`, so the callee read its tag/payload
+// from garbage and mutations through it were silently lost (the array stayed empty).
+#[test]
+fn test_array_passed_to_closure_value_mutates() {
+    let output = run(r#"import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+val acc = []
+val f = (a: Json) => push(a, 1)
+f(acc)
+f(acc)
+print(toString(length(acc)))
+"#);
+    assert_eq!(output, vec!["2"]);
+}
+
 #[test]
 fn test_recursion() {
     let output = run(r#"import { print } from "std/io"
