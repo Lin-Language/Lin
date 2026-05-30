@@ -2587,6 +2587,45 @@ print(toString(hi["w"]))
 }
 
 #[test]
+fn test_for_callback_json_assign_loop_correct() {
+    // Regression for the for-callback-return box leak fix. The `for` callback's boxed-ABI
+    // return is now released every iteration. For a body that is an ASSIGNMENT to a captured
+    // `var: Json` (`acc = concat(acc, [i])`), the assignment expression's result is the value
+    // that ALSO flows into the cell; the fix makes the global/cell own a CLONED, independent
+    // box and returns an independently-owned box, so the per-iteration release frees exactly the
+    // discarded return and never the value the cell keeps. Over 5000 iterations a wrong release
+    // (double-free / use-after-free) corrupts the final length or aborts. The final array must
+    // contain all 5000 appended elements.
+    let out = run(r#"import { range, for, concat, length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+var acc: Json = []
+range(0, 5000).for(i => acc = concat(acc, [i]))
+print(toString(length(acc)))
+"#);
+    assert_eq!(out, vec!["5000"]);
+}
+
+#[test]
+fn test_for_callback_side_effect_sum_loop_correct() {
+    // Regression for the for-callback-return box leak: a side-effecting body that mutates a
+    // captured non-Json `var` (`s = s + i`). The callback boxes its result for the uniform ABI
+    // each iteration (a fresh, independently-owned box once `s` grows past the small-int cache);
+    // the fix releases that discarded box every iteration. Correctness must be unaffected:
+    // sum(0..10000) = 10000*9999/2 = 49995000.
+    let out = run(r#"import { range, for } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+var s = 0
+range(0, 10000).for(i => s = s + i)
+print(toString(s))
+"#);
+    assert_eq!(out, vec!["49995000"]);
+}
+
+#[test]
 fn test_to_uint8_narrowing() {
     // std/number toUInt8 truncates a wider integer to a byte (two's-complement / `as`).
     let out = run(r#"import { print } from "std/io"

@@ -1095,11 +1095,23 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // to the global's declared representation first.
             if let Some(gty) = ctx.global_val_slots.get(slot).cloned() {
                 let v = coerce_to_slot_type(val_temp, &value.ty(), &gty, builder);
-                if needs_owning(&gty) {
-                    builder.emit(Instruction::Retain { val: v, ty: gty.clone() });
-                }
-                builder.emit(Instruction::GlobalValSet { slot: *slot, value: v, ty: gty });
+                // The global owns an INDEPENDENT reference to its value (symmetric owning model,
+                // mirroring the captured-cell path above). For unions this CLONES the box
+                // (`own_for_store` → `CloneBox`/`lin_tagged_clone`) so the global gets its OWN
+                // `TaggedVal*` shell — NOT an alias of the producer's/return's shell. (The old
+                // code used `Retain`, which shared the shell: a discarding caller releasing the
+                // assignment result then freed the global's shell → use-after-free.)
+                let stored = own_for_store(v, &gty, builder);
+                builder.emit(Instruction::GlobalValSet { slot: *slot, value: stored, ty: gty.clone() });
                 builder.slots.insert(*slot, v);
+                // The assignment EXPRESSION result must itself be an independently-owned value so
+                // a discarding caller (e.g. the `for` callback-return release below) can release
+                // it without touching the global's distinct reference. `own_for_read` clones the
+                // box (union) / retains (concrete rc) and registers it for scope-exit release, so
+                // when the result is NOT discarded by a loop it is still reclaimed at teardown.
+                if needs_owning(&gty) {
+                    return own_for_read(v, &gty, builder);
+                }
                 return v;
             }
             builder.slots.insert(*slot, val_temp);
@@ -1863,6 +1875,14 @@ fn emit_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
         obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
     });
     body_fn(i, elem, builder, ctx);
+    // NOTE: the `Index` op (`lin_array_get_tagged`) allocates a fresh 16-byte `TaggedVal*` shell
+    // for a union/Json `elem` each iteration; this shell leaks (a residual, distinct from the
+    // for-callback-return leak fixed here). It is NOT reclaimed because the runtime's
+    // `lin_array_push_tagged`/`lin_array_set` MOVE an element's inner into result arrays WITHOUT
+    // retaining, so the element box's inner ownership is consumed unpredictably by the body —
+    // neither a tag-aware release nor a shell-only free is provably safe (both double-free
+    // `map`/`minBy`/`maxBy`, which move elements into result/accumulator arrays). Reclaiming it
+    // safely needs a change to those runtime move-vs-retain conventions, out of scope here.
     let one = builder.const_temp(Const::Int(1, Type::Int64));
     builder.emit(Instruction::Binary {
         dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
@@ -1880,8 +1900,18 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
     let iterable = lower_expr(&args[0], builder, ctx);
     let body = lower_expr(&args[1], builder, ctx);
     let elem_ty = iter_elem_type(&iterable_ty);
+    // The callback closure uses the uniform BOXED ABI: it ALWAYS returns a freshly-allocated,
+    // independently-owned `TaggedVal*` (e.g. `lin_box_null()` for a void-ish body, `lin_box_int`
+    // for an int result, or — for an assignment body like `acc = concat(...)` — its own owned +1
+    // ref, now distinct from the cell/global's shell thanks to the clone-on-store above). `for`
+    // discards that value, so we MUST call with a union ret_ty (forcing codegen to emit a
+    // `call ptr` rather than a `call void` that silently drops the returned box) and then
+    // tag-aware release it every iteration, inside the loop body before the back-edge — never
+    // registered as scope-owned (that would release once AFTER the loop, leaking per-iteration).
+    let boxed = Type::TypeVar(u32::MAX);
     emit_index_loop(iterable, &iterable_ty, builder, ctx, |_, elem, b, _| {
-        call_body_closure(body, &[(elem, elem_ty.clone())], &param_tys, &Type::Null, b);
+        let ret = call_body_closure(body, &[(elem, elem_ty.clone())], &param_tys, &boxed, b);
+        b.emit(Instruction::Release { val: ret, ty: boxed.clone() });
     });
     builder.const_temp(Const::Null)
 }
