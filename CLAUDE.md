@@ -35,10 +35,10 @@ Cargo workspace with nine crates (`crates/`):
 
 - **`lin-common`** — shared `Span`, `Diagnostic`, `Interner`, edit-distance helpers. No dependencies on other crates.
 - **`lin-lex`** — lexer with indentation tracking. Produces `Token` stream with synthetic `Indent`/`Dedent`/`Newline` tokens.
-- **`lin-parse`** — parser, surface AST (`Module`, `Stmt`, `Expr`, `Pattern`, `TypeExpr`). Includes parser error recovery and "did you mean" diagnostics.
-- **`lin-check`** — type checker. Consumes the surface AST; produces `TypedModule` (typed IR). Handles bidirectional inference, structural typing, union narrowing, exhaustiveness checking, TypeVar zonking, and numeric widening. Emits `Diagnostic` values with Ariadne-style multi-span rendering.
+- **`lin-parse`** — parser, surface AST (`Module`, `Stmt`, `Expr`, `Pattern`, `TypeExpr`). Includes parser error recovery and "did you mean" diagnostics. The recursive-descent parser is one `impl Parser` split across a `parser/` module tree by concern (`parser/mod.rs` holds `Parser` + token-cursor helpers; `stmt.rs`, `expr.rs` incl. the precedence ladder, `function.rs`, `pattern.rs`, `types.rs`).
+- **`lin-check`** — type checker. Consumes the surface AST; produces `TypedModule` (typed IR). Handles bidirectional inference, structural typing, union narrowing, exhaustiveness checking, TypeVar zonking, and numeric widening. Emits `Diagnostic` values with Ariadne-style multi-span rendering. The `Checker` is one `impl` split across a `checker/` module tree (`checker/mod.rs` holds `Checker` + module-level passes; `stmt.rs`, `expr.rs`, `ops.rs`, `call.rs`, `function.rs`, `pattern.rs`, `intrinsics.rs`, `helpers.rs`).
 - **`lin-ir`** — flat 3-address IR (`LinIR`) sitting between `TypedExpr` and LLVM, and the **sole** lowering path. Contains: IR data types (`ir.rs`), the `TypedModule → LinModule` lowering pass (`lower.rs`, incl. `lower_module` for the main module and `lower_import_module` for imports), backwards-dataflow liveness analysis (`liveness.rs`), and the Perceus-inspired RC elision pass (`rc_elide.rs`).
-- **`lin-codegen`** — LLVM backend via `inkwell`. Compiles a `LinModule` (the flat IR) to LLVM IR via `compile_module_from_ir` (main module) and `compile_import_from_ir` (imports). Handles functions, closures, objects, arrays, strings, union tagged dispatch, pattern matching, TCO, and unboxed scalar arrays. (The former TypedAST-direct backend was removed once the IR path reached parity.)
+- **`lin-codegen`** — LLVM backend via `inkwell`. Compiles a `LinModule` (the flat IR) to LLVM IR via `compile_module_from_ir` (main module) and `compile_import_from_ir` (imports). Handles functions, closures, objects, arrays, strings, union tagged dispatch, pattern matching, TCO, and unboxed scalar arrays. (The former TypedAST-direct backend was removed once the IR path reached parity.) One `impl Codegen` split across a `codegen/` module tree (`mod.rs`, `runtime.rs` = `RuntimeFns` runtime decls, `builder_ext.rs` = `BuilderExt` façade over inkwell's `build_*().unwrap()`, plus `types`/`boxing`/`literals`/`arith`/`call`/`data`/`intrinsics`/`match`/`rc`).
 - **`lin-runtime`** — small static library linked into every compiled binary. Provides refcounted strings/arrays/objects, intrinsics (`lin_print`, `lin_string_concat`, etc.), and flat scalar array variants (`lin_flat_array_alloc_i32`, etc.).
 - **`lin-compile`** — orchestrates the full compilation pipeline: source → lex → parse → type check → codegen → link. Includes a module cache (`.lin-cache/<sha256>.typed`) and module signature files (`.lin-cache/<sha256>.sig`) to skip re-checking unchanged imports.
 - **`lin`** — CLI binary. Dispatches `build`, `check`, `test` subcommands.
@@ -87,9 +87,9 @@ The typical path:
 
 1. **Tokens** — add `TokenKind` variants in `lin-lex/src/token.rs`, lex them in `lin-lex/src/lexer.rs`. Remember the indentation suppression invariants for new delimiters.
 2. **AST** — add `Expr`/`Stmt`/`Pattern`/`TypeExpr` variants in `lin-parse/src/ast.rs`. Each variant carries its own `Span`. Add a branch in `Expr::span()`.
-3. **Parser** — wire into `lin-parse/src/parser.rs`. For postfix operators, mind the DEDENT suppression rule (ADR-011). For continuation-line constructs, use the `skip_continuation_newline` pattern (ADR-013).
-4. **Type checker** — add handling in `lin-check/src/checker.rs`.
-5. **Codegen** — add handling in `lin-codegen/src/codegen.rs`. If a new runtime intrinsic is needed, add it to `lin-runtime/src/`.
+3. **Parser** — wire into the `lin-parse/src/parser/` module tree (expressions in `expr.rs`, statements in `stmt.rs`, etc.). For postfix operators, mind the DEDENT suppression rule (ADR-011). For continuation-line constructs, use the `skip_continuation_newline` pattern (ADR-013).
+4. **Type checker** — add handling in the `lin-check/src/checker/` module tree (expression inference in `expr.rs`, statements in `stmt.rs`, etc.).
+5. **Codegen** — add handling in the `lin-codegen/src/codegen/` module tree (instruction dispatch in `mod.rs`; intrinsics in `intrinsics.rs`, etc.). If a new runtime intrinsic is needed, add it to `lin-runtime/src/` and declare it in `codegen/runtime.rs`'s `RuntimeFns`.
 6. **Tests** — add an end-to-end test in `crates/lin/tests/integration.rs` and a fixture in `examples/`.
 
 ## Adding a stdlib function
@@ -98,7 +98,7 @@ Make sure it is included in the `docs/STDLIB.md` documentation. Add a test case 
 
 ## Where things live by topic
 
-- **Operator precedence** — `parse_or_expr` → `parse_and_expr` → `parse_comparison` → ... in `lin-parse/src/parser.rs`. Mirror the spec §24.2 ladder when changing.
+- **Operator precedence** — `parse_or_expr` → `parse_and_expr` → `parse_comparison` → ... in `lin-parse/src/parser/expr.rs`. Mirror the spec §24.2 ladder when changing.
 - **Iterator semantics** — `lin_iter` / `lin_for` intrinsics in `lin-runtime`; `lin_iter` constructs an opaque iterator handle. Per spec §17.6, do not model iterators as JSON-shaped objects.
 - **Equality** — implemented in codegen's `emit_eq`; objects are order-independent, arrays are ordered, cross-numeric (`Int == Float`) compares by value.
 - **Display / `toString`** — `lin_to_string` in `lin-runtime/src/`.
