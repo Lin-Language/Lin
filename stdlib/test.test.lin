@@ -2,37 +2,37 @@ import { expect, toBe, toBeNull, toSatisfy, toSucceed, toFail, toFailWith, test,
 import { toString, contains } from "std/string"
 
 val s = suite("std/test", [
-  test("toBe passes when equal", () =>
+  test("toBe passes when equal", () => [
     expect(42).toBe(42)
-  ),
+  ]),
 
-  test("toBe passes for strings", () =>
+  test("toBe passes for strings", () => [
     expect("hello").toBe("hello")
-  ),
+  ]),
 
-  test("toBe passes for booleans", () =>
+  test("toBe passes for booleans", () => [
     expect(true).toBe(true)
-  ),
+  ]),
 
-  test("toBeNull passes for null", () =>
+  test("toBeNull passes for null", () => [
     expect(null).toBeNull()
-  ),
+  ]),
 
-  test("toSatisfy passes when predicate holds", () =>
+  test("toSatisfy passes when predicate holds", () => [
     expect(10).toSatisfy(x => x > 5)
-  ),
+  ]),
 
-  test("toSucceed passes for success tagged value", () =>
+  test("toSucceed passes for success tagged value", () => [
     expect({ "type": "success", "value": 1 }).toSucceed()
-  ),
+  ]),
 
-  test("toFail passes for failure tagged value", () =>
+  test("toFail passes for failure tagged value", () => [
     expect({ "type": "failure", "error": "oops" }).toFail()
-  ),
+  ]),
 
-  test("toFailWith passes when error message matches", () =>
+  test("toFailWith passes when error message matches", () => [
     expect({ "type": "failure", "error": "oops" }).toFailWith("oops")
-  ),
+  ]),
 
   test("multiple assertions in one test via array", () =>
     [
@@ -58,7 +58,7 @@ val s = suite("std/test", [
   ),
 
   test("toBe failure message contains expected and actual", () =>
-    val r = expect(1).toBe(2)
+    val r: Json = expect(1).toBe(2)
     val checks = [
       expect(r["type"]).toBe("fail"),
       expect(r["message"].contains("expected")).toBe(true),
@@ -74,23 +74,32 @@ val s = suite("std/test", [
     ]
   ),
 
-  test("toSatisfy fails when predicate does not hold", () =>
+  test("toSatisfy fails when predicate does not hold", () => [
     expect(expect(1).toSatisfy(x => x > 10)["type"]).toBe("fail")
-  ),
+  ]),
 
   test("toFailWith fails when error message differs", () =>
     val r = { "type": "failure", "error": "oops" }
-    expect(expect(r).toFailWith("wrong")["type"]).toBe("fail")
+    val checks = [
+      expect(expect(r).toFailWith("wrong")["type"]).toBe("fail")
+    ]
+    checks
   ),
 
   test("toSucceed fails when given a failure", () =>
     val r = { "type": "failure", "error": "oops" }
-    expect(expect(r).toSucceed()["type"]).toBe("fail")
+    val checks = [
+      expect(expect(r).toSucceed()["type"]).toBe("fail")
+    ]
+    checks
   ),
 
   test("toFail fails when given a success", () =>
     val r = { "type": "success", "value": 1 }
-    expect(expect(r).toFail()["type"]).toBe("fail")
+    val checks = [
+      expect(expect(r).toFail()["type"]).toBe("fail")
+    ]
+    checks
   ),
 
   test("toSatisfy can inspect union shapes via has-pattern", () =>

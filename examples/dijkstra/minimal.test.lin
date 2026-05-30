@@ -6,7 +6,10 @@ val s = suite("minimal", [
   test("dist to self is 0", () =>
     val adj = buildAdj([{ "from": "A", "to": "B", "weight": 5 }])
     val result = dijkstra(adj, "A", ["A", "B"])
-    expect(result["dist"]["A"]).toBe(0)
+    val checks = [
+      expect(result["dist"]["A"]).toBe(0)
+    ]
+    checks
   ),
 ])
 run(s)

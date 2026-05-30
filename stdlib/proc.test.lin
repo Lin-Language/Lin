@@ -27,7 +27,10 @@ val s = suite("std/proc", [
   test("wait returns the child's exit code", () =>
     val h = spawn(["sh", "-c", "exit 3"])
     val code = wait(h)
-    expect(code).toBe(3)
+    val r = [
+      expect(code).toBe(3)
+    ]
+    r
   ),
 ])
 

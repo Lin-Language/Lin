@@ -14,7 +14,10 @@ val s = suite("std/net", [
     val sock = udpBind(39301)
     val ok = sock["type"] != "error"
     udpClose(sock)
-    expect(ok).toBe(true)
+    val checks = [
+      expect(ok).toBe(true)
+    ]
+    checks
   ),
 
   test("non-blocking udpRecv with no data returns Null", () =>
@@ -23,7 +26,10 @@ val s = suite("std/net", [
     val empty: UInt8[] = [0, 0, 0, 0]
     val r = udpRecv(sock, empty)
     udpClose(sock)
-    expect(r == null).toBe(true)
+    val checks = [
+      expect(r == null).toBe(true)
+    ]
+    checks
   ),
 
   test("UDP loopback send-to-self round-trips bytes", () =>

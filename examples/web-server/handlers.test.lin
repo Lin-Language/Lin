@@ -7,15 +7,24 @@ val makeReq = (method: String, path: String): Json =>
 val s = suite("handlers", [
   test("handleStatus returns 200", () =>
     val resp = handleStatus(makeReq("GET", "/api/status"))
-    expect(resp["status"]).toBe(200)
+    val checks = [
+      expect(resp["status"]).toBe(200)
+    ]
+    checks
   ),
   test("handleUser returns 200 for valid path", () =>
     val resp = handleUser(makeReq("GET", "/users/42"))
-    expect(resp["status"]).toBe(200)
+    val checks = [
+      expect(resp["status"]).toBe(200)
+    ]
+    checks
   ),
   test("handleUser returns 404 for non-matching path", () =>
     val resp = handleUser(makeReq("GET", "/other"))
-    expect(resp["status"]).toBe(404)
+    val checks = [
+      expect(resp["status"]).toBe(404)
+    ]
+    checks
   ),
 ])
 run(s)

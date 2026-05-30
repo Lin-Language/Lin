@@ -21,19 +21,21 @@ val s = suite("std/http", [
     r
   ),
 
-  test("notFound has status 404", () =>
+  test("notFound has status 404", () => [
     expect(notFound["status"]).toBe(404)
-  ),
+  ]),
 
   test("badRequest has status 400", () =>
     val resp = badRequest("missing field")
-    expect(resp["status"]).toBe(400)
+    val r = [expect(resp["status"]).toBe(400)]
+    r
   ),
 
   test("parseBody parses JSON body", () =>
     val req = { "method": "POST", "path": "/", "query": "", "headers": {}, "body": "{\"x\": 99}" }
     val body = parseBody(req)
-    expect(body["x"]).toBe(99)
+    val r = [expect(body["x"]).toBe(99)]
+    r
   ),
 
   test("pathMatch extracts named segments", () =>
@@ -44,7 +46,8 @@ val s = suite("std/http", [
 
   test("pathMatch returns null on mismatch", () =>
     val m = pathMatch("/users/:id", "/products/5")
-    expect(m).toBe(null)
+    val r = [expect(m).toBe(null)]
+    r
   ),
 ])
 

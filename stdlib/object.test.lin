@@ -6,156 +6,225 @@ import { length } from "std/array"
 val s = suite("std/object", [
   test("keys returns object keys", () =>
     val k = keys({ "a": 1, "b": 2 })
-    expect(length(k)).toBe(2)
+    val checks = [
+      expect(length(k)).toBe(2)
+    ]
+    checks
   ),
 
   test("keys order is insertion order", () =>
     val k = keys({ "x": 1, "y": 2 })
-    expect(k[0]).toBe("x")
+    val checks = [
+      expect(k[0]).toBe("x")
+    ]
+    checks
   ),
 
   test("values returns object values", () =>
     val obj = { "a": 10, "b": 20 }
     val v = values(obj)
-    expect(length(v)).toBe(2)
+    val checks = [
+      expect(length(v)).toBe(2)
+    ]
+    checks
   ),
 
   test("entries returns key-value pairs", () =>
     val obj = { "a": 1 }
     val e = entries(obj)
-    expect(e[0][0]).toBe("a")
+    val checks = [
+      expect(e[0][0]).toBe("a")
+    ]
+    checks
   ),
 
   test("missing key returns null", () =>
     val obj = { "a": 1 }
-    expect(obj["missing"]).toBe(null)
+    val checks = [
+      expect(obj["missing"]).toBe(null)
+    ]
+    checks
   ),
 
   test("spread merges objects", () =>
     val a = { "x": 1 }
     val b = { ...a, "y": 2 }
-    expect(b["x"]).toBe(1)
+    val checks = [
+      expect(b["x"]).toBe(1)
+    ]
+    checks
   ),
 
   test("spread override takes last value", () =>
     val a = { "x": 1 }
     val b = { ...a, "x": 99 }
-    expect(b["x"]).toBe(99)
+    val checks = [
+      expect(b["x"]).toBe(99)
+    ]
+    checks
   ),
 
   test("fromEntries builds object from pairs", () =>
     val obj = fromEntries([["a", 1], ["b", 2]])
-    expect(obj["a"]).toBe(1)
+    val checks = [
+      expect(obj["a"]).toBe(1)
+    ]
+    checks
   ),
 
   test("fromEntries second value is correct", () =>
     val obj = fromEntries([["a", 1], ["b", 2]])
-    expect(obj["b"]).toBe(2)
+    val checks = [
+      expect(obj["b"]).toBe(2)
+    ]
+    checks
   ),
 
   test("fromEntries empty array produces empty object", () =>
     val obj = fromEntries([])
-    expect(length(keys(obj))).toBe(0)
+    val checks = [
+      expect(length(keys(obj))).toBe(0)
+    ]
+    checks
   ),
 
   test("merge combines two objects", () =>
     val merged = merge({ "a": 1, "b": 2 }, { "c": 3 })
-    expect(merged["a"]).toBe(1)
+    val checks = [
+      expect(merged["a"]).toBe(1)
+    ]
+    checks
   ),
 
   test("merge right wins on conflict", () =>
     val merged = merge({ "a": 1, "b": 2 }, { "b": 3, "c": 4 })
-    expect(merged["b"]).toBe(3)
+    val checks = [
+      expect(merged["b"]).toBe(3)
+    ]
+    checks
   ),
 
   test("merge includes all keys", () =>
     val merged = merge({ "a": 1 }, { "b": 2 })
-    expect(length(keys(merged))).toBe(2)
+    val checks = [
+      expect(length(keys(merged))).toBe(2)
+    ]
+    checks
   ),
 
   test("pick returns only specified keys", () =>
     val obj = { "a": 1, "b": 2, "c": 3 }
     val p = pick(obj, ["a", "c"])
-    expect(length(keys(p))).toBe(2)
+    val checks = [
+      expect(length(keys(p))).toBe(2)
+    ]
+    checks
   ),
 
   test("pick includes correct values", () =>
     val obj = { "a": 1, "b": 2, "c": 3 }
     val p = pick(obj, ["a", "c"])
-    expect(p["a"]).toBe(1)
+    val checks = [
+      expect(p["a"]).toBe(1)
+    ]
+    checks
   ),
 
   test("pick second included value is correct", () =>
     val obj = { "a": 1, "b": 2, "c": 3 }
     val p = pick(obj, ["a", "c"])
-    expect(p["c"]).toBe(3)
+    val checks = [
+      expect(p["c"]).toBe(3)
+    ]
+    checks
   ),
 
   test("pick excludes unspecified keys", () =>
     val obj = { "a": 1, "b": 2, "c": 3 }
     val p = pick(obj, ["a", "c"])
-    expect(p["b"]).toBe(null)
+    val checks = [
+      expect(p["b"]).toBe(null)
+    ]
+    checks
   ),
 
   test("omit returns object without specified keys", () =>
     val obj = { "a": 1, "b": 2, "c": 3 }
     val o = omit(obj, ["b"])
-    expect(length(keys(o))).toBe(2)
+    val checks = [
+      expect(length(keys(o))).toBe(2)
+    ]
+    checks
   ),
 
   test("omit excluded key is absent", () =>
     val obj = { "a": 1, "b": 2, "c": 3 }
     val o = omit(obj, ["b"])
-    expect(o["b"]).toBe(null)
+    val checks = [
+      expect(o["b"]).toBe(null)
+    ]
+    checks
   ),
 
   test("omit keeps remaining keys", () =>
     val obj = { "a": 1, "b": 2, "c": 3 }
     val o = omit(obj, ["b"])
-    expect(o["a"]).toBe(1)
+    val checks = [
+      expect(o["a"]).toBe(1)
+    ]
+    checks
   ),
 
   test("mapValues transforms all values", () =>
     val obj = { "a": 1, "b": 2 }
     val m = mapValues(obj, x => x * 2)
-    expect(m["a"]).toBe(2)
+    val checks = [
+      expect(m["a"]).toBe(2)
+    ]
+    checks
   ),
 
   test("mapValues second value is transformed", () =>
     val obj = { "a": 1, "b": 2 }
     val m = mapValues(obj, x => x * 2)
-    expect(m["b"]).toBe(4)
+    val checks = [
+      expect(m["b"]).toBe(4)
+    ]
+    checks
   ),
 
   test("mapValues preserves all keys", () =>
     val obj = { "a": 1, "b": 2 }
     val m = mapValues(obj, x => x * 2)
-    expect(length(keys(m))).toBe(2)
+    val checks = [
+      expect(length(keys(m))).toBe(2)
+    ]
+    checks
   ),
 
-  test("isEmpty returns true for empty object", () =>
+  test("isEmpty returns true for empty object", () => [
     expect(isEmpty({})).toBe(true)
-  ),
+  ]),
 
-  test("isEmpty returns true for empty array", () =>
+  test("isEmpty returns true for empty array", () => [
     expect(isEmpty([])).toBe(true)
-  ),
+  ]),
 
-  test("isEmpty returns true for empty string", () =>
+  test("isEmpty returns true for empty string", () => [
     expect(isEmpty("")).toBe(true)
-  ),
+  ]),
 
-  test("isEmpty returns false for non-empty object", () =>
+  test("isEmpty returns false for non-empty object", () => [
     expect(isEmpty({ "a": 1 })).toBe(false)
-  ),
+  ]),
 
-  test("isEmpty returns false for non-empty array", () =>
+  test("isEmpty returns false for non-empty array", () => [
     expect(isEmpty([1])).toBe(false)
-  ),
+  ]),
 
-  test("isEmpty returns false for non-empty string", () =>
+  test("isEmpty returns false for non-empty string", () => [
     expect(isEmpty("hi")).toBe(false)
-  ),
+  ]),
 ])
 
 run(s)
