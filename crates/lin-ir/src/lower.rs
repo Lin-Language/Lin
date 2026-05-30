@@ -531,6 +531,20 @@ impl FuncBuilder {
         }
     }
 
+    /// True if `t` is registered as owned (holds an independent +1) in any live scope frame.
+    /// Used at the function return boundary to distinguish a value the scope already owns
+    /// (fresh alloc, retained projection, cloned cell/global read — return it as-is) from a
+    /// BORROWED interior pointer (e.g. a union/Json `obj[k]` projection — `lin_object_get`
+    /// hands back a `*TaggedVal` pointing INTO the container, which the lowerer deliberately
+    /// does NOT own). The latter must be cloned before it escapes as the result, or the
+    /// caller's uniform "result is owned +1, release it" convention double-frees the interior
+    /// value when the container is also released.
+    fn is_owned_in_scope(&self, t: Temp) -> bool {
+        self.scope_owned
+            .iter()
+            .any(|frame| frame.iter().any(|(owned, _)| *owned == t))
+    }
+
     /// THE container-insert ownership rule, in one place.
     ///
     /// When a value is stored into a container that takes ownership of one reference
@@ -3365,6 +3379,30 @@ fn lower_function_expr_with_id(
     // surface type `Null`, but the cell (and the CellGet temp) is `Json`. Trusting the
     // stale `Null` would coerce the live Json value to a boxed null on return.
     let body_ty = inner_builder.temp_types.get(&raw_ret).cloned().unwrap_or_else(|| body.ty());
+    // A function result MUST be an OWNED (+1) reference — the uniform call convention has the
+    // caller `register_owned` the result and release it at scope exit. A BORROWED union/Json
+    // projection (`obj[k]` / `obj.field`) violates this: the lowerer deliberately does NOT own
+    // a union projection (`lin_object_get` returns an INTERIOR `*TaggedVal` into the container,
+    // not an ownable box — correct for transient in-place use), so if such a value ESCAPES as
+    // the body result, the callee hands back the interior pointer and the caller's release
+    // double-frees it once the container is released. Clone the borrowed box (`CloneBox` →
+    // `lin_tagged_clone`, the established "own a union value" primitive — see `own_for_read`)
+    // into a fresh owned +1 box so the result satisfies the convention. Only values NOT already
+    // owned in scope are cloned (a fresh alloc, a retained concrete projection, or an
+    // already-cloned cell/global read is left untouched — cloning it would leak). The transient
+    // read fast path (read a field, use it inline, don't escape) never reaches here, so it is
+    // not cloned. Skip when the block diverged (no live result temp).
+    let raw_ret = if !inner_builder.is_current_block_terminated()
+        && is_union_ty(&body_ty)
+        && !inner_builder.is_owned_in_scope(raw_ret)
+    {
+        let dst = inner_builder.alloc_temp(body_ty.clone());
+        inner_builder.emit(Instruction::CloneBox { dst, src: raw_ret, ty: body_ty.clone() });
+        inner_builder.register_owned(dst, body_ty.clone());
+        dst
+    } else {
+        raw_ret
+    };
     // Closure return ABI:
     // - `forced_ret` (set when this closure is a callback argument whose parameter declares
     //   a concrete return, e.g. groupBy's `keyFn: (Json) => String`): return exactly that

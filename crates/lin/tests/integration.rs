@@ -4293,3 +4293,70 @@ print(toString(doubled([5, 6, 7])))
 "#);
     assert_eq!(out, vec!["40000", "[10, 12, 14]"]);
 }
+
+#[test]
+fn test_union_projection_returned_no_double_free() {
+    // Regression: a Json/union projection (`obj[k]` / `obj.field`) RETURNED from a function
+    // double-freed. `lin_object_get` hands back a BORROWED INTERIOR `*TaggedVal` pointing into
+    // the container's entry array — NOT an ownable heap box. The lowerer deliberately does not
+    // own a union projection (correct for transient in-place use), but the uniform call
+    // convention has the caller treat a function result as OWNED (+1) and release it. When such
+    // a projection ESCAPES as the return value, the container release frees the interior value
+    // AND the caller's release frees it again → `free(): invalid pointer`. The fix clones a
+    // borrowed union projection (`CloneBox` → `lin_tagged_clone`) at the function return
+    // boundary so the result is a genuine owned +1 box. Each case below crashed with exit 1
+    // before the fix; the `run` harness asserts a successful exit, so a relapse fails the test.
+
+    // Projection returned directly from a named function (the minimal `pluck` repro).
+    let out = run(r#"import { print } from "std/io"
+val pluck = (x: Json): Json => x["name"]
+print(pluck({ "name": "Alice" }))
+"#);
+    assert_eq!(out, vec!["Alice"]);
+
+    // Projection returned from a map CALLBACK closure, result stored into an array then iterated:
+    // each element must be an owned box the array releases exactly once.
+    let out = run(r#"import { print } from "std/io"
+import { for, map } from "std/array"
+val records = [{ "name": "Alice" }, { "name": "Bob" }]
+records.map(r => r["name"]).for(n => print(n))
+"#);
+    assert_eq!(out, vec!["Alice", "Bob"]);
+
+    // Nested projection (`r["value"]["name"]`) through a map callback: the inner projection is a
+    // transient read, the outer escapes — only the escaping result is cloned.
+    let out = run(r#"import { print } from "std/io"
+import { map, for } from "std/array"
+val records = [{ "value": { "name": "Alice" } }, { "value": { "name": "Bob" } }]
+val names = records.map(r => r["value"]["name"])
+names.for(n => print(n))
+"#);
+    assert_eq!(out, vec!["Alice", "Bob"]);
+
+    // Projection bound to a `val` and THEN returned (a different escape route into the return
+    // boundary than a bare projection expression): the bound borrowed projection must still be
+    // cloned to an owned box before it leaves the scope.
+    let out = run(r#"import { print } from "std/io"
+val pluck = (x: Json): Json =>
+  val n = x["name"]
+  n
+print(pluck({ "name": "Carol" }))
+"#);
+    assert_eq!(out, vec!["Carol"]);
+
+    // Calling the projection-returning function many times in a loop must stay balanced (the
+    // per-call clone is released each iteration; a relapse to the borrowed-return double-free,
+    // or a per-iteration over-clone leak, would surface here / under the ASan CI leg).
+    let out = run(r#"import { print } from "std/io"
+import { range, for } from "std/array"
+import { toString } from "std/string"
+val pluck = (x: Json): Json => x["v"]
+var c = 0
+range(0, 2000).for(i =>
+  c = c + 1
+  print(toString(pluck({ "v": "x" })))
+)
+print(toString(c))
+"#);
+    assert_eq!(out.last().map(|s| s.as_str()), Some("2000"));
+}
