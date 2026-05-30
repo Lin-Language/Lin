@@ -1178,15 +1178,42 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             if let Some(cell_ty) = builder.cell_slots.get(slot).cloned() {
                 if let Some(&cell) = builder.slots.get(slot) {
                     let v = coerce_to_slot_type(val_temp, &value.ty(), &cell_ty, builder);
+                    // When the slot is a union and the value was concrete, `coerce_to_slot_type`
+                    // allocated a FRESH transient `TaggedVal*` box `v` wrapping the raw value (the
+                    // raw value keeps its own +1, released at scope exit). We clone `v` once for the
+                    // cell's owned reference and once for the assignment result, then free the
+                    // orphaned `v` shell (its inner is owned by the raw value's scope-exit release).
+                    // Mirrors the Var-init path's `coerce_and_own_store` and the global path below.
+                    let made_fresh_box = is_union_ty(&cell_ty)
+                        && !is_union_ty(&value.ty())
+                        && type_repr_differs(&value.ty(), &cell_ty);
                     // The cell owns an INDEPENDENT reference to its value: take an owned copy on
                     // store so it survives the producing scope's own release, and codegen
                     // releases the cell's OLD reference on reassignment (fixing the
                     // per-reassignment leak). Concrete rc: retain `v` in place (the stored
                     // pointer is `v` with rc+1). Union: clone the box (`stored` is a fresh
                     // TaggedVal* the cell exclusively owns) so release-old never frees a
-                    // borrowed box. The LocalSet expression result stays `v` (a borrowed view).
+                    // borrowed box.
                     let stored = own_for_store(v, &cell_ty, builder);
-                    builder.emit(Instruction::CellSet { cell, value: stored, ty: cell_ty });
+                    builder.emit(Instruction::CellSet { cell, value: stored, ty: cell_ty.clone() });
+                    // The assignment EXPRESSION result must be an INDEPENDENTLY-owned value (not the
+                    // transient box `v`): a discarding caller (e.g. the `for` callback-return
+                    // release) can then reclaim it without touching the cell's distinct reference.
+                    // `own_for_read` clones the box (union) / retains (concrete rc) and registers it
+                    // for scope-exit release.
+                    if needs_owning(&cell_ty) {
+                        let result = own_for_read(v, &cell_ty, builder);
+                        // Free the transient coercion box shell AFTER both clones read it (freeing
+                        // earlier would be a use-after-free of the shell). A fresh box implies a
+                        // union slot, so this only runs on the owning path. `result` is a distinct
+                        // box, so freeing `v`'s shell can't touch it.
+                        if made_fresh_box {
+                            builder.emit(Instruction::FreeBoxShell { val: v });
+                        }
+                        return result;
+                    }
+                    // Non-owning cell: `made_fresh_box` is impossible (it requires a union slot),
+                    // so there is no transient box to free and `v` is the raw value itself.
                     return v;
                 }
             }
@@ -1195,6 +1222,16 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // to the global's declared representation first.
             if let Some(gty) = ctx.global_val_slots.get(slot).cloned() {
                 let v = coerce_to_slot_type(val_temp, &value.ty(), &gty, builder);
+                // When the slot is a union and the value was concrete, `coerce_to_slot_type`
+                // allocated a FRESH transient `TaggedVal*` box `v` wrapping the raw value (the
+                // raw value keeps its own +1, released at scope exit). Below we clone `v` once for
+                // the global's owned reference and once for the assignment result; the original
+                // `v` shell is then an orphan and must have its 16-byte shell freed (its inner is
+                // owned by the raw value's scope-exit release, NOT by `v`). Mirrors the Var-init
+                // path's `coerce_and_own_store`. When no fresh box was made (already-union value,
+                // or non-union slot), nothing extra is freed.
+                let made_fresh_box =
+                    is_union_ty(&gty) && !is_union_ty(&value.ty()) && type_repr_differs(&value.ty(), &gty);
                 // The global owns an INDEPENDENT reference to its value (symmetric owning model,
                 // mirroring the captured-cell path above). For unions this CLONES the box
                 // (`own_for_store` → `CloneBox`/`lin_tagged_clone`) so the global gets its OWN
@@ -1210,8 +1247,19 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 // box (union) / retains (concrete rc) and registers it for scope-exit release, so
                 // when the result is NOT discarded by a loop it is still reclaimed at teardown.
                 if needs_owning(&gty) {
-                    return own_for_read(v, &gty, builder);
+                    let result = own_for_read(v, &gty, builder);
+                    // Free the transient coercion box shell AFTER cloning it for both the store
+                    // (`own_for_store`) and the result (`own_for_read`) — freeing it earlier would
+                    // be a use-after-free of the shell those clones read. A fresh box implies a
+                    // union slot, so this only runs on the owning path here. (`result` is a
+                    // distinct, independently-owned box, so freeing `v`'s shell can't touch it.)
+                    if made_fresh_box {
+                        builder.emit(Instruction::FreeBoxShell { val: v });
+                    }
+                    return result;
                 }
+                // Non-owning slot: `made_fresh_box` is impossible (it requires a union slot), so
+                // there is no transient box to free and `v` is the raw value itself.
                 return v;
             }
             builder.slots.insert(*slot, val_temp);

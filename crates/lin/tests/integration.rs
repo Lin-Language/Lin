@@ -3234,3 +3234,38 @@ print("done")
 "#);
     assert_eq!(out, vec!["done"]);
 }
+
+#[test]
+fn test_concrete_string_into_json_var_loop() {
+    // Regression: reassigning a fresh CONCRETE value (toString -> String) into a Json/union
+    // `var` inside a loop boxes the value via Coerce, producing a transient TaggedVal* shell.
+    // The LocalSet store path used to clone that box for the global/cell AND for the result
+    // but never freed the transient shell, leaking ~36 bytes per iteration. The fix frees the
+    // shell (FreeBoxShell) after both clones. This asserts correctness: the var must hold the
+    // last assigned value and the program must not crash (no use-after-free / double-free).
+    let out = run(r#"import { range, for } from "std/array"
+import { toString } from "std/string"
+import { print } from "std/io"
+
+var last: Json = ""
+range(0, 5).for(i => last = toString(i))
+print(toString(last))
+"#);
+    assert_eq!(out, vec!["4"]);
+}
+
+#[test]
+fn test_concrete_object_into_json_var_loop() {
+    // Regression companion to the String case: a fresh concrete Object boxed into a Json var
+    // each iteration. Exercises the same transient-coercion-box free path with an Object payload
+    // and confirms the final stored value is correct.
+    let out = run(r#"import { range, for } from "std/array"
+import { toString } from "std/string"
+import { print } from "std/io"
+
+var last: Json = null
+range(0, 5).for(i => last = { "n": i })
+print(toString(last))
+"#);
+    assert_eq!(out, vec![r#"{"n": 4}"#]);
+}
