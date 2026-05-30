@@ -3317,6 +3317,46 @@ Adds a millisecond timeout to `promise`. If the promise does not resolve within 
 
 ---
 
+### shared / get / set / withLock
+
+```txt
+val shared:   <T>(T) -> Shared<T>
+val get:      <T>(Shared<T>) -> T
+val set:      <T>(Shared<T>, T) -> Null
+val withLock: <T, R>(Shared<T>, (T) -> R) -> R
+```
+
+`Shared<T>` is opt-in **shared mutable state** for many threads (ADR-043 §2.3.1): an
+atomic-refcounted box wrapping a reader-writer lock over a private copy of the value.
+
+- `shared(v)` creates a `Shared<T>` boxing a deep copy of `v` (must be transferable).
+- `get(s)` takes the **read** lock and returns a deep-copied snapshot (concurrent with other
+  `get`s).
+- `set(s, v)` takes the **write** lock and replaces the inner value with a deep copy of `v`.
+- `withLock(s, f)` holds the **write** lock across `f`, which receives the inner value mutable
+  in place (e.g. `a => push(a, 7)`); `f`'s result is copied out. Use this for atomic
+  read-modify-write.
+
+```txt
+val s = shared([4, 5, 6])
+val snap = s.get()                  // snapshot copy
+s.set([7, 8, 9])                    // replace wholesale
+s.withLock(arr => push(arr, 7))     // atomic in-place mutate
+val n = s.withLock(arr => length(arr))   // read a derived value out
+```
+
+Safety: every value entering is copied in, every value leaving is copied out, so no live
+reference into the box escapes the lock. `get`/`set` are individually atomic but not across the
+gap (last-writer-wins); use `withLock` when the update must be atomic.
+
+> Caveat: `withLock` mutates **in place**, so a scalar accumulator (`n => n + 1`) does not
+> persist — use a one-element array or `get`/`set`. The compile-time accessor-only enforcement
+> (rejecting e.g. `push(s, 7)` directly on a `Shared`) is not yet wired (it needs a dedicated
+> `Shared<T>` type variant in the checker); the runtime box semantics are fully enforced.
+> Importing both `std/array`'s `set` and this `set` in one file collides — alias one.
+
+---
+
 ### worker
 
 ```txt

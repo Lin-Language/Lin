@@ -81,10 +81,17 @@ unsafe fn clone_object(src: *const LinObject) -> *mut LinObject {
 /// Transfer one tagged payload (the 8-byte field) by kind: scalars copy verbatim; heap
 /// pointers are deep-copied.
 unsafe fn transfer_payload(tag: u8, payload: u64) -> u64 {
+    use crate::tagged::TAG_SHARED;
     match tag {
         TAG_STR => clone_string(payload as *const LinString) as u64,
         TAG_ARRAY => clone_array(payload as *const LinArray) as u64,
         TAG_OBJECT => clone_object(payload as *const LinObject) as u64,
+        TAG_SHARED => {
+            // Nesting/boundary rule (ADR-043 §2.3.1): a Shared box embedded in a transferred
+            // value is NOT deep-copied through — bump its atomic refcount and SHARE the box.
+            crate::shared::lin_shared_retain_box(payload as *const u8);
+            payload
+        }
         // Scalars: copy verbatim. (TAG_FUNCTION is not transferable data — the checker
         // prevents it appearing here; pass through as a last resort.)
         _ => payload,

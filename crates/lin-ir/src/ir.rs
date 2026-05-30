@@ -106,6 +106,12 @@ pub enum Intrinsic {
     Retry,
     ThreadPool,
     Worker,
+    // Shared<T> — opt-in shared mutable state (ADR-043 §2.3.1). shared(v) boxes a private copy;
+    // get/set/withLock are the only accessors (copy out / copy in / locked in-place mutate).
+    SharedNew,
+    SharedGet,
+    SharedSet,
+    SharedWithLock,
     Request,
     Message,
     Close,

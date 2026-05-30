@@ -1980,6 +1980,73 @@ print(r["type"])
 }
 
 #[test]
+fn test_shared_get_set() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { shared, get, set } from "std/async"
+
+val s = shared([4, 5, 6])
+print(toString(get(s)))
+set(s, [7, 8, 9])
+print(toString(get(s)))
+"#);
+    assert_eq!(output, vec!["[4, 5, 6]", "[7, 8, 9]"]);
+}
+
+#[test]
+fn test_shared_withlock_in_place_mutate() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { shared, get, withLock } from "std/async"
+import { push, length } from "std/array"
+
+val arr = shared([1, 2, 3])
+withLock(arr, a => push(a, 4))
+print(toString(length(withLock(arr, a => a))))
+print(toString(get(arr)))
+"#);
+    assert_eq!(output, vec!["4", "[1, 2, 3, 4]"]);
+}
+
+#[test]
+fn test_shared_escape_returns_copy() {
+    // A value returned out of withLock is a COPY: mutating it does not affect the box.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { shared, get, withLock } from "std/async"
+import { push } from "std/array"
+
+val arr = shared([1, 2, 3])
+val leaked = withLock(arr, a => a)
+push(leaked, 999)
+print(toString(get(arr)))
+"#);
+    assert_eq!(output, vec!["[1, 2, 3]"]);
+}
+
+#[test]
+fn test_shared_concurrent_withlock_no_lost_updates() {
+    // N threads each push to a shared array under the write lock → all updates land.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { shared, get, withLock, parallel } from "std/async"
+import { push, length } from "std/array"
+
+val box = shared([])
+val tasks = parallel([
+  () => withLock(box, a => push(a, 1)),
+  () => withLock(box, a => push(a, 1)),
+  () => withLock(box, a => push(a, 1)),
+  () => withLock(box, a => push(a, 1)),
+  () => withLock(box, a => push(a, 1)),
+  () => withLock(box, a => push(a, 1))
+])
+print(toString(length(get(box))))
+"#);
+    assert_eq!(output, vec!["6"]);
+}
+
+#[test]
 fn test_async_real_parallelism() {
     // Two thunks that each sleep 150ms. With real OS threads the wall-clock should be
     // ~150ms (overlap), not ~300ms (sequential). Assert it completed well under the

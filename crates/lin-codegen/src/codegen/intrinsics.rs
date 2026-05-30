@@ -387,6 +387,47 @@ impl<'ctx> Codegen<'ctx> {
                 // Box the raw *LinWorker so it round-trips through TypeVar slots / Json params.
                 self.box_handle(raw)
             }
+            // shared(v) → lin_shared_new(boxed v) → boxed Shared (TAG_SHARED). v may arrive
+            // concrete; box it so the runtime receives a TaggedVal* to deep-copy in.
+            Intrinsic::SharedNew => {
+                let v = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let v_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
+                let v_boxed = if Self::is_union_type(&v_ty) || v.is_pointer_value() { v } else { self.box_value(v, &v_ty) };
+                let f = self.get_or_declare_fn("lin_shared_new", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(f, &[v_boxed.into()], "ir_shared_new").try_as_basic_value().unwrap_basic()
+            }
+            // get(s) → lin_shared_get(s) → boxed snapshot (unboxed to the concrete result type).
+            Intrinsic::SharedGet => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let f = self.get_or_declare_fn("lin_shared_get", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                let tagged = self.builder.call(f, &[s.into()], "ir_shared_get").try_as_basic_value().unwrap_basic();
+                if !Self::is_union_type(ret_ty) && *ret_ty != Type::Null {
+                    self.unbox_tagged_val_to_type(tagged, ret_ty)
+                } else { tagged }
+            }
+            // set(s, v) → lin_shared_set(s, boxed v) → Null.
+            Intrinsic::SharedSet => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let v = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let v_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                let v_boxed = if Self::is_union_type(&v_ty) || v.is_pointer_value() { v } else { self.box_value(v, &v_ty) };
+                let f = self.get_or_declare_fn("lin_shared_set", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(f, &[s.into(), v_boxed.into()], "ir_shared_set").try_as_basic_value().unwrap_basic()
+            }
+            // withLock(s, f) → lin_shared_with_lock(s, fclosure) → boxed result (unboxed to ret).
+            Intrinsic::SharedWithLock => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                let func = if Self::is_union_type(&func_ty) && func.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[func.into()], "ir_wl_cls").try_as_basic_value().unwrap_basic()
+                } else { func };
+                let f = self.get_or_declare_fn("lin_shared_with_lock", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                let tagged = self.builder.call(f, &[s.into(), func.into()], "ir_shared_wl").try_as_basic_value().unwrap_basic();
+                if !Self::is_union_type(ret_ty) && *ret_ty != Type::Null {
+                    self.unbox_tagged_val_to_type(tagged, ret_ty)
+                } else { tagged }
+            }
             // w.request(msg) → lin_worker_request(w, boxed msg) → result (unboxed if concrete).
             Intrinsic::Request => {
                 let worker_boxed = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());

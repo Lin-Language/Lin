@@ -16,6 +16,7 @@ pub mod net;
 pub mod number;
 pub mod object;
 pub mod path;
+pub mod shared;
 pub mod proc;
 pub mod server;
 pub mod signal;

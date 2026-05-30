@@ -48,6 +48,11 @@ pub const TAG_PROMISE: u8 = 16;
 /// round-trips through TypeVar slots; codegen boxes the constructor result and unboxes at the
 /// method boundary (`pool.async`, `w.request`/`message`/`close`). RC is a no-op for this tag.
 pub const TAG_HANDLE: u8 = 17;
+/// `Shared<T>` box — payload is a `*const SharedBox` (atomic-refcounted, RwLock-guarded shared
+/// mutable state, §2.3.1). Unlike other heap tags, its refcount is ATOMIC: retain/release go
+/// through `lin_shared_retain`/`lin_shared_release`. The thread-transfer copy path shares it by
+/// an atomic bump rather than deep-copying through it (the nesting rule).
+pub const TAG_SHARED: u8 = 18;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -446,6 +451,7 @@ pub unsafe extern "C" fn lin_tagged_release(p: *mut u8) {
         TAG_STR => crate::string::lin_string_release(payload as *mut crate::string::LinString),
         TAG_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
         TAG_OBJECT => crate::object::lin_object_release(payload as *mut crate::object::LinObject),
+        TAG_SHARED => crate::shared::lin_shared_release_box(payload as *const u8),
         _ => {} // Scalars (null, bool, int, float) have no heap payload.
     }
     // Cached scalar boxes (small ints, bools) are immutable statics — never free them.

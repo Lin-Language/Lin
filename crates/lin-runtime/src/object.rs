@@ -55,6 +55,7 @@ unsafe fn release_tagged_payload(tv: &TaggedVal) {
         TAG_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
         TAG_OBJECT => lin_object_release(payload as *mut LinObject),
         TAG_FUNCTION => crate::memory::lin_closure_release(payload as *mut u8),
+        TAG_SHARED => crate::shared::lin_shared_release_box(payload as *const u8),
         _ => {}
     }
 }
@@ -77,6 +78,10 @@ unsafe fn retain_tagged_payload(tv: &TaggedVal) {
         TAG_OBJECT => {
             let o = payload as *mut LinObject;
             if !o.is_null() { (*o).refcount += 1; }
+        }
+        TAG_SHARED => {
+            // Atomic refcount on the Shared box (cross-thread-shared).
+            crate::shared::lin_shared_retain_box(payload as *const u8);
         }
         _ => {} // scalars: no heap payload
     }
