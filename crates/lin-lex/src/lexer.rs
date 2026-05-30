@@ -216,7 +216,12 @@ impl Lexer {
             return true;
         }
         let prev = self.source[self.pos - 1];
-        matches!(prev, '(' | ',' | '=' | ':' | ' ')
+        // `-` begins a negative literal (not a binary subtraction) when it follows a token that
+        // cannot end an expression: an opener `( [`, a separator `, =  :`, or whitespace. After
+        // `[` specifically, `-1` is an array element, so `[-1, ...]` must lex like `[ -1, ...]`
+        // (otherwise the `0 - 1` Sub it would become types as Int32 and can't narrow to e.g.
+        // Int8[]).
+        matches!(prev, '(' | '[' | ',' | '=' | ':' | ' ')
     }
 
     fn lex_string(&mut self) -> Token {

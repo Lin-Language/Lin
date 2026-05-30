@@ -3764,16 +3764,31 @@ print(toString(buf))
 
 #[test]
 fn test_int8_flat_array_negatives() {
-    // Int8[] stores signed bytes; negative literals (written `-N` with a preceding space so
-    // the lexer treats `-` as part of the literal) round-trip.
+    // Int8[] stores signed bytes; negative literals round-trip. Regression: a `-` immediately
+    // after `[` (no space) must lex as a negative literal — `[-1, ...]` — not a `0 - 1`
+    // subtraction (which types as Int32 and fails to narrow to Int8). Both spacings now work.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 
-val s: Int8[] = [ -1, 127]
-print(toString(s[0]))
-print(toString(s[1]))
+val nospace: Int8[] = [-1, -128, 127]
+print(toString(nospace[0]))
+print(toString(nospace[1]))
+val space: Int8[] = [ -2, 100]
+print(toString(space[0]))
 "#);
-    assert_eq!(out, vec!["-1", "127"]);
+    assert_eq!(out, vec!["-1", "-128", "-2"]);
+
+    // The fix must NOT turn index-position subtraction into a literal: `a[i-1]` and `a[i - 1]`
+    // still subtract (the `-` follows `i`, not `[`).
+    let idx = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val a = [10, 20, 30]
+val i = 2
+print(toString(a[i-1]))
+print(toString(a[i - 1]))
+"#);
+    assert_eq!(idx, vec!["20", "20"]);
 }
 
 #[test]
