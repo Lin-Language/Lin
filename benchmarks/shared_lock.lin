@@ -1,0 +1,33 @@
+// Benchmark: Shared<T> lock throughput under contention.
+//
+// Several threads hammer one Shared<T> box: each task takes the write lock many
+// times via `withLock` (a read-modify-write on a one-element counter array). This
+// measures RwLock acquire/release cost plus the copy-in/out at the lock boundary
+// under real cross-thread contention — the price of opt-in shared mutable state.
+import { print } from "std/io"
+import { toString } from "std/string"
+import { parallel, shared, get, withLock } from "std/async"
+import { push, length, for, range } from "std/array"
+
+val box = shared([])
+
+// One worker: take the write lock `iters` times, pushing an element each time.
+// `box` is a top-level val captured by the thunk; the Shared box is shared by
+// reference across threads (atomic refcount), not copied (the nesting rule).
+val hammer = (iters: Int32): Int32 =>
+  range(0, iters).for(i => withLock(box, a => push(a, 1)))
+  0
+
+val tasks = parallel([
+  () => hammer(20000),
+  () => hammer(20000),
+  () => hammer(20000),
+  () => hammer(20000),
+  () => hammer(20000),
+  () => hammer(20000),
+  () => hammer(20000),
+  () => hammer(20000)
+])
+
+// 8 workers x 20000 locked pushes = 160000 elements if no update is lost.
+print(toString(length(get(box))))

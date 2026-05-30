@@ -1,0 +1,32 @@
+// Benchmark: parallel speedup — CPU-bound work fanned across OS threads.
+//
+// Eight independent CPU-bound chunks run via `parallel`. On a multicore box the
+// wall-clock should approach the time of a single chunk (the chunks overlap),
+// while total CPU time stays ~8x — so this measures real parallel throughput,
+// not just spawn overhead. The work is data-dependent (a Collatz-style walk) so
+// the optimizer can't fold it away.
+import { print } from "std/io"
+import { toString } from "std/string"
+import { parallel } from "std/async"
+import { for } from "std/array"
+
+// Data-dependent integer walk; `n` iterations accumulating a running sum.
+val walk = (start: Int32, n: Int32, steps: Int32): Int32 =>
+  if n == 0 then steps
+  else
+    val next =
+      if start == 1 then 27
+      else if start - (start / 2) * 2 == 0 then start / 2
+      else 3 * start + 1
+    walk(next, n - 1, steps + start)
+
+val chunk = (): Int32 => walk(27, 30000000, 0)
+
+val results = parallel([
+  () => chunk(), () => chunk(), () => chunk(), () => chunk(),
+  () => chunk(), () => chunk(), () => chunk(), () => chunk()
+])
+
+var sum = 0
+results.for(v => sum = sum + v)
+print(toString(sum))
