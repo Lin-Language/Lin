@@ -2197,6 +2197,85 @@ values({ "a": 1, "b": 2 })   // [1, 2]
 
 ---
 
+## std/json
+
+Import:
+
+```txt
+import { fromJson } from "std/json"
+```
+
+---
+
+### fromJson
+
+```txt
+val fromJson: (Type, value: Json) -> T | Error
+```
+
+Type-directed decode: validates a `Json` value against the target type `T` and returns either
+the decoded value (typed as `T`) or an `Error`. Write it idiomatically as `T.fromJson(json)` or
+equivalently as `fromJson(T, json)`. `T` is a **type** (a type name or `type` alias), not a
+runtime value.
+
+```txt
+type Person = { "name": String, "age": Int32 }
+
+val p = Person.fromJson({ "name": "Bob", "age": 30 })
+// p is Person | Error
+```
+
+**Detecting failure.** On the first structural mismatch `fromJson` returns a single `Error`
+object — it stops at the first error and does not collect all of them. The `Error` shape is:
+
+```txt
+{ "type": "error", "message": String, "path": String }
+```
+
+`path` is a JSONPath-ish location of the mismatch, e.g. `$.address.city` or `$[2]`. Detect a
+decode failure with `is Error` or, equivalently, the discriminant `result["type"] == "error"`.
+`is Error` is special-cased to check the `"type": "error"` discriminant (not just the object
+tag), so it distinguishes a decode failure from a successfully-decoded value (see ADR-047).
+
+```txt
+// Idiomatic: match on `T | Error`. The `is Error` arm MUST come first — a structural object
+// type like `Person` is matched by a bare object tag check, so a later `is Person` arm would
+// also catch the Error object (union first-match-wins, ADR-047).
+val describe = (r: Person | Error): Null =>
+  match r
+    is Error => print("decode failed at ${r["path"]}: ${r["message"]}")
+    is Person => print("hello, ${r["name"]}")
+
+// Equivalent, using the discriminant directly:
+val r = Person.fromJson(input)
+if r["type"] == "error" then
+  print("decode failed at ${r["path"]}: ${r["message"]}")
+else
+  print("hello, ${r["name"]}")
+```
+
+**What is validated.**
+
+- **Objects**: every required field must be present with a compatible type; a field is optional
+  (may be absent) iff its target type includes `Null` (e.g. `String | Null`). Extra keys are
+  ignored (width subtyping).
+- **Arrays** (`T[]`): every element is validated against `T`. **Fixed arrays** (`[A, B]`): the
+  length must match exactly and each position is validated.
+- **Unions**: the **first** structurally-matching variant wins. Prefer a discriminant field for
+  overlapping object variants (ADR-047).
+- **Numbers** (target-driven): an **integer** target requires an integral, in-range number
+  (`3.14` → error; out-of-range → error); a **float** target accepts any number; a
+  `Json`/unconstrained target accepts any number as-is.
+- Recursive types (e.g. `type Tree = { "value": Int32, "children": Tree[] }`) are supported.
+
+Array, fixed-array, and union targets must be named via a `type` alias (the receiver must be a
+bare type name): `type IntArr = Int32[]; IntArr.fromJson([1, 2, 3])`.
+
+A `Json` value cannot be assigned to a concrete structured object without decoding — `fromJson`
+(or `is`/`has` narrowing) is the sound conversion (ADR-046).
+
+---
+
 ## std/io
 
 Import:

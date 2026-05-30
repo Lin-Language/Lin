@@ -1,0 +1,21 @@
+// std/json — type-directed JSON decoding (ADR-047).
+//
+// `fromJson` is a compiler special form: the type checker recognises the surface name
+// `fromJson` at the call site (in both the `Person.fromJson(json)` dot form and the
+// `fromJson(Person, json)` direct form) and decodes the Json value against the target type T,
+// returning `T | Error`. Decoding stops at the first structural mismatch and returns a single
+// Error value: { "type": "error", "message": String, "path": String } (the `path` is a
+// JSONPath-ish location such as `$.address.city`).
+//
+// Number policy is target-driven: an integer target requires an in-range integral number; a
+// float target accepts any number; a Json/unconstrained target accepts any number as-is.
+// Union targets pick the FIRST structurally-matching variant.
+//
+// The export below exists so `import { fromJson } from "std/json"` resolves and `lin check`
+// does not flag `fromJson` as undefined. Its body is never evaluated for real call sites: the
+// checker rewrites those into the decode special form before this signature is consulted. The
+// first argument is a TYPE (for example `Person`), which is why no ordinary value-level
+// wrapper can express it.
+
+export val fromJson = (type: Json, value: Json): Json =>
+  value

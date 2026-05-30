@@ -134,6 +134,20 @@ pub enum TypedExpr {
         result_type: Type,
         span: Span,
     },
+    /// `T.fromJson(value)` / `fromJson(T, value)` — type-directed decode (ADR-047).
+    /// `target` is the resolved concrete `Type` T (drives the runtime schema descriptor);
+    /// `value` is the Json input; `result_type` is `T | Error` and flows to the surrounding
+    /// assignment/return check.
+    FromJson {
+        target: Type,
+        value: Box<TypedExpr>,
+        result_type: Type,
+        /// Resolved bodies of every `Named` type reachable from `target`, so codegen can
+        /// build the recursive schema descriptor without a type environment. Recursion points
+        /// in `target`/these bodies remain `Type::Named(n)` and are looked up here (ADR-047).
+        named_defs: Vec<(String, Type)>,
+        span: Span,
+    },
     Match {
         scrutinee: Box<TypedExpr>,
         arms: Vec<TypedMatchArm>,
@@ -215,6 +229,7 @@ impl TypedExpr {
             TypedExpr::Coerce { to, .. } => to.clone(),
             TypedExpr::Call { result_type, .. } => result_type.clone(),
             TypedExpr::If { result_type, .. } => result_type.clone(),
+            TypedExpr::FromJson { result_type, .. } => result_type.clone(),
             TypedExpr::Match { result_type, .. } => result_type.clone(),
             TypedExpr::Block { ty, .. } => ty.clone(),
             TypedExpr::Function {
@@ -249,6 +264,7 @@ impl TypedExpr {
             TypedExpr::Coerce { span, .. } => *span,
             TypedExpr::Call { span, .. } => *span,
             TypedExpr::If { span, .. } => *span,
+            TypedExpr::FromJson { span, .. } => *span,
             TypedExpr::Match { span, .. } => *span,
             TypedExpr::Block { span, .. } => *span,
             TypedExpr::Function { span, .. } => *span,

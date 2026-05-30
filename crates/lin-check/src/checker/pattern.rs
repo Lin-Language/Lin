@@ -9,6 +9,31 @@ use crate::typed_ir::*;
 use crate::types::Type;
 
 impl Checker {
+    /// Build the `Error` discriminant pattern `{ "type": "error", "message": _ }` used to
+    /// desugar `is Error` (ADR-047). Field presence is checked for both keys; `"type"` carries
+    /// the literal value constraint `"error"` so a decoded value (which never has
+    /// `"type" == "error"`) does not match.
+    fn error_discriminant_pattern(&self, span: lin_common::Span) -> TypedPattern {
+        TypedPattern::Object {
+            fields: vec![
+                TypedPatternField {
+                    key: "type".to_string(),
+                    binding_slot: None,
+                    value_pattern: Some(Box::new(TypedExpr::StringLit("error".to_string(), span))),
+                    ty: Type::Str,
+                },
+                TypedPatternField {
+                    key: "message".to_string(),
+                    binding_slot: None,
+                    value_pattern: None,
+                    ty: Type::Str,
+                },
+            ],
+            rest: None,
+            span,
+        }
+    }
+
     pub(crate) fn check_match_arm(
         &mut self,
         arm: &lin_parse::ast::MatchArm,
@@ -68,6 +93,17 @@ impl Checker {
                     &self.env,
                 )
                 .map_err(|e| Diagnostic::error(*span, e))?;
+                // `is Error` / `match | is Error` (ADR-047): `Error` is a structural object
+                // alias `{ "type": String, "message": String }`. A bare tag check would match
+                // ANY object (e.g. a successfully-decoded `Person`), so `is Error` could not
+                // discriminate a decode failure from a decoded value. Desugar `is Error` into a
+                // value-constrained object pattern `{ "type": "error", "message": _ }`, reusing
+                // the existing object-pattern lowering which checks field presence AND the
+                // `"type" == "error"` discriminant at runtime. The decode-error object always
+                // carries `"type": "error"`; a decoded value of any other shape does not.
+                if name == "Error" {
+                    return Ok(self.error_discriminant_pattern(*span));
+                }
                 Ok(TypedPattern::TypeCheck(ty, *span))
             }
             Pattern::Literal(expr) => {

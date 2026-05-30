@@ -4915,3 +4915,310 @@ val sch = { "host": { "type": "string" }, "port": { "type": "number" } }
 "#);
     assert_eq!(out, vec!["true", "true", "false", "false", "false", "true"]);
 }
+
+// ---------------------------------------------------------------------------
+// fromJson type-directed decode (ADR-047)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_from_json_object_success() {
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val p = Person.fromJson({ "name": "Bob", "age": 30 })
+print(if p["type"] == "error" then "ERR" else "${p["name"]} ${p["age"]}")
+"#);
+    assert_eq!(out, vec!["Bob 30"]);
+}
+
+#[test]
+fn test_from_json_direct_call_form() {
+    // fromJson(T, j) equals T.fromJson(j).
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val p = fromJson(Person, { "name": "Zoe", "age": 9 })
+print(if p["type"] == "error" then "ERR" else "${p["name"]} ${p["age"]}")
+"#);
+    assert_eq!(out, vec!["Zoe 9"]);
+}
+
+#[test]
+fn test_from_json_missing_required_field() {
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val p = Person.fromJson({ "name": "Bob" })
+print(if p["type"] == "error" then "ERR" else "OK")
+"#);
+    assert_eq!(out, vec!["ERR"]);
+}
+
+#[test]
+fn test_from_json_missing_nullable_field_ok() {
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Opt = { "name": String, "nick": String | Null }
+val p = Opt.fromJson({ "name": "Bob" })
+print(if p["type"] == "error" then "ERR" else "OK ${p["name"]}")
+"#);
+    assert_eq!(out, vec!["OK Bob"]);
+}
+
+#[test]
+fn test_from_json_extra_field_ignored() {
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val p = Person.fromJson({ "name": "Bob", "age": 30, "extra": true })
+print(if p["type"] == "error" then "ERR" else "OK ${p["name"]}")
+"#);
+    assert_eq!(out, vec!["OK Bob"]);
+}
+
+#[test]
+fn test_from_json_wrong_type() {
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val p = Person.fromJson({ "name": "Bob", "age": "x" })
+print(if p["type"] == "error" then "ERR ${p["path"]}" else "OK")
+"#);
+    assert_eq!(out, vec!["ERR $.age"]);
+}
+
+#[test]
+fn test_from_json_int_range_reject() {
+    // `3.14` is non-integral; `5000000000.0` is integral but exceeds Int32's range. (A bare
+    // suffixless integer literal like 5000000000 is truncated to Int32 by the lexer before it
+    // ever reaches the decoder — spec §26 — so the overflow case is expressed as a float.)
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type T = { "n": Int32 }
+val a = T.fromJson({ "n": 3.14 })
+val b = T.fromJson({ "n": 5000000000.0 })
+print(if a["type"] == "error" then "a ERR" else "a OK")
+print(if b["type"] == "error" then "b ERR" else "b OK")
+"#);
+    assert_eq!(out, vec!["a ERR", "b ERR"]);
+}
+
+#[test]
+fn test_from_json_float_accepts_int() {
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type T = Float64
+val x = T.fromJson(5)
+print(if x["type"] == "error" then "ERR" else "OK ${x}")
+"#);
+    assert_eq!(out, vec!["OK 5"]);
+}
+
+#[test]
+fn test_from_json_nested_object() {
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Addr = { "city": String }
+type Person = { "name": String, "address": Addr }
+val ok = Person.fromJson({ "name": "A", "address": { "city": "NYC" } })
+val bad = Person.fromJson({ "name": "A", "address": { "city": 5 } })
+print(if ok["type"] == "error" then "ERR" else "OK ${ok["address"]["city"]}")
+print(if bad["type"] == "error" then "ERR ${bad["path"]}" else "OK")
+"#);
+    assert_eq!(out, vec!["OK NYC", "ERR $.address.city"]);
+}
+
+#[test]
+fn test_from_json_array() {
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type T = Int32[]
+val bad = T.fromJson([1, 2, "x"])
+print(if bad["type"] == "error" then "ERR ${bad["path"]}" else "OK")
+"#);
+    assert_eq!(out, vec!["ERR $[2]"]);
+}
+
+#[test]
+fn test_from_json_fixed_array() {
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Pair = [String, Int32]
+val ok = Pair.fromJson(["a", 7])
+val wrong_len = Pair.fromJson(["a", 7, 9])
+print(if ok["type"] == "error" then "ERR" else "OK ${ok[0]} ${ok[1]}")
+print(if wrong_len["type"] == "error" then "LEN_ERR" else "OK")
+"#);
+    assert_eq!(out, vec!["OK a 7", "LEN_ERR"]);
+}
+
+#[test]
+fn test_from_json_union_variant() {
+    // First structurally-matching variant wins (ADR-047).
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Shape = { "k": String, "r": Float64 } | { "k": String, "w": Int32 }
+val ok = Shape.fromJson({ "k": "circle", "r": 1.5 })
+val none = Shape.fromJson({ "k": "x", "z": 9 })
+print(if ok["type"] == "error" then "ERR" else "OK ${ok["k"]}")
+print(if none["type"] == "error" then "NONE" else "OK")
+"#);
+    assert_eq!(out, vec!["OK circle", "NONE"]);
+}
+
+#[test]
+fn test_from_json_recursive_type() {
+    // Exercises the descriptor back-edge: a recursive type must terminate.
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Tree = { "value": Int32, "children": Tree[] }
+val ok = Tree.fromJson({ "value": 1, "children": [{ "value": 2, "children": [] }] })
+val bad = Tree.fromJson({ "value": 1, "children": [{ "value": "x", "children": [] }] })
+print(if ok["type"] == "error" then "ERR" else "OK ${ok["children"][0]["value"]}")
+print(if bad["type"] == "error" then "ERR ${bad["path"]}" else "OK")
+"#);
+    assert_eq!(out, vec!["OK 2", "ERR $.children[0].value"]);
+}
+
+#[test]
+fn test_from_json_error_value_shape() {
+    // A decode Error carries type/message/path.
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val e = Person.fromJson({ "name": "Bob", "age": "x" })
+print("${e["type"]}")
+print(if e["message"] == null then "NO_MSG" else "HAS_MSG")
+print("${e["path"]}")
+"#);
+    assert_eq!(out, vec!["error", "HAS_MSG", "$.age"]);
+}
+
+#[test]
+fn test_from_json_is_error_discriminates() {
+    // `is Error` (ADR-047) distinguishes a decode FAILURE from a successfully-decoded value:
+    // the Error object carries `"type": "error"`, a decoded Person does not. `is Error`
+    // desugars to the value-constrained object pattern `{ "type": "error", .. }`.
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val good = Person.fromJson({ "name": "Ada", "age": 36 })
+val bad = Person.fromJson({ "name": "Bob", "age": "old" })
+print(if good is Error then "good:ERR" else "good:OK")
+print(if bad is Error then "bad:ERR" else "bad:OK")
+"#);
+    assert_eq!(out, vec!["good:OK", "bad:ERR"]);
+}
+
+#[test]
+fn test_from_json_match_is_error_idiom() {
+    // The agreed idiom: `match result | is Error => .. | is Person => ..`. Error MUST be the
+    // first arm (union first-match-wins: `is Person` is a bare object tag check that also
+    // matches the Error object — see ADR-047). Exhaustiveness accepts `is Error` as covering
+    // the Error variant of `Person | Error`.
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val describe = (r: Person | Error): Null =>
+  match r
+    is Error => print("err:${r["message"]}")
+    is Person => print("ok:${r["name"]}")
+val main = (): Null =>
+  describe(Person.fromJson({ "name": "Ada", "age": 36 }))
+  describe(Person.fromJson({ "name": "Bob", "age": "old" }))
+main()
+"#);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[0], "ok:Ada");
+    assert!(out[1].starts_with("err:"), "expected decode error, got {}", out[1]);
+}
+
+// Cast-hole closing (ADR-046): Json -> concrete structured object is now a type error.
+
+#[test]
+fn test_json_to_concrete_now_errors() {
+    // The TWO-STEP form: a Json-typed identifier assigned to a structured concrete object is a
+    // type error (ADR-046). NOTE: this form already worked before the headline fix — see
+    // test_json_call_result_to_concrete_now_errors for the real call-result hazard.
+    let err = run_expect_err(r#"type Person = { "name": String, "age": Int32 }
+val j: Json = { "name": "Bob", "age": 30 }
+val p: Person = j
+"#);
+    assert!(
+        err.contains("Person") || err.contains("4294967295") || err.to_lowercase().contains("json"),
+        "expected a Json->Person type error, got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_json_call_result_to_concrete_now_errors() {
+    // HEADLINE case (ADR-046): the RHS is a *call* whose return type is Json (here the stdlib
+    // `readJson`), assigned to a structured concrete object. This must be a type error. Before
+    // the fix this type-checked clean because the bidirectional `val` path propagated the
+    // expected concrete type down and a zero/Json-param function was misclassified as opaque,
+    // freshening its Json return into a permissive inference var.
+    let err = run_expect_err(r#"import { readJson } from "std/fs"
+type Person = { "name": String, "age": Int32 }
+val p: Person = readJson("p.json")
+"#);
+    assert!(
+        err.contains("Person") || err.contains("4294967295") || err.to_lowercase().contains("json"),
+        "expected a Json call-result -> Person type error, got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_json_local_call_result_to_concrete_now_errors() {
+    // Same headline hazard with a LOCAL Json-returning function (zero params). The opaque-
+    // Function misclassification used to freshen its `Json` return for zero-param functions,
+    // letting `val p: Person = getJson()` slip through. Must now error.
+    let err = run_expect_err(r#"type Person = { "name": String, "age": Int32 }
+val getJson = (): Json => { "name": "Bob", "age": 30 }
+val p: Person = getJson()
+"#);
+    assert!(
+        err.contains("Person") || err.contains("4294967295") || err.to_lowercase().contains("json"),
+        "expected a local Json call-result -> Person type error, got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_json_arg_to_concrete_param_errors() {
+    // Passing a Json value into a concrete structured-object parameter is rejected (ADR-046).
+    let err = run_expect_err(r#"type Person = { "name": String, "age": Int32 }
+val greet = (p: Person): String => p["name"]
+val j: Json = { "name": "Bob", "age": 30 }
+val r = greet(j)
+"#);
+    assert!(
+        err.contains("Person") || err.contains("4294967295") || err.to_lowercase().contains("json"),
+        "expected a Json-arg type error, got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_concrete_to_json_still_ok() {
+    // Concrete value -> Json (covariant sink) still compiles.
+    let out = run(r#"import { print } from "std/io"
+val f = (x: Json): Json => x
+val p = { "name": "Bob", "age": 30 }
+print("${f(p)["name"]}")
+"#);
+    assert_eq!(out, vec!["Bob"]);
+}
+
+#[test]
+fn test_is_narrowing_still_works() {
+    // is-narrowing of a Json value into a concrete branch still compiles + runs.
+    let out = run(r#"import { print } from "std/io"
+val pick = (j: Json): String =>
+  if j is String then j else "not-a-string"
+print(pick("hi"))
+print(pick(42))
+"#);
+    assert_eq!(out, vec!["hi", "not-a-string"]);
+}
