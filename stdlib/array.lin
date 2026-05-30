@@ -1,5 +1,14 @@
+import foreign "lin-runtime"
+  val lin_array_slice_dyn: (Json, Int32, Int32) => Json
+
 export val push = (arr: Json, item: Json): Null =>
   lin_push(arr, item)
+
+// Polymorphic sub-buffer copy. Dispatches on the array's runtime element type,
+// so a UInt8[] yields a UInt8[], an Int32[] an Int32[], a Json[] a Json[].
+// `start`/`end` clamp to [0, length]; `end` is exclusive.
+export val slice = (arr: Json, start: Int32, end: Int32): Json =>
+  lin_array_slice_dyn(arr, start, end)
 
 export val arrayAllocate = (n: Int32): Json =>
   lin_array_allocate(n)
