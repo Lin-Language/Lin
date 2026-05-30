@@ -98,6 +98,33 @@ pub unsafe extern "C" fn lin_tagged_retain(p: *const u8) {
     retain_tagged_payload(&*(p as *const TaggedVal));
 }
 
+/// Clone a boxed TaggedVal*: allocate a FRESH TaggedVal box copying the tag+payload and
+/// retain the inner heap payload (if any). Returns an independently-owned box that can be
+/// released with `lin_tagged_release` without affecting the source box.
+///
+/// This is the union analogue of `lin_rc_retain` for the OWNING var-cell/global model: a
+/// cell/global holding a Json/union value owns its OWN box (not an alias of a borrowed
+/// caller box). Storing clones the incoming box; reading clones the cell's box; the cell's
+/// release-old and the read's scope-exit release each free a box they exclusively own. This
+/// keeps store/read/release-old/teardown perfectly symmetric (mirroring the concrete-rc
+/// retain/release pairs) and never frees a box owned by someone else.
+///
+/// Null-safe (null Json → null box). Cached scalar boxes (small ints, bools) are returned
+/// as-is: they are immutable statics, carry no heap payload, and `lin_tagged_release`
+/// no-ops on them, so an alias is safe and avoids a needless allocation.
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_clone(p: *const u8) -> *mut u8 {
+    if p.is_null() {
+        return std::ptr::null_mut();
+    }
+    if crate::tagged::is_cached_box_pub(p) {
+        return p as *mut u8;
+    }
+    let src = &*(p as *const TaggedVal);
+    retain_tagged_payload(src);
+    crate::tagged::alloc_tagged(src.tag, src.payload)
+}
+
 /// Set a field. Key must be a LinString*. Value is a TaggedVal* (pointer to tagged payload).
 /// Copies the 16-byte TaggedVal struct and retains the inner value (the object owns a reference).
 /// Takes ownership of the key reference (caller must not release it — use lin_object_keys'

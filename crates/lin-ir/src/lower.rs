@@ -523,6 +523,81 @@ fn is_rc_type(ty: &Type) -> bool {
     )
 }
 
+/// A type that participates in the OWNING reference model for var cells / module globals:
+/// a cell/global holding such a value owns one independent reference to it. This covers
+/// both concrete reference-counted heap values (`is_rc_type`) AND boxed Json/union values
+/// (`is_union_ty`). For unions the retain/release carried `ty` causes codegen to dispatch
+/// the tag-aware `lin_tagged_retain`/`lin_tagged_release` (which bump/drop the boxed
+/// payload's refcount and are null/scalar/cached-box safe). Store, read, release-old and
+/// teardown must ALL use this predicate together — an asymmetry causes a double-free
+/// (release without matching retain) or a leak (retain without matching release).
+fn needs_owning(ty: &Type) -> bool {
+    is_rc_type(ty) || is_union_ty(ty)
+}
+
+/// STORE side of the owning model: produce a value the cell/global will OWN.
+/// - concrete rc (`is_rc_type`): take an independent reference in place (`Retain`); the
+///   stored temp is the same heap pointer, now with rc+1.
+/// - union (`is_union_ty`): clone the box (`CloneBox` → `lin_tagged_clone`) so the cell owns
+///   its OWN `TaggedVal*` (not an alias of a borrowed caller box); release-old can free it
+///   safely. Returns the cloned temp to store.
+/// - otherwise: no-op, returns the value unchanged.
+/// Mirrors `own_for_read`; together with codegen's release-old these keep the four sides
+/// (store/read/release-old/teardown) symmetric for both concrete and union slot types.
+fn own_for_store(t: Temp, ty: &Type, builder: &mut FuncBuilder) -> Temp {
+    if is_union_ty(ty) {
+        let dst = builder.alloc_temp(ty.clone());
+        builder.emit(Instruction::CloneBox { dst, src: t, ty: ty.clone() });
+        dst
+    } else if is_rc_type(ty) {
+        builder.emit(Instruction::Retain { val: t, ty: ty.clone() });
+        t
+    } else {
+        t
+    }
+}
+
+/// Coerce a value to a (possibly union) slot type and produce a value the cell/global will
+/// OWN, reclaiming any transient box created by the coercion.
+///
+/// When `slot_ty` is a union and the coercion boxes a concrete value (`value_ty` concrete),
+/// the coercion allocates a FRESH transient `TaggedVal*` box `b` wrapping the raw value
+/// (which is itself separately owned and released at scope exit). `own_for_store` then clones
+/// `b` into the box the cell owns — so `b` is now an orphan whose inner is owned twice over
+/// (once by the raw value's scope-exit release, once by the cell's clone). We therefore free
+/// `b`'s 16-byte shell (NOT its inner) to avoid a per-store box leak. When no transient box
+/// was created (already-union value, or non-union slot), nothing extra is freed.
+fn coerce_and_own_store(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+    let made_fresh_box = is_union_ty(slot_ty) && !is_union_ty(value_ty) && type_repr_differs(value_ty, slot_ty);
+    let coerced = coerce_to_slot_type(t, value_ty, slot_ty, builder);
+    let stored = own_for_store(coerced, slot_ty, builder);
+    if made_fresh_box {
+        builder.emit(Instruction::FreeBoxShell { val: coerced });
+    }
+    stored
+}
+
+/// READ side of the owning model: take an independently-owned copy of a value just loaded
+/// from a cell/global and register it for scope-exit release.
+/// - concrete rc: `Retain` in place + register the same temp.
+/// - union: `CloneBox` into a fresh temp (the reader owns its own box; releasing it at scope
+///   exit never frees the cell's box) + register the cloned temp.
+/// Returns the temp to use as the read result.
+fn own_for_read(t: Temp, ty: &Type, builder: &mut FuncBuilder) -> Temp {
+    if is_union_ty(ty) {
+        let dst = builder.alloc_temp(ty.clone());
+        builder.emit(Instruction::CloneBox { dst, src: t, ty: ty.clone() });
+        builder.register_owned(dst, ty.clone());
+        dst
+    } else if is_rc_type(ty) {
+        builder.emit(Instruction::Retain { val: t, ty: ty.clone() });
+        builder.register_owned(t, ty.clone());
+        t
+    } else {
+        t
+    }
+}
+
 /// Collect `var` slots that are mutably captured by any (possibly nested) closure within
 /// a statement. Such slots are stored as heap cells shared by reference.
 fn collect_mutable_capture_slots_stmt(stmt: &TypedStmt, out: &mut std::collections::HashSet<usize>) {
@@ -741,14 +816,12 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 // closure boundary — matching the AST path's pointer-cell model. Boxing of
                 // the init and of each reassigned value is handled by coerce_to_slot_type.
                 let cell_ty = if matches!(ty, Type::Null) { Type::TypeVar(u32::MAX) } else { ty.clone() };
-                let t = lower_expr(value, builder, ctx);
-                let t = coerce_to_slot_type(t, &value.ty(), &cell_ty, builder);
-                // For a concrete reference-counted cell, take an independent reference to the
-                // initial value (mirrors the reassignment path in LocalSet) so the cell's
-                // release-on-reassign stays balanced. Boxed cells keep the legacy borrow model.
-                if is_rc_type(&cell_ty) {
-                    builder.emit(Instruction::Retain { val: t, ty: cell_ty.clone() });
-                }
+                let raw = lower_expr(value, builder, ctx);
+                // The cell owns an independent reference to its initial value (mirrors the
+                // reassignment path in LocalSet) so the cell's release-on-reassign stays
+                // balanced. Concrete rc: retain in place; union: clone the box so the cell owns
+                // its own TaggedVal* (and free the transient coercion box shell).
+                let t = coerce_and_own_store(raw, &value.ty(), &cell_ty, builder);
                 let cell = builder.alloc_temp(Type::TypeVar(u32::MAX));
                 builder.emit(Instruction::MakeCell { dst: cell, init: t, ty: cell_ty.clone() });
                 builder.cell_slots.insert(*slot, cell_ty);
@@ -762,13 +835,15 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 // can't see main's SSA temps) can read/write it. Writes inside closures go
                 // through GlobalValSet (see LocalSet); reads through GlobalValGet (LocalGet).
                 if ctx.global_val_slots.contains_key(slot) {
-                    // For a concrete reference-counted global, take an independent reference to
-                    // the initial value (mirrors LocalSet) so release-on-reassign stays
-                    // balanced. Boxed globals keep the legacy borrow model.
-                    if is_rc_type(ty) {
-                        builder.emit(Instruction::Retain { val: t, ty: ty.clone() });
-                    }
-                    builder.emit(Instruction::GlobalValSet { slot: *slot, value: t, ty: ty.clone() });
+                    // The global owns an independent reference to its initial value (mirrors
+                    // LocalSet) so release-on-reassign stays balanced. Concrete rc: retain in
+                    // place; union: clone the box so the global owns its own TaggedVal*. (This
+                    // runs once per program, so the transient init box is not freed here — only
+                    // per-iteration reassignment boxes, freed at the LocalSet site, matter for
+                    // the leak. `t` also stays live in the plain slot, though global_var reads
+                    // always go through GlobalValGet.)
+                    let gv = own_for_store(t, ty, builder);
+                    builder.emit(Instruction::GlobalValSet { slot: *slot, value: gv, ty: ty.clone() });
                 }
             }
         }
@@ -921,27 +996,33 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty.clone() });
                 // The global holds the var's declared representation; narrow to the requested
                 // concrete type if this use wants one (e.g. a Json global read as Int32).
-                let out = if is_union_ty(&gty) && !is_union_ty(ty) {
+                let narrowed = is_union_ty(&gty) && !is_union_ty(ty);
+                if narrowed {
+                    // Narrow the loaded box to the requested concrete type. Unboxing (Coerce)
+                    // does not add a reference, so the narrowed concrete value aliases the
+                    // box's inner payload. Owning read at the CONCRETE representation: retain
+                    // the inner in place + register, so it survives a later global reassignment
+                    // (release-old) and is freed at scope exit. (`own_for_read` with the
+                    // concrete `ty` retains in place — not a box clone.)
                     let d = builder.alloc_temp(ty.clone());
                     builder.emit(Instruction::Coerce { dst: d, src: dst, from_ty: gty.clone(), to_ty: ty.clone() });
-                    d
-                } else { dst };
-                if is_rc_type(&gty) {
-                    builder.emit(Instruction::Retain { val: out, ty: gty.clone() });
-                    builder.register_owned(out, gty);
+                    return own_for_read(d, ty, builder);
                 }
-                return out;
+                // Not narrowed: the loaded value is the global's box. Owning read clones it so
+                // the reader owns its own box (concrete rc globals retain in place).
+                return own_for_read(dst, &gty, builder);
             }
             // Heap-cell slot (mutably-captured var): load the current value through the cell.
             if let Some(cell_ty) = builder.cell_slots.get(slot).cloned() {
                 if let Some(&cell) = builder.slots.get(slot) {
                     let dst = builder.alloc_temp(cell_ty.clone());
                     builder.emit(Instruction::CellGet { dst, cell, ty: cell_ty.clone() });
-                    if is_rc_type(&cell_ty) {
-                        builder.emit(Instruction::Retain { val: dst, ty: cell_ty.clone() });
-                        builder.register_owned(dst, cell_ty);
-                    }
-                    return dst;
+                    // Owning read: take an independently-owned copy of the loaded value so it
+                    // survives a later reassignment of the cell (release-old on CellSet) and is
+                    // released at scope exit. Concrete rc: retain in place. Union: clone the box
+                    // (the reader owns its OWN TaggedVal*, so releasing it at scope exit never
+                    // frees the cell's box).
+                    return own_for_read(dst, &cell_ty, builder);
                 }
             }
             if let Some(&t) = builder.slots.get(slot) {
@@ -978,14 +1059,12 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 dst
             } else if let Some(gty) = ctx.global_val_slots.get(slot).cloned() {
                 // A top-level val referenced where it isn't an in-scope temp (e.g. inside a
-                // closure) — load it from its module global.
+                // closure) — load it from its module global. Owning read: take an
+                // independently-owned copy (concrete rc: retain; union: clone the box) and
+                // register for scope-exit release.
                 let dst = builder.alloc_temp(gty.clone());
                 builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty.clone() });
-                if is_rc_type(&gty) {
-                    builder.emit(Instruction::Retain { val: dst, ty: gty.clone() });
-                    builder.register_owned(dst, gty);
-                }
-                dst
+                own_for_read(dst, &gty, builder)
             } else {
                 // Slot not yet in scope — emit a placeholder null temp.
                 // (Can happen for forward-declared functions resolved by codegen.)
@@ -999,16 +1078,15 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             if let Some(cell_ty) = builder.cell_slots.get(slot).cloned() {
                 if let Some(&cell) = builder.slots.get(slot) {
                     let v = coerce_to_slot_type(val_temp, &value.ty(), &cell_ty, builder);
-                    // For a concrete reference-counted cell, the cell owns an INDEPENDENT
-                    // reference to its value: retain on store so it survives the producing
-                    // scope's own release, and codegen releases the cell's old reference on
-                    // reassignment (fixing the per-reassignment leak). Boxed (Json/union) cells
-                    // keep the legacy borrow model (no retain/no release) to avoid double-frees
-                    // of borrowed values.
-                    if is_rc_type(&cell_ty) {
-                        builder.emit(Instruction::Retain { val: v, ty: cell_ty.clone() });
-                    }
-                    builder.emit(Instruction::CellSet { cell, value: v, ty: cell_ty });
+                    // The cell owns an INDEPENDENT reference to its value: take an owned copy on
+                    // store so it survives the producing scope's own release, and codegen
+                    // releases the cell's OLD reference on reassignment (fixing the
+                    // per-reassignment leak). Concrete rc: retain `v` in place (the stored
+                    // pointer is `v` with rc+1). Union: clone the box (`stored` is a fresh
+                    // TaggedVal* the cell exclusively owns) so release-old never frees a
+                    // borrowed box. The LocalSet expression result stays `v` (a borrowed view).
+                    let stored = own_for_store(v, &cell_ty, builder);
+                    builder.emit(Instruction::CellSet { cell, value: stored, ty: cell_ty });
                     return v;
                 }
             }
@@ -1017,7 +1095,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // to the global's declared representation first.
             if let Some(gty) = ctx.global_val_slots.get(slot).cloned() {
                 let v = coerce_to_slot_type(val_temp, &value.ty(), &gty, builder);
-                if is_rc_type(&gty) {
+                if needs_owning(&gty) {
                     builder.emit(Instruction::Retain { val: v, ty: gty.clone() });
                 }
                 builder.emit(Instruction::GlobalValSet { slot: *slot, value: v, ty: gty });

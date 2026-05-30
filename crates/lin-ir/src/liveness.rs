@@ -215,6 +215,8 @@ pub fn instr_use_def(instr: &Instruction) -> (Vec<Temp>, Vec<Temp>) {
         Instruction::CellSet { cell, value, .. } => (vec![*cell, *value], vec![]),
         Instruction::Retain { val, .. } => (vec![*val], vec![]),
         Instruction::Release { val, .. } => (vec![*val], vec![]),
+        Instruction::CloneBox { dst, src, .. } => (vec![*src], vec![*dst]),
+        Instruction::FreeBoxShell { val } => (vec![*val], vec![]),
         Instruction::IsType { dst, val, .. } => (vec![*val], vec![*dst]),
         Instruction::HasPattern { dst, val, .. } => (vec![*val], vec![*dst]),
         Instruction::Box { dst, val, .. } => (vec![*val], vec![*dst]),

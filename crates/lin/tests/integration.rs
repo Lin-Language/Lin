@@ -2524,6 +2524,69 @@ print(toString(a + 300))
 }
 
 #[test]
+fn test_json_var_object_reassign_loop_no_uaf() {
+    // Regression for the union var-cell use-after-free: a captured `var` of union (Json) type
+    // reassigned to a freshly-allocated OBJECT literal each iteration. Before the owning model
+    // (clone-on-store/read, release-old, balanced teardown) the cell aliased a temp object that
+    // was freed at closure-scope exit, so the final read saw freed/garbage memory.
+    let out = run(r#"import { range, for } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+var acc: Json = { "v": 0 }
+range(0, 2000).for(i => acc = { "v": i })
+print(toString(acc["v"]))
+"#);
+    assert_eq!(out, vec!["1999"]);
+}
+
+#[test]
+fn test_json_var_array_reassign_loop_no_uaf() {
+    // Same bug, ARRAY literal variant: a captured `var: Json` reassigned to a fresh array each
+    // iteration. A use-after-free here corrupted the length read (or crashed).
+    let out = run(r#"import { range, for, length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+var acc: Json = [0, 0, 0]
+range(0, 2000).for(i => acc = [i, i, i])
+print(toString(length(acc)))
+"#);
+    assert_eq!(out, vec!["3"]);
+}
+
+#[test]
+fn test_reduce_minby_maxby_churn_no_double_free() {
+    // Exercises the stdlib `reduce` Json accumulator cell plus the pass-through reducers used
+    // by `minBy`/`maxBy` (which return a borrowed argument). The earlier half-fix (owning store
+    // but borrowing read) double-freed these borrowed values. With the symmetric clone-based
+    // owning model the accumulator cell owns its own box and never frees the borrowed inputs.
+    // 2000 iterations of sum/min/max over churned arrays — a double-free corrupts results or
+    // aborts the process.
+    let out = run(r#"import { range, for, map, reduce, minBy, maxBy, length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+var total: Json = 0
+range(0, 2000).for(i =>
+  val xs = [i, i + 1, i + 2, i - 5]
+  val s = xs.reduce(0, (acc, x) => acc + x)
+  total = s
+)
+print(toString(total))
+
+val pairs = range(0, 2000).map(i => { "k": i, "w": (i * 7) % 13 })
+val lo = pairs.minBy(p => p["w"])
+val hi = pairs.maxBy(p => p["w"])
+print(toString(lo["w"]))
+print(toString(hi["w"]))
+"#);
+    // Last iter i=1999: 1999 + 2000 + 2001 + 1994 = 7994.
+    // minBy/maxBy over (i*7)%13: minimum weight 0, maximum weight 12.
+    assert_eq!(out, vec!["7994", "0", "12"]);
+}
+
+#[test]
 fn test_to_uint8_narrowing() {
     // std/number toUInt8 truncates a wider integer to a byte (two's-complement / `as`).
     let out = run(r#"import { print } from "std/io"

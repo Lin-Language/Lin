@@ -123,6 +123,13 @@ unsafe fn is_cached_box(p: *const u8) -> bool {
         || in_range(BOOL_CACHE.as_ptr(), 2)
 }
 
+/// Public wrapper for `is_cached_box`, used by `lin_tagged_clone` to alias immutable cached
+/// scalar boxes instead of allocating a fresh box for them.
+#[inline]
+pub unsafe fn is_cached_box_pub(p: *const u8) -> bool {
+    is_cached_box(p)
+}
+
 pub unsafe fn alloc_tagged(tag: u8, payload: u64) -> *mut u8 {
     let layout = Layout::new::<TaggedVal>();
     let ptr = alloc(layout);
@@ -352,6 +359,24 @@ pub unsafe extern "C" fn lin_length_dyn(p: *const u8) -> i32 {
         }
         _ => 0,
     }
+}
+
+/// Free ONLY the TaggedVal box allocation, WITHOUT touching its inner heap payload.
+///
+/// Used by the owning var-cell/global model when a transient box (e.g. the result of boxing
+/// a freshly-allocated array/object via Coerce on the way into a union cell) has had its
+/// inner payload's ownership transferred elsewhere (the cell clones the box, retaining the
+/// inner; the inner's original +1 is released separately via the raw value's scope-exit
+/// release). Calling `lin_tagged_release` on such a box would double-free the inner, so we
+/// reclaim only the 16-byte box shell here.
+///
+/// Null-safe and cached-box-safe (immutable static scalar boxes are never freed).
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_free_box(p: *mut u8) {
+    if p.is_null() || is_cached_box(p) {
+        return;
+    }
+    std::alloc::dealloc(p, std::alloc::Layout::new::<TaggedVal>());
 }
 
 /// Release a TaggedVal*: release the pointed-to heap value (if pointer type), then free the box.

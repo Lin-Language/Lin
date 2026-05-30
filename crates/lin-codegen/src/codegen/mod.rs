@@ -701,6 +701,42 @@ impl<'ctx> Codegen<'ctx> {
                                 self.emit_release(v, ty);
                             }
                         }
+                        Instruction::CloneBox { dst, src, ty } => {
+                            if let Some(&v) = temp_map.get(src) {
+                                let cloned = if Self::is_union_type(ty) && v.is_pointer_value() {
+                                    // Allocate a fresh, independently-owned box copying the
+                                    // tag+payload and retaining the inner heap payload. The
+                                    // cell/global (or reader) then owns its own box; releasing
+                                    // it never frees a borrowed caller's box.
+                                    let clone_fn = self.get_or_declare_fn(
+                                        "lin_tagged_clone",
+                                        ptr_ty.fn_type(&[ptr_ty.into()], false),
+                                    );
+                                    self.builder
+                                        .call(clone_fn, &[v.into()], "ir_tagged_clone")
+                                        .try_as_basic_value()
+                                        .unwrap_basic()
+                                } else {
+                                    // Non-union (concrete rc): a plain retain, value unchanged.
+                                    if v.is_pointer_value() {
+                                        self.builder.call(self.rt.rc_retain, &[v.into()], "");
+                                    }
+                                    v
+                                };
+                                temp_map.insert(*dst, cloned);
+                            }
+                        }
+                        Instruction::FreeBoxShell { val } => {
+                            if let Some(&v) = temp_map.get(val) {
+                                if v.is_pointer_value() {
+                                    let free_fn = self.get_or_declare_fn(
+                                        "lin_tagged_free_box",
+                                        self.context.void_type().fn_type(&[ptr_ty.into()], false),
+                                    );
+                                    self.builder.call(free_fn, &[v.into()], "");
+                                }
+                            }
+                        }
                         Instruction::Call { dst, callee, args, ret_ty } => {
                             let arg_vals: Vec<BasicMetadataValueEnum> = args
                                 .iter()
@@ -1002,14 +1038,15 @@ impl<'ctx> Codegen<'ctx> {
                                 // value. On reassignment its previous reference must be dropped,
                                 // otherwise every reassignment leaks the old value. The lowerer
                                 // pairs this with a Retain of the new value so the global holds
-                                // an independent reference. Restricted to concrete reference-
-                                // counted types: boxed (Json/union) globals keep the legacy
-                                // borrow model, where the value's owner (not the global) frees
-                                // it — releasing here would double-free borrowed values.
-                                if Self::ty_is_concrete_rc(ty) {
+                                // an independent reference. Applies to concrete reference-counted
+                                // types AND boxed Json/union globals: the lowerer now uses the
+                                // SAME owning model (clone on store, clone+register on read,
+                                // release-old here) for unions, so `emit_release` dispatches the
+                                // tag-aware `lin_tagged_release` (null-safe: the global's zero
+                                // initial value is a no-op release).
+                                if Self::ty_is_concrete_rc(ty) || Self::is_union_type(ty) {
                                     let old = self.builder
-                                        .build_load(llvm_ty, glob.as_pointer_value(), "ir_gv_old")
-                                        .unwrap();
+                                        .load(llvm_ty, glob.as_pointer_value(), "ir_gv_old");
                                     self.emit_release(old, ty);
                                 }
                                 self.builder.store(glob.as_pointer_value(), v);
@@ -1053,16 +1090,16 @@ impl<'ctx> Codegen<'ctx> {
                                     // value. On reassignment its previous reference must be
                                     // dropped, otherwise every reassignment leaks the old value.
                                     // The lowerer pairs this with a Retain of the new value so
-                                    // the cell holds an independent reference. Restricted to
-                                    // concrete reference-counted types: boxed (Json/union) cells
-                                    // keep the legacy borrow model (releasing a borrowed value
-                                    // here would double-free). The release fns null-check the
-                                    // cell's initial zero.
-                                    if Self::ty_is_concrete_rc(ty) {
+                                    // the cell holds an independent reference. Applies to concrete
+                                    // reference-counted types AND boxed Json/union cells: the
+                                    // lowerer uses the SAME owning model for unions (clone on
+                                    // store, clone+register on read), so `emit_release` here
+                                    // dispatches the tag-aware `lin_tagged_release`. The release
+                                    // fns null-check the cell's initial zero.
+                                    if Self::ty_is_concrete_rc(ty) || Self::is_union_type(ty) {
                                         let llvm_ty = self.llvm_type(ty);
                                         let old = self.builder
-                                            .build_load(llvm_ty, c.into_pointer_value(), "ir_cell_old")
-                                            .unwrap();
+                                            .load(llvm_ty, c.into_pointer_value(), "ir_cell_old");
                                         self.emit_release(old, ty);
                                     }
                                     self.builder.store(c.into_pointer_value(), v);

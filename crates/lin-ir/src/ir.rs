@@ -230,6 +230,19 @@ pub enum Instruction {
     Retain { val: Temp, ty: Type },
     /// Decrement refcount; free if zero. Only emitted for owned values.
     Release { val: Temp, ty: Type },
+    /// Clone a boxed Json/union value (`TaggedVal*`): allocate a fresh, independently-owned
+    /// box copying the tag+payload and retaining the inner heap payload. Used by the owning
+    /// model for union var-cells/globals so the cell and each reader hold their OWN box rather
+    /// than an alias of a borrowed box (whose free would be a double-free). Maps to
+    /// `lin_tagged_clone`. For non-union `ty` this degrades to a plain Retain of `src` into
+    /// `dst` (dst == src), so the lowerer can use it uniformly.
+    CloneBox { dst: Temp, src: Temp, ty: Type },
+    /// Free ONLY the `TaggedVal*` box shell of `val` (not its inner heap payload). Emitted for
+    /// a transient box (e.g. a freshly-boxed concrete value coerced into a union cell/global)
+    /// whose inner payload's ownership is held elsewhere — typically the raw value's own
+    /// scope-exit release. A full `Release` would double-free the inner; this reclaims only the
+    /// 16-byte box. Maps to `lin_tagged_free_box`. Null/cached-box safe.
+    FreeBoxShell { val: Temp },
     /// result = val is type_tag? (returns bool)
     IsType { dst: Temp, val: Temp, ty: Type },
     /// result = val has pattern? (returns bool)
