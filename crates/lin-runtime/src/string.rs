@@ -478,6 +478,7 @@ pub unsafe extern "C" fn lin_value_key(tagged: *const TaggedVal) -> *mut LinStri
 }
 
 unsafe fn tagged_to_key_string(tagged: *const TaggedVal) -> String {
+    use crate::tagged::*;
     if tagged.is_null() {
         return "N".to_string();
     }
@@ -499,10 +500,29 @@ unsafe fn tagged_to_key_string(tagged: *const TaggedVal) -> String {
             let arr = payload as *const crate::array::LinArray;
             if arr.is_null() { return "a:[]".to_string(); }
             let len = (*arr).len as usize;
+            let elem_tag = (*arr).elem_tag;
             let mut parts = Vec::with_capacity(len);
             for i in 0..len {
-                let elem = (*arr).data.add(i) as *const TaggedVal;
-                parts.push(tagged_to_key_string(elem));
+                // Flat (unboxed) scalar arrays store raw values, not TaggedVal structs,
+                // so decode per elem_tag exactly like array_to_json_string does. A tagged
+                // array (elem_tag == 0xFF) recurses element-by-element.
+                let part = match elem_tag {
+                    0xFF => {
+                        let elem = (*arr).data.add(i) as *const TaggedVal;
+                        tagged_to_key_string(elem)
+                    }
+                    TAG_INT32 => format!("i:{}", *((*arr).data as *const i32).add(i)),
+                    TAG_INT64 => format!("I:{}", *((*arr).data as *const i64).add(i)),
+                    TAG_FLOAT32 => format!("f:{}", *((*arr).data as *const f32).add(i)),
+                    TAG_FLOAT64 => format!("F:{}", *((*arr).data as *const f64).add(i)),
+                    TAG_BOOL => format!("b:{}", if *((*arr).data as *const u8).add(i) != 0 { "true" } else { "false" }),
+                    TAG_UINT8 => format!("i:{}", *((*arr).data as *const u8).add(i)),
+                    TAG_INT8 => format!("i:{}", *((*arr).data as *const i8).add(i)),
+                    TAG_UINT16 => format!("i:{}", *((*arr).data as *const u16).add(i)),
+                    TAG_INT16 => format!("i:{}", *((*arr).data as *const i16).add(i)),
+                    _ => "N".to_string(),
+                };
+                parts.push(part);
             }
             format!("a:[{}]", parts.join(","))
         }
