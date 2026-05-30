@@ -5,3 +5,5 @@
 .claude/worktrees/
 examples/lib/*.a
 examples/lib/*.o
+docs-site/output/
+/docs-builder
