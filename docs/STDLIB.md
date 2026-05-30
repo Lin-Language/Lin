@@ -3649,8 +3649,8 @@ Declares a single test case. All assertions in the body are evaluated before the
 
 ```txt
 test("string conversions", () => [
-  expect(toString(42)).toBe("42"),
-  expect(toString(true)).toBe("true")
+  expect((42).toString()).toBe("42"),
+  expect(true.toString()).toBe("true")
 ])
 ```
 
