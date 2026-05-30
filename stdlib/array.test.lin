@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
-import { map, filter, reduce, find, some, every, flatMap, indexOf, reverse, concat, push, length, range, rangeStep, for, partition, zip, unique, take, drop, takeWhile, dropWhile, flatten, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy } from "std/array"
+import { map, filter, reduce, find, some, every, flatMap, indexOf, reverse, concat, push, length, range, rangeStep, for, partition, zip, unique, take, drop, takeWhile, dropWhile, flatten, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, iterOf } from "std/array"
 
 val s = suite("std/array", [
   test("length of array", () =>
@@ -26,6 +26,18 @@ val s = suite("std/array", [
     val result = []
     range(0, 3).for(i => push(result, i))
     expect(toString(result)).toBe("[0, 1, 2]")
+  ),
+
+  test("iterOf iterates over array elements", () =>
+    val result = []
+    iterOf([10, 20, 30]).for(x => push(result, x))
+    expect(toString(result)).toBe("[10, 20, 30]")
+  ),
+
+  test("iterOf over empty array produces nothing", () =>
+    val result = []
+    iterOf([]).for(x => push(result, x))
+    expect(length(result)).toBe(0)
   ),
 
   test("map doubles values", () =>

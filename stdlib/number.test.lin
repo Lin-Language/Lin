@@ -57,6 +57,14 @@ val s = suite("std/number", [
   test("tryParseFloat64 returns null for invalid string", () =>
     expect(tryParseFloat64("abc")).toBe(null)
   ),
+
+  test("dot-syntax for number parsing", () =>
+    [
+      expect("99".parseInt32()).toBe(99),
+      expect("2.5".parseFloat64()).toBe(2.5),
+      expect("7".isInt32()).toBe(true)
+    ]
+  ),
 ])
 
 run(s)

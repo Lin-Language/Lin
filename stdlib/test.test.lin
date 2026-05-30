@@ -1,5 +1,5 @@
 import { expect, toBe, toBeNull, toSatisfy, toSucceed, toFail, toFailWith, test, suite, run } from "std/test"
-import { toString } from "std/string"
+import { toString, contains } from "std/string"
 
 val s = suite("std/test", [
   test("toBe passes when equal", () =>
@@ -40,6 +40,67 @@ val s = suite("std/test", [
       expect(2).toBe(2),
       expect(3).toBe(3)
     ]
+  ),
+
+  test("toBe fails on unequal values", () =>
+    [
+      expect(expect(1).toBe(2)["type"]).toBe("fail"),
+      expect(expect("a").toBe("b")["type"]).toBe("fail"),
+      expect(expect([1]).toBe([2])["type"]).toBe("fail")
+    ]
+  ),
+
+  test("toBe passes on equal compound values", () =>
+    [
+      expect(expect([1, 2]).toBe([1, 2])["type"]).toBe("pass"),
+      expect(expect({ "a": 1 }).toBe({ "a": 1 })["type"]).toBe("pass")
+    ]
+  ),
+
+  test("toBe failure message contains expected and actual", () =>
+    val r = expect(1).toBe(2)
+    val checks = [
+      expect(r["type"]).toBe("fail"),
+      expect(r["message"].contains("expected")).toBe(true),
+      expect(r["message"].contains("actual")).toBe(true)
+    ]
+    checks
+  ),
+
+  test("toBeNull fails on non-null", () =>
+    [
+      expect(expect(0).toBeNull()["type"]).toBe("fail"),
+      expect(expect("").toBeNull()["type"]).toBe("fail")
+    ]
+  ),
+
+  test("toSatisfy fails when predicate does not hold", () =>
+    expect(expect(1).toSatisfy(x => x > 10)["type"]).toBe("fail")
+  ),
+
+  test("toFailWith fails when error message differs", () =>
+    val r = { "type": "failure", "error": "oops" }
+    expect(expect(r).toFailWith("wrong")["type"]).toBe("fail")
+  ),
+
+  test("toSucceed fails when given a failure", () =>
+    val r = { "type": "failure", "error": "oops" }
+    expect(expect(r).toSucceed()["type"]).toBe("fail")
+  ),
+
+  test("toFail fails when given a success", () =>
+    val r = { "type": "success", "value": 1 }
+    expect(expect(r).toFail()["type"]).toBe("fail")
+  ),
+
+  test("toSatisfy can inspect union shapes via has-pattern", () =>
+    val ok = { "type": "success", "value": 42 }
+    val err = { "type": "failure", "error": "boom" }
+    val checks = [
+      expect(ok).toSatisfy(r => r has { "type": "success", value }),
+      expect(err).toSatisfy(r => r has { "type": "failure", error })
+    ]
+    checks
   ),
 ])
 
