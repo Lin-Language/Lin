@@ -545,6 +545,19 @@ impl FuncBuilder {
             .any(|frame| frame.iter().any(|(owned, _)| *owned == t))
     }
 
+    /// True if `t` is registered owned in the INNERMOST (current) scope frame only — i.e. a
+    /// value freshly produced and owned by THIS scope (a +1 the scope will release on pop),
+    /// as opposed to one owned by an enclosing frame (e.g. a `val r = …` local read inside a
+    /// branch: `r`'s +1 lives in the function-body scope, not the branch scope). Used by an
+    /// `if`/match branch to decide whether a union value flowing into the merge can TRANSFER
+    /// its branch-scope +1 (current-frame owned) or must be CLONED (owned elsewhere / borrowed),
+    /// so the merge ends up with an independently-owned box that an enclosing release can't free.
+    fn is_owned_in_current_scope(&self, t: Temp) -> bool {
+        self.scope_owned
+            .last()
+            .is_some_and(|frame| frame.iter().any(|(owned, _)| *owned == t))
+    }
+
     /// THE container-insert ownership rule, in one place.
     ///
     /// When a value is stored into a container that takes ownership of one reference
@@ -605,13 +618,23 @@ impl FuncBuilder {
     fn pop_scope_releasing(&mut self, keep: Temp) {
         let keep = self.expand_keep_for_escape(&[keep]);
         if let Some(frame) = self.scope_owned.pop() {
-            let mut kept: Vec<Temp> = Vec::new();
+            let mut kept: Vec<(Temp, Type)> = Vec::new();
             for (t, ty) in frame {
-                if keep.contains(&t) && !kept.contains(&t) {
-                    kept.push(t);
+                if keep.contains(&t) && !kept.iter().any(|(k, _)| *k == t) {
+                    kept.push((t, ty));
                 } else {
                     self.emit(Instruction::Release { val: t, ty });
                 }
+            }
+            // The kept survivors' +1 references TRANSFER UP to the now-current (parent) scope:
+            // re-register them so the parent owns and releases them (or keeps them again if the
+            // value is the parent's own survivor). Without this, a block whose result is an
+            // owned +1 (e.g. an `if`/match merge value, a fresh call result) would be seen as
+            // unowned by the enclosing function-return path — which then takes a SECOND +1 via
+            // CloneBox/Retain, leaking one reference per evaluation (a per-iteration leak inside
+            // a loop). Mirrors `pop_scope_releasing_keep`.
+            for (t, ty) in kept {
+                self.register_owned(t, ty);
             }
         }
     }
@@ -983,6 +1006,77 @@ fn coerce_to_slot_type(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut F
     } else {
         t
     }
+}
+
+/// Coerce one branch of an `if` (used as a value) to the merge's result representation, producing
+/// a result the merge OWNS independently. Returns `(merge_value, keep_set, owns_plus_one)`:
+/// `keep_set` lists temps the branch scope must NOT release; `owns_plus_one` is true when
+/// `merge_value` carries an independent +1 reference (so the merge must register+release it).
+///
+/// Two use-after-free hazards drive this, both for the `if isFailure(r) then r else …`
+/// propagation idiom where `r` is an owned local (`val r = deep()`) whose +1 lives in the
+/// ENCLOSING (function-body) scope — not the branch scope:
+///
+/// 1. UNBOX to a CONCRETE merge type. A plain `Coerce` (union → concrete) yields the box's
+///    INTERIOR pointer with NO new reference, so the concrete value ALIASES the box's inner
+///    payload. The merge releases it once; meanwhile the enclosing scope releases `r`'s box —
+///    freeing the very payload the result aliases.
+/// 2. A UNION merge value that aliases `r`'s box. The merge phi just forwards `r`'s box; the
+///    enclosing scope releases `r` BEFORE the function-return clone (or any later use) runs,
+///    so the forwarded box dangles.
+///
+/// Fix in both cases: take an INDEPENDENT reference. For (1), `CloneBox` then unbox the clone
+/// then free the clone's shell — the concrete result owns a +1 inner. For (2), `CloneBox` a
+/// branch value that is NOT owned by the branch's own scope (a `val`-local read, a param, a
+/// projection) into a fresh +1 box. A value already owned by the CURRENT branch scope (a fresh
+/// allocation / call result) just transfers its +1. A concrete value boxed to union transfers
+/// via the kept raw temp.
+fn coerce_if_branch(
+    raw: Temp,
+    value_ty: &Type,
+    result_type: &Type,
+    builder: &mut FuncBuilder,
+) -> (Temp, Vec<Temp>, bool) {
+    // (1) Unbox a union/Json value to a CONCRETE rc merge representation: take an independent
+    // reference via clone-then-unbox so the merge result does not alias a payload freed by the
+    // source box's own owner.
+    if is_union_ty(value_ty) && !is_union_ty(result_type) && is_rc_type(result_type) {
+        let cloned = builder.alloc_temp(value_ty.clone());
+        builder.emit(Instruction::CloneBox { dst: cloned, src: raw, ty: value_ty.clone() });
+        let unboxed = builder.alloc_temp(result_type.clone());
+        builder.emit(Instruction::Coerce {
+            dst: unboxed, src: cloned, from_ty: value_ty.clone(), to_ty: result_type.clone(),
+        });
+        // The clone's inner payload (+1) now lives on as `unboxed`; reclaim the clone's
+        // 16-byte box shell (the inner survives). `raw` (the source box) is left to its own
+        // owner — do not keep it. The merge owns `unboxed` (+1 concrete rc).
+        builder.emit(Instruction::FreeBoxShell { val: cloned });
+        return (unboxed, vec![unboxed], true);
+    }
+    // (2) Union merge value. Ensure it is an independently-owned +1 box.
+    if is_union_ty(result_type) {
+        if is_union_ty(value_ty) {
+            if builder.is_owned_in_current_scope(raw) {
+                // Fresh in this branch (a call result / allocation owned by the branch scope):
+                // transfer its +1 to the merge. Keep it across the branch pop.
+                return (raw, vec![raw], true);
+            }
+            // Borrowed (a `val`-local read like `r`, a param, a projection): clone into a fresh
+            // +1 box so an enclosing release of the source box cannot free what the merge holds.
+            let cloned = builder.alloc_temp(value_ty.clone());
+            builder.emit(Instruction::CloneBox { dst: cloned, src: raw, ty: value_ty.clone() });
+            return (cloned, vec![cloned], true);
+        }
+        // Concrete value boxed to union: the fresh box owns its inner (the kept raw transfers
+        // its +1 into the box). The merge owns the box.
+        let boxed = coerce_to_slot_type(raw, value_ty, result_type, builder);
+        return (boxed, vec![boxed, raw], true);
+    }
+    // Concrete merge, concrete branch (or scalar unbox): the existing coercion, no extra
+    // ownership. Keep BOTH the value and the raw pre-coercion temp — a box (e.g. lin_box_object)
+    // shares the underlying pointer, so releasing the raw would free what the kept box wraps.
+    let val = coerce_to_slot_type(raw, value_ty, result_type, builder);
+    (val, vec![val, raw], false)
 }
 
 fn const_type(c: &Const) -> Type {
@@ -2663,33 +2757,32 @@ fn lower_if(
     });
 
     let result_dst = builder.alloc_temp(result_type.clone());
-    // Only CONCRETE rc merge results are registered as owned. A boxed-union if-result is NOT
-    // owned here: a branch may yield a BORROWED union box (e.g. `if c then x else y` returning
-    // params, as in minBy's reducer `if x[0] < acc[0] then x else acc`), which carries no +1, so
-    // registering+releasing the merge would double-free a borrowed box. (Concrete rc branch
-    // values are always +1 — a concrete param read retains in place.)
-    let result_is_rc = is_rc_type(result_type);
 
     // Each branch gets its own ownership scope so heap temps it allocates are released
     // at the end of *that branch* — not in the merge block, where only one branch's
     // temps are live (releasing the other branch's temps there frees undefined values).
-    // The branch's result value is kept (released as part of the merge's owned set).
+    // `coerce_if_branch` produces a value the merge OWNS independently (cloning a borrowed
+    // union/concrete that aliases an enclosing-scope value), so registering+releasing the
+    // merge is always balanced — no borrowed-box double-free (the historic reason a union
+    // merge was left unowned: e.g. minBy's reducer `if x[0] < acc[0] then x else acc` over
+    // params — now those params are cloned into a fresh +1).
     // We collect (value_temp, predecessor_block) for a Phi in the merge block, recording
     // the ACTUAL predecessor (the block current at the end of the branch, which may differ
     // from the branch entry if the branch contained nested control flow).
     let mut incomings: Vec<(Temp, BlockId)> = Vec::new();
+    // Whether the merged value carries an independent +1 (so the enclosing scope owns/releases
+    // it). Determined by the branch coercion; both branches agree (it is a function of the
+    // result representation). Defaults to the concrete-rc rule if neither branch falls through.
+    let mut merge_owned = is_rc_type(result_type) || is_union_ty(result_type);
 
     // --- then branch ---
     builder.switch_to(then_block);
     builder.push_scope();
     let then_raw = lower_expr(then_br, builder, ctx);
     if !builder.is_current_block_terminated() {
-        // Coerce to the if's result representation so both phi inputs agree (e.g. an
-        // `Object` branch value boxed to a `Json` if-result). Keep BOTH the kept result
-        // and its raw pre-coercion temp: a box shares the underlying pointer, so releasing
-        // the original would free what the kept box wraps.
-        let then_val = coerce_to_slot_type(then_raw, &then_br.ty(), result_type, builder);
-        builder.pop_scope_releasing_keep(&[then_val, then_raw]);
+        let (then_val, keep, owned) = coerce_if_branch(then_raw, &then_br.ty(), result_type, builder);
+        merge_owned = owned;
+        builder.pop_scope_releasing_keep(&keep);
         incomings.push((then_val, builder.current_block));
         builder.terminate(Terminator::Jump(merge_block));
     } else {
@@ -2701,8 +2794,9 @@ fn lower_if(
     builder.push_scope();
     let else_raw = lower_expr(else_br, builder, ctx);
     if !builder.is_current_block_terminated() {
-        let else_val = coerce_to_slot_type(else_raw, &else_br.ty(), result_type, builder);
-        builder.pop_scope_releasing_keep(&[else_val, else_raw]);
+        let (else_val, keep, owned) = coerce_if_branch(else_raw, &else_br.ty(), result_type, builder);
+        merge_owned = owned;
+        builder.pop_scope_releasing_keep(&keep);
         incomings.push((else_val, builder.current_block));
         builder.terminate(Terminator::Jump(merge_block));
     } else {
@@ -2719,7 +2813,7 @@ fn lower_if(
     });
     // The merged result is owned by the enclosing scope (released there, or kept if it is
     // the block's return value).
-    if result_is_rc {
+    if merge_owned {
         builder.register_owned(result_dst, result_type.clone());
     }
     result_dst

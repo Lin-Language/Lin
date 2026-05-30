@@ -4450,3 +4450,94 @@ print(toString(c))
 "#);
     assert_eq!(out.last().map(|s| s.as_str()), Some("2000"));
 }
+
+// Regression: the error-propagation idiom `val r = <owned Json call result>; if cond then r
+// else <fresh value>` returned from a function. When one branch yields the owned union local
+// `r` and the merge is unified to a CONCRETE representation, the then-branch used to UNBOX `r`
+// (`lin_unbox_ptr`) into an INTERIOR pointer aliasing `r`'s box payload WITHOUT a reference.
+// At the merge, the scope-release of `r` (`lin_tagged_release`) then freed that payload while
+// the merged result still aliased it — re-boxing the freed inner produced a box around freed
+// memory (a use-after-free; later reads crashed with a misaligned/null deref). The fix has the
+// escaping branch take an INDEPENDENT reference (clone-then-unbox, or clone the box when the
+// merge stays boxed) so the result owns its payload, and propagates that +1 up through the
+// block scope so the function-return path does not re-clone (which would leak per call).
+#[test]
+fn test_if_branch_returns_owned_json_local_no_uaf() {
+    // Minimal: then-branch returns the owned local `r`, else-branch is a fresh object.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val deep = (): Json => { "type": "failure" }
+val top = (b: Boolean): Json =>
+  val r = deep()
+  if b then r else { "type": "ok" }
+print(toString(top(true)))
+print(toString(top(false)))
+"#);
+    assert_eq!(out, vec![r#"{"type": "failure"}"#, r#"{"type": "ok"}"#]);
+
+    // The actual `if isFailure(r) then r else { ... }` idiom: the condition reads `r`, the
+    // failure path returns `r` unchanged, the success path projects from `r`.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val deep = (): Json => { "type": "failure", "error": "eof" }
+val top = (): Json =>
+  val r = deep()
+  if r["type"] == "failure" then r
+  else { "type": "success", "value": r["node"] }
+print(toString(top()))
+"#);
+    assert_eq!(out, vec![r#"{"type": "failure", "error": "eof"}"#]);
+
+    // Both branches are union (`r` and another call result `mk()`): the merge stays boxed and
+    // must clone the borrowed `r` so the scope-release of `r` does not dangle the result.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val mk = (): Json => { "type": "failure", "k": "v" }
+val pick = (i: Int32): Json =>
+  val r = mk()
+  if i > 0 then r else mk()
+print(toString(pick(5)))
+print(toString(pick(0)))
+"#);
+    assert_eq!(out, vec![r#"{"type": "failure", "k": "v"}"#, r#"{"type": "failure", "k": "v"}"#]);
+
+    // Multi-level propagation: `mid` returns `r` (from `deep`) on failure, `top` returns `r`
+    // (from `mid`) on failure — the owned union local is forwarded through two `if`-branches.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+val isFailure = (x: Json): Boolean => x["type"] == "failure"
+val deep = (arr: Json, pos: Int32): Json =>
+  if pos >= length(arr) then { "type": "failure", "error": "eof" }
+  else { "node": arr[pos], "pos": pos + 1 }
+val mid = (arr: Json, pos: Int32): Json =>
+  val r = deep(arr, pos)
+  if isFailure(r) then r
+  else { "node": r["node"], "pos": r["pos"] }
+val top = (arr: Json): Json =>
+  val r = mid(arr, 5)
+  if isFailure(r) then r
+  else { "type": "success", "value": r["node"] }
+print(toString(top([1, 2])))
+"#);
+    assert_eq!(out, vec![r#"{"type": "failure", "error": "eof"}"#]);
+
+    // Returned-in-a-loop with the result discarded: a per-call leak (the if-branch clone
+    // re-cloned by the function return) would surface here under the ASan CI leg; functionally
+    // it must just run to completion.
+    let out = run(r#"import { print } from "std/io"
+import { for, range } from "std/array"
+val mk = (): Json => { "type": "failure", "k": "v" }
+val pick = (i: Int32): Json =>
+  val r = mk()
+  if i > 0 then r else mk()
+val main = (): Null =>
+  range(0, 2000).for(i =>
+    val x = pick(i)
+    null
+  )
+  print("done")
+main()
+"#);
+    assert_eq!(out, vec!["done"]);
+}
