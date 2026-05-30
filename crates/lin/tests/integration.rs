@@ -1138,6 +1138,39 @@ print(toString(scale(5, 3)))
 }
 
 #[test]
+fn test_imported_fn_uses_module_level_val() {
+    // Regression: a top-level non-function `val` referenced inside an EXPORTED function
+    // mis-lowered in the import path (lower_import_module never registered the val, so the
+    // reference resolved to an unmaterialised temp → codegen panic "undefined rhs temp").
+    // Covers: float val, string val, a val referencing another val, and a val used in
+    // multiple exported functions — all read through their `__val` wrappers.
+    let dir = std::env::temp_dir().join(format!("lin_modval_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "val K = 0.1\n\
+         val GREETING = \"Hi, \"\n\
+         val BASE = 10\n\
+         val DOUBLE = BASE * 2\n\
+         export val f = (x: Float64): Float64 =>\n  \
+           if x == 1.0 then x + K\n  \
+           else x\n\
+         export val greet = (name: String): String => \"${GREETING}${name}\"\n\
+         export val addBase = (x: Int32): Int32 => x + BASE\n\
+         export val addDouble = (x: Int32): Int32 => x + DOUBLE\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ f, greet, addBase, addDouble }} from "{}/lib"
+print(toString(f(1.0)))
+print(greet("World"))
+print(toString(addBase(5)))
+print(toString(addDouble(5)))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["1.1", "Hi, World", "15", "25"]);
+}
+
+#[test]
 fn test_default_args_trailing_comma_still_curries() {
     // A trailing comma requests partial application even when defaults exist,
     // rather than filling the default.

@@ -138,6 +138,21 @@ pub fn lower_import_module(module: &TypedModule, module_key: &str) -> LinModule 
     }
     ctx.global_fn_slots = global_fn_slots.clone();
 
+    // Register every top-level NON-FUNCTION `val` so references to it from inside an exported
+    // function body resolve to its zero-arg `{module_key}_{name}__val` wrapper (emitted below),
+    // exactly as a *cross-module* importer would resolve the binding. An imported module has no
+    // `main`, so unlike `lower_module` it cannot publish these to LLVM globals + module-init;
+    // instead each read recomputes the value through its wrapper (cheap, and the same recompute
+    // contract the importing module already relies on). This MUST run before lowering function
+    // bodies (and before emitting the wrappers, whose initialisers may reference sibling vals).
+    for stmt in &module.statements {
+        if let TypedStmt::Val { slot, value, ty, name: Some(name), .. } = stmt {
+            if matches!(value, TypedExpr::Function { .. }) { continue; }
+            let wrapper = format!("{}_{}__val", module_key, name);
+            ctx.import_val_slots.insert(*slot, (wrapper, ty.clone()));
+        }
+    }
+
     // Mutable-capture pre-scan (heap cells) — same as the main lowering.
     for stmt in &module.statements {
         collect_mutable_capture_slots_stmt(stmt, &mut ctx.mutable_cell_slots);
