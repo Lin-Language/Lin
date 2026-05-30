@@ -716,6 +716,12 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 let cell_ty = if matches!(ty, Type::Null) { Type::TypeVar(u32::MAX) } else { ty.clone() };
                 let t = lower_expr(value, builder, ctx);
                 let t = coerce_to_slot_type(t, &value.ty(), &cell_ty, builder);
+                // For a concrete reference-counted cell, take an independent reference to the
+                // initial value (mirrors the reassignment path in LocalSet) so the cell's
+                // release-on-reassign stays balanced. Boxed cells keep the legacy borrow model.
+                if is_rc_type(&cell_ty) {
+                    builder.emit(Instruction::Retain { val: t, ty: cell_ty.clone() });
+                }
                 let cell = builder.alloc_temp(Type::TypeVar(u32::MAX));
                 builder.emit(Instruction::MakeCell { dst: cell, init: t, ty: cell_ty.clone() });
                 builder.cell_slots.insert(*slot, cell_ty);
@@ -729,6 +735,12 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 // can't see main's SSA temps) can read/write it. Writes inside closures go
                 // through GlobalValSet (see LocalSet); reads through GlobalValGet (LocalGet).
                 if ctx.global_val_slots.contains_key(slot) {
+                    // For a concrete reference-counted global, take an independent reference to
+                    // the initial value (mirrors LocalSet) so release-on-reassign stays
+                    // balanced. Boxed globals keep the legacy borrow model.
+                    if is_rc_type(ty) {
+                        builder.emit(Instruction::Retain { val: t, ty: ty.clone() });
+                    }
                     builder.emit(Instruction::GlobalValSet { slot: *slot, value: t, ty: ty.clone() });
                 }
             }
@@ -960,6 +972,15 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             if let Some(cell_ty) = builder.cell_slots.get(slot).cloned() {
                 if let Some(&cell) = builder.slots.get(slot) {
                     let v = coerce_to_slot_type(val_temp, &value.ty(), &cell_ty, builder);
+                    // For a concrete reference-counted cell, the cell owns an INDEPENDENT
+                    // reference to its value: retain on store so it survives the producing
+                    // scope's own release, and codegen releases the cell's old reference on
+                    // reassignment (fixing the per-reassignment leak). Boxed (Json/union) cells
+                    // keep the legacy borrow model (no retain/no release) to avoid double-frees
+                    // of borrowed values.
+                    if is_rc_type(&cell_ty) {
+                        builder.emit(Instruction::Retain { val: v, ty: cell_ty.clone() });
+                    }
                     builder.emit(Instruction::CellSet { cell, value: v, ty: cell_ty });
                     return v;
                 }
@@ -969,6 +990,9 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // to the global's declared representation first.
             if let Some(gty) = ctx.global_val_slots.get(slot).cloned() {
                 let v = coerce_to_slot_type(val_temp, &value.ty(), &gty, builder);
+                if is_rc_type(&gty) {
+                    builder.emit(Instruction::Retain { val: v, ty: gty.clone() });
+                }
                 builder.emit(Instruction::GlobalValSet { slot: *slot, value: v, ty: gty });
                 builder.slots.insert(*slot, v);
                 return v;

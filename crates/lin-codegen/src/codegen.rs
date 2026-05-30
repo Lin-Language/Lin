@@ -509,6 +509,27 @@ impl<'ctx> Codegen<'ctx> {
 
 
 
+    /// Concrete (non-boxed) reference-counted heap types: the IR lowerer tracks these for
+    /// scope-exit release (mirrors `lin_ir`'s `is_rc_type`), and a cell/global holding one
+    /// owns an independent reference (the lowerer retains on store). Boxed Json/union/Named
+    /// values are excluded: they follow the legacy borrow model where the value's true owner
+    /// frees it, so a cell/global must NOT release them on reassignment (double-free).
+    ///
+    /// This MUST stay in lockstep with `lin_ir::lower::is_rc_type`: codegen releases the old
+    /// value on reassignment only for types the lowerer also retained on store. A type present
+    /// here but absent there would be released without a matching retain — a refcount underflow.
+    /// (`Iterator` is deliberately omitted for that reason: the lowerer does not retain it.)
+    fn ty_is_concrete_rc(ty: &Type) -> bool {
+        matches!(
+            ty,
+            Type::Str
+                | Type::Array(_)
+                | Type::FixedArray(_)
+                | Type::Object(_)
+                | Type::Function { .. }
+        )
+    }
+
     /// Emit a type-dispatched release call for a heap-allocated value.
     /// No-op for scalars (non-pointer LLVM values) and null pointers.
     fn emit_release(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) {
@@ -2174,6 +2195,20 @@ impl<'ctx> Codegen<'ctx> {
                                     g.set_initializer(&llvm_ty.const_zero());
                                     g
                                 });
+                                // A top-level `var` global owns one reference to its current
+                                // value. On reassignment its previous reference must be dropped,
+                                // otherwise every reassignment leaks the old value. The lowerer
+                                // pairs this with a Retain of the new value so the global holds
+                                // an independent reference. Restricted to concrete reference-
+                                // counted types: boxed (Json/union) globals keep the legacy
+                                // borrow model, where the value's owner (not the global) frees
+                                // it — releasing here would double-free borrowed values.
+                                if Self::ty_is_concrete_rc(ty) {
+                                    let old = self.builder
+                                        .build_load(llvm_ty, glob.as_pointer_value(), "ir_gv_old")
+                                        .unwrap();
+                                    self.emit_release(old, ty);
+                                }
                                 self.builder.build_store(glob.as_pointer_value(), v).unwrap();
                             }
                         }
@@ -2209,9 +2244,25 @@ impl<'ctx> Codegen<'ctx> {
                                 }
                             }
                         }
-                        Instruction::CellSet { cell, value, .. } => {
+                        Instruction::CellSet { cell, value, ty } => {
                             if let (Some(&c), Some(&v)) = (temp_map.get(cell), temp_map.get(value)) {
                                 if c.is_pointer_value() {
+                                    // A captured `var` cell owns one reference to its current
+                                    // value. On reassignment its previous reference must be
+                                    // dropped, otherwise every reassignment leaks the old value.
+                                    // The lowerer pairs this with a Retain of the new value so
+                                    // the cell holds an independent reference. Restricted to
+                                    // concrete reference-counted types: boxed (Json/union) cells
+                                    // keep the legacy borrow model (releasing a borrowed value
+                                    // here would double-free). The release fns null-check the
+                                    // cell's initial zero.
+                                    if Self::ty_is_concrete_rc(ty) {
+                                        let llvm_ty = self.llvm_type(ty);
+                                        let old = self.builder
+                                            .build_load(llvm_ty, c.into_pointer_value(), "ir_cell_old")
+                                            .unwrap();
+                                        self.emit_release(old, ty);
+                                    }
                                     self.builder.build_store(c.into_pointer_value(), v).unwrap();
                                 }
                             }

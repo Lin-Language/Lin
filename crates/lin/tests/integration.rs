@@ -2281,6 +2281,49 @@ print(toString(x))
 }
 
 #[test]
+fn test_concrete_rc_cell_reassignment_in_loop() {
+    // Regression: reassigning a concrete reference-counted (here String) `var` inside a
+    // closure must release the cell's OLD value and retain the NEW one, so refcounts stay
+    // balanced over many reassignments. Before the fix the old value's reference was dropped
+    // on the floor (leak) and the cell aliased a scope-released value (use-after-free /
+    // garbage output). A 5000-iteration loop would corrupt or leak; with the fix it runs
+    // cleanly and yields the final value deterministically.
+    let output = run(r#"import { print } from "std/io"
+import { for, range } from "std/array"
+import { trim, repeat } from "std/string"
+
+val build = (): String =>
+  var acc = "seed"
+  range(0, 5000).for(i =>
+    acc = trim(repeat("x", 3))
+    0
+  )
+  acc
+
+print(build())
+"#);
+    assert_eq!(output, vec!["xxx"]);
+}
+
+#[test]
+fn test_concrete_rc_global_var_reassignment_in_loop() {
+    // Same fix, exercised through the top-level `var` (module-global) path: a concrete-rc
+    // global reassigned inside a closure must release its old value and retain the new one.
+    let output = run(r#"import { print } from "std/io"
+import { for, range } from "std/array"
+import { repeat } from "std/string"
+
+var acc = "seed"
+range(0, 5000).for(i =>
+  acc = repeat("y", 2)
+  0
+)
+print(acc)
+"#);
+    assert_eq!(output, vec!["yy"]);
+}
+
+#[test]
 fn test_nested_generics_still_parse() {
     // Regression: `>>` shift detection (two ADJACENT `Gt` tokens in VALUE position) must
     // NOT break nested generic type close `>>` in TYPE position. Generic types are parsed
