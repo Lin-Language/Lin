@@ -588,18 +588,18 @@ End state: O(n log n) sort, O(n) string building, O(n) unique/omit, constant-fac
 
 ### Significant fixes (double key evaluations)
 
-- [ ] **Schwartzian transform for `sortBy` / `minBy` / `maxBy`** — current comparators call `keyFn(a)` and `keyFn(b)` on every comparison, so `keyFn` is called O(n²) times. Map to `[key, value]` pairs once (O(n) calls), sort/reduce by `pair[0]`, then extract values. Alternatively add `lin_sort_by_key(arr, keyFn)` intrinsic that caches keys internally.
-- [ ] **`string.isBlank` allocation** — calls `lin_string_trim(s) == ""` which allocates a trimmed copy just to check emptiness. Add `lin_string_is_blank` intrinsic that scans bytes directly.
-- [ ] **`string.startsWith` / `string.endsWith` allocation** — each extracts a substring copy for comparison. Add `lin_string_starts_with(s, prefix)` and `lin_string_ends_with(s, suffix)` intrinsics that compare in-place without allocation.
+- [x] **Schwartzian transform for `sortBy` / `minBy` / `maxBy`** — `stdlib/array.lin` maps to `[keyFn(item), item]` pairs once (O(n) `keyFn` calls), sorts/reduces by `pair[0]`, then extracts values.
+- [x] **`string.isBlank` allocation** — `lin_string_is_blank` intrinsic scans chars directly (`string.rs`); no trimmed copy.
+- [x] **`string.startsWith` / `string.endsWith` allocation** — `lin_string_starts_with` / `lin_string_ends_with` intrinsics compare in-place via Rust `str::starts_with`/`ends_with` (`string.rs`); no substring copy.
 
 ### Minor fixes (constant-factor and allocation)
 
-- [ ] **`lin_array_alloc_sized(n)` intrinsic** — for `map`, `zip`, `take`, `reverse` the output size is known before the loop. Preallocate to eliminate all intermediate `push`-driven reallocations.
-- [ ] **`lin_array_concat` intrinsic** — current `concat` calls `push` per element; a bulk `memcpy`-based copy would be a large constant-factor improvement, especially for flat scalar arrays.
-- [ ] **`append` / `prepend` intermediate alloc** — both construct a 1-element `[item]` literal before calling `concat`. A `lin_array_append` / `lin_array_prepend` intrinsic would skip that allocation.
-- [ ] **`object.values` / `object.entries` two-pass** — both call `lin_keys` then iterate the key array; a `lin_object_values` / `lin_object_entries` intrinsic would traverse the internal hash map in a single pass without the intermediate key array.
-- [ ] **`countBy` two passes** — currently calls `groupBy` (allocates all groups) then counts lengths. A single-pass accumulation directly into integer counts would use less memory and fewer allocations.
-- [ ] **`groupBy` double key lookup** — `result[key]` is accessed twice per element (once for null check, once for the push). A `lin_object_get_or_insert` intrinsic would do a single hash lookup.
+- [x] **`lin_array_alloc_sized(n)` intrinsic** — `lin_array_alloc(cap)` preallocates with the known output size; used by `map`, `zip`, `take`, `reverse`, `append`, `prepend`.
+- [x] **`lin_array_concat` intrinsic** — `lin_array_concat_into(dst, src)` exists in `array.rs` for bulk copy. (`concat` in `stdlib/array.lin` still uses a manual `set` loop rather than the intrinsic — acceptable.)
+- [ ] **`append` / `prepend` intermediate alloc** — no `lin_array_append` / `lin_array_prepend` intrinsic; stdlib allocates an `n+1` array and copies. Minor.
+- [x] **`object.values` / `object.entries` two-pass** — `lin_object_values` / `lin_object_entries` intrinsics traverse the internal map in a single pass (`object.rs`); no intermediate key array.
+- [x] **`countBy` two passes** — `stdlib/array.lin` `countBy` accumulates counts directly in a single pass; no longer routes through `groupBy`.
+- [ ] **`groupBy` double key lookup** — still a null-check-then-push double lookup in Lin; no `lin_object_get_or_insert` intrinsic. Minor.
 
 ---
 
@@ -613,13 +613,13 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 
 ### Layer 1 — Bytes and bitwise operators
 
-- [ ] **Small-int flat array variants** (`lin-runtime/src/array.rs`) — add the full flat family (`alloc/push/get/set/free/alloc_filled/concat_into/eq/slice`) for `i8`, `u8`, `i16`, `u16`, mirroring the existing `i32` family. New element tags `TAG_UINT8`, `TAG_INT8`, `TAG_UINT16`, `TAG_INT16` (next free after `TAG_FUNCTION=9`) in `tagged.rs`. Strides 1 byte (`i8`/`u8`) and 2 bytes (`i16`/`u16`).
-- [ ] **Flat-scalar dispatch** (`lin-codegen`) — extend `is_flat_scalar` and `flat_suffix` to cover `Int8/UInt8/Int16/UInt16` (suffixes `i8/u8/i16/u16`). `UInt8[]` then works everywhere flat scalars do (literals, indexing, in-place `buf[i]=x`, `length`, `push`, combinators, `==`).
+- [x] **Small-int flat array variants** (`lin-runtime/src/array.rs`) — full flat family (`alloc/push/get/set/free/alloc_filled/concat_into/eq/slice`) for `i8`, `u8`, `i16`, `u16` present via macro expansion, plus `lin_flat_to_tagged_*` converters.
+- [x] **Flat-scalar dispatch** (`lin-codegen`) — `is_flat_scalar` and `flat_suffix` cover `Int8/UInt8/Int16/UInt16` (suffixes `i8/u8/i16/u16`) alongside the 32/64-bit families.
 - [x] **Bitwise tokens** (`lin-lex`) — new tokens `Amp` (`&`), `Caret` (`^`), `Tilde` (`~`). Maximal-munch: lone `&` → `Amp`, `&&` → existing `And`. Reuse existing `Pipe` (`|`) in value position. NOTE: `<<`/`>>` are deliberately NOT lexed as combined `Shl`/`Shr` tokens — that would break nested generic close `>>` (`Promise<Promise<Int32>>`). Shifts are detected at the parser level from two ADJACENT `Lt`/`Gt` tokens in value position (`parse_shift_expr` / `adjacent_pair`).
 - [x] **Bitwise AST + parser** — `BinOp::{BAnd, BOr, BXor, Shl, Shr}` and surface `UnaryOp::BNot` + `Expr::UnaryOp` (ast.rs). Precedence rungs per spec §24.2: `~` above `*`; `<<`/`>>` between `+`/`-` and comparison; `&`, `^`, `|` between `==`/`!=` and `&&`, in that order (`parse_bitor_expr` → `parse_bitxor_expr` → `parse_bitand_expr` → ... → `parse_shift_expr` → `parse_additive_expr` → ... → `parse_unary_expr`).
 - [x] **Bitwise type rules** (`lin-check`, `infer_binary_op` + new `infer_unary_op`) — integer-only operands; float operand is a compile-time error. `& | ^`: result = widened integer type (reuse `widen_numeric`). `<< >>`: result = left operand's type. `~x`: result = type of `x`. TypeVar/dynamic operands fall back to the other side's type or `Int32`.
 - [x] **Bitwise codegen / IR lowering** (`lin-ir/src/lower.rs`, `lin-codegen`) — `BinOp::{BAnd,BOr,BXor,Shl,Shr}` map to LLVM `build_and/or/xor/left_shift/right_shift` (logical shift for unsigned, arithmetic for signed via `lty.is_signed()`); surface `UnaryOp::BNot` lowers to IR `UnaryOp::Not` → `build_not`.
-- [ ] **`slice` function** — `slice(arr, start, end)` in `std/array` (and re-exported from `std/bytes`), backed by `lin_flat_array_slice_<suffix>` for flat element types and the tagged-array slice path otherwise. No range-index syntax.
+- [ ] **`slice` function** — `slice(arr, start, end)` in `std/array` (and re-exported from `std/bytes`), backed by `lin_flat_array_slice_<suffix>` for flat element types and the tagged-array slice path otherwise. No range-index syntax. NOTE: the runtime `lin_flat_array_slice_<suffix>` intrinsics already exist (`array.rs`); only the stdlib `slice` wrapper is missing.
 - [ ] **Float bit-reinterpret intrinsics** (`lin-runtime`) — `lin_f32_to_bits`/`lin_f32_from_bits`/`lin_f64_to_bits`/`lin_f64_from_bits` (`f32::to_bits` etc.).
 - [ ] **`std/bytes` module** (pure Lin + the four float intrinsics) — `u16/u32/u64` big- and little-endian read/write via shift-and-mask; `f32/f64` (de)serialization via the bit-reinterpret intrinsics; `slice`.
 
