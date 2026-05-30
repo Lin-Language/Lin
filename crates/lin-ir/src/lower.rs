@@ -744,6 +744,31 @@ fn is_union_ty(ty: &Type) -> bool {
     matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_))
 }
 
+/// A concrete heap-allocated value type whose box wraps a refcounted heap pointer
+/// (Str/Array/FixedArray/Object/Iterator). Boxing one of these into a Json/union param
+/// (via Coerce → `lin_box_str`/`lin_box_array`/`lin_box_object`) allocates a FRESH 16-byte
+/// `TaggedVal*` shell whose inner is the (separately owned) heap pointer. Scalars
+/// (int/bool/float/null) are excluded: their boxes may be cached/immutable.
+fn is_heap_ty(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Str | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Iterator(_)
+    )
+}
+
+/// Whether passing an argument of `arg_ty` to a parameter of `param_ty` causes
+/// `lower_coerce_arg` to box a CONCRETE HEAP value into a fresh, caller-owned `TaggedVal*`
+/// shell. The shell's inner heap pointer is owned separately (released by the arg's own
+/// scope-exit release), so after the call the caller must free ONLY the shell.
+/// True iff: param is union, arg is concrete heap. Excludes already-union args (the box
+/// belongs to someone else) and scalar args (cached boxes).
+fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool {
+    match param_ty {
+        Some(p) => is_union_ty(p) && !is_union_ty(arg_ty) && is_heap_ty(arg_ty),
+        None => false,
+    }
+}
+
 /// Retain a Function-typed argument that is NOT a freshly-made closure before passing it
 /// to a call. AST-compiled callees release their Function-typed parameters at return; a
 /// borrowed (non-fresh) closure must be retained to balance that, while a fresh closure's
@@ -775,6 +800,26 @@ fn expr_is_fresh_alloc(expr: &TypedExpr) -> bool {
         TypedExpr::Block { expr, .. } => expr_is_fresh_alloc(expr),
         TypedExpr::Coerce { expr, .. } => expr_is_fresh_alloc(expr),
         _ => false,
+    }
+}
+
+/// After a (non-tail) call, free the 16-byte `TaggedVal*` SHELL of each argument box that
+/// WE freshly allocated by coercing a concrete heap value into a Json/union parameter (see
+/// `arg_box_is_caller_owned_shell`). Json/union params are BORROWED: the callee never
+/// releases them (`lower_function_expr_with_id`'s param scope only registers Function-typed
+/// params for release — the universal convention for every Lin function, incl. stdlib
+/// for/map/filter/reduce), so the caller owns and must reclaim the shell.
+///
+/// Frees only the shell, never the inner heap payload (that pointer is owned separately and
+/// released by the arg's own scope-exit release — freeing it here would double-free).
+///
+/// Uses `FreeBoxShellIfDistinct` against the call result `dst`: a callee that simply returns
+/// its Json param (e.g. an identity/pass-through) hands the very same box back as the result,
+/// which the caller now owns (`register_owned(dst)`) and will release later — freeing that
+/// shell here would corrupt the returned value, so we skip it when the shell == result.
+fn free_arg_box_shells(shell_boxes: &[Temp], dst: Temp, builder: &mut FuncBuilder) {
+    for &shell in shell_boxes {
+        builder.emit(Instruction::FreeBoxShellIfDistinct { val: shell, other: dst });
     }
 }
 
@@ -1481,12 +1526,16 @@ fn lower_call(
         // Imported function: call the compiled symbol by its mangled name, boxing
         // concrete args passed to Json/union-typed parameters.
         if let Some((sym, param_tys)) = ctx.import_fn_slots.get(slot).cloned() {
+            let mut shell_boxes: Vec<Temp> = Vec::new();
             let lowered_args: Vec<Temp> = args
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
                     let arg = lower_call_arg(a, param_tys.get(i), builder, ctx);
                     retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
+                    if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
+                        shell_boxes.push(arg);
+                    }
                     arg
                 })
                 .collect();
@@ -1504,6 +1553,7 @@ fn lower_call(
                 args: lowered_args,
                 ret_ty: result_type.clone(),
             });
+            free_arg_box_shells(&shell_boxes, dst, builder);
             builder.register_owned(dst, result_type.clone());
             return dst;
         }
@@ -1515,12 +1565,16 @@ fn lower_call(
                 Type::Function { params, .. } => params,
                 _ => vec![],
             };
+            let mut shell_boxes: Vec<Temp> = Vec::new();
             let lowered_args: Vec<Temp> = args
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
                     let arg = lower_call_arg(a, param_tys.get(i), builder, ctx);
                     retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
+                    if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
+                        shell_boxes.push(arg);
+                    }
                     arg
                 })
                 .collect();
@@ -1537,6 +1591,10 @@ fn lower_call(
             // than the current function — so it can never use the self-recursive TailCall fast
             // path (which jumps to the current function's entry expecting all parameters).
             if is_tail && !is_default_fill {
+                // A tail call has no "after" block in which to free arg-box shells; the box is
+                // consumed by the jump. A boxed concrete-heap arg in tail position is rare
+                // (would require a self-recursive function taking a Json param a concrete heap
+                // value is passed to), and the small per-tail-call shell leak is left unfixed.
                 builder.terminate(Terminator::TailCall { args: lowered_args.clone() });
                 // Dead block to keep IR valid.
                 let post = builder.alloc_block("tco_post");
@@ -1551,6 +1609,7 @@ fn lower_call(
                 args: lowered_args,
                 ret_ty: result_type.clone(),
             });
+            free_arg_box_shells(&shell_boxes, dst, builder);
             builder.register_owned(dst, result_type.clone());
             return dst;
         }

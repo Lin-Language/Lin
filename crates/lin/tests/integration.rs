@@ -384,6 +384,44 @@ print(toString(total))
     assert_eq!(output, vec!["225"]);
 }
 
+// Regression (call-arg-box leak): passing a CONCRETE array to a Json-typed param (`for`'s
+// iterable) inside an outer loop boxes the array into a fresh TaggedVal* shell each outer
+// iteration. The shell was never freed → one-box-per-iteration leak. Caller now frees the
+// shell after the call. This runs the nested loop under churn; correctness here also guards
+// against an over-eager shell free corrupting the borrowed array (double-free / wrong result).
+#[test]
+fn test_nested_for_over_concrete_array_arg_box() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/array"
+
+var k = 0
+val xs = [1, 2, 3]
+range(0, 5000).for(j => xs.for(s => k = k + 1))
+print(toString(k))
+"#);
+    assert_eq!(output, vec!["15000"]);
+}
+
+// Regression (call-arg-box leak): a concrete Object passed to a Json-typed param (`keys`)
+// repeatedly under churn. Each call boxes the object into a fresh shell; the shell free must
+// not touch the object's inner payload (which the object's own scope-exit release owns).
+#[test]
+fn test_object_to_json_param_under_churn() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for, length } from "std/array"
+import { keys } from "std/object"
+
+val o = {"a": 1, "b": 2}
+var n = 0
+range(0, 5000).for(j => n = n + length(keys(o)))
+print(toString(n))
+"#);
+    // keys(o) has 2 entries; summed 5000 times = 10000.
+    assert_eq!(output, vec!["10000"]);
+}
+
 #[test]
 fn test_map_filter_reduce() {
     let output = run(r#"import { print } from "std/io"
