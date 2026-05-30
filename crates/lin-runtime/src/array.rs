@@ -30,6 +30,26 @@ unsafe fn array_elem_layout(cap: u64) -> Layout {
     )
 }
 
+/// (size, align) of one element for a given `elem_tag`. Flat scalar arrays store raw
+/// values of the element's natural width; `0xFF` (tagged) stores 16-byte LinArrayElem.
+/// The data buffer MUST be freed with the same layout it was allocated with, so this
+/// must match each flat family's `$alloc`/`$free` (e.g. lin_flat_array_alloc_u8 uses
+/// size_of::<u8>()). Using the tagged 16-byte layout to free a flat array corrupts the heap.
+fn flat_elem_size_align(elem_tag: u8) -> (usize, usize) {
+    use crate::tagged::*;
+    match elem_tag {
+        TAG_INT32 | TAG_FLOAT32 => (4, 4),
+        TAG_INT64 | TAG_FLOAT64 => (8, 8),
+        TAG_UINT8 | TAG_INT8 | TAG_BOOL => (1, 1),
+        TAG_UINT16 | TAG_INT16 => (2, 2),
+        // 0xFF and anything else: tagged 16-byte elements.
+        _ => (
+            std::mem::size_of::<LinArrayElem>(),
+            std::mem::align_of::<LinArrayElem>(),
+        ),
+    }
+}
+
 unsafe fn array_layout() -> Layout {
     Layout::from_size_align_unchecked(
         std::mem::size_of::<LinArray>(),
@@ -54,8 +74,14 @@ pub unsafe extern "C" fn lin_array_alloc(initial_cap: u64) -> *mut LinArray {
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_free(arr: *mut LinArray) {
-    let cap = (*arr).cap;
-    dealloc((*arr).data as *mut u8, array_elem_layout(cap));
+    let cap = (*arr).cap as usize;
+    // Free the data buffer with the SAME layout it was allocated with. Flat scalar
+    // arrays use their element's natural width, not the 16-byte tagged element size —
+    // freeing a flat u8 array with the tagged layout deallocs 16x too much and corrupts
+    // the heap (surfaces as a SEGV in a much later, unrelated allocation).
+    let (esize, ealign) = flat_elem_size_align((*arr).elem_tag);
+    let data_layout = Layout::from_size_align_unchecked(esize * cap, ealign);
+    dealloc((*arr).data as *mut u8, data_layout);
     dealloc(arr as *mut u8, array_layout());
 }
 
@@ -460,6 +486,41 @@ pub unsafe extern "C" fn lin_array_slice_tagged(arr: *const LinArray, start: i64
         ));
     }
     out
+}
+
+/// Polymorphic slice: dispatch on the array's runtime `elem_tag` and call the
+/// matching typed slice fn. Preserves element type (a UInt8[] yields a UInt8[],
+/// an Int32[] yields an Int32[], a tagged Json[] yields a Json[]). Backs the
+/// std/array `slice` export and (re-exported) std/bytes `slice`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_slice_dyn(arr: *const u8, start: i64, end: i64) -> *mut u8 {
+    use crate::tagged::*;
+    if arr.is_null() {
+        return alloc_tagged(TAG_ARRAY, lin_array_alloc(4) as u64);
+    }
+    // `Json` arrays cross the FFI boundary as a TaggedVal*(Array); a raw LinArray*
+    // can also arrive from typed array params. Unwrap to the inner LinArray*.
+    let tag = *arr;
+    let lin_arr = if tag == TAG_ARRAY {
+        (*(arr as *const TaggedVal)).payload as *const LinArray
+    } else {
+        arr as *const LinArray
+    };
+    let out: *mut LinArray = match (*lin_arr).elem_tag {
+        0xFF => lin_array_slice_tagged(lin_arr, start, end),
+        TAG_INT32 => lin_flat_array_slice_i32(lin_arr, start, end),
+        TAG_INT64 => lin_flat_array_slice_i64(lin_arr, start, end),
+        TAG_FLOAT32 => lin_flat_array_slice_f32(lin_arr, start, end),
+        TAG_FLOAT64 => lin_flat_array_slice_f64(lin_arr, start, end),
+        TAG_UINT8 => lin_flat_array_slice_u8(lin_arr, start, end),
+        TAG_INT8 => lin_flat_array_slice_i8(lin_arr, start, end),
+        TAG_UINT16 => lin_flat_array_slice_u16(lin_arr, start, end),
+        TAG_INT16 => lin_flat_array_slice_i16(lin_arr, start, end),
+        // Unknown tag: fall back to a tagged slice (treats elements as 16-byte TaggedVals).
+        _ => lin_array_slice_tagged(lin_arr, start, end),
+    };
+    // Return a Json value: TaggedVal*(Array) wrapping the result.
+    alloc_tagged(TAG_ARRAY, out as u64)
 }
 
 /// Copy all elements from `src` into `dst` (tagged arrays only).

@@ -1,7 +1,7 @@
 use crate::string::{LinString, lin_string_from_bytes};
 use crate::object::{LinObject, lin_object_alloc, lin_object_set};
 use crate::array::{lin_array_alloc, LinArray, lin_array_length, lin_array_get_tagged,
-                   lin_flat_array_alloc_i32, lin_flat_array_push_i32};
+                   lin_flat_array_alloc_u8, lin_flat_array_push_u8};
 use crate::tagged::{TaggedVal, TAG_STR, TAG_INT32, TAG_OBJECT, TAG_ARRAY, alloc_tagged, lin_unbox_ptr};
 
 pub unsafe fn make_string(s: &str) -> *mut LinString {
@@ -411,8 +411,8 @@ unsafe fn collect_dir_recursive(base: &str, prefix: &str, arr: *mut LinArray) ->
     Ok(())
 }
 
-/// Read a file as raw bytes. Returns TaggedVal*(flat Int32 array) on success, error on failure.
-/// Each byte is stored as an Int32 value.
+/// Read a file as raw bytes. Returns TaggedVal*(flat UInt8 array) on success, error on failure.
+/// The result is a packed UInt8[] byte buffer (§35.1): one byte per element.
 #[no_mangle]
 pub unsafe extern "C" fn lin_fs_read_file_bytes(path: *const u8) -> *mut u8 {
     let path_str = match resolve_lin_str(path) {
@@ -423,15 +423,17 @@ pub unsafe extern "C" fn lin_fs_read_file_bytes(path: *const u8) -> *mut u8 {
         Ok(b) => b,
         Err(e) => return make_error_tagged(&e.to_string()),
     };
-    let arr = lin_flat_array_alloc_i32(bytes.len().max(4) as u64);
+    let arr = lin_flat_array_alloc_u8(bytes.len().max(4) as u64);
     for b in &bytes {
-        lin_flat_array_push_i32(arr, *b as i32);
+        lin_flat_array_push_u8(arr, *b);
     }
     alloc_tagged(TAG_ARRAY, arr as u64)
 }
 
-/// Write a flat Int32 array as raw bytes to a file.
-/// arr is a TaggedVal*(Array) where the inner array is a flat i32 array.
+/// Write a UInt8[] byte buffer as raw bytes to a file.
+/// arr is a TaggedVal*(Array) or raw LinArray*; the inner array is normally a
+/// flat UInt8 array (read directly from its u8 data) but a tagged array is also
+/// tolerated (each element read via lin_array_get_tagged).
 /// Returns null on success, error on failure.
 #[no_mangle]
 pub unsafe extern "C" fn lin_fs_write_file_bytes(path: *const u8, arr: *const u8) -> *mut u8 {
@@ -452,22 +454,32 @@ pub unsafe extern "C" fn lin_fs_write_file_bytes(path: *const u8, arr: *const u8
     };
     let len = lin_array_length(lin_arr) as usize;
     let mut bytes: Vec<u8> = Vec::with_capacity(len);
-    for i in 0..len as i64 {
-        let tv_ptr = lin_array_get_tagged(lin_arr, i);
-        let val = if tv_ptr.is_null() {
-            0u8
-        } else {
-            let tag = (*tv_ptr).tag;
-            let payload = (*tv_ptr).payload;
-            let v = match tag {
-                TAG_INT32 => payload as i32,
-                _ => payload as i32,
+    let elem_tag = (*lin_arr).elem_tag;
+    if elem_tag == crate::tagged::TAG_UINT8 || elem_tag == crate::tagged::TAG_INT8 {
+        // Flat 1-byte array: read raw bytes straight from the data buffer.
+        let data = (*lin_arr).data as *const u8;
+        for i in 0..len {
+            bytes.push(*data.add(i));
+        }
+    } else {
+        // Fallback for tagged or other-width arrays: box each element and truncate.
+        for i in 0..len as i64 {
+            let tv_ptr = lin_array_get_tagged(lin_arr, i);
+            let val = if tv_ptr.is_null() {
+                0u8
+            } else {
+                let etag = (*tv_ptr).tag;
+                let payload = (*tv_ptr).payload;
+                let v = match etag {
+                    TAG_INT32 => payload as i32,
+                    _ => payload as i32,
+                };
+                // Free the allocated TaggedVal returned by lin_array_get_tagged.
+                std::alloc::dealloc(tv_ptr as *mut u8, std::alloc::Layout::new::<TaggedVal>());
+                v as u8
             };
-            // Free the allocated TaggedVal returned by lin_array_get_tagged
-            std::alloc::dealloc(tv_ptr as *mut u8, std::alloc::Layout::new::<TaggedVal>());
-            v as u8
-        };
-        bytes.push(val);
+            bytes.push(val);
+        }
     }
     match std::fs::write(&path_str, &bytes) {
         Ok(_) => std::ptr::null_mut(),
