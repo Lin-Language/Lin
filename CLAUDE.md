@@ -18,9 +18,9 @@ Do not work or make changes directly in the codebase. Create a subagent with a g
 
 ```bash
 cargo build --workspace && cargo test --workspace   # always build first — integration tests invoke target/debug/lin as a subprocess, so a stale binary causes spurious failures
-cargo run -p lin -- build examples/hello.lin -o hello  # compile to native binary
-cargo run -p lin -- check examples/hello.lin    # type check only
-cargo run -p lin -- test stdlib/                # run stdlib test suite (*.test.lin)
+cargo run -p lin -- build examples/calc/main.lin -o calc  # compile to native binary
+cargo run -p lin -- check examples/calc/main.lin    # type check only
+cargo run -p lin -- test stdlib/ examples/      # run stdlib + example-project test suites (*.test.lin)
 ```
 
 Environment variables for `lin build`:

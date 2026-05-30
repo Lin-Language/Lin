@@ -66,14 +66,14 @@ The extension bundles the `lin` compiler and `lin-lsp` language server — no se
 
 ```bash
 # Compile and run immediately
-lin run examples/hello.lin
+lin run examples/calc/main.lin
 
 # Compile to a binary
-lin build examples/hello.lin -o hello
-./hello
+lin build examples/calc/main.lin -o calc
+./calc
 
 # Type-check without compiling
-lin check examples/hello.lin
+lin check examples/calc/main.lin
 ```
 
 ---
@@ -386,7 +386,7 @@ import foreign "libmathlib.a"
 print(toString(sqrt(2.0)))   // 1.4142...
 ```
 
-The C header `crates/lin-runtime/lin.h` defines `LinString` and `LinArray` for passing non-primitive types across the boundary. See `examples/ffi-c.lin` for a complete example.
+The C header `crates/lin-runtime/lin.h` defines `LinString` and `LinArray` for passing non-primitive types across the boundary. See `examples/ffi/main.lin` for a complete example.
 
 ---
 
