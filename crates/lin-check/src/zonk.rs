@@ -127,6 +127,14 @@ fn zonk_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
             zonk_expr(else_br, subs);
             *result_type = zonk_type(result_type, subs);
         }
+        TypedExpr::FromJson { target, value, result_type, named_defs, .. } => {
+            *target = zonk_type(target, subs);
+            zonk_expr(value, subs);
+            *result_type = zonk_type(result_type, subs);
+            for (_, body) in named_defs.iter_mut() {
+                *body = zonk_type(body, subs);
+            }
+        }
         TypedExpr::Match { scrutinee, arms, result_type, .. } => {
             zonk_expr(scrutinee, subs);
             for arm in arms { zonk_match_arm(arm, subs); }

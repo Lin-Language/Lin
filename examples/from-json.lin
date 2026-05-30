@@ -1,0 +1,39 @@
+// fromJson — type-directed JSON decoding (ADR-047).
+//
+// `Person.fromJson(json)` validates a Json value against the target type and returns either the
+// decoded value (typed as Person) or an Error object `{ type, message, path }` describing the
+// first structural mismatch. Detect the failure with `is Error` (which matches the decode
+// error's `"type": "error"` discriminant). Put the `is Error` arm FIRST: a structural object
+// type like `Person` is matched by a bare object tag check, so a later `is Person` arm would
+// also match the Error object (union first-match-wins, ADR-047).
+
+import { print } from "std/io"
+import { fromJson } from "std/json"
+
+type Address = { "city": String, "zip": String | Null }
+type Person = { "name": String, "age": Int32, "address": Address }
+
+val describe = (label: String, result: Person | Error): Null =>
+  match result
+    is Error => print("${label}: decode error at ${result["path"]} — ${result["message"]}")
+    is Person => print("${label}: ${result["name"]}, age ${result["age"]}, in ${result["address"]["city"]}")
+
+val main = (): Null =>
+  // Valid: zip is optional (String | Null), so omitting it is fine.
+  describe("good", Person.fromJson({
+    "name": "Ada",
+    "age": 36,
+    "address": { "city": "London" }
+  }))
+
+  // Wrong nested type: age is a string where Int32 is expected.
+  describe("bad-type", Person.fromJson({
+    "name": "Bob",
+    "age": "old",
+    "address": { "city": "Paris" }
+  }))
+
+  // Missing required field: address absent.
+  describe("missing", Person.fromJson({ "name": "Cleo", "age": 12 }))
+
+main()

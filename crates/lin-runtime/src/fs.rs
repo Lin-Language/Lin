@@ -39,6 +39,35 @@ unsafe fn make_error_obj(msg: &str) -> *mut LinObject {
     obj
 }
 
+/// Build a `fromJson` decode error as an owned `TaggedVal*(Object)` (ADR-047). Shape:
+/// `{ "type": "error", "message": <msg>, "path": <path> }`. The `type`/`message` fields keep
+/// the existing error convention; `path` is a JSONPath-ish location (e.g. `$.address.city`).
+/// Returned value is independently owned by the caller (release with `lin_tagged_release`).
+///
+/// Unlike the legacy `make_error_obj`, this builds the object leak-cleanly: `lin_object_set`
+/// retains the key and the value's inner payload, so the local +1 reference created here for
+/// each freshly-allocated key/value string is released afterwards. The net owner of every
+/// inner string is the object; releasing the returned box frees the object and, transitively,
+/// every string — no orphaned +1 references (verified under ASan).
+pub unsafe fn make_decode_error(msg: &str, path: &str) -> *mut u8 {
+    use crate::string::lin_string_release;
+    let obj = lin_object_alloc(4);
+    let set_str = |obj: *mut LinObject, key: &str, val: &str| {
+        let k = make_string(key);
+        let v = make_string(val);
+        let mut tv: TaggedVal = std::mem::zeroed();
+        tv.tag = TAG_STR;
+        tv.payload = v as u64;
+        lin_object_set(obj, k, &tv); // retains both k and v
+        lin_string_release(k); // drop our local +1 (object now owns its own ref)
+        lin_string_release(v);
+    };
+    set_str(obj, "type", "error");
+    set_str(obj, "message", msg);
+    set_str(obj, "path", path);
+    alloc_tagged(TAG_OBJECT, obj as u64)
+}
+
 /// Resolve a path that may be either a bare LinString* or a TaggedVal*(Str).
 /// Returns a Rust String on success, None on null/invalid input.
 ///

@@ -373,6 +373,8 @@ This is equivalent to the optional-chaining operator (`?.`) in other languages â
 - If the operand may be `Null` (e.g., a union `T | Null`), the access type widens to include `Null`.
 - Array element access on `T[]` has type `T` (the static type does not include `Null`; the runtime error is the contract for OOB).
 
+A `Json` value is **not** implicitly convertible to a concrete structured object type (an object with a required, non-nullable field). Binding or passing a `Json` value where such a type is expected is a compile-time error; convert it explicitly with `fromJson` (validated decode, `std/json`) or narrow it with `is`/`has` (runtime tag checks). `Json â†’ Json` and `Json` flowing into scalars/handles/buffers/open objects remain permissive. See ADR-046 and ADR-047.
+
 ## 7. Bindings
 
 ### 7.1 Immutable Bindings
