@@ -1,5 +1,6 @@
 import foreign "lin-runtime"
   val lin_array_slice_dyn: (Json, Int32, Int32) => Json
+  val lin_array_concat_dyn: (Json, Json) => Json
 
 export val push = (arr: Json, item: Json): Null =>
   lin_push(arr, item)
@@ -62,20 +63,12 @@ export val iterOf = (arr: Json) =>
 export val iter = (init: Json, hasNext: Json, next: Json, value: Json) =>
   lin_iter(init, hasNext, next, value)
 
+// Concatenate two arrays. Dispatches on the runtime element type so two flat arrays
+// of the same type (e.g. UInt8[] ++ UInt8[]) yield a flat array — byte-level consumers
+// (u32FromBe, fs writes, FFI) then read packed bytes, not boxed TaggedVal elements.
+// Mixed/tagged element types yield a Json[].
 export val concat = (a: Json, b: Json): Json =>
-  val n = length(a)
-  val m = length(b)
-  val result = lin_array_allocate(n + m)
-  var i = 0
-  a.for(x =>
-    lin_array_set(result, i, x)
-    i = i + 1
-  )
-  b.for(x =>
-    lin_array_set(result, i, x)
-    i = i + 1
-  )
-  result
+  lin_array_concat_dyn(a, b)
 
 export val map = (arr: Json, f: Function): Json =>
   val n = length(arr)
