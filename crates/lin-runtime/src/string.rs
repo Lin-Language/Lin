@@ -40,6 +40,10 @@ pub unsafe extern "C" fn lin_string_release(s: *mut LinString) {
     if s.is_null() {
         return;
     }
+    // A zero refcount here means a double-release (ownership bug in codegen/lowering): the
+    // next decrement would wrap u32 and leak instead of freeing. Catch it in debug/ASan
+    // builds; release builds keep the original (silent) behaviour to avoid a runtime cost.
+    debug_assert!((*s).refcount > 0, "lin_string_release: refcount underflow (double free)");
     (*s).refcount -= 1;
     if (*s).refcount == 0 {
         lin_string_free(s);

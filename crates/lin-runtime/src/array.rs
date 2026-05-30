@@ -23,6 +23,15 @@ pub struct LinArrayElem {
     pub payload: u64,
 }
 
+// A tagged array element IS a `TaggedVal`: `lin_array_get_tagged` reinterprets element memory
+// as a TaggedVal and codegen `copy_nonoverlapping(.., 16)` between the two. They must stay
+// byte-identical, so pin the layout at compile time.
+const _: () = {
+    assert!(core::mem::size_of::<LinArrayElem>() == core::mem::size_of::<crate::tagged::TaggedVal>());
+    assert!(core::mem::offset_of!(LinArrayElem, tag) == 0);
+    assert!(core::mem::offset_of!(LinArrayElem, payload) == 8);
+};
+
 unsafe fn array_elem_layout(cap: u64) -> Layout {
     Layout::from_size_align_unchecked(
         std::mem::size_of::<LinArrayElem>() * cap as usize,
@@ -65,6 +74,9 @@ pub unsafe extern "C" fn lin_array_release(arr: *mut LinArray) {
     if arr.is_null() {
         return;
     }
+    // Zero refcount ⇒ double-release (ownership bug); the decrement below would wrap u32.
+    // Debug/ASan-only guard, no release-build cost.
+    debug_assert!((*arr).refcount > 0, "lin_array_release: refcount underflow (double free)");
     (*arr).refcount -= 1;
     if (*arr).refcount == 0 {
         // For tagged arrays (elem_tag == 0xFF), release any heap-typed elements before

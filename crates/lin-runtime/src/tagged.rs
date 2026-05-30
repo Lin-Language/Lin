@@ -38,6 +38,17 @@ pub struct TaggedVal {
     pub payload: u64,
 }
 
+// Codegen and the runtime hard-code this layout: `lin_box_*`/`build_tagged_val_alloca`
+// write `tag` at offset 0 and `payload` at offset 8, and several hot paths
+// `copy_nonoverlapping(.., 16)` between a TaggedVal and a LinArrayElem (which must be the
+// same shape — see array.rs). A field reorder or size change would silently corrupt every
+// boxed value, so pin the layout at compile time.
+const _: () = {
+    assert!(core::mem::size_of::<TaggedVal>() == 16);
+    assert!(core::mem::offset_of!(TaggedVal, tag) == 0);
+    assert!(core::mem::offset_of!(TaggedVal, payload) == 8);
+};
+
 // ---------------------------------------------------------------------------
 // Cached scalar boxes (CPython-style small-value interning).
 //

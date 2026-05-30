@@ -34,6 +34,9 @@ pub unsafe extern "C" fn lin_closure_release(ptr: *mut u8) {
         return;
     }
     let rc_ptr = ptr as *mut u32;
+    // Zero refcount ⇒ double-release (ownership bug); the decrement below would wrap u32.
+    // Debug/ASan-only guard, no release-build cost.
+    debug_assert!(*rc_ptr > 0, "lin_closure_release: refcount underflow (double free)");
     *rc_ptr -= 1;
     if *rc_ptr == 0 {
         // Read env_ptr (offset 16) and env_size (offset 24).

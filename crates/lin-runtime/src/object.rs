@@ -430,6 +430,9 @@ pub unsafe extern "C" fn lin_object_release(obj: *mut LinObject) {
     if obj.is_null() {
         return;
     }
+    // Zero refcount ⇒ double-release (ownership bug); the decrement below would wrap u32.
+    // Debug/ASan-only guard, no release-build cost.
+    debug_assert!((*obj).refcount > 0, "lin_object_release: refcount underflow (double free)");
     (*obj).refcount -= 1;
     if (*obj).refcount == 0 {
         use crate::tagged::*;
