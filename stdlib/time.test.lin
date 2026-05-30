@@ -2,35 +2,41 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { now, sleep, sleepMicros, startTimer, elapsed, toIso } from "std/time"
 
 val s = suite("std/time", [
-  test("now returns a positive timestamp", () =>
+  test("now returns a positive timestamp", () => [
     expect(now() > 0).toBe(true)
-  ),
+  ]),
 
-  test("startTimer returns a positive value", () =>
+  test("startTimer returns a positive value", () => [
     expect(startTimer() > 0).toBe(true)
-  ),
+  ]),
 
   test("elapsed is non-negative", () =>
     val t = startTimer()
-    expect(elapsed(t) >= 0).toBe(true)
+    val checks = [
+      expect(elapsed(t) >= 0).toBe(true)
+    ]
+    checks
   ),
 
-  test("toIso of Unix epoch", () =>
+  test("toIso of Unix epoch", () => [
     expect(toIso(0)).toBe("1970-01-01T00:00:00.000Z")
-  ),
+  ]),
 
-  test("toIso of a known timestamp", () =>
+  test("toIso of a known timestamp", () => [
     expect(toIso(1000)).toBe("1970-01-01T00:00:01.000Z")
-  ),
+  ]),
 
-  test("toIso includes milliseconds", () =>
+  test("toIso includes milliseconds", () => [
     expect(toIso(1500)).toBe("1970-01-01T00:00:01.500Z")
-  ),
+  ]),
 
   test("sleepMicros runs and elapsed stays non-negative", () =>
     val t = startTimer()
     sleepMicros(500)
-    expect(elapsed(t) >= 0).toBe(true)
+    val checks = [
+      expect(elapsed(t) >= 0).toBe(true)
+    ]
+    checks
   ),
 ])
 

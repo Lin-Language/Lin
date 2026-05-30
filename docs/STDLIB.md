@@ -301,7 +301,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`expect`](#expect) | `(Json) -> Asserter` | Begin an assertion chain |
 | [`run`](#run-test) | `(Suite[]) -> Null` | Execute suites, print results, exit non-zero on failure |
 | [`suite`](#suite) | `(String, Test[]) -> Suite` | Group tests under a name |
-| [`test`](#test) | `(String, () -> Assertion \| Assertion[]) -> Test` | Declare a single test case |
+| [`test`](#test) | `(String, () -> Assertion[]) -> Test` | Declare a single test case |
 
 **std/time**
 
@@ -3569,16 +3569,40 @@ import { suite, test, run, expect } from "std/test"
 import { suite, test, run, expect } from "std/test"
 
 val arithmetic = suite("arithmetic", [
-  test("adds two positives", () =>
+  test("adds two positives", () => [
     expect(1 + 2).toBe(3)
-  ),
-  test("multiple assertions", () =>
-    expect(0 + 0).toBe(0)
+  ]),
+  test("multiple assertions", () => [
+    expect(0 + 0).toBe(0),
     expect(10 + -10).toBe(0)
-  )
+  ])
 ])
 
 run([arithmetic])
+```
+
+**A test body must return an array of assertions.** Each matcher
+(`expect(...).toBe(...)`, etc.) produces one `Assertion`; the body returns them
+as an `Assertion[]` (a comma-separated array literal), and **every** assertion in
+the array is evaluated — a test fails if any one of them fails. This is enforced
+by the type system: a bare single assertion or a sequence of bare assertion
+statements is a compile error, which is what guarantees no assertion is silently
+skipped. Even a single assertion is wrapped in `[ ... ]`.
+
+When a test needs setup before its assertions, bind the assertions to a `val`
+and return it on its own final line (a bare `[` after a statement is parsed as
+index access on the preceding expression, so the explicit binding is required):
+
+```txt
+test("sorts ascending", () =>
+  val input = [3, 1, 2]
+  val sorted = input.sort((a, b) => a - b)
+  val checks = [
+    expect(toString(input)).toBe("[3, 1, 2]"),
+    expect(toString(sorted)).toBe("[1, 2, 3]")
+  ]
+  checks
+)
 ```
 
 ---
@@ -3586,13 +3610,11 @@ run([arithmetic])
 ### Types
 
 ```txt
-type Assertion =
-  | { "type": "pass" }
-  | { "type": "fail", "message": String }
+type Assertion = { "type": "pass" } | { "type": "fail", "message": String }
 
 type Test = {
   "name": String,
-  "run": () -> Assertion | Assertion[]
+  "run": () -> Assertion[]
 }
 
 type Suite = {
@@ -3613,7 +3635,7 @@ Groups a list of `Test` values under a name.
 
 ```txt
 val myTests = suite("math", [
-  test("one plus one", () => expect(1 + 1).toBe(2))
+  test("one plus one", () => [ expect(1 + 1).toBe(2) ])
 ])
 ```
 
@@ -3622,16 +3644,16 @@ val myTests = suite("math", [
 ### test
 
 ```txt
-val test: (name: String, body: () -> Assertion | Assertion[]) -> Test
+val test: (name: String, body: () -> Assertion[]) -> Test
 ```
 
 Declares a single test case. All assertions in the body are evaluated before the test is marked failed.
 
 ```txt
-test("string conversions", () =>
-  expect(toString(42)).toBe("42")
+test("string conversions", () => [
+  expect(toString(42)).toBe("42"),
   expect(toString(true)).toBe("true")
-)
+])
 ```
 
 ---

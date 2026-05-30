@@ -1679,7 +1679,24 @@ fn lower_call(
     }
 
     let fn_temp = lower_expr(func, builder, ctx);
-    let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();
+    // Box concrete args to Json/union params and retain Function-typed args, matching the
+    // closure's declared parameter types — exactly as the named/imported call paths above.
+    // Without this, e.g. an Array passed to a `Json` closure param reaches the callee as a
+    // raw `LinArray*` instead of a boxed `TaggedVal*`, so the callee reads the tag/payload
+    // from garbage and mutations through it are lost (silent data corruption).
+    let param_tys: Vec<Type> = match func.ty() {
+        Type::Function { params, .. } => params,
+        _ => vec![],
+    };
+    let lowered_args: Vec<Temp> = args
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let arg = lower_call_arg(a, param_tys.get(i), builder, ctx);
+            retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
+            arg
+        })
+        .collect();
 
     if is_tail {
         builder.terminate(Terminator::TailCall { args: lowered_args.clone() });

@@ -9,9 +9,9 @@ val classify = (n: Int32) =>
     "non-positive"
 
 val s = suite("cov_demo", [
-  test("classify positive", () =>
+  test("classify positive", () => [
     expect(classify(5)).toBe("positive")
-  ),
+  ]),
 ])
 
 run(s)
