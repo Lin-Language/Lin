@@ -509,17 +509,21 @@ pub unsafe extern "C" fn lin_fs_write_lines(path: *const u8, arr: *const u8) -> 
     };
     let len = lin_array_length(lin_arr) as usize;
     let mut lines: Vec<String> = Vec::with_capacity(len);
-    for i in 0..len as i64 {
-        let tv_ptr = lin_array_get_tagged(lin_arr, i);
-        let s = if tv_ptr.is_null() {
-            String::new()
+    // Read each String element's LinString* directly from the array's data buffer
+    // (payload field of the 16-byte LinArrayElem), the same way lin_string_join_arr
+    // does. This avoids lin_array_get_tagged, which allocates a fresh TaggedVal and
+    // retains the payload — the previous `resolve_lin_str(tv as *const u8)` approach
+    // misread that wrapper as a LinString and leaked the retain, causing intermittent
+    // wild-pointer reads under load.
+    for i in 0..len {
+        let elem = (*lin_arr).data.add(i);
+        let s = (*elem).payload as *const crate::string::LinString;
+        if s.is_null() {
+            lines.push(String::new());
         } else {
-            let line = resolve_lin_str(tv_ptr as *const u8).unwrap_or_default();
-            // Free the allocated TaggedVal returned by lin_array_get_tagged
-            std::alloc::dealloc(tv_ptr as *mut u8, std::alloc::Layout::new::<TaggedVal>());
-            line
-        };
-        lines.push(s);
+            let slice = std::slice::from_raw_parts((*s).data.as_ptr(), (*s).len as usize);
+            lines.push(std::str::from_utf8(slice).unwrap_or_default().to_owned());
+        }
     }
     let content = lines.join("\n") + "\n";
     match std::fs::write(&path_str, content.as_bytes()) {
