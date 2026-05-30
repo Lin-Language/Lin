@@ -3524,3 +3524,71 @@ print(classify({ "kind": "z" }))
 "#);
     assert_eq!(out, vec!["is-a", "bound-other"]);
 }
+
+#[test]
+fn test_discarded_map_result_in_loop_correct() {
+    // Regression for the Json call-result leak: a `map` call returns a `Json` (boxed `TaggedVal*`)
+    // that is bound to a per-iteration `val m` and DISCARDED. `register_owned`'s old `is_rc_type`
+    // gate excluded unions, so the owned box (and its inner array) was never released — a per-
+    // iteration leak. The fix registers union import-fn call results so scope exit tag-releases
+    // them. Correctness gate: over 20000 iterations, summing the lengths must stay exact and the
+    // process must not abort (a wrong release would double-free the map result). 20000 * 3 = 60000.
+    let out = run(r#"import { range, for, map, length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+var c = 0
+range(0, 20000).for(i =>
+  val m = [1, 2, 3].map(x => x + i)
+  c = c + length(m)
+)
+print(toString(c))
+"#);
+    assert_eq!(out, vec!["60000"]);
+}
+
+#[test]
+fn test_discarded_filter_result_in_loop_correct() {
+    // Companion to the map case for `filter` (also returns a fresh `Json` array). Each iteration
+    // discards the filtered array; the per-iteration release must reclaim it without corrupting
+    // the source literal or the count. 20000 iterations; each filter keeps the 2 elements > 0
+    // (1 and 2 are always > i is false for i>=1, so use a fixed predicate): [1,2,3,4] filtered by
+    // x > 2 yields [3,4] every time → 20000 * 2 = 40000.
+    let out = run(r#"import { range, for, filter, length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+var c = 0
+range(0, 20000).for(i =>
+  val m = [1, 2, 3, 4].filter(x => x > 2)
+  c = c + length(m)
+)
+print(toString(c))
+"#);
+    assert_eq!(out, vec!["40000"]);
+}
+
+#[test]
+fn test_map_result_bound_and_returned_from_function() {
+    // A function binds a `map` result to a `val` and RETURNS it: the returned union box must be
+    // KEPT (transferred to the caller at +1), not released by the callee's scope-exit teardown
+    // (which would hand back freed memory). Also exercises the concrete-rc return path: `val r =
+    // [..]; r` must return the array at exactly +1 (the read-retain of the trailing expression is
+    // released as a redundant extra registration, fixing the return-retain leak). Calling it many
+    // times and summing lengths must stay exact.
+    let out = run(r#"import { range, for, map, length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val doubled = (xs: Json): Json =>
+  val m = xs.map(x => x * 2)
+  m
+var c = 0
+range(0, 10000).for(i =>
+  c = c + length(doubled([1, 2, 3, 4]))
+)
+print(toString(c))
+print(toString(doubled([5, 6, 7])))
+"#);
+    assert_eq!(out, vec!["40000", "[10, 12, 14]"]);
+}
