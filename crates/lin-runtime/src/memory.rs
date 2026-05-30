@@ -59,6 +59,15 @@ pub unsafe extern "C" fn lin_closure_release(ptr: *mut u8) {
 pub extern "C" fn lin_rc_retain(ptr: *mut u32) {
     if !ptr.is_null() {
         unsafe {
+            // Immortal (interned) string literals carry a saturated refcount (>= IMMORTAL_RC).
+            // Strings reach this path via the codegen `Retain` instruction for `Type::Str`, so a
+            // retain of an interned literal must be a no-op to keep its refcount from climbing past
+            // u32::MAX. Arrays/objects/closures (the other users of this offset-0 refcount) can
+            // never reach 2^31 live owners, so the guard never affects them. Mirror of the
+            // sentinel guard in lin_string_release.
+            if *ptr >= crate::string::IMMORTAL_RC {
+                return;
+            }
             *ptr += 1;
         }
     }
