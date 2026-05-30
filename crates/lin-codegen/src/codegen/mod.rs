@@ -737,6 +737,17 @@ impl<'ctx> Codegen<'ctx> {
                                 }
                             }
                         }
+                        Instruction::FreeBoxShellIfDistinct { val, other } => {
+                            if let (Some(&v), Some(&o)) = (temp_map.get(val), temp_map.get(other)) {
+                                if v.is_pointer_value() && o.is_pointer_value() {
+                                    let free_fn = self.get_or_declare_fn(
+                                        "lin_tagged_free_box_if_distinct",
+                                        self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+                                    );
+                                    self.builder.call(free_fn, &[v.into(), o.into()], "");
+                                }
+                            }
+                        }
                         Instruction::Call { dst, callee, args, ret_ty } => {
                             let arg_vals: Vec<BasicMetadataValueEnum> = args
                                 .iter()

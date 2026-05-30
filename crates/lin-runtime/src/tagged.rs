@@ -408,6 +408,19 @@ pub unsafe extern "C" fn lin_tagged_free_box(p: *mut u8) {
     std::alloc::dealloc(p, std::alloc::Layout::new::<TaggedVal>());
 }
 
+/// Free the `TaggedVal*` box shell of `p`, but ONLY if `p` is a DIFFERENT pointer than `other`.
+/// Used by `for`/`while` to reclaim a per-iteration element box shell while avoiding a
+/// double-free when the callback returned (an alias of) that very box: in that case the loop's
+/// separate full release of the return box already reclaimed it, so freeing the shell again here
+/// would double-free. Frees only the shell (never the inner payload); null/cached-box safe.
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_free_box_if_distinct(p: *mut u8, other: *mut u8) {
+    if p == other {
+        return;
+    }
+    lin_tagged_free_box(p);
+}
+
 /// Release a TaggedVal*: release the pointed-to heap value (if pointer type), then free the box.
 /// Safe to call with null (treated as null — no-op).
 #[no_mangle]

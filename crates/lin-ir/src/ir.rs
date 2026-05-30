@@ -251,6 +251,11 @@ pub enum Instruction {
     /// scope-exit release. A full `Release` would double-free the inner; this reclaims only the
     /// 16-byte box. Maps to `lin_tagged_free_box`. Null/cached-box safe.
     FreeBoxShell { val: Temp },
+    /// Free ONLY the `TaggedVal*` box shell of `val`, but ONLY when `val` is a distinct pointer
+    /// from `other`. Used by `for`/`while` to reclaim the per-iteration element box shell without
+    /// double-freeing when the callback returned (an alias of) that box — whose separate full
+    /// release already reclaimed it. Maps to `lin_tagged_free_box_if_distinct`. Null/cached-safe.
+    FreeBoxShellIfDistinct { val: Temp, other: Temp },
     /// result = val is type_tag? (returns bool)
     IsType { dst: Temp, val: Temp, ty: Type },
     /// result = val has pattern? (returns bool)
