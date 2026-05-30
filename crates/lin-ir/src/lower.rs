@@ -1586,7 +1586,12 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // (lin_tagged_eq / lin_tagged_cmp) that tolerates boxed/null operands, and unboxing
             // a possibly-null Json (e.g. `opts["k"] == true` where the key is absent) would be
             // unsound.
-            if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod) {
+            // BITWISE ops (`& | ^ << >>`) need concrete integer operands too — same as
+            // arithmetic. A boxed Json/union operand (e.g. `acc ^ bytes[i]` where `bytes[i]`
+            // projects an Int out of a Json array) must be unboxed first, or codegen runs the
+            // integer op on a raw `TaggedVal*` pointer (a codegen-time type-mismatch crash).
+            if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+                          | BinOp::BAnd | BinOp::BOr | BinOp::BXor | BinOp::Shl | BinOp::Shr) {
                 operand_ty = if !is_union_ty(&left_ty) { left_ty.clone() }
                              else if !is_union_ty(&right_ty) { right_ty.clone() }
                              else { left_ty.clone() };

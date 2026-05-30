@@ -3514,6 +3514,28 @@ print(toString([1, 2, 3].reduce(1, (acc, x) => acc << x)))
 }
 
 #[test]
+fn test_bitwise_boxed_projection_operand() {
+    // Regression: a bitwise op whose operand is a boxed-Json projection (`bytes[i]` out of a
+    // Json array), used in a recursive call argument, must unbox the operand before the LLVM
+    // integer op. Previously only Add/Sub/Mul/Div/Mod unboxed union operands; bitwise ops did
+    // not, so the boxed `TaggedVal*` reached codegen as an int operand → codegen type-mismatch
+    // crash. A recursive XOR checksum exercises exactly this path.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+val checksum = (bytes: Json, i: Int32, acc: Int32): Int32 =>
+  if i >= length(bytes) then acc
+  else checksum(bytes, i + 1, acc ^ bytes[i])
+
+print(toString(checksum([1, 2, 3], 0, 0)))
+print(toString(checksum([255, 1, 2], 0, 0)))
+"#);
+    // 1^2^3 = 0 ; 255^1^2 = 252
+    assert_eq!(output, vec!["0", "252"]);
+}
+
+#[test]
 fn test_bitwise_xor_precedence() {
     // `^` binds between `&` and `|`:  1 | 6 ^ 3 & 2  ==  1 | (6 ^ (3 & 2))  ==  1 | (6 ^ 2)  ==  1 | 4  ==  5
     let output = run(r#"import { print } from "std/io"
