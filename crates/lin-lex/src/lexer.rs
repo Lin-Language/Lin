@@ -40,6 +40,23 @@ impl Lexer {
                 break;
             }
         }
+        // Mark each token whose preceding gap (since the previous token ended) contains a
+        // source newline. Explicit `Newline` tokens already signal line breaks at the top
+        // level; this additionally surfaces breaks that were suppressed inside `()`/`[]`/`{}`
+        // (ADR-004), which the parser needs to keep a line-leading `[`/`(` from gluing onto the
+        // previous expression as an index/call. Spans are char offsets into `source`.
+        let mut prev_end = 0usize;
+        for tok in tokens.iter_mut() {
+            let start = tok.span.start as usize;
+            if start > prev_end
+                && self.source[prev_end..start.min(self.source.len())]
+                    .iter()
+                    .any(|&c| c == '\n')
+            {
+                tok.newline_before = true;
+            }
+            prev_end = prev_end.max(tok.span.end as usize);
+        }
         tokens
     }
 

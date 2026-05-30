@@ -7,24 +7,21 @@ val makeReq = (path: String): Json =>
 val s = suite("router", [
   test("routes /api/status to 200", () =>
     val resp = router(makeReq("/api/status"))
-    val checks = [
+    [
       expect(resp["status"]).toBe(200)
     ]
-    checks
   ),
   test("routes /users/:id to 200", () =>
     val resp = router(makeReq("/users/5"))
-    val checks = [
+    [
       expect(resp["status"]).toBe(200)
     ]
-    checks
   ),
   test("unknown path returns 404", () =>
     val resp = router(makeReq("/unknown/path"))
-    val checks = [
+    [
       expect(resp["status"]).toBe(404)
     ]
-    checks
   ),
 ])
 run(s)

@@ -42,10 +42,9 @@ val s = suite("std/hash", [
   test("objects hash independent of key order", () =>
     val a = { "x": 1, "y": 2 }
     val b = { "y": 2, "x": 1 }
-    val checks = [
+    [
       expect(hash(a) == hash(b)).toBe(true)
     ]
-    checks
   ),
 
   test("objects with different values hash differently", () => [
@@ -56,11 +55,10 @@ val s = suite("std/hash", [
   test("nested structures hash deeply", () =>
     val a = { "items": [1, 2], "meta": { "n": 3 } }
     val b = { "meta": { "n": 3 }, "items": [1, 2] }
-    val checks = [
+    [
       expect(hash(a) == hash(b)).toBe(true),
       expect(hash(a) == hash({ "items": [1, 2], "meta": { "n": 4 } })).toBe(false)
     ]
-    checks
   ),
 ])
 

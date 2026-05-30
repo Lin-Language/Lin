@@ -9,10 +9,9 @@ val s = suite("std/io", [
   test("print accepts strings", () =>
     // Just verify it doesn't crash; output is a side effect
     val _ = true
-    val checks = [
+    [
       expect(true).toBe(true)
     ]
-    checks
   ),
 
   test("exit function exists (callable)", () => [
@@ -23,19 +22,17 @@ val s = suite("std/io", [
   test("printErr accepts strings", () =>
     // printErr writes to stderr; verify it doesn't crash
     val _ = true
-    val checks = [
+    [
       expect(true).toBe(true)
     ]
-    checks
   ),
 
   test("args returns an array", () =>
     val result = args()
     // args() returns String[] — just verify it's callable and the type is right
-    val checks = [
+    [
       expect(true).toBe(true)
     ]
-    checks
   ),
 
   test("prompt function exists (callable)", () => [

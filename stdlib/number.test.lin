@@ -5,19 +5,19 @@ import { length } from "std/array"
 
 val s = suite("std/number", [
   test("parseInt32 parses integer string", () => [
-    expect(parseInt32("42")).toBe(42)
+    expect("42".parseInt32()).toBe(42)
   ]),
 
   test("parseFloat64 parses float string", () => [
-    expect(parseFloat64("3.14")).toBe(3.14)
+    expect("3.14".parseFloat64()).toBe(3.14)
   ]),
 
   test("toInt32 truncates float", () => [
-    expect(toInt32(3.9)).toBe(3)
+    expect(3.9.toInt32()).toBe(3)
   ]),
 
   test("toFloat64 converts int to float", () => [
-    expect(toFloat64(5)).toBe(5.0)
+    expect(5.toFloat64()).toBe(5.0)
   ]),
 
   test("toFloat32 narrows Float64 to a Float32 usable by f32ToBe", () => [
@@ -29,43 +29,43 @@ val s = suite("std/number", [
   ]),
 
   test("isInt32 true for integer string", () => [
-    expect(isInt32("42")).toBe(true)
+    expect("42".isInt32()).toBe(true)
   ]),
 
   test("isInt32 false for float string", () => [
-    expect(isInt32("3.14")).toBe(false)
+    expect("3.14".isInt32()).toBe(false)
   ]),
 
   test("isInt32 false for non-numeric string", () => [
-    expect(isInt32("abc")).toBe(false)
+    expect("abc".isInt32()).toBe(false)
   ]),
 
   test("isFloat64 true for float string", () => [
-    expect(isFloat64("3.14")).toBe(true)
+    expect("3.14".isFloat64()).toBe(true)
   ]),
 
   test("isFloat64 true for integer string", () => [
-    expect(isFloat64("42")).toBe(true)
+    expect("42".isFloat64()).toBe(true)
   ]),
 
   test("isFloat64 false for non-numeric string", () => [
-    expect(isFloat64("abc")).toBe(false)
+    expect("abc".isFloat64()).toBe(false)
   ]),
 
   test("tryParseInt32 returns int for valid string", () => [
-    expect(tryParseInt32("42")).toBe(42)
+    expect("42".tryParseInt32()).toBe(42)
   ]),
 
   test("tryParseInt32 returns null for invalid string", () => [
-    expect(tryParseInt32("abc")).toBe(null)
+    expect("abc".tryParseInt32()).toBe(null)
   ]),
 
   test("tryParseFloat64 returns float for valid string", () => [
-    expect(tryParseFloat64("3.14")).toBe(3.14)
+    expect("3.14".tryParseFloat64()).toBe(3.14)
   ]),
 
   test("tryParseFloat64 returns null for invalid string", () => [
-    expect(tryParseFloat64("abc")).toBe(null)
+    expect("abc".tryParseFloat64()).toBe(null)
   ]),
 
   test("dot-syntax for number parsing", () =>
