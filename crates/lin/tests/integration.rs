@@ -2061,14 +2061,16 @@ print(toString(line))
 fn test_http_fetch_json() {
     use std::thread;
     use std::time::Duration;
-    let port: u16 = 19200;
+    // Bind on the test thread to an OS-assigned ephemeral port (port 0) so concurrent
+    // test runs can never collide on a fixed port. Reading the port back after the bind
+    // also guarantees the listener is open before the client runs — no startup sleep race.
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let port = server.server_addr().to_ip().unwrap().port();
     thread::spawn(move || {
-        let server = tiny_http::Server::http(format!("0.0.0.0:{}", port)).unwrap();
         if let Ok(Some(req)) = server.recv_timeout(Duration::from_secs(10)) {
             let _ = req.respond(tiny_http::Response::from_string(r#"{"value": 42}"#));
         }
     });
-    thread::sleep(Duration::from_millis(100));
     let output = run(&format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
 
@@ -2677,4 +2679,78 @@ print(toString(b[0]))               // 222 (0xDE)
 print(toString(u32FromBe(b, 0) == v))   // true
 "#);
     assert_eq!(out, vec!["4", "222", "true"]);
+}
+
+#[test]
+fn test_unsigned_int_display() {
+    // Boxed unsigned integers must display as unsigned, even when their value would be a
+    // negative bit pattern if read signed (u32 >= 2^31, u64 >= 2^63). Regression for the
+    // "prints -1 instead of 4294967295" bug.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val a: UInt32 = 4294967295
+val b: UInt32 = 2864434397
+val c: UInt8 = 255
+val d: UInt16 = 65535
+val e: UInt64 = 18446744073709551615
+
+print(toString(a))   // 4294967295
+print(toString(b))   // 2864434397
+print(toString(c))   // 255
+print(toString(d))   // 65535
+print(toString(e))   // 18446744073709551615
+"#);
+    assert_eq!(out, vec![
+        "4294967295",
+        "2864434397",
+        "255",
+        "65535",
+        "18446744073709551615",
+    ]);
+}
+
+#[test]
+fn test_unsigned_int_cross_compare() {
+    // A boxed UInt32 (now stored as TAG_INT64) still compares correctly against a boxed Int32,
+    // both for equality and ordering of large values.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val x: UInt32 = 5
+val y: Int32 = 5
+print(toString(x == y))   // true
+
+val big: UInt32 = 4000000000
+val one: Int32 = 1
+print(toString(big > one))   // true
+"#);
+    assert_eq!(out, vec!["true", "true"]);
+}
+
+#[test]
+fn test_unsigned_int_arithmetic_roundtrip() {
+    // Boxing then using a UInt32 in arithmetic preserves the high-bit value.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val a: UInt32 = 4294967290
+val b: UInt32 = a + 3
+print(toString(b))   // 4294967293
+"#);
+    assert_eq!(out, vec!["4294967293"]);
+}
+
+#[test]
+fn test_computed_high_u32_display() {
+    // A UInt32 computed at runtime (not a literal) from all-0xFF bytes prints 4294967295,
+    // exercising the display path rather than only bit-equality.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { u32FromBe } from "std/bytes"
+
+val bytes: UInt8[] = [255, 255, 255, 255]
+print(toString(u32FromBe(bytes, 0)))   // 4294967295
+"#);
+    assert_eq!(out, vec!["4294967295"]);
 }

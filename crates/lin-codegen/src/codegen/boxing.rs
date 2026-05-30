@@ -29,13 +29,23 @@ impl<'ctx> Codegen<'ctx> {
                     .try_as_basic_value().unwrap_basic()
             }
             Type::UInt8 | Type::UInt16 | Type::UInt32 => {
-                let i32v = self.builder.int_z_extend_or_bit_cast(val.into_int_value(), self.context.i32_type(), "tou32");
-                self.builder.call(self.rt.box_int32, &[i32v.into()], "boxi32")
+                // Zero-extend to a (always-positive) i64 and box as TAG_INT64 so the value
+                // reads back correctly: a u32 >= 2^31 would be a negative i32 if boxed as
+                // TAG_INT32, breaking display/JSON/eq/cmp. The zero-extended i64 is positive.
+                let i64v = self.builder.int_z_extend_or_bit_cast(val.into_int_value(), self.context.i64_type(), "tou64");
+                self.builder.call(self.rt.box_int64, &[i64v.into()], "boxu_as_i64")
                     .try_as_basic_value().unwrap_basic()
             }
-            Type::Int64 | Type::UInt64 => {
+            Type::Int64 => {
                 let i64v = val.into_int_value();
                 self.builder.call(self.rt.box_int64, &[i64v.into()], "boxi64")
+                    .try_as_basic_value().unwrap_basic()
+            }
+            Type::UInt64 => {
+                // Box as TAG_UINT64 so the payload is read back unsigned (a u64 >= 2^63 would
+                // be negative if read as i64).
+                let i64v = val.into_int_value();
+                self.builder.call(self.rt.box_uint64, &[i64v.into()], "boxu64")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::Float32 => {
@@ -137,13 +147,22 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.int_truncate_or_bit_cast(v.into_int_value(), ity, "toi").into()
             }
             Type::UInt8 | Type::UInt16 | Type::UInt32 => {
-                let v = self.builder.call(self.rt.unbox_int32, &[ptr_val.into()], "uu32")
+                // UInt8/16/32 are boxed as TAG_INT64 (zero-extended). Read the full i64 payload
+                // and truncate to the target width — this preserves all value bits.
+                let v = self.builder.call(self.rt.unbox_int64, &[ptr_val.into()], "uu64")
                     .try_as_basic_value().unwrap_basic();
                 let ity = self.llvm_type(target_ty).into_int_type();
                 self.builder.int_truncate_or_bit_cast(v.into_int_value(), ity, "toui").into()
             }
-            Type::Int64 | Type::UInt64 => {
+            Type::Int64 => {
                 self.builder.call(self.rt.unbox_int64, &[ptr_val.into()], "ui64")
+                    .try_as_basic_value().unwrap_basic()
+            }
+            Type::UInt64 => {
+                // Boxed as TAG_UINT64; the bits are identical to TAG_INT64 so unbox_int64
+                // returns the correct 64-bit pattern (the value's signedness only matters at
+                // display/compare time, handled by the runtime tag).
+                self.builder.call(self.rt.unbox_uint64, &[ptr_val.into()], "uu64v")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::Float32 | Type::Float64 => {
@@ -239,11 +258,19 @@ impl<'ctx> Codegen<'ctx> {
         if !tagged.is_pointer_value() { return tagged; }
         let ptr = tagged.into_pointer_value();
         match ty {
-            Type::Int32 | Type::UInt32 => {
-                self.builder.call(self.rt.unbox_int32, &[ptr.into()], "ir_u32").try_as_basic_value().unwrap_basic()
+            Type::Int32 => {
+                self.builder.call(self.rt.unbox_int32, &[ptr.into()], "ir_i32").try_as_basic_value().unwrap_basic()
             }
-            Type::Int64 | Type::UInt64 => {
-                self.builder.call(self.rt.unbox_int64, &[ptr.into()], "ir_u64").try_as_basic_value().unwrap_basic()
+            Type::UInt32 => {
+                // Boxed as TAG_INT64 (zero-extended); read i64 and truncate to i32 width.
+                let v = self.builder.call(self.rt.unbox_int64, &[ptr.into()], "ir_u32_64").try_as_basic_value().unwrap_basic().into_int_value();
+                self.builder.int_truncate_or_bit_cast(v, self.context.i32_type(), "ir_u32").into()
+            }
+            Type::Int64 => {
+                self.builder.call(self.rt.unbox_int64, &[ptr.into()], "ir_i64").try_as_basic_value().unwrap_basic()
+            }
+            Type::UInt64 => {
+                self.builder.call(self.rt.unbox_uint64, &[ptr.into()], "ir_u64").try_as_basic_value().unwrap_basic()
             }
             Type::Float64 | Type::Float32 => {
                 self.builder.call(self.rt.unbox_float64, &[ptr.into()], "ir_uf64").try_as_basic_value().unwrap_basic()

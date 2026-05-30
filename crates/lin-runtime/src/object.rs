@@ -66,8 +66,9 @@ unsafe fn retain_tagged_payload(tv: &TaggedVal) {
     let payload = tv.payload;
     match tv.tag {
         TAG_STR => {
-            let s = payload as *mut crate::string::LinString;
-            if !s.is_null() { (*s).refcount += 1; }
+            // inc_ref leaves interned literals (saturated refcount) untouched; ordinary strings
+            // are bumped as before.
+            crate::string::lin_string_inc_ref(payload as *mut crate::string::LinString);
         }
         TAG_ARRAY => {
             let a = payload as *mut crate::array::LinArray;
@@ -160,7 +161,8 @@ pub unsafe extern "C" fn lin_object_set(obj: *mut LinObject, key: *mut LinString
     let slot = (*obj).entries.add(len as usize);
     // Retain the key: the object owns one reference.
     // Caller retains their own reference and must release it separately.
-    (*key).refcount += 1;
+    // inc_ref is a no-op for interned literal keys (saturated refcount).
+    crate::string::lin_string_inc_ref(key);
     (*slot).key = key;
     std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
     // Retain the value's inner payload — the object now owns a reference.
@@ -208,8 +210,8 @@ pub unsafe extern "C" fn lin_object_keys(obj: *const LinObject) -> *mut crate::a
     for i in 0..len {
         let entry = (*obj).entries.add(i as usize);
         let key = (*entry).key;
-        // Retain so the array owns a reference to each key string.
-        (*key).refcount += 1;
+        // Retain so the array owns a reference to each key string (no-op for interned literals).
+        crate::string::lin_string_inc_ref(key);
         let slot = (*arr).data.add(i as usize);
         (*slot).tag = crate::tagged::TAG_STR;
         (*slot).payload = key as u64;
@@ -245,7 +247,7 @@ pub unsafe extern "C" fn lin_object_entries(obj: *const LinObject) -> *mut crate
         let pair = crate::array::lin_array_alloc(2);
         (*(*pair).data.add(0)).tag = crate::tagged::TAG_STR;
         (*(*pair).data.add(0)).payload = (*entry).key as u64;
-        (*(*entry).key).refcount += 1; // array slot owns a reference to the key string
+        crate::string::lin_string_inc_ref((*entry).key); // array slot owns a ref to the key string (no-op for interned literals)
         let val_src = &(*entry).value;
         std::ptr::copy_nonoverlapping(val_src as *const TaggedVal, (*pair).data.add(1) as *mut TaggedVal, 1);
         retain_tagged_payload(val_src);
@@ -360,8 +362,8 @@ unsafe fn tagged_val_eq(a: *const crate::tagged::TaggedVal, b: *const crate::tag
     if at == TAG_NULL && bt == TAG_NULL { return true; }
     if at == TAG_NULL || bt == TAG_NULL { return false; }
     // Cross-numeric: widen to f64 so Int32(1) == Int64(1).
-    let at_is_num = at >= TAG_INT32 && at <= TAG_FLOAT64;
-    let bt_is_num = bt >= TAG_INT32 && bt <= TAG_FLOAT64;
+    let at_is_num = (at >= TAG_INT32 && at <= TAG_FLOAT64) || at == crate::tagged::TAG_UINT64;
+    let bt_is_num = (bt >= TAG_INT32 && bt <= TAG_FLOAT64) || bt == crate::tagged::TAG_UINT64;
     if at_is_num && bt_is_num && at != bt {
         return tagged_as_f64(at, ap) == tagged_as_f64(bt, bp);
     }
@@ -369,6 +371,7 @@ unsafe fn tagged_val_eq(a: *const crate::tagged::TaggedVal, b: *const crate::tag
     if at == TAG_BOOL { return ap == bp; }
     if at == TAG_INT32 { return (ap as i32) == (bp as i32); }
     if at == TAG_INT64 { return (ap as i64) == (bp as i64); }
+    if at == crate::tagged::TAG_UINT64 { return ap == bp; }
     if at == TAG_FLOAT32 {
         let af = f32::from_bits(ap as u32);
         let bf = f32::from_bits(bp as u32);

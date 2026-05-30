@@ -104,8 +104,13 @@ impl<'ctx> Codegen<'ctx> {
         match ty {
             Type::Null => 0,
             Type::Bool => 1,
-            Type::Int8 | Type::Int16 | Type::Int32 | Type::UInt8 | Type::UInt16 | Type::UInt32 => 2,
-            Type::Int64 | Type::UInt64 => 3,
+            Type::Int8 | Type::Int16 | Type::Int32 => 2,
+            // UInt8/16/32 are zero-extended and boxed as TAG_INT64 (always-positive i64) so
+            // a u32 >= 2^31 reads back correctly. Must match box_value / build_tagged_val_alloca.
+            Type::UInt8 | Type::UInt16 | Type::UInt32 => 3,
+            Type::Int64 => 3,
+            // UInt64 — read back unsigned. TAG_UINT64 = 14 in lin-runtime/src/tagged.rs.
+            Type::UInt64 => 14,
             Type::Float32 => 4,
             Type::Float64 => 5,
             Type::Str => 6,
@@ -175,8 +180,11 @@ impl<'ctx> Codegen<'ctx> {
         let tag: u64 = match ty {
             Type::Null => 0,
             Type::Bool => 1,
-            Type::Int32 | Type::UInt32 => 2,
-            Type::Int64 | Type::UInt64 => 3,
+            Type::Int32 => 2,
+            // UInt8/16/32 boxed as TAG_INT64; UInt64 as TAG_UINT64. Keep in sync with type_tag
+            // / box_value so `is`-checks against a boxed value match its actual runtime tag.
+            Type::UInt32 | Type::Int64 => 3,
+            Type::UInt64 => 14,
             Type::Float32 | Type::Float64 => 4,
             Type::Str => 6,
             Type::Object(_) => 7,

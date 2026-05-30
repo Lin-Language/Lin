@@ -688,3 +688,11 @@ Tracked here so they don't get lost:
 - Full pairwise numeric widening matrix and explicit-cast catalogue.
 - Multi-error reporting (recoverable parse/check).
 - Mutual tail-call optimisation.
+- **Unsigned display in flat scalar arrays.** Boxed unsigned scalars now display
+  correctly (UInt8/16/32 box as positive Int64, UInt64 uses TAG_UINT64). But a flat
+  `UInt32[]`/`UInt64[]` stores elements as raw i32/i64 (`flat_suffix` maps UInt32→i32),
+  so `toString` of the whole array renders elements signed — e.g. `UInt32[] =
+  [4294967295]` prints `[-1]`. `UInt8[]`/`UInt16[]` are correct (they carry TAG_UINT8/16
+  flat tags), and indexing a single element (`a[0]`) is correct (scalar box path). A full
+  fix needs distinct flat element tags for u32/u64 so `array_to_json_string` can read the
+  unsigned width. Narrow, separate from the scalar boxing fix.

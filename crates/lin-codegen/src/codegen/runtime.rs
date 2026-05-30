@@ -12,7 +12,11 @@ use inkwell::AddressSpace;
 /// The full set of `lin-runtime` symbols the codegen calls into. Constructed once via
 /// [`RuntimeFns::new`], which emits the matching `declare` directives into `module`.
 pub(crate) struct RuntimeFns<'ctx> {
-    pub string_from_bytes: FunctionValue<'ctx>,
+    /// Interns a string *literal*: returns a cached, immortal LinString for the given `@str_data`
+    /// global, allocating it once for the whole run. Emitted by `compile_string_lit` for all
+    /// compile-time string constants. Genuine runtime string creation (concat, interpolation, fs
+    /// reads, etc.) calls `lin_string_from_bytes` directly via `get_or_declare_fn`, not this struct.
+    pub string_literal: FunctionValue<'ctx>,
     pub string_length: FunctionValue<'ctx>,
     pub string_eq: FunctionValue<'ctx>,
     pub print: FunctionValue<'ctx>,
@@ -29,6 +33,7 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub box_bool: FunctionValue<'ctx>,
     pub box_int32: FunctionValue<'ctx>,
     pub box_int64: FunctionValue<'ctx>,
+    pub box_uint64: FunctionValue<'ctx>,
     pub box_float64: FunctionValue<'ctx>,
     pub box_str: FunctionValue<'ctx>,
     pub box_object: FunctionValue<'ctx>,
@@ -37,6 +42,7 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub get_tag: FunctionValue<'ctx>,
     pub unbox_int32: FunctionValue<'ctx>,
     pub unbox_int64: FunctionValue<'ctx>,
+    pub unbox_uint64: FunctionValue<'ctx>,
     pub unbox_float64: FunctionValue<'ctx>,
     pub unbox_bool: FunctionValue<'ctx>,
     pub unbox_ptr: FunctionValue<'ctx>,
@@ -64,8 +70,8 @@ impl<'ctx> RuntimeFns<'ctx> {
         let void_type = context.void_type();
         let bool_type = context.bool_type();
 
-        let string_from_bytes = module.add_function(
-            "lin_string_from_bytes",
+        let string_literal = module.add_function(
+            "lin_string_literal",
             string_ptr_type.fn_type(&[ptr_type.into(), i32_type.into()], false),
             None,
         );
@@ -140,6 +146,7 @@ impl<'ctx> RuntimeFns<'ctx> {
         let box_bool = module.add_function("lin_box_bool", ptr_type.fn_type(&[i8_type.into()], false), None);
         let box_int32 = module.add_function("lin_box_int32", ptr_type.fn_type(&[i32_type.into()], false), None);
         let box_int64 = module.add_function("lin_box_int64", ptr_type.fn_type(&[i64_type.into()], false), None);
+        let box_uint64 = module.add_function("lin_box_uint64", ptr_type.fn_type(&[i64_type.into()], false), None);
         let box_float64 = module.add_function("lin_box_float64", ptr_type.fn_type(&[context.f64_type().into()], false), None);
         let box_str = module.add_function("lin_box_str", ptr_type.fn_type(&[ptr_type.into()], false), None);
         let box_object = module.add_function("lin_box_object", ptr_type.fn_type(&[ptr_type.into()], false), None);
@@ -148,6 +155,7 @@ impl<'ctx> RuntimeFns<'ctx> {
         let get_tag = module.add_function("lin_get_tag", i8_type.fn_type(&[ptr_type.into()], false), None);
         let unbox_int32 = module.add_function("lin_unbox_int32", i32_type.fn_type(&[ptr_type.into()], false), None);
         let unbox_int64 = module.add_function("lin_unbox_int64", i64_type.fn_type(&[ptr_type.into()], false), None);
+        let unbox_uint64 = module.add_function("lin_unbox_uint64", i64_type.fn_type(&[ptr_type.into()], false), None);
         let unbox_float64 = module.add_function("lin_unbox_float64", context.f64_type().fn_type(&[ptr_type.into()], false), None);
         let unbox_bool = module.add_function("lin_unbox_bool", i8_type.fn_type(&[ptr_type.into()], false), None);
         let unbox_ptr = module.add_function("lin_unbox_ptr", ptr_type.fn_type(&[ptr_type.into()], false), None);
@@ -170,7 +178,7 @@ impl<'ctx> RuntimeFns<'ctx> {
         let tagged_release = module.add_function("lin_tagged_release", void_type.fn_type(&[ptr_type.into()], false), None);
 
         Self {
-            string_from_bytes,
+            string_literal,
             string_length,
             string_eq,
             print,
@@ -187,6 +195,7 @@ impl<'ctx> RuntimeFns<'ctx> {
             box_bool,
             box_int32,
             box_int64,
+            box_uint64,
             box_float64,
             box_str,
             box_object,
@@ -195,6 +204,7 @@ impl<'ctx> RuntimeFns<'ctx> {
             get_tag,
             unbox_int32,
             unbox_int64,
+            unbox_uint64,
             unbox_float64,
             unbox_bool,
             unbox_ptr,

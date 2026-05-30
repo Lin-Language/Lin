@@ -377,7 +377,13 @@ impl Lexer {
             let val = if negative { -val } else { val };
             Token::new(TokenKind::FloatLit(val), span)
         } else {
-            let val: i64 = num_str.parse().unwrap_or(0);
+            // Parse as i64 when in range; otherwise fall back to u64 and store its bit
+            // pattern (so UInt64 literals > i64::MAX, e.g. 18446744073709551615, survive into
+            // codegen — they are re-read as u64 via the UInt64 tag).
+            let val: i64 = match num_str.parse::<i64>() {
+                Ok(v) => v,
+                Err(_) => num_str.parse::<u64>().map(|u| u as i64).unwrap_or(0),
+            };
             let val = if negative { -val } else { val };
             Token::new(TokenKind::IntLit(val), span)
         }

@@ -71,6 +71,7 @@ pub unsafe fn tagged_to_json(tv: *const u8) -> serde_json::Value {
         TAG_BOOL => serde_json::Value::Bool(payload != 0),
         TAG_INT32 => serde_json::json!(payload as i32),
         TAG_INT64 => serde_json::json!(payload as i64),
+        crate::tagged::TAG_UINT64 => serde_json::json!(payload),
         TAG_FLOAT64 => serde_json::json!(f64::from_bits(payload)),
         TAG_STR => {
             let s = payload as *const LinString;

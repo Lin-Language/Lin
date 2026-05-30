@@ -110,7 +110,15 @@ impl Checker {
                     if let TypedExpr::IntLit(v, _, lit_span) = &typed_args[i] {
                         if let Some((lo, hi)) = integer_range(param_ty) {
                             let (v, lit_span) = (*v, *lit_span);
-                            if (v as i128) >= lo && (v as i128) <= hi {
+                            // For an unsigned target, a literal above i64::MAX is stored as a
+                            // negative bit pattern — also accept its unsigned reinterpretation.
+                            let signed = v as i128;
+                            let fits = (signed >= lo && signed <= hi)
+                                || (!param_ty.is_signed() && {
+                                    let unsigned = (v as u64) as i128;
+                                    unsigned >= lo && unsigned <= hi
+                                });
+                            if fits {
                                 typed_args[i] = TypedExpr::IntLit(v, param_ty.clone(), lit_span);
                             }
                         }

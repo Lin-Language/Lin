@@ -1,4 +1,6 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_FLOAT32, TAG_ARRAY, TAG_OBJECT};
 
 /// Runtime string representation: reference-counted, UTF-8.
@@ -8,6 +10,84 @@ pub struct LinString {
     pub refcount: u32,
     pub len: u32,
     pub data: [u8; 0],
+}
+
+/// Refcount sentinel for *immortal* (interned) string literals.
+///
+/// String literals are compile-time constants; we allocate one shared `LinString` per distinct
+/// literal for the whole program run (see `lin_string_literal`) instead of re-allocating on every
+/// evaluation. To keep that shared box alive under arbitrary retain/release traffic without a
+/// layout change (the `LinString` layout is pinned by codegen — refcount:u32, len:u32, data), we
+/// mark it immortal by setting its refcount into the top of the u32 range.
+///
+/// SAFETY CONTRACT (single-threaded runtime — async "operates synchronously", no real threads):
+///   * `lin_string_release` returns early (before the underflow `debug_assert!` and before
+///     decrementing) when `refcount >= IMMORTAL_RC`, so an interned literal is never freed even
+///     when a container that holds it is dropped.
+///   * Every refcount *increment* path that touches a `LinString` (`lin_rc_retain`,
+///     `retain_tagged_payload`, the raw `(*key).refcount += 1` sites in object.rs) is funneled
+///     through `lin_string_inc_ref`, which leaves an immortal string's refcount unchanged. So
+///     retains can never push it past `u32::MAX`, and a balanced retain/release pair is a double
+///     no-op — provably overflow-free regardless of how many containers borrow the literal.
+/// The threshold sits halfway up the u32 range: an ordinary heap string would need 2^31 live
+/// owners to reach it, which is impossible (each owner is a distinct pointer into a far smaller
+/// address space), so a normal string can never be mistaken for immortal.
+pub const IMMORTAL_RC: u32 = 0x8000_0000;
+
+thread_local! {
+    /// Interning cache for string literals, keyed by the literal's global data pointer.
+    ///
+    /// Each distinct string literal in the program has a unique, stable `@str_data` global; codegen
+    /// passes that pointer to `lin_string_literal`. The first call for a given pointer allocates the
+    /// `LinString` once (copying the bytes, refcount = IMMORTAL_RC) and caches it; subsequent calls
+    /// return the same pointer. Net: one allocation per distinct literal per run.
+    ///
+    /// Single-threaded: a `thread_local!` `RefCell` is sufficient and avoids any locking on the hot
+    /// path. (The scalar-box cache in tagged.rs is a compile-time `static` because TaggedVals are
+    /// plain data; literals need a runtime map because the byte data lives in the compiled module,
+    /// keyed by a pointer only known at run time.)
+    static LITERAL_CACHE: RefCell<HashMap<(usize, u32), *mut LinString>> = RefCell::new(HashMap::new());
+}
+
+/// Increment a string's refcount, leaving immortal (interned) strings untouched.
+/// All retain paths that touch a `LinString` go through this so an immortal string can never
+/// overflow its refcount. Null-safe. Inlined to keep the ordinary path a single branch + add.
+#[inline]
+pub unsafe fn lin_string_inc_ref(s: *mut LinString) {
+    if s.is_null() {
+        return;
+    }
+    if (*s).refcount >= IMMORTAL_RC {
+        return;
+    }
+    (*s).refcount += 1;
+}
+
+/// Return a cached, immortal `LinString` for the string literal whose byte data lives at `data`
+/// (an `@str_data` global emitted by codegen) with length `len`. First call for a given pointer
+/// allocates and caches; subsequent calls return the same pointer. The returned string has refcount
+/// `IMMORTAL_RC` and is never freed (see `lin_string_release`) — only true compile-time literals
+/// must use this; dynamic strings (concat/interpolation/fs/etc.) keep using `lin_string_from_bytes`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_literal(data: *const u8, len: u32) -> *mut LinString {
+    // Key on (pointer, len), not pointer alone. A zero-length global (`""`, empty interpolation
+    // segment) has no storage, so the linker can place it at the *same address* as the adjacent
+    // non-empty global; keying on the pointer alone would then return the empty string for a
+    // distinct non-empty literal. The length disambiguates those aliasing cases. Identical-content
+    // literals that LLVM constant-merges share ptr+len and are correctly deduped.
+    let key = (data as usize, len);
+    LITERAL_CACHE.with(|cache| {
+        if let Some(&s) = cache.borrow().get(&key) {
+            return s;
+        }
+        let ptr = lin_string_alloc(len);
+        (*ptr).refcount = IMMORTAL_RC;
+        if len > 0 {
+            std::ptr::copy_nonoverlapping(data, (*ptr).data.as_mut_ptr(), len as usize);
+        }
+        cache.borrow_mut().insert(key, ptr);
+        ptr
+    })
 }
 
 impl LinString {
@@ -38,6 +118,13 @@ pub unsafe extern "C" fn lin_string_free(s: *mut LinString) {
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_release(s: *mut LinString) {
     if s.is_null() {
+        return;
+    }
+    // Immortal (interned) string literals carry a saturated refcount and must never be freed or
+    // decremented — they are shared, allocated once, and outlive every container that borrows
+    // them. Return before the underflow assert and the decrement. Single predictable branch on
+    // the hot release path (the sentinel comparison); ordinary strings fall through unchanged.
+    if (*s).refcount >= IMMORTAL_RC {
         return;
     }
     // A zero refcount here means a double-release (ownership bug in codegen/lowering): the
@@ -177,6 +264,12 @@ pub unsafe extern "C" fn lin_string_cmp(a: *const LinString, b: *const LinString
 
 #[no_mangle]
 pub extern "C" fn lin_int_to_string(n: i64) -> *mut LinString {
+    let s = n.to_string();
+    unsafe { lin_string_from_bytes(s.as_ptr(), s.len() as u32) }
+}
+
+#[no_mangle]
+pub extern "C" fn lin_uint_to_string(n: u64) -> *mut LinString {
     let s = n.to_string();
     unsafe { lin_string_from_bytes(s.as_ptr(), s.len() as u32) }
 }
@@ -346,6 +439,7 @@ pub unsafe fn tagged_to_json_string(tagged: *const TaggedVal) -> String {
     if tag == TAG_BOOL { return if payload != 0 { "true" } else { "false" }.to_string(); }
     if tag == TAG_INT32 { return (payload as i32).to_string(); }
     if tag == TAG_INT64 { return (payload as i64).to_string(); }
+    if tag == crate::tagged::TAG_UINT64 { return payload.to_string(); }
     if tag == TAG_FLOAT32 {
         let f = f32::from_bits(payload as u32);
         return format!("{}", f);
@@ -493,6 +587,7 @@ unsafe fn tagged_to_key_string(tagged: *const TaggedVal) -> String {
         TAG_BOOL => format!("b:{}", if payload != 0 { "true" } else { "false" }),
         TAG_INT32 => format!("i:{}", payload as i32),
         TAG_INT64 => format!("I:{}", payload as i64),
+        TAG_UINT64 => format!("U:{}", payload),
         TAG_FLOAT32 => format!("f:{}", f32::from_bits(payload as u32)),
         TAG_FLOAT64 => format!("F:{}", f64::from_bits(payload)),
         TAG_STR => {
@@ -630,6 +725,8 @@ pub unsafe extern "C" fn lin_tagged_to_string(tagged: *const TaggedVal) -> *mut 
         lin_int_to_string(payload as i32 as i64)
     } else if tag == TAG_INT64 {
         lin_int_to_string(payload as i64)
+    } else if tag == crate::tagged::TAG_UINT64 {
+        lin_uint_to_string(payload)
     } else if tag == TAG_FLOAT32 {
         let f = f32::from_bits(payload as u32);
         lin_float_to_string(f as f64)

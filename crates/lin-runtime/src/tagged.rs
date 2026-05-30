@@ -29,6 +29,10 @@ pub const TAG_UINT8: u8 = 10;
 pub const TAG_INT8: u8 = 11;
 pub const TAG_UINT16: u8 = 12;
 pub const TAG_INT16: u8 = 13;
+/// UInt64 — payload interpreted as `u64` (unsigned). All other unsigned widths
+/// (UInt8/16/32) are zero-extended and boxed as TAG_INT64 (always-positive i64), so
+/// this is the only tag whose payload must be read unsigned.
+pub const TAG_UINT64: u8 = 14;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -175,6 +179,14 @@ pub unsafe extern "C" fn lin_box_int64(v: i64) -> *mut u8 {
     alloc_tagged(TAG_INT64, v as u64)
 }
 
+/// Box a UInt64 value. Tagged TAG_UINT64 so the payload is read back unsigned.
+/// Always heap-allocates: the small-int caches are tagged TAG_INT64, so reusing them
+/// would lose the unsigned tag. (UInt64 values are rare on the hot path.)
+#[no_mangle]
+pub unsafe extern "C" fn lin_box_uint64(v: u64) -> *mut u8 {
+    alloc_tagged(TAG_UINT64, v)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_box_float64(v: f64) -> *mut u8 {
     alloc_tagged(TAG_FLOAT64, v.to_bits())
@@ -222,6 +234,12 @@ pub unsafe extern "C" fn lin_unbox_int64(p: *const u8) -> i64 {
     (*(p as *const TaggedVal)).payload as i64
 }
 
+/// Unbox a UInt64 value (assumes tag is TAG_UINT64).
+#[no_mangle]
+pub unsafe extern "C" fn lin_unbox_uint64(p: *const u8) -> u64 {
+    (*(p as *const TaggedVal)).payload
+}
+
 /// Unbox a Float64 value (assumes tag is TAG_FLOAT64).
 #[no_mangle]
 pub unsafe extern "C" fn lin_unbox_float64(p: *const u8) -> f64 {
@@ -257,8 +275,8 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
     let ap = (*av).payload;
     let bp = (*bv).payload;
     // Cross-numeric equality: compare numeric types by value (Int32 == Int64 if same numeric value).
-    let at_is_num = at >= TAG_INT32 && at <= TAG_FLOAT64;
-    let bt_is_num = bt >= TAG_INT32 && bt <= TAG_FLOAT64;
+    let at_is_num = (at >= TAG_INT32 && at <= TAG_FLOAT64) || at == TAG_UINT64;
+    let bt_is_num = (bt >= TAG_INT32 && bt <= TAG_FLOAT64) || bt == TAG_UINT64;
     if at_is_num && bt_is_num && at != bt {
         return (tagged_as_f64(at, ap) == tagged_as_f64(bt, bp)) as u8;
     }
@@ -267,6 +285,7 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
         TAG_BOOL => (ap == bp) as u8,
         TAG_INT32 => ((ap as i32) == (bp as i32)) as u8,
         TAG_INT64 => ((ap as i64) == (bp as i64)) as u8,
+        TAG_UINT64 => (ap == bp) as u8,
         TAG_FLOAT32 => (f32::from_bits(ap as u32) == f32::from_bits(bp as u32)) as u8,
         TAG_FLOAT64 => (f64::from_bits(ap) == f64::from_bits(bp)) as u8,
         TAG_STR => {
@@ -307,6 +326,7 @@ pub unsafe extern "C" fn lin_tagged_cmp(a: *const u8, b: *const u8) -> i32 {
         }
         (TAG_INT32, TAG_INT32) => (ap as i32).cmp(&(bp as i32)) as i32,
         (TAG_INT64, TAG_INT64) => (ap as i64).cmp(&(bp as i64)) as i32,
+        (TAG_UINT64, TAG_UINT64) => ap.cmp(&bp) as i32,
         (TAG_FLOAT32, TAG_FLOAT32) => {
             let af = f32::from_bits(ap as u32);
             let bf = f32::from_bits(bp as u32);
@@ -318,7 +338,10 @@ pub unsafe extern "C" fn lin_tagged_cmp(a: *const u8, b: *const u8) -> i32 {
             af.partial_cmp(&bf).map(|o| o as i32).unwrap_or(0)
         }
         // Mixed numeric: widen to f64
-        (a_tag, b_tag) if a_tag >= TAG_INT32 && a_tag <= TAG_FLOAT64 && b_tag >= TAG_INT32 && b_tag <= TAG_FLOAT64 => {
+        (a_tag, b_tag)
+            if ((a_tag >= TAG_INT32 && a_tag <= TAG_FLOAT64) || a_tag == TAG_UINT64)
+                && ((b_tag >= TAG_INT32 && b_tag <= TAG_FLOAT64) || b_tag == TAG_UINT64) =>
+        {
             let af = tagged_as_f64(at, ap);
             let bf = tagged_as_f64(bt, bp);
             af.partial_cmp(&bf).map(|o| o as i32).unwrap_or(0)
@@ -331,6 +354,7 @@ pub(crate) unsafe fn tagged_as_f64(tag: u8, payload: u64) -> f64 {
     match tag {
         TAG_INT32 => (payload as i32) as f64,
         TAG_INT64 => (payload as i64) as f64,
+        TAG_UINT64 => payload as f64,
         TAG_FLOAT32 => f32::from_bits(payload as u32) as f64,
         TAG_FLOAT64 => f64::from_bits(payload),
         _ => 0.0,
@@ -457,6 +481,50 @@ mod cache_tests {
             assert_eq!(lin_get_tag(p), TAG_INT64);
             assert_eq!(lin_unbox_int64(p), 5);
             assert!(is_cached_box(p));
+        }
+    }
+
+    #[test]
+    fn uint64_box_tag_and_roundtrip() {
+        unsafe {
+            for v in [0u64, 1, 42, i64::MAX as u64, (i64::MAX as u64) + 1, u64::MAX] {
+                let p = lin_box_uint64(v);
+                assert_eq!(lin_get_tag(p), TAG_UINT64, "uint64 box must carry TAG_UINT64");
+                assert_eq!(lin_unbox_uint64(p), v, "uint64 unbox round-trip");
+                // Never cached — always heap-allocated; release frees it (no double-free panic).
+                assert!(!is_cached_box(p));
+                lin_tagged_release(p);
+            }
+        }
+    }
+
+    #[test]
+    fn uint64_max_displays_unsigned() {
+        unsafe {
+            let p = lin_box_uint64(u64::MAX) as *const crate::tagged::TaggedVal;
+            let s = crate::string::lin_tagged_to_string(p);
+            assert_eq!((*s).as_str(), "18446744073709551615");
+            crate::string::lin_string_release(s);
+            // Release the box.
+            lin_tagged_release(lin_box_uint64(u64::MAX));
+        }
+    }
+
+    #[test]
+    fn uint64_eq_and_cmp_high_bit() {
+        unsafe {
+            // u64 >= 2^63 must compare as a large positive number, not negative.
+            let big = lin_box_uint64(u64::MAX);
+            let small = lin_box_uint64(1);
+            assert_eq!(lin_tagged_eq(big, big), 1);
+            assert_eq!(lin_tagged_eq(big, small), 0);
+            assert_eq!(lin_tagged_cmp(big, small), 1, "u64::MAX > 1");
+            assert_eq!(lin_tagged_cmp(small, big), -1, "1 < u64::MAX");
+            // Cross-type: a UInt64 small value equals an Int32 of the same value.
+            let i = lin_box_int32(1);
+            assert_eq!(lin_tagged_eq(small, i), 1, "UInt64(1) == Int32(1)");
+            lin_tagged_release(big);
+            lin_tagged_release(small);
         }
     }
 }

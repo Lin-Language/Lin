@@ -13,7 +13,7 @@
     "source=${localEnv:HOME}/.bash_history,target=/home/hmcts/.bash_history,type=bind,consistency=cached",
     "source=${localEnv:HOME}/.config/gh,target=/home/vscode/.config/gh,type=bind"
   ],
-  "runArgs": ["--memory=32g", "--memory-swap=32g", "--oom-kill-disable=false"],
+  "runArgs": ["--memory=128g", "--memory-swap=32g", "--oom-kill-disable=false"],
   "features": {
     "ghcr.io/devcontainers/features/git:1": {},
     "ghcr.io/devcontainers/features/node:1": {},

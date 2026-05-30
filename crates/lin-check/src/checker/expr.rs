@@ -21,10 +21,26 @@ impl Checker {
         if let Expr::IntLit(v, span) = expr {
             if expected.is_integer() {
                 if let Some((lo, hi)) = integer_range(expected) {
-                    if (*v as i128) < lo || (*v as i128) > hi {
+                    let signed = *v as i128;
+                    // A decimal literal larger than i64::MAX (e.g. UInt64 = 18446744073709551615)
+                    // is lexed as the i64 bit pattern (negative). For an unsigned target, also
+                    // consider the unsigned reinterpretation so such literals fit their range.
+                    let fits = (signed >= lo && signed <= hi)
+                        || (!expected.is_signed() && {
+                            let unsigned = (*v as u64) as i128;
+                            unsigned >= lo && unsigned <= hi
+                        });
+                    if !fits {
+                        // Show the unsigned spelling only when it was lexed as an above-i64::MAX
+                        // decimal (stored as a negative bit pattern) targeting an unsigned type.
+                        let shown = if !expected.is_signed() && *v < 0 {
+                            format!("{}", *v as u64)
+                        } else {
+                            format!("{}", v)
+                        };
                         return Err(Diagnostic::error(
                             *span,
-                            format!("literal {} is out of range for type {}", v, expected),
+                            format!("literal {} is out of range for type {}", shown, expected),
                         ));
                     }
                 }
