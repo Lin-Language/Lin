@@ -1,5 +1,7 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { parseInt32, parseFloat64, toInt32, toFloat64, isInt32, isFloat64, tryParseInt32, tryParseFloat64 } from "std/number"
+import { parseInt32, parseFloat64, toInt32, toFloat64, toFloat32, isInt32, isFloat64, tryParseInt32, tryParseFloat64 } from "std/number"
+import { f32ToBe } from "std/bytes"
+import { length } from "std/array"
 
 val s = suite("std/number", [
   test("parseInt32 parses integer string", () => [
@@ -16,6 +18,14 @@ val s = suite("std/number", [
 
   test("toFloat64 converts int to float", () => [
     expect(5.toFloat64()).toBe(5.0)
+  ]),
+
+  test("toFloat32 narrows Float64 to a Float32 usable by f32ToBe", () => [
+    // The only way to get a Float32 from a computed Float64. 0.5 is exact in f32:
+    // big-endian bytes are 0x3F000000.
+    expect(length(f32ToBe(toFloat32(0.5)))).toBe(4),
+    expect(f32ToBe(toFloat32(0.5))[0]).toBe(63),
+    expect(f32ToBe(toFloat32(0.5))[1]).toBe(0)
   ]),
 
   test("isInt32 true for integer string", () => [

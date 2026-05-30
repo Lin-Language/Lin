@@ -229,7 +229,7 @@ impl<'ctx> Codegen<'ctx> {
                 cpu.to_str().unwrap_or("generic"),
                 features.to_str().unwrap_or(""),
                 OptimizationLevel::Aggressive,
-                RelocMode::Default,
+                RelocMode::PIC,
                 CodeModel::Default,
             )
             .ok_or("Failed to create target machine for optimization")?;
@@ -254,7 +254,7 @@ impl<'ctx> Codegen<'ctx> {
                 cpu.to_str().unwrap_or("generic"),
                 features.to_str().unwrap_or(""),
                 OptimizationLevel::Aggressive,
-                RelocMode::Default,
+                RelocMode::PIC,
                 CodeModel::Default,
             )
             .ok_or("Failed to create target machine")?;

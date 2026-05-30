@@ -1,0 +1,113 @@
+// Raspberry-Pi RC-car controller — a Lin port of the `deathbot` keyboard client.
+//
+// The original (Rust) reads the keyboard in raw mode and sends an 8-byte UDP
+// control packet at 20 Hz: two big-endian IEEE-754 f32 motor speeds in [-1, 1].
+//
+//   q / a  →  left  +/-       w / s  →  right +/-
+//   space  →  stop            ESC    →  quit
+//
+// This file is the protocol + control core, written entirely in Lin on top of the
+// low-level stdlib added in Milestone 21:
+//   std/bytes  — f32 big-endian serialization (f32ToBe)
+//   std/net    — UDP sockets (udpBind / udpSendTo)
+//   std/math   — clamp / round
+//   std/number — toFloat32 (the only way to narrow a computed Float64 to Float32)
+//   std/tty    — raw-mode keyboard (rawMode / readKey)   [see runController below]
+//   std/time   — sleep (20 Hz tick)
+//
+// `encodePacket`, `clampSpeed`, and `applyKey` are pure and unit-tested in
+// controller.test.lin. `runController` wires them to real TTY + UDP I/O; it is
+// not run by CI (it needs a live terminal and a peer) but shows the full loop.
+
+import { print } from "std/io"
+import { toString } from "std/string"
+import { clamp, round } from "std/math"
+import { toFloat32 } from "std/number"
+import { f32ToBe } from "std/bytes"
+import { length, concat, range, for } from "std/array"
+import { udpBind, udpSendTo } from "std/net"
+import { rawMode, readKey } from "std/tty"
+import { sleep } from "std/time"
+
+// One key press nudges a motor speed by this much.
+val STEP = 0.1
+
+// Quantise a motor speed to one decimal place and clamp to [-1.0, 1.0],
+// matching the Rust `clamp(v) = (v*10).round()/10` then `.clamp(-1,1)`.
+export val clampSpeed = (v: Float64): Float64 =>
+  clamp(round(v * 10.0) / 10.0, 0.0 - 1.0, 1.0)
+
+// Encode the 8-byte control packet: left then right, each a big-endian f32.
+// `concat` preserves the flat UInt8[] element type, so the result reads back as
+// packed bytes (udpSendTo / f32FromBe see real bytes, not boxed elements).
+export val encodePacket = (left: Float64, right: Float64): UInt8[] =>
+  concat(f32ToBe(toFloat32(left)), f32ToBe(toFloat32(right)))
+
+// Apply one keypress to the [left, right] speed pair, returning the new pair.
+// Keycodes are raw bytes from readKey: q=113 a=97 w=119 s=115 space=32 ESC=27.
+// Any other key leaves the speeds unchanged.
+export val applyKey = (key: Int32, left: Float64, right: Float64): Float64[] =>
+  if key == 113 then [clampSpeed(left + STEP), right]        // q: left +
+  else if key == 97 then [clampSpeed(left - STEP), right]     // a: left -
+  else if key == 119 then [left, clampSpeed(right + STEP)]    // w: right +
+  else if key == 115 then [left, clampSpeed(right - STEP)]    // s: right -
+  else if key == 32 then [0.0, 0.0]                           // space: stop
+  else [left, right]
+
+// The full interactive loop (real TTY + UDP). Not exercised by CI — it needs a
+// live terminal and a listening peer — but this is the faithful control client.
+//
+// `left`/`right`/`running` are mutable cells the tick closure captures by
+// reference. The per-tick body is a single `tick` call (no block-form `if`
+// inside the `.for` lambda, since indentation is suppressed inside parens).
+export val runController = (host: String, port: Int32): Null =>
+  val fd = udpBind(0)
+  rawMode(true)
+  print("Controls: q/a = left +/-  |  w/s = right +/-  |  space = stop  |  ESC = quit")
+
+  var left = 0.0
+  var right = 0.0
+  var running = true
+
+  // Next [left, right] pair for a key: ESC and unknown/no-key leave speeds as-is
+  // (ESC's stop is handled in `tick`), space/q/a/w/s go through applyKey.
+  val nextPair = (key: Int32): Float64[] =>
+    if key == 27 then [left, right]
+    else if key == null then [left, right]
+    else applyKey(key, left, right)
+
+  // One 20 Hz tick: poll a key (non-blocking), update speeds, send the packet.
+  // ESC (27) zeroes the speeds and stops the loop.
+  val tick = (): Null =>
+    val key = readKey()
+    val pair = nextPair(key)
+    left = pair[0]
+    right = pair[1]
+    if key == 27 then
+      left = 0.0
+      right = 0.0
+      running = false
+    else null
+    udpSendTo(fd, host, port, encodePacket(left, right))
+    sleep(50)
+
+  range(0, 100000).for(i =>
+    if running then tick() else null
+  )
+
+  rawMode(false)
+  print("Stopped.")
+
+// A non-interactive smoke run so the example is exercised by CI: encode a few
+// packets and confirm the byte length, without touching the TTY or a socket.
+val demo = (): Null =>
+  val stop = encodePacket(0.0, 0.0)
+  val fwd = encodePacket(1.0, 1.0)
+  val mixed = encodePacket(0.5, 0.0 - 0.3)
+  print("stop packet bytes: ${toString(length(stop))}")
+  print("forward packet bytes: ${toString(length(fwd))}")
+  print("mixed packet bytes: ${toString(length(mixed))}")
+  print("clampSpeed(1.5) = ${toString(clampSpeed(1.5))}")
+  print("clampSpeed(0.15) = ${toString(clampSpeed(0.15))}")
+
+demo()

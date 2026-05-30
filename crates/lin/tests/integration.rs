@@ -812,6 +812,28 @@ print(toString(nan))
 }
 
 #[test]
+fn test_float_constants_link_under_pie() {
+    // Float constants land in .rodata and, with a non-PIC reloc model, emit
+    // R_X86_64_32S absolute relocations that the system `cc`'s default PIE link
+    // rejects ("can not be used when making a PIE object"). Codegen uses RelocMode::PIC
+    // so this links. A function returning different float arrays per branch is the
+    // shape that reliably surfaced it. Regression for the PIE link failure.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val pick = (k: Int32): Float64[] =>
+  if k == 1 then [0.5, 1.5]
+  else if k == 2 then [2.5, 3.5]
+  else [0.0, 0.0]
+
+print(toString(pick(1)[0]))
+print(toString(pick(2)[1]))
+print(toString(pick(9)[0]))
+"#);
+    assert_eq!(output, vec!["0.5", "3.5", "0.0"]);
+}
+
+#[test]
 fn test_null_propagation_deep() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"

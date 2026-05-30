@@ -3,6 +3,7 @@ import foreign "lin-runtime"
   val lin_parse_float64: (String) => Float64
   val lin_to_int32: (Float64) => Int32
   val lin_to_float64: (Int32) => Float64
+  val lin_to_float32: (Float64) => Float32
   val lin_is_int32: (String) => Boolean
   val lin_is_float64: (String) => Boolean
   val lin_to_uint8: (UInt64) => UInt8
@@ -24,6 +25,9 @@ export val toInt32 = (v: Float64): Int32 =>
 
 export val toFloat64 = (v: Int32): Float64 =>
   lin_to_float64(v)
+
+export val toFloat32 = (v: Float64): Float32 =>
+  lin_to_float32(v)
 
 // Explicit narrowing integer casts (spec §26). Each truncates the input to the
 // target width using two's-complement / `as`-cast semantics. The input is taken

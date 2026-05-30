@@ -693,3 +693,9 @@ Tracked here so they don't get lost:
   synchronous stub — no actual threads. Making it real is gated on catchable
   faults at the thread boundary, a thread-safe RC story, and deferred thunk
   evaluation in codegen. Phased design + plan in **`docs/ASYNC_DESIGN.md`**.
+
+## CI follow-up
+
+- **Wire `examples/` tests into CI.** All example tests now pass; add a
+  `lin test examples/ --timeout 120` step (the two former blockers — the web-server
+  `:id` route and the matrix `vector` heap corruption — are fixed).

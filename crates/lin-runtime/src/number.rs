@@ -26,6 +26,14 @@ pub extern "C" fn lin_to_float64(v: i32) -> f64 {
     v as f64
 }
 
+/// Explicit Float64 -> Float32 narrowing cast (spec §26). There is no implicit
+/// float narrowing, so this is the only way to obtain a Float32 from a computed
+/// Float64 (e.g. for big-endian f32 serialization via std/bytes).
+#[no_mangle]
+pub extern "C" fn lin_to_float32(v: f64) -> f32 {
+    v as f32
+}
+
 // -------------------------------------------------------------------------
 // Explicit narrowing integer casts (spec §26). Each takes the widest
 // practical integer input (i64) and truncates to the target width using
