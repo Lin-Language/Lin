@@ -2790,6 +2790,47 @@ print(toString(s))
 }
 
 #[test]
+fn test_for_element_box_flat_array_churn_correct() {
+    // Regression for the for-element-ARGUMENT box leak. Each `for` iteration boxes the flat
+    // Int32 element into a fresh `TaggedVal*` for the Json callback param; that per-iteration box
+    // was leaked (~36 B/iter). The fix reclaims the box shell every iteration via
+    // `lin_tagged_free_box_if_distinct` (skipping when the callback returned that very box, e.g.
+    // an identity body). Over 50000 iterations correctness must be unaffected: a wrong (double)
+    // free would abort or corrupt the accumulator. sum(0..50000) = 50000*49999/2 = 1249975000.
+    let out = run(r#"import { range, for } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+var s = 0
+range(0, 50000).for(i => s = s + i)
+print(toString(s))
+"#);
+    assert_eq!(out, vec!["1249975000"]);
+}
+
+#[test]
+fn test_for_element_box_tagged_array_churn_correct() {
+    // Regression for the for-element box reclaim on a TAGGED array (heap-inner String elements).
+    // Here the per-iteration element box wraps a refcounted String; reclaiming only the box SHELL
+    // (never the inner) must NOT corrupt the source array — the strings stay owned by `xs` and are
+    // read again on every pass. Also covers a callback that PASSES the element to another function
+    // (`contains`), proving the shared inner is intact. 20000 passes over the 3-element array; a
+    // wrong inner release would free a live string and abort/corrupt the count.
+    let out = run(r#"import { for, range } from "std/array"
+import { contains } from "std/string"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val xs = ["alpha", "beta", "gamma"]
+var total = 0
+range(0, 20000).for(j => xs.for(s => if contains(s, "a") then total = total + 1 else total = total))
+print(toString(total))
+"#);
+    // "alpha", "beta", "gamma" all contain "a" → 3 per pass * 20000 = 60000.
+    assert_eq!(out, vec!["60000"]);
+}
+
+#[test]
 fn test_to_uint8_narrowing() {
     // std/number toUInt8 truncates a wider integer to a byte (two's-complement / `as`).
     let out = run(r#"import { print } from "std/io"
