@@ -3609,19 +3609,17 @@ by the type system: a bare single assertion or a sequence of bare assertion
 statements is a compile error, which is what guarantees no assertion is silently
 skipped. Even a single assertion is wrapped in `[ ... ]`.
 
-When a test needs setup before its assertions, bind the assertions to a `val`
-and return it on its own final line (a bare `[` after a statement is parsed as
-index access on the preceding expression, so the explicit binding is required):
+When a test needs setup before its assertions, write the setup statements
+followed by the array literal as the body's final expression:
 
 ```txt
 test("sorts ascending", () =>
   val input = [3, 1, 2]
   val sorted = input.sort((a, b) => a - b)
-  val checks = [
-    expect(toString(input)).toBe("[3, 1, 2]"),
-    expect(toString(sorted)).toBe("[1, 2, 3]")
+  [
+    expect(input.toString()).toBe("[3, 1, 2]"),
+    expect(sorted.toString()).toBe("[1, 2, 3]")
   ]
-  checks
 )
 ```
 
@@ -3671,8 +3669,8 @@ Declares a single test case. All assertions in the body are evaluated before the
 
 ```txt
 test("string conversions", () => [
-  expect(toString(42)).toBe("42"),
-  expect(toString(true)).toBe("true")
+  expect((42).toString()).toBe("42"),
+  expect(true.toString()).toBe("true")
 ])
 ```
 

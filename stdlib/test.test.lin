@@ -59,12 +59,11 @@ val s = suite("std/test", [
 
   test("toBe failure message contains expected and actual", () =>
     val r: Json = expect(1).toBe(2)
-    val checks = [
+    [
       expect(r["type"]).toBe("fail"),
       expect(r["message"].contains("expected")).toBe(true),
       expect(r["message"].contains("actual")).toBe(true)
     ]
-    checks
   ),
 
   test("toBeNull fails on non-null", () =>
@@ -80,36 +79,32 @@ val s = suite("std/test", [
 
   test("toFailWith fails when error message differs", () =>
     val r = { "type": "failure", "error": "oops" }
-    val checks = [
+    [
       expect(expect(r).toFailWith("wrong")["type"]).toBe("fail")
     ]
-    checks
   ),
 
   test("toSucceed fails when given a failure", () =>
     val r = { "type": "failure", "error": "oops" }
-    val checks = [
+    [
       expect(expect(r).toSucceed()["type"]).toBe("fail")
     ]
-    checks
   ),
 
   test("toFail fails when given a success", () =>
     val r = { "type": "success", "value": 1 }
-    val checks = [
+    [
       expect(expect(r).toFail()["type"]).toBe("fail")
     ]
-    checks
   ),
 
   test("toSatisfy can inspect union shapes via has-pattern", () =>
     val ok = { "type": "success", "value": 42 }
     val err = { "type": "failure", "error": "boom" }
-    val checks = [
+    [
       expect(ok).toSatisfy(r => r has { "type": "success", value }),
       expect(err).toSatisfy(r => r has { "type": "failure", error })
     ]
-    checks
   ),
 ])
 

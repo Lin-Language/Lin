@@ -21,56 +21,51 @@ val s = suite("std/bytes", [
   test("u16 big-endian round-trips", () =>
     val v: UInt16 = 0xBEEF
     val b: UInt8[] = u16ToBe(v)
-    val checks = [
-      expect(length(b)).toBe(2),
+    [
+      expect(b.length()).toBe(2),
       expect(b[0]).toBe(0xBE),
       expect(b[1]).toBe(0xEF),
       expect(u16FromBe(b, 0) == v).toBe(true)
     ]
-    checks
   ),
 
   test("u16 little-endian round-trips", () =>
     val v: UInt16 = 0xBEEF
     val b: UInt8[] = u16ToLe(v)
-    val checks = [
+    [
       expect(b[0]).toBe(0xEF),
       expect(b[1]).toBe(0xBE),
       expect(u16FromLe(b, 0) == v).toBe(true)
     ]
-    checks
   ),
 
   test("u32 big-endian round-trips", () =>
     val v: UInt32 = 0x11223344
     val b: UInt8[] = u32ToBe(v)
-    val checks = [
-      expect(length(b)).toBe(4),
+    [
+      expect(b.length()).toBe(4),
       expect(b[0]).toBe(0x11),
       expect(b[3]).toBe(0x44),
       expect(u32FromBe(b, 0) == v).toBe(true)
     ]
-    checks
   ),
 
   test("u32 little-endian round-trips", () =>
     val v: UInt32 = 0x11223344
     val b: UInt8[] = u32ToLe(v)
-    val checks = [
+    [
       expect(b[0]).toBe(0x44),
       expect(b[3]).toBe(0x11),
       expect(u32FromLe(b, 0) == v).toBe(true)
     ]
-    checks
   ),
 
   test("u32 with the high bit set round-trips", () =>
     val v: UInt32 = 0xFF00FF01
-    val checks = [
+    [
       expect(u32FromBe(u32ToBe(v), 0) == v).toBe(true),
       expect(u32FromLe(u32ToLe(v), 0) == v).toBe(true)
     ]
-    checks
   ),
 
   test("high unsigned values display unsigned", () =>
@@ -78,93 +73,84 @@ val s = suite("std/bytes", [
     val maxBytes: UInt8[] = [255, 255, 255, 255]
     // A computed high u64 (all bits set) prints as u64::MAX, not -1.
     val maxBytes8: UInt8[] = [255, 255, 255, 255, 255, 255, 255, 255]
-    val checks = [
-      expect(toString(u32FromBe(maxBytes, 0))).toBe("4294967295"),
-      expect(toString(u64FromBe(maxBytes8, 0))).toBe("18446744073709551615")
+    [
+      expect(u32FromBe(maxBytes, 0).toString()).toBe("4294967295"),
+      expect(u64FromBe(maxBytes8, 0).toString()).toBe("18446744073709551615")
     ]
-    checks
   ),
 
   test("u64 big-endian round-trips", () =>
     val v: UInt64 = 0x0123456789ABCDEF
     val b: UInt8[] = u64ToBe(v)
-    val checks = [
-      expect(length(b)).toBe(8),
+    [
+      expect(b.length()).toBe(8),
       expect(b[0]).toBe(0x01),
       expect(b[7]).toBe(0xEF),
       expect(u64FromBe(b, 0) == v).toBe(true)
     ]
-    checks
   ),
 
   test("u64 little-endian round-trips", () =>
     val v: UInt64 = 0x0123456789ABCDEF
     val b: UInt8[] = u64ToLe(v)
-    val checks = [
+    [
       expect(b[0]).toBe(0xEF),
       expect(b[7]).toBe(0x01),
       expect(u64FromLe(b, 0) == v).toBe(true)
     ]
-    checks
   ),
 
   test("read honours the offset", () =>
     val b: UInt8[] = [0x00, 0x00, 0x12, 0x34]
     val v: UInt16 = 0x1234
-    val checks = [
+    [
       expect(u16FromBe(b, 2) == v).toBe(true)
     ]
-    checks
   ),
 
   test("f32 bits round-trip", () =>
     val bits: UInt32 = 0x40600000
     val f: Float32 = f32FromBits(bits)
-    val checks = [
+    [
       expect(f32ToBits(f) == bits).toBe(true),
       expect(f).toBe(f32FromBits(0x40600000))
     ]
-    checks
   ),
 
   test("f64 bits round-trip", () =>
     val bits: UInt64 = 0x400921FB54442D18
     val f: Float64 = f64FromBits(bits)
-    val checks = [
+    [
       expect(f64ToBits(f) == bits).toBe(true)
     ]
-    checks
   ),
 
   test("f32 big-endian serialize/deserialize", () =>
     val f: Float32 = f32FromBits(0x40600000)
     val b: UInt8[] = f32ToBe(f)
-    val checks = [
-      expect(length(b)).toBe(4),
+    [
+      expect(b.length()).toBe(4),
       expect(f32FromBe(b, 0) == f).toBe(true)
     ]
-    checks
   ),
 
   test("f64 big-endian serialize/deserialize", () =>
     val f: Float64 = f64FromBits(0x400921FB54442D18)
     val b: UInt8[] = f64ToBe(f)
-    val checks = [
-      expect(length(b)).toBe(8),
+    [
+      expect(b.length()).toBe(8),
       expect(f64FromBe(b, 0) == f).toBe(true)
     ]
-    checks
   ),
 
   test("slice on a UInt8[] yields a UInt8[]", () =>
     val buf: UInt8[] = [10, 20, 30, 40, 50]
     val sub: UInt8[] = slice(buf, 1, 4)
-    val checks = [
-      expect(length(sub)).toBe(3),
+    [
+      expect(sub.length()).toBe(3),
       expect(sub[0]).toBe(20),
       expect(sub[2]).toBe(40)
     ]
-    checks
   ),
 
   test("8-byte two-f32 control packet round-trips", () =>
@@ -176,12 +162,11 @@ val s = suite("std/bytes", [
     f32ToBe(leftMotor).for(x => push(packet, x))
     f32ToBe(rightMotor).for(x => push(packet, x))
     // Read both back.
-    val checks = [
-      expect(length(packet)).toBe(8),
+    [
+      expect(packet.length()).toBe(8),
       expect(f32FromBe(packet, 0) == leftMotor).toBe(true),
       expect(f32FromBe(packet, 4) == rightMotor).toBe(true)
     ]
-    checks
   ),
 ])
 

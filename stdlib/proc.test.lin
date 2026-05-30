@@ -12,7 +12,7 @@ val s = suite("std/proc", [
     val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
     val n = readStdout(h, buf)
     val code = wait(h)
-    val r = [
+    [
       expect(n).toBe(5),
       expect(buf[0]).toBe(104),
       expect(buf[1]).toBe(101),
@@ -21,16 +21,14 @@ val s = suite("std/proc", [
       expect(buf[4]).toBe(111),
       expect(code).toBe(0),
     ]
-    r
   ),
 
   test("wait returns the child's exit code", () =>
     val h = spawn(["sh", "-c", "exit 3"])
     val code = wait(h)
-    val r = [
+    [
       expect(code).toBe(3)
     ]
-    r
   ),
 ])
 

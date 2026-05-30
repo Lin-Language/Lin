@@ -12,10 +12,9 @@ val s = suite("std/time", [
 
   test("elapsed is non-negative", () =>
     val t = startTimer()
-    val checks = [
-      expect(elapsed(t) >= 0).toBe(true)
+    [
+      expect(t.elapsed() >= 0).toBe(true)
     ]
-    checks
   ),
 
   test("toIso of Unix epoch", () => [
@@ -33,10 +32,9 @@ val s = suite("std/time", [
   test("sleepMicros runs and elapsed stays non-negative", () =>
     val t = startTimer()
     sleepMicros(500)
-    val checks = [
-      expect(elapsed(t) >= 0).toBe(true)
+    [
+      expect(t.elapsed() >= 0).toBe(true)
     ]
-    checks
   ),
 ])
 

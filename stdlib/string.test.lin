@@ -3,15 +3,15 @@ import { toString, trim, trimStart, trimEnd, toUpper, toLower, substring, indexO
 
 val s = suite("std/string", [
   test("toString of int", () => [
-    expect(toString(42)).toBe("42")
+    expect((42).toString()).toBe("42")
   ]),
 
   test("toString of null", () => [
-    expect(toString(null)).toBe("null")
+    expect(null.toString()).toBe("null")
   ]),
 
   test("toString of bool", () => [
-    expect(toString(true)).toBe("true")
+    expect(true.toString()).toBe("true")
   ]),
 
   test("trim removes whitespace", () => [
@@ -63,15 +63,15 @@ val s = suite("std/string", [
   ]),
 
   test("isBlank returns true for empty string", () => [
-    expect(isBlank("")).toBe(true)
+    expect("".isBlank()).toBe(true)
   ]),
 
   test("isBlank returns true for whitespace-only string", () => [
-    expect(isBlank("  ")).toBe(true)
+    expect("  ".isBlank()).toBe(true)
   ]),
 
   test("isBlank returns false for non-blank string", () => [
-    expect(isBlank("hi")).toBe(false)
+    expect("hi".isBlank()).toBe(false)
   ]),
 
   test("contains returns true when present", () => [
@@ -100,18 +100,16 @@ val s = suite("std/string", [
 
   test("split splits on delimiter", () =>
     val parts = "a,b,c".split(",")
-    val checks = [
+    [
       expect(parts[0]).toBe("a")
     ]
-    checks
   ),
 
   test("join joins with separator", () =>
     val result = ["a", "b", "c"].join("-")
-    val checks = [
+    [
       expect(result).toBe("a-b-c")
     ]
-    checks
   ),
 
   test("replace substitutes first match", () => [
@@ -147,35 +145,33 @@ val s = suite("std/string", [
   ]),
 
   test("lines splits on newline", () =>
-    val parts = lines("a\nb\nc")
-    val checks = [
+    val parts = "a\nb\nc".lines()
+    [
       expect(parts[0]).toBe("a")
     ]
-    checks
   ),
 
   test("lines returns single line when no newline", () =>
-    val parts = lines("hello")
-    val checks = [
+    val parts = "hello".lines()
+    [
       expect(parts[0]).toBe("hello")
     ]
-    checks
   ),
 
   test("codePointAt returns code point", () => [
-    expect(codePointAt("A", 0)).toBe(65)
+    expect("A".codePointAt(0)).toBe(65)
   ]),
 
   test("codePointAt returns -1 for out of bounds", () => [
-    expect(codePointAt("A", 5)).toBe(-1)
+    expect("A".codePointAt(5)).toBe(-1)
   ]),
 
   test("fromCodePoints builds string from code points", () => [
-    expect(fromCodePoints([72, 101, 108, 108, 111])).toBe("Hello")
+    expect([72, 101, 108, 108, 111].fromCodePoints()).toBe("Hello")
   ]),
 
   test("fromCodePoints returns empty string for empty array", () => [
-    expect(fromCodePoints([])).toBe("")
+    expect([].fromCodePoints()).toBe("")
   ]),
 
   test("padStart pads left with character", () => [

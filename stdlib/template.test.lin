@@ -7,35 +7,31 @@ val tmpTpl = "/tmp/lin_test_template.tpl"
 val s = suite("std/template", [
   test("renderWith substitutes variables", () =>
     val result = renderWith("Hello, \${name}!", { "name": "Lin" })
-    val checks = [
+    [
       expect(result).toBe("Hello, Lin!")
     ]
-    checks
   ),
 
   test("renderWith handles multiple variables", () =>
     val result = renderWith("\${greeting}, \${name}!", { "greeting": "Hi", "name": "world" })
-    val checks = [
+    [
       expect(result).toBe("Hi, world!")
     ]
-    checks
   ),
 
   test("render reads template from file", () =>
     writeFile(tmpTpl, "Value: \${v}")
     val result = render(tmpTpl, { "v": "42" })
-    val checks = [
+    [
       expect(result).toBe("Value: 42")
     ]
-    checks
   ),
 
   test("render returns error for missing file", () =>
     val result = render("/nonexistent/template.tpl", {})
-    val checks = [
+    [
       expect(result["type"]).toBe("error")
     ]
-    checks
   ),
 ])
 
