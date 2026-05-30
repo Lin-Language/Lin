@@ -1057,8 +1057,16 @@ impl<'ctx> Codegen<'ctx> {
                             temp_map.insert(*dst, result);
                         }
                         Instruction::MakeObject { dst, fields, spreads, ty } => {
-                            // Compile field values first (they're already Temps).
-                            let cap = i32_ty.const_int((fields.len() + 4).max(4) as u64, false);
+                            // Right-size the capacity. For a plain (no-spread) literal the final
+                            // size is exactly the field count (after de-duplicating literal keys,
+                            // below). With spreads the final size is unknown (spread sources add
+                            // fields), so keep some headroom and let the buffer grow on demand.
+                            let cap_hint = if spreads.is_empty() {
+                                fields.len()
+                            } else {
+                                fields.len() + 4
+                            };
+                            let cap = i32_ty.const_int(cap_hint as u64, false);
                             let obj_ptr = self.builder.call(self.rt.object_alloc, &[cap.into()], "ir_obj").try_as_basic_value().unwrap_basic().into_pointer_value();
                             // Apply spreads. A spread source typed Json/union arrives boxed
                             // (a TaggedVal*) — unbox to the raw LinObject* before merging, or
@@ -1078,7 +1086,31 @@ impl<'ctx> Codegen<'ctx> {
                                     }
                                 }
                             }
-                            for (key, val_temp) in fields {
+                            // For a no-spread literal the keys appended are statically
+                            // known-distinct, so we can use the no-dup-check fast append
+                            // (`lin_object_set_fresh`). But object-literal semantics are
+                            // last-wins for a repeated key (`{"x":1,"x":2}["x"] == 2`), and the
+                            // checker does NOT reject duplicate literal keys — so we must first
+                            // de-duplicate, keeping the LAST occurrence of each key. (When spreads
+                            // are present a literal field can collide with a spread-provided key,
+                            // which we cannot detect statically, so that case keeps the
+                            // dup-checking `lin_object_set`.)
+                            let use_fresh = spreads.is_empty();
+                            let last_idx: std::collections::HashMap<&String, usize> = if use_fresh {
+                                let mut m = std::collections::HashMap::new();
+                                for (i, (key, _)) in fields.iter().enumerate() {
+                                    m.insert(key, i);
+                                }
+                                m
+                            } else {
+                                std::collections::HashMap::new()
+                            };
+                            for (idx, (key, val_temp)) in fields.iter().enumerate() {
+                                // Skip earlier duplicates in the no-spread fast path so only the
+                                // last write for a key is materialised (last-wins).
+                                if use_fresh && last_idx.get(key) != Some(&idx) {
+                                    continue;
+                                }
                                 if let Some(&val) = temp_map.get(val_temp) {
                                     let key_str = self.compile_string_lit(key).into_pointer_value();
                                     let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
@@ -1091,7 +1123,8 @@ impl<'ctx> Codegen<'ctx> {
                                     } else {
                                         self.build_tagged_val_alloca(&val, &val_ty)
                                     };
-                                    self.builder.call(self.rt.object_set, &[obj_ptr.into(), key_str.into(), tagged.into()], "");
+                                    let set_fn = if use_fresh { self.rt.object_set_fresh } else { self.rt.object_set };
+                                    self.builder.call(set_fn, &[obj_ptr.into(), key_str.into(), tagged.into()], "");
                                     self.builder.call(self.rt.string_release, &[key_str.into()], "");
                                 }
                             }

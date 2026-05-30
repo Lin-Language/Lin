@@ -35,7 +35,11 @@ unsafe fn entries_layout(cap: u32) -> Layout {
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_object_alloc(initial_cap: u32) -> *mut LinObject {
-    let cap = initial_cap.max(4);
+    // Honor the caller's exact capacity hint (codegen now passes the literal's field count for
+    // the no-spread case, so a 3-field literal allocates 3 entries rather than over-allocating).
+    // Keep a minimum of 1 so the entries buffer is never a zero-size allocation (UB), and so the
+    // grow path's `cap * 2` always makes progress (an empty `{}` asks for 0 → cap 1).
+    let cap = initial_cap.max(1);
     let ptr = alloc(object_layout()) as *mut LinObject;
     (*ptr).refcount = 1;
     (*ptr).len = 0;
@@ -168,6 +172,46 @@ pub unsafe extern "C" fn lin_object_set(obj: *mut LinObject, key: *mut LinString
     let slot = (*obj).entries.add(len as usize);
     // Retain the key: the object owns one reference.
     // Caller retains their own reference and must release it separately.
+    // inc_ref is a no-op for interned literal keys (saturated refcount).
+    crate::string::lin_string_inc_ref(key);
+    (*slot).key = key;
+    std::ptr::copy_nonoverlapping(val_ref, &mut (*slot).value, 1);
+    // Retain the value's inner payload — the object now owns a reference.
+    retain_tagged_payload(val_ref);
+    (*obj).len = len + 1;
+}
+
+/// Append a field for a statically-known-distinct key, with the SAME ownership semantics as
+/// `lin_object_set`'s append branch but WITHOUT the linear dup-check scan.
+///
+/// Used only for object-literal construction (codegen `MakeObject`), where the keys appended
+/// through this path are guaranteed distinct: the codegen de-duplicates literal keys (last
+/// wins) before emitting, and this path is only used when the literal has no spreads (so a
+/// field cannot collide with a spread-provided key). For genuine dynamic `obj[k]=v`, spreads,
+/// and merges, `lin_object_set` (which dup-checks/overwrites) is still used.
+///
+/// Ownership (must stay identical to `lin_object_set`'s append branch so RC stays balanced —
+/// the IR lowering accounts for object_set RETAINING the value's inner payload):
+///   - the key is `inc_ref`'d (no-op for interned literal keys with a saturated refcount); the
+///     object owns one reference, the caller keeps and releases their own;
+///   - the 16-byte TaggedVal is copied into the slot and its inner heap payload retained, so the
+///     object owns its own reference to the value (the source box keeps its own).
+/// A null `val` pointer is treated as the null Json value (matching `lin_object_set`).
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_set_fresh(obj: *mut LinObject, key: *mut LinString, val: *const TaggedVal) {
+    use crate::tagged::TAG_NULL;
+    let null_tv = TaggedVal { tag: TAG_NULL, _pad: [0; 7], payload: 0 };
+    let val_ref: &TaggedVal = if val.is_null() { &null_tv } else { &*val };
+    let len = (*obj).len;
+    let cap = (*obj).cap;
+    if len == cap {
+        let new_cap = if cap == 0 { 1 } else { cap * 2 };
+        let old_layout = entries_layout(cap);
+        let new_layout = entries_layout(new_cap);
+        (*obj).entries = realloc((*obj).entries as *mut u8, old_layout, new_layout.size()) as *mut LinObjectEntry;
+        (*obj).cap = new_cap;
+    }
+    let slot = (*obj).entries.add(len as usize);
     // inc_ref is a no-op for interned literal keys (saturated refcount).
     crate::string::lin_string_inc_ref(key);
     (*slot).key = key;
@@ -554,5 +598,101 @@ pub unsafe extern "C" fn lin_object_copy_except(
             }
         }
         lin_object_set(dst, key, &(*entry).value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tagged::{alloc_tagged, TAG_STR, TAG_ARRAY, TAG_OBJECT, TAG_INT32};
+
+    unsafe fn mk_string(s: &str) -> *mut LinString {
+        crate::string::lin_string_from_bytes(s.as_ptr(), s.len() as u32)
+    }
+
+    unsafe fn get_tag(obj: *const LinObject, key: *const LinString) -> u8 {
+        let tv = lin_object_get(obj, key);
+        if tv.is_null() { crate::tagged::TAG_NULL } else { (*tv).tag }
+    }
+
+    // Build an object literal-style (fresh append) whose VALUES are heap types, then drop
+    // it. Under ASan this proves the new no-dup-check append retains the inner payloads
+    // exactly like lin_object_set (one balanced reference per slot) — no leak, no UAF.
+    #[test]
+    fn fresh_append_heap_values_balanced_rc() {
+        unsafe {
+            // Distinct literal keys (caller owns one ref each, as codegen does).
+            let kx = mk_string("x");
+            let ky = mk_string("y");
+            let kz = mk_string("z");
+
+            // Heap-typed values: a string, an array, a nested object. The caller box owns
+            // the +1; lin_object_set_fresh retains the inner so the object owns its own ref.
+            let sval = mk_string("hello");
+            let s_box = alloc_tagged(TAG_STR, sval as u64) as *const TaggedVal;
+
+            let arr = crate::array::lin_array_alloc(2);
+            (*arr).len = 0;
+            let a_box = alloc_tagged(TAG_ARRAY, arr as u64) as *const TaggedVal;
+
+            let inner = lin_object_alloc(0); // empty {} -> min cap honored
+            let o_box = alloc_tagged(TAG_OBJECT, inner as u64) as *const TaggedVal;
+
+            // cap exactly 3 (right-sized, no over-alloc / no min-4).
+            let obj = lin_object_alloc(3);
+            assert_eq!((*obj).cap, 3, "right-sized cap honored");
+
+            lin_object_set_fresh(obj, kx, s_box);
+            lin_object_set_fresh(obj, ky, a_box);
+            lin_object_set_fresh(obj, kz, o_box);
+
+            assert_eq!((*obj).len, 3);
+            assert_eq!((*obj).cap, 3, "no growth for exactly-sized literal");
+            assert_eq!(get_tag(obj, kx), TAG_STR);
+            assert_eq!(get_tag(obj, ky), TAG_ARRAY);
+            assert_eq!(get_tag(obj, kz), TAG_OBJECT);
+
+            // Drop the object: releases each key (no-op for any saturated) and each inner
+            // payload's owned reference.
+            lin_object_release(obj);
+
+            // The caller's own boxes still hold a live reference; release them now. If the
+            // object's release had over-released, this would be a UAF/double-free under ASan.
+            crate::tagged::lin_tagged_release(s_box as *mut u8);
+            crate::tagged::lin_tagged_release(a_box as *mut u8);
+            crate::tagged::lin_tagged_release(o_box as *mut u8);
+
+            // Free the caller's key references (object held its own inc_ref'd copies).
+            crate::string::lin_string_release(kx);
+            crate::string::lin_string_release(ky);
+            crate::string::lin_string_release(kz);
+        }
+    }
+
+    // Growth path of fresh append: starting from a 0-hint (min cap 1) object, append past
+    // capacity and confirm the realloc keeps every entry intact and RC stays balanced.
+    #[test]
+    fn fresh_append_growth() {
+        unsafe {
+            let obj = lin_object_alloc(0);
+            assert_eq!((*obj).cap, 1, "min cap 1 for empty hint (no zero-size alloc)");
+            let keys: Vec<*mut LinString> =
+                (0..5).map(|i| mk_string(&format!("k{i}"))).collect();
+            for (i, &k) in keys.iter().enumerate() {
+                let v = alloc_tagged(TAG_INT32, i as u64) as *const TaggedVal;
+                lin_object_set_fresh(obj, k, v);
+                // scalar box: lin_tagged_release no-ops, but call it for symmetry safety.
+                crate::tagged::lin_tagged_release(v as *mut u8);
+            }
+            assert_eq!((*obj).len, 5);
+            assert!((*obj).cap >= 5);
+            for (i, &k) in keys.iter().enumerate() {
+                let tv = lin_object_get(obj, k);
+                assert!(!tv.is_null());
+                assert_eq!((*tv).payload as i32, i as i32);
+            }
+            lin_object_release(obj);
+            for k in keys { crate::string::lin_string_release(k); }
+        }
     }
 }
