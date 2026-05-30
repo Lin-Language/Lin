@@ -326,9 +326,9 @@ impl Parser {
                 TokenKind::LParen if !after_block => {
                     let span = self.current_span();
                     self.advance(); // (
-                    let args = self.parse_call_args();
+                    let (args, partial) = self.parse_call_args();
                     self.expect(TokenKind::RParen);
-                    expr = Expr::Call { func: Box::new(expr), args, span };
+                    expr = Expr::Call { func: Box::new(expr), args, partial, span };
                 }
                 TokenKind::Dot => {
                     after_block = false;
@@ -336,15 +336,15 @@ impl Parser {
                     self.advance(); // .
                     self.skip_newlines();
                     let method = self.expect_ident();
-                    let args = if self.check(TokenKind::LParen) {
+                    let (args, partial) = if self.check(TokenKind::LParen) {
                         self.advance();
-                        let a = self.parse_call_args();
+                        let (a, p) = self.parse_call_args();
                         self.expect(TokenKind::RParen);
-                        Some(a)
+                        (Some(a), p)
                     } else {
-                        None
+                        (None, false)
                     };
-                    expr = Expr::DotCall { receiver: Box::new(expr), method, args, span };
+                    expr = Expr::DotCall { receiver: Box::new(expr), method, args, partial, span };
                 }
                 TokenKind::Newline => {
                     // Look ahead past newlines/indent for dot-chaining
@@ -364,23 +364,28 @@ impl Parser {
         expr
     }
 
-    pub(crate) fn parse_call_args(&mut self) -> Vec<Expr> {
+    /// Parses a call argument list. Returns the args and whether the list ended
+    /// with an explicit trailing comma (`f(x,)`), which requests partial
+    /// application rather than default-fill.
+    pub(crate) fn parse_call_args(&mut self) -> (Vec<Expr>, bool) {
         let mut args = Vec::new();
+        let mut trailing_comma = false;
         self.skip_newlines();
         if self.check(TokenKind::RParen) {
-            return args;
+            return (args, false);
         }
         args.push(self.parse_arg_expr());
         while self.check(TokenKind::Comma) {
             self.advance();
             self.skip_newlines();
             if self.check(TokenKind::RParen) {
+                trailing_comma = true;
                 break;
             }
             args.push(self.parse_arg_expr());
         }
         self.skip_newlines();
-        args
+        (args, trailing_comma)
     }
 
     pub(crate) fn parse_arg_expr(&mut self) -> Expr {

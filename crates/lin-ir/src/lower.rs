@@ -1387,7 +1387,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
 /// boxed-return ABI.
 fn lower_call_arg(a: &TypedExpr, param_ty: Option<&Type>, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     if let (TypedExpr::Function { name, params, body, ret_type, captures, .. },
-            Some(Type::Function { params: cb_params, ret: cb_ret })) = (a, param_ty)
+            Some(Type::Function { params: cb_params, ret: cb_ret, .. })) = (a, param_ty)
     {
         // Only force a concrete return when the callback's params are ALSO concrete. If any
         // param is union/Json (TypeVar), the AST closure-call convention
@@ -1598,7 +1598,7 @@ fn iter_elem_type(iterable_ty: &Type) -> Type {
 /// statically-known `Function` type. Used to match the closure's compiled ABI when calling it.
 fn callback_signature(expr: &TypedExpr) -> (Vec<Type>, Type) {
     match expr.ty() {
-        Type::Function { params, ret } => (params, *ret),
+        Type::Function { params, ret, .. } => (params, *ret),
         _ => (vec![], Type::TypeVar(u32::MAX)),
     }
 }
@@ -2785,6 +2785,7 @@ fn lower_function_expr_with_id(
     let closure_ty = Type::Function {
         params: params.iter().map(|p| p.ty.clone()).collect(),
         ret: Box::new(ret_type.clone()),
+        required: params.iter().filter(|p| p.default.is_none()).count(),
     };
     let dst = builder.alloc_temp(closure_ty.clone());
     builder.emit(Instruction::MakeClosure {

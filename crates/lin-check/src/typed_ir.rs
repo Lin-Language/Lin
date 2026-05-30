@@ -121,6 +121,10 @@ pub enum TypedExpr {
         args: Vec<TypedExpr>,
         result_type: Type,
         is_tail: bool,
+        /// True when this call is an explicit partial application (`f(x,)`).
+        /// When false and fewer args than the callee's arity are supplied, the
+        /// missing trailing arguments are filled from their defaults.
+        partial: bool,
         span: Span,
     },
     If {
@@ -218,6 +222,7 @@ impl TypedExpr {
             } => Type::Function {
                 params: params.iter().map(|p| p.ty.clone()).collect(),
                 ret: Box::new(ret_type.clone()),
+                required: params.iter().filter(|p| p.default.is_none()).count(),
             },
             TypedExpr::MakeObject { ty, .. } => ty.clone(),
             TypedExpr::MakeArray { ty, .. } => ty.clone(),
@@ -264,6 +269,10 @@ pub struct TypedParam {
     pub slot: usize,
     pub name: String,
     pub ty: Type,
+    /// Default value expression, type-checked against `ty`. Present only for
+    /// optional (trailing) parameters. Lowered by the defining module into
+    /// per-arity adapter functions.
+    pub default: Option<Box<TypedExpr>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

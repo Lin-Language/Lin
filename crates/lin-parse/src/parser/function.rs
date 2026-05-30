@@ -53,18 +53,19 @@ impl Parser {
                 let dot_span = self.current_span();
                 self.advance();
                 let method = self.expect_ident();
-                let call_args = if self.check(TokenKind::LParen) {
+                let (call_args, partial) = if self.check(TokenKind::LParen) {
                     self.advance();
-                    let a = self.parse_call_args();
+                    let (a, p) = self.parse_call_args();
                     self.expect(TokenKind::RParen);
-                    Some(a)
+                    (Some(a), p)
                 } else {
-                    None
+                    (None, false)
                 };
                 return Expr::DotCall {
                     receiver: Box::new(Expr::TupleArgs(args, span)),
                     method,
                     args: call_args,
+                    partial,
                     span: dot_span,
                 };
             }
@@ -80,18 +81,19 @@ impl Parser {
             self.advance();
             self.skip_newlines();
             let method = self.expect_ident();
-            let call_args = if self.check(TokenKind::LParen) {
+            let (call_args, partial) = if self.check(TokenKind::LParen) {
                 self.advance();
-                let a = self.parse_call_args();
+                let (a, p) = self.parse_call_args();
                 self.expect(TokenKind::RParen);
-                Some(a)
+                (Some(a), p)
             } else {
-                None
+                (None, false)
             };
             return Expr::DotCall {
                 receiver: Box::new(first),
                 method,
                 args: call_args,
+                partial,
                 span: dot_span,
             };
         }
@@ -121,6 +123,7 @@ impl Parser {
         let param = Param {
             pattern: Pattern::Ident(name, span),
             type_ann: None,
+            default: None,
         };
         self.expect(TokenKind::Arrow);
         self.skip_newlines();
@@ -257,6 +260,15 @@ impl Parser {
         } else {
             None
         };
-        Param { pattern, type_ann }
+        // Default value: `name: Type = expr` (or `name = expr`). Guard against `==`
+        // so a malformed comparison isn't silently consumed as a default.
+        let default = if self.check(TokenKind::Eq) && !self.check_ahead(TokenKind::Eq, 1) {
+            self.advance(); // =
+            self.skip_newlines();
+            Some(Box::new(self.parse_arg_expr()))
+        } else {
+            None
+        };
+        Param { pattern, type_ann, default }
     }
 }

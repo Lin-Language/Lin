@@ -7,8 +7,8 @@ val add = (a: Int32, b: Int32): Int32 =>
 val result = add(1, 2)
 print(toString(result))
 
-// Partial application
-val addTen = add(10)
+// Partial application (trailing comma requests currying)
+val addTen = add(10,)
 val fifteen = addTen(5)
 print(toString(fifteen))
 

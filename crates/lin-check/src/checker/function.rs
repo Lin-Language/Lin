@@ -25,6 +25,9 @@ impl Checker {
         let mut typed_params = Vec::new();
         // Destructuring stmts for params with non-Ident patterns (e.g. `{ name, age }: Json`).
         let mut param_destr_stmts: Vec<TypedStmt> = Vec::new();
+        // Tracks whether a preceding parameter carried a default — once one does, every
+        // following parameter must too (optional params must be last).
+        let mut seen_default = false;
 
         for (i, param) in params.iter().enumerate() {
             let ty = if let Some(ref type_ann) = param.type_ann {
@@ -38,11 +41,36 @@ impl Checker {
                 _ => (format!("__param_{}", i), None),
             };
 
+            // Type-check the default value (if any) before defining this parameter's
+            // slot, so it may reference earlier parameters but not itself. Enforce the
+            // optional-last rule: a required parameter may not follow an optional one.
+            let typed_default = match &param.default {
+                Some(default_expr) => {
+                    let typed = self.check_expr(default_expr, &ty)?;
+                    seen_default = true;
+                    Some(Box::new(typed))
+                }
+                None => {
+                    if seen_default {
+                        let dspan = name_span.unwrap_or(span);
+                        return Err(Diagnostic::error(
+                            dspan,
+                            format!(
+                                "required parameter '{}' cannot follow a parameter with a default value",
+                                name
+                            ),
+                        ).with_help("give this parameter a default too, or move it before the optional parameters".to_string()));
+                    }
+                    None
+                }
+            };
+
             let slot = self.env.define_at(name.clone(), ty.clone(), false, name_span);
             typed_params.push(TypedParam {
                 slot,
                 name,
                 ty: ty.clone(),
+                default: typed_default,
             });
 
             // For destructuring patterns, emit a synthetic Destructure stmt into the body.
@@ -155,6 +183,7 @@ impl Checker {
 
         let mut typed_params = Vec::new();
         let mut param_destr_stmts: Vec<TypedStmt> = Vec::new();
+        let mut seen_default = false;
         for (i, param) in params.iter().enumerate() {
             // Use the declared annotation if present; otherwise use the hint from expected_params.
             let ty = if let Some(ref type_ann) = param.type_ann {
@@ -170,8 +199,30 @@ impl Checker {
                 _ => format!("__param_{}", i),
             };
 
+            // Type-check the default before defining this param's slot (earlier params
+            // are in scope; self-reference is not). Enforce optional-last.
+            let typed_default = match &param.default {
+                Some(default_expr) => {
+                    let typed = self.check_expr(default_expr, &ty)?;
+                    seen_default = true;
+                    Some(Box::new(typed))
+                }
+                None => {
+                    if seen_default {
+                        return Err(Diagnostic::error(
+                            span,
+                            format!(
+                                "required parameter '{}' cannot follow a parameter with a default value",
+                                name
+                            ),
+                        ).with_help("give this parameter a default too, or move it before the optional parameters".to_string()));
+                    }
+                    None
+                }
+            };
+
             let slot = self.env.define(name.clone(), ty.clone(), false);
-            typed_params.push(TypedParam { slot, name, ty: ty.clone() });
+            typed_params.push(TypedParam { slot, name, ty: ty.clone(), default: typed_default });
 
             if let Pattern::Object(fields, obj_rest, _) = &param.pattern {
                 let obj_slot = typed_params.last().unwrap().slot;

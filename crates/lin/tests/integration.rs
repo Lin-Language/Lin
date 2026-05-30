@@ -197,7 +197,7 @@ fn test_functions_and_partial_application() {
 import { toString } from "std/string"
 
 val add = (a: Int32, b: Int32): Int32 => a + b
-val addTen = add(10)
+val addTen = add(10,)
 print(toString(addTen(5)))
 print(toString(add(3, 4)))
 "#);
@@ -1020,8 +1020,8 @@ fn test_partial_application_chain() {
 import { toString } from "std/string"
 
 val add3 = (a: Int32, b: Int32, c: Int32): Int32 => a + b + c
-val step1 = add3(1)
-val step2 = step1(2)
+val step1 = add3(1,)
+val step2 = step1(2,)
 val result = step2(3)
 print(toString(result))
 "#);

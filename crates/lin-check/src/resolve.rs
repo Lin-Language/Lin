@@ -37,10 +37,9 @@ fn resolve_type_inner(
             let param_types: Result<Vec<Type>, String> =
                 params.iter().map(|p| resolve_type_inner(p, env, visiting)).collect();
             let ret_type = resolve_type_inner(ret, env, visiting)?;
-            Ok(Type::Function {
-                params: param_types?,
-                ret: Box::new(ret_type),
-            })
+            // Type annotations cannot express default arguments, so every declared
+            // parameter is required.
+            Ok(Type::func(param_types?, ret_type))
         }
         TypeExpr::Object(fields, _span) => {
             let mut resolved = IndexMap::new();
@@ -80,10 +79,10 @@ fn resolve_named_cycle(
         "Json" => Ok(json_type()),
         // Function is an opaque type annotation — any arity is acceptable.
         // Params and ret use TypeVar(u32::MAX) so compat check treats it as accepting any function.
-        "Function" => Ok(Type::Function {
-            params: vec![Type::TypeVar(u32::MAX)],
-            ret: Box::new(Type::TypeVar(u32::MAX)),
-        }),
+        "Function" => Ok(Type::func(
+            vec![Type::TypeVar(u32::MAX)],
+            Type::TypeVar(u32::MAX),
+        )),
         // Iterator without type argument: use Json wildcard element type
         "Iterator" => Ok(Type::Iterator(Box::new(json_type()))),
         _ => {
@@ -135,9 +134,10 @@ fn expand_named_body(
             }
             Ok(Type::Object(out))
         }
-        Type::Function { params, ret } => Ok(Type::Function {
+        Type::Function { params, ret, required } => Ok(Type::Function {
             params: params.iter().map(|p| expand_named_body(p, env, visiting)).collect::<Result<_, _>>()?,
             ret: Box::new(expand_named_body(ret, env, visiting)?),
+            required: *required,
         }),
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(expand_named_body(inner, env, visiting)?))),
         other => Ok(other.clone()),
@@ -212,12 +212,14 @@ fn substitute(
         Type::Function {
             params: fn_params,
             ret,
+            required,
         } => Ok(Type::Function {
             params: fn_params
                 .iter()
                 .map(|t| substitute(t, params, args, env, visiting))
                 .collect::<Result<_, _>>()?,
             ret: Box::new(substitute(ret, params, args, env, visiting)?),
+            required: *required,
         }),
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(substitute(inner, params, args, env, visiting)?))),
         _ => Ok(ty.clone()),

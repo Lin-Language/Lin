@@ -17,7 +17,7 @@ pub(crate) fn collect_type_subs(pattern: &Type, actual: &Type, subs: &mut std::c
         (Type::Union(pts), actual) => {
             for pt in pts { collect_type_subs(pt, actual, subs); }
         }
-        (Type::Function { params: pp, ret: pr }, Type::Function { params: ap, ret: ar }) => {
+        (Type::Function { params: pp, ret: pr, .. }, Type::Function { params: ap, ret: ar, .. }) => {
             for (p, a) in pp.iter().zip(ap.iter()) { collect_type_subs(p, a, subs); }
             collect_type_subs(pr, ar, subs);
         }
@@ -32,9 +32,10 @@ pub(crate) fn apply_type_subs(ty: &Type, subs: &std::collections::HashMap<u32, T
         Type::Array(t) => Type::Array(Box::new(apply_type_subs(t, subs))),
         Type::Iterator(t) => Type::Iterator(Box::new(apply_type_subs(t, subs))),
         Type::Union(ts) => Type::Union(ts.iter().map(|t| apply_type_subs(t, subs)).collect()),
-        Type::Function { params, ret } => Type::Function {
+        Type::Function { params, ret, required } => Type::Function {
             params: params.iter().map(|p| apply_type_subs(p, subs)).collect(),
             ret: Box::new(apply_type_subs(ret, subs)),
+            required: *required,
         },
         _ => ty.clone(),
     }
@@ -84,7 +85,7 @@ pub(crate) fn is_legal_ffi_value_type(ty: &Type) -> bool {
 /// The binding must be a function type whose params and return are legal value types.
 pub(crate) fn is_legal_ffi_type(ty: &Type) -> bool {
     match ty {
-        Type::Function { params, ret } => {
+        Type::Function { params, ret, .. } => {
             params.iter().all(is_legal_ffi_value_type) && is_legal_ffi_value_type(ret)
         }
         _ => false,

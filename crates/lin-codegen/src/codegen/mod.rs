@@ -746,7 +746,7 @@ impl<'ctx> Codegen<'ctx> {
                             // and a Function result type ⇒ build a partial-application closure.
                             let partial_app = |s: &mut Self, callee_fn: FunctionValue<'ctx>| -> Option<BasicValueEnum<'ctx>> {
                                 if (arg_vals.len() as u32) < callee_fn.count_params() {
-                                    if let Type::Function { params: remaining, ret: final_ret } = ret_ty {
+                                    if let Type::Function { params: remaining, ret: final_ret, .. } = ret_ty {
                                         let vals: Vec<BasicValueEnum> = arg_vals.iter().map(|a| match a {
                                             BasicMetadataValueEnum::IntValue(v) => (*v).into(),
                                             BasicMetadataValueEnum::FloatValue(v) => (*v).into(),
