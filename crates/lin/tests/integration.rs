@@ -1158,6 +1158,39 @@ print(toString(scale(5, 3)))
 }
 
 #[test]
+fn test_imported_fn_uses_module_level_val() {
+    // Regression: a top-level non-function `val` referenced inside an EXPORTED function
+    // mis-lowered in the import path (lower_import_module never registered the val, so the
+    // reference resolved to an unmaterialised temp → codegen panic "undefined rhs temp").
+    // Covers: float val, string val, a val referencing another val, and a val used in
+    // multiple exported functions — all read through their `__val` wrappers.
+    let dir = std::env::temp_dir().join(format!("lin_modval_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "val K = 0.1\n\
+         val GREETING = \"Hi, \"\n\
+         val BASE = 10\n\
+         val DOUBLE = BASE * 2\n\
+         export val f = (x: Float64): Float64 =>\n  \
+           if x == 1.0 then x + K\n  \
+           else x\n\
+         export val greet = (name: String): String => \"${GREETING}${name}\"\n\
+         export val addBase = (x: Int32): Int32 => x + BASE\n\
+         export val addDouble = (x: Int32): Int32 => x + DOUBLE\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ f, greet, addBase, addDouble }} from "{}/lib"
+print(toString(f(1.0)))
+print(greet("World"))
+print(toString(addBase(5)))
+print(toString(addDouble(5)))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["1.1", "Hi, World", "15", "25"]);
+}
+
+#[test]
 fn test_default_args_trailing_comma_still_curries() {
     // A trailing comma requests partial application even when defaults exist,
     // rather than filling the default.
@@ -3288,4 +3321,78 @@ range(0, 5).for(i => last = { "n": i })
 print(toString(last))
 "#);
     assert_eq!(out, vec![r#"{"n": 4}"#]);
+}
+
+#[test]
+fn test_flat_array_arg_used_twice_no_double_free() {
+    // Regression: a flat scalar array (Float64[]) passed in two argument positions, or two
+    // separate flat-array literals, must not be released more times than it was retained.
+    // The callee `dot` reads each heap parameter twice (`a[0]`, `a[1]`); each read lowered to
+    // a Retain + a scope-exit Release. The RC-elision pass paired BOTH Retains to the SAME
+    // first Release (a HashSet deduped the second elision), eliding two Retains but only one
+    // Release — leaving one extra Release and a heap-use-after-free in lin_array_release. The
+    // functional guard here (prints 25.0 instead of crashing) catches it deterministically;
+    // the ASan CI leg surfaces the underlying UAF.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val dot = (a: Float64[], b: Float64[]): Float64 => a[0] * b[0] + a[1] * b[1]
+val v: Float64[] = [3.0, 4.0]
+print(toString(dot(v, v)))
+"#);
+    assert_eq!(out, vec!["25.0"]);
+
+    // Two separate flat-array literals exercise the same balance (each callee param read twice,
+    // distinct caller-owned allocations).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val dot = (a: Float64[], b: Float64[]): Float64 => a[0] * b[0] + a[1] * b[1]
+print(toString(dot([3.0, 4.0], [3.0, 4.0])))
+"#);
+    assert_eq!(out, vec!["25.0"]);
+
+    // A single flat-array argument whose parameter is read more than once is the minimal form
+    // of the same bug (one alloc, callee consumes one extra reference).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val sum2 = (a: Float64[]): Float64 => a[0] + a[1]
+val v: Float64[] = [3.0, 4.0]
+print(toString(sum2(v)))
+"#);
+    assert_eq!(out, vec!["7.0"]);
+}
+
+#[test]
+fn test_match_binding_pattern_matches_and_unboxes() {
+    // Two bugs in `is <binding>` match arms:
+    // (1) the binding was bound to the BOXED scrutinee pointer, so a concrete binding
+    //     (`is n` where n: Int32) used in a guard reinterpreted the pointer as the scalar
+    //     (`ptrtoint`) — `when n > 5` compared a heap address (always true).
+    // (2) the binding pattern was lowered as a type-CHECK (IsType against the binding's
+    //     declared type), so `match req["path"] is p when ...` never matched a concrete
+    //     value inside a Json scrutinee. A binding is a named catch-all: it always matches.
+    let out = run(r#"import { print } from "std/io"
+val f = (x: Int32): String =>
+  match x
+    is n when n > 5 => "big"
+    is m when m > 0 => "pos"
+    else => "other"
+print(f(10))
+print(f(3))
+print(f(0 - 1))
+"#);
+    assert_eq!(out, vec!["big", "pos", "other"]);
+
+    // A binding over a Json scrutinee mixed with a literal arm: the binding must match
+    // unconditionally (it was lowered as a type-check that failed for a concrete value
+    // inside a Json scrutinee, so the literal-or-else path was taken instead).
+    // `examples/web-server/router.test.lin` exercises the full guarded router shape.
+    let out = run(r#"import { print } from "std/io"
+val classify = (req: Json): String =>
+  match req["kind"]
+    is "a" => "is-a"
+    is other => "bound-other"
+print(classify({ "kind": "a" }))
+print(classify({ "kind": "z" }))
+"#);
+    assert_eq!(out, vec!["is-a", "bound-other"]);
 }

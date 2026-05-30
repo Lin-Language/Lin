@@ -69,14 +69,31 @@ fn elide_rc_fn(func: &mut LinFunction) {
             }
 
             // --- same-block search ---
+            // Pair with the first Release of `temp` that has NOT already been claimed by an
+            // earlier Retain. Retain/Release elision must be ONE-TO-ONE: when a temp is
+            // retained N times and released N times in the same block (e.g. a heap parameter
+            // read N>1 times — each read emits a Retain and registers a scope-exit Release),
+            // every Retain pairing to the SAME first Release would elide N Retains but, since
+            // `to_remove` is a set, only ONE Release — leaving N-1 unbalanced Releases and an
+            // over-release (use-after-free). Skipping already-claimed Releases keeps the
+            // pairing balanced.
             if let Some(release_idx) =
-                find_paired_release_in_block(*retain_val, retain_idx, &instrs)
+                find_paired_release_in_block(*retain_val, retain_idx, &instrs, |i| {
+                    to_remove.contains(&(block_idx, i))
+                })
             {
                 if path_has_no_interference(*retain_val, retain_idx, release_idx, &instrs) {
                     to_remove.insert((block_idx, retain_idx));
                     to_remove.insert((block_idx, release_idx));
                 }
                 // Found a same-block Release (clean or not) — do not also do cross-block BFS.
+                continue;
+            }
+            // No UNCLAIMED Release found. If the block nonetheless contains a Release of the
+            // temp (already claimed by an earlier Retain), this Retain is matched in-block too:
+            // leave it as-is (it stays) and do NOT fall through to the cross-block search, which
+            // would mis-pair it with a Release in a successor block.
+            if find_paired_release_in_block(*retain_val, retain_idx, &instrs, |_| false).is_some() {
                 continue;
             }
 
@@ -101,6 +118,7 @@ fn elide_rc_fn(func: &mut LinFunction) {
                 block_idx,
                 func,
                 &block_index,
+                &to_remove,
             ) {
                 // The release block's prefix (before the Release) must also be clean.
                 let prefix_clean = path_has_no_interference(
@@ -157,9 +175,13 @@ fn find_paired_release_in_block(
     temp: Temp,
     retain_idx: usize,
     instrs: &[Instruction],
+    is_claimed: impl Fn(usize) -> bool,
 ) -> Option<usize> {
     for i in (retain_idx + 1)..instrs.len() {
         match &instrs[i] {
+            // Skip a Release already claimed (paired+elided) by an earlier Retain so each
+            // Release matches at most one Retain (one-to-one elision).
+            Instruction::Release { val, .. } if *val == temp && is_claimed(i) => continue,
             Instruction::Release { val, .. } if *val == temp => return Some(i),
             other => {
                 let (_uses, defs) = crate::liveness::instr_use_def(other);
@@ -207,6 +229,7 @@ fn find_paired_release_cross_block(
     origin_block_idx: usize,
     func: &LinFunction,
     block_index: &HashMap<BlockId, usize>,
+    claimed: &HashSet<(usize, usize)>,
 ) -> Option<(usize, usize)> {
     let origin_block = &func.blocks[origin_block_idx];
 
@@ -235,8 +258,12 @@ fn find_paired_release_cross_block(
         let Some(&idx) = block_index.get(&bid) else { continue };
         let block = &func.blocks[idx];
 
-        // Check whether this block contains the Release.
-        if let Some(release_pos) = find_release_at_block_start(temp, block) {
+        // Check whether this block contains an UNCLAIMED Release (one not already paired with
+        // an earlier Retain). Skipping claimed Releases keeps elision one-to-one across blocks,
+        // matching the same-block rule.
+        if let Some(release_pos) =
+            find_release_at_block_start(temp, block, |i| claimed.contains(&(idx, i)))
+        {
             // Found the Release. Check that the prefix of this block (before the
             // Release) is clean (using the sentinel usize::MAX to mean "from 0").
             return Some((idx, release_pos));
@@ -267,9 +294,14 @@ fn find_paired_release_cross_block(
 
 /// Find the index of the first Release for `temp` in `block`.
 /// Returns `None` if not found, or if a redefinition appears before the Release.
-fn find_release_at_block_start(temp: Temp, block: &BasicBlock) -> Option<usize> {
+fn find_release_at_block_start(
+    temp: Temp,
+    block: &BasicBlock,
+    is_claimed: impl Fn(usize) -> bool,
+) -> Option<usize> {
     for (i, instr) in block.instructions.iter().enumerate() {
         match instr {
+            Instruction::Release { val, .. } if *val == temp && is_claimed(i) => continue,
             Instruction::Release { val, .. } if *val == temp => return Some(i),
             other => {
                 let (_uses, defs) = crate::liveness::instr_use_def(other);
@@ -524,6 +556,34 @@ mod tests {
         assert!(
             !remaining.iter().any(|i| matches!(i, Instruction::Release { .. })),
             "Release should be elided"
+        );
+    }
+
+    /// Two Retains and two Releases of the same temp in one block (e.g. a heap parameter read
+    /// twice) must elide ONE-TO-ONE: exactly one Retain/Release pair removed, one of each kept.
+    /// Regression for the flat-array-arg-used-twice use-after-free, where both Retains paired to
+    /// the first Release — eliding two Retains but (set-deduped) only one Release, leaving an
+    /// unbalanced extra Release.
+    #[test]
+    fn elides_one_to_one_for_double_retain_double_release() {
+        // Retain(t0), Copy, Retain(t0), Copy, Release(t0), Release(t0) — net balanced.
+        let instrs = vec![
+            Instruction::Retain { val: Temp(0), ty: Type::Str },
+            Instruction::Copy { dst: Temp(1), src: Temp(0) },
+            Instruction::Retain { val: Temp(0), ty: Type::Str },
+            Instruction::Copy { dst: Temp(2), src: Temp(0) },
+            Instruction::Release { val: Temp(0), ty: Type::Str },
+            Instruction::Release { val: Temp(0), ty: Type::Str },
+        ];
+        let mut module = make_module(make_fn(FuncId(0), instrs));
+        elide_rc(&mut module);
+        let remaining = &module.functions[0].blocks[0].instructions;
+        let retains = remaining.iter().filter(|i| matches!(i, Instruction::Retain { .. })).count();
+        let releases = remaining.iter().filter(|i| matches!(i, Instruction::Release { .. })).count();
+        // Balance must be preserved: equal counts of Retain and Release survive.
+        assert_eq!(
+            retains, releases,
+            "retain/release counts must stay balanced (got {retains} retains, {releases} releases)"
         );
     }
 
