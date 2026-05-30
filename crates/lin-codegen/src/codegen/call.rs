@@ -307,21 +307,6 @@ impl<'ctx> Codegen<'ctx> {
         cls_ptr.into()
     }
 
-    /// Call a thunk closure value `(env) -> ptr` (closures use the uniform boxed ABI).
-    /// Returns the boxed Json result. Used by the async intrinsics on the IR path.
-    pub(crate) fn call_thunk_value(&mut self, thunk: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
-        let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        if !thunk.is_pointer_value() { return ptr_ty.const_null().into(); }
-        let cls_ptr = thunk.into_pointer_value();
-        let cls_ty = self.closure_struct_type();
-        let fn_field = self.builder.struct_gep(cls_ty, cls_ptr, 2, "thunk_fn_f");
-        let fn_ptr = self.builder.load(ptr_ty, fn_field, "thunk_fn").into_pointer_value();
-        let env_field = self.builder.struct_gep(cls_ty, cls_ptr, 3, "thunk_env_f");
-        let env_ptr = self.builder.load(ptr_ty, env_field, "thunk_env");
-        let fn_ty = ptr_ty.fn_type(&[ptr_ty.into()], false);
-        self.builder.indirect_call(fn_ty, fn_ptr, &[env_ptr.into()], "thunk_res").try_as_basic_value().unwrap_basic()
-    }
-
     /// Make a closure struct {i32 rc=1, i32 _pad, fn_ptr, env_ptr} with optional captured env.
     pub(crate) fn make_closure_struct(&mut self, fn_ptr: BasicValueEnum<'ctx>, captures: &[BasicValueEnum<'ctx>]) -> BasicValueEnum<'ctx> {
         self.make_closure_struct_desc_caps(fn_ptr, captures, None, None)
