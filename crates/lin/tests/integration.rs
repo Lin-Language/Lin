@@ -1261,6 +1261,29 @@ print(toString(result))
 }
 
 #[test]
+fn test_val_bound_multiline_chain_in_fn_body() {
+    // Regression: a `val`-bound multi-line dot-chain INSIDE a function body used to
+    // misparse. The `.map` continuation line is indented deeper than the `val`, so the
+    // lexer emitted an INDENT that the postfix loop consumed to continue the chain,
+    // leaving the enclosing inline-block's INDENT/DEDENT accounting unbalanced — the
+    // `val ys` and trailing `ys` were misattributed (→ "Undefined variable 'ys'").
+    // Fix: the lexer suppresses INDENT/DEDENT for a line beginning with `.method`,
+    // mirroring its `&&`/`||` continuation handling. (block/dot-chain indent-balance bug)
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter } from "std/array"
+
+val f = (xs: Json): Json =>
+  val ys = xs
+    .map(x => x + 1)
+    .filter(x => x > 2)
+  ys
+print(toString(f([1, 2, 3])))
+"#);
+    assert_eq!(output, vec!["[3, 4]"]);
+}
+
+#[test]
 fn test_match_with_block_body() {
     let output = run(r#"import { print } from "std/io"
 

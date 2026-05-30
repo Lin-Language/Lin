@@ -158,6 +158,16 @@ impl Lexer {
         if ch == '|' && self.peek_at(1) == Some('|') {
             return;
         }
+        // A line beginning with `.method` is a dot-chain continuation of the previous
+        // expression, not a new block (spec §3.2; mirrors the `&&`/`||` suppression above
+        // and ADR-006/013). Suppressing INDENT/DEDENT here keeps the enclosing block's
+        // indentation accounting balanced when the chain is bound to a `val` inside a
+        // function body (the postfix loop still chains via skip_newlines_and_indent).
+        // Restricted to `.` followed by an identifier char so the range/spread `...`
+        // token is unaffected.
+        if ch == '.' && self.peek_at(1).is_some_and(|c| c.is_alphabetic() || c == '_') {
+            return;
+        }
 
         let current = *self.indent_stack.last().unwrap();
         if indent > current {
