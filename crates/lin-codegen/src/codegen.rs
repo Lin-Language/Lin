@@ -1862,8 +1862,11 @@ impl<'ctx> Codegen<'ctx> {
                             pending_phis.push((phi, incomings.clone()));
                         }
                         Instruction::Binary { dst, op, lhs, rhs, operand_ty, ty } => {
-                            let lv = temp_map.get(lhs).copied().unwrap_or_else(|| ptr_ty.const_null().into());
-                            let rv = temp_map.get(rhs).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                            // A missing operand temp means malformed IR (an undefined SSA temp) —
+                            // the old null-pointer fallback silently miscompiled to garbage
+                            // arithmetic. Fail loudly with the offending temp instead.
+                            let lv = *temp_map.get(lhs).unwrap_or_else(|| panic!("Binary: undefined lhs temp {lhs:?}"));
+                            let rv = *temp_map.get(rhs).unwrap_or_else(|| panic!("Binary: undefined rhs temp {rhs:?}"));
                             let rty = func.temp_types.get(rhs).cloned().unwrap_or(Type::Null);
                             let result = self.compile_binary_op_values(lv, rv, op, operand_ty, &rty, ty);
                             temp_map.insert(*dst, result);
@@ -2363,7 +2366,9 @@ impl<'ctx> Codegen<'ctx> {
                         self.builder.build_unconditional_branch(target_bb).unwrap();
                     }
                     Terminator::CondJump { cond, then_block, else_block } => {
-                        let cond_val = temp_map.get(cond).copied().unwrap_or_else(|| self.context.bool_type().const_zero().into());
+                        // A missing condition temp means malformed IR — the old `const_zero`
+                        // fallback silently took the else branch unconditionally. Fail loudly.
+                        let cond_val = *temp_map.get(cond).unwrap_or_else(|| panic!("CondJump: undefined cond temp {cond:?}"));
                         let cond_i1 = if cond_val.get_type() == self.context.bool_type().into() {
                             cond_val.into_int_value()
                         } else {
