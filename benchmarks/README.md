@@ -62,10 +62,31 @@ changed.
 | `array_pipeline.lin` | `map`/`filter`/`reduce` over a large range: indirect closure calls, Int32 box/unbox through the `Json` element slot, RC on intermediate arrays, allocation. |
 | `object_access.lin` | Object construction + the O(n) linear-scan field lookup in `lin_object`; chained field reads multiply the scan. |
 | `string_build.lin` | String allocation with no small-string optimisation, interpolation/concat, string RC. |
+| `async_await.lin` | `async`/`await` spawn-per-call overhead: OS thread spawn + env deep-copy (Option C) + join, per round-trip. Trivial thunk, so time is the thread machinery (mostly `sys`). |
+| `parallel_speedup.lin` | Real parallel throughput: 8 CPU-bound chunks via `parallel`. Wall-clock should approach one chunk while `user` CPU stays ~8x — measures overlap, not just spawn cost. |
+| `thread_pool.lin` | `ThreadPool` enqueue + dispatch + result collection for many short tasks on a bounded pool (queue contention among workers), vs async's spawn-per-call. |
+| `shared_lock.lin` | `Shared<T>` `RwLock` acquire/release + copy-in/out under real cross-thread write contention (8 threads × many `withLock` RMWs on one box). |
+| `worker_roundtrip.lin` | `Worker` request/reply: mailbox send + handler dispatch + oneshot reply, per blocking `request`, over a long-lived worker thread. |
 
 These map to the performance findings in the project's perf review (RC traffic,
-boxing at polymorphic boundaries, O(n) object field access, no SSO). When adding
-an optimisation, add or extend a benchmark that targets it.
+boxing at polymorphic boundaries, O(n) object field access, no SSO) plus the
+concurrency cost model (ADR-043/044/045: copy-by-default transfer, atomic
+`Shared` box + lock, immortal `Frozen` reads). When adding an optimisation, add
+or extend a benchmark that targets it.
+
+### Reading the concurrency benchmarks
+
+The async/threading benchmarks measure different costs, so compare each against
+itself across changes, not against one another:
+
+- `async_await` / `worker_roundtrip` are **latency** benchmarks — per-operation
+  round-trip cost (thread spawn, mailbox round-trip). Most of the time is `sys`
+  (syscalls / scheduling), so they're noisier than the CPU-bound benchmarks.
+- `parallel_speedup` is a **throughput** benchmark — its wall-clock depends on
+  core count. On a busy or low-core machine the speedup shrinks; check `user`
+  time stays ~Nx wall-clock to confirm the chunks actually overlapped.
+- `thread_pool` / `shared_lock` mix dispatch/lock overhead with light work; they
+  surface queue and lock contention.
 
 ## Caveats
 
