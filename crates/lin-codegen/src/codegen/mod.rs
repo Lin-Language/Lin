@@ -17,7 +17,9 @@ use lin_check::typed_ir::*;
 use lin_check::types::Type;
 use lin_ir::ir as lir;
 use crate::coverage::{self, CoverageEmitter};
+use runtime::RuntimeFns;
 
+mod runtime;
 mod types;
 mod boxing;
 mod literals;
@@ -32,51 +34,8 @@ pub struct Codegen<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
     builder: Builder<'ctx>,
-    // Runtime function declarations
-    rt_string_from_bytes: FunctionValue<'ctx>,
-    rt_string_length: FunctionValue<'ctx>,
-    rt_string_eq: FunctionValue<'ctx>,
-    rt_print: FunctionValue<'ctx>,
-    rt_panic: FunctionValue<'ctx>,
-    rt_array_alloc: FunctionValue<'ctx>,
-    rt_array_push: FunctionValue<'ctx>,
-    rt_array_get: FunctionValue<'ctx>,
-    rt_int_to_string: FunctionValue<'ctx>,
-    rt_float_to_string: FunctionValue<'ctx>,
-    rt_bool_to_string: FunctionValue<'ctx>,
-    rt_null_to_string: FunctionValue<'ctx>,
-    rt_alloc: FunctionValue<'ctx>,
-    // Tagged union boxing/unboxing runtime functions
-    rt_box_null: FunctionValue<'ctx>,
-    rt_box_bool: FunctionValue<'ctx>,
-    rt_box_int32: FunctionValue<'ctx>,
-    rt_box_int64: FunctionValue<'ctx>,
-    rt_box_float64: FunctionValue<'ctx>,
-    rt_box_str: FunctionValue<'ctx>,
-    rt_box_object: FunctionValue<'ctx>,
-    rt_box_array: FunctionValue<'ctx>,
-    rt_box_function: FunctionValue<'ctx>,
-    rt_get_tag: FunctionValue<'ctx>,
-    rt_unbox_int32: FunctionValue<'ctx>,
-    rt_unbox_int64: FunctionValue<'ctx>,
-    rt_unbox_float64: FunctionValue<'ctx>,
-    rt_unbox_bool: FunctionValue<'ctx>,
-    rt_unbox_ptr: FunctionValue<'ctx>,
-    // Dynamic object runtime functions
-    rt_object_alloc: FunctionValue<'ctx>,
-    rt_object_set: FunctionValue<'ctx>,
-    rt_object_get: FunctionValue<'ctx>,
-    rt_object_eq: FunctionValue<'ctx>,
-    rt_tagged_to_string: FunctionValue<'ctx>,
-    // Single-allocation multi-part string build
-    // Retain function (increment refcount)
-    rt_rc_retain: FunctionValue<'ctx>,
-    // Release functions (decrement refcount, free if zero)
-    rt_string_release: FunctionValue<'ctx>,
-    rt_array_release: FunctionValue<'ctx>,
-    rt_object_release: FunctionValue<'ctx>,
-    rt_closure_release: FunctionValue<'ctx>,
-    rt_tagged_release: FunctionValue<'ctx>,
+    /// Process-wide `lin-runtime` C-ABI function declarations (see `runtime.rs`).
+    rt: RuntimeFns<'ctx>,
     // Cached LLVM types
     string_ptr_type: inkwell::types::PointerType<'ctx>,
     array_ptr_type: inkwell::types::PointerType<'ctx>,
@@ -120,167 +79,15 @@ impl<'ctx> Codegen<'ctx> {
         // Opaque pointer for string (ptr to LinString struct in runtime)
         let string_ptr_type = context.ptr_type(AddressSpace::default());
         let array_ptr_type = context.ptr_type(AddressSpace::default());
-        let ptr_type = context.ptr_type(AddressSpace::default());
 
-        // Declare runtime functions (C ABI, defined in lin-runtime)
-        let i32_type = context.i32_type();
-        let i64_type = context.i64_type();
-        let void_type = context.void_type();
-        let bool_type = context.bool_type();
-
-        let rt_string_from_bytes = module.add_function(
-            "lin_string_from_bytes",
-            string_ptr_type.fn_type(&[ptr_type.into(), i32_type.into()], false),
-            None,
-        );
-        let rt_string_length = module.add_function(
-            "lin_string_length",
-            i32_type.fn_type(&[string_ptr_type.into()], false),
-            None,
-        );
-        let rt_string_eq = module.add_function(
-            "lin_string_eq",
-            bool_type.fn_type(&[string_ptr_type.into(), string_ptr_type.into()], false),
-            None,
-        );
-        let rt_print = module.add_function(
-            "lin_print",
-            void_type.fn_type(&[string_ptr_type.into()], false),
-            None,
-        );
-        let rt_panic = module.add_function(
-            "lin_panic",
-            void_type.fn_type(&[string_ptr_type.into(), i32_type.into(), i32_type.into()], false),
-            None,
-        );
-        // lin_array_alloc(initial_capacity: i64) -> ptr
-        let rt_array_alloc = module.add_function(
-            "lin_array_alloc",
-            ptr_type.fn_type(&[i64_type.into()], false),
-            None,
-        );
-        // lin_array_push(arr: ptr, elem: ptr, tag: i8) -> void
-        let rt_array_push = module.add_function(
-            "lin_array_push",
-            void_type.fn_type(&[ptr_type.into(), ptr_type.into(), context.i8_type().into()], false),
-            None,
-        );
-        // lin_array_get(arr: ptr, idx: i64) -> ptr (tagged element)
-        let rt_array_get = module.add_function(
-            "lin_array_get",
-            ptr_type.fn_type(&[ptr_type.into(), i64_type.into()], false),
-            None,
-        );
-        // lin_array_get_tagged(arr: ptr, idx: i64) -> ptr (TaggedVal*) — handles flat + tagged arrays
-        // lin_array_length(arr: ptr) -> i64
-        // lin_alloc(size: i64) -> ptr — general heap allocation for closures/envs
-        let rt_alloc = module.add_function(
-            "lin_alloc",
-            ptr_type.fn_type(&[i64_type.into()], false),
-            None,
-        );
-        // Numeric to string conversions
-        let rt_int_to_string = module.add_function(
-            "lin_int_to_string",
-            string_ptr_type.fn_type(&[i64_type.into()], false),
-            None,
-        );
-        let rt_float_to_string = module.add_function(
-            "lin_float_to_string",
-            string_ptr_type.fn_type(&[context.f64_type().into()], false),
-            None,
-        );
-        let rt_bool_to_string = module.add_function(
-            "lin_bool_to_string",
-            string_ptr_type.fn_type(&[bool_type.into()], false),
-            None,
-        );
-        let rt_null_to_string = module.add_function(
-            "lin_null_to_string",
-            string_ptr_type.fn_type(&[], false),
-            None,
-        );
-        // Tagged union boxing/unboxing
-        let i8_type = context.i8_type();
-        let rt_box_null = module.add_function("lin_box_null", ptr_type.fn_type(&[], false), None);
-        let rt_box_bool = module.add_function("lin_box_bool", ptr_type.fn_type(&[i8_type.into()], false), None);
-        let rt_box_int32 = module.add_function("lin_box_int32", ptr_type.fn_type(&[i32_type.into()], false), None);
-        let rt_box_int64 = module.add_function("lin_box_int64", ptr_type.fn_type(&[i64_type.into()], false), None);
-        let rt_box_float64 = module.add_function("lin_box_float64", ptr_type.fn_type(&[context.f64_type().into()], false), None);
-        let rt_box_str = module.add_function("lin_box_str", ptr_type.fn_type(&[ptr_type.into()], false), None);
-        let rt_box_object = module.add_function("lin_box_object", ptr_type.fn_type(&[ptr_type.into()], false), None);
-        let rt_box_array = module.add_function("lin_box_array", ptr_type.fn_type(&[ptr_type.into()], false), None);
-        let rt_box_function = module.add_function("lin_box_function", ptr_type.fn_type(&[ptr_type.into()], false), None);
-        let rt_get_tag = module.add_function("lin_get_tag", i8_type.fn_type(&[ptr_type.into()], false), None);
-        let rt_unbox_int32 = module.add_function("lin_unbox_int32", i32_type.fn_type(&[ptr_type.into()], false), None);
-        let rt_unbox_int64 = module.add_function("lin_unbox_int64", i64_type.fn_type(&[ptr_type.into()], false), None);
-        let rt_unbox_float64 = module.add_function("lin_unbox_float64", context.f64_type().fn_type(&[ptr_type.into()], false), None);
-        let rt_unbox_bool = module.add_function("lin_unbox_bool", i8_type.fn_type(&[ptr_type.into()], false), None);
-        let rt_unbox_ptr = module.add_function("lin_unbox_ptr", ptr_type.fn_type(&[ptr_type.into()], false), None);
-        // Dynamic object runtime functions
-        // lin_tagged_to_string(tagged: ptr) -> ptr (LinString*)
-        let rt_tagged_to_string = module.add_function("lin_tagged_to_string", string_ptr_type.fn_type(&[ptr_type.into()], false), None);
-        // lin_object_alloc(initial_cap: i32) -> ptr
-        let rt_object_alloc = module.add_function("lin_object_alloc", ptr_type.fn_type(&[i32_type.into()], false), None);
-        // lin_object_set(obj: ptr, key: ptr, val: ptr) -> void
-        let rt_object_set = module.add_function("lin_object_set", void_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false), None);
-        // lin_object_get(obj: ptr, key: ptr) -> ptr (points to TaggedVal, or null)
-        let rt_object_get = module.add_function("lin_object_get", ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false), None);
-        // lin_object_has(obj: ptr, key: ptr) -> i8
-        // lin_object_eq(a: ptr, b: ptr) -> i8
-        let rt_object_eq = module.add_function("lin_object_eq", i8_type.fn_type(&[ptr_type.into(), ptr_type.into()], false), None);
-        // lin_string_build_n(parts: ptr, n: i32) -> ptr — single-allocation multi-part concat
-        // Release functions: decrement refcount, free if zero.
-        let rt_rc_retain = module.add_function("lin_rc_retain", void_type.fn_type(&[ptr_type.into()], false), None);
-        let rt_string_release = module.add_function("lin_string_release", void_type.fn_type(&[ptr_type.into()], false), None);
-        let rt_array_release = module.add_function("lin_array_release", void_type.fn_type(&[ptr_type.into()], false), None);
-        let rt_object_release = module.add_function("lin_object_release", void_type.fn_type(&[ptr_type.into()], false), None);
-        let rt_closure_release = module.add_function("lin_closure_release", void_type.fn_type(&[ptr_type.into()], false), None);
-        let rt_tagged_release = module.add_function("lin_tagged_release", void_type.fn_type(&[ptr_type.into()], false), None);
+        // Declare runtime functions (C ABI, defined in lin-runtime).
+        let rt = RuntimeFns::new(context, &module);
 
         Self {
             context,
             module,
             builder,
-            rt_string_from_bytes,
-            rt_string_length,
-            rt_string_eq,
-            rt_print,
-            rt_panic,
-            rt_array_alloc,
-            rt_array_push,
-            rt_array_get,
-            rt_int_to_string,
-            rt_float_to_string,
-            rt_bool_to_string,
-            rt_null_to_string,
-            rt_alloc,
-            rt_box_null,
-            rt_box_bool,
-            rt_box_int32,
-            rt_box_int64,
-            rt_box_float64,
-            rt_box_str,
-            rt_box_object,
-            rt_box_array,
-            rt_box_function,
-            rt_get_tag,
-            rt_unbox_int32,
-            rt_unbox_int64,
-            rt_unbox_float64,
-            rt_unbox_bool,
-            rt_unbox_ptr,
-            rt_object_alloc,
-            rt_object_set,
-            rt_object_get,
-            rt_object_eq,
-            rt_tagged_to_string,
-            rt_rc_retain,
-            rt_string_release,
-            rt_array_release,
-            rt_object_release,
-            rt_closure_release,
-            rt_tagged_release,
+            rt,
             string_ptr_type,
             array_ptr_type,
             named_fns: HashMap::new(),
@@ -850,7 +657,7 @@ impl<'ctx> Codegen<'ctx> {
                                             self.context.void_type().fn_type(&[ptr_ty.into()], false));
                                         self.builder.build_call(retain_fn, &[v.into()], "").unwrap();
                                     } else {
-                                        self.builder.build_call(self.rt_rc_retain, &[v.into()], "").unwrap();
+                                        self.builder.build_call(self.rt.rc_retain, &[v.into()], "").unwrap();
                                     }
                                 }
                             }
@@ -927,7 +734,7 @@ impl<'ctx> Codegen<'ctx> {
                                             // the closure struct first.
                                             let callee_ty = func.temp_types.get(fn_temp).cloned().unwrap_or(Type::Null);
                                             let cls_ptr = if Self::is_union_type(&callee_ty) {
-                                                self.builder.build_call(self.rt_unbox_ptr, &[cls_ptr.into()], "ir_fn_unbox")
+                                                self.builder.build_call(self.rt.unbox_ptr, &[cls_ptr.into()], "ir_fn_unbox")
                                                     .unwrap().try_as_basic_value().unwrap_basic()
                                             } else { cls_ptr };
                                             // Under-application of a closure value: the result is
@@ -1002,7 +809,7 @@ impl<'ctx> Codegen<'ctx> {
                         Instruction::MakeObject { dst, fields, spreads, ty } => {
                             // Compile field values first (they're already Temps).
                             let cap = i32_ty.const_int((fields.len() + 4).max(4) as u64, false);
-                            let obj_ptr = self.builder.build_call(self.rt_object_alloc, &[cap.into()], "ir_obj")
+                            let obj_ptr = self.builder.build_call(self.rt.object_alloc, &[cap.into()], "ir_obj")
                                 .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
                             // Apply spreads. A spread source typed Json/union arrives boxed
                             // (a TaggedVal*) — unbox to the raw LinObject* before merging, or
@@ -1015,7 +822,7 @@ impl<'ctx> Codegen<'ctx> {
                                         if sv.is_pointer_value() {
                                             let s_ty = func.temp_types.get(s).cloned().unwrap_or(Type::Null);
                                             let src = if Self::is_union_type(&s_ty) {
-                                                self.builder.build_call(self.rt_unbox_ptr, &[sv.into()], "ir_spread_unbox")
+                                                self.builder.build_call(self.rt.unbox_ptr, &[sv.into()], "ir_spread_unbox")
                                                     .unwrap().try_as_basic_value().unwrap_basic()
                                             } else { sv };
                                             self.builder.build_call(merge_fn, &[obj_ptr.into(), src.into()], "").unwrap();
@@ -1036,8 +843,8 @@ impl<'ctx> Codegen<'ctx> {
                                     } else {
                                         self.build_tagged_val_alloca(&val, &val_ty)
                                     };
-                                    self.builder.build_call(self.rt_object_set, &[obj_ptr.into(), key_str.into(), tagged.into()], "").unwrap();
-                                    self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
+                                    self.builder.build_call(self.rt.object_set, &[obj_ptr.into(), key_str.into(), tagged.into()], "").unwrap();
+                                    self.builder.build_call(self.rt.string_release, &[key_str.into()], "").unwrap();
                                 }
                             }
                             let _ = ty;
@@ -1059,7 +866,7 @@ impl<'ctx> Codegen<'ctx> {
                                 }
                                 arr_v
                             } else {
-                                let arr_v = self.builder.build_call(self.rt_array_alloc, &[cap.into()], "ir_arr")
+                                let arr_v = self.builder.build_call(self.rt.array_alloc, &[cap.into()], "ir_arr")
                                     .unwrap().try_as_basic_value().unwrap_basic();
                                 for e_temp in elements {
                                     if let Some(&ev) = temp_map.get(e_temp) {
@@ -1114,10 +921,10 @@ impl<'ctx> Codegen<'ctx> {
                             if let Some(&src_v) = temp_map.get(src) {
                                 // Unbox a boxed Json object to the raw LinObject*.
                                 let src_obj = if Self::is_union_type(src_ty) && src_v.is_pointer_value() {
-                                    self.builder.build_call(self.rt_unbox_ptr, &[src_v.into()], "orest_unbox")
+                                    self.builder.build_call(self.rt.unbox_ptr, &[src_v.into()], "orest_unbox")
                                         .unwrap().try_as_basic_value().unwrap_basic()
                                 } else { src_v };
-                                let rest_obj = self.builder.build_call(self.rt_object_alloc,
+                                let rest_obj = self.builder.build_call(self.rt.object_alloc,
                                     &[i32_ty.const_int(4, false).into()], "orest")
                                     .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
                                 let exclude_fn = self.get_or_declare_fn("lin_object_copy_except",
@@ -1134,7 +941,7 @@ impl<'ctx> Codegen<'ctx> {
                                 let keys_ptr = self.builder.build_pointer_cast(keys_arr, ptr_ty, "orest_kps").unwrap();
                                 self.builder.build_call(exclude_fn,
                                     &[rest_obj.into(), src_obj.into(), keys_ptr.into(), i32_ty.const_int(n_exc as u64, false).into()], "").unwrap();
-                                let boxed = self.builder.build_call(self.rt_box_object, &[rest_obj.into()], "orest_boxed")
+                                let boxed = self.builder.build_call(self.rt.box_object, &[rest_obj.into()], "orest_boxed")
                                     .unwrap().try_as_basic_value().unwrap_basic();
                                 temp_map.insert(*dst, boxed);
                             }
@@ -1198,7 +1005,7 @@ impl<'ctx> Codegen<'ctx> {
                                 let llvm_ty = self.llvm_type(ty);
                                 let size = llvm_ty.size_of().unwrap();
                                 let size_i64 = self.builder.build_int_z_extend_or_bit_cast(size, i64_ty, "cell_sz").unwrap();
-                                let cell = self.builder.build_call(self.rt_alloc, &[size_i64.into()], "ir_cell")
+                                let cell = self.builder.build_call(self.rt.alloc, &[size_i64.into()], "ir_cell")
                                     .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
                                 self.builder.build_store(cell, v).unwrap();
                                 temp_map.insert(*dst, cell.into());
@@ -1284,7 +1091,7 @@ impl<'ctx> Codegen<'ctx> {
                             if let Some(&msg_v) = temp_map.get(msg) {
                                 if msg_v.is_pointer_value() {
                                     let zero = i32_ty.const_zero();
-                                    self.builder.build_call(self.rt_panic, &[msg_v.into(), zero.into(), zero.into()], "").unwrap();
+                                    self.builder.build_call(self.rt.panic, &[msg_v.into(), zero.into(), zero.into()], "").unwrap();
                                 }
                             }
                             // Note: no terminator here — the block's IR Terminator (an

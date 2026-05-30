@@ -72,7 +72,7 @@ impl<'ctx> Codegen<'ctx> {
                 };
                 let cell = self.builder.build_alloca(store_llvm_ty, "arr_cell").unwrap();
                 self.builder.build_store(cell, store_val).unwrap();
-                self.builder.build_call(self.rt_array_push, &[arr.into(), cell.into(), tag.into()], "arr_push").unwrap();
+                self.builder.build_call(self.rt.array_push, &[arr.into(), cell.into(), tag.into()], "arr_push").unwrap();
             }
         }
     }
@@ -82,7 +82,7 @@ impl<'ctx> Codegen<'ctx> {
     /// it; otherwise pass through. Used by the dynamic object/array helper intrinsics.
     pub(crate) fn ir_as_raw_ptr(&mut self, v: BasicValueEnum<'ctx>, ty: &Type) -> BasicValueEnum<'ctx> {
         if Self::is_union_type(ty) || !v.is_pointer_value() {
-            self.builder.build_call(self.rt_unbox_ptr, &[v.into()], "ir_raw_ptr")
+            self.builder.build_call(self.rt.unbox_ptr, &[v.into()], "ir_raw_ptr")
                 .unwrap().try_as_basic_value().unwrap_basic()
         } else {
             v
@@ -95,7 +95,7 @@ impl<'ctx> Codegen<'ctx> {
         let i64_ty = self.context.i64_type();
         let Some(n) = n else { return i64_ty.const_zero() };
         if n.is_pointer_value() {
-            let n_i32 = self.builder.build_call(self.rt_unbox_int32, &[n.into()], "ir_n_unbox")
+            let n_i32 = self.builder.build_call(self.rt.unbox_int32, &[n.into()], "ir_n_unbox")
                 .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
             return self.builder.build_int_s_extend(n_i32, i64_ty, "ir_n64").unwrap();
         }
@@ -116,7 +116,7 @@ impl<'ctx> Codegen<'ctx> {
         // real Array/Object pointer — unbox it to the raw container pointer before
         // calling the runtime accessors (which expect LinArray*/LinObject*).
         let container = if Self::is_union_type(obj_ty) {
-            self.builder.build_call(self.rt_unbox_ptr, &[obj.into()], "ir_idx_unbox")
+            self.builder.build_call(self.rt.unbox_ptr, &[obj.into()], "ir_idx_unbox")
                 .unwrap().try_as_basic_value().unwrap_basic()
         } else {
             obj
@@ -132,7 +132,7 @@ impl<'ctx> Codegen<'ctx> {
             && key.is_pointer_value()
         {
             let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-            let k_tag = self.builder.build_call(self.rt_get_tag, &[key.into()], "ir_idxk_tag")
+            let k_tag = self.builder.build_call(self.rt.get_tag, &[key.into()], "ir_idxk_tag")
                 .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
             let i8t = self.context.i8_type();
             let is_i32 = self.builder.build_int_compare(IntPredicate::EQ, k_tag, i8t.const_int(2, false), "ir_k_i32").unwrap();
@@ -153,9 +153,9 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.build_unconditional_branch(mrg).unwrap();
             // string key → object get, guarded by an object-tag check on the container source.
             self.builder.position_at_end(str_b);
-            let key_raw = self.builder.build_call(self.rt_unbox_ptr, &[key.into()], "ir_idxk_str")
+            let key_raw = self.builder.build_call(self.rt.unbox_ptr, &[key.into()], "ir_idxk_str")
                 .unwrap().try_as_basic_value().unwrap_basic();
-            let obj_tag = self.builder.build_call(self.rt_get_tag, &[obj.into()], "ir_idx_otag")
+            let obj_tag = self.builder.build_call(self.rt.get_tag, &[obj.into()], "ir_idx_otag")
                 .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
             let is_obj = self.builder.build_int_compare(IntPredicate::EQ, obj_tag, i8t.const_int(7, false), "ir_idx_isobj").unwrap();
             let oget_b = self.context.append_basic_block(llvm_fn, "ir_idx_oget");
@@ -163,7 +163,7 @@ impl<'ctx> Codegen<'ctx> {
             let omrg = self.context.append_basic_block(llvm_fn, "ir_idx_omrg");
             self.builder.build_conditional_branch(is_obj, oget_b, onull_b).unwrap();
             self.builder.position_at_end(oget_b);
-            let oget = self.builder.build_call(self.rt_object_get, &[container.into(), key_raw.into()], "ir_idx_osget")
+            let oget = self.builder.build_call(self.rt.object_get, &[container.into(), key_raw.into()], "ir_idx_osget")
                 .unwrap().try_as_basic_value().unwrap_basic();
             let oget_exit = self.builder.get_insert_block().unwrap();
             self.builder.build_unconditional_branch(omrg).unwrap();
@@ -208,7 +208,7 @@ impl<'ctx> Codegen<'ctx> {
                 return self.builder.build_call(get_tagged_fn, &[container.into(), idx.into()], "ir_aget_tv")
                     .unwrap().try_as_basic_value().unwrap_basic();
             }
-            let tagged = self.builder.build_call(self.rt_array_get, &[container.into(), idx.into()], "ir_aget")
+            let tagged = self.builder.build_call(self.rt.array_get, &[container.into(), idx.into()], "ir_aget")
                 .unwrap().try_as_basic_value().unwrap_basic();
             return self.unbox_tagged_val_to_type(tagged, result_ty);
         }
@@ -216,7 +216,7 @@ impl<'ctx> Codegen<'ctx> {
         let key_str = if matches!(key_ty, Type::Str) {
             key
         } else if Self::is_union_type(key_ty) && key.is_pointer_value() {
-            self.builder.build_call(self.rt_unbox_ptr, &[key.into()], "ir_key_unbox")
+            self.builder.build_call(self.rt.unbox_ptr, &[key.into()], "ir_key_unbox")
                 .unwrap().try_as_basic_value().unwrap_basic()
         } else {
             key
@@ -228,7 +228,7 @@ impl<'ctx> Codegen<'ctx> {
         // AST compile_index string-key-on-Json path.
         if Self::is_union_type(obj_ty) {
             let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-            let obj_tag = self.builder.build_call(self.rt_get_tag, &[obj.into()], "ir_idx_tag")
+            let obj_tag = self.builder.build_call(self.rt.get_tag, &[obj.into()], "ir_idx_tag")
                 .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
             let is_obj = self.builder.build_int_compare(
                 IntPredicate::EQ, obj_tag, self.context.i8_type().const_int(7, false), "ir_idx_is_obj").unwrap();
@@ -237,7 +237,7 @@ impl<'ctx> Codegen<'ctx> {
             let mrg = self.context.append_basic_block(llvm_fn, "ir_idx_obj_mrg");
             self.builder.build_conditional_branch(is_obj, ok, no).unwrap();
             self.builder.position_at_end(ok);
-            let entry = self.builder.build_call(self.rt_object_get, &[container.into(), key_str.into()], "ir_oget")
+            let entry = self.builder.build_call(self.rt.object_get, &[container.into(), key_str.into()], "ir_oget")
                 .unwrap().try_as_basic_value().unwrap_basic();
             let ok_exit = self.builder.get_insert_block().unwrap();
             self.builder.build_unconditional_branch(mrg).unwrap();
@@ -250,7 +250,7 @@ impl<'ctx> Codegen<'ctx> {
             let result_ptr = phi.as_basic_value();
             return self.unbox_tagged_val_to_type(result_ptr, result_ty);
         }
-        let tagged = self.builder.build_call(self.rt_object_get, &[container.into(), key_str.into()], "ir_oget")
+        let tagged = self.builder.build_call(self.rt.object_get, &[container.into(), key_str.into()], "ir_oget")
             .unwrap().try_as_basic_value().unwrap_basic();
         self.unbox_tagged_val_to_type(tagged, result_ty)
     }
@@ -267,7 +267,7 @@ impl<'ctx> Codegen<'ctx> {
         match obj_ty {
             Type::Object(_) | Type::Named(_) => {
                 if obj.is_pointer_value() && key.is_pointer_value() {
-                    self.builder.build_call(self.rt_object_set,
+                    self.builder.build_call(self.rt.object_set,
                         &[obj.into(), key.into(), tagged_val.into()], "").unwrap();
                 }
             }
@@ -280,11 +280,11 @@ impl<'ctx> Codegen<'ctx> {
             Type::TypeVar(_) | Type::Union(_) => {
                 if !obj.is_pointer_value() { return; }
                 // Unbox the boxed container, then dispatch on the key's LLVM kind.
-                let container = self.builder.build_call(self.rt_unbox_ptr, &[obj.into()], "iset_unbox")
+                let container = self.builder.build_call(self.rt.unbox_ptr, &[obj.into()], "iset_unbox")
                     .unwrap().try_as_basic_value().unwrap_basic();
                 if key.is_pointer_value() {
                     // String (object) key.
-                    self.builder.build_call(self.rt_object_set,
+                    self.builder.build_call(self.rt.object_set,
                         &[container.into(), key.into(), tagged_val.into()], "").unwrap();
                 } else if key.is_int_value() {
                     let idx = self.index_value_to_i64(key);
@@ -302,7 +302,7 @@ impl<'ctx> Codegen<'ctx> {
         if key.is_int_value() {
             self.builder.build_int_s_extend_or_bit_cast(key.into_int_value(), self.context.i64_type(), "ir_idx64").unwrap()
         } else if key.is_pointer_value() {
-            let i32_key = self.builder.build_call(self.rt_unbox_int32, &[key.into()], "ir_skey_i32")
+            let i32_key = self.builder.build_call(self.rt.unbox_int32, &[key.into()], "ir_skey_i32")
                 .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
             self.builder.build_int_s_extend(i32_key, self.context.i64_type(), "ir_skey_i64").unwrap()
         } else {
@@ -315,15 +315,15 @@ impl<'ctx> Codegen<'ctx> {
         if obj.is_pointer_value() {
             // A Json/union object arrives as a boxed TaggedVal*; unbox to the raw LinObject*.
             let container = if Self::is_union_type(obj_ty) {
-                self.builder.build_call(self.rt_unbox_ptr, &[obj.into()], "ir_fget_unbox")
+                self.builder.build_call(self.rt.unbox_ptr, &[obj.into()], "ir_fget_unbox")
                     .unwrap().try_as_basic_value().unwrap_basic()
             } else {
                 obj
             };
             let key_str = self.compile_string_lit(field).into_pointer_value();
-            let tagged = self.builder.build_call(self.rt_object_get, &[container.into(), key_str.into()], "ir_fget")
+            let tagged = self.builder.build_call(self.rt.object_get, &[container.into(), key_str.into()], "ir_fget")
                 .unwrap().try_as_basic_value().unwrap_basic();
-            self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
+            self.builder.build_call(self.rt.string_release, &[key_str.into()], "").unwrap();
             self.unbox_tagged_val_to_type(tagged, result_ty)
         } else { ptr_ty.const_null().into() }
     }

@@ -9,7 +9,7 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) fn compile_ir_is_type(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) -> inkwell::values::IntValue<'ctx> {
         // Use get_tag and compare.
         if val.is_pointer_value() {
-            let tag = self.builder.build_call(self.rt_get_tag, &[val.into()], "ir_tag")
+            let tag = self.builder.build_call(self.rt.get_tag, &[val.into()], "ir_tag")
                 .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
             let expected = self.type_tag_const(ty);
             self.builder.build_int_compare(IntPredicate::EQ, tag, expected, "ir_is").unwrap()
@@ -34,7 +34,7 @@ impl<'ctx> Codegen<'ctx> {
             let key_str = self.compile_string_lit(field).into_pointer_value();
             let has_i8 = self.builder.build_call(has_fn, &[val.into(), key_str.into()], "ir_has")
                 .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
-            self.builder.build_call(self.rt_string_release, &[key_str.into()], "").unwrap();
+            self.builder.build_call(self.rt.string_release, &[key_str.into()], "").unwrap();
             let has_bool = self.builder.build_int_truncate_or_bit_cast(has_i8, bool_ty, "has_b").unwrap();
             all_present = self.builder.build_and(all_present, has_bool, "has_acc").unwrap();
         }

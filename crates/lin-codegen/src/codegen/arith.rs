@@ -97,7 +97,7 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(panic_bb);
         let panic_msg = self.compile_string_lit(msg);
         let zero_i32 = self.context.i32_type().const_zero();
-        self.builder.build_call(self.rt_panic, &[panic_msg.into(), zero_i32.into(), zero_i32.into()], "").unwrap();
+        self.builder.build_call(self.rt.panic, &[panic_msg.into(), zero_i32.into(), zero_i32.into()], "").unwrap();
         self.builder.build_unreachable().unwrap();
         self.builder.position_at_end(ok_bb);
     }
@@ -112,7 +112,7 @@ impl<'ctx> Codegen<'ctx> {
         let i64_ty = self.context.i64_type();
         let result = if *ty == Type::Str {
             self.builder
-                .build_call(self.rt_string_eq, &[lv.into(), rv.into()], "seq")
+                .build_call(self.rt.string_eq, &[lv.into(), rv.into()], "seq")
                 .unwrap()
                 .try_as_basic_value()
                 .unwrap_basic()
@@ -120,7 +120,7 @@ impl<'ctx> Codegen<'ctx> {
         } else if matches!(ty, Type::Object(_)) {
             // Structural object equality via runtime (order-independent).
             let eq_i8 = self.builder
-                .build_call(self.rt_object_eq, &[lv.into(), rv.into()], "oeq")
+                .build_call(self.rt.object_eq, &[lv.into(), rv.into()], "oeq")
                 .unwrap()
                 .try_as_basic_value()
                 .unwrap_basic()

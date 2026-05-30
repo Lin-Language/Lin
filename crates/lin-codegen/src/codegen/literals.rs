@@ -39,7 +39,7 @@ impl<'ctx> Codegen<'ctx> {
         let len = self.context.i32_type().const_int(bytes.len() as u64, false);
 
         self.builder
-            .build_call(self.rt_string_from_bytes, &[ptr.into(), len.into()], "str")
+            .build_call(self.rt.string_from_bytes, &[ptr.into(), len.into()], "str")
             .unwrap()
             .try_as_basic_value()
             .unwrap_basic()

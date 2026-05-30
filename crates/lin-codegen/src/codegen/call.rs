@@ -90,7 +90,7 @@ impl<'ctx> Codegen<'ctx> {
         let env_struct_ty = self.context.struct_type(&env_field_types, false);
         let env_size = env_struct_ty.size_of().unwrap();
         let env_size_i64 = self.builder.build_int_z_extend_or_bit_cast(env_size, self.context.i64_type(), "papp_env_sz").unwrap();
-        let env_ptr = self.builder.build_call(self.rt_alloc, &[env_size_i64.into()], "papp_env")
+        let env_ptr = self.builder.build_call(self.rt.alloc, &[env_size_i64.into()], "papp_env")
             .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
         for (i, val) in compiled_partials.iter().enumerate() {
             let field = self.builder.build_struct_gep(env_struct_ty, env_ptr, i as u32, "papp_f").unwrap();
@@ -109,7 +109,7 @@ impl<'ctx> Codegen<'ctx> {
         let wrapper_fn = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
 
         let cls_struct_ty = self.closure_struct_type();
-        let cls_ptr = self.builder.build_call(self.rt_alloc, &[self.context.i64_type().const_int(32, false).into()], "papp_cls")
+        let cls_ptr = self.builder.build_call(self.rt.alloc, &[self.context.i64_type().const_int(32, false).into()], "papp_cls")
             .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
         let rc_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 0, "papp_cls_rc").unwrap();
         self.builder.build_store(rc_field, self.context.i32_type().const_int(1, false)).unwrap();
@@ -173,7 +173,7 @@ impl<'ctx> Codegen<'ctx> {
         let env_struct_ty = self.context.struct_type(&env_field_types, false);
         let env_size = env_struct_ty.size_of().unwrap();
         let env_size_i64 = self.builder.build_int_z_extend_or_bit_cast(env_size, self.context.i64_type(), "papp_env_sz").unwrap();
-        let env_ptr2 = self.builder.build_call(self.rt_alloc, &[env_size_i64.into()], "papp_env").unwrap()
+        let env_ptr2 = self.builder.build_call(self.rt.alloc, &[env_size_i64.into()], "papp_env").unwrap()
             .try_as_basic_value().unwrap_basic().into_pointer_value();
         let cls_field = self.builder.build_struct_gep(env_struct_ty, env_ptr2, 0, "papp_cls_f").unwrap();
         self.builder.build_store(cls_field, closure_ptr).unwrap();
@@ -233,7 +233,7 @@ impl<'ctx> Codegen<'ctx> {
 
         // Build the outer closure struct { rc, _pad, fn_ptr, env_ptr }.
         let cls_struct_ty = self.closure_struct_type();
-        let cls_ptr = self.builder.build_call(self.rt_alloc, &[self.context.i64_type().const_int(32, false).into()], "papp_cls").unwrap()
+        let cls_ptr = self.builder.build_call(self.rt.alloc, &[self.context.i64_type().const_int(32, false).into()], "papp_cls").unwrap()
             .try_as_basic_value().unwrap_basic().into_pointer_value();
         let rc_field = self.builder.build_struct_gep(cls_struct_ty, cls_ptr, 0, "papp_cls_rc").unwrap();
         self.builder.build_store(rc_field, self.context.i32_type().const_int(1, false)).unwrap();
@@ -271,7 +271,7 @@ impl<'ctx> Codegen<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
         let cls_size = i64_ty.const_int(32, false);
-        let cls_mem = self.builder.build_call(self.rt_alloc, &[cls_size.into()], "ir_cls")
+        let cls_mem = self.builder.build_call(self.rt.alloc, &[cls_size.into()], "ir_cls")
             .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
         let cls_ty = self.closure_struct_type();
         let rc_f = self.builder.build_struct_gep(cls_ty, cls_mem, 0, "ir_rc").unwrap();
@@ -288,7 +288,7 @@ impl<'ctx> Codegen<'ctx> {
             let n = captures.len();
             let env_size_bytes = 8u64 + (n as u64 * 8); // size header + 8 bytes per capture (ptr/i64)
             let env_size_val = i64_ty.const_int(env_size_bytes, false);
-            let env_mem = self.builder.build_call(self.rt_alloc, &[env_size_val.into()], "ir_env")
+            let env_mem = self.builder.build_call(self.rt.alloc, &[env_size_val.into()], "ir_env")
                 .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
             // Write size at offset 0.
             self.builder.build_store(env_mem, env_size_val).unwrap();
