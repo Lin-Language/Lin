@@ -17,7 +17,21 @@ impl<'ctx> Codegen<'ctx> {
     /// TaggedVal* (ptr), matching the uniform closure ABI the IR indirect-call path uses
     /// (where every closure returns Json and the caller unboxes). The wrapped function's
     /// concrete scalar/pointer return is boxed before returning.
-    pub(crate) fn wrap_named_fn_as_closure_boxed(&mut self, named_fn: FunctionValue<'ctx>) -> BasicValueEnum<'ctx> {
+    /// Build (or reuse) a boxed-ABI wrapper `__cls_wrapb_<fn>(ptr env, args...) -> ptr` that
+    /// ignores the env, forwards `args` to `named_fn`, and boxes the concrete return into a
+    /// TaggedVal*. This is the uniform calling convention every indirect/closure call uses.
+    /// Shared by closure construction and default-argument descriptor entries.
+    pub(crate) fn boxed_abi_wrapper(&mut self, named_fn: FunctionValue<'ctx>) -> FunctionValue<'ctx> {
+        self.boxed_abi_wrapper_ret(named_fn, None)
+    }
+
+    /// As `boxed_abi_wrapper`, but with the wrapped function's true Lin return type when known.
+    /// This disambiguates a raw pointer return (Str/Array/Object — must be boxed) from an
+    /// already-boxed Json/union return (passed through). Without it, only the LLVM return kind
+    /// is available and every pointer is assumed already-boxed, which crashes the indirect
+    /// caller when it unboxes a raw String*. Pass `None` for closures that already use the
+    /// uniform boxed (Json) return ABI.
+    pub(crate) fn boxed_abi_wrapper_ret(&mut self, named_fn: FunctionValue<'ctx>, lin_ret_ty: Option<&Type>) -> FunctionValue<'ctx> {
         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
         let named_ret_ty = named_fn.get_type().get_return_type();
         let mut wrapper_param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
@@ -27,51 +41,79 @@ impl<'ctx> Codegen<'ctx> {
         // Uniform ABI: always return ptr.
         let wrapper_fn_ty = ptr_ty.fn_type(&wrapper_param_types, false);
         let wrapper_name = format!("__cls_wrapb_{}", named_fn.get_name().to_str().unwrap_or("fn"));
-        let wrapper_fn = if let Some(existing) = self.module.get_function(&wrapper_name) {
-            existing
-        } else {
-            let wf = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
-            self.add_fn_attrs(wf, &["nounwind"]);
-            let saved_block = self.builder.get_insert_block().unwrap();
-            let entry = self.context.append_basic_block(wf, "entry");
-            self.builder.position_at_end(entry);
-            let fwd_args: Vec<BasicMetadataValueEnum> = (1..wf.count_params())
-                .map(|i| wf.get_nth_param(i).unwrap().into())
-                .collect();
-            let call = self.builder.call(named_fn, &fwd_args, "wfwd");
-            // Box the concrete return to a TaggedVal* using the LLVM return kind.
-            let boxed: BasicValueEnum<'ctx> = match named_ret_ty {
-                Some(rt) => {
-                    let rv = call.try_as_basic_value().basic().unwrap();
-                    let lin_ty = if rt.is_int_type() {
+        if let Some(existing) = self.module.get_function(&wrapper_name) {
+            return existing;
+        }
+        let wf = self.module.add_function(&wrapper_name, wrapper_fn_ty, None);
+        // User-emitted Lin functions never unwind (value-based errors), and this wrapper
+        // only forwards + boxes — mark it nounwind like other emitted functions.
+        self.add_fn_attrs(wf, &["nounwind"]);
+        let saved_block = self.builder.get_insert_block();
+        let entry = self.context.append_basic_block(wf, "entry");
+        self.builder.position_at_end(entry);
+        let fwd_args: Vec<BasicMetadataValueEnum> = (1..wf.count_params())
+            .map(|i| wf.get_nth_param(i).unwrap().into())
+            .collect();
+        let call = self.builder.call(named_fn, &fwd_args, "wfwd");
+        // Box the concrete return to a TaggedVal*. Prefer the true Lin return type; fall back
+        // to inferring from the LLVM return kind (scalars only — a bare pointer of unknown Lin
+        // type is assumed already-boxed Json).
+        let boxed: BasicValueEnum<'ctx> = match named_ret_ty {
+            Some(rt) => {
+                let rv = call.try_as_basic_value().basic().unwrap();
+                let lin_ty = match lin_ret_ty {
+                    // Known Lin return type: box exactly per that type (Str/Array/Object are raw
+                    // pointers that MUST be boxed; union/Json values are already boxed).
+                    Some(t) => t.clone(),
+                    None if rt.is_int_type() => {
                         match rt.into_int_type().get_bit_width() { 1 => Type::Bool, 8 => Type::Int8, 16 => Type::Int16, 64 => Type::Int64, _ => Type::Int32 }
-                    } else if rt.is_float_type() {
+                    }
+                    None if rt.is_float_type() => {
                         if rt.into_float_type() == self.context.f32_type() { Type::Float32 } else { Type::Float64 }
-                    } else {
-                        // Already a pointer (Str/Array/Object/Json) — box as-is via TypeVar dispatch.
-                        Type::TypeVar(u32::MAX)
-                    };
-                    if matches!(lin_ty, Type::TypeVar(_)) { rv } else { self.box_value(rv, &lin_ty) }
-                }
-                None => ptr_ty.const_null().into(),
-            };
-            self.builder.r#return(Some(&boxed));
-            self.builder.position_at_end(saved_block);
-            wf
+                    }
+                    // Already a pointer of unknown Lin type — assume boxed Json (TypeVar).
+                    None => Type::TypeVar(u32::MAX),
+                };
+                // Union/Json/Named values arrive already boxed; pass through. Everything else
+                // (scalars, Str, Array, Object) is boxed into a TaggedVal*.
+                if Self::is_union_type(&lin_ty) { rv } else { self.box_value(rv, &lin_ty) }
+            }
+            None => ptr_ty.const_null().into(),
         };
-        // Build {rc, _pad, fn_ptr, null_env} closure struct.
-        let lin_alloc_fn = self.get_or_declare_fn("lin_alloc",
-            ptr_ty.fn_type(&[self.context.i64_type().into()], false));
-        let cls_mem = self.builder.call(lin_alloc_fn,
-            &[self.context.i64_type().const_int(32, false).into()], "wnfnb_cls").try_as_basic_value().unwrap_basic().into_pointer_value();
-        let cls_ty = self.closure_struct_type();
-        let rc_field = self.builder.struct_gep(cls_ty, cls_mem, 0, "wnfnb_rc");
-        self.builder.store(rc_field, self.context.i32_type().const_int(1, false));
-        let fn_field = self.builder.struct_gep(cls_ty, cls_mem, 2, "wnfnb_fp");
-        self.builder.store(fn_field, wrapper_fn.as_global_value().as_pointer_value());
-        let env_field = self.builder.struct_gep(cls_ty, cls_mem, 3, "wnfnb_ep");
-        self.builder.store(env_field, ptr_ty.const_null());
-        cls_mem.into()
+        self.builder.r#return(Some(&boxed));
+        if let Some(sb) = saved_block {
+            self.builder.position_at_end(sb);
+        }
+        wf
+    }
+
+    pub(crate) fn wrap_named_fn_as_closure_boxed(&mut self, named_fn: FunctionValue<'ctx>) -> BasicValueEnum<'ctx> {
+        self.wrap_named_fn_as_closure_boxed_desc(named_fn, None)
+    }
+
+    /// Variant of `wrap_named_fn_as_closure_boxed` that attaches a default-argument descriptor
+    /// (closure offset 32) so an indirect under-arity call on this capture-less function value
+    /// dispatches through the descriptor to the right default-fill adapter.
+    pub(crate) fn wrap_named_fn_as_closure_boxed_desc(
+        &mut self,
+        named_fn: FunctionValue<'ctx>,
+        descriptor: Option<PointerValue<'ctx>>,
+    ) -> BasicValueEnum<'ctx> {
+        self.wrap_named_fn_as_closure_boxed_desc_ret(named_fn, descriptor, None)
+    }
+
+    /// As `wrap_named_fn_as_closure_boxed_desc`, with the wrapped function's true Lin return
+    /// type so the boxed-ABI wrapper boxes a raw Str/Array/Object return correctly.
+    pub(crate) fn wrap_named_fn_as_closure_boxed_desc_ret(
+        &mut self,
+        named_fn: FunctionValue<'ctx>,
+        descriptor: Option<PointerValue<'ctx>>,
+        lin_ret_ty: Option<&Type>,
+    ) -> BasicValueEnum<'ctx> {
+        let wrapper_fn = self.boxed_abi_wrapper_ret(named_fn, lin_ret_ty);
+        let fn_ptr = wrapper_fn.as_global_value().as_pointer_value();
+        // No captures: capture-less closure with a null env, descriptor at offset 32.
+        self.make_closure_struct_desc(fn_ptr.into(), &[], descriptor)
     }
 
     /// Value-input port of `build_partial_application` for the LinIR path: the partial
@@ -110,7 +152,10 @@ impl<'ctx> Codegen<'ctx> {
         self.add_fn_attrs(wrapper_fn, &["nounwind"]);
 
         let cls_struct_ty = self.closure_struct_type();
-        let cls_ptr = self.builder.call(self.rt.alloc, &[self.context.i64_type().const_int(32, false).into()], "papp_cls").try_as_basic_value().unwrap_basic().into_pointer_value();
+        // 40 bytes: closure header (32) + descriptor slot at offset 32 (null here — a partial
+        // application has no default arguments). All closures are 40 bytes so the runtime can
+        // free them with a single fixed layout.
+        let cls_ptr = self.builder.call(self.rt.alloc, &[self.context.i64_type().const_int(40, false).into()], "papp_cls").try_as_basic_value().unwrap_basic().into_pointer_value();
         let rc_field = self.builder.struct_gep(cls_struct_ty, cls_ptr, 0, "papp_cls_rc");
         self.builder.store(rc_field, self.context.i32_type().const_int(1, false));
         let fn_field = self.builder.struct_gep(cls_struct_ty, cls_ptr, 2, "papp_cls_fn");
@@ -123,6 +168,11 @@ impl<'ctx> Codegen<'ctx> {
             self.context.i8_type(), cls_ptr, &[self.context.i64_type().const_int(24, false)], "papp_env_sz_f"
         ) };
         self.builder.store(env_sz_gep, env_size_i64);
+        // Null descriptor at offset 32.
+        let desc_gep = unsafe { self.builder.gep(
+            self.context.i8_type(), cls_ptr, &[self.context.i64_type().const_int(32, false)], "papp_desc_f"
+        ) };
+        self.builder.store(desc_gep, ptr_ty.const_null());
 
         let current_block = self.builder.get_insert_block().unwrap();
         {
@@ -232,9 +282,10 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.r#return(Some(&inner_result));
         self.builder.position_at_end(saved_block);
 
-        // Build the outer closure struct { rc, _pad, fn_ptr, env_ptr }.
+        // Build the outer closure struct { rc, _pad, fn_ptr, env_ptr } (40 bytes incl. the
+        // offset-32 descriptor slot, null here — a partial application has no defaults).
         let cls_struct_ty = self.closure_struct_type();
-        let cls_ptr = self.builder.call(self.rt.alloc, &[self.context.i64_type().const_int(32, false).into()], "papp_cls")
+        let cls_ptr = self.builder.call(self.rt.alloc, &[self.context.i64_type().const_int(40, false).into()], "papp_cls")
             .try_as_basic_value().unwrap_basic().into_pointer_value();
         let rc_field = self.builder.struct_gep(cls_struct_ty, cls_ptr, 0, "papp_cls_rc");
         self.builder.store(rc_field, self.context.i32_type().const_int(1, false));
@@ -248,6 +299,11 @@ impl<'ctx> Codegen<'ctx> {
             self.context.i8_type(), cls_ptr, &[self.context.i64_type().const_int(24, false)], "papp_env_sz_f"
         ) };
         self.builder.store(env_sz_gep, env_size_i64);
+        // Null descriptor at offset 32.
+        let desc_gep = unsafe { self.builder.gep(
+            self.context.i8_type(), cls_ptr, &[self.context.i64_type().const_int(32, false)], "papp_desc_f"
+        ) };
+        self.builder.store(desc_gep, ptr_ty.const_null());
         cls_ptr.into()
     }
 
@@ -268,15 +324,33 @@ impl<'ctx> Codegen<'ctx> {
 
     /// Make a closure struct {i32 rc=1, i32 _pad, fn_ptr, env_ptr} with optional captured env.
     pub(crate) fn make_closure_struct(&mut self, fn_ptr: BasicValueEnum<'ctx>, captures: &[BasicValueEnum<'ctx>]) -> BasicValueEnum<'ctx> {
+        self.make_closure_struct_desc(fn_ptr, captures, None)
+    }
+
+    /// Like `make_closure_struct`, but also stores a default-argument descriptor pointer at
+    /// closure offset 32 (null when `descriptor` is None). The closure is allocated at 40 bytes
+    /// so the descriptor slot is always present; `lin_closure_release` frees 40 bytes to match.
+    pub(crate) fn make_closure_struct_desc(
+        &mut self,
+        fn_ptr: BasicValueEnum<'ctx>,
+        captures: &[BasicValueEnum<'ctx>],
+        descriptor: Option<PointerValue<'ctx>>,
+    ) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
-        let cls_size = i64_ty.const_int(32, false);
+        // 40 bytes: 32-byte closure header + 8-byte descriptor pointer at offset 32.
+        let cls_size = i64_ty.const_int(40, false);
         let cls_mem = self.builder.call(self.rt.alloc, &[cls_size.into()], "ir_cls").try_as_basic_value().unwrap_basic().into_pointer_value();
         let cls_ty = self.closure_struct_type();
         let rc_f = self.builder.struct_gep(cls_ty, cls_mem, 0, "ir_rc");
         self.builder.store(rc_f, self.context.i32_type().const_int(1, false));
         let fp_f = self.builder.struct_gep(cls_ty, cls_mem, 2, "ir_fp");
         self.builder.store(fp_f, fn_ptr);
+        // Descriptor pointer at offset 32 (null if this function has no default args).
+        let desc_gep = unsafe { self.builder.gep(
+            self.context.i8_type(), cls_mem, &[i64_ty.const_int(32, false)], "ir_desc"
+        ) };
+        self.builder.store(desc_gep, descriptor.unwrap_or_else(|| ptr_ty.const_null()));
 
         if captures.is_empty() {
             let ep_f = self.builder.struct_gep(cls_ty, cls_mem, 3, "ir_ep");

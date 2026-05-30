@@ -1,0 +1,11 @@
+import { spawn, readStdout, wait } from "std/proc"
+import { print } from "std/io"
+
+val h = spawn(["sh", "-c", "printf 'Hi'"])
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+val n = readStdout(h, buf)
+print("bytes read: ${n}")
+print("byte0: ${buf[0]}")
+print("byte1: ${buf[1]}")
+val code = wait(h)
+print("exit code: ${code}")

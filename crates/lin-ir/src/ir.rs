@@ -354,6 +354,21 @@ impl LinFunction {
     }
 }
 
+/// Default-argument dispatch info for one function with optional parameters.
+/// Used to build the runtime closure descriptor so an INDIRECT call through a
+/// function value (`val g = f; g(x)`) can fill omitted trailing defaults.
+#[derive(Debug, Clone)]
+pub struct DefaultDescriptor {
+    /// Minimum (non-partial) call arity.
+    pub required: usize,
+    /// Total declared parameter count.
+    pub total: usize,
+    /// Entry function per arity: `entries[k - required]` is the FuncId to call when
+    /// `k` arguments are supplied (`required <= k <= total`). The last entry
+    /// (`k == total`) is the real function; the rest are default-fill adapters.
+    pub entries: Vec<FuncId>,
+}
+
 /// A full Lin module in flat IR form.
 #[derive(Debug, Clone)]
 pub struct LinModule {
@@ -362,6 +377,10 @@ pub struct LinModule {
     pub global_fn_slots: HashMap<usize, FuncId>,
     /// Maps slot index → intrinsic name for intrinsic slots.
     pub intrinsics: HashMap<usize, String>,
+    /// Real FuncId → default-argument descriptor, for functions with optional params.
+    /// Codegen builds a static descriptor global per entry and attaches it to closure
+    /// values so indirect under-arity calls dispatch to the right default-fill adapter.
+    pub default_descriptors: HashMap<FuncId, DefaultDescriptor>,
 }
 
 impl LinModule {

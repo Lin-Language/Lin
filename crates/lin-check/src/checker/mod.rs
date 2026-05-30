@@ -120,7 +120,7 @@ impl Checker {
             Type::Array(t) | Type::Iterator(t) => Self::collect_typevar_ids(t, out),
             Type::FixedArray(ts) => { for t in ts { Self::collect_typevar_ids(t, out); } }
             Type::Union(ts) => { for t in ts { Self::collect_typevar_ids(t, out); } }
-            Type::Function { params, ret } => {
+            Type::Function { params, ret, .. } => {
                 for p in params { Self::collect_typevar_ids(p, out); }
                 Self::collect_typevar_ids(ret, out);
             }
@@ -186,9 +186,11 @@ impl Checker {
                             .as_ref()
                             .and_then(|t| resolve_type(t, &self.env).ok())
                             .unwrap_or(Type::TypeVar(self.env.next_slot() as u32));
+                        let required = params.iter().filter(|p| p.default.is_none()).count();
                         let fn_type = Type::Function {
                             params: param_types,
                             ret: Box::new(ret_type),
+                            required,
                         };
                         let slot = self.env.define(name, fn_type, false);
                         self.forward_declared.insert(slot);

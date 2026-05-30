@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use lin_check::typed_ir::*;
 use lin_check::types::Type;
 use lin_parse::ast::BinOp;
+use lin_common::Span;
 
 use crate::ir::*;
 
@@ -80,6 +81,13 @@ pub fn lower_module(module: &TypedModule) -> LinModule {
     let main_fn = builder.finish();
     ctx.functions.push(main_fn);
 
+    // Synthesize default-argument adapters queued during the main pass. Each lowers into
+    // ctx.pending_functions (drained below).
+    let adapters = std::mem::take(&mut ctx.pending_adapters);
+    for spec in &adapters {
+        lower_adapter(spec, &mut ctx);
+    }
+
     // Compile nested functions collected during lowering.
     while let Some(pending) = ctx.pending_functions.pop() {
         ctx.functions.push(pending);
@@ -89,6 +97,7 @@ pub fn lower_module(module: &TypedModule) -> LinModule {
         functions: ctx.functions,
         global_fn_slots,
         intrinsics: ctx.intrinsics,
+        default_descriptors: ctx.default_descriptors,
     }
 }
 
@@ -156,12 +165,17 @@ pub fn lower_import_module(module: &TypedModule, module_key: &str) -> LinModule 
     for stmt in &module.statements {
         if let TypedStmt::Val {
             slot,
-            value: TypedExpr::Function { params, body, ret_type, captures, .. },
+            value: TypedExpr::Function { params, body, ret_type, captures, span: fn_span, .. },
             ..
         } = stmt
         {
             if let Some(&fid) = ctx.global_fn_slots.get(slot) {
                 let mangled = fn_names.get(&fid).cloned();
+                // Register default-fill adapters under the mangled export symbol, so importers
+                // can issue Named calls to `{module_key}_{name}$default{k}`.
+                if let Some(real_name) = mangled.as_deref() {
+                    register_default_adapters(fid, *slot, real_name, params, ret_type, *fn_span, &mut ctx);
+                }
                 lower_function_expr_with_id(
                     Some(fid), None, mangled.as_deref(), params, body, ret_type, captures,
                     &mut host, &mut ctx,
@@ -197,6 +211,12 @@ pub fn lower_import_module(module: &TypedModule, module_key: &str) -> LinModule 
         }
     }
 
+    // Synthesize default-argument adapters for exported functions.
+    let adapters = std::mem::take(&mut ctx.pending_adapters);
+    for spec in &adapters {
+        lower_adapter(spec, &mut ctx);
+    }
+
     // Collect all lifted/nested functions produced during lowering.
     while let Some(pending) = ctx.pending_functions.pop() {
         ctx.functions.push(pending);
@@ -206,6 +226,7 @@ pub fn lower_import_module(module: &TypedModule, module_key: &str) -> LinModule 
         functions: ctx.functions,
         global_fn_slots,
         intrinsics: ctx.intrinsics,
+        default_descriptors: ctx.default_descriptors,
     }
 }
 
@@ -241,6 +262,32 @@ struct LowerCtx {
     /// closure call may have mutated the global since the last local write. Writes go through
     /// `GlobalValSet`.
     global_var_slots: std::collections::HashSet<usize>,
+    /// Default-argument adapters for top-level functions. `(real fid, arity k)` → adapter fid.
+    /// The adapter takes the first `k` parameters, fills the remaining defaults, and tail-calls
+    /// the real function. A non-partial call supplying `k < total` args is routed here.
+    default_adapters: HashMap<(FuncId, usize), FuncId>,
+    /// Adapter bodies queued for lowering after the main pass (see `AdapterSpec`).
+    pending_adapters: Vec<AdapterSpec>,
+    /// Real FuncId → default-argument descriptor (for the closure-value indirect path).
+    default_descriptors: HashMap<FuncId, DefaultDescriptor>,
+}
+
+/// A default-fill adapter to be synthesized and lowered. `f@k` takes the first `k` parameters
+/// of `f`, binds each remaining parameter to its default expression, then calls `f` with the
+/// full argument list. Built as a synthetic `TypedExpr::Function` so it reuses the normal
+/// function-lowering path (RC, coercion, chained/earlier-param default references).
+struct AdapterSpec {
+    adapter_fid: FuncId,
+    symbol: String,
+    /// Slot of the real function (resolved through `global_fn_slots` for the inner call).
+    real_slot: usize,
+    real_fn_ty: Type,
+    /// All parameters of the real function, in order (carrying their defaults).
+    params: Vec<TypedParam>,
+    /// Number of leading parameters this adapter accepts; the rest are defaulted.
+    arity: usize,
+    ret_type: Type,
+    span: Span,
 }
 
 impl LowerCtx {
@@ -256,6 +303,9 @@ impl LowerCtx {
             import_val_slots: HashMap::new(),
             mutable_cell_slots: std::collections::HashSet::new(),
             global_val_slots: HashMap::new(),
+            default_adapters: HashMap::new(),
+            pending_adapters: Vec::new(),
+            default_descriptors: HashMap::new(),
         }
     }
 
@@ -784,9 +834,14 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
             // during the module pre-scan (so `CallTarget::Direct` references resolve).
             // Reuse that id when lowering the function body, otherwise a fresh id is
             // allocated and the Direct call target points at a non-existent function.
-            if let (TypedExpr::Function { name, params, body, ret_type, captures, .. }, Some(&fid)) =
+            if let (TypedExpr::Function { name, params, body, ret_type, captures, span: fn_span, .. }, Some(&fid)) =
                 (value, ctx.global_fn_slots.get(slot))
             {
+                // Register default-fill adapters for this top-level function (no-op if it has
+                // no optional parameters). The real symbol is the function's own name.
+                if let Some(real_name) = name.as_deref() {
+                    register_default_adapters(fid, *slot, real_name, params, ret_type, *fn_span, ctx);
+                }
                 let t = lower_function_expr_with_id(
                     Some(fid), None, name.as_deref(), params, body, ret_type, captures, builder, ctx,
                 );
@@ -1188,8 +1243,8 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             dst
         }
 
-        TypedExpr::Call { func, args, result_type, is_tail, .. } => {
-            lower_call(func, args, result_type, *is_tail, builder, ctx)
+        TypedExpr::Call { func, args, result_type, is_tail, partial, .. } => {
+            lower_call(func, args, result_type, *is_tail, *partial, builder, ctx)
         }
 
         TypedExpr::If { cond, then_br, else_br, result_type, .. } => {
@@ -1387,7 +1442,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
 /// boxed-return ABI.
 fn lower_call_arg(a: &TypedExpr, param_ty: Option<&Type>, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     if let (TypedExpr::Function { name, params, body, ret_type, captures, .. },
-            Some(Type::Function { params: cb_params, ret: cb_ret })) = (a, param_ty)
+            Some(Type::Function { params: cb_params, ret: cb_ret, .. })) = (a, param_ty)
     {
         // Only force a concrete return when the callback's params are ALSO concrete. If any
         // param is union/Json (TypeVar), the AST closure-call convention
@@ -1407,6 +1462,7 @@ fn lower_call(
     args: &[TypedExpr],
     result_type: &Type,
     is_tail: bool,
+    partial: bool,
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> Temp {
@@ -1415,6 +1471,13 @@ fn lower_call(
         if let Some(name) = builder.intrinsic_slots.get(slot).cloned() {
             return lower_intrinsic_call(&name, args, result_type, builder, ctx);
         }
+        // Total declared arity of the callee — used to detect a default-fill call (fewer
+        // non-partial args than parameters), which routes to a per-arity adapter symbol.
+        let total_arity = match func.ty() {
+            Type::Function { params, .. } => params.len(),
+            _ => args.len(),
+        };
+        let is_default_fill = !partial && args.len() < total_arity;
         // Imported function: call the compiled symbol by its mangled name, boxing
         // concrete args passed to Json/union-typed parameters.
         if let Some((sym, param_tys)) = ctx.import_fn_slots.get(slot).cloned() {
@@ -1427,10 +1490,17 @@ fn lower_call(
                     arg
                 })
                 .collect();
+            // A default-fill call targets the import's `{sym}$default{k}` adapter, which fills
+            // the remaining defaults and tail-calls the real export.
+            let callee_sym = if is_default_fill {
+                format!("{}$default{}", sym, args.len())
+            } else {
+                sym
+            };
             let dst = builder.alloc_temp(result_type.clone());
             builder.emit(Instruction::Call {
                 dst,
-                callee: CallTarget::Named(sym),
+                callee: CallTarget::Named(callee_sym),
                 args: lowered_args,
                 ret_ty: result_type.clone(),
             });
@@ -1454,7 +1524,19 @@ fn lower_call(
                     arg
                 })
                 .collect();
-            if is_tail {
+            // A default-fill call dispatches to the pre-registered adapter for this arity
+            // (Direct call). The adapter fills the remaining defaults and tail-calls the real
+            // function. Partial application (`f(x,)`) keeps the real fid and is handled by
+            // codegen's partial-application path.
+            let callee_fid = if is_default_fill {
+                ctx.default_adapters.get(&(fid, args.len())).copied().unwrap_or(fid)
+            } else {
+                fid
+            };
+            // A default-fill call routes to the adapter, which has a different (smaller) arity
+            // than the current function — so it can never use the self-recursive TailCall fast
+            // path (which jumps to the current function's entry expecting all parameters).
+            if is_tail && !is_default_fill {
                 builder.terminate(Terminator::TailCall { args: lowered_args.clone() });
                 // Dead block to keep IR valid.
                 let post = builder.alloc_block("tco_post");
@@ -1465,7 +1547,7 @@ fn lower_call(
             let dst = builder.alloc_temp(result_type.clone());
             builder.emit(Instruction::Call {
                 dst,
-                callee: CallTarget::Direct(fid),
+                callee: CallTarget::Direct(callee_fid),
                 args: lowered_args,
                 ret_ty: result_type.clone(),
             });
@@ -1598,7 +1680,7 @@ fn iter_elem_type(iterable_ty: &Type) -> Type {
 /// statically-known `Function` type. Used to match the closure's compiled ABI when calling it.
 fn callback_signature(expr: &TypedExpr) -> (Vec<Type>, Type) {
     match expr.ty() {
-        Type::Function { params, ret } => (params, *ret),
+        Type::Function { params, ret, .. } => (params, *ret),
         _ => (vec![], Type::TypeVar(u32::MAX)),
     }
 }
@@ -2628,6 +2710,135 @@ fn pattern_elem_type(pattern: &TypedPattern) -> Type {
 }
 
 // -------------------------------------------------------------------------
+// Default-argument adapters
+// -------------------------------------------------------------------------
+
+/// If `params` carry any defaults, pre-assign a FuncId + symbol for each shortfall arity
+/// `required ..total` and queue an `AdapterSpec` to be lowered after the main pass. `real_fid`
+/// is the real function's id; `real_slot` is its binding slot (so the adapter body can issue a
+/// `Direct` call through `global_fn_slots`). Returns immediately if there are no defaults.
+fn register_default_adapters(
+    real_fid: FuncId,
+    real_slot: usize,
+    real_symbol_prefix: &str,
+    params: &[TypedParam],
+    ret_type: &Type,
+    span: Span,
+    ctx: &mut LowerCtx,
+) {
+    let total = params.len();
+    let required = params.iter().filter(|p| p.default.is_none()).count();
+    if required == total {
+        return; // no optional parameters
+    }
+    let real_fn_ty = Type::Function {
+        params: params.iter().map(|p| p.ty.clone()).collect(),
+        ret: Box::new(ret_type.clone()),
+        required,
+    };
+    // Descriptor entries: one per arity in required..=total. The last (k == total) is the
+    // real function itself; the rest are default-fill adapters.
+    let mut entries: Vec<FuncId> = Vec::with_capacity(total - required + 1);
+    for arity in required..total {
+        let adapter_fid = ctx.alloc_func_id();
+        let symbol = format!("{}$default{}", real_symbol_prefix, arity);
+        ctx.default_adapters.insert((real_fid, arity), adapter_fid);
+        entries.push(adapter_fid);
+        ctx.pending_adapters.push(AdapterSpec {
+            adapter_fid,
+            symbol,
+            real_slot,
+            real_fn_ty: real_fn_ty.clone(),
+            params: params.to_vec(),
+            arity,
+            ret_type: ret_type.clone(),
+            span,
+        });
+    }
+    entries.push(real_fid);
+    ctx.default_descriptors.insert(real_fid, DefaultDescriptor { required, total, entries });
+}
+
+/// Synthesize and lower one default-fill adapter (see `AdapterSpec`). The adapter is built as
+/// a `TypedExpr::Function` whose parameters are the first `arity` params (defaults stripped),
+/// and whose body is a block that binds each remaining parameter to its default expression and
+/// then calls the real function with the full argument list. Reusing `TypedExpr` means the
+/// normal lowering path handles RC, coercion, and chained/earlier-param default references.
+fn lower_adapter(spec: &AdapterSpec, ctx: &mut LowerCtx) {
+    let AdapterSpec { adapter_fid, symbol, real_slot, real_fn_ty, params, arity, ret_type, span } = spec;
+    let span = *span;
+
+    // Adapter parameters: the first `arity` real params, defaults removed (they are now
+    // mandatory inputs). They reuse the real params' slots so default expressions that
+    // reference earlier parameters resolve to the same LocalGet slots.
+    let adapter_params: Vec<TypedParam> = params[..*arity]
+        .iter()
+        .map(|p| TypedParam { slot: p.slot, name: p.name.clone(), ty: p.ty.clone(), default: None })
+        .collect();
+
+    // Body block: bind each defaulted param to its default, then call the real function.
+    let mut stmts: Vec<TypedStmt> = Vec::new();
+    for p in &params[*arity..] {
+        let default_expr = p.default.as_ref()
+            .expect("optional param must carry a default")
+            .as_ref()
+            .clone();
+        stmts.push(TypedStmt::Val {
+            slot: p.slot,
+            name: None,
+            value: default_expr,
+            ty: p.ty.clone(),
+            span,
+        });
+    }
+
+    // Full-arity call to the real function: f(p0, p1, ..., p_{total-1}).
+    let real_func = TypedExpr::LocalGet { slot: *real_slot, ty: real_fn_ty.clone(), span };
+    let call_args: Vec<TypedExpr> = params
+        .iter()
+        .map(|p| TypedExpr::LocalGet { slot: p.slot, ty: p.ty.clone(), span })
+        .collect();
+    let call = TypedExpr::Call {
+        func: Box::new(real_func),
+        args: call_args,
+        result_type: ret_type.clone(),
+        // NOT a tail call: the `TailCall` terminator self-jumps to the current function's
+        // entry (the adapter), but this call targets the *real* function. Marking it tail
+        // would make the adapter loop on itself. A plain Direct call is correct.
+        is_tail: false,
+        // A full-arity call: never itself a partial application or default-fill.
+        partial: false,
+        span,
+    };
+    let body = TypedExpr::Block {
+        stmts,
+        expr: Box::new(call),
+        ty: ret_type.clone(),
+        span,
+    };
+
+    // Lower through the normal function path under the adapter's forced id and symbol.
+    // Adapters never capture (they only reference the real function via global_fn_slots and
+    // their own params), so `captures` is empty and the function is non-closure.
+    let mut host = FuncBuilder::new(
+        ctx.alloc_func_id(), None, vec![], false, Type::Null, ctx.intrinsics.clone(),
+    );
+    host.push_scope();
+    lower_function_expr_with_id(
+        Some(*adapter_fid),
+        None,
+        Some(symbol.as_str()),
+        &adapter_params,
+        &body,
+        ret_type,
+        &[],
+        &mut host,
+        ctx,
+    );
+    host.discard_scope();
+}
+
+// -------------------------------------------------------------------------
 // Nested function lowering
 // -------------------------------------------------------------------------
 
@@ -2851,6 +3062,7 @@ fn lower_function_expr_with_id(
     let closure_ty = Type::Function {
         params: params.iter().map(|p| p.ty.clone()).collect(),
         ret: Box::new(ret_type.clone()),
+        required: params.iter().filter(|p| p.default.is_none()).count(),
     };
     let dst = builder.alloc_temp(closure_ty.clone());
     builder.emit(Instruction::MakeClosure {

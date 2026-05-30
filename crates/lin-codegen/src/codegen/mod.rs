@@ -72,6 +72,11 @@ pub struct Codegen<'ctx> {
     /// when coverage is off or the current module's source isn't tracked (suppresses
     /// instrumentation, e.g. for stdlib imports).
     current_source: Option<(u32, std::rc::Rc<str>)>,
+    /// Default-argument descriptor global per real FuncId, for the module currently being
+    /// compiled. A closure value created from a default-bearing function points at this
+    /// descriptor (closure offset 32) so an indirect under-arity call dispatches to the
+    /// correct default-fill adapter. Repopulated per `compile_module_from_ir`.
+    cls_descriptors: HashMap<lir::FuncId, inkwell::values::PointerValue<'ctx>>,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -107,6 +112,7 @@ impl<'ctx> Codegen<'ctx> {
                 None
             },
             current_source: None,
+            cls_descriptors: HashMap::new(),
         }
     }
 
@@ -503,6 +509,50 @@ impl<'ctx> Codegen<'ctx> {
             ir_fn_symbol.insert(func.id, name.clone());
         }
 
+        // ---- Pass 1b: build default-argument descriptor globals ----
+        // For each function with optional parameters, emit a static descriptor
+        //   { i32 total, i32 required, [ptr; n] entries }
+        // whose entries are boxed-ABI wrappers (env_ptr, args...) -> ptr of each arity's
+        // entry function (adapters + the real fn). A closure value made from this function
+        // points at the descriptor (closure offset 32) so an indirect under-arity call
+        // dispatches to the right adapter. Cleared per module.
+        self.cls_descriptors.clear();
+        {
+            let ptr_ty = self.context.ptr_type(AddressSpace::default());
+            let i32_ty = self.context.i32_type();
+            for (real_fid, desc) in &module.default_descriptors {
+                // The real function's declared Lin return type — used so each entry wrapper
+                // boxes a raw Str/Array/Object return (otherwise the indirect caller unboxes a
+                // raw pointer). All entries share the real function's return type.
+                let real_ret_ty = module.function(*real_fid).map(|f| f.ret_ty.clone());
+                let entry_ptrs: Vec<inkwell::values::BasicValueEnum<'ctx>> = desc.entries
+                    .iter()
+                    .filter_map(|fid| ir_fn_to_llvm.get(fid).copied())
+                    .map(|f| self.boxed_abi_wrapper_ret(f, real_ret_ty.as_ref()).as_global_value().as_pointer_value().into())
+                    .collect();
+                if entry_ptrs.len() != desc.entries.len() { continue; }
+                let entries_arr = ptr_ty.const_array(
+                    &entry_ptrs.iter().map(|v| v.into_pointer_value()).collect::<Vec<_>>()
+                );
+                let desc_struct_ty = self.context.struct_type(
+                    &[i32_ty.into(), i32_ty.into(), ptr_ty.array_type(desc.entries.len() as u32).into()],
+                    false,
+                );
+                let desc_val = self.context.const_struct(
+                    &[
+                        i32_ty.const_int(desc.total as u64, false).into(),
+                        i32_ty.const_int(desc.required as u64, false).into(),
+                        entries_arr.into(),
+                    ],
+                    false,
+                );
+                let g = self.module.add_global(desc_struct_ty, None, &format!("{}__lin_desc_{}", self.ir_anon_prefix, real_fid.0));
+                g.set_constant(true);
+                g.set_initializer(&desc_val);
+                self.cls_descriptors.insert(*real_fid, g.as_pointer_value());
+            }
+        }
+
         // Module globals backing top-level non-function vals (GlobalValSet/Get), shared
         // across all functions so closures can read module-level vals.
         let mut ir_global_vals: StdMap<usize, inkwell::values::GlobalValue<'ctx>> = StdMap::new();
@@ -757,7 +807,7 @@ impl<'ctx> Codegen<'ctx> {
                             // and a Function result type ⇒ build a partial-application closure.
                             let partial_app = |s: &mut Self, callee_fn: FunctionValue<'ctx>| -> Option<BasicValueEnum<'ctx>> {
                                 if (arg_vals.len() as u32) < callee_fn.count_params() {
-                                    if let Type::Function { params: remaining, ret: final_ret } = ret_ty {
+                                    if let Type::Function { params: remaining, ret: final_ret, .. } = ret_ty {
                                         let vals: Vec<BasicValueEnum> = arg_vals.iter().map(|a| match a {
                                             BasicMetadataValueEnum::IntValue(v) => (*v).into(),
                                             BasicMetadataValueEnum::FloatValue(v) => (*v).into(),
@@ -833,9 +883,64 @@ impl<'ctx> Codegen<'ctx> {
                                                 temp_map.insert(*dst, r);
                                                 continue;
                                             }
-                                            // Build closure call: load fn_ptr from offset 2 of closure struct.
                                             let cls_ty = self.closure_struct_type();
                                             let cls_ptr_v = cls_ptr.into_pointer_value();
+                                            // Default-fill through a function VALUE: the result type is concrete
+                                            // (handled above if it were still a Function) but fewer args than the
+                                            // value's declared arity are supplied. Dispatch through the closure's
+                                            // descriptor (offset 32): entries[k - required] is a boxed-ABI adapter
+                                            // that fills the omitted trailing defaults. The descriptor is null for
+                                            // functions without defaults, so this only fires when one is present.
+                                            let callee_total = match &callee_ty {
+                                                Type::Function { params, .. } => params.len(),
+                                                _ => args.len(),
+                                            };
+                                            let callee_required = match &callee_ty {
+                                                Type::Function { required, .. } => *required,
+                                                _ => args.len(),
+                                            };
+                                            if args.len() < callee_total && args.len() >= callee_required {
+                                                let desc_gep = unsafe { self.builder.gep(
+                                                    self.context.i8_type(), cls_ptr_v,
+                                                    &[i64_ty.const_int(32, false)], "ir_desc_p"
+                                                ) };
+                                                let desc_ptr = self.builder.load(ptr_ty, desc_gep, "ir_desc").into_pointer_value();
+                                                // entries array begins at descriptor offset 8 (after i32 total,
+                                                // i32 required). Select entry index = k - required.
+                                                let entry_idx = args.len() - callee_required;
+                                                let entry_gep = unsafe { self.builder.gep(
+                                                    self.context.i8_type(), desc_ptr,
+                                                    &[i64_ty.const_int((8 + entry_idx * 8) as u64, false)], "ir_entry_p"
+                                                ) };
+                                                let entry_fn = self.builder.load(ptr_ty, entry_gep, "ir_entry").into_pointer_value();
+                                                let env_gep = self.builder.struct_gep(cls_ty, cls_ptr_v, 3, "ir_ep");
+                                                let env_ptr = self.builder.load(ptr_ty, env_gep, "ir_envp");
+                                                // Adapter has the boxed ABI: (env, k supplied args...) -> ptr.
+                                                let mut fn_param_types: Vec<BasicMetadataTypeEnum> = vec![ptr_ty.into()];
+                                                let mut call_args: Vec<BasicMetadataValueEnum> = vec![env_ptr.into()];
+                                                for (av, a_temp) in arg_vals.iter().zip(args.iter()) {
+                                                    let arg_ty = func.temp_types.get(a_temp).cloned().unwrap_or(Type::Null);
+                                                    fn_param_types.push(self.llvm_param_type(&arg_ty));
+                                                    call_args.push((*av).into());
+                                                }
+                                                let returns_void = matches!(ret_ty, Type::Null | Type::Never);
+                                                let fn_ty = if returns_void {
+                                                    void_ty.fn_type(&fn_param_types, false)
+                                                } else {
+                                                    ptr_ty.fn_type(&fn_param_types, false)
+                                                };
+                                                let call = self.builder.indirect_call(fn_ty, entry_fn, &call_args, "ir_desc_call");
+                                                let result = if returns_void {
+                                                    ptr_ty.const_null().into()
+                                                } else {
+                                                    let boxed = call.try_as_basic_value().unwrap_basic();
+                                                    if Self::is_union_type(ret_ty) { boxed }
+                                                    else { self.unbox_tagged_val_to_type(boxed, ret_ty) }
+                                                };
+                                                temp_map.insert(*dst, result);
+                                                continue;
+                                            }
+                                            // Build closure call: load fn_ptr from offset 2 of closure struct.
                                             let fn_gep = self.builder.struct_gep(cls_ty, cls_ptr_v, 2, "ir_fp");
                                             let fn_ptr = self.builder.load(ptr_ty, fn_gep, "ir_fnp").into_pointer_value();
                                             let env_gep = self.builder.struct_gep(cls_ty, cls_ptr_v, 3, "ir_ep");
@@ -955,12 +1060,18 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::MakeClosure { dst, func: fid, captures, ret_ty: _ } => {
                             if let Some(&callee_fn) = ir_fn_to_llvm.get(fid) {
+                                // If this function has default arguments, attach its descriptor
+                                // so an indirect under-arity call fills the omitted defaults.
+                                let descriptor = self.cls_descriptors.get(fid).copied();
                                 let cls = if captures.is_empty() {
                                     // The target was lowered as a non-closure (no env param 0),
                                     // but closure call sites invoke fn_ptr(env, args...) -> ptr.
                                     // Wrap it in an env-ignoring stub that also boxes the return,
-                                    // matching the uniform boxed closure ABI.
-                                    self.wrap_named_fn_as_closure_boxed(callee_fn)
+                                    // matching the uniform boxed closure ABI. Pass the function's
+                                    // real Lin return type so a raw Str/Array/Object return is
+                                    // boxed (the indirect caller always unboxes).
+                                    let ret = module.function(*fid).map(|f| f.ret_ty.clone());
+                                    self.wrap_named_fn_as_closure_boxed_desc_ret(callee_fn, descriptor, ret.as_ref())
                                 } else {
                                     // Captures present ⇒ the function has an env param 0; build
                                     // the env struct and store the raw fn ptr.
@@ -969,7 +1080,7 @@ impl<'ctx> Codegen<'ctx> {
                                         .iter()
                                         .filter_map(|c| temp_map.get(c).copied())
                                         .collect();
-                                    self.make_closure_struct(fn_ptr.into(), &capture_vals)
+                                    self.make_closure_struct_desc(fn_ptr.into(), &capture_vals, descriptor)
                                 };
                                 temp_map.insert(*dst, cls);
                             }

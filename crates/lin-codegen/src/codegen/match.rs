@@ -60,7 +60,14 @@ impl<'ctx> Codegen<'ctx> {
                 let from_bits = iv.get_type().get_bit_width();
                 let to_bits = it.get_bit_width();
                 return if to_bits > from_bits {
-                    self.builder.int_z_extend_or_bit_cast(iv, it, "ir_zext").into()
+                    // Widen by the SOURCE type's signedness: a signed Int32 -1 (0xFFFFFFFF)
+                    // must sign-extend to Int64 -1, not zero-extend to 4294967295. Using
+                    // zero-extend unconditionally corrupted `val x: Int64 = 0 - 1`.
+                    if from_ty.is_signed() {
+                        self.builder.int_s_extend_or_bit_cast(iv, it, "ir_sext").into()
+                    } else {
+                        self.builder.int_z_extend_or_bit_cast(iv, it, "ir_zext").into()
+                    }
                 } else {
                     self.builder.int_truncate_or_bit_cast(iv, it, "ir_trunc").into()
                 };

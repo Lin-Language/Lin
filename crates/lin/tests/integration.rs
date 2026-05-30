@@ -197,7 +197,7 @@ fn test_functions_and_partial_application() {
 import { toString } from "std/string"
 
 val add = (a: Int32, b: Int32): Int32 => a + b
-val addTen = add(10)
+val addTen = add(10,)
 print(toString(addTen(5)))
 print(toString(add(3, 4)))
 "#);
@@ -1020,12 +1020,116 @@ fn test_partial_application_chain() {
 import { toString } from "std/string"
 
 val add3 = (a: Int32, b: Int32, c: Int32): Int32 => a + b + c
-val step1 = add3(1)
-val step2 = step1(2)
+val step1 = add3(1,)
+val step2 = step1(2,)
 val result = step2(3)
 print(toString(result))
 "#);
     assert_eq!(output, vec!["6"]);
+}
+
+#[test]
+fn test_default_args_basic() {
+    // Omitting a trailing optional argument fills it from its default.
+    let output = run(r#"import { print } from "std/io"
+
+val greet = (name: String, greeting: String = "Hello") => "${greeting}, ${name}"
+print(greet("World"))
+print(greet("World", "Hi"))
+"#);
+    assert_eq!(output, vec!["Hello, World", "Hi, World"]);
+}
+
+#[test]
+fn test_default_args_chained() {
+    // A default may reference earlier parameters, including earlier defaults.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val box = (w: Int32, h: Int32 = w, area: Int32 = w * h) => area
+print(toString(box(4)))
+print(toString(box(4, 3)))
+print(toString(box(4, 3, 99)))
+"#);
+    assert_eq!(output, vec!["16", "12", "99"]);
+}
+
+#[test]
+fn test_default_args_object() {
+    let output = run(r#"import { print } from "std/io"
+
+val config = (name: String, opts: Json = { "v": false }) => "${name}:${opts}"
+print(config("a"))
+print(config("b", { "v": true }))
+"#);
+    assert_eq!(output, vec!["a:{\"v\": false}", "b:{\"v\": true}"]);
+}
+
+#[test]
+fn test_default_args_indirect_value() {
+    // Default-fill works when the function is held as a first-class value
+    // (the closure carries a descriptor so the indirect call fills defaults).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val scale = (x: Int32, factor: Int32 = 2) => x * factor
+val g = scale
+print(toString(g(5)))
+print(toString(g(5, 3)))
+"#);
+    assert_eq!(output, vec!["10", "15"]);
+}
+
+#[test]
+fn test_default_args_cross_module() {
+    // An imported function's defaults are filled by an adapter emitted in the
+    // defining module and called by symbol from the importer.
+    let dir = std::env::temp_dir().join(format!("lin_da_xmod_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "export val scale = (x: Int32, factor: Int32 = 2) => x * factor\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ scale }} from "{}/lib"
+print(toString(scale(5)))
+print(toString(scale(5, 3)))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["10", "15"]);
+}
+
+#[test]
+fn test_default_args_trailing_comma_still_curries() {
+    // A trailing comma requests partial application even when defaults exist,
+    // rather than filling the default.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val scale = (x: Int32, factor: Int32 = 2) => x * factor
+val triple = scale(3,)
+print(toString(triple(4)))
+"#);
+    assert_eq!(output, vec!["12"]);
+}
+
+#[test]
+fn test_default_args_too_few_is_error() {
+    // Supplying fewer than the required (non-defaulted) arguments is an error.
+    let err = run_expect_err(r#"import { print } from "std/io"
+val f = (a: Int32, b: Int32 = 1) => a + b
+print(f())
+"#);
+    assert!(err.contains("Too few arguments"), "got: {}", err);
+}
+
+#[test]
+fn test_default_args_required_after_optional_is_error() {
+    // A required parameter may not follow one with a default value.
+    let err = run_expect_err(r#"
+val bad = (a: Int32, b: Int32 = 1, c: Int32) => a + b + c
+"#);
+    assert!(err.contains("cannot follow a parameter with a default"), "got: {}", err);
 }
 
 #[test]
@@ -2810,6 +2914,35 @@ print(toString(e))   // 18446744073709551615
 }
 
 #[test]
+fn test_signed_widening_sign_extends() {
+    // Widening a signed integer to a wider type must SIGN-extend: `0 - 1` is an Int32 -1
+    // (0xFFFFFFFF); storing it into an Int64 slot must give -1, not 4294967295. Regression
+    // for a Coerce path that zero-extended unconditionally. Unsigned widening must still
+    // zero-extend (a UInt8 200 → UInt32 stays 200), so both directions are checked.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val a: Int64 = 0 - 1
+val b: Int64 = 5 - 10
+val c: Int32 = 0 - 1
+val big: Int64 = 3000000000
+
+val u8v: UInt8 = 200
+val uwide: UInt32 = u8v
+val u16v: UInt16 = 65000
+val uwide2: UInt64 = u16v
+
+print(toString(a))       // -1
+print(toString(b))       // -5
+print(toString(c))       // -1
+print(toString(big))     // 3000000000 (positive widening unaffected)
+print(toString(uwide))   // 200 (unsigned still zero-extends)
+print(toString(uwide2))  // 65000
+"#);
+    assert_eq!(out, vec!["-1", "-5", "-1", "3000000000", "200", "65000"]);
+}
+
+#[test]
 fn test_unsigned_int_cross_compare() {
     // A boxed UInt32 (now stored as TAG_INT64) still compares correctly against a boxed Int32,
     // both for equality and ordering of large values.
@@ -2852,4 +2985,200 @@ val bytes: UInt8[] = [255, 255, 255, 255]
 print(toString(u32FromBe(bytes, 0)))   // 4294967295
 "#);
     assert_eq!(out, vec!["4294967295"]);
+}
+
+// ===========================================================================
+// std/net — UDP and TCP sockets (Milestone 21, Layer 2)
+//
+// These exercise REAL loopback sockets. They are consolidated into single test
+// functions (one for UDP, one for TCP) so that all socket work for a given
+// protocol runs single-threaded with deterministic ordering, and so that fixed
+// high ports don't collide across parallel test threads.
+// ===========================================================================
+
+#[test]
+fn test_net_udp_loopback_roundtrip() {
+    // Bind one UDP socket and send a datagram to itself, then recvFrom it.
+    // udpBind binds a fixed port (the API doesn't surface an OS-assigned port),
+    // so we use a high port and send to 127.0.0.1:<port>.
+    let out = run(r#"import { udpBind, udpSendTo, udpRecv, udpRecvFrom, udpSetNonblocking, udpClose } from "std/net"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val port = 39201
+val sock = udpBind(port)
+print("bound: ${toString(sock["type"] != "error")}")
+
+// Non-blocking recv with no data pending must return Null.
+val nb = udpSetNonblocking(sock, true)
+val empty: UInt8[] = [0, 0, 0, 0]
+val none = udpRecv(sock, empty)
+print("empty-recv-null: ${toString(none == null)}")
+
+// Back to blocking for the round-trip.
+val nb2 = udpSetNonblocking(sock, false)
+val msg: UInt8[] = [72, 105, 33, 10]
+val sent = udpSendTo(sock, "127.0.0.1", port, msg)
+print("sent: ${toString(sent)}")
+
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+val res = udpRecvFrom(sock, buf)
+print("len: ${toString(res["len"])}")
+print("addr: ${toString(res["addr"])}")
+print("b0: ${toString(buf[0])}")
+print("b1: ${toString(buf[1])}")
+print("b2: ${toString(buf[2])}")
+print("b3: ${toString(buf[3])}")
+
+val c = udpClose(sock)
+"#);
+    assert_eq!(
+        out,
+        vec![
+            "bound: true",
+            "empty-recv-null: true",
+            "sent: 4",
+            "len: 4",
+            "addr: 127.0.0.1",
+            "b0: 72",
+            "b1: 105",
+            "b2: 33",
+            "b3: 10",
+        ]
+    );
+}
+
+#[test]
+fn test_net_tcp_loopback_echo() {
+    // Single-threaded TCP ordering: listen, connect (blocking — the kernel
+    // completes the handshake into the listener backlog), then a blocking accept
+    // immediately returns the pending connection. The server then reads the
+    // client's bytes. After the client closes, the server's recv returns 0.
+    let out = run(r#"import { tcpListen, tcpAccept, tcpConnect, tcpRecv, tcpSend, tcpClose } from "std/net"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val port = 39202
+val listener = tcpListen(port)
+print("listening: ${toString(listener["type"] != "error")}")
+
+val client = tcpConnect("127.0.0.1", port)
+print("connected: ${toString(client["type"] != "error")}")
+
+val accepted = tcpAccept(listener)
+val server = accepted["fd"]
+print("accepted: ${toString(accepted["type"] != "error")}")
+
+val payload: UInt8[] = [76, 105, 110, 33]
+val sent = tcpSend(client, payload)
+print("sent: ${toString(sent)}")
+
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0]
+val n = tcpRecv(server, buf)
+print("recv: ${toString(n)}")
+print("b0: ${toString(buf[0])}")
+print("b1: ${toString(buf[1])}")
+print("b2: ${toString(buf[2])}")
+print("b3: ${toString(buf[3])}")
+
+// Close the client; the server's next recv must return 0 (peer closed).
+val cc = tcpClose(client)
+val buf2: UInt8[] = [0, 0, 0, 0]
+val n2 = tcpRecv(server, buf2)
+print("recv-after-close: ${toString(n2)}")
+
+val sc = tcpClose(server)
+val lc = tcpClose(listener)
+"#);
+    assert_eq!(
+        out,
+        vec![
+            "listening: true",
+            "connected: true",
+            "accepted: true",
+            "sent: 4",
+            "recv: 4",
+            "b0: 76",
+            "b1: 105",
+            "b2: 110",
+            "b3: 33",
+            "recv-after-close: 0",
+        ]
+    );
+}
+
+// ===========================================================================
+// std/proc — subprocesses, and std/tty — raw terminal (Milestone 21, Layer 3)
+//
+// std/proc is deterministic: we spawn a real `sh -c` process, read its piped
+// stdout, and wait for its exit code. std/tty cannot be exercised under the
+// test harness (stdin is a pipe, not a TTY); we only assert that rawMode on a
+// non-TTY returns an Error object gracefully (no panic / no crash).
+// ===========================================================================
+
+#[test]
+fn test_proc_spawn_read_wait() {
+    // Spawn `sh -c 'printf hello'`, read its stdout into a buffer, assert the
+    // bytes, then wait for exit code 0. `sh -c` is the most portable spawn.
+    let out = run(r#"import { spawn, readStdout, wait } from "std/proc"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val h = spawn(["sh", "-c", "printf hello"])
+print("spawned: ${toString(h["type"] != "error")}")
+
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+val n = readStdout(h, buf)
+print("n: ${toString(n)}")
+print("b0: ${toString(buf[0])}")
+print("b1: ${toString(buf[1])}")
+print("b2: ${toString(buf[2])}")
+print("b3: ${toString(buf[3])}")
+print("b4: ${toString(buf[4])}")
+
+val code = wait(h)
+print("code: ${toString(code)}")
+"#);
+    assert_eq!(
+        out,
+        vec![
+            "spawned: true",
+            "n: 5",
+            "b0: 104", // 'h'
+            "b1: 101", // 'e'
+            "b2: 108", // 'l'
+            "b3: 108", // 'l'
+            "b4: 111", // 'o'
+            "code: 0",
+        ]
+    );
+}
+
+#[test]
+fn test_proc_wait_exit_code() {
+    // `sh -c 'exit 3'` exits with code 3.
+    let out = run(r#"import { spawn, wait } from "std/proc"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val h = spawn(["sh", "-c", "exit 3"])
+val code = wait(h)
+print("code: ${toString(code)}")
+"#);
+    assert_eq!(out, vec!["code: 3"]);
+}
+
+#[test]
+fn test_tty_rawmode_on_non_tty_returns_error() {
+    // Under the test harness stdin is not a TTY, so tcgetattr fails and rawMode
+    // must return an Error object (type == "error") rather than panicking. We
+    // assert "error" (not crash) without depending on the exact message.
+    let out = run(r#"import { rawMode } from "std/tty"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val r = rawMode(true)
+print("type: ${toString(r["type"])}")
+"#);
+    assert_eq!(out, vec!["type: error"]);
 }

@@ -99,8 +99,8 @@ pub fn is_compatible_env(
 
         // Function compatibility: contravariant params, covariant return
         (
-            Type::Function { params: vp, ret: vr },
-            Type::Function { params: tp, ret: tr },
+            Type::Function { params: vp, ret: vr, .. },
+            Type::Function { params: tp, ret: tr, .. },
         ) => {
             // Opaque `Function` annotation: all params are TypeVar(MAX) and ret is TypeVar(MAX).
             // Treat as accepting any function regardless of arity.

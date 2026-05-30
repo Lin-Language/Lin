@@ -497,6 +497,7 @@ mod tests {
             functions: vec![func],
             global_fn_slots: std::collections::HashMap::new(),
             intrinsics: std::collections::HashMap::new(),
+            default_descriptors: std::collections::HashMap::new(),
         }
     }
 

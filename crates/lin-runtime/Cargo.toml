@@ -10,3 +10,4 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 serde_json = { version = "1", default-features = false, features = ["std"] }
 ureq = { workspace = true }
+libc = "0.2"

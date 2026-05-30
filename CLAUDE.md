@@ -44,7 +44,7 @@ Cargo workspace with nine crates (`crates/`):
 - **`lin`** — CLI binary. Dispatches `build`, `check`, `test` subcommands.
 - **`lin-lsp`** — language server (in progress).
 
-Stdlib lives in `stdlib/*.lin` and is loaded via `include_str!` in `lin-compile`. Current stdlib modules: `std/io`, `std/string`, `std/number`, `std/array`, `std/object`, `std/async`, `std/fs`, `std/http`, `std/template`, `std/test`.
+Stdlib lives in `stdlib/*.lin` and is loaded via `include_str!` in `lin-compile`. Current stdlib modules: `std/io`, `std/string`, `std/number`, `std/array`, `std/object`, `std/async`, `std/fs`, `std/http`, `std/net`, `std/proc`, `std/tty`, `std/template`, `std/test`.
 
 ## Pipeline shape
 

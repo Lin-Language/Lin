@@ -1,0 +1,34 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { spawn, readStdout, wait } from "std/proc"
+
+// std/proc: spawning a real subprocess is deterministic. We run `sh -c 'printf hello'`,
+// read its piped stdout, assert the bytes, and check the exit code. This touches no
+// stdin/TTY state, so it is CI-safe. std/tty is NOT tested here (it requires a real
+// terminal); see crates/lin/tests/integration.rs for the non-TTY rawMode error case.
+
+val s = suite("std/proc", [
+  test("spawn + readStdout returns the child's output bytes", () =>
+    val h = spawn(["sh", "-c", "printf hello"])
+    val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+    val n = readStdout(h, buf)
+    val code = wait(h)
+    val r = [
+      expect(n).toBe(5),
+      expect(buf[0]).toBe(104),
+      expect(buf[1]).toBe(101),
+      expect(buf[2]).toBe(108),
+      expect(buf[3]).toBe(108),
+      expect(buf[4]).toBe(111),
+      expect(code).toBe(0),
+    ]
+    r
+  ),
+
+  test("wait returns the child's exit code", () =>
+    val h = spawn(["sh", "-c", "exit 3"])
+    val code = wait(h)
+    expect(code).toBe(3)
+  ),
+])
+
+run(s)

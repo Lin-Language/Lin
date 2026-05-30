@@ -78,12 +78,17 @@ pub enum Expr {
     Call {
         func: Box<Expr>,
         args: Vec<Expr>,
+        /// True when the argument list ended with an explicit trailing comma
+        /// (`f(x,)`), requesting partial application rather than default-fill.
+        partial: bool,
         span: Span,
     },
     DotCall {
         receiver: Box<Expr>,
         method: String,
         args: Option<Vec<Expr>>,
+        /// True when the argument list ended with an explicit trailing comma.
+        partial: bool,
         span: Span,
     },
     Index {
@@ -241,6 +246,10 @@ pub struct ObjectPatternField {
 pub struct Param {
     pub pattern: Pattern,
     pub type_ann: Option<TypeExpr>,
+    /// Default value expression: `(a: Int32, b: Int32 = a + 1)`. When present, the
+    /// parameter is optional at call sites. Optional params must be last (enforced
+    /// in lin-check). A default may reference parameters declared before it.
+    pub default: Option<Box<Expr>>,
 }
 
 #[derive(Debug, Clone)]

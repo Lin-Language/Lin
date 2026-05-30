@@ -23,6 +23,11 @@ pub enum Type {
     Function {
         params: Vec<Type>,
         ret: Box<Type>,
+        /// Number of leading parameters that have no default value, i.e. the
+        /// minimum arity a (non-partial) call must supply. `required == params.len()`
+        /// for functions without default arguments. Excluded from structural
+        /// compatibility — see `compat.rs`.
+        required: usize,
     },
     Iterator(Box<Type>),
     TypeVar(u32),
@@ -33,6 +38,12 @@ pub enum Type {
 }
 
 impl Type {
+    /// Construct a function type with no default arguments (`required == params.len()`).
+    pub fn func(params: Vec<Type>, ret: Type) -> Type {
+        let required = params.len();
+        Type::Function { params, ret: Box::new(ret), required }
+    }
+
     pub fn is_numeric(&self) -> bool {
         matches!(
             self,
@@ -159,13 +170,18 @@ impl fmt::Display for Type {
                 }
                 Ok(())
             }
-            Type::Function { params, ret } => {
+            Type::Function { params, ret, required } => {
                 write!(f, "(")?;
                 for (i, p) in params.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", p)?;
+                    // Optional (defaulted) params render with a trailing `?`.
+                    if i >= *required {
+                        write!(f, "{}?", p)?;
+                    } else {
+                        write!(f, "{}", p)?;
+                    }
                 }
                 write!(f, ") => {}", ret)
             }

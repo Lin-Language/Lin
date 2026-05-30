@@ -11,6 +11,7 @@ impl Checker {
         &mut self,
         func: &Expr,
         args: &[Expr],
+        partial: bool,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
         // Function expression and arguments are not in tail position.
@@ -20,7 +21,7 @@ impl Checker {
         let func_ty = typed_func.ty();
 
         let (typed_args, result_type) = match &func_ty {
-            Type::Function { params, ret } => {
+            Type::Function { params, ret, required } => {
                 // Opaque `Function` annotation: all params and ret are TypeVar.
                 // Accept any number of arguments and return a fresh TypeVar.
                 let is_opaque = params.iter().all(|p| matches!(p, Type::TypeVar(_)))
@@ -37,6 +38,7 @@ impl Checker {
                         args: typed_args,
                         result_type,
                         is_tail: self.is_tail_call(func),
+                        partial,
                         span,
                     });
                 }
@@ -144,14 +146,53 @@ impl Checker {
                 }
 
                 let concrete_ret = apply_type_subs(ret, &subs);
+                let required = *required;
 
-                let result_type = if typed_args.len() < params.len() {
-                    let remaining_params = concrete_params[typed_args.len()..].to_vec();
-                    Type::Function {
-                        params: remaining_params,
-                        ret: Box::new(concrete_ret),
+                let result_type = if partial {
+                    // Explicit partial application (`f(x,)`): return a function awaiting
+                    // the remaining parameters, preserving how many of those are still
+                    // required. A trailing comma on a fully-supplied arg list is just a
+                    // full call.
+                    if typed_args.len() < params.len() {
+                        let remaining_params = concrete_params[typed_args.len()..].to_vec();
+                        let remaining_required = required.saturating_sub(typed_args.len());
+                        Type::Function {
+                            params: remaining_params,
+                            ret: Box::new(concrete_ret),
+                            required: remaining_required,
+                        }
+                    } else {
+                        concrete_ret
                     }
                 } else {
+                    // Default-fill semantics: omitting trailing optional arguments fills
+                    // them from their defaults and calls now. Supplying fewer than the
+                    // required count is an error (use a trailing comma to curry instead).
+                    if typed_args.len() < required {
+                        let optional = params.len() - required;
+                        let help = if optional == 0 {
+                            format!(
+                                "this function takes {} argument{} — to partially apply, add a trailing comma: f(x,)",
+                                params.len(),
+                                if params.len() == 1 { "" } else { "s" },
+                            )
+                        } else {
+                            format!(
+                                "this function takes {} required and {} optional argument{} — to partially apply, add a trailing comma: f(x,)",
+                                required,
+                                optional,
+                                if optional == 1 { "" } else { "s" },
+                            )
+                        };
+                        return Err(Diagnostic::error(
+                            span,
+                            format!(
+                                "Too few arguments: expected at least {}, got {}",
+                                required,
+                                typed_args.len()
+                            ),
+                        ).with_help(help));
+                    }
                     concrete_ret
                 };
                 (typed_args, result_type)
@@ -216,6 +257,7 @@ impl Checker {
             args: typed_args,
             result_type,
             is_tail,
+            partial,
             span,
         })
     }
@@ -225,8 +267,13 @@ impl Checker {
         receiver: &Expr,
         method: &str,
         args: &Option<Vec<Expr>>,
+        partial: bool,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
+        // A dot access with no argument list (`x.f`) is partial application of the
+        // receiver (spec §11.1), never default-fill. An explicit trailing comma
+        // (`x.f(y,)`) is also partial.
+        let partial = partial || args.is_none();
         // Desugar: receiver.method(args) -> method(receiver, args)
         // Special case: TupleArgs receiver spreads all elements as individual args.
         // e.g. (10, 3).sub -> sub(10, 3), not sub((10, 3))
@@ -238,6 +285,7 @@ impl Checker {
                 let dummy_call = Expr::Call {
                     func: Box::new(Expr::Ident(method.to_string(), span)),
                     args: all_arg_exprs.into_iter().cloned().collect(),
+                    partial,
                     span,
                 };
                 return self.infer_expr(&dummy_call);
@@ -248,7 +296,7 @@ impl Checker {
 
         // Look up method type for TypeVar substitution.
         if let Some(method_ty) = self.env.effective_type(method) {
-            if let Type::Function { params: method_params, ret } = method_ty.clone() {
+            if let Type::Function { params: method_params, ret, required: method_required } = method_ty.clone() {
                 // Build all arg expressions: [receiver, ...args]
                 let all_arg_exprs: Vec<&Expr> = std::iter::once(receiver)
                     .chain(args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]).iter())
@@ -301,10 +349,28 @@ impl Checker {
                     .map(|p| apply_type_subs(p, &subs))
                     .collect();
                 let concrete_ret = apply_type_subs(&ret, &subs);
-                let result_type = if all_args.len() < method_params.len() {
-                    let remaining = concrete_params[all_args.len()..].to_vec();
-                    Type::Function { params: remaining, ret: Box::new(concrete_ret) }
+                let result_type = if partial {
+                    if all_args.len() < method_params.len() {
+                        let remaining = concrete_params[all_args.len()..].to_vec();
+                        let remaining_required = method_required.saturating_sub(all_args.len());
+                        Type::Function {
+                            params: remaining,
+                            ret: Box::new(concrete_ret),
+                            required: remaining_required,
+                        }
+                    } else {
+                        concrete_ret
+                    }
                 } else {
+                    if all_args.len() < method_required {
+                        return Err(Diagnostic::error(
+                            span,
+                            format!(
+                                "Too few arguments to '{}': expected at least {}, got {} (including the receiver)",
+                                method, method_required, all_args.len()
+                            ),
+                        ).with_help("to partially apply, add a trailing comma: x.f(y,)".to_string()));
+                    }
                     concrete_ret
                 };
 
@@ -331,6 +397,7 @@ impl Checker {
                     args: all_args,
                     result_type,
                     is_tail: false,
+                    partial,
                     span,
                 });
             }
@@ -360,11 +427,28 @@ impl Checker {
         }
         if let Some(ty) = self.env.effective_type(method) {
             let result_type = match &ty {
-                Type::Function { params, ret } => {
-                    if all_args.len() < params.len() {
-                        let remaining = params[all_args.len()..].to_vec();
-                        Type::Function { params: remaining, ret: ret.clone() }
+                Type::Function { params, ret, required } => {
+                    if partial {
+                        if all_args.len() < params.len() {
+                            let remaining = params[all_args.len()..].to_vec();
+                            Type::Function {
+                                params: remaining,
+                                ret: ret.clone(),
+                                required: required.saturating_sub(all_args.len()),
+                            }
+                        } else {
+                            *ret.clone()
+                        }
                     } else {
+                        if all_args.len() < *required {
+                            return Err(Diagnostic::error(
+                                span,
+                                format!(
+                                    "Too few arguments to '{}': expected at least {}, got {} (including the receiver)",
+                                    method, required, all_args.len()
+                                ),
+                            ).with_help("to partially apply, add a trailing comma: x.f(y,)".to_string()));
+                        }
                         *ret.clone()
                     }
                 }
@@ -377,6 +461,7 @@ impl Checker {
                 args: all_args,
                 result_type,
                 is_tail: false,
+                partial,
                 span,
             })
         } else {

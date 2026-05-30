@@ -34,9 +34,10 @@ fn zonk_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| zonk_type(t, subs)).collect()),
         Type::Iterator(inner) => Type::Iterator(Box::new(zonk_type(inner, subs))),
         Type::Union(ts) => Type::flatten_union(ts.iter().map(|t| zonk_type(t, subs)).collect()),
-        Type::Function { params, ret } => Type::Function {
+        Type::Function { params, ret, required } => Type::Function {
             params: params.iter().map(|p| zonk_type(p, subs)).collect(),
             ret: Box::new(zonk_type(ret, subs)),
+            required: *required,
         },
         Type::Object(fields) => {
             let mut out = indexmap::IndexMap::new();

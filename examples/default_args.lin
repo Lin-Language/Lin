@@ -1,0 +1,33 @@
+import { print } from "std/io"
+import { toString } from "std/string"
+
+// A parameter may declare a default value with `= expr`. Optional (defaulted)
+// parameters must come last. Calling with fewer arguments fills the trailing
+// defaults; an explicit trailing comma requests partial application instead.
+
+val greet = (name: String, greeting: String = "Hello") => "${greeting}, ${name}"
+
+print(greet("World"))          // Hello, World   (greeting defaulted)
+print(greet("World", "Hi"))    // Hi, World
+
+// Defaults may reference earlier parameters (and chain through one another).
+val box = (w: Int32, h: Int32 = w, area: Int32 = w * h) => area
+
+print(toString(box(4)))        // 4 * 4  = 16
+print(toString(box(4, 3)))     // 4 * 3  = 12
+print(toString(box(4, 3, 99))) // 99
+
+// Object default value.
+val config = (name: String, opts: Json = { "verbose": false }) => "${name}: ${opts}"
+
+print(config("app"))                          // app: {"verbose": false}
+print(config("app", { "verbose": true }))     // app: {"verbose": true}
+
+// Default-fill also works when the function is held as a first-class value.
+val g = greet
+print(g("Lin"))                // Hello, Lin
+
+// A trailing comma still means partial application (currying), not default-fill.
+val add = (a: Int32, b: Int32) => a + b
+val addTen = add(10,)
+print(toString(addTen(5)))     // 15

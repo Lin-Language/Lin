@@ -628,14 +628,14 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 
 ### Layer 2 — Sockets
 
-- [ ] **UDP intrinsics** (`lin-runtime/src/net.rs`) — `lin_udp_bind`, `lin_udp_recv`, `lin_udp_recv_from`, `lin_udp_send_to`, `lin_udp_set_nonblocking`, `lin_udp_close`. fd returned as opaque `Int32` (spec §35.4); non-blocking would-block surfaces as `Null`, not `Error`.
-- [ ] **TCP intrinsics** (`lin-runtime/src/net.rs`) — `lin_tcp_listen`, `lin_tcp_accept`, `lin_tcp_connect`, `lin_tcp_recv`, `lin_tcp_send`, `lin_tcp_set_nonblocking`, `lin_tcp_close`. `accept` returns a connection fd + peer addr (or `Null` when would-block); `recv` returns `0` on peer-closed.
-- [ ] **`std/net` module** — UDP: `udpBind`, `udpRecv`, `udpRecvFrom`, `udpSendTo`, `udpSetNonblocking`, `udpClose`. TCP: `tcpListen`, `tcpAccept`, `tcpConnect`, `tcpRecv`, `tcpSend`, `tcpSetNonblocking`, `tcpClose`. All wrap intrinsics in the `T | Error` / `Null`-on-would-block convention.
+- [x] **UDP intrinsics** (`lin-runtime/src/net.rs`) — `lin_udp_bind`, `lin_udp_recv`, `lin_udp_recv_from`, `lin_udp_send_to`, `lin_udp_set_nonblocking`, `lin_udp_close`. fd returned as opaque `Int32` (spec §35.4); non-blocking would-block surfaces as `Null`, not `Error`.
+- [x] **TCP intrinsics** (`lin-runtime/src/net.rs`) — `lin_tcp_listen`, `lin_tcp_accept`, `lin_tcp_connect`, `lin_tcp_recv`, `lin_tcp_send`, `lin_tcp_set_nonblocking`, `lin_tcp_close`. `accept` returns a connection fd + peer addr (or `Null` when would-block); `recv` returns `0` on peer-closed.
+- [x] **`std/net` module** — UDP: `udpBind`, `udpRecv`, `udpRecvFrom`, `udpSendTo`, `udpSetNonblocking`, `udpClose`. TCP: `tcpListen`, `tcpAccept`, `tcpConnect`, `tcpRecv`, `tcpSend`, `tcpSetNonblocking`, `tcpClose`. All wrap intrinsics in the `T | Error` / `Null`-on-would-block convention.
 
 ### Layer 3 — Subprocess and raw terminal
 
-- [ ] **Subprocess intrinsics** — `lin_proc_spawn(String[])`, `lin_proc_read_stdout`, `lin_proc_kill`, `lin_proc_wait`; opaque `Int64` handle. **`std/proc`**: `spawn`, `readStdout`, `kill`, `wait`.
-- [ ] **Raw-TTY intrinsics** — `lin_tty_raw_mode(Boolean)`, `lin_tty_read_key()` (non-blocking). **`std/tty`**: `rawMode`, `readKey` (`Int32 | Null`).
+- [x] **Subprocess intrinsics** — `lin_proc_spawn(String[])`, `lin_proc_read_stdout`, `lin_proc_kill`, `lin_proc_wait`; opaque `Int64` handle. **`std/proc`**: `spawn`, `readStdout`, `kill`, `wait`.
+- [x] **Raw-TTY intrinsics** — `lin_tty_raw_mode(Boolean)`, `lin_tty_read_key()` (non-blocking). **`std/tty`**: `rawMode`, `readKey` (`Int32 | Null`).
 
 ### Layer 4 — Timing, signals; FFI and Worker for the rest
 
@@ -655,9 +655,9 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 - [ ] `UInt8[]` literals, indexing, in-place write, `length`, `push`, `slice`, `==`.
 - [ ] Each bitwise operator (`& | ^ << >> ~`) with integer fixtures; float-operand rejection is a compile-time error; precedence fixtures.
 - [ ] `std/bytes` round-trips: `u32ToBe`/`u32FromBe`, `f32ToBits`/`f32FromBits`, the 8-byte two-f32 control packet.
-- [ ] `std/net`: UDP loopback send/recv; non-blocking recv returns `Null` when no data.
-- [ ] `std/net`: TCP loopback — listener accepts a connection, echoes bytes back to a connected client; `recv` returns `0` after the peer closes.
-- [ ] `std/proc`: spawn a process, read its stdout to EOF, exit code via `wait`.
+- [x] `std/net`: UDP loopback send/recv; non-blocking recv returns `Null` when no data.
+- [x] `std/net`: TCP loopback — listener accepts a connection, echoes bytes back to a connected client; `recv` returns `0` after the peer closes.
+- [x] `std/proc`: spawn a process, read its stdout to EOF, exit code via `wait`.
 - [ ] `examples/`: a NAL-parser / RTP-packetizer fixture (the protocol core, no OS), plus a UDP echo fixture.
 
 ---

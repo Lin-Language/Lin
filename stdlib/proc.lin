@@ -1,0 +1,23 @@
+import foreign "lin-runtime"
+  val lin_proc_spawn: (String[]) => Json
+  val lin_proc_read_stdout: (Int64, UInt8[]) => Json
+  val lin_proc_kill: (Int64) => Json
+  val lin_proc_wait: (Int64) => Json
+
+// spawn a subprocess; argv[0] is the program, the rest are arguments.
+// Returns an opaque Int64 process handle, or an Error.
+export val spawn = (argv: String[]): Json =>
+  lin_proc_spawn(argv)
+
+// read up to buf.length bytes from the process's stdout into buf.
+// Returns the number of bytes read (0 = EOF), or an Error.
+export val readStdout = (handle: Int64, buf: UInt8[]): Json =>
+  lin_proc_read_stdout(handle, buf)
+
+// kill the subprocess. Returns Null on success, or an Error.
+export val kill = (handle: Int64): Json =>
+  lin_proc_kill(handle)
+
+// wait for the subprocess to exit. Returns its exit code, or an Error.
+export val wait = (handle: Int64): Json =>
+  lin_proc_wait(handle)

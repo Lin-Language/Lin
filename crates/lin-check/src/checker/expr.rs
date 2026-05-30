@@ -11,7 +11,7 @@ impl Checker {
     pub(crate) fn check_expr(&mut self, expr: &Expr, expected: &Type) -> Result<TypedExpr, Diagnostic> {
         // For function expressions with a known expected function type, use the expected
         // param types to guide inference (bidirectional type checking).
-        if let (Expr::Function { params, return_type, body, span }, Type::Function { params: expected_params, ret: expected_ret }) = (expr, expected) {
+        if let (Expr::Function { params, return_type, body, span }, Type::Function { params: expected_params, ret: expected_ret, .. }) = (expr, expected) {
             return self.infer_function_with_hints(params, return_type, body, *span, None, expected_params, expected_ret);
         }
 
@@ -95,8 +95,8 @@ impl Checker {
             Expr::Ident(name, span)  => self.infer_ident(name, *span),
             Expr::BinaryOp { left, op, right, span } => self.infer_binary_op(left, *op, right, *span),
             Expr::UnaryOp { op, operand, span } => self.infer_unary_op(*op, operand, *span),
-            Expr::Call { func, args, span }           => self.infer_call(func, args, *span),
-            Expr::DotCall { receiver, method, args, span } => self.infer_dot_call(receiver, method, args, *span),
+            Expr::Call { func, args, partial, span }  => self.infer_call(func, args, *partial, *span),
+            Expr::DotCall { receiver, method, args, partial, span } => self.infer_dot_call(receiver, method, args, *partial, *span),
             Expr::Index { object, key, span }         => self.infer_index(object, key, *span),
             Expr::If { condition, then_branch, else_branch, span } => self.infer_if(condition, then_branch, else_branch, *span),
             Expr::Match { scrutinee, arms, span }     => self.infer_match(scrutinee, arms, *span),

@@ -18,6 +18,9 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/fs`](#stdfs) | Filesystem read and write |
 | [`std/path`](#stdpath) | Path string manipulation |
 | [`std/http`](#stdhttp) | HTTP client and server |
+| [`std/net`](#stdnet) | UDP and TCP sockets |
+| [`std/proc`](#stdproc) | Subprocess spawn / stdout / wait |
+| [`std/tty`](#stdtty) | Raw terminal mode and key reads |
 | [`std/async`](#stdasync) | Async, concurrency and workers |
 | [`std/env`](#stdenv) | Environment variables |
 | [`std/process`](#stdprocess) | External process execution |
@@ -2995,6 +2998,139 @@ match parseBody(req)
   is { "type": "failure", "error": e }    => badRequest(e)
   is { "type": "success", "value": body } => createItem(body)
 ```
+
+---
+
+## std/net
+
+Low-level UDP and TCP sockets — the byte-stream layer beneath `std/http`/`std/server`, for non-HTTP protocols and custom framing. Every socket is an opaque integer fd handle (spec §35.4): there are no open-socket objects in user code, just the raw OS fd as an `Int32`. Every fallible call returns the `T | Error` result shape; a non-blocking read with no data available yet returns `Null` (so a poll loop reads naturally). IPv4 only; `bind`/`listen` bind to `0.0.0.0`.
+
+`recv`/`recvFrom`/`tcpRecv` fill a **caller-owned** `UInt8[]` and return the number of bytes read; the buffer is never transferred across the boundary. The buffer's length bounds the read — pre-size it to the maximum datagram/chunk you want to accept (e.g. `[0,0,...]` of N elements).
+
+### UDP
+
+```txt
+udpBind:           (port: Int32)                              => Int32 | Error    // fd handle
+udpRecv:           (fd: Int32, buf: UInt8[])                  => Int32 | Null | Error  // bytes read; Null = would-block
+udpRecvFrom:       (fd: Int32, buf: UInt8[])                  => { "len": Int32, "addr": String, "port": Int32 } | Null | Error
+udpSendTo:         (fd: Int32, addr: String, port: Int32, buf: UInt8[]) => Int32 | Error
+udpSetNonblocking: (fd: Int32, on: Boolean)                   => Null | Error
+udpClose:          (fd: Int32)                                => Null | Error
+```
+
+### TCP
+
+A listener accepts connections, each of which is itself an fd; a client connects directly. Reads and writes operate on a connected fd.
+
+```txt
+tcpListen:         (port: Int32)                  => Int32 | Error            // listener fd
+tcpAccept:         (fd: Int32)                    => { "fd": Int32, "addr": String, "port": Int32 } | Null | Error  // Null = would-block
+tcpConnect:        (host: String, port: Int32)    => Int32 | Error            // connected fd
+tcpRecv:           (fd: Int32, buf: UInt8[])      => Int32 | Null | Error      // bytes read; 0 = peer closed; Null = would-block
+tcpSend:           (fd: Int32, buf: UInt8[])      => Int32 | Error            // bytes written
+tcpSetNonblocking: (fd: Int32, on: Boolean)       => Null | Error
+tcpClose:          (fd: Int32)                    => Null | Error
+```
+
+### UDP echo example
+
+```txt
+import { udpBind, udpSendTo, udpRecvFrom, udpClose } from "std/net"
+import { print } from "std/io"
+
+val sock = udpBind(39201)
+val msg: UInt8[] = [72, 105, 33]               // "Hi!"
+udpSendTo(sock, "127.0.0.1", 39201, msg)       // send to self
+
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+val res = udpRecvFrom(sock, buf)
+print("got ${res["len"]} bytes from ${res["addr"]}")   // got 3 bytes from 127.0.0.1
+udpClose(sock)
+```
+
+### TCP echo example
+
+```txt
+import { tcpListen, tcpAccept, tcpConnect, tcpRecv, tcpSend, tcpClose } from "std/net"
+import { print } from "std/io"
+
+val listener = tcpListen(39202)
+val client   = tcpConnect("127.0.0.1", 39202)  // kernel completes the handshake
+val accepted = tcpAccept(listener)             // returns the pending connection
+val server   = accepted["fd"]
+
+val payload: UInt8[] = [76, 105, 110, 33]      // "Lin!"
+tcpSend(client, payload)
+
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0]
+val n = tcpRecv(server, buf)                   // n == 4
+print("echoed ${n} bytes")
+
+tcpClose(client)
+val n2 = tcpRecv(server, buf)                  // 0 — peer closed
+tcpClose(server)
+tcpClose(listener)
+```
+
+---
+
+## std/proc
+
+Spawn and manage child processes. A process is an opaque integer handle (spec §35.4, §35.6) — an `Int64` the runtime interprets, not an OS pid (the handle is a monotonic id, so it is immune to pid-reuse races). Every fallible call returns the `T | Error` result shape.
+
+```txt
+spawn:       (argv: String[])              => Int64 | Error     // opaque process handle
+readStdout:  (handle: Int64, buf: UInt8[]) => Int32 | Error     // bytes read; 0 = EOF
+kill:        (handle: Int64)               => Null | Error
+wait:        (handle: Int64)               => Int32 | Error     // exit code
+```
+
+`argv[0]` is the program (looked up on `PATH` or an absolute path); the rest are arguments. The child's stdin is connected to `/dev/null`, its stdout is captured into a pipe (so `readStdout` works), and its stderr is inherited from the parent.
+
+`readStdout` fills a **caller-owned** `UInt8[]` and returns the number of bytes read, reading incrementally from the same pipe across calls; `0` means end-of-stream. `wait` blocks until the child exits, returns its exit code (`-1` if it was terminated by a signal), and reaps the process — after `wait` the handle is no longer valid. `kill` sends SIGKILL; killing an already-exited child is tolerated and returns `Null`.
+
+### Example — capture a subprocess's output
+
+```txt
+import { spawn, readStdout, wait } from "std/proc"
+import { print } from "std/io"
+
+val h = spawn(["sh", "-c", "printf hello"])
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+val n = readStdout(h, buf)          // n == 5
+print("read ${n} bytes, first = ${buf[0]}")   // read 5 bytes, first = 104 ('h')
+val code = wait(h)                  // 0
+print("exited ${code}")
+```
+
+---
+
+## std/tty
+
+Raw terminal mode and non-blocking key input on stdin (spec §35.7).
+
+```txt
+rawMode:  (on: Boolean)  => Null | Error    // enable/disable terminal raw mode
+readKey:  ()             => Int32 | Null    // keycode, or Null if no key available (non-blocking)
+```
+
+`rawMode(true)` puts the terminal into raw mode: canonical line buffering and echo are disabled, and reads become non-blocking. The original terminal settings are saved and restored exactly by `rawMode(false)`. If stdin is not a terminal (e.g. a pipe), `rawMode` returns an `Error` object rather than panicking.
+
+`readKey` reads a single byte from stdin without blocking: it returns the byte value (`0..255`) as an `Int32`, or `Null` if no key is currently available. Multi-byte sequences (arrow keys, function keys) arrive one byte at a time, so a reader reassembles escape sequences itself.
+
+### Example — poll for a key in raw mode
+
+```txt
+import { rawMode, readKey } from "std/tty"
+import { print } from "std/io"
+
+rawMode(true)            // disable canonical mode + echo; reads are non-blocking
+val k = readKey()        // a byte value, or null if nothing was typed
+if k != null then print("key: ${k}") else print("no key ready")
+rawMode(false)           // restore the original terminal settings
+```
+
+A real application polls `readKey` repeatedly (typically via a `range(...).for(...)` driven loop with `std/time` `sleepMicros` between polls), treating `null` as "nothing yet" and acting on byte values as keys.
 
 ---
 

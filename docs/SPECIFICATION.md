@@ -591,6 +591,17 @@ val add = (a: Int32, b: Int32) =>
   return a + b
 ```
 
+### 9.5 Default Parameter Values
+
+A parameter may declare a default value with `= expr` after its (optional) type
+annotation, making it optional at the call site. Optional parameters must be
+last. See §10.6 for the full semantics.
+
+```txt
+val greet = (name: String, greeting: String = "Hello") =>
+  "${greeting}, ${name}"
+```
+
 ## 10. Function Calls and Partial Application
 
 ### 10.1 Function Calls
@@ -601,14 +612,31 @@ val result = add(1, 2)
 
 ### 10.2 Partial Application
 
-Functions may be partially applied from left to right by supplying fewer arguments than the function declares. The result is a new function awaiting the remaining arguments.
+Functions may be partially applied from left to right. Partial application is
+requested with an **explicit trailing comma** after the supplied arguments; the
+result is a new function awaiting the remaining arguments.
 
 ```txt
-val addTen = add(10)
+val addTen = add(10,)
 val fifteen = addTen(5)
 ```
 
 The type of `addTen` is `(Int32) => Int32`.
+
+A call without a trailing comma is a complete call. If it supplies fewer
+arguments than the function declares, the omitted trailing parameters must have
+default values (see §10.6), which are filled in; otherwise it is an error (§10.5).
+The trailing comma is what distinguishes "call now, using defaults for the rest"
+from "partially apply." A trailing comma on a fully-saturated argument list has
+no effect.
+
+```txt
+val add = (a: Int32, b: Int32) => a + b
+
+val f  = add(10)    // error: add has no default for `b`; use add(10,) to curry
+val g  = add(10,)   // partial application — g : (Int32) => Int32
+val s  = add(1, 2)  // complete call
+```
 
 ### 10.3 Over-Application Is an Error
 
@@ -635,6 +663,47 @@ This syntax is not a tuple value:
 ```
 
 It is an argument list, and is only meaningful in call or dot-application contexts (see §11.1).
+
+### 10.6 Default Argument Values
+
+A parameter may declare a default value with `= expr` after its (optional) type
+annotation. Such a parameter is **optional**: a complete call (no trailing comma)
+may omit it, and the default expression is evaluated to supply the missing value.
+
+```txt
+val greet = (name: String, greeting: String = "Hello") => "${greeting}, ${name}"
+
+greet("World")          // "Hello, World"   — greeting defaulted
+greet("World", "Hi")    // "Hi, World"
+```
+
+Rules:
+
+- **Optional parameters must be last.** Once a parameter has a default, every
+  parameter after it must also have one. A required parameter following an
+  optional one is a compile-time error.
+- A default expression is type-checked against its parameter's type.
+- A default expression may reference parameters declared **before** it (and any
+  outer binding in scope), so defaults can chain:
+
+  ```txt
+  val box = (w: Int32, h: Int32 = w, area: Int32 = w * h) => area
+  box(4)        // area = 4 * 4 = 16
+  box(4, 3)     // area = 4 * 3 = 12
+  ```
+
+- Default values are filled left-to-right for the omitted trailing parameters.
+  A complete call must still supply at least the **required** (non-defaulted)
+  parameters; supplying fewer is an error (§10.5).
+- Default-fill applies uniformly to direct calls, dot-application
+  (`x.f(...)`, §11), and calls through a first-class function value
+  (`val g = greet; g("World")`).
+- To partially apply a function that has defaults — rather than fill them — use
+  an explicit trailing comma (§10.2): `greet("World",)` yields a function
+  awaiting `greeting`.
+
+Default values are evaluated by the *defining* module, so an imported function
+carries its defaults across module boundaries.
 
 ## 11. Dot Application
 
