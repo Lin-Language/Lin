@@ -2012,6 +2012,65 @@ print(r["type"])
 }
 
 #[test]
+fn test_stress_high_fanout_parallel() {
+    // High fan-out: 12 capture-less thunks through parallel — exercises the spawn/join +
+    // result-collection machinery. (Larger fan-out via map-returning-closures hits a
+    // pre-existing higher-order limitation unrelated to async, so the array is written out.)
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { parallel } from "std/async"
+import { reduce } from "std/array"
+
+val results = parallel([
+  () => 1, () => 2, () => 3, () => 4, () => 5, () => 6,
+  () => 7, () => 8, () => 9, () => 10, () => 11, () => 12
+])
+print(toString(reduce(results, 0, (a, b) => a + b)))
+"#);
+    // 1+2+...+12 = 78
+    assert_eq!(output, vec!["78"]);
+}
+
+#[test]
+fn test_stress_pool_many_short_tasks() {
+    // Many short tasks on a small pool — exercises queue draining + worker reuse across waves.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { await, threadPool, poolAsync } from "std/async"
+import { push, length } from "std/array"
+import { for, range } from "std/array"
+
+val pool = threadPool(3)
+var promises = []
+range(0, 30).for(i => push(promises, pool.poolAsync(() => 1)))
+var total = 0
+promises.for(p => total = total + await(p))
+print(toString(total))
+"#);
+    assert_eq!(output, vec!["30"]);
+}
+
+#[test]
+fn test_stress_worker_churn() {
+    // Worker churn: spin up and tear down many workers in a loop, each handling one request.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { worker, request, close } from "std/async"
+import { for, range } from "std/array"
+
+var total = 0
+range(0, 30).for(i =>
+  val w = worker(msg => msg + 1, () => null)
+  total = total + request(w, i)
+  close(w)
+)
+print(toString(total))
+"#);
+    // sum of (i+1) for i in 0..29 = sum 1..30 = 465
+    assert_eq!(output, vec!["465"]);
+}
+
+#[test]
 fn test_frozen_concurrent_reads() {
     // A frozen array read concurrently by many threads — immortal RC makes non-atomic
     // retain/release no-ops, so reads are race-free without copying or locking.

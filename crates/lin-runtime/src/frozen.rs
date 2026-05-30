@@ -87,6 +87,41 @@ mod tests {
     use crate::tagged::{alloc_tagged, TAG_INT32};
 
     #[test]
+    fn frozen_array_read_concurrently_is_race_free() {
+        // N threads read a frozen array's header (length) and bump/drop its (immortal) refcount
+        // via retain/release — which are guarded no-ops — concurrently. Under TSan this proves
+        // the immortal-RC read path has no data race (the load-bearing Frozen<T> guarantee).
+        unsafe {
+            let arr = lin_array_alloc(8);
+            for i in 0..5 {
+                let e = alloc_tagged(TAG_INT32, i);
+                lin_array_push_tagged(arr, e as *const u8);
+                crate::tagged::lin_tagged_free_box(e);
+            }
+            let boxed = alloc_tagged(TAG_ARRAY, arr as u64);
+            lin_freeze(boxed);
+            let addr = arr as usize;
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                handles.push(std::thread::spawn(move || {
+                    let a = addr as *mut LinArray;
+                    for _ in 0..200 {
+                        // Read length + retain/release (guarded no-ops on the immortal array).
+                        let _len = (*a).len;
+                        crate::memory::lin_rc_retain(a as *mut u32);
+                        crate::array::lin_array_release(a);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+            assert_eq!((*arr).len, 5);
+            assert!((*arr).refcount >= IMMORTAL_RC);
+        }
+    }
+
+    #[test]
     fn freeze_seals_array_immortal() {
         unsafe {
             let arr = lin_array_alloc(4);
