@@ -276,6 +276,7 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/path"     => Some(include_str!("../../../stdlib/path.lin")),
         "std/math"     => Some(include_str!("../../../stdlib/math.lin")),
         "std/hash"     => Some(include_str!("../../../stdlib/hash.lin")),
+        "std/bytes"    => Some(include_str!("../../../stdlib/bytes.lin")),
         _ => None,
     }
 }

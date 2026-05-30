@@ -1429,7 +1429,20 @@ Numeric values automatically widen between numeric types when used in arithmetic
 - An integer combined with a floating-point value widens to a floating-point type large enough to hold the integer exactly when possible, otherwise to the larger floating-point family.
 - Two floating-point values widen to the larger.
 
-Explicit narrowing — assigning a wider numeric to a narrower one, or any floating-point to an integer — requires an explicit cast via stdlib (`toInt32`, `toFloat32`, etc.) and is a runtime error if the value cannot be represented exactly. Implicit narrowing is a compile-time error.
+Explicit narrowing — assigning a wider numeric to a narrower one, or any floating-point to an integer — requires an explicit cast via stdlib and is a runtime error if the value cannot be represented exactly (for the float→int casts). Implicit narrowing is a compile-time error.
+
+The explicit-narrowing mechanism is a family of `std/number` cast functions, each truncating to the named width with two's-complement (`as`-cast) semantics:
+
+```txt
+toInt32:  (Float64) => Int32      // truncate a float to a 32-bit int
+toFloat64:(Int32)   => Float64    // widen
+toUInt8 / toInt8:    (UInt64) => UInt8 / Int8       // integer narrowing
+toUInt16 / toInt16:  (UInt64) => UInt16 / Int16
+toUInt32 / toInt64:  (UInt64) => UInt32 / Int64
+toUInt64:            (UInt64) => UInt64
+```
+
+The integer-narrowing casts take their input as `UInt64` (the widest unsigned), so any narrower *unsigned* integer — or a value first masked down to a byte/word — widens into the parameter without range loss before truncation; a bare integer literal in range is accepted directly. These are the byte-extraction primitives used by `std/bytes` (§35.3) and are generally useful wherever explicit width control is needed.
 
 Literal inference: a numeric literal without a suffix takes the type required by its surrounding context if one exists; otherwise integer literals default to `Int32` and floating-point literals default to `Float64`.
 
@@ -2277,22 +2290,29 @@ val inverted = ~mask                   // bitwise complement
 
 ### 35.3 `std/bytes`
 
-`std/bytes` provides slicing and endian (de)serialization. The endian helpers are written in Lin on top of §35.1 and §35.2; only the float bit-reinterpret functions require intrinsics (a float's bit pattern cannot be obtained by shift-and-mask).
+`std/bytes` provides slicing and endian (de)serialization. The endian helpers are written in Lin on top of §35.1 and §35.2, **plus the explicit narrowing casts of §26** (exported from `std/number`). The earlier claim that the endian helpers are pure shift-and-mask was incomplete: extracting a byte from a wider integer — e.g. `(v >> 24) & 0xFF` for a `UInt32` `v` — yields a `UInt32`, which cannot be *implicitly* narrowed to a `UInt8` (§26 makes implicit narrowing a compile-time error), so an explicit `toUInt8(...)` cast is required. Conversely, assembling a wide integer from bytes widens each byte first (`toUInt32(b[off]) << 24 | ...`). The four float bit-reinterpret functions are the only true intrinsics here (a float's bit pattern cannot be obtained by shift-and-mask).
 
 ```txt
-slice:       <T>(T[], Int32, Int32) => T[]      // also exported from std/array; sub-buffer copy
+slice:       (UInt8[], Int32, Int32) => UInt8[]   // also exported from std/array; sub-buffer copy
 
 u16FromBe / u32FromBe / u64FromBe:  (UInt8[], Int32) => UIntN     // read big-endian at offset
 u16ToBe   / u32ToBe   / u64ToBe:    (UIntN) => UInt8[]            // write big-endian
-// little-endian variants: u16FromLe, u32ToLe, ...
+// little-endian variants: u16FromLe, u32FromLe, u64FromLe, u16ToLe, u32ToLe, u64ToLe
 
 f32ToBits:   (Float32) => UInt32        // intrinsic: bit reinterpret
 f32FromBits: (UInt32) => Float32
 f64ToBits:   (Float64) => UInt64
 f64FromBits: (UInt64) => Float64
+
+f32ToBe / f32ToLe:     (Float32) => UInt8[]          // compose bits + endian write
+f32FromBe / f32FromLe: (UInt8[], Int32) => Float32   // compose endian read + bits
+f64ToBe / f64ToLe:     (Float64) => UInt8[]
+f64FromBe / f64FromLe: (UInt8[], Int32) => Float64
 ```
 
-Slicing is a function, `slice(buf, start, end)`; there is no range-index syntax (`buf[a..b]`) in this version.
+The narrowing casts that back the byte-extraction live in `std/number` (§26): `toUInt8`, `toInt8`, `toUInt16`, `toInt16`, `toUInt32`, `toInt64`, `toUInt64`, each `(UInt64) => <target>`, truncating with two's-complement (`as`-cast) semantics.
+
+Slicing is a function, `slice(buf, start, end)`; there is no range-index syntax (`buf[a..b]`) in this version. `slice` preserves element type — slicing a `UInt8[]` yields a `UInt8[]`.
 
 ### 35.4 OS Handle Convention
 

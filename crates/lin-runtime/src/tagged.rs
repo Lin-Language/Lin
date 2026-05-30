@@ -138,6 +138,11 @@ pub unsafe fn alloc_tagged(tag: u8, payload: u64) -> *mut u8 {
     }
     let tv = ptr as *mut TaggedVal;
     (*tv).tag = tag;
+    // Zero the padding so the full leading u64 equals `tag` with no garbage in the pad
+    // bytes. resolve_lin_str (and similar) discriminate boxed-vs-raw by reading the first
+    // 8 bytes as a u64 and comparing to a tag constant; uninitialised pad made that check
+    // unreliable (it only worked when the allocator happened to return zeroed memory).
+    (*tv)._pad = [0; 7];
     (*tv).payload = payload;
     ptr
 }

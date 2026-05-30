@@ -2585,3 +2585,57 @@ print(toString(hi["w"]))
     // minBy/maxBy over (i*7)%13: minimum weight 0, maximum weight 12.
     assert_eq!(out, vec!["7994", "0", "12"]);
 }
+
+#[test]
+fn test_to_uint8_narrowing() {
+    // std/number toUInt8 truncates a wider integer to a byte (two's-complement / `as`).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { toUInt8 } from "std/number"
+
+val v: UInt32 = 0x11223344
+print(toString(toUInt8((v >> 24) & 0xFF)))   // 17 (0x11)
+print(toString(toUInt8(0x1FF)))               // 255 (truncated)
+print(toString(toUInt8(256)))                 // 0 (wraps)
+"#);
+    assert_eq!(out, vec!["17", "255", "0"]);
+}
+
+#[test]
+fn test_slice_preserves_element_type() {
+    // slice dispatches on the array's runtime element type: a UInt8[] yields a UInt8[]
+    // (indexes without sign wrap), an Int32[] an Int32[], a tagged array a tagged array.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { slice, length } from "std/array"
+
+val bytes: UInt8[] = [10, 200, 30, 40, 50]
+val sub: UInt8[] = slice(bytes, 1, 4)
+print(toString(length(sub)))   // 3
+print(toString(sub[0]))        // 200 (no sign wrap → still flat u8)
+
+val ints: Int32[] = [100, 200, 300, 400]
+print(toString(slice(ints, 2, 4)[0]))   // 300
+
+val words = ["a", "b", "c", "d"]
+print(slice(words, 0, 2)[1])   // b
+"#);
+    assert_eq!(out, vec!["3", "200", "300", "b"]);
+}
+
+#[test]
+fn test_u32_be_round_trip() {
+    // std/bytes: a UInt32 survives a big-endian write then read.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+import { u32ToBe, u32FromBe } from "std/bytes"
+
+val v: UInt32 = 0xDEADBEEF
+val b: UInt8[] = u32ToBe(v)
+print(toString(length(b)))          // 4
+print(toString(b[0]))               // 222 (0xDE)
+print(toString(u32FromBe(b, 0) == v))   // true
+"#);
+    assert_eq!(out, vec!["4", "222", "true"]);
+}

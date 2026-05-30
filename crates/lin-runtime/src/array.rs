@@ -39,6 +39,26 @@ unsafe fn array_elem_layout(cap: u64) -> Layout {
     )
 }
 
+/// (size, align) of one element for a given `elem_tag`. Flat scalar arrays store raw
+/// values of the element's natural width; `0xFF` (tagged) stores 16-byte LinArrayElem.
+/// The data buffer MUST be freed with the same layout it was allocated with, so this
+/// must match each flat family's `$alloc`/`$free` (e.g. lin_flat_array_alloc_u8 uses
+/// size_of::<u8>()). Using the tagged 16-byte layout to free a flat array corrupts the heap.
+fn flat_elem_size_align(elem_tag: u8) -> (usize, usize) {
+    use crate::tagged::*;
+    match elem_tag {
+        TAG_INT32 | TAG_FLOAT32 => (4, 4),
+        TAG_INT64 | TAG_FLOAT64 => (8, 8),
+        TAG_UINT8 | TAG_INT8 | TAG_BOOL => (1, 1),
+        TAG_UINT16 | TAG_INT16 => (2, 2),
+        // 0xFF and anything else: tagged 16-byte elements.
+        _ => (
+            std::mem::size_of::<LinArrayElem>(),
+            std::mem::align_of::<LinArrayElem>(),
+        ),
+    }
+}
+
 unsafe fn array_layout() -> Layout {
     Layout::from_size_align_unchecked(
         std::mem::size_of::<LinArray>(),
@@ -63,8 +83,14 @@ pub unsafe extern "C" fn lin_array_alloc(initial_cap: u64) -> *mut LinArray {
 
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_free(arr: *mut LinArray) {
-    let cap = (*arr).cap;
-    dealloc((*arr).data as *mut u8, array_elem_layout(cap));
+    let cap = (*arr).cap as usize;
+    // Free the data buffer with the SAME layout it was allocated with. Flat scalar
+    // arrays use their element's natural width, not the 16-byte tagged element size —
+    // freeing a flat u8 array with the tagged layout deallocs 16x too much and corrupts
+    // the heap (surfaces as a SEGV in a much later, unrelated allocation).
+    let (esize, ealign) = flat_elem_size_align((*arr).elem_tag);
+    let data_layout = Layout::from_size_align_unchecked(esize * cap, ealign);
+    dealloc((*arr).data as *mut u8, data_layout);
     dealloc(arr as *mut u8, array_layout());
 }
 
@@ -472,6 +498,41 @@ pub unsafe extern "C" fn lin_array_slice_tagged(arr: *const LinArray, start: i64
         ));
     }
     out
+}
+
+/// Polymorphic slice: dispatch on the array's runtime `elem_tag` and call the
+/// matching typed slice fn. Preserves element type (a UInt8[] yields a UInt8[],
+/// an Int32[] yields an Int32[], a tagged Json[] yields a Json[]). Backs the
+/// std/array `slice` export and (re-exported) std/bytes `slice`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_slice_dyn(arr: *const u8, start: i64, end: i64) -> *mut u8 {
+    use crate::tagged::*;
+    if arr.is_null() {
+        return alloc_tagged(TAG_ARRAY, lin_array_alloc(4) as u64);
+    }
+    // `Json` arrays cross the FFI boundary as a TaggedVal*(Array); a raw LinArray*
+    // can also arrive from typed array params. Unwrap to the inner LinArray*.
+    let tag = *arr;
+    let lin_arr = if tag == TAG_ARRAY {
+        (*(arr as *const TaggedVal)).payload as *const LinArray
+    } else {
+        arr as *const LinArray
+    };
+    let out: *mut LinArray = match (*lin_arr).elem_tag {
+        0xFF => lin_array_slice_tagged(lin_arr, start, end),
+        TAG_INT32 => lin_flat_array_slice_i32(lin_arr, start, end),
+        TAG_INT64 => lin_flat_array_slice_i64(lin_arr, start, end),
+        TAG_FLOAT32 => lin_flat_array_slice_f32(lin_arr, start, end),
+        TAG_FLOAT64 => lin_flat_array_slice_f64(lin_arr, start, end),
+        TAG_UINT8 => lin_flat_array_slice_u8(lin_arr, start, end),
+        TAG_INT8 => lin_flat_array_slice_i8(lin_arr, start, end),
+        TAG_UINT16 => lin_flat_array_slice_u16(lin_arr, start, end),
+        TAG_INT16 => lin_flat_array_slice_i16(lin_arr, start, end),
+        // Unknown tag: fall back to a tagged slice (treats elements as 16-byte TaggedVals).
+        _ => lin_array_slice_tagged(lin_arr, start, end),
+    };
+    // Return a Json value: TaggedVal*(Array) wrapping the result.
+    alloc_tagged(TAG_ARRAY, out as u64)
 }
 
 /// Copy all elements from `src` into `dst` (tagged arrays only).
@@ -1215,4 +1276,67 @@ pub unsafe extern "C" fn lin_flat_to_tagged_i16(flat: *const LinArray) -> *mut L
     }
     (*tagged).len = len;
     tagged
+}
+
+#[cfg(test)]
+mod free_layout_tests {
+    use super::*;
+    use crate::tagged::*;
+
+    // Regression: lin_array_free must size the data-buffer dealloc from elem_tag, not
+    // always assume the 16-byte tagged LinArrayElem. Freeing a flat UInt8[] (1 byte/elem)
+    // with the tagged layout deallocs 16x too much and corrupts the heap. This pure-logic
+    // check fails instantly if anyone reverts flat_elem_size_align to the 16-byte size,
+    // without needing the non-deterministic ASan crash to happen to trigger.
+    #[test]
+    fn flat_elem_size_align_matches_alloc_width() {
+        assert_eq!(flat_elem_size_align(TAG_UINT8), (1, 1));
+        assert_eq!(flat_elem_size_align(TAG_INT8), (1, 1));
+        assert_eq!(flat_elem_size_align(TAG_UINT16), (2, 2));
+        assert_eq!(flat_elem_size_align(TAG_INT16), (2, 2));
+        assert_eq!(flat_elem_size_align(TAG_INT32), (4, 4));
+        assert_eq!(flat_elem_size_align(TAG_FLOAT32), (4, 4));
+        assert_eq!(flat_elem_size_align(TAG_INT64), (8, 8));
+        assert_eq!(flat_elem_size_align(TAG_FLOAT64), (8, 8));
+        // Tagged arrays (0xFF) and anything unknown use the 16-byte element.
+        assert_eq!(
+            flat_elem_size_align(0xFF),
+            (std::mem::size_of::<LinArrayElem>(), std::mem::align_of::<LinArrayElem>())
+        );
+    }
+
+    // Alloc/grow/release cycles for the flat widths. The release frees the data buffer via
+    // lin_array_free; with the wrong layout this is an allocator mismatch that miri and
+    // `cargo test` under -Zsanitizer=address catch deterministically.
+    #[test]
+    fn flat_u8_alloc_push_release_roundtrips() {
+        unsafe {
+            // Start at cap 4 and push past it to force a realloc, exercising the grow path.
+            let arr = lin_flat_array_alloc_u8(4);
+            for b in 0u16..=300 {
+                lin_flat_array_push_u8(arr, b as u8);
+            }
+            assert_eq!((*arr).len, 301);
+            assert_eq!(lin_flat_array_get_u8(arr, 0), 0);
+            assert_eq!(lin_flat_array_get_u8(arr, 255), 255);
+            lin_array_release(arr); // refcount starts at 1 -> frees here
+        }
+    }
+
+    #[test]
+    fn flat_widths_release_cleanly() {
+        unsafe {
+            let a = lin_flat_array_alloc_i16(4);
+            for v in 0..50i16 { lin_flat_array_push_i16(a, v); }
+            lin_array_release(a);
+
+            let b = lin_flat_array_alloc_u16(4);
+            for v in 0..50u16 { lin_flat_array_push_u16(b, v); }
+            lin_array_release(b);
+
+            let c = lin_flat_array_alloc_i8(4);
+            for v in 0..50i8 { lin_flat_array_push_i8(c, v); }
+            lin_array_release(c);
+        }
+    }
 }

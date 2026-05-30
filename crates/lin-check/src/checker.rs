@@ -1139,6 +1139,23 @@ impl Checker {
                     .map(|p| apply_type_subs(p, &subs))
                     .collect();
 
+                // Spec §26: a suffixless integer literal takes its context type. When an
+                // argument is a bare integer literal and the parameter has a concrete integer
+                // type T, re-type the literal at width T (if it fits) so it satisfies the
+                // parameter. This lets e.g. `toUInt8(255)` or `f32FromBits(0x40600000)` pass
+                // even when the parameter is a wider/unsigned integer than the Int32 default.
+                for (i, param_ty) in concrete_params.iter().enumerate() {
+                    if i >= typed_args.len() { break; }
+                    if let TypedExpr::IntLit(v, _, lit_span) = &typed_args[i] {
+                        if let Some((lo, hi)) = integer_range(param_ty) {
+                            let (v, lit_span) = (*v, *lit_span);
+                            if (v as i128) >= lo && (v as i128) <= hi {
+                                typed_args[i] = TypedExpr::IntLit(v, param_ty.clone(), lit_span);
+                            }
+                        }
+                    }
+                }
+
                 // Check argument compatibility against concrete params.
                 for (i, (arg, param_ty)) in
                     typed_args.iter().zip(concrete_params.iter()).enumerate()

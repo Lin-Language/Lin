@@ -11,6 +11,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/string`](#stdstring) | String manipulation functions |
 | [`std/array`](#stdarray) | Array and iterator functions |
 | [`std/number`](#stdnumber) | Numeric parsing and conversion functions |
+| [`std/bytes`](#stdbytes) | Byte-buffer slicing and endian (de)serialization |
 | [`std/math`](#stdmath) | Mathematical functions |
 | [`std/object`](#stdobject) | Object introspection functions |
 | [`std/io`](#stdio) | stdin/stdout and terminal input |
@@ -93,6 +94,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`reduce`](#reduce) | `(Json[], Json, (Json, Json) -> Json) -> Json` | Fold left with an accumulator |
 | [`reverse`](#reverse) | `(Json[]) -> Json[]` | Return a reversed copy |
 | [`scan`](#scan) | `(Json[], Json, (Json, Json) -> Json) -> Json[]` | Reduce returning all intermediate values |
+| [`slice`](#slice) | `(T[], Int32, Int32) -> T[]` | Sub-buffer copy; preserves element type |
 | [`some`](#some) | `(Json[], (Json) -> Boolean) -> Boolean` | True if any element matches |
 | [`sort`](#sort) | `(Json[], (Json, Json) -> Int32) -> Json[]` | Return sorted copy using comparator |
 | [`sortBy`](#sortBy) | `(Json[], (Json) -> Json) -> Json[]` | Return sorted copy using key extractor |
@@ -112,6 +114,13 @@ This document specifies the standard library for the Lin language. All modules a
 | [`parseInt32`](#parseInt32) | `(String) -> Int32` | Parse decimal string to Int32 |
 | [`toFloat64`](#toFloat64) | `(Int32) -> Float64` | Widen Int32 to Float64 |
 | [`toInt32`](#toInt32) | `(Float64) -> Int32` | Truncate float to Int32 |
+| [`toUInt8`](#narrowing-casts) | `(UInt64) -> UInt8` | Truncate to an 8-bit unsigned byte |
+| [`toInt8`](#narrowing-casts) | `(UInt64) -> Int8` | Truncate to an 8-bit signed byte |
+| [`toUInt16`](#narrowing-casts) | `(UInt64) -> UInt16` | Truncate to a 16-bit unsigned int |
+| [`toInt16`](#narrowing-casts) | `(UInt64) -> Int16` | Truncate to a 16-bit signed int |
+| [`toUInt32`](#narrowing-casts) | `(UInt64) -> UInt32` | Truncate to a 32-bit unsigned int |
+| [`toInt64`](#narrowing-casts) | `(UInt64) -> Int64` | Reinterpret to a 64-bit signed int |
+| [`toUInt64`](#narrowing-casts) | `(UInt64) -> UInt64` | Identity / reinterpret to 64-bit unsigned int |
 | [`tryParseFloat64`](#tryParseFloat64) | `(String) -> Float64 \| Null` | Parse Float64, returning Null on failure |
 | [`tryParseInt32`](#tryParseInt32) | `(String) -> Int32 \| Null` | Parse Int32, returning Null on failure |
 
@@ -190,13 +199,13 @@ This document specifies the standard library for the Lin language. All modules a
 | [`mkdir`](#mkdir) | `(String, Json) -> Null \| Error` | Create a directory; supports `{ parents }` option |
 | [`mv`](#mv) | `(String, String) -> Null \| Error` | Move or rename a file |
 | [`readFile`](#readFile) | `(String) -> String \| Error` | Read entire file as a string |
-| [`readFileBytes`](#readFileBytes) | `(String) -> Int32[] \| Error` | Read file as raw bytes (each byte as Int32) |
+| [`readFileBytes`](#readFileBytes) | `(String) -> UInt8[] \| Error` | Read file as a raw byte buffer |
 | [`readJson`](#readJson) | `(String) -> Json \| Error` | Read and parse file as JSON |
 | [`readLines`](#readLines) | `(String) -> String[] \| Error` | Read lines of a file into an array |
 | [`rm`](#rm) | `(String, Json) -> Null \| Error` | Remove a file or directory; supports `{ recursive }` |
 | [`stat`](#stat) | `(String) -> FileStat \| Error` | File metadata |
 | [`writeFile`](#writeFile) | `(String, String) -> Null \| Error` | Write string to file, replacing contents |
-| [`writeFileBytes`](#writeFileBytes) | `(String, Int32[]) -> Null \| Error` | Write raw bytes to file |
+| [`writeFileBytes`](#writeFileBytes) | `(String, UInt8[]) -> Null \| Error` | Write a raw byte buffer to file |
 | [`writeJson`](#writeJson) | `(String, Json, Json) -> Null \| Error` | Serialise value to pretty JSON; supports `{ compact }` option |
 | [`writeLines`](#writeLines) | `(String, String[]) -> Null \| Error` | Write an array of strings, one per line |
 
@@ -1240,6 +1249,20 @@ Like `reduce`, but returns an array of all intermediate accumulator values inclu
 
 ---
 
+### slice
+
+```txt
+val slice: (arr: T[], start: Int32, end: Int32) -> T[]
+```
+
+Returns a copy of the elements in the half-open range `[start, end)`. `start` and `end` are clamped to `[0, length(arr)]`. The element type is preserved: slicing a `UInt8[]` yields a `UInt8[]`, an `Int32[]` an `Int32[]`, and a `Json[]` a `Json[]`. Also re-exported from `std/bytes`. There is no range-index syntax (`arr[a..b]`).
+
+```txt
+[10, 20, 30, 40, 50].slice(1, 4)   // [20, 30, 40]
+```
+
+---
+
 ### some
 
 ```txt
@@ -1475,6 +1498,28 @@ toInt32(-2.1)   // -2
 
 ---
 
+### Narrowing casts
+
+```txt
+val toUInt8:  (v: UInt64) -> UInt8
+val toInt8:   (v: UInt64) -> Int8
+val toUInt16: (v: UInt64) -> UInt16
+val toInt16:  (v: UInt64) -> Int16
+val toUInt32: (v: UInt64) -> UInt32
+val toInt64:  (v: UInt64) -> Int64
+val toUInt64: (v: UInt64) -> UInt64
+```
+
+Explicit integer narrowing (spec §26). Implicit narrowing — assigning a wider numeric to a narrower one — is a compile-time error; these casts perform it explicitly, truncating to the target width with two's-complement (`as`-cast) semantics. The input is taken as `UInt64` (the widest unsigned), so any narrower *unsigned* integer — or a value masked down to a byte/word — widens into the parameter without range loss; a bare integer literal in range is accepted directly. They are the byte-extraction mechanism used by `std/bytes`, but are generally useful wherever explicit width control is needed.
+
+```txt
+toUInt8(0x1234)              // 0x34  (52)
+toUInt8((v >> 24) & 0xFF)    // top byte of a UInt32 v
+toUInt16(b[0]) << 8          // widen a byte for endian assembly
+```
+
+---
+
 ### tryParseFloat64
 
 ```txt
@@ -1502,6 +1547,50 @@ Parses `s` as a base-10 integer. Returns `Null` if `s` is not a valid `Int32`, i
 tryParseInt32("42")    // 42
 tryParseInt32("3.14")  // null
 tryParseInt32("bad")   // null
+```
+
+---
+
+## std/bytes
+
+Slicing and endian (de)serialization on `UInt8[]` byte buffers (spec §35.1–§35.3). The endian helpers are written in Lin on top of the bitwise operators (§35.2) and the `std/number` narrowing casts (extracting a byte from a wider integer needs an explicit narrowing cast). The four float bit-reinterpret functions are runtime intrinsics, since a float's bit pattern cannot be obtained by shift-and-mask.
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `slice` | `(UInt8[], Int32, Int32) -> UInt8[]` | Sub-buffer copy (re-export of `std/array` slice) |
+| `u16FromBe` / `u32FromBe` / `u64FromBe` | `(UInt8[], Int32) -> UIntN` | Read big-endian at offset |
+| `u16FromLe` / `u32FromLe` / `u64FromLe` | `(UInt8[], Int32) -> UIntN` | Read little-endian at offset |
+| `u16ToBe` / `u32ToBe` / `u64ToBe` | `(UIntN) -> UInt8[]` | Write big-endian |
+| `u16ToLe` / `u32ToLe` / `u64ToLe` | `(UIntN) -> UInt8[]` | Write little-endian |
+| `f32ToBits` | `(Float32) -> UInt32` | Reinterpret a float's bits (intrinsic) |
+| `f32FromBits` | `(UInt32) -> Float32` | Reinterpret bits as a float (intrinsic) |
+| `f64ToBits` | `(Float64) -> UInt64` | Reinterpret a double's bits (intrinsic) |
+| `f64FromBits` | `(UInt64) -> Float64` | Reinterpret bits as a double (intrinsic) |
+| `f32ToBe` / `f32ToLe` | `(Float32) -> UInt8[]` | Serialize a float (big/little-endian) |
+| `f32FromBe` / `f32FromLe` | `(UInt8[], Int32) -> Float32` | Deserialize a float at offset |
+| `f64ToBe` / `f64ToLe` | `(Float64) -> UInt8[]` | Serialize a double (big/little-endian) |
+| `f64FromBe` / `f64FromLe` | `(UInt8[], Int32) -> Float64` | Deserialize a double at offset |
+
+Reads take a buffer and a byte offset; writes return a freshly allocated `UInt8[]` of the type's width (2, 4, or 8 bytes). Slicing is a function, `slice(buf, start, end)`; there is no range-index syntax.
+
+Example — an 8-byte two-`Float32` control packet (e.g. two motor speeds) round-tripped through a big-endian buffer:
+
+```txt
+import { push, length, for } from "std/array"
+import { f32ToBe, f32FromBe, f32FromBits } from "std/bytes"
+
+// Float32 literals are not yet context-narrowed, so build them from bit patterns:
+// 1.5f = 0x3FC00000, -2.25f = 0xC0100000.
+val leftMotor: Float32 = f32FromBits(0x3FC00000)
+val rightMotor: Float32 = f32FromBits(0xC0100000)
+
+val packet: UInt8[] = []
+f32ToBe(leftMotor).for(x => push(packet, x))
+f32ToBe(rightMotor).for(x => push(packet, x))
+// length(packet) == 8
+
+val a: Float32 = f32FromBe(packet, 0)   // 1.5
+val b: Float32 = f32FromBe(packet, 4)   // -2.25
 ```
 
 ---
@@ -2395,10 +2484,10 @@ match readFile("config.txt")
 ### readFileBytes
 
 ```txt
-val readFileBytes: (path: String) -> Int32[] | Error
+val readFileBytes: (path: String) -> UInt8[] | Error
 ```
 
-Reads the file at `path` as raw bytes. Each byte is returned as an `Int32` value (0–255). Returns an `Error` if the file cannot be read.
+Reads the file at `path` as a packed `UInt8[]` byte buffer (§35.1) — one byte per element. Returns an `Error` if the file cannot be read.
 
 ```txt
 val bytes = readFileBytes("image.png")
@@ -2477,10 +2566,10 @@ Writes `content` to the file at `path`, replacing existing contents.
 ### writeFileBytes
 
 ```txt
-val writeFileBytes: (path: String, bytes: Int32[]) -> Null | Error
+val writeFileBytes: (path: String, bytes: UInt8[]) -> Null | Error
 ```
 
-Writes raw bytes to the file at `path`. Each element of `bytes` is treated as a byte value (0–255). Returns `Null` on success, `Error` on failure.
+Writes a `UInt8[]` byte buffer (§35.1) to the file at `path`. Returns `Null` on success, `Error` on failure.
 
 ---
 
