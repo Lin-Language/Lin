@@ -1708,6 +1708,52 @@ fn call_body_closure(body: Temp, raw_args: &[(Temp, Type)], param_tys: &[Type], 
     dst
 }
 
+/// Like `call_body_closure`, but also returns each argument that is passed to the callback as
+/// a boxed `TaggedVal*` (a union/Json value): the per-iteration ELEMENT BOX. This is either the
+/// fresh box from `lin_array_get_tagged` (the array is statically Json, e.g. the stdlib `for`
+/// wrapper) or a fresh `box_to_json` of a concrete element. Used ONLY by `for`/`while` to
+/// reclaim that box's 16-byte SHELL via `FreeBoxShell` (`lin_tagged_free_box`).
+///
+/// SAFETY: `FreeBoxShell` frees only the box shell (NOT its inner heap payload), and is a no-op
+/// on cached small-int/bool boxes and non-pointer args. The element box is ALWAYS a freshly
+/// allocated, unshared shell (`lin_array_get_tagged` always allocs; `box_to_json` allocs or
+/// returns an immutable cache), so freeing the shell can never double-free or corrupt — even if
+/// the callback MOVED the inner into a result via `push`/`set` (those move the inner and leave
+/// the shell behind; the inner stays owned by the result). For scalar elements (no inner) this
+/// reclaims the whole box — the ~36 B/iter `range(...).for(...)` leak. For heap-inner elements
+/// it reclaims the shell and leaves the inner's existing ownership untouched (the residual inner
+/// leak is unchanged from before — provably reclaiming it needs the runtime move-vs-retain
+/// conventions to change, out of scope). `map`/`filter`/`reduce` use the plain
+/// `call_body_closure` and never reach this path, so their element-into-result moves are intact.
+fn call_body_closure_with_elem_boxes(body: Temp, raw_args: &[(Temp, Type)], param_tys: &[Type], ret_ty: &Type, builder: &mut FuncBuilder) -> (Temp, Vec<Temp>) {
+    let mut elem_boxes = Vec::new();
+    let call_args: Vec<Temp> = raw_args
+        .iter()
+        .enumerate()
+        .map(|(i, (t, ty))| {
+            let pty = param_tys.get(i);
+            let arg = coerce_arg_to_param(*t, ty, pty, builder);
+            // The callback receives a boxed `TaggedVal*` element exactly when the parameter is a
+            // union (the element arrived already-union from `lin_array_get_tagged`, or was boxed
+            // from a concrete scalar by `coerce_arg_to_param`). Concrete-param callbacks get a raw
+            // scalar — nothing to free.
+            let boxed = matches!(pty, Some(p) if is_union_ty(p)) || is_union_ty(ty);
+            if boxed {
+                elem_boxes.push(arg);
+            }
+            arg
+        })
+        .collect();
+    let dst = builder.alloc_temp(ret_ty.clone());
+    builder.emit(Instruction::Call {
+        dst,
+        callee: CallTarget::Indirect(body),
+        args: call_args,
+        ret_ty: ret_ty.clone(),
+    });
+    (dst, elem_boxes)
+}
+
 /// Coerce a concrete argument to a union/Json parameter (box it); pass through otherwise.
 fn coerce_arg_to_param(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: &mut FuncBuilder) -> Temp {
     match param_ty {
@@ -1992,8 +2038,22 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
     // registered as scope-owned (that would release once AFTER the loop, leaking per-iteration).
     let boxed = Type::TypeVar(u32::MAX);
     emit_index_loop(iterable, &iterable_ty, builder, ctx, |_, elem, b, _| {
-        let ret = call_body_closure(body, &[(elem, elem_ty.clone())], &param_tys, &boxed, b);
+        let (ret, elem_boxes) = call_body_closure_with_elem_boxes(body, &[(elem, elem_ty.clone())], &param_tys, &boxed, b);
+        // Release the callback-RETURN box (a fresh, independently-owned +1; `for` discards it).
+        // This fully reclaims it (inner + shell). The callback CAN return (an alias of) the
+        // element box — e.g. `x => x`, or `acc = f(acc, x)` where `f` yields its element — in which
+        // case `ret` IS the element box and this single release already reclaimed it.
         b.emit(Instruction::Release { val: ret, ty: boxed.clone() });
+        // Reclaim the per-iteration element BOX SHELL — but ONLY when it is DISTINCT from `ret`
+        // (the release above already reclaimed it otherwise; a second free would double-free).
+        // `lin_tagged_free_box_if_distinct` frees only the 16-byte shell (cached- and
+        // non-pointer-safe), never the inner payload — so it is safe for both flat (scalar, no
+        // inner: full reclaim — the ~36 B/iter leak) and tagged (heap inner stays owned by the
+        // source array / wherever the body moved it) element boxes. for/while-only reclaim;
+        // map/filter/reduce use the plain `call_body_closure` and never reach this path.
+        for ebox in &elem_boxes {
+            b.emit(Instruction::FreeBoxShellIfDistinct { val: *ebox, other: ret });
+        }
     });
     builder.const_temp(Const::Null)
 }
@@ -2040,7 +2100,13 @@ fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx
         obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
     });
     // keep = body(elem) : Bool — continue only while true.
-    let keep = call_body_closure(body, &[(elem, elem_ty.clone())], &param_tys, &Type::Bool, builder);
+    let (keep, elem_boxes) = call_body_closure_with_elem_boxes(body, &[(elem, elem_ty.clone())], &param_tys, &Type::Bool, builder);
+    // Reclaim the per-iteration element BOX SHELL (same mechanism + safety as `lower_for`):
+    // `FreeBoxShell` frees only the 16-byte shell, never the inner. The predicate's `Bool` return
+    // is an unboxed scalar, so it can NEVER alias the element box — no de-aliasing needed here.
+    for ebox in &elem_boxes {
+        builder.emit(Instruction::FreeBoxShell { val: *ebox });
+    }
     builder.terminate(Terminator::CondJump { cond: keep, then_block: cont_block, else_block: exit });
 
     builder.switch_to(cont_block);
