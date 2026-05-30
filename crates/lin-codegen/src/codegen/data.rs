@@ -245,16 +245,42 @@ impl<'ctx> Codegen<'ctx> {
     /// dispatch on the object's static type; for Json/union objects, dispatch at
     /// runtime on the value's LLVM kind (pointer key ⇒ object set, int key ⇒ array set),
     /// unboxing the boxed container first.
-    pub(crate) fn compile_ir_index_set(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, obj_ty: &Type, _key_ty: &Type, val_ty: &Type) {
+    pub(crate) fn compile_ir_index_set(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, val_ty: &Type) {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
         let void_ty = self.context.void_type();
-        let tagged_val = self.build_tagged_val_alloca(&value, val_ty);
+        // Build the TaggedVal* to hand to the runtime setter (which copies the 16-byte
+        // TaggedVal and retains its inner payload).
+        //
+        // A value whose static type is union/Json/TypeVar (e.g. a `for`/`map` callback
+        // PARAMETER) already arrives BOXED — i.e. the LLVM value is itself a `TaggedVal*`
+        // under the uniform closure ABI. Re-wrapping it with `build_tagged_val_alloca` would
+        // misread the box pointer as the payload and tag it with `type_tag(TypeVar) == NULL`,
+        // so reads see null (the boxed-value-dropped bug). Pass the existing box straight
+        // through instead — RC stays balanced because the setter copy+retains the inner just
+        // as it would for a freshly built stack TaggedVal, and the source box keeps its own
+        // reference. Mirrors the `MakeObject` element-boxing path.
+        let tagged_val = if Self::is_union_type(val_ty) && value.is_pointer_value() {
+            value.into_pointer_value()
+        } else {
+            self.build_tagged_val_alloca(&value, val_ty)
+        };
+        // Resolve an object key to a raw `LinString*`. A string key that is a callback param
+        // arrives boxed (a `TaggedVal*`); unbox it, or `lin_object_set` reads the box as a
+        // LinString and corrupts the key.
+        let resolve_obj_key = |this: &mut Self, k: BasicValueEnum<'ctx>| -> BasicValueEnum<'ctx> {
+            if Self::is_union_type(key_ty) && k.is_pointer_value() {
+                this.builder.call(this.rt.unbox_ptr, &[k.into()], "iset_key_unbox").try_as_basic_value().unwrap_basic()
+            } else {
+                k
+            }
+        };
         match obj_ty {
             Type::Object(_) | Type::Named(_) => {
                 if obj.is_pointer_value() && key.is_pointer_value() {
+                    let key_str = resolve_obj_key(self, key);
                     self.builder.call(self.rt.object_set,
-                        &[obj.into(), key.into(), tagged_val.into()], "");
+                        &[obj.into(), key_str.into(), tagged_val.into()], "");
                 }
             }
             Type::Array(_) | Type::FixedArray(_) => {
@@ -265,10 +291,36 @@ impl<'ctx> Codegen<'ctx> {
             }
             Type::TypeVar(_) | Type::Union(_) => {
                 if !obj.is_pointer_value() { return; }
-                // Unbox the boxed container, then dispatch on the key's LLVM kind.
+                // Unbox the boxed container, then dispatch on the key's runtime kind. A boxed
+                // string key (TaggedVal*) and a boxed int key are both pointers, so dispatch
+                // on the unboxed key's tag rather than the LLVM kind when the key is union.
                 let container = self.builder.call(self.rt.unbox_ptr, &[obj.into()], "iset_unbox").try_as_basic_value().unwrap_basic();
-                if key.is_pointer_value() {
-                    // String (object) key.
+                if Self::is_union_type(key_ty) && key.is_pointer_value() {
+                    // Runtime-typed key: tag-dispatch int (array) vs string (object).
+                    let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                    let i8t = self.context.i8_type();
+                    let k_tag = self.builder.call(self.rt.get_tag, &[key.into()], "iset_ktag").try_as_basic_value().unwrap_basic().into_int_value();
+                    let is_i32 = self.builder.int_compare(IntPredicate::EQ, k_tag, i8t.const_int(2, false), "iset_k_i32");
+                    let is_i64 = self.builder.int_compare(IntPredicate::EQ, k_tag, i8t.const_int(3, false), "iset_k_i64");
+                    let is_int = self.builder.or(is_i32, is_i64, "iset_k_int");
+                    let int_b = self.context.append_basic_block(llvm_fn, "iset_intk");
+                    let str_b = self.context.append_basic_block(llvm_fn, "iset_strk");
+                    let mrg = self.context.append_basic_block(llvm_fn, "iset_kmrg");
+                    self.builder.conditional_branch(is_int, int_b, str_b);
+                    self.builder.position_at_end(int_b);
+                    let idx = self.index_value_to_i64(key);
+                    let set_fn = self.get_or_declare_fn("lin_array_set",
+                        void_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
+                    self.builder.call(set_fn, &[container.into(), idx.into(), tagged_val.into()], "");
+                    self.builder.unconditional_branch(mrg);
+                    self.builder.position_at_end(str_b);
+                    let key_str = self.builder.call(self.rt.unbox_ptr, &[key.into()], "iset_key_unbox").try_as_basic_value().unwrap_basic();
+                    self.builder.call(self.rt.object_set,
+                        &[container.into(), key_str.into(), tagged_val.into()], "");
+                    self.builder.unconditional_branch(mrg);
+                    self.builder.position_at_end(mrg);
+                } else if key.is_pointer_value() {
+                    // Statically a string (object) key.
                     self.builder.call(self.rt.object_set,
                         &[container.into(), key.into(), tagged_val.into()], "");
                 } else if key.is_int_value() {

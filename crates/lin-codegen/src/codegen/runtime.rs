@@ -48,6 +48,7 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub unbox_ptr: FunctionValue<'ctx>,
     pub object_alloc: FunctionValue<'ctx>,
     pub object_set: FunctionValue<'ctx>,
+    pub object_set_fresh: FunctionValue<'ctx>,
     pub object_get: FunctionValue<'ctx>,
     pub object_eq: FunctionValue<'ctx>,
     pub tagged_to_string: FunctionValue<'ctx>,
@@ -165,6 +166,8 @@ impl<'ctx> RuntimeFns<'ctx> {
         let object_alloc = module.add_function("lin_object_alloc", ptr_type.fn_type(&[i32_type.into()], false), None);
         // lin_object_set(obj: ptr, key: ptr, val: ptr) -> void
         let object_set = module.add_function("lin_object_set", void_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false), None);
+        // lin_object_set_fresh(obj: ptr, key: ptr, val: ptr) -> void — no-dup-check literal append
+        let object_set_fresh = module.add_function("lin_object_set_fresh", void_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false), None);
         // lin_object_get(obj: ptr, key: ptr) -> ptr (points to TaggedVal, or null)
         let object_get = module.add_function("lin_object_get", ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false), None);
         // lin_object_eq(a: ptr, b: ptr) -> i8
@@ -210,6 +213,7 @@ impl<'ctx> RuntimeFns<'ctx> {
             unbox_ptr,
             object_alloc,
             object_set,
+            object_set_fresh,
             object_get,
             object_eq,
             tagged_to_string,

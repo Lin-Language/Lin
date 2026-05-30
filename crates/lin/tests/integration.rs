@@ -4629,3 +4629,78 @@ main()
 "#);
     assert_eq!(out, vec!["done"]);
 }
+
+#[test]
+fn object_index_assign_of_callback_param() {
+    // Regression: `obj[key] = value` where `value` is a for/map callback PARAMETER used to
+    // store NULL. Under the uniform closure ABI a callback param arrives BOXED (a TaggedVal*),
+    // but `compile_ir_index_set` re-wrapped it via `build_tagged_val_alloca` using the param's
+    // STATIC scalar type — that path saw a pointer where it expected an int, tagged the box as
+    // NULL, and dropped the value (the boxed-value-dropped bug). The fix passes an
+    // already-boxed Json value straight to the object/array setter.
+
+    // Int value via `for` callback param.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/array"
+[5].for(n =>
+  var o = {}
+  o["x"] = n
+  print(toString(o))
+)
+"#);
+    assert_eq!(out, vec![r#"{"x": 5}"#]);
+
+    // Int values accumulated via `map` callback, returning the built object.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map } from "std/array"
+val rs = [5, 6].map(n =>
+  var o = {}
+  o["x"] = n
+  o
+)
+print(toString(rs))
+"#);
+    assert_eq!(out, vec![r#"[{"x": 5}, {"x": 6}]"#]);
+
+    // String value via callback param.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/array"
+["hi"].for(s =>
+  var o = {}
+  o["msg"] = s
+  print(toString(o))
+)
+"#);
+    assert_eq!(out, vec![r#"{"msg": "hi"}"#]);
+
+    // Captured-`var` object accumulated across a loop, with the callback param as the KEY
+    // (a boxed string key must be unboxed to a raw LinString*).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/array"
+var out = {}
+["a", "b", "c"].for(k =>
+  out[k] = 1
+)
+print(toString(out))
+"#);
+    assert_eq!(out, vec![r#"{"a": 1, "b": 1, "c": 1}"#]);
+
+    // Churn loop: building an object via index-assign of a callback param across many
+    // iterations must not leak (verified under the ASan CI leg); functionally just completes.
+    let out = run(r#"import { print } from "std/io"
+import { for, range } from "std/array"
+val main = (): Null =>
+  range(0, 2000).for(i =>
+    var o = {}
+    o["k"] = i
+    null
+  )
+  print("done")
+main()
+"#);
+    assert_eq!(out, vec!["done"]);
+}
