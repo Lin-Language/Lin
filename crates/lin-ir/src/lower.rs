@@ -2588,6 +2588,14 @@ fn lower_match_pattern(
         TypedMatchPattern::Is(tp @ TypedPattern::Object { .. }) => {
             lower_object_pattern_test(tp, scrut, builder, ctx)
         }
+        // `is <name>` (a binding) and `is _` (wildcard) match ANY value unconditionally —
+        // they are named/anonymous catch-alls, not type checks. The generic arm below would
+        // call pattern_type_check, which returns the binding's declared type (= the
+        // scrutinee's static type, often Json) and emit an `IsType` tag check that can fail
+        // for a concrete value inside a Json scrutinee (e.g. `match req["path"] is p when …`
+        // never matched). Bindings always match; the value is bound in lower_match_bindings.
+        TypedMatchPattern::Is(TypedPattern::Binding(..))
+        | TypedMatchPattern::Is(TypedPattern::Wildcard(..)) => PatternTest::Always,
         TypedMatchPattern::Is(tp) => {
             let (check_ty, _) = pattern_type_check(tp);
             let dst = builder.alloc_temp(Type::Bool);
@@ -2691,8 +2699,22 @@ fn lower_typed_pattern_bindings(
 ) {
     match pattern {
         TypedPattern::Binding(slot, ty, _) => {
+            // The match scrutinee is boxed to Json/union (`box_to_json` at match entry).
+            // If this binding has a CONCRETE type (e.g. `is n` where n: Int32), binding it
+            // directly to the boxed pointer would later reinterpret the pointer as the
+            // scalar (ptrtoint) — so a guard like `when n > 5` compares a heap address, not
+            // the value, and is effectively always true. Unbox via Coerce when the
+            // scrutinee is boxed but the binding is concrete; a plain Bind (alias) is
+            // correct when types already match (e.g. a Json scrutinee bound to Json).
+            let scrut_ty = builder.temp_types.get(&scrut).cloned().unwrap_or(Type::TypeVar(u32::MAX));
             let t = builder.alloc_temp(ty.clone());
-            builder.emit(Instruction::Bind { dst: t, src: scrut, ty: ty.clone() });
+            if is_union_ty(&scrut_ty) && !is_union_ty(ty) {
+                builder.emit(Instruction::Coerce {
+                    dst: t, src: scrut, from_ty: scrut_ty, to_ty: ty.clone(),
+                });
+            } else {
+                builder.emit(Instruction::Bind { dst: t, src: scrut, ty: ty.clone() });
+            }
             builder.slots.insert(*slot, t);
         }
         TypedPattern::Object { fields, .. } => {

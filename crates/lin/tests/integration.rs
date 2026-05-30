@@ -3272,3 +3272,39 @@ print(toString(sum2(v)))
 "#);
     assert_eq!(out, vec!["7.0"]);
 }
+
+#[test]
+fn test_match_binding_pattern_matches_and_unboxes() {
+    // Two bugs in `is <binding>` match arms:
+    // (1) the binding was bound to the BOXED scrutinee pointer, so a concrete binding
+    //     (`is n` where n: Int32) used in a guard reinterpreted the pointer as the scalar
+    //     (`ptrtoint`) — `when n > 5` compared a heap address (always true).
+    // (2) the binding pattern was lowered as a type-CHECK (IsType against the binding's
+    //     declared type), so `match req["path"] is p when ...` never matched a concrete
+    //     value inside a Json scrutinee. A binding is a named catch-all: it always matches.
+    let out = run(r#"import { print } from "std/io"
+val f = (x: Int32): String =>
+  match x
+    is n when n > 5 => "big"
+    is m when m > 0 => "pos"
+    else => "other"
+print(f(10))
+print(f(3))
+print(f(0 - 1))
+"#);
+    assert_eq!(out, vec!["big", "pos", "other"]);
+
+    // A binding over a Json scrutinee mixed with a literal arm: the binding must match
+    // unconditionally (it was lowered as a type-check that failed for a concrete value
+    // inside a Json scrutinee, so the literal-or-else path was taken instead).
+    // `examples/web-server/router.test.lin` exercises the full guarded router shape.
+    let out = run(r#"import { print } from "std/io"
+val classify = (req: Json): String =>
+  match req["kind"]
+    is "a" => "is-a"
+    is other => "bound-other"
+print(classify({ "kind": "a" }))
+print(classify({ "kind": "z" }))
+"#);
+    assert_eq!(out, vec!["is-a", "bound-other"]);
+}
