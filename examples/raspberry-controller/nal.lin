@@ -1,0 +1,75 @@
+// H.264 Annex B NAL-unit parser — Lin port of server/src/nal.rs.
+//
+// The camera produces an Annex B byte stream: NAL units delimited by start codes
+// (00 00 01 or 00 00 00 01). nal_type is the low 5 bits of the first NAL byte.
+//
+// PARSER MODEL — whole-buffer (not stateful/chunked):
+//   The Rust NalParser is *stateful*: it buffers bytes across push() calls,
+//   tracks an `in_nal` flag, and carries a partial NAL forward to the next call.
+//   Lin has no mutable struct to hold that state ergonomically, so this port is a
+//   pure WHOLE-BUFFER parser: parseNals(buf) takes one complete buffer and returns
+//   every COMPLETE NAL unit in it.
+//
+//   It faithfully reproduces the Rust flush semantics: a NAL unit is only emitted
+//   when a *following* start code delimits it. The bytes after the final start
+//   code are a (possibly partial) trailing NAL and are NOT emitted — exactly like
+//   the stateful parser, which keeps them buffered for the next push(). So a
+//   buffer of "SC NAL_A SC NAL_B" emits only NAL_A; the trailing-SC test inputs in
+//   nal.rs add a sentinel start code precisely to flush the NAL before it.
+//
+//   LIMITS / tests NOT ported (because they exercise cross-call state this model
+//   does not have): `chunked_input` and `start_code_split_across_chunks`. Both
+//   feed two separate push() calls and assert the carry-over; a whole-buffer
+//   parser has no notion of "the rest arrives later". All single-buffer tests
+//   (single_nal_unit, multiple_nal_units, three_byte_start_codes,
+//   mixed_start_code_lengths, no_start_code, empty_input) ARE ported.
+//
+// Result shape: an array of { "nalType": Int32, "data": UInt8[] } objects, where
+// `data` is the NAL bytes WITHOUT the start code (matching NalUnit.data).
+//
+// Stdlib used: std/array — slice, length, push.
+
+import { slice, length, push } from "std/array"
+
+// Length of the start code at position i: 4 for 00 00 00 01, 3 for 00 00 01,
+// else 0. Nested ifs guard each index because Lin's `&&` does not short-circuit
+// array indexing (both operands are evaluated). Mirrors Rust start_code_at.
+export val startCodeAt = (b: UInt8[], i: Int32): Int32 =>
+  if i + 3 <= length(b) then
+    if b[i] == 0 then
+      if b[i + 1] == 0 then
+        if i + 4 <= length(b) then
+          if b[i + 2] == 0 then
+            if b[i + 3] == 1 then 4 else 0
+          else if b[i + 2] == 1 then 3 else 0
+        else if b[i + 2] == 1 then 3 else 0
+      else 0
+    else 0
+  else 0
+
+// Emit the NAL spanning [lo, hi) into acc (skipping empties), nal_type = data[0]
+// & 0x1F. Matches the Rust `if !nal_data.is_empty()` guard.
+val emitNal = (b: UInt8[], lo: Int32, hi: Int32, acc: Json): Null =>
+  if hi > lo then
+    val data: UInt8[] = slice(b, lo, hi)
+    push(acc, { "nalType": data[0] & 0x1F, "data": data })
+  else null
+
+// Recursive scan: i = cursor, start = index of the current NAL's first byte
+// (start < 0 means "no NAL open yet"), acc = accumulating result array. On each
+// start code, flush the open NAL (if any) and begin a new one after the code.
+val scan = (b: UInt8[], i: Int32, start: Int32, acc: Json): Null =>
+  if i >= length(b) then null
+  else
+    val sc = startCodeAt(b, i)
+    if sc > 0 then
+      val flushed = if start >= 0 then emitNal(b, start, i, acc) else null
+      scan(b, i + sc, i + sc, acc)
+    else
+      scan(b, i + 1, start, acc)
+
+// Parse a complete buffer into the array of complete NAL units it contains.
+export val parseNals = (b: UInt8[]): Json =>
+  val acc: Json[] = []
+  scan(b, 0, 0 - 1, acc)
+  acc

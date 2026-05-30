@@ -492,8 +492,16 @@ impl FuncBuilder {
     }
 
     /// Register an owned temp in the current scope frame.
+    ///
+    /// Uses `needs_owning` (concrete rc OR boxed union/Json), not just `is_rc_type`: an owned
+    /// boxed-union value (e.g. the result of a `map`/`filter`/`reduce`/`concat`/`keys` call,
+    /// which all return `Json`) is a freshly-allocated `TaggedVal*` (+1) that the scope must
+    /// release at exit, exactly like a concrete rc value. The scope-exit `Release { ty: <union> }`
+    /// dispatches the tag-aware `lin_tagged_release` (null/scalar/cached-box safe; frees the box
+    /// shell and drops the inner payload's rc). Restricting to `is_rc_type` silently dropped
+    /// union registrations (the historic source of the per-call Json leak).
     fn register_owned(&mut self, t: Temp, ty: Type) {
-        if is_rc_type(&ty) {
+        if needs_owning(&ty) {
             if let Some(frame) = self.scope_owned.last_mut() {
                 frame.push((t, ty));
             }
@@ -523,11 +531,32 @@ impl FuncBuilder {
     /// Non-RC values need nothing. Centralising this means a new container-insert site can't
     /// silently get the rule half-right (the historical source of double-free / leak bugs).
     ///
-    /// `temp` is the RAW underlying heap value (never a boxed TaggedVal — retaining a box
-    /// bumps the wrong refcount). `source` is the expression that produced it.
-    fn transfer_into_container(&mut self, temp: Temp, source: &TypedExpr) {
+    /// `temp` is the RAW underlying heap value (for concrete rc, never a boxed TaggedVal —
+    /// retaining a box bumps the wrong refcount; for unions it IS the boxed TaggedVal). `source`
+    /// is the expression that produced it. `op_consumes_union` records whether the container op,
+    /// for a UNION element, MOVES the box into the slot (raw struct copy, no inner retain) rather
+    /// than retaining the inner — see the runtime semantics below.
+    ///
+    /// Union elements need op-specific handling because the runtime is NOT uniform:
+    ///   - `Push` (tagged array, `lin_push_dyn`) and `object_set` RETAIN the boxed value's inner
+    ///     payload — the slot gets its own reference. The source box keeps its own reference and
+    ///     is released by its owner (scope-exit for a fresh call result, the original owner for a
+    ///     borrowed value). So we do NOTHING: leave it registered, do not retain.
+    ///   - `lin_array_set` into a tagged array does a raw `copy_nonoverlapping` of the TaggedVal
+    ///     struct and does NOT bump the inner rc — it CONSUMES the box. A fresh source must be
+    ///     unregistered (else scope-exit + the slot both free the same inner → double-free); a
+    ///     borrowed source must be retained (so the slot owns its own inner reference, mirroring
+    ///     the concrete-rc rule).
+    /// For CONCRETE rc elements every op consumes (codegen never retains a concrete element on
+    /// insert), so the original fresh-vs-borrowed rule applies regardless of `op_consumes_union`.
+    fn transfer_into_container(&mut self, temp: Temp, source: &TypedExpr, op_consumes_union: bool) {
         let ty = source.ty();
-        if !is_rc_type(&ty) {
+        if !needs_owning(&ty) {
+            return;
+        }
+        if is_union_ty(&ty) && !op_consumes_union {
+            // Retain-semantics op (Push / object_set): the runtime took its own inner reference;
+            // the source box stays owned by its current owner. Nothing to balance here.
             return;
         }
         if expr_is_fresh_alloc(source) {
@@ -538,10 +567,18 @@ impl FuncBuilder {
     }
 
     /// Pop the current scope frame and emit Release for all owned temps except `keep`.
+    /// `keep` transfers EXACTLY ONE owned reference to the survivor: a temp registered more than
+    /// once in this scope (e.g. `val r = [..]; r`, where the block result `r` is registered at the
+    /// array allocation AND again by the `LocalGet` read-retain of the trailing expression) leaks
+    /// every reference beyond the first unless the extras are released. So keep the FIRST `keep`
+    /// occurrence and RELEASE the rest. (Mirrors `pop_scope_releasing_keep`.)
     fn pop_scope_releasing(&mut self, keep: Temp) {
         if let Some(frame) = self.scope_owned.pop() {
+            let mut kept = false;
             for (t, ty) in frame {
-                if t != keep {
+                if t == keep && !kept {
+                    kept = true;
+                } else {
                     self.emit(Instruction::Release { val: t, ty });
                 }
             }
@@ -549,10 +586,25 @@ impl FuncBuilder {
     }
 
     /// Pop the current scope frame, releasing all owned temps except those in `keep`.
+    ///
+    /// A kept temp transfers EXACTLY ONE owned reference to the survivor (the function return,
+    /// or an if/match branch value flowing into the merge phi). The same temp can be registered
+    /// MULTIPLE times in one scope: e.g. `val r = [..]; r` registers `r` once at the array
+    /// allocation and again at the `LocalGet` read-retain of the return expression. Keeping ALL
+    /// registrations would leak every reference beyond the first (the classic concrete-rc
+    /// return-retain leak: the array is freed by the caller's single release but stays at the
+    /// extra refcount). So we keep only the FIRST occurrence of each kept temp and RELEASE the
+    /// rest, leaving the survivor at exactly +1 for the caller.
     fn pop_scope_releasing_keep(&mut self, keep: &[Temp]) {
         if let Some(frame) = self.scope_owned.pop() {
+            let mut kept_seen: Vec<Temp> = Vec::new();
             for (t, ty) in frame {
-                if !keep.contains(&t) {
+                if keep.contains(&t) && !kept_seen.contains(&t) {
+                    // Transfer this single reference to the survivor.
+                    kept_seen.push(t);
+                } else {
+                    // Either not kept at all, or a redundant extra registration of a kept temp
+                    // (a leaked read-retain) — release it.
                     self.emit(Instruction::Release { val: t, ty });
                 }
             }
@@ -1421,7 +1473,10 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                     // The array owns a reference to each heap element (lin_array_release
                     // recursively releases them when the array is freed) — apply the standard
                     // container-insert ownership rule on the RAW value before boxing/coercing.
-                    builder.transfer_into_container(t, e);
+                    // `lin_array_push_tagged` raw-copies the element's TaggedVal struct without
+                    // retaining its inner (a MOVE), so a union element is CONSUMED here too —
+                    // pass `op_consumes_union = true` so a fresh union element is unregistered.
+                    builder.transfer_into_container(t, e, true);
                     coerce_to_slot_type(t, &e.ty(), &elem_ty, builder)
                 })
                 .collect();
@@ -1713,7 +1768,15 @@ fn lower_call(
         args: lowered_args,
         ret_ty: result_type.clone(),
     });
-    builder.register_owned(dst, result_type.clone());
+    // Concrete rc results are owned (+1) here; a UNION result from an INDIRECT closure call is
+    // NOT registered, because the closure return ABI does NOT guarantee +1 for a boxed-union
+    // return: a closure whose body yields a borrowed param/local box (e.g. minBy's
+    // `(acc, x) => if x[0] < acc[0] then x else acc`) hands back a +0 box. Registering it would
+    // make scope-exit release a box the callee never owned us → double-free. (Concrete rc returns
+    // ARE +1: a concrete param read retains in place before the closure keeps it on return.)
+    if is_rc_type(result_type) {
+        builder.register_owned(dst, result_type.clone());
+    }
     dst
 }
 
@@ -1792,9 +1855,26 @@ fn lower_intrinsic_call(
     // value, calls lin_object_set (which retains the inner), then releases the box (undoing
     // that retain) — net effect is also a transfer. So the standard container-insert ownership
     // rule applies to the element in every case.
+    // A fresh UNION box consumed by `lin_array_set` (raw struct move, no inner retain) leaves an
+    // orphaned 16-byte box SHELL: the array slot owns the inner, but the source box header is no
+    // longer referenced and must be freed (shell only — freeing the inner would corrupt the slot).
+    // Freed AFTER the set (the set reads from the box), via FreeBoxShell (`lin_tagged_free_box`,
+    // null/cached-box safe). This is the per-element box leak inside `map`'s
+    // `lin_array_set(result, i, f(item))`.
+    let mut shell_to_free: Option<Temp> = None;
     if matches!(intrinsic, Intrinsic::Push | Intrinsic::ArraySetDyn | Intrinsic::ObjectSetDyn) {
         if let (Some(elem_expr), Some(&elem_temp)) = (args.last(), lowered_args.last()) {
-            builder.transfer_into_container(elem_temp, elem_expr);
+            // For a UNION element, only `lin_array_set` (ArraySetDyn) moves the box (raw struct
+            // copy, no inner retain); `Push`/`object_set` retain the inner. Concrete elements are
+            // always consumed regardless of this flag.
+            let op_consumes_union = matches!(intrinsic, Intrinsic::ArraySetDyn);
+            builder.transfer_into_container(elem_temp, elem_expr, op_consumes_union);
+            if op_consumes_union
+                && is_union_ty(&elem_expr.ty())
+                && expr_is_fresh_alloc(elem_expr)
+            {
+                shell_to_free = Some(elem_temp);
+            }
         }
     }
 
@@ -1805,6 +1885,9 @@ fn lower_intrinsic_call(
         args: lowered_args,
         ret_ty: result_type.clone(),
     });
+    if let Some(shell) = shell_to_free {
+        builder.emit(Instruction::FreeBoxShell { val: shell });
+    }
     builder.register_owned(dst, result_type.clone());
     dst
 }
@@ -2441,6 +2524,11 @@ fn lower_if(
     });
 
     let result_dst = builder.alloc_temp(result_type.clone());
+    // Only CONCRETE rc merge results are registered as owned. A boxed-union if-result is NOT
+    // owned here: a branch may yield a BORROWED union box (e.g. `if c then x else y` returning
+    // params, as in minBy's reducer `if x[0] < acc[0] then x else acc`), which carries no +1, so
+    // registering+releasing the merge would double-free a borrowed box. (Concrete rc branch
+    // values are always +1 — a concrete param read retains in place.)
     let result_is_rc = is_rc_type(result_type);
 
     // Each branch gets its own ownership scope so heap temps it allocates are released
@@ -2617,6 +2705,8 @@ fn lower_match(
         ty: result_type.clone(),
         incomings,
     });
+    // Only CONCRETE rc merge results are owned (see lower_if): a boxed-union match-result may be
+    // a borrowed arm value (carrying no +1), so registering+releasing it would double-free.
     if is_rc_type(result_type) {
         builder.register_owned(result_dst, result_type.clone());
     }
