@@ -1644,6 +1644,53 @@ val dbl = (x: Int32): Int32 => x * 2
 }
 
 #[test]
+fn test_named_fn_as_function_arg_to_multiparam_user_fn() {
+    // Regression: passing a top-level NAMED function as a `Function`-typed ARGUMENT to a
+    // multi-param USER function (alongside other heap/scalar params) used to DROP the arg.
+    // A bare `LocalGet` of a global-fn slot in value position fell through to a placeholder
+    // null temp with no defining instruction, so codegen's arg collection (filter_map over
+    // temp_map) silently dropped it — emitting 3 args for a 4-param call. A RECURSIVE callee
+    // then failed to build ("Incorrect number of arguments passed to called function!"); a
+    // NON-RECURSIVE callee built then SEGFAULTED when it invoked the missing Function arg.
+    // Fix: materialize the named fn as a closure VALUE (MakeClosure, no captures) like a
+    // lambda literal would. Covers recursive + non-recursive callees, Json + Int args.
+
+    // Recursive callee, Json args.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val leaf = (t: Json, p: Int32): Json => { "v": p }
+val combine = (t: Json, l: Json, p: Int32, f: Function): Json =>
+  if p >= 2 then { "v": l }
+  else
+    val r = f(t, p + 1)
+    combine(t, r, r["v"], f)
+val go = (t: Json): Json => combine(t, { "v": 0 }, 0, leaf)
+print(toString(go([])))
+"#);
+    assert_eq!(output, vec![r#"{"v": {"v": 2}}"#]);
+
+    // Non-recursive callee, Json args.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val leaf = (t: Json, p: Int32): Json => { "v": p }
+val combine = (t: Json, l: Json, p: Int32, f: Function): Json => f(t, p)
+val go = (t: Json): Json => combine(t, { "v": 0 }, 0, leaf)
+print(toString(go([])))
+"#);
+    assert_eq!(output, vec![r#"{"v": 0}"#]);
+
+    // Non-recursive callee, all-Int args.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val leaf = (t: Int32, p: Int32): Int32 => t + p
+val combine = (t: Int32, l: Int32, p: Int32, f: Function): Int32 => f(t, p)
+val go = (t: Int32): Int32 => combine(t, 0, 0, leaf)
+print(toString(go(9)))
+"#);
+    assert_eq!(output, vec!["9"]);
+}
+
+#[test]
 fn test_function_param_destructuring() {
     let output = run(r#"import { print } from "std/io"
 

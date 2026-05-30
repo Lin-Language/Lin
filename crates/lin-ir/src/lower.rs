@@ -1292,6 +1292,28 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 let dst = builder.alloc_temp(gty.clone());
                 builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty.clone() });
                 own_for_read(dst, &gty, builder)
+            } else if let Some(&fid) = ctx.global_fn_slots.get(slot) {
+                // A top-level NAMED function referenced as a VALUE (not in call position):
+                // e.g. passed as a `Function`-typed argument `combine(t, l, p, leaf)`, or stored
+                // in a binding. Top-level fn vals are NOT published as module globals (they live
+                // only as `main`'s SSA temps — see lower_module's global_val_slots scan, which
+                // excludes Function vals), so inside any OTHER function the slot resolves to none
+                // of the branches above. Without this it fell through to the placeholder `else`
+                // and emitted NO instruction, so codegen's arg collection (filter_map over
+                // temp_map) silently DROPPED the arg — "3 args for a 4-param call" → codegen
+                // error for a recursive callee, segfault for a non-recursive one. Materialize the
+                // named fn as a closure VALUE exactly as a lambda literal would (MakeClosure with
+                // no captures), so codegen wraps it in the uniform boxed-ABI desc-ret stub.
+                let closure_ty = ty.clone();
+                let dst = builder.alloc_temp(closure_ty.clone());
+                builder.emit(Instruction::MakeClosure {
+                    dst,
+                    func: fid,
+                    captures: vec![],
+                    ret_ty: closure_ty.clone(),
+                });
+                builder.register_owned(dst, closure_ty);
+                dst
             } else {
                 // Slot not yet in scope — emit a placeholder null temp.
                 // (Can happen for forward-declared functions resolved by codegen.)
