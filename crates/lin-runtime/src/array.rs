@@ -629,7 +629,42 @@ pub unsafe extern "C" fn lin_flat_array_concat_into_f64(dst: *mut LinArray, src:
     }
 }
 
-/// Tagged-element array equality (structural, element-by-element).
+/// Load element `i` of `arr` into a `TaggedVal` (by value, no heap allocation), handling
+/// BOTH tagged arrays (`elem_tag == 0xFF`, elements already laid out as TaggedVal) and flat
+/// scalar arrays (raw i8/i16/i32/i64/f32/f64/bool elements). Used by `lin_array_eq` so it can
+/// compare any array — including flat ones reached by recursion through a nested heap array.
+unsafe fn array_elem_as_tagged(arr: *const LinArray, i: usize) -> crate::tagged::TaggedVal {
+    use crate::tagged::*;
+    let mut tv: TaggedVal = std::mem::zeroed();
+    let et = (*arr).elem_tag;
+    if et == 0xFF {
+        // Tagged element: copy the in-place TaggedVal-layout element directly.
+        let elem = (*arr).data.add(i) as *const TaggedVal;
+        return *elem;
+    }
+    // Flat scalar element: read the raw value of the right width and box it inline.
+    match et {
+        TAG_INT32 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const i32).add(i)) as i64 as u64; }
+        TAG_INT64 => { tv.tag = TAG_INT64; tv.payload = (*((*arr).data as *const i64).add(i)) as u64; }
+        TAG_FLOAT32 => { tv.tag = TAG_FLOAT32; tv.payload = (*((*arr).data as *const f32).add(i)).to_bits() as u64; }
+        TAG_FLOAT64 => { tv.tag = TAG_FLOAT64; tv.payload = (*((*arr).data as *const f64).add(i)).to_bits(); }
+        TAG_UINT8 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const u8).add(i)) as i64 as u64; }
+        TAG_INT8 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const i8).add(i)) as i64 as u64; }
+        TAG_UINT16 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const u16).add(i)) as i64 as u64; }
+        TAG_INT16 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const i16).add(i)) as i64 as u64; }
+        TAG_UINT32 => { tv.tag = TAG_INT64; tv.payload = (*((*arr).data as *const u32).add(i)) as u64; }
+        TAG_UINT64 => { tv.tag = TAG_UINT64; tv.payload = *((*arr).data as *const u64).add(i); }
+        TAG_BOOL => { tv.tag = TAG_BOOL; tv.payload = (*((*arr).data as *const u8).add(i)) as u64; }
+        _ => { tv.tag = TAG_NULL; }
+    }
+    tv
+}
+
+/// Structural array equality (element-by-element, deep). Works for tagged AND flat scalar
+/// arrays, and is the recursion target for nested arrays (a TAG_ARRAY element routes here
+/// via `lin_tagged_eq`). Each element is compared via `lin_tagged_eq`, so scalars compare by
+/// value (incl. cross-numeric) and heap elements (String/Array/Object) recurse deeply. A raw
+/// payload `!=` would compare heap elements by POINTER — wrong for distinct-but-equal values.
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_eq(a: *const LinArray, b: *const LinArray) -> u8 {
     if a == b { return 1; }
@@ -637,12 +672,14 @@ pub unsafe extern "C" fn lin_array_eq(a: *const LinArray, b: *const LinArray) ->
     let len = (*a).len;
     if len != (*b).len { return 0; }
     for i in 0..len as usize {
-        let ae = (*a).data.add(i);
-        let be = (*b).data.add(i);
-        if (*ae).tag != (*be).tag { return 0; }
-        // Compare payloads — for strings/arrays/objects this is pointer eq (shallow),
-        // which matches the spec for the typed-array case where elements are scalars.
-        if (*ae).payload != (*be).payload { return 0; }
+        let ae = array_elem_as_tagged(a, i);
+        let be = array_elem_as_tagged(b, i);
+        if crate::tagged::lin_tagged_eq(
+            &ae as *const crate::tagged::TaggedVal as *const u8,
+            &be as *const crate::tagged::TaggedVal as *const u8,
+        ) == 0 {
+            return 0;
+        }
     }
     1
 }

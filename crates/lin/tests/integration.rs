@@ -243,15 +243,11 @@ print(toString([1, 2] == [2, 1]))
 }
 
 // Arrays whose ELEMENTS are heap values (strings, nested arrays, objects) must compare
-// STRUCTURALLY, like the top-level object/array equality above. This currently fails:
-// `lin_array_eq` (lin-runtime/src/array.rs) compares element payloads by POINTER, so two
-// distinct-but-equal heap elements (e.g. two "a" strings) are seen as unequal and the whole
-// array compares false. Scalar-element arrays (handled by the int case in test_equality) are
-// unaffected because their payloads are inline values. Fix: lin_array_eq must recurse via
-// lin_tagged_eq for heap-tagged elements instead of comparing raw payload pointers.
-// Ignored until that fix lands — remove the #[ignore] once lin_array_eq recurses.
+// STRUCTURALLY, like the top-level object/array equality above. `lin_array_eq`
+// (lin-runtime/src/array.rs) now recurses via `lin_tagged_eq` per element, so two
+// distinct-but-equal heap elements (e.g. two "a" strings) compare equal. Scalar-element
+// arrays are unaffected (their payloads are inline values, compared by value).
 #[test]
-#[ignore = "known bug: lin_array_eq compares heap elements by pointer, not structurally"]
 fn test_array_equality_with_heap_elements() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -259,10 +255,11 @@ import { toString } from "std/string"
 print(toString(["a", "b"] == ["a", "b"]))
 print(toString(["a", "b"] == ["a", "c"]))
 print(toString([[1, 2], [3]] == [[1, 2], [3]]))
+print(toString([[1], [2, 3]] == [[1], [2, 4]]))
 print(toString([{ "k": 1 }] == [{ "k": 1 }]))
 print(toString([{ "k": 1 }] == [{ "k": 2 }]))
 "#);
-    assert_eq!(output, vec!["true", "false", "true", "true", "false"]);
+    assert_eq!(output, vec!["true", "false", "true", "false", "true", "false"]);
 }
 
 #[test]
@@ -3289,6 +3286,41 @@ sleepMicros(500)
 print("done")
 "#);
     assert_eq!(out, vec!["done"]);
+}
+
+#[test]
+fn test_concrete_string_into_json_var_loop() {
+    // Regression: reassigning a fresh CONCRETE value (toString -> String) into a Json/union
+    // `var` inside a loop boxes the value via Coerce, producing a transient TaggedVal* shell.
+    // The LocalSet store path used to clone that box for the global/cell AND for the result
+    // but never freed the transient shell, leaking ~36 bytes per iteration. The fix frees the
+    // shell (FreeBoxShell) after both clones. This asserts correctness: the var must hold the
+    // last assigned value and the program must not crash (no use-after-free / double-free).
+    let out = run(r#"import { range, for } from "std/array"
+import { toString } from "std/string"
+import { print } from "std/io"
+
+var last: Json = ""
+range(0, 5).for(i => last = toString(i))
+print(toString(last))
+"#);
+    assert_eq!(out, vec!["4"]);
+}
+
+#[test]
+fn test_concrete_object_into_json_var_loop() {
+    // Regression companion to the String case: a fresh concrete Object boxed into a Json var
+    // each iteration. Exercises the same transient-coercion-box free path with an Object payload
+    // and confirms the final stored value is correct.
+    let out = run(r#"import { range, for } from "std/array"
+import { toString } from "std/string"
+import { print } from "std/io"
+
+var last: Json = null
+range(0, 5).for(i => last = { "n": i })
+print(toString(last))
+"#);
+    assert_eq!(out, vec![r#"{"n": 4}"#]);
 }
 
 #[test]
