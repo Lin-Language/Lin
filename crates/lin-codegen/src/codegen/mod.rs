@@ -1228,6 +1228,34 @@ impl<'ctx> Codegen<'ctx> {
                                 }
                             }
                         }
+                        Instruction::FreeCell { cell, ty } => {
+                            if let Some(&c) = temp_map.get(cell) {
+                                if c.is_pointer_value() {
+                                    // Release the cell's CURRENT owned value, then free the cell
+                                    // allocation. Mirrors CellSet's release-old (the cell holds
+                                    // exactly one independent reference to its current value), but
+                                    // there is no new value to store — this is the cell's final
+                                    // teardown at the creating function's scope exit. Only emitted
+                                    // for provably-non-escaping cells (lowerer escape analysis), so
+                                    // no surviving closure can read the cell after this.
+                                    let llvm_ty = self.llvm_type(ty);
+                                    if Self::ty_is_concrete_rc(ty) || Self::is_union_type(ty) {
+                                        let old = self.builder
+                                            .load(llvm_ty, c.into_pointer_value(), "ir_cell_final");
+                                        self.emit_release(old, ty);
+                                    }
+                                    // Free the raw cell allocation (no refcount header). Size
+                                    // matches MakeCell's `lin_alloc(size_of ty)`.
+                                    let size = llvm_ty.size_of().unwrap();
+                                    let size_i64 = self.builder.int_z_extend_or_bit_cast(size, i64_ty, "cell_free_sz");
+                                    let free_fn = self.get_or_declare_fn(
+                                        "lin_cell_free",
+                                        self.context.void_type().fn_type(&[ptr_ty.into(), i64_ty.into()], false),
+                                    );
+                                    self.builder.call(free_fn, &[c.into_pointer_value().into(), size_i64.into()], "");
+                                }
+                            }
+                        }
                         Instruction::EnvCapture { dst, env, index, ty } => {
                             if let Some(&env_v) = temp_map.get(env) {
                                 if env_v.is_pointer_value() {

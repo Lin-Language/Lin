@@ -424,6 +424,71 @@ print(toString(total))
     assert_eq!(output, vec!["225"]);
 }
 
+// Regression (captured-cell free): `map` uses a `var i` cell captured by its inner `.for`
+// closure. The cell + its value were leaked on every `map` call (a per-call ~31 B leak; in a
+// hot loop, unbounded RSS growth). The lowerer now frees provably-non-escaping captured cells
+// at the creating function's scope exit (the closure is a synchronous, non-retained combinator
+// callback argument, so it can't outlive the call). This is the discarded-map-in-loop leak
+// case: it must still produce the CORRECT count, and a wrong (over-eager) free would be a
+// use-after-free crashing or corrupting `map`'s accumulator.
+#[test]
+fn test_map_in_loop_discarded_cell_free() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for, map } from "std/array"
+
+val outer = range(0, 5000)
+var c = 0
+outer.for(i =>
+  val m = [1, 2, 3].map(x => x + 1)
+  c = c + 1
+)
+print(toString(c))
+"#);
+    assert_eq!(output, vec!["5000"]);
+}
+
+// Regression (escape safety): a `var n` cell captured by a closure that is RETURNED from its
+// creating function ESCAPES — the closure (and thus the cell) outlives the call. The lowerer
+// must NOT free this cell at scope exit; doing so would be a use-after-free when the returned
+// closure is later invoked. This counter factory must still increment correctly across calls.
+#[test]
+fn test_escaping_captured_cell_not_freed() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val mk = () =>
+  var n = 0
+  () =>
+    n = n + 1
+    n
+val c = mk()
+print(toString(c()))
+print(toString(c()))
+print(toString(c()))
+"#);
+    assert_eq!(output, vec!["1", "2", "3"]);
+}
+
+// Regression (captured-cell free correctness): every combinator whose stdlib body uses a `var`
+// cell (map/filter/reduce/find/some/every) must still produce correct results after the cell
+// free is applied — a wrong free would corrupt or crash them.
+#[test]
+fn test_combinators_with_var_cells_correct_after_free() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter, reduce, find, some, every } from "std/array"
+
+print(toString([1, 2, 3].map(x => x * 2)))
+print(toString([1, 2, 3, 4].filter(x => x > 2)))
+print(toString([1, 2, 3, 4].reduce(0, (a, b) => a + b)))
+print(toString([1, 2, 3, 4].find(x => x > 2)))
+print(toString([1, 2, 3].some(x => x > 2)))
+print(toString([1, 2, 3].every(x => x > 0)))
+"#);
+    assert_eq!(output, vec!["[2, 4, 6]", "[3, 4]", "10", "3", "true", "true"]);
+}
+
 // Regression (call-arg-box leak): passing a CONCRETE array to a Json-typed param (`for`'s
 // iterable) inside an outer loop boxes the array into a fresh TaggedVal* shell each outer
 // iteration. The shell was never freed → one-box-per-iteration leak. Caller now frees the

@@ -134,6 +134,14 @@ pub fn lower_import_module(module: &TypedModule, module_key: &str) -> LinModule 
             let fid = ctx.alloc_func_id();
             global_fn_slots.insert(*slot, fid);
             fn_names.insert(fid, format!("{}_{}", module_key, name));
+            // Stdlib-internal combinator call (e.g. `map`'s body calls the sibling `for`):
+            // record the callback arg index so cells captured by the closure passed to it stay
+            // freeable. Restricted to `std/array` so only its trusted combinators qualify.
+            if module_key == "std_array" {
+                if let Some(idx) = safe_combinator_callback_index(name) {
+                    ctx.safe_combinator_slots.insert(*slot, idx);
+                }
+            }
         }
     }
     ctx.global_fn_slots = global_fn_slots.clone();
@@ -285,6 +293,21 @@ struct LowerCtx {
     pending_adapters: Vec<AdapterSpec>,
     /// Real FuncId → default-argument descriptor (for the closure-value indirect path).
     default_descriptors: HashMap<FuncId, DefaultDescriptor>,
+    /// Function slots that are KNOWN synchronous, non-retaining higher-order combinators
+    /// (`for`/`while`/`map`/`filter`/`reduce`/`find`/`some`/`every`), mapped to the argument
+    /// index of their callback parameter. A closure literal lowered as THAT argument is consumed
+    /// synchronously and never retained/stored/returned, so heap cells it captures do not escape.
+    /// Populated for: stdlib imports (matched by export name) and stdlib-internal calls (matched
+    /// in `lower_import_module`). Used alongside the intrinsic combinators (`lin_for` etc.).
+    safe_combinator_slots: HashMap<usize, usize>,
+    /// >0 while lowering an expression that is a SYNCHRONOUS, non-retained callback argument
+    /// to a known consuming combinator (for/while/map/filter/reduce). A closure literal
+    /// (`MakeClosure`) lowered while this is >0 is PROVABLY consumed-and-discarded by the
+    /// combinator within the same function call — it is never bound, returned, or stored — so
+    /// the heap cell(s) it captures do not escape and may be freed at the creating function's
+    /// scope exit. When this is 0, any captured cell is conservatively marked escaping (left
+    /// leaking). See `FreeCell` and the captured-cell escape analysis.
+    safe_callback_depth: u32,
 }
 
 /// A default-fill adapter to be synthesized and lowered. `f@k` takes the first `k` parameters
@@ -321,6 +344,8 @@ impl LowerCtx {
             default_adapters: HashMap::new(),
             pending_adapters: Vec::new(),
             default_descriptors: HashMap::new(),
+            safe_combinator_slots: HashMap::new(),
+            safe_callback_depth: 0,
         }
     }
 
@@ -360,6 +385,17 @@ struct FuncBuilder {
     /// Slots stored as heap cells (mutably-captured `var`s): slot → stored value type.
     /// `slots[slot]` holds the cell-pointer temp; LocalGet/LocalSet go through the cell.
     cell_slots: HashMap<usize, Type>,
+    /// Captured-`var` heap cells (MakeCell) created in THIS function body, in creation order:
+    /// (cell temp, stored value type, creation block). Candidates for scope-exit freeing. Only
+    /// cells created in the ENTRY block (BlockId(0)) are freed — the entry block dominates every
+    /// block, so the function-scope-exit block (where FreeCell is emitted) is guaranteed
+    /// dominated by the MakeCell, satisfying LLVM SSA dominance. Cells created inside a
+    /// conditional/loop branch (e.g. `_qsort`'s `var i` inside `if lo < hi`) are NOT in the
+    /// entry block, would fail dominance at the merge exit, and are left leaking (sound).
+    created_cells: Vec<(Temp, Type, BlockId)>,
+    /// The subset of `created_cells` proven to ESCAPE (a capturing closure was lowered outside
+    /// safe-combinator-callback context). Escaping cells are NEVER freed (leak, but sound).
+    escaping_cells: std::collections::HashSet<Temp>,
 }
 
 impl FuncBuilder {
@@ -403,6 +439,8 @@ impl FuncBuilder {
             scope_owned: Vec::new(),
             diverged_blocks: std::collections::HashSet::new(),
             cell_slots: HashMap::new(),
+            created_cells: Vec::new(),
+            escaping_cells: std::collections::HashSet::new(),
         }
     }
 
@@ -991,8 +1029,14 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 let t = coerce_and_own_store(raw, &value.ty(), &cell_ty, builder);
                 let cell = builder.alloc_temp(Type::TypeVar(u32::MAX));
                 builder.emit(Instruction::MakeCell { dst: cell, init: t, ty: cell_ty.clone() });
-                builder.cell_slots.insert(*slot, cell_ty);
+                builder.cell_slots.insert(*slot, cell_ty.clone());
                 builder.slots.insert(*slot, cell);
+                // Track this cell for the captured-cell escape analysis: it becomes a
+                // scope-exit FreeCell candidate unless a capturing closure is later lowered
+                // outside safe-combinator-callback context (which marks it escaping). Record the
+                // creation block so we only free entry-block cells (dominance — see field doc).
+                let create_block = builder.current_block;
+                builder.created_cells.push((cell, cell_ty, create_block));
             } else {
                 let t = lower_expr(value, builder, ctx);
                 let t = coerce_to_slot_type(t, &value.ty(), ty, builder);
@@ -1025,6 +1069,15 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 if let Type::Function { params, .. } = &b.ty {
                     let sym = format!("{}_{}", module_key, b.name);
                     ctx.import_fn_slots.insert(b.slot, (sym, params.clone()));
+                    // Imported stdlib combinator (map/for/filter/…): a closure passed as its
+                    // callback argument is consumed synchronously and never escapes — record the
+                    // callback arg index so captured cells stay freeable. Restricted to the
+                    // `std/array` module so a same-named export from elsewhere isn't trusted.
+                    if module_key == "std_array" {
+                        if let Some(idx) = safe_combinator_callback_index(&b.name) {
+                            ctx.safe_combinator_slots.insert(b.slot, idx);
+                        }
+                    }
                 } else {
                     let wrapper = format!("{}_{}__val", module_key, b.name);
                     ctx.import_val_slots.insert(b.slot, (wrapper, b.ty.clone()));
@@ -1620,6 +1673,29 @@ fn lower_call_arg(a: &TypedExpr, param_ty: Option<&Type>, builder: &mut FuncBuil
     lower_coerce_arg(t, &a.ty(), param_ty, builder)
 }
 
+/// Lower argument `i` of a call. When `i` is the callback index of a KNOWN synchronous
+/// combinator (`cb_idx`), enable the captured-cell safe-context (the closure is consumed
+/// synchronously and never escapes); otherwise lower normally. `safe_callback_depth` is a
+/// counter so nested combinator callbacks remain safe and only fully unwinding to 0 (a
+/// non-combinator context) marks captured cells escaping.
+fn lower_call_arg_maybe_safe(
+    a: &TypedExpr,
+    param_ty: Option<&Type>,
+    i: usize,
+    cb_idx: Option<usize>,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Temp {
+    if cb_idx == Some(i) {
+        ctx.safe_callback_depth += 1;
+        let t = lower_call_arg(a, param_ty, builder, ctx);
+        ctx.safe_callback_depth -= 1;
+        t
+    } else {
+        lower_call_arg(a, param_ty, builder, ctx)
+    }
+}
+
 fn lower_call(
     func: &TypedExpr,
     args: &[TypedExpr],
@@ -1641,6 +1717,10 @@ fn lower_call(
             _ => args.len(),
         };
         let is_default_fill = !partial && args.len() < total_arity;
+        // If the callee is a KNOWN synchronous combinator (stdlib for/map/filter/…), the index
+        // of its callback argument: a closure lowered there is consumed synchronously and does
+        // not escape, so captured cells stay freeable. None for any other callee (conservative).
+        let cb_idx = ctx.safe_combinator_slots.get(slot).copied();
         // Imported function: call the compiled symbol by its mangled name, boxing
         // concrete args passed to Json/union-typed parameters.
         if let Some((sym, param_tys)) = ctx.import_fn_slots.get(slot).cloned() {
@@ -1649,7 +1729,7 @@ fn lower_call(
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    let arg = lower_call_arg(a, param_tys.get(i), builder, ctx);
+                    let arg = lower_call_arg_maybe_safe(a, param_tys.get(i), i, cb_idx, builder, ctx);
                     retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
                     if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
                         shell_boxes.push(arg);
@@ -1688,7 +1768,7 @@ fn lower_call(
                 .iter()
                 .enumerate()
                 .map(|(i, a)| {
-                    let arg = lower_call_arg(a, param_tys.get(i), builder, ctx);
+                    let arg = lower_call_arg_maybe_safe(a, param_tys.get(i), i, cb_idx, builder, ctx);
                     retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
                     if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
                         shell_boxes.push(arg);
@@ -1896,6 +1976,36 @@ fn iter_elem_type(iterable_ty: &Type) -> Type {
         // Json/union iterables yield dynamically-typed (boxed) elements.
         _ => Type::TypeVar(u32::MAX),
     }
+}
+
+/// If `name` is a KNOWN synchronous, non-retaining higher-order combinator, return the
+/// argument index of its callback parameter. These stdlib functions (and the matching `lin_*`
+/// intrinsics) invoke the callback synchronously during the call and never retain, store, or
+/// return it — so a closure passed as that argument does NOT escape, and heap cells it captures
+/// are safe to free at the creating function's scope exit. CONSERVATIVE: only these exact names
+/// are trusted; every other callee leaves the captured cell escaping (leaking, but sound).
+/// `reduce` takes (arr, init, f) — its callback is arg index 2; the rest take (arr, f) — index 1.
+fn safe_combinator_callback_index(name: &str) -> Option<usize> {
+    match name {
+        "for" | "while" | "map" | "filter" | "find" | "some" | "every" => Some(1),
+        "reduce" => Some(2),
+        _ => None,
+    }
+}
+
+/// Lower a callback ARGUMENT to a known synchronous, invoke-and-discard combinator
+/// (for/while/map/filter/reduce) with the captured-cell escape analysis enabled. While
+/// `safe_callback_depth > 0`, a closure literal lowered here does NOT escape (the combinator
+/// runs it synchronously and never retains/stores/returns it), so any heap cell it captures
+/// stays a scope-exit FreeCell candidate. SOUNDNESS: these five combinators are the only
+/// callers that mark the context safe; every other use of a closure (binding, return, store,
+/// async/worker, unknown callee, or even another arg position) leaves the depth at 0, so the
+/// captured cell is conservatively marked escaping and never freed.
+fn lower_callback_in_safe_ctx(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+    ctx.safe_callback_depth += 1;
+    let t = lower_expr(expr, builder, ctx);
+    ctx.safe_callback_depth -= 1;
+    t
 }
 
 /// The declared parameter types and return type of a callback expression, if it has a
@@ -2248,7 +2358,7 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
     let iterable_ty = args[0].ty();
     let (param_tys, _) = callback_signature(&args[1]);
     let iterable = lower_expr(&args[0], builder, ctx);
-    let body = lower_expr(&args[1], builder, ctx);
+    let body = lower_callback_in_safe_ctx(&args[1], builder, ctx);
     let elem_ty = iter_elem_type(&iterable_ty);
     // The callback closure uses the uniform BOXED ABI: it ALWAYS returns a freshly-allocated,
     // independently-owned `TaggedVal*` (e.g. `lin_box_null()` for a void-ish body, `lin_box_int`
@@ -2285,7 +2395,7 @@ fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx
     let iterable_ty = args[0].ty();
     let (param_tys, _) = callback_signature(&args[1]);
     let iterable = lower_expr(&args[0], builder, ctx);
-    let body = lower_expr(&args[1], builder, ctx);
+    let body = lower_callback_in_safe_ctx(&args[1], builder, ctx);
 
     let elem_ty = iter_elem_type(&iterable_ty);
     let len = builder.alloc_temp(Type::Int64);
@@ -2347,7 +2457,7 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
     let iterable_ty = args[0].ty();
     let (param_tys, cb_ret) = callback_signature(&args[1]);
     let iterable = lower_expr(&args[0], builder, ctx);
-    let f = lower_expr(&args[1], builder, ctx);
+    let f = lower_callback_in_safe_ctx(&args[1], builder, ctx);
 
     // Output element type per the map's declared result type; storage matches it.
     let out_elem_ty = match result_type {
@@ -2369,7 +2479,7 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
     let iterable_ty = args[0].ty();
     let (param_tys, _) = callback_signature(&args[1]);
     let iterable = lower_expr(&args[0], builder, ctx);
-    let pred = lower_expr(&args[1], builder, ctx);
+    let pred = lower_callback_in_safe_ctx(&args[1], builder, ctx);
 
     // filter preserves the element type; storage matches it.
     let out_elem_ty = match result_type {
@@ -2403,7 +2513,7 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
     let init_ty = args[1].ty();
     let init_raw = lower_expr(&args[1], builder, ctx);
     let init = box_to_json(init_raw, &init_ty, builder);
-    let f = lower_expr(&args[2], builder, ctx);
+    let f = lower_callback_in_safe_ctx(&args[2], builder, ctx);
     let elem_ty = iter_elem_type(&iterable_ty);
 
     let len = builder.alloc_temp(Type::Int64);
@@ -3186,6 +3296,8 @@ fn lower_function_expr_with_id(
         scope_owned: Vec::new(),
         diverged_blocks: std::collections::HashSet::new(),
         cell_slots: HashMap::new(),
+        created_cells: Vec::new(),
+        escaping_cells: std::collections::HashSet::new(),
     };
 
     // Add entry block. Tag it with the function body's span so coverage records a
@@ -3279,6 +3391,34 @@ fn lower_function_expr_with_id(
     } else {
         raw_ret
     };
+    // Captured-cell cleanup: free PROVABLY-non-escaping cells created in this function body.
+    // A cell is freed here only if NO closure capturing it escaped (see the escape analysis at
+    // MakeClosure). `FreeCell` releases the cell's owned value (tag-aware/concrete) then frees
+    // the cell allocation. Done at the single function-scope exit (this block, before the
+    // scope-release Releases and the Return) — never inside the loop that uses it. Skipped when
+    // the block already diverged (dead code). A cell pointer is never the return value (returns
+    // come from CellGet copies, which `own_for_read` clones/retains independently), but we still
+    // exclude ret_temp/raw_ret defensively. Escaping cells (in `escaping_cells`) are left
+    // leaking — sound: freeing one would be a use-after-free when a surviving closure reads it.
+    if !inner_builder.is_current_block_terminated() {
+        let to_free: Vec<(Temp, Type)> = inner_builder
+            .created_cells
+            .iter()
+            // Only free entry-block cells: the entry block dominates this exit block, so the
+            // MakeCell dominates the FreeCell (LLVM SSA dominance). A cell created inside a
+            // conditional/loop branch is left leaking (sound — see `created_cells` doc).
+            .filter(|(c, _, blk)| {
+                *blk == BlockId(0)
+                    && !inner_builder.escaping_cells.contains(c)
+                    && *c != ret_temp
+                    && *c != raw_ret
+            })
+            .map(|(c, ty, _)| (*c, ty.clone()))
+            .collect();
+        for (cell, ty) in to_free {
+            inner_builder.emit(Instruction::FreeCell { cell, ty });
+        }
+    }
     // Release owned temps in body scope except the return value AND the raw pre-coercion
     // temp: a box (e.g. lin_box_object) shares the underlying pointer, so releasing the
     // original would free what the returned box wraps.
@@ -3309,6 +3449,23 @@ fn lower_function_expr_with_id(
             })
         })
         .collect();
+
+    // Captured-cell escape analysis. A mutably-captured `var` is a heap cell whose pointer is
+    // shared into THIS closure's env. The cell is SAFE to free at the creating function's scope
+    // exit only if EVERY closure that captures it is consumed synchronously and non-retained
+    // (i.e. lowered as a direct callback argument to a known consuming combinator). When this
+    // closure is lowered OUTSIDE that context (`safe_callback_depth == 0`) — it is bound,
+    // returned, stored, passed to async/worker, or passed to an unknown callee — any cell it
+    // captures may outlive the creating function, so we mark it escaping and never free it.
+    // Conservative by construction: anything not provably a synchronous combinator callback
+    // escapes. (A capture temp that is one of THIS function's created cells is the cell pointer.)
+    if ctx.safe_callback_depth == 0 {
+        for &cap_t in &capture_temps {
+            if builder.created_cells.iter().any(|(c, _, _)| *c == cap_t) {
+                builder.escaping_cells.insert(cap_t);
+            }
+        }
+    }
 
     let closure_ty = Type::Function {
         params: params.iter().map(|p| p.ty.clone()).collect(),
