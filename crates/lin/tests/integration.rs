@@ -2979,6 +2979,36 @@ print(slice(words, 0, 2)[1])   // b
 }
 
 #[test]
+fn test_concat_preserves_flat_element_type() {
+    // concat dispatches on element type: two flat UInt8[] yield a flat UInt8[], so a
+    // byte-level consumer (u32FromBe reads `(*arr).data as *const u8`) sees packed bytes.
+    // Previously concat always built a TAGGED array (16-byte elements), so u32FromBe read
+    // TaggedVal bytes and decoded garbage (e.g. 33554432 instead of 2864434397).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { concat, length } from "std/array"
+import { u32FromBe } from "std/bytes"
+
+val a: UInt8[] = [170, 187]
+val b: UInt8[] = [204, 221]
+val c = concat(a, b)
+print(toString(length(c)))          // 4
+print(toString(c[0]))               // 170 (element access)
+print(toString(u32FromBe(c, 0)))    // 2864434397 = 0xAABBCCDD (byte-level read)
+
+val ia: Int32[] = [10, 20]
+print(toString(concat(ia, [30, 40])[2]))   // 30 (Int32[] stays flat)
+
+val sa = ["x", "y"]
+print(concat(sa, ["z"])[2])         // z (tagged stays tagged)
+
+val flat: UInt8[] = [1, 2]
+print(toString(concat(flat, ["a"])[0]))  // 1 (mixed → tagged, value preserved)
+"#);
+    assert_eq!(out, vec!["4", "170", "2864434397", "30", "z", "1"]);
+}
+
+#[test]
 fn test_u32_be_round_trip() {
     // std/bytes: a UInt32 survives a big-endian write then read.
     let out = run(r#"import { print } from "std/io"

@@ -585,6 +585,86 @@ pub unsafe extern "C" fn lin_array_concat_into(dst: *mut LinArray, src: *const L
     }
 }
 
+/// Concatenate `a ++ b`, PRESERVING a flat element representation when both inputs are
+/// flat arrays of the same element type. Mirrors `lin_array_slice_dyn`: the pure-Lin
+/// `concat` allocated a tagged result (lin_array_allocate), so concatenating two flat
+/// `UInt8[]` produced a tagged array — `c[i]` read correctly via the elem_tag-aware get,
+/// but byte-level consumers (`u32FromBe`, fs write, FFI) that read `(*arr).data as *const
+/// u8` saw 16-byte TaggedVal elements instead of packed bytes. When the two arrays share a
+/// flat `elem_tag`, build a flat result of that type; otherwise fall back to a tagged
+/// concat. Inputs cross the boundary as `Json` (TaggedVal*(Array)) or raw `LinArray*`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_concat_dyn(a: *const u8, b: *const u8) -> *mut u8 {
+    use crate::tagged::*;
+    unsafe fn unwrap(p: *const u8) -> *const LinArray {
+        if p.is_null() { return std::ptr::null(); }
+        if *p == TAG_ARRAY { (*(p as *const TaggedVal)).payload as *const LinArray }
+        else { p as *const LinArray }
+    }
+    let la = unwrap(a);
+    let lb = unwrap(b);
+    let ta = if la.is_null() { 0xFF } else { (*la).elem_tag };
+    let tb = if lb.is_null() { 0xFF } else { (*lb).elem_tag };
+    let total = (if la.is_null() { 0 } else { (*la).len }) + (if lb.is_null() { 0 } else { (*lb).len });
+
+    // Both flat and same element type → flat result of that type.
+    if ta == tb && ta != 0xFF {
+        // (alloc_fn, concat_into_fn) for the shared flat element tag.
+        macro_rules! flat_cat {
+            ($alloc:ident, $cat:ident) => {{
+                let out = $alloc(total.max(1));
+                if !la.is_null() { $cat(out, la); }
+                if !lb.is_null() { $cat(out, lb); }
+                return alloc_tagged(TAG_ARRAY, out as u64);
+            }};
+        }
+        match ta {
+            TAG_INT32   => flat_cat!(lin_flat_array_alloc_i32, lin_flat_array_concat_into_i32),
+            TAG_INT64   => flat_cat!(lin_flat_array_alloc_i64, lin_flat_array_concat_into_i64),
+            TAG_FLOAT32 => flat_cat!(lin_flat_array_alloc_f32, lin_flat_array_concat_into_f32),
+            TAG_FLOAT64 => flat_cat!(lin_flat_array_alloc_f64, lin_flat_array_concat_into_f64),
+            TAG_UINT8   => flat_cat!(lin_flat_array_alloc_u8,  lin_flat_array_concat_into_u8),
+            TAG_INT8    => flat_cat!(lin_flat_array_alloc_i8,  lin_flat_array_concat_into_i8),
+            TAG_UINT16  => flat_cat!(lin_flat_array_alloc_u16, lin_flat_array_concat_into_u16),
+            TAG_INT16   => flat_cat!(lin_flat_array_alloc_i16, lin_flat_array_concat_into_i16),
+            TAG_UINT32  => flat_cat!(lin_flat_array_alloc_u32, lin_flat_array_concat_into_u32),
+            TAG_UINT64  => flat_cat!(lin_flat_array_alloc_u64, lin_flat_array_concat_into_u64),
+            _ => {} // unknown flat tag: fall through to the tagged path
+        }
+    }
+
+    // Mixed or tagged element types → tagged result. A flat source is first widened to a
+    // tagged array (lin_flat_to_tagged_* boxes its raw scalars) so concat_into can copy
+    // its elements as TaggedVals; a tagged source is appended directly.
+    let out = lin_array_alloc(total.max(4));
+    unsafe fn append_tagged(out: *mut LinArray, src: *const LinArray) {
+        if src.is_null() { return; }
+        let et = (*src).elem_tag;
+        if et == 0xFF {
+            lin_array_concat_into(out, src);
+            return;
+        }
+        let widened: *mut LinArray = match et {
+            TAG_INT32   => lin_flat_to_tagged_i32(src),
+            TAG_INT64   => lin_flat_to_tagged_i64(src),
+            TAG_FLOAT32 => lin_flat_to_tagged_f32(src),
+            TAG_FLOAT64 => lin_flat_to_tagged_f64(src),
+            TAG_UINT8   => lin_flat_to_tagged_u8(src),
+            TAG_INT8    => lin_flat_to_tagged_i8(src),
+            TAG_UINT16  => lin_flat_to_tagged_u16(src),
+            TAG_INT16   => lin_flat_to_tagged_i16(src),
+            TAG_UINT32  => lin_flat_to_tagged_u32(src),
+            TAG_UINT64  => lin_flat_to_tagged_u64(src),
+            _ => { lin_array_concat_into(out, src); return; }
+        };
+        lin_array_concat_into(out, widened);
+        lin_array_free(widened);
+    }
+    append_tagged(out, la);
+    append_tagged(out, lb);
+    alloc_tagged(TAG_ARRAY, out as u64)
+}
+
 /// Copy all i32 elements from `src` flat array into `dst` flat array.
 #[no_mangle]
 pub unsafe extern "C" fn lin_flat_array_concat_into_i32(dst: *mut LinArray, src: *const LinArray) {
