@@ -309,7 +309,12 @@ impl Parser {
         let mut after_block = self.prev_was_dedent();
         loop {
             match self.peek_kind() {
-                TokenKind::LBracket if !after_block => {
+                // A `[`/`(` that opens a new source line is NOT a postfix index/call on the
+                // previous expression — it starts a new statement (e.g. a line-leading array
+                // literal returned from an inline lambda body). Inside `()`/`[]`/`{}` the line
+                // break is invisible as a token (ADR-004), so we rely on `at_line_start`. This
+                // mirrors the post-Dedent suppression for top-level blocks (ADR-011).
+                TokenKind::LBracket if !after_block && !self.at_line_start() => {
                     let span = self.current_span();
                     self.advance(); // [
                     let key = self.parse_expr();
@@ -323,7 +328,7 @@ impl Parser {
                     }
                     expr = Expr::Index { object: Box::new(expr), key: Box::new(key), span };
                 }
-                TokenKind::LParen if !after_block => {
+                TokenKind::LParen if !after_block && !self.at_line_start() => {
                     let span = self.current_span();
                     self.advance(); // (
                     let (args, partial) = self.parse_call_args();

@@ -1516,6 +1516,30 @@ data.for(x =>
     assert_eq!(output, vec!["a", "b", "a", "b", "a", "b"]);
 }
 
+// A line-leading `[` after a statement inside an inline lambda body starts a NEW array-literal
+// statement, not a postfix index on the previous expression. Inside `()` the line break is
+// suppressed as a token (ADR-004), so the parser relies on each token's `newline_before` flag.
+// Without this, `f` below parsed as `push(acc, 4)[ ... ]` and the body's value was the index
+// result (Null) instead of the array. Mirrors the post-Dedent `[` suppression of ADR-011.
+#[test]
+fn test_line_leading_array_after_statement_in_inline_lambda() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+
+val f = (): Json =>
+  val acc = [1, 2, 3]
+  push(acc, 4)
+  [
+    length(acc),
+    acc[0]
+  ]
+
+print(toString(f()))
+"#);
+    assert_eq!(output, vec!["[4, 1]"]);
+}
+
 #[test]
 fn test_bare_expr_side_effects_top_level_func() {
     let output = run(r#"import { print } from "std/io"

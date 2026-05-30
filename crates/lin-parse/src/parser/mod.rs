@@ -76,6 +76,13 @@ impl Parser {
         matches!(self.tokens[self.pos - 1].kind, TokenKind::Dedent)
     }
 
+    /// True when the current token begins a new source line (a newline precedes it), even one
+    /// suppressed inside `()`/`[]`/`{}` (ADR-004). Used to stop a line-leading postfix `[`/`(`
+    /// from gluing onto the previous expression as an index/call inside an inline lambda body.
+    pub(crate) fn at_line_start(&self) -> bool {
+        self.pos < self.tokens.len() && self.tokens[self.pos].newline_before
+    }
+
     pub(crate) fn peek_kind(&self) -> TokenKind {
         if self.pos < self.tokens.len() {
             self.tokens[self.pos].kind.clone()

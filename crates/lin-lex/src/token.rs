@@ -4,6 +4,12 @@ use lin_common::Span;
 pub struct Token {
     pub kind: TokenKind,
     pub span: Span,
+    /// True when a source newline appears between the previous token and this one — even when
+    /// that newline was suppressed for block purposes because it falls inside `()`/`[]`/`{}`
+    /// (ADR-004). The parser uses this to stop a postfix `[`/`(` on a fresh line from being
+    /// glued to the previous expression as an index/call inside an inline lambda body, so a
+    /// line-leading array literal reads as its own statement. Defaults to false.
+    pub newline_before: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -91,6 +97,6 @@ pub enum InterpPart {
 
 impl Token {
     pub fn new(kind: TokenKind, span: Span) -> Self {
-        Self { kind, span }
+        Self { kind, span, newline_before: false }
     }
 }
