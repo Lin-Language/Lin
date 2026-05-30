@@ -332,7 +332,7 @@ impl Lexer {
             self.pos += 1;
         }
 
-        if self.pos < self.source.len() && self.source[self.pos] == '.' && self.peek_at(1).map_or(false, |c| c.is_ascii_digit()) {
+        if self.pos < self.source.len() && self.source[self.pos] == '.' && self.peek_at(1).is_some_and(|c| c.is_ascii_digit()) {
             is_float = true;
             num_str.push('.');
             self.pos += 1;

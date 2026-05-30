@@ -5,3 +5,4 @@
 .claude/worktrees/
 examples/lib/*.a
 examples/lib/*.o
+benchmarks/results/

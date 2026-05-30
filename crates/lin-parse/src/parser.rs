@@ -743,7 +743,7 @@ impl Parser {
                     let key_span = self.current_span();
                     let name = ident_name.clone();
                     self.diagnostics.push(
-                        Diagnostic::error(key_span, format!("object keys must be quoted strings"))
+                        Diagnostic::error(key_span, "object keys must be quoted strings".to_string())
                             .with_help(format!("use a quoted key: \"{}\"", name))
                     );
                     let key = self.parse_expr();
@@ -1206,7 +1206,7 @@ impl Parser {
                 let span = self.current_span();
                 let name = self.expect_ident();
                 // If starts with uppercase, it's a type name
-                if name.chars().next().map_or(false, |c| c.is_uppercase()) {
+                if name.chars().next().is_some_and(|c| c.is_uppercase()) {
                     Pattern::TypeName(name, span)
                 } else {
                     Pattern::Ident(name, span)

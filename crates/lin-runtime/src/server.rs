@@ -1,4 +1,3 @@
-use crate::string::LinString;
 use crate::object::{lin_object_alloc, lin_object_set};
 use crate::tagged::{TaggedVal, TAG_STR, TAG_OBJECT, alloc_tagged};
 use crate::fs::{make_string, resolve_lin_str};

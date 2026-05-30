@@ -222,7 +222,7 @@ fn is_atomic(expr: &Expr) -> bool {
             is_atomic(func) && args.iter().all(is_atomic)
         }
         Expr::DotCall { receiver, args, .. } => {
-            is_atomic(receiver) && args.as_ref().map_or(true, |a| a.iter().all(is_atomic))
+            is_atomic(receiver) && args.as_ref().is_none_or(|a| a.iter().all(is_atomic))
         }
         Expr::Assign { value, .. } => is_atomic(value),
         Expr::IndexAssign { object, key, value, .. } => {
@@ -837,7 +837,7 @@ fn fmt_stmt(stmt: &Stmt, ind: &str) -> String {
 
 // ── dot chain ─────────────────────────────────────────────────────────────────
 
-fn collect_chain<'a>(expr: &'a Expr) -> (&'a Expr, Vec<(&'a str, &'a Option<Vec<Expr>>)>) {
+fn collect_chain(expr: &Expr) -> (&Expr, Vec<(&str, &Option<Vec<Expr>>)>) {
     let mut chain = Vec::new();
     let mut cur = expr;
     loop {

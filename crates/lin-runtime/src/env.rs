@@ -1,5 +1,5 @@
 use crate::string::{LinString, lin_string_from_bytes};
-use crate::object::{LinObject, lin_object_alloc, lin_object_set};
+use crate::object::{lin_object_alloc, lin_object_set};
 use crate::tagged::{TaggedVal, TAG_STR, alloc_tagged};
 
 unsafe fn make_lin_string(s: &str) -> *mut LinString {

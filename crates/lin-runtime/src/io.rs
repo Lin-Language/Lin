@@ -1,5 +1,5 @@
 use crate::string::{LinString, lin_string_from_bytes};
-use crate::tagged::{TaggedVal, alloc_tagged, TAG_STR, TAG_ARRAY};
+use crate::tagged::{TaggedVal, alloc_tagged, TAG_STR};
 use std::io::{BufRead, Read, Write};
 
 /// Read one line from stdin. Returns TaggedVal*(Str) or null if EOF.

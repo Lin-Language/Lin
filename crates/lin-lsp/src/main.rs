@@ -10,7 +10,7 @@ use lin_check::typed_ir::{TypedModule, TypedStmt};
 use lin_check::types::Type;
 use lin_check::Checker;
 use lin_common::Severity;
-use lin_parse::ast::{Stmt, ImportBinding};
+use lin_parse::ast::Stmt;
 
 // ── server ────────────────────────────────────────────────────────────────────
 

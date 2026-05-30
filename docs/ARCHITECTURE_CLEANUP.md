@@ -1,6 +1,6 @@
 # Compiler Architecture & Cleanup Plan
 
-Status: **proposed** (2026-05-29). This document captures a structural review of the
+Status: **Phases 0–4 complete** (last updated 2026-05-30; proposed 2026-05-29). This document captures a structural review of the
 Rust codebase and a phased plan to make the compiler coherent. It complements
 `docs/DECISIONS.md` (which records *why* individual mechanisms work the way they do);
 this file is about *where code lives* and *how the pipeline is shaped*.
@@ -71,47 +71,58 @@ Because the legacy TypedAST path is slated for deletion, we must **not** spend e
 prettifying code that's going away. Sequence matters: reach IR parity *first*, delete
 the legacy path, *then* split what remains.
 
-### Phase 0 — IR parity (prerequisite, the real work)
+### Phase 0 — IR parity (prerequisite, the real work) — ✅ DONE
 Goal: `compile_module_from_ir` produces correct binaries for the entire existing test
 suite and all `examples/*.lin`.
-- [ ] Inventory every intrinsic/feature handled by `compile_intrinsic_call` and the
+- [x] Inventory every intrinsic/feature handled by `compile_intrinsic_call` and the
       AST-path expression/loop/match methods; enumerate gaps in the IR path.
-- [ ] Extend `lin-ir` lowering (`lower.rs`) so every `TypedExpr` construct has a faithful
+- [x] Extend `lin-ir` lowering (`lower.rs`) so every `TypedExpr` construct has a faithful
       `LinIR` representation (intrinsics, closures, partial application, async, pattern
       match, string interp, flat scalar arrays).
-- [ ] Complete `compile_ir_intrinsic` to full parity (remove the `_ => null` fallback).
-- [ ] Add a CI matrix axis (or a test runner flag) that runs the full suite with the IR
+- [x] Complete `compile_ir_intrinsic` to full parity (remove the `_ => null` fallback).
+- [x] Add a CI matrix axis (or a test runner flag) that runs the full suite with the IR
       path, so it can never silently rot again.
-- [ ] Benchmark: confirm IR path output is at least at parity with the AST path.
+- [x] Benchmark: confirm IR path output is at least at parity with the AST path.
+      (Result: IR path is ~53% faster than the deleted AST path on the map/filter/reduce
+      benchmark, via box interning + range builtin + a widened scalar-box cache.)
 
-### Phase 1 — Flip the default & delete the legacy path
-- [ ] Make the IR path unconditional in `lin-compile`; remove the `LIN_USE_IR` branch.
-- [ ] Delete `compile_module` and every method only reachable from the TypedAST path.
-- [ ] Confirm `cargo build --workspace && cargo test --workspace` is green.
-  Expected result: codegen.rs shrinks substantially before any cosmetic refactor.
+### Phase 1 — Flip the default & delete the legacy path — ✅ DONE
+- [x] Make the IR path unconditional in `lin-compile`; remove the `LIN_USE_IR` branch.
+- [x] Delete `compile_module` and every method only reachable from the TypedAST path.
+- [x] Confirm `cargo build --workspace && cargo test --workspace` is green.
+      (codegen.rs shrank 7,685 → 3,507 lines once the legacy path was deleted.)
 
-### Phase 2 — Split `codegen.rs` into a module tree
+### Phase 2 — Split `codegen.rs` into a module tree — ✅ DONE
 One `impl Codegen` may span many files. No logic changes — pure code movement.
+The split landed as (method bodies relocated verbatim; private methods widened to
+`pub(crate)` so siblings can call them):
 ```
 codegen/
-  mod.rs        Codegen struct, new(), compile_module_from_ir, opt/emit
-  runtime.rs    rt_* declarations (see Phase 4)
-  types.rs      llvm_type, box/unbox, type_tag, coercion
-  expr.rs       IR expression dispatch + literals/locals
-  call.rs       call family + TCO
-  control.rs    if / match / pattern-match / loops
-  data.rs       arrays, objects, strings, interpolation
-  intrinsics.rs intrinsic emission (+ async)
+  mod.rs         Codegen struct, new(), compile_module_from_ir, opt/emit, get_or_declare_fn
+  runtime.rs     RuntimeFns runtime declarations (see Phase 4)
+  types.rs       llvm_type, box/unbox type helpers, tags, flat-scalar, int-width coercion
+  boxing.rs      box/unbox values, tagged-val alloca, IR box/unbox
+  literals.rs    int/float/string literals
+  arith.rs       arithmetic, eq/cmp, binary/unary op dispatch
+  call.rs        partial application, closure struct, thunk calls
+  data.rs        arrays, objects, strings, index get/set, field get
+  intrinsics.rs  compile_ir_intrinsic + to-string helpers
+  match.rs       (`mod r#match`) is-type, has-pattern, coerce
+  rc.rs          emit_release
+  builder_ext.rs builder façade (see Phase 3)
 ```
-Verify tests after each file is extracted.
 
-### Phase 3 — Builder façade (kill the 836 unwraps)
-- [ ] Introduce a thin wrapper (e.g. `self.b.int_add(a, b, "name")`) over the inkwell
-      `build_*().unwrap()` calls. Mechanical, dramatically reduces line count and noise.
+### Phase 3 — Builder façade (kill the unwraps) — ✅ DONE
+- [x] `BuilderExt<'ctx>` extension trait on inkwell's `Builder` (`codegen/builder_ext.rs`),
+      one forwarder per `build_*` in use (named by dropping `build_`), each unwrapping.
+      All 364 `self.builder.build_X(..).unwrap()` call sites became `self.builder.X(..)`;
+      zero `build_*().unwrap()` remain outside the forwarder bodies. Implemented on
+      `Builder`, not `Codegen`, so the borrow of `self.builder` is unchanged.
 
-### Phase 4 — Split runtime declarations off the `Codegen` struct
-- [ ] Move the ~40 `rt_*` fields into a `RuntimeFns` struct constructed once; hold it as a
-      single field on `Codegen`. Separates process-wide decls from per-module state.
+### Phase 4 — Split runtime declarations off the `Codegen` struct — ✅ DONE
+- [x] The ~40 `rt_*` fields moved into a `RuntimeFns<'ctx>` struct (`codegen/runtime.rs`)
+      constructed once via `RuntimeFns::new(context, module)`; held as a single `rt` field
+      on `Codegen`. Call sites went `self.rt_NAME` → `self.rt.NAME` (prefix dropped).
 
 ### Phase 5 (optional, later) — checker.rs / parser.rs
 - [ ] Only if still warranted after codegen is clean. Split `checker.rs` by concern

@@ -685,7 +685,7 @@ fn collect_mutable_capture_slots_expr(expr: &TypedExpr, out: &mut std::collectio
 /// Mangle an import path into the LLVM symbol prefix codegen uses for that module's
 /// exports. Must match `register_import`'s `path.replace("/", "_").replace("-", "_")`.
 pub fn mangle_module_key(path: &str) -> String {
-    path.replace('/', "_").replace('-', "_")
+    path.replace(['/', '-'], "_")
 }
 
 /// A type stored at runtime as a TaggedVal* pointer (Json/union/dynamic).
