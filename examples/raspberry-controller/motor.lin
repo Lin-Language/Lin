@@ -1,0 +1,37 @@
+// Motor PWM mapping — Lin port of the pure speed→PWM logic in Motor::set()
+// (server/src/motor.rs).
+//
+// The Rust driver maps a clamped speed in [-1, 1] to a software-PWM duty cycle
+// on one of two GPIO pins:
+//   speed > 0  →  drive RPWM, duty = speed * PWM_PERIOD  (forward)
+//   speed < 0  →  drive LPWM, duty = |speed| * PWM_PERIOD (reverse)
+//   speed == 0 →  stop (both pins low, duty 0)
+// PWM_PERIOD is 1000µs (1 kHz software PWM).
+//
+// HARDWARE STUB: the real driver calls into rppal (GPIO/PWM) to set pin levels —
+// `rpwm.set_pwm(period, duty)` etc. Lin has no GPIO, so this port returns a
+// DESCRIPTIVE command object instead of touching pins. A real implementation
+// would take this {channel, duty} and call an FFI GPIO/PWM routine (e.g. an
+// `import foreign` binding to a libgpiod / pigpio symbol) to apply it.
+//
+// Stdlib used:
+//   std/math   — clamp, round, abs
+//   std/number — toInt32 (Float64 duty → Int32)
+
+import { clamp, round, abs } from "std/math"
+import { toInt32 } from "std/number"
+
+// Software-PWM period in microseconds (1 kHz). Duty is in the same units.
+export val PWM_PERIOD = 1000.0
+
+// Map a motor speed in [-1, 1] to a PWM command:
+//   { "channel": "rpwm"|"lpwm"|"stop", "duty": Int32 (0..PWM_PERIOD) }
+// Speed is clamped first (matching Motor::set's leading clamp).
+export val motorCommand = (speed: Float64): { "channel": String, "duty": Int32 } =>
+  val s = clamp(speed, 0.0 - 1.0, 1.0)
+  if s > 0.0 then
+    { "channel": "rpwm", "duty": toInt32(round(s * PWM_PERIOD)) }
+  else if s < 0.0 then
+    { "channel": "lpwm", "duty": toInt32(round(abs(s) * PWM_PERIOD)) }
+  else
+    { "channel": "stop", "duty": 0 }
