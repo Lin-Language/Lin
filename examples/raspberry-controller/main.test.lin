@@ -1,5 +1,5 @@
 import { suite, test, expect, run, toBe } from "std/test"
-import { clampSpeed, encodePacket, applyKey } from "./controller"
+import { clampSpeed, encodePacket, applyKey } from "./main"
 import { length } from "std/array"
 import { f32FromBe } from "std/bytes"
 

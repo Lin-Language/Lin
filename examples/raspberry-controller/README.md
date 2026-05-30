@@ -21,7 +21,7 @@ protocol code — the actual point of interest — is ported faithfully.
 | `motor.lin` | `server/src/motor.rs::Motor::set` | The pure speed→PWM mapping (channel + duty). GPIO is **stubbed**. |
 | `nal.lin` | `server/src/nal.rs` | H.264 Annex B NAL-unit parser (start-code scanning, nal_type). |
 | `rtp.lin` | `server/src/rtp.rs` | RTP packetizer (RFC 6184): header, Single-NAL mode, FU-A fragmentation. |
-| `controller.lin` | `client/src/main.rs` | The **client**: keyboard → control packet (the original example, kept). |
+| `main.lin` | `client/src/main.rs` | The **client**: keyboard → control packet (the original example, kept). |
 
 Each library module `export`s its functions and has **no top-level side effects**,
 so it can be imported by its colocated `*.test.lin`. The tests port the Rust
@@ -60,7 +60,7 @@ small NALs, FU-A fragmentation at 1200 bytes for large ones (`rtp.packetize`).
   is not portable; the interesting part (NAL + RTP byte processing) is ported and
   would be fed from whatever produces the H.264 stream.
 - **The blocking UDP server loop + 500 ms watchdog**: not reproduced as a running
-  loop here. `std/net` UDP sockets exist (and `controller.lin`'s `runController`
+  loop here. `std/net` UDP sockets exist (and `main.lin`'s `runController`
   shows the live client loop), but the testable core is the pure `parsePacket` /
   `encodePacket` / motor / NAL / RTP logic, which is what these modules expose.
 
@@ -99,8 +99,8 @@ small NALs, FU-A fragmentation at 1200 bytes for large ones (`rtp.packetize`).
 # Run every module's unit tests (this is the primary deliverable)
 lin test examples/raspberry-controller/
 
-# Build the client demo (controller.lin has a non-interactive demo())
-lin build examples/raspberry-controller/controller.lin -o controller && ./controller
+# Build the client demo (main.lin has a non-interactive demo())
+lin build examples/raspberry-controller/main.lin -o controller && ./controller
 ```
 
 To drive a real car, call `controller.runController("<pi-ip>", 3000)` instead of
@@ -114,4 +114,4 @@ its `demo()`.
 | `motor.lin` | `std/math` (`clamp`/`round`/`abs`), `std/number` (`toInt32`) |
 | `nal.lin` | `std/array` (`slice`/`length`/`push`) |
 | `rtp.lin` | `std/bytes` (`u16ToBe`/`u32ToBe`), `std/array` (`concat`/`slice`/`length`/`push`), `std/number` (`toUInt8`) |
-| `controller.lin` | `std/bytes`, `std/number`, `std/math`, `std/net`, `std/tty`, `std/time`, `std/array`, `std/io`, `std/string` |
+| `main.lin` | `std/bytes`, `std/number`, `std/math`, `std/net`, `std/tty`, `std/time`, `std/array`, `std/io`, `std/string` |

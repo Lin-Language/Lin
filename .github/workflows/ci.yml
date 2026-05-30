@@ -60,17 +60,24 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      - name: Run examples through lin run
+      - name: Run example projects through lin run
         run: |
-          for f in examples/*.lin; do
-            case "$f" in
-              examples/ffi-c.lin|\
-              examples/http-client.lin|\
-              examples/showcase.lin|\
-              examples/template.lin) echo "SKIP $f"; continue ;;
+          # Each example is now a project directory with a runnable main.lin. Run every
+          # main.lin, with per-project handling for the ones that need argv or artifacts.
+          for m in examples/*/main.lin; do
+            dir="$(dirname "$m")"
+            case "$dir" in
+              # ffi/ needs its C static lib prebuilt + linked (lin build only); the
+              # authoritative end-to-end FFI check is the Rust integration suite.
+              examples/ffi) echo "SKIP $m (needs prebuilt .a; covered by Rust FFI test)"; continue ;;
+              # dijkstra/main.lin reads a graph + source/target/output from argv.
+              examples/dijkstra)
+                echo "==> $m (with argv)"
+                cargo run -p lin --quiet -- run "$m" -- examples/dijkstra/graph.json A E /tmp/dijkstra_out.json || exit 1
+                continue ;;
             esac
-            echo "==> $f"
-            cargo run -p lin --quiet -- run "$f" || exit 1
+            echo "==> $m"
+            cargo run -p lin --quiet -- run "$m" || exit 1
           done
 
       - name: Run stdlib and example tests
@@ -126,7 +133,7 @@ jobs:
           RUSTFLAGS="-Zsanitizer=address" cargo +nightly build \
             -p lin-runtime --target x86_64-unknown-linux-gnu
 
-      - name: Build + run each stdlib test under AddressSanitizer (LinIR path)
+      - name: Build + run each stdlib & example test under AddressSanitizer (LinIR path)
         env:
           # LinIR is the default backend; no LIN_USE_IR needed.
           LIN_EMIT_IR: "1"
@@ -134,7 +141,11 @@ jobs:
         run: |
           RT="$(find target/x86_64-unknown-linux-gnu/debug -name liblin_runtime.a | head -1)"
           fail=0
-          for f in stdlib/*.test.lin; do
+          # stdlib unit tests AND the example-project suites — the latter are realistic
+          # multi-module programs (calc/report/config/codec/…) whose map/filter/reduce,
+          # flat-array, projection, and closure usage is the strongest RC/UAF guard.
+          # `lin build` bundles a test's relative-import modules into one linkable .ll.
+          for f in stdlib/*.test.lin examples/*/*.test.lin; do
             echo "==> $f"
             cargo run -p lin --quiet -- build "$f" -o /tmp/asan_test || { echo "BUILD FAIL $f"; fail=1; continue; }
             clang-22 -fsanitize=address -g /tmp/asan_test.ll "$RT" -o /tmp/asan_test_bin
