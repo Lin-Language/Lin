@@ -76,8 +76,19 @@ fn check_union_exhaustiveness(
         }
     }).collect();
 
+    // `is Error` desugars to a value-constrained object pattern `{ "type": "error", .. }`
+    // (ADR-047), so it is NOT a `TypeCheck` arm. Recognise it here so it counts as covering the
+    // `Error` object variant of a `T | Error` union; otherwise a `match | is T | is Error`
+    // would be reported non-exhaustive.
+    let covers_error = arms.iter().any(|a| {
+        matches!(&a.pattern, TypedMatchPattern::Is(p) if is_error_pattern(p))
+    });
+
     // Find union members not covered by any arm.
     let missing: Vec<&Type> = variants.iter().filter(|v| {
+        if covers_error && is_error_variant(v) {
+            return false;
+        }
         !covered.iter().any(|c| types_overlap(c, v))
     }).collect();
 
@@ -127,6 +138,31 @@ fn check_bool_exhaustiveness(arms: &[TypedMatchArm], span: Span) -> Vec<Diagnost
         (true, false) => vec![Diagnostic::error(span, "non-exhaustive Boolean match: `false` is not covered.")
             .with_help("Add `is false => ...` or an `else` arm.")],
         (false, false) => vec![Diagnostic::warning(span, "match may be non-exhaustive: no `else` arm.")],
+    }
+}
+
+/// True if `p` is the desugared `is Error` pattern: an object pattern that constrains the
+/// `"type"` field to the literal `"error"` (ADR-047).
+fn is_error_pattern(p: &TypedPattern) -> bool {
+    if let TypedPattern::Object { fields, .. } = p {
+        fields.iter().any(|f| {
+            f.key == "type"
+                && matches!(
+                    f.value_pattern.as_deref(),
+                    Some(crate::typed_ir::TypedExpr::StringLit(s, _)) if s == "error"
+                )
+        })
+    } else {
+        false
+    }
+}
+
+/// True if `v` is (structurally) the `Error` object variant `{ "type": String, "message": .. }`.
+fn is_error_variant(v: &Type) -> bool {
+    if let Type::Object(fields) = v {
+        fields.contains_key("type") && fields.contains_key("message")
+    } else {
+        false
     }
 }
 

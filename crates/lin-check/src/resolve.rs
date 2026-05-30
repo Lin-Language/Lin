@@ -77,10 +77,12 @@ fn resolve_named_cycle(
         "Float64" => Ok(Type::Float64),
         "String" => Ok(Type::Str),
         "Json" => Ok(json_type()),
-        // `Error` is the conventional error value (spec §19, §32.2.2): an object carrying a
-        // `type` discriminant and a `message`. The async runtime produces exactly this shape
-        // (`{ "type": "error", "message": String }`) when a thunk faults. It has no special
-        // control-flow behaviour — `is Error` is a structural shape check on those fields.
+        // `Error` is the conventional error value (spec §19, §32.2.2) and a structural object
+        // alias (ADR-047): an object carrying a `type` discriminant and a `message`. Both the
+        // async runtime (on a caught thunk fault) and `fromJson` produce this shape — the
+        // decode-error value additionally carries `"path"`, which width subtyping permits.
+        // Modelled as an Object (not a new `Type` variant) so the ~20 exhaustive `Type` matches
+        // don't change (cf. ADR-044); `is Error` is a field-presence + `"type" == "error"` check.
         "Error" => Ok(error_type()),
         // Function is an opaque type annotation — any arity is acceptable.
         // Params and ret use TypeVar(u32::MAX) so compat check treats it as accepting any function.
@@ -240,20 +242,19 @@ fn substitute(
     }
 }
 
-pub fn json_type() -> Type {
-    // Json is the open dynamic type: any JSON-compatible value.
-    // We use TypeVar(u32::MAX) as a special "any" marker that is_compatible always accepts.
-    // This allows object literals, arrays, strings, numbers, bools, null to all satisfy Json.
-    Type::TypeVar(u32::MAX)
-}
-
-/// The built-in `Error` type: `{ "type": String, "message": String }` — the conventional
-/// error value, and the exact shape the async runtime builds on a caught thunk fault. Modelled
-/// structurally so `is Error` is a field-presence check and `Error` composes in unions
-/// (`T | Error`). Field values are `String` (`type` is the discriminant, `message` the text).
+/// The structural shape of a decode `Error` (ADR-047). An open object with the two stable
+/// fields user code can rely on; the runtime value also carries `"path"`, which width
+/// subtyping permits. Used as the second variant of `fromJson`'s `T | Error` result.
 pub fn error_type() -> Type {
     let mut fields = IndexMap::new();
     fields.insert("type".to_string(), Type::Str);
     fields.insert("message".to_string(), Type::Str);
     Type::Object(fields)
+}
+
+pub fn json_type() -> Type {
+    // Json is the open dynamic type: any JSON-compatible value.
+    // We use TypeVar(u32::MAX) as a special "any" marker that is_compatible always accepts.
+    // This allows object literals, arrays, strings, numbers, bools, null to all satisfy Json.
+    Type::TypeVar(u32::MAX)
 }

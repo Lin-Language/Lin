@@ -588,8 +588,51 @@ impl<'ctx> Codegen<'ctx> {
                     arr
                 }
             }
+            // fromJson(value, descriptor) => T | Error (ADR-047). Emit the compile-time schema
+            // descriptor as a static i8 global, then call the generic runtime walker. `args[0]`
+            // is the (already boxed-to-Json) input value. The result is owned by the caller
+            // (the input retained on success, or a fresh Error).
+            Intrinsic::FromJson { target, named_defs } => {
+                let value = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let desc_ptr = self.emit_from_json_descriptor(target, named_defs);
+                let from_json_fn = self.get_or_declare_fn(
+                    "lin_from_json",
+                    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+                );
+                self.builder
+                    .call(from_json_fn, &[value.into(), desc_ptr.into()], "from_json")
+                    .try_as_basic_value()
+                    .unwrap_basic()
+            }
             _ => ptr_ty.const_null().into(),
         }
+    }
+
+    /// Emit the `fromJson` schema descriptor for `target` as a static, constant `i8` global and
+    /// return a pointer to its first byte. The descriptor is a self-contained, position-relative
+    /// bytecode the runtime `lin_from_json` walker interprets in lockstep with the value. Object
+    /// keys are inlined (length-prefixed UTF-8); recursion uses absolute byte offsets into the
+    /// same blob, so recursive/cyclic types terminate. `named_defs` supplies the resolved bodies
+    /// of every `Named` type reachable from `target` (codegen has no type environment).
+    fn emit_from_json_descriptor(
+        &self,
+        target: &Type,
+        named_defs: &[(String, Type)],
+    ) -> inkwell::values::PointerValue<'ctx> {
+        let named: std::collections::HashMap<String, Type> =
+            named_defs.iter().cloned().collect();
+        let mut enc = DescEncoder::new(&named);
+        enc.encode(target);
+        let bytes = enc.finish();
+
+        let i8_ty = self.context.i8_type();
+        let arr_ty = i8_ty.array_type(bytes.len() as u32);
+        let consts: Vec<_> = bytes.iter().map(|&b| i8_ty.const_int(b as u64, false)).collect();
+        let const_arr = i8_ty.const_array(&consts);
+        let global = self.module.add_global(arr_ty, None, "lin_from_json_desc");
+        global.set_constant(true);
+        global.set_initializer(&const_arr);
+        global.as_pointer_value()
     }
 
     /// Box a raw `*LinPromise` (from a runtime spawn/combinator) into a TaggedVal*(TAG_PROMISE)
@@ -657,4 +700,202 @@ impl<'ctx> Codegen<'ctx> {
         self.value_to_string_simple(val, ty)
     }
 
+}
+
+// ---------------------------------------------------------------------------
+// fromJson schema-descriptor encoding (ADR-047)
+//
+// The descriptor is a flat byte blob describing the target type tree. The runtime walker
+// `lin_from_json` interprets it in lockstep with the Json value. All multi-byte integers are
+// little-endian. Offsets are absolute byte indices into the same blob (so recursion is just a
+// back-edge to an already-emitted node). The encoding MUST match the runtime decoder in
+// `crates/lin-runtime/src/decode.rs`.
+//
+//   KIND_JSON   (0)                            accept any value
+//   KIND_NULL   (1)
+//   KIND_BOOL   (2)
+//   KIND_STRING (3)
+//   KIND_INT    (4)  u8 width_bytes, u8 signed     1/2/4/8 ; signed 0|1
+//   KIND_FLOAT  (5)  u8 width_bytes                4|8
+//   KIND_ARRAY  (6)  u32 elem_offset
+//   KIND_FIXED  (7)  u32 len, then len * u32 offsets
+//   KIND_OBJECT (8)  u32 nfields, then nfields * { u16 key_len, key_bytes, u8 nullable, u32 off }
+//   KIND_UNION  (9)  u32 nvariants, then nvariants * u32 offsets
+const KIND_JSON: u8 = 0;
+const KIND_NULL: u8 = 1;
+const KIND_BOOL: u8 = 2;
+const KIND_STRING: u8 = 3;
+const KIND_INT: u8 = 4;
+const KIND_FLOAT: u8 = 5;
+const KIND_ARRAY: u8 = 6;
+const KIND_FIXED: u8 = 7;
+const KIND_OBJECT: u8 = 8;
+const KIND_UNION: u8 = 9;
+
+struct DescEncoder<'a> {
+    buf: Vec<u8>,
+    /// Memo: type Display string → byte offset of its already-emitted node. Lets recursive and
+    /// repeated types share one node (and makes cycles terminate).
+    memo: std::collections::HashMap<String, u32>,
+    named: &'a std::collections::HashMap<String, Type>,
+}
+
+impl<'a> DescEncoder<'a> {
+    fn new(named: &'a std::collections::HashMap<String, Type>) -> Self {
+        Self { buf: Vec::new(), memo: std::collections::HashMap::new(), named }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.buf
+    }
+
+    fn put_u8(&mut self, b: u8) {
+        self.buf.push(b);
+    }
+    fn put_u16(&mut self, v: u16) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    fn put_u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+    /// Reserve a u32 slot, returning its byte offset so it can be back-patched once the referent
+    /// node's offset is known.
+    fn reserve_u32(&mut self) -> usize {
+        let at = self.buf.len();
+        self.buf.extend_from_slice(&[0, 0, 0, 0]);
+        at
+    }
+    fn patch_u32(&mut self, at: usize, v: u32) {
+        self.buf[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    }
+
+    /// Encode `ty` as a node, returning its byte offset. The node header is always written at the
+    /// returned offset; container children are appended after the header and referenced by
+    /// back-patched absolute offsets, so a recursive child can back-edge to this node. Memoised
+    /// (by Named name, else by type display) so repeated/recursive types reuse one node.
+    fn encode(&mut self, ty: &Type) -> u32 {
+        // Resolve a Named reference to its body, keying the memo on the NAME so a recursive
+        // back-edge resolves to the in-progress node's offset.
+        if let Type::Named(n) = ty {
+            if let Some(&off) = self.memo.get(n) {
+                return off;
+            }
+            if let Some(body) = self.named.get(n).cloned() {
+                let off = self.buf.len() as u32;
+                self.memo.insert(n.clone(), off);
+                self.write_node(&body);
+                return off;
+            }
+            let off = self.buf.len() as u32;
+            self.put_u8(KIND_JSON);
+            return off;
+        }
+
+        let key = format!("{}", ty);
+        if let Some(&off) = self.memo.get(&key) {
+            return off;
+        }
+        let off = self.buf.len() as u32;
+        self.memo.insert(key, off);
+        self.write_node(ty);
+        off
+    }
+
+    /// Write the node header for `ty` at the current buffer position (which the caller has
+    /// already recorded as this node's offset), appending and back-patching any children.
+    fn write_node(&mut self, ty: &Type) {
+        match ty {
+            Type::Null => self.put_u8(KIND_NULL),
+            Type::Bool => self.put_u8(KIND_BOOL),
+            Type::Str => self.put_u8(KIND_STRING),
+            Type::Int8 => { self.put_u8(KIND_INT); self.put_u8(1); self.put_u8(1); }
+            Type::Int16 => { self.put_u8(KIND_INT); self.put_u8(2); self.put_u8(1); }
+            Type::Int32 => { self.put_u8(KIND_INT); self.put_u8(4); self.put_u8(1); }
+            Type::Int64 => { self.put_u8(KIND_INT); self.put_u8(8); self.put_u8(1); }
+            Type::UInt8 => { self.put_u8(KIND_INT); self.put_u8(1); self.put_u8(0); }
+            Type::UInt16 => { self.put_u8(KIND_INT); self.put_u8(2); self.put_u8(0); }
+            Type::UInt32 => { self.put_u8(KIND_INT); self.put_u8(4); self.put_u8(0); }
+            Type::UInt64 => { self.put_u8(KIND_INT); self.put_u8(8); self.put_u8(0); }
+            Type::Float32 => { self.put_u8(KIND_FLOAT); self.put_u8(4); }
+            Type::Float64 => { self.put_u8(KIND_FLOAT); self.put_u8(8); }
+            // Json / unconstrained TypeVar / opaque handles / functions / iterators: accept any.
+            Type::TypeVar(_) | Type::Iterator(_) | Type::Function { .. } | Type::Never => {
+                self.put_u8(KIND_JSON)
+            }
+            Type::Array(inner) => {
+                self.put_u8(KIND_ARRAY);
+                let slot = self.reserve_u32();
+                let elem_off = self.encode(inner);
+                self.patch_u32(slot, elem_off);
+            }
+            Type::FixedArray(elems) => {
+                self.put_u8(KIND_FIXED);
+                self.put_u32(elems.len() as u32);
+                let mut slots = Vec::with_capacity(elems.len());
+                for _ in elems {
+                    slots.push(self.reserve_u32());
+                }
+                for (e, slot) in elems.iter().zip(slots) {
+                    let off = self.encode(e);
+                    self.patch_u32(slot, off);
+                }
+            }
+            Type::Object(fields) => {
+                self.put_u8(KIND_OBJECT);
+                self.put_u32(fields.len() as u32);
+                // Header rows are variable-length (inline keys), so emit each row then its value
+                // node right after the whole header is impossible to pre-size; instead emit all
+                // rows with reserved value-offset slots, then encode value nodes and patch.
+                let mut value_slots = Vec::with_capacity(fields.len());
+                for (key, vty) in fields.iter() {
+                    let kb = key.as_bytes();
+                    self.put_u16(kb.len() as u16);
+                    self.buf.extend_from_slice(kb);
+                    let nullable = field_is_nullable(vty);
+                    self.put_u8(if nullable { 1 } else { 0 });
+                    value_slots.push((self.reserve_u32(), vty.clone()));
+                }
+                for (slot, vty) in value_slots {
+                    let off = self.encode(&vty);
+                    self.patch_u32(slot, off);
+                }
+            }
+            Type::Union(variants) => {
+                self.put_u8(KIND_UNION);
+                self.put_u32(variants.len() as u32);
+                let mut slots = Vec::with_capacity(variants.len());
+                for _ in variants {
+                    slots.push(self.reserve_u32());
+                }
+                for (v, slot) in variants.iter().zip(slots) {
+                    let off = self.encode(v);
+                    self.patch_u32(slot, off);
+                }
+            }
+            Type::Named(n) => {
+                // Reached only if `encode` did not resolve it (no body provided): back-edge if
+                // memoised, else opaque Json.
+                if let Some(&off) = self.memo.get(n) {
+                    // Re-emit as an alias node is not supported; the simplest correct behaviour is
+                    // to inline a back-edge via KIND_UNION-of-one is overkill. We instead duplicate
+                    // by encoding Json (safe, accept-any). Recursive named types always have a body
+                    // in `named`, so this path is for truly-unknown names only.
+                    let _ = off;
+                    self.put_u8(KIND_JSON);
+                } else {
+                    self.put_u8(KIND_JSON);
+                }
+            }
+        }
+    }
+}
+
+/// A target object FIELD is "nullable" (its absence in the Json is allowed) when its type
+/// includes `Null` — mirrors the object compatibility rule in `lin-check/src/compat.rs`.
+fn field_is_nullable(t: &Type) -> bool {
+    match t {
+        Type::Null => true,
+        Type::Union(variants) => variants.iter().any(field_is_nullable),
+        _ => false,
+    }
 }

@@ -114,6 +114,28 @@ impl Type {
         }
     }
 
+    /// True if this type contains any `TypeVar` anywhere in its structure
+    /// (including the Json marker `TypeVar(u32::MAX)`, generic params, and fresh
+    /// inference vars). A type with no TypeVar is "fully concrete" — the only
+    /// targets a `Json` value may NOT flow into without an explicit decode (ADR-046).
+    pub fn contains_type_var(&self) -> bool {
+        match self {
+            Type::TypeVar(_) => true,
+            Type::Array(inner) | Type::Iterator(inner) => inner.contains_type_var(),
+            Type::FixedArray(elems) => elems.iter().any(|t| t.contains_type_var()),
+            Type::Union(variants) => variants.iter().any(|t| t.contains_type_var()),
+            Type::Object(fields) => fields.values().any(|t| t.contains_type_var()),
+            Type::Function { params, ret, .. } => {
+                params.iter().any(|t| t.contains_type_var()) || ret.contains_type_var()
+            }
+            // Named types are opaque references; their bodies may contain Json but
+            // are resolved/unfolded elsewhere. Treat a bare Named as non-vargenic
+            // here (a concrete user type like `Person`).
+            Type::Named(_) => false,
+            _ => false,
+        }
+    }
+
     pub fn flatten_union(types: Vec<Type>) -> Type {
         let mut flat = Vec::new();
         for t in types {
