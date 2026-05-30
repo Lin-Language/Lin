@@ -171,6 +171,48 @@ When a uniquely-owned value is destroyed at the same point a same-shaped allocat
 
 ---
 
+## Reference counting under threads (async / concurrency)
+
+Lin's RC is **non-atomic** on the single-threaded hot path. Real OS-thread concurrency (spec
+§32, ADR-043/044/045) keeps that hot path free by **never sharing ordinary mutable heap values
+across threads** — three mechanisms cover every cross-thread case:
+
+1. **Transfer by deep copy (Option C) — the default.** When a value crosses a thread boundary
+   (a thunk's captured `val`s, or a transferable result handed back through a promise), it is
+   **deep-copied** so each thread owns a private, disjoint object graph (`lin_transfer_clone`,
+   `transfer_clone_env` in `transfer.rs`). Nothing is shared, so non-atomic RC stays sound. The
+   boundary-crossing set is exactly the transferable types (JSON-shaped, acyclic — enforced by
+   the checker), so the copy is total and bounded. The closure env carries a codegen-emitted
+   **capture descriptor** (one `CAP_*` byte per slot, stored at the env's offset-0 word) so the
+   runtime knows which env words are heap pointers to deep-copy; an env that captures a
+   function/iterator (`CAP_OPAQUE`) is not transferable, so that thunk runs inline as a sound
+   fallback.
+
+2. **`Shared<T>` — opt-in shared *mutable* state (ADR-044).** An **atomic**-refcounted box
+   (`SharedBox`, `shared.rs`) wrapping an `RwLock` over the inner value. Only the box's refcount
+   is atomic; the inner graph keeps ordinary non-atomic RC because it is only ever reachable
+   while a lock is held. Every value enters/leaves by deep copy, so no live reference escapes
+   the lock. The transfer copy path *shares* a `Shared` box by an atomic bump (the nesting
+   rule), never copies through it.
+
+3. **`Frozen<T>` — opt-in shared *read-only* state (ADR-045).** `frozen(v)` deep-seals the graph
+   **immortal** (saturated refcount), reusing the interned-string immortality trick generalized
+   to a whole graph. The immortal guard on string/array/object retain/release makes RC a no-op
+   on frozen nodes, so a read-only function's existing non-atomic RC runs correctly on a value
+   shared by N threads — no recompilation, no lock, no atomics. Frozen ⇒ never freed (load-once
+   data only). The transfer path shares frozen nodes by reference (zero-copy).
+
+Catchable faults: a runtime fault inside an async thunk unwinds to the thread boundary and
+becomes an `Error` (fault.rs / ADR-043); the faulting runtime functions and the thunk-call
+transmutes are `extern "C-unwind"` and async-reachable Lin frames carry `uwtable`.
+
+Atomic-RC-everywhere (Option A), dynamic shared-flag RC (Option D), and copy-on-write were
+rejected (ADR-043 §2.3) — they tax the non-threaded hot path. **TSan** (ThreadSanitizer) is the
+right tool for the RC-race class; ASan covers leaks/use-after-free across the transfer + box
+machinery and is wired in CI.
+
+---
+
 ## Testing approach
 
 - Run `cargo test --workspace` after every phase to verify no regressions.

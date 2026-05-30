@@ -77,6 +77,11 @@ fn resolve_named_cycle(
         "Float64" => Ok(Type::Float64),
         "String" => Ok(Type::Str),
         "Json" => Ok(json_type()),
+        // `Error` is the conventional error value (spec §19, §32.2.2): an object carrying a
+        // `type` discriminant and a `message`. The async runtime produces exactly this shape
+        // (`{ "type": "error", "message": String }`) when a thunk faults. It has no special
+        // control-flow behaviour — `is Error` is a structural shape check on those fields.
+        "Error" => Ok(error_type()),
         // Function is an opaque type annotation — any arity is acceptable.
         // Params and ret use TypeVar(u32::MAX) so compat check treats it as accepting any function.
         "Function" => Ok(Type::func(
@@ -231,4 +236,15 @@ pub fn json_type() -> Type {
     // We use TypeVar(u32::MAX) as a special "any" marker that is_compatible always accepts.
     // This allows object literals, arrays, strings, numbers, bools, null to all satisfy Json.
     Type::TypeVar(u32::MAX)
+}
+
+/// The built-in `Error` type: `{ "type": String, "message": String }` — the conventional
+/// error value, and the exact shape the async runtime builds on a caught thunk fault. Modelled
+/// structurally so `is Error` is a field-presence check and `Error` composes in unions
+/// (`T | Error`). Field values are `String` (`type` is the discriminant, `message` the text).
+pub fn error_type() -> Type {
+    let mut fields = IndexMap::new();
+    fields.insert("type".to_string(), Type::Str);
+    fields.insert("message".to_string(), Type::Str);
+    Type::Object(fields)
 }

@@ -1,9 +1,27 @@
 # Async / Concurrency — Design & Implementation Plan
 
-Status: **proposal**. This document describes how to turn Lin's concurrency
-primitives from their current synchronous stub into real OS-thread concurrency,
-as specified in `SPECIFICATION.md` §32. It is a design + phased plan, not a
-merged change.
+Status: **implemented** (Phases 0–8). This document described turning Lin's
+concurrency primitives from their synchronous stub into real OS-thread
+concurrency (`SPECIFICATION.md` §32); that work has landed. As-built decisions:
+ADR-043 (model: copy-by-default RC + catchable faults), ADR-044 (`Shared<T>`),
+ADR-045 (`Frozen<T>`) in `docs/DECISIONS.md`; RC-under-threads model in
+`MEMORY_MANAGEMENT.md`.
+
+Implemented: real `async`/`await` on OS threads, fault isolation at the thread
+boundary (a thunk fault → `Error` at `await`), transfer-by-deep-copy (Option C)
+for thunk envs + results, order-preserving `parallel`, real `race`/`timeout`/
+`retry`, a bounded `ThreadPool` (`poolAsync`), long-lived `Worker`s
+(request/message/close + `onShutdown`), `Shared<T>` (atomic box + RwLock) and
+`Frozen<T>` (immortal deep-freeze, lock-free concurrent reads). Guarded by the
+full gate + ASan + a TSan leg on the runtime.
+
+Deferred (in the ADRs, not blocking): compile-time *type-level* enforcement for
+`Shared<T>` (accessor-only) and `Frozen<T>` (mutation-inference read-only
+coercion), each needing a dedicated `Type` variant; the `pool.async` exact
+spelling (shipped as `poolAsync`); `pool.serve` multi-threaded HTTP. All runtime
+semantics are fully implemented and verified.
+
+The original proposal text follows.
 
 ---
 

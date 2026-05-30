@@ -3202,6 +3202,24 @@ val [users, posts] = await([
 ])
 ```
 
+`await` auto-flattens nested promises (§32.2.3): if the thunk itself returns a `Promise`, `await`
+resolves through every layer (`await(async(() => async(() => 42)))` is `42`).
+
+If the thunk faults (array out of bounds, division by zero, …), the fault is caught at the thread
+boundary and surfaces as an `Error` value (an object `{ "type": "error", "message": String }`)
+rather than halting the program. Discriminate it with the built-in `Error` type:
+
+```txt
+match await(p)
+  is Error => print("failed: ${result["message"]}")
+  else     => use(result)
+```
+
+> Note: the spec also says the checker should *reject* using an uninspected `Error` result as a
+> plain `T` (§32.2.2). That static check is not yet enforced — the async surface is `Json`-typed,
+> so `await(p)` returns `Json` and coerces freely; it needs parametric `Promise<T>` typing
+> (ADR-046). `is Error` gives the runtime discrimination meanwhile.
+
 ---
 
 ### close
@@ -3278,12 +3296,32 @@ Runs the thunk up to `n` times, returning the first successful result. If all at
 val threadPool: (Int32) -> ThreadPool
 ```
 
-Creates a thread pool with `n` worker threads. The pool can be used with `pool.async(thunk)` for submitting work, or `pool.serve(port, handler)` for a multi-threaded HTTP server.
+Creates a bounded thread pool with `n` worker threads draining a shared task queue. Submit
+work with `pool.poolAsync(thunk)` (see below). The pool bounds concurrency: at most `n` thunks
+run at once; excess work queues until a worker frees up.
 
 ```txt
 val pool = threadPool(8)
-val p = pool.async(() => heavyWork())
+val p = pool.poolAsync(() => heavyWork())
+val r = await(p)
 ```
+
+---
+
+### poolAsync
+
+```txt
+val poolAsync: (ThreadPool, () => T) -> Promise<T | Error>
+```
+
+Enqueues `thunk` on `pool` and returns a `Promise` for its result, resolved when a pool worker
+runs it. Designed for the dot-call form `pool.poolAsync(thunk)`. Same transferable-capture rules
+as the top-level `async` (the thunk's `val` captures are deep-copied across the boundary; it must
+not capture `var`). A fault inside the thunk is isolated and surfaces as an `Error` at `await`.
+
+> Note: the spec spells this `pool.async(...)`; in this implementation the pool submission method
+> is exported as `poolAsync` (a distinct name from the top-level `async`, which takes only a
+> thunk). `pool.serve(...)` for multi-threaded HTTP is not yet implemented.
 
 ---
 
@@ -3294,6 +3332,72 @@ val timeout: (Promise, Int32) -> T
 ```
 
 Adds a millisecond timeout to `promise`. If the promise does not resolve within `ms` milliseconds, the result is an error.
+
+---
+
+### shared / get / set / withLock
+
+```txt
+val shared:   <T>(T) -> Shared<T>
+val get:      <T>(Shared<T>) -> T
+val set:      <T>(Shared<T>, T) -> Null
+val withLock: <T, R>(Shared<T>, (T) -> R) -> R
+```
+
+`Shared<T>` is opt-in **shared mutable state** for many threads (ADR-043 §2.3.1): an
+atomic-refcounted box wrapping a reader-writer lock over a private copy of the value.
+
+- `shared(v)` creates a `Shared<T>` boxing a deep copy of `v` (must be transferable).
+- `get(s)` takes the **read** lock and returns a deep-copied snapshot (concurrent with other
+  `get`s).
+- `set(s, v)` takes the **write** lock and replaces the inner value with a deep copy of `v`.
+- `withLock(s, f)` holds the **write** lock across `f`, which receives the inner value mutable
+  in place (e.g. `a => push(a, 7)`); `f`'s result is copied out. Use this for atomic
+  read-modify-write.
+
+```txt
+val s = shared([4, 5, 6])
+val snap = s.get()                  // snapshot copy
+s.set([7, 8, 9])                    // replace wholesale
+s.withLock(arr => push(arr, 7))     // atomic in-place mutate
+val n = s.withLock(arr => length(arr))   // read a derived value out
+```
+
+Safety: every value entering is copied in, every value leaving is copied out, so no live
+reference into the box escapes the lock. `get`/`set` are individually atomic but not across the
+gap (last-writer-wins); use `withLock` when the update must be atomic.
+
+> Caveat: `withLock` mutates **in place**, so a scalar accumulator (`n => n + 1`) does not
+> persist — use a one-element array or `get`/`set`. The compile-time accessor-only enforcement
+> (rejecting e.g. `push(s, 7)` directly on a `Shared`) is not yet wired (it needs a dedicated
+> `Shared<T>` type variant in the checker); the runtime box semantics are fully enforced.
+> Importing both `std/array`'s `set` and this `set` in one file collides — alias one.
+
+---
+
+### frozen
+
+```txt
+val frozen: <T>(T) -> T
+```
+
+`frozen(v)` deep-freezes a transferable graph into shared **read-only** state (ADR-045 §2.3.2):
+every heap node is sealed immortal+immutable, so many threads can read it concurrently with
+**zero copies, no lock, and no atomics**. The value keeps its plain type, so readers use it
+transparently:
+
+```txt
+val timetable = frozen(loadTimetable())
+val routes = parallel(
+  journeys.map(j => () => planJourney(timetable, j))   // shared by reference, not copied
+)
+```
+
+> **Immortal ⇒ never freed.** Use `frozen` for load-once, program-lifetime reference data (a
+> timetable, routing table, config). A `frozen()` value created and discarded in a loop leaks.
+> The compile-time read-only coercion / mutation-inference (rejecting a frozen value passed to a
+> mutating parameter) is deferred (ADR-045): mutating a frozen value is currently a silent no-op
+> rather than a compile error. Concurrent reads are fully safe.
 
 ---
 

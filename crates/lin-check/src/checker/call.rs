@@ -375,7 +375,7 @@ impl Checker {
                 };
 
                 // var-capture check for pool.async(f) / pool.async(fs).
-                if method == "lin_async" {
+                if method == "lin_async" || method == "lin_pool_async" {
                     let globals = self.mutable_global_slots.clone();
                     for arg in &all_args[1..] {
                         if let Some(var_name) = first_mutable_capture(arg, &globals) {
@@ -411,7 +411,7 @@ impl Checker {
             }
         }
         // var-capture check for pool.async(f) / pool.async(fs) (fallback path).
-        if method == "lin_async" {
+        if method == "lin_async" || method == "lin_pool_async" {
             let globals = self.mutable_global_slots.clone();
             for arg in &all_args[1..] {
                 if let Some(var_name) = first_mutable_capture(arg, &globals) {

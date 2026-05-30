@@ -1,6 +1,8 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
-import { async, await, parallel, worker, request, close } from "std/async"
+import { async, await, parallel, race, timeout, retry, threadPool, poolAsync, worker, request, close, shared, get, set, withLock, frozen } from "std/async"
+import { push, length } from "std/array"
+import { sleep } from "std/time"
 
 val s = suite("std/async", [
   test("async/await basic value", () =>
@@ -32,6 +34,191 @@ val s = suite("std/async", [
     close(w)
     [
       expect(reply).toBe(42)
+    ]
+  ),
+
+  test("worker holds confined var state across requests", () =>
+    var total = 0
+    val acc = worker(
+      n =>
+        total = total + n
+        total,
+      () => null
+    )
+    val a = request(acc, 10)
+    val b = request(acc, 5)
+    close(acc)
+    [
+      expect(a).toBe(10),
+      expect(b).toBe(15)
+    ]
+  ),
+
+  test("worker handler fault surfaces as Error", () =>
+    val z = 0
+    val w = worker(n => n / z, () => null)
+    val r = request(w, 5)
+    close(w)
+    [
+      expect(r["type"]).toBe("error")
+    ]
+  ),
+
+  test("async captures string val (deep-copied across thread)", () =>
+    val name = "world"
+    val p = async(() => "hello ${name}")
+    val checks = [
+      expect(await(p)).toBe("hello world")
+    ]
+    checks
+  ),
+
+  test("async captures array val", () =>
+    val xs = [10, 20, 30]
+    val p = async(() => xs[1])
+    val checks = [
+      expect(await(p)).toBe(20)
+    ]
+    checks
+  ),
+
+  test("fault in thunk is caught as Error at await (div by zero)", () =>
+    val z = 0
+    val p = async(() => 42 / z)
+    val r = await(p)
+    // The fault surfaces as an Error object { type: "error", message: ... };
+    // the program continues rather than aborting (spec §32.2.2).
+    val checks = [
+      expect(r["type"]).toBe("error")
+    ]
+    checks
+  ),
+
+  test("fault in thunk: array out of bounds caught as Error", () =>
+    val arr = [1, 2, 3]
+    val p = async(() => arr[99])
+    val r = await(p)
+    val checks = [
+      expect(r["type"]).toBe("error")
+    ]
+    checks
+  ),
+
+  test("await flattens a nested promise (§32.2.3)", () =>
+    val p = async(() => async(() => 42))
+    val checks = [
+      expect(await(p)).toBe(42)
+    ]
+    checks
+  ),
+
+  test("program continues after a caught async fault", () =>
+    val z = 0
+    val bad = await(async(() => 1 / z))
+    val good = await(async(() => 7 + 1))
+    val checks = [
+      expect(good).toBe(8)
+    ]
+    checks
+  ),
+
+  test("race resolves with first to complete", () =>
+    val w = await(race([
+      async(() =>
+        sleep(150)
+        "slow"
+      ),
+      async(() =>
+        sleep(5)
+        "fast"
+      )
+    ]))
+    val checks = [
+      expect(w).toBe("fast")
+    ]
+    checks
+  ),
+
+  test("timeout expires to null when too slow", () =>
+    val slow = async(() =>
+      sleep(200)
+      "done"
+    )
+    val checks = [
+      expect(await(timeout(slow, 20))).toBe(null)
+    ]
+    checks
+  ),
+
+  test("timeout passes the value through when fast", () => [
+    expect(await(timeout(async(() => 5), 1000))).toBe(5)
+  ]),
+
+  test("retry returns value on first success", () => [
+    expect(await(retry(() => 7, 3))).toBe(7)
+  ]),
+
+  test("retry surfaces Error when all attempts fail", () =>
+    val z = 0
+    val r = await(retry(() => 1 / z, 3))
+    val checks = [
+      expect(r["type"]).toBe("error")
+    ]
+    checks
+  ),
+
+  test("pool runs queued tasks", () =>
+    val pool = threadPool(2)
+    val p1 = pool.poolAsync(() => 10)
+    val p2 = pool.poolAsync(() => 20)
+    val checks = [
+      expect(await(p1) + await(p2)).toBe(30)
+    ]
+    checks
+  ),
+
+  test("pool task fault is isolated as Error", () =>
+    val pool = threadPool(2)
+    val z = 0
+    val r = await(pool.poolAsync(() => 1 / z))
+    val checks = [
+      expect(r["type"]).toBe("error")
+    ]
+    checks
+  ),
+
+  test("shared get/set snapshot", () =>
+    val sh = shared([1, 2, 3])
+    val before = get(sh).toString()
+    set(sh, [9])
+    val after = get(sh).toString()
+    [
+      expect(before).toBe("[1, 2, 3]"),
+      expect(after).toBe("[9]")
+    ]
+  ),
+
+  test("shared withLock mutates in place; concurrent pushes don't lose updates", () =>
+    val box = shared([])
+    val tasks = parallel([
+      () => withLock(box, a => push(a, 1)),
+      () => withLock(box, a => push(a, 1)),
+      () => withLock(box, a => push(a, 1))
+    ])
+    [
+      expect(length(get(box))).toBe(3)
+    ]
+  ),
+
+  test("frozen graph read concurrently by many threads", () =>
+    val table = frozen([10, 20, 30, 40, 50])
+    val results = parallel([
+      () => length(table),
+      () => length(table),
+      () => length(table)
+    ])
+    [
+      expect(results.toString()).toBe("[5, 5, 5]")
     ]
   ),
 ])

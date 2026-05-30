@@ -164,6 +164,27 @@ impl Checker {
             ], Type::TypeVar(9105)));
         // threadPool: (Int32) => ThreadPool
         self.define_intrinsic("lin_thread_pool", Type::func(vec![Type::Int32], Type::TypeVar(9106)));
+        // poolAsync: (ThreadPool, () => T) => Promise<T>  — enqueue a thunk on a bounded pool.
+        self.define_intrinsic("lin_pool_async", Type::func(vec![
+                Type::TypeVar(9120),
+                Type::func(vec![], Type::TypeVar(9121)),
+            ], Type::TypeVar(9121)));
+        // Shared<T> accessors (ADR-043 §2.3.1). The opaque Shared<T> type is modelled with a
+        // TypeVar here (no dedicated Type variant yet); the runtime enforces the box semantics.
+        //   shared:   <T>(T) => Shared<T>
+        //   get:      <T>(Shared<T>) => T          (snapshot copy-out)
+        //   set:      <T>(Shared<T>, T) => Null    (copy-in)
+        //   withLock: <T,R>(Shared<T>, (T) => R) => R
+        self.define_intrinsic("lin_shared", Type::func(vec![Type::TypeVar(9130)], Type::TypeVar(9131)));
+        self.define_intrinsic("lin_shared_get", Type::func(vec![Type::TypeVar(9132)], Type::TypeVar(9133)));
+        self.define_intrinsic("lin_shared_set", Type::func(vec![Type::TypeVar(9134), Type::TypeVar(9135)], Type::Null));
+        self.define_intrinsic("lin_shared_with_lock", Type::func(vec![
+                Type::TypeVar(9136),
+                Type::func(vec![Type::TypeVar(9137)], Type::TypeVar(9138)),
+            ], Type::TypeVar(9138)));
+        // frozen: <T>(T) => T  (deep immortal seal; the value keeps its plain type so readers use
+        // it transparently). Frozen<T> read-only coercion / mutation-inference is deferred (ADR-045).
+        self.define_intrinsic("lin_freeze", Type::func(vec![Type::TypeVar(9140)], Type::TypeVar(9140)));
         // worker: ((Msg) => Reply, () => Null) => Worker
         self.define_intrinsic("lin_worker", Type::func(vec![
                 Type::func(vec![Type::TypeVar(9107)], Type::TypeVar(9108)),

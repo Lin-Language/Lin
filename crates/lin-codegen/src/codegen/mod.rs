@@ -77,6 +77,13 @@ pub struct Codegen<'ctx> {
     /// descriptor (closure offset 32) so an indirect under-arity call dispatches to the
     /// correct default-fill adapter. Repopulated per `compile_module_from_ir`.
     cls_descriptors: HashMap<lir::FuncId, inkwell::values::PointerValue<'ctx>>,
+    /// True if the whole program may spawn an async boundary (it references any of the
+    /// concurrency intrinsics). When set, user-emitted Lin functions are NOT marked
+    /// `nounwind`: a runtime fault inside an async thunk unwinds through Lin frames to the
+    /// thread boundary's `catch_unwind` (spec §32.2.2), so `nounwind` would be unsound on
+    /// any function reachable from a thunk — and any function can be (ADR-042, doc §2.4.3
+    /// option a). Conservatively program-wide; the non-async hot path keeps `nounwind`.
+    uses_async: bool,
 }
 
 impl<'ctx> Codegen<'ctx> {
@@ -105,6 +112,7 @@ impl<'ctx> Codegen<'ctx> {
             imported_val_wrappers: HashMap::new(),
             foreign_lib_paths: Vec::new(),
             ir_anon_prefix: String::new(),
+            uses_async: false,
             coverage: if coverage_enabled {
                 // Source path is set by set_main_source; start with empty path.
                 Some(CoverageEmitter::new(String::new()))
@@ -134,6 +142,29 @@ impl<'ctx> Codegen<'ctx> {
             let attr = self.context.create_enum_attribute(kind_id, 0);
             fn_value.add_attribute(AttributeLoc::Function, attr);
         }
+    }
+
+    /// Mark `f` `nounwind` UNLESS the program uses async. When async is in play a runtime
+    /// fault inside a thunk unwinds through Lin frames to the thread boundary (spec §32.2.2),
+    /// so `nounwind` would be unsound on any reachable function — and we can't cheaply prove a
+    /// given function is unreachable from a thunk, so we conservatively drop it program-wide.
+    /// The common non-async program keeps the attribute (and its optimisation value).
+    pub(crate) fn mark_user_fn_nounwind(&self, f: FunctionValue<'ctx>) {
+        if !self.uses_async {
+            self.add_fn_attrs(f, &["nounwind"]);
+        } else {
+            // Async program: a thunk fault unwinds through Lin frames to the thread boundary.
+            // The frame must therefore emit an unwind table (`uwtable`) so the unwinder can
+            // walk through it; without it a plain `call` to a faulting runtime fn that unwinds
+            // is treated as a non-unwinding panic and aborts the process.
+            self.add_fn_attrs(f, &["uwtable"]);
+        }
+    }
+
+    /// Set by the driver before any module is compiled, once it has scanned the whole program
+    /// (main + all imports) for any concurrency intrinsic. See `uses_async`.
+    pub fn set_uses_async(&mut self, v: bool) {
+        self.uses_async = v;
     }
 
     /// Set the main module's source path + text for coverage. Index 0 of the coverage
@@ -489,9 +520,11 @@ impl<'ctx> Codegen<'ctx> {
                 else {
                     let f = self.module.add_function(&name, fn_ty, None);
                     // User-emitted Lin functions use value-based errors and never
-                    // unwind, so `nounwind` is sound. (Runtime `lin_*` decls are not
-                    // marked — the Rust runtime is `panic = "unwind"`.)
-                    self.add_fn_attrs(f, &["nounwind"]);
+                    // unwind, so `nounwind` is sound — EXCEPT when the program uses async,
+                    // where a thunk fault unwinds through Lin frames (see
+                    // `mark_user_fn_nounwind`). (Runtime `lin_*` decls are not marked — the
+                    // Rust runtime is `panic = "unwind"`.)
+                    self.mark_user_fn_nounwind(f);
                     f
                 }
             } else {
@@ -500,7 +533,7 @@ impl<'ctx> Codegen<'ctx> {
                 if let Some(existing) = self.module.get_function(&name) { existing }
                 else {
                     let f = self.module.add_function(&name, fn_ty, None);
-                    self.add_fn_attrs(f, &["nounwind"]);
+                    self.mark_user_fn_nounwind(f);
                     f
                 }
             };
@@ -1080,7 +1113,19 @@ impl<'ctx> Codegen<'ctx> {
                                         .iter()
                                         .filter_map(|c| temp_map.get(c).copied())
                                         .collect();
-                                    self.make_closure_struct_desc(fn_ptr.into(), &capture_vals, descriptor)
+                                    // Capture kinds (for thread-transfer env deep-copy) from the
+                                    // captured temps' IR types. Only emitted when the program uses
+                                    // async (the descriptor is dead weight otherwise).
+                                    let capture_kinds: Option<Vec<u8>> = if self.uses_async {
+                                        Some(captures.iter().map(|c| {
+                                            let ty = func.temp_types.get(c).cloned().unwrap_or(Type::Null);
+                                            Self::capture_kind(&ty)
+                                        }).collect())
+                                    } else { None };
+                                    self.make_closure_struct_desc_caps(
+                                        fn_ptr.into(), &capture_vals, descriptor,
+                                        capture_kinds.as_deref(),
+                                    )
                                 };
                                 temp_map.insert(*dst, cls);
                             }
