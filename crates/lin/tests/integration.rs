@@ -1904,6 +1904,82 @@ print(toString(reply))
 }
 
 #[test]
+fn test_worker_stateful_var_capture() {
+    // A worker handler may close over `var` (§32.6.4): the accumulator state is confined to
+    // the worker thread and updated across sequential requests. onShutdown sees the final state.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { worker, request, close } from "std/async"
+
+var total = 0
+val acc = worker(
+  n =>
+    total = total + n
+    total,
+  () => print("final ${toString(total)}")
+)
+print(toString(request(acc, 10)))
+print(toString(request(acc, 5)))
+print(toString(request(acc, 100)))
+close(acc)
+"#);
+    assert_eq!(output, vec!["10", "15", "115", "final 115"]);
+}
+
+#[test]
+fn test_worker_message_fire_and_forget() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { worker, request, message, close } from "std/async"
+import { push, length } from "std/array"
+
+var log = []
+val w = worker(
+  n =>
+    push(log, n)
+    length(log),
+  () => null
+)
+message(w, 1)
+message(w, 2)
+val count = request(w, 3)
+close(w)
+print(toString(count))
+"#);
+    assert_eq!(output, vec!["3"]);
+}
+
+#[test]
+fn test_worker_handler_fault_surfaces_error() {
+    // A fault in the worker handler is caught at the boundary and returned as an Error to the
+    // in-flight request (§32.6.5); the program continues.
+    let output = run(r#"import { print } from "std/io"
+import { worker, request, close } from "std/async"
+
+val z = 0
+val w = worker(n => n / z, () => null)
+val r = request(w, 5)
+close(w)
+print(r["type"])
+"#);
+    assert_eq!(output, vec!["error"]);
+}
+
+#[test]
+fn test_worker_send_after_close_errors() {
+    // Sending to a closed worker yields an Error (§32.6.5), not a crash.
+    let output = run(r#"import { print } from "std/io"
+import { worker, request, close } from "std/async"
+
+val w = worker(msg => msg, () => null)
+close(w)
+val r = request(w, 1)
+print(r["type"])
+"#);
+    assert_eq!(output, vec!["error"]);
+}
+
+#[test]
 fn test_async_real_parallelism() {
     // Two thunks that each sleep 150ms. With real OS threads the wall-clock should be
     // ~150ms (overlap), not ~300ms (sequential). Assert it completed well under the

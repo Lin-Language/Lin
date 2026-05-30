@@ -69,13 +69,34 @@ struct PoolQueueState {
     shutdown: bool,
 }
 
-/// A Worker (Phase 5). Retained synchronous shape until Phase 5 replaces it with a real
-/// long-lived thread + mailbox.
+/// A message sent to a worker's mailbox (spec §32.6). `Request` carries a oneshot reply
+/// channel; `Message` is fire-and-forget; `Close` triggers `onShutdown` + thread exit.
+enum WorkerMsg {
+    Request { msg: SendPtr, reply: std::sync::mpsc::Sender<WorkerReply> },
+    Message { msg: SendPtr },
+    Close,
+}
+unsafe impl Send for WorkerMsg {}
+
+/// A worker's reply to a `request`: the handler's result, or an error if the handler faulted
+/// (the worker survives a faulting message; the in-flight request gets the diagnostic, §32.6.5).
+enum WorkerReply {
+    Ok(SendPtr),
+    Err(String),
+}
+unsafe impl Send for WorkerReply {}
+
+/// A long-lived worker thread + MPSC mailbox (spec §32.6). The handler closure runs on the
+/// worker thread, processing messages sequentially — so the handler MAY close over `var`
+/// (§32.6.4): the state is confined to this one thread and never concurrently accessed.
+/// `request` blocks for the reply; `message` is fire-and-forget; `close` drains, runs
+/// `onShutdown`, and joins. Messages crossing into the worker are deep-copied (transferable).
 #[repr(C)]
 pub struct LinWorker {
-    pub on_msg_fn: *mut u8,
-    pub on_msg_env: *mut u8,
-    pub on_msg_has_env: u8,
+    tx: std::sync::mpsc::Sender<WorkerMsg>,
+    handle: Option<JoinHandle<()>>,
+    /// True once `close` has been called, so later sends are rejected (§32.6.5).
+    closed: bool,
 }
 
 /// Build an `Error` object `{ "type": "error", "message": <msg> }` as a boxed `TaggedVal*`.
@@ -548,32 +569,8 @@ pub unsafe extern "C" fn lin_pool_async_one(pool: *mut LinThreadPool, thunk: *mu
     p
 }
 
-/// Allocate a LinWorker with the given on_message closure. (Phase 5 replaces this.)
-
-/// Allocate a LinWorker with the given on_message closure. (Phase 5 replaces this.)
-#[no_mangle]
-pub unsafe extern "C" fn lin_worker_new(
-    fn_ptr: *mut u8,
-    env_ptr: *mut u8,
-    has_env: u8,
-) -> *mut LinWorker {
-    let ptr = lin_alloc(std::mem::size_of::<LinWorker>()) as *mut LinWorker;
-    (*ptr).on_msg_fn = fn_ptr;
-    (*ptr).on_msg_env = env_ptr;
-    (*ptr).on_msg_has_env = has_env;
-    ptr
-}
-
-/// Send a message to a worker and synchronously get the reply. (Phase 5 makes this a real
-/// mailbox round-trip.)
-#[no_mangle]
-pub unsafe extern "C" fn lin_worker_request(worker: *mut LinWorker, msg: *mut u8) -> *mut u8 {
-    if worker.is_null() {
-        return std::ptr::null_mut();
-    }
-    let fn_ptr = (*worker).on_msg_fn;
-    let env_ptr = (*worker).on_msg_env;
-    let has_env = (*worker).on_msg_has_env;
+/// Invoke a worker closure `(env?, msg) -> reply` by raw fn/env pointers on the worker thread.
+unsafe fn call_worker_handler(fn_ptr: *mut u8, env_ptr: *mut u8, has_env: u8, msg: *mut u8) -> *mut u8 {
     if fn_ptr.is_null() {
         return std::ptr::null_mut();
     }
@@ -586,12 +583,111 @@ pub unsafe extern "C" fn lin_worker_request(worker: *mut LinWorker, msg: *mut u8
     }
 }
 
-/// Fire-and-forget message to a worker (result discarded).
+/// Spawn a long-lived worker thread with an MPSC mailbox. `on_msg_*` is the message handler
+/// closure (`(Msg) => Reply`); `on_close_*` is the optional `onShutdown` closure (`() => Null`,
+/// invoked once at `close`). The handler env stays on the worker thread (thread-confined state,
+/// so the handler may close over `var`, §32.6.4). Returns a `*LinWorker` handle.
 #[no_mangle]
-pub unsafe extern "C" fn lin_worker_message(worker: *mut LinWorker, msg: *mut u8) {
-    lin_worker_request(worker, msg);
+pub unsafe extern "C" fn lin_worker_new(
+    on_msg_fn: *mut u8,
+    on_msg_env: *mut u8,
+    on_msg_has_env: u8,
+    on_close_fn: *mut u8,
+    on_close_env: *mut u8,
+    on_close_has_env: u8,
+) -> *mut LinWorker {
+    crate::fault::install_quiet_fault_hook();
+    let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
+
+    // Capture handler/onClose pointers as addresses (Send); they are read-only code + a
+    // thread-confined env that lives on the worker thread for the worker's lifetime.
+    let msg_fn = on_msg_fn as usize;
+    let msg_env = on_msg_env as usize;
+    let close_fn = on_close_fn as usize;
+    let close_env = on_close_env as usize;
+
+    let handle = std::thread::spawn(move || {
+        // Process messages sequentially until Close (or the sender is dropped).
+        while let Ok(m) = rx.recv() {
+            match m {
+                WorkerMsg::Request { msg, reply } => {
+                    let msg_ptr = msg.0;
+                    let outcome = crate::fault::with_async_boundary(|| {
+                        call_worker_handler(msg_fn as *mut u8, msg_env as *mut u8, on_msg_has_env, msg_ptr)
+                    });
+                    let r = match outcome {
+                        Ok(v) => WorkerReply::Ok(SendPtr(v)),
+                        Err(e) => WorkerReply::Err(e),
+                    };
+                    // If the requester has gone away, drop the reply silently.
+                    let _ = reply.send(r);
+                }
+                WorkerMsg::Message { msg } => {
+                    let msg_ptr = msg.0;
+                    // Fire-and-forget: a fault here is isolated (worker survives), result dropped.
+                    let _ = crate::fault::with_async_boundary(|| {
+                        call_worker_handler(msg_fn as *mut u8, msg_env as *mut u8, on_msg_has_env, msg_ptr)
+                    });
+                }
+                WorkerMsg::Close => {
+                    // Run onShutdown (if any), then exit the loop. Fault in onShutdown is isolated.
+                    if close_fn != 0 {
+                        let _ = crate::fault::with_async_boundary(|| {
+                            call_worker_handler(close_fn as *mut u8, close_env as *mut u8, on_close_has_env, std::ptr::null_mut())
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
+    let ptr = lin_alloc(std::mem::size_of::<LinWorker>()) as *mut LinWorker;
+    std::ptr::write(ptr, LinWorker { tx, handle: Some(handle), closed: false });
+    ptr
 }
 
-/// Close a worker (no-op until Phase 5).
+/// Send a message to a worker and BLOCK for its reply (spec §32.6: `request`). The message is
+/// deep-copied for transfer (Option C). On handler fault, returns an `Error` object. Sending to
+/// a closed/dead worker returns an `Error` (§32.6.5).
 #[no_mangle]
-pub unsafe extern "C" fn lin_worker_close(_worker: *mut LinWorker) {}
+pub unsafe extern "C" fn lin_worker_request(worker: *mut LinWorker, msg: *mut u8) -> *mut u8 {
+    if worker.is_null() || (*worker).closed {
+        return make_error_tagged("worker is closed");
+    }
+    let msg_copy = crate::transfer::lin_transfer_clone(msg as *const u8);
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel::<WorkerReply>();
+    if (*worker).tx.send(WorkerMsg::Request { msg: SendPtr(msg_copy), reply: reply_tx }).is_err() {
+        return make_error_tagged("worker is dead");
+    }
+    match reply_rx.recv() {
+        Ok(WorkerReply::Ok(v)) => v.0,
+        Ok(WorkerReply::Err(e)) => make_error_tagged(&e),
+        Err(_) => make_error_tagged("worker died before replying"),
+    }
+}
+
+/// Fire-and-forget message to a worker (spec §32.6: `message`); the reply is discarded. The
+/// message is deep-copied for transfer. Sending to a closed worker is a no-op.
+#[no_mangle]
+pub unsafe extern "C" fn lin_worker_message(worker: *mut LinWorker, msg: *mut u8) {
+    if worker.is_null() || (*worker).closed {
+        return;
+    }
+    let msg_copy = crate::transfer::lin_transfer_clone(msg as *const u8);
+    let _ = (*worker).tx.send(WorkerMsg::Message { msg: SendPtr(msg_copy) });
+}
+
+/// Close a worker (spec §32.6: `close`): send the shutdown sentinel (the worker drains queued
+/// messages first, then runs `onShutdown`), and join the thread. Idempotent.
+#[no_mangle]
+pub unsafe extern "C" fn lin_worker_close(worker: *mut LinWorker) {
+    if worker.is_null() || (*worker).closed {
+        return;
+    }
+    (*worker).closed = true;
+    let _ = (*worker).tx.send(WorkerMsg::Close);
+    if let Some(h) = (*worker).handle.take() {
+        let _ = h.join();
+    }
+}

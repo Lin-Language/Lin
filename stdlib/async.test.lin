@@ -36,6 +36,33 @@ val s = suite("std/async", [
     ]
   ),
 
+  test("worker holds confined var state across requests", () =>
+    var total = 0
+    val acc = worker(
+      n =>
+        total = total + n
+        total,
+      () => null
+    )
+    val a = request(acc, 10)
+    val b = request(acc, 5)
+    close(acc)
+    [
+      expect(a).toBe(10),
+      expect(b).toBe(15)
+    ]
+  ),
+
+  test("worker handler fault surfaces as Error", () =>
+    val z = 0
+    val w = worker(n => n / z, () => null)
+    val r = request(w, 5)
+    close(w)
+    [
+      expect(r["type"]).toBe("error")
+    ]
+  ),
+
   test("async captures string val (deep-copied across thread)", () =>
     val name = "world"
     val p = async(() => "hello ${name}")
