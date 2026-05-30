@@ -55,6 +55,7 @@ unsafe fn release_tagged_payload(tv: &TaggedVal) {
         TAG_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
         TAG_OBJECT => lin_object_release(payload as *mut LinObject),
         TAG_FUNCTION => crate::memory::lin_closure_release(payload as *mut u8),
+        TAG_SHARED => crate::shared::lin_shared_release_box(payload as *const u8),
         _ => {}
     }
 }
@@ -72,11 +73,17 @@ unsafe fn retain_tagged_payload(tv: &TaggedVal) {
         }
         TAG_ARRAY => {
             let a = payload as *mut crate::array::LinArray;
-            if !a.is_null() { (*a).refcount += 1; }
+            // Skip frozen (immortal) arrays — their refcount must never be written (read-only,
+            // shared across threads). Mirror of the string immortal guard.
+            if !a.is_null() && (*a).refcount < crate::string::IMMORTAL_RC { (*a).refcount += 1; }
         }
         TAG_OBJECT => {
             let o = payload as *mut LinObject;
-            if !o.is_null() { (*o).refcount += 1; }
+            if !o.is_null() && (*o).refcount < crate::string::IMMORTAL_RC { (*o).refcount += 1; }
+        }
+        TAG_SHARED => {
+            // Atomic refcount on the Shared box (cross-thread-shared).
+            crate::shared::lin_shared_retain_box(payload as *const u8);
         }
         _ => {} // scalars: no heap payload
     }
@@ -170,6 +177,26 @@ pub unsafe extern "C" fn lin_object_set(obj: *mut LinObject, key: *mut LinString
     (*obj).len = len + 1;
 }
 
+/// Append an entry taking OWNERSHIP of an already-owned `key` and `value` (no retain). The
+/// caller must not release either afterwards. Assumes `key` does not already exist (used by
+/// the thread-transfer deep-copy path, which builds a fresh object from distinct keys). Grows
+/// the entry buffer as needed.
+pub unsafe fn object_push_owned(obj: *mut LinObject, key: *mut LinString, value: TaggedVal) {
+    let len = (*obj).len;
+    let cap = (*obj).cap;
+    if len == cap {
+        let new_cap = cap * 2;
+        let old_layout = entries_layout(cap);
+        let new_layout = entries_layout(new_cap);
+        (*obj).entries = realloc((*obj).entries as *mut u8, old_layout, new_layout.size()) as *mut LinObjectEntry;
+        (*obj).cap = new_cap;
+    }
+    let slot = (*obj).entries.add(len as usize);
+    (*slot).key = key;
+    (*slot).value = value;
+    (*obj).len = len + 1;
+}
+
 /// Get a field value as a pointer to TaggedVal. Returns null if key not found.
 #[no_mangle]
 pub unsafe extern "C" fn lin_object_get(obj: *const LinObject, key: *const LinString) -> *const TaggedVal {
@@ -189,10 +216,9 @@ pub unsafe extern "C" fn lin_object_get(obj: *const LinObject, key: *const LinSt
 /// Copy all fields from `src` into `dst`, overwriting existing keys.
 /// Used to implement object spread: `{ ...src, ... }`.
 #[no_mangle]
-pub unsafe extern "C" fn lin_object_merge(dst: *mut LinObject, src: *const LinObject) {
+pub unsafe extern "C-unwind" fn lin_object_merge(dst: *mut LinObject, src: *const LinObject) {
     if src.is_null() {
-        eprintln!("Runtime error: cannot spread null into object");
-        std::process::exit(1);
+        crate::fault::runtime_fault("Runtime error: cannot spread null into object");
     }
     let src_len = (*src).len;
     for i in 0..src_len {
@@ -458,6 +484,11 @@ unsafe fn lin_array_eq_deep(a: *const crate::array::LinArray, b: *const crate::a
 #[no_mangle]
 pub unsafe extern "C" fn lin_object_release(obj: *mut LinObject) {
     if obj.is_null() {
+        return;
+    }
+    // Frozen (immortal) objects: saturated refcount, never freed/decremented (Frozen<T>,
+    // ADR-045). Guard makes retain/release no-ops so concurrent reads are race-free.
+    if (*obj).refcount >= crate::string::IMMORTAL_RC {
         return;
     }
     // Zero refcount ⇒ double-release (ownership bug); the decrement below would wrap u32.

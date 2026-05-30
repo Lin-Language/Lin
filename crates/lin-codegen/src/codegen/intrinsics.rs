@@ -247,25 +247,43 @@ impl<'ctx> Codegen<'ctx> {
                 } else { ptr_ty.const_null().into() }
             }
             Intrinsic::Async => {
-                // async(thunk): call the thunk closure synchronously (it returns a boxed
-                // Json result), then wrap in a LinPromise*. The thunk may arrive boxed (a
-                // Json-typed parameter, as in std/async's `async(f: Json)`) — unbox to the
-                // raw closure struct before calling.
+                // async(thunk): hand the UNEVALUATED thunk closure to the runtime, which spawns
+                // an OS thread, deep-copies the captured env (Option C), runs the thunk inside a
+                // fault boundary, and returns a LinPromise*. The thunk may arrive boxed (a
+                // Json-typed parameter, as in std/async's `async(f: Json)`) — unbox to the raw
+                // closure struct first.
+                //
+                // The `pool.async(f)` dot form desugars to `lin_async(pool, f)` (2 args): the
+                // first arg is the ThreadPool. We route that to lin_pool_async_one (enqueue) so
+                // the thunk runs on a pool worker instead of a fresh thread (spec §32.5).
                 let thunk = args.last().copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let thunk_ty = arg_tys.last().cloned().unwrap_or(Type::Null);
                 let thunk = if Self::is_union_type(&thunk_ty) && thunk.is_pointer_value() {
                     self.builder.call(self.rt.unbox_ptr, &[thunk.into()], "ir_async_cls").try_as_basic_value().unwrap_basic()
                 } else { thunk };
-                let result = self.call_thunk_value(thunk);
-                let make_promise = self.get_or_declare_fn("lin_make_promise",
-                    ptr_ty.fn_type(&[ptr_ty.into()], false));
-                self.builder.call(make_promise, &[result.into()], "ir_promise").try_as_basic_value().unwrap_basic()
+                let raw = if args.len() >= 2 {
+                    // pool.async(f): args[0] is the pool handle, boxed as TAG_HANDLE — unbox to
+                    // the raw *LinThreadPool.
+                    let pool = self.unbox_handle(args[0]);
+                    let pool_async_fn = self.get_or_declare_fn("lin_pool_async_one",
+                        ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                    self.builder.call(pool_async_fn, &[pool.into(), thunk.into()], "ir_pool_async").try_as_basic_value().unwrap_basic()
+                } else {
+                    let spawn_fn = self.get_or_declare_fn("lin_async_spawn",
+                        ptr_ty.fn_type(&[ptr_ty.into()], false));
+                    self.builder.call(spawn_fn, &[thunk.into()], "ir_async_spawn").try_as_basic_value().unwrap_basic()
+                };
+                // Box the raw *LinPromise into a TaggedVal*(TAG_PROMISE) so it round-trips
+                // through TypeVar slots and arrays (e.g. race([...])).
+                self.box_promise(raw)
             }
             Intrinsic::Await => {
                 let promise = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                // The promise arrives boxed (TAG_PROMISE); unbox to the raw *LinPromise.
+                let raw = self.unbox_promise(promise);
                 let await_fn = self.get_or_declare_fn("lin_await_promise",
                     ptr_ty.fn_type(&[ptr_ty.into()], false));
-                let tagged = self.builder.call(await_fn, &[promise.into()], "ir_await").try_as_basic_value().unwrap_basic();
+                let tagged = self.builder.call(await_fn, &[raw.into()], "ir_await").try_as_basic_value().unwrap_basic();
                 // Unbox to the (concrete) result type if needed.
                 if !Self::is_union_type(ret_ty) && *ret_ty != Type::Null {
                     self.unbox_tagged_val_to_type(tagged, ret_ty)
@@ -283,51 +301,60 @@ impl<'ctx> Codegen<'ctx> {
                 }
                 ptr_ty.const_null().into()
             }
-            // parallel(tasks): tasks is a boxed array of thunk closures. Run each synchronously
-            // and collect the boxed results into a new tagged array. Mirrors the runtime-path
-            // branch of the AST compile_async_intrinsic.
+            // parallel(tasks): hand the (unboxed) array of thunk closures to the runtime, which
+            // spawns all of them on OS threads then joins in order (order-preserving) and
+            // returns a fresh tagged array of boxed results. A faulting task yields an Error in
+            // its slot. `tasks` arrives boxed (Json-typed param) — unbox to the raw LinArray*.
             Intrinsic::Parallel => {
-                let i64_ty = self.context.i64_type();
                 let tasks = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let arr_unboxed = if tasks.is_pointer_value() {
                     self.builder.call(self.rt.unbox_ptr, &[tasks.into()], "ir_par_arr").try_as_basic_value().unwrap_basic()
                 } else { ptr_ty.const_null().into() };
-                let len_fn = self.get_or_declare_fn("lin_array_length",
-                    i64_ty.fn_type(&[ptr_ty.into()], false));
-                let len = self.builder.call(len_fn, &[arr_unboxed.into()], "ir_par_len").try_as_basic_value().unwrap_basic().into_int_value();
-                let out_arr = self.builder.call(self.rt.array_alloc, &[len.into()], "ir_par_out").try_as_basic_value().unwrap_basic();
-                let get_tagged_fn = self.get_or_declare_fn("lin_array_get_tagged",
-                    ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
-                let push_tagged_fn = self.get_or_declare_fn("lin_array_push_tagged",
-                    self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
-                let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-                let check = self.context.append_basic_block(llvm_fn, "ir_par_check");
-                let body = self.context.append_basic_block(llvm_fn, "ir_par_body");
-                let exit = self.context.append_basic_block(llvm_fn, "ir_par_exit");
-                let i_alloc = self.builder.alloca(i64_ty, "ir_par_i");
-                self.builder.store(i_alloc, i64_ty.const_zero());
-                self.builder.unconditional_branch(check);
-                self.builder.position_at_end(check);
-                let cur = self.builder.load(i64_ty, i_alloc, "ir_par_cur").into_int_value();
-                let cond = self.builder.int_compare(inkwell::IntPredicate::SLT, cur, len, "ir_par_cond");
-                self.builder.conditional_branch(cond, body, exit);
-                self.builder.position_at_end(body);
-                let elem_tv = self.builder.call(get_tagged_fn, &[arr_unboxed.into(), cur.into()], "ir_par_elem").try_as_basic_value().unwrap_basic();
-                // Element is a boxed closure (TaggedVal*); unbox to the closure struct, then
-                // call it via the uniform boxed thunk ABI.
-                let cls = self.builder.call(self.rt.unbox_ptr, &[elem_tv.into()], "ir_par_cls").try_as_basic_value().unwrap_basic();
-                let res = self.call_thunk_value(cls);
-                self.builder.call(push_tagged_fn, &[out_arr.into(), res.into()], "");
-                let next = self.builder.int_add(cur, i64_ty.const_int(1, false), "ir_par_next");
-                self.builder.store(i_alloc, next);
-                self.builder.unconditional_branch(check);
-                self.builder.position_at_end(exit);
-                out_arr
+                let par_fn = self.get_or_declare_fn("lin_parallel",
+                    ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(par_fn, &[arr_unboxed.into()], "ir_parallel").try_as_basic_value().unwrap_basic()
             }
-            // race/timeout/retry — simplified synchronous semantics: return the given
-            // promise/first argument unchanged (matches the AST handler).
-            Intrinsic::Race | Intrinsic::Timeout | Intrinsic::Retry => {
-                args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into())
+            // race(promises): unbox the array, hand to lin_race → first-to-complete promise.
+            Intrinsic::Race => {
+                let promises = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let arr_unboxed = if promises.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[promises.into()], "ir_race_arr").try_as_basic_value().unwrap_basic()
+                } else { ptr_ty.const_null().into() };
+                let race_fn = self.get_or_declare_fn("lin_race",
+                    ptr_ty.fn_type(&[ptr_ty.into()], false));
+                let raw = self.builder.call(race_fn, &[arr_unboxed.into()], "ir_race").try_as_basic_value().unwrap_basic();
+                self.box_promise(raw)
+            }
+            // timeout(promise, ms): lin_timeout(promise, ms) → settled promise (orig value or null).
+            Intrinsic::Timeout => {
+                let i32_ty = self.context.i32_type();
+                let promise = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let ms = args.get(1).copied().unwrap_or_else(|| i32_ty.const_zero().into());
+                let ms_i32 = if ms.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(ms.into_int_value(), i32_ty, "ir_to_ms")
+                } else { i32_ty.const_zero() };
+                let raw_p = self.unbox_promise(promise);
+                let to_fn = self.get_or_declare_fn("lin_timeout",
+                    ptr_ty.fn_type(&[ptr_ty.into(), i32_ty.into()], false));
+                let raw = self.builder.call(to_fn, &[raw_p.into(), ms_i32.into()], "ir_timeout").try_as_basic_value().unwrap_basic();
+                self.box_promise(raw)
+            }
+            // retry(thunk, n): unbox the thunk closure, lin_retry(thunk, n) → settled promise.
+            Intrinsic::Retry => {
+                let i32_ty = self.context.i32_type();
+                let thunk = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let thunk_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
+                let thunk = if Self::is_union_type(&thunk_ty) && thunk.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[thunk.into()], "ir_retry_cls").try_as_basic_value().unwrap_basic()
+                } else { thunk };
+                let n = args.get(1).copied().unwrap_or_else(|| i32_ty.const_int(1, false).into());
+                let n_i32 = if n.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(n.into_int_value(), i32_ty, "ir_retry_n")
+                } else { i32_ty.const_int(1, false) };
+                let retry_fn = self.get_or_declare_fn("lin_retry",
+                    ptr_ty.fn_type(&[ptr_ty.into(), i32_ty.into()], false));
+                let raw = self.builder.call(retry_fn, &[thunk.into(), n_i32.into()], "ir_retry").try_as_basic_value().unwrap_basic();
+                self.box_promise(raw)
             }
             // threadPool(n) → lin_thread_pool_new(n).
             Intrinsic::ThreadPool => {
@@ -336,34 +363,101 @@ impl<'ctx> Codegen<'ctx> {
                 let n_i32 = if n.is_int_value() { n.into_int_value() } else { i32_ty.const_int(2, false) };
                 let pool_fn = self.get_or_declare_fn("lin_thread_pool_new",
                     ptr_ty.fn_type(&[i32_ty.into()], false));
-                self.builder.call(pool_fn, &[n_i32.into()], "ir_pool").try_as_basic_value().unwrap_basic()
+                let raw = self.builder.call(pool_fn, &[n_i32.into()], "ir_pool").try_as_basic_value().unwrap_basic();
+                // Box the raw *LinThreadPool so it round-trips through TypeVar slots / Json params.
+                self.box_handle(raw)
             }
-            // worker(handler, onClose) → lin_worker_new(fn_ptr, env_ptr, has_env). The handler
-            // arrives as a (possibly boxed) closure value.
+            // worker(handler, onClose) → lin_worker_new(h_fn, h_env, h_has, c_fn, c_env, c_has).
+            // Both handler and onClose arrive as (possibly boxed) closure values; extract each
+            // closure's (fn_ptr, env_ptr, has_env). The worker thread keeps the handler env
+            // (thread-confined, §32.6.4) for its lifetime.
             Intrinsic::Worker => {
+                let i8_ty = self.context.i8_type();
                 let handler = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let handler_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
-                let i8_ty = self.context.i8_type();
-                let (fn_ptr, env_ptr, has_env) = if handler.is_pointer_value() {
-                    let cls_ptr = if Self::is_union_type(&handler_ty) {
-                        self.builder.call(self.rt.unbox_ptr, &[handler.into()], "ir_w_cls").try_as_basic_value().unwrap_basic().into_pointer_value()
-                    } else { handler.into_pointer_value() };
-                    let cls_ty = self.closure_struct_type();
-                    let fn_f = self.builder.struct_gep(cls_ty, cls_ptr, 2, "ir_w_fn_f");
-                    let fp = self.builder.load(ptr_ty, fn_f, "ir_w_fn");
-                    let env_f = self.builder.struct_gep(cls_ty, cls_ptr, 3, "ir_w_env_f");
-                    let ep = self.builder.load(ptr_ty, env_f, "ir_w_env");
-                    (fp, ep, i8_ty.const_int(1, false))
-                } else {
-                    (ptr_ty.const_null().into(), ptr_ty.const_null().into(), i8_ty.const_int(0, false))
-                };
+                let (h_fn, h_env, h_has) = self.extract_closure_fields(handler, &handler_ty);
+                let onclose = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let onclose_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                let (c_fn, c_env, c_has) = self.extract_closure_fields(onclose, &onclose_ty);
                 let worker_fn = self.get_or_declare_fn("lin_worker_new",
-                    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), i8_ty.into()], false));
-                self.builder.call(worker_fn, &[fn_ptr.into(), env_ptr.into(), has_env.into()], "ir_worker").try_as_basic_value().unwrap_basic()
+                    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), i8_ty.into(), ptr_ty.into(), ptr_ty.into(), i8_ty.into()], false));
+                let raw = self.builder.call(worker_fn,
+                    &[h_fn.into(), h_env.into(), h_has.into(), c_fn.into(), c_env.into(), c_has.into()],
+                    "ir_worker").try_as_basic_value().unwrap_basic();
+                // Box the raw *LinWorker so it round-trips through TypeVar slots / Json params.
+                self.box_handle(raw)
+            }
+            // shared(v) → lin_shared_new(boxed v) → boxed Shared (TAG_SHARED). v may arrive
+            // concrete; box it so the runtime receives a TaggedVal* to deep-copy in.
+            Intrinsic::SharedNew => {
+                let v = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let v_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
+                let v_boxed = if Self::is_union_type(&v_ty) || v.is_pointer_value() { v } else { self.box_value(v, &v_ty) };
+                let f = self.get_or_declare_fn("lin_shared_new", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(f, &[v_boxed.into()], "ir_shared_new").try_as_basic_value().unwrap_basic()
+            }
+            // get(s) → lin_shared_get(s) → boxed snapshot (unboxed to the concrete result type).
+            Intrinsic::SharedGet => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let f = self.get_or_declare_fn("lin_shared_get", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                let tagged = self.builder.call(f, &[s.into()], "ir_shared_get").try_as_basic_value().unwrap_basic();
+                if !Self::is_union_type(ret_ty) && *ret_ty != Type::Null {
+                    self.unbox_tagged_val_to_type(tagged, ret_ty)
+                } else { tagged }
+            }
+            // set(s, v) → lin_shared_set(s, boxed v) → Null.
+            Intrinsic::SharedSet => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let v = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let v_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                let v_boxed = if Self::is_union_type(&v_ty) || v.is_pointer_value() { v } else { self.box_value(v, &v_ty) };
+                let f = self.get_or_declare_fn("lin_shared_set", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(f, &[s.into(), v_boxed.into()], "ir_shared_set").try_as_basic_value().unwrap_basic()
+            }
+            // withLock(s, f) → lin_shared_with_lock(s, fclosure) → boxed result (unboxed to ret).
+            Intrinsic::SharedWithLock => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                let func = if Self::is_union_type(&func_ty) && func.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[func.into()], "ir_wl_cls").try_as_basic_value().unwrap_basic()
+                } else { func };
+                let f = self.get_or_declare_fn("lin_shared_with_lock", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                let tagged = self.builder.call(f, &[s.into(), func.into()], "ir_shared_wl").try_as_basic_value().unwrap_basic();
+                if !Self::is_union_type(ret_ty) && *ret_ty != Type::Null {
+                    self.unbox_tagged_val_to_type(tagged, ret_ty)
+                } else { tagged }
+            }
+            // frozen(v) → deep immortal seal of v's graph; returns v with its ORIGINAL type
+            // (readers use the plain type transparently). For a concrete heap value (raw
+            // LinArray*/LinObject*/LinString*) we box it just to hand a TaggedVal* to lin_freeze,
+            // which seals the graph in place; we then return the ORIGINAL value `v` unchanged.
+            // For a boxed/union value we freeze it directly and return the same box.
+            Intrinsic::Freeze => {
+                let v = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let v_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
+                let freeze_fn = self.get_or_declare_fn("lin_freeze", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                if Self::is_union_type(&v_ty) {
+                    // Already a boxed TaggedVal* — freeze it and return the same box.
+                    self.builder.call(freeze_fn, &[v.into()], "ir_freeze").try_as_basic_value().unwrap_basic()
+                } else if v.is_pointer_value() {
+                    // Concrete heap value: box transiently to seal the graph, free the transient
+                    // box shell, return the original concrete pointer (its graph is now frozen).
+                    let boxed = self.box_value(v, &v_ty);
+                    self.builder.call(freeze_fn, &[boxed.into()], "ir_freeze");
+                    if boxed.is_pointer_value() {
+                        self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                    }
+                    v
+                } else {
+                    // Scalar: nothing to freeze; return as-is.
+                    v
+                }
             }
             // w.request(msg) → lin_worker_request(w, boxed msg) → result (unboxed if concrete).
             Intrinsic::Request => {
-                let worker = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let worker_boxed = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let worker = self.unbox_handle(worker_boxed);
                 let msg = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let msg_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
                 let msg_ptr = if Self::is_union_type(&msg_ty) || msg.is_pointer_value() { msg } else { self.box_value(msg, &msg_ty) };
@@ -376,7 +470,8 @@ impl<'ctx> Codegen<'ctx> {
             }
             // w.message(msg) → lin_worker_message(w, boxed msg) (void).
             Intrinsic::Message => {
-                let worker = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let worker_boxed = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let worker = self.unbox_handle(worker_boxed);
                 let msg = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let msg_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
                 let msg_ptr = if Self::is_union_type(&msg_ty) || msg.is_pointer_value() { msg } else { self.box_value(msg, &msg_ty) };
@@ -387,7 +482,8 @@ impl<'ctx> Codegen<'ctx> {
             }
             // w.close() → lin_worker_close(w) (void).
             Intrinsic::Close => {
-                let worker = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let worker_boxed = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let worker = self.unbox_handle(worker_boxed);
                 let close_fn = self.get_or_declare_fn("lin_worker_close",
                     self.context.void_type().fn_type(&[ptr_ty.into()], false));
                 self.builder.call(close_fn, &[worker.into()], "");
@@ -511,6 +607,62 @@ impl<'ctx> Codegen<'ctx> {
             }
             _ => ptr_ty.const_null().into(),
         }
+    }
+
+    /// Box a raw `*LinPromise` (from a runtime spawn/combinator) into a TaggedVal*(TAG_PROMISE)
+    /// so it round-trips through TypeVar slots and arrays like any other tagged value.
+    fn box_promise(&mut self, raw: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let f = self.get_or_declare_fn("lin_box_promise", ptr_ty.fn_type(&[ptr_ty.into()], false));
+        self.builder.call(f, &[raw.into()], "ir_box_promise").try_as_basic_value().unwrap_basic()
+    }
+
+    /// Unbox a boxed promise (TAG_PROMISE) back to the raw `*LinPromise` for await/combinators.
+    fn unbox_promise(&mut self, boxed: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let f = self.get_or_declare_fn("lin_unbox_promise", ptr_ty.fn_type(&[ptr_ty.into()], false));
+        self.builder.call(f, &[boxed.into()], "ir_unbox_promise").try_as_basic_value().unwrap_basic()
+    }
+
+    /// Extract `(fn_ptr, env_ptr, has_env)` from a (possibly boxed) closure value. A null/
+    /// non-pointer value yields `(null, null, 0)`. Used by the Worker intrinsic to pull the
+    /// handler and onClose closures apart for the runtime.
+    fn extract_closure_fields(
+        &mut self,
+        cls: BasicValueEnum<'ctx>,
+        cls_ty: &Type,
+    ) -> (BasicValueEnum<'ctx>, BasicValueEnum<'ctx>, BasicValueEnum<'ctx>) {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i8_ty = self.context.i8_type();
+        if !cls.is_pointer_value() {
+            return (ptr_ty.const_null().into(), ptr_ty.const_null().into(), i8_ty.const_zero().into());
+        }
+        let cls_ptr = if Self::is_union_type(cls_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[cls.into()], "ir_cls_unbox").try_as_basic_value().unwrap_basic().into_pointer_value()
+        } else {
+            cls.into_pointer_value()
+        };
+        let cls_struct_ty = self.closure_struct_type();
+        let fn_f = self.builder.struct_gep(cls_struct_ty, cls_ptr, 2, "ir_cls_fn_f");
+        let fp = self.builder.load(ptr_ty, fn_f, "ir_cls_fn");
+        let env_f = self.builder.struct_gep(cls_struct_ty, cls_ptr, 3, "ir_cls_env_f");
+        let ep = self.builder.load(ptr_ty, env_f, "ir_cls_env");
+        (fp, ep, i8_ty.const_int(1, false).into())
+    }
+
+    /// Box an opaque runtime handle (ThreadPool/Worker) as TaggedVal*(TAG_HANDLE) so it
+    /// round-trips through TypeVar slots / Json params like any tagged value.
+    fn box_handle(&mut self, raw: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let f = self.get_or_declare_fn("lin_box_handle", ptr_ty.fn_type(&[ptr_ty.into()], false));
+        self.builder.call(f, &[raw.into()], "ir_box_handle").try_as_basic_value().unwrap_basic()
+    }
+
+    /// Unbox a boxed handle (TAG_HANDLE) back to the raw ThreadPool/Worker pointer.
+    fn unbox_handle(&mut self, boxed: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let f = self.get_or_declare_fn("lin_unbox_handle", ptr_ty.fn_type(&[ptr_ty.into()], false));
+        self.builder.call(f, &[boxed.into()], "ir_unbox_handle").try_as_basic_value().unwrap_basic()
     }
 
     /// Compile a `toString` call on a typed value (used by LinIR intrinsic path).

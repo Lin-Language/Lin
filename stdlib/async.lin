@@ -19,6 +19,9 @@ export val retry = (f: Json, times: Int32): Json =>
 export val threadPool = (size: Int32): Json =>
   lin_thread_pool(size)
 
+export val poolAsync = (pool: Json, f: Json): Json =>
+  lin_pool_async(pool, f)
+
 export val worker = (handler: Json, onClose: Json): Json =>
   lin_worker(handler, onClose)
 
@@ -30,3 +33,22 @@ export val message = (w: Json, msg: Json): Null =>
 
 export val close = (w: Json): Null =>
   lin_close(w)
+
+// Shared<T> — opt-in shared mutable state (ADR-043 §2.3.1). `shared` boxes a private copy;
+// `get` snapshots out, `set` copies in, `withLock` mutates in place under the write lock.
+export val shared = (v: Json): Json =>
+  lin_shared(v)
+
+export val get = (s: Json): Json =>
+  lin_shared_get(s)
+
+export val set = (s: Json, v: Json): Null =>
+  lin_shared_set(s, v)
+
+export val withLock = (s: Json, f: Json): Json =>
+  lin_shared_with_lock(s, f)
+
+// Frozen<T> — opt-in shared READ-ONLY state (ADR-043 §2.3.2). Deep-freezes a transferable
+// graph into an immortal, immutable, lock-free-readable value; readers use the plain type.
+export val frozen = (v: Json): Json =>
+  lin_freeze(v)

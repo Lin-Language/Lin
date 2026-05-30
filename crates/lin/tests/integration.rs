@@ -1936,6 +1936,529 @@ print(toString(reply))
 }
 
 #[test]
+fn test_worker_stateful_var_capture() {
+    // A worker handler may close over `var` (§32.6.4): the accumulator state is confined to
+    // the worker thread and updated across sequential requests. onShutdown sees the final state.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { worker, request, close } from "std/async"
+
+var total = 0
+val acc = worker(
+  n =>
+    total = total + n
+    total,
+  () => print("final ${toString(total)}")
+)
+print(toString(request(acc, 10)))
+print(toString(request(acc, 5)))
+print(toString(request(acc, 100)))
+close(acc)
+"#);
+    assert_eq!(output, vec!["10", "15", "115", "final 115"]);
+}
+
+#[test]
+fn test_worker_message_fire_and_forget() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { worker, request, message, close } from "std/async"
+import { push, length } from "std/array"
+
+var log = []
+val w = worker(
+  n =>
+    push(log, n)
+    length(log),
+  () => null
+)
+message(w, 1)
+message(w, 2)
+val count = request(w, 3)
+close(w)
+print(toString(count))
+"#);
+    assert_eq!(output, vec!["3"]);
+}
+
+#[test]
+fn test_worker_handler_fault_surfaces_error() {
+    // A fault in the worker handler is caught at the boundary and returned as an Error to the
+    // in-flight request (§32.6.5); the program continues.
+    let output = run(r#"import { print } from "std/io"
+import { worker, request, close } from "std/async"
+
+val z = 0
+val w = worker(n => n / z, () => null)
+val r = request(w, 5)
+close(w)
+print(r["type"])
+"#);
+    assert_eq!(output, vec!["error"]);
+}
+
+#[test]
+fn test_worker_send_after_close_errors() {
+    // Sending to a closed worker yields an Error (§32.6.5), not a crash.
+    let output = run(r#"import { print } from "std/io"
+import { worker, request, close } from "std/async"
+
+val w = worker(msg => msg, () => null)
+close(w)
+val r = request(w, 1)
+print(r["type"])
+"#);
+    assert_eq!(output, vec!["error"]);
+}
+
+#[test]
+fn test_stress_high_fanout_parallel() {
+    // High fan-out: 12 capture-less thunks through parallel — exercises the spawn/join +
+    // result-collection machinery. (Larger fan-out via map-returning-closures hits a
+    // pre-existing higher-order limitation unrelated to async, so the array is written out.)
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { parallel } from "std/async"
+import { reduce } from "std/array"
+
+val results = parallel([
+  () => 1, () => 2, () => 3, () => 4, () => 5, () => 6,
+  () => 7, () => 8, () => 9, () => 10, () => 11, () => 12
+])
+print(toString(reduce(results, 0, (a, b) => a + b)))
+"#);
+    // 1+2+...+12 = 78
+    assert_eq!(output, vec!["78"]);
+}
+
+#[test]
+fn test_stress_pool_many_short_tasks() {
+    // Many short tasks on a small pool — exercises queue draining + worker reuse across waves.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { await, threadPool, poolAsync } from "std/async"
+import { push, length } from "std/array"
+import { for, range } from "std/array"
+
+val pool = threadPool(3)
+var promises = []
+range(0, 30).for(i => push(promises, pool.poolAsync(() => 1)))
+var total = 0
+promises.for(p => total = total + await(p))
+print(toString(total))
+"#);
+    assert_eq!(output, vec!["30"]);
+}
+
+#[test]
+fn test_stress_worker_churn() {
+    // Worker churn: spin up and tear down many workers in a loop, each handling one request.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { worker, request, close } from "std/async"
+import { for, range } from "std/array"
+
+var total = 0
+range(0, 30).for(i =>
+  val w = worker(msg => msg + 1, () => null)
+  total = total + request(w, i)
+  close(w)
+)
+print(toString(total))
+"#);
+    // sum of (i+1) for i in 0..29 = sum 1..30 = 465
+    assert_eq!(output, vec!["465"]);
+}
+
+#[test]
+fn test_frozen_concurrent_reads() {
+    // A frozen array read concurrently by many threads — immortal RC makes non-atomic
+    // retain/release no-ops, so reads are race-free without copying or locking.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { frozen, parallel } from "std/async"
+import { length } from "std/array"
+
+val table = frozen([10, 20, 30, 40, 50])
+val results = parallel([
+  () => length(table),
+  () => length(table),
+  () => length(table),
+  () => length(table)
+])
+print(toString(results))
+"#);
+    assert_eq!(output, vec!["[5, 5, 5, 5]"]);
+}
+
+#[test]
+fn test_frozen_object_read() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { frozen } from "std/async"
+
+val config = frozen({ "host": "localhost", "port": 8080 })
+print(toString(config["host"]))
+print(toString(config["port"]))
+"#);
+    assert_eq!(output, vec!["localhost", "8080"]);
+}
+
+#[test]
+fn test_frozen_survives_in_async() {
+    // A frozen value is immortal and shared by reference into the thunk; both the worker and
+    // the parent read it correctly.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { frozen, async, await } from "std/async"
+import { length } from "std/array"
+
+val data = frozen([1, 2, 3])
+val p = async(() => length(data))
+print(toString(await(p)))
+print(toString(length(data)))
+"#);
+    assert_eq!(output, vec!["3", "3"]);
+}
+
+#[test]
+fn test_shared_get_set() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { shared, get, set } from "std/async"
+
+val s = shared([4, 5, 6])
+print(toString(get(s)))
+set(s, [7, 8, 9])
+print(toString(get(s)))
+"#);
+    assert_eq!(output, vec!["[4, 5, 6]", "[7, 8, 9]"]);
+}
+
+#[test]
+fn test_shared_withlock_in_place_mutate() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { shared, get, withLock } from "std/async"
+import { push, length } from "std/array"
+
+val arr = shared([1, 2, 3])
+withLock(arr, a => push(a, 4))
+print(toString(length(withLock(arr, a => a))))
+print(toString(get(arr)))
+"#);
+    assert_eq!(output, vec!["4", "[1, 2, 3, 4]"]);
+}
+
+#[test]
+fn test_shared_escape_returns_copy() {
+    // A value returned out of withLock is a COPY: mutating it does not affect the box.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { shared, get, withLock } from "std/async"
+import { push } from "std/array"
+
+val arr = shared([1, 2, 3])
+val leaked = withLock(arr, a => a)
+push(leaked, 999)
+print(toString(get(arr)))
+"#);
+    assert_eq!(output, vec!["[1, 2, 3]"]);
+}
+
+#[test]
+fn test_shared_concurrent_withlock_no_lost_updates() {
+    // N threads each push to a shared array under the write lock → all updates land.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { shared, get, withLock, parallel } from "std/async"
+import { push, length } from "std/array"
+
+val box = shared([])
+val tasks = parallel([
+  () => withLock(box, a => push(a, 1)),
+  () => withLock(box, a => push(a, 1)),
+  () => withLock(box, a => push(a, 1)),
+  () => withLock(box, a => push(a, 1)),
+  () => withLock(box, a => push(a, 1)),
+  () => withLock(box, a => push(a, 1))
+])
+print(toString(length(get(box))))
+"#);
+    assert_eq!(output, vec!["6"]);
+}
+
+#[test]
+fn test_async_real_parallelism() {
+    // Two thunks that each sleep 150ms. With real OS threads the wall-clock should be
+    // ~150ms (overlap), not ~300ms (sequential). Assert it completed well under the
+    // sequential bound — generous to avoid CI flakiness, but still proves overlap.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await } from "std/async"
+import { sleep, now } from "std/time"
+
+val start = now()
+val p1 = async(() =>
+  sleep(150)
+  1
+)
+val p2 = async(() =>
+  sleep(150)
+  2
+)
+val r1 = await(p1)
+val r2 = await(p2)
+val elapsed = now() - start
+print(toString(r1 + r2))
+if elapsed < 250 then print("PARALLEL") else print("SEQUENTIAL")
+"#);
+    assert_eq!(output, vec!["3", "PARALLEL"],
+        "two 150ms thunks should overlap (real threads), completing in <250ms");
+}
+
+#[test]
+fn test_async_fault_isolation_div_by_zero() {
+    // A runtime fault (division by zero) inside an async thunk must be caught at the thread
+    // boundary and surface as an Error value at await — the program continues (spec §32.2.2),
+    // it does not abort.
+    let output = run(r#"import { print } from "std/io"
+import { async, await } from "std/async"
+
+val z = 0
+val p = async(() => 42 / z)
+val r = await(p)
+print(r["type"])
+print("continued")
+"#);
+    assert_eq!(output, vec!["error", "continued"]);
+}
+
+#[test]
+fn test_async_fault_isolation_oob() {
+    // Array out-of-bounds inside a thunk is likewise caught as an Error at await.
+    let output = run(r#"import { print } from "std/io"
+import { async, await } from "std/async"
+
+val arr = [1, 2, 3]
+val p = async(() => arr[99])
+val r = await(p)
+print(r["type"])
+print("ok")
+"#);
+    assert_eq!(output, vec!["error", "ok"]);
+}
+
+#[test]
+fn test_async_string_capture_transferred() {
+    // A captured String val must be deep-copied across the thread boundary and usable there.
+    let output = run(r#"import { print } from "std/io"
+import { async, await } from "std/async"
+
+val name = "world"
+val p = async(() => "hello ${name}")
+print(await(p))
+"#);
+    assert_eq!(output, vec!["hello world"]);
+}
+
+#[test]
+fn test_pool_async_parallel() {
+    // 4 tasks of 100ms on a 4-worker pool overlap → ~100ms wall-clock, not 400ms.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { await, threadPool, poolAsync } from "std/async"
+import { sleep, now } from "std/time"
+
+val pool = threadPool(4)
+val start = now()
+val p1 = pool.poolAsync(() =>
+  sleep(100)
+  1
+)
+val p2 = pool.poolAsync(() =>
+  sleep(100)
+  2
+)
+val p3 = pool.poolAsync(() =>
+  sleep(100)
+  3
+)
+val p4 = pool.poolAsync(() =>
+  sleep(100)
+  4
+)
+val sum = await(p1) + await(p2) + await(p3) + await(p4)
+val elapsed = now() - start
+print(toString(sum))
+if elapsed < 300 then print("PARALLEL") else print("SLOW")
+"#);
+    assert_eq!(output, vec!["10", "PARALLEL"]);
+}
+
+#[test]
+fn test_pool_bounds_concurrency() {
+    // 4 tasks of 80ms on a 2-worker pool run in 2 waves → ~160ms (bounded), not ~80ms.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { await, threadPool, poolAsync } from "std/async"
+import { sleep, now } from "std/time"
+
+val pool = threadPool(2)
+val start = now()
+val a = pool.poolAsync(() =>
+  sleep(80)
+  1
+)
+val b = pool.poolAsync(() =>
+  sleep(80)
+  1
+)
+val c = pool.poolAsync(() =>
+  sleep(80)
+  1
+)
+val d = pool.poolAsync(() =>
+  sleep(80)
+  1
+)
+val total = await(a) + await(b) + await(c) + await(d)
+val elapsed = now() - start
+print(toString(total))
+if elapsed >= 140 then print("BOUNDED") else print("UNBOUNDED")
+"#);
+    assert_eq!(output, vec!["4", "BOUNDED"]);
+}
+
+#[test]
+fn test_pool_async_fault_isolation() {
+    let output = run(r#"import { print } from "std/io"
+import { await, threadPool, poolAsync } from "std/async"
+
+val pool = threadPool(2)
+val z = 0
+val p = pool.poolAsync(() => 1 / z)
+val r = await(p)
+print(r["type"])
+"#);
+    assert_eq!(output, vec!["error"]);
+}
+
+#[test]
+fn test_race_first_wins() {
+    let output = run(r#"import { print } from "std/io"
+import { async, await, race } from "std/async"
+import { sleep } from "std/time"
+
+val winner = await(race([
+  async(() =>
+    sleep(200)
+    "slow"
+  ),
+  async(() =>
+    sleep(10)
+    "fast"
+  )
+]))
+print(winner)
+"#);
+    assert_eq!(output, vec!["fast"]);
+}
+
+#[test]
+fn test_timeout_expires_to_null() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await, timeout } from "std/async"
+import { sleep } from "std/time"
+
+val slow = async(() =>
+  sleep(300)
+  "done"
+)
+val r = await(timeout(slow, 30))
+print(toString(r))
+"#);
+    assert_eq!(output, vec!["null"]);
+}
+
+#[test]
+fn test_timeout_completes_in_time() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await, timeout } from "std/async"
+
+val quick = async(() => 99)
+val r = await(timeout(quick, 5000))
+print(toString(r))
+"#);
+    assert_eq!(output, vec!["99"]);
+}
+
+#[test]
+fn test_retry_succeeds_first_try() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await, retry } from "std/async"
+
+val p = retry(() => 7, 3)
+print(toString(await(p)))
+"#);
+    assert_eq!(output, vec!["7"]);
+}
+
+#[test]
+fn test_retry_all_fail_returns_error() {
+    let output = run(r#"import { print } from "std/io"
+import { async, await, retry } from "std/async"
+
+val z = 0
+val p = retry(() => 1 / z, 3)
+val r = await(p)
+print(r["type"])
+"#);
+    assert_eq!(output, vec!["error"]);
+}
+
+#[test]
+fn test_parallel_preserves_order_with_sleep() {
+    // Tasks finish in reverse order of submission, but results must stay in submission order.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { parallel } from "std/async"
+import { sleep } from "std/time"
+
+val rs = parallel([
+  () =>
+    sleep(120)
+    1,
+  () =>
+    sleep(60)
+    2,
+  () =>
+    sleep(10)
+    3
+])
+print(toString(rs))
+"#);
+    assert_eq!(output, vec!["[1, 2, 3]"]);
+}
+
+#[test]
+fn test_async_captures_function_value_runs() {
+    // A thunk capturing a function value (CAP_OPAQUE env) runs inline as a sound fallback.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await } from "std/async"
+
+val double = (x: Int32): Int32 => x * 2
+val p = async(() => double(21))
+print(toString(await(p)))
+"#);
+    assert_eq!(output, vec!["42"]);
+}
+
+#[test]
 fn test_iterator_restart() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"

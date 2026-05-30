@@ -1814,6 +1814,9 @@ fn lower_intrinsic_call(
         "lin_array_allocate_filled" => Intrinsic::ArrayAllocateFilled,
         "concat" => Intrinsic::Concat,
         "lin_async" => Intrinsic::Async,
+        // pool.poolAsync(f) → lin_pool_async(pool, f): same intrinsic as async, but the 2-arg
+        // form routes to the bounded thread pool (codegen's Async branch detects the pool arg).
+        "lin_pool_async" => Intrinsic::Async,
         "lin_await" => Intrinsic::Await,
         "lin_exit" => Intrinsic::Exit,
         "lin_parallel" => Intrinsic::Parallel,
@@ -1821,6 +1824,11 @@ fn lower_intrinsic_call(
         "lin_timeout" => Intrinsic::Timeout,
         "lin_retry" => Intrinsic::Retry,
         "lin_thread_pool" => Intrinsic::ThreadPool,
+        "lin_shared" => Intrinsic::SharedNew,
+        "lin_shared_get" => Intrinsic::SharedGet,
+        "lin_shared_set" => Intrinsic::SharedSet,
+        "lin_shared_with_lock" => Intrinsic::SharedWithLock,
+        "lin_freeze" => Intrinsic::Freeze,
         "lin_worker" => Intrinsic::Worker,
         "lin_request" => Intrinsic::Request,
         "lin_message" => Intrinsic::Message,
