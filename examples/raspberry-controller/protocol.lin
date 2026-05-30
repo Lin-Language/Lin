@@ -2,41 +2,29 @@
 // and the client's `encode` (client/src/main.rs).
 //
 // The wire format is an 8-byte UDP control packet: two big-endian IEEE-754 f32
-// motor speeds (left, right), each clamped to [-1.0, 1.0].
+// motor speeds (left, right). The server decodes each f32, WIDENS it to f64, and
+// clamps to [-1.0, 1.0] — `parse_packet` returns `(f64, f64)`. This port mirrors
+// that exactly: the wire values are f32, the decoded speeds are Float64.
 //
 // Stdlib used:
 //   std/bytes  — f32ToBe / f32FromBe (big-endian f32 (de)serialization)
-//   std/number — toFloat32 (build the Float32 wire values / clamp bounds)
-//   std/array  — concat (preserves flat UInt8[]), length
-//
-// NOTE on the Float32 domain: f32FromBe returns a Float32, and Lin's codegen
-// does not currently widen a Float32 into a Float64 across a call/binary-op
-// boundary (only at a box boundary). The wire format is genuinely f32, so this
-// port stays entirely in Float32: speeds parse, clamp, and round-trip as
-// Float32 — exactly the IEEE-754 single-precision values that go on the wire.
-// This matches stdlib/bytes.test.lin, which also compares f32 to f32 throughout.
+//   std/number — toFloat32 (narrow a Float64 speed to the f32 wire value)
+//   std/math   — clamp (Float64 clamp, matching Rust f64::clamp)
+//   std/array  — concat (preserves flat UInt8[])
 
 import { toFloat32 } from "std/number"
 import { f32ToBe, f32FromBe } from "std/bytes"
 import { concat } from "std/array"
+import { clamp } from "std/math"
 
-// Clamp bounds as Float32 (the wire domain).
-val ONE: Float32 = toFloat32(1.0)
-val NEG_ONE: Float32 = toFloat32(0.0 - 1.0)
-
-// Clamp a Float32 speed to [-1, 1]. Pure Float32 comparison (mirrors Rust
-// f64::clamp, but in the single-precision domain the wire actually uses).
-export val clampSpeed = (v: Float32): Float32 =>
-  if v > ONE then ONE
-  else if v < NEG_ONE then NEG_ONE
-  else v
-
-// Decode the 8-byte packet into a [left, right] speed pair, clamped to [-1, 1].
-// Mirrors Rust parse_packet: f32::from_be_bytes(buf[0..4]), clamped.
-export val parsePacket = (buf: UInt8[]): Float32[] =>
+// Decode the 8-byte packet into a [left, right] Float64 speed pair, clamped to
+// [-1, 1]. Mirrors Rust parse_packet: `f32::from_be_bytes(buf[0..4]) as f64`,
+// then `.clamp(-1.0, 1.0)`. f32FromBe yields a Float32 that widens to Float64
+// for the clamp — exactly the Rust `as f64`.
+export val parsePacket = (buf: UInt8[]): Float64[] =>
   [
-    clampSpeed(f32FromBe(buf, 0)),
-    clampSpeed(f32FromBe(buf, 4))
+    clamp(f32FromBe(buf, 0), 0.0 - 1.0, 1.0),
+    clamp(f32FromBe(buf, 4), 0.0 - 1.0, 1.0)
   ]
 
 // Encode a [left, right] speed pair into the 8-byte packet. Mirrors the client's

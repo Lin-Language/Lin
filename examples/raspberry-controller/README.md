@@ -66,12 +66,6 @@ small NALs, FU-A fragmentation at 1200 bytes for large ones (`rtp.packetize`).
 
 ## Simplifications you should know about
 
-- **Float domain.** The wire format is genuinely IEEE-754 `f32`, and Lin's codegen
-  does not currently widen a `Float32` into a `Float64` across a call/operator
-  boundary, so `protocol.lin` stays entirely in `Float32` (`clampSpeed`,
-  `parsePacket` return `Float32`). This matches `stdlib/bytes.test.lin`, which also
-  keeps f32 values in the f32 domain. Test values (1.0, 0.5, 0.25, …) are exact in
-  f32, so equality comparisons are safe.
 - **NAL parser is whole-buffer, not stateful.** The Rust `NalParser` buffers bytes
   across `push()` calls (an `in_nal` flag carrying a partial NAL forward).
   `nal.lin` is a pure whole-buffer parser: `parseNals(buf)` returns the complete
@@ -116,7 +110,7 @@ its `demo()`.
 
 | Module | stdlib |
 | --- | --- |
-| `protocol.lin` | `std/bytes` (`f32ToBe`/`f32FromBe`), `std/number` (`toFloat32`), `std/array` (`concat`) |
+| `protocol.lin` | `std/bytes` (`f32ToBe`/`f32FromBe`), `std/number` (`toFloat32`), `std/math` (`clamp`), `std/array` (`concat`) |
 | `motor.lin` | `std/math` (`clamp`/`round`/`abs`), `std/number` (`toInt32`) |
 | `nal.lin` | `std/array` (`slice`/`length`/`push`) |
 | `rtp.lin` | `std/bytes` (`u16ToBe`/`u32ToBe`), `std/array` (`concat`/`slice`/`length`/`push`), `std/number` (`toUInt8`) |
