@@ -2527,7 +2527,7 @@ counter.for(i => print(toString(i)))
 
 #[test]
 fn test_fs_write_read_roundtrip() {
-    let tmp = std::env::temp_dir().join("lin_ctest_rw.txt");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_rw_{}.txt", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let path = tmp.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
@@ -2543,7 +2543,7 @@ print(content)
 
 #[test]
 fn test_fs_append_file() {
-    let tmp = std::env::temp_dir().join("lin_ctest_append.txt");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_append_{}.txt", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let path = tmp.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
@@ -2560,7 +2560,7 @@ print(content)
 
 #[test]
 fn test_fs_exists() {
-    let tmp = std::env::temp_dir().join("lin_ctest_exists.txt");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_exists_{}.txt", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let path = tmp.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
@@ -2588,7 +2588,7 @@ print(result["type"])
 
 #[test]
 fn test_fs_read_lines() {
-    let tmp = std::env::temp_dir().join("lin_ctest_lines.txt");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_lines_{}.txt", std::process::id()));
     let _ = fs::remove_file(&tmp);
     fs::write(&tmp, "alpha\nbeta\ngamma\n").unwrap();
     let path = tmp.display().to_string();
@@ -2608,7 +2608,7 @@ print(lines[2])
 
 #[test]
 fn test_fs_read_write_json() {
-    let tmp = std::env::temp_dir().join("lin_ctest_json.json");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_json_{}.json", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let path = tmp.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
@@ -2627,7 +2627,7 @@ print(toString(loaded["version"]))
 
 #[test]
 fn test_fs_is_file() {
-    let tmp = std::env::temp_dir().join("lin_ctest_isfile.txt");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_isfile_{}.txt", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let path = tmp.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
@@ -2660,7 +2660,7 @@ print(toString(isFile("{dir_path}")))
 
 #[test]
 fn test_fs_stat() {
-    let tmp = std::env::temp_dir().join("lin_ctest_stat.txt");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_stat_{}.txt", std::process::id()));
     let _ = fs::remove_file(&tmp);
     let path = tmp.display().to_string();
     fs::write(&tmp, "hello lin").unwrap();
@@ -2690,7 +2690,7 @@ print(s["type"])
 
 #[test]
 fn test_fs_list_dir() {
-    let tmp_dir = std::env::temp_dir().join("lin_ctest_listdir");
+    let tmp_dir = std::env::temp_dir().join(format!("lin_ctest_listdir_{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp_dir);
     fs::create_dir_all(&tmp_dir).unwrap();
     fs::write(tmp_dir.join("a.txt"), "").unwrap();
@@ -2721,7 +2721,7 @@ print(result["type"])
 
 #[test]
 fn test_fs_mkdir() {
-    let tmp_dir = std::env::temp_dir().join("lin_ctest_mkdir");
+    let tmp_dir = std::env::temp_dir().join(format!("lin_ctest_mkdir_{}", std::process::id()));
     let _ = fs::remove_dir_all(&tmp_dir);
     let dir_path = tmp_dir.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
@@ -2740,8 +2740,9 @@ print(toString(after))
 
 #[test]
 fn test_fs_mkdir_all() {
-    let tmp_dir = std::env::temp_dir().join("lin_ctest_mkdirall").join("a").join("b");
-    let _ = fs::remove_dir_all(std::env::temp_dir().join("lin_ctest_mkdirall"));
+    let root = std::env::temp_dir().join(format!("lin_ctest_mkdirall_{}", std::process::id()));
+    let tmp_dir = root.join("a").join("b");
+    let _ = fs::remove_dir_all(&root);
     let dir_path = tmp_dir.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
@@ -2750,13 +2751,13 @@ import {{ mkdir, isDir }} from "std/fs"
 mkdir("{dir_path}", {{ "parents": true }})
 print(toString(isDir("{dir_path}")))
 "#));
-    let _ = fs::remove_dir_all(std::env::temp_dir().join("lin_ctest_mkdirall"));
+    let _ = fs::remove_dir_all(&root);
     assert_eq!(output, vec!["true"]);
 }
 
 #[test]
 fn test_fs_delete_file() {
-    let tmp = std::env::temp_dir().join("lin_ctest_deletefile.txt");
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_deletefile_{}.txt", std::process::id()));
     fs::write(&tmp, "hello").unwrap();
     let path = tmp.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
@@ -2786,8 +2787,8 @@ print(result["type"])
 
 #[test]
 fn test_fs_rename() {
-    let src = std::env::temp_dir().join("lin_ctest_rename_src.txt");
-    let dst = std::env::temp_dir().join("lin_ctest_rename_dst.txt");
+    let src = std::env::temp_dir().join(format!("lin_ctest_rename_src_{}.txt", std::process::id()));
+    let dst = std::env::temp_dir().join(format!("lin_ctest_rename_dst_{}.txt", std::process::id()));
     let _ = fs::remove_file(&src);
     let _ = fs::remove_file(&dst);
     fs::write(&src, "hello rename").unwrap();

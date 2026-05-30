@@ -20,7 +20,7 @@ pub struct LinString {
 /// layout change (the `LinString` layout is pinned by codegen — refcount:u32, len:u32, data), we
 /// mark it immortal by setting its refcount into the top of the u32 range.
 ///
-/// SAFETY CONTRACT (single-threaded runtime — async "operates synchronously", no real threads):
+/// SAFETY CONTRACT (sound under real OS-thread concurrency — async is genuine threading, ADR-042/043):
 ///   * `lin_string_release` returns early (before the underflow `debug_assert!` and before
 ///     decrementing) when `refcount >= IMMORTAL_RC`, so an interned literal is never freed even
 ///     when a container that holds it is dropped.
@@ -42,8 +42,16 @@ thread_local! {
     /// `LinString` once (copying the bytes, refcount = IMMORTAL_RC) and caches it; subsequent calls
     /// return the same pointer. Net: one allocation per distinct literal per run.
     ///
-    /// Single-threaded: a `thread_local!` `RefCell` is sufficient and avoids any locking on the hot
-    /// path. (The scalar-box cache in tagged.rs is a compile-time `static` because TaggedVals are
+    /// Thread-safe without any locking: because the cache is `thread_local!`, each thread interns
+    /// into its OWN map — there is no shared map for concurrent threads to race on, so a plain
+    /// `RefCell` is sufficient on the hot path. Interned strings are immortal (refcount =
+    /// IMMORTAL_RC) and immutable; both retain (`lin_string_inc_ref`) and release
+    /// (`lin_string_release`) no-op on them. So even though an immortal literal POINTER can escape
+    /// its originating thread (e.g. `transfer::clone_string` passes immortal strings through by
+    /// pointer instead of deep-copying), sharing it across threads is benign: nothing ever mutates
+    /// its bytes or refcount — the same safety basis as `Frozen<T>`. Two threads may each intern
+    /// distinct boxes for the same literal, which only wastes a little memory.
+    /// (The scalar-box cache in tagged.rs is a compile-time `static` because TaggedVals are
     /// plain data; literals need a runtime map because the byte data lives in the compiled module,
     /// keyed by a pointer only known at run time.)
     static LITERAL_CACHE: RefCell<HashMap<(usize, u32), *mut LinString>> = RefCell::new(HashMap::new());
