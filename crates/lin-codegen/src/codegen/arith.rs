@@ -263,6 +263,9 @@ impl<'ctx> Codegen<'ctx> {
         let box_rhs = |s: &mut Self, v: BasicValueEnum<'ctx>| -> BasicValueEnum<'ctx> {
             if Self::is_union_type(rty) { v } else { s.box_value(v, rty) }
         };
+        let box_lhs = |s: &mut Self, v: BasicValueEnum<'ctx>| -> BasicValueEnum<'ctx> {
+            if Self::is_union_type(lty) { v } else { s.box_value(v, lty) }
+        };
         // Mixed int/float arithmetic (e.g. `5 + 3.0`): widen the integer operand to float
         // so both sides agree, and dispatch on the float type. The checker permits these
         // numeric combinations without inserting explicit Coerce nodes on both operands.
@@ -322,6 +325,50 @@ impl<'ctx> Codegen<'ctx> {
                 let lext = if lw < wide.get_bit_width() { ext(self, lv, lty) } else { lv };
                 let rext = if rw < wide.get_bit_width() { ext(self, rv, rty) } else { rv };
                 return self.compile_binary_op_values(lext, rext, op, wide_ty, wide_ty, result_ty);
+            }
+        }
+        // Equality / ordering where EITHER operand is a boxed union (Json/TypeVar). These
+        // must be ORDER-SYMMETRIC: `lit == proj` and `proj == lit` have to agree. The boxed
+        // operand is a TaggedVal* whose representation differs from a concrete value (e.g. a
+        // raw `LinString*` literal, or an i64), so routing through the typed `compile_eq` /
+        // `compile_cmp` would misread it (it dispatches on the static `lty` and calls
+        // `lin_string_eq`/etc. expecting a raw pointer). Instead box BOTH sides by their
+        // STATIC type (a no-op for the already-boxed union side) and dispatch via the tagged
+        // runtime ops, which tolerate boxed/null payloads of mixed shapes. The earlier
+        // lhs-only branch below handled `proj == lit` but not `lit == proj` — that asymmetry
+        // produced order-dependent string equality for boxed-key projections.
+        if matches!(op, BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq)
+            && ((Self::is_union_type(lty) && lv.is_pointer_value())
+                || (Self::is_union_type(rty) && rv.is_pointer_value()))
+        {
+            let lv_tagged = box_lhs(self, lv);
+            let rv_tagged = box_rhs(self, rv);
+            match op {
+                BinOp::Eq | BinOp::NotEq => {
+                    let i8_ty = self.context.i8_type();
+                    let eq_fn = self.get_or_declare_fn("lin_tagged_eq",
+                        i8_ty.fn_type(
+                            &[self.context.ptr_type(AddressSpace::default()).into(),
+                              self.context.ptr_type(AddressSpace::default()).into()], false));
+                    let eq_u8 = self.builder.call(eq_fn, &[lv_tagged.into(), rv_tagged.into()], "ir_teq").try_as_basic_value().unwrap_basic().into_int_value();
+                    let eq = self.builder.int_truncate(eq_u8, self.context.bool_type(), "ir_teq_b");
+                    return if matches!(op, BinOp::NotEq) {
+                        self.builder.not(eq, "ir_tne").into()
+                    } else { eq.into() };
+                }
+                _ => {
+                    let i32_ty = self.context.i32_type();
+                    let ptr_t = self.context.ptr_type(AddressSpace::default());
+                    let cmp_fn = self.get_or_declare_fn("lin_tagged_cmp",
+                        i32_ty.fn_type(&[ptr_t.into(), ptr_t.into()], false));
+                    let ord = self.builder.call(cmp_fn, &[lv_tagged.into(), rv_tagged.into()], "ir_tcmp").try_as_basic_value().unwrap_basic().into_int_value();
+                    let zero = i32_ty.const_zero();
+                    let pred = match op {
+                        BinOp::Lt => IntPredicate::SLT, BinOp::LtEq => IntPredicate::SLE,
+                        BinOp::Gt => IntPredicate::SGT, _ => IntPredicate::SGE,
+                    };
+                    return self.builder.int_compare(pred, ord, zero, "ir_tcmp_b").into();
+                }
             }
         }
         // When operands are boxed (Json/union), use tagged runtime ops for equality and

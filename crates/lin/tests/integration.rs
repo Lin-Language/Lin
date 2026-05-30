@@ -4704,3 +4704,56 @@ main()
 "#);
     assert_eq!(out, vec!["done"]);
 }
+
+// Regression: `==` against a boxed-key projection operand was ORDER-DEPENDENT. Inside a
+// for/map callback, `m[k]` (with `k` the boxed callback param) is a boxed-Json projection,
+// not a raw value. `compile_eq` dispatched on the static operand type and called
+// `lin_string_eq`/etc. expecting a raw pointer, so it misread the box: `m[k] == "abc"` was
+// true but `"abc" == m[k]` was FALSE. The fix routes BOTH orderings through the tagged
+// runtime ops (lin_tagged_eq) when either operand is a boxed union, boxing the concrete
+// side — so the comparison is symmetric. This silently broke `schema[k]["type"] == "string"`
+// validation.
+#[test]
+fn eq_boxed_key_projection_is_order_symmetric() {
+    // String: boxed-key projection vs literal, both orderings.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/array"
+val m = { "host": "abc" }
+["host"].for(k =>
+  print(toString(m[k] == "abc"))
+  print(toString("abc" == m[k]))
+  print(toString(m[k] == "nope"))
+  print(toString("nope" == m[k]))
+)
+"#);
+    assert_eq!(out, vec!["true", "true", "false", "false"]);
+
+    // Int: boxed-key projection vs literal, both orderings.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/array"
+val m = { "n": 42 }
+["n"].for(k =>
+  print(toString(m[k] == 42))
+  print(toString(42 == m[k]))
+  print(toString(m[k] == 7))
+  print(toString(7 == m[k]))
+)
+"#);
+    assert_eq!(out, vec!["true", "true", "false", "false"]);
+
+    // Nested projection-in-closure config-validation shape: sch[k]["type"] == "string"
+    // compared both orderings (and `!=`).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for } from "std/array"
+val sch = { "host": { "type": "string" }, "port": { "type": "number" } }
+["host", "port"].for(k =>
+  print(toString(sch[k]["type"] == "string"))
+  print(toString("string" == sch[k]["type"]))
+  print(toString(sch[k]["type"] != "string"))
+)
+"#);
+    assert_eq!(out, vec!["true", "true", "false", "false", "false", "true"]);
+}
