@@ -2061,14 +2061,16 @@ print(toString(line))
 fn test_http_fetch_json() {
     use std::thread;
     use std::time::Duration;
-    let port: u16 = 19200;
+    // Bind on the test thread to an OS-assigned ephemeral port (port 0) so concurrent
+    // test runs can never collide on a fixed port. Reading the port back after the bind
+    // also guarantees the listener is open before the client runs — no startup sleep race.
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let port = server.server_addr().to_ip().unwrap().port();
     thread::spawn(move || {
-        let server = tiny_http::Server::http(format!("0.0.0.0:{}", port)).unwrap();
         if let Ok(Some(req)) = server.recv_timeout(Duration::from_secs(10)) {
             let _ = req.respond(tiny_http::Response::from_string(r#"{"value": 42}"#));
         }
     });
-    thread::sleep(Duration::from_millis(100));
     let output = run(&format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
 

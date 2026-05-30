@@ -23,7 +23,16 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     pub(crate) fn compile_string_lit(&self, s: &str) -> BasicValueEnum<'ctx> {
-        // Create a global constant for the byte data, then call lin_string_from_bytes.
+        // String literals are compile-time constants. Emit the byte data as a global constant and
+        // intern it at runtime via lin_string_literal: the first evaluation allocates one immortal
+        // LinString for that @str_data global, every later evaluation returns the cached pointer.
+        // This removes the per-occurrence malloc+memcpy (and the matching release) that the old
+        // lin_string_from_bytes path incurred — brutal in hot loops with constant object keys.
+        //
+        // All callers of compile_string_lit pass genuine compile-time literals (string-literal
+        // expressions, object/match keys, panic messages, the "[object]" fallback), so interning is
+        // always correct. Dynamic strings (concat results, interpolation parts, fs reads, etc.) do
+        // NOT route through here — they keep using lin_string_from_bytes.
         let bytes = s.as_bytes();
         let byte_array_type = self.context.i8_type().array_type(bytes.len() as u32);
         let const_bytes: Vec<_> = bytes
@@ -39,7 +48,7 @@ impl<'ctx> Codegen<'ctx> {
         let len = self.context.i32_type().const_int(bytes.len() as u64, false);
 
         self.builder
-            .build_call(self.rt.string_from_bytes, &[ptr.into(), len.into()], "str")
+            .build_call(self.rt.string_literal, &[ptr.into(), len.into()], "str")
             .unwrap()
             .try_as_basic_value()
             .unwrap_basic()
