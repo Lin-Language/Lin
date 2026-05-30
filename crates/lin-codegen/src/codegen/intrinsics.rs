@@ -498,15 +498,7 @@ impl<'ctx> Codegen<'ctx> {
                     let val_ty = arg_tys.get(2).cloned().unwrap_or(Type::Null);
                     let obj_ptr = self.ir_as_raw_ptr(args[0], &obj_ty);
                     let key_ptr = self.ir_as_raw_ptr(args[1], &key_ty);
-                    let val_is_fresh_box = !Self::is_union_type(&val_ty);
-                    let val_tagged = if val_is_fresh_box {
-                        self.box_value(args[2], &val_ty)
-                    } else { args[2] };
-                    self.builder.call(self.rt.object_set,
-                        &[obj_ptr.into(), key_ptr.into(), val_tagged.into()], "");
-                    if val_is_fresh_box && val_tagged.is_pointer_value() {
-                        self.builder.call(self.rt.tagged_release, &[val_tagged.into()], "");
-                    }
+                    self.emit_object_set(obj_ptr, key_ptr, args[2], &val_ty);
                 }
                 ptr_ty.const_null().into()
             }
@@ -515,20 +507,11 @@ impl<'ctx> Codegen<'ctx> {
                 if args.len() >= 3 {
                     let arr_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
                     let val_ty = arg_tys.get(2).cloned().unwrap_or(Type::Null);
-                    let i64_ty = self.context.i64_type();
-                    let void_ty = self.context.void_type();
                     let arr_ptr = if Self::is_union_type(&arr_ty) {
                         self.builder.call(self.rt.unbox_ptr, &[args[0].into()], "set_arr").try_as_basic_value().unwrap_basic()
                     } else { args[0] };
                     let idx_i64 = self.index_value_to_i64(args[1]);
-                    let elem_tagged = if Self::is_union_type(&val_ty) {
-                        args[2]
-                    } else {
-                        self.box_value(args[2], &val_ty)
-                    };
-                    let set_fn = self.get_or_declare_fn("lin_array_set",
-                        void_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
-                    self.builder.call(set_fn, &[arr_ptr.into(), idx_i64.into(), elem_tagged.into()], "");
+                    self.emit_array_set(arr_ptr, idx_i64, args[2], &val_ty);
                 }
                 ptr_ty.const_null().into()
             }

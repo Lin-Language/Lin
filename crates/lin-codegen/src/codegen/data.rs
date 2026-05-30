@@ -241,30 +241,64 @@ impl<'ctx> Codegen<'ctx> {
         self.unbox_tagged_val_to_type(tagged, result_ty)
     }
 
-    /// `object[key] = value` for the IR path. Mirrors the AST `compile_index_set`:
-    /// dispatch on the object's static type; for Json/union objects, dispatch at
-    /// runtime on the value's LLVM kind (pointer key ⇒ object set, int key ⇒ array set),
-    /// unboxing the boxed container first.
-    pub(crate) fn compile_ir_index_set(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, val_ty: &Type) {
+    /// Store `value` into an object: `lin_object_set(obj_ptr, key_ptr, box(value))`.
+    /// `obj_ptr`/`key_ptr` must already be RAW (unboxed) `LinObject*`/`LinString*`.
+    ///
+    /// A concrete value is heap-boxed; a union value (already a `TaggedVal*` under the
+    /// uniform ABI) is passed straight through. `lin_object_set` copies the 16-byte
+    /// TaggedVal and RETAINS its inner payload, so for a fresh box we release it afterwards
+    /// (undoing the box's own +0, freeing the shell) — net codegen effect on the inner is
+    /// zero; the slot's single reference is supplied by the IR `transfer_into_container`
+    /// emitted in `IndexSet`/`ObjectSetDyn` lowering. Shared by `compile_ir_index_set` and
+    /// `Intrinsic::ObjectSetDyn` so the two paths can never drift (the historical RC-bug
+    /// source).
+    pub(crate) fn emit_object_set(&mut self, obj_ptr: BasicValueEnum<'ctx>, key_ptr: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type) {
+        let val_is_fresh_box = !Self::is_union_type(val_ty);
+        let val_tagged = if val_is_fresh_box {
+            self.box_value(value, val_ty)
+        } else { value };
+        self.builder.call(self.rt.object_set,
+            &[obj_ptr.into(), key_ptr.into(), val_tagged.into()], "");
+        if val_is_fresh_box && val_tagged.is_pointer_value() {
+            self.builder.call(self.rt.tagged_release, &[val_tagged.into()], "");
+        }
+    }
+
+    /// Store `value` into an array slot: `lin_array_set(arr_ptr, idx_i64, tagged(value))`.
+    /// `arr_ptr` must already be a RAW (unboxed) `LinArray*`.
+    ///
+    /// `lin_array_set` raw-copies the 16-byte TaggedVal INLINE into the slot WITHOUT
+    /// retaining the inner (it CONSUMES the source). So:
+    ///   - a CONCRETE value is marshalled through a STACK `TaggedVal` (no heap allocation) —
+    ///     the 16 bytes are copied inline and the stack memory is reclaimed automatically;
+    ///     heap-boxing here would orphan the box shell (the `FreeBoxShell` reclaim only
+    ///     covers union values), leaking 16 bytes per store.
+    ///   - a UNION value is already a heap box: pass it straight through to be consumed; a
+    ///     fresh source box's orphaned shell is freed by the `FreeBoxShell` the IR emits.
+    /// The slot's owning reference is supplied by the IR `transfer_into_container` emitted in
+    /// `IndexSet`/`ArraySetDyn` lowering. Shared by `compile_ir_index_set` and `ArraySetDyn`.
+    pub(crate) fn emit_array_set(&mut self, arr_ptr: BasicValueEnum<'ctx>, idx_i64: inkwell::values::IntValue<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type) {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
         let void_ty = self.context.void_type();
-        // Build the TaggedVal* to hand to the runtime setter (which copies the 16-byte
-        // TaggedVal and retains its inner payload).
-        //
-        // A value whose static type is union/Json/TypeVar (e.g. a `for`/`map` callback
-        // PARAMETER) already arrives BOXED — i.e. the LLVM value is itself a `TaggedVal*`
-        // under the uniform closure ABI. Re-wrapping it with `build_tagged_val_alloca` would
-        // misread the box pointer as the payload and tag it with `type_tag(TypeVar) == NULL`,
-        // so reads see null (the boxed-value-dropped bug). Pass the existing box straight
-        // through instead — RC stays balanced because the setter copy+retains the inner just
-        // as it would for a freshly built stack TaggedVal, and the source box keeps its own
-        // reference. Mirrors the `MakeObject` element-boxing path.
-        let tagged_val = if Self::is_union_type(val_ty) && value.is_pointer_value() {
-            value.into_pointer_value()
+        let elem_tagged: BasicValueEnum<'ctx> = if Self::is_union_type(val_ty) {
+            value
         } else {
-            self.build_tagged_val_alloca(&value, val_ty)
+            self.build_tagged_val_alloca(&value, val_ty).into()
         };
+        let set_fn = self.get_or_declare_fn("lin_array_set",
+            void_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
+        self.builder.call(set_fn, &[arr_ptr.into(), idx_i64.into(), elem_tagged.into()], "");
+    }
+
+    /// `object[key] = value` for the IR path. Mirrors the AST `compile_index_set`:
+    /// dispatch on the object's static type; for Json/union objects, dispatch at
+    /// runtime on the key's tag (int key ⇒ array set, string key ⇒ object set),
+    /// unboxing the boxed container first. Stores go through the shared `emit_object_set`/
+    /// `emit_array_set` helpers so the boxing/retain/release sequence is IDENTICAL to the
+    /// `lin_object_set`/`lin_array_set` intrinsics; the matching IR-level ownership transfer
+    /// is emitted in `IndexSet` lowering (`lin-ir`).
+    pub(crate) fn compile_ir_index_set(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, val_ty: &Type) {
         // Resolve an object key to a raw `LinString*`. A string key that is a callback param
         // arrives boxed (a `TaggedVal*`); unbox it, or `lin_object_set` reads the box as a
         // LinString and corrupts the key.
@@ -279,15 +313,12 @@ impl<'ctx> Codegen<'ctx> {
             Type::Object(_) | Type::Named(_) => {
                 if obj.is_pointer_value() && key.is_pointer_value() {
                     let key_str = resolve_obj_key(self, key);
-                    self.builder.call(self.rt.object_set,
-                        &[obj.into(), key_str.into(), tagged_val.into()], "");
+                    self.emit_object_set(obj, key_str, value, val_ty);
                 }
             }
             Type::Array(_) | Type::FixedArray(_) => {
                 let idx = self.index_value_to_i64(key);
-                let set_fn = self.get_or_declare_fn("lin_array_set",
-                    void_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
-                self.builder.call(set_fn, &[obj.into(), idx.into(), tagged_val.into()], "");
+                self.emit_array_set(obj, idx, value, val_ty);
             }
             Type::TypeVar(_) | Type::Union(_) => {
                 if !obj.is_pointer_value() { return; }
@@ -296,7 +327,12 @@ impl<'ctx> Codegen<'ctx> {
                 // on the unboxed key's tag rather than the LLVM kind when the key is union.
                 let container = self.builder.call(self.rt.unbox_ptr, &[obj.into()], "iset_unbox").try_as_basic_value().unwrap_basic();
                 if Self::is_union_type(key_ty) && key.is_pointer_value() {
-                    // Runtime-typed key: tag-dispatch int (array) vs string (object).
+                    // Runtime-typed key: tag-dispatch int (array) vs string (object). The op is
+                    // not statically known, so the IR uses a uniform RETAIN contract for a union
+                    // value (`op_consumes_union = false`): object-set retains naturally, and the
+                    // array branch below adds a `lin_tagged_retain` to match — so both branches
+                    // leave the source box owned by its current owner. (A concrete value is
+                    // boxed/retained identically by both helpers.)
                     let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                     let i8t = self.context.i8_type();
                     let k_tag = self.builder.call(self.rt.get_tag, &[key.into()], "iset_ktag").try_as_basic_value().unwrap_basic().into_int_value();
@@ -308,26 +344,28 @@ impl<'ctx> Codegen<'ctx> {
                     let mrg = self.context.append_basic_block(llvm_fn, "iset_kmrg");
                     self.builder.conditional_branch(is_int, int_b, str_b);
                     self.builder.position_at_end(int_b);
+                    // Array (consume) branch: for a union value, retain the inner first so the
+                    // slot owns its own reference — matching object-set's retain semantics, so
+                    // the IR's uniform `op_consumes_union = false` is correct for either branch.
+                    if Self::is_union_type(val_ty) && value.is_pointer_value() {
+                        let retain_fn = self.get_or_declare_fn("lin_tagged_retain",
+                            self.context.void_type().fn_type(&[self.context.ptr_type(AddressSpace::default()).into()], false));
+                        self.builder.call(retain_fn, &[value.into()], "");
+                    }
                     let idx = self.index_value_to_i64(key);
-                    let set_fn = self.get_or_declare_fn("lin_array_set",
-                        void_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
-                    self.builder.call(set_fn, &[container.into(), idx.into(), tagged_val.into()], "");
+                    self.emit_array_set(container, idx, value, val_ty);
                     self.builder.unconditional_branch(mrg);
                     self.builder.position_at_end(str_b);
                     let key_str = self.builder.call(self.rt.unbox_ptr, &[key.into()], "iset_key_unbox").try_as_basic_value().unwrap_basic();
-                    self.builder.call(self.rt.object_set,
-                        &[container.into(), key_str.into(), tagged_val.into()], "");
+                    self.emit_object_set(container, key_str, value, val_ty);
                     self.builder.unconditional_branch(mrg);
                     self.builder.position_at_end(mrg);
                 } else if key.is_pointer_value() {
                     // Statically a string (object) key.
-                    self.builder.call(self.rt.object_set,
-                        &[container.into(), key.into(), tagged_val.into()], "");
+                    self.emit_object_set(container, key, value, val_ty);
                 } else if key.is_int_value() {
                     let idx = self.index_value_to_i64(key);
-                    let set_fn = self.get_or_declare_fn("lin_array_set",
-                        void_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
-                    self.builder.call(set_fn, &[container.into(), idx.into(), tagged_val.into()], "");
+                    self.emit_array_set(container, idx, value, val_ty);
                 }
             }
             _ => {}

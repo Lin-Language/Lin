@@ -75,7 +75,7 @@ export val map = (arr: Json, f: Function): Json =>
   val result = lin_array_allocate(n)
   var i = 0
   arr.for(item =>
-    lin_array_set(result, i, f(item))
+    result[i] = f(item)
     i = i + 1
   )
   result
@@ -138,13 +138,13 @@ export val reverse = (arr: Json): Json =>
   val result = lin_array_allocate(n)
   var i = n - 1
   arr.for(item =>
-    lin_array_set(result, i, item)
+    result[i] = item
     i = i - 1
   )
   result
 
 export val set = (arr: Json, idx: Int32, item: Json): Null =>
-  lin_array_set(arr, idx, item)
+  arr[idx] = item
 
 export val at = (arr: Json, index: Int32): Json =>
   val i = if index < 0 then length(arr) + index else index
@@ -163,7 +163,7 @@ export val zip = (a: Json, b: Json): Json =>
   val result = lin_array_allocate(n)
   var i = 0
   take(a, n).for(item =>
-    lin_array_set(result, i, [item, b[i]])
+    result[i] = [item, b[i]]
     i = i + 1
   )
   result
@@ -184,7 +184,7 @@ export val take = (arr: Json, n: Int32): Json =>
   var i = 0
   arr.for(item =>
     if i < end then
-      lin_array_set(result, i, item)
+      result[i] = item
       i = i + 1
   )
   result
@@ -302,19 +302,19 @@ export val append = (arr: Json[], item: Json): Json[] =>
   val result = lin_array_allocate(n + 1)
   var i = 0
   arr.for(x =>
-    lin_array_set(result, i, x)
+    result[i] = x
     i = i + 1
   )
-  lin_array_set(result, n, item)
+  result[n] = item
   result
 
 export val prepend = (arr: Json[], item: Json): Json[] =>
   val n = length(arr)
   val result = lin_array_allocate(n + 1)
-  lin_array_set(result, 0, item)
+  result[0] = item
   var i = 1
   arr.for(x =>
-    lin_array_set(result, i, x)
+    result[i] = x
     i = i + 1
   )
   result
@@ -334,7 +334,7 @@ export val groupBy = (arr: Json, keyFn: (Json) => String): Json =>
     val key = keyFn(item)
     val group = result[key]
     if group == null then
-      lin_object_set(result, key, [item])
+      result[key] = [item]
     else
       push(group, item)
   )
@@ -345,8 +345,8 @@ export val countBy = (arr: Json, keyFn: (Json) => String): Json =>
   arr.for(item =>
     val key = keyFn(item)
     if result[key] == null then
-      lin_object_set(result, key, 1)
+      result[key] = 1
     else
-      lin_object_set(result, key, result[key] + 1)
+      result[key] = result[key] + 1
   )
   result

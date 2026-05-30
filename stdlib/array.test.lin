@@ -590,6 +590,76 @@ val s = suite("std/array", [
       expect(result["anything"]).toBe(null)
     ]
   ),
+
+  // --- heap/union element coverage for index-assign (`result[i] = x`) ---
+  // These exercise the array/object index-assign store with STRING and ARRAY
+  // (heap) elements, where the fresh-vs-borrowed and consume-vs-retain ownership
+  // rules matter (scalar elements hide RC bugs). Read the stored value back so a
+  // use-after-free corrupts the assertion; the ASan CI leg also runs these.
+
+  test("map producing strings (fresh union element)", () =>
+    val result = [1, 2, 3].map(x => "n${x}")
+    [
+      expect(result.toString()).toBe("[\"n1\", \"n2\", \"n3\"]")
+    ]
+  ),
+
+  test("map producing arrays (fresh nested-heap element)", () =>
+    val result = [1, 2, 3].map(x => [x, x])
+    [
+      expect(result.toString()).toBe("[[1, 1], [2, 2], [3, 3]]")
+    ]
+  ),
+
+  test("reverse of string elements (borrowed union)", () =>
+    val result = ["a", "b", "c"].reverse()
+    [
+      expect(result.toString()).toBe("[\"c\", \"b\", \"a\"]")
+    ]
+  ),
+
+  test("take of string elements (borrowed union)", () =>
+    val result = ["a", "b", "c"].take(2)
+    [
+      expect(result.toString()).toBe("[\"a\", \"b\"]")
+    ]
+  ),
+
+  test("append a string element", () =>
+    val result = ["a", "b"].append("c")
+    [
+      expect(result.toString()).toBe("[\"a\", \"b\", \"c\"]")
+    ]
+  ),
+
+  test("prepend a string element", () =>
+    val result = ["b", "c"].prepend("a")
+    [
+      expect(result.toString()).toBe("[\"a\", \"b\", \"c\"]")
+    ]
+  ),
+
+  test("zip of string elements", () =>
+    val result = [1, 2].zip(["a", "b"])
+    [
+      expect(result.toString()).toBe("[[1, \"a\"], [2, \"b\"]]")
+    ]
+  ),
+
+  test("sort of string elements (in-place index-assign swaps)", () =>
+    val result = ["c", "a", "b"].sort((a, b) => if a < b then -1 else if a > b then 1 else 0)
+    [
+      expect(result.toString()).toBe("[\"a\", \"b\", \"c\"]")
+    ]
+  ),
+
+  test("groupBy collecting string elements into array values", () =>
+    val result = ["a", "a", "b"].groupBy(x => x)
+    [
+      expect(result["a"].toString()).toBe("[\"a\", \"a\"]"),
+      expect(result["b"].toString()).toBe("[\"b\"]")
+    ]
+  ),
 ])
 
 run(s)

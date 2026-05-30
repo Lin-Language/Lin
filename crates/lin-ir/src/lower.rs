@@ -1831,6 +1831,22 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             let obj_temp = lower_expr(object, builder, ctx);
             let key_temp = lower_expr(key, builder, ctx);
             let val_temp = lower_expr(value, builder, ctx);
+            // `arr[i] = v` transfers a reference into the container exactly like the
+            // `lin_array_set`/`lin_object_set` intrinsics (codegen routes both through the
+            // same `emit_array_set`/`emit_object_set` helpers). Balance ownership of the
+            // stored value with the matching rule:
+            //   - Array/FixedArray store via `lin_array_set` MOVES a union box (raw struct
+            //     copy, no inner retain) ⇒ consume: a fresh union source is unregistered (and
+            //     its orphaned box shell freed below), a borrowed one is retained.
+            //   - Object/Named (and the runtime-dispatched TypeVar/Union case, where codegen
+            //     adds a `lin_tagged_retain` on the array branch so both branches are retain-
+            //     style) store via `lin_object_set`, which RETAINS the inner ⇒ no consume.
+            // A concrete heap value is consumed by every store regardless of this flag.
+            let op_consumes_union = matches!(obj_ty, Type::Array(_) | Type::FixedArray(_));
+            builder.transfer_into_container(val_temp, value, op_consumes_union);
+            let free_shell = op_consumes_union
+                && is_union_ty(&val_ty)
+                && expr_is_fresh_alloc(value);
             builder.emit(Instruction::IndexSet {
                 object: obj_temp,
                 key: key_temp,
@@ -1839,6 +1855,12 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 key_ty,
                 val_ty,
             });
+            // A fresh union box consumed by `lin_array_set` leaves an orphaned 16-byte shell
+            // (the slot owns the inner; the source box header is unreferenced) — free it after
+            // the set has read from it. Mirrors the `ArraySetDyn` intrinsic path.
+            if free_shell {
+                builder.emit(Instruction::FreeBoxShell { val: val_temp });
+            }
             // IndexSet evaluates to Null.
             builder.const_temp(Const::Null)
         }

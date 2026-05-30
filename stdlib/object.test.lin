@@ -202,6 +202,44 @@ val s = suite("std/object", [
   test("isEmpty returns false for non-empty string", () => [
     expect(isEmpty("hi")).toBe(false)
   ]),
+
+  // --- heap/union value coverage for object index-assign (`result[k] = v`) ---
+  // String values exercise the object-set store's retain semantics; scalar values
+  // hide RC bugs. The ASan CI leg also runs these.
+
+  test("mapValues producing string values", () =>
+    val m = { "a": 1, "b": 2 }.mapValues(v => "v${v}")
+    [
+      expect(m["a"]).toBe("v1"),
+      expect(m["b"]).toBe("v2")
+    ]
+  ),
+
+  test("pick copies string values", () =>
+    val p = { "a": "x", "b": "y", "c": "z" }.pick(["a", "c"])
+    [
+      expect(p["a"]).toBe("x"),
+      expect(p["c"]).toBe("z"),
+      expect(p["b"]).toBe(null)
+    ]
+  ),
+
+  test("omit copies remaining string values", () =>
+    val o = { "a": "x", "b": "y", "c": "z" }.omit(["b"])
+    [
+      expect(o["a"]).toBe("x"),
+      expect(o["c"]).toBe("z"),
+      expect(o["b"]).toBe(null)
+    ]
+  ),
+
+  test("fromEntries with string values", () =>
+    val r = fromEntries([["a", "x"], ["b", "y"]])
+    [
+      expect(r["a"]).toBe("x"),
+      expect(r["b"]).toBe("y")
+    ]
+  ),
 ])
 
 run(s)
