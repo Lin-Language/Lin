@@ -1,3 +1,4 @@
+use super::builder_ext::BuilderExt;
 use inkwell::values::{
     BasicValueEnum, PointerValue,
 };
@@ -12,62 +13,62 @@ impl<'ctx> Codegen<'ctx> {
     /// For TypeVar, dispatches on the actual LLVM type (int/float/pointer) to pick the right box call.
     pub(crate) fn box_value(&mut self, val: BasicValueEnum<'ctx>, val_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr = match val_ty {
-            Type::Null => self.builder.build_call(self.rt.box_null, &[], "boxnull").unwrap()
+            Type::Null => self.builder.call(self.rt.box_null, &[], "boxnull")
                 .try_as_basic_value().unwrap_basic(),
             Type::Bool => {
                 let i8v = if val.is_int_value() {
                     // Bool is i1; zero-extend to i8 for lin_box_bool(i8).
-                    self.builder.build_int_z_extend_or_bit_cast(val.into_int_value(), self.context.i8_type(), "btoi8").unwrap().into()
+                    self.builder.int_z_extend_or_bit_cast(val.into_int_value(), self.context.i8_type(), "btoi8").into()
                 } else { val };
-                self.builder.build_call(self.rt.box_bool, &[i8v.into()], "boxbool").unwrap()
+                self.builder.call(self.rt.box_bool, &[i8v.into()], "boxbool")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::Int8 | Type::Int16 | Type::Int32 => {
-                let i32v = self.builder.build_int_s_extend_or_bit_cast(val.into_int_value(), self.context.i32_type(), "toi32").unwrap();
-                self.builder.build_call(self.rt.box_int32, &[i32v.into()], "boxi32").unwrap()
+                let i32v = self.builder.int_s_extend_or_bit_cast(val.into_int_value(), self.context.i32_type(), "toi32");
+                self.builder.call(self.rt.box_int32, &[i32v.into()], "boxi32")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::UInt8 | Type::UInt16 | Type::UInt32 => {
-                let i32v = self.builder.build_int_z_extend_or_bit_cast(val.into_int_value(), self.context.i32_type(), "tou32").unwrap();
-                self.builder.build_call(self.rt.box_int32, &[i32v.into()], "boxi32").unwrap()
+                let i32v = self.builder.int_z_extend_or_bit_cast(val.into_int_value(), self.context.i32_type(), "tou32");
+                self.builder.call(self.rt.box_int32, &[i32v.into()], "boxi32")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::Int64 | Type::UInt64 => {
                 let i64v = val.into_int_value();
-                self.builder.build_call(self.rt.box_int64, &[i64v.into()], "boxi64").unwrap()
+                self.builder.call(self.rt.box_int64, &[i64v.into()], "boxi64")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::Float32 => {
-                let f64v = self.builder.build_float_ext(val.into_float_value(), self.context.f64_type(), "f32tof64").unwrap();
-                self.builder.build_call(self.rt.box_float64, &[f64v.into()], "boxf64").unwrap()
+                let f64v = self.builder.float_ext(val.into_float_value(), self.context.f64_type(), "f32tof64");
+                self.builder.call(self.rt.box_float64, &[f64v.into()], "boxf64")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::Float64 => {
-                self.builder.build_call(self.rt.box_float64, &[val.into()], "boxf64").unwrap()
+                self.builder.call(self.rt.box_float64, &[val.into()], "boxf64")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::Str => {
-                self.builder.build_call(self.rt.box_str, &[val.into()], "boxstr").unwrap()
+                self.builder.call(self.rt.box_str, &[val.into()], "boxstr")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::Object(_) => {
-                self.builder.build_call(self.rt.box_object, &[val.into()], "boxobj").unwrap()
+                self.builder.call(self.rt.box_object, &[val.into()], "boxobj")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::Array(_) if val.is_pointer_value() => {
                 // Box the LinArray* directly (flat or tagged). The elem_tag field in LinArray
                 // lets runtime functions (lin_array_get_tagged, lin_push_dyn, etc.) dispatch
                 // correctly without needing a separate conversion copy.
-                self.builder.build_call(self.rt.box_array, &[val.into()], "boxarr").unwrap()
+                self.builder.call(self.rt.box_array, &[val.into()], "boxarr")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => {
                 // Iterator values have already been converted to tagged arrays by the intrinsic.
-                self.builder.build_call(self.rt.box_array, &[val.into()], "boxarr").unwrap()
+                self.builder.call(self.rt.box_array, &[val.into()], "boxarr")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::Function { .. } => {
-                self.builder.build_call(self.rt.box_function, &[val.into()], "boxfn").unwrap()
+                self.builder.call(self.rt.box_function, &[val.into()], "boxfn")
                     .try_as_basic_value().unwrap_basic()
             }
             // Union type — if value is a pointer, box as object (most common case).
@@ -77,7 +78,7 @@ impl<'ctx> Codegen<'ctx> {
                     // If all variants are Object types, this is a LinObject*.
                     let all_objects = variants.iter().all(|v| matches!(v, Type::Object(_)));
                     if all_objects {
-                        self.builder.build_call(self.rt.box_object, &[val.into()], "boxobj").unwrap()
+                        self.builder.call(self.rt.box_object, &[val.into()], "boxobj")
                             .try_as_basic_value().unwrap_basic()
                     } else {
                         // Already tagged (or unknown) — return as-is.
@@ -95,19 +96,19 @@ impl<'ctx> Codegen<'ctx> {
                     let i64_ty = self.context.i64_type();
                     let bit_width = iv.get_type().get_bit_width();
                     if bit_width <= 32 {
-                        let i32v = self.builder.build_int_s_extend_or_bit_cast(iv, i32_ty, "tvi32").unwrap();
-                        self.builder.build_call(self.rt.box_int32, &[i32v.into()], "tvboxi32").unwrap()
+                        let i32v = self.builder.int_s_extend_or_bit_cast(iv, i32_ty, "tvi32");
+                        self.builder.call(self.rt.box_int32, &[i32v.into()], "tvboxi32")
                             .try_as_basic_value().unwrap_basic()
                     } else {
-                        let i64v = self.builder.build_int_s_extend_or_bit_cast(iv, i64_ty, "tvi64").unwrap();
-                        self.builder.build_call(self.rt.box_int64, &[i64v.into()], "tvboxi64").unwrap()
+                        let i64v = self.builder.int_s_extend_or_bit_cast(iv, i64_ty, "tvi64");
+                        self.builder.call(self.rt.box_int64, &[i64v.into()], "tvboxi64")
                             .try_as_basic_value().unwrap_basic()
                     }
                 } else if val.is_float_value() {
                     let fv = val.into_float_value();
                     let f64_ty = self.context.f64_type();
-                    let f64v = self.builder.build_float_ext(fv, f64_ty, "tvf64").unwrap();
-                    self.builder.build_call(self.rt.box_float64, &[f64v.into()], "tvboxf64").unwrap()
+                    let f64v = self.builder.float_ext(fv, f64_ty, "tvf64");
+                    self.builder.call(self.rt.box_float64, &[f64v.into()], "tvboxf64")
                         .try_as_basic_value().unwrap_basic()
                 } else {
                     val
@@ -124,42 +125,42 @@ impl<'ctx> Codegen<'ctx> {
         match target_ty {
             Type::Null => self.context.ptr_type(AddressSpace::default()).const_null().into(),
             Type::Bool => {
-                let v = self.builder.build_call(self.rt.unbox_bool, &[ptr_val.into()], "ubool").unwrap()
+                let v = self.builder.call(self.rt.unbox_bool, &[ptr_val.into()], "ubool")
                     .try_as_basic_value().unwrap_basic();
                 // Convert i8 to i1
-                self.builder.build_int_truncate(v.into_int_value(), self.context.bool_type(), "utobool").unwrap().into()
+                self.builder.int_truncate(v.into_int_value(), self.context.bool_type(), "utobool").into()
             }
             Type::Int8 | Type::Int16 | Type::Int32 => {
-                let v = self.builder.build_call(self.rt.unbox_int32, &[ptr_val.into()], "ui32").unwrap()
+                let v = self.builder.call(self.rt.unbox_int32, &[ptr_val.into()], "ui32")
                     .try_as_basic_value().unwrap_basic();
                 let ity = self.llvm_type(target_ty).into_int_type();
-                self.builder.build_int_truncate_or_bit_cast(v.into_int_value(), ity, "toi").unwrap().into()
+                self.builder.int_truncate_or_bit_cast(v.into_int_value(), ity, "toi").into()
             }
             Type::UInt8 | Type::UInt16 | Type::UInt32 => {
-                let v = self.builder.build_call(self.rt.unbox_int32, &[ptr_val.into()], "uu32").unwrap()
+                let v = self.builder.call(self.rt.unbox_int32, &[ptr_val.into()], "uu32")
                     .try_as_basic_value().unwrap_basic();
                 let ity = self.llvm_type(target_ty).into_int_type();
-                self.builder.build_int_truncate_or_bit_cast(v.into_int_value(), ity, "toui").unwrap().into()
+                self.builder.int_truncate_or_bit_cast(v.into_int_value(), ity, "toui").into()
             }
             Type::Int64 | Type::UInt64 => {
-                self.builder.build_call(self.rt.unbox_int64, &[ptr_val.into()], "ui64").unwrap()
+                self.builder.call(self.rt.unbox_int64, &[ptr_val.into()], "ui64")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::Float32 | Type::Float64 => {
-                let v = self.builder.build_call(self.rt.unbox_float64, &[ptr_val.into()], "uf64").unwrap()
+                let v = self.builder.call(self.rt.unbox_float64, &[ptr_val.into()], "uf64")
                     .try_as_basic_value().unwrap_basic();
                 if matches!(target_ty, Type::Float32) {
-                    self.builder.build_float_trunc(v.into_float_value(), self.context.f32_type(), "tof32").unwrap().into()
+                    self.builder.float_trunc(v.into_float_value(), self.context.f32_type(), "tof32").into()
                 } else {
                     v
                 }
             }
             Type::Str => {
-                self.builder.build_call(self.rt.unbox_ptr, &[ptr_val.into()], "ustr").unwrap()
+                self.builder.call(self.rt.unbox_ptr, &[ptr_val.into()], "ustr")
                     .try_as_basic_value().unwrap_basic()
             }
             Type::Object(_) | Type::Array(_) | Type::FixedArray(_) | Type::Function { .. } => {
-                self.builder.build_call(self.rt.unbox_ptr, &[ptr_val.into()], "uptr").unwrap()
+                self.builder.call(self.rt.unbox_ptr, &[ptr_val.into()], "uptr")
                     .try_as_basic_value().unwrap_basic()
             }
             // Already tagged — return as-is
@@ -174,26 +175,26 @@ impl<'ctx> Codegen<'ctx> {
         let i8_ty = self.context.i8_type();
         let i64_ty = self.context.i64_type();
         let tagged_ty = self.context.struct_type(&[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false);
-        let alloca = self.builder.build_alloca(tagged_ty, "tv").unwrap();
+        let alloca = self.builder.alloca(tagged_ty, "tv");
 
         let tag = Self::type_tag(val_ty);
         let tag_val = i8_ty.const_int(tag as u64, false);
-        let tag_ptr = self.builder.build_struct_gep(tagged_ty, alloca, 0, "tv_tag").unwrap();
-        self.builder.build_store(tag_ptr, tag_val).unwrap();
+        let tag_ptr = self.builder.struct_gep(tagged_ty, alloca, 0, "tv_tag");
+        self.builder.store(tag_ptr, tag_val);
 
         // Write payload as u64.
-        let payload_ptr = self.builder.build_struct_gep(tagged_ty, alloca, 2, "tv_payload").unwrap();
+        let payload_ptr = self.builder.struct_gep(tagged_ty, alloca, 2, "tv_payload");
         let payload: inkwell::values::IntValue<'ctx> = match val_ty {
             Type::Null => i64_ty.const_zero(),
             Type::Bool => {
                 let b = if val.is_int_value() {
-                    self.builder.build_int_z_extend(val.into_int_value(), i64_ty, "bext").unwrap()
+                    self.builder.int_z_extend(val.into_int_value(), i64_ty, "bext")
                 } else { i64_ty.const_zero() };
                 b
             }
             Type::Int8 | Type::Int16 | Type::Int32 | Type::UInt8 | Type::UInt16 | Type::UInt32 => {
                 if val.is_int_value() {
-                    self.builder.build_int_z_extend_or_bit_cast(val.into_int_value(), i64_ty, "iext").unwrap()
+                    self.builder.int_z_extend_or_bit_cast(val.into_int_value(), i64_ty, "iext")
                 } else { i64_ty.const_zero() }
             }
             Type::Int64 | Type::UInt64 => {
@@ -203,23 +204,23 @@ impl<'ctx> Codegen<'ctx> {
                 let fv = if val.is_float_value() { val.into_float_value() }
                     else { self.context.f32_type().const_float(0.0) };
                 // Extend to f64 then bitcast bits to i64
-                let fv64 = self.builder.build_float_ext(fv, self.context.f64_type(), "f32ext").unwrap();
-                self.builder.build_bit_cast(fv64, i64_ty, "fbits").unwrap().into_int_value()
+                let fv64 = self.builder.float_ext(fv, self.context.f64_type(), "f32ext");
+                self.builder.bit_cast(fv64, i64_ty, "fbits").into_int_value()
             }
             Type::Float64 => {
                 let fv = if val.is_float_value() { val.into_float_value() }
                     else { self.context.f64_type().const_float(0.0) };
                 // Bitcast f64 bits to i64 (reinterpret, not convert)
-                self.builder.build_bit_cast(fv, i64_ty, "fbits").unwrap().into_int_value()
+                self.builder.bit_cast(fv, i64_ty, "fbits").into_int_value()
             }
             _ => {
                 // Pointer types: str, array, object, function — store pointer as u64
                 if val.is_pointer_value() {
-                    self.builder.build_ptr_to_int(val.into_pointer_value(), i64_ty, "pti").unwrap()
+                    self.builder.ptr_to_int(val.into_pointer_value(), i64_ty, "pti")
                 } else { i64_ty.const_zero() }
             }
         };
-        self.builder.build_store(payload_ptr, payload).unwrap();
+        self.builder.store(payload_ptr, payload);
         alloca
     }
 
@@ -239,29 +240,23 @@ impl<'ctx> Codegen<'ctx> {
         let ptr = tagged.into_pointer_value();
         match ty {
             Type::Int32 | Type::UInt32 => {
-                self.builder.build_call(self.rt.unbox_int32, &[ptr.into()], "ir_u32")
-                    .unwrap().try_as_basic_value().unwrap_basic()
+                self.builder.call(self.rt.unbox_int32, &[ptr.into()], "ir_u32").try_as_basic_value().unwrap_basic()
             }
             Type::Int64 | Type::UInt64 => {
-                self.builder.build_call(self.rt.unbox_int64, &[ptr.into()], "ir_u64")
-                    .unwrap().try_as_basic_value().unwrap_basic()
+                self.builder.call(self.rt.unbox_int64, &[ptr.into()], "ir_u64").try_as_basic_value().unwrap_basic()
             }
             Type::Float64 | Type::Float32 => {
-                self.builder.build_call(self.rt.unbox_float64, &[ptr.into()], "ir_uf64")
-                    .unwrap().try_as_basic_value().unwrap_basic()
+                self.builder.call(self.rt.unbox_float64, &[ptr.into()], "ir_uf64").try_as_basic_value().unwrap_basic()
             }
             Type::Bool => {
-                let i8v = self.builder.build_call(self.rt.unbox_bool, &[ptr.into()], "ir_ubool")
-                    .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
-                self.builder.build_int_truncate_or_bit_cast(i8v, self.context.bool_type(), "ub_bool").unwrap().into()
+                let i8v = self.builder.call(self.rt.unbox_bool, &[ptr.into()], "ir_ubool").try_as_basic_value().unwrap_basic().into_int_value();
+                self.builder.int_truncate_or_bit_cast(i8v, self.context.bool_type(), "ub_bool").into()
             }
             Type::Str => {
-                self.builder.build_call(self.rt.unbox_ptr, &[ptr.into()], "ir_ustr")
-                    .unwrap().try_as_basic_value().unwrap_basic()
+                self.builder.call(self.rt.unbox_ptr, &[ptr.into()], "ir_ustr").try_as_basic_value().unwrap_basic()
             }
             Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. } => {
-                self.builder.build_call(self.rt.unbox_ptr, &[ptr.into()], "ir_uptr")
-                    .unwrap().try_as_basic_value().unwrap_basic()
+                self.builder.call(self.rt.unbox_ptr, &[ptr.into()], "ir_uptr").try_as_basic_value().unwrap_basic()
             }
             Type::Null => ptr_ty.const_null().into(),
             _ => tagged, // pass through for union/unknown

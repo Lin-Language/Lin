@@ -18,7 +18,9 @@ use lin_check::types::Type;
 use lin_ir::ir as lir;
 use crate::coverage::{self, CoverageEmitter};
 use runtime::RuntimeFns;
+use builder_ext::BuilderExt;
 
+mod builder_ext;
 mod runtime;
 mod types;
 mod boxing;
@@ -504,14 +506,14 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.position_at_end(tco_entry);
                 for (i, (_temp, ty)) in func.params.iter().enumerate() {
                     let llvm_ty = self.llvm_type(ty);
-                    let slot = self.builder.build_alloca(llvm_ty, "tco_param").unwrap();
+                    let slot = self.builder.alloca(llvm_ty, "tco_param");
                     if let Some(pv) = llvm_fn.get_nth_param(i as u32) {
-                        self.builder.build_store(slot, pv).unwrap();
+                        self.builder.store(slot, pv);
                     }
                     param_allocs.push(slot);
                 }
                 if let Some(first_ir_bb) = func.blocks.first().and_then(|b| ir_block_to_llvm.get(&b.id)) {
-                    self.builder.build_unconditional_branch(*first_ir_bb).unwrap();
+                    self.builder.unconditional_branch(*first_ir_bb);
                 }
             }
 
@@ -522,7 +524,7 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.position_at_end(*first_ir_bb);
                     for (i, (temp, ty)) in func.params.iter().enumerate() {
                         let llvm_ty = self.llvm_type(ty);
-                        let loaded = self.builder.build_load(llvm_ty, param_allocs[i], "tco_pload").unwrap();
+                        let loaded = self.builder.load(llvm_ty, param_allocs[i], "tco_pload");
                         temp_map.insert(*temp, loaded);
                     }
                 }
@@ -598,16 +600,16 @@ impl<'ctx> Codegen<'ctx> {
                 if let (Some(profc), Some(&k)) = (profc, block_counter.get(&block.id)) {
                     let counter_arr_ty = i64_ty.array_type(block_counter.len() as u32);
                     let gep = unsafe {
-                        self.builder.build_in_bounds_gep(
+                        self.builder.in_bounds_gep(
                             counter_arr_ty,
                             profc.as_pointer_value(),
                             &[i64_ty.const_zero(), i64_ty.const_int(k as u64, false)],
                             "covctr_ptr",
-                        ).unwrap()
+                        )
                     };
-                    let cur = self.builder.build_load(i64_ty, gep, "covctr").unwrap().into_int_value();
-                    let inc = self.builder.build_int_add(cur, i64_ty.const_int(1, false), "covctr_inc").unwrap();
-                    self.builder.build_store(gep, inc).unwrap();
+                    let cur = self.builder.load(i64_ty, gep, "covctr").into_int_value();
+                    let inc = self.builder.int_add(cur, i64_ty.const_int(1, false), "covctr_inc");
+                    self.builder.store(gep, inc);
                 }
 
                 for instr in &block.instructions {
@@ -632,7 +634,7 @@ impl<'ctx> Codegen<'ctx> {
                             // instructions, but defer wiring the incoming edges until all
                             // blocks are compiled (a back-edge value may be defined later).
                             let phi_ty = self.llvm_type(ty);
-                            let phi = self.builder.build_phi(phi_ty, "ir_phi").unwrap();
+                            let phi = self.builder.phi(phi_ty, "ir_phi");
                             temp_map.insert(*dst, phi.as_basic_value());
                             pending_phis.push((phi, incomings.clone()));
                         }
@@ -655,9 +657,9 @@ impl<'ctx> Codegen<'ctx> {
                                         // offset 0 and corrupt it.
                                         let retain_fn = self.get_or_declare_fn("lin_tagged_retain",
                                             self.context.void_type().fn_type(&[ptr_ty.into()], false));
-                                        self.builder.build_call(retain_fn, &[v.into()], "").unwrap();
+                                        self.builder.call(retain_fn, &[v.into()], "");
                                     } else {
-                                        self.builder.build_call(self.rt.rc_retain, &[v.into()], "").unwrap();
+                                        self.builder.call(self.rt.rc_retain, &[v.into()], "");
                                     }
                                 }
                             }
@@ -693,7 +695,7 @@ impl<'ctx> Codegen<'ctx> {
                                     let callee_fn = ir_fn_to_llvm[fid];
                                     if let Some(p) = partial_app(self, callee_fn) { p }
                                     else {
-                                        let call = self.builder.build_call(callee_fn, &arg_vals, "call").unwrap();
+                                        let call = self.builder.call(callee_fn, &arg_vals, "call");
                                         if matches!(ret_ty, Type::Null | Type::Never) { ptr_ty.const_null().into() }
                                         else { call.try_as_basic_value().unwrap_basic() }
                                     }
@@ -721,7 +723,7 @@ impl<'ctx> Codegen<'ctx> {
                                     };
                                     if let Some(p) = partial_app(self, callee_fn) { p }
                                     else {
-                                        let call = self.builder.build_call(callee_fn, &arg_vals, "call_n").unwrap();
+                                        let call = self.builder.call(callee_fn, &arg_vals, "call_n");
                                         if matches!(ret_ty, Type::Null | Type::Never) { ptr_ty.const_null().into() }
                                         else { call.try_as_basic_value().unwrap_basic() }
                                     }
@@ -734,8 +736,7 @@ impl<'ctx> Codegen<'ctx> {
                                             // the closure struct first.
                                             let callee_ty = func.temp_types.get(fn_temp).cloned().unwrap_or(Type::Null);
                                             let cls_ptr = if Self::is_union_type(&callee_ty) {
-                                                self.builder.build_call(self.rt.unbox_ptr, &[cls_ptr.into()], "ir_fn_unbox")
-                                                    .unwrap().try_as_basic_value().unwrap_basic()
+                                                self.builder.call(self.rt.unbox_ptr, &[cls_ptr.into()], "ir_fn_unbox").try_as_basic_value().unwrap_basic()
                                             } else { cls_ptr };
                                             // Under-application of a closure value: the result is
                                             // still a Function, so bundle the inner closure + the
@@ -756,10 +757,10 @@ impl<'ctx> Codegen<'ctx> {
                                             // Build closure call: load fn_ptr from offset 2 of closure struct.
                                             let cls_ty = self.closure_struct_type();
                                             let cls_ptr_v = cls_ptr.into_pointer_value();
-                                            let fn_gep = self.builder.build_struct_gep(cls_ty, cls_ptr_v, 2, "ir_fp").unwrap();
-                                            let fn_ptr = self.builder.build_load(ptr_ty, fn_gep, "ir_fnp").unwrap().into_pointer_value();
-                                            let env_gep = self.builder.build_struct_gep(cls_ty, cls_ptr_v, 3, "ir_ep").unwrap();
-                                            let env_ptr = self.builder.build_load(ptr_ty, env_gep, "ir_envp").unwrap();
+                                            let fn_gep = self.builder.struct_gep(cls_ty, cls_ptr_v, 2, "ir_fp");
+                                            let fn_ptr = self.builder.load(ptr_ty, fn_gep, "ir_fnp").into_pointer_value();
+                                            let env_gep = self.builder.struct_gep(cls_ty, cls_ptr_v, 3, "ir_ep");
+                                            let env_ptr = self.builder.load(ptr_ty, env_gep, "ir_envp");
 
                                             // Build param types: env_ptr + arg types.
                                             // Recover arg types from the IR temp_types map.
@@ -778,7 +779,7 @@ impl<'ctx> Codegen<'ctx> {
                                             } else {
                                                 ptr_ty.fn_type(&fn_param_types, false)
                                             };
-                                            let call = self.builder.build_indirect_call(fn_ty, fn_ptr, &call_args, "ir_ind").unwrap();
+                                            let call = self.builder.indirect_call(fn_ty, fn_ptr, &call_args, "ir_ind");
                                             if returns_void {
                                                 ptr_ty.const_null().into()
                                             } else {
@@ -809,8 +810,7 @@ impl<'ctx> Codegen<'ctx> {
                         Instruction::MakeObject { dst, fields, spreads, ty } => {
                             // Compile field values first (they're already Temps).
                             let cap = i32_ty.const_int((fields.len() + 4).max(4) as u64, false);
-                            let obj_ptr = self.builder.build_call(self.rt.object_alloc, &[cap.into()], "ir_obj")
-                                .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+                            let obj_ptr = self.builder.call(self.rt.object_alloc, &[cap.into()], "ir_obj").try_as_basic_value().unwrap_basic().into_pointer_value();
                             // Apply spreads. A spread source typed Json/union arrives boxed
                             // (a TaggedVal*) — unbox to the raw LinObject* before merging, or
                             // lin_object_merge reads the box as an object and crashes.
@@ -822,10 +822,9 @@ impl<'ctx> Codegen<'ctx> {
                                         if sv.is_pointer_value() {
                                             let s_ty = func.temp_types.get(s).cloned().unwrap_or(Type::Null);
                                             let src = if Self::is_union_type(&s_ty) {
-                                                self.builder.build_call(self.rt.unbox_ptr, &[sv.into()], "ir_spread_unbox")
-                                                    .unwrap().try_as_basic_value().unwrap_basic()
+                                                self.builder.call(self.rt.unbox_ptr, &[sv.into()], "ir_spread_unbox").try_as_basic_value().unwrap_basic()
                                             } else { sv };
-                                            self.builder.build_call(merge_fn, &[obj_ptr.into(), src.into()], "").unwrap();
+                                            self.builder.call(merge_fn, &[obj_ptr.into(), src.into()], "");
                                         }
                                     }
                                 }
@@ -843,8 +842,8 @@ impl<'ctx> Codegen<'ctx> {
                                     } else {
                                         self.build_tagged_val_alloca(&val, &val_ty)
                                     };
-                                    self.builder.build_call(self.rt.object_set, &[obj_ptr.into(), key_str.into(), tagged.into()], "").unwrap();
-                                    self.builder.build_call(self.rt.string_release, &[key_str.into()], "").unwrap();
+                                    self.builder.call(self.rt.object_set, &[obj_ptr.into(), key_str.into(), tagged.into()], "");
+                                    self.builder.call(self.rt.string_release, &[key_str.into()], "");
                                 }
                             }
                             let _ = ty;
@@ -857,8 +856,7 @@ impl<'ctx> Codegen<'ctx> {
                                 let alloc_fn = self.get_or_declare_fn(
                                     &format!("lin_flat_array_alloc_{}", suffix),
                                     ptr_ty.fn_type(&[i64_ty.into()], false));
-                                let arr_v = self.builder.build_call(alloc_fn, &[cap.into()], "ir_farr")
-                                    .unwrap().try_as_basic_value().unwrap_basic();
+                                let arr_v = self.builder.call(alloc_fn, &[cap.into()], "ir_farr").try_as_basic_value().unwrap_basic();
                                 for e_temp in elements {
                                     if let Some(&ev) = temp_map.get(e_temp) {
                                         self.flat_array_push(arr_v, ev, elem_ty);
@@ -866,8 +864,7 @@ impl<'ctx> Codegen<'ctx> {
                                 }
                                 arr_v
                             } else {
-                                let arr_v = self.builder.build_call(self.rt.array_alloc, &[cap.into()], "ir_arr")
-                                    .unwrap().try_as_basic_value().unwrap_basic();
+                                let arr_v = self.builder.call(self.rt.array_alloc, &[cap.into()], "ir_arr").try_as_basic_value().unwrap_basic();
                                 for e_temp in elements {
                                     if let Some(&ev) = temp_map.get(e_temp) {
                                         self.tagged_array_push_value(arr_v, ev, elem_ty);
@@ -921,28 +918,25 @@ impl<'ctx> Codegen<'ctx> {
                             if let Some(&src_v) = temp_map.get(src) {
                                 // Unbox a boxed Json object to the raw LinObject*.
                                 let src_obj = if Self::is_union_type(src_ty) && src_v.is_pointer_value() {
-                                    self.builder.build_call(self.rt.unbox_ptr, &[src_v.into()], "orest_unbox")
-                                        .unwrap().try_as_basic_value().unwrap_basic()
+                                    self.builder.call(self.rt.unbox_ptr, &[src_v.into()], "orest_unbox").try_as_basic_value().unwrap_basic()
                                 } else { src_v };
-                                let rest_obj = self.builder.build_call(self.rt.object_alloc,
-                                    &[i32_ty.const_int(4, false).into()], "orest")
-                                    .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
+                                let rest_obj = self.builder.call(self.rt.object_alloc,
+                                    &[i32_ty.const_int(4, false).into()], "orest").try_as_basic_value().unwrap_basic().into_pointer_value();
                                 let exclude_fn = self.get_or_declare_fn("lin_object_copy_except",
                                     void_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into(), i32_ty.into()], false));
                                 let n_exc = exclude.len() as u32;
                                 let arr_ty = ptr_ty.array_type(n_exc.max(1));
-                                let keys_arr = self.builder.build_alloca(arr_ty, "orest_keys").unwrap();
+                                let keys_arr = self.builder.alloca(arr_ty, "orest_keys");
                                 for (i, key) in exclude.iter().enumerate() {
                                     let key_str = self.compile_string_lit(key);
-                                    let gep = unsafe { self.builder.build_gep(arr_ty, keys_arr,
-                                        &[i32_ty.const_zero(), i32_ty.const_int(i as u64, false)], "orest_kp").unwrap() };
-                                    self.builder.build_store(gep, key_str).unwrap();
+                                    let gep = unsafe { self.builder.gep(arr_ty, keys_arr,
+                                        &[i32_ty.const_zero(), i32_ty.const_int(i as u64, false)], "orest_kp") };
+                                    self.builder.store(gep, key_str);
                                 }
-                                let keys_ptr = self.builder.build_pointer_cast(keys_arr, ptr_ty, "orest_kps").unwrap();
-                                self.builder.build_call(exclude_fn,
-                                    &[rest_obj.into(), src_obj.into(), keys_ptr.into(), i32_ty.const_int(n_exc as u64, false).into()], "").unwrap();
-                                let boxed = self.builder.build_call(self.rt.box_object, &[rest_obj.into()], "orest_boxed")
-                                    .unwrap().try_as_basic_value().unwrap_basic();
+                                let keys_ptr = self.builder.pointer_cast(keys_arr, ptr_ty, "orest_kps");
+                                self.builder.call(exclude_fn,
+                                    &[rest_obj.into(), src_obj.into(), keys_ptr.into(), i32_ty.const_int(n_exc as u64, false).into()], "");
+                                let boxed = self.builder.call(self.rt.box_object, &[rest_obj.into()], "orest_boxed").try_as_basic_value().unwrap_basic();
                                 temp_map.insert(*dst, boxed);
                             }
                         }
@@ -956,9 +950,8 @@ impl<'ctx> Codegen<'ctx> {
                                         i8t.fn_type(&[ptr_ty.into(), i64_ty.into(), i8t.into()], false));
                                     let n_v = i64_ty.const_int(*n, false);
                                     let at_v = i8t.const_int(*at_least as u64, false);
-                                    let r = self.builder.build_call(check_fn, &[v.into(), n_v.into(), at_v.into()], "alc")
-                                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
-                                    self.builder.build_int_truncate_or_bit_cast(r, self.context.bool_type(), "alc_b").unwrap().into()
+                                    let r = self.builder.call(check_fn, &[v.into(), n_v.into(), at_v.into()], "alc").try_as_basic_value().unwrap_basic().into_int_value();
+                                    self.builder.int_truncate_or_bit_cast(r, self.context.bool_type(), "alc_b").into()
                                 } else {
                                     self.context.bool_type().const_zero().into()
                                 };
@@ -987,7 +980,7 @@ impl<'ctx> Codegen<'ctx> {
                                         .unwrap();
                                     self.emit_release(old, ty);
                                 }
-                                self.builder.build_store(glob.as_pointer_value(), v).unwrap();
+                                self.builder.store(glob.as_pointer_value(), v);
                             }
                         }
                         Instruction::GlobalValGet { dst, slot, ty } => {
@@ -997,17 +990,16 @@ impl<'ctx> Codegen<'ctx> {
                                 g.set_initializer(&llvm_ty.const_zero());
                                 g
                             });
-                            let v = self.builder.build_load(llvm_ty, glob.as_pointer_value(), "ir_gvget").unwrap();
+                            let v = self.builder.load(llvm_ty, glob.as_pointer_value(), "ir_gvget");
                             temp_map.insert(*dst, v);
                         }
                         Instruction::MakeCell { dst, init, ty } => {
                             if let Some(&v) = temp_map.get(init) {
                                 let llvm_ty = self.llvm_type(ty);
                                 let size = llvm_ty.size_of().unwrap();
-                                let size_i64 = self.builder.build_int_z_extend_or_bit_cast(size, i64_ty, "cell_sz").unwrap();
-                                let cell = self.builder.build_call(self.rt.alloc, &[size_i64.into()], "ir_cell")
-                                    .unwrap().try_as_basic_value().unwrap_basic().into_pointer_value();
-                                self.builder.build_store(cell, v).unwrap();
+                                let size_i64 = self.builder.int_z_extend_or_bit_cast(size, i64_ty, "cell_sz");
+                                let cell = self.builder.call(self.rt.alloc, &[size_i64.into()], "ir_cell").try_as_basic_value().unwrap_basic().into_pointer_value();
+                                self.builder.store(cell, v);
                                 temp_map.insert(*dst, cell.into());
                             }
                         }
@@ -1015,7 +1007,7 @@ impl<'ctx> Codegen<'ctx> {
                             if let Some(&c) = temp_map.get(cell) {
                                 if c.is_pointer_value() {
                                     let llvm_ty = self.llvm_type(ty);
-                                    let v = self.builder.build_load(llvm_ty, c.into_pointer_value(), "ir_cellget").unwrap();
+                                    let v = self.builder.load(llvm_ty, c.into_pointer_value(), "ir_cellget");
                                     temp_map.insert(*dst, v);
                                 } else {
                                     temp_map.insert(*dst, self.llvm_type(ty).const_zero());
@@ -1041,7 +1033,7 @@ impl<'ctx> Codegen<'ctx> {
                                             .unwrap();
                                         self.emit_release(old, ty);
                                     }
-                                    self.builder.build_store(c.into_pointer_value(), v).unwrap();
+                                    self.builder.store(c.into_pointer_value(), v);
                                 }
                             }
                         }
@@ -1054,10 +1046,10 @@ impl<'ctx> Codegen<'ctx> {
                                     let i8_ty = self.context.i8_type();
                                     let offset = i64_ty.const_int(8 + (*index as u64) * 8, false);
                                     let gep = unsafe {
-                                        self.builder.build_gep(i8_ty, env_v.into_pointer_value(), &[offset], "ir_capgep").unwrap()
+                                        self.builder.gep(i8_ty, env_v.into_pointer_value(), &[offset], "ir_capgep")
                                     };
                                     let load_ty = self.llvm_type(ty);
-                                    let loaded = self.builder.build_load(load_ty, gep, "ir_cap").unwrap();
+                                    let loaded = self.builder.load(load_ty, gep, "ir_cap");
                                     temp_map.insert(*dst, loaded);
                                 } else {
                                     temp_map.insert(*dst, self.llvm_type(ty).const_zero());
@@ -1091,7 +1083,7 @@ impl<'ctx> Codegen<'ctx> {
                             if let Some(&msg_v) = temp_map.get(msg) {
                                 if msg_v.is_pointer_value() {
                                     let zero = i32_ty.const_zero();
-                                    self.builder.build_call(self.rt.panic, &[msg_v.into(), zero.into(), zero.into()], "").unwrap();
+                                    self.builder.call(self.rt.panic, &[msg_v.into(), zero.into(), zero.into()], "");
                                 }
                             }
                             // Note: no terminator here — the block's IR Terminator (an
@@ -1128,17 +1120,17 @@ impl<'ctx> Codegen<'ctx> {
                 match &block.terminator {
                     Terminator::Return(Some(t)) => {
                         if let Some(&v) = temp_map.get(t) {
-                            self.builder.build_return(Some(&v)).unwrap();
+                            self.builder.r#return(Some(&v));
                         } else {
-                            self.builder.build_return(None).unwrap();
+                            self.builder.r#return(None);
                         }
                     }
                     Terminator::Return(None) => {
-                        self.builder.build_return(None).unwrap();
+                        self.builder.r#return(None);
                     }
                     Terminator::Jump(target) => {
                         let target_bb = ir_block_to_llvm[target];
-                        self.builder.build_unconditional_branch(target_bb).unwrap();
+                        self.builder.unconditional_branch(target_bb);
                     }
                     Terminator::CondJump { cond, then_block, else_block } => {
                         // A missing condition temp means malformed IR — the old `const_zero`
@@ -1151,20 +1143,20 @@ impl<'ctx> Codegen<'ctx> {
                         };
                         let then_bb = ir_block_to_llvm[then_block];
                         let else_bb = ir_block_to_llvm[else_block];
-                        self.builder.build_conditional_branch(cond_i1, then_bb, else_bb).unwrap();
+                        self.builder.conditional_branch(cond_i1, then_bb, else_bb);
                     }
                     Terminator::TailCall { args } => {
                         // TCO: store the new argument values into the param allocas and
                         // branch back to the loop header (the function's first IR block).
                         for (i, arg_temp) in args.iter().enumerate() {
                             if let (Some(&v), Some(slot)) = (temp_map.get(arg_temp), param_allocs.get(i)) {
-                                self.builder.build_store(*slot, v).unwrap();
+                                self.builder.store(*slot, v);
                             }
                         }
                         if let Some(first_ir_bb) = func.blocks.first().and_then(|b| ir_block_to_llvm.get(&b.id)) {
-                            self.builder.build_unconditional_branch(*first_ir_bb).unwrap();
+                            self.builder.unconditional_branch(*first_ir_bb);
                         } else {
-                            self.builder.build_unreachable().unwrap();
+                            self.builder.unreachable();
                         }
                     }
                     Terminator::Switch { val, cases, default } => {
@@ -1178,17 +1170,17 @@ impl<'ctx> Codegen<'ctx> {
                                         ir_block_to_llvm.get(bid).map(|bb| (self.context.i8_type().const_int(*tag as u64, false), *bb))
                                     })
                                     .collect();
-                                self.builder.build_switch(int_v, def_bb, &case_bbs).unwrap();
+                                self.builder.switch(int_v, def_bb, &case_bbs);
                             } else {
                                 let def_bb = ir_block_to_llvm[default];
-                                self.builder.build_unconditional_branch(def_bb).unwrap();
+                                self.builder.unconditional_branch(def_bb);
                             }
                         } else {
-                            self.builder.build_unreachable().unwrap();
+                            self.builder.unreachable();
                         }
                     }
                     Terminator::Unreachable => {
-                        self.builder.build_unreachable().unwrap();
+                        self.builder.unreachable();
                     }
                 }
             }

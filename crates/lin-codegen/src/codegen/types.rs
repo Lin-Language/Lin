@@ -1,3 +1,4 @@
+use super::builder_ext::BuilderExt;
 use inkwell::types::{BasicMetadataTypeEnum, BasicTypeEnum};
 use inkwell::values::BasicValueEnum;
 use inkwell::AddressSpace;
@@ -159,12 +160,12 @@ impl<'ctx> Codegen<'ctx> {
             val
         } else if tgt_bits > iv_bits {
             if target_ty.is_signed() {
-                self.builder.build_int_s_extend(iv, target_llvm, "ir_len_sext").unwrap().into()
+                self.builder.int_s_extend(iv, target_llvm, "ir_len_sext").into()
             } else {
-                self.builder.build_int_z_extend(iv, target_llvm, "ir_len_zext").unwrap().into()
+                self.builder.int_z_extend(iv, target_llvm, "ir_len_zext").into()
             }
         } else {
-            self.builder.build_int_truncate(iv, target_llvm, "ir_len_trunc").unwrap().into()
+            self.builder.int_truncate(iv, target_llvm, "ir_len_trunc").into()
         }
     }
 

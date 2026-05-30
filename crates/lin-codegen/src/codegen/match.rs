@@ -1,3 +1,4 @@
+use super::builder_ext::BuilderExt;
 use inkwell::values::BasicValueEnum;
 use inkwell::{AddressSpace, IntPredicate};
 
@@ -9,10 +10,9 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) fn compile_ir_is_type(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) -> inkwell::values::IntValue<'ctx> {
         // Use get_tag and compare.
         if val.is_pointer_value() {
-            let tag = self.builder.build_call(self.rt.get_tag, &[val.into()], "ir_tag")
-                .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+            let tag = self.builder.call(self.rt.get_tag, &[val.into()], "ir_tag").try_as_basic_value().unwrap_basic().into_int_value();
             let expected = self.type_tag_const(ty);
-            self.builder.build_int_compare(IntPredicate::EQ, tag, expected, "ir_is").unwrap()
+            self.builder.int_compare(IntPredicate::EQ, tag, expected, "ir_is")
         } else {
             self.context.bool_type().const_zero()
         }
@@ -32,11 +32,10 @@ impl<'ctx> Codegen<'ctx> {
         let mut all_present = bool_ty.const_int(1, false);
         for field in &pattern.required_fields {
             let key_str = self.compile_string_lit(field).into_pointer_value();
-            let has_i8 = self.builder.build_call(has_fn, &[val.into(), key_str.into()], "ir_has")
-                .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
-            self.builder.build_call(self.rt.string_release, &[key_str.into()], "").unwrap();
-            let has_bool = self.builder.build_int_truncate_or_bit_cast(has_i8, bool_ty, "has_b").unwrap();
-            all_present = self.builder.build_and(all_present, has_bool, "has_acc").unwrap();
+            let has_i8 = self.builder.call(has_fn, &[val.into(), key_str.into()], "ir_has").try_as_basic_value().unwrap_basic().into_int_value();
+            self.builder.call(self.rt.string_release, &[key_str.into()], "");
+            let has_bool = self.builder.int_truncate_or_bit_cast(has_i8, bool_ty, "has_b");
+            all_present = self.builder.and(all_present, has_bool, "has_acc");
         }
         all_present
     }
@@ -48,12 +47,12 @@ impl<'ctx> Codegen<'ctx> {
             if val.is_int_value() && to_ty.is_float() {
                 let iv = val.into_int_value();
                 let ft = if matches!(to_ty, Type::Float32) { self.context.f32_type().into() } else { self.context.f64_type() };
-                return self.builder.build_signed_int_to_float(iv, ft, "ir_i2f").unwrap().into();
+                return self.builder.signed_int_to_float(iv, ft, "ir_i2f").into();
             }
             if val.is_float_value() && to_ty.is_integer() {
                 let fv = val.into_float_value();
                 let it = self.llvm_type(to_ty).into_int_type();
-                return self.builder.build_float_to_signed_int(fv, it, "ir_f2i").unwrap().into();
+                return self.builder.float_to_signed_int(fv, it, "ir_f2i").into();
             }
             if val.is_int_value() && to_ty.is_integer() {
                 let iv = val.into_int_value();
@@ -61,9 +60,9 @@ impl<'ctx> Codegen<'ctx> {
                 let from_bits = iv.get_type().get_bit_width();
                 let to_bits = it.get_bit_width();
                 return if to_bits > from_bits {
-                    self.builder.build_int_z_extend_or_bit_cast(iv, it, "ir_zext").unwrap().into()
+                    self.builder.int_z_extend_or_bit_cast(iv, it, "ir_zext").into()
                 } else {
-                    self.builder.build_int_truncate_or_bit_cast(iv, it, "ir_trunc").unwrap().into()
+                    self.builder.int_truncate_or_bit_cast(iv, it, "ir_trunc").into()
                 };
             }
             return val;

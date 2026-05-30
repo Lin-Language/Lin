@@ -1,3 +1,4 @@
+use super::builder_ext::BuilderExt;
 use inkwell::values::BasicValueEnum;
 use inkwell::{AddressSpace, IntPredicate, FloatPredicate};
 
@@ -37,14 +38,14 @@ impl<'ctx> Codegen<'ctx> {
     ) -> BasicValueEnum<'ctx> {
         if ty.is_float() {
             match op {
-                "sub" => self.builder.build_float_sub(lv.into_float_value(), rv.into_float_value(), "fsub").unwrap().into(),
-                "mul" => self.builder.build_float_mul(lv.into_float_value(), rv.into_float_value(), "fmul").unwrap().into(),
+                "sub" => self.builder.float_sub(lv.into_float_value(), rv.into_float_value(), "fsub").into(),
+                "mul" => self.builder.float_mul(lv.into_float_value(), rv.into_float_value(), "fmul").into(),
                 _ => unreachable!(),
             }
         } else {
             match op {
-                "sub" => self.builder.build_int_sub(lv.into_int_value(), rv.into_int_value(), "sub").unwrap().into(),
-                "mul" => self.builder.build_int_mul(lv.into_int_value(), rv.into_int_value(), "mul").unwrap().into(),
+                "sub" => self.builder.int_sub(lv.into_int_value(), rv.into_int_value(), "sub").into(),
+                "mul" => self.builder.int_mul(lv.into_int_value(), rv.into_int_value(), "mul").into(),
                 _ => unreachable!(),
             }
         }
@@ -57,13 +58,13 @@ impl<'ctx> Codegen<'ctx> {
         ty: &Type,
     ) -> BasicValueEnum<'ctx> {
         if ty.is_float() {
-            self.builder.build_float_div(lv.into_float_value(), rv.into_float_value(), "fdiv").unwrap().into()
+            self.builder.float_div(lv.into_float_value(), rv.into_float_value(), "fdiv").into()
         } else {
             self.emit_int_zero_check(rv, "division by zero");
             if ty.is_signed() {
-                self.builder.build_int_signed_div(lv.into_int_value(), rv.into_int_value(), "sdiv").unwrap().into()
+                self.builder.int_signed_div(lv.into_int_value(), rv.into_int_value(), "sdiv").into()
             } else {
-                self.builder.build_int_unsigned_div(lv.into_int_value(), rv.into_int_value(), "udiv").unwrap().into()
+                self.builder.int_unsigned_div(lv.into_int_value(), rv.into_int_value(), "udiv").into()
             }
         }
     }
@@ -75,13 +76,13 @@ impl<'ctx> Codegen<'ctx> {
         ty: &Type,
     ) -> BasicValueEnum<'ctx> {
         if ty.is_float() {
-            self.builder.build_float_rem(lv.into_float_value(), rv.into_float_value(), "frem").unwrap().into()
+            self.builder.float_rem(lv.into_float_value(), rv.into_float_value(), "frem").into()
         } else {
             self.emit_int_zero_check(rv, "modulo by zero");
             if ty.is_signed() {
-                self.builder.build_int_signed_rem(lv.into_int_value(), rv.into_int_value(), "srem").unwrap().into()
+                self.builder.int_signed_rem(lv.into_int_value(), rv.into_int_value(), "srem").into()
             } else {
-                self.builder.build_int_unsigned_rem(lv.into_int_value(), rv.into_int_value(), "urem").unwrap().into()
+                self.builder.int_unsigned_rem(lv.into_int_value(), rv.into_int_value(), "urem").into()
             }
         }
     }
@@ -90,15 +91,15 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) fn emit_int_zero_check(&mut self, val: BasicValueEnum<'ctx>, msg: &str) {
         let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
         let zero = val.into_int_value().get_type().const_zero();
-        let is_zero = self.builder.build_int_compare(inkwell::IntPredicate::EQ, val.into_int_value(), zero, "divzero_chk").unwrap();
+        let is_zero = self.builder.int_compare(inkwell::IntPredicate::EQ, val.into_int_value(), zero, "divzero_chk");
         let panic_bb = self.context.append_basic_block(llvm_fn, "divzero_panic");
         let ok_bb = self.context.append_basic_block(llvm_fn, "divzero_ok");
-        self.builder.build_conditional_branch(is_zero, panic_bb, ok_bb).unwrap();
+        self.builder.conditional_branch(is_zero, panic_bb, ok_bb);
         self.builder.position_at_end(panic_bb);
         let panic_msg = self.compile_string_lit(msg);
         let zero_i32 = self.context.i32_type().const_zero();
-        self.builder.build_call(self.rt.panic, &[panic_msg.into(), zero_i32.into(), zero_i32.into()], "").unwrap();
-        self.builder.build_unreachable().unwrap();
+        self.builder.call(self.rt.panic, &[panic_msg.into(), zero_i32.into(), zero_i32.into()], "");
+        self.builder.unreachable();
         self.builder.position_at_end(ok_bb);
     }
 
@@ -125,21 +126,21 @@ impl<'ctx> Codegen<'ctx> {
                 .try_as_basic_value()
                 .unwrap_basic()
                 .into_int_value();
-            self.builder.build_int_truncate(eq_i8, self.context.bool_type(), "oeq_b").unwrap()
+            self.builder.int_truncate(eq_i8, self.context.bool_type(), "oeq_b")
         } else if let Type::Array(elem) = ty {
             let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
             let fn_ty = self.context.i8_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
             let eq_i8 = if Self::is_flat_scalar(elem) {
                 let suffix = Self::flat_suffix(elem);
                 let eq_fn = self.get_or_declare_fn(&format!("lin_flat_array_eq_{}", suffix), fn_ty);
-                self.builder.build_call(eq_fn, &[lv.into(), rv.into()], "aeq").unwrap()
+                self.builder.call(eq_fn, &[lv.into(), rv.into()], "aeq")
                     .try_as_basic_value().unwrap_basic().into_int_value()
             } else {
                 let eq_fn = self.get_or_declare_fn("lin_array_eq", fn_ty);
-                self.builder.build_call(eq_fn, &[lv.into(), rv.into()], "aeq").unwrap()
+                self.builder.call(eq_fn, &[lv.into(), rv.into()], "aeq")
                     .try_as_basic_value().unwrap_basic().into_int_value()
             };
-            self.builder.build_int_truncate(eq_i8, self.context.bool_type(), "aeq_b").unwrap()
+            self.builder.int_truncate(eq_i8, self.context.bool_type(), "aeq_b")
         } else if ty.is_float() {
             self.builder
                 .build_float_compare(FloatPredicate::OEQ, lv.into_float_value(), rv.into_float_value(), "feq")
@@ -147,16 +148,16 @@ impl<'ctx> Codegen<'ctx> {
         } else if lv.is_pointer_value() || rv.is_pointer_value() {
             // Pointer comparison (closures, etc.) — compare addresses.
             let lp = if lv.is_pointer_value() {
-                self.builder.build_ptr_to_int(lv.into_pointer_value(), i64_ty, "lpi").unwrap()
+                self.builder.ptr_to_int(lv.into_pointer_value(), i64_ty, "lpi")
             } else {
-                self.builder.build_int_s_extend_or_bit_cast(lv.into_int_value(), i64_ty, "lpx").unwrap()
+                self.builder.int_s_extend_or_bit_cast(lv.into_int_value(), i64_ty, "lpx")
             };
             let rp = if rv.is_pointer_value() {
-                self.builder.build_ptr_to_int(rv.into_pointer_value(), i64_ty, "rpi").unwrap()
+                self.builder.ptr_to_int(rv.into_pointer_value(), i64_ty, "rpi")
             } else {
-                self.builder.build_int_s_extend_or_bit_cast(rv.into_int_value(), i64_ty, "rpx").unwrap()
+                self.builder.int_s_extend_or_bit_cast(rv.into_int_value(), i64_ty, "rpx")
             };
-            self.builder.build_int_compare(IntPredicate::EQ, lp, rp, "peq").unwrap()
+            self.builder.int_compare(IntPredicate::EQ, lp, rp, "peq")
         } else {
             self.builder
                 .build_int_compare(IntPredicate::EQ, lv.into_int_value(), rv.into_int_value(), "ieq")
@@ -164,7 +165,7 @@ impl<'ctx> Codegen<'ctx> {
         };
 
         if negate {
-            self.builder.build_not(result, "neq").unwrap().into()
+            self.builder.not(result, "neq").into()
         } else {
             result.into()
         }
@@ -202,14 +203,14 @@ impl<'ctx> Codegen<'ctx> {
         // Normalize operand types: if either is a pointer, convert both to i64.
         let (lv, rv) = if lv.is_pointer_value() || rv.is_pointer_value() {
             let l = if lv.is_pointer_value() {
-                self.builder.build_ptr_to_int(lv.into_pointer_value(), i64_ty, "lpc").unwrap().into()
+                self.builder.ptr_to_int(lv.into_pointer_value(), i64_ty, "lpc").into()
             } else {
-                self.builder.build_int_s_extend_or_bit_cast(lv.into_int_value(), i64_ty, "lext").unwrap().into()
+                self.builder.int_s_extend_or_bit_cast(lv.into_int_value(), i64_ty, "lext").into()
             };
             let r = if rv.is_pointer_value() {
-                self.builder.build_ptr_to_int(rv.into_pointer_value(), i64_ty, "rpc").unwrap().into()
+                self.builder.ptr_to_int(rv.into_pointer_value(), i64_ty, "rpc").into()
             } else {
-                self.builder.build_int_s_extend_or_bit_cast(rv.into_int_value(), i64_ty, "rext").unwrap().into()
+                self.builder.int_s_extend_or_bit_cast(rv.into_int_value(), i64_ty, "rext").into()
             };
             (l, r)
         } else {
@@ -217,11 +218,11 @@ impl<'ctx> Codegen<'ctx> {
         };
 
         if ty.is_float() {
-            self.builder.build_float_compare(float_pred, lv.into_float_value(), rv.into_float_value(), "fcmp").unwrap().into()
+            self.builder.float_compare(float_pred, lv.into_float_value(), rv.into_float_value(), "fcmp").into()
         } else if ty.is_signed() || lv.is_int_value() && lv.into_int_value().get_type().get_bit_width() == 64 {
-            self.builder.build_int_compare(signed_pred, lv.into_int_value(), rv.into_int_value(), "scmp").unwrap().into()
+            self.builder.int_compare(signed_pred, lv.into_int_value(), rv.into_int_value(), "scmp").into()
         } else {
-            self.builder.build_int_compare(unsigned_pred, lv.into_int_value(), rv.into_int_value(), "ucmp").unwrap().into()
+            self.builder.int_compare(unsigned_pred, lv.into_int_value(), rv.into_int_value(), "ucmp").into()
         }
     }
 
@@ -230,16 +231,16 @@ impl<'ctx> Codegen<'ctx> {
             lir::UnaryOp::Neg => {
                 if val.is_int_value() {
                     let iv = val.into_int_value();
-                    self.builder.build_int_neg(iv, "ir_neg").unwrap().into()
+                    self.builder.int_neg(iv, "ir_neg").into()
                 } else if val.is_float_value() {
                     let fv = val.into_float_value();
-                    self.builder.build_float_neg(fv, "ir_fneg").unwrap().into()
+                    self.builder.float_neg(fv, "ir_fneg").into()
                 } else { val }
             }
             lir::UnaryOp::Not => {
                 if val.is_int_value() {
                     let iv = val.into_int_value();
-                    self.builder.build_not(iv, "ir_not").unwrap().into()
+                    self.builder.not(iv, "ir_not").into()
                 } else { val }
             }
         }
@@ -275,9 +276,9 @@ impl<'ctx> Codegen<'ctx> {
             let f64_ty = self.context.f64_type();
             let to_f = |s: &Self, v: BasicValueEnum<'ctx>| -> BasicValueEnum<'ctx> {
                 if v.is_int_value() {
-                    s.builder.build_signed_int_to_float(v.into_int_value(), f64_ty, "ir_i2f").unwrap().into()
+                    s.builder.signed_int_to_float(v.into_int_value(), f64_ty, "ir_i2f").into()
                 } else {
-                    s.builder.build_float_cast(v.into_float_value(), f64_ty, "ir_fwiden").unwrap().into()
+                    s.builder.float_cast(v.into_float_value(), f64_ty, "ir_fwiden").into()
                 }
             };
             let lf = to_f(self, lv);
@@ -298,9 +299,9 @@ impl<'ctx> Codegen<'ctx> {
                 let wide_ty = if wide_is_left { lty } else { rty };
                 let ext = |s: &Self, v: BasicValueEnum<'ctx>, src_ty: &Type| -> BasicValueEnum<'ctx> {
                     if src_ty.is_signed() {
-                        s.builder.build_int_s_extend(v.into_int_value(), wide, "ir_sext").unwrap().into()
+                        s.builder.int_s_extend(v.into_int_value(), wide, "ir_sext").into()
                     } else {
-                        s.builder.build_int_z_extend(v.into_int_value(), wide, "ir_zext").unwrap().into()
+                        s.builder.int_z_extend(v.into_int_value(), wide, "ir_zext").into()
                     }
                 };
                 let lext = if lw < wide.get_bit_width() { ext(self, lv, lty) } else { lv };
@@ -326,11 +327,10 @@ impl<'ctx> Codegen<'ctx> {
                     // already a TaggedVal*. `x == 3` boxes 3 as int; `t == "pass"` boxes the
                     // string. (box_rhs is a no-op for union rty.)
                     let rv_tagged = box_rhs(self, rv);
-                    let eq_u8 = self.builder.build_call(eq_fn, &[lv.into(), rv_tagged.into()], "ir_teq")
-                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
-                    let eq = self.builder.build_int_truncate(eq_u8, self.context.bool_type(), "ir_teq_b").unwrap();
+                    let eq_u8 = self.builder.call(eq_fn, &[lv.into(), rv_tagged.into()], "ir_teq").try_as_basic_value().unwrap_basic().into_int_value();
+                    let eq = self.builder.int_truncate(eq_u8, self.context.bool_type(), "ir_teq_b");
                     return if matches!(op, BinOp::NotEq) {
-                        self.builder.build_not(eq, "ir_tne").unwrap().into()
+                        self.builder.not(eq, "ir_tne").into()
                     } else { eq.into() };
                 }
                 BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => {
@@ -341,14 +341,13 @@ impl<'ctx> Codegen<'ctx> {
                     let cmp_fn = self.get_or_declare_fn("lin_tagged_cmp",
                         i32_ty.fn_type(&[ptr_t.into(), ptr_t.into()], false));
                     let rv_tagged = box_rhs(self, rv);
-                    let ord = self.builder.build_call(cmp_fn, &[lv.into(), rv_tagged.into()], "ir_tcmp")
-                        .unwrap().try_as_basic_value().unwrap_basic().into_int_value();
+                    let ord = self.builder.call(cmp_fn, &[lv.into(), rv_tagged.into()], "ir_tcmp").try_as_basic_value().unwrap_basic().into_int_value();
                     let zero = i32_ty.const_zero();
                     let pred = match op {
                         BinOp::Lt => IntPredicate::SLT, BinOp::LtEq => IntPredicate::SLE,
                         BinOp::Gt => IntPredicate::SGT, _ => IntPredicate::SGE,
                     };
-                    return self.builder.build_int_compare(pred, ord, zero, "ir_tcmp_b").unwrap().into();
+                    return self.builder.int_compare(pred, ord, zero, "ir_tcmp_b").into();
                 }
                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
                 | BinOp::BAnd | BinOp::BOr | BinOp::BXor | BinOp::Shl | BinOp::Shr => {
@@ -381,18 +380,18 @@ impl<'ctx> Codegen<'ctx> {
             BinOp::LtEq => self.compile_cmp(lv, rv, lty, IntPredicate::SLE, IntPredicate::ULE, FloatPredicate::OLE),
             BinOp::Gt => self.compile_cmp(lv, rv, lty, IntPredicate::SGT, IntPredicate::UGT, FloatPredicate::OGT),
             BinOp::GtEq => self.compile_cmp(lv, rv, lty, IntPredicate::SGE, IntPredicate::UGE, FloatPredicate::OGE),
-            BinOp::And => self.builder.build_and(lv.into_int_value(), rv.into_int_value(), "ir_and").unwrap().into(),
-            BinOp::Or => self.builder.build_or(lv.into_int_value(), rv.into_int_value(), "ir_or").unwrap().into(),
+            BinOp::And => self.builder.and(lv.into_int_value(), rv.into_int_value(), "ir_and").into(),
+            BinOp::Or => self.builder.or(lv.into_int_value(), rv.into_int_value(), "ir_or").into(),
             // Bitwise integer operators (§35.2). Operands are integers (checker-enforced)
             // and widths have been reconciled above.
-            BinOp::BAnd => self.builder.build_and(lv.into_int_value(), rv.into_int_value(), "ir_band").unwrap().into(),
-            BinOp::BOr => self.builder.build_or(lv.into_int_value(), rv.into_int_value(), "ir_bor").unwrap().into(),
-            BinOp::BXor => self.builder.build_xor(lv.into_int_value(), rv.into_int_value(), "ir_bxor").unwrap().into(),
-            BinOp::Shl => self.builder.build_left_shift(lv.into_int_value(), rv.into_int_value(), "ir_shl").unwrap().into(),
+            BinOp::BAnd => self.builder.and(lv.into_int_value(), rv.into_int_value(), "ir_band").into(),
+            BinOp::BOr => self.builder.or(lv.into_int_value(), rv.into_int_value(), "ir_bor").into(),
+            BinOp::BXor => self.builder.xor(lv.into_int_value(), rv.into_int_value(), "ir_bxor").into(),
+            BinOp::Shl => self.builder.left_shift(lv.into_int_value(), rv.into_int_value(), "ir_shl").into(),
             // `>>` is arithmetic for signed types and logical for unsigned types.
             BinOp::Shr => {
                 let sign_extend = lty.is_signed();
-                self.builder.build_right_shift(lv.into_int_value(), rv.into_int_value(), sign_extend, "ir_shr").unwrap().into()
+                self.builder.right_shift(lv.into_int_value(), rv.into_int_value(), sign_extend, "ir_shr").into()
             }
         }
     }
