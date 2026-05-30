@@ -3278,12 +3278,32 @@ Runs the thunk up to `n` times, returning the first successful result. If all at
 val threadPool: (Int32) -> ThreadPool
 ```
 
-Creates a thread pool with `n` worker threads. The pool can be used with `pool.async(thunk)` for submitting work, or `pool.serve(port, handler)` for a multi-threaded HTTP server.
+Creates a bounded thread pool with `n` worker threads draining a shared task queue. Submit
+work with `pool.poolAsync(thunk)` (see below). The pool bounds concurrency: at most `n` thunks
+run at once; excess work queues until a worker frees up.
 
 ```txt
 val pool = threadPool(8)
-val p = pool.async(() => heavyWork())
+val p = pool.poolAsync(() => heavyWork())
+val r = await(p)
 ```
+
+---
+
+### poolAsync
+
+```txt
+val poolAsync: (ThreadPool, () => T) -> Promise<T | Error>
+```
+
+Enqueues `thunk` on `pool` and returns a `Promise` for its result, resolved when a pool worker
+runs it. Designed for the dot-call form `pool.poolAsync(thunk)`. Same transferable-capture rules
+as the top-level `async` (the thunk's `val` captures are deep-copied across the boundary; it must
+not capture `var`). A fault inside the thunk is isolated and surfaces as an `Error` at `await`.
+
+> Note: the spec spells this `pool.async(...)`; in this implementation the pool submission method
+> is exported as `poolAsync` (a distinct name from the top-level `async`, which takes only a
+> thunk). `pool.serve(...)` for multi-threaded HTTP is not yet implemented.
 
 ---
 

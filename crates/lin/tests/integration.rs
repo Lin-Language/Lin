@@ -1954,6 +1954,88 @@ print(await(p))
 }
 
 #[test]
+fn test_pool_async_parallel() {
+    // 4 tasks of 100ms on a 4-worker pool overlap → ~100ms wall-clock, not 400ms.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { await, threadPool, poolAsync } from "std/async"
+import { sleep, now } from "std/time"
+
+val pool = threadPool(4)
+val start = now()
+val p1 = pool.poolAsync(() =>
+  sleep(100)
+  1
+)
+val p2 = pool.poolAsync(() =>
+  sleep(100)
+  2
+)
+val p3 = pool.poolAsync(() =>
+  sleep(100)
+  3
+)
+val p4 = pool.poolAsync(() =>
+  sleep(100)
+  4
+)
+val sum = await(p1) + await(p2) + await(p3) + await(p4)
+val elapsed = now() - start
+print(toString(sum))
+if elapsed < 300 then print("PARALLEL") else print("SLOW")
+"#);
+    assert_eq!(output, vec!["10", "PARALLEL"]);
+}
+
+#[test]
+fn test_pool_bounds_concurrency() {
+    // 4 tasks of 80ms on a 2-worker pool run in 2 waves → ~160ms (bounded), not ~80ms.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { await, threadPool, poolAsync } from "std/async"
+import { sleep, now } from "std/time"
+
+val pool = threadPool(2)
+val start = now()
+val a = pool.poolAsync(() =>
+  sleep(80)
+  1
+)
+val b = pool.poolAsync(() =>
+  sleep(80)
+  1
+)
+val c = pool.poolAsync(() =>
+  sleep(80)
+  1
+)
+val d = pool.poolAsync(() =>
+  sleep(80)
+  1
+)
+val total = await(a) + await(b) + await(c) + await(d)
+val elapsed = now() - start
+print(toString(total))
+if elapsed >= 140 then print("BOUNDED") else print("UNBOUNDED")
+"#);
+    assert_eq!(output, vec!["4", "BOUNDED"]);
+}
+
+#[test]
+fn test_pool_async_fault_isolation() {
+    let output = run(r#"import { print } from "std/io"
+import { await, threadPool, poolAsync } from "std/async"
+
+val pool = threadPool(2)
+val z = 0
+val p = pool.poolAsync(() => 1 / z)
+val r = await(p)
+print(r["type"])
+"#);
+    assert_eq!(output, vec!["error"]);
+}
+
+#[test]
 fn test_race_first_wins() {
     let output = run(r#"import { print } from "std/io"
 import { async, await, race } from "std/async"

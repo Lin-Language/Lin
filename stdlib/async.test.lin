@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
-import { async, await, parallel, race, timeout, retry, worker, request, close } from "std/async"
+import { async, await, parallel, race, timeout, retry, threadPool, poolAsync, worker, request, close } from "std/async"
 import { sleep } from "std/time"
 
 val s = suite("std/async", [
@@ -129,6 +129,26 @@ val s = suite("std/async", [
   test("retry surfaces Error when all attempts fail", () =>
     val z = 0
     val r = await(retry(() => 1 / z, 3))
+    val checks = [
+      expect(r["type"]).toBe("error")
+    ]
+    checks
+  ),
+
+  test("pool runs queued tasks", () =>
+    val pool = threadPool(2)
+    val p1 = pool.poolAsync(() => 10)
+    val p2 = pool.poolAsync(() => 20)
+    val checks = [
+      expect(await(p1) + await(p2)).toBe(30)
+    ]
+    checks
+  ),
+
+  test("pool task fault is isolated as Error", () =>
+    val pool = threadPool(2)
+    val z = 0
+    val r = await(pool.poolAsync(() => 1 / z))
     val checks = [
       expect(r["type"]).toBe("error")
     ]

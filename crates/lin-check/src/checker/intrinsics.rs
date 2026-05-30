@@ -164,6 +164,11 @@ impl Checker {
             ], Type::TypeVar(9105)));
         // threadPool: (Int32) => ThreadPool
         self.define_intrinsic("lin_thread_pool", Type::func(vec![Type::Int32], Type::TypeVar(9106)));
+        // poolAsync: (ThreadPool, () => T) => Promise<T>  — enqueue a thunk on a bounded pool.
+        self.define_intrinsic("lin_pool_async", Type::func(vec![
+                Type::TypeVar(9120),
+                Type::func(vec![], Type::TypeVar(9121)),
+            ], Type::TypeVar(9121)));
         // worker: ((Msg) => Reply, () => Null) => Worker
         self.define_intrinsic("lin_worker", Type::func(vec![
                 Type::func(vec![Type::TypeVar(9107)], Type::TypeVar(9108)),

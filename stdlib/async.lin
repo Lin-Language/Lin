@@ -19,6 +19,9 @@ export val retry = (f: Json, times: Int32): Json =>
 export val threadPool = (size: Int32): Json =>
   lin_thread_pool(size)
 
+export val poolAsync = (pool: Json, f: Json): Json =>
+  lin_pool_async(pool, f)
+
 export val worker = (handler: Json, onClose: Json): Json =>
   lin_worker(handler, onClose)
 

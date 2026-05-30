@@ -1751,6 +1751,9 @@ fn lower_intrinsic_call(
         "lin_array_allocate_filled" => Intrinsic::ArrayAllocateFilled,
         "concat" => Intrinsic::Concat,
         "lin_async" => Intrinsic::Async,
+        // pool.poolAsync(f) → lin_pool_async(pool, f): same intrinsic as async, but the 2-arg
+        // form routes to the bounded thread pool (codegen's Async branch detects the pool arg).
+        "lin_pool_async" => Intrinsic::Async,
         "lin_await" => Intrinsic::Await,
         "lin_exit" => Intrinsic::Exit,
         "lin_parallel" => Intrinsic::Parallel,

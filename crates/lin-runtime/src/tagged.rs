@@ -43,6 +43,11 @@ pub const TAG_UINT32: u8 = 15;
 /// codegen boxes a freshly-spawned promise and unboxes it at `await`/combinator boundaries. RC
 /// is a no-op for this tag (promises are not refcounted; `await` reaps the underlying thread).
 pub const TAG_PROMISE: u8 = 16;
+/// ThreadPool / Worker handle — payload is a `*mut LinThreadPool` / `*mut LinWorker` (opaque,
+/// non-refcounted, program-lifetime runtime handles). Boxed like a promise so the handle
+/// round-trips through TypeVar slots; codegen boxes the constructor result and unboxes at the
+/// method boundary (`pool.async`, `w.request`/`message`/`close`). RC is a no-op for this tag.
+pub const TAG_HANDLE: u8 = 17;
 
 #[repr(C)]
 #[derive(Clone, Copy)]

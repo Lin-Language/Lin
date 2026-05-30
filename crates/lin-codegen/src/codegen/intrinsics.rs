@@ -252,14 +252,27 @@ impl<'ctx> Codegen<'ctx> {
                 // fault boundary, and returns a LinPromise*. The thunk may arrive boxed (a
                 // Json-typed parameter, as in std/async's `async(f: Json)`) — unbox to the raw
                 // closure struct first.
+                //
+                // The `pool.async(f)` dot form desugars to `lin_async(pool, f)` (2 args): the
+                // first arg is the ThreadPool. We route that to lin_pool_async_one (enqueue) so
+                // the thunk runs on a pool worker instead of a fresh thread (spec §32.5).
                 let thunk = args.last().copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let thunk_ty = arg_tys.last().cloned().unwrap_or(Type::Null);
                 let thunk = if Self::is_union_type(&thunk_ty) && thunk.is_pointer_value() {
                     self.builder.call(self.rt.unbox_ptr, &[thunk.into()], "ir_async_cls").try_as_basic_value().unwrap_basic()
                 } else { thunk };
-                let spawn_fn = self.get_or_declare_fn("lin_async_spawn",
-                    ptr_ty.fn_type(&[ptr_ty.into()], false));
-                let raw = self.builder.call(spawn_fn, &[thunk.into()], "ir_async_spawn").try_as_basic_value().unwrap_basic();
+                let raw = if args.len() >= 2 {
+                    // pool.async(f): args[0] is the pool handle, boxed as TAG_HANDLE — unbox to
+                    // the raw *LinThreadPool.
+                    let pool = self.unbox_handle(args[0]);
+                    let pool_async_fn = self.get_or_declare_fn("lin_pool_async_one",
+                        ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                    self.builder.call(pool_async_fn, &[pool.into(), thunk.into()], "ir_pool_async").try_as_basic_value().unwrap_basic()
+                } else {
+                    let spawn_fn = self.get_or_declare_fn("lin_async_spawn",
+                        ptr_ty.fn_type(&[ptr_ty.into()], false));
+                    self.builder.call(spawn_fn, &[thunk.into()], "ir_async_spawn").try_as_basic_value().unwrap_basic()
+                };
                 // Box the raw *LinPromise into a TaggedVal*(TAG_PROMISE) so it round-trips
                 // through TypeVar slots and arrays (e.g. race([...])).
                 self.box_promise(raw)
@@ -350,7 +363,9 @@ impl<'ctx> Codegen<'ctx> {
                 let n_i32 = if n.is_int_value() { n.into_int_value() } else { i32_ty.const_int(2, false) };
                 let pool_fn = self.get_or_declare_fn("lin_thread_pool_new",
                     ptr_ty.fn_type(&[i32_ty.into()], false));
-                self.builder.call(pool_fn, &[n_i32.into()], "ir_pool").try_as_basic_value().unwrap_basic()
+                let raw = self.builder.call(pool_fn, &[n_i32.into()], "ir_pool").try_as_basic_value().unwrap_basic();
+                // Box the raw *LinThreadPool so it round-trips through TypeVar slots / Json params.
+                self.box_handle(raw)
             }
             // worker(handler, onClose) → lin_worker_new(fn_ptr, env_ptr, has_env). The handler
             // arrives as a (possibly boxed) closure value.
@@ -373,11 +388,14 @@ impl<'ctx> Codegen<'ctx> {
                 };
                 let worker_fn = self.get_or_declare_fn("lin_worker_new",
                     ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), i8_ty.into()], false));
-                self.builder.call(worker_fn, &[fn_ptr.into(), env_ptr.into(), has_env.into()], "ir_worker").try_as_basic_value().unwrap_basic()
+                let raw = self.builder.call(worker_fn, &[fn_ptr.into(), env_ptr.into(), has_env.into()], "ir_worker").try_as_basic_value().unwrap_basic();
+                // Box the raw *LinWorker so it round-trips through TypeVar slots / Json params.
+                self.box_handle(raw)
             }
             // w.request(msg) → lin_worker_request(w, boxed msg) → result (unboxed if concrete).
             Intrinsic::Request => {
-                let worker = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let worker_boxed = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let worker = self.unbox_handle(worker_boxed);
                 let msg = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let msg_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
                 let msg_ptr = if Self::is_union_type(&msg_ty) || msg.is_pointer_value() { msg } else { self.box_value(msg, &msg_ty) };
@@ -390,7 +408,8 @@ impl<'ctx> Codegen<'ctx> {
             }
             // w.message(msg) → lin_worker_message(w, boxed msg) (void).
             Intrinsic::Message => {
-                let worker = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let worker_boxed = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let worker = self.unbox_handle(worker_boxed);
                 let msg = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let msg_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
                 let msg_ptr = if Self::is_union_type(&msg_ty) || msg.is_pointer_value() { msg } else { self.box_value(msg, &msg_ty) };
@@ -401,7 +420,8 @@ impl<'ctx> Codegen<'ctx> {
             }
             // w.close() → lin_worker_close(w) (void).
             Intrinsic::Close => {
-                let worker = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let worker_boxed = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let worker = self.unbox_handle(worker_boxed);
                 let close_fn = self.get_or_declare_fn("lin_worker_close",
                     self.context.void_type().fn_type(&[ptr_ty.into()], false));
                 self.builder.call(close_fn, &[worker.into()], "");
@@ -540,6 +560,21 @@ impl<'ctx> Codegen<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let f = self.get_or_declare_fn("lin_unbox_promise", ptr_ty.fn_type(&[ptr_ty.into()], false));
         self.builder.call(f, &[boxed.into()], "ir_unbox_promise").try_as_basic_value().unwrap_basic()
+    }
+
+    /// Box an opaque runtime handle (ThreadPool/Worker) as TaggedVal*(TAG_HANDLE) so it
+    /// round-trips through TypeVar slots / Json params like any tagged value.
+    fn box_handle(&mut self, raw: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let f = self.get_or_declare_fn("lin_box_handle", ptr_ty.fn_type(&[ptr_ty.into()], false));
+        self.builder.call(f, &[raw.into()], "ir_box_handle").try_as_basic_value().unwrap_basic()
+    }
+
+    /// Unbox a boxed handle (TAG_HANDLE) back to the raw ThreadPool/Worker pointer.
+    fn unbox_handle(&mut self, boxed: BasicValueEnum<'ctx>) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let f = self.get_or_declare_fn("lin_unbox_handle", ptr_ty.fn_type(&[ptr_ty.into()], false));
+        self.builder.call(f, &[boxed.into()], "ir_unbox_handle").try_as_basic_value().unwrap_basic()
     }
 
     /// Compile a `toString` call on a typed value (used by LinIR intrinsic path).

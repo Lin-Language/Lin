@@ -36,11 +36,37 @@ pub struct LinPromise {
     handle: Option<JoinHandle<()>>,
 }
 
-/// A ThreadPool (Phase 4). Placeholder layout retained for ABI compatibility until Phase 4
-/// fills it in; `n` records the requested worker count.
+/// A unit of work for a thread pool: a thunk (fn_ptr + deep-copied private env) plus the
+/// promise state to resolve with its result. All pointers are addresses (Send) recast inside
+/// the worker; the env is a thread-private copy (Option C) so non-atomic RC is safe.
+struct PoolTask {
+    fn_addr: usize,
+    env_addr: usize,
+    env_size: u64,
+    result: Arc<(Mutex<PromiseState>, Condvar)>,
+}
+// SAFETY: fn_addr is read-only code; env is a private deep copy not shared with any other
+// thread; `result` is an Arc (Send). The addresses are upheld-valid by the spawn path.
+unsafe impl Send for PoolTask {}
+
+/// A bounded thread pool (spec §32.5): `n` worker threads draining a shared MPMC task queue.
+/// `pool.async` enqueues work rather than spawning. Dropping the pool (program exit) closes the
+/// queue; workers finish the in-flight task and exit.
 #[repr(C)]
 pub struct LinThreadPool {
     pub n: i32,
+    queue: Arc<PoolQueue>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+/// Shared task queue + shutdown flag, guarded by a mutex with a condvar for idle workers.
+struct PoolQueue {
+    tasks: Mutex<PoolQueueState>,
+    cvar: Condvar,
+}
+struct PoolQueueState {
+    queue: std::collections::VecDeque<PoolTask>,
+    shutdown: bool,
 }
 
 /// A Worker (Phase 5). Retained synchronous shape until Phase 5 replaces it with a real
@@ -91,6 +117,31 @@ pub unsafe extern "C" fn lin_unbox_promise(p: *mut u8) -> *mut LinPromise {
     } else {
         // Not a boxed promise — treat the pointer itself as the promise (legacy/raw path).
         p as *mut LinPromise
+    }
+}
+
+/// Box an opaque runtime handle (`*LinThreadPool` / `*LinWorker`) as a TaggedVal*(TAG_HANDLE)
+/// so it round-trips through TypeVar slots / Json params. Null → null.
+#[no_mangle]
+pub unsafe extern "C" fn lin_box_handle(h: *mut u8) -> *mut u8 {
+    if h.is_null() {
+        return std::ptr::null_mut();
+    }
+    crate::tagged::alloc_tagged(crate::tagged::TAG_HANDLE, h as u64)
+}
+
+/// Unbox a TaggedVal*(TAG_HANDLE) back to the raw handle pointer. Accepts an already-raw
+/// pointer defensively. Null → null.
+#[no_mangle]
+pub unsafe extern "C" fn lin_unbox_handle(p: *mut u8) -> *mut u8 {
+    if p.is_null() {
+        return std::ptr::null_mut();
+    }
+    let tv = &*(p as *const crate::tagged::TaggedVal);
+    if tv.tag == crate::tagged::TAG_HANDLE {
+        tv.payload as *mut u8
+    } else {
+        p
     }
 }
 
@@ -392,13 +443,112 @@ pub unsafe extern "C" fn lin_parallel(tasks: *mut u8) -> *mut u8 {
     out as *mut u8
 }
 
-/// Allocate a LinThreadPool with `n` workers. (Phase 4 fills in real worker threads.)
+/// One pool worker: drain the queue, running each task in a fault boundary and resolving its
+/// promise. Exits when the queue is shut down and empty.
+unsafe fn pool_worker_loop(queue: Arc<PoolQueue>) {
+    crate::fault::install_quiet_fault_hook();
+    loop {
+        let task = {
+            let mut state = queue.tasks.lock().unwrap();
+            loop {
+                if let Some(t) = state.queue.pop_front() {
+                    break Some(t);
+                }
+                if state.shutdown {
+                    break None;
+                }
+                state = queue.cvar.wait(state).unwrap();
+            }
+        };
+        let Some(task) = task else { return };
+        let fn_ptr = task.fn_addr as *mut u8;
+        let env_ptr = task.env_addr as *mut u8;
+        let outcome = crate::fault::with_async_boundary(|| {
+            let call: unsafe extern "C-unwind" fn(*mut u8) -> *mut u8 = std::mem::transmute(fn_ptr);
+            call(env_ptr)
+        });
+        if !env_ptr.is_null() && task.env_size > 0 {
+            crate::transfer::release_env_copy(env_ptr, task.env_size);
+        }
+        let (lock, cvar) = &*task.result;
+        let mut st = lock.lock().unwrap();
+        *st = match outcome {
+            Ok(v) => PromiseState::Resolved(SendPtr(v)),
+            Err(msg) => PromiseState::Failed(msg),
+        };
+        cvar.notify_all();
+    }
+}
+
+/// Allocate a bounded LinThreadPool with `n` worker threads draining a shared task queue.
+/// `n` is clamped to at least 1.
 #[no_mangle]
 pub unsafe extern "C" fn lin_thread_pool_new(n: i32) -> *mut LinThreadPool {
+    let count = n.max(1) as usize;
+    let queue = Arc::new(PoolQueue {
+        tasks: Mutex::new(PoolQueueState { queue: std::collections::VecDeque::new(), shutdown: false }),
+        cvar: Condvar::new(),
+    });
+    let mut workers = Vec::with_capacity(count);
+    for _ in 0..count {
+        let q = Arc::clone(&queue);
+        workers.push(std::thread::spawn(move || pool_worker_loop(q)));
+    }
     let ptr = lin_alloc(std::mem::size_of::<LinThreadPool>()) as *mut LinThreadPool;
-    (*ptr).n = n;
+    std::ptr::write(ptr, LinThreadPool { n, queue, workers });
     ptr
 }
+
+/// Enqueue `thunk` (a closure pointer) on `pool` and return a `LinPromise` for its result. The
+/// thunk's env is deep-copied (Option C) so the worker owns a private graph; a non-transferable
+/// env (CAP_OPAQUE) falls back to running inline on the calling thread. Mirror of
+/// `lin_async_spawn` but enqueues instead of spawning a fresh thread.
+#[no_mangle]
+pub unsafe extern "C" fn lin_pool_async_one(pool: *mut LinThreadPool, thunk: *mut u8) -> *mut LinPromise {
+    if pool.is_null() || thunk.is_null() {
+        return lin_async_spawn(thunk);
+    }
+    let fn_ptr = *(thunk.add(8) as *const *mut u8);
+    let env_ptr = *(thunk.add(16) as *const *mut u8);
+
+    if !crate::transfer::env_is_transferable(env_ptr) {
+        let outcome = crate::fault::with_async_boundary(|| {
+            let call: unsafe extern "C-unwind" fn(*mut u8) -> *mut u8 = std::mem::transmute(fn_ptr);
+            call(env_ptr)
+        });
+        return match outcome {
+            Ok(v) => lin_make_promise(v),
+            Err(msg) => lin_make_promise(make_error_tagged(&msg)),
+        };
+    }
+
+    let env_copy = crate::transfer::transfer_clone_env(env_ptr);
+    let env_size: u64 = if env_copy.is_null() {
+        0
+    } else {
+        let desc = *(env_copy as *const *const u8);
+        8 + (*(desc as *const u32) as u64) * 8
+    };
+
+    let result = Arc::new((Mutex::new(PromiseState::Pending), Condvar::new()));
+    let task = PoolTask {
+        fn_addr: fn_ptr as usize,
+        env_addr: env_copy as usize,
+        env_size,
+        result: Arc::clone(&result),
+    };
+    {
+        let q = &(*pool).queue;
+        let mut state = q.tasks.lock().unwrap();
+        state.queue.push_back(task);
+        q.cvar.notify_one();
+    }
+    let p = lin_alloc(std::mem::size_of::<LinPromise>()) as *mut LinPromise;
+    std::ptr::write(p, LinPromise { inner: result, handle: None });
+    p
+}
+
+/// Allocate a LinWorker with the given on_message closure. (Phase 5 replaces this.)
 
 /// Allocate a LinWorker with the given on_message closure. (Phase 5 replaces this.)
 #[no_mangle]
@@ -445,28 +595,3 @@ pub unsafe extern "C" fn lin_worker_message(worker: *mut LinWorker, msg: *mut u8
 /// Close a worker (no-op until Phase 5).
 #[no_mangle]
 pub unsafe extern "C" fn lin_worker_close(_worker: *mut LinWorker) {}
-
-/// Call a plain (capture-less) thunk on a thread pool. Phase 4 enqueues; for now spawn inline
-/// via a tiny synthetic closure shell so `lin_async_spawn` can read fn/env from offsets 8/16.
-#[no_mangle]
-pub unsafe extern "C" fn lin_pool_async_plain(
-    _pool: *mut LinThreadPool,
-    fn_ptr: *mut u8,
-) -> *mut LinPromise {
-    let shell = lin_alloc(24);
-    *(shell.add(8) as *mut *mut u8) = fn_ptr;
-    *(shell.add(16) as *mut *mut u8) = std::ptr::null_mut();
-    let p = lin_async_spawn(shell);
-    std::alloc::dealloc(shell, std::alloc::Layout::from_size_align_unchecked(24, 8));
-    p
-}
-
-/// Call a closure thunk on a thread pool. Phase 4 enqueues; for now delegate to the spawn path
-/// (which deep-copies the env). The `thunk` here is the full closure pointer.
-#[no_mangle]
-pub unsafe extern "C" fn lin_pool_async_closure(
-    _pool: *mut LinThreadPool,
-    thunk: *mut u8,
-) -> *mut LinPromise {
-    lin_async_spawn(thunk)
-}
