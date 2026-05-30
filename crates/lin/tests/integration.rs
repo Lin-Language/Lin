@@ -242,6 +242,29 @@ print(toString([1, 2] == [2, 1]))
     assert_eq!(output, vec!["true", "true", "true", "true", "true", "false"]);
 }
 
+// Arrays whose ELEMENTS are heap values (strings, nested arrays, objects) must compare
+// STRUCTURALLY, like the top-level object/array equality above. This currently fails:
+// `lin_array_eq` (lin-runtime/src/array.rs) compares element payloads by POINTER, so two
+// distinct-but-equal heap elements (e.g. two "a" strings) are seen as unequal and the whole
+// array compares false. Scalar-element arrays (handled by the int case in test_equality) are
+// unaffected because their payloads are inline values. Fix: lin_array_eq must recurse via
+// lin_tagged_eq for heap-tagged elements instead of comparing raw payload pointers.
+// Ignored until that fix lands — remove the #[ignore] once lin_array_eq recurses.
+#[test]
+#[ignore = "known bug: lin_array_eq compares heap elements by pointer, not structurally"]
+fn test_array_equality_with_heap_elements() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+print(toString(["a", "b"] == ["a", "b"]))
+print(toString(["a", "b"] == ["a", "c"]))
+print(toString([[1, 2], [3]] == [[1, 2], [3]]))
+print(toString([{ "k": 1 }] == [{ "k": 1 }]))
+print(toString([{ "k": 1 }] == [{ "k": 2 }]))
+"#);
+    assert_eq!(output, vec!["true", "false", "true", "true", "false"]);
+}
+
 #[test]
 fn test_pattern_matching_is() {
     let output = run(r#"import { print } from "std/io"
