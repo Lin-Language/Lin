@@ -233,6 +233,25 @@ val gradeFor = (avg: Int32): String =>
     else => "F"
 ```
 
+Parameters may have default values (which must come last, and may reference
+earlier parameters). Omit a trailing argument to use its default:
+
+```lin
+val greet = (name: String, greeting: String = "Hello") => "${greeting}, ${name}"
+
+print(greet("World"))         // Hello, World
+print(greet("World", "Hi"))   // Hi, World
+```
+
+Supplying fewer arguments than declared with a trailing comma partially applies
+the function instead:
+
+```lin
+val add = (a: Int32, b: Int32) => a + b
+val addTen = add(10,)         // a function awaiting `b`
+print(toString(addTen(5)))    // 15
+```
+
 ### Dot chaining
 
 `x.f(y)` is sugar for `f(x, y)`:

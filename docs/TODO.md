@@ -688,3 +688,8 @@ Tracked here so they don't get lost:
 - Full pairwise numeric widening matrix and explicit-cast catalogue.
 - Multi-error reporting (recoverable parse/check).
 - Mutual tail-call optimisation.
+- **Real OS-thread concurrency.** The async surface (§32) is fully specified and
+  wired through checker/IR/codegen, but the runtime (`async_rt.rs`) is a
+  synchronous stub — no actual threads. Making it real is gated on catchable
+  faults at the thread boundary, a thread-safe RC story, and deferred thunk
+  evaluation in codegen. Phased design + plan in **`docs/ASYNC_DESIGN.md`**.
