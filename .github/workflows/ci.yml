@@ -73,8 +73,8 @@ jobs:
             cargo run -p lin --quiet -- run "$f" || exit 1
           done
 
-      - name: Run stdlib tests
-        run: cargo run -p lin --quiet -- test stdlib/ --timeout 120
+      - name: Run stdlib and example tests
+        run: cargo run -p lin --quiet -- test stdlib/ examples/ --timeout 120
 
   # AddressSanitizer leg: builds an instrumented lin-runtime and links the compiled
   # test programs against it on the LinIR path, then runs the stdlib suite under ASan.
