@@ -30,6 +30,13 @@ pub enum Type {
         required: usize,
     },
     Iterator(Box<Type>),
+    /// `Shared<T>` — opt-in shared *mutable* state (ADR-044). An opaque box over `T`; the ONLY
+    /// operations are the `shared`/`get`/`set`/`withLock` accessors. It is deliberately NOT
+    /// structurally compatible with `T` or with `Json` (see `compat.rs`), so any other operation
+    /// on a `Shared<T>` — `push`, indexing, auto-unwrap — is a compile-time type error. It is
+    /// constructed only by the `shared` intrinsic's return type; it cannot be spelled in source
+    /// annotations (no `resolve.rs` case), so user code can never name it directly.
+    Shared(Box<Type>),
     TypeVar(u32),
     Never,
     /// A named type alias reference (used for recursive types that cannot be eagerly expanded).
@@ -186,6 +193,7 @@ impl fmt::Display for Type {
                 write!(f, ") => {}", ret)
             }
             Type::Iterator(inner) => write!(f, "Iterator<{}>", inner),
+            Type::Shared(inner) => write!(f, "Shared<{}>", inner),
             Type::TypeVar(id) => write!(f, "?T{}", id),
             Type::Never => write!(f, "Never"),
             Type::Named(name) => write!(f, "{}", name),

@@ -54,10 +54,23 @@ pub fn is_compatible_env(
     }
 
     match (value_type, target_type) {
-        (_, Type::TypeVar(_)) | (Type::TypeVar(_), _) => true,
-
+        // Never is the bottom type: assignable to anything (kept ahead of the Shared arms so
+        // `Never -> Shared<T>` stays compatible).
         (Type::Never, _) => true,
         (_, Type::Never) => false,
+
+        // `Shared<T>` is opaque and INVARIANT: it is compatible ONLY with another `Shared<U>`
+        // (with compatible inner types). Crucially these arms come BEFORE the TypeVar/`Json`
+        // wildcard below, so a `Shared<T>` does NOT silently widen to `Json` (which would let it
+        // flow into any `Json` parameter — e.g. `push(s, x)` — and defeat the accessor-only
+        // guard). The only ops on a `Shared<T>` are the shared/get/set/withLock accessors, whose
+        // intrinsic signatures take `Shared<T>` explicitly (ADR-044). Inner `Json` (TypeVar MAX)
+        // still matches via the recursive call, so `shared`'s generic `T` binds normally.
+        (Type::Shared(a), Type::Shared(b)) => is_compatible_env(a, b, env, depth),
+        (Type::Shared(_), _) => false,
+        (_, Type::Shared(_)) => false,
+
+        (_, Type::TypeVar(_)) | (Type::TypeVar(_), _) => true,
 
         // Numeric widening: narrower assignable to wider
         (a, b) if a.is_numeric() && b.is_numeric() => is_numeric_compatible(a, b),

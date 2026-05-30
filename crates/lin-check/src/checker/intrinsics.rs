@@ -170,17 +170,24 @@ impl Checker {
                 Type::func(vec![], Type::TypeVar(9121)),
             ], Type::TypeVar(9121)));
         // Shared<T> accessors (ADR-043 §2.3.1). The opaque Shared<T> type is modelled with a
-        // TypeVar here (no dedicated Type variant yet); the runtime enforces the box semantics.
+        // The opaque `Shared<T>` type (ADR-044): the four accessors below are the ONLY operations.
+        // `Shared<T>` is invariant and never auto-unwraps to `T`/`Json`, so any other op on it
+        // (push, indexing, …) is a compile-time type error. Each accessor shares a single TypeVar
+        // `T` between its `Shared<T>` and the bare `T`, so inference links the two.
         //   shared:   <T>(T) => Shared<T>
         //   get:      <T>(Shared<T>) => T          (snapshot copy-out)
         //   set:      <T>(Shared<T>, T) => Null    (copy-in)
-        //   withLock: <T,R>(Shared<T>, (T) => R) => R
-        self.define_intrinsic("lin_shared", Type::func(vec![Type::TypeVar(9130)], Type::TypeVar(9131)));
-        self.define_intrinsic("lin_shared_get", Type::func(vec![Type::TypeVar(9132)], Type::TypeVar(9133)));
-        self.define_intrinsic("lin_shared_set", Type::func(vec![Type::TypeVar(9134), Type::TypeVar(9135)], Type::Null));
+        //   withLock: <T, R>(Shared<T>, (T) => R) => R
+        let shared_t = || Type::TypeVar(9130);
+        self.define_intrinsic("lin_shared",
+            Type::func(vec![shared_t()], Type::Shared(Box::new(shared_t()))));
+        self.define_intrinsic("lin_shared_get",
+            Type::func(vec![Type::Shared(Box::new(shared_t()))], shared_t()));
+        self.define_intrinsic("lin_shared_set",
+            Type::func(vec![Type::Shared(Box::new(shared_t())), shared_t()], Type::Null));
         self.define_intrinsic("lin_shared_with_lock", Type::func(vec![
-                Type::TypeVar(9136),
-                Type::func(vec![Type::TypeVar(9137)], Type::TypeVar(9138)),
+                Type::Shared(Box::new(shared_t())),
+                Type::func(vec![shared_t()], Type::TypeVar(9138)),
             ], Type::TypeVar(9138)));
         // frozen: <T>(T) => T  (deep immortal seal; the value keeps its plain type so readers use
         // it transparently). Frozen<T> read-only coercion / mutation-inference is deferred (ADR-045).

@@ -90,6 +90,9 @@ fn resolve_named_cycle(
         )),
         // Iterator without type argument: use Json wildcard element type
         "Iterator" => Ok(Type::Iterator(Box::new(json_type()))),
+        // Shared without a type argument: Shared<Json>. The opaque shared-mutable-state box
+        // (ADR-044); only the shared/get/set/withLock accessors operate on it.
+        "Shared" => Ok(Type::Shared(Box::new(json_type()))),
         _ => {
             // Cycle detected: return Named(name) as an opaque reference instead of expanding.
             if visiting.contains(name) {
@@ -161,6 +164,12 @@ fn resolve_generic(
                 return Err("Iterator takes exactly 1 type argument".to_string());
             }
             Ok(Type::Iterator(Box::new(args[0].clone())))
+        }
+        "Shared" => {
+            if args.len() != 1 {
+                return Err("Shared takes exactly 1 type argument".to_string());
+            }
+            Ok(Type::Shared(Box::new(args[0].clone())))
         }
         _ => {
             if let Some(decl) = env.lookup_type(name) {

@@ -3367,11 +3367,16 @@ Safety: every value entering is copied in, every value leaving is copied out, so
 reference into the box escapes the lock. `get`/`set` are individually atomic but not across the
 gap (last-writer-wins); use `withLock` when the update must be atomic.
 
+> `Shared<T>` is **accessor-only**: `shared`/`get`/`set`/`withLock` are the only operations.
+> Passing a `Shared` value to anything else (e.g. `push(s, 7)`, indexing) is a compile-time type
+> error — the box never auto-unwraps to its inner type or to `Json` (ADR-044). The inner value
+> is reachable only via `get`/`withLock`, which copy it out. (This check is enforced by
+> `lin build`/`lin run`, which resolve imports; a bare `lin check` does not resolve imports and
+> so won't show it.)
+>
 > Caveat: `withLock` mutates **in place**, so a scalar accumulator (`n => n + 1`) does not
-> persist — use a one-element array or `get`/`set`. The compile-time accessor-only enforcement
-> (rejecting e.g. `push(s, 7)` directly on a `Shared`) is not yet wired (it needs a dedicated
-> `Shared<T>` type variant in the checker); the runtime box semantics are fully enforced.
-> Importing both `std/array`'s `set` and this `set` in one file collides — alias one.
+> persist — use a one-element array or `get`/`set`. Importing both `std/array`'s `set` and this
+> `set` in one file collides — alias one.
 
 ---
 

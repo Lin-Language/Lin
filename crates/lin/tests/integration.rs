@@ -2651,6 +2651,42 @@ print(toString(length(get(box))))
 }
 
 #[test]
+fn test_shared_rejects_non_accessor_op() {
+    // ADR-044: Shared<T> is accessor-only. Passing a Shared value to a non-accessor (here
+    // `push`, which wants an array/Json) is a compile-time type error — the Shared box never
+    // auto-unwraps to its inner type or to Json.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { shared } from "std/async"
+import { push } from "std/array"
+
+val s = shared([1, 2, 3])
+push(s, 7)
+print("unreachable")
+"#);
+    assert!(
+        err.contains("Shared"),
+        "expected a Shared-related type error, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_shared_get_result_is_usable_inner_type() {
+    // The flip side: get(s) yields the inner type, which IS usable with ordinary ops — proving
+    // the guard blocks the Shared box itself, not values copied out of it.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { shared, get } from "std/async"
+import { push, length } from "std/array"
+
+val s = shared([1, 2, 3])
+val snap = get(s)
+push(snap, 4)
+print(toString(length(snap)))
+"#);
+    assert_eq!(output, vec!["4"]);
+}
+
+#[test]
 fn test_async_real_parallelism() {
     // Two thunks that each sleep 150ms. With real OS threads the wall-clock should be
     // ~150ms (overlap), not ~300ms (sequential). Assert it completed well under the
