@@ -285,6 +285,21 @@ impl<'ctx> Codegen<'ctx> {
             let rf = to_f(self, rv);
             return self.compile_binary_op_values(lf, rf, op, &Type::Float64, &Type::Float64, result_ty);
         }
+        // Mismatched float widths (Float32 op Float64): widen the narrower operand to the
+        // wider with fpext, then dispatch on the wider float type. Without this, `f32 + f64`
+        // hit "Both operands to a binary operator are not of the same type".
+        if lv.is_float_value() && rv.is_float_value() {
+            let lw = lv.into_float_value().get_type().get_bit_width();
+            let rw = rv.into_float_value().get_type().get_bit_width();
+            if lw != rw {
+                let wide_is_left = lw > rw;
+                let wide = if wide_is_left { lv.into_float_value().get_type() } else { rv.into_float_value().get_type() };
+                let wide_ty = if wide_is_left { lty } else { rty };
+                let lf = if lw < wide.get_bit_width() { self.builder.float_ext(lv.into_float_value(), wide, "ir_fpext").into() } else { lv };
+                let rf = if rw < wide.get_bit_width() { self.builder.float_ext(rv.into_float_value(), wide, "ir_fpext").into() } else { rv };
+                return self.compile_binary_op_values(lf, rf, op, wide_ty, wide_ty, result_ty);
+            }
+        }
         // Mismatched integer widths (e.g. Int64 `n` vs an Int32 literal `0`): sign-extend
         // the narrower operand to the wider so the ICmp/arith operands agree.
         if lv.is_int_value() && rv.is_int_value() {

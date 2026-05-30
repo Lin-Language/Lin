@@ -54,6 +54,22 @@ impl<'ctx> Codegen<'ctx> {
                 let it = self.llvm_type(to_ty).into_int_type();
                 return self.builder.float_to_signed_int(fv, it, "ir_f2i").into();
             }
+            if val.is_float_value() && to_ty.is_float() {
+                // Float ↔ float width change: fpext (Float32→Float64) or fptrunc
+                // (Float64→Float32). Without this arm the value stayed at its source
+                // width and the downstream call/store saw the wrong float type.
+                let fv = val.into_float_value();
+                let ft = self.llvm_type(to_ty).into_float_type();
+                let from_bits = fv.get_type().get_bit_width();
+                let to_bits = ft.get_bit_width();
+                return if to_bits > from_bits {
+                    self.builder.float_ext(fv, ft, "ir_fpext").into()
+                } else if to_bits < from_bits {
+                    self.builder.float_trunc(fv, ft, "ir_fptrunc").into()
+                } else {
+                    val
+                };
+            }
             if val.is_int_value() && to_ty.is_integer() {
                 let iv = val.into_int_value();
                 let it = self.llvm_type(to_ty).into_int_type();
