@@ -14,6 +14,8 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/bytes`](#stdbytes) | Byte-buffer slicing and endian (de)serialization |
 | [`std/math`](#stdmath) | Mathematical functions |
 | [`std/object`](#stdobject) | Object introspection functions |
+| [`std/json`](#stdjson) | Type-directed JSON decode |
+| [`std/hash`](#stdhash) | Stable structural hash of any value |
 | [`std/io`](#stdio) | stdin/stdout and terminal input |
 | [`std/fs`](#stdfs) | Filesystem read and write |
 | [`std/path`](#stdpath) | Path string manipulation |
@@ -65,6 +67,7 @@ This document specifies the standard library for the Lin language. All modules a
 | Function | Signature | Summary |
 | --- | --- | --- |
 | [`append`](#append) | `(Json[], Json) -> Json[]` | Non-mutating single-element append |
+| [`arrayAllocate`](#arrayAllocate) | `(Int32) -> Json[]` | Allocate an array of n nulls |
 | [`at`](#at-array) | `(Json[], Int32) -> Json` | Element at index; negative indices count from end |
 | [`chunk`](#chunk) | `(Json[], Int32) -> Json[][]` | Split into n-sized sub-arrays |
 | [`compact`](#compact) | `(Json[]) -> Json[]` | Remove null elements |
@@ -93,10 +96,12 @@ This document specifies the standard library for the Lin language. All modules a
 | [`prepend`](#prepend) | `(Json[], Json) -> Json[]` | Non-mutating single-element prepend |
 | [`product`](#product) | `(Number[]) -> Number` | Product of all elements |
 | [`push`](#push) | `(Json[], Json) -> Null` | Append an element to an array in place |
-| [`range`](#range) | `(Int32, Int32, Int32?) -> Iterator` | Integer range `[start, end)` with optional step |
+| [`range`](#range) | `(Int32, Int32) -> Iterator` | Integer range `[start, end)`, step 1 |
+| [`rangeStep`](#rangeStep) | `(Int32, Int32, Int32) -> Iterator` | Integer range with an explicit (possibly negative) step |
 | [`reduce`](#reduce) | `(Json[], Json, (Json, Json) -> Json) -> Json` | Fold left with an accumulator |
 | [`reverse`](#reverse) | `(Json[]) -> Json[]` | Return a reversed copy |
 | [`scan`](#scan) | `(Json[], Json, (Json, Json) -> Json) -> Json[]` | Reduce returning all intermediate values |
+| [`set`](#set-array) | `(Json[], Int32, Json) -> Null` | Set an element by index in place |
 | [`slice`](#slice) | `(T[], Int32, Int32) -> T[]` | Sub-buffer copy; preserves element type |
 | [`some`](#some) | `(Json[], (Json) -> Boolean) -> Boolean` | True if any element matches |
 | [`sort`](#sort) | `(Json[], (Json, Json) -> Int32) -> Json[]` | Return sorted copy using comparator |
@@ -256,13 +261,19 @@ This document specifies the standard library for the Lin language. All modules a
 | [`async`](#async) | `(() -> T) -> Promise` | Run a thunk asynchronously |
 | [`await`](#await) | `(Promise) -> T` | Block until a promise resolves |
 | [`close`](#close) | `(Worker) -> Null` | Shut down a worker |
+| [`frozen`](#frozen) | `<T>(T) -> T` | Deep-freeze a value into lock-free shared read-only state |
+| [`get`](#shared--get--set--withlock) | `<T>(Shared<T>) -> T` | Read a snapshot copy out of a `Shared` |
 | [`message`](#message) | `(Worker, Msg) -> Null` | Send a fire-and-forget message to a worker |
 | [`parallel`](#parallel) | `((() -> T)[]) -> T[]` | Run an array of thunks concurrently, collect results |
+| [`poolAsync`](#poolAsync) | `(ThreadPool, () -> T) -> Promise` | Enqueue a thunk on a thread pool |
 | [`race`](#race) | `(Promise[]) -> T` | Resolve with the first promise to complete |
 | [`request`](#request) | `(Worker, Msg) -> Reply` | Send a request to a worker and wait for reply |
 | [`retry`](#retry) | `(() -> T, Int32) -> T` | Retry a thunk up to n times on failure |
+| [`set`](#shared--get--set--withlock) | `<T>(Shared<T>, T) -> Null` | Replace a `Shared`'s value |
+| [`shared`](#shared--get--set--withlock) | `<T>(T) -> Shared<T>` | Create opt-in shared mutable state |
 | [`threadPool`](#threadPool) | `(Int32) -> ThreadPool` | Create a thread pool with n workers |
 | [`timeout`](#timeout) | `(Promise, Int32) -> T` | Add a millisecond timeout to a promise |
+| [`withLock`](#shared--get--set--withlock) | `<T, R>(Shared<T>, (T) -> R) -> R` | Atomic read-modify-write on a `Shared` |
 | [`worker`](#worker) | `((Msg) -> Reply, () -> Null) -> Worker` | Create a background worker |
 
 **std/env**
@@ -312,7 +323,8 @@ This document specifies the standard library for the Lin language. All modules a
 | [`fromIso`](#fromIso) | `(String) -> Int64 \| Error` | Parse an ISO 8601 string to a millisecond timestamp |
 | [`now`](#now) | `() -> Int64` | Current Unix timestamp in milliseconds |
 | [`parse`](#parse-time) | `(String, String) -> Int64 \| Error` | Parse a date string with a format pattern |
-| [`sleep`](#sleep) | `(Int32) -> Null` | Block for n milliseconds |
+| [`sleep`](#sleep) | `(Int64) -> Null` | Block for n milliseconds |
+| [`sleepMicros`](#sleepMicros) | `(Int64) -> Null` | Block for n microseconds |
 | [`startTimer`](#startTimer) | `() -> Timer` | Start a high-resolution elapsed timer |
 | [`toIso`](#toIso) | `(Int64) -> String` | Format a timestamp as ISO 8601 |
 
@@ -741,6 +753,22 @@ Returns a new array with `item` added at the end. Does not modify `arr`. For in-
 ```txt
 append([1, 2], 3)    // [1, 2, 3]
 append([], "hello")  // ["hello"]
+```
+
+---
+
+### arrayAllocate
+
+```txt
+val arrayAllocate: (n: Int32) -> Json[]
+```
+
+Returns a new array of length `n` with every element initialised to `null`. Useful as a
+pre-sized buffer to fill by index with [`set`](#set-array).
+
+```txt
+val buf = arrayAllocate(3)   // [null, null, null]
+set(buf, 0, "a")
 ```
 
 ---
@@ -1196,16 +1224,30 @@ push(xs, 2)
 ### range
 
 ```txt
-val range: (start: Int32, end: Int32, step: Int32?) -> Iterator
+val range: (start: Int32, end: Int32) -> Iterator
 ```
 
-Returns an iterator that yields integers from `start` up to (but not including) `end`, advancing by `step` each time. `step` defaults to `1` if omitted. `step` must be positive; if `start >= end`, the iterator is empty.
+Returns an iterator that yields integers from `start` up to (but not including) `end`, stepping by `1`. If `start >= end`, the iterator is empty. For a custom or negative step, use [`rangeStep`](#rangeStep).
 
 ```txt
 range(0, 3).for(i => print(toString(i)))   // prints 0, 1, 2
 range(1, 4).map(i => i * 2)               // [2, 4, 6]
-range(0, 10, 2).map(i => i)               // [0, 2, 4, 6, 8]
 range(5, 5)                               // empty
+```
+
+---
+
+### rangeStep
+
+```txt
+val rangeStep: (start: Int32, end: Int32, step: Int32) -> Iterator
+```
+
+Returns an iterator that yields integers from `start` toward `end` (exclusive), advancing by `step` each time. With a positive `step` it counts up while `i < end`; with a negative `step` it counts down while `i > end`. A `step` of `0` yields an empty iterator.
+
+```txt
+rangeStep(0, 10, 2).for(i => print(toString(i)))   // 0, 2, 4, 6, 8
+rangeStep(5, 0, -1).map(i => i)                    // [5, 4, 3, 2, 1]
 ```
 
 ---
@@ -1249,6 +1291,23 @@ Like `reduce`, but returns an array of all intermediate accumulator values inclu
 ```txt
 [1, 2, 3, 4].scan(0, (acc, x) => acc + x)   // [0, 1, 3, 6, 10]
 [].scan(0, (acc, x) => acc + x)              // [0]
+```
+
+---
+
+### set (array) {#set-array}
+
+```txt
+val set: (arr: Json[], index: Int32, item: Json) -> Null
+```
+
+Sets the element at `index` to `item` **in place** — a mutating operation, the index-assignment counterpart to [`push`](#push). `index` must be in bounds (`0 <= index < length(arr)`); an out-of-bounds index is a runtime error. Often paired with [`arrayAllocate`](#arrayAllocate) to fill a pre-sized buffer.
+
+```txt
+val buf = arrayAllocate(3)
+set(buf, 0, "a")
+set(buf, 1, "b")
+// buf is now ["a", "b", null]
 ```
 
 ---
@@ -2273,6 +2332,36 @@ bare type name): `type IntArr = Int32[]; IntArr.fromJson([1, 2, 3])`.
 
 A `Json` value cannot be assigned to a concrete structured object without decoding — `fromJson`
 (or `is`/`has` narrowing) is the sound conversion (ADR-046).
+
+---
+
+## std/hash
+
+Import:
+
+```txt
+import { hash } from "std/hash"
+```
+
+---
+
+### hash
+
+```txt
+val hash: (x: Json) -> String
+```
+
+Returns a canonical, type-tagged string key for any JSON value. The key is stable and matches Lin's structural equality (spec §14): equal values produce equal keys, objects hash independently of key order, and arrays hash order-sensitively. Values of different types never collide — the key carries a type tag, so `hash(42)` (`"i:42"`) differs from `hash("42")` (`"s:42"`). Use it to deduplicate or index values by structural identity (e.g. as object keys in a manual set/map).
+
+```txt
+hash(null)        // "N"
+hash(true)        // "b:true"
+hash(42)          // "i:42"
+hash("hello")     // "s:hello"
+hash([1, 2, 3]) == hash([1, 2, 3])   // true
+hash([1, 2]) == hash([2, 1])         // false
+hash(42) == hash("42")               // false
+```
 
 ---
 
@@ -3918,7 +4007,7 @@ parse("bad", "%Y-%m-%d")                     // { "type": "failure", "error": ".
 ### sleep
 
 ```txt
-val sleep: (ms: Int32) -> Null
+val sleep: (ms: Int64) -> Null
 ```
 
 Blocks the current thread for at least `ms` milliseconds.
