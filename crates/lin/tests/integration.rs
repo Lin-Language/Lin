@@ -7368,3 +7368,35 @@ print(toString(items[1]["type"]))
 "#);
     assert_eq!(out, vec!["2", "1", "3", "3", "b"]);
 }
+
+#[test]
+fn test_combinator_over_non_array_json_is_safe_noop() {
+    // Regression: a `for`/`filter`/`map`/`reduce` over a statically-`Json` value whose RUNTIME value
+    // is NOT an array (here an Object) must NOT misread the non-array payload as a `LinArray`.
+    //
+    // The combinator loop used `lin_length_dyn` for its bound (which reports an Object's KEY COUNT)
+    // and then blindly unboxed the Json pointer and read it through `lin_array_get_tagged` — so for
+    // a 2-key object it ran 2 iterations, dereferencing the `LinObject` as a `LinArray` (UB:
+    // "misaligned pointer dereference: address must be a multiple of 0x4 but is 0x41" — a string byte
+    // read as an i32 flat-array buffer). This was the docs-builder crash: an `ls()` error object
+    // (`{ "type": "error", ... }`) flowed into `allFiles.filter(...)` because the builder's guard
+    // checked for "failure" not "error". The fix bounds the combinator loop with `lin_iterable_length`
+    // (array length, else 0), so iterating a non-array Json is a clean no-op and the result is empty.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { filter, map, reduce, for, length } from "std/array"
+import { contains } from "std/string"
+val mkObj = (): Json => { "type": "error", "message": "boom" }
+val v = mkObj()
+val kept = v.filter(x => contains(x, "a"))
+print(toString(length(kept)))
+val mapped = v.map(x => x)
+print(toString(length(mapped)))
+val total = v.reduce(0, (acc, x) => acc + 1)
+print(toString(total))
+var n = 0
+v.for(x => n = n + 1)
+print(toString(n))
+"#);
+    assert_eq!(out, vec!["0", "0", "0", "0"]);
+}
