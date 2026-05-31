@@ -8,6 +8,8 @@
 import { load } from "./loader"
 import { print } from "std/io"
 import { toString } from "std/string"
+import { parse } from "std/yaml"
+import { jqFirst } from "std/jq"
 
 val show = (label: String, raw: Json): Null =>
   match load(raw)
@@ -27,3 +29,15 @@ show("missing-name", { "port": 3000 })
 
 // Wrong type for `port`.
 show("bad-type", { "name": "svc", "port": "not-a-number" })
+
+// Config doesn't have to be inline JSON — parse it from YAML. A parsed YAML
+// document is an ordinary Json value, so it flows through the same load() path.
+val yamlSrc = "name: from-yaml\nhost: 10.0.0.1\nport: 7000\ndebug: true\n"
+match parse(yamlSrc)
+  is Error => print("yaml: parse failed")
+  else     => show("yaml", parse(yamlSrc))
+
+// Query the parsed config with a jq filter (the "yq" pattern: yaml.parse(...).jq(...)).
+// jqFirst returns the single matched value, or null if the path is absent.
+val port = yamlSrc.parse().jqFirst(".port")
+print("yaml-port via jq: ${toString(port)}")
