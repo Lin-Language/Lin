@@ -2692,7 +2692,17 @@ fn alloc_output_array(elem_ty: &Type, result_type: &Type, builder: &mut FuncBuil
 
 /// Push `val` (typed `val_ty`) into an output array allocated by `alloc_output_array`.
 /// Flat arrays take the raw scalar; tagged arrays take a Json-boxed value.
-fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp, val_ty: &Type, builder: &mut FuncBuilder) {
+///
+/// `borrowed` records whether `val` is a value this combinator BORROWS rather than freshly owns:
+/// `filter` pushes the very element it read from the SOURCE array (still owned by the source), so
+/// the result must take its OWN reference; `map` pushes the lambda's fresh result (+1 it owns), so
+/// the push MOVES it. The tagged push of a CONCRETE-rc element (`Push` → `lin_array_push_tagged`)
+/// raw-copies the TaggedVal WITHOUT bumping the inner refcount (move semantics), so a borrowed
+/// concrete element must be `Retain`ed first — otherwise both the source array and the result array
+/// reference the same object at refcount 1, and releasing both double-frees it (the `filter` over an
+/// object array UAF; ADR-069 R2). A UNION element pushes via the retaining `lin_push_dyn`, and a
+/// flat-scalar element carries no refcount, so neither needs the extra retain.
+fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp, val_ty: &Type, borrowed: bool, builder: &mut FuncBuilder) {
     let push_dst = builder.alloc_temp(Type::Null);
     match flat {
         Some(kind) => {
@@ -2711,6 +2721,14 @@ fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp,
             });
         }
         None => {
+            // A borrowed CONCRETE-rc element pushed into a tagged result array via the MOVE
+            // intrinsic (`lin_array_push_tagged`, which does NOT bump the inner refcount) must be
+            // retained so the result array owns its own reference (else double-free with the
+            // source array at teardown — the `filter`-over-object-array UAF). Union elements push
+            // via the retaining `lin_push_dyn`; flat scalars carry no refcount — neither needs this.
+            if borrowed && is_rc_type(val_ty) && !is_union_ty(val_ty) {
+                builder.emit(Instruction::Retain { val, ty: val_ty.clone() });
+            }
             let boxed = box_to_json(val, val_ty, builder);
             builder.emit(Instruction::CallIntrinsic {
                 dst: push_dst, intrinsic: Intrinsic::Push, args: vec![out, boxed], ret_ty: Type::Null,
@@ -3103,7 +3121,8 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
         emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |_, elem, b, c| {
             let (mapped, mapped_ty) =
                 inline_lambda_body(&lam_params, &lam_body, &[(elem, elem_ty.clone())], b, c);
-            push_output(out, flat, &out_elem_ty, mapped, &mapped_ty, b);
+            // `mapped` is the lambda's freshly-owned result (+1) — MOVE it into the result array.
+            push_output(out, flat, &out_elem_ty, mapped, &mapped_ty, false, b);
         });
         return out;
     }
@@ -3113,7 +3132,8 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
 
     emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |_, elem, b, _| {
         let mapped = call_body_closure(f, &[(elem, elem_ty.clone())], &param_tys, &cb_ret, b);
-        push_output(out, flat, &out_elem_ty, mapped, &cb_ret, b);
+        // `mapped` is the callback's freshly-owned result (+1) — MOVE it into the result array.
+        push_output(out, flat, &out_elem_ty, mapped, &cb_ret, false, b);
     });
     out
 }
@@ -3156,7 +3176,9 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
             let skip_block = b.alloc_block("filter_skip");
             b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: skip_block });
             b.switch_to(keep_block);
-            push_output(out, flat, &out_elem_ty, elem, &elem_ty, b);
+            // `elem` is BORROWED from the source array — the result array must take its own
+            // reference (retain on a tagged concrete-rc push; see `push_output`).
+            push_output(out, flat, &out_elem_ty, elem, &elem_ty, true, b);
             b.terminate(Terminator::Jump(skip_block));
             b.switch_to(skip_block);
         });
@@ -3171,7 +3193,8 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
         let skip_block = b.alloc_block("filter_skip");
         b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: skip_block });
         b.switch_to(keep_block);
-        push_output(out, flat, &out_elem_ty, elem, &elem_ty, b);
+        // `elem` is BORROWED from the source array — retain on the tagged concrete-rc push.
+        push_output(out, flat, &out_elem_ty, elem, &elem_ty, true, b);
         b.terminate(Terminator::Jump(skip_block));
         b.switch_to(skip_block);
     });
