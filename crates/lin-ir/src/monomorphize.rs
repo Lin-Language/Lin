@@ -22,6 +22,24 @@ use std::collections::HashMap;
 
 use lin_check::typed_ir::*;
 use lin_check::types::Type;
+use lin_common::Diagnostic;
+
+/// Maximum number of distinct *native* (unboxed) specializations minted per generic function.
+/// Beyond this, further distinct instantiations fall back to a single shared boxed/type-erased
+/// copy (correct, just not unboxed) so pathological programs can't blow up code size. A
+/// diagnostic is emitted on first overflow so the fallback is never silent. Picked generously:
+/// real programs instantiate a generic at a handful of types.
+///
+/// Overridable via the `LIN_SPEC_BUDGET` env var (used by tests, where minting 50+ distinct
+/// concrete instantiations of one generic is otherwise impractical given the small type universe).
+const SPECIALIZATION_BUDGET_DEFAULT: usize = 50;
+
+fn specialization_budget() -> usize {
+    std::env::var("LIN_SPEC_BUDGET")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SPECIALIZATION_BUDGET_DEFAULT)
+}
 
 /// Lowest id used for a quantified generic type parameter (mirrors `lin-check`'s
 /// `next_generic_tv` base; 9000 itself is the intrinsic array/iterator slot).
@@ -154,8 +172,26 @@ pub fn module_has_generic_fn(module: &TypedModule) -> bool {
 }
 
 /// Entry point: rewrite generic-function calls to monomorphized specializations.
-/// Returns the module unchanged when it contains no generic functions.
-pub fn monomorphize(module: &mut TypedModule) {
+/// Returns the diagnostics produced (errors for generic calls that cannot be instantiated);
+/// the module is left unchanged when it contains no generic functions.
+///
+/// Three improvements over the original Phase-0 pass (single-module hardening):
+///   - **Worklist/fixpoint (BUG 1):** materializing one specialization clones the generic body,
+///     substitutes its quantified TypeVars with the concrete instantiation, then re-runs the call
+///     rewriter *over that body*. A nested call to another generic (`wrap`→`id`) is therefore
+///     re-monomorphized under the composed substitution, routing to the native `id$Int32` instead
+///     of leaving a half-generic `id$T9002` copy. New specs minted while materializing are pushed
+///     back onto the worklist and processed until it drains.
+///   - **Alias propagation + boxed fallback (BUG 2):** a generic bound to another `val`
+///     (`val f = id`) is tracked as an alias, so an indirect call `f(5)` monomorphizes to
+///     `id$Int32` exactly like a direct call. Any generic call that still can't be turned into a
+///     native specialization (a generic used as a first-class value that escapes, or a budget
+///     overflow) routes through a *boxed/type-erased* call to the kept generic original: the call
+///     boxes its args (TypeVar params ⇒ uniform boxed ptr ABI) and the result is unboxed back to
+///     the concrete type via a wrapping `Coerce`. Correct, just not unboxed — and never a panic.
+///   - **Budget (`SPECIALIZATION_BUDGET`):** caps distinct native specializations per generic;
+///     overflow instantiations take the boxed fallback and emit a one-time diagnostic.
+pub fn monomorphize(module: &mut TypedModule) -> Vec<Diagnostic> {
     // 1. Discover top-level generic functions (slot -> GenericFn).
     let mut generics: HashMap<usize, GenericFn> = HashMap::new();
     for stmt in &module.statements {
@@ -170,65 +206,135 @@ pub fn monomorphize(module: &mut TypedModule) {
         }
     }
     if generics.is_empty() {
-        return; // No-op for ordinary modules.
+        return Vec::new(); // No-op for ordinary modules.
     }
 
-    // Fresh slot allocator: start above the highest slot currently in use.
-    let mut next_slot = max_slot(module) + 1;
+    // 1b. Build the alias map: `val f = id` where `id` (transitively) names a generic. The call
+    //     rewriter treats a call through an alias slot exactly like a direct call to the underlying
+    //     generic. This is what lets `val f = id; f(5)` monomorphize correctly (BUG 2).
+    let aliases = collect_generic_aliases(&module.statements, &generics);
 
-    // 2. Walk the whole module, rewriting calls to generic functions and queuing
-    //    specializations. `specs` dedups by instantiation key; `new_vals` accumulates the
-    //    specialized top-level `Val`s to append.
-    let mut specs: HashMap<(usize, Vec<(u32, String)>), SpecInfo> = HashMap::new();
-    let mut used_generic_slots: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut state = MonoState {
+        generics,
+        aliases,
+        specs: HashMap::new(),
+        worklist: Vec::new(),
+        per_generic_count: HashMap::new(),
+        boxed_fallback_used: std::collections::HashSet::new(),
+        next_slot: max_slot(module) + 1,
+        used_generic_slots: std::collections::HashSet::new(),
+        diagnostics: Vec::new(),
+        budget: specialization_budget(),
+    };
 
+    // 2. Walk the whole module, rewriting calls to generic functions and queuing specializations.
     let mut stmts = std::mem::take(&mut module.statements);
     for stmt in &mut stmts {
-        rewrite_stmt(stmt, &generics, &mut specs, &mut next_slot, &mut used_generic_slots);
+        rewrite_stmt(stmt, &mut state);
     }
 
-    // 3. Materialize each specialization as a concrete top-level Val with the quantified
-    //    TypeVars substituted throughout its body.
-    let mut new_vals: Vec<TypedStmt> = Vec::new();
-    for (_, spec) in specs.iter() {
-        let g = &generics[&spec.generic_slot];
+    // 3. Drain the worklist: materialize each native specialization by cloning the generic body,
+    //    substituting its quantified TypeVars, then re-running the call rewriter over the body
+    //    (which may mint further specializations — pushed back onto the worklist). Fixpoint.
+    let mut materialized: Vec<TypedStmt> = Vec::new();
+    while let Some(key) = state.worklist.pop() {
+        let (generic_slot, spec_slot, spec_name, subs) = {
+            let info = &state.specs[&key];
+            (info.generic_slot, info.slot, info.name.clone(), info.subs.clone())
+        };
+        let g = &state.generics[&generic_slot];
         let mut func = g.func.clone();
-        subst_expr(&mut func, &spec.subs);
+        let span = g.func.span();
+        subst_expr(&mut func, &subs);
         if let TypedExpr::Function { name, .. } = &mut func {
-            *name = Some(spec.name.clone());
+            *name = Some(spec_name.clone());
         }
+        // Re-monomorphize calls inside the now-concrete body (worklist fixpoint).
+        rewrite_expr(&mut func, &mut state);
         let ty = func.ty();
-        new_vals.push(TypedStmt::Val {
-            slot: spec.slot,
-            name: Some(spec.name.clone()),
+        materialized.push(TypedStmt::Val {
+            slot: spec_slot,
+            name: Some(spec_name),
             value: func,
             ty,
-            span: g.func.span(),
+            span,
         });
     }
     // Deterministic order so codegen/IR output is stable across runs.
-    new_vals.sort_by(|a, b| {
-        let sa = if let TypedStmt::Val { slot, .. } = a { *slot } else { 0 };
-        let sb = if let TypedStmt::Val { slot, .. } = b { *slot } else { 0 };
-        sa.cmp(&sb)
-    });
+    materialized.sort_by_key(|s| if let TypedStmt::Val { slot, .. } = s { *slot } else { 0 });
 
-    // 4. Drop now-unused generic originals (only direct calls were rewritten; an unused generic
-    //    original left in place would force codegen to compile a boxed polymorphic stub). A
-    //    generic still referenced (e.g. as a value) is kept as-is — out of Phase 0 scope.
+    // 3b. A generic function used as a FIRST-CLASS VALUE that escapes (e.g. passed as an argument
+    //     to another function, `apply(f, 5)`) cannot be monomorphized: there is no single concrete
+    //     type to specialize at, and emitting the bare generic as a closure value would feed
+    //     codegen a half-typed function (the historical malformed-IR / parameter-type-mismatch).
+    //     Detect any surviving generic/alias `LocalGet` that is not (a) the direct callee of a
+    //     boxed-fallback call or (b) the RHS of a plain alias `val`, and report a clear diagnostic
+    //     rather than letting codegen emit broken IR. (Out of single-module Phase 0/3.5 scope.)
+    let generic_slots: std::collections::HashSet<usize> = state.generics.keys().copied().collect();
+    let alias_slots: std::collections::HashSet<usize> = state.aliases.keys().copied().collect();
+    let mut value_use: Option<(usize, lin_common::Span)> = None;
+    for stmt in stmts.iter().chain(materialized.iter()) {
+        scan_value_uses(stmt, &generic_slots, &alias_slots, &mut |slot, span| {
+            if value_use.is_none() {
+                value_use = Some((slot, span));
+            }
+        });
+    }
+    if let Some((slot, span)) = value_use {
+        let gslot = if generic_slots.contains(&slot) { slot } else { state.aliases[&slot] };
+        let name = state.generics[&gslot].name.clone();
+        state.diagnostics.push(
+            Diagnostic::error(span, format!(
+                "generic function '{}' is used as a first-class value here, which is not supported",
+                name
+            ))
+            .with_help("call the generic directly (e.g. `f(x)`) so it can be monomorphized to a concrete type".to_string())
+        );
+    }
+
+    // 4. Drop generic originals that are no longer referenced. An original is KEPT when it is still
+    //    used: either directly as a first-class value, or as the target of a boxed-fallback call.
+    let keep: std::collections::HashSet<usize> = state
+        .used_generic_slots
+        .union(&state.boxed_fallback_used)
+        .copied()
+        .collect();
     stmts.retain(|stmt| {
         if let TypedStmt::Val { slot, value: TypedExpr::Function { .. }, .. } = stmt {
-            if generics.contains_key(slot) {
-                return used_generic_slots.contains(slot);
+            if generic_slots.contains(slot) {
+                return keep.contains(slot);
             }
         }
         true
     });
 
-    // Insert specializations just before `main`-level use. Appending keeps top-level ordering
-    // valid: function `val`s are forward-declared by slot in lowering, so order is immaterial.
-    stmts.extend(new_vals);
+    // Insert specializations after the originals. Order is immaterial — top-level function `val`s
+    // are forward-declared by slot in lowering.
+    stmts.extend(materialized);
     module.statements = stmts;
+    state.diagnostics
+}
+
+/// Mutable working state threaded through the rewrite/worklist passes.
+struct MonoState {
+    /// Top-level generic functions, keyed by their `val` slot.
+    generics: HashMap<usize, GenericFn>,
+    /// Alias slot -> underlying generic slot (`val f = id`).
+    aliases: HashMap<usize, usize>,
+    /// Deduped specializations, keyed by (generic slot + sorted concrete args).
+    specs: HashMap<(usize, Vec<(u32, String)>), SpecInfo>,
+    /// Spec keys awaiting materialization (worklist for the fixpoint).
+    worklist: Vec<(usize, Vec<(u32, String)>)>,
+    /// Native specialization count per generic slot (for the budget).
+    per_generic_count: HashMap<usize, usize>,
+    /// Generic slots that have emitted the one-time budget-overflow diagnostic.
+    boxed_fallback_used: std::collections::HashSet<usize>,
+    next_slot: usize,
+    /// Generic slots still referenced as plain first-class values (kept, not dropped).
+    used_generic_slots: std::collections::HashSet<usize>,
+    diagnostics: Vec<Diagnostic>,
+    /// Per-generic native-specialization cap (see `specialization_budget`).
+    budget: usize,
 }
 
 struct SpecInfo {
@@ -236,6 +342,96 @@ struct SpecInfo {
     slot: usize,
     name: String,
     subs: HashMap<u32, Type>,
+}
+
+/// True if `slot` names a generic function or an alias of one.
+fn is_generic_or_alias(
+    slot: usize,
+    generic_slots: &std::collections::HashSet<usize>,
+    alias_slots: &std::collections::HashSet<usize>,
+) -> bool {
+    generic_slots.contains(&slot) || alias_slots.contains(&slot)
+}
+
+/// Walk a top-level statement reporting any `LocalGet` of a generic/alias slot that ESCAPES as a
+/// first-class value. Legitimate, non-escaping occurrences are skipped:
+///   - a plain alias `val f = <generic LocalGet>` RHS (just records the binding), and
+///   - the direct callee (`func`) of a `Call` (a call we either monomorphized or routed through
+///     the boxed fallback — both fine).
+fn scan_value_uses(
+    stmt: &TypedStmt,
+    generic_slots: &std::collections::HashSet<usize>,
+    alias_slots: &std::collections::HashSet<usize>,
+    report: &mut dyn FnMut(usize, lin_common::Span),
+) {
+    match stmt {
+        // Skip the RHS of a pure alias binding (`val f = id`).
+        TypedStmt::Val { value: TypedExpr::LocalGet { slot, .. }, .. }
+            if is_generic_or_alias(*slot, generic_slots, alias_slots) => {}
+        TypedStmt::Val { value, .. } | TypedStmt::Var { value, .. } => {
+            scan_value_uses_expr(value, generic_slots, alias_slots, report)
+        }
+        TypedStmt::Destructure { value, .. } | TypedStmt::ArrayDestructure { value, .. } => {
+            scan_value_uses_expr(value, generic_slots, alias_slots, report)
+        }
+        TypedStmt::Expr(e) => scan_value_uses_expr(e, generic_slots, alias_slots, report),
+        TypedStmt::Import { .. } | TypedStmt::ForeignImport { .. } => {}
+    }
+}
+
+fn scan_value_uses_expr(
+    expr: &TypedExpr,
+    generic_slots: &std::collections::HashSet<usize>,
+    alias_slots: &std::collections::HashSet<usize>,
+    report: &mut dyn FnMut(usize, lin_common::Span),
+) {
+    // A direct LocalGet of a generic/alias slot reached here (i.e. NOT excluded as a Call func or
+    // alias RHS) is an escaping value use.
+    if let TypedExpr::LocalGet { slot, span, .. } = expr {
+        if is_generic_or_alias(*slot, generic_slots, alias_slots) {
+            report(*slot, *span);
+            return;
+        }
+    }
+    // For a Call, the callee `func` is allowed to be a generic/alias LocalGet (monomorphized or
+    // boxed-fallback call). Scan only the arguments for escaping value uses.
+    if let TypedExpr::Call { args, .. } = expr {
+        for a in args {
+            scan_value_uses_expr(a, generic_slots, alias_slots, report);
+        }
+        return;
+    }
+    for_each_child(expr, &mut |c| scan_value_uses_expr(c, generic_slots, alias_slots, report));
+}
+
+/// Build the alias map: every `val X = <LocalGet of a generic-or-alias slot>` records `X`'s slot
+/// pointing at the underlying generic. Resolved transitively so `val g = f; val f = id` both map
+/// to `id`. Only plain re-bindings are aliases; any other use is a real value reference.
+fn collect_generic_aliases(
+    stmts: &[TypedStmt],
+    generics: &HashMap<usize, GenericFn>,
+) -> HashMap<usize, usize> {
+    let mut aliases: HashMap<usize, usize> = HashMap::new();
+    // Direct generic-slot targets first.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for stmt in stmts {
+            if let TypedStmt::Val { slot, value: TypedExpr::LocalGet { slot: src, .. }, .. } = stmt {
+                let target = if generics.contains_key(src) {
+                    Some(*src)
+                } else {
+                    aliases.get(src).copied()
+                };
+                if let Some(t) = target {
+                    if aliases.insert(*slot, t) != Some(t) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    aliases
 }
 
 /// Highest slot index referenced anywhere in the module (Val/Var/param/destructure/LocalGet).
@@ -298,92 +494,236 @@ fn max_slot_expr(expr: &TypedExpr, m: &mut usize) {
 // Call rewriting
 // ---------------------------------------------------------------------------
 
-fn rewrite_stmt(
-    stmt: &mut TypedStmt,
-    generics: &HashMap<usize, GenericFn>,
-    specs: &mut HashMap<(usize, Vec<(u32, String)>), SpecInfo>,
-    next_slot: &mut usize,
-    used: &mut std::collections::HashSet<usize>,
-) {
+fn rewrite_stmt(stmt: &mut TypedStmt, state: &mut MonoState) {
     match stmt {
-        TypedStmt::Val { value, .. } | TypedStmt::Var { value, .. } => {
-            rewrite_expr(value, generics, specs, next_slot, used);
-        }
+        // The body of a top-level generic function is a TEMPLATE whose param/return types are
+        // still symbolic TypeVars. Do NOT rewrite calls inside it here — its calls are only
+        // resolvable once the body is cloned and substituted at a concrete instantiation
+        // (materialization re-runs `rewrite_expr` on the substituted body). Rewriting the template
+        // in place would see an inner call like `id(y:U)` as an unconstrained generic call.
+        TypedStmt::Val { slot, value: TypedExpr::Function { .. }, .. }
+            if state.generics.contains_key(slot) => {}
+        TypedStmt::Val { value, .. } | TypedStmt::Var { value, .. } => rewrite_expr(value, state),
         TypedStmt::Destructure { value, .. } | TypedStmt::ArrayDestructure { value, .. } => {
-            rewrite_expr(value, generics, specs, next_slot, used);
+            rewrite_expr(value, state)
         }
-        TypedStmt::Expr(e) => rewrite_expr(e, generics, specs, next_slot, used),
+        TypedStmt::Expr(e) => rewrite_expr(e, state),
         TypedStmt::Import { .. } | TypedStmt::ForeignImport { .. } => {}
     }
 }
 
-fn rewrite_expr(
-    expr: &mut TypedExpr,
-    generics: &HashMap<usize, GenericFn>,
-    specs: &mut HashMap<(usize, Vec<(u32, String)>), SpecInfo>,
-    next_slot: &mut usize,
-    used: &mut std::collections::HashSet<usize>,
-) {
-    // Rewrite a direct call to a generic function first (so we substitute before recursing into
-    // its now-concrete args, which are already concrete anyway).
-    if let TypedExpr::Call { func, args, result_type, .. } = expr {
+fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState) {
+    // Recurse into children FIRST so any nested generic calls (e.g. in this call's arguments) are
+    // rewritten before we handle this node. Doing it first also means that after we (possibly) wrap
+    // a generic call in a `Coerce` for the boxed fallback, we do NOT re-descend into the wrapped
+    // call — which would otherwise re-trigger the rewrite and loop forever.
+    for_each_child_mut(expr, &mut |c| rewrite_expr(c, state));
+
+    // Handle a call to a generic function (directly by name, or through a `val f = id` alias).
+    if let TypedExpr::Call { func, args, result_type, span, .. } = expr {
         if let TypedExpr::LocalGet { slot, .. } = func.as_ref() {
-            if let Some(g) = generics.get(slot) {
+            // Resolve the underlying generic slot (direct or via alias chain).
+            let generic_slot = if state.generics.contains_key(slot) {
+                Some(*slot)
+            } else {
+                state.aliases.get(slot).copied()
+            };
+            if let Some(gslot) = generic_slot {
+                let g = &state.generics[&gslot];
                 if let TypedExpr::Function { params, ret_type, .. } = &g.func {
-                    // Unify generic signature against the concrete call types.
+                    let params = params.clone();
+                    let ret_type = ret_type.clone();
+                    // Unify the generic signature against the concrete call types.
                     let mut subs: HashMap<u32, Type> = HashMap::new();
                     for (p, a) in params.iter().zip(args.iter()) {
                         collect_subs(&p.ty, &a.ty(), &mut subs);
                     }
-                    // The call's result_type is the checker's concrete instantiation of `ret`.
-                    collect_subs(ret_type, result_type, &mut subs);
+                    collect_subs(&ret_type, result_type, &mut subs);
 
-                    if subs.keys().all(|id| *id >= GENERIC_TV_BASE && *id != u32::MAX)
-                        && !subs.is_empty()
-                    {
-                        let key = instantiation_key(*slot, &subs);
-                        let spec_slot = if let Some(info) = specs.get(&key) {
-                            info.slot
+                    // Fully instantiated ⇔ every quantified id has a concrete (no remaining
+                    // generic TypeVar) binding AND nothing is left unconstrained.
+                    let all_quantified = subs
+                        .keys()
+                        .all(|id| *id >= GENERIC_TV_BASE && *id != u32::MAX);
+                    let fully_concrete = !subs.is_empty()
+                        && all_quantified
+                        && subs.values().all(|t| !mentions_generic_tv(t));
+
+                    if fully_concrete {
+                        // Respect the per-generic native-specialization budget.
+                        let key = instantiation_key(gslot, &subs);
+                        let known = state.specs.contains_key(&key);
+                        let count = *state.per_generic_count.get(&gslot).unwrap_or(&0);
+                        if known || count < state.budget {
+                            let base_name = g_name(state, gslot);
+                            let spec_slot = native_spec_slot(state, gslot, &base_name, key, subs.clone());
+                            repoint_call_native(func, &params, &ret_type, &subs, spec_slot);
                         } else {
-                            let s = *next_slot;
-                            *next_slot += 1;
-                            let name = specialization_name(&g.name, &subs);
-                            specs.insert(key.clone(), SpecInfo {
-                                generic_slot: *slot,
-                                slot: s,
-                                name,
-                                subs: subs.clone(),
-                            });
-                            s
-                        };
-                        // Repoint the call's func LocalGet at the specialization. Give the
-                        // LocalGet the concrete specialized function type so lowering resolves
-                        // the right ABI; the global_fn_slots map keys on this slot.
-                        let concrete_params: Vec<Type> =
-                            params.iter().map(|p| subst_type(&p.ty, &subs)).collect();
-                        let concrete_ret = subst_type(ret_type, &subs);
-                        let required = params.iter().filter(|p| p.default.is_none()).count();
-                        let fn_ty = Type::Function {
-                            params: concrete_params,
-                            ret: Box::new(concrete_ret),
-                            required,
-                        };
-                        if let TypedExpr::LocalGet { slot: fslot, ty, .. } = func.as_mut() {
-                            *fslot = spec_slot;
-                            *ty = fn_ty;
+                            // Budget exceeded: fall back to one shared boxed copy of the original.
+                            if state.boxed_fallback_used.insert(gslot) {
+                                let name = g_name(state, gslot);
+                                let budget = state.budget;
+                                state.diagnostics.push(
+                                    Diagnostic::warning(*span, format!(
+                                        "generic function '{}' exceeded the specialization budget of {} distinct instantiations",
+                                        name, budget
+                                    ))
+                                    .with_help("further instantiations are compiled as a single boxed (type-erased) copy — correct, but slower than a per-type specialization".to_string())
+                                );
+                            }
+                            boxed_fallback_call(expr, gslot, &params, &ret_type, state);
                         }
+                    } else if mentions_unconstrained(&subs, &params, &ret_type) {
+                        // A type parameter is not pinned down by the arguments or the result type:
+                        // we cannot pick a concrete monomorphization. This is a hard error rather
+                        // than silently-wrong code.
+                        let name = g_name(state, gslot);
+                        state.diagnostics.push(
+                            Diagnostic::error(*span, format!(
+                                "cannot infer a concrete type for the type parameter(s) of generic function '{}' at this call",
+                                name
+                            ))
+                            .with_help("annotate the argument(s) or the surrounding context so every type parameter is determined".to_string())
+                        );
+                        // Keep the original around so codegen still has a (boxed) definition.
+                        state.boxed_fallback_used.insert(gslot);
+                        boxed_fallback_call(expr, gslot, &params, &ret_type, state);
                     } else {
-                        // Could not fully instantiate (e.g. generic-in-generic). Keep the
-                        // original; this path is out of Phase 0 scope.
-                        used.insert(*slot);
+                        // No substitution at all (e.g. a generic used purely as a value here).
+                        state.used_generic_slots.insert(gslot);
                     }
                 }
             }
         }
     }
+}
 
-    // Recurse into children.
-    for_each_child_mut(expr, &mut |c| rewrite_expr(c, generics, specs, next_slot, used));
+/// Name of the generic function for slot `gslot`.
+fn g_name(state: &MonoState, gslot: usize) -> String {
+    state.generics[&gslot].name.clone()
+}
+
+/// Mint (or look up) a native specialization for `gslot` at `subs`, returning its slot. New specs
+/// bump the per-generic budget counter and are pushed onto the worklist for materialization.
+fn native_spec_slot(
+    state: &mut MonoState,
+    gslot: usize,
+    base_name: &str,
+    key: (usize, Vec<(u32, String)>),
+    subs: HashMap<u32, Type>,
+) -> usize {
+    if let Some(info) = state.specs.get(&key) {
+        return info.slot;
+    }
+    let s = state.next_slot;
+    state.next_slot += 1;
+    let name = specialization_name(base_name, &subs);
+    state.specs.insert(key.clone(), SpecInfo { generic_slot: gslot, slot: s, name, subs });
+    *state.per_generic_count.entry(gslot).or_insert(0) += 1;
+    state.worklist.push(key);
+    s
+}
+
+/// Repoint a generic call's `func` LocalGet at the native specialization slot, giving it the
+/// concrete specialized function type so lowering resolves the unboxed ABI.
+fn repoint_call_native(
+    func: &mut Box<TypedExpr>,
+    params: &[TypedParam],
+    ret_type: &Type,
+    subs: &HashMap<u32, Type>,
+    spec_slot: usize,
+) {
+    let concrete_params: Vec<Type> = params.iter().map(|p| subst_type(&p.ty, subs)).collect();
+    let concrete_ret = subst_type(ret_type, subs);
+    let required = params.iter().filter(|p| p.default.is_none()).count();
+    let fn_ty = Type::Function {
+        params: concrete_params,
+        ret: Box::new(concrete_ret),
+        required,
+    };
+    if let TypedExpr::LocalGet { slot: fslot, ty, .. } = func.as_mut() {
+        *fslot = spec_slot;
+        *ty = fn_ty;
+    }
+}
+
+/// Rewrite `expr` (a generic Call) into a boxed/type-erased call to the kept generic original.
+///
+/// The call's `func` is repointed at the generic original's slot with the *generic* (TypeVar)
+/// signature, so lowering boxes each concrete argument into the uniform boxed-ptr ABI the original
+/// (with TypeVar params) expects, and the Direct call returns a boxed ptr. The whole call is then
+/// wrapped in a `Coerce { from: <generic ret TypeVar>, to: <concrete result> }` so the boxed
+/// result is unboxed back to the type the surrounding context expects. Correct, just not unboxed.
+fn boxed_fallback_call(
+    expr: &mut TypedExpr,
+    gslot: usize,
+    params: &[TypedParam],
+    ret_type: &Type,
+    _state: &mut MonoState,
+) {
+    let TypedExpr::Call { func, result_type, .. } = expr else { return };
+    let concrete_result = result_type.clone();
+    let required = params.iter().filter(|p| p.default.is_none()).count();
+    // Give the func LocalGet the generic original's slot + generic signature so lowering uses the
+    // boxed (TypeVar ⇒ ptr) ABI and boxes the args.
+    let generic_fn_ty = Type::Function {
+        params: params.iter().map(|p| p.ty.clone()).collect(),
+        ret: Box::new(ret_type.clone()),
+        required,
+    };
+    if let TypedExpr::LocalGet { slot: fslot, ty, .. } = func.as_mut() {
+        *fslot = gslot;
+        *ty = generic_fn_ty;
+    }
+    // The Direct call now yields the generic return type (a boxed ptr for a TypeVar). Make the
+    // Call's own result_type match that so lowering reads a ptr, then unbox via Coerce.
+    *result_type = ret_type.clone();
+    let span = expr.span();
+    let inner = std::mem::replace(expr, TypedExpr::NullLit(span));
+    *expr = TypedExpr::Coerce {
+        expr: Box::new(inner),
+        from: ret_type.clone(),
+        to: concrete_result,
+        span,
+    };
+}
+
+/// True if any of the generic function's type parameters (the quantified ids appearing in its
+/// params/ret) is left unconstrained or unresolved by `subs` (no binding, or a binding that still
+/// mentions a generic TypeVar). Such an instantiation cannot be made concrete.
+fn mentions_unconstrained(
+    subs: &HashMap<u32, Type>,
+    params: &[TypedParam],
+    ret_type: &Type,
+) -> bool {
+    let mut ids = std::collections::HashSet::new();
+    for p in params {
+        collect_quantified_ids(&p.ty, &mut ids);
+    }
+    collect_quantified_ids(ret_type, &mut ids);
+    ids.iter().any(|id| match subs.get(id) {
+        None => true,
+        Some(t) => mentions_generic_tv(t),
+    })
+}
+
+/// Collect every quantified generic TypeVar id (≥ base, excluding the Json wildcard) in `ty`.
+fn collect_quantified_ids(ty: &Type, out: &mut std::collections::HashSet<u32>) {
+    match ty {
+        Type::TypeVar(id) if *id >= GENERIC_TV_BASE && *id != u32::MAX => {
+            out.insert(*id);
+        }
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) => collect_quantified_ids(t, out),
+        Type::FixedArray(ts) | Type::Union(ts) => {
+            ts.iter().for_each(|t| collect_quantified_ids(t, out))
+        }
+        Type::Object(fields) => fields.values().for_each(|t| collect_quantified_ids(t, out)),
+        Type::Function { params, ret, .. } => {
+            params.iter().for_each(|t| collect_quantified_ids(t, out));
+            collect_quantified_ids(ret, out);
+        }
+        _ => {}
+    }
 }
 
 // ---------------------------------------------------------------------------

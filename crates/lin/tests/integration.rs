@@ -6001,3 +6001,214 @@ print(identity("hello"))
     assert!(!body.contains("lin_box_int32") && !body.contains("lin_unbox_int32"),
         "identity$Int32 body must contain no int boxing, got:\n{}", body);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 3.5: hardening single-module generics (nested calls, aliasing, budget,
+// type-param hygiene, uninferrable type parameters).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_generic_nested_call_remonomorphized() {
+    // BUG 1: a generic function whose body calls ANOTHER generic must re-monomorphize the inner
+    // call under the composed substitution. `wrap$Int32` must call the native `id$Int32`, not a
+    // half-generic copy. Previously printed garbage.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val id = <T>(x: T): T => x
+val wrap = <U>(y: U): U => id(y)
+print(toString(wrap(42)))
+"#);
+    assert_eq!(out, vec!["42"]);
+}
+
+#[test]
+fn test_generic_nested_call_is_native_in_ir() {
+    // IR proof for BUG 1: wrap$Int32 calls id$Int32 (both native i32), with no half-generic
+    // `id$T...` copy and no `lin_box_int32(ptr null)`.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_gen_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_gen_{}", id));
+    let ll_path = bin_path.with_extension("ll");
+
+    fs::write(&src_path, r#"import { print } from "std/io"
+import { toString } from "std/string"
+val id = <T>(x: T): T => x
+val wrap = <U>(y: U): U => id(y)
+print(toString(wrap(42)))
+"#).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_EMIT_IR", "1")
+        .env("LIN_NO_OPT", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+
+    let ll = fs::read_to_string(&ll_path).expect("LLVM IR not emitted");
+    let _ = fs::remove_file(&bin_path);
+    let _ = fs::remove_file(&ll_path);
+
+    assert!(ll.contains("define i32 @\"wrap$Int32\"(i32"),
+        "expected an unboxed i32 wrap specialization, IR:\n{}", ll);
+    assert!(ll.contains("define i32 @\"id$Int32\"(i32"),
+        "expected an unboxed i32 id specialization, IR:\n{}", ll);
+    // wrap$Int32 body must call id$Int32 directly (native).
+    let body_start = ll.find("define i32 @\"wrap$Int32\"").unwrap();
+    let body = &ll[body_start..];
+    let body_end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
+    let body = &body[..body_end];
+    assert!(body.contains("call i32 @\"id$Int32\""),
+        "wrap$Int32 must call native id$Int32, got:\n{}", body);
+    // No half-generic copy and no boxing of a null pointer.
+    assert!(!ll.contains("id$T"),
+        "no half-generic id$T... copy should exist, IR:\n{}", ll);
+    assert!(!ll.contains("lin_box_int32(ptr null)"),
+        "no lin_box_int32(ptr null) should appear, IR:\n{}", ll);
+}
+
+#[test]
+fn test_generic_aliased_then_called() {
+    // BUG 2: a generic bound to another val (`val f = id`) then called indirectly must
+    // monomorphize, not crash codegen. Previously panicked in boxing.rs.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val id = <T>(x: T): T => x
+val f = id
+print(toString(f(5)))
+"#);
+    assert_eq!(out, vec!["5"]);
+}
+
+#[test]
+fn test_generic_aliased_multiple_types() {
+    // The alias resolves to the underlying generic at EACH call site independently.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val id = <T>(x: T): T => x
+val f = id
+print(toString(f(7)))
+print(f("hi"))
+"#);
+    assert_eq!(out, vec!["7", "hi"]);
+}
+
+#[test]
+fn test_generic_higher_order_passed_directly_still_works() {
+    // Regression guard: a (non-generic) function passed directly as a callback argument and
+    // applied inside the callee must keep working alongside the generic machinery.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val applyTwice = (g: (Int32) => Int32, x: Int32): Int32 => g(g(x))
+val inc = (n: Int32): Int32 => n + 1
+print(toString(applyTwice(inc, 5)))
+"#);
+    assert_eq!(out, vec!["7"]);
+}
+
+#[test]
+fn test_generic_type_param_hygiene_outer_alias_survives() {
+    // Type-param hygiene: a generic param `<T>` must not leak past the function body and clobber
+    // an outer `type T = Int32` alias. `use: T` must still resolve to Int32 after `id`.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type T = Int32
+val id = <T>(x: T): T => x
+val use: T = 7
+print(toString(id(3)))
+print(toString(use))
+"#);
+    assert_eq!(out, vec!["3", "7"]);
+}
+
+#[test]
+fn test_generic_nested_generics_no_param_leak() {
+    // A generic whose body uses another generic, at multiple types — confirms nested generic
+    // param bindings don't leak and both instantiations work.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val id = <T>(x: T): T => x
+val twice = <U>(y: U): U => id(id(y))
+print(toString(twice(10)))
+print(twice("hi"))
+"#);
+    assert_eq!(out, vec!["10", "hi"]);
+}
+
+#[test]
+fn test_generic_used_as_first_class_value_errors() {
+    // A generic (or an alias of one) passed as a first-class value that escapes — here `f` is
+    // handed to `apply` and called inside it — cannot be monomorphized. This must produce a clear
+    // diagnostic, not the historical malformed IR / "Call parameter type does not match" crash.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val id = <T>(x: T): T => x
+val f = id
+val apply = (g: (Int32) => Int32, x: Int32): Int32 => g(x)
+print(toString(apply(f, 5)))
+"#);
+    assert!(err.contains("used as a first-class value"),
+        "expected a first-class-value diagnostic, got:\n{}", err);
+}
+
+#[test]
+fn test_generic_uninferrable_type_param_errors() {
+    // A type parameter unconstrained by args/return must produce a clear diagnostic, not a
+    // panic or silently-wrong code.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val mk = <T>(): T => 0
+print(toString(mk()))
+"#);
+    assert!(err.contains("cannot infer a concrete type for the type parameter"),
+        "expected an uninferrable-type-parameter diagnostic, got:\n{}", err);
+}
+
+/// Build + run with a custom `LIN_SPEC_BUDGET`, returning the compile stderr (for the warning)
+/// and the program's stdout lines.
+fn run_with_spec_budget(source: &str, budget: &str) -> (String, Vec<String>) {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_budget_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_budget_{}", id));
+    fs::write(&src_path, source).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_SPEC_BUDGET", budget)
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+    let stderr = String::from_utf8_lossy(&compile.stderr).to_string();
+
+    let run_out = Command::new(&bin_path).output().expect("failed to run compiled binary");
+    let _ = fs::remove_file(&bin_path);
+    assert!(run_out.status.success(), "runtime error:\n{}",
+        String::from_utf8_lossy(&run_out.stderr));
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    let lines: Vec<String> = stdout.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect();
+    (stderr, lines)
+}
+
+#[test]
+fn test_generic_specialization_budget_falls_back_correctly() {
+    // With the budget capped at 2, a third distinct instantiation overflows: it emits a warning
+    // and falls back to a boxed/type-erased copy — but the program still produces correct output.
+    let (stderr, out) = run_with_spec_budget(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val id = <T>(x: T): T => x
+print(toString(id(1)))
+print(id("two"))
+print(toString(id(true)))
+"#, "2");
+    assert!(stderr.contains("specialization budget"),
+        "expected a budget-overflow warning, got stderr:\n{}", stderr);
+    assert_eq!(out, vec!["1", "two", "true"]);
+}

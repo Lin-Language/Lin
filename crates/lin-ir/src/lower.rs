@@ -16,15 +16,18 @@ use lin_common::Span;
 
 use crate::ir::*;
 
-/// Entry point: lower a TypedModule to a LinModule.
-pub fn lower_module(module: &TypedModule) -> LinModule {
-    // Phase 0 monomorphization: materialize concrete copies of single-module generic functions
+/// Entry point: lower a TypedModule to a LinModule, plus any monomorphization diagnostics
+/// (e.g. a generic call whose type parameters cannot be inferred). Diagnostics are empty for
+/// ordinary modules and for well-formed generic programs.
+pub fn lower_module(module: &TypedModule) -> (LinModule, Vec<lin_common::Diagnostic>) {
+    // Monomorphization: materialize concrete copies of single-module generic functions
     // (e.g. `identity$Int32`) and route calls to them BEFORE lowering, so the backend emits
     // native unboxed scalars. The clone is taken only when the module actually has a generic
     // function; ordinary modules skip it entirely and lower byte-for-byte as before.
+    let mut diagnostics = Vec::new();
     let owned: Option<TypedModule> = if crate::monomorphize::module_has_generic_fn(module) {
         let mut m = module.clone();
-        crate::monomorphize::monomorphize(&mut m);
+        diagnostics = crate::monomorphize::monomorphize(&mut m);
         Some(m)
     } else {
         None
@@ -106,12 +109,13 @@ pub fn lower_module(module: &TypedModule) -> LinModule {
         ctx.functions.push(pending);
     }
 
-    LinModule {
+    let lin_module = LinModule {
         functions: ctx.functions,
         global_fn_slots,
         intrinsics: ctx.intrinsics,
         default_descriptors: ctx.default_descriptors,
-    }
+    };
+    (lin_module, diagnostics)
 }
 
 /// Lower an IMPORTED TypedModule to a LinModule for the IR pipeline.
