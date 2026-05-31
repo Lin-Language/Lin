@@ -53,13 +53,32 @@
     });
   }
 
+  // --- Landing-page code tabs ---
+  function setupHeroTabs() {
+    const tabs = document.querySelectorAll('.hero-tab');
+    if (!tabs.length) return;
+    tabs.forEach(function (tab) {
+      tab.addEventListener('click', function () {
+        const id = tab.getAttribute('data-tab');
+        document.querySelectorAll('.hero-tab').forEach(function (t) {
+          t.classList.toggle('active', t === tab);
+        });
+        document.querySelectorAll('.hero-panel').forEach(function (p) {
+          p.classList.toggle('active', p.getAttribute('data-panel') === id);
+        });
+      });
+    });
+  }
+
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', function () {
       setupThemeToggle();
       setupNavToggle();
+      setupHeroTabs();
     });
   } else {
     setupThemeToggle();
     setupNavToggle();
+    setupHeroTabs();
   }
 })();

@@ -13,6 +13,7 @@
   ${nav}
 
   <main class="home-main">
+    ${hero}
     <article class="hero-article">
       ${content}
     </article>

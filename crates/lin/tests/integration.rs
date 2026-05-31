@@ -1130,6 +1130,47 @@ print(toString(nan))
     assert_eq!(output, vec!["inf", "-inf", "NaN"]);
 }
 
+// Regression: arithmetic on two BOXED (Json/union) operands — e.g. Float64 fields
+// destructured from an object by a `has` pattern — dispatched on a hardcoded Int32
+// unbox, so `3.0 * 4.0` reinterpreted the float bits as an integer and returned 0.
+// Codegen now routes boxed-operand Add/Sub/Mul/Div/Mod through lin_tagged_arith,
+// which dispatches on the runtime tag (float result if either operand is a float).
+#[test]
+fn test_boxed_json_float_arithmetic() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val o: Json = { "a": 3.0, "b": 4.0 }
+val mul = match o
+  has { a, b } => a * b
+  else => -1.0
+val add = match o
+  has { a, b } => a + b
+  else => -1.0
+val div = match o
+  has { a, b } => a / b
+  else => -1.0
+print(toString(mul))
+print(toString(add))
+print(toString(div))
+
+// Integer operands still use the integer path.
+val oi: Json = { "a": 3, "b": 4 }
+val imul = match oi
+  has { a, b } => a * b
+  else => -1
+print(toString(imul))
+
+// Mixed int/float widens to float.
+val om: Json = { "a": 3, "b": 4.0 }
+val mmul = match om
+  has { a, b } => a * b
+  else => -1.0
+print(toString(mmul))
+"#);
+    assert_eq!(output, vec!["12.0", "7.0", "0.75", "12", "12.0"]);
+}
+
 #[test]
 fn test_float32_widens_to_float64() {
     // A Float32 must widen to Float64 (fpext) across every numeric context, per spec §26
@@ -7066,6 +7107,27 @@ print(toString(r.reduce(0, (acc, x) => acc + x)))
     assert!(garbage.is_none(),
         "import-path monomorphization emitted a garbage unbound-TypeVar monomorph '{}' (GAP 2), IR:\n{}",
         garbage.unwrap(), ll);
+}
+
+#[test]
+fn test_stdlib_generic_accessors_at_set_indexof() {
+    // ADR-067: stdlib `at`/`set`/`indexOf` carry generic `<T>(T[], …)` signatures. They must stay
+    // representation-consistent and correct on both a flat concrete-scalar `Int32[]` and a tagged
+    // `String[]`, including negative-index wrap and the in-place `set` round-trip.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { at, set, indexOf } from "std/array"
+val a = [10, 20, 30]
+print(toString(a.at(1)))
+print(toString(a.at(-1)))
+set(a, 0, 99)
+print(toString(a.at(0)))
+print(toString(a.indexOf(30)))
+val s = ["x", "y", "z"]
+print(s.at(-1))
+print(toString(s.indexOf("y")))
+"#);
+    assert_eq!(out, vec!["20", "30", "99", "2", "z", "1"]);
 }
 
 /// Find the first `$T<digits>` token in `ir` (a garbage unbound-TypeVar monomorph name). Returns

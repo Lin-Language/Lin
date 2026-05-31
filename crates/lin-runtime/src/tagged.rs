@@ -381,6 +381,61 @@ pub(crate) unsafe fn tagged_as_f64(tag: u8, payload: u64) -> f64 {
     }
 }
 
+/// Arithmetic on two boxed numeric TaggedVal*, dispatching on the runtime tags.
+/// `op`: 0=Add 1=Sub 2=Mul 3=Div 4=Mod. Returns a freshly boxed numeric TaggedVal*.
+///
+/// Codegen uses this for `a OP b` when both operands are boxed union/Json values
+/// (e.g. fields destructured from an object by a `has` pattern): their concrete
+/// numeric type is only known at runtime, so unboxing to a fixed type in codegen
+/// would reinterpret a float's bits as an integer. If either operand is a float,
+/// the result is Float64; otherwise the widest integer tag present is preserved.
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_arith(a: *const u8, b: *const u8, op: i32) -> *mut u8 {
+    let av = a as *const TaggedVal;
+    let bv = b as *const TaggedVal;
+    let at = if av.is_null() { TAG_NULL } else { (*av).tag };
+    let bt = if bv.is_null() { TAG_NULL } else { (*bv).tag };
+    let ap = if av.is_null() { 0u64 } else { (*av).payload };
+    let bp = if bv.is_null() { 0u64 } else { (*bv).payload };
+
+    let a_is_float = at == TAG_FLOAT32 || at == TAG_FLOAT64;
+    let b_is_float = bt == TAG_FLOAT32 || bt == TAG_FLOAT64;
+
+    if a_is_float || b_is_float {
+        let af = tagged_as_f64(at, ap);
+        let bf = tagged_as_f64(bt, bp);
+        let r = match op {
+            0 => af + bf,
+            1 => af - bf,
+            2 => af * bf,
+            3 => af / bf,
+            4 => af % bf,
+            _ => 0.0,
+        };
+        return lin_box_float64(r);
+    }
+
+    // Integer path. Read both payloads as i64 (a UInt64 read as i64 matches the
+    // existing two's-complement wrap behaviour) and preserve the widest tag seen.
+    let ai = ap as i64;
+    let bi = bp as i64;
+    let r = match op {
+        0 => ai.wrapping_add(bi),
+        1 => ai.wrapping_sub(bi),
+        2 => ai.wrapping_mul(bi),
+        3 => if bi == 0 { 0 } else { ai.wrapping_div(bi) },
+        4 => if bi == 0 { 0 } else { ai.wrapping_rem(bi) },
+        _ => 0,
+    };
+    if at == TAG_UINT64 || bt == TAG_UINT64 {
+        lin_box_uint64(r as u64)
+    } else if at == TAG_INT64 || bt == TAG_INT64 {
+        lin_box_int64(r)
+    } else {
+        lin_box_int32(r as i32)
+    }
+}
+
 /// Dynamic length dispatch: returns length of string, array, or object TaggedVal*.
 /// Returns 0 for null/bool/numeric types (no meaningful length).
 #[no_mangle]
