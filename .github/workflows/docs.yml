@@ -55,3 +55,18 @@ jobs:
         with:
           name: docs-site
           path: docs-site/output
+
+      # Trigger the org root site (Lin-Language.github.io) to rebuild and deploy.
+      # Only on master, and only if the build above succeeded. Needs a PAT in the
+      # PAGES_DISPATCH_TOKEN secret with `contents: write` on the org-site repo;
+      # the step is skipped (not failed) when the secret is absent.
+      - name: Publish to lin-language.github.io
+        if: github.ref == 'refs/heads/master' && env.PAGES_DISPATCH_TOKEN != ''
+        env:
+          PAGES_DISPATCH_TOKEN: ${{ secrets.PAGES_DISPATCH_TOKEN }}
+        run: |
+          curl -sf -X POST \
+            -H "Authorization: Bearer $PAGES_DISPATCH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Lin-Language/Lin-Language.github.io/dispatches \
+            -d '{"event_type":"docs-update"}'
