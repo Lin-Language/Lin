@@ -64,6 +64,37 @@ fn trailing_text(anchor_start: u32) -> String {
     })
 }
 
+/// True if `anchor_start` has any attached comment (leading or trailing).
+fn anchor_has_comment(anchor_start: u32) -> bool {
+    CTX.with(|c| {
+        let c = c.borrow();
+        c.trailing.contains_key(&anchor_start)
+            || c.leading.get(&anchor_start).is_some_and(|v| !v.is_empty())
+    })
+}
+
+/// True if any branch body in the `if`/`else if` chain rooted at `expr` carries an
+/// attached comment — in which case the inline single-line form must be skipped so the
+/// comment has a line to live on. Walks the chain (each `else if` is a nested `Expr::If`).
+fn if_has_branch_comment(expr: &Expr) -> bool {
+    let mut cur = expr;
+    loop {
+        match cur {
+            Expr::If { then_branch, else_branch, .. } => {
+                if anchor_has_comment(then_branch.span().start) {
+                    return true;
+                }
+                if matches!(**else_branch, Expr::If { .. }) {
+                    cur = else_branch;
+                } else {
+                    return anchor_has_comment(else_branch.span().start);
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
 pub struct Formatter {
     comments: Vec<Comment>,
     /// Char offset of each source line's start (`line_starts[i]` = start of line `i`). Used to
@@ -219,7 +250,23 @@ fn collect_anchors_expr(expr: &Expr, out: &mut Vec<Anchor>) {
         }
         Expr::If { condition, then_branch, else_branch, .. } => {
             collect_anchors_expr(condition, out);
+            // A SINGLE-LINE (atomic) branch body is a comment anchor so an inline branch
+            // comment (`if c then BODY  // note`) stays attached to its branch when the
+            // chain is re-rendered in block form. A multi-line body (block/if/match) is
+            // NOT anchored here: its inner statements/tail are already anchors, and adding
+            // a competing anchor at the body's span (which `render_body` won't emit for a
+            // non-atomic body) would swallow a demoted comment and drop it.
+            if is_atomic(then_branch) {
+                let tb = then_branch.span();
+                out.push(Anchor { start: tb.start, end: tb.end, trailing_ok: true });
+            }
             collect_anchors_expr(then_branch, out);
+            // A chained `else if` recurses into the nested `If` (adding its own branch
+            // anchors). A terminal `else` with a single-line body gets its own anchor.
+            if !matches!(**else_branch, Expr::If { .. }) && is_atomic(else_branch) {
+                let eb = else_branch.span();
+                out.push(Anchor { start: eb.start, end: eb.end, trailing_ok: true });
+            }
             collect_anchors_expr(else_branch, out);
         }
         Expr::Match { scrutinee, arms, .. } => {
@@ -881,8 +928,10 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
             let cond = fmt_expr(condition, false, ind);
             let is_null_else = matches!(else_branch.as_ref(), Expr::NullLit(_));
 
-            // Try inline.
-            if is_atomic(then_branch) && is_atomic(else_branch) {
+            // Try inline. Skipped when any branch body carries an attached comment —
+            // the inline form (`if c then a else b`) has nowhere to place it, so we fall
+            // through to block form where each branch renders on its own commented line.
+            if is_atomic(then_branch) && is_atomic(else_branch) && !if_has_branch_comment(expr) {
                 let t = fmt_inline(then_branch);
                 let e = fmt_inline(else_branch);
                 let inline = format!("if {} then {} else {}", cond, t, e);
@@ -891,21 +940,65 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
                 }
             }
 
-            // Block form.
-            // fmt_expr returns with "first line no indent"; we add child_ind to first line.
-            let then_body = fmt_expr(then_branch, false, &child_ind);
-            let then_block = indent_first(&then_body, &child_ind);
+            // Block form. Walk the `else if` chain iteratively so each `else if`
+            // stays FLAT at `ind` rather than nesting one indent level deeper per
+            // arm (which would produce an `else { if … else { if … } }` staircase).
+            // Each arm renders as `[else ]if COND then\n  BODY`; the terminal arm
+            // renders as `else\n  BODY` (or nothing for a null else in stmt position).
+            // fmt_expr returns "first line no indent"; indent_first adds child_ind.
+            // Render a branch body as an indented block, carrying any leading/trailing
+            // comments anchored to that body (inline branch comments survive block form).
+            // Only single-line (atomic) bodies pull comments by their own span key: a
+            // multi-line body (Block/if/match) is handled by its inner anchors, and its
+            // span.start collides with its first statement's start, so fetching by that key
+            // would wrongly re-emit (and, each pass, duplicate) the inner statement's comment.
+            let render_body = |body: &Expr| -> String {
+                let block = indent_first(&fmt_expr(body, false, &child_ind), &child_ind);
+                if !is_atomic(body) {
+                    return block;
+                }
+                let anchor = body.span().start;
+                let lead = take_leading(anchor, &child_ind);
+                let trailing = trailing_text(anchor);
+                if trailing.is_empty() {
+                    format!("{}{}", lead, block)
+                } else {
+                    format!("{}{} {}", lead, block, trailing)
+                }
+            };
 
-            if is_null_else && is_stmt {
-                format!("if {} then\n{}", cond, then_block)
-            } else {
-                let else_body = fmt_expr(else_branch, false, &child_ind);
-                let else_block = indent_first(&else_body, &child_ind);
-                format!(
-                    "if {} then\n{}\n{}else\n{}",
-                    cond, then_block, ind, else_block
-                )
+            let mut out = String::new();
+            let mut cur_cond = cond;
+            let mut cur_then: &Expr = then_branch;
+            let mut cur_else: &Expr = else_branch;
+            let mut cur_null_else = is_null_else;
+            let mut first = true;
+            loop {
+                if first {
+                    out.push_str(&format!("if {} then\n{}", cur_cond, render_body(cur_then)));
+                    first = false;
+                } else {
+                    out.push_str(&format!("\n{}else if {} then\n{}", ind, cur_cond, render_body(cur_then)));
+                }
+
+                match cur_else {
+                    // `else if` — continue the chain flat at the same `ind`.
+                    Expr::If { condition, then_branch, else_branch, .. } => {
+                        cur_cond = fmt_expr(condition, false, ind);
+                        cur_then = then_branch;
+                        cur_null_else = matches!(else_branch.as_ref(), Expr::NullLit(_));
+                        cur_else = else_branch;
+                    }
+                    // Terminal else.
+                    _ => {
+                        if !(cur_null_else && is_stmt) {
+                            out.push_str(&format!("\n{}else\n{}", ind, render_body(cur_else)));
+                        }
+                        break;
+                    }
+                }
             }
+            out
         }
 
         // ── Match ─────────────────────────────────────────────────────────────
