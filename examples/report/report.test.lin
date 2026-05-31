@@ -1,8 +1,12 @@
-import { expect, toBe, toSucceed, toFail, test, suite, run } from "std/test"
-import { parseRow } from "./parse"
-import { validRecords, parseErrors, stats, render } from "./report"
+// Unit suite for report.lin — the pure pipeline functions over fixed inputs.
+//
+// validRecords / parseErrors / stats are exercised in isolation (map/filter/
+// reduce/sort churn over heap records). Row-parsing lives in parse.test.lin and
+// the end-to-end render lives in integration.test.lin.
+
+import { expect, toBe, test, suite, run } from "std/test"
+import { validRecords, parseErrors, stats } from "./report"
 import { length } from "std/array"
-import { contains } from "std/string"
 
 val sample = [
   "Alice, 85",
@@ -14,36 +18,23 @@ val sample = [
 ]
 
 val s = suite("report", [
-  // --- Row parsing + validation ---
-  test("parses a well-formed row", () => [
-    expect(parseRow("Alice, 85")).toSucceed()
-  ]),
-  test("extracts name and score", () =>
-    val r = parseRow("Alice, 85")["value"]
-    [
-      expect(r["name"]).toBe("Alice"),
-      expect(r["score"]).toBe(85)
-    ]
-  ),
-  test("rejects a row without a comma", () => [
-    expect(parseRow("bad-row")).toFail()
-  ]),
-  test("rejects an empty name", () => [
-    expect(parseRow(", 50")).toFail()
-  ]),
-  test("rejects a non-numeric score", () => [
-    expect(parseRow("Eve, abc")).toFail()
-  ]),
-
-  // --- Pipeline over the batch (map/filter/reduce churn over heap records) ---
+  // --- Splitting valid from invalid ---
   test("keeps only the valid records", () => [
     expect(length(validRecords(sample))).toBe(4)
   ]),
   test("collects the parse errors", () => [
     expect(length(parseErrors(sample))).toBe(2)
   ]),
+  test("all-invalid input yields zero valid records", () => [
+    expect(length(validRecords(["x", "y", "z"]))).toBe(0)
+  ]),
+
+  // --- Statistics over the valid records ---
   test("computes count over valid records", () => [
     expect(stats(validRecords(sample))["count"]).toBe(4)
+  ]),
+  test("sums scores via reduce", () => [
+    expect(stats(validRecords(sample))["total"]).toBe(355)
   ]),
   test("computes the integer average", () => [
     expect(stats(validRecords(sample))["average"]).toBe(88)
@@ -51,42 +42,13 @@ val s = suite("report", [
   test("finds the top scorer", () => [
     expect(stats(validRecords(sample))["top"]).toBe("Diana")
   ]),
-  test("sums scores via reduce", () => [
-    expect(stats(validRecords(sample))["total"]).toBe(355)
-  ]),
-
-  // --- Edge cases ---
   test("empty input yields zero stats", () =>
     val st = stats(validRecords([]))
     [
       expect(st["count"]).toBe(0),
-      expect(st["average"]).toBe(0)
-    ]
-  ),
-  test("all-invalid input yields zero valid records", () => [
-    expect(length(validRecords(["x", "y", "z"]))).toBe(0)
-  ]),
-
-  // --- Reduce/map churn: a large batch must not corrupt RC (ASan guard) ---
-  test("handles a larger batch without corruption", () =>
-    val many = [
-      "A, 1", "B, 2", "C, 3", "D, 4", "E, 5", "F, 6", "G, 7", "H, 8",
-      "A, 1", "B, 2", "C, 3", "D, 4", "E, 5", "F, 6", "G, 7", "H, 8"
-    ]
-    [
-      expect(length(validRecords(many))).toBe(16),
-      expect(stats(validRecords(many))["total"]).toBe(72)
-    ]
-  ),
-
-  // --- End-to-end render ---
-  test("renders a report with header, top scorer, and skipped-row note", () =>
-    val out = render(sample)
-    [
-      expect(out.contains("=== Report ===")).toBe(true),
-      expect(out.contains("Diana: 100")).toBe(true),
-      expect(out.contains("count=4 avg=88 top=Diana")).toBe(true),
-      expect(out.contains("skipped 2 bad row(s)")).toBe(true)
+      expect(st["total"]).toBe(0),
+      expect(st["average"]).toBe(0),
+      expect(st["top"]).toBe("")
     ]
   ),
 ])

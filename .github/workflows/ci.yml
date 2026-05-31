@@ -67,9 +67,6 @@ jobs:
           for m in examples/*/main.lin; do
             dir="$(dirname "$m")"
             case "$dir" in
-              # ffi/ needs its C static lib prebuilt + linked (lin build only); the
-              # authoritative end-to-end FFI check is the Rust integration suite.
-              examples/ffi) echo "SKIP $m (needs prebuilt .a; covered by Rust FFI test)"; continue ;;
               # web-server/main.lin calls serve(...), which blocks forever; the router and
               # handlers are covered by *.test.lin and the Rust serve integration test.
               examples/web-server) echo "SKIP $m (serve blocks forever; covered by tests)"; continue ;;
@@ -104,8 +101,13 @@ jobs:
           echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-22 main" \
             | sudo tee /etc/apt/sources.list.d/llvm-22.list
           sudo apt-get update
+          # libclang-rt-22-dev provides clang's compiler-rt sanitizer archives
+          # (libclang_rt.asan.a / .asan_static.a). Without it the instrumented
+          # `clang-22 -fsanitize=address` link below fails with
+          # "cannot find libclang_rt.asan*.a". Not needed by the host LLVM legs.
           sudo apt-get install -y --no-install-recommends \
-            llvm-22 llvm-22-dev llvm-22-runtime clang-22 libpolly-22-dev
+            llvm-22 llvm-22-dev llvm-22-runtime clang-22 libpolly-22-dev \
+            libclang-rt-22-dev
           echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
 
       - name: Install Rust nightly (for -Zsanitizer)
@@ -127,6 +129,19 @@ jobs:
       - name: Build lin (compiler) and the ASan-instrumented runtime
         run: |
           cargo build -p lin
+          # Force a fresh liblin_runtime.a for BOTH the host and the instrumented
+          # target. The restored cache can contain a staticlib built from older
+          # runtime source (runtime source changes don't bump Cargo.lock, so the
+          # same cache key is reused); cargo's fingerprint then reports it
+          # up-to-date and skips the rebuild, so the stale .a survives. The
+          # internal `cc` link `lin build` runs (find_runtime_lib() picks
+          # target/debug) — and the explicit clang link below (target triple
+          # dir) — would then fail with `undefined reference` to any
+          # newer runtime symbol. `cargo clean -p` clears the artifact AND its
+          # fingerprint (a bare rm would leave the fingerprint "fresh" and cargo
+          # would not rebuild), guaranteeing both archives match current source.
+          cargo clean -p lin-runtime
+          cargo clean -p lin-runtime --target x86_64-unknown-linux-gnu
           # `lin build` runs its own internal `cc` link against the host
           # liblin_runtime.a (find_runtime_lib() looks in target/debug). Building
           # the compiler alone only emits lin-runtime as an rlib, so emit the
@@ -151,7 +166,11 @@ jobs:
           for f in stdlib/*.test.lin examples/*/*.test.lin; do
             echo "==> $f"
             cargo run -p lin --quiet -- build "$f" -o /tmp/asan_test || { echo "BUILD FAIL $f"; fail=1; continue; }
-            clang-22 -fsanitize=address -g /tmp/asan_test.ll "$RT" -o /tmp/asan_test_bin
+            # The ffi suite calls into a committed C archive (libmathlib.a), which uses libm
+            # (sqrt). Link both for the ASan binary; every other test links only the runtime.
+            extra=""
+            case "$f" in examples/ffi/*) extra="examples/ffi/libmathlib.a -lm" ;; esac
+            clang-22 -fsanitize=address -g /tmp/asan_test.ll "$RT" $extra -o /tmp/asan_test_bin
             # Leak detection off: the stdlib intentionally retains program-lifetime
             # globals (module init state) that are never released at exit.
             if ! ASAN_OPTIONS=detect_leaks=0 /tmp/asan_test_bin > /tmp/asan_out 2>&1; then

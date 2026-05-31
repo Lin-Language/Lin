@@ -18,7 +18,9 @@ import { length } from "std/array"
 import { parseInt32 } from "std/number"
 
 // A lexer token (mirrors lexer.lin's Token — type aliases aren't cross-module).
-type Token = { "kind": String, "text": String }
+// Exported so unit tests can construct token-array fixtures typed as Token[]
+// (a Json[] literal won't coerce to Token[]).
+export type Token = { "kind": String, "text": String }
 
 // AST nodes (recursive). `kind` is the discriminant: "num" | "binop".
 type Num = { "kind": String, "value": Int32 }

@@ -1,0 +1,73 @@
+// Unit suite for lexer.lin — `tokenize` in isolation.
+//
+// Covers numbers (incl. multi-digit as one token), operators, parens, whitespace
+// skipping, and the `bad` token emitted for unknown characters.
+
+import { expect, toBe, test, suite, run } from "std/test"
+import { tokenize } from "./lexer"
+import { length } from "std/array"
+
+val s = suite("lexer", [
+  // --- Numbers ---
+  test("tokenizes a single-digit number as one token", () => [
+    expect(length(tokenize("7"))).toBe(1),
+    expect(tokenize("7")[0]["kind"]).toBe("num"),
+    expect(tokenize("7")[0]["text"]).toBe("7")
+  ]),
+  test("tokenizes a multi-digit number as one token", () => [
+    expect(length(tokenize("123"))).toBe(1),
+    expect(tokenize("123")[0]["text"]).toBe("123")
+  ]),
+
+  // --- Operators ---
+  test("tokenizes each arithmetic operator", () => [
+    expect(tokenize("+")[0]["kind"]).toBe("op"),
+    expect(tokenize("+")[0]["text"]).toBe("+"),
+    expect(tokenize("-")[0]["text"]).toBe("-"),
+    expect(tokenize("*")[0]["text"]).toBe("*"),
+    expect(tokenize("/")[0]["text"]).toBe("/")
+  ]),
+
+  // --- Parens ---
+  test("tokenizes parentheses as lparen/rparen", () => [
+    expect(tokenize("(")[0]["kind"]).toBe("lparen"),
+    expect(tokenize(")")[0]["kind"]).toBe("rparen")
+  ]),
+  test("tokenizes operators and parens into the right count", () => [
+    // ( 1 + 2 ) => lparen num op num rparen
+    expect(length(tokenize("(1+2)"))).toBe(5)
+  ]),
+
+  // --- Whitespace ---
+  test("skips spaces, tabs, and the surrounding stream stays stable", () =>
+    val toks = tokenize("  1 +  2 ")
+    [
+      expect(length(toks)).toBe(3),
+      expect(toks[0]["text"]).toBe("1"),
+      expect(toks[1]["kind"]).toBe("op"),
+      expect(toks[2]["text"]).toBe("2")
+    ]
+  ),
+  test("empty source yields no tokens", () => [
+    expect(length(tokenize(""))).toBe(0),
+    expect(length(tokenize("   "))).toBe(0)
+  ]),
+
+  // --- Bad characters ---
+  test("emits a bad token for an unknown character", () =>
+    val toks = tokenize("@")
+    [
+      expect(length(toks)).toBe(1),
+      expect(toks[0]["kind"]).toBe("bad"),
+      expect(toks[0]["text"]).toBe("@")
+    ]
+  ),
+  test("a bad character is one token among the good ones", () =>
+    val toks = tokenize("1 @ 2")
+    [
+      expect(length(toks)).toBe(3),
+      expect(toks[1]["kind"]).toBe("bad")
+    ]
+  ),
+])
+run(s)
