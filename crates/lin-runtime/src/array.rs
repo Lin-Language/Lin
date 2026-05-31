@@ -441,6 +441,35 @@ pub unsafe extern "C" fn lin_array_length(arr: *const LinArray) -> i64 {
     (*arr).len as i64
 }
 
+/// Iterable length for the `for`/`while`/`map`/`filter`/`reduce` combinator loop bound when the
+/// iterable is a UNION/Json-typed value (a boxed `TaggedVal*`). Returns the backing array's length
+/// only when the box actually holds an Array (TAG_ARRAY); for any other runtime kind (Object,
+/// String, Null, scalar, …) it returns 0, so the combinator iterates ZERO times rather than
+/// misreading the non-array payload as a `LinArray` (a `LinObject`/`LinString` read through the
+/// flat/tagged array element path is undefined behaviour — the docs-builder crash, ADR-068 follow-up).
+///
+/// This keeps `for`/`filter` over a statically-`Json` value SOUND when its runtime value isn't an
+/// array (e.g. an `ls()` error object that slipped past a misspelled `isFailure` guard): a no-op
+/// loop and an empty result, matching Lin's "bracket access is safe by default" stance — never UB.
+/// User-facing `length()` is unaffected (it still routes through `lin_length_dyn`, which reports
+/// object key counts / string lengths); only the combinator's internal loop bound uses this.
+#[no_mangle]
+pub unsafe extern "C" fn lin_iterable_length(p: *const u8) -> i64 {
+    use crate::tagged::{TaggedVal, TAG_ARRAY};
+    if p.is_null() {
+        return 0;
+    }
+    let tv = p as *const TaggedVal;
+    if (*tv).tag != TAG_ARRAY {
+        return 0;
+    }
+    let arr = (*tv).payload as *const LinArray;
+    if arr.is_null() {
+        return 0;
+    }
+    (*arr).len as i64
+}
+
 /// Get element at index as a heap-allocated TaggedVal*, handling both flat and tagged arrays.
 /// The caller is responsible for eventual deallocation. Returns null on OOB.
 #[no_mangle]

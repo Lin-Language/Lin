@@ -2495,6 +2495,38 @@ fn combinator_read_elem_ty(iterable: &TypedExpr, builder: &FuncBuilder, ctx: &Lo
     if is_provably_flat_producer(iterable, builder, ctx) { static_elem } else { Type::TypeVar(u32::MAX) }
 }
 
+/// Emit the LOOP-BOUND length for a combinator (`for`/`while`/`map`/`filter`/`reduce`) over
+/// `iterable` (already lowered to `iterable_temp`, typed `iterable_ty`).
+///
+/// For a statically-concrete `Array`/`Iterator`/`FixedArray` the value is known to be an array, so
+/// the plain `Length` intrinsic (→ `lin_array_length`) is used. For a UNION/Json iterable the
+/// runtime value may NOT be an array (e.g. an `ls()` error Object that slipped past a guard) — and
+/// the element read below blindly unboxes the pointer and reads it as a `LinArray`. Using
+/// `lin_length_dyn` there reports an Object's key count / String's length, so the loop would run and
+/// misread the non-array payload as array memory (UB — the docs-builder crash). Routing the bound
+/// through `lin_iterable_length` (array length, else 0) makes a non-array iterable a no-op loop,
+/// keeping the combinator sound for any Json value. Concrete scalar-array pipelines (the ADR-069
+/// fast path) are unaffected — they take the `Intrinsic::Length` branch.
+fn emit_iterable_len(iterable_temp: Temp, iterable_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+    let len = builder.alloc_temp(Type::Int64);
+    if is_union_ty(iterable_ty) {
+        builder.emit(Instruction::Call {
+            dst: len,
+            callee: CallTarget::Named("lin_iterable_length".to_string()),
+            args: vec![iterable_temp],
+            ret_ty: Type::Int64,
+        });
+    } else {
+        builder.emit(Instruction::CallIntrinsic {
+            dst: len,
+            intrinsic: Intrinsic::Length,
+            args: vec![iterable_temp],
+            ret_ty: Type::Int64,
+        });
+    }
+    len
+}
+
 /// True when `expr` provably produces a FLAT-buffer array for its (flat-scalar) element type.
 fn is_provably_flat_producer(expr: &TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> bool {
     match expr {
@@ -2932,14 +2964,8 @@ fn emit_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
 ) {
     let elem_ty = elem_ty.clone();
 
-    // len = length(iterable)
-    let len = builder.alloc_temp(Type::Int64);
-    builder.emit(Instruction::CallIntrinsic {
-        dst: len,
-        intrinsic: Intrinsic::Length,
-        args: vec![iterable],
-        ret_ty: Type::Int64,
-    });
+    // len = length(iterable) — tag-checked (0 for a non-array Json) when the iterable is union.
+    let len = emit_iterable_len(iterable, iterable_ty, builder);
     let zero = builder.const_temp(Const::Int(0, Type::Int64));
 
     let preheader = builder.current_block;
@@ -3046,10 +3072,8 @@ fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx
     let body = lower_callback_in_safe_ctx(&args[1], builder, ctx);
 
     let elem_ty = read_elem_ty;
-    let len = builder.alloc_temp(Type::Int64);
-    builder.emit(Instruction::CallIntrinsic {
-        dst: len, intrinsic: Intrinsic::Length, args: vec![iterable], ret_ty: Type::Int64,
-    });
+    // Tag-checked length (0 for a non-array Json) when the iterable is union. See emit_iterable_len.
+    let len = emit_iterable_len(iterable, &iterable_ty, builder);
     let zero = builder.const_temp(Const::Int(0, Type::Int64));
 
     let preheader = builder.current_block;
@@ -3235,10 +3259,8 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
             // The init must match the accumulator representation (a concrete scalar).
             let init = coerce_arg_to_param_repr(init_raw, &init_ty, &acc_ty, builder);
 
-            let len = builder.alloc_temp(Type::Int64);
-            builder.emit(Instruction::CallIntrinsic {
-                dst: len, intrinsic: Intrinsic::Length, args: vec![iterable], ret_ty: Type::Int64,
-            });
+            // Tag-checked length (0 for a non-array Json) when union. See emit_iterable_len.
+            let len = emit_iterable_len(iterable, &iterable_ty, builder);
             let zero = builder.const_temp(Const::Int(0, Type::Int64));
 
             let preheader = builder.current_block;
@@ -3298,10 +3320,8 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
     let init = box_to_json(init_raw, &init_ty, builder);
     let f = lower_callback_in_safe_ctx(&args[2], builder, ctx);
 
-    let len = builder.alloc_temp(Type::Int64);
-    builder.emit(Instruction::CallIntrinsic {
-        dst: len, intrinsic: Intrinsic::Length, args: vec![iterable], ret_ty: Type::Int64,
-    });
+    // Tag-checked length (0 for a non-array Json) when union. See emit_iterable_len.
+    let len = emit_iterable_len(iterable, &iterable_ty, builder);
     let zero = builder.const_temp(Const::Int(0, Type::Int64));
 
     let preheader = builder.current_block;
