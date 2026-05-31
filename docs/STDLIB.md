@@ -69,7 +69,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`append`](#append) | `(Json[], Json) -> Json[]` | Non-mutating single-element append |
 | [`arrayAllocate`](#arrayAllocate) | `(Int32) -> Json[]` | Allocate an array of n nulls |
 | [`arrayAllocateFilled`](#arrayAllocateFilled) | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
-| [`at`](#at-array) | `(Json[], Int32) -> Json` | Element at index; negative indices count from end |
+| [`at`](#at-array) | `<T>(T[], Int32) -> T` | Element at index; negative indices count from end |
 | [`chunk`](#chunk) | `(Json[], Int32) -> Json[][]` | Split into n-sized sub-arrays |
 | [`compact`](#compact) | `(Json[]) -> Json[]` | Remove null elements |
 | [`concat`](#concat) | `(Json[], Json[]) -> Json[]` | Concatenate two arrays |
@@ -84,7 +84,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`for`](#for) | `(Iterable, (Json) -> Json) -> Null` | Iterate over array or iterator |
 | [`while`](#while) | `(Json[], (Json) -> Boolean) -> Null` | Iterate, stopping when callback returns false |
 | [`groupBy`](#groupBy) | `(Json[], (Json) -> String) -> { ...Json[] }` | Group into object of arrays by key function |
-| [`indexOf`](#indexOf-array) | `(Json[], Json) -> Int32` | First index of value, or -1 |
+| [`indexOf`](#indexOf-array) | `<T>(T[], T) -> Int32` | First index of value, or -1 |
 | [`iter`](#iter) | `(() -> S, (S) -> Boolean, (S) -> S, (S) -> T) -> Iterator` | Build a custom iterator |
 | [`iterOf`](#iterOf) | `(Json[]) -> Iterator` | Iterator over an array |
 | [`length`](#length-array) | `(Json) -> Int32` | Length of array, string, or object |
@@ -102,7 +102,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`reduce`](#reduce) | `(Json[], Json, (Json, Json) -> Json) -> Json` | Fold left with an accumulator |
 | [`reverse`](#reverse) | `(Json[]) -> Json[]` | Return a reversed copy |
 | [`scan`](#scan) | `(Json[], Json, (Json, Json) -> Json) -> Json[]` | Reduce returning all intermediate values |
-| [`set`](#set-array) | `(Json[], Int32, Json) -> Null` | Set an element by index in place |
+| [`set`](#set-array) | `<T>(T[], Int32, T) -> Null` | Set an element by index in place |
 | [`slice`](#slice) | `(T[], Int32, Int32) -> T[]` | Sub-buffer copy; preserves element type |
 | [`some`](#some) | `(Json[], (Json) -> Boolean) -> Boolean` | True if any element matches |
 | [`sort`](#sort) | `(Json[], (Json, Json) -> Int32) -> Json[]` | Return sorted copy using comparator |
@@ -794,7 +794,7 @@ arrayAllocateFilled(0, 9)        // []
 ### at (array) {#at-array}
 
 ```txt
-val at: (arr: Json[], index: Int32) -> Json
+val at: <T>(arr: T[], index: Int32) -> T
 ```
 
 Returns the element at `index`. Negative indices count from the end: `-1` is the last element, `-2` is second-to-last. If the resolved index is out of bounds, returns `null`.
@@ -1036,7 +1036,7 @@ Returns an object where each key is a value returned by `f`, and the correspondi
 ### indexOf (array) {#indexOf-array}
 
 ```txt
-val indexOf: (arr: Json[], target: Json) -> Int32
+val indexOf: <T>(arr: T[], target: T) -> Int32
 ```
 
 Returns the zero-based index of the first element deeply equal to `target`, or `-1` if not found.
@@ -1316,7 +1316,7 @@ Like `reduce`, but returns an array of all intermediate accumulator values inclu
 ### set (array) {#set-array}
 
 ```txt
-val set: (arr: Json[], index: Int32, item: Json) -> Null
+val set: <T>(arr: T[], index: Int32, item: T) -> Null
 ```
 
 Sets the element at `index` to `item` **in place** — a mutating operation, the index-assignment counterpart to [`push`](#push). `index` must be in bounds (`0 <= index < length(arr)`); an out-of-bounds index is a runtime error. Often paired with [`arrayAllocate`](#arrayAllocate) to fill a pre-sized buffer.
