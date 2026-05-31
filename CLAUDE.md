@@ -14,6 +14,8 @@ The project has one backend:
 
 Do not work or make changes directly in the codebase. Create a subagent with a git worktree do the work there, ensure the workstree is up to date with the latest master, make sure the tests pass, then ask before merging back.
 
+Do not use git stash for no-op comparisons in worktrees — stashes are shared and keep tangling. Compare via git checkout HEAD~1 on the committed branch only.
+
 ## Build / run / test
 
 ```bash
