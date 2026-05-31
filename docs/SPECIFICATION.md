@@ -2332,7 +2332,119 @@ sleepMicros: (n: Int64) => Null
 waitSignal: (sig: Int32) => Int32           // block until the signal is delivered
 ```
 
-### 27.9 What Is Deliberately Absent
+### 27.9 Streams
+
+A `Stream<T>` is an opaque runtime value (§18, §28) representing a **lazy, effectful, fallible sequence** of values pulled from an OS resource. It is a sibling of `Iterator<T>` but a distinct type: an iterator is a pure, restartable description built from side-effect-free state functions (§18.2), whereas a stream owns an fd, advances a read position with each pull, and can fail mid-traversal. For that reason a stream is **not** modelled as an iterator, and its protocol is private (it is not JSON, and not subscriptable). See ADR-074.
+
+`Stream<T>` is covariant in `T`. The conceptual notation `Stream<T>` is a resolvable type name in `val`/parameter/return annotations (subject to the placement restriction in §27.9.5).
+
+#### 27.9.1 The Pull Graph and Push Sink Model
+
+A stream is built as a **lazy pull graph**. A *source* node is at the root (a file, socket, subprocess, or stdin); each *adapter* (`lines`, `chunks`, `map`, `filter`, `take`) wraps an upstream stream and transforms items as they are pulled. Nothing is read until a **terminal** operation drives the graph. A `writeStream` builds a **push sink** node: pulling the sink pulls one item from upstream and writes it to the destination, so the whole pipeline runs one item at a time with bounded memory.
+
+```txt
+readStream("in.csv")        // source:  Stream<UInt8[]>
+  .lines()                  // adapter: Stream<String>
+  .map(transform)           // adapter: Stream<String>
+  .filter(removeEmptyLines) // adapter: Stream<String>
+  .writeStream("out.csv")   // sink node (a Stream whose terminal writes upstream items)
+  .drain()                  // terminal: drive on this thread -> Null | Error
+```
+
+Errors are threaded **in-band** through the graph: a read error poisons the upstream, and every downstream adapter becomes a passthrough, so the first error short-circuits straight to the terminal op without an `is Error` check at every step. This is the §20 value-based error convention applied to the lazy graph (ADR-074).
+
+#### 27.9.2 Unified Sources
+
+File, TCP, subprocess-stdout, and stdin are all **byte streams** — `Stream<UInt8[]>` — each supplying a different read backend. Bytes are fundamental; line- and text-oriented views are adapters.
+
+```txt
+readStream:        (path: String)        => Stream<UInt8[]>   // std/stream
+tcpStream:         (fd: Int32)           => Stream<UInt8[]>   // std/net
+stdoutStream:      (h: ProcessHandle)    => Stream<UInt8[]>   // std/process
+stdinStream:       ()                    => Stream<UInt8[]>   // std/io
+```
+
+A would-block / EOF condition ends the stream normally; a hard read failure ends it with an `Error` (the exact ending is source-kind-dependent, §27.9.4).
+
+#### 27.9.3 Adapters
+
+Adapters are lazy: they return a new `Stream` and read nothing until driven.
+
+```txt
+lines:   (Stream<UInt8[]>)               => Stream<String>    // split byte stream into lines
+chunks:  (Stream<UInt8[]>, n: Int32)     => Stream<UInt8[]>   // re-chunk to n-byte windows
+map:     <T, U>(Stream<T>, (T) => U)        => Stream<U>
+filter:  <T>(Stream<T>, (T) => Boolean)     => Stream<T>
+take:    <T>(Stream<T>, n: Int32)           => Stream<T>      // first n items then end
+```
+
+`map`/`filter` callbacks use the same dot-application and lambda forms as the array combinators (§18.5). They are pure transforms over each item; effects (printing, side outputs) are allowed but the item flow is one-at-a-time.
+
+#### 27.9.4 Terminal Operations
+
+A terminal operation drives the pull graph. There are synchronous reads, a `for`-consumer, and two pipeline drivers.
+
+```txt
+readText: (Stream<UInt8[]>)              => String | Error    // drain a byte stream to one String
+collect:  (Stream<UInt8[]>)              => UInt8[] | Error    // drain to one byte buffer
+for:      <T>(Stream<T>, (T) => Null)       => Null | Error    // consume each item (dot form .for(fn))
+drain:    (Stream<T>)                    => Null | Error       // run a sink pipeline on this thread
+promise:  (Stream<T>)                    => Promise<Null | Error>  // run on a worker thread
+```
+
+**`.for(fn)`** consumes a stream item by item (Lin has no `for…in`; iteration is always `.for(fn)`, §18). It returns **`Null | Error`** — not `Null` like an array `for` (§18.1) — because driving a stream can end two ways: **EOF ends the loop normally** (the expression is `Null`), and **a read `Error` mid-traversal becomes the expression's value**.
+
+```txt
+val outcome = readStream("in.log").lines().for(line =>
+  print(line)
+)
+match outcome
+  is Error => print("read failed: ${outcome["message"]}")
+  else     => null
+```
+
+**`.drain()`** drives a sink pipeline (typically ending in a `writeStream`) on the **calling thread** and returns `Null | Error`. It uses no new runtime machinery — it is the synchronous driver.
+
+**`.promise()`** **moves** the whole pipeline onto a **worker OS thread** (ADR-073 move-transfer) and returns `Promise<Null | Error>`. This gives real concurrency and **fault isolation**: a runtime fault while the worker drives the stream is caught at the thread boundary and surfaces as an `Error` when the promise is awaited, exactly as for any `async` thunk (§24.2.2). Awaiting follows the usual rule — the result is `Null | Error` and the `Error` case must be handled (§24.2.2, ADR-070).
+
+```txt
+val p = readStream("big.log").lines().filter(isError).writeStream("errors.log").promise()
+match await(p)
+  is Error => print("pipeline failed")
+  else     => print("done")
+```
+
+Because the pipeline is moved (not copied) and the worker becomes its sole owner, the worker's RC-drop finalizer closes the fd — no value is shared across threads, so non-atomic refcounting stays sound (§28, ADR-073).
+
+#### 27.9.5 Affine Semantics and Lifetime
+
+A `Stream<T>` is an **affine resource** (use-at-most-once; ADR-073):
+
+- **Single use.** A stream is consumed by passing it as an argument, returning it, or applying a terminal op. Using a stream again after it has been consumed (or moved to a worker by `.promise()`) is a **compile-time error** (`use of moved value`).
+- **Dropping is fine.** A stream that is never consumed is **not** an error — its fd is closed deterministically by the **RC-drop finalizer** when the last reference goes away (§28, ADR-074). Building a stream and never driving it is almost certainly a mistake, so the checker emits a **warning** (`stream is never consumed`), but it does not block compilation.
+- **Explicit close.** `close(s)` (`std/stream`) closes the fd eagerly and is **idempotent**; it is for callers who want deterministic timing rather than scope-end cleanup.
+- **Placement restriction (v1).** A `Stream` value may live only in a `val` binding, a function parameter, or a return position. It may **not** be stored in an object field, an array element, or a `var`. This is a deliberately narrow v1 rule (it keeps the use-after-move check confined to local single-name bindings) and is relaxable later. Storing a stream in a container or `var` is a compile-time error.
+
+#### 27.9.6 Worked Example
+
+A streaming CSV transform — quote each field and re-join with `|`, dropping blank lines — running line by line with bounded memory:
+
+```txt
+import { readStream, lines, writeStream, drain } from "std/stream"
+import { map, filter } from "std/array"
+
+val transform = (line: String): String =>
+  line.split(",").map(f => "\"${f}\"").join("|")   // a,b,c -> "a"|"b"|"c"
+
+val removeEmptyLines = (line: String): Boolean =>
+  !line.isBlank()
+
+val run = (): Null | Error =>
+  readStream("in.csv").lines().map(transform).filter(removeEmptyLines)
+    .writeStream("out.csv").drain()
+```
+
+### 27.10 What Is Deliberately Absent
 
 Two systems facilities are **not** provided as core primitives, by design:
 

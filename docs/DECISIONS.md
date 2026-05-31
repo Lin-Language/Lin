@@ -637,7 +637,7 @@ to match the platform child representation.
 **Decision**: Lin provides **no** shared-memory concurrency primitives (mutexes, atomics,
 cross-thread shared mutable cells). Cross-thread mutable state is modelled exclusively with a
 `Worker<Msg, Reply>` (§24.6) that owns the state and serialises all access through its single-threaded
-message queue. Spec §27.9 records this as a deliberate absence.
+message queue. Spec §27.10 records this as a deliberate absence.
 
 **Rationale**: The concurrency model is share-nothing (§24): `async` thunks and `parallel` may not
 capture `var` bindings (compile-time error, ADR-034), and transferred values must be JSON-compatible. A
@@ -1080,7 +1080,7 @@ decision-list #29 updated to "circular import is a compile-time error." Regressi
 
 ## ADR-073: Affine resource types + move-transfer
 
-**Decision**: A *resource type* — currently just `Stream<T>` (§27.10, ADR-074) — is **affine**: it
+**Decision**: A *resource type* — currently just `Stream<T>` (§27.9, ADR-074) — is **affine**: it
 may be used **at most once**, and dropping it unused is fine. Resource values cross a thread boundary
 by **MOVE** (a pointer handoff, no clone), where transferable JSON-shaped values still cross by deep
 **COPY** (ADR-043 Option C, the existing path). Both rules yield **disjoint object graphs** per
@@ -1098,7 +1098,7 @@ This completes the transfer model anticipated in ADR-043:
    it again, and the **worker** owns it for the rest of its life and releases it (the RC-drop finalizer,
    ADR-074, runs on the worker). Because the source relinquishes the only reference, the moved graph is
    exactly as disjoint as a copied one — one owner, one thread — so non-atomic RC remains correct without
-   atomics. A move is O(1); a copy is O(size). This is the `.promise()` hand-off (§27.10).
+   atomics. A move is O(1); a copy is O(size). This is the `.promise()` hand-off (§27.9).
 
 **Affine, not strict-linear.** A strict-linear discipline would make *dropping* a resource an error
 (every stream must be explicitly consumed). We choose **affine** (use-at-most-once) because the RC-drop
@@ -1160,7 +1160,7 @@ behaviour, and it does *less* work than the copy path, not more.
 **Decision**: A `Stream<T>` is a new **opaque runtime type** — `Type::Stream(Box<Type>)`, sibling to
 `Type::Iterator` (`crates/lin-check/src/types.rs`), covariant in `T`, erased to a `TAG_STREAM` box at
 runtime — and it is deliberately **NOT** modelled as an `Iterator<T>`. A stream is a lazy pull-graph
-over a byte/value source plus an optional push sink; the surface API and semantics live in §27.10. This
+over a byte/value source plus an optional push sink; the surface API and semantics live in §27.9. This
 ADR records the three semantic choices that make a stream a thing of its own.
 
 **Why a stream is not an iterator.** The iterator protocol (§18.2, ADR-026) is built from four
@@ -1181,7 +1181,7 @@ types/compat/zonk/resolve, checker, IR lowering/monomorphize, codegen) but never
 
 **RC-drop auto-close finalizer.** A `TAG_STREAM` box carries the source backend (an fd + read state, or
 an adapter node pointing at its upstream). Its **release finalizer closes the fd** when the refcount
-reaches 0 if it is not already closed — deterministic cleanup with no GC, exactly the §39 RC contract.
+reaches 0 if it is not already closed — deterministic cleanup with no GC, exactly the ADR-039 RC contract.
 An explicit `close(s)` is **idempotent** (closing an already-closed stream is a no-op) and exists for
 callers who want determinism rather than scope-end timing. This is what makes the affine *drop-is-fine*
 rule of ADR-073 sound: an un-consumed stream still closes its fd. The finalizer is in the UAF/double-free
@@ -1231,4 +1231,4 @@ stream branch in `lower_for`; it does not touch the iterator path. A stream `for
 its `Null | Error` result trips the same union-vs-bare-target check as `await` (ADR-070) when assigned
 to a bare type. Distinct from `Shared<T>` (ADR-044, shared mutable, atomic-RC, copy-in/out) and
 `Frozen<T>` (ADR-045, immortal read-only): a stream is single-owner, moved not shared (ADR-073). Full
-surface spec in §27.10; stdlib API in `std/stream` (STDLIB.md).
+surface spec in §27.9; stdlib API in `std/stream` (STDLIB.md).
