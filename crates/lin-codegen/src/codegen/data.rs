@@ -189,7 +189,11 @@ impl<'ctx> Codegen<'ctx> {
                 return ptr_ty.const_null().into();
             };
             // Flat scalar element: read the unboxed scalar directly (mirrors AST `flat_array_get`).
-            if Self::is_flat_scalar(result_ty) {
+            // A fixed-length array (`[T1, T2, ...]`) is always stored TAGGED — its positional
+            // element types are heterogeneous — so even when the result type is a scalar the
+            // slot is a TaggedVal*, not raw bytes. Skip the flat shortcut and take the tagged
+            // read + unbox path below; reading it as flat would return garbage.
+            if Self::is_flat_scalar(result_ty) && !matches!(obj_ty, Type::FixedArray(_)) {
                 return self.flat_array_get(container, idx, result_ty);
             }
             // For TypeVar/Union result, use lin_array_get_tagged so the result is always
