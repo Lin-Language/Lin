@@ -18,11 +18,12 @@ of a "run my build & check steps" tool.
 - **`task.lin`** — `Task` / `TaskResult` types; `runTask` (spawn + classify) and `runAll`.
 - **`report.lin`** — pure `summarize` (tally pass/fail) and `render` (format the report).
 - **`main.lin`** — defines a few tasks, runs them, prints the report.
-- **`task.test.lin`** — unit tests for `runTask`/`runAll` over real deterministic
-  commands (`printf`, `true`, `false`, a missing binary).
+- **`task.test.lin`** — unit tests for `runTask`/`runAll` with `std/process.exec`
+  mocked (ADR-071), so classification (pass / fail / could-not-launch) is tested
+  deterministically without spawning anything or depending on host binaries.
 - **`report.test.lin`** — pure unit tests for `summarize`/`render` over synthetic results.
-- **`integration.test.lin`** — end-to-end: run a mixed task list through the whole
-  pipeline and assert the rolled-up summary and rendered report.
+- **`integration.test.lin`** — end-to-end: a mixed task list through the whole
+  pipeline (also mocking `exec`) asserting the rolled-up summary and rendered report.
 
 ## Run / Test
 

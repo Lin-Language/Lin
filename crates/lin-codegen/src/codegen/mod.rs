@@ -197,6 +197,9 @@ impl<'ctx> Codegen<'ctx> {
         module: &TypedModule,
         src: Option<&(String, String)>,
         imports: &HashMap<String, TypedModule>,
+        // ADR-071: export names of THIS module that a test `replace` overrides. Their bodies are
+        // not emitted here; the main module supplies the canonical symbol instead.
+        replaced_exports: &std::collections::HashSet<String>,
     ) {
         // Merge the imported module's intrinsic slot map (same as register_import) so the
         // importer's lowering still recognises re-exported intrinsics.
@@ -209,7 +212,7 @@ impl<'ctx> Codegen<'ctx> {
         // `examples/report` → `std/array.reduce`) are specialized here, not left as a boxed
         // type-erased call that crashes a concrete use site.
         let mut ir_module =
-            lin_ir::lower_import_module_with_imports(module, &module_key, imports);
+            lin_ir::lower_import_module_with_imports(module, &module_key, imports, replaced_exports);
         lin_ir::rc_elide::elide_rc(&mut ir_module);
         // Prefix this module's anonymous functions so `__lin_fn_<id>` symbols don't collide
         // with the main module's or other imports' (each module numbers FuncIds from 0).
@@ -236,6 +239,11 @@ impl<'ctx> Codegen<'ctx> {
         // `imported_val_wrappers[(path, name)]` zero-arg wrapper.
         for stmt in &module.statements {
             if let TypedStmt::Val { value, name: Some(name), .. } = stmt {
+                // ADR-071: a replaced export's symbol is defined by the main module, not here;
+                // it's registered when the main module compiles. Skip it.
+                if replaced_exports.contains(name) {
+                    continue;
+                }
                 if matches!(value, TypedExpr::Function { .. }) {
                     let sym = format!("{}_{}", module_key, name);
                     if let Some(f) = self.module.get_function(&sym) {

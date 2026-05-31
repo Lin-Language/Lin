@@ -1,43 +1,60 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { runTask, runAll } from "./task"
+import { exec } from "std/process"
 import { length } from "std/array"
 
-// Unit tests for runTask/runAll over real but deterministic system commands
-// (printf, true, false, and a missing binary).
+// Unit tests for runTask/runAll. `exec` is mocked (ADR-071) so the classification
+// logic is tested deterministically — no real subprocesses, no dependence on which
+// binaries a machine has, and full control over the launch-failure path (an Error
+// return), which a real `exec` cannot reliably reproduce across systems. The mock
+// dispatches on the command name to a canned result: a normal ExecResult object, or
+// an Error object for the "could not launch" case. A var counter spies on how many
+// times exec was invoked. (Test bodies run eagerly and share this module-level state,
+// so the runAll check below asserts the DELTA across its own call, not an absolute.)
+var execCount = 0
+
+replace exec = (command: String, args: String[]): Json =>
+  execCount = execCount + 1
+  if command == "ok" then { "status": 0, "stdout": "hello\n", "stderr": "" }
+  else if command == "boom" then { "status": 1, "stdout": "", "stderr": "nope" }
+  else if command == "missing" then { "type": "error", "message": "command not found" }
+  else { "status": 0, "stdout": "", "stderr": "" }
+
 val s = suite("task", [
-  test("a zero-exit command passes and captures stdout", () =>
-    val r = runTask({ "name": "echo", "command": "printf", "args": ["hello"] })
+  test("a zero-exit command passes and captures trimmed stdout", () =>
+    val r = runTask({ "name": "echo", "command": "ok", "args": ["hi"] })
     [
       expect(r["outcome"]).toBe("pass"),
       expect(r["status"]).toBe(0),
       expect(r["output"]).toBe("hello")
     ]
   ),
-  test("`true` passes", () => [
-    expect(runTask({ "name": "t", "command": "true", "args": [] })["outcome"]).toBe("pass")
-  ]),
-  test("a non-zero exit is a fail with its status", () =>
-    val r = runTask({ "name": "f", "command": "false", "args": [] })
+  test("a non-zero exit is a fail carrying its status", () =>
+    val r = runTask({ "name": "f", "command": "boom", "args": [] })
     [
       expect(r["outcome"]).toBe("fail"),
       expect(r["status"]).toBe(1)
     ]
   ),
   test("an unlaunchable command is an error, not a crash", () =>
-    val r = runTask({ "name": "x", "command": "definitely-not-a-real-command-xyz", "args": [] })
+    val r = runTask({ "name": "x", "command": "missing", "args": [] })
     [
-      expect(r["outcome"]).toBe("error")
+      expect(r["outcome"]).toBe("error"),
+      expect(r["status"]).toBe(-1),
+      expect(r["output"]).toBe("command not found")
     ]
   ),
-  test("runAll runs every task in order", () =>
+  test("runAll runs every task in order, invoking exec once each", () =>
+    val before = execCount
     val results = runAll([
-      { "name": "a", "command": "true", "args": [] },
-      { "name": "b", "command": "false", "args": [] }
+      { "name": "a", "command": "ok",   "args": [] },
+      { "name": "b", "command": "boom", "args": [] }
     ])
     [
       expect(length(results)).toBe(2),
       expect(results[0]["outcome"]).toBe("pass"),
-      expect(results[1]["outcome"]).toBe("fail")
+      expect(results[1]["outcome"]).toBe("fail"),
+      expect(execCount - before).toBe(2)
     ]
   ),
 ])

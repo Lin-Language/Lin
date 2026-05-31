@@ -219,7 +219,9 @@ fn collect_anchors_stmt(stmt: &Stmt, out: &mut Vec<Anchor>) {
     let sp = stmt.span();
     out.push(Anchor { start: sp.start, end: sp.end, trailing_ok: true });
     match stmt {
-        Stmt::Val { value, .. } | Stmt::Var { value, .. } => collect_anchors_expr(value, out),
+        Stmt::Val { value, .. } | Stmt::Var { value, .. } | Stmt::Replace { value, .. } => {
+            collect_anchors_expr(value, out)
+        }
         Stmt::Expr(e) => collect_anchors_expr(e, out),
         _ => {}
     }
@@ -1286,6 +1288,12 @@ fn fmt_stmt(stmt: &Stmt, ind: &str) -> String {
         Stmt::Expr(e) => {
             let s = fmt_expr(e, true, ind);
             format!("{}{}", ind, s)
+        }
+
+        Stmt::Replace { name, value, .. } => {
+            let rhs = fmt_expr(value, false, ind);
+            let header = format!("{}replace {} = ", ind, name);
+            multiline_concat(&header, &rhs)
         }
     }
 }
