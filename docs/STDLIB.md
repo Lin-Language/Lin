@@ -77,7 +77,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`drop`](#drop) | `(Json[], Int32) -> Json[]` | All elements after first n |
 | [`dropWhile`](#dropWhile) | `(Json[], (Json) -> Boolean) -> Json[]` | Skip elements while predicate holds |
 | [`every`](#every) | `(Json[], (Json) -> Boolean) -> Boolean` | True if all elements match |
-| [`filter`](#filter) | `(Json[], (Json) -> Boolean) -> Json[]` | Keep elements matching predicate |
+| [`filter`](#filter) | `<T>(T[], (T) -> Boolean) -> T[]` | Keep elements matching predicate |
 | [`find`](#find) | `(Json[], (Json) -> Boolean) -> Json` | First matching element, or null |
 | [`flatMap`](#flatMap) | `(Json[], (Json) -> Json[]) -> Json[]` | Map then flatten one level |
 | [`flatten`](#flatten) | `(Json[]) -> Json[]` | Flatten one level of nesting |
@@ -88,7 +88,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`iter`](#iter) | `(() -> S, (S) -> Boolean, (S) -> S, (S) -> T) -> Iterator` | Build a custom iterator |
 | [`iterOf`](#iterOf) | `(Json[]) -> Iterator` | Iterator over an array |
 | [`length`](#length-array) | `(Json) -> Int32` | Length of array, string, or object |
-| [`map`](#map) | `(Json[], (Json) -> Json) -> Json[]` | Transform each element |
+| [`map`](#map) | `<T, U>(T[], (T) -> U) -> U[]` | Transform each element |
 | [`max`](#max-array) | `(Number[]) -> Number` | Maximum element |
 | [`maxBy`](#maxBy) | `(Json[], (Json) -> Number) -> Json` | Element with the largest key |
 | [`min`](#min-array) | `(Number[]) -> Number` | Minimum element |
@@ -99,7 +99,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`push`](#push) | `(Json[], Json) -> Null` | Append an element to an array in place |
 | [`range`](#range) | `(Int32, Int32) -> Iterator` | Integer range `[start, end)`, step 1 |
 | [`rangeStep`](#rangeStep) | `(Int32, Int32, Int32) -> Iterator` | Integer range with an explicit (possibly negative) step |
-| [`reduce`](#reduce) | `(Json[], Json, (Json, Json) -> Json) -> Json` | Fold left with an accumulator |
+| [`reduce`](#reduce) | `<T, U>(T[], U, (U, T) -> U) -> U` | Fold left with an accumulator |
 | [`reverse`](#reverse) | `(Json[]) -> Json[]` | Return a reversed copy |
 | [`scan`](#scan) | `(Json[], Json, (Json, Json) -> Json) -> Json[]` | Reduce returning all intermediate values |
 | [`set`](#set-array) | `<T>(T[], Int32, T) -> Null` | Set an element by index in place |
@@ -923,10 +923,12 @@ Returns `true` if `f` returns `true` for every element. Returns `true` for an em
 ### filter
 
 ```txt
-val filter: (arr: Json[], f: (Json) -> Boolean) -> Json[]
+val filter: <T>(arr: T[], f: (T) -> Boolean) -> T[]
 ```
 
-Returns a new array containing only the elements for which `f` returns `true`.
+Returns a new array containing only the elements for which `f` returns `true`. Generic: the result
+element type is the input element type. For a monomorphic scalar array with a capture-less literal
+predicate, the predicate is inlined into a flat loop with no per-element boxing (ADR-069).
 
 ```txt
 [1, 2, 3, 4].filter(x => x > 2)   // [3, 4]
@@ -1103,10 +1105,13 @@ length({ "a": 1 })       // 1
 ### map
 
 ```txt
-val map: (arr: Json[], f: (Json) -> Json) -> Json[]
+val map: <T, U>(arr: T[], f: (T) -> U) -> U[]
 ```
 
-Returns a new array formed by applying `f` to each element of `arr` in order.
+Returns a new array formed by applying `f` to each element of `arr` in order. Generic: the result
+element type is the callback's return type. For a monomorphic scalar array with a capture-less literal
+lambda, the lambda body is inlined into a flat loop with no per-element boxing or closure call
+(ADR-069).
 
 ```txt
 [1, 2, 3].map(x => x * 2)        // [2, 4, 6]
@@ -1273,10 +1278,10 @@ rangeStep(5, 0, -1).map(i => i)                    // [5, 4, 3, 2, 1]
 ### reduce
 
 ```txt
-val reduce: (arr: Json[], init: Json, f: (Json, Json) -> Json) -> Json
+val reduce: <T, U>(arr: T[], init: U, f: (U, T) -> U) -> U
 ```
 
-Folds `arr` left-to-right starting from `init`. `f` receives the accumulator as its first argument and the current element as its second.
+Folds `arr` left-to-right starting from `init`. `f` receives the accumulator as its first argument and the current element as its second. Generic: the accumulator/result type is the type of `init`. For a monomorphic scalar accumulator with a capture-less literal reducer, the accumulator is carried unboxed through the loop and the reducer body is inlined with no per-element boxing or closure call (ADR-069).
 
 ```txt
 [1, 2, 3, 4].reduce(0, (acc, x) => acc + x)   // 10

@@ -73,21 +73,39 @@ export val iter = (init: Json, hasNext: Json, next: Json, value: Json) =>
 export val concat = (a: Json, b: Json): Json =>
   lin_array_concat_dyn(a, b)
 
-// map/filter/reduce route to the lin_map/lin_filter/lin_reduce builtins, whose IR lowering
-// allocates a flat output array, reads flat elements, and — for a capture-less lambda — inlines the
-// callback body with no per-element box/unbox/closure-call when the source/element types are
-// flat-scalar (ADR-068). Kept on the permissive `Json`/`Function` signatures (NOT generic): a fully
-// generic signature over-constrains the union/object call sites the rest of the stdlib relies on
-// (e.g. `sortBy`'s `arr.map(item => [keyFn(item), item])`, `report`'s `.map(r => r["value"])` over a
-// `Success | Failure` union) — those keep working through the Json path, while the flat-scalar fast
-// path still fires for monomorphic scalar pipelines via the intrinsic's own type-directed lowering.
-export val map = (arr: Json, f: Function): Json =>
+// map/filter/reduce are GENERIC thin wrappers over the lin_map/lin_filter/lin_reduce builtins.
+// At a monomorphic scalar call site (`range(0,n).map(x => x*2)`), the call-site combinator-wrapper
+// inline (lin-ir monomorphize) replaces the wrapper with `lin_map(arr, <lambda>)` so the literal
+// lambda is visible to the intrinsic's lowering, which then INLINES a capture-less lambda body
+// directly into the loop — binding the param to the flat element, no per-element box/unbox/closure
+// call, and carrying a scalar reduce accumulator unboxed through the loop phi (ADR-069).
+// Heterogeneous/union/object call sites monomorphize at the `$Json` tagged representation, keeping
+// the boxed path correct.
+export val map = <T, U>(arr: T[], f: (T) => U): U[] =>
   lin_map(arr, f)
 
-export val filter = (arr: Json, f: Function): Json =>
+export val filter = <T>(arr: T[], f: (T) => Boolean): T[] =>
   lin_filter(arr, f)
 
-export val reduce = (arr: Json, init: Json, f: (Json, Json) => Json): Json =>
+export val reduce = <T, U>(arr: T[], init: U, f: (U, T) => U): U =>
+  lin_reduce(arr, init, f)
+
+// Non-generic Json wrappers over the same intrinsics, used INTERNALLY by the heterogeneous
+// stdlib combinators (sortBy/minBy/maxBy/compact/sum/...) that operate on `Json[]`. A direct
+// sibling call to the generic `map`/`filter`/`reduce` from inside this module would specialize at
+// the `$Json` representation cross-module, where the combinator's owned-array result and the
+// surrounding generic body's RC accounting disagree (a double-release of the intermediate array —
+// the chained-map-over-Json RC mismatch noted in ADR-068/069). Keeping these helpers on the
+// non-generic Json signature routes them through the SAME boxed intrinsic path the pre-generics
+// map/filter/reduce used, which is correct. The generic exports above still give the zero-box fast
+// path for monomorphic scalar pipelines at the user's call site.
+val _mapJ = (arr: Json, f: Function): Json =>
+  lin_map(arr, f)
+
+val _filterJ = (arr: Json, f: Function): Json =>
+  lin_filter(arr, f)
+
+val _reduceJ = (arr: Json, init: Json, f: (Json, Json) => Json): Json =>
   lin_reduce(arr, init, f)
 
 export val find = (arr: Json, f: Function): Json =>
@@ -233,7 +251,7 @@ export val chunk = (arr: Json, size: Int32): Json =>
   result
 
 export val compact = (arr: Json): Json =>
-  arr.filter(x => x != null)
+  _filterJ(arr, x => x != null)
 
 val _swap = (arr: Json, i: Int32, j: Int32): Null =>
   val tmp = arr[i]
@@ -265,33 +283,33 @@ export val sort = (arr: Json, cmp: (Json, Json) => Int32): Json =>
   result
 
 export val sortBy = (arr: Json, keyFn: (Json) => Json): Json =>
-  val pairs = arr.map(item => [keyFn(item), item])
+  val pairs = _mapJ(arr, item => [keyFn(item), item])
   val sorted = sort(pairs, (a, b) =>
     if a[0] < b[0] then -1 else if a[0] > b[0] then 1 else 0
   )
-  sorted.map(pair => pair[1])
+  _mapJ(sorted, pair => pair[1])
 
 export val sum = (arr: Json[]): Json =>
-  arr.reduce(0, (acc, x) => acc + x)
+  _reduceJ(arr, 0, (acc, x) => acc + x)
 
 export val product = (arr: Json[]): Json =>
-  arr.reduce(1, (acc, x) => acc * x)
+  _reduceJ(arr, 1, (acc, x) => acc * x)
 
 export val min = (arr: Json[]): Json =>
-  arr.reduce(arr[0], (acc, x) => if x < acc then x else acc)
+  _reduceJ(arr, arr[0], (acc, x) => if x < acc then x else acc)
 
 export val max = (arr: Json[]): Json =>
-  arr.reduce(arr[0], (acc, x) => if x > acc then x else acc)
+  _reduceJ(arr, arr[0], (acc, x) => if x > acc then x else acc)
 
 export val minBy = (arr: Json[], keyFn: (Json) => Json): Json =>
-  val pairs = arr.map(item => [keyFn(item), item])
-  pairs.reduce(pairs[0], (acc, x) =>
+  val pairs = _mapJ(arr, item => [keyFn(item), item])
+  _reduceJ(pairs, pairs[0], (acc, x) =>
     if x[0] < acc[0] then x else acc
   )[1]
 
 export val maxBy = (arr: Json[], keyFn: (Json) => Json): Json =>
-  val pairs = arr.map(item => [keyFn(item), item])
-  pairs.reduce(pairs[0], (acc, x) =>
+  val pairs = _mapJ(arr, item => [keyFn(item), item])
+  _reduceJ(pairs, pairs[0], (acc, x) =>
     if x[0] > acc[0] then x else acc
   )[1]
 
