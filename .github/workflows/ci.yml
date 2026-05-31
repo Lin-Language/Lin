@@ -67,9 +67,6 @@ jobs:
           for m in examples/*/main.lin; do
             dir="$(dirname "$m")"
             case "$dir" in
-              # ffi/ needs its C static lib prebuilt + linked (lin build only); the
-              # authoritative end-to-end FFI check is the Rust integration suite.
-              examples/ffi) echo "SKIP $m (needs prebuilt .a; covered by Rust FFI test)"; continue ;;
               # web-server/main.lin calls serve(...), which blocks forever; the router and
               # handlers are covered by *.test.lin and the Rust serve integration test.
               examples/web-server) echo "SKIP $m (serve blocks forever; covered by tests)"; continue ;;
