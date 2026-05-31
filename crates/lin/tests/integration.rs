@@ -3452,6 +3452,38 @@ print(toString(total))
     assert_eq!(output, vec!["13"]);
 }
 
+// Stage 4 (streams): the worked CSV example from the design brief. readStream → lines → filter
+// → map → writeStream → drain, run on the calling thread. Asserts the exact transformed output
+// file (`a,b,c` -> `"a"|"b"|"c"`), plus lazy adapters + in-band drain + sink working together.
+#[test]
+fn test_stream_csv_pipeline_drain() {
+    let indir = std::env::temp_dir();
+    let inp = indir.join(format!("lin_ctest_csvin_{}.csv", std::process::id()));
+    let outp = indir.join(format!("lin_ctest_csvout_{}.csv", std::process::id()));
+    let _ = fs::remove_file(&inp);
+    let _ = fs::remove_file(&outp);
+    fs::write(&inp, "a,b,c\nx,y,z\n\nfoo,bar,baz").unwrap();
+    let inp_s = inp.display().to_string();
+    let outp_s = outp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines, map, filter, writeStream, drain }} from "std/stream"
+import {{ split, join }} from "std/string"
+import {{ map as amap, length }} from "std/array"
+
+val notEmpty = (line: String): Boolean => length(line) > 0
+val quoteFields = (line: String): String =>
+  amap(split(line, ","), f => "\"${{f}}\"").join("|")
+
+readStream("{inp_s}").lines().filter(notEmpty).map(quoteFields).writeStream("{outp_s}").drain()
+print("ok")
+"#));
+    let written = fs::read_to_string(&outp).unwrap_or_default();
+    let _ = fs::remove_file(&inp);
+    let _ = fs::remove_file(&outp);
+    assert_eq!(output, vec!["ok"]);
+    assert_eq!(written, "\"a\"|\"b\"|\"c\"\n\"x\"|\"y\"|\"z\"\n\"foo\"|\"bar\"|\"baz\"\n");
+}
+
 #[test]
 fn test_fs_append_file() {
     let tmp = std::env::temp_dir().join(format!("lin_ctest_append_{}.txt", std::process::id()));

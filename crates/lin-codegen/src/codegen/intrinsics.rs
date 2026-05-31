@@ -544,6 +544,55 @@ impl<'ctx> Codegen<'ctx> {
                 let f = self.get_or_declare_fn("lin_stream_close", ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(f, &[s.into()], "ir_stream_close").try_as_basic_value().unwrap_basic()
             }
+            // Lazy adapters returning a new Stream (TaggedVal*(TAG_STREAM)). map/filter pass a
+            // transform closure (unboxed to a raw closure ptr if it arrived boxed); take/chunks an
+            // Int64 count; lines no extra arg; write a String path. All return a boxed Stream.
+            Intrinsic::StreamMap | Intrinsic::StreamFilter => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                // The runtime tolerates either a boxed Function or a raw closure ptr; pass through.
+                let func = if Self::is_union_type(&func_ty) && func.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[func.into()], "ir_stream_cls").try_as_basic_value().unwrap_basic()
+                } else { func };
+                let name = if matches!(intrinsic, Intrinsic::StreamMap) { "lin_stream_map" } else { "lin_stream_filter" };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), func.into()], "ir_stream_adapt").try_as_basic_value().unwrap_basic()
+            }
+            Intrinsic::StreamTake | Intrinsic::StreamChunks => {
+                let i64_ty = self.context.i64_type();
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let n = args.get(1).copied().unwrap_or_else(|| i64_ty.const_zero().into());
+                let n_i64 = if n.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(n.into_int_value(), i64_ty, "ir_stream_n")
+                } else { i64_ty.const_zero() };
+                let name = if matches!(intrinsic, Intrinsic::StreamTake) { "lin_stream_take" } else { "lin_stream_chunks" };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), n_i64.into()], "ir_stream_take_chunks").try_as_basic_value().unwrap_basic()
+            }
+            Intrinsic::StreamLines => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let fnv = self.get_or_declare_fn("lin_stream_lines", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into()], "ir_stream_lines").try_as_basic_value().unwrap_basic()
+            }
+            Intrinsic::StreamWrite => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let path = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let fnv = self.get_or_declare_fn("lin_stream_write", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), path.into()], "ir_stream_write").try_as_basic_value().unwrap_basic()
+            }
+            // Terminal drivers (sync, calling thread). Each returns a boxed union value
+            // (Null|Error / UInt8[]|Error / String|Error) — leave it boxed.
+            Intrinsic::StreamDrain | Intrinsic::StreamCollect | Intrinsic::StreamReadText => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let name = match intrinsic {
+                    Intrinsic::StreamDrain => "lin_stream_drain",
+                    Intrinsic::StreamCollect => "lin_stream_collect",
+                    _ => "lin_stream_read_text",
+                };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into()], "ir_stream_term").try_as_basic_value().unwrap_basic()
+            }
             // lin_object_set(obj, key, val) => Null. Unbox obj→LinObject*, key→LinString*,
             // box val→TaggedVal*, then call the runtime. Mirrors the AST handler.
             Intrinsic::ObjectSetDyn => {

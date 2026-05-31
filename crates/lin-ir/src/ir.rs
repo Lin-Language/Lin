@@ -128,6 +128,19 @@ pub enum Intrinsic {
     StreamOpen,
     StreamRead,
     StreamClose,
+    // Lazy adapters (Stage 4): each builds a new Stream node over an upstream Stream. map/filter
+    // carry a transform closure (called boxed-in/boxed-out); take/chunks carry an Int count.
+    StreamMap,
+    StreamFilter,
+    StreamTake,
+    StreamLines,
+    StreamChunks,
+    // Sink + terminal drivers (Stage 4). writeStream builds a sink; drain drives on the calling
+    // thread; collect/readText pull-all-into-one-value. All terminals close the stream.
+    StreamWrite,
+    StreamDrain,
+    StreamCollect,
+    StreamReadText,
     /// `fromJson` type-directed decode (ADR-047). Carries the resolved target `Type` T and the
     /// resolved bodies of every reachable `Named` type (so codegen can build a recursive schema
     /// descriptor with no type environment). Runtime: `lin_from_json(value, descriptor) -> ptr`
