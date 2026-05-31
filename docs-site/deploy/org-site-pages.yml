@@ -1,0 +1,109 @@
+# This workflow belongs in the Lin-Language.github.io repo, NOT in the Lin repo.
+# Copy it to:  Lin-Language.github.io/.github/workflows/pages.yml
+#
+# It checks out the Lin repo, builds the docs site from there (the generator is
+# written in Lin), and deploys the result to the org root site:
+#   https://lin-language.github.io
+#
+# Because it only READS the public Lin repo, no cross-repo token is needed.
+# LIN_DOCS_BASE is left unset (""), so links/assets are root-relative.
+
+name: Pages
+
+on:
+  # Rebuild when this repo changes...
+  push:
+    branches: [main]
+  # ...and let the Lin repo trigger a rebuild on its own pushes (see note below).
+  repository_dispatch:
+    types: [docs-update]
+  # Allow manual runs from the Actions tab.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build docs from Lin-Language/Lin
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out the Lin repo (docs source + generator)
+        uses: actions/checkout@v4
+        with:
+          repository: Lin-Language/Lin
+          ref: master
+
+      - name: Install LLVM 22
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-22 llvm-22-dev llvm-22-runtime clang-22 libpolly-22-dev
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build Lin compiler
+        run: cargo build --workspace
+
+      - name: Build the docs generator (written in Lin)
+        run: ./target/debug/lin build docs-site/builder/main.lin -o docs-builder
+
+      - name: Generate the static site (root-relative, no base path)
+        run: ./docs-builder
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs-site/output
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: build
+    runs-on: ubuntu-22.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+# ---------------------------------------------------------------------------
+# To rebuild automatically when the Lin repo changes (optional), add a step to
+# Lin's own workflow that fires a repository_dispatch at this repo:
+#
+#   - name: Trigger org-site rebuild
+#     if: github.ref == 'refs/heads/master'
+#     run: |
+#       curl -sf -X POST \
+#         -H "Authorization: Bearer ${{ secrets.PAGES_DISPATCH_TOKEN }}" \
+#         -H "Accept: application/vnd.github+json" \
+#         https://api.github.com/repos/Lin-Language/Lin-Language.github.io/dispatches \
+#         -d '{"event_type":"docs-update"}'
+#
+# where PAGES_DISPATCH_TOKEN is a PAT with `contents: write` (or the dispatch
+# scope) on Lin-Language.github.io. Without this, the org site rebuilds on its own
+# pushes or via a manual "Run workflow" — fine to start with.
+# ---------------------------------------------------------------------------
