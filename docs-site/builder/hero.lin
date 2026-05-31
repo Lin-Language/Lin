@@ -17,7 +17,7 @@ val escapeHtml = (text: String): String =>
     .replaceAll(">", "&gt;")
 
 val fileContent = (v: Json): String =>
-  if v != null && v["type"] == "failure" then "" else v
+  if v != null && v["type"] == "error" then "" else v
 
 // The feature list — the canonical positioning, one <li> per capability.
 val featureList = (): String =>

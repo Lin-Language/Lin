@@ -3015,10 +3015,10 @@ val fetch: (url: String) -> HttpResponse | Error
 Sends a GET request to `url`. Returns an `Error` only on transport-level failure; HTTP error status codes (4xx, 5xx) are returned as `HttpResponse` values.
 
 ```txt
-match fetch("https://api.example.com/ping")
-  is { "type": "failure", "error": e }        => print("network error: ${e}")
-  is { "type": "success", "value": resp } =>
-    print(toString(resp["status"]))
+val resp = fetch("https://api.example.com/ping")
+match resp
+  is Error => print("network error: ${resp["message"]}")
+  else     => print(toString(resp["status"]))
 ```
 
 ---
@@ -3032,11 +3032,10 @@ val fetchJson: (url: String) -> Json | Error
 GET `url`, parse the body as JSON. Returns an `Error` if transport fails, the status is not 2xx, or the body is not valid JSON.
 
 ```txt
-match fetchJson("https://api.example.com/users")
-  is { "type": "success", "value": users } =>
-    users.map(u => u["name"]).for(name => print(name))
-  is { "type": "failure", "error": e }     =>
-    print("failed: ${e}")
+val users = fetchJson("https://api.example.com/users")
+match users
+  is Error => print("failed: ${users["message"]}")
+  else     => users.map(u => u["name"]).for(name => print(name))
 ```
 
 ---
@@ -3189,9 +3188,10 @@ val parseBody: (req: HttpRequest) -> Json | Error
 Parses `req["body"]` as JSON.
 
 ```txt
-match parseBody(req)
-  is { "type": "failure", "error": e }    => badRequest(e)
-  is { "type": "success", "value": body } => createItem(body)
+val body = parseBody(req)
+match body
+  is Error => badRequest(body["message"])
+  else     => createItem(body)
 ```
 
 ---
@@ -3307,10 +3307,10 @@ wait:        (handle: ProcessHandle)            => Int32 | Error      // exit co
 import { exec } from "std/process"
 import { print } from "std/io"
 
-match exec("git", ["status", "--short"])
-  is { "type": "failure", "error": e } => print("exec failed: ${e}")
+val r = exec("git", ["status", "--short"])
+match r
+  is Error => print("exec failed: ${r["message"]}")
   else =>
-    val r = exec("git", ["status", "--short"])
     print("exit ${toString(r["status"])}")
     print(r["stdout"])
 ```
@@ -3748,12 +3748,13 @@ Template syntax uses `${key}` holes where `key` is a field name or dot-separated
 val render: (path: String, data: {}) -> String | Error
 ```
 
-Reads the file at `path` and renders it as a template against `data`. Intended for `.lint` template files. Returns `{ "type": "failure", "error": ... }` if the file cannot be read.
+Reads the file at `path` and renders it as a template against `data`. Intended for `.lint` template files. Returns an `Error` (`{ "type": "error", "message": ... }`) if the file cannot be read.
 
 ```txt
-match render("greet.lint", { "name": "Alice", "score": 42 })
-  is { "type": "failure", "error": e } => print("error: ${e}")
-  is { "type": "success", "value": s } => print(s)
+val s = render("greet.lint", { "name": "Alice", "score": 42 })
+match s
+  is Error => print("error: ${s["message"]}")
+  else     => print(s)
 ```
 
 ---
@@ -4000,7 +4001,7 @@ Parses an ISO 8601 date/datetime string and returns the corresponding Unix milli
 ```txt
 fromIso("2024-01-15T10:30:00Z")   // 1705314600000
 fromIso("2024-01-15")             // 1705276800000
-fromIso("not a date")             // { "type": "failure", "error": "..." }
+fromIso("not a date")             // { "type": "error", "message": "..." }
 ```
 
 ---
@@ -4032,7 +4033,7 @@ Parses the date/time string `s` using a strftime-style `pattern` and returns the
 ```txt
 parse("2024-01-15", "%Y-%m-%d")              // 1705276800000
 parse("15/01/2024 10:30", "%d/%m/%Y %H:%M")  // 1705314600000
-parse("bad", "%Y-%m-%d")                     // { "type": "failure", "error": "..." }
+parse("bad", "%Y-%m-%d")                     // { "type": "error", "message": "..." }
 ```
 
 ---
