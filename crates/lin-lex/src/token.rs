@@ -1,5 +1,16 @@
 use lin_common::{Span, NumSuffix};
 
+/// A `//` line comment captured on the lexer's side channel (not part of the token
+/// stream — see `Lexer::comments()`). `own_line` is true when nothing but whitespace
+/// precedes the comment on its source line; false for a trailing comment after code.
+/// `text` is right-trimmed of trailing whitespace at capture for formatter idempotency.
+#[derive(Debug, Clone)]
+pub struct Comment {
+    pub span: Span,
+    pub text: String,
+    pub own_line: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     pub kind: TokenKind,
