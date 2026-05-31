@@ -73,27 +73,22 @@ export val iter = (init: Json, hasNext: Json, next: Json, value: Json) =>
 export val concat = (a: Json, b: Json): Json =>
   lin_array_concat_dyn(a, b)
 
+// map/filter/reduce route to the lin_map/lin_filter/lin_reduce builtins, whose IR lowering
+// allocates a flat output array, reads flat elements, and — for a capture-less lambda — inlines the
+// callback body with no per-element box/unbox/closure-call when the source/element types are
+// flat-scalar (ADR-068). Kept on the permissive `Json`/`Function` signatures (NOT generic): a fully
+// generic signature over-constrains the union/object call sites the rest of the stdlib relies on
+// (e.g. `sortBy`'s `arr.map(item => [keyFn(item), item])`, `report`'s `.map(r => r["value"])` over a
+// `Success | Failure` union) — those keep working through the Json path, while the flat-scalar fast
+// path still fires for monomorphic scalar pipelines via the intrinsic's own type-directed lowering.
 export val map = (arr: Json, f: Function): Json =>
-  val n = length(arr)
-  val result = lin_array_allocate(n)
-  var i = 0
-  arr.for(item =>
-    result[i] = f(item)
-    i = i + 1
-  )
-  result
+  lin_map(arr, f)
 
 export val filter = (arr: Json, f: Function): Json =>
-  val result = []
-  arr.for(item =>
-    if f(item) then push(result, item)
-  )
-  result
+  lin_filter(arr, f)
 
 export val reduce = (arr: Json, init: Json, f: (Json, Json) => Json): Json =>
-  var acc = init
-  arr.for(item => acc = f(acc, item))
-  acc
+  lin_reduce(arr, init, f)
 
 export val find = (arr: Json, f: Function): Json =>
   var found = null

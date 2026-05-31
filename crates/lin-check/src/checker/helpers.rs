@@ -86,6 +86,17 @@ pub(crate) fn collect_type_subs(pattern: &Type, actual: &Type, subs: &mut std::c
             collect_type_subs(pt, &Type::TypeVar(u32::MAX), subs)
         }
         (Type::Iterator(pt), Type::Iterator(at)) => collect_type_subs(pt, at, subs),
+        // An `Iterable`-shaped generic param `T[]` is routinely applied to a runtime ITERATOR
+        // (e.g. `range(0,n): Iterator<Int32>` then `.map(T[], …)`). Cross-unify the element through
+        // the Array↔Iterator boundary so `T` binds to the element type (Int32), and the callback
+        // lambda is type-checked at the CONCRETE element type rather than defaulting to Json. Without
+        // this the lambda param is Json → a per-element box/unbox even on the inlined flat path
+        // (mirrors `lin-ir`'s monomorphize `collect_subs`).
+        (Type::Array(pt), Type::Iterator(at)) => collect_type_subs(pt, at, subs),
+        (Type::Iterator(pt), Type::Array(at)) => collect_type_subs(pt, at, subs),
+        (Type::Iterator(pt), Type::FixedArray(ats)) => {
+            for at in ats { collect_type_subs(pt, at, subs); }
+        }
         (Type::Shared(pt), Type::Shared(at)) => collect_type_subs(pt, at, subs),
         (Type::Union(pts), actual) => {
             for pt in pts { collect_type_subs(pt, actual, subs); }

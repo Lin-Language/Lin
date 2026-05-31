@@ -1,0 +1,20 @@
+import { print } from "std/io"
+import { fetchJson, serve, json, text, matchPath } from "std/http"
+
+// Client: fetch and decode JSON in one call. The result is plain Json, so you
+// read fields and match on shape the same way as any other value.
+val user = fetchJson("https://api.example.com/users/1")
+print("name: ${user["name"]}")
+
+// Server: a handler is just a function from a request to a response. `matchPath`
+// extracts path parameters; the json/text helpers build the response objects.
+val handler = (req: Json): Json =>
+  if req["path"] == "/" then
+    text(200, "Lin web server")
+  else
+    val m = matchPath(req["path"], "/users/:id")
+    if m == null then json(404, { "error": "not found" })
+    else json(200, { "id": m["id"], "name": "User ${m["id"]}" })
+
+// serve blocks, dispatching each request through the handler.
+handler.serve(3000)
