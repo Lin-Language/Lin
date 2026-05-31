@@ -77,6 +77,15 @@ pub fn is_compatible_env(
         (Type::Shared(_), _) => false,
         (_, Type::Shared(_)) => false,
 
+        // `Stream<T>` is covariant in T (a `Stream<U>` flows into a `Stream<T>` when `U` is
+        // compatible with `T`) but, like `Shared`, is opaque: it does NOT widen to `Json` nor
+        // unify with any other type, so the only legal operations are the stream-API intrinsics
+        // whose signatures take `Stream<T>` explicitly. These arms come BEFORE the `Json`
+        // wildcard so a stream can never silently flow into a `Json` sink (streams brief §1).
+        (Type::Stream(a), Type::Stream(b)) => is_compatible_env(a, b, env, lenient_json, depth),
+        (Type::Stream(_), _) => false,
+        (_, Type::Stream(_)) => false,
+
         // Anything is assignable INTO Json (covariant sink): concrete T -> Json. (ADR-046)
         (_, Type::TypeVar(n)) if *n == u32::MAX => true,
         // Json -> a concrete structured Object (one with a required, non-nullable field):

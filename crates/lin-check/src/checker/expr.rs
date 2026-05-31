@@ -869,7 +869,7 @@ pub(crate) fn is_json_dynamic(ty: &Type) -> bool {
 pub(crate) fn type_mentions_strlit(ty: &Type) -> bool {
     match ty {
         Type::StrLit(_) => true,
-        Type::Array(inner) | Type::Iterator(inner) | Type::Shared(inner) => type_mentions_strlit(inner),
+        Type::Array(inner) | Type::Iterator(inner) | Type::Shared(inner) | Type::Stream(inner) => type_mentions_strlit(inner),
         Type::FixedArray(elems) => elems.iter().any(type_mentions_strlit),
         Type::Union(variants) => variants.iter().any(type_mentions_strlit),
         Type::Object(fields) => fields.values().any(type_mentions_strlit),

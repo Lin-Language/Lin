@@ -919,7 +919,10 @@ impl<'a> DescEncoder<'a> {
             | Type::Iterator(_)
             | Type::Function { .. }
             | Type::Never
-            | Type::Shared(_) => self.put_u8(KIND_JSON),
+            | Type::Shared(_)
+            // `Stream<T>` is opaque and never a `fromJson` target (not JSON-shaped, not
+            // spellable in annotations); included only for match exhaustiveness — accept-any.
+            | Type::Stream(_) => self.put_u8(KIND_JSON),
             Type::Array(inner) => {
                 self.put_u8(KIND_ARRAY);
                 let slot = self.reserve_u32();

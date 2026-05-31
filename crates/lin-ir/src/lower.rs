@@ -1070,8 +1070,11 @@ pub fn mangle_module_key(path: &str) -> String {
 /// Mirrors codegen's `Codegen::is_union_type`. `Shared<T>` is a boxed `TaggedVal*(TAG_SHARED)`,
 /// so it belongs here: it follows the OWNING model and its RC dispatches through the tag-aware
 /// `lin_tagged_retain`/`lin_tagged_release`, whose TAG_SHARED arm does the atomic box rc.
+/// `Stream<T>` is likewise a boxed `TaggedVal*(TAG_STREAM)` whose RC dispatches through the
+/// tag-aware path (the TAG_STREAM arm decrements the stream box's refcount, closing the fd at
+/// zero) — so it is owning too.
 fn is_union_ty(ty: &Type) -> bool {
-    matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_))
+    matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_))
 }
 
 /// A concrete heap-allocated value type whose box wraps a refcounted heap pointer
