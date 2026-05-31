@@ -72,7 +72,9 @@ fn process_file(path: &PathBuf, check: bool) -> Result<bool, String> {
 /// Lex, parse, and format a Lin source string.
 /// Returns an error string if there are parse errors.
 pub fn format_source(source: &str) -> Result<String, String> {
-    let tokens = lin_lex::Lexer::new(source, 0).tokenize();
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    let comments = lexer.comments().to_vec();
     let mut parser = lin_parse::Parser::new(tokens);
     let module = parser.parse_module();
 
@@ -85,7 +87,7 @@ pub fn format_source(source: &str) -> Result<String, String> {
         return Err(msgs.join("; "));
     }
 
-    Ok(lin_parse::Formatter::new().format_module(&module))
+    Ok(lin_parse::Formatter::with_comments(source, comments).format_module(&module))
 }
 
 /// Collect .lin files from the given paths. If a path is a directory, glob
