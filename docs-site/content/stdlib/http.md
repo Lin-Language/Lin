@@ -43,17 +43,19 @@ type HttpOptions = {
 ### `fetch`
 
 ```lin
-match fetch("https://example.com/ping")
-  has { "type": "failure", error } => print("network error: ${error}")
+val result = fetch("https://example.com/ping")
+match result
+  is Error => print("network error: ${result["message"]}")
   else => print(result["status"])
 ```
 
 ### `fetchJson`
 
 ```lin
-match fetchJson("https://api.example.com/users")
-  has { "type": "success", value } => value.for(u => print(u["name"]))
-  has { "type": "failure", error } => print("failed: ${error}")
+val users = fetchJson("https://api.example.com/users")
+match users
+  is Error => print("failed: ${users["message"]}")
+  else => users.for(u => print(u["name"]))
 ```
 
 ### `fetchWith`
@@ -114,10 +116,10 @@ val params = req["path"].matchPath("/users/:id/posts")
 
 ```lin
 val handler = req =>
-  match parseBody(req)
-    has { "type": "failure", error } => badRequest(error)
-    has { "type": "success", value } => json(200, { "received": value })
-    else => json(200, { "received": null })
+  val body = parseBody(req)
+  match body
+    is Error => badRequest(body["message"])
+    else => json(200, { "received": body })
 
 handler.serve(3000)
 ```

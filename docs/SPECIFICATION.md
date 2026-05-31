@@ -2094,7 +2094,7 @@ The functions in `std/io`, `std/fs`, and `std/http` cannot be implemented in Lin
 All three modules follow the same conventions:
 
 1. **Blocking by default.** Every function runs synchronously. Use `async` at the call site when concurrency is needed.
-2. **`T | Error` for fallible operations.** A function that may fail at the OS or network level returns a `Result`-shaped value (`{ "type": "success", "value": T } | { "type": "failure", "error": String }`). HTTP error status codes are not transport errors and do not produce `Error`.
+2. **`T | Error` for fallible operations.** A function that may fail at the OS or network level returns `T | Error`, where `Error` is the conventional error value `{ "type": "error", "message": String }` (see §19, §32.2.2), detected with `is Error`. HTTP error status codes are not transport errors and do not produce `Error`.
 3. **`Iterator` for sequences.** Line-oriented reads return iterators rather than loading everything into memory.
 4. **No hidden global state.** Stdin, stdout, and the filesystem are the implicit context; there are no open-handle values exposed to user code.
 
@@ -2171,13 +2171,12 @@ export val fetchWith = (url: String, opts: HttpOptions): HttpResponse | Error =>
   __httpFetchWith(url, opts)
 
 export val fetchJson = (url: String): Json | Error =>
-  match __httpFetch(url)
-    is { "type": "failure", "error": e } => { "type": "failure", "error": e }
-    is { "type": "success", "value": resp } =>
-      if resp["status"] >= 200 && resp["status"] < 300 then
-        parseJson(resp["body"])
-      else
-        { "type": "failure", "error": "HTTP ${resp["status"]}" }
+  val resp = __httpFetch(url)
+  if resp is Error then resp
+  else if resp["status"] >= 200 && resp["status"] < 300 then
+    parseJson(resp["body"])
+  else
+    { "type": "error", "message": "HTTP ${resp["status"]}" }
 
 export val postJson = (url: String, body: Json): HttpResponse | Error =>
   __httpFetchWith(url, {

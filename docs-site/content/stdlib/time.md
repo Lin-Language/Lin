@@ -49,7 +49,7 @@ toIso(now())   // e.g. "2025-05-27T14:32:07.123Z"
 
 fromIso("2024-01-15T10:30:00Z")   // 1705313400000
 fromIso("2024-01-15")             // 1705276800000
-fromIso("bad")                    // { "type": "failure", "error": "..." }
+fromIso("bad")                    // { "type": "error", "message": "..." }
 ```
 
 ---
