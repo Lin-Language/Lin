@@ -6,22 +6,13 @@ on:
   pull_request:
     branches: [master]
 
-# Allow the deploy job to publish to GitHub Pages.
-permissions:
-  contents: read
-  pages: write
-  id-token: write
-
-# A single in-flight Pages deployment at a time; let a newer push cancel an older run.
-concurrency:
-  group: pages
-  cancel-in-progress: false
-
+# Build-only CI check: confirms the Lin-written docs generator still compiles and
+# runs. The site is DEPLOYED from the Lin-Language.github.io repo (the org root
+# site at https://lin-language.github.io), whose workflow checks this repo out and
+# builds it — see that repo's .github/workflows. This job does not publish Pages.
 jobs:
-  # Build the site on every push and PR (PRs build but do not deploy — a cheap check
-  # that the Lin-written generator still compiles and runs).
   build:
-    name: Build docs
+    name: Build docs (check)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -57,27 +48,10 @@ jobs:
         run: ./target/debug/lin build docs-site/builder/main.lin -o docs-builder
 
       - name: Generate the static site
-        # GitHub Pages serves this project site under /Lin, so prefix all links/assets.
-        env:
-          LIN_DOCS_BASE: /Lin
         run: ./docs-builder
 
-      - name: Upload Pages artifact
-        if: github.ref == 'refs/heads/master'
-        uses: actions/upload-pages-artifact@v3
+      - name: Upload generated site (artifact, for inspection)
+        uses: actions/upload-artifact@v4
         with:
+          name: docs-site
           path: docs-site/output
-
-  # Deploy only from master, after a successful build.
-  deploy:
-    name: Deploy to GitHub Pages
-    if: github.ref == 'refs/heads/master'
-    needs: build
-    runs-on: ubuntu-22.04
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy
-        id: deployment
-        uses: actions/deploy-pages@v4
