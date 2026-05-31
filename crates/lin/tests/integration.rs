@@ -4380,6 +4380,29 @@ print(toString(hi["w"]))
 }
 
 #[test]
+fn test_concat_fresh_strings_no_use_after_free() {
+    // Regression: `lin_array_concat_dyn`'s tagged path copied each element's TaggedVal WITHOUT
+    // retaining its heap payload, so `acc = concat(acc, [freshString])` in a loop left the result
+    // and the freed temp/old-acc sharing one payload at refcount 1 → use-after-free / heap
+    // corruption (only masked when the elements are interned string literals). The tagged-source
+    // copy now retains; the result owns its elements independently. Uses interpolated (non-interned
+    // per-iteration) strings so the elements are genuinely heap-owned and a missing retain faults.
+    let out = run(r#"import { print } from "std/io"
+import { concat, range, for, length } from "std/array"
+import { toString } from "std/string"
+val mk = (n: Int32): String => "item-${n}-${n * 13}"
+var acc: String[] = []
+range(0, 40).for(n =>
+  acc = concat(acc, [mk(n)])
+)
+print(toString(length(acc)))
+print(acc[0])
+print(acc[39])
+"#);
+    assert_eq!(out, vec!["40", "item-0-0", "item-39-507"]);
+}
+
+#[test]
 fn test_for_callback_json_assign_loop_correct() {
     // Regression for the for-callback-return box leak fix. The `for` callback's boxed-ABI
     // return is now released every iteration. For a body that is an ASSIGNMENT to a captured
