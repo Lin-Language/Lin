@@ -3546,6 +3546,64 @@ print(text)
     assert_eq!(output, vec!["hello affine"]);
 }
 
+// Stage 8 (streams): `.promise()` drives a pipeline on a WORKER thread; two run concurrently and
+// are awaited. Real cross-thread move (the stream is moved onto each worker). Verifies both
+// outputs are correct (the workers ran the pipelines and closed their fds).
+#[test]
+fn test_stream_promise_concurrent() {
+    let dir = std::env::temp_dir();
+    let in1 = dir.join(format!("lin_ctest_pc_in1_{}.txt", std::process::id()));
+    let in2 = dir.join(format!("lin_ctest_pc_in2_{}.txt", std::process::id()));
+    let out1 = dir.join(format!("lin_ctest_pc_out1_{}.txt", std::process::id()));
+    let out2 = dir.join(format!("lin_ctest_pc_out2_{}.txt", std::process::id()));
+    for p in [&in1, &in2, &out1, &out2] { let _ = fs::remove_file(p); }
+    fs::write(&in1, "a\nb").unwrap();
+    fs::write(&in2, "c\nd").unwrap();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines, writeStream, promise }} from "std/stream"
+import {{ await }} from "std/async"
+import {{ readFile }} from "std/fs"
+
+val p1 = readStream("{i1}").lines().writeStream("{o1}").promise()
+val p2 = readStream("{i2}").lines().writeStream("{o2}").promise()
+val r1 = await(p1)
+val r2 = await(p2)
+print(readFile("{o1}"))
+print(readFile("{o2}"))
+"#, i1 = in1.display(), i2 = in2.display(), o1 = out1.display(), o2 = out2.display()));
+    for p in [&in1, &in2, &out1, &out2] { let _ = fs::remove_file(p); }
+    assert_eq!(output, vec!["a", "b", "c", "d"]);
+}
+
+// Stage 8 (streams): a fault inside a transform on a `.promise()` worker is caught at the async
+// boundary and surfaces as an `Error` at `await` (ADR-070 / §32.2.2), NOT a crash.
+#[test]
+fn test_stream_promise_fault_isolation() {
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_pf_{}.txt", std::process::id()));
+    let out = std::env::temp_dir().join(format!("lin_ctest_pfo_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(&out);
+    fs::write(&tmp, "a\nb\nc").unwrap();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines, map, writeStream, promise }} from "std/stream"
+import {{ await }} from "std/async"
+
+val boom = (line: Json): Json =>
+  val arr = [1, 2]
+  arr[100]
+
+val p = readStream("{inp}").lines().map(boom).writeStream("{outp}").promise()
+val r = await(p)
+val status = match r
+  is Error => "caught error"
+  else => "ok"
+print(status)
+"#, inp = tmp.display(), outp = out.display()));
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(&out);
+    assert_eq!(output, vec!["caught error"]);
+}
+
 #[test]
 fn test_fs_append_file() {
     let tmp = std::env::temp_dir().join(format!("lin_ctest_append_{}.txt", std::process::id()));

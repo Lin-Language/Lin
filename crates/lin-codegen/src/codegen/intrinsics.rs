@@ -617,6 +617,15 @@ impl<'ctx> Codegen<'ctx> {
                 let fnv = self.get_or_declare_fn("lin_io_stdin_stream", ptr_ty.fn_type(&[], false));
                 self.builder.call(fnv, &[], "ir_stream_stdin").try_as_basic_value().unwrap_basic()
             }
+            // .promise() → lin_stream_promise(s) → *LinPromise, boxed as TAG_PROMISE so it
+            // round-trips through await/parallel like any other promise. The stream is MOVED in
+            // (the IR suppressed the caller's release).
+            Intrinsic::StreamPromise => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let fnv = self.get_or_declare_fn("lin_stream_promise", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                let raw = self.builder.call(fnv, &[s.into()], "ir_stream_promise").try_as_basic_value().unwrap_basic();
+                self.box_promise(raw)
+            }
             // .for(fn) over a Stream → lin_stream_for(stream, closure) → boxed Null | Error. The
             // body closure may arrive boxed; unbox to the raw closure ptr like map/filter.
             Intrinsic::StreamFor => {

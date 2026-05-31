@@ -61,3 +61,11 @@ export val close = (s: Stream): Null =>
 // Import this `for` (not std/array's) when consuming a stream: `stream.lines().for(println)`.
 export val for = (s: Stream, f: Function): Json =>
   lin_for(s, f)
+
+// `.promise()` — drive the pipeline on a WORKER thread → `Promise<Null | Error>` (brief §5).
+// The stream is MOVED onto the worker (legal via CAP_MOVE, Stage 7): the worker owns the whole
+// pipeline, drives it to EOF, and the result resolves to `Null` (success) or an `Error` (a
+// read/transform fault is caught at the async boundary — ADR-070 / §32.2.2 — and surfaces as the
+// awaited `Error`). Real concurrency + fault isolation: run several with `parallel([...])`.
+export val promise = (s: Stream): Json =>
+  lin_stream_promise(s)

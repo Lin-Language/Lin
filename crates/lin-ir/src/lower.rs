@@ -2102,7 +2102,19 @@ fn lower_call_arg(a: &TypedExpr, param_ty: Option<&Type>, builder: &mut FuncBuil
         }
     }
     let t = lower_expr(a, builder, ctx);
-    lower_coerce_arg(t, &a.ty(), param_ty, builder)
+    let coerced = lower_coerce_arg(t, &a.ty(), param_ty, builder);
+    move_streamish_arg(&a.ty(), coerced, builder);
+    coerced
+}
+
+/// A streamish ARGUMENT is MOVED into the callee (streams brief §7/§9): the callee/worker takes
+/// ownership of the boxed-stream pointer, so the caller must NOT release it at scope exit.
+/// Unregister the lowered arg temp from the caller's owning scope. The affine check guarantees
+/// the caller never uses it again. No-op for non-stream args.
+fn move_streamish_arg(arg_ty: &Type, t: Temp, builder: &mut FuncBuilder) {
+    if type_is_streamish_ir(arg_ty) {
+        builder.unregister_owned(t);
+    }
 }
 
 /// Lower argument `i` of a call, combining two concerns:
@@ -2128,6 +2140,7 @@ fn lower_call_arg_tracked(
         let raw = lower_expr(a, builder, ctx);
         let coerced = lower_coerce_arg(raw, &a.ty(), param_ty, builder);
         let tracked = if coerced != raw { Some(raw) } else { None };
+        move_streamish_arg(&a.ty(), coerced, builder);
         return (coerced, tracked);
     }
     // Combinator callback position: enable the safe captured-cell context while lowering.
@@ -2400,6 +2413,7 @@ fn lower_intrinsic_call(
         "lin_net_tcp_stream" => Intrinsic::StreamTcp,
         "lin_process_stdout_stream" => Intrinsic::StreamStdout,
         "lin_io_stdin_stream" => Intrinsic::StreamStdin,
+        "lin_stream_promise" => Intrinsic::StreamPromise,
         _ => {
             // Unknown intrinsic: lower as indirect call fallback.
             let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();
@@ -2415,6 +2429,16 @@ fn lower_intrinsic_call(
         }
     };
     let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();
+
+    // `.promise()` MOVES its stream argument onto the worker (Stage 8): the runtime takes
+    // ownership of the boxed-stream pointer, so the caller must NOT release it (handoff). Suppress
+    // the source temp's scope-exit release — without this the caller AND the worker would both
+    // release the box (double-free / double-close). The affine check guarantees no further use.
+    if matches!(intrinsic, Intrinsic::StreamPromise) {
+        if let Some(&arg0) = lowered_args.first() {
+            builder.unregister_owned(arg0);
+        }
+    }
 
     // `push(arr, elem)` / `set(arr, idx, elem)` / `object_set(obj, key, val)` all transfer a
     // reference to their LAST argument into the container. For push/set, codegen stores the
