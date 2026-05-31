@@ -229,8 +229,11 @@ val tests = [
 
 `replace` is permitted **only** in a `*.test.lin` file — using it in a program built
 with `lin build`/`lin run` is a hard compile error, so a shipped binary can never
-silently swap a real import. See the `examples/mocking/` project for a full worked
-example (a clock, a store, and a logger composed from them, each mocked in tests).
+silently swap a real import. For worked examples, see `examples/processes/` (mocks
+`std/process.exec` so the task-runner tests are deterministic and hermetic),
+`examples/dijkstra/` (mocks `std/fs` read/write to test the file-driven solver), and
+`examples/web-server/` (mocks `std/template.render` to decouple routing tests from a
+view file on disk).
 
 ## Coverage
 

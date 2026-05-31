@@ -189,4 +189,5 @@ compiled symbol. Highlights:
 - `replace` is permitted **only in a `*.test.lin`** — a hard error elsewhere, so a
   shipped binary can never silently swap an import.
 
-See the `examples/mocking/` project for a full worked example.
+For worked examples, see `examples/processes/` (mock `exec`), `examples/dijkstra/`
+(mock `std/fs`), and `examples/web-server/` (mock `render`).
