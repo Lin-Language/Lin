@@ -14,13 +14,13 @@ val p = async(() => expensiveComputation())
 val result = await(p)
 ```
 
-`await` blocks the caller until the promise resolves.
+`await` blocks the caller until the promise resolves, returning `T | Error`.
 
-The thunk must be a zero-argument function: `() => T`.
+The thunk must be a zero-argument function `() => T`, and `T` must be a transferable (JSON-shaped) value — a thunk may not return a `Function` or `Iterator`.
 
 ## No async colouring
 
-In many languages, `async` is viral — calling an async function forces you to become async too. In Lin, `async` and `await` are ordinary functions. Any function can call `async`. Any function can call `await`. There is no `async def`.
+In many languages, `async` is viral — calling an async function forces you to become async too. In Lin, a function is never *marked* async or sync; there is no `async def`. `async` and `await` are ordinary functions, and you decide at the **call site** whether to run a given function on a background thread. Any function can call `async`, and any function can call `await`.
 
 ## `parallel` — fork/join
 
@@ -58,6 +58,7 @@ This prevents data races. Use `val` bindings (which are immutable) for data you 
 
 ```lin
 import { async, await } from "std/async"
+import { print } from "std/io"
 
 val p = async(() =>
   val xs = [1, 2, 3]
@@ -101,11 +102,29 @@ Workers may close over `var` bindings because they are single-threaded: messages
 For high-fan-out work, create a `ThreadPool` to distribute tasks across a fixed number of threads:
 
 ```lin
-import { threadPool, await } from "std/async"
+import { threadPool, poolAsync, await } from "std/async"
 
 val pool = threadPool(8)
-val p = pool.async(() => heavyWork())
+val p = pool.poolAsync(() => heavyWork())   // poolAsync(pool, thunk)
 val result = await(p)
+```
+
+`pool.poolAsync(thunk)` is dot application for `poolAsync(pool, thunk)`.
+
+## Shared state
+
+For state that several threads must coordinate on, `std/async` provides `shared`/`get`/`set`/`withLock` (a lockable mutable cell) and `frozen` (a read-only graph shared lock-free by reference):
+
+```lin
+import { shared, withLock, get, parallel } from "std/async"
+import { push, length } from "std/array"
+
+val box = shared([])
+parallel([
+  () => withLock(box, a => push(a, 1)),
+  () => withLock(box, a => push(a, 1))
+])
+val total = length(get(box))   // 2
 ```
 
 ## Summary
@@ -115,4 +134,5 @@ val result = await(p)
 | Background computation | `async` + `await` |
 | Multiple results needed | `parallel` |
 | Stateful background thread | `worker` + `request` |
-| High-fan-out work | `threadPool` |
+| High-fan-out work | `threadPool` + `poolAsync` |
+| Coordinated shared state | `shared` / `withLock` / `frozen` |

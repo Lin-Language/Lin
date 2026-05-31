@@ -11,12 +11,15 @@ import { map, filter, reduce, for, range, find, some, every, sort, sortBy, lengt
 | Function | Signature | Description |
 | --- | --- | --- |
 | `append` | `(Json[], Json) -> Json[]` | Non-mutating single-element append |
+| `arrayAllocate` | `(Int32) -> Json[]` | Allocate an array of n nulls |
+| `arrayAllocateFilled` | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
 | `at` | `(Json[], Int32) -> Json` | Element at index; negative from end |
 | `chunk` | `(Json[], Int32) -> Json[][]` | Split into n-sized sub-arrays |
 | `compact` | `(Json[]) -> Json[]` | Remove null elements |
 | `concat` | `(Json[], Json[]) -> Json[]` | Concatenate two arrays |
 | `countBy` | `(Json[], (Json) -> String) -> {}` | Frequency map by key function |
 | `drop` | `(Json[], Int32) -> Json[]` | All elements after first n |
+| `dropWhile` | `(Json[], (Json) -> Boolean) -> Json[]` | Skip elements while predicate holds |
 | `every` | `(Json[], (Json) -> Boolean) -> Boolean` | True if all elements match |
 | `filter` | `(Json[], (Json) -> Boolean) -> Json[]` | Keep matching elements |
 | `find` | `(Json[], (Json) -> Boolean) -> Json` | First matching element or null |
@@ -37,14 +40,20 @@ import { map, filter, reduce, for, range, find, some, every, sort, sortBy, lengt
 | `prepend` | `(Json[], Json) -> Json[]` | Non-mutating prepend |
 | `push` | `(Json[], Json) -> Null` | Append in place (mutating) |
 | `range` | `(Int32, Int32) -> Iterator` | Integer range `[start, end)` |
+| `rangeStep` | `(Int32, Int32, Int32) -> Iterator` | Integer range with an explicit (possibly negative) step |
 | `reduce` | `(Json[], Json, (Json, Json) -> Json) -> Json` | Fold left |
 | `reverse` | `(Json[]) -> Json[]` | Reversed copy |
+| `scan` | `(Json[], Json, (Json, Json) -> Json) -> Json[]` | Reduce returning all intermediate values |
+| `set` | `(Json[], Int32, Json) -> Null` | Set an element by index in place (mutating) |
+| `slice` | `(T[], Int32, Int32) -> T[]` | Copy of `[start, end)`; preserves element type |
 | `some` | `(Json[], (Json) -> Boolean) -> Boolean` | True if any element matches |
 | `sort` | `(Json[], (Json, Json) -> Int32) -> Json[]` | Sort with comparator |
 | `sortBy` | `(Json[], (Json) -> Json) -> Json[]` | Sort by key extractor |
 | `sum` | `(Number[]) -> Number` | Sum all elements |
 | `take` | `(Json[], Int32) -> Json[]` | First n elements |
+| `takeWhile` | `(Json[], (Json) -> Boolean) -> Json[]` | Elements until predicate fails |
 | `unique` | `(Json[]) -> Json[]` | Remove duplicates |
+| `while` | `(Json[], (Json) -> Boolean) -> Null` | Iterate, stopping when callback returns false |
 | `zip` | `(Json[], Json[]) -> [Json, Json][]` | Pair elements by index |
 
 ---

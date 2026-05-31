@@ -85,5 +85,11 @@ All standard library paths begin with `std/`:
 std/string    std/array     std/number    std/math
 std/object    std/io        std/fs        std/path
 std/http      std/async     std/env       std/process
-std/template  std/test      std/time
+std/template  std/test      std/time      std/json
+std/bytes     std/hash      std/net       std/signal
+std/tty
 ```
+
+## Generics across modules
+
+Generic type and function declarations work across module boundaries. Cross-module generic functions are **monomorphized per importer** — each importing module gets a specialised copy for the concrete types it uses. Exported generic types (e.g. `Result<T, E>`) can be imported and applied like any other type.

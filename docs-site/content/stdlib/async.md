@@ -5,7 +5,8 @@ Concurrency primitives: async/await, workers, thread pools.
 ```lin
 import { async, await, parallel, race, timeout, retry } from "std/async"
 import { worker, message, request, close } from "std/async"
-import { threadPool } from "std/async"
+import { threadPool, poolAsync } from "std/async"
+import { shared, get, set, withLock, frozen } from "std/async"
 ```
 
 ## Function reference
@@ -15,13 +16,19 @@ import { threadPool } from "std/async"
 | `async` | `(() -> T) -> Promise` | Run thunk on background thread |
 | `await` | `(Promise) -> T` | Block until promise resolves |
 | `close` | `(Worker) -> Null` | Shut down worker |
+| `frozen` | `(T) -> T` | Deep-freeze a value into lock-free shared read-only state |
+| `get` | `(Shared) -> T` | Read a snapshot copy out of a `Shared` |
 | `message` | `(Worker, Msg) -> Null` | Fire-and-forget message to worker |
 | `parallel` | `((() -> T)[]) -> T[]` | Run array of thunks concurrently |
+| `poolAsync` | `(ThreadPool, () -> T) -> Promise` | Enqueue a thunk on a thread pool |
 | `race` | `(Promise[]) -> T` | First promise to complete wins |
 | `request` | `(Worker, Msg) -> Reply` | Synchronous request/reply to worker |
 | `retry` | `(() -> T, Int32) -> T` | Retry thunk up to n times |
+| `set` | `(Shared, T) -> Null` | Replace a `Shared`'s value |
+| `shared` | `(T) -> Shared` | Create opt-in shared mutable state |
 | `threadPool` | `(Int32) -> ThreadPool` | Create thread pool |
 | `timeout` | `(Promise, Int32) -> T` | Add timeout to a promise |
+| `withLock` | `(Shared, (T) -> R) -> R` | Atomic read-modify-write on a `Shared` |
 | `worker` | `((Msg) -> Reply, () -> Null) -> Worker` | Create background worker |
 
 ---
@@ -98,21 +105,43 @@ Workers may close over `var` bindings (single-threaded, no races).
 
 ---
 
-### `threadPool`
+### `threadPool` / `poolAsync`
+
+A thread pool bounds concurrency: at most `n` thunks run at once, and excess work queues until a worker frees up. Enqueue work with `poolAsync(pool, thunk)`, designed for the dot-call form `pool.poolAsync(thunk)`.
 
 ```lin
 val pool = threadPool(8)
-val p = pool.async(() => heavyWork())
+val p = pool.poolAsync(() => heavyWork())
 val result = await(p)
 
 // Multiple tasks:
-val results = await(pool.async([
-  () => work(1),
-  () => work(2),
-  () => work(3)
-]))
+val results = parallel([
+  () => pool.poolAsync(() => work(1)),
+  () => pool.poolAsync(() => work(2)),
+  () => pool.poolAsync(() => work(3))
+])
+```
 
-// HTTP server on pool:
-import { serve, json } from "std/http"
-pool.serve(3000, req => json(200, { "status": "ok" }))
+---
+
+### `shared` / `get` / `set` / `withLock`
+
+`shared` wraps a value in opt-in shared mutable state safe to read and update across threads. `get` reads a snapshot, `set` replaces it, and `withLock` runs an atomic read-modify-write.
+
+```lin
+val counter = shared(0)
+
+counter.withLock(n => n + 1)   // atomic increment
+val current = get(counter)     // snapshot copy
+set(counter, 100)              // replace
+```
+
+---
+
+### `frozen`
+
+`frozen` deep-freezes a value into lock-free read-only state that any thread can share without copying.
+
+```lin
+val config = frozen({ "retries": 3, "timeout": 5000 })
 ```

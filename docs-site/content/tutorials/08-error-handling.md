@@ -45,31 +45,44 @@ match result
     print("error: ${error}")
 ```
 
-## Composing fallible operations
+## The built-in `Error` type
 
-Chain results by matching each step:
+Lin has a built-in `Error` type, structurally `{ "type": String, "message": String }`. The standard library uses it for failures rather than a hand-rolled tag, so you discriminate it with `is Error`:
 
 ```lin
 import { readFile } from "std/fs"
-import { readJson } from "std/fs"
+import { print } from "std/io"
+
+val src = readFile("data.txt")   // String | Error
+match src
+  is Error => print("could not read: ${src["message"]}")
+  else     => print("file contents: ${src}")
+```
+
+## Composing fallible operations
+
+Chain results by matching each step. Use `is Error` to detect a stdlib failure and produce your own tagged result:
+
+```lin
+import { readFile, readJson } from "std/fs"
 
 val loadConfig = (path: String): Json =>
   val fileResult = readFile(path)
   match fileResult
-    has { "type": "failure", error } =>
-      { "type": "failure", "error": "cannot read config: ${error}" }
+    is Error =>
+      { "type": "failure", "error": "cannot read config: ${fileResult["message"]}" }
     else =>
       val parseResult = readJson(path)
       match parseResult
-        has { "type": "failure", error } =>
-          { "type": "failure", "error": "cannot parse config: ${error}" }
+        is Error =>
+          { "type": "failure", "error": "cannot parse config: ${parseResult["message"]}" }
         else =>
           { "type": "success", "value": parseResult }
 ```
 
 ## Standard library errors
 
-The standard library (`std/fs`, `std/http`, etc.) returns `Json | Error` or `T | Error`. Match on the result to handle failures:
+The standard library (`std/fs`, `std/http`, etc.) returns `Json | Error` or `T | Error`, where `Error` is the built-in `{ "type": String, "message": String }` type. Match with `is Error` to handle failures:
 
 ```lin
 import { readFile } from "std/fs"
@@ -77,9 +90,29 @@ import { print } from "std/io"
 
 val src = readFile("data.txt")
 match src
-  has { "type": "failure", error } => print("could not read: ${error}")
-  else => print("file contents: ${src}")
+  is Error => print("could not read: ${src["message"]}")
+  else     => print("file contents: ${src}")
 ```
+
+## Decoding untrusted JSON with `fromJson`
+
+When you have a `Json` value of unknown shape — from a file, an HTTP response, or stdin — the recommended way to get a concrete, validated type is `fromJson` from `std/json`. It performs type-directed, recursive decoding and returns `T | Error`:
+
+```lin
+import { fromJson } from "std/json"
+import { readJson } from "std/fs"
+import { print } from "std/io"
+
+type Person = { "name": String, "age": Int32 }
+
+val raw = readJson("person.json")
+val person = Person.fromJson(raw)   // Person | Error
+match person
+  is Error => print("invalid person: ${person["message"]}")
+  else     => print("${person["name"]} is ${person["age"]}")
+```
+
+This is preferable to hand-checking each field: `fromJson` validates the whole structure (including nested objects and arrays) in one step.
 
 ## Runtime errors
 

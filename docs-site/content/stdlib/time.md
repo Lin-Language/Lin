@@ -3,22 +3,23 @@
 Timestamps, timing, and formatting. All timestamps are Unix time in milliseconds.
 
 ```lin
-import { now, sleep, toIso, fromIso, format, parse, startTimer, elapsed } from "std/time"
+import { now, sleep, sleepMicros, toIso, fromIso, format, parse, startTimer, elapsed } from "std/time"
 ```
 
-`Timer` is an opaque runtime type returned by `startTimer`.
+The timer handle returned by `startTimer` is an `Int64` opaque token; pass it back to `elapsed`.
 
 ## Function reference
 
 | Function | Signature | Description |
 | --- | --- | --- |
-| `elapsed` | `(Timer) -> Int64` | Milliseconds since timer was started |
+| `elapsed` | `(Int64) -> Int64` | Milliseconds since timer was started |
 | `format` | `(Int64, String) -> String` | Format timestamp with strftime pattern |
 | `fromIso` | `(String) -> Int64 \| Error` | Parse ISO 8601 string to ms timestamp |
 | `now` | `() -> Int64` | Current Unix timestamp in milliseconds |
 | `parse` | `(String, String) -> Int64 \| Error` | Parse date string with format pattern |
-| `sleep` | `(Int32) -> Null` | Block for n milliseconds |
-| `startTimer` | `() -> Timer` | Start high-resolution elapsed timer |
+| `sleep` | `(Int64) -> Null` | Block for n milliseconds |
+| `sleepMicros` | `(Int64) -> Null` | Block for n microseconds |
+| `startTimer` | `() -> Int64` | Start high-resolution elapsed timer |
 | `toIso` | `(Int64) -> String` | Format timestamp as ISO 8601 |
 
 ---
@@ -31,10 +32,11 @@ val ts = now()   // e.g. 1716825600000
 
 ---
 
-### `sleep`
+### `sleep` / `sleepMicros`
 
 ```lin
-sleep(1000)   // wait 1 second
+sleep(1000)        // wait 1 second
+sleepMicros(500)   // wait ~0.5 ms
 ```
 
 ---

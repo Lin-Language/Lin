@@ -114,12 +114,14 @@ When you don't know the shape in advance — e.g., data from a file or HTTP requ
 import { readJson } from "std/fs"
 import { print } from "std/io"
 
-val result = readJson("config.json")
+val result = readJson("config.json")   // Json | Error
 match result
-  has { "type": "failure", error } => print("error: ${error}")
+  is Error => print("error: ${result["message"]}")
   else =>
     val config = result
     print(config["version"])
 ```
 
 `Json` allows accessing any key without type errors. The result of a bracket access on `Json` is also `Json`.
+
+Note that `Json` is a *covariant sink*: any value assigns into a `Json`, but a `Json` value does not implicitly assign out to a concrete object type with required fields. To convert untrusted `Json` into a typed value, validate it with `fromJson` (from `std/json`) or narrow it with `is`/`has`.

@@ -9,7 +9,7 @@ From highest to lowest:
 | Level | Operators | Notes |
 | --- | --- | --- |
 | 1 | `()`, `[]`, `.` | Call, index, dot application |
-| 2 | `~` | Unary bitwise NOT (only unary operator) |
+| 2 | `~`, `!` | Unary bitwise NOT and logical NOT (the only unary operators) |
 | 3 | `*`, `/`, `%` | Multiplication, division, modulo |
 | 4 | `+`, `-` | Addition, subtraction |
 | 5 | `<<`, `>>` | Bitwise shift |
@@ -35,6 +35,12 @@ val e = 10 % 3     // 1
 
 `+` works only on numeric types. String concatenation uses interpolation.
 
+There is **no unary minus operator**. To negate a value, subtract it from zero:
+
+```lin
+val neg = 0 - x
+```
+
 ## Comparison
 
 ```lin
@@ -53,11 +59,13 @@ val a = true && false   // false
 val b = true || false   // true
 ```
 
-No unary boolean NOT. Use `== false` instead:
+Logical NOT uses the unary `!` operator:
 
 ```lin
-val notReady = ready == false
+val notReady = !ready
 ```
+
+(`ready == false` also works, but `!` is the idiomatic form.)
 
 ## Bitwise
 
@@ -93,7 +101,7 @@ arr[99]       // runtime error (out of bounds)
 
 ## `if` expression
 
-Every `if` requires an `else`. Three layout forms:
+Every `if` requires an `else`. Two layout forms:
 
 ```lin
 // Inline
@@ -128,8 +136,10 @@ val isNull = value is Null
 
 ## Negating boolean results
 
+Use the unary `!` operator:
+
 ```lin
-val isNotNull = (value is Null) == false
+val isNotNull = !(value is Null)
 ```
 
 ## Assignments as expressions

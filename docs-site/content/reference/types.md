@@ -15,7 +15,13 @@
 | `Float32` | 32-bit IEEE 754 float | `3.14f32` |
 | `Float64` | 64-bit IEEE 754 float (default) | `3.14` |
 
-Without a suffix, integer literals default to `Int32` and floating-point literals default to `Float64`.
+### Numeric literal typing
+
+- A **type suffix pins the type**: `42i8` is `Int8`, `42u32` is `UInt32`, `3.14f32` is `Float32`, `3.14f64` is `Float64`.
+- A **bare suffixless integer** defaults to `Int32` if it fits. If it exceeds the `Int32` range it widens to the smallest type that preserves the value (e.g. `1705314600000` becomes `Int64`) — it is never silently truncated.
+- **Context can resize a bare literal**: `val x: Int64 = 42` types `42` as `Int64`.
+- A **suffixed literal in a conflicting context is a compile error**: `val x: Int32 = 5i64` fails, because the suffix pins `5i64` to `Int64`.
+- A bare floating-point literal defaults to `Float64`.
 
 ## `Number`
 
@@ -25,7 +31,7 @@ Without a suffix, integer literals default to `Int32` and floating-point literal
 type Number =
   | Int8 | Int16 | Int32 | Int64
   | UInt8 | UInt16 | UInt32 | UInt64
-  | Float8 | Float16 | Float32 | Float64
+  | Float32 | Float64
 ```
 
 ## `Json`
@@ -40,6 +46,31 @@ type Json =
 ```
 
 Use `Json` when the shape of data is not statically known.
+
+### `Json` is a covariant sink
+
+Any value assigns **into** `Json` — `val j: Json = anyValue` is always allowed. But `Json` does **not** implicitly assign **out** to a concrete object type with required fields. To go from an untrusted `Json` value to a concrete type you must either:
+
+- validate via `fromJson` (from `std/json`), which decodes and type-checks recursively, returning `T | Error`; or
+- narrow with an `is`/`has` pattern in a `match`.
+
+```lin
+import { fromJson } from "std/json"
+
+type Person = { "name": String, "age": Int32 }
+
+val decoded = Person.fromJson(someJson)   // Person | Error
+```
+
+## The `Error` type
+
+`Error` is a built-in type, structurally equivalent to:
+
+```lin
+{ "type": String, "message": String }
+```
+
+Fallible stdlib operations return `T | Error`, and faults inside `async` thunks surface as `Error` at `await`. Use `is Error` to detect it.
 
 ## Union types
 
@@ -88,14 +119,27 @@ type Mapper<T, U> = (T) => U
 
 ## Generic types
 
+Generic type declarations and applications are supported:
+
 ```lin
 type Box<T> = {
   "value": T,
   "label": String
 }
+
+type Result<T, E> =
+  | { "type": "success", "value": T }
+  | { "type": "failure", "error": E }
+
+type Mapper<T, U> = (T) => U
 ```
 
 Generic types are covariant in producer positions and contravariant in consumer positions.
+
+Limitations:
+
+- You **cannot** use a generic application in an `is` pattern (`is Result<Int32, String>` is not supported). Match the underlying tagged shape instead via `has { "type": "success", value }`.
+- Cross-module generic functions are monomorphized per importer.
 
 ## Opaque runtime types
 

@@ -25,10 +25,11 @@ type ExecResult = {
 | `chdir` | `(String) -> Null \| Error` | Change working directory |
 | `cwd` | `() -> String` | Current working directory |
 | `exec` | `(String, String[]) -> ExecResult \| Error` | Run command and collect output |
-| `kill` | `(ProcessHandle) -> Null` | Send SIGTERM to spawned process |
+| `kill` | `(ProcessHandle) -> Null \| Error` | Send SIGTERM to spawned process |
+| `readStdout` | `(ProcessHandle, UInt8[]) -> Int32 \| Error` | Read piped stdout into a buffer (0 = EOF) |
 | `shell` | `(String) -> ExecResult \| Error` | Run shell command string |
-| `spawn` | `(String, String[]) -> ProcessHandle` | Start process without waiting |
-| `wait` | `(ProcessHandle) -> ExecResult \| Error` | Wait for spawned process |
+| `spawn` | `(String, String[]) -> ProcessHandle \| Error` | Start process without waiting |
+| `wait` | `(ProcessHandle) -> Int32 \| Error` | Wait for spawned process; returns exit code |
 
 ---
 
@@ -74,8 +75,25 @@ match chdir("src")
 ```lin
 val proc = spawn("server", ["--port", "8080"])
 // ... do other work ...
-val result = wait(proc)
+val exitCode = wait(proc)   // exit code, or -1 if signalled
 
 // Or kill it:
 kill(proc)
+```
+
+After `wait` the handle is no longer valid.
+
+---
+
+### `readStdout`
+
+`readStdout` reads a spawned process's piped stdout incrementally into a caller-owned `UInt8[]`, returning the number of bytes read (`0` means end-of-stream):
+
+```lin
+import { spawn, readStdout, wait } from "std/process"
+
+val h = spawn("sh", ["-c", "printf hello"])
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+val n = readStdout(h, buf)   // n == 5; buf[0] == 104 ('h')
+wait(h)
 ```
