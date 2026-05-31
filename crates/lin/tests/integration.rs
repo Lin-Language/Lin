@@ -6412,6 +6412,196 @@ print(a[1])
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4.5b: extend the element-type-aware flat-array WRITE path to the realistic
+// map-shape combinator idiom where the allocation is an INTERMEDIATE `val` binding
+// (`val result = lin_array_allocate(n); ...; result`) rather than the trivial
+// `=> lin_array_allocate(n)` body. The checker pins the intermediate binding's
+// element type to the declared-return element so monomorphization produces a flat
+// allocation matching the flat reader. Previously the intermediate binding stayed
+// `Array(MAX)` (tagged) while the `Int32[]`-typed consumer read flat → garbage.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_generic_map_intermediate_alloc_int32_is_flat_and_correct() {
+    // The full map-shape combinator: declared `U[]`, an intermediate
+    // `val result = lin_array_allocate(n)`, written in a for-loop, returned bare.
+    // Monomorphized at U=Int32 it must produce a FLAT array read flat. Before the
+    // fix this printed garbage (a tagged producer read through the flat i32 accessor).
+    let out = run(r#"import { length, for as afor } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
+  val n = length(arr)
+  val result = lin_array_allocate(n)
+  var i = 0
+  arr.afor(x =>
+    result[i] = f(x)
+    i = i + 1
+  )
+  result
+val doubled: Int32[] = mymap([10, 20, 30], x => x * 2)
+print(toString(doubled[0]))
+print(toString(doubled[1]))
+print(toString(doubled[2]))
+"#);
+    assert_eq!(out, vec!["20", "40", "60"]);
+}
+
+#[test]
+fn test_generic_map_intermediate_alloc_flat_path_in_ir() {
+    // IR proof: the U=Int32 monomorph allocates FLAT (lin_flat_array_alloc*) for the
+    // intermediate binding and the consumer reads with the FLAT getter — producer and
+    // consumer agree, no tagged allocator (lin_array_alloc_null) on this monomorph.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_imap_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_imap_{}", id));
+    let ll_path = bin_path.with_extension("ll");
+
+    fs::write(&src_path, r#"import { length, for as afor } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
+  val n = length(arr)
+  val result = lin_array_allocate(n)
+  var i = 0
+  arr.afor(x =>
+    result[i] = f(x)
+    i = i + 1
+  )
+  result
+val doubled: Int32[] = mymap([10, 20, 30], x => x * 2)
+print(toString(doubled[0]))
+"#).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_EMIT_IR", "1")
+        .env("LIN_NO_OPT", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+
+    let ll = fs::read_to_string(&ll_path).expect("LLVM IR not emitted");
+    let _ = fs::remove_file(&bin_path);
+    let _ = fs::remove_file(&ll_path);
+
+    let body_start = ll.find("define ptr @\"mymap$Int32_Int32\"").expect("missing mymap$Int32_Int32 monomorph");
+    let body = &ll[body_start..];
+    let body_end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
+    let body = &body[..body_end];
+    assert!(body.contains("lin_flat_array_alloc"),
+        "mymap$Int32_Int32 must allocate a flat array, got:\n{}", body);
+    assert!(!body.contains("lin_array_alloc_null"),
+        "mymap$Int32_Int32 must NOT allocate a tagged array, got:\n{}", body);
+    // The consumer reads the Int32[] result with the flat getter.
+    assert!(ll.contains("lin_flat_array_get_i32"),
+        "expected a flat i32 read of the Int32[] value, IR:\n{}", ll);
+}
+
+#[test]
+fn test_generic_map_intermediate_alloc_string_stays_tagged() {
+    // The SAME generic map-shape combinator instantiated at U=String (heap element):
+    // must stay TAGGED and correct. Proves the intermediate-alloc refinement is gated
+    // strictly to flat scalars and never corrupts a heap-element result.
+    let out = run(r#"import { length, for as afor } from "std/array"
+import { print } from "std/io"
+val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
+  val n = length(arr)
+  val result = lin_array_allocate(n)
+  var i = 0
+  arr.afor(x =>
+    result[i] = f(x)
+    i = i + 1
+  )
+  result
+val tagged: String[] = mymap(["a", "b"], s => "${s}!")
+print(tagged[0])
+print(tagged[1])
+"#);
+    assert_eq!(out, vec!["a!", "b!"]);
+}
+
+#[test]
+fn test_generic_map_intermediate_alloc_mixed_instantiations() {
+    // The SAME generic instantiated at BOTH Int32 (flat) and String (tagged) in one
+    // program — each monomorph picks its own representation; both must be correct.
+    let out = run(r#"import { length, for as afor } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
+  val n = length(arr)
+  val result = lin_array_allocate(n)
+  var i = 0
+  arr.afor(x =>
+    result[i] = f(x)
+    i = i + 1
+  )
+  result
+val ints: Int32[] = mymap([1, 2, 3], x => x * 10)
+val strs: String[] = mymap(["a", "b"], s => "${s}!")
+print(toString(ints[0]))
+print(toString(ints[2]))
+print(strs[0])
+print(strs[1])
+"#);
+    assert_eq!(out, vec!["10", "30", "a!", "b!"]);
+}
+
+#[test]
+fn test_generic_map_intermediate_alloc_json_stays_tagged() {
+    // A Json (wildcard) instantiation of the same combinator stays TAGGED and correct —
+    // the heterogeneous element representation is preserved.
+    let out = run(r#"import { length, for as afor } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
+  val n = length(arr)
+  val result = lin_array_allocate(n)
+  var i = 0
+  arr.afor(x =>
+    result[i] = f(x)
+    i = i + 1
+  )
+  result
+val xs: Json[] = [1, "two", true]
+val ys: Json[] = mymap(xs, (x: Json): Json => x)
+print(toString(length(ys)))
+print(toString(ys[0]))
+print(toString(ys[1]))
+"#);
+    assert_eq!(out, vec!["3", "1", "two"]);
+}
+
+#[test]
+fn test_intermediate_alloc_user_annotation_is_respected() {
+    // A user-annotated intermediate binding (`val result: Json[] = lin_array_allocate(n)`)
+    // must NOT be re-pinned by the refinement — the explicit annotation wins, so the
+    // binding stays tagged and the program is correct under the tagged accessor it uses.
+    // Guards the `type_ann.is_some()` bail in intermediate_array_allocate_binding.
+    let out = run(r#"import { length, for as afor } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+val mymap = <T>(arr: T[]): Json[] =>
+  val n = length(arr)
+  val result: Json[] = lin_array_allocate(n)
+  var i = 0
+  arr.afor(x =>
+    result[i] = x
+    i = i + 1
+  )
+  result
+val ys: Json[] = mymap([7, 8, 9])
+print(toString(length(ys)))
+print(toString(ys[0]))
+"#);
+    assert_eq!(out, vec!["3", "7"]);
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3.5: hardening single-module generics (nested calls, aliasing, budget,
 // type-param hygiene, uninferrable type parameters).
 // ---------------------------------------------------------------------------
