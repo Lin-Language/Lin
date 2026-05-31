@@ -2432,13 +2432,23 @@ tcpClose:          (fd: Int32)                    => Null | Error
 
 Note that `std/http` already provides a high-level blocking HTTP server (`serve`, §33.5) and an HTTP client (§33.4); `std/net` is the lower-level byte-stream layer beneath them, for non-HTTP protocols and custom framing.
 
-### 35.6 `std/proc` — Subprocesses
+### 35.6 `std/process` — External Processes
+
+Two styles share one module. **Batch** runs a command to completion and collects its full output; **streaming** spawns a child and reads its stdout incrementally. `ProcessHandle` is an opaque `Int64` id (not an OS pid).
 
 ```txt
-spawn:       (argv: String[])              => Int64 | Error     // opaque process handle
-readStdout:  (handle: Int64, buf: UInt8[]) => Int32 | Error     // bytes; 0 = EOF
-kill:        (handle: Int64)               => Null | Error
-wait:        (handle: Int64)               => Int32 | Error     // exit code
+type ExecResult = { "status": Int32, "stdout": String, "stderr": String }
+
+// batch
+exec:        (command: String, args: String[]) => ExecResult | Error
+shell:       (command: String)                 => ExecResult | Error   // via /bin/sh -c
+cwd:         ()                                 => String
+chdir:       (path: String)                     => Null | Error
+// streaming
+spawn:       (command: String, args: String[]) => ProcessHandle | Error
+readStdout:  (handle: ProcessHandle, buf: UInt8[]) => Int32 | Error     // bytes; 0 = EOF
+kill:        (handle: ProcessHandle)            => Null | Error
+wait:        (handle: ProcessHandle)            => Int32 | Error         // exit code
 ```
 
 ### 35.7 `std/tty` — Raw Terminal
