@@ -68,6 +68,53 @@ val x: Int64 = 42    // ok — 42 typed as Int64
 val y: Int32 = 5i64  // error — the i64 suffix pins it to Int64
 ```
 
+## Arrays
+
+The type of an array whose elements all have type `T` is written `T[]`:
+
+```lin
+val xs: Int32[] = [1, 2, 3]
+val names: String[] = ["Bob", "Alice"]
+```
+
+`T[]` is unbounded — it describes an array of *any* length whose every element has type `T`. Element access has type `T` (no implicit `Null`):
+
+```lin
+import { length, push } from "std/array"
+
+val first: Int32 = xs[0]      // Int32
+length(xs)                    // 3
+push(xs, 4)                   // xs is now [1, 2, 3, 4]
+```
+
+Indexing out of bounds is a runtime error — it does not return `null`. (Reading a missing *object* key does return `Null`; arrays are stricter.)
+
+Array types nest, so a grid of integers is `Int32[][]`:
+
+```lin
+val grid: Int32[][] = [[1, 2], [3, 4]]
+val cell: Int32 = grid[1][0]   // 3
+```
+
+For an array whose elements have mixed types, use `Json[]` — an array of arbitrary JSON values:
+
+```lin
+val mixed: Json[] = ["age", 42, true]
+```
+
+### Fixed-length array types
+
+The spec also defines a **fixed-length** array type, written `[T1, T2, ..., Tn]`, describing an array of exactly `n` elements where each position has its own type:
+
+```lin
+val pair: [String, Int32] = ["age", 42]
+val point: [Float64, Float64] = [1.5, 2.0]
+```
+
+These are not a separate runtime kind — they remain ordinary JSON arrays, and the form simply constrains the length and the per-position element types at the type level. A fixed-length array type is assignable to the matching unbounded type (`[String, Int32]` to `Json[]`) when the positional types are compatible; the reverse is not.
+
+> Fixed-length array types are part of the language design but are **not yet fully supported by the compiler** — prefer `T[]` (or `Json[]` for mixed arrays) for now.
+
 ## Union types
 
 A value that might be one of several types is a **union**:
