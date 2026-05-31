@@ -852,6 +852,12 @@ fn fmt_stmt(stmt: &Stmt, ind: &str) -> String {
             let s = fmt_expr(e, true, ind);
             format!("{}{}", ind, s)
         }
+
+        Stmt::Replace { name, value, .. } => {
+            let rhs = fmt_expr(value, false, ind);
+            let header = format!("{}replace {} = ", ind, name);
+            multiline_concat(&header, &rhs)
+        }
     }
 }
 

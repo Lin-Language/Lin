@@ -17,6 +17,36 @@ pub struct TypedModule {
     /// type position (the value-import mechanism via `ModuleSignature::exports` is the analogue).
     #[serde(default)]
     pub exported_types: HashMap<String, (Vec<String>, Type)>,
+    /// Test-only mock overrides (`replace <name> = <expr>`, ADR-071). Each entry records the
+    /// imported export's CANONICAL mangled symbol (`{module_key}_{name}` for functions, the same
+    /// base for vals — the `__val` suffix is added at lowering) and the type-checked replacement
+    /// body. Lowering emits each body under that symbol and suppresses the original module's
+    /// emission of it, so every reference — however the import path is spelled — resolves to the
+    /// mock (it's one LLVM symbol). Only ever non-empty in a `.test.lin` (a hard error otherwise).
+    /// Side-channel metadata like `intrinsics`/`exported_types`; statement lowering ignores it.
+    #[serde(default)]
+    pub replacements: Vec<Replacement>,
+}
+
+/// One `replace <name> = <expr>` override (ADR-071). See `TypedModule::replacements`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Replacement {
+    /// The export's canonical mangled symbol base, `{module_key}_{name}` (e.g. `std_fs_readFile`).
+    /// Function mocks are emitted under this exact symbol; val mocks under `{sym}__val`.
+    pub sym: String,
+    /// The export name as seen in the source module (e.g. `readFile`), used to identify which of
+    /// an imported module's exports to suppress during that module's lowering.
+    pub export_name: String,
+    /// The resolved import path (e.g. `std/fs`), so lowering can match the owning module.
+    pub module_path: String,
+    /// True when the replacement body is a function (emitted as a named function); false for a
+    /// non-function val (emitted as a zero-arg `{sym}__val` wrapper).
+    pub is_function: bool,
+    /// The type-checked replacement body.
+    pub value: TypedExpr,
+    /// The export's declared type (the body was checked against this).
+    pub ty: Type,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

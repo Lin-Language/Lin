@@ -1,0 +1,16 @@
+// Runnable demo: log a few audit lines to a temp file using the REAL clock and
+// store, then read them back. Tests (see *.test.lin) exercise the same code paths
+// with the clock and store mocked. CI runs this via `lin run`.
+
+import { print } from "std/io"
+import { info, error } from "./logger"
+import { readAll } from "./store"
+
+val path = "/tmp/lin_mocking_demo.log"
+
+info(path, "service started")
+error(path, "disk almost full")
+info(path, "service stopped")
+
+print("--- audit log ---")
+print(readAll(path))

@@ -70,6 +70,12 @@ pub struct Checker {
     /// matches the flat reader. Set/cleared around the body in `infer_function`; gated to the
     /// allocation intrinsic so no other binding's representation changes. See ADR for rationale.
     array_alloc_elem_hint: Option<(String, Type)>,
+    /// Origin of each value-import binding, keyed by the LOCAL name it is bound under (honouring
+    /// `as` aliases). `(module_path, export_name)`. Used by `replace <name> = ...` (ADR-071) to
+    /// resolve which imported export a mock targets, so lowering can override its canonical symbol.
+    import_origins: std::collections::HashMap<String, (String, String)>,
+    /// Collected `replace` overrides (ADR-071), threaded into `TypedModule::replacements`.
+    replacements: Vec<crate::typed_ir::Replacement>,
 }
 
 impl Default for Checker {
@@ -101,6 +107,8 @@ impl Checker {
             // collide with `lin_map`/`lin_iter` et al.
             next_generic_tv: 9001,
             array_alloc_elem_hint: None,
+            import_origins: std::collections::HashMap::new(),
+            replacements: Vec::new(),
         }
     }
 
@@ -147,6 +155,7 @@ impl Checker {
                 span: module.span,
                 intrinsics: self.intrinsic_slots.clone(),
                 exported_types,
+                replacements: self.replacements.clone(),
             };
             // Zonking pass: replace solved TypeVar nodes with their concrete types.
             let subs = self.solved_type_vars.clone();

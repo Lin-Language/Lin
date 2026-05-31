@@ -39,6 +39,14 @@ pub enum Stmt {
         bindings: Vec<ForeignBinding>,
         span: Span,
     },
+    /// Test-only mock: `replace <name> = <expr>`. `name` must be a previously-imported
+    /// export; `value` becomes the definition emitted for that export's symbol across the
+    /// whole test program (ADR-071). Only valid in a `.test.lin`.
+    Replace {
+        name: String,
+        value: Expr,
+        span: Span,
+    },
     Expr(Expr),
 }
 

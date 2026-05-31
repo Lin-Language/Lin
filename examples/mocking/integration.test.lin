@@ -1,0 +1,39 @@
+// End-to-end: drive the logger across several calls with a mocked clock and a
+// store mock that accumulates every written line into an in-memory log. Asserts
+// the full transcript — the realistic "did the whole flow produce the right
+// output" check, with no filesystem and no real time involved.
+
+import { test, suite, run, expect, toBe } from "std/test"
+import { join } from "std/string"
+import { push } from "std/array"
+import { info, error } from "./logger"
+import { stamp } from "./clock"
+import { append } from "./store"
+
+replace stamp = (): String => "2021-01-01T00:00:00.000Z"
+
+// In-memory append-only log the store mock writes into. `push` mutates the array in
+// place (returns Null), so the shared binding accumulates across calls.
+val lines: String[] = []
+replace append = (path: String, line: String): Json =>
+  lines.push(line)
+  { "type": "success" }
+
+val tests = [
+  test("a sequence of audit calls produces the expected transcript", () => [
+    expect(runScenario()).toBe(join([
+      "2021-01-01T00:00:00.000Z [INFO] service started",
+      "2021-01-01T00:00:00.000Z [ERROR] disk almost full",
+      "2021-01-01T00:00:00.000Z [INFO] service stopped",
+    ], "|")),
+  ]),
+]
+
+// Run the scenario, then return the accumulated lines joined for a single assertion.
+val runScenario = (): String =>
+  info("/audit.log", "service started")
+  error("/audit.log", "disk almost full")
+  info("/audit.log", "service stopped")
+  join(lines, "|")
+
+run(suite("mocking integration", tests))

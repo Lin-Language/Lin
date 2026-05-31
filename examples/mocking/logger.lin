@@ -1,0 +1,22 @@
+// The unit under test: an audit logger composed from the clock and the store. It
+// has no idea either dependency can be mocked — it just calls the local exports.
+// Tests `replace` `clock.stamp` and `store.append` to make logging deterministic
+// and side-effect-free, asserting on the captured output.
+
+import { stamp } from "./clock"
+import { append } from "./store"
+
+// Format one audit line: "<iso-timestamp> [<level>] <message>".
+export val formatLine = (level: String, message: String): String =>
+  "${stamp()} [${level}] ${message}"
+
+// Write an audit line to `path`. Returns the store result.
+export val log = (path: String, level: String, message: String): Json =>
+  append(path, formatLine(level, message))
+
+// Convenience wrappers over `log` at fixed levels.
+export val info = (path: String, message: String): Json =>
+  log(path, "INFO", message)
+
+export val error = (path: String, message: String): Json =>
+  log(path, "ERROR", message)
