@@ -30,7 +30,7 @@ The lexer produces a flat `Vec<Token>` from source text. Each token carries a `S
 
 Key behaviours:
 - Synthetic `Indent` / `Dedent` tokens track block boundaries at two-space level changes.
-- Indentation synthesis is suppressed inside balanced `{ }`, `( )`, `[ ]` — allowing multi-line object literals and function arguments without spurious block tokens (ADR-004, ADR-017).
+- Indentation synthesis is suppressed inside balanced `{ }`, `( )`, `[ ]` — allowing multi-line object literals and function arguments without spurious block tokens (ADR-004).
 - `InterpString(Vec<InterpPart>)` is a single compound token whose `Expr` parts each carry their own sub-token stream; the parser recurses into them (ADR-005).
 
 ---
@@ -294,7 +294,7 @@ For mutual recursion, top-level named functions are forward-declared before thei
 
 ### Tail-call optimisation
 
-The checker marks direct self-recursive tail calls, and the lowering pass emits a `TailCall { args }` terminator for them. When a function contains any `TailCall`, codegen allocates one alloca per parameter in the entry block, stores the incoming params, and creates a `tco_loop` header that loads the params back into temps. `TailCall` lowers to: evaluate the arg temps → store into the param allocas → branch to the header. No trampoline is needed. Mutual TCO is not implemented (ADR-012).
+The checker marks direct self-recursive tail calls, and the lowering pass emits a `TailCall { args }` terminator for them. When a function contains any `TailCall`, codegen allocates one alloca per parameter in the entry block, stores the incoming params, and creates a `tco_loop` header that loads the params back into temps. `TailCall` lowers to: evaluate the arg temps → store into the param allocas → branch to the header. No trampoline is needed. Mutual TCO is not implemented (ADR-021).
 
 ### Union types and tagged dispatch
 
