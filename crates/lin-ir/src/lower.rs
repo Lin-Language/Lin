@@ -1077,6 +1077,16 @@ fn is_union_ty(ty: &Type) -> bool {
     matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_))
 }
 
+/// True if `ty` IS a `Stream` or a `Union` containing one. A streamish capture crosses a thread
+/// boundary by MOVE (CAP_MOVE), not copy. Mirrors `lin_check::checker::expr::type_is_streamish`.
+fn type_is_streamish_ir(ty: &Type) -> bool {
+    match ty {
+        Type::Stream(_) => true,
+        Type::Union(variants) => variants.iter().any(type_is_streamish_ir),
+        _ => false,
+    }
+}
+
 /// A concrete heap-allocated value type whose box wraps a refcounted heap pointer
 /// (Str/Array/FixedArray/Object/Iterator). Boxing one of these into a Json/union param
 /// (via Coerce → `lin_box_str`/`lin_box_array`/`lin_box_object`) allocates a FRESH 16-byte
@@ -4540,7 +4550,20 @@ fn lower_function_expr_with_id(
             capture_kinds.push(CaptureRelease::None);
             continue;
         }
-        if is_union_ty(&cap.ty) {
+        if type_is_streamish_ir(&cap.ty) {
+            // MOVE capture (streams brief §9): a Stream crosses by MOVE, not copy. Hand the
+            // boxed-stream pointer off VERBATIM — NO CloneBox, NO Retain. The env takes the
+            // source's reference; the source's scope-exit release is SUPPRESSED (the slot is
+            // recorded as moved-out below) so the fd closes exactly once, on the worker that owns
+            // the env copy. The affine check (Stage 6) guarantees the source never touches it again.
+            capture_temps.push(base);
+            capture_kinds.push(CaptureRelease::Move);
+            // Suppress the source's scope-exit release of this very temp — its +1 has been
+            // transferred to the env. Without this, the source scope AND the worker's
+            // `release_env_copy` would both release the same boxed-stream pointer (double-free /
+            // double-close). `unregister_owned` is the established "ownership moved out" hook.
+            builder.unregister_owned(base);
+        } else if is_union_ty(&cap.ty) {
             // Env owns its own boxed TaggedVal*.
             let owned = builder.alloc_temp(cap.ty.clone());
             builder.emit(Instruction::CloneBox { dst: owned, src: base, ty: cap.ty.clone() });

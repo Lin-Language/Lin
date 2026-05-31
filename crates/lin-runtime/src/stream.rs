@@ -1202,6 +1202,49 @@ mod tests {
         }
     }
 
+    // Stage 7: CAP_MOVE across the closure-env transfer ABI. Simulates moving a Stream capture
+    // onto a worker: build an env holding the boxed stream at a CAP_MOVE slot, deep-copy the env
+    // for the worker (`transfer_clone_env` — CAP_MOVE hands the pointer off VERBATIM, no clone),
+    // then release BOTH the worker's env copy and the source closure's captures. The fd must close
+    // EXACTLY ONCE — by the worker — and the source must NOT release it (handoff). Run under ASan
+    // this proves the no-clone / no-source-release / worker-releases path has no double-free.
+    #[test]
+    fn cap_move_stream_closes_once_by_worker() {
+        unsafe {
+            use crate::transfer::{transfer_clone_env, release_env_copy, CAP_MOVE};
+            let cc = Arc::new(AtomicUsize::new(0));
+            let stream = make(vec![b"data".to_vec()], cc.clone(), None);
+
+            // Build a source env: { u64 size, cap0 = stream_ptr } (one capture, 16 bytes).
+            let env_size = 8 + 8usize;
+            let src_env = crate::memory::lin_alloc(env_size);
+            *(src_env as *mut u64) = env_size as u64;
+            *(src_env.add(8) as *mut *mut u8) = stream;
+
+            // Capture descriptor: { u32 count=1, u8 kinds[1] = CAP_MOVE }.
+            let desc_layout = std::alloc::Layout::from_size_align_unchecked(8, 4);
+            let desc = std::alloc::alloc(desc_layout);
+            *(desc as *mut u32) = 1;
+            *desc.add(4) = CAP_MOVE;
+
+            // Worker side: deep-copy the env. CAP_MOVE → the SAME stream pointer is handed off.
+            let worker_env = transfer_clone_env(src_env as *const u8, desc as *const u8);
+            assert_eq!(*(worker_env.add(8) as *const *mut u8), stream, "move hands off verbatim");
+            assert_eq!(cc.load(Ordering::SeqCst), 0, "no close on transfer");
+
+            // Source closure teardown: `release_captures` skips CAP_MOVE (handed off) — model it
+            // by simply NOT releasing the source slot, then free the source env shell.
+            crate::memory::lin_cell_free(src_env, env_size);
+            assert_eq!(cc.load(Ordering::SeqCst), 0, "source handoff does not close");
+
+            // Worker teardown: release the env COPY — CAP_MOVE releases the stream (close once).
+            release_env_copy(worker_env, desc as *const u8, env_size as u64);
+            assert_eq!(cc.load(Ordering::SeqCst), 1, "worker closes the moved stream exactly once");
+
+            std::alloc::dealloc(desc, desc_layout);
+        }
+    }
+
     #[test]
     fn drain_default_forces_and_closes() {
         unsafe {

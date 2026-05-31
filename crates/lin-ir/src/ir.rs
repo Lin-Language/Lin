@@ -175,6 +175,15 @@ pub enum CaptureRelease {
     Closure,
     /// Boxed `TaggedVal*` (union/Json) → `lin_tagged_release` (drops inner payload + frees box).
     Tagged,
+    /// MOVED resource capture (streams brief §9, ADR-072): a `Stream` (or `Stream | Error`) crosses
+    /// the thread boundary by MOVE, not copy. The pointer is handed off verbatim — NO clone on
+    /// capture, NO retain — and the SOURCE must not release it (the affine check guarantees it is
+    /// never touched again). The WORKER owns it and releases it (`lin_tagged_release`, whose
+    /// TAG_STREAM arm runs the auto-close finalizer) when the closure env is torn down. This yields
+    /// a disjoint object graph on the worker, so the non-atomic RC of the rest of the graph stays
+    /// sound. The release action is the SAME as `Tagged` (`lin_tagged_release`); `Move` differs
+    /// only in the CAPTURE side (no clone/retain) and in suppressing the source's scope release.
+    Move,
 }
 
 impl CaptureRelease {
@@ -187,6 +196,10 @@ impl CaptureRelease {
             CaptureRelease::Object => 3,
             CaptureRelease::Closure => 4,
             CaptureRelease::Tagged => 5,
+            // CAP_MOVE: the worker releases a moved resource the same way it releases a Tagged
+            // capture (`lin_tagged_release` → TAG_STREAM finalizer). The distinction is on the
+            // capture/source side, not the release side. Mirrors `transfer::CAP_MOVE`.
+            CaptureRelease::Move => 6,
         }
     }
 }

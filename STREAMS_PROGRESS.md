@@ -288,3 +288,35 @@ Files touched:
     called multiple times; a stream moved through a generic container. These are out of v1 scope
     per the placement restriction (no container linearity). The must-use warning (Stage 5) and
     this consume-check together cover the common single-binding patterns.
+
+---
+
+## Stage 7 — CAP_MOVE across the closure-env transfer ABI
+- Commit: <pending>
+- Gate (ASan: moved stream's fd closes once, by the worker): MET, verified under
+  AddressSanitizer (`cap_move_stream_closes_once_by_worker`). Full workspace: 385 integration +
+  52 runtime unit tests, 0 failures.
+
+### What was added
+- `ir.rs` `CaptureRelease::Move` (`.code() == 6`) + `transfer.rs` `CAP_MOVE = 6` — the two
+  mirrored capture-kind tables, both extended past 5 = Tagged.
+- `transfer.rs`: `transfer_clone_env` CAP_MOVE arm hands the resource pointer off VERBATIM (no
+  clone, no retain); `release_env_copy` CAP_MOVE arm releases it via `lin_tagged_release`
+  (TAG_STREAM finalizer → fd closes once, ON THE WORKER). `env_is_transferable` already permits
+  CAP_MOVE (it only rejects CAP_CLOSURE).
+- `memory.rs` `release_captures`: code 6 (Move) deliberately falls to the no-op arm — the LOCAL
+  (source) closure must NOT release a handed-off resource; only the worker's `release_env_copy`
+  does. (Documented; the inline-fallback caveat noted there too.)
+- `lower.rs`: a streamish capture (`type_is_streamish_ir`) emits `CaptureRelease::Move` with NO
+  CloneBox/Retain AND `unregister_owned(base)` — suppressing the SOURCE's scope-exit release so
+  the moved box isn't released twice (source + worker).
+- ASan test (`cap_move_stream_closes_once_by_worker`) drives the env transfer directly: build env
+  with a CAP_MOVE stream slot → `transfer_clone_env` (verbatim handoff) → free source env shell
+  (no close) → `release_env_copy` (worker closes once). Asserts close-count == 1.
+
+### Notes
+17. The IR/codegen Move path is now in place, but it is only REACHABLE end-to-end once `.promise()`
+    captures a stream into an async thunk — which the async checker currently REJECTS (Stream is
+    `is_definitely_non_transferable`). Making that capture legal-by-move is exactly Stage 8. So
+    Stage 7's gate is verified at the runtime-ABI level (the direct env-transfer ASan test);
+    Stage 8 wires the language path that emits it and adds the concurrent + fault-injection tests.
