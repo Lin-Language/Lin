@@ -1156,7 +1156,7 @@ impl<'ctx> Codegen<'ctx> {
                             };
                             temp_map.insert(*dst, arr);
                         }
-                        Instruction::MakeClosure { dst, func: fid, captures, ret_ty: _ } => {
+                        Instruction::MakeClosure { dst, func: fid, captures, capture_kinds, ret_ty: _ } => {
                             if let Some(&callee_fn) = ir_fn_to_llvm.get(fid) {
                                 // If this function has default arguments, attach its descriptor
                                 // so an indirect under-arity call fills the omitted defaults.
@@ -1202,18 +1202,17 @@ impl<'ctx> Codegen<'ctx> {
                                         .iter()
                                         .filter_map(|c| temp_map.get(c).copied())
                                         .collect();
-                                    // Capture kinds (for thread-transfer env deep-copy) from the
-                                    // captured temps' IR types. Only emitted when the program uses
-                                    // async (the descriptor is dead weight otherwise).
-                                    let capture_kinds: Option<Vec<u8>> = if self.uses_async {
-                                        Some(captures.iter().map(|c| {
-                                            let ty = func.temp_types.get(c).cloned().unwrap_or(Type::Null);
-                                            Self::capture_kind(&ty)
-                                        }).collect())
-                                    } else { None };
+                                    // Per-capture release kinds (ADR-060 owning captures). The env
+                                    // OWNS one reference per owning capture, so the capture
+                                    // descriptor is ALWAYS emitted: `lin_closure_release` walks it
+                                    // to release heap captures on free, and the async transfer path
+                                    // reuses the same encoding (CaptureRelease::code). The lowerer
+                                    // already computed these in lockstep with the retain/CloneBox it
+                                    // emitted, so codegen does not re-derive from temp types.
+                                    let kinds: Vec<u8> = capture_kinds.iter().map(|k| k.code()).collect();
                                     self.make_closure_struct_desc_caps(
                                         fn_ptr.into(), &capture_vals, descriptor,
-                                        capture_kinds.as_deref(),
+                                        Some(&kinds),
                                     )
                                 };
                                 temp_map.insert(*dst, cls);

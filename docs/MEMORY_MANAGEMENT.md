@@ -14,7 +14,7 @@ Five types live on the heap and carry a `u32` refcount as their first field:
 | `T[]` (tagged) | `LinArray` (elem_tag=0xFF) | `refcount:u32 \| elem_tag:u8 \| _pad \| len:u64 \| cap:u64 \| data:*LinArrayElem` |
 | `T[]` (flat scalar) | `LinArray` (elem_tag≠0xFF) | same header; `data` points to raw `T` elements |
 | `{…}` object | `LinObject` | `refcount:u32 \| len:u32 \| cap:u32 \| _pad \| entries:*LinObjectEntry` |
-| `(…) => …` closure | `LinClosure` | `refcount:u32 \| _pad:u32 \| fn_ptr:ptr \| env_ptr:ptr \| env_size:u64` (32 bytes) |
+| `(…) => …` closure | `LinClosure` | `refcount:u32 \| _pad:u32 \| fn_ptr:ptr \| env_ptr:ptr \| env_size:u64 \| default_desc:ptr \| capture_desc:ptr` (48 bytes; ADR-051) |
 
 Scalars (`Int32`, `Int64`, `Float32`, `Float64`, `Bool`, `Null`) are stored unboxed as LLVM primitives and carry no refcount.
 
@@ -34,7 +34,7 @@ Union-typed (`Json`, unresolved `TypeVar`) values are heap-boxed as `TaggedVal {
 | `lin_string_release(s)` | Decrements refcount; frees the single allocation when zero |
 | `lin_array_release(arr)` | Decrements refcount; when zero, **recursively releases** all heap-typed elements (TAG_STR, TAG_ARRAY, TAG_OBJECT, TAG_FUNCTION) then frees header + data buffer |
 | `lin_object_release(obj)` | Decrements refcount; when zero, **recursively releases** all keys (always `LinString*`) and heap-typed values, then frees entries + header |
-| `lin_closure_release(ptr)` | Decrements refcount; when zero, frees the env allocation (size stored at offset 24 in the closure struct) then frees the 32-byte closure struct |
+| `lin_closure_release(ptr)` | Decrements refcount; when zero, **recursively releases owning captures** via the closure's capture descriptor (offset 40), then frees the env allocation (size at offset 24) and the 48-byte closure struct (ADR-051) |
 | `lin_tagged_release(p)` | Releases the inner heap value, then frees the `TaggedVal` box |
 
 The recursive release in `lin_array_release` and `lin_object_release` means **nested structures are freed correctly without compiler assistance**. Flat scalar arrays (int/float elements) have no pointer payloads and skip recursion.

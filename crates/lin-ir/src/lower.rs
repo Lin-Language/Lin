@@ -16,15 +16,18 @@ use lin_common::Span;
 
 use crate::ir::*;
 
-/// Entry point: lower a TypedModule to a LinModule.
-pub fn lower_module(module: &TypedModule) -> LinModule {
-    // Phase 0 monomorphization: materialize concrete copies of single-module generic functions
+/// Entry point: lower a TypedModule to a LinModule, plus any monomorphization diagnostics
+/// (e.g. a generic call whose type parameters cannot be inferred). Diagnostics are empty for
+/// ordinary modules and for well-formed generic programs.
+pub fn lower_module(module: &TypedModule) -> (LinModule, Vec<lin_common::Diagnostic>) {
+    // Monomorphization: materialize concrete copies of single-module generic functions
     // (e.g. `identity$Int32`) and route calls to them BEFORE lowering, so the backend emits
     // native unboxed scalars. The clone is taken only when the module actually has a generic
     // function; ordinary modules skip it entirely and lower byte-for-byte as before.
+    let mut diagnostics = Vec::new();
     let owned: Option<TypedModule> = if crate::monomorphize::module_has_generic_fn(module) {
         let mut m = module.clone();
-        crate::monomorphize::monomorphize(&mut m);
+        diagnostics = crate::monomorphize::monomorphize(&mut m);
         Some(m)
     } else {
         None
@@ -106,12 +109,13 @@ pub fn lower_module(module: &TypedModule) -> LinModule {
         ctx.functions.push(pending);
     }
 
-    LinModule {
+    let lin_module = LinModule {
         functions: ctx.functions,
         global_fn_slots,
         intrinsics: ctx.intrinsics,
         default_descriptors: ctx.default_descriptors,
-    }
+    };
+    (lin_module, diagnostics)
 }
 
 /// Lower an IMPORTED TypedModule to a LinModule for the IR pipeline.
@@ -1491,6 +1495,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                     dst,
                     func: fid,
                     captures: vec![],
+                    capture_kinds: vec![],
                     ret_ty: closure_ty.clone(),
                 });
                 builder.register_owned(dst, closure_ty);
@@ -1851,7 +1856,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // like `Person`): a bare tag check (or mere field-presence, ADR-050) matches objects
             // with the WRONG field types, which is unsound — the arm then narrows the binding and
             // a subsequent field access operates on the wrong runtime type. Deep-validate field
-            // types recursively via the `fromJson` structural walker (ADR-053). `MatchesSchema`
+            // types recursively via the `fromJson` structural walker (ADR-054). `MatchesSchema`
             // borrows the boxed value and reads a static descriptor — no ownership change, so the
             // `val_temp` boxing is the same one the former HasPattern path used.
             if let TypedPattern::TypeCheckDeep(target, named_defs, _) = pattern {
@@ -3312,7 +3317,7 @@ fn lower_match_pattern(
         // `is <Named>` where the name resolves to a non-empty object shape (a user object-type
         // alias like `Person`): a bare tag check (or mere field-presence, ADR-050) matches
         // objects with the WRONG field types, which is unsound once the arm narrows the binding.
-        // Deep-validate field types recursively via the `fromJson` structural walker (ADR-053).
+        // Deep-validate field types recursively via the `fromJson` structural walker (ADR-054).
         // `scrut` is the already-boxed scrutinee; `MatchesSchema` borrows it (no ownership change).
         TypedMatchPattern::Is(TypedPattern::TypeCheckDeep(target, named_defs, _)) => {
             let dst = builder.alloc_temp(Type::Bool);
@@ -3918,14 +3923,54 @@ fn lower_function_expr_with_id(
     ctx.pending_functions.push(inner_fn);
 
     // In the outer function, emit a MakeClosure instruction.
-    let capture_temps: Vec<Temp> = captures
-        .iter()
-        .map(|cap| {
-            builder.slots.get(&cap.outer_slot).copied().unwrap_or_else(|| {
-                builder.alloc_temp(cap.ty.clone())
-            })
-        })
-        .collect();
+    //
+    // OWNING-CAPTURE MODEL (mirrors the array/object container rule): the closure env owns one
+    // reference per heap/union capture, so the closure may safely OUTLIVE the scope that
+    // produced the captured value (e.g. a closure returned from a `map` callback into the result
+    // array). For each captured value temp:
+    //   - a mutably-captured `var` stores the CELL POINTER (shared by reference, ADR-015); the
+    //     cell has its own MakeCell/FreeCell/escaping-cell lifecycle, so it stays borrow-only —
+    //     do NOT retain it here, and do NOT release it on closure free.
+    //   - a concrete-rc value (Str/Array/Object/Function) is retained in place (`Retain`), so the
+    //     env holds an independent +1; `lin_closure_release` drops it via the capture descriptor.
+    //   - a union/Json value is CLONED (`CloneBox` → `lin_tagged_clone`) so the env owns its OWN
+    //     `TaggedVal*` box (never an alias of a borrowed caller box, whose free would double-free
+    //     the shared box); `lin_closure_release` frees that owned box.
+    // Scalars need no ownership. This is the established store-side discipline (see `own_for_store`
+    // / `transfer_into_container`), applied to the closure env.
+    let mut capture_temps: Vec<Temp> = Vec::with_capacity(captures.len());
+    let mut capture_kinds: Vec<CaptureRelease> = Vec::with_capacity(captures.len());
+    for cap in captures {
+        let base = builder.slots.get(&cap.outer_slot).copied().unwrap_or_else(|| {
+            builder.alloc_temp(cap.ty.clone())
+        });
+        // Mutable-cell captures (the var-by-reference cell pointer) stay borrow-only — the cell
+        // has its own MakeCell/FreeCell/escaping-cell lifecycle, so the env must NOT own it.
+        if cap.is_mutable || !needs_owning(&cap.ty) {
+            capture_temps.push(base);
+            capture_kinds.push(CaptureRelease::None);
+            continue;
+        }
+        if is_union_ty(&cap.ty) {
+            // Env owns its own boxed TaggedVal*.
+            let owned = builder.alloc_temp(cap.ty.clone());
+            builder.emit(Instruction::CloneBox { dst: owned, src: base, ty: cap.ty.clone() });
+            capture_temps.push(owned);
+            capture_kinds.push(CaptureRelease::Tagged);
+        } else {
+            // Concrete rc: take an independent reference; the env holds the same pointer +1.
+            builder.emit(Instruction::Retain { val: base, ty: cap.ty.clone() });
+            capture_temps.push(base);
+            capture_kinds.push(match &cap.ty {
+                Type::Str | Type::StrLit(_) => CaptureRelease::Str,
+                Type::Array(_) | Type::FixedArray(_) => CaptureRelease::Array,
+                Type::Object(_) => CaptureRelease::Object,
+                Type::Function { .. } => CaptureRelease::Closure,
+                // is_rc_type covers exactly the above; any other owning type is union (handled).
+                _ => CaptureRelease::None,
+            });
+        }
+    }
 
     // Captured-cell escape analysis. A mutably-captured `var` is a heap cell whose pointer is
     // shared into THIS closure's env. The cell is SAFE to free at the creating function's scope
@@ -3954,6 +3999,7 @@ fn lower_function_expr_with_id(
         dst,
         func: fid,
         captures: capture_temps,
+        capture_kinds,
         ret_ty: closure_ty.clone(),
     });
     builder.register_owned(dst, closure_ty);

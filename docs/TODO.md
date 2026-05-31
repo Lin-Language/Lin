@@ -622,7 +622,7 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 - [x] **Float bit-reinterpret intrinsics** (`lin-runtime`) — `lin_f32_to_bits`/`lin_f32_from_bits`/`lin_f64_to_bits`/`lin_f64_from_bits` (`f32::to_bits` etc.).
 - [x] **`std/bytes` module** (Lin + the four float intrinsics + the narrowing casts) — `u16/u32/u64` big- and little-endian read/write; `f32/f64` bit reinterpret and big/little-endian (de)serialization; `slice`. Registered in `lin-compile` and `lin-lsp`. Tests in `stdlib/bytes.test.lin`.
 - [x] **`std/fs` byte APIs migrated to `UInt8[]`** — `lin_fs_read_file_bytes` now builds a flat `UInt8[]`; `lin_fs_write_file_bytes` reads raw u8 from the flat buffer (tagged fallback retained). `readFileBytes`/`writeFileBytes` signatures and STDLIB docs updated. No other `Int32[]`-as-bytes usages remain in stdlib/examples (only `string.fromCodePoints`, which is genuinely codepoints).
-- [ ] NOTE (follow-up, not blocking): `std/array.concat` builds a tagged result and does not preserve a flat `UInt8[]` representation — concatenating byte buffers via `concat` then indexing as `UInt8` reads zeros. Build packets with `push` until a flat-aware `concat` lands.
+- [x] **flat-aware `concat`/`slice`** — `std/array.concat` and `slice` now preserve the flat `UInt8[]` representation; concatenating byte buffers then indexing/slicing/pushing as `UInt8` reads correct values (verified on current master: `concat([1,2,3],[4,5])` → `[1,2,3,4,5]`, `slice(c,1,4)` → `[2,3,4]`).
 
 ### Layer 2 — Sockets
 
@@ -638,6 +638,7 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 ### Layer 4 — Timing, signals; FFI and Worker for the rest
 
 - [x] **`std/time.sleepMicros`** — `lin_time_sleep_micros(Int64)` intrinsic + wrapper.
+- [x] **`std/time` date formatting/parsing** — `format` (strftime, UTC), `fromIso` (ISO 8601 → ms), `parse` (pattern → ms); `lin_time_{format,from_iso,parse}` intrinsics. Hand-rolled civil-date math (Hinnant days_from_civil), no date crate.
 - [x] **`std/signal.waitSignal`** — `lin_signal_wait(Int32)` intrinsic + wrapper. (Decided: blocking-wait form — block the signal in the thread mask then `sigwait`, race-free, no handler installed.)
 - [ ] **GPIO via existing FFI** — no new core primitive; validate `import foreign` against a C GPIO library, using `sleepMicros` for software PWM. (No core work; `sleepMicros` is the only language-level support, now landed.)
 - [ ] **Cross-thread state via Worker** — no new core primitive; confirm a `Worker<Msg, Reply>` owning shared state (e.g. a discovered client address) replaces `Arc<Mutex<…>>`. (No core work; `Worker` already exists.)
@@ -645,8 +646,8 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 ### Spec / docs amendments
 
 - [x] Spec §35 (this section), §24.1/§24.2 (bitwise operators + precedence), §3.7 (`~` is the one unary).
-- [ ] `docs/STDLIB.md` — full signatures for `std/bytes`, `std/net`, `std/process`, `std/tty`, `std/signal`, and the `std/time.sleepMicros` addition.
-- [ ] `docs/DECISIONS.md` — ADRs for (a) fd-as-opaque-Int handle convention, (b) share-nothing upheld over a Mutex primitive, (c) flat unboxed small-int arrays, (d) `~` as the single sanctioned unary operator.
+- [x] `docs/STDLIB.md` — full signatures for `std/bytes`, `std/net`, `std/process`, `std/tty`, `std/signal`, and the `std/time.sleepMicros` addition. (All present and verified.)
+- [x] `docs/DECISIONS.md` — ADR-056 (fd-as-opaque-Int handle convention), ADR-057 (share-nothing upheld over a Mutex primitive), ADR-058 (flat unboxed scalar arrays), ADR-059 (two unary operators `~`/`!`; supersedes the original "`~` is the only unary" framing now that `!` landed per ADR-047).
 
 ### Tests
 
