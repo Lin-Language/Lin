@@ -104,16 +104,19 @@ val mixed: Json[] = ["age", 42, true]
 
 ### Fixed-length array types
 
-The spec also defines a **fixed-length** array type, written `[T1, T2, ..., Tn]`, describing an array of exactly `n` elements where each position has its own type:
+A **fixed-length** array type, written `[T1, T2, ..., Tn]`, describes an array of exactly `n` elements where each position has its own type:
 
 ```lin
 val pair: [String, Int32] = ["age", 42]
 val point: [Float64, Float64] = [1.5, 2.0]
+
+val name: String = pair[0]   // "age"
+val age: Int32 = pair[1]     // 42
 ```
 
-These are not a separate runtime kind — they remain ordinary JSON arrays, and the form simply constrains the length and the per-position element types at the type level. A fixed-length array type is assignable to the matching unbounded type (`[String, Int32]` to `Json[]`) when the positional types are compatible; the reverse is not.
+These are not a separate runtime kind — they remain ordinary JSON arrays, and the form simply constrains the length and the per-position element types at the type level. Supplying the wrong number of elements is a compile-time error.
 
-> Fixed-length array types are part of the language design but are **not yet fully supported by the compiler** — prefer `T[]` (or `Json[]` for mixed arrays) for now.
+A fixed-length array type is assignable to the matching unbounded type (`[String, Int32]` to `Json[]`) when the positional types are compatible; the reverse is not.
 
 ## Union types
 
