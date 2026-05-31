@@ -130,6 +130,37 @@ impl Checker {
         let inferred = self.infer_expr(expr)?;
         let actual_ty = inferred.ty();
 
+        // Refine a fresh `arrayAllocate(n)` against an `Array(_)` expectation (Phase 4.5). The
+        // `lin_array_allocate` intrinsic returns the Json-wildcard array `Array(TypeVar(MAX))`.
+        // Inside a GENERIC combinator (e.g. `map<…, U>(...): U[] => arrayAllocate(n)`), the body
+        // is checked against the abstract return `Array(U)`. We retype the wildcard result to
+        // that expected `Array(elem)` so the element type is `U` (the generic param), NOT the
+        // never-substituted `MAX` wildcard. When the function is later MONOMORPHIZED at `U=Int32`,
+        // type substitution turns the recorded `result_type` into `Array(Int32)`, which finally
+        // reaches codegen's `ArrayAllocate` as a concrete-scalar element type — there it emits a
+        // FLAT allocation, so the producer's representation matches the concrete-typed reader
+        // (which already reads flat via `lin_flat_array_get_<sfx>`). Without this, the result
+        // stays tagged while a `Int32[]`-typed reader reads it flat → reinterprets 16-byte tagged
+        // slots as packed scalars → garbage.
+        //
+        // SOUND because (a) the value is a fresh allocation whose representation the compiler
+        // fully controls end-to-end, and (b) it is gated STRICTLY to the `lin_array_allocate`
+        // intrinsic — no other `Json[]`-returning call (slice/concat/parse, whose runtime
+        // representation we do NOT control) is ever refined. The codegen flat/tagged decision is
+        // independently re-gated on `is_flat_scalar`, so a `String[]` or a still-abstract generic
+        // element stays TAGGED. NO-OP for current code: the only caller today is the non-generic
+        // stdlib `arrayAllocate` wrapper, whose body is checked against `Json` (`Array(MAX)` =
+        // `Array(MAX)`), so the element is unchanged and the allocation stays tagged.
+        if Self::is_fresh_array_allocate_call(expr) {
+            if let (Type::Array(actual_elem), Type::Array(exp_elem)) = (&actual_ty, expected) {
+                let actual_is_wildcard = matches!(actual_elem.as_ref(), Type::TypeVar(n) if *n == u32::MAX);
+                let exp_is_wildcard = matches!(exp_elem.as_ref(), Type::TypeVar(n) if *n == u32::MAX);
+                if actual_is_wildcard && !exp_is_wildcard {
+                    return Ok(Self::retype_call_result(inferred, expected.clone()));
+                }
+            }
+        }
+
         if !self.types_compatible(&actual_ty, expected) {
             return Err(Diagnostic::error(
                 expr.span(),
@@ -146,6 +177,30 @@ impl Checker {
             })
         } else {
             Ok(inferred)
+        }
+    }
+
+    /// True when `expr` is a direct call to the `lin_array_allocate` allocation intrinsic — a
+    /// freshly-allocated array whose representation the compiler fully controls, so it is safe
+    /// to refine its (Json-wildcard) element type to a concrete expected scalar array type and
+    /// emit a flat allocation. Only this exact intrinsic qualifies; the user-facing
+    /// `arrayAllocate` stdlib wrapper erases to `Json` and is non-generic, so refining at its
+    /// call site would not change the (tagged) array it actually allocates internally.
+    fn is_fresh_array_allocate_call(expr: &Expr) -> bool {
+        match expr {
+            Expr::Call { func, .. } => matches!(func.as_ref(), Expr::Ident(n, _) if n == "lin_array_allocate"),
+            _ => false,
+        }
+    }
+
+    /// Replace a `TypedExpr::Call`'s `result_type` with `new_ty`. Used to retype a fresh
+    /// `arrayAllocate` from the Json-wildcard array to a concrete scalar array type.
+    fn retype_call_result(call: TypedExpr, new_ty: Type) -> TypedExpr {
+        match call {
+            TypedExpr::Call { func, args, is_tail, partial, span, .. } => TypedExpr::Call {
+                func, args, result_type: new_ty, is_tail, partial, span,
+            },
+            other => other,
         }
     }
 

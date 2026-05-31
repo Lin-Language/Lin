@@ -6253,6 +6253,143 @@ print(identity("hello"))
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4.5: element-type-aware array WRITE path. A monomorphized generic that
+// allocates via `arrayAllocate` at a concrete-scalar element type must produce a
+// FLAT array, so the flat-allocated producer matches the concrete-typed (flat)
+// reader. Previously the alloc stayed tagged while the reader read flat → garbage.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_generic_array_allocate_int32_is_flat_and_correct() {
+    // A generic allocator monomorphized at T=Int32: allocate, index-set, index-read, all as
+    // a statically-typed Int32[]. Must print 40 (10 + 30). Before the fix this printed garbage
+    // (a tagged array read through the flat i32 accessor).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val allocT = <T>(n: Int32, zero: T): T[] => lin_array_allocate(n)
+val a: Int32[] = allocT(3, 0)
+a[0] = 10
+a[1] = 20
+a[2] = 30
+print(toString(a[0] + a[2]))
+"#);
+    assert_eq!(out, vec!["40"]);
+}
+
+#[test]
+fn test_generic_array_allocate_int32_flat_path_in_ir() {
+    // IR proof: the T=Int32 monomorph allocates FLAT (lin_flat_array_alloc_filled_i32) and the
+    // reader uses the FLAT getter (lin_flat_array_get_i32) — producer and consumer agree, with
+    // no tagged getter (lin_array_get_tagged) and no boxing of the read scalars on this path.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_flat_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_flat_{}", id));
+    let ll_path = bin_path.with_extension("ll");
+
+    fs::write(&src_path, r#"import { print } from "std/io"
+import { toString } from "std/string"
+val allocT = <T>(n: Int32, zero: T): T[] => lin_array_allocate(n)
+val a: Int32[] = allocT(3, 0)
+a[0] = 10
+a[1] = 20
+a[2] = 30
+print(toString(a[0] + a[2]))
+"#).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_EMIT_IR", "1")
+        .env("LIN_NO_OPT", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+
+    let ll = fs::read_to_string(&ll_path).expect("LLVM IR not emitted");
+    let _ = fs::remove_file(&bin_path);
+    let _ = fs::remove_file(&ll_path);
+
+    // The monomorph body allocates a FLAT i32 array.
+    let body_start = ll.find("define ptr @\"allocT$Int32\"").expect("missing allocT$Int32 monomorph");
+    let body = &ll[body_start..];
+    let body_end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
+    let body = &body[..body_end];
+    assert!(body.contains("lin_flat_array_alloc_filled_i32"),
+        "allocT$Int32 must allocate a flat i32 array, got:\n{}", body);
+    assert!(!body.contains("lin_array_alloc_null"),
+        "allocT$Int32 must NOT allocate a tagged array, got:\n{}", body);
+
+    // The reader uses the flat i32 getter (consumer matches producer).
+    assert!(ll.contains("lin_flat_array_get_i32"),
+        "expected a flat i32 read of the Int32[] value, IR:\n{}", ll);
+}
+
+#[test]
+fn test_generic_array_allocate_string_stays_tagged() {
+    // A heap (NON-flat-scalar) element type must stay TAGGED: String[] is allocated tagged and
+    // read tagged. Allocate, index-set string elements, read them back. Proves the flat path is
+    // gated strictly to scalars and does not corrupt heap-element arrays.
+    let out = run(r#"import { print } from "std/io"
+val allocT = <T>(n: Int32, zero: T): T[] => lin_array_allocate(n)
+val a: String[] = allocT(2, "")
+a[0] = "hi"
+a[1] = "there"
+print(a[0])
+print(a[1])
+"#);
+    assert_eq!(out, vec!["hi", "there"]);
+}
+
+#[test]
+fn test_generic_array_allocate_string_tagged_path_in_ir() {
+    // IR proof for the heap-element case: String[] monomorph stays tagged (lin_array_alloc_null),
+    // never a flat allocator.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_strtag_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_strtag_{}", id));
+    let ll_path = bin_path.with_extension("ll");
+
+    fs::write(&src_path, r#"import { print } from "std/io"
+val allocT = <T>(n: Int32, zero: T): T[] => lin_array_allocate(n)
+val a: String[] = allocT(2, "")
+a[0] = "hi"
+a[1] = "there"
+print(a[0])
+print(a[1])
+"#).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_EMIT_IR", "1")
+        .env("LIN_NO_OPT", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+
+    let ll = fs::read_to_string(&ll_path).expect("LLVM IR not emitted");
+    let _ = fs::remove_file(&bin_path);
+    let _ = fs::remove_file(&ll_path);
+
+    let body_start = ll.find("define ptr @\"allocT$Str\"")
+        .or_else(|| ll.find("define ptr @\"allocT$String\""))
+        .expect("missing allocT String monomorph");
+    let body = &ll[body_start..];
+    let body_end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
+    let body = &body[..body_end];
+    assert!(body.contains("lin_array_alloc_null"),
+        "String[] allocT must allocate a tagged array, got:\n{}", body);
+    assert!(!body.contains("lin_flat_array_alloc"),
+        "String[] allocT must NOT allocate a flat array, got:\n{}", body);
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3.5: hardening single-module generics (nested calls, aliasing, budget,
 // type-param hygiene, uninferrable type parameters).
 // ---------------------------------------------------------------------------
