@@ -207,6 +207,21 @@ val s = suite("std/string", [
   test("padEnd handles multi-char pad with truncation", () => [
     expect("ab".padEnd(5, "xy")).toBe("abxyx")
   ]),
+
+  // Regression: toString of a STRING value must return an OWNED (+1) reference, like every
+  // other toString branch. lin_tagged_to_string used to hand back the input string borrowed
+  // (+0) for TAG_STR, so the caller's release over-decremented and double-freed the buffer.
+  // Stringifying a FRESH heap string (a join result) and then using both it and the original
+  // reliably double-freed the buffer — the intermittent heap corruption seen on assertion
+  // fail paths (`toString(value)` in std/test). Both reads below must see the intact value.
+  test("toString of a fresh heap string does not over-release it", () =>
+    val joined = ["a", "b", "c"].join(",")
+    val viaToString = joined.toString()
+    [
+      expect(viaToString).toBe("a,b,c"),
+      expect(joined).toBe("a,b,c")
+    ]
+  ),
 ])
 
 run(s)
