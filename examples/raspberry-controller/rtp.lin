@@ -2,7 +2,7 @@
 //
 // Packetizes one NAL unit into one or more RTP packets:
 //   nal.len() <= MAX_RTP_PAYLOAD  →  Single NAL Unit Mode (header ++ nal)
-//   nal.len() >  MAX_RTP_PAYLOAD  →  FU-A fragmentation (RFC 6184 §5.8)
+//   nal.len() >  MAX_RTP_PAYLOAD  →  FU-A fragmentation (RFC 6184 §4.8)
 //
 // STATE THREADING: the Rust RtpPacketizer is a mutable struct (sequence,
 // timestamp, ssrc) whose `sequence` increments on every header write. Lin has no

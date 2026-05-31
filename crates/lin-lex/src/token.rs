@@ -15,7 +15,7 @@ pub struct Token {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     // Literals. Numeric literals carry an optional explicit type suffix (e.g. `42i8`,
-    // `3.14f32`); `None` means no suffix (type comes from context/default — spec §3.6, §26).
+    // `3.14f32`); `None` means no suffix (type comes from context/default — spec §2.6, §21).
     StringLit(String),
     IntLit(i64, Option<NumSuffix>),
     FloatLit(f64, Option<NumSuffix>),

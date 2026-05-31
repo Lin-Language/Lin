@@ -1058,7 +1058,7 @@ print(toString(c))
 
 #[test]
 fn test_logical_operators_short_circuit_evaluation() {
-    // Spec §24: `&&` / `||` are SHORT-CIRCUITING — the RHS must NOT be evaluated when the LHS
+    // Spec §8: `&&` / `||` are SHORT-CIRCUITING — the RHS must NOT be evaluated when the LHS
     // already decides the result. This asserts EVALUATION order, not just the boolean value:
     //  - a side-effecting RHS (a print) must be absent from the output when short-circuited;
     //  - the canonical bounds-check guard `i < length(arr) && arr[i] > 0` must not index OOB.
@@ -1173,7 +1173,7 @@ print(toString(mmul))
 
 #[test]
 fn test_float32_widens_to_float64() {
-    // A Float32 must widen to Float64 (fpext) across every numeric context, per spec §26
+    // A Float32 must widen to Float64 (fpext) across every numeric context, per spec §21
     // (widening is always to a type that represents both). Codegen's Coerce had no
     // float→float arm and its binary-op path didn't reconcile two floats of different
     // widths, so each of these failed with "Call parameter type does not match" /
@@ -1918,7 +1918,7 @@ print(toString(result))
     assert_eq!(output, vec!["7"]);
 }
 
-// Fixed-length array types (`[T1, T2, ...]`, spec §8.3). An array literal checked
+// Fixed-length array types (`[T1, T2, ...]`, spec §5.3). An array literal checked
 // against a fixed-length type is stored as a TAGGED array (heterogeneous positional
 // element types); indexing reads the tagged slot and unboxes to the positional type.
 // Regression: before, the literal inferred to the unbounded `T[]` and failed the type
@@ -2531,7 +2531,7 @@ print(toString(result))
 
 #[test]
 fn test_await_result_must_handle_error() {
-    // §32.2.2 enforcement (ADR-070): await yields `T | Error`, so assigning it to a bare
+    // §24.2.2 enforcement (ADR-070): await yields `T | Error`, so assigning it to a bare
     // binding that does not handle the Error case is a compile-time type error. The diagnostic
     // names the union vs. the bare target. (Goes through the full `build` pipeline because the
     // standalone `check` subcommand does not resolve imports.)
@@ -2590,7 +2590,7 @@ print(toString(results))
 
 #[test]
 fn test_thread_pool_async() {
-    // await now yields `T | Error` (§32.2.2), so each result is handled before arithmetic.
+    // await now yields `T | Error` (§24.2.2), so each result is handled before arithmetic.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { async, await, threadPool } from "std/async"
@@ -2625,7 +2625,7 @@ print(toString(reply))
 
 #[test]
 fn test_worker_stateful_var_capture() {
-    // A worker handler may close over `var` (§32.6.4): the accumulator state is confined to
+    // A worker handler may close over `var` (§24.6.4): the accumulator state is confined to
     // the worker thread and updated across sequential requests. onShutdown sees the final state.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -2672,7 +2672,7 @@ print(toString(count))
 #[test]
 fn test_worker_handler_fault_surfaces_error() {
     // A fault in the worker handler is caught at the boundary and returned as an Error to the
-    // in-flight request (§32.6.5); the program continues.
+    // in-flight request (§24.6.5); the program continues.
     let output = run(r#"import { print } from "std/io"
 import { worker, request, close } from "std/async"
 
@@ -2687,7 +2687,7 @@ print(r["type"])
 
 #[test]
 fn test_worker_send_after_close_errors() {
-    // Sending to a closed worker yields an Error (§32.6.5), not a crash.
+    // Sending to a closed worker yields an Error (§24.6.5), not a crash.
     let output = run(r#"import { print } from "std/io"
 import { worker, request, close } from "std/async"
 
@@ -2764,7 +2764,7 @@ print(toString(total))
 
 #[test]
 fn test_await_flattens_nested_promise() {
-    // §32.2.3: await auto-flattens — a thunk that itself returns a Promise resolves through.
+    // §24.2.3: await auto-flattens — a thunk that itself returns a Promise resolves through.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { async, await } from "std/async"
@@ -2777,7 +2777,7 @@ print(toString(await(async(() => async(() => async(() => 7))))))
 
 #[test]
 fn test_is_error_matches_faulted_thunk() {
-    // §32.2.2: a thunk fault surfaces as an Error value; `is Error` discriminates it, and a
+    // §24.2.2: a thunk fault surfaces as an Error value; `is Error` discriminates it, and a
     // successful result falls through to `else`.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -3000,7 +3000,7 @@ if elapsed < 290 then print("PARALLEL") else print("SEQUENTIAL")
 #[test]
 fn test_async_fault_isolation_div_by_zero() {
     // A runtime fault (division by zero) inside an async thunk must be caught at the thread
-    // boundary and surface as an Error value at await — the program continues (spec §32.2.2),
+    // boundary and surface as an Error value at await — the program continues (spec §24.2.2),
     // it does not abort.
     let output = run(r#"import { print } from "std/io"
 import { async, await } from "std/async"
@@ -3564,7 +3564,7 @@ print(toString(none))
     assert_eq!(output, vec!["42", "7", "null"]);
 }
 
-/// End-to-end test of the real HTTP `serve` intrinsic (spec §33.5). `serve` blocks
+/// End-to-end test of the real HTTP `serve` intrinsic (spec §25.5). `serve` blocks
 /// forever, so the compiled program runs as a background child process; we poll-connect
 /// a raw TCP client, send an HTTP/1.1 request, and assert the wire response. The child is
 /// always killed via a guard so a hung server never leaks past the test.
@@ -3955,7 +3955,7 @@ print(toString(0xFF & 0x0F))
 
 #[test]
 fn test_bitwise_nal_masking() {
-    // The NAL-type extraction example from spec §35.2.
+    // The NAL-type extraction example from spec §27.2.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -4318,7 +4318,7 @@ print(toString(a == c))
 #[test]
 fn test_uint8_literal_out_of_range_rejected() {
     // A suffixless integer literal that does not fit the target small-integer type's range
-    // is a compile-time error (spec §26 context-typed literal + range check).
+    // is a compile-time error (spec §21 context-typed literal + range check).
     let err = run_expect_err(r#"import { print } from "std/io"
 val bad: UInt8[] = [256]
 print("unreachable")
@@ -4362,7 +4362,7 @@ print(toString(big))
 
 #[test]
 fn test_i64_suffix_preserves_large_literal() {
-    // An `i64` suffix pins the literal to Int64 (spec §3.6), so a value beyond Int32's range
+    // An `i64` suffix pins the literal to Int64 (spec §2.6), so a value beyond Int32's range
     // is preserved exactly rather than truncated. (The suffix used to be lexed then discarded.)
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -4419,7 +4419,7 @@ print("unreachable")
 #[test]
 fn test_smallint_value_with_bare_literal_arith() {
     // A small-int value combined with a bare integer literal must keep the small-int width:
-    // the literal adopts the operand's type (spec §26) so no spurious widening crashes codegen
+    // the literal adopts the operand's type (spec §21) so no spurious widening crashes codegen
     // and the arithmetic result is correct.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -5756,7 +5756,7 @@ print(if p["type"] == "error" then "ERR ${p["path"]}" else "OK")
 fn test_from_json_int_range_reject() {
     // `3.14` is non-integral; `5000000000.0` is integral but exceeds Int32's range. (A bare
     // suffixless integer literal like 5000000000 is truncated to Int32 by the lexer before it
-    // ever reaches the decoder — spec §26 — so the overflow case is expressed as a float.)
+    // ever reaches the decoder — spec §21 — so the overflow case is expressed as a float.)
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
 type T = { "n": Int32 }
@@ -6180,7 +6180,7 @@ print(s)
 
 #[test]
 fn test_bare_string_literal_still_string() {
-    // §33: a bare string-literal VALUE still infers to String, usable everywhere a String is.
+    // §25: a bare string-literal VALUE still infers to String, usable everywhere a String is.
     let out = run(r#"import { print } from "std/io"
 val x = "foo"
 val y: String = x
@@ -6193,7 +6193,7 @@ print(y)
 
 #[test]
 fn test_spec18_divide_discriminates() {
-    // The spec §18 divide()/Result example runs and discriminates both branches at runtime.
+    // The spec §19 divide()/Result example runs and discriminates both branches at runtime.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
@@ -6272,7 +6272,7 @@ print(handle(false)["body"])
 
 #[test]
 fn test_multiline_union_leading_pipe() {
-    // The spec §18 canonical form: a multi-line tagged union with a leading `|` on each
+    // The spec §19 canonical form: a multi-line tagged union with a leading `|` on each
     // variant in a `type` alias. Previously failed to parse ("unexpected token Pipe")
     // because the indented body's INDENT token sat between `=` and the first `|`.
     let out = run(r#"import { print } from "std/io"

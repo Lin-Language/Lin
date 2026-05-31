@@ -50,7 +50,7 @@ pub unsafe extern "C" fn lin_server_path_match(
 }
 
 // ---------------------------------------------------------------------------
-// HTTP/1.1 server (`serve`, spec §33.5)
+// HTTP/1.1 server (`serve`, spec §25.5)
 //
 // A minimal, dependency-free HTTP/1.1 server. `lin_serve` binds a TCP listener,
 // then serves connections SEQUENTIALLY (one request at a time): read + parse the

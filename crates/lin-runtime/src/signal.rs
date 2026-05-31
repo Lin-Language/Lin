@@ -1,6 +1,6 @@
 //! `std/signal` runtime intrinsics — minimal, race-free signal waiting.
 //!
-//! Per spec §35.8:
+//! Per spec §27.8:
 //! ```txt
 //! waitSignal: (sig: Int32) => Int32   // block until the signal is delivered
 //! ```
