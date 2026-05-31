@@ -6925,3 +6925,165 @@ print(toString(length(strs)))
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(output, vec!["60", "2"]);
 }
+
+#[test]
+fn test_generic_t_array_param_with_json_arg_is_correct() {
+    // GAP 1: a generic `T[]` param unified against a `Json` value binds `T = Json` (the wildcard),
+    // monomorphizing to a TAGGED `$Json` instance — NOT leaving `T` unbound (which previously read
+    // the array at a bogus element type → null/garbage). The SAME generic applied to a concrete
+    // `Int32[]` still specializes to the flat `$Int32` instance. Both must produce correct values.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val firstOf = <T>(arr: T[]): T => arr[0]
+val j: Json = [7, 8, 9]
+print(toString(firstOf(j)))
+val ints: Int32[] = [10, 20, 30]
+print(toString(firstOf(ints)))
+"#);
+    // Json arg → 7 (correct, not null/garbage); Int32 arg → 10 (correct, flat).
+    assert_eq!(out, vec!["7", "10"]);
+}
+
+#[test]
+fn test_generic_t_array_param_json_tagged_int32_flat_in_ir() {
+    // IR proof for GAP 1: the Json instantiation mints a TAGGED `firstOf$Json` monomorph (reads via
+    // the tagged getter), while the Int32 instantiation mints a FLAT `firstOf$Int32` monomorph
+    // (reads via lin_flat_array_get_i32, returns a native i32). No garbage `$T<id>` symbol.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_gap1_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_gap1_{}", id));
+    let ll_path = bin_path.with_extension("ll");
+
+    fs::write(&src_path, r#"import { print } from "std/io"
+import { toString } from "std/string"
+val firstOf = <T>(arr: T[]): T => arr[0]
+val j: Json = [7, 8, 9]
+print(toString(firstOf(j)))
+val ints: Int32[] = [10, 20, 30]
+print(toString(firstOf(ints)))
+"#).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_EMIT_IR", "1")
+        .env("LIN_NO_OPT", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+
+    let ll = fs::read_to_string(&ll_path).expect("LLVM IR not emitted");
+    let _ = fs::remove_file(&bin_path);
+    let _ = fs::remove_file(&ll_path);
+
+    // The Json instantiation is named `$Json` (tagged), the Int32 one `$Int32` (flat).
+    assert!(ll.contains("\"firstOf$Json\""),
+        "expected a tagged firstOf$Json monomorph for the Json arg, IR:\n{}", ll);
+    assert!(ll.contains("define i32 @\"firstOf$Int32\"(ptr"),
+        "expected a flat i32 firstOf$Int32 monomorph for the Int32[] arg, IR:\n{}", ll);
+    // Soundness guard: never an unbound-TypeVar `$T<id>` garbage monomorph.
+    let re = regex_lite_find_t_id(&ll);
+    assert!(re.is_none(),
+        "found a garbage unbound-TypeVar monomorph '{}' — GAP 2 regression, IR:\n{}",
+        re.unwrap(), ll);
+}
+
+#[test]
+fn test_generic_import_path_unbound_typevar_is_safe() {
+    // GAP 2 (LATENT SOUNDNESS BUG): a generic called INSIDE an imported module on that module's own
+    // `Json` param previously emitted a `$T<id>` garbage monomorph keyed on the UNBOUND TypeVar,
+    // which read/allocated the array at a bogus element type → runtime `capacity overflow` / heap
+    // corruption. The import-monomorphization path must now erase any non-concrete TypeVar to the
+    // Json wildcard, producing a correct tagged `$Json` monomorph (the same resolution the main
+    // module uses). Module `helpers` exports `doubleAll(arr: Json)` whose body calls the sibling
+    // generic `mymap` on its Json param — exactly the import-path-unbound case.
+    let dir = std::env::temp_dir().join(format!("lin_gap2_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("helpers.lin"),
+        "import { for, push } from \"std/array\"\n\
+         export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
+           val result = []\n  \
+           arr.for(item => push(result, f(item)))\n  \
+           result\n\
+         export val doubleAll = (arr: Json): Json =>\n  \
+           mymap(arr, x => x * 2)\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ reduce }} from "std/array"
+import {{ doubleAll }} from "{}/helpers"
+val r: Json = doubleAll([5, 6, 7])
+print(toString(r.reduce(0, (acc, x) => acc + x)))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    // 5+6+7 = 18, doubled = 36. Correct tagged result, no crash, no garbage.
+    assert_eq!(output, vec!["36"]);
+}
+
+#[test]
+fn test_generic_import_path_unbound_typevar_no_garbage_monomorph_in_ir() {
+    // IR proof for GAP 2: the import-path `mymap` instantiation driven by `doubleAll`'s Json param
+    // mints a tagged `mymap$Json_...` monomorph and NEVER a `$T<id>` garbage symbol.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let dir = ws.join(format!("target/lin_gap2_ir_{}", id));
+    let _ = fs::create_dir_all(&dir);
+    fs::write(dir.join("helpers.lin"),
+        "import { for, push } from \"std/array\"\n\
+         export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
+           val result = []\n  \
+           arr.for(item => push(result, f(item)))\n  \
+           result\n\
+         export val doubleAll = (arr: Json): Json =>\n  \
+           mymap(arr, x => x * 2)\n").unwrap();
+    let src_path = dir.join("main.lin");
+    let bin_path = dir.join("main");
+    let ll_path = bin_path.with_extension("ll");
+    fs::write(&src_path, format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ reduce }} from "std/array"
+import {{ doubleAll }} from "{}/helpers"
+val r: Json = doubleAll([5, 6, 7])
+print(toString(r.reduce(0, (acc, x) => acc + x)))
+"#, dir.to_str().unwrap())).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_EMIT_IR", "1")
+        .env("LIN_NO_OPT", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+    let ll = fs::read_to_string(&ll_path).expect("LLVM IR not emitted");
+    let _ = fs::remove_dir_all(&dir);
+
+    let garbage = regex_lite_find_t_id(&ll);
+    assert!(garbage.is_none(),
+        "import-path monomorphization emitted a garbage unbound-TypeVar monomorph '{}' (GAP 2), IR:\n{}",
+        garbage.unwrap(), ll);
+}
+
+/// Find the first `$T<digits>` token in `ir` (a garbage unbound-TypeVar monomorph name). Returns
+/// the matched substring, or `None`. Deliberately dependency-free (no `regex` crate in this test
+/// binary): scan for the `$T` marker followed by ASCII digits.
+fn regex_lite_find_t_id(ir: &str) -> Option<String> {
+    let bytes = ir.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'$' && bytes[i + 1] == b'T' && bytes[i + 2].is_ascii_digit() {
+            let start = i;
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            return Some(ir[start..j].to_string());
+        }
+        i += 1;
+    }
+    None
+}

@@ -971,3 +971,53 @@ neither fixes nor regresses it — the refinement never fires on a `[]` literal 
 (int32-flat-and-correct + IR proof, string-stays-tagged, mixed instantiations, json-stays-tagged,
 user-annotation-respected) in `crates/lin/tests/integration.rs`. ASan-clean over stdlib + examples + the
 flat/tagged/mixed fixtures.
+
+## ADR-066: A `Json` argument binds a generic `T[]` param to the Json wildcard; import-path monomorphization erases leftover inference TypeVars to Json (no garbage monomorph)
+
+**Status:** accepted (Phase 6-pre, prerequisite for genericizing stdlib `array.lin`).
+
+**Context.** Monomorphization specializes a generic function per distinct concrete instantiation,
+keying the specialization on the concrete types unified from the call site (`name$Int32`,
+`name$Str`, ...). Two related gaps made a generic `T[]` parameter unsafe once stdlib functions
+become generic and call each other internally:
+
+1. **Inference gap (lin-check).** `collect_type_subs` (`checker/helpers.rs`) had cases for
+   `(Array(T), Array(a))` and `(Array(T), FixedArray(..))` but NONE for `(Array(T), TypeVar(MAX))`
+   — i.e. unifying a generic `T[]` param against a `Json` value (`Json == TypeVar(u32::MAX)`).
+   So a generic `map<T,U>(arr: T[], ...)` called INTERNALLY by another stdlib fn on its `Json`
+   param (e.g. `sortBy` doing `arr.map(...)`) left `T` unbound.
+2. **Import-monomorphization soundness bug (lin-ir).** When a type param stayed bound to a
+   NON-CONCRETE `TypeVar` at a call inside an imported module, the import path
+   (`lower_import_module` -> `monomorphize_import`) materialized a specialization keyed on that
+   unsolved id (`map$T44_...`). The body then read/allocated the backing array at a bogus element
+   type -> runtime `capacity overflow` / heap corruption (`lin-runtime/src/array.rs`). The
+   main-module path tolerated this only because the case rarely arose; the import path hits it
+   routinely once stdlib fns call sibling generics on `Json` params.
+
+**Decision.**
+
+- **Bind `T = Json` for a `Json` argument.** Add `(Array(pt), TypeVar(MAX))` and
+  `(Iterator(pt), TypeVar(MAX))` arms to BOTH unifiers — `collect_type_subs` (lin-check) and
+  `collect_subs` (lin-ir `monomorphize.rs`) — that recurse the element against the Json wildcard.
+  A `Json` array argument therefore binds the element TypeVar(s) to `TypeVar(MAX)`, producing a
+  representation-consistent TAGGED `$Json` monomorph (`is_flat_scalar(MAX)` is false). A concrete
+  `Int32[]` argument still binds `T = Int32` and produces the FLAT `$Int32` monomorph.
+- **Erase leftover inference TypeVars to Json before keying a specialization (import safety net).**
+  In `monomorphize_inner` (lin-ir), after unifying the call, every binding value is run through
+  `erase_nonconcrete_typevars`: any LEFTOVER/unsolved inference `TypeVar` (id `< GENERIC_TV_BASE`,
+  e.g. `TypeVar(44)`) is rewritten to the `TypeVar(MAX)` Json wildcard, yielding a safe tagged
+  `$Json` monomorph instead of a garbage `$T<id>` one. A QUANTIFIED generic id (`>= GENERIC_TV_BASE`)
+  is deliberately LEFT UNTOUCHED so a genuinely-unconstrained param (`val mk = <T>(): T => 0; mk()`)
+  still produces the clean "cannot infer a concrete type" diagnostic rather than silently erasing.
+  `mangle_type(TypeVar(MAX))` renders as `Json`, so an erased specialization is named `name$Json`.
+
+**Consequences.** A generic `T[]` fn applied to a `Json` value is correct (tagged `$Json`, not
+null/garbage/crash); applied to `Int32[]` is still flat `$Int32`. The import path can never emit a
+`$T<id>` garbage monomorph or corrupt the heap. **No-op for current code**: no generic stdlib fns
+exist yet and no user generic on master flows a `Json` value into a `T[]` param, so the new arms
+never fire and the monomorphize pass is still skipped for non-generic modules — `array_pipeline`
+`-O0` IR is byte-identical. Regression tests in `crates/lin/tests/integration.rs`:
+`test_generic_t_array_param_with_json_arg_is_correct` (+ IR proof of tagged-Json / flat-Int32),
+`test_generic_import_path_unbound_typevar_is_safe` (+ IR proof of no `$T<id>` garbage). ASan-clean
+over stdlib + examples + both fixtures. Drove the import-path bug by temporarily making stdlib `map`
+generic and calling it via `sortBy` (reverted before commit).
