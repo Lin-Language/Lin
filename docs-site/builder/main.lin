@@ -1,9 +1,10 @@
 import { print } from "std/io"
 import { readFile, writeFile, readJson, ls, mkdir, cp } from "std/fs"
 import { join } from "std/path"
-import { split, startsWith, contains, trim, substring, indexOf } from "std/string"
+import { split, startsWith, contains, trim, substring, indexOf, replaceAll } from "std/string"
 import { for, filter, push, length } from "std/array"
 import { renderWith } from "std/template"
+import { getEnv } from "std/env"
 
 import { markdownToHtml } from "./markdown"
 import { buildNav } from "./nav"
@@ -15,6 +16,13 @@ val outputDir = "docs-site/output"
 val staticDir = "docs-site/static"
 val pageTemplate = "docs-site/templates/page.lint"
 val homeTemplate = "docs-site/templates/home.lint"
+
+// Deployment base path. GitHub Pages serves a project site under "/<repo>", so all
+// internal links and asset URLs are prefixed with this. Set LIN_DOCS_BASE=/Lin in CI;
+// it defaults to "" for a local build served from the filesystem root.
+val basePath =
+  val env = getEnv("LIN_DOCS_BASE")
+  if env == null then "" else env
 
 // Extract the text from a heading line "# Foo" -> "Foo"
 val headingText = (line: String): String =>
@@ -82,14 +90,17 @@ val processFile = (filePath: String, navEntries: Json): Null =>
   else
     val source = fileContent(sourceJson)
     val title = extractTitle(source)
-    val htmlContent = markdownToHtml(source)
+    val rawHtml = markdownToHtml(source)
+    // Prefix root-relative links (href="/...") authored in the Markdown with the
+    // deployment base path. No-op when basePath is "" (local/root deployment).
+    val htmlContent = replaceAll(rawHtml, "href=\"/", "href=\"${basePath}/")
     val urlPath = contentPathToUrl(filePath)
-    val navHtml = buildNav(navEntries, urlPath)
+    val navHtml = buildNav(navEntries, urlPath, basePath)
     val outputPath = contentPathToOutput(filePath)
     val templatePath = if urlPath == "/" then homeTemplate else pageTemplate
     val templateJson = readFile(templatePath)
     val templateStr = fileContent(templateJson)
-    val rendered = renderWith(templateStr, { "title": title, "nav": navHtml, "content": htmlContent })
+    val rendered = renderWith(templateStr, { "title": title, "nav": navHtml, "content": htmlContent, "base": basePath })
     val outDir = dirName(outputPath)
     mkdir(outDir, { "parents": true })
     val writeResult = writeFile(outputPath, rendered)
