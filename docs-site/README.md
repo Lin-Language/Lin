@@ -42,6 +42,10 @@ cargo build --workspace                                  # build the lin compile
 # open docs-site/output/index.html
 ```
 
+`LIN_DOCS_BASE` sets a deployment subpath prefix for all links and assets. It
+defaults to `""` (root) for local builds; CI sets `LIN_DOCS_BASE=/Lin` because the
+GitHub Pages project site is served from `https://lin-language.github.io/Lin/`.
+
 ## Deployment
 
 `.github/workflows/docs.yml` builds the compiler, compiles and runs the generator,

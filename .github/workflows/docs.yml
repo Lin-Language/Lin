@@ -57,6 +57,9 @@ jobs:
         run: ./target/debug/lin build docs-site/builder/main.lin -o docs-builder
 
       - name: Generate the static site
+        # GitHub Pages serves this project site under /Lin, so prefix all links/assets.
+        env:
+          LIN_DOCS_BASE: /Lin
         run: ./docs-builder
 
       - name: Upload Pages artifact
