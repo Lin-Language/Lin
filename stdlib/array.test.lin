@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
-import { map, filter, reduce, find, some, every, flatMap, indexOf, reverse, concat, push, length, range, rangeStep, for, partition, zip, unique, take, drop, takeWhile, dropWhile, flatten, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, iterOf, arrayAllocate, arrayAllocateFilled, set } from "std/array"
+import { map, filter, reduce, find, some, every, flatMap, indexOf, reverse, concat, push, length, range, rangeStep, for, partition, zip, unique, take, drop, takeWhile, dropWhile, flatten, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, iterOf, arrayAllocate, arrayAllocateFilled, set, at } from "std/array"
 
 val s = suite("std/array", [
   test("length of array", () => [
@@ -61,6 +61,25 @@ val s = suite("std/array", [
     val result = [1, 2, 3, 4].filter(x => x % 2 == 0)
     [
       expect(result.toString()).toBe("[2, 4]")
+    ]
+  ),
+
+  // Regression (ADR-069 R2): filtering an array of OBJECTS pushes each kept element (BORROWED from
+  // the source) into the result; the result array must take its own reference, else releasing both
+  // the source and the filtered array at teardown double-frees the shared objects (heap UAF).
+  test("filter over object array does not double-free kept elements", () =>
+    val items = [
+      { "type": "a", "v": 1 },
+      { "type": "b", "v": 2 },
+      { "type": "a", "v": 3 }
+    ]
+    val kept = items.filter(i => i["type"] == "a")
+    [
+      expect(length(kept)).toBe(2),
+      expect(kept[0]["v"]).toBe(1),
+      expect(kept[1]["v"]).toBe(3),
+      // the source must remain intact and independently usable after the filter
+      expect(length(items)).toBe(3)
     ]
   ),
 
@@ -131,6 +150,36 @@ val s = suite("std/array", [
     val result = [10, 20, 30].indexOf(99)
     [
       expect(result).toBe(-1)
+    ]
+  ),
+
+  // at/set/indexOf carry generic <T>(T[], ...) signatures (ADR-067): they
+  // preserve the element type so concrete Int32[]/String[] callers stay
+  // representation-consistent. Cover both element representations and the
+  // negative-index wrap.
+  test("at returns element on Int32[]", () =>
+    [
+      expect([10, 20, 30].at(1)).toBe(20)
+    ]
+  ),
+
+  test("at wraps negative index on String[]", () =>
+    [
+      expect(["a", "b", "c"].at(-1)).toBe("c")
+    ]
+  ),
+
+  test("indexOf on String[]", () =>
+    [
+      expect(["a", "b", "c"].indexOf("c")).toBe(2)
+    ]
+  ),
+
+  test("set then at round-trips on Int32[]", () =>
+    val a = [1, 2, 3]
+    set(a, 1, 99)
+    [
+      expect(a.at(1)).toBe(99)
     ]
   ),
 

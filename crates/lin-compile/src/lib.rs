@@ -122,7 +122,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     for path in &import_order {
         let imp_module = imported_modules.get(path).unwrap();
         let src = if opts.coverage { import_sources.get(path) } else { None };
-        cg.compile_import_from_ir(path, imp_module, src);
+        cg.compile_import_from_ir(path, imp_module, src, &imported_modules);
     }
 
     // Compile the main module through LinIR.

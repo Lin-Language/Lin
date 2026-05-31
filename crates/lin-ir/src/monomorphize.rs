@@ -19,8 +19,9 @@
 //! its free references re-homed into the importer (sibling calls → `Named` exports of the origin
 //! module, intrinsics → merged intrinsic slots, thin intrinsic wrappers inlined to the intrinsic),
 //! and emitted as a local specialization. Imported modules also monomorphize their OWN sibling
-//! generic calls during `lower_import_module` (`monomorphize_import`, which keeps all originals for
-//! external importers). Passing a generic as a first-class value, and generic methods, remain
+//! generic calls AND their own cross-module generic calls during `lower_import_module`
+//! (`monomorphize_import_with_imports`, which keeps all originals for external importers). Passing a
+//! generic as a first-class value, and generic methods, remain
 //! deferred. When a module uses no generic function (the common case) this pass is a no-op and
 //! leaves the module byte-identical (the no-op invariant — see `module_uses_generic`).
 
@@ -100,6 +101,46 @@ fn subst_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
     }
 }
 
+/// Rewrite every LEFTOVER/UNSOLVED inference `TypeVar` mentioned in `ty` (an id `< GENERIC_TV_BASE`,
+/// i.e. a fresh checker inference var that never got solved, e.g. `TypeVar(44)`) to the `u32::MAX`
+/// Json wildcard. The existing Json wildcard (`u32::MAX`) is already a wildcard and is preserved.
+///
+/// A quantified generic param id (`>= GENERIC_TV_BASE`, `!= u32::MAX`) is deliberately LEFT
+/// UNTOUCHED: a binding that still mentions one means the generic is genuinely unconstrained at
+/// this call (e.g. `val mk = <T>(): T => 0; mk()`), which must keep producing the clean
+/// "cannot infer a concrete type" diagnostic rather than silently erasing to Json.
+///
+/// Why erase the leftover inference vars: keying a specialization on a bare unsolved `TypeVar(44)`
+/// mints a garbage `$T44` monomorph that reads/allocates the backing array at a bogus element type
+/// (Gap 2 — runtime capacity overflow / heap corruption). Erasing to the Json wildcard yields a
+/// tagged `$Json` monomorph whose element representation is the uniform tagged value — correct and
+/// safe. A concrete type (Int32, String, Object, …) is left untouched, so a real `Int32[]` argument
+/// still produces the flat `$Int32` specialization.
+fn erase_nonconcrete_typevars(ty: &Type) -> Type {
+    match ty {
+        // Leftover/unsolved inference var (below the quantified-generic range): erase to Json.
+        Type::TypeVar(id) if *id < GENERIC_TV_BASE => Type::TypeVar(u32::MAX),
+        // Json wildcard, or a quantified generic param: leave as-is.
+        Type::TypeVar(_) => ty.clone(),
+        Type::Array(t) => Type::Array(Box::new(erase_nonconcrete_typevars(t))),
+        Type::Iterator(t) => Type::Iterator(Box::new(erase_nonconcrete_typevars(t))),
+        Type::Shared(t) => Type::Shared(Box::new(erase_nonconcrete_typevars(t))),
+        Type::FixedArray(ts) => {
+            Type::FixedArray(ts.iter().map(erase_nonconcrete_typevars).collect())
+        }
+        Type::Union(ts) => Type::Union(ts.iter().map(erase_nonconcrete_typevars).collect()),
+        Type::Object(fields) => Type::Object(
+            fields.iter().map(|(k, v)| (k.clone(), erase_nonconcrete_typevars(v))).collect(),
+        ),
+        Type::Function { params, ret, required } => Type::Function {
+            params: params.iter().map(erase_nonconcrete_typevars).collect(),
+            ret: Box::new(erase_nonconcrete_typevars(ret)),
+            required: *required,
+        },
+        _ => ty.clone(),
+    }
+}
+
 /// Unify a generic `pattern` type against a concrete `actual` type, accumulating
 /// `TypeVar id -> concrete` bindings. Only quantified ids (≥ base) are recorded.
 fn collect_subs(pattern: &Type, actual: &Type, subs: &mut HashMap<u32, Type>) {
@@ -110,6 +151,17 @@ fn collect_subs(pattern: &Type, actual: &Type, subs: &mut HashMap<u32, Type>) {
         (Type::Array(p), Type::Array(a)) => collect_subs(p, a, subs),
         (Type::Array(p), Type::FixedArray(ats)) => {
             for a in ats { collect_subs(p, a, subs); }
+        }
+        // A generic `T[]` (or `Iterator<T>`) param unified against a `Json` value (the MAX
+        // wildcard) — e.g. a stdlib fn calling a sibling generic on its own `Json` param. Bind
+        // the element TypeVar(s) to the Json wildcard so the specialization is keyed at the
+        // tagged `$Json` representation rather than left unbound (Gap 1, mirrors lin-check's
+        // `collect_type_subs`).
+        (Type::Array(p), Type::TypeVar(id)) if *id == u32::MAX => {
+            collect_subs(p, &Type::TypeVar(u32::MAX), subs)
+        }
+        (Type::Iterator(p), Type::TypeVar(id)) if *id == u32::MAX => {
+            collect_subs(p, &Type::TypeVar(u32::MAX), subs)
         }
         // An `Iterable`-shaped generic param `T[]` is routinely applied to a runtime ITERATOR
         // (e.g. `range(0,n)` returns `Iterator<Int32>`, then `.map(…)` whose param is `arr: T[]`).
@@ -158,6 +210,9 @@ fn mangle_type(ty: &Type) -> String {
         Type::Object(_) => "Object".into(),
         Type::Union(_) => "Union".into(),
         Type::Function { .. } => "Fn".into(),
+        // The `u32::MAX` Json wildcard (an erased non-concrete type-arg) mangles to `Json`, so a
+        // type-erased specialization is named `name$Json` rather than `name$T4294967295`.
+        Type::TypeVar(id) if *id == u32::MAX => "Json".into(),
         Type::TypeVar(id) => format!("T{}", id),
         _ => "X".into(),
     }
@@ -245,17 +300,6 @@ pub fn monomorphize(module: &mut TypedModule) -> Vec<Diagnostic> {
     monomorphize_inner(module, &no_imports, false)
 }
 
-/// Monomorphize an IMPORTED module's own (single-module) generic sibling calls during its
-/// `lower_import_module` compilation. Like `monomorphize`, but KEEPS every generic original (an
-/// external importer that does not specialize a call still issues a boxed `Named` call to the
-/// original `{module_key}_{name}` symbol, so it must remain defined). Cross-module generics
-/// reachable from the import are not specialized here (the import has no `imports` map); those are
-/// handled in the top-level importer via `monomorphize_with_imports`.
-pub fn monomorphize_import(module: &mut TypedModule) -> Vec<Diagnostic> {
-    let no_imports: HashMap<String, TypedModule> = HashMap::new();
-    monomorphize_inner(module, &no_imports, true)
-}
-
 /// Cross-module entry point: like `monomorphize`, but also discovers generic functions reachable
 /// through this module's `import { … }` statements (whose generic bodies live in `imports`). A call
 /// to an imported generic is specialized HERE — the imported body is cloned, type-substituted, its
@@ -270,6 +314,20 @@ pub fn monomorphize_with_imports(
     imports: &HashMap<String, TypedModule>,
 ) -> Vec<Diagnostic> {
     monomorphize_inner(module, imports, false)
+}
+
+/// Like `monomorphize_with_imports`, but compiling a module that is itself being lowered as an
+/// IMPORT (`lower_import_module`). Cross-module generic calls it makes (e.g. `examples/report`'s
+/// `records.reduce(0, …)` calling the generic `std/array.reduce`) are specialized HERE using the
+/// program's `imports` map — exactly like the top-level importer — so the boxed-generic fallback
+/// (which returns a type-erased `Json`, mismatching a concrete scalar use site and crashing
+/// codegen) is avoided. `keep_all_originals` is true because an external importer of THIS module's
+/// own generics may still issue a boxed `Named` call to the kept originals.
+pub fn monomorphize_import_with_imports(
+    module: &mut TypedModule,
+    imports: &HashMap<String, TypedModule>,
+) -> Vec<Diagnostic> {
+    monomorphize_inner(module, imports, true)
 }
 
 fn monomorphize_inner(
@@ -1064,15 +1122,39 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
     // call — which would otherwise re-trigger the rewrite and loop forever.
     for_each_child_mut(expr, &mut |c| rewrite_expr(c, state));
 
-    // Handle a call to a generic function (directly by name, or through a `val f = id` alias).
-    if let TypedExpr::Call { func, args, result_type, span, .. } = expr {
+    // Resolve the underlying generic slot of a call's callee (direct or via a `val f = id` alias).
+    let callee_generic_slot = if let TypedExpr::Call { func, .. } = expr {
         if let TypedExpr::LocalGet { slot, .. } = func.as_ref() {
-            // Resolve the underlying generic slot (direct or via alias chain).
-            let generic_slot = if state.generics.contains_key(slot) {
+            if state.generics.contains_key(slot) {
                 Some(*slot)
             } else {
                 state.aliases.get(slot).copied()
-            };
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // CAPTURE-LESS-LAMBDA INLINE (the zero-box win, ADR-069): if the callee is a thin
+    // intrinsic-combinator wrapper (`map`/`filter`/`reduce` = `lin_map`/… forwarding its params) AND
+    // the callback argument is a capture-less LITERAL lambda, inline the wrapper at THIS call site —
+    // rewriting the call to a direct `lin_map(arr, <lambda>)` — so the literal lambda becomes visible
+    // to the intrinsic's IR lowering (`lower_map`/…), which inlines the lambda body straight into the
+    // loop with NO per-element box/unbox/closure-call. Done before the type-spec path so the inlined
+    // direct-intrinsic form is what lowers. Capturing lambdas and stored-fn callbacks fall through to
+    // the normal (closure-call) specialization path.
+    if let Some(gslot) = callee_generic_slot {
+        if try_inline_combinator_wrapper(expr, gslot, state) {
+            return;
+        }
+    }
+
+    // Handle a call to a generic function (directly by name, or through a `val f = id` alias).
+    if let TypedExpr::Call { func, args, result_type, span, .. } = expr {
+        if let TypedExpr::LocalGet { .. } = func.as_ref() {
+            let generic_slot = callee_generic_slot;
             if let Some(gslot) = generic_slot {
                 let g = &state.generics[&gslot];
                 if let TypedExpr::Function { params, ret_type, .. } = &g.func {
@@ -1085,8 +1167,24 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                     }
                     collect_subs(&ret_type, result_type, &mut subs);
 
-                    // Fully instantiated ⇔ every quantified id has a concrete (no remaining
-                    // generic TypeVar) binding AND nothing is left unconstrained.
+                    // GAP 2 SAFETY: a quantified type param may be bound to a type that still
+                    // mentions a NON-CONCRETE TypeVar — either the `u32::MAX` Json wildcard (a
+                    // `Json` argument, see Gap 1) or a leftover/unsolved checker inference var
+                    // (e.g. `TypeVar(44)`, id < GENERIC_TV_BASE). Materializing a specialization
+                    // keyed on such a value would read/allocate the array at a BOGUS element type
+                    // (`$T44` / `$T4294967295` garbage monomorph → runtime capacity overflow /
+                    // heap corruption). The MAIN-module path historically tolerated this only
+                    // because such cases rarely arose; the IMPORT path (a stdlib fn calling a
+                    // sibling generic on its own `Json` param) hits it routinely. Resolve EVERY
+                    // non-concrete TypeVar (any id) to the Json wildcard, producing a tagged
+                    // `$Json` monomorph that is representation-consistent and correct.
+                    for v in subs.values_mut() {
+                        *v = erase_nonconcrete_typevars(v);
+                    }
+
+                    // Fully instantiated ⇔ every quantified id has a (now Json-erased) binding
+                    // that no longer mentions a quantified generic TypeVar AND nothing is left
+                    // unconstrained.
                     let all_quantified = subs
                         .keys()
                         .all(|id| *id >= GENERIC_TV_BASE && *id != u32::MAX);
@@ -1102,7 +1200,7 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                         if known || count < state.budget {
                             let base_name = g_name(state, gslot);
                             let spec_slot = native_spec_slot(state, gslot, &base_name, key, subs.clone());
-                            repoint_call_native(func, &params, &ret_type, &subs, spec_slot);
+                            repoint_call_native(expr, &params, &ret_type, &subs, spec_slot);
                         } else {
                             // Budget exceeded: fall back to one shared boxed copy of the original.
                             if state.boxed_fallback_used.insert(gslot) {
@@ -1169,10 +1267,100 @@ fn native_spec_slot(
     s
 }
 
-/// Repoint a generic call's `func` LocalGet at the native specialization slot, giving it the
+/// Intrinsic-combinator wrappers whose callback body the IR lowering can inline (ADR-069). Each is
+/// `lin_X(params…)` forwarding its parameters 1:1, so a call's existing args are already in the
+/// intrinsic's argument order and need no reordering when we repoint the callee.
+fn combinator_intrinsic(name: &str) -> bool {
+    matches!(name, "lin_map" | "lin_filter" | "lin_reduce")
+}
+
+/// Try to inline a thin intrinsic-combinator wrapper call (`map`/`filter`/`reduce`) at the call
+/// site when its callback argument is a CAPTURE-LESS LITERAL lambda. On success, repoints the call's
+/// `func` at a (re-homed) intrinsic slot for `lin_map`/`lin_filter`/`lin_reduce` so the call lowers
+/// straight through the intrinsic — exposing the literal lambda to `lower_map`/… which inlines its
+/// body into the loop (zero per-element box/unbox/closure-call). Returns true if it rewrote the call.
+///
+/// Conditions (all required):
+///   - the generic is a thin intrinsic wrapper for a combinator intrinsic (`thin_intrinsic_wrapper`);
+///   - exactly one argument is a `TypedExpr::Function` with NO captures (a capture-less literal
+///     lambda — a capturing lambda or a stored/passed `Function` value is NOT inlinable here and
+///     must keep the closure path);
+///   - the intrinsic's origin module is known (so its name is resolvable).
+/// The wrapper forwards its params 1:1, so the call args map directly to the intrinsic args.
+fn try_inline_combinator_wrapper(
+    expr: &mut TypedExpr,
+    gslot: usize,
+    state: &mut MonoState<'_>,
+) -> bool {
+    let g = &state.generics[&gslot];
+    // Resolve the intrinsic this wrapper forwards to. The wrapper's body is type-checked in its
+    // ORIGIN module, so classify the intrinsic against that module's intrinsic map.
+    let origin_module: Option<&TypedModule> = match &g.origin {
+        Some(path) => state.imports.get(path),
+        None => None,
+    };
+    let intrinsic = match origin_module {
+        Some(m) => match thin_intrinsic_wrapper(m, &g.func) {
+            Some(intr) if combinator_intrinsic(&intr) => intr,
+            _ => return false,
+        },
+        // A locally-defined generic combinator (not the stdlib import case) — not inlined here.
+        None => return false,
+    };
+
+    let TypedExpr::Call { args, .. } = expr else { return false };
+    // Exactly one capture-less literal-lambda argument qualifies.
+    let mut lambda_args = 0;
+    for a in args.iter() {
+        if let TypedExpr::Function { captures, .. } = a {
+            if captures.is_empty() {
+                lambda_args += 1;
+            } else {
+                // A capturing literal lambda: do not inline (the loop body would need its captured
+                // environment, which the closure path provides). Bail to the closure specialization.
+                return false;
+            }
+        }
+    }
+    if lambda_args != 1 {
+        return false;
+    }
+
+    // Mint (deduped by name) a fresh importer intrinsic slot for `lin_*` and repoint the callee.
+    let key = (String::new(), intrinsic.clone());
+    let slot = if let Some(&s) = state.rehome_intrinsic_cache.get(&key) {
+        s
+    } else {
+        let fresh = state.next_slot;
+        state.next_slot += 1;
+        state.rehome_intrinsic_cache.insert(key, fresh);
+        state.rehomed_intrinsics.insert(fresh, intrinsic.clone());
+        fresh
+    };
+
+    if let TypedExpr::Call { func, .. } = expr {
+        if let TypedExpr::LocalGet { slot: fslot, .. } = func.as_mut() {
+            *fslot = slot;
+        }
+    }
+    true
+}
+
+/// Repoint a generic Call at the native specialization slot, giving its `func` LocalGet the
 /// concrete specialized function type so lowering resolves the unboxed ABI.
+///
+/// The specialization returns the CONCRETE return type (e.g. `reduce$Union_Int32` returns a native
+/// `i32`). The checker, however, may have left the Call's `result_type` as the boxed/erased generic
+/// return (the `U` TypeVar surfaced as `Json` in the surrounding context — e.g. `total = s` where
+/// `total: Json`), and the surrounding lowering relies on the result having THAT representation. If
+/// the concrete return and the original `result_type` differ in representation (scalar vs boxed
+/// ptr), we set the Call's own `result_type` to the concrete type and wrap the whole Call in a
+/// `Coerce { from: concrete, to: original }` so the boxed/unboxed handoff to the surrounding context
+/// is explicit — mirroring `boxed_fallback_call`'s Coerce, but in the native (unboxed) direction.
+/// Without this the closure/global that consumes the result would emit `ret i32`/`store i32` against
+/// a `ptr` slot (a hard codegen type mismatch).
 fn repoint_call_native(
-    func: &mut Box<TypedExpr>,
+    expr: &mut TypedExpr,
     params: &[TypedParam],
     ret_type: &Type,
     subs: &HashMap<u32, Type>,
@@ -1183,13 +1371,40 @@ fn repoint_call_native(
     let required = params.iter().filter(|p| p.default.is_none()).count();
     let fn_ty = Type::Function {
         params: concrete_params,
-        ret: Box::new(concrete_ret),
+        ret: Box::new(concrete_ret.clone()),
         required,
     };
+    let TypedExpr::Call { func, result_type, .. } = expr else { return };
     if let TypedExpr::LocalGet { slot: fslot, ty, .. } = func.as_mut() {
         *fslot = spec_slot;
         *ty = fn_ty;
     }
+    let original_result = result_type.clone();
+    // The native spec produces `concrete_ret`. Make the Call node report that.
+    *result_type = concrete_ret.clone();
+    // If the surrounding context expected a different representation (the checker's erased result),
+    // re-coerce the native result back to it.
+    if repr_differs(&concrete_ret, &original_result) {
+        let span = expr.span();
+        let inner = std::mem::replace(expr, TypedExpr::NullLit(span));
+        *expr = TypedExpr::Coerce {
+            expr: Box::new(inner),
+            from: concrete_ret,
+            to: original_result,
+            span,
+        };
+    }
+}
+
+/// True when two types differ in runtime representation such that a value of one must be
+/// boxed/unboxed to be used as the other: one is a union/Json (boxed `TaggedVal*` / `u32::MAX`
+/// wildcard or a `Union`), the other a concrete non-union type. (Mirrors `lin-ir`'s
+/// `type_repr_differs`; kept local to avoid a cross-module dependency.)
+fn repr_differs(a: &Type, b: &Type) -> bool {
+    fn is_boxed(t: &Type) -> bool {
+        matches!(t, Type::Union(_)) || matches!(t, Type::TypeVar(id) if *id == u32::MAX)
+    }
+    is_boxed(a) != is_boxed(b)
 }
 
 /// Rewrite `expr` (a generic Call) into a boxed/type-erased call to the kept generic original.

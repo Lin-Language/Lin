@@ -149,14 +149,30 @@ pub fn lower_module_with_imports(
 /// through `global_fn_slots` (Direct calls to the mangled symbols); cross-module imports,
 /// foreign bindings, and intrinsics resolve exactly as in the main lowering.
 pub fn lower_import_module(module: &TypedModule, module_key: &str) -> LinModule {
-    // Monomorphize this import's OWN single-module generic sibling calls (e.g. stdlib `sum`/`min`
-    // calling the now-generic `reduce`). Without this, a sibling call to a generic gets a concrete
-    // `result_type` from the checker but lowers to the boxed generic symbol — a representation
-    // mismatch that crashes codegen. Generic originals are all KEPT (external importers may issue a
-    // boxed `Named` call to them). No-op for an import with no generic functions (byte-identical).
-    let owned: Option<TypedModule> = if crate::monomorphize::module_has_generic_fn(module) {
+    let no_imports: HashMap<String, TypedModule> = HashMap::new();
+    lower_import_module_with_imports(module, module_key, &no_imports)
+}
+
+/// Like `lower_import_module`, but with the program's already-typed imported modules so an import
+/// that ITSELF makes cross-module generic calls (e.g. `examples/report` → `std/array.reduce`) gets
+/// those calls specialized here instead of falling to the boxed type-erased generic (which returns
+/// `Json` and crashes a concrete-scalar use site). Mirrors the top-level `lower_module_with_imports`
+/// monomorphization, but keeps every generic original (external importers may still call them
+/// boxed). No-op (byte-identical lowering) when the module neither defines nor uses any generic.
+pub fn lower_import_module_with_imports(
+    module: &TypedModule,
+    module_key: &str,
+    imports: &HashMap<String, TypedModule>,
+) -> LinModule {
+    // Monomorphize this import's generic calls: its OWN single-module sibling calls (e.g. stdlib
+    // `sum`/`min` calling the now-generic `reduce`) AND any CROSS-MODULE generic call it makes into
+    // its imports (resolved via `imports`). Without this, such a call gets a concrete `result_type`
+    // from the checker but lowers to the boxed generic symbol — a representation mismatch that
+    // crashes codegen. Generic originals are all KEPT (external importers may issue a boxed `Named`
+    // call to them). No-op for a module that neither defines nor uses a generic (byte-identical).
+    let owned: Option<TypedModule> = if crate::monomorphize::module_uses_generic(module, imports) {
         let mut m = module.clone();
-        let _ = crate::monomorphize::monomorphize_import(&mut m);
+        let _ = crate::monomorphize::monomorphize_import_with_imports(&mut m, imports);
         Some(m)
     } else {
         None
@@ -548,6 +564,57 @@ impl FuncBuilder {
 
     fn switch_to(&mut self, block: BlockId) {
         self.current_block = block;
+    }
+
+    /// Patch the back-edge predecessor block of the `Phi` writing `dst` in `header`. Used by loop
+    /// scaffolds whose body may switch basic blocks (e.g. `filter`'s keep/skip split): the phi's
+    /// back-edge must name the block that actually jumps back to the header, not the nominal loop
+    /// body block. `old_block` is the placeholder predecessor recorded when the phi was emitted.
+    fn patch_phi_incoming(&mut self, header: BlockId, dst: Temp, old_block: BlockId, new_block: BlockId) {
+        if old_block == new_block {
+            return;
+        }
+        if let Some(b) = self.blocks.iter_mut().find(|b| b.id == header) {
+            for instr in b.instructions.iter_mut() {
+                if let Instruction::Phi { dst: pdst, incomings, .. } = instr {
+                    if *pdst == dst {
+                        for inc in incomings.iter_mut() {
+                            if inc.1 == old_block {
+                                inc.1 = new_block;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Patch a header phi `dst`'s back-edge incoming: replace the provisional `(old_value,
+    /// old_block)` pair with the real `(new_value, new_block)`. Used by the inlined-reduce loop,
+    /// whose accumulator phi back-edge value (the lowered reducer body's result) and predecessor
+    /// block are only known after the body — which may switch blocks — is lowered.
+    fn patch_phi_incoming_value(
+        &mut self,
+        header: BlockId,
+        dst: Temp,
+        old_value: Temp,
+        new_value: Temp,
+        new_block: BlockId,
+    ) {
+        if let Some(b) = self.blocks.iter_mut().find(|b| b.id == header) {
+            for instr in b.instructions.iter_mut() {
+                if let Instruction::Phi { dst: pdst, incomings, .. } = instr {
+                    if *pdst == dst {
+                        for inc in incomings.iter_mut() {
+                            if inc.0 == old_value {
+                                inc.0 = new_value;
+                                inc.1 = new_block;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn seal(&mut self) {
@@ -2383,6 +2450,153 @@ fn callback_signature(expr: &TypedExpr) -> (Vec<Type>, Type) {
     }
 }
 
+/// True for a concrete fixed-width scalar (Int*/UInt*/Float*/Bool) — a type carried UNBOXED with no
+/// refcount. Used to decide whether a combinator's element read can use the FLAT scalar getter
+/// (`combinator_read_elem_ty`): a scalar element has no refcount and a flat representation, so a
+/// flat read on a provably-flat source is sound.
+fn is_inline_scalar(ty: &Type) -> bool {
+    matches!(ty,
+        Type::Int8 | Type::UInt8 | Type::Int16 | Type::UInt16 |
+        Type::Int32 | Type::UInt32 | Type::Int64 | Type::UInt64 |
+        Type::Float32 | Type::Float64 | Type::Bool
+    )
+}
+
+/// The element type to READ from `iterable` in a combinator loop, accounting for the fact that a
+/// flat-scalar `T[]` static type does NOT guarantee a flat RUNTIME representation.
+///
+/// A `[]`+push builder (`val r = []; …push(r,x)…; r`) allocates a TAGGED array even when the binding
+/// is later used as `Int32[]` (the empty literal is `Array(Never)`), so a flat read on it misreads
+/// garbage. The static type can't distinguish a genuinely-flat producer (`range`/`map`/`filter`,
+/// flat literals) from a `[]`+push builder. So:
+///   - for a PROVABLY-FLAT source, return the concrete scalar element type → fast flat read;
+///   - otherwise return the `Json` wildcard (`TypeVar(MAX)`) → the representation-agnostic TAGGED
+///     read (`lin_array_get_tagged`, which dispatches on the array's runtime `elem_tag` and works
+///     for BOTH flat and tagged arrays), keeping a `[]`+push array correct.
+///
+/// PROVABLY FLAT = the result of a flat-producing builtin/combinator (their lowering allocates a
+/// flat buffer for a flat-scalar element), recognised by an `Iterator<scalar>` static result —
+/// `range`/`rangeStep`/`iterOf` return `Iterator<…>`, and `map`/`filter` return arrays only via
+/// these intrinsics whose declared result is `Array<scalar>` from a flat producer chain — or a
+/// non-empty scalar array literal (`[1,2,3]`). A `[]`+push builder returns a plain `Array`, never an
+/// `Iterator`, and a bare param/projection is also not trusted.
+fn combinator_read_elem_ty(iterable: &TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> Type {
+    let static_elem = iter_elem_type(&iterable.ty());
+    if !is_inline_scalar(&static_elem) {
+        // Heap/union element: already read tagged; nothing to gate.
+        return static_elem;
+    }
+    if is_provably_flat_producer(iterable, builder, ctx) { static_elem } else { Type::TypeVar(u32::MAX) }
+}
+
+/// True when `expr` provably produces a FLAT-buffer array for its (flat-scalar) element type.
+fn is_provably_flat_producer(expr: &TypedExpr, builder: &FuncBuilder, ctx: &LowerCtx) -> bool {
+    match expr {
+        // A non-empty scalar array literal lowers to a flat MakeArray.
+        TypedExpr::MakeArray { elements, .. } => !elements.is_empty(),
+        // A call to a flat-producing builtin/combinator: range/rangeStep/iterOf (Iterator builtins),
+        // map/filter (their lowering allocates a flat output for a flat-scalar element), and the
+        // flat array allocators. Recognised by the callee slot resolving to one of those intrinsics
+        // OR a stdlib export of that name (the importer's `import_fn_slots`).
+        TypedExpr::Call { func, .. } => {
+            if let TypedExpr::LocalGet { slot, .. } = func.as_ref() {
+                if let Some(intr) = builder.intrinsic_slots.get(slot) {
+                    return is_flat_producer_name(intr);
+                }
+                if let Some((sym, _)) = ctx.import_fn_slots.get(slot) {
+                    // Imported export symbol is `{module_key}_{name}`; match on the trailing name.
+                    return sym.rsplit('_').next().map(is_flat_producer_export).unwrap_or(false);
+                }
+                if let Some(&fid) = ctx.global_fn_slots.get(slot) {
+                    let _ = fid; // local sibling: not a flat producer we trust here.
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// Intrinsic names whose IR lowering allocates a FLAT scalar buffer (so a flat read on the result
+/// is sound). `lin_map`/`lin_filter` allocate flat output for a flat-scalar element type.
+fn is_flat_producer_name(name: &str) -> bool {
+    matches!(name,
+        "lin_range" | "lin_map" | "lin_filter"
+            | "lin_array_allocate" | "lin_array_allocate_filled")
+}
+
+/// Stdlib export names that thinly wrap a flat producer (`range`→`lin_range`, `map`/`filter`, the
+/// flat array allocators). Used when a combinator result reaches another combinator via the
+/// importer's Named call (`import_fn_slots`) rather than an inlined intrinsic.
+fn is_flat_producer_export(name: &str) -> bool {
+    matches!(name,
+        "range" | "map" | "filter" | "arrayAllocate" | "arrayAllocateFilled")
+}
+
+
+/// A capture-less literal lambda usable for INLINING into a combinator loop (ADR-069): a
+/// `TypedExpr::Function` with no captures. Returns its params + body so the caller can bind each
+/// param to a loop temp and lower the body inline — no closure alloc, no boxed indirect call. A
+/// capturing lambda or a non-literal callback (a stored/passed `Function` value) returns `None` and
+/// the caller falls back to the closure-call path.
+fn inlinable_lambda(expr: &TypedExpr) -> Option<(&[TypedParam], &TypedExpr)> {
+    match expr {
+        TypedExpr::Function { params, body, captures, .. } if captures.is_empty() => {
+            Some((params, body))
+        }
+        _ => None,
+    }
+}
+
+/// Inline a capture-less lambda's body into the current block: bind each param slot to the
+/// corresponding argument temp (coerced to the param's declared representation), then lower the body
+/// inline. Returns the body's result temp (typed as the body's lowered type). Used by the combinator
+/// inliner to splice `x => x*2` etc. directly into the loop with no boxing/closure call.
+///
+/// The param bindings are made in a fresh scope so the body's own `val`/locals don't leak; arguments
+/// are bound BEFORE the scope is pushed-over (they are the loop's element/accumulator temps, owned by
+/// the loop, not by this body scope — so the scope-exit release must not free them). We bind the raw
+/// temps directly without registering them owned in the body scope.
+fn inline_lambda_body(
+    params: &[TypedParam],
+    body: &TypedExpr,
+    arg_temps: &[(Temp, Type)],
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> (Temp, Type) {
+    builder.push_scope();
+    for (i, param) in params.iter().enumerate() {
+        if let Some((t, arg_ty)) = arg_temps.get(i) {
+            // Coerce the argument to the param's declared representation (e.g. unbox a Json
+            // element into a concrete scalar param, or box a scalar into a Json param). For the
+            // common monomorphic-scalar case the representations already match and this is a no-op.
+            let bound = coerce_arg_to_param_repr(*t, arg_ty, &param.ty, builder);
+            builder.slots.insert(param.slot, bound);
+        }
+    }
+    let raw = lower_expr(body, builder, ctx);
+    let body_ty = builder.temp_types.get(&raw).cloned().unwrap_or_else(|| body.ty());
+    // Release this body scope's own locals, KEEPING the result temp. The bound param temps were
+    // never registered owned here (they belong to the loop), so they are not double-released.
+    builder.pop_scope_releasing_keep(&[raw]);
+    (raw, body_ty)
+}
+
+/// Coerce `arg` (typed `arg_ty`) to the representation of `param_ty`: box a concrete value into a
+/// union/Json param, or unbox a union value into a concrete param; pass through when the
+/// representations already match. (A two-directional companion to `coerce_arg_to_param`, which only
+/// boxes — the inliner can also need to UNBOX, e.g. a Json element bound to a concrete scalar param.)
+fn coerce_arg_to_param_repr(arg: Temp, arg_ty: &Type, param_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+    if !type_repr_differs(arg_ty, param_ty) {
+        return arg;
+    }
+    let dst = builder.alloc_temp(param_ty.clone());
+    builder.emit(Instruction::Coerce {
+        dst, src: arg, from_ty: arg_ty.clone(), to_ty: param_ty.clone(),
+    });
+    dst
+}
+
 /// Call a body closure temp with arguments, coercing each argument to the closure's
 /// declared parameter type (e.g. box a concrete element to Json when the callback param
 /// is Json) so the closure ABI lines up. Returns the result temp typed as the closure's
@@ -2478,7 +2692,17 @@ fn alloc_output_array(elem_ty: &Type, result_type: &Type, builder: &mut FuncBuil
 
 /// Push `val` (typed `val_ty`) into an output array allocated by `alloc_output_array`.
 /// Flat arrays take the raw scalar; tagged arrays take a Json-boxed value.
-fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp, val_ty: &Type, builder: &mut FuncBuilder) {
+///
+/// `borrowed` records whether `val` is a value this combinator BORROWS rather than freshly owns:
+/// `filter` pushes the very element it read from the SOURCE array (still owned by the source), so
+/// the result must take its OWN reference; `map` pushes the lambda's fresh result (+1 it owns), so
+/// the push MOVES it. The tagged push of a CONCRETE-rc element (`Push` → `lin_array_push_tagged`)
+/// raw-copies the TaggedVal WITHOUT bumping the inner refcount (move semantics), so a borrowed
+/// concrete element must be `Retain`ed first — otherwise both the source array and the result array
+/// reference the same object at refcount 1, and releasing both double-frees it (the `filter` over an
+/// object array UAF; ADR-069 R2). A UNION element pushes via the retaining `lin_push_dyn`, and a
+/// flat-scalar element carries no refcount, so neither needs the extra retain.
+fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp, val_ty: &Type, borrowed: bool, builder: &mut FuncBuilder) {
     let push_dst = builder.alloc_temp(Type::Null);
     match flat {
         Some(kind) => {
@@ -2497,6 +2721,14 @@ fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp,
             });
         }
         None => {
+            // A borrowed CONCRETE-rc element pushed into a tagged result array via the MOVE
+            // intrinsic (`lin_array_push_tagged`, which does NOT bump the inner refcount) must be
+            // retained so the result array owns its own reference (else double-free with the
+            // source array at teardown — the `filter`-over-object-array UAF). Union elements push
+            // via the retaining `lin_push_dyn`; flat scalars carry no refcount — neither needs this.
+            if borrowed && is_rc_type(val_ty) && !is_union_ty(val_ty) {
+                builder.emit(Instruction::Retain { val, ty: val_ty.clone() });
+            }
             let boxed = box_to_json(val, val_ty, builder);
             builder.emit(Instruction::CallIntrinsic {
                 dst: push_dst, intrinsic: Intrinsic::Push, args: vec![out, boxed], ret_ty: Type::Null,
@@ -2687,11 +2919,12 @@ fn lower_iter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder,
 fn emit_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
     iterable: Temp,
     iterable_ty: &Type,
+    elem_ty: &Type,
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
     body_fn: F,
 ) {
-    let elem_ty = iter_elem_type(iterable_ty);
+    let elem_ty = elem_ty.clone();
 
     // len = length(iterable)
     let len = builder.alloc_temp(Type::Int64);
@@ -2740,12 +2973,17 @@ fn emit_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
     // neither a tag-aware release nor a shell-only free is provably safe (both double-free
     // `map`/`minBy`/`maxBy`, which move elements into result/accumulator arrays). Reclaiming it
     // safely needs a change to those runtime move-vs-retain conventions, out of scope here.
+    // `body_fn` may have switched basic blocks (e.g. filter's keep/skip split). The increment +
+    // back-edge are emitted in whatever block is now current, and the header phi's back-edge
+    // predecessor is patched to that block (it was provisionally recorded as `body`).
+    let back_block = builder.current_block;
     let one = builder.const_temp(Const::Int(1, Type::Int64));
     builder.emit(Instruction::Binary {
         dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
         operand_ty: Type::Int64, ty: Type::Int64,
     });
     builder.terminate(Terminator::Jump(header));
+    builder.patch_phi_incoming(header, i, body, back_block);
 
     builder.switch_to(exit);
 }
@@ -2754,9 +2992,13 @@ fn emit_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
 fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
     let (param_tys, _) = callback_signature(&args[1]);
+    // Read elements at the source's PROVABLE runtime representation: flat-scalar only when the
+    // source is a provably-flat producer, else the tagged Json read (sound for a `[]`+push array
+    // mistyped as flat). See `combinator_read_elem_ty` (ADR-068).
+    let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
     let iterable = lower_expr(&args[0], builder, ctx);
     let body = lower_callback_in_safe_ctx(&args[1], builder, ctx);
-    let elem_ty = iter_elem_type(&iterable_ty);
+    let elem_ty = read_elem_ty.clone();
     // The callback closure uses the uniform BOXED ABI: it ALWAYS returns a freshly-allocated,
     // independently-owned `TaggedVal*` (e.g. `lin_box_null()` for a void-ish body, `lin_box_int`
     // for an int result, or — for an assignment body like `acc = concat(...)` — its own owned +1
@@ -2766,7 +3008,7 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
     // tag-aware release it every iteration, inside the loop body before the back-edge — never
     // registered as scope-owned (that would release once AFTER the loop, leaking per-iteration).
     let boxed = Type::TypeVar(u32::MAX);
-    emit_index_loop(iterable, &iterable_ty, builder, ctx, |_, elem, b, _| {
+    emit_index_loop(iterable, &iterable_ty, &read_elem_ty, builder, ctx, |_, elem, b, _| {
         let (ret, elem_boxes) = call_body_closure_with_elem_boxes(body, &[(elem, elem_ty.clone())], &param_tys, &boxed, b);
         // Release the callback-RETURN box (a fresh, independently-owned +1; `for` discards it).
         // This fully reclaims it (inner + shell). The callback CAN return (an alias of) the
@@ -2791,10 +3033,13 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
 fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
     let (param_tys, _) = callback_signature(&args[1]);
+    // Read at the source's PROVABLE representation (ADR-068): tagged Json read unless provably flat,
+    // so a `[]`+push array mistyped as a flat `T[]` is read correctly (not as raw flat scalars).
+    let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
     let iterable = lower_expr(&args[0], builder, ctx);
     let body = lower_callback_in_safe_ctx(&args[1], builder, ctx);
 
-    let elem_ty = iter_elem_type(&iterable_ty);
+    let elem_ty = read_elem_ty;
     let len = builder.alloc_temp(Type::Int64);
     builder.emit(Instruction::CallIntrinsic {
         dst: len, intrinsic: Intrinsic::Length, args: vec![iterable], ret_ty: Type::Int64,
@@ -2853,20 +3098,42 @@ fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx
 fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
     let (param_tys, cb_ret) = callback_signature(&args[1]);
-    let iterable = lower_expr(&args[0], builder, ctx);
-    let f = lower_callback_in_safe_ctx(&args[1], builder, ctx);
 
     // Output element type per the map's declared result type; storage matches it.
     let out_elem_ty = match result_type {
         Type::Array(t) | Type::Iterator(t) => (**t).clone(),
         _ => Type::TypeVar(u32::MAX),
     };
-    let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
-    let elem_ty = iter_elem_type(&iterable_ty);
+    // Read at the source's PROVABLE representation: a flat scalar only for a provably-flat producer
+    // (range/map/filter result, flat literal), else the tagged Json read — sound for a `[]`+push
+    // array mistyped as a flat `T[]` (ADR-068).
+    let elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
 
-    emit_index_loop(iterable, &iterable_ty, builder, ctx, |_, elem, b, _| {
+    let iterable = lower_expr(&args[0], builder, ctx);
+
+    // INLINE FAST PATH (ADR-069): a capture-less literal lambda is spliced directly into the loop —
+    // its param bound to the element temp, its body lowered inline — with no closure alloc and no
+    // per-element box/unbox/indirect call.
+    if let Some((lam_params, lam_body)) = inlinable_lambda(&args[1]) {
+        let lam_params = lam_params.to_vec();
+        let lam_body = lam_body.clone();
+        let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+        emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |_, elem, b, c| {
+            let (mapped, mapped_ty) =
+                inline_lambda_body(&lam_params, &lam_body, &[(elem, elem_ty.clone())], b, c);
+            // `mapped` is the lambda's freshly-owned result (+1) — MOVE it into the result array.
+            push_output(out, flat, &out_elem_ty, mapped, &mapped_ty, false, b);
+        });
+        return out;
+    }
+
+    let f = lower_callback_in_safe_ctx(&args[1], builder, ctx);
+    let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+
+    emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |_, elem, b, _| {
         let mapped = call_body_closure(f, &[(elem, elem_ty.clone())], &param_tys, &cb_ret, b);
-        push_output(out, flat, &out_elem_ty, mapped, &cb_ret, b);
+        // `mapped` is the callback's freshly-owned result (+1) — MOVE it into the result array.
+        push_output(out, flat, &out_elem_ty, mapped, &cb_ret, false, b);
     });
     out
 }
@@ -2875,24 +3142,59 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
 fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
     let (param_tys, _) = callback_signature(&args[1]);
-    let iterable = lower_expr(&args[0], builder, ctx);
-    let pred = lower_callback_in_safe_ctx(&args[1], builder, ctx);
 
     // filter preserves the element type; storage matches it.
     let out_elem_ty = match result_type {
         Type::Array(t) | Type::Iterator(t) => (**t).clone(),
         _ => Type::TypeVar(u32::MAX),
     };
-    let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
-    let elem_ty = iter_elem_type(&iterable_ty);
+    // Read at the source's PROVABLE representation (ADR-068): flat scalar for a provably-flat
+    // producer, else tagged Json (sound for a `[]`+push array mistyped as flat).
+    let elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
 
-    emit_index_loop(iterable, &iterable_ty, builder, ctx, |_, elem, b, _| {
+    let iterable = lower_expr(&args[0], builder, ctx);
+
+    // INLINE FAST PATH (ADR-069): a capture-less literal predicate lambda is spliced into the loop;
+    // its body's Bool result drives the keep/skip split directly — no closure, no boxed call.
+    if let Some((lam_params, lam_body)) = inlinable_lambda(&args[1]) {
+        let lam_params = lam_params.to_vec();
+        let lam_body = lam_body.clone();
+        let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+        emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |_, elem, b, c| {
+            let (pred_raw, pred_ty) =
+                inline_lambda_body(&lam_params, &lam_body, &[(elem, elem_ty.clone())], b, c);
+            // Coerce the predicate result to an i1 Bool (a concrete-Bool body needs no coercion;
+            // a Json/boxed-bool body is unboxed via Coerce).
+            let keep = if matches!(pred_ty, Type::Bool) {
+                pred_raw
+            } else {
+                let d = b.alloc_temp(Type::Bool);
+                b.emit(Instruction::Coerce { dst: d, src: pred_raw, from_ty: pred_ty, to_ty: Type::Bool });
+                d
+            };
+            let keep_block = b.alloc_block("filter_keep");
+            let skip_block = b.alloc_block("filter_skip");
+            b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: skip_block });
+            b.switch_to(keep_block);
+            // `elem` is BORROWED from the source array — the result array must take its own
+            // reference (retain on a tagged concrete-rc push; see `push_output`).
+            push_output(out, flat, &out_elem_ty, elem, &elem_ty, true, b);
+            b.terminate(Terminator::Jump(skip_block));
+            b.switch_to(skip_block);
+        });
+        return out;
+    }
+
+    let pred = lower_callback_in_safe_ctx(&args[1], builder, ctx);
+    let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+    emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |_, elem, b, _| {
         let keep = call_body_closure(pred, &[(elem, elem_ty.clone())], &param_tys, &Type::Bool, b);
         let keep_block = b.alloc_block("filter_keep");
         let skip_block = b.alloc_block("filter_skip");
         b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: skip_block });
         b.switch_to(keep_block);
-        push_output(out, flat, &out_elem_ty, elem, &elem_ty, b);
+        // `elem` is BORROWED from the source array — retain on the tagged concrete-rc push.
+        push_output(out, flat, &out_elem_ty, elem, &elem_ty, true, b);
         b.terminate(Terminator::Jump(skip_block));
         b.switch_to(skip_block);
     });
@@ -2906,12 +3208,89 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
     let json = Type::TypeVar(u32::MAX);
     let iterable_ty = args[0].ty();
     let (param_tys, _) = callback_signature(&args[2]);
-    let iterable = lower_expr(&args[0], builder, ctx);
+    // Read at the source's PROVABLE representation (ADR-068): a flat scalar for a provably-flat
+    // producer, else the tagged Json read (sound for a `[]`+push array mistyped as flat).
+    let elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
     let init_ty = args[1].ty();
+
+    let iterable = lower_expr(&args[0], builder, ctx);
+
+    // INLINE FAST PATH (ADR-069): a capture-less literal reducer lambda with a CONCRETE SCALAR
+    // accumulator carries the accumulator UNBOXED through the loop phi and inlines the lambda body
+    // each iteration — no per-element box/unbox/closure call. Gated to a scalar `result_type` (the
+    // accumulator representation): a union/Json/heap accumulator keeps the boxed Json-phi path below
+    // (its phi must carry a uniform boxed ptr, and the inline machinery here assumes a value phi).
+    if is_inline_scalar(result_type) {
+        if let Some((lam_params, lam_body)) = inlinable_lambda(&args[2]) {
+            let lam_params = lam_params.to_vec();
+            let lam_body = lam_body.clone();
+            let acc_ty = result_type.clone();
+            let init_raw = lower_expr(&args[1], builder, ctx);
+            // The init must match the accumulator representation (a concrete scalar).
+            let init = coerce_arg_to_param_repr(init_raw, &init_ty, &acc_ty, builder);
+
+            let len = builder.alloc_temp(Type::Int64);
+            builder.emit(Instruction::CallIntrinsic {
+                dst: len, intrinsic: Intrinsic::Length, args: vec![iterable], ret_ty: Type::Int64,
+            });
+            let zero = builder.const_temp(Const::Int(0, Type::Int64));
+
+            let preheader = builder.current_block;
+            let header = builder.alloc_block("reduce_header");
+            let body = builder.alloc_block("reduce_body");
+            let exit = builder.alloc_block("reduce_exit");
+
+            let i = builder.alloc_temp(Type::Int64);
+            let i_next = builder.alloc_temp(Type::Int64);
+            let acc = builder.alloc_temp(acc_ty.clone());
+            builder.terminate(Terminator::Jump(header));
+
+            builder.switch_to(header);
+            builder.emit(Instruction::Phi {
+                dst: i, ty: Type::Int64, incomings: vec![(zero, preheader), (i_next, body)],
+            });
+            // The accumulator phi back-edge value is filled in after the body is lowered (the body
+            // may switch blocks, e.g. an `if` inside the reducer — `patch_phi_incoming`).
+            builder.emit(Instruction::Phi {
+                dst: acc, ty: acc_ty.clone(), incomings: vec![(init, preheader), (acc, body)],
+            });
+            let cond = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::Binary {
+                dst: cond, op: BinOp::Lt, lhs: i, rhs: len, operand_ty: Type::Int64, ty: Type::Bool,
+            });
+            builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
+
+            builder.switch_to(body);
+            let elem = builder.alloc_temp(elem_ty.clone());
+            builder.emit(Instruction::Index {
+                dst: elem, object: iterable, key: i,
+                obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+            });
+            // acc_next = <lambda body>(acc, elem), inlined. The reducer params are (acc, elem).
+            let (acc_next_raw, acc_next_ty) = inline_lambda_body(
+                &lam_params, &lam_body,
+                &[(acc, acc_ty.clone()), (elem, elem_ty.clone())], builder, ctx,
+            );
+            let acc_next = coerce_arg_to_param_repr(acc_next_raw, &acc_next_ty, &acc_ty, builder);
+            let one = builder.const_temp(Const::Int(1, Type::Int64));
+            builder.emit(Instruction::Binary {
+                dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
+            });
+            // The body may have switched blocks; patch both phis' back-edge predecessors + the acc
+            // phi's incoming value to the actual loop-back block / computed accumulator.
+            let back_block = builder.current_block;
+            builder.terminate(Terminator::Jump(header));
+            builder.patch_phi_incoming(header, i, body, back_block);
+            builder.patch_phi_incoming_value(header, acc, acc, acc_next, back_block);
+
+            builder.switch_to(exit);
+            return acc;
+        }
+    }
+
     let init_raw = lower_expr(&args[1], builder, ctx);
     let init = box_to_json(init_raw, &init_ty, builder);
     let f = lower_callback_in_safe_ctx(&args[2], builder, ctx);
-    let elem_ty = iter_elem_type(&iterable_ty);
 
     let len = builder.alloc_temp(Type::Int64);
     builder.emit(Instruction::CallIntrinsic {
