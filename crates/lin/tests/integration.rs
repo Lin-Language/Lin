@@ -3868,9 +3868,11 @@ fn test_ffi_end_to_end_c_library() {
 
 // ── Formatter idempotency ─────────────────────────────────────────────────────
 
-/// Lex, parse, and format a Lin source string. Panics on parse errors.
+/// Lex, parse, and format a Lin source string, preserving comments. Panics on parse errors.
 fn fmt(source: &str) -> String {
-    let tokens = lin_lex::Lexer::new(source, 0).tokenize();
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    let comments = lexer.comments().to_vec();
     let mut parser = lin_parse::Parser::new(tokens);
     let module = parser.parse_module();
     assert!(
@@ -3879,7 +3881,7 @@ fn fmt(source: &str) -> String {
         parser.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>(),
         source
     );
-    lin_parse::Formatter::new().format_module(&module)
+    lin_parse::Formatter::with_comments(source, comments).format_module(&module)
 }
 
 #[test]
@@ -3920,6 +3922,119 @@ val result = items.filter(x => x > 2).map(x => x * 10).reduce(0, (a, b) => a + b
         formatted_once, formatted_twice,
         "formatter is not idempotent!\nFirst pass:\n{}\nSecond pass:\n{}",
         formatted_once, formatted_twice
+    );
+}
+
+#[test]
+fn test_fmt_preserves_leading_comments() {
+    // Own-line comments at top level and inside a block (function body) must survive
+    // as leading lines on the statement that follows them, at that statement's indent.
+    let source = r#"import { print } from "std/io"
+
+// top-level leading comment
+val x = 1
+
+val f = (n: Int32): Int32 =>
+  // in-block leading comment
+  val y = n + 1
+  y
+"#;
+    let out = fmt(source);
+    assert!(out.contains("// top-level leading comment\nval x = 1"), "top-level leading comment lost or misplaced:\n{}", out);
+    assert!(out.contains("  // in-block leading comment\n  val y = n + 1"), "in-block leading comment lost or misplaced:\n{}", out);
+    // Idempotent.
+    assert_eq!(out, fmt(&out), "leading-comment format not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_preserves_trailing_comments() {
+    // A trailing comment after a single-line statement round-trips with exactly one space.
+    let source = "val x = 1 // note\n";
+    let out = fmt(source);
+    assert!(out.contains("val x = 1 // note"), "trailing comment lost:\n{}", out);
+    // Exactly one space before the comment (no double space, no tab).
+    assert!(!out.contains("val x = 1  // note"), "trailing comment not canonicalised to one space:\n{}", out);
+    // Idempotent.
+    assert_eq!(out, fmt(&out), "trailing-comment format not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_comments_idempotent() {
+    // A fixture mixing own-line, trailing, and indented in-block comments.
+    let source = r#"import { print } from "std/io"
+
+// leading on a val
+val total = 10 // trailing on a val
+
+val classify = (n: Int32): String =>
+  // explain the branch below
+  val label = if n > 0 then "pos" else "nonpos"
+  label // trailing inside a block
+"#;
+    let pass1 = fmt(source);
+    let pass2 = fmt(&pass1);
+    assert_eq!(pass1, pass2, "comment formatting not idempotent\npass1:\n{}\npass2:\n{}", pass1, pass2);
+    // All four comments survive.
+    for needle in ["// leading on a val", "// trailing on a val", "// explain the branch below", "// trailing inside a block"] {
+        assert!(pass1.contains(needle), "comment {:?} dropped:\n{}", needle, pass1);
+    }
+}
+
+/// Count `//` occurrences in a string (proxy for comment count for the corpus sanity check).
+fn count_comments(s: &str) -> usize {
+    s.matches("//").count()
+}
+
+#[test]
+fn test_fmt_corpus_idempotent_and_comments_preserved() {
+    // Corpus guard: format every stdlib/*.lin and examples/**/*.lin twice; pass1 must equal
+    // pass2 (idempotency over the real corpus). Also assert that a single format does not
+    // change the `//` count of any file (no comment loss).
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for dir in ["stdlib", "examples"] {
+        let pattern = format!("{}/{}/**/*.lin", root.display(), dir);
+        for entry in glob::glob(&pattern).unwrap().flatten() {
+            if entry.components().any(|c| c.as_os_str() == ".lin-cache") {
+                continue;
+            }
+            files.push(entry);
+        }
+    }
+    assert!(files.len() > 50, "expected the corpus to have many files, found {}", files.len());
+
+    let mut non_idempotent: Vec<String> = Vec::new();
+    let mut comment_changed: Vec<String> = Vec::new();
+
+    for path in &files {
+        let src = std::fs::read_to_string(path).unwrap();
+        let before = count_comments(&src);
+        let pass1 = fmt(&src);
+        let pass2 = fmt(&pass1);
+        if pass1 != pass2 {
+            non_idempotent.push(path.display().to_string());
+        }
+        let after = count_comments(&pass1);
+        if before != after {
+            comment_changed.push(format!("{} ({} -> {})", path.display(), before, after));
+        }
+    }
+
+    assert!(
+        non_idempotent.is_empty(),
+        "formatter not idempotent on corpus files: {:?}",
+        non_idempotent
+    );
+    assert!(
+        comment_changed.is_empty(),
+        "comment count changed when formatting corpus files: {:?}",
+        comment_changed
     );
 }
 
