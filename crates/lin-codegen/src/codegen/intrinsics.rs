@@ -521,6 +521,29 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(close_fn, &[worker.into()], "");
                 ptr_ty.const_null().into()
             }
+            // openRead(path) → lin_fs_open(path) → boxed Stream<UInt8[]> (TAG_STREAM) OR a
+            // boxed Error object. Both are TaggedVal*, so the union result needs no unboxing.
+            // The path arg is a String (raw LinString* or boxed Str); pass it through — the
+            // runtime's resolve_lin_str tolerates both shapes (mirrors the lin_fs_* family).
+            Intrinsic::StreamOpen => {
+                let path = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let f = self.get_or_declare_fn("lin_fs_open", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(f, &[path.into()], "ir_stream_open").try_as_basic_value().unwrap_basic()
+            }
+            // read(stream) → lin_stream_read(stream) → boxed `T | Null | Error` (chunk = flat
+            // UInt8[] array box, EOF = null, error = Error object). Always a TaggedVal*; the
+            // result type is a union, so leave it boxed for the caller to inspect.
+            Intrinsic::StreamRead => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let f = self.get_or_declare_fn("lin_stream_read", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(f, &[s.into()], "ir_stream_read").try_as_basic_value().unwrap_basic()
+            }
+            // close(stream) → lin_stream_close(stream) → Null (idempotent).
+            Intrinsic::StreamClose => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let f = self.get_or_declare_fn("lin_stream_close", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(f, &[s.into()], "ir_stream_close").try_as_basic_value().unwrap_basic()
+            }
             // lin_object_set(obj, key, val) => Null. Unbox obj→LinObject*, key→LinString*,
             // box val→TaggedVal*, then call the runtime. Mirrors the AST handler.
             Intrinsic::ObjectSetDyn => {

@@ -207,6 +207,23 @@ impl Checker {
         // worker.close(): (Worker) => Null
         self.define_intrinsic("lin_close", Type::func(vec![Type::TypeVar(9109)], Type::Null));
 
+        // Stream<T> — opaque, effectful, fallible pull-source (streams brief, ADR-072). These
+        // intrinsic signatures are the SOLE source of a `Stream<T>` type: `Stream` is not
+        // spellable in source annotations (no `resolve.rs` case), so stdlib wrappers obtain it by
+        // inference from these returns. Reading yields `T | Null | Error` (Null = EOF, the
+        // fallible-stdlib error shape on I/O failure); opening yields `Stream<UInt8[]> | Error`.
+        //   openRead: (String) => Stream<UInt8[]> | Error
+        //   read:     <T>(Stream<T>) => T | Null | Error
+        //   close:    <T>(Stream<T>) => Null
+        let byte_chunk = || Type::Array(Box::new(Type::UInt8));
+        self.define_intrinsic("lin_fs_open", Type::func(vec![Type::Str],
+            Type::Union(vec![Type::Stream(Box::new(byte_chunk())), crate::resolve::error_type()])));
+        let stream_t = || Type::TypeVar(9160);
+        self.define_intrinsic("lin_stream_read", Type::func(vec![Type::Stream(Box::new(stream_t()))],
+            Type::Union(vec![stream_t(), Type::Null, crate::resolve::error_type()])));
+        self.define_intrinsic("lin_stream_close",
+            Type::func(vec![Type::Stream(Box::new(Type::TypeVar(9161)))], Type::Null));
+
         // serve: ((Request) => Response, Int32) => Null  (spec §25.5). Handler-first so
         // `router.serve(port)` desugars to `serve(router, port)`. Blocks forever; typed Null.
         self.define_intrinsic("lin_serve", Type::func(vec![

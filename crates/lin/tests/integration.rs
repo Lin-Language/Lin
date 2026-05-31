@@ -3420,6 +3420,38 @@ print(content)
     assert_eq!(output, vec!["hello from lin"]);
 }
 
+// Stage 3 (streams): open a file as a byte Stream<UInt8[]>, pull chunks until EOF, and count
+// the bytes read. Exercises lin_fs_open → lin_stream_read end-to-end (open + read bytes), the
+// TAG_STREAM box flowing through a `val`, and the EOF (Null) / chunk discrimination.
+#[test]
+fn test_stream_open_read_bytes_end_to_end() {
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_stream_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let path = tmp.display().to_string();
+    // 13 bytes of content.
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ length }} from "std/array"
+import {{ writeFile, openRead, readChunk }} from "std/fs"
+
+val countBytes = (s, acc: Int32): Int32 =>
+  val chunk = readChunk(s)
+  match chunk
+    is Null => acc
+    is Error => acc
+    else => countBytes(s, acc + length(chunk))
+
+writeFile("{path}", "hello, stream")
+val stream = openRead("{path}")
+val total = match stream
+  is Error => 0 - 1
+  else => countBytes(stream, 0)
+print(toString(total))
+"#));
+    let _ = fs::remove_file(&tmp);
+    assert_eq!(output, vec!["13"]);
+}
+
 #[test]
 fn test_fs_append_file() {
     let tmp = std::env::temp_dir().join(format!("lin_ctest_append_{}.txt", std::process::id()));

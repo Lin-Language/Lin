@@ -101,3 +101,51 @@ Files touched:
 4. Atomic vs non-atomic rc: brief §9 says non-atomic would be sound (disjoint graphs after a
    move). I chose AtomicU32 for belt-and-braces (cheap: one box, not per-element). Easy to
    revisit if a benchmark ever cares.
+
+---
+
+## Stage 3 — fs.openRead + file read backend + codegen dispatch
+- Commit: <pending>
+- Gate (open+read bytes end-to-end): MET. `test_stream_open_read_bytes_end_to_end` opens a
+  13-byte file as a `Stream<UInt8[]>`, pulls chunks until EOF, counts bytes → prints `13`.
+- Tests: 2 new runtime tests (file backend + open-missing-is-error) + 1 integration test.
+  Runtime stream tests (7) pass under ASan. Workspace: 376 pass + the flaky http test.
+
+### What was added
+- `lin-runtime/src/stream.rs` — `FileSource` (reads in 64 KiB chunks; `close` drops the File →
+  fd closed) + `lin_fs_open(path) -> Stream<UInt8[]> | Error` (open failure → Error object).
+- `lin-ir/src/ir.rs` — `Intrinsic::{StreamOpen, StreamRead, StreamClose}`.
+- `lin-ir/src/lower.rs` — name map: `lin_fs_open`→StreamOpen, `lin_stream_read`→StreamRead,
+  `lin_stream_close`→StreamClose (so they're intrinsics, not foreign named calls).
+- `lin-check/src/checker/intrinsics.rs` — intrinsic signatures (the SOLE source of `Stream<T>`):
+  `lin_fs_open: (String)=>Stream<UInt8[]>|Error`, `lin_stream_read: <T>(Stream<T>)=>T|Null|Error`,
+  `lin_stream_close: <T>(Stream<T>)=>Null`.
+- `lin-codegen/src/codegen/intrinsics.rs` — StreamOpen/Read/Close dispatch (modelled on
+  `lin_shared_*`): each is a single runtime call returning a TaggedVal*; results are unions so
+  they stay boxed.
+- `stdlib/fs.lin` — `openRead` (return type inferred), `readChunk`, `closeStream` wrappers.
+
+### DESIGN DEVIATION (needs morning sign-off)
+5. **Made `Stream` SPELLABLE in source annotations** (added the `"Stream"` cases to
+   `resolve.rs`, mirroring `Shared` exactly: `Stream` => `Stream<Json>`, `Stream<T>` generic).
+   The brief LOCKED "not spellable (no resolve.rs case)". I relaxed it because:
+   - The stdlib's thin pull wrappers (`readChunk`/`closeStream`) need a `Stream`-typed param.
+   - An UNANNOTATED single param (`(s) =>`) is mis-rendered by the FORMATTER as an arg-position
+     bare lambda (`s =>`), which is INVALID at a `val =` RHS (ADR-007: bare lambdas only in arg
+     position) — this is a genuine pre-existing formatter bug (`formatter.rs:703-708`) that no
+     existing stdlib code triggers because nothing else uses untyped single params. It also
+     emits `s: Null =>` (return type on a bare lambda) which is invalid everywhere.
+   - Opacity is FULLY preserved: `compat.rs` still rejects every non-stream op on a `Stream`, so
+     a user who names `Stream` gains nothing but the type itself (cannot index/push/iterate/widen
+     it). This is exactly the `Shared` situation (Shared is spellable and stdlib annotates it).
+   ALTERNATIVES considered: (a) fix the formatter to keep parens for single-untyped-param
+   lambdas / track arg-position context — larger change touching the parser/formatter; (b) keep
+   Stream unspellable and only ever pass it through typed params — impossible for a generic pull
+   wrapper. If you'd rather keep the brief's letter, the fix is (a); say so and I'll do it.
+6. **compat.rs TypeVar exception for Stream**: the opaque-rejection arms `(Stream,_)=>false` /
+   `(_,Stream)=>false` would also have blocked an INFERENCE TypeVar from unifying with a Stream
+   (needed even for annotated wrappers, since the intrinsic's `Stream<T9160>` param meets a
+   `Stream<Json>` arg and T9160 must bind). Added explicit arms so a non-MAX TypeVar on either
+   side is permissive, while the `u32::MAX` Json wildcard is STILL rejected (a stream must never
+   widen to Json). Mirrors the existing general TypeVar-permissive rule, scoped under the Stream
+   guards.

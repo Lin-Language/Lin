@@ -121,6 +121,13 @@ pub enum Intrinsic {
     Request,
     Message,
     Close,
+    // Stream<T> — opaque, effectful, fallible pull-source owning an OS resource (streams brief,
+    // ADR-072). `StreamOpen` opens a file source → `Stream<UInt8[]> | Error`; `StreamRead` pulls
+    // the next chunk → `UInt8[] | Null | Error` (Null = EOF); `StreamClose` closes the resource
+    // (idempotent). Dispatch is modelled on the `Shared*` family.
+    StreamOpen,
+    StreamRead,
+    StreamClose,
     /// `fromJson` type-directed decode (ADR-047). Carries the resolved target `Type` T and the
     /// resolved bodies of every reachable `Named` type (so codegen can build a recursive schema
     /// descriptor with no type environment). Runtime: `lin_from_json(value, descriptor) -> ptr`

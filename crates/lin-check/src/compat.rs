@@ -79,10 +79,22 @@ pub fn is_compatible_env(
 
         // `Stream<T>` is covariant in T (a `Stream<U>` flows into a `Stream<T>` when `U` is
         // compatible with `T`) but, like `Shared`, is opaque: it does NOT widen to `Json` nor
-        // unify with any other type, so the only legal operations are the stream-API intrinsics
-        // whose signatures take `Stream<T>` explicitly. These arms come BEFORE the `Json`
-        // wildcard so a stream can never silently flow into a `Json` sink (streams brief §1).
+        // unify with any other CONCRETE type, so the only legal operations are the stream-API
+        // intrinsics whose signatures take `Stream<T>` explicitly. These arms come BEFORE the
+        // `Json` wildcard so a stream can never silently flow into a `Json` sink (brief §1).
+        //
+        // The one exception is an inference/generic TypeVar on the OTHER side: `Stream` IS
+        // spellable only via the intrinsic returns, so the stdlib's thin wrappers take it through
+        // UNANNOTATED params (`readChunk = (s) => lin_stream_read(s)`) whose fresh inference var
+        // must unify with `Stream<T>`. We therefore DON'T reject when the other side is a TypeVar
+        // — that case falls through to the bidirectional-permissive TypeVar arm below (which both
+        // accepts and lets the arg's inference var bind to the stream type). The `u32::MAX` Json
+        // wildcard is NOT a TypeVar exception here: a `Stream` must never widen to `Json`, so the
+        // explicit guards below reject it before the permissive arm.
         (Type::Stream(a), Type::Stream(b)) => is_compatible_env(a, b, env, lenient_json, depth),
+        (Type::Stream(_), Type::TypeVar(n)) if *n == u32::MAX => false,
+        (Type::TypeVar(n), Type::Stream(_)) if *n == u32::MAX => false,
+        (Type::Stream(_), Type::TypeVar(_)) | (Type::TypeVar(_), Type::Stream(_)) => true,
         (Type::Stream(_), _) => false,
         (_, Type::Stream(_)) => false,
 

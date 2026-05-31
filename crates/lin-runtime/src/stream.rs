@@ -148,6 +148,58 @@ unsafe fn close_box(b: *const StreamBox) {
 }
 
 // -------------------------------------------------------------------------
+// File read backend (Stage 3). Reads a file in fixed-size byte chunks.
+// -------------------------------------------------------------------------
+
+/// Default read chunk size (bytes). Each `read` pulls up to this many bytes; a short read at the
+/// tail still produces a chunk, and the following read returns EOF.
+const FILE_CHUNK: usize = 64 * 1024;
+
+/// A read backend over an open file. Owns the `File` (closing it drops the fd).
+struct FileSource {
+    file: Option<std::fs::File>,
+}
+
+impl StreamSource for FileSource {
+    fn read(&mut self) -> Result<Option<Vec<u8>>, String> {
+        use std::io::Read;
+        let f = match self.file.as_mut() {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let mut buf = vec![0u8; FILE_CHUNK];
+        match f.read(&mut buf) {
+            Ok(0) => Ok(None), // EOF
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(Some(buf))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+    fn close(&mut self) {
+        // Drop the File — its Drop closes the fd. Idempotent (the box guards double-close).
+        self.file.take();
+    }
+}
+
+/// `openRead(path)` → open `path` for reading and return a boxed `Stream<UInt8[]>`
+/// (TaggedVal*(TAG_STREAM)). On open failure, returns a `{ type:"error", message }` tagged
+/// object instead of a stream — so the result type is `Stream<UInt8[]> | Error` and the caller
+/// branches on `is Error` before using the stream (matches the canonical fallible-stdlib shape).
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_open(path: *const u8) -> *mut u8 {
+    let path_str = match crate::fs::resolve_lin_str(path) {
+        Some(s) => s,
+        None => return crate::fs::make_error_tagged("invalid UTF-8 path"),
+    };
+    match std::fs::File::open(&path_str) {
+        Ok(file) => StreamBox::new_boxed(Box::new(FileSource { file: Some(file) })),
+        Err(e) => crate::fs::make_error_tagged(&e.to_string()),
+    }
+}
+
+// -------------------------------------------------------------------------
 // C-callable ABI (codegen dispatch + stdlib wrappers call these).
 // -------------------------------------------------------------------------
 
@@ -323,6 +375,46 @@ mod tests {
             assert!(matches!(stream_read_outcome(s), ReadOutcome::Err(_)));
             crate::tagged::lin_tagged_release(s);
             assert_eq!(cc.load(Ordering::SeqCst), 1, "errored stream still closes once");
+        }
+    }
+
+    #[test]
+    fn file_source_reads_bytes_then_eof_and_closes() {
+        unsafe {
+            let path = "/tmp/lin_stream_file_source_test.bin";
+            std::fs::write(path, b"hello stream").unwrap();
+            let path_str = crate::string::lin_string_from_bytes(path.as_ptr(), path.len() as u32);
+            let path_tagged = crate::tagged::alloc_tagged(crate::tagged::TAG_STR, path_str as u64);
+
+            let s = lin_fs_open(path_tagged as *const u8);
+            assert_eq!(crate::tagged::lin_get_tag(s), TAG_STREAM, "openRead yields a Stream");
+
+            // First read: the whole file (< chunk size).
+            match stream_read_outcome(s) {
+                ReadOutcome::Chunk(b) => assert_eq!(&b, b"hello stream"),
+                _ => panic!("expected a chunk"),
+            }
+            // Next read: EOF.
+            assert!(matches!(stream_read_outcome(s), ReadOutcome::Eof));
+
+            crate::tagged::lin_tagged_release(s); // finalizer closes the fd (no double-close)
+            crate::tagged::lin_tagged_release(path_tagged);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn open_missing_file_is_error() {
+        unsafe {
+            let path = "/tmp/lin_stream_definitely_missing_file_xyz.bin";
+            let _ = std::fs::remove_file(path);
+            let path_str = crate::string::lin_string_from_bytes(path.as_ptr(), path.len() as u32);
+            let path_tagged = crate::tagged::alloc_tagged(crate::tagged::TAG_STR, path_str as u64);
+            let r = lin_fs_open(path_tagged as *const u8);
+            // An open failure is an Error object, NOT a stream.
+            assert_eq!(crate::tagged::lin_get_tag(r), crate::tagged::TAG_OBJECT);
+            crate::tagged::lin_tagged_release(r);
+            crate::tagged::lin_tagged_release(path_tagged);
         }
     }
 
