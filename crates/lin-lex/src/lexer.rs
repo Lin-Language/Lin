@@ -1,4 +1,4 @@
-use lin_common::Span;
+use lin_common::{Span, NumSuffix};
 use crate::token::{Token, TokenKind};
 
 pub struct Lexer {
@@ -39,6 +39,23 @@ impl Lexer {
             if is_eof {
                 break;
             }
+        }
+        // Mark each token whose preceding gap (since the previous token ended) contains a
+        // source newline. Explicit `Newline` tokens already signal line breaks at the top
+        // level; this additionally surfaces breaks that were suppressed inside `()`/`[]`/`{}`
+        // (ADR-004), which the parser needs to keep a line-leading `[`/`(` from gluing onto the
+        // previous expression as an index/call. Spans are char offsets into `source`.
+        let mut prev_end = 0usize;
+        for tok in tokens.iter_mut() {
+            let start = tok.span.start as usize;
+            if start > prev_end
+                && self.source[prev_end..start.min(self.source.len())]
+                    .iter()
+                    .any(|&c| c == '\n')
+            {
+                tok.newline_before = true;
+            }
+            prev_end = prev_end.max(tok.span.end as usize);
         }
         tokens
     }
@@ -141,6 +158,16 @@ impl Lexer {
         if ch == '|' && self.peek_at(1) == Some('|') {
             return;
         }
+        // A line beginning with `.method` is a dot-chain continuation of the previous
+        // expression, not a new block (spec §3.2; mirrors the `&&`/`||` suppression above
+        // and ADR-006/013). Suppressing INDENT/DEDENT here keeps the enclosing block's
+        // indentation accounting balanced when the chain is bound to a `val` inside a
+        // function body (the postfix loop still chains via skip_newlines_and_indent).
+        // Restricted to `.` followed by an identifier char so the range/spread `...`
+        // token is unaffected.
+        if ch == '.' && self.peek_at(1).is_some_and(|c| c.is_alphabetic() || c == '_') {
+            return;
+        }
 
         let current = *self.indent_stack.last().unwrap();
         if indent > current {
@@ -189,7 +216,12 @@ impl Lexer {
             return true;
         }
         let prev = self.source[self.pos - 1];
-        matches!(prev, '(' | ',' | '=' | ':' | ' ')
+        // `-` begins a negative literal (not a binary subtraction) when it follows a token that
+        // cannot end an expression: an opener `( [`, a separator `, =  :`, or whitespace. After
+        // `[` specifically, `-1` is an array element, so `[-1, ...]` must lex like `[ -1, ...]`
+        // (otherwise the `0 - 1` Sub it would become types as Int32 and can't narrow to e.g.
+        // Int8[]).
+        matches!(prev, '(' | '[' | ',' | '=' | ':' | ' ')
     }
 
     fn lex_string(&mut self) -> Token {
@@ -332,7 +364,7 @@ impl Lexer {
             self.pos += 1;
         }
 
-        if self.pos < self.source.len() && self.source[self.pos] == '.' && self.peek_at(1).map_or(false, |c| c.is_ascii_digit()) {
+        if self.pos < self.source.len() && self.source[self.pos] == '.' && self.peek_at(1).is_some_and(|c| c.is_ascii_digit()) {
             is_float = true;
             num_str.push('.');
             self.pos += 1;
@@ -358,28 +390,43 @@ impl Lexer {
             }
         }
 
-        // Skip type suffixes (i8, u32, f32, etc.) - we just consume them
-        while self.pos < self.source.len() && (self.source[self.pos].is_alphabetic() || self.source[self.pos].is_ascii_digit()) {
+        // Capture a type suffix (i8, u32, f32, etc.). It begins with i/u/f followed by digits.
+        // The suffix is parsed into a NumSuffix and carried on the token so the checker can pin
+        // the literal's type (spec §3.6); an unrecognised suffix is ignored (kept as None).
+        let mut suffix_str = String::new();
+        if self.pos < self.source.len() {
             let c = self.source[self.pos];
             if c == 'i' || c == 'u' || c == 'f' {
+                suffix_str.push(c);
                 self.pos += 1;
                 while self.pos < self.source.len() && self.source[self.pos].is_ascii_digit() {
+                    suffix_str.push(self.source[self.pos]);
                     self.pos += 1;
                 }
-            } else {
-                break;
             }
+        }
+        let suffix = NumSuffix::parse(&suffix_str);
+        // A float suffix (or a decimal point/exponent) makes this a float literal even if the
+        // mantissa had no '.', e.g. `42f32`.
+        if suffix.map(|s| s.is_float()).unwrap_or(false) {
+            is_float = true;
         }
 
         let span = self.span(start, self.pos);
         if is_float {
             let val: f64 = num_str.parse().unwrap_or(0.0);
             let val = if negative { -val } else { val };
-            Token::new(TokenKind::FloatLit(val), span)
+            Token::new(TokenKind::FloatLit(val, suffix), span)
         } else {
-            let val: i64 = num_str.parse().unwrap_or(0);
+            // Parse as i64 when in range; otherwise fall back to u64 and store its bit
+            // pattern (so UInt64 literals > i64::MAX, e.g. 18446744073709551615, survive into
+            // codegen — they are re-read as u64 via the UInt64 tag).
+            let val: i64 = match num_str.parse::<i64>() {
+                Ok(v) => v,
+                Err(_) => num_str.parse::<u64>().map(|u| u as i64).unwrap_or(0),
+            };
             let val = if negative { -val } else { val };
-            Token::new(TokenKind::IntLit(val), span)
+            Token::new(TokenKind::IntLit(val, suffix), span)
         }
     }
 
@@ -394,7 +441,37 @@ impl Lexer {
         }
         let val = i64::from_str_radix(&num_str, 16).unwrap_or(0);
         let val = if negative { -val } else { val };
-        Token::new(TokenKind::IntLit(val), self.span(start, self.pos))
+        let suffix = self.lex_int_suffix();
+        Token::new(TokenKind::IntLit(val, suffix), self.span(start, self.pos))
+    }
+
+    /// Consume an integer type suffix (i8/u32/...) following a hex/binary/octal literal, if
+    /// present, and parse it into a NumSuffix. A float suffix is not valid on these forms and
+    /// is left unconsumed (it would lex as a following identifier — an error downstream).
+    fn lex_int_suffix(&mut self) -> Option<NumSuffix> {
+        if self.pos >= self.source.len() {
+            return None;
+        }
+        let c = self.source[self.pos];
+        if c != 'i' && c != 'u' {
+            return None;
+        }
+        let mark = self.pos;
+        let mut s = String::new();
+        s.push(c);
+        self.pos += 1;
+        while self.pos < self.source.len() && self.source[self.pos].is_ascii_digit() {
+            s.push(self.source[self.pos]);
+            self.pos += 1;
+        }
+        match NumSuffix::parse(&s) {
+            Some(suf) => Some(suf),
+            None => {
+                // Not a real suffix — rewind so it lexes as whatever follows.
+                self.pos = mark;
+                None
+            }
+        }
     }
 
     fn lex_binary(&mut self, start: usize, negative: bool) -> Token {
@@ -408,7 +485,8 @@ impl Lexer {
         }
         let val = i64::from_str_radix(&num_str, 2).unwrap_or(0);
         let val = if negative { -val } else { val };
-        Token::new(TokenKind::IntLit(val), self.span(start, self.pos))
+        let suffix = self.lex_int_suffix();
+        Token::new(TokenKind::IntLit(val, suffix), self.span(start, self.pos))
     }
 
     fn lex_octal(&mut self, start: usize, negative: bool) -> Token {
@@ -422,7 +500,8 @@ impl Lexer {
         }
         let val = i64::from_str_radix(&num_str, 8).unwrap_or(0);
         let val = if negative { -val } else { val };
-        Token::new(TokenKind::IntLit(val), self.span(start, self.pos))
+        let suffix = self.lex_int_suffix();
+        Token::new(TokenKind::IntLit(val, suffix), self.span(start, self.pos))
     }
 
     fn lex_ident_or_keyword(&mut self) -> Token {
@@ -499,7 +578,7 @@ impl Lexer {
                     self.pos += 1;
                     TokenKind::NotEq
                 } else {
-                    TokenKind::Ident("!".to_string())
+                    TokenKind::Bang
                 }
             }
             '<' => {

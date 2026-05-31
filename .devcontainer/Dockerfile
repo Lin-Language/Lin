@@ -20,6 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     lld-22 \
     lldb-22 \
     pkg-config \
+    # LLVM 22's static libs reference zstd; linking lin needs the libzstd.so dev
+    # symlink (the runtime libzstd1 alone gives only .so.1 → "-lzstd not found").
+    libzstd-dev \
     && rm -rf /var/lib/apt/lists/* \
     && update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-22 100 \
     && update-alternatives --install /usr/bin/clang clang /usr/bin/clang-22 100 \

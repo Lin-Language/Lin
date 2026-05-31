@@ -1,0 +1,40 @@
+// Integration suite — the full encode -> decode flow across tlv.lin (and the
+// bit helpers it sits alongside). Drives realistic multi-field messages end to
+// end and includes a churn case as an ASan guard against flat-array RC corruption.
+
+import { expect, toBe, test, suite, run } from "std/test"
+import { encode, decode } from "./tlv"
+import { length } from "std/array"
+
+val s = suite("codec-integration", [
+  // --- Realistic multi-field message survives a full round-trip ---
+  test("encode -> decode preserves a realistic message", () =>
+    val fields = [
+      { "tag": 1, "bytes": [72, 105] },
+      { "tag": 2, "bytes": [255, 0, 128] }
+    ]
+    val back = decode(encode(fields))
+    [
+      expect(length(back)).toBe(2),
+      expect(back[0]["tag"]).toBe(1),
+      expect(back[0]["bytes"]).toBe([72, 105]),
+      expect(back[1]["tag"]).toBe(2),
+      expect(back[1]["bytes"]).toBe([255, 0, 128])
+    ]
+  ),
+
+  // --- Churn: many fields encode/decode without flat-array RC corruption ---
+  test("round-trips a large multi-field message", () =>
+    val many = [
+      { "tag": 1, "bytes": [1] }, { "tag": 2, "bytes": [2, 2] }, { "tag": 3, "bytes": [3, 3, 3] },
+      { "tag": 4, "bytes": [4] }, { "tag": 5, "bytes": [5, 5] }, { "tag": 6, "bytes": [6, 6, 6] },
+      { "tag": 7, "bytes": [7] }, { "tag": 8, "bytes": [8, 8] }, { "tag": 9, "bytes": [9, 9, 9] }
+    ]
+    val back = decode(encode(many))
+    [
+      expect(length(back)).toBe(9),
+      expect(back[8]["bytes"]).toBe([9, 9, 9])
+    ]
+  ),
+])
+run(s)

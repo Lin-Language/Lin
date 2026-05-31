@@ -1,0 +1,118 @@
+// RTP packetizer for H.264 (RFC 6184) — Lin port of server/src/rtp.rs.
+//
+// Packetizes one NAL unit into one or more RTP packets:
+//   nal.len() <= MAX_RTP_PAYLOAD  →  Single NAL Unit Mode (header ++ nal)
+//   nal.len() >  MAX_RTP_PAYLOAD  →  FU-A fragmentation (RFC 6184 §5.8)
+//
+// STATE THREADING: the Rust RtpPacketizer is a mutable struct (sequence,
+// timestamp, ssrc) whose `sequence` increments on every header write. Lin has no
+// mutable struct, and (as of this milestone) reading a UInt16/UInt32 field back
+// out of a boxed Json object does not round-trip in codegen — only Int32 does.
+// So state is threaded FUNCTIONALLY as explicit typed scalar parameters rather
+// than a state object:
+//   - `packetize(seq, ts, ssrc, nal, marker)` returns the packets (array of
+//     UInt8[]); it does NOT mutate anything.
+//   - `nextSequence(seq, nal)` returns the sequence number AFTER packetizing that
+//     NAL (advanced by the number of packets it produced: 1 for single-NAL mode,
+//     N for FU-A). The caller chains it into the next `packetize` call — the
+//     functional equivalent of `&mut self.sequence`.
+//   - `advanceTimestamp(ts)` returns the next frame's timestamp.
+// seq is UInt16 and ts/ssrc are UInt32, exactly the wire field widths; the byte
+// helpers (u16ToBe/u32ToBe) consume them directly.
+//
+// Stdlib used:
+//   std/bytes  — u16ToBe / u32ToBe (big-endian header fields)
+//   std/array  — concat (flat UInt8[]), slice, length, push
+//   std/number — toUInt8 (compose FU indicator / header bytes)
+
+import { u16ToBe, u32ToBe } from "std/bytes"
+import { concat, slice, length, push } from "std/array"
+import { toUInt8 } from "std/number"
+
+export val RTP_HEADER_SIZE = 12
+export val MAX_RTP_PAYLOAD = 1200      // smaller fragments survive lossy WiFi
+export val PAYLOAD_TYPE = 96           // dynamic PT for H.264
+val CLOCK_RATE = 90000
+export val TIMESTAMP_INCREMENT: UInt32 = 3000  // CLOCK_RATE / 30 (30 fps)
+
+// Byte-0 is constant (V=2, P=0, X=0, CC=0). Byte-1 is M-bit + payload type.
+val hdrNoMarker: UInt8[] = [0x80, 0x60]   // 0x60 = PAYLOAD_TYPE (96)
+val hdrMarker: UInt8[] = [0x80, 0xE0]     // 0xE0 = 0x80 | 96
+
+// Advance the timestamp by one frame period. (u32 wrap is not modelled — frames
+// would have to run for ~16 hours at 30fps before TIMESTAMP_INCREMENT overflows.)
+export val advanceTimestamp = (ts: UInt32): UInt32 => ts + TIMESTAMP_INCREMENT
+
+// How many RTP packets a NAL produces: 0 if empty, 1 if it fits in one packet,
+// else the FU-A fragment count (ceil(payloadLen / maxFragment)).
+export val packetCount = (nal: UInt8[]): Int32 =>
+  if length(nal) == 0 then 0
+  else if length(nal) <= MAX_RTP_PAYLOAD then 1
+  else
+    val payloadLen = length(nal) - 1            // skip the NAL header byte
+    val maxFrag = MAX_RTP_PAYLOAD - 2           // FU indicator + FU header
+    (payloadLen + maxFrag - 1) / maxFrag        // ceil division
+
+// Advance a UInt16 sequence by n (one +1 step per packet). `seq + 1` stays
+// UInt16; an Int32 count does not coerce into a UInt16 add, so step it.
+val addSeq = (seq: UInt16, n: Int32): UInt16 =>
+  if n <= 0 then seq else addSeq(seq + 1, n - 1)
+
+// Sequence number after packetizing `nal` (advanced by its packet count).
+// The caller threads this into the next packetize call — the functional
+// equivalent of the Rust `self.sequence.wrapping_add(...)`.
+export val nextSequence = (seq: UInt16, nal: UInt8[]): UInt16 =>
+  addSeq(seq, packetCount(nal))
+
+// Write a 12-byte RTP header. Mirrors Rust write_header (sequence advance is the
+// caller's job via nextSequence).
+export val writeHeader = (seq: UInt16, ts: UInt32, ssrc: UInt32, marker: Boolean): UInt8[] =>
+  val b1: UInt8[] = if marker then hdrMarker else hdrNoMarker
+  concat(concat(concat(b1, u16ToBe(seq)), u32ToBe(ts)), u32ToBe(ssrc))
+
+// Single NAL Unit Mode: header ++ nal verbatim.
+val makeSingleNal = (seq: UInt16, ts: UInt32, ssrc: UInt32, nal: UInt8[], marker: Boolean): UInt8[] =>
+  concat(writeHeader(seq, ts, ssrc, marker), nal)
+
+// Compose the [FU-indicator, FU-header] two-byte prefix for an FU-A fragment.
+// fu_indicator = (nal[0] & 0x60) | 28 ; fu_header = (nal[0] & 0x1F) | start | end.
+val fuPrefix = (nalHdr: UInt8, first: Boolean, last: Boolean): UInt8[] =>
+  val nri: UInt8 = nalHdr & 0x60
+  val nt: UInt8 = nalHdr & 0x1F
+  val withStart: UInt8 = if first then toUInt8(nt | 0x80) else nt
+  val withEnd: UInt8 = if last then toUInt8(withStart | 0x40) else withStart
+  val fuInd: UInt8 = toUInt8(nri | 28)
+  [fuInd, withEnd]
+
+// Recursive FU-A fragmentation over `payload` (NAL bytes after the header byte).
+// `seq` advances per fragment. Each fragment: RTP header (marker only on the last
+// fragment, when `marker`) ++ [FU-I, FU-H] ++ fragment bytes.
+val fragLoop = (seq: UInt16, ts: UInt32, ssrc: UInt32, nalHdr: UInt8, payload: UInt8[], offset: Int32, maxFrag: Int32, marker: Boolean, acc: Json[]): Null =>
+  if offset >= length(payload) then null
+  else
+    val plen = length(payload)
+    val end = if offset + maxFrag < plen then offset + maxFrag else plen
+    val first = offset == 0
+    val last = end == plen
+    val header = writeHeader(seq, ts, ssrc, marker && last)
+    val prefix = fuPrefix(nalHdr, first, last)
+    val fragment: UInt8[] = slice(payload, offset, end)
+    val packet = concat(concat(header, prefix), fragment)
+    val pushed = push(acc, packet)
+    fragLoop(seq + 1, ts, ssrc, nalHdr, payload, end, maxFrag, marker, acc)
+
+// Packetize one NAL unit into its RTP packets (array of UInt8[]). An empty NAL
+// produces no packets, matching Rust. Sequence threading is the caller's job:
+// pass the current seq, then advance it with nextSequence for the next call.
+export val packetize = (seq: UInt16, ts: UInt32, ssrc: UInt32, nal: UInt8[], marker: Boolean): Json =>
+  val packets: Json[] = []
+  if length(nal) == 0 then
+    packets
+  else if length(nal) <= MAX_RTP_PAYLOAD then
+    val one = push(packets, makeSingleNal(seq, ts, ssrc, nal, marker))
+    packets
+  else
+    val maxFrag = MAX_RTP_PAYLOAD - 2
+    val payload: UInt8[] = slice(nal, 1, length(nal))
+    val done = fragLoop(seq, ts, ssrc, nal[0], payload, 0, maxFrag, marker, packets)
+    packets

@@ -1,0 +1,28 @@
+// Benchmark: Worker request/reply round-trip throughput.
+//
+// One long-lived worker thread processes a stream of blocking `request` calls.
+// Each request copies the message in, hands it to the handler on the worker
+// thread, and blocks for the reply over a oneshot channel. Looping N requests
+// isolates the mailbox send + handler-dispatch + reply round-trip cost (the
+// handler also accumulates confined `var` state, §32.6.4).
+import { print } from "std/io"
+import { toString } from "std/string"
+import { worker, request, close } from "std/async"
+import { for, range } from "std/array"
+
+// Confined accumulator: each request adds its message to a running total kept on
+// the worker thread, and replies with the new total.
+var total = 0
+val acc = worker(
+  n =>
+    total = total + n
+    total,
+  () => null
+)
+
+var last = 0
+range(0, 50000).for(i => last = request(acc, 1))
+close(acc)
+
+// `last` is the final running total = number of requests.
+print(toString(last))

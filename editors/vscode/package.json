@@ -5,9 +5,10 @@
   "version": "0.3.0",
   "publisher": "LinusN",
   "license": "MIT",
+  "icon": "icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/linusnorton/lin-lang"
+    "url": "https://github.com/Lin-Language/Lin"
   },
   "keywords": ["lin", "programming language", "compiler"],
   "engines": {
@@ -20,7 +21,8 @@
     "onLanguage:lin",
     "onCommand:lin.build",
     "onCommand:lin.run",
-    "onCommand:lin.test"
+    "onCommand:lin.test",
+    "onCommand:lin.installOnPath"
   ],
   "main": "./client.js",
   "contributes": {
@@ -53,6 +55,11 @@
       {
         "command": "lin.test",
         "title": "Test",
+        "category": "Lin"
+      },
+      {
+        "command": "lin.installOnPath",
+        "title": "Install `lin` on PATH (all terminals)",
         "category": "Lin"
       }
     ]

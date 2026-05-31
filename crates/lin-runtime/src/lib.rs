@@ -4,18 +4,27 @@
 
 pub mod array;
 pub mod async_rt;
+pub mod decode;
 pub mod env;
+pub mod fault;
+pub mod frozen;
 pub mod fs;
 pub mod http;
 pub mod io;
 pub mod json;
 pub mod math;
 pub mod memory;
+pub mod net;
 pub mod number;
 pub mod object;
 pub mod path;
+pub mod shared;
+pub mod process;
 pub mod server;
+pub mod signal;
 pub mod string;
 pub mod tagged;
 pub mod template;
 pub mod time;
+pub mod transfer;
+pub mod tty;

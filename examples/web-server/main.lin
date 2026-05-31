@@ -1,14 +1,6 @@
 import { router } from "./router"
+import { serve } from "std/http"
 import { print } from "std/io"
-import { toString } from "std/string"
 
-val makeReq = (method: String, path: String): Json =>
-  { "method": method, "path": path, "query": "", "headers": {}, "body": "" }
-
-val statusResp = router(makeReq("GET", "/api/status"))
-print("status: ${toString(statusResp["status"])}")
-
-val userResp = router(makeReq("GET", "/users/1"))
-print("user: ${toString(userResp["status"])}")
-
-print("ready")
+print("listening on http://localhost:3000")
+router.serve(3000)

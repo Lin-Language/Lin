@@ -16,6 +16,11 @@ pub enum Type {
     Float32,
     Float64,
     Str,
+    /// A singleton string-literal type, e.g. `"success"`. At runtime a `StrLit`
+    /// value is represented identically to a `Str` (TAG_STR, same boxing/RC/toString);
+    /// the literal only constrains type-checking (compat, bidirectional refinement,
+    /// exhaustiveness). See ADR-053.
+    StrLit(String),
     Array(Box<Type>),
     FixedArray(Vec<Type>),
     Object(IndexMap<String, Type>),
@@ -23,8 +28,20 @@ pub enum Type {
     Function {
         params: Vec<Type>,
         ret: Box<Type>,
+        /// Number of leading parameters that have no default value, i.e. the
+        /// minimum arity a (non-partial) call must supply. `required == params.len()`
+        /// for functions without default arguments. Excluded from structural
+        /// compatibility — see `compat.rs`.
+        required: usize,
     },
     Iterator(Box<Type>),
+    /// `Shared<T>` — opt-in shared *mutable* state (ADR-044). An opaque box over `T`; the ONLY
+    /// operations are the `shared`/`get`/`set`/`withLock` accessors. It is deliberately NOT
+    /// structurally compatible with `T` or with `Json` (see `compat.rs`), so any other operation
+    /// on a `Shared<T>` — `push`, indexing, auto-unwrap — is a compile-time type error. It is
+    /// constructed only by the `shared` intrinsic's return type; it cannot be spelled in source
+    /// annotations (no `resolve.rs` case), so user code can never name it directly.
+    Shared(Box<Type>),
     TypeVar(u32),
     Never,
     /// A named type alias reference (used for recursive types that cannot be eagerly expanded).
@@ -33,6 +50,12 @@ pub enum Type {
 }
 
 impl Type {
+    /// Construct a function type with no default arguments (`required == params.len()`).
+    pub fn func(params: Vec<Type>, ret: Type) -> Type {
+        let required = params.len();
+        Type::Function { params, ret: Box::new(ret), required }
+    }
+
     pub fn is_numeric(&self) -> bool {
         matches!(
             self,
@@ -67,9 +90,24 @@ impl Type {
         matches!(self, Type::Float32 | Type::Float64)
     }
 
+    /// True when this element type maps to a FLAT unboxed scalar array (a concrete
+    /// fixed-width numeric). Mirrors codegen's `Codegen::is_flat_scalar` — the two MUST
+    /// agree, since the checker decides when to refine an `arrayAllocate` result to a
+    /// concrete array type and codegen decides whether to emit a flat allocation.
+    pub fn is_flat_scalar(&self) -> bool {
+        self.is_integer() || self.is_float()
+    }
+
     /// Returns true for the dynamic "any" JSON type (TypeVar(u32::MAX)).
     pub fn is_json(&self) -> bool {
         matches!(self, Type::TypeVar(u32::MAX))
+    }
+
+    /// True for `Str` and for any string-literal singleton (`StrLit`). Used wherever
+    /// a runtime-string representation is what matters (equality, comparison, boxing,
+    /// RC), since a `StrLit` is a `Str` at runtime. See ADR-053.
+    pub fn is_string_ish(&self) -> bool {
+        matches!(self, Type::Str | Type::StrLit(_))
     }
 
     pub fn is_signed(&self) -> bool {
@@ -93,6 +131,28 @@ impl Type {
             Type::Int32 | Type::UInt32 | Type::Float32 => Some(32),
             Type::Int64 | Type::UInt64 | Type::Float64 => Some(64),
             _ => None,
+        }
+    }
+
+    /// True if this type contains any `TypeVar` anywhere in its structure
+    /// (including the Json marker `TypeVar(u32::MAX)`, generic params, and fresh
+    /// inference vars). A type with no TypeVar is "fully concrete" — the only
+    /// targets a `Json` value may NOT flow into without an explicit decode (ADR-046).
+    pub fn contains_type_var(&self) -> bool {
+        match self {
+            Type::TypeVar(_) => true,
+            Type::Array(inner) | Type::Iterator(inner) => inner.contains_type_var(),
+            Type::FixedArray(elems) => elems.iter().any(|t| t.contains_type_var()),
+            Type::Union(variants) => variants.iter().any(|t| t.contains_type_var()),
+            Type::Object(fields) => fields.values().any(|t| t.contains_type_var()),
+            Type::Function { params, ret, .. } => {
+                params.iter().any(|t| t.contains_type_var()) || ret.contains_type_var()
+            }
+            // Named types are opaque references; their bodies may contain Json but
+            // are resolved/unfolded elsewhere. Treat a bare Named as non-vargenic
+            // here (a concrete user type like `Person`).
+            Type::Named(_) => false,
+            _ => false,
         }
     }
 
@@ -129,6 +189,7 @@ impl fmt::Display for Type {
             Type::Float32 => write!(f, "Float32"),
             Type::Float64 => write!(f, "Float64"),
             Type::Str => write!(f, "String"),
+            Type::StrLit(s) => write!(f, "\"{}\"", s),
             Type::Array(inner) => write!(f, "{}[]", inner),
             Type::FixedArray(types) => {
                 write!(f, "[")?;
@@ -159,17 +220,23 @@ impl fmt::Display for Type {
                 }
                 Ok(())
             }
-            Type::Function { params, ret } => {
+            Type::Function { params, ret, required } => {
                 write!(f, "(")?;
                 for (i, p) in params.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", p)?;
+                    // Optional (defaulted) params render with a trailing `?`.
+                    if i >= *required {
+                        write!(f, "{}?", p)?;
+                    } else {
+                        write!(f, "{}", p)?;
+                    }
                 }
                 write!(f, ") => {}", ret)
             }
             Type::Iterator(inner) => write!(f, "Iterator<{}>", inner),
+            Type::Shared(inner) => write!(f, "Shared<{}>", inner),
             Type::TypeVar(id) => write!(f, "?T{}", id),
             Type::Never => write!(f, "Never"),
             Type::Named(name) => write!(f, "{}", name),

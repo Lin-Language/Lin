@@ -340,3 +340,64 @@ val p = lin_async(() => 42)
     let result = parse_and_check(src);
     assert!(result.is_ok(), "async returning Int32 should be allowed: {:?}", result.err());
 }
+
+// Regression: the match-arm-union-vs-declared-object bug. A function declared to return a named
+// object type `R`, whose body is a `match`/`if` with one arm yielding a `Json` value and another
+// yielding a concrete object literal, previously formed the union `Json | {concrete}` and rejected
+// it against `R`. Each arm is now checked against `R` directly (bidirectional push): the object
+// literal checks structurally, and a `Json` value is accept-any in arm position.
+#[test]
+fn test_match_json_arm_plus_object_arm_against_declared_object_return() {
+    let src = r#"
+type R = { "status": Int32, "headers": Json, "body": String }
+val other = (): Json => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
+val handle = (b: Boolean): R =>
+  match b
+    is true => other()
+    else => { "status": 404, "headers": { "a": 1 }, "body": "no" }
+"#;
+    let result = parse_and_check(src);
+    assert!(result.is_ok(), "match Json-arm + object-arm vs declared object should check: {:?}", result.err());
+}
+
+// Same bug, `if` form: `if cond then jsonValue else objectLiteral` declared `: R`.
+#[test]
+fn test_if_json_arm_plus_object_arm_against_declared_object_return() {
+    let src = r#"
+type R = { "status": Int32, "headers": Json, "body": String }
+val other = (): Json => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
+val handle = (b: Boolean): R =>
+  if b then other() else { "status": 404, "headers": { "a": 1 }, "body": "no" }
+"#;
+    let result = parse_and_check(src);
+    assert!(result.is_ok(), "if Json-arm + object-arm vs declared object should check: {:?}", result.err());
+}
+
+// Guard against over-broadening: a genuinely wrong-shaped object arm must STILL error.
+#[test]
+fn test_match_wrong_shaped_object_arm_still_errors() {
+    let src = r#"
+type R = { "status": Int32, "headers": Json, "body": String }
+val other = (): Json => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
+val handle = (b: Boolean): R =>
+  match b
+    is true => other()
+    else => { "status": 404, "body": 99 }
+"#;
+    let result = parse_and_check(src);
+    assert!(result.is_err(), "wrong-shaped object arm must still error");
+}
+
+// Guard against over-broadening (ADR-046): a DIRECT `Json` body returned as a structured object
+// (not via a match/if arm with a concrete-object companion) must still error — the relaxation is
+// scoped to checked match/if arms, not bare bodies.
+#[test]
+fn test_bare_json_body_against_declared_object_still_errors() {
+    let src = r#"
+type R = { "status": Int32, "headers": Json, "body": String }
+val other = (): Json => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
+val handle = (): R => other()
+"#;
+    let result = parse_and_check(src);
+    assert!(result.is_err(), "bare Json body vs structured object return must still error (ADR-046)");
+}

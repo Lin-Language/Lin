@@ -12,14 +12,15 @@ source.lin
   └─ lin-parse     Parser          Token[] → Module (surface AST)
   └─ lin-check     Type checker    Module → TypedModule
   └─ lin-ir        Lowering        TypedModule → LinModule (flat 3-address IR)
+       └─ liveness Liveness        backwards dataflow → per-instruction live sets
        └─ rc_elide RC elision      LinModule → LinModule (paired Retain/Release removed)
-  └─ lin-codegen   LLVM backend    TypedModule → LLVM IR (via inkwell)
+  └─ lin-codegen   LLVM backend    LinModule → LLVM IR (via inkwell)
        └─ O2 passes                LLVM IR → optimised LLVM IR
        └─ emit .o                  LLVM IR → object file
   └─ cc link       Linker          .o + liblin_runtime.a → native binary
 ```
 
-The orchestration lives in `crates/lin-compile/src/lib.rs`. `lin-codegen` currently consumes `TypedModule` directly; `LinIR` (`lin-ir`) is available as a pre-pass but not yet wired into the codegen path — it is used by the RC elision pass and future analyses.
+The orchestration lives in `crates/lin-compile/src/lib.rs`. **`LinIR` (`lin-ir`) is the sole lowering path**: `lin-codegen` consumes the flat `LinModule`, never `TypedModule` directly. (A legacy TypedAST-direct backend existed behind `LIN_USE_IR=0`; it was removed once the IR path reached parity, shrinking `codegen.rs` from ~7,700 lines to a module tree — see Stage 5.)
 
 ---
 
@@ -90,6 +91,7 @@ TypedExpr::IntLit(i64, Type, Span)
          | LocalGet { slot: usize, ty: Type, span }
          | LocalSet { slot: usize, value: Box<TypedExpr>, ty, span }
          | BinaryOp { left, op: BinOp, right, result_type, span }
+         | UnaryOp { op, operand, result_type, span }
          | Coerce { expr, from: Type, to: Type, span }    -- implicit numeric widening
          | Call { func, args, result_type, is_tail: bool, span }
          | If { cond, then_br, else_br, result_type, span }
@@ -99,6 +101,7 @@ TypedExpr::IntLit(i64, Type, Span)
          | MakeObject { fields, spreads, ty, span }
          | MakeArray { elements, ty, span }
          | Index { object, key, result_type, span }
+         | IndexSet { object, key, value, span }          -- arr[i] = v / obj[k] = v
          | FieldGet { object, field, result_type, span }
          | StringInterp { parts, span }
          | Is { expr, pattern, span }
@@ -109,16 +112,18 @@ Variables are **slot-indexed** rather than name-indexed. `LocalGet { slot }` ref
 
 ### Key checker passes
 
+The `Checker` is one `impl` split across a `checker/` module tree by concern: `checker/mod.rs` (struct + `check_module` + module-level passes), `stmt.rs`, `expr.rs` (expression inference), `ops.rs` (binary/unary), `call.rs`, `function.rs`, `pattern.rs`, `intrinsics.rs`, `helpers.rs` (free functions). The passes below cross-cut those files.
+
 | Pass | Where | What |
 |------|-------|-------|
 | Type resolution | `resolve.rs` | Converts surface `TypeExpr` → internal `Type`; handles generic substitution |
-| Bidirectional inference | `checker.rs` | `check(expr, expected)` pushes types down; `infer(expr) → Type` synthesises bottom-up |
+| Bidirectional inference | `checker/expr.rs` | `check(expr, expected)` pushes types down; `infer(expr) → Type` synthesises bottom-up |
 | Numeric widening | `widen.rs` | Binary ops emit a `Coerce` node when one operand needs widening |
 | Structural compatibility | `compat.rs` | `is_compatible(value_ty, target_ty)` — used for assignments, call-site checking |
-| Flow-sensitive narrowing | `checker.rs` | After `is`/`has` tests, refines union types in true branches |
+| Flow-sensitive narrowing | `checker/expr.rs` | After `is`/`has` tests, refines union types in true branches |
 | Exhaustiveness checking | `exhaustiveness.rs` | Maranget matrix-decomposition algorithm; produces a counterexample witness if non-exhaustive |
 | TypeVar zonking | `zonk.rs` | Post-inference walk that replaces all solved `TypeVar(id)` with their concrete types; unsolved vars are errors |
-| Closure analysis | `checker.rs` | Identifies free variables; mutable `var` captures become heap cells (`is_mutable: true`) |
+| Closure analysis | `checker/function.rs` | Identifies free variables; mutable `var` captures become heap cells (`is_mutable: true`) |
 
 ### "Did you mean" diagnostics
 
@@ -140,14 +145,14 @@ A `ModuleSignature` is just the exported `name → Type` map. Dependents only ne
 
 ## Stage 4 — Flat IR (`lin-ir`)
 
-`LinIR` is a flat 3-address IR sitting between `TypedExpr` (tree-shaped) and LLVM. It enables analyses that need explicit control flow (liveness, RC elision) without going all the way to LLVM IR.
+`LinIR` is a flat 3-address IR sitting between `TypedExpr` (tree-shaped) and LLVM, and it is the **only** path into codegen. It makes control flow explicit so analyses (liveness, RC elision) can run before LLVM, and so codegen has a single uniform shape to walk.
 
 ### Design principles
 
 - **No nested expressions**: every sub-expression result is a named `Temp(u32)`.
-- **No phi nodes**: merge-points use explicit `Copy` instructions to pre-allocated temps; SSA reconstruction is delegated to LLVM.
+- **Explicit basic blocks**: each `BasicBlock` is a list of `Instruction`s ending with exactly one `Terminator`. Loops (`for`/`while`/`map`/`filter`/`reduce`) lower to real CFG (header/body/exit blocks with `CondJump`/`Jump` back-edges), so the IR is genuinely optimizable rather than a tree of opaque calls.
+- **Merge points via `Phi`**: block merges use an explicit `Phi` instruction carrying `(value, predecessor block)` incomings; codegen emits a real LLVM `phi`. (Straight-line/`Bind` copies are still used where a single definition reaches the merge.)
 - **Explicit RC**: `Retain { val, ty }` and `Release { val, ty }` instructions are emitted by the lowering pass and removed by the RC elision pass where provably redundant.
-- **Flat basic blocks**: each `BasicBlock` is a list of `Instruction`s ending with exactly one `Terminator`.
 
 ### Identity types
 
@@ -162,8 +167,9 @@ FuncId(u32)   -- function within a module
 ```
 Const { dst, val: Const }
 Copy { dst, src }
+Phi { dst, incomings: Vec<(Temp, BlockId)>, ty }   -- merge-point value
 Unary { dst, op, operand, ty }
-Binary { dst, op: BinOp, lhs, rhs, ty }
+Binary { dst, op: BinOp, lhs, rhs, operand_ty, ty }
 Coerce { dst, src, from_ty, to_ty }
 Call { dst, callee: CallTarget, args, ret_ty }
 CallIntrinsic { dst, intrinsic: Intrinsic, args, ret_ty }
@@ -171,7 +177,12 @@ MakeClosure { dst, func: FuncId, captures, ret_ty }
 MakeObject { dst, fields, spreads, ty }
 MakeArray { dst, elements, elem_ty }
 Index { dst, object, key, result_ty }
+IndexSet { object, key, value, ... }               -- arr[i] = v / obj[k] = v
 FieldGet { dst, object, field, result_ty }
+EnvCapture { ... }                                 -- read a captured value from the closure env
+ArrayLenCheck { ... } / ObjectRest { ... }         -- destructuring support
+GlobalValGet / GlobalValSet { ... }                -- top-level non-fn val slots
+MakeCell / CellGet / CellSet { ... }               -- heap cells for mutable `var` captures
 Retain { val, ty }
 Release { val, ty }
 IsType { dst, val, ty }
@@ -195,13 +206,15 @@ Unreachable
 
 ### Lowering pass (`lower.rs`)
 
-`lower_module(typed: &TypedModule) -> LinModule` performs a single tree-walk:
+`lower_module(typed: &TypedModule) -> LinModule` lowers the main module; `lower_import_module(typed, module_key)` lowers an imported module (named functions + `__val` wrappers, no `main`, symbols prefixed by the mangled module key). Both perform a single tree-walk:
 
 - Statements → sequences of instructions in the current block.
-- `If` → `CondJump` to then/else blocks, results copied into a pre-allocated merge temp, then `Jump` to a merge block.
+- `If` → `CondJump` to then/else blocks, with a `Phi` at the merge block selecting each branch's result.
 - `Match` → a sequence of pattern-test blocks, each with a `CondJump` to body or next arm; exhaustion falls through to a `Panic`.
-- Nested `Function` nodes → lifted into new `LinFunction`s pushed to `ctx.pending_functions`; the outer function emits `MakeClosure`.
+- Loops (`for`/`while`/`map`/`filter`/`reduce`) → explicit CFG: a header block testing the bound/condition, a body block that calls the body-closure temp, accumulator handling for map/filter/reduce, a back-edge `Jump`, and an exit block.
+- Nested `Function` nodes → lifted into new `LinFunction`s; the outer function emits `MakeClosure`. Captured `var` bindings become heap cells (`MakeCell`/`CellGet`/`CellSet`).
 - `StringInterp` → a chain of `CallIntrinsic(ToString)` + `CallIntrinsic(StringConcat)` instructions with `Release` for intermediate temps.
+- Container inserts (array elements, `push`/`set`/`object_set`) route through one `transfer_into_container` helper applying the ownership rule: a fresh allocation transfers its `+1` into the container (dropped from the owning scope); a borrowed value is retained.
 
 ### Liveness analysis (`liveness.rs`)
 
@@ -226,7 +239,30 @@ Only types that participate in RC (`Str`, `Array`, `Object`, `Function`) are can
 
 ## Stage 5 — LLVM Codegen (`lin-codegen`)
 
-The codegen crate uses [`inkwell`](https://github.com/TheDan64/inkwell) (safe Rust bindings to the LLVM C API) to compile `TypedModule` directly to LLVM IR.
+The codegen crate uses [`inkwell`](https://github.com/TheDan64/inkwell) (safe Rust bindings to the LLVM C API) to compile a `LinModule` (the flat IR) to LLVM IR. The entry points are `compile_module_from_ir` (main module) and `compile_import_from_ir` (imports).
+
+### File layout
+
+`codegen.rs` was split into a module tree under `codegen/` (one `impl Codegen` spanning several files, grouped by concern):
+
+| File | Contents |
+|------|----------|
+| `mod.rs` | `Codegen` struct, `new()`, `compile_module_from_ir`, optimisation/emit, `get_or_declare_fn` |
+| `runtime.rs` | `RuntimeFns` — the ~40 process-wide `lin-runtime` `declare`s, built once and held as the `rt` field |
+| `builder_ext.rs` | `BuilderExt` — a façade trait over inkwell's `Builder` so call sites read `self.builder.int_add(a, b, "n")` instead of `self.builder.build_int_add(a, b, "n").unwrap()` |
+| `types.rs` | `llvm_type`, type tags, flat-scalar tests, int-width coercion |
+| `boxing.rs` | box / unbox values, tagged-val alloca |
+| `literals.rs` | int / float / string literals |
+| `arith.rs` | arithmetic, eq / cmp, binary / unary op dispatch |
+| `call.rs` | partial application, closure structs, thunk calls |
+| `data.rs` | arrays, objects, strings, index get/set, field get |
+| `intrinsics.rs` | `compile_ir_intrinsic` + to-string helpers |
+| `match.rs` | is-type, has-pattern, coerce |
+| `rc.rs` | `emit_release` |
+
+### Value tracking
+
+Each `LinFunction` is walked block-by-block. A `temp_map: HashMap<Temp, BasicValueEnum>` maps each IR `Temp` to its LLVM value; `Phi` instructions become real LLVM `phi` nodes (back-edge incomings are patched after all blocks are emitted). Block parameters and TCO param-slot loads seed the map at the function entry. A missing temp lookup is a malformed-IR bug and panics with the offending temp rather than silently substituting a default.
 
 ### Type mapping
 
@@ -242,21 +278,13 @@ The codegen crate uses [`inkwell`](https://github.com/TheDan64/inkwell) (safe Ru
 | `Str` | `ptr` (to heap-allocated `LinString`) |
 | `Array(T)` | `ptr` (to heap-allocated `LinArray`) |
 | `Object(...)` | `ptr` (to heap-allocated `LinObject`) |
-| `Union(...)` | `ptr` (to heap-allocated `TaggedVal`) |
+| `Union(...)` / `TypeVar` (Json/any) | `ptr` (to heap-allocated `TaggedVal`) |
 | `Function { ... }` | `ptr` (to `{ fn_ptr, env_ptr }` closure pair) |
 | `Null` | `i8` (constant `0`) |
 
-### Slot storage
+### Bindings
 
-Each Lin binding slot maps to a `SlotStorage`:
-
-```rust
-enum SlotStorage {
-    Value(BasicValueEnum),   // immutable val — bare SSA value
-    Alloca(PointerValue),    // mutable var — stack alloca (heap cell for var captures)
-    Closure(PointerValue),   // closure value — ptr to { fn_ptr, env_ptr }
-}
-```
+The old `TypedExpr`-direct backend kept a per-slot `SlotStorage` map. On the IR path that bookkeeping is gone: the lowering pass has already turned every binding read/write into a `Temp` (immutable values), a `MakeCell`/`CellGet`/`CellSet` heap cell (mutable `var` captured by a closure, shared by reference per spec §27.2), an `EnvCapture` (a value read out of a closure's env), or a `GlobalValGet`/`GlobalValSet` (top-level non-function `val` slots). Codegen just emits the LLVM for each instruction and records results in `temp_map`.
 
 ### Functions and closures
 
@@ -266,7 +294,7 @@ For mutual recursion, top-level named functions are forward-declared before thei
 
 ### Tail-call optimisation
 
-Direct self-recursive tail calls are transformed into a loop: the function body is wrapped in an unconditional `br` back to a `loop_body` block; self-tail-calls store updated arguments into alloca slots and branch back. No trampoline is needed.
+The checker marks direct self-recursive tail calls, and the lowering pass emits a `TailCall { args }` terminator for them. When a function contains any `TailCall`, codegen allocates one alloca per parameter in the entry block, stores the incoming params, and creates a `tco_loop` header that loads the params back into temps. `TailCall` lowers to: evaluate the arg temps → store into the param allocas → branch to the header. No trampoline is needed. Mutual TCO is not implemented (ADR-012).
 
 ### Union types and tagged dispatch
 
@@ -274,17 +302,21 @@ Values of union type (`Union(...)`) are boxed into a heap-allocated `TaggedVal`:
 
 ```c
 struct TaggedVal {
-    uint8_t tag;    // 0=null, 1=bool, 2=int32, 3=int64, 4=float64, 5=str, 6=object, 7=array, 8=function
+    uint8_t tag;    // 0=null 1=bool 2=int32 3=int64 4=float32 5=float64
+                    // 6=str 7=object 8=array 9=function
+                    // 10=uint8 11=int8 12=uint16 13=int16
     uint8_t pad[7];
     uint64_t payload;  // integer/float value, or pointer
 };
 ```
 
+The struct is exactly 16 bytes with `tag` at offset 0 and `payload` at offset 8 — a layout codegen and several hot paths hard-code (a tagged array's `LinArrayElem` is byte-identical, so 16 bytes are `memcpy`'d between them). The runtime pins this with a compile-time `assert!`.
+
 `match` over a union type emits an LLVM `switch i8 %tag` (O(1) jump table) rather than a chain of `icmp`/`br` pairs.
 
 ### Unboxed scalar arrays
 
-When the element type of an array is a known concrete scalar (`Int32`, `UInt32`, `Int64`, `UInt64`, `Float32`, `Float64`), the codegen emits flat (unboxed) array operations:
+When the element type of an array is a known concrete scalar (any of `Int8`/`UInt8`, `Int16`/`UInt16`, `Int32`/`UInt32`, `Int64`/`UInt64`, `Float32`, `Float64` — see `is_flat_scalar`), the codegen emits flat (unboxed) array operations keyed on a width/signedness suffix:
 
 | Scalar type | Alloc | Push | Get |
 |-------------|-------|------|-----|
@@ -293,7 +325,7 @@ When the element type of an array is a known concrete scalar (`Int32`, `UInt32`,
 | `f32` | `lin_flat_array_alloc_f32` | `lin_flat_array_push_f32` | `lin_flat_array_get_f32` |
 | `f64` | `lin_flat_array_alloc_f64` | `lin_flat_array_push_f64` | `lin_flat_array_get_f64` |
 
-Flat arrays store raw scalars (4 or 8 bytes per element) instead of `LinArrayElem` tagged unions (16 bytes each), giving a 5–10× improvement in numeric array access.
+(8- and 16-bit scalars use the analogous narrower variants.) Flat arrays store raw scalars (1–8 bytes per element) instead of `LinArrayElem` tagged unions (16 bytes each), giving a 5–10× improvement in numeric array access.
 
 ---
 
@@ -305,7 +337,9 @@ A small static library (`liblin_runtime.a`) linked into every compiled binary. W
 
 Heap values use **reference counting**. The refcount is stored as the first `u32` field of every heap struct. `lin_alloc(size)` is a thin wrapper over `malloc`. `lin_rc_retain` / `lin_rc_release` adjust the count.
 
-Strings, arrays, and objects each have type-specific `*_release` functions that decrement the refcount, free the struct if zero, and recursively release nested values.
+Strings, arrays, and objects each have type-specific `*_release` functions that decrement the refcount, free the struct if zero, and recursively release nested values. Each `*_release` carries a debug-only `debug_assert!(refcount > 0)` underflow guard so a double-release shows up as a diagnosable panic under debug/ASan builds (no release-build cost).
+
+**Cached scalar boxes.** Boxing a scalar (`lin_box_int32`/`_int64`/`_bool`) is on the hot path of every map/filter/reduce callback. Small integers (`[-128, 1024)`) and booleans are pre-allocated as immutable `static` `TaggedVal`s; `lin_box_*` returns a pointer into that table instead of calling the allocator, and `lin_tagged_release` skips any pointer that lies inside the table (CPython-style interning). This eliminates roughly one `malloc` per element in numeric pipelines.
 
 ### Data structures
 
@@ -342,7 +376,8 @@ struct LinObject {
     uint32_t refcount;
     uint32_t len;
     uint32_t cap;
-    LinObjectEntry *entries;  // sorted by key pointer for binary search
+    uint32_t _pad;
+    LinObjectEntry *entries;  // insertion-ordered; lookup is a linear key-equality scan
 };
 ```
 
@@ -472,20 +507,20 @@ pub struct CompileOptions {
 
 1. Add a variant to `Type` in `lin-check/src/types.rs`.
 2. Add the `Display` arm and serde derives (already derived).
-3. Handle it in `resolve.rs` (surface `TypeExpr` → `Type`), `compat.rs` (compatibility), `widen.rs` (numeric widening if applicable), and `checker.rs` (infer/check).
-4. Add the LLVM type mapping in `codegen.rs`:`llvm_type()`.
+3. Handle it in `resolve.rs` (surface `TypeExpr` → `Type`), `compat.rs` (compatibility), `widen.rs` (numeric widening if applicable), and `checker/expr.rs` (infer/check).
+4. Add the LLVM type mapping in `codegen/types.rs`:`llvm_type()`.
 5. Add runtime support in `lin-runtime` if heap allocation is needed.
 
 ### Adding a new intrinsic
 
-1. Register the name and arity in `lin-check/src/checker.rs`:`register_intrinsics()`.
-2. Add a `compile_intrinsic_call` arm in `lin-codegen/src/codegen.rs`.
-3. If it needs a new runtime function: add it to the appropriate `lin-runtime/src/*.rs` module and declare it in `Codegen::new()`.
-4. Add the `Intrinsic` variant to `lin-ir/src/ir.rs` if the IR lowering pass should handle it explicitly.
+1. Register the name and arity in `lin-check/src/checker/intrinsics.rs`:`register_intrinsics()`.
+2. Map its name to an `Intrinsic` variant in `lin-ir/src/lower.rs`:`lower_intrinsic_call` (adding the variant to `lin-ir/src/ir.rs` if new).
+3. Add a `compile_ir_intrinsic` arm in `lin-codegen/src/codegen/intrinsics.rs`.
+4. If it needs a new runtime function: add it to the appropriate `lin-runtime/src/*.rs` module, declare it in `RuntimeFns::new()` (`codegen/runtime.rs`), and call it via `self.rt.<name>`.
 
 ### Adding a new IR instruction
 
 1. Add the variant to `Instruction` in `lin-ir/src/ir.rs`.
 2. Add arms in `liveness.rs`:`instr_use_def()` (return the correct `(uses, defs)`).
-3. Handle it in `rc_elide.rs`:`path_has_no_interference()` if it could alias a refcounted value.
-4. Add lowering in `lower.rs` and eventually a codegen arm when `lin-codegen` consumes `LinIR`.
+3. Handle it in `rc_elide.rs` if it could alias a refcounted value.
+4. Emit it in `lower.rs`, and add a codegen arm in the relevant `codegen/*.rs` file (the instruction-dispatch loop is in `codegen/mod.rs`:`compile_module_from_ir`).

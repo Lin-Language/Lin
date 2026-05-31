@@ -6,12 +6,16 @@ val s = suite("dijkstra algorithm", [
   test("distance from source to itself is 0", () =>
     val adj = buildAdj([{ "from": "A", "to": "B", "weight": 5 }])
     val result = dijkstra(adj, "A", ["A", "B"])
-    expect(result["dist"]["A"]).toBe(0)
+    [
+      expect(result["dist"]["A"]).toBe(0)
+    ]
   ),
   test("finds direct edge weight", () =>
     val adj = buildAdj([{ "from": "A", "to": "B", "weight": 7 }])
     val result = dijkstra(adj, "A", ["A", "B"])
-    expect(result["dist"]["B"]).toBe(7)
+    [
+      expect(result["dist"]["B"]).toBe(7)
+    ]
   ),
   test("picks shortest of two paths", () =>
     val adj = buildAdj([
@@ -20,12 +24,16 @@ val s = suite("dijkstra algorithm", [
       { "from": "A", "to": "B", "weight": 10 },
     ])
     val result = dijkstra(adj, "A", ["A", "B", "C"])
-    expect(result["dist"]["B"]).toBe(3)
+    [
+      expect(result["dist"]["B"]).toBe(3)
+    ]
   ),
   test("unreachable node stays at initial large distance", () =>
     val adj = buildAdj([{ "from": "A", "to": "B", "weight": 1 }])
     val result = dijkstra(adj, "A", ["A", "B", "C"])
-    expect(result["dist"]["C"]).toBe(999999999)
+    [
+      expect(result["dist"]["C"]).toBe(999999999)
+    ]
   ),
   test("records correct prev pointer for path reconstruction", () =>
     val adj = buildAdj([
@@ -34,7 +42,9 @@ val s = suite("dijkstra algorithm", [
       { "from": "A", "to": "B", "weight": 10 },
     ])
     val result = dijkstra(adj, "A", ["A", "B", "C"])
-    expect(result["prev"]["B"]).toBe("C")
+    [
+      expect(result["prev"]["B"]).toBe("C")
+    ]
   ),
 ])
 run(s)

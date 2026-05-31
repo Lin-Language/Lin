@@ -1,38 +1,58 @@
 # Lin
 
-A small, expression-based programming language built around JSON data, structural typing, pattern matching, and functional-style pipelines.
+Lin is a compiled, functional programming language with modern ergonomics, including:
+
+- JSON as the native data model
+- Dot application & partial application
+- Pattern matching with structural `is`/`has`
+- Native threads with no function colouring — share-nothing concurrency
+- A robust structural type system — union types, generics, and exhaustiveness checking
+- Errors as values, safe-by-default access
 
 ```lin
-val greet = (name: String): String => "Hello, ${name}!"
-print(greet("world"))
-```
+import { print } from "std/io"
+import { filter, map, for } from "std/array"
+import { toString } from "std/string"
 
-- Everything is an expression
-- Runtime values are strict JSON (null, bool, number, string, array, object) plus functions and iterators
-- Indentation defines blocks — no braces or semicolons needed
-- Structural typing with union types and pattern matching
-- Errors are ordinary values
-- Dot syntax for chaining: `x.f(y)` calls `f(x, y)`
+val players = [
+  { "name": "Alice", "score": 42 },
+  { "name": "Bob",   "score": 17 },
+  { "name": "Carol", "score": 91 }
+]
+
+players
+  .filter(p => p["score"] >= 20)
+  .map(p => "${p["name"]}: ${toString(p["score"])}")
+  .for(line => print(line))
+```
 
 ---
 
-## Installation
+macOS (Apple Silicon) and Linux (x86_64):
 
-Download the latest binary for your platform and put it on your `$PATH`:
-
-**macOS (Apple Silicon)**
 ```bash
-curl -L https://github.com/linusnorton/lin-lang/releases/download/latest/lin-macos-arm64.tar.gz \
-  | tar -xz -C /usr/local/bin
+curl -fsSL https://raw.githubusercontent.com/Lin-Language/Lin/master/install.sh | sh
 ```
 
-**Linux (x86_64)**
+The script detects your platform, downloads the matching release, and installs
+the `lin` compiler, the `lin-lsp` language server, and `liblin_runtime.a` (the
+runtime linked into every program you build) into `/usr/local/lib/lin`, with a
+`lin` symlink on your `$PATH`. It uses `sudo` only for the directories that need
+it. To install somewhere you own without `sudo`, set the target directories:
+
 ```bash
-curl -L https://github.com/linusnorton/lin-lang/releases/download/latest/lin-linux-x86_64.tar.gz \
-  | tar -xz -C /usr/local/bin
+curl -fsSL https://raw.githubusercontent.com/Lin-Language/Lin/master/install.sh \
+  | LIN_LIB_DIR="$HOME/.local/lib/lin" LIN_BIN_DIR="$HOME/.local/bin" sh
 ```
 
-The binary is self-contained — no LLVM installation required. A C linker (`cc`) must be on your `$PATH` to link compiled programs; on macOS this comes with Xcode Command Line Tools, on Linux install `gcc` or `clang`.
+The binary is self-contained — no LLVM installation required. A C linker (`cc`)
+must be on your `$PATH` to link compiled programs; on macOS this comes with
+Xcode Command Line Tools, on Linux install `gcc` or `clang`.
+
+Prefer to do it by hand, or on another platform? Grab a tarball from the
+[latest release](https://github.com/Lin-Language/Lin/releases/tag/latest),
+extract its three files into one directory, and put that directory on your
+`$PATH`.
 
 **Verify**
 ```bash
@@ -43,7 +63,7 @@ lin --version
 
 ## VS Code Extension
 
-Download `lin-lang.vsix` from the [latest release](https://github.com/linusnorton/lin-lang/releases/tag/latest) and install it:
+Download `lin-lang.vsix` from the [latest release](https://github.com/Lin-Language/Lin/releases/tag/latest) and install it:
 
 ```bash
 code --install-extension lin-lang.vsix
@@ -60,20 +80,28 @@ The extension includes:
 
 The extension bundles the `lin` compiler and `lin-lsp` language server — no separate installation required.
 
+**`lin` on your PATH, no curl needed.** When the extension is active, the
+bundled `lin` is automatically added to the PATH of VS Code's integrated
+terminal — open a terminal and `lin run foo.lin` just works. To use `lin` in
+**any** shell (outside VS Code too), run the **Lin: Install `lin` on PATH**
+command from the palette: it symlinks the bundled compiler into `~/.local/bin`.
+Both always point at the version shipped with the installed extension, and the
+integrated-terminal entry is removed automatically when you uninstall.
+
 ---
 
 ## Quick Start
 
 ```bash
 # Compile and run immediately
-lin run examples/hello.lin
+lin run examples/calc/main.lin
 
 # Compile to a binary
-lin build examples/hello.lin -o hello
-./hello
+lin build examples/calc/main.lin -o calc
+./calc
 
 # Type-check without compiling
-lin check examples/hello.lin
+lin check examples/calc/main.lin
 ```
 
 ---
@@ -233,6 +261,25 @@ val gradeFor = (avg: Int32): String =>
     else => "F"
 ```
 
+Parameters may have default values (which must come last, and may reference
+earlier parameters). Omit a trailing argument to use its default:
+
+```lin
+val greet = (name: String, greeting: String = "Hello") => "${greeting}, ${name}"
+
+print(greet("World"))         // Hello, World
+print(greet("World", "Hi"))   // Hi, World
+```
+
+Supplying fewer arguments than declared with a trailing comma partially applies
+the function instead:
+
+```lin
+val add = (a: Int32, b: Int32) => a + b
+val addTen = add(10,)         // a function awaiting `b`
+print(toString(addTen(5)))    // 15
+```
+
 ### Dot chaining
 
 `x.f(y)` is sugar for `f(x, y)`:
@@ -319,8 +366,7 @@ print(message)
 | `std/array` | `map`, `filter`, `reduce`, `for`, `range`, `length`, `push`, `concat` |
 | `std/iter` | `iter`, `range`, iterator combinators |
 | `std/fs` | `readFile`, `writeFile`, `appendFile`, `readLines`, `readJson`, `writeJson`, `exists` |
-| `std/http` | `fetch`, `fetchWith`, `fetchJson`, `postJson` |
-| `std/server` | `serve`, `json`, `text`, `redirect`, `notFound`, `badRequest`, `parseBody`, `pathMatch` |
+| `std/http` | `fetch`, `fetchWith`, `fetchJson`, `postJson`, `serve`, `json`, `text`, `redirect`, `notFound`, `badRequest`, `parseBody`, `matchPath` |
 
 ### Concurrency
 
@@ -346,13 +392,16 @@ val results = parallel(
 ### HTTP server
 
 ```lin
-import { serve, json, text, pathMatch } from "std/server"
+import { serve, json, text, matchPath } from "std/http"
 
-serve(8080, req =>
-  match pathMatch("/users/:id", req["path"])
-    is Null    => text(404, "not found")
-    has { id } => json(200, { "userId": id })
-)
+val router = (req: Json): Json =>
+  match req["path"]
+    is path when matchPath(path, "/users/:id") != null =>
+      val m = matchPath(path, "/users/:id")
+      json(200, { "userId": m["id"] })
+    else => text(404, "not found")
+
+router.serve(8080)
 ```
 
 ### Foreign functions (C / Rust interop)
@@ -367,7 +416,7 @@ import foreign "libmathlib.a"
 print(toString(sqrt(2.0)))   // 1.4142...
 ```
 
-The C header `crates/lin-runtime/lin.h` defines `LinString` and `LinArray` for passing non-primitive types across the boundary. See `examples/ffi-c.lin` for a complete example.
+The C header `crates/lin-runtime/lin.h` defines `LinString` and `LinArray` for passing non-primitive types across the boundary. See `examples/ffi/main.lin` for a complete example.
 
 ---
 
@@ -376,7 +425,7 @@ The C header `crates/lin-runtime/lin.h` defines `LinString` and `LinArray` for p
 **Prerequisites:** Rust toolchain, LLVM 22 (`llvm-22-dev`, `libpolly-22-dev`), a C linker.
 
 ```bash
-git clone https://github.com/linusnorton/lin-lang
+git clone https://github.com/Lin-Language/Lin
 cd lin-lang
 cargo build --release -p lin
 # binary is at target/release/lin

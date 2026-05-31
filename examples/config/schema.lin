@@ -1,0 +1,58 @@
+// Schema + defaults for the config loader.
+//
+// A schema describes each expected field: its required type ("string" | "int" |
+// "bool") and an optional default. `applyDefaults` fills missing fields; `validate`
+// checks that present fields have the right type, returning a list of error strings.
+
+import { keys } from "std/object"
+import { for, length, push } from "std/array"
+import { toString } from "std/string"
+
+// One schema entry: the expected type tag ("string" | "int" | "bool") and an
+// optional default value. The default is heterogeneous across entries (String,
+// Int32 or Boolean) and absent for required fields, so it stays dynamic (Json).
+export type SchemaEntry = { "type": String, "default": Json }
+
+// The schema for our app config. Each entry: { "type", "default" } (default omitted
+// for required fields).
+export val schema = (): Json =>
+  {
+    "host": { "type": "string", "default": "localhost" },
+    "port": { "type": "int", "default": 8080 },
+    "debug": { "type": "bool", "default": false },
+    "name": { "type": "string" }
+  }
+
+// The runtime type tag of a Json value, as one of our schema type names.
+val typeName = (v: Json): String =>
+  match v
+    is String => "string"
+    is Int32 => "int"
+    is Boolean => "bool"
+    else => "other"
+
+// Fill any field absent from `cfg` with its schema default. Required fields (no
+// default) are left absent for `validate` to flag. Builds a fresh object so the
+// caller's input is not mutated.
+export val applyDefaults = (cfg: Json): Json =>
+  val sch = schema()
+  var out = {}
+  sch.keys().for(k =>
+    if cfg[k] != null then out[k] = cfg[k]
+    else if sch[k]["default"] != null then out[k] = sch[k]["default"]
+  )
+  out
+
+// Validate a (defaults-applied) config against the schema. Returns an array of
+// error message strings (empty array == valid).
+export val validate = (cfg: Json): String[] =>
+  val sch = schema()
+  var errors = []
+  sch.keys().for(k =>
+    val expected = sch[k]["type"]
+    val actual = cfg[k]
+    if actual == null then push(errors, "missing required field: ${k}")
+    else if typeName(actual) != expected then
+      push(errors, "field ${k}: expected ${expected}, got ${typeName(actual)}")
+  )
+  errors

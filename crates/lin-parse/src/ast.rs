@@ -1,4 +1,4 @@
-use lin_common::Span;
+use lin_common::{Span, NumSuffix};
 
 #[derive(Debug, Clone)]
 pub struct Module {
@@ -57,8 +57,11 @@ pub struct ImportBinding {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    IntLit(i64, Span),
-    FloatLit(f64, Span),
+    /// Integer literal with an optional explicit type suffix (e.g. `42i8`). The suffix, when
+    /// present, pins the literal's type in the checker, overriding context/default (spec §3.6).
+    IntLit(i64, Option<NumSuffix>, Span),
+    /// Float literal with an optional explicit type suffix (e.g. `3.14f32`).
+    FloatLit(f64, Option<NumSuffix>, Span),
     StringLit(String, Span),
     BoolLit(bool, Span),
     NullLit(Span),
@@ -78,12 +81,17 @@ pub enum Expr {
     Call {
         func: Box<Expr>,
         args: Vec<Expr>,
+        /// True when the argument list ended with an explicit trailing comma
+        /// (`f(x,)`), requesting partial application rather than default-fill.
+        partial: bool,
         span: Span,
     },
     DotCall {
         receiver: Box<Expr>,
         method: String,
         args: Option<Vec<Expr>>,
+        /// True when the argument list ended with an explicit trailing comma.
+        partial: bool,
         span: Span,
     },
     Index {
@@ -104,6 +112,10 @@ pub enum Expr {
     },
     Block(Vec<Stmt>, Box<Expr>, Span),
     Function {
+        /// Generic type parameters introduced by a leading `<T, ...>` (Phase 0: single-module
+        /// monomorphized generics). Empty for ordinary (non-generic) functions, which keeps the
+        /// monomorphization pass a no-op.
+        type_params: Vec<String>,
         params: Vec<Param>,
         return_type: Option<TypeExpr>,
         body: Box<Expr>,
@@ -138,8 +150,8 @@ pub enum Expr {
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
-            Expr::IntLit(_, s) => *s,
-            Expr::FloatLit(_, s) => *s,
+            Expr::IntLit(_, _, s) => *s,
+            Expr::FloatLit(_, _, s) => *s,
             Expr::StringLit(_, s) => *s,
             Expr::BoolLit(_, s) => *s,
             Expr::NullLit(s) => *s,
@@ -199,10 +211,12 @@ pub enum BinOp {
     Shr,
 }
 
-/// Unary operators. `~` (bitwise not) is the only unary operator in the language.
+/// Unary operators: `~` (bitwise not) and `!` (logical not). Both prefix,
+/// right-associative, at the same precedence (tighter than `*`, looser than postfix).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UnaryOp {
     BNot,
+    Not,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +255,10 @@ pub struct ObjectPatternField {
 pub struct Param {
     pub pattern: Pattern,
     pub type_ann: Option<TypeExpr>,
+    /// Default value expression: `(a: Int32, b: Int32 = a + 1)`. When present, the
+    /// parameter is optional at call sites. Optional params must be last (enforced
+    /// in lin-check). A default may reference parameters declared before it.
+    pub default: Option<Box<Expr>>,
 }
 
 #[derive(Debug, Clone)]
@@ -253,4 +271,6 @@ pub enum TypeExpr {
     Function(Vec<TypeExpr>, Box<TypeExpr>, Span),
     Object(Vec<(String, TypeExpr)>, Span),
     TaggedUnion(Vec<TypeExpr>, Span),
+    /// A string-literal singleton type, e.g. `"success"` in type position.
+    StringLit(String, Span),
 }

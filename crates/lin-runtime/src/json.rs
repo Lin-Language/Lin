@@ -1,6 +1,6 @@
 /// JSON parsing and serialization for Lin runtime.
 use crate::string::LinString;
-use crate::object::{LinObject, lin_object_alloc, lin_object_set};
+use crate::object::{lin_object_alloc, lin_object_set};
 use crate::array::{LinArray, lin_array_alloc};
 use crate::tagged::{TaggedVal, TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT64, TAG_STR, TAG_OBJECT, TAG_ARRAY, alloc_tagged};
 use crate::fs::{make_string, make_error_tagged, resolve_lin_str};
@@ -71,6 +71,7 @@ pub unsafe fn tagged_to_json(tv: *const u8) -> serde_json::Value {
         TAG_BOOL => serde_json::Value::Bool(payload != 0),
         TAG_INT32 => serde_json::json!(payload as i32),
         TAG_INT64 => serde_json::json!(payload as i64),
+        crate::tagged::TAG_UINT64 => serde_json::json!(payload),
         TAG_FLOAT64 => serde_json::json!(f64::from_bits(payload)),
         TAG_STR => {
             let s = payload as *const LinString;

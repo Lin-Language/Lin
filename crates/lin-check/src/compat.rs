@@ -5,14 +5,21 @@ use crate::types::Type;
 /// This implements the `has`-style compatibility used for function arguments and assignments.
 /// Named types are not unfolded here; use `is_compatible_env` when an env is available.
 pub fn is_compatible(value_type: &Type, target_type: &Type) -> bool {
-    is_compatible_env(value_type, target_type, None, &mut 0)
+    is_compatible_env(value_type, target_type, None, false, &mut 0)
 }
 
 /// Env-aware compatibility check that can unfold Named types one level.
+///
+/// `lenient_json` controls the `Json` (`TypeVar(u32::MAX)`) → concrete-target direction
+/// (ADR-046). When `false` (user modules), a `Json` value is NOT assignable to a fully
+/// concrete target — it must be decoded via `fromJson` or narrowed via `is`/`has`. When
+/// `true` (the trusted stdlib, whose wrappers forward `Json` handles into concrete
+/// intrinsic/foreign params by design), the old fully-permissive behaviour is kept.
 pub fn is_compatible_env(
     value_type: &Type,
     target_type: &Type,
     env: Option<&TypeEnv>,
+    lenient_json: bool,
     depth: &mut usize,
 ) -> bool {
     // Guard against infinite recursion in deeply nested recursive types.
@@ -30,7 +37,7 @@ pub fn is_compatible_env(
             if let Some(decl) = env.lookup_type(n) {
                 if decl.params.is_empty() {
                     *depth += 1;
-                    let result = is_compatible_env(&decl.body.clone(), target_type, Some(env), depth);
+                    let result = is_compatible_env(&decl.body.clone(), target_type, Some(env), lenient_json, depth);
                     *depth -= 1;
                     return result;
                 }
@@ -44,7 +51,7 @@ pub fn is_compatible_env(
             if let Some(decl) = env.lookup_type(n) {
                 if decl.params.is_empty() {
                     *depth += 1;
-                    let result = is_compatible_env(value_type, &decl.body.clone(), Some(env), depth);
+                    let result = is_compatible_env(value_type, &decl.body.clone(), Some(env), lenient_json, depth);
                     *depth -= 1;
                     return result;
                 }
@@ -54,36 +61,76 @@ pub fn is_compatible_env(
     }
 
     match (value_type, target_type) {
-        (_, Type::TypeVar(_)) | (Type::TypeVar(_), _) => true,
-
+        // Never is the bottom type: assignable to anything (kept ahead of the Shared arms so
+        // `Never -> Shared<T>` stays compatible).
         (Type::Never, _) => true,
         (_, Type::Never) => false,
+
+        // `Shared<T>` is opaque and INVARIANT: it is compatible ONLY with another `Shared<U>`
+        // (with compatible inner types). Crucially these arms come BEFORE the TypeVar/`Json`
+        // wildcard below, so a `Shared<T>` does NOT silently widen to `Json` (which would let it
+        // flow into any `Json` parameter — e.g. `push(s, x)` — and defeat the accessor-only
+        // guard). The only ops on a `Shared<T>` are the shared/get/set/withLock accessors, whose
+        // intrinsic signatures take `Shared<T>` explicitly (ADR-044). Inner `Json` (TypeVar MAX)
+        // still matches via the recursive call, so `shared`'s generic `T` binds normally.
+        (Type::Shared(a), Type::Shared(b)) => is_compatible_env(a, b, env, lenient_json, depth),
+        (Type::Shared(_), _) => false,
+        (_, Type::Shared(_)) => false,
+
+        // Anything is assignable INTO Json (covariant sink): concrete T -> Json. (ADR-046)
+        (_, Type::TypeVar(n)) if *n == u32::MAX => true,
+        // Json -> a concrete structured Object (one with a required, non-nullable field):
+        // this is the silent-unvalidated-decode hazard the cast-hole fix targets — e.g.
+        // `val p: Person = readJson(...)`. Reject in user code; the value must be decoded
+        // via `fromJson` or narrowed via `is`/`has` (ADR-046). The trusted stdlib
+        // (lenient_json) keeps the old permissive behaviour. Json flowing into scalars,
+        // arrays, opaque handles (`Int64`/`Int32`), buffers (`UInt8[]`), open objects (`{}`),
+        // functions, iterators, or anything still containing a TypeVar stays permissive:
+        // those are the language's pervasive handle/buffer/polymorphic-return patterns, not
+        // structured decodes (see ADR-046 for why the line is drawn at required-field objects).
+        (Type::TypeVar(s), target) if *s == u32::MAX => {
+            lenient_json || !requires_structured_decode(target, env, depth)
+        }
+        // Non-MAX inference / generic / intrinsic TypeVars stay bidirectionally permissive.
+        (_, Type::TypeVar(_)) | (Type::TypeVar(_), _) => true,
+
+        // Singleton string-literal types (ADR-051). A `StrLit("x")` is a `String` at runtime;
+        // these rules constrain only check-time assignability:
+        //  1. two literals are compatible iff equal (unequal => reject; the equal case is also
+        //     caught by the `value_type == target_type` fast path above, but the explicit arm
+        //     stops an unequal pair falling through to a later, wrong branch).
+        //  2. a literal widens to the open `String` type.
+        //  3. `String` is NOT assignable to a literal type — load-bearing rejection: an arbitrary
+        //     string is not statically known to equal the singleton.
+        (Type::StrLit(a), Type::StrLit(b)) => a == b,
+        (Type::StrLit(_), Type::Str) => true,
+        (Type::Str, Type::StrLit(_)) => false,
 
         // Numeric widening: narrower assignable to wider
         (a, b) if a.is_numeric() && b.is_numeric() => is_numeric_compatible(a, b),
 
         // Union on the value side: every variant must be compatible with target
         (Type::Union(variants), target) => {
-            variants.iter().all(|v| is_compatible_env(v, target, env, depth))
+            variants.iter().all(|v| is_compatible_env(v, target, env, lenient_json, depth))
         }
 
         // Union on the target side: value must be compatible with at least one variant
         (value, Type::Union(variants)) => {
-            variants.iter().any(|v| is_compatible_env(value, v, env, depth))
+            variants.iter().any(|v| is_compatible_env(value, v, env, lenient_json, depth))
         }
 
         // Array covariance
-        (Type::Array(a), Type::Array(b)) => is_compatible_env(a, b, env, depth),
+        (Type::Array(a), Type::Array(b)) => is_compatible_env(a, b, env, lenient_json, depth),
 
         // Fixed array to unbounded array
         (Type::FixedArray(elements), Type::Array(elem_ty)) => {
-            elements.iter().all(|e| is_compatible_env(e, elem_ty, env, depth))
+            elements.iter().all(|e| is_compatible_env(e, elem_ty, env, lenient_json, depth))
         }
 
         // Fixed array positional compatibility
         (Type::FixedArray(a), Type::FixedArray(b)) => {
             a.len() == b.len()
-                && a.iter().zip(b.iter()).all(|(av, bv)| is_compatible_env(av, bv, env, depth))
+                && a.iter().zip(b.iter()).all(|(av, bv)| is_compatible_env(av, bv, env, lenient_json, depth))
         }
 
         // Object structural compatibility: value has all target fields with compatible types.
@@ -91,16 +138,16 @@ pub fn is_compatible_env(
         (Type::Object(value_fields), Type::Object(target_fields)) => {
             target_fields.iter().all(|(key, target_ty)| {
                 match value_fields.get(key) {
-                    Some(vt) => is_compatible_env(vt, target_ty, env, depth),
-                    None => is_compatible_env(&Type::Null, target_ty, env, depth),
+                    Some(vt) => is_compatible_env(vt, target_ty, env, lenient_json, depth),
+                    None => is_compatible_env(&Type::Null, target_ty, env, lenient_json, depth),
                 }
             })
         }
 
         // Function compatibility: contravariant params, covariant return
         (
-            Type::Function { params: vp, ret: vr },
-            Type::Function { params: tp, ret: tr },
+            Type::Function { params: vp, ret: vr, .. },
+            Type::Function { params: tp, ret: tr, .. },
         ) => {
             // Opaque `Function` annotation: all params are TypeVar(MAX) and ret is TypeVar(MAX).
             // Treat as accepting any function regardless of arity.
@@ -118,14 +165,14 @@ pub fn is_compatible_env(
             let params_ok = vp
                 .iter()
                 .zip(tp.iter())
-                .all(|(v, t)| is_compatible_env(t, v, env, depth));
+                .all(|(v, t)| is_compatible_env(t, v, env, lenient_json, depth));
             // Covariant: value return must be compatible with target return
-            let ret_ok = is_compatible_env(vr, tr, env, depth);
+            let ret_ok = is_compatible_env(vr, tr, env, lenient_json, depth);
             params_ok && ret_ok
         }
 
         // Iterator covariance
-        (Type::Iterator(a), Type::Iterator(b)) => is_compatible_env(a, b, env, depth),
+        (Type::Iterator(a), Type::Iterator(b)) => is_compatible_env(a, b, env, lenient_json, depth),
 
         _ => false,
     }
@@ -156,6 +203,56 @@ pub fn is_exact_match(value_type: &Type, target_type: &Type) -> bool {
         }
         // Named types: treat as compatible for exact match (can't expand without env)
         (Type::Named(a), Type::Named(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// True when assigning a `Json` value into `target` would silently skip validation of a
+/// *structured object shape* — i.e. `target` is (or unfolds to) an `Object` with at least one
+/// required (non-nullable) field. This is the cast-hole hazard the ADR-046 fix targets:
+/// `val p: Person = readJson(...)` where `Person = {name:String, age:Int32}`. An open object
+/// `{}` (the stdlib "any object" sink) and a fully-optional object impose no obligation, so
+/// they are NOT structured decodes. We deliberately do NOT treat scalar/array targets as
+/// structured decodes: Json flowing into `Int64`/`Int32`/`UInt8[]`/etc. is the language's
+/// pervasive opaque-handle / buffer / polymorphic-return pattern, which has no `fromJson`
+/// remedy and predates this change.
+///
+/// A *total* scope (rejecting ANY `Json -> concrete T`, scalars/arrays included) was tried and
+/// empirically rejected: it broke the stdlib's pervasive polymorphic-return idiom where
+/// `slice`/`concat`/`accept`/`wait`/etc. return `Json` and the result is assigned to a concrete
+/// `val` (`val sub: UInt8[] = slice(bytes, 1, 4)`, `val code: Int64 = wait(pid)`), and it broke
+/// `is`-narrowing into a concrete branch (`if j is String then j else ""`, whose narrowed value
+/// is still statically `Json`). Those have no `fromJson` remedy and forcing one is hostile, so
+/// the gate is scoped to the genuine hazard — unchecked *structured object* decodes. See
+/// ADR-046 for the full empirical break list.
+fn requires_structured_decode(target: &Type, env: Option<&TypeEnv>, depth: &mut usize) -> bool {
+    if *depth > 32 {
+        return false;
+    }
+    match target {
+        Type::Object(fields) => fields.values().any(|t| !includes_null(t)),
+        Type::Named(n) => {
+            if let Some(env) = env {
+                if let Some(decl) = env.lookup_type(n) {
+                    if decl.params.is_empty() {
+                        *depth += 1;
+                        let r = requires_structured_decode(&decl.body.clone(), Some(env), depth);
+                        *depth -= 1;
+                        return r;
+                    }
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+/// True if `t` is `Null`, or a union that includes `Null` (an optional field type).
+fn includes_null(t: &Type) -> bool {
+    match t {
+        Type::Null => true,
+        Type::Union(variants) => variants.iter().any(includes_null),
         _ => false,
     }
 }

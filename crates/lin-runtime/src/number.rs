@@ -26,6 +26,85 @@ pub extern "C" fn lin_to_float64(v: i32) -> f64 {
     v as f64
 }
 
+/// Explicit Float64 -> Float32 narrowing cast (spec §26). There is no implicit
+/// float narrowing, so this is the only way to obtain a Float32 from a computed
+/// Float64 (e.g. for big-endian f32 serialization via std/bytes).
+#[no_mangle]
+pub extern "C" fn lin_to_float32(v: f64) -> f32 {
+    v as f32
+}
+
+// -------------------------------------------------------------------------
+// Explicit narrowing integer casts (spec §26). Each takes the widest
+// practical integer input (i64) and truncates to the target width using
+// `as`-cast (sign/zero handling per Rust `as` semantics). These back the
+// std/number `toUInt8`/`toInt8`/`toUInt16`/`toInt16`/`toUInt32`/`toInt64`/
+// `toUInt64` exports and the byte-extraction in std/bytes. The input is taken
+// as u64 (the widest unsigned) so any narrower unsigned integer (UInt8/16/32)
+// or a masked UInt64 widens into it at the call site without losing range.
+// -------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn lin_to_uint8(v: u64) -> u8 {
+    v as u8
+}
+
+#[no_mangle]
+pub extern "C" fn lin_to_int8(v: u64) -> i8 {
+    v as i8
+}
+
+#[no_mangle]
+pub extern "C" fn lin_to_uint16(v: u64) -> u16 {
+    v as u16
+}
+
+#[no_mangle]
+pub extern "C" fn lin_to_int16(v: u64) -> i16 {
+    v as i16
+}
+
+#[no_mangle]
+pub extern "C" fn lin_to_uint32(v: u64) -> u32 {
+    v as u32
+}
+
+#[no_mangle]
+pub extern "C" fn lin_to_int64(v: u64) -> i64 {
+    v as i64
+}
+
+#[no_mangle]
+pub extern "C" fn lin_to_uint64(v: u64) -> u64 {
+    v
+}
+
+// -------------------------------------------------------------------------
+// Float bit-reinterpret intrinsics (spec §35.3). A float's bit pattern
+// cannot be obtained by shift-and-mask, so std/bytes needs these to
+// (de)serialize floats through UInt8[] buffers.
+// -------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "C" fn lin_f32_to_bits(f: f32) -> u32 {
+    f.to_bits()
+}
+
+#[no_mangle]
+pub extern "C" fn lin_f32_from_bits(u: u32) -> f32 {
+    f32::from_bits(u)
+}
+
+#[no_mangle]
+pub extern "C" fn lin_f64_to_bits(f: f64) -> u64 {
+    f.to_bits()
+}
+
+#[no_mangle]
+pub extern "C" fn lin_f64_from_bits(u: u64) -> f64 {
+    f64::from_bits(u)
+}
+
 #[no_mangle]
 pub extern "C" fn lin_is_int32(s: *const LinString) -> bool {
     unsafe {

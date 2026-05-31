@@ -13,7 +13,7 @@ use lin_codegen::Codegen;
 use lin_lex::Lexer;
 use lin_parse::ast::{Module, Stmt};
 use lin_parse::Parser;
-use lin_ir::{lower_module, rc_elide};
+use lin_ir::{lower_module_with_imports, rc_elide};
 
 #[derive(Debug)]
 pub struct CompileOptions {
@@ -76,7 +76,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     pre_resolve_imports_from_ast(&ast_module, &base_dir, &mut imported_modules, &mut import_order, &mut import_sources)?;
 
     // 3b. Type check main module with pre-resolved import types.
-    let typed_module = check_module_with_imports(&ast_module, &imported_modules)
+    let typed_module = check_module_with_imports(&ast_module, &imported_modules, false)
         .map_err(CompileError::TypeCheck)?;
 
     // 4. LLVM codegen via the LinIR pipeline (the sole compilation backend).
@@ -85,6 +85,25 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     // instrumented (stdlib import sources are not tracked, so they pass `None` below).
     let context = Context::create();
     let mut cg = Codegen::new(&context, &module_name, opts.coverage);
+
+    // Determine, before any function is declared, whether the whole program may spawn an
+    // async boundary — it references any concurrency intrinsic (the `lin_async`/`lin_parallel`/
+    // `lin_worker`/… family, reachable only via `std/async`). When it does, codegen must NOT
+    // mark user functions `nounwind`, because a runtime fault inside a thunk unwinds through
+    // Lin frames to the thread boundary (spec §32.2.2, ADR-042). Scan the main module and every
+    // import's intrinsic map.
+    let async_intrinsics = [
+        "lin_async", "lin_await", "lin_parallel", "lin_race", "lin_timeout", "lin_retry",
+        "lin_thread_pool", "lin_worker", "lin_request", "lin_message", "lin_close",
+        "lin_pool_async", "lin_serve",
+    ];
+    let mut uses_async = typed_module.intrinsics.values().any(|n| async_intrinsics.contains(&n.as_str()));
+    for m in imported_modules.values() {
+        if m.intrinsics.values().any(|n| async_intrinsics.contains(&n.as_str())) {
+            uses_async = true;
+        }
+    }
+    cg.set_uses_async(uses_async);
 
     // Point coverage at the main module's source (canonical absolute path so llvm-cov can
     // locate the file when reporting).
@@ -117,7 +136,19 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
                 }
             }
         }
-        let mut ir_module = lower_module(&typed_module);
+        let (mut ir_module, mono_diags) = lower_module_with_imports(&typed_module, &imported_modules);
+        // Monomorphization diagnostics: errors (e.g. an uninferrable type parameter) abort the
+        // build; warnings (e.g. specialization-budget overflow → boxed fallback) are rendered but
+        // do not stop compilation, since the fallback still produces a correct program.
+        let (errors, warnings): (Vec<_>, Vec<_>) = mono_diags
+            .into_iter()
+            .partition(|d| matches!(d.severity, lin_common::Severity::Error));
+        for w in &warnings {
+            w.render(&opts.source_path.to_string_lossy(), &source);
+        }
+        if !errors.is_empty() {
+            return Err(CompileError::TypeCheck(errors));
+        }
         rc_elide::elide_rc(&mut ir_module);
         cg.compile_module_from_ir(&ir_module);
     }
@@ -244,16 +275,25 @@ fn parse_source(source: &str) -> Result<Module, Vec<lin_common::Diagnostic>> {
 fn check_module_with_imports(
     ast_module: &Module,
     imported_modules: &HashMap<String, TypedModule>,
+    lenient_json: bool,
 ) -> Result<TypedModule, Vec<lin_common::Diagnostic>> {
     let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
+    let mut import_type_decls: HashMap<(String, String), (Vec<String>, Type)> = HashMap::new();
     for (path, imp_module) in imported_modules {
         let sig = ModuleSignature::from_module(imp_module);
         for (name, ty) in sig.exports {
             import_type_map.insert((path.clone(), name), ty);
         }
+        for (name, decl) in sig.type_exports {
+            import_type_decls.insert((path.clone(), name), decl);
+        }
     }
     let mut checker = Checker::new();
     checker.import_types = import_type_map;
+    checker.import_type_decls = import_type_decls;
+    // The trusted stdlib forwards Json handles into concrete intrinsic/foreign params by
+    // design, so it checks Json->concrete leniently (ADR-046). User code does not.
+    checker.lenient_json = lenient_json;
     checker.protect_import_typevars();
     checker.check_module(ast_module)
 }
@@ -262,6 +302,7 @@ fn check_module_with_imports(
 fn stdlib_source(path: &str) -> Option<&'static str> {
     match path {
         "std/io"     => Some(include_str!("../../../stdlib/io.lin")),
+        "std/json"   => Some(include_str!("../../../stdlib/json.lin")),
         "std/string" => Some(include_str!("../../../stdlib/string.lin")),
         "std/number" => Some(include_str!("../../../stdlib/number.lin")),
         "std/array"  => Some(include_str!("../../../stdlib/array.lin")),
@@ -276,6 +317,11 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/path"     => Some(include_str!("../../../stdlib/path.lin")),
         "std/math"     => Some(include_str!("../../../stdlib/math.lin")),
         "std/hash"     => Some(include_str!("../../../stdlib/hash.lin")),
+        "std/bytes"    => Some(include_str!("../../../stdlib/bytes.lin")),
+        "std/net"      => Some(include_str!("../../../stdlib/net.lin")),
+        "std/process"  => Some(include_str!("../../../stdlib/process.lin")),
+        "std/tty"      => Some(include_str!("../../../stdlib/tty.lin")),
+        "std/signal"   => Some(include_str!("../../../stdlib/signal.lin")),
         _ => None,
     }
 }
@@ -324,7 +370,10 @@ fn pre_resolve_imports_from_ast(
             continue;
         }
 
-        let typed = check_module_with_imports(&ast_mod, cache)
+        // Only the embedded stdlib is trusted to forward Json into concrete params (ADR-046);
+        // user-defined imported modules are checked strictly, like the main module.
+        let is_stdlib = stdlib_source(path.as_str()).is_some();
+        let typed = check_module_with_imports(&ast_mod, cache, is_stdlib)
             .map_err(CompileError::TypeCheck)?;
         let sig = ModuleSignature::from_module(&typed);
         save_cache(&src_text, &typed, &imported_base);

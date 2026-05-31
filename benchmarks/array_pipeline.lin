@@ -1,0 +1,18 @@
+// Benchmark: array combinators — map/filter/reduce over a large range.
+// Exercises closure calls (indirect), boxing/unboxing of Int32 through the
+// Json element type, RC traffic on intermediate arrays, and allocation.
+import { print } from "std/io"
+import { toString } from "std/string"
+import { range, map, filter, reduce } from "std/array"
+
+val n = 2000000
+
+// range -> map -> filter -> reduce. Each stage allocates a new array and
+// runs an indirect closure call per element; the Int32 values flow through
+// the polymorphic Json slot, so this is the canonical box/unbox hot path.
+val total = range(0, n)
+  .map(x => x * 2)
+  .filter(x => x % 3 == 0)
+  .reduce(0, (acc, x) => acc + x)
+
+print(toString(total))

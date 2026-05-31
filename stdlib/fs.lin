@@ -19,7 +19,7 @@ import foreign "lin-runtime"
   val lin_fs_cp: (String, String) => Json
   val lin_fs_rm: (String, Int32) => Json
   val lin_fs_read_file_bytes: (String) => Json
-  val lin_fs_write_file_bytes: (String, Int32[]) => Json
+  val lin_fs_write_file_bytes: (String, UInt8[]) => Json
   val lin_fs_write_lines: (String, String[]) => Json
 
 export val readFile = (path: String): Json =>
@@ -78,7 +78,7 @@ export val mv = (src: String, dst: String): Json =>
 export val readFileBytes = (path: String): Json =>
   lin_fs_read_file_bytes(path)
 
-export val writeFileBytes = (path: String, bytes: Int32[]): Json =>
+export val writeFileBytes = (path: String, bytes: UInt8[]): Json =>
   lin_fs_write_file_bytes(path, bytes)
 
 export val writeLines = (path: String, lines: String[]): Json =>

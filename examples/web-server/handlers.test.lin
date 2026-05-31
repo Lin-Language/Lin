@@ -1,21 +1,43 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { handleStatus, handleUser } from "./handlers"
+import { contains } from "std/string"
+import { HttpRequest as Request } from "std/http"
+import { getIndex, getStatus, getUser } from "./handlers"
 
-val makeReq = (method: String, path: String): Json =>
+val makeReq = (method: String, path: String): Request =>
   { "method": method, "path": path, "query": "", "headers": {}, "body": "" }
 
 val s = suite("handlers", [
-  test("handleStatus returns 200", () =>
-    val resp = handleStatus(makeReq("GET", "/api/status"))
-    expect(resp["status"]).toBe(200)
+  test("getIndex returns the rendered template HTML in the body", () =>
+    // Regression: getIndex used to discard the rendered template and return the
+    // literal string "index". The body must be the rendered HTML, with the data
+    // interpolated into the template (title "Lin Web Server", heading "Welcome").
+    val resp = getIndex(makeReq("GET", "/"))
+    [
+      expect(resp["status"]).toBe(200),
+      expect(contains(resp["body"], "<!DOCTYPE html>")).toBe(true),
+      expect(contains(resp["body"], "Lin Web Server")).toBe(true),
+      expect(contains(resp["body"], "Welcome")).toBe(true),
+      // The old bug returned the literal "index"; a rendered body never equals it.
+      expect(resp["body"] == "index").toBe(false)
+    ]
   ),
-  test("handleUser returns 200 for valid path", () =>
-    val resp = handleUser(makeReq("GET", "/users/42"))
-    expect(resp["status"]).toBe(200)
+  test("getStatus returns 200", () =>
+    val resp = getStatus(makeReq("GET", "/api/status"))
+    [
+      expect(resp["status"]).toBe(200)
+    ]
   ),
-  test("handleUser returns 404 for non-matching path", () =>
-    val resp = handleUser(makeReq("GET", "/other"))
-    expect(resp["status"]).toBe(404)
+  test("getUser returns 200 for valid path", () =>
+    val resp = getUser(makeReq("GET", "/users/42"))
+    [
+      expect(resp["status"]).toBe(200)
+    ]
+  ),
+  test("getUser returns 404 for non-matching path", () =>
+    val resp = getUser(makeReq("GET", "/other"))
+    [
+      expect(resp["status"]).toBe(404)
+    ]
   ),
 ])
 run(s)

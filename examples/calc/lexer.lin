@@ -1,0 +1,60 @@
+// Lexer for the calc expression language.
+//
+// Turns a source string into a flat token array. Each token is a small tagged
+// object: { "kind": "num", "text": "12" } | { "kind": "op", "text": "+" } |
+// { "kind": "lparen" } | { "kind": "rparen" } | { "kind": "bad", "text": "@" }.
+//
+// Lin has no general `while` loop and local `val`s cannot self-recurse (only
+// top-level functions are forward-declared), so the scan is a set of top-level
+// recursive functions threading an index `i` through the source — the idiomatic
+// shape for stateful iteration in Lin. The token accumulator is built fresh and
+// returned out of `tokenize`, which exercises the fresh-arg-escape path.
+
+import { charCode, substring, at } from "std/string"
+import { push, length } from "std/array"
+
+// A lexer token. `kind` is the discriminant ("num" | "op" | "lparen" |
+// "rparen" | "bad"); `text` carries the source slice for the kinds that need
+// it (num/op/bad). lparen/rparen omit `text` — structurally still a Token.
+type Token = { "kind": String, "text": String }
+
+// Character classes (ASCII). charCode gives the codepoint at an index.
+val isDigit = (c: Int32): Boolean =>
+  c >= 48 && c <= 57            // '0'..'9'
+
+val isSpace = (c: Int32): Boolean =>
+  c == 32 || c == 9 || c == 10 || c == 13
+
+// End index (one past the last digit) of the number run starting at `i`.
+val scanNumberEnd = (src: String, i: Int32, n: Int32): Int32 =>
+  if i < n && isDigit(charCode(src, i)) then scanNumberEnd(src, i + 1, n)
+  else i
+
+// Append one token (or skip one space) per step, then recurse on the new index.
+// `tokens` is mutated in place via push and threaded through unchanged.
+val scan = (src: String, i: Int32, n: Int32, tokens: Token[]): Token[] =>
+  if i >= n then tokens
+  else
+    val c = charCode(src, i)
+    if isSpace(c) then scan(src, i + 1, n, tokens)
+    else if isDigit(c) then
+      val end = scanNumberEnd(src, i, n)
+      push(tokens, { "kind": "num", "text": src.substring(i, end) })
+      scan(src, end, n, tokens)
+    else if c == 40 then                                  // '('
+      push(tokens, { "kind": "lparen" })
+      scan(src, i + 1, n, tokens)
+    else if c == 41 then                                  // ')'
+      push(tokens, { "kind": "rparen" })
+      scan(src, i + 1, n, tokens)
+    else if c == 43 || c == 45 || c == 42 || c == 47 then // + - * /
+      push(tokens, { "kind": "op", "text": src.at(i) })
+      scan(src, i + 1, n, tokens)
+    else
+      // Unknown character: emit a bad token the parser will reject.
+      push(tokens, { "kind": "bad", "text": src.at(i) })
+      scan(src, i + 1, n, tokens)
+
+// Public entry point: source string -> token array.
+export val tokenize = (src: String): Token[] =>
+  src.scan(0, length(src), [])

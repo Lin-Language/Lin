@@ -206,7 +206,7 @@ There is no unary minus operator on arbitrary expressions in this version of the
 val negated = 0 - x
 ```
 
-The only unary operator is bitwise `~` (§35.2); there is no unary minus.
+There are two unary operators — bitwise `~` (§35.2) and logical `!` (§24.1, §35.2); there is no unary minus.
 
 ## 4. Values
 
@@ -372,6 +372,8 @@ This is equivalent to the optional-chaining operator (`?.`) in other languages �
 - If the operand's static type is a typed object that does **not** declare the key, the access is a compile-time error. (Use `Json` if you need free-form access.)
 - If the operand may be `Null` (e.g., a union `T | Null`), the access type widens to include `Null`.
 - Array element access on `T[]` has type `T` (the static type does not include `Null`; the runtime error is the contract for OOB).
+
+A `Json` value is **not** implicitly convertible to a concrete structured object type (an object with a required, non-nullable field). Binding or passing a `Json` value where such a type is expected is a compile-time error; convert it explicitly with `fromJson` (validated decode, `std/json`) or narrow it with `is`/`has` (runtime tag checks). `Json → Json` and `Json` flowing into scalars/handles/buffers/open objects remain permissive. See ADR-046 and ADR-047.
 
 ## 7. Bindings
 
@@ -591,6 +593,17 @@ val add = (a: Int32, b: Int32) =>
   return a + b
 ```
 
+### 9.5 Default Parameter Values
+
+A parameter may declare a default value with `= expr` after its (optional) type
+annotation, making it optional at the call site. Optional parameters must be
+last. See §10.6 for the full semantics.
+
+```txt
+val greet = (name: String, greeting: String = "Hello") =>
+  "${greeting}, ${name}"
+```
+
 ## 10. Function Calls and Partial Application
 
 ### 10.1 Function Calls
@@ -601,14 +614,31 @@ val result = add(1, 2)
 
 ### 10.2 Partial Application
 
-Functions may be partially applied from left to right by supplying fewer arguments than the function declares. The result is a new function awaiting the remaining arguments.
+Functions may be partially applied from left to right. Partial application is
+requested with an **explicit trailing comma** after the supplied arguments; the
+result is a new function awaiting the remaining arguments.
 
 ```txt
-val addTen = add(10)
+val addTen = add(10,)
 val fifteen = addTen(5)
 ```
 
 The type of `addTen` is `(Int32) => Int32`.
+
+A call without a trailing comma is a complete call. If it supplies fewer
+arguments than the function declares, the omitted trailing parameters must have
+default values (see §10.6), which are filled in; otherwise it is an error (§10.5).
+The trailing comma is what distinguishes "call now, using defaults for the rest"
+from "partially apply." A trailing comma on a fully-saturated argument list has
+no effect.
+
+```txt
+val add = (a: Int32, b: Int32) => a + b
+
+val f  = add(10)    // error: add has no default for `b`; use add(10,) to curry
+val g  = add(10,)   // partial application — g : (Int32) => Int32
+val s  = add(1, 2)  // complete call
+```
 
 ### 10.3 Over-Application Is an Error
 
@@ -635,6 +665,47 @@ This syntax is not a tuple value:
 ```
 
 It is an argument list, and is only meaningful in call or dot-application contexts (see §11.1).
+
+### 10.6 Default Argument Values
+
+A parameter may declare a default value with `= expr` after its (optional) type
+annotation. Such a parameter is **optional**: a complete call (no trailing comma)
+may omit it, and the default expression is evaluated to supply the missing value.
+
+```txt
+val greet = (name: String, greeting: String = "Hello") => "${greeting}, ${name}"
+
+greet("World")          // "Hello, World"   — greeting defaulted
+greet("World", "Hi")    // "Hi, World"
+```
+
+Rules:
+
+- **Optional parameters must be last.** Once a parameter has a default, every
+  parameter after it must also have one. A required parameter following an
+  optional one is a compile-time error.
+- A default expression is type-checked against its parameter's type.
+- A default expression may reference parameters declared **before** it (and any
+  outer binding in scope), so defaults can chain:
+
+  ```txt
+  val box = (w: Int32, h: Int32 = w, area: Int32 = w * h) => area
+  box(4)        // area = 4 * 4 = 16
+  box(4, 3)     // area = 4 * 3 = 12
+  ```
+
+- Default values are filled left-to-right for the omitted trailing parameters.
+  A complete call must still supply at least the **required** (non-defaulted)
+  parameters; supplying fewer is an error (§10.5).
+- Default-fill applies uniformly to direct calls, dot-application
+  (`x.f(...)`, §11), and calls through a first-class function value
+  (`val g = greet; g("World")`).
+- To partially apply a function that has defaults — rather than fill them — use
+  an explicit trailing comma (§10.2): `greet("World",)` yields a function
+  awaiting `greeting`.
+
+Default values are evaluated by the *defining* module, so an imported function
+carries its defaults across module boundaries.
 
 ## 11. Dot Application
 
@@ -769,11 +840,13 @@ The inner `if`'s `else` is at the same indent as the `if` itself; the outer `mat
 
 ### 13.1 `is`
 
-`is` performs an **exact** match.
+`is` performs a **type-exact** match: the value must conform to `T`, checked recursively.
 
-- For a named object type `T`, `value is T` is true only if `value` has *exactly* the fields of `T`, with no extra fields, each typed correctly.
+- For a named object type `T`, `value is T` is true if `value` is an object that has every field of `T` **present and of the correct type** (checked recursively into nested objects, arrays, and literal-typed fields). Extra fields are permitted — `is` validates field *types*, not field *count*. This is what makes the post-match narrowing to `T` sound (ADR-054): if `value is T` succeeds, `value` genuinely conforms to `T`, so the narrowed field types are not a lie. Field-type checking follows the same structural-validation semantics and number policy as `fromJson` (§18, `std/json`): an integer-typed field accepts an integral in-range number, a float-typed field accepts any number, a literal-typed field requires the exact value.
 - For a primitive type, `value is T` is true only if the runtime value has that exact type.
 - For a literal, `value is "Dave"` is true only if the value equals the literal.
+
+The difference between `is T` and `has T` (§13.2) for an object type is therefore precisely whether field *types* are validated: `is` checks presence **and** type; `has` checks presence only. Both permit extra fields.
 
 ```txt
 val describe = (input: String | Int32 | Null): String =>
@@ -796,7 +869,7 @@ val isDave = (input: String): Boolean =>
 val isAdult = person has { age } && person["age"] >= 18
 ```
 
-Literal values used with `is` have base type, not singleton type. `"Dave" is "Dave"` is true; the type of the literal `"Dave"` is `String`.
+A string literal as a **value** (e.g. on either side of `is`) has base type `String`, not a singleton. `"Dave" is "Dave"` is true and is a runtime equality check; the type of the literal value `"Dave"` is `String`. A string literal in **type** position, however, *is* a singleton type — see §18 (tagged unions) and design principle §33. So `value is "Dave"` tests value equality, whereas `type Name = "Dave"` declares a type whose only inhabitant is the string `"Dave"`.
 
 A single `match` arm may not combine `is` and `has` patterns — each arm uses one keyword.
 
@@ -804,8 +877,10 @@ A single `match` arm may not combine `is` and `has` patterns — each arm uses o
 
 `has` performs a **structural compatibility** check — the value contains *at least* the requested shape, but may have additional fields.
 
-- For a named object type `T`, `value has T` is true if every field of `T` is present in `value` with a compatible type. Extra fields are permitted.
+- For a named object type `T`, `value has T` is true if every field of `T` is **present** in `value` (its keys exist). Field *types* are **not** validated — that is what `is T` adds (§13.1). Extra fields are permitted.
 - For an inline shape `{ a, b }`, `value has { a, b }` is true if `value` is an object containing at least those keys.
+
+So `has` is the presence-only check and `is` is the presence-and-type check; both allow extra fields. Use `has` to test/destructure shape when the field types are already known or unimportant, and `is` when a successful match must guarantee the fields' types (e.g. before narrowing a `Json` value to a typed shape).
 
 ```txt
 val describeNamed = (input: Json): String =>
@@ -938,7 +1013,17 @@ val describe = (input: String | Int32 | Null): String =>
 
 ### 16.1 `is` Patterns
 
-`is` means exact match.
+`is` is the type-exact / shape-exact form. Its precise meaning depends on the pattern kind:
+
+- **Primitive / literal / `Null`:** exact runtime-type or value match.
+- **Named object type (`is Person`):** every declared field present and correctly typed, checked
+  recursively; extra fields permitted (§13.1, ADR-054).
+- **Array literal pattern (`is [a, b]`):** length-exact — the array must have exactly the listed
+  number of elements.
+- **Inline object pattern (`is { name }`):** the listed keys must be present (and any literal
+  value-constraints satisfied); extra fields are permitted. (Inline `is { .. }` is a
+  presence + value-constraint check, not a recursive field-*type* check — that is what a named
+  object type `is T` adds.)
 
 ```txt
 match input
@@ -947,7 +1032,7 @@ match input
   is String => "String"
 ```
 
-For arrays:
+For arrays (length-exact):
 
 ```txt
 match items
@@ -956,11 +1041,11 @@ match items
   is [first, second] => "exactly two items"
 ```
 
-For objects:
+For objects (listed keys present; extra fields allowed):
 
 ```txt
 match input
-  is { name } => "exactly one field: name"
+  is { name } => "has at least the field: name"
 ```
 
 ### 16.2 `has` Patterns
@@ -1192,13 +1277,23 @@ This is not used because JSON-shaped types should describe JSON-shaped data. Ite
 
 ## 18. Tagged Unions
 
-Tagged unions are represented with structural JSON object types.
+Tagged unions are represented with structural JSON object types. The discriminant field uses a
+**string-literal singleton type** (`"success"` / `"failure"`), so the tags are checked at compile
+time: a literal in this position admits only its exact value, an object literal carrying the wrong
+tag (or no tag) is a **compile-time type error**, and assigning a value to a `Result<…>` selects
+the matching variant by its discriminant. The `match`/`has` arms then discriminate the variants at
+runtime via the `"type"` field.
 
 ```txt
 type Result<T, E> =
   | { "type": "success", "value": T }
   | { "type": "failure", "error": E }
 ```
+
+Both the multi-line leading-`|` form above (the canonical spelling) and the equivalent single-line
+form `type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }`
+parse. In the multi-line form the leading `|` is optional on the first variant; a `|` may also
+begin a continuation line.
 
 ```txt
 val divide = (a: Float64, b: Float64): Result<Float64, String> =>
@@ -1305,8 +1400,8 @@ std/iter     range, iterOf  (also auto-imported as globals)
 std/result   Result<T, E> type alias
 std/io       print, readLine, lines, readAll
 std/fs       readFile, writeFile, appendFile, readLines, readJson, writeJson, exists
-std/http     fetch, fetchWith, fetchJson, postJson
-std/server   serve, json, text, redirect, notFound, badRequest, pathMatch, parseBody
+std/http     fetch, fetchWith, fetchJson, postJson,
+             serve, json, text, redirect, notFound, badRequest, matchPath, parseBody
 ```
 
 The full signature of every function is specified in `docs/STDLIB.md`.
@@ -1356,7 +1451,7 @@ Closures capture bindings from their defining scope. Mutable bindings are captur
 ```txt
 +   -   *   /   %
 ==  !=  >   <   >=  <=
-&&  ||
+&&  ||  !
 &   |   ^   <<  >>  ~      (bitwise — see §35.2)
 ```
 
@@ -1366,10 +1461,10 @@ These are built-in operators, not ordinary functions. They are not available thr
 
 The bitwise operators `&`, `|`, `^`, `<<`, `>>` require integer operands; `~` is unary. They are specified in §35.2. In type-expression position `|` remains the union separator (§8.4); the two never overlap syntactically.
 
-The **only** unary operator is bitwise `~` (§35.2). There is no unary minus (see §3.7 for negative literals) and no boolean negation operator; boolean negation must be done explicitly:
+There are two unary operators: bitwise `~` (§35.2) and logical `!`. There is no unary minus (see §3.7 for negative literals). Logical `!b` requires a `Bool` operand and yields `Bool`:
 
 ```txt
-val notReady = ready == false
+val notReady = !ready
 ```
 
 ### 24.2 Precedence
@@ -1378,7 +1473,7 @@ Precedence follows the standard convention used by C-family languages, from high
 
 ```txt
 1.  ()  []  .          (call, index, dot application)
-2.  ~                  (unary bitwise not)
+2.  ~  !               (unary bitwise not, unary logical not; right-associative)
 3.  *  /  %
 4.  +  -
 5.  <<  >>             (bitwise shift)
@@ -1391,7 +1486,7 @@ Precedence follows the standard convention used by C-family languages, from high
 12. ||
 ```
 
-All binary arithmetic, comparison, and bitwise operators are left-associative. `&&` and `||` are left-associative and short-circuiting.
+All binary arithmetic, comparison, and bitwise operators are left-associative. `&&` and `||` are left-associative and short-circuiting. The unary operators `~` and `!` are right-associative and bind tighter than `*` but looser than postfix, so `!a == b` parses as `(!a) == b`.
 
 ## 25. Type Narrowing
 
@@ -1429,9 +1524,22 @@ Numeric values automatically widen between numeric types when used in arithmetic
 - An integer combined with a floating-point value widens to a floating-point type large enough to hold the integer exactly when possible, otherwise to the larger floating-point family.
 - Two floating-point values widen to the larger.
 
-Explicit narrowing — assigning a wider numeric to a narrower one, or any floating-point to an integer — requires an explicit cast via stdlib (`toInt32`, `toFloat32`, etc.) and is a runtime error if the value cannot be represented exactly. Implicit narrowing is a compile-time error.
+Explicit narrowing — assigning a wider numeric to a narrower one, or any floating-point to an integer — requires an explicit cast via stdlib and is a runtime error if the value cannot be represented exactly (for the float→int casts). Implicit narrowing is a compile-time error.
 
-Literal inference: a numeric literal without a suffix takes the type required by its surrounding context if one exists; otherwise integer literals default to `Int32` and floating-point literals default to `Float64`.
+The explicit-narrowing mechanism is a family of `std/number` cast functions, each truncating to the named width with two's-complement (`as`-cast) semantics:
+
+```txt
+toInt32:  (Float64) => Int32      // truncate a float to a 32-bit int
+toFloat64:(Int32)   => Float64    // widen
+toUInt8 / toInt8:    (UInt64) => UInt8 / Int8       // integer narrowing
+toUInt16 / toInt16:  (UInt64) => UInt16 / Int16
+toUInt32 / toInt64:  (UInt64) => UInt32 / Int64
+toUInt64:            (UInt64) => UInt64
+```
+
+The integer-narrowing casts take their input as `UInt64` (the widest unsigned), so any narrower *unsigned* integer — or a value first masked down to a byte/word — widens into the parameter without range loss before truncation; a bare integer literal in range is accepted directly. These are the byte-extraction primitives used by `std/bytes` (§35.3) and are generally useful wherever explicit width control is needed.
+
+Literal inference: a numeric literal with an explicit type suffix (e.g. `5i64`, `3.14f32`, §3.6) is fixed at that type, overriding context — assigning it where an incompatible type is expected is a type error. A suffixless literal takes the type required by its surrounding context if one exists; otherwise integer literals default to `Int32` and floating-point literals default to `Float64`. An integer literal whose value exceeds `Int32`'s range but has no wider context does **not** truncate: its default widens to the smallest type that preserves the value (`Int64`, or `UInt64` for a decimal above `Int64`'s max). A literal that does not fit its required (context or suffix) type is a compile-time error, never a silent truncation.
 
 Generic and overload-style inference uses bidirectional type checking: type information flows both from declarations into expressions and from expression context back into holes. This is sufficient for `[1,2,3].map(i => i * i)` to infer `T = Int32` and `U = Int32` without explicit annotation.
 
@@ -1606,12 +1714,12 @@ Decided:
 1. `export` may be used on `val`, `var`, and `type` declarations.
 2. `Json` is a built-in type; `Number` is a built-in union alias covering every numeric family (§4.2).
 3. `Unknown` and `Never` are not built-in types initially.
-4. `is Person` is exact; `has Person` or `has { ... }` matches shape and allows extra fields.
+4. `is Person` checks every declared field is present and correctly typed (recursively; extra fields allowed — ADR-054); `has Person` or `has { ... }` checks only that the requested fields are present (types not validated). Both allow extra fields; arrays match length-exactly (§16.1).
 5. `is` on generic type applications is unsupported in v1.
 6. `is`/`has` are expressions of type `Boolean` and may appear in any expression context.
 7. A single `match` arm uses either `is` or `has`, not both.
 8. Assignment expressions evaluate to the assigned value.
-9. Operators are built-in, not ordinary functions. No unary operators in v1.
+9. Operators are built-in, not ordinary functions. Exactly two unary operators — bitwise `~` and logical `!`; no unary minus (§24.1, §35.2, ADR-059).
 10. `Iterator<T>` and `Iterable<T>` are opaque runtime types.
 11. Arrays satisfy `Iterable<T>` automatically.
 12. Array types are `T[]` (unbounded) and `[T1, T2, ...]` (fixed-length).
@@ -1635,7 +1743,7 @@ Decided:
 30. Bracket access is safe: missing object key → `Null`, `Null` propagates; array OOB is a runtime error.
 31. Generic types are covariant in producer positions, contravariant in consumer positions.
 32. Type-expression precedence: `[]` > `<>` > `=>` > `|`.
-33. Literal types: literal values have their base type (`"Dave"` is `String`), not a singleton type.
+33. Literal types: a string literal in **type** position is a singleton type (`type Tag = "ok"` admits only the value `"ok"`). A string literal as a **value** still infers to its base type (`val x = "Dave"` is `String`); the singleton is obtained by checking it against an expected literal type. A literal widens to `String`; `String` does not narrow to a literal. (Numeric/boolean literal types are not yet supported.)
 34. Runtime errors halt the program; they cannot be caught.
 35. Integer division by zero is a runtime error; floating-point follows IEEE 754.
 36. `toString` is defined for every primitive (§27.8); used implicitly by string interpolation.
@@ -1702,7 +1810,7 @@ match result
   is Int32 => print("got ${result}")
 ```
 
-A runtime error inside the thunk (array out of bounds, integer division by zero, non-exhaustive match, etc.) is caught at the OS thread boundary and surfaces as an `Error` value at the `await` call site rather than halting the program. This makes `async` a **fault isolation boundary** — the only place in Lin where runtime errors become recoverable values. The general rule that runtime errors are uncatchable (§19.1) does not apply inside an async thunk.
+An async fault surfaces as an `Error` value whose discriminant is the string-literal `"type": "error"`; since string literals in type position are singleton types (§18, §33), this tag is the same kind of compile-time-checked discriminant used by user-defined tagged unions. A runtime error inside the thunk (array out of bounds, integer division by zero, non-exhaustive match, etc.) is caught at the OS thread boundary and surfaces as an `Error` value at the `await` call site rather than halting the program. This makes `async` a **fault isolation boundary** — the only place in Lin where runtime errors become recoverable values. The general rule that runtime errors are uncatchable (§19.1) does not apply inside an async thunk.
 
 If `await` is called and the result is `Error` but the caller does not inspect it (e.g. assigns to a `val` typed as `Int32`), the type checker will reject the assignment at compile time.
 
@@ -2067,27 +2175,27 @@ export val postJson = (url: String, body: Json): HttpResponse | Error =>
   })
 ```
 
-`parseJson` is an intrinsic (`__parseJson: (String) -> Json | Error`) that parses a JSON string into a Lin value. It is not part of the public stdlib API but is available internally to `std/http` and `std/server`.
+`parseJson` is an intrinsic (`__parseJson: (String) -> Json | Error`) that parses a JSON string into a Lin value. It is not part of the public stdlib API but is available internally to `std/http`.
 
-### 33.5 `std/server` Intrinsics
+### 33.5 HTTP Server (`serve`)
 
-The server module requires two intrinsics — one for sequential serving and one for pool-dispatched serving. Everything else (`json`, `text`, `redirect`, `notFound`, `badRequest`, `pathMatch`, `parseBody`) is written in Lin on top of the `HttpResponse` type and `__parseJson`.
+Server support lives in `std/http` alongside the client. The serving loop itself is the one intrinsic; everything else (`json`, `text`, `redirect`, `notFound`, `badRequest`, `matchPath`, `parseBody`) is written in Lin on top of the `HttpResponse` type and `__parseJson`.
 
 ```txt
-__serverServe:         (port: Int32, handler: (HttpRequest) -> HttpResponse) -> Null
-__serverServeWithPool: (pool: ThreadPool, port: Int32, handler: (HttpRequest) -> HttpResponse) -> Null
+__serverServe: (handler: (HttpRequest) -> HttpResponse, port: Int32) -> Null
 ```
 
-`__serverServeWithPool` is not called directly from Lin. It is invoked via the `pool.serve` dot-call form, which the runtime dispatches to this intrinsic when `.serve` is called on a `ThreadPool` value. The handler is subject to the same `var`-capture restriction as `pool.async` (§32.2.1) — enforced at compile time where statically detectable.
+`__serverServe` binds a TCP listener on `port`, then serves connections **sequentially** (one request at a time): it parses each incoming HTTP/1.1 request into an `HttpRequest`, invokes `handler`, and writes the returned `HttpResponse` back on the wire. It blocks indefinitely (it only returns — as an `Error`-shaped value — if the port cannot be bound). The handler runs inside a fault-isolation boundary: a faulting handler yields a `500` response and the server keeps serving.
 
-The Lin stdlib wrappers in `std/server`:
+The handler argument comes **first** so the dot-call form reads naturally: `router.serve(3000)` desugars (first-argument application, §11.1) to `serve(router, 3000)`. Both forms are equivalent.
+
+A pool-dispatched variant (`pool.serve`, concurrent request handling) is not yet implemented.
+
+The Lin stdlib wrappers in `std/http`:
 
 ```txt
-export val serve = (port: Int32, handler: (HttpRequest) -> HttpResponse): Null =>
-  __serverServe(port, handler)
-
-// pool.serve dispatches to __serverServeWithPool via the runtime's dot-call dispatch
-// on ThreadPool values; it is not a standalone exported function.
+export val serve = (handler: (HttpRequest) -> HttpResponse, port: Int32): Null =>
+  __serverServe(handler, port)
 
 export val json = (status: Int32, body: Json): HttpResponse => {
   "status":  status,
@@ -2097,7 +2205,7 @@ export val json = (status: Int32, body: Json): HttpResponse => {
 
 export val text = (status: Int32, body: String): HttpResponse => {
   "status":  status,
-  "headers": { "Content-Type": "text/plain" },
+  "headers": { "Content-Type": "text/plain; charset=utf-8" },
   "body":    body
 }
 
@@ -2107,20 +2215,20 @@ export val redirect = (url: String): HttpResponse => {
   "body":    ""
 }
 
-export val notFound = (): HttpResponse =>
-  text(404, "Not Found")
+export val notFound: HttpResponse =
+  { "status": 404, "headers": {}, "body": "Not Found" }
 
 export val badRequest = (message: String): HttpResponse =>
-  text(400, message)
+  { "status": 400, "headers": {}, "body": message }
 
 export val parseBody = (req: HttpRequest): Json | Error =>
   __parseJson(req["body"])
 
-export val pathMatch = (pattern: String, path: String): { ...String } | Null =>
+export val matchPath = (path: String, pattern: String): { ...String } | Null =>
   __serverPathMatch(pattern, path)
 ```
 
-`__serverPathMatch: (String, String) -> { ...String } | Null` is a Rust intrinsic that splits both strings on `/`, matches literal segments exactly, captures `:name` segments by name, and returns `Null` on any mismatch.
+`__serverPathMatch` is a Rust intrinsic that splits both strings on `/`, matches literal segments exactly, captures `:name` segments by name, and returns `Null` on any mismatch. `matchPath` takes the **path first** so it reads as `req["path"].matchPath("/users/:id")` in dot-call form.
 
 ## 34. Foreign Function Interface
 
@@ -2259,11 +2367,11 @@ Lin provides the bitwise binary operators and one unary operator:
 ~    bitwise not       (unary)
 ```
 
-`~` is the **only** unary operator in the language; it is the single exception to the "no unary operators" rule of §3.7/§24.1.
+There are two unary operators in the language: bitwise `~` (here) and logical `!` (§24.1). They are the exceptions to the "no unary minus" rule of §3.7/§24.1.
 
-**Typing.** Bitwise and shift operators require **integer** operands; a floating-point operand is a compile-time error. For `&`, `|`, `^`, the result type is the widened integer type of the two operands (§26). For `<<` and `>>`, the result type is the type of the left operand and the right operand may be any integer. For `~x`, the result type is the type of `x`.
+**Typing.** Bitwise and shift operators require **integer** operands; a floating-point operand is a compile-time error. For `&`, `|`, `^`, the result type is the widened integer type of the two operands (§26). For `<<` and `>>`, the result type is the type of the left operand and the right operand may be any integer. For `~x`, the result type is the type of `x`. The logical-not operator `!x` requires a `Bool` operand and yields `Bool`.
 
-**Precedence.** The new operators slot into the §24.2 ladder as shown there: shifts bind tighter than comparison; `&`, `^`, `|` bind between equality and `&&`, in that order (tightest first). `~` binds tighter than `*`.
+**Precedence.** The new operators slot into the §24.2 ladder as shown there: shifts bind tighter than comparison; `&`, `^`, `|` bind between equality and `&&`, in that order (tightest first). `~` and `!` bind tighter than `*` (and are right-associative).
 
 ```txt
 val nalType = header & 0x1F            // extract low 5 bits
@@ -2277,22 +2385,29 @@ val inverted = ~mask                   // bitwise complement
 
 ### 35.3 `std/bytes`
 
-`std/bytes` provides slicing and endian (de)serialization. The endian helpers are written in Lin on top of §35.1 and §35.2; only the float bit-reinterpret functions require intrinsics (a float's bit pattern cannot be obtained by shift-and-mask).
+`std/bytes` provides slicing and endian (de)serialization. The endian helpers are written in Lin on top of §35.1 and §35.2, **plus the explicit narrowing casts of §26** (exported from `std/number`). The earlier claim that the endian helpers are pure shift-and-mask was incomplete: extracting a byte from a wider integer — e.g. `(v >> 24) & 0xFF` for a `UInt32` `v` — yields a `UInt32`, which cannot be *implicitly* narrowed to a `UInt8` (§26 makes implicit narrowing a compile-time error), so an explicit `toUInt8(...)` cast is required. Conversely, assembling a wide integer from bytes widens each byte first (`toUInt32(b[off]) << 24 | ...`). The four float bit-reinterpret functions are the only true intrinsics here (a float's bit pattern cannot be obtained by shift-and-mask).
 
 ```txt
-slice:       <T>(T[], Int32, Int32) => T[]      // also exported from std/array; sub-buffer copy
+slice:       (UInt8[], Int32, Int32) => UInt8[]   // also exported from std/array; sub-buffer copy
 
 u16FromBe / u32FromBe / u64FromBe:  (UInt8[], Int32) => UIntN     // read big-endian at offset
 u16ToBe   / u32ToBe   / u64ToBe:    (UIntN) => UInt8[]            // write big-endian
-// little-endian variants: u16FromLe, u32ToLe, ...
+// little-endian variants: u16FromLe, u32FromLe, u64FromLe, u16ToLe, u32ToLe, u64ToLe
 
 f32ToBits:   (Float32) => UInt32        // intrinsic: bit reinterpret
 f32FromBits: (UInt32) => Float32
 f64ToBits:   (Float64) => UInt64
 f64FromBits: (UInt64) => Float64
+
+f32ToBe / f32ToLe:     (Float32) => UInt8[]          // compose bits + endian write
+f32FromBe / f32FromLe: (UInt8[], Int32) => Float32   // compose endian read + bits
+f64ToBe / f64ToLe:     (Float64) => UInt8[]
+f64FromBe / f64FromLe: (UInt8[], Int32) => Float64
 ```
 
-Slicing is a function, `slice(buf, start, end)`; there is no range-index syntax (`buf[a..b]`) in this version.
+The narrowing casts that back the byte-extraction live in `std/number` (§26): `toUInt8`, `toInt8`, `toUInt16`, `toInt16`, `toUInt32`, `toInt64`, `toUInt64`, each `(UInt64) => <target>`, truncating with two's-complement (`as`-cast) semantics.
+
+Slicing is a function, `slice(buf, start, end)`; there is no range-index syntax (`buf[a..b]`) in this version. `slice` preserves element type — slicing a `UInt8[]` yields a `UInt8[]`.
 
 ### 35.4 OS Handle Convention
 
@@ -2329,15 +2444,25 @@ tcpClose:          (fd: Int32)                    => Null | Error
 
 `recv` fills a caller-owned `UInt8[]` (§35.1) and returns the number of bytes read; the buffer is never transferred across the boundary. Non-blocking mode plus a `Null`-on-would-block `recv`/`accept` replaces an explicit `poll`.
 
-Note that `std/server` (§33.5) already provides a high-level blocking HTTP server, and `std/http` (§33.4) an HTTP client; `std/net` is the lower-level byte-stream layer beneath them, for non-HTTP protocols and custom framing.
+Note that `std/http` already provides a high-level blocking HTTP server (`serve`, §33.5) and an HTTP client (§33.4); `std/net` is the lower-level byte-stream layer beneath them, for non-HTTP protocols and custom framing.
 
-### 35.6 `std/proc` — Subprocesses
+### 35.6 `std/process` — External Processes
+
+Two styles share one module. **Batch** runs a command to completion and collects its full output; **streaming** spawns a child and reads its stdout incrementally. `ProcessHandle` is an opaque `Int64` id (not an OS pid).
 
 ```txt
-spawn:       (argv: String[])              => Int64 | Error     // opaque process handle
-readStdout:  (handle: Int64, buf: UInt8[]) => Int32 | Error     // bytes; 0 = EOF
-kill:        (handle: Int64)               => Null | Error
-wait:        (handle: Int64)               => Int32 | Error     // exit code
+type ExecResult = { "status": Int32, "stdout": String, "stderr": String }
+
+// batch
+exec:        (command: String, args: String[]) => ExecResult | Error
+shell:       (command: String)                 => ExecResult | Error   // via /bin/sh -c
+cwd:         ()                                 => String
+chdir:       (path: String)                     => Null | Error
+// streaming
+spawn:       (command: String, args: String[]) => ProcessHandle | Error
+readStdout:  (handle: ProcessHandle, buf: UInt8[]) => Int32 | Error     // bytes; 0 = EOF
+kill:        (handle: ProcessHandle)            => Null | Error
+wait:        (handle: ProcessHandle)            => Int32 | Error         // exit code
 ```
 
 ### 35.7 `std/tty` — Raw Terminal

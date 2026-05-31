@@ -29,6 +29,30 @@ pub const TAG_UINT8: u8 = 10;
 pub const TAG_INT8: u8 = 11;
 pub const TAG_UINT16: u8 = 12;
 pub const TAG_INT16: u8 = 13;
+/// UInt64 — payload interpreted as `u64` (unsigned). For *boxed scalars* all other unsigned
+/// widths (UInt8/16/32) are zero-extended and boxed as TAG_INT64 (always-positive i64), so
+/// for boxed scalars this is the only tag whose payload must be read unsigned. (As a *flat
+/// array elem_tag* it likewise marks unsigned-64-bit storage — shared numeric space.)
+pub const TAG_UINT64: u8 = 14;
+/// UInt32 flat-array elem_tag — marks a flat array whose raw elements are `u32`, so display/
+/// JSON reads them unsigned. (Boxed UInt32 *scalars* still use TAG_INT64 positive; this tag
+/// only ever appears as a flat-array elem_tag, never on a boxed TaggedVal.)
+pub const TAG_UINT32: u8 = 15;
+/// Promise (async) — payload is a `*mut LinPromise` (an opaque, non-refcounted runtime handle).
+/// A boxed promise round-trips through TypeVar slots and arrays like any other tagged value;
+/// codegen boxes a freshly-spawned promise and unboxes it at `await`/combinator boundaries. RC
+/// is a no-op for this tag (promises are not refcounted; `await` reaps the underlying thread).
+pub const TAG_PROMISE: u8 = 16;
+/// ThreadPool / Worker handle — payload is a `*mut LinThreadPool` / `*mut LinWorker` (opaque,
+/// non-refcounted, program-lifetime runtime handles). Boxed like a promise so the handle
+/// round-trips through TypeVar slots; codegen boxes the constructor result and unboxes at the
+/// method boundary (`pool.async`, `w.request`/`message`/`close`). RC is a no-op for this tag.
+pub const TAG_HANDLE: u8 = 17;
+/// `Shared<T>` box — payload is a `*const SharedBox` (atomic-refcounted, RwLock-guarded shared
+/// mutable state, §2.3.1). Unlike other heap tags, its refcount is ATOMIC: retain/release go
+/// through `lin_shared_retain`/`lin_shared_release`. The thread-transfer copy path shares it by
+/// an atomic bump rather than deep-copying through it (the nesting rule).
+pub const TAG_SHARED: u8 = 18;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -37,6 +61,17 @@ pub struct TaggedVal {
     pub _pad: [u8; 7],
     pub payload: u64,
 }
+
+// Codegen and the runtime hard-code this layout: `lin_box_*`/`build_tagged_val_alloca`
+// write `tag` at offset 0 and `payload` at offset 8, and several hot paths
+// `copy_nonoverlapping(.., 16)` between a TaggedVal and a LinArrayElem (which must be the
+// same shape — see array.rs). A field reorder or size change would silently corrupt every
+// boxed value, so pin the layout at compile time.
+const _: () = {
+    assert!(core::mem::size_of::<TaggedVal>() == 16);
+    assert!(core::mem::offset_of!(TaggedVal, tag) == 0);
+    assert!(core::mem::offset_of!(TaggedVal, payload) == 8);
+};
 
 // ---------------------------------------------------------------------------
 // Cached scalar boxes (CPython-style small-value interning).
@@ -112,6 +147,13 @@ unsafe fn is_cached_box(p: *const u8) -> bool {
         || in_range(BOOL_CACHE.as_ptr(), 2)
 }
 
+/// Public wrapper for `is_cached_box`, used by `lin_tagged_clone` to alias immutable cached
+/// scalar boxes instead of allocating a fresh box for them.
+#[inline]
+pub unsafe fn is_cached_box_pub(p: *const u8) -> bool {
+    is_cached_box(p)
+}
+
 pub unsafe fn alloc_tagged(tag: u8, payload: u64) -> *mut u8 {
     let layout = Layout::new::<TaggedVal>();
     let ptr = alloc(layout);
@@ -120,6 +162,11 @@ pub unsafe fn alloc_tagged(tag: u8, payload: u64) -> *mut u8 {
     }
     let tv = ptr as *mut TaggedVal;
     (*tv).tag = tag;
+    // Zero the padding so the full leading u64 equals `tag` with no garbage in the pad
+    // bytes. resolve_lin_str (and similar) discriminate boxed-vs-raw by reading the first
+    // 8 bytes as a u64 and comparing to a tag constant; uninitialised pad made that check
+    // unreliable (it only worked when the allocator happened to return zeroed memory).
+    (*tv)._pad = [0; 7];
     (*tv).payload = payload;
     ptr
 }
@@ -150,6 +197,14 @@ pub unsafe extern "C" fn lin_box_int64(v: i64) -> *mut u8 {
         return &INT64_CACHE[(v - SMALL_INT_MIN) as usize] as *const TaggedVal as *mut u8;
     }
     alloc_tagged(TAG_INT64, v as u64)
+}
+
+/// Box a UInt64 value. Tagged TAG_UINT64 so the payload is read back unsigned.
+/// Always heap-allocates: the small-int caches are tagged TAG_INT64, so reusing them
+/// would lose the unsigned tag. (UInt64 values are rare on the hot path.)
+#[no_mangle]
+pub unsafe extern "C" fn lin_box_uint64(v: u64) -> *mut u8 {
+    alloc_tagged(TAG_UINT64, v)
 }
 
 #[no_mangle]
@@ -199,6 +254,12 @@ pub unsafe extern "C" fn lin_unbox_int64(p: *const u8) -> i64 {
     (*(p as *const TaggedVal)).payload as i64
 }
 
+/// Unbox a UInt64 value (assumes tag is TAG_UINT64).
+#[no_mangle]
+pub unsafe extern "C" fn lin_unbox_uint64(p: *const u8) -> u64 {
+    (*(p as *const TaggedVal)).payload
+}
+
 /// Unbox a Float64 value (assumes tag is TAG_FLOAT64).
 #[no_mangle]
 pub unsafe extern "C" fn lin_unbox_float64(p: *const u8) -> f64 {
@@ -234,8 +295,8 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
     let ap = (*av).payload;
     let bp = (*bv).payload;
     // Cross-numeric equality: compare numeric types by value (Int32 == Int64 if same numeric value).
-    let at_is_num = at >= TAG_INT32 && at <= TAG_FLOAT64;
-    let bt_is_num = bt >= TAG_INT32 && bt <= TAG_FLOAT64;
+    let at_is_num = (at >= TAG_INT32 && at <= TAG_FLOAT64) || at == TAG_UINT64;
+    let bt_is_num = (bt >= TAG_INT32 && bt <= TAG_FLOAT64) || bt == TAG_UINT64;
     if at_is_num && bt_is_num && at != bt {
         return (tagged_as_f64(at, ap) == tagged_as_f64(bt, bp)) as u8;
     }
@@ -244,6 +305,7 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
         TAG_BOOL => (ap == bp) as u8,
         TAG_INT32 => ((ap as i32) == (bp as i32)) as u8,
         TAG_INT64 => ((ap as i64) == (bp as i64)) as u8,
+        TAG_UINT64 => (ap == bp) as u8,
         TAG_FLOAT32 => (f32::from_bits(ap as u32) == f32::from_bits(bp as u32)) as u8,
         TAG_FLOAT64 => (f64::from_bits(ap) == f64::from_bits(bp)) as u8,
         TAG_STR => {
@@ -284,6 +346,7 @@ pub unsafe extern "C" fn lin_tagged_cmp(a: *const u8, b: *const u8) -> i32 {
         }
         (TAG_INT32, TAG_INT32) => (ap as i32).cmp(&(bp as i32)) as i32,
         (TAG_INT64, TAG_INT64) => (ap as i64).cmp(&(bp as i64)) as i32,
+        (TAG_UINT64, TAG_UINT64) => ap.cmp(&bp) as i32,
         (TAG_FLOAT32, TAG_FLOAT32) => {
             let af = f32::from_bits(ap as u32);
             let bf = f32::from_bits(bp as u32);
@@ -295,7 +358,10 @@ pub unsafe extern "C" fn lin_tagged_cmp(a: *const u8, b: *const u8) -> i32 {
             af.partial_cmp(&bf).map(|o| o as i32).unwrap_or(0)
         }
         // Mixed numeric: widen to f64
-        (a_tag, b_tag) if a_tag >= TAG_INT32 && a_tag <= TAG_FLOAT64 && b_tag >= TAG_INT32 && b_tag <= TAG_FLOAT64 => {
+        (a_tag, b_tag)
+            if ((a_tag >= TAG_INT32 && a_tag <= TAG_FLOAT64) || a_tag == TAG_UINT64)
+                && ((b_tag >= TAG_INT32 && b_tag <= TAG_FLOAT64) || b_tag == TAG_UINT64) =>
+        {
             let af = tagged_as_f64(at, ap);
             let bf = tagged_as_f64(bt, bp);
             af.partial_cmp(&bf).map(|o| o as i32).unwrap_or(0)
@@ -308,6 +374,7 @@ pub(crate) unsafe fn tagged_as_f64(tag: u8, payload: u64) -> f64 {
     match tag {
         TAG_INT32 => (payload as i32) as f64,
         TAG_INT64 => (payload as i64) as f64,
+        TAG_UINT64 => payload as f64,
         TAG_FLOAT32 => f32::from_bits(payload as u32) as f64,
         TAG_FLOAT64 => f64::from_bits(payload),
         _ => 0.0,
@@ -338,6 +405,37 @@ pub unsafe extern "C" fn lin_length_dyn(p: *const u8) -> i32 {
     }
 }
 
+/// Free ONLY the TaggedVal box allocation, WITHOUT touching its inner heap payload.
+///
+/// Used by the owning var-cell/global model when a transient box (e.g. the result of boxing
+/// a freshly-allocated array/object via Coerce on the way into a union cell) has had its
+/// inner payload's ownership transferred elsewhere (the cell clones the box, retaining the
+/// inner; the inner's original +1 is released separately via the raw value's scope-exit
+/// release). Calling `lin_tagged_release` on such a box would double-free the inner, so we
+/// reclaim only the 16-byte box shell here.
+///
+/// Null-safe and cached-box-safe (immutable static scalar boxes are never freed).
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_free_box(p: *mut u8) {
+    if p.is_null() || is_cached_box(p) {
+        return;
+    }
+    std::alloc::dealloc(p, std::alloc::Layout::new::<TaggedVal>());
+}
+
+/// Free the `TaggedVal*` box shell of `p`, but ONLY if `p` is a DIFFERENT pointer than `other`.
+/// Used by `for`/`while` to reclaim a per-iteration element box shell while avoiding a
+/// double-free when the callback returned (an alias of) that very box: in that case the loop's
+/// separate full release of the return box already reclaimed it, so freeing the shell again here
+/// would double-free. Frees only the shell (never the inner payload); null/cached-box safe.
+#[no_mangle]
+pub unsafe extern "C" fn lin_tagged_free_box_if_distinct(p: *mut u8, other: *mut u8) {
+    if p == other {
+        return;
+    }
+    lin_tagged_free_box(p);
+}
+
 /// Release a TaggedVal*: release the pointed-to heap value (if pointer type), then free the box.
 /// Safe to call with null (treated as null — no-op).
 #[no_mangle]
@@ -353,6 +451,7 @@ pub unsafe extern "C" fn lin_tagged_release(p: *mut u8) {
         TAG_STR => crate::string::lin_string_release(payload as *mut crate::string::LinString),
         TAG_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
         TAG_OBJECT => crate::object::lin_object_release(payload as *mut crate::object::LinObject),
+        TAG_SHARED => crate::shared::lin_shared_release_box(payload as *const u8),
         _ => {} // Scalars (null, bool, int, float) have no heap payload.
     }
     // Cached scalar boxes (small ints, bools) are immutable statics — never free them.
@@ -416,6 +515,50 @@ mod cache_tests {
             assert_eq!(lin_get_tag(p), TAG_INT64);
             assert_eq!(lin_unbox_int64(p), 5);
             assert!(is_cached_box(p));
+        }
+    }
+
+    #[test]
+    fn uint64_box_tag_and_roundtrip() {
+        unsafe {
+            for v in [0u64, 1, 42, i64::MAX as u64, (i64::MAX as u64) + 1, u64::MAX] {
+                let p = lin_box_uint64(v);
+                assert_eq!(lin_get_tag(p), TAG_UINT64, "uint64 box must carry TAG_UINT64");
+                assert_eq!(lin_unbox_uint64(p), v, "uint64 unbox round-trip");
+                // Never cached — always heap-allocated; release frees it (no double-free panic).
+                assert!(!is_cached_box(p));
+                lin_tagged_release(p);
+            }
+        }
+    }
+
+    #[test]
+    fn uint64_max_displays_unsigned() {
+        unsafe {
+            let p = lin_box_uint64(u64::MAX) as *const crate::tagged::TaggedVal;
+            let s = crate::string::lin_tagged_to_string(p);
+            assert_eq!((*s).as_str(), "18446744073709551615");
+            crate::string::lin_string_release(s);
+            // Release the box.
+            lin_tagged_release(lin_box_uint64(u64::MAX));
+        }
+    }
+
+    #[test]
+    fn uint64_eq_and_cmp_high_bit() {
+        unsafe {
+            // u64 >= 2^63 must compare as a large positive number, not negative.
+            let big = lin_box_uint64(u64::MAX);
+            let small = lin_box_uint64(1);
+            assert_eq!(lin_tagged_eq(big, big), 1);
+            assert_eq!(lin_tagged_eq(big, small), 0);
+            assert_eq!(lin_tagged_cmp(big, small), 1, "u64::MAX > 1");
+            assert_eq!(lin_tagged_cmp(small, big), -1, "1 < u64::MAX");
+            // Cross-type: a UInt64 small value equals an Int32 of the same value.
+            let i = lin_box_int32(1);
+            assert_eq!(lin_tagged_eq(small, i), 1, "UInt64(1) == Int32(1)");
+            lin_tagged_release(big);
+            lin_tagged_release(small);
         }
     }
 }

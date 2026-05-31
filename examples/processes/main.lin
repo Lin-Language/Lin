@@ -1,0 +1,20 @@
+// processes — a small task runner: run a sequence of named shell commands as
+// subprocesses, classify each (pass/fail/error), and print a summary report.
+// A realistic "run my build/check steps" tool exercising std/process (exec),
+// recursion over a task list, and tagged result classification.
+//
+// Run:   lin run examples/processes/main.lin
+// Test:  lin test examples/processes/
+
+import { runAll } from "./task"
+import { render } from "./report"
+import { print } from "std/io"
+
+val tasks = [
+  { "name": "echo",    "command": "printf", "args": ["hello"] },
+  { "name": "true",    "command": "true",   "args": [] },
+  { "name": "false",   "command": "false",  "args": [] },
+  { "name": "missing", "command": "definitely-not-a-real-command-xyz", "args": [] }
+]
+
+print(render(runAll(tasks)))

@@ -11,15 +11,21 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/string`](#stdstring) | String manipulation functions |
 | [`std/array`](#stdarray) | Array and iterator functions |
 | [`std/number`](#stdnumber) | Numeric parsing and conversion functions |
+| [`std/bytes`](#stdbytes) | Byte-buffer slicing and endian (de)serialization |
 | [`std/math`](#stdmath) | Mathematical functions |
 | [`std/object`](#stdobject) | Object introspection functions |
+| [`std/json`](#stdjson) | Type-directed JSON decode |
+| [`std/hash`](#stdhash) | Stable structural hash of any value |
 | [`std/io`](#stdio) | stdin/stdout and terminal input |
 | [`std/fs`](#stdfs) | Filesystem read and write |
 | [`std/path`](#stdpath) | Path string manipulation |
 | [`std/http`](#stdhttp) | HTTP client and server |
+| [`std/net`](#stdnet) | UDP and TCP sockets |
+| [`std/process`](#stdprocess) | Run and manage external processes |
+| [`std/tty`](#stdtty) | Raw terminal mode and key reads |
+| [`std/signal`](#stdsignal) | Blocking wait for OS signals |
 | [`std/async`](#stdasync) | Async, concurrency and workers |
 | [`std/env`](#stdenv) | Environment variables |
-| [`std/process`](#stdprocess) | External process execution |
 | [`std/template`](#stdtemplate) | String template rendering |
 | [`std/test`](#stdtest) | Test framework |
 | [`std/time`](#stdtime) | Timestamps and timing |
@@ -61,6 +67,8 @@ This document specifies the standard library for the Lin language. All modules a
 | Function | Signature | Summary |
 | --- | --- | --- |
 | [`append`](#append) | `(Json[], Json) -> Json[]` | Non-mutating single-element append |
+| [`arrayAllocate`](#arrayAllocate) | `(Int32) -> Json[]` | Allocate an array of n nulls |
+| [`arrayAllocateFilled`](#arrayAllocateFilled) | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
 | [`at`](#at-array) | `(Json[], Int32) -> Json` | Element at index; negative indices count from end |
 | [`chunk`](#chunk) | `(Json[], Int32) -> Json[][]` | Split into n-sized sub-arrays |
 | [`compact`](#compact) | `(Json[]) -> Json[]` | Remove null elements |
@@ -89,10 +97,13 @@ This document specifies the standard library for the Lin language. All modules a
 | [`prepend`](#prepend) | `(Json[], Json) -> Json[]` | Non-mutating single-element prepend |
 | [`product`](#product) | `(Number[]) -> Number` | Product of all elements |
 | [`push`](#push) | `(Json[], Json) -> Null` | Append an element to an array in place |
-| [`range`](#range) | `(Int32, Int32, Int32?) -> Iterator` | Integer range `[start, end)` with optional step |
+| [`range`](#range) | `(Int32, Int32) -> Iterator` | Integer range `[start, end)`, step 1 |
+| [`rangeStep`](#rangeStep) | `(Int32, Int32, Int32) -> Iterator` | Integer range with an explicit (possibly negative) step |
 | [`reduce`](#reduce) | `(Json[], Json, (Json, Json) -> Json) -> Json` | Fold left with an accumulator |
 | [`reverse`](#reverse) | `(Json[]) -> Json[]` | Return a reversed copy |
 | [`scan`](#scan) | `(Json[], Json, (Json, Json) -> Json) -> Json[]` | Reduce returning all intermediate values |
+| [`set`](#set-array) | `(Json[], Int32, Json) -> Null` | Set an element by index in place |
+| [`slice`](#slice) | `(T[], Int32, Int32) -> T[]` | Sub-buffer copy; preserves element type |
 | [`some`](#some) | `(Json[], (Json) -> Boolean) -> Boolean` | True if any element matches |
 | [`sort`](#sort) | `(Json[], (Json, Json) -> Int32) -> Json[]` | Return sorted copy using comparator |
 | [`sortBy`](#sortBy) | `(Json[], (Json) -> Json) -> Json[]` | Return sorted copy using key extractor |
@@ -112,6 +123,13 @@ This document specifies the standard library for the Lin language. All modules a
 | [`parseInt32`](#parseInt32) | `(String) -> Int32` | Parse decimal string to Int32 |
 | [`toFloat64`](#toFloat64) | `(Int32) -> Float64` | Widen Int32 to Float64 |
 | [`toInt32`](#toInt32) | `(Float64) -> Int32` | Truncate float to Int32 |
+| [`toUInt8`](#narrowing-casts) | `(UInt64) -> UInt8` | Truncate to an 8-bit unsigned byte |
+| [`toInt8`](#narrowing-casts) | `(UInt64) -> Int8` | Truncate to an 8-bit signed byte |
+| [`toUInt16`](#narrowing-casts) | `(UInt64) -> UInt16` | Truncate to a 16-bit unsigned int |
+| [`toInt16`](#narrowing-casts) | `(UInt64) -> Int16` | Truncate to a 16-bit signed int |
+| [`toUInt32`](#narrowing-casts) | `(UInt64) -> UInt32` | Truncate to a 32-bit unsigned int |
+| [`toInt64`](#narrowing-casts) | `(UInt64) -> Int64` | Reinterpret to a 64-bit signed int |
+| [`toUInt64`](#narrowing-casts) | `(UInt64) -> UInt64` | Identity / reinterpret to 64-bit unsigned int |
 | [`tryParseFloat64`](#tryParseFloat64) | `(String) -> Float64 \| Null` | Parse Float64, returning Null on failure |
 | [`tryParseInt32`](#tryParseInt32) | `(String) -> Int32 \| Null` | Parse Int32, returning Null on failure |
 
@@ -190,13 +208,13 @@ This document specifies the standard library for the Lin language. All modules a
 | [`mkdir`](#mkdir) | `(String, Json) -> Null \| Error` | Create a directory; supports `{ parents }` option |
 | [`mv`](#mv) | `(String, String) -> Null \| Error` | Move or rename a file |
 | [`readFile`](#readFile) | `(String) -> String \| Error` | Read entire file as a string |
-| [`readFileBytes`](#readFileBytes) | `(String) -> Int32[] \| Error` | Read file as raw bytes (each byte as Int32) |
+| [`readFileBytes`](#readFileBytes) | `(String) -> UInt8[] \| Error` | Read file as a raw byte buffer |
 | [`readJson`](#readJson) | `(String) -> Json \| Error` | Read and parse file as JSON |
 | [`readLines`](#readLines) | `(String) -> String[] \| Error` | Read lines of a file into an array |
 | [`rm`](#rm) | `(String, Json) -> Null \| Error` | Remove a file or directory; supports `{ recursive }` |
 | [`stat`](#stat) | `(String) -> FileStat \| Error` | File metadata |
 | [`writeFile`](#writeFile) | `(String, String) -> Null \| Error` | Write string to file, replacing contents |
-| [`writeFileBytes`](#writeFileBytes) | `(String, Int32[]) -> Null \| Error` | Write raw bytes to file |
+| [`writeFileBytes`](#writeFileBytes) | `(String, UInt8[]) -> Null \| Error` | Write a raw byte buffer to file |
 | [`writeJson`](#writeJson) | `(String, Json, Json) -> Null \| Error` | Serialise value to pretty JSON; supports `{ compact }` option |
 | [`writeLines`](#writeLines) | `(String, String[]) -> Null \| Error` | Write an array of strings, one per line |
 
@@ -232,9 +250,9 @@ This document specifies the standard library for the Lin language. All modules a
 | [`json`](#json-helper) | `(Int32, Json) -> HttpResponse` | Build a JSON response |
 | [`notFound`](#notFound) | `HttpResponse` | 404 response value |
 | [`parseBody`](#parseBody) | `(HttpRequest) -> Json \| Error` | Parse the request body as JSON |
-| [`pathMatch`](#pathMatch) | `(String, String) -> { ...String } \| Null` | Match a path against a pattern, returning captured params |
+| [`matchPath`](#matchPath) | `(String, String) -> { ...String } \| Null` | Match a path against a pattern, returning captured params |
 | [`redirect`](#redirect) | `(String) -> HttpResponse` | Build a 302 redirect response |
-| [`serve`](#serve) | `(Int32, (HttpRequest) -> HttpResponse) -> Null` | Start a sequential HTTP server |
+| [`serve`](#serve) | `((HttpRequest) -> HttpResponse, Int32) -> Null` | Start a sequential HTTP server |
 | [`text`](#text-helper) | `(Int32, String) -> HttpResponse` | Build a plain-text response |
 
 **std/async**
@@ -244,13 +262,19 @@ This document specifies the standard library for the Lin language. All modules a
 | [`async`](#async) | `(() -> T) -> Promise` | Run a thunk asynchronously |
 | [`await`](#await) | `(Promise) -> T` | Block until a promise resolves |
 | [`close`](#close) | `(Worker) -> Null` | Shut down a worker |
+| [`frozen`](#frozen) | `<T>(T) -> T` | Deep-freeze a value into lock-free shared read-only state |
+| [`get`](#shared--get--set--withlock) | `<T>(Shared<T>) -> T` | Read a snapshot copy out of a `Shared` |
 | [`message`](#message) | `(Worker, Msg) -> Null` | Send a fire-and-forget message to a worker |
 | [`parallel`](#parallel) | `((() -> T)[]) -> T[]` | Run an array of thunks concurrently, collect results |
+| [`poolAsync`](#poolAsync) | `(ThreadPool, () -> T) -> Promise` | Enqueue a thunk on a thread pool |
 | [`race`](#race) | `(Promise[]) -> T` | Resolve with the first promise to complete |
 | [`request`](#request) | `(Worker, Msg) -> Reply` | Send a request to a worker and wait for reply |
 | [`retry`](#retry) | `(() -> T, Int32) -> T` | Retry a thunk up to n times on failure |
+| [`set`](#shared--get--set--withlock) | `<T>(Shared<T>, T) -> Null` | Replace a `Shared`'s value |
+| [`shared`](#shared--get--set--withlock) | `<T>(T) -> Shared<T>` | Create opt-in shared mutable state |
 | [`threadPool`](#threadPool) | `(Int32) -> ThreadPool` | Create a thread pool with n workers |
 | [`timeout`](#timeout) | `(Promise, Int32) -> T` | Add a millisecond timeout to a promise |
+| [`withLock`](#shared--get--set--withlock) | `<T, R>(Shared<T>, (T) -> R) -> R` | Atomic read-modify-write on a `Shared` |
 | [`worker`](#worker) | `((Msg) -> Reply, () -> Null) -> Worker` | Create a background worker |
 
 **std/env**
@@ -266,13 +290,14 @@ This document specifies the standard library for the Lin language. All modules a
 
 | Function | Signature | Summary |
 | --- | --- | --- |
-| [`chdir`](#chdir) | `(String) -> Null \| Error` | Change working directory |
+| [`exec`](#exec) | `(String, String[]) -> ExecResult \| Error` | Run a command to completion, collect output |
+| [`shell`](#shell) | `(String) -> ExecResult \| Error` | Run a shell command string via `/bin/sh -c` |
 | [`cwd`](#cwd) | `() -> String` | Current working directory |
-| [`exec`](#exec) | `(String, String[]) -> ExecResult \| Error` | Run a command and collect output |
-| [`kill`](#kill) | `(ProcessHandle) -> Null` | Send SIGTERM to a spawned process |
-| [`shell`](#shell) | `(String) -> ExecResult \| Error` | Run a shell command string |
-| [`spawn`](#spawn) | `(String, String[]) -> ProcessHandle` | Start a process without waiting |
-| [`wait`](#wait) | `(ProcessHandle) -> ExecResult \| Error` | Wait for a spawned process to finish |
+| [`chdir`](#chdir) | `(String) -> Null \| Error` | Change working directory |
+| [`spawn`](#spawn) | `(String, String[]) -> ProcessHandle \| Error` | Start a process without waiting |
+| [`readStdout`](#readStdout) | `(ProcessHandle, UInt8[]) -> Int32 \| Error` | Read piped stdout into a buffer (0 = EOF) |
+| [`kill`](#kill) | `(ProcessHandle) -> Null \| Error` | Send SIGTERM to a spawned process |
+| [`wait`](#wait) | `(ProcessHandle) -> Int32 \| Error` | Wait for a spawned process; returns exit code |
 
 **std/template**
 
@@ -288,7 +313,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`expect`](#expect) | `(Json) -> Asserter` | Begin an assertion chain |
 | [`run`](#run-test) | `(Suite[]) -> Null` | Execute suites, print results, exit non-zero on failure |
 | [`suite`](#suite) | `(String, Test[]) -> Suite` | Group tests under a name |
-| [`test`](#test) | `(String, () -> Assertion \| Assertion[]) -> Test` | Declare a single test case |
+| [`test`](#test) | `(String, () -> Assertion[]) -> Test` | Declare a single test case |
 
 **std/time**
 
@@ -299,7 +324,8 @@ This document specifies the standard library for the Lin language. All modules a
 | [`fromIso`](#fromIso) | `(String) -> Int64 \| Error` | Parse an ISO 8601 string to a millisecond timestamp |
 | [`now`](#now) | `() -> Int64` | Current Unix timestamp in milliseconds |
 | [`parse`](#parse-time) | `(String, String) -> Int64 \| Error` | Parse a date string with a format pattern |
-| [`sleep`](#sleep) | `(Int32) -> Null` | Block for n milliseconds |
+| [`sleep`](#sleep) | `(Int64) -> Null` | Block for n milliseconds |
+| [`sleepMicros`](#sleepMicros) | `(Int64) -> Null` | Block for n microseconds |
 | [`startTimer`](#startTimer) | `() -> Timer` | Start a high-resolution elapsed timer |
 | [`toIso`](#toIso) | `(Int64) -> String` | Format a timestamp as ISO 8601 |
 
@@ -723,11 +749,44 @@ import { map, filter, for, range } from "std/array"
 val append: (arr: Json[], item: Json) -> Json[]
 ```
 
-Returns a new array with `item` added at the end. Does not modify `arr`. For in-place mutation, use `push`.
+Returns a new array with `item` added at the end. Does not modify `arr`. For in-place mutation, use `push`. The result preserves the input's element representation: appending to a flat scalar array (e.g. `UInt8[]`, `Int32[]`) yields a flat array of the same type (the item is coerced into the element type), so byte-level consumers still read packed bytes; a `Json[]` stays tagged.
 
 ```txt
 append([1, 2], 3)    // [1, 2, 3]
 append([], "hello")  // ["hello"]
+```
+
+---
+
+### arrayAllocate
+
+```txt
+val arrayAllocate: (n: Int32) -> Json[]
+```
+
+Returns a new array of length `n` with every element initialised to `null`. Useful as a
+pre-sized buffer to fill by index with [`set`](#set-array).
+
+```txt
+val buf = arrayAllocate(3)   // [null, null, null]
+set(buf, 0, "a")
+```
+
+---
+
+### arrayAllocateFilled
+
+```txt
+val arrayAllocateFilled: (n: Int32, fill: Json) -> Json[]
+```
+
+Returns a new array of length `n` with every element set to `fill`. When `fill` is a heap value (array, object, or string), the elements share the same value (each slot reads it back equal); replace a slot wholesale with [`set`](#set-array) to give it a distinct value.
+
+```txt
+arrayAllocateFilled(3, 0)        // [0, 0, 0]
+arrayAllocateFilled(2, "x")      // ["x", "x"]
+arrayAllocateFilled(3, [1, 2])   // [[1, 2], [1, 2], [1, 2]]
+arrayAllocateFilled(0, 9)        // []
 ```
 
 ---
@@ -1139,7 +1198,7 @@ val [evens, odds] = [1, 2, 3, 4, 5].partition(x => x % 2 == 0)
 val prepend: (arr: Json[], item: Json) -> Json[]
 ```
 
-Returns a new array with `item` added at the beginning. Does not modify `arr`.
+Returns a new array with `item` added at the beginning. Does not modify `arr`. Like `append`, the result preserves the input's element representation (a flat `UInt8[]`/`Int32[]` stays flat; a `Json[]` stays tagged).
 
 ```txt
 prepend([2, 3], 1)    // [1, 2, 3]
@@ -1183,16 +1242,30 @@ push(xs, 2)
 ### range
 
 ```txt
-val range: (start: Int32, end: Int32, step: Int32?) -> Iterator
+val range: (start: Int32, end: Int32) -> Iterator
 ```
 
-Returns an iterator that yields integers from `start` up to (but not including) `end`, advancing by `step` each time. `step` defaults to `1` if omitted. `step` must be positive; if `start >= end`, the iterator is empty.
+Returns an iterator that yields integers from `start` up to (but not including) `end`, stepping by `1`. If `start >= end`, the iterator is empty. For a custom or negative step, use [`rangeStep`](#rangeStep).
 
 ```txt
 range(0, 3).for(i => print(toString(i)))   // prints 0, 1, 2
 range(1, 4).map(i => i * 2)               // [2, 4, 6]
-range(0, 10, 2).map(i => i)               // [0, 2, 4, 6, 8]
 range(5, 5)                               // empty
+```
+
+---
+
+### rangeStep
+
+```txt
+val rangeStep: (start: Int32, end: Int32, step: Int32) -> Iterator
+```
+
+Returns an iterator that yields integers from `start` toward `end` (exclusive), advancing by `step` each time. With a positive `step` it counts up while `i < end`; with a negative `step` it counts down while `i > end`. A `step` of `0` yields an empty iterator.
+
+```txt
+rangeStep(0, 10, 2).for(i => print(toString(i)))   // 0, 2, 4, 6, 8
+rangeStep(5, 0, -1).map(i => i)                    // [5, 4, 3, 2, 1]
 ```
 
 ---
@@ -1236,6 +1309,37 @@ Like `reduce`, but returns an array of all intermediate accumulator values inclu
 ```txt
 [1, 2, 3, 4].scan(0, (acc, x) => acc + x)   // [0, 1, 3, 6, 10]
 [].scan(0, (acc, x) => acc + x)              // [0]
+```
+
+---
+
+### set (array) {#set-array}
+
+```txt
+val set: (arr: Json[], index: Int32, item: Json) -> Null
+```
+
+Sets the element at `index` to `item` **in place** — a mutating operation, the index-assignment counterpart to [`push`](#push). `index` must be in bounds (`0 <= index < length(arr)`); an out-of-bounds index is a runtime error. Often paired with [`arrayAllocate`](#arrayAllocate) to fill a pre-sized buffer.
+
+```txt
+val buf = arrayAllocate(3)
+set(buf, 0, "a")
+set(buf, 1, "b")
+// buf is now ["a", "b", null]
+```
+
+---
+
+### slice
+
+```txt
+val slice: (arr: T[], start: Int32, end: Int32) -> T[]
+```
+
+Returns a copy of the elements in the half-open range `[start, end)`. `start` and `end` are clamped to `[0, length(arr)]`. The element type is preserved: slicing a `UInt8[]` yields a `UInt8[]`, an `Int32[]` an `Int32[]`, and a `Json[]` a `Json[]`. Also re-exported from `std/bytes`. There is no range-index syntax (`arr[a..b]`).
+
+```txt
+[10, 20, 30, 40, 50].slice(1, 4)   // [20, 30, 40]
 ```
 
 ---
@@ -1475,6 +1579,28 @@ toInt32(-2.1)   // -2
 
 ---
 
+### Narrowing casts
+
+```txt
+val toUInt8:  (v: UInt64) -> UInt8
+val toInt8:   (v: UInt64) -> Int8
+val toUInt16: (v: UInt64) -> UInt16
+val toInt16:  (v: UInt64) -> Int16
+val toUInt32: (v: UInt64) -> UInt32
+val toInt64:  (v: UInt64) -> Int64
+val toUInt64: (v: UInt64) -> UInt64
+```
+
+Explicit integer narrowing (spec §26). Implicit narrowing — assigning a wider numeric to a narrower one — is a compile-time error; these casts perform it explicitly, truncating to the target width with two's-complement (`as`-cast) semantics. The input is taken as `UInt64` (the widest unsigned), so any narrower *unsigned* integer — or a value masked down to a byte/word — widens into the parameter without range loss; a bare integer literal in range is accepted directly. They are the byte-extraction mechanism used by `std/bytes`, but are generally useful wherever explicit width control is needed.
+
+```txt
+toUInt8(0x1234)              // 0x34  (52)
+toUInt8((v >> 24) & 0xFF)    // top byte of a UInt32 v
+toUInt16(b[0]) << 8          // widen a byte for endian assembly
+```
+
+---
+
 ### tryParseFloat64
 
 ```txt
@@ -1502,6 +1628,50 @@ Parses `s` as a base-10 integer. Returns `Null` if `s` is not a valid `Int32`, i
 tryParseInt32("42")    // 42
 tryParseInt32("3.14")  // null
 tryParseInt32("bad")   // null
+```
+
+---
+
+## std/bytes
+
+Slicing and endian (de)serialization on `UInt8[]` byte buffers (spec §35.1–§35.3). The endian helpers are written in Lin on top of the bitwise operators (§35.2) and the `std/number` narrowing casts (extracting a byte from a wider integer needs an explicit narrowing cast). The four float bit-reinterpret functions are runtime intrinsics, since a float's bit pattern cannot be obtained by shift-and-mask.
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `slice` | `(UInt8[], Int32, Int32) -> UInt8[]` | Sub-buffer copy (re-export of `std/array` slice) |
+| `u16FromBe` / `u32FromBe` / `u64FromBe` | `(UInt8[], Int32) -> UIntN` | Read big-endian at offset |
+| `u16FromLe` / `u32FromLe` / `u64FromLe` | `(UInt8[], Int32) -> UIntN` | Read little-endian at offset |
+| `u16ToBe` / `u32ToBe` / `u64ToBe` | `(UIntN) -> UInt8[]` | Write big-endian |
+| `u16ToLe` / `u32ToLe` / `u64ToLe` | `(UIntN) -> UInt8[]` | Write little-endian |
+| `f32ToBits` | `(Float32) -> UInt32` | Reinterpret a float's bits (intrinsic) |
+| `f32FromBits` | `(UInt32) -> Float32` | Reinterpret bits as a float (intrinsic) |
+| `f64ToBits` | `(Float64) -> UInt64` | Reinterpret a double's bits (intrinsic) |
+| `f64FromBits` | `(UInt64) -> Float64` | Reinterpret bits as a double (intrinsic) |
+| `f32ToBe` / `f32ToLe` | `(Float32) -> UInt8[]` | Serialize a float (big/little-endian) |
+| `f32FromBe` / `f32FromLe` | `(UInt8[], Int32) -> Float32` | Deserialize a float at offset |
+| `f64ToBe` / `f64ToLe` | `(Float64) -> UInt8[]` | Serialize a double (big/little-endian) |
+| `f64FromBe` / `f64FromLe` | `(UInt8[], Int32) -> Float64` | Deserialize a double at offset |
+
+Reads take a buffer and a byte offset; writes return a freshly allocated `UInt8[]` of the type's width (2, 4, or 8 bytes). Slicing is a function, `slice(buf, start, end)`; there is no range-index syntax.
+
+Example — an 8-byte two-`Float32` control packet (e.g. two motor speeds) round-tripped through a big-endian buffer:
+
+```txt
+import { push, length, for } from "std/array"
+import { f32ToBe, f32FromBe, f32FromBits } from "std/bytes"
+
+// Float32 literals are not yet context-narrowed, so build them from bit patterns:
+// 1.5f = 0x3FC00000, -2.25f = 0xC0100000.
+val leftMotor: Float32 = f32FromBits(0x3FC00000)
+val rightMotor: Float32 = f32FromBits(0xC0100000)
+
+val packet: UInt8[] = []
+f32ToBe(leftMotor).for(x => push(packet, x))
+f32ToBe(rightMotor).for(x => push(packet, x))
+// length(packet) == 8
+
+val a: Float32 = f32FromBe(packet, 0)   // 1.5
+val b: Float32 = f32FromBe(packet, 4)   // -2.25
 ```
 
 ---
@@ -2104,6 +2274,115 @@ values({ "a": 1, "b": 2 })   // [1, 2]
 
 ---
 
+## std/json
+
+Import:
+
+```txt
+import { fromJson } from "std/json"
+```
+
+---
+
+### fromJson
+
+```txt
+val fromJson: (Type, value: Json) -> T | Error
+```
+
+Type-directed decode: validates a `Json` value against the target type `T` and returns either
+the decoded value (typed as `T`) or an `Error`. Write it idiomatically as `T.fromJson(json)` or
+equivalently as `fromJson(T, json)`. `T` is a **type** (a type name or `type` alias), not a
+runtime value.
+
+```txt
+type Person = { "name": String, "age": Int32 }
+
+val p = Person.fromJson({ "name": "Bob", "age": 30 })
+// p is Person | Error
+```
+
+**Detecting failure.** On the first structural mismatch `fromJson` returns a single `Error`
+object — it stops at the first error and does not collect all of them. The `Error` shape is:
+
+```txt
+{ "type": "error", "message": String, "path": String }
+```
+
+`path` is a JSONPath-ish location of the mismatch, e.g. `$.address.city` or `$[2]`. Detect a
+decode failure with `is Error` or, equivalently, the discriminant `result["type"] == "error"`.
+`is Error` is special-cased to check the `"type": "error"` discriminant (not just the object
+tag), so it distinguishes a decode failure from a successfully-decoded value (see ADR-047).
+
+```txt
+// Idiomatic: match on `T | Error`. The `is Error` arm MUST come first — a structural object
+// type like `Person` is matched by a bare object tag check, so a later `is Person` arm would
+// also catch the Error object (union first-match-wins, ADR-047).
+val describe = (r: Person | Error): Null =>
+  match r
+    is Error => print("decode failed at ${r["path"]}: ${r["message"]}")
+    is Person => print("hello, ${r["name"]}")
+
+// Equivalent, using the discriminant directly:
+val r = Person.fromJson(input)
+if r["type"] == "error" then
+  print("decode failed at ${r["path"]}: ${r["message"]}")
+else
+  print("hello, ${r["name"]}")
+```
+
+**What is validated.**
+
+- **Objects**: every required field must be present with a compatible type; a field is optional
+  (may be absent) iff its target type includes `Null` (e.g. `String | Null`). Extra keys are
+  ignored (width subtyping).
+- **Arrays** (`T[]`): every element is validated against `T`. **Fixed arrays** (`[A, B]`): the
+  length must match exactly and each position is validated.
+- **Unions**: the **first** structurally-matching variant wins. Prefer a discriminant field for
+  overlapping object variants (ADR-047).
+- **Numbers** (target-driven): an **integer** target requires an integral, in-range number
+  (`3.14` → error; out-of-range → error); a **float** target accepts any number; a
+  `Json`/unconstrained target accepts any number as-is.
+- Recursive types (e.g. `type Tree = { "value": Int32, "children": Tree[] }`) are supported.
+
+Array, fixed-array, and union targets must be named via a `type` alias (the receiver must be a
+bare type name): `type IntArr = Int32[]; IntArr.fromJson([1, 2, 3])`.
+
+A `Json` value cannot be assigned to a concrete structured object without decoding — `fromJson`
+(or `is`/`has` narrowing) is the sound conversion (ADR-046).
+
+---
+
+## std/hash
+
+Import:
+
+```txt
+import { hash } from "std/hash"
+```
+
+---
+
+### hash
+
+```txt
+val hash: (x: Json) -> String
+```
+
+Returns a canonical, type-tagged string key for any JSON value. The key is stable and matches Lin's structural equality (spec §14): equal values produce equal keys, objects hash independently of key order, and arrays hash order-sensitively. Values of different types never collide — the key carries a type tag, so `hash(42)` (`"i:42"`) differs from `hash("42")` (`"s:42"`). Use it to deduplicate or index values by structural identity (e.g. as object keys in a manual set/map).
+
+```txt
+hash(null)        // "N"
+hash(true)        // "b:true"
+hash(42)          // "i:42"
+hash("hello")     // "s:hello"
+hash([1, 2, 3]) == hash([1, 2, 3])   // true
+hash([1, 2]) == hash([2, 1])         // false
+hash(42) == hash("42")               // false
+```
+
+---
+
 ## std/io
 
 Import:
@@ -2395,10 +2674,10 @@ match readFile("config.txt")
 ### readFileBytes
 
 ```txt
-val readFileBytes: (path: String) -> Int32[] | Error
+val readFileBytes: (path: String) -> UInt8[] | Error
 ```
 
-Reads the file at `path` as raw bytes. Each byte is returned as an `Int32` value (0–255). Returns an `Error` if the file cannot be read.
+Reads the file at `path` as a packed `UInt8[]` byte buffer (§35.1) — one byte per element. Returns an `Error` if the file cannot be read.
 
 ```txt
 val bytes = readFileBytes("image.png")
@@ -2477,10 +2756,10 @@ Writes `content` to the file at `path`, replacing existing contents.
 ### writeFileBytes
 
 ```txt
-val writeFileBytes: (path: String, bytes: Int32[]) -> Null | Error
+val writeFileBytes: (path: String, bytes: UInt8[]) -> Null | Error
 ```
 
-Writes raw bytes to the file at `path`. Each element of `bytes` is treated as a byte value (0–255). Returns `Null` on success, `Error` on failure.
+Writes a `UInt8[]` byte buffer (§35.1) to the file at `path`. Returns `Null` on success, `Error` on failure.
 
 ---
 
@@ -2787,17 +3066,20 @@ POST `body` as JSON to `url` with `Content-Type: application/json`.
 ### serve
 
 ```txt
-val serve: (port: Int32, handler: (HttpRequest) -> HttpResponse) -> Null
+val serve: (handler: (HttpRequest) -> HttpResponse, port: Int32) -> Null
 ```
 
-Starts an HTTP server on `port` and calls `handler` for each incoming request **sequentially** — one request at a time. Blocks indefinitely.
+Starts an HTTP server on `port` and calls `handler` for each incoming request **sequentially** — one request at a time. Parses each HTTP/1.1 request into an `HttpRequest`, then writes the returned `HttpResponse` back on the wire. Blocks indefinitely (it only returns — as an `Error` — if the port cannot be bound). A handler that faults yields a `500` response and the server keeps serving.
+
+The handler is the **first** argument so the dot-call form reads naturally: `router.serve(3000)` is `serve(router, 3000)`.
 
 ```txt
-serve(3000, req =>
-  match req
-    has { "method": "GET", "path": "/ping" } => text(200, "pong")
+val router = (req: HttpRequest): HttpResponse =>
+  match req["path"]
+    is "/ping" => text(200, "pong")
     else => notFound
-)
+
+router.serve(3000)
 ```
 
 ---
@@ -2873,22 +3155,22 @@ badRequest("missing required field: name")
 
 ---
 
-### pathMatch
+### matchPath
 
 ```txt
-val pathMatch: (path: String, pattern: String) -> { ...String } | Null
+val matchPath: (path: String, pattern: String) -> { ...String } | Null
 ```
 
 Matches `path` against `pattern`. Pattern segments beginning with `:` are named captures. Returns an object of captured parameters on match, or `Null`. The path is the first argument so the function chains naturally off a request path.
 
 ```txt
-pathMatch("/users/42",       "/users/:id")       // { "id": "42" }
-pathMatch("/users/42/posts", "/users/:id/posts") // { "id": "42" }
-pathMatch("/items/42",       "/users/:id")        // null
-pathMatch("/static",         "/static")           // {}
+matchPath("/users/42",       "/users/:id")       // { "id": "42" }
+matchPath("/users/42/posts", "/users/:id/posts") // { "id": "42" }
+matchPath("/items/42",       "/users/:id")        // null
+matchPath("/static",         "/static")           // {}
 
 // dot-chaining from a request:
-req["path"].pathMatch("/users/:id")
+req["path"].matchPath("/users/:id")
 ```
 
 ---
@@ -2905,6 +3187,195 @@ Parses `req["body"]` as JSON.
 match parseBody(req)
   is { "type": "failure", "error": e }    => badRequest(e)
   is { "type": "success", "value": body } => createItem(body)
+```
+
+---
+
+## std/net
+
+Low-level UDP and TCP sockets — the byte-stream layer beneath `std/http`, for non-HTTP protocols and custom framing. Every socket is an opaque integer fd handle (spec §35.4): there are no open-socket objects in user code, just the raw OS fd as an `Int32`. Every fallible call returns the `T | Error` result shape; a non-blocking read with no data available yet returns `Null` (so a poll loop reads naturally). IPv4 only; `bind`/`listen` bind to `0.0.0.0`.
+
+`recv`/`recvFrom`/`tcpRecv` fill a **caller-owned** `UInt8[]` and return the number of bytes read; the buffer is never transferred across the boundary. The buffer's length bounds the read — pre-size it to the maximum datagram/chunk you want to accept (e.g. `[0,0,...]` of N elements).
+
+### UDP
+
+```txt
+udpBind:           (port: Int32)                              => Int32 | Error    // fd handle
+udpRecv:           (fd: Int32, buf: UInt8[])                  => Int32 | Null | Error  // bytes read; Null = would-block
+udpRecvFrom:       (fd: Int32, buf: UInt8[])                  => { "len": Int32, "addr": String, "port": Int32 } | Null | Error
+udpSendTo:         (fd: Int32, addr: String, port: Int32, buf: UInt8[]) => Int32 | Error
+udpSetNonblocking: (fd: Int32, on: Boolean)                   => Null | Error
+udpClose:          (fd: Int32)                                => Null | Error
+```
+
+### TCP
+
+A listener accepts connections, each of which is itself an fd; a client connects directly. Reads and writes operate on a connected fd.
+
+```txt
+tcpListen:         (port: Int32)                  => Int32 | Error            // listener fd
+tcpAccept:         (fd: Int32)                    => { "fd": Int32, "addr": String, "port": Int32 } | Null | Error  // Null = would-block
+tcpConnect:        (host: String, port: Int32)    => Int32 | Error            // connected fd
+tcpRecv:           (fd: Int32, buf: UInt8[])      => Int32 | Null | Error      // bytes read; 0 = peer closed; Null = would-block
+tcpSend:           (fd: Int32, buf: UInt8[])      => Int32 | Error            // bytes written
+tcpSetNonblocking: (fd: Int32, on: Boolean)       => Null | Error
+tcpClose:          (fd: Int32)                    => Null | Error
+```
+
+### UDP echo example
+
+```txt
+import { udpBind, udpSendTo, udpRecvFrom, udpClose } from "std/net"
+import { print } from "std/io"
+
+val sock = udpBind(39201)
+val msg: UInt8[] = [72, 105, 33]               // "Hi!"
+udpSendTo(sock, "127.0.0.1", 39201, msg)       // send to self
+
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+val res = udpRecvFrom(sock, buf)
+print("got ${res["len"]} bytes from ${res["addr"]}")   // got 3 bytes from 127.0.0.1
+udpClose(sock)
+```
+
+### TCP echo example
+
+```txt
+import { tcpListen, tcpAccept, tcpConnect, tcpRecv, tcpSend, tcpClose } from "std/net"
+import { print } from "std/io"
+
+val listener = tcpListen(39202)
+val client   = tcpConnect("127.0.0.1", 39202)  // kernel completes the handshake
+val accepted = tcpAccept(listener)             // returns the pending connection
+val server   = accepted["fd"]
+
+val payload: UInt8[] = [76, 105, 110, 33]      // "Lin!"
+tcpSend(client, payload)
+
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0]
+val n = tcpRecv(server, buf)                   // n == 4
+print("echoed ${n} bytes")
+
+tcpClose(client)
+val n2 = tcpRecv(server, buf)                  // 0 — peer closed
+tcpClose(server)
+tcpClose(listener)
+```
+
+---
+
+## std/process
+
+Run and manage external processes. Two styles share one module:
+
+- **Batch** — `exec`/`shell` run a command to completion and collect its full stdout/stderr into an `ExecResult`. `cwd`/`chdir` query/change the working directory.
+- **Streaming** — `spawn` starts a child and returns an opaque `ProcessHandle`; `readStdout` reads its piped stdout incrementally; `kill` signals it; `wait` blocks for the exit code.
+
+Every fallible call returns the `T | Error` result shape (spec §35.6).
+
+### Types
+
+```txt
+type ExecResult = { "status": Int32, "stdout": String, "stderr": String }
+```
+
+`ProcessHandle` is an opaque `Int64` id the runtime interprets — a monotonic id, not an OS pid (so it is immune to pid-reuse races).
+
+```txt
+exec:        (command: String, args: String[]) => ExecResult | Error
+shell:       (command: String)                 => ExecResult | Error
+cwd:         ()                                 => String
+chdir:       (path: String)                     => Null | Error
+spawn:       (command: String, args: String[]) => ProcessHandle | Error
+readStdout:  (handle: ProcessHandle, buf: UInt8[]) => Int32 | Error   // bytes read; 0 = EOF
+kill:        (handle: ProcessHandle)            => Null | Error
+wait:        (handle: ProcessHandle)            => Int32 | Error      // exit code
+```
+
+`exec` runs `command` with `args` (no shell — no injection risk), waits, and returns its status plus captured stdout/stderr. `shell` runs a command string through `/bin/sh -c` (POSIX); prefer `exec` when possible. `command` is looked up on `PATH` or given as an absolute path.
+
+`spawn` starts a child without waiting: its stdin is connected to `/dev/null`, its stdout is captured into a pipe (so `readStdout` works), and its stderr is inherited. `readStdout` fills a **caller-owned** `UInt8[]` and returns the number of bytes read, reading incrementally from the same pipe across calls; `0` means end-of-stream. `wait` blocks until the child exits, returns its exit code (`-1` if terminated by a signal), and reaps the process — after `wait` the handle is no longer valid. (stdout streamed via `readStdout` is not re-collected by `wait`; use `exec` for batch output.) `kill` sends SIGTERM; killing an already-exited child is tolerated and returns `Null`.
+
+### Example — batch: run a command and read its output
+
+```txt
+import { exec } from "std/process"
+import { print } from "std/io"
+
+match exec("git", ["status", "--short"])
+  is { "type": "failure", "error": e } => print("exec failed: ${e}")
+  else =>
+    val r = exec("git", ["status", "--short"])
+    print("exit ${toString(r["status"])}")
+    print(r["stdout"])
+```
+
+### Example — streaming: capture a subprocess's output incrementally
+
+```txt
+import { spawn, readStdout, wait } from "std/process"
+import { print } from "std/io"
+
+val h = spawn("sh", ["-c", "printf hello"])
+val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+val n = readStdout(h, buf)          // n == 5
+print("read ${n} bytes, first = ${buf[0]}")   // read 5 bytes, first = 104 ('h')
+val code = wait(h)                  // 0
+print("exited ${code}")
+```
+
+---
+
+## std/tty
+
+Raw terminal mode and non-blocking key input on stdin (spec §35.7).
+
+```txt
+rawMode:  (on: Boolean)  => Null | Error    // enable/disable terminal raw mode
+readKey:  ()             => Int32 | Null    // keycode, or Null if no key available (non-blocking)
+```
+
+`rawMode(true)` puts the terminal into raw mode: canonical line buffering and echo are disabled, and reads become non-blocking. The original terminal settings are saved and restored exactly by `rawMode(false)`. If stdin is not a terminal (e.g. a pipe), `rawMode` returns an `Error` object rather than panicking.
+
+`readKey` reads a single byte from stdin without blocking: it returns the byte value (`0..255`) as an `Int32`, or `Null` if no key is currently available. Multi-byte sequences (arrow keys, function keys) arrive one byte at a time, so a reader reassembles escape sequences itself.
+
+### Example — poll for a key in raw mode
+
+```txt
+import { rawMode, readKey } from "std/tty"
+import { print } from "std/io"
+
+rawMode(true)            // disable canonical mode + echo; reads are non-blocking
+val k = readKey()        // a byte value, or null if nothing was typed
+if k != null then print("key: ${k}") else print("no key ready")
+rawMode(false)           // restore the original terminal settings
+```
+
+A real application polls `readKey` repeatedly (typically via a `range(...).for(...)` driven loop with `std/time` `sleepMicros` between polls), treating `null` as "nothing yet" and acting on byte values as keys.
+
+---
+
+## std/signal
+
+Minimal, blocking signal handling. Import:
+
+```txt
+import { waitSignal } from "std/signal"
+```
+
+---
+
+### waitSignal
+
+```txt
+val waitSignal: (sig: Int32) -> Int32
+```
+
+Blocks the calling thread until OS signal `sig` is delivered, then returns the signal number. The signal is first blocked in the thread's mask and consumed with `sigwait`, so a signal that arrives during setup is not lost (no handler is installed). The mask is per-thread and a single signal is waited on per call.
+
+```txt
+val sig = waitSignal(2)   // block until SIGINT (2); returns 2
+print("caught signal ${toString(sig)}")
 ```
 
 ---
@@ -2950,6 +3421,24 @@ val [users, posts] = await([
   async(() => fetchJson("https://db/posts"))
 ])
 ```
+
+`await` auto-flattens nested promises (§32.2.3): if the thunk itself returns a `Promise`, `await`
+resolves through every layer (`await(async(() => async(() => 42)))` is `42`).
+
+If the thunk faults (array out of bounds, division by zero, …), the fault is caught at the thread
+boundary and surfaces as an `Error` value (an object `{ "type": "error", "message": String }`)
+rather than halting the program. Discriminate it with the built-in `Error` type:
+
+```txt
+match await(p)
+  is Error => print("failed: ${result["message"]}")
+  else     => use(result)
+```
+
+> Note: the spec also says the checker should *reject* using an uninspected `Error` result as a
+> plain `T` (§32.2.2). That static check is not yet enforced — the async surface is `Json`-typed,
+> so `await(p)` returns `Json` and coerces freely; it needs parametric `Promise<T>` typing
+> (ADR-046). `is Error` gives the runtime discrimination meanwhile.
 
 ---
 
@@ -3027,12 +3516,32 @@ Runs the thunk up to `n` times, returning the first successful result. If all at
 val threadPool: (Int32) -> ThreadPool
 ```
 
-Creates a thread pool with `n` worker threads. The pool can be used with `pool.async(thunk)` for submitting work, or `pool.serve(port, handler)` for a multi-threaded HTTP server.
+Creates a bounded thread pool with `n` worker threads draining a shared task queue. Submit
+work with `pool.poolAsync(thunk)` (see below). The pool bounds concurrency: at most `n` thunks
+run at once; excess work queues until a worker frees up.
 
 ```txt
 val pool = threadPool(8)
-val p = pool.async(() => heavyWork())
+val p = pool.poolAsync(() => heavyWork())
+val r = await(p)
 ```
+
+---
+
+### poolAsync
+
+```txt
+val poolAsync: (ThreadPool, () => T) -> Promise<T | Error>
+```
+
+Enqueues `thunk` on `pool` and returns a `Promise` for its result, resolved when a pool worker
+runs it. Designed for the dot-call form `pool.poolAsync(thunk)`. Same transferable-capture rules
+as the top-level `async` (the thunk's `val` captures are deep-copied across the boundary; it must
+not capture `var`). A fault inside the thunk is isolated and surfaces as an `Error` at `await`.
+
+> Note: the spec spells this `pool.async(...)`; in this implementation the pool submission method
+> is exported as `poolAsync` (a distinct name from the top-level `async`, which takes only a
+> thunk). `pool.serve(...)` for multi-threaded HTTP is not yet implemented.
 
 ---
 
@@ -3043,6 +3552,77 @@ val timeout: (Promise, Int32) -> T
 ```
 
 Adds a millisecond timeout to `promise`. If the promise does not resolve within `ms` milliseconds, the result is an error.
+
+---
+
+### shared / get / set / withLock
+
+```txt
+val shared:   <T>(T) -> Shared<T>
+val get:      <T>(Shared<T>) -> T
+val set:      <T>(Shared<T>, T) -> Null
+val withLock: <T, R>(Shared<T>, (T) -> R) -> R
+```
+
+`Shared<T>` is opt-in **shared mutable state** for many threads (ADR-043 §2.3.1): an
+atomic-refcounted box wrapping a reader-writer lock over a private copy of the value.
+
+- `shared(v)` creates a `Shared<T>` boxing a deep copy of `v` (must be transferable).
+- `get(s)` takes the **read** lock and returns a deep-copied snapshot (concurrent with other
+  `get`s).
+- `set(s, v)` takes the **write** lock and replaces the inner value with a deep copy of `v`.
+- `withLock(s, f)` holds the **write** lock across `f`, which receives the inner value mutable
+  in place (e.g. `a => push(a, 7)`); `f`'s result is copied out. Use this for atomic
+  read-modify-write.
+
+```txt
+val s = shared([4, 5, 6])
+val snap = s.get()                  // snapshot copy
+s.set([7, 8, 9])                    // replace wholesale
+s.withLock(arr => push(arr, 7))     // atomic in-place mutate
+val n = s.withLock(arr => length(arr))   // read a derived value out
+```
+
+Safety: every value entering is copied in, every value leaving is copied out, so no live
+reference into the box escapes the lock. `get`/`set` are individually atomic but not across the
+gap (last-writer-wins); use `withLock` when the update must be atomic.
+
+> `Shared<T>` is **accessor-only**: `shared`/`get`/`set`/`withLock` are the only operations.
+> Passing a `Shared` value to anything else (e.g. `push(s, 7)`, indexing) is a compile-time type
+> error — the box never auto-unwraps to its inner type or to `Json` (ADR-044). The inner value
+> is reachable only via `get`/`withLock`, which copy it out. (This check is enforced by
+> `lin build`/`lin run`, which resolve imports; a bare `lin check` does not resolve imports and
+> so won't show it.)
+>
+> Caveat: `withLock` mutates **in place**, so a scalar accumulator (`n => n + 1`) does not
+> persist — use a one-element array or `get`/`set`. Importing both `std/array`'s `set` and this
+> `set` in one file collides — alias one.
+
+---
+
+### frozen
+
+```txt
+val frozen: <T>(T) -> T
+```
+
+`frozen(v)` deep-freezes a transferable graph into shared **read-only** state (ADR-045 §2.3.2):
+every heap node is sealed immortal+immutable, so many threads can read it concurrently with
+**zero copies, no lock, and no atomics**. The value keeps its plain type, so readers use it
+transparently:
+
+```txt
+val timetable = frozen(loadTimetable())
+val routes = parallel(
+  journeys.map(j => () => planJourney(timetable, j))   // shared by reference, not copied
+)
+```
+
+> **Immortal ⇒ never freed.** Use `frozen` for load-once, program-lifetime reference data (a
+> timetable, routing table, config). A `frozen()` value created and discarded in a loop leaks.
+> The compile-time read-only coercion / mutation-inference (rejecting a frozen value passed to a
+> mutating parameter) is deferred (ADR-045): mutating a frozen value is currently a silent no-op
+> rather than a compile error. Concurrent reads are fully safe.
 
 ---
 
@@ -3135,130 +3715,6 @@ unsetEnv("DEBUG")
 
 ---
 
-## std/process
-
-Running and managing external processes.
-
-Import:
-
-```txt
-import { exec, shell, cwd } from "std/process"
-```
-
-### Types
-
-```txt
-type ExecResult = {
-  "status": Int32,
-  "stdout": String,
-  "stderr": String
-}
-```
-
-`ProcessHandle` is an opaque runtime type returned by `spawn`.
-
----
-
-### chdir
-
-```txt
-val chdir: (path: String) -> Null | Error
-```
-
-Changes the working directory of the current process to `path`. Returns an `Error` if `path` does not exist or is not a directory.
-
-```txt
-match chdir("project/src")
-  is { "type": "failure", "error": e } => print("cannot cd: ${e}")
-  else => null
-```
-
----
-
-### cwd
-
-```txt
-val cwd: () -> String
-```
-
-Returns the absolute path of the current working directory.
-
-```txt
-val here = cwd()   // e.g. "/home/alice/project"
-```
-
----
-
-### exec
-
-```txt
-val exec: (command: String, args: String[]) -> ExecResult | Error
-```
-
-Runs `command` with `args`, waits for it to exit, and returns its status code, stdout, and stderr as an `ExecResult`. Returns an `Error` if the command cannot be launched.
-
-```txt
-match exec("git", ["status", "--short"])
-  is { "type": "failure", "error": e } => print("exec failed: ${e}")
-  is { "type": "success", "value": r } =>
-    print("exit ${toString(r["status"])}")
-    print(r["stdout"])
-```
-
----
-
-### kill
-
-```txt
-val kill: (handle: ProcessHandle) -> Null
-```
-
-Sends `SIGTERM` to the process identified by `handle`. Returns immediately; use `wait` to collect the exit status.
-
----
-
-### shell
-
-```txt
-val shell: (command: String) -> ExecResult | Error
-```
-
-Runs `command` through the system shell (`/bin/sh -c` on POSIX). Prefer `exec` when possible to avoid shell injection.
-
-```txt
-match shell("ls -la | wc -l")
-  is { "type": "success", "value": r } => print(r["stdout"].trim())
-  is { "type": "failure", "error": e } => print("shell error: ${e}")
-```
-
----
-
-### spawn
-
-```txt
-val spawn: (command: String, args: String[]) -> ProcessHandle
-```
-
-Starts `command` with `args` without waiting for it to finish. Returns a `ProcessHandle` for use with `kill` and `wait`.
-
-```txt
-val proc = spawn("server", ["--port", "8080"])
-// ... do other work ...
-val result = wait(proc)
-```
-
----
-
-### wait
-
-```txt
-val wait: (handle: ProcessHandle) -> ExecResult | Error
-```
-
-Waits for the process identified by `handle` to exit and returns its status code, stdout, and stderr.
-
----
-
 ## std/template
 
 Import:
@@ -3318,16 +3774,38 @@ import { suite, test, run, expect } from "std/test"
 import { suite, test, run, expect } from "std/test"
 
 val arithmetic = suite("arithmetic", [
-  test("adds two positives", () =>
+  test("adds two positives", () => [
     expect(1 + 2).toBe(3)
-  ),
-  test("multiple assertions", () =>
-    expect(0 + 0).toBe(0)
+  ]),
+  test("multiple assertions", () => [
+    expect(0 + 0).toBe(0),
     expect(10 + -10).toBe(0)
-  )
+  ])
 ])
 
 run([arithmetic])
+```
+
+**A test body must return an array of assertions.** Each matcher
+(`expect(...).toBe(...)`, etc.) produces one `Assertion`; the body returns them
+as an `Assertion[]` (a comma-separated array literal), and **every** assertion in
+the array is evaluated — a test fails if any one of them fails. This is enforced
+by the type system: a bare single assertion or a sequence of bare assertion
+statements is a compile error, which is what guarantees no assertion is silently
+skipped. Even a single assertion is wrapped in `[ ... ]`.
+
+When a test needs setup before its assertions, write the setup statements
+followed by the array literal as the body's final expression:
+
+```txt
+test("sorts ascending", () =>
+  val input = [3, 1, 2]
+  val sorted = input.sort((a, b) => a - b)
+  [
+    expect(input.toString()).toBe("[3, 1, 2]"),
+    expect(sorted.toString()).toBe("[1, 2, 3]")
+  ]
+)
 ```
 
 ---
@@ -3335,13 +3813,11 @@ run([arithmetic])
 ### Types
 
 ```txt
-type Assertion =
-  | { "type": "pass" }
-  | { "type": "fail", "message": String }
+type Assertion = { "type": "pass" } | { "type": "fail", "message": String }
 
 type Test = {
   "name": String,
-  "run": () -> Assertion | Assertion[]
+  "run": () -> Assertion[]
 }
 
 type Suite = {
@@ -3362,7 +3838,7 @@ Groups a list of `Test` values under a name.
 
 ```txt
 val myTests = suite("math", [
-  test("one plus one", () => expect(1 + 1).toBe(2))
+  test("one plus one", () => [ expect(1 + 1).toBe(2) ])
 ])
 ```
 
@@ -3371,16 +3847,16 @@ val myTests = suite("math", [
 ### test
 
 ```txt
-val test: (name: String, body: () -> Assertion | Assertion[]) -> Test
+val test: (name: String, body: () -> Assertion[]) -> Test
 ```
 
 Declares a single test case. All assertions in the body are evaluated before the test is marked failed.
 
 ```txt
-test("string conversions", () =>
-  expect(toString(42)).toBe("42")
-  expect(toString(true)).toBe("true")
-)
+test("string conversions", () => [
+  expect((42).toString()).toBe("42"),
+  expect(true.toString()).toBe("true")
+])
 ```
 
 ---
@@ -3487,12 +3963,13 @@ print("took ${toString(elapsed(t))}ms")
 val format: (ts: Int64, pattern: String) -> String
 ```
 
-Formats the Unix millisecond timestamp `ts` as a string using a strftime-style `pattern`. Patterns follow the C `strftime` conventions (e.g. `%Y-%m-%d`, `%H:%M:%S`). The timestamp is interpreted in UTC.
+Formats the Unix millisecond timestamp `ts` as a string using a strftime-style `pattern`. The timestamp is interpreted in UTC. Supported specifiers: `%Y %y %m %d %e %H %I %M %S %p %j %a %A %b %B %h` and `%%` (literal `%`); an unrecognised `%x` is emitted verbatim.
 
 ```txt
 format(now(), "%Y-%m-%d")           // e.g. "2025-05-27"
 format(now(), "%H:%M:%S")           // e.g. "14:32:07"
 format(now(), "%Y-%m-%dT%H:%M:%S")  // e.g. "2025-05-27T14:32:07"
+format(now(), "%a %B %d")           // e.g. "Tue May 27"
 ```
 
 ---
@@ -3506,7 +3983,7 @@ val fromIso: (s: String) -> Int64 | Error
 Parses an ISO 8601 date/datetime string and returns the corresponding Unix millisecond timestamp. Timezone offsets are respected; bare dates (`2024-01-15`) are interpreted as UTC midnight.
 
 ```txt
-fromIso("2024-01-15T10:30:00Z")   // 1705313400000
+fromIso("2024-01-15T10:30:00Z")   // 1705314600000
 fromIso("2024-01-15")             // 1705276800000
 fromIso("not a date")             // { "type": "failure", "error": "..." }
 ```
@@ -3535,11 +4012,11 @@ print("elapsed: ${toString(now() - start)}ms")
 val parse: (s: String, pattern: String) -> Int64 | Error
 ```
 
-Parses the date/time string `s` using a strftime-style `pattern` and returns the Unix millisecond timestamp. Unspecified fields default to zero or UTC midnight.
+Parses the date/time string `s` using a strftime-style `pattern` and returns the Unix millisecond timestamp (UTC). Unspecified fields default to UTC midnight on 1970-01-01. Numeric specifiers (`%Y %y %m %d %e %H %M %S`) and literal characters are supported; textual names (`%a`/`%B`) are format-only, not parsed. Out-of-range fields and literal mismatches return an `Error`.
 
 ```txt
 parse("2024-01-15", "%Y-%m-%d")              // 1705276800000
-parse("15/01/2024 10:30", "%d/%m/%Y %H:%M")  // 1705313400000
+parse("15/01/2024 10:30", "%d/%m/%Y %H:%M")  // 1705314600000
 parse("bad", "%Y-%m-%d")                     // { "type": "failure", "error": "..." }
 ```
 
@@ -3548,13 +4025,27 @@ parse("bad", "%Y-%m-%d")                     // { "type": "failure", "error": ".
 ### sleep
 
 ```txt
-val sleep: (ms: Int32) -> Null
+val sleep: (ms: Int64) -> Null
 ```
 
 Blocks the current thread for at least `ms` milliseconds.
 
 ```txt
 sleep(1000)   // wait 1 second
+```
+
+---
+
+### sleepMicros
+
+```txt
+val sleepMicros: (n: Int64) -> Null
+```
+
+Blocks the current thread for at least `n` microseconds. Microsecond-granularity counterpart to `sleep`, intended for tight timing loops such as software PWM.
+
+```txt
+sleepMicros(500)   // wait ~0.5 ms
 ```
 
 ---

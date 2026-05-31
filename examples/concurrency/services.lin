@@ -1,0 +1,80 @@
+// Higher-level concurrency primitives: ThreadPool, Worker, Shared<T>, Frozen<T>.
+// Each helper is self-contained so the tests can drive it and assert the outcome.
+
+import { async, await, parallel, threadPool, poolAsync, worker, request, close, shared, get, set, withLock, frozen } from "std/async"
+import { push, length, for, range } from "std/array"
+
+// ThreadPool — a bounded pool runs queued work on a fixed set of threads. We submit `n`
+// trivial tasks (the thunk `() => 1` captures nothing) and sum their results; with a real
+// pool they run concurrently, bounded by the worker count. Returns the sum (each task
+// contributes 1, so the sum is the task count `n`).
+export val poolSum = (workers: Int32, n: Int32): Int32 =>
+  val pool = threadPool(workers)
+  var promises = []
+  range(0, n).for(i => push(promises, pool.poolAsync(() => 1)))
+  var total = 0
+  promises.for(p => total = total + await(p))
+  total
+
+// Worker — a long-lived thread that owns confined mutable state (§32.6.4). The handler
+// closes over `var total`; sequential requests accumulate into it, and `onShutdown` is
+// invoked at close. Returns the running total after the given deposits.
+export val accumulate = (deposits: Int32[]): Int32 =>
+  var total = 0
+  val acc = worker(
+    n =>
+      total = total + n
+      total,
+    () => null
+  )
+  var last = 0
+  deposits.for(d => last = request(acc, d))
+  close(acc)
+  last
+
+// Worker fault isolation (§32.6.5) — a handler that faults surfaces an Error to the
+// in-flight request; the program continues. Returns true if the request came back an Error.
+export val workerFaults = (): Boolean =>
+  val zero = 0
+  val w = worker(n => n / zero, () => null)
+  val reply = request(w, 5)
+  close(w)
+  match reply
+    is Error => true
+    else => false
+
+// Shared<T> — opt-in shared mutable state. Several concurrent tasks push to one shared array
+// under the write lock; no updates are lost. Returns the final element count.
+export val sharedCounter = (): Int32 =>
+  val box = shared([])
+  parallel([
+    () => withLock(box, a => push(a, 1)),
+    () => withLock(box, a => push(a, 1)),
+    () => withLock(box, a => push(a, 1)),
+    () => withLock(box, a => push(a, 1)),
+    () => withLock(box, a => push(a, 1))
+  ])
+  length(get(box))
+
+// Shared get/set snapshot — get() copies a snapshot out; set() replaces wholesale. Returns
+// the snapshot taken before the set (proving get is an independent copy, not a live view).
+export val sharedSnapshot = (): Json =>
+  val box = shared([1, 2, 3])
+  val before = get(box)
+  set(box, [9, 9])
+  before
+
+// Frozen<T> — a read-only graph shared by reference across threads with zero copies and no
+// locks. We freeze a lookup table and read it from parallel tasks. Returns the sum of the
+// looked-up values (proving every thread saw the same frozen data).
+export val frozenLookup = (): Int32 =>
+  val table = frozen([10, 20, 30, 40])
+  val results = parallel([
+    () => table[0],
+    () => table[1],
+    () => table[2],
+    () => table[3]
+  ])
+  var sum = 0
+  results.for(v => sum = sum + v)
+  sum

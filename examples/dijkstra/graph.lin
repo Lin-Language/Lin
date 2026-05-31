@@ -1,7 +1,16 @@
 import { for, push, reverse, length } from "std/array"
 import { toString } from "std/string"
 
-export val buildAdj = (edges: Json): Json =>
+// A weighted directed edge as it appears in the input graph.
+export type Edge = { "from": String, "to": String, "weight": Int32 }
+
+// An adjacency entry: a reachable node and the cost of the edge to it.
+export type Neighbor = { "to": String, "weight": Int32 }
+
+// The adjacency structure (`buildAdj`'s result), the distance map and the prev
+// map are all keyed by node name at runtime, so they stay dynamic (Json). The
+// adjacency values are Neighbor[]; dist values are Int32; prev values are String.
+export val buildAdj = (edges: Edge[]): Json =>
   var adj = {}
   edges.for(edge =>
     val src = edge["from"]
@@ -13,14 +22,14 @@ export val buildAdj = (edges: Json): Json =>
   )
   adj
 
-val walkPath = (prev: Json, source: String, path: Json, current: String): Null =>
+val walkPath = (prev: Json, source: String, path: String[], current: String): Null =>
   val pRaw = prev[current]
   if pRaw != null && current != source then
     val p = toString(pRaw)
     push(path, p)
     walkPath(prev, source, path, p)
 
-export val reconstructPath = (prev: Json, source: String, target: String): Json =>
+export val reconstructPath = (prev: Json, source: String, target: String): String[] =>
   if target == source then [source]
   else
     var path = [target]

@@ -33,10 +33,12 @@ fn zonk_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
         Type::Array(inner) => Type::Array(Box::new(zonk_type(inner, subs))),
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| zonk_type(t, subs)).collect()),
         Type::Iterator(inner) => Type::Iterator(Box::new(zonk_type(inner, subs))),
+        Type::Shared(inner) => Type::Shared(Box::new(zonk_type(inner, subs))),
         Type::Union(ts) => Type::flatten_union(ts.iter().map(|t| zonk_type(t, subs)).collect()),
-        Type::Function { params, ret } => Type::Function {
+        Type::Function { params, ret, required } => Type::Function {
             params: params.iter().map(|p| zonk_type(p, subs)).collect(),
             ret: Box::new(zonk_type(ret, subs)),
+            required: *required,
         },
         Type::Object(fields) => {
             let mut out = indexmap::IndexMap::new();
@@ -125,6 +127,14 @@ fn zonk_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
             zonk_expr(else_br, subs);
             *result_type = zonk_type(result_type, subs);
         }
+        TypedExpr::FromJson { target, value, result_type, named_defs, .. } => {
+            *target = zonk_type(target, subs);
+            zonk_expr(value, subs);
+            *result_type = zonk_type(result_type, subs);
+            for (_, body) in named_defs.iter_mut() {
+                *body = zonk_type(body, subs);
+            }
+        }
         TypedExpr::Match { scrutinee, arms, result_type, .. } => {
             zonk_expr(scrutinee, subs);
             for arm in arms { zonk_match_arm(arm, subs); }
@@ -193,6 +203,12 @@ fn zonk_match_arm(arm: &mut TypedMatchArm, subs: &HashMap<u32, Type>) {
 fn zonk_pattern(pat: &mut TypedPattern, subs: &HashMap<u32, Type>) {
     match pat {
         TypedPattern::TypeCheck(ty, _) => *ty = zonk_type(ty, subs),
+        TypedPattern::TypeCheckDeep(ty, named_defs, _) => {
+            *ty = zonk_type(ty, subs);
+            for (_, body) in named_defs.iter_mut() {
+                *body = zonk_type(body, subs);
+            }
+        }
         TypedPattern::Literal(e) => zonk_expr(e, subs),
         TypedPattern::Binding(_, ty, _) => *ty = zonk_type(ty, subs),
         TypedPattern::Object { fields, .. } => {

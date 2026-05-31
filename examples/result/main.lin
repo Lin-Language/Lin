@@ -1,0 +1,25 @@
+// result — a form-validation pipeline built on a generic Result<T, E> tagged union.
+//
+// Result<T, E> (in result.lin) is discriminated by a `"type"` field whose value is a
+// singleton string-literal type ("success" / "failure"), checked at compile time. The
+// combinators (ok/err/andThen/map) compose fallible steps; form.lin validates a
+// registration by chaining field validators that short-circuit on the first error.
+//
+// Run:   lin run examples/result/main.lin
+// Test:  lin test examples/result/
+
+import { validateForm, RawForm } from "./form"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val show = (label: String, raw: RawForm): Null =>
+  match validateForm(raw)
+    has { "type": "success", value } =>
+      print("${label}: ok — ${value["name"]} <${value["email"]}>, age ${toString(value["age"])}")
+    has { "type": "failure", error } => print("${label}: rejected — ${error}")
+    else => print("${label}: ?")
+
+show("valid",    { "name": "Ada",  "email": "ada@example.com", "age": "36" })
+show("no-name",  { "name": "   ",  "email": "ada@example.com", "age": "36" })
+show("bad-mail", { "name": "Bo",   "email": "nope",            "age": "36" })
+show("bad-age",  { "name": "Cleo", "email": "c@x.io",          "age": "999" })

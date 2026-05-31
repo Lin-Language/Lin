@@ -37,10 +37,9 @@ fn resolve_type_inner(
             let param_types: Result<Vec<Type>, String> =
                 params.iter().map(|p| resolve_type_inner(p, env, visiting)).collect();
             let ret_type = resolve_type_inner(ret, env, visiting)?;
-            Ok(Type::Function {
-                params: param_types?,
-                ret: Box::new(ret_type),
-            })
+            // Type annotations cannot express default arguments, so every declared
+            // parameter is required.
+            Ok(Type::func(param_types?, ret_type))
         }
         TypeExpr::Object(fields, _span) => {
             let mut resolved = IndexMap::new();
@@ -55,6 +54,7 @@ fn resolve_type_inner(
                 variants.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::flatten_union(resolved?))
         }
+        TypeExpr::StringLit(s, _span) => Ok(Type::StrLit(s.clone())),
     }
 }
 
@@ -78,14 +78,24 @@ fn resolve_named_cycle(
         "Float64" => Ok(Type::Float64),
         "String" => Ok(Type::Str),
         "Json" => Ok(json_type()),
+        // `Error` is the conventional error value (spec §19, §32.2.2) and a structural object
+        // alias (ADR-047): an object carrying a `type` discriminant and a `message`. Both the
+        // async runtime (on a caught thunk fault) and `fromJson` produce this shape — the
+        // decode-error value additionally carries `"path"`, which width subtyping permits.
+        // Modelled as an Object (not a new `Type` variant) so the ~20 exhaustive `Type` matches
+        // don't change (cf. ADR-044); `is Error` is a field-presence + `"type" == "error"` check.
+        "Error" => Ok(error_type()),
         // Function is an opaque type annotation — any arity is acceptable.
         // Params and ret use TypeVar(u32::MAX) so compat check treats it as accepting any function.
-        "Function" => Ok(Type::Function {
-            params: vec![Type::TypeVar(u32::MAX)],
-            ret: Box::new(Type::TypeVar(u32::MAX)),
-        }),
+        "Function" => Ok(Type::func(
+            vec![Type::TypeVar(u32::MAX)],
+            Type::TypeVar(u32::MAX),
+        )),
         // Iterator without type argument: use Json wildcard element type
         "Iterator" => Ok(Type::Iterator(Box::new(json_type()))),
+        // Shared without a type argument: Shared<Json>. The opaque shared-mutable-state box
+        // (ADR-044); only the shared/get/set/withLock accessors operate on it.
+        "Shared" => Ok(Type::Shared(Box::new(json_type()))),
         _ => {
             // Cycle detected: return Named(name) as an opaque reference instead of expanding.
             if visiting.contains(name) {
@@ -135,9 +145,10 @@ fn expand_named_body(
             }
             Ok(Type::Object(out))
         }
-        Type::Function { params, ret } => Ok(Type::Function {
+        Type::Function { params, ret, required } => Ok(Type::Function {
             params: params.iter().map(|p| expand_named_body(p, env, visiting)).collect::<Result<_, _>>()?,
             ret: Box::new(expand_named_body(ret, env, visiting)?),
+            required: *required,
         }),
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(expand_named_body(inner, env, visiting)?))),
         other => Ok(other.clone()),
@@ -156,6 +167,12 @@ fn resolve_generic(
                 return Err("Iterator takes exactly 1 type argument".to_string());
             }
             Ok(Type::Iterator(Box::new(args[0].clone())))
+        }
+        "Shared" => {
+            if args.len() != 1 {
+                return Err("Shared takes exactly 1 type argument".to_string());
+            }
+            Ok(Type::Shared(Box::new(args[0].clone())))
         }
         _ => {
             if let Some(decl) = env.lookup_type(name) {
@@ -212,16 +229,28 @@ fn substitute(
         Type::Function {
             params: fn_params,
             ret,
+            required,
         } => Ok(Type::Function {
             params: fn_params
                 .iter()
                 .map(|t| substitute(t, params, args, env, visiting))
                 .collect::<Result<_, _>>()?,
             ret: Box::new(substitute(ret, params, args, env, visiting)?),
+            required: *required,
         }),
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(substitute(inner, params, args, env, visiting)?))),
         _ => Ok(ty.clone()),
     }
+}
+
+/// The structural shape of a decode `Error` (ADR-047). An open object with the two stable
+/// fields user code can rely on; the runtime value also carries `"path"`, which width
+/// subtyping permits. Used as the second variant of `fromJson`'s `T | Error` result.
+pub fn error_type() -> Type {
+    let mut fields = IndexMap::new();
+    fields.insert("type".to_string(), Type::Str);
+    fields.insert("message".to_string(), Type::Str);
+    Type::Object(fields)
 }
 
 pub fn json_type() -> Type {

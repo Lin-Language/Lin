@@ -1,0 +1,44 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { runTask, runAll } from "./task"
+import { length } from "std/array"
+
+// Unit tests for runTask/runAll over real but deterministic system commands
+// (printf, true, false, and a missing binary).
+val s = suite("task", [
+  test("a zero-exit command passes and captures stdout", () =>
+    val r = runTask({ "name": "echo", "command": "printf", "args": ["hello"] })
+    [
+      expect(r["outcome"]).toBe("pass"),
+      expect(r["status"]).toBe(0),
+      expect(r["output"]).toBe("hello")
+    ]
+  ),
+  test("`true` passes", () => [
+    expect(runTask({ "name": "t", "command": "true", "args": [] })["outcome"]).toBe("pass")
+  ]),
+  test("a non-zero exit is a fail with its status", () =>
+    val r = runTask({ "name": "f", "command": "false", "args": [] })
+    [
+      expect(r["outcome"]).toBe("fail"),
+      expect(r["status"]).toBe(1)
+    ]
+  ),
+  test("an unlaunchable command is an error, not a crash", () =>
+    val r = runTask({ "name": "x", "command": "definitely-not-a-real-command-xyz", "args": [] })
+    [
+      expect(r["outcome"]).toBe("error")
+    ]
+  ),
+  test("runAll runs every task in order", () =>
+    val results = runAll([
+      { "name": "a", "command": "true", "args": [] },
+      { "name": "b", "command": "false", "args": [] }
+    ])
+    [
+      expect(length(results)).toBe(2),
+      expect(results[0]["outcome"]).toBe("pass"),
+      expect(results[1]["outcome"]).toBe("fail")
+    ]
+  ),
+])
+run(s)

@@ -1,62 +1,107 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { parseInt32, parseFloat64, toInt32, toFloat64, isInt32, isFloat64, tryParseInt32, tryParseFloat64 } from "std/number"
+import { parseInt32, parseFloat64, toInt32, toFloat64, toFloat32, isInt32, isFloat64, tryParseInt32, tryParseFloat64 } from "std/number"
+import { f32ToBe } from "std/bytes"
+import { length } from "std/array"
+import { toString } from "std/string"
 
 val s = suite("std/number", [
-  test("parseInt32 parses integer string", () =>
-    expect(parseInt32("42")).toBe(42)
+  test("parseInt32 parses integer string", () => [
+    expect("42".parseInt32()).toBe(42)
+  ]),
+
+  test("parseFloat64 parses float string", () => [
+    expect("3.14".parseFloat64()).toBe(3.14)
+  ]),
+
+  test("toInt32 truncates float", () => [
+    expect(3.9.toInt32()).toBe(3)
+  ]),
+
+  test("toFloat64 converts int to float", () => [
+    expect(5.toFloat64()).toBe(5.0)
+  ]),
+
+  test("toFloat32 narrows Float64 to a Float32 usable by f32ToBe", () => [
+    // The only way to get a Float32 from a computed Float64. 0.5 is exact in f32:
+    // big-endian bytes are 0x3F000000.
+    expect(length(f32ToBe(toFloat32(0.5)))).toBe(4),
+    expect(f32ToBe(toFloat32(0.5))[0]).toBe(63),
+    expect(f32ToBe(toFloat32(0.5))[1]).toBe(0)
+  ]),
+
+  test("isInt32 true for integer string", () => [
+    expect("42".isInt32()).toBe(true)
+  ]),
+
+  test("isInt32 false for float string", () => [
+    expect("3.14".isInt32()).toBe(false)
+  ]),
+
+  test("isInt32 false for non-numeric string", () => [
+    expect("abc".isInt32()).toBe(false)
+  ]),
+
+  test("isFloat64 true for float string", () => [
+    expect("3.14".isFloat64()).toBe(true)
+  ]),
+
+  test("isFloat64 true for integer string", () => [
+    expect("42".isFloat64()).toBe(true)
+  ]),
+
+  test("isFloat64 false for non-numeric string", () => [
+    expect("abc".isFloat64()).toBe(false)
+  ]),
+
+  test("tryParseInt32 returns int for valid string", () => [
+    expect("42".tryParseInt32()).toBe(42)
+  ]),
+
+  test("tryParseInt32 returns null for invalid string", () => [
+    expect("abc".tryParseInt32()).toBe(null)
+  ]),
+
+  test("tryParseFloat64 returns float for valid string", () => [
+    expect("3.14".tryParseFloat64()).toBe(3.14)
+  ]),
+
+  test("tryParseFloat64 returns null for invalid string", () => [
+    expect("abc".tryParseFloat64()).toBe(null)
+  ]),
+
+  test("dot-syntax for number parsing", () =>
+    [
+      expect("99".parseInt32()).toBe(99),
+      expect("2.5".parseFloat64()).toBe(2.5),
+      expect("7".isInt32()).toBe(true)
+    ]
   ),
 
-  test("parseFloat64 parses float string", () =>
-    expect(parseFloat64("3.14")).toBe(3.14)
+  // --- numeric literal suffix typing (spec §3.6) ---
+  // An `i64` suffix pins the literal to Int64, so a value far larger than Int32's range
+  // (1_705_314_600_000) is preserved exactly rather than truncated to its low 32 bits
+  // (212583488). Regression for the silent-truncation bug.
+  test("i64 suffix preserves a value beyond Int32 range", () => [
+    expect(toString(1705314600000i64)).toBe("1705314600000")
+  ]),
+
+  test("i64-suffixed literal round-trips through arithmetic", () =>
+    val big = 1705314600000i64
+    [
+      expect(toString(big + 1i64)).toBe("1705314600001"),
+      expect(big > 2147483647i64).toBe(true)
+    ]
   ),
 
-  test("toInt32 truncates float", () =>
-    expect(toInt32(3.9)).toBe(3)
+  test("Int64 annotation preserves a large literal", () =>
+    val ts: Int64 = 1705314600000
+    [expect(toString(ts)).toBe("1705314600000")]
   ),
 
-  test("toFloat64 converts int to float", () =>
-    expect(toFloat64(5)).toBe(5.0)
-  ),
-
-  test("isInt32 true for integer string", () =>
-    expect(isInt32("42")).toBe(true)
-  ),
-
-  test("isInt32 false for float string", () =>
-    expect(isInt32("3.14")).toBe(false)
-  ),
-
-  test("isInt32 false for non-numeric string", () =>
-    expect(isInt32("abc")).toBe(false)
-  ),
-
-  test("isFloat64 true for float string", () =>
-    expect(isFloat64("3.14")).toBe(true)
-  ),
-
-  test("isFloat64 true for integer string", () =>
-    expect(isFloat64("42")).toBe(true)
-  ),
-
-  test("isFloat64 false for non-numeric string", () =>
-    expect(isFloat64("abc")).toBe(false)
-  ),
-
-  test("tryParseInt32 returns int for valid string", () =>
-    expect(tryParseInt32("42")).toBe(42)
-  ),
-
-  test("tryParseInt32 returns null for invalid string", () =>
-    expect(tryParseInt32("abc")).toBe(null)
-  ),
-
-  test("tryParseFloat64 returns float for valid string", () =>
-    expect(tryParseFloat64("3.14")).toBe(3.14)
-  ),
-
-  test("tryParseFloat64 returns null for invalid string", () =>
-    expect(tryParseFloat64("abc")).toBe(null)
-  ),
+  test("a small u8-suffixed literal types as UInt8", () => [
+    // toString works regardless of width; the point is it compiles and keeps its value.
+    expect(toString(200u8)).toBe("200")
+  ]),
 ])
 
 run(s)

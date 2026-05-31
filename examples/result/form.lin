@@ -1,0 +1,23 @@
+// form.lin — validate a user-registration form by composing field validators with
+// Result combinators. Validation short-circuits on the FIRST failing field via
+// `andThen`, so a valid form yields a typed record and an invalid one yields the
+// first error message.
+
+import { ok, err, andThen, isOk } from "./result"
+import { nonEmpty, email, intInRange } from "./validate"
+
+export type Registration = { "name": String, "email": String, "age": Int32 }
+
+// Raw (unvalidated) form input: all string fields, as they'd arrive from a request.
+export type RawForm = { "name": String, "email": String, "age": String }
+
+// Validate a raw form into a Registration, or the first error. Each step runs only if
+// the previous succeeded (andThen short-circuits on failure).
+export val validateForm = (raw: RawForm): Json =>
+  nonEmpty("name", raw["name"])
+    .andThen(name =>
+      email(raw["email"])
+        .andThen(em =>
+          intInRange("age", raw["age"], 0, 150)
+            .andThen(age =>
+              ok({ "name": name, "email": em, "age": age }))))

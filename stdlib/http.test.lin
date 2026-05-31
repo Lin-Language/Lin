@@ -1,50 +1,46 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
-import { json, text, redirect, notFound, badRequest, parseBody, pathMatch } from "std/http"
+import { json, text, redirect, notFound, badRequest, parseBody, matchPath } from "std/http"
 
 val s = suite("std/http", [
   test("json helper sets status and content-type", () =>
     val resp = json(200, { "ok": true })
-    val r = [expect(resp["status"]).toBe(200), expect(resp["headers"]["Content-Type"]).toBe("application/json")]
-    r
+    [expect(resp["status"]).toBe(200), expect(resp["headers"]["Content-Type"]).toBe("application/json")]
   ),
 
   test("text helper sets status and body", () =>
     val resp = text(200, "hello world")
-    val r = [expect(resp["status"]).toBe(200), expect(resp["body"]).toBe("hello world")]
-    r
+    [expect(resp["status"]).toBe(200), expect(resp["body"]).toBe("hello world")]
   ),
 
   test("redirect sets 302 and Location header", () =>
     val resp = redirect("/home")
-    val r = [expect(resp["status"]).toBe(302), expect(resp["headers"]["Location"]).toBe("/home")]
-    r
+    [expect(resp["status"]).toBe(302), expect(resp["headers"]["Location"]).toBe("/home")]
   ),
 
-  test("notFound has status 404", () =>
+  test("notFound has status 404", () => [
     expect(notFound["status"]).toBe(404)
-  ),
+  ]),
 
   test("badRequest has status 400", () =>
     val resp = badRequest("missing field")
-    expect(resp["status"]).toBe(400)
+    [expect(resp["status"]).toBe(400)]
   ),
 
   test("parseBody parses JSON body", () =>
     val req = { "method": "POST", "path": "/", "query": "", "headers": {}, "body": "{\"x\": 99}" }
-    val body = parseBody(req)
-    expect(body["x"]).toBe(99)
+    val body = req.parseBody()
+    [expect(body["x"]).toBe(99)]
   ),
 
-  test("pathMatch extracts named segments", () =>
-    val m = pathMatch("/users/:id/posts/:postId", "/users/42/posts/7")
-    val r = [expect(m["id"]).toBe("42"), expect(m["postId"]).toBe("7")]
-    r
+  test("matchPath extracts named segments", () =>
+    val m = matchPath("/users/42/posts/7", "/users/:id/posts/:postId")
+    [expect(m["id"]).toBe("42"), expect(m["postId"]).toBe("7")]
   ),
 
-  test("pathMatch returns null on mismatch", () =>
-    val m = pathMatch("/users/:id", "/products/5")
-    expect(m).toBe(null)
+  test("matchPath returns null on mismatch", () =>
+    val m = matchPath("/products/5", "/users/:id")
+    [expect(m).toBe(null)]
   ),
 ])
 

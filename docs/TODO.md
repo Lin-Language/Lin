@@ -492,19 +492,17 @@ See spec §33 for the full intrinsic signatures. See `docs/STDLIB.md` for the co
 - [x] Add `ureq` (or equivalent minimal Rust HTTP client) to workspace dependencies.
 - [x] `__httpFetch` intrinsic: send GET request, return `HttpResponse | Error`. Populate `"status"`, `"headers"`, `"body"`. Transport errors (DNS, TLS, connection refused) → `Error`; HTTP error status codes → successful `HttpResponse`.
 - [x] `__httpFetchWith` intrinsic: same as `__httpFetch` but accepts `HttpOptions` object; read `"method"`, `"headers"`, `"body"` fields (missing fields use defaults: `"GET"`, empty headers, empty body).
-- [x] `__parseJson` intrinsic (internal): parse a JSON string to `Json | Error`; used by `fetchJson` and `std/server`.
+- [x] `__parseJson` intrinsic (internal): parse a JSON string to `Json | Error`; used by `fetchJson` and the `std/http` server helpers.
 - [x] `std/http` Lin module: `fetch` and `fetchWith` delegate to intrinsics; `fetchJson` and `postJson` written in Lin on top of them (spec §33.4).
 - [x] Define `HttpResponse` and `HttpOptions` as exported types from `std/http`.
 
-### `std/server` — HTTP server
+### HTTP server (in `std/http`)
 
-- [x] Add `tiny_http` crate dependency to workspace.
-- [x] `__serverServe` intrinsic: bind TCP listener on `port`, accept in a loop, parse each connection into an `HttpRequest` object (`"method"`, `"path"`, `"query"`, `"headers"`, `"body"`), call `handler`, write the `HttpResponse` back to the socket. Block the calling thread indefinitely.
-- [x] `__serverServeWithPool` intrinsic: same as above but hand each request to the `ThreadPool` task channel.
-- [x] `pool.serve` dot-call: extend the runtime's dot-call dispatch on `ThreadPool` values so `.serve(port, handler)` routes to `__serverServeWithPool`.
+- [x] `__serverServe` intrinsic (`lin_serve`, hand-rolled HTTP/1.1, no extra deps): bind a TCP listener on `port`, accept in a loop, parse each connection into an `HttpRequest` object (`"method"`, `"path"`, `"query"`, `"headers"`, `"body"`), call `handler` inside a fault-isolation boundary, write the `HttpResponse` back to the socket. Sequential (one request at a time); blocks the calling thread indefinitely. Signature is `serve(handler, port)` (handler first) so `router.serve(port)` dot-call desugars to `serve(router, port)`.
+- [ ] `__serverServeWithPool` intrinsic / `pool.serve` dot-call: concurrent request handling via a `ThreadPool`. Not yet implemented.
 - [x] `__serverPathMatch` intrinsic: split pattern and path on `/`; match literal segments exactly; collect `:name` segments as string captures into a result object; return `Null` on length mismatch or literal segment mismatch.
-- [x] `std/server` Lin module: `serve`, `json`, `text`, `redirect`, `notFound`, `badRequest`, `parseBody`, `pathMatch` — written in Lin on top of the two server intrinsics, `__serverPathMatch`, and `__parseJson` (spec §33.5).
-- [x] Export `HttpRequest` type from `std/server`.
+- [x] `std/http` server helpers: `serve`, `json`, `text`, `redirect`, `notFound`, `badRequest`, `parseBody`, `matchPath` (path-first) — written in Lin on top of `__serverServe`, `__serverPathMatch`, and `__parseJson` (spec §33.5).
+- [x] Export `HttpRequest` / `HttpResponse` types from `std/http`.
 
 ### Tests
 
@@ -520,11 +518,11 @@ See spec §33 for the full intrinsic signatures. See `docs/STDLIB.md` for the co
 - [x] `std/http`: `postJson` sends correct `Content-Type` header and body.
 - [x] `std/http`: HTTP 404 response is returned as `HttpResponse` (not `Error`); transport failure is `Error`.
 - [x] Concurrent `async(() => fetchJson(...))` calls complete without data races.
-- [x] `std/server`: `serve` on a background thread responds correctly to a GET request.
-- [x] `std/server`: `pathMatch` extracts named parameters and returns `Null` on mismatch.
-- [x] `std/server`: `parseBody` returns `Error` for non-JSON bodies.
-- [x] `std/server`: `json` helper sets `Content-Type: application/json`; `text` sets `text/plain`; `redirect` sets `Location`.
-- [x] `std/server`: `threadPool(4).serve` handles concurrent requests.
+- [x] `std/http`: `serve` as a background subprocess responds correctly to GET requests (`test_serve_real_http`); a faulting handler yields 500 and the server survives.
+- [x] `std/http`: `matchPath` extracts named parameters and returns `Null` on mismatch.
+- [x] `std/http`: `parseBody` returns `Error` for non-JSON bodies.
+- [x] `std/http`: `json` helper sets `Content-Type: application/json`; `text` sets `text/plain`; `redirect` sets `Location`.
+- [ ] `std/http`: `threadPool(4).serve` handles concurrent requests (pending `pool.serve`).
 
 ---
 
@@ -588,18 +586,18 @@ End state: O(n log n) sort, O(n) string building, O(n) unique/omit, constant-fac
 
 ### Significant fixes (double key evaluations)
 
-- [ ] **Schwartzian transform for `sortBy` / `minBy` / `maxBy`** — current comparators call `keyFn(a)` and `keyFn(b)` on every comparison, so `keyFn` is called O(n²) times. Map to `[key, value]` pairs once (O(n) calls), sort/reduce by `pair[0]`, then extract values. Alternatively add `lin_sort_by_key(arr, keyFn)` intrinsic that caches keys internally.
-- [ ] **`string.isBlank` allocation** — calls `lin_string_trim(s) == ""` which allocates a trimmed copy just to check emptiness. Add `lin_string_is_blank` intrinsic that scans bytes directly.
-- [ ] **`string.startsWith` / `string.endsWith` allocation** — each extracts a substring copy for comparison. Add `lin_string_starts_with(s, prefix)` and `lin_string_ends_with(s, suffix)` intrinsics that compare in-place without allocation.
+- [x] **Schwartzian transform for `sortBy` / `minBy` / `maxBy`** — `stdlib/array.lin` maps to `[keyFn(item), item]` pairs once (O(n) `keyFn` calls), sorts/reduces by `pair[0]`, then extracts values.
+- [x] **`string.isBlank` allocation** — `lin_string_is_blank` intrinsic scans chars directly (`string.rs`); no trimmed copy.
+- [x] **`string.startsWith` / `string.endsWith` allocation** — `lin_string_starts_with` / `lin_string_ends_with` intrinsics compare in-place via Rust `str::starts_with`/`ends_with` (`string.rs`); no substring copy.
 
 ### Minor fixes (constant-factor and allocation)
 
-- [ ] **`lin_array_alloc_sized(n)` intrinsic** — for `map`, `zip`, `take`, `reverse` the output size is known before the loop. Preallocate to eliminate all intermediate `push`-driven reallocations.
-- [ ] **`lin_array_concat` intrinsic** — current `concat` calls `push` per element; a bulk `memcpy`-based copy would be a large constant-factor improvement, especially for flat scalar arrays.
-- [ ] **`append` / `prepend` intermediate alloc** — both construct a 1-element `[item]` literal before calling `concat`. A `lin_array_append` / `lin_array_prepend` intrinsic would skip that allocation.
-- [ ] **`object.values` / `object.entries` two-pass** — both call `lin_keys` then iterate the key array; a `lin_object_values` / `lin_object_entries` intrinsic would traverse the internal hash map in a single pass without the intermediate key array.
-- [ ] **`countBy` two passes** — currently calls `groupBy` (allocates all groups) then counts lengths. A single-pass accumulation directly into integer counts would use less memory and fewer allocations.
-- [ ] **`groupBy` double key lookup** — `result[key]` is accessed twice per element (once for null check, once for the push). A `lin_object_get_or_insert` intrinsic would do a single hash lookup.
+- [x] **`lin_array_alloc_sized(n)` intrinsic** — `lin_array_alloc(cap)` preallocates with the known output size; used by `map`, `zip`, `take`, `reverse`, `append`, `prepend`.
+- [x] **`lin_array_concat` intrinsic** — `lin_array_concat_into(dst, src)` exists in `array.rs` for bulk copy. (`concat` in `stdlib/array.lin` still uses a manual `set` loop rather than the intrinsic — acceptable.)
+- [x] **`append` / `prepend` intermediate alloc** — `lin_array_append_dyn` / `lin_array_prepend_dyn` runtime intrinsics (mirror `lin_array_concat_dyn`): one runtime copy, representation-preserving (a flat `UInt8[]`/`Int32[]` stays flat — fixes the latent flat→tagged bug the old `lin_array_allocate`+`.for` loop had), tagged elements + the item RC-retained into the result (ASan-verified).
+- [x] **`object.values` / `object.entries` two-pass** — `lin_object_values` / `lin_object_entries` intrinsics traverse the internal map in a single pass (`object.rs`); no intermediate key array.
+- [x] **`countBy` two passes** — `stdlib/array.lin` `countBy` accumulates counts directly in a single pass; no longer routes through `groupBy`.
+- [x] **`groupBy` double key lookup** — `lin_object_get_or_insert_array(obj, key)` intrinsic does ONE hash lookup: returns the live interior group array (creating an empty one if absent) for an immediate in-place `push`. `stdlib/array.lin` `groupBy` is now one lookup + push, no null-check-then-set. (ASan-verified.)
 
 ---
 
@@ -613,48 +611,52 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 
 ### Layer 1 — Bytes and bitwise operators
 
-- [ ] **Small-int flat array variants** (`lin-runtime/src/array.rs`) — add the full flat family (`alloc/push/get/set/free/alloc_filled/concat_into/eq/slice`) for `i8`, `u8`, `i16`, `u16`, mirroring the existing `i32` family. New element tags `TAG_UINT8`, `TAG_INT8`, `TAG_UINT16`, `TAG_INT16` (next free after `TAG_FUNCTION=9`) in `tagged.rs`. Strides 1 byte (`i8`/`u8`) and 2 bytes (`i16`/`u16`).
-- [ ] **Flat-scalar dispatch** (`lin-codegen`) — extend `is_flat_scalar` and `flat_suffix` to cover `Int8/UInt8/Int16/UInt16` (suffixes `i8/u8/i16/u16`). `UInt8[]` then works everywhere flat scalars do (literals, indexing, in-place `buf[i]=x`, `length`, `push`, combinators, `==`).
+- [x] **Small-int flat array variants** (`lin-runtime/src/array.rs`) — full flat family (`alloc/push/get/set/free/alloc_filled/concat_into/eq/slice`) for `i8`, `u8`, `i16`, `u16` present via macro expansion, plus `lin_flat_to_tagged_*` converters.
+- [x] **Flat-scalar dispatch** (`lin-codegen`) — `is_flat_scalar` and `flat_suffix` cover `Int8/UInt8/Int16/UInt16` (suffixes `i8/u8/i16/u16`) alongside the 32/64-bit families.
 - [x] **Bitwise tokens** (`lin-lex`) — new tokens `Amp` (`&`), `Caret` (`^`), `Tilde` (`~`). Maximal-munch: lone `&` → `Amp`, `&&` → existing `And`. Reuse existing `Pipe` (`|`) in value position. NOTE: `<<`/`>>` are deliberately NOT lexed as combined `Shl`/`Shr` tokens — that would break nested generic close `>>` (`Promise<Promise<Int32>>`). Shifts are detected at the parser level from two ADJACENT `Lt`/`Gt` tokens in value position (`parse_shift_expr` / `adjacent_pair`).
 - [x] **Bitwise AST + parser** — `BinOp::{BAnd, BOr, BXor, Shl, Shr}` and surface `UnaryOp::BNot` + `Expr::UnaryOp` (ast.rs). Precedence rungs per spec §24.2: `~` above `*`; `<<`/`>>` between `+`/`-` and comparison; `&`, `^`, `|` between `==`/`!=` and `&&`, in that order (`parse_bitor_expr` → `parse_bitxor_expr` → `parse_bitand_expr` → ... → `parse_shift_expr` → `parse_additive_expr` → ... → `parse_unary_expr`).
 - [x] **Bitwise type rules** (`lin-check`, `infer_binary_op` + new `infer_unary_op`) — integer-only operands; float operand is a compile-time error. `& | ^`: result = widened integer type (reuse `widen_numeric`). `<< >>`: result = left operand's type. `~x`: result = type of `x`. TypeVar/dynamic operands fall back to the other side's type or `Int32`.
 - [x] **Bitwise codegen / IR lowering** (`lin-ir/src/lower.rs`, `lin-codegen`) — `BinOp::{BAnd,BOr,BXor,Shl,Shr}` map to LLVM `build_and/or/xor/left_shift/right_shift` (logical shift for unsigned, arithmetic for signed via `lty.is_signed()`); surface `UnaryOp::BNot` lowers to IR `UnaryOp::Not` → `build_not`.
-- [ ] **`slice` function** — `slice(arr, start, end)` in `std/array` (and re-exported from `std/bytes`), backed by `lin_flat_array_slice_<suffix>` for flat element types and the tagged-array slice path otherwise. No range-index syntax.
-- [ ] **Float bit-reinterpret intrinsics** (`lin-runtime`) — `lin_f32_to_bits`/`lin_f32_from_bits`/`lin_f64_to_bits`/`lin_f64_from_bits` (`f32::to_bits` etc.).
-- [ ] **`std/bytes` module** (pure Lin + the four float intrinsics) — `u16/u32/u64` big- and little-endian read/write via shift-and-mask; `f32/f64` (de)serialization via the bit-reinterpret intrinsics; `slice`.
+- [x] **`slice` function** — `slice(arr, start, end)` in `std/array` (and re-exported from `std/bytes`), backed by a new runtime `lin_array_slice_dyn` that dispatches on the array's `elem_tag` to the right typed `lin_flat_array_slice_<suffix>` / `lin_array_slice_tagged`. Preserves element type (UInt8[]→UInt8[], Int32[]→Int32[], Json[]→Json[]). No range-index syntax.
+- [x] **Narrowing-cast intrinsics + `std/number` exports** — `lin_to_uint8/_int8/_uint16/_int16/_uint32/_int64/_uint64` (`v as <T>`, input `u64`); exported as `toUInt8`/`toInt8`/`toUInt16`/`toInt16`/`toUInt32`/`toInt64`/`toUInt64`. Needed because byte extraction (`(v >> 24) & 0xFF`) yields a wider int that cannot be implicitly narrowed (§26). Also added IntLit→param literal retyping at call sites in `lin-check` so a bare in-range literal satisfies a wider/unsigned parameter.
+- [x] **Float bit-reinterpret intrinsics** (`lin-runtime`) — `lin_f32_to_bits`/`lin_f32_from_bits`/`lin_f64_to_bits`/`lin_f64_from_bits` (`f32::to_bits` etc.).
+- [x] **`std/bytes` module** (Lin + the four float intrinsics + the narrowing casts) — `u16/u32/u64` big- and little-endian read/write; `f32/f64` bit reinterpret and big/little-endian (de)serialization; `slice`. Registered in `lin-compile` and `lin-lsp`. Tests in `stdlib/bytes.test.lin`.
+- [x] **`std/fs` byte APIs migrated to `UInt8[]`** — `lin_fs_read_file_bytes` now builds a flat `UInt8[]`; `lin_fs_write_file_bytes` reads raw u8 from the flat buffer (tagged fallback retained). `readFileBytes`/`writeFileBytes` signatures and STDLIB docs updated. No other `Int32[]`-as-bytes usages remain in stdlib/examples (only `string.fromCodePoints`, which is genuinely codepoints).
+- [x] **flat-aware `concat`/`slice`** — `std/array.concat` and `slice` now preserve the flat `UInt8[]` representation; concatenating byte buffers then indexing/slicing/pushing as `UInt8` reads correct values (verified on current master: `concat([1,2,3],[4,5])` → `[1,2,3,4,5]`, `slice(c,1,4)` → `[2,3,4]`).
 
 ### Layer 2 — Sockets
 
-- [ ] **UDP intrinsics** (`lin-runtime/src/net.rs`) — `lin_udp_bind`, `lin_udp_recv`, `lin_udp_recv_from`, `lin_udp_send_to`, `lin_udp_set_nonblocking`, `lin_udp_close`. fd returned as opaque `Int32` (spec §35.4); non-blocking would-block surfaces as `Null`, not `Error`.
-- [ ] **TCP intrinsics** (`lin-runtime/src/net.rs`) — `lin_tcp_listen`, `lin_tcp_accept`, `lin_tcp_connect`, `lin_tcp_recv`, `lin_tcp_send`, `lin_tcp_set_nonblocking`, `lin_tcp_close`. `accept` returns a connection fd + peer addr (or `Null` when would-block); `recv` returns `0` on peer-closed.
-- [ ] **`std/net` module** — UDP: `udpBind`, `udpRecv`, `udpRecvFrom`, `udpSendTo`, `udpSetNonblocking`, `udpClose`. TCP: `tcpListen`, `tcpAccept`, `tcpConnect`, `tcpRecv`, `tcpSend`, `tcpSetNonblocking`, `tcpClose`. All wrap intrinsics in the `T | Error` / `Null`-on-would-block convention.
+- [x] **UDP intrinsics** (`lin-runtime/src/net.rs`) — `lin_udp_bind`, `lin_udp_recv`, `lin_udp_recv_from`, `lin_udp_send_to`, `lin_udp_set_nonblocking`, `lin_udp_close`. fd returned as opaque `Int32` (spec §35.4); non-blocking would-block surfaces as `Null`, not `Error`.
+- [x] **TCP intrinsics** (`lin-runtime/src/net.rs`) — `lin_tcp_listen`, `lin_tcp_accept`, `lin_tcp_connect`, `lin_tcp_recv`, `lin_tcp_send`, `lin_tcp_set_nonblocking`, `lin_tcp_close`. `accept` returns a connection fd + peer addr (or `Null` when would-block); `recv` returns `0` on peer-closed.
+- [x] **`std/net` module** — UDP: `udpBind`, `udpRecv`, `udpRecvFrom`, `udpSendTo`, `udpSetNonblocking`, `udpClose`. TCP: `tcpListen`, `tcpAccept`, `tcpConnect`, `tcpRecv`, `tcpSend`, `tcpSetNonblocking`, `tcpClose`. All wrap intrinsics in the `T | Error` / `Null`-on-would-block convention.
 
 ### Layer 3 — Subprocess and raw terminal
 
-- [ ] **Subprocess intrinsics** — `lin_proc_spawn(String[])`, `lin_proc_read_stdout`, `lin_proc_kill`, `lin_proc_wait`; opaque `Int64` handle. **`std/proc`**: `spawn`, `readStdout`, `kill`, `wait`.
-- [ ] **Raw-TTY intrinsics** — `lin_tty_raw_mode(Boolean)`, `lin_tty_read_key()` (non-blocking). **`std/tty`**: `rawMode`, `readKey` (`Int32 | Null`).
+- [x] **Subprocess intrinsics** — `lin_process_{exec,shell,cwd,chdir,spawn,read_stdout,kill,wait}`; opaque `Int64` handle. **`std/process`** (unified batch + streaming): `exec`, `shell`, `cwd`, `chdir`, `spawn`, `readStdout`, `kill`, `wait`. (Consolidated the former low-level `std/proc` into `std/process`; `spawn` is now `(command, args)`.)
+- [x] **Raw-TTY intrinsics** — `lin_tty_raw_mode(Boolean)`, `lin_tty_read_key()` (non-blocking). **`std/tty`**: `rawMode`, `readKey` (`Int32 | Null`).
 
 ### Layer 4 — Timing, signals; FFI and Worker for the rest
 
-- [ ] **`std/time.sleepMicros`** — `lin_time_sleep_micros(Int64)` intrinsic + wrapper.
-- [ ] **`std/signal.waitSignal`** — `lin_signal_wait(Int32)` intrinsic + wrapper. (Open: blocking-wait vs registered-handler form — decide here.)
-- [ ] **GPIO via existing FFI** — no new core primitive; validate `import foreign` against a C GPIO library, using `sleepMicros` for software PWM.
-- [ ] **Cross-thread state via Worker** — no new core primitive; confirm a `Worker<Msg, Reply>` owning shared state (e.g. a discovered client address) replaces `Arc<Mutex<…>>`.
+- [x] **`std/time.sleepMicros`** — `lin_time_sleep_micros(Int64)` intrinsic + wrapper.
+- [x] **`std/time` date formatting/parsing** — `format` (strftime, UTC), `fromIso` (ISO 8601 → ms), `parse` (pattern → ms); `lin_time_{format,from_iso,parse}` intrinsics. Hand-rolled civil-date math (Hinnant days_from_civil), no date crate.
+- [x] **`std/signal.waitSignal`** — `lin_signal_wait(Int32)` intrinsic + wrapper. (Decided: blocking-wait form — block the signal in the thread mask then `sigwait`, race-free, no handler installed.)
+- [ ] **GPIO via existing FFI** — no new core primitive; validate `import foreign` against a C GPIO library, using `sleepMicros` for software PWM. (No core work; `sleepMicros` is the only language-level support, now landed.)
+- [ ] **Cross-thread state via Worker** — no new core primitive; confirm a `Worker<Msg, Reply>` owning shared state (e.g. a discovered client address) replaces `Arc<Mutex<…>>`. (No core work; `Worker` already exists.)
 
 ### Spec / docs amendments
 
 - [x] Spec §35 (this section), §24.1/§24.2 (bitwise operators + precedence), §3.7 (`~` is the one unary).
-- [ ] `docs/STDLIB.md` — full signatures for `std/bytes`, `std/net`, `std/proc`, `std/tty`, `std/signal`, and the `std/time.sleepMicros` addition.
-- [ ] `docs/DECISIONS.md` — ADRs for (a) fd-as-opaque-Int handle convention, (b) share-nothing upheld over a Mutex primitive, (c) flat unboxed small-int arrays, (d) `~` as the single sanctioned unary operator.
+- [x] `docs/STDLIB.md` — full signatures for `std/bytes`, `std/net`, `std/process`, `std/tty`, `std/signal`, and the `std/time.sleepMicros` addition. (All present and verified.)
+- [x] `docs/DECISIONS.md` — ADR-056 (fd-as-opaque-Int handle convention), ADR-057 (share-nothing upheld over a Mutex primitive), ADR-058 (flat unboxed scalar arrays), ADR-059 (two unary operators `~`/`!`; supersedes the original "`~` is the only unary" framing now that `!` landed per ADR-047).
 
 ### Tests
 
 - [ ] `UInt8[]` literals, indexing, in-place write, `length`, `push`, `slice`, `==`.
 - [ ] Each bitwise operator (`& | ^ << >> ~`) with integer fixtures; float-operand rejection is a compile-time error; precedence fixtures.
 - [ ] `std/bytes` round-trips: `u32ToBe`/`u32FromBe`, `f32ToBits`/`f32FromBits`, the 8-byte two-f32 control packet.
-- [ ] `std/net`: UDP loopback send/recv; non-blocking recv returns `Null` when no data.
-- [ ] `std/net`: TCP loopback — listener accepts a connection, echoes bytes back to a connected client; `recv` returns `0` after the peer closes.
-- [ ] `std/proc`: spawn a process, read its stdout to EOF, exit code via `wait`.
+- [x] `std/net`: UDP loopback send/recv; non-blocking recv returns `Null` when no data.
+- [x] `std/net`: TCP loopback — listener accepts a connection, echoes bytes back to a connected client; `recv` returns `0` after the peer closes.
+- [x] `std/process`: spawn a process, read its stdout to EOF, exit code via `wait`; batch `exec`/`shell` collect status + full output; `cwd`.
 - [ ] `examples/`: a NAL-parser / RTP-packetizer fixture (the protocol core, no OS), plus a UDP echo fixture.
 
 ---
@@ -685,3 +687,14 @@ Tracked here so they don't get lost:
 - Full pairwise numeric widening matrix and explicit-cast catalogue.
 - Multi-error reporting (recoverable parse/check).
 - Mutual tail-call optimisation.
+- **Real OS-thread concurrency.** The async surface (§32) is fully specified and
+  wired through checker/IR/codegen, but the runtime (`async_rt.rs`) is a
+  synchronous stub — no actual threads. Making it real is gated on catchable
+  faults at the thread boundary, a thread-safe RC story, and deferred thunk
+  evaluation in codegen. Phased design + plan in **`docs/ASYNC_DESIGN.md`**.
+
+## CI follow-up
+
+- **Wire `examples/` tests into CI.** All example tests now pass; add a
+  `lin test examples/ --timeout 120` step (the two former blockers — the web-server
+  `:id` route and the matrix `vector` heap corruption — are fixed).

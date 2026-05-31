@@ -60,21 +60,39 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      - name: Run examples through lin run
+      - name: Build FFI example archive (native object format)
         run: |
-          for f in examples/*.lin; do
-            case "$f" in
-              examples/ffi-c.lin|\
-              examples/http-client.lin|\
-              examples/showcase.lin|\
-              examples/template.lin) echo "SKIP $f"; continue ;;
+          # The committed libmathlib.a is a Linux archive; rebuild it from source with the
+          # runner's native cc so the ffi example links on every platform (macOS ld rejects
+          # a foreign-format archive: "archive member '/' not a mach-o file"). Remove the
+          # committed archive first — `ar rcs` onto the existing GNU-format file keeps its
+          # '/' symbol-table member, which macOS ld then rejects.
+          rm -f examples/ffi/libmathlib.a
+          cc -c examples/ffi/mathlib.c -o examples/ffi/mathlib.o
+          ar rcs examples/ffi/libmathlib.a examples/ffi/mathlib.o
+
+      - name: Run example projects through lin run
+        run: |
+          # Each example is now a project directory with a runnable main.lin. Run every
+          # main.lin, with per-project handling for the ones that need argv or artifacts.
+          for m in examples/*/main.lin; do
+            dir="$(dirname "$m")"
+            case "$dir" in
+              # web-server/main.lin calls serve(...), which blocks forever; the router and
+              # handlers are covered by *.test.lin and the Rust serve integration test.
+              examples/web-server) echo "SKIP $m (serve blocks forever; covered by tests)"; continue ;;
+              # dijkstra/main.lin reads a graph + source/target/output from argv.
+              examples/dijkstra)
+                echo "==> $m (with argv)"
+                cargo run -p lin --quiet -- run "$m" -- examples/dijkstra/graph.json A E /tmp/dijkstra_out.json || exit 1
+                continue ;;
             esac
-            echo "==> $f"
-            cargo run -p lin --quiet -- run "$f" || exit 1
+            echo "==> $m"
+            cargo run -p lin --quiet -- run "$m" || exit 1
           done
 
-      - name: Run stdlib tests
-        run: cargo run -p lin --quiet -- test stdlib/ --timeout 120
+      - name: Run stdlib and example tests
+        run: cargo run -p lin --quiet -- test stdlib/ examples/ --timeout 120
 
   # AddressSanitizer leg: builds an instrumented lin-runtime and links the compiled
   # test programs against it on the LinIR path, then runs the stdlib suite under ASan.
@@ -94,8 +112,13 @@ jobs:
           echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-22 main" \
             | sudo tee /etc/apt/sources.list.d/llvm-22.list
           sudo apt-get update
+          # libclang-rt-22-dev provides clang's compiler-rt sanitizer archives
+          # (libclang_rt.asan.a / .asan_static.a). Without it the instrumented
+          # `clang-22 -fsanitize=address` link below fails with
+          # "cannot find libclang_rt.asan*.a". Not needed by the host LLVM legs.
           sudo apt-get install -y --no-install-recommends \
-            llvm-22 llvm-22-dev llvm-22-runtime clang-22 libpolly-22-dev
+            llvm-22 llvm-22-dev llvm-22-runtime clang-22 libpolly-22-dev \
+            libclang-rt-22-dev
           echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
 
       - name: Install Rust nightly (for -Zsanitizer)
@@ -117,10 +140,29 @@ jobs:
       - name: Build lin (compiler) and the ASan-instrumented runtime
         run: |
           cargo build -p lin
+          # Force a fresh liblin_runtime.a for BOTH the host and the instrumented
+          # target. The restored cache can contain a staticlib built from older
+          # runtime source (runtime source changes don't bump Cargo.lock, so the
+          # same cache key is reused); cargo's fingerprint then reports it
+          # up-to-date and skips the rebuild, so the stale .a survives. The
+          # internal `cc` link `lin build` runs (find_runtime_lib() picks
+          # target/debug) — and the explicit clang link below (target triple
+          # dir) — would then fail with `undefined reference` to any
+          # newer runtime symbol. `cargo clean -p` clears the artifact AND its
+          # fingerprint (a bare rm would leave the fingerprint "fresh" and cargo
+          # would not rebuild), guaranteeing both archives match current source.
+          cargo clean -p lin-runtime
+          cargo clean -p lin-runtime --target x86_64-unknown-linux-gnu
+          # `lin build` runs its own internal `cc` link against the host
+          # liblin_runtime.a (find_runtime_lib() looks in target/debug). Building
+          # the compiler alone only emits lin-runtime as an rlib, so emit the
+          # staticlib explicitly — otherwise that internal link fails before the
+          # .ll is ever handed to the instrumented clang link below.
+          cargo build -p lin-runtime
           RUSTFLAGS="-Zsanitizer=address" cargo +nightly build \
             -p lin-runtime --target x86_64-unknown-linux-gnu
 
-      - name: Build + run each stdlib test under AddressSanitizer (LinIR path)
+      - name: Build + run each stdlib & example test under AddressSanitizer (LinIR path)
         env:
           # LinIR is the default backend; no LIN_USE_IR needed.
           LIN_EMIT_IR: "1"
@@ -128,10 +170,18 @@ jobs:
         run: |
           RT="$(find target/x86_64-unknown-linux-gnu/debug -name liblin_runtime.a | head -1)"
           fail=0
-          for f in stdlib/*.test.lin; do
+          # stdlib unit tests AND the example-project suites — the latter are realistic
+          # multi-module programs (calc/report/config/codec/…) whose map/filter/reduce,
+          # flat-array, projection, and closure usage is the strongest RC/UAF guard.
+          # `lin build` bundles a test's relative-import modules into one linkable .ll.
+          for f in stdlib/*.test.lin examples/*/*.test.lin; do
             echo "==> $f"
             cargo run -p lin --quiet -- build "$f" -o /tmp/asan_test || { echo "BUILD FAIL $f"; fail=1; continue; }
-            clang-22 -fsanitize=address -g /tmp/asan_test.ll "$RT" -o /tmp/asan_test_bin
+            # The ffi suite calls into a committed C archive (libmathlib.a), which uses libm
+            # (sqrt). Link both for the ASan binary; every other test links only the runtime.
+            extra=""
+            case "$f" in examples/ffi/*) extra="examples/ffi/libmathlib.a -lm" ;; esac
+            clang-22 -fsanitize=address -g /tmp/asan_test.ll "$RT" $extra -o /tmp/asan_test_bin
             # Leak detection off: the stdlib intentionally retains program-lifetime
             # globals (module init state) that are never released at exit.
             if ! ASAN_OPTIONS=detect_leaks=0 /tmp/asan_test_bin > /tmp/asan_out 2>&1; then
@@ -140,3 +190,69 @@ jobs:
             rm -f /tmp/asan_test.ll
           done
           exit $fail
+
+      # Runtime unit tests under AddressSanitizer. The stdlib-test leg above is the
+      # *integration* guard, but its coverage is incidental: a heap bug only crashes
+      # when later allocations happen to reuse the corrupted region, so it can pass by
+      # luck. This leg runs the lin-runtime #[test] suite (memory layout / free / RC
+      # invariants) directly under ASan, giving a deterministic guard for those bugs.
+      - name: Run lin-runtime unit tests under AddressSanitizer
+        env:
+          # std::process::exit in some runtime paths trips the leak checker at exit;
+          # these tests assert behaviour, not leak-freedom, so disable LSan here.
+          ASAN_OPTIONS: detect_leaks=0
+          RUSTFLAGS: "-Zsanitizer=address"
+          RUSTDOCFLAGS: "-Zsanitizer=address"
+        run: |
+          cargo +nightly test -p lin-runtime \
+            --target x86_64-unknown-linux-gnu
+
+  # ThreadSanitizer leg: the right tool for the concurrency RC-race class (async/parallel/
+  # ThreadPool/Worker, Shared<T> atomic box, Frozen<T> immortal reads). Runs the lin-runtime
+  # #[test] suite — which includes multi-threaded tests (concurrent Shared get/set, etc.) —
+  # under TSan, building std instrumented via -Zbuild-std (requires the rust-src component).
+  tsan:
+    name: TSan (lin-runtime, Linux)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM 22
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-22 llvm-22-dev llvm-22-runtime clang-22 libpolly-22-dev
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
+
+      - name: Install Rust nightly (for -Zsanitizer + -Zbuild-std)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: tsan-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: tsan-cargo-
+
+      - name: Run lin-runtime unit tests under ThreadSanitizer
+        env:
+          RUSTFLAGS: "-Zsanitizer=thread"
+          RUSTDOCFLAGS: "-Zsanitizer=thread"
+          # The runtime intentionally retains program-lifetime globals; TSan only flags races.
+          TSAN_OPTIONS: report_signal_unsafe=0
+        run: |
+          # --lib: run the unit-test suite (which holds the multi-threaded race tests). Doctests
+          # are skipped — under -Zbuild-std rustdoc can't reconcile the sanitizer ABI across a
+          # transitive dependency, an artifact unrelated to the race-class guard.
+          cargo +nightly test -p lin-runtime -Zbuild-std --lib \
+            --target x86_64-unknown-linux-gnu

@@ -1,0 +1,53 @@
+// Report generation: parse a batch of CSV lines, compute statistics over the
+// valid records, and render a text report. Exercises map/filter/reduce churn over
+// heap (object) values — the pattern that historically broke RC.
+
+import { parseRow } from "./parse"
+import { map, filter, reduce, length, sortBy } from "std/array"
+import { toString, join } from "std/string"
+
+// A validated CSV record (structurally identical to parse.lin's `Record`; Lin's
+// structural typing lets the parse result flow straight into the pipeline).
+export type Record = { "name": String, "score": Int32 }
+
+// Summary statistics over a batch of valid records.
+export type Stats = { "count": Int32, "total": Int32, "average": Int32, "top": String }
+
+// Parse every line into a result, keep the successful records' values.
+export val validRecords = (lines: String[]): Record[] =>
+  lines
+    .map(line => parseRow(line))
+    .filter(r => r["type"] == "success")
+    .map(r => r["value"])
+
+// The error messages from the rows that failed to parse.
+export val parseErrors = (lines: String[]): String[] =>
+  lines
+    .map(line => parseRow(line))
+    .filter(r => r["type"] == "failure")
+    .map(r => r["error"])
+
+// Statistics over the valid records: count, total, average (integer), and the
+// top scorer's name. Returns an object; `count == 0` is handled by the caller.
+export val stats = (records: Record[]): Stats =>
+  val count = length(records)
+  if count == 0 then { "count": 0, "total": 0, "average": 0, "top": "" }
+  else
+    val total = records.reduce(0, (sum, r) => sum + r["score"])
+    val ranked = records.sortBy(r => 0 - r["score"])
+    { "count": count, "total": total, "average": total / count, "top": ranked[0]["name"] }
+
+// A trailing "skipped N bad row(s)" note, or "" when every row parsed.
+val errorNote = (errs: String[]): String =>
+  if length(errs) == 0 then "" else "\nskipped ${toString(length(errs))} bad row(s)"
+
+// Render a multi-line text report from a batch of CSV lines.
+export val render = (lines: String[]): String =>
+  val records = validRecords(lines)
+  val st = stats(records)
+  val rows = records
+    .sortBy(r => 0 - r["score"])
+    .map(r => "  ${r["name"]}: ${toString(r["score"])}")
+    .join("\n")
+  val errLines = errorNote(parseErrors(lines))
+  "=== Report ===\n${rows}\ncount=${toString(st["count"])} avg=${toString(st["average"])} top=${st["top"]}${errLines}"

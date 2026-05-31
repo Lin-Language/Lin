@@ -23,11 +23,40 @@ pub struct LinArrayElem {
     pub payload: u64,
 }
 
+// A tagged array element IS a `TaggedVal`: `lin_array_get_tagged` reinterprets element memory
+// as a TaggedVal and codegen `copy_nonoverlapping(.., 16)` between the two. They must stay
+// byte-identical, so pin the layout at compile time.
+const _: () = {
+    assert!(core::mem::size_of::<LinArrayElem>() == core::mem::size_of::<crate::tagged::TaggedVal>());
+    assert!(core::mem::offset_of!(LinArrayElem, tag) == 0);
+    assert!(core::mem::offset_of!(LinArrayElem, payload) == 8);
+};
+
 unsafe fn array_elem_layout(cap: u64) -> Layout {
     Layout::from_size_align_unchecked(
         std::mem::size_of::<LinArrayElem>() * cap as usize,
         std::mem::align_of::<LinArrayElem>(),
     )
+}
+
+/// (size, align) of one element for a given `elem_tag`. Flat scalar arrays store raw
+/// values of the element's natural width; `0xFF` (tagged) stores 16-byte LinArrayElem.
+/// The data buffer MUST be freed with the same layout it was allocated with, so this
+/// must match each flat family's `$alloc`/`$free` (e.g. lin_flat_array_alloc_u8 uses
+/// size_of::<u8>()). Using the tagged 16-byte layout to free a flat array corrupts the heap.
+fn flat_elem_size_align(elem_tag: u8) -> (usize, usize) {
+    use crate::tagged::*;
+    match elem_tag {
+        TAG_INT32 | TAG_UINT32 | TAG_FLOAT32 => (4, 4),
+        TAG_INT64 | TAG_UINT64 | TAG_FLOAT64 => (8, 8),
+        TAG_UINT8 | TAG_INT8 | TAG_BOOL => (1, 1),
+        TAG_UINT16 | TAG_INT16 => (2, 2),
+        // 0xFF and anything else: tagged 16-byte elements.
+        _ => (
+            std::mem::size_of::<LinArrayElem>(),
+            std::mem::align_of::<LinArrayElem>(),
+        ),
+    }
 }
 
 unsafe fn array_layout() -> Layout {
@@ -52,10 +81,42 @@ pub unsafe extern "C" fn lin_array_alloc(initial_cap: u64) -> *mut LinArray {
     ptr
 }
 
+/// Deep-copy a FLAT scalar array (elem_tag != 0xFF): allocate a fresh header + raw element
+/// buffer of the same width and copy the bytes verbatim. Flat arrays hold no pointers, so a
+/// byte copy is a complete deep copy. Used by the thread-transfer path (transfer.rs).
+pub unsafe fn lin_array_clone_flat(src: *const LinArray) -> *mut LinArray {
+    let len = (*src).len;
+    let cap = (*src).cap.max(4);
+    let elem_tag = (*src).elem_tag;
+    let (esize, ealign) = flat_elem_size_align(elem_tag);
+    let ptr = alloc(array_layout()) as *mut LinArray;
+    (*ptr).refcount = 1;
+    (*ptr).elem_tag = elem_tag;
+    (*ptr)._pad3 = [0; 3];
+    (*ptr).len = len;
+    (*ptr).cap = cap;
+    let data_layout = Layout::from_size_align_unchecked(esize * cap as usize, ealign);
+    (*ptr).data = alloc(data_layout) as *mut LinArrayElem;
+    if len > 0 {
+        std::ptr::copy_nonoverlapping(
+            (*src).data as *const u8,
+            (*ptr).data as *mut u8,
+            esize * len as usize,
+        );
+    }
+    ptr
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_free(arr: *mut LinArray) {
-    let cap = (*arr).cap;
-    dealloc((*arr).data as *mut u8, array_elem_layout(cap));
+    let cap = (*arr).cap as usize;
+    // Free the data buffer with the SAME layout it was allocated with. Flat scalar
+    // arrays use their element's natural width, not the 16-byte tagged element size —
+    // freeing a flat u8 array with the tagged layout deallocs 16x too much and corrupts
+    // the heap (surfaces as a SEGV in a much later, unrelated allocation).
+    let (esize, ealign) = flat_elem_size_align((*arr).elem_tag);
+    let data_layout = Layout::from_size_align_unchecked(esize * cap, ealign);
+    dealloc((*arr).data as *mut u8, data_layout);
     dealloc(arr as *mut u8, array_layout());
 }
 
@@ -65,6 +126,16 @@ pub unsafe extern "C" fn lin_array_release(arr: *mut LinArray) {
     if arr.is_null() {
         return;
     }
+    // Frozen (immortal) arrays carry a saturated refcount and must never be freed or
+    // decremented — they are deep-frozen, shared read-only across threads, and program-lifetime
+    // (Frozen<T>, ADR-045). The read-only guard makes retain/release no-ops, so concurrent reads
+    // of a frozen graph from N threads never write the refcount → race-free with non-atomic RC.
+    if (*arr).refcount >= crate::string::IMMORTAL_RC {
+        return;
+    }
+    // Zero refcount ⇒ double-release (ownership bug); the decrement below would wrap u32.
+    // Debug/ASan-only guard, no release-build cost.
+    debug_assert!((*arr).refcount > 0, "lin_array_release: refcount underflow (double free)");
     (*arr).refcount -= 1;
     if (*arr).refcount == 0 {
         // For tagged arrays (elem_tag == 0xFF), release any heap-typed elements before
@@ -217,6 +288,27 @@ pub unsafe extern "C" fn lin_push_dyn(arr: *mut LinArray, tagged: *const crate::
                 if elem_tag == TAG_UINT16 { lin_flat_array_push_u16(arr, v as u16); }
                 else { lin_flat_array_push_i16(arr, v as i16); }
             }
+            TAG_UINT32 => {
+                // A boxed UInt32 scalar is TAG_INT64-positive; read it back unsigned.
+                let v = match tag {
+                    TAG_INT32 => payload as i32 as u32,
+                    TAG_INT64 => payload as u32,
+                    TAG_UINT64 => payload as u32,
+                    TAG_FLOAT64 => f64::from_bits(payload) as u32,
+                    _ => 0,
+                };
+                lin_flat_array_push_u32(arr, v);
+            }
+            TAG_UINT64 => {
+                let v = match tag {
+                    TAG_INT32 => payload as i32 as i64 as u64,
+                    TAG_INT64 => payload,
+                    TAG_UINT64 => payload,
+                    TAG_FLOAT64 => f64::from_bits(payload) as u64,
+                    _ => 0,
+                };
+                lin_flat_array_push_u64(arr, v);
+            }
             _ => {}
         }
     }
@@ -289,12 +381,11 @@ pub unsafe extern "C" fn lin_flat_to_tagged_f64(flat: *const LinArray) -> *mut L
 
 /// Get a pointer to the element payload at index. Supports negative indices (Python-style).
 #[no_mangle]
-pub unsafe extern "C" fn lin_array_get(arr: *const LinArray, idx: i64) -> *mut LinArrayElem {
+pub unsafe extern "C-unwind" fn lin_array_get(arr: *const LinArray, idx: i64) -> *mut LinArrayElem {
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {
-        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-        std::process::exit(1);
+        crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
     }
     (*arr).data.add(actual as usize)
 }
@@ -353,15 +444,14 @@ pub unsafe extern "C" fn lin_array_length(arr: *const LinArray) -> i64 {
 /// Get element at index as a heap-allocated TaggedVal*, handling both flat and tagged arrays.
 /// The caller is responsible for eventual deallocation. Returns null on OOB.
 #[no_mangle]
-pub unsafe extern "C" fn lin_array_get_tagged(arr: *const LinArray, idx: i64) -> *mut crate::tagged::TaggedVal {
+pub unsafe extern "C-unwind" fn lin_array_get_tagged(arr: *const LinArray, idx: i64) -> *mut crate::tagged::TaggedVal {
     use crate::tagged::*;
     if arr.is_null() { return std::ptr::null_mut(); }
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     let idx = actual;
     if idx < 0 || idx >= len {
-        eprintln!("Runtime error: array index {} out of bounds (len {})", actual, len);
-        std::process::exit(1);
+        crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", actual, len));
     }
     let tv_layout = Layout::from_size_align_unchecked(
         std::mem::size_of::<TaggedVal>(),
@@ -418,6 +508,21 @@ pub unsafe extern "C" fn lin_array_get_tagged(arr: *const LinArray, idx: i64) ->
             (*tv)._pad = [0; 7];
             (*tv).payload = v as i64 as u64;
         }
+        TAG_UINT32 => {
+            // Zero-extend the u32 into a positive i64 box (matches the scalar boxing of
+            // UInt32, which uses TAG_INT64-positive). A raw u32 may exceed i32 range, so
+            // TAG_INT32 would render it signed — TAG_INT64 keeps it positive and exact.
+            let v = *((*arr).data as *const u32).add(idx as usize);
+            (*tv).tag = TAG_INT64;
+            (*tv)._pad = [0; 7];
+            (*tv).payload = v as u64;
+        }
+        TAG_UINT64 => {
+            let v = *((*arr).data as *const u64).add(idx as usize);
+            (*tv).tag = TAG_UINT64;
+            (*tv)._pad = [0; 7];
+            (*tv).payload = v;
+        }
         _ => {
             // Tagged array: elem is already a LinArrayElem (16 bytes) = TaggedVal layout.
             let elem = (*arr).data.add(idx as usize);
@@ -462,8 +567,50 @@ pub unsafe extern "C" fn lin_array_slice_tagged(arr: *const LinArray, start: i64
     out
 }
 
-/// Copy all elements from `src` into `dst` (tagged arrays only).
-/// Used by lin concat(a, b) — appends all elements of src to dst.
+/// Polymorphic slice: dispatch on the array's runtime `elem_tag` and call the
+/// matching typed slice fn. Preserves element type (a UInt8[] yields a UInt8[],
+/// an Int32[] yields an Int32[], a tagged Json[] yields a Json[]). Backs the
+/// std/array `slice` export and (re-exported) std/bytes `slice`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_slice_dyn(arr: *const u8, start: i64, end: i64) -> *mut u8 {
+    use crate::tagged::*;
+    if arr.is_null() {
+        return alloc_tagged(TAG_ARRAY, lin_array_alloc(4) as u64);
+    }
+    // `Json` arrays cross the FFI boundary as a TaggedVal*(Array); a raw LinArray*
+    // can also arrive from typed array params. Unwrap to the inner LinArray*.
+    let tag = *arr;
+    let lin_arr = if tag == TAG_ARRAY {
+        (*(arr as *const TaggedVal)).payload as *const LinArray
+    } else {
+        arr as *const LinArray
+    };
+    let out: *mut LinArray = match (*lin_arr).elem_tag {
+        0xFF => lin_array_slice_tagged(lin_arr, start, end),
+        TAG_INT32 => lin_flat_array_slice_i32(lin_arr, start, end),
+        TAG_INT64 => lin_flat_array_slice_i64(lin_arr, start, end),
+        TAG_FLOAT32 => lin_flat_array_slice_f32(lin_arr, start, end),
+        TAG_FLOAT64 => lin_flat_array_slice_f64(lin_arr, start, end),
+        TAG_UINT8 => lin_flat_array_slice_u8(lin_arr, start, end),
+        TAG_INT8 => lin_flat_array_slice_i8(lin_arr, start, end),
+        TAG_UINT16 => lin_flat_array_slice_u16(lin_arr, start, end),
+        TAG_INT16 => lin_flat_array_slice_i16(lin_arr, start, end),
+        TAG_UINT32 => lin_flat_array_slice_u32(lin_arr, start, end),
+        TAG_UINT64 => lin_flat_array_slice_u64(lin_arr, start, end),
+        // Unknown tag: fall back to a tagged slice (treats elements as 16-byte TaggedVals).
+        _ => lin_array_slice_tagged(lin_arr, start, end),
+    };
+    // Return a Json value: TaggedVal*(Array) wrapping the result.
+    alloc_tagged(TAG_ARRAY, out as u64)
+}
+
+/// Copy all elements from `src` into `dst` (tagged arrays only), MOVING each element's
+/// 16-byte `TaggedVal` without retaining its payload. The caller must own the moved-from
+/// elements and not release them afterwards (e.g. `concat_dyn`'s widened-flat temp, whose
+/// boxes are transferred to `dst` and whose array struct is then freed by `lin_array_free`
+/// — which frees only the struct + data buffer, never the element payloads). Using this on
+/// a borrowed source that stays live double-counts and leads to a use-after-free; use
+/// `lin_array_concat_into_retaining` for that case.
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_concat_into(dst: *mut LinArray, src: *const LinArray) {
     if src.is_null() { return; }
@@ -472,6 +619,203 @@ pub unsafe extern "C" fn lin_array_concat_into(dst: *mut LinArray, src: *const L
         let elem = (*src).data.add(i);
         lin_array_push_tagged(dst, elem as *const u8);
     }
+}
+
+/// Copy all elements from a BORROWED `src` into `dst` (tagged arrays only), RETAINING each
+/// element's heap payload so `dst` and `src` are independent owners. This is the correct
+/// primitive when `src` stays alive after the copy (e.g. `concat(a, b)` where `a`/`b` are the
+/// caller's still-owned arrays). Without the retain, both arrays reference the same payload at
+/// one refcount, and freeing either frees the shared payload out from under the other —
+/// observable as heap corruption when concatenating fresh (non-interned) strings/objects.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_concat_into_retaining(dst: *mut LinArray, src: *const LinArray) {
+    if src.is_null() { return; }
+    let src_len = (*src).len as usize;
+    for i in 0..src_len {
+        let elem = (*src).data.add(i);
+        // Retain the payload before the move-copy so dst is an independent owner.
+        // LinArrayElem and TaggedVal share the same {tag, payload} layout (push_tagged
+        // raw-copies the 16 bytes between them), so the reinterpret is sound.
+        crate::object::retain_tagged_payload_pub(&*(elem as *const crate::tagged::TaggedVal));
+        lin_array_push_tagged(dst, elem as *const u8);
+    }
+}
+
+/// Concatenate `a ++ b`, PRESERVING a flat element representation when both inputs are
+/// flat arrays of the same element type. Mirrors `lin_array_slice_dyn`: the pure-Lin
+/// `concat` allocated a tagged result (lin_array_allocate), so concatenating two flat
+/// `UInt8[]` produced a tagged array — `c[i]` read correctly via the elem_tag-aware get,
+/// but byte-level consumers (`u32FromBe`, fs write, FFI) that read `(*arr).data as *const
+/// u8` saw 16-byte TaggedVal elements instead of packed bytes. When the two arrays share a
+/// flat `elem_tag`, build a flat result of that type; otherwise fall back to a tagged
+/// concat. Inputs cross the boundary as `Json` (TaggedVal*(Array)) or raw `LinArray*`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_concat_dyn(a: *const u8, b: *const u8) -> *mut u8 {
+    use crate::tagged::*;
+    unsafe fn unwrap(p: *const u8) -> *const LinArray {
+        if p.is_null() { return std::ptr::null(); }
+        if *p == TAG_ARRAY { (*(p as *const TaggedVal)).payload as *const LinArray }
+        else { p as *const LinArray }
+    }
+    let la = unwrap(a);
+    let lb = unwrap(b);
+    let ta = if la.is_null() { 0xFF } else { (*la).elem_tag };
+    let tb = if lb.is_null() { 0xFF } else { (*lb).elem_tag };
+    let total = (if la.is_null() { 0 } else { (*la).len }) + (if lb.is_null() { 0 } else { (*lb).len });
+
+    // Both flat and same element type → flat result of that type.
+    if ta == tb && ta != 0xFF {
+        // (alloc_fn, concat_into_fn) for the shared flat element tag.
+        macro_rules! flat_cat {
+            ($alloc:ident, $cat:ident) => {{
+                let out = $alloc(total.max(1));
+                if !la.is_null() { $cat(out, la); }
+                if !lb.is_null() { $cat(out, lb); }
+                return alloc_tagged(TAG_ARRAY, out as u64);
+            }};
+        }
+        match ta {
+            TAG_INT32   => flat_cat!(lin_flat_array_alloc_i32, lin_flat_array_concat_into_i32),
+            TAG_INT64   => flat_cat!(lin_flat_array_alloc_i64, lin_flat_array_concat_into_i64),
+            TAG_FLOAT32 => flat_cat!(lin_flat_array_alloc_f32, lin_flat_array_concat_into_f32),
+            TAG_FLOAT64 => flat_cat!(lin_flat_array_alloc_f64, lin_flat_array_concat_into_f64),
+            TAG_UINT8   => flat_cat!(lin_flat_array_alloc_u8,  lin_flat_array_concat_into_u8),
+            TAG_INT8    => flat_cat!(lin_flat_array_alloc_i8,  lin_flat_array_concat_into_i8),
+            TAG_UINT16  => flat_cat!(lin_flat_array_alloc_u16, lin_flat_array_concat_into_u16),
+            TAG_INT16   => flat_cat!(lin_flat_array_alloc_i16, lin_flat_array_concat_into_i16),
+            TAG_UINT32  => flat_cat!(lin_flat_array_alloc_u32, lin_flat_array_concat_into_u32),
+            TAG_UINT64  => flat_cat!(lin_flat_array_alloc_u64, lin_flat_array_concat_into_u64),
+            _ => {} // unknown flat tag: fall through to the tagged path
+        }
+    }
+
+    // Mixed or tagged element types → tagged result. A flat source is first widened to a
+    // tagged array (lin_flat_to_tagged_* boxes its raw scalars) so concat_into can copy
+    // its elements as TaggedVals; a tagged source is appended directly.
+    let out = lin_array_alloc(total.max(4));
+    unsafe fn append_tagged(out: *mut LinArray, src: *const LinArray) {
+        if src.is_null() { return; }
+        let et = (*src).elem_tag;
+        if et == 0xFF {
+            // Borrowed tagged source — retain each element so `out` owns its own references.
+            lin_array_concat_into_retaining(out, src);
+            return;
+        }
+        let widened: *mut LinArray = match et {
+            TAG_INT32   => lin_flat_to_tagged_i32(src),
+            TAG_INT64   => lin_flat_to_tagged_i64(src),
+            TAG_FLOAT32 => lin_flat_to_tagged_f32(src),
+            TAG_FLOAT64 => lin_flat_to_tagged_f64(src),
+            TAG_UINT8   => lin_flat_to_tagged_u8(src),
+            TAG_INT8    => lin_flat_to_tagged_i8(src),
+            TAG_UINT16  => lin_flat_to_tagged_u16(src),
+            TAG_INT16   => lin_flat_to_tagged_i16(src),
+            TAG_UINT32  => lin_flat_to_tagged_u32(src),
+            TAG_UINT64  => lin_flat_to_tagged_u64(src),
+            _ => { lin_array_concat_into_retaining(out, src); return; }
+        };
+        // `widened` is a fresh +1 temp whose boxed scalars are MOVED into `out`; freeing it
+        // drops only the struct + buffer (never the element payloads), so this stays a move.
+        lin_array_concat_into(out, widened);
+        lin_array_free(widened);
+    }
+    append_tagged(out, la);
+    append_tagged(out, lb);
+    alloc_tagged(TAG_ARRAY, out as u64)
+}
+
+/// Append `item` to the end of `arr`, returning a NEW array. Prepend puts it first.
+/// Both PRESERVE the input's representation: a flat array of element tag T stays flat
+/// (the item is coerced into T via `lin_push_dyn`); a tagged/`Json` array stays tagged
+/// (each copied element AND the item are RETAINED into the result, so the result owns its
+/// own +1 reference to every heap payload). Inputs are BORROWED: `arr` is not consumed and
+/// `item` is not consumed.
+///
+/// Unlike `lin_array_concat_into`/`lin_array_concat_dyn` (which copy tagged elements WITHOUT
+/// retaining and so rely on a steal-the-reference discipline at the call boundary), this path
+/// retains every tagged element it copies. That makes append/prepend RC-self-contained: the
+/// returned array can be released independently of `arr`/`item` with no over- or under-release,
+/// even when the elements are fresh (non-interned) heap values.
+unsafe fn array_unwrap(p: *const u8) -> *const LinArray {
+    use crate::tagged::TAG_ARRAY;
+    if p.is_null() { return std::ptr::null(); }
+    if *p == TAG_ARRAY { (*(p as *const crate::tagged::TaggedVal)).payload as *const LinArray }
+    else { p as *const LinArray }
+}
+
+/// Allocate a fresh result array matching `src`'s element representation, sized for
+/// `src.len + 1` (the appended/prepended item). A flat source yields a flat result of the
+/// same `elem_tag`; a tagged/null source yields a tagged result.
+unsafe fn alloc_like(src: *const LinArray, extra: u64) -> *mut LinArray {
+    use crate::tagged::*;
+    let et = if src.is_null() { 0xFF } else { (*src).elem_tag };
+    let cap = (if src.is_null() { 0 } else { (*src).len }) + extra;
+    match et {
+        TAG_INT32   => lin_flat_array_alloc_i32(cap.max(1)),
+        TAG_INT64   => lin_flat_array_alloc_i64(cap.max(1)),
+        TAG_FLOAT32 => lin_flat_array_alloc_f32(cap.max(1)),
+        TAG_FLOAT64 => lin_flat_array_alloc_f64(cap.max(1)),
+        TAG_UINT8   => lin_flat_array_alloc_u8(cap.max(1)),
+        TAG_INT8    => lin_flat_array_alloc_i8(cap.max(1)),
+        TAG_UINT16  => lin_flat_array_alloc_u16(cap.max(1)),
+        TAG_INT16   => lin_flat_array_alloc_i16(cap.max(1)),
+        TAG_UINT32  => lin_flat_array_alloc_u32(cap.max(1)),
+        TAG_UINT64  => lin_flat_array_alloc_u64(cap.max(1)),
+        _           => lin_array_alloc(cap.max(4)), // 0xFF tagged / unknown
+    }
+}
+
+/// Copy every element of `src` into `out`. For a flat `src` this is a raw scalar byte copy
+/// (no RC); for a tagged `src` each element is pushed via `lin_push_dyn`, which RETAINS the
+/// inner heap payload so `out` owns its own reference. `out` must already match `src`'s
+/// representation (see `alloc_like`).
+unsafe fn copy_all_retaining(out: *mut LinArray, src: *const LinArray) {
+    use crate::tagged::*;
+    if src.is_null() { return; }
+    match (*src).elem_tag {
+        TAG_INT32   => lin_flat_array_concat_into_i32(out, src),
+        TAG_INT64   => lin_flat_array_concat_into_i64(out, src),
+        TAG_FLOAT32 => lin_flat_array_concat_into_f32(out, src),
+        TAG_FLOAT64 => lin_flat_array_concat_into_f64(out, src),
+        TAG_UINT8   => lin_flat_array_concat_into_u8(out, src),
+        TAG_INT8    => lin_flat_array_concat_into_i8(out, src),
+        TAG_UINT16  => lin_flat_array_concat_into_u16(out, src),
+        TAG_INT16   => lin_flat_array_concat_into_i16(out, src),
+        TAG_UINT32  => lin_flat_array_concat_into_u32(out, src),
+        TAG_UINT64  => lin_flat_array_concat_into_u64(out, src),
+        _ => {
+            // Tagged source: push each element via lin_push_dyn (copies + retains payload).
+            let len = (*src).len as usize;
+            for i in 0..len {
+                let elem = (*src).data.add(i) as *const TaggedVal;
+                lin_push_dyn(out, elem);
+            }
+        }
+    }
+}
+
+/// `arr ++ [item]` — append `item` at the end, preserving representation. See the doc above.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_append_dyn(arr: *const u8, item: *const u8) -> *mut u8 {
+    use crate::tagged::*;
+    let src = array_unwrap(arr);
+    let out = alloc_like(src, 1);
+    copy_all_retaining(out, src);
+    // lin_push_dyn coerces `item` into a flat element (no RC) or copies+retains it for a
+    // tagged result — exactly the per-representation handling we want.
+    lin_push_dyn(out, item as *const TaggedVal);
+    alloc_tagged(TAG_ARRAY, out as u64)
+}
+
+/// `[item] ++ arr` — prepend `item` at the front, preserving representation. See the doc above.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_prepend_dyn(arr: *const u8, item: *const u8) -> *mut u8 {
+    use crate::tagged::*;
+    let src = array_unwrap(arr);
+    let out = alloc_like(src, 1);
+    lin_push_dyn(out, item as *const TaggedVal);
+    copy_all_retaining(out, src);
+    alloc_tagged(TAG_ARRAY, out as u64)
 }
 
 /// Copy all i32 elements from `src` flat array into `dst` flat array.
@@ -518,20 +862,60 @@ pub unsafe extern "C" fn lin_flat_array_concat_into_f64(dst: *mut LinArray, src:
     }
 }
 
-/// Tagged-element array equality (structural, element-by-element).
+/// Load element `i` of `arr` into a `TaggedVal` (by value, no heap allocation), handling
+/// BOTH tagged arrays (`elem_tag == 0xFF`, elements already laid out as TaggedVal) and flat
+/// scalar arrays (raw i8/i16/i32/i64/f32/f64/bool elements). Used by `lin_array_eq` so it can
+/// compare any array — including flat ones reached by recursion through a nested heap array.
+unsafe fn array_elem_as_tagged(arr: *const LinArray, i: usize) -> crate::tagged::TaggedVal {
+    use crate::tagged::*;
+    let mut tv: TaggedVal = std::mem::zeroed();
+    let et = (*arr).elem_tag;
+    if et == 0xFF {
+        // Tagged element: copy the in-place TaggedVal-layout element directly.
+        let elem = (*arr).data.add(i) as *const TaggedVal;
+        return *elem;
+    }
+    // Flat scalar element: read the raw value of the right width and box it inline.
+    match et {
+        TAG_INT32 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const i32).add(i)) as i64 as u64; }
+        TAG_INT64 => { tv.tag = TAG_INT64; tv.payload = (*((*arr).data as *const i64).add(i)) as u64; }
+        TAG_FLOAT32 => { tv.tag = TAG_FLOAT32; tv.payload = (*((*arr).data as *const f32).add(i)).to_bits() as u64; }
+        TAG_FLOAT64 => { tv.tag = TAG_FLOAT64; tv.payload = (*((*arr).data as *const f64).add(i)).to_bits(); }
+        TAG_UINT8 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const u8).add(i)) as i64 as u64; }
+        TAG_INT8 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const i8).add(i)) as i64 as u64; }
+        TAG_UINT16 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const u16).add(i)) as i64 as u64; }
+        TAG_INT16 => { tv.tag = TAG_INT32; tv.payload = (*((*arr).data as *const i16).add(i)) as i64 as u64; }
+        TAG_UINT32 => { tv.tag = TAG_INT64; tv.payload = (*((*arr).data as *const u32).add(i)) as u64; }
+        TAG_UINT64 => { tv.tag = TAG_UINT64; tv.payload = *((*arr).data as *const u64).add(i); }
+        TAG_BOOL => { tv.tag = TAG_BOOL; tv.payload = (*((*arr).data as *const u8).add(i)) as u64; }
+        _ => { tv.tag = TAG_NULL; }
+    }
+    tv
+}
+
+/// Structural array equality (element-by-element, deep). Works for tagged AND flat scalar
+/// arrays, and is the recursion target for nested arrays (a TAG_ARRAY element routes here
+/// via `lin_tagged_eq`). Each element is compared via `lin_tagged_eq`, so scalars compare by
+/// value (incl. cross-numeric) and heap elements (String/Array/Object) recurse deeply. A raw
+/// payload `!=` would compare heap elements by POINTER — wrong for distinct-but-equal values.
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_eq(a: *const LinArray, b: *const LinArray) -> u8 {
     if a == b { return 1; }
     if a.is_null() || b.is_null() { return 0; }
     let len = (*a).len;
     if len != (*b).len { return 0; }
+    // Compare element-by-element via `lin_tagged_eq` uniformly (handles flat and tagged,
+    // scalars by value, heap elements deeply); the per-element TaggedVal copy is cheap and
+    // avoids reading a flat scalar buffer with the 16-byte tagged stride.
     for i in 0..len as usize {
-        let ae = (*a).data.add(i);
-        let be = (*b).data.add(i);
-        if (*ae).tag != (*be).tag { return 0; }
-        // Compare payloads — for strings/arrays/objects this is pointer eq (shallow),
-        // which matches the spec for the typed-array case where elements are scalars.
-        if (*ae).payload != (*be).payload { return 0; }
+        let ae = array_elem_as_tagged(a, i);
+        let be = array_elem_as_tagged(b, i);
+        if crate::tagged::lin_tagged_eq(
+            &ae as *const crate::tagged::TaggedVal as *const u8,
+            &be as *const crate::tagged::TaggedVal as *const u8,
+        ) == 0 {
+            return 0;
+        }
     }
     1
 }
@@ -623,12 +1007,11 @@ pub unsafe extern "C" fn lin_flat_array_push_i32(arr: *mut LinArray, val: i32) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lin_flat_array_get_i32(arr: *const LinArray, idx: i64) -> i32 {
+pub unsafe extern "C-unwind" fn lin_flat_array_get_i32(arr: *const LinArray, idx: i64) -> i32 {
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {
-        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-        std::process::exit(1);
+        crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
     }
     let data = (*arr).data as *const i32;
     *data.add(actual as usize)
@@ -684,12 +1067,11 @@ pub unsafe extern "C" fn lin_flat_array_push_i64(arr: *mut LinArray, val: i64) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lin_flat_array_get_i64(arr: *const LinArray, idx: i64) -> i64 {
+pub unsafe extern "C-unwind" fn lin_flat_array_get_i64(arr: *const LinArray, idx: i64) -> i64 {
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {
-        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-        std::process::exit(1);
+        crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
     }
     let data = (*arr).data as *const i64;
     *data.add(actual as usize)
@@ -745,12 +1127,11 @@ pub unsafe extern "C" fn lin_flat_array_push_f32(arr: *mut LinArray, val: f32) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lin_flat_array_get_f32(arr: *const LinArray, idx: i64) -> f32 {
+pub unsafe extern "C-unwind" fn lin_flat_array_get_f32(arr: *const LinArray, idx: i64) -> f32 {
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {
-        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-        std::process::exit(1);
+        crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
     }
     let data = (*arr).data as *const f32;
     *data.add(actual as usize)
@@ -806,12 +1187,11 @@ pub unsafe extern "C" fn lin_flat_array_push_f64(arr: *mut LinArray, val: f64) {
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn lin_flat_array_get_f64(arr: *const LinArray, idx: i64) -> f64 {
+pub unsafe extern "C-unwind" fn lin_flat_array_get_f64(arr: *const LinArray, idx: i64) -> f64 {
     let len = (*arr).len as i64;
     let actual = if idx < 0 { len + idx } else { idx };
     if actual < 0 || actual >= len {
-        eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-        std::process::exit(1);
+        crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
     }
     let data = (*arr).data as *const f64;
     *data.add(actual as usize)
@@ -950,8 +1330,7 @@ macro_rules! flat_set_slice {
             let len = (*arr).len as i64;
             let actual = if idx < 0 { len + idx } else { idx };
             if actual < 0 || actual >= len {
-                eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-                std::process::exit(1);
+                crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
             }
             let data = (*arr).data as *mut $t;
             *data.add(actual as usize) = val;
@@ -1033,8 +1412,7 @@ macro_rules! flat_small_int {
             let len = (*arr).len as i64;
             let actual = if idx < 0 { len + idx } else { idx };
             if actual < 0 || actual >= len {
-                eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-                std::process::exit(1);
+                crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
             }
             let data = (*arr).data as *const $t;
             *data.add(actual as usize)
@@ -1045,8 +1423,7 @@ macro_rules! flat_small_int {
             let len = (*arr).len as i64;
             let actual = if idx < 0 { len + idx } else { idx };
             if actual < 0 || actual >= len {
-                eprintln!("Runtime error: array index {} out of bounds (len {})", idx, len);
-                std::process::exit(1);
+                crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
             }
             let data = (*arr).data as *mut $t;
             *data.add(actual as usize) = val;
@@ -1144,6 +1521,21 @@ flat_small_int!(i16, crate::tagged::TAG_INT16,
     lin_flat_array_set_i16, lin_flat_array_free_i16, lin_flat_array_alloc_filled_i16,
     lin_flat_array_concat_into_i16, lin_flat_array_eq_i16, lin_flat_array_slice_i16);
 
+// Unsigned 32/64-bit flat families. Same generated shape as the small-int families, but
+// elem_tag carries TAG_UINT32/TAG_UINT64 so display/JSON read the elements UNSIGNED.
+// (Signed i32/i64 keep their own families with TAG_INT32/TAG_INT64.) The macro generates
+// set+slice itself, so there is NO name collision with the flat_set_slice! families (those
+// only cover i32/i64/f32/f64 — distinct symbol names).
+flat_small_int!(u32, crate::tagged::TAG_UINT32,
+    lin_flat_array_alloc_u32, lin_flat_array_push_u32, lin_flat_array_get_u32,
+    lin_flat_array_set_u32, lin_flat_array_free_u32, lin_flat_array_alloc_filled_u32,
+    lin_flat_array_concat_into_u32, lin_flat_array_eq_u32, lin_flat_array_slice_u32);
+
+flat_small_int!(u64, crate::tagged::TAG_UINT64,
+    lin_flat_array_alloc_u64, lin_flat_array_push_u64, lin_flat_array_get_u64,
+    lin_flat_array_set_u64, lin_flat_array_free_u64, lin_flat_array_alloc_filled_u64,
+    lin_flat_array_concat_into_u64, lin_flat_array_eq_u64, lin_flat_array_slice_u64);
+
 /// Convert a flat u8 array to a tagged LinArray (each element tagged as TAG_INT32).
 /// Small integers widen to Int32 in the tagged (Json) representation.
 #[no_mangle]
@@ -1203,4 +1595,183 @@ pub unsafe extern "C" fn lin_flat_to_tagged_i16(flat: *const LinArray) -> *mut L
     }
     (*tagged).len = len;
     tagged
+}
+
+/// Convert a flat u32 array to a tagged LinArray. Each element is zero-extended into a
+/// positive Int64 box (TAG_INT64), matching how a boxed UInt32 scalar is represented, so
+/// values above i32::MAX render unsigned (e.g. 4294967295) instead of negative.
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_to_tagged_u32(flat: *const LinArray) -> *mut LinArray {
+    let len = (*flat).len;
+    let tagged = lin_array_alloc(len.max(4));
+    let src = (*flat).data as *const u32;
+    for i in 0..len as usize {
+        let slot = (*tagged).data.add(i);
+        (*slot).tag = crate::tagged::TAG_INT64;
+        (*slot).payload = *src.add(i) as u64;
+    }
+    (*tagged).len = len;
+    tagged
+}
+
+/// Convert a flat u64 array to a tagged LinArray. Each element is tagged TAG_UINT64 so the
+/// payload is read back unsigned (matching the boxed UInt64 scalar representation).
+#[no_mangle]
+pub unsafe extern "C" fn lin_flat_to_tagged_u64(flat: *const LinArray) -> *mut LinArray {
+    let len = (*flat).len;
+    let tagged = lin_array_alloc(len.max(4));
+    let src = (*flat).data as *const u64;
+    for i in 0..len as usize {
+        let slot = (*tagged).data.add(i);
+        (*slot).tag = crate::tagged::TAG_UINT64;
+        (*slot).payload = *src.add(i);
+    }
+    (*tagged).len = len;
+    tagged
+}
+
+#[cfg(test)]
+mod free_layout_tests {
+    use super::*;
+    use crate::tagged::*;
+
+    // Regression: lin_array_free must size the data-buffer dealloc from elem_tag, not
+    // always assume the 16-byte tagged LinArrayElem. Freeing a flat UInt8[] (1 byte/elem)
+    // with the tagged layout deallocs 16x too much and corrupts the heap. This pure-logic
+    // check fails instantly if anyone reverts flat_elem_size_align to the 16-byte size,
+    // without needing the non-deterministic ASan crash to happen to trigger.
+    #[test]
+    fn flat_elem_size_align_matches_alloc_width() {
+        assert_eq!(flat_elem_size_align(TAG_UINT8), (1, 1));
+        assert_eq!(flat_elem_size_align(TAG_INT8), (1, 1));
+        assert_eq!(flat_elem_size_align(TAG_UINT16), (2, 2));
+        assert_eq!(flat_elem_size_align(TAG_INT16), (2, 2));
+        assert_eq!(flat_elem_size_align(TAG_INT32), (4, 4));
+        assert_eq!(flat_elem_size_align(TAG_UINT32), (4, 4));
+        assert_eq!(flat_elem_size_align(TAG_FLOAT32), (4, 4));
+        assert_eq!(flat_elem_size_align(TAG_INT64), (8, 8));
+        assert_eq!(flat_elem_size_align(TAG_UINT64), (8, 8));
+        assert_eq!(flat_elem_size_align(TAG_FLOAT64), (8, 8));
+        // Tagged arrays (0xFF) and anything unknown use the 16-byte element.
+        assert_eq!(
+            flat_elem_size_align(0xFF),
+            (std::mem::size_of::<LinArrayElem>(), std::mem::align_of::<LinArrayElem>())
+        );
+    }
+
+    // Alloc/grow/release cycles for the flat widths. The release frees the data buffer via
+    // lin_array_free; with the wrong layout this is an allocator mismatch that miri and
+    // `cargo test` under -Zsanitizer=address catch deterministically.
+    #[test]
+    fn flat_u8_alloc_push_release_roundtrips() {
+        unsafe {
+            // Start at cap 4 and push past it to force a realloc, exercising the grow path.
+            let arr = lin_flat_array_alloc_u8(4);
+            for b in 0u16..=300 {
+                lin_flat_array_push_u8(arr, b as u8);
+            }
+            assert_eq!((*arr).len, 301);
+            assert_eq!(lin_flat_array_get_u8(arr, 0), 0);
+            assert_eq!(lin_flat_array_get_u8(arr, 255), 255);
+            lin_array_release(arr); // refcount starts at 1 -> frees here
+        }
+    }
+
+    #[test]
+    fn flat_widths_release_cleanly() {
+        unsafe {
+            let a = lin_flat_array_alloc_i16(4);
+            for v in 0..50i16 { lin_flat_array_push_i16(a, v); }
+            lin_array_release(a);
+
+            let b = lin_flat_array_alloc_u16(4);
+            for v in 0..50u16 { lin_flat_array_push_u16(b, v); }
+            lin_array_release(b);
+
+            let c = lin_flat_array_alloc_i8(4);
+            for v in 0..50i8 { lin_flat_array_push_i8(c, v); }
+            lin_array_release(c);
+        }
+    }
+
+    // append/prepend on a FLAT u8 array must stay flat (elem_tag preserved) and place the new
+    // element's raw byte in the right slot — the latent-bug check (a tagged result would store a
+    // 16-byte TaggedVal and `data as *const u8` would read a zero/garbage byte at index 2).
+    #[test]
+    fn append_prepend_preserve_flat_u8_representation() {
+        unsafe {
+            let b = lin_flat_array_alloc_u8(4);
+            lin_flat_array_push_u8(b, 1);
+            lin_flat_array_push_u8(b, 2);
+            // A u8 value crosses as a boxed scalar: small ints box as TAG_INT32 (lin_box_int32),
+            // so the item arrives tagged TAG_INT32. lin_push_dyn coerces it into the flat u8 slot.
+            let item = alloc_tagged(TAG_INT32, 3);
+
+            // append -> [1,2,3], still flat u8
+            let app_box = lin_array_append_dyn(b as *const u8, item as *const u8);
+            let app = (*(app_box as *const TaggedVal)).payload as *mut LinArray;
+            assert_eq!((*app).elem_tag, TAG_UINT8, "append result must stay flat u8");
+            assert_eq!((*app).len, 3);
+            let bytes = std::slice::from_raw_parts((*app).data as *const u8, 3);
+            assert_eq!(bytes, &[1u8, 2, 3], "raw packed bytes (NOT zero at idx 2)");
+
+            // prepend -> [3,1,2], still flat u8
+            let pre_box = lin_array_prepend_dyn(b as *const u8, item as *const u8);
+            let pre = (*(pre_box as *const TaggedVal)).payload as *mut LinArray;
+            assert_eq!((*pre).elem_tag, TAG_UINT8, "prepend result must stay flat u8");
+            let pbytes = std::slice::from_raw_parts((*pre).data as *const u8, 3);
+            assert_eq!(pbytes, &[3u8, 1, 2]);
+
+            // Input `b` is borrowed and unchanged.
+            assert_eq!((*b).len, 2);
+
+            // The result arrays (rc=1) are owned by their returned boxes; release via the box
+            // exactly once (releasing both the box AND the array directly would double-free).
+            lin_tagged_release(app_box);
+            lin_tagged_release(pre_box);
+            lin_array_release(b);
+            lin_tagged_release(item as *mut u8);
+        }
+    }
+
+    // append/prepend on a TAGGED String array: each copied element AND the item must be
+    // RC-retained into the result, so releasing the result frees its own refs without touching
+    // the borrowed inputs. Under ASan a missing retain surfaces as a UAF when reading back the
+    // strings after the inputs drop; a missing release surfaces as a leak. Loop to amplify.
+    #[test]
+    fn append_prepend_tagged_strings_rc_balanced() {
+        unsafe {
+            // Build the growing-accumulator pattern that the pure-Lin/concat path mishandles:
+            // acc = append(acc, freshString) in a loop, releasing the previous acc each round.
+            let mk = |s: &str| crate::string::lin_string_from_bytes(s.as_ptr(), s.len() as u32);
+            let mut acc = lin_array_alloc(4); // empty tagged
+            (*acc).len = 0;
+            for i in 0..200 {
+                let s = mk(&format!("item{i}")); // fresh (non-interned) string, rc=1
+                let item_box = alloc_tagged(TAG_STR, s as u64); // owns the +1 via this box
+                let next_box = lin_array_append_dyn(
+                    acc as *const u8, item_box as *const u8,
+                );
+                // Release the item box (append retained its own ref into the result).
+                lin_tagged_release(item_box);
+                // Release the previous acc (its elements were retained into next, so they live).
+                lin_array_release(acc);
+                acc = (*(next_box as *const TaggedVal)).payload as *mut LinArray;
+                // Free only the box shell; the inner array survives in `acc`.
+                crate::tagged::lin_tagged_free_box(next_box);
+            }
+            assert_eq!((*acc).len, 200);
+            // Read back every string — a UAF here means a retain was missing.
+            for i in 0..200usize {
+                let elem = (*acc).data.add(i) as *const TaggedVal;
+                assert_eq!((*elem).tag, TAG_STR);
+                let sp = (*elem).payload as *const crate::string::LinString;
+                let want = format!("item{i}");
+                let wp = mk(&want);
+                assert!(crate::string::lin_string_eq(sp, wp), "element {i} survived RC and matches");
+                crate::string::lin_string_release(wp);
+            }
+            lin_array_release(acc);
+        }
+    }
 }

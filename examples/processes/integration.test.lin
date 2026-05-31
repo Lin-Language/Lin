@@ -1,0 +1,36 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { runAll } from "./task"
+import { summarize, render } from "./report"
+import { contains } from "std/string"
+
+// End-to-end: run a real mixed task list through the whole pipeline (spawn each
+// subprocess → classify → summarize → render) and assert the rolled-up outcome.
+val tasks = [
+  { "name": "echo",    "command": "printf", "args": ["hi"] },
+  { "name": "ok",      "command": "true",   "args": [] },
+  { "name": "bad",     "command": "false",  "args": [] },
+  { "name": "missing", "command": "definitely-not-a-real-command-xyz", "args": [] }
+]
+
+val s = suite("processes integration", [
+  test("runs the whole task list and rolls up the summary", () =>
+    val results = runAll(tasks)
+    val sm = summarize(results)
+    [
+      expect(sm["total"]).toBe(4),
+      expect(sm["passed"]).toBe(2),
+      expect(sm["failed"]).toBe(2),
+      expect(sm["ok"]).toBe(false)
+    ]
+  ),
+  test("renders a report naming each task and the failure count", () =>
+    val out = render(runAll(tasks))
+    [
+      expect(out.contains("[pass] echo")).toBe(true),
+      expect(out.contains("[fail] bad (exit 1)")).toBe(true),
+      expect(out.contains("[error] missing")).toBe(true),
+      expect(out.contains("2 of 4 task(s) failed")).toBe(true)
+    ]
+  ),
+])
+run(s)

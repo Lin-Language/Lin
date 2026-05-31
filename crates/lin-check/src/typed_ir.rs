@@ -10,6 +10,13 @@ pub struct TypedModule {
     /// Maps slot index to intrinsic name (e.g. 0 => "print").
     /// Populated by the checker when it registers intrinsics.
     pub intrinsics: HashMap<usize, String>,
+    /// Exported `type` declarations (`export type Foo = ...`), as name → (params, resolved body).
+    /// Type decls produce no runtime code, so they are recorded here as module metadata (like
+    /// `intrinsics`) rather than as `TypedStmt`s — lowering/codegen ignore this field. A dependent
+    /// module's checker re-registers these into its type env so `import { Foo }` can be used in
+    /// type position (the value-import mechanism via `ModuleSignature::exports` is the analogue).
+    #[serde(default)]
+    pub exported_types: HashMap<String, (Vec<String>, Type)>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -83,7 +90,10 @@ pub struct ForeignSlot {
 pub enum TypedExpr {
     IntLit(i64, Type, Span),
     FloatLit(f64, Type, Span),
-    StringLit(String, Span),
+    /// A string literal. The `Type` is normally `Str`, but bidirectional refinement
+    /// (ADR-051) may narrow it to a `StrLit` singleton when checked against an expected
+    /// literal type. The runtime representation is identical either way.
+    StringLit(String, Type, Span),
     BoolLit(bool, Span),
     NullLit(Span),
     LocalGet {
@@ -121,6 +131,10 @@ pub enum TypedExpr {
         args: Vec<TypedExpr>,
         result_type: Type,
         is_tail: bool,
+        /// True when this call is an explicit partial application (`f(x,)`).
+        /// When false and fewer args than the callee's arity are supplied, the
+        /// missing trailing arguments are filled from their defaults.
+        partial: bool,
         span: Span,
     },
     If {
@@ -128,6 +142,20 @@ pub enum TypedExpr {
         then_br: Box<TypedExpr>,
         else_br: Box<TypedExpr>,
         result_type: Type,
+        span: Span,
+    },
+    /// `T.fromJson(value)` / `fromJson(T, value)` — type-directed decode (ADR-047).
+    /// `target` is the resolved concrete `Type` T (drives the runtime schema descriptor);
+    /// `value` is the Json input; `result_type` is `T | Error` and flows to the surrounding
+    /// assignment/return check.
+    FromJson {
+        target: Type,
+        value: Box<TypedExpr>,
+        result_type: Type,
+        /// Resolved bodies of every `Named` type reachable from `target`, so codegen can
+        /// build the recursive schema descriptor without a type environment. Recursion points
+        /// in `target`/these bodies remain `Type::Named(n)` and are looked up here (ADR-047).
+        named_defs: Vec<(String, Type)>,
         span: Span,
     },
     Match {
@@ -201,7 +229,7 @@ impl TypedExpr {
         match self {
             TypedExpr::IntLit(_, t, _) => t.clone(),
             TypedExpr::FloatLit(_, t, _) => t.clone(),
-            TypedExpr::StringLit(_, _) => Type::Str,
+            TypedExpr::StringLit(_, ty, _) => ty.clone(),
             TypedExpr::BoolLit(_, _) => Type::Bool,
             TypedExpr::NullLit(_) => Type::Null,
             TypedExpr::LocalGet { ty, .. } => ty.clone(),
@@ -211,6 +239,7 @@ impl TypedExpr {
             TypedExpr::Coerce { to, .. } => to.clone(),
             TypedExpr::Call { result_type, .. } => result_type.clone(),
             TypedExpr::If { result_type, .. } => result_type.clone(),
+            TypedExpr::FromJson { result_type, .. } => result_type.clone(),
             TypedExpr::Match { result_type, .. } => result_type.clone(),
             TypedExpr::Block { ty, .. } => ty.clone(),
             TypedExpr::Function {
@@ -218,6 +247,7 @@ impl TypedExpr {
             } => Type::Function {
                 params: params.iter().map(|p| p.ty.clone()).collect(),
                 ret: Box::new(ret_type.clone()),
+                required: params.iter().filter(|p| p.default.is_none()).count(),
             },
             TypedExpr::MakeObject { ty, .. } => ty.clone(),
             TypedExpr::MakeArray { ty, .. } => ty.clone(),
@@ -234,7 +264,7 @@ impl TypedExpr {
         match self {
             TypedExpr::IntLit(_, _, s) => *s,
             TypedExpr::FloatLit(_, _, s) => *s,
-            TypedExpr::StringLit(_, s) => *s,
+            TypedExpr::StringLit(_, _, s) => *s,
             TypedExpr::BoolLit(_, s) => *s,
             TypedExpr::NullLit(s) => *s,
             TypedExpr::LocalGet { span, .. } => *span,
@@ -244,6 +274,7 @@ impl TypedExpr {
             TypedExpr::Coerce { span, .. } => *span,
             TypedExpr::Call { span, .. } => *span,
             TypedExpr::If { span, .. } => *span,
+            TypedExpr::FromJson { span, .. } => *span,
             TypedExpr::Match { span, .. } => *span,
             TypedExpr::Block { span, .. } => *span,
             TypedExpr::Function { span, .. } => *span,
@@ -264,6 +295,10 @@ pub struct TypedParam {
     pub slot: usize,
     pub name: String,
     pub ty: Type,
+    /// Default value expression, type-checked against `ty`. Present only for
+    /// optional (trailing) parameters. Lowered by the defining module into
+    /// per-arity adapter functions.
+    pub default: Option<Box<TypedExpr>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -292,6 +327,13 @@ pub enum TypedMatchPattern {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TypedPattern {
     TypeCheck(Type, Span),
+    /// `is <Name>` where the resolved type is a non-empty object (ADR-054). Behaves exactly
+    /// like `TypeCheck(ty, span)` for narrowing/zonking/exhaustiveness, but lowers to a
+    /// `MatchesSchema` deep type-validation instead of a bare tag/presence check. Carries the
+    /// resolved bodies of every reachable `Named` type (`named_defs`) so IR lowering — which
+    /// has no type environment — can build the recursive schema descriptor (mirrors
+    /// `TypedExpr::FromJson`'s payload).
+    TypeCheckDeep(Type, Vec<(String, Type)>, Span),
     Literal(Box<TypedExpr>),
     Object {
         fields: Vec<TypedPatternField>,

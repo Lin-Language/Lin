@@ -10,6 +10,10 @@ use crate::typed_ir::{TypedModule, TypedStmt};
 pub struct ModuleSignature {
     /// Exported (or top-level visible) name → type pairs.
     pub exports: HashMap<String, Type>,
+    /// Exported `type` decls: name → (type params, resolved body). Lets dependents resolve an
+    /// imported type name used in a type annotation. Empty for modules with no exported types.
+    #[serde(default)]
+    pub type_exports: HashMap<String, (Vec<String>, Type)>,
 }
 
 impl ModuleSignature {
@@ -21,7 +25,7 @@ impl ModuleSignature {
                 exports.insert(n.clone(), ty.clone());
             }
         }
-        Self { exports }
+        Self { exports, type_exports: module.exported_types.clone() }
     }
 
     /// Serialize to bytes (for caching).

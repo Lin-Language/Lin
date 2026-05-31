@@ -1,0 +1,20 @@
+// report — a CSV → validated report generator. Reads "name,score" rows, validates
+// them, computes statistics, and prints a text report (skipping malformed rows).
+// A realistic data-pipeline exercising map/filter/reduce/sort over heap records.
+//
+// Run:   lin run examples/report/main.lin
+// Test:  lin test examples/report/
+
+import { render } from "./report"
+import { print } from "std/io"
+
+val lines = [
+  "Alice, 85",
+  "Bob, 92",
+  "bad-row",
+  "Charlie, 78",
+  ", 50",
+  "Diana, 100"
+]
+
+print(render(lines))

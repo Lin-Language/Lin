@@ -331,3 +331,587 @@ Implementation:
 **Rationale**: Adding comment-preservation would require either (a) threading comment tokens through the AST — significant structural change with no benefit to the compiler — or (b) a separate comment-reattachment pass that heuristically associates comments with nearby AST nodes based on source positions. Both approaches are complex and fragile. The formatter's primary use case (CI canonicality checks, auto-formatting on save) does not require comment preservation. Users who care about comments should commit before formatting.
 
 **Consequence**: Running `lin fmt` on a file that has comments will silently drop them. This is documented behaviour. Future work: a comment-preserving pass that uses `Span` information to reattach comments to the nearest following AST node.
+
+## ADR-041: Default argument values — trailing-comma inversion + per-arity adapters
+
+**Decision**: A parameter may carry a default value (`(a: Int32, b: Int32 = a + 1)`). Optional parameters must be last. Because Lin already gives "supply fewer arguments than declared" a meaning — left-to-right partial application (spec §10.2) — and default values want the *same* call shape to mean "call now, fill the rest from defaults", the two are disambiguated at the call site by an **explicit trailing comma**: `f(x,)` partially applies; `f(x)` is a complete call that fills any omitted trailing defaults (and is an error if an omitted parameter has no default). This inverts the previous rule, where bare under-application curried. `Type::Function` gains a `required: usize` field (count of non-defaulted leading params), excluded from structural compatibility but serialized into module signatures so importers can check arity. Defaults are filled by the **defining** module, not the caller: for a function with optional params, lowering synthesizes one **adapter** per shortfall arity (`f$default{k}`) that binds the omitted parameters to their default expressions and calls the real function. Static calls (direct, dot, imported-by-symbol) route to the adapter by name/id. For the first-class-value path (`val g = f; g(x)`), each default-bearing function gets a static **descriptor** (`{ total, required, entries[] }` of boxed-ABI wrappers) stored at closure offset 32; an indirect under-arity call dispatches through it. The closure struct grew from 32 to 40 bytes (all closures, uniformly, so the runtime frees a single fixed layout); the descriptor is a never-freed static global.
+
+**Rationale**: Synthesizing adapters as `TypedExpr::Function` and lowering them through the normal function path means RC, coercion, and earlier-parameter/chained default references (`(a, b = a + 1, c = b + 1)`) all work for free — defaults are just ordinary expressions evaluated in a scope where the preceding parameters are bound. Filling defaults in the defining module (rather than serializing default *expressions* into `.sig` files for callers to inline) keeps signatures small and makes cross-module defaults work by symbol reference. The trailing-comma marker resolves the currying/default-fill ambiguity at the exact site where intent lives, with zero new tokens. Putting `required` in `Type::Function` but excluding it from compatibility means default-ness never blocks an assignment or argument match — a `(Int32, Int32) => Int32` value is interchangeable whether or not its second parameter had a default.
+
+**Consequence**: Existing code that relied on bare under-application to curry (e.g. `add(10)`) must add a trailing comma (`add(10,)`); within this repo only one example needed migration. The closure ABI change (32→40 bytes) touches every closure allocation site and `lin_closure_release`; all are updated together. A self-recursive *default-fill* tail call cannot use the TCO fast path (it targets a different-arity adapter), so it lowers as an ordinary call. Implementing the indirect path surfaced and fixed a pre-existing bug in the boxed-ABI wrapper: it inferred the Lin return type from the LLVM return kind and treated every pointer return as already-boxed Json, so a function value returning a raw `String`/`Array`/`Object` crashed the indirect caller (which unboxes); the wrapper now takes the real Lin return type and boxes correctly.
+
+## ADR-043: Async concurrency — copy-by-default RC, catchable faults at the thread boundary
+
+**Decision**: Turning the synchronous async stub into real OS-thread concurrency (spec §32) is gated on three model decisions, locked in here (see `docs/ASYNC_DESIGN.md` for the full plan):
+
+1. **RC under threads = Option C (transfer by deep copy) by default, plus two opt-in shared types `Shared<T>` and `Frozen<T>`.** Refcounts stay non-atomic on the single-threaded hot path. Values crossing a thread boundary (a thunk's captured env, and the transferable result returned through a promise) are **deep-copied** so each thread owns a private, disjoint object graph — nothing is shared, so non-atomic RC is sound. The set of boundary-crossing values is exactly the transferable types (JSON-shaped, acyclic, no `Function`/`Iterator`/cycles — already enforced by the checker), so a deep copy is total and bounded. `Shared<T>` (atomic-RC box + `RwLock`, accessor-only, copy in/out) is the escape hatch for shared *mutable* state; `Frozen<T>` (immortal deep-frozen graph, zero-copy lock-free reads via mutation-inference coercion) for shared *read-only* state. Atomic-RC-everywhere (Option A) and dynamic shared-flag RC (Option D) and COW are rejected (§2.3, §2.3.3) — they tax the non-threaded hot path we just optimised.
+
+2. **Catchable faults via a thread-local async-boundary flag.** A runtime fault (`lin_panic`, array OOB, division by zero, non-exhaustive match, null-spread) historically called `std::process::exit(1)` — uncatchable, correct at the top level (spec §19.1). All such sites now route through `crate::fault::runtime_fault(msg)`: inside an async boundary (thread-local depth > 0) it `panic!`s and unwinds to the boundary's `catch_unwind` (becoming an `Error` at `await`, spec §32.2.2); outside, it keeps the `process::exit(1)` behaviour. The spawned thunk runs inside `fault::with_async_boundary`. `lin_exit` (user `exit()`) is unaffected — intentional termination stays a real exit.
+
+3. **`nounwind` is dropped program-wide when the program uses async.** User-emitted Lin functions are marked `nounwind` (sound: value-based errors, frames never unwind) — but a fault inside a thunk now unwinds *through* Lin frames to the boundary, so `nounwind` is unsound for any function reachable from a thunk. We cannot cheaply prove a given function is unreachable from a thunk, so codegen conservatively drops `nounwind` from all user functions whenever the program references any concurrency intrinsic (detected in `lin-compile` by scanning every module's intrinsic map for the `lin_async`/`lin_parallel`/`lin_worker`/… family, which is reachable only through `std/async`). The overwhelmingly common non-async program keeps `nounwind` and its optimisation value (doc §2.4.3 option a).
+
+**Rationale**: The spec's correctness-by-construction guards (`var`-capture ban, transferable-only returns) were designed anticipating threads — they guarantee a thunk shares only immutable, JSON-shaped, acyclic data with its parent, which is exactly what makes Option C's deep copy total and keeps the single-threaded path atomic-free. Catchable faults are the entire point of `async` being Lin's fault-isolation boundary; routing every fault through one helper that branches on a thread-local keeps the top-level `exit` semantics intact while making thunk faults recoverable. The runtime is `panic = "unwind"` (unchanged), so `catch_unwind` works and unwinding crosses the LLVM/Rust boundary; the only requirement is that the Lin frames in between are not `nounwind`, hence decision 3.
+
+**Consequence**: Programs that use async pay a small code-size/optimisation cost (no `nounwind` on user functions) — measured negligible, and zero for non-async programs. Deep-copying large transferable results at a boundary is the cost of Option C; `Shared<T>`/`Frozen<T>` are the escape hatches so we are never forced into all-atomic RC. `Shared<T>` reintroduces deadlock and RC-cycle hazards (documented); `Frozen<T>`'s immortal graphs are never freed (load-once data only). A genuine (non-fault) panic inside a thunk is also caught and surfaced as an `Error` — acceptable, since a runtime bug in a worker should isolate to that worker rather than abort the process. (Implementation note, post-merge with Rust 1.81+: a panic must not unwind out of a plain `extern "C"` runtime fn — the faulting runtime functions and the thunk-call transmutes are `extern "C-unwind"`, and async-reachable Lin frames get `uwtable` so the unwinder can walk through them.)
+
+## ADR-042: All call paths must coerce arguments to parameter types
+
+**Decision**: Every call-lowering path in `lower_call` (`lin-ir/src/lower.rs`) coerces each argument to the callee's declared parameter type via `lower_call_arg` (which boxes a concrete value to `Json`/`TaggedVal*` when the parameter is union/Json) and retains heap arguments via `retain_call_arg`. This includes the fallback **indirect-call path** — a call through a closure *value* (`val f = ...; f(x)`, a closure passed as a parameter, or any non-statically-resolved callee) — which previously lowered its arguments with a bare `lower_expr` and no coercion.
+
+**Rationale**: Lin's uniform closure ABI passes `Json` parameters as boxed `TaggedVal*`. The named-function and imported-function paths already box concrete arguments (an `Array`, `Object`, or scalar) to match a `Json` parameter; the indirect path is just another way to reach the same ABI and must follow the same rule. The callee's parameter types are read from the callee expression's `Type::Function` signature, identically to the other paths.
+
+**Consequence**: Fixes silent data corruption — before this, an `Array` (or any heap value) passed to a `Json`-typed closure parameter reached the callee as a raw `LinArray*` instead of a boxed `TaggedVal*`. The callee read its tag/payload from garbage, so the value behaved as a different (or empty) object and *mutations through it were lost* (e.g. `push` into an accumulator passed to a stored closure left the original array empty). This is the argument-side analog of the return-side boxing bug noted in ADR-041; together they make the first-class-function/closure path representation-correct for all heap types. Regression: `test_array_passed_to_closure_value_mutates` in `crates/lin/tests/integration.rs`.
+
+## ADR-043: Line-leading `[`/`(` is a new statement, not a postfix index/call
+
+**Decision**: Inside an inline lambda body (a `() => ...` body with no `Indent`, parsed by `parse_inline_block`), a `[` or `(` that begins a new source line starts a NEW statement (an array literal, or a parenthesised expression) rather than continuing the previous expression as an index or call. The lexer records, per token, whether a source newline precedes it (`Token::newline_before`) — set in a post-tokenize pass that scans the gap between consecutive token spans — and `parse_postfix_expr` suppresses the `LBracket`/`LParen` postfix arms when `at_line_start()` is true.
+
+**Rationale**: Inside `()`/`[]`/`{}` the lexer suppresses newline tokens entirely (ADR-004), so the parser otherwise has no signal that a `[` opens a new line, and its postfix loop greedily reads `expr \n [ ... ]` as `expr[...]`. This made a line-leading array literal after a statement (the natural way to return a list of values from a multi-statement inline body) silently parse as an index into the preceding expression. The `newline_before` flag recovers the suppressed line break without re-introducing block-structuring newlines into delimited spans. This mirrors the existing post-`Dedent` suppression of postfix `[`/`(` at top-level block boundaries (ADR-011) — same intent, applied where the boundary is a suppressed newline rather than a Dedent.
+
+**Consequence**: `std/test` bodies that do setup then return assertions can use the natural form — `val xs = f(); push(xs, y); [ expect(...).toBe(...) ]` — instead of binding the array to a throwaway `val checks` just to avoid the index-gluing. Same-line indexing (`arr[0]`) and same-line/continuation method chains (`x.map(...)\n  .filter(...)`) are unaffected: the postfix `.` arm is not gated on `at_line_start`, and a same-line `[`/`(` has no preceding newline. Multi-line dot chains assigned through an inline-body `val` (`val r = xs\n  .map(...)`) remain a separate pre-existing inline-body limitation, unchanged by this ADR.
+
+## ADR-044: `Shared<T>` — opt-in shared mutable state (runtime box; type enforcement deferred)
+
+**Decision**: `Shared<T>` (ADR-043 §2.3.1) is implemented as a runtime box: an **atomic**-refcounted `SharedBox` wrapping an `RwLock` over the inner value (stored as a boxed `TaggedVal*`). Four built-ins, exported by `std/async`: `shared(v)` (deep-copy-in, atomic rc=1), `get(s)` (read lock, deep-copy a snapshot out), `set(s, v)` (write lock, deep-copy in), `withLock(s, f)` (write lock held across `f`, which mutates the inner value in place; `f`'s result is deep-copied out). The box is boxed as `TaggedVal*(TAG_SHARED)`; its retain/release route to atomic `lin_shared_retain_box`/`lin_shared_release_box`, and the thread-transfer copy path **shares** it by an atomic bump rather than copying through (the nesting rule). The inner object graph keeps ordinary non-atomic RC — it is only reachable while a lock is held, so all access is serialized.
+
+**Rationale**: This delivers the load-bearing guarantee — real, race-free shared *mutable* state without taxing the single-threaded hot path (only the box's refcount is atomic; only `Shared` operations take a lock). Copy-in/copy-out at every boundary means no live reference into the inner graph escapes the lock, so the inner non-atomic RC is sound. Validated under ASan and a multi-threaded `#[test]` (8 threads × concurrent get/set) plus a Lin-level concurrent-`withLock`-push test (no lost updates).
+
+**Consequence**: The compile-time **accessor-only enforcement** (rejecting `push(s, 7)`, indexing, auto-unwrap on a `Shared<T>` as a type error) is **now wired** (follow-up landed): a dedicated `Type::Shared(Box<Type>)` variant is threaded through the checker, IR, and codegen. `shared`/`get`/`set`/`withLock` are typed against it (`shared: <T>(T) => Shared<T>`, `get: <T>(Shared<T>) => T`, `set: <T>(Shared<T>, T) => Null`, `withLock: <T,R>(Shared<T>, (T)=>R) => R`); the stdlib wrappers annotate `Shared` (resolvable by name, like `Iterator`); and compat makes `Shared<T>` **invariant** — compatible only with another `Shared<U>` (inner types recursed) and explicitly NOT widening to `Json`/`TypeVar`, so it can't silently flow into a `Json` parameter and lose the guard. Any non-accessor op on a `Shared` value is therefore a type error (`Argument 1 has type Shared<…>, expected …`). At runtime it is still a boxed `TaggedVal*(TAG_SHARED)` (`is_union_type` / `is_union_ty` include it; RC dispatches through the tag-aware path; `capture_kind` → `CAP_TAGGED` so the transfer copy path shares it by atomic bump — the nesting rule). NOTE: `lin check` does not resolve imports, so this enforcement is visible under `lin build`/`lin run` (which do); a bare `lin check` still sees imported names as `Json`. Remaining caveats unchanged: `withLock` mutates in place, so a scalar accumulator (`n => n + 1`) does not persist (use a one-element array or `get`/`set`); `set` collides by name with `std/array`'s `set` when both are imported (alias one); `Shared<T>` makes reference cycles reachable and Lin has no cycle collector (ADR-039); `withLock` reintroduces deadlock potential (no reentrancy, keep critical sections short).
+
+## ADR-045: `Frozen<T>` — opt-in shared read-only state via deep immortal seal (coercion deferred)
+
+**Decision**: `Frozen<T>` (ADR-043 §2.3.2) is implemented as a deep, transitive **immortal seal**. `frozen(v)` (runtime `lin_freeze`, exported by `std/async`) walks the transferable graph rooted at `v` and saturates every heap node's refcount to `IMMORTAL_RC` (string/array/object, recursively). The existing immortal guard on strings is extended to arrays and objects: `lin_array_release`/`lin_object_release` and the array/object arms of `retain_tagged_payload` (and `lin_rc_retain`, already guarded) become **no-ops** when a node's refcount is `>= IMMORTAL_RC`. The thread-transfer copy path shares an immortal array/object by reference (zero-copy), never deep-copies through it. `frozen(v)` returns `v` (now frozen) — the value keeps its plain type, so readers use it transparently.
+
+**Rationale**: The trap with shared read-only data is that a read-only function compiled once against `T` does **non-atomic** `retain`/`release` on its parameter; run on N threads sharing one value, those refcount writes race even though the contents are never written. Making the graph immortal turns retain/release into guarded no-ops that only *read* the sentinel — and a race needs a writer, so concurrent reads of the count are race-free. Therefore the read-only function's existing non-atomic RC runs correctly on a shared frozen value **with no recompilation, no lock, and no atomics**. This is the interned-string immortality trick (already shipped) generalized from one string to a whole graph. Validated by a multi-threaded test (a frozen array read concurrently by N threads) under ASan.
+
+**Consequence**: **Immortal ⇒ never freed.** `frozen` is for load-once, program-lifetime reference data (one O(size) seal at startup); a `frozen()` value created-and-discarded in a loop **leaks** — documented in STDLIB.md. The **mutation-inference read-only coercion** (the §2.3.2 rule that lets a `Frozen<T>` be passed to a `T` parameter *iff the callee doesn't mutate it*, rejecting mutating callees at compile time) is **deferred** — it needs a dedicated `Type::Frozen` variant plus an interprocedural per-parameter mutation-inference pass cached in `ModuleSignature`. Today `frozen(v): T` returns the plain type, so reads "just work", but *mutating* a frozen value is not a compile error — the mutation is silently a no-op on the immortal node (and lost) rather than diagnosed. The runtime immortality/zero-copy-share semantics are fully enforced and safe. A frozen graph is acyclic and immutable, so unlike `Shared<T>` it adds no deadlock and no new cycle hazard.
+
+## ADR-046: `Error` built-in type + `is Error`; `await`'s `T | Error` wrapping deferred
+
+**Decision**: `Error` is a built-in type resolving to the structural shape
+`{ "type": String, "message": String }` (`resolve.rs::error_type`) — the conventional error
+value (spec §19) and the exact object the async runtime builds when a thunk faults
+(`{ "type": "error", "message": <msg> }`). `is Error` (and any `is <ObjectShape>`) lowers to a
+**field-presence** check (`HasPattern` on the object's keys) rather than a bare tag check, so it
+matches error-shaped objects specifically instead of every object. This makes the spec's §32.2.2
+pattern work:
+
+```txt
+match await(p)
+  is Error => print("failed: ${result}")
+  else     => use(result)
+```
+
+**Rationale**: `Error` has no special control-flow behaviour (§19), so a structural object type is
+the faithful model — it composes in unions and narrows by shape. Routing object-shaped `is`
+checks through the existing `HasPattern` machinery reuses the same field-presence test as
+`is { .. }`, with no new runtime support.
+
+**Consequence (deferred)**: The other half of §32.2.2 — `async` wrapping its result as
+`Promise<T | Error>` so the checker **rejects using an uninspected `Error` as a plain `T`** — is
+**not implemented**, and is not a localized change. The entire async surface is `Json`-typed
+through the stdlib wrappers (`async = (f: Json): Json`, `await = (p: Json): Json`); there is no
+parametric `Promise<T>` tracking (there never was — the synchronous stub was `Json`-typed too).
+`await(p)` therefore returns `Json`, which coerces freely to any type, so the "reject uninspected
+Error" rule cannot be enforced without first making `async`/`await` **generic over the thunk's
+return type** — a parametric-opaque-type feature spanning the checker's inference, the intrinsic
+signatures, and module signatures. That is its own project; until then `is Error` gives users the
+*runtime* discrimination the spec intends, and a fault is always a well-formed `Error` object,
+just not statically forced to be handled. Likewise §32.2.3 nested-promise auto-flatten IS now
+implemented (runtime: `await` recurses through a `TAG_PROMISE` result).
+
+## ADR-047: Logical `!` as the second unary operator
+
+**Decision**: Add a prefix logical-not operator `!` (e.g. `if !ready`, `match ... when !cond`, `val x = !flag`). It sits at the same precedence level as bitwise `~` — tighter than `*`, looser than postfix — and is right-associative, so `!!x` parses as `!(!x)` and `!a == b` parses as `(!a) == b`. Both its operand and its result are `Bool`. A non-`Bool`, non-`TypeVar` operand is a compile-time error. Negated *patterns* (e.g. `is !true`) are explicitly out of scope.
+
+**Rationale**: The previous spec stated `~` was the only unary operator and that boolean negation had to be written `ready == false`. That boilerplate appeared throughout the stdlib (`std/array`) and user code. `!` removes it. Implementation is cheap because it reuses the existing unary pipeline end-to-end: the lexer emits a new `Bang` token, the AST gains `UnaryOp::Not`, and IR lowering maps `UnaryOp::Not` to the same `crate::ir::UnaryOp::Not` as `~` — for an `i1`, a bitwise-not *is* a logical-not, so codegen's existing `build_not` arm needs no change. When the operand is not statically `Bool` (e.g. a boxed `TypeVar` flowing through a generic lambda), the lowering routes it through `lower_cond_as_bool` first to unbox/coerce to a raw `i1` before the `Unary` instruction.
+
+**Consequence**: This supersedes the prior "the only unary operator is `~`" statement in §3.7, §24.1, and §35.2 of the specification. The language now has exactly two unary operators (`~` bitwise, `!` logical); there is still no unary minus.
+
+## ADR-048: `Json` is a covariant sink — closing the Json→concrete cast hole
+
+**Decision**: `Json` (modelled as `Type::TypeVar(u32::MAX)`, see `types.rs::is_json`) is made a **covariant sink**: anything is assignable *into* `Json` (concrete `T → Json` stays allowed, so `writeJson(value: Json)` and the pervasive "store anything as Json" patterns keep working), but a `Json` *value* is **not** assignable *out* to a fully-concrete **structured object** target — one that (after unfolding `Named` types) is an `Object` with at least one required, non-nullable field. So `val p: Person = readJson(...)` (where `Person = {name: String, age: Int32}`) is now a type error; the value must be decoded via `fromJson` (ADR-047) or narrowed via `is`/`has`. The fix splits the old blanket `(_, TypeVar(_)) | (TypeVar(_), _) => true` arm in `compat.rs` into: (1) `(_, TypeVar(MAX)) => true` (sink), (2) `(TypeVar(MAX), target) => lenient_json || !requires_structured_decode(target)`, (3) the existing permissive arm for all *other* (non-MAX) TypeVars — genuine inference vars, the `9000+` generic slots, intrinsic vars — so inference is unchanged. `requires_structured_decode` deliberately treats only required-field objects as the hazard: `Json` flowing into scalars (`Int32`/`Int64`), buffers (`UInt8[]`), opaque handles, open objects (`{}`), arrays, functions, iterators, or anything still containing a TypeVar stays permissive — those are the language's handle/buffer/polymorphic-return patterns, which have no `fromJson` remedy and predate this change.
+
+**Rationale**: The old rule made `Json` bidirectionally compatible with *everything*, so a value read from a `Json` source could be silently bound to a richly-typed annotation with **zero validation** — the annotation was a lie. Drawing the line at required-field objects catches the real "I claimed this JSON is a `Person`" hazard (the one a decoder can fix) while not breaking the thousands of existing scalar/handle/buffer flows. The leniency is scoped: a per-`Checker` `lenient_json` flag is set **only** for the trusted embedded stdlib (whose wrappers forward `Json` handles into concrete intrinsic/foreign params by design, e.g. `lin_parse_json`, `pathMatch`); user modules and user-defined imported modules always check strictly. After this change the only sound `Json → T` conversions are (a) `fromJson` (validated decode) and (b) `is`/`has` narrowing (a separate `checker/pattern.rs` path that branches on `ty.is_json()` directly and is backed by runtime tag checks, so it stays sound and is unaffected).
+
+**Consequence**: The predicted blast-radius migration sites (`pathMatch`'s `String` params, `lin_parse_json`'s `String` param) did **not** in fact break: their targets are scalars, not required-field objects, so the narrower `requires_structured_decode` rule leaves them permissive — no stdlib widening was needed. The whole stdlib, example suite, and test suite compile unchanged. The scalar/handle escape hatch is a deliberate soundness gap (`Json → Int32` is still unchecked) accepted to avoid a disruptive migration; tightening it later (e.g. a `fromJson` for scalars) is additive. `lin build` of `val p: Person = readJson(...)` (and the direct `val p: Person = jsonReturningCall()` form) now surfaces `Expected type {...}, got ?T4294967295`; the remedy is `Person.fromJson(...)`. (Note: `lin check` of a *single* file leaves imported functions' return types as fresh inference vars rather than `Json`, so the gate cannot fire there for an imported call — the full `lin build` pipeline, which resolves import signatures, is the authority. A bug where a zero-param or all-`Json`-param `Json`-returning function was misclassified as the opaque `Function` annotation — and its `Json` return freshened into a permissive inference var, slipping the gate — was fixed in `infer_call` by requiring the opaque shortcut to have a *non-empty* all-`TypeVar(MAX)` param list.)
+
+**Scope decision — total vs structured (empirically locked)**: a *total* gate (rejecting ANY `Json → concrete T`, including scalars and arrays) was implemented and run against the full suite. It broke (a) the stdlib's pervasive **polymorphic-return idiom** — `slice`/`concat`/`accept`/`wait`/etc. return `Json` and are routinely assigned to concrete `val`s (`val sub: UInt8[] = slice(bytes, 1, 4)`, `val code: Int64 = wait(pid)`, socket `accept(): Int32`) — and (b) **`is`-narrowing into a concrete branch** (`if j is String then j else ""`, whose narrowed value is still statically `Json`). Empirically: `test_is_narrowing_still_works`, `test_slice_preserves_element_type`, `test_net_tcp_loopback_echo`, `test_net_udp_loopback_roundtrip`, `test_proc_spawn_read_wait`, `test_proc_wait_exit_code` all failed under the total gate. These patterns have **no `fromJson` remedy** and forcing one is hostile, so the total scope was rejected and the gate is **scoped to required-field structured objects** — the genuine "unchecked object decode" hazard. This matches the structured-object-only conclusion anticipated in the plan.
+
+## ADR-049: `fromJson` — type-directed JSON decode (descriptor-driven runtime interpreter)
+
+**Decision**: `T.fromJson(json)` (and the equivalent `fromJson(T, json)`) is a **checker special form** that validates a `Json` value against the target type `T` and yields `T | Error`. It is recognised by the surface name `fromJson` at the call site (intercepted in both `infer_call` and `infer_dot_call` *before* arg0/receiver is inferred as a value, since arg0 is a *type*, not a runtime value — so unlike `print`/`for` no `lin_*` wrapper can express it). `std/json` exports a `fromJson` stub purely so the import resolves and `lin check` sees the name; the stub body is never used for real call sites. Validation is implemented as a single generic runtime interpreter `lin_from_json(value, descriptor)` driven by a compact, position-relative byte **descriptor** emitted per call site by codegen (`DescEncoder`), so emitted code is O(1) per site and recursion/cycles are finite back-edges (memoised by named type). The interpreter walks value+descriptor in lockstep, returns the input **cloned** (`lin_tagged_clone`, +1 independently owned) on success or a fresh `Error` on the first structural mismatch, building a JSONPath-ish `path` (e.g. `$.address.city`) during the walk. `Error` is a structural object alias `{ "type": "error", "message": String }` (resolved by `resolve_named_cycle`, not a new `Type` variant — cf. ADR-044), and the runtime error value also carries a `"path"` field, which width subtyping permits.
+
+This ADR records three load-bearing semantic choices and their trade-offs:
+
+- **(a) Union variant selection is FIRST-MATCH-WINS.** A `KIND_UNION` node tries each variant in declaration order and accepts the first that validates. **Trade-off**: for overlapping, non-discriminated object variants the most-permissive / first-listed variant *shadows* more-specific ones — e.g. with `{ "k": String } | { "k": String, "w": Int32 }`, an input that has both `k` and `w` matches the first variant. The *runtime data is fully preserved* (the same value is returned, no fields are dropped), but the *static type* the program reasons about is the matched variant, which may be the wider one. **Recommendation**: give union variants a discriminant field (e.g. a literal `"type"` tag) so exactly one variant matches; list more-specific variants first when overlap is unavoidable. First-match-wins was chosen for v1 because it is predictable, order-explicit, and matches the spec's first-error policy spirit; a "best/most-specific match" rule would be ambiguous and costly.
+
+- **(b) Number policy is target-type-driven.** An **integer** target requires the JSON number to be integral and within the target's width/signedness range (a float like `3.14` is rejected; an integral float like `5000000000.0` against `Int32` is rejected as out of range). A **float** target (`Float32`/`Float64`) accepts any JSON number. An **unconstrained** target (`Json`/a `TypeVar`, encoded as `KIND_JSON`) accepts any number as-is with no narrowing — number-range validation is intentionally skipped there by design. (Note: a bare suffixless integer *literal* in Lin source is typed `Int32` and truncated by the lexer per spec §26 *before* it can reach `fromJson`, so genuine out-of-range integers arriving from real JSON parsing are the cases the range check guards.)
+
+- **(c) `Error` is a structural object alias, but `is Error` IS made to discriminate.** `Error` is `{ "type": String, "message": String }` (open, resolved by `resolve_named_cycle`; the runtime value also carries `"path"`). A *bare* tag check would match any object, so to make the agreed idiom `match result | is Error => .. | is Person => ..` work, **`is Error` is desugared in the checker (`check_pattern`, `Pattern::TypeName == "Error"`) into the value-constrained object pattern `{ "type": "error", "message": _ }`.** This reuses the existing object-pattern lowering (`lower_object_pattern_test`) which checks field presence AND `scrut["type"] == "error"` at runtime — exactly what distinguishes a decode failure (always `"type": "error"`) from a decoded value (any other shape). Standalone `Expr::Is` was routed through the same object-pattern path (its old `IsType` lowering mapped an object pattern to `Type::Never`/tag `0xFF`, which never matched). Exhaustiveness was taught to count this desugared pattern as covering the `Error` union variant. Chosen over adding a dedicated `Type::StrLit` literal-type (which would touch ~20 exhaustive `Type` matches across codegen/boxing/representation — too invasive, cf. ADR-044) and over a new `Type` variant. **Former residual trade-off, now RESOLVED by ADR-050:** when this ADR was written, the standalone expression form `result is Person` compiled to a bare `TAG_OBJECT` check, so it *also* matched the Error object and the `is Error` arm had to come first or a decode failure would route into the `Person` arm and fault on `result["name"]`. ADR-050 makes `is <ObjectType>` check the target's required fields in **both** the match-arm and expression paths, so `is Person` no longer matches an Error object and the arm order is no longer load-bearing. The `result["type"] == "error"` discriminant still works and remains valid for code that prefers it.
+
+**Rationale**: A descriptor + one generic interpreter (validator strategy C) beats inlining per-site LLVM (code bloat, recursion needs emitted helpers) and per-type generated functions (still heavy IR, forward-decl cycle handling): it keeps generated code tiny, reuses the existing tag/unbox runtime primitives, makes recursion trivial (table indices), and makes the walker ordinary, unit-testable Rust. Returning a **clone** rather than the same retained pointer (a deviation from the original plan note) keeps ownership symmetric: the `fromJson` result is registered `+1 owned` in lin-ir, and the input value temp is independently owned and released by normal liveness — returning the *same* pointer would alias two owners and double-free. Verified under AddressSanitizer: no use-after-free / double-free; the decode-`Error` builder (`make_decode_error`) releases its locally-created key/value strings after `lin_object_set` retains them, so error values are leak-clean (only the program-lifetime interned string-literal cache leaks, as elsewhere).
+
+**Consequence**: The input `Json` is **borrowed** (never consumed); the result is unconditionally a fresh `+1`-owned value (clone on success, fresh `Error` on failure); the descriptor is a static const global (never freed). Array/fixed-array/object/union targets can only be named via a `type` alias or built-in name because the special form requires arg0 to be a bare identifier (`Int32[].fromJson(...)` does not parse; use `type IntArr = Int32[]`). A user who shadows `fromJson` with a *local* binding defers to the normal call path; a global user `fromJson` called with a real type-name arg0 would still be intercepted (an accepted, low-risk corner). `Iterator`/`Function`/`Never`/`TypeVar` target fields encode as `KIND_JSON` (accept-any), since they are not JSON-shaped and have no meaningful structural check.
+
+## ADR-050: `is <ObjectType>` checks required fields (in both match-arm and expression forms)
+
+**Decision**: `x is Person` (where `Person` resolves to an object type with at least one field) checks at runtime that `x` is an object **and has all of `Person`'s required field keys present** — not merely that `x` carries the `TAG_OBJECT` tag. This holds uniformly in both lowering paths: the match-arm path (`lower_match_pattern`) already emitted a `HasPattern` field-presence check for `Is(TypeCheck(Object(fields)))`; this ADR adds the *same* arm to the standalone-expression path (`TypedExpr::Is` in `lower.rs`), which previously fell through to a bare `IsType` tag check. An empty object type (`{}`) still degrades to the tag check (nothing to require).
+
+**Rationale**: A bare tag check made `is <ObjectType>` unsound. `is Person` matched *any* object — including a `fromJson` decode error `{ "type": "error", ... }` or an arbitrary `{ "foo": "bar" }`. Because the matched arm then statically **narrows** the binding to `Person`, a subsequent `x["name"]` is typed `String` and compiled through the non-null-safe field path; on an object actually lacking `name`, `lin_object_get` returns null and string interpolation null-derefs (`lin_string_concat`), crashing. The narrowing was a lie the runtime did not enforce. Mirroring `is { .. }` / `has` field-presence checking closes the hole with the existing `HasPattern` → `lin_value_has_field` machinery — no new instruction, no new runtime primitive.
+
+**Consequence**: This **supersedes the ADR-049 arm-ordering rule**: `is Person` no longer matches an `Error` object (an `Error` has `type`/`message`, not `name`/`age`), so `match | is Person => .. | is Error => ..` is now sound in either order. ~~Checking is **field-presence only**, not recursive field-*type* validation: `is Person` on `{ "name": 1, "age": "x" }` (both keys present, wrong value types) still matches~~ **(SUPERSEDED by ADR-053: `is <ObjectType>` now deep-validates field TYPES recursively, so a presence-only-but-wrong-type object no longer matches; see ADR-053 for the why and how — this ADR's presence-rejection is subsumed by the deeper check).** This keeps `is` cheap (one `lin_value_has_field` per required key) and consistent with `has`/`is { .. }`, which are also presence checks. Width subtyping is preserved: extra fields on `x` don't prevent a match. Verified: a real `Person` matches; an object missing a required field does not; the former decode-failure crash is gone; full suite green (278 integration + 6 + 33 + 7 + 24).
+
+## ADR-051: Singleton string-literal types
+
+**Decision**: A string literal in **type** position is a singleton type. `Type::StrLit(String)` is a
+new `Type` variant (mirrored by `TypeExpr::StringLit` in the surface AST and parsed in
+`parser/types.rs` before the `_` fallback). It admits only the one string value. This makes the
+spec §18 tagged union discriminate at compile time:
+
+```txt
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+val r:   Result<Int32, String> = { "type": "success", "value": 1 }   // OK
+val bad: Result<Int32, String> = { "type": "nope",    "value": 1 }   // compile error
+```
+
+The guiding principle is **"`StrLit` is `Str` at runtime, a singleton at check-time."** A
+`StrLit("x")` value is represented at runtime *identically* to a `String` — same `TAG_STR`/6 tag,
+same `string_ptr_type` llvm type, same boxing/unboxing, same refcounting, same `toString`. So
+nearly every exhaustive `Type` match in `lin-ir`/`lin-codegen` simply grew a new arm grouped with
+`Type::Str` (`Type::Str | Type::StrLit(_)`), and a `StrLit` lowers to an owned `Str` temp. The only
+genuinely new logic is at check-time.
+
+**This REVERSES the avoidance of a new `Type` variant that ADR-044/049 chose.** ADR-049 explicitly
+rejected "adding a dedicated `Type::StrLit` literal-type (which would touch ~20 exhaustive `Type`
+matches across codegen/boxing/representation — too invasive)". That cost was paid here, but the
+"`StrLit` = `Str` at runtime" mitigation made it mechanical: each of those ~20 sites does *exactly*
+what the `Str` arm does, so there is no new representation, no new runtime primitive, and no new RC
+class. The three RC classifiers that must stay in lockstep — `lin-ir::lower::is_rc_type`,
+`lin-ir::rc_elide::is_rc_type`, and `lin-codegen::types::ty_is_concrete_rc` — all treat `StrLit`
+as a refcounted string, and release routes through `string_release` (retain uses the tag-aware
+`lin_rc_retain`, identical to `Str`). Validated under AddressSanitizer: a `String`-typed and a
+`StrLit`-typed loop (1000 iterations each, build-and-discard) produce an *identical* leak profile
+(4140 bytes / 3 allocations — the program-lifetime interned literal cache, leaked by design as
+elsewhere), with **no** use-after-free, double-free, or refcount underflow. The §18 divide/Result
+example runs and discriminates both branches cleanly under ASan too.
+
+**Compat rules (`compat.rs`, after the `Shared`/`TypeVar(MAX)` arms, before numeric/union/object)**:
+1. `(StrLit a, StrLit b) => a == b` — two singletons compatible iff equal.
+2. `(StrLit, Str) => true` — a literal widens to the open `String` type.
+3. `(Str, StrLit) => false` — load-bearing rejection: an arbitrary string is not statically known
+   to equal the singleton, so `val t: Tag = someString` is an error.
+4. The `Json`-sink arms are unchanged; an object with a (non-null) `StrLit` field is already treated
+   as "structured" by `requires_structured_decode`, so a `Json` value still cannot be silently
+   bound to a literal-discriminated object — it must go through `fromJson` or `is`/`has` narrowing.
+
+**Bidirectional refinement (`checker/expr.rs`)**: a bare string-literal *value* still infers to
+`String` (`infer_expr` is unchanged — §33). Narrowing happens only in `check_expr` against an
+expected type: (a) `Expr::StringLit` against an expected `StrLit("t")` is accepted iff equal and
+yields a `StrLit("t")`-typed node (`TypedExpr::StringLit` gained a `Type` field, normally `Str`);
+(b) `Expr::Object` against an expected object/union/named type pushes the expected field types down
+per-field, and for a union *selects the variant by matching the discriminant literal*, erroring with
+the list of valid tags if none match. To make this reach the §18 `divide` body — an
+`if/then/else` returning object literals — the expected return type is now pushed into the function
+body (and through `if`/block tail positions), but **only when the declared return type mentions a
+`StrLit`**, so all other inference and error messages (e.g. "Function body has type …") are
+unchanged. This mirrors the existing array-literal refinement pattern.
+
+**`fromJson` validates the exact literal value (ADR-052).** A `StrLit` field encodes as a
+`KIND_STRLIT` descriptor node carrying the expected bytes; the runtime interpreter (`lin_from_json`)
+checks the JSON value is a string AND equals the singleton, reporting e.g.
+`expected "alpha" at $.kind, got "beta"`. This makes `Result.fromJson(...)` reject a wrong
+discriminant tag, so the union's first-match-wins probe discriminates variants by their literal tag
+(a `{ "type": "failure", ... }` value fails the `"success"` variant's `KIND_STRLIT` check and falls
+through to the `"failure"` variant). Superseded the original v1 `KIND_STRING` placeholder.
+
+**Limitations / scope (deliberate, v1)**:
+- **`Json → StrLit` stays permissive (unchecked) in user code.** A `Json` value IS assignable to a
+  `StrLit` target (`requires_structured_decode(StrLit)` is false — a literal is scalar-like), exactly
+  as `Json → Int32` is unchecked (ADR-048 scalar gap). `fromJson` is the validated path. Tightening
+  this would diverge from the scalar-gap policy, so it is left consistent by design.
+- **Exhaustiveness (Step F) was NOT implemented.** Recognising a literal-discriminated `has`/`is`
+  arm as covering a specific union variant is *not* done. This is safe: the existing exhaustiveness
+  checker already requires an `else` (or a covering arm) for *any* object-union `has`-match — literal
+  or not — and emits a diagnostic when absent; that behaviour is unchanged and consistent. Adding
+  partial literal-coverage recognition risked inconsistency for marginal benefit, so it was skipped
+  (the §18 examples use `else`, which always satisfies exhaustiveness).
+- **Numeric and boolean literal types are out of scope** — only string literals are singletons.
+
+**Consequence**: `lin build`/`lin run` of a wrong-tag object now reports e.g. *"Object does not
+match any variant of …; expected a discriminant tag in [\"failure\", \"success\"]"* at the object's
+span; a `String → literal` assignment reports *"Expected type \"ok\", got String"*. Literal tags
+survive generic substitution (`Result<Int32, String>` and `Result<String, Int32>` both
+discriminate), since `substitute` passes `StrLit` through its `_ => ty.clone()` tail. As with
+`lin-check` generally, a single-file `lin check` leaves an imported function's return type as a
+fresh inference var, so the strictest checking is via the full `lin build` pipeline. Verified: full
+suite green (288 integration + 6 + 33 + 7; stdlib 19 files; examples 22 files), plus the new
+`examples/result/main.lin` fixture.
+
+## ADR-052: `fromJson` validates string-literal field values (KIND_STRLIT)
+
+**Decision**: A `Type::StrLit(s)` target field in `fromJson` (ADR-049) encodes as a new descriptor
+node `KIND_STRLIT = 10` carrying `{ u16 lit_len, lit_bytes }`. The runtime interpreter
+(`lin_from_json`, `lin-runtime/src/decode.rs`) validates the JSON value is a string **and** equals
+that exact literal, returning a decode `Error` like `expected "alpha" at $.kind, got "beta"` on
+mismatch. This supersedes ADR-051's v1 placeholder, where a `StrLit` field encoded as `KIND_STRING`
+(string-ness only, exact value unchecked).
+
+**Rationale**: Without it, `Result.fromJson({ "type": "bogus", ... })` decoded *successfully* —
+`KIND_STRING` accepted any string in the discriminant slot, then the union's first-match-wins probe
+(ADR-049(a)) selected the first variant regardless of tag. That is exactly the silent mis-decode
+`fromJson` exists to prevent. With `KIND_STRLIT`, each union variant's discriminant literal is
+checked during the probe, so a `{ "type": "failure", ... }` value fails the `"success"` variant and
+correctly falls through to the `"failure"` variant — real, validated discrimination.
+
+**Consequence**: `KIND_STRLIT` is appended to the descriptor opcode set in both the encoder
+(`codegen/intrinsics.rs` `DescEncoder::write_node`) and the decoder (`decode.rs`), kept in sync. A
+plain `Type::Str` field still encodes as `KIND_STRING` (accepts any string), so only literal-typed
+fields gain value-checking — no change to ordinary string decoding. The encoder memo already keys
+`StrLit("a")` and `Str` distinctly (their `Display` differs: `"a"` vs `String`), so shared/recursive
+nodes are unaffected. Verified: a wrong discriminant tag is rejected with a path-located message,
+correct tags decode and discriminate, plain `String` fields are unchanged, full suite green.
+
+## ADR-053: Imported types usable in type position
+
+**Decision**: An `export type Foo = ...` declaration can be imported (`import { Foo } from "m"`,
+including `Foo as Bar` aliases) and used in a type annotation in the importing module. Spec §20.3
+always promised this ("Types may be imported with the same syntax"), but it was never implemented:
+type exports were dropped at the module boundary, so a use-site hit *"Unknown type 'Foo'"*.
+
+**Why it was missing**: a `type` decl produces no runtime code, so the checker resolved it into its
+local `TypeEnv::type_decls` and then returned `TypedStmt::Expr(NullLit)` — it left no trace in the
+`TypedModule`. `ModuleSignature::from_module` only scanned `TypedStmt::Val`, so the dependent
+module's checker (which is seeded from the signature via the `import_types` map) never learned the
+name. Value imports worked; type imports silently didn't.
+
+**Mechanism**: mirror the value path one level up, as *module metadata* rather than a statement.
+- `TypedModule` gains `exported_types: HashMap<String, (Vec<String>, Type)>` (params + resolved
+  body), populated in `check_module` from each `export type` via `env.lookup_type` — alongside the
+  existing `intrinsics` metadata map. It is **not** a `TypedStmt`, so `lin-ir` lowering, codegen,
+  liveness, and rc_elide are entirely unaffected (they never see it).
+- `ModuleSignature` gains `type_exports` (copied from `exported_types`), so dependents that only
+  load the `.sig` still get types. Both new fields are `#[serde(default)]`, so stale `.typed`/`.sig`
+  caches deserialize as empty and trigger a graceful re-check rather than an error.
+- `Checker` gains an `import_type_decls: (module, name) -> (params, body)` input (the type-level
+  analogue of `import_types`). `lin-compile` populates it from each import's `type_exports`.
+- A new `register_imported_types` pre-pass (run before `forward_declare_types`, since
+  forward-declared signatures may annotate with imported types) walks the `Import` stmts and, for
+  each binding matching `import_type_decls`, calls `env.define_type(local_name, params, body)`
+  honouring `as` aliases.
+
+The body stored is the **fully resolved** type (Named cycle points preserved), so no cross-module
+type-env lookup is needed at the use site — it resolves like a local `type` alias. Generic exported
+types work because the stored `params` flow through the same `substitute` path as local generics.
+
+**Scope/limits**: registration is scoped to what is imported — referencing `Foo` without importing
+it is still *"Unknown type"* (verified by `test_imported_type_unknown_without_import`). Verified:
+the web-server example now does `import { HttpRequest as Request, HttpResponse as Response } from
+"std/http"` (its local `Request`/`Response` aliases deleted); full suite green; imported types
+round-trip through both cold and warm module caches.
+
+## ADR-054: `is <ObjectType>` deep type validation
+
+**Decision**: `x is <Name>` (where `Name` resolves to a non-empty object type, e.g.
+`Person = { "name": String, "age": Int32 }`) validates field **types recursively** at runtime, not
+merely that the fields are present (ADR-050). The match succeeds only when `x` genuinely conforms to
+the target type — so the binding narrowing the matched arm performs is **sound**. The deep walk is
+the *same* operation as `fromJson`'s structural validator (ADR-049): it is **reused, not
+duplicated**. A new runtime entry point `lin_matches_schema(value, descriptor) -> u8` runs the
+existing `validate` walker (`lin-runtime/src/decode.rs`) and returns a bool (`{ let d = Desc { base:
+desc }; let mut p = String::new(); validate(value, &d, 0, &mut p).is_ok() as u8 }`); the mismatch
+error string is discarded on the cold path. This inherits fromJson's number policy verbatim
+(`KIND_INT` integral + width/sign range, `KIND_FLOAT` any number, `KIND_STRLIT` exact value,
+`KIND_OBJECT` recursive, `KIND_ARRAY`/`KIND_FIXED`/`KIND_UNION` as in ADR-049) — exactly the
+consistent, sound semantics wanted.
+
+**This reverses ADR-050's presence-only note.** ADR-050 left it explicit that `is Person` on
+`{ "name": 1, "age": "x" }` (keys present, wrong value types) still matched, deferring full
+type validation to `fromJson`. That residual unsoundness is what this ADR closes: such a value now
+falls through, so a subsequent `x["age"] + 1` never operates on a string. ADR-050's presence
+rejection is *subsumed* — a missing field still fails (the `KIND_OBJECT` walk reports the missing
+required field), and now a present-but-wrong-typed field fails too.
+
+**Wiring** (mirrors `Intrinsic::FromJson { target, named_defs }`):
+- **Checker** (`checker/pattern.rs`): `check_pattern` for `Pattern::TypeName` whose resolved type is
+  a non-empty `Type::Object` now produces a **new typed-pattern variant**
+  `TypedPattern::TypeCheckDeep(Type, Vec<(String, Type)>, Span)` carrying the object type plus the
+  resolved bodies of every reachable `Named` type (via the existing `collect_named_defs` helper,
+  promoted to `pub(crate)`) so IR lowering — which has no type environment — can build the
+  (possibly recursive) schema descriptor. Plain primitives, unions, and non-object named types keep
+  the bare `TypeCheck` (and its `IsType` tag check); `is Error` keeps its value-constrained object
+  pattern (`error_discriminant_pattern`); empty object types `{}` keep `TypeCheck` (bare tag check).
+- **A new variant, not a field on `TypeCheck`, was chosen.** `TypeCheck(Type, Span)` is matched in
+  ~8 places; adding a field touches all of them invasively. The variant localizes the change: the
+  sites that needed updating just treat `TypeCheckDeep` like `TypeCheck` — narrowing
+  (`checker/pattern.rs`, narrow to the carried `Type`), zonking (`zonk.rs`, zonk the `Type` and the
+  `named_defs` bodies), exhaustiveness (`exhaustiveness.rs`, count it as covering its variant),
+  and the IR pattern helpers `pattern_type_check` / `pattern_elem_type` / the no-binding arm in
+  `lower.rs`. Only the two `is <ObjectType>` emit sites diverge.
+- **IR** (`lin-ir/src/ir.rs`, `lower.rs`, `liveness.rs`): a new instruction `MatchesSchema { dst,
+  val, target, named_defs }` (payload mirrors `FromJson`). The two former `is <ObjectType>` sites —
+  the standalone `TypedExpr::Is` arm and `lower_match_pattern`'s
+  `Is(TypeCheckDeep(..))` — now emit `MatchesSchema` instead of `HasPattern`. `val` is the
+  already-boxed-to-Json scrutinee, exactly as the `HasPattern` path boxed it (`box_to_json`);
+  liveness treats it as `(uses val, defs dst)`.
+- **Codegen** (`codegen/match.rs`, `mod.rs`): `MatchesSchema` reuses `emit_from_json_descriptor`
+  (promoted to `pub(crate)`) to emit the same static descriptor global the `FromJson` path builds,
+  then calls `lin_matches_schema(val, desc)` and truncates the returned `i8` to a bool. Branchless,
+  single basic block — composes inside match-arm test blocks like `compile_ir_has_pattern`.
+
+**RC/memory**: `lin_matches_schema` **borrows** `value` (no clone, no release) and reads a static
+const descriptor — no ownership change, low risk. The input value temp's ownership is unchanged from
+the `HasPattern` path; the `box_to_json` boxing is still done before `MatchesSchema`.
+
+**Unchanged behavior** (verified): `has { .. }` and inline `is { .. }` object patterns stay
+presence + value-constraint (`lower_object_pattern_test`); `is Error` stays the value-constrained
+object pattern and still discriminates a decode failure from a decoded value in either arm order;
+empty object types `{}` keep the bare tag check; all `fromJson`, async/await `Error`, and
+literal-type/union tests stay green.
+
+**Consequence**: `is <ObjectType>` narrowing is now sound — the runtime enforces what the type
+narrowing claims. Recursive types (`type Tree = { "value": Int32, "children": Tree[] }`) terminate
+because `collect_named_defs` is bounded by a `seen` set and the descriptor encoder memoises Named
+nodes as finite back-edges. Number policy is consistent with `fromJson`: `is { "n": Int32 }` rejects
+`3.14` (non-integral) and accepts `5.0` (integral). Verified end-to-end via `lin build`: deep
+rejection of a wrong (incl. nested) field type, a valid value matching with sound narrowed field
+access (`v["age"] + 1` = correct number), `is Error` still discriminating, and recursive `Tree`
+validation. Full suite green (302 integration + 6 + 33 + 29 + 7; 42 stdlib/examples test files).
+
+## ADR-055: `std/proc` consolidated into `std/process` (batch + streaming)
+
+**Decision**: There were two documented subprocess modules — a working low-level `std/proc`
+(`spawn(argv)` → `Int64`, `readStdout`, `wait` → exit code) and an unimplemented high-level
+`std/process` (`exec`/`shell`/`cwd`/`chdir`, `spawn(command,args)`, `wait` → `ExecResult`). They
+are merged into a single `std/process` exposing **both** styles:
+- **Batch**: `exec(command, args)` / `shell(command)` run to completion and return an
+  `ExecResult { status, stdout, stderr }`; `cwd()` / `chdir(path)`.
+- **Streaming**: `spawn(command, args)` → opaque `ProcessHandle` (`Int64`); `readStdout(handle, buf)`
+  reads the piped stdout incrementally; `kill`; `wait` → exit code (`Int32`).
+
+**Why both, and why `wait` stays exit-code**: streaming and batch don't compose on one handle —
+`readStdout` drains the pipe, so a `wait` that returned full stdout (as the doc'd `std/process.wait`
+implied) would come back empty. Rather than maintain two registries or silently break streaming, the
+batch path (`exec`/`shell`) owns "collect all output", and the streaming `wait` returns just the exit
+code. `spawn`/`exec` both take `(command, args)` (the doc'd `std/process` shape); the old argv-array
+`spawn(["sh", ...])` form is gone.
+
+**Mechanism**: runtime `crates/lin-runtime/src/proc.rs` → `process.rs`, intrinsics renamed
+`lin_proc_*` → `lin_process_*`, adding `lin_process_{exec,shell,cwd,chdir}` (the batch fns build an
+`ExecResult` object / run `Command::output()`). Streaming fns keep the monotonic-id `Child` registry
+unchanged. `stdlib/proc.lin` → `process.lin`, embedded as `"std/process"` in `lin-compile`. The
+stdlib wrappers dogfood ADR-053 (imported types): `ExecResult` is an exported record type and
+`ProcessHandle` an exported `Int64` alias, used in the wrapper signatures.
+
+**RC/memory**: `make_exec_result` follows the leak-clean object-build pattern (`fs::make_decode_error`)
+— `lin_object_set` retains the key and the value's inner string, so the local `+1` from each
+`make_string` is released afterward; the object becomes sole owner and freeing the returned box frees
+everything. (The older `make_response_object`/`make_error_obj` skip this; they are program-lifetime
+singletons so it never mattered, but `exec` is called repeatedly.) Verified leak-free under
+LeakSanitizer (the only residual reports are pre-existing program-lifetime interned string literals).
+
+**Migration**: the lone consumer (`examples/processes`) and the proc tests were updated to the new
+`spawn(command, args)` form and `std/process` import. Verified: stdlib + example suites green; three
+integration tests (`test_process_spawn_read_wait`, `test_process_wait_exit_code`,
+`test_process_exec_and_shell_batch`) pass.
+
+## ADR-056: OS resources are opaque integer fd handles
+
+**Decision**: Operating-system resources exposed by `std/net`, `std/process`, and `std/time`
+(timers) are represented to Lin code as **opaque integer handles**, never as runtime object values. A
+socket fd is an `Int32` (`udpBind`/`tcpListen`/`tcpAccept`/`tcpConnect` return `Int32 | Error`); a
+subprocess handle is an `Int64` (`std/process.spawn` returns a `ProcessHandle`, an exported `Int64`
+alias — ADR-055). The integer is meaningful only to the runtime, which keeps the real `fd`/`Child` in
+a side table keyed by the integer; user code passes it back to the relevant intrinsic
+(`udpRecv(fd, …)`, `wait(handle)`, …). See spec §35.4–§35.6.
+
+**Rationale**: This upholds the §33.1 "no hidden open-handle values" convention already used for
+stdin/stdout/filesystem — there is no `Socket` or `Process` object kind to add to the runtime, no new
+boxing, and no lifetime/RC story for OS handles. An integer is transferable, comparable, and trivially
+representable. Fallible operations return the `T | Error` shape (§33.1); a non-blocking read with no
+data yet returns `Null` (not `Error`), so poll loops read naturally (`recv`/`accept` →
+`Int32 | Null | Error`).
+
+**Consequence**: No new runtime *kind* is introduced for sockets/processes — they reuse the existing
+integer representation (a typed alias like `ProcessHandle` is just `Int64` for readability, not a
+distinct kind). The cost is that handles are not type-distinct from ordinary integers; misuse (passing
+the wrong integer) is not caught by the type system, consistent with the deliberately-unsafe nature of
+the low-level layer. The `Int32`/`Int64` split is pragmatic: fds fit in 32 bits, process handles use 64
+to match the platform child representation.
+
+## ADR-057: Share-nothing concurrency — no Mutex/atomics primitive
+
+**Decision**: Lin provides **no** shared-memory concurrency primitives (mutexes, atomics,
+cross-thread shared mutable cells). Cross-thread mutable state is modelled exclusively with a
+`Worker<Msg, Reply>` (§32.6) that owns the state and serialises all access through its single-threaded
+message queue. Spec §35.9 records this as a deliberate absence.
+
+**Rationale**: The concurrency model is share-nothing (§32): `async` thunks and `parallel` may not
+capture `var` bindings (compile-time error, ADR-034), and transferred values must be JSON-compatible. A
+`Worker` owning its state and processing messages one at a time preserves that invariant — there is no
+concurrent access to the worker's closed-over `var`, so no data race is possible without ever
+introducing a lock. Adding a `Mutex`/atomic primitive would reintroduce exactly the data-race surface
+the model is designed to exclude, and would need a new opaque runtime kind plus a poisoning/lifetime
+story.
+
+**Consequence**: Patterns that would use `Arc<Mutex<T>>` in Rust (a shared counter, a connection pool,
+a discovered-peer-address cache) are expressed as a `Worker` whose `onMessage` handler closes over the
+state (§32.6.4). This is more message-passing boilerplate than a shared cell, accepted as the price of
+guaranteed freedom from data races. Single-threaded mutation via `var` is unaffected; the restriction
+applies only across thread boundaries.
+
+## ADR-058: Flat unboxed arrays for scalar element types
+
+**Decision**: An array whose element type is a fixed-width scalar — `Int8`/`Int16`/`Int32`/`Int64`,
+`UInt8`/`UInt16`/`UInt32`/`UInt64`, `Float32`/`Float64` — is stored as a **packed, unboxed,
+contiguous buffer** (one element-width slot per element, no per-element tag), not as an array of boxed
+`TaggedVal`s. The runtime provides a flat variant per family
+(`lin_flat_array_alloc_{i8,i16,i32,i64,u8,u16,u32,u64,f32,f64}` and matching push/index). A `UInt8[]`
+is therefore a literal byte buffer (spec §35.1). Semantically these remain ordinary `T[]` arrays —
+every array operation (literals, indexing, in-place write, `length`, `push`, `slice`, `concat`, `==`,
+the `std/array` combinators) works identically; the representation is an implementation detail.
+
+**Rationale**: Byte/scalar buffers are the substrate for binary protocols, `std/bytes`, and socket
+I/O (`recv` fills a caller-owned `UInt8[]`). Boxing each byte as a tagged value would cost ~16× the
+memory and defeat the point. Because the element type is statically known, codegen selects the flat
+representation with no runtime tag dispatch. Mixed/`Json`/object arrays keep the boxed tagged
+representation; only statically-scalar element types go flat.
+
+**Consequence**: Codegen and the runtime must convert between flat and tagged forms at boundaries where
+a flat array meets a `Json`/dynamic context (`lin_flat_to_tagged_*`, used e.g. by `toString` and
+dynamic length). The flat/boxed distinction is why `concat`/`slice` are flat-representation-aware:
+slicing/concatenating a `UInt8[]` yields a `UInt8[]` whose elements read correctly, not a boxed array
+of zeros. `is_flat_scalar` (codegen) is the single predicate deciding the representation and must stay
+consistent with the runtime's family set.
+
+## ADR-059: Two unary operators — bitwise `~` and logical `!`; no unary minus
+
+**Decision**: Lin has exactly **two** prefix unary operators: bitwise complement `~` (§35.2) and
+logical not `!` (§24.1). There is **no unary minus** — a leading `-` is part of a numeric literal in
+literal position (§3.7), and negating a computed value is written `0 - x`. Both unary operators are
+right-associative and bind tighter than `*` but looser than postfix call/index/dot (§24.2).
+
+**Rationale**: This supersedes the original v1 design (recorded in earlier drafts and TODO) of `~` as
+the *single* sanctioned unary operator. `!` was added (ADR-047) because boolean negation otherwise had
+to be spelled `x == false`, pervasive boilerplate in stdlib and user code; it reuses the existing unary
+pipeline end-to-end (lexer `Bang` token, `UnaryOp::Not`, and for an `i1` a bitwise-not *is* a
+logical-not, so codegen's `build_not` needs no new arm). Unary minus is still excluded: it would
+complicate the negative-literal lexing rule (§3.7) for marginal benefit, and `0 - x` is unambiguous.
+
+**Consequence**: Typing rules differ by operator — `~x` requires an integer and yields that integer
+type; `!x` requires `Bool` and yields `Bool`; a float operand to `~` (or a non-`Bool` to `!`) is a
+compile-time error. The spec's older "the only unary operator is `~`" / "no unary operators in v1"
+statements (§24.1, §35.2, decision-list #9) are updated to "exactly two unary operators (`~`, `!`); no
+unary minus".
+
+## ADR-060: Closures OWN their captures (retain on capture, release on free)
+
+**Decision**: A closure's environment now OWNS one reference per heap/union capture — the same ownership rule arrays and objects already follow for stored elements. At `MakeClosure` the lowerer takes ownership of each capturing value (concrete rc → `Retain` in place; union/`Json` → `CloneBox` so the env holds its own `TaggedVal*`); `lin_closure_release` releases them when the closure is freed. Mutably-captured `var` bindings are unchanged: they store the heap **cell pointer** (shared by reference, ADR-015) and keep their existing borrow-only / `FreeCell` / escaping-cell lifecycle — the env does not own the cell. Scalars need no ownership.
+
+To let the runtime release captures, every closure carries a **capture descriptor** at closure offset 40 (`{ u32 count, u8 kinds[count] }`, a static read-only global): one `CaptureRelease` byte per capture (None / Str / Array / Object / Closure / Tagged). The closure struct grew from 40 to 48 bytes (`CLOSURE_SIZE`); `alloc_closure`/`store_capture_descriptor` centralise the layout, and `lin_closure_release` frees 48 and walks the descriptor (mirroring the recursive element release in `lin_array_release`/`lin_object_release`). Partial-application closures keep borrow semantics with a null capture descriptor. The async thread-transfer path (ADR-042) reads the same descriptor (passed explicitly from the closure, no longer stored at env offset 0) and reuses its codes.
+
+**Rationale**: Captures were **borrow-only** — the env stored a borrowed pointer with no retain, and `lin_closure_release` freed nothing. That is sound only while a closure cannot outlive its captured values' scope. The `safe_callback_depth`/escaping-cell analysis covered that for mutable `var` cells, but immutable value captures had no ownership at all, so a closure that ESCAPES (e.g. returned from a `map`/`filter` callback into the result array) dangled: `map(xs, i => () => i)` then called a thunk returned garbage (`[[object]…]`) because the captured element box had been freed at end-of-iteration and its memory reused. Making the env an owning container, exactly like arrays/objects, fixes this uniformly and reuses the existing store-side discipline (`transfer_into_container` / `own_for_store`).
+
+**Consequence**: `map(xs, i => () => i)` and any escaping capturing closure are now correct. **Performance is unchanged**: the added retain/release pairs are elided by the existing RC-elision pass for the overwhelmingly common non-escaping combinator-callback case (closures created and consumed in one scope) — a before/after benchmark (`benchmarks/closures.lin`, capturing `map`/`filter`/`reduce` over 2M elements) showed no measurable difference, and the full benchmark suite was flat. The cost lands only on closures that genuinely escape, where it is required for correctness. The closure struct is 8 bytes larger (40→48); `CLOSURE_SIZE` in `lin-codegen/src/codegen/call.rs` and the free size in `lin-runtime/src/memory.rs` must stay in lockstep. Verified under ASan (stdlib + every example-project test suite — heavy closure users — show no use-after-free or double-free; the only leak is the pre-existing exit-time top-level-`val` leak, identical for non-capturing `map`).
+
+## ADR-061: Numeric literal suffixes honoured; large bare literals widen, never truncate
+
+**Decision**: Two related fixes to integer-literal typing, both making the implementation match spec §3.6/§26:
+1. **Type suffixes are honoured.** `42i8`, `5u64`, `3.14f32` etc. now pin the literal's type, overriding context/default. Previously the lexer recognised the suffix characters but *discarded* them ("we just consume them"), so `1705314600000i64` was an indistinguishable bare `IntLit` that defaulted to `Int32` and **silently truncated** to its low 32 bits (`212583488`).
+2. **A bare literal beyond `Int32` widens its default instead of truncating.** With no surrounding context, a suffixless integer literal still defaults to `Int32` when it fits; when it exceeds `Int32`'s range it defaults to the smallest type that *preserves* the value (`Int64`, or `UInt64` for a decimal above `i64::MAX`). It is never silently truncated.
+
+**Why widen rather than error.** An earlier attempt made an out-of-range bare literal a compile error ("annotate or suffix it"). That broke ergonomic, previously-working code: call arguments are inferred context-free first and *then* re-typed to the parameter width (`checker/call.rs`), so `format(1705314600000, …)` (an `Int64` param) legitimately relies on the literal surviving inference. Widening the default preserves the value for that downstream re-typing while still fixing the truncation; a genuinely-too-big-for-any-type case can't arise (the lexer already maps `> i64::MAX` decimals to the `UInt64` bit pattern). A literal assigned where an *incompatible* concrete type is required (e.g. `val x: Int32 = 5i64`, or `[256]: UInt8[]`) is still a hard error — that path was already range-checked and is unchanged.
+
+**Mechanism**: a shared `NumSuffix` enum in `lin-common` is parsed by the lexer and carried on `TokenKind::IntLit`/`FloatLit` → surface `Expr::IntLit`/`FloatLit` (the typed IR already carries a resolved `Type`, so the suffix stops at the checker). `checker/helpers.rs` gains `suffix_to_type`, `default_int_literal_type` (the Int32→Int64→UInt64 widening ladder), and `check_int_literal_fits` (extracted from the old inline range check). `check_expr` keeps context-typing for suffixless literals; a suffixed literal flows through `infer_expr` (typed at its suffix type) and the normal compatibility tail validates it against the expected type. The formatter round-trips suffixes.
+
+**Consequence**: `1705314600000i64` and `val ts: Int64 = 1705314600000` and a bare `1705314600000` all preserve the value; `val x: Int32 = 5i64` is a type error; small suffixed literals (`200u8`) type at their width. Covered by `stdlib/number.test.lin` (suffix preservation + arithmetic round-trip) and integration tests (`test_i64_suffix_preserves_large_literal`, `test_int64_annotation_preserves_large_literal`, `test_bare_literal_overflowing_int32_preserved`, `test_suffix_overrides_expected_context_conflict`). Full suite green; surfaced and fixed during the `std/time` work, where `format(<ms>, …)` first exposed the truncation.
+## ADR-062: `append`/`prepend`/`groupBy` runtime intrinsics — representation-preserving, RC-self-contained
+
+**Decision**: `std/array`'s `append`, `prepend`, and `groupBy` are backed by runtime intrinsics
+rather than pure-Lin loops: `lin_array_append_dyn(arr, item)` / `lin_array_prepend_dyn(arr, item)`
+(in `array.rs`) and `lin_object_get_or_insert_array(obj, key)` (in `object.rs`). All three are
+ordinary `import foreign "lin-runtime"` symbols (ADR-009), needing no special codegen dispatch —
+they mirror `lin_array_concat_dyn`'s wiring exactly.
+
+`append`/`prepend` allocate a result that **preserves the input's element representation**
+(ADR-058): a flat scalar source (`UInt8[]`, `Int32[]`, …) yields a flat result of the same
+`elem_tag` — the item is coerced into the element type via `lin_push_dyn`, the source bytes are
+bulk-copied via the per-type flat `concat_into` — while a tagged/`Json[]` source yields a tagged
+result. This fixes a latent bug in the old Lin implementation, which used `lin_array_allocate` (a
+*tagged* array) + a `.for` copy loop, so appending to a flat `UInt8[]` silently produced a tagged
+array of boxed 16-byte elements — element access worked but byte-level consumers (`u32FromBe`, fs
+writes, FFI) read garbage (the same class as the pre-fix `concat` bug).
+
+**Rationale for hand-rolling append/prepend instead of composing on `concat_dyn`**: `concat_dyn`'s
+tagged path copies element pointers *without* retaining them (`lin_array_push_tagged`) — it relies
+on a steal-the-reference discipline at the call boundary and is **not** RC-self-contained (a
+growing-accumulator `acc = concat(acc, [freshString])` loop corrupts the heap once the previous
+`acc` is released, because the new array's aliased string pointers were never retained; interned
+literals merely mask it via their saturated refcount). Composing append on `concat_dyn` and then
+freeing the temporary singleton would therefore double-free. The intrinsics instead copy each
+tagged element through `lin_push_dyn`, which **retains** the inner payload, and likewise retain the
+item — so the returned array owns its own +1 for every heap element and can be released
+independently of the borrowed `arr`/`item` with no over- or under-release.
+
+**`get_or_insert` ownership model**: `lin_object_get_or_insert_array` does a *single* hash lookup.
+The group array always lives **inside** the object (the object owns it). On the present-and-array
+path it retains that interior array (+1) and boxes it; on the absent path it allocates a fresh
+array, inserts it via `lin_object_set` (which retains → object owns its ref), drops the
+construction +1, then bumps once for the returned box. Either way the returned `Json`
+(`TaggedVal*(Array)`) is an owned +1 like every other foreign `Json` result — its scope-exit
+release brings the count back down, leaving the object's reference intact. The caller `push`es
+into the returned box, which mutates the interior array **in place** (`push` borrows its array arg;
+it neither retains nor replaces it), so the new element is visible through the object. `groupBy` is
+thereby one lookup + push per item instead of get-then-`null`-check-then-set (two lookups).
+
+**Consequence**: These are perf wins plus a correctness fix (flat preservation for append/prepend).
+The RC discipline is the bug-class `cargo test` cannot catch (ADR/feedback on UAF/double-free), so
+the intrinsics carry dedicated AddressSanitizer-verified unit tests in `array.rs`/`object.rs`
+(build+release intermediates in a loop; a missing retain surfaces as a UAF, a missing release as a
+leak). Note `concat_dyn`'s own no-retain tagged path remains a latent defect (out of scope here);
+append/prepend deliberately do **not** inherit it.
+
+## ADR-063: Cross-module generic instantiation materializes in the IMPORTING module
+
+**Decision**: A generic `val` function (`<T>(x: T): T => x`) defined in an IMPORTED module is monomorphized in the **importing** module's lowering, not the defining one. `lin-compile` threads the already-typed `imported_modules` map into `lower_module_with_imports` → `monomorphize_with_imports`. The pass discovers a call to an imported generic (the importer's `ImportSlot.ty` is a `Function` with a generic TypeVar in its **parameters** — a return-only TypeVar, as on stdlib intrinsic wrappers like `iter: (…) => Iterator<T>`, does NOT count), clones the generic body out of the imported `TypedModule`, substitutes its quantified TypeVars at the concrete call instantiation, **re-homes** the body into the importer, and emits it as a local specialization (`id$Int32`) that the call is rerouted to.
+
+Re-homing (`rehome_imported_body`) rewrites the cloned body's slots: every body-local slot (params, inner `val`/`var`, destructure targets) is remapped to a fresh importer slot (so it can't collide with the importer's own slots or another specialization), and every FREE reference to the origin module's scope is rewritten into an importer-side construct the importer's lowering already resolves — a sibling function/val → a synthesised `TypedStmt::Import` (a `Named` call to `{origin_key}_{name}`), an intrinsic → a merged intrinsic slot, a **thin intrinsic wrapper** (`for = (it,f) => lin_for(it,f)`) → the intrinsic itself (inlined, preserving the polymorphic builtin's concrete-element dispatch), a foreign binding → a `ForeignImport`. An import-of-import resolves to the SOURCE module's symbol, never the intermediate's. Imported modules also monomorphize their OWN sibling generic calls during `lower_import_module` (`monomorphize_import`), keeping ALL generic originals so external importers that don't specialize still resolve the boxed `{module_key}_{name}` symbol.
+
+Two supporting fixes: (1) `subst_expr` now substitutes the declared-type field of statements inside a block (`subst_stmt_types`) — a `var acc: U` in a generic body otherwise kept `ty: TypeVar(U)`, producing a boxed-union cell while the substituted closure that captures it read the concrete type (a misaligned-pointer crash). (2) the checker's `infer_function_with_hints` now surfaces a lambda's CONCRETE body type when the expected return is a quantified generic param (id ≥ 9001), so a higher-order generic call (`mymap(arr, x => x*2)` with `f: (T) => U`) can bind `U` from the lambda body; the bare-TypeVar boxing convention is retained for the Json/`Function` polymorphic-slot case.
+
+**Rationale**: The importer has the full `TypedModule` for every import (not just the signature), so it can see imported generic BODIES — the only place with both the body and the concrete call types. Specializing there avoids touching the imported module's compilation/caching and avoids cross-contamination (each importer derives its own specializations from the cached generic body; the `.lin-cache` stores the TypedModule with the generic body intact, keyed by source hash regardless of how importers instantiate). The no-op invariant is preserved: `module_uses_generic` gates the whole pass, so a module that neither defines nor imports a param-generic function lowers byte-for-byte as before (verified: `benchmarks/array_pipeline.lin` IR is byte-identical to baseline).
+
+**Consequence**: User-defined cross-module generics — including higher-order ones with the `map` shape (`<T,U>(arr: T[], f: (T) => U)`) — specialize to native, unboxed code in the importer (e.g. `id$Int32` is `define i32 @"id$Int32"(i32)`). Verified end-to-end (output + IR proof + ASan, no UAF/leak) and across the cache (two importers using one imported generic at different element types each get correct specializations). **Converting stdlib `map`/`filter`/`reduce` to generic was attempted and DEFERRED**: the specialized bodies are themselves nearly box-free, but (a) the result of a `[]`-plus-`push` build is a *tagged* array while a static `U[]` result type makes consumers read via the *flat* ABI — a representation mismatch — and (b) the per-element boxing at the `lin_for` callback boundary remains (the closure ABI passes a `TaggedVal*`), so the static box count rose and ~20 of the diverse stdlib/example uses regressed. The full flat/zero-box pipeline needs closure-callback ABI specialization, which is the next increment. stdlib `array.lin` is therefore left `Json`-typed; the cross-module infrastructure is in place for when that lands.
+
+## ADR-064: `concat` retains copied elements (move-vs-retain split in array element copy)
+
+**Decision**: When `lin_array_concat_dyn` copies elements from a **borrowed** source array (the
+tagged-element path, `elem_tag == 0xFF`), it now **retains** each element's heap payload via the new
+`lin_array_concat_into_retaining`, so the result array and the source array are independent owners.
+The non-retaining `lin_array_concat_into` (a raw 16-byte `TaggedVal` move, no retain) is **kept** and
+used only where the source is a fresh temp whose ownership is transferred — `concat_dyn`'s
+widened-flat path, where `lin_flat_to_tagged_*` boxes raw scalars at `+1` and the temp array is then
+`lin_array_free`d (which frees only the struct + buffer, never the element payloads, so the boxes are
+correctly *moved* into the result).
+
+**Rationale**: The old `concat_dyn` used the move-copy (`lin_array_push_tagged`, raw 16-byte copy
+without retain) for **every** path, including borrowed sources. So `concat(a, b)` left `a`/`b` and the
+result sharing each element at one refcount; releasing any of them (e.g. `acc = concat(acc, […])` in a
+loop, which frees the old `acc`) freed the shared payload out from under the result — a genuine
+use-after-free, ASan-confirmed (`heap-use-after-free in lin_string_release` on pristine master). It was
+masked in practice only because string *literals* are interned with immortal refcounts; `concat` of
+computed strings/objects corrupted the heap. `lin_array_push_tagged` itself MUST stay non-retaining —
+its other callers (`io`/`fs`/`json`/`async_rt`/`frozen` building arrays from freshly-owned values, and
+the `map`/`minBy`/`maxBy` element-move convention noted in `lower.rs`) deliberately rely on the move
+to transfer ownership; adding a retain there would leak. The fix therefore lives in a *separate
+retaining copy primitive* selected per-source-ownership inside `concat_dyn`, not in the shared push.
+
+**Consequence**: `concat` of fresh (non-interned) heap values is now memory-safe — the growing-concat
+loop runs clean under ASan (only the pre-existing program-lifetime interned-string-cache leak remains;
+a scoped concat-of-fresh-strings test leaks nothing of its own). The move-vs-retain split is the
+load-bearing invariant: a future change must keep "copy from a still-live borrowed array → retain;
+copy from a fresh temp being freed → move". Regression: `test_concat_fresh_strings_no_use_after_free`
+(40-iteration growing concat of interpolated strings). The sibling `append`/`prepend` intrinsics
+(ADR-062) already retain by the same reasoning; this brings `concat` into line. The analogous
+move-without-retain residual leaks in the `for`/`map` element-shell path (`lower.rs`) are a distinct,
+pre-existing issue and are not addressed here.

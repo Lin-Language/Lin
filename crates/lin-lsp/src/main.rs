@@ -10,7 +10,7 @@ use lin_check::typed_ir::{TypedModule, TypedStmt};
 use lin_check::types::Type;
 use lin_check::Checker;
 use lin_common::Severity;
-use lin_parse::ast::{Stmt, ImportBinding};
+use lin_parse::ast::Stmt;
 
 // ── server ────────────────────────────────────────────────────────────────────
 
@@ -421,6 +421,8 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/path"     => Some(include_str!("../../../stdlib/path.lin")),
         "std/math"     => Some(include_str!("../../../stdlib/math.lin")),
         "std/env"      => Some(include_str!("../../../stdlib/env.lin")),
+        "std/hash"     => Some(include_str!("../../../stdlib/hash.lin")),
+        "std/bytes"    => Some(include_str!("../../../stdlib/bytes.lin")),
         _ => None,
     }
 }

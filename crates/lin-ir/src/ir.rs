@@ -34,7 +34,8 @@ pub enum Const {
 }
 
 /// Known runtime operations that map 1:1 to lin-runtime functions.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Note: not `Eq` — `FromJson(Box<Type>)` carries a `Type`, which is only `PartialEq`.
+#[derive(Debug, Clone, PartialEq)]
 pub enum Intrinsic {
     Print,
     ToString,
@@ -106,9 +107,61 @@ pub enum Intrinsic {
     Retry,
     ThreadPool,
     Worker,
+    /// HTTP server (`serve`, spec §33.5). `serve(handler, port)` → `lin_serve(h_fn, h_env,
+    /// h_has, port)`. Blocks forever; the handler is invoked once per request.
+    Serve,
+    // Shared<T> — opt-in shared mutable state (ADR-043 §2.3.1). shared(v) boxes a private copy;
+    // get/set/withLock are the only accessors (copy out / copy in / locked in-place mutate).
+    SharedNew,
+    SharedGet,
+    SharedSet,
+    SharedWithLock,
+    // Frozen<T> — opt-in shared read-only state (ADR-043 §2.3.2): deep immortal seal of a graph.
+    Freeze,
     Request,
     Message,
     Close,
+    /// `fromJson` type-directed decode (ADR-047). Carries the resolved target `Type` T and the
+    /// resolved bodies of every reachable `Named` type (so codegen can build a recursive schema
+    /// descriptor with no type environment). Runtime: `lin_from_json(value, descriptor) -> ptr`
+    /// returns the input value retained (+1) on success, or a fresh `Error` object on the first
+    /// structural mismatch.
+    FromJson {
+        target: Box<Type>,
+        named_defs: Vec<(String, Type)>,
+    },
+}
+
+/// How a closure env releases one captured slot when the closure is freed (ADR-060: owning
+/// captures). The env owns one reference per owning capture; `lin_closure_release` walks the
+/// emitted capture descriptor and applies the matching release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureRelease {
+    /// Borrow-only: scalar, or a mutably-captured `var` cell pointer (the cell has its own
+    /// MakeCell/FreeCell lifecycle). Nothing to release.
+    None,
+    /// Concrete refcounted heap pointer: String/Array/Object → `lin_*_release`.
+    Str,
+    Array,
+    Object,
+    /// Captured closure value (Function) → `lin_closure_release`.
+    Closure,
+    /// Boxed `TaggedVal*` (union/Json) → `lin_tagged_release` (drops inner payload + frees box).
+    Tagged,
+}
+
+impl CaptureRelease {
+    /// The on-disk byte code stored in the capture descriptor for `lin_closure_release`.
+    pub fn code(self) -> u8 {
+        match self {
+            CaptureRelease::None => 0,
+            CaptureRelease::Str => 1,
+            CaptureRelease::Array => 2,
+            CaptureRelease::Object => 3,
+            CaptureRelease::Closure => 4,
+            CaptureRelease::Tagged => 5,
+        }
+    }
 }
 
 /// Element kinds for unboxed (flat) scalar arrays.
@@ -119,7 +172,9 @@ pub enum FlatElemKind {
     U16,
     I16,
     I32,
+    U32,
     I64,
+    U64,
     F32,
     F64,
 }
@@ -132,7 +187,9 @@ impl FlatElemKind {
             FlatElemKind::U16 => "u16",
             FlatElemKind::I16 => "i16",
             FlatElemKind::I32 => "i32",
+            FlatElemKind::U32 => "u32",
             FlatElemKind::I64 => "i64",
+            FlatElemKind::U64 => "u64",
             FlatElemKind::F32 => "f32",
             FlatElemKind::F64 => "f64",
         }
@@ -144,8 +201,10 @@ impl FlatElemKind {
             Type::Int8 => Some(FlatElemKind::I8),
             Type::UInt16 => Some(FlatElemKind::U16),
             Type::Int16 => Some(FlatElemKind::I16),
-            Type::Int32 | Type::UInt32 => Some(FlatElemKind::I32),
-            Type::Int64 | Type::UInt64 => Some(FlatElemKind::I64),
+            Type::Int32 => Some(FlatElemKind::I32),
+            Type::UInt32 => Some(FlatElemKind::U32),
+            Type::Int64 => Some(FlatElemKind::I64),
+            Type::UInt64 => Some(FlatElemKind::U64),
             Type::Float32 => Some(FlatElemKind::F32),
             Type::Float64 => Some(FlatElemKind::F64),
             _ => None,
@@ -160,7 +219,9 @@ impl FlatElemKind {
             FlatElemKind::U16 => Type::UInt16,
             FlatElemKind::I16 => Type::Int16,
             FlatElemKind::I32 => Type::Int32,
+            FlatElemKind::U32 => Type::UInt32,
             FlatElemKind::I64 => Type::Int64,
+            FlatElemKind::U64 => Type::UInt64,
             FlatElemKind::F32 => Type::Float32,
             FlatElemKind::F64 => Type::Float64,
         }
@@ -191,8 +252,18 @@ pub enum Instruction {
     Call { dst: Temp, callee: CallTarget, args: Vec<Temp>, ret_ty: Type },
     /// result = intrinsic(args...)
     CallIntrinsic { dst: Temp, intrinsic: Intrinsic, args: Vec<Temp>, ret_ty: Type },
-    /// result = closure(func_id, env_temps[...])  — allocates closure struct
-    MakeClosure { dst: Temp, func: FuncId, captures: Vec<Temp>, ret_ty: Type },
+    /// result = closure(func_id, env_temps[...]) — allocates the closure struct + env.
+    /// `capture_kinds[i]` is the release kind of `captures[i]` (see `CaptureRelease`): the env
+    /// OWNS one reference per owning capture, so `lin_closure_release` drops it on free. The
+    /// lowerer fills these (it knows `is_mutable` + the capture type); cell-pointer captures are
+    /// `CaptureRelease::None` (borrow-only — the cell has its own lifecycle).
+    MakeClosure { dst: Temp, func: FuncId, captures: Vec<Temp>, capture_kinds: Vec<CaptureRelease>, ret_ty: Type },
+    /// result = closure value wrapping an EXTERNAL named function symbol (an imported
+    /// top-level function or FFI symbol) referenced as a value rather than called. `sym`
+    /// is the mangled/foreign symbol; `ty` is the function's full Lin type (params + ret)
+    /// so codegen can build the capture-less boxed-ABI wrapper. Mirrors `MakeClosure` for a
+    /// local function, but the callee is resolved by symbol name, not FuncId.
+    MakeNamedClosure { dst: Temp, sym: String, ty: Type },
     /// result = { fields... }  — allocates object on heap
     MakeObject { dst: Temp, fields: Vec<(String, Temp)>, spreads: Vec<Temp>, ty: Type },
     /// result = [ elements... ]  — allocates array on heap
@@ -226,14 +297,52 @@ pub enum Instruction {
     CellGet { dst: Temp, cell: Temp, ty: Type },
     /// *cell = value  (update a captured `var` cell in place).
     CellSet { cell: Temp, value: Temp, ty: Type },
+    /// Release the cell's owned VALUE (`*cell`, tag-aware/concrete per `ty`), then free the
+    /// cell allocation itself (`lin_cell_free`). Emitted ONCE at the creating function's scope
+    /// exit, ONLY for cells the lowerer has PROVEN non-escaping: every closure that captured
+    /// the cell was lowered as a synchronous, non-retained argument to a known consuming
+    /// combinator (for/while/map/filter/reduce). Reclaims the per-call cell + its current value
+    /// (fixing the captured-cell leak). Never emitted for an escaping cell (would be a
+    /// use-after-free when a surviving closure later reads it).
+    FreeCell { cell: Temp, ty: Type },
     /// Increment refcount of a heap value (string, array, object, closure env).
     Retain { val: Temp, ty: Type },
     /// Decrement refcount; free if zero. Only emitted for owned values.
     Release { val: Temp, ty: Type },
+    /// Clone a boxed Json/union value (`TaggedVal*`): allocate a fresh, independently-owned
+    /// box copying the tag+payload and retaining the inner heap payload. Used by the owning
+    /// model for union var-cells/globals so the cell and each reader hold their OWN box rather
+    /// than an alias of a borrowed box (whose free would be a double-free). Maps to
+    /// `lin_tagged_clone`. For non-union `ty` this degrades to a plain Retain of `src` into
+    /// `dst` (dst == src), so the lowerer can use it uniformly.
+    CloneBox { dst: Temp, src: Temp, ty: Type },
+    /// Free ONLY the `TaggedVal*` box shell of `val` (not its inner heap payload). Emitted for
+    /// a transient box (e.g. a freshly-boxed concrete value coerced into a union cell/global)
+    /// whose inner payload's ownership is held elsewhere — typically the raw value's own
+    /// scope-exit release. A full `Release` would double-free the inner; this reclaims only the
+    /// 16-byte box. Maps to `lin_tagged_free_box`. Null/cached-box safe.
+    FreeBoxShell { val: Temp },
+    /// Free ONLY the `TaggedVal*` box shell of `val`, but ONLY when `val` is a distinct pointer
+    /// from `other`. Used by `for`/`while` to reclaim the per-iteration element box shell without
+    /// double-freeing when the callback returned (an alias of) that box — whose separate full
+    /// release already reclaimed it. Maps to `lin_tagged_free_box_if_distinct`. Null/cached-safe.
+    FreeBoxShellIfDistinct { val: Temp, other: Temp },
     /// result = val is type_tag? (returns bool)
     IsType { dst: Temp, val: Temp, ty: Type },
     /// result = val has pattern? (returns bool)
     HasPattern { dst: Temp, val: Temp, pattern: HasDesc },
+    /// result = `val` deeply conforms to `target`? (returns bool) — `is <ObjectType>` deep
+    /// type validation (ADR-054). Reuses the `fromJson` structural walker via
+    /// `lin_matches_schema(value, descriptor)`: codegen emits the same schema descriptor it
+    /// builds for `Intrinsic::FromJson` (from `target` + the resolved `named_defs` bodies of
+    /// reachable Named types) and calls the runtime to recursively validate field TYPES, not
+    /// just presence. `val` is a boxed `TaggedVal*` (borrowed, no ownership change).
+    MatchesSchema {
+        dst: Temp,
+        val: Temp,
+        target: Type,
+        named_defs: Vec<(String, Type)>,
+    },
     /// result = box(val, ty) — wrap a scalar as a tagged union value
     Box { dst: Temp, val: Temp, ty: Type },
     /// result = unbox(val, ty) — extract scalar from tagged union
@@ -328,6 +437,21 @@ impl LinFunction {
     }
 }
 
+/// Default-argument dispatch info for one function with optional parameters.
+/// Used to build the runtime closure descriptor so an INDIRECT call through a
+/// function value (`val g = f; g(x)`) can fill omitted trailing defaults.
+#[derive(Debug, Clone)]
+pub struct DefaultDescriptor {
+    /// Minimum (non-partial) call arity.
+    pub required: usize,
+    /// Total declared parameter count.
+    pub total: usize,
+    /// Entry function per arity: `entries[k - required]` is the FuncId to call when
+    /// `k` arguments are supplied (`required <= k <= total`). The last entry
+    /// (`k == total`) is the real function; the rest are default-fill adapters.
+    pub entries: Vec<FuncId>,
+}
+
 /// A full Lin module in flat IR form.
 #[derive(Debug, Clone)]
 pub struct LinModule {
@@ -336,6 +460,10 @@ pub struct LinModule {
     pub global_fn_slots: HashMap<usize, FuncId>,
     /// Maps slot index → intrinsic name for intrinsic slots.
     pub intrinsics: HashMap<usize, String>,
+    /// Real FuncId → default-argument descriptor, for functions with optional params.
+    /// Codegen builds a static descriptor global per entry and attaches it to closure
+    /// values so indirect under-arity calls dispatch to the right default-fill adapter.
+    pub default_descriptors: HashMap<FuncId, DefaultDescriptor>,
 }
 
 impl LinModule {
