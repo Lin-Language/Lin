@@ -4496,6 +4496,75 @@ print(toString(concat(flat, ["a"])[0]))  // 1 (mixed → tagged, value preserved
 }
 
 #[test]
+fn test_append_prepend_basic_and_representation() {
+    // append/prepend are runtime intrinsics (lin_array_append_dyn / _prepend_dyn) that
+    // PRESERVE the input's representation. Json[] stays Json[]; a flat UInt8[]/Int32[] stays
+    // flat (proven byte-level via u32FromBe, which reads `(*arr).data as *const u8` — a tagged
+    // result would decode garbage); String[] stays tagged and its strings survive RC retain.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { append, prepend, length } from "std/array"
+import { u32FromBe } from "std/bytes"
+
+// Json[] (tagged scalars)
+val nums = [1, 2, 3]
+print(toString(append(nums, 4)))     // [1, 2, 3, 4]
+print(toString(prepend(nums, 0)))    // [0, 1, 2, 3]
+print(toString(length(append(nums, 4))))  // 4
+
+// flat UInt8[] — latent-bug check: index AND byte-level read must be correct.
+val b: UInt8[] = [170, 187, 204]
+val ap: UInt8[] = append(b, 221)     // [170,187,204,221] = 0xAABBCCDD
+print(toString(ap[3]))               // 221 (element access)
+print(toString(u32FromBe(ap, 0)))    // 2864434397 (packed bytes ⇒ still flat)
+val bb: UInt8[] = [187, 204, 221]
+val pp: UInt8[] = prepend(bb, 170)   // [170,187,204,221]
+print(toString(u32FromBe(pp, 0)))    // 2864434397 (prepend also stays flat)
+
+// flat Int32[]
+val ia: Int32[] = [10, 20]
+print(toString(append(ia, 30)[2]))   // 30
+print(toString(prepend(ia, 5)[0]))   // 5
+
+// String[] (tagged, RC) — strings print correctly after retain.
+val ss = ["a", "b"]
+print(append(ss, "c")[2])            // c
+print(prepend(ss, "z")[0])           // z
+"#);
+    assert_eq!(
+        out,
+        vec![
+            "[1, 2, 3, 4]", "[0, 1, 2, 3]", "4",
+            "221", "2864434397", "2864434397",
+            "30", "5",
+            "c", "z",
+        ]
+    );
+}
+
+#[test]
+fn test_group_by_even_odd_and_empty() {
+    // groupBy now does ONE hash lookup per item (lin_object_get_or_insert_array) + push,
+    // instead of get-then-set. Grouping by even/odd splits correctly; an empty input is {}.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { groupBy } from "std/array"
+
+val g = groupBy([1, 2, 3, 4, 5], x => if x % 2 == 0 then "even" else "odd")
+print(toString(g["even"]))   // [2, 4]
+print(toString(g["odd"]))    // [1, 3, 5]
+
+val ge = groupBy([], x => "k")
+print(toString(ge))          // {}
+
+// Single bucket: every item lands under one key.
+val one = groupBy([7, 9, 11], x => "all")
+print(toString(one["all"]))  // [7, 9, 11]
+"#);
+    assert_eq!(out, vec!["[2, 4]", "[1, 3, 5]", "{}", "[7, 9, 11]"]);
+}
+
+#[test]
 fn test_u32_be_round_trip() {
     // std/bytes: a UInt32 survives a big-endian write then read.
     let out = run(r#"import { print } from "std/io"

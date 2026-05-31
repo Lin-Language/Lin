@@ -1,6 +1,9 @@
 import foreign "lin-runtime"
   val lin_array_slice_dyn: (Json, Int32, Int32) => Json
   val lin_array_concat_dyn: (Json, Json) => Json
+  val lin_array_append_dyn: (Json, Json) => Json
+  val lin_array_prepend_dyn: (Json, Json) => Json
+  val lin_object_get_or_insert_array: (Json, String) => Json
 
 export val push = (arr: Json, item: Json): Null =>
   lin_push(arr, item)
@@ -297,27 +300,16 @@ export val maxBy = (arr: Json[], keyFn: (Json) => Json): Json =>
     if x[0] > acc[0] then x else acc
   )[1]
 
+// Append `item` to the end of `arr`, returning a new array. Dispatches on the runtime element
+// type so a flat array (e.g. UInt8[]) stays flat — the item is coerced into the element type —
+// and a tagged Json[] stays tagged with each element/item RC-retained into the result.
 export val append = (arr: Json[], item: Json): Json[] =>
-  val n = length(arr)
-  val result = lin_array_allocate(n + 1)
-  var i = 0
-  arr.for(x =>
-    result[i] = x
-    i = i + 1
-  )
-  result[n] = item
-  result
+  lin_array_append_dyn(arr, item)
 
+// Prepend `item` to the front of `arr`, returning a new array. Same flat-preservation and RC
+// discipline as `append`.
 export val prepend = (arr: Json[], item: Json): Json[] =>
-  val n = length(arr)
-  val result = lin_array_allocate(n + 1)
-  result[0] = item
-  var i = 1
-  arr.for(x =>
-    result[i] = x
-    i = i + 1
-  )
-  result
+  lin_array_prepend_dyn(arr, item)
 
 export val scan = (arr: Json[], init: Json, f: (Json, Json) => Json): Json[] =>
   val result = [init]
@@ -332,11 +324,10 @@ export val groupBy = (arr: Json, keyFn: (Json) => String): Json =>
   var result = {}
   arr.for(item =>
     val key = keyFn(item)
-    val group = result[key]
-    if group == null then
-      result[key] = [item]
-    else
-      push(group, item)
+    // One hash lookup: fetch the group array for `key`, creating it if absent, then push in
+    // place (no separate null-check + assign double lookup).
+    val group = lin_object_get_or_insert_array(result, key)
+    push(group, item)
   )
   result
 

@@ -825,3 +825,48 @@ To let the runtime release captures, every closure carries a **capture descripto
 **Mechanism**: a shared `NumSuffix` enum in `lin-common` is parsed by the lexer and carried on `TokenKind::IntLit`/`FloatLit` → surface `Expr::IntLit`/`FloatLit` (the typed IR already carries a resolved `Type`, so the suffix stops at the checker). `checker/helpers.rs` gains `suffix_to_type`, `default_int_literal_type` (the Int32→Int64→UInt64 widening ladder), and `check_int_literal_fits` (extracted from the old inline range check). `check_expr` keeps context-typing for suffixless literals; a suffixed literal flows through `infer_expr` (typed at its suffix type) and the normal compatibility tail validates it against the expected type. The formatter round-trips suffixes.
 
 **Consequence**: `1705314600000i64` and `val ts: Int64 = 1705314600000` and a bare `1705314600000` all preserve the value; `val x: Int32 = 5i64` is a type error; small suffixed literals (`200u8`) type at their width. Covered by `stdlib/number.test.lin` (suffix preservation + arithmetic round-trip) and integration tests (`test_i64_suffix_preserves_large_literal`, `test_int64_annotation_preserves_large_literal`, `test_bare_literal_overflowing_int32_preserved`, `test_suffix_overrides_expected_context_conflict`). Full suite green; surfaced and fixed during the `std/time` work, where `format(<ms>, …)` first exposed the truncation.
+## ADR-062: `append`/`prepend`/`groupBy` runtime intrinsics — representation-preserving, RC-self-contained
+
+**Decision**: `std/array`'s `append`, `prepend`, and `groupBy` are backed by runtime intrinsics
+rather than pure-Lin loops: `lin_array_append_dyn(arr, item)` / `lin_array_prepend_dyn(arr, item)`
+(in `array.rs`) and `lin_object_get_or_insert_array(obj, key)` (in `object.rs`). All three are
+ordinary `import foreign "lin-runtime"` symbols (ADR-009), needing no special codegen dispatch —
+they mirror `lin_array_concat_dyn`'s wiring exactly.
+
+`append`/`prepend` allocate a result that **preserves the input's element representation**
+(ADR-058): a flat scalar source (`UInt8[]`, `Int32[]`, …) yields a flat result of the same
+`elem_tag` — the item is coerced into the element type via `lin_push_dyn`, the source bytes are
+bulk-copied via the per-type flat `concat_into` — while a tagged/`Json[]` source yields a tagged
+result. This fixes a latent bug in the old Lin implementation, which used `lin_array_allocate` (a
+*tagged* array) + a `.for` copy loop, so appending to a flat `UInt8[]` silently produced a tagged
+array of boxed 16-byte elements — element access worked but byte-level consumers (`u32FromBe`, fs
+writes, FFI) read garbage (the same class as the pre-fix `concat` bug).
+
+**Rationale for hand-rolling append/prepend instead of composing on `concat_dyn`**: `concat_dyn`'s
+tagged path copies element pointers *without* retaining them (`lin_array_push_tagged`) — it relies
+on a steal-the-reference discipline at the call boundary and is **not** RC-self-contained (a
+growing-accumulator `acc = concat(acc, [freshString])` loop corrupts the heap once the previous
+`acc` is released, because the new array's aliased string pointers were never retained; interned
+literals merely mask it via their saturated refcount). Composing append on `concat_dyn` and then
+freeing the temporary singleton would therefore double-free. The intrinsics instead copy each
+tagged element through `lin_push_dyn`, which **retains** the inner payload, and likewise retain the
+item — so the returned array owns its own +1 for every heap element and can be released
+independently of the borrowed `arr`/`item` with no over- or under-release.
+
+**`get_or_insert` ownership model**: `lin_object_get_or_insert_array` does a *single* hash lookup.
+The group array always lives **inside** the object (the object owns it). On the present-and-array
+path it retains that interior array (+1) and boxes it; on the absent path it allocates a fresh
+array, inserts it via `lin_object_set` (which retains → object owns its ref), drops the
+construction +1, then bumps once for the returned box. Either way the returned `Json`
+(`TaggedVal*(Array)`) is an owned +1 like every other foreign `Json` result — its scope-exit
+release brings the count back down, leaving the object's reference intact. The caller `push`es
+into the returned box, which mutates the interior array **in place** (`push` borrows its array arg;
+it neither retains nor replaces it), so the new element is visible through the object. `groupBy` is
+thereby one lookup + push per item instead of get-then-`null`-check-then-set (two lookups).
+
+**Consequence**: These are perf wins plus a correctness fix (flat preservation for append/prepend).
+The RC discipline is the bug-class `cargo test` cannot catch (ADR/feedback on UAF/double-free), so
+the intrinsics carry dedicated AddressSanitizer-verified unit tests in `array.rs`/`object.rs`
+(build+release intermediates in a loop; a missing retain surfaces as a UAF, a missing release as a
+leak). Note `concat_dyn`'s own no-retain tagged path remains a latent defect (out of scope here);
+append/prepend deliberately do **not** inherit it.
