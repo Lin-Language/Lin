@@ -54,7 +54,7 @@ This prevents data races. Use `val` bindings (which are immutable) for data you 
 
 ## Error handling in async
 
-`async` wraps the return type in `T | Error`. A runtime error inside the thunk is caught at the thread boundary and surfaced as an `Error` at `await`:
+`await` returns `T | Error`: a runtime error inside the thunk is caught at the thread boundary and surfaced as an `Error` at `await` (rather than crashing the program). You **must** handle the `Error` case — the type checker rejects assigning an awaited result straight to the bare value type:
 
 ```lin
 import { async, await } from "std/async"
@@ -65,11 +65,13 @@ val p = async(() =>
   xs[99]   // array index out of bounds — becomes an Error
 )
 
-val result = await(p)
+val result = await(p)   // Int32 | Error
 match result
   is Error => print("task failed")
   else     => print("got: ${result}")
 ```
+
+Skipping the `match` and writing `val result: Int32 = await(p)` is a compile-time error — this is how Lin guarantees async faults are handled at the call site.
 
 ## Workers — long-lived stateful threads
 

@@ -1812,15 +1812,27 @@ match result
 
 An async fault surfaces as an `Error` value whose discriminant is the string-literal `"type": "error"`; since string literals in type position are singleton types (§18, §33), this tag is the same kind of compile-time-checked discriminant used by user-defined tagged unions. A runtime error inside the thunk (array out of bounds, integer division by zero, non-exhaustive match, etc.) is caught at the OS thread boundary and surfaces as an `Error` value at the `await` call site rather than halting the program. This makes `async` a **fault isolation boundary** — the only place in Lin where runtime errors become recoverable values. The general rule that runtime errors are uncatchable (§19.1) does not apply inside an async thunk.
 
-If `await` is called and the result is `Error` but the caller does not inspect it (e.g. assigns to a `val` typed as `Int32`), the type checker will reject the assignment at compile time.
+If `await` is called and the result is `Error` but the caller does not inspect it (e.g. assigns to a `val` typed as `Int32`), the type checker will reject the assignment at compile time:
+
+```txt
+val p = async(() => 1 + 1)
+val v: Int32 = await(p)   // compile error: Int32 | Error is not assignable to Int32
+```
+
+This is enforced. To consume an awaited result you must handle the `Error` case (typically with `match … is Error => … else => …`).
+
+> **Implementation note (ADR-070).** Conceptually `async` produces a `Promise<T | Error>`. In the reference compiler the `T | Error` union is attached at `await` (typed `<T>(p: T): T | Error`), not at `async` — a promise handle in flight is an opaque value, and only `await` materialises a result that can be an `Error`. The observable rule is identical: you cannot use an awaited value without handling the `Error`. There is no nominal `Promise<T>` type, so the checker enforces "must handle the `Error`" but does not catch "forgot to `await`" (using a promise where its resolved value is expected).
 
 #### 32.2.3 Nested Promises
 
-`await` auto-flattens nested promises. If the thunk itself returns a `Promise<T>`, `await` resolves through all layers:
+`await` auto-flattens nested promises. If the thunk itself returns a `Promise<T>`, `await` resolves through all layers. The result is still `T | Error` (the union does not nest — `await` flattens both the promise layers and any inner `Error`):
 
 ```txt
-val p: Promise<Int32> = async(() => async(() => 42))
-val v: Int32 = await(p)   // 42, not Promise<Int32>
+val p = async(() => async(() => 42))
+val v = await(p)   // Int32 | Error — 42 once the Error case is handled, not Promise<Int32>
+match v
+  is Error => print("failed")
+  else     => print("${v}")   // 42
 ```
 
 ### 32.3 `parallel`
