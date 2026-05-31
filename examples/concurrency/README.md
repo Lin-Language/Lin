@@ -1,6 +1,6 @@
 # Concurrency tour
 
-A small project exercising every async / threading primitive Lin provides (spec §32).
+A small project exercising every async / threading primitive Lin provides (spec §24).
 
 ## Files
 
@@ -27,7 +27,7 @@ lin test examples/concurrency/             # the test suites
 
 - Thunks here capture top-level `val`s or function parameters — both are
   transferred to the worker thread by deep copy (Option C). The `Worker` handler
-  deliberately closes over a `var` (§32.6.4): that state is confined to the worker
+  deliberately closes over a `var` (§24.6.4): that state is confined to the worker
   thread, so it is safe.
 - `Frozen<T>` data is shared by reference across threads with zero copies; the
   parallel readers all observe the same immortal graph.
