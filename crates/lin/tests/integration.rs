@@ -7109,6 +7109,27 @@ print(toString(r.reduce(0, (acc, x) => acc + x)))
         garbage.unwrap(), ll);
 }
 
+#[test]
+fn test_stdlib_generic_accessors_at_set_indexof() {
+    // ADR-067: stdlib `at`/`set`/`indexOf` carry generic `<T>(T[], …)` signatures. They must stay
+    // representation-consistent and correct on both a flat concrete-scalar `Int32[]` and a tagged
+    // `String[]`, including negative-index wrap and the in-place `set` round-trip.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { at, set, indexOf } from "std/array"
+val a = [10, 20, 30]
+print(toString(a.at(1)))
+print(toString(a.at(-1)))
+set(a, 0, 99)
+print(toString(a.at(0)))
+print(toString(a.indexOf(30)))
+val s = ["x", "y", "z"]
+print(s.at(-1))
+print(toString(s.indexOf("y")))
+"#);
+    assert_eq!(out, vec!["20", "30", "99", "2", "z", "1"]);
+}
+
 /// Find the first `$T<digits>` token in `ir` (a garbage unbound-TypeVar monomorph name). Returns
 /// the matched substring, or `None`. Deliberately dependency-free (no `regex` crate in this test
 /// binary): scan for the `$T` marker followed by ASCII digits.

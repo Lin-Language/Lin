@@ -127,7 +127,7 @@ export val flatMap = (arr: Json, f: Function): Json =>
   )
   result
 
-export val indexOf = (arr: Json, target: Json): Int32 =>
+export val indexOf = <T>(arr: T[], target: T): Int32 =>
   var result = -1
   var i = 0
   lin_while(arr, item =>
@@ -146,10 +146,10 @@ export val reverse = (arr: Json): Json =>
   )
   result
 
-export val set = (arr: Json, idx: Int32, item: Json): Null =>
+export val set = <T>(arr: T[], idx: Int32, item: T): Null =>
   arr[idx] = item
 
-export val at = (arr: Json, index: Int32): Json =>
+export val at = <T>(arr: T[], index: Int32): T =>
   val i = if index < 0 then length(arr) + index else index
   arr[i]
 
