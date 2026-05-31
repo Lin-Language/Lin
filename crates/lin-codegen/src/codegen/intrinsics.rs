@@ -196,11 +196,22 @@ impl<'ctx> Codegen<'ctx> {
                     let elem = args[1];
                     let arr_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
                     let elem_ty = arg_tys.get(1).cloned().unwrap_or_else(|| Type::TypeVar(u32::MAX));
-                    if Self::is_union_type(&arr_ty) {
-                        // arr is a boxed TaggedVal* wrapping a LinArray* (flat or tagged).
-                        // Unbox to the raw array, then lin_push_dyn dispatches on its elem_tag.
-                        // Calling lin_array_push_tagged on the boxed pointer corrupts the heap.
-                        let arr_raw = self.builder.call(self.rt.unbox_ptr, &[arr.into()], "ir_push_arr").try_as_basic_value().unwrap_basic();
+                    // A statically FLAT-scalar array (e.g. `val r: Int32[] = []` then `push(r, x)`):
+                    // the `[]` literal allocated a FLAT buffer (lin_flat_array_alloc_*), so a tagged
+                    // push (`lin_array_push_tagged`) would corrupt it. Route through `lin_push_dyn`,
+                    // which reads the array's runtime `elem_tag` and coerces the boxed element into
+                    // the flat slot. Scalars carry no refcount, so no RC balancing is needed (the
+                    // boxed element shell is a fresh cached/heap box freed after the move). This is
+                    // the `[]`+push flat-representation consistency fix (ADR-068).
+                    let arr_elem_flat = matches!(&arr_ty, Type::Array(e) if Self::is_flat_scalar(e));
+                    if Self::is_union_type(&arr_ty) || arr_elem_flat {
+                        // arr may be a boxed TaggedVal* wrapping a LinArray* (flat or tagged), or a
+                        // raw flat LinArray*. Unbox if boxed, then lin_push_dyn dispatches on elem_tag.
+                        let arr_raw = if Self::is_union_type(&arr_ty) {
+                            self.builder.call(self.rt.unbox_ptr, &[arr.into()], "ir_push_arr").try_as_basic_value().unwrap_basic()
+                        } else {
+                            arr
+                        };
                         let elem_is_fresh_box = !Self::is_union_type(&elem_ty);
                         let elem_tagged = if elem_is_fresh_box {
                             self.box_value(elem, &elem_ty)
@@ -212,7 +223,7 @@ impl<'ctx> Codegen<'ctx> {
                             self.builder.call(self.rt.tagged_release, &[elem_tagged.into()], "");
                         }
                     } else {
-                        // arr is a raw LinArray* of known element type.
+                        // arr is a raw tagged LinArray* of known element type (move semantics).
                         self.tagged_array_push_value(arr, elem, &elem_ty);
                     }
                 }

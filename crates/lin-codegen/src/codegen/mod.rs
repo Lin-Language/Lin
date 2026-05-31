@@ -909,11 +909,22 @@ impl<'ctx> Codegen<'ctx> {
                                             let cls_ptr = if Self::is_union_type(&callee_ty) {
                                                 self.builder.call(self.rt.unbox_ptr, &[cls_ptr.into()], "ir_fn_unbox").try_as_basic_value().unwrap_basic()
                                             } else { cls_ptr };
-                                            // Under-application of a closure value: the result is
-                                            // still a Function, so bundle the inner closure + the
-                                            // supplied args into a new partial-application closure
-                                            // taking the remaining params (no direct call yet).
+                                            // Under-application of a closure value: FEWER args than
+                                            // the callee's declared arity are supplied AND the result
+                                            // is still a Function — bundle the inner closure + the
+                                            // supplied args into a partial-application closure over
+                                            // the remaining params. A CURRIED callee (full arity, but
+                                            // it RETURNS a function — e.g. a `map` callback
+                                            // `i => () => i`) is NOT under-application: it must be
+                                            // CALLED. Disambiguated by arg-count vs callee arity
+                                            // (`ret is Function` alone is ambiguous between the two).
+                                            let callee_arity = match &callee_ty {
+                                                Type::Function { params, .. } => params.len(),
+                                                _ => args.len(),
+                                            };
+                                            let is_under_application = args.len() < callee_arity;
                                             if let Type::Function { params: remaining, .. } = ret_ty {
+                                              if is_under_application {
                                                 // Box each supplied partial into a TaggedVal* (ptr)
                                                 // so the partial-application wrapper forwards it to
                                                 // the inner closure under the uniform all-ptr boxed
@@ -931,6 +942,7 @@ impl<'ctx> Codegen<'ctx> {
                                                     cls_ptr.into_pointer_value(), &partials, remaining);
                                                 temp_map.insert(*dst, r);
                                                 continue;
+                                              }
                                             }
                                             let cls_ty = self.closure_struct_type();
                                             let cls_ptr_v = cls_ptr.into_pointer_value();

@@ -7149,3 +7149,54 @@ fn regex_lite_find_t_id(ir: &str) -> Option<String> {
     }
     None
 }
+
+#[test]
+fn test_map_callback_returns_curried_closure_full_apply() {
+    // ADR-068: a `map` callback that RETURNS a closure (curried `i => () => i`) is a FULL
+    // application of the 1-arg callback, not under-application — the indirect-call path must CALL it
+    // (returning the thunk), not bundle it into a partial-application closure. Before the arg-count
+    // vs arity disambiguation it returned garbage (a pointer reinterpreted as the value).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map } from "std/array"
+val thunks = map([5, 6, 7], i => () => i)
+print(toString(thunks[0]()))
+print(toString(thunks[1]()))
+print(toString(thunks[2]()))
+"#);
+    assert_eq!(out, vec!["5", "6", "7"]);
+}
+
+#[test]
+fn test_reduce_over_push_built_flat_typed_array_reads_correctly() {
+    // ADR-068: a `[]`+push builder typed `Int32[]` allocates a TAGGED array; `reduce` over it must
+    // read at the runtime representation (tagged), not flat — a flat read would misread garbage.
+    // `combinator_read_elem_ty` only flat-reads provably-flat producers; a `[]`+push source falls
+    // back to the tagged read.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push, reduce } from "std/array"
+val build = (): Int32[] =>
+  val result = []
+  push(result, 5)
+  push(result, 6)
+  push(result, 7)
+  result
+print(toString(reduce(build(), 0, (a, x) => a + x)))
+"#);
+    assert_eq!(out, vec!["18"]);
+}
+
+#[test]
+fn test_filter_then_reduce_flat_pipeline_correct() {
+    // ADR-068: filter's keep/skip block split exercises the `emit_index_loop` phi back-edge patch
+    // (the back-edge predecessor is the skip block, not the nominal body block). A range→filter→
+    // reduce flat pipeline must produce the right sum and valid IR.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, filter, reduce } from "std/array"
+val total = range(0, 10).filter(x => x % 2 == 0).reduce(0, (acc, x) => acc + x)
+print(toString(total))
+"#);
+    assert_eq!(out, vec!["20"]);
+}

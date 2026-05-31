@@ -58,12 +58,20 @@ val doubled = doubler(x => x * 2)
 
 ## Partial application
 
-Passing fewer arguments than the arity returns a new function:
+Functions partially apply from left to right. Partial application is requested with an **explicit trailing comma** after the supplied arguments; the result is a new function awaiting the rest:
 
 ```lin
 val add = (a: Int32, b: Int32) => a + b
-val addTen = add(10)       // (Int32) => Int32
+val addTen = add(10,)      // (Int32) => Int32
 val fifteen = addTen(5)    // 15
+```
+
+The trailing comma distinguishes partial application from a complete call. A call without it that supplies too few arguments is an error, unless the omitted trailing parameters have default values (§10.6), which are filled in instead:
+
+```lin
+val f = add(10)      // error: add has no default for `b`; use add(10,) to curry
+val g = add(10,)     // partial application — g : (Int32) => Int32
+val s = add(1, 2)    // complete call
 ```
 
 Over-application (more arguments than the function expects) is a compile-time error.
@@ -114,9 +122,17 @@ c["get"]()    // 2
 
 `async` thunks (functions passed to `async()`) may not capture `var` bindings. This is a compile-time error where detectable. Workers may capture `var` bindings because they are single-threaded.
 
-## No default parameters
+## Default parameters
 
-Lin does not support default parameter values. Use partial application or overloading via union types instead.
+A parameter may declare a default value. Optional (defaulted) parameters must come last — once a parameter has a default, every parameter after it must too. A default expression may reference parameters declared before it:
+
+```lin
+val box = (w: Int32, h: Int32 = w, area: Int32 = w * h) => area
+box(4)        // h = 4, area = 16
+box(4, 3)     // area = 12
+```
+
+A complete call must supply at least the required (non-defaulted) parameters; omitted trailing parameters are filled with their defaults. This is why a no-trailing-comma call like `add(10)` is only valid when the omitted parameters have defaults — otherwise use `add(10,)` to partially apply instead of filling.
 
 ## Parameter destructuring
 

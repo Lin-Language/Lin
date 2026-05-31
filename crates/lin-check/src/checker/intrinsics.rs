@@ -103,7 +103,10 @@ impl Checker {
             Type::func(vec![Type::Int32, Type::Int32], Type::Iterator(Box::new(Type::Int32))),
         );
 
-        // map: (Iterable<T>, (T) => U) => Iterator<U>
+        // map: (Iterable<T>, (T) => U) => U[]
+        // The lowering MATERIALIZES a concrete array (flat for scalar U, tagged otherwise), so the
+        // return type is `U[]` — the stdlib `map` thin wrapper declares the same, and callers chain
+        // `.filter`/`.reduce`/index on it as an array.
         self.define_intrinsic(
             "lin_map",
             Type::func(vec![
@@ -112,10 +115,10 @@ impl Checker {
                         Type::Iterator(Box::new(Type::TypeVar(9030))),
                     ]),
                     Type::func(vec![Type::TypeVar(9030)], Type::TypeVar(9031)),
-                ], Type::Iterator(Box::new(Type::TypeVar(9031)))),
+                ], Type::Array(Box::new(Type::TypeVar(9031)))),
         );
 
-        // filter: (Iterable<T>, (T) => Boolean) => Iterator<T>
+        // filter: (Iterable<T>, (T) => Boolean) => T[]
         self.define_intrinsic(
             "lin_filter",
             Type::func(vec![
@@ -124,7 +127,7 @@ impl Checker {
                         Type::Iterator(Box::new(Type::TypeVar(9040))),
                     ]),
                     Type::func(vec![Type::TypeVar(9040)], Type::Bool),
-                ], Type::Iterator(Box::new(Type::TypeVar(9040)))),
+                ], Type::Array(Box::new(Type::TypeVar(9040)))),
         );
 
         // reduce: (Iterable<T>, U, (U, T) => U) => U
