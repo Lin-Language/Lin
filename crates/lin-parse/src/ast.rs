@@ -42,6 +42,21 @@ pub enum Stmt {
     Expr(Expr),
 }
 
+impl Stmt {
+    /// The source span of this statement. Struct variants return their own `span` field;
+    /// `Stmt::Expr` delegates to the wrapped expression. Mirrors `Expr::span()`.
+    pub fn span(&self) -> Span {
+        match self {
+            Stmt::Val { span, .. } => *span,
+            Stmt::Var { span, .. } => *span,
+            Stmt::TypeDecl { span, .. } => *span,
+            Stmt::Import { span, .. } => *span,
+            Stmt::ForeignImport { span, .. } => *span,
+            Stmt::Expr(e) => e.span(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ForeignBinding {
     pub name: String,
