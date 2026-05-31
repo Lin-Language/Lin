@@ -27,12 +27,9 @@ impl<'ctx> Codegen<'ctx> {
     /// ignores the env, forwards `args` to `named_fn`, and boxes the concrete return into a
     /// TaggedVal*. This is the uniform calling convention every indirect/closure call uses.
     /// Shared by closure construction and default-argument descriptor entries.
-    pub(crate) fn boxed_abi_wrapper(&mut self, named_fn: FunctionValue<'ctx>) -> FunctionValue<'ctx> {
-        self.boxed_abi_wrapper_ret(named_fn, None, None)
-    }
-
-    /// As `boxed_abi_wrapper`, but with the wrapped function's true Lin return type when known.
-    /// This disambiguates a raw pointer return (Str/Array/Object — must be boxed) from an
+    ///
+    /// `lin_ret_ty` gives the wrapped function's true Lin return type when known. This
+    /// disambiguates a raw pointer return (Str/Array/Object — must be boxed) from an
     /// already-boxed Json/union return (passed through). Without it, only the LLVM return kind
     /// is available and every pointer is assumed already-boxed, which crashes the indirect
     /// caller when it unboxes a raw String*. Pass `None` for closures that already use the
@@ -155,22 +152,9 @@ impl<'ctx> Codegen<'ctx> {
         wf
     }
 
-    pub(crate) fn wrap_named_fn_as_closure_boxed(&mut self, named_fn: FunctionValue<'ctx>) -> BasicValueEnum<'ctx> {
-        self.wrap_named_fn_as_closure_boxed_desc(named_fn, None)
-    }
-
-    /// Variant of `wrap_named_fn_as_closure_boxed` that attaches a default-argument descriptor
-    /// (closure offset 32) so an indirect under-arity call on this capture-less function value
-    /// dispatches through the descriptor to the right default-fill adapter.
-    pub(crate) fn wrap_named_fn_as_closure_boxed_desc(
-        &mut self,
-        named_fn: FunctionValue<'ctx>,
-        descriptor: Option<PointerValue<'ctx>>,
-    ) -> BasicValueEnum<'ctx> {
-        self.wrap_named_fn_as_closure_boxed_desc_ret(named_fn, descriptor, None, None)
-    }
-
-    /// As `wrap_named_fn_as_closure_boxed_desc`, with the wrapped function's true Lin return
+    /// Wrap a capture-less named function as a closure value, attaching a default-argument
+    /// descriptor (closure offset 32) so an indirect under-arity call dispatches through the
+    /// descriptor to the right default-fill adapter, with the wrapped function's true Lin return
     /// type so the boxed-ABI wrapper boxes a raw Str/Array/Object return correctly.
     pub(crate) fn wrap_named_fn_as_closure_boxed_desc_ret(
         &mut self,
@@ -403,14 +387,10 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.store(gep, desc);
     }
 
-    /// Make a closure struct {i32 rc=1, i32 _pad, fn_ptr, env_ptr} with optional captured env.
-    pub(crate) fn make_closure_struct(&mut self, fn_ptr: BasicValueEnum<'ctx>, captures: &[BasicValueEnum<'ctx>]) -> BasicValueEnum<'ctx> {
-        self.make_closure_struct_desc_caps(fn_ptr, captures, None, None)
-    }
-
-    /// Like `make_closure_struct`, but also stores a default-argument descriptor pointer at
-    /// closure offset 32 (null when `descriptor` is None). The closure is allocated at 40 bytes
-    /// so the descriptor slot is always present; `lin_closure_release` frees 40 bytes to match.
+    /// Make a closure struct {i32 rc=1, i32 _pad, fn_ptr, env_ptr} with optional captured env,
+    /// also storing a default-argument descriptor pointer at closure offset 32 (null when
+    /// `descriptor` is None). The closure is allocated at 40 bytes so the descriptor slot is
+    /// always present; `lin_closure_release` frees 40 bytes to match.
     pub(crate) fn make_closure_struct_desc(
         &mut self,
         fn_ptr: BasicValueEnum<'ctx>,
