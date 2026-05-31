@@ -42,6 +42,37 @@ impl Checker {
             });
         }
 
+        // Array literal against an expected FIXED-LENGTH array type (`[T1, T2, ...]`, §8.3).
+        // Without this, the literal infers to the unbounded `T[]` (with a unioned element type
+        // for heterogeneous literals) and then fails the compatibility check against the
+        // positional type. Check arity, then push each positional expected type into the
+        // matching element so per-element literal coercion (e.g. integer width) applies.
+        if let (Expr::Array(elements, span), Type::FixedArray(expected_elems)) = (expr, expected) {
+            if elements.len() != expected_elems.len() {
+                return Err(Diagnostic::error(
+                    *span,
+                    format!(
+                        "Expected a {}-element array for type {}, got {} element(s)",
+                        expected_elems.len(),
+                        expected,
+                        elements.len(),
+                    ),
+                ));
+            }
+            let typed_elements: Result<Vec<_>, _> = elements
+                .iter()
+                .zip(expected_elems.iter())
+                .map(|(e, t)| self.check_expr(e, t))
+                .collect();
+            let typed_elements = typed_elements?;
+            let types: Vec<Type> = typed_elements.iter().map(|t| t.ty()).collect();
+            return Ok(TypedExpr::MakeArray {
+                elements: typed_elements,
+                ty: Type::FixedArray(types),
+                span: *span,
+            });
+        }
+
         // Singleton string-literal refinement (ADR-051). A bare string literal infers to
         // `String`, but when checked against an expected `StrLit("t")` it is accepted iff its
         // value equals `t`, and the resulting typed expression is narrowed to `StrLit("t")` so
