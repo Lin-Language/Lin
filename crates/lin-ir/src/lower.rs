@@ -2378,6 +2378,15 @@ fn lower_intrinsic_call(
         "lin_fs_open" => Intrinsic::StreamOpen,
         "lin_stream_read" => Intrinsic::StreamRead,
         "lin_stream_close" => Intrinsic::StreamClose,
+        "lin_stream_map" => Intrinsic::StreamMap,
+        "lin_stream_filter" => Intrinsic::StreamFilter,
+        "lin_stream_take" => Intrinsic::StreamTake,
+        "lin_stream_lines" => Intrinsic::StreamLines,
+        "lin_stream_chunks" => Intrinsic::StreamChunks,
+        "lin_stream_write" => Intrinsic::StreamWrite,
+        "lin_stream_drain" => Intrinsic::StreamDrain,
+        "lin_stream_collect" => Intrinsic::StreamCollect,
+        "lin_stream_read_text" => Intrinsic::StreamReadText,
         _ => {
             // Unknown intrinsic: lower as indirect call fallback.
             let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();

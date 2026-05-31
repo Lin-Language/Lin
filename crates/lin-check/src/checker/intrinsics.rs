@@ -224,6 +224,36 @@ impl Checker {
         self.define_intrinsic("lin_stream_close",
             Type::func(vec![Type::Stream(Box::new(Type::TypeVar(9161)))], Type::Null));
 
+        // Lazy adapters (Stage 4). Transform closures operate on BOXED items (Json-in/Json-out)
+        // so the runtime can call them uniformly regardless of the concrete item type — stream
+        // items (UInt8[] chunks, String lines, …) are all JSON-compatible. Each adapter returns a
+        // fresh `Stream` (= Stream<Json>); the opaque Stream type confines ops to this API.
+        let any_stream = || Type::Stream(Box::new(Type::TypeVar(u32::MAX)));
+        self.define_intrinsic("lin_stream_map", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::TypeVar(u32::MAX)),
+            ], any_stream()));
+        self.define_intrinsic("lin_stream_filter", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::Bool),
+            ], any_stream()));
+        self.define_intrinsic("lin_stream_take",
+            Type::func(vec![any_stream(), Type::Int32], any_stream()));
+        self.define_intrinsic("lin_stream_lines",
+            Type::func(vec![any_stream()], any_stream()));
+        self.define_intrinsic("lin_stream_chunks",
+            Type::func(vec![any_stream(), Type::Int32], any_stream()));
+        // Sink + terminals. writeStream → a sink Stream; drain → Null|Error; collect → UInt8[]|
+        // Error; readText → String|Error. All terminals consume + close the stream.
+        self.define_intrinsic("lin_stream_write",
+            Type::func(vec![any_stream(), Type::Str], any_stream()));
+        self.define_intrinsic("lin_stream_drain",
+            Type::func(vec![any_stream()], Type::Union(vec![Type::Null, crate::resolve::error_type()])));
+        self.define_intrinsic("lin_stream_collect",
+            Type::func(vec![any_stream()], Type::Union(vec![Type::Array(Box::new(Type::UInt8)), crate::resolve::error_type()])));
+        self.define_intrinsic("lin_stream_read_text",
+            Type::func(vec![any_stream()], Type::Union(vec![Type::Str, crate::resolve::error_type()])));
+
         // serve: ((Request) => Response, Int32) => Null  (spec §25.5). Handler-first so
         // `router.serve(port)` desugars to `serve(router, port)`. Blocks forever; typed Null.
         self.define_intrinsic("lin_serve", Type::func(vec![

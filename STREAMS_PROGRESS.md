@@ -149,3 +149,53 @@ Files touched:
    side is permissive, while the `u32::MAX` Json wildcard is STILL rejected (a stream must never
    widen to Json). Mirrors the existing general TypeVar-permissive rule, scoped under the Stream
    guards.
+
+---
+
+## Stage 4 — std/stream adapters + sink + .drain()
+- Commit: <pending>
+- Gate: MET. Worked CSV example produces the EXACT expected `out.csv`
+  (`a,b,c` -> `"a"|"b"|"c"`); `stdlib/stream.test.lin` green (10 tests); ASan over drain green.
+- Tests: 12 runtime stream tests (incl. 5 new adapter/drain) pass under `cargo test` AND ASan;
+  `stdlib/stream.test.lin` (10 tests) green via `lin test`; integration
+  `test_stream_csv_pipeline_drain` green; `examples/streams/main.lin` runs and prints the
+  transformed CSV. Workspace: 378 integration + all unit tests green, 0 failures.
+
+### What was added
+- `lin-runtime/src/stream.rs` — generalised the backend to a TAGGED-item model:
+  `StreamSource::read_tagged` (default wraps byte `read` into a `UInt8[]`), `pull_tagged` (the
+  single low-level pull every adapter/terminal funnels through), `TaggedOutcome`.
+  - Lazy adapters (each a new `StreamBox` owning a RETAINED ref to its upstream; closing it
+    closes+releases the upstream): `MapSource`/`FilterSource` (call a retained Lin closure via
+    the boxed-ABI `(env, boxed_arg)->boxed_ret`), `TakeSource`, `LinesSource` (byte→String line
+    framing, CRLF-tolerant, flushes a final unterminated line), `ChunksSource` (fixed-size
+    re-chunk). `LinFn` wraps a retained closure (released on Drop). `Upstream` owns+closes the
+    upstream box.
+  - Sink + terminals (sync, calling thread): `WriteSink` + `drive_sink`; `lin_stream_drain`
+    (sink → write loop; non-sink → pull-and-discard; always closes), `lin_stream_collect`
+    (→ UInt8[]|Error), `lin_stream_read_text` (→ String|Error). In-band error threading: an
+    upstream `Err` short-circuits straight to the terminal (becomes the canonical Error object).
+- `lin-ir/src/ir.rs` + `lower.rs` — `Intrinsic::Stream{Map,Filter,Take,Lines,Chunks,Write,
+  Drain,Collect,ReadText}` + name map.
+- `lin-check/src/checker/intrinsics.rs` — signatures (transform closures typed `(Json)=>Json` /
+  `(Json)=>Boolean` so the runtime calls them via the uniform boxed-closure ABI regardless of
+  the concrete item type — chunks/lines are JSON-compatible).
+- `lin-codegen/src/codegen/intrinsics.rs` — dispatch for all nine.
+- `stdlib/stream.lin` (NEW) — `readStream/lines/chunks/map/filter/take/writeStream/drain/
+  collect/readText/close`. Registered in `lin-compile` as `std/stream`.
+- `stdlib/stream.test.lin` (NEW, 10 tests), `examples/streams/main.lin` (NEW worked CSV),
+  `crates/lin/tests/integration.rs::test_stream_csv_pipeline_drain`.
+
+### Notes / surprises
+7. **Closure representation**: transform closures are typed `(Json)=>Json` and called from the
+   runtime via the BOXED closure ABI (the `__cls_wrapb_*` wrapper every function value carries —
+   it declares all params `ptr`, unboxes to the concrete param, boxes the result). So a user's
+   `(line: String): String` closure works unchanged: the wrapper unboxes the boxed String item.
+   An inline `f => …` infers `Json` params; both forms tested.
+8. **stream.map vs array.map**: `stream.map` is `Stream`-typed, so the brief example's INNER
+   `line.split(",").map(...)` (over a `String[]`) must use ARRAY map — import it `as amap`.
+   First CSV attempt crashed (huge alloc) because `.map` dot-resolved to `stream.map` over a
+   String[]; with `amap` it's correct. Worth a doc note for users; the example/test use `amap`.
+9. The chain accepts a `Stream<UInt8[]> | Error` receiver into a `Stream` param via dot-call
+   receiver leniency (a union receiver picks the matching variant). A DIRECT call `close(st)`
+   with `st: Stream|Error` does NOT type-check — use `st.close()` (dot form). Tests use dot form.

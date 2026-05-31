@@ -1,0 +1,42 @@
+// streams — the worked CSV example from the Stream<T> design (streams brief, ADR-072).
+//
+// Reads a CSV file as a lazy byte Stream, splits it into lines, drops blank lines, quotes and
+// re-joins each field, then writes the transformed rows to an output file — driven on the
+// calling thread by `.drain()`. Self-contained: it writes its own input fixture first so it
+// runs with no arguments.
+//
+// Run:   lin run examples/streams/main.lin
+// Test:  lin test examples/streams/
+
+import { print } from "std/io"
+import { readStream, lines, map, filter, writeStream, drain } from "std/stream"
+import { writeFile, readFile } from "std/fs"
+import { split, join } from "std/string"
+import { map as amap, length } from "std/array"
+
+val inPath = "/tmp/lin_streams_example_in.csv"
+val outPath = "/tmp/lin_streams_example_out.csv"
+
+// Each non-blank CSV row `a,b,c` becomes `"a"|"b"|"c"`.
+val quoteFields = (line: String): String =>
+  amap(split(line, ","), f => "\"${f}\"").join("|")
+
+val notEmpty = (line: String): Boolean =>
+  length(line) > 0
+
+// Write the input fixture, then run the lazy pipeline to completion.
+writeFile(inPath, "a,b,c\nx,y,z\n\nfoo,bar,baz")
+
+val result = readStream(inPath)
+  .lines()
+  .filter(notEmpty)
+  .map(quoteFields)
+  .writeStream(outPath)
+  .drain()
+
+// `drain` returns Null on success or an Error; surface which.
+val status = match result
+  is Error => "error: ${result["message"]}"
+  else => "ok"
+print("pipeline: ${status}")
+print(readFile(outPath))

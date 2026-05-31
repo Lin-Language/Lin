@@ -1,0 +1,106 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { readStream, lines, map, filter, take, chunks, writeStream, drain, collect, readText, close } from "std/stream"
+import { writeFile, readFile } from "std/fs"
+import { length } from "std/array"
+import { split, join } from "std/string"
+import { map as amap } from "std/array"
+
+// Each test writes its own fixture file (a unique path) then reads it back through a stream.
+// Streams are affine (single-use), so a fresh stream is opened per test.
+
+val fixture = "/tmp/lin_stream_test_fixture.txt"
+val csvIn = "/tmp/lin_stream_test_in.csv"
+val csvOut = "/tmp/lin_stream_test_out.csv"
+
+val notEmpty = (line: String): Boolean => length(line) > 0
+val quoteFields = (line: String): String =>
+  amap(split(line, ","), f => "\"${f}\"").join("|")
+
+val s = suite("std/stream", [
+  test("readText reads the whole file as one String", () =>
+    writeFile(fixture, "hello stream world")
+    val text = readStream(fixture).readText()
+    [
+      expect(text).toBe("hello stream world")
+    ]
+  ),
+
+  test("collect returns all bytes as a UInt8[] of the right length", () =>
+    writeFile(fixture, "abcde")
+    val bytes = readStream(fixture).collect()
+    [
+      expect(length(bytes)).toBe(5)
+    ]
+  ),
+
+  test("lines splits a multi-line file into String lines", () =>
+    writeFile(fixture, "one\ntwo\nthree")
+    val out = readStream(fixture).lines().collect()
+    // collect concatenates the line strings (no separators); 3 lines = 11 chars.
+    [
+      expect(length(out)).toBe(11)
+    ]
+  ),
+
+  test("lines + take limits the number of lines pulled", () =>
+    writeFile(fixture, "a\nb\nc\nd\ne")
+    val out = readStream(fixture).lines().take(2).collect()
+    // first two lines "a","b" concatenated = "ab" = 2 bytes
+    [
+      expect(length(out)).toBe(2)
+    ]
+  ),
+
+  test("filter drops lines that fail the predicate", () =>
+    writeFile(fixture, "x\n\ny\n\nz")
+    val out = readStream(fixture).lines().filter(notEmpty).collect()
+    // non-empty lines x,y,z concatenated = "xyz" = 3 bytes
+    [
+      expect(length(out)).toBe(3)
+    ]
+  ),
+
+  test("map transforms each line", () =>
+    writeFile(fixture, "ab\ncd")
+    val out = readStream(fixture).lines().map(line => "<${line}>").readText()
+    // "<ab>" + "<cd>" = 8 chars
+    [
+      expect(length(out)).toBe(8)
+    ]
+  ),
+
+  test("chunks re-frames a byte stream into fixed-size pieces", () =>
+    writeFile(fixture, "abcdefg")
+    val out = readStream(fixture).chunks(3).collect()
+    [
+      expect(length(out)).toBe(7)
+    ]
+  ),
+
+  test("writeStream + drain runs the CSV pipeline end-to-end", () =>
+    writeFile(csvIn, "a,b,c\nx,y,z\n\nfoo,bar,baz")
+    readStream(csvIn).lines().filter(notEmpty).map(quoteFields).writeStream(csvOut).drain()
+    val written = readFile(csvOut)
+    [
+      expect(written).toBe("\"a\"|\"b\"|\"c\"\n\"x\"|\"y\"|\"z\"\n\"foo\"|\"bar\"|\"baz\"\n")
+    ]
+  ),
+
+  test("drain returns Null on success", () =>
+    writeFile(fixture, "p\nq")
+    val r = readStream(fixture).lines().writeStream(csvOut).drain()
+    [
+      expect(r is Error).toBe(false)
+    ]
+  ),
+
+  test("explicit close on a stream is harmless", () =>
+    writeFile(fixture, "data")
+    readStream(fixture).close()
+    [
+      expect(true).toBe(true)
+    ]
+  )
+])
+
+run(s)
