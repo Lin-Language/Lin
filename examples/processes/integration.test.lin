@@ -1,15 +1,25 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { runAll } from "./task"
 import { summarize, render } from "./report"
+import { exec } from "std/process"
 import { contains } from "std/string"
 
-// End-to-end: run a real mixed task list through the whole pipeline (spawn each
-// subprocess → classify → summarize → render) and assert the rolled-up outcome.
+// End-to-end: a mixed task list through the whole pipeline (run each → classify →
+// summarize → render). `exec` is mocked (ADR-071) so the run is deterministic and
+// hermetic — no real subprocesses, no dependence on which binaries the host has or
+// on platform exit-code conventions, and the "command could not launch" case (an
+// Error return) is reproduced exactly, which a real `exec` cannot do portably.
+replace exec = (command: String, args: String[]): Json =>
+  if command == "printf" then { "status": 0, "stdout": "hi", "stderr": "" }
+  else if command == "true" then { "status": 0, "stdout": "", "stderr": "" }
+  else if command == "false" then { "status": 1, "stdout": "", "stderr": "" }
+  else { "type": "error", "message": "command not found" }
+
 val tasks = [
   { "name": "echo",    "command": "printf", "args": ["hi"] },
   { "name": "ok",      "command": "true",   "args": [] },
   { "name": "bad",     "command": "false",  "args": [] },
-  { "name": "missing", "command": "definitely-not-a-real-command-xyz", "args": [] }
+  { "name": "missing", "command": "nope",   "args": [] }
 ]
 
 val s = suite("processes integration", [

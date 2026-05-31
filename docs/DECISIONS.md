@@ -1039,6 +1039,7 @@ test-only + intrinsic/unused diagnostics).
   sidesteps it and is sufficient for a test helper.
 - **`run` now delegates to `report`**, the non-exiting variant (`(Suite) => Int32`) added for
   guaranteed afterAll teardown — `run(s) = if report(s) > 0 then exit(1) else null`.
-- A worked project lives at `examples/mocking/` (clock + store + logger), and the feature is
+- Worked examples: `examples/processes/` (mock `exec`), `examples/dijkstra/` (mock `std/fs`), and
+  `examples/web-server/` (mock `render`) — each replaces a side-effecting dependency in its tests; the feature is
   documented in docs/SPECIFICATION.md §22.1–22.2, docs/STDLIB.md (std/test), and the doc-site
   Testing tutorial.
