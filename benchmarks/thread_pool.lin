@@ -5,8 +5,11 @@
 // workers), as opposed to async's spawn-per-call. Each task is trivial, so the
 // time is dominated by queue/dispatch overhead, amortized over a real worker pool.
 import { print } from "std/io"
+
 import { toString } from "std/string"
+
 import { await, threadPool, poolAsync } from "std/async"
+
 import { push, for, range } from "std/array"
 
 val pool = threadPool(8)
@@ -14,10 +17,12 @@ val pool = threadPool(8)
 // Submit many trivial tasks, collecting their promises (the thunk `() => 1`
 // captures nothing — submitted, queued, and run by a pool worker).
 var promises = []
+
 range(0, 20000).for(i => push(promises, pool.poolAsync(() => 1)))
 
 // Drain: await every promise and sum the results.
 var total = 0
+
 promises.for(p => total = total + await(p))
 
 print(toString(total))

@@ -11,39 +11,29 @@ import foreign "lin-runtime"
   val lin_path_resolve: (String) => String
   val lin_string_split: (String, String) => String[]
 
-export val basename = (p: String): String =>
-  lin_path_basename(p)
+export val basename = (p: String): String => lin_path_basename(p)
 
-export val dirname = (p: String): String =>
-  lin_path_dirname(p)
+export val dirname = (p: String): String => lin_path_dirname(p)
 
-export val extname = (p: String): String =>
-  lin_path_extname(p)
+export val extname = (p: String): String => lin_path_extname(p)
 
-export val stem = (p: String): String =>
-  lin_path_stem(p)
+export val stem = (p: String): String => lin_path_stem(p)
 
-export val isAbsolute = (p: String): Boolean =>
-  lin_path_is_absolute(p)
+export val isAbsolute = (p: String): Boolean => lin_path_is_absolute(p)
 
-export val normalize = (p: String): String =>
-  lin_path_normalize(p)
+export val normalize = (p: String): String => lin_path_normalize(p)
 
-export val resolve = (p: String): String =>
-  lin_path_resolve(p)
+export val resolve = (p: String): String => lin_path_resolve(p)
 
 export val join = (parts: String[]): String =>
   val n = lin_length(parts)
-  if n == 0 then ""
+  if n == 0 then
+    ""
   else
     var result = parts[0]
-    range(1, n).for(i =>
-      result = lin_path_join2(result, parts[i])
-    )
+    range(1, n).for(i => result = lin_path_join2(result, parts[i]))
     normalize(result)
 
-export val split = (p: String): String[] =>
-  lin_string_split(p, "/")
+export val split = (p: String): String[] => lin_string_split(p, "/")
 
-export val relative = (from: String, to: String): String =>
-  to
+export val relative = (_: String, to: String): String => to

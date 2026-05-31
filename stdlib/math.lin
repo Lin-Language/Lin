@@ -31,33 +31,61 @@ import foreign "lin-runtime"
   val lin_math_to_fixed: (Float64, Int64) => String
 
 export val PI = lin_math_pi()
+
 export val E = lin_math_e()
+
 export val INFINITY = lin_math_infinity()
+
 export val NAN = lin_math_nan()
 
 export val floor = (x: Float64): Float64 => lin_math_floor(x)
+
 export val ceil = (x: Float64): Float64 => lin_math_ceil(x)
+
 export val round = (x: Float64): Float64 => lin_math_round(x)
+
 export val trunc = (x: Float64): Float64 => lin_math_trunc(x)
+
 export val sqrt = (x: Float64): Float64 => lin_math_sqrt(x)
+
 export val pow = (base: Float64, exp: Float64): Float64 => lin_math_pow(base, exp)
+
 export val exp = (x: Float64): Float64 => lin_math_exp(x)
+
 export val log = (x: Float64): Float64 => lin_math_log(x)
+
 export val log2 = (x: Float64): Float64 => lin_math_log2(x)
+
 export val log10 = (x: Float64): Float64 => lin_math_log10(x)
+
 export val sin = (x: Float64): Float64 => lin_math_sin(x)
+
 export val cos = (x: Float64): Float64 => lin_math_cos(x)
+
 export val tan = (x: Float64): Float64 => lin_math_tan(x)
+
 export val asin = (x: Float64): Float64 => lin_math_asin(x)
+
 export val acos = (x: Float64): Float64 => lin_math_acos(x)
+
 export val atan = (x: Float64): Float64 => lin_math_atan(x)
+
 export val atan2 = (y: Float64, x: Float64): Float64 => lin_math_atan2(y, x)
+
 export val abs = (x: Float64): Float64 => lin_math_abs_f64(x)
+
 export val min = (a: Float64, b: Float64): Float64 => lin_math_min_f64(a, b)
+
 export val max = (a: Float64, b: Float64): Float64 => lin_math_max_f64(a, b)
+
 export val clamp = (x: Float64, lo: Float64, hi: Float64): Float64 => lin_math_clamp(x, lo, hi)
+
 export val sign = (x: Float64): Int64 => lin_math_sign(x)
+
 export val isNaN = (x: Float64): Boolean => lin_math_is_nan(x)
+
 export val isFinite = (x: Float64): Boolean => lin_math_is_finite(x)
+
 export val random = (): Float64 => lin_math_random()
+
 export val toFixed = (x: Float64, decimals: Int64): String => lin_math_to_fixed(x, decimals)

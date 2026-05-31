@@ -29,7 +29,9 @@ Environment variables for `lin build`:
 - `LIN_EMIT_IR=1` — write the LLVM IR (`.ll`) alongside the binary
 - `LIN_NO_OPT=1` — skip LLVM optimisation passes (faster builds, slower output)
 
-CI runs on GitHub Actions (`.github/workflows/ci.yml`): `cargo build`, `cargo test --workspace`, and all non-network `examples/*.lin` on every push. There is no formatter wired up yet. There is no `cargo` available at the system shell at the time of writing — assume the user runs commands themselves.
+CI runs on GitHub Actions (`.github/workflows/ci.yml`): `cargo build`, `cargo test --workspace`, `lin fmt --check` over `stdlib/`/`examples/`/`benchmarks/`, and all non-network `examples/*.lin` on every push. There is no `cargo` available at the system shell at the time of writing — assume the user runs commands themselves.
+
+A source formatter exists: `cargo run -p lin -- fmt <paths>` rewrites `.lin` files to canonical form in place; `lin fmt --check <paths>` verifies without writing (used by CI). It is comment-preserving and AST-faithful — it must never change program meaning, which is enforced by the corpus type-check + run-equivalence gate in the formatter tests (`crates/lin/tests/integration.rs`). See ADR-040 (reversed) for comment handling.
 
 ## Workspace layout
 

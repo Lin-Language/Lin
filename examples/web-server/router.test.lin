@@ -1,28 +1,28 @@
 import { expect, toBe, test, suite, run } from "std/test"
+
 import { HttpRequest as Request } from "std/http"
+
 import { router } from "./router"
 
 val makeReq = (path: String): Request =>
-  { "method": "GET", "path": path, "query": "", "headers": {}, "body": "" }
+  {
+    "method": "GET",
+    "path": path,
+    "query": "",
+    "headers": {},
+    "body": "",
+  }
 
 val s = suite("router", [
   test("routes /api/status to 200", () =>
     val resp = router(makeReq("/api/status"))
-    [
-      expect(resp["status"]).toBe(200)
-    ]
-  ),
+    [expect(resp["status"]).toBe(200)]),
   test("routes /users/:id to 200", () =>
     val resp = router(makeReq("/users/5"))
-    [
-      expect(resp["status"]).toBe(200)
-    ]
-  ),
+    [expect(resp["status"]).toBe(200)]),
   test("unknown path returns 404", () =>
     val resp = router(makeReq("/unknown/path"))
-    [
-      expect(resp["status"]).toBe(404)
-    ]
-  ),
+    [expect(resp["status"]).toBe(404)]),
 ])
+
 run(s)

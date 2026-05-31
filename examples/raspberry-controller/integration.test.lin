@@ -1,9 +1,15 @@
 import { suite, test, expect, run, toBe } from "std/test"
+
 import { clampSpeed, applyKey } from "./main"
+
 import { encodePacket, parsePacket } from "./protocol"
+
 import { motorCommand, MotorCommand } from "./motor"
+
 import { parseNals, NalUnit } from "./nal"
+
 import { packetize, nextSequence } from "./rtp"
+
 import { length } from "std/array"
 
 // End-to-end RC-car system test. Composes the four modules into the two real
@@ -18,72 +24,96 @@ import { length } from "std/array"
 //     parseNals(buffer) -> packetize(nal) -> RTP packets, seq threaded
 //
 // Unit suites cover each module in isolation; this asserts they wire together.
-
 val s = suite("raspberry-controller integration", [
-  // Drive the whole control path: a 'q' keypress (left +0.1) then a 'w' keypress
-  // (right +0.1), encode the resulting pair into the 8-byte wire packet, decode it
-  // as the server would, and map each decoded speed to a PWM motor command.
   test("control path: keypress -> encode -> decode -> motor PWM", () =>
-    val afterQ: Float64[] = applyKey(113, 0.0, 0.0)          // q: left -> 0.1
+    // Drive the whole control path: a 'q' keypress (left +0.1) then a 'w' keypress
+    // (right +0.1), encode the resulting pair into the 8-byte wire packet, decode it
+    // as the server would, and map each decoded speed to a PWM motor command.
+    val afterQ: Float64[] = applyKey(113, 0.0, 0.0) // q: left -> 0.1
     val afterW: Float64[] = applyKey(119, afterQ[0], afterQ[1]) // w: right -> 0.1
     val packet: UInt8[] = encodePacket(afterW[0], afterW[1])
-    val decoded: Float64[] = parsePacket(packet)             // server-side decode
+    val decoded: Float64[] = parsePacket(packet) // server-side decode
     val leftCmd: MotorCommand = motorCommand(decoded[0])
     val rightCmd: MotorCommand = motorCommand(decoded[1])
     [
       expect(afterW[0]).toBe(0.1),
       expect(afterW[1]).toBe(0.1),
-      expect(length(packet)).toBe(8),                        // two big-endian f32
-      // 0.1 is not f32-exact, so the decoded speed is ~0.1 (not == 0.1); assert
-      // the wire round-trips through the motor mapping, whose round() absorbs it.
-      expect(decoded[0] > 0.0).toBe(true),                   // forward after round-trip
+      expect(length(packet)).toBe(8),
+      expect(decoded[0] > 0.0).toBe(true),
       expect(decoded[1] > 0.0).toBe(true),
-      expect(leftCmd["channel"]).toBe("rpwm"),               // forward -> rpwm
-      expect(leftCmd["duty"]).toBe(100),                     // round(0.1 * 1000)
+      expect(leftCmd["channel"]).toBe("rpwm"),
+      expect(leftCmd["duty"]).toBe(100),
       expect(rightCmd["channel"]).toBe("rpwm"),
-      expect(rightCmd["duty"]).toBe(100)
-    ]
-  ),
-
-  // Reverse + stop through the same path: 'a' steps left negative, then 'space'
-  // stops both. Decode and confirm the motor sees a full stop.
+      expect(rightCmd["duty"]).toBe(100),
+    ]),
   test("control path: reverse then stop maps to lpwm then stop", () =>
-    val rev: Float64[] = applyKey(97, 0.0, 0.0)              // a: left -> -0.1
+    // two big-endian f32
+    // 0.1 is not f32-exact, so the decoded speed is ~0.1 (not == 0.1); assert
+    // the wire round-trips through the motor mapping, whose round() absorbs it.
+    // forward after round-trip
+    // forward -> rpwm
+    // round(0.1 * 1000)
+    // Reverse + stop through the same path: 'a' steps left negative, then 'space'
+    // stops both. Decode and confirm the motor sees a full stop.
+    val rev: Float64[] = applyKey(97, 0.0, 0.0) // a: left -> -0.1
     val revCmd: MotorCommand = motorCommand(parsePacket(encodePacket(rev[0], rev[1]))[0])
-    val stopped: Float64[] = applyKey(32, rev[0], rev[1])    // space: stop
+    val stopped: Float64[] = applyKey(32, rev[0], rev[1]) // space: stop
     val stopPkt: UInt8[] = encodePacket(stopped[0], stopped[1])
     val stopDec: Float64[] = parsePacket(stopPkt)
     val stopCmd: MotorCommand = motorCommand(stopDec[0])
     [
-      expect(revCmd["channel"]).toBe("lpwm"),                // reverse -> lpwm
+      expect(revCmd["channel"]).toBe("lpwm"),
       expect(revCmd["duty"]).toBe(100),
       expect(stopDec[0]).toBe(0.0),
       expect(stopDec[1]).toBe(0.0),
       expect(stopCmd["channel"]).toBe("stop"),
-      expect(stopCmd["duty"]).toBe(0)
-    ]
-  ),
-
-  // Drive the video path: parse a small Annex-B buffer into NAL units, then
-  // RTP-packetize the first (small) NAL, threading the sequence number forward.
+      expect(stopCmd["duty"]).toBe(0),
+    ]),
   test("video path: parse Annex-B stream -> RTP packetize", () =>
-    val buf: UInt8[] = [0, 0, 0, 1, 0x67, 0xAA, 0xBB, 0, 0, 0, 1, 0x68, 0xCC, 0, 0, 0, 1, 0x41]
-    val nals: NalUnit[] = parseNals(buf)                     // emits 2 complete NALs
+    // reverse -> lpwm
+    // Drive the video path: parse a small Annex-B buffer into NAL units, then
+    // RTP-packetize the first (small) NAL, threading the sequence number forward.
+    val buf: UInt8[] = [
+      0,
+      0,
+      0,
+      1,
+      103,
+      170,
+      187,
+      0,
+      0,
+      0,
+      1,
+      104,
+      204,
+      0,
+      0,
+      0,
+      1,
+      65,
+    ]
+    val nals: NalUnit[] = parseNals(buf) // emits 2 complete NALs
     val firstNal: UInt8[] = nals[0]["data"]
-    val packets = packetize(0, 0, 0x12345678, firstNal, false)
+    val packets = packetize(0, 0, 305419896, firstNal, false)
     val seqAfter = nextSequence(0, firstNal)
     val pkt: UInt8[] = packets[0]
     [
-      expect(length(nals)).toBe(2),                          // SPS(7) + PPS(8), 0x41 flushes
+      expect(length(nals)).toBe(2),
       expect(nals[0]["nalType"]).toBe(7),
       expect(nals[1]["nalType"]).toBe(8),
-      expect(length(packets)).toBe(1),                       // small NAL -> single packet
-      expect(pkt[0]).toBe(0x80),                             // RTP V=2
-      expect(pkt[8]).toBe(0x12),                             // SSRC big-endian
-      expect(pkt[12]).toBe(0x67),                            // payload = NAL verbatim
-      expect(seqAfter).toBe(1)                               // sequence advanced by 1
-    ]
-  ),
+      expect(length(packets)).toBe(1),
+      expect(pkt[0]).toBe(128),
+      expect(pkt[8]).toBe(18),
+      expect(pkt[12]).toBe(103),
+      expect(seqAfter).toBe(1),
+    ]),
 ])
 
+// SPS(7) + PPS(8), 0x41 flushes
+// small NAL -> single packet
+// RTP V=2
+// SSRC big-endian
+// payload = NAL verbatim
+// sequence advanced by 1
 run(s)

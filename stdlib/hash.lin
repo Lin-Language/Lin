@@ -1,2 +1,1 @@
-export val hash = (x: Json): String =>
-  lin_value_key(x)
+export val hash = (x: Json): String => lin_value_key(x)

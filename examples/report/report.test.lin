@@ -3,9 +3,10 @@
 // validRecords / parseErrors / stats are exercised in isolation (map/filter/
 // reduce/sort churn over heap records). Row-parsing lives in parse.test.lin and
 // the end-to-end render lives in integration.test.lin.
-
 import { expect, toBe, test, suite, run } from "std/test"
+
 import { validRecords, parseErrors, stats } from "./report"
+
 import { length } from "std/array"
 
 val sample = [
@@ -14,42 +15,29 @@ val sample = [
   "bad-row",
   "Charlie, 78",
   ", 50",
-  "Diana, 100"
+  "Diana, 100",
 ]
 
 val s = suite("report", [
-  // --- Splitting valid from invalid ---
-  test("keeps only the valid records", () => [
-    expect(length(validRecords(sample))).toBe(4)
-  ]),
-  test("collects the parse errors", () => [
-    expect(length(parseErrors(sample))).toBe(2)
-  ]),
-  test("all-invalid input yields zero valid records", () => [
-    expect(length(validRecords(["x", "y", "z"]))).toBe(0)
-  ]),
-
-  // --- Statistics over the valid records ---
-  test("computes count over valid records", () => [
-    expect(stats(validRecords(sample))["count"]).toBe(4)
-  ]),
-  test("sums scores via reduce", () => [
-    expect(stats(validRecords(sample))["total"]).toBe(355)
-  ]),
-  test("computes the integer average", () => [
-    expect(stats(validRecords(sample))["average"]).toBe(88)
-  ]),
-  test("finds the top scorer", () => [
-    expect(stats(validRecords(sample))["top"]).toBe("Diana")
-  ]),
+  test("keeps only the valid records", () =>
+    // --- Splitting valid from invalid ---
+    [expect(length(validRecords(sample))).toBe(4)]),
+  test("collects the parse errors", () => [expect(length(parseErrors(sample))).toBe(2)]),
+  test("all-invalid input yields zero valid records", () => [expect(length(validRecords(["x", "y", "z"]))).toBe(0)]),
+  test("computes count over valid records", () =>
+    // --- Statistics over the valid records ---
+    [expect(stats(validRecords(sample))["count"]).toBe(4)]),
+  test("sums scores via reduce", () => [expect(stats(validRecords(sample))["total"]).toBe(355)]),
+  test("computes the integer average", () => [expect(stats(validRecords(sample))["average"]).toBe(88)]),
+  test("finds the top scorer", () => [expect(stats(validRecords(sample))["top"]).toBe("Diana")]),
   test("empty input yields zero stats", () =>
     val st = stats(validRecords([]))
     [
       expect(st["count"]).toBe(0),
       expect(st["total"]).toBe(0),
       expect(st["average"]).toBe(0),
-      expect(st["top"]).toBe("")
-    ]
-  ),
+      expect(st["top"]).toBe(""),
+    ]),
 ])
+
 run(s)

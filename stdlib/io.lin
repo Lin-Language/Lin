@@ -5,27 +5,20 @@ import foreign "lin-runtime"
   val lin_io_print_err: (String) => Null
   val lin_io_args: () => String[]
 
-export val readLine = (): Json =>
-  lin_io_read_line()
+export val readLine = (): Json => lin_io_read_line()
 
-export val readAll = (): String =>
-  lin_io_read_all()
+export val readAll = (): String => lin_io_read_all()
 
-export val lines = (): String[] =>
-  lin_io_lines()
+export val lines = (): String[] => lin_io_lines()
 
-export val print = (x: Json): Null =>
-  lin_print(x)
+export val print = (x: Json): Null => lin_print(x)
 
-export val printErr = (x: Json): Null =>
-  lin_io_print_err(lin_to_string(x))
+export val printErr = (x: Json): Null => lin_io_print_err(lin_to_string(x))
 
-export val args = (): String[] =>
-  lin_io_args()
+export val args = (): String[] => lin_io_args()
 
 export val prompt = (message: String): Json =>
   print(message)
   readLine()
 
-export val exit = (code: Int32): Null =>
-  lin_exit(code)
+export val exit = (code: Int32): Null => lin_exit(code)

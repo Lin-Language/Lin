@@ -57,6 +57,13 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      - name: Check formatting
+        # The formatter is comment-preserving and AST-faithful (see ADR-040 reversal).
+        # `--check` exits non-zero if any stdlib/example/benchmark .lin is not canonical,
+        # so formatting can't drift. Run on Linux only — output is platform-independent.
+        if: runner.os == 'Linux'
+        run: cargo run -p lin -- fmt --check stdlib/ examples/ benchmarks/
+
       - name: Test
         run: cargo test --workspace
 
