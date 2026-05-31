@@ -468,6 +468,28 @@ range(1, 4).for(i => print(toString(i)))
     assert_eq!(output, vec!["1", "2", "3"]);
 }
 
+// Regression: elements of a `split()` (and `lines()`) result must iterate correctly under the
+// generic `for`/`map` path. `lin_string_split` previously pushed each element with tag 0
+// (TAG_NULL) instead of TAG_STR, so generic iteration read every element as `null` (index access
+// happened to work because codegen knew the static String[] element type). The runtime now tags
+// split elements TAG_STR, so `.for`/`.map` see the real strings.
+#[test]
+fn test_split_result_iterates_as_strings() {
+    let output = run(r#"import { print } from "std/io"
+import { split } from "std/string"
+import { for, map } from "std/array"
+
+val parts = split("alpha,beta,gamma", ",")
+parts.for(s => print(s))
+val wrapped = parts.map(s => "<${s}>")
+wrapped.for(s => print(s))
+"#);
+    assert_eq!(
+        output,
+        vec!["alpha", "beta", "gamma", "<alpha>", "<beta>", "<gamma>"]
+    );
+}
+
 // Regression: a top-level mutable `var` accumulated from inside a `.for` loop body closure.
 // The closure can't see main's SSA temps, so the var must be a module global written via
 // GlobalValSet and read via GlobalValGet; and `acc + i` must unbox the boxed (TypeVar) loop

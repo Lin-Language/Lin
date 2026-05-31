@@ -412,13 +412,17 @@ pub unsafe extern "C" fn lin_string_repeat(s: *const LinString, count: i32) -> *
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_split(s: *const LinString, delimiter: *const LinString) -> *mut crate::array::LinArray {
     use crate::array::{lin_array_alloc, lin_array_push};
+    use crate::tagged::TAG_STR;
     let st = (*s).as_str();
     let delim = (*delimiter).as_str();
     let arr = lin_array_alloc(4);
     for part in st.split(delim) {
         let part_str = lin_string_from_bytes(part.as_ptr(), part.len() as u32);
         let cell = &part_str as *const *mut LinString as *const u8;
-        lin_array_push(arr, cell, 0);
+        // Tag each element TAG_STR (not 0/TAG_NULL): the array owns the fresh string.
+        // A wrong tag makes generic iteration (for/map) read the element as null and
+        // leaks the string on array release.
+        lin_array_push(arr, cell, TAG_STR);
     }
     arr
 }
