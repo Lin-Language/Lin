@@ -2490,7 +2490,7 @@ print(toString(result))
 
 #[test]
 fn test_await_result_must_handle_error() {
-    // §32.2.2 enforcement (ADR-070): await yields `T | Error`, so assigning it to a bare
+    // §32.2.2 enforcement (ADR-065): await yields `T | Error`, so assigning it to a bare
     // binding that does not handle the Error case is a compile-time type error. The diagnostic
     // names the union vs. the bare target. (Goes through the full `build` pipeline because the
     // standalone `check` subcommand does not resolve imports.)
