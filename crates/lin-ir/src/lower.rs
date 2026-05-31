@@ -20,14 +20,29 @@ use crate::ir::*;
 /// (e.g. a generic call whose type parameters cannot be inferred). Diagnostics are empty for
 /// ordinary modules and for well-formed generic programs.
 pub fn lower_module(module: &TypedModule) -> (LinModule, Vec<lin_common::Diagnostic>) {
-    // Monomorphization: materialize concrete copies of single-module generic functions
-    // (e.g. `identity$Int32`) and route calls to them BEFORE lowering, so the backend emits
-    // native unboxed scalars. The clone is taken only when the module actually has a generic
-    // function; ordinary modules skip it entirely and lower byte-for-byte as before.
+    let no_imports: HashMap<String, TypedModule> = HashMap::new();
+    lower_module_with_imports(module, &no_imports)
+}
+
+/// Like `lower_module`, but with access to the importing program's already-typed imported modules.
+/// This lets the monomorphizer specialize generic functions that live in an IMPORTED module
+/// (including stdlib): a call to an imported generic is specialized in THIS module by cloning and
+/// re-homing the imported body (see `monomorphize_with_imports`). Cross-module generic
+/// instantiation is the whole point of the generics milestone — `range(0,n).map(x=>x*2)…` lowers
+/// to a flat unboxed Int32 pipeline because `map`/`filter`/`reduce` specialize at `Int32` here.
+pub fn lower_module_with_imports(
+    module: &TypedModule,
+    imports: &HashMap<String, TypedModule>,
+) -> (LinModule, Vec<lin_common::Diagnostic>) {
+    // Monomorphization: materialize concrete copies of generic functions (single-module
+    // `identity$Int32` AND cross-module `std_array_map$…`) and route calls to them BEFORE lowering,
+    // so the backend emits native unboxed scalars. The clone is taken only when the module actually
+    // uses a generic function (its own or an imported one); ordinary modules skip it entirely and
+    // lower byte-for-byte as before.
     let mut diagnostics = Vec::new();
-    let owned: Option<TypedModule> = if crate::monomorphize::module_has_generic_fn(module) {
+    let owned: Option<TypedModule> = if crate::monomorphize::module_uses_generic(module, imports) {
         let mut m = module.clone();
-        diagnostics = crate::monomorphize::monomorphize(&mut m);
+        diagnostics = crate::monomorphize::monomorphize_with_imports(&mut m, imports);
         Some(m)
     } else {
         None
@@ -134,6 +149,20 @@ pub fn lower_module(module: &TypedModule) -> (LinModule, Vec<lin_common::Diagnos
 /// through `global_fn_slots` (Direct calls to the mangled symbols); cross-module imports,
 /// foreign bindings, and intrinsics resolve exactly as in the main lowering.
 pub fn lower_import_module(module: &TypedModule, module_key: &str) -> LinModule {
+    // Monomorphize this import's OWN single-module generic sibling calls (e.g. stdlib `sum`/`min`
+    // calling the now-generic `reduce`). Without this, a sibling call to a generic gets a concrete
+    // `result_type` from the checker but lowers to the boxed generic symbol — a representation
+    // mismatch that crashes codegen. Generic originals are all KEPT (external importers may issue a
+    // boxed `Named` call to them). No-op for an import with no generic functions (byte-identical).
+    let owned: Option<TypedModule> = if crate::monomorphize::module_has_generic_fn(module) {
+        let mut m = module.clone();
+        let _ = crate::monomorphize::monomorphize_import(&mut m);
+        Some(m)
+    } else {
+        None
+    };
+    let module: &TypedModule = owned.as_ref().unwrap_or(module);
+
     let mut ctx = LowerCtx::new();
     ctx.intrinsics = module.intrinsics.clone();
 
