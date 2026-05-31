@@ -5495,6 +5495,103 @@ main()
     assert_eq!(out, vec!["ok:Ada", "err"]);
 }
 
+// ── `is <ObjectType>` deep type validation (ADR-053) ──────────────────────────
+
+#[test]
+fn test_is_objecttype_deep_rejects_wrong_field_type() {
+    // ADR-053: `is Person` deep-validates field TYPES, not just presence (ADR-050). A Json value
+    // whose `age` is a string (both keys present, WRONG type) must NOT match Person, so the arm
+    // falls through to `else` instead of narrowing and operating on the wrong runtime type.
+    let out = run(r#"import { print } from "std/io"
+type Person = { "name": String, "age": Int32 }
+type Box = { "data": Json }
+val main = (): Null =>
+  val bad: Box = { "data": { "name": "ok", "age": "not-an-int" } }
+  val v: Json = bad["data"]
+  print(if v is Person then "WRONG-MATCH" else "rejected")
+  val good: Box = { "data": { "name": "ok", "age": 5 } }
+  val w: Json = good["data"]
+  print(if w is Person then "matched" else "WRONG-NO-MATCH")
+main()
+"#);
+    assert_eq!(out, vec!["rejected", "matched"]);
+}
+
+#[test]
+fn test_is_objecttype_deep_nested() {
+    // ADR-053: deep validation recurses into NESTED object fields. A wrong type in a nested field
+    // (zip as a string) is rejected; a correct nested value matches.
+    let out = run(r#"import { print } from "std/io"
+type T = { "addr": { "zip": Int32 } }
+type Box = { "data": Json }
+val main = (): Null =>
+  val bad: Box = { "data": { "addr": { "zip": "oops" } } }
+  val v: Json = bad["data"]
+  print(if v is T then "WRONG" else "nested-rejected")
+  val good: Box = { "data": { "addr": { "zip": 90210 } } }
+  val w: Json = good["data"]
+  print(if w is T then "nested-matched" else "WRONG")
+main()
+"#);
+    assert_eq!(out, vec!["nested-rejected", "nested-matched"]);
+}
+
+#[test]
+fn test_is_objecttype_deep_accepts_valid_and_narrows() {
+    // ADR-053: a fully well-typed value matches AND the narrowed field access is sound — `v["age"]`
+    // is a real Int32, so `v["age"] + 1` produces a correct number (the unsoundness ADR-050's note
+    // left open is closed).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Person = { "name": String, "age": Int32 }
+type Box = { "data": Json }
+val main = (): Null =>
+  val b: Box = { "data": { "name": "Ada", "age": 36 } }
+  val v: Json = b["data"]
+  if v is Person then print("age+1=${toString(v["age"] + 1)}") else print("no")
+main()
+"#);
+    assert_eq!(out, vec!["age+1=37"]);
+}
+
+#[test]
+fn test_is_objecttype_deep_number_policy() {
+    // ADR-053 inherits fromJson's number policy: a non-integral number fails an Int target;
+    // an integral float (5.0) satisfies it.
+    let out = run(r#"import { print } from "std/io"
+type N = { "n": Int32 }
+type Box = { "data": Json }
+val main = (): Null =>
+  val frac: Box = { "data": { "n": 3.14 } }
+  val v: Json = frac["data"]
+  print(if v is N then "WRONG-frac" else "frac-rejected")
+  val whole: Box = { "data": { "n": 5.0 } }
+  val w: Json = whole["data"]
+  print(if w is N then "integral-matched" else "WRONG-int")
+main()
+"#);
+    assert_eq!(out, vec!["frac-rejected", "integral-matched"]);
+}
+
+#[test]
+fn test_is_error_still_discriminates_after_deep() {
+    // ADR-053 regression: `is Error` (a value-constrained object pattern, NOT TypeCheckDeep) is
+    // untouched and still discriminates a decode failure from a decoded value, in either arm order.
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val describe = (r: Person | Error): Null =>
+  match r
+    is Error => print("err")
+    is Person => print("ok:${r["name"]}")
+val main = (): Null =>
+  describe(Person.fromJson({ "name": "Ada", "age": 36 }))
+  describe(Person.fromJson({ "name": "Bob", "age": "old" }))
+main()
+"#);
+    assert_eq!(out, vec!["ok:Ada", "err"]);
+}
+
 // ── singleton string-literal types (ADR-051) ──────────────────────────────────
 
 #[test]

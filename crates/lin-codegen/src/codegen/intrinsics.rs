@@ -635,7 +635,7 @@ impl<'ctx> Codegen<'ctx> {
     /// keys are inlined (length-prefixed UTF-8); recursion uses absolute byte offsets into the
     /// same blob, so recursive/cyclic types terminate. `named_defs` supplies the resolved bodies
     /// of every `Named` type reachable from `target` (codegen has no type environment).
-    fn emit_from_json_descriptor(
+    pub(crate) fn emit_from_json_descriptor(
         &self,
         target: &Type,
         named_defs: &[(String, Type)],

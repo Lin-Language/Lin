@@ -288,3 +288,15 @@ pub unsafe extern "C" fn lin_from_json(value: *const u8, desc: *const u8) -> *mu
         Err(msg) => make_decode_error(&msg, &path),
     }
 }
+
+/// Deep structural type test for `is <ObjectType>` (ADR-053). Runs the SAME validator the
+/// `fromJson` decoder uses (`validate`) against the schema descriptor `desc` and returns
+/// `1` when `value` fully conforms to the target type (recursively, with fromJson's number
+/// policy), `0` otherwise. The input is borrowed (never cloned/consumed); the descriptor is a
+/// static const global. The mismatch error string is discarded (cold path).
+#[no_mangle]
+pub unsafe extern "C" fn lin_matches_schema(value: *const u8, desc: *const u8) -> u8 {
+    let d = Desc { base: desc };
+    let mut p = String::new();
+    validate(value, &d, 0, &mut p).is_ok() as u8
+}

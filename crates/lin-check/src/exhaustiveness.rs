@@ -69,10 +69,11 @@ fn check_union_exhaustiveness(
 ) -> Vec<Diagnostic> {
     // Collect all types that are explicitly covered by `is T` arms.
     let covered: Vec<&Type> = arms.iter().filter_map(|a| {
-        if let TypedMatchPattern::Is(TypedPattern::TypeCheck(ty, _)) = &a.pattern {
-            Some(ty)
-        } else {
-            None
+        // `TypeCheckDeep` (ADR-053, `is <ObjectType>`) covers its variant exactly like `TypeCheck`.
+        match &a.pattern {
+            TypedMatchPattern::Is(TypedPattern::TypeCheck(ty, _)) => Some(ty),
+            TypedMatchPattern::Is(TypedPattern::TypeCheckDeep(ty, _, _)) => Some(ty),
+            _ => None,
         }
     }).collect();
 

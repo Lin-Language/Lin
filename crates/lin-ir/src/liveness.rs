@@ -222,6 +222,7 @@ pub fn instr_use_def(instr: &Instruction) -> (Vec<Temp>, Vec<Temp>) {
         Instruction::FreeBoxShellIfDistinct { val, other } => (vec![*val, *other], vec![]),
         Instruction::IsType { dst, val, .. } => (vec![*val], vec![*dst]),
         Instruction::HasPattern { dst, val, .. } => (vec![*val], vec![*dst]),
+        Instruction::MatchesSchema { dst, val, .. } => (vec![*val], vec![*dst]),
         Instruction::Box { dst, val, .. } => (vec![*val], vec![*dst]),
         Instruction::Unbox { dst, val, .. } => (vec![*val], vec![*dst]),
         Instruction::Bind { dst, src, .. } => (vec![*src], vec![*dst]),
