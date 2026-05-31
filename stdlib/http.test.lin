@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
-import { json, text, redirect, notFound, badRequest, parseBody, pathMatch } from "std/http"
+import { json, text, redirect, notFound, badRequest, parseBody, matchPath } from "std/http"
 
 val s = suite("std/http", [
   test("json helper sets status and content-type", () =>
@@ -33,13 +33,13 @@ val s = suite("std/http", [
     [expect(body["x"]).toBe(99)]
   ),
 
-  test("pathMatch extracts named segments", () =>
-    val m = pathMatch("/users/:id/posts/:postId", "/users/42/posts/7")
+  test("matchPath extracts named segments", () =>
+    val m = matchPath("/users/42/posts/7", "/users/:id/posts/:postId")
     [expect(m["id"]).toBe("42"), expect(m["postId"]).toBe("7")]
   ),
 
-  test("pathMatch returns null on mismatch", () =>
-    val m = pathMatch("/users/:id", "/products/5")
+  test("matchPath returns null on mismatch", () =>
+    val m = matchPath("/products/5", "/users/:id")
     [expect(m).toBe(null)]
   ),
 ])

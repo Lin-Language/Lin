@@ -1,9 +1,12 @@
-import { handleIndex, handleStatus, handleUser } from "./handlers"
-import { pathMatch } from "std/http"
+import { getIndex, getStatus, getUser } from "./handlers"
+import { json, matchPath } from "std/http"
 
-export val router = (req: Json): Json =>
+type Request = { "method": String, "path": String, "query": String, "headers": Json, "body": String }
+type Response = { "status": Int32, "headers": Json, "body": String }
+
+export val router = (req: Request): Response =>
   match req["path"]
-    is "/" => handleIndex(req)
-    is "/api/status" => handleStatus(req)
-    is path when pathMatch("/users/:id", path) != null => handleUser(req)
-    else => { "status": 404, "headers": {}, "body": "Not Found" }
+    is "/" => getIndex(req)
+    is "/api/status" => getStatus(req)
+    is path when matchPath(path, "/users/:id") != null => getUser(req)
+    else => json(404, { "error": "Not Found" })

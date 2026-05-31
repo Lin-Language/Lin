@@ -1585,6 +1585,32 @@ print(toString(addDouble(5)))
 }
 
 #[test]
+fn test_imported_fn_passed_as_value() {
+    // Regression: an imported top-level function referenced as a VALUE (not called) was
+    // dropped in IR lowering — the LocalGet branch had no `import_fn_slots` case, so the
+    // slot fell through to a placeholder that emitted no instruction and codegen silently
+    // dropped the argument ("Incorrect number of arguments passed to called function!").
+    // Both forms below pass an imported fn as a value: as a higher-order arg to `map`, and
+    // bound to a local `val` then called. (A local fn used the same way always worked.)
+    let dir = std::env::temp_dir().join(format!("lin_impfnval_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("lib.lin"),
+        "export val double = (x: Int32): Int32 => x * 2\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ map }} from "std/array"
+import {{ double }} from "{}/lib"
+val doubled = [1, 2, 3].map(double)
+print(toString(doubled))
+val f = double
+print(toString(f(21)))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["[2, 4, 6]", "42"]);
+}
+
+#[test]
 fn test_default_args_trailing_comma_still_curries() {
     // A trailing comma requests partial application even when defaults exist,
     // rather than filling the default.
@@ -3257,14 +3283,135 @@ fn test_server_path_match() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 
-import { pathMatch } from "std/http"
-val m = pathMatch("/users/:id/posts/:postId", "/users/42/posts/7")
+import { matchPath } from "std/http"
+val m = matchPath("/users/42/posts/7", "/users/:id/posts/:postId")
 print(m["id"])
 print(m["postId"])
-val none = pathMatch("/users/:id", "/products/5")
+val none = matchPath("/products/5", "/users/:id")
 print(toString(none))
 "#);
     assert_eq!(output, vec!["42", "7", "null"]);
+}
+
+/// End-to-end test of the real HTTP `serve` intrinsic (spec §33.5). `serve` blocks
+/// forever, so the compiled program runs as a background child process; we poll-connect
+/// a raw TCP client, send an HTTP/1.1 request, and assert the wire response. The child is
+/// always killed via a guard so a hung server never leaks past the test.
+#[test]
+fn test_serve_real_http() {
+    use std::io::Read;
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    let lin_bin = lin_bin();
+    if !lin_bin.exists() {
+        eprintln!("SKIP test_serve_real_http: lin binary not built");
+        return;
+    }
+
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    // Use a project dir with a SEPARATE router module: `main.lin` imports `router` and calls
+    // `router.serve(port)`. This is the real example's shape and also guards the imported-fn-
+    // as-value lowering fix — passing an imported function value to serve (see
+    // test_imported_fn_passed_as_value).
+    let dir = ws.join(format!("target/lin_serve_{}", id));
+    let _ = fs::create_dir_all(&dir);
+    let src_path = dir.join("main.lin");
+    let bin_path = dir.join("server_bin");
+    // A high, fixed-ish port derived from the test id to avoid collisions across the suite.
+    let port: u16 = 41_900 + (id as u16 % 50);
+
+    fs::write(dir.join("router.lin"),
+        r#"import { json, text, matchPath } from "std/http"
+
+export val router = (req: Json): Json =>
+  match req["path"]
+    is "/" => text(200, "hello from lin")
+    is path when matchPath(path, "/users/:id") != null =>
+      val m = matchPath(path, "/users/:id")
+      json(200, { "id": m["id"] })
+    else => json(404, { "error": "not found" })
+"#).unwrap();
+
+    let source = format!(
+        r#"import {{ serve }} from "std/http"
+import {{ router }} from "./router"
+
+router.serve({port})
+"#
+    );
+    fs::write(&src_path, &source).unwrap();
+
+    let compile = Command::new(&lin_bin)
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary");
+    assert!(
+        compile.status.success(),
+        "serve program compilation failed:\nstderr: {}\nsource:\n{}",
+        String::from_utf8_lossy(&compile.stderr),
+        source
+    );
+
+    // Guard that always kills the spawned server and removes the project dir on drop.
+    struct ChildGuard {
+        child: std::process::Child,
+        dir: PathBuf,
+    }
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    let child = Command::new(&bin_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn serve binary");
+    let mut guard = ChildGuard { child, dir: dir.clone() };
+
+    // Poll-connect until the server is accepting (or time out).
+    let addr = format!("127.0.0.1:{}", port);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let request = |path: &str| -> String {
+        let mut last_err = String::new();
+        while Instant::now() < deadline {
+            match TcpStream::connect(&addr) {
+                Ok(mut stream) => {
+                    let req = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", path);
+                    stream.write_all(req.as_bytes()).unwrap();
+                    let mut resp = String::new();
+                    stream.read_to_string(&mut resp).unwrap();
+                    return resp;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        }
+        panic!("server never came up on {}: {}", addr, last_err);
+    };
+
+    let root = request("/");
+    assert!(root.starts_with("HTTP/1.1 200 OK"), "GET / status: {}", root);
+    assert!(root.contains("hello from lin"), "GET / body: {}", root);
+
+    let user = request("/users/42");
+    assert!(user.starts_with("HTTP/1.1 200 OK"), "GET /users/42 status: {}", user);
+    assert!(user.contains("\"id\": \"42\""), "GET /users/42 body: {}", user);
+
+    let missing = request("/nope");
+    assert!(missing.starts_with("HTTP/1.1 404"), "GET /nope status: {}", missing);
+
+    // Explicit kill (the guard would also do this on drop).
+    let _ = guard.child.kill();
+    let _ = guard.child.wait();
 }
 
 #[test]

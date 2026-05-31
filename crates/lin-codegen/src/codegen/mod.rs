@@ -1219,6 +1219,35 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, cls);
                             }
                         }
+                        Instruction::MakeNamedClosure { dst, sym, ty } => {
+                            // Materialize an imported/FFI function symbol as a capture-less closure
+                            // value (see the import_fn_slots branch in lower.rs LocalGet). Resolve
+                            // the external symbol at its CONCRETE Lin signature — the same signature
+                            // the import was compiled with — then wrap it in the uniform boxed-ABI
+                            // stub exactly as a local named function value is.
+                            let (param_tys, ret_ty): (Vec<Type>, Type) = match ty {
+                                Type::Function { params, ret, .. } => (params.clone(), (**ret).clone()),
+                                _ => (vec![], Type::Null),
+                            };
+                            let named_fn = match self.module.get_function(sym) {
+                                Some(f) => f,
+                                None => {
+                                    let llvm_params: Vec<BasicMetadataTypeEnum> = param_tys
+                                        .iter()
+                                        .map(|t| self.llvm_param_type(t))
+                                        .collect();
+                                    let fn_ty = if matches!(ret_ty, Type::Null | Type::Never) {
+                                        void_ty.fn_type(&llvm_params, false)
+                                    } else {
+                                        self.llvm_type(&ret_ty).fn_type(&llvm_params, false)
+                                    };
+                                    self.module.add_function(sym, fn_ty, None)
+                                }
+                            };
+                            let cls = self.wrap_named_fn_as_closure_boxed_desc_ret(
+                                named_fn, None, Some(&ret_ty), Some(&param_tys));
+                            temp_map.insert(*dst, cls);
+                        }
                         Instruction::Index { dst, object, key, obj_ty, key_ty, result_ty } => {
                             if let (Some(&obj_v), Some(&key_v)) = (temp_map.get(object), temp_map.get(key)) {
                                 let result = self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty);

@@ -1376,8 +1376,8 @@ std/iter     range, iterOf  (also auto-imported as globals)
 std/result   Result<T, E> type alias
 std/io       print, readLine, lines, readAll
 std/fs       readFile, writeFile, appendFile, readLines, readJson, writeJson, exists
-std/http     fetch, fetchWith, fetchJson, postJson
-std/server   serve, json, text, redirect, notFound, badRequest, pathMatch, parseBody
+std/http     fetch, fetchWith, fetchJson, postJson,
+             serve, json, text, redirect, notFound, badRequest, matchPath, parseBody
 ```
 
 The full signature of every function is specified in `docs/STDLIB.md`.
@@ -2151,27 +2151,27 @@ export val postJson = (url: String, body: Json): HttpResponse | Error =>
   })
 ```
 
-`parseJson` is an intrinsic (`__parseJson: (String) -> Json | Error`) that parses a JSON string into a Lin value. It is not part of the public stdlib API but is available internally to `std/http` and `std/server`.
+`parseJson` is an intrinsic (`__parseJson: (String) -> Json | Error`) that parses a JSON string into a Lin value. It is not part of the public stdlib API but is available internally to `std/http`.
 
-### 33.5 `std/server` Intrinsics
+### 33.5 HTTP Server (`serve`)
 
-The server module requires two intrinsics — one for sequential serving and one for pool-dispatched serving. Everything else (`json`, `text`, `redirect`, `notFound`, `badRequest`, `pathMatch`, `parseBody`) is written in Lin on top of the `HttpResponse` type and `__parseJson`.
+Server support lives in `std/http` alongside the client. The serving loop itself is the one intrinsic; everything else (`json`, `text`, `redirect`, `notFound`, `badRequest`, `matchPath`, `parseBody`) is written in Lin on top of the `HttpResponse` type and `__parseJson`.
 
 ```txt
-__serverServe:         (port: Int32, handler: (HttpRequest) -> HttpResponse) -> Null
-__serverServeWithPool: (pool: ThreadPool, port: Int32, handler: (HttpRequest) -> HttpResponse) -> Null
+__serverServe: (handler: (HttpRequest) -> HttpResponse, port: Int32) -> Null
 ```
 
-`__serverServeWithPool` is not called directly from Lin. It is invoked via the `pool.serve` dot-call form, which the runtime dispatches to this intrinsic when `.serve` is called on a `ThreadPool` value. The handler is subject to the same `var`-capture restriction as `pool.async` (§32.2.1) — enforced at compile time where statically detectable.
+`__serverServe` binds a TCP listener on `port`, then serves connections **sequentially** (one request at a time): it parses each incoming HTTP/1.1 request into an `HttpRequest`, invokes `handler`, and writes the returned `HttpResponse` back on the wire. It blocks indefinitely (it only returns — as an `Error`-shaped value — if the port cannot be bound). The handler runs inside a fault-isolation boundary: a faulting handler yields a `500` response and the server keeps serving.
 
-The Lin stdlib wrappers in `std/server`:
+The handler argument comes **first** so the dot-call form reads naturally: `router.serve(3000)` desugars (first-argument application, §11.1) to `serve(router, 3000)`. Both forms are equivalent.
+
+A pool-dispatched variant (`pool.serve`, concurrent request handling) is not yet implemented.
+
+The Lin stdlib wrappers in `std/http`:
 
 ```txt
-export val serve = (port: Int32, handler: (HttpRequest) -> HttpResponse): Null =>
-  __serverServe(port, handler)
-
-// pool.serve dispatches to __serverServeWithPool via the runtime's dot-call dispatch
-// on ThreadPool values; it is not a standalone exported function.
+export val serve = (handler: (HttpRequest) -> HttpResponse, port: Int32): Null =>
+  __serverServe(handler, port)
 
 export val json = (status: Int32, body: Json): HttpResponse => {
   "status":  status,
@@ -2181,7 +2181,7 @@ export val json = (status: Int32, body: Json): HttpResponse => {
 
 export val text = (status: Int32, body: String): HttpResponse => {
   "status":  status,
-  "headers": { "Content-Type": "text/plain" },
+  "headers": { "Content-Type": "text/plain; charset=utf-8" },
   "body":    body
 }
 
@@ -2191,20 +2191,20 @@ export val redirect = (url: String): HttpResponse => {
   "body":    ""
 }
 
-export val notFound = (): HttpResponse =>
-  text(404, "Not Found")
+export val notFound: HttpResponse =
+  { "status": 404, "headers": {}, "body": "Not Found" }
 
 export val badRequest = (message: String): HttpResponse =>
-  text(400, message)
+  { "status": 400, "headers": {}, "body": message }
 
 export val parseBody = (req: HttpRequest): Json | Error =>
   __parseJson(req["body"])
 
-export val pathMatch = (pattern: String, path: String): { ...String } | Null =>
+export val matchPath = (path: String, pattern: String): { ...String } | Null =>
   __serverPathMatch(pattern, path)
 ```
 
-`__serverPathMatch: (String, String) -> { ...String } | Null` is a Rust intrinsic that splits both strings on `/`, matches literal segments exactly, captures `:name` segments by name, and returns `Null` on any mismatch.
+`__serverPathMatch` is a Rust intrinsic that splits both strings on `/`, matches literal segments exactly, captures `:name` segments by name, and returns `Null` on any mismatch. `matchPath` takes the **path first** so it reads as `req["path"].matchPath("/users/:id")` in dot-call form.
 
 ## 34. Foreign Function Interface
 
@@ -2420,7 +2420,7 @@ tcpClose:          (fd: Int32)                    => Null | Error
 
 `recv` fills a caller-owned `UInt8[]` (§35.1) and returns the number of bytes read; the buffer is never transferred across the boundary. Non-blocking mode plus a `Null`-on-would-block `recv`/`accept` replaces an explicit `poll`.
 
-Note that `std/server` (§33.5) already provides a high-level blocking HTTP server, and `std/http` (§33.4) an HTTP client; `std/net` is the lower-level byte-stream layer beneath them, for non-HTTP protocols and custom framing.
+Note that `std/http` already provides a high-level blocking HTTP server (`serve`, §33.5) and an HTTP client (§33.4); `std/net` is the lower-level byte-stream layer beneath them, for non-HTTP protocols and custom framing.
 
 ### 35.6 `std/proc` — Subprocesses
 

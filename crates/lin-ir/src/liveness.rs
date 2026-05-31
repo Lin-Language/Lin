@@ -196,6 +196,7 @@ pub fn instr_use_def(instr: &Instruction) -> (Vec<Temp>, Vec<Temp>) {
         }
         Instruction::CallIntrinsic { dst, args, .. } => (args.clone(), vec![*dst]),
         Instruction::MakeClosure { dst, captures, .. } => (captures.clone(), vec![*dst]),
+        Instruction::MakeNamedClosure { dst, .. } => (vec![], vec![*dst]),
         Instruction::MakeObject { dst, fields, spreads, .. } => {
             let mut uses: Vec<Temp> = fields.iter().map(|(_, t)| *t).collect();
             uses.extend(spreads.iter().copied());

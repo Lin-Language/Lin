@@ -107,6 +107,9 @@ pub enum Intrinsic {
     Retry,
     ThreadPool,
     Worker,
+    /// HTTP server (`serve`, spec §33.5). `serve(handler, port)` → `lin_serve(h_fn, h_env,
+    /// h_has, port)`. Blocks forever; the handler is invoked once per request.
+    Serve,
     // Shared<T> — opt-in shared mutable state (ADR-043 §2.3.1). shared(v) boxes a private copy;
     // get/set/withLock are the only accessors (copy out / copy in / locked in-place mutate).
     SharedNew,
@@ -219,6 +222,12 @@ pub enum Instruction {
     CallIntrinsic { dst: Temp, intrinsic: Intrinsic, args: Vec<Temp>, ret_ty: Type },
     /// result = closure(func_id, env_temps[...])  — allocates closure struct
     MakeClosure { dst: Temp, func: FuncId, captures: Vec<Temp>, ret_ty: Type },
+    /// result = closure value wrapping an EXTERNAL named function symbol (an imported
+    /// top-level function or FFI symbol) referenced as a value rather than called. `sym`
+    /// is the mangled/foreign symbol; `ty` is the function's full Lin type (params + ret)
+    /// so codegen can build the capture-less boxed-ABI wrapper. Mirrors `MakeClosure` for a
+    /// local function, but the callee is resolved by symbol name, not FuncId.
+    MakeNamedClosure { dst: Temp, sym: String, ty: Type },
     /// result = { fields... }  — allocates object on heap
     MakeObject { dst: Temp, fields: Vec<(String, Temp)>, spreads: Vec<Temp>, ty: Type },
     /// result = [ elements... ]  — allocates array on heap

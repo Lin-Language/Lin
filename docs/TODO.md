@@ -492,19 +492,17 @@ See spec §33 for the full intrinsic signatures. See `docs/STDLIB.md` for the co
 - [x] Add `ureq` (or equivalent minimal Rust HTTP client) to workspace dependencies.
 - [x] `__httpFetch` intrinsic: send GET request, return `HttpResponse | Error`. Populate `"status"`, `"headers"`, `"body"`. Transport errors (DNS, TLS, connection refused) → `Error`; HTTP error status codes → successful `HttpResponse`.
 - [x] `__httpFetchWith` intrinsic: same as `__httpFetch` but accepts `HttpOptions` object; read `"method"`, `"headers"`, `"body"` fields (missing fields use defaults: `"GET"`, empty headers, empty body).
-- [x] `__parseJson` intrinsic (internal): parse a JSON string to `Json | Error`; used by `fetchJson` and `std/server`.
+- [x] `__parseJson` intrinsic (internal): parse a JSON string to `Json | Error`; used by `fetchJson` and the `std/http` server helpers.
 - [x] `std/http` Lin module: `fetch` and `fetchWith` delegate to intrinsics; `fetchJson` and `postJson` written in Lin on top of them (spec §33.4).
 - [x] Define `HttpResponse` and `HttpOptions` as exported types from `std/http`.
 
-### `std/server` — HTTP server
+### HTTP server (in `std/http`)
 
-- [x] Add `tiny_http` crate dependency to workspace.
-- [x] `__serverServe` intrinsic: bind TCP listener on `port`, accept in a loop, parse each connection into an `HttpRequest` object (`"method"`, `"path"`, `"query"`, `"headers"`, `"body"`), call `handler`, write the `HttpResponse` back to the socket. Block the calling thread indefinitely.
-- [x] `__serverServeWithPool` intrinsic: same as above but hand each request to the `ThreadPool` task channel.
-- [x] `pool.serve` dot-call: extend the runtime's dot-call dispatch on `ThreadPool` values so `.serve(port, handler)` routes to `__serverServeWithPool`.
+- [x] `__serverServe` intrinsic (`lin_serve`, hand-rolled HTTP/1.1, no extra deps): bind a TCP listener on `port`, accept in a loop, parse each connection into an `HttpRequest` object (`"method"`, `"path"`, `"query"`, `"headers"`, `"body"`), call `handler` inside a fault-isolation boundary, write the `HttpResponse` back to the socket. Sequential (one request at a time); blocks the calling thread indefinitely. Signature is `serve(handler, port)` (handler first) so `router.serve(port)` dot-call desugars to `serve(router, port)`.
+- [ ] `__serverServeWithPool` intrinsic / `pool.serve` dot-call: concurrent request handling via a `ThreadPool`. Not yet implemented.
 - [x] `__serverPathMatch` intrinsic: split pattern and path on `/`; match literal segments exactly; collect `:name` segments as string captures into a result object; return `Null` on length mismatch or literal segment mismatch.
-- [x] `std/server` Lin module: `serve`, `json`, `text`, `redirect`, `notFound`, `badRequest`, `parseBody`, `pathMatch` — written in Lin on top of the two server intrinsics, `__serverPathMatch`, and `__parseJson` (spec §33.5).
-- [x] Export `HttpRequest` type from `std/server`.
+- [x] `std/http` server helpers: `serve`, `json`, `text`, `redirect`, `notFound`, `badRequest`, `parseBody`, `matchPath` (path-first) — written in Lin on top of `__serverServe`, `__serverPathMatch`, and `__parseJson` (spec §33.5).
+- [x] Export `HttpRequest` / `HttpResponse` types from `std/http`.
 
 ### Tests
 
@@ -520,11 +518,11 @@ See spec §33 for the full intrinsic signatures. See `docs/STDLIB.md` for the co
 - [x] `std/http`: `postJson` sends correct `Content-Type` header and body.
 - [x] `std/http`: HTTP 404 response is returned as `HttpResponse` (not `Error`); transport failure is `Error`.
 - [x] Concurrent `async(() => fetchJson(...))` calls complete without data races.
-- [x] `std/server`: `serve` on a background thread responds correctly to a GET request.
-- [x] `std/server`: `pathMatch` extracts named parameters and returns `Null` on mismatch.
-- [x] `std/server`: `parseBody` returns `Error` for non-JSON bodies.
-- [x] `std/server`: `json` helper sets `Content-Type: application/json`; `text` sets `text/plain`; `redirect` sets `Location`.
-- [x] `std/server`: `threadPool(4).serve` handles concurrent requests.
+- [x] `std/http`: `serve` as a background subprocess responds correctly to GET requests (`test_serve_real_http`); a faulting handler yields 500 and the server survives.
+- [x] `std/http`: `matchPath` extracts named parameters and returns `Null` on mismatch.
+- [x] `std/http`: `parseBody` returns `Error` for non-JSON bodies.
+- [x] `std/http`: `json` helper sets `Content-Type: application/json`; `text` sets `text/plain`; `redirect` sets `Location`.
+- [ ] `std/http`: `threadPool(4).serve` handles concurrent requests (pending `pool.serve`).
 
 ---
 

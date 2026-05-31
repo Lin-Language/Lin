@@ -1420,6 +1420,24 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                     builder.register_owned(t, ty.clone());
                 }
                 t
+            } else if let Some((sym, _)) = ctx.import_fn_slots.get(slot).cloned() {
+                // An imported top-level function (or FFI symbol) referenced as a VALUE rather
+                // than called — e.g. passed as a `Function`-typed argument like
+                // `router.serve(3000)` (desugared to `serve(router, 3000)`) or `arr.map(imported)`.
+                // Without this branch the slot resolves to none of the call-position handling
+                // above and falls through to the placeholder `else`, emitting NO instruction, so
+                // codegen's arg collection silently DROPS the value (the "N args for an N+1-param
+                // call" codegen error). Materialize it as a capture-less closure VALUE bound to the
+                // external symbol — the codegen mirror of the local-named-function case below.
+                let closure_ty = ty.clone();
+                let dst = builder.alloc_temp(closure_ty.clone());
+                builder.emit(Instruction::MakeNamedClosure {
+                    dst,
+                    sym,
+                    ty: closure_ty.clone(),
+                });
+                builder.register_owned(dst, closure_ty);
+                dst
             } else if let Some((wrapper, val_ty)) = ctx.import_val_slots.get(slot).cloned() {
                 // Imported non-function val: call its zero-arg wrapper to compute the value.
                 let dst = builder.alloc_temp(val_ty.clone());
@@ -2200,6 +2218,7 @@ fn lower_intrinsic_call(
         "lin_shared_with_lock" => Intrinsic::SharedWithLock,
         "lin_freeze" => Intrinsic::Freeze,
         "lin_worker" => Intrinsic::Worker,
+        "lin_serve" => Intrinsic::Serve,
         "lin_request" => Intrinsic::Request,
         "lin_message" => Intrinsic::Message,
         "lin_close" => Intrinsic::Close,

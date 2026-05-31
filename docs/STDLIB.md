@@ -245,9 +245,9 @@ This document specifies the standard library for the Lin language. All modules a
 | [`json`](#json-helper) | `(Int32, Json) -> HttpResponse` | Build a JSON response |
 | [`notFound`](#notFound) | `HttpResponse` | 404 response value |
 | [`parseBody`](#parseBody) | `(HttpRequest) -> Json \| Error` | Parse the request body as JSON |
-| [`pathMatch`](#pathMatch) | `(String, String) -> { ...String } \| Null` | Match a path against a pattern, returning captured params |
+| [`matchPath`](#matchPath) | `(String, String) -> { ...String } \| Null` | Match a path against a pattern, returning captured params |
 | [`redirect`](#redirect) | `(String) -> HttpResponse` | Build a 302 redirect response |
-| [`serve`](#serve) | `(Int32, (HttpRequest) -> HttpResponse) -> Null` | Start a sequential HTTP server |
+| [`serve`](#serve) | `((HttpRequest) -> HttpResponse, Int32) -> Null` | Start a sequential HTTP server |
 | [`text`](#text-helper) | `(Int32, String) -> HttpResponse` | Build a plain-text response |
 
 **std/async**
@@ -2959,17 +2959,20 @@ POST `body` as JSON to `url` with `Content-Type: application/json`.
 ### serve
 
 ```txt
-val serve: (port: Int32, handler: (HttpRequest) -> HttpResponse) -> Null
+val serve: (handler: (HttpRequest) -> HttpResponse, port: Int32) -> Null
 ```
 
-Starts an HTTP server on `port` and calls `handler` for each incoming request **sequentially** — one request at a time. Blocks indefinitely.
+Starts an HTTP server on `port` and calls `handler` for each incoming request **sequentially** — one request at a time. Parses each HTTP/1.1 request into an `HttpRequest`, then writes the returned `HttpResponse` back on the wire. Blocks indefinitely (it only returns — as an `Error` — if the port cannot be bound). A handler that faults yields a `500` response and the server keeps serving.
+
+The handler is the **first** argument so the dot-call form reads naturally: `router.serve(3000)` is `serve(router, 3000)`.
 
 ```txt
-serve(3000, req =>
-  match req
-    has { "method": "GET", "path": "/ping" } => text(200, "pong")
+val router = (req: HttpRequest): HttpResponse =>
+  match req["path"]
+    is "/ping" => text(200, "pong")
     else => notFound
-)
+
+router.serve(3000)
 ```
 
 ---
@@ -3045,22 +3048,22 @@ badRequest("missing required field: name")
 
 ---
 
-### pathMatch
+### matchPath
 
 ```txt
-val pathMatch: (path: String, pattern: String) -> { ...String } | Null
+val matchPath: (path: String, pattern: String) -> { ...String } | Null
 ```
 
 Matches `path` against `pattern`. Pattern segments beginning with `:` are named captures. Returns an object of captured parameters on match, or `Null`. The path is the first argument so the function chains naturally off a request path.
 
 ```txt
-pathMatch("/users/42",       "/users/:id")       // { "id": "42" }
-pathMatch("/users/42/posts", "/users/:id/posts") // { "id": "42" }
-pathMatch("/items/42",       "/users/:id")        // null
-pathMatch("/static",         "/static")           // {}
+matchPath("/users/42",       "/users/:id")       // { "id": "42" }
+matchPath("/users/42/posts", "/users/:id/posts") // { "id": "42" }
+matchPath("/items/42",       "/users/:id")        // null
+matchPath("/static",         "/static")           // {}
 
 // dot-chaining from a request:
-req["path"].pathMatch("/users/:id")
+req["path"].matchPath("/users/:id")
 ```
 
 ---
@@ -3083,7 +3086,7 @@ match parseBody(req)
 
 ## std/net
 
-Low-level UDP and TCP sockets — the byte-stream layer beneath `std/http`/`std/server`, for non-HTTP protocols and custom framing. Every socket is an opaque integer fd handle (spec §35.4): there are no open-socket objects in user code, just the raw OS fd as an `Int32`. Every fallible call returns the `T | Error` result shape; a non-blocking read with no data available yet returns `Null` (so a poll loop reads naturally). IPv4 only; `bind`/`listen` bind to `0.0.0.0`.
+Low-level UDP and TCP sockets — the byte-stream layer beneath `std/http`, for non-HTTP protocols and custom framing. Every socket is an opaque integer fd handle (spec §35.4): there are no open-socket objects in user code, just the raw OS fd as an `Int32`. Every fallible call returns the `T | Error` result shape; a non-blocking read with no data available yet returns `Null` (so a poll loop reads naturally). IPv4 only; `bind`/`listen` bind to `0.0.0.0`.
 
 `recv`/`recvFrom`/`tcpRecv` fill a **caller-owned** `UInt8[]` and return the number of bytes read; the buffer is never transferred across the boundary. The buffer's length bounds the read — pre-size it to the maximum datagram/chunk you want to accept (e.g. `[0,0,...]` of N elements).
 

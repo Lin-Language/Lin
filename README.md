@@ -338,8 +338,7 @@ print(message)
 | `std/array` | `map`, `filter`, `reduce`, `for`, `range`, `length`, `push`, `concat` |
 | `std/iter` | `iter`, `range`, iterator combinators |
 | `std/fs` | `readFile`, `writeFile`, `appendFile`, `readLines`, `readJson`, `writeJson`, `exists` |
-| `std/http` | `fetch`, `fetchWith`, `fetchJson`, `postJson` |
-| `std/server` | `serve`, `json`, `text`, `redirect`, `notFound`, `badRequest`, `parseBody`, `pathMatch` |
+| `std/http` | `fetch`, `fetchWith`, `fetchJson`, `postJson`, `serve`, `json`, `text`, `redirect`, `notFound`, `badRequest`, `parseBody`, `matchPath` |
 
 ### Concurrency
 
@@ -365,13 +364,16 @@ val results = parallel(
 ### HTTP server
 
 ```lin
-import { serve, json, text, pathMatch } from "std/server"
+import { serve, json, text, matchPath } from "std/http"
 
-serve(8080, req =>
-  match pathMatch("/users/:id", req["path"])
-    is Null    => text(404, "not found")
-    has { id } => json(200, { "userId": id })
-)
+val router = (req: Json): Json =>
+  match req["path"]
+    is path when matchPath(path, "/users/:id") != null =>
+      val m = matchPath(path, "/users/:id")
+      json(200, { "userId": m["id"] })
+    else => text(404, "not found")
+
+router.serve(8080)
 ```
 
 ### Foreign functions (C / Rust interop)
