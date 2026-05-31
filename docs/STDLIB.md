@@ -736,7 +736,7 @@ import { map, filter, for, range } from "std/array"
 val append: (arr: Json[], item: Json) -> Json[]
 ```
 
-Returns a new array with `item` added at the end. Does not modify `arr`. For in-place mutation, use `push`.
+Returns a new array with `item` added at the end. Does not modify `arr`. For in-place mutation, use `push`. The result preserves the input's element representation: appending to a flat scalar array (e.g. `UInt8[]`, `Int32[]`) yields a flat array of the same type (the item is coerced into the element type), so byte-level consumers still read packed bytes; a `Json[]` stays tagged.
 
 ```txt
 append([1, 2], 3)    // [1, 2, 3]
@@ -1152,7 +1152,7 @@ val [evens, odds] = [1, 2, 3, 4, 5].partition(x => x % 2 == 0)
 val prepend: (arr: Json[], item: Json) -> Json[]
 ```
 
-Returns a new array with `item` added at the beginning. Does not modify `arr`.
+Returns a new array with `item` added at the beginning. Does not modify `arr`. Like `append`, the result preserves the input's element representation (a flat `UInt8[]`/`Int32[]` stays flat; a `Json[]` stays tagged).
 
 ```txt
 prepend([2, 3], 1)    // [1, 2, 3]
