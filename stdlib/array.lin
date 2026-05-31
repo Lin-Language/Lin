@@ -162,9 +162,9 @@ export val reverse = (arr: Json): Json =>
 export val set = <T>(arr: T[], idx: Int32, item: T): Null =>
   arr[idx] = item
 
-export val at = <T>(arr: T[], index: Int32): T =>
+export val at = <T>(arr: T[], index: Int32): T | Null =>
   val i = if index < 0 then length(arr) + index else index
-  arr[i]
+  if i >= 0 && i < length(arr) then arr[i] else null
 
 export val partition = (arr: Json, f: Function): Json =>
   val pass = []

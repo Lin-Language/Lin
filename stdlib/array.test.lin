@@ -169,6 +169,18 @@ val s = suite("std/array", [
     ]
   ),
 
+  test("at returns null on out-of-bounds positive index", () =>
+    [
+      expect([10, 20, 30].at(5)).toBe(null)
+    ]
+  ),
+
+  test("at returns null on out-of-bounds negative index", () =>
+    [
+      expect([10, 20, 30].at(-5)).toBe(null)
+    ]
+  ),
+
   test("indexOf on String[]", () =>
     [
       expect(["a", "b", "c"].indexOf("c")).toBe(2)
