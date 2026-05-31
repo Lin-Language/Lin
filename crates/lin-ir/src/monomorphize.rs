@@ -100,6 +100,46 @@ fn subst_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
     }
 }
 
+/// Rewrite every LEFTOVER/UNSOLVED inference `TypeVar` mentioned in `ty` (an id `< GENERIC_TV_BASE`,
+/// i.e. a fresh checker inference var that never got solved, e.g. `TypeVar(44)`) to the `u32::MAX`
+/// Json wildcard. The existing Json wildcard (`u32::MAX`) is already a wildcard and is preserved.
+///
+/// A quantified generic param id (`>= GENERIC_TV_BASE`, `!= u32::MAX`) is deliberately LEFT
+/// UNTOUCHED: a binding that still mentions one means the generic is genuinely unconstrained at
+/// this call (e.g. `val mk = <T>(): T => 0; mk()`), which must keep producing the clean
+/// "cannot infer a concrete type" diagnostic rather than silently erasing to Json.
+///
+/// Why erase the leftover inference vars: keying a specialization on a bare unsolved `TypeVar(44)`
+/// mints a garbage `$T44` monomorph that reads/allocates the backing array at a bogus element type
+/// (Gap 2 — runtime capacity overflow / heap corruption). Erasing to the Json wildcard yields a
+/// tagged `$Json` monomorph whose element representation is the uniform tagged value — correct and
+/// safe. A concrete type (Int32, String, Object, …) is left untouched, so a real `Int32[]` argument
+/// still produces the flat `$Int32` specialization.
+fn erase_nonconcrete_typevars(ty: &Type) -> Type {
+    match ty {
+        // Leftover/unsolved inference var (below the quantified-generic range): erase to Json.
+        Type::TypeVar(id) if *id < GENERIC_TV_BASE => Type::TypeVar(u32::MAX),
+        // Json wildcard, or a quantified generic param: leave as-is.
+        Type::TypeVar(_) => ty.clone(),
+        Type::Array(t) => Type::Array(Box::new(erase_nonconcrete_typevars(t))),
+        Type::Iterator(t) => Type::Iterator(Box::new(erase_nonconcrete_typevars(t))),
+        Type::Shared(t) => Type::Shared(Box::new(erase_nonconcrete_typevars(t))),
+        Type::FixedArray(ts) => {
+            Type::FixedArray(ts.iter().map(erase_nonconcrete_typevars).collect())
+        }
+        Type::Union(ts) => Type::Union(ts.iter().map(erase_nonconcrete_typevars).collect()),
+        Type::Object(fields) => Type::Object(
+            fields.iter().map(|(k, v)| (k.clone(), erase_nonconcrete_typevars(v))).collect(),
+        ),
+        Type::Function { params, ret, required } => Type::Function {
+            params: params.iter().map(erase_nonconcrete_typevars).collect(),
+            ret: Box::new(erase_nonconcrete_typevars(ret)),
+            required: *required,
+        },
+        _ => ty.clone(),
+    }
+}
+
 /// Unify a generic `pattern` type against a concrete `actual` type, accumulating
 /// `TypeVar id -> concrete` bindings. Only quantified ids (≥ base) are recorded.
 fn collect_subs(pattern: &Type, actual: &Type, subs: &mut HashMap<u32, Type>) {
@@ -110,6 +150,17 @@ fn collect_subs(pattern: &Type, actual: &Type, subs: &mut HashMap<u32, Type>) {
         (Type::Array(p), Type::Array(a)) => collect_subs(p, a, subs),
         (Type::Array(p), Type::FixedArray(ats)) => {
             for a in ats { collect_subs(p, a, subs); }
+        }
+        // A generic `T[]` (or `Iterator<T>`) param unified against a `Json` value (the MAX
+        // wildcard) — e.g. a stdlib fn calling a sibling generic on its own `Json` param. Bind
+        // the element TypeVar(s) to the Json wildcard so the specialization is keyed at the
+        // tagged `$Json` representation rather than left unbound (Gap 1, mirrors lin-check's
+        // `collect_type_subs`).
+        (Type::Array(p), Type::TypeVar(id)) if *id == u32::MAX => {
+            collect_subs(p, &Type::TypeVar(u32::MAX), subs)
+        }
+        (Type::Iterator(p), Type::TypeVar(id)) if *id == u32::MAX => {
+            collect_subs(p, &Type::TypeVar(u32::MAX), subs)
         }
         // An `Iterable`-shaped generic param `T[]` is routinely applied to a runtime ITERATOR
         // (e.g. `range(0,n)` returns `Iterator<Int32>`, then `.map(…)` whose param is `arr: T[]`).
@@ -158,6 +209,9 @@ fn mangle_type(ty: &Type) -> String {
         Type::Object(_) => "Object".into(),
         Type::Union(_) => "Union".into(),
         Type::Function { .. } => "Fn".into(),
+        // The `u32::MAX` Json wildcard (an erased non-concrete type-arg) mangles to `Json`, so a
+        // type-erased specialization is named `name$Json` rather than `name$T4294967295`.
+        Type::TypeVar(id) if *id == u32::MAX => "Json".into(),
         Type::TypeVar(id) => format!("T{}", id),
         _ => "X".into(),
     }
@@ -1085,8 +1139,24 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                     }
                     collect_subs(&ret_type, result_type, &mut subs);
 
-                    // Fully instantiated ⇔ every quantified id has a concrete (no remaining
-                    // generic TypeVar) binding AND nothing is left unconstrained.
+                    // GAP 2 SAFETY: a quantified type param may be bound to a type that still
+                    // mentions a NON-CONCRETE TypeVar — either the `u32::MAX` Json wildcard (a
+                    // `Json` argument, see Gap 1) or a leftover/unsolved checker inference var
+                    // (e.g. `TypeVar(44)`, id < GENERIC_TV_BASE). Materializing a specialization
+                    // keyed on such a value would read/allocate the array at a BOGUS element type
+                    // (`$T44` / `$T4294967295` garbage monomorph → runtime capacity overflow /
+                    // heap corruption). The MAIN-module path historically tolerated this only
+                    // because such cases rarely arose; the IMPORT path (a stdlib fn calling a
+                    // sibling generic on its own `Json` param) hits it routinely. Resolve EVERY
+                    // non-concrete TypeVar (any id) to the Json wildcard, producing a tagged
+                    // `$Json` monomorph that is representation-consistent and correct.
+                    for v in subs.values_mut() {
+                        *v = erase_nonconcrete_typevars(v);
+                    }
+
+                    // Fully instantiated ⇔ every quantified id has a (now Json-erased) binding
+                    // that no longer mentions a quantified generic TypeVar AND nothing is left
+                    // unconstrained.
                     let all_quantified = subs
                         .keys()
                         .all(|id| *id >= GENERIC_TV_BASE && *id != u32::MAX);
