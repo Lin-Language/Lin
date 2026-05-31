@@ -33,6 +33,7 @@ const KIND_ARRAY: u8 = 6;
 const KIND_FIXED: u8 = 7;
 const KIND_OBJECT: u8 = 8;
 const KIND_UNION: u8 = 9;
+const KIND_STRLIT: u8 = 10;
 
 /// Read-only cursor over the descriptor blob. The blob is a static const global (never freed).
 struct Desc {
@@ -127,6 +128,20 @@ unsafe fn validate(
                 Ok(())
             } else {
                 Err(format!("expected String at {}", path))
+            }
+        }
+        KIND_STRLIT => {
+            // Node layout: KIND_STRLIT, u16 lit_len, lit_bytes.
+            let lit_len = desc.u16_at(node + 1) as usize;
+            let expected = desc.str_at(node + 3, lit_len);
+            if tag != TAG_STR {
+                return Err(format!("expected \"{}\" at {}", expected, path));
+            }
+            let s = &*(payload as *const crate::string::LinString);
+            if s.as_str() == expected {
+                Ok(())
+            } else {
+                Err(format!("expected \"{}\" at {}, got \"{}\"", expected, path, s.as_str()))
             }
         }
         KIND_INT => {

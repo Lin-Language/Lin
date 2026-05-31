@@ -742,6 +742,7 @@ impl<'ctx> Codegen<'ctx> {
 //   KIND_FIXED  (7)  u32 len, then len * u32 offsets
 //   KIND_OBJECT (8)  u32 nfields, then nfields * { u16 key_len, key_bytes, u8 nullable, u32 off }
 //   KIND_UNION  (9)  u32 nvariants, then nvariants * u32 offsets
+//   KIND_STRLIT (10) u16 lit_len, lit_bytes      value must be a string equal to this literal
 const KIND_JSON: u8 = 0;
 const KIND_NULL: u8 = 1;
 const KIND_BOOL: u8 = 2;
@@ -752,6 +753,7 @@ const KIND_ARRAY: u8 = 6;
 const KIND_FIXED: u8 = 7;
 const KIND_OBJECT: u8 = 8;
 const KIND_UNION: u8 = 9;
+const KIND_STRLIT: u8 = 10;
 
 struct DescEncoder<'a> {
     buf: Vec<u8>,
@@ -828,9 +830,16 @@ impl<'a> DescEncoder<'a> {
         match ty {
             Type::Null => self.put_u8(KIND_NULL),
             Type::Bool => self.put_u8(KIND_BOOL),
-            // StrLit decodes as a plain string in v1: KIND_STRING validates it is a JSON
-            // string but does NOT check the exact literal value (see ADR-051).
-            Type::Str | Type::StrLit(_) => self.put_u8(KIND_STRING),
+            Type::Str => self.put_u8(KIND_STRING),
+            // A string-literal type validates the JSON value is a string AND equals the exact
+            // literal — this is what makes `Result.fromJson(...)` reject a wrong discriminant
+            // tag at decode time, so union variants discriminate correctly (ADR-051).
+            Type::StrLit(s) => {
+                self.put_u8(KIND_STRLIT);
+                let lb = s.as_bytes();
+                self.put_u16(lb.len() as u16);
+                self.buf.extend_from_slice(lb);
+            }
             Type::Int8 => { self.put_u8(KIND_INT); self.put_u8(1); self.put_u8(1); }
             Type::Int16 => { self.put_u8(KIND_INT); self.put_u8(2); self.put_u8(1); }
             Type::Int32 => { self.put_u8(KIND_INT); self.put_u8(4); self.put_u8(1); }

@@ -517,13 +517,19 @@ body (and through `if`/block tail positions), but **only when the declared retur
 `StrLit`**, so all other inference and error messages (e.g. "Function body has type …") are
 unchanged. This mirrors the existing array-literal refinement pattern.
 
+**`fromJson` validates the exact literal value (ADR-052).** A `StrLit` field encodes as a
+`KIND_STRLIT` descriptor node carrying the expected bytes; the runtime interpreter (`lin_from_json`)
+checks the JSON value is a string AND equals the singleton, reporting e.g.
+`expected "alpha" at $.kind, got "beta"`. This makes `Result.fromJson(...)` reject a wrong
+discriminant tag, so the union's first-match-wins probe discriminates variants by their literal tag
+(a `{ "type": "failure", ... }` value fails the `"success"` variant's `KIND_STRLIT` check and falls
+through to the `"failure"` variant). Superseded the original v1 `KIND_STRING` placeholder.
+
 **Limitations / scope (deliberate, v1)**:
-- **`fromJson` does not validate the exact literal value.** A `StrLit` field encodes as
-  `KIND_STRING` in the descriptor (`DescEncoder`), so `fromJson` checks the JSON value is a string
-  but not that it equals the singleton. This is consistent with ADR-049's scalar policy and is a
-  documented v1 gap; tightening it (a `KIND_STRLIT` exact-match node) is additive.
-- **No `Json → StrLit` decode.** A `Json` value cannot be assigned out to a literal type, exactly as
-  it cannot to any structured target (ADR-048 scalar/structured gap).
+- **`Json → StrLit` stays permissive (unchecked) in user code.** A `Json` value IS assignable to a
+  `StrLit` target (`requires_structured_decode(StrLit)` is false — a literal is scalar-like), exactly
+  as `Json → Int32` is unchecked (ADR-048 scalar gap). `fromJson` is the validated path. Tightening
+  this would diverge from the scalar-gap policy, so it is left consistent by design.
 - **Exhaustiveness (Step F) was NOT implemented.** Recognising a literal-discriminated `has`/`is`
   arm as covering a specific union variant is *not* done. This is safe: the existing exhaustiveness
   checker already requires an `else` (or a covering arm) for *any* object-union `has`-match — literal
@@ -542,7 +548,31 @@ fresh inference var, so the strictest checking is via the full `lin build` pipel
 suite green (288 integration + 6 + 33 + 7; stdlib 19 files; examples 22 files), plus the new
 `examples/result/main.lin` fixture.
 
-## ADR-052: Imported types usable in type position
+## ADR-052: `fromJson` validates string-literal field values (KIND_STRLIT)
+
+**Decision**: A `Type::StrLit(s)` target field in `fromJson` (ADR-049) encodes as a new descriptor
+node `KIND_STRLIT = 10` carrying `{ u16 lit_len, lit_bytes }`. The runtime interpreter
+(`lin_from_json`, `lin-runtime/src/decode.rs`) validates the JSON value is a string **and** equals
+that exact literal, returning a decode `Error` like `expected "alpha" at $.kind, got "beta"` on
+mismatch. This supersedes ADR-051's v1 placeholder, where a `StrLit` field encoded as `KIND_STRING`
+(string-ness only, exact value unchecked).
+
+**Rationale**: Without it, `Result.fromJson({ "type": "bogus", ... })` decoded *successfully* —
+`KIND_STRING` accepted any string in the discriminant slot, then the union's first-match-wins probe
+(ADR-049(a)) selected the first variant regardless of tag. That is exactly the silent mis-decode
+`fromJson` exists to prevent. With `KIND_STRLIT`, each union variant's discriminant literal is
+checked during the probe, so a `{ "type": "failure", ... }` value fails the `"success"` variant and
+correctly falls through to the `"failure"` variant — real, validated discrimination.
+
+**Consequence**: `KIND_STRLIT` is appended to the descriptor opcode set in both the encoder
+(`codegen/intrinsics.rs` `DescEncoder::write_node`) and the decoder (`decode.rs`), kept in sync. A
+plain `Type::Str` field still encodes as `KIND_STRING` (accepts any string), so only literal-typed
+fields gain value-checking — no change to ordinary string decoding. The encoder memo already keys
+`StrLit("a")` and `Str` distinctly (their `Display` differs: `"a"` vs `String`), so shared/recursive
+nodes are unaffected. Verified: a wrong discriminant tag is rejected with a path-located message,
+correct tags decode and discriminate, plain `String` fields are unchanged, full suite green.
+
+## ADR-053: Imported types usable in type position
 
 **Decision**: An `export type Foo = ...` declaration can be imported (`import { Foo } from "m"`,
 including `Foo as Bar` aliases) and used in a type annotation in the importing module. Spec §20.3

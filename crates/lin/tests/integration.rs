@@ -5703,3 +5703,56 @@ print("${b["value"]} ${o["x"]}")
 "#);
     assert_eq!(out, vec!["9 hi"]);
 }
+
+#[test]
+fn test_from_json_strlit_discriminates_union() {
+    // ADR-052: fromJson validates the exact literal value of a StrLit field, so a tagged-union
+    // decode discriminates by the discriminant tag. Correct tags decode to the right variant;
+    // first-match-wins probes each variant's KIND_STRLIT check.
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Result = { "type": "success", "value": Int32 } | { "type": "failure", "error": String }
+val show = (j: Json): String =>
+  val r = Result.fromJson(j)
+  match r
+    is Error => "decode-error"
+    has { "type": "success", "value": v } => "ok ${v}"
+    has { "type": "failure", "error": e } => "fail ${e}"
+    else => "?"
+print(show({ "type": "success", "value": 7 }))
+print(show({ "type": "failure", "error": "boom" }))
+"#);
+    assert_eq!(out, vec!["ok 7", "fail boom"]);
+}
+
+#[test]
+fn test_from_json_strlit_rejects_wrong_tag() {
+    // ADR-052: a wrong discriminant value is a decode error (was a silent mis-decode under the
+    // old KIND_STRING placeholder), with a path-located message.
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Tagged = { "kind": "alpha", "n": Int32 }
+val r = Tagged.fromJson({ "kind": "beta", "n": 1 })
+match r
+  is Error => print("err: ${r["message"]}")
+  else => print("ok")
+"#);
+    assert_eq!(out.len(), 1);
+    assert!(out[0].contains("alpha") && out[0].contains("beta"),
+        "expected literal-mismatch message naming both tags, got: {}", out[0]);
+}
+
+#[test]
+fn test_from_json_plain_string_field_accepts_any() {
+    // ADR-052 must NOT regress plain String fields: they still encode as KIND_STRING and accept
+    // any string value (only StrLit fields are value-checked).
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val r = Person.fromJson({ "name": "anything goes", "age": 5 })
+match r
+  is Error => print("err")
+  else => print("ok ${r["name"]}")
+"#);
+    assert_eq!(out, vec!["ok anything goes"]);
+}
