@@ -87,6 +87,52 @@ impl Checker {
         }
     }
 
+    /// Phase 4.5b: the binding name of an INTERMEDIATE `lin_array_allocate` builder body — the
+    /// common map-shape combinator idiom:
+    ///
+    /// ```lin
+    /// <T, U>(arr: T[], f: (T) => U): U[] =>
+    ///   val result = lin_array_allocate(n)   // fresh, compiler-controlled allocation
+    ///   ...                                  // write into result[i]
+    ///   result                               // returned bare
+    /// ```
+    ///
+    /// Returns `Some("result")` only when the body is a `Block` whose FINAL expression is a bare
+    /// `Ident(name)` AND one of the block's statements is `val name = lin_array_allocate(..)`.
+    /// Used to PIN that binding's element type to the declared-return element so monomorphization
+    /// produces a flat allocation matching the flat reader (see `infer_function`).
+    ///
+    /// STRICT GATING (Phase 4.5 safety rule): the binding must be a direct `lin_array_allocate`
+    /// call — never a slice/concat/parse or any other `Json[]`-returning call whose runtime
+    /// representation the compiler does NOT control. A wrongly-pinned non-flat producer would be
+    /// read flat by the concrete consumer → garbage. When the pattern doesn't match exactly, this
+    /// returns `None` and the binding stays `Array(MAX)` (tagged, correct).
+    fn intermediate_array_allocate_binding(body: &lin_parse::ast::Expr) -> Option<String> {
+        use lin_parse::ast::{Expr, Pattern, Stmt};
+        let Expr::Block(stmts, final_expr, _) = body else { return None };
+        // The block's value must be a bare identifier.
+        let Expr::Ident(returned, _) = final_expr.as_ref() else { return None };
+        // That identifier must be bound by a `val <returned> = lin_array_allocate(..)` in the block.
+        for stmt in stmts {
+            if let Stmt::Val { pattern: Pattern::Ident(name, _), type_ann, value, .. } = stmt {
+                if name == returned {
+                    // A user-supplied annotation already fixes the element type — don't override it.
+                    if type_ann.is_some() {
+                        return None;
+                    }
+                    if let Expr::Call { func, .. } = value {
+                        if matches!(func.as_ref(), Expr::Ident(n, _) if n == "lin_array_allocate") {
+                            return Some(returned.clone());
+                        }
+                    }
+                    // The name is rebound to something else — bail (stay correct/tagged).
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn infer_function(
         &mut self,
         type_params: &[String],
@@ -220,6 +266,18 @@ impl Checker {
         // the post-pass `types_compatible(body_ty, declared)` re-check (which would reject the
         // surviving `Json | {R}` union type) is skipped.
         let mut checked_against_declared = false;
+        // Phase 4.5b: pin an INTERMEDIATE `val result = lin_array_allocate(n)` binding's element
+        // type to the declared-return element. Save/restore the hint so nested functions and
+        // siblings are unaffected (hygiene). See `intermediate_array_allocate_binding` + ADR.
+        let prev_alloc_hint = self.array_alloc_elem_hint.take();
+        if let Some(Type::Array(elem)) = &declared_ret {
+            let elem_is_wildcard = matches!(elem.as_ref(), Type::TypeVar(n) if *n == u32::MAX);
+            if !elem_is_wildcard {
+                if let Some(binding) = Self::intermediate_array_allocate_binding(body) {
+                    self.array_alloc_elem_hint = Some((binding, (**elem).clone()));
+                }
+            }
+        }
         let typed_body_raw = match &declared_ret {
             Some(declared) if super::expr::expected_pushes_into_branches(declared) => {
                 checked_against_declared = true;
@@ -237,6 +295,7 @@ impl Checker {
             }
             _ => self.infer_expr(body)?,
         };
+        self.array_alloc_elem_hint = prev_alloc_hint;
         // Wrap body in a Block with destructuring preamble if needed.
         let typed_body = if param_destr_stmts.is_empty() {
             typed_body_raw
@@ -401,6 +460,16 @@ impl Checker {
         // See `infer_function` for the rationale: push a structured declared return type into the
         // body's `if`/`match` arms (fixes the match-arm-union-vs-declared-object bug).
         let mut checked_against_declared = false;
+        // Phase 4.5b: pin an INTERMEDIATE alloc binding (see `infer_function`).
+        let prev_alloc_hint = self.array_alloc_elem_hint.take();
+        if let Some(Type::Array(elem)) = &declared_ret {
+            let elem_is_wildcard = matches!(elem.as_ref(), Type::TypeVar(n) if *n == u32::MAX);
+            if !elem_is_wildcard {
+                if let Some(binding) = Self::intermediate_array_allocate_binding(body) {
+                    self.array_alloc_elem_hint = Some((binding, (**elem).clone()));
+                }
+            }
+        }
         let typed_body_raw = match &declared_ret {
             Some(declared) if super::expr::expected_pushes_into_branches(declared) => {
                 checked_against_declared = true;
@@ -418,6 +487,7 @@ impl Checker {
             }
             _ => self.infer_expr(body)?,
         };
+        self.array_alloc_elem_hint = prev_alloc_hint;
         let typed_body = if param_destr_stmts.is_empty() {
             typed_body_raw
         } else {

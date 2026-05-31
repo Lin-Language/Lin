@@ -915,3 +915,59 @@ copy from a fresh temp being freed → move". Regression: `test_concat_fresh_str
 (ADR-062) already retain by the same reasoning; this brings `concat` into line. The analogous
 move-without-retain residual leaks in the `for`/`map` element-shell path (`lower.rs`) are a distinct,
 pre-existing issue and are not addressed here.
+
+## ADR-065: Flow-typing refinement pins generic combinator array element types so monomorphization emits flat arrays
+
+**Context**: A generic array combinator returns a fresh array whose elements are produced at the
+generic param type — `<T, U>(arr: T[], f: (T) => U): U[]`. The only allocation intrinsic whose runtime
+representation the compiler fully controls is `lin_array_allocate`, which infers to the Json-wildcard
+array `Array(TypeVar(MAX))`. When such a function is MONOMORPHIZED at a concrete-scalar element
+(e.g. `U=Int32`), `subst` only rewrites TypeVars that actually appear in the recorded type — it
+substitutes `U→Int32` everywhere `U` occurs but never touches the `MAX` wildcard. So the allocation
+stays a TAGGED array (`lin_array_alloc_null`, 16-byte slots) while the `Int32[]`-typed consumer reads
+it through the FLAT accessor (`lin_flat_array_get_i32`, packed scalars) — a producer/consumer
+representation disagreement that reads garbage.
+
+**Decision (checker-side flow-typing, in `lin-check`)**: refine the wildcard element of a fresh
+`lin_array_allocate` to the function's declared-return element so monomorphization's existing `subst`
+pins `Array(U)` → `Array(Int32)`, and codegen's `is_flat_scalar` gate then emits a flat allocation that
+matches the flat reader. Two cases, both gated STRICTLY to the `lin_array_allocate` intrinsic:
+
+- **Direct body (Phase 4.5)**: `=> lin_array_allocate(n)` checked against the declared `Array(elem)`
+  retypes the call result via `retype_call_result` (`checker/expr.rs`,
+  `is_fresh_array_allocate_call`/`body_is_fresh_array_allocate`).
+- **Intermediate binding (Phase 4.5b, this ADR)**: the realistic map-shape body
+  `val result = lin_array_allocate(n); …write…; result`. `intermediate_array_allocate_binding`
+  (`checker/function.rs`) recognises a `Block` whose final expr is a bare `Ident(name)` bound by an
+  un-annotated `val name = lin_array_allocate(..)`; `infer_function`/`infer_function_with_hints` then
+  set a transient `array_alloc_elem_hint = (name, elem)` (saved/restored around the body for hygiene,
+  so nested/sibling functions are unaffected), and `check_stmt`'s `Stmt::Val` checks that exact binding
+  against `Array(elem)`. A user-supplied annotation on the binding wins (the helper bails), keeping the
+  programmer's representation choice authoritative.
+
+**Strict gating / correctness invariant**: ONLY the `lin_array_allocate` intrinsic — a fresh allocation
+the compiler controls end-to-end — is ever refined. Slice/concat/parse and every other `Json[]`-returning
+call (whose runtime representation we do NOT control) is left at `Array(MAX)` (tagged, correct). The
+flat/tagged decision is independently re-gated by codegen's `is_flat_scalar`, so a `String[]` or a
+still-abstract generic element stays TAGGED. The write into the refined flat array uses `lin_array_set`,
+which is representation-aware (dispatches on `elem_tag`, narrowing a tagged value into the packed flat
+slot), so producer (flat alloc) / writer (elem_tag-aware set) / reader (flat get) all agree.
+
+**No-op for pre-existing code**: nothing on master/generics-stdlib yet flows a concrete-scalar element
+through these patterns (stdlib array.lin is still Json), so the IR is byte-identical — verified by
+diffing a map/filter array-combinator program's `-O0` IR with and without the change.
+
+**Covered vs deferred**: the alloc-builder idiom (map/reverse/take/etc. — allocate then index-set and
+return) is covered. The `[]`+push builder idiom (filter/reduce: `val result = []; …push(result, x)…;
+result`) is DEFERRED. It would need (a) pinning the empty-array-literal binding's element type to the
+generic param and (b) representation-aware `Push` codegen — today the non-union `Push` path emits
+`lin_array_push`/`lin_array_push_tagged`, which assume the 16-byte tagged layout and would CORRUPT a
+flat buffer (only `lin_push_dyn` dispatches on `elem_tag`). Making the empty literal flat without also
+making `Push` flat-aware would introduce a new producer/consumer disagreement, so per "correctness over
+completeness" the push path is left as a follow-up. NOTE: the push-builder consumed at a concrete-scalar
+type already produces garbage on the generics-stdlib baseline (tagged producer, flat reader); this change
+neither fixes nor regresses it — the refinement never fires on a `[]` literal (it is a `MakeArray`, not a
+`lin_array_allocate` call). Regression tests: `test_generic_map_intermediate_alloc_*`
+(int32-flat-and-correct + IR proof, string-stays-tagged, mixed instantiations, json-stays-tagged,
+user-annotation-respected) in `crates/lin/tests/integration.rs`. ASan-clean over stdlib + examples + the
+flat/tagged/mixed fixtures.
