@@ -94,7 +94,9 @@ val lines: () -> Iterator
 Returns an iterator yielding one `String` per line of stdin. Terminates at EOF.
 
 ```lin
+import { print, lines } from "std/io"
 import { for } from "std/array"
+import { trim } from "std/string"
 
 lines().for(line => print(line.trim()))
 ```

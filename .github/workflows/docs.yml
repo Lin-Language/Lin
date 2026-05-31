@@ -6,43 +6,75 @@ on:
   pull_request:
     branches: [master]
 
+# Allow the deploy job to publish to GitHub Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# A single in-flight Pages deployment at a time; let a newer push cancel an older run.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
 jobs:
-  build-and-deploy:
+  # Build the site on every push and PR (PRs build but do not deploy — a cheap check
+  # that the Lin-written generator still compiles and runs).
+  build:
+    name: Build docs
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install LLVM
+      - name: Install LLVM 22
         run: |
-          wget https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 22
-          echo "LLVM_SYS_220_PREFIX=/usr/lib/llvm-22" >> $GITHUB_ENV
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key \
+            | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-22 main" \
+            | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            llvm-22 llvm-22-dev llvm-22-runtime clang-22 libpolly-22-dev
+          echo "LLVM_SYS_221_PREFIX=/usr/lib/llvm-22" >> "$GITHUB_ENV"
 
-      - name: Install Rust
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target/
+            target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
 
       - name: Build Lin compiler
         run: cargo build --workspace
 
-      - name: Build docs generator
+      - name: Build the docs generator (written in Lin)
         run: ./target/debug/lin build docs-site/builder/main.lin -o docs-builder
 
-      - name: Generate docs
+      - name: Generate the static site
         run: ./docs-builder
 
-      - name: Deploy to GitHub Pages
+      - name: Upload Pages artifact
         if: github.ref == 'refs/heads/master'
-        uses: peaceiris/actions-gh-pages@v3
+        uses: actions/upload-pages-artifact@v3
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./docs-site/output
+          path: docs-site/output
+
+  # Deploy only from master, after a successful build.
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-22.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

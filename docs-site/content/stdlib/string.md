@@ -11,9 +11,11 @@ import { trim, toUpper, toLower, split, join, replace, replaceAll, contains, sta
 | Function | Signature | Description |
 | --- | --- | --- |
 | `at` | `(String, Int32) -> String` | Character at index; negative counts from end |
+| `charCode` | `(String, Int32) -> Int32` | Numeric codepoint at index (alias of `codePointAt`) |
 | `codePointAt` | `(String, Int32) -> Int32` | Numeric codepoint at index |
 | `contains` | `(String, String) -> Boolean` | Test whether needle is a substring |
 | `endsWith` | `(String, String) -> Boolean` | Test whether string ends with suffix |
+| `fromCharCode` | `(Int32) -> String` | Build a one-character string from a codepoint value |
 | `fromCodePoints` | `(Int32[]) -> String` | Build string from codepoint values |
 | `indexOf` | `(String, String) -> Int32` | First occurrence index, or -1 |
 | `isBlank` | `(String) -> Boolean` | True if empty or all whitespace |
@@ -147,4 +149,16 @@ repeat("-", 5)   // "-----"
 ```lin
 padStart("42", 5, "0")    // "00042"
 padEnd("hi", 5, ".")      // "hi..."
+```
+
+---
+
+### `codePointAt` / `charCode` / `fromCharCode`
+
+`codePointAt` (and its alias `charCode`) returns the numeric Unicode codepoint at an index; `fromCharCode` is the inverse for a single codepoint.
+
+```lin
+codePointAt("A", 0)    // 65
+charCode("café", 3)    // 233   (é)
+fromCharCode(65)       // "A"
 ```

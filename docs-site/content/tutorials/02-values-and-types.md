@@ -44,6 +44,30 @@ counter = counter + 1
 
 Lin also has `Int8`, `Int16`, `Int64`, `UInt8`–`UInt64`, `Float32`, and `Float64`. The defaults are `Int32` for integer literals and `Float64` for floating-point literals.
 
+### Numeric literals
+
+A type suffix pins a literal's type:
+
+```lin
+val a = 42i8      // Int8
+val b = 42u32     // UInt32
+val c = 3.14f32   // Float32
+val d = 3.14f64   // Float64
+```
+
+A bare integer literal defaults to `Int32` if it fits; if it is too large it widens to the smallest type that preserves the value (it is never truncated):
+
+```lin
+val big = 1705314600000   // Int64 (too large for Int32)
+```
+
+Context can resize a bare literal, but a suffixed literal that conflicts with its context is a compile error:
+
+```lin
+val x: Int64 = 42    // ok — 42 typed as Int64
+val y: Int32 = 5i64  // error — the i64 suffix pins it to Int64
+```
+
 ## Union types
 
 A value that might be one of several types is a **union**:
@@ -64,6 +88,16 @@ val data: Json = { "name": "Alice", "scores": [10, 20, 30] }
 ```
 
 Use `Json` when you need a dynamically shaped value — for example, data read from a file or HTTP response.
+
+Any value assigns *into* `Json`, but `Json` does not implicitly assign *out* to a concrete object type with required fields. To go from untrusted `Json` to a concrete type, validate it with `fromJson` (from `std/json`) or narrow it with an `is`/`has` pattern:
+
+```lin
+import { fromJson } from "std/json"
+
+type Person = { "name": String, "age": Int32 }
+
+val person = Person.fromJson(someJson)   // Person | Error
+```
 
 ## Type annotations are optional
 

@@ -12,9 +12,22 @@ match scrutinee
 
 Arms are checked top-to-bottom. The value of the `match` expression is the value of the first matching arm. If no arm matches and there is no `else`, the program terminates with a runtime error.
 
-## `is` patterns — exact match
+## `is` vs `has` at a glance
 
-`is` checks for an exact type or value.
+The single most important distinction: **`is` validates types deeply and recursively; `has` only checks that fields are present.**
+
+- **`is T`** — for an object type, checks the value is an object, every declared field of `T` is present, and every field has the correct type, recursing into nested objects and arrays. Extra fields are allowed. For primitives, `is Int32` is an exact type check, `is "Dave"` is exact value equality, `is Null` is exact.
+- **`has { ... }`** — checks only that the named fields are present. Their types are **not** checked. Extra fields are allowed.
+
+Given `type Person = { "name": String, "age": Int32 }`, the value `{ "name": "Bob", "age": "not a number" }` does **not** match `is Person` (age is a `String`), but **does** match `has { name, age }` (both keys present).
+
+Use `is` when you need a sound type guarantee before reading fields; use `has` to destructure when you already know the types from context.
+
+> Generic applications cannot appear in `is` patterns — `is Result<Int32, String>` is not supported. Match the underlying tagged shape with `has { "type": "success", value }` instead.
+
+## `is` patterns — deep type / value match
+
+`is` checks for an exact type or value, validating object types recursively.
 
 ### Type patterns
 
@@ -52,11 +65,11 @@ match obj
   is { "x": x, "y": y } => "point with x=${x} y=${y}"
 ```
 
-`is` on an object requires the object to have **exactly** those fields — no extras.
+`is` on an object requires every named field to be present **and** correctly typed (recursively). Extra fields beyond those named are allowed.
 
-## `has` patterns — structural match
+## `has` patterns — presence-only structural match
 
-`has` checks for structural compatibility — the value must contain at least the specified shape.
+`has` checks for structural presence — the value must contain at least the named fields. The **types** of those fields are not checked.
 
 ### Object patterns
 

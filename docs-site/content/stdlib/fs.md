@@ -19,11 +19,13 @@ import { readFile, writeFile, readJson, ls, mkdir, exists, isFile, isDir } from 
 | `mkdir` | `(String, Json) -> Null \| Error` | Create directory; `{ parents: true }` for `-p` |
 | `mv` | `(String, String) -> Null \| Error` | Move or rename a file |
 | `readFile` | `(String) -> String \| Error` | Read file as UTF-8 string |
+| `readFileBytes` | `(String) -> UInt8[] \| Error` | Read file as a raw byte buffer |
 | `readJson` | `(String) -> Json \| Error` | Read and parse file as JSON |
 | `readLines` | `(String) -> String[] \| Error` | Read file lines into an array |
 | `rm` | `(String, Json) -> Null \| Error` | Remove file; `{ recursive: true }` for directory |
 | `stat` | `(String) -> FileStat \| Error` | File metadata |
 | `writeFile` | `(String, String) -> Null \| Error` | Write string to file |
+| `writeFileBytes` | `(String, UInt8[]) -> Null \| Error` | Write a raw byte buffer to file |
 | `writeJson` | `(String, Json, Json) -> Null \| Error` | Write JSON; `{ compact: true }` for minified |
 | `writeLines` | `(String, String[]) -> Null \| Error` | Write lines to file |
 

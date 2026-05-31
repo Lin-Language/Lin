@@ -20,9 +20,29 @@ print(describe("hi"))    // a string: hi
 
 `match` evaluates to the value of the matched arm. Every `match` must be exhaustive — if no arm matches and there is no `else`, it is a runtime error.
 
-## `is` — exact match
+## `is` vs `has` — the key distinction
 
-`is` checks an exact type or value:
+This is the most important thing to understand about Lin's patterns:
+
+- **`is` validates types deeply and recursively.** `value is Person` checks that the value is an object **and** that every declared field of `Person` is present **and** correctly typed, recursing into nested objects and arrays. Extra fields are allowed. For primitives, `is Int32` is an exact type check, `is "Dave"` is exact value equality, and `is Null` is an exact check.
+- **`has` only checks that fields are present.** `value has { name, age }` matches if both keys exist, regardless of their types. Extra fields are allowed.
+
+Concretely, given:
+
+```lin
+type Person = { "name": String, "age": Int32 }
+```
+
+the value `{ "name": "Bob", "age": "not a number" }`:
+
+- does **not** match `is Person` — `age` is a `String`, not an `Int32`, and `is` checks types recursively.
+- **does** match `has { name, age }` — both keys are present, and `has` ignores their types.
+
+Use `is` when you need a sound type guarantee before reading fields; use `has` when you already know the types from context and just want to destructure.
+
+## `is` — exact / deep type match
+
+`is` checks an exact type, value, or — for object types — a full recursive type match:
 
 ```lin
 match input
@@ -34,9 +54,9 @@ match input
 
 Arms are checked top-to-bottom. For literal values (`is "Dave"`), only that exact value matches.
 
-## `has` — structural match
+## `has` — structural (presence-only) match
 
-`has` checks that an object contains at least certain fields, allowing extra fields:
+`has` checks that an object contains at least certain fields, allowing extra fields. It does **not** check the types of those fields:
 
 ```lin
 val greet = (person: Json): String =>
@@ -87,6 +107,8 @@ val msg = match divide(10.0, 2.0)
   has { "type": "success", value } => "result: ${value}"
   has { "type": "failure", error } => "error: ${error}"
 ```
+
+Note: you cannot match on a *generic application* directly — `is Result<Float64, String>` is not supported. Match the underlying tagged shape instead, as above with `has { "type": "success", value }`.
 
 ## Narrowing in branches
 

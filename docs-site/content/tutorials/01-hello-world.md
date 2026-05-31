@@ -88,6 +88,7 @@ printErr("warning: file not found")
 
 ```lin
 import { print, args } from "std/io"
+import { length, for } from "std/array"
 
 val arguments = args()
 print("got ${length(arguments)} arguments")

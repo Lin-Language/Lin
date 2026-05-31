@@ -1,268 +1,276 @@
-import { split, join, startsWith, contains, replaceAll, trim, substring, indexOf, toLower } from "std/string"
-import { map, filter, reduce, for, push, range, length } from "std/array"
+// Markdown → JSON block model → HTML.
+//
+// Two phases, exactly as the docs pipeline is structured:
+//   1. parseBlocks(source): Json   — markdown text into a JSON array of block records
+//   2. renderBlocks(blocks): String — the JSON block model into an HTML fragment
+//
+// markdownToHtml composes the two. Keeping the JSON model in the middle means the
+// parser and the renderer stay independent and each block is a plain data record.
 
-// Slugify heading text: lowercase, spaces->hyphens
+import { split, join, startsWith, contains, replaceAll, trim, substring, indexOf, toLower } from "std/string"
+import { for, append, concat, length } from "std/array"
+
+// ---------------------------------------------------------------------------
+// Inline formatting (applied at render time to heading/paragraph/list/quote text)
+// ---------------------------------------------------------------------------
+
+// Slugify heading text into an anchor id: lowercase, drop punctuation, spaces -> hyphens.
 val slugify = (text: String): String =>
   val lower = toLower(text)
-  val s1 = replaceAll(lower, "`", "")
-  val s2 = replaceAll(s1, "*", "")
-  val s3 = replaceAll(s2, "_", "")
-  val s4 = replaceAll(s3, "(", "")
-  val s5 = replaceAll(s4, ")", "")
-  replaceAll(trim(s5), " ", "-")
+  val noPunct = lower
+    .replaceAll("`", "")
+    .replaceAll("*", "")
+    .replaceAll("_", "")
+    .replaceAll("(", "")
+    .replaceAll(")", "")
+  replaceAll(trim(noPunct), " ", "-")
 
-// Process inline code: `text` -> <code>text</code>
-val processInlineCode = (text: String): String =>
-  if contains(text, "`") then
-    val parts = split(text, "`")
-    val n = length(parts)
-    var result = ""
-    range(0, n).for(i =>
-      val part = parts[i]
-      val even = i % 2 == 0
-      if even then result = "${result}${part}"
-      else result = "${result}<code>${part}</code>"
-    )
-    result
-  else text
+// Escape the HTML-significant characters so code (and inline-code) renders verbatim.
+// `&` must be replaced first so the entities introduced below are not double-escaped.
+val escapeHtml = (text: String): String =>
+  text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
 
-// Process bold: **text** -> <strong>text</strong>
-val processInlineBold = (text: String): String =>
-  if contains(text, "**") then
-    val parts = split(text, "**")
-    val n = length(parts)
-    var result = ""
-    range(0, n).for(i =>
-      val part = parts[i]
-      val even = i % 2 == 0
-      if even then result = "${result}${part}"
-      else result = "${result}<strong>${part}</strong>"
-    )
-    result
-  else text
-
-// Process italic: _text_ -> <em>text</em>
-val processInlineItalic = (text: String): String =>
-  if contains(text, "_") then
-    val parts = split(text, "_")
-    val n = length(parts)
-    var result = ""
-    range(0, n).for(i =>
-      val part = parts[i]
-      val even = i % 2 == 0
-      if even then result = "${result}${part}"
-      else result = "${result}<em>${part}</em>"
-    )
-    result
-  else text
-
-// Process first link in text: [text](url) -> <a href="url">text</a>
-val processOneLink = (text: String): String =>
-  val idx = indexOf(text, "](")
-  if idx == -1 then text
+// Wrap the odd-indexed segments produced by splitting on a delimiter.
+// "a `b` c".split("`") -> ["a ", "b", " c"]; segments 1,3,5,... are the wrapped spans.
+val wrapAlternating = (text: String, delim: String, open: String, close: String): String =>
+  if contains(text, delim) == false then text
   else
-    val before = substring(text, 0, idx)
-    val after = substring(text, idx + 2, length(text))
-    val openBracket = indexOf(before, "[")
-    if openBracket == -1 then text
+    val parts = split(text, delim)
+    var out = ""
+    var i = 0
+    parts.for(part =>
+      if i % 2 == 0 then out = "${out}${part}"
+      else out = "${out}${open}${part}${close}"
+      i = i + 1
+    )
+    out
+
+// Replace the first [text](url) with an anchor tag, recursing on the remainder.
+val processLinks = (text: String): String =>
+  val mid = indexOf(text, "](")
+  if mid == -1 then text
+  else
+    val before = substring(text, 0, mid)
+    val after = substring(text, mid + 2, length(text))
+    val open = indexOf(before, "[")
+    val close = indexOf(after, ")")
+    if open == -1 || close == -1 then text
     else
-      val linkText = substring(before, openBracket + 1, length(before))
-      val prefix = substring(before, 0, openBracket)
-      val closeP = indexOf(after, ")")
-      if closeP == -1 then text
-      else
-        val url = substring(after, 0, closeP)
-        val rest = substring(after, closeP + 1, length(after))
-        "${prefix}<a href=\"${url}\">${linkText}</a>${rest}"
+      val prefix = substring(before, 0, open)
+      val linkText = substring(before, open + 1, length(before))
+      val url = substring(after, 0, close)
+      val rest = substring(after, close + 1, length(after))
+      // Bind the recursive result before interpolating: calling processLinks inline
+      // inside the interpolation releases the sibling substring locals early (the same
+      // projection/recursion RC bug recorded in KNOWN_ISSUES.md).
+      val tail = processLinks(rest)
+      "${prefix}<a href=\"${url}\">${linkText}</a>${tail}"
 
-// Apply all inline formatting
-val processInline = (text: String): String =>
-  val s1 = processInlineCode(text)
-  val s2 = processInlineBold(s1)
-  val s3 = processInlineItalic(s2)
-  processOneLink(s3)
-
-// Render a fenced code block
-val renderCodeBlock = (codeLines: String[], langClass: String): String =>
-  val content = join(codeLines, "\n")
-  if length(langClass) > 0 then
-    "<pre><code class=\"language-${langClass}\">${content}</code></pre>"
+// Inline code spans: wrap `code` in <code>…</code>, escaping the code's content so
+// characters like < and & render verbatim. Done separately from wrapAlternating so the
+// span content is escaped while surrounding prose is left for the other formatters.
+val processInlineCode = (text: String): String =>
+  if contains(text, "`") == false then text
   else
-    "<pre><code>${content}</code></pre>"
+    val parts = split(text, "`")
+    var out = ""
+    var i = 0
+    parts.for(part =>
+      if i % 2 == 0 then out = "${out}${part}"
+      else out = "${out}<code>${escapeHtml(part)}</code>"
+      i = i + 1
+    )
+    out
 
-// Close any open list, returning updated html
-val closeList = (html: String, inList: Boolean, listOrdered: Boolean): String =>
-  if inList then
-    val tag = if listOrdered then "ol" else "ul"
-    "${html}</${tag}>\n"
-  else html
+// Apply all inline formatting: code spans, bold, italic, then links.
+val inline = (text: String): String =>
+  val code = processInlineCode(text)
+  val bold = wrapAlternating(code, "**", "<strong>", "</strong>")
+  val italic = wrapAlternating(bold, "_", "<em>", "</em>")
+  processLinks(italic)
 
-// Close blockquote, returning updated html
-val closeBlockquote = (html: String, inBlockquote: Boolean): String =>
-  if inBlockquote then "${html}</blockquote>\n"
-  else html
+// ---------------------------------------------------------------------------
+// Phase 1: parse markdown source into a JSON array of block records
+// ---------------------------------------------------------------------------
 
-// Flush paragraph buffer
-val flushParagraph = (html: String, paragraphLines: String[]): String =>
-  if length(paragraphLines) > 0 then
-    "${html}<p>${processInline(join(paragraphLines, " "))}</p>\n"
-  else html
+// Block records:
+//   { "kind": "heading",    "level": Int32, "text": String }
+//   { "kind": "paragraph",  "text": String }
+//   { "kind": "code",       "lang": String, "code": String }
+//   { "kind": "list",       "ordered": Boolean, "items": String[] }
+//   { "kind": "blockquote", "lines": String[] }
+//   { "kind": "hr" }
 
-// Process a heading line: returns html fragment
-val headingHtml = (line: String, level: Int32, prefixLen: Int32): String =>
-  val text = substring(line, prefixLen, length(line))
-  val slug = slugify(text)
-  val processed = processInline(text)
-  "<h${level} id=\"${slug}\">${processed}</h${level}>\n"
+// Heading prefix length for levels 1..5 ("# " = 2, "## " = 3, ...), or 0 if not a heading.
+val headingLevel = (line: String): Int32 =>
+  if startsWith(line, "##### ") then 5
+  else if startsWith(line, "#### ") then 4
+  else if startsWith(line, "### ") then 3
+  else if startsWith(line, "## ") then 2
+  else if startsWith(line, "# ") then 1
+  else 0
 
-// Detect if a line is an ordered list item: "1. text", "2. text", etc.
-val isOrderedListItem = (line: String): Boolean =>
-  if length(line) < 3 then false
+// Is this an ordered list item? "1. text", "2. text", ...
+val isOrderedItem = (line: String): Boolean =>
+  val dot = indexOf(line, ". ")
+  if dot <= 0 then false
   else
-    val firstChar = substring(line, 0, 1)
-    val second = substring(line, 1, 2)
-    val containsDigit = contains("123456789", firstChar)
-    if containsDigit == false then false
-    else second == "."
+    val head = substring(line, 0, dot)
+    var allDigits = true
+    var i = 0
+    head.split("").for(ch =>
+      if ch != "" && contains("0123456789", ch) == false then allDigits = false
+      i = i + 1
+    )
+    allDigits
 
-// Handle a line inside a code block
-val processCodeBlockLine = (st: Json, rawLine: String): Json =>
-  if startsWith(trim(rawLine), "```") then
-    val cb = renderCodeBlock(st["codeLines"], st["codeBlockLang"])
-    {
-      "html": "${st["html"]}${cb}\n",
-      "inCodeBlock": false,
-      "codeBlockLang": "",
-      "codeLines": [],
-      "inList": st["inList"],
-      "listOrdered": st["listOrdered"],
-      "inBlockquote": st["inBlockquote"],
-      "paragraphLines": st["paragraphLines"]
-    }
-  else
-    val newLines = st["codeLines"]
-    newLines.push(rawLine)
-    { ...st, "codeLines": newLines }
+// The parser threads an immutable state record through one call per line. A record
+// (rather than captured `var`s) is used because the per-line dispatch has to be a
+// named function with multi-statement branches — inside a `.for(...)` lambda the
+// parser suppresses the indentation those branches rely on, so the dispatch can't
+// live there directly.
+//
+// State: {
+//   "blocks":      Json[]  — completed block records
+//   "para":        String[] — buffered paragraph lines
+//   "quote":       String[] — buffered blockquote lines
+//   "items":       String[] — buffered list items
+//   "ordered":     Boolean  — current list is ordered
+//   "inCode":      Boolean  — inside a fenced code block
+//   "codeLang":    String   — language tag of the open fence
+//   "codeLines":   String[] — buffered code lines
+// }
 
-// Handle a fence opening line
-val processFenceLine = (st: Json, trimmed: String): Json =>
-  val h1 = flushParagraph(st["html"], st["paragraphLines"])
-  val h2 = closeList(h1, st["inList"], st["listOrdered"])
-  val h3 = closeBlockquote(h2, st["inBlockquote"])
+// State threading is purely functional: every handler returns a NEW state record
+// built with the non-mutating `append`, never by reading a field and `push`-ing into
+// it. Reading `st["blocks"]` and mutating it would alias the value still referenced by
+// the caller (and by the shared starting record), corrupting the parse.
+val freshState = (): Json => {
+  "blocks": [], "para": [], "quote": [], "items": [],
+  "ordered": false, "inCode": false, "codeLang": "", "codeLines": []
+}
+
+// Append the buffered paragraph/quote/list (whichever is open) as completed blocks.
+// Each is independent, so this is safe to call before starting any new block.
+val withParagraphFlushed = (blocks: Json, st: Json): Json =>
+  if length(st["para"]) > 0 then blocks.append({ "kind": "paragraph", "text": join(st["para"], " ") }) else blocks
+
+val withQuoteFlushed = (blocks: Json, st: Json): Json =>
+  if length(st["quote"]) > 0 then blocks.append({ "kind": "blockquote", "lines": st["quote"] }) else blocks
+
+val withListFlushed = (blocks: Json, st: Json): Json =>
+  if length(st["items"]) > 0 then blocks.append({ "kind": "list", "ordered": st["ordered"], "items": st["items"] }) else blocks
+
+// All open buffers flushed into the completed-blocks array.
+val flushedBlocks = (st: Json): Json =>
+  withListFlushed(withQuoteFlushed(withParagraphFlushed(st["blocks"], st), st), st)
+
+// Flush every buffer and clear them.
+val flushBuffers = (st: Json): Json =>
+  { ...st, "blocks": flushedBlocks(st), "para": [], "quote": [], "items": [] }
+
+val handleCodeLine = (st: Json, line: String, trimmed: String): Json =>
+  if startsWith(trimmed, "```") then
+    val blocks = st["blocks"].append({ "kind": "code", "lang": st["codeLang"], "code": join(st["codeLines"], "\n") })
+    { ...st, "blocks": blocks, "inCode": false, "codeLang": "", "codeLines": [] }
+  else { ...st, "codeLines": st["codeLines"].append(line) }
+
+val openFence = (st: Json, trimmed: String): Json =>
   val lang = if length(trimmed) > 3 then trim(substring(trimmed, 3, length(trimmed))) else ""
-  {
-    "html": h3,
-    "inCodeBlock": true,
-    "codeBlockLang": lang,
-    "codeLines": [],
-    "inList": false,
-    "listOrdered": false,
-    "inBlockquote": false,
-    "paragraphLines": []
-  }
+  { ...flushBuffers(st), "inCode": true, "codeLang": lang, "codeLines": [] }
 
-// Handle an empty line
-val processEmptyLine = (st: Json): Json =>
-  val h1 = flushParagraph(st["html"], st["paragraphLines"])
-  val h2 = closeList(h1, st["inList"], st["listOrdered"])
-  val h3 = closeBlockquote(h2, st["inBlockquote"])
-  { ...st, "html": h3, "inList": false, "listOrdered": false, "inBlockquote": false, "paragraphLines": [] }
+val addHeading = (st: Json, line: String, level: Int32): Json =>
+  val blocks = flushedBlocks(st).append({ "kind": "heading", "level": level, "text": trim(substring(line, level + 1, length(line))) })
+  { ...st, "blocks": blocks, "para": [], "quote": [], "items": [] }
 
-// Handle a horizontal rule line
-val processHrLine = (st: Json): Json =>
-  val h1 = flushParagraph(st["html"], st["paragraphLines"])
-  val h2 = closeList(h1, st["inList"], st["listOrdered"])
-  val h3 = closeBlockquote(h2, st["inBlockquote"])
-  { ...st, "html": "${h3}<hr>\n", "inList": false, "listOrdered": false, "inBlockquote": false, "paragraphLines": [] }
+val addHr = (st: Json): Json =>
+  val blocks = flushedBlocks(st).append({ "kind": "hr" })
+  { ...st, "blocks": blocks, "para": [], "quote": [], "items": [] }
 
-// Handle a heading line (any level)
-val processHeadingLine = (st: Json, line: String, level: Int32, prefixLen: Int32): Json =>
-  val h1 = flushParagraph(st["html"], st["paragraphLines"])
-  val h2 = closeList(h1, st["inList"], st["listOrdered"])
-  { ...st, "html": "${h2}${headingHtml(line, level, prefixLen)}", "inList": false, "listOrdered": false, "paragraphLines": [] }
+// Flush paragraph and list, but keep accumulating consecutive quote lines.
+val addQuoteLine = (st: Json, line: String): Json =>
+  val blocks = withListFlushed(withParagraphFlushed(st["blocks"], st), st)
+  { ...st, "blocks": blocks, "para": [], "items": [], "quote": st["quote"].append(substring(line, 2, length(line))) }
 
-// Handle a h4/h5 heading (no list close needed)
-val processSmallHeadingLine = (st: Json, line: String, level: Int32, prefixLen: Int32): Json =>
-  val h1 = flushParagraph(st["html"], st["paragraphLines"])
-  { ...st, "html": "${h1}${headingHtml(line, level, prefixLen)}", "paragraphLines": [] }
+// Append a list item; a change of list kind (ordered vs unordered) closes the previous list.
+val addListItem = (st: Json, text: String, ordered: Boolean): Json =>
+  val base = withQuoteFlushed(withParagraphFlushed(st["blocks"], st), st)
+  val kindChanged = length(st["items"]) > 0 && st["ordered"] != ordered
+  val blocks = if kindChanged then withListFlushed(base, st) else base
+  val items = if kindChanged then [] else st["items"]
+  { ...st, "blocks": blocks, "para": [], "quote": [], "items": items.append(text), "ordered": ordered }
 
-// Handle a blockquote line
-val processBlockquoteLine = (st: Json, line: String): Json =>
-  val h1 = flushParagraph(st["html"], st["paragraphLines"])
-  val h2 = closeList(h1, st["inList"], st["listOrdered"])
-  val text = substring(line, 2, length(line))
-  val openTag = if st["inBlockquote"] == true then "" else "<blockquote>\n"
-  val newHtml = "${h2}${openTag}<p>${processInline(text)}</p>\n"
-  { ...st, "html": newHtml, "inList": false, "listOrdered": false, "inBlockquote": true, "paragraphLines": [] }
+val addParagraphLine = (st: Json, line: String): Json =>
+  val blocks = withListFlushed(withQuoteFlushed(st["blocks"], st), st)
+  { ...st, "blocks": blocks, "quote": [], "items": [], "para": st["para"].append(line) }
 
-// Handle an unordered list item line
-val processUnorderedListLine = (st: Json, line: String): Json =>
-  val h1 = flushParagraph(st["html"], st["paragraphLines"])
-  val h2 = closeBlockquote(h1, st["inBlockquote"])
-  val openTag = if st["inList"] == false then "<ul>\n" else if st["listOrdered"] == true then "</ol>\n<ul>\n" else ""
-  val text = substring(line, 2, length(line))
-  { ...st, "html": "${h2}${openTag}<li>${processInline(text)}</li>\n", "inList": true, "listOrdered": false, "inBlockquote": false, "paragraphLines": [] }
+// Dispatch one line to the handler that matches its markdown role.
+val parseLine = (st: Json, line: String): Json =>
+  val trimmed = trim(line)
+  if st["inCode"] then handleCodeLine(st, line, trimmed)
+  else if startsWith(trimmed, "```") then openFence(st, trimmed)
+  else if trimmed == "" then flushBuffers(st)
+  else if trimmed == "---" then addHr(st)
+  else if headingLevel(line) > 0 then addHeading(st, line, headingLevel(line))
+  else if startsWith(line, "> ") then addQuoteLine(st, line)
+  else if startsWith(line, "- ") then addListItem(st, substring(line, 2, length(line)), false)
+  else if isOrderedItem(line) then addListItem(st, substring(line, indexOf(line, ". ") + 2, length(line)), true)
+  else addParagraphLine(st, line)
 
-// Handle an ordered list item line
-val processOrderedListLine = (st: Json, line: String): Json =>
-  val h1 = flushParagraph(st["html"], st["paragraphLines"])
-  val h2 = closeBlockquote(h1, st["inBlockquote"])
-  val openTag = if st["inList"] == false then "<ol>\n" else if st["listOrdered"] == false then "</ul>\n<ol>\n" else ""
-  val dotPos = indexOf(line, ". ")
-  val text = if dotPos == -1 then line else substring(line, dotPos + 2, length(line))
-  { ...st, "html": "${h2}${openTag}<li>${processInline(text)}</li>\n", "inList": true, "listOrdered": true, "inBlockquote": false, "paragraphLines": [] }
-
-// Handle a plain paragraph line
-val processParagraphLine = (st: Json, line: String): Json =>
-  val h1 = closeList(st["html"], st["inList"], st["listOrdered"])
-  val h2 = closeBlockquote(h1, st["inBlockquote"])
-  val newParas = st["paragraphLines"]
-  newParas.push(line)
-  { ...st, "html": h2, "inList": false, "listOrdered": false, "inBlockquote": false, "paragraphLines": newParas }
-
-// Dispatch a single line to the appropriate handler
-val processLine = (st: Json, rawLine: String): Json =>
-  val inCB = st["inCodeBlock"]
-  if inCB == true then processCodeBlockLine(st, rawLine)
+// Close a code fence left open at end-of-input by emitting the buffered code block.
+val closeOpenCode = (st: Json): Json =>
+  if st["inCode"] == false then st
   else
-    val line = rawLine
-    val trimmed = trim(line)
-    if startsWith(trimmed, "```") then processFenceLine(st, trimmed)
-    else if trimmed == "" then processEmptyLine(st)
-    else if trimmed == "---" then processHrLine(st)
-    else if startsWith(line, "##### ") then processSmallHeadingLine(st, line, 5, 6)
-    else if startsWith(line, "#### ") then processSmallHeadingLine(st, line, 4, 5)
-    else if startsWith(line, "### ") then processHeadingLine(st, line, 3, 4)
-    else if startsWith(line, "## ") then processHeadingLine(st, line, 2, 3)
-    else if startsWith(line, "# ") then processHeadingLine(st, line, 1, 2)
-    else if startsWith(line, "> ") then processBlockquoteLine(st, line)
-    else if startsWith(line, "- ") then processUnorderedListLine(st, line)
-    else if isOrderedListItem(line) then processOrderedListLine(st, line)
-    else processParagraphLine(st, line)
+    val blocks = st["blocks"].append({ "kind": "code", "lang": st["codeLang"], "code": join(st["codeLines"], "\n") })
+    { ...st, "blocks": blocks, "inCode": false, "codeLines": [] }
 
-// Main converter
+export val parseBlocks = (source: String): Json =>
+  var state: Json = freshState()
+  source.split("\n").for(line => state = parseLine(state, line))
+  // Close an unterminated code fence, then flush trailing buffers.
+  val finalState = flushBuffers(closeOpenCode(state))
+  // `concat` returns an independent array. Returning the bare projection
+  // `finalState["blocks"]` instead hits a codegen use-after-free: the container is
+  // released before the projected array is cloned for the result (see KNOWN_ISSUES.md).
+  concat([], finalState["blocks"])
+
+// ---------------------------------------------------------------------------
+// Phase 2: render the JSON block model to an HTML fragment
+// ---------------------------------------------------------------------------
+
+val renderBlock = (block: Json): String =>
+  val kind = block["kind"]
+  if kind == "heading" then
+    val level = block["level"]
+    val text = block["text"]
+    "<h${level} id=\"${slugify(text)}\">${inline(text)}</h${level}>\n"
+  else if kind == "paragraph" then
+    "<p>${inline(block["text"])}</p>\n"
+  else if kind == "code" then
+    val lang = block["lang"]
+    val attr = if length(lang) > 0 then " class=\"language-${lang}\"" else ""
+    val escaped = escapeHtml(block["code"])
+    "<pre><code${attr}>${escaped}</code></pre>\n"
+  else if kind == "list" then
+    val tag = if block["ordered"] then "ol" else "ul"
+    var items = ""
+    block["items"].for(item => items = "${items}<li>${inline(item)}</li>\n")
+    "<${tag}>\n${items}</${tag}>\n"
+  else if kind == "blockquote" then
+    var inner = ""
+    block["lines"].for(qline => inner = "${inner}<p>${inline(qline)}</p>\n")
+    "<blockquote>\n${inner}</blockquote>\n"
+  else if kind == "hr" then "<hr>\n"
+  else ""
+
+export val renderBlocks = (blocks: Json): String =>
+  var html = ""
+  blocks.for(block => html = "${html}${renderBlock(block)}")
+  html
+
+// Convenience composition used by the site builder.
 export val markdownToHtml = (source: String): String =>
-  val lines = split(source, "\n")
-  val numLines = length(lines)
-
-  val initState = {
-    "html": "",
-    "inCodeBlock": false,
-    "codeBlockLang": "",
-    "codeLines": [],
-    "inList": false,
-    "listOrdered": false,
-    "inBlockquote": false,
-    "paragraphLines": []
-  }
-
-  // Use range-based iteration to work around String[] for-iteration bug
-  val finalState = range(0, numLines).reduce(initState, (st, i) => processLine(st, lines[i]))
-
-  // Final flush
-  val h1 = flushParagraph(finalState["html"], finalState["paragraphLines"])
-  val h2 = closeList(h1, finalState["inList"], finalState["listOrdered"])
-  val h3 = closeBlockquote(h2, finalState["inBlockquote"])
-  if finalState["inCodeBlock"] == true then
-    "${h3}${renderCodeBlock(finalState["codeLines"], finalState["codeBlockLang"])}\n"
-  else h3
+  renderBlocks(parseBlocks(source))

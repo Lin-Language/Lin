@@ -50,6 +50,7 @@ val longest = ["cat", "elephant", "dog"].reduce("", (acc, word) =>
 
 ```lin
 import { print } from "std/io"
+import { for } from "std/array"
 
 [1, 2, 3].for(x => print(x))
 ```
@@ -59,7 +60,8 @@ import { print } from "std/io"
 ## `range` — integer ranges
 
 ```lin
-import { range } from "std/array"
+import { print } from "std/io"
+import { range, for, map } from "std/array"
 
 range(0, 5).for(i => print(i))
 // 0 1 2 3 4
