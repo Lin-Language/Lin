@@ -1134,10 +1134,16 @@ callback via `CallTarget::Indirect` always boxes each element and unboxes the re
    `lin-ir`'s monomorphize `collect_subs`), so a generic combinator's callback is typed at the
    concrete element type rather than defaulting to `Json`.
 
-**Result.** array_pipeline output 1892804906 (unchanged); min-of-9 0.485s → 0.296s (**1.64x**) from
-the flat-output intrinsic lowering + provably-flat reads (vs the old boxed for/push loops). The main
-loops still box the per-element callback (the lambda parameter is `Json` without generic
-signatures), so this is NOT yet the zero-per-element-box win. Integration 352/0 (isolated),
+**Result.** array_pipeline output 1892804906 (unchanged). The flat-output intrinsic lowering +
+provably-flat reads drop the static box/unbox count (≈55→25) and the apparent debug-build speedup is
+large, BUT at the shipped `-O2` level the change is **perf-NEUTRAL** (verified interleaved release
+min-of-11: ~168ms before vs ~166ms after — within noise). LLVM's O2 already elides most of the
+removed boxing on the hot path, and the per-element callback is still boxed (the lambda parameter is
+`Json` without generic signatures), so this is NOT the zero-per-element-box win and delivers no
+measurable release speedup yet. (An earlier draft of this ADR cited 1.64x from debug-build numbers —
+that does not hold at `-O2`; corrected here.) The real value of this change is the three latent-bug
+fixes below plus routing map/filter/reduce through the typed intrinsics as the foundation for the
+real win once generic conversion + filter flow-narrowing land (Phase 6-round2). Integration 352/0 (isolated),
 stdlib+examples 59/59, all example projects, ASan-clean (stdlib+examples + flat/tagged/mixed/sortBy
 fixtures + the `[]`+push-typed-flat case). No-op invariant: a non-combinator program's main IR is
 byte-identical to base (only `std/array` differs, the intended change).
@@ -1170,6 +1176,8 @@ resolves to a non-scalar union — at which point the capture-less-lambda inline
 the zero-box pipeline. A second candidate, an unboxed-variant closure `fn_ptr` (a closure-struct ABI
 change), was judged too high-risk to attempt unattended and is not pursued.
 
-**Consequences.** A representation-safe, faster (1.64x) map/filter/reduce with three latent bugs
-fixed; the headline zero-box win is staged behind a documented checker prerequisite rather than
-shipped broken.
+**Consequences.** A representation-safe map/filter/reduce routed through the typed intrinsics with
+three latent bugs fixed (curried callback, malformed loop phi, flat-read-on-tagged). Perf-neutral at
+`-O2` today (the win is staged behind generic conversion + filter flow-narrowing, see above), but the
+correctness fixes and the cleaner intrinsic foundation ship now. The headline zero-box win is staged
+behind a documented checker prerequisite rather than shipped broken.
