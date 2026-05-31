@@ -419,18 +419,18 @@ impl Parser {
 
     pub(crate) fn parse_primary_expr(&mut self) -> Expr {
         match self.peek_kind() {
-            TokenKind::IntLit(_) => {
+            TokenKind::IntLit(..) => {
                 let span = self.current_span();
-                if let TokenKind::IntLit(v) = self.advance_kind() {
-                    Expr::IntLit(v, span)
+                if let TokenKind::IntLit(v, suffix) = self.advance_kind() {
+                    Expr::IntLit(v, suffix, span)
                 } else {
                     unreachable!()
                 }
             }
-            TokenKind::FloatLit(_) => {
+            TokenKind::FloatLit(..) => {
                 let span = self.current_span();
-                if let TokenKind::FloatLit(v) = self.advance_kind() {
-                    Expr::FloatLit(v, span)
+                if let TokenKind::FloatLit(v, suffix) = self.advance_kind() {
+                    Expr::FloatLit(v, suffix, span)
                 } else {
                     unreachable!()
                 }
@@ -484,7 +484,7 @@ impl Parser {
                 self.advance();
                 let right = self.parse_postfix_expr();
                 Expr::BinaryOp {
-                    left: Box::new(Expr::IntLit(0, span)),
+                    left: Box::new(Expr::IntLit(0, None, span)),
                     op: BinOp::Sub,
                     right: Box::new(right),
                     span,

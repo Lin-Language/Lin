@@ -67,9 +67,6 @@ jobs:
           for m in examples/*/main.lin; do
             dir="$(dirname "$m")"
             case "$dir" in
-              # ffi/ needs its C static lib prebuilt + linked (lin build only); the
-              # authoritative end-to-end FFI check is the Rust integration suite.
-              examples/ffi) echo "SKIP $m (needs prebuilt .a; covered by Rust FFI test)"; continue ;;
               # web-server/main.lin calls serve(...), which blocks forever; the router and
               # handlers are covered by *.test.lin and the Rust serve integration test.
               examples/web-server) echo "SKIP $m (serve blocks forever; covered by tests)"; continue ;;
@@ -169,7 +166,11 @@ jobs:
           for f in stdlib/*.test.lin examples/*/*.test.lin; do
             echo "==> $f"
             cargo run -p lin --quiet -- build "$f" -o /tmp/asan_test || { echo "BUILD FAIL $f"; fail=1; continue; }
-            clang-22 -fsanitize=address -g /tmp/asan_test.ll "$RT" -o /tmp/asan_test_bin
+            # The ffi suite calls into a committed C archive (libmathlib.a), which uses libm
+            # (sqrt). Link both for the ASan binary; every other test links only the runtime.
+            extra=""
+            case "$f" in examples/ffi/*) extra="examples/ffi/libmathlib.a -lm" ;; esac
+            clang-22 -fsanitize=address -g /tmp/asan_test.ll "$RT" $extra -o /tmp/asan_test_bin
             # Leak detection off: the stdlib intentionally retains program-lifetime
             # globals (module init state) that are never released at exit.
             if ! ASAN_OPTIONS=detect_leaks=0 /tmp/asan_test_bin > /tmp/asan_out 2>&1; then

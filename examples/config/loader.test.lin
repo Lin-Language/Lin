@@ -1,0 +1,35 @@
+import { expect, toBe, toSucceed, toFail, test, suite, run } from "std/test"
+import { load } from "./loader"
+
+// Unit suite for loader.lin: load() returns a tagged Success/Failure result. We
+// assert the discriminant and payload shape, not the downstream schema rules
+// (those are covered in schema.test.lin).
+val s = suite("config loader", [
+  test("loads a minimal config successfully", () => [
+    expect(load({ "name": "svc" })).toSucceed()
+  ]),
+  test("success result carries the resolved config under value", () =>
+    val r = load({ "name": "svc" })
+    [
+      expect(r["type"]).toBe("success"),
+      expect(r["value"]["name"]).toBe("svc")
+    ]
+  ),
+  test("full override loads successfully", () => [
+    expect(load({ "host": "0.0.0.0", "port": 9090, "debug": true, "name": "api" })).toSucceed()
+  ]),
+  test("missing required field fails to load", () => [
+    expect(load({ "port": 3000 })).toFail()
+  ]),
+  test("failure result carries a non-empty error string", () =>
+    val r = load({ "port": 3000 })
+    [
+      expect(r["type"]).toBe("failure"),
+      expect(r["error"] != null).toBe(true)
+    ]
+  ),
+  test("wrong-typed field fails to load", () => [
+    expect(load({ "name": "svc", "port": "nope" })).toFail()
+  ]),
+])
+run(s)

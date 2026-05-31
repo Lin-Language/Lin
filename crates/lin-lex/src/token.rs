@@ -1,4 +1,4 @@
-use lin_common::Span;
+use lin_common::{Span, NumSuffix};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
@@ -14,10 +14,11 @@ pub struct Token {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
-    // Literals
+    // Literals. Numeric literals carry an optional explicit type suffix (e.g. `42i8`,
+    // `3.14f32`); `None` means no suffix (type comes from context/default — spec §3.6, §26).
     StringLit(String),
-    IntLit(i64),
-    FloatLit(f64),
+    IntLit(i64, Option<NumSuffix>),
+    FloatLit(f64, Option<NumSuffix>),
     True,
     False,
     Null,

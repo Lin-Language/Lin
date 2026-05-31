@@ -55,18 +55,18 @@ impl Parser {
                     unreachable!()
                 }
             }
-            TokenKind::IntLit(_) => {
+            TokenKind::IntLit(..) => {
                 let span = self.current_span();
-                if let TokenKind::IntLit(v) = self.advance_kind() {
-                    Pattern::Literal(Box::new(Expr::IntLit(v, span)))
+                if let TokenKind::IntLit(v, suffix) = self.advance_kind() {
+                    Pattern::Literal(Box::new(Expr::IntLit(v, suffix, span)))
                 } else {
                     unreachable!()
                 }
             }
-            TokenKind::FloatLit(_) => {
+            TokenKind::FloatLit(..) => {
                 let span = self.current_span();
-                if let TokenKind::FloatLit(v) = self.advance_kind() {
-                    Pattern::Literal(Box::new(Expr::FloatLit(v, span)))
+                if let TokenKind::FloatLit(v, suffix) = self.advance_kind() {
+                    Pattern::Literal(Box::new(Expr::FloatLit(v, suffix, span)))
                 } else {
                     unreachable!()
                 }
