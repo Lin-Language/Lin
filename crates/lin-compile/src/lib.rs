@@ -30,6 +30,9 @@ pub enum CompileError {
     TypeCheck(Vec<lin_common::Diagnostic>),
     Codegen(String),
     Link(String),
+    /// A circular import was detected while resolving the module graph. Carries the
+    /// cycle as a human-readable path chain (e.g. `a -> b -> a`).
+    ImportCycle(String),
 }
 
 impl std::fmt::Display for CompileError {
@@ -44,6 +47,9 @@ impl std::fmt::Display for CompileError {
             }
             CompileError::Codegen(msg) => write!(f, "codegen error: {}", msg),
             CompileError::Link(msg) => write!(f, "link error: {}", msg),
+            CompileError::ImportCycle(chain) => {
+                write!(f, "circular import detected: {}", chain)
+            }
         }
     }
 }
@@ -73,7 +79,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     let mut import_order: Vec<String> = Vec::new();
     // import_sources holds (abs_source_path, source_text) for user-defined (non-stdlib) imports only.
     let mut import_sources: HashMap<String, (String, String)> = HashMap::new();
-    pre_resolve_imports_from_ast(&ast_module, &base_dir, &mut imported_modules, &mut import_order, &mut import_sources)?;
+    pre_resolve_imports_from_ast(&ast_module, &base_dir, &opts.source_path, &mut imported_modules, &mut import_order, &mut import_sources)?;
 
     // 3b. Type check main module with pre-resolved import types.
     let typed_module = check_module_with_imports(&ast_module, &imported_modules, false)
@@ -363,9 +369,46 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
 fn pre_resolve_imports_from_ast(
     ast_module: &Module,
     base_dir: &Path,
+    entry_path: &Path,
     cache: &mut HashMap<String, TypedModule>,
     order: &mut Vec<String>,
     import_sources: &mut HashMap<String, (String, String)>,
+) -> Result<(), CompileError> {
+    // `visiting` is the DFS stack of module identities currently being resolved; it both
+    // detects cycles and supplies the chain for the diagnostic. Seed it with the entry
+    // module so a cycle that loops back to the entry point is also caught and reported
+    // with a complete chain.
+    let entry_identity = entry_path
+        .canonicalize()
+        .unwrap_or_else(|_| entry_path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let mut visiting: Vec<String> = vec![entry_identity];
+    pre_resolve_imports_inner(ast_module, base_dir, cache, order, import_sources, &mut visiting)
+}
+
+/// A module's stable identity for cycle detection. Stdlib paths (`std/...`) are already
+/// canonical; user modules are keyed by their canonicalised absolute file path so that two
+/// different spellings of the same file (`../a` vs `a`) map to one identity.
+fn module_identity(path: &str, base_dir: &Path) -> String {
+    if stdlib_source(path).is_some() {
+        return path.to_string();
+    }
+    let file_path = base_dir.join(format!("{}.lin", path));
+    file_path
+        .canonicalize()
+        .unwrap_or(file_path)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn pre_resolve_imports_inner(
+    ast_module: &Module,
+    base_dir: &Path,
+    cache: &mut HashMap<String, TypedModule>,
+    order: &mut Vec<String>,
+    import_sources: &mut HashMap<String, (String, String)>,
+    visiting: &mut Vec<String>,
 ) -> Result<(), CompileError> {
     for stmt in &ast_module.statements {
         let Stmt::Import { path, .. } = stmt else { continue };
@@ -373,16 +416,29 @@ fn pre_resolve_imports_from_ast(
             continue;
         }
 
+        // Detect a circular import before descending: if this module is already on the
+        // DFS stack, recursing would loop forever (and overflow the stack). Report the
+        // cycle as a readable `a -> b -> a` chain instead.
+        let identity = module_identity(path, base_dir);
+        if let Some(start) = visiting.iter().position(|m| m == &identity) {
+            let mut chain: Vec<String> = visiting[start..].to_vec();
+            chain.push(identity);
+            return Err(CompileError::ImportCycle(chain.join(" -> ")));
+        }
+        visiting.push(identity);
+
+        // From here, any early `?` aborts the whole compile, so `visiting` is discarded;
+        // we only need to `pop` on the paths that fall through to the next sibling import.
         let (ast_mod, src_text, imported_base, abs_path) = if let Some(src) = stdlib_source(path.as_str()) {
             let ast = parse_source(src).map_err(CompileError::TypeCheck)?;
-            pre_resolve_imports_from_ast(&ast, base_dir, cache, order, import_sources)?;
+            pre_resolve_imports_inner(&ast, base_dir, cache, order, import_sources, visiting)?;
             (ast, src.to_string(), base_dir.to_path_buf(), None)
         } else {
             let file_path = base_dir.join(format!("{}.lin", path));
             let src = std::fs::read_to_string(&file_path)?;
             let ast = parse_source(&src).map_err(CompileError::TypeCheck)?;
             let imported_base = file_path.parent().unwrap_or(base_dir).to_path_buf();
-            pre_resolve_imports_from_ast(&ast, &imported_base, cache, order, import_sources)?;
+            pre_resolve_imports_inner(&ast, &imported_base, cache, order, import_sources, visiting)?;
             let abs = file_path.canonicalize().unwrap_or(file_path);
             (ast, src, imported_base, Some(abs.to_string_lossy().to_string()))
         };
@@ -399,6 +455,7 @@ fn pre_resolve_imports_from_ast(
             }
             order.push(path.clone());
             cache.insert(path.clone(), cached);
+            visiting.pop();
             continue;
         }
 
@@ -415,6 +472,7 @@ fn pre_resolve_imports_from_ast(
         }
         order.push(path.clone());
         cache.insert(path.clone(), typed);
+        visiting.pop();
     }
     Ok(())
 }

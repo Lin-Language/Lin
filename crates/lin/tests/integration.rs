@@ -1718,6 +1718,71 @@ print("unused")
 }
 
 #[test]
+fn test_circular_import_is_diagnosed_not_stack_overflow() {
+    // Regression: import resolution recursed before caching, so a cyclic import
+    // (a -> b -> a) recursed forever and overflowed the stack (SIGABRT) instead of
+    // producing a diagnostic. The DFS now tracks an on-stack `visiting` set and reports
+    // a clean "circular import detected" error with the cycle chain.
+    let dir = std::env::temp_dir().join(format!("lin_import_cycle_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("a.lin"),
+        "import { fromB } from \"b\"\n\
+         export val fromA = (): Int32 => 1\n\
+         val x = fromB()\n").unwrap();
+    std::fs::write(dir.join("b.lin"),
+        "import { fromA } from \"a\"\n\
+         export val fromB = (): Int32 => fromA()\n").unwrap();
+
+    let bin_path = dir.join("a.out");
+    let compile = Command::new(lin_bin())
+        .args(["build", dir.join("a.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+
+    let stderr = String::from_utf8_lossy(&compile.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&compile.stdout).to_string();
+    let combined = format!("{stderr}{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Must fail cleanly, not crash: a stack overflow aborts with SIGABRT (signal 6),
+    // which is neither a normal exit nor the diagnostic we expect.
+    assert!(!compile.status.success(), "expected failure, got success: {combined}");
+    assert!(
+        combined.contains("circular import detected"),
+        "expected a circular-import diagnostic, got: {combined}"
+    );
+    // The chain should name both modules in the cycle.
+    assert!(combined.contains("a.lin") && combined.contains("b.lin"),
+        "expected the cycle chain to name a.lin and b.lin, got: {combined}");
+}
+
+#[test]
+fn test_diamond_imports_are_not_false_cycles() {
+    // A module imported by two different paths (a diamond) is NOT a cycle. Resolution
+    // pops each module from the visiting stack when done, so the shared dependency is
+    // reached twice without being flagged.
+    let dir = std::env::temp_dir().join(format!("lin_import_diamond_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("shared.lin"),
+        "export val base = (): Int32 => 10\n").unwrap();
+    std::fs::write(dir.join("left.lin"),
+        "import { base } from \"shared\"\n\
+         export val viaLeft = (): Int32 => base() + 1\n").unwrap();
+    std::fs::write(dir.join("right.lin"),
+        "import { base } from \"shared\"\n\
+         export val viaRight = (): Int32 => base() + 2\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ viaLeft }} from "{d}/left"
+import {{ viaRight }} from "{d}/right"
+print(toString(viaLeft() + viaRight()))
+"#, d = dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["23"]);
+}
+
+#[test]
 fn test_default_args_trailing_comma_still_curries() {
     // A trailing comma requests partial application even when defaults exist,
     // rather than filling the default.

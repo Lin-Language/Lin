@@ -1452,7 +1452,7 @@ Object key access never causes a runtime error — missing keys produce `Null` (
 
 Floating-point operations follow IEEE 754: division by zero produces `±Infinity` or `NaN`, not an error. Integer `%` follows the sign of the dividend (Rust convention).
 
-> **Note on import cycles.** Imports are resolved eagerly at compile time (§22.5). A circular import is not currently detected and is a known gap (Appendix B); it is not surfaced as a clean runtime error.
+> **Note on import cycles.** Imports are resolved eagerly at compile time (§22.5). A circular import is a **compile-time error** (`circular import detected: a -> b -> a`), not a runtime fault.
 
 ---
 
@@ -1552,7 +1552,7 @@ resolves to `myDir/anotherDir/aFile.lin`, located relative to the importing file
 
 Imports are resolved **eagerly at compile time**: the entry-point module and all of its transitive imports are parsed and type-checked before code generation. Each imported module is type-checked once and cached by source hash (`.lin-cache/`), and a separate signature file records just its exported name→type map so dependents can verify their usage without re-checking the full module. Module-level `val`/`var` initialise in dependency order at program start.
 
-Circular imports are not currently detected (Appendix B). The original design called for lazy initialisation with a runtime error on a cycle within an init chain; that is not what the implementation does today.
+A **circular import is a compile-time error**: resolution tracks the chain of modules currently being resolved and, if an import re-enters one already on that chain, reports `circular import detected: a -> b -> a` rather than looping. (This differs from the original design, which called for lazy initialisation with a *runtime* error on a cycle; the implemented behaviour rejects the cycle earlier, at compile time.) A diamond — the same module reached by two independent import paths — is not a cycle and is resolved once.
 
 ### 22.6 Naming Conventions
 
@@ -2578,7 +2578,7 @@ val parseAge = (input: String): Result<Int32, String> =>
 26. Numeric widening is always to a type that can fully represent both operand ranges; widening is applied everywhere (operators, calls, returns, assignments) but narrowing is never implicit.
 27. The standard-library module list and signatures live in `docs/STDLIB.md`; names are imported explicitly (nothing is auto-imported as a global). `range`/`iterOf` are in `std/array`; there is no `std/iter` or `std/result` module.
 28. Two-space indentation; `&&`/`||` may begin a continuation line at any deeper indent.
-29. Imports are resolved eagerly at compile time; each module is checked once and cached. (Cycle handling: see B.2.)
+29. Imports are resolved eagerly at compile time; each module is checked once and cached. A circular import is a compile-time error (§22.5); a diamond is not a cycle.
 30. Bracket access is safe: missing object key → `Null`, `Null` propagates; array OOB is a runtime error.
 31. Generic types are covariant in producer positions, contravariant in consumer positions.
 32. Type-expression precedence: `[]` > `<>` > `=>` > `|`.
@@ -2593,7 +2593,6 @@ val parseAge = (input: String): Result<Int32, String> =>
 
 ### B.2 Known Gaps and Deferred Work
 
-- **Circular import detection.** Imports resolve eagerly at compile time (§22.5); a cyclic import is not currently detected and is not surfaced as a clean error. The original lazy-initialisation-with-runtime-cycle-error design is not implemented.
 - **`Float8` / `Float16`.** Listed in earlier drafts; not implemented. Only `Float32`/`Float64` exist.
 - **Nominal `Promise<T>` / `ThreadPool` / `Worker<Msg,Reply>` types.** These are opaque runtime values erased to `Json` (§4.1, §24.1). The checker enforces "handle the `Error` after `await`" but cannot catch "forgot to `await`" (ADR-070).
 - **`Number` / `Iterable<T>` as resolvable names.** Conceptual only; use `Json` or concrete families / `Iterator<T>`.

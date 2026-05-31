@@ -1045,3 +1045,35 @@ test-only + intrinsic/unused diagnostics).
   `examples/web-server/` (mock `render`) — each replaces a side-effecting dependency in its tests; the feature is
   documented in docs/SPECIFICATION.md §22.8–22.9, docs/STDLIB.md (std/test), and the doc-site
   Testing tutorial.
+
+## ADR-072: Circular imports are a compile-time error (DFS visiting-stack)
+
+**Decision**: A circular import is rejected at compile time with a
+`CompileError::ImportCycle` carrying the cycle as a readable chain
+(`circular import detected: a -> b -> a`). Import resolution
+(`pre_resolve_imports_inner` in `lin-compile`) threads a `visiting: Vec<String>`
+DFS stack of module *identities*; before descending into an import it checks
+whether that identity is already on the stack and, if so, returns the cycle chain
+instead of recursing. A module's identity is its canonicalised absolute file path
+(so `../a` and `a` are one module) or, for stdlib, the `std/...` path. The
+entry-point module seeds the stack so a cycle that loops back to the entry is also
+caught. Each module is popped on the success paths (cache-hit and
+checked-and-cached), so a **diamond** — one module reached by two independent
+paths — is resolved once and is *not* flagged (the second visit hits the
+`cache.contains_key` guard).
+
+**Rationale**: Resolution recurses into each import *before* inserting it into the
+cache, so the pre-existing `cache.contains_key` guard could never break a cycle —
+`a -> b -> a` recursed forever and **overflowed the stack** (SIGABRT), a crash with
+no diagnostic. The spec originally called for *lazy* initialisation with a
+*runtime* cycle error, but the implementation resolves eagerly at compile time, so
+catching the cycle during resolution (earlier, with a clean message) is both
+simpler and stricter than the original design. A visiting-stack DFS is the standard
+cycle-detection shape and yields the chain for free.
+
+**Consequence**: A cyclic import fails `lin build`/`lin run` with
+`circular import detected: <chain>` and a non-zero exit, never a stack overflow.
+Diamonds and ordinary deep import graphs are unaffected. Spec §22.5/§20.1 and
+decision-list #29 updated to "circular import is a compile-time error." Regressions:
+`test_circular_import_is_diagnosed_not_stack_overflow` and
+`test_diamond_imports_are_not_false_cycles` in `crates/lin/tests/integration.rs`.
