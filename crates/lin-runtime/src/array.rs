@@ -604,14 +604,39 @@ pub unsafe extern "C" fn lin_array_slice_dyn(arr: *const u8, start: i64, end: i6
     alloc_tagged(TAG_ARRAY, out as u64)
 }
 
-/// Copy all elements from `src` into `dst` (tagged arrays only).
-/// Used by lin concat(a, b) — appends all elements of src to dst.
+/// Copy all elements from `src` into `dst` (tagged arrays only), MOVING each element's
+/// 16-byte `TaggedVal` without retaining its payload. The caller must own the moved-from
+/// elements and not release them afterwards (e.g. `concat_dyn`'s widened-flat temp, whose
+/// boxes are transferred to `dst` and whose array struct is then freed by `lin_array_free`
+/// — which frees only the struct + data buffer, never the element payloads). Using this on
+/// a borrowed source that stays live double-counts and leads to a use-after-free; use
+/// `lin_array_concat_into_retaining` for that case.
 #[no_mangle]
 pub unsafe extern "C" fn lin_array_concat_into(dst: *mut LinArray, src: *const LinArray) {
     if src.is_null() { return; }
     let src_len = (*src).len as usize;
     for i in 0..src_len {
         let elem = (*src).data.add(i);
+        lin_array_push_tagged(dst, elem as *const u8);
+    }
+}
+
+/// Copy all elements from a BORROWED `src` into `dst` (tagged arrays only), RETAINING each
+/// element's heap payload so `dst` and `src` are independent owners. This is the correct
+/// primitive when `src` stays alive after the copy (e.g. `concat(a, b)` where `a`/`b` are the
+/// caller's still-owned arrays). Without the retain, both arrays reference the same payload at
+/// one refcount, and freeing either frees the shared payload out from under the other —
+/// observable as heap corruption when concatenating fresh (non-interned) strings/objects.
+#[no_mangle]
+pub unsafe extern "C" fn lin_array_concat_into_retaining(dst: *mut LinArray, src: *const LinArray) {
+    if src.is_null() { return; }
+    let src_len = (*src).len as usize;
+    for i in 0..src_len {
+        let elem = (*src).data.add(i);
+        // Retain the payload before the move-copy so dst is an independent owner.
+        // LinArrayElem and TaggedVal share the same {tag, payload} layout (push_tagged
+        // raw-copies the 16 bytes between them), so the reinterpret is sound.
+        crate::object::retain_tagged_payload_pub(&*(elem as *const crate::tagged::TaggedVal));
         lin_array_push_tagged(dst, elem as *const u8);
     }
 }
@@ -672,7 +697,8 @@ pub unsafe extern "C" fn lin_array_concat_dyn(a: *const u8, b: *const u8) -> *mu
         if src.is_null() { return; }
         let et = (*src).elem_tag;
         if et == 0xFF {
-            lin_array_concat_into(out, src);
+            // Borrowed tagged source — retain each element so `out` owns its own references.
+            lin_array_concat_into_retaining(out, src);
             return;
         }
         let widened: *mut LinArray = match et {
@@ -686,8 +712,10 @@ pub unsafe extern "C" fn lin_array_concat_dyn(a: *const u8, b: *const u8) -> *mu
             TAG_INT16   => lin_flat_to_tagged_i16(src),
             TAG_UINT32  => lin_flat_to_tagged_u32(src),
             TAG_UINT64  => lin_flat_to_tagged_u64(src),
-            _ => { lin_array_concat_into(out, src); return; }
+            _ => { lin_array_concat_into_retaining(out, src); return; }
         };
+        // `widened` is a fresh +1 temp whose boxed scalars are MOVED into `out`; freeing it
+        // drops only the struct + buffer (never the element payloads), so this stays a move.
         lin_array_concat_into(out, widened);
         lin_array_free(widened);
     }

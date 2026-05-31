@@ -882,3 +882,36 @@ Two supporting fixes: (1) `subst_expr` now substitutes the declared-type field o
 **Rationale**: The importer has the full `TypedModule` for every import (not just the signature), so it can see imported generic BODIES — the only place with both the body and the concrete call types. Specializing there avoids touching the imported module's compilation/caching and avoids cross-contamination (each importer derives its own specializations from the cached generic body; the `.lin-cache` stores the TypedModule with the generic body intact, keyed by source hash regardless of how importers instantiate). The no-op invariant is preserved: `module_uses_generic` gates the whole pass, so a module that neither defines nor imports a param-generic function lowers byte-for-byte as before (verified: `benchmarks/array_pipeline.lin` IR is byte-identical to baseline).
 
 **Consequence**: User-defined cross-module generics — including higher-order ones with the `map` shape (`<T,U>(arr: T[], f: (T) => U)`) — specialize to native, unboxed code in the importer (e.g. `id$Int32` is `define i32 @"id$Int32"(i32)`). Verified end-to-end (output + IR proof + ASan, no UAF/leak) and across the cache (two importers using one imported generic at different element types each get correct specializations). **Converting stdlib `map`/`filter`/`reduce` to generic was attempted and DEFERRED**: the specialized bodies are themselves nearly box-free, but (a) the result of a `[]`-plus-`push` build is a *tagged* array while a static `U[]` result type makes consumers read via the *flat* ABI — a representation mismatch — and (b) the per-element boxing at the `lin_for` callback boundary remains (the closure ABI passes a `TaggedVal*`), so the static box count rose and ~20 of the diverse stdlib/example uses regressed. The full flat/zero-box pipeline needs closure-callback ABI specialization, which is the next increment. stdlib `array.lin` is therefore left `Json`-typed; the cross-module infrastructure is in place for when that lands.
+
+## ADR-064: `concat` retains copied elements (move-vs-retain split in array element copy)
+
+**Decision**: When `lin_array_concat_dyn` copies elements from a **borrowed** source array (the
+tagged-element path, `elem_tag == 0xFF`), it now **retains** each element's heap payload via the new
+`lin_array_concat_into_retaining`, so the result array and the source array are independent owners.
+The non-retaining `lin_array_concat_into` (a raw 16-byte `TaggedVal` move, no retain) is **kept** and
+used only where the source is a fresh temp whose ownership is transferred — `concat_dyn`'s
+widened-flat path, where `lin_flat_to_tagged_*` boxes raw scalars at `+1` and the temp array is then
+`lin_array_free`d (which frees only the struct + buffer, never the element payloads, so the boxes are
+correctly *moved* into the result).
+
+**Rationale**: The old `concat_dyn` used the move-copy (`lin_array_push_tagged`, raw 16-byte copy
+without retain) for **every** path, including borrowed sources. So `concat(a, b)` left `a`/`b` and the
+result sharing each element at one refcount; releasing any of them (e.g. `acc = concat(acc, […])` in a
+loop, which frees the old `acc`) freed the shared payload out from under the result — a genuine
+use-after-free, ASan-confirmed (`heap-use-after-free in lin_string_release` on pristine master). It was
+masked in practice only because string *literals* are interned with immortal refcounts; `concat` of
+computed strings/objects corrupted the heap. `lin_array_push_tagged` itself MUST stay non-retaining —
+its other callers (`io`/`fs`/`json`/`async_rt`/`frozen` building arrays from freshly-owned values, and
+the `map`/`minBy`/`maxBy` element-move convention noted in `lower.rs`) deliberately rely on the move
+to transfer ownership; adding a retain there would leak. The fix therefore lives in a *separate
+retaining copy primitive* selected per-source-ownership inside `concat_dyn`, not in the shared push.
+
+**Consequence**: `concat` of fresh (non-interned) heap values is now memory-safe — the growing-concat
+loop runs clean under ASan (only the pre-existing program-lifetime interned-string-cache leak remains;
+a scoped concat-of-fresh-strings test leaks nothing of its own). The move-vs-retain split is the
+load-bearing invariant: a future change must keep "copy from a still-live borrowed array → retain;
+copy from a fresh temp being freed → move". Regression: `test_concat_fresh_strings_no_use_after_free`
+(40-iteration growing concat of interpolated strings). The sibling `append`/`prepend` intrinsics
+(ADR-062) already retain by the same reasoning; this brings `concat` into line. The analogous
+move-without-retain residual leaks in the `for`/`map` element-shell path (`lower.rs`) are a distinct,
+pre-existing issue and are not addressed here.
