@@ -1083,3 +1083,93 @@ everywhere. The flat-pipeline payoff awaits the unboxed closure ABI (Phase 5b) w
 builder/`for`-callback combinators (and ultimately `map`). Regression: integration 351/0,
 stdlib+examples 59/59, all example projects build, ASan-clean. Tests in `stdlib/array.test.lin`
 (`at`/`set`/`indexOf` on `Int32[]`+`String[]`+round-trip).
+
+## ADR-068: Route `map`/`filter`/`reduce` through the materializing `lin_*` intrinsics with representation-safe element reads; defer the full unboxed-callback win to a generic-signature + filter-narrowing prerequisite
+
+**Status.** Accepted (partial; the unboxed per-element callback win is investigated, proven in
+isolation, and deferred — see below).
+
+**Context (the LINCHPIN goal).** The generics/perf milestone targets ZERO per-element boxing in a
+monomorphic array pipeline `range(0,n).map(x=>x*2).filter(x=>x%3==0).reduce(0,(a,x)=>a+x)`. The
+blocker is the UNIFORM ALL-PTR BOXED CLOSURE ABI: a closure's stored `fn_ptr` is a
+`__cls_wrapb_*` wrapper `ptr(ptr env, ptr boxedArg…) -> ptr boxedRet`, so a combinator calling its
+callback via `CallTarget::Indirect` always boxes each element and unboxes the result — per-element
+`lin_box_int32`/`lin_unbox_int32` + malloc, even at a concrete element type.
+
+**What this change does (the shipped, fully-tested subset).**
+1. `std/array`'s `map`/`filter`/`reduce` are thin wrappers over the `lin_map`/`lin_filter`/
+   `lin_reduce` intrinsics (previously these intrinsics existed but were UNUSED; map/filter/reduce
+   were hand-written `for`/`push` loops). Their IR lowering (`lower_map`/`lower_filter`/
+   `lower_reduce` in `lin-ir/src/lower.rs`) allocates a flat output array for a flat-scalar result
+   element and reads flat where the source is provably flat — replacing the old boxed `for`/`push`
+   loops. `lin_map`/`lin_filter` now declare an `Array<U>`/`Array<T>` result (was `Iterator`), to
+   match the `Json` wrapper and the materialized reality.
+2. **Representation-safe element reads (`combinator_read_elem_ty`).** A flat-scalar `T[]` STATIC
+   type does NOT guarantee a flat RUNTIME buffer: a `[]`+push builder (`val r=[]; …push(r,x)…; r`)
+   allocates a TAGGED array even when later used as `Int32[]` (the empty literal is `Array(Never)`).
+   A flat read on it misreads garbage. So each combinator reads at the element type only when the
+   source is a PROVABLY-FLAT producer (a `range`/`map`/`filter`/flat-alloc call, or a non-empty
+   scalar array literal — `is_provably_flat_producer`); otherwise it reads via the tagged getter
+   (`lin_array_get_tagged`, which dispatches on the array's runtime `elem_tag` and is correct for
+   both flat and tagged), keeping `[]`+push arrays sound. This fixes a PRE-EXISTING latent
+   mismatch (a `[]`+push-typed-`Int32[]` array read flat) that the intrinsic routing would
+   otherwise have exposed.
+3. **`[]`+push flat-push consistency.** `Intrinsic::Push` now routes a push into a statically
+   flat-scalar array (`Array(flat_scalar)`) through `lin_push_dyn` (which dispatches on the runtime
+   `elem_tag`, coercing the boxed element into the flat slot) instead of `lin_array_push_tagged`
+   (which corrupts a flat buffer). Scalars carry no refcount, so no RC balancing is needed.
+4. **Curried-callback codegen fix (latent bug).** The indirect closure-call path treated "result is
+   a `Function`" as UNDER-APPLICATION (partial application). A CURRIED callee at full arity that
+   RETURNS a function (e.g. a `map` callback `i => () => i`) is indistinguishable from
+   under-application by return type alone, so it was wrongly bundled into a partial-application
+   closure → garbage. Now disambiguated by ARG-COUNT vs the callee's declared arity
+   (`crates/lin-codegen/src/codegen/mod.rs`).
+5. **`emit_index_loop` phi back-edge patch (latent bug).** The index-loop scaffold hard-coded the
+   loop body block as the phi's back-edge predecessor, which is wrong when the body switches blocks
+   (e.g. `filter`'s keep/skip split — never exercised before because nothing called `lin_filter`).
+   The phi's back-edge is now patched to the block that actually jumps back to the header
+   (`patch_phi_incoming`).
+6. **Checker `Array`↔`Iterator` cross-unification** in `collect_type_subs`: a generic `T[]` param
+   applied to a runtime `Iterator<Int32>` (e.g. `range(0,n)`) now binds `T=Int32` (mirrors
+   `lin-ir`'s monomorphize `collect_subs`), so a generic combinator's callback is typed at the
+   concrete element type rather than defaulting to `Json`.
+
+**Result.** array_pipeline output 1892804906 (unchanged); min-of-9 0.485s → 0.296s (**1.64x**) from
+the flat-output intrinsic lowering + provably-flat reads (vs the old boxed for/push loops). The main
+loops still box the per-element callback (the lambda parameter is `Json` without generic
+signatures), so this is NOT yet the zero-per-element-box win. Integration 352/0 (isolated),
+stdlib+examples 59/59, all example projects, ASan-clean (stdlib+examples + flat/tagged/mixed/sortBy
+fixtures + the `[]`+push-typed-flat case). No-op invariant: a non-combinator program's main IR is
+byte-identical to base (only `std/array` differs, the intended change).
+
+**Why the full unboxed-callback win is DEFERRED (the investigation result).** The clean way to get
+the lambda parameter typed at the concrete element (eliminating input boxing) AND to route the call
+to the intrinsic with the lambda literal VISIBLE (so its body can be inlined unboxed) is to make
+`map`/`filter`/`reduce` GENERIC (`<T,U>(T[], (T)=>U): U[]`). A prototype of that — generic
+signatures + a monomorphize "thin-wrapper-combinator" call-site inline + a capture-less-lambda
+inliner in `lower_map`/`lower_filter`/`lower_reduce` (binding the param to the flat element, lowering
+the body inline, carrying a scalar reduce accumulator unboxed through the loop phi) — achieved the
+FULL payoff: array_pipeline min-of-9 0.485s → **0.033s (14.7x)**, ZERO box/unbox in the main loops,
+ASan-clean. It was NOT shipped because the generic signatures regress the Json/union-typed call
+sites the rest of the stdlib and examples rely on:
+  - `examples/report`: `validRecords(): Record[]` ends `…filter(r => r["type"]=="success").map(r =>
+    r["value"])`. With a precise generic `map`, the body types as `(Record | Null)[]` (the `Null`
+    because `r["value"]` on the `Success | Failure` union is nullable — the `filter` does not
+    NARROW the union), which is not assignable to `Record[]`. The old `Json`-returning `map`
+    absorbed this. Fixing it soundly needs **flow-narrowing through `filter`** (a real checker
+    feature), out of scope here.
+  - `sortBy`/`minBy`/`maxBy` etc. call `arr.map(item => [keyFn(item), item])` over a `Json[]`; the
+    chained generic instantiation over `Json` arrays tripped monomorphize inference gaps and an RC
+    mismatch in the `[]`+push pair builder.
+Per the milestone's correctness-over-completeness discipline (never ship a broken pipeline), the
+generic conversion + the inline mechanism were reverted; only the representation-safe intrinsic
+routing + the latent-bug fixes above ship. The full win is unblocked by: (a) generic `map`/`filter`/
+`reduce` signatures, (b) `filter` flow-narrowing (so a post-`filter` union member access isn't
+nullable), and (c) a Json-permissive fallback for a generic combinator result whose element type
+resolves to a non-scalar union — at which point the capture-less-lambda inliner (proven above) lands
+the zero-box pipeline. A second candidate, an unboxed-variant closure `fn_ptr` (a closure-struct ABI
+change), was judged too high-risk to attempt unattended and is not pursued.
+
+**Consequences.** A representation-safe, faster (1.64x) map/filter/reduce with three latent bugs
+fixed; the headline zero-box win is staged behind a documented checker prerequisite rather than
+shipped broken.
