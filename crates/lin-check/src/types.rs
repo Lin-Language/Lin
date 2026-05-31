@@ -42,6 +42,15 @@ pub enum Type {
     /// constructed only by the `shared` intrinsic's return type; it cannot be spelled in source
     /// annotations (no `resolve.rs` case), so user code can never name it directly.
     Shared(Box<Type>),
+    /// `Stream<T>` — an opaque, lazy, effectful pull-source that owns an OS resource (a file
+    /// descriptor, socket, …) (ADR-072, streams brief). A sibling to `Iterator` but distinct:
+    /// the iterator protocol's `cond`/`current` must be pure, whereas a stream is effectful and
+    /// fallible. Like `Shared`, it is NOT structurally compatible with `T` or `Json` (see
+    /// `compat.rs`), so any operation other than the stream API is a compile-time type error.
+    /// It is NON-TRANSFERABLE across threads by copy (it owns a resource); crossing a thread
+    /// boundary is a MOVE (CAP_MOVE, Stage 7). Covariant in `T`. Constructed only by the stream
+    /// source intrinsics' return types; it cannot be spelled in source annotations.
+    Stream(Box<Type>),
     TypeVar(u32),
     Never,
     /// A named type alias reference (used for recursive types that cannot be eagerly expanded).
@@ -141,7 +150,7 @@ impl Type {
     pub fn contains_type_var(&self) -> bool {
         match self {
             Type::TypeVar(_) => true,
-            Type::Array(inner) | Type::Iterator(inner) => inner.contains_type_var(),
+            Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner) => inner.contains_type_var(),
             Type::FixedArray(elems) => elems.iter().any(|t| t.contains_type_var()),
             Type::Union(variants) => variants.iter().any(|t| t.contains_type_var()),
             Type::Object(fields) => fields.values().any(|t| t.contains_type_var()),
@@ -252,6 +261,7 @@ impl fmt::Display for Type {
             }
             Type::Iterator(inner) => write!(f, "Iterator<{}>", inner),
             Type::Shared(inner) => write!(f, "Shared<{}>", inner),
+            Type::Stream(inner) => write!(f, "Stream<{}>", inner),
             Type::TypeVar(id) => write!(f, "?T{}", id),
             Type::Never => write!(f, "Never"),
             Type::Named(name) => write!(f, "{}", name),
