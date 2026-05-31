@@ -47,9 +47,13 @@ export val retryDivide = (n: Int32, divisor: Int32, times: Int32): Json =>
   await(retry(() => n / divisor, times))
 
 // fault isolation (§32.2.2) — a runtime fault inside the thunk surfaces as an Error value
-// at `await`; we discriminate it with `is Error` and recover, rather than aborting.
+// at `await`; we discriminate it with `is Error` and recover, rather than aborting. await now
+// yields `T | Error`, so the result is taken as `Json` and the match recovers to a concrete Int32.
 export val safeDivide = (n: Int32, divisor: Int32): Int32 =>
-  val result = await(async(() => n / divisor))
+  recoverInt(await(async(() => n / divisor)))
+
+// Recover an awaited numeric result: a faulted Error becomes -1, otherwise the value.
+val recoverInt = (result: Json): Int32 =>
   match result
     is Error => 0 - 1
     else => result
