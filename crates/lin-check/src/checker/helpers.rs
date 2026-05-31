@@ -4,7 +4,7 @@ use crate::typed_ir::*;
 use crate::types::Type;
 use crate::widen::widen_numeric;
 
-/// The concrete numeric `Type` named by an explicit literal suffix (spec §3.6).
+/// The concrete numeric `Type` named by an explicit literal suffix (spec §2.6).
 pub(crate) fn suffix_to_type(suffix: NumSuffix) -> Type {
     match suffix {
         NumSuffix::I8 => Type::Int8,
@@ -20,7 +20,7 @@ pub(crate) fn suffix_to_type(suffix: NumSuffix) -> Type {
     }
 }
 
-/// The default type for a suffixless integer literal with no surrounding context (spec §26):
+/// The default type for a suffixless integer literal with no surrounding context (spec §21):
 /// `Int32` when the value fits, otherwise the smallest type that PRESERVES it — `Int64`, or
 /// `UInt64` for a decimal above `i64::MAX` (lexed as a negative i64 bit pattern). This avoids
 /// the silent truncation a flat `Int32` default would cause for large literals; downstream
@@ -32,7 +32,7 @@ pub(crate) fn default_int_literal_type(v: i64) -> Type {
         Type::Int64
     } else {
         // Negative: either a genuine negative that fits i64, or a decimal > i64::MAX stored as
-        // a negative bit pattern. A literal source has no unary minus (spec §3.7) except the
+        // a negative bit pattern. A literal source has no unary minus (spec §2.7) except the
         // parser's `0 - lit` desugar, so a bare negative IntLit here is the above-i64::MAX case.
         Type::UInt64
     }
@@ -145,7 +145,7 @@ pub(crate) fn integer_range(ty: &Type) -> Option<(i128, i128)> {
 /// Returns true if `ty` is definitely non-transferable across thread boundaries.
 /// Non-transferable: Function, Iterator, Never.
 /// TypeVar (unknown), Promise/Worker/ThreadPool (TypeVar-resolved), are not flagged —
-/// we only reject types we can statically prove are non-transferable (spec §32.3).
+/// we only reject types we can statically prove are non-transferable (spec §24.3).
 pub(crate) fn is_definitely_non_transferable(ty: &Type) -> bool {
     match ty {
         Type::Function { .. } | Type::Iterator(_) | Type::Never => true,
@@ -155,7 +155,7 @@ pub(crate) fn is_definitely_non_transferable(ty: &Type) -> bool {
     }
 }
 
-/// Returns true if `ty` is a legal FFI value type per spec §34.3.
+/// Returns true if `ty` is a legal FFI value type per spec §26.3.
 /// Legal: Int8–Int64, UInt8–UInt64, Float32, Float64, Boolean, Null, String.
 pub(crate) fn is_legal_ffi_value_type(ty: &Type) -> bool {
     matches!(ty,
@@ -166,7 +166,7 @@ pub(crate) fn is_legal_ffi_value_type(ty: &Type) -> bool {
     )
 }
 
-/// Returns true if `ty` is a legal FFI binding type per spec §34.3.
+/// Returns true if `ty` is a legal FFI binding type per spec §26.3.
 /// The binding must be a function type whose params and return are legal value types.
 pub(crate) fn is_legal_ffi_type(ty: &Type) -> bool {
     match ty {

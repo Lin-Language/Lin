@@ -26,7 +26,7 @@ pub extern "C" fn lin_to_float64(v: i32) -> f64 {
     v as f64
 }
 
-/// Explicit Float64 -> Float32 narrowing cast (spec §26). There is no implicit
+/// Explicit Float64 -> Float32 narrowing cast (spec §21). There is no implicit
 /// float narrowing, so this is the only way to obtain a Float32 from a computed
 /// Float64 (e.g. for big-endian f32 serialization via std/bytes).
 #[no_mangle]
@@ -35,7 +35,7 @@ pub extern "C" fn lin_to_float32(v: f64) -> f32 {
 }
 
 // -------------------------------------------------------------------------
-// Explicit narrowing integer casts (spec §26). Each takes the widest
+// Explicit narrowing integer casts (spec §21). Each takes the widest
 // practical integer input (i64) and truncates to the target width using
 // `as`-cast (sign/zero handling per Rust `as` semantics). These back the
 // std/number `toUInt8`/`toInt8`/`toUInt16`/`toInt16`/`toUInt32`/`toInt64`/
@@ -80,7 +80,7 @@ pub extern "C" fn lin_to_uint64(v: u64) -> u64 {
 }
 
 // -------------------------------------------------------------------------
-// Float bit-reinterpret intrinsics (spec §35.3). A float's bit pattern
+// Float bit-reinterpret intrinsics (spec §27.3). A float's bit pattern
 // cannot be obtained by shift-and-mask, so std/bytes needs these to
 // (de)serialize floats through UInt8[] buffers.
 // -------------------------------------------------------------------------

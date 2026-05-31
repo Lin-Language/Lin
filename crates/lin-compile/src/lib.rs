@@ -109,7 +109,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     // async boundary — it references any concurrency intrinsic (the `lin_async`/`lin_parallel`/
     // `lin_worker`/… family, reachable only via `std/async`). When it does, codegen must NOT
     // mark user functions `nounwind`, because a runtime fault inside a thunk unwinds through
-    // Lin frames to the thread boundary (spec §32.2.2, ADR-042). Scan the main module and every
+    // Lin frames to the thread boundary (spec §24.2.2, ADR-042). Scan the main module and every
     // import's intrinsic map.
     let async_intrinsics = [
         "lin_async", "lin_await", "lin_parallel", "lin_race", "lin_timeout", "lin_retry",

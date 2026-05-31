@@ -28,7 +28,7 @@ enum PromiseState {
     Failed(String),
 }
 
-/// A Promise — a future value computed on another OS thread (spec §32.2). Backed by a
+/// A Promise — a future value computed on another OS thread (spec §24.2). Backed by a
 /// mutex+condvar so `await` blocks until the worker publishes a result.
 #[repr(C)]
 pub struct LinPromise {
@@ -50,7 +50,7 @@ struct PoolTask {
 // thread; `result` is an Arc (Send). The addresses are upheld-valid by the spawn path.
 unsafe impl Send for PoolTask {}
 
-/// A bounded thread pool (spec §32.5): `n` worker threads draining a shared MPMC task queue.
+/// A bounded thread pool (spec §24.5): `n` worker threads draining a shared MPMC task queue.
 /// `pool.async` enqueues work rather than spawning. Dropping the pool (program exit) closes the
 /// queue; workers finish the in-flight task and exit.
 #[repr(C)]
@@ -70,7 +70,7 @@ struct PoolQueueState {
     shutdown: bool,
 }
 
-/// A message sent to a worker's mailbox (spec §32.6). `Request` carries a oneshot reply
+/// A message sent to a worker's mailbox (spec §24.6). `Request` carries a oneshot reply
 /// channel; `Message` is fire-and-forget; `Close` triggers `onShutdown` + thread exit.
 enum WorkerMsg {
     Request { msg: SendPtr, reply: std::sync::mpsc::Sender<WorkerReply> },
@@ -80,23 +80,23 @@ enum WorkerMsg {
 unsafe impl Send for WorkerMsg {}
 
 /// A worker's reply to a `request`: the handler's result, or an error if the handler faulted
-/// (the worker survives a faulting message; the in-flight request gets the diagnostic, §32.6.5).
+/// (the worker survives a faulting message; the in-flight request gets the diagnostic, §24.6.5).
 enum WorkerReply {
     Ok(SendPtr),
     Err(String),
 }
 unsafe impl Send for WorkerReply {}
 
-/// A long-lived worker thread + MPSC mailbox (spec §32.6). The handler closure runs on the
+/// A long-lived worker thread + MPSC mailbox (spec §24.6). The handler closure runs on the
 /// worker thread, processing messages sequentially — so the handler MAY close over `var`
-/// (§32.6.4): the state is confined to this one thread and never concurrently accessed.
+/// (§24.6.4): the state is confined to this one thread and never concurrently accessed.
 /// `request` blocks for the reply; `message` is fire-and-forget; `close` drains, runs
 /// `onShutdown`, and joins. Messages crossing into the worker are deep-copied (transferable).
 #[repr(C)]
 pub struct LinWorker {
     tx: std::sync::mpsc::Sender<WorkerMsg>,
     handle: Option<JoinHandle<()>>,
-    /// True once `close` has been called, so later sends are rejected (§32.6.5).
+    /// True once `close` has been called, so later sends are rejected (§24.6.5).
     closed: bool,
 }
 
@@ -187,7 +187,7 @@ pub unsafe extern "C" fn lin_make_promise(value: *mut u8) -> *mut LinPromise {
 /// the calling thread and the promise resolves immediately. This is the sound fallback: still
 /// correct, just without parallelism for that one thunk. (The checker already bans `var`
 /// captures and non-transferable *returns*; an opaque *captured function* is the only case that
-/// reaches here, and §32.2.1 allows it — running inline keeps it correct.)
+/// reaches here, and §24.2.1 allows it — running inline keeps it correct.)
 #[no_mangle]
 pub unsafe extern "C" fn lin_async_spawn(thunk: *mut u8) -> *mut LinPromise {
     crate::fault::install_quiet_fault_hook();
@@ -286,7 +286,7 @@ pub unsafe extern "C" fn lin_await_promise(promise: *mut LinPromise) -> *mut u8 
     }
     match result {
         Ok(v) => {
-            // Auto-flatten nested promises (spec §32.2.3): if the thunk itself returned a
+            // Auto-flatten nested promises (spec §24.2.3): if the thunk itself returned a
             // Promise (boxed TAG_PROMISE), resolve through it. The inner promise's result
             // ownership transfers out; we free the now-redundant outer TAG_PROMISE box shell.
             if !v.is_null() && (*(v as *const crate::tagged::TaggedVal)).tag == crate::tagged::TAG_PROMISE {
@@ -318,7 +318,7 @@ unsafe fn poll_promise(promise: *mut LinPromise) -> Option<Result<*mut u8, Strin
     }
 }
 
-/// `race(promises)` (spec §32.4): returns a settled promise carrying the result of the FIRST of
+/// `race(promises)` (spec §24.4): returns a settled promise carrying the result of the FIRST of
 /// `promises` to complete. The others keep running; their results are discarded (abandoned, not
 /// cancelled — Lin has no cancellation in v1). `promises` is the raw `LinArray*` whose elements'
 /// payloads are `*mut LinPromise`. The winning value is deep-copied into the returned promise so
@@ -351,7 +351,7 @@ pub unsafe extern "C" fn lin_race(promises: *mut u8) -> *mut LinPromise {
     }
 }
 
-/// `timeout(promise, ms)` (spec §32.4): returns a settled promise carrying the original value if
+/// `timeout(promise, ms)` (spec §24.4): returns a settled promise carrying the original value if
 /// `promise` completes within `ms` milliseconds, else the Json null value (timed out — the slow
 /// thread is abandoned, not cancelled). An error result is passed through. The value is
 /// deep-copied so it is independent of the source promise.
@@ -380,7 +380,7 @@ pub unsafe extern "C" fn lin_timeout(promise: *mut LinPromise, ms: i32) -> *mut 
     }
 }
 
-/// `retry(thunk, n)` (spec §32.4): spawn `thunk` up to `n` times, returning a settled promise
+/// `retry(thunk, n)` (spec §24.4): spawn `thunk` up to `n` times, returning a settled promise
 /// with the first result that is NOT an `Error`; if all `n` attempts error, the last `Error` is
 /// the result. `thunk` is the raw closure pointer. Runs attempts sequentially (each is itself a
 /// real spawn+await), which is the spec's "spawns the thunk up to n times" semantics.
@@ -440,7 +440,7 @@ unsafe fn is_error_value(v: *mut u8) -> bool {
 
 /// Run all thunks in `tasks` (a tagged `LinArray*` of boxed closures) concurrently on OS
 /// threads, then join them in order, returning a fresh tagged `LinArray*` of their boxed
-/// results — **order-preserving** (result[i] is task[i]'s result), spec §32.3. A thunk that
+/// results — **order-preserving** (result[i] is task[i]'s result), spec §24.3. A thunk that
 /// faults yields an `Error` object in its slot (fault isolation per task). Each task's env is
 /// deep-copied for transfer (Option C); a non-transferable task runs inline on a worker thread.
 ///
@@ -600,7 +600,7 @@ unsafe fn call_worker_handler(fn_ptr: *mut u8, env_ptr: *mut u8, has_env: u8, ms
 /// Spawn a long-lived worker thread with an MPSC mailbox. `on_msg_*` is the message handler
 /// closure (`(Msg) => Reply`); `on_close_*` is the optional `onShutdown` closure (`() => Null`,
 /// invoked once at `close`). The handler env stays on the worker thread (thread-confined state,
-/// so the handler may close over `var`, §32.6.4). Returns a `*LinWorker` handle.
+/// so the handler may close over `var`, §24.6.4). Returns a `*LinWorker` handle.
 #[no_mangle]
 pub unsafe extern "C" fn lin_worker_new(
     on_msg_fn: *mut u8,
@@ -661,9 +661,9 @@ pub unsafe extern "C" fn lin_worker_new(
     ptr
 }
 
-/// Send a message to a worker and BLOCK for its reply (spec §32.6: `request`). The message is
+/// Send a message to a worker and BLOCK for its reply (spec §24.6: `request`). The message is
 /// deep-copied for transfer (Option C). On handler fault, returns an `Error` object. Sending to
-/// a closed/dead worker returns an `Error` (§32.6.5).
+/// a closed/dead worker returns an `Error` (§24.6.5).
 #[no_mangle]
 pub unsafe extern "C" fn lin_worker_request(worker: *mut LinWorker, msg: *mut u8) -> *mut u8 {
     if worker.is_null() || (*worker).closed {
@@ -681,7 +681,7 @@ pub unsafe extern "C" fn lin_worker_request(worker: *mut LinWorker, msg: *mut u8
     }
 }
 
-/// Fire-and-forget message to a worker (spec §32.6: `message`); the reply is discarded. The
+/// Fire-and-forget message to a worker (spec §24.6: `message`); the reply is discarded. The
 /// message is deep-copied for transfer. Sending to a closed worker is a no-op.
 #[no_mangle]
 pub unsafe extern "C" fn lin_worker_message(worker: *mut LinWorker, msg: *mut u8) {
@@ -692,7 +692,7 @@ pub unsafe extern "C" fn lin_worker_message(worker: *mut LinWorker, msg: *mut u8
     let _ = (*worker).tx.send(WorkerMsg::Message { msg: SendPtr(msg_copy) });
 }
 
-/// Close a worker (spec §32.6: `close`): send the shutdown sentinel (the worker drains queued
+/// Close a worker (spec §24.6: `close`): send the shutdown sentinel (the worker drains queued
 /// messages first, then runs `onShutdown`), and join the thread. Idempotent.
 #[no_mangle]
 pub unsafe extern "C" fn lin_worker_close(worker: *mut LinWorker) {

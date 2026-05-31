@@ -1,6 +1,6 @@
 //! `std/tty` runtime intrinsics — raw terminal mode and non-blocking key reads.
 //!
-//! Per spec §35.7:
+//! Per spec §27.7:
 //! ```txt
 //! rawMode: (on: Boolean) => Null | Error
 //! readKey: ()           => Int32 | Null   // keycode, or Null if no key available

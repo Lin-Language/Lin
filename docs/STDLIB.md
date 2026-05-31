@@ -1596,7 +1596,7 @@ val toInt64:  (v: UInt64) -> Int64
 val toUInt64: (v: UInt64) -> UInt64
 ```
 
-Explicit integer narrowing (spec §26). Implicit narrowing — assigning a wider numeric to a narrower one — is a compile-time error; these casts perform it explicitly, truncating to the target width with two's-complement (`as`-cast) semantics. The input is taken as `UInt64` (the widest unsigned), so any narrower *unsigned* integer — or a value masked down to a byte/word — widens into the parameter without range loss; a bare integer literal in range is accepted directly. They are the byte-extraction mechanism used by `std/bytes`, but are generally useful wherever explicit width control is needed.
+Explicit integer narrowing (spec §21). Implicit narrowing — assigning a wider numeric to a narrower one — is a compile-time error; these casts perform it explicitly, truncating to the target width with two's-complement (`as`-cast) semantics. The input is taken as `UInt64` (the widest unsigned), so any narrower *unsigned* integer — or a value masked down to a byte/word — widens into the parameter without range loss; a bare integer literal in range is accepted directly. They are the byte-extraction mechanism used by `std/bytes`, but are generally useful wherever explicit width control is needed.
 
 ```txt
 toUInt8(0x1234)              // 0x34  (52)
@@ -1639,7 +1639,7 @@ tryParseInt32("bad")   // null
 
 ## std/bytes
 
-Slicing and endian (de)serialization on `UInt8[]` byte buffers (spec §35.1–§35.3). The endian helpers are written in Lin on top of the bitwise operators (§35.2) and the `std/number` narrowing casts (extracting a byte from a wider integer needs an explicit narrowing cast). The four float bit-reinterpret functions are runtime intrinsics, since a float's bit pattern cannot be obtained by shift-and-mask.
+Slicing and endian (de)serialization on `UInt8[]` byte buffers (spec §27.1–§27.3). The endian helpers are written in Lin on top of the bitwise operators (§27.2) and the `std/number` narrowing casts (extracting a byte from a wider integer needs an explicit narrowing cast). The four float bit-reinterpret functions are runtime intrinsics, since a float's bit pattern cannot be obtained by shift-and-mask.
 
 | Function | Signature | Description |
 | --- | --- | --- |
@@ -2374,7 +2374,7 @@ import { hash } from "std/hash"
 val hash: (x: Json) -> String
 ```
 
-Returns a canonical, type-tagged string key for any JSON value. The key is stable and matches Lin's structural equality (spec §14): equal values produce equal keys, objects hash independently of key order, and arrays hash order-sensitively. Values of different types never collide — the key carries a type tag, so `hash(42)` (`"i:42"`) differs from `hash("42")` (`"s:42"`). Use it to deduplicate or index values by structural identity (e.g. as object keys in a manual set/map).
+Returns a canonical, type-tagged string key for any JSON value. The key is stable and matches Lin's structural equality (spec §9): equal values produce equal keys, objects hash independently of key order, and arrays hash order-sensitively. Values of different types never collide — the key carries a type tag, so `hash(42)` (`"i:42"`) differs from `hash("42")` (`"s:42"`). Use it to deduplicate or index values by structural identity (e.g. as object keys in a manual set/map).
 
 ```txt
 hash(null)        // "N"
@@ -2682,7 +2682,7 @@ match readFile("config.txt")
 val readFileBytes: (path: String) -> UInt8[] | Error
 ```
 
-Reads the file at `path` as a packed `UInt8[]` byte buffer (§35.1) — one byte per element. Returns an `Error` if the file cannot be read.
+Reads the file at `path` as a packed `UInt8[]` byte buffer (§27.1) — one byte per element. Returns an `Error` if the file cannot be read.
 
 ```txt
 val bytes = readFileBytes("image.png")
@@ -2764,7 +2764,7 @@ Writes `content` to the file at `path`, replacing existing contents.
 val writeFileBytes: (path: String, bytes: UInt8[]) -> Null | Error
 ```
 
-Writes a `UInt8[]` byte buffer (§35.1) to the file at `path`. Returns `Null` on success, `Error` on failure.
+Writes a `UInt8[]` byte buffer (§27.1) to the file at `path`. Returns `Null` on success, `Error` on failure.
 
 ---
 
@@ -3198,7 +3198,7 @@ match body
 
 ## std/net
 
-Low-level UDP and TCP sockets — the byte-stream layer beneath `std/http`, for non-HTTP protocols and custom framing. Every socket is an opaque integer fd handle (spec §35.4): there are no open-socket objects in user code, just the raw OS fd as an `Int32`. Every fallible call returns the `T | Error` result shape; a non-blocking read with no data available yet returns `Null` (so a poll loop reads naturally). IPv4 only; `bind`/`listen` bind to `0.0.0.0`.
+Low-level UDP and TCP sockets — the byte-stream layer beneath `std/http`, for non-HTTP protocols and custom framing. Every socket is an opaque integer fd handle (spec §27.4): there are no open-socket objects in user code, just the raw OS fd as an `Int32`. Every fallible call returns the `T | Error` result shape; a non-blocking read with no data available yet returns `Null` (so a poll loop reads naturally). IPv4 only; `bind`/`listen` bind to `0.0.0.0`.
 
 `recv`/`recvFrom`/`tcpRecv` fill a **caller-owned** `UInt8[]` and return the number of bytes read; the buffer is never transferred across the boundary. The buffer's length bounds the read — pre-size it to the maximum datagram/chunk you want to accept (e.g. `[0,0,...]` of N elements).
 
@@ -3276,7 +3276,7 @@ Run and manage external processes. Two styles share one module:
 - **Batch** — `exec`/`shell` run a command to completion and collect its full stdout/stderr into an `ExecResult`. `cwd`/`chdir` query/change the working directory.
 - **Streaming** — `spawn` starts a child and returns an opaque `ProcessHandle`; `readStdout` reads its piped stdout incrementally; `kill` signals it; `wait` blocks for the exit code.
 
-Every fallible call returns the `T | Error` result shape (spec §35.6).
+Every fallible call returns the `T | Error` result shape (spec §27.6).
 
 ### Types
 
@@ -3333,7 +3333,7 @@ print("exited ${code}")
 
 ## std/tty
 
-Raw terminal mode and non-blocking key input on stdin (spec §35.7).
+Raw terminal mode and non-blocking key input on stdin (spec §27.7).
 
 ```txt
 rawMode:  (on: Boolean)  => Null | Error    // enable/disable terminal raw mode
@@ -3427,7 +3427,7 @@ val [users, posts] = await([
 ])
 ```
 
-`await` auto-flattens nested promises (§32.2.3): if the thunk itself returns a `Promise`, `await`
+`await` auto-flattens nested promises (§24.2.3): if the thunk itself returns a `Promise`, `await`
 resolves through every layer (`await(async(() => async(() => 42)))` is `42`).
 
 If the thunk faults (array out of bounds, division by zero, …), the fault is caught at the thread
@@ -3440,7 +3440,7 @@ match await(p)
   else     => use(result)
 ```
 
-The static check from §32.2.2 *is* enforced: because `await` returns `T | Error`, assigning the
+The static check from §24.2.2 *is* enforced: because `await` returns `T | Error`, assigning the
 result to a binding that does not handle the `Error` case is a compile-time error.
 
 ```txt
