@@ -390,6 +390,17 @@ impl Checker {
 
         let is_tail = self.is_tail_call(func);
 
+        // Affine consume (streams brief §7): an OWNERSHIP-TAKING stream op (adapter/terminal/`for`)
+        // MOVES its stream argument — mark it consumed so a later use of the same binding errors.
+        // Borrows (`read`/`close`) are NOT in the consuming set, so a pull loop reads freely.
+        if !partial {
+            if let (Expr::Ident(callee, _), Some(arg0)) = (func, args.first()) {
+                if is_stream_consuming_op(callee) {
+                    self.mark_stream_consumed(arg0);
+                }
+            }
+        }
+
         Ok(TypedExpr::Call {
             func: Box::new(typed_func),
             args: typed_args,
@@ -445,6 +456,14 @@ impl Checker {
         }
 
         let typed_receiver = self.infer_expr(receiver)?;
+
+        // Affine consume (streams brief §7): a dot-call `s.lines()`/`s.drain()`/… MOVES the
+        // receiver stream into the ownership-taking op. Mark it consumed AFTER inferring the
+        // receiver (so reading it AS the receiver is fine) so a later use of `s` errors. Borrows
+        // (`s.read()`/`s.close()`) are not in the consuming set. Skipped for partial application.
+        if !partial && is_stream_consuming_op(method) {
+            self.mark_stream_consumed(receiver);
+        }
 
         // Look up method type for TypeVar substitution.
         if let Some(method_ty) = self.env.effective_type(method) {
@@ -632,4 +651,18 @@ impl Checker {
         }
         false
     }
+}
+
+/// True for an OWNERSHIP-TAKING stream operation (streams brief §7): the adapters and terminal
+/// drivers that MOVE their stream argument and must not be followed by another use of the same
+/// binding. Borrowing ops that read/close a stream in place without consuming the whole pipeline
+/// (`read`/`readChunk`/`close`/`closeStream`) are deliberately ABSENT, so a low-level pull loop
+/// may read the same stream binding repeatedly. Keyed on the std/stream (and std/net/process/io)
+/// wrapper names, which are how user code names these ops at the call/dot-call site.
+pub(crate) fn is_stream_consuming_op(name: &str) -> bool {
+    matches!(
+        name,
+        "lines" | "map" | "filter" | "take" | "chunks" | "writeStream"
+            | "drain" | "collect" | "readText" | "for"
+    )
 }

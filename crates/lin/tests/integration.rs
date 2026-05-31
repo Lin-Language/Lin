@@ -3484,6 +3484,68 @@ print("ok")
     assert_eq!(written, "\"a\"|\"b\"|\"c\"\n\"x\"|\"y\"|\"z\"\n\"foo\"|\"bar\"|\"baz\"\n");
 }
 
+// Stage 6 (streams): affine use-after-move + placement restriction (negative cases).
+#[test]
+fn test_stream_use_after_move_rejected() {
+    let err = run_expect_err(r#"import { readStream, lines, readText } from "std/stream"
+import { writeFile } from "std/fs"
+writeFile("/tmp/lin_uam.txt", "x")
+val s = readStream("/tmp/lin_uam.txt")
+val a = s.lines()
+val b = s.readText()
+"#);
+    assert!(
+        err.contains("used more than once") || err.contains("affine"),
+        "expected a use-after-move error, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_stream_in_var_rejected() {
+    let err = run_expect_err(r#"import { readStream } from "std/stream"
+import { writeFile } from "std/fs"
+writeFile("/tmp/lin_sv.txt", "x")
+var s = readStream("/tmp/lin_sv.txt")
+"#);
+    assert!(
+        err.contains("cannot be stored in a `var`") || err.contains("Stream"),
+        "expected a var-placement error, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_stream_in_object_field_rejected() {
+    let err = run_expect_err(r#"import { readStream } from "std/stream"
+import { writeFile } from "std/fs"
+writeFile("/tmp/lin_so.txt", "x")
+val s = readStream("/tmp/lin_so.txt")
+val o = { "s": s }
+"#);
+    assert!(
+        err.contains("object field") || err.contains("Stream"),
+        "expected an object-field placement error, got:\n{err}"
+    );
+}
+
+// Positive: a stream used exactly once (bound, then consumed by one terminal) type-checks + runs.
+#[test]
+fn test_stream_single_use_ok() {
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_single_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let path = tmp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, readText }} from "std/stream"
+import {{ writeFile }} from "std/fs"
+
+writeFile("{path}", "hello affine")
+val s = readStream("{path}")
+val text = s.readText()
+print(text)
+"#));
+    let _ = fs::remove_file(&tmp);
+    assert_eq!(output, vec!["hello affine"]);
+}
+
 #[test]
 fn test_fs_append_file() {
     let tmp = std::env::temp_dir().join(format!("lin_ctest_append_{}.txt", std::process::id()));
