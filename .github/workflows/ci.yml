@@ -64,7 +64,10 @@ jobs:
         run: |
           # The committed libmathlib.a is a Linux archive; rebuild it from source with the
           # runner's native cc so the ffi example links on every platform (macOS ld rejects
-          # a foreign-format archive: "archive member '/' not a mach-o file").
+          # a foreign-format archive: "archive member '/' not a mach-o file"). Remove the
+          # committed archive first — `ar rcs` onto the existing GNU-format file keeps its
+          # '/' symbol-table member, which macOS ld then rejects.
+          rm -f examples/ffi/libmathlib.a
           cc -c examples/ffi/mathlib.c -o examples/ffi/mathlib.o
           ar rcs examples/ffi/libmathlib.a examples/ffi/mathlib.o
 
