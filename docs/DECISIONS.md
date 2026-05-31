@@ -955,3 +955,66 @@ the `else` arm rather than `?T`. Routing the awaited value through a `Json`-type
 `(r: Json): Int32 => match r is Error => … else => r` helper) sidesteps this and coerces cleanly; the
 concurrency examples and async tests use that helper for happy-path arithmetic. Improving union
 narrowing over unsolved type variables is a separate, pre-existing checker concern.
+
+## ADR-071: Test mocking via `replace` + test-lifecycle story (beforeEach/afterEach/beforeAll/afterAll)
+
+**Status.** Accepted.
+
+**Context.** Restructuring `examples/*` into per-module unit suites surfaced two recurring gaps in
+the testing story: (1) no way to isolate a module under test from a real dependency (a unit calling
+`std/fs.readFile` or a sibling module always hit the real implementation), and (2) no documented
+setup/teardown lifecycle. Lin's compile-time, share-nothing model rules out a JS-style runtime
+monkey-patch; the design has to fit how imports actually resolve.
+
+**Key enabling fact.** Every call to an exported function lowers to `CallTarget::Named("<sym>")`,
+where `<sym>` is derived from the import's RESOLVED module key (`mangle_module_key(path)` +
+export name), NOT the surface path. Codegen resolves a `Named` call by a single
+`module.get_function("<sym>")`. So `./some/file`, `./file`, and any transitively-importing module
+all emit the SAME symbol, and there is exactly one LLVM definition per symbol. `lin test` compiles
+each `.test.lin` as its OWN program, so anything scoped to one program is scoped to one test file.
+
+**Decision — mocking (`replace`).**
+- Syntax: `import { someExport } from "./some/file"` (brings in the real symbol + its type), then
+  `replace someExport = <expr>` at top level of a `.test.lin`. Vals are replaceable too.
+- Semantics (**Option A — replace EVERYWHERE**): the `replace` body becomes the canonical definition
+  emitted for that export's mangled symbol; the original module's definition of that symbol is
+  skipped in this program. Because resolution is symbol-name based, EVERY reference — the test file,
+  the module under test, and any transitive importer, however the path is spelled — sees the mock.
+  This is the "replaced no matter how you reference it" guarantee.
+- The mock body is type-checked against the real export's signature (drift is a compile error); the
+  landed cross-module type-import work supplies the real signature.
+- Stdlib is mockable: `std/fs.readFile` etc. are ordinary compiled Lin wrappers, so `replace`
+  redirects the Lin-API call sites (the C `lin_fs_*` runtime symbol is never reached). Mocking at the
+  Lin-API level is the intent.
+- NOT replaceable: the polymorphic INTRINSIC primitives (`print`, `map`, `filter`, `reduce`, `for`,
+  `length`, `toString`, the async family) — codegen special-cases these, they are not `Named` calls.
+  A `replace` targeting one is a compile error.
+- `replace` is only meaningful in a `.test.lin`; using it in a `lin build` program is a hard error
+  (it would silently swap stdlib in a shipped binary).
+- Spies are an ordinary mock closing over a module-level `var`/`Shared` cell (count calls, capture
+  args), asserted after the run — no extra framework.
+- Accepted tradeoff of Option A: a mock that references its own replaced symbol self-recurses
+  (`replace readFile = (p) => readFile(p)` loops); delegation/pass-through to the real impl is NOT
+  possible. Chosen for simplicity over Option B (leave the test file's own binding original).
+
+**Decision — lifecycle.** No dedicated keywords; the eager-evaluation model already supports the
+common cases, and DI/combinators cover the rest:
+- **beforeAll**: a module-scope `val`/statement above the suite. `test(...)` bodies run EAGERLY as
+  the `tests` array is built, so module-scope setup runs once before them.
+- **afterAll**: statements after `run(s)`. CAVEAT: `run` calls `exit(1)` on failure, so post-`run`
+  cleanup does not execute when a test fails. For guaranteed teardown, pass cleanup to a `run`
+  variant or run cleanup before `run`. (Future: `run` could return a status instead of exiting.)
+- **beforeEach/afterEach + fixtures**: prefer a functional `around`/`withFixture` COMBINATOR over new
+  keywords — a wrapper that builds the fixture, runs the body with it injected, and tears down:
+  `val withDb = (name, body) => test(name, () => val db = open(); val r = body(db); close(db); r)`.
+  This is per-test setup + teardown + dependency injection using partial application and the existing
+  model; assertion FAILURES are values (don't skip teardown). True keyword `beforeEach`/`afterEach`
+  would require deferring test bodies (store thunks, run setup/body/teardown in `run`) — deferred as
+  a later option if the combinator proves insufficient.
+
+**Consequences.** Mocking is a compile-time, abs-path-keyed, type-checked symbol override scoped to a
+single test program — no runtime cost, no cross-test leakage, works for user modules and stdlib
+wrappers alike. Lifecycle leans on Lin's functional/DI grain rather than new syntax. Implementation
+spans lin-parse (a `Replace` stmt), lin-check (resolve target symbol, type-check body), and
+lin-ir/lin-compile (emit the body under the export's symbol; suppress the original; enforce
+test-only + intrinsic/unused diagnostics).

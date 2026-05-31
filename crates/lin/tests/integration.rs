@@ -7400,3 +7400,24 @@ print(toString(n))
 "#);
     assert_eq!(out, vec!["0", "0", "0", "0"]);
 }
+
+// ADR-071: `replace` is a TEST-ONLY mock. In a normal `lin build` program (this harness writes a
+// `.lin`, not a `.test.lin`) it must be a hard compile error — a shipped binary must never silently
+// swap a real import. The positive cases (mocking user modules + stdlib, internal call-sites seeing
+// the mock, spies, val mocks, type-drift rejection) are exercised end-to-end by `lin test` over
+// `crates/lin/tests/replace_mocking/*.test.lin` and under ASan in the CI example-suite leg.
+#[test]
+fn test_replace_rejected_in_non_test_program() {
+    let err = run_expect_err(
+        r#"import { print } from "std/io"
+import { readFile } from "std/fs"
+replace readFile = (path: String): Json => "mock"
+print(readFile("x"))
+"#,
+    );
+    assert!(
+        err.contains("`replace` is only allowed in a `*.test.lin`"),
+        "expected test-only rejection, got:\n{}",
+        err
+    );
+}

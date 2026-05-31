@@ -22,11 +22,36 @@ impl Parser {
                     Some(self.parse_import())
                 }
             }
+            // `replace` is a CONTEXTUAL keyword (not reserved — `std/string` exports a
+            // `replace` fn): recognise it only in the statement-leading shape
+            // `replace <ident> = <expr>` (a single `=`, not `==`). Anything else lexed as
+            // `replace` stays a normal identifier expression.
+            TokenKind::Ident(w) if w == "replace" && self.is_replace_stmt() => {
+                Some(self.parse_replace())
+            }
             _ => {
                 let expr = self.parse_expr();
                 Some(Stmt::Expr(expr))
             }
         }
+    }
+
+    /// Lookahead for the `replace <ident> = ...` (NOT `==`) statement shape.
+    fn is_replace_stmt(&self) -> bool {
+        // pos: `replace`, pos+1: an identifier, pos+2: a single `=`.
+        self.check_ahead(TokenKind::Ident(String::new()), 1)
+            && self.check_ahead(TokenKind::Eq, 2)
+    }
+
+    /// Parse `replace <name> = <expr>` (a test-only mock — ADR-071).
+    pub(crate) fn parse_replace(&mut self) -> Stmt {
+        let span = self.current_span();
+        self.advance(); // `replace`
+        let name = self.expect_ident();
+        self.expect(TokenKind::Eq);
+        self.skip_newlines();
+        let value = self.parse_expr_or_block();
+        Stmt::Replace { name, value, span }
     }
 
     pub(crate) fn parse_export(&mut self) -> Option<Stmt> {
