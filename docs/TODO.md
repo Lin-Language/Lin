@@ -73,11 +73,11 @@ End state: arithmetic, `var` mutation, assignment-as-expression, multi-statement
 
 ### `lin-lex`
 - [x] Numeric literal forms: decimal, hex (`0x`), binary (`0b`), octal (`0o`), underscores, exponent, type suffixes (`i8`, `u32`, `f32`, ...).
-- [x] Negative-literal disambiguation: `-` joins a literal only when the previous token cannot end an expression (spec §3.7).
+- [x] Negative-literal disambiguation: `-` joins a literal only when the previous token cannot end an expression (spec §2.7).
 - [x] Operator tokens: `+ - * / % == != < <= > >= && ||`, `=`.
 
 ### `lin-parse`
-- [x] Operator precedence and associativity per spec §24.2.
+- [x] Operator precedence and associativity per spec §8.2.
 - [x] `var` declarations and assignment-as-expression.
 - [x] `val x: Type = expr` with optional type annotation (annotation recorded but not yet checked).
 
@@ -105,7 +105,7 @@ End state: multi-line function bodies, multi-line `if/then/else`, blocks.
 ### `lin-parse`
 - [x] Block expressions (final expression is the value).
 - [x] Function expressions `(params) => body` with single-line and block forms; optional return type annotation.
-- [x] `if cond then a else b` in all three layout forms (single-line, then/else on subsequent lines, block branches). `then` and `else` must sit exactly one indent level deeper than `if` (§12).
+- [x] `if cond then a else b` in all three layout forms (single-line, then/else on subsequent lines, block branches). `then` and `else` must sit exactly one indent level deeper than `if` (§10).
 
 ### Tests
 - [x] Each `if` layout variant round-trips and evaluates correctly.
@@ -135,14 +135,14 @@ End state: object/array literals, bracket access (safe-by-default), destructurin
 - [x] JSON object as insertion-ordered key/value map.
 - [x] Object equality: order-independent, structural, deep.
 - [x] Array equality: order-sensitive, deep.
-- [x] **Safe bracket access** (spec §6.1):
+- [x] **Safe bracket access** (spec §7.1):
   - Missing object key → `Null`.
   - Bracket on `Null` (either object- or array-style) → `Null`.
   - Array index OOB → runtime error.
 
 ### Tests
 - [x] All destructuring forms.
-- [x] Equality fixtures matching spec §14.
+- [x] Equality fixtures matching spec §9.
 - [x] Deep-chain access through missing keys and through `null`.
 - [x] Array OOB raises a diagnostic with span and call stack.
 
@@ -162,7 +162,7 @@ End state: escapes, multi-line strings, `${...}` interpolation.
 
 ### `lin-codegen`
 - [x] Strings stored UTF-8 length-prefixed.
-- [x] `toString` for every primitive (formats per spec §27.8).
+- [x] `toString` for every primitive (formats per spec §28.8).
 
 ### Tests
 - [x] Escape and Unicode fixtures.
@@ -186,7 +186,7 @@ End state: full call semantics including chains and partial application.
 - [x] `(x, y).f` → `f(x, y)` (partial).
 
 ### `lin-codegen`
-- [x] Partial application: dedicated value with `(fn_ptr, accumulated_args)`. Further application appends; arity match invokes (spec §27.7).
+- [x] Partial application: dedicated value with `(fn_ptr, accumulated_args)`. Further application appends; arity match invokes (spec §28.7).
 - [x] Over-application: compile-time error.
 - [x] Argument evaluation: left-to-right.
 
@@ -204,14 +204,14 @@ End state: named types, generics syntax, structural compatibility.
 - [x] Object types, union types `|`, function types `(T) => U`.
 - [x] Array type forms: `T[]` (unbounded) and `[T1, T2, T3]` (fixed-length).
 - [x] Generic parameters and applications using `<…>`.
-- [x] Type-expression precedence: `[]` > `<>` > `=>` > `|` (spec §8.7).
+- [x] Type-expression precedence: `[]` > `<>` > `=>` > `|` (spec §5.7).
 
 ### `lin-check` (type system v1)
 - [x] Internal type representation.
 - [x] Structural compatibility check (used both for assignability and `has`).
 - [x] Exact-shape check (used for `is`).
 - [x] Recursive types: name-based with lazy unfolding and cycle-aware equality.
-- [x] Reject self-referential non-function `val` (spec §7.3) — naturally blocked: non-function `val` name is not in scope during RHS evaluation.
+- [x] Reject self-referential non-function `val` (spec §6.3) — naturally blocked: non-function `val` name is not in scope during RHS evaluation.
 
 ### Tests
 - [x] Compatible/incompatible assignment fixtures.
@@ -229,7 +229,7 @@ End state: type narrowing in `if` branches via `is`/`has`.
 - [x] `is`/`has` permitted in any expression context (return type `Boolean`).
 
 ### `lin-check`
-- [x] Narrowing rules per spec §25.
+- [x] Narrowing rules per spec §13.
 - [x] Reject `is` on generic applications — naturally blocked at parser level; parser only produces `Pattern::TypeName(string)`, not generic patterns.
 - [x] Literal types: literal expressions have base type (no singleton types).
 
@@ -274,7 +274,7 @@ End state: `[1,2,3].map(i => i * i)` type-checks without annotations.
 ### `lin-check`
 - [x] Bidirectional checking: synthesise where possible, propagate expected types into lambdas and partial applications.
 - [x] Generic parameter substitution and unification at call sites.
-- [x] **Variance** (spec §8.8): covariant in producer positions, contravariant in consumer positions.
+- [x] **Variance** (spec §5.8): covariant in producer positions, contravariant in consumer positions.
 - [x] **Numeric widening everywhere safe** (operators, returns, calls, assignments); never implicit narrowing.
 
 ### Tests
@@ -308,7 +308,7 @@ End state: multi-file programs with `import` and `export`.
 End state: `range(0, 10).for(i => print(i))` runs.
 
 ### `lin-codegen`
-- [x] Opaque `Iterator` value carrying four closures + state cell (spec §27.6).
+- [x] Opaque `Iterator` value carrying four closures + state cell (spec §28.6).
 - [x] `iter` built-in constructs an iterator from the four functions.
 - [x] Restartability: re-invoking the initial-state thunk yields a fresh logical start.
 - [x] `for` built-in: the only direct stepper.
@@ -409,7 +409,7 @@ Improvements based on compiler architecture best-practice research (Maranget 200
 
 End state: thunks run on OS threads; `parallel` fork-joins; workers handle messages.
 
-See spec §32 for the full design.
+See spec §24 for the full design.
 
 ### New runtime value types (`lin-runtime`)
 
@@ -442,7 +442,7 @@ See spec §32 for the full design.
 
 ### `print` thread safety
 
-- [x] Wrap the stdout sink in a `Mutex` and flush one complete line atomically so output from concurrent threads does not interleave mid-line (spec §32.7).
+- [x] Wrap the stdout sink in a `Mutex` and flush one complete line atomically so output from concurrent threads does not interleave mid-line (spec §24.7).
 
 ### Tests
 
@@ -465,7 +465,7 @@ See spec §32 for the full design.
 
 End state: programs can read stdin, read/write files, and make HTTP requests.
 
-See spec §33 for the full intrinsic signatures. See `docs/STDLIB.md` for the complete public API.
+See spec §25 for the full intrinsic signatures. See `docs/STDLIB.md` for the complete public API.
 
 ### `std/io` — stdin
 
@@ -473,7 +473,7 @@ See spec §33 for the full intrinsic signatures. See `docs/STDLIB.md` for the co
 - [x] `__ioLines` intrinsic: read all lines from stdin eagerly, return as `Array<String>`.
 - [x] `__ioReadAll` intrinsic: `io::read_to_string(&mut stdin)`, return `String`.
 - [x] `std/io` Lin module: thin wrappers (`readLine`, `lines`, `readAll`) delegating to the above intrinsics.
-- [x] `print` thread-safety: wrap stdout sink in a `Mutex` so concurrent async thunks don't interleave mid-line (spec §32.7).
+- [x] `print` thread-safety: wrap stdout sink in a `Mutex` so concurrent async thunks don't interleave mid-line (spec §24.7).
 
 ### `std/fs` — filesystem
 
@@ -493,7 +493,7 @@ See spec §33 for the full intrinsic signatures. See `docs/STDLIB.md` for the co
 - [x] `__httpFetch` intrinsic: send GET request, return `HttpResponse | Error`. Populate `"status"`, `"headers"`, `"body"`. Transport errors (DNS, TLS, connection refused) → `Error`; HTTP error status codes → successful `HttpResponse`.
 - [x] `__httpFetchWith` intrinsic: same as `__httpFetch` but accepts `HttpOptions` object; read `"method"`, `"headers"`, `"body"` fields (missing fields use defaults: `"GET"`, empty headers, empty body).
 - [x] `__parseJson` intrinsic (internal): parse a JSON string to `Json | Error`; used by `fetchJson` and the `std/http` server helpers.
-- [x] `std/http` Lin module: `fetch` and `fetchWith` delegate to intrinsics; `fetchJson` and `postJson` written in Lin on top of them (spec §33.4).
+- [x] `std/http` Lin module: `fetch` and `fetchWith` delegate to intrinsics; `fetchJson` and `postJson` written in Lin on top of them (spec §25.4).
 - [x] Define `HttpResponse` and `HttpOptions` as exported types from `std/http`.
 
 ### HTTP server (in `std/http`)
@@ -501,7 +501,7 @@ See spec §33 for the full intrinsic signatures. See `docs/STDLIB.md` for the co
 - [x] `__serverServe` intrinsic (`lin_serve`, hand-rolled HTTP/1.1, no extra deps): bind a TCP listener on `port`, accept in a loop, parse each connection into an `HttpRequest` object (`"method"`, `"path"`, `"query"`, `"headers"`, `"body"`), call `handler` inside a fault-isolation boundary, write the `HttpResponse` back to the socket. Sequential (one request at a time); blocks the calling thread indefinitely. Signature is `serve(handler, port)` (handler first) so `router.serve(port)` dot-call desugars to `serve(router, port)`.
 - [ ] `__serverServeWithPool` intrinsic / `pool.serve` dot-call: concurrent request handling via a `ThreadPool`. Not yet implemented.
 - [x] `__serverPathMatch` intrinsic: split pattern and path on `/`; match literal segments exactly; collect `:name` segments as string captures into a result object; return `Null` on length mismatch or literal segment mismatch.
-- [x] `std/http` server helpers: `serve`, `json`, `text`, `redirect`, `notFound`, `badRequest`, `parseBody`, `matchPath` (path-first) — written in Lin on top of `__serverServe`, `__serverPathMatch`, and `__parseJson` (spec §33.5).
+- [x] `std/http` server helpers: `serve`, `json`, `text`, `redirect`, `notFound`, `badRequest`, `parseBody`, `matchPath` (path-first) — written in Lin on top of `__serverServe`, `__serverPathMatch`, and `__parseJson` (spec §25.5).
 - [x] Export `HttpRequest` / `HttpResponse` types from `std/http`.
 
 ### Tests
@@ -530,7 +530,7 @@ See spec §33 for the full intrinsic signatures. See `docs/STDLIB.md` for the co
 
 End state: a Lin program can call functions from a compiled C or Rust static library.
 
-See spec §34 for the full design.
+See spec §26 for the full design.
 
 ### Parser (`lin-parse`)
 
@@ -540,7 +540,7 @@ See spec §34 for the full design.
 
 ### Type checker (`lin-check`)
 
-- [x] Validate that every type in a `foreign` binding is a legal foreign function type (§34.3): params and return must be numeric, Boolean, Null, or String. Emit a compile-time error for any other type.
+- [x] Validate that every type in a `foreign` binding is a legal foreign function type (§26.3): params and return must be numeric, Boolean, Null, or String. Emit a compile-time error for any other type.
 - [x] Register each foreign binding in the module's type environment with its declared type, exactly like a top-level `val`.
 - [x] Thread the library path through to codegen; stored in `TypedStmt::ForeignImport`.
 
@@ -605,7 +605,7 @@ End state: O(n log n) sort, O(n) string building, O(n) unique/omit, constant-fac
 
 End state: binary protocol code (byte parsing, packet (de)serialization), UDP sockets, subprocesses, and raw-terminal input are expressible in Lin. Validated against a real systems target (the `deathbot` UDP/RTP/NAL server and keyboard client).
 
-See spec §35 for the full design. **Gated on the IR switchover landing on master** — all operator and intrinsic-dispatch work targets the post-IR pipeline (operators lowered as `LinIR::Binary`/`Unary` in `lin-ir`; intrinsics dispatched in `lin-ir/src/lower.rs`). Implementing against the old `codegen.rs` path would be thrown away by the migration.
+See spec §27 for the full design. **Gated on the IR switchover landing on master** — all operator and intrinsic-dispatch work targets the post-IR pipeline (operators lowered as `LinIR::Binary`/`Unary` in `lin-ir`; intrinsics dispatched in `lin-ir/src/lower.rs`). Implementing against the old `codegen.rs` path would be thrown away by the migration.
 
 Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything else depends on it, and it alone makes the protocol-parsing core (NAL/RTP, ~480 lines, no OS access) writable in Lin.
 
@@ -614,11 +614,11 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 - [x] **Small-int flat array variants** (`lin-runtime/src/array.rs`) — full flat family (`alloc/push/get/set/free/alloc_filled/concat_into/eq/slice`) for `i8`, `u8`, `i16`, `u16` present via macro expansion, plus `lin_flat_to_tagged_*` converters.
 - [x] **Flat-scalar dispatch** (`lin-codegen`) — `is_flat_scalar` and `flat_suffix` cover `Int8/UInt8/Int16/UInt16` (suffixes `i8/u8/i16/u16`) alongside the 32/64-bit families.
 - [x] **Bitwise tokens** (`lin-lex`) — new tokens `Amp` (`&`), `Caret` (`^`), `Tilde` (`~`). Maximal-munch: lone `&` → `Amp`, `&&` → existing `And`. Reuse existing `Pipe` (`|`) in value position. NOTE: `<<`/`>>` are deliberately NOT lexed as combined `Shl`/`Shr` tokens — that would break nested generic close `>>` (`Promise<Promise<Int32>>`). Shifts are detected at the parser level from two ADJACENT `Lt`/`Gt` tokens in value position (`parse_shift_expr` / `adjacent_pair`).
-- [x] **Bitwise AST + parser** — `BinOp::{BAnd, BOr, BXor, Shl, Shr}` and surface `UnaryOp::BNot` + `Expr::UnaryOp` (ast.rs). Precedence rungs per spec §24.2: `~` above `*`; `<<`/`>>` between `+`/`-` and comparison; `&`, `^`, `|` between `==`/`!=` and `&&`, in that order (`parse_bitor_expr` → `parse_bitxor_expr` → `parse_bitand_expr` → ... → `parse_shift_expr` → `parse_additive_expr` → ... → `parse_unary_expr`).
+- [x] **Bitwise AST + parser** — `BinOp::{BAnd, BOr, BXor, Shl, Shr}` and surface `UnaryOp::BNot` + `Expr::UnaryOp` (ast.rs). Precedence rungs per spec §8.2: `~` above `*`; `<<`/`>>` between `+`/`-` and comparison; `&`, `^`, `|` between `==`/`!=` and `&&`, in that order (`parse_bitor_expr` → `parse_bitxor_expr` → `parse_bitand_expr` → ... → `parse_shift_expr` → `parse_additive_expr` → ... → `parse_unary_expr`).
 - [x] **Bitwise type rules** (`lin-check`, `infer_binary_op` + new `infer_unary_op`) — integer-only operands; float operand is a compile-time error. `& | ^`: result = widened integer type (reuse `widen_numeric`). `<< >>`: result = left operand's type. `~x`: result = type of `x`. TypeVar/dynamic operands fall back to the other side's type or `Int32`.
 - [x] **Bitwise codegen / IR lowering** (`lin-ir/src/lower.rs`, `lin-codegen`) — `BinOp::{BAnd,BOr,BXor,Shl,Shr}` map to LLVM `build_and/or/xor/left_shift/right_shift` (logical shift for unsigned, arithmetic for signed via `lty.is_signed()`); surface `UnaryOp::BNot` lowers to IR `UnaryOp::Not` → `build_not`.
 - [x] **`slice` function** — `slice(arr, start, end)` in `std/array` (and re-exported from `std/bytes`), backed by a new runtime `lin_array_slice_dyn` that dispatches on the array's `elem_tag` to the right typed `lin_flat_array_slice_<suffix>` / `lin_array_slice_tagged`. Preserves element type (UInt8[]→UInt8[], Int32[]→Int32[], Json[]→Json[]). No range-index syntax.
-- [x] **Narrowing-cast intrinsics + `std/number` exports** — `lin_to_uint8/_int8/_uint16/_int16/_uint32/_int64/_uint64` (`v as <T>`, input `u64`); exported as `toUInt8`/`toInt8`/`toUInt16`/`toInt16`/`toUInt32`/`toInt64`/`toUInt64`. Needed because byte extraction (`(v >> 24) & 0xFF`) yields a wider int that cannot be implicitly narrowed (§26). Also added IntLit→param literal retyping at call sites in `lin-check` so a bare in-range literal satisfies a wider/unsigned parameter.
+- [x] **Narrowing-cast intrinsics + `std/number` exports** — `lin_to_uint8/_int8/_uint16/_int16/_uint32/_int64/_uint64` (`v as <T>`, input `u64`); exported as `toUInt8`/`toInt8`/`toUInt16`/`toInt16`/`toUInt32`/`toInt64`/`toUInt64`. Needed because byte extraction (`(v >> 24) & 0xFF`) yields a wider int that cannot be implicitly narrowed (§21). Also added IntLit→param literal retyping at call sites in `lin-check` so a bare in-range literal satisfies a wider/unsigned parameter.
 - [x] **Float bit-reinterpret intrinsics** (`lin-runtime`) — `lin_f32_to_bits`/`lin_f32_from_bits`/`lin_f64_to_bits`/`lin_f64_from_bits` (`f32::to_bits` etc.).
 - [x] **`std/bytes` module** (Lin + the four float intrinsics + the narrowing casts) — `u16/u32/u64` big- and little-endian read/write; `f32/f64` bit reinterpret and big/little-endian (de)serialization; `slice`. Registered in `lin-compile` and `lin-lsp`. Tests in `stdlib/bytes.test.lin`.
 - [x] **`std/fs` byte APIs migrated to `UInt8[]`** — `lin_fs_read_file_bytes` now builds a flat `UInt8[]`; `lin_fs_write_file_bytes` reads raw u8 from the flat buffer (tagged fallback retained). `readFileBytes`/`writeFileBytes` signatures and STDLIB docs updated. No other `Int32[]`-as-bytes usages remain in stdlib/examples (only `string.fromCodePoints`, which is genuinely codepoints).
@@ -626,7 +626,7 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 
 ### Layer 2 — Sockets
 
-- [x] **UDP intrinsics** (`lin-runtime/src/net.rs`) — `lin_udp_bind`, `lin_udp_recv`, `lin_udp_recv_from`, `lin_udp_send_to`, `lin_udp_set_nonblocking`, `lin_udp_close`. fd returned as opaque `Int32` (spec §35.4); non-blocking would-block surfaces as `Null`, not `Error`.
+- [x] **UDP intrinsics** (`lin-runtime/src/net.rs`) — `lin_udp_bind`, `lin_udp_recv`, `lin_udp_recv_from`, `lin_udp_send_to`, `lin_udp_set_nonblocking`, `lin_udp_close`. fd returned as opaque `Int32` (spec §27.4); non-blocking would-block surfaces as `Null`, not `Error`.
 - [x] **TCP intrinsics** (`lin-runtime/src/net.rs`) — `lin_tcp_listen`, `lin_tcp_accept`, `lin_tcp_connect`, `lin_tcp_recv`, `lin_tcp_send`, `lin_tcp_set_nonblocking`, `lin_tcp_close`. `accept` returns a connection fd + peer addr (or `Null` when would-block); `recv` returns `0` on peer-closed.
 - [x] **`std/net` module** — UDP: `udpBind`, `udpRecv`, `udpRecvFrom`, `udpSendTo`, `udpSetNonblocking`, `udpClose`. TCP: `tcpListen`, `tcpAccept`, `tcpConnect`, `tcpRecv`, `tcpSend`, `tcpSetNonblocking`, `tcpClose`. All wrap intrinsics in the `T | Error` / `Null`-on-would-block convention.
 
@@ -645,7 +645,7 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 
 ### Spec / docs amendments
 
-- [x] Spec §35 (this section), §24.1/§24.2 (bitwise operators + precedence), §3.7 (`~` is the one unary).
+- [x] Spec §27 (this section), §8.1/§8.2 (bitwise operators + precedence), §2.7 (`~` is the one unary).
 - [x] `docs/STDLIB.md` — full signatures for `std/bytes`, `std/net`, `std/process`, `std/tty`, `std/signal`, and the `std/time.sleepMicros` addition. (All present and verified.)
 - [x] `docs/DECISIONS.md` — ADR-056 (fd-as-opaque-Int handle convention), ADR-057 (share-nothing upheld over a Mutex primitive), ADR-058 (flat unboxed scalar arrays), ADR-059 (two unary operators `~`/`!`; supersedes the original "`~` is the only unary" framing now that `!` landed per ADR-047).
 
@@ -687,7 +687,7 @@ Tracked here so they don't get lost:
 - Full pairwise numeric widening matrix and explicit-cast catalogue.
 - Multi-error reporting (recoverable parse/check).
 - Mutual tail-call optimisation.
-- **Real OS-thread concurrency.** The async surface (§32) is fully specified and
+- **Real OS-thread concurrency.** The async surface (§24) is fully specified and
   wired through checker/IR/codegen, but the runtime (`async_rt.rs`) is a
   synchronous stub — no actual threads. Making it real is gated on catchable
   faults at the thread boundary, a thread-safe RC story, and deferred thunk
