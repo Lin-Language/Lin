@@ -250,3 +250,41 @@ Files touched:
     `std/array`) — the std/array `for` erases the receiver to `Json`, so the IR never sees a
     `Stream` and silently no-ops (treats the stream as a 0-length array). Documented in the
     stdlib comment; the example/tests import `for` from std/stream.
+
+---
+
+## Stage 6 — affine use-after-move check + placement restriction
+- Commit: <pending>
+- Gate: MET. Positive + negative type-check tests green:
+  `test_stream_{use_after_move,in_var,in_object_field}_rejected` + `test_stream_single_use_ok`.
+  Full workspace: 385 integration + all unit tests, 0 failures.
+
+### What was added (`lin-check`)
+- **Placement restriction** (hard ERROR, brief §8): a `Stream` (or `Stream | Error` — see #14)
+  may live only in a `val`/arg/return. Rejected in `Stmt::Var` (stmt.rs), object Pair, and array
+  element (expr.rs) via the new `type_is_streamish` helper.
+- **Affine use-after-move** (hard ERROR, brief §7): a flow-sensitive `consumed_streams: HashSet<
+  slot>` on the Checker. An OWNERSHIP-TAKING op (adapters lines/map/filter/take/chunks/writeStream
+  + terminals drain/collect/readText/for) MOVES its stream arg — `mark_stream_consumed` records
+  the binding at the call/dot-call site (`is_stream_consuming_op`). A later read of a consumed
+  binding errors in `infer_ident`. BORROWS (`read`/`readChunk`/`close`/`closeStream`) are NOT in
+  the consuming set, so a low-level recursive pull loop reads the same binding freely.
+- **Conservative branch merge**: `infer_if` and `infer_match` snapshot `consumed_streams` before
+  the branches and union the per-branch results after (a stream consumed in ANY branch is
+  consumed after — prevents a use after a possible move).
+
+### Surprises / decisions
+14. **`Stream | Error` is the real binding type**: the source intrinsics return `Stream<…> |
+    Error`, so a `val s = readStream(...)` has the UNION type, not a bare `Stream`. The
+    placement/affine/must-use checks therefore use `type_is_streamish` (matches `Stream` OR a
+    union containing `Stream`) rather than `matches!(.., Stream(_))`.
+15. **borrow vs move was load-bearing**: my FIRST affine model consumed on EVERY identifier read,
+    which broke the Stage-3 `readChunk` recursive pull loop (it reads `s` twice per frame:
+    `readChunk(s)` + `countBytes(s, …)`). REWORKED to consume only at ownership-taking call
+    sites; `read`/`close` borrow. This matches the brief's "consumed by the first adapter/terminal
+    it flows into" precisely. The Stage-3 low-level loop now type-checks again.
+16. **v1 scope of the affine check**: tracks simple `Ident` reads of `val`/param Stream bindings.
+    NOT yet covered (sound — they just aren't flagged): a stream consumed inside a lambda that's
+    called multiple times; a stream moved through a generic container. These are out of v1 scope
+    per the placement restriction (no container linearity). The must-use warning (Stage 5) and
+    this consume-check together cover the common single-binding patterns.
