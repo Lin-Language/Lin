@@ -177,3 +177,31 @@ counter()   // 1
 counter()   // 2
 counter()   // 3
 ```
+
+## Generic functions
+
+A function can declare type parameters in angle brackets before its argument list. They let one function work over many types while keeping the relationship between argument and result types precise:
+
+```lin
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val identity = <T>(x: T): T => x
+
+print(toString(identity(42)))   // 42
+print(identity("hello"))        // hello
+```
+
+Type parameters are inferred from the arguments at each call site — you don't write them explicitly when calling. Use several when the types relate to each other:
+
+```lin
+val pair = <A, B>(a: A, b: B): { "first": A, "second": B } =>
+  { "first": a, "second": b }
+
+val firstOf = <T>(xs: T[]): T => xs[0]
+
+print(firstOf([10, 20, 30]))    // 10
+print(firstOf(["a", "b"]))      // a
+```
+
+Here `firstOf` guarantees its result has the same element type as the array it was given — an `Int32[]` in, an `Int32` out. See the [Types reference](/reference/types.html#generic-types) for generic *type* declarations (`type Result<T, E> = ...`) and variance.

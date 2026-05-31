@@ -119,7 +119,7 @@ type Mapper<T, U> = (T) => U
 
 ## Generic types
 
-Generic type declarations and applications are supported:
+Generic type declarations and applications both use angle brackets:
 
 ```lin
 type Box<T> = {
@@ -132,14 +132,50 @@ type Result<T, E> =
   | { "type": "failure", "error": E }
 
 type Mapper<T, U> = (T) => U
+
+// Application: supply concrete types for the parameters.
+type ParseResult = Result<Int32, String>
 ```
 
-Generic types are covariant in producer positions and contravariant in consumer positions.
+## Generic functions
 
-Limitations:
+A `val` function may declare type parameters before its argument list. They are inferred from the arguments at the call site:
 
-- You **cannot** use a generic application in an `is` pattern (`is Result<Int32, String>` is not supported). Match the underlying tagged shape instead via `has { "type": "success", value }`.
-- Cross-module generic functions are monomorphized per importer.
+```lin
+val identity = <T>(x: T): T => x
+val firstOf = <T>(xs: T[]): T => xs[0]
+val pair = <A, B>(a: A, b: B): { "first": A, "second": B } =>
+  { "first": a, "second": b }
+```
+
+`firstOf([1, 2, 3])` returns an `Int32`; `firstOf(["a"])` returns a `String` — the type parameter ties the result to the element type of the argument.
+
+## Variance
+
+Generic types are **covariant** in producer positions (return type, array element, container content) and **contravariant** in consumer positions (function arguments):
+
+- `Person[]` is assignable to `Json[]`.
+- `Iterator<Person>` is assignable to `Iterator<Json>`.
+- A function returning `Person` is assignable to one returning `Json`.
+- `(Json) => Int32` is assignable to `(Person) => Int32` (a consumer of `Json` accepts a `Person`).
+
+## Type-expression precedence
+
+Type operators bind tightest-first:
+
+| Order | Form | Example |
+| --- | --- | --- |
+| 1 | `T[]` | postfix array |
+| 2 | `Generic<…>` | postfix generic application |
+| 3 | `(T1, T2) => U` | function arrow |
+| 4 | `T \| U` | union |
+
+So `Int32 | String[]` parses as `Int32 | (String[])`, and `(Int32) => String[]` as `(Int32) => (String[])`. Parenthesise where the surface reading is unclear.
+
+## Limitations
+
+- You **cannot** use a generic application in an `is` pattern — `is Result<Int32, String>` is a compile-time error. Match the underlying tagged shape instead via `has { "type": "success", value }`.
+- Cross-module generic functions are monomorphized per importer (each importing module compiles its own specialisations).
 
 ## Opaque runtime types
 
