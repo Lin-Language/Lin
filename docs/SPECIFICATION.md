@@ -279,7 +279,7 @@ Rules:
 2. Commas are required between fields.
 3. Trailing commas are not allowed.
 4. Runtime object values must be JSON-compatible.
-5. An object literal may include spread elements of the form `...expr`. `expr` must evaluate to an object at runtime; otherwise an error is raised. Fields and spreads are processed left-to-right. When the same key is written more than once (by spread or explicitly), the later value replaces the earlier one and the key keeps its first-occurrence position in iteration order.
+5. An object literal may include spread elements of the form `...expr`. If `expr` evaluates to an object, its fields are copied in. If `expr` is `null` (or an absent/optional value that resolves to null), the spread contributes no fields — it is a no-op, not a runtime error. Fields and spreads are processed left-to-right. When the same key is written more than once (by spread or explicitly), the later value replaces the earlier one and the key keeps its first-occurrence position in iteration order.
 
 ```txt
 val person = {

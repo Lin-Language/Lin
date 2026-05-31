@@ -71,7 +71,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`append`](#append) | `(Json[], Json) -> Json[]` | Non-mutating single-element append |
 | [`arrayAllocate`](#arrayAllocate) | `(Int32) -> Json[]` | Allocate an array of n nulls |
 | [`arrayAllocateFilled`](#arrayAllocateFilled) | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
-| [`at`](#at-array) | `<T>(T[], Int32) -> T` | Element at index; negative indices count from end |
+| [`at`](#at-array) | `<T>(T[], Int32) -> T \| Null` | Element at index, or `null` if out of bounds; negative indices count from end |
 | [`chunk`](#chunk) | `(Json[], Int32) -> Json[][]` | Split into n-sized sub-arrays |
 | [`compact`](#compact) | `(Json[]) -> Json[]` | Remove null elements |
 | [`concat`](#concat) | `(Json[], Json[]) -> Json[]` | Concatenate two arrays |
@@ -812,10 +812,10 @@ arrayAllocateFilled(0, 9)        // []
 ### at (array) {#at-array}
 
 ```txt
-val at: <T>(arr: T[], index: Int32) -> T
+val at: <T>(arr: T[], index: Int32) -> T | Null
 ```
 
-Returns the element at `index`. Negative indices count from the end: `-1` is the last element, `-2` is second-to-last. If the resolved index is out of bounds, returns `null`.
+Safe accessor. Returns the element at `index`, or `null` if the resolved index is out of bounds (so it never traps). Negative indices count from the end: `-1` is the last element, `-2` is second-to-last. The `null`-on-out-of-bounds case widens the return type to `T | Null`.
 
 ```txt
 at([10, 20, 30], 0)    // 10

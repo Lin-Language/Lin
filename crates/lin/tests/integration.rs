@@ -2538,13 +2538,17 @@ print(toString(keys(merged)))
 }
 
 #[test]
-fn test_object_spread_null_error() {
-    let err = run_expect_err(r#"import { print } from "std/io"
+fn test_object_spread_null_noop() {
+    // Spreading null contributes no fields (it is not a runtime error).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { keys } from "std/object"
 
 val merged = { ...null, "a": 1 }
-print(merged["a"])
+print(toString(merged["a"]))
+print(toString(keys(merged)))
 "#);
-    assert!(err.contains("Object") || err.contains("spread") || err.contains("null"), "got: {}", err);
+    assert_eq!(output, vec!["1", "[\"a\"]"]);
 }
 
 #[test]
