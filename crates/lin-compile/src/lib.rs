@@ -136,7 +136,19 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
                 }
             }
         }
-        let mut ir_module = lower_module(&typed_module);
+        let (mut ir_module, mono_diags) = lower_module(&typed_module);
+        // Monomorphization diagnostics: errors (e.g. an uninferrable type parameter) abort the
+        // build; warnings (e.g. specialization-budget overflow → boxed fallback) are rendered but
+        // do not stop compilation, since the fallback still produces a correct program.
+        let (errors, warnings): (Vec<_>, Vec<_>) = mono_diags
+            .into_iter()
+            .partition(|d| matches!(d.severity, lin_common::Severity::Error));
+        for w in &warnings {
+            w.render(&opts.source_path.to_string_lossy(), &source);
+        }
+        if !errors.is_empty() {
+            return Err(CompileError::TypeCheck(errors));
+        }
         rc_elide::elide_rc(&mut ir_module);
         cg.compile_module_from_ir(&ir_module);
     }
