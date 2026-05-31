@@ -6,9 +6,17 @@ use super::Parser;
 impl Parser {
     pub(crate) fn parse_type_expr(&mut self) -> TypeExpr {
         let first = self.parse_type_primary();
-        if self.check(TokenKind::Pipe) {
+        // A `|` continuation may sit on the next (indented) line, e.g.
+        // `type R =⏎  { .. }⏎  | { .. }` (first variant without a leading pipe). Peek past
+        // newlines via save/restore: only treat them as a continuation when a `|` follows,
+        // so a real statement boundary (newline not followed by `|`) is left intact.
+        if self.check(TokenKind::Pipe) || self.newline_precedes_pipe() {
             let mut types = vec![first];
-            while self.check(TokenKind::Pipe) {
+            loop {
+                self.skip_newlines();
+                if !self.check(TokenKind::Pipe) {
+                    break;
+                }
                 self.advance();
                 self.skip_newlines();
                 types.push(self.parse_type_primary());

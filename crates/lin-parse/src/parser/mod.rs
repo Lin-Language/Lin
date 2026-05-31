@@ -180,6 +180,20 @@ impl Parser {
         }
     }
 
+    /// True when the upcoming token(s) are one or more Newlines followed by a `|`.
+    /// Pure lookahead — does not advance. Used to recognise a union-variant `|` that
+    /// continues onto the next line when the first variant had no leading pipe.
+    pub(crate) fn newline_precedes_pipe(&self) -> bool {
+        if !self.check(TokenKind::Newline) {
+            return false;
+        }
+        let mut i = self.pos;
+        while matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Newline)) {
+            i += 1;
+        }
+        matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Pipe))
+    }
+
     pub(crate) fn skip_newlines_and_indent(&mut self) {
         while matches!(self.peek_kind(), TokenKind::Newline | TokenKind::Indent | TokenKind::Dedent) {
             self.advance();

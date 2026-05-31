@@ -1276,10 +1276,10 @@ type Result<T, E> =
   | { "type": "failure", "error": E }
 ```
 
-(The multi-line leading-`|` form above is the canonical spelling; the parser currently requires a
-tagged union written in a `type` alias to be on a single line —
-`type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }` — when
-its variants are object literals.)
+Both the multi-line leading-`|` form above (the canonical spelling) and the equivalent single-line
+form `type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }`
+parse. In the multi-line form the leading `|` is optional on the first variant; a `|` may also
+begin a continuation line.
 
 ```txt
 val divide = (a: Float64, b: Float64): Result<Float64, String> =>

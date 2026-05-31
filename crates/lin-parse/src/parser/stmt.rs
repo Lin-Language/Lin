@@ -92,8 +92,29 @@ impl Parser {
             Vec::new()
         };
         self.expect(TokenKind::Eq);
+        // A type body may continue on indented lines (spec §18 tagged-union form:
+        // `type R =⏎  | { .. }⏎  | { .. }`). The lexer emits `Newline Indent` after `=`,
+        // so skip the Indent too — otherwise the leading `|` is unreachable and parsing
+        // fails with `unexpected token Pipe`. Track whether we opened an indented block so
+        // its matching Dedent can be consumed after the body, keeping the statement boundary
+        // clean for the next top-level item.
         self.skip_newlines();
+        let indented = self.check(TokenKind::Indent);
+        if indented {
+            self.advance();
+            self.skip_newlines();
+        }
         let body = self.parse_type_expr_with_leading_pipe();
+        if indented {
+            // Consume the trailing Newline(s)/Dedent that close the indented body.
+            while matches!(self.peek_kind(), TokenKind::Newline | TokenKind::Dedent) {
+                let was_dedent = self.check(TokenKind::Dedent);
+                self.advance();
+                if was_dedent {
+                    break;
+                }
+            }
+        }
         Stmt::TypeDecl { name, params, body, exported, span }
     }
 
