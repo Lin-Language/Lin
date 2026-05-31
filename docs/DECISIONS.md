@@ -1018,3 +1018,27 @@ wrappers alike. Lifecycle leans on Lin's functional/DI grain rather than new syn
 spans lin-parse (a `Replace` stmt), lin-check (resolve target symbol, type-check body), and
 lin-ir/lin-compile (emit the body under the export's symbol; suppress the original; enforce
 test-only + intrinsic/unused diagnostics).
+
+**As implemented.** A few details settled during implementation:
+- `Stmt::Replace { name, value, span }` (no `TypedStmt::Replace` — the checker collects overrides
+  into a side-channel `TypedModule::replacements`, mirroring `intrinsics`/`exported_types`, so no
+  exhaustive-match churn across crates). Lowering emits each mock under the export's canonical
+  mangled symbol (`{module_key}_{name}`, or `{sym}__val` for vals); the owning module skips emitting
+  that symbol and routes its slot through `import_fn_slots`/`import_val_slots`, so internal sibling
+  calls also become `Named` calls to the single mock definition.
+- **Test-only gating is by FILENAME** (`*.test.lin`), not subcommand. This is what makes it hold for
+  every entry point at once: `lin test` AND the ASan CI leg (which runs `lin build <f>.test.lin`)
+  accept it, while `lin build`/`lin run` on a normal program reject it. (A subcommand flag would have
+  broken the ASan leg.)
+- **Type drift** is caught by an explicit `types_compatible` check after `check_expr` — the
+  function-hint path treats expected param types as hints, so an annotation could otherwise override
+  them silently.
+- **`withFixture` is `Json`-typed**, not generic: `(() => Json, (Json) => Null, String, (Json) =>
+  Assertion[]) => Test`. A generic stdlib export taking function params + returning a concrete type
+  hit a monomorphization edge (resolved as a `__val` wrapper, link error); the `Json` fixture type
+  sidesteps it and is sufficient for a test helper.
+- **`run` now delegates to `report`**, the non-exiting variant (`(Suite) => Int32`) added for
+  guaranteed afterAll teardown — `run(s) = if report(s) > 0 then exit(1) else null`.
+- A worked project lives at `examples/mocking/` (clock + store + logger), and the feature is
+  documented in docs/SPECIFICATION.md §22.1–22.2, docs/STDLIB.md (std/test), and the doc-site
+  Testing tutorial.

@@ -3943,6 +3943,97 @@ Passes when `value` has shape `{ "type": "failure", "error": e }` and `e == mess
 
 ---
 
+### withFixture
+
+```txt
+val withFixture: (
+  setup: () -> Json,
+  teardown: (Json) -> Null,
+  name: String,
+  body: (Json) -> Assertion[]
+) -> Test
+```
+
+Per-test setup/teardown with dependency injection. Builds a fixture with `setup`,
+injects it into `body`, then tears it down with `teardown` — all inside one `test`.
+Because assertion failures are **values** (not exceptions), teardown always runs,
+even when the body's assertions fail. This is the functional alternative to keyword
+`beforeEach`/`afterEach`; compose it into a reusable per-fixture helper with partial
+application:
+
+```txt
+val withDb = withFixture(openDb, closeDb,)   // trailing comma = partial application
+
+val tests = [
+  withDb("inserts a row", (db) => [ expect(db.count()).toBe(1) ]),
+  withDb("reads it back", (db) => [ expect(db.first().name).toBe("ada") ])
+]
+```
+
+---
+
+### report
+
+```txt
+val report: (s: Suite) -> Int32
+```
+
+Like `run`, but **returns the failure count** (0 = all passed) instead of exiting.
+Statements after it execute regardless of outcome — the building block for
+guaranteed `afterAll` teardown:
+
+```txt
+val failures = report(suite("db", tests))
+closeConnections()                  // always runs, even on failure
+if failures > 0 then exit(1) else null
+```
+
+---
+
+### Setup & teardown (lifecycle)
+
+Lin's eager test model needs no dedicated lifecycle keywords:
+
+- **beforeAll** — a module-scope `val`/statement above the suite. Test bodies run
+  eagerly as the `tests` array is built, so module-scope setup runs once before them.
+- **afterAll** — statements after the run. `run` calls `exit(1)` on failure, so for
+  teardown that must run even when a test fails, use `report` (which returns instead
+  of exiting) and place cleanup after it.
+- **beforeEach / afterEach** — use [`withFixture`](#withfixture), which runs
+  setup+teardown around each test body and injects the fixture.
+
+---
+
+### Mocking with `replace`
+
+A test-only `replace <name> = <expr>` statement overrides an imported export for the
+whole test program — for mocking sibling modules and stdlib wrappers:
+
+```txt
+import { readFile } from "std/fs"
+
+replace readFile = (path: String): Json => "mock contents of ${path}"
+```
+
+- **Replaced everywhere.** The override applies to every caller of that export —
+  the test file, the module under test, and any transitive importer — because it
+  swaps the export's single compiled symbol. A module that internally calls the
+  replaced function sees the mock without any change to itself.
+- **Stdlib is mockable** at the Lin-API level (`std/fs.readFile`, `std/time.now`,
+  …). The polymorphic intrinsics (`print`, `map`, `filter`, `reduce`, `for`,
+  `length`, `toString`, the async family) are **not** replaceable.
+- **Type-checked.** The replacement body is checked against the export's real
+  signature; a mismatch is a compile error.
+- **Vals too.** `replace maxRetries = 99` overrides a non-function export.
+- **Spies** are an ordinary mock closing over a module-level `var` cell to record
+  calls/arguments, asserted after the run.
+- **Test-only.** `replace` is permitted only in a `*.test.lin` file; using it in a
+  `lin build`/`lin run` program is a hard compile error.
+
+See `examples/mocking/` for a worked project and ADR-071 for the design.
+
+---
+
 ## std/time
 
 Timestamps, delays, and timing. All timestamps are Unix time in milliseconds.

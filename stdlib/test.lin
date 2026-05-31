@@ -74,15 +74,43 @@ export val toFailWith = (asserter: Json, message: String): Assertion =>
 export val test = (name: String, body: () => Assertion[]): Json =>
   _evalResult(name, body())
 
+// `withFixture` is the per-test setup/teardown + dependency-injection combinator (ADR-071):
+// it builds a fixture, injects it into the body, and tears it down — all within a single
+// `test`. Because assertion failures are VALUES (not exceptions), teardown always runs, even
+// when the body's assertions fail. This is the functional alternative to keyword
+// beforeEach/afterEach: compose it (often via partial application) into a per-fixture helper,
+// e.g. `val withDb = withFixture(openDb, closeDb,)`, then `withDb("name", db => [ ... ])`.
+export val withFixture = (
+  setup: () => Json,
+  teardown: (Json) => Null,
+  name: String,
+  body: (Json) => Assertion[],
+): Json =>
+  test(name, () =>
+    val fixture = setup()
+    val results = body(fixture)
+    teardown(fixture)
+    results
+  )
+
 export val suite = (name: String, tests: Json[]): Json =>
   { "name": name, "tests": tests }
 
-export val run = (s: Json): Null =>
+// Print a suite's results and return the failure count (0 = all passed). Unlike `run`, this
+// does NOT call `exit`, so statements AFTER it execute regardless of outcome — the building
+// block for guaranteed afterAll teardown. Inspect the count and `exit` yourself if you want a
+// failing process status: `val failures = report(s); cleanup(); if failures > 0 then exit(1)`.
+export val report = (s: Json): Int32 =>
   val failed = s["tests"].filter(r => r["type"] == "fail")
   val passCount = length(s["tests"]) - length(failed)
   val failCount = length(failed)
   _printSuiteResults({ "name": s["name"], "results": s["tests"] })
   if failCount == 0 then print("${toString(passCount)} passed")
-  else
-    print("${toString(failCount)} failed, ${toString(passCount)} passed")
-    exit(1)
+  else print("${toString(failCount)} failed, ${toString(passCount)} passed")
+  failCount
+
+// Run a suite: print results and `exit(1)` if any test failed (the common case — a non-zero
+// status fails CI). For guaranteed post-run teardown even on failure, use `report` instead.
+export val run = (s: Json): Null =>
+  if report(s) > 0 then exit(1)
+  else null
