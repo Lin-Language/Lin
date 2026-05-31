@@ -1,20 +1,119 @@
 /// AST pretty-printer for Lin source files.
 ///
 /// Produces canonical, idempotent output from a parsed `Module`.
-/// NOTE: Comments are not preserved because they are not represented in the
-/// AST (they are stripped by the lexer). See docs/DECISIONS.md ADR-040.
+///
+/// Comments are preserved (reversing the original ADR-040 decision). Lin has only `//`
+/// line comments; the lexer no longer discards them but records each on a side channel
+/// (`Lexer::comments()`). `Formatter::with_comments` consumes that side channel, attaches
+/// each comment to an AST anchor (a statement, a block tail, or a single-expression
+/// function body), and re-emits it during formatting: own-line comments as leading lines
+/// at the anchor's indentation; trailing comments one space after the anchor's code.
+/// `Formatter::new()` keeps the old comment-free behaviour for callers that don't have a
+/// comment side channel handy.
 
 use crate::ast::*;
 use lin_common::NumSuffix;
+use lin_lex::Comment;
+use std::collections::HashMap;
+use std::cell::RefCell;
 
-pub struct Formatter;
+/// Comment attachment, computed once in `with_comments` and consulted by the free-function
+/// formatters via a thread-local for the duration of a single `format_module` call. Keys are
+/// anchor span starts (char offsets).
+#[derive(Default)]
+struct CommentCtx {
+    /// Leading own-line comments, in source order, attached to the anchor that follows them.
+    leading: HashMap<u32, Vec<Comment>>,
+    /// One trailing comment (same source line as the anchor's code).
+    trailing: HashMap<u32, Comment>,
+    /// Own-line comments dangling after the last anchor (EOF), emitted at the end.
+    dangling: Vec<Comment>,
+}
+
+thread_local! {
+    static CTX: RefCell<CommentCtx> = RefCell::new(CommentCtx::default());
+}
+
+/// Leading comments for `anchor_start`, rendered as `"{ind}{text}\n"` lines (joined), or empty.
+fn take_leading(anchor_start: u32, ind: &str) -> String {
+    CTX.with(|c| {
+        let c = c.borrow();
+        match c.leading.get(&anchor_start) {
+            Some(cs) if !cs.is_empty() => {
+                let mut out = String::new();
+                for cm in cs {
+                    out.push_str(ind);
+                    out.push_str(&cm.text);
+                    out.push('\n');
+                }
+                out
+            }
+            _ => String::new(),
+        }
+    })
+}
+
+/// The trailing comment text for `anchor_start` (e.g. `"// note"`), or empty.
+fn trailing_text(anchor_start: u32) -> String {
+    CTX.with(|c| {
+        c.borrow()
+            .trailing
+            .get(&anchor_start)
+            .map(|cm| cm.text.clone())
+            .unwrap_or_default()
+    })
+}
+
+pub struct Formatter {
+    comments: Vec<Comment>,
+    /// Char offset of each source line's start (`line_starts[i]` = start of line `i`). Used to
+    /// decide whether a trailing comment is on the same source line as an anchor's code.
+    line_starts: Vec<usize>,
+}
+
+/// Char offsets at which each source line begins. `line_starts[0] == 0`; each `\n` opens a new
+/// line at the following char. Offsets are in char space (spans are char offsets — lexer.rs).
+fn compute_line_starts(source: &str) -> Vec<usize> {
+    let mut starts = vec![0usize];
+    for (i, ch) in source.chars().enumerate() {
+        if ch == '\n' {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
+/// 0-based source line containing char offset `pos`.
+fn line_of(line_starts: &[usize], pos: usize) -> usize {
+    match line_starts.binary_search(&pos) {
+        Ok(i) => i,
+        Err(i) => i - 1,
+    }
+}
 
 impl Formatter {
+    /// Comment-free formatter (legacy behaviour). Used by callers without a comment side
+    /// channel; produces identical output to before comment preservation existed.
     pub fn new() -> Self {
-        Formatter
+        Formatter { comments: Vec::new(), line_starts: Vec::new() }
+    }
+
+    /// Comment-preserving formatter. `comments` is the lexer's side channel for the SAME
+    /// `source` that produced the `Module` passed to `format_module`.
+    pub fn with_comments(source: &str, comments: Vec<Comment>) -> Self {
+        Formatter {
+            comments,
+            line_starts: compute_line_starts(source),
+        }
     }
 
     pub fn format_module(&self, module: &Module) -> String {
+        // Build the comment attachment for this module and install it on the thread-local
+        // for the duration of the format, then clear it (so a comment-free Formatter::new()
+        // call doesn't see stale state from a previous run).
+        let ctx = build_comment_ctx(&self.comments, &self.line_starts, module);
+        CTX.with(|c| *c.borrow_mut() = ctx);
+
         let mut out = String::new();
         let mut first = true;
         for stmt in &module.statements {
@@ -27,9 +126,27 @@ impl Formatter {
                 out.push('\n');
             }
             first = false;
-            out.push_str(&fmt_stmt(stmt, ""));
+            let anchor = stmt.span().start;
+            out.push_str(&take_leading(anchor, ""));
+            let mut s = fmt_stmt(stmt, "");
+            let trailing = trailing_text(anchor);
+            if !trailing.is_empty() {
+                s.push(' ');
+                s.push_str(&trailing);
+            }
+            out.push_str(&s);
             out.push('\n');
         }
+
+        // EOF-dangling own-line comments (after the last anchor).
+        let dangling = CTX.with(|c| std::mem::take(&mut c.borrow_mut().dangling));
+        for cm in &dangling {
+            out.push_str(&cm.text);
+            out.push('\n');
+        }
+
+        // Clear the thread-local so it doesn't leak into a later comment-free format.
+        CTX.with(|c| *c.borrow_mut() = CommentCtx::default());
         out
     }
 }
@@ -38,6 +155,186 @@ impl Default for Formatter {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ── comment attachment ─────────────────────────────────────────────────────────
+
+/// One comment anchor: an AST position a comment may attach to. `start` keys leading/trailing
+/// maps; `end` is used for same-line trailing matching. `trailing_ok` is false for anchors
+/// whose recorded span is unreliable for trailing placement (a single-expression function
+/// body that is itself control flow — `if`/`match`/block — has a tiny, misleading span and
+/// renders across multiple lines, so a trailing comment on it cannot be placed idempotently).
+#[derive(Clone, Copy)]
+struct Anchor {
+    start: u32,
+    end: u32,
+    trailing_ok: bool,
+}
+
+/// Collect every comment anchor in the module, in source order: each statement in a
+/// statement-list slot (module top level, every block's stmts, and each block tail), plus
+/// each single-expression function body (so a comment between `=>` and the body is kept).
+/// Returns anchors sorted by `start` ascending.
+fn collect_anchors(module: &Module) -> Vec<Anchor> {
+    let mut anchors = Vec::new();
+    for stmt in &module.statements {
+        collect_anchors_stmt(stmt, &mut anchors);
+    }
+    anchors.sort_unstable_by_key(|a| a.start);
+    anchors
+}
+
+fn collect_anchors_stmt(stmt: &Stmt, out: &mut Vec<Anchor>) {
+    let sp = stmt.span();
+    out.push(Anchor { start: sp.start, end: sp.end, trailing_ok: true });
+    match stmt {
+        Stmt::Val { value, .. } | Stmt::Var { value, .. } => collect_anchors_expr(value, out),
+        Stmt::Expr(e) => collect_anchors_expr(e, out),
+        _ => {}
+    }
+}
+
+fn collect_anchors_expr(expr: &Expr, out: &mut Vec<Anchor>) {
+    match expr {
+        Expr::Block(stmts, tail, _) => {
+            for s in stmts {
+                collect_anchors_stmt(s, out);
+            }
+            let t = tail.span();
+            out.push(Anchor { start: t.start, end: t.end, trailing_ok: true });
+            collect_anchors_expr(tail, out);
+        }
+        Expr::Function { body, .. } => {
+            // A single-expression body is itself an implicit anchor so a leading comment
+            // between `=>` and the body survives (e.g. array.lin `range`). A Block body's
+            // anchors are picked up by recursing. A control-flow body (`if`/`match`) has an
+            // unreliable, often single-token span and renders multi-line, so it may only
+            // carry LEADING comments, never trailing.
+            if !matches!(**body, Expr::Block(..)) {
+                let b = body.span();
+                let trailing_ok = !matches!(**body, Expr::If { .. } | Expr::Match { .. });
+                out.push(Anchor { start: b.start, end: b.end, trailing_ok });
+            }
+            collect_anchors_expr(body, out);
+        }
+        Expr::If { condition, then_branch, else_branch, .. } => {
+            collect_anchors_expr(condition, out);
+            collect_anchors_expr(then_branch, out);
+            collect_anchors_expr(else_branch, out);
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            collect_anchors_expr(scrutinee, out);
+            for arm in arms {
+                collect_anchors_expr(&arm.body, out);
+            }
+        }
+        Expr::Call { func, args, .. } => {
+            collect_anchors_expr(func, out);
+            for a in args {
+                collect_anchors_expr(a, out);
+            }
+        }
+        Expr::DotCall { receiver, args, .. } => {
+            collect_anchors_expr(receiver, out);
+            if let Some(args) = args {
+                for a in args {
+                    collect_anchors_expr(a, out);
+                }
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            collect_anchors_expr(left, out);
+            collect_anchors_expr(right, out);
+        }
+        Expr::UnaryOp { operand, .. } => collect_anchors_expr(operand, out),
+        Expr::Index { object, key, .. } => {
+            collect_anchors_expr(object, out);
+            collect_anchors_expr(key, out);
+        }
+        Expr::IndexAssign { object, key, value, .. } => {
+            collect_anchors_expr(object, out);
+            collect_anchors_expr(key, out);
+            collect_anchors_expr(value, out);
+        }
+        Expr::Assign { value, .. } => collect_anchors_expr(value, out),
+        Expr::Array(items, _) | Expr::TupleArgs(items, _) => {
+            for it in items {
+                collect_anchors_expr(it, out);
+            }
+        }
+        Expr::Object(fields, _) => {
+            for f in fields {
+                match f {
+                    ObjectField::Pair(k, v) => {
+                        collect_anchors_expr(k, out);
+                        collect_anchors_expr(v, out);
+                    }
+                    ObjectField::Spread(e) => collect_anchors_expr(e, out),
+                }
+            }
+        }
+        Expr::Is { expr, .. } | Expr::Has { expr, .. } => collect_anchors_expr(expr, out),
+        Expr::StringInterp(parts, _) => {
+            for p in parts {
+                if let StringPart::Expr(e) = p {
+                    collect_anchors_expr(e, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Compute leading/trailing/dangling attachment for `comments` against the module's anchors.
+fn build_comment_ctx(comments: &[Comment], line_starts: &[usize], module: &Module) -> CommentCtx {
+    let mut ctx = CommentCtx::default();
+    if comments.is_empty() {
+        return ctx;
+    }
+    let anchors = collect_anchors(module);
+
+    for cm in comments {
+        if cm.own_line {
+            // Leading: attach to the first anchor that starts strictly after the comment.
+            match anchors.iter().find(|a| a.start > cm.span.start) {
+                Some(a) => ctx.leading.entry(a.start).or_default().push(cm.clone()),
+                None => ctx.dangling.push(cm.clone()),
+            }
+        } else {
+            // Trailing: attach to the closest anchor that both ENDS at or before the comment
+            // and lies ENTIRELY on the comment's source line (`start` and `end` both on that
+            // line). The whole-line requirement is what keeps formatting idempotent: an anchor
+            // that merely *ends* on the comment's line but spans earlier lines (e.g. a
+            // multi-line `if`/`match` whose recorded span end happens to fall on the first
+            // line) would be rendered across several output lines, so appending the comment to
+            // its last line moves the comment relative to the code — and the next format pass
+            // would re-attach it differently. Comments with no single-line anchor are demoted
+            // to a leading own-line comment of the next anchor (lossless, deterministic).
+            let cm_line = line_of(line_starts, cm.span.start as usize);
+            let anchor = anchors
+                .iter()
+                .filter(|a| {
+                    a.trailing_ok
+                        && a.end <= cm.span.start
+                        && line_of(line_starts, a.start as usize) == cm_line
+                        && line_of(line_starts, a.end.saturating_sub(1) as usize) == cm_line
+                })
+                .max_by_key(|a| a.end);
+            match anchor {
+                // Keep only the first trailing comment per anchor (canonical: one per line).
+                Some(a) => {
+                    ctx.trailing.entry(a.start).or_insert_with(|| cm.clone());
+                }
+                // No single-line anchor on this line: demote to a leading own-line comment of
+                // the next anchor so it survives at a stable position.
+                None => match anchors.iter().find(|a| a.start > cm.span.start) {
+                    Some(a) => ctx.leading.entry(a.start).or_default().push(cm.clone()),
+                    None => ctx.dangling.push(cm.clone()),
+                },
+            }
+        }
+    }
+    ctx
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -689,17 +986,38 @@ fn fmt_function(
         None => format!("({}){}", ps.join(", "), ret),
     };
 
+    // Leading comments attached to a single-expression body (Block bodies carry their own
+    // comments inside `fmt_block`). A leading comment forces the multi-line form so the
+    // comment sits on its own line above the body, at the body's indentation.
+    let body_anchor = body.span().start;
+    let body_leading = if matches!(body, Expr::Block(..)) {
+        String::new()
+    } else {
+        take_leading(body_anchor, &child_ind)
+    };
+    let body_trailing = if matches!(body, Expr::Block(..)) {
+        String::new()
+    } else {
+        trailing_text(body_anchor)
+    };
+
     // Block / match / complex if → multi-line.
     let needs_multiline = matches!(body, Expr::Block(..) | Expr::Match { .. })
-        || (matches!(body, Expr::If { .. }) && !is_atomic(body));
+        || (matches!(body, Expr::If { .. }) && !is_atomic(body))
+        || !body_leading.is_empty();
 
-    let body_str = fmt_expr(body, false, &child_ind);
+    let mut body_str = fmt_expr(body, false, &child_ind);
+    if !body_trailing.is_empty() {
+        body_str.push(' ');
+        body_str.push_str(&body_trailing);
+    }
     // Use multi-line form if the body is inherently multi-line or if the
     // body_str spans multiple lines (e.g. a nested if/else that didn't
     // fit inline).
     if needs_multiline || body_str.contains('\n') {
         let indented = indent_first(&body_str, &child_ind);
-        format!("{} =>\n{}", param_part, indented)
+        // `body_leading` lines already carry `child_ind` and trailing newlines.
+        format!("{} =>\n{}{}", param_part, body_leading, indented)
     } else {
         format!("{} => {}", param_part, body_str)
     }
@@ -721,14 +1039,38 @@ fn fmt_block(stmts: &[Stmt], tail: &Expr, ind: &str) -> String {
         if matches!(stmt, Stmt::Expr(Expr::NullLit(_))) {
             continue;
         }
-        let s = fmt_stmt_in_block(stmt, ind);
+        let anchor = stmt.span().start;
+        // Leading comments at `ind` (each its own line) — already include trailing newlines,
+        // so trim the final one and push as a separate joined-by-\n line entry.
+        let leading = take_leading(anchor, ind);
+        if !leading.is_empty() {
+            lines.push(leading.trim_end_matches('\n').to_string());
+        }
+        let mut s = fmt_stmt_in_block(stmt, ind);
+        let trailing = trailing_text(anchor);
+        if !trailing.is_empty() {
+            s.push(' ');
+            s.push_str(&trailing);
+        }
         lines.push(s);
     }
 
-    // Tail: fmt_expr with `ind` → first line NO indent, rest have `ind`.
+    // Tail: leading comments, then the tail expr.
+    let tail_anchor = tail.span().start;
+    let tail_leading = take_leading(tail_anchor, ind);
+    if !tail_leading.is_empty() {
+        lines.push(tail_leading.trim_end_matches('\n').to_string());
+    }
+    // fmt_expr with `ind` → first line NO indent, rest have `ind`.
     let tail_s = fmt_expr(tail, false, ind);
     // Prefix the first line of tail_s with `ind` so all lines have uniform indent.
-    lines.push(format!("{}{}", ind, tail_s));
+    let mut tail_line = format!("{}{}", ind, tail_s);
+    let tail_trailing = trailing_text(tail_anchor);
+    if !tail_trailing.is_empty() {
+        tail_line.push(' ');
+        tail_line.push_str(&tail_trailing);
+    }
+    lines.push(tail_line);
 
     // Now lines[0] has `ind` on first line. Strip it to satisfy the "first line no indent" rule.
     let joined = lines.join("\n");
