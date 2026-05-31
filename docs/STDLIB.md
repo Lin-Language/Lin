@@ -15,6 +15,8 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/math`](#stdmath) | Mathematical functions |
 | [`std/object`](#stdobject) | Object introspection functions |
 | [`std/json`](#stdjson) | Type-directed JSON decode |
+| [`std/yaml`](#stdyaml) | YAML parse and serialise |
+| [`std/jq`](#stdjq) | Query Json values with jq filters |
 | [`std/hash`](#stdhash) | Stable structural hash of any value |
 | [`std/io`](#stdio) | stdin/stdout and terminal input |
 | [`std/fs`](#stdfs) | Filesystem read and write |
@@ -181,6 +183,22 @@ This document specifies the standard library for the Lin language. All modules a
 | [`omit`](#omit) | `({}, String[]) -> {}` | Return object without specified keys |
 | [`pick`](#pick) | `({}, String[]) -> {}` | Return object with only specified keys |
 | [`values`](#values) | `(Json) -> Json[]` | Array of object values |
+
+**std/yaml**
+
+| Function | Signature | Summary |
+| --- | --- | --- |
+| [`parse`](#parse-yaml) | `(String) -> Json \| Error` | Parse one YAML document |
+| [`parseAll`](#parseAll) | `(String) -> Json[] \| Error` | Parse a `---`-separated multi-document stream |
+| [`stringify`](#stringify-yaml) | `(Json) -> String` | Serialise a value to block-style YAML |
+| [`stringifyAll`](#stringifyAll) | `(Json[]) -> String` | Serialise values to a `---`-separated YAML stream |
+
+**std/jq**
+
+| Function | Signature | Summary |
+| --- | --- | --- |
+| [`jq`](#jq) | `(Json, String) -> Json[] \| Error` | Run a jq filter, collecting all outputs |
+| [`jqFirst`](#jqFirst) | `(Json, String) -> Json \| Error` | Run a jq filter, returning the first output or `Null` |
 
 **std/io**
 
@@ -2517,6 +2535,144 @@ val name = readLine()
 match name
   is Null => print("no input")
   else    => print("hello ${name}")
+```
+
+---
+
+## std/yaml
+
+Import:
+
+```txt
+import { parse, parseAll, stringify, stringifyAll } from "std/yaml"
+```
+
+YAML maps to the same data model as JSON: a parsed document is an ordinary Json value (object, array, string, number, boolean, or `null`). Fallible functions return the canonical `Error` value (`{ "type": "error", "message": String }`) on a parse failure, detectable with `is Error`.
+
+---
+
+### parse <a name="parse-yaml"></a>
+
+```txt
+val parse: (src: String) -> Json | Error
+```
+
+Parses a single YAML document into a Json value. Returns an `Error` value if `src` is not well-formed YAML.
+
+```txt
+val cfg = parse("name: web\nreplicas: 3\n")
+print(cfg["name"])      // web
+print(cfg["replicas"])  // 3
+```
+
+Combine with `std/fs` and `std/jq` to query a config file (a "yq"-style pipeline):
+
+```txt
+readFile("deploy.yaml").parse().jq(".spec.containers[].image")
+```
+
+---
+
+### parseAll
+
+```txt
+val parseAll: (src: String) -> Json[] | Error
+```
+
+Parses a multi-document YAML stream — documents separated by a `---` line — into an array of Json values. Returns an `Error` value if any document is malformed.
+
+```txt
+val docs = parseAll("a: 1\n---\nb: 2\n")
+print(docs.length())  // 2
+```
+
+---
+
+### stringify <a name="stringify-yaml"></a>
+
+```txt
+val stringify: (value: Json) -> String
+```
+
+Serialises a Json value to a block-style YAML document.
+
+```txt
+print(stringify({ "name": "web", "ports": [80, 443] }))
+// name: web
+// ports:
+// - 80
+// - 443
+```
+
+---
+
+### stringifyAll
+
+```txt
+val stringifyAll: (values: Json[]) -> String
+```
+
+Serialises an array of Json values to a multi-document YAML stream, each document preceded by a `---` separator. The result round-trips through `parseAll`.
+
+```txt
+print(stringifyAll([{ "a": 1 }, { "b": 2 }]))
+// ---
+// a: 1
+// ---
+// b: 2
+```
+
+---
+
+## std/jq
+
+Import:
+
+```txt
+import { jq, jqFirst } from "std/jq"
+```
+
+Runs [jq](https://jqlang.github.io/jq/) filter programs against a Json value, using a pure-Rust jq implementation. A filter can produce zero, one, or many output values; the full result set is returned as a Json array. Both compile errors (invalid filter syntax) and runtime errors return the canonical `Error` value, detectable with `is Error`.
+
+---
+
+### jq
+
+```txt
+val jq: (input: Json, filter: String) -> Json[] | Error
+```
+
+Runs `filter` against `input` and returns every output value as a Json array. Returns an `Error` value if the filter fails to compile or errors at runtime.
+
+```txt
+val data = { "users": [{ "name": "Ada", "age": 36 }, { "name": "Bob", "age": 30 }] }
+
+jq(data, ".users[] | .name")        // ["Ada", "Bob"]
+jq(data, ".users | map(.age) | add") // [66]
+jq(data, ".users[] | select(.age > 32) | .name") // ["Ada"]
+```
+
+Because of dot-application, this reads naturally as a pipeline:
+
+```txt
+readFile("deploy.yaml").parse().jq(".spec.containers[].image")
+```
+
+---
+
+### jqFirst
+
+```txt
+val jqFirst: (input: Json, filter: String) -> Json | Error
+```
+
+Like [`jq`](#jq), but returns just the first output value instead of an array. Returns `Null` when the filter produces no output, and propagates an `Error` value unchanged.
+
+```txt
+val data = { "users": [{ "name": "Ada" }, { "name": "Bob" }] }
+
+jqFirst(data, ".users[] | .name")           // "Ada"
+jqFirst(data, ".users[] | select(false)")   // null
 ```
 
 ---

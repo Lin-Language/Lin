@@ -3367,6 +3367,35 @@ print(toString(loaded["version"]))
 }
 
 #[test]
+fn test_yaml_parse_and_stringify() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { parse, stringify } from "std/yaml"
+
+val doc = parse("name: Bob\nage: 30\n")
+print(doc["name"])
+print(toString(doc["age"]))
+val back = parse(stringify(doc))
+print(back["name"])
+"#);
+    assert_eq!(output, vec!["Bob", "30", "Bob"]);
+}
+
+#[test]
+fn test_jq_query() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { jq, jqFirst } from "std/jq"
+
+val data = { "users": [{ "name": "Ada", "age": 36 }, { "name": "Bob", "age": 30 }] }
+print(toString(jq(data, ".users[] | .name")))
+print(toString(jq(data, ".users | map(.age) | add")))
+print(toString(jqFirst(data, ".users[] | .name")))
+"#);
+    assert_eq!(output, vec![r#"["Ada", "Bob"]"#, "[66]", "Ada"]);
+}
+
+#[test]
 fn test_fs_is_file() {
     let tmp = std::env::temp_dir().join(format!("lin_ctest_isfile_{}.txt", std::process::id()));
     let _ = fs::remove_file(&tmp);
