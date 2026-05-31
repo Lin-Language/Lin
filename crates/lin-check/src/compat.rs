@@ -94,6 +94,18 @@ pub fn is_compatible_env(
         // Non-MAX inference / generic / intrinsic TypeVars stay bidirectionally permissive.
         (_, Type::TypeVar(_)) | (Type::TypeVar(_), _) => true,
 
+        // Singleton string-literal types (ADR-051). A `StrLit("x")` is a `String` at runtime;
+        // these rules constrain only check-time assignability:
+        //  1. two literals are compatible iff equal (unequal => reject; the equal case is also
+        //     caught by the `value_type == target_type` fast path above, but the explicit arm
+        //     stops an unequal pair falling through to a later, wrong branch).
+        //  2. a literal widens to the open `String` type.
+        //  3. `String` is NOT assignable to a literal type — load-bearing rejection: an arbitrary
+        //     string is not statically known to equal the singleton.
+        (Type::StrLit(a), Type::StrLit(b)) => a == b,
+        (Type::StrLit(_), Type::Str) => true,
+        (Type::Str, Type::StrLit(_)) => false,
+
         // Numeric widening: narrower assignable to wider
         (a, b) if a.is_numeric() && b.is_numeric() => is_numeric_compatible(a, b),
 

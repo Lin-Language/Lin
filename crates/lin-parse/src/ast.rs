@@ -264,4 +264,6 @@ pub enum TypeExpr {
     Function(Vec<TypeExpr>, Box<TypeExpr>, Span),
     Object(Vec<(String, TypeExpr)>, Span),
     TaggedUnion(Vec<TypeExpr>, Span),
+    /// A string-literal singleton type, e.g. `"success"` in type position.
+    StringLit(String, Span),
 }

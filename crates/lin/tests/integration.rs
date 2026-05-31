@@ -5327,3 +5327,116 @@ main()
 "#);
     assert_eq!(out, vec!["ok:Ada", "err"]);
 }
+
+// ── singleton string-literal types (ADR-051) ──────────────────────────────────
+
+#[test]
+fn test_literal_type_good_assignment() {
+    // A discriminated tagged-union value with the correct literal tag is accepted, and the
+    // match/has arms discriminate at runtime.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+val r: Result<Int32, String> = { "type": "success", "value": 7 }
+val msg = match r
+  has { "type": "success", value } => "ok ${toString(value)}"
+  has { "type": "failure", error } => "err ${error}"
+  else => "?"
+print(msg)
+"#);
+    assert_eq!(out, vec!["ok 7"]);
+}
+
+#[test]
+fn test_literal_type_wrong_tag_rejected() {
+    // An object with a tag that matches no variant is a compile error naming the valid tags.
+    let err = run_expect_err(r#"import { print } from "std/io"
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+val bad: Result<Int32, String> = { "type": "nope", "value": 1 }
+print("x")
+"#);
+    assert!(err.contains("nope") || err.contains("success") || err.contains("failure"),
+        "expected the wrong-tag error to mention the bad/valid tags, got:\n{}", err);
+}
+
+#[test]
+fn test_string_not_assignable_to_literal() {
+    // A plain String value is NOT assignable to a singleton literal type (load-bearing reject).
+    let err = run_expect_err(r#"import { print } from "std/io"
+type Tag = "ok"
+val s: String = "ok"
+val t: Tag = s
+print("x")
+"#);
+    assert!(err.contains("ok") && (err.contains("Expected") || err.contains("String")),
+        "expected a literal-type rejection, got:\n{}", err);
+}
+
+#[test]
+fn test_literal_assignable_to_string() {
+    // A literal-typed value widens to String (ADR-051 rule 2).
+    let out = run(r#"import { print } from "std/io"
+type Tag = "ok"
+val t: Tag = "ok"
+val s: String = t
+print(s)
+"#);
+    assert_eq!(out, vec!["ok"]);
+}
+
+#[test]
+fn test_bare_string_literal_still_string() {
+    // §33: a bare string-literal VALUE still infers to String, usable everywhere a String is.
+    let out = run(r#"import { print } from "std/io"
+val x = "foo"
+val y: String = x
+val use = (s: String): String => s
+print(use(x))
+print(y)
+"#);
+    assert_eq!(out, vec!["foo", "foo"]);
+}
+
+#[test]
+fn test_spec18_divide_discriminates() {
+    // The spec §18 divide()/Result example runs and discriminates both branches at runtime.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+val divide = (a: Float64, b: Float64): Result<Float64, String> =>
+  if b == 0.0 then { "type": "failure", "error": "Cannot divide by zero" }
+  else { "type": "success", "value": a / b }
+val message = (r: Result<Float64, String>): String =>
+  match r
+    has { "type": "success", value } => "Result: ${toString(value)}"
+    has { "type": "failure", error } => "Error: ${error}"
+    else => "?"
+print(message(divide(10.0, 2.0)))
+print(message(divide(1.0, 0.0)))
+"#);
+    assert_eq!(out, vec!["Result: 5.0", "Error: Cannot divide by zero"]);
+}
+
+#[test]
+fn test_literal_type_survives_generic_substitution() {
+    // Literal tags survive generic substitution in BOTH orderings of the type params.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+val a: Result<Int32, String> = { "type": "success", "value": 42 }
+val b: Result<String, Int32> = { "type": "failure", "error": 7 }
+val showA = (r: Result<Int32, String>): String =>
+  match r
+    has { "type": "success", value } => "A ok ${toString(value)}"
+    has { "type": "failure", error } => "A err ${error}"
+    else => "?"
+val showB = (r: Result<String, Int32>): String =>
+  match r
+    has { "type": "success", value } => "B ok ${value}"
+    has { "type": "failure", error } => "B err ${toString(error)}"
+    else => "?"
+print(showA(a))
+print(showB(b))
+"#);
+    assert_eq!(out, vec!["A ok 42", "B err 7"]);
+}

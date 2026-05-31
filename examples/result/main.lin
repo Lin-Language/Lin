@@ -1,0 +1,33 @@
+// result — spec §18 tagged-union example with real singleton string-literal types.
+//
+// `Result<T, E>` is a tagged union discriminated by a `"type"` field whose value is a
+// *singleton string-literal type* ("success" / "failure"). The literal tags are checked
+// at compile time: an object with the wrong tag (or no tag) is a type error, and the
+// `match`/`has` arms discriminate the two branches at runtime.
+//
+// Run:   lin run examples/result/main.lin
+// Test:  lin test examples/result/
+
+import { print } from "std/io"
+import { toString } from "std/string"
+
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+
+val divide = (a: Float64, b: Float64): Result<Float64, String> =>
+  if b == 0.0 then {
+    "type": "failure",
+    "error": "Cannot divide by zero"
+  }
+  else {
+    "type": "success",
+    "value": a / b
+  }
+
+val message = (r: Result<Float64, String>): String =>
+  match r
+    has { "type": "success", value } => "Result: ${toString(value)}"
+    has { "type": "failure", error } => "Error: ${error}"
+    else => "?"
+
+print(message(divide(10.0, 2.0)))
+print(message(divide(1.0, 0.0)))

@@ -111,7 +111,7 @@ impl<'ctx> Codegen<'ctx> {
         negate: bool,
     ) -> BasicValueEnum<'ctx> {
         let i64_ty = self.context.i64_type();
-        let result = if *ty == Type::Str {
+        let result = if ty.is_string_ish() {
             self.builder
                 .build_call(self.rt.string_eq, &[lv.into(), rv.into()], "seq")
                 .unwrap()
@@ -181,7 +181,7 @@ impl<'ctx> Codegen<'ctx> {
         float_pred: FloatPredicate,
     ) -> BasicValueEnum<'ctx> {
         // String comparison via runtime — pointer comparison is wrong.
-        if ty == &Type::Str {
+        if ty.is_string_ish() {
             let i32_ty = self.context.i32_type();
             let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
             let cmp_fn_ty = i32_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false);

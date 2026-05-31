@@ -20,7 +20,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::UInt64 => self.context.i64_type().into(),
             Type::Float32 => self.context.f32_type().into(),
             Type::Float64 => self.context.f64_type().into(),
-            Type::Str => self.string_ptr_type.into(),
+            Type::Str | Type::StrLit(_) => self.string_ptr_type.into(),
             Type::Null => {
                 // Null is represented as a pointer (null ptr), same as Union/TypeVar.
                 // This ensures Null-typed vars can hold tagged values assigned later.
@@ -96,6 +96,7 @@ impl<'ctx> Codegen<'ctx> {
         matches!(
             ty,
             Type::Str
+                | Type::StrLit(_)
                 | Type::Array(_)
                 | Type::FixedArray(_)
                 | Type::Object(_)
@@ -117,7 +118,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::UInt64 => 14,
             Type::Float32 => 4,
             Type::Float64 => 5,
-            Type::Str => 6,
+            Type::Str | Type::StrLit(_) => 6,
             Type::Object(_) => 7,
             Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => 8,
             Type::Function { .. } => 9,
@@ -192,7 +193,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::UInt32 | Type::Int64 => 3,
             Type::UInt64 => 14,
             Type::Float32 | Type::Float64 => 4,
-            Type::Str => 6,
+            Type::Str | Type::StrLit(_) => 6,
             Type::Object(_) => 7,
             Type::Array(_) | Type::FixedArray(_) => 8,
             Type::Function { .. } => 9,

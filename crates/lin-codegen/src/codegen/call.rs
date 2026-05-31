@@ -486,7 +486,7 @@ impl<'ctx> Codegen<'ctx> {
         const CAP_TAGGED: u8 = 4;
         const CAP_OPAQUE: u8 = 5;
         match ty {
-            Type::Str => CAP_STR,
+            Type::Str | Type::StrLit(_) => CAP_STR,
             Type::Array(_) | Type::FixedArray(_) => CAP_ARRAY,
             Type::Object(_) => CAP_OBJECT,
             // Shared<T> is a boxed TaggedVal*(TAG_SHARED); CAP_TAGGED routes it through

@@ -1,0 +1,33 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { toString } from "std/string"
+
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+
+val divide = (a: Float64, b: Float64): Result<Float64, String> =>
+  if b == 0.0 then { "type": "failure", "error": "Cannot divide by zero" }
+  else { "type": "success", "value": a / b }
+
+val message = (r: Result<Float64, String>): String =>
+  match r
+    has { "type": "success", value } => "Result: ${toString(value)}"
+    has { "type": "failure", error } => "Error: ${error}"
+    else => "?"
+
+val s = suite("result", [
+  test("success branch discriminates and carries the value", () => [
+    expect(message(divide(10.0, 2.0))).toBe("Result: 5.0")
+  ]),
+  test("failure branch discriminates and carries the error", () => [
+    expect(message(divide(1.0, 0.0))).toBe("Error: Cannot divide by zero")
+  ]),
+  // Literal tags survive generic substitution in both orderings.
+  test("Result<Int32,String> success", () =>
+    val r: Result<Int32, String> = { "type": "success", "value": 7 }
+    [ expect(r["type"]).toBe("success") ]
+  ),
+  test("Result<String,Int32> failure", () =>
+    val r: Result<String, Int32> = { "type": "failure", "error": 9 }
+    [ expect(r["error"]).toBe(9) ]
+  ),
+])
+run(s)

@@ -46,7 +46,7 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
         match ty {
-            Type::Str => val,
+            Type::Str | Type::StrLit(_) => val,
             Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64
             | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 => {
                 let i64_ty = self.context.i64_type();
@@ -167,7 +167,7 @@ impl<'ctx> Codegen<'ctx> {
                 // Json/union→lin_length_dyn (runtime tag dispatch). Calling lin_array_length on
                 // a boxed Json (TaggedVal*) would read garbage.
                 let raw_len = match &arg_ty {
-                    Type::Str => {
+                    Type::Str | Type::StrLit(_) => {
                         self.builder.call(self.rt.string_length, &[arg.into()], "ir_slen").try_as_basic_value().unwrap_basic()
                     }
                     Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => {
@@ -807,7 +807,9 @@ impl<'a> DescEncoder<'a> {
         match ty {
             Type::Null => self.put_u8(KIND_NULL),
             Type::Bool => self.put_u8(KIND_BOOL),
-            Type::Str => self.put_u8(KIND_STRING),
+            // StrLit decodes as a plain string in v1: KIND_STRING validates it is a JSON
+            // string but does NOT check the exact literal value (see ADR-051).
+            Type::Str | Type::StrLit(_) => self.put_u8(KIND_STRING),
             Type::Int8 => { self.put_u8(KIND_INT); self.put_u8(1); self.put_u8(1); }
             Type::Int16 => { self.put_u8(KIND_INT); self.put_u8(2); self.put_u8(1); }
             Type::Int32 => { self.put_u8(KIND_INT); self.put_u8(4); self.put_u8(1); }

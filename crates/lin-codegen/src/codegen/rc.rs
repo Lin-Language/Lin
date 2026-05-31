@@ -11,7 +11,7 @@ impl<'ctx> Codegen<'ctx> {
         if !val.is_pointer_value() { return; }
         let ptr = val.into_pointer_value();
         match ty {
-            Type::Str => { self.builder.call(self.rt.string_release, &[ptr.into()], ""); }
+            Type::Str | Type::StrLit(_) => { self.builder.call(self.rt.string_release, &[ptr.into()], ""); }
             Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => { self.builder.call(self.rt.array_release, &[ptr.into()], ""); }
             Type::Object(_) => { self.builder.call(self.rt.object_release, &[ptr.into()], ""); }
             Type::Function { .. } => { self.builder.call(self.rt.closure_release, &[ptr.into()], ""); }

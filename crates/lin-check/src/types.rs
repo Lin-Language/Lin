@@ -16,6 +16,11 @@ pub enum Type {
     Float32,
     Float64,
     Str,
+    /// A singleton string-literal type, e.g. `"success"`. At runtime a `StrLit`
+    /// value is represented identically to a `Str` (TAG_STR, same boxing/RC/toString);
+    /// the literal only constrains type-checking (compat, bidirectional refinement,
+    /// exhaustiveness). See ADR-051.
+    StrLit(String),
     Array(Box<Type>),
     FixedArray(Vec<Type>),
     Object(IndexMap<String, Type>),
@@ -88,6 +93,13 @@ impl Type {
     /// Returns true for the dynamic "any" JSON type (TypeVar(u32::MAX)).
     pub fn is_json(&self) -> bool {
         matches!(self, Type::TypeVar(u32::MAX))
+    }
+
+    /// True for `Str` and for any string-literal singleton (`StrLit`). Used wherever
+    /// a runtime-string representation is what matters (equality, comparison, boxing,
+    /// RC), since a `StrLit` is a `Str` at runtime. See ADR-051.
+    pub fn is_string_ish(&self) -> bool {
+        matches!(self, Type::Str | Type::StrLit(_))
     }
 
     pub fn is_signed(&self) -> bool {
@@ -169,6 +181,7 @@ impl fmt::Display for Type {
             Type::Float32 => write!(f, "Float32"),
             Type::Float64 => write!(f, "Float64"),
             Type::Str => write!(f, "String"),
+            Type::StrLit(s) => write!(f, "\"{}\"", s),
             Type::Array(inner) => write!(f, "{}[]", inner),
             Type::FixedArray(types) => {
                 write!(f, "[")?;

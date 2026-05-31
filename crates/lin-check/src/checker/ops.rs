@@ -78,7 +78,7 @@ impl Checker {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                 let left_is_any = matches!(left_ty, Type::TypeVar(_));
                 let right_is_any = matches!(right_ty, Type::TypeVar(_));
-                if op == BinOp::Add && (left_ty == Type::Str || right_ty == Type::Str) {
+                if op == BinOp::Add && (left_ty.is_string_ish() || right_ty.is_string_ish()) {
                     return Err(Diagnostic::error(
                         span,
                         "String concatenation with + is not supported; use interpolation: \"${a}${b}\"".to_string(),

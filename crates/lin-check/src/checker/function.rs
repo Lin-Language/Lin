@@ -112,7 +112,22 @@ impl Checker {
         // Function body is always in tail position of itself.
         self.in_tail_position = self.current_function.is_some();
 
-        let typed_body_raw = self.infer_expr(body)?;
+        // Resolve the declared return type up front so the body can be CHECKED against it
+        // (bidirectional), pushing the expected type into the body. Needed for singleton
+        // string-literal refinement (ADR-051) — see infer_function_with_hints for the rationale.
+        let declared_ret = match return_type {
+            Some(rt) => Some(resolve_type(rt, &self.env).map_err(|e| Diagnostic::error(span, e))?),
+            None => None,
+        };
+        // Only CHECK the body bidirectionally when the declared return type carries a `StrLit`
+        // singleton (the only case that needs the expected type pushed down for refinement).
+        // Otherwise infer as before, preserving the existing "Function body has type ..." error.
+        let typed_body_raw = match &declared_ret {
+            Some(declared) if super::expr::type_mentions_strlit(declared) => {
+                self.check_expr(body, declared)?
+            }
+            _ => self.infer_expr(body)?,
+        };
         // Wrap body in a Block with destructuring preamble if needed.
         let typed_body = if param_destr_stmts.is_empty() {
             typed_body_raw
@@ -137,8 +152,7 @@ impl Checker {
         // Stable ordering by outer_slot for deterministic codegen.
         captures.sort_by_key(|c| c.outer_slot);
 
-        let ret_type = if let Some(ref rt) = return_type {
-            let declared = resolve_type(rt, &self.env).map_err(|e| Diagnostic::error(span, e))?;
+        let ret_type = if let Some(declared) = declared_ret {
             if !self.types_compatible(&body_ty, &declared) {
                 return Err(Diagnostic::error(
                     span,
@@ -260,7 +274,21 @@ impl Checker {
         self.current_function = fn_name.map(|s| s.to_string());
         self.in_tail_position = self.current_function.is_some();
 
-        let typed_body_raw = self.infer_expr(body)?;
+        // Resolve the declared return type up front so the body can be CHECKED against it
+        // (bidirectional). This pushes the expected type into the body — needed for singleton
+        // string-literal refinement (ADR-051): a `{ "type": "success", .. }` literal in the
+        // body narrows its discriminant to the expected `StrLit` variant. Falls back to plain
+        // inference when there is no annotation.
+        let declared_ret = match return_type {
+            Some(rt) => Some(resolve_type(rt, &self.env).map_err(|e| Diagnostic::error(span, e))?),
+            None => None,
+        };
+        let typed_body_raw = match &declared_ret {
+            Some(declared) if super::expr::type_mentions_strlit(declared) => {
+                self.check_expr(body, declared)?
+            }
+            _ => self.infer_expr(body)?,
+        };
         let typed_body = if param_destr_stmts.is_empty() {
             typed_body_raw
         } else {
@@ -283,8 +311,7 @@ impl Checker {
         let mut captures: Vec<Capture> = captures_map.into_values().collect();
         captures.sort_by_key(|c| c.outer_slot);
 
-        let ret_type = if let Some(ref rt) = return_type {
-            let declared = resolve_type(rt, &self.env).map_err(|e| Diagnostic::error(span, e))?;
+        let ret_type = if let Some(declared) = declared_ret {
             if !self.types_compatible(&body_ty, &declared) {
                 return Err(Diagnostic::error(span, format!(
                     "Function body has type {}, declared return type is {}", body_ty, declared

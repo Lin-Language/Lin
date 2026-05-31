@@ -111,6 +111,12 @@ impl Parser {
                     TypeExpr::Named(name, span)
                 }
             }
+            TokenKind::StringLit(_) => {
+                // A string-literal singleton type, e.g. `"success"`.
+                let span = self.current_span();
+                let s = if let TokenKind::StringLit(s) = self.advance_kind() { s } else { String::new() };
+                TypeExpr::StringLit(s, span)
+            }
             _ => {
                 let span = self.current_span();
                 self.advance();

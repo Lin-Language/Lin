@@ -149,7 +149,7 @@ fn is_error_pattern(p: &TypedPattern) -> bool {
             f.key == "type"
                 && matches!(
                     f.value_pattern.as_deref(),
-                    Some(crate::typed_ir::TypedExpr::StringLit(s, _)) if s == "error"
+                    Some(crate::typed_ir::TypedExpr::StringLit(s, _, _)) if s == "error"
                 )
         })
     } else {

@@ -54,6 +54,7 @@ fn resolve_type_inner(
                 variants.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::flatten_union(resolved?))
         }
+        TypeExpr::StringLit(s, _span) => Ok(Type::StrLit(s.clone())),
     }
 }
 

@@ -757,7 +757,7 @@ impl FuncBuilder {
 fn is_rc_type(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Str | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. }
+        Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. }
     )
 }
 
@@ -942,7 +942,7 @@ fn is_union_ty(ty: &Type) -> bool {
 fn is_heap_ty(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Str | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Iterator(_)
+        Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Iterator(_)
     )
 }
 
@@ -1350,7 +1350,8 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         TypedExpr::FloatLit(v, ty, _) => {
             builder.const_temp(Const::Float(*v, ty.clone()))
         }
-        TypedExpr::StringLit(s, _) => {
+        TypedExpr::StringLit(s, _, _) => {
+            // StrLit is Str at runtime (ADR-051): always lower to an owned Str temp.
             let t = builder.const_temp(Const::Str(s.clone()));
             builder.register_owned(t, Type::Str);
             t

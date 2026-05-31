@@ -63,6 +63,73 @@ impl Checker {
             });
         }
 
+        // Singleton string-literal refinement (ADR-051). A bare string literal infers to
+        // `String`, but when checked against an expected `StrLit("t")` it is accepted iff its
+        // value equals `t`, and the resulting typed expression is narrowed to `StrLit("t")` so
+        // it satisfies the literal target (e.g. a discriminant field).
+        if let Expr::StringLit(s, span) = expr {
+            if let Type::StrLit(t) = expected {
+                if s == t {
+                    return Ok(TypedExpr::StringLit(s.clone(), Type::StrLit(t.clone()), *span));
+                }
+                return Err(Diagnostic::error(
+                    *span,
+                    format!("Expected literal type \"{}\", got \"{}\"", t, s),
+                ));
+            }
+        }
+
+        // Object-literal refinement against an expected object/union/named type. Pushing the
+        // expected field types down lets a discriminant string literal narrow to its `StrLit`
+        // singleton, and (for a union) selects the matching variant by its discriminant tag.
+        if let Expr::Object(fields, span) = expr {
+            if let Some(result) = self.check_object_against(fields, expected, *span)? {
+                return Ok(result);
+            }
+        }
+
+        // Propagate the expected type into the branches of an `if`/`else` (each branch is a
+        // tail position whose value is the expression's value), so an object/string literal in
+        // a branch is refined against the same expected type (ADR-051). Only when both branches
+        // are present (a bare `if ... then x` has an implicit Null else and is handled below).
+        if let Expr::If { condition, then_branch, else_branch, span } = expr {
+            if type_mentions_strlit(expected) && !matches!(else_branch.as_ref(), Expr::NullLit(_)) {
+                let in_tail = self.in_tail_position;
+                self.in_tail_position = false;
+                let typed_cond = self.check_expr(condition, &Type::Bool)?;
+                self.in_tail_position = in_tail;
+                let typed_then = self.check_expr(then_branch, expected)?;
+                self.in_tail_position = in_tail;
+                let typed_else = self.check_expr(else_branch, expected)?;
+                let result_type = unify_types(&[typed_then.ty(), typed_else.ty()]);
+                return Ok(TypedExpr::If {
+                    cond: Box::new(typed_cond),
+                    then_br: Box::new(typed_then),
+                    else_br: Box::new(typed_else),
+                    result_type,
+                    span: *span,
+                });
+            }
+        }
+
+        // Propagate the expected type into the final expression of a block.
+        if let (Expr::Block(stmts, final_expr, span), true) = (expr, type_mentions_strlit(expected)) {
+            self.env.push_scope();
+            let mut typed_stmts = Vec::new();
+            for stmt in stmts {
+                typed_stmts.push(self.check_stmt(stmt)?);
+            }
+            let typed_final = self.check_expr(final_expr, expected)?;
+            let block_ty = typed_final.ty();
+            self.env.pop_scope();
+            return Ok(TypedExpr::Block {
+                stmts: typed_stmts,
+                expr: Box::new(typed_final),
+                ty: block_ty,
+                span: *span,
+            });
+        }
+
         let inferred = self.infer_expr(expr)?;
         let actual_ty = inferred.ty();
 
@@ -89,7 +156,7 @@ impl Checker {
         match expr {
             Expr::IntLit(v, span)    => Ok(TypedExpr::IntLit(*v, Type::Int32, *span)),
             Expr::FloatLit(v, span)  => Ok(TypedExpr::FloatLit(*v, Type::Float64, *span)),
-            Expr::StringLit(s, span) => Ok(TypedExpr::StringLit(s.clone(), *span)),
+            Expr::StringLit(s, span) => Ok(TypedExpr::StringLit(s.clone(), Type::Str, *span)),
             Expr::BoolLit(b, span)   => Ok(TypedExpr::BoolLit(*b, *span)),
             Expr::NullLit(span)      => Ok(TypedExpr::NullLit(*span)),
             Expr::Ident(name, span)  => self.infer_ident(name, *span),
@@ -188,7 +255,7 @@ impl Checker {
                     // Empty schema (e.g. `var result = {}`): object may be populated dynamically,
                     // so any key access must be a runtime lookup → TypeVar.
                     self.env.fresh_type_var()
-                } else if let TypedExpr::StringLit(ref key_str, _) = typed_key {
+                } else if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
                     if !fields.contains_key(key_str) {
                         // Key not in the known object type — emit a warning with a "did you mean" hint.
                         let suggestion = lin_common::closest_match(
@@ -221,7 +288,7 @@ impl Checker {
                     let inner = if non_null.len() == 1 {
                         match &non_null[0] {
                             Type::Object(fields) => {
-                                if let TypedExpr::StringLit(ref key_str, _) = typed_key {
+                                if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
                                     fields.get(key_str).cloned().unwrap_or(Type::Null)
                                 } else {
                                     Type::Union(fields.values().cloned().collect())
@@ -351,6 +418,132 @@ impl Checker {
         Ok(TypedExpr::MakeObject { fields: typed_fields, spreads, ty: Type::Object(obj_type), span })
     }
 
+    /// Bidirectional refinement for an object literal against an expected type (ADR-051).
+    ///
+    /// Returns `Ok(Some(_))` when it produced a refined typed object; `Ok(None)` to defer to
+    /// ordinary inference (e.g. the expected type is not object-shaped, or the literal contains
+    /// spreads, which the refinement path does not narrow). Only fires when the expected type
+    /// actually carries a `StrLit` field somewhere — otherwise it defers, leaving non-literal
+    /// behaviour exactly as before.
+    fn check_object_against(
+        &mut self,
+        fields: &[ObjectField],
+        expected: &Type,
+        span: Span,
+    ) -> Result<Option<TypedExpr>, Diagnostic> {
+        // Spreads are not refined (their static shape is opaque here) — defer.
+        if fields.iter().any(|f| matches!(f, ObjectField::Spread(_))) {
+            return Ok(None);
+        }
+        match expected {
+            // Unfold a non-generic Named alias one level and retry.
+            Type::Named(n) => {
+                if let Some(decl) = self.env.lookup_type(n) {
+                    if decl.params.is_empty() {
+                        let body = decl.body.clone();
+                        return self.check_object_against(fields, &body, span);
+                    }
+                }
+                Ok(None)
+            }
+            Type::Object(expected_fields) => {
+                // Only take over when at least one expected field is a literal singleton; this
+                // keeps plain structural objects on the existing inference path.
+                if !expected_fields.values().any(|t| matches!(t, Type::StrLit(_))) {
+                    return Ok(None);
+                }
+                Ok(Some(self.check_object_fields(fields, expected_fields, span)?))
+            }
+            Type::Union(variants) => {
+                // Discriminant selection: find the variant whose literal-typed field matches a
+                // matching literal field in the object. Only consider variants that have a
+                // discriminant (a StrLit field) — these are the tagged-union cases.
+                let literal_variants: Vec<&IndexMap<String, Type>> = variants
+                    .iter()
+                    .filter_map(|v| match v {
+                        Type::Object(f) if f.values().any(|t| matches!(t, Type::StrLit(_))) => Some(f),
+                        _ => None,
+                    })
+                    .collect();
+                if literal_variants.is_empty() {
+                    return Ok(None);
+                }
+                // Collect the object literal's string-literal field values for matching.
+                let lit_field_value = |key: &str| -> Option<String> {
+                    for f in fields {
+                        if let ObjectField::Pair(k, v) = f {
+                            if let (Expr::StringLit(kk, _), Expr::StringLit(vv, _)) = (k, v) {
+                                if kk == key {
+                                    return Some(vv.clone());
+                                }
+                            }
+                        }
+                    }
+                    None
+                };
+                // Pick the first variant all of whose StrLit fields are matched by the literal.
+                let chosen = literal_variants.iter().find(|vf| {
+                    vf.iter().all(|(k, t)| match t {
+                        Type::StrLit(want) => lit_field_value(k).as_deref() == Some(want.as_str()),
+                        _ => true,
+                    })
+                });
+                match chosen {
+                    Some(vf) => Ok(Some(self.check_object_fields(fields, vf, span)?)),
+                    None => {
+                        // No variant matched: report the valid discriminant tags.
+                        let mut tags = Vec::new();
+                        for vf in &literal_variants {
+                            for t in vf.values() {
+                                if let Type::StrLit(s) = t {
+                                    tags.push(format!("\"{}\"", s));
+                                }
+                            }
+                        }
+                        tags.sort();
+                        tags.dedup();
+                        Err(Diagnostic::error(
+                            span,
+                            format!(
+                                "Object does not match any variant of {}; expected a discriminant tag in [{}]",
+                                expected,
+                                tags.join(", ")
+                            ),
+                        ))
+                    }
+                }
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Check each object-literal field against the matching expected field type, narrowing
+    /// literal-typed fields. The resulting object type uses the expected field types where a
+    /// field is present (preserving `StrLit` singletons), so the whole object is assignable to
+    /// the expected (object or selected union variant) type.
+    fn check_object_fields(
+        &mut self,
+        fields: &[ObjectField],
+        expected_fields: &IndexMap<String, Type>,
+        span: Span,
+    ) -> Result<TypedExpr, Diagnostic> {
+        let mut typed_fields = Vec::new();
+        let mut obj_type = IndexMap::new();
+        for field in fields {
+            if let ObjectField::Pair(key_expr, val_expr) = field {
+                if let Expr::StringLit(key, _) = key_expr {
+                    let typed_val = match expected_fields.get(key) {
+                        Some(ft) => self.check_expr(val_expr, ft)?,
+                        None => self.infer_expr(val_expr)?,
+                    };
+                    obj_type.insert(key.clone(), typed_val.ty());
+                    typed_fields.push((key.clone(), typed_val));
+                }
+            }
+        }
+        Ok(TypedExpr::MakeObject { fields: typed_fields, spreads: Vec::new(), ty: Type::Object(obj_type), span })
+    }
+
     pub(crate) fn infer_array(&mut self, elements: &[Expr], span: Span) -> Result<TypedExpr, Diagnostic> {
         let typed_elements: Result<Vec<_>, _> = elements.iter().map(|e| self.infer_expr(e)).collect();
         let typed_elements = typed_elements?;
@@ -404,7 +597,7 @@ impl Checker {
         let obj_ty = typed_obj.ty();
         let typed_value = match &obj_ty {
             Type::Object(fields) => {
-                if let TypedExpr::StringLit(ref key_str, _) = typed_key {
+                if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
                     if let Some(field_ty) = fields.get(key_str) {
                         self.check_expr(value, field_ty)?
                     } else {
@@ -447,5 +640,22 @@ impl Checker {
             }
         }
         Ok(TypedExpr::StringInterp { parts: typed_parts, span })
+    }
+}
+
+/// True if `ty` contains a `StrLit` singleton anywhere in its structure. Used to scope the
+/// bidirectional literal refinement (ADR-051) so the if/block expected-type propagation only
+/// fires for literal-typed targets, leaving all other inference behaviour unchanged.
+pub(crate) fn type_mentions_strlit(ty: &Type) -> bool {
+    match ty {
+        Type::StrLit(_) => true,
+        Type::Array(inner) | Type::Iterator(inner) | Type::Shared(inner) => type_mentions_strlit(inner),
+        Type::FixedArray(elems) => elems.iter().any(type_mentions_strlit),
+        Type::Union(variants) => variants.iter().any(type_mentions_strlit),
+        Type::Object(fields) => fields.values().any(type_mentions_strlit),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(type_mentions_strlit) || type_mentions_strlit(ret)
+        }
+        _ => false,
     }
 }

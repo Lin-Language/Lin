@@ -60,7 +60,7 @@ impl<'ctx> Codegen<'ctx> {
                 // cell must hold 8 defined bytes. Pointers are 8 bytes; small integers/bools
                 // are zero-extended to i64; f32 is bit-widened via an i64 cell.
                 let (store_val, store_llvm_ty): (BasicValueEnum<'ctx>, BasicTypeEnum<'ctx>) = match val_ty {
-                    Type::Str | Type::Array(_) | Type::Object(_) | Type::Iterator(_) | Type::Function { .. } => {
+                    Type::Str | Type::StrLit(_) | Type::Array(_) | Type::Object(_) | Type::Iterator(_) | Type::Function { .. } => {
                         (val, self.context.ptr_type(inkwell::AddressSpace::default()).as_basic_type_enum())
                     }
                     _ if val.is_int_value() => {
@@ -203,7 +203,7 @@ impl<'ctx> Codegen<'ctx> {
             return self.unbox_tagged_val_to_type(tagged, result_ty);
         }
         // Object key access. lin_object_get expects a raw *LinString key; unbox a boxed key.
-        let key_str = if matches!(key_ty, Type::Str) {
+        let key_str = if key_ty.is_string_ish() {
             key
         } else if Self::is_union_type(key_ty) && key.is_pointer_value() {
             self.builder.call(self.rt.unbox_ptr, &[key.into()], "ir_key_unbox").try_as_basic_value().unwrap_basic()

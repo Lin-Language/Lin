@@ -867,7 +867,7 @@ val isDave = (input: String): Boolean =>
 val isAdult = person has { age } && person["age"] >= 18
 ```
 
-Literal values used with `is` have base type, not singleton type. `"Dave" is "Dave"` is true; the type of the literal `"Dave"` is `String`.
+A string literal as a **value** (e.g. on either side of `is`) has base type `String`, not a singleton. `"Dave" is "Dave"` is true and is a runtime equality check; the type of the literal value `"Dave"` is `String`. A string literal in **type** position, however, *is* a singleton type — see §18 (tagged unions) and design principle §33. So `value is "Dave"` tests value equality, whereas `type Name = "Dave"` declares a type whose only inhabitant is the string `"Dave"`.
 
 A single `match` arm may not combine `is` and `has` patterns — each arm uses one keyword.
 
@@ -1263,13 +1263,23 @@ This is not used because JSON-shaped types should describe JSON-shaped data. Ite
 
 ## 18. Tagged Unions
 
-Tagged unions are represented with structural JSON object types.
+Tagged unions are represented with structural JSON object types. The discriminant field uses a
+**string-literal singleton type** (`"success"` / `"failure"`), so the tags are checked at compile
+time: a literal in this position admits only its exact value, an object literal carrying the wrong
+tag (or no tag) is a **compile-time type error**, and assigning a value to a `Result<…>` selects
+the matching variant by its discriminant. The `match`/`has` arms then discriminate the variants at
+runtime via the `"type"` field.
 
 ```txt
 type Result<T, E> =
   | { "type": "success", "value": T }
   | { "type": "failure", "error": E }
 ```
+
+(The multi-line leading-`|` form above is the canonical spelling; the parser currently requires a
+tagged union written in a `type` alias to be on a single line —
+`type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }` — when
+its variants are object literals.)
 
 ```txt
 val divide = (a: Float64, b: Float64): Result<Float64, String> =>
@@ -1719,7 +1729,7 @@ Decided:
 30. Bracket access is safe: missing object key → `Null`, `Null` propagates; array OOB is a runtime error.
 31. Generic types are covariant in producer positions, contravariant in consumer positions.
 32. Type-expression precedence: `[]` > `<>` > `=>` > `|`.
-33. Literal types: literal values have their base type (`"Dave"` is `String`), not a singleton type.
+33. Literal types: a string literal in **type** position is a singleton type (`type Tag = "ok"` admits only the value `"ok"`). A string literal as a **value** still infers to its base type (`val x = "Dave"` is `String`); the singleton is obtained by checking it against an expected literal type. A literal widens to `String`; `String` does not narrow to a literal. (Numeric/boolean literal types are not yet supported.)
 34. Runtime errors halt the program; they cannot be caught.
 35. Integer division by zero is a runtime error; floating-point follows IEEE 754.
 36. `toString` is defined for every primitive (§27.8); used implicitly by string interpolation.
@@ -1786,7 +1796,7 @@ match result
   is Int32 => print("got ${result}")
 ```
 
-A runtime error inside the thunk (array out of bounds, integer division by zero, non-exhaustive match, etc.) is caught at the OS thread boundary and surfaces as an `Error` value at the `await` call site rather than halting the program. This makes `async` a **fault isolation boundary** — the only place in Lin where runtime errors become recoverable values. The general rule that runtime errors are uncatchable (§19.1) does not apply inside an async thunk.
+An async fault surfaces as an `Error` value whose discriminant is the string-literal `"type": "error"`; since string literals in type position are singleton types (§18, §33), this tag is the same kind of compile-time-checked discriminant used by user-defined tagged unions. A runtime error inside the thunk (array out of bounds, integer division by zero, non-exhaustive match, etc.) is caught at the OS thread boundary and surfaces as an `Error` value at the `await` call site rather than halting the program. This makes `async` a **fault isolation boundary** — the only place in Lin where runtime errors become recoverable values. The general rule that runtime errors are uncatchable (§19.1) does not apply inside an async thunk.
 
 If `await` is called and the result is `Error` but the caller does not inspect it (e.g. assigns to a `val` typed as `Int32`), the type checker will reject the assignment at compile time.
 

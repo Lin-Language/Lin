@@ -19,7 +19,7 @@ impl Checker {
                 TypedPatternField {
                     key: "type".to_string(),
                     binding_slot: None,
-                    value_pattern: Some(Box::new(TypedExpr::StringLit("error".to_string(), span))),
+                    value_pattern: Some(Box::new(TypedExpr::StringLit("error".to_string(), Type::Str, span))),
                     ty: Type::Str,
                 },
                 TypedPatternField {

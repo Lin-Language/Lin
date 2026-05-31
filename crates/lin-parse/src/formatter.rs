@@ -140,6 +140,7 @@ fn fmt_type(ty: &TypeExpr) -> String {
                 .collect();
             format!("{{ {} }}", fs.join(", "))
         }
+        TypeExpr::StringLit(s, _) => format!("\"{}\"", s),
     }
 }
 

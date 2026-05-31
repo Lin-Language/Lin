@@ -164,7 +164,7 @@ fn elide_rc_fn(func: &mut LinFunction) {
 fn is_rc_type(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Str | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. }
+        Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. }
     )
 }
 

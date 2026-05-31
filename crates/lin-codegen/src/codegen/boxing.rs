@@ -89,7 +89,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.box_float64, &[val.into()], "boxf64")
                     .try_as_basic_value().unwrap_basic()
             }
-            Type::Str => {
+            Type::Str | Type::StrLit(_) => {
                 self.builder.call(self.rt.box_str, &[val.into()], "boxstr")
                     .try_as_basic_value().unwrap_basic()
             }
@@ -206,7 +206,7 @@ impl<'ctx> Codegen<'ctx> {
                     v
                 }
             }
-            Type::Str => {
+            Type::Str | Type::StrLit(_) => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr_val.into()], "ustr")
                     .try_as_basic_value().unwrap_basic()
             }
@@ -311,7 +311,7 @@ impl<'ctx> Codegen<'ctx> {
                 let i8v = self.builder.call(self.rt.unbox_bool, &[ptr.into()], "ir_ubool").try_as_basic_value().unwrap_basic().into_int_value();
                 self.builder.int_truncate_or_bit_cast(i8v, self.context.bool_type(), "ub_bool").into()
             }
-            Type::Str => {
+            Type::Str | Type::StrLit(_) => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr.into()], "ir_ustr").try_as_basic_value().unwrap_basic()
             }
             Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. } => {

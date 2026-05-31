@@ -461,3 +461,83 @@ This ADR records three load-bearing semantic choices and their trade-offs:
 **Rationale**: A bare tag check made `is <ObjectType>` unsound. `is Person` matched *any* object — including a `fromJson` decode error `{ "type": "error", ... }` or an arbitrary `{ "foo": "bar" }`. Because the matched arm then statically **narrows** the binding to `Person`, a subsequent `x["name"]` is typed `String` and compiled through the non-null-safe field path; on an object actually lacking `name`, `lin_object_get` returns null and string interpolation null-derefs (`lin_string_concat`), crashing. The narrowing was a lie the runtime did not enforce. Mirroring `is { .. }` / `has` field-presence checking closes the hole with the existing `HasPattern` → `lin_value_has_field` machinery — no new instruction, no new runtime primitive.
 
 **Consequence**: This **supersedes the ADR-049 arm-ordering rule**: `is Person` no longer matches an `Error` object (an `Error` has `type`/`message`, not `name`/`age`), so `match | is Person => .. | is Error => ..` is now sound in either order. Checking is **field-presence only**, not recursive field-*type* validation: `is Person` on `{ "name": 1, "age": "x" }` (both keys present, wrong value types) still matches — full structural+type validation is what `fromJson` (ADR-049) is for. This keeps `is` cheap (one `lin_value_has_field` per required key) and consistent with `has`/`is { .. }`, which are also presence checks. Width subtyping is preserved: extra fields on `x` don't prevent a match. Verified: a real `Person` matches; an object missing a required field does not; the former decode-failure crash is gone; full suite green (278 integration + 6 + 33 + 7 + 24).
+
+## ADR-051: Singleton string-literal types
+
+**Decision**: A string literal in **type** position is a singleton type. `Type::StrLit(String)` is a
+new `Type` variant (mirrored by `TypeExpr::StringLit` in the surface AST and parsed in
+`parser/types.rs` before the `_` fallback). It admits only the one string value. This makes the
+spec §18 tagged union discriminate at compile time:
+
+```txt
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+val r:   Result<Int32, String> = { "type": "success", "value": 1 }   // OK
+val bad: Result<Int32, String> = { "type": "nope",    "value": 1 }   // compile error
+```
+
+The guiding principle is **"`StrLit` is `Str` at runtime, a singleton at check-time."** A
+`StrLit("x")` value is represented at runtime *identically* to a `String` — same `TAG_STR`/6 tag,
+same `string_ptr_type` llvm type, same boxing/unboxing, same refcounting, same `toString`. So
+nearly every exhaustive `Type` match in `lin-ir`/`lin-codegen` simply grew a new arm grouped with
+`Type::Str` (`Type::Str | Type::StrLit(_)`), and a `StrLit` lowers to an owned `Str` temp. The only
+genuinely new logic is at check-time.
+
+**This REVERSES the avoidance of a new `Type` variant that ADR-044/049 chose.** ADR-049 explicitly
+rejected "adding a dedicated `Type::StrLit` literal-type (which would touch ~20 exhaustive `Type`
+matches across codegen/boxing/representation — too invasive)". That cost was paid here, but the
+"`StrLit` = `Str` at runtime" mitigation made it mechanical: each of those ~20 sites does *exactly*
+what the `Str` arm does, so there is no new representation, no new runtime primitive, and no new RC
+class. The three RC classifiers that must stay in lockstep — `lin-ir::lower::is_rc_type`,
+`lin-ir::rc_elide::is_rc_type`, and `lin-codegen::types::ty_is_concrete_rc` — all treat `StrLit`
+as a refcounted string, and release routes through `string_release` (retain uses the tag-aware
+`lin_rc_retain`, identical to `Str`). Validated under AddressSanitizer: a `String`-typed and a
+`StrLit`-typed loop (1000 iterations each, build-and-discard) produce an *identical* leak profile
+(4140 bytes / 3 allocations — the program-lifetime interned literal cache, leaked by design as
+elsewhere), with **no** use-after-free, double-free, or refcount underflow. The §18 divide/Result
+example runs and discriminates both branches cleanly under ASan too.
+
+**Compat rules (`compat.rs`, after the `Shared`/`TypeVar(MAX)` arms, before numeric/union/object)**:
+1. `(StrLit a, StrLit b) => a == b` — two singletons compatible iff equal.
+2. `(StrLit, Str) => true` — a literal widens to the open `String` type.
+3. `(Str, StrLit) => false` — load-bearing rejection: an arbitrary string is not statically known
+   to equal the singleton, so `val t: Tag = someString` is an error.
+4. The `Json`-sink arms are unchanged; an object with a (non-null) `StrLit` field is already treated
+   as "structured" by `requires_structured_decode`, so a `Json` value still cannot be silently
+   bound to a literal-discriminated object — it must go through `fromJson` or `is`/`has` narrowing.
+
+**Bidirectional refinement (`checker/expr.rs`)**: a bare string-literal *value* still infers to
+`String` (`infer_expr` is unchanged — §33). Narrowing happens only in `check_expr` against an
+expected type: (a) `Expr::StringLit` against an expected `StrLit("t")` is accepted iff equal and
+yields a `StrLit("t")`-typed node (`TypedExpr::StringLit` gained a `Type` field, normally `Str`);
+(b) `Expr::Object` against an expected object/union/named type pushes the expected field types down
+per-field, and for a union *selects the variant by matching the discriminant literal*, erroring with
+the list of valid tags if none match. To make this reach the §18 `divide` body — an
+`if/then/else` returning object literals — the expected return type is now pushed into the function
+body (and through `if`/block tail positions), but **only when the declared return type mentions a
+`StrLit`**, so all other inference and error messages (e.g. "Function body has type …") are
+unchanged. This mirrors the existing array-literal refinement pattern.
+
+**Limitations / scope (deliberate, v1)**:
+- **`fromJson` does not validate the exact literal value.** A `StrLit` field encodes as
+  `KIND_STRING` in the descriptor (`DescEncoder`), so `fromJson` checks the JSON value is a string
+  but not that it equals the singleton. This is consistent with ADR-049's scalar policy and is a
+  documented v1 gap; tightening it (a `KIND_STRLIT` exact-match node) is additive.
+- **No `Json → StrLit` decode.** A `Json` value cannot be assigned out to a literal type, exactly as
+  it cannot to any structured target (ADR-048 scalar/structured gap).
+- **Exhaustiveness (Step F) was NOT implemented.** Recognising a literal-discriminated `has`/`is`
+  arm as covering a specific union variant is *not* done. This is safe: the existing exhaustiveness
+  checker already requires an `else` (or a covering arm) for *any* object-union `has`-match — literal
+  or not — and emits a diagnostic when absent; that behaviour is unchanged and consistent. Adding
+  partial literal-coverage recognition risked inconsistency for marginal benefit, so it was skipped
+  (the §18 examples use `else`, which always satisfies exhaustiveness).
+- **Numeric and boolean literal types are out of scope** — only string literals are singletons.
+
+**Consequence**: `lin build`/`lin run` of a wrong-tag object now reports e.g. *"Object does not
+match any variant of …; expected a discriminant tag in [\"failure\", \"success\"]"* at the object's
+span; a `String → literal` assignment reports *"Expected type \"ok\", got String"*. Literal tags
+survive generic substitution (`Result<Int32, String>` and `Result<String, Int32>` both
+discriminate), since `substitute` passes `StrLit` through its `_ => ty.clone()` tail. As with
+`lin-check` generally, a single-file `lin check` leaves an imported function's return type as a
+fresh inference var, so the strictest checking is via the full `lin build` pipeline. Verified: full
+suite green (288 integration + 6 + 33 + 7; stdlib 19 files; examples 22 files), plus the new
+`examples/result/main.lin` fixture.
