@@ -267,6 +267,12 @@ impl Checker {
         self.define_intrinsic("lin_process_stdout_stream", Type::func(vec![Type::Int64], byte_stream()));
         self.define_intrinsic("lin_io_stdin_stream", Type::func(vec![], byte_stream()));
 
+        // promise(s): (Stream) => Promise<Null | Error> (Stage 8). The promise handle round-trips
+        // as a Json/TypeVar value (TAG_PROMISE), like every other promise; `await` then yields the
+        // `Null | Error` result. Typed `Json` result so it flows through await/parallel uniformly.
+        self.define_intrinsic("lin_stream_promise",
+            Type::func(vec![any_stream()], Type::TypeVar(u32::MAX)));
+
         // serve: ((Request) => Response, Int32) => Null  (spec §25.5). Handler-first so
         // `router.serve(port)` desugars to `serve(router, port)`. Blocks forever; typed Null.
         self.define_intrinsic("lin_serve", Type::func(vec![

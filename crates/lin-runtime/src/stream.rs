@@ -394,6 +394,32 @@ impl LinFn {
             std::mem::transmute(fn_ptr);
         call(env_ptr, arg)
     }
+
+    /// Call the transform, CATCHING any unwinding fault (array OOB, division-by-zero, an explicit
+    /// `panic`, …) and converting it to an in-band `Err(message)` (streams brief §8 fault
+    /// boundary). This MUST wrap every transform call, because the surrounding drive path crosses
+    /// `extern "C"` (non-unwind) ABI boundaries (`lin_stream_drain`/`_drive_owned`) — an
+    /// uncaught panic there would ABORT the process ("panic in a function that cannot unwind")
+    /// rather than surface as the awaited `Error`. The closure call itself is `extern "C-unwind"`,
+    /// so the panic unwinds INTO this Rust frame, where `catch_unwind` can intercept it.
+    unsafe fn call_caught(&self, arg: *mut u8) -> Result<*mut u8, String> {
+        let this = self.closure;
+        let arg_addr = arg as usize;
+        // `AssertUnwindSafe`: the closure pointer + arg are raw and not Rust-UnwindSafe, but a
+        // caught fault leaves them in a defined (already-released-by-the-caller) state — we do not
+        // re-touch `arg` after a catch (the caller releases it), so this is sound here.
+        let closure_addr = this as usize;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let f = LinFn { closure: closure_addr as *mut u8 };
+            let r = f.call(arg_addr as *mut u8);
+            std::mem::forget(f); // do not drop (release) the borrowed closure here
+            r
+        }));
+        match result {
+            Ok(v) => Ok(v),
+            Err(_) => Err("stream transform faulted".to_string()),
+        }
+    }
 }
 
 impl Drop for LinFn {
@@ -448,11 +474,15 @@ impl StreamSource for MapSource {
             TaggedOutcome::Eof => TaggedOutcome::Eof,
             TaggedOutcome::Err(m) => TaggedOutcome::Err(m),
             TaggedOutcome::Item(item) => {
-                let out = self.f.call(item);
+                let out = self.f.call_caught(item);
                 // The closure consumed/derived `item`; release our reference to it. (The boxed
                 // result `out` is independently owned and returned to the driver.)
                 crate::tagged::lin_tagged_release(item);
-                TaggedOutcome::Item(out)
+                match out {
+                    Ok(v) => TaggedOutcome::Item(v),
+                    // A transform fault becomes an in-band Err that short-circuits to the terminal.
+                    Err(m) => TaggedOutcome::Err(m),
+                }
             }
         }
     }
@@ -473,7 +503,13 @@ impl StreamSource for FilterSource {
                 TaggedOutcome::Eof => return TaggedOutcome::Eof,
                 TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
                 TaggedOutcome::Item(item) => {
-                    let verdict = self.p.call(item);
+                    let verdict = match self.p.call_caught(item) {
+                        Ok(v) => v,
+                        Err(m) => {
+                            crate::tagged::lin_tagged_release(item);
+                            return TaggedOutcome::Err(m);
+                        }
+                    };
                     let keep = crate::tagged::lin_get_tag(verdict) == crate::tagged::TAG_BOOL
                         && crate::tagged::lin_unbox_bool(verdict) != 0;
                     crate::tagged::lin_tagged_release(verdict);
@@ -861,13 +897,30 @@ pub unsafe extern "C" fn lin_stream_for(s: *const u8, body: *mut u8) -> *mut u8 
             TaggedOutcome::Eof => break std::ptr::null_mut(), // normal end → Null
             TaggedOutcome::Err(m) => break crate::fs::make_error_tagged(&m),
             TaggedOutcome::Item(item) => {
-                let ret = f.call(item);
+                let ret = f.call_caught(item);
                 crate::tagged::lin_tagged_release(item);
-                crate::tagged::lin_tagged_release(ret); // body's return is discarded
+                match ret {
+                    Ok(r) => crate::tagged::lin_tagged_release(r), // body's return is discarded
+                    // A body fault ends the for-expr with an Error (consistent with a read Error).
+                    Err(m) => break crate::fs::make_error_tagged(&m),
+                }
             }
         }
     };
     close_box(b);
+    result
+}
+
+/// Drive a stream to completion and CONSUME it (close + release the caller's owned reference),
+/// returning `Null | Error`. This is the worker-thread body behind `.promise()` (Stage 8): it
+/// takes ownership of `s` (a boxed `TaggedVal*(TAG_STREAM)`, moved onto the worker), drives the
+/// sink (or pulls-and-discards a non-sink), then releases the stream so the fd closes exactly
+/// once on the worker. A read/transform fault surfaces as the returned Error object (in-band).
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_drive_owned(s: *mut u8) -> *mut u8 {
+    let result = lin_stream_drain(s);
+    // `drain` closed the backend; release the worker's owned reference (frees the box).
+    crate::tagged::lin_tagged_release(s);
     result
 }
 

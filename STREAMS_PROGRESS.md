@@ -320,3 +320,48 @@ Files touched:
     `is_definitely_non_transferable`). Making that capture legal-by-move is exactly Stage 8. So
     Stage 7's gate is verified at the runtime-ABI level (the direct env-transfer ASan test);
     Stage 8 wires the language path that emits it and adds the concurrent + fault-injection tests.
+
+---
+
+## Stage 8 — .promise() true-threaded + fault isolation
+- Commit: <pending>
+- Gate: MET. Concurrent pipelines (`test_stream_promise_concurrent`, two `.promise()` workers) +
+  fault injection (`test_stream_promise_fault_isolation`, a transform OOB → `Error` at await).
+  Full workspace: 387 integration + all unit tests, 0 failures. Runtime stream tests clean under
+  ASan (covers alloc/retain/release/close/move/fault).
+
+### What was added
+- `lin-runtime/src/async_rt.rs` `lin_stream_promise(s)` → spawns a worker that drives the MOVED
+  stream to EOF via `lin_stream_drive_owned`, wrapped in `with_async_boundary` (fault → Failed →
+  `Error` at await). Returns a `LinPromise` boxed TAG_PROMISE in codegen.
+- `lin-runtime/src/stream.rs` `lin_stream_drive_owned(s)` — worker body: drive + close + release.
+  `LinFn::call_caught` — wraps a transform call in `catch_unwind`, converting a fault to an
+  in-band `TaggedOutcome::Err`. MapSource/FilterSource/`lin_stream_for` now use it (see #18).
+- `ir.rs`/`lower.rs`/`lin-check`/`lin-codegen`: `Intrinsic::StreamPromise` + types + dispatch.
+- **Cross-call MOVE for streamish args** (`move_streamish_arg` in lower.rs): a streamish value
+  passed as a function ARGUMENT is moved — the caller's scope-exit release is suppressed
+  (`unregister_owned`). Without this, the `.promise()` stdlib wrapper double-freed (caller AND
+  worker both released the sink). This generalizes Stage 7's capture-move to the arg boundary.
+- `stdlib/stream.lin` `promise` wrapper → `lin_stream_promise(s)`.
+- Tests: `test_stream_promise_{concurrent,fault_isolation}`.
+
+### Surprises / decisions
+18. **`extern "C"` abort vs catch_unwind**: the FIRST fault-injection attempt ABORTED the process
+    ("panic in a function that cannot unwind") instead of surfacing as an Error — an array-OOB
+    panic unwound up to `lin_stream_drain`/`_drive_owned`, which are `extern "C"` (NON-unwind), so
+    the panic aborted at that ABI boundary BEFORE reaching the worker's `with_async_boundary`. FIX:
+    catch the fault at the TRANSFORM call site (`call_caught`, inside the unwind-safe Rust frame
+    the `extern "C-unwind"` closure unwinds into) and convert it to an in-band `Err`. This is the
+    correct place anyway — it threads the fault in-band to the terminal, matching brief §6/§8.
+
+### KNOWN PRE-EXISTING BUG (not streams; flag for the morning)
+19. `parallel([...])` over THUNKS that have side effects / return Json (`parallel([() =>
+    writeFile(...), …])`) SEGFAULTS at program exit — REPRODUCED WITHOUT STREAMS (a plain
+    `parallel([() => writeFile("a","x"), () => writeFile("b","y")])` crashes the same way; the
+    files are written correctly, the crash is at teardown). And `parallel([p1, p2])` over
+    already-spawned PROMISES panics with a misaligned-pointer deref in `transfer.rs:220` (the
+    promise box is deep-copied as an env capture). Both are PRE-EXISTING `parallel`/pool issues,
+    NOT introduced by streams. CONSEQUENCE: the brief's "concurrent pipelines via parallel([...])"
+    is demonstrated instead with MULTIPLE `.promise()` calls (the real streams concurrency
+    primitive), which is stable across repeated runs. If you want `parallel`-of-stream-thunks to
+    work, the underlying `parallel`/pool teardown bug needs a separate fix (out of streams scope).
