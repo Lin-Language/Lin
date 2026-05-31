@@ -1,0 +1,38 @@
+// task.lin — define a build/check task and run it as a subprocess.
+//
+// A Task is a named external command. `runTask` executes it with std/process.exec,
+// waits for completion, and classifies the outcome into a TaskResult the report
+// module summarizes. A task that cannot even be launched (exec returns an Error) is
+// reported as a failure with the error message, not a crash.
+
+import { exec } from "std/process"
+import { trim } from "std/string"
+import { length, push } from "std/array"
+
+export type Task = { "name": String, "command": String, "args": String[] }
+
+// outcome: "pass" (exit 0) | "fail" (non-zero exit) | "error" (could not launch).
+export type TaskResult = { "name": String, "outcome": String, "status": Int32, "output": String }
+
+val isError = (x: Json): Boolean =>
+  x["type"] == "error"
+
+// Run one task to completion and classify it.
+export val runTask = (t: Task): TaskResult =>
+  val r = exec(t["command"], t["args"])
+  if isError(r) then
+    { "name": t["name"], "outcome": "error", "status": -1, "output": r["message"] }
+  else
+    val status = r["status"]
+    val outcome = if status == 0 then "pass" else "fail"
+    { "name": t["name"], "outcome": outcome, "status": status, "output": r["stdout"].trim() }
+
+// Run a list of tasks in order, collecting their results.
+val runFrom = (tasks: Task[], i: Int32, acc: TaskResult[]): TaskResult[] =>
+  if i >= length(tasks) then acc
+  else
+    push(acc, runTask(tasks[i]))
+    runFrom(tasks, i + 1, acc)
+
+export val runAll = (tasks: Task[]): TaskResult[] =>
+  runFrom(tasks, 0, [])

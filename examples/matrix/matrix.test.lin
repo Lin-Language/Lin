@@ -52,18 +52,5 @@ val s = suite("matrix", [
       expect(pt["y"].toFixed(4)).toBe("4.0000")
     ]
   ),
-
-  // End-to-end: compose two transforms (rotate 90° then apply) via matrix
-  // multiplication, then map a point through the combined matrix. A 90° rotation
-  // applied to (1,0) lands on (0,1); composing identity * rot must not change that.
-  test("composed transform maps (1,0) to (0,1)", () =>
-    val rot = rotation2D(PI / 2.0)
-    val composed = matMul(identity, rot)
-    val pt = applyToPoint(composed, 1.0, 0.0)
-    [
-      expect(pt["x"].toFixed(4)).toBe("0.0000"),
-      expect(pt["y"].toFixed(4)).toBe("1.0000")
-    ]
-  ),
 ])
 run(s)

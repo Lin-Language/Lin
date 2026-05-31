@@ -1,33 +1,32 @@
-# Processes
+# processes
 
-Run external processes with `std/process`, two ways: `exec` (batch — run to
-completion and collect the full output) and `spawn`/`readStdout`/`wait` (streaming
-— read piped stdout incrementally). A small tour over real child processes.
+A small **task runner**: run a sequence of named external commands as subprocesses,
+classify each outcome (pass / fail / error), and print a summary report — the shape
+of a "run my build & check steps" tool.
 
 ## What it demonstrates
 
-- `std/process` batch API: `exec(command, args)` → `ExecResult { status, stdout, stderr }`.
-- `std/process` streaming API: `spawn(command, args)`, `readStdout(handle, buf)`, `wait(handle)`.
-- Flat `UInt8[]` byte buffers as read targets (`readStdout` fills the buffer in place).
-- Reading a child's bytes and propagating its exit code.
+- `std/process.exec` — run a command to completion and collect `{ status, stdout, stderr }`.
+- Classifying a subprocess result into a tagged `TaskResult` (`pass` on exit 0, `fail`
+  on non-zero, `error` when the command can't be launched — no crash).
+- Recursion over a task list to run them in order.
+- Separating impure I/O (`task.lin`, which spawns) from pure data→text (`report.lin`,
+  which summarizes/renders) so the reporting logic unit-tests without subprocesses.
 
 ## Structure
 
-- **`main.lin`** — `exec("printf", ["Hello"])` for batch output, then spawns
-  `sh -c "printf 'Hi'"`, reads its stdout, and prints the bytes and exit code.
-- **`process.test.lin`** — asserts the read byte count, the actual bytes (`'H'`=72, `'i'`=105),
-  and a non-zero exit code from `sh -c "exit 3"`.
-
-## Typing note
-
-`ExecResult` is a named record type exported by `std/process`. The process handle
-from `spawn` is an opaque `ProcessHandle` (an `Int64` id, not an OS pid). The stdout
-buffer is a flat `UInt8[]` and the argument list is `String[]`. (Lower-level
-spawn/exit-code assertions also live in the Rust integration suite.)
+- **`task.lin`** — `Task` / `TaskResult` types; `runTask` (spawn + classify) and `runAll`.
+- **`report.lin`** — pure `summarize` (tally pass/fail) and `render` (format the report).
+- **`main.lin`** — defines a few tasks, runs them, prints the report.
+- **`task.test.lin`** — unit tests for `runTask`/`runAll` over real deterministic
+  commands (`printf`, `true`, `false`, a missing binary).
+- **`report.test.lin`** — pure unit tests for `summarize`/`render` over synthetic results.
+- **`integration.test.lin`** — end-to-end: run a mixed task list through the whole
+  pipeline and assert the rolled-up summary and rendered report.
 
 ## Run / Test
 
 ```bash
-lin run examples/processes/main.lin      # exec batch output, then spawn + read bytes
-lin test examples/processes/             # the recoverable, deterministic assertions
+lin run examples/processes/main.lin
+lin test examples/processes/
 ```

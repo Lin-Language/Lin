@@ -7,13 +7,13 @@
   "workspaceFolder": "${localWorkspaceFolder}",
   "mounts": [
     "source=/var/run/docker.sock,target=/var/run/docker-host.sock,type=bind",
-    "source=${localEnv:HOME}/.claude,target=/home/hmcts/.claude,type=bind,consistency=cached",
-    "source=${localEnv:HOME}/.claude.json,target=/home/hmcts/.claude.json,type=bind,consistency=cached",
-    "source=${localEnv:HOME}/.zsh_history,target=/home/hmcts/.zsh_history,type=bind,consistency=cached",
-    "source=${localEnv:HOME}/.bash_history,target=/home/hmcts/.bash_history,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.claude,target=/home/vscode/.claude,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.claude.json,target=/home/vscode/.claude.json,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.zsh_history,target=/home/vscode/.zsh_history,type=bind,consistency=cached",
+    "source=${localEnv:HOME}/.bash_history,target=/home/vscode/.bash_history,type=bind,consistency=cached",
     "source=${localEnv:HOME}/.config/gh,target=/home/vscode/.config/gh,type=bind"
   ],
-  "runArgs": ["--memory=128g", "--memory-swap=32g", "--oom-kill-disable=false"],
+  "runArgs": ["--memory=200g", "--memory-swap=212g", "--oom-kill-disable=false"],
   "features": {
     "ghcr.io/devcontainers/features/git:1": {},
     "ghcr.io/devcontainers/features/node:1": {},
@@ -45,6 +45,6 @@
       }
     }
   },
-  "postCreateCommand": "npm install -g @anthropic-ai/claude-code && cargo build --workspace",
+  "postCreateCommand": "npm install -g @anthropic-ai/claude-code",
   "remoteUser": "vscode"
 }

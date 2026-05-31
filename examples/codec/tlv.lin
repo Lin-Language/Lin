@@ -17,7 +17,8 @@ import { toUInt16, toInt32, toUInt64, toFloat64 } from "std/number"
 
 // One TLV field: a tag byte (0..255) plus its raw value bytes. The value is a
 // flat byte array; decode rebuilds these from slices of the packed buffer.
-type Field = { "tag": Int32, "bytes": Int32[] }
+// Exported so unit tests can type field fixtures as Field[].
+export type Field = { "tag": Int32, "bytes": Int32[] }
 
 // Append every byte of `src` (a byte list) onto the UInt8[] accumulator `buf`.
 // `src` stays dynamic Json: it's called with both the field's Int32[] value and
