@@ -23,6 +23,7 @@ pub mod shared;
 pub mod process;
 pub mod server;
 pub mod signal;
+pub mod stream;
 pub mod string;
 pub mod tagged;
 pub mod template;

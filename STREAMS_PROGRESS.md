@@ -59,3 +59,45 @@ Files touched:
    box (no double-free, just a leak). Looks like a latent pre-existing bug, not mine to fix
    here, but worth confirming. Stream is wired correctly into `emit_release`.
 2. Confirmed the one baseline test failure is the flaky localhost HTTP test, not a regression.
+
+---
+
+## Stage 2 — TAG_STREAM + finalizer + lin_stream_read/close
+- Commit: <pending>
+- Gate (close-once): MET, verified under AddressSanitizer.
+- Tests: 5 new `lin-runtime` stream unit tests pass under `cargo test` AND under
+  `RUSTFLAGS="-Zsanitizer=address" cargo +nightly test -p lin-runtime --target
+  x86_64-unknown-linux-gnu stream` — clean, no UAF / no double-free / no leak.
+- Workspace: build clean; 375 integration tests pass + the same flaky http test (passes in
+  isolation). No regressions.
+
+### What was added
+- `lin-runtime/src/tagged.rs` — `TAG_STREAM = 19` + doc; TAG_STREAM arm in `lin_tagged_release`
+  → `lin_stream_release_box` (runs the auto-close finalizer).
+- `lin-runtime/src/object.rs` — TAG_STREAM arms in `release_tagged_payload` and
+  `retain_tagged_payload` (so the tag-aware `lin_tagged_retain`/`lin_tagged_release` and
+  object/array slot retain/release handle streams).
+- `lin-runtime/src/lib.rs` — `pub mod stream;`.
+- `lin-runtime/src/stream.rs` (NEW) — modelled on `shared.rs`:
+  - `StreamSource` trait — the pluggable read backend (`read() -> Ok(Some(chunk))|Ok(None)=EOF|
+    Err(msg)`, `close()`). Concrete file backend lands Stage 3; tcp/process/stdin Stage 5.
+  - `StreamBox { rc: AtomicU32, state: Mutex<{source: Option<Box<dyn StreamSource>>, closed} >}`.
+    Atomic rc (matches Shared) so the finalizer can't race a stray cross-thread touch.
+  - `ReadOutcome` (Chunk | Eof | Err) → tagged value (flat UInt8[] | null | error object).
+  - `lin_stream_read` / `lin_stream_close` (idempotent) C ABI.
+  - `lin_stream_retain_box` / `lin_stream_release_box` — the release path runs `close_box`
+    (guarded by the `closed` flag → fd closes EXACTLY ONCE) then frees the box.
+  - 5 unit tests asserting close-once via a shared `AtomicUsize` close counter across: drop
+    w/o close, explicit-close-then-drop, retain/release balance, read-error-then-drop, and the
+    tagged-chunk shape.
+
+### Notes / questions
+3. `transfer.rs::transfer_payload` has no TAG_STREAM arm — a stream embedded in a transferred
+   value would currently fall to the `_ => payload` catch-all (alias the box pointer WITHOUT a
+   retain → would double-close). This path is UNREACHABLE today because the checker marks
+   `Stream` non-transferable (`is_definitely_non_transferable`, Stage 1) so a stream never
+   reaches `lin_transfer_clone`. The correct cross-thread mechanism is CAP_MOVE (Stage 7), which
+   will touch transfer.rs deliberately. Flagged so it isn't forgotten; safe as-is.
+4. Atomic vs non-atomic rc: brief §9 says non-atomic would be sound (disjoint graphs after a
+   move). I chose AtomicU32 for belt-and-braces (cheap: one box, not per-element). Easy to
+   revisit if a benchmark ever cares.
