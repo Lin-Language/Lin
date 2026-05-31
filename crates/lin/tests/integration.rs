@@ -1918,6 +1918,47 @@ print(toString(result))
     assert_eq!(output, vec!["7"]);
 }
 
+// Fixed-length array types (`[T1, T2, ...]`, spec §8.3). An array literal checked
+// against a fixed-length type is stored as a TAGGED array (heterogeneous positional
+// element types); indexing reads the tagged slot and unboxes to the positional type.
+// Regression: before, the literal inferred to the unbounded `T[]` and failed the type
+// check; after a partial fix it type-checked but indexing read flat bytes and returned
+// garbage. This covers heterogeneous + homogeneous + float positions + Json[] widening.
+#[test]
+fn test_fixed_length_array_types() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+val pair: [String, Int32] = ["age", 42]
+val triple: [String, Int32, Int32] = ["coords", 10, 20]
+print(pair[0])
+print(toString(pair[1]))
+print(toString(triple[2]))
+
+val pt: [Float64, Float64] = [1.5, 2.0]
+print(toString(pt[0] + pt[1]))
+
+// A fixed-length array is assignable to the matching unbounded type.
+val widened: Json[] = pair
+print(toString(length(widened)))
+print(widened[0])
+"#);
+    assert_eq!(output, vec!["age", "42", "20", "3.5", "2", "age"]);
+}
+
+// Arity mismatch against a fixed-length array type is a compile-time error.
+#[test]
+fn test_fixed_length_array_arity_mismatch() {
+    let result = run_expect_err(r#"val p: [String, Int32] = ["only-one"]
+print("unreachable")
+"#);
+    assert!(
+        result.contains("2-element") || result.contains("element"),
+        "expected an arity error, got: {result}"
+    );
+}
+
 #[test]
 fn test_array_rest_destructuring() {
     let output = run(r#"import { print } from "std/io"
