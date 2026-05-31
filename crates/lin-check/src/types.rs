@@ -90,6 +90,14 @@ impl Type {
         matches!(self, Type::Float32 | Type::Float64)
     }
 
+    /// True when this element type maps to a FLAT unboxed scalar array (a concrete
+    /// fixed-width numeric). Mirrors codegen's `Codegen::is_flat_scalar` — the two MUST
+    /// agree, since the checker decides when to refine an `arrayAllocate` result to a
+    /// concrete array type and codegen decides whether to emit a flat allocation.
+    pub fn is_flat_scalar(&self) -> bool {
+        self.is_integer() || self.is_float()
+    }
+
     /// Returns true for the dynamic "any" JSON type (TypeVar(u32::MAX)).
     pub fn is_json(&self) -> bool {
         matches!(self, Type::TypeVar(u32::MAX))

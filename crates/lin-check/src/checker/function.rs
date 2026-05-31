@@ -74,6 +74,19 @@ impl Checker {
         }
     }
 
+    /// True when a function body is, or ends in, a direct `lin_array_allocate(n)` call — the one
+    /// allocation intrinsic whose representation the compiler fully controls (Phase 4.5). Used to
+    /// decide whether to CHECK the body against an `Array(_)` declared return so the fresh
+    /// allocation's Json-wildcard element type is refined to the declared element.
+    fn body_is_fresh_array_allocate(body: &lin_parse::ast::Expr) -> bool {
+        use lin_parse::ast::Expr;
+        match body {
+            Expr::Call { func, .. } => matches!(func.as_ref(), Expr::Ident(n, _) if n == "lin_array_allocate"),
+            Expr::Block(_, final_expr, _) => Self::body_is_fresh_array_allocate(final_expr),
+            _ => false,
+        }
+    }
+
     pub(crate) fn infer_function(
         &mut self,
         type_params: &[String],
@@ -210,6 +223,16 @@ impl Checker {
         let typed_body_raw = match &declared_ret {
             Some(declared) if super::expr::expected_pushes_into_branches(declared) => {
                 checked_against_declared = true;
+                self.check_expr(body, declared)?
+            }
+            // Phase 4.5: a generic combinator whose body is `=> arrayAllocate(n)` and whose
+            // declared return is an `Array(_)` must be CHECKED against that return so the fresh
+            // allocation's Json-wildcard element type is refined to the declared element (the
+            // generic param `T`). Monomorphization then turns `Array(T)` into a concrete
+            // `Array(Int32)`, letting codegen emit a flat allocation that matches the flat reader.
+            // Inferring the body (the default) would leave it `Array(MAX)` (tagged) → mismatch.
+            // Gated to the allocation intrinsic so no other array-returning body changes behaviour.
+            Some(declared @ Type::Array(_)) if Self::body_is_fresh_array_allocate(body) => {
                 self.check_expr(body, declared)?
             }
             _ => self.infer_expr(body)?,
@@ -381,6 +404,16 @@ impl Checker {
         let typed_body_raw = match &declared_ret {
             Some(declared) if super::expr::expected_pushes_into_branches(declared) => {
                 checked_against_declared = true;
+                self.check_expr(body, declared)?
+            }
+            // Phase 4.5: a generic combinator whose body is `=> arrayAllocate(n)` and whose
+            // declared return is an `Array(_)` must be CHECKED against that return so the fresh
+            // allocation's Json-wildcard element type is refined to the declared element (the
+            // generic param `T`). Monomorphization then turns `Array(T)` into a concrete
+            // `Array(Int32)`, letting codegen emit a flat allocation that matches the flat reader.
+            // Inferring the body (the default) would leave it `Array(MAX)` (tagged) → mismatch.
+            // Gated to the allocation intrinsic so no other array-returning body changes behaviour.
+            Some(declared @ Type::Array(_)) if Self::body_is_fresh_array_allocate(body) => {
                 self.check_expr(body, declared)?
             }
             _ => self.infer_expr(body)?,
