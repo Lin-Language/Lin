@@ -1905,7 +1905,7 @@ print(toString(add5(10)))
 
 #[test]
 fn test_map_returns_capturing_closures() {
-    // Regression (ADR-055 owning captures): a `map` callback that RETURNS a closure capturing
+    // Regression (ADR-056 owning captures): a `map` callback that RETURNS a closure capturing
     // the callback parameter. The returned thunks ESCAPE into the result array; each must own
     // its captured value (the element box), not borrow a per-iteration box that is freed and
     // reused. Before the owning-capture fix, calling a thunk returned garbage (`[[object]…]`)
@@ -4680,23 +4680,23 @@ val lc = tcpClose(listener)
 }
 
 // ===========================================================================
-// std/proc — subprocesses, and std/tty — raw terminal (Milestone 21, Layer 3)
+// std/process — subprocesses, and std/tty — raw terminal (Milestone 21, Layer 3)
 //
-// std/proc is deterministic: we spawn a real `sh -c` process, read its piped
-// stdout, and wait for its exit code. std/tty cannot be exercised under the
-// test harness (stdin is a pipe, not a TTY); we only assert that rawMode on a
-// non-TTY returns an Error object gracefully (no panic / no crash).
+// std/process is deterministic: we spawn a real `sh -c` process (streaming) and
+// run small `printf`/`sh` commands to completion (batch). std/tty cannot be
+// exercised under the test harness (stdin is a pipe, not a TTY); we only assert
+// that rawMode on a non-TTY returns an Error object gracefully (no panic / crash).
 // ===========================================================================
 
 #[test]
-fn test_proc_spawn_read_wait() {
+fn test_process_spawn_read_wait() {
     // Spawn `sh -c 'printf hello'`, read its stdout into a buffer, assert the
     // bytes, then wait for exit code 0. `sh -c` is the most portable spawn.
-    let out = run(r#"import { spawn, readStdout, wait } from "std/proc"
+    let out = run(r#"import { spawn, readStdout, wait } from "std/process"
 import { print } from "std/io"
 import { toString } from "std/string"
 
-val h = spawn(["sh", "-c", "printf hello"])
+val h = spawn("sh", ["-c", "printf hello"])
 print("spawned: ${toString(h["type"] != "error")}")
 
 val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
@@ -4727,17 +4727,50 @@ print("code: ${toString(code)}")
 }
 
 #[test]
-fn test_proc_wait_exit_code() {
+fn test_process_wait_exit_code() {
     // `sh -c 'exit 3'` exits with code 3.
-    let out = run(r#"import { spawn, wait } from "std/proc"
+    let out = run(r#"import { spawn, wait } from "std/process"
 import { print } from "std/io"
 import { toString } from "std/string"
 
-val h = spawn(["sh", "-c", "exit 3"])
+val h = spawn("sh", ["-c", "exit 3"])
 val code = wait(h)
 print("code: ${toString(code)}")
 "#);
     assert_eq!(out, vec!["code: 3"]);
+}
+
+#[test]
+fn test_process_exec_and_shell_batch() {
+    // Batch API: exec collects status + full stdout into an ExecResult; shell runs
+    // through /bin/sh; a non-zero exit is reported in `status`; cwd is non-empty.
+    let out = run(r#"import { exec, shell, cwd } from "std/process"
+import { contains } from "std/string"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val r = exec("printf", ["Hello"])
+print("exec status: ${toString(r["status"])}")
+print("exec stdout: ${r["stdout"]}")
+
+val r2 = shell("printf one; printf two")
+print("shell stdout: ${r2["stdout"]}")
+
+val r3 = exec("sh", ["-c", "exit 7"])
+print("fail status: ${toString(r3["status"])}")
+
+print("cwd ok: ${toString(contains(cwd(), "/"))}")
+"#);
+    assert_eq!(
+        out,
+        vec![
+            "exec status: 0",
+            "exec stdout: Hello",
+            "shell stdout: onetwo",
+            "fail status: 7",
+            "cwd ok: true",
+        ]
+    );
 }
 
 #[test]

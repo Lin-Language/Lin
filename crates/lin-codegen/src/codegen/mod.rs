@@ -1202,7 +1202,7 @@ impl<'ctx> Codegen<'ctx> {
                                         .iter()
                                         .filter_map(|c| temp_map.get(c).copied())
                                         .collect();
-                                    // Per-capture release kinds (ADR-055 owning captures). The env
+                                    // Per-capture release kinds (ADR-056 owning captures). The env
                                     // OWNS one reference per owning capture, so the capture
                                     // descriptor is ALWAYS emitted: `lin_closure_release` walks it
                                     // to release heap captures on free, and the async transfer path

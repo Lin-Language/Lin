@@ -132,7 +132,7 @@ pub enum Intrinsic {
     },
 }
 
-/// How a closure env releases one captured slot when the closure is freed (ADR-055: owning
+/// How a closure env releases one captured slot when the closure is freed (ADR-056: owning
 /// captures). The env owns one reference per owning capture; `lin_closure_release` walks the
 /// emitted capture descriptor and applies the matching release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

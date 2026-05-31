@@ -840,11 +840,13 @@ The inner `if`'s `else` is at the same indent as the `if` itself; the outer `mat
 
 ### 13.1 `is`
 
-`is` performs an **exact** match.
+`is` performs a **type-exact** match: the value must conform to `T`, checked recursively.
 
-- For a named object type `T`, `value is T` is true only if `value` has *exactly* the fields of `T`, with no extra fields, each typed correctly.
+- For a named object type `T`, `value is T` is true if `value` is an object that has every field of `T` **present and of the correct type** (checked recursively into nested objects, arrays, and literal-typed fields). Extra fields are permitted — `is` validates field *types*, not field *count*. This is what makes the post-match narrowing to `T` sound (ADR-054): if `value is T` succeeds, `value` genuinely conforms to `T`, so the narrowed field types are not a lie. Field-type checking follows the same structural-validation semantics and number policy as `fromJson` (§18, `std/json`): an integer-typed field accepts an integral in-range number, a float-typed field accepts any number, a literal-typed field requires the exact value.
 - For a primitive type, `value is T` is true only if the runtime value has that exact type.
 - For a literal, `value is "Dave"` is true only if the value equals the literal.
+
+The difference between `is T` and `has T` (§13.2) for an object type is therefore precisely whether field *types* are validated: `is` checks presence **and** type; `has` checks presence only. Both permit extra fields.
 
 ```txt
 val describe = (input: String | Int32 | Null): String =>
@@ -875,8 +877,10 @@ A single `match` arm may not combine `is` and `has` patterns — each arm uses o
 
 `has` performs a **structural compatibility** check — the value contains *at least* the requested shape, but may have additional fields.
 
-- For a named object type `T`, `value has T` is true if every field of `T` is present in `value` with a compatible type. Extra fields are permitted.
+- For a named object type `T`, `value has T` is true if every field of `T` is **present** in `value` (its keys exist). Field *types* are **not** validated — that is what `is T` adds (§13.1). Extra fields are permitted.
 - For an inline shape `{ a, b }`, `value has { a, b }` is true if `value` is an object containing at least those keys.
+
+So `has` is the presence-only check and `is` is the presence-and-type check; both allow extra fields. Use `has` to test/destructure shape when the field types are already known or unimportant, and `is` when a successful match must guarantee the fields' types (e.g. before narrowing a `Json` value to a typed shape).
 
 ```txt
 val describeNamed = (input: Json): String =>
@@ -1009,7 +1013,17 @@ val describe = (input: String | Int32 | Null): String =>
 
 ### 16.1 `is` Patterns
 
-`is` means exact match.
+`is` is the type-exact / shape-exact form. Its precise meaning depends on the pattern kind:
+
+- **Primitive / literal / `Null`:** exact runtime-type or value match.
+- **Named object type (`is Person`):** every declared field present and correctly typed, checked
+  recursively; extra fields permitted (§13.1, ADR-054).
+- **Array literal pattern (`is [a, b]`):** length-exact — the array must have exactly the listed
+  number of elements.
+- **Inline object pattern (`is { name }`):** the listed keys must be present (and any literal
+  value-constraints satisfied); extra fields are permitted. (Inline `is { .. }` is a
+  presence + value-constraint check, not a recursive field-*type* check — that is what a named
+  object type `is T` adds.)
 
 ```txt
 match input
@@ -1018,7 +1032,7 @@ match input
   is String => "String"
 ```
 
-For arrays:
+For arrays (length-exact):
 
 ```txt
 match items
@@ -1027,11 +1041,11 @@ match items
   is [first, second] => "exactly two items"
 ```
 
-For objects:
+For objects (listed keys present; extra fields allowed):
 
 ```txt
 match input
-  is { name } => "exactly one field: name"
+  is { name } => "has at least the field: name"
 ```
 
 ### 16.2 `has` Patterns
@@ -1700,7 +1714,7 @@ Decided:
 1. `export` may be used on `val`, `var`, and `type` declarations.
 2. `Json` is a built-in type; `Number` is a built-in union alias covering every numeric family (§4.2).
 3. `Unknown` and `Never` are not built-in types initially.
-4. `is Person` is exact; `has Person` or `has { ... }` matches shape and allows extra fields.
+4. `is Person` checks every declared field is present and correctly typed (recursively; extra fields allowed — ADR-054); `has Person` or `has { ... }` checks only that the requested fields are present (types not validated). Both allow extra fields; arrays match length-exactly (§16.1).
 5. `is` on generic type applications is unsupported in v1.
 6. `is`/`has` are expressions of type `Boolean` and may appear in any expression context.
 7. A single `match` arm uses either `is` or `has`, not both.
@@ -2432,13 +2446,23 @@ tcpClose:          (fd: Int32)                    => Null | Error
 
 Note that `std/http` already provides a high-level blocking HTTP server (`serve`, §33.5) and an HTTP client (§33.4); `std/net` is the lower-level byte-stream layer beneath them, for non-HTTP protocols and custom framing.
 
-### 35.6 `std/proc` — Subprocesses
+### 35.6 `std/process` — External Processes
+
+Two styles share one module. **Batch** runs a command to completion and collects its full output; **streaming** spawns a child and reads its stdout incrementally. `ProcessHandle` is an opaque `Int64` id (not an OS pid).
 
 ```txt
-spawn:       (argv: String[])              => Int64 | Error     // opaque process handle
-readStdout:  (handle: Int64, buf: UInt8[]) => Int32 | Error     // bytes; 0 = EOF
-kill:        (handle: Int64)               => Null | Error
-wait:        (handle: Int64)               => Int32 | Error     // exit code
+type ExecResult = { "status": Int32, "stdout": String, "stderr": String }
+
+// batch
+exec:        (command: String, args: String[]) => ExecResult | Error
+shell:       (command: String)                 => ExecResult | Error   // via /bin/sh -c
+cwd:         ()                                 => String
+chdir:       (path: String)                     => Null | Error
+// streaming
+spawn:       (command: String, args: String[]) => ProcessHandle | Error
+readStdout:  (handle: ProcessHandle, buf: UInt8[]) => Int32 | Error     // bytes; 0 = EOF
+kill:        (handle: ProcessHandle)            => Null | Error
+wait:        (handle: ProcessHandle)            => Int32 | Error         // exit code
 ```
 
 ### 35.7 `std/tty` — Raw Terminal

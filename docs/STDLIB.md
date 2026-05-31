@@ -19,12 +19,11 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/path`](#stdpath) | Path string manipulation |
 | [`std/http`](#stdhttp) | HTTP client and server |
 | [`std/net`](#stdnet) | UDP and TCP sockets |
-| [`std/proc`](#stdproc) | Subprocess spawn / stdout / wait |
+| [`std/process`](#stdprocess) | Run and manage external processes |
 | [`std/tty`](#stdtty) | Raw terminal mode and key reads |
 | [`std/signal`](#stdsignal) | Blocking wait for OS signals |
 | [`std/async`](#stdasync) | Async, concurrency and workers |
 | [`std/env`](#stdenv) | Environment variables |
-| [`std/process`](#stdprocess) | External process execution |
 | [`std/template`](#stdtemplate) | String template rendering |
 | [`std/test`](#stdtest) | Test framework |
 | [`std/time`](#stdtime) | Timestamps and timing |
@@ -279,13 +278,14 @@ This document specifies the standard library for the Lin language. All modules a
 
 | Function | Signature | Summary |
 | --- | --- | --- |
-| [`chdir`](#chdir) | `(String) -> Null \| Error` | Change working directory |
+| [`exec`](#exec) | `(String, String[]) -> ExecResult \| Error` | Run a command to completion, collect output |
+| [`shell`](#shell) | `(String) -> ExecResult \| Error` | Run a shell command string via `/bin/sh -c` |
 | [`cwd`](#cwd) | `() -> String` | Current working directory |
-| [`exec`](#exec) | `(String, String[]) -> ExecResult \| Error` | Run a command and collect output |
-| [`kill`](#kill) | `(ProcessHandle) -> Null` | Send SIGTERM to a spawned process |
-| [`shell`](#shell) | `(String) -> ExecResult \| Error` | Run a shell command string |
-| [`spawn`](#spawn) | `(String, String[]) -> ProcessHandle` | Start a process without waiting |
-| [`wait`](#wait) | `(ProcessHandle) -> ExecResult \| Error` | Wait for a spawned process to finish |
+| [`chdir`](#chdir) | `(String) -> Null \| Error` | Change working directory |
+| [`spawn`](#spawn) | `(String, String[]) -> ProcessHandle \| Error` | Start a process without waiting |
+| [`readStdout`](#readStdout) | `(ProcessHandle, UInt8[]) -> Int32 \| Error` | Read piped stdout into a buffer (0 = EOF) |
+| [`kill`](#kill) | `(ProcessHandle) -> Null \| Error` | Send SIGTERM to a spawned process |
+| [`wait`](#wait) | `(ProcessHandle) -> Int32 \| Error` | Wait for a spawned process; returns exit code |
 
 **std/template**
 
@@ -3157,28 +3157,59 @@ tcpClose(listener)
 
 ---
 
-## std/proc
+## std/process
 
-Spawn and manage child processes. A process is an opaque integer handle (spec §35.4, §35.6) — an `Int64` the runtime interprets, not an OS pid (the handle is a monotonic id, so it is immune to pid-reuse races). Every fallible call returns the `T | Error` result shape.
+Run and manage external processes. Two styles share one module:
+
+- **Batch** — `exec`/`shell` run a command to completion and collect its full stdout/stderr into an `ExecResult`. `cwd`/`chdir` query/change the working directory.
+- **Streaming** — `spawn` starts a child and returns an opaque `ProcessHandle`; `readStdout` reads its piped stdout incrementally; `kill` signals it; `wait` blocks for the exit code.
+
+Every fallible call returns the `T | Error` result shape (spec §35.6).
+
+### Types
 
 ```txt
-spawn:       (argv: String[])              => Int64 | Error     // opaque process handle
-readStdout:  (handle: Int64, buf: UInt8[]) => Int32 | Error     // bytes read; 0 = EOF
-kill:        (handle: Int64)               => Null | Error
-wait:        (handle: Int64)               => Int32 | Error     // exit code
+type ExecResult = { "status": Int32, "stdout": String, "stderr": String }
 ```
 
-`argv[0]` is the program (looked up on `PATH` or an absolute path); the rest are arguments. The child's stdin is connected to `/dev/null`, its stdout is captured into a pipe (so `readStdout` works), and its stderr is inherited from the parent.
-
-`readStdout` fills a **caller-owned** `UInt8[]` and returns the number of bytes read, reading incrementally from the same pipe across calls; `0` means end-of-stream. `wait` blocks until the child exits, returns its exit code (`-1` if it was terminated by a signal), and reaps the process — after `wait` the handle is no longer valid. `kill` sends SIGKILL; killing an already-exited child is tolerated and returns `Null`.
-
-### Example — capture a subprocess's output
+`ProcessHandle` is an opaque `Int64` id the runtime interprets — a monotonic id, not an OS pid (so it is immune to pid-reuse races).
 
 ```txt
-import { spawn, readStdout, wait } from "std/proc"
+exec:        (command: String, args: String[]) => ExecResult | Error
+shell:       (command: String)                 => ExecResult | Error
+cwd:         ()                                 => String
+chdir:       (path: String)                     => Null | Error
+spawn:       (command: String, args: String[]) => ProcessHandle | Error
+readStdout:  (handle: ProcessHandle, buf: UInt8[]) => Int32 | Error   // bytes read; 0 = EOF
+kill:        (handle: ProcessHandle)            => Null | Error
+wait:        (handle: ProcessHandle)            => Int32 | Error      // exit code
+```
+
+`exec` runs `command` with `args` (no shell — no injection risk), waits, and returns its status plus captured stdout/stderr. `shell` runs a command string through `/bin/sh -c` (POSIX); prefer `exec` when possible. `command` is looked up on `PATH` or given as an absolute path.
+
+`spawn` starts a child without waiting: its stdin is connected to `/dev/null`, its stdout is captured into a pipe (so `readStdout` works), and its stderr is inherited. `readStdout` fills a **caller-owned** `UInt8[]` and returns the number of bytes read, reading incrementally from the same pipe across calls; `0` means end-of-stream. `wait` blocks until the child exits, returns its exit code (`-1` if terminated by a signal), and reaps the process — after `wait` the handle is no longer valid. (stdout streamed via `readStdout` is not re-collected by `wait`; use `exec` for batch output.) `kill` sends SIGTERM; killing an already-exited child is tolerated and returns `Null`.
+
+### Example — batch: run a command and read its output
+
+```txt
+import { exec } from "std/process"
 import { print } from "std/io"
 
-val h = spawn(["sh", "-c", "printf hello"])
+match exec("git", ["status", "--short"])
+  is { "type": "failure", "error": e } => print("exec failed: ${e}")
+  else =>
+    val r = exec("git", ["status", "--short"])
+    print("exit ${toString(r["status"])}")
+    print(r["stdout"])
+```
+
+### Example — streaming: capture a subprocess's output incrementally
+
+```txt
+import { spawn, readStdout, wait } from "std/process"
+import { print } from "std/io"
+
+val h = spawn("sh", ["-c", "printf hello"])
 val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
 val n = readStdout(h, buf)          // n == 5
 print("read ${n} bytes, first = ${buf[0]}")   // read 5 bytes, first = 104 ('h')
@@ -3574,130 +3605,6 @@ Removes the environment variable `name`. If the variable is not set, this is a n
 ```txt
 unsetEnv("DEBUG")
 ```
-
----
-
-## std/process
-
-Running and managing external processes.
-
-Import:
-
-```txt
-import { exec, shell, cwd } from "std/process"
-```
-
-### Types
-
-```txt
-type ExecResult = {
-  "status": Int32,
-  "stdout": String,
-  "stderr": String
-}
-```
-
-`ProcessHandle` is an opaque runtime type returned by `spawn`.
-
----
-
-### chdir
-
-```txt
-val chdir: (path: String) -> Null | Error
-```
-
-Changes the working directory of the current process to `path`. Returns an `Error` if `path` does not exist or is not a directory.
-
-```txt
-match chdir("project/src")
-  is { "type": "failure", "error": e } => print("cannot cd: ${e}")
-  else => null
-```
-
----
-
-### cwd
-
-```txt
-val cwd: () -> String
-```
-
-Returns the absolute path of the current working directory.
-
-```txt
-val here = cwd()   // e.g. "/home/alice/project"
-```
-
----
-
-### exec
-
-```txt
-val exec: (command: String, args: String[]) -> ExecResult | Error
-```
-
-Runs `command` with `args`, waits for it to exit, and returns its status code, stdout, and stderr as an `ExecResult`. Returns an `Error` if the command cannot be launched.
-
-```txt
-match exec("git", ["status", "--short"])
-  is { "type": "failure", "error": e } => print("exec failed: ${e}")
-  is { "type": "success", "value": r } =>
-    print("exit ${toString(r["status"])}")
-    print(r["stdout"])
-```
-
----
-
-### kill
-
-```txt
-val kill: (handle: ProcessHandle) -> Null
-```
-
-Sends `SIGTERM` to the process identified by `handle`. Returns immediately; use `wait` to collect the exit status.
-
----
-
-### shell
-
-```txt
-val shell: (command: String) -> ExecResult | Error
-```
-
-Runs `command` through the system shell (`/bin/sh -c` on POSIX). Prefer `exec` when possible to avoid shell injection.
-
-```txt
-match shell("ls -la | wc -l")
-  is { "type": "success", "value": r } => print(r["stdout"].trim())
-  is { "type": "failure", "error": e } => print("shell error: ${e}")
-```
-
----
-
-### spawn
-
-```txt
-val spawn: (command: String, args: String[]) -> ProcessHandle
-```
-
-Starts `command` with `args` without waiting for it to finish. Returns a `ProcessHandle` for use with `kill` and `wait`.
-
-```txt
-val proc = spawn("server", ["--port", "8080"])
-// ... do other work ...
-val result = wait(proc)
-```
-
----
-
-### wait
-
-```txt
-val wait: (handle: ProcessHandle) -> ExecResult | Error
-```
-
-Waits for the process identified by `handle` to exit and returns its status code, stdout, and stderr.
 
 ---
 

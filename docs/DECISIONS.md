@@ -609,6 +609,7 @@ it is still *"Unknown type"* (verified by `test_imported_type_unknown_without_im
 the web-server example now does `import { HttpRequest as Request, HttpResponse as Response } from
 "std/http"` (its local `Request`/`Response` aliases deleted); full suite green; imported types
 round-trip through both cold and warm module caches.
+
 ## ADR-054: `is <ObjectType>` deep type validation
 
 **Decision**: `x is <Name>` (where `Name` resolves to a non-empty object type, e.g.
@@ -677,7 +678,44 @@ rejection of a wrong (incl. nested) field type, a valid value matching with soun
 access (`v["age"] + 1` = correct number), `is Error` still discriminating, and recursive `Tree`
 validation. Full suite green (302 integration + 6 + 33 + 29 + 7; 42 stdlib/examples test files).
 
-## ADR-055: Closures OWN their captures (retain on capture, release on free)
+## ADR-055: `std/proc` consolidated into `std/process` (batch + streaming)
+
+**Decision**: There were two documented subprocess modules — a working low-level `std/proc`
+(`spawn(argv)` → `Int64`, `readStdout`, `wait` → exit code) and an unimplemented high-level
+`std/process` (`exec`/`shell`/`cwd`/`chdir`, `spawn(command,args)`, `wait` → `ExecResult`). They
+are merged into a single `std/process` exposing **both** styles:
+- **Batch**: `exec(command, args)` / `shell(command)` run to completion and return an
+  `ExecResult { status, stdout, stderr }`; `cwd()` / `chdir(path)`.
+- **Streaming**: `spawn(command, args)` → opaque `ProcessHandle` (`Int64`); `readStdout(handle, buf)`
+  reads the piped stdout incrementally; `kill`; `wait` → exit code (`Int32`).
+
+**Why both, and why `wait` stays exit-code**: streaming and batch don't compose on one handle —
+`readStdout` drains the pipe, so a `wait` that returned full stdout (as the doc'd `std/process.wait`
+implied) would come back empty. Rather than maintain two registries or silently break streaming, the
+batch path (`exec`/`shell`) owns "collect all output", and the streaming `wait` returns just the exit
+code. `spawn`/`exec` both take `(command, args)` (the doc'd `std/process` shape); the old argv-array
+`spawn(["sh", ...])` form is gone.
+
+**Mechanism**: runtime `crates/lin-runtime/src/proc.rs` → `process.rs`, intrinsics renamed
+`lin_proc_*` → `lin_process_*`, adding `lin_process_{exec,shell,cwd,chdir}` (the batch fns build an
+`ExecResult` object / run `Command::output()`). Streaming fns keep the monotonic-id `Child` registry
+unchanged. `stdlib/proc.lin` → `process.lin`, embedded as `"std/process"` in `lin-compile`. The
+stdlib wrappers dogfood ADR-053 (imported types): `ExecResult` is an exported record type and
+`ProcessHandle` an exported `Int64` alias, used in the wrapper signatures.
+
+**RC/memory**: `make_exec_result` follows the leak-clean object-build pattern (`fs::make_decode_error`)
+— `lin_object_set` retains the key and the value's inner string, so the local `+1` from each
+`make_string` is released afterward; the object becomes sole owner and freeing the returned box frees
+everything. (The older `make_response_object`/`make_error_obj` skip this; they are program-lifetime
+singletons so it never mattered, but `exec` is called repeatedly.) Verified leak-free under
+LeakSanitizer (the only residual reports are pre-existing program-lifetime interned string literals).
+
+**Migration**: the lone consumer (`examples/processes`) and the proc tests were updated to the new
+`spawn(command, args)` form and `std/process` import. Verified: stdlib + example suites green; three
+integration tests (`test_process_spawn_read_wait`, `test_process_wait_exit_code`,
+`test_process_exec_and_shell_batch`) pass.
+
+## ADR-056: Closures OWN their captures (retain on capture, release on free)
 
 **Decision**: A closure's environment now OWNS one reference per heap/union capture — the same ownership rule arrays and objects already follow for stored elements. At `MakeClosure` the lowerer takes ownership of each capturing value (concrete rc → `Retain` in place; union/`Json` → `CloneBox` so the env holds its own `TaggedVal*`); `lin_closure_release` releases them when the closure is freed. Mutably-captured `var` bindings are unchanged: they store the heap **cell pointer** (shared by reference, ADR-015) and keep their existing borrow-only / `FreeCell` / escaping-cell lifecycle — the env does not own the cell. Scalars need no ownership.
 

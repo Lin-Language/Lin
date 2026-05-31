@@ -1,0 +1,61 @@
+import foreign "lin-runtime"
+  val lin_process_exec: (String, String[]) => Json
+  val lin_process_shell: (String) => Json
+  val lin_process_cwd: () => String
+  val lin_process_chdir: (String) => Json
+  val lin_process_spawn: (String, String[]) => Json
+  val lin_process_read_stdout: (Int64, UInt8[]) => Json
+  val lin_process_kill: (Int64) => Json
+  val lin_process_wait: (Int64) => Json
+
+// The captured result of a finished process: its exit status and full output.
+export type ExecResult = {
+  "status": Int32,
+  "stdout": String,
+  "stderr": String
+}
+
+// An opaque handle to a spawned process (an Int64 id, not an OS pid). Used with
+// readStdout / kill / wait.
+export type ProcessHandle = Int64
+
+// --- Batch: run to completion, collect all output ---
+
+// Run `command` with `args`, wait for it to exit, and return its status code and
+// captured stdout/stderr as an ExecResult. Returns an Error if it cannot be launched.
+export val exec = (command: String, args: String[]): Json =>
+  lin_process_exec(command, args)
+
+// Run `command` through the system shell (`/bin/sh -c`). Prefer `exec` to avoid
+// shell injection. Returns an ExecResult, or an Error.
+export val shell = (command: String): Json =>
+  lin_process_shell(command)
+
+// The absolute path of the current working directory.
+export val cwd = (): String =>
+  lin_process_cwd()
+
+// Change the current working directory to `path`. Returns Null on success, or an Error.
+export val chdir = (path: String): Json =>
+  lin_process_chdir(path)
+
+// --- Streaming: spawn and read incrementally ---
+
+// Start `command` with `args` without waiting. stdout is piped (read it with
+// readStdout); stderr is inherited. Returns an opaque ProcessHandle, or an Error.
+export val spawn = (command: String, args: String[]): Json =>
+  lin_process_spawn(command, args)
+
+// Read up to buf.length bytes from the process's stdout into buf.
+// Returns the number of bytes read (0 = EOF), or an Error.
+export val readStdout = (handle: ProcessHandle, buf: UInt8[]): Json =>
+  lin_process_read_stdout(handle, buf)
+
+// Send SIGTERM to the process. Returns Null on success, or an Error.
+export val kill = (handle: ProcessHandle): Json =>
+  lin_process_kill(handle)
+
+// Wait for the process to exit and return its exit code, or an Error. (stdout that
+// was streamed via readStdout is not re-collected here — use `exec` for batch output.)
+export val wait = (handle: ProcessHandle): Json =>
+  lin_process_wait(handle)
