@@ -13,10 +13,16 @@
 //! body is fully concrete (e.g. `(x: Int32): Int32`), the existing codegen emits native scalars —
 //! no `lin_box_int32`/`lin_unbox_int32` around the identity call.
 //!
-//! Scope (Phase 0): single module only. Generic functions must be top-level `val` bindings called
-//! *directly* by name (`identity(5)`). Passing a generic function as a first-class value, generic
-//! methods, and cross-module/stdlib generics are deferred to later phases. When a module contains
-//! no generic functions (the common case) this pass is a no-op and leaves the module byte-identical.
+//! Scope: top-level generic `val` functions called *directly* by name (`identity(5)`), whether
+//! defined in THIS module or in an IMPORTED one. A call to a generic imported from another module
+//! (`monomorphize_with_imports`) is specialized HERE: the imported body is cloned, type-substituted,
+//! its free references re-homed into the importer (sibling calls → `Named` exports of the origin
+//! module, intrinsics → merged intrinsic slots, thin intrinsic wrappers inlined to the intrinsic),
+//! and emitted as a local specialization. Imported modules also monomorphize their OWN sibling
+//! generic calls during `lower_import_module` (`monomorphize_import`, which keeps all originals for
+//! external importers). Passing a generic as a first-class value, and generic methods, remain
+//! deferred. When a module uses no generic function (the common case) this pass is a no-op and
+//! leaves the module byte-identical (the no-op invariant — see `module_uses_generic`).
 
 use std::collections::HashMap;
 
@@ -60,11 +66,17 @@ fn mentions_generic_tv(ty: &Type) -> bool {
     }
 }
 
-/// A top-level generic function discovered in the module.
+/// A top-level generic function discovered in the module (or in an import).
 struct GenericFn {
     name: String,
     /// The full `Function` TypedExpr (params/body/ret_type/captures/span).
     func: TypedExpr,
+    /// For a generic imported from another module, the module path it came from. `None` for a
+    /// generic defined in the module being lowered. Cross-module specializations clone the
+    /// imported body into THIS module, but the body's free references (calls to the imported
+    /// module's own siblings/intrinsics/imports) must be rewritten to resolve in the importer —
+    /// see `rehome_imported_body`.
+    origin: Option<String>,
 }
 
 /// Substitute quantified TypeVars throughout a type.
@@ -97,6 +109,16 @@ fn collect_subs(pattern: &Type, actual: &Type, subs: &mut HashMap<u32, Type>) {
         }
         (Type::Array(p), Type::Array(a)) => collect_subs(p, a, subs),
         (Type::Array(p), Type::FixedArray(ats)) => {
+            for a in ats { collect_subs(p, a, subs); }
+        }
+        // An `Iterable`-shaped generic param `T[]` is routinely applied to a runtime ITERATOR
+        // (e.g. `range(0,n)` returns `Iterator<Int32>`, then `.map(…)` whose param is `arr: T[]`).
+        // The element type is what a specialization keys on, so cross-unify the element through the
+        // Array↔Iterator boundary — without this, `T` is left unbound and `map`/`filter`/`reduce`
+        // over a `range(...)` would specialize at a fresh `TypeVar` (the boxed path) instead of Int32.
+        (Type::Array(p), Type::Iterator(a)) => collect_subs(p, a, subs),
+        (Type::Iterator(p), Type::Array(a)) => collect_subs(p, a, subs),
+        (Type::Iterator(p), Type::FixedArray(ats)) => {
             for a in ats { collect_subs(p, a, subs); }
         }
         (Type::Iterator(p), Type::Iterator(a)) => collect_subs(p, a, subs),
@@ -171,6 +193,33 @@ pub fn module_has_generic_fn(module: &TypedModule) -> bool {
     })
 }
 
+/// Cheap pre-check: does this module either declare its own generic function OR import a generic
+/// function from another module? When neither holds, monomorphization is skipped entirely and the
+/// module lowers byte-for-byte as before (the no-op invariant). An imported binding is "generic" if
+/// its declared type mentions a quantified TypeVar — the importing module's `ImportSlot.ty` carries
+/// the origin module's generic signature.
+pub fn module_uses_generic(module: &TypedModule, imports: &HashMap<String, TypedModule>) -> bool {
+    if module_has_generic_fn(module) {
+        return true;
+    }
+    module.statements.iter().any(|stmt| {
+        if let TypedStmt::Import { path, bindings, .. } = stmt {
+            if !imports.contains_key(path) {
+                return false;
+            }
+            // Only a binding whose type is a function with a generic in its PARAMETERS counts —
+            // mirrors the cross-module discovery rule, so intrinsic-wrapper exports whose only
+            // TypeVar is in the return (e.g. `iter: (…) => Iterator<T>`) don't trip the pass.
+            bindings.iter().any(|b| match &b.ty {
+                Type::Function { params, .. } => params.iter().any(mentions_generic_tv),
+                _ => false,
+            })
+        } else {
+            false
+        }
+    })
+}
+
 /// Entry point: rewrite generic-function calls to monomorphized specializations.
 /// Returns the diagnostics produced (errors for generic calls that cannot be instantiated);
 /// the module is left unchanged when it contains no generic functions.
@@ -192,7 +241,43 @@ pub fn module_has_generic_fn(module: &TypedModule) -> bool {
 ///   - **Budget (`SPECIALIZATION_BUDGET`):** caps distinct native specializations per generic;
 ///     overflow instantiations take the boxed fallback and emit a one-time diagnostic.
 pub fn monomorphize(module: &mut TypedModule) -> Vec<Diagnostic> {
-    // 1. Discover top-level generic functions (slot -> GenericFn).
+    let no_imports: HashMap<String, TypedModule> = HashMap::new();
+    monomorphize_inner(module, &no_imports, false)
+}
+
+/// Monomorphize an IMPORTED module's own (single-module) generic sibling calls during its
+/// `lower_import_module` compilation. Like `monomorphize`, but KEEPS every generic original (an
+/// external importer that does not specialize a call still issues a boxed `Named` call to the
+/// original `{module_key}_{name}` symbol, so it must remain defined). Cross-module generics
+/// reachable from the import are not specialized here (the import has no `imports` map); those are
+/// handled in the top-level importer via `monomorphize_with_imports`.
+pub fn monomorphize_import(module: &mut TypedModule) -> Vec<Diagnostic> {
+    let no_imports: HashMap<String, TypedModule> = HashMap::new();
+    monomorphize_inner(module, &no_imports, true)
+}
+
+/// Cross-module entry point: like `monomorphize`, but also discovers generic functions reachable
+/// through this module's `import { … }` statements (whose generic bodies live in `imports`). A call
+/// to an imported generic is specialized HERE — the imported body is cloned, type-substituted, its
+/// free references re-homed into the importer (sibling calls → `Named` exports of the origin module,
+/// intrinsics → merged intrinsic slots, imports → the importer's own re-imports), and emitted as a
+/// local specialization. The importing module's call is then rerouted to that native specialization,
+/// so the Int32 instantiation of e.g. `std/array.map` lowers to a flat unboxed loop. The single
+/// boxed copy compiled into the imported module is left untouched (and simply goes unused when every
+/// caller specializes).
+pub fn monomorphize_with_imports(
+    module: &mut TypedModule,
+    imports: &HashMap<String, TypedModule>,
+) -> Vec<Diagnostic> {
+    monomorphize_inner(module, imports, false)
+}
+
+fn monomorphize_inner(
+    module: &mut TypedModule,
+    imports: &HashMap<String, TypedModule>,
+    keep_all_originals: bool,
+) -> Vec<Diagnostic> {
+    // 1. Discover top-level generic functions defined in THIS module (slot -> GenericFn).
     let mut generics: HashMap<usize, GenericFn> = HashMap::new();
     for stmt in &module.statements {
         if let TypedStmt::Val { slot, name: Some(name), value, .. } = stmt {
@@ -200,7 +285,37 @@ pub fn monomorphize(module: &mut TypedModule) -> Vec<Diagnostic> {
                 let is_generic = params.iter().any(|p| mentions_generic_tv(&p.ty))
                     || mentions_generic_tv(ret_type);
                 if is_generic {
-                    generics.insert(*slot, GenericFn { name: name.clone(), func: value.clone() });
+                    generics.insert(*slot, GenericFn { name: name.clone(), func: value.clone(), origin: None });
+                }
+            }
+        }
+    }
+
+    // 1a. Discover generic functions reachable through imports. For each `import { name } from
+    //     "path"` binding whose imported definition is a generic function, register it keyed by the
+    //     IMPORTER's binding slot, tagged with its origin module path. A call through that binding
+    //     slot is then specialized exactly like a local generic call (the body is re-homed first).
+    for stmt in &module.statements {
+        if let TypedStmt::Import { path, bindings, .. } = stmt {
+            let Some(origin) = imports.get(path) else { continue };
+            for b in bindings {
+                if let Some(func) = find_exported_fn(origin, &b.name) {
+                    if let TypedExpr::Function { params, .. } = &func {
+                        // A TRUE cross-module generic has a `<T>` parameter mentioned in its PARAMS
+                        // (the call site can then pin it from argument types). We deliberately do
+                        // NOT treat a function generic only in its RETURN as monomorphizable here:
+                        // stdlib intrinsic wrappers (`iter`, `iterOf`, `range`, …) carry an
+                        // intrinsic-polymorphism TypeVar (e.g. `Iterator<TypeVar(9021)>`) in their
+                        // INFERRED return — those are not user generics and must keep their single
+                        // boxed compilation (specializing them would be both wrong and uninferrable).
+                        let is_generic = params.iter().any(|p| mentions_generic_tv(&p.ty));
+                        if is_generic {
+                            generics.insert(
+                                b.slot,
+                                GenericFn { name: b.name.clone(), func, origin: Some(path.clone()) },
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -214,6 +329,18 @@ pub fn monomorphize(module: &mut TypedModule) -> Vec<Diagnostic> {
     //     generic. This is what lets `val f = id; f(5)` monomorphize correctly (BUG 2).
     let aliases = collect_generic_aliases(&module.statements, &generics);
 
+    // The slot allocator must clear not just the importer's own max slot, but every slot
+    // appearing inside an imported generic body we may clone in (origin-module param/local slots
+    // live in the origin module's numbering and would otherwise collide). Take the max across all.
+    let mut next_slot = max_slot(module) + 1;
+    for g in generics.values() {
+        if g.origin.is_some() {
+            let mut m = 0usize;
+            max_slot_expr(&g.func, &mut m);
+            next_slot = next_slot.max(m + 1);
+        }
+    }
+
     let mut state = MonoState {
         generics,
         aliases,
@@ -221,10 +348,15 @@ pub fn monomorphize(module: &mut TypedModule) -> Vec<Diagnostic> {
         worklist: Vec::new(),
         per_generic_count: HashMap::new(),
         boxed_fallback_used: std::collections::HashSet::new(),
-        next_slot: max_slot(module) + 1,
+        next_slot,
         used_generic_slots: std::collections::HashSet::new(),
         diagnostics: Vec::new(),
         budget: specialization_budget(),
+        imports,
+        rehomed_imports: Vec::new(),
+        rehomed_intrinsics: HashMap::new(),
+        rehome_binding_cache: HashMap::new(),
+        rehome_intrinsic_cache: HashMap::new(),
     };
 
     // 2. Walk the whole module, rewriting calls to generic functions and queuing specializations.
@@ -242,12 +374,22 @@ pub fn monomorphize(module: &mut TypedModule) -> Vec<Diagnostic> {
             let info = &state.specs[&key];
             (info.generic_slot, info.slot, info.name.clone(), info.subs.clone())
         };
-        let g = &state.generics[&generic_slot];
-        let mut func = g.func.clone();
-        let span = g.func.span();
+        let origin = state.generics[&generic_slot].origin.clone();
+        let mut func = state.generics[&generic_slot].func.clone();
+        let span = func.span();
         subst_expr(&mut func, &subs);
         if let TypedExpr::Function { name, .. } = &mut func {
             *name = Some(spec_name.clone());
+        }
+        // For a CROSS-MODULE generic, the cloned body's free references (sibling calls,
+        // intrinsics, the origin module's own imports/vals) and its local slots are numbered in
+        // the ORIGIN module's scope — meaningless in the importer. Re-home them: remap every
+        // local slot to a fresh importer slot, and rewrite each free reference into an
+        // importer-side construct (a Named import binding / merged intrinsic / re-import) that the
+        // importer's lowering already knows how to resolve. Must run BEFORE `rewrite_expr` so its
+        // re-monomorphization of nested generic calls sees importer-stable slots.
+        if let Some(origin_path) = &origin {
+            rehome_imported_body(&mut func, origin_path, &mut state);
         }
         // Re-monomorphize calls inside the now-concrete body (worklist fixpoint).
         rewrite_expr(&mut func, &mut state);
@@ -294,6 +436,10 @@ pub fn monomorphize(module: &mut TypedModule) -> Vec<Diagnostic> {
 
     // 4. Drop generic originals that are no longer referenced. An original is KEPT when it is still
     //    used: either directly as a first-class value, or as the target of a boxed-fallback call.
+    //    `keep_all_originals` (import compilation) additionally keeps EVERY local generic original
+    //    so that an external importer that doesn't specialize a call still resolves the boxed
+    //    `{module_key}_{name}` symbol. (Cross-module re-homed generics — `origin.is_some()` — are
+    //    never emitted as locals anyway; only this module's own generics are subject to the drop.)
     let keep: std::collections::HashSet<usize> = state
         .used_generic_slots
         .union(&state.boxed_fallback_used)
@@ -302,21 +448,406 @@ pub fn monomorphize(module: &mut TypedModule) -> Vec<Diagnostic> {
     stmts.retain(|stmt| {
         if let TypedStmt::Val { slot, value: TypedExpr::Function { .. }, .. } = stmt {
             if generic_slots.contains(slot) {
-                return keep.contains(slot);
+                return keep_all_originals || keep.contains(slot);
             }
         }
         true
     });
 
+    // Merge any intrinsic slots discovered while re-homing cross-module bodies into the module's
+    // intrinsic map, so lowering resolves them (e.g. `lin_array_allocate`, `lin_for`).
+    for (slot, name) in &state.rehomed_intrinsics {
+        module.intrinsics.insert(*slot, name.clone());
+    }
+
+    // Prepend the re-homed import statements (sibling/foreign/val bindings of the origin modules)
+    // so lowering's Import pre-pass registers their Named symbols before the specializations that
+    // call them are lowered.
+    let rehomed = std::mem::take(&mut state.rehomed_imports);
+
     // Insert specializations after the originals. Order is immaterial — top-level function `val`s
     // are forward-declared by slot in lowering.
     stmts.extend(materialized);
-    module.statements = stmts;
+    let mut final_stmts = rehomed;
+    final_stmts.extend(stmts);
+    module.statements = final_stmts;
     state.diagnostics
 }
 
+/// Find an exported top-level function `val name = <Function>` in `module` by name, returning a
+/// clone of its `TypedExpr::Function`. Used to pull an imported generic's body into the importer.
+fn find_exported_fn(module: &TypedModule, name: &str) -> Option<TypedExpr> {
+    module.statements.iter().find_map(|s| match s {
+        TypedStmt::Val { name: Some(n), value: value @ TypedExpr::Function { .. }, .. } if n == name => {
+            Some(value.clone())
+        }
+        _ => None,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Cross-module body re-homing
+// ---------------------------------------------------------------------------
+
+/// How a free (non-local) slot referenced inside a re-homed cross-module body resolves in the
+/// origin module — used to pick the importer-side construct it should be rewritten into.
+enum OriginRef {
+    /// An intrinsic (origin's `intrinsics[slot]` = name). Merged into the importer's intrinsic map.
+    Intrinsic(String),
+    /// A top-level function/val (or import-of-import) that resolves to a `Named` export of some
+    /// module. `path` is the module that actually DEFINES the symbol (the origin module itself for
+    /// a local sibling, or the origin's own import source for an import-of-import — the symbol lives
+    /// under THAT module's mangled prefix, never the intermediate importer's).
+    Sibling { path: String, name: String, ty: Type },
+    /// A foreign (FFI) binding `name` with type `ty`. Re-declared as a ForeignImport so the raw
+    /// symbol resolves.
+    Foreign(String, Type),
+}
+
+/// Classify an origin-module slot. Returns `None` for a slot that is local to the function body
+/// (param / inner `val`/`var`/destructure) — those are slot-remapped, not re-imported.
+///
+/// `origin_path` is the module the body came from. For an import-of-import (the origin module
+/// itself imported the name from elsewhere), the resolved `Sibling.path` is the SOURCE module that
+/// defines the symbol — the symbol lives under that module's mangled prefix, never the
+/// intermediate's. This is what makes `helpers.lin`'s `import { for, push } from "std/array"`
+/// re-home to `std_array_for` / `std_array_push`, not the non-existent `._helpers_for`.
+fn classify_origin_slot(origin: &TypedModule, origin_path: &str, slot: usize) -> Option<OriginRef> {
+    if let Some(name) = origin.intrinsics.get(&slot) {
+        return Some(OriginRef::Intrinsic(name.clone()));
+    }
+    for stmt in &origin.statements {
+        match stmt {
+            TypedStmt::Val { slot: s, name: Some(name), value, ty, .. } if *s == slot => {
+                // A thin intrinsic wrapper (`for = (it, f) => lin_for(it, f)`,
+                // `push = (a, x) => lin_push(a, x)`, `length = (x) => lin_length(x)`) is INLINED to
+                // the underlying intrinsic. This is the flat-array lever: routing the re-homed body
+                // through the polymorphic `lin_*` builtin (which dispatches on the array's concrete
+                // runtime element type) keeps Int32 elements unboxed, whereas a `Named` call to the
+                // boxed `{key}_{name}` wrapper would force the uniform boxed-Function/TaggedVal
+                // element ABI — defeating the specialization (and, for `for`'s callback, mismatching
+                // the concrete-element closure → a tagged-value misread at runtime).
+                if let Some(intr) = thin_intrinsic_wrapper(origin, value) {
+                    return Some(OriginRef::Intrinsic(intr));
+                }
+                // Otherwise: a real sibling, resolved through a Named symbol under the origin's
+                // mangled prefix (`{key}_{name}` for fns, `{key}_{name}__val` for non-fn vals).
+                return Some(OriginRef::Sibling {
+                    path: origin_path.to_string(),
+                    name: name.clone(),
+                    ty: ty.clone(),
+                });
+            }
+            TypedStmt::ForeignImport { bindings, .. } => {
+                for b in bindings {
+                    if b.slot == slot {
+                        return Some(OriginRef::Foreign(b.name.clone(), b.ty.clone()));
+                    }
+                }
+            }
+            TypedStmt::Import { path, bindings, .. } => {
+                for b in bindings {
+                    if b.slot == slot {
+                        // Import-of-import: the symbol is defined by `path` (the source module),
+                        // not by `origin_path`. Re-home the reference to that source module.
+                        return Some(OriginRef::Sibling {
+                            path: path.clone(),
+                            name: b.name.clone(),
+                            ty: b.ty.clone(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// If `value` is a thin intrinsic wrapper — a function whose body is exactly a call to an origin
+/// intrinsic `lin_X` forwarding its parameters 1:1 in order (modulo a transparent `Coerce`/`Block`
+/// wrapper) — return the intrinsic name `lin_X`. Used to INLINE such wrappers (`for`, `push`,
+/// `length`, …) to the intrinsic when re-homing, so the polymorphic builtin's concrete-element
+/// dispatch is preserved. Returns `None` for any non-trivial body.
+fn thin_intrinsic_wrapper(origin: &TypedModule, value: &TypedExpr) -> Option<String> {
+    let TypedExpr::Function { params, body, .. } = value else { return None };
+    // Unwrap a transparent trailing-expression Block or a Coerce around the call.
+    let mut inner = body.as_ref();
+    loop {
+        match inner {
+            TypedExpr::Block { stmts, expr, .. } if stmts.is_empty() => inner = expr,
+            TypedExpr::Coerce { expr, .. } => inner = expr,
+            _ => break,
+        }
+    }
+    let TypedExpr::Call { func, args, .. } = inner else { return None };
+    // Callee must be an intrinsic LocalGet of THIS module.
+    let TypedExpr::LocalGet { slot, .. } = func.as_ref() else { return None };
+    let intr = origin.intrinsics.get(slot)?;
+    // Arguments must be exactly the params, in order, by slot (each possibly Coerce-wrapped).
+    if args.len() != params.len() {
+        return None;
+    }
+    for (a, p) in args.iter().zip(params.iter()) {
+        let mut ai = a;
+        while let TypedExpr::Coerce { expr, .. } = ai {
+            ai = expr;
+        }
+        match ai {
+            TypedExpr::LocalGet { slot: s, .. } if *s == p.slot => {}
+            _ => return None,
+        }
+    }
+    Some(intr.clone())
+}
+
+/// Collect every slot that is BOUND locally within a function body: its own params, plus any
+/// `val`/`var`/destructure slot introduced inside (including nested functions' params/captures
+/// targets). These are remapped to fresh importer slots; everything else is a free reference.
+fn collect_local_slots(func: &TypedExpr, out: &mut std::collections::HashSet<usize>) {
+    if let TypedExpr::Function { params, body, .. } = func {
+        for p in params {
+            out.insert(p.slot);
+        }
+        collect_local_slots_expr(body, out);
+    }
+}
+
+fn collect_local_slots_expr(expr: &TypedExpr, out: &mut std::collections::HashSet<usize>) {
+    match expr {
+        TypedExpr::Function { params, body, .. } => {
+            for p in params { out.insert(p.slot); }
+            collect_local_slots_expr(body, out);
+        }
+        TypedExpr::Block { stmts, expr, .. } => {
+            for s in stmts { collect_local_slots_stmt(s, out); }
+            collect_local_slots_expr(expr, out);
+        }
+        _ => for_each_child(expr, &mut |c| collect_local_slots_expr(c, out)),
+    }
+}
+
+fn collect_local_slots_stmt(stmt: &TypedStmt, out: &mut std::collections::HashSet<usize>) {
+    match stmt {
+        TypedStmt::Val { slot, value, .. } | TypedStmt::Var { slot, value, .. } => {
+            out.insert(*slot);
+            collect_local_slots_expr(value, out);
+        }
+        TypedStmt::Destructure { obj_slot, value, fields, rest, .. } => {
+            out.insert(*obj_slot);
+            for (_, s, _) in fields { out.insert(*s); }
+            if let Some(s) = rest { out.insert(*s); }
+            collect_local_slots_expr(value, out);
+        }
+        TypedStmt::ArrayDestructure { arr_slot, value, elements, rest, .. } => {
+            out.insert(*arr_slot);
+            for (_, s, _) in elements { out.insert(*s); }
+            if let Some((s, _)) = rest { out.insert(*s); }
+            collect_local_slots_expr(value, out);
+        }
+        TypedStmt::Expr(e) => collect_local_slots_expr(e, out),
+        TypedStmt::Import { .. } | TypedStmt::ForeignImport { .. } => {}
+    }
+}
+
+/// Re-home a cloned cross-module generic body into the importing module.
+///
+/// 1. Every locally-bound slot (params, inner `val`/`var`, destructure targets) is remapped to a
+///    FRESH importer slot, so it can't collide with the importer's own slots or with another
+///    specialization minted from the same/another origin module.
+/// 2. Every FREE slot (a reference to the origin module's own scope — a sibling function, an
+///    intrinsic, a foreign binding, or a non-function val) is rewritten to a fresh importer slot
+///    that is registered with the importer via either a synthesised `TypedStmt::Import` /
+///    `ForeignImport` (so lowering issues a `Named` call to the origin module's exported symbol)
+///    or a merged intrinsic-slot entry. References are deduped per (origin, name) so one binding
+///    serves all uses across all specializations.
+fn rehome_imported_body(func: &mut TypedExpr, origin_path: &str, state: &mut MonoState<'_>) {
+    let origin = match state.imports.get(origin_path) {
+        Some(m) => m.clone(),
+        None => return,
+    };
+    // 1. Determine which slots are local to this body.
+    let mut locals = std::collections::HashSet::new();
+    collect_local_slots(func, &mut locals);
+
+    // 2. Build the slot remap: locals → fresh importer slots; frees → fresh importer slots backed
+    //    by a re-homed binding/intrinsic. Done lazily during the rewrite walk.
+    let mut remap: HashMap<usize, usize> = HashMap::new();
+    for &local in &locals {
+        let fresh = state.next_slot;
+        state.next_slot += 1;
+        remap.insert(local, fresh);
+    }
+
+    // 3. Resolve (or mint) the importer slot for a free origin slot, registering the matching
+    //    importer-side binding the first time it is seen.
+    rehome_walk(func, &origin, origin_path, &locals, &mut remap, state);
+}
+
+/// Resolve the importer slot a free origin slot should be rewritten to, minting + registering the
+/// re-homed binding/intrinsic on first encounter (deduped per origin+name).
+fn rehome_free_slot(
+    origin_slot: usize,
+    origin: &TypedModule,
+    origin_path: &str,
+    state: &mut MonoState<'_>,
+) -> Option<usize> {
+    let origin_ref = classify_origin_slot(origin, origin_path, origin_slot)?;
+    match origin_ref {
+        OriginRef::Intrinsic(name) => {
+            // Intrinsics are global runtime builtins — dedupe by name alone (not per-origin) so a
+            // single merged intrinsic slot serves every re-homed body that uses it.
+            let key = (String::new(), name.clone());
+            if let Some(&s) = state.rehome_intrinsic_cache.get(&key) {
+                return Some(s);
+            }
+            let fresh = state.next_slot;
+            state.next_slot += 1;
+            state.rehome_intrinsic_cache.insert(key, fresh);
+            state.rehomed_intrinsics.insert(fresh, name);
+            Some(fresh)
+        }
+        OriginRef::Sibling { path, name, ty } => {
+            rehome_import_binding(&path, &name, ty, false, state)
+        }
+        OriginRef::Foreign(name, ty) => {
+            rehome_import_binding(origin_path, &name, ty, true, state)
+        }
+    }
+}
+
+/// Mint (deduped) a fresh importer slot for a re-homed import/foreign binding and append the
+/// matching one-binding `TypedStmt::Import`/`ForeignImport` to `rehomed_imports`.
+fn rehome_import_binding(
+    origin_path: &str,
+    name: &str,
+    ty: Type,
+    foreign: bool,
+    state: &mut MonoState<'_>,
+) -> Option<usize> {
+    let key = (origin_path.to_string(), name.to_string());
+    if let Some(&s) = state.rehome_binding_cache.get(&key) {
+        return Some(s);
+    }
+    let fresh = state.next_slot;
+    state.next_slot += 1;
+    state.rehome_binding_cache.insert(key, fresh);
+    let span = lin_common::Span::dummy();
+    if foreign {
+        state.rehomed_imports.push(TypedStmt::ForeignImport {
+            path: "lin-runtime".to_string(),
+            bindings: vec![ForeignSlot { name: name.to_string(), slot: fresh, ty, valid: true }],
+            span,
+        });
+    } else {
+        state.rehomed_imports.push(TypedStmt::Import {
+            path: origin_path.to_string(),
+            bindings: vec![ImportSlot { name: name.to_string(), slot: fresh, ty }],
+            span,
+        });
+    }
+    Some(fresh)
+}
+
+/// Rewrite slots throughout a cloned body: locals via `remap`, frees via `rehome_free_slot`
+/// (registering the importer binding on first encounter and extending `remap`).
+fn rehome_walk(
+    expr: &mut TypedExpr,
+    origin: &TypedModule,
+    origin_path: &str,
+    locals: &std::collections::HashSet<usize>,
+    remap: &mut HashMap<usize, usize>,
+    state: &mut MonoState<'_>,
+) {
+    // Resolve a single slot to its importer-side target, minting bindings as needed.
+    fn resolve(
+        slot: usize,
+        origin: &TypedModule,
+        origin_path: &str,
+        locals: &std::collections::HashSet<usize>,
+        remap: &mut HashMap<usize, usize>,
+        state: &mut MonoState<'_>,
+    ) -> usize {
+        if let Some(&s) = remap.get(&slot) {
+            return s;
+        }
+        if locals.contains(&slot) {
+            // A local we somehow hadn't pre-mapped (shouldn't happen — pre-seeded). Mint one.
+            let fresh = state.next_slot;
+            state.next_slot += 1;
+            remap.insert(slot, fresh);
+            return fresh;
+        }
+        if let Some(fresh) = rehome_free_slot(slot, origin, origin_path, state) {
+            remap.insert(slot, fresh);
+            fresh
+        } else {
+            // Unknown free slot (e.g. a forward-declared origin global not classified). Leave it;
+            // lowering will treat it as an out-of-scope placeholder. Record identity to avoid loop.
+            remap.insert(slot, slot);
+            slot
+        }
+    }
+
+    match expr {
+        TypedExpr::LocalGet { slot, .. } | TypedExpr::LocalSet { slot, .. } => {
+            *slot = resolve(*slot, origin, origin_path, locals, remap, state);
+        }
+        TypedExpr::Function { params, captures, .. } => {
+            for p in params.iter_mut() {
+                p.slot = resolve(p.slot, origin, origin_path, locals, remap, state);
+            }
+            for c in captures.iter_mut() {
+                c.outer_slot = resolve(c.outer_slot, origin, origin_path, locals, remap, state);
+            }
+        }
+        _ => {}
+    }
+    // Statement-bound slots inside blocks need their binding slot remapped too.
+    if let TypedExpr::Block { stmts, .. } = expr {
+        for s in stmts.iter_mut() {
+            rehome_stmt_slots(s, origin, origin_path, locals, remap, state);
+        }
+    }
+    for_each_child_mut(expr, &mut |c| rehome_walk(c, origin, origin_path, locals, remap, state));
+}
+
+fn rehome_stmt_slots(
+    stmt: &mut TypedStmt,
+    origin: &TypedModule,
+    origin_path: &str,
+    locals: &std::collections::HashSet<usize>,
+    remap: &mut HashMap<usize, usize>,
+    state: &mut MonoState<'_>,
+) {
+    let r = |slot: usize, state: &mut MonoState<'_>, remap: &mut HashMap<usize, usize>| {
+        if let Some(&s) = remap.get(&slot) { return s; }
+        let fresh = state.next_slot;
+        state.next_slot += 1;
+        remap.insert(slot, fresh);
+        fresh
+    };
+    match stmt {
+        TypedStmt::Val { slot, .. } | TypedStmt::Var { slot, .. } => {
+            *slot = r(*slot, state, remap);
+        }
+        TypedStmt::Destructure { obj_slot, fields, rest, .. } => {
+            *obj_slot = r(*obj_slot, state, remap);
+            for (_, s, _) in fields.iter_mut() { *s = r(*s, state, remap); }
+            if let Some(s) = rest { *s = r(*s, state, remap); }
+        }
+        TypedStmt::ArrayDestructure { arr_slot, elements, rest, .. } => {
+            *arr_slot = r(*arr_slot, state, remap);
+            for (_, s, _) in elements.iter_mut() { *s = r(*s, state, remap); }
+            if let Some((s, _)) = rest { *s = r(*s, state, remap); }
+        }
+        _ => {}
+    }
+    let _ = (origin, origin_path, locals);
+}
+
 /// Mutable working state threaded through the rewrite/worklist passes.
-struct MonoState {
+struct MonoState<'a> {
     /// Top-level generic functions, keyed by their `val` slot.
     generics: HashMap<usize, GenericFn>,
     /// Alias slot -> underlying generic slot (`val f = id`).
@@ -335,6 +866,20 @@ struct MonoState {
     diagnostics: Vec<Diagnostic>,
     /// Per-generic native-specialization cap (see `specialization_budget`).
     budget: usize,
+    /// Imported TypedModules, keyed by import path — the source of cross-module generic bodies
+    /// and the scope used to classify a re-homed body's free references.
+    imports: &'a HashMap<String, TypedModule>,
+    /// `TypedStmt::Import`/`ForeignImport` statements synthesised while re-homing cross-module
+    /// bodies (sibling/foreign/val bindings of the origin modules), prepended to the module.
+    rehomed_imports: Vec<TypedStmt>,
+    /// Intrinsic slots (fresh importer slot → intrinsic name) discovered while re-homing; merged
+    /// into the module's intrinsic map so lowering resolves them.
+    rehomed_intrinsics: HashMap<usize, String>,
+    /// Dedup: (origin_path, exported-name) → the fresh importer slot already minted for re-homing
+    /// a reference to that origin binding (sibling fn / foreign / val). Keeps one binding per use.
+    rehome_binding_cache: HashMap<(String, String), usize>,
+    /// Dedup: (origin_path, intrinsic-name) → fresh importer slot already minted.
+    rehome_intrinsic_cache: HashMap<(String, String), usize>,
 }
 
 struct SpecInfo {
@@ -494,7 +1039,7 @@ fn max_slot_expr(expr: &TypedExpr, m: &mut usize) {
 // Call rewriting
 // ---------------------------------------------------------------------------
 
-fn rewrite_stmt(stmt: &mut TypedStmt, state: &mut MonoState) {
+fn rewrite_stmt(stmt: &mut TypedStmt, state: &mut MonoState<'_>) {
     match stmt {
         // The body of a top-level generic function is a TEMPLATE whose param/return types are
         // still symbolic TypeVars. Do NOT rewrite calls inside it here — its calls are only
@@ -512,7 +1057,7 @@ fn rewrite_stmt(stmt: &mut TypedStmt, state: &mut MonoState) {
     }
 }
 
-fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState) {
+fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
     // Recurse into children FIRST so any nested generic calls (e.g. in this call's arguments) are
     // rewritten before we handle this node. Doing it first also means that after we (possibly) wrap
     // a generic call in a `Coerce` for the boxed fallback, we do NOT re-descend into the wrapped
@@ -599,14 +1144,14 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState) {
 }
 
 /// Name of the generic function for slot `gslot`.
-fn g_name(state: &MonoState, gslot: usize) -> String {
+fn g_name(state: &MonoState<'_>, gslot: usize) -> String {
     state.generics[&gslot].name.clone()
 }
 
 /// Mint (or look up) a native specialization for `gslot` at `subs`, returning its slot. New specs
 /// bump the per-generic budget counter and are pushed onto the worklist for materialization.
 fn native_spec_slot(
-    state: &mut MonoState,
+    state: &mut MonoState<'_>,
     gslot: usize,
     base_name: &str,
     key: (usize, Vec<(u32, String)>),
@@ -659,7 +1204,7 @@ fn boxed_fallback_call(
     gslot: usize,
     params: &[TypedParam],
     ret_type: &Type,
-    _state: &mut MonoState,
+    _state: &mut MonoState<'_>,
 ) {
     let TypedExpr::Call { func, result_type, .. } = expr else { return };
     let concrete_result = result_type.clone();
@@ -771,8 +1316,44 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
         TypedExpr::IndexSet { obj_ty, .. } => *obj_ty = subst_type(obj_ty, subs),
         TypedExpr::StringInterp { .. } | TypedExpr::Is { .. } | TypedExpr::Has { .. } => {}
     }
+    // Substitute the type fields carried on STATEMENTS inside a block. `for_each_child_mut` only
+    // descends into a statement's value EXPRESSION, never its declared-type field — so without this
+    // a `var acc: U = …` inside a generic body keeps its `ty: TypeVar(U)` after substitution. That
+    // would make the lowered cell a boxed union while the (substituted) closure that captures it
+    // reads it as the concrete type → a representation mismatch and a misaligned-pointer crash.
+    if let TypedExpr::Block { stmts, .. } = expr {
+        for s in stmts.iter_mut() {
+            subst_stmt_types(s, subs);
+        }
+    }
     // Recurse into children to substitute nested types.
     for_each_child_mut(expr, &mut |c| subst_expr(c, subs));
+}
+
+/// Substitute generic TypeVars in the declared-type fields of a statement (the value expression's
+/// own types are handled by `subst_expr` recursing into it via `for_each_child_mut`).
+fn subst_stmt_types(stmt: &mut TypedStmt, subs: &HashMap<u32, Type>) {
+    match stmt {
+        TypedStmt::Val { ty, .. } | TypedStmt::Var { ty, .. } => {
+            *ty = subst_type(ty, subs);
+        }
+        TypedStmt::Destructure { obj_ty, fields, .. } => {
+            *obj_ty = subst_type(obj_ty, subs);
+            for (_, _, fty) in fields.iter_mut() {
+                *fty = subst_type(fty, subs);
+            }
+        }
+        TypedStmt::ArrayDestructure { elem_ty, elements, rest, .. } => {
+            *elem_ty = subst_type(elem_ty, subs);
+            for (_, _, ety) in elements.iter_mut() {
+                *ety = subst_type(ety, subs);
+            }
+            if let Some((_, rty)) = rest {
+                *rty = subst_type(rty, subs);
+            }
+        }
+        TypedStmt::Expr(_) | TypedStmt::Import { .. } | TypedStmt::ForeignImport { .. } => {}
+    }
 }
 
 // ---------------------------------------------------------------------------
