@@ -9,6 +9,12 @@ use lin_check::types::Type;
 use super::Codegen;
 
 impl<'ctx> Codegen<'ctx> {
+    /// Byte size of every closure struct. Layout: rc@0, _pad@4, fn_ptr@8, env_ptr@16,
+    /// env_size@24, default-arg descriptor@32, capture descriptor@40 (ADR-060). All closures
+    /// are this fixed size so `lin_closure_release` frees them with one layout. MUST match the
+    /// `CLOSURE_SIZE`/free size in `lin-runtime/src/memory.rs`.
+    pub(crate) const CLOSURE_SIZE: u64 = 48;
+
     /// Wrap a named (top-level) LLVM function in a closure struct with a thin adapter.
     /// Named functions have signature `(T1, T2, ...) -> R` (no env_ptr).
     /// The closure ABI expects `(ptr env, T1, T2, ...) -> R`.
@@ -217,10 +223,11 @@ impl<'ctx> Codegen<'ctx> {
         self.mark_user_fn_nounwind(wrapper_fn);
 
         let cls_struct_ty = self.closure_struct_type();
-        // 40 bytes: closure header (32) + descriptor slot at offset 32 (null here — a partial
-        // application has no default arguments). All closures are 40 bytes so the runtime can
-        // free them with a single fixed layout.
-        let cls_ptr = self.builder.call(self.rt.alloc, &[self.context.i64_type().const_int(40, false).into()], "papp_cls").try_as_basic_value().unwrap_basic().into_pointer_value();
+        // CLOSURE_SIZE bytes: header (32) + env_size@24 + default-arg descriptor@32 (null — a
+        // partial application has no default args) + capture descriptor@40 (null — partial-app
+        // captures use BORROW semantics; the inner closure / partial args are released by their
+        // own owners, not by this closure's free). All closures are one fixed size.
+        let cls_ptr = self.alloc_closure();
         let rc_field = self.builder.struct_gep(cls_struct_ty, cls_ptr, 0, "papp_cls_rc");
         self.builder.store(rc_field, self.context.i32_type().const_int(1, false));
         let fn_field = self.builder.struct_gep(cls_struct_ty, cls_ptr, 2, "papp_cls_fn");
@@ -233,11 +240,12 @@ impl<'ctx> Codegen<'ctx> {
             self.context.i8_type(), cls_ptr, &[self.context.i64_type().const_int(24, false)], "papp_env_sz_f"
         ) };
         self.builder.store(env_sz_gep, env_size_i64);
-        // Null descriptor at offset 32.
+        // Null default-arg descriptor at offset 32 + null capture descriptor at offset 40.
         let desc_gep = unsafe { self.builder.gep(
             self.context.i8_type(), cls_ptr, &[self.context.i64_type().const_int(32, false)], "papp_desc_f"
         ) };
         self.builder.store(desc_gep, ptr_ty.const_null());
+        self.store_capture_descriptor(cls_ptr, ptr_ty.const_null());
 
         let current_block = self.builder.get_insert_block().unwrap();
         {
@@ -352,11 +360,11 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.r#return(Some(&inner_result));
         self.builder.position_at_end(saved_block);
 
-        // Build the outer closure struct { rc, _pad, fn_ptr, env_ptr } (40 bytes incl. the
-        // offset-32 descriptor slot, null here — a partial application has no defaults).
+        // Build the outer closure struct { rc, _pad, fn_ptr, env_ptr } (CLOSURE_SIZE bytes; the
+        // offset-32 default-arg descriptor and offset-40 capture descriptor are both null here —
+        // a partial application has no defaults and uses borrow semantics for its captures).
         let cls_struct_ty = self.closure_struct_type();
-        let cls_ptr = self.builder.call(self.rt.alloc, &[self.context.i64_type().const_int(40, false).into()], "papp_cls")
-            .try_as_basic_value().unwrap_basic().into_pointer_value();
+        let cls_ptr = self.alloc_closure();
         let rc_field = self.builder.struct_gep(cls_struct_ty, cls_ptr, 0, "papp_cls_rc");
         self.builder.store(rc_field, self.context.i32_type().const_int(1, false));
         let fn_field = self.builder.struct_gep(cls_struct_ty, cls_ptr, 2, "papp_cls_fn");
@@ -369,12 +377,30 @@ impl<'ctx> Codegen<'ctx> {
             self.context.i8_type(), cls_ptr, &[self.context.i64_type().const_int(24, false)], "papp_env_sz_f"
         ) };
         self.builder.store(env_sz_gep, env_size_i64);
-        // Null descriptor at offset 32.
+        // Null default-arg descriptor at offset 32 + null capture descriptor at offset 40.
         let desc_gep = unsafe { self.builder.gep(
             self.context.i8_type(), cls_ptr, &[self.context.i64_type().const_int(32, false)], "papp_desc_f"
         ) };
         self.builder.store(desc_gep, ptr_ty.const_null());
+        self.store_capture_descriptor(cls_ptr, ptr_ty.const_null());
         cls_ptr.into()
+    }
+
+    /// Allocate one closure struct (`CLOSURE_SIZE` = 48 bytes). Layout: rc@0, _pad@4, fn@8,
+    /// env@16, env_size@24, default-arg descriptor@32, capture descriptor@40 (ADR-060). The
+    /// single allocator for every closure so the size stays in one place.
+    pub(crate) fn alloc_closure(&mut self) -> PointerValue<'ctx> {
+        let size = self.context.i64_type().const_int(Self::CLOSURE_SIZE, false);
+        self.builder.call(self.rt.alloc, &[size.into()], "cls").try_as_basic_value().unwrap_basic().into_pointer_value()
+    }
+
+    /// Store the capture-descriptor pointer at closure offset 40 (`lin_closure_release` reads it
+    /// to release owning captures). `desc` is null when the closure has no owning captures.
+    pub(crate) fn store_capture_descriptor(&mut self, cls_mem: PointerValue<'ctx>, desc: PointerValue<'ctx>) {
+        let gep = unsafe { self.builder.gep(
+            self.context.i8_type(), cls_mem, &[self.context.i64_type().const_int(40, false)], "cls_capdesc"
+        ) };
+        self.builder.store(gep, desc);
     }
 
     /// Make a closure struct {i32 rc=1, i32 _pad, fn_ptr, env_ptr} with optional captured env.
@@ -410,41 +436,41 @@ impl<'ctx> Codegen<'ctx> {
     ) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
-        // 40 bytes: 32-byte closure header + 8-byte descriptor pointer at offset 32.
-        let cls_size = i64_ty.const_int(40, false);
-        let cls_mem = self.builder.call(self.rt.alloc, &[cls_size.into()], "ir_cls").try_as_basic_value().unwrap_basic().into_pointer_value();
+        // 48-byte closure (CLOSURE_SIZE): 32-byte header + env_size@24 + default-arg
+        // descriptor@32 + CAPTURE descriptor@40 (ADR-060). The capture descriptor records each
+        // owning capture's release kind; `lin_closure_release` walks it to release captures.
+        let cls_mem = self.alloc_closure();
         let cls_ty = self.closure_struct_type();
         let rc_f = self.builder.struct_gep(cls_ty, cls_mem, 0, "ir_rc");
         self.builder.store(rc_f, self.context.i32_type().const_int(1, false));
         let fp_f = self.builder.struct_gep(cls_ty, cls_mem, 2, "ir_fp");
         self.builder.store(fp_f, fn_ptr);
-        // Descriptor pointer at offset 32 (null if this function has no default args).
+        // Default-arg descriptor at offset 32 (null if this function has no default args).
         let desc_gep = unsafe { self.builder.gep(
             self.context.i8_type(), cls_mem, &[i64_ty.const_int(32, false)], "ir_desc"
         ) };
         self.builder.store(desc_gep, descriptor.unwrap_or_else(|| ptr_ty.const_null()));
+        // Capture descriptor at offset 40: a static `{u32 count, u8 kinds[]}` global, or null
+        // when there are no owning captures. Always written so the slot is initialized
+        // (lin_alloc does not zero).
+        let capdesc: PointerValue<'ctx> = match capture_kinds {
+            Some(kinds) if !kinds.is_empty() => self.emit_capture_descriptor(kinds),
+            _ => ptr_ty.const_null(),
+        };
+        self.store_capture_descriptor(cls_mem, capdesc);
 
         if captures.is_empty() {
             let ep_f = self.builder.struct_gep(cls_ty, cls_mem, 3, "ir_ep");
             self.builder.store(ep_f, ptr_ty.const_null());
         } else {
             // Build an env struct.
-            // Layout: {u64 size, cap0, cap1, ...}
+            // Layout: {u64 size, cap0, cap1, ...}  (offset 0 is the redundant size header, read
+            // by no one; the capture descriptor lives in the CLOSURE at offset 40, not here).
             let n = captures.len();
             let env_size_bytes = 8u64 + (n as u64 * 8); // size header + 8 bytes per capture (ptr/i64)
             let env_size_val = i64_ty.const_int(env_size_bytes, false);
             let env_mem = self.builder.call(self.rt.alloc, &[env_size_val.into()], "ir_env").try_as_basic_value().unwrap_basic().into_pointer_value();
-            // Offset 0: a capture descriptor pointer (for thread-transfer deep copy) when
-            // capture kinds are provided, otherwise the redundant size header (read by no one).
-            match capture_kinds {
-                Some(kinds) => {
-                    let desc = self.emit_capture_descriptor(kinds);
-                    self.builder.store(env_mem, desc);
-                }
-                None => {
-                    self.builder.store(env_mem, env_size_val);
-                }
-            }
+            self.builder.store(env_mem, env_size_val);
             // Write captures at offsets 8, 16, ...
             for (i, &cap) in captures.iter().enumerate() {
                 let offset = 8u64 + (i as u64 * 8);
@@ -469,37 +495,6 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.store(env_size_gep, env_size_val);
         }
         cls_mem.into()
-    }
-
-    /// The `transfer::CAP_*` kind for a captured value of type `ty`, describing how the runtime
-    /// must transfer that env slot across a thread boundary. MUST match `transfer.rs`'s codes
-    /// and the env storage representation chosen by `llvm_type`:
-    ///   scalars → CAP_SCALAR (8-byte value); Str → CAP_STR; Array/FixedArray → CAP_ARRAY;
-    ///   Object → CAP_OBJECT; Union/TypeVar/Named/Null → CAP_TAGGED (boxed TaggedVal*, also
-    ///   covers the null Json value); Function/Iterator → CAP_OPAQUE (not deep-copyable).
-    pub(crate) fn capture_kind(ty: &Type) -> u8 {
-        // Keep in lockstep with crate::transfer CAP_* constants.
-        const CAP_SCALAR: u8 = 0;
-        const CAP_STR: u8 = 1;
-        const CAP_ARRAY: u8 = 2;
-        const CAP_OBJECT: u8 = 3;
-        const CAP_TAGGED: u8 = 4;
-        const CAP_OPAQUE: u8 = 5;
-        match ty {
-            Type::Str | Type::StrLit(_) => CAP_STR,
-            Type::Array(_) | Type::FixedArray(_) => CAP_ARRAY,
-            Type::Object(_) => CAP_OBJECT,
-            // Shared<T> is a boxed TaggedVal*(TAG_SHARED); CAP_TAGGED routes it through
-            // lin_transfer_clone, whose TAG_SHARED arm shares the box by atomic-refcount bump
-            // (the nesting rule) rather than deep-copying through it.
-            Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Null | Type::Shared(_) => CAP_TAGGED,
-            Type::Function { .. } | Type::Iterator(_) => CAP_OPAQUE,
-            Type::Bool
-            | Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64
-            | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64
-            | Type::Float32 | Type::Float64 => CAP_SCALAR,
-            Type::Never => CAP_SCALAR,
-        }
     }
 
     /// Emit (and cache) a static read-only capture-descriptor global `{ i32 count, [count x i8]

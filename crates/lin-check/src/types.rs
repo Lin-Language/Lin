@@ -19,7 +19,7 @@ pub enum Type {
     /// A singleton string-literal type, e.g. `"success"`. At runtime a `StrLit`
     /// value is represented identically to a `Str` (TAG_STR, same boxing/RC/toString);
     /// the literal only constrains type-checking (compat, bidirectional refinement,
-    /// exhaustiveness). See ADR-051.
+    /// exhaustiveness). See ADR-053.
     StrLit(String),
     Array(Box<Type>),
     FixedArray(Vec<Type>),
@@ -97,7 +97,7 @@ impl Type {
 
     /// True for `Str` and for any string-literal singleton (`StrLit`). Used wherever
     /// a runtime-string representation is what matters (equality, comparison, boxing,
-    /// RC), since a `StrLit` is a `Str` at runtime. See ADR-051.
+    /// RC), since a `StrLit` is a `Str` at runtime. See ADR-053.
     pub fn is_string_ish(&self) -> bool {
         matches!(self, Type::Str | Type::StrLit(_))
     }
