@@ -1,0 +1,36 @@
+// parallel.lin — CPU-bound fan-out: 8 independent chunks via `parallel`.
+//
+// Each chunk runs a data-dependent Collatz-style integer walk for ITERS
+// iterations, accumulating `steps + start` into a 64-bit total. The chunks
+// overlap on a multicore box, so wall-clock approaches one chunk while CPU
+// time stays ~8x. Prints exactly one stdout line "RESULT=<int>".
+//
+// Parameters (identical across all languages): START=27 ITERS=30000000 CHUNKS=8.
+import { print } from "std/io"
+import { toString } from "std/string"
+import { parallel } from "std/async"
+import { for } from "std/array"
+
+// `start`/`n` stay Int32 (start never exceeds ~9232 here, so 3*start+1 and
+// start/2 never overflow Int32); only `steps` accumulates into Int64. The
+// `steps + s2` site widens the Int32 `start` into the Int64 accumulator.
+val walk = (start: Int32, n: Int32, steps: Int64): Int64 =>
+  if n == 0 then steps
+  else
+    val next =
+      if start == 1 then 27
+      else if start - (start / 2) * 2 == 0 then start / 2
+      else 3 * start + 1
+    val s2: Int64 = start
+    walk(next, n - 1, steps + s2)
+
+val chunk = (): Int64 => walk(27, 30000000, 0i64)
+
+val results = parallel([
+  () => chunk(), () => chunk(), () => chunk(), () => chunk(),
+  () => chunk(), () => chunk(), () => chunk(), () => chunk()
+])
+
+var sum = 0i64
+results.for(v => sum = sum + v)
+print("RESULT=${toString(sum)}")

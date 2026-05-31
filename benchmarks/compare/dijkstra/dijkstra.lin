@@ -1,0 +1,42 @@
+// dijkstra.lin — linear-scan priority-queue Dijkstra (O(V^2)) over graph.json.
+//
+// Reuses the tested example implementation (examples/dijkstra/algorithm.lin +
+// graph.lin) verbatim — no new Lin algorithm code. The graph read + parse
+// happens inside the timed region (std/fs readJson). Prints exactly one stdout
+// line "RESULT=<int>".
+import { print } from "std/io"
+import { toString } from "std/string"
+import { readJson } from "std/fs"
+import { for } from "std/array"
+import { buildAdj } from "../../../examples/dijkstra/graph"
+import { dijkstra } from "../../../examples/dijkstra/algorithm"
+
+// "infinity" sentinel for the checksum's finite test (dist < INF == finite).
+// The example seeds unreached nodes at 999999999, which is < INF, so a wrong
+// (disconnected) tree would still be caught by the dist values themselves; this
+// graph is fully connected so every node is finite.
+val INF = 1000000000
+
+val toInt = (v: Json): Int32 =>
+  match v
+    is Int32 => v
+    else => 0
+
+// A finite distance contributes to the sum; INF (unreached) contributes 0. The
+// Int32 result widens into the Int64 accumulator at the `+` site.
+val finite = (d: Int32): Int32 =>
+  if d < INF then d else 0
+
+val graph = readJson("benchmarks/compare/data/graph.json")
+val adj = buildAdj(graph["edges"])
+val nodes = graph["nodes"]
+val result = dijkstra(adj, "n0", nodes)
+val dist = result["dist"]
+
+var total = 0i64
+nodes.for(n => total = total + finite(toInt(dist[n])))
+
+val targetDist: Int64 = toInt(dist["n999"])
+val checksum = targetDist * 1000003i64 + (total - (total / 1000000000i64) * 1000000000i64)
+
+print("RESULT=${toString(checksum)}")
