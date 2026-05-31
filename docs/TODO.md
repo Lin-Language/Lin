@@ -594,10 +594,10 @@ End state: O(n log n) sort, O(n) string building, O(n) unique/omit, constant-fac
 
 - [x] **`lin_array_alloc_sized(n)` intrinsic** — `lin_array_alloc(cap)` preallocates with the known output size; used by `map`, `zip`, `take`, `reverse`, `append`, `prepend`.
 - [x] **`lin_array_concat` intrinsic** — `lin_array_concat_into(dst, src)` exists in `array.rs` for bulk copy. (`concat` in `stdlib/array.lin` still uses a manual `set` loop rather than the intrinsic — acceptable.)
-- [ ] **`append` / `prepend` intermediate alloc** — no `lin_array_append` / `lin_array_prepend` intrinsic; stdlib allocates an `n+1` array and copies. Minor.
+- [x] **`append` / `prepend` intermediate alloc** — `lin_array_append_dyn` / `lin_array_prepend_dyn` runtime intrinsics (mirror `lin_array_concat_dyn`): one runtime copy, representation-preserving (a flat `UInt8[]`/`Int32[]` stays flat — fixes the latent flat→tagged bug the old `lin_array_allocate`+`.for` loop had), tagged elements + the item RC-retained into the result (ASan-verified).
 - [x] **`object.values` / `object.entries` two-pass** — `lin_object_values` / `lin_object_entries` intrinsics traverse the internal map in a single pass (`object.rs`); no intermediate key array.
 - [x] **`countBy` two passes** — `stdlib/array.lin` `countBy` accumulates counts directly in a single pass; no longer routes through `groupBy`.
-- [ ] **`groupBy` double key lookup** — still a null-check-then-push double lookup in Lin; no `lin_object_get_or_insert` intrinsic. Minor.
+- [x] **`groupBy` double key lookup** — `lin_object_get_or_insert_array(obj, key)` intrinsic does ONE hash lookup: returns the live interior group array (creating an empty one if absent) for an immediate in-place `push`. `stdlib/array.lin` `groupBy` is now one lookup + push, no null-check-then-set. (ASan-verified.)
 
 ---
 

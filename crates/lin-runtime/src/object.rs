@@ -257,6 +257,70 @@ pub unsafe extern "C" fn lin_object_get(obj: *const LinObject, key: *const LinSt
     std::ptr::null()
 }
 
+/// Look up `key` in `obj` ONCE. If it maps to an array, return that array (the live interior
+/// one, so a subsequent `push` mutates it in place); otherwise insert a fresh empty array under
+/// `key` and return that. The result is a `Json` value (`TaggedVal*(Array)`) so the caller can
+/// pass it straight to `push`. Backs `std/array.groupBy`, replacing the get-then-set double
+/// lookup with one lookup + push.
+///
+/// `obj` crosses the FFI boundary as a `Json` (`TaggedVal*(Object)`) or raw `LinObject*`; `key`
+/// is a `String` (`LinString*`). Both are BORROWED.
+///
+/// RC: the array always lives INSIDE the object (object owns it). The returned `Json` box is an
+/// owned +1 like every other foreign `Json` result, so we RETAIN the array before boxing it —
+/// the box's eventual scope-exit release brings the count back down, leaving the object's own
+/// reference intact. `push` into the returned box mutates the interior array IN PLACE (push
+/// borrows its array arg; it neither retains nor replaces it), so the mutation is visible
+/// through the object. On the insert path the object takes its own +1 via `object_push_owned`
+/// over a freshly-allocated (rc=1) array, and we bump once more for the returned box.
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_get_or_insert_array(obj: *const u8, key: *const u8) -> *mut u8 {
+    use crate::tagged::*;
+    if obj.is_null() {
+        // No object to mutate; hand back a fresh empty array so `push` is still well-defined.
+        return alloc_tagged(TAG_ARRAY, crate::array::lin_array_alloc(4) as u64);
+    }
+    // Unwrap a boxed Json object to the raw LinObject*; a raw LinObject* is used as-is.
+    let lin_obj = if *obj == TAG_OBJECT {
+        (*(obj as *const TaggedVal)).payload as *mut LinObject
+    } else {
+        obj as *mut LinObject
+    };
+    // `key` arrives as a LinString* (possibly boxed as Json(Str) — unwrap if so).
+    let key_str = if !key.is_null() && *key == TAG_STR {
+        (*(key as *const TaggedVal)).payload as *const LinString
+    } else {
+        key as *const LinString
+    };
+
+    // Single lookup.
+    let existing = lin_object_get(lin_obj, key_str);
+    if !existing.is_null() && (*existing).tag == TAG_ARRAY {
+        let arr = (*existing).payload as *mut crate::array::LinArray;
+        // Retain: the returned Json box owns a +1; the object keeps its own reference.
+        if !arr.is_null() && (*arr).refcount < crate::string::IMMORTAL_RC {
+            (*arr).refcount += 1;
+        }
+        return alloc_tagged(TAG_ARRAY, arr as u64);
+    }
+
+    // Absent (or present-but-not-an-array): create a fresh empty array and insert it.
+    let arr = crate::array::lin_array_alloc(4); // rc = 1
+    // Build a TaggedVal(Array) and store it via the dup-checking setter so a present-but-
+    // non-array value is overwritten (release its old payload) rather than duplicated.
+    let val = TaggedVal { tag: TAG_ARRAY, _pad: [0; 7], payload: arr as u64 };
+    // lin_object_set RETAINS the value's inner payload (arr -> rc 2) and keeps its own key ref.
+    lin_object_set(lin_obj, key_str as *mut LinString, &val);
+    // Drop our construction +1: the object now owns its retained reference (rc back to 1 in the
+    // object). Then bump once for the returned box's owned +1 (rc 2: object + returned box).
+    // Net since alloc (rc1): set retained (+1 = 2), we release our build ref (-1 = 1), box (+1 = 2).
+    crate::array::lin_array_release(arr);
+    if (*arr).refcount < crate::string::IMMORTAL_RC {
+        (*arr).refcount += 1;
+    }
+    alloc_tagged(TAG_ARRAY, arr as u64)
+}
+
 /// Copy all fields from `src` into `dst`, overwriting existing keys.
 /// Used to implement object spread: `{ ...src, ... }`.
 #[no_mangle]
@@ -604,7 +668,7 @@ pub unsafe extern "C" fn lin_object_copy_except(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tagged::{alloc_tagged, TAG_STR, TAG_ARRAY, TAG_OBJECT, TAG_INT32};
+    use crate::tagged::{alloc_tagged, lin_tagged_release, TAG_STR, TAG_ARRAY, TAG_OBJECT, TAG_INT32};
 
     unsafe fn mk_string(s: &str) -> *mut LinString {
         crate::string::lin_string_from_bytes(s.as_ptr(), s.len() as u32)
@@ -693,6 +757,62 @@ mod tests {
             }
             lin_object_release(obj);
             for k in keys { crate::string::lin_string_release(k); }
+        }
+    }
+
+    // Mirror std/array.groupBy: for each item, get-or-insert the group array under its key and
+    // push the item into the returned (boxed) array IN PLACE. The returned Json box is an owned
+    // +1; releasing it after each push must leave the object's own reference intact. Under ASan
+    // an over-release (returning a +0 alias) frees the group while the object still points at it
+    // (UAF on the next push/read); an under-release leaks every group box. Loop to amplify.
+    #[test]
+    fn get_or_insert_array_groupby_rc_balanced() {
+        unsafe {
+            use crate::array::{lin_array_length, lin_array_get_tagged};
+            let obj = lin_object_alloc(2); // the `var result = {}`
+            let obj_box = alloc_tagged(TAG_OBJECT, obj as u64); // object crosses as Json
+            // Two interned-ish keys reused every iteration (caller owns one ref each).
+            let even = crate::string::lin_string_from_bytes("even".as_ptr(), 4);
+            let odd = crate::string::lin_string_from_bytes("odd".as_ptr(), 3);
+
+            for i in 0..100i64 {
+                let key = if i % 2 == 0 { even } else { odd };
+                let key_box = alloc_tagged(TAG_STR, key as u64);
+                // get-or-insert returns a boxed Json(Array), owned +1.
+                let group_box = lin_object_get_or_insert_array(
+                    obj_box as *const u8, key_box as *const u8,
+                );
+                let group = (*(group_box as *const TaggedVal)).payload as *mut crate::array::LinArray;
+                // push the integer item into the group in place (mirrors `push(group, item)`).
+                let item = alloc_tagged(TAG_INT32, i as u64);
+                crate::array::lin_push_dyn(group, item as *const TaggedVal);
+                // scalar box: release no-ops on cached small ints, frees otherwise.
+                lin_tagged_release(item as *mut u8);
+                // Release the returned group box (its +1 was for this binding only).
+                lin_tagged_release(group_box);
+                // key_box is a fresh box aliasing `even`/`odd`; free the shell, the key lives on.
+                crate::tagged::lin_tagged_free_box(key_box);
+            }
+
+            // Two groups, 50 each, all items intact.
+            let g_even = lin_object_get(obj, even);
+            let g_odd = lin_object_get(obj, odd);
+            assert!(!g_even.is_null() && (*g_even).tag == TAG_ARRAY);
+            assert!(!g_odd.is_null() && (*g_odd).tag == TAG_ARRAY);
+            let ea = (*g_even).payload as *const crate::array::LinArray;
+            let oa = (*g_odd).payload as *const crate::array::LinArray;
+            assert_eq!(lin_array_length(ea), 50);
+            assert_eq!(lin_array_length(oa), 50);
+            // Read back the first/last of each (UAF check).
+            let first_even = lin_array_get_tagged(ea, 0);
+            assert_eq!((*first_even).payload as i32, 0);
+            std::alloc::dealloc(first_even as *mut u8, std::alloc::Layout::new::<TaggedVal>());
+
+            // Teardown: releasing the object frees both group arrays exactly once.
+            lin_object_release(obj);
+            crate::tagged::lin_tagged_free_box(obj_box);
+            crate::string::lin_string_release(even);
+            crate::string::lin_string_release(odd);
         }
     }
 }
