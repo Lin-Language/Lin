@@ -11,8 +11,8 @@ impl Checker {
     pub(crate) fn check_expr(&mut self, expr: &Expr, expected: &Type) -> Result<TypedExpr, Diagnostic> {
         // For function expressions with a known expected function type, use the expected
         // param types to guide inference (bidirectional type checking).
-        if let (Expr::Function { params, return_type, body, span }, Type::Function { params: expected_params, ret: expected_ret, .. }) = (expr, expected) {
-            return self.infer_function_with_hints(params, return_type, body, *span, None, expected_params, expected_ret);
+        if let (Expr::Function { type_params, params, return_type, body, span }, Type::Function { params: expected_params, ret: expected_ret, .. }) = (expr, expected) {
+            return self.infer_function_with_hints(type_params, params, return_type, body, *span, None, expected_params, expected_ret);
         }
 
         // A suffixless integer literal takes its context type (spec §26). When the expected
@@ -63,7 +63,7 @@ impl Checker {
             });
         }
 
-        // Singleton string-literal refinement (ADR-053). A bare string literal infers to
+        // Singleton string-literal refinement (ADR-051). A bare string literal infers to
         // `String`, but when checked against an expected `StrLit("t")` it is accepted iff its
         // value equals `t`, and the resulting typed expression is narrowed to `StrLit("t")` so
         // it satisfies the literal target (e.g. a discriminant field).
@@ -90,17 +90,24 @@ impl Checker {
 
         // Propagate the expected type into the branches of an `if`/`else` (each branch is a
         // tail position whose value is the expression's value), so an object/string literal in
-        // a branch is refined against the same expected type (ADR-053). Only when both branches
+        // a branch is refined against the same expected type (ADR-051). Only when both branches
         // are present (a bare `if ... then x` has an implicit Null else and is handled below).
+        //
+        // Bidirectional-push fix for the match-arm-union-vs-declared-object bug: when the
+        // expected type is structured (an object / named object / union), each branch is checked
+        // against the expected type rather than inferred-then-unioned. This refines object
+        // literals structurally AND lets a `Json`-typed branch be accepted against a structured
+        // object return type (see `check_branch_against` / `branch_value_compatible`), instead of
+        // forming `Json | {concrete}` and rejecting that union against the declared return.
         if let Expr::If { condition, then_branch, else_branch, span } = expr {
-            if type_mentions_strlit(expected) && !matches!(else_branch.as_ref(), Expr::NullLit(_)) {
+            if expected_pushes_into_branches(expected) && !matches!(else_branch.as_ref(), Expr::NullLit(_)) {
                 let in_tail = self.in_tail_position;
                 self.in_tail_position = false;
                 let typed_cond = self.check_expr(condition, &Type::Bool)?;
                 self.in_tail_position = in_tail;
-                let typed_then = self.check_expr(then_branch, expected)?;
+                let typed_then = self.check_branch_against(then_branch, expected)?;
                 self.in_tail_position = in_tail;
-                let typed_else = self.check_expr(else_branch, expected)?;
+                let typed_else = self.check_branch_against(else_branch, expected)?;
                 let result_type = unify_types(&[typed_then.ty(), typed_else.ty()]);
                 return Ok(TypedExpr::If {
                     cond: Box::new(typed_cond),
@@ -109,6 +116,17 @@ impl Checker {
                     result_type,
                     span: *span,
                 });
+            }
+        }
+
+        // Bidirectional-push for `match`: check each arm body against the expected type when the
+        // expected type is structured. Same rationale as the `if` branch above — this is the root
+        // cause of the match-arm-union-vs-declared-object bug (a `Json` arm + a concrete-object
+        // arm declared `: R` was inferred independently, unioned into `Json | {concrete}`, and
+        // that union rejected against `R`). Each arm is now checked against `R` directly.
+        if let Expr::Match { scrutinee, arms, span } = expr {
+            if expected_pushes_into_branches(expected) {
+                return self.check_match(scrutinee, arms, expected, *span);
             }
         }
 
@@ -168,7 +186,7 @@ impl Checker {
             Expr::If { condition, then_branch, else_branch, span } => self.infer_if(condition, then_branch, else_branch, *span),
             Expr::Match { scrutinee, arms, span }     => self.infer_match(scrutinee, arms, *span),
             Expr::Block(stmts, final_expr, span)      => self.infer_block(stmts, final_expr, *span),
-            Expr::Function { params, return_type, body, span } => self.infer_function(params, return_type, body, *span, None),
+            Expr::Function { type_params, params, return_type, body, span } => self.infer_function(type_params, params, return_type, body, *span, None),
             Expr::Object(fields, span)                => self.infer_object(fields, *span),
             Expr::Array(elements, span)               => self.infer_array(elements, *span),
             Expr::Assign { target, value, span }      => self.infer_assign(target, value, *span),
@@ -342,6 +360,79 @@ impl Checker {
         })
     }
 
+    /// Check a single `if`/`match` branch body against the expected (declared return / context)
+    /// type, refining object/string literals structurally. A branch whose value is `Json`
+    /// (`TypeVar(u32::MAX)`, the top/dynamic type) is accepted where any structured type is
+    /// expected: `Json` is accept-any in this checked-arm position, so a function declared to
+    /// return `R` may yield a `Json` value from one arm and a concrete `R`-shaped object from
+    /// another. This is the bidirectional-push counterpart to the union-vs-declared-object bug;
+    /// it deliberately does NOT relax `is_compatible_env` (ADR-046 still rejects a direct
+    /// `val p: Person = jsonValue` decode).
+    pub(crate) fn check_branch_against(&mut self, body: &Expr, expected: &Type) -> Result<TypedExpr, Diagnostic> {
+        // First try the bidirectional refinement path (object/string-literal/nested if/match).
+        let typed = self.check_expr_branch_inner(body, expected)?;
+        let ty = typed.ty();
+        if is_json_dynamic(&ty) || self.types_compatible(&ty, expected) {
+            Ok(typed)
+        } else {
+            Err(Diagnostic::error(
+                body.span(),
+                format!("Expected type {}, got {}", expected, ty),
+            ))
+        }
+    }
+
+    /// Infer/refine a branch body, pushing the expected type in where it helps (object literals,
+    /// nested `if`/`match`, string literals) but tolerating a mismatch here — the caller
+    /// (`check_branch_against`) makes the final compatibility decision (including the Json-arm
+    /// allowance). We can't call `check_expr` directly because it errors on a `Json` value vs a
+    /// structured object target.
+    fn check_expr_branch_inner(&mut self, body: &Expr, expected: &Type) -> Result<TypedExpr, Diagnostic> {
+        match body {
+            Expr::Object(..) | Expr::If { .. } | Expr::Match { .. } | Expr::StringLit(..)
+            | Expr::IntLit(..) | Expr::Array(..) | Expr::Block(..) | Expr::Function { .. } => {
+                // These have bidirectional handling in check_expr that does not spuriously reject
+                // a Json value (objects/literals refine; nested if/match recurse through this same
+                // branch logic via expected_pushes_into_branches).
+                self.check_expr(body, expected)
+            }
+            _ => self.infer_expr(body),
+        }
+    }
+
+    /// Check a `match` expression with the expected type pushed into each arm body.
+    pub(crate) fn check_match(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        expected: &Type,
+        span: Span,
+    ) -> Result<TypedExpr, Diagnostic> {
+        let typed_scrutinee = self.infer_expr(scrutinee)?;
+        let scrutinee_ty = typed_scrutinee.ty();
+        let scrutinee_name = if let Expr::Ident(name, _) = scrutinee {
+            Some(name.as_str())
+        } else {
+            None
+        };
+        let mut typed_arms = Vec::new();
+        let mut arm_types = Vec::new();
+        for arm in arms {
+            let typed_arm = self.check_match_arm_against(arm, &scrutinee_ty, scrutinee_name, expected)?;
+            arm_types.push(typed_arm.body.ty());
+            typed_arms.push(typed_arm);
+        }
+        let result_type = if arm_types.is_empty() { Type::Never } else { unify_types(&arm_types) };
+
+        let exhaustiveness_diags =
+            crate::exhaustiveness::check_exhaustiveness(&scrutinee_ty, &typed_arms, span);
+        for d in exhaustiveness_diags {
+            self.diagnostics.push(d);
+        }
+
+        Ok(TypedExpr::Match { scrutinee: Box::new(typed_scrutinee), arms: typed_arms, result_type, span })
+    }
+
     pub(crate) fn infer_match(&mut self, scrutinee: &Expr, arms: &[MatchArm], span: Span) -> Result<TypedExpr, Diagnostic> {
         let typed_scrutinee = self.infer_expr(scrutinee)?;
         let scrutinee_ty = typed_scrutinee.ty();
@@ -418,7 +509,7 @@ impl Checker {
         Ok(TypedExpr::MakeObject { fields: typed_fields, spreads, ty: Type::Object(obj_type), span })
     }
 
-    /// Bidirectional refinement for an object literal against an expected type (ADR-053).
+    /// Bidirectional refinement for an object literal against an expected type (ADR-051).
     ///
     /// Returns `Ok(Some(_))` when it produced a refined typed object; `Ok(None)` to defer to
     /// ordinary inference (e.g. the expected type is not object-shaped, or the literal contains
@@ -644,8 +735,25 @@ impl Checker {
 }
 
 /// True if `ty` contains a `StrLit` singleton anywhere in its structure. Used to scope the
-/// bidirectional literal refinement (ADR-053) so the if/block expected-type propagation only
+/// bidirectional literal refinement (ADR-051) so the if/block expected-type propagation only
 /// fires for literal-typed targets, leaving all other inference behaviour unchanged.
+/// True when the expected type is one we want pushed into `if`/`match` branch bodies for
+/// bidirectional checking: a structured object, a named (alias) type, a union, or anything that
+/// mentions a `StrLit` singleton (ADR-051). Plain scalars / arrays / iterators / `Json` keep the
+/// old inference-then-unify path (pushing into them buys nothing and risks behaviour changes).
+pub(crate) fn expected_pushes_into_branches(ty: &Type) -> bool {
+    match ty {
+        Type::Object(_) | Type::Named(_) | Type::Union(_) => true,
+        _ => type_mentions_strlit(ty),
+    }
+}
+
+/// True if `ty` is the dynamic/top `Json` type (`TypeVar(u32::MAX)`). A value of this type is
+/// accept-any in checked branch/arm position (see `check_branch_against`).
+pub(crate) fn is_json_dynamic(ty: &Type) -> bool {
+    matches!(ty, Type::TypeVar(n) if *n == u32::MAX)
+}
+
 pub(crate) fn type_mentions_strlit(ty: &Type) -> bool {
     match ty {
         Type::StrLit(_) => true,

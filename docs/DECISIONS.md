@@ -460,7 +460,7 @@ This ADR records three load-bearing semantic choices and their trade-offs:
 
 **Rationale**: A bare tag check made `is <ObjectType>` unsound. `is Person` matched *any* object — including a `fromJson` decode error `{ "type": "error", ... }` or an arbitrary `{ "foo": "bar" }`. Because the matched arm then statically **narrows** the binding to `Person`, a subsequent `x["name"]` is typed `String` and compiled through the non-null-safe field path; on an object actually lacking `name`, `lin_object_get` returns null and string interpolation null-derefs (`lin_string_concat`), crashing. The narrowing was a lie the runtime did not enforce. Mirroring `is { .. }` / `has` field-presence checking closes the hole with the existing `HasPattern` → `lin_value_has_field` machinery — no new instruction, no new runtime primitive.
 
-**Consequence**: This **supersedes the ADR-049 arm-ordering rule**: `is Person` no longer matches an `Error` object (an `Error` has `type`/`message`, not `name`/`age`), so `match | is Person => .. | is Error => ..` is now sound in either order. Checking is **field-presence only**, not recursive field-*type* validation: `is Person` on `{ "name": 1, "age": "x" }` (both keys present, wrong value types) still matches — full structural+type validation is what `fromJson` (ADR-049) is for. This keeps `is` cheap (one `lin_value_has_field` per required key) and consistent with `has`/`is { .. }`, which are also presence checks. Width subtyping is preserved: extra fields on `x` don't prevent a match. Verified: a real `Person` matches; an object missing a required field does not; the former decode-failure crash is gone; full suite green (278 integration + 6 + 33 + 7 + 24).
+**Consequence**: This **supersedes the ADR-049 arm-ordering rule**: `is Person` no longer matches an `Error` object (an `Error` has `type`/`message`, not `name`/`age`), so `match | is Person => .. | is Error => ..` is now sound in either order. ~~Checking is **field-presence only**, not recursive field-*type* validation: `is Person` on `{ "name": 1, "age": "x" }` (both keys present, wrong value types) still matches~~ **(SUPERSEDED by ADR-053: `is <ObjectType>` now deep-validates field TYPES recursively, so a presence-only-but-wrong-type object no longer matches; see ADR-053 for the why and how — this ADR's presence-rejection is subsumed by the deeper check).** This keeps `is` cheap (one `lin_value_has_field` per required key) and consistent with `has`/`is { .. }`, which are also presence checks. Width subtyping is preserved: extra fields on `x` don't prevent a match. Verified: a real `Person` matches; an object missing a required field does not; the former decode-failure crash is gone; full suite green (278 integration + 6 + 33 + 7 + 24).
 
 ## ADR-051: Singleton string-literal types
 
@@ -609,8 +609,75 @@ it is still *"Unknown type"* (verified by `test_imported_type_unknown_without_im
 the web-server example now does `import { HttpRequest as Request, HttpResponse as Response } from
 "std/http"` (its local `Request`/`Response` aliases deleted); full suite green; imported types
 round-trip through both cold and warm module caches.
+## ADR-054: `is <ObjectType>` deep type validation
 
-## ADR-053: Closures OWN their captures (retain on capture, release on free)
+**Decision**: `x is <Name>` (where `Name` resolves to a non-empty object type, e.g.
+`Person = { "name": String, "age": Int32 }`) validates field **types recursively** at runtime, not
+merely that the fields are present (ADR-050). The match succeeds only when `x` genuinely conforms to
+the target type — so the binding narrowing the matched arm performs is **sound**. The deep walk is
+the *same* operation as `fromJson`'s structural validator (ADR-049): it is **reused, not
+duplicated**. A new runtime entry point `lin_matches_schema(value, descriptor) -> u8` runs the
+existing `validate` walker (`lin-runtime/src/decode.rs`) and returns a bool (`{ let d = Desc { base:
+desc }; let mut p = String::new(); validate(value, &d, 0, &mut p).is_ok() as u8 }`); the mismatch
+error string is discarded on the cold path. This inherits fromJson's number policy verbatim
+(`KIND_INT` integral + width/sign range, `KIND_FLOAT` any number, `KIND_STRLIT` exact value,
+`KIND_OBJECT` recursive, `KIND_ARRAY`/`KIND_FIXED`/`KIND_UNION` as in ADR-049) — exactly the
+consistent, sound semantics wanted.
+
+**This reverses ADR-050's presence-only note.** ADR-050 left it explicit that `is Person` on
+`{ "name": 1, "age": "x" }` (keys present, wrong value types) still matched, deferring full
+type validation to `fromJson`. That residual unsoundness is what this ADR closes: such a value now
+falls through, so a subsequent `x["age"] + 1` never operates on a string. ADR-050's presence
+rejection is *subsumed* — a missing field still fails (the `KIND_OBJECT` walk reports the missing
+required field), and now a present-but-wrong-typed field fails too.
+
+**Wiring** (mirrors `Intrinsic::FromJson { target, named_defs }`):
+- **Checker** (`checker/pattern.rs`): `check_pattern` for `Pattern::TypeName` whose resolved type is
+  a non-empty `Type::Object` now produces a **new typed-pattern variant**
+  `TypedPattern::TypeCheckDeep(Type, Vec<(String, Type)>, Span)` carrying the object type plus the
+  resolved bodies of every reachable `Named` type (via the existing `collect_named_defs` helper,
+  promoted to `pub(crate)`) so IR lowering — which has no type environment — can build the
+  (possibly recursive) schema descriptor. Plain primitives, unions, and non-object named types keep
+  the bare `TypeCheck` (and its `IsType` tag check); `is Error` keeps its value-constrained object
+  pattern (`error_discriminant_pattern`); empty object types `{}` keep `TypeCheck` (bare tag check).
+- **A new variant, not a field on `TypeCheck`, was chosen.** `TypeCheck(Type, Span)` is matched in
+  ~8 places; adding a field touches all of them invasively. The variant localizes the change: the
+  sites that needed updating just treat `TypeCheckDeep` like `TypeCheck` — narrowing
+  (`checker/pattern.rs`, narrow to the carried `Type`), zonking (`zonk.rs`, zonk the `Type` and the
+  `named_defs` bodies), exhaustiveness (`exhaustiveness.rs`, count it as covering its variant),
+  and the IR pattern helpers `pattern_type_check` / `pattern_elem_type` / the no-binding arm in
+  `lower.rs`. Only the two `is <ObjectType>` emit sites diverge.
+- **IR** (`lin-ir/src/ir.rs`, `lower.rs`, `liveness.rs`): a new instruction `MatchesSchema { dst,
+  val, target, named_defs }` (payload mirrors `FromJson`). The two former `is <ObjectType>` sites —
+  the standalone `TypedExpr::Is` arm and `lower_match_pattern`'s
+  `Is(TypeCheckDeep(..))` — now emit `MatchesSchema` instead of `HasPattern`. `val` is the
+  already-boxed-to-Json scrutinee, exactly as the `HasPattern` path boxed it (`box_to_json`);
+  liveness treats it as `(uses val, defs dst)`.
+- **Codegen** (`codegen/match.rs`, `mod.rs`): `MatchesSchema` reuses `emit_from_json_descriptor`
+  (promoted to `pub(crate)`) to emit the same static descriptor global the `FromJson` path builds,
+  then calls `lin_matches_schema(val, desc)` and truncates the returned `i8` to a bool. Branchless,
+  single basic block — composes inside match-arm test blocks like `compile_ir_has_pattern`.
+
+**RC/memory**: `lin_matches_schema` **borrows** `value` (no clone, no release) and reads a static
+const descriptor — no ownership change, low risk. The input value temp's ownership is unchanged from
+the `HasPattern` path; the `box_to_json` boxing is still done before `MatchesSchema`.
+
+**Unchanged behavior** (verified): `has { .. }` and inline `is { .. }` object patterns stay
+presence + value-constraint (`lower_object_pattern_test`); `is Error` stays the value-constrained
+object pattern and still discriminates a decode failure from a decoded value in either arm order;
+empty object types `{}` keep the bare tag check; all `fromJson`, async/await `Error`, and
+literal-type/union tests stay green.
+
+**Consequence**: `is <ObjectType>` narrowing is now sound — the runtime enforces what the type
+narrowing claims. Recursive types (`type Tree = { "value": Int32, "children": Tree[] }`) terminate
+because `collect_named_defs` is bounded by a `seen` set and the descriptor encoder memoises Named
+nodes as finite back-edges. Number policy is consistent with `fromJson`: `is { "n": Int32 }` rejects
+`3.14` (non-integral) and accepts `5.0` (integral). Verified end-to-end via `lin build`: deep
+rejection of a wrong (incl. nested) field type, a valid value matching with sound narrowed field
+access (`v["age"] + 1` = correct number), `is Error` still discriminating, and recursive `Tree`
+validation. Full suite green (302 integration + 6 + 33 + 29 + 7; 42 stdlib/examples test files).
+
+## ADR-055: Closures OWN their captures (retain on capture, release on free)
 
 **Decision**: A closure's environment now OWNS one reference per heap/union capture — the same ownership rule arrays and objects already follow for stored elements. At `MakeClosure` the lowerer takes ownership of each capturing value (concrete rc → `Retain` in place; union/`Json` → `CloneBox` so the env holds its own `TaggedVal*`); `lin_closure_release` releases them when the closure is freed. Mutably-captured `var` bindings are unchanged: they store the heap **cell pointer** (shared by reference, ADR-015) and keep their existing borrow-only / `FreeCell` / escaping-cell lifecycle — the env does not own the cell. Scalars need no ownership.
 

@@ -53,6 +53,15 @@ pub struct Checker {
     /// wrappers forward `Json` handles into concrete intrinsic/foreign params by design.
     /// User modules check with `false`, so `val p: Person = readJson(...)` is a type error.
     pub lenient_json: bool,
+    /// Phase 0 monomorphized generics: maps a generic function's binding name to the
+    /// (type-param name → quantified TypeVar id) assignment chosen during forward declaration.
+    /// `infer_function` reuses the SAME ids so the forward-declared signature (used by call-site
+    /// inference) and the body's parameter types agree. The ids live in the ≥9000 range so they
+    /// behave like intrinsic generic slots: never globally solved, instantiated per call site via
+    /// a local subs map (`collect_and_save_subs` skips ≥9000).
+    generic_fn_params: std::collections::HashMap<String, Vec<(String, u32)>>,
+    /// Next free quantified-generic TypeVar id (≥9000, above the intrinsic slot 9000).
+    next_generic_tv: u32,
 }
 
 impl Default for Checker {
@@ -79,6 +88,10 @@ impl Checker {
             protected_type_vars: std::collections::HashSet::new(),
             mutable_global_slots: std::collections::HashMap::new(),
             lenient_json: false,
+            generic_fn_params: std::collections::HashMap::new(),
+            // Start above the intrinsic generic slot (9000) so quantified generics never
+            // collide with `lin_map`/`lin_iter` et al.
+            next_generic_tv: 9001,
         }
     }
 
@@ -214,24 +227,46 @@ impl Checker {
     fn forward_declare_functions(&mut self, module: &Module) {
         for stmt in &module.statements {
             if let Stmt::Val { pattern, value, .. } = stmt {
-                if let Expr::Function { params, return_type, .. } = value {
+                if let Expr::Function { type_params, params, return_type, .. } = value {
                     let name = match pattern {
                         lin_parse::ast::Pattern::Ident(n, _) => Some(n.clone()),
                         _ => None,
                     };
                     if let Some(name) = name {
+                        // Generic function: allocate one quantified TypeVar (≥9000) per type
+                        // param and resolve the signature in a scratch env binding each param to
+                        // that TypeVar. The SAME id assignment is recorded in `generic_fn_params`
+                        // and reused by `infer_function`, so the forward-declared signature (driving
+                        // call-site inference) and the lowered body's param types are consistent.
+                        let (env_for_resolve, param_assign) = if type_params.is_empty() {
+                            (self.env.clone(), Vec::new())
+                        } else {
+                            let mut assign = Vec::new();
+                            let mut scratch = self.env.clone();
+                            for tp in type_params {
+                                let id = self.next_generic_tv;
+                                self.next_generic_tv += 1;
+                                assign.push((tp.clone(), id));
+                                scratch.define_type(tp.clone(), Vec::new(), Type::TypeVar(id));
+                            }
+                            (scratch, assign)
+                        };
+                        if !param_assign.is_empty() {
+                            self.generic_fn_params.insert(name.clone(), param_assign);
+                        }
+
                         let param_types: Vec<Type> = params
                             .iter()
                             .map(|p| {
                                 p.type_ann
                                     .as_ref()
-                                    .and_then(|t| resolve_type(t, &self.env).ok())
+                                    .and_then(|t| resolve_type(t, &env_for_resolve).ok())
                                     .unwrap_or(Type::TypeVar(self.env.next_slot() as u32))
                             })
                             .collect();
                         let ret_type = return_type
                             .as_ref()
-                            .and_then(|t| resolve_type(t, &self.env).ok())
+                            .and_then(|t| resolve_type(t, &env_for_resolve).ok())
                             .unwrap_or(Type::TypeVar(self.env.next_slot() as u32));
                         let required = params.iter().filter(|p| p.default.is_none()).count();
                         let fn_type = Type::Function {

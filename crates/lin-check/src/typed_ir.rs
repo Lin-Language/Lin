@@ -91,7 +91,7 @@ pub enum TypedExpr {
     IntLit(i64, Type, Span),
     FloatLit(f64, Type, Span),
     /// A string literal. The `Type` is normally `Str`, but bidirectional refinement
-    /// (ADR-053) may narrow it to a `StrLit` singleton when checked against an expected
+    /// (ADR-051) may narrow it to a `StrLit` singleton when checked against an expected
     /// literal type. The runtime representation is identical either way.
     StringLit(String, Type, Span),
     BoolLit(bool, Span),
@@ -327,6 +327,13 @@ pub enum TypedMatchPattern {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TypedPattern {
     TypeCheck(Type, Span),
+    /// `is <Name>` where the resolved type is a non-empty object (ADR-054). Behaves exactly
+    /// like `TypeCheck(ty, span)` for narrowing/zonking/exhaustiveness, but lowers to a
+    /// `MatchesSchema` deep type-validation instead of a bare tag/presence check. Carries the
+    /// resolved bodies of every reachable `Named` type (`named_defs`) so IR lowering — which
+    /// has no type environment — can build the recursive schema descriptor (mirrors
+    /// `TypedExpr::FromJson`'s payload).
+    TypeCheckDeep(Type, Vec<(String, Type)>, Span),
     Literal(Box<TypedExpr>),
     Object {
         fields: Vec<TypedPatternField>,

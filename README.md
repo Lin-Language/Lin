@@ -3,8 +3,20 @@
 A small, expression-based programming language built around JSON data, structural typing, pattern matching, and functional-style pipelines.
 
 ```lin
-val greet = (name: String): String => "Hello, ${name}!"
-print(greet("world"))
+import { print } from "std/io"
+import { filter, map, for } from "std/array"
+import { toString } from "std/string"
+
+val players = [
+  { "name": "Alice", "score": 42 },
+  { "name": "Bob",   "score": 17 },
+  { "name": "Carol", "score": 91 }
+]
+
+players
+  .filter(p => p["score"] >= 20)
+  .map(p => "${p["name"]}: ${toString(p["score"])}")
+  .for(line => print(line))
 ```
 
 - Everything is an expression
@@ -16,23 +28,31 @@ print(greet("world"))
 
 ---
 
-## Installation
+macOS (Apple Silicon) and Linux (x86_64):
 
-Download the latest binary for your platform and put it on your `$PATH`:
-
-**macOS (Apple Silicon)**
 ```bash
-curl -L https://github.com/linusnorton/lin-lang/releases/download/latest/lin-macos-arm64.tar.gz \
-  | tar -xz -C /usr/local/bin
+curl -fsSL https://raw.githubusercontent.com/Lin-Language/Lin/master/install.sh | sh
 ```
 
-**Linux (x86_64)**
+The script detects your platform, downloads the matching release, and installs
+the `lin` compiler, the `lin-lsp` language server, and `liblin_runtime.a` (the
+runtime linked into every program you build) into `/usr/local/lib/lin`, with a
+`lin` symlink on your `$PATH`. It uses `sudo` only for the directories that need
+it. To install somewhere you own without `sudo`, set the target directories:
+
 ```bash
-curl -L https://github.com/linusnorton/lin-lang/releases/download/latest/lin-linux-x86_64.tar.gz \
-  | tar -xz -C /usr/local/bin
+curl -fsSL https://raw.githubusercontent.com/Lin-Language/Lin/master/install.sh \
+  | LIN_LIB_DIR="$HOME/.local/lib/lin" LIN_BIN_DIR="$HOME/.local/bin" sh
 ```
 
-The binary is self-contained — no LLVM installation required. A C linker (`cc`) must be on your `$PATH` to link compiled programs; on macOS this comes with Xcode Command Line Tools, on Linux install `gcc` or `clang`.
+The binary is self-contained — no LLVM installation required. A C linker (`cc`)
+must be on your `$PATH` to link compiled programs; on macOS this comes with
+Xcode Command Line Tools, on Linux install `gcc` or `clang`.
+
+Prefer to do it by hand, or on another platform? Grab a tarball from the
+[latest release](https://github.com/Lin-Language/Lin/releases/tag/latest),
+extract its three files into one directory, and put that directory on your
+`$PATH`.
 
 **Verify**
 ```bash
@@ -43,7 +63,7 @@ lin --version
 
 ## VS Code Extension
 
-Download `lin-lang.vsix` from the [latest release](https://github.com/linusnorton/lin-lang/releases/tag/latest) and install it:
+Download `lin-lang.vsix` from the [latest release](https://github.com/Lin-Language/Lin/releases/tag/latest) and install it:
 
 ```bash
 code --install-extension lin-lang.vsix
@@ -59,6 +79,14 @@ The extension includes:
 - **Lin: Build / Run / Test** commands — open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and search for "Lin" to compile, run, or test the active file without leaving the editor.
 
 The extension bundles the `lin` compiler and `lin-lsp` language server — no separate installation required.
+
+**`lin` on your PATH, no curl needed.** When the extension is active, the
+bundled `lin` is automatically added to the PATH of VS Code's integrated
+terminal — open a terminal and `lin run foo.lin` just works. To use `lin` in
+**any** shell (outside VS Code too), run the **Lin: Install `lin` on PATH**
+command from the palette: it symlinks the bundled compiler into `~/.local/bin`.
+Both always point at the version shipped with the installed extension, and the
+integrated-terminal entry is removed automatically when you uninstall.
 
 ---
 
@@ -397,7 +425,7 @@ The C header `crates/lin-runtime/lin.h` defines `LinString` and `LinArray` for p
 **Prerequisites:** Rust toolchain, LLVM 22 (`llvm-22-dev`, `libpolly-22-dev`), a C linker.
 
 ```bash
-git clone https://github.com/linusnorton/lin-lang
+git clone https://github.com/Lin-Language/Lin
 cd lin-lang
 cargo build --release -p lin
 # binary is at target/release/lin

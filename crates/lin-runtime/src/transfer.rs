@@ -13,7 +13,7 @@
 //!     mutated or freed). `Shared`/`Frozen` boxes (Phases 6-7) will be shared by
 //!     atomic-refcount bump, not copied through — handled when those types land.
 //!   * `transfer_clone_env(env_ptr, desc)` — deep-copies a closure's env allocation using the
-//!     codegen-emitted capture descriptor (passed in from the closure's offset-40 slot, ADR-053)
+//!     codegen-emitted capture descriptor (passed in from the closure's offset-40 slot, ADR-055)
 //!     recording each slot's kind.
 
 use crate::tagged::{TaggedVal, TAG_STR, TAG_ARRAY, TAG_OBJECT};
@@ -128,7 +128,7 @@ pub unsafe extern "C" fn lin_transfer_clone(p: *const u8) -> *mut u8 {
 // Capture descriptor kind codes (one byte per captured env slot, env slot `i` at byte offset
 // `8 + i*8`). These mirror `lin_ir::ir::CaptureRelease::code()` — the SAME descriptor drives
 // both closure-release and this thread-transfer path. The descriptor pointer lives in the
-// CLOSURE at offset 40 (ADR-053); the async caller passes it in explicitly.
+// CLOSURE at X; the async caller passes it in explicitly.
 pub const CAP_NONE: u8 = 0; // scalar (copy verbatim) or a borrowed var-cell pointer
 pub const CAP_STR: u8 = 1; // *mut LinString
 pub const CAP_ARRAY: u8 = 2; // *mut LinArray

@@ -132,7 +132,7 @@ pub enum Intrinsic {
     },
 }
 
-/// How a closure env releases one captured slot when the closure is freed (ADR-053: owning
+/// How a closure env releases one captured slot when the closure is freed (ADR-055: owning
 /// captures). The env owns one reference per owning capture; `lin_closure_release` walks the
 /// emitted capture descriptor and applies the matching release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,6 +331,18 @@ pub enum Instruction {
     IsType { dst: Temp, val: Temp, ty: Type },
     /// result = val has pattern? (returns bool)
     HasPattern { dst: Temp, val: Temp, pattern: HasDesc },
+    /// result = `val` deeply conforms to `target`? (returns bool) — `is <ObjectType>` deep
+    /// type validation (ADR-054). Reuses the `fromJson` structural walker via
+    /// `lin_matches_schema(value, descriptor)`: codegen emits the same schema descriptor it
+    /// builds for `Intrinsic::FromJson` (from `target` + the resolved `named_defs` bodies of
+    /// reachable Named types) and calls the runtime to recursively validate field TYPES, not
+    /// just presence. `val` is a boxed `TaggedVal*` (borrowed, no ownership change).
+    MatchesSchema {
+        dst: Temp,
+        val: Temp,
+        target: Type,
+        named_defs: Vec<(String, Type)>,
+    },
     /// result = box(val, ty) — wrap a scalar as a tagged union value
     Box { dst: Temp, val: Temp, ty: Type },
     /// result = unbox(val, ty) — extract scalar from tagged union

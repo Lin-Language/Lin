@@ -1905,7 +1905,7 @@ print(toString(add5(10)))
 
 #[test]
 fn test_map_returns_capturing_closures() {
-    // Regression (ADR-053 owning captures): a `map` callback that RETURNS a closure capturing
+    // Regression (ADR-055 owning captures): a `map` callback that RETURNS a closure capturing
     // the callback parameter. The returned thunks ESCAPE into the result array; each must own
     // its captured value (the element box), not borrow a per-iteration box that is freed and
     // reused. Before the owning-capture fix, calling a thunk returned garbage (`[[object]…]`)
@@ -5576,7 +5576,104 @@ main()
     assert_eq!(out, vec!["ok:Ada", "err"]);
 }
 
-// ── singleton string-literal types (ADR-053) ──────────────────────────────────
+// ── `is <ObjectType>` deep type validation (ADR-054) ──────────────────────────
+
+#[test]
+fn test_is_objecttype_deep_rejects_wrong_field_type() {
+    // ADR-053: `is Person` deep-validates field TYPES, not just presence (ADR-050). A Json value
+    // whose `age` is a string (both keys present, WRONG type) must NOT match Person, so the arm
+    // falls through to `else` instead of narrowing and operating on the wrong runtime type.
+    let out = run(r#"import { print } from "std/io"
+type Person = { "name": String, "age": Int32 }
+type Box = { "data": Json }
+val main = (): Null =>
+  val bad: Box = { "data": { "name": "ok", "age": "not-an-int" } }
+  val v: Json = bad["data"]
+  print(if v is Person then "WRONG-MATCH" else "rejected")
+  val good: Box = { "data": { "name": "ok", "age": 5 } }
+  val w: Json = good["data"]
+  print(if w is Person then "matched" else "WRONG-NO-MATCH")
+main()
+"#);
+    assert_eq!(out, vec!["rejected", "matched"]);
+}
+
+#[test]
+fn test_is_objecttype_deep_nested() {
+    // ADR-053: deep validation recurses into NESTED object fields. A wrong type in a nested field
+    // (zip as a string) is rejected; a correct nested value matches.
+    let out = run(r#"import { print } from "std/io"
+type T = { "addr": { "zip": Int32 } }
+type Box = { "data": Json }
+val main = (): Null =>
+  val bad: Box = { "data": { "addr": { "zip": "oops" } } }
+  val v: Json = bad["data"]
+  print(if v is T then "WRONG" else "nested-rejected")
+  val good: Box = { "data": { "addr": { "zip": 90210 } } }
+  val w: Json = good["data"]
+  print(if w is T then "nested-matched" else "WRONG")
+main()
+"#);
+    assert_eq!(out, vec!["nested-rejected", "nested-matched"]);
+}
+
+#[test]
+fn test_is_objecttype_deep_accepts_valid_and_narrows() {
+    // ADR-053: a fully well-typed value matches AND the narrowed field access is sound — `v["age"]`
+    // is a real Int32, so `v["age"] + 1` produces a correct number (the unsoundness ADR-050's note
+    // left open is closed).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Person = { "name": String, "age": Int32 }
+type Box = { "data": Json }
+val main = (): Null =>
+  val b: Box = { "data": { "name": "Ada", "age": 36 } }
+  val v: Json = b["data"]
+  if v is Person then print("age+1=${toString(v["age"] + 1)}") else print("no")
+main()
+"#);
+    assert_eq!(out, vec!["age+1=37"]);
+}
+
+#[test]
+fn test_is_objecttype_deep_number_policy() {
+    // ADR-053 inherits fromJson's number policy: a non-integral number fails an Int target;
+    // an integral float (5.0) satisfies it.
+    let out = run(r#"import { print } from "std/io"
+type N = { "n": Int32 }
+type Box = { "data": Json }
+val main = (): Null =>
+  val frac: Box = { "data": { "n": 3.14 } }
+  val v: Json = frac["data"]
+  print(if v is N then "WRONG-frac" else "frac-rejected")
+  val whole: Box = { "data": { "n": 5.0 } }
+  val w: Json = whole["data"]
+  print(if w is N then "integral-matched" else "WRONG-int")
+main()
+"#);
+    assert_eq!(out, vec!["frac-rejected", "integral-matched"]);
+}
+
+#[test]
+fn test_is_error_still_discriminates_after_deep() {
+    // ADR-053 regression: `is Error` (a value-constrained object pattern, NOT TypeCheckDeep) is
+    // untouched and still discriminates a decode failure from a decoded value, in either arm order.
+    let out = run(r#"import { print } from "std/io"
+import { fromJson } from "std/json"
+type Person = { "name": String, "age": Int32 }
+val describe = (r: Person | Error): Null =>
+  match r
+    is Error => print("err")
+    is Person => print("ok:${r["name"]}")
+val main = (): Null =>
+  describe(Person.fromJson({ "name": "Ada", "age": 36 }))
+  describe(Person.fromJson({ "name": "Bob", "age": "old" }))
+main()
+"#);
+    assert_eq!(out, vec!["ok:Ada", "err"]);
+}
+
+// ── singleton string-literal types (ADR-051) ──────────────────────────────────
 
 #[test]
 fn test_literal_type_good_assignment() {
@@ -5690,6 +5787,41 @@ print(showB(b))
 }
 
 #[test]
+fn test_match_json_arm_plus_object_arm_against_declared_object_return() {
+    // Regression: the match-arm-union-vs-declared-object bug. A handler declared to return a named
+    // object type `R`, whose `match` has one arm yielding a `Json` value and another yielding a
+    // concrete object literal, previously formed `Json | {concrete}` and rejected it against `R`.
+    // Each arm is now checked against `R` directly (bidirectional push). Both arms must produce a
+    // value indexable as `R` at runtime.
+    let out = run(r#"import { print } from "std/io"
+type R = { "status": Int32, "headers": Json, "body": String }
+val other = (): Json => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
+val handle = (b: Boolean): R =>
+  match b
+    is true => other()
+    else => { "status": 404, "headers": { "a": 1 }, "body": "no" }
+print(handle(true)["body"])
+print(handle(false)["body"])
+print("status ${handle(true)["status"]}")
+"#);
+    assert_eq!(out, vec!["ok", "no", "status 200"]);
+}
+
+#[test]
+fn test_if_json_arm_plus_object_arm_against_declared_object_return() {
+    // Same bug, `if` form: `if cond then jsonValue else objectLiteral` declared `: R`.
+    let out = run(r#"import { print } from "std/io"
+type R = { "status": Int32, "headers": Json, "body": String }
+val other = (): Json => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
+val handle = (b: Boolean): R =>
+  if b then other() else { "status": 404, "headers": { "a": 1 }, "body": "no" }
+print(handle(true)["body"])
+print(handle(false)["body"])
+"#);
+    assert_eq!(out, vec!["ok", "no"]);
+}
+
+#[test]
 fn test_multiline_union_leading_pipe() {
     // The spec §18 canonical form: a multi-line tagged union with a leading `|` on each
     // variant in a `type` alias. Previously failed to parse ("unexpected token Pipe")
@@ -5792,4 +5924,84 @@ match r
   else => print("ok ${r["name"]}")
 "#);
     assert_eq!(out, vec!["ok anything goes"]);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 0: monomorphized generic functions (single-module `identity<T>`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_generic_identity_int_and_string() {
+    // The canonical Phase-0 slice: one generic `val` function instantiated at two types
+    // in the same module. T=Int32 must run native (no boxing — see the IR-proof test below).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val identity = <T>(x: T): T => x
+print(toString(identity(5)))
+print(identity("hello"))
+"#);
+    assert_eq!(out, vec!["5", "hello"]);
+}
+
+#[test]
+fn test_generic_identity_three_types_and_reuse() {
+    // Generic over a third type (Bool), plus the SAME type used twice (Int32) to exercise
+    // specialization de-duplication.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val identity = <T>(x: T): T => x
+print(toString(identity(5)))
+print(toString(identity(42)))
+print(identity("hello"))
+print(toString(identity(true)))
+"#);
+    assert_eq!(out, vec!["5", "42", "hello", "true"]);
+}
+
+#[test]
+fn test_generic_identity_int_specialization_is_unboxed() {
+    // IR proof: the T=Int32 specialization must pass/return a native i32 with NO
+    // lin_box_int32/lin_unbox_int32 around the identity call or inside its body.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_gen_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_gen_{}", id));
+    let ll_path = bin_path.with_extension("ll");
+
+    fs::write(&src_path, r#"import { print } from "std/io"
+import { toString } from "std/string"
+val identity = <T>(x: T): T => x
+print(toString(identity(5)))
+print(identity("hello"))
+"#).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_EMIT_IR", "1")
+        .env("LIN_NO_OPT", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+
+    let ll = fs::read_to_string(&ll_path).expect("LLVM IR not emitted");
+    let _ = fs::remove_file(&bin_path);
+    let _ = fs::remove_file(&ll_path);
+
+    // The specialization exists, takes and returns native i32.
+    assert!(ll.contains("define i32 @\"identity$Int32\"(i32"),
+        "expected an unboxed i32 specialization, IR:\n{}", ll);
+    // The call site passes a native i32 directly (no boxing of the argument).
+    assert!(ll.contains("call i32 @\"identity$Int32\"(i32 5)"),
+        "expected a native-i32 call to the Int32 specialization, IR:\n{}", ll);
+
+    // No box/unbox appears inside the identity$Int32 body. Slice out its definition and check.
+    let body_start = ll.find("define i32 @\"identity$Int32\"").unwrap();
+    let body = &ll[body_start..];
+    let body_end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
+    let body = &body[..body_end];
+    assert!(!body.contains("lin_box_int32") && !body.contains("lin_unbox_int32"),
+        "identity$Int32 body must contain no int boxing, got:\n{}", body);
 }

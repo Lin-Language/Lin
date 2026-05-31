@@ -80,7 +80,7 @@ impl Checker {
     /// Walk `ty` collecting, for each `Type::Named(n)` reachable, the resolved body of `n` (from
     /// the type environment) into `out` (deduplicated). Recurses into each collected body so
     /// mutually-recursive named types are all captured. Recursion is bounded by `seen`.
-    fn collect_named_defs(
+    pub(crate) fn collect_named_defs(
         &self,
         ty: &Type,
         seen: &mut std::collections::HashSet<String>,

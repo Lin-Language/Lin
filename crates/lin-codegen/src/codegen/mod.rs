@@ -1202,7 +1202,7 @@ impl<'ctx> Codegen<'ctx> {
                                         .iter()
                                         .filter_map(|c| temp_map.get(c).copied())
                                         .collect();
-                                    // Per-capture release kinds (ADR-053 owning captures). The env
+                                    // Per-capture release kinds (ADR-055 owning captures). The env
                                     // OWNS one reference per owning capture, so the capture
                                     // descriptor is ALWAYS emitted: `lin_closure_release` walks it
                                     // to release heap captures on free, and the async transfer path
@@ -1446,6 +1446,12 @@ impl<'ctx> Codegen<'ctx> {
                         Instruction::HasPattern { dst, val, pattern } => {
                             if let Some(&v) = temp_map.get(val) {
                                 let result = self.compile_ir_has_pattern(v, pattern);
+                                temp_map.insert(*dst, result.into());
+                            }
+                        }
+                        Instruction::MatchesSchema { dst, val, target, named_defs } => {
+                            if let Some(&v) = temp_map.get(val) {
+                                let result = self.compile_ir_matches_schema(v, target, named_defs);
                                 temp_map.insert(*dst, result.into());
                             }
                         }

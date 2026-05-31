@@ -407,7 +407,7 @@ impl Parser {
     pub(crate) fn parse_arg_expr(&mut self) -> Expr {
         self.skip_newlines();
         // An argument can be a function expression or a regular expression
-        if self.is_function_start() {
+        if self.is_function_start() || self.is_generic_function_start() {
             return self.parse_function_expr();
         }
         // Check for bare identifier lambda: name => body
@@ -474,6 +474,9 @@ impl Parser {
             TokenKind::LBrace => self.parse_object_expr(),
             TokenKind::LBracket => self.parse_array_expr(),
             TokenKind::LParen => self.parse_paren_or_function(),
+            // Generic function literal `<T, ...>(...) => ...`. A primary expression never
+            // otherwise begins with `<` (comparison `<` is only reached after a left operand).
+            TokenKind::Lt if self.is_generic_function_start() => self.parse_function_expr(),
             TokenKind::If => self.parse_if_expr(),
             TokenKind::Match => self.parse_match_expr(),
             TokenKind::Minus => {

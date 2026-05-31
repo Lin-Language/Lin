@@ -23,6 +23,7 @@ impl Parser {
                 self.skip_newlines();
                 let body = self.parse_expr_or_block();
                 return Expr::Function {
+                    type_params: Vec::new(),
                     params: Vec::new(),
                     return_type: None,
                     body: Box::new(body),
@@ -129,6 +130,7 @@ impl Parser {
         self.skip_newlines();
         let body = self.parse_function_body();
         Expr::Function {
+            type_params: Vec::new(),
             params: vec![param],
             return_type: None,
             body: Box::new(body),
@@ -223,8 +225,66 @@ impl Parser {
         false
     }
 
+    /// Detects a generic function literal `<T, ...>(...)` at the current position.
+    /// Only matches a `<` immediately followed by an ident-list closed by `>` and then a `(`.
+    /// This is unambiguous in primary/argument position because a bare expression never begins
+    /// with `<`. (Comparison `<` is only ever reached from the binary-operator ladder, after a
+    /// left operand has been parsed — never here.)
+    pub(crate) fn is_generic_function_start(&self) -> bool {
+        if !self.check(TokenKind::Lt) {
+            return false;
+        }
+        let mut i = self.pos + 1;
+        // Require at least one type-param ident.
+        if !matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
+            return false;
+        }
+        loop {
+            // ident
+            if !matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
+                return false;
+            }
+            i += 1;
+            match self.tokens.get(i).map(|t| &t.kind) {
+                Some(TokenKind::Comma) => {
+                    i += 1;
+                    continue;
+                }
+                Some(TokenKind::Gt) => {
+                    i += 1;
+                    break;
+                }
+                _ => return false,
+            }
+        }
+        // After `>` must come `(` to begin the parameter list.
+        matches!(self.tokens.get(i).map(|t| &t.kind), Some(TokenKind::LParen))
+    }
+
+    /// Parse a `<T, ...>` type-parameter list (the leading `<` is at the cursor).
+    fn parse_type_params(&mut self) -> Vec<String> {
+        self.advance(); // <
+        let mut params = Vec::new();
+        loop {
+            params.push(self.expect_ident());
+            if self.check(TokenKind::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        self.expect(TokenKind::Gt);
+        params
+    }
+
     pub(crate) fn parse_function_expr(&mut self) -> Expr {
         let span = self.current_span();
+        // Optional generic type parameters: `<T, ...>(...) => ...`
+        let type_params = if self.check(TokenKind::Lt) {
+            self.parse_type_params()
+        } else {
+            Vec::new()
+        };
         self.advance(); // (
         self.skip_newlines();
         let mut params = Vec::new();
@@ -248,7 +308,7 @@ impl Parser {
         self.expect(TokenKind::Arrow);
         self.skip_newlines();
         let body = self.parse_function_body();
-        Expr::Function { params, return_type, body: Box::new(body), span }
+        Expr::Function { type_params, params, return_type, body: Box::new(body), span }
     }
 
     pub(crate) fn parse_param(&mut self) -> Param {

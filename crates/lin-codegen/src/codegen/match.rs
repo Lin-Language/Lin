@@ -40,6 +40,38 @@ impl<'ctx> Codegen<'ctx> {
         all_present
     }
 
+    /// `is <ObjectType>` deep type validation (ADR-054). Emits the SAME schema descriptor the
+    /// `fromJson` path builds (`emit_from_json_descriptor`) and calls `lin_matches_schema(value,
+    /// descriptor)`, which runs the `fromJson` structural walker and returns an `i8` bool (`1` iff
+    /// `val` recursively conforms to `target`). `val` is a boxed `TaggedVal*`, borrowed (no
+    /// ownership change). Branchless — one runtime call, single basic block — so it composes
+    /// inside match-arm test blocks just like `compile_ir_has_pattern`.
+    pub(crate) fn compile_ir_matches_schema(
+        &mut self,
+        val: BasicValueEnum<'ctx>,
+        target: &Type,
+        named_defs: &[(String, Type)],
+    ) -> inkwell::values::IntValue<'ctx> {
+        let bool_ty = self.context.bool_type();
+        if !val.is_pointer_value() {
+            return bool_ty.const_zero();
+        }
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i8_ty = self.context.i8_type();
+        let desc_ptr = self.emit_from_json_descriptor(target, named_defs);
+        let matches_fn = self.get_or_declare_fn(
+            "lin_matches_schema",
+            i8_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+        );
+        let r_i8 = self
+            .builder
+            .call(matches_fn, &[val.into(), desc_ptr.into()], "ir_matches_schema")
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        self.builder.int_truncate_or_bit_cast(r_i8, bool_ty, "matches_b")
+    }
+
     pub(crate) fn compile_ir_coerce(&mut self, val: BasicValueEnum<'ctx>, from_ty: &Type, to_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         // Numeric widening.

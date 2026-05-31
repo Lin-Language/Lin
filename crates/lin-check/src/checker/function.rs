@@ -7,8 +7,41 @@ use crate::typed_ir::*;
 use crate::types::Type;
 
 impl Checker {
+    /// Bind a generic function's type parameters into the type-decl environment so bare `T`
+    /// annotations resolve to a quantified TypeVar (≥9000). For a named function we reuse the id
+    /// assignment recorded by `forward_declare_functions` (so signature and body agree); for an
+    /// anonymous generic lambda we mint fresh ids. No-op when there are no type params, which
+    /// keeps non-generic functions on their existing code path.
+    ///
+    /// NOTE: `type_decls` is not scope-stacked, so this can shadow an outer alias of the same
+    /// name for the duration of the body. Phase 0 is single-module with a lone `T`; broader
+    /// hygiene (save/restore, nested generics) is deferred to Phase 3.
+    pub(crate) fn bind_type_params(&mut self, type_params: &[String], fn_name: Option<&str>) {
+        if type_params.is_empty() {
+            return;
+        }
+        // Prefer the forward-declared assignment for this binding name.
+        let recorded = fn_name.and_then(|n| self.generic_fn_params.get(n).cloned());
+        match recorded {
+            Some(assign) => {
+                for (name, id) in assign {
+                    self.env.define_type(name, Vec::new(), Type::TypeVar(id));
+                }
+            }
+            None => {
+                // Anonymous generic lambda: allocate fresh quantified ids now.
+                for tp in type_params {
+                    let id = self.next_generic_tv;
+                    self.next_generic_tv += 1;
+                    self.env.define_type(tp.clone(), Vec::new(), Type::TypeVar(id));
+                }
+            }
+        }
+    }
+
     pub(crate) fn infer_function(
         &mut self,
+        type_params: &[String],
         params: &[Param],
         return_type: &Option<lin_parse::ast::TypeExpr>,
         body: &Expr,
@@ -21,6 +54,13 @@ impl Checker {
         self.capture_stack.push(std::collections::HashMap::new());
 
         self.env.push_scope();
+
+        // Bind generic type parameters to their quantified TypeVar ids so that bare `T`
+        // annotations resolve. Reuse the assignment chosen at forward-declaration time (keyed by
+        // the binding name) so the signature and body agree; for an anonymous generic lambda,
+        // mint fresh ids on the fly. These TypeVars live in the ≥9000 range and so are never
+        // globally solved — each call site instantiates them locally (Phase 0 monomorphization).
+        self.bind_type_params(type_params, fn_name);
 
         let mut typed_params = Vec::new();
         // Destructuring stmts for params with non-Ident patterns (e.g. `{ name, age }: Json`).
@@ -114,16 +154,26 @@ impl Checker {
 
         // Resolve the declared return type up front so the body can be CHECKED against it
         // (bidirectional), pushing the expected type into the body. Needed for singleton
-        // string-literal refinement (ADR-053) — see infer_function_with_hints for the rationale.
+        // string-literal refinement (ADR-051) — see infer_function_with_hints for the rationale.
         let declared_ret = match return_type {
             Some(rt) => Some(resolve_type(rt, &self.env).map_err(|e| Diagnostic::error(span, e))?),
             None => None,
         };
-        // Only CHECK the body bidirectionally when the declared return type carries a `StrLit`
-        // singleton (the only case that needs the expected type pushed down for refinement).
-        // Otherwise infer as before, preserving the existing "Function body has type ..." error.
+        // CHECK the body bidirectionally against the declared return type when that type is
+        // structured (an object/named/union, or one mentioning a `StrLit` singleton). This pushes
+        // the expected type into `if`/`match` arms (see `check_branch_against`), which:
+        //   - refines object/string literals against the declared shape (ADR-051), and
+        //   - lets one arm yield a `Json` value while another yields a concrete object literal,
+        //     each checked against the declared return — fixing the match-arm-union-vs-declared-
+        //     object bug (previously the arms were inferred independently, unioned into
+        //     `Json | {concrete}`, and that union rejected against `R`).
+        // `checked_against_declared` records that `check_expr` already enforced compatibility, so
+        // the post-pass `types_compatible(body_ty, declared)` re-check (which would reject the
+        // surviving `Json | {R}` union type) is skipped.
+        let mut checked_against_declared = false;
         let typed_body_raw = match &declared_ret {
-            Some(declared) if super::expr::type_mentions_strlit(declared) => {
+            Some(declared) if super::expr::expected_pushes_into_branches(declared) => {
+                checked_against_declared = true;
                 self.check_expr(body, declared)?
             }
             _ => self.infer_expr(body)?,
@@ -153,7 +203,7 @@ impl Checker {
         captures.sort_by_key(|c| c.outer_slot);
 
         let ret_type = if let Some(declared) = declared_ret {
-            if !self.types_compatible(&body_ty, &declared) {
+            if !checked_against_declared && !self.types_compatible(&body_ty, &declared) {
                 return Err(Diagnostic::error(
                     span,
                     format!(
@@ -181,6 +231,7 @@ impl Checker {
     /// `expected_ret` is the expected return type from the calling context (e.g. TypeVar for f: Function).
     pub(crate) fn infer_function_with_hints(
         &mut self,
+        type_params: &[String],
         params: &[Param],
         return_type: &Option<lin_parse::ast::TypeExpr>,
         body: &Expr,
@@ -194,6 +245,9 @@ impl Checker {
         self.capture_stack.push(std::collections::HashMap::new());
 
         self.env.push_scope();
+
+        // Bind generic type params (see `infer_function` for rationale).
+        self.bind_type_params(type_params, fn_name);
 
         let mut typed_params = Vec::new();
         let mut param_destr_stmts: Vec<TypedStmt> = Vec::new();
@@ -276,15 +330,19 @@ impl Checker {
 
         // Resolve the declared return type up front so the body can be CHECKED against it
         // (bidirectional). This pushes the expected type into the body — needed for singleton
-        // string-literal refinement (ADR-053): a `{ "type": "success", .. }` literal in the
+        // string-literal refinement (ADR-051): a `{ "type": "success", .. }` literal in the
         // body narrows its discriminant to the expected `StrLit` variant. Falls back to plain
         // inference when there is no annotation.
         let declared_ret = match return_type {
             Some(rt) => Some(resolve_type(rt, &self.env).map_err(|e| Diagnostic::error(span, e))?),
             None => None,
         };
+        // See `infer_function` for the rationale: push a structured declared return type into the
+        // body's `if`/`match` arms (fixes the match-arm-union-vs-declared-object bug).
+        let mut checked_against_declared = false;
         let typed_body_raw = match &declared_ret {
-            Some(declared) if super::expr::type_mentions_strlit(declared) => {
+            Some(declared) if super::expr::expected_pushes_into_branches(declared) => {
+                checked_against_declared = true;
                 self.check_expr(body, declared)?
             }
             _ => self.infer_expr(body)?,
@@ -312,7 +370,7 @@ impl Checker {
         captures.sort_by_key(|c| c.outer_slot);
 
         let ret_type = if let Some(declared) = declared_ret {
-            if !self.types_compatible(&body_ty, &declared) {
+            if !checked_against_declared && !self.types_compatible(&body_ty, &declared) {
                 return Err(Diagnostic::error(span, format!(
                     "Function body has type {}, declared return type is {}", body_ty, declared
                 )));

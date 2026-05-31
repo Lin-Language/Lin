@@ -94,7 +94,7 @@ pub fn is_compatible_env(
         // Non-MAX inference / generic / intrinsic TypeVars stay bidirectionally permissive.
         (_, Type::TypeVar(_)) | (Type::TypeVar(_), _) => true,
 
-        // Singleton string-literal types (ADR-053). A `StrLit("x")` is a `String` at runtime;
+        // Singleton string-literal types (ADR-051). A `StrLit("x")` is a `String` at runtime;
         // these rules constrain only check-time assignability:
         //  1. two literals are compatible iff equal (unequal => reject; the equal case is also
         //     caught by the `value_type == target_type` fast path above, but the explicit arm

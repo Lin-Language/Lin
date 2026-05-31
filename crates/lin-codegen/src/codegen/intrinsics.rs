@@ -635,7 +635,7 @@ impl<'ctx> Codegen<'ctx> {
     /// keys are inlined (length-prefixed UTF-8); recursion uses absolute byte offsets into the
     /// same blob, so recursive/cyclic types terminate. `named_defs` supplies the resolved bodies
     /// of every `Named` type reachable from `target` (codegen has no type environment).
-    fn emit_from_json_descriptor(
+    pub(crate) fn emit_from_json_descriptor(
         &self,
         target: &Type,
         named_defs: &[(String, Type)],
@@ -833,7 +833,7 @@ impl<'a> DescEncoder<'a> {
             Type::Str => self.put_u8(KIND_STRING),
             // A string-literal type validates the JSON value is a string AND equals the exact
             // literal — this is what makes `Result.fromJson(...)` reject a wrong discriminant
-            // tag at decode time, so union variants discriminate correctly (ADR-053).
+            // tag at decode time, so union variants discriminate correctly (ADR-051).
             Type::StrLit(s) => {
                 self.put_u8(KIND_STRLIT);
                 let lb = s.as_bytes();
