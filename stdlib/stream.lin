@@ -54,3 +54,10 @@ export val readText = (s: Stream): Json =>
 // a dropped stream, so this is for determinism).
 export val close = (s: Stream): Null =>
   lin_stream_close(s)
+
+// `for` consumes a Stream item-by-item on the calling thread → `Null | Error` (brief §3): EOF
+// ends the loop normally; the first read Error becomes the result. Typed against `Stream` (not
+// the array `for`'s `Json`) so the Stream type reaches the IR lowerer's stream-`for` branch.
+// Import this `for` (not std/array's) when consuming a stream: `stream.lines().for(println)`.
+export val for = (s: Stream, f: Function): Json =>
+  lin_for(s, f)

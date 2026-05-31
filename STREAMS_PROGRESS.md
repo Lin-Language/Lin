@@ -199,3 +199,54 @@ Files touched:
 9. The chain accepts a `Stream<UInt8[]> | Error` receiver into a `Stream` param via dot-call
    receiver leniency (a union receiver picks the matching variant). A DIRECT call `close(st)`
    with `st: Stream|Error` does NOT type-check — use `st.close()` (dot form). Tests use dot form.
+
+---
+
+## Stage 5 — unified sources + .for(fn) + must-use warning  ★ MERGEABLE SYNC-CORE CHECKPOINT ★
+- Commit: <pending>
+- Gate: MET. Per-source integration tests (file/TCP/process-stdout/stdin) green; example
+  fixture (`examples/streams/main.lin`) runs; must-use warning fires on a dropped stream and is
+  absent on a consumed one. Full workspace: 381 integration + all unit tests, 0 failures.
+- **THIS IS THE MERGEABLE SYNC-CORE CHECKPOINT** — everything through here is sound on a single
+  thread with no new concurrency machinery. Stages 6-8 add the affine check, CAP_MOVE, and the
+  async `.promise()` driver. If you want to merge a usable subset, merge up to this commit.
+
+### What was added
+- `lin-runtime`: unified OS sources — `TcpSource` (delegates to `net::tcp_stream_read`/
+  `tcp_stream_close`), `ProcessSource` (`process::process_stdout_read`), `StdinSource` (reads
+  stdin). Public read helpers added to `net.rs`/`process.rs` so the registries stay encapsulated.
+  Constructors `lin_net_tcp_stream(fd)`, `lin_process_stdout_stream(handle)`,
+  `lin_io_stdin_stream()`. New `lin_stream_for(stream, body)` drives `.for` on the calling
+  thread (EOF → Null; first read Error → the Error value), closing the stream at the end.
+- `lin-ir`/`lin-check`/`lin-codegen`: `Intrinsic::Stream{Tcp,Stdout,Stdin,For}` + types +
+  dispatch. `lower_for` gains a STREAM branch (keys on `Type::Stream` iterable → emits
+  `lin_stream_for`); `lin_for`'s iterable union gains a `Stream<T>` variant (return kept `Null`
+  — see surprise #10).
+- `lin-check/src/checker/stmt.rs`: must-use WARNING when a bare expression statement has type
+  `Stream` (a pipeline with no terminal). It's a WARNING (build still succeeds) per brief §7.
+- `lin-compile`: `check_module_with_imports` now also returns the checker's non-error warnings;
+  the build pipeline renders the main module's warnings (they were previously dropped).
+- `stdlib`: `net.tcpStream`, `process.stdoutStream`, `io.stdinStream`, and std/stream's `for`
+  (typed `(Stream, Function): Json`).
+- Tests: 3 per-source integration tests (`test_stream_{process_stdout,stdin,tcp}_source`).
+
+### Surprises / decisions
+10. **`lin_for` return type must stay `Null`**: I first widened it to `Null | Error` (to give a
+    stream `for` the right static type). That broke EVERY test — std/array's `for` wrapper is
+    declared `: Null`, so the stdlib `array.lin` failed to compile, cascading to all programs
+    that import std/array. REVERTED: `lin_for` keeps `: Null` (only the iterable union gained the
+    `Stream` variant); the IR lowerer's stream branch emits `lin_stream_for` regardless of the
+    declared type, and std/stream's own `for` wrapper is typed `Json` so the runtime's Null|Error
+    is surfaced. LESSON for the morning: changing a widely-used intrinsic's return type ripples
+    through every stdlib wrapper's annotation — touch only the iterable/param side.
+11. **compat `Stream`↔`Union`**: the opaque `(Stream,_)=>false` arm also intercepted
+    `(Stream, Union)` BEFORE the union-target rule, so a `Stream` couldn't match the `Stream`
+    variant of `lin_for`'s iterable union. Added explicit `(Stream,Union)|(Union,Stream)` arms
+    that defer to a new `union_compat` helper (the standard all-variants / any-variant rules).
+12. **must-use scope**: warns on a bare `Stmt::Expr` of `Stream` type only — a properly-terminated
+    pipeline has type `Null|Error`/`UInt8[]|…`, never `Stream`, so no false positive. A
+    stream stored in an unused `val` is NOT yet flagged (that's the affine analysis, Stage 6).
+13. **stream `for` import**: `stream.for(fn)` requires importing `for` from `std/stream` (not
+    `std/array`) — the std/array `for` erases the receiver to `Json`, so the IR never sees a
+    `Stream` and silently no-ops (treats the stream as a 0-length array). Documented in the
+    stdlib comment; the example/tests import `for` from std/stream.

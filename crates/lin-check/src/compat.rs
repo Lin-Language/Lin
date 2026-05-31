@@ -95,6 +95,13 @@ pub fn is_compatible_env(
         (Type::Stream(_), Type::TypeVar(n)) if *n == u32::MAX => false,
         (Type::TypeVar(n), Type::Stream(_)) if *n == u32::MAX => false,
         (Type::Stream(_), Type::TypeVar(_)) | (Type::TypeVar(_), Type::Stream(_)) => true,
+        // A `Stream` flowing into / out of a UNION must consult the union (e.g. `Stream<UInt8[]>`
+        // into `Array | Iterator | Stream<T>` — the stream-`for`/intrinsic iterable param — must
+        // match the `Stream` variant). Defer to the union rules below rather than rejecting here.
+        (Type::Stream(_), Type::Union(_)) | (Type::Union(_), Type::Stream(_)) => {
+            // fall through to the Union arms (handled after this match block via a re-dispatch).
+            return union_compat(value_type, target_type, env, lenient_json, depth);
+        }
         (Type::Stream(_), _) => false,
         (_, Type::Stream(_)) => false,
 
@@ -195,6 +202,27 @@ pub fn is_compatible_env(
         // Iterator covariance
         (Type::Iterator(a), Type::Iterator(b)) => is_compatible_env(a, b, env, lenient_json, depth),
 
+        _ => false,
+    }
+}
+
+/// Apply the union compatibility rules (used by the `Stream`↔`Union` arms, which must defer to
+/// the union logic instead of the opaque `Stream` rejection): a union VALUE is compatible when
+/// every variant is; a union TARGET is compatible when at least one variant matches.
+fn union_compat(
+    value_type: &Type,
+    target_type: &Type,
+    env: Option<&TypeEnv>,
+    lenient_json: bool,
+    depth: &mut usize,
+) -> bool {
+    match (value_type, target_type) {
+        (Type::Union(variants), target) => {
+            variants.iter().all(|v| is_compatible_env(v, target, env, lenient_json, depth))
+        }
+        (value, Type::Union(variants)) => {
+            variants.iter().any(|v| is_compatible_env(value, v, env, lenient_json, depth))
+        }
         _ => false,
     }
 }

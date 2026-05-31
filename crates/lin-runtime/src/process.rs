@@ -229,6 +229,30 @@ pub unsafe extern "C" fn lin_process_spawn(command: *const u8, args: *const u8) 
     }
 }
 
+/// Stream-source read: pull up to `max` bytes from the child `handle`'s piped stdout. Returns
+/// `Ok(None)` at EOF (0 bytes), `Ok(Some(bytes))` for a chunk, or `Err` on an I/O error / unknown
+/// handle. Used by `std/stream`'s `stdoutStream` backend (the registry stays encapsulated here).
+pub fn process_stdout_read(handle: i64, max: usize) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read;
+    let mut buf = vec![0u8; max];
+    let result = with_registry(|m| match m.get_mut(&handle) {
+        Some(entry) => match entry.stdout.as_mut() {
+            Some(out) => Some(out.read(&mut buf)),
+            None => Some(Ok(0usize)), // not piped / already taken → EOF
+        },
+        None => None,
+    });
+    match result {
+        None => Err("no such process handle".to_string()),
+        Some(Ok(0)) => Ok(None),
+        Some(Ok(n)) => {
+            buf.truncate(n);
+            Ok(Some(buf))
+        }
+        Some(Err(e)) => Err(e.to_string()),
+    }
+}
+
 /// readStdout: (handle, buf) => Int32 | Error. Returns bytes read (0 = EOF).
 /// Reads incrementally from the child's captured stdout pipe across calls.
 #[no_mangle]
