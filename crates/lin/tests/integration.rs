@@ -5877,7 +5877,7 @@ print(if bad is Error then "bad:ERR" else "bad:OK")
 
 #[test]
 fn test_from_json_match_is_error_idiom() {
-    // The idiom `match result | is Error => .. | is Person => ..`. As of ADR-050 the arm order
+    // The idiom `match result | is Error => .. | is Person => ..`. As of ADR-054 the arm order
     // is no longer load-bearing (`is Person` checks required fields, so it does not match the
     // Error object), but the Error-first form remains valid. Exhaustiveness accepts `is Error`
     // as covering the Error variant of `Person | Error`.
@@ -5990,7 +5990,7 @@ print(pick(42))
 
 #[test]
 fn test_is_objecttype_expr_checks_required_fields() {
-    // Regression (ADR-050): the EXPRESSION form `x is Person` must check that the object has
+    // Regression (ADR-054): the EXPRESSION form `x is Person` must check that the object has
     // Person's required fields, not just that it is some object (bare TAG_OBJECT). Previously a
     // non-Person object matched, then the narrowed `x["name"]` faulted/returned null.
     let out = run(r#"import { print } from "std/io"
@@ -6007,7 +6007,7 @@ print(if other is Person then "other:yes" else "other:no")
 
 #[test]
 fn test_is_person_first_arm_no_longer_faults() {
-    // Regression (ADR-050): with required-field checking, `is Person` as the FIRST arm no longer
+    // Regression (ADR-054): with required-field checking, `is Person` as the FIRST arm no longer
     // swallows a decode-error object — the ADR-049 ordering footgun is gone. A decode failure
     // (which lacks name/age) falls through to the Error arm instead of faulting on r["name"].
     let out = run(r#"import { print } from "std/io"
@@ -6029,7 +6029,7 @@ main()
 
 #[test]
 fn test_is_objecttype_deep_rejects_wrong_field_type() {
-    // ADR-053: `is Person` deep-validates field TYPES, not just presence (ADR-050). A Json value
+    // ADR-054: `is Person` deep-validates field TYPES, not just presence. A Json value
     // whose `age` is a string (both keys present, WRONG type) must NOT match Person, so the arm
     // falls through to `else` instead of narrowing and operating on the wrong runtime type.
     let out = run(r#"import { print } from "std/io"
@@ -6069,8 +6069,8 @@ main()
 #[test]
 fn test_is_objecttype_deep_accepts_valid_and_narrows() {
     // ADR-053: a fully well-typed value matches AND the narrowed field access is sound — `v["age"]`
-    // is a real Int32, so `v["age"] + 1` produces a correct number (the unsoundness ADR-050's note
-    // left open is closed).
+    // is a real Int32, so `v["age"] + 1` produces a correct number (the unsoundness the earlier
+    // presence-only rule left open, now folded into ADR-054, is closed).
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 type Person = { "name": String, "age": Int32 }
@@ -6324,7 +6324,7 @@ print("${b["value"]} ${o["x"]}")
 
 #[test]
 fn test_from_json_strlit_discriminates_union() {
-    // ADR-052: fromJson validates the exact literal value of a StrLit field, so a tagged-union
+    // ADR-049: fromJson validates the exact literal value of a StrLit field, so a tagged-union
     // decode discriminates by the discriminant tag. Correct tags decode to the right variant;
     // first-match-wins probes each variant's KIND_STRLIT check.
     let out = run(r#"import { print } from "std/io"
@@ -6345,7 +6345,7 @@ print(show({ "type": "failure", "error": "boom" }))
 
 #[test]
 fn test_from_json_strlit_rejects_wrong_tag() {
-    // ADR-052: a wrong discriminant value is a decode error (was a silent mis-decode under the
+    // ADR-049: a wrong discriminant value is a decode error (was a silent mis-decode under the
     // old KIND_STRING placeholder), with a path-located message.
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
@@ -6362,7 +6362,7 @@ match r
 
 #[test]
 fn test_from_json_plain_string_field_accepts_any() {
-    // ADR-052 must NOT regress plain String fields: they still encode as KIND_STRING and accept
+    // ADR-049 (KIND_STRLIT) must NOT regress plain String fields: they still encode as KIND_STRING and accept
     // any string value (only StrLit fields are value-checked).
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
@@ -7292,7 +7292,7 @@ fn regex_lite_find_t_id(ir: &str) -> Option<String> {
 
 #[test]
 fn test_map_callback_returns_curried_closure_full_apply() {
-    // ADR-068: a `map` callback that RETURNS a closure (curried `i => () => i`) is a FULL
+    // ADR-069: a `map` callback that RETURNS a closure (curried `i => () => i`) is a FULL
     // application of the 1-arg callback, not under-application — the indirect-call path must CALL it
     // (returning the thunk), not bundle it into a partial-application closure. Before the arg-count
     // vs arity disambiguation it returned garbage (a pointer reinterpreted as the value).
@@ -7309,7 +7309,7 @@ print(toString(thunks[2]()))
 
 #[test]
 fn test_reduce_over_push_built_flat_typed_array_reads_correctly() {
-    // ADR-068: a `[]`+push builder typed `Int32[]` allocates a TAGGED array; `reduce` over it must
+    // ADR-069: a `[]`+push builder typed `Int32[]` allocates a TAGGED array; `reduce` over it must
     // read at the runtime representation (tagged), not flat — a flat read would misread garbage.
     // `combinator_read_elem_ty` only flat-reads provably-flat producers; a `[]`+push source falls
     // back to the tagged read.
@@ -7329,7 +7329,7 @@ print(toString(reduce(build(), 0, (a, x) => a + x)))
 
 #[test]
 fn test_filter_then_reduce_flat_pipeline_correct() {
-    // ADR-068: filter's keep/skip block split exercises the `emit_index_loop` phi back-edge patch
+    // ADR-069: filter's keep/skip block split exercises the `emit_index_loop` phi back-edge patch
     // (the back-edge predecessor is the skip block, not the nominal body block). A range→filter→
     // reduce flat pipeline must produce the right sum and valid IR.
     let out = run(r#"import { print } from "std/io"

@@ -1955,7 +1955,8 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 };
             }
             // `is <Named>` resolving to a non-empty object shape (e.g. a user object-type alias
-            // like `Person`): a bare tag check (or mere field-presence, ADR-050) matches objects
+            // like `Person`): a bare tag check (or the mere field-presence the earlier rule folded
+            // into ADR-054 checked) matches objects
             // with the WRONG field types, which is unsound — the arm then narrows the binding and
             // a subsequent field access operates on the wrong runtime type. Deep-validate field
             // types recursively via the `fromJson` structural walker (ADR-054). `MatchesSchema`
@@ -3026,7 +3027,7 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
     let (param_tys, _) = callback_signature(&args[1]);
     // Read elements at the source's PROVABLE runtime representation: flat-scalar only when the
     // source is a provably-flat producer, else the tagged Json read (sound for a `[]`+push array
-    // mistyped as flat). See `combinator_read_elem_ty` (ADR-068).
+    // mistyped as flat). See `combinator_read_elem_ty` (ADR-069).
     let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
     let iterable = lower_expr(&args[0], builder, ctx);
     let body = lower_callback_in_safe_ctx(&args[1], builder, ctx);
@@ -3065,7 +3066,7 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
 fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
     let (param_tys, _) = callback_signature(&args[1]);
-    // Read at the source's PROVABLE representation (ADR-068): tagged Json read unless provably flat,
+    // Read at the source's PROVABLE representation (ADR-069): tagged Json read unless provably flat,
     // so a `[]`+push array mistyped as a flat `T[]` is read correctly (not as raw flat scalars).
     let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
     let iterable = lower_expr(&args[0], builder, ctx);
@@ -3136,7 +3137,7 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
     };
     // Read at the source's PROVABLE representation: a flat scalar only for a provably-flat producer
     // (range/map/filter result, flat literal), else the tagged Json read — sound for a `[]`+push
-    // array mistyped as a flat `T[]` (ADR-068).
+    // array mistyped as a flat `T[]` (ADR-069).
     let elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
 
     let iterable = lower_expr(&args[0], builder, ctx);
@@ -3178,7 +3179,7 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
         Type::Array(t) | Type::Iterator(t) => (**t).clone(),
         _ => Type::TypeVar(u32::MAX),
     };
-    // Read at the source's PROVABLE representation (ADR-068): flat scalar for a provably-flat
+    // Read at the source's PROVABLE representation (ADR-069): flat scalar for a provably-flat
     // producer, else tagged Json (sound for a `[]`+push array mistyped as flat).
     let elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
 
@@ -3238,7 +3239,7 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
     let json = Type::TypeVar(u32::MAX);
     let iterable_ty = args[0].ty();
     let (param_tys, _) = callback_signature(&args[2]);
-    // Read at the source's PROVABLE representation (ADR-068): a flat scalar for a provably-flat
+    // Read at the source's PROVABLE representation (ADR-069): a flat scalar for a provably-flat
     // producer, else the tagged Json read (sound for a `[]`+push array mistyped as flat).
     let elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
     let init_ty = args[1].ty();
@@ -3749,7 +3750,8 @@ fn lower_match_pattern(
         TypedMatchPattern::Is(TypedPattern::Binding(..))
         | TypedMatchPattern::Is(TypedPattern::Wildcard(..)) => PatternTest::Always,
         // `is <Named>` where the name resolves to a non-empty object shape (a user object-type
-        // alias like `Person`): a bare tag check (or mere field-presence, ADR-050) matches
+        // alias like `Person`): a bare tag check (or the mere field-presence the earlier rule
+        // folded into ADR-054 checked) matches
         // objects with the WRONG field types, which is unsound once the arm narrows the binding.
         // Deep-validate field types recursively via the `fromJson` structural walker (ADR-054).
         // `scrut` is the already-boxed scrutinee; `MatchesSchema` borrows it (no ownership change).

@@ -68,12 +68,12 @@ Imports are resolved recursively before the main module is checked. Each importe
 
 These are non-obvious and easy to break. Full rationale lives in `docs/DECISIONS.md` — read it before making structural changes.
 
-- **Indentation lexing is suppressed inside `{ }`, `( )`, `[ ]`.** This lets JSON object literals span lines without triggering block parsing. Don't add INDENT/DEDENT logic inside delimiter-balanced spans (ADR-004, ADR-017).
+- **Indentation lexing is suppressed inside `{ }`, `( )`, `[ ]`.** This lets JSON object literals span lines without triggering block parsing. Don't add INDENT/DEDENT logic inside delimiter-balanced spans (ADR-004).
 - **String interpolation is one compound token** (`InterpString(Vec<InterpPart>)`) whose `Expr` parts each carry their own sub-token-stream. The parser recurses into those sub-streams (ADR-005).
 - **Dot-chaining across newlines uses save/restore lookahead** in the parser's postfix loop. Don't aggressively skip newlines — it breaks block structure (ADR-006). After a `Dedent`, postfix `[` and `(` are suppressed but `.` is allowed (ADR-011).
 - **Bare-identifier lambdas (`x => x * 2`) are only recognised in argument position.** `is_bare_lambda()` looks ahead from inside argument parsing (ADR-007).
 - **`val` whose RHS is a function literal is forward-declared** before codegen via a pre-scan, so mutual recursion works between top-level functions (ADR-015). Non-function `val` cannot self-reference (spec §7.3).
-- **TCO uses a `TailResult` trampoline in codegen.** Direct self-recursive calls in tail position are emitted as jumps. Mutual TCO is not implemented (ADR-012, spec §27.3).
+- **TCO uses an alloca/loop transform in codegen.** Direct self-recursive calls in tail position are emitted as jumps back to a `tco_loop` header. Mutual TCO is not implemented (ADR-021, spec §27.3).
 - **`var` is captured by reference** — a heap-allocated mutable slot shared by all closures over the same binding (spec §27.2, ADR-015).
 - **Bracket access is safe by default.** Missing object key → `Null`; `Null` propagates through chains; array OOB is a runtime error (spec §6.1).
 - **Compiler builtins use `lin_*` names; user-facing names come from stdlib.** All polymorphic primitives (`lin_print`, `lin_for`, `lin_iter`, `lin_length`, `lin_to_string`, `lin_push`, `lin_keys`, and all concurrency: `lin_async` etc.) are dispatched specially in codegen. They are not visible to user code. Stdlib files re-export them under their clean names: `std/io` exports `print`, `std/array` exports `map`/`filter`/`reduce`/`push`/`length`/`for`/`range`, `std/object` exports `keys`, `std/string` exports `toString`, `std/async` exports `async`/`await` etc. User code must import them explicitly (ADR-002, ADR-009).
@@ -89,7 +89,7 @@ The typical path:
 
 1. **Tokens** — add `TokenKind` variants in `lin-lex/src/token.rs`, lex them in `lin-lex/src/lexer.rs`. Remember the indentation suppression invariants for new delimiters.
 2. **AST** — add `Expr`/`Stmt`/`Pattern`/`TypeExpr` variants in `lin-parse/src/ast.rs`. Each variant carries its own `Span`. Add a branch in `Expr::span()`.
-3. **Parser** — wire into the `lin-parse/src/parser/` module tree (expressions in `expr.rs`, statements in `stmt.rs`, etc.). For postfix operators, mind the DEDENT suppression rule (ADR-011). For continuation-line constructs, use the `skip_continuation_newline` pattern (ADR-013).
+3. **Parser** — wire into the `lin-parse/src/parser/` module tree (expressions in `expr.rs`, statements in `stmt.rs`, etc.). For postfix operators, mind the DEDENT suppression rule (ADR-011). For continuation-line constructs, use the `skip_continuation_newline` pattern (ADR-006).
 4. **Type checker** — add handling in the `lin-check/src/checker/` module tree (expression inference in `expr.rs`, statements in `stmt.rs`, etc.).
 5. **Codegen** — add handling in the `lin-codegen/src/codegen/` module tree (instruction dispatch in `mod.rs`; intrinsics in `intrinsics.rs`, etc.). If a new runtime intrinsic is needed, add it to `lin-runtime/src/` and declare it in `codegen/runtime.rs`'s `RuntimeFns`.
 6. **Tests** — add an end-to-end test in `crates/lin/tests/integration.rs` and a fixture in `examples/`.
