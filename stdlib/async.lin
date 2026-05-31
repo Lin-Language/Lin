@@ -1,12 +1,29 @@
+// async returns an opaque Promise<T> handle, modelled as Json: the value only materialises at
+// the await site, so wrapping it in `T | Error` here would mis-type the live promise handle
+// (codegen would try to box the promise pointer as a `T`). The Error injection happens in
+// `await`, where the value is actually produced. See ADR-065.
 export val async = (f: Json): Json =>
   lin_async(f)
 
-export val await = (p: Json): Json =>
+// await resolves a promise to its value, wrapping it in `T | Error` (spec §32.2.2). A faulted
+// thunk surfaces as an Error here, so the result is a union; assigning it to a bare binding
+// that does not handle the Error case is a compile-time error (the existing union-assignment
+// check, the same one `fromJson` relies on). Handle it with `match … is Error => … else => …`.
+export val await = <T>(p: T): T | Error =>
   lin_await(p)
 
+// parallel keeps the Json signature: the element type `(() => T)[]` is not expressible in the
+// surface type grammar (no parenthesised function type before `[]`), and `lin_parallel`
+// deliberately returns a tagged `Json[]` to keep codegen from picking a flat-scalar array
+// representation. See ADR-065.
 export val parallel = (tasks: Json): Json[] =>
   lin_parallel(tasks)
 
+// race/timeout/retry/poolAsync all return a Promise handle (lin_race/_timeout/_retry/
+// _pool_async return `*mut LinPromise` in the runtime), NOT a resolved value, so they keep the
+// opaque Json typing — exactly like `async`. The `T | Error` Error injection happens once, at
+// `await`, where the value is actually produced. Typing these as `T | Error` would mis-type the
+// live promise pointer and crash codegen (it would box the promise as a scalar). See ADR-065.
 export val race = (promises: Json): Json =>
   lin_race(promises)
 

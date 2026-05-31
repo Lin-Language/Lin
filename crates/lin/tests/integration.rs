@@ -2489,6 +2489,39 @@ print(toString(result))
 }
 
 #[test]
+fn test_await_result_must_handle_error() {
+    // §32.2.2 enforcement (ADR-070): await yields `T | Error`, so assigning it to a bare
+    // binding that does not handle the Error case is a compile-time type error. The diagnostic
+    // names the union vs. the bare target. (Goes through the full `build` pipeline because the
+    // standalone `check` subcommand does not resolve imports.)
+    let err = run_expect_err(r#"import { async, await } from "std/async"
+
+val p = async(() => 1 + 1)
+val r: Int32 = await(p)
+"#);
+    assert!(
+        err.contains("Int32") && err.contains("\"type\""),
+        "expected a union-not-assignable-to-Int32 type error, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_await_handled_error_runs() {
+    // The flip side of the enforcement: once the Error case is handled (here via `match`), the
+    // program type-checks and runs, yielding the resolved value.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await } from "std/async"
+
+val p = async(() => 1 + 1)
+match await(p)
+  is Error => print("error")
+  else => print(toString(await(p)))
+"#);
+    assert_eq!(output, vec!["2"]);
+}
+
+#[test]
 fn test_async_val_capture() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -2516,15 +2549,20 @@ print(toString(results))
 
 #[test]
 fn test_thread_pool_async() {
+    // await now yields `T | Error` (§32.2.2), so each result is handled before arithmetic.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { async, await, threadPool } from "std/async"
 
+val unwrap = (r: Json): Int32 =>
+  match r
+    is Error => 0
+    else => r
 val pool = threadPool(2)
 val p1 = async(() => 100)
 val p2 = async(() => 200)
-val r1 = await(p1)
-val r2 = await(p2)
+val r1 = unwrap(await(p1))
+val r2 = unwrap(await(p2))
 print(toString(r1 + r2))
 "#);
     assert_eq!(output, vec!["300"]);
@@ -2649,11 +2687,15 @@ import { await, threadPool, poolAsync } from "std/async"
 import { push, length } from "std/array"
 import { for, range } from "std/array"
 
+val unwrap = (r: Json): Int32 =>
+  match r
+    is Error => 0
+    else => r
 val pool = threadPool(3)
 var promises = []
 range(0, 30).for(i => push(promises, pool.poolAsync(() => 1)))
 var total = 0
-promises.for(p => total = total + await(p))
+promises.for(p => total = total + unwrap(await(p)))
 print(toString(total))
 "#);
     assert_eq!(output, vec!["30"]);
@@ -2891,6 +2933,10 @@ import { toString } from "std/string"
 import { async, await } from "std/async"
 import { sleep, now } from "std/time"
 
+val unwrap = (r: Json): Int32 =>
+  match r
+    is Error => 0
+    else => r
 val start = now()
 val p1 = async(() =>
   sleep(150)
@@ -2900,8 +2946,8 @@ val p2 = async(() =>
   sleep(150)
   2
 )
-val r1 = await(p1)
-val r2 = await(p2)
+val r1 = unwrap(await(p1))
+val r2 = unwrap(await(p2))
 val elapsed = now() - start
 print(toString(r1 + r2))
 if elapsed < 290 then print("PARALLEL") else print("SEQUENTIAL")
@@ -2963,6 +3009,10 @@ import { toString } from "std/string"
 import { await, threadPool, poolAsync } from "std/async"
 import { sleep, now } from "std/time"
 
+val unwrap = (r: Json): Int32 =>
+  match r
+    is Error => 0
+    else => r
 val pool = threadPool(4)
 val start = now()
 val p1 = pool.poolAsync(() =>
@@ -2981,7 +3031,7 @@ val p4 = pool.poolAsync(() =>
   sleep(100)
   4
 )
-val sum = await(p1) + await(p2) + await(p3) + await(p4)
+val sum = unwrap(await(p1)) + unwrap(await(p2)) + unwrap(await(p3)) + unwrap(await(p4))
 val elapsed = now() - start
 print(toString(sum))
 if elapsed < 300 then print("PARALLEL") else print("SLOW")
@@ -2997,6 +3047,10 @@ import { toString } from "std/string"
 import { await, threadPool, poolAsync } from "std/async"
 import { sleep, now } from "std/time"
 
+val unwrap = (r: Json): Int32 =>
+  match r
+    is Error => 0
+    else => r
 val pool = threadPool(2)
 val start = now()
 val a = pool.poolAsync(() =>
@@ -3015,7 +3069,7 @@ val d = pool.poolAsync(() =>
   sleep(80)
   1
 )
-val total = await(a) + await(b) + await(c) + await(d)
+val total = unwrap(await(a)) + unwrap(await(b)) + unwrap(await(c)) + unwrap(await(d))
 val elapsed = now() - start
 print(toString(total))
 if elapsed >= 140 then print("BOUNDED") else print("UNBOUNDED")

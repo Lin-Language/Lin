@@ -4,6 +4,14 @@ import { async, await, parallel, race, timeout, retry, threadPool, poolAsync, wo
 import { push, length } from "std/array"
 import { sleep } from "std/time"
 
+// await now yields `T | Error` (§32.2.2); this recovers the numeric value (Error -> 0) so the
+// happy-path pool test can sum results. Defined at module level because a multi-line `match`
+// does not parse inside a parenthesised test lambda (indentation is suppressed in parens).
+val unwrapInt = (r: Json): Int32 =>
+  match r
+    is Error => 0
+    else => r
+
 val s = suite("std/async", [
   test("async/await basic value", () =>
     val p = async(() => 42)
@@ -168,11 +176,12 @@ val s = suite("std/async", [
   ),
 
   test("pool runs queued tasks", () =>
+    // await yields `T | Error` (§32.2.2), so each result is handled before arithmetic.
     val pool = threadPool(2)
     val p1 = pool.poolAsync(() => 10)
     val p2 = pool.poolAsync(() => 20)
     val checks = [
-      expect(await(p1) + await(p2)).toBe(30)
+      expect(unwrapInt(await(p1)) + unwrapInt(await(p2))).toBe(30)
     ]
     checks
   ),

@@ -13,8 +13,15 @@ export val poolSum = (workers: Int32, n: Int32): Int32 =>
   var promises = []
   range(0, n).for(i => push(promises, pool.poolAsync(() => 1)))
   var total = 0
-  promises.for(p => total = total + await(p))
+  // await yields `T | Error` (§32.2.2); `recoverInt` handles the Error case before summing.
+  promises.for(p => total = total + recoverInt(await(p)))
   total
+
+// Recover an awaited numeric result: a faulted Error contributes 0, otherwise the value.
+val recoverInt = (result: Json): Int32 =>
+  match result
+    is Error => 0
+    else => result
 
 // Worker — a long-lived thread that owns confined mutable state (§32.6.4). The handler
 // closes over `var total`; sequential requests accumulate into it, and `onShutdown` is
