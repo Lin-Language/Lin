@@ -58,7 +58,7 @@ pub struct ImportBinding {
 #[derive(Debug, Clone)]
 pub enum Expr {
     /// Integer literal with an optional explicit type suffix (e.g. `42i8`). The suffix, when
-    /// present, pins the literal's type in the checker, overriding context/default (spec §3.6).
+    /// present, pins the literal's type in the checker, overriding context/default (spec §2.6).
     IntLit(i64, Option<NumSuffix>, Span),
     /// Float literal with an optional explicit type suffix (e.g. `3.14f32`).
     FloatLit(f64, Option<NumSuffix>, Span),

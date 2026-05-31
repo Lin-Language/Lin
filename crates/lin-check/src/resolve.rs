@@ -78,7 +78,7 @@ fn resolve_named_cycle(
         "Float64" => Ok(Type::Float64),
         "String" => Ok(Type::Str),
         "Json" => Ok(json_type()),
-        // `Error` is the conventional error value (spec §19, §32.2.2) and a structural object
+        // `Error` is the conventional error value (spec §20, §24.2.2) and a structural object
         // alias (ADR-047): an object carrying a `type` discriminant and a `message`. Both the
         // async runtime (on a caught thunk fault) and `fromJson` produce this shape — the
         // decode-error value additionally carries `"path"`, which width subtyping permits.

@@ -478,7 +478,7 @@ impl<'ctx> Codegen<'ctx> {
             BinOp::GtEq => self.compile_cmp(lv, rv, lty, IntPredicate::SGE, IntPredicate::UGE, FloatPredicate::OGE),
             BinOp::And => self.builder.and(lv.into_int_value(), rv.into_int_value(), "ir_and").into(),
             BinOp::Or => self.builder.or(lv.into_int_value(), rv.into_int_value(), "ir_or").into(),
-            // Bitwise integer operators (§35.2). Operands are integers (checker-enforced)
+            // Bitwise integer operators (§27.2). Operands are integers (checker-enforced)
             // and widths have been reconciled above.
             BinOp::BAnd => self.builder.and(lv.into_int_value(), rv.into_int_value(), "ir_band").into(),
             BinOp::BOr => self.builder.or(lv.into_int_value(), rv.into_int_value(), "ir_bor").into(),

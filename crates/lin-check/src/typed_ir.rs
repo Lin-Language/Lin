@@ -82,7 +82,7 @@ pub struct ForeignSlot {
     pub name: String,
     pub slot: usize,
     pub ty: Type,
-    /// True if this is a legal FFI type (see spec §34.3).
+    /// True if this is a legal FFI type (see spec §26.3).
     pub valid: bool,
 }
 

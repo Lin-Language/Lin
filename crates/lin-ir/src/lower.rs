@@ -1699,7 +1699,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         }
 
         TypedExpr::BinaryOp { left, op, right, result_type, .. } => {
-            // `&&` / `||` are SHORT-CIRCUITING (spec §24): the RHS must only be evaluated when
+            // `&&` / `||` are SHORT-CIRCUITING (spec §8): the RHS must only be evaluated when
             // the LHS does not already decide the result. Emit branch + merge + Phi control flow
             // (mirroring lower_if) rather than a bitwise and/or over two eagerly-lowered operands.
             if matches!(op, BinOp::And | BinOp::Or) {
@@ -1849,7 +1849,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         TypedExpr::MakeArray { elements, ty, .. } => {
             let elem_ty = match ty {
                 Type::Array(inner) => *inner.clone(),
-                // A fixed-length array (`[T1, T2, ...]`, §8.3) has heterogeneous positional
+                // A fixed-length array (`[T1, T2, ...]`, §5.3) has heterogeneous positional
                 // types, so it is stored as a TAGGED (Json) array — each element boxes to a
                 // TaggedVal* via coerce_to_slot_type below, and Index reads unbox per the
                 // positional result type. Without this the slot type defaulted to Null and
@@ -3491,7 +3491,7 @@ fn lower_if(
     result_dst
 }
 
-/// Lower a short-circuiting `&&` / `||` (spec §24) as branch + merge + Phi, so the RHS is
+/// Lower a short-circuiting `&&` / `||` (spec §8) as branch + merge + Phi, so the RHS is
 /// only evaluated on the path that needs it.
 ///
 /// - `a && b`: eval a; if a then eval b else `false`; phi.

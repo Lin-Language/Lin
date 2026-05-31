@@ -46,7 +46,7 @@ export val withDeadline = (workMs: Int64, ms: Int32): Json =>
 export val retryDivide = (n: Int32, divisor: Int32, times: Int32): Json =>
   await(retry(() => n / divisor, times))
 
-// fault isolation (§32.2.2) — a runtime fault inside the thunk surfaces as an Error value
+// fault isolation (§24.2.2) — a runtime fault inside the thunk surfaces as an Error value
 // at `await`; we discriminate it with `is Error` and recover, rather than aborting. await now
 // yields `T | Error`, so the result is taken as `Json` and the match recovers to a concrete Int32.
 export val safeDivide = (n: Int32, divisor: Int32): Int32 =>
@@ -58,7 +58,7 @@ val recoverInt = (result: Json): Int32 =>
     is Error => 0 - 1
     else => result
 
-// nested-promise flatten (§32.2.3) — a thunk that itself returns a Promise is resolved
+// nested-promise flatten (§24.2.3) — a thunk that itself returns a Promise is resolved
 // through every layer by a single await.
 export val nestedValue = (n: Int32): Json =>
   await(async(() => async(() => n)))

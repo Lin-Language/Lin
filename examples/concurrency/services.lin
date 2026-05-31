@@ -13,7 +13,7 @@ export val poolSum = (workers: Int32, n: Int32): Int32 =>
   var promises = []
   range(0, n).for(i => push(promises, pool.poolAsync(() => 1)))
   var total = 0
-  // await yields `T | Error` (§32.2.2); `recoverInt` handles the Error case before summing.
+  // await yields `T | Error` (§24.2.2); `recoverInt` handles the Error case before summing.
   promises.for(p => total = total + recoverInt(await(p)))
   total
 
@@ -23,7 +23,7 @@ val recoverInt = (result: Json): Int32 =>
     is Error => 0
     else => result
 
-// Worker — a long-lived thread that owns confined mutable state (§32.6.4). The handler
+// Worker — a long-lived thread that owns confined mutable state (§24.6.4). The handler
 // closes over `var total`; sequential requests accumulate into it, and `onShutdown` is
 // invoked at close. Returns the running total after the given deposits.
 export val accumulate = (deposits: Int32[]): Int32 =>
@@ -39,7 +39,7 @@ export val accumulate = (deposits: Int32[]): Int32 =>
   close(acc)
   last
 
-// Worker fault isolation (§32.6.5) — a handler that faults surfaces an Error to the
+// Worker fault isolation (§24.6.5) — a handler that faults surfaces an Error to the
 // in-flight request; the program continues. Returns true if the request came back an Error.
 export val workerFaults = (): Boolean =>
   val zero = 0
