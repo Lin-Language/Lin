@@ -1,0 +1,30 @@
+import { print } from "std/io"
+import { for } from "std/array"
+
+type Shape =
+  | { "kind": "circle", "r": Float64 }
+  | { "kind": "rect", "w": Float64, "h": Float64 }
+  | { "kind": "point" }
+
+// `match` is exhaustive: the checker rejects the program if a case is unhandled.
+// `has` checks a value's shape and destructures it; `when` adds a guard.
+val area = (s: Shape): Float64 =>
+  match s
+    has { "kind": "circle", r }  => 3.14159 * r * r
+    has { "kind": "rect", w, h } => w * h
+    else                         => 0.0
+
+val describe = (s: Shape): String =>
+  match s
+    has { "kind": "circle", r } when r > 10.0 => "big circle"
+    has { "kind": "circle" }                  => "circle"
+    has { "kind": "rect" }                    => "rectangle"
+    else                                      => "a point"
+
+val shapes: Shape[] = [
+  { "kind": "circle", "r": 12.0 },
+  { "kind": "rect", "w": 3.0, "h": 4.0 },
+  { "kind": "point" }
+]
+
+shapes.for(s => print("${describe(s)} has area ${area(s)}"))

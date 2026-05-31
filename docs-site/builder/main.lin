@@ -8,6 +8,7 @@ import { getEnv } from "std/env"
 
 import { markdownToHtml } from "./markdown"
 import { buildNav } from "./nav"
+import { buildHero } from "./hero"
 
 // Resolve paths relative to the docs-site directory.
 // The binary is run from the repo root, so we prefix with "docs-site/".
@@ -97,10 +98,13 @@ val processFile = (filePath: String, navEntries: Json): Null =>
     val urlPath = contentPathToUrl(filePath)
     val navHtml = buildNav(navEntries, urlPath, basePath)
     val outputPath = contentPathToOutput(filePath)
-    val templatePath = if urlPath == "/" then homeTemplate else pageTemplate
+    val isHome = urlPath == "/"
+    val templatePath = if isHome then homeTemplate else pageTemplate
     val templateJson = readFile(templatePath)
     val templateStr = fileContent(templateJson)
-    val rendered = renderWith(templateStr, { "title": title, "nav": navHtml, "content": htmlContent, "base": basePath })
+    // The home page gets the two-column feature/code-tabs hero above its content.
+    val hero = if isHome then buildHero(basePath) else ""
+    val rendered = renderWith(templateStr, { "title": title, "nav": navHtml, "content": htmlContent, "base": basePath, "hero": hero })
     val outDir = dirName(outputPath)
     mkdir(outDir, { "parents": true })
     val writeResult = writeFile(outputPath, rendered)

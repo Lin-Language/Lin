@@ -25,6 +25,18 @@ Verify the installation:
 lin --version
 ```
 
+### VS Code extension
+
+If you use VS Code, the **Lin Language** extension is the easiest way to get started — it bundles the `lin` compiler and the `lin-lsp` language server, so there is nothing else to install.
+
+Install it from the Marketplace (search for **"Lin Language"** in the Extensions view), or grab `lin-lang.vsix` from the [latest release](https://github.com/Lin-Language/Lin/releases/tag/latest) and install it from the command line:
+
+```bash
+code --install-extension lin-lang.vsix
+```
+
+The extension provides syntax highlighting, inline type/parse diagnostics, hover types, go-to-definition, and dot-completion with auto-import, plus **Lin: Build / Run / Test** commands from the Command Palette. It also puts the bundled `lin` on the PATH of VS Code's integrated terminal — run the **Lin: Install `lin` on PATH** command to make it available in every shell.
+
 ### Build from source
 
 Building from source requires a Rust toolchain and LLVM 22.
