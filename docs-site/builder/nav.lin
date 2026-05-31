@@ -1,0 +1,53 @@
+import { for, filter, push } from "std/array"
+import { contains } from "std/string"
+
+// Build navigation HTML from an array of nav entries.
+// Each entry: { "title": String, "path": String, "section": String }
+// currentPath: the path of the page being rendered (e.g. "/tutorials/01-hello-world")
+//
+// Outputs a <nav> block with sections grouped.
+
+// Get the href for a nav entry path. `base` is the deployment subpath prefix (e.g.
+// "/Lin" for a project Pages site, or "" for a root deployment).
+val navHref = (base: String, path: String): String =>
+  if path == "/" then "${base}/index.html" else "${base}${path}.html"
+
+// Render nav entries for one section
+val renderSectionEntries = (sectionEntries: Json, currentPath: String, base: String): String =>
+  var html = ""
+  sectionEntries.for(entry =>
+    val path = entry["path"]
+    val title = entry["title"]
+    val isActive = path == currentPath
+    val activeClass = if isActive then " class=\"active\"" else ""
+    val href = navHref(base, path)
+    html = "${html}<a href=\"${href}\"${activeClass}>${title}</a>\n"
+  )
+  html
+
+// Render one section block
+val renderSection = (section: String, sectionEntries: Json, currentPath: String, base: String): String =>
+  val entriesHtml = renderSectionEntries(sectionEntries, currentPath, base)
+  if section != "" then
+    "<div class=\"nav-section\">\n<h3 class=\"nav-section-title\">${section}</h3>\n${entriesHtml}</div>\n"
+  else entriesHtml
+
+export val buildNav = (entries: Json, currentPath: String, base: String): String =>
+  // Collect unique section names in order
+  var sections = []
+  var seenStr = "|"
+  entries.for(entry =>
+    val section = entry["section"]
+    val marker = "|${section}|"
+    if contains(seenStr, marker) == false then sections.push(section)
+    if contains(seenStr, marker) == false then seenStr = "${seenStr}${marker}"
+  )
+
+  var html = "<nav id=\"sidebar\">\n"
+  sections.for(section =>
+    val sectionEntries = entries.filter(e => e["section"] == section)
+    val sectionHtml = renderSection(section, sectionEntries, currentPath, base)
+    html = "${html}${sectionHtml}"
+  )
+  html = "${html}</nav>\n"
+  html
