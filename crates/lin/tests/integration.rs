@@ -6453,6 +6453,196 @@ print(a[1])
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4.5b: extend the element-type-aware flat-array WRITE path to the realistic
+// map-shape combinator idiom where the allocation is an INTERMEDIATE `val` binding
+// (`val result = lin_array_allocate(n); ...; result`) rather than the trivial
+// `=> lin_array_allocate(n)` body. The checker pins the intermediate binding's
+// element type to the declared-return element so monomorphization produces a flat
+// allocation matching the flat reader. Previously the intermediate binding stayed
+// `Array(MAX)` (tagged) while the `Int32[]`-typed consumer read flat → garbage.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_generic_map_intermediate_alloc_int32_is_flat_and_correct() {
+    // The full map-shape combinator: declared `U[]`, an intermediate
+    // `val result = lin_array_allocate(n)`, written in a for-loop, returned bare.
+    // Monomorphized at U=Int32 it must produce a FLAT array read flat. Before the
+    // fix this printed garbage (a tagged producer read through the flat i32 accessor).
+    let out = run(r#"import { length, for as afor } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
+  val n = length(arr)
+  val result = lin_array_allocate(n)
+  var i = 0
+  arr.afor(x =>
+    result[i] = f(x)
+    i = i + 1
+  )
+  result
+val doubled: Int32[] = mymap([10, 20, 30], x => x * 2)
+print(toString(doubled[0]))
+print(toString(doubled[1]))
+print(toString(doubled[2]))
+"#);
+    assert_eq!(out, vec!["20", "40", "60"]);
+}
+
+#[test]
+fn test_generic_map_intermediate_alloc_flat_path_in_ir() {
+    // IR proof: the U=Int32 monomorph allocates FLAT (lin_flat_array_alloc*) for the
+    // intermediate binding and the consumer reads with the FLAT getter — producer and
+    // consumer agree, no tagged allocator (lin_array_alloc_null) on this monomorph.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_imap_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_imap_{}", id));
+    let ll_path = bin_path.with_extension("ll");
+
+    fs::write(&src_path, r#"import { length, for as afor } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
+  val n = length(arr)
+  val result = lin_array_allocate(n)
+  var i = 0
+  arr.afor(x =>
+    result[i] = f(x)
+    i = i + 1
+  )
+  result
+val doubled: Int32[] = mymap([10, 20, 30], x => x * 2)
+print(toString(doubled[0]))
+"#).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_EMIT_IR", "1")
+        .env("LIN_NO_OPT", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+
+    let ll = fs::read_to_string(&ll_path).expect("LLVM IR not emitted");
+    let _ = fs::remove_file(&bin_path);
+    let _ = fs::remove_file(&ll_path);
+
+    let body_start = ll.find("define ptr @\"mymap$Int32_Int32\"").expect("missing mymap$Int32_Int32 monomorph");
+    let body = &ll[body_start..];
+    let body_end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
+    let body = &body[..body_end];
+    assert!(body.contains("lin_flat_array_alloc"),
+        "mymap$Int32_Int32 must allocate a flat array, got:\n{}", body);
+    assert!(!body.contains("lin_array_alloc_null"),
+        "mymap$Int32_Int32 must NOT allocate a tagged array, got:\n{}", body);
+    // The consumer reads the Int32[] result with the flat getter.
+    assert!(ll.contains("lin_flat_array_get_i32"),
+        "expected a flat i32 read of the Int32[] value, IR:\n{}", ll);
+}
+
+#[test]
+fn test_generic_map_intermediate_alloc_string_stays_tagged() {
+    // The SAME generic map-shape combinator instantiated at U=String (heap element):
+    // must stay TAGGED and correct. Proves the intermediate-alloc refinement is gated
+    // strictly to flat scalars and never corrupts a heap-element result.
+    let out = run(r#"import { length, for as afor } from "std/array"
+import { print } from "std/io"
+val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
+  val n = length(arr)
+  val result = lin_array_allocate(n)
+  var i = 0
+  arr.afor(x =>
+    result[i] = f(x)
+    i = i + 1
+  )
+  result
+val tagged: String[] = mymap(["a", "b"], s => "${s}!")
+print(tagged[0])
+print(tagged[1])
+"#);
+    assert_eq!(out, vec!["a!", "b!"]);
+}
+
+#[test]
+fn test_generic_map_intermediate_alloc_mixed_instantiations() {
+    // The SAME generic instantiated at BOTH Int32 (flat) and String (tagged) in one
+    // program — each monomorph picks its own representation; both must be correct.
+    let out = run(r#"import { length, for as afor } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
+  val n = length(arr)
+  val result = lin_array_allocate(n)
+  var i = 0
+  arr.afor(x =>
+    result[i] = f(x)
+    i = i + 1
+  )
+  result
+val ints: Int32[] = mymap([1, 2, 3], x => x * 10)
+val strs: String[] = mymap(["a", "b"], s => "${s}!")
+print(toString(ints[0]))
+print(toString(ints[2]))
+print(strs[0])
+print(strs[1])
+"#);
+    assert_eq!(out, vec!["10", "30", "a!", "b!"]);
+}
+
+#[test]
+fn test_generic_map_intermediate_alloc_json_stays_tagged() {
+    // A Json (wildcard) instantiation of the same combinator stays TAGGED and correct —
+    // the heterogeneous element representation is preserved.
+    let out = run(r#"import { length, for as afor } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
+  val n = length(arr)
+  val result = lin_array_allocate(n)
+  var i = 0
+  arr.afor(x =>
+    result[i] = f(x)
+    i = i + 1
+  )
+  result
+val xs: Json[] = [1, "two", true]
+val ys: Json[] = mymap(xs, (x: Json): Json => x)
+print(toString(length(ys)))
+print(toString(ys[0]))
+print(toString(ys[1]))
+"#);
+    assert_eq!(out, vec!["3", "1", "two"]);
+}
+
+#[test]
+fn test_intermediate_alloc_user_annotation_is_respected() {
+    // A user-annotated intermediate binding (`val result: Json[] = lin_array_allocate(n)`)
+    // must NOT be re-pinned by the refinement — the explicit annotation wins, so the
+    // binding stays tagged and the program is correct under the tagged accessor it uses.
+    // Guards the `type_ann.is_some()` bail in intermediate_array_allocate_binding.
+    let out = run(r#"import { length, for as afor } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+val mymap = <T>(arr: T[]): Json[] =>
+  val n = length(arr)
+  val result: Json[] = lin_array_allocate(n)
+  var i = 0
+  arr.afor(x =>
+    result[i] = x
+    i = i + 1
+  )
+  result
+val ys: Json[] = mymap([7, 8, 9])
+print(toString(length(ys)))
+print(toString(ys[0]))
+"#);
+    assert_eq!(out, vec!["3", "7"]);
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3.5: hardening single-module generics (nested calls, aliasing, budget,
 // type-param hygiene, uninferrable type parameters).
 // ---------------------------------------------------------------------------
@@ -6775,4 +6965,166 @@ print(toString(length(strs)))
     let output = run(&main);
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(output, vec!["60", "2"]);
+}
+
+#[test]
+fn test_generic_t_array_param_with_json_arg_is_correct() {
+    // GAP 1: a generic `T[]` param unified against a `Json` value binds `T = Json` (the wildcard),
+    // monomorphizing to a TAGGED `$Json` instance — NOT leaving `T` unbound (which previously read
+    // the array at a bogus element type → null/garbage). The SAME generic applied to a concrete
+    // `Int32[]` still specializes to the flat `$Int32` instance. Both must produce correct values.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val firstOf = <T>(arr: T[]): T => arr[0]
+val j: Json = [7, 8, 9]
+print(toString(firstOf(j)))
+val ints: Int32[] = [10, 20, 30]
+print(toString(firstOf(ints)))
+"#);
+    // Json arg → 7 (correct, not null/garbage); Int32 arg → 10 (correct, flat).
+    assert_eq!(out, vec!["7", "10"]);
+}
+
+#[test]
+fn test_generic_t_array_param_json_tagged_int32_flat_in_ir() {
+    // IR proof for GAP 1: the Json instantiation mints a TAGGED `firstOf$Json` monomorph (reads via
+    // the tagged getter), while the Int32 instantiation mints a FLAT `firstOf$Int32` monomorph
+    // (reads via lin_flat_array_get_i32, returns a native i32). No garbage `$T<id>` symbol.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_gap1_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_gap1_{}", id));
+    let ll_path = bin_path.with_extension("ll");
+
+    fs::write(&src_path, r#"import { print } from "std/io"
+import { toString } from "std/string"
+val firstOf = <T>(arr: T[]): T => arr[0]
+val j: Json = [7, 8, 9]
+print(toString(firstOf(j)))
+val ints: Int32[] = [10, 20, 30]
+print(toString(firstOf(ints)))
+"#).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_EMIT_IR", "1")
+        .env("LIN_NO_OPT", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+
+    let ll = fs::read_to_string(&ll_path).expect("LLVM IR not emitted");
+    let _ = fs::remove_file(&bin_path);
+    let _ = fs::remove_file(&ll_path);
+
+    // The Json instantiation is named `$Json` (tagged), the Int32 one `$Int32` (flat).
+    assert!(ll.contains("\"firstOf$Json\""),
+        "expected a tagged firstOf$Json monomorph for the Json arg, IR:\n{}", ll);
+    assert!(ll.contains("define i32 @\"firstOf$Int32\"(ptr"),
+        "expected a flat i32 firstOf$Int32 monomorph for the Int32[] arg, IR:\n{}", ll);
+    // Soundness guard: never an unbound-TypeVar `$T<id>` garbage monomorph.
+    let re = regex_lite_find_t_id(&ll);
+    assert!(re.is_none(),
+        "found a garbage unbound-TypeVar monomorph '{}' — GAP 2 regression, IR:\n{}",
+        re.unwrap(), ll);
+}
+
+#[test]
+fn test_generic_import_path_unbound_typevar_is_safe() {
+    // GAP 2 (LATENT SOUNDNESS BUG): a generic called INSIDE an imported module on that module's own
+    // `Json` param previously emitted a `$T<id>` garbage monomorph keyed on the UNBOUND TypeVar,
+    // which read/allocated the array at a bogus element type → runtime `capacity overflow` / heap
+    // corruption. The import-monomorphization path must now erase any non-concrete TypeVar to the
+    // Json wildcard, producing a correct tagged `$Json` monomorph (the same resolution the main
+    // module uses). Module `helpers` exports `doubleAll(arr: Json)` whose body calls the sibling
+    // generic `mymap` on its Json param — exactly the import-path-unbound case.
+    let dir = std::env::temp_dir().join(format!("lin_gap2_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("helpers.lin"),
+        "import { for, push } from \"std/array\"\n\
+         export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
+           val result = []\n  \
+           arr.for(item => push(result, f(item)))\n  \
+           result\n\
+         export val doubleAll = (arr: Json): Json =>\n  \
+           mymap(arr, x => x * 2)\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ reduce }} from "std/array"
+import {{ doubleAll }} from "{}/helpers"
+val r: Json = doubleAll([5, 6, 7])
+print(toString(r.reduce(0, (acc, x) => acc + x)))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    // 5+6+7 = 18, doubled = 36. Correct tagged result, no crash, no garbage.
+    assert_eq!(output, vec!["36"]);
+}
+
+#[test]
+fn test_generic_import_path_unbound_typevar_no_garbage_monomorph_in_ir() {
+    // IR proof for GAP 2: the import-path `mymap` instantiation driven by `doubleAll`'s Json param
+    // mints a tagged `mymap$Json_...` monomorph and NEVER a `$T<id>` garbage symbol.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let dir = ws.join(format!("target/lin_gap2_ir_{}", id));
+    let _ = fs::create_dir_all(&dir);
+    fs::write(dir.join("helpers.lin"),
+        "import { for, push } from \"std/array\"\n\
+         export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
+           val result = []\n  \
+           arr.for(item => push(result, f(item)))\n  \
+           result\n\
+         export val doubleAll = (arr: Json): Json =>\n  \
+           mymap(arr, x => x * 2)\n").unwrap();
+    let src_path = dir.join("main.lin");
+    let bin_path = dir.join("main");
+    let ll_path = bin_path.with_extension("ll");
+    fs::write(&src_path, format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ reduce }} from "std/array"
+import {{ doubleAll }} from "{}/helpers"
+val r: Json = doubleAll([5, 6, 7])
+print(toString(r.reduce(0, (acc, x) => acc + x)))
+"#, dir.to_str().unwrap())).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_EMIT_IR", "1")
+        .env("LIN_NO_OPT", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+    let ll = fs::read_to_string(&ll_path).expect("LLVM IR not emitted");
+    let _ = fs::remove_dir_all(&dir);
+
+    let garbage = regex_lite_find_t_id(&ll);
+    assert!(garbage.is_none(),
+        "import-path monomorphization emitted a garbage unbound-TypeVar monomorph '{}' (GAP 2), IR:\n{}",
+        garbage.unwrap(), ll);
+}
+
+/// Find the first `$T<digits>` token in `ir` (a garbage unbound-TypeVar monomorph name). Returns
+/// the matched substring, or `None`. Deliberately dependency-free (no `regex` crate in this test
+/// binary): scan for the `$T` marker followed by ASCII digits.
+fn regex_lite_find_t_id(ir: &str) -> Option<String> {
+    let bytes = ir.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'$' && bytes[i + 1] == b'T' && bytes[i + 2].is_ascii_digit() {
+            let start = i;
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            return Some(ir[start..j].to_string());
+        }
+        i += 1;
+    }
+    None
 }

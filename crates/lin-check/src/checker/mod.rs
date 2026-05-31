@@ -62,6 +62,14 @@ pub struct Checker {
     generic_fn_params: std::collections::HashMap<String, Vec<(String, u32)>>,
     /// Next free quantified-generic TypeVar id (≥9000, above the intrinsic slot 9000).
     next_generic_tv: u32,
+    /// Phase 4.5b: element-type hint for an INTERMEDIATE `val <name> = lin_array_allocate(..)`
+    /// binding inside a combinator whose declared return is `Array(elem)`. When the active value
+    /// binding's name matches `.0` and its RHS is a fresh `lin_array_allocate` call, `check_stmt`
+    /// pins the binding's element type to `.1` (the declared-return element), so monomorphization
+    /// turns `Array(U)` into a concrete `Array(Int32)` and codegen emits a flat allocation that
+    /// matches the flat reader. Set/cleared around the body in `infer_function`; gated to the
+    /// allocation intrinsic so no other binding's representation changes. See ADR for rationale.
+    array_alloc_elem_hint: Option<(String, Type)>,
 }
 
 impl Default for Checker {
@@ -92,6 +100,7 @@ impl Checker {
             // Start above the intrinsic generic slot (9000) so quantified generics never
             // collide with `lin_map`/`lin_iter` et al.
             next_generic_tv: 9001,
+            array_alloc_elem_hint: None,
         }
     }
 
