@@ -29,12 +29,38 @@ impl Checker {
                     _ => None,
                 };
 
+                // Phase 4.5b: an INTERMEDIATE `val result = lin_array_allocate(n)` inside a
+                // combinator whose declared return is `Array(elem)`. `infer_function` set
+                // `array_alloc_elem_hint = Some((result, elem))` for exactly this binding. Check
+                // the fresh allocation against `Array(elem)` so its Json-wildcard element type is
+                // refined to the declared element (the generic param `U`). Monomorphization then
+                // pins `Array(U)` to a concrete `Array(Int32)` and codegen emits a flat allocation
+                // matching the flat reader. Gated to the allocation intrinsic (see the helper).
+                // Double-gate on the value here too (the hint name was matched syntactically in
+                // `infer_function`, but a nested non-function block could re-bind the same name to
+                // a non-alloc value; never retype that). Only a direct `lin_array_allocate(..)`
+                // call is refined.
+                let value_is_array_allocate = matches!(
+                    value,
+                    Expr::Call { func, .. } if matches!(func.as_ref(), Expr::Ident(n, _) if n == "lin_array_allocate")
+                );
+                let alloc_hint_elem = match (binding_name, &self.array_alloc_elem_hint) {
+                    (Some(name), Some((hint_name, elem)))
+                        if name == hint_name && expected.is_none() && value_is_array_allocate =>
+                    {
+                        Some(Type::Array(Box::new(elem.clone())))
+                    }
+                    _ => None,
+                };
+
                 let mut typed_value = match (value, binding_name) {
                     (Expr::Function { type_params, params, return_type, body, span }, Some(name)) => {
                         self.infer_function(type_params, params, return_type, body, *span, Some(name))?
                     }
                     _ => {
-                        if let Some(ref expected_ty) = expected {
+                        if let Some(ref hint_ty) = alloc_hint_elem {
+                            self.check_expr(value, hint_ty)?
+                        } else if let Some(ref expected_ty) = expected {
                             self.check_expr(value, expected_ty)?
                         } else {
                             self.infer_expr(value)?

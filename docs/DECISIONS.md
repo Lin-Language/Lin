@@ -915,3 +915,171 @@ copy from a fresh temp being freed → move". Regression: `test_concat_fresh_str
 (ADR-062) already retain by the same reasoning; this brings `concat` into line. The analogous
 move-without-retain residual leaks in the `for`/`map` element-shell path (`lower.rs`) are a distinct,
 pre-existing issue and are not addressed here.
+
+## ADR-065: Flow-typing refinement pins generic combinator array element types so monomorphization emits flat arrays
+
+**Context**: A generic array combinator returns a fresh array whose elements are produced at the
+generic param type — `<T, U>(arr: T[], f: (T) => U): U[]`. The only allocation intrinsic whose runtime
+representation the compiler fully controls is `lin_array_allocate`, which infers to the Json-wildcard
+array `Array(TypeVar(MAX))`. When such a function is MONOMORPHIZED at a concrete-scalar element
+(e.g. `U=Int32`), `subst` only rewrites TypeVars that actually appear in the recorded type — it
+substitutes `U→Int32` everywhere `U` occurs but never touches the `MAX` wildcard. So the allocation
+stays a TAGGED array (`lin_array_alloc_null`, 16-byte slots) while the `Int32[]`-typed consumer reads
+it through the FLAT accessor (`lin_flat_array_get_i32`, packed scalars) — a producer/consumer
+representation disagreement that reads garbage.
+
+**Decision (checker-side flow-typing, in `lin-check`)**: refine the wildcard element of a fresh
+`lin_array_allocate` to the function's declared-return element so monomorphization's existing `subst`
+pins `Array(U)` → `Array(Int32)`, and codegen's `is_flat_scalar` gate then emits a flat allocation that
+matches the flat reader. Two cases, both gated STRICTLY to the `lin_array_allocate` intrinsic:
+
+- **Direct body (Phase 4.5)**: `=> lin_array_allocate(n)` checked against the declared `Array(elem)`
+  retypes the call result via `retype_call_result` (`checker/expr.rs`,
+  `is_fresh_array_allocate_call`/`body_is_fresh_array_allocate`).
+- **Intermediate binding (Phase 4.5b, this ADR)**: the realistic map-shape body
+  `val result = lin_array_allocate(n); …write…; result`. `intermediate_array_allocate_binding`
+  (`checker/function.rs`) recognises a `Block` whose final expr is a bare `Ident(name)` bound by an
+  un-annotated `val name = lin_array_allocate(..)`; `infer_function`/`infer_function_with_hints` then
+  set a transient `array_alloc_elem_hint = (name, elem)` (saved/restored around the body for hygiene,
+  so nested/sibling functions are unaffected), and `check_stmt`'s `Stmt::Val` checks that exact binding
+  against `Array(elem)`. A user-supplied annotation on the binding wins (the helper bails), keeping the
+  programmer's representation choice authoritative.
+
+**Strict gating / correctness invariant**: ONLY the `lin_array_allocate` intrinsic — a fresh allocation
+the compiler controls end-to-end — is ever refined. Slice/concat/parse and every other `Json[]`-returning
+call (whose runtime representation we do NOT control) is left at `Array(MAX)` (tagged, correct). The
+flat/tagged decision is independently re-gated by codegen's `is_flat_scalar`, so a `String[]` or a
+still-abstract generic element stays TAGGED. The write into the refined flat array uses `lin_array_set`,
+which is representation-aware (dispatches on `elem_tag`, narrowing a tagged value into the packed flat
+slot), so producer (flat alloc) / writer (elem_tag-aware set) / reader (flat get) all agree.
+
+**No-op for pre-existing code**: nothing on master/generics-stdlib yet flows a concrete-scalar element
+through these patterns (stdlib array.lin is still Json), so the IR is byte-identical — verified by
+diffing a map/filter array-combinator program's `-O0` IR with and without the change.
+
+**Covered vs deferred**: the alloc-builder idiom (map/reverse/take/etc. — allocate then index-set and
+return) is covered. The `[]`+push builder idiom (filter/reduce: `val result = []; …push(result, x)…;
+result`) is DEFERRED. It would need (a) pinning the empty-array-literal binding's element type to the
+generic param and (b) representation-aware `Push` codegen — today the non-union `Push` path emits
+`lin_array_push`/`lin_array_push_tagged`, which assume the 16-byte tagged layout and would CORRUPT a
+flat buffer (only `lin_push_dyn` dispatches on `elem_tag`). Making the empty literal flat without also
+making `Push` flat-aware would introduce a new producer/consumer disagreement, so per "correctness over
+completeness" the push path is left as a follow-up. NOTE: the push-builder consumed at a concrete-scalar
+type already produces garbage on the generics-stdlib baseline (tagged producer, flat reader); this change
+neither fixes nor regresses it — the refinement never fires on a `[]` literal (it is a `MakeArray`, not a
+`lin_array_allocate` call). Regression tests: `test_generic_map_intermediate_alloc_*`
+(int32-flat-and-correct + IR proof, string-stays-tagged, mixed instantiations, json-stays-tagged,
+user-annotation-respected) in `crates/lin/tests/integration.rs`. ASan-clean over stdlib + examples + the
+flat/tagged/mixed fixtures.
+
+## ADR-066: A `Json` argument binds a generic `T[]` param to the Json wildcard; import-path monomorphization erases leftover inference TypeVars to Json (no garbage monomorph)
+
+**Status:** accepted (Phase 6-pre, prerequisite for genericizing stdlib `array.lin`).
+
+**Context.** Monomorphization specializes a generic function per distinct concrete instantiation,
+keying the specialization on the concrete types unified from the call site (`name$Int32`,
+`name$Str`, ...). Two related gaps made a generic `T[]` parameter unsafe once stdlib functions
+become generic and call each other internally:
+
+1. **Inference gap (lin-check).** `collect_type_subs` (`checker/helpers.rs`) had cases for
+   `(Array(T), Array(a))` and `(Array(T), FixedArray(..))` but NONE for `(Array(T), TypeVar(MAX))`
+   — i.e. unifying a generic `T[]` param against a `Json` value (`Json == TypeVar(u32::MAX)`).
+   So a generic `map<T,U>(arr: T[], ...)` called INTERNALLY by another stdlib fn on its `Json`
+   param (e.g. `sortBy` doing `arr.map(...)`) left `T` unbound.
+2. **Import-monomorphization soundness bug (lin-ir).** When a type param stayed bound to a
+   NON-CONCRETE `TypeVar` at a call inside an imported module, the import path
+   (`lower_import_module` -> `monomorphize_import`) materialized a specialization keyed on that
+   unsolved id (`map$T44_...`). The body then read/allocated the backing array at a bogus element
+   type -> runtime `capacity overflow` / heap corruption (`lin-runtime/src/array.rs`). The
+   main-module path tolerated this only because the case rarely arose; the import path hits it
+   routinely once stdlib fns call sibling generics on `Json` params.
+
+**Decision.**
+
+- **Bind `T = Json` for a `Json` argument.** Add `(Array(pt), TypeVar(MAX))` and
+  `(Iterator(pt), TypeVar(MAX))` arms to BOTH unifiers — `collect_type_subs` (lin-check) and
+  `collect_subs` (lin-ir `monomorphize.rs`) — that recurse the element against the Json wildcard.
+  A `Json` array argument therefore binds the element TypeVar(s) to `TypeVar(MAX)`, producing a
+  representation-consistent TAGGED `$Json` monomorph (`is_flat_scalar(MAX)` is false). A concrete
+  `Int32[]` argument still binds `T = Int32` and produces the FLAT `$Int32` monomorph.
+- **Erase leftover inference TypeVars to Json before keying a specialization (import safety net).**
+  In `monomorphize_inner` (lin-ir), after unifying the call, every binding value is run through
+  `erase_nonconcrete_typevars`: any LEFTOVER/unsolved inference `TypeVar` (id `< GENERIC_TV_BASE`,
+  e.g. `TypeVar(44)`) is rewritten to the `TypeVar(MAX)` Json wildcard, yielding a safe tagged
+  `$Json` monomorph instead of a garbage `$T<id>` one. A QUANTIFIED generic id (`>= GENERIC_TV_BASE`)
+  is deliberately LEFT UNTOUCHED so a genuinely-unconstrained param (`val mk = <T>(): T => 0; mk()`)
+  still produces the clean "cannot infer a concrete type" diagnostic rather than silently erasing.
+  `mangle_type(TypeVar(MAX))` renders as `Json`, so an erased specialization is named `name$Json`.
+
+**Consequences.** A generic `T[]` fn applied to a `Json` value is correct (tagged `$Json`, not
+null/garbage/crash); applied to `Int32[]` is still flat `$Int32`. The import path can never emit a
+`$T<id>` garbage monomorph or corrupt the heap. **No-op for current code**: no generic stdlib fns
+exist yet and no user generic on master flows a `Json` value into a `T[]` param, so the new arms
+never fire and the monomorphize pass is still skipped for non-generic modules — `array_pipeline`
+`-O0` IR is byte-identical. Regression tests in `crates/lin/tests/integration.rs`:
+`test_generic_t_array_param_with_json_arg_is_correct` (+ IR proof of tagged-Json / flat-Int32),
+`test_generic_import_path_unbound_typevar_is_safe` (+ IR proof of no `$T<id>` garbage). ASan-clean
+over stdlib + examples + both fixtures. Drove the import-path bug by temporarily making stdlib `map`
+generic and calling it via `sortBy` (reverted before commit).
+
+## ADR-067: Only direct-index array accessors (`at`/`set`/`indexOf`) are genericized to `<T>(T[], …)`; allocating/builder/dyn-fn/numeric/iterator combinators stay `Json`
+
+**Status:** accepted (Phase 6).
+
+**Context.** Phase 6 set out to convert `stdlib/array.lin` signatures from `Json` to generic `<T>`
+so concrete-element callers (`Int32[]`, `String[]`) get type-safety and, where the body is an
+alloc-builder, an unboxed flat representation. The prerequisites (ADR-065 flat-write for
+alloc-builder bodies; ADR-066 `T=Json` binding + safe import-path TypeVar erasure) are in place. The
+governing invariant is **representation consistency**: a value produced as flat (unboxed scalar
+buffer) must be read flat, and a value produced as tagged (16-byte `TaggedVal` elements) must be read
+tagged. A generic `T[]` return type makes a *concrete-scalar* consumer read the result via the flat
+accessor; if the body actually produced a boxed/tagged value, the consumer reads garbage and/or the
+runtime corrupts the heap (`array.rs` layout assertions, `ZExt` codegen on a pointer).
+
+**What converted (verified correct on `Int32[]`, `String[]`, heterogeneous `Json[]`, ASan-clean):**
+- `at`  → `<T>(arr: T[], index: Int32): T`
+- `set` → `<T>(arr: T[], idx: Int32, item: T): Null`
+- `indexOf` → `<T>(arr: T[], target: T): Int32`
+
+These are **direct-index accessors**: they read/write a single element through bracket
+indexing (`arr[i]` / `arr[i] = item`), which is already element-type-aware in both directions, and
+they do **not** allocate a new array nor route the element through an opaque `for`/closure callback
+or `push`. The element type flows straight between the typed param/return slot and the tag-aware
+index path, so flat and tagged inputs both stay consistent. Purely type-safety wins — no new
+allocation, no representation change, so no perf delta and the hot path of `array_pipeline`
+(`map`/`filter`/`reduce`, all still `Json`) is functionally unchanged (min-of-9 ≈ 550 ms before and
+after; output `1892804906`).
+
+**What stayed `Json` (converting each regressed, with the reason):**
+- `map` — alloc-builder, but `result[i] = f(item)` writes the result of an **opaque closure call**,
+  which arrives boxed. A flat `U[]` result would write/read it via the unboxed path → garbage
+  (`[1,2,3].map(x => x*2)` printed `-1349553662`). Needs the unboxed closure ABI (Phase 5b).
+- `push` — the non-union `Push` codegen assumes the tagged layout; a generic `push` to a
+  concrete-scalar flat array failed codegen (`ZExt only operates on integer`) and broke every test.
+- `slice` / `concat` / `append` / `prepend` — backed by `lin_array_*_dyn` runtime fns that preserve
+  the runtime element representation, but a `T[]`-typed monomorph reader for **sub-byte-width flat
+  element types** (`UInt8[]`) reads inconsistently: genericizing `slice` regressed the byte
+  consumers (`bytes`, `codec/tlv`, `raspberry-controller/rtp`+`nal`). Left `Json`.
+- `filter` / `reduce` / `find` / `flatMap` / `partition` / `unique` / `compact` / `take` / `drop` /
+  `takeWhile` / `dropWhile` / `zip` / `reverse` / `chunk` / `scan` / `groupBy` / `countBy` —
+  `[]`+`push` builders, or alloc-builders that copy the element **through an opaque `for` callback**
+  (so the element arrives boxed). Same Phase-5b gap as `map`: a flat-typed reader of the result would
+  see garbage. Left `Json`.
+- `sum` / `product` / `min` / `max` / `minBy` / `maxBy` — numeric reductions using `+`/`*`/`<`; a
+  `<T>` body needs a `<T: Numeric>` constraint Lin lacks, so the body would not type-check. Left
+  `Json[]`.
+- `for` / `while` / `iter` / `iterOf` / `range` / `rangeStep` — operate on iterables
+  (`Iterator<T>`), not just `T[]`; constraining to `T[]` breaks iterator callers. Left `Json`.
+- `object.lin` `fromEntries` / `mapValues` / `isEmpty` — object-centric (and `length` is used on
+  objects too, so it must stay `Json`); no clean `T[]` win. Left untouched.
+
+**Behaviour note.** `at`/`set`/`indexOf` no longer accept a non-array `Json` (e.g. an `Iterator`)
+directly — `range(0,10).at(5)` now reports `expected Int32[]`. No existing stdlib/example caller
+relied on that (the only `at` caller, `calc/lexer`, uses `std/string`'s `at`; the only 2-arg `set`
+caller uses `std/async`'s `set`). Wrap an iterator in an array (e.g. via `slice`) first.
+
+**Consequences.** Type-safety for the three accessors; representation consistency preserved
+everywhere. The flat-pipeline payoff awaits the unboxed closure ABI (Phase 5b) which unblocks the
+builder/`for`-callback combinators (and ultimately `map`). Regression: integration 351/0,
+stdlib+examples 59/59, all example projects build, ASan-clean. Tests in `stdlib/array.test.lin`
+(`at`/`set`/`indexOf` on `Int32[]`+`String[]`+round-trip).
