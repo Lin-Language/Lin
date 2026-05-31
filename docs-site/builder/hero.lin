@@ -53,6 +53,8 @@ export val buildHero = (base: String): String =>
     { "id": "pattern", "label": "Pattern Matching", "file": "pattern-matching.lin" },
     { "id": "union", "label": "Union Types", "file": "union-types.lin" },
     { "id": "async", "label": "Async", "file": "async.lin" },
+    { "id": "threading", "label": "Threading", "file": "threading.lin" },
+    { "id": "http", "label": "HTTP", "file": "http.lin" },
     { "id": "lowlevel", "label": "Low Level", "file": "low-level.lin" }
   ]
 
