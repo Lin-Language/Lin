@@ -1719,7 +1719,7 @@ Decided:
 6. `is`/`has` are expressions of type `Boolean` and may appear in any expression context.
 7. A single `match` arm uses either `is` or `has`, not both.
 8. Assignment expressions evaluate to the assigned value.
-9. Operators are built-in, not ordinary functions. No unary operators in v1.
+9. Operators are built-in, not ordinary functions. Exactly two unary operators — bitwise `~` and logical `!`; no unary minus (§24.1, §35.2, ADR-059).
 10. `Iterator<T>` and `Iterable<T>` are opaque runtime types.
 11. Arrays satisfy `Iterable<T>` automatically.
 12. Array types are `T[]` (unbounded) and `[T1, T2, ...]` (fixed-length).
