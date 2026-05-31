@@ -1,5 +1,5 @@
 use lin_common::{Span, NumSuffix};
-use crate::token::{Token, TokenKind};
+use crate::token::{Comment, Token, TokenKind};
 
 pub struct Lexer {
     source: Vec<char>,
@@ -12,6 +12,10 @@ pub struct Lexer {
     bracket_depth: usize,
     brace_depth: usize,
     interp_depth: Vec<usize>,
+    /// `//` line comments captured as they are skipped, on a side channel so the token
+    /// stream is byte-identical with or without comments (ADR-040 reversal). Consumed by
+    /// the formatter to re-attach comments after a reformat. See `comments()`.
+    comments: Vec<Comment>,
 }
 
 impl Lexer {
@@ -27,7 +31,15 @@ impl Lexer {
             bracket_depth: 0,
             brace_depth: 0,
             interp_depth: Vec::new(),
+            comments: Vec::new(),
         }
+    }
+
+    /// The `//` line comments captured during tokenization, in source order. Empty until
+    /// `tokenize()` (or another lexing entry point) has run. Used by the formatter to
+    /// re-attach comments to the reformatted output.
+    pub fn comments(&self) -> &[Comment] {
+        &self.comments
     }
 
     pub fn tokenize(&mut self) -> Vec<Token> {
@@ -192,9 +204,35 @@ impl Lexer {
     }
 
     fn skip_line_comment(&mut self) {
+        let start = self.pos;
+        // Char advance is identical to the original discard-only loop, so the token stream
+        // is byte-identical with or without the recording.
         while self.pos < self.source.len() && self.source[self.pos] != '\n' {
             self.pos += 1;
         }
+        // Right-trim trailing whitespace from the captured text (canonicalization for
+        // idempotency: `//x   ` → `//x`). The span still covers the original, untrimmed run.
+        let raw: String = self.source[start..self.pos].iter().collect();
+        let text = raw.trim_end().to_string();
+        // `own_line` iff only whitespace precedes `start` on this line: scan back over spaces
+        // and tabs; true if we reach index 0 or a newline.
+        let mut own_line = true;
+        let mut i = start;
+        while i > 0 {
+            match self.source[i - 1] {
+                ' ' | '\t' => i -= 1,
+                '\n' => break,
+                _ => {
+                    own_line = false;
+                    break;
+                }
+            }
+        }
+        self.comments.push(Comment {
+            span: self.span(start, self.pos),
+            text,
+            own_line,
+        });
     }
 
     fn peek_at(&self, offset: usize) -> Option<char> {
@@ -618,5 +656,110 @@ impl Lexer {
             _ => TokenKind::Ident(ch.to_string()),
         };
         Token::new(kind, self.span(start, self.pos))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tokens(src: &str) -> Vec<Token> {
+        Lexer::new(src, 0).tokenize()
+    }
+
+    #[test]
+    fn comments_do_not_alter_token_stream() {
+        // Prove the token stream is byte-identical with vs without comments. We strip the
+        // comment text from each line while PRESERVING line structure (an own-line comment
+        // becomes a blank line, a trailing comment is dropped leaving the code). Blank lines
+        // produce no tokens, so kinds AND spans AND newline_before must all match.
+        let with_comments = "\
+val x = 1 // trailing
+// own-line comment
+val y = 2
+";
+        // Line-structure-preserving removal of comment text only.
+        let stripped: String = {
+            let mut out = String::new();
+            for line in with_comments.split_inclusive('\n') {
+                let body = line.trim_end_matches('\n');
+                if let Some(idx) = body.find("//") {
+                    // Keep code before the comment, trimming the now-trailing space so the
+                    // remaining code is positioned exactly as the lexer would see it (the
+                    // lexer's skip_spaces would skip that space anyway, but trimming keeps
+                    // the token spans aligned for the same-line code).
+                    out.push_str(body[..idx].trim_end());
+                } else {
+                    out.push_str(body);
+                }
+                if line.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            out
+        };
+
+        let a = tokens(with_comments);
+        let b = tokens(&stripped);
+        let kinds_a: Vec<_> = a.iter().map(|t| &t.kind).collect();
+        let kinds_b: Vec<_> = b.iter().map(|t| &t.kind).collect();
+        assert_eq!(kinds_a, kinds_b, "token kinds must match with/without comments");
+        assert_eq!(a.len(), b.len(), "token count must match");
+        for (ta, tb) in a.iter().zip(b.iter()) {
+            assert_eq!(ta.newline_before, tb.newline_before, "newline_before must match");
+        }
+        // Absolute spans necessarily differ (comment text occupies source columns/lines),
+        // but the relative SHAPE must be identical: each token's span LENGTH matches its
+        // comment-free counterpart, proving the lexer consumed exactly the same code chars.
+        for (ta, tb) in a.iter().zip(b.iter()) {
+            assert_eq!(
+                ta.span.end - ta.span.start,
+                tb.span.end - tb.span.start,
+                "span length must match for {:?}",
+                ta.kind
+            );
+        }
+    }
+
+    #[test]
+    fn comments_are_captured_with_own_line_flag() {
+        let src = "\
+// leading own-line
+val x = 1 // trailing after code
+val y = 2
+";
+        let mut lexer = Lexer::new(src, 0);
+        let _ = lexer.tokenize();
+        let comments = lexer.comments();
+        assert_eq!(comments.len(), 2);
+
+        assert_eq!(comments[0].text, "// leading own-line");
+        assert!(comments[0].own_line);
+
+        assert_eq!(comments[1].text, "// trailing after code");
+        assert!(!comments[1].own_line);
+    }
+
+    #[test]
+    fn comment_text_is_right_trimmed() {
+        let src = "val x = 1 // note   \n";
+        let mut lexer = Lexer::new(src, 0);
+        let _ = lexer.tokenize();
+        let comments = lexer.comments();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].text, "// note");
+        assert!(!comments[0].own_line);
+    }
+
+    #[test]
+    fn indented_own_line_comment_is_own_line() {
+        let src = "val f = x =>\n    // body comment\n    x\n";
+        let mut lexer = Lexer::new(src, 0);
+        let _ = lexer.tokenize();
+        let comments = lexer.comments();
+        assert_eq!(comments.len(), 1);
+        // Indentation precedes `//` and is consumed before capture, so text starts at `//`.
+        assert_eq!(comments[0].text, "// body comment");
+        assert!(comments[0].own_line);
     }
 }
