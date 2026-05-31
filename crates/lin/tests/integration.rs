@@ -3959,6 +3959,34 @@ fn test_fmt_preserves_trailing_comments() {
 }
 
 #[test]
+fn test_fmt_else_if_chain_stays_flat() {
+    // A flat `else if` chain must NOT nest one indent level deeper per arm (no
+    // `else { if … else { if … } }` staircase). Each `else if` sits at the `if` indent.
+    // The branch values are long enough that the chain cannot collapse to one inline line.
+    let source = "val f = (kind: Int32): Int32 =>\n  if kind == 1 then 1000000 + 1000000\n  else if kind == 2 then 2000000 + 2000000\n  else if kind == 3 then 3000000 + 3000000\n  else 9000000 + 9000000\n";
+    let out = fmt(source);
+    assert!(out.contains("\n  else if kind == 2 then"), "else-if not flat:\n{}", out);
+    assert!(out.contains("\n  else if kind == 3 then"), "else-if not flat:\n{}", out);
+    // No deep staircase indent (8+ spaces before an `if`).
+    assert!(!out.contains("        if kind =="), "else-if chain nested into a staircase:\n{}", out);
+    assert_eq!(out, fmt(&out), "else-if chain format not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_preserves_inline_branch_comments() {
+    // Trailing comments on each arm of a one-line `if/else if` chain must stay attached
+    // to their branch body when the chain is re-rendered in block form.
+    let source = "val f = (k: Int32): Int32 =>\n  if k == 1 then 10 // one\n  else if k == 2 then 20 // two\n  else 0 // other\n";
+    let out = fmt(source);
+    assert!(out.contains("10 // one"), "then-branch comment lost:\n{}", out);
+    assert!(out.contains("20 // two"), "else-if-branch comment lost:\n{}", out);
+    assert!(out.contains("0 // other"), "else-branch comment lost:\n{}", out);
+    // All three comments survive (none dropped, none duplicated).
+    assert_eq!(out.matches("//").count(), 3, "branch comment count changed:\n{}", out);
+    assert_eq!(out, fmt(&out), "branch-comment format not idempotent:\n{}", out);
+}
+
+#[test]
 fn test_fmt_comments_idempotent() {
     // A fixture mixing own-line, trailing, and indented in-block comments.
     let source = r#"import { print } from "std/io"
