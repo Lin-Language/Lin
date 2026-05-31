@@ -738,6 +738,14 @@ pub unsafe extern "C" fn lin_string_replace_all(
 
 /// Convert a TaggedVal* to a string, dispatching on the runtime tag.
 /// `tagged` may be null (treated as Null) or a pointer to a TaggedVal.
+///
+/// OWNERSHIP: returns an OWNED (+1) string the caller must release. Every numeric/null/bool/
+/// array/object branch allocates a fresh +1 string, and codegen's `ToString` lowering registers
+/// the result as owned and releases it at scope exit. The `TAG_STR` case must therefore RETAIN the
+/// borrowed input string before returning it (rather than handing back a +0 alias), or the
+/// caller's release over-decrements and double-frees the underlying buffer — the bug behind the
+/// intermittent heap corruption when a fresh heap string (e.g. a `join` result) was stringified on
+/// an assertion's fail path (`toString(value)` in std/test).
 #[no_mangle]
 pub unsafe extern "C" fn lin_tagged_to_string(tagged: *const TaggedVal) -> *mut LinString {
     if tagged.is_null() {
@@ -762,7 +770,11 @@ pub unsafe extern "C" fn lin_tagged_to_string(tagged: *const TaggedVal) -> *mut 
         let f = f64::from_bits(payload);
         lin_float_to_string(f)
     } else if tag == TAG_STR {
-        payload as *mut LinString
+        // Return an OWNED reference: retain the borrowed input so the caller's release is
+        // balanced (no-op for immortal literals). See the OWNERSHIP note above.
+        let s = payload as *mut LinString;
+        lin_string_inc_ref(s);
+        s
     } else if tag == TAG_ARRAY {
         let arr = payload as *const crate::array::LinArray;
         lin_array_to_string(arr)
