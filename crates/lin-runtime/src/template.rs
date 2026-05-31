@@ -82,9 +82,13 @@ unsafe fn resolve_path(obj: *const LinObject, path: &str) -> String {
         }
 
         if idx == last {
-            // Convert the final value to its display string.
+            // Convert the final value to its display string. `lin_tagged_to_string` returns an
+            // OWNED (+1) string; copy its bytes into an owned Rust String, then release our
+            // reference so the heap string is not leaked (no-op for immortal literals).
             let s = lin_tagged_to_string(tv);
-            return (*s).as_str().to_owned();
+            let owned = (*s).as_str().to_owned();
+            crate::string::lin_string_release(s);
+            return owned;
         }
 
         // Descend into nested object.
