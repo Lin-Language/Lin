@@ -3,6 +3,10 @@
 /build
 .lin-cache/
 .claude/worktrees/
+examples/lib/*.a
+examples/lib/*.o
 examples/ffi/*.o
 # libmathlib.a is committed (the FFI example links against it; lin test needs it).
 benchmarks/results/
+docs-site/output/
+/docs-builder

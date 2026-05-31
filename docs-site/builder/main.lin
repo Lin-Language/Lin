@@ -1,0 +1,147 @@
+import { print } from "std/io"
+import { readFile, writeFile, readJson, ls, mkdir, cp } from "std/fs"
+import { join } from "std/path"
+import { split, startsWith, contains, trim, substring, indexOf, replaceAll } from "std/string"
+import { for, filter, push, length } from "std/array"
+import { renderWith } from "std/template"
+import { getEnv } from "std/env"
+
+import { markdownToHtml } from "./markdown"
+import { buildNav } from "./nav"
+
+// Resolve paths relative to the docs-site directory.
+// The binary is run from the repo root, so we prefix with "docs-site/".
+val contentDir = "docs-site/content"
+val outputDir = "docs-site/output"
+val staticDir = "docs-site/static"
+val pageTemplate = "docs-site/templates/page.lint"
+val homeTemplate = "docs-site/templates/home.lint"
+
+// Deployment base path. GitHub Pages serves a project site under "/<repo>", so all
+// internal links and asset URLs are prefixed with this. Set LIN_DOCS_BASE=/Lin in CI;
+// it defaults to "" for a local build served from the filesystem root.
+val basePath =
+  val env = getEnv("LIN_DOCS_BASE")
+  if env == null then "" else env
+
+// Extract the text from a heading line "# Foo" -> "Foo"
+val headingText = (line: String): String =>
+  trim(substring(line, 2, length(line)))
+
+// Extract the first H1 heading from markdown source, or fall back to the default
+val extractTitle = (source: String): String =>
+  var title = "Lin Documentation"
+  var found = false
+  val lines = split(source, "\n")
+  lines.for(line =>
+    if found == false && startsWith(line, "# ") then title = headingText(line)
+    if found == false && startsWith(line, "# ") then found = true
+  )
+  title
+
+// Convert a content file path to its output HTML path
+// e.g. "docs-site/content/tutorials/01-hello.md" -> "docs-site/output/tutorials/01-hello.html"
+val contentPathToOutput = (path: String): String =>
+  val prefix = "${contentDir}/"
+  val prefixLen = length(prefix)
+  val relative = if startsWith(path, prefix) then substring(path, prefixLen, length(path)) else path
+  val noExt = if contains(relative, ".md") then substring(relative, 0, length(relative) - 3) else relative
+  "${outputDir}/${noExt}.html"
+
+// Convert a content file path to its URL path
+val contentPathToUrl = (path: String): String =>
+  val prefix = "${contentDir}/"
+  val prefixLen = length(prefix)
+  val relative = if startsWith(path, prefix) then substring(path, prefixLen, length(path)) else path
+  val noExt = if contains(relative, ".md") then substring(relative, 0, length(relative) - 3) else relative
+  if noExt == "index" then "/" else "/${noExt}"
+
+// Get the directory portion of a file path
+val dirName = (filePath: String): String =>
+  val parts = split(filePath, "/")
+  val n = length(parts)
+  var dirParts = []
+  var k = 0
+  parts.for(part =>
+    if k < n - 1 then dirParts.push(part)
+    k = k + 1
+  )
+  join(dirParts)
+
+// Check if a Json value indicates a failure
+val isFailure = (v: Json): Boolean =>
+  v != null && v["type"] == "failure"
+
+// Get file content string from readFile result (returns "" on error)
+val fileContent = (v: Json): String =>
+  if isFailure(v) then ""
+  else v
+
+// Get error message from a failure value
+val errorMsg = (v: Json): String =>
+  if v == null then "unknown error"
+  else if v["error"] == null then "unknown error"
+  else v["error"]
+
+// Process a single markdown file, returning Null
+val processFile = (filePath: String, navEntries: Json): Null =>
+  val sourceJson = readFile(filePath)
+  if isFailure(sourceJson) then print("Error reading ${filePath}: ${errorMsg(sourceJson)}")
+  else
+    val source = fileContent(sourceJson)
+    val title = extractTitle(source)
+    val rawHtml = markdownToHtml(source)
+    // Prefix root-relative links (href="/...") authored in the Markdown with the
+    // deployment base path. No-op when basePath is "" (local/root deployment).
+    val htmlContent = replaceAll(rawHtml, "href=\"/", "href=\"${basePath}/")
+    val urlPath = contentPathToUrl(filePath)
+    val navHtml = buildNav(navEntries, urlPath, basePath)
+    val outputPath = contentPathToOutput(filePath)
+    val templatePath = if urlPath == "/" then homeTemplate else pageTemplate
+    val templateJson = readFile(templatePath)
+    val templateStr = fileContent(templateJson)
+    val rendered = renderWith(templateStr, { "title": title, "nav": navHtml, "content": htmlContent, "base": basePath })
+    val outDir = dirName(outputPath)
+    mkdir(outDir, { "parents": true })
+    val writeResult = writeFile(outputPath, rendered)
+    if isFailure(writeResult) then print("Error writing ${outputPath}: ${errorMsg(writeResult)}")
+    else print("  ${outputPath}")
+
+// Copy static assets to output/static/
+val copyStatic = (): Null =>
+  val outStaticDir = "${outputDir}/static"
+  mkdir(outStaticDir, { "parents": true })
+  val filesJson = ls(staticDir, {})
+  if isFailure(filesJson) then print("Error listing static dir: ${errorMsg(filesJson)}")
+  else
+    val files = filesJson
+    files.for(filename =>
+      val srcPath = "${staticDir}/${filename}"
+      val dstPath = "${outStaticDir}/${filename}"
+      val copyResult = cp(srcPath, dstPath)
+      if isFailure(copyResult) then print("Error copying ${filename}: ${errorMsg(copyResult)}")
+    )
+
+// Main entry point
+val navResult = readJson("${contentDir}/nav.json")
+val navEntries = if isFailure(navResult) then [] else navResult
+
+val allFilesJson = ls(contentDir, { "recursive": true })
+val allFiles = if isFailure(allFilesJson) then [] else allFilesJson
+
+val mdFiles = allFiles.filter(f => contains(f, ".md"))
+val total = length(mdFiles)
+print("Building docs: ${total} pages...")
+
+mkdir(outputDir, { "parents": true })
+
+var count = 0
+mdFiles.for(relativePath =>
+  val fullPath = "${contentDir}/${relativePath}"
+  processFile(fullPath, navEntries)
+  count = count + 1
+)
+
+copyStatic()
+
+print("Done! Generated ${count} pages in ${outputDir}/")
