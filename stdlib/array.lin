@@ -95,7 +95,7 @@ export val reduce = <T, U>(arr: T[], init: U, f: (U, T) => U): U =>
 // sibling call to the generic `map`/`filter`/`reduce` from inside this module would specialize at
 // the `$Json` representation cross-module, where the combinator's owned-array result and the
 // surrounding generic body's RC accounting disagree (a double-release of the intermediate array —
-// the chained-map-over-Json RC mismatch noted in ADR-068/069). Keeping these helpers on the
+// the chained-map-over-Json RC mismatch noted in ADR-069). Keeping these helpers on the
 // non-generic Json signature routes them through the SAME boxed intrinsic path the pre-generics
 // map/filter/reduce used, which is correct. The generic exports above still give the zero-box fast
 // path for monomorphic scalar pipelines at the user's call site.
