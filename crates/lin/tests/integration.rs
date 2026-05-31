@@ -2552,6 +2552,42 @@ print(toString(keys(merged)))
 }
 
 #[test]
+fn test_union_if_null_nested_dedups_to_single_null() {
+    // `if … then null else (if … then v else null)` unions a literal Null with a nested
+    // union that also ends in Null. `flatten_union` must drop the NON-adjacent duplicate
+    // Null (it uses order-preserving set-insert, not consecutive `Vec::dedup`), so the
+    // missing-arm diagnostic reads "not covered: Null", never the malformed "Null | Null".
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val a = true
+val b = false
+val x = if a then null else (if b then 5 else null)
+val y = match x
+  is Int32 => x
+print(toString(y))
+"#);
+    assert!(err.contains("not covered: Null") && !err.contains("Null | Null"), "got: {}", err);
+}
+
+#[test]
+fn test_union_if_null_else_json_collapses_to_json() {
+    // When exactly one branch is literal Null and the other is `Json` (the dynamic top type
+    // that already subsumes Null), the result collapses to `Json` rather than `Json | Null`.
+    // This both avoids a redundant union and keeps the internal `?T…` sentinel out of
+    // diagnostics. A `Json` result is assignable to `Int32` under the lenient-json rule.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val j: Json = 7
+val c = false
+val x: Int32 = if c then null else j
+print(toString(x))
+"#);
+    assert_eq!(output, vec!["7"]);
+}
+
+#[test]
 fn test_object_shorthand_construction() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"

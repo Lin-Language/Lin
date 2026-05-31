@@ -445,8 +445,17 @@ impl Checker {
         // index). When exactly one branch is `Null` and the other is not, form the union so both
         // branches survive (and survive monomorphization substitution of any generic `T`).
         let result_type = if (then_ty == Type::Null) != (else_ty == Type::Null) {
-            // Exactly one branch is the literal Null type — keep both as a union.
-            Type::flatten_union(vec![then_ty, else_ty])
+            // Exactly one branch is the literal Null type. Keep both as a union so the
+            // value-producing branch survives — UNLESS the other branch is `Json` (the dynamic
+            // top type, `TypeVar(u32::MAX)`), which already subsumes `Null`: there `Json | Null`
+            // is redundant and would leak the internal `?T4294967295` sentinel into diagnostics,
+            // so collapse to `Json` (the pre-change behaviour for this specific pairing).
+            let other = if then_ty == Type::Null { &else_ty } else { &then_ty };
+            if is_json_dynamic(other) {
+                other.clone()
+            } else {
+                Type::flatten_union(vec![then_ty, else_ty])
+            }
         } else if self.types_compatible(&then_ty, &else_ty) {
             else_ty
         } else if self.types_compatible(&else_ty, &then_ty) {
