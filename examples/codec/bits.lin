@@ -1,28 +1,20 @@
 // Bit-twiddling helpers used by the codec, and a home for the low-level / byte
 // language features (bitwise operators, small integer types, nibble packing).
-
 import { length } from "std/array"
 
 // Pack two 4-bit nibbles into one byte.
-export val packNibbles = (high: Int32, low: Int32): Int32 =>
-  (high << 4) | (low & 0x0F)
+export val packNibbles = (high: Int32, low: Int32): Int32 => high << 4 | low & 15
 
 // The high nibble of a byte.
-export val highNibble = (b: Int32): Int32 =>
-  b >> 4
+export val highNibble = (b: Int32): Int32 => b >> 4
 
 // The low nibble of a byte.
-export val lowNibble = (b: Int32): Int32 =>
-  b & 0x0F
+export val lowNibble = (b: Int32): Int32 => b & 15
 
 // Extract a NAL-unit-type-style field: the low 5 bits of a header byte.
-export val nalType = (header: Int32): Int32 =>
-  header & 0x1F
+export val nalType = (header: Int32): Int32 => header & 31
 
 // A simple 1-byte XOR checksum over a byte list.
-val checksumFrom = (bytes: Int32[], i: Int32, acc: Int32): Int32 =>
-  if i >= length(bytes) then acc
-  else checksumFrom(bytes, i + 1, acc ^ bytes[i])
+val checksumFrom = (bytes: Int32[], i: Int32, acc: Int32): Int32 => if i >= length(bytes) then acc else checksumFrom(bytes, i + 1, acc ^ bytes[i])
 
-export val checksum = (bytes: Int32[]): Int32 =>
-  checksumFrom(bytes, 0, 0)
+export val checksum = (bytes: Int32[]): Int32 => checksumFrom(bytes, 0, 0)

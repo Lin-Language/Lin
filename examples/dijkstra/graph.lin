@@ -1,4 +1,5 @@
 import { for, push, reverse, length } from "std/array"
+
 import { toString } from "std/string"
 
 // A weighted directed edge as it appears in the input graph.
@@ -12,14 +13,14 @@ export type Neighbor = { "to": String, "weight": Int32 }
 // adjacency values are Neighbor[]; dist values are Int32; prev values are String.
 export val buildAdj = (edges: Edge[]): Json =>
   var adj = {}
-  edges.for(edge =>
-    val src = edge["from"]
-    val existing = adj[src]
-    if existing == null then
-      lin_object_set(adj, src, [{ "to": edge["to"], "weight": edge["weight"] }])
-    else
-      push(existing, { "to": edge["to"], "weight": edge["weight"] })
-  )
+  edges
+    .for(edge =>
+      val src = edge["from"]
+      val existing = adj[src]
+      if existing == null then
+        lin_object_set(adj, src, [{ "to": edge["to"], "weight": edge["weight"] }])
+      else
+        push(existing, { "to": edge["to"], "weight": edge["weight"] }))
   adj
 
 val walkPath = (prev: Json, source: String, path: String[], current: String): Null =>
@@ -28,9 +29,12 @@ val walkPath = (prev: Json, source: String, path: String[], current: String): Nu
     val p = toString(pRaw)
     push(path, p)
     walkPath(prev, source, path, p)
+  else
+    null
 
 export val reconstructPath = (prev: Json, source: String, target: String): String[] =>
-  if target == source then [source]
+  if target == source then
+    [source]
   else
     var path = [target]
     walkPath(prev, source, path, target)

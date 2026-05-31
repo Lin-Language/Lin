@@ -4,12 +4,11 @@
 //
 // This complements the schema-based loader: `fromJson` is the language's built-in
 // structural decode, where loader.lin/schema.lin show a hand-rolled validator.
-
 import { fromJson } from "std/json"
 
 export type Address = { "city": String, "zip": String | Null }
+
 export type Person = { "name": String, "age": Int32, "address": Address }
 
 // Decode a Json value into a Person (or an Error). Detect failure with `is Error`.
-export val decodePerson = (j: Json): Person | Error =>
-  Person.fromJson(j)
+export val decodePerson = (j: Json): Person | Error => Person.fromJson(j)

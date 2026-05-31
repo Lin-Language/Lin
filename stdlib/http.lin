@@ -4,59 +4,66 @@ import foreign "lin-runtime"
   val lin_parse_json: (String) => Json
   val lin_server_path_match: (String, String) => Json
 
-export type HttpRequest = {
-  "method": String,
-  "path": String,
-  "query": String,
-  "headers": Json,
-  "body": String
-}
+export type HttpRequest = { "method": String, "path": String, "query": String, "headers": Json, "body": String }
 
-export type HttpResponse = {
-  "status": Int32,
-  "headers": Json,
-  "body": String
-}
+export type HttpResponse = { "status": Int32, "headers": Json, "body": String }
 
-export type HttpOptions = {
-  "method": String,
-  "headers": Json,
-  "body": String
-}
+export type HttpOptions = { "method": String, "headers": Json, "body": String }
 
-export val fetch = (url: String): Json =>
-  lin_http_fetch(url)
+export val fetch = (url: String): Json => lin_http_fetch(url)
 
-export val fetchWith = (url: String, options: Json): Json =>
-  lin_http_fetch_with(url, options)
+export val fetchWith = (url: String, options: Json): Json => lin_http_fetch_with(url, options)
 
 export val fetchJson = (url: String): Json =>
   val response = lin_http_fetch(url)
-  if response["type"] == "error" then response
-  else lin_parse_json(response["body"])
+  if response["type"] == "error" then
+    response
+  else
+    lin_parse_json(response["body"])
 
 export val postJson = (url: String, body: Json): Json =>
-  lin_http_fetch_with(url, { "method": "POST", "headers": { "Content-Type": "application/json" }, "body": lin_to_string(body) })
+  lin_http_fetch_with(url, {
+    "method": "POST",
+    "headers": { "Content-Type": "application/json" },
+    "body": lin_to_string(body),
+  })
 
 export val json = (status: Int32, data: Json): HttpResponse =>
-  { "status": status, "headers": { "Content-Type": "application/json" }, "body": lin_to_string(data) }
+  {
+    "status": status,
+    "headers": { "Content-Type": "application/json" },
+    "body": lin_to_string(data),
+  }
 
 export val text = (status: Int32, body: String): HttpResponse =>
-  { "status": status, "headers": { "Content-Type": "text/plain; charset=utf-8" }, "body": body }
+  {
+    "status": status,
+    "headers": { "Content-Type": "text/plain; charset=utf-8" },
+    "body": body,
+  }
 
 export val redirect = (location: String): HttpResponse =>
-  { "status": 302, "headers": { "Location": location }, "body": "" }
+  {
+    "status": 302,
+    "headers": { "Location": location },
+    "body": "",
+  }
 
-export val notFound: HttpResponse = { "status": 404, "headers": {}, "body": "Not Found" }
+export val notFound: HttpResponse = {
+  "status": 404,
+  "headers": {},
+  "body": "Not Found",
+}
 
 export val badRequest = (message: String): HttpResponse =>
-  { "status": 400, "headers": {}, "body": message }
+  {
+    "status": 400,
+    "headers": {},
+    "body": message,
+  }
 
-export val parseBody = (req: Json): Json =>
-  lin_parse_json(req["body"])
+export val parseBody = (req: Json): Json => lin_parse_json(req["body"])
 
-export val matchPath = (path: String, pattern: String): Json =>
-  lin_server_path_match(pattern, path)
+export val matchPath = (path: String, pattern: String): Json => lin_server_path_match(pattern, path)
 
-export val serve = (handler: Json, port: Int32): Null =>
-  lin_serve(handler, port)
+export val serve = (handler: Json, port: Int32): Null => lin_serve(handler, port)

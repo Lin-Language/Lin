@@ -4,53 +4,66 @@
 // Modules:
 //   tasks.lin    — async/await, parallel, race, timeout, retry, fault isolation, nested flatten
 //   services.lin — ThreadPool, Worker, Shared<T>, Frozen<T>
-
 import { print } from "std/io"
+
 import { toString } from "std/string"
-import {
-  squareAsync, weightedTriple, firstToFinish, withDeadline,
-  retryDivide, safeDivide, nestedValue
-} from "./tasks"
-import {
-  poolSum, accumulate, workerFaults, sharedCounter, sharedSnapshot, frozenLookup
-} from "./services"
+
+import { squareAsync, weightedTriple, firstToFinish, withDeadline, retryDivide, safeDivide, nestedValue } from "./tasks"
+
+import { poolSum, accumulate, workerFaults, sharedCounter, sharedSnapshot, frozenLookup } from "./services"
 
 print("== async / await ==")
+
 print("7 squared on another thread: ${toString(squareAsync(7))}")
 
 print("== parallel (order-preserving) ==")
+
 print("weighted triple of (1,2,3): ${toString(weightedTriple(1, 2, 3))}")
 
 print("== race (first to finish wins) ==")
+
 print("slow=200ms vs fast=10ms: ${firstToFinish(200, 10)}")
 
 print("== timeout (abandons the slow thread) ==")
+
 print("300ms work, 30ms budget: ${toString(withDeadline(300, 30))}")
+
 print("5ms work, 1s budget:     ${toString(withDeadline(5, 1000))}")
 
 print("== retry (first non-Error wins) ==")
+
 print("10/2 retried 3x: ${toString(retryDivide(10, 2, 3))}")
+
 print("10/0 retried 3x: ${retryDivide(10, 0, 3)["type"]}")
 
 print("== fault isolation (thunk fault -> Error at await) ==")
+
 print("safeDivide 10/2: ${toString(safeDivide(10, 2))}")
+
 print("safeDivide 10/0: ${toString(safeDivide(10, 0))}  (recovered to -1)")
 
 print("== nested-promise auto-flatten ==")
+
 print("async(async(42)) awaited once: ${toString(nestedValue(42))}")
 
 print("== ThreadPool (bounded concurrency) ==")
+
 print("12 tasks on 3 workers, summed: ${toString(poolSum(3, 12))}")
 
 print("== Worker (confined mutable state + onShutdown) ==")
+
 print("deposits [10,5,100] -> running total: ${toString(accumulate([10, 5, 100]))}")
+
 print("worker handler fault isolated: ${toString(workerFaults())}")
 
 print("== Shared<T> (atomic box + RwLock) ==")
+
 print("5 concurrent withLock pushes: ${toString(sharedCounter())}")
+
 print("get() snapshot stays stable after set(): ${toString(sharedSnapshot())}")
 
 print("== Frozen<T> (lock-free shared reads) ==")
+
 print("sum of frozen table read in parallel: ${toString(frozenLookup())}")
 
 print("done")

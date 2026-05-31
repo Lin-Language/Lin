@@ -1,6 +1,9 @@
 import { suite, test, expect, run, toBe } from "std/test"
+
 import { clampSpeed, encodePacket, applyKey } from "./main"
+
 import { length } from "std/array"
+
 import { f32FromBe } from "std/bytes"
 
 // Tests for the pure protocol/control core of the RC-car controller. The
@@ -8,54 +11,67 @@ import { f32FromBe } from "std/bytes"
 // (encodePacket, applyKey, clampSpeed) are, and std/net/std/tty have their own
 // coverage in the runtime test suites. Test bodies are Assertion[] arrays so every
 // assertion runs.
-
 val s = suite("raspberry-controller", [
-  test("clampSpeed quantises to one decimal and clamps to [-1, 1]", () => [
-    expect(clampSpeed(0.5)).toBe(0.5),
-    expect(clampSpeed(0.15)).toBe(0.2),              // rounds to nearest 0.1
-    expect(clampSpeed(0.24)).toBe(0.2),
-    expect(clampSpeed(1.5)).toBe(1.0),               // clamps high
-    expect(clampSpeed(0.0 - 1.5)).toBe(0.0 - 1.0)    // clamps low
-  ]),
-
-  test("encodePacket is 8 bytes: two big-endian f32 motor speeds", () => [
-    expect(length(encodePacket(0.0, 0.0))).toBe(8),
-    expect(length(encodePacket(0.5, 0.0 - 0.25))).toBe(8),
+  test("clampSpeed quantises to one decimal and clamps to [-1, 1]", () =>
+    [
+      expect(clampSpeed(0.5)).toBe(0.5),
+      expect(clampSpeed(0.15)).toBe(0.2),
+      expect(clampSpeed(0.24)).toBe(0.2),
+      expect(clampSpeed(1.5)).toBe(1.0),
+      expect(clampSpeed(0.0 - 1.5)).toBe(0.0 - 1.0),
+    ]),
+  test("encodePacket is 8 bytes: two big-endian f32 motor speeds", () =>
+    // rounds to nearest 0.1
+    // clamps high
+    // clamps low
+    [
+      expect(length(encodePacket(0.0, 0.0))).toBe(8),
+      expect(length(encodePacket(0.5, 0.0 - 0.25))).toBe(8),
+      expect(f32FromBe(encodePacket(0.5, 0.0 - 0.25), 0)).toBe(0.5),
+      expect(f32FromBe(encodePacket(0.5, 0.0 - 0.25), 4)).toBe(0.0 - 0.25),
+    ]),
+  test("encodePacket stop is all zero bytes", () =>
     // decode the two f32s back out (0.5 and -0.25 are exact in f32). This is the
     // byte-level read that the flat-concat fix makes correct.
-    expect(f32FromBe(encodePacket(0.5, 0.0 - 0.25), 0)).toBe(0.5),
-    expect(f32FromBe(encodePacket(0.5, 0.0 - 0.25), 4)).toBe(0.0 - 0.25)
-  ]),
-
-  test("encodePacket stop is all zero bytes", () => [
-    expect(encodePacket(0.0, 0.0)[0]).toBe(0),
-    expect(encodePacket(0.0, 0.0)[3]).toBe(0),
-    expect(encodePacket(0.0, 0.0)[7]).toBe(0)
-  ]),
-
-  test("applyKey: q/a step left, w/s step right, space stops", () => [
-    expect(applyKey(113, 0.0, 0.0)[0]).toBe(0.1),          // q: left +
-    expect(applyKey(97, 0.0, 0.0)[0]).toBe(0.0 - 0.1),     // a: left -
-    expect(applyKey(119, 0.0, 0.0)[1]).toBe(0.1),          // w: right +
-    expect(applyKey(115, 0.0, 0.0)[1]).toBe(0.0 - 0.1),    // s: right -
-    expect(applyKey(32, 0.7, 0.0 - 0.4)[0]).toBe(0.0),     // space: both zero
-    expect(applyKey(32, 0.7, 0.0 - 0.4)[1]).toBe(0.0)
-  ]),
-
-  test("applyKey leaves the other wheel untouched", () => [
-    expect(applyKey(113, 0.0, 0.3)[1]).toBe(0.3),   // q doesn't change right
-    expect(applyKey(119, 0.6, 0.0)[0]).toBe(0.6)    // w doesn't change left
-  ]),
-
-  test("applyKey clamps at the boundary", () => [
-    expect(applyKey(113, 1.0, 0.0)[0]).toBe(1.0),            // q at max stays 1.0
-    expect(applyKey(115, 0.0, 0.0 - 1.0)[1]).toBe(0.0 - 1.0) // s at min stays -1.0
-  ]),
-
-  test("applyKey ignores unknown keys", () => [
-    expect(applyKey(120, 0.5, 0.3)[0]).toBe(0.5),   // x: unchanged
-    expect(applyKey(120, 0.5, 0.3)[1]).toBe(0.3)
-  ]),
+    [
+      expect(encodePacket(0.0, 0.0)[0]).toBe(0),
+      expect(encodePacket(0.0, 0.0)[3]).toBe(0),
+      expect(encodePacket(0.0, 0.0)[7]).toBe(0),
+    ]),
+  test("applyKey: q/a step left, w/s step right, space stops", () =>
+    [
+      expect(applyKey(113, 0.0, 0.0)[0]).toBe(0.1),
+      expect(applyKey(97, 0.0, 0.0)[0]).toBe(0.0 - 0.1),
+      expect(applyKey(119, 0.0, 0.0)[1]).toBe(0.1),
+      expect(applyKey(115, 0.0, 0.0)[1]).toBe(0.0 - 0.1),
+      expect(applyKey(32, 0.7, 0.0 - 0.4)[0]).toBe(0.0),
+      expect(applyKey(32, 0.7, 0.0 - 0.4)[1]).toBe(0.0),
+    ]),
+  test("applyKey leaves the other wheel untouched", () =>
+    // q: left +
+    // a: left -
+    // w: right +
+    // s: right -
+    // space: both zero
+    [
+      expect(applyKey(113, 0.0, 0.3)[1]).toBe(0.3),
+      expect(applyKey(119, 0.6, 0.0)[0]).toBe(0.6),
+    ]),
+  test("applyKey clamps at the boundary", () =>
+    // q doesn't change right
+    // w doesn't change left
+    [
+      expect(applyKey(113, 1.0, 0.0)[0]).toBe(1.0),
+      expect(applyKey(115, 0.0, 0.0 - 1.0)[1]).toBe(0.0 - 1.0),
+    ]),
+  test("applyKey ignores unknown keys", () =>
+    // q at max stays 1.0
+    // s at min stays -1.0
+    [
+      expect(applyKey(120, 0.5, 0.3)[0]).toBe(0.5),
+      expect(applyKey(120, 0.5, 0.3)[1]).toBe(0.3),
+    ]),
 ])
 
+// x: unchanged
 run(s)

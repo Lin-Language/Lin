@@ -4,8 +4,8 @@
 //
 // Run:   lin run examples/report/main.lin
 // Test:  lin test examples/report/
-
 import { render } from "./report"
+
 import { print } from "std/io"
 
 val lines = [
@@ -14,7 +14,7 @@ val lines = [
   "bad-row",
   "Charlie, 78",
   ", 50",
-  "Diana, 100"
+  "Diana, 100",
 ]
 
 print(render(lines))
