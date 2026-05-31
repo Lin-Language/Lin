@@ -1291,3 +1291,48 @@ the borrowed-concrete-element tagged push, and the full object-array inline win 
 disabled). Verified: stdlib+examples 59/59; integration 357/0; ASan-clean across every example-project
 test (codec/report/result/matrix/config/processes/dijkstra/web-server) + a `filter`-over-`Object[]`
 fixture that double-freed before; array_pipeline still `1892804906` with zero box/unbox in the loops.
+## ADR-070: `await` enforces Error handling via `T | Error` (no nominal Promise type)
+
+**Decision.** `await` is typed as a generic `<T>(p: T): T | Error` in `stdlib/async.lin`. It is the
+single point where a faulted async computation surfaces as an `Error` value (spec §32.2.2), so it is
+also the single point where the `Error` member is injected into the type. The result is a union
+`T | Error`, and the *existing* union-assignment check — the same machinery `fromJson` relies on
+(ADR-047) — rejects assigning it to a bare target type:
+
+```
+val r: Int32 = await(p)   // Error: Expected type Int32, got ?T | { "type": String, "message": String }
+```
+
+To consume the result you must handle the `Error` case (`match … is Error => … else => …`), exactly
+as the spec intends. No new checker, codegen, runtime, or intrinsic code was needed; the feature is a
+pure stdlib signature change leaning on generics (ADR-063) plus the pre-existing union-vs-bare check.
+
+**Why `await`, not `async`.** The natural reading of the spec ("async wraps its return in `T|Error`")
+is *not* codegen-sound here, and an early attempt to type `async` as `<T>(f: () => T): T | Error`
+crashed codegen (`Found PointerValue … but expected the IntValue variant` in `boxing.rs`). The reason:
+`async`/`poolAsync`/`race`/`timeout`/`retry` all return a **live `LinPromise*` handle**, not a resolved
+value — the value only materialises at `await`. A union type forces a boxed-`TaggedVal*` representation
+and scalar boxing; applying it to a promise pointer makes codegen try to box the promise *as* its inner
+scalar, which is a representation mismatch. So every promise-*producing* wrapper keeps its opaque `Json`
+typing (a `LinPromise*` is just an opaque pointer, same as `Json`), and only the promise-*consuming*
+`await` — whose runtime result genuinely is a boxed value — carries the `T | Error` union. This still
+satisfies §32.2.2 (you cannot use an awaited result without handling the `Error`), which is the rule the
+spec actually cares about; it just attaches the union one call later than the prose suggests.
+
+**Why lightweight (no `Type::Promise<T>`).** Introducing a nominal `Type::Promise<T>` would touch
+type compat/resolve/zonk/monomorphize, every async intrinsic signature, and codegen boxing — a large,
+risky change for the §32.2.2 guarantee alone. The generic-union approach reuses what already exists.
+
+**Known limitation (honest).** Because there is no nominal `Promise<T>` and a promise handle is erased
+to `Json`, this enforces *"you must handle the Error after awaiting"* but does **not** catch *"you forgot
+to await"* — i.e. using a promise as if it were the value. A real `Type::Promise<T>` would catch the
+latter (a promise wouldn't be assignable to its inner type), but at the cost above. This is not a
+regression: the previous all-`Json` typing didn't catch the forgotten-await case either. Deferred.
+
+**Narrowing footnote.** Match narrowing does not strip the structural `Error` member from an
+`?T | Error` union whose `T` is an unsolved type variable (the awaited value, since the promise is
+`Json`). So `match await(…) is Error => … else => result` leaves `result` typed as the full union in
+the `else` arm rather than `?T`. Routing the awaited value through a `Json`-typed boundary (a tiny
+`(r: Json): Int32 => match r is Error => … else => r` helper) sidesteps this and coerces cleanly; the
+concurrency examples and async tests use that helper for happy-path arithmetic. Improving union
+narrowing over unsolved type variables is a separate, pre-existing checker concern.

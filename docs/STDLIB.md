@@ -260,7 +260,7 @@ This document specifies the standard library for the Lin language. All modules a
 | Function | Signature | Summary |
 | --- | --- | --- |
 | [`async`](#async) | `(() -> T) -> Promise` | Run a thunk asynchronously |
-| [`await`](#await) | `(Promise) -> T` | Block until a promise resolves |
+| [`await`](#await) | `<T>(T) -> T \| Error` | Block until a promise resolves; result must handle `Error` |
 | [`close`](#close) | `(Worker) -> Null` | Shut down a worker |
 | [`frozen`](#frozen) | `<T>(T) -> T` | Deep-freeze a value into lock-free shared read-only state |
 | [`get`](#shared--get--set--withlock) | `<T>(Shared<T>) -> T` | Read a snapshot copy out of a `Shared` |
@@ -3415,10 +3415,10 @@ val result = await(p)
 ### await
 
 ```txt
-val await: (Promise) -> T
+val await: <T>(p: T) -> T | Error
 ```
 
-Blocks the current thread until the promise resolves, then returns its value. Can also await an array of promises — returns an array of results.
+Blocks the current thread until the promise resolves, then returns its value as `T | Error`. Can also await an array of promises — returns an array of results.
 
 ```txt
 val [users, posts] = await([
@@ -3440,10 +3440,20 @@ match await(p)
   else     => use(result)
 ```
 
-> Note: the spec also says the checker should *reject* using an uninspected `Error` result as a
-> plain `T` (§32.2.2). That static check is not yet enforced — the async surface is `Json`-typed,
-> so `await(p)` returns `Json` and coerces freely; it needs parametric `Promise<T>` typing
-> (ADR-046). `is Error` gives the runtime discrimination meanwhile.
+The static check from §32.2.2 *is* enforced: because `await` returns `T | Error`, assigning the
+result to a binding that does not handle the `Error` case is a compile-time error.
+
+```txt
+val r: Int32 = await(p)   // type error: Int32 | Error is not assignable to Int32
+```
+
+You must handle the `Error` (e.g. with the `match` above) before using the value as a plain `T`.
+
+> Limitation (ADR-070): there is no nominal `Promise<T>` type — a promise handle is erased to
+> `Json` — so this enforces "you must handle the `Error` after awaiting" but does **not** catch
+> "you forgot to `await`" (using a promise as if it were the value). Error injection happens at
+> `await` (where the value materialises), not at `async`, because the other async primitives
+> return live promise handles, not values.
 
 ---
 

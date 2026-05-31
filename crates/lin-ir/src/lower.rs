@@ -1849,6 +1849,12 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         TypedExpr::MakeArray { elements, ty, .. } => {
             let elem_ty = match ty {
                 Type::Array(inner) => *inner.clone(),
+                // A fixed-length array (`[T1, T2, ...]`, §8.3) has heterogeneous positional
+                // types, so it is stored as a TAGGED (Json) array — each element boxes to a
+                // TaggedVal* via coerce_to_slot_type below, and Index reads unbox per the
+                // positional result type. Without this the slot type defaulted to Null and
+                // every element was coerced away to null.
+                Type::FixedArray(_) => Type::TypeVar(u32::MAX),
                 _ => Type::Null,
             };
             // Coerce each element to the array's element representation. For a Json/union
