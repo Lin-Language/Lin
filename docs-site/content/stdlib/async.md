@@ -14,7 +14,7 @@ import { shared, get, set, withLock, frozen } from "std/async"
 | Function | Signature | Description |
 | --- | --- | --- |
 | `async` | `(() -> T) -> Promise` | Run thunk on background thread |
-| `await` | `(Promise) -> T` | Block until promise resolves |
+| `await` | `(Promise) -> T \| Error` | Block until promise resolves; result must handle `Error` |
 | `close` | `(Worker) -> Null` | Shut down worker |
 | `frozen` | `(T) -> T` | Deep-freeze a value into lock-free shared read-only state |
 | `get` | `(Shared) -> T` | Read a snapshot copy out of a `Shared` |
@@ -38,8 +38,13 @@ import { shared, get, set, withLock, frozen } from "std/async"
 ```lin
 val p = async(() => expensiveComputation())
 // ... do other work ...
-val result = await(p)
+val result = await(p)   // T | Error
+match result
+  is Error => print("failed")
+  else     => print("${result}")
 ```
+
+`await` returns `T | Error` — a fault inside the thunk surfaces as an `Error` here. You must handle the `Error` case; assigning straight to the bare value type (`val n: Int32 = await(p)`) is a compile-time error (spec §32.2.2, ADR-070).
 
 The thunk may not capture `var` bindings (compile-time error where detectable).
 

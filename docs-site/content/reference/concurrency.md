@@ -33,15 +33,26 @@ Blocks the current thread until the promise resolves, returning `T | Error`:
 
 ```lin
 val result = await(p)   // T | Error
+match result
+  is Error => print("failed")
+  else     => print("got ${result}")
 ```
 
 A fault (runtime error) inside the thunk is caught at the thread boundary and surfaces as an `Error` value at `await`, so the result type is always `T | Error`.
+
+**You must handle the `Error` case.** Assigning an awaited result straight to a binding of the bare value type is a compile-time error — the type checker enforces it (spec §32.2.2):
+
+```lin
+val n: Int32 = await(p)   // compile error: Int32 | Error is not assignable to Int32
+```
 
 `await` also accepts a `Promise[]` and returns a result array:
 
 ```lin
 val [a, b] = await([asyncA, asyncB])
 ```
+
+> The `T | Error` union is attached at `await` rather than at `async` (the promise handle in flight is opaque; only `await` materialises a result that can fault). There is no nominal `Promise<T>` type, so the checker enforces "handle the `Error`" but does not catch "forgot to `await`". See ADR-070.
 
 ## `parallel(thunks)`
 
