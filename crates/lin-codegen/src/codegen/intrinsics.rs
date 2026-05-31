@@ -560,10 +560,38 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.call(vk_fn, &[tagged.into()], "ir_vkey").try_as_basic_value().unwrap_basic()
                 } else { ptr_ty.const_null().into() }
             }
-            // lin_array_allocate(n) => Json[]  (null-filled tagged array of length n).
+            // lin_array_allocate(n) => T[]. When the result element type is a CONCRETE scalar
+            // (e.g. a monomorphized `Int32[]`), allocate a FLAT array so the producer's
+            // representation matches the concrete-typed reader (which already reads flat via
+            // `lin_flat_array_get_<suffix>`). `lin_array_allocate(n)` yields a length-`n` array
+            // of default slots, so the flat path uses the filled-with-zero allocator to pre-size
+            // to `n` — a subsequent `result[i] = v` index-set then lands in-bounds, exactly like
+            // the tagged `alloc_null(n)`. For Json/TypeVar/union or heap (String, …) element
+            // types stay TAGGED (existing behaviour). The READ path already dispatches on the
+            // static element type; this aligns the WRITE path so a flat-allocated array is only
+            // ever flat-written and flat-read (alloc/set/get/length/release all agree).
             Intrinsic::ArrayAllocate => {
                 let i64_ty = self.context.i64_type();
                 let n_i64 = self.ir_n_to_i64(args.first().copied(), arg_tys.first());
+                // Only a uniform `Array(T)` has a single element type. `FixedArray` is a
+                // heterogeneous tuple shape (Vec<Type>) and never a flat scalar array.
+                let elem_ty = match ret_ty {
+                    Type::Array(inner) => Some((**inner).clone()),
+                    _ => None,
+                };
+                if let Some(elem) = elem_ty.filter(Self::is_flat_scalar) {
+                    let suffix = Self::flat_suffix(&elem);
+                    let fn_name = format!("lin_flat_array_alloc_filled_{}", suffix);
+                    let llvm_elem_ty = self.llvm_type(&elem);
+                    let zero: BasicValueEnum<'ctx> = if llvm_elem_ty.is_float_type() {
+                        llvm_elem_ty.into_float_type().const_zero().into()
+                    } else {
+                        llvm_elem_ty.into_int_type().const_zero().into()
+                    };
+                    let alloc_fn = self.get_or_declare_fn(&fn_name,
+                        ptr_ty.fn_type(&[i64_ty.into(), llvm_elem_ty.into()], false));
+                    return self.builder.call(alloc_fn, &[n_i64.into(), zero.into()], "ir_alloc_flat").try_as_basic_value().unwrap_basic();
+                }
                 let alloc_fn = self.get_or_declare_fn("lin_array_alloc_null",
                     ptr_ty.fn_type(&[i64_ty.into()], false));
                 self.builder.call(alloc_fn, &[n_i64.into()], "ir_alloc_arr").try_as_basic_value().unwrap_basic()
