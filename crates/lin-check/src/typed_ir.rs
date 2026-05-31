@@ -327,6 +327,13 @@ pub enum TypedMatchPattern {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TypedPattern {
     TypeCheck(Type, Span),
+    /// `is <Name>` where the resolved type is a non-empty object (ADR-053). Behaves exactly
+    /// like `TypeCheck(ty, span)` for narrowing/zonking/exhaustiveness, but lowers to a
+    /// `MatchesSchema` deep type-validation instead of a bare tag/presence check. Carries the
+    /// resolved bodies of every reachable `Named` type (`named_defs`) so IR lowering — which
+    /// has no type environment — can build the recursive schema descriptor (mirrors
+    /// `TypedExpr::FromJson`'s payload).
+    TypeCheckDeep(Type, Vec<(String, Type)>, Span),
     Literal(Box<TypedExpr>),
     Object {
         fields: Vec<TypedPatternField>,

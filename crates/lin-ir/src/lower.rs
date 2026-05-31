@@ -1834,21 +1834,22 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                     PatternTest::Always => builder.const_temp(Const::Bool(true)),
                 };
             }
-            // `is <Named>` resolving to an object shape (e.g. `Error`, or a user object-type
-            // alias like `Person`): a bare tag check matches ANY object, which is too loose and
-            // unsound — narrowing then types missing fields as present, faulting at runtime.
-            // Check the required fields are present, mirroring the match-arm path (HasPattern).
-            if let TypedPattern::TypeCheck(Type::Object(fields), _) = pattern {
-                if !fields.is_empty() {
-                    let dst = builder.alloc_temp(Type::Bool);
-                    let required_fields: Vec<String> = fields.keys().cloned().collect();
-                    builder.emit(Instruction::HasPattern {
-                        dst,
-                        val: val_temp,
-                        pattern: HasDesc { required_fields },
-                    });
-                    return dst;
-                }
+            // `is <Named>` resolving to a non-empty object shape (e.g. a user object-type alias
+            // like `Person`): a bare tag check (or mere field-presence, ADR-050) matches objects
+            // with the WRONG field types, which is unsound — the arm then narrows the binding and
+            // a subsequent field access operates on the wrong runtime type. Deep-validate field
+            // types recursively via the `fromJson` structural walker (ADR-053). `MatchesSchema`
+            // borrows the boxed value and reads a static descriptor — no ownership change, so the
+            // `val_temp` boxing is the same one the former HasPattern path used.
+            if let TypedPattern::TypeCheckDeep(target, named_defs, _) = pattern {
+                let dst = builder.alloc_temp(Type::Bool);
+                builder.emit(Instruction::MatchesSchema {
+                    dst,
+                    val: val_temp,
+                    target: target.clone(),
+                    named_defs: named_defs.clone(),
+                });
+                return dst;
             }
             let dst = builder.alloc_temp(Type::Bool);
             let (check_ty, _span) = pattern_type_check(pattern);
@@ -3295,16 +3296,18 @@ fn lower_match_pattern(
         // never matched). Bindings always match; the value is bound in lower_match_bindings.
         TypedMatchPattern::Is(TypedPattern::Binding(..))
         | TypedMatchPattern::Is(TypedPattern::Wildcard(..)) => PatternTest::Always,
-        // `is <Named>` where the name resolves to an object shape (e.g. the built-in `Error`,
-        // or a user object-type alias): a bare tag check matches ANY object, which is too loose.
-        // Check the object's required fields are present, mirroring `is { .. }`.
-        TypedMatchPattern::Is(TypedPattern::TypeCheck(Type::Object(fields), _)) if !fields.is_empty() => {
-            let required_fields: Vec<String> = fields.keys().cloned().collect();
+        // `is <Named>` where the name resolves to a non-empty object shape (a user object-type
+        // alias like `Person`): a bare tag check (or mere field-presence, ADR-050) matches
+        // objects with the WRONG field types, which is unsound once the arm narrows the binding.
+        // Deep-validate field types recursively via the `fromJson` structural walker (ADR-053).
+        // `scrut` is the already-boxed scrutinee; `MatchesSchema` borrows it (no ownership change).
+        TypedMatchPattern::Is(TypedPattern::TypeCheckDeep(target, named_defs, _)) => {
             let dst = builder.alloc_temp(Type::Bool);
-            builder.emit(Instruction::HasPattern {
+            builder.emit(Instruction::MatchesSchema {
                 dst,
                 val: scrut,
-                pattern: HasDesc { required_fields },
+                target: target.clone(),
+                named_defs: named_defs.clone(),
             });
             PatternTest::Cond(dst)
         }
@@ -3488,7 +3491,10 @@ fn lower_typed_pattern_bindings(
                 builder.slots.insert(*rest_slot, dst);
             }
         }
-        TypedPattern::TypeCheck(_, _) | TypedPattern::Literal(_) | TypedPattern::Wildcard(_) => {
+        TypedPattern::TypeCheck(_, _)
+        | TypedPattern::TypeCheckDeep(_, _, _)
+        | TypedPattern::Literal(_)
+        | TypedPattern::Wildcard(_) => {
             // No bindings.
         }
     }
@@ -3498,6 +3504,7 @@ fn pattern_elem_type(pattern: &TypedPattern) -> Type {
     match pattern {
         TypedPattern::Binding(_, ty, _) => ty.clone(),
         TypedPattern::TypeCheck(ty, _) => ty.clone(),
+        TypedPattern::TypeCheckDeep(ty, _, _) => ty.clone(),
         _ => Type::Null,
     }
 }
@@ -3998,6 +4005,7 @@ fn lower_string_interp(
 fn pattern_type_check(pattern: &TypedPattern) -> (Type, lin_common::Span) {
     match pattern {
         TypedPattern::TypeCheck(ty, span) => (ty.clone(), *span),
+        TypedPattern::TypeCheckDeep(ty, _, span) => (ty.clone(), *span),
         TypedPattern::Binding(_, ty, span) => (ty.clone(), *span),
         TypedPattern::Wildcard(span) => (Type::Never, *span),
         TypedPattern::Literal(e) => (e.ty(), e.span()),

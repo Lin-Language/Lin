@@ -203,6 +203,12 @@ fn zonk_match_arm(arm: &mut TypedMatchArm, subs: &HashMap<u32, Type>) {
 fn zonk_pattern(pat: &mut TypedPattern, subs: &HashMap<u32, Type>) {
     match pat {
         TypedPattern::TypeCheck(ty, _) => *ty = zonk_type(ty, subs),
+        TypedPattern::TypeCheckDeep(ty, named_defs, _) => {
+            *ty = zonk_type(ty, subs);
+            for (_, body) in named_defs.iter_mut() {
+                *body = zonk_type(body, subs);
+            }
+        }
         TypedPattern::Literal(e) => zonk_expr(e, subs),
         TypedPattern::Binding(_, ty, _) => *ty = zonk_type(ty, subs),
         TypedPattern::Object { fields, .. } => {

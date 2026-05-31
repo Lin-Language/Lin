@@ -47,7 +47,13 @@ impl Checker {
                 let tp = self.check_pattern(pat, scrutinee_ty)?;
                 // Narrow the scrutinee variable within this arm's scope.
                 // Reuse the same slot so LocalGet can unbox the TaggedVal pointer correctly.
-                if let (Some(name), TypedPattern::TypeCheck(ref narrowed_ty, _)) = (scrutinee_name, &tp) {
+                // `TypeCheckDeep` (ADR-053) narrows to its object type exactly like `TypeCheck`.
+                let narrowed = match &tp {
+                    TypedPattern::TypeCheck(ty, _) => Some(ty),
+                    TypedPattern::TypeCheckDeep(ty, _, _) => Some(ty),
+                    _ => None,
+                };
+                if let (Some(name), Some(narrowed_ty)) = (scrutinee_name, narrowed) {
                     if let Some(orig_info) = self.env.lookup(name) {
                         let orig_slot = orig_info.slot;
                         self.env.define_narrowed(name.to_string(), narrowed_ty.clone(), orig_slot);
@@ -154,6 +160,23 @@ impl Checker {
                 // carries `"type": "error"`; a decoded value of any other shape does not.
                 if name == "Error" {
                     return Ok(self.error_discriminant_pattern(*span));
+                }
+                // `is <Name>` resolving to a non-empty object type (ADR-053): validate field
+                // TYPES recursively at runtime, not just field presence (ADR-050). A bare
+                // presence check let `{ "name": 1, "age": "x" }` match `Person`, then the arm
+                // narrowed the binding and a subsequent `x["age"] + 1` operated on the wrong
+                // runtime type — unsound. Reuse the `fromJson` structural walker by carrying the
+                // target object type + the resolved bodies of every reachable Named type (so IR
+                // lowering can build the recursive schema descriptor without a type env). An
+                // empty object type `{}` keeps the cheap bare tag check (nothing to validate).
+                if let Type::Object(ref fields) = ty {
+                    if !fields.is_empty() {
+                        let mut named_defs: Vec<(String, Type)> = Vec::new();
+                        let mut seen: std::collections::HashSet<String> =
+                            std::collections::HashSet::new();
+                        self.collect_named_defs(&ty, &mut seen, &mut named_defs);
+                        return Ok(TypedPattern::TypeCheckDeep(ty, named_defs, *span));
+                    }
                 }
                 Ok(TypedPattern::TypeCheck(ty, *span))
             }

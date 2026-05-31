@@ -1450,6 +1450,12 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, result.into());
                             }
                         }
+                        Instruction::MatchesSchema { dst, val, target, named_defs } => {
+                            if let Some(&v) = temp_map.get(val) {
+                                let result = self.compile_ir_matches_schema(v, target, named_defs);
+                                temp_map.insert(*dst, result.into());
+                            }
+                        }
                         Instruction::Coerce { dst, src, from_ty, to_ty } => {
                             if let Some(&sv) = temp_map.get(src) {
                                 let result = self.compile_ir_coerce(sv, from_ty, to_ty);
