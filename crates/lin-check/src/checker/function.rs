@@ -119,11 +119,21 @@ impl Checker {
             Some(rt) => Some(resolve_type(rt, &self.env).map_err(|e| Diagnostic::error(span, e))?),
             None => None,
         };
-        // Only CHECK the body bidirectionally when the declared return type carries a `StrLit`
-        // singleton (the only case that needs the expected type pushed down for refinement).
-        // Otherwise infer as before, preserving the existing "Function body has type ..." error.
+        // CHECK the body bidirectionally against the declared return type when that type is
+        // structured (an object/named/union, or one mentioning a `StrLit` singleton). This pushes
+        // the expected type into `if`/`match` arms (see `check_branch_against`), which:
+        //   - refines object/string literals against the declared shape (ADR-051), and
+        //   - lets one arm yield a `Json` value while another yields a concrete object literal,
+        //     each checked against the declared return — fixing the match-arm-union-vs-declared-
+        //     object bug (previously the arms were inferred independently, unioned into
+        //     `Json | {concrete}`, and that union rejected against `R`).
+        // `checked_against_declared` records that `check_expr` already enforced compatibility, so
+        // the post-pass `types_compatible(body_ty, declared)` re-check (which would reject the
+        // surviving `Json | {R}` union type) is skipped.
+        let mut checked_against_declared = false;
         let typed_body_raw = match &declared_ret {
-            Some(declared) if super::expr::type_mentions_strlit(declared) => {
+            Some(declared) if super::expr::expected_pushes_into_branches(declared) => {
+                checked_against_declared = true;
                 self.check_expr(body, declared)?
             }
             _ => self.infer_expr(body)?,
@@ -153,7 +163,7 @@ impl Checker {
         captures.sort_by_key(|c| c.outer_slot);
 
         let ret_type = if let Some(declared) = declared_ret {
-            if !self.types_compatible(&body_ty, &declared) {
+            if !checked_against_declared && !self.types_compatible(&body_ty, &declared) {
                 return Err(Diagnostic::error(
                     span,
                     format!(
@@ -283,8 +293,12 @@ impl Checker {
             Some(rt) => Some(resolve_type(rt, &self.env).map_err(|e| Diagnostic::error(span, e))?),
             None => None,
         };
+        // See `infer_function` for the rationale: push a structured declared return type into the
+        // body's `if`/`match` arms (fixes the match-arm-union-vs-declared-object bug).
+        let mut checked_against_declared = false;
         let typed_body_raw = match &declared_ret {
-            Some(declared) if super::expr::type_mentions_strlit(declared) => {
+            Some(declared) if super::expr::expected_pushes_into_branches(declared) => {
+                checked_against_declared = true;
                 self.check_expr(body, declared)?
             }
             _ => self.infer_expr(body)?,
@@ -312,7 +326,7 @@ impl Checker {
         captures.sort_by_key(|c| c.outer_slot);
 
         let ret_type = if let Some(declared) = declared_ret {
-            if !self.types_compatible(&body_ty, &declared) {
+            if !checked_against_declared && !self.types_compatible(&body_ty, &declared) {
                 return Err(Diagnostic::error(span, format!(
                     "Function body has type {}, declared return type is {}", body_ty, declared
                 )));

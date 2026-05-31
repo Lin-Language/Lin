@@ -81,6 +81,57 @@ impl Checker {
         })
     }
 
+    /// Like `check_match_arm`, but checks the arm body against an `expected` type (bidirectional
+    /// push). Used when a `match` is in a position with a known structured expected type (e.g. a
+    /// declared object return type) so each arm refines/accepts against it directly, rather than
+    /// inferring arms independently and unioning them. See `check_branch_against` for the
+    /// arm-body compatibility rule (including the `Json`-arm allowance).
+    pub(crate) fn check_match_arm_against(
+        &mut self,
+        arm: &lin_parse::ast::MatchArm,
+        scrutinee_ty: &Type,
+        scrutinee_name: Option<&str>,
+        expected: &Type,
+    ) -> Result<TypedMatchArm, Diagnostic> {
+        self.env.push_scope();
+
+        let typed_pattern = match &arm.pattern {
+            MatchPattern::Is(pat) => {
+                let tp = self.check_pattern(pat, scrutinee_ty)?;
+                if let (Some(name), TypedPattern::TypeCheck(ref narrowed_ty, _)) = (scrutinee_name, &tp) {
+                    if let Some(orig_info) = self.env.lookup(name) {
+                        let orig_slot = orig_info.slot;
+                        self.env.define_narrowed(name.to_string(), narrowed_ty.clone(), orig_slot);
+                    } else {
+                        self.env.define(name.to_string(), narrowed_ty.clone(), false);
+                    }
+                }
+                TypedMatchPattern::Is(tp)
+            }
+            MatchPattern::Has(pat) => {
+                TypedMatchPattern::Has(self.check_pattern(pat, scrutinee_ty)?)
+            }
+            MatchPattern::Else => TypedMatchPattern::Else,
+        };
+
+        let typed_guard = if let Some(ref guard) = arm.guard {
+            Some(self.check_expr(guard, &Type::Bool)?)
+        } else {
+            None
+        };
+
+        let typed_body = self.check_branch_against(&arm.body, expected)?;
+
+        self.env.pop_scope();
+
+        Ok(TypedMatchArm {
+            pattern: typed_pattern,
+            guard: typed_guard,
+            body: typed_body,
+            span: arm.span,
+        })
+    }
+
     pub(crate) fn check_pattern(
         &mut self,
         pattern: &Pattern,

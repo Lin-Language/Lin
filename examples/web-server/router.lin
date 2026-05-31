@@ -1,10 +1,13 @@
 import { handleIndex, handleStatus, handleUser } from "./handlers"
 import { pathMatch } from "std/http"
 
-// Requests have a known shape; responses are the handlers' `Json` results.
+// Requests and responses both have a known shape; each match arm (a handler's
+// `Response` result or a concrete `Response`-shaped object literal) is checked
+// against the declared `Response` return type.
 type Request = { "method": String, "path": String, "query": String, "headers": Json, "body": String }
+type Response = { "status": Int32, "headers": Json, "body": String }
 
-export val router = (req: Request): Json =>
+export val router = (req: Request): Response =>
   match req["path"]
     is "/" => handleIndex(req)
     is "/api/status" => handleStatus(req)

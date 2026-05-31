@@ -1,21 +1,25 @@
 import { json, text, notFound, badRequest, pathMatch } from "std/http"
 import { render } from "std/template"
 
-// The incoming request has a known shape (`Request`); the response values come
-// straight from std/http's `json`/`text`/`badRequest` helpers, which are typed
-// `Json` (a dynamic header map + serialized body), so the return stays `Json`.
+// The incoming request has a known shape (`Request`). Responses also have a known
+// shape (`Response`): every handler yields the std/http `json`/`text`/`badRequest`
+// helpers (typed `Json` — a dynamic header map + serialized body) OR a concrete
+// `Response`-shaped object literal. With bidirectional return-type checking the two
+// kinds of arm are each checked against the declared `Response`, so handlers can be
+// typed `Response` rather than the dynamic `Json`.
 type Request = { "method": String, "path": String, "query": String, "headers": Json, "body": String }
+type Response = { "status": Int32, "headers": Json, "body": String }
 
-export val handleIndex = (req: Request): Json =>
+export val handleIndex = (req: Request): Response =>
   val data = { "title": "Lin Web Server", "heading": "Welcome", "status": "running", "version": "1.0" }
   match render("examples/web-server/views/index.lint", data)
     has { "type": "error", message } => badRequest("template error: ${message}")
     else => text(200, "index")
 
-export val handleStatus = (req: Request): Json =>
+export val handleStatus = (req: Request): Response =>
   json(200, { "status": "ok", "uptime": 0, "version": "1.0" })
 
-export val handleUser = (req: Request): Json =>
+export val handleUser = (req: Request): Response =>
   val m = pathMatch("/users/:id", req["path"])
   if m == null then { "status": 404, "headers": {}, "body": "Not Found" }
   else json(200, { "id": m["id"], "name": "User ${m["id"]}" })

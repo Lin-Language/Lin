@@ -38,18 +38,18 @@ export val fetchJson = (url: String): Json =>
 export val postJson = (url: String, body: Json): Json =>
   lin_http_fetch_with(url, { "method": "POST", "headers": { "Content-Type": "application/json" }, "body": lin_to_string(body) })
 
-export val json = (status: Int32, data: Json): Json =>
+export val json = (status: Int32, data: Json): HttpResponse =>
   { "status": status, "headers": { "Content-Type": "application/json" }, "body": lin_to_string(data) }
 
-export val text = (status: Int32, body: String): Json =>
+export val text = (status: Int32, body: String): HttpResponse =>
   { "status": status, "headers": { "Content-Type": "text/plain; charset=utf-8" }, "body": body }
 
-export val redirect = (location: String): Json =>
+export val redirect = (location: String): HttpResponse =>
   { "status": 302, "headers": { "Location": location }, "body": "" }
 
 export val notFound = { "status": 404, "headers": {}, "body": "Not Found" }
 
-export val badRequest = (message: String): Json =>
+export val badRequest = (message: String): HttpResponse =>
   { "status": 400, "headers": {}, "body": message }
 
 export val parseBody = (req: Json): Json =>

@@ -5460,3 +5460,38 @@ print(showB(b))
 "#);
     assert_eq!(out, vec!["A ok 42", "B err 7"]);
 }
+
+#[test]
+fn test_match_json_arm_plus_object_arm_against_declared_object_return() {
+    // Regression: the match-arm-union-vs-declared-object bug. A handler declared to return a named
+    // object type `R`, whose `match` has one arm yielding a `Json` value and another yielding a
+    // concrete object literal, previously formed `Json | {concrete}` and rejected it against `R`.
+    // Each arm is now checked against `R` directly (bidirectional push). Both arms must produce a
+    // value indexable as `R` at runtime.
+    let out = run(r#"import { print } from "std/io"
+type R = { "status": Int32, "headers": Json, "body": String }
+val other = (): Json => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
+val handle = (b: Boolean): R =>
+  match b
+    is true => other()
+    else => { "status": 404, "headers": { "a": 1 }, "body": "no" }
+print(handle(true)["body"])
+print(handle(false)["body"])
+print("status ${handle(true)["status"]}")
+"#);
+    assert_eq!(out, vec!["ok", "no", "status 200"]);
+}
+
+#[test]
+fn test_if_json_arm_plus_object_arm_against_declared_object_return() {
+    // Same bug, `if` form: `if cond then jsonValue else objectLiteral` declared `: R`.
+    let out = run(r#"import { print } from "std/io"
+type R = { "status": Int32, "headers": Json, "body": String }
+val other = (): Json => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
+val handle = (b: Boolean): R =>
+  if b then other() else { "status": 404, "headers": { "a": 1 }, "body": "no" }
+print(handle(true)["body"])
+print(handle(false)["body"])
+"#);
+    assert_eq!(out, vec!["ok", "no"]);
+}
