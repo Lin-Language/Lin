@@ -1,0 +1,23 @@
+import { print } from "std/io"
+import { u32ToBe, u32FromBe, f32ToLe, f32FromLe } from "std/bytes"
+import { length, for, range } from "std/array"
+
+// Typed numeric families and fixed-width byte buffers: Lin compiles to native
+// code via LLVM, so low-level binary work has no boxing in the hot path.
+val header: UInt8[] = u32ToBe(0xCAFEu32)
+print("encoded ${length(header)} bytes")
+
+val magic: UInt32 = u32FromBe(header, 0)
+print("magic = ${magic}")
+
+// Round-trip a Float32 through its little-endian byte representation.
+val bytes: UInt8[] = f32ToLe(3.5f32)
+val back: Float32 = f32FromLe(bytes, 0)
+print("float round-trip: ${back}")
+
+// A flat UInt8[] is stored unboxed — a contiguous scalar buffer, not tagged cells.
+var checksum: UInt32 = 0u32
+range(0, length(header)).for(i =>
+  checksum = checksum + header[i]
+)
+print("checksum = ${checksum}")

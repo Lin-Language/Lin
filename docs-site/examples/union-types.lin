@@ -1,0 +1,28 @@
+import { print } from "std/io"
+import { fromJson } from "std/json"
+
+// A generic, structural result type. The string-literal "type" field is the
+// discriminant — the type checker verifies it at every construction site.
+type Result<T, E> =
+  | { "type": "ok", "value": T }
+  | { "type": "error", "error": E }
+
+type User = { "name": String, "age": Int32 }
+
+val parseAge = (raw: String): Result<Int32, String> =>
+  if raw == "" then { "type": "error", "error": "empty" }
+  else { "type": "ok", "value": 42 }
+
+val msg = match parseAge("42")
+  has { "type": "ok", value }    => "age is ${value}"
+  has { "type": "error", error } => "failed: ${error}"
+  else                           => "unknown"
+
+print(msg)
+
+// fromJson validates untrusted Json against a type, recursively, returning
+// the typed value or the built-in Error — no unchecked casts.
+val decoded: User | Error = User.fromJson({ "name": "Ada", "age": 36 })
+match decoded
+  is Error => print("bad input: ${decoded["message"]}")
+  else     => print("hello ${decoded["name"]}")

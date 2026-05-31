@@ -1,0 +1,74 @@
+// Builds the landing-page hero: a two-column band with the feature list on the
+// left and a tabbed set of syntax-highlighted code examples on the right.
+//
+// The examples are the real, compilable .lin files under docs-site/examples/ — they
+// are read at build time, HTML-escaped, and wrapped as <pre><code class="language-lin">
+// blocks so the client-side highlighter styles them. Tab switching is in theme.js.
+
+import { readFile } from "std/fs"
+import { replaceAll, length } from "std/string"
+import { for } from "std/array"
+
+// Same escaping the Markdown renderer uses for code (& first, then < and >).
+val escapeHtml = (text: String): String =>
+  text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+
+val fileContent = (v: Json): String =>
+  if v != null && v["type"] == "failure" then "" else v
+
+// The feature list — the canonical positioning, one <li> per capability.
+val featureList = (): String =>
+  val items = [
+    "<li><strong>JSON as the native data model</strong></li>",
+    "<li><strong>Dot application &amp; partial application</strong></li>",
+    "<li><strong>Pattern matching</strong> with structural <code>is</code>/<code>has</code></li>",
+    "<li><strong>Native threads with no function colouring</strong> — share-nothing concurrency</li>",
+    "<li><strong>A robust structural type system</strong> — union types, generics, and exhaustiveness checking</li>",
+    "<li><strong>Errors as values</strong>, safe-by-default access</li>"
+  ]
+  var lis = ""
+  items.for(it => lis = "${lis}${it}\n")
+  "<ul class=\"hero-features\">\n${lis}</ul>\n"
+
+// One tab button. `active` marks the initially-selected tab.
+val tabButton = (id: String, label: String, active: Boolean): String =>
+  val cls = if active then "hero-tab active" else "hero-tab"
+  "<button class=\"${cls}\" data-tab=\"${id}\">${label}</button>\n"
+
+// One tab panel wrapping an example file's (escaped) source.
+val tabPanel = (id: String, exampleFile: String, active: Boolean): String =>
+  val raw = fileContent(readFile("docs-site/examples/${exampleFile}"))
+  val code = escapeHtml(raw)
+  val cls = if active then "hero-panel active" else "hero-panel"
+  "<div class=\"${cls}\" data-panel=\"${id}\"><pre><code class=\"language-lin\">${code}</code></pre></div>\n"
+
+// Build the full hero. `base` is the deployment path prefix for the CTA links.
+export val buildHero = (base: String): String =>
+  // (id, label, example filename) for each tab. The first is active.
+  val tabs = [
+    { "id": "functional", "label": "Functional", "file": "functional.lin" },
+    { "id": "pattern", "label": "Pattern Matching", "file": "pattern-matching.lin" },
+    { "id": "union", "label": "Union Types", "file": "union-types.lin" },
+    { "id": "async", "label": "Async", "file": "async.lin" },
+    { "id": "lowlevel", "label": "Low Level", "file": "low-level.lin" }
+  ]
+
+  var buttons = ""
+  var panels = ""
+  var i = 0
+  tabs.for(t =>
+    val active = i == 0
+    buttons = "${buttons}${tabButton(t["id"], t["label"], active)}"
+    panels = "${panels}${tabPanel(t["id"], t["file"], active)}"
+    i = i + 1
+  )
+
+  val features = featureList()
+  val cta = "<div class=\"hero-cta\">\n<a class=\"btn btn-primary\" href=\"${base}/getting-started.html\">Get Started</a>\n<a class=\"btn\" href=\"https://github.com/Lin-Language/Lin\">GitHub</a>\n</div>\n"
+  val tagline = "<p class=\"hero-tagline\">A compiled, functional programming language with modern ergonomics.</p>\n"
+  val left = "<div class=\"hero-left\">\n<h1>Lin</h1>\n${tagline}${features}${cta}</div>\n"
+  val right = "<div class=\"hero-right\">\n<div class=\"hero-tabs\">\n${buttons}</div>\n<div class=\"hero-panels\">\n${panels}</div>\n</div>\n"
+  "<section class=\"hero\">\n${left}${right}</section>\n"
