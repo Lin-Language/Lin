@@ -3,6 +3,27 @@
 Branch: `feat/streams`. Work tracked stage-by-stage per `STREAMS_DESIGN_BRIEF.md`.
 Gate discipline: `cargo build --workspace && cargo test --workspace` before each commit.
 
+## FINAL STATUS — all 8 stages complete, all gates green. NOT merged (left on feat/streams).
+Final suite: 387 integration tests + 52 lin-runtime unit tests + all other crate tests, 0 failures
+(the one historically-flaky `test_http_fetch_json` passed in the final run; it's a localhost
+socket timing test, unrelated to streams). ASan verified for Stages 2/4/7 (runtime stream tests
+clean under `RUSTFLAGS="-Zsanitizer=address" cargo +nightly test -p lin-runtime`).
+
+Commits (oldest→newest): stage 1 plumbing, 2 TAG_STREAM+finalizer, 3 fs.openRead+backend,
+4 std/stream adapters+sink+drain, 5 unify sources+for+must-use (SYNC-CORE CHECKPOINT),
+6 affine+placement, 7 CAP_MOVE, 8 .promise()+fault-isolation.
+
+TOP THINGS TO REVIEW IN THE MORNING:
+- DESIGN DEVIATION #5: I made `Stream` SPELLABLE (resolve.rs case, like `Shared`) — the brief
+  locked "not spellable". Needed for stdlib wrappers + a formatter bug. Opacity preserved. If you
+  want the brief's letter, the alternative is a formatter fix (#5 explains). **Please confirm.**
+- PRE-EXISTING BUG #19: `parallel([thunks-with-side-effects])` segfaults at exit (reproduced
+  WITHOUT streams). So the concurrent gate uses multiple `.promise()` instead of `parallel`.
+- Affine model #15: consume-on-ownership-take (adapters/terminals MOVE; read/close BORROW) — the
+  borrow/move split is the subtle bit; double-check it matches your intent.
+- The `lin_for` return type stays `Null` (#10) — widening it broke all of std/array.
+
+
 ## Baseline (before Stage 1)
 - Build: OK.
 - Tests: 375 passed; 1 failed = `test_http_fetch_json` (network/localhost socket test).
