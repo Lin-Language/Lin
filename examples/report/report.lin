@@ -2,7 +2,7 @@
 // valid records, and render a text report. Exercises map/filter/reduce churn over
 // heap (object) values — the pattern that historically broke RC.
 
-import { parseRow } from "./parse"
+import { parseRow, Parsed } from "./parse"
 import { map, filter, reduce, length, sortBy } from "std/array"
 import { toString, join } from "std/string"
 
@@ -13,19 +13,38 @@ export type Record = { "name": String, "score": Int32 }
 // Summary statistics over a batch of valid records.
 export type Stats = { "count": Int32, "total": Int32, "average": Int32, "top": String }
 
+// Extract a successful parse's `Record`, narrowing the `Success | Failure` union via `is`/`has`
+// so the result is the concrete `Record` type. A bare `r["value"]` over the union is
+// `Record | Null` (the `Failure` arm has no `value`), and the precise generic `map` PRESERVES
+// that nullability — unlike the old Json-returning combinators that erased it — so a sound
+// narrowing is needed here (ADR-069 R1). The `failure` arm is unreachable after `validRecords`'
+// `filter`, but keeps the match total. (The narrowing lives in a named helper because a
+// multi-arm `match` cannot be written inline inside a `.map( … )` argument: indentation is
+// suppressed inside the parentheses, so the arms wouldn't parse — ADR-004/ADR-014.)
+val recordOf = (r: Parsed): Record =>
+  match r
+    has { "type": "success", value } => value
+    else => { "name": "", "score": 0 }
+
+// Extract a failed parse's error String, with the same union-narrowing discipline.
+val errorOf = (r: Parsed): String =>
+  match r
+    has { "type": "failure", error } => error
+    else => ""
+
 // Parse every line into a result, keep the successful records' values.
 export val validRecords = (lines: String[]): Record[] =>
   lines
     .map(line => parseRow(line))
     .filter(r => r["type"] == "success")
-    .map(r => r["value"])
+    .map(r => recordOf(r))
 
 // The error messages from the rows that failed to parse.
 export val parseErrors = (lines: String[]): String[] =>
   lines
     .map(line => parseRow(line))
     .filter(r => r["type"] == "failure")
-    .map(r => r["error"])
+    .map(r => errorOf(r))
 
 // Statistics over the valid records: count, total, average (integer), and the
 // top scorer's name. Returns an object; `count == 0` is handled by the caller.

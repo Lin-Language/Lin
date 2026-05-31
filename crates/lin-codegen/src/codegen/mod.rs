@@ -196,6 +196,7 @@ impl<'ctx> Codegen<'ctx> {
         path: &str,
         module: &TypedModule,
         src: Option<&(String, String)>,
+        imports: &HashMap<String, TypedModule>,
     ) {
         // Merge the imported module's intrinsic slot map (same as register_import) so the
         // importer's lowering still recognises re-exported intrinsics.
@@ -204,7 +205,11 @@ impl<'ctx> Codegen<'ctx> {
         }
 
         let module_key = lin_ir::mangle_module_key(path);
-        let mut ir_module = lin_ir::lower_import_module(module, &module_key);
+        // Pass the program's imports so this module's OWN cross-module generic calls (e.g.
+        // `examples/report` → `std/array.reduce`) are specialized here, not left as a boxed
+        // type-erased call that crashes a concrete use site.
+        let mut ir_module =
+            lin_ir::lower_import_module_with_imports(module, &module_key, imports);
         lin_ir::rc_elide::elide_rc(&mut ir_module);
         // Prefix this module's anonymous functions so `__lin_fn_<id>` symbols don't collide
         // with the main module's or other imports' (each module numbers FuncIds from 0).

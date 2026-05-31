@@ -1180,4 +1180,92 @@ change), was judged too high-risk to attempt unattended and is not pursued.
 three latent bugs fixed (curried callback, malformed loop phi, flat-read-on-tagged). Perf-neutral at
 `-O2` today (the win is staged behind generic conversion + filter flow-narrowing, see above), but the
 correctness fixes and the cleaner intrinsic foundation ship now. The headline zero-box win is staged
-behind a documented checker prerequisite rather than shipped broken.
+behind a documented checker prerequisite rather than shipped broken. **SUPERSEDED by ADR-069**,
+which lands the deferred win.
+
+## ADR-069: Generic `map`/`filter`/`reduce` + a capture-less-lambda inliner — the zero-per-element-box array pipeline (10x at -O2)
+
+**Status.** Accepted. This is the shipped completion of the win ADR-068 proved-but-deferred.
+
+**Context.** ADR-068 routed `map`/`filter`/`reduce` through the materializing `lin_*` intrinsics and
+proved (in isolation, then reverted) that generic signatures + a capture-less-lambda inliner deliver
+ZERO per-element boxing for the monomorphic pipeline
+`range(0,n).map(x=>x*2).filter(x=>x%3==0).reduce(0,(a,x)=>a+x)`. It was not shipped because the
+generic signatures regressed two call sites. This ADR lands it without regressing anything.
+
+**What shipped.**
+1. **Generic signatures** (`stdlib/array.lin`): `map<T,U>(arr:T[], f:(T)=>U): U[]`,
+   `filter<T>(arr:T[], f:(T)=>Boolean): T[]`, `reduce<T,U>(arr:T[], init:U, f:(U,T)=>U): U`. At a
+   monomorphic scalar call site the checker types the callback param at the concrete element type
+   (no input boxing) and the monomorphizer picks the flat (e.g. `$Int32`) specialization.
+2. **Call-site combinator-wrapper inline** (`lin-ir/monomorphize.rs`, `try_inline_combinator_wrapper`):
+   when a call targets a generic thin intrinsic-combinator wrapper (`map`/`filter`/`reduce`, whose
+   body is exactly `lin_map`/… forwarding its params) AND the callback argument is a CAPTURE-LESS
+   LITERAL lambda, the call is rewritten in the calling module to a direct `lin_map(arr, <lambda>)`
+   (re-homing the intrinsic slot), so the literal lambda is VISIBLE to the intrinsic's IR lowering.
+   A capturing lambda or a stored/passed `Function` value is NOT inlined — it falls through to the
+   normal closure-call specialization (still correct, just boxed).
+3. **Capture-less-lambda inliner in `lower_map`/`lower_filter`/`lower_reduce`** (`lin-ir/lower.rs`,
+   `inlinable_lambda` + `inline_lambda_body`): when the callback arg is a capture-less literal
+   `Function`, its body is spliced directly into the loop — param bound to the flat element temp,
+   body lowered inline — with NO closure alloc and NO per-element box/unbox/indirect call. `reduce`
+   additionally carries a CONCRETE-SCALAR accumulator UNBOXED through the loop phi (gated on a scalar
+   `result_type`; a union/heap accumulator keeps the boxed Json-phi path). RC: unboxed scalar
+   elements/results carry no refcount, so there is no per-iteration box to release — the inliner
+   emits none, and ASan confirms no UAF/double-free/leak.
+
+**The two regressions and how they were solved (correctness-first).**
+  - **R1 (`examples/report`):** `validRecords()`/`parseErrors()` ended `…filter(…).map(r=>r["value"])`
+    over a `Success | Failure` union; with precise generic `map` the element types as `Record | Null`
+    (the union member access is nullable, `filter` does not narrow), not assignable to `Record[]`.
+    SOLVED by option (a) — restructured the example to be well-typed under precise generics: a named
+    helper `recordOf(r: Parsed): Record` (and `errorOf`) narrows the union via an idiomatic
+    `match … has { "type": "success", value } => value; else => …` and the pipeline maps through it.
+    (The narrowing lives in a named helper, not inline in `.map(…)`, because a multi-arm `match` can't
+    be written inside the combinator's parentheses — indentation is suppressed there, ADR-004/014.)
+    The example still demonstrates the full map/filter/map churn over heap records.
+  - **R2 (`sortBy`/`minBy`/`maxBy`/`compact`/`sum`/…):** these stdlib combinators call `map`/`reduce`/
+    `filter` internally over `Json[]`; a SIBLING call to the now-generic combinator specialized at
+    `$Json` cross-module, where the combinator's owned-array result and the surrounding generic body's
+    RC accounting disagreed — a double-release of the intermediate array (capacity-overflow crash).
+    SOLVED by keeping those internal callers on non-generic Json helpers (`_mapJ`/`_filterJ`/
+    `_reduceJ`, thin wrappers over the same intrinsics — exactly the pre-generics path), which is
+    correct. The generic exports still give the zero-box fast path at the user's monomorphic call site.
+
+**Two supporting fixes (latent gaps the generic conversion exposed, both general correctness wins):**
+  - **Cross-module generic specialization for IMPORTED modules** (`lower_import_module_with_imports`,
+    `monomorphize_import_with_imports`): a module that imports a generic AND is itself imported (e.g.
+    `examples/report` calling `std/array.reduce`) previously did not specialize its cross-module
+    generic calls — they fell to the boxed type-erased original (returns `Json`), crashing a concrete
+    scalar use site (`ret i32` vs `ptr`). The import path now monomorphizes with the program's imports
+    map, exactly like the top-level importer.
+  - **`repoint_call_native` re-coercion**: when a native specialization returns a CONCRETE scalar but
+    the checker left the Call's `result_type` as the boxed/erased generic return (the `U` TypeVar
+    surfaced as `Json` in the surrounding context, e.g. `total = s` with `total: Json`), the Call is
+    wrapped in a `Coerce { concrete → original }` so the boxed/unboxed handoff is explicit. Without it
+    the consumer emits `store i32`/`ret i32` against a `ptr` slot (a hard codegen type mismatch).
+
+**Result — the HONEST verified release number.** array_pipeline output 1892804906 (unchanged). The hot
+map/filter/reduce loops are now FULLY UNBOXED in `main` — flat `lin_flat_array_get_i32`/`push_i32`, a
+native `mul`/`srem`/`icmp`/`add`, and the reduce accumulator carried as a native `i32` through the loop
+phi — ZERO `lin_box_int32`/`lin_unbox_int32`/closure-call per element (the only two boxes left in
+`main` are the FINAL accumulator boxed for `toString` + the print string). Interleaved RELEASE (`-O2`)
+min-of-11, same machine, base (ADR-068 Phase 5b) vs after: **~328ms → ~33ms = ~10.0x** (verified twice:
+10.06x, 9.95x). This is a real `-O2` speedup, NOT a debug artifact — at `-O2` LLVM cannot elide the
+boxed closure ABI's per-element malloc/indirect-call the way it elides the cheaper boxing ADR-068
+removed, so eliminating the closure call itself is what unlocks the win.
+
+**Correctness + safety.** stdlib+examples 59/59; integration 355/0 (isolated). map/filter/reduce
+verified over `Int32[]` (flat), `String[]`/`Float64[]` (tagged/flat), `Json[]` (heterogeneous);
+capturing lambda → closure path (correct); stored-fn-value callback → closure path (correct); chained
+pipeline; non-scalar (array/string) reduce accumulator → boxed Json-phi path (correct). ASan-clean over
+the full stdlib+examples leg + flat/tagged/capturing/mixed/sortBy/churn fixtures (no UAF/double-free/
+leak beyond the known program-lifetime globals). No-op invariant: a non-combinator program's MAIN
+module IR is BYTE-IDENTICAL to base (only `std/array` differs — the intended source change).
+
+**Consequences.** The zero-per-element-box array pipeline ships at a verified ~10x `-O2` speedup.
+Generic `map`/`filter`/`reduce` + capture-less-lambda inlining is the mechanism; the internal Json
+helpers and the union-narrowing example rewrite keep every heterogeneous/union call site correct;
+the import-path monomorphization + native-return re-coercion are general fixes for cross-module
+generic calls. Capturing lambdas and stored-fn callbacks keep the (correct, boxed) closure path —
+inlining the unboxed-closure ABI for those remains future work (judged too high-risk to attempt here).

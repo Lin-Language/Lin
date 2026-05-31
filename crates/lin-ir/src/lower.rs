@@ -149,14 +149,30 @@ pub fn lower_module_with_imports(
 /// through `global_fn_slots` (Direct calls to the mangled symbols); cross-module imports,
 /// foreign bindings, and intrinsics resolve exactly as in the main lowering.
 pub fn lower_import_module(module: &TypedModule, module_key: &str) -> LinModule {
-    // Monomorphize this import's OWN single-module generic sibling calls (e.g. stdlib `sum`/`min`
-    // calling the now-generic `reduce`). Without this, a sibling call to a generic gets a concrete
-    // `result_type` from the checker but lowers to the boxed generic symbol — a representation
-    // mismatch that crashes codegen. Generic originals are all KEPT (external importers may issue a
-    // boxed `Named` call to them). No-op for an import with no generic functions (byte-identical).
-    let owned: Option<TypedModule> = if crate::monomorphize::module_has_generic_fn(module) {
+    let no_imports: HashMap<String, TypedModule> = HashMap::new();
+    lower_import_module_with_imports(module, module_key, &no_imports)
+}
+
+/// Like `lower_import_module`, but with the program's already-typed imported modules so an import
+/// that ITSELF makes cross-module generic calls (e.g. `examples/report` → `std/array.reduce`) gets
+/// those calls specialized here instead of falling to the boxed type-erased generic (which returns
+/// `Json` and crashes a concrete-scalar use site). Mirrors the top-level `lower_module_with_imports`
+/// monomorphization, but keeps every generic original (external importers may still call them
+/// boxed). No-op (byte-identical lowering) when the module neither defines nor uses any generic.
+pub fn lower_import_module_with_imports(
+    module: &TypedModule,
+    module_key: &str,
+    imports: &HashMap<String, TypedModule>,
+) -> LinModule {
+    // Monomorphize this import's generic calls: its OWN single-module sibling calls (e.g. stdlib
+    // `sum`/`min` calling the now-generic `reduce`) AND any CROSS-MODULE generic call it makes into
+    // its imports (resolved via `imports`). Without this, such a call gets a concrete `result_type`
+    // from the checker but lowers to the boxed generic symbol — a representation mismatch that
+    // crashes codegen. Generic originals are all KEPT (external importers may issue a boxed `Named`
+    // call to them). No-op for a module that neither defines nor uses a generic (byte-identical).
+    let owned: Option<TypedModule> = if crate::monomorphize::module_uses_generic(module, imports) {
         let mut m = module.clone();
-        let _ = crate::monomorphize::monomorphize_import(&mut m);
+        let _ = crate::monomorphize::monomorphize_import_with_imports(&mut m, imports);
         Some(m)
     } else {
         None
@@ -564,6 +580,34 @@ impl FuncBuilder {
                     if *pdst == dst {
                         for inc in incomings.iter_mut() {
                             if inc.1 == old_block {
+                                inc.1 = new_block;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Patch a header phi `dst`'s back-edge incoming: replace the provisional `(old_value,
+    /// old_block)` pair with the real `(new_value, new_block)`. Used by the inlined-reduce loop,
+    /// whose accumulator phi back-edge value (the lowered reducer body's result) and predecessor
+    /// block are only known after the body — which may switch blocks — is lowered.
+    fn patch_phi_incoming_value(
+        &mut self,
+        header: BlockId,
+        dst: Temp,
+        old_value: Temp,
+        new_value: Temp,
+        new_block: BlockId,
+    ) {
+        if let Some(b) = self.blocks.iter_mut().find(|b| b.id == header) {
+            for instr in b.instructions.iter_mut() {
+                if let Instruction::Phi { dst: pdst, incomings, .. } = instr {
+                    if *pdst == dst {
+                        for inc in incomings.iter_mut() {
+                            if inc.0 == old_value {
+                                inc.0 = new_value;
                                 inc.1 = new_block;
                             }
                         }
@@ -2490,6 +2534,69 @@ fn is_flat_producer_export(name: &str) -> bool {
 }
 
 
+/// A capture-less literal lambda usable for INLINING into a combinator loop (ADR-069): a
+/// `TypedExpr::Function` with no captures. Returns its params + body so the caller can bind each
+/// param to a loop temp and lower the body inline — no closure alloc, no boxed indirect call. A
+/// capturing lambda or a non-literal callback (a stored/passed `Function` value) returns `None` and
+/// the caller falls back to the closure-call path.
+fn inlinable_lambda(expr: &TypedExpr) -> Option<(&[TypedParam], &TypedExpr)> {
+    match expr {
+        TypedExpr::Function { params, body, captures, .. } if captures.is_empty() => {
+            Some((params, body))
+        }
+        _ => None,
+    }
+}
+
+/// Inline a capture-less lambda's body into the current block: bind each param slot to the
+/// corresponding argument temp (coerced to the param's declared representation), then lower the body
+/// inline. Returns the body's result temp (typed as the body's lowered type). Used by the combinator
+/// inliner to splice `x => x*2` etc. directly into the loop with no boxing/closure call.
+///
+/// The param bindings are made in a fresh scope so the body's own `val`/locals don't leak; arguments
+/// are bound BEFORE the scope is pushed-over (they are the loop's element/accumulator temps, owned by
+/// the loop, not by this body scope — so the scope-exit release must not free them). We bind the raw
+/// temps directly without registering them owned in the body scope.
+fn inline_lambda_body(
+    params: &[TypedParam],
+    body: &TypedExpr,
+    arg_temps: &[(Temp, Type)],
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> (Temp, Type) {
+    builder.push_scope();
+    for (i, param) in params.iter().enumerate() {
+        if let Some((t, arg_ty)) = arg_temps.get(i) {
+            // Coerce the argument to the param's declared representation (e.g. unbox a Json
+            // element into a concrete scalar param, or box a scalar into a Json param). For the
+            // common monomorphic-scalar case the representations already match and this is a no-op.
+            let bound = coerce_arg_to_param_repr(*t, arg_ty, &param.ty, builder);
+            builder.slots.insert(param.slot, bound);
+        }
+    }
+    let raw = lower_expr(body, builder, ctx);
+    let body_ty = builder.temp_types.get(&raw).cloned().unwrap_or_else(|| body.ty());
+    // Release this body scope's own locals, KEEPING the result temp. The bound param temps were
+    // never registered owned here (they belong to the loop), so they are not double-released.
+    builder.pop_scope_releasing_keep(&[raw]);
+    (raw, body_ty)
+}
+
+/// Coerce `arg` (typed `arg_ty`) to the representation of `param_ty`: box a concrete value into a
+/// union/Json param, or unbox a union value into a concrete param; pass through when the
+/// representations already match. (A two-directional companion to `coerce_arg_to_param`, which only
+/// boxes — the inliner can also need to UNBOX, e.g. a Json element bound to a concrete scalar param.)
+fn coerce_arg_to_param_repr(arg: Temp, arg_ty: &Type, param_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+    if !type_repr_differs(arg_ty, param_ty) {
+        return arg;
+    }
+    let dst = builder.alloc_temp(param_ty.clone());
+    builder.emit(Instruction::Coerce {
+        dst, src: arg, from_ty: arg_ty.clone(), to_ty: param_ty.clone(),
+    });
+    dst
+}
+
 /// Call a body closure temp with arguments, coercing each argument to the closure's
 /// declared parameter type (e.g. box a concrete element to Json when the callback param
 /// is Json) so the closure ABI lines up. Returns the result temp typed as the closure's
@@ -2985,6 +3092,22 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
     let elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
 
     let iterable = lower_expr(&args[0], builder, ctx);
+
+    // INLINE FAST PATH (ADR-069): a capture-less literal lambda is spliced directly into the loop —
+    // its param bound to the element temp, its body lowered inline — with no closure alloc and no
+    // per-element box/unbox/indirect call.
+    if let Some((lam_params, lam_body)) = inlinable_lambda(&args[1]) {
+        let lam_params = lam_params.to_vec();
+        let lam_body = lam_body.clone();
+        let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+        emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |_, elem, b, c| {
+            let (mapped, mapped_ty) =
+                inline_lambda_body(&lam_params, &lam_body, &[(elem, elem_ty.clone())], b, c);
+            push_output(out, flat, &out_elem_ty, mapped, &mapped_ty, b);
+        });
+        return out;
+    }
+
     let f = lower_callback_in_safe_ctx(&args[1], builder, ctx);
     let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
 
@@ -3010,6 +3133,36 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
     let elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
 
     let iterable = lower_expr(&args[0], builder, ctx);
+
+    // INLINE FAST PATH (ADR-069): a capture-less literal predicate lambda is spliced into the loop;
+    // its body's Bool result drives the keep/skip split directly — no closure, no boxed call.
+    if let Some((lam_params, lam_body)) = inlinable_lambda(&args[1]) {
+        let lam_params = lam_params.to_vec();
+        let lam_body = lam_body.clone();
+        let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
+        emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |_, elem, b, c| {
+            let (pred_raw, pred_ty) =
+                inline_lambda_body(&lam_params, &lam_body, &[(elem, elem_ty.clone())], b, c);
+            // Coerce the predicate result to an i1 Bool (a concrete-Bool body needs no coercion;
+            // a Json/boxed-bool body is unboxed via Coerce).
+            let keep = if matches!(pred_ty, Type::Bool) {
+                pred_raw
+            } else {
+                let d = b.alloc_temp(Type::Bool);
+                b.emit(Instruction::Coerce { dst: d, src: pred_raw, from_ty: pred_ty, to_ty: Type::Bool });
+                d
+            };
+            let keep_block = b.alloc_block("filter_keep");
+            let skip_block = b.alloc_block("filter_skip");
+            b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: skip_block });
+            b.switch_to(keep_block);
+            push_output(out, flat, &out_elem_ty, elem, &elem_ty, b);
+            b.terminate(Terminator::Jump(skip_block));
+            b.switch_to(skip_block);
+        });
+        return out;
+    }
+
     let pred = lower_callback_in_safe_ctx(&args[1], builder, ctx);
     let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
     emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |_, elem, b, _| {
@@ -3038,6 +3191,80 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
     let init_ty = args[1].ty();
 
     let iterable = lower_expr(&args[0], builder, ctx);
+
+    // INLINE FAST PATH (ADR-069): a capture-less literal reducer lambda with a CONCRETE SCALAR
+    // accumulator carries the accumulator UNBOXED through the loop phi and inlines the lambda body
+    // each iteration — no per-element box/unbox/closure call. Gated to a scalar `result_type` (the
+    // accumulator representation): a union/Json/heap accumulator keeps the boxed Json-phi path below
+    // (its phi must carry a uniform boxed ptr, and the inline machinery here assumes a value phi).
+    if is_inline_scalar(result_type) {
+        if let Some((lam_params, lam_body)) = inlinable_lambda(&args[2]) {
+            let lam_params = lam_params.to_vec();
+            let lam_body = lam_body.clone();
+            let acc_ty = result_type.clone();
+            let init_raw = lower_expr(&args[1], builder, ctx);
+            // The init must match the accumulator representation (a concrete scalar).
+            let init = coerce_arg_to_param_repr(init_raw, &init_ty, &acc_ty, builder);
+
+            let len = builder.alloc_temp(Type::Int64);
+            builder.emit(Instruction::CallIntrinsic {
+                dst: len, intrinsic: Intrinsic::Length, args: vec![iterable], ret_ty: Type::Int64,
+            });
+            let zero = builder.const_temp(Const::Int(0, Type::Int64));
+
+            let preheader = builder.current_block;
+            let header = builder.alloc_block("reduce_header");
+            let body = builder.alloc_block("reduce_body");
+            let exit = builder.alloc_block("reduce_exit");
+
+            let i = builder.alloc_temp(Type::Int64);
+            let i_next = builder.alloc_temp(Type::Int64);
+            let acc = builder.alloc_temp(acc_ty.clone());
+            builder.terminate(Terminator::Jump(header));
+
+            builder.switch_to(header);
+            builder.emit(Instruction::Phi {
+                dst: i, ty: Type::Int64, incomings: vec![(zero, preheader), (i_next, body)],
+            });
+            // The accumulator phi back-edge value is filled in after the body is lowered (the body
+            // may switch blocks, e.g. an `if` inside the reducer — `patch_phi_incoming`).
+            builder.emit(Instruction::Phi {
+                dst: acc, ty: acc_ty.clone(), incomings: vec![(init, preheader), (acc, body)],
+            });
+            let cond = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::Binary {
+                dst: cond, op: BinOp::Lt, lhs: i, rhs: len, operand_ty: Type::Int64, ty: Type::Bool,
+            });
+            builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
+
+            builder.switch_to(body);
+            let elem = builder.alloc_temp(elem_ty.clone());
+            builder.emit(Instruction::Index {
+                dst: elem, object: iterable, key: i,
+                obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
+            });
+            // acc_next = <lambda body>(acc, elem), inlined. The reducer params are (acc, elem).
+            let (acc_next_raw, acc_next_ty) = inline_lambda_body(
+                &lam_params, &lam_body,
+                &[(acc, acc_ty.clone()), (elem, elem_ty.clone())], builder, ctx,
+            );
+            let acc_next = coerce_arg_to_param_repr(acc_next_raw, &acc_next_ty, &acc_ty, builder);
+            let one = builder.const_temp(Const::Int(1, Type::Int64));
+            builder.emit(Instruction::Binary {
+                dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64,
+            });
+            // The body may have switched blocks; patch both phis' back-edge predecessors + the acc
+            // phi's incoming value to the actual loop-back block / computed accumulator.
+            let back_block = builder.current_block;
+            builder.terminate(Terminator::Jump(header));
+            builder.patch_phi_incoming(header, i, body, back_block);
+            builder.patch_phi_incoming_value(header, acc, acc, acc_next, back_block);
+
+            builder.switch_to(exit);
+            return acc;
+        }
+    }
+
     let init_raw = lower_expr(&args[1], builder, ctx);
     let init = box_to_json(init_raw, &init_ty, builder);
     let f = lower_callback_in_safe_ctx(&args[2], builder, ctx);

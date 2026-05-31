@@ -4444,6 +4444,51 @@ print(toString(hi["w"]))
 }
 
 #[test]
+fn test_generic_combinator_pipeline_inlined() {
+    // ADR-069: generic map/filter/reduce + the capture-less-lambda inliner. The monomorphic scalar
+    // pipeline `range(0,n).map(x=>x*2).filter(x=>x%3==0).reduce(0,(a,x)=>a+x)` lowers to a fully
+    // unboxed flat loop (verified separately: zero per-element box/unbox in `main`). Here we assert
+    // the VALUE is correct over a small n so a representation/RC bug in the inliner shows up.
+    let out = run(r#"import { range, map, filter, reduce } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+val total = range(0, 10).map(x => x * 2).filter(x => x % 3 == 0).reduce(0, (a, x) => a + x)
+print(toString(total))
+"#);
+    // range 0..10 -> *2 = [0,2,4,6,8,10,12,14,16,18]; %3==0 -> [0,6,12,18]; sum = 36.
+    assert_eq!(out, vec!["36"]);
+}
+
+#[test]
+fn test_generic_combinator_inline_vs_closure_paths() {
+    // ADR-069: the inliner fires ONLY for a capture-less literal lambda; a capturing lambda and a
+    // stored/passed `Function` value must keep the (correct, boxed) closure path. Also exercises the
+    // tagged String element path and a non-scalar (array) reduce accumulator (the boxed Json-phi
+    // path). All four must produce the right values.
+    let out = run(r#"import { map, filter, reduce } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+// capture-less literal -> inline path
+print(toString([1, 2, 3].map(x => x + 1)))
+// capturing lambda -> closure path (captures k)
+val k = 100
+print(toString([1, 2, 3].map(x => x + k)))
+// stored fn value -> closure path
+val dbl = (x: Int32): Int32 => x * 2
+print(toString([1, 2, 3].map(dbl)))
+// tagged String elements
+print(toString(["a", "bb", "ccc"].filter(s => true)))
+// non-scalar (array) reduce accumulator -> boxed Json-phi path
+print(toString([1, 2, 3].reduce([0], (a, x) => a)))
+"#);
+    assert_eq!(
+        out,
+        vec!["[2, 3, 4]", "[101, 102, 103]", "[2, 4, 6]", r#"["a", "bb", "ccc"]"#, "[0]"]
+    );
+}
+
+#[test]
 fn test_concat_fresh_strings_no_use_after_free() {
     // Regression: `lin_array_concat_dyn`'s tagged path copied each element's TaggedVal WITHOUT
     // retaining its heap payload, so `acc = concat(acc, [freshString])` in a loop left the result
