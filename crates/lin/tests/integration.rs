@@ -5483,6 +5483,60 @@ print("code: ${toString(code)}")
     );
 }
 
+// Stage 5 (streams): the unified process-stdout source. `spawn` a child, wrap its piped stdout
+// as a Stream<UInt8[]>, and `readText` the whole output through the stream layer.
+#[test]
+fn test_stream_process_stdout_source() {
+    let out = run(r#"import { spawn } from "std/process"
+import { stdoutStream } from "std/process"
+import { readText } from "std/stream"
+import { print } from "std/io"
+
+val h = spawn("sh", ["-c", "printf 'line1\nline2\n'"])
+val text = stdoutStream(h).readText()
+print(text)
+"#);
+    assert_eq!(out, vec!["line1", "line2"]);
+}
+
+// Stage 5 (streams): the unified stdin source. Feed lines on stdin, read them back through a
+// stdinStream → lines → for pipeline.
+#[test]
+fn test_stream_stdin_source() {
+    let output = run_with_stdin(r#"import { stdinStream } from "std/io"
+import { lines, for } from "std/stream"
+import { print } from "std/io"
+
+stdinStream().lines().for(line => print("got: ${line}"))
+"#, "aaa\nbbb\nccc\n");
+    let parts: Vec<&str> = output.lines().collect();
+    assert_eq!(parts, vec!["got: aaa", "got: bbb", "got: ccc"]);
+}
+
+// Stage 5 (streams): the unified TCP source. Loopback connect, send bytes, close the client, and
+// read the server side through a tcpStream → readText. The client close makes the server stream
+// reach EOF, so readText returns the full payload.
+#[test]
+fn test_stream_tcp_source() {
+    let out = run(r#"import { tcpListen, tcpAccept, tcpConnect, tcpSend, tcpClose, tcpStream } from "std/net"
+import { readText } from "std/stream"
+import { print } from "std/io"
+
+val port = 39271
+val listener = tcpListen(port)
+val client = tcpConnect("127.0.0.1", port)
+val accepted = tcpAccept(listener)
+val server = accepted["fd"]
+val payload: UInt8[] = [72, 105, 33]
+tcpSend(client, payload)
+tcpClose(client)
+val text = tcpStream(server).readText()
+print("got: ${text}")
+tcpClose(listener)
+"#);
+    assert_eq!(out, vec!["got: Hi!"]);
+}
+
 #[test]
 fn test_process_wait_exit_code() {
     // `sh -c 'exit 3'` exits with code 3.

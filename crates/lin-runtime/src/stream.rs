@@ -260,6 +260,90 @@ impl StreamSource for FileSource {
     }
 }
 
+// Unified OS sources (Stage 5): TCP socket, child-process stdout, and stdin all become
+// `Stream<UInt8[]>`, each supplying a different read backend (brief §4). The fd/handle-keyed
+// sources delegate to the owning module's registry (net/process); stdin reads the global handle.
+
+/// A TCP socket read backend. Holds the connected socket's fd; reads delegate to the net
+/// registry (`net::tcp_stream_read`); close removes the socket from the registry (closing the fd).
+struct TcpSource {
+    fd: i32,
+    open: bool,
+}
+impl StreamSource for TcpSource {
+    fn read(&mut self) -> Result<Option<Vec<u8>>, String> {
+        if !self.open {
+            return Ok(None);
+        }
+        crate::net::tcp_stream_read(self.fd, FILE_CHUNK)
+    }
+    fn close(&mut self) {
+        if self.open {
+            crate::net::tcp_stream_close(self.fd);
+            self.open = false;
+        }
+    }
+}
+
+/// A child-process stdout read backend. Holds the process handle; reads delegate to the process
+/// registry (`process::process_stdout_read`). Close is a no-op here (the child's lifecycle —
+/// kill/wait — is managed via std/process; the stream just stops reading).
+struct ProcessSource {
+    handle: i64,
+}
+impl StreamSource for ProcessSource {
+    fn read(&mut self) -> Result<Option<Vec<u8>>, String> {
+        crate::process::process_stdout_read(self.handle, FILE_CHUNK)
+    }
+    fn close(&mut self) {}
+}
+
+/// A stdin read backend. Reads from the process's standard input in chunks; `Ok(None)` at EOF.
+struct StdinSource {
+    done: bool,
+}
+impl StreamSource for StdinSource {
+    fn read(&mut self) -> Result<Option<Vec<u8>>, String> {
+        use std::io::Read;
+        if self.done {
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; FILE_CHUNK];
+        match std::io::stdin().lock().read(&mut buf) {
+            Ok(0) => {
+                self.done = true;
+                Ok(None)
+            }
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(Some(buf))
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+    fn close(&mut self) {
+        self.done = true;
+    }
+}
+
+/// `tcpStream(fd)` → a `Stream<UInt8[]>` over a connected TCP socket.
+#[no_mangle]
+pub unsafe extern "C" fn lin_net_tcp_stream(fd: i32) -> *mut u8 {
+    StreamBox::new_boxed(Box::new(TcpSource { fd, open: true }))
+}
+
+/// `stdoutStream(handle)` → a `Stream<UInt8[]>` over a child process's piped stdout.
+#[no_mangle]
+pub unsafe extern "C" fn lin_process_stdout_stream(handle: i64) -> *mut u8 {
+    StreamBox::new_boxed(Box::new(ProcessSource { handle }))
+}
+
+/// `stdinStream()` → a `Stream<UInt8[]>` over the process's standard input.
+#[no_mangle]
+pub unsafe extern "C" fn lin_io_stdin_stream() -> *mut u8 {
+    StreamBox::new_boxed(Box::new(StdinSource { done: false }))
+}
+
 /// `openRead(path)` → open `path` for reading and return a boxed `Stream<UInt8[]>`
 /// (TaggedVal*(TAG_STREAM)). On open failure, returns a `{ type:"error", message }` tagged
 /// object instead of a stream — so the result type is `Stream<UInt8[]> | Error` and the caller
@@ -758,6 +842,29 @@ pub unsafe extern "C" fn lin_stream_drain(s: *const u8) -> *mut u8 {
             src.drive(b)
         } else {
             std::ptr::null_mut()
+        }
+    };
+    close_box(b);
+    result
+}
+
+/// `.for(s, body)` over a Stream (Stage 5): pull every item and call `body(item)` on the calling
+/// thread, until EOF (→ Null) or the first read Error (→ the Error object becomes the for-expr's
+/// value, brief §3). `body` is a 1-arg boxed-ABI closure; its return is discarded. Closes the
+/// stream when the loop ends (deterministic release; the RC finalizer would close it anyway).
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_for(s: *const u8, body: *mut u8) -> *mut u8 {
+    let b = unwrap_stream(s);
+    let f = LinFn::from_owned(retain_closure(as_closure(body)));
+    let result = loop {
+        match pull_tagged(b) {
+            TaggedOutcome::Eof => break std::ptr::null_mut(), // normal end → Null
+            TaggedOutcome::Err(m) => break crate::fs::make_error_tagged(&m),
+            TaggedOutcome::Item(item) => {
+                let ret = f.call(item);
+                crate::tagged::lin_tagged_release(item);
+                crate::tagged::lin_tagged_release(ret); // body's return is discarded
+            }
         }
     };
     close_box(b);

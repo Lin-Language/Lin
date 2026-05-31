@@ -2387,6 +2387,9 @@ fn lower_intrinsic_call(
         "lin_stream_drain" => Intrinsic::StreamDrain,
         "lin_stream_collect" => Intrinsic::StreamCollect,
         "lin_stream_read_text" => Intrinsic::StreamReadText,
+        "lin_net_tcp_stream" => Intrinsic::StreamTcp,
+        "lin_process_stdout_stream" => Intrinsic::StreamStdout,
+        "lin_io_stdin_stream" => Intrinsic::StreamStdin,
         _ => {
             // Unknown intrinsic: lower as indirect call fallback.
             let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();
@@ -3066,6 +3069,24 @@ fn emit_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
 /// `for(iterable, body)` → index loop calling `body(elem)` for side effects; returns Null.
 fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
+    // STREAM `.for(fn)` (Stage 5): a `for` over a Stream is driven by the runtime, not the
+    // index-loop. EOF ends the loop normally (→ Null); the first read Error becomes the for-expr's
+    // value (→ Error). So a stream `for` has result type `Null | Error`. The body closure ESCAPES
+    // into the runtime call, so it is lowered as an ordinary (non-safe-ctx) closure value.
+    if matches!(iterable_ty, Type::Stream(_)) {
+        let stream = lower_expr(&args[0], builder, ctx);
+        let body = lower_expr(&args[1], builder, ctx);
+        let ret_ty = Type::Union(vec![Type::Null, lin_check::resolve::error_type()]);
+        let dst = builder.alloc_temp(ret_ty.clone());
+        builder.emit(Instruction::CallIntrinsic {
+            dst,
+            intrinsic: Intrinsic::StreamFor,
+            args: vec![stream, body],
+            ret_ty: ret_ty.clone(),
+        });
+        builder.register_owned(dst, ret_ty);
+        return dst;
+    }
     let (param_tys, _) = callback_signature(&args[1]);
     // Read elements at the source's PROVABLE runtime representation: flat-scalar only when the
     // source is a provably-flat producer, else the tagged Json read (sound for a `[]`+push array

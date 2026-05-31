@@ -378,6 +378,23 @@ impl Checker {
             }
             Stmt::Expr(expr) => {
                 let typed = self.infer_expr(expr)?;
+                // Must-use WARNING for a dropped Stream (streams brief §7): a `Stream` is an
+                // affine resource — building a pipeline that is discarded as a bare statement (no
+                // terminal `drain`/`for`/`collect`/`readText`/`close`) wastes it. Dropping is not
+                // an ERROR (the RC finalizer still closes the fd), so this is a warning, not a
+                // hard failure. A pipeline ENDED by a terminal has type `Null|Error`/`UInt8[]|…`,
+                // not `Stream`, so a properly-consumed stream never triggers this.
+                if matches!(typed.ty(), crate::types::Type::Stream(_)) {
+                    self.diagnostics.push(
+                        lin_common::Diagnostic::warning(
+                            expr.span(),
+                            "this Stream value is unused — its pipeline is never driven \
+                             (add a terminal like `.drain()`, `.for(...)`, `.collect()`, \
+                             `.readText()`, or `.close()`)",
+                        )
+                        .with_note(expr.span(), "a dropped Stream is closed by its finalizer, but no data is ever read"),
+                    );
+                }
                 Ok(TypedStmt::Expr(typed))
             }
         }

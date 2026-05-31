@@ -141,6 +141,13 @@ pub enum Intrinsic {
     StreamDrain,
     StreamCollect,
     StreamReadText,
+    // Unified OS sources (Stage 5): TCP socket / process stdout / stdin → Stream<UInt8[]>.
+    StreamTcp,
+    StreamStdout,
+    StreamStdin,
+    // `.for(fn)` over a Stream (Stage 5): drive each item through `fn` on the calling thread →
+    // Null | Error (EOF → Null; a read error → the Error value). Closes the stream at the end.
+    StreamFor,
     /// `fromJson` type-directed decode (ADR-047). Carries the resolved target `Type` T and the
     /// resolved bodies of every reachable `Named` type (so codegen can build a recursive schema
     /// descriptor with no type environment). Runtime: `lin_from_json(value, descriptor) -> ptr`

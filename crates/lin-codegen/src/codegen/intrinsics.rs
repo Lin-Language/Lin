@@ -593,6 +593,42 @@ impl<'ctx> Codegen<'ctx> {
                 let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(fnv, &[s.into()], "ir_stream_term").try_as_basic_value().unwrap_basic()
             }
+            // Unified OS sources → boxed Stream<UInt8[]>. tcp takes an i32 fd; stdout an i64
+            // handle; stdin takes no args.
+            Intrinsic::StreamTcp => {
+                let i32_ty = self.context.i32_type();
+                let fd = args.first().copied().unwrap_or_else(|| i32_ty.const_zero().into());
+                let fd_i32 = if fd.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(fd.into_int_value(), i32_ty, "ir_tcp_fd")
+                } else { i32_ty.const_zero() };
+                let fnv = self.get_or_declare_fn("lin_net_tcp_stream", ptr_ty.fn_type(&[i32_ty.into()], false));
+                self.builder.call(fnv, &[fd_i32.into()], "ir_stream_tcp").try_as_basic_value().unwrap_basic()
+            }
+            Intrinsic::StreamStdout => {
+                let i64_ty = self.context.i64_type();
+                let h = args.first().copied().unwrap_or_else(|| i64_ty.const_zero().into());
+                let h_i64 = if h.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(h.into_int_value(), i64_ty, "ir_proc_h")
+                } else { i64_ty.const_zero() };
+                let fnv = self.get_or_declare_fn("lin_process_stdout_stream", ptr_ty.fn_type(&[i64_ty.into()], false));
+                self.builder.call(fnv, &[h_i64.into()], "ir_stream_stdout").try_as_basic_value().unwrap_basic()
+            }
+            Intrinsic::StreamStdin => {
+                let fnv = self.get_or_declare_fn("lin_io_stdin_stream", ptr_ty.fn_type(&[], false));
+                self.builder.call(fnv, &[], "ir_stream_stdin").try_as_basic_value().unwrap_basic()
+            }
+            // .for(fn) over a Stream → lin_stream_for(stream, closure) → boxed Null | Error. The
+            // body closure may arrive boxed; unbox to the raw closure ptr like map/filter.
+            Intrinsic::StreamFor => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                let func = if Self::is_union_type(&func_ty) && func.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[func.into()], "ir_streamfor_cls").try_as_basic_value().unwrap_basic()
+                } else { func };
+                let fnv = self.get_or_declare_fn("lin_stream_for", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), func.into()], "ir_stream_for").try_as_basic_value().unwrap_basic()
+            }
             // lin_object_set(obj, key, val) => Null. Unbox obj→LinObject*, key→LinString*,
             // box val→TaggedVal*, then call the runtime. Mirrors the AST handler.
             Intrinsic::ObjectSetDyn => {

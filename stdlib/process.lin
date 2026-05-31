@@ -59,3 +59,8 @@ export val kill = (handle: ProcessHandle): Json =>
 // was streamed via readStdout is not re-collected here — use `exec` for batch output.)
 export val wait = (handle: ProcessHandle): Json =>
   lin_process_wait(handle)
+
+// stdoutStream(handle): wrap a spawned child's piped stdout as a lazy byte Stream<UInt8[]>
+// (streams brief §4). Reading pulls from the pipe until EOF.
+export val stdoutStream = (handle: ProcessHandle): Stream =>
+  lin_process_stdout_stream(handle)

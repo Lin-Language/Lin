@@ -62,13 +62,19 @@ impl Checker {
             Type::func(vec![Type::Object(IndexMap::new()), Type::Str, Type::TypeVar(u32::MAX)], Type::Null),
         );
 
-        // for: (Iterable<T>, (T) => Json) => Null  — callback return type is ignored
+        // for: (Iterable<T>, (T) => Json) => Null  — callback return type is ignored. A `Stream<T>`
+        // is ALSO accepted as the iterable (streams brief §3): a stream `for` is driven by the
+        // runtime (the IR lowerer branches on the Stream type → `lin_stream_for`), ends normally
+        // at EOF, and a read Error becomes the for-expr's value. The declared result stays `Null`
+        // so the array/iterator `for` wrappers (`: Null`) are unchanged; std/stream's `for` wrapper
+        // widens its OWN declared return to `Null | Error` to surface the stream error arm.
         self.define_intrinsic(
             "lin_for",
             Type::func(vec![
                     Type::Union(vec![
                         Type::Array(Box::new(Type::TypeVar(9010))),
                         Type::Iterator(Box::new(Type::TypeVar(9010))),
+                        Type::Stream(Box::new(Type::TypeVar(9010))),
                     ]),
                     Type::func(vec![Type::TypeVar(9010)], Type::TypeVar(u32::MAX)),
                 ], Type::Null),
@@ -253,6 +259,13 @@ impl Checker {
             Type::func(vec![any_stream()], Type::Union(vec![Type::Array(Box::new(Type::UInt8)), crate::resolve::error_type()])));
         self.define_intrinsic("lin_stream_read_text",
             Type::func(vec![any_stream()], Type::Union(vec![Type::Str, crate::resolve::error_type()])));
+
+        // Unified OS sources (Stage 5): each yields a Stream<UInt8[]> over a different backend.
+        // tcpStream(fd) / stdoutStream(handle) take an integer fd/handle; stdinStream() is nullary.
+        let byte_stream = || Type::Stream(Box::new(Type::Array(Box::new(Type::UInt8))));
+        self.define_intrinsic("lin_net_tcp_stream", Type::func(vec![Type::Int32], byte_stream()));
+        self.define_intrinsic("lin_process_stdout_stream", Type::func(vec![Type::Int64], byte_stream()));
+        self.define_intrinsic("lin_io_stdin_stream", Type::func(vec![], byte_stream()));
 
         // serve: ((Request) => Response, Int32) => Null  (spec §25.5). Handler-first so
         // `router.serve(port)` desugars to `serve(router, port)`. Blocks forever; typed Null.
