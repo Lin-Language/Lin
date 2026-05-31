@@ -69,25 +69,25 @@ val dirName = (filePath: String): String =>
   )
   join(dirParts)
 
-// Check if a Json value indicates a failure
-val isFailure = (v: Json): Boolean =>
-  v != null && v["type"] == "failure"
+// Check if a Json value is a stdlib Error value
+val isError = (v: Json): Boolean =>
+  v != null && v["type"] == "error"
 
 // Get file content string from readFile result (returns "" on error)
 val fileContent = (v: Json): String =>
-  if isFailure(v) then ""
+  if isError(v) then ""
   else v
 
-// Get error message from a failure value
+// Get error message from an Error value
 val errorMsg = (v: Json): String =>
   if v == null then "unknown error"
-  else if v["error"] == null then "unknown error"
-  else v["error"]
+  else if v["message"] == null then "unknown error"
+  else v["message"]
 
 // Process a single markdown file, returning Null
 val processFile = (filePath: String, navEntries: Json): Null =>
   val sourceJson = readFile(filePath)
-  if isFailure(sourceJson) then print("Error reading ${filePath}: ${errorMsg(sourceJson)}")
+  if isError(sourceJson) then print("Error reading ${filePath}: ${errorMsg(sourceJson)}")
   else
     val source = fileContent(sourceJson)
     val title = extractTitle(source)
@@ -108,7 +108,7 @@ val processFile = (filePath: String, navEntries: Json): Null =>
     val outDir = dirName(outputPath)
     mkdir(outDir, { "parents": true })
     val writeResult = writeFile(outputPath, rendered)
-    if isFailure(writeResult) then print("Error writing ${outputPath}: ${errorMsg(writeResult)}")
+    if isError(writeResult) then print("Error writing ${outputPath}: ${errorMsg(writeResult)}")
     else print("  ${outputPath}")
 
 // Copy static assets to output/static/
@@ -116,22 +116,22 @@ val copyStatic = (): Null =>
   val outStaticDir = "${outputDir}/static"
   mkdir(outStaticDir, { "parents": true })
   val filesJson = ls(staticDir, {})
-  if isFailure(filesJson) then print("Error listing static dir: ${errorMsg(filesJson)}")
+  if isError(filesJson) then print("Error listing static dir: ${errorMsg(filesJson)}")
   else
     val files = filesJson
     files.for(filename =>
       val srcPath = "${staticDir}/${filename}"
       val dstPath = "${outStaticDir}/${filename}"
       val copyResult = cp(srcPath, dstPath)
-      if isFailure(copyResult) then print("Error copying ${filename}: ${errorMsg(copyResult)}")
+      if isError(copyResult) then print("Error copying ${filename}: ${errorMsg(copyResult)}")
     )
 
 // Main entry point
 val navResult = readJson("${contentDir}/nav.json")
-val navEntries = if isFailure(navResult) then [] else navResult
+val navEntries = if isError(navResult) then [] else navResult
 
 val allFilesJson = ls(contentDir, { "recursive": true })
-val allFiles = if isFailure(allFilesJson) then [] else allFilesJson
+val allFiles = if isError(allFilesJson) then [] else allFilesJson
 
 val mdFiles = allFiles.filter(f => contains(f, ".md"))
 val total = length(mdFiles)

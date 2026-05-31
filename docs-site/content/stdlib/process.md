@@ -36,10 +36,10 @@ type ExecResult = {
 ### `exec`
 
 ```lin
-match exec("git", ["status", "--short"])
-  has { "type": "failure", error } => print("exec failed: ${error}")
+val r = exec("git", ["status", "--short"])
+match r
+  is Error => print("exec failed: ${r["message"]}")
   else =>
-    val r = exec("git", ["status", "--short"])
     print("exit ${r["status"]}")
     print(r["stdout"])
 ```
@@ -49,9 +49,10 @@ match exec("git", ["status", "--short"])
 ### `shell`
 
 ```lin
-match shell("ls -la | wc -l")
-  has { "type": "success", value } => print(value["stdout"].trim())
-  has { "type": "failure", error } => print("error: ${error}")
+val out = shell("ls -la | wc -l")
+match out
+  is Error => print("error: ${out["message"]}")
+  else => print(out["stdout"].trim())
 ```
 
 Prefer `exec` when possible to avoid shell injection vulnerabilities.
@@ -63,8 +64,9 @@ Prefer `exec` when possible to avoid shell injection vulnerabilities.
 ```lin
 val here = cwd()   // "/home/alice/project"
 
-match chdir("src")
-  has { "type": "failure", error } => print("cannot chdir: ${error}")
+val result = chdir("src")
+match result
+  is Error => print("cannot chdir: ${result["message"]}")
   else => null
 ```
 

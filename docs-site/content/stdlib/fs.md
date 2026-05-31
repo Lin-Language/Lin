@@ -49,7 +49,7 @@ type FileStat = {
 ```lin
 val content = readFile("config.txt")
 match content
-  has { "type": "failure", error } => print("error: ${error}")
+  is Error => print("error: ${content["message"]}")
   else => print(content)
 ```
 
@@ -60,7 +60,7 @@ match content
 ```lin
 val result = writeFile("output.txt", "hello world\n")
 match result
-  has { "type": "failure", error } => print("write failed: ${error}")
+  is Error => print("write failed: ${result["message"]}")
   else => null
 ```
 
@@ -71,7 +71,7 @@ match result
 ```lin
 val data = readJson("config.json")
 match data
-  has { "type": "failure", error } => print("parse error: ${error}")
+  is Error => print("parse error: ${data["message"]}")
   else => print(data["version"])
 ```
 

@@ -43,11 +43,12 @@ Missing keys render as `"null"`.
 ### `render`
 
 ```lin
-match render("templates/email.lint", {
+val result = render("templates/email.lint", {
   "name": "Alice",
   "subject": "Welcome"
 })
-  has { "type": "failure", error } => print("template error: ${error}")
+match result
+  is Error => print("template error: ${result["message"]}")
   else => sendEmail(result)
 ```
 
@@ -76,7 +77,7 @@ val result = render("greeting.lint", {
 })
 
 match result
-  has { "type": "failure", error } => print("error: ${error}")
+  is Error => print("error: ${result["message"]}")
   else => print(result)
 ```
 
