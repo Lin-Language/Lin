@@ -79,6 +79,25 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     let typed_module = check_module_with_imports(&ast_module, &imported_modules, false)
         .map_err(CompileError::TypeCheck)?;
 
+    // ADR-071: `replace` is a TEST-ONLY mock — valid only in a `*.test.lin`. Gating on the
+    // FILENAME (not the subcommand) means it holds for every entry point: `lin run`/`lin build`
+    // on a normal program reject it (a shipped binary must never silently swap an import like
+    // stdlib `fs`), while `lin test` AND the ASan CI leg (which runs `lin build <f>.test.lin`)
+    // both accept it. A `replace` outside a `.test.lin` is a hard error.
+    let is_test_file = opts
+        .source_path
+        .to_string_lossy()
+        .ends_with(".test.lin");
+    if !is_test_file && !typed_module.replacements.is_empty() {
+        let span = typed_module.replacements[0].span;
+        return Err(CompileError::TypeCheck(vec![lin_common::Diagnostic::error(
+            span,
+            "`replace` is only allowed in a `*.test.lin` file (it mocks an import for tests). \
+             Remove it from this program (ADR-071)."
+                .to_string(),
+        )]));
+    }
+
     // 4. LLVM codegen via the LinIR pipeline (the sole compilation backend).
     // When `opts.coverage` is set, the codegen instruments per-block counters and emits the
     // LLVM coverage-mapping globals; only the main module and user (non-stdlib) imports are
@@ -115,6 +134,18 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         cg.set_main_source(&abs, &source);
     }
 
+    // ADR-071: group the main module's test `replace` overrides by the import path they target,
+    // so each imported module is compiled WITHOUT emitting the replaced export's body — the main
+    // module supplies the canonical symbol instead.
+    let mut replaced_by_path: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    for r in &typed_module.replacements {
+        replaced_by_path
+            .entry(r.module_path.clone())
+            .or_default()
+            .insert(r.export_name.clone());
+    }
+    let empty_replaced: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     // Register imported modules with codegen in dependency order so cross-module slot
     // resolution works correctly (dependencies must be registered before dependents). Each
     // imported module is lowered and compiled through the same LinIR pipeline as the main
@@ -122,7 +153,8 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     for path in &import_order {
         let imp_module = imported_modules.get(path).unwrap();
         let src = if opts.coverage { import_sources.get(path) } else { None };
-        cg.compile_import_from_ir(path, imp_module, src, &imported_modules);
+        let replaced = replaced_by_path.get(path).unwrap_or(&empty_replaced);
+        cg.compile_import_from_ir(path, imp_module, src, &imported_modules, replaced);
     }
 
     // Compile the main module through LinIR.

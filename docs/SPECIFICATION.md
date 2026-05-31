@@ -1436,6 +1436,56 @@ export type Person = {
 
 Modules are not ordinary JSON values because they may contain functions and types.
 
+### 22.1 Test Mocking — `replace`
+
+A `replace` statement overrides an imported binding for the duration of a test
+program. It is a **test-only** facility: it is permitted only in a `*.test.lin`
+file, and using it anywhere else is a compile error.
+
+```txt
+import { readFile } from "std/fs"
+
+replace readFile = (path: String): Json => "mock contents of ${path}"
+```
+
+Syntax: `replace <name> = <expr>`, at the top level of a module, where `<name>` is
+a binding brought in by an `import` above it. (`replace` is a contextual keyword —
+it is an ordinary identifier everywhere except the start of this statement form, so
+`std/string`'s `replace` function is unaffected.)
+
+Semantics:
+
+- **Whole-program override.** The `replace` body becomes the definition the entire
+  test program uses for that export. Because an exported binding compiles to a single
+  symbol, every reference resolves to the mock — the test file, the module under
+  test, and any transitively-importing module, however the import path is spelled. A
+  module that internally calls the replaced binding sees the mock with no change to
+  itself. Delegation back to the original implementation is therefore not possible
+  (a mock that calls its own replaced name recurses).
+- **Type-checked.** The body is checked against the export's declared signature; a
+  mismatch is a compile error.
+- **Functions and vals.** Both a function export and a non-function `val` export may
+  be replaced.
+- **Stdlib is mockable** at the Lin-API level (e.g. `std/fs.readFile`,
+  `std/time.now`). The polymorphic built-in primitives (`print`, `map`, `filter`,
+  `reduce`, `for`, `length`, `toString`, and the concurrency family) are not
+  replaceable — they are not ordinary linkable symbols.
+- **Spies** are an ordinary mock that closes over a module-level `var`/`Shared` cell
+  to record calls or arguments, asserted after the test run.
+
+### 22.2 Test Lifecycle
+
+The standard `std/test` framework provides setup/teardown without dedicated
+keywords (see `docs/STDLIB.md`):
+
+- **beforeAll**: a module-scope `val`/statement above the suite (test bodies run
+  eagerly as the suite array is built).
+- **afterAll**: statements after `report(suite)` — `report` returns the failure
+  count instead of exiting, so teardown runs even when a test fails.
+- **beforeEach/afterEach**: the `withFixture(setup, teardown, name, body)`
+  combinator, which builds a fixture, injects it into the test body, and tears it
+  down — failures are values, so teardown always runs.
+
 ## 23. Scoping
 
 Bindings are lexical.

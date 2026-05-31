@@ -1,5 +1,16 @@
 import { expect, toBe, toBeNull, toSatisfy, toSucceed, toFail, toFailWith, test, suite, run } from "std/test"
+import { withFixture, report } from "std/test"
 import { toString, contains } from "std/string"
+
+// Spy cells for the withFixture lifecycle test below.
+var fxSetups = 0
+var fxTeardowns = 0
+val fxSetup = (): Json =>
+  fxSetups = fxSetups + 1
+  { "conn": 7 }
+val fxTeardown = (fixture: Json): Null =>
+  fxTeardowns = fxTeardowns + 1
+  null
 
 val s = suite("std/test", [
   test("toBe passes when equal", () => [
@@ -105,6 +116,33 @@ val s = suite("std/test", [
       expect(ok).toSatisfy(r => r has { "type": "success", value }),
       expect(err).toSatisfy(r => r has { "type": "failure", error })
     ]
+  ),
+
+  // withFixture injects the fixture into the body and runs setup/teardown around it. These two
+  // entries each fire setup once and teardown once; the meta-test below asserts the counts.
+  withFixture(fxSetup, fxTeardown, "withFixture injects the fixture", (db) => [
+    expect(db["conn"]).toBe(7)
+  ]),
+
+  withFixture(fxSetup, fxTeardown, "withFixture runs again independently", (db) => [
+    expect(db["conn"]).toBe(7)
+  ]),
+
+  // Eager evaluation: the two withFixture entries above already ran (the tests array is built
+  // before this entry), so setup and teardown have each fired exactly twice.
+  test("withFixture ran setup and teardown for each use", () => [
+    expect(fxSetups).toBe(2),
+    expect(fxTeardowns).toBe(2)
+  ]),
+
+  // `report` prints results and RETURNS the failure count instead of exiting — the building
+  // block for guaranteed afterAll teardown. A two-pass / one-fail suite reports 1.
+  test("report returns the failure count without exiting", () =>
+    val sub = suite("sub", [
+      test("ok", () => [ expect(1).toBe(1) ]),
+      test("bad", () => [ expect(1).toBe(2) ])
+    ])
+    [ expect(report(sub)).toBe(1) ]
   ),
 ])
 

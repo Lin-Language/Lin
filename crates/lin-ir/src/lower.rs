@@ -112,6 +112,14 @@ pub fn lower_module_with_imports(
     let main_fn = builder.finish();
     ctx.functions.push(main_fn);
 
+    // ADR-071: emit each test `replace` body under the import export's CANONICAL mangled symbol
+    // (`{module_key}_{name}` for functions, `{sym}__val` for vals). The replaced export's own
+    // module skipped emitting that symbol (see `lower_import_module_with_imports`'s
+    // `replaced_exports` handling), so the single LLVM definition is the mock — every caller,
+    // however the import path is spelled, resolves to it. Lowered AFTER `main` so any sibling
+    // top-level fns the body references are already in `global_fn_slots`.
+    lower_replacements(&module.replacements, &mut ctx);
+
     // Synthesize default-argument adapters queued during the main pass. Each lowers into
     // ctx.pending_functions (drained below).
     let adapters = std::mem::take(&mut ctx.pending_adapters);
@@ -150,7 +158,8 @@ pub fn lower_module_with_imports(
 /// foreign bindings, and intrinsics resolve exactly as in the main lowering.
 pub fn lower_import_module(module: &TypedModule, module_key: &str) -> LinModule {
     let no_imports: HashMap<String, TypedModule> = HashMap::new();
-    lower_import_module_with_imports(module, module_key, &no_imports)
+    let no_replaced: std::collections::HashSet<String> = std::collections::HashSet::new();
+    lower_import_module_with_imports(module, module_key, &no_imports, &no_replaced)
 }
 
 /// Like `lower_import_module`, but with the program's already-typed imported modules so an import
@@ -163,6 +172,7 @@ pub fn lower_import_module_with_imports(
     module: &TypedModule,
     module_key: &str,
     imports: &HashMap<String, TypedModule>,
+    replaced_exports: &std::collections::HashSet<String>,
 ) -> LinModule {
     // Monomorphize this import's generic calls: its OWN single-module sibling calls (e.g. stdlib
     // `sum`/`min` calling the now-generic `reduce`) AND any CROSS-MODULE generic call it makes into
@@ -190,9 +200,23 @@ pub fn lower_import_module_with_imports(
         if let TypedStmt::Val {
             slot,
             value: TypedExpr::Function { name: Some(name), .. },
+            ty,
             ..
         } = stmt
         {
+            // ADR-071: a `replace`d export is NOT emitted here. Route its slot through
+            // `import_fn_slots` to the canonical symbol so even THIS module's internal sibling
+            // calls become `Named` calls to the symbol the main (test) module will define. The
+            // single LLVM symbol then resolves to the mock for every caller. No FuncId / body.
+            if replaced_exports.contains(name) {
+                let sym = format!("{}_{}", module_key, name);
+                let param_tys: Vec<Type> = match ty {
+                    Type::Function { params, .. } => params.clone(),
+                    _ => vec![],
+                };
+                ctx.import_fn_slots.insert(*slot, (sym, param_tys));
+                continue;
+            }
             let fid = ctx.alloc_func_id();
             global_fn_slots.insert(*slot, fid);
             fn_names.insert(fid, format!("{}_{}", module_key, name));
@@ -274,6 +298,9 @@ pub fn lower_import_module_with_imports(
     for stmt in &module.statements {
         if let TypedStmt::Val { value, ty, name: Some(name), .. } = stmt {
             if matches!(value, TypedExpr::Function { .. }) { continue; }
+            // ADR-071: a `replace`d val's wrapper is emitted by the main (test) module instead;
+            // skip the original body so the single `__val` symbol resolves to the mock.
+            if replaced_exports.contains(name) { continue; }
             let fid = ctx.alloc_func_id();
             let wrapper_name = format!("{}_{}__val", module_key, name);
             let mut wb = FuncBuilder::new(
@@ -4090,6 +4117,96 @@ fn lower_adapter(spec: &AdapterSpec, ctx: &mut LowerCtx) {
         ctx,
     );
     host.discard_scope();
+}
+
+/// ADR-071: lower each test `replace` body to a top-level definition under the export's
+/// canonical mangled symbol. Function mocks become a `LinFunction` named exactly `{module_key}_
+/// {name}`; non-function (val) mocks become a zero-arg `{sym}__val` wrapper. The replaced
+/// export's own module skipped emitting that symbol, so this is the sole definition and every
+/// caller resolves to it (single LLVM symbol). Run from the MAIN module lowering only.
+fn lower_replacements(replacements: &[Replacement], ctx: &mut LowerCtx) {
+    for Replacement { sym, is_function, value, ty, span, .. } in replacements {
+        let span = *span;
+        if *is_function {
+            // The export's declared signature drives the emitted function's ABI so callers
+            // (which build the call from the import's declared param/ret types) match.
+            let (decl_params, decl_ret): (Vec<Type>, Type) = match ty {
+                Type::Function { params, ret, .. } => (params.clone(), (**ret).clone()),
+                _ => (vec![], Type::Null),
+            };
+            let fid = ctx.alloc_func_id();
+            let mut host = FuncBuilder::new(
+                ctx.alloc_func_id(), None, vec![], false, Type::Null, ctx.intrinsics.clone(),
+            );
+            host.push_scope();
+            match value {
+                // Primary case: a lambda literal — lower its body directly under the symbol.
+                // Params were checked against the export signature, so their types match the
+                // declared ABI; we force the declared return type for exactness.
+                TypedExpr::Function { params, body, captures, .. } => {
+                    lower_function_expr_with_id(
+                        Some(fid), None, Some(sym.as_str()),
+                        params, body, &decl_ret, captures, &mut host, ctx,
+                    );
+                }
+                // Fallback: any other function-typed expr (e.g. `replace f = otherFn`). Emit a
+                // forwarding wrapper with synthetic params that evaluates the expr and calls it.
+                other => {
+                    // Synthetic param slots in a high range so they never collide with the
+                    // checker's slots (referenced only within this generated body).
+                    let base = usize::MAX / 2;
+                    let synth_params: Vec<TypedParam> = decl_params
+                        .iter()
+                        .enumerate()
+                        .map(|(i, pty)| TypedParam {
+                            slot: base + i,
+                            name: format!("__rp{}", i),
+                            ty: pty.clone(),
+                            default: None,
+                        })
+                        .collect();
+                    let call_args: Vec<TypedExpr> = synth_params
+                        .iter()
+                        .map(|p| TypedExpr::LocalGet { slot: p.slot, ty: p.ty.clone(), span })
+                        .collect();
+                    let call = TypedExpr::Call {
+                        func: Box::new(other.clone()),
+                        args: call_args,
+                        result_type: decl_ret.clone(),
+                        is_tail: false,
+                        partial: false,
+                        span,
+                    };
+                    lower_function_expr_with_id(
+                        Some(fid), None, Some(sym.as_str()),
+                        &synth_params, &call, &decl_ret, &[], &mut host, ctx,
+                    );
+                }
+            }
+            host.discard_scope();
+        } else {
+            // Non-function val mock: emit the `{sym}__val` zero-arg wrapper (mirrors the import
+            // export path), so reads of the binding (a `Named` call to the wrapper) hit the mock.
+            let fid = ctx.alloc_func_id();
+            let wrapper_name = format!("{}__val", sym);
+            let mut wb = FuncBuilder::new(
+                fid, Some(wrapper_name), vec![], false, ty.clone(), ctx.intrinsics.clone(),
+            );
+            wb.push_scope();
+            let t = lower_expr(value, &mut wb, ctx);
+            let t = coerce_to_slot_type(t, &value.ty(), ty, &mut wb);
+            wb.pop_scope_releasing_keep(&[t]);
+            if !wb.is_current_block_terminated() {
+                if matches!(ty, Type::Null | Type::Never) {
+                    wb.terminate(Terminator::Return(None));
+                } else {
+                    wb.terminate(Terminator::Return(Some(t)));
+                }
+            }
+            wb.seal();
+            ctx.functions.push(wb.finish());
+        }
+    }
 }
 
 // -------------------------------------------------------------------------
