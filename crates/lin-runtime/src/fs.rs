@@ -21,6 +21,7 @@ pub unsafe extern "C" fn lin_make_error_tagged(msg: *const LinString) -> *mut u8
 }
 
 unsafe fn make_error_obj(msg: &str) -> *mut LinObject {
+    use crate::string::lin_string_release;
     let obj = lin_object_alloc(4);
     let type_key = make_string("type");
     let error_val = make_string("error");
@@ -29,13 +30,18 @@ unsafe fn make_error_obj(msg: &str) -> *mut LinObject {
     let mut tv: TaggedVal = std::mem::zeroed();
     tv.tag = TAG_STR;
     tv.payload = error_val as u64;
-    lin_object_set(obj, type_key, &tv);
-    // Note: lin_object_set takes ownership of key pointer; do NOT release type_key.
+    lin_object_set(obj, type_key, &tv); // inc_refs type_key, retains error_val
     let mut tv2: TaggedVal = std::mem::zeroed();
     tv2.tag = TAG_STR;
     tv2.payload = msg_val as u64;
-    lin_object_set(obj, msg_key, &tv2);
-    // Note: lin_object_set takes ownership of key pointer; do NOT release msg_key.
+    lin_object_set(obj, msg_key, &tv2); // inc_refs msg_key, retains msg_val
+    // lin_object_set takes its OWN reference to each key and value; release the local +1
+    // from each make_string so the object is the sole owner (freeing the returned error
+    // object then frees everything — no leak; verified under LeakSanitizer).
+    lin_string_release(type_key);
+    lin_string_release(error_val);
+    lin_string_release(msg_key);
+    lin_string_release(msg_val);
     obj
 }
 

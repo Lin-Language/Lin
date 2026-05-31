@@ -47,7 +47,7 @@ impl Checker {
                 let tp = self.check_pattern(pat, scrutinee_ty)?;
                 // Narrow the scrutinee variable within this arm's scope.
                 // Reuse the same slot so LocalGet can unbox the TaggedVal pointer correctly.
-                // `TypeCheckDeep` (ADR-053) narrows to its object type exactly like `TypeCheck`.
+                // `TypeCheckDeep` (ADR-054) narrows to its object type exactly like `TypeCheck`.
                 let narrowed = match &tp {
                     TypedPattern::TypeCheck(ty, _) => Some(ty),
                     TypedPattern::TypeCheckDeep(ty, _, _) => Some(ty),
@@ -161,7 +161,7 @@ impl Checker {
                 if name == "Error" {
                     return Ok(self.error_discriminant_pattern(*span));
                 }
-                // `is <Name>` resolving to a non-empty object type (ADR-053): validate field
+                // `is <Name>` resolving to a non-empty object type (ADR-054): validate field
                 // TYPES recursively at runtime, not just field presence (ADR-050). A bare
                 // presence check let `{ "name": 1, "age": "x" }` match `Person`, then the arm
                 // narrowed the binding and a subsequent `x["age"] + 1` operated on the wrong
