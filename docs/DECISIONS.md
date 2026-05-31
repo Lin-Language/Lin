@@ -1077,3 +1077,158 @@ Diamonds and ordinary deep import graphs are unaffected. Spec §22.5/§20.1 and
 decision-list #29 updated to "circular import is a compile-time error." Regressions:
 `test_circular_import_is_diagnosed_not_stack_overflow` and
 `test_diamond_imports_are_not_false_cycles` in `crates/lin/tests/integration.rs`.
+
+## ADR-073: Affine resource types + move-transfer
+
+**Decision**: A *resource type* — currently just `Stream<T>` (§27.10, ADR-074) — is **affine**: it
+may be used **at most once**, and dropping it unused is fine. Resource values cross a thread boundary
+by **MOVE** (a pointer handoff, no clone), where transferable JSON-shaped values still cross by deep
+**COPY** (ADR-043 Option C, the existing path). Both rules yield **disjoint object graphs** per
+thread, so the single-threaded non-atomic refcount (ADR-039) stays sound on both sides.
+
+This completes the transfer model anticipated in ADR-043:
+
+1. **Transferable values cross by deep copy (unchanged).** A JSON-shaped, acyclic, `Function`/
+   `Iterator`-free value (the only kind a thunk may capture or return, §24.2) is deep-copied at the
+   boundary so each thread owns a private graph. Non-atomic RC is sound because nothing is shared.
+
+2. **Resource values cross by move (new).** A `Stream<T>` cannot be deep-copied — it owns an OS fd and
+   a live read position; copying would alias the fd. Instead it is **moved**: the box pointer is handed
+   to the worker thread verbatim (no clone, no source-side release), the source binding must never touch
+   it again, and the **worker** owns it for the rest of its life and releases it (the RC-drop finalizer,
+   ADR-074, runs on the worker). Because the source relinquishes the only reference, the moved graph is
+   exactly as disjoint as a copied one — one owner, one thread — so non-atomic RC remains correct without
+   atomics. A move is O(1); a copy is O(size). This is the `.promise()` hand-off (§27.10).
+
+**Affine, not strict-linear.** A strict-linear discipline would make *dropping* a resource an error
+(every stream must be explicitly consumed). We choose **affine** (use-at-most-once) because the RC-drop
+finalizer (ADR-074) already closes the fd deterministically when the last reference goes away, so an
+un-consumed stream is not a leak — it is closed at end of scope like any other heap value. Therefore:
+- **Double-use is the only hard error.** Using a stream after it has been moved or terminally consumed
+  is a compile-time error.
+- **Must-use is a WARNING, not an error.** A stream that is built and never drained/awaited is almost
+  always a mistake (the pipeline never runs), so the checker warns — but it is sound (the finalizer
+  closes the fd), so it does not block compilation.
+
+**The flow-sensitive use-after-move check.** The checker tracks, per local binding of resource type, a
+*consumed* flag through the control-flow of a function body. A binding becomes consumed when it is:
+passed as an argument (the callee takes ownership), returned, or fed to a terminal/sink op
+(`.drain()`/`.promise()`/`.for(...)`/`readText`/`collect`). A later reference to a consumed binding is
+the use-after-move error. Branches join conservatively: a binding consumed on *any* path is treated as
+consumed afterwards (a use on the other path is still flagged, since the program cannot statically know
+which path ran). This is the same shape as the `async` var-capture analysis (ADR-034) — a localized,
+flow-sensitive scan over the typed body — not a full borrow checker.
+
+**v1 placement restriction.** A `Stream` value may live **only** in a `val` binding, a function
+parameter, or a function return position. It may **not** be stored in an object field, an array element,
+or a `var`. This confines the move-checker to *local bindings* with a single static name — it never has
+to reason about aliasing through a container or through a mutable cell that two closures share
+(ADR-015). The restriction is enforced in the checker (a `Stream`-typed object/array literal element or
+`var` initializer is a type error) and is **relaxable later** (container-linearity / region tracking)
+without changing the surface API. It mirrors the deliberately-narrow scope choices of ADR-044 (`Shared`
+is invariant, never widens to `Json`) and ADR-048 (the structured-decode gate).
+
+**`CAP_MOVE` in the closure-env ABI.** Capture kinds live in two mirrored places that previously stopped
+at `CAP_TAGGED=5` (`crates/lin-runtime/src/transfer.rs`'s `CAP_*` family and `lin-ir/src/ir.rs`'s
+`enum CaptureRelease`). A resource capture gets a new kind **`CAP_MOVE=6`**. At the thread-transfer
+boundary (`transfer_clone_env`, ADR-043/ADR-060) a `CAP_MOVE` capture is **moved, not cloned**: the box
+pointer is copied into the worker's env and the source env's slot is **not** released (`release_env_copy`
+skips it) — the worker now owns it. `env_is_transferable` accepts a `CAP_MOVE` capture (a resource is
+transferable by move even though it is non-copyable). This is the single ABI mechanism that realises the
+move at run time; everything else (the affine check) makes it *safe*.
+
+**Rationale**: ADR-043 deliberately left "resource values cross by move" as future work — its Option C
+deep-copy is *total* only over transferable types, and a stream is precisely the non-transferable,
+single-owner value that copy cannot handle. Move is the natural dual: copy gives each side its own graph
+by duplication; move gives each side its own graph by *relinquishment*. The affine check is what makes
+relinquishment sound (the source provably never touches the moved value again), and it is the minimum
+needed — full linearity (must-use-as-error) buys nothing once the finalizer guarantees cleanup, and a
+full borrow checker is far more than local single-owner resources require. The placement restriction
+keeps the v1 check tractable by removing aliasing entirely.
+
+**Consequence**: `Stream<T>` is the first affine type; the machinery (consumed-flag flow analysis,
+`CAP_MOVE`, the placement restriction) is reusable for any future single-owner OS resource. The
+move-transfer path **must** be verified under AddressSanitizer (a `cargo test` pass cannot catch the
+UAF/double-free class): a moved stream's fd must close **exactly once**, on the worker, with no
+source-side release and no double-free. A program that violates the affine rule fails to compile
+(`use of moved value 's'`); a built-but-never-run stream compiles with a `stream is never consumed`
+warning. The non-atomic RC hot path (ADR-039) is untouched — `CAP_MOVE` is the only new boundary
+behaviour, and it does *less* work than the copy path, not more.
+
+## ADR-074: `Stream<T>` distinct from `Iterator`; `for`/terminal error semantics
+
+**Decision**: A `Stream<T>` is a new **opaque runtime type** — `Type::Stream(Box<Type>)`, sibling to
+`Type::Iterator` (`crates/lin-check/src/types.rs`), covariant in `T`, erased to a `TAG_STREAM` box at
+runtime — and it is deliberately **NOT** modelled as an `Iterator<T>`. A stream is a lazy pull-graph
+over a byte/value source plus an optional push sink; the surface API and semantics live in §27.10. This
+ADR records the three semantic choices that make a stream a thing of its own.
+
+**Why a stream is not an iterator.** The iterator protocol (§18.2, ADR-026) is built from four
+**pure** state-transition functions — initial-state, continuation predicate, next-state, current-value
+— and §18.2.1 even promises restartability by re-running the initial-state thunk. A stream violates
+every one of those assumptions:
+- It is **effectful**: pulling the next chunk performs a `read(2)` and advances an OS file position;
+  there is no pure "current value at this state."
+- It is **fallible**: a read can fail mid-traversal (`EIO`, connection reset), which a pure
+  `(State) => T` current-value function cannot express.
+- It **owns an OS resource** (an fd) with a lifetime, so it is single-owner/affine (ADR-073), whereas
+  an iterator is a freely-copyable pure description.
+
+Forcing a stream into the iterator shape would either make the protocol functions impure (breaking
+§18.2's contract and the iterator-restartability guarantee) or hide the fd lifetime, so `Stream<T>` is a
+distinct opaque kind. It reuses `Iterator`'s *threading* through the compiler (the ~16-file checklist:
+types/compat/zonk/resolve, checker, IR lowering/monomorphize, codegen) but never its *protocol*.
+
+**RC-drop auto-close finalizer.** A `TAG_STREAM` box carries the source backend (an fd + read state, or
+an adapter node pointing at its upstream). Its **release finalizer closes the fd** when the refcount
+reaches 0 if it is not already closed — deterministic cleanup with no GC, exactly the §39 RC contract.
+An explicit `close(s)` is **idempotent** (closing an already-closed stream is a no-op) and exists for
+callers who want determinism rather than scope-end timing. This is what makes the affine *drop-is-fine*
+rule of ADR-073 sound: an un-consumed stream still closes its fd. The finalizer is in the UAF/double-free
+class and **must** be ASan-verified (fd closes exactly once).
+
+**`for` over a stream returns `Null | Error`.** A stream is consumed with `.for(fn)` dot-application —
+**not** `for…in`, which does not exist in Lin (iteration is always `.for(fn)`/combinators, §18). Driving
+a stream to completion can end two ways, so `for` over a stream is typed **`Null | Error`** (unlike `for`
+over an array/iterator, which is `Null`, §18.1):
+- **EOF ends the loop normally** → the `for`-expression evaluates to `Null`.
+- **A read `Error` mid-traversal becomes the `for`-expression's value** → the loop stops and yields the
+  `Error`.
+
+So a stream `for` reads like any other fallible op (§25.1):
+
+```txt
+val outcome = readStream("in.log").lines().for(line =>
+  print(line)
+)
+match outcome
+  is Error => print("read failed: ${outcome["message"]}")
+  else     => null
+```
+
+The exact ending is **source-kind-dependent**: a file stream that reaches EOF ends with `Null`; a socket
+stream whose peer resets ends with `Error`. `lin_for`'s lowering (`lin-ir/src/lower.rs`, `lower_for`)
+gains a stream branch that drives the pull-graph and produces the `Null | Error` result.
+
+**In-band error threading through the lazy graph.** The pipeline is a lazy pull-graph; rather than make
+every adapter re-check `is Error`, a **poisoned upstream makes every downstream adapter a passthrough**.
+The first read error propagates *as data* straight to the terminal op, which surfaces it as the
+`Null | Error` (`for`/`drain`) or `Promise<Null | Error>` (`promise`) result. This keeps the chain
+fluent — `readStream(p).lines().map(f).filter(g).writeStream(q).drain()` has no error handling at each
+step, only at the terminal — and it short-circuits: once poisoned, no further reads or user callbacks
+run. It is the stream analog of the §20 value-based error convention: errors are ordinary values flowing
+through the graph, not exceptions.
+
+**Rationale**: Keeping `Stream` distinct from `Iterator` preserves the iterator's purity/restartability
+contract (which the optimizer and the §18 combinators rely on) while giving effectful, fallible,
+fd-owning sources an honest type. The RC-drop finalizer reuses the existing deterministic-RC cleanup
+(ADR-039) instead of inventing a lifetime story. Typing `for` as `Null | Error` makes a stream loop obey
+the same `T | Error`-handling discipline as every other fallible stdlib op (§25.1, ADR-046), and
+in-band threading keeps the fluent API the brief requires without an `is Error` at every adapter.
+
+**Consequence**: `Stream<T>` adds one opaque runtime kind (`TAG_STREAM=19`), one finalizer, and a
+stream branch in `lower_for`; it does not touch the iterator path. A stream `for`/terminal that ignores
+its `Null | Error` result trips the same union-vs-bare-target check as `await` (ADR-070) when assigned
+to a bare type. Distinct from `Shared<T>` (ADR-044, shared mutable, atomic-RC, copy-in/out) and
+`Frozen<T>` (ADR-045, immortal read-only): a stream is single-owner, moved not shared (ADR-073). Full
+surface spec in §27.10; stdlib API in `std/stream` (STDLIB.md).
