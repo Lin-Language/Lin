@@ -80,7 +80,7 @@ pub struct Codegen<'ctx> {
     /// True if the whole program may spawn an async boundary (it references any of the
     /// concurrency intrinsics). When set, user-emitted Lin functions are NOT marked
     /// `nounwind`: a runtime fault inside an async thunk unwinds through Lin frames to the
-    /// thread boundary's `catch_unwind` (spec §32.2.2), so `nounwind` would be unsound on
+    /// thread boundary's `catch_unwind` (spec §24.2.2), so `nounwind` would be unsound on
     /// any function reachable from a thunk — and any function can be (ADR-042, doc §2.4.3
     /// option a). Conservatively program-wide; the non-async hot path keeps `nounwind`.
     uses_async: bool,
@@ -145,7 +145,7 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// Mark `f` `nounwind` UNLESS the program uses async. When async is in play a runtime
-    /// fault inside a thunk unwinds through Lin frames to the thread boundary (spec §32.2.2),
+    /// fault inside a thunk unwinds through Lin frames to the thread boundary (spec §24.2.2),
     /// so `nounwind` would be unsound on any reachable function — and we can't cheaply prove a
     /// given function is unreachable from a thunk, so we conservatively drop it program-wide.
     /// The common non-async program keeps the attribute (and its optimisation value).

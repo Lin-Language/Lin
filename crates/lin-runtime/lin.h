@@ -2,7 +2,7 @@
  * lin.h — Public C/C++ header for interoperability with the Lin runtime.
  *
  * Include this header in C or C++ libraries that are called from Lin via
- * `import foreign` (spec §34). It defines the data structures that the Lin
+ * `import foreign` (spec §26). It defines the data structures that the Lin
  * compiler uses to pass and return non-primitive values across the FFI boundary.
  *
  * For numeric types (Int8–Int64, UInt8–UInt64, Float32, Float64) and Boolean,

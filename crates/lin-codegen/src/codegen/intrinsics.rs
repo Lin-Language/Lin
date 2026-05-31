@@ -266,7 +266,7 @@ impl<'ctx> Codegen<'ctx> {
                 //
                 // The `pool.async(f)` dot form desugars to `lin_async(pool, f)` (2 args): the
                 // first arg is the ThreadPool. We route that to lin_pool_async_one (enqueue) so
-                // the thunk runs on a pool worker instead of a fresh thread (spec §32.5).
+                // the thunk runs on a pool worker instead of a fresh thread (spec §24.5).
                 let thunk = args.last().copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let thunk_ty = arg_tys.last().cloned().unwrap_or(Type::Null);
                 let thunk = if Self::is_union_type(&thunk_ty) && thunk.is_pointer_value() {
@@ -381,7 +381,7 @@ impl<'ctx> Codegen<'ctx> {
             // worker(handler, onClose) → lin_worker_new(h_fn, h_env, h_has, c_fn, c_env, c_has).
             // Both handler and onClose arrive as (possibly boxed) closure values; extract each
             // closure's (fn_ptr, env_ptr, has_env). The worker thread keeps the handler env
-            // (thread-confined, §32.6.4) for its lifetime.
+            // (thread-confined, §24.6.4) for its lifetime.
             Intrinsic::Worker => {
                 let i8_ty = self.context.i8_type();
                 let handler = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());

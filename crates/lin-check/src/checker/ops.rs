@@ -9,7 +9,7 @@ use crate::widen::widen_numeric;
 
 impl Checker {
     /// If `cand` is a bare integer literal and `other` has a concrete integer type T, re-type
-    /// `cand` to T (spec §26). Errors if the literal value doesn't fit T's range. `op_span` is
+    /// `cand` to T (spec §21). Errors if the literal value doesn't fit T's range. `op_span` is
     /// used for the error location. No-op when `cand` isn't an `IntLit` or `other` isn't a
     /// concrete integer type.
     pub(crate) fn retype_literal_operand(
@@ -50,7 +50,7 @@ impl Checker {
         let typed_right = self.infer_expr(right)?;
         self.in_tail_position = prev_tail;
 
-        // Spec §26: a suffixless integer literal takes its context type. When one operand of
+        // Spec §21: a suffixless integer literal takes its context type. When one operand of
         // an arithmetic/bitwise op is a bare integer literal (typed Int32 by default) and the
         // OTHER operand has a concrete integer type T, re-type the literal at width T so both
         // sides share a width. This avoids a width mismatch between the checker's result type
@@ -102,7 +102,7 @@ impl Checker {
                 Type::Bool
             }
             BinOp::And | BinOp::Or => Type::Bool,
-            // Bitwise and/or/xor (§35.2): both operands must be integer; result is the
+            // Bitwise and/or/xor (§27.2): both operands must be integer; result is the
             // widened integer type. A float operand is a compile-time error.
             BinOp::BAnd | BinOp::BOr | BinOp::BXor => {
                 let left_is_any = matches!(left_ty, Type::TypeVar(_));
@@ -137,7 +137,7 @@ impl Checker {
                     ));
                 }
             }
-            // Shifts (§35.2): left operand integer, right operand any integer; result is
+            // Shifts (§27.2): left operand integer, right operand any integer; result is
             // the type of the left operand.
             BinOp::Shl | BinOp::Shr => {
                 let left_is_any = matches!(left_ty, Type::TypeVar(_));
@@ -182,7 +182,7 @@ impl Checker {
         })
     }
 
-    // Unary `~` (bitwise not, §35.2): operand must be integer; result is the operand's type.
+    // Unary `~` (bitwise not, §27.2): operand must be integer; result is the operand's type.
     pub(crate) fn infer_unary_op(
         &mut self,
         op: UnaryOp,

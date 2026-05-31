@@ -107,7 +107,7 @@ pub enum Intrinsic {
     Retry,
     ThreadPool,
     Worker,
-    /// HTTP server (`serve`, spec §33.5). `serve(handler, port)` → `lin_serve(h_fn, h_env,
+    /// HTTP server (`serve`, spec §25.5). `serve(handler, port)` → `lin_serve(h_fn, h_env,
     /// h_has, port)`. Blocks forever; the handler is invoked once per request.
     Serve,
     // Shared<T> — opt-in shared mutable state (ADR-043 §2.3.1). shared(v) boxes a private copy;

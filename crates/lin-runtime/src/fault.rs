@@ -1,8 +1,8 @@
-//! Fault isolation at the async thread boundary (spec §32.2.2).
+//! Fault isolation at the async thread boundary (spec §24.2.2).
 //!
 //! Every runtime fault (array OOB, division by zero, non-exhaustive match, explicit
 //! `lin_panic`, null-spread) historically called `std::process::exit(1)` — uncatchable,
-//! which is correct for the top-level program (spec §19.1) but wrong inside an `async`
+//! which is correct for the top-level program (spec §20.1) but wrong inside an `async`
 //! thunk, where the fault must be *caught at the thread boundary* and surfaced as an
 //! `Error` value at `await`.
 //!
@@ -39,7 +39,7 @@ pub struct FaultPanic {
 
 /// Raise a runtime fault. Inside an async boundary this `panic!`s (caught at the boundary
 /// and turned into an `Error`); otherwise it prints to stderr and exits the process — the
-/// historical, uncatchable top-level behaviour (spec §19.1).
+/// historical, uncatchable top-level behaviour (spec §20.1).
 ///
 /// `-> !` is a lie inside a boundary (we unwind rather than diverge to exit), but every
 /// caller treats it as diverging, which a panic also does, so it is sound.
