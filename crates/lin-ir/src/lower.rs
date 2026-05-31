@@ -1459,6 +1459,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                     dst,
                     func: fid,
                     captures: vec![],
+                    capture_kinds: vec![],
                     ret_ty: closure_ty.clone(),
                 });
                 builder.register_owned(dst, closure_ty);
@@ -3878,14 +3879,54 @@ fn lower_function_expr_with_id(
     ctx.pending_functions.push(inner_fn);
 
     // In the outer function, emit a MakeClosure instruction.
-    let capture_temps: Vec<Temp> = captures
-        .iter()
-        .map(|cap| {
-            builder.slots.get(&cap.outer_slot).copied().unwrap_or_else(|| {
-                builder.alloc_temp(cap.ty.clone())
-            })
-        })
-        .collect();
+    //
+    // OWNING-CAPTURE MODEL (mirrors the array/object container rule): the closure env owns one
+    // reference per heap/union capture, so the closure may safely OUTLIVE the scope that
+    // produced the captured value (e.g. a closure returned from a `map` callback into the result
+    // array). For each captured value temp:
+    //   - a mutably-captured `var` stores the CELL POINTER (shared by reference, ADR-015); the
+    //     cell has its own MakeCell/FreeCell/escaping-cell lifecycle, so it stays borrow-only —
+    //     do NOT retain it here, and do NOT release it on closure free.
+    //   - a concrete-rc value (Str/Array/Object/Function) is retained in place (`Retain`), so the
+    //     env holds an independent +1; `lin_closure_release` drops it via the capture descriptor.
+    //   - a union/Json value is CLONED (`CloneBox` → `lin_tagged_clone`) so the env owns its OWN
+    //     `TaggedVal*` box (never an alias of a borrowed caller box, whose free would double-free
+    //     the shared box); `lin_closure_release` frees that owned box.
+    // Scalars need no ownership. This is the established store-side discipline (see `own_for_store`
+    // / `transfer_into_container`), applied to the closure env.
+    let mut capture_temps: Vec<Temp> = Vec::with_capacity(captures.len());
+    let mut capture_kinds: Vec<CaptureRelease> = Vec::with_capacity(captures.len());
+    for cap in captures {
+        let base = builder.slots.get(&cap.outer_slot).copied().unwrap_or_else(|| {
+            builder.alloc_temp(cap.ty.clone())
+        });
+        // Mutable-cell captures (the var-by-reference cell pointer) stay borrow-only — the cell
+        // has its own MakeCell/FreeCell/escaping-cell lifecycle, so the env must NOT own it.
+        if cap.is_mutable || !needs_owning(&cap.ty) {
+            capture_temps.push(base);
+            capture_kinds.push(CaptureRelease::None);
+            continue;
+        }
+        if is_union_ty(&cap.ty) {
+            // Env owns its own boxed TaggedVal*.
+            let owned = builder.alloc_temp(cap.ty.clone());
+            builder.emit(Instruction::CloneBox { dst: owned, src: base, ty: cap.ty.clone() });
+            capture_temps.push(owned);
+            capture_kinds.push(CaptureRelease::Tagged);
+        } else {
+            // Concrete rc: take an independent reference; the env holds the same pointer +1.
+            builder.emit(Instruction::Retain { val: base, ty: cap.ty.clone() });
+            capture_temps.push(base);
+            capture_kinds.push(match &cap.ty {
+                Type::Str => CaptureRelease::Str,
+                Type::Array(_) | Type::FixedArray(_) => CaptureRelease::Array,
+                Type::Object(_) => CaptureRelease::Object,
+                Type::Function { .. } => CaptureRelease::Closure,
+                // is_rc_type covers exactly the above; any other owning type is union (handled).
+                _ => CaptureRelease::None,
+            });
+        }
+    }
 
     // Captured-cell escape analysis. A mutably-captured `var` is a heap cell whose pointer is
     // shared into THIS closure's env. The cell is SAFE to free at the creating function's scope
@@ -3914,6 +3955,7 @@ fn lower_function_expr_with_id(
         dst,
         func: fid,
         captures: capture_temps,
+        capture_kinds,
         ret_ty: closure_ty.clone(),
     });
     builder.register_owned(dst, closure_ty);

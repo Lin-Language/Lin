@@ -1834,6 +1834,43 @@ print(toString(add5(10)))
 }
 
 #[test]
+fn test_map_returns_capturing_closures() {
+    // Regression (ADR-051 owning captures): a `map` callback that RETURNS a closure capturing
+    // the callback parameter. The returned thunks ESCAPE into the result array; each must own
+    // its captured value (the element box), not borrow a per-iteration box that is freed and
+    // reused. Before the owning-capture fix, calling a thunk returned garbage (`[[object]…]`)
+    // because the captured value pointed at freed-then-reused memory.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map } from "std/array"
+
+val thunks = map([5, 6, 7], i => () => i)
+print(toString(thunks[0]()))
+print(toString(thunks[1]()))
+print(toString(thunks[2]()))
+"#);
+    assert_eq!(output, vec!["5", "6", "7"]);
+}
+
+#[test]
+fn test_closure_captures_string_escapes() {
+    // A capturing closure over a String that ESCAPES its creating scope: `makeGreeter` returns a
+    // thunk capturing the `name` parameter, and the returned thunk outlives `makeGreeter`'s
+    // frame. The env must OWN the captured string (retain on capture / release on free) so it
+    // stays alive after the call returns.
+    let output = run(r#"import { print } from "std/io"
+
+val makeGreeter = (name: String) => () => "hi ${name}"
+val g0 = makeGreeter("alice")
+val g1 = makeGreeter("bob")
+print(g0())
+print(g1())
+print(g0())
+"#);
+    assert_eq!(output, vec!["hi alice", "hi bob", "hi alice"]);
+}
+
+#[test]
 fn test_named_fn_as_opaque_function_value() {
     // Regression: passing a TOP-LEVEL NAMED function where an opaque `Function` value is
     // expected used to produce GARBAGE. The capture-less closure wrapper (`__cls_wrapb_*`)

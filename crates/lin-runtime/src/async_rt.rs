@@ -42,6 +42,7 @@ pub struct LinPromise {
 struct PoolTask {
     fn_addr: usize,
     env_addr: usize,
+    desc_addr: usize,
     env_size: u64,
     result: Arc<(Mutex<PromiseState>, Condvar)>,
 }
@@ -193,13 +194,13 @@ pub unsafe extern "C" fn lin_async_spawn(thunk: *mut u8) -> *mut LinPromise {
     if thunk.is_null() {
         return lin_make_promise(std::ptr::null_mut());
     }
-    // Closure layout: offset 8 = fn_ptr, offset 16 = env_ptr.
+    // Closure layout: offset 8 = fn_ptr, offset 16 = env_ptr, offset 40 = capture descriptor.
     let fn_ptr = *(thunk.add(8) as *const *mut u8);
     let env_ptr = *(thunk.add(16) as *const *mut u8);
+    let cap_desc = *(thunk.add(40) as *const *const u8);
 
-    if !crate::transfer::env_is_transferable(env_ptr) {
-        // Run inline (sound fallback). No fault boundary needed for parity with the previous
-        // inline behaviour — actually we DO want fault isolation even inline, so wrap it.
+    if !crate::transfer::env_is_transferable(env_ptr, cap_desc) {
+        // Run inline (sound fallback). We still want fault isolation even inline, so wrap it.
         let outcome = crate::fault::with_async_boundary(|| {
             let call: unsafe extern "C-unwind" fn(*mut u8) -> *mut u8 = std::mem::transmute(fn_ptr);
             call(env_ptr)
@@ -211,13 +212,12 @@ pub unsafe extern "C" fn lin_async_spawn(thunk: *mut u8) -> *mut LinPromise {
     }
 
     // Deep-copy the env so the worker owns a private graph (null env → null, no copy needed).
-    let env_copy = crate::transfer::transfer_clone_env(env_ptr);
+    let env_copy = crate::transfer::transfer_clone_env(env_ptr, cap_desc);
     // env_size for releasing the copy on the worker: 8 + count*8, recovered from the descriptor.
     let env_size: u64 = if env_copy.is_null() {
         0
     } else {
-        let desc = *(env_copy as *const *const u8);
-        let count = *(desc as *const u32) as u64;
+        let count = *(cap_desc as *const u32) as u64;
         8 + count * 8
     };
 
@@ -228,6 +228,7 @@ pub unsafe extern "C" fn lin_async_spawn(thunk: *mut u8) -> *mut LinPromise {
     // upheld manually (ADR-042 Option C).
     let fn_addr = fn_ptr as usize;
     let env_addr = env_copy as usize;
+    let desc_addr = cap_desc as usize;
 
     let handle = std::thread::spawn(move || {
         let fn_ptr = fn_addr as *mut u8;
@@ -238,7 +239,7 @@ pub unsafe extern "C" fn lin_async_spawn(thunk: *mut u8) -> *mut LinPromise {
         });
         // Free the thread-private env copy now that the thunk has finished with it.
         if !env_ptr.is_null() && env_size > 0 {
-            crate::transfer::release_env_copy(env_ptr, env_size);
+            crate::transfer::release_env_copy(env_ptr, desc_addr as *const u8, env_size);
         }
         let (lock, cvar) = &*inner_for_thread;
         let mut state = lock.lock().unwrap();
@@ -501,7 +502,7 @@ unsafe fn pool_worker_loop(queue: Arc<PoolQueue>) {
             call(env_ptr)
         });
         if !env_ptr.is_null() && task.env_size > 0 {
-            crate::transfer::release_env_copy(env_ptr, task.env_size);
+            crate::transfer::release_env_copy(env_ptr, task.desc_addr as *const u8, task.env_size);
         }
         let (lock, cvar) = &*task.result;
         let mut st = lock.lock().unwrap();
@@ -543,8 +544,9 @@ pub unsafe extern "C" fn lin_pool_async_one(pool: *mut LinThreadPool, thunk: *mu
     }
     let fn_ptr = *(thunk.add(8) as *const *mut u8);
     let env_ptr = *(thunk.add(16) as *const *mut u8);
+    let cap_desc = *(thunk.add(40) as *const *const u8);
 
-    if !crate::transfer::env_is_transferable(env_ptr) {
+    if !crate::transfer::env_is_transferable(env_ptr, cap_desc) {
         let outcome = crate::fault::with_async_boundary(|| {
             let call: unsafe extern "C-unwind" fn(*mut u8) -> *mut u8 = std::mem::transmute(fn_ptr);
             call(env_ptr)
@@ -555,18 +557,18 @@ pub unsafe extern "C" fn lin_pool_async_one(pool: *mut LinThreadPool, thunk: *mu
         };
     }
 
-    let env_copy = crate::transfer::transfer_clone_env(env_ptr);
+    let env_copy = crate::transfer::transfer_clone_env(env_ptr, cap_desc);
     let env_size: u64 = if env_copy.is_null() {
         0
     } else {
-        let desc = *(env_copy as *const *const u8);
-        8 + (*(desc as *const u32) as u64) * 8
+        8 + (*(cap_desc as *const u32) as u64) * 8
     };
 
     let result = Arc::new((Mutex::new(PromiseState::Pending), Condvar::new()));
     let task = PoolTask {
         fn_addr: fn_ptr as usize,
         env_addr: env_copy as usize,
+        desc_addr: cap_desc as usize,
         env_size,
         result: Arc::clone(&result),
     };

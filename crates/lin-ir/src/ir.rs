@@ -129,6 +129,38 @@ pub enum Intrinsic {
     },
 }
 
+/// How a closure env releases one captured slot when the closure is freed (ADR-051: owning
+/// captures). The env owns one reference per owning capture; `lin_closure_release` walks the
+/// emitted capture descriptor and applies the matching release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureRelease {
+    /// Borrow-only: scalar, or a mutably-captured `var` cell pointer (the cell has its own
+    /// MakeCell/FreeCell lifecycle). Nothing to release.
+    None,
+    /// Concrete refcounted heap pointer: String/Array/Object → `lin_*_release`.
+    Str,
+    Array,
+    Object,
+    /// Captured closure value (Function) → `lin_closure_release`.
+    Closure,
+    /// Boxed `TaggedVal*` (union/Json) → `lin_tagged_release` (drops inner payload + frees box).
+    Tagged,
+}
+
+impl CaptureRelease {
+    /// The on-disk byte code stored in the capture descriptor for `lin_closure_release`.
+    pub fn code(self) -> u8 {
+        match self {
+            CaptureRelease::None => 0,
+            CaptureRelease::Str => 1,
+            CaptureRelease::Array => 2,
+            CaptureRelease::Object => 3,
+            CaptureRelease::Closure => 4,
+            CaptureRelease::Tagged => 5,
+        }
+    }
+}
+
 /// Element kinds for unboxed (flat) scalar arrays.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FlatElemKind {
@@ -218,7 +250,12 @@ pub enum Instruction {
     /// result = intrinsic(args...)
     CallIntrinsic { dst: Temp, intrinsic: Intrinsic, args: Vec<Temp>, ret_ty: Type },
     /// result = closure(func_id, env_temps[...])  — allocates closure struct
-    MakeClosure { dst: Temp, func: FuncId, captures: Vec<Temp>, ret_ty: Type },
+    /// result = closure(func_id, env_temps[...]) — allocates the closure struct + env.
+    /// `capture_kinds[i]` is the release kind of `captures[i]` (see `CaptureRelease`): the env
+    /// OWNS one reference per owning capture, so `lin_closure_release` drops it on free. The
+    /// lowerer fills these (it knows `is_mutable` + the capture type); cell-pointer captures are
+    /// `CaptureRelease::None` (borrow-only — the cell has its own lifecycle).
+    MakeClosure { dst: Temp, func: FuncId, captures: Vec<Temp>, capture_kinds: Vec<CaptureRelease>, ret_ty: Type },
     /// result = { fields... }  — allocates object on heap
     MakeObject { dst: Temp, fields: Vec<(String, Temp)>, spreads: Vec<Temp>, ty: Type },
     /// result = [ elements... ]  — allocates array on heap

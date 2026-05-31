@@ -1,0 +1,29 @@
+// Benchmark: capturing closures — the path affected by the owning-capture RC model.
+//
+// Non-capturing callbacks (x => x*2) carry no env and are unchanged by the capture
+// retain/release work. This benchmark deliberately CAPTURES enclosing heap/scalar values in
+// its callbacks so each closure allocates an env and (under the owning model) retains its
+// captures on creation + releases on free. The combinator usage is synchronous and
+// non-escaping, so RC elision should drive the added traffic to ~zero — this benchmark is the
+// guard that it does.
+import { print } from "std/io"
+import { toString } from "std/string"
+import { range, map, filter, reduce } from "std/array"
+
+val n = 2000000
+
+// `base`, `lo`, `hi`, `seed` are captured by the callbacks below (closures over outer vals).
+val base = 7
+val lo = 100
+val hi = 1700000
+val seed = 3
+
+// map/filter/reduce where EVERY callback captures an outer value → each is a capturing
+// closure with a one-slot env, created once and consumed synchronously by the combinator.
+val total = range(0, n)
+  .map(x => x * base)
+  .filter(x => x > lo)
+  .filter(x => x < hi)
+  .reduce(seed, (acc, x) => acc + x)
+
+print(toString(total))
