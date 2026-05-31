@@ -1,15 +1,23 @@
-// processes — spawn a subprocess, read its stdout into a byte buffer, and wait for
-// its exit code. Exercises std/proc (spawn/readStdout/wait) and flat UInt8[] buffers.
+// processes — run subprocesses two ways with std/process:
+//   * exec: batch — run to completion, collect status + full stdout
+//   * spawn/readStdout/wait: streaming — read piped stdout into a byte buffer
+// Also exercises flat UInt8[] buffers.
 //
 // Run:   lin run examples/processes/main.lin
 // Test:  lin test examples/processes/   (the recoverable parts; exit-code/byte
 //        assertions over a real subprocess live in the Rust integration suite)
 
-import { spawn, readStdout, wait } from "std/proc"
+import { exec, spawn, readStdout, wait } from "std/process"
 import { print } from "std/io"
 import { toString } from "std/string"
 
-val h = spawn(["sh", "-c", "printf 'Hi'"])
+// Batch: run `printf 'Hello'` and collect its whole output.
+val result = exec("printf", ["Hello"])
+print("exec status: ${toString(result["status"])}")
+print("exec stdout: ${result["stdout"]}")
+
+// Streaming: spawn `sh -c "printf 'Hi'"`, read its stdout bytes incrementally.
+val h = spawn("sh", ["-c", "printf 'Hi'"])
 val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
 val n = readStdout(h, buf)
 print("bytes read: ${toString(n)}")

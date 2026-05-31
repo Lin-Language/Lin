@@ -632,7 +632,7 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 
 ### Layer 3 — Subprocess and raw terminal
 
-- [x] **Subprocess intrinsics** — `lin_proc_spawn(String[])`, `lin_proc_read_stdout`, `lin_proc_kill`, `lin_proc_wait`; opaque `Int64` handle. **`std/proc`**: `spawn`, `readStdout`, `kill`, `wait`.
+- [x] **Subprocess intrinsics** — `lin_process_{exec,shell,cwd,chdir,spawn,read_stdout,kill,wait}`; opaque `Int64` handle. **`std/process`** (unified batch + streaming): `exec`, `shell`, `cwd`, `chdir`, `spawn`, `readStdout`, `kill`, `wait`. (Consolidated the former low-level `std/proc` into `std/process`; `spawn` is now `(command, args)`.)
 - [x] **Raw-TTY intrinsics** — `lin_tty_raw_mode(Boolean)`, `lin_tty_read_key()` (non-blocking). **`std/tty`**: `rawMode`, `readKey` (`Int32 | Null`).
 
 ### Layer 4 — Timing, signals; FFI and Worker for the rest
@@ -645,7 +645,7 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 ### Spec / docs amendments
 
 - [x] Spec §35 (this section), §24.1/§24.2 (bitwise operators + precedence), §3.7 (`~` is the one unary).
-- [ ] `docs/STDLIB.md` — full signatures for `std/bytes`, `std/net`, `std/proc`, `std/tty`, `std/signal`, and the `std/time.sleepMicros` addition.
+- [ ] `docs/STDLIB.md` — full signatures for `std/bytes`, `std/net`, `std/process`, `std/tty`, `std/signal`, and the `std/time.sleepMicros` addition.
 - [ ] `docs/DECISIONS.md` — ADRs for (a) fd-as-opaque-Int handle convention, (b) share-nothing upheld over a Mutex primitive, (c) flat unboxed small-int arrays, (d) `~` as the single sanctioned unary operator.
 
 ### Tests
@@ -655,7 +655,7 @@ Sequenced in layers. Layer 1 (bytes + bitwise) is the keystone — everything el
 - [ ] `std/bytes` round-trips: `u32ToBe`/`u32FromBe`, `f32ToBits`/`f32FromBits`, the 8-byte two-f32 control packet.
 - [x] `std/net`: UDP loopback send/recv; non-blocking recv returns `Null` when no data.
 - [x] `std/net`: TCP loopback — listener accepts a connection, echoes bytes back to a connected client; `recv` returns `0` after the peer closes.
-- [x] `std/proc`: spawn a process, read its stdout to EOF, exit code via `wait`.
+- [x] `std/process`: spawn a process, read its stdout to EOF, exit code via `wait`; batch `exec`/`shell` collect status + full output; `cwd`.
 - [ ] `examples/`: a NAL-parser / RTP-packetizer fixture (the protocol core, no OS), plus a UDP echo fixture.
 
 ---

@@ -1,5 +1,5 @@
 import { expect, toBe, toSatisfy, test, suite, run } from "std/test"
-import { spawn, readStdout, wait } from "std/proc"
+import { spawn, readStdout, wait } from "std/process"
 import { length } from "std/array"
 
 // Drive a real subprocess and assert on the recoverable, deterministic parts: the
@@ -7,7 +7,7 @@ import { length } from "std/array"
 // lower-level spawn/exit-code assertions; this is the Lin-level smoke coverage.)
 val s = suite("processes", [
   test("reads a subprocess's stdout bytes", () =>
-    val h = spawn(["sh", "-c", "printf 'Hi'"])
+    val h = spawn("sh", ["-c", "printf 'Hi'"])
     val buf: UInt8[] = [0, 0, 0, 0]
     val n = readStdout(h, buf)
     val code = wait(h)
@@ -19,7 +19,7 @@ val s = suite("processes", [
     ]
   ),
   test("propagates a non-zero exit code", () =>
-    val h = spawn(["sh", "-c", "exit 3"])
+    val h = spawn("sh", ["-c", "exit 3"])
     val code = wait(h)
     [
       expect(code).toBe(3)

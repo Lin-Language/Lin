@@ -1,6 +1,13 @@
 # Lin
 
-A small, expression-based programming language built around JSON data, structural typing, pattern matching, and functional-style pipelines.
+Lin is a compiled, functional programming language with modern ergonomics, including:
+
+- JSON as the native data model
+- Dot application & partial application
+- Pattern matching with structural `is`/`has`
+- Native threads with no function colouring — share-nothing concurrency
+- A robust structural type system — union types, generics, and exhaustiveness checking
+- Errors as values, safe-by-default access
 
 ```lin
 import { print } from "std/io"
@@ -18,13 +25,6 @@ players
   .map(p => "${p["name"]}: ${toString(p["score"])}")
   .for(line => print(line))
 ```
-
-- Everything is an expression
-- Runtime values are strict JSON (null, bool, number, string, array, object) plus functions and iterators
-- Indentation defines blocks — no braces or semicolons needed
-- Structural typing with union types and pattern matching
-- Errors are ordinary values
-- Dot syntax for chaining: `x.f(y)` calls `f(x, y)`
 
 ---
 

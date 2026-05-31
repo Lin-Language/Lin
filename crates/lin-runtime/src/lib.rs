@@ -19,7 +19,7 @@ pub mod number;
 pub mod object;
 pub mod path;
 pub mod shared;
-pub mod proc;
+pub mod process;
 pub mod server;
 pub mod signal;
 pub mod string;
