@@ -1269,3 +1269,25 @@ helpers and the union-narrowing example rewrite keep every heterogeneous/union c
 the import-path monomorphization + native-return re-coercion are general fixes for cross-module
 generic calls. Capturing lambdas and stored-fn callbacks keep the (correct, boxed) closure path —
 inlining the unboxed-closure ABI for those remains future work (judged too high-risk to attempt here).
+
+**R2 bug fix — `filter` over an object/heap array double-freed kept elements (the parked segfault).**
+The original ADR-069 commit (e9274f5) made `filter` produce a result array of the SOURCE's concrete
+element type. For a CONCRETE-rc element (an object/array/string — e.g. `std/test`'s `Assertion[]`, or
+any `Object[]`), `filter`'s keep path pushes the element it READ from the source array straight into
+the result array via the `Push` intrinsic. For a concrete tagged element that intrinsic lowers to
+`lin_array_push_tagged`, which raw-copies the 16-byte `TaggedVal` WITHOUT bumping the inner refcount
+(MOVE semantics — correct only for a freshly-owned value). But filter's element is BORROWED: it is
+still owned by the source array. So the source and the filtered array both referenced the same object
+at refcount 1, and releasing both at scope/teardown double-freed it → heap-use-after-free
+(`lin_object_release`), surfacing as the `examples/*/*.test.lin` (codec/report/…) segfault via
+`std/test`'s `results.filter(a => a["type"]=="fail")`. (On the pre-payoff base `filter` returned a
+`Json` array, whose elements push via the RETAINING `lin_push_dyn`, so the bug did not exist there.)
+Fix: `push_output` now takes a `borrowed` flag. `filter` (which pushes the borrowed source element)
+passes `borrowed: true`; on a tagged concrete-rc push it emits a `Retain` first so the result array
+owns its own reference. `map` (which pushes the lambda's freshly-owned result) passes `borrowed:
+false` and keeps the MOVE. Union elements (retaining `lin_push_dyn`) and flat scalars (no refcount)
+need nothing, so the flat-scalar pipeline win is untouched — the fix is purely the missing retain on
+the borrowed-concrete-element tagged push, and the full object-array inline win is RETAINED (no path
+disabled). Verified: stdlib+examples 59/59; integration 357/0; ASan-clean across every example-project
+test (codec/report/result/matrix/config/processes/dijkstra/web-server) + a `filter`-over-`Object[]`
+fixture that double-freed before; array_pipeline still `1892804906` with zero box/unbox in the loops.

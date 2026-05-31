@@ -64,6 +64,25 @@ val s = suite("std/array", [
     ]
   ),
 
+  // Regression (ADR-069 R2): filtering an array of OBJECTS pushes each kept element (BORROWED from
+  // the source) into the result; the result array must take its own reference, else releasing both
+  // the source and the filtered array at teardown double-frees the shared objects (heap UAF).
+  test("filter over object array does not double-free kept elements", () =>
+    val items = [
+      { "type": "a", "v": 1 },
+      { "type": "b", "v": 2 },
+      { "type": "a", "v": 3 }
+    ]
+    val kept = items.filter(i => i["type"] == "a")
+    [
+      expect(length(kept)).toBe(2),
+      expect(kept[0]["v"]).toBe(1),
+      expect(kept[1]["v"]).toBe(3),
+      // the source must remain intact and independently usable after the filter
+      expect(length(items)).toBe(3)
+    ]
+  ),
+
   test("reduce sums values", () =>
     val result = [1, 2, 3, 4].reduce(0, (acc, x) => acc + x)
     [

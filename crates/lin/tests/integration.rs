@@ -7245,3 +7245,31 @@ print(toString(total))
 "#);
     assert_eq!(out, vec!["20"]);
 }
+
+#[test]
+fn test_filter_object_array_no_double_free() {
+    // ADR-069 R2 regression: `filter` over an array of OBJECTS pushes each kept element (BORROWED
+    // from the source array) into the result array. The tagged push (`lin_array_push_tagged`) MOVES
+    // the TaggedVal without bumping the inner refcount, so the kept element must be RETAINED first —
+    // otherwise both the source and the filtered array reference the same object at refcount 1 and
+    // releasing both double-frees it (heap-use-after-free at teardown — caught by ASan, manifested
+    // as the `examples/codec/bits.test.lin` etc. segfault). The source must also stay intact and
+    // usable after the filter. Exercised both as a freshly-built source and re-read afterwards.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { filter, length } from "std/array"
+type Item = { "type": String, "v": Int32 }
+val items: Item[] = [
+  { "type": "a", "v": 1 },
+  { "type": "b", "v": 2 },
+  { "type": "a", "v": 3 }
+]
+val kept = items.filter(i => i["type"] == "a")
+print(toString(length(kept)))
+print(toString(kept[0]["v"]))
+print(toString(kept[1]["v"]))
+print(toString(length(items)))
+print(toString(items[1]["type"]))
+"#);
+    assert_eq!(out, vec!["2", "1", "3", "3", "b"]);
+}
