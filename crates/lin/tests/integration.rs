@@ -4803,6 +4803,39 @@ print("done")
 }
 
 #[test]
+fn test_time_format_parse_from_iso() {
+    // format (strftime, UTC), fromIso (ISO 8601 -> ms), parse (pattern -> ms), and graceful
+    // Error on bad input. Expected timestamps bound as Int64 vals (a bare >Int32 literal in a
+    // comparison would default to Int32 and truncate).
+    let out = run(r#"import { format, fromIso, parse } from "std/time"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+print(format(1705314600000, "%Y-%m-%dT%H:%M:%S"))
+print(format(1705314600000, "%a %B %d"))
+print(toString(fromIso("2024-01-15T10:30:00Z")))
+print(toString(fromIso("2024-01-15")))
+print(toString(parse("15/01/2024 10:30", "%d/%m/%Y %H:%M")))
+val a = fromIso("not a date")
+print(a["type"])
+val b = parse("bad", "%Y-%m-%d")
+print(b["type"])
+"#);
+    assert_eq!(
+        out,
+        vec![
+            "2024-01-15T10:30:00",
+            "Mon January 15",
+            "1705314600000",
+            "1705276800000",
+            "1705314600000",
+            "error",
+            "error",
+        ]
+    );
+}
+
+#[test]
 fn test_concrete_string_into_json_var_loop() {
     // Regression: reassigning a fresh CONCRETE value (toString -> String) into a Json/union
     // `var` inside a loop boxes the value via Coerce, producing a transient TaggedVal* shell.

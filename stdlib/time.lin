@@ -5,6 +5,9 @@ import foreign "lin-runtime"
   val lin_time_start_timer: () => Int64
   val lin_time_elapsed: (Int64) => Int64
   val lin_time_to_iso: (Int64) => String
+  val lin_time_format: (Int64, String) => String
+  val lin_time_from_iso: (String) => Json
+  val lin_time_parse: (String, String) => Json
 
 export val now = (): Int64 => lin_time_now()
 export val sleep = (ms: Int64): Null => lin_time_sleep(ms)
@@ -12,3 +15,15 @@ export val sleepMicros = (us: Int64): Null => lin_time_sleep_micros(us)
 export val startTimer = (): Int64 => lin_time_start_timer()
 export val elapsed = (timer: Int64): Int64 => lin_time_elapsed(timer)
 export val toIso = (ms: Int64): String => lin_time_to_iso(ms)
+
+// Format a Unix ms timestamp (UTC) with a strftime-style pattern (e.g. "%Y-%m-%d").
+export val format = (ms: Int64, pattern: String): String =>
+  lin_time_format(ms, pattern)
+
+// Parse an ISO 8601 date/datetime to a Unix ms timestamp, or an Error.
+export val fromIso = (s: String): Json =>
+  lin_time_from_iso(s)
+
+// Parse a date string with a strftime-style pattern to a Unix ms timestamp (UTC), or an Error.
+export val parse = (s: String, pattern: String): Json =>
+  lin_time_parse(s, pattern)

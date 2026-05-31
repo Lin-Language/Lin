@@ -3856,12 +3856,13 @@ print("took ${toString(elapsed(t))}ms")
 val format: (ts: Int64, pattern: String) -> String
 ```
 
-Formats the Unix millisecond timestamp `ts` as a string using a strftime-style `pattern`. Patterns follow the C `strftime` conventions (e.g. `%Y-%m-%d`, `%H:%M:%S`). The timestamp is interpreted in UTC.
+Formats the Unix millisecond timestamp `ts` as a string using a strftime-style `pattern`. The timestamp is interpreted in UTC. Supported specifiers: `%Y %y %m %d %e %H %I %M %S %p %j %a %A %b %B %h` and `%%` (literal `%`); an unrecognised `%x` is emitted verbatim.
 
 ```txt
 format(now(), "%Y-%m-%d")           // e.g. "2025-05-27"
 format(now(), "%H:%M:%S")           // e.g. "14:32:07"
 format(now(), "%Y-%m-%dT%H:%M:%S")  // e.g. "2025-05-27T14:32:07"
+format(now(), "%a %B %d")           // e.g. "Tue May 27"
 ```
 
 ---
@@ -3875,7 +3876,7 @@ val fromIso: (s: String) -> Int64 | Error
 Parses an ISO 8601 date/datetime string and returns the corresponding Unix millisecond timestamp. Timezone offsets are respected; bare dates (`2024-01-15`) are interpreted as UTC midnight.
 
 ```txt
-fromIso("2024-01-15T10:30:00Z")   // 1705313400000
+fromIso("2024-01-15T10:30:00Z")   // 1705314600000
 fromIso("2024-01-15")             // 1705276800000
 fromIso("not a date")             // { "type": "failure", "error": "..." }
 ```
@@ -3904,11 +3905,11 @@ print("elapsed: ${toString(now() - start)}ms")
 val parse: (s: String, pattern: String) -> Int64 | Error
 ```
 
-Parses the date/time string `s` using a strftime-style `pattern` and returns the Unix millisecond timestamp. Unspecified fields default to zero or UTC midnight.
+Parses the date/time string `s` using a strftime-style `pattern` and returns the Unix millisecond timestamp (UTC). Unspecified fields default to UTC midnight on 1970-01-01. Numeric specifiers (`%Y %y %m %d %e %H %M %S`) and literal characters are supported; textual names (`%a`/`%B`) are format-only, not parsed. Out-of-range fields and literal mismatches return an `Error`.
 
 ```txt
 parse("2024-01-15", "%Y-%m-%d")              // 1705276800000
-parse("15/01/2024 10:30", "%d/%m/%Y %H:%M")  // 1705313400000
+parse("15/01/2024 10:30", "%d/%m/%Y %H:%M")  // 1705314600000
 parse("bad", "%Y-%m-%d")                     // { "type": "failure", "error": "..." }
 ```
 
