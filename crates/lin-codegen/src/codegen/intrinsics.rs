@@ -586,9 +586,29 @@ impl<'ctx> Codegen<'ctx> {
                     let alloc_fn = self.get_or_declare_fn("lin_array_alloc_null",
                         ptr_ty.fn_type(&[i64_ty.into()], false));
                     let arr = self.builder.call(alloc_fn, &[n_i64.into()], "ir_fillgen").try_as_basic_value().unwrap_basic();
-                    let tagged = self.build_tagged_val_alloca(&fill_val, &fill_ty);
+                    // The fill must reach `lin_array_set` as a `TaggedVal*`. When `fill_ty` is a
+                    // union/Json type the value arrives ALREADY boxed as a `TaggedVal*` (e.g. the
+                    // stdlib wrapper's `fill: Json` param), so pass it through directly —
+                    // re-wrapping it via `build_tagged_val_alloca` would build a NULL-tagged box
+                    // around the box pointer (every slot would read back as `null`). Only a
+                    // concrete unboxed scalar needs a fresh stack `TaggedVal` built around it.
+                    let is_boxed_union = Self::is_union_type(&fill_ty) && fill_val.is_pointer_value();
+                    let tagged = if is_boxed_union {
+                        fill_val.into_pointer_value()
+                    } else {
+                        self.build_tagged_val_alloca(&fill_val, &fill_ty)
+                    };
                     let set_fn = self.get_or_declare_fn("lin_array_set",
                         self.context.void_type().fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
+                    // `lin_array_set` raw-copies the 16-byte TaggedVal into the slot WITHOUT
+                    // retaining the inner payload (it CONSUMES one owning reference). We store the
+                    // SAME box into all n slots, so each slot needs its own reference to the inner
+                    // heap value: retain the inner once per iteration. (A concrete scalar has no
+                    // heap payload, so no retain — `lin_tagged_retain` is a no-op there anyway, but
+                    // we only have a stack TaggedVal in that case, so guard on the boxed-union case.)
+                    // The caller's original borrowed reference is left intact for its own scope.
+                    let retain_fn = self.get_or_declare_fn("lin_tagged_retain",
+                        self.context.void_type().fn_type(&[ptr_ty.into()], false));
                     let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                     let i_alloc = self.builder.alloca(i64_ty, "ir_fi");
                     self.builder.store(i_alloc, i64_ty.const_zero());
@@ -601,6 +621,9 @@ impl<'ctx> Codegen<'ctx> {
                     let cond = self.builder.int_compare(inkwell::IntPredicate::SLT, cur, n_i64, "ir_fill_cond");
                     self.builder.conditional_branch(cond, body, exit);
                     self.builder.position_at_end(body);
+                    if is_boxed_union {
+                        self.builder.call(retain_fn, &[tagged.into()], "");
+                    }
                     self.builder.call(set_fn, &[arr.into(), cur.into(), tagged.into()], "");
                     let next = self.builder.int_add(cur, i64_ty.const_int(1, false), "ir_fi_n");
                     self.builder.store(i_alloc, next);

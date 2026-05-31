@@ -68,6 +68,7 @@ This document specifies the standard library for the Lin language. All modules a
 | --- | --- | --- |
 | [`append`](#append) | `(Json[], Json) -> Json[]` | Non-mutating single-element append |
 | [`arrayAllocate`](#arrayAllocate) | `(Int32) -> Json[]` | Allocate an array of n nulls |
+| [`arrayAllocateFilled`](#arrayAllocateFilled) | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
 | [`at`](#at-array) | `(Json[], Int32) -> Json` | Element at index; negative indices count from end |
 | [`chunk`](#chunk) | `(Json[], Int32) -> Json[][]` | Split into n-sized sub-arrays |
 | [`compact`](#compact) | `(Json[]) -> Json[]` | Remove null elements |
@@ -769,6 +770,23 @@ pre-sized buffer to fill by index with [`set`](#set-array).
 ```txt
 val buf = arrayAllocate(3)   // [null, null, null]
 set(buf, 0, "a")
+```
+
+---
+
+### arrayAllocateFilled
+
+```txt
+val arrayAllocateFilled: (n: Int32, fill: Json) -> Json[]
+```
+
+Returns a new array of length `n` with every element set to `fill`. When `fill` is a heap value (array, object, or string), the elements share the same value (each slot reads it back equal); replace a slot wholesale with [`set`](#set-array) to give it a distinct value.
+
+```txt
+arrayAllocateFilled(3, 0)        // [0, 0, 0]
+arrayAllocateFilled(2, "x")      // ["x", "x"]
+arrayAllocateFilled(3, [1, 2])   // [[1, 2], [1, 2], [1, 2]]
+arrayAllocateFilled(0, 9)        // []
 ```
 
 ---

@@ -2159,6 +2159,37 @@ combined.for(x => print(toString(x)))
 }
 
 #[test]
+fn test_array_allocate_filled() {
+    // Regression: arrayAllocateFilled used to ignore the fill value and return all-null
+    // (the generic fill path re-wrapped the already-boxed Json arg in a NULL-tagged box).
+    // It must now fill every slot with the value — scalars, strings, and heap values alike,
+    // and a heap fill must not double-free when the array drops (each slot owns a reference).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { arrayAllocateFilled, arrayAllocate, set, length } from "std/array"
+
+print(arrayAllocateFilled(3, 0).toString())
+print(arrayAllocateFilled(2, "x").toString())
+print(arrayAllocateFilled(3, [1, 2]).toString())
+print(toString(length(arrayAllocateFilled(0, 9))))
+
+val buf = arrayAllocate(3)
+set(buf, 0, "a")
+print(buf.toString())
+"#);
+    assert_eq!(
+        output,
+        vec![
+            "[0, 0, 0]",
+            "[\"x\", \"x\"]",
+            "[[1, 2], [1, 2], [1, 2]]",
+            "0",
+            "[\"a\", null, null]",
+        ]
+    );
+}
+
+#[test]
 fn test_keys_values_entries() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"

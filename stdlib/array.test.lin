@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
-import { map, filter, reduce, find, some, every, flatMap, indexOf, reverse, concat, push, length, range, rangeStep, for, partition, zip, unique, take, drop, takeWhile, dropWhile, flatten, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, iterOf } from "std/array"
+import { map, filter, reduce, find, some, every, flatMap, indexOf, reverse, concat, push, length, range, rangeStep, for, partition, zip, unique, take, drop, takeWhile, dropWhile, flatten, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, iterOf, arrayAllocate, arrayAllocateFilled, set } from "std/array"
 
 val s = suite("std/array", [
   test("length of array", () => [
@@ -710,6 +710,43 @@ val s = suite("std/array", [
     [
       expect(result["a"].toString()).toBe("[\"a\", \"a\"]"),
       expect(result["b"].toString()).toBe("[\"b\"]")
+    ]
+  ),
+
+  test("arrayAllocate produces n nulls", () =>
+    val b = arrayAllocate(3)
+    [
+      expect(length(b)).toBe(3),
+      expect(b.toString()).toBe("[null, null, null]")
+    ]
+  ),
+
+  test("arrayAllocateFilled fills with a scalar", () => [
+    expect(arrayAllocateFilled(3, 0).toString()).toBe("[0, 0, 0]"),
+    expect(arrayAllocateFilled(2, 7).toString()).toBe("[7, 7]"),
+    expect(arrayAllocateFilled(3, true).toString()).toBe("[true, true, true]"),
+    expect(arrayAllocateFilled(0, 9).toString()).toBe("[]")
+  ]),
+
+  test("arrayAllocateFilled fills with a string", () => [
+    expect(arrayAllocateFilled(2, "x").toString()).toBe("[\"x\", \"x\"]")
+  ]),
+
+  test("arrayAllocateFilled fills with a heap value (shared, but each slot reads it back)", () =>
+    val b = arrayAllocateFilled(3, [1, 2])
+    [
+      expect(b.toString()).toBe("[[1, 2], [1, 2], [1, 2]]"),
+      expect(b[0].toString()).toBe("[1, 2]"),
+      expect(b[2].toString()).toBe("[1, 2]")
+    ]
+  ),
+
+  test("arrayAllocate + set fills a pre-sized buffer by index", () =>
+    val b = arrayAllocate(3)
+    set(b, 0, "a")
+    set(b, 1, "b")
+    [
+      expect(b.toString()).toBe("[\"a\", \"b\", null]")
     ]
   ),
 ])
