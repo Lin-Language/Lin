@@ -411,11 +411,45 @@ impl<'ctx> Codegen<'ctx> {
                     };
                     return self.builder.int_compare(pred, ord, zero, "ir_tcmp_b").into();
                 }
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
-                | BinOp::BAnd | BinOp::BOr | BinOp::BXor | BinOp::Shl | BinOp::Shr => {
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
+                    // Arithmetic on a boxed union/Json operand: the concrete numeric type
+                    // (Int32/Int64/Float64/…) is only known at runtime, so unboxing to a
+                    // fixed type here would reinterpret e.g. a Float64's bits as an integer.
+                    // Dispatch on the runtime tags via lin_tagged_arith, which returns a
+                    // freshly boxed numeric result (Float64 if either operand is a float).
+                    let ptr_t = self.context.ptr_type(AddressSpace::default());
+                    let i32_ty = self.context.i32_type();
+                    let arith_fn = self.get_or_declare_fn("lin_tagged_arith",
+                        ptr_t.fn_type(&[ptr_t.into(), ptr_t.into(), i32_ty.into()], false));
+                    let rv_tagged = box_rhs(self, rv);
+                    let op_code = match op {
+                        BinOp::Add => 0, BinOp::Sub => 1, BinOp::Mul => 2,
+                        BinOp::Div => 3, _ => 4, // Mod
+                    };
+                    let boxed = self.builder.call(
+                        arith_fn,
+                        &[lv.into(), rv_tagged.into(), i32_ty.const_int(op_code, false).into()],
+                        "ir_tarith",
+                    ).try_as_basic_value().unwrap_basic();
+                    // The helper hands back a freshly boxed (union) value. If the surrounding
+                    // context wants a concrete scalar, unbox it and reclaim the box shell —
+                    // the payload is a scalar (no inner heap), so freeing the 16-byte shell is
+                    // safe and avoids leaking one box per arithmetic op.
+                    return if Self::is_union_type(result_ty) {
+                        boxed
+                    } else {
+                        let concrete = self.unbox_tagged_val_to_type(boxed, result_ty);
+                        let free_fn = self.get_or_declare_fn(
+                            "lin_tagged_free_box",
+                            self.context.void_type().fn_type(&[ptr_t.into()], false));
+                        self.builder.call(free_fn, &[boxed.into()], "");
+                        concrete
+                    };
+                }
+                BinOp::BAnd | BinOp::BOr | BinOp::BXor | BinOp::Shl | BinOp::Shr => {
                     // Bitwise/shift ops are integer-only (checker-enforced); a boxed union
                     // operand (e.g. a TypeVar reduce-lambda param) must be unboxed to the
-                    // concrete integer type before the LLVM int op, same as arithmetic.
+                    // concrete integer type before the LLVM int op.
                     let lconc = self.unbox_tagged_val_to_type(lv, &Type::Int32);
                     let rconc = if rv.is_pointer_value() { self.unbox_tagged_val_to_type(rv, &Type::Int32) } else { rv };
                     let concrete = self.compile_binary_op_values(lconc, rconc, op, &Type::Int32, &Type::Int32, &Type::Int32);
