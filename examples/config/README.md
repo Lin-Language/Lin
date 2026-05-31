@@ -29,8 +29,10 @@ on. A companion module shows the language's built-in type-directed decode
 | `loader.lin` | `load(raw)` = defaults + validate → `LoadResult`. Owns `Config`, `Success`, `Failure`, `LoadResult`. |
 | `decode.lin` | `decodePerson(j)` via `Person.fromJson`. Owns `Person`, `Address`. |
 | `main.lin` | Loads sample configs (minimal / override / missing-field / wrong-type, plus one parsed from YAML) and prints the outcome. |
-| `config.test.lin` | Defaults, validation, and end-to-end `load` success/failure. |
+| `schema.test.lin` | `applyDefaults` and `validate` unit tests. |
+| `loader.test.lin` | `load` success/failure and the joined error message. |
 | `decode.test.lin` | `fromJson` decode success and structural-mismatch errors. |
+| `integration.test.lin` | End-to-end `load` (defaults + validation) success/failure. |
 | `yaml.test.lin` | YAML config parsed via `std/yaml` loaded through `load`, and `std/jq` queries over it. |
 
 The discriminant field is typed `String` (string-literal singleton types are not
