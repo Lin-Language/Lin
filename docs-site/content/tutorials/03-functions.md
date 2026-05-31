@@ -75,6 +75,38 @@ The trailing comma is what marks the call as partial. Without it, `add(10)` is a
 complete call that's missing an argument — an error, unless the omitted parameter
 has a default value.
 
+## Optional parameters
+
+A parameter can declare a default with `= expr` after its type. Such a parameter is
+optional: a complete call may leave it out, and the default fills in.
+
+```lin
+import { print } from "std/io"
+
+val greet = (name: String, greeting: String = "Hello"): String =>
+  "${greeting}, ${name}!"
+
+print(greet("World"))         // Hello, World!
+print(greet("World", "Hi"))   // Hi, World!
+```
+
+Optional parameters must come last — once a parameter has a default, every parameter
+after it must too. A default can reference parameters declared before it, so defaults
+can chain:
+
+```lin
+val box = (w: Int32, h: Int32 = w, area: Int32 = w * h): Int32 => area
+
+box(4)        // h = 4, area = 16
+box(4, 3)     // area = 12
+box(4, 3, 99) // area = 99
+```
+
+A complete call still has to supply the required (non-defaulted) parameters; omitting
+those is an error. And remember the distinction from partial application: `greet("World")`
+*fills* the default, while `greet("World",)` — with the trailing comma — *curries*,
+returning a `(String) => String` that still expects `greeting`.
+
 ## Recursion
 
 A `val` function can reference itself by name:
