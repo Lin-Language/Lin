@@ -13,7 +13,7 @@ use lin_codegen::Codegen;
 use lin_lex::Lexer;
 use lin_parse::ast::{Module, Stmt};
 use lin_parse::Parser;
-use lin_ir::{lower_module, rc_elide};
+use lin_ir::{lower_module_with_imports, rc_elide};
 
 #[derive(Debug)]
 pub struct CompileOptions {
@@ -136,7 +136,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
                 }
             }
         }
-        let (mut ir_module, mono_diags) = lower_module(&typed_module);
+        let (mut ir_module, mono_diags) = lower_module_with_imports(&typed_module, &imported_modules);
         // Monomorphization diagnostics: errors (e.g. an uninferrable type parameter) abort the
         // build; warnings (e.g. specialization-budget overflow → boxed fallback) are rendered but
         // do not stop compilation, since the fallback still produces a correct program.
