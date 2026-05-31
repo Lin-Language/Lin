@@ -1,6 +1,68 @@
+use lin_common::{Diagnostic, NumSuffix, Span};
+
 use crate::typed_ir::*;
 use crate::types::Type;
 use crate::widen::widen_numeric;
+
+/// The concrete numeric `Type` named by an explicit literal suffix (spec §3.6).
+pub(crate) fn suffix_to_type(suffix: NumSuffix) -> Type {
+    match suffix {
+        NumSuffix::I8 => Type::Int8,
+        NumSuffix::I16 => Type::Int16,
+        NumSuffix::I32 => Type::Int32,
+        NumSuffix::I64 => Type::Int64,
+        NumSuffix::U8 => Type::UInt8,
+        NumSuffix::U16 => Type::UInt16,
+        NumSuffix::U32 => Type::UInt32,
+        NumSuffix::U64 => Type::UInt64,
+        NumSuffix::F32 => Type::Float32,
+        NumSuffix::F64 => Type::Float64,
+    }
+}
+
+/// The default type for a suffixless integer literal with no surrounding context (spec §26):
+/// `Int32` when the value fits, otherwise the smallest type that PRESERVES it — `Int64`, or
+/// `UInt64` for a decimal above `i64::MAX` (lexed as a negative i64 bit pattern). This avoids
+/// the silent truncation a flat `Int32` default would cause for large literals; downstream
+/// context (call args / operators) may still re-type the literal to a different width.
+pub(crate) fn default_int_literal_type(v: i64) -> Type {
+    if v >= i32::MIN as i64 && v <= i32::MAX as i64 {
+        Type::Int32
+    } else if v >= 0 {
+        Type::Int64
+    } else {
+        // Negative: either a genuine negative that fits i64, or a decimal > i64::MAX stored as
+        // a negative bit pattern. A literal source has no unary minus (spec §3.7) except the
+        // parser's `0 - lit` desugar, so a bare negative IntLit here is the above-i64::MAX case.
+        Type::UInt64
+    }
+}
+
+/// Check that integer literal `v` fits `ty`'s range. `v` is the i64 bit pattern from the lexer
+/// (a decimal > i64::MAX is stored as a negative pattern; reinterpret as u64 for unsigned
+/// targets). Returns a range-error diagnostic at `span` when it doesn't fit.
+pub(crate) fn check_int_literal_fits(v: i64, ty: &Type, span: Span) -> Result<(), Diagnostic> {
+    if let Some((lo, hi)) = integer_range(ty) {
+        let signed = v as i128;
+        let fits = (signed >= lo && signed <= hi)
+            || (!ty.is_signed() && {
+                let unsigned = (v as u64) as i128;
+                unsigned >= lo && unsigned <= hi
+            });
+        if !fits {
+            let shown = if !ty.is_signed() && v < 0 {
+                format!("{}", v as u64)
+            } else {
+                format!("{}", v)
+            };
+            return Err(Diagnostic::error(
+                span,
+                format!("literal {} is out of range for type {}", shown, ty),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Collect TypeVar substitutions from matching `actual` against `pattern`.
 /// E.g., matching `Iterator<Int32>` against `Iterator<TypeVar(9010)>` yields `9010 -> Int32`.

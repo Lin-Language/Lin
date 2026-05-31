@@ -4155,6 +4155,62 @@ print("unreachable")
 }
 
 #[test]
+fn test_bare_literal_overflowing_int32_preserved() {
+    // Regression: a bare integer literal larger than the default Int32 range, with no wider
+    // context, used to SILENTLY TRUNCATE to its low 32 bits (1705314600000 -> 212583488).
+    // It must now default to the smallest type that PRESERVES the value (Int64 here), so the
+    // full value survives — no truncation, and no annotation required.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val c = 1705314600000
+print(toString(c))
+val big = 3000000000   // > Int32 max, fits Int64
+print(toString(big))
+"#);
+    assert_eq!(out, vec!["1705314600000", "3000000000"]);
+}
+
+#[test]
+fn test_i64_suffix_preserves_large_literal() {
+    // An `i64` suffix pins the literal to Int64 (spec §3.6), so a value beyond Int32's range
+    // is preserved exactly rather than truncated. (The suffix used to be lexed then discarded.)
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+print(toString(1705314600000i64))
+val x = 1705314600000i64
+print(toString(x + 1i64))
+"#);
+    assert_eq!(out, vec!["1705314600000", "1705314600001"]);
+}
+
+#[test]
+fn test_int64_annotation_preserves_large_literal() {
+    // The annotation route to the same value: `: Int64` gives the literal Int64 context.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val ts: Int64 = 1705314600000
+print(toString(ts))
+"#);
+    assert_eq!(out, vec!["1705314600000"]);
+}
+
+#[test]
+fn test_suffix_overrides_expected_context_conflict() {
+    // A suffix pins the type; assigning an i64-suffixed literal to an Int32 binding is a
+    // type error (the suffix wins over context, then compatibility is checked) — not a
+    // silent reinterpretation.
+    let err = run_expect_err(r#"import { print } from "std/io"
+val x: Int32 = 5i64
+print("unreachable")
+"#);
+    assert!(
+        err.contains("Int32") && (err.contains("Int64") || err.contains("Expected")),
+        "expected a type-mismatch error for i64 suffix into Int32, got:\n{}",
+        err
+    );
+}
+
+#[test]
 fn test_nonliteral_int32_to_uint8_still_rejected() {
     // A NON-literal Int32 value assigned to UInt8 is still a narrowing error: literal
     // context-typing must not loosen the numeric-compatibility rules for computed values.

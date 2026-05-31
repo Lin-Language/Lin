@@ -1,4 +1,4 @@
-use lin_common::Span;
+use lin_common::{Span, NumSuffix};
 use crate::token::{Token, TokenKind};
 
 pub struct Lexer {
@@ -390,24 +390,33 @@ impl Lexer {
             }
         }
 
-        // Skip type suffixes (i8, u32, f32, etc.) - we just consume them
-        while self.pos < self.source.len() && (self.source[self.pos].is_alphabetic() || self.source[self.pos].is_ascii_digit()) {
+        // Capture a type suffix (i8, u32, f32, etc.). It begins with i/u/f followed by digits.
+        // The suffix is parsed into a NumSuffix and carried on the token so the checker can pin
+        // the literal's type (spec §3.6); an unrecognised suffix is ignored (kept as None).
+        let mut suffix_str = String::new();
+        if self.pos < self.source.len() {
             let c = self.source[self.pos];
             if c == 'i' || c == 'u' || c == 'f' {
+                suffix_str.push(c);
                 self.pos += 1;
                 while self.pos < self.source.len() && self.source[self.pos].is_ascii_digit() {
+                    suffix_str.push(self.source[self.pos]);
                     self.pos += 1;
                 }
-            } else {
-                break;
             }
+        }
+        let suffix = NumSuffix::parse(&suffix_str);
+        // A float suffix (or a decimal point/exponent) makes this a float literal even if the
+        // mantissa had no '.', e.g. `42f32`.
+        if suffix.map(|s| s.is_float()).unwrap_or(false) {
+            is_float = true;
         }
 
         let span = self.span(start, self.pos);
         if is_float {
             let val: f64 = num_str.parse().unwrap_or(0.0);
             let val = if negative { -val } else { val };
-            Token::new(TokenKind::FloatLit(val), span)
+            Token::new(TokenKind::FloatLit(val, suffix), span)
         } else {
             // Parse as i64 when in range; otherwise fall back to u64 and store its bit
             // pattern (so UInt64 literals > i64::MAX, e.g. 18446744073709551615, survive into
@@ -417,7 +426,7 @@ impl Lexer {
                 Err(_) => num_str.parse::<u64>().map(|u| u as i64).unwrap_or(0),
             };
             let val = if negative { -val } else { val };
-            Token::new(TokenKind::IntLit(val), span)
+            Token::new(TokenKind::IntLit(val, suffix), span)
         }
     }
 
@@ -432,7 +441,37 @@ impl Lexer {
         }
         let val = i64::from_str_radix(&num_str, 16).unwrap_or(0);
         let val = if negative { -val } else { val };
-        Token::new(TokenKind::IntLit(val), self.span(start, self.pos))
+        let suffix = self.lex_int_suffix();
+        Token::new(TokenKind::IntLit(val, suffix), self.span(start, self.pos))
+    }
+
+    /// Consume an integer type suffix (i8/u32/...) following a hex/binary/octal literal, if
+    /// present, and parse it into a NumSuffix. A float suffix is not valid on these forms and
+    /// is left unconsumed (it would lex as a following identifier — an error downstream).
+    fn lex_int_suffix(&mut self) -> Option<NumSuffix> {
+        if self.pos >= self.source.len() {
+            return None;
+        }
+        let c = self.source[self.pos];
+        if c != 'i' && c != 'u' {
+            return None;
+        }
+        let mark = self.pos;
+        let mut s = String::new();
+        s.push(c);
+        self.pos += 1;
+        while self.pos < self.source.len() && self.source[self.pos].is_ascii_digit() {
+            s.push(self.source[self.pos]);
+            self.pos += 1;
+        }
+        match NumSuffix::parse(&s) {
+            Some(suf) => Some(suf),
+            None => {
+                // Not a real suffix — rewind so it lexes as whatever follows.
+                self.pos = mark;
+                None
+            }
+        }
     }
 
     fn lex_binary(&mut self, start: usize, negative: bool) -> Token {
@@ -446,7 +485,8 @@ impl Lexer {
         }
         let val = i64::from_str_radix(&num_str, 2).unwrap_or(0);
         let val = if negative { -val } else { val };
-        Token::new(TokenKind::IntLit(val), self.span(start, self.pos))
+        let suffix = self.lex_int_suffix();
+        Token::new(TokenKind::IntLit(val, suffix), self.span(start, self.pos))
     }
 
     fn lex_octal(&mut self, start: usize, negative: bool) -> Token {
@@ -460,7 +500,8 @@ impl Lexer {
         }
         let val = i64::from_str_radix(&num_str, 8).unwrap_or(0);
         let val = if negative { -val } else { val };
-        Token::new(TokenKind::IntLit(val), self.span(start, self.pos))
+        let suffix = self.lex_int_suffix();
+        Token::new(TokenKind::IntLit(val, suffix), self.span(start, self.pos))
     }
 
     fn lex_ident_or_keyword(&mut self) -> Token {

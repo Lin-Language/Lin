@@ -5,6 +5,7 @@
 /// AST (they are stripped by the lexer). See docs/DECISIONS.md ADR-040.
 
 use crate::ast::*;
+use lin_common::NumSuffix;
 
 pub struct Formatter;
 
@@ -77,6 +78,23 @@ fn format_float(f: f64) -> String {
         s
     } else {
         format!("{}.0", s)
+    }
+}
+
+/// The source spelling of a numeric type suffix, for round-tripping in the formatter.
+fn suffix_str(suffix: &Option<NumSuffix>) -> &'static str {
+    match suffix {
+        None => "",
+        Some(NumSuffix::I8) => "i8",
+        Some(NumSuffix::I16) => "i16",
+        Some(NumSuffix::I32) => "i32",
+        Some(NumSuffix::I64) => "i64",
+        Some(NumSuffix::U8) => "u8",
+        Some(NumSuffix::U16) => "u16",
+        Some(NumSuffix::U32) => "u32",
+        Some(NumSuffix::U64) => "u64",
+        Some(NumSuffix::F32) => "f32",
+        Some(NumSuffix::F64) => "f64",
     }
 }
 
@@ -252,8 +270,8 @@ fn is_atomic(expr: &Expr) -> bool {
 /// the expression fits on one line.
 fn fmt_inline(expr: &Expr) -> String {
     match expr {
-        Expr::IntLit(n, _) => n.to_string(),
-        Expr::FloatLit(f, _) => format_float(*f),
+        Expr::IntLit(n, suffix, _) => format!("{}{}", n, suffix_str(suffix)),
+        Expr::FloatLit(f, suffix, _) => format!("{}{}", format_float(*f), suffix_str(suffix)),
         Expr::StringLit(s, _) => format!("\"{}\"", escape_string(s)),
         Expr::BoolLit(b, _) => b.to_string(),
         Expr::NullLit(_) => "null".to_string(),
@@ -452,8 +470,8 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
 
     match expr {
         // ── atomics ───────────────────────────────────────────────────────────
-        Expr::IntLit(n, _) => n.to_string(),
-        Expr::FloatLit(f, _) => format_float(*f),
+        Expr::IntLit(n, suffix, _) => format!("{}{}", n, suffix_str(suffix)),
+        Expr::FloatLit(f, suffix, _) => format!("{}{}", format_float(*f), suffix_str(suffix)),
         Expr::StringLit(s, _) => format!("\"{}\"", escape_string(s)),
         Expr::BoolLit(b, _) => b.to_string(),
         Expr::NullLit(_) => "null".to_string(),

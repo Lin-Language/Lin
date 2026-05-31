@@ -33,6 +33,41 @@ impl Span {
     }
 }
 
+/// An explicit numeric type suffix on a literal (e.g. `42i8`, `3.14f32`, `5u64`).
+/// Carried from the lexer through the surface AST so the type checker can pin the
+/// literal's type, overriding context/default inference (spec §3.6). `None` ⇒ no suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumSuffix {
+    I8, I16, I32, I64,
+    U8, U16, U32, U64,
+    F32, F64,
+}
+
+impl NumSuffix {
+    /// Parse the suffix letters after the digits (e.g. "i64", "u8", "f32").
+    /// Returns `None` for an unrecognised suffix.
+    pub fn parse(s: &str) -> Option<NumSuffix> {
+        match s {
+            "i8" => Some(NumSuffix::I8),
+            "i16" => Some(NumSuffix::I16),
+            "i32" => Some(NumSuffix::I32),
+            "i64" => Some(NumSuffix::I64),
+            "u8" => Some(NumSuffix::U8),
+            "u16" => Some(NumSuffix::U16),
+            "u32" => Some(NumSuffix::U32),
+            "u64" => Some(NumSuffix::U64),
+            "f32" => Some(NumSuffix::F32),
+            "f64" => Some(NumSuffix::F64),
+            _ => None,
+        }
+    }
+
+    /// True for `f32`/`f64`.
+    pub fn is_float(self) -> bool {
+        matches!(self, NumSuffix::F32 | NumSuffix::F64)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub span: Span,

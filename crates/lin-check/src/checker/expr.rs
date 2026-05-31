@@ -3,7 +3,7 @@ use lin_common::{Diagnostic, Span};
 use lin_parse::ast::{Expr, MatchArm, ObjectField, Stmt, StringPart};
 
 use super::Checker;
-use super::helpers::{integer_range, unify_types};
+use super::helpers::{check_int_literal_fits, default_int_literal_type, suffix_to_type, unify_types};
 use crate::typed_ir::*;
 use crate::types::Type;
 
@@ -15,35 +15,14 @@ impl Checker {
             return self.infer_function_with_hints(type_params, params, return_type, body, *span, None, expected_params, expected_ret);
         }
 
-        // A suffixless integer literal takes its context type (spec §26). When the expected
-        // type is an integer numeric type, re-type the literal directly at that width — but
-        // only if its value fits the target's range, otherwise it's a compile error.
-        if let Expr::IntLit(v, span) = expr {
+        // Integer literal against an expected type. A suffixless literal takes its context
+        // type (spec §26), re-typed at that width if the value fits (else a compile error,
+        // not a silent truncation). A *suffixed* literal pins its own type (spec §3.6) — it
+        // falls through to `infer_expr` below, and the tail's compatibility check verifies it
+        // against `expected` like any other typed expression.
+        if let Expr::IntLit(v, None, span) = expr {
             if expected.is_integer() {
-                if let Some((lo, hi)) = integer_range(expected) {
-                    let signed = *v as i128;
-                    // A decimal literal larger than i64::MAX (e.g. UInt64 = 18446744073709551615)
-                    // is lexed as the i64 bit pattern (negative). For an unsigned target, also
-                    // consider the unsigned reinterpretation so such literals fit their range.
-                    let fits = (signed >= lo && signed <= hi)
-                        || (!expected.is_signed() && {
-                            let unsigned = (*v as u64) as i128;
-                            unsigned >= lo && unsigned <= hi
-                        });
-                    if !fits {
-                        // Show the unsigned spelling only when it was lexed as an above-i64::MAX
-                        // decimal (stored as a negative bit pattern) targeting an unsigned type.
-                        let shown = if !expected.is_signed() && *v < 0 {
-                            format!("{}", *v as u64)
-                        } else {
-                            format!("{}", v)
-                        };
-                        return Err(Diagnostic::error(
-                            *span,
-                            format!("literal {} is out of range for type {}", shown, expected),
-                        ));
-                    }
-                }
+                check_int_literal_fits(*v, expected, *span)?;
                 return Ok(TypedExpr::IntLit(*v, expected.clone(), *span));
             }
         }
@@ -172,8 +151,35 @@ impl Checker {
 
     pub(crate) fn infer_expr(&mut self, expr: &Expr) -> Result<TypedExpr, Diagnostic> {
         match expr {
-            Expr::IntLit(v, span)    => Ok(TypedExpr::IntLit(*v, Type::Int32, *span)),
-            Expr::FloatLit(v, span)  => Ok(TypedExpr::FloatLit(*v, Type::Float64, *span)),
+            // Integer literal with no surrounding context. An explicit suffix pins the type
+            // (spec §3.6). Otherwise the literal defaults to Int32 (spec §26) when it fits,
+            // but a value beyond Int32 widens its default to the smallest type that holds it
+            // (Int64, then UInt64 for decimals above i64::MAX) so the value is PRESERVED —
+            // never silently truncated. The value is still available for context re-typing at
+            // call sites / operators (`call.rs`, `ops.rs`), so e.g. `f(5_000_000_000)` into an
+            // Int64 param still works.
+            Expr::IntLit(v, suffix, span) => {
+                match suffix {
+                    Some(suf) => {
+                        let ty = suffix_to_type(*suf);
+                        if ty.is_integer() {
+                            check_int_literal_fits(*v, &ty, *span)?;
+                            Ok(TypedExpr::IntLit(*v, ty, *span))
+                        } else {
+                            // Float suffix on an integer literal (e.g. `42f32`).
+                            Ok(TypedExpr::FloatLit(*v as f64, ty, *span))
+                        }
+                    }
+                    None => Ok(TypedExpr::IntLit(*v, default_int_literal_type(*v), *span)),
+                }
+            }
+            Expr::FloatLit(v, suffix, span) => {
+                let ty = match suffix {
+                    Some(suf) => suffix_to_type(*suf),
+                    None => Type::Float64,
+                };
+                Ok(TypedExpr::FloatLit(*v, ty, *span))
+            }
             Expr::StringLit(s, span) => Ok(TypedExpr::StringLit(s.clone(), Type::Str, *span)),
             Expr::BoolLit(b, span)   => Ok(TypedExpr::BoolLit(*b, *span)),
             Expr::NullLit(span)      => Ok(TypedExpr::NullLit(*span)),

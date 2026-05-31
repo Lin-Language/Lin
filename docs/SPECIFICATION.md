@@ -1539,7 +1539,7 @@ toUInt64:            (UInt64) => UInt64
 
 The integer-narrowing casts take their input as `UInt64` (the widest unsigned), so any narrower *unsigned* integer — or a value first masked down to a byte/word — widens into the parameter without range loss before truncation; a bare integer literal in range is accepted directly. These are the byte-extraction primitives used by `std/bytes` (§35.3) and are generally useful wherever explicit width control is needed.
 
-Literal inference: a numeric literal without a suffix takes the type required by its surrounding context if one exists; otherwise integer literals default to `Int32` and floating-point literals default to `Float64`.
+Literal inference: a numeric literal with an explicit type suffix (e.g. `5i64`, `3.14f32`, §3.6) is fixed at that type, overriding context — assigning it where an incompatible type is expected is a type error. A suffixless literal takes the type required by its surrounding context if one exists; otherwise integer literals default to `Int32` and floating-point literals default to `Float64`. An integer literal whose value exceeds `Int32`'s range but has no wider context does **not** truncate: its default widens to the smallest type that preserves the value (`Int64`, or `UInt64` for a decimal above `Int64`'s max). A literal that does not fit its required (context or suffix) type is a compile-time error, never a silent truncation.
 
 Generic and overload-style inference uses bidirectional type checking: type information flows both from declarations into expressions and from expression context back into holes. This is sufficient for `[1,2,3].map(i => i * i)` to infer `T = Int32` and `U = Int32` without explicit annotation.
 

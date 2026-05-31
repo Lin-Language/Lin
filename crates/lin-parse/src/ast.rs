@@ -1,4 +1,4 @@
-use lin_common::Span;
+use lin_common::{Span, NumSuffix};
 
 #[derive(Debug, Clone)]
 pub struct Module {
@@ -57,8 +57,11 @@ pub struct ImportBinding {
 
 #[derive(Debug, Clone)]
 pub enum Expr {
-    IntLit(i64, Span),
-    FloatLit(f64, Span),
+    /// Integer literal with an optional explicit type suffix (e.g. `42i8`). The suffix, when
+    /// present, pins the literal's type in the checker, overriding context/default (spec §3.6).
+    IntLit(i64, Option<NumSuffix>, Span),
+    /// Float literal with an optional explicit type suffix (e.g. `3.14f32`).
+    FloatLit(f64, Option<NumSuffix>, Span),
     StringLit(String, Span),
     BoolLit(bool, Span),
     NullLit(Span),
@@ -147,8 +150,8 @@ pub enum Expr {
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
-            Expr::IntLit(_, s) => *s,
-            Expr::FloatLit(_, s) => *s,
+            Expr::IntLit(_, _, s) => *s,
+            Expr::FloatLit(_, _, s) => *s,
             Expr::StringLit(_, s) => *s,
             Expr::BoolLit(_, s) => *s,
             Expr::NullLit(s) => *s,
