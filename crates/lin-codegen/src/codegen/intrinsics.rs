@@ -202,7 +202,7 @@ impl<'ctx> Codegen<'ctx> {
                     // which reads the array's runtime `elem_tag` and coerces the boxed element into
                     // the flat slot. Scalars carry no refcount, so no RC balancing is needed (the
                     // boxed element shell is a fresh cached/heap box freed after the move). This is
-                    // the `[]`+push flat-representation consistency fix (ADR-068).
+                    // the `[]`+push flat-representation consistency fix (ADR-069).
                     let arr_elem_flat = matches!(&arr_ty, Type::Array(e) if Self::is_flat_scalar(e));
                     if Self::is_union_type(&arr_ty) || arr_elem_flat {
                         // arr may be a boxed TaggedVal* wrapping a LinArray* (flat or tagged), or a

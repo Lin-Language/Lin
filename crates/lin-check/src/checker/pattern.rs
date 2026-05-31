@@ -162,7 +162,8 @@ impl Checker {
                     return Ok(self.error_discriminant_pattern(*span));
                 }
                 // `is <Name>` resolving to a non-empty object type (ADR-054): validate field
-                // TYPES recursively at runtime, not just field presence (ADR-050). A bare
+                // TYPES recursively at runtime, not just the field presence the earlier rule
+                // (now folded into ADR-054) checked. A bare
                 // presence check let `{ "name": 1, "age": "x" }` match `Person`, then the arm
                 // narrowed the binding and a subsequent `x["age"] + 1` operated on the wrong
                 // runtime type — unsound. Reuse the `fromJson` structural walker by carrying the
