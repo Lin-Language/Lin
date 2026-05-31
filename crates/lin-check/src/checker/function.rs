@@ -5,6 +5,15 @@ use super::Checker;
 use crate::resolve::resolve_type;
 use crate::typed_ir::*;
 use crate::types::Type;
+use crate::env::TypeDecl;
+
+/// Records the `type_decls` entries that `bind_type_params` shadowed, so they can be restored
+/// (`unbind_type_params`) once a generic function body is checked. Keeps type-param names from
+/// leaking past the function and prevents a nested generic's params from clobbering the outer's.
+#[derive(Default)]
+pub(crate) struct TypeParamGuard {
+    saved: Vec<(String, Option<TypeDecl>)>,
+}
 
 impl Checker {
     /// Bind a generic function's type parameters into the type-decl environment so bare `T`
@@ -13,18 +22,27 @@ impl Checker {
     /// anonymous generic lambda we mint fresh ids. No-op when there are no type params, which
     /// keeps non-generic functions on their existing code path.
     ///
-    /// NOTE: `type_decls` is not scope-stacked, so this can shadow an outer alias of the same
-    /// name for the duration of the body. Phase 0 is single-module with a lone `T`; broader
-    /// hygiene (save/restore, nested generics) is deferred to Phase 3.
-    pub(crate) fn bind_type_params(&mut self, type_params: &[String], fn_name: Option<&str>) {
+    /// NOTE: `type_decls` is not scope-stacked. To keep type-param bindings hygienic, this returns
+    /// a `TypeParamGuard` recording every `type_decls` entry it shadowed (the prior value, or
+    /// absence). The caller MUST pass it to `unbind_type_params` after checking the body, which
+    /// restores the previous bindings — so a generic param `T` cannot leak past the function and a
+    /// nested generic's params cannot clobber the outer one's. No-op when there are no type params,
+    /// which keeps non-generic functions on their existing code path.
+    pub(crate) fn bind_type_params(
+        &mut self,
+        type_params: &[String],
+        fn_name: Option<&str>,
+    ) -> TypeParamGuard {
+        let mut guard = TypeParamGuard::default();
         if type_params.is_empty() {
-            return;
+            return guard;
         }
         // Prefer the forward-declared assignment for this binding name.
         let recorded = fn_name.and_then(|n| self.generic_fn_params.get(n).cloned());
         match recorded {
             Some(assign) => {
                 for (name, id) in assign {
+                    guard.saved.push((name.clone(), self.env.type_decls.get(&name).cloned()));
                     self.env.define_type(name, Vec::new(), Type::TypeVar(id));
                 }
             }
@@ -33,7 +51,24 @@ impl Checker {
                 for tp in type_params {
                     let id = self.next_generic_tv;
                     self.next_generic_tv += 1;
+                    guard.saved.push((tp.clone(), self.env.type_decls.get(tp).cloned()));
                     self.env.define_type(tp.clone(), Vec::new(), Type::TypeVar(id));
+                }
+            }
+        }
+        guard
+    }
+
+    /// Restore the `type_decls` entries shadowed by a prior `bind_type_params`, removing the
+    /// generic param bindings (or reinstating an outer alias of the same name).
+    pub(crate) fn unbind_type_params(&mut self, guard: TypeParamGuard) {
+        for (name, prev) in guard.saved.into_iter().rev() {
+            match prev {
+                Some(decl) => {
+                    self.env.type_decls.insert(name, decl);
+                }
+                None => {
+                    self.env.type_decls.shift_remove(&name);
                 }
             }
         }
@@ -60,7 +95,8 @@ impl Checker {
         // the binding name) so the signature and body agree; for an anonymous generic lambda,
         // mint fresh ids on the fly. These TypeVars live in the ≥9000 range and so are never
         // globally solved — each call site instantiates them locally (Phase 0 monomorphization).
-        self.bind_type_params(type_params, fn_name);
+        // The guard is restored after the body so the param names don't leak (hygiene).
+        let type_param_guard = self.bind_type_params(type_params, fn_name);
 
         let mut typed_params = Vec::new();
         // Destructuring stmts for params with non-Ident patterns (e.g. `{ name, age }: Json`).
@@ -195,6 +231,8 @@ impl Checker {
         self.current_function = prev_fn;
         self.in_tail_position = prev_tail;
         self.env.pop_scope();
+        // Restore any type aliases shadowed by this function's generic params (hygiene).
+        self.unbind_type_params(type_param_guard);
 
         self.function_scope_depths.pop();
         let captures_map = self.capture_stack.pop().unwrap_or_default();
@@ -247,7 +285,7 @@ impl Checker {
         self.env.push_scope();
 
         // Bind generic type params (see `infer_function` for rationale).
-        self.bind_type_params(type_params, fn_name);
+        let type_param_guard = self.bind_type_params(type_params, fn_name);
 
         let mut typed_params = Vec::new();
         let mut param_destr_stmts: Vec<TypedStmt> = Vec::new();
@@ -363,6 +401,8 @@ impl Checker {
         self.current_function = prev_fn;
         self.in_tail_position = prev_tail;
         self.env.pop_scope();
+        // Restore any type aliases shadowed by this function's generic params (hygiene).
+        self.unbind_type_params(type_param_guard);
 
         self.function_scope_depths.pop();
         let captures_map = self.capture_stack.pop().unwrap_or_default();

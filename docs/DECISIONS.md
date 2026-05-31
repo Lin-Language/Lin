@@ -714,3 +714,92 @@ LeakSanitizer (the only residual reports are pre-existing program-lifetime inter
 `spawn(command, args)` form and `std/process` import. Verified: stdlib + example suites green; three
 integration tests (`test_process_spawn_read_wait`, `test_process_wait_exit_code`,
 `test_process_exec_and_shell_batch`) pass.
+
+## ADR-056: OS resources are opaque integer fd handles
+
+**Decision**: Operating-system resources exposed by `std/net`, `std/process`, and `std/time`
+(timers) are represented to Lin code as **opaque integer handles**, never as runtime object values. A
+socket fd is an `Int32` (`udpBind`/`tcpListen`/`tcpAccept`/`tcpConnect` return `Int32 | Error`); a
+subprocess handle is an `Int64` (`std/process.spawn` returns a `ProcessHandle`, an exported `Int64`
+alias — ADR-055). The integer is meaningful only to the runtime, which keeps the real `fd`/`Child` in
+a side table keyed by the integer; user code passes it back to the relevant intrinsic
+(`udpRecv(fd, …)`, `wait(handle)`, …). See spec §35.4–§35.6.
+
+**Rationale**: This upholds the §33.1 "no hidden open-handle values" convention already used for
+stdin/stdout/filesystem — there is no `Socket` or `Process` object kind to add to the runtime, no new
+boxing, and no lifetime/RC story for OS handles. An integer is transferable, comparable, and trivially
+representable. Fallible operations return the `T | Error` shape (§33.1); a non-blocking read with no
+data yet returns `Null` (not `Error`), so poll loops read naturally (`recv`/`accept` →
+`Int32 | Null | Error`).
+
+**Consequence**: No new runtime *kind* is introduced for sockets/processes — they reuse the existing
+integer representation (a typed alias like `ProcessHandle` is just `Int64` for readability, not a
+distinct kind). The cost is that handles are not type-distinct from ordinary integers; misuse (passing
+the wrong integer) is not caught by the type system, consistent with the deliberately-unsafe nature of
+the low-level layer. The `Int32`/`Int64` split is pragmatic: fds fit in 32 bits, process handles use 64
+to match the platform child representation.
+
+## ADR-057: Share-nothing concurrency — no Mutex/atomics primitive
+
+**Decision**: Lin provides **no** shared-memory concurrency primitives (mutexes, atomics,
+cross-thread shared mutable cells). Cross-thread mutable state is modelled exclusively with a
+`Worker<Msg, Reply>` (§32.6) that owns the state and serialises all access through its single-threaded
+message queue. Spec §35.9 records this as a deliberate absence.
+
+**Rationale**: The concurrency model is share-nothing (§32): `async` thunks and `parallel` may not
+capture `var` bindings (compile-time error, ADR-034), and transferred values must be JSON-compatible. A
+`Worker` owning its state and processing messages one at a time preserves that invariant — there is no
+concurrent access to the worker's closed-over `var`, so no data race is possible without ever
+introducing a lock. Adding a `Mutex`/atomic primitive would reintroduce exactly the data-race surface
+the model is designed to exclude, and would need a new opaque runtime kind plus a poisoning/lifetime
+story.
+
+**Consequence**: Patterns that would use `Arc<Mutex<T>>` in Rust (a shared counter, a connection pool,
+a discovered-peer-address cache) are expressed as a `Worker` whose `onMessage` handler closes over the
+state (§32.6.4). This is more message-passing boilerplate than a shared cell, accepted as the price of
+guaranteed freedom from data races. Single-threaded mutation via `var` is unaffected; the restriction
+applies only across thread boundaries.
+
+## ADR-058: Flat unboxed arrays for scalar element types
+
+**Decision**: An array whose element type is a fixed-width scalar — `Int8`/`Int16`/`Int32`/`Int64`,
+`UInt8`/`UInt16`/`UInt32`/`UInt64`, `Float32`/`Float64` — is stored as a **packed, unboxed,
+contiguous buffer** (one element-width slot per element, no per-element tag), not as an array of boxed
+`TaggedVal`s. The runtime provides a flat variant per family
+(`lin_flat_array_alloc_{i8,i16,i32,i64,u8,u16,u32,u64,f32,f64}` and matching push/index). A `UInt8[]`
+is therefore a literal byte buffer (spec §35.1). Semantically these remain ordinary `T[]` arrays —
+every array operation (literals, indexing, in-place write, `length`, `push`, `slice`, `concat`, `==`,
+the `std/array` combinators) works identically; the representation is an implementation detail.
+
+**Rationale**: Byte/scalar buffers are the substrate for binary protocols, `std/bytes`, and socket
+I/O (`recv` fills a caller-owned `UInt8[]`). Boxing each byte as a tagged value would cost ~16× the
+memory and defeat the point. Because the element type is statically known, codegen selects the flat
+representation with no runtime tag dispatch. Mixed/`Json`/object arrays keep the boxed tagged
+representation; only statically-scalar element types go flat.
+
+**Consequence**: Codegen and the runtime must convert between flat and tagged forms at boundaries where
+a flat array meets a `Json`/dynamic context (`lin_flat_to_tagged_*`, used e.g. by `toString` and
+dynamic length). The flat/boxed distinction is why `concat`/`slice` are flat-representation-aware:
+slicing/concatenating a `UInt8[]` yields a `UInt8[]` whose elements read correctly, not a boxed array
+of zeros. `is_flat_scalar` (codegen) is the single predicate deciding the representation and must stay
+consistent with the runtime's family set.
+
+## ADR-059: Two unary operators — bitwise `~` and logical `!`; no unary minus
+
+**Decision**: Lin has exactly **two** prefix unary operators: bitwise complement `~` (§35.2) and
+logical not `!` (§24.1). There is **no unary minus** — a leading `-` is part of a numeric literal in
+literal position (§3.7), and negating a computed value is written `0 - x`. Both unary operators are
+right-associative and bind tighter than `*` but looser than postfix call/index/dot (§24.2).
+
+**Rationale**: This supersedes the original v1 design (recorded in earlier drafts and TODO) of `~` as
+the *single* sanctioned unary operator. `!` was added (ADR-047) because boolean negation otherwise had
+to be spelled `x == false`, pervasive boilerplate in stdlib and user code; it reuses the existing unary
+pipeline end-to-end (lexer `Bang` token, `UnaryOp::Not`, and for an `i1` a bitwise-not *is* a
+logical-not, so codegen's `build_not` needs no new arm). Unary minus is still excluded: it would
+complicate the negative-literal lexing rule (§3.7) for marginal benefit, and `0 - x` is unambiguous.
+
+**Consequence**: Typing rules differ by operator — `~x` requires an integer and yields that integer
+type; `!x` requires `Bool` and yields `Bool`; a float operand to `~` (or a non-`Bool` to `!`) is a
+compile-time error. The spec's older "the only unary operator is `~`" / "no unary operators in v1"
+statements (§24.1, §35.2, decision-list #9) are updated to "exactly two unary operators (`~`, `!`); no
+unary minus".
