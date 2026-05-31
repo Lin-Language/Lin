@@ -18,6 +18,19 @@ use crate::ir::*;
 
 /// Entry point: lower a TypedModule to a LinModule.
 pub fn lower_module(module: &TypedModule) -> LinModule {
+    // Phase 0 monomorphization: materialize concrete copies of single-module generic functions
+    // (e.g. `identity$Int32`) and route calls to them BEFORE lowering, so the backend emits
+    // native unboxed scalars. The clone is taken only when the module actually has a generic
+    // function; ordinary modules skip it entirely and lower byte-for-byte as before.
+    let owned: Option<TypedModule> = if crate::monomorphize::module_has_generic_fn(module) {
+        let mut m = module.clone();
+        crate::monomorphize::monomorphize(&mut m);
+        Some(m)
+    } else {
+        None
+    };
+    let module: &TypedModule = owned.as_ref().unwrap_or(module);
+
     let mut ctx = LowerCtx::new();
     ctx.intrinsics = module.intrinsics.clone();
 

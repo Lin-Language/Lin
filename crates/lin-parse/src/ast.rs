@@ -109,6 +109,10 @@ pub enum Expr {
     },
     Block(Vec<Stmt>, Box<Expr>, Span),
     Function {
+        /// Generic type parameters introduced by a leading `<T, ...>` (Phase 0: single-module
+        /// monomorphized generics). Empty for ordinary (non-generic) functions, which keeps the
+        /// monomorphization pass a no-op.
+        type_params: Vec<String>,
         params: Vec<Param>,
         return_type: Option<TypeExpr>,
         body: Box<Expr>,

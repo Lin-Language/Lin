@@ -11,8 +11,8 @@ impl Checker {
     pub(crate) fn check_expr(&mut self, expr: &Expr, expected: &Type) -> Result<TypedExpr, Diagnostic> {
         // For function expressions with a known expected function type, use the expected
         // param types to guide inference (bidirectional type checking).
-        if let (Expr::Function { params, return_type, body, span }, Type::Function { params: expected_params, ret: expected_ret, .. }) = (expr, expected) {
-            return self.infer_function_with_hints(params, return_type, body, *span, None, expected_params, expected_ret);
+        if let (Expr::Function { type_params, params, return_type, body, span }, Type::Function { params: expected_params, ret: expected_ret, .. }) = (expr, expected) {
+            return self.infer_function_with_hints(type_params, params, return_type, body, *span, None, expected_params, expected_ret);
         }
 
         // A suffixless integer literal takes its context type (spec §26). When the expected
@@ -186,7 +186,7 @@ impl Checker {
             Expr::If { condition, then_branch, else_branch, span } => self.infer_if(condition, then_branch, else_branch, *span),
             Expr::Match { scrutinee, arms, span }     => self.infer_match(scrutinee, arms, *span),
             Expr::Block(stmts, final_expr, span)      => self.infer_block(stmts, final_expr, *span),
-            Expr::Function { params, return_type, body, span } => self.infer_function(params, return_type, body, *span, None),
+            Expr::Function { type_params, params, return_type, body, span } => self.infer_function(type_params, params, return_type, body, *span, None),
             Expr::Object(fields, span)                => self.infer_object(fields, *span),
             Expr::Array(elements, span)               => self.infer_array(elements, *span),
             Expr::Assign { target, value, span }      => self.infer_assign(target, value, *span),

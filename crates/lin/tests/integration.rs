@@ -5888,3 +5888,83 @@ match r
 "#);
     assert_eq!(out, vec!["ok anything goes"]);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 0: monomorphized generic functions (single-module `identity<T>`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_generic_identity_int_and_string() {
+    // The canonical Phase-0 slice: one generic `val` function instantiated at two types
+    // in the same module. T=Int32 must run native (no boxing — see the IR-proof test below).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val identity = <T>(x: T): T => x
+print(toString(identity(5)))
+print(identity("hello"))
+"#);
+    assert_eq!(out, vec!["5", "hello"]);
+}
+
+#[test]
+fn test_generic_identity_three_types_and_reuse() {
+    // Generic over a third type (Bool), plus the SAME type used twice (Int32) to exercise
+    // specialization de-duplication.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val identity = <T>(x: T): T => x
+print(toString(identity(5)))
+print(toString(identity(42)))
+print(identity("hello"))
+print(toString(identity(true)))
+"#);
+    assert_eq!(out, vec!["5", "42", "hello", "true"]);
+}
+
+#[test]
+fn test_generic_identity_int_specialization_is_unboxed() {
+    // IR proof: the T=Int32 specialization must pass/return a native i32 with NO
+    // lin_box_int32/lin_unbox_int32 around the identity call or inside its body.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_gen_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_gen_{}", id));
+    let ll_path = bin_path.with_extension("ll");
+
+    fs::write(&src_path, r#"import { print } from "std/io"
+import { toString } from "std/string"
+val identity = <T>(x: T): T => x
+print(toString(identity(5)))
+print(identity("hello"))
+"#).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_EMIT_IR", "1")
+        .env("LIN_NO_OPT", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+
+    let ll = fs::read_to_string(&ll_path).expect("LLVM IR not emitted");
+    let _ = fs::remove_file(&bin_path);
+    let _ = fs::remove_file(&ll_path);
+
+    // The specialization exists, takes and returns native i32.
+    assert!(ll.contains("define i32 @\"identity$Int32\"(i32"),
+        "expected an unboxed i32 specialization, IR:\n{}", ll);
+    // The call site passes a native i32 directly (no boxing of the argument).
+    assert!(ll.contains("call i32 @\"identity$Int32\"(i32 5)"),
+        "expected a native-i32 call to the Int32 specialization, IR:\n{}", ll);
+
+    // No box/unbox appears inside the identity$Int32 body. Slice out its definition and check.
+    let body_start = ll.find("define i32 @\"identity$Int32\"").unwrap();
+    let body = &ll[body_start..];
+    let body_end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
+    let body = &body[..body_end];
+    assert!(!body.contains("lin_box_int32") && !body.contains("lin_unbox_int32"),
+        "identity$Int32 body must contain no int boxing, got:\n{}", body);
+}
