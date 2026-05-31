@@ -61,14 +61,19 @@ val result = "  hello world  "
 
 ## Partial application
 
-Passing fewer arguments than a function expects returns a new function:
+To partially apply a function — supply some arguments now and get back a function
+awaiting the rest — add an **explicit trailing comma** after the arguments you provide:
 
 ```lin
 val add = (a: Int32, b: Int32) => a + b
 
-val addTen = add(10)     // a function: (Int32) => Int32
+val addTen = add(10,)    // a function: (Int32) => Int32
 val result = addTen(5)   // 15
 ```
+
+The trailing comma is what marks the call as partial. Without it, `add(10)` is a
+complete call that's missing an argument — an error, unless the omitted parameter
+has a default value.
 
 ## Recursion
 
