@@ -24,6 +24,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/http`](#stdhttp) | HTTP client and server |
 | [`std/net`](#stdnet) | UDP and TCP sockets |
 | [`std/process`](#stdprocess) | Run and manage external processes |
+| [`std/stream`](#stdstream) | Lazy, fallible byte/value streams over OS resources |
 | [`std/tty`](#stdtty) | Raw terminal mode and key reads |
 | [`std/signal`](#stdsignal) | Blocking wait for OS signals |
 | [`std/async`](#stdasync) | Async, concurrency and workers |
@@ -316,6 +317,24 @@ This document specifies the standard library for the Lin language. All modules a
 | [`readStdout`](#readStdout) | `(ProcessHandle, UInt8[]) -> Int32 \| Error` | Read piped stdout into a buffer (0 = EOF) |
 | [`kill`](#kill) | `(ProcessHandle) -> Null \| Error` | Send SIGTERM to a spawned process |
 | [`wait`](#wait) | `(ProcessHandle) -> Int32 \| Error` | Wait for a spawned process; returns exit code |
+
+**std/stream**
+
+| Function | Signature | Summary |
+| --- | --- | --- |
+| [`readStream`](#readStream) | `(String) -> Stream<UInt8[]>` | Open a file as a lazy byte stream |
+| [`lines`](#lines-stream) | `(Stream<UInt8[]>) -> Stream<String>` | View a byte stream as a stream of lines |
+| [`chunks`](#chunks) | `(Stream<UInt8[]>, Int32) -> Stream<UInt8[]>` | Re-chunk a byte stream to fixed-size windows |
+| [`map`](#map-stream) | `<T,U>(Stream<T>, (T) -> U) -> Stream<U>` | Lazily transform each item |
+| [`filter`](#filter-stream) | `<T>(Stream<T>, (T) -> Boolean) -> Stream<T>` | Lazily keep items matching a predicate |
+| [`take`](#take-stream) | `<T>(Stream<T>, Int32) -> Stream<T>` | Take the first n items then end |
+| [`readText`](#readText) | `(Stream<UInt8[]>) -> String \| Error` | Drain a byte stream to one String |
+| [`collect`](#collect) | `(Stream<UInt8[]>) -> UInt8[] \| Error` | Drain a byte stream to one byte buffer |
+| [`writeStream`](#writeStream) | `<T>(Stream<T>, String) -> Stream<T>` | Build a sink that writes upstream items to a file |
+| [`drain`](#drain) | `<T>(Stream<T>) -> Null \| Error` | Run a pipeline on the calling thread |
+| [`promise`](#promise-stream) | `<T>(Stream<T>) -> Json` | Move a pipeline to a worker thread; `Promise<Null \| Error>` |
+| [`for`](#for-stream) | `<T>(Stream<T>, (T) -> Null) -> Null \| Error` | Consume each item (EOF -> Null, read error -> Error) |
+| [`close`](#close-stream) | `(Stream<T>) -> Null` | Close the underlying fd; idempotent |
 
 **std/template**
 
@@ -3484,6 +3503,214 @@ print("read ${n} bytes, first = ${buf[0]}")   // read 5 bytes, first = 104 ('h')
 val code = wait(h)                  // 0
 print("exited ${code}")
 ```
+
+---
+
+## std/stream
+
+Lazy, fallible streams over OS resources — files, sockets, subprocess stdout, and stdin (spec §27.9). A `Stream<T>` is an opaque runtime value built as a **lazy pull graph**: a source node, zero or more adapters (`lines`/`chunks`/`map`/`filter`/`take`), and a terminal operation that drives the graph one item at a time with bounded memory. Errors are threaded **in-band** — the first read error poisons the upstream and short-circuits to the terminal op, so error handling lives only at the terminal, not at every adapter.
+
+A `Stream<T>` is an **affine resource** (ADR-073): it may be consumed at most once (using it again after a terminal op or after `.promise()` moves it to a worker is a compile-time error), but dropping an unused stream is fine — the runtime closes the fd via an RC-drop finalizer. In v1 a stream may live only in a `val`, a function parameter, or a return value; storing one in an object/array field or a `var` is a compile-time error.
+
+Import:
+
+```txt
+import { readStream, lines, map, filter, writeStream, drain } from "std/stream"
+```
+
+Byte sources also come from other modules — `tcpStream` (`std/net`), `stdoutStream` (`std/process`), and `stdinStream` (`std/io`) all return `Stream<UInt8[]>` (spec §27.9.2) and feed the same adapters and terminals documented here.
+
+### Types
+
+```txt
+Stream<T>   // opaque; covariant in T; not JSON, not subscriptable
+```
+
+---
+
+### readStream
+
+```txt
+val readStream: (path: String) -> Stream<UInt8[]>
+```
+
+Opens the file at `path` as a lazy byte stream. No bytes are read until a terminal operation drives the stream. A failure to open, or a read failure during traversal, surfaces in-band as an `Error` at the terminal op (the source-kind ending rule of spec §27.9.4).
+
+```txt
+val text = readStream("notes.txt").readText()
+match text
+  is Error => print("read failed: ${text["message"]}")
+  else     => print(text)
+```
+
+---
+
+### lines (stream) {#lines-stream}
+
+```txt
+val lines: (Stream<UInt8[]>) -> Stream<String>
+```
+
+Lazily views a byte stream as a stream of lines (splitting on newlines, decoding UTF-8 per line). An adapter — it reads nothing until driven.
+
+```txt
+readStream("access.log").lines().for(line => print(line))
+```
+
+---
+
+### chunks
+
+```txt
+val chunks: (Stream<UInt8[]>, n: Int32) -> Stream<UInt8[]>
+```
+
+Re-chunks a byte stream into fixed-size `n`-byte windows (the final window may be shorter). Useful for fixed-record binary formats.
+
+```txt
+readStream("frames.bin").chunks(188).for(frame => process(frame))
+```
+
+---
+
+### map (stream) {#map-stream}
+
+```txt
+val map: <T, U>(Stream<T>, f: (T) -> U) -> Stream<U>
+```
+
+Lazily transforms each item with `f`. The callback uses the same dot-application and lambda forms as the array combinators (spec §18.5); it runs once per item as the item is pulled.
+
+```txt
+readStream("in.csv").lines().map(line => line.toUpper())
+```
+
+---
+
+### filter (stream) {#filter-stream}
+
+```txt
+val filter: <T>(Stream<T>, p: (T) -> Boolean) -> Stream<T>
+```
+
+Lazily keeps only items for which `p` returns `true`.
+
+```txt
+readStream("app.log").lines().filter(line => line.contains("ERROR"))
+```
+
+---
+
+### take (stream) {#take-stream}
+
+```txt
+val take: <T>(Stream<T>, n: Int32) -> Stream<T>
+```
+
+Yields the first `n` items then ends the stream normally. Driving stops pulling upstream once `n` items have passed.
+
+```txt
+readStream("huge.log").lines().take(100).for(line => print(line))
+```
+
+---
+
+### readText
+
+```txt
+val readText: (Stream<UInt8[]>) -> String | Error
+```
+
+Terminal. Drives a byte stream to completion and returns its full contents as one `String`, or an `Error` if a read fails. Synchronous (calling thread).
+
+---
+
+### collect
+
+```txt
+val collect: (Stream<UInt8[]>) -> UInt8[] | Error
+```
+
+Terminal. Drives a byte stream to completion and returns its full contents as one `UInt8[]` buffer, or an `Error` if a read fails. Synchronous (calling thread).
+
+---
+
+### writeStream
+
+```txt
+val writeStream: <T>(Stream<T>, path: String) -> Stream<T>
+```
+
+Builds a **sink** node that writes each upstream item to the file at `path`. It returns a `Stream` whose terminal op (`drain`/`promise`) runs the whole pipeline — pulling one item at a time and writing it — so memory stays bounded regardless of input size. Building the sink does not write anything; a terminal op must drive it.
+
+```txt
+readStream("in.csv").lines().map(transform).writeStream("out.csv").drain()
+```
+
+---
+
+### drain
+
+```txt
+val drain: <T>(Stream<T>) -> Null | Error
+```
+
+Terminal. Drives the pipeline on the **calling thread** and returns `Null` on normal completion (EOF) or `Error` if a read or write fails. This is the synchronous driver — no worker thread, no new runtime machinery.
+
+```txt
+val outcome = readStream("in.csv").lines().writeStream("out.csv").drain()
+match outcome
+  is Error => print("copy failed: ${outcome["message"]}")
+  else     => print("done")
+```
+
+---
+
+### promise (stream) {#promise-stream}
+
+```txt
+val promise: <T>(Stream<T>) -> Json    // Promise<Null | Error>
+```
+
+Terminal. **Moves** the whole pipeline onto a **worker OS thread** (ADR-073) and immediately returns a promise. This gives real concurrency plus fault isolation: a runtime fault while the worker drives the stream is caught at the thread boundary and surfaces as an `Error` when the promise is awaited (spec §24.2.2). Because the pipeline is moved (not copied) and the worker becomes its sole owner, non-atomic refcounting stays sound and the worker's RC-drop finalizer closes the fd.
+
+The promise type is conceptually `Promise<Null | Error>`; like all promise handles it is erased to `Json` in annotations (spec §24.1). `await` reattaches the `Null | Error` union, so the `Error` case must be handled (ADR-070).
+
+```txt
+val p = readStream("big.log").lines().filter(isError).writeStream("errors.log").promise()
+match await(p)
+  is Error => print("pipeline failed")
+  else     => print("done")
+```
+
+---
+
+### for (stream) {#for-stream}
+
+```txt
+val for: <T>(Stream<T>, (T) -> Null) -> Null | Error
+```
+
+Terminal. Consumes the stream item by item via dot application — `s.for(fn)` (Lin has no `for…in`; iteration is always `.for(fn)`, spec §18). Unlike `for` over an array or iterator (which returns `Null`, spec §18.1), a stream `for` returns **`Null | Error`**: **EOF ends the loop normally** (the expression is `Null`) and **a read `Error` mid-traversal becomes the expression's value**.
+
+```txt
+val outcome = readStream("in.log").lines().for(line =>
+  print(line)
+)
+match outcome
+  is Error => print("read failed: ${outcome["message"]}")
+  else     => null
+```
+
+---
+
+### close (stream) {#close-stream}
+
+```txt
+val close: (Stream<T>) -> Null
+```
+
+Closes the underlying fd eagerly. **Idempotent** — closing an already-closed (or already-drained) stream is a no-op. Optional: the RC-drop finalizer closes the fd automatically when the last reference goes away (spec §27.9.5); `close` is for callers who want deterministic timing rather than scope-end cleanup.
 
 ---
 
