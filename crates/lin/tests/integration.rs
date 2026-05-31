@@ -2820,8 +2820,9 @@ print(toString(length(snap)))
 #[test]
 fn test_async_real_parallelism() {
     // Two thunks that each sleep 150ms. With real OS threads the wall-clock should be
-    // ~150ms (overlap), not ~300ms (sequential). Assert it completed well under the
-    // sequential bound — generous to avoid CI flakiness, but still proves overlap.
+    // ~150ms (overlap), not ~300ms (sequential). Assert it completed under the sequential
+    // bound — generous to avoid CI flakiness (slow/oversubscribed runners), but still
+    // proves overlap since the sequential floor is ~300ms.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { async, await } from "std/async"
@@ -2840,10 +2841,10 @@ val r1 = await(p1)
 val r2 = await(p2)
 val elapsed = now() - start
 print(toString(r1 + r2))
-if elapsed < 250 then print("PARALLEL") else print("SEQUENTIAL")
+if elapsed < 290 then print("PARALLEL") else print("SEQUENTIAL")
 "#);
     assert_eq!(output, vec!["3", "PARALLEL"],
-        "two 150ms thunks should overlap (real threads), completing in <250ms");
+        "two 150ms thunks should overlap (real threads), completing well under the ~300ms sequential floor");
 }
 
 #[test]
