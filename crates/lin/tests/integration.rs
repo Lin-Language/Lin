@@ -3884,6 +3884,74 @@ fn fmt(source: &str) -> String {
     lin_parse::Formatter::with_comments(source, comments).format_module(&module)
 }
 
+// ── Formatter must never change program meaning ───────────────────────────────
+// The formatter rebuilds source from the AST, which discards parentheses and the
+// generic `<T>` list. If it doesn't re-emit them correctly the formatted code can
+// silently MISCOMPILE (wrong operator precedence) or fail to compile (lost generics).
+// These guard the specific defects found when first sweeping the stdlib, plus a
+// general "format then run produces identical output" equivalence check.
+
+#[test]
+fn test_fmt_preserves_grouping_parens() {
+    // `(a + b) / c` must keep its parens — `/` binds tighter than `+`, so dropping
+    // them changes the value. Left-assoc redundant parens are dropped; right-side and
+    // looser-child parens are kept.
+    assert_eq!(fmt("val x = (1 + 2) / 3\n").trim(), "val x = (1 + 2) / 3");
+    assert_eq!(fmt("val x = (1 + 2 - 1) / 4\n").trim(), "val x = (1 + 2 - 1) / 4");
+    assert_eq!(fmt("val x = a - (b - c)\n").trim(), "val x = a - (b - c)");
+    assert_eq!(fmt("val x = (a - b) - c\n").trim(), "val x = a - b - c");
+    assert_eq!(fmt("val x = (a || b) && c\n").trim(), "val x = (a || b) && c");
+    // And it must actually still evaluate correctly end-to-end.
+    let out = run("import { print } from \"std/io\"\nimport { toString } from \"std/string\"\nval r = (1 + 2) / 3\nprint(toString(r))\n");
+    assert_eq!(out, vec!["1"], "( 1 + 2 ) / 3 should be 1, not 1 + (2/3) = 1");
+}
+
+#[test]
+fn test_fmt_preserves_postfix_base_parens() {
+    // A binary-op (or other non-primary) used as a postfix base must stay parenthesised:
+    // postfix `.`/`[]`/`()` bind tighter than binary operators.
+    assert_eq!(fmt("val a = (x + y).foo()\n").trim(), "val a = (x + y).foo()");
+    assert_eq!(fmt("val b = (x + y)[0]\n").trim(), "val b = (x + y)[0]");
+    assert_eq!(fmt("val c = (f + g)(3)\n").trim(), "val c = (f + g)(3)");
+    // Atomic / chain bases keep NO parens.
+    assert_eq!(fmt("val d = arr.map(x => x).length()\n").trim(), "val d = arr.map(x => x).length()");
+}
+
+#[test]
+fn test_fmt_preserves_generic_type_params() {
+    // The `<T, U>` list is not in the surface text the parser keeps as tokens — the
+    // formatter must re-emit it from `Expr::Function::type_params` or the body's T/U
+    // become "Unknown type". This is exactly what broke stdlib `map`/`filter`/`reduce`.
+    assert_eq!(
+        fmt("val map = <T, U>(arr: T[], f: (T) => U): U[] => lin_map(arr, f)\n").trim(),
+        "val map = <T, U>(arr: T[], f: (T) => U): U[] => lin_map(arr, f)"
+    );
+    assert_eq!(
+        fmt("val id = <T>(x: T): T => x\n").trim(),
+        "val id = <T>(x: T): T => x"
+    );
+}
+
+#[test]
+fn test_fmt_run_equivalence() {
+    // The strongest guard: formatting must not change runtime behaviour. Compile+run a
+    // program with precedence-sensitive arithmetic and a generic call both before and
+    // after formatting; the output must be identical.
+    let source = "import { print } from \"std/io\"\n\
+import { toString } from \"std/string\"\n\
+import { map, reduce } from \"std/array\"\n\
+import { range } from \"std/array\"\n\
+val poly = (n: Int32): Int32 => (n + 1) * (n - 1) / 2\n\
+val doubled = <T>(xs: T[], f: (T) => T): T[] => xs.map(f)\n\
+val xs = range(1, 5).map(i => poly(i))\n\
+val total = xs.reduce(0, (a, x) => a + x)\n\
+print(toString(total))\n";
+    let formatted = fmt(source);
+    let before = run(source);
+    let after = run(&formatted);
+    assert_eq!(before, after, "formatting changed program output\nformatted:\n{}", formatted);
+}
+
 #[test]
 fn test_fmt_idempotent() {
     // Source with varied constructs: if/match/function/objects/arrays/imports/types.
@@ -4039,6 +4107,11 @@ fn test_fmt_corpus_idempotent_and_comments_preserved() {
 
     let mut non_idempotent: Vec<String> = Vec::new();
     let mut comment_changed: Vec<String> = Vec::new();
+    // Formatted output that no longer type-checks — the miscompile guard. Re-emitting the
+    // AST drops parentheses and the generic `<T>` list; if the formatter doesn't restore
+    // them the formatted file fails `lin check` (e.g. "Unknown type 'T'"). Idempotency
+    // alone does NOT catch this — broken-but-stable output passes the checks above.
+    let mut check_failed: Vec<String> = Vec::new();
 
     for path in &files {
         let src = std::fs::read_to_string(path).unwrap();
@@ -4052,6 +4125,15 @@ fn test_fmt_corpus_idempotent_and_comments_preserved() {
         if before != after {
             comment_changed.push(format!("{} ({} -> {})", path.display(), before, after));
         }
+        // Type-check the formatted text standalone. Only for SELF-CONTAINED files (no
+        // relative/sibling imports) — a temp file in the workspace root resolves `std/...`
+        // and `foreign` imports against the embedded stdlib, but not `./sibling` modules,
+        // which would spuriously fail to resolve. All stdlib/*.lin are self-contained, so
+        // the generics-critical code (map/filter/reduce/<T>) is fully covered; sibling-
+        // importing example files rely on idempotency + the targeted run-equivalence test.
+        if is_self_contained(&src) && lin_check_ok(path) && !lin_check_ok_source(&pass1) {
+            check_failed.push(path.display().to_string());
+        }
     }
 
     assert!(
@@ -4064,6 +4146,51 @@ fn test_fmt_corpus_idempotent_and_comments_preserved() {
         "comment count changed when formatting corpus files: {:?}",
         comment_changed
     );
+    assert!(
+        check_failed.is_empty(),
+        "formatted output no longer type-checks (miscompile!) for: {:?}",
+        check_failed
+    );
+}
+
+/// True if the source has no relative/sibling import (only `std/...` or `foreign`), so it
+/// can be type-checked as a standalone temp file in the workspace root.
+fn is_self_contained(source: &str) -> bool {
+    !source.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("import") && (t.contains("\"./") || t.contains("\"../"))
+    })
+}
+
+/// `lin check <path>` succeeds.
+fn lin_check_ok(path: &std::path::Path) -> bool {
+    Command::new(lin_bin())
+        .args(["check", path.to_str().unwrap()])
+        .current_dir(workspace_root())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// `lin check` succeeds on a source string (written to a temp file alongside the source
+/// dir so relative imports still resolve). Used to check formatted output in place.
+fn lin_check_ok_source(source: &str) -> bool {
+    // Write into the workspace root so `std/...` imports resolve via the embedded stdlib;
+    // corpus files use only std imports or sibling modules, and a root temp file can't see
+    // siblings — so multi-module files are checked via the real path in lin_check_ok and
+    // this single-file check focuses on the formatted-text validity of self-contained files.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let p = ws.join(format!("target/fmt_check_{}.lin", id));
+    std::fs::write(&p, source).unwrap();
+    let ok = Command::new(lin_bin())
+        .args(["check", p.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&p);
+    ok
 }
 
 #[test]

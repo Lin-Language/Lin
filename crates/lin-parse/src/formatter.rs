@@ -418,6 +418,76 @@ fn unaryop_symbol(op: &UnaryOp) -> &'static str {
     }
 }
 
+/// Binding precedence of a binary operator, matching the parser's ladder
+/// (`parser/expr.rs`): larger = binds tighter. Used to decide when a `BinaryOp`
+/// operand must be parenthesised to preserve the parsed grouping. ALL binary
+/// operators are left-associative.
+fn binop_prec(op: &BinOp) -> u8 {
+    match op {
+        BinOp::Or => 1,
+        BinOp::And => 2,
+        BinOp::BOr => 3,
+        BinOp::BXor => 4,
+        BinOp::BAnd => 5,
+        BinOp::Eq | BinOp::NotEq => 6,
+        BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq => 7,
+        BinOp::Shl | BinOp::Shr => 8,
+        BinOp::Add | BinOp::Sub => 9,
+        BinOp::Mul | BinOp::Div | BinOp::Mod => 10,
+    }
+}
+
+/// True if `base`, when used as the receiver/object/function of a postfix operator
+/// (`.method`, `[index]`, `(args)`), must be parenthesised to preserve the parse.
+/// Postfix binds tighter than every binary/unary operator and than `is`/`has`, and a
+/// bare function literal / if / match / block as a postfix base would also misparse,
+/// so all of these need wrapping. Atomic primaries (literals, idents, an already
+/// parenthesised-by-construction Array/Object, and nested postfix chains) do not.
+fn needs_postfix_parens(base: &Expr) -> bool {
+    matches!(
+        base,
+        Expr::BinaryOp { .. }
+            | Expr::UnaryOp { .. }
+            | Expr::If { .. }
+            | Expr::Match { .. }
+            | Expr::Function { .. }
+            | Expr::Is { .. }
+            | Expr::Has { .. }
+            | Expr::Assign { .. }
+            | Expr::IndexAssign { .. }
+            | Expr::Block(..)
+    )
+}
+
+/// Render a postfix operator's base (`render` produces its own text), parenthesising
+/// when `needs_postfix_parens` says the parse would otherwise change.
+fn fmt_postfix_base(base: &Expr, render: impl Fn(&Expr) -> String) -> String {
+    let s = render(base);
+    if needs_postfix_parens(base) {
+        format!("({})", s)
+    } else {
+        s
+    }
+}
+
+/// Format a `BinaryOp` operand, wrapping it in parentheses when the parsed
+/// grouping would otherwise be lost. `parent` is the enclosing operator; `is_right`
+/// marks the right operand (which needs parens at EQUAL precedence too, because the
+/// operators are left-associative — `a - (b - c)` must keep its parens, `(a - b) - c`
+/// must not). A child binding strictly looser than the parent always needs parens.
+/// The rendering closure `render` produces the operand's own (paren-free) text.
+fn fmt_binop_operand(operand: &Expr, parent: &BinOp, is_right: bool, render: impl Fn(&Expr) -> String) -> String {
+    let s = render(operand);
+    if let Expr::BinaryOp { op: child_op, .. } = operand {
+        let (cp, pp) = (binop_prec(child_op), binop_prec(parent));
+        let needs = cp < pp || (cp == pp && is_right);
+        if needs {
+            return format!("({})", s);
+        }
+    }
+    s
+}
+
 fn format_float(f: f64) -> String {
     let s = format!("{}", f);
     if s.contains('.') || s.contains('e') || s.contains('E') {
@@ -624,18 +694,23 @@ fn fmt_inline(expr: &Expr) -> String {
         Expr::Ident(name, _) => name.clone(),
         Expr::StringInterp(parts, _) => fmt_interp(parts),
         Expr::BinaryOp { left, op, right, .. } => {
-            format!("{} {} {}", fmt_inline(left), binop_symbol(op), fmt_inline(right))
+            format!(
+                "{} {} {}",
+                fmt_binop_operand(left, op, false, fmt_inline),
+                binop_symbol(op),
+                fmt_binop_operand(right, op, true, fmt_inline)
+            )
         }
         Expr::UnaryOp { op, operand, .. } => {
             format!("{}{}", unaryop_symbol(op), fmt_inline(operand))
         }
         Expr::Call { func, args, .. } => {
-            let fs = fmt_inline(func);
+            let fs = fmt_postfix_base(func, fmt_inline);
             let as_: Vec<String> = args.iter().map(fmt_inline).collect();
             format!("{}({})", fs, as_.join(", "))
         }
         Expr::DotCall { receiver, method, args, .. } => {
-            let r = fmt_inline(receiver);
+            let r = fmt_postfix_base(receiver, fmt_inline);
             match args {
                 None => format!("{}.{}", r, method),
                 Some(a) => {
@@ -645,7 +720,7 @@ fn fmt_inline(expr: &Expr) -> String {
             }
         }
         Expr::Index { object, key, .. } => {
-            format!("{}[{}]", fmt_inline(object), fmt_inline(key))
+            format!("{}[{}]", fmt_postfix_base(object, fmt_inline), fmt_inline(key))
         }
         Expr::Array(items, _) => {
             let ss: Vec<String> = items.iter().map(fmt_inline).collect();
@@ -683,7 +758,7 @@ fn fmt_inline(expr: &Expr) -> String {
                 fmt_inline(else_branch)
             )
         }
-        Expr::Function { params, return_type, body, .. } => {
+        Expr::Function { type_params, params, return_type, body, .. } => {
             let ps: Vec<String> = params
                 .iter()
                 .map(|p| {
@@ -699,13 +774,16 @@ fn fmt_inline(expr: &Expr) -> String {
                 .as_ref()
                 .map(|t| format!(": {}", fmt_type(t)))
                 .unwrap_or_default();
+            let generics = fmt_type_params(type_params);
             let body = fmt_inline(body);
-            if params.len() == 1 && params[0].type_ann.is_none() {
+            // The bare single-param shorthand can't carry a `<T>` list — a generic
+            // function always uses the parenthesised form.
+            if type_params.is_empty() && params.len() == 1 && params[0].type_ann.is_none() {
                 if let Pattern::Ident(name, _) = &params[0].pattern {
                     return format!("{}{} => {}", name, ret, body);
                 }
             }
-            format!("({}){} => {}", ps.join(", "), ret, body)
+            format!("{}({}){} => {}", generics, ps.join(", "), ret, body)
         }
         Expr::Block(stmts, tail, _) => {
             // In Lin, there's no semicolon separator. An inline block with stmts
@@ -825,11 +903,12 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         Expr::StringInterp(parts, _) => fmt_interp(parts),
 
         Expr::BinaryOp { left, op, right, .. } => {
+            let render = |e: &Expr| fmt_expr(e, false, ind);
             format!(
                 "{} {} {}",
-                fmt_expr(left, false, ind),
+                fmt_binop_operand(left, op, false, render),
                 binop_symbol(op),
-                fmt_expr(right, false, ind)
+                fmt_binop_operand(right, op, true, render)
             )
         }
         Expr::UnaryOp { op, operand, .. } => {
@@ -847,7 +926,8 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
             )
         }
         Expr::Index { object, key, .. } => {
-            format!("{}[{}]", fmt_expr(object, false, ind), fmt_expr(key, false, ind))
+            let base = fmt_postfix_base(object, |e| fmt_expr(e, false, ind));
+            format!("{}[{}]", base, fmt_expr(key, false, ind))
         }
         Expr::Is { expr, pattern, .. } => {
             format!("{} is {}", fmt_expr(expr, false, ind), fmt_pattern(pattern))
@@ -862,7 +942,7 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
 
         // ── Call ──────────────────────────────────────────────────────────────
         Expr::Call { func, args, .. } => {
-            let fs = fmt_expr(func, false, ind);
+            let fs = fmt_postfix_base(func, |e| fmt_expr(e, false, ind));
             let as_: Vec<String> = args.iter().map(|a| fmt_expr(a, false, ind)).collect();
             format!("{}({})", fs, as_.join(", "))
         }
@@ -921,8 +1001,8 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         }
 
         // ── Function ──────────────────────────────────────────────────────────
-        Expr::Function { params, return_type, body, .. } => {
-            fmt_function(params, return_type.as_ref(), body, ind)
+        Expr::Function { type_params, params, return_type, body, .. } => {
+            fmt_function(type_params, params, return_type.as_ref(), body, ind)
         }
 
         // ── If ────────────────────────────────────────────────────────────────
@@ -1043,7 +1123,18 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
 /// Format a function expression.
 /// `ind` is the indentation of the function expression itself.
 /// The body is indented at `ind + "  "`.
+/// Render a function's generic type-parameter list, e.g. `<T, U>`. Empty for a
+/// non-generic function (no angle brackets emitted).
+fn fmt_type_params(type_params: &[String]) -> String {
+    if type_params.is_empty() {
+        String::new()
+    } else {
+        format!("<{}>", type_params.join(", "))
+    }
+}
+
 fn fmt_function(
+    type_params: &[String],
     params: &[Param],
     return_type: Option<&TypeExpr>,
     body: &Expr,
@@ -1066,8 +1157,11 @@ fn fmt_function(
         .as_ref()
         .map(|t| format!(": {}", fmt_type(t)))
         .unwrap_or_default();
+    let generics = fmt_type_params(type_params);
 
-    let bare = if params.len() == 1 && params[0].type_ann.is_none() {
+    // A generic function (`<T>(…)`) always needs the parenthesised param list — the
+    // bare single-param lambda shorthand (`x => …`) cannot carry a type-param list.
+    let bare = if type_params.is_empty() && params.len() == 1 && params[0].type_ann.is_none() {
         if let Pattern::Ident(name, _) = &params[0].pattern {
             Some(name.clone())
         } else {
@@ -1078,7 +1172,7 @@ fn fmt_function(
     };
     let param_part = match bare {
         Some(name) => format!("{}{}", name, ret),
-        None => format!("({}){}", ps.join(", "), ret),
+        None => format!("{}({}){}", generics, ps.join(", "), ret),
     };
 
     // Leading comments attached to a single-expression body (Block bodies carry their own
@@ -1329,7 +1423,7 @@ fn fmt_chain(expr: &Expr, ind: &str) -> String {
     }
 
     // Multi-line.
-    let root_str = fmt_expr(root, false, ind);
+    let root_str = fmt_postfix_base(root, |e| fmt_expr(e, false, ind));
     let call_strs: Vec<String> = chain
         .iter()
         .map(|(method, args)| match args {
