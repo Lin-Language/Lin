@@ -10,6 +10,8 @@
   { "title": "Modules & Imports", "path": "/tutorials/07-modules", "section": "Tutorials" },
   { "title": "Error Handling", "path": "/tutorials/08-error-handling", "section": "Tutorials" },
   { "title": "Concurrency", "path": "/tutorials/09-concurrency", "section": "Tutorials" },
+  { "title": "Generics", "path": "/tutorials/10-generics", "section": "Tutorials" },
+  { "title": "HTTP & Web", "path": "/tutorials/11-http", "section": "Tutorials" },
   { "title": "Types", "path": "/reference/types", "section": "Reference" },
   { "title": "Expressions", "path": "/reference/expressions", "section": "Reference" },
   { "title": "Functions", "path": "/reference/functions", "section": "Reference" },
