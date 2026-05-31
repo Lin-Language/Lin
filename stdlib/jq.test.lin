@@ -1,0 +1,77 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { jq, jqFirst } from "std/jq"
+import { length } from "std/array"
+
+val data = {
+  "name": "acme",
+  "users": [
+    { "name": "Ada", "age": 36 },
+    { "name": "Bob", "age": 30 },
+    { "name": "Cleo", "age": 41 }
+  ]
+}
+
+val s = suite("std/jq", [
+  test("field access .foo", () =>
+    val r = jq(data, ".name")
+    [
+      expect(length(r)).toBe(1),
+      expect(r[0]).toBe("acme")
+    ]
+  ),
+
+  test("iterate and project .users[] | .name", () =>
+    val r = jq(data, ".users[] | .name")
+    [
+      expect(length(r)).toBe(3),
+      expect(r[0]).toBe("Ada"),
+      expect(r[1]).toBe("Bob"),
+      expect(r[2]).toBe("Cleo")
+    ]
+  ),
+
+  test("map and reduce .users | map(.age) | add", () =>
+    val r = jq(data, ".users | map(.age) | add")
+    [
+      expect(r[0]).toBe(107)
+    ]
+  ),
+
+  test("select filters elements", () =>
+    val r = jq(data, ".users[] | select(.age > 35) | .name")
+    [
+      expect(length(r)).toBe(2),
+      expect(r[0]).toBe("Ada"),
+      expect(r[1]).toBe("Cleo")
+    ]
+  ),
+
+  test("invalid filter syntax returns an Error", () =>
+    val r = jq(data, ".[")
+    [
+      expect(r is Error).toBe(true),
+      expect(r["type"]).toBe("error")
+    ]
+  ),
+
+  test("jqFirst returns the first output value", () =>
+    [
+      expect(jqFirst(data, ".users[] | .name")).toBe("Ada")
+    ]
+  ),
+
+  test("jqFirst returns null on an empty stream", () =>
+    [
+      expect(jqFirst(data, ".users[] | select(false)")).toBe(null)
+    ]
+  ),
+
+  test("jqFirst propagates errors", () =>
+    val r = jqFirst(data, ".[")
+    [
+      expect(r is Error).toBe(true)
+    ]
+  ),
+])
+
+run(s)
