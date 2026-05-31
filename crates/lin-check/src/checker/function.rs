@@ -416,10 +416,24 @@ impl Checker {
                 )));
             }
             declared
+        } else if matches!(expected_ret, Type::TypeVar(id)
+            if *id >= 9001 && *id != u32::MAX)
+            && !matches!(body_ty, Type::TypeVar(_))
+        {
+            // Expected return is a QUANTIFIED GENERIC type parameter (`<U>`, id ≥ 9001) and the
+            // body has a concrete type: surface the concrete `body_ty` as the lambda's return.
+            // This is what lets a higher-order generic call (`mymap(arr, x => x*2)` where
+            // `mymap`'s `f: (T) => U`) bind `U` from the lambda body — the call site's
+            // `collect_and_save_subs` reads the lambda's concrete return and the result type
+            // `U[]` becomes `Int32[]`, so monomorphization can specialize. Forcing the bare
+            // generic TypeVar here (as the polymorphic-slot case below does) would leave `U`
+            // uninferrable and the call would fall back to a boxed copy.
+            body_ty
         } else if matches!(expected_ret, Type::TypeVar(_)) {
-            // Expected return is a TypeVar (e.g. worker reply, promise result).
-            // Use TypeVar so codegen boxes the concrete result — ensures a consistent tagged
-            // calling convention when the closure is called through a polymorphic slot.
+            // Expected return is a TypeVar (e.g. worker reply, promise result, or a Json/`Function`
+            // polymorphic slot). Use TypeVar so codegen boxes the concrete result — ensures a
+            // consistent tagged calling convention when the closure is called through a
+            // polymorphic slot.
             expected_ret.clone()
         } else {
             body_ty

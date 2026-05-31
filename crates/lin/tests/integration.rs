@@ -6282,3 +6282,117 @@ print(toString(id(true)))
         "expected a budget-overflow warning, got stderr:\n{}", stderr);
     assert_eq!(out, vec!["1", "two", "true"]);
 }
+
+// ---------------------------------------------------------------------------
+// Phase 4: cross-module generic instantiation (a generic defined in an IMPORTED
+// module is specialized in the importing module — see lin-ir monomorphize
+// `monomorphize_with_imports` + cross-module body re-homing).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_generic_cross_module_identity() {
+    // Step A: a generic `id` defined in an imported user module is monomorphized at the call site
+    // in the importer. T=Int32 and T=String both run natively from the same imported definition.
+    let dir = std::env::temp_dir().join(format!("lin_xgen_id_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("helpers.lin"),
+        "export val id = <T>(x: T): T => x\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ id }} from "{}/helpers"
+print(toString(id(5)))
+print(id("hi"))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["5", "hi"]);
+}
+
+#[test]
+fn test_generic_cross_module_identity_is_native_in_ir() {
+    // IR proof for Step A: the imported generic specializes to a NATIVE i32 function `id$Int32`
+    // in the importer, called with an unboxed i32 (no lin_box_int32 around the argument).
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let dir = ws.join(format!("target/lin_xgen_ir_{}", id));
+    let _ = fs::create_dir_all(&dir);
+    fs::write(dir.join("helpers.lin"), "export val id = <T>(x: T): T => x\n").unwrap();
+    let src_path = dir.join("main.lin");
+    let bin_path = dir.join("main");
+    let ll_path = bin_path.with_extension("ll");
+    fs::write(&src_path, format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ id }} from "{}/helpers"
+print(toString(id(5)))
+print(id("hi"))
+"#, dir.to_str().unwrap())).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_EMIT_IR", "1")
+        .env("LIN_NO_OPT", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+    let ll = fs::read_to_string(&ll_path).expect("LLVM IR not emitted");
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(ll.contains("define i32 @\"id$Int32\"(i32"),
+        "expected a native i32 cross-module specialization, IR:\n{}", ll);
+    assert!(ll.contains("call i32 @\"id$Int32\"(i32 5)"),
+        "expected a native-i32 call to the cross-module Int32 specialization, IR:\n{}", ll);
+}
+
+#[test]
+fn test_generic_cross_module_higher_order_map() {
+    // Step B: a higher-order generic `mymap` defined in an imported module — with a Function-typed
+    // param and a `for`/`push` loop body — specializes at Int32 in the importer and runs correctly.
+    // Exercises cross-module re-homing of the body's sibling/intrinsic references AND the checker
+    // change that lets the lambda body bind the generic return type `U`.
+    let dir = std::env::temp_dir().join(format!("lin_xgen_map_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("helpers.lin"),
+        "import { for, push } from \"std/array\"\n\
+         export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
+           val result = []\n  \
+           arr.for(item => push(result, f(item)))\n  \
+           result\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ reduce }} from "std/array"
+import {{ mymap }} from "{}/helpers"
+val doubled = mymap([1, 2, 3], x => x * 2)
+print(toString(doubled.reduce(0, (acc, x) => acc + x)))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["12"]);
+}
+
+#[test]
+fn test_generic_cross_module_two_instantiations() {
+    // Cache/specialization correctness: the SAME imported generic instantiated at two different
+    // element types from one importer mints two distinct specializations, each correct.
+    let dir = std::env::temp_dir().join(format!("lin_xgen_two_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("helpers.lin"),
+        "import { for, push } from \"std/array\"\n\
+         export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
+           val result = []\n  \
+           arr.for(item => push(result, f(item)))\n  \
+           result\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ reduce, length }} from "std/array"
+import {{ mymap }} from "{}/helpers"
+val ints = mymap([1, 2, 3], x => x * 10)
+val strs = mymap(["a", "b"], s => s)
+print(toString(ints.reduce(0, (acc, x) => acc + x)))
+print(toString(length(strs)))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["60", "2"]);
+}
