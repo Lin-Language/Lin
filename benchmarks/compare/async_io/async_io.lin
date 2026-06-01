@@ -1,0 +1,33 @@
+// async_io.lin — I/O-bound concurrency with bounded parallelism.
+//
+// 200 tasks each sleep 50ms then return i*2+1; a thread pool of 50 bounds the
+// concurrency (NOT bare `parallel`, which would spawn 200 threads and finish in
+// one sleep). Wall-clock should be ~ceil(200/50)*50 = ~200ms. The thunks return
+// a plain Int32 (JSON-transferable) and capture only the loop value `i`. Prints
+// exactly one stdout line "RESULT=<int>".
+//
+// Parameters (identical across all languages): TASKS=200 SLEEP_MS=50 CONCURRENCY=50.
+import { print } from "std/io"
+import { toString } from "std/string"
+import { threadPool, poolAsync, await } from "std/async"
+import { push, for, range } from "std/array"
+import { sleep } from "std/time"
+
+val task = (i: Int32): Int32 =>
+  sleep(50i64)
+  i * 2 + 1
+
+// await yields T | Error (§24.2.2); recover a faulted task as 0 before summing.
+val recoverInt = (result: Json): Int32 =>
+  match result
+    is Int32 => result
+    else => 0
+
+val pool = threadPool(50)
+var promises = []
+range(0, 200).for((i) => push(promises, pool.poolAsync(() => task(i))))
+
+var sum = 0
+promises.for((p) => sum = sum + recoverInt(await(p)))
+
+print("RESULT=${toString(sum)}")

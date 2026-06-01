@@ -98,7 +98,7 @@ export val runController = (host: String, port: Int32): Null =>
     udpSendTo(fd, host, port, encodePacket(left, right))
     sleep(50)
 
-  range(0, 100000).for(i => if running then tick() else null)
+  range(0, 100000).for((i) => if running then tick() else null)
 
   rawMode(false)
   print("Stopped.")

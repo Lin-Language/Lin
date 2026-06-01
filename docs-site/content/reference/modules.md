@@ -86,8 +86,8 @@ std/string    std/array     std/number    std/math
 std/object    std/io        std/fs        std/path
 std/http      std/async     std/env       std/process
 std/template  std/test      std/time      std/json
-std/bytes     std/hash      std/net       std/signal
-std/tty
+std/yaml      std/jq        std/bytes     std/hash
+std/net       std/signal    std/tty
 ```
 
 ## Generics across modules

@@ -49,7 +49,7 @@ export val applyDefaults = (cfg: Json): Json =>
   var out = {}
   sch
     .keys()
-    .for(k =>
+    .for((k) =>
       if cfg[k] != null then
         out[k] = cfg[k]
       else if sch[k]["default"] != null then
@@ -65,7 +65,7 @@ export val validate = (cfg: Json): String[] =>
   var errors = []
   sch
     .keys()
-    .for(k =>
+    .for((k) =>
       val expected = sch[k]["type"]
       val actual = cfg[k]
       if actual == null then

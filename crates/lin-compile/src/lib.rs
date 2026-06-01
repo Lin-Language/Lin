@@ -25,11 +25,19 @@ pub struct CompileOptions {
 }
 
 #[derive(Debug)]
+pub struct CheckOptions {
+    pub source_path: PathBuf,
+}
+
+#[derive(Debug)]
 pub enum CompileError {
     Io(std::io::Error),
     TypeCheck(Vec<lin_common::Diagnostic>),
     Codegen(String),
     Link(String),
+    /// A circular import was detected while resolving the module graph. Carries the
+    /// cycle as a human-readable path chain (e.g. `a -> b -> a`).
+    ImportCycle(String),
 }
 
 impl std::fmt::Display for CompileError {
@@ -44,6 +52,9 @@ impl std::fmt::Display for CompileError {
             }
             CompileError::Codegen(msg) => write!(f, "codegen error: {}", msg),
             CompileError::Link(msg) => write!(f, "link error: {}", msg),
+            CompileError::ImportCycle(chain) => {
+                write!(f, "circular import detected: {}", chain)
+            }
         }
     }
 }
@@ -54,15 +65,32 @@ impl From<std::io::Error> for CompileError {
     }
 }
 
-pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
+/// The product of the shared front-end prefix: source text through type-checked main module
+/// with all imports resolved. `compile()` continues into lowering/codegen; `check()` stops here.
+struct CheckedFrontEnd {
+    source: String,
+    module_name: String,
+    typed_module: TypedModule,
+    imported_modules: HashMap<String, TypedModule>,
+    import_order: Vec<String>,
+    import_sources: HashMap<String, (String, String)>,
+    /// Non-error diagnostics (warnings) produced while checking the main module.
+    warnings: Vec<lin_common::Diagnostic>,
+}
+
+/// Run the shared front end: read source, lex+parse, recursively resolve+type-check imports,
+/// then type-check the main module with the resolved import types. Used by both `compile()`
+/// (which proceeds to codegen) and `check()` (which stops here), so the two never diverge on
+/// how imports are resolved or how the module cache is consulted.
+fn check_front_end(source_path: &Path) -> Result<CheckedFrontEnd, CompileError> {
     // 1. Read source
-    let source = std::fs::read_to_string(&opts.source_path)?;
-    let module_name = opts.source_path
+    let source = std::fs::read_to_string(source_path)?;
+    let module_name = source_path
         .file_stem()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let base_dir = opts.source_path.parent().unwrap_or(Path::new(".")).to_path_buf();
+    let base_dir = source_path.parent().unwrap_or(Path::new(".")).to_path_buf();
 
     // 2. Lex + Parse
     let ast_module = parse_source(&source).map_err(CompileError::TypeCheck)?;
@@ -73,11 +101,61 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     let mut import_order: Vec<String> = Vec::new();
     // import_sources holds (abs_source_path, source_text) for user-defined (non-stdlib) imports only.
     let mut import_sources: HashMap<String, (String, String)> = HashMap::new();
-    pre_resolve_imports_from_ast(&ast_module, &base_dir, &mut imported_modules, &mut import_order, &mut import_sources)?;
+    pre_resolve_imports_from_ast(&ast_module, &base_dir, source_path, &mut imported_modules, &mut import_order, &mut import_sources)?;
 
     // 3b. Type check main module with pre-resolved import types.
-    let typed_module = check_module_with_imports(&ast_module, &imported_modules, false)
+    let (typed_module, warnings) = check_module_with_imports(&ast_module, &imported_modules, false)
         .map_err(CompileError::TypeCheck)?;
+
+    Ok(CheckedFrontEnd {
+        source,
+        module_name,
+        typed_module,
+        imported_modules,
+        import_order,
+        import_sources,
+        warnings,
+    })
+}
+
+/// Type-check `opts.source_path` and all of its (transitive) imports, stopping before any
+/// lowering or codegen. Returns the non-error diagnostics (warnings) on success; errors are
+/// returned via `Err(CompileError::TypeCheck(_))`. This shares the entire import-resolution
+/// front end with `compile()`, so `lin check` and `lin build` agree on what they accept.
+pub fn check(opts: &CheckOptions) -> Result<Vec<lin_common::Diagnostic>, CompileError> {
+    let front = check_front_end(&opts.source_path)?;
+
+    // Mirror `compile()`'s ADR-071 gate: `replace` is only valid in a `*.test.lin` file.
+    let is_test_file = opts.source_path.to_string_lossy().ends_with(".test.lin");
+    if !is_test_file && !front.typed_module.replacements.is_empty() {
+        let span = front.typed_module.replacements[0].span;
+        return Err(CompileError::TypeCheck(vec![lin_common::Diagnostic::error(
+            span,
+            "`replace` is only allowed in a `*.test.lin` file (it mocks an import for tests). \
+             Remove it from this program (ADR-071)."
+                .to_string(),
+        )]));
+    }
+
+    Ok(front.warnings)
+}
+
+pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
+    let CheckedFrontEnd {
+        source,
+        module_name,
+        typed_module,
+        imported_modules,
+        import_order,
+        import_sources,
+        warnings,
+    } = check_front_end(&opts.source_path)?;
+
+    // Surface any type-check warnings (e.g. exhaustiveness, did-you-mean) rendered against the
+    // main module's source.
+    for w in &warnings {
+        w.render(&opts.source_path.to_string_lossy(), &source);
+    }
 
     // ADR-071: `replace` is a TEST-ONLY mock — valid only in a `*.test.lin`. Gating on the
     // FILENAME (not the subcommand) means it holds for every entry point: `lin run`/`lin build`
@@ -109,7 +187,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     // async boundary — it references any concurrency intrinsic (the `lin_async`/`lin_parallel`/
     // `lin_worker`/… family, reachable only via `std/async`). When it does, codegen must NOT
     // mark user functions `nounwind`, because a runtime fault inside a thunk unwinds through
-    // Lin frames to the thread boundary (spec §32.2.2, ADR-042). Scan the main module and every
+    // Lin frames to the thread boundary (spec §24.2.2, ADR-042). Scan the main module and every
     // import's intrinsic map.
     let async_intrinsics = [
         "lin_async", "lin_await", "lin_parallel", "lin_race", "lin_timeout", "lin_retry",
@@ -304,11 +382,13 @@ fn parse_source(source: &str) -> Result<Module, Vec<lin_common::Diagnostic>> {
 
 /// Build an import_types map from already-typed imported modules, then type-check `ast_module`.
 /// Uses `ModuleSignature` for each import — only needs the public name→type map, not the full IR.
+/// On success returns the `TypedModule` together with the checker's non-error diagnostics
+/// (warnings), which callers may render.
 fn check_module_with_imports(
     ast_module: &Module,
     imported_modules: &HashMap<String, TypedModule>,
     lenient_json: bool,
-) -> Result<TypedModule, Vec<lin_common::Diagnostic>> {
+) -> Result<(TypedModule, Vec<lin_common::Diagnostic>), Vec<lin_common::Diagnostic>> {
     let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
     let mut import_type_decls: HashMap<(String, String), (Vec<String>, Type)> = HashMap::new();
     for (path, imp_module) in imported_modules {
@@ -327,7 +407,10 @@ fn check_module_with_imports(
     // design, so it checks Json->concrete leniently (ADR-046). User code does not.
     checker.lenient_json = lenient_json;
     checker.protect_import_typevars();
-    checker.check_module(ast_module)
+    let typed = checker.check_module(ast_module)?;
+    // On success, `check_module` leaves only non-error diagnostics (warnings) on the checker.
+    let warnings = checker.diagnostics().to_vec();
+    Ok((typed, warnings))
 }
 
 /// Embedded stdlib source files (mirrors interpreter's include_str! approach).
@@ -354,6 +437,8 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/process"  => Some(include_str!("../../../stdlib/process.lin")),
         "std/tty"      => Some(include_str!("../../../stdlib/tty.lin")),
         "std/signal"   => Some(include_str!("../../../stdlib/signal.lin")),
+        "std/yaml"     => Some(include_str!("../../../stdlib/yaml.lin")),
+        "std/jq"       => Some(include_str!("../../../stdlib/jq.lin")),
         _ => None,
     }
 }
@@ -363,9 +448,46 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
 fn pre_resolve_imports_from_ast(
     ast_module: &Module,
     base_dir: &Path,
+    entry_path: &Path,
     cache: &mut HashMap<String, TypedModule>,
     order: &mut Vec<String>,
     import_sources: &mut HashMap<String, (String, String)>,
+) -> Result<(), CompileError> {
+    // `visiting` is the DFS stack of module identities currently being resolved; it both
+    // detects cycles and supplies the chain for the diagnostic. Seed it with the entry
+    // module so a cycle that loops back to the entry point is also caught and reported
+    // with a complete chain.
+    let entry_identity = entry_path
+        .canonicalize()
+        .unwrap_or_else(|_| entry_path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    let mut visiting: Vec<String> = vec![entry_identity];
+    pre_resolve_imports_inner(ast_module, base_dir, cache, order, import_sources, &mut visiting)
+}
+
+/// A module's stable identity for cycle detection. Stdlib paths (`std/...`) are already
+/// canonical; user modules are keyed by their canonicalised absolute file path so that two
+/// different spellings of the same file (`../a` vs `a`) map to one identity.
+fn module_identity(path: &str, base_dir: &Path) -> String {
+    if stdlib_source(path).is_some() {
+        return path.to_string();
+    }
+    let file_path = base_dir.join(format!("{}.lin", path));
+    file_path
+        .canonicalize()
+        .unwrap_or(file_path)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn pre_resolve_imports_inner(
+    ast_module: &Module,
+    base_dir: &Path,
+    cache: &mut HashMap<String, TypedModule>,
+    order: &mut Vec<String>,
+    import_sources: &mut HashMap<String, (String, String)>,
+    visiting: &mut Vec<String>,
 ) -> Result<(), CompileError> {
     for stmt in &ast_module.statements {
         let Stmt::Import { path, .. } = stmt else { continue };
@@ -373,16 +495,29 @@ fn pre_resolve_imports_from_ast(
             continue;
         }
 
+        // Detect a circular import before descending: if this module is already on the
+        // DFS stack, recursing would loop forever (and overflow the stack). Report the
+        // cycle as a readable `a -> b -> a` chain instead.
+        let identity = module_identity(path, base_dir);
+        if let Some(start) = visiting.iter().position(|m| m == &identity) {
+            let mut chain: Vec<String> = visiting[start..].to_vec();
+            chain.push(identity);
+            return Err(CompileError::ImportCycle(chain.join(" -> ")));
+        }
+        visiting.push(identity);
+
+        // From here, any early `?` aborts the whole compile, so `visiting` is discarded;
+        // we only need to `pop` on the paths that fall through to the next sibling import.
         let (ast_mod, src_text, imported_base, abs_path) = if let Some(src) = stdlib_source(path.as_str()) {
             let ast = parse_source(src).map_err(CompileError::TypeCheck)?;
-            pre_resolve_imports_from_ast(&ast, base_dir, cache, order, import_sources)?;
+            pre_resolve_imports_inner(&ast, base_dir, cache, order, import_sources, visiting)?;
             (ast, src.to_string(), base_dir.to_path_buf(), None)
         } else {
             let file_path = base_dir.join(format!("{}.lin", path));
             let src = std::fs::read_to_string(&file_path)?;
             let ast = parse_source(&src).map_err(CompileError::TypeCheck)?;
             let imported_base = file_path.parent().unwrap_or(base_dir).to_path_buf();
-            pre_resolve_imports_from_ast(&ast, &imported_base, cache, order, import_sources)?;
+            pre_resolve_imports_inner(&ast, &imported_base, cache, order, import_sources, visiting)?;
             let abs = file_path.canonicalize().unwrap_or(file_path);
             (ast, src, imported_base, Some(abs.to_string_lossy().to_string()))
         };
@@ -399,13 +534,14 @@ fn pre_resolve_imports_from_ast(
             }
             order.push(path.clone());
             cache.insert(path.clone(), cached);
+            visiting.pop();
             continue;
         }
 
         // Only the embedded stdlib is trusted to forward Json into concrete params (ADR-046);
         // user-defined imported modules are checked strictly, like the main module.
         let is_stdlib = stdlib_source(path.as_str()).is_some();
-        let typed = check_module_with_imports(&ast_mod, cache, is_stdlib)
+        let (typed, _warnings) = check_module_with_imports(&ast_mod, cache, is_stdlib)
             .map_err(CompileError::TypeCheck)?;
         let sig = ModuleSignature::from_module(&typed);
         save_cache(&src_text, &typed, &imported_base);
@@ -415,6 +551,7 @@ fn pre_resolve_imports_from_ast(
         }
         order.push(path.clone());
         cache.insert(path.clone(), typed);
+        visiting.pop();
     }
     Ok(())
 }

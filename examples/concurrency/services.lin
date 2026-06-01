@@ -10,10 +10,10 @@ import { push, length, for, range } from "std/array"
 export val poolSum = (workers: Int32, n: Int32): Int32 =>
   val pool = threadPool(workers)
   var promises = []
-  range(0, n).for(i => push(promises, pool.poolAsync(() => 1)))
+  range(0, n).for((i) => push(promises, pool.poolAsync(() => 1)))
   var total = 0
   // await yields `T | Error` (§24.2.2); `recoverInt` handles the Error case before summing.
-  promises.for(p => total = total + recoverInt(await(p)))
+  promises.for((p) => total = total + recoverInt(await(p)))
   total
 
 // Recover an awaited numeric result: a faulted Error contributes 0, otherwise the value.
@@ -28,13 +28,13 @@ val recoverInt = (result: Json): Int32 =>
 export val accumulate = (deposits: Int32[]): Int32 =>
   var total = 0
   val acc = worker(
-    n =>
+    (n) =>
       total = total + n
       total,
     () => null
   )
   var last = 0
-  deposits.for(d => last = request(acc, d))
+  deposits.for((d) => last = request(acc, d))
   close(acc)
   last
 
@@ -42,7 +42,7 @@ export val accumulate = (deposits: Int32[]): Int32 =>
 // in-flight request; the program continues. Returns true if the request came back an Error.
 export val workerFaults = (): Boolean =>
   val zero = 0
-  val w = worker(n => n / zero, () => null)
+  val w = worker((n) => n / zero, () => null)
   val reply = request(w, 5)
   close(w)
   match reply
@@ -54,11 +54,11 @@ export val workerFaults = (): Boolean =>
 export val sharedCounter = (): Int32 =>
   val box = shared([])
   parallel([
-    () => withLock(box, a => push(a, 1)),
-    () => withLock(box, a => push(a, 1)),
-    () => withLock(box, a => push(a, 1)),
-    () => withLock(box, a => push(a, 1)),
-    () => withLock(box, a => push(a, 1))
+    () => withLock(box, (a) => push(a, 1)),
+    () => withLock(box, (a) => push(a, 1)),
+    () => withLock(box, (a) => push(a, 1)),
+    () => withLock(box, (a) => push(a, 1)),
+    () => withLock(box, (a) => push(a, 1))
   ])
   length(get(box))
 
@@ -77,5 +77,5 @@ export val frozenLookup = (): Int32 =>
   val table = frozen([10, 20, 30, 40])
   val results = parallel([() => table[0], () => table[1], () => table[2], () => table[3]])
   var sum = 0
-  results.for(v => sum = sum + v)
+  results.for((v) => sum = sum + v)
   sum

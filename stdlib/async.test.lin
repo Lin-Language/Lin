@@ -25,14 +25,14 @@ val s = suite("std/async", [
     val results = parallel([() => 1, () => 2, () => 3])
     [expect(results.toString()).toBe("[1, 2, 3]")]),
   test("worker request/reply", () =>
-    val w = worker(msg => msg * 2, () => null)
+    val w = worker((msg) => msg * 2, () => null)
     val reply = request(w, 21)
     close(w)
     [expect(reply).toBe(42)]),
   test("worker holds confined var state across requests", () =>
     var total = 0
     val acc = worker(
-      n =>
+      (n) =>
         total = total + n
         total,
       () => null
@@ -43,7 +43,7 @@ val s = suite("std/async", [
     [expect(a).toBe(10), expect(b).toBe(15)]),
   test("worker handler fault surfaces as Error", () =>
     val z = 0
-    val w = worker(n => n / z, () => null)
+    val w = worker((n) => n / z, () => null)
     val r = request(w, 5)
     close(w)
     [expect(r["type"]).toBe("error")]),
@@ -133,9 +133,9 @@ val s = suite("std/async", [
   test("shared withLock mutates in place; concurrent pushes don't lose updates", () =>
     val box = shared([])
     val tasks = parallel([
-      () => withLock(box, a => push(a, 1)),
-      () => withLock(box, a => push(a, 1)),
-      () => withLock(box, a => push(a, 1))
+      () => withLock(box, (a) => push(a, 1)),
+      () => withLock(box, (a) => push(a, 1)),
+      () => withLock(box, (a) => push(a, 1))
     ])
     [expect(length(get(box))).toBe(3)]),
   test("frozen graph read concurrently by many threads", () =>

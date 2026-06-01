@@ -171,7 +171,7 @@ impl Lexer {
             return;
         }
         // A line beginning with `.method` is a dot-chain continuation of the previous
-        // expression, not a new block (spec §3.2; mirrors the `&&`/`||` suppression above
+        // expression, not a new block (spec §2.2; mirrors the `&&`/`||` suppression above
         // and ADR-006/013). Suppressing INDENT/DEDENT here keeps the enclosing block's
         // indentation accounting balanced when the chain is bound to a `val` inside a
         // function body (the postfix loop still chains via skip_newlines_and_indent).
@@ -430,7 +430,7 @@ impl Lexer {
 
         // Capture a type suffix (i8, u32, f32, etc.). It begins with i/u/f followed by digits.
         // The suffix is parsed into a NumSuffix and carried on the token so the checker can pin
-        // the literal's type (spec §3.6); an unrecognised suffix is ignored (kept as None).
+        // the literal's type (spec §2.6); an unrecognised suffix is ignored (kept as None).
         let mut suffix_str = String::new();
         if self.pos < self.source.len() {
             let c = self.source[self.pos];

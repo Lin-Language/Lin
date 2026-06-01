@@ -943,13 +943,12 @@ fn fmt_inline(expr: &Expr) -> String {
                 .unwrap_or_default();
             let generics = fmt_type_params(type_params);
             let body = fmt_inline(body);
-            // The bare single-param shorthand can't carry a `<T>` list — a generic
-            // function always uses the parenthesised form.
-            if type_params.is_empty() && params.len() == 1 && params[0].type_ann.is_none() {
-                if let Pattern::Ident(name, _) = &params[0].pattern {
-                    return format!("{}{} => {}", name, ret, body);
-                }
-            }
+            // Always parenthesise the parameter list. A bare-identifier lambda (`x => x`) is
+            // only legal in argument position (ADR-007), and `fmt_inline` has no notion of its
+            // context — it is used for `val` RHS, block tails, etc. as well as arguments. The
+            // parenthesised form `(x) => x` is valid in every position, so emitting it
+            // unconditionally guarantees the formatter's output always re-parses. A generic
+            // function additionally carries its `<T>` list (which the bare form can't).
             format!("{}({}){} => {}", generics, ps.join(", "), ret, body)
         }
         Expr::Block(stmts, tail, _) => {
@@ -1351,21 +1350,12 @@ fn fmt_function(
         .unwrap_or_default();
     let generics = fmt_type_params(type_params);
 
-    // A generic function (`<T>(…)`) always needs the parenthesised param list — the
-    // bare single-param lambda shorthand (`x => …`) cannot carry a type-param list.
-    let bare = if type_params.is_empty() && params.len() == 1 && params[0].type_ann.is_none() {
-        if let Pattern::Ident(name, _) = &params[0].pattern {
-            Some(name.clone())
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    let param_part = match bare {
-        Some(name) => format!("{}{}", name, ret),
-        None => format!("{}({}){}", generics, ps.join(", "), ret),
-    };
+    // Always parenthesise the parameter list. A bare-identifier lambda (`x => x`) is only legal
+    // in argument position (ADR-007), and this formatter has no notion of its context, so the
+    // paren-less form could land on a `val` RHS or other non-argument position where it does
+    // not parse. The parenthesised form `(x) => x` is valid everywhere, keeping the formatter's
+    // output round-trip safe. A generic function additionally carries its `<T>` list.
+    let param_part = format!("{}({}){}", generics, ps.join(", "), ret);
 
     // Leading comments attached to a single-expression body (Block bodies carry their own
     // comments inside `fmt_block`). A leading comment forces the multi-line form so the
@@ -1751,4 +1741,65 @@ fn fmt_chain(expr: &Expr, ind: &str) -> String {
         })
         .collect();
     format!("{}\n{}", root_str, call_strs.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::Parser;
+    use lin_lex::Lexer;
+
+    /// Parse `src`, returning the formatted output. Asserts the source itself parsed cleanly.
+    fn format(src: &str) -> String {
+        let tokens = Lexer::new(src, 0).tokenize();
+        let mut parser = Parser::new(tokens);
+        let module = parser.parse_module();
+        assert!(
+            parser.diagnostics.is_empty(),
+            "source did not parse cleanly: {:?}",
+            parser.diagnostics
+        );
+        Formatter::new().format_module(&module)
+    }
+
+    /// True if `src` parses with no diagnostics.
+    fn parses_clean(src: &str) -> bool {
+        let tokens = Lexer::new(src, 0).tokenize();
+        let mut parser = Parser::new(tokens);
+        let _ = parser.parse_module();
+        parser.diagnostics.is_empty()
+    }
+
+    /// The core invariant: formatter output must always re-parse. A bare-identifier lambda
+    /// (`x => x`) is only legal in argument position (ADR-007), so the formatter must keep the
+    /// parens on a lambda bound to a `val` RHS (or any non-argument position). Before the fix,
+    /// `val h = (x) => x` was rewritten to the unparseable `val h = x => x`.
+    #[test]
+    fn lambda_roundtrip_stays_parseable() {
+        let cases = [
+            "val h = (x) => x\n",
+            "val f = (s: String): String => s\n",
+            "val g = (x): Int => x\n",
+            "val xs = ns.map((x) => x)\n",
+        ];
+        for src in cases {
+            let out = format(src);
+            assert!(
+                parses_clean(&out),
+                "formatter output did not re-parse.\ninput:  {src:?}\noutput: {out:?}"
+            );
+            // Idempotency: formatting the output again is a fixpoint.
+            let out2 = format(&out);
+            assert_eq!(out, out2, "formatter not idempotent for {src:?}");
+        }
+    }
+
+    /// A bare param with a return-type annotation (`x: Ret => body`) is invalid everywhere,
+    /// so the formatter must never emit it — it must parenthesise the param.
+    #[test]
+    fn lambda_with_return_type_is_parenthesised() {
+        let out = format("val g = (x): Int => x\n");
+        assert!(out.contains("(x): Int =>"), "expected parenthesised param, got {out:?}");
+        assert!(parses_clean(&out), "output did not re-parse: {out:?}");
+    }
 }

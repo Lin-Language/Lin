@@ -447,7 +447,7 @@ unsafe fn collect_dir_recursive(base: &str, prefix: &str, arr: *mut LinArray) ->
 }
 
 /// Read a file as raw bytes. Returns TaggedVal*(flat UInt8 array) on success, error on failure.
-/// The result is a packed UInt8[] byte buffer (§35.1): one byte per element.
+/// The result is a packed UInt8[] byte buffer (§27.1): one byte per element.
 #[no_mangle]
 pub unsafe extern "C" fn lin_fs_read_file_bytes(path: *const u8) -> *mut u8 {
     let path_str = match resolve_lin_str(path) {

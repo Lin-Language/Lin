@@ -127,8 +127,8 @@ val s = suite("std/bytes", [
     val rightMotor: Float32 = f32FromBits(3222274048)
     // Pack both as big-endian f32 into one 8-byte buffer.
     val packet: UInt8[] = []
-    f32ToBe(leftMotor).for(x => push(packet, x))
-    f32ToBe(rightMotor).for(x => push(packet, x))
+    f32ToBe(leftMotor).for((x) => push(packet, x))
+    f32ToBe(rightMotor).for((x) => push(packet, x))
     // Read both back.
     [
       expect(packet.length()).toBe(8),

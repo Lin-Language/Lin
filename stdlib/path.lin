@@ -38,7 +38,7 @@ export val join = (parts: String[]): String =>
     ""
   else
     var result = parts[0]
-    range(1, n).for(i => result = lin_path_join2(result, parts[i]))
+    range(1, n).for((i) => result = lin_path_join2(result, parts[i]))
     normalize(result)
 
 export val split = (p: String): String[] =>

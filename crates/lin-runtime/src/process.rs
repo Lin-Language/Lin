@@ -9,7 +9,7 @@
 //!   `readStdout` reads its piped stdout incrementally; `kill` signals it; `wait` blocks
 //!   for the exit code. This is the long-running / incremental-output path.
 //!
-//! Every fallible call returns the `T | Error` result shape (spec §35.6).
+//! Every fallible call returns the `T | Error` result shape (spec §27.6).
 //!
 //! ## handle / registry design (streaming path)
 //!

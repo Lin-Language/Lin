@@ -94,7 +94,7 @@ val s = suite("std/string", [
     // Regression: split elements were tagged TAG_NULL, so generic map/for read them as null.
     val wrapped = "a,b,c"
       .split(",")
-      .map(s => "<${s}>")
+      .map((s) => "<${s}>")
       .join("|")
     [expect(wrapped).toBe("<a>|<b>|<c>")]),
   test("join joins with separator", () =>

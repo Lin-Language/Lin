@@ -105,15 +105,15 @@ val s = suite("std/object", [
     [expect(o["a"]).toBe(1)]),
   test("mapValues transforms all values", () =>
     val obj = { "a": 1, "b": 2 }
-    val m = obj.mapValues(x => x * 2)
+    val m = obj.mapValues((x) => x * 2)
     [expect(m["a"]).toBe(2)]),
   test("mapValues second value is transformed", () =>
     val obj = { "a": 1, "b": 2 }
-    val m = obj.mapValues(x => x * 2)
+    val m = obj.mapValues((x) => x * 2)
     [expect(m["b"]).toBe(4)]),
   test("mapValues preserves all keys", () =>
     val obj = { "a": 1, "b": 2 }
-    val m = obj.mapValues(x => x * 2)
+    val m = obj.mapValues((x) => x * 2)
     [expect(m.keys().length()).toBe(2)]),
   test(
     "isEmpty returns true for empty object",
@@ -140,7 +140,7 @@ val s = suite("std/object", [
     // --- heap/union value coverage for object index-assign (`result[k] = v`) ---
     // String values exercise the object-set store's retain semantics; scalar values
     // hide RC bugs. The ASan CI leg also runs these.
-    val m = { "a": 1, "b": 2 }.mapValues(v => "v${v}")
+    val m = { "a": 1, "b": 2 }.mapValues((v) => "v${v}")
     [expect(m["a"]).toBe("v1"), expect(m["b"]).toBe("v2")]),
   test("pick copies string values", () =>
     val p = { "a": "x", "b": "y", "c": "z" }.pick(["a", "c"])

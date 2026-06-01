@@ -240,7 +240,7 @@ impl Checker {
                     .map(|p| apply_type_subs(p, &subs))
                     .collect();
 
-                // Spec §26: a suffixless integer literal takes its context type. When an
+                // Spec §21: a suffixless integer literal takes its context type. When an
                 // argument is a bare integer literal and the parameter has a concrete integer
                 // type T, re-type the literal at width T (if it fits) so it satisfies the
                 // parameter. This lets e.g. `toUInt8(255)` or `f32FromBits(0x40600000)` pass
@@ -409,7 +409,7 @@ impl Checker {
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
         // A dot access with no argument list (`x.f`) is partial application of the
-        // receiver (spec §11.1), never default-fill. An explicit trailing comma
+        // receiver (spec §16.1), never default-fill. An explicit trailing comma
         // (`x.f(y,)`) is also partial.
         let partial = partial || args.is_none();
         // Desugar: receiver.method(args) -> method(receiver, args)

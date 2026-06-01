@@ -13,7 +13,7 @@ export type Neighbor = { "to": String, "weight": Int32 }
 export val buildAdj = (edges: Edge[]): Json =>
   var adj = {}
   edges
-    .for(edge =>
+    .for((edge) =>
       val src = edge["from"]
       val existing = adj[src]
       if existing == null then

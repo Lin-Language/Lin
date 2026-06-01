@@ -15,7 +15,7 @@ val m = mat3(2.0, 3.0, 0.0, 4.0, 5.0, 0.0, 0.0, 0.0, 1.0)
 val p = matMul(id, m)
 print("matrix multiply identity * M:")
 range(0, 3)
-  .for(i =>
+  .for((i) =>
     print(
       "  ${mat3Get(p, i, 0).toFixed(1)} ${mat3Get(p, i, 1).toFixed(1)} ${mat3Get(p, i, 2).toFixed(1)}"
     ))

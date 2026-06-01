@@ -14,28 +14,28 @@ val s = suite("std/array", [
     [expect(result.length()).toBe(4)]),
   test("range produces correct values", () =>
     val result = []
-    range(0, 3).for(i => result.push(i))
+    range(0, 3).for((i) => result.push(i))
     [expect(result.toString()).toBe("[0, 1, 2]")]),
   test("iterOf iterates over array elements", () =>
     val result = []
-    iterOf([10, 20, 30]).for(x => result.push(x))
+    iterOf([10, 20, 30]).for((x) => result.push(x))
     [expect(result.toString()).toBe("[10, 20, 30]")]),
   test("iterOf over empty array produces nothing", () =>
     val result = []
-    iterOf([]).for(x => result.push(x))
+    iterOf([]).for((x) => result.push(x))
     [expect(result.length()).toBe(0)]),
   test("map doubles values", () =>
-    val result = [1, 2, 3].map(x => x * 2)
+    val result = [1, 2, 3].map((x) => x * 2)
     [expect(result.toString()).toBe("[2, 4, 6]")]),
   test("filter keeps evens", () =>
-    val result = [1, 2, 3, 4].filter(x => x % 2 == 0)
+    val result = [1, 2, 3, 4].filter((x) => x % 2 == 0)
     [expect(result.toString()).toBe("[2, 4]")]),
   test("filter over object array does not double-free kept elements", () =>
     // Regression (ADR-069 R2): filtering an array of OBJECTS pushes each kept element (BORROWED from
     // the source) into the result; the result array must take its own reference, else releasing both
     // the source and the filtered array at teardown double-frees the shared objects (heap UAF).
     val items = [{ "type": "a", "v": 1 }, { "type": "b", "v": 2 }, { "type": "a", "v": 3 }]
-    val kept = items.filter(i => i["type"] == "a")
+    val kept = items.filter((i) => i["type"] == "a")
     [
       expect(length(kept)).toBe(2),
       expect(kept[0]["v"]).toBe(1),
@@ -47,25 +47,25 @@ val s = suite("std/array", [
     val result = [1, 2, 3, 4].reduce(0, (acc, x) => acc + x)
     [expect(result).toBe(10)]),
   test("find returns first match", () =>
-    val result = [1, 2, 3, 4].find(x => x > 2)
+    val result = [1, 2, 3, 4].find((x) => x > 2)
     [expect(result).toBe(3)]),
   test("find returns null when no match", () =>
-    val result = [1, 2, 3].find(x => x > 10)
+    val result = [1, 2, 3].find((x) => x > 10)
     [expect(result).toBe(null)]),
   test("some returns true when any match", () =>
-    val result = [1, 2, 3].some(x => x == 2)
+    val result = [1, 2, 3].some((x) => x == 2)
     [expect(result).toBe(true)]),
   test("some returns false when none match", () =>
-    val result = [1, 2, 3].some(x => x == 99)
+    val result = [1, 2, 3].some((x) => x == 99)
     [expect(result).toBe(false)]),
   test("every returns true when all match", () =>
-    val result = [2, 4, 6].every(x => x % 2 == 0)
+    val result = [2, 4, 6].every((x) => x % 2 == 0)
     [expect(result).toBe(true)]),
   test("every returns false when any fail", () =>
-    val result = [2, 3, 6].every(x => x % 2 == 0)
+    val result = [2, 3, 6].every((x) => x % 2 == 0)
     [expect(result).toBe(false)]),
   test("flatMap flattens one level", () =>
-    val result = [1, 2, 3].flatMap(x => [x, x * 10])
+    val result = [1, 2, 3].flatMap((x) => [x, x * 10])
     [expect(result.toString()).toBe("[1, 10, 2, 20, 3, 30]")]),
   test("indexOf returns index of found element", () =>
     val result = [10, 20, 30].indexOf(20)
@@ -95,13 +95,13 @@ val s = suite("std/array", [
     val result = [1, 2, 3].reverse()
     [expect(result.toString()).toBe("[3, 2, 1]")]),
   test("partition splits into passing and failing", () =>
-    val result = [1, 2, 3, 4, 5].partition(x => x % 2 == 0)
+    val result = [1, 2, 3, 4, 5].partition((x) => x % 2 == 0)
     [
       expect(result[0].toString()).toBe("[2, 4]"),
       expect(result[1].toString()).toBe("[1, 3, 5]")
     ]),
   test("partition with empty array", () =>
-    val result = [].partition(x => x == 1)
+    val result = [].partition((x) => x == 1)
     [expect(result[0].length()).toBe(0), expect(result[1].length()).toBe(0)]),
   test("zip pairs elements at same index", () =>
     val result = [1, 2, 3].zip(["a", "b", "c"])
@@ -128,16 +128,16 @@ val s = suite("std/array", [
     val result = [1, 2].drop(10)
     [expect(result.length()).toBe(0)]),
   test("takeWhile returns elements while predicate holds", () =>
-    val result = [1, 2, 3, 4].takeWhile(x => x < 3)
+    val result = [1, 2, 3, 4].takeWhile((x) => x < 3)
     [expect(result.toString()).toBe("[1, 2]")]),
   test("takeWhile stops at first false", () =>
-    val result = [1, 3, 2, 4].takeWhile(x => x < 3)
+    val result = [1, 3, 2, 4].takeWhile((x) => x < 3)
     [expect(result.toString()).toBe("[1]")]),
   test("dropWhile skips elements while predicate holds", () =>
-    val result = [1, 2, 3, 4].dropWhile(x => x < 3)
+    val result = [1, 2, 3, 4].dropWhile((x) => x < 3)
     [expect(result.toString()).toBe("[3, 4]")]),
   test("dropWhile returns all when predicate is immediately false", () =>
-    val result = [3, 4, 5].dropWhile(x => x < 3)
+    val result = [3, 4, 5].dropWhile((x) => x < 3)
     [expect(result.toString()).toBe("[3, 4, 5]")]),
   test("sort numbers ascending", () =>
     val result = [3, 1, 2].sort((a, b) => a - b)
@@ -162,10 +162,10 @@ val s = suite("std/array", [
     val result = [42].sort((a, b) => a - b)
     [expect(result.toString()).toBe("[42]")]),
   test("sortBy numbers by value", () =>
-    val result = [3, 1, 2].sortBy(x => x)
+    val result = [3, 1, 2].sortBy((x) => x)
     [expect(result.toString()).toBe("[1, 2, 3]")]),
   test("sortBy objects by field", () =>
-    val result = [{ "name": "Bob" }, { "name": "Alice" }, { "name": "Charlie" }].sortBy(x => x["name"])
+    val result = [{ "name": "Bob" }, { "name": "Alice" }, { "name": "Charlie" }].sortBy((x) => x["name"])
     [
       expect(result[0]["name"]).toBe("Alice"),
       expect(result[1]["name"]).toBe("Bob"),
@@ -173,7 +173,7 @@ val s = suite("std/array", [
     ]),
   test("sortBy does not mutate original array", () =>
     val original = [3, 1, 2]
-    val result = original.sortBy(x => x)
+    val result = original.sortBy((x) => x)
     [expect(original.toString()).toBe("[3, 1, 2]")]),
   test("sum of integers", () =>
     val result = [1, 2, 3, 4].sum()
@@ -194,34 +194,34 @@ val s = suite("std/array", [
     val result = [3, 1, 4, 1, 5].max()
     [expect(result).toBe(5)]),
   test("minBy returns element with smallest key", () =>
-    val result = [{ "n": 3 }, { "n": 1 }, { "n": 2 }].minBy(x => x["n"])
+    val result = [{ "n": 3 }, { "n": 1 }, { "n": 2 }].minBy((x) => x["n"])
     [expect(result["n"]).toBe(1)]),
   test("maxBy returns element with largest key", () =>
-    val result = [{ "n": 3 }, { "n": 1 }, { "n": 2 }].maxBy(x => x["n"])
+    val result = [{ "n": 3 }, { "n": 1 }, { "n": 2 }].maxBy((x) => x["n"])
     [expect(result["n"]).toBe(3)]),
   test("rangeStep with positive step 2", () =>
     val result = []
-    rangeStep(0, 6, 2).for(x => result.push(x))
+    rangeStep(0, 6, 2).for((x) => result.push(x))
     [expect(result.toString()).toBe("[0, 2, 4]")]),
   test("rangeStep with positive step 3", () =>
     val result = []
-    rangeStep(0, 10, 3).for(x => result.push(x))
+    rangeStep(0, 10, 3).for((x) => result.push(x))
     [expect(result.toString()).toBe("[0, 3, 6, 9]")]),
   test("rangeStep with negative step", () =>
     val result = []
-    rangeStep(5, 0, -1).for(x => result.push(x))
+    rangeStep(5, 0, -1).for((x) => result.push(x))
     [expect(result.toString()).toBe("[5, 4, 3, 2, 1]")]),
   test("rangeStep with negative step -2", () =>
     val result = []
-    rangeStep(10, 0, -2).for(x => result.push(x))
+    rangeStep(10, 0, -2).for((x) => result.push(x))
     [expect(result.toString()).toBe("[10, 8, 6, 4, 2]")]),
   test("rangeStep with step 0 returns empty iterator", () =>
     val result = []
-    rangeStep(0, 10, 0).for(x => result.push(x))
+    rangeStep(0, 10, 0).for((x) => result.push(x))
     [expect(result.length()).toBe(0)]),
   test("rangeStep with step 1 matches range", () =>
     val result = []
-    rangeStep(0, 4, 1).for(x => result.push(x))
+    rangeStep(0, 4, 1).for((x) => result.push(x))
     [expect(result.toString()).toBe("[0, 1, 2, 3]")]),
   test("flatten flattens one level of nesting", () =>
     val result = [[1, 2], [3, 4]].flatten()
@@ -303,21 +303,21 @@ val s = suite("std/array", [
     val result = [1, 2, 3, 4].scan(1, (acc, x) => acc * x)
     [expect(result.toString()).toBe("[1, 1, 2, 6, 24]")]),
   test("groupBy groups elements by key function", () =>
-    val result = [1, 2, 3, 4].groupBy(x => if x % 2 == 0 then "even" else "odd")
+    val result = [1, 2, 3, 4].groupBy((x) => if x % 2 == 0 then "even" else "odd")
     [
       expect(result["odd"].toString()).toBe("[1, 3]"),
       expect(result["even"].toString()).toBe("[2, 4]")
     ]),
   test("groupBy with single key puts all in one group", () =>
-    val result = [1, 2, 3].groupBy(x => "all")
+    val result = [1, 2, 3].groupBy((x) => "all")
     [expect(result["all"].toString()).toBe("[1, 2, 3]")]),
   test("groupBy empty array returns empty object", () =>
-    val result = [].groupBy(x => "k")
+    val result = [].groupBy((x) => "k")
     [expect(result["k"]).toBe(null)]),
   test("groupBy preserves order within each group across many items", () =>
     // One lookup + in-place push per item (lin_object_get_or_insert_array): items must
     // accumulate in encounter order within each bucket.
-    val result = [1, 2, 3, 4, 5, 6].groupBy(x => if x % 2 == 0 then "even" else "odd")
+    val result = [1, 2, 3, 4, 5, 6].groupBy((x) => if x % 2 == 0 then "even" else "odd")
     [
       expect(result["odd"].toString()).toBe("[1, 3, 5]"),
       expect(result["even"].toString()).toBe("[2, 4, 6]")
@@ -326,7 +326,7 @@ val s = suite("std/array", [
     // String elements stress the tagged-payload retain path: the group arrays must own their
     // own references so the values print correctly (a UAF would corrupt these assertions).
     val result = ["apple", "avocado", "banana", "cherry"]
-      .groupBy(s =>
+      .groupBy((s) =>
         if s == "banana" then "b" else if s == "cherry" then "c" else "a")
     [
       expect(result["a"].toString()).toBe("[\"apple\", \"avocado\"]"),
@@ -334,17 +334,17 @@ val s = suite("std/array", [
       expect(result["c"].toString()).toBe("[\"cherry\"]")
     ]),
   test("countBy counts occurrences of each key", () =>
-    val result = ["a", "b", "a", "c", "b", "a"].countBy(x => x)
+    val result = ["a", "b", "a", "c", "b", "a"].countBy((x) => x)
     [
       expect(result["a"]).toBe(3),
       expect(result["b"]).toBe(2),
       expect(result["c"]).toBe(1)
     ]),
   test("countBy groups even and odd counts", () =>
-    val result = [1, 2, 3, 4, 5].countBy(x => if x % 2 == 0 then "even" else "odd")
+    val result = [1, 2, 3, 4, 5].countBy((x) => if x % 2 == 0 then "even" else "odd")
     [expect(result["odd"]).toBe(3), expect(result["even"]).toBe(2)]),
   test("countBy empty array returns empty object", () =>
-    val result = [].countBy(x => x)
+    val result = [].countBy((x) => x)
     [expect(result["anything"]).toBe(null)]),
   test("map producing strings (fresh union element)", () =>
     // --- heap/union element coverage for index-assign (`result[i] = x`) ---
@@ -352,10 +352,10 @@ val s = suite("std/array", [
     // (heap) elements, where the fresh-vs-borrowed and consume-vs-retain ownership
     // rules matter (scalar elements hide RC bugs). Read the stored value back so a
     // use-after-free corrupts the assertion; the ASan CI leg also runs these.
-    val result = [1, 2, 3].map(x => "n${x}")
+    val result = [1, 2, 3].map((x) => "n${x}")
     [expect(result.toString()).toBe("[\"n1\", \"n2\", \"n3\"]")]),
   test("map producing arrays (fresh nested-heap element)", () =>
-    val result = [1, 2, 3].map(x => [x, x])
+    val result = [1, 2, 3].map((x) => [x, x])
     [expect(result.toString()).toBe("[[1, 1], [2, 2], [3, 3]]")]),
   test("reverse of string elements (borrowed union)", () =>
     val result = ["a", "b", "c"].reverse()
@@ -376,7 +376,7 @@ val s = suite("std/array", [
     val result = ["c", "a", "b"].sort((a, b) => if a < b then -1 else if a > b then 1 else 0)
     [expect(result.toString()).toBe("[\"a\", \"b\", \"c\"]")]),
   test("groupBy collecting string elements into array values", () =>
-    val result = ["a", "a", "b"].groupBy(x => x)
+    val result = ["a", "a", "b"].groupBy((x) => x)
     [
       expect(result["a"].toString()).toBe("[\"a\", \"a\"]"),
       expect(result["b"].toString()).toBe("[\"b\"]")

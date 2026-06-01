@@ -19,7 +19,7 @@ val s = suite("std/test", [
   test("toBeNull passes for null", () => [expect(null).toBeNull()]),
   test(
     "toSatisfy passes when predicate holds",
-    () => [expect(10).toSatisfy(x => x > 5)]
+    () => [expect(10).toSatisfy((x) => x > 5)]
   ),
   test(
     "toSucceed passes for success tagged value",
@@ -60,7 +60,7 @@ val s = suite("std/test", [
     ]),
   test(
     "toSatisfy fails when predicate does not hold",
-    () => [expect(expect(1).toSatisfy(x => x > 10)["type"]).toBe("fail")]
+    () => [expect(expect(1).toSatisfy((x) => x > 10)["type"]).toBe("fail")]
   ),
   test("toFailWith fails when error message differs", () =>
     val r = { "type": "failure", "error": "oops" }
@@ -75,10 +75,10 @@ val s = suite("std/test", [
     val ok = { "type": "success", "value": 42 }
     val err = { "type": "failure", "error": "boom" }
     [
-      expect(ok).toSatisfy(r => r has { "type": "success", value }),
-      expect(err).toSatisfy(r => r has { "type": "failure", error })
+      expect(ok).toSatisfy((r) => r has { "type": "success", value }),
+      expect(err).toSatisfy((r) => r has { "type": "failure", error })
     ]),
-  withFixture(fxSetup, fxTeardown, "withFixture injects the fixture", db =>
+  withFixture(fxSetup, fxTeardown, "withFixture injects the fixture", (db) =>
     // withFixture injects the fixture into the body and runs setup/teardown around it. These two
     // entries each fire setup once and teardown once; the meta-test below asserts the counts.
     [expect(db["conn"]).toBe(7)]),
@@ -86,7 +86,7 @@ val s = suite("std/test", [
     fxSetup,
     fxTeardown,
     "withFixture runs again independently",
-    db => [expect(db["conn"]).toBe(7)]
+    (db) => [expect(db["conn"]).toBe(7)]
   ),
   test("withFixture ran setup and teardown for each use", () =>
     // Eager evaluation: the two withFixture entries above already ran (the tests array is built

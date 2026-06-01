@@ -1,6 +1,6 @@
 //! `std/net` runtime intrinsics — UDP and TCP sockets.
 //!
-//! Sockets are exposed to Lin as opaque integer fd handles (spec §35.4). Every
+//! Sockets are exposed to Lin as opaque integer fd handles (spec §27.4). Every
 //! fallible call returns the `T | Error` result shape; a non-blocking read with
 //! no data available yet returns `Null` (a null pointer).
 //!

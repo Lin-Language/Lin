@@ -35,7 +35,7 @@ impl Span {
 
 /// An explicit numeric type suffix on a literal (e.g. `42i8`, `3.14f32`, `5u64`).
 /// Carried from the lexer through the surface AST so the type checker can pin the
-/// literal's type, overriding context/default inference (spec §3.6). `None` ⇒ no suffix.
+/// literal's type, overriding context/default inference (spec §2.6). `None` ⇒ no suffix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NumSuffix {
     I8, I16, I32, I64,

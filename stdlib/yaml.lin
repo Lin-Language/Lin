@@ -1,0 +1,17 @@
+import foreign "lin-runtime"
+  val lin_yaml_parse: (String) => Json
+  val lin_yaml_parse_all: (String) => Json
+  val lin_yaml_stringify: (Json) => String
+  val lin_yaml_stringify_all: (Json) => String
+
+export val parse = (src: String): Json =>
+  lin_yaml_parse(src)
+
+export val parseAll = (src: String): Json =>
+  lin_yaml_parse_all(src)
+
+export val stringify = (value: Json): String =>
+  lin_yaml_stringify(value)
+
+export val stringifyAll = (values: Json[]): String =>
+  lin_yaml_stringify_all(values)

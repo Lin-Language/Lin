@@ -34,16 +34,16 @@ val errorOf = (r: Parsed): String =>
 // Parse every line into a result, keep the successful records' values.
 export val validRecords = (lines: String[]): Record[] =>
   lines
-    .map(line => parseRow(line))
-    .filter(r => r["type"] == "success")
-    .map(r => recordOf(r))
+    .map((line) => parseRow(line))
+    .filter((r) => r["type"] == "success")
+    .map((r) => recordOf(r))
 
 // The error messages from the rows that failed to parse.
 export val parseErrors = (lines: String[]): String[] =>
   lines
-    .map(line => parseRow(line))
-    .filter(r => r["type"] == "failure")
-    .map(r => errorOf(r))
+    .map((line) => parseRow(line))
+    .filter((r) => r["type"] == "failure")
+    .map((r) => errorOf(r))
 
 // Statistics over the valid records: count, total, average (integer), and the
 // top scorer's name. Returns an object; `count == 0` is handled by the caller.
@@ -58,7 +58,7 @@ export val stats = (records: Record[]): Stats =>
     }
   else
     val total = records.reduce(0, (sum, r) => sum + r["score"])
-    val ranked = records.sortBy(r => 0 - r["score"])
+    val ranked = records.sortBy((r) => 0 - r["score"])
     {
       "count": count,
       "total": total,
@@ -78,8 +78,8 @@ export val render = (lines: String[]): String =>
   val records = validRecords(lines)
   val st = stats(records)
   val rows = records
-    .sortBy(r => 0 - r["score"])
-    .map(r => "  ${r["name"]}: ${toString(r["score"])}")
+    .sortBy((r) => 0 - r["score"])
+    .map((r) => "  ${r["name"]}: ${toString(r["score"])}")
     .join("\n")
   val errLines = errorNote(parseErrors(lines))
   "=== Report ===\n${rows}\ncount=${toString(st["count"])} avg=${toString(st["average"])} top=${st["top"]}${errLines}"
