@@ -3,6 +3,7 @@
 // Walks the tree produced by the parser, computing an Int32 result. Division by
 // zero is reported as a recoverable failure value (not a trap), so the whole
 // `evaluate` pipeline returns a tagged result the caller pattern-matches on.
+
 import { parseInt32 } from "std/number"
 
 // Tagged-result shapes. The discriminant field `type` is typed String (spec:
@@ -26,30 +27,21 @@ val evalNode = (node: Json): Json =>
     { "type": "success", "value": node["value"] }
   else
     val left = evalNode(node["left"])
-    if isFailure(left) then
-      left
+    if isFailure(left) then left
     else
       val right = evalNode(node["right"])
-      if isFailure(right) then
-        right
+      if isFailure(right) then right
       else
         val a = left["value"]
         val b = right["value"]
         val op = node["op"]
-        if op == "+" then
-          { "type": "success", "value": a + b }
-        else if op == "-" then
-          { "type": "success", "value": a - b }
-        else if op == "*" then
-          { "type": "success", "value": a * b }
-        else if b == 0 then
-          fail("division by zero")
-        else
-          { "type": "success", "value": a / b }
+        if op == "+" then { "type": "success", "value": a + b }
+        else if op == "-" then { "type": "success", "value": a - b }
+        else if op == "*" then { "type": "success", "value": a * b }
+        else if b == 0 then fail("division by zero")
+        else { "type": "success", "value": a / b }
 
 // Public entry: an AST result (success/failure from the parser) -> evaluated result.
 export val evalAst = (parsed: Json): Evaluated =>
-  if isFailure(parsed) then
-    parsed
-  else
-    evalNode(parsed["value"])
+  if isFailure(parsed) then parsed
+  else evalNode(parsed["value"])

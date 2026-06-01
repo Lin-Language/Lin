@@ -4510,16 +4510,44 @@ fn fmt(source: &str) -> String {
 #[test]
 fn test_fmt_preserves_grouping_parens() {
     // `(a + b) / c` must keep its parens — `/` binds tighter than `+`, so dropping
-    // them changes the value. Left-assoc redundant parens are dropped; right-side and
-    // looser-child parens are kept.
+    // them changes the value. Author-written parens are PRESERVED (we never strip a
+    // grouping the author wrote, even when precedence makes it redundant — it reads worse
+    // stripped, e.g. `(a / b) * c`), and parens are never ADDED where the author had none.
     assert_eq!(fmt("val x = (1 + 2) / 3\n").trim(), "val x = (1 + 2) / 3");
     assert_eq!(fmt("val x = (1 + 2 - 1) / 4\n").trim(), "val x = (1 + 2 - 1) / 4");
     assert_eq!(fmt("val x = a - (b - c)\n").trim(), "val x = a - (b - c)");
-    assert_eq!(fmt("val x = (a - b) - c\n").trim(), "val x = a - b - c");
+    // Author parens preserved even when redundant; none added when absent.
+    assert_eq!(fmt("val x = (a - b) - c\n").trim(), "val x = (a - b) - c");
+    assert_eq!(fmt("val x = a - b - c\n").trim(), "val x = a - b - c");
     assert_eq!(fmt("val x = (a || b) && c\n").trim(), "val x = (a || b) && c");
     // And it must actually still evaluate correctly end-to-end.
     let out = run("import { print } from \"std/io\"\nimport { toString } from \"std/string\"\nval r = (1 + 2) / 3\nprint(toString(r))\n");
     assert_eq!(out, vec!["1"], "( 1 + 2 ) / 3 should be 1, not 1 + (2/3) = 1");
+}
+
+#[test]
+fn test_fmt_multi_call_array_multiline() {
+    // A multi-element array whose elements contain calls renders multi-line (packing several
+    // calls on one line reads poorly). A single-call array and a plain-literal array stay inline.
+    let out = fmt("val a = [expect(x).toBe(1), expect(y).toBe(2)]\n");
+    assert!(out.contains("[\n  expect(x).toBe(1),\n  expect(y).toBe(2)\n]"), "multi-call array not multiline:\n{}", out);
+    assert_eq!(fmt("val b = [expect(x).toBe(1)]\n").trim(), "val b = [expect(x).toBe(1)]");
+    assert_eq!(fmt("val c = [1, 2, 3]\n").trim(), "val c = [1, 2, 3]");
+    assert_eq!(out, fmt(&out), "not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_bare_lambda_in_arg_position() {
+    // A single-ident / wildcard, type-less lambda is bare in ARGUMENT position, parenthesised
+    // elsewhere (round-trip safe — bare doesn't parse on a `val` RHS).
+    assert_eq!(fmt("val x = items.map(i => i + 1)\n").trim(), "val x = items.map(i => i + 1)");
+    assert_eq!(fmt("val x = items.for(_ => g())\n").trim(), "val x = items.for(_ => g())");
+    assert_eq!(fmt("val f = (x) => x + 1\n").trim(), "val f = (x) => x + 1");
+    // A single-call chain whose lambda arg is multi-line stays unsplit (receiver.method(...) on
+    // one line); the multi-line lambda body flows beneath.
+    let chain = fmt("val x = nodes.for(_ =>\n  set(adj, ai, [])\n  ai = ai + 1\n)\n");
+    assert!(chain.contains("val x = nodes.for(_ =>"), "single-call chain split or lambda parenthesised:\n{}", chain);
+    assert_eq!(chain, fmt(&chain), "chain not idempotent:\n{}", chain);
 }
 
 #[test]
@@ -4531,7 +4559,7 @@ fn test_fmt_preserves_postfix_base_parens() {
     assert_eq!(fmt("val c = (f + g)(3)\n").trim(), "val c = (f + g)(3)");
     // Atomic / chain bases keep NO parens. (Lambda params are always parenthesised for
     // round-trip safety — ADR-007 / d6e7bdb.)
-    assert_eq!(fmt("val d = arr.map(x => x).length()\n").trim(), "val d = arr.map((x) => x).length()");
+    assert_eq!(fmt("val d = arr.map(x => x).length()\n").trim(), "val d = arr.map(x => x).length()");
 }
 
 #[test]
@@ -4547,10 +4575,10 @@ fn test_fmt_preserves_radix_literals() {
     assert_eq!(fmt("val s = 0xFFu8\n").trim(), "val s = 0xFFu8");
     assert_eq!(fmt("val g = 0xDEAD_BEEF\n").trim(), "val g = 0xDEAD_BEEF");
     assert_eq!(fmt("val n = -0x10\n").trim(), "val n = -0x10");
-    // The motivating case: parens safely stripped, hex preserved.
+    // The motivating case: hex preserved AND the author's grouping parens preserved.
     assert_eq!(
         fmt("val packNibbles = (high: Int32, low: Int32): Int32 =>\n  (high << 4) | (low & 0x0F)\n").trim(),
-        "val packNibbles = (high: Int32, low: Int32): Int32 =>\n  high << 4 | low & 0x0F"
+        "val packNibbles = (high: Int32, low: Int32): Int32 =>\n  (high << 4) | (low & 0x0F)"
     );
     // Idempotent.
     assert_eq!(fmt("val m = 0x0F\n"), fmt(&fmt("val m = 0x0F\n")));
@@ -4720,11 +4748,11 @@ fn test_fmt_rule1_chain_threshold() {
     // regardless of length. 4 calls → one `.method(...)` per line.
     let source = "import { range, map, filter, reduce } from \"std/array\"\nval total = range(0, n).map(x => x * 2).filter(x => x % 3 == 0).reduce(0, (acc, x) => acc + x)\n";
     let out = fmt(source);
-    let expected = "val total = range(0, n)\n  .map((x) => x * 2)\n  .filter((x) => x % 3 == 0)\n  .reduce(0, (acc, x) => acc + x)";
+    let expected = "val total = range(0, n)\n  .map(x => x * 2)\n  .filter(x => x % 3 == 0)\n  .reduce(0, (acc, x) => acc + x)";
     assert!(out.contains(expected), "Rule 1 chain not multiline:\n{}", out);
     // A 2-call chain still stays inline.
     let two = fmt("import { range, map } from \"std/array\"\nval a = range(0, n).map(x => x)\n");
-    assert!(two.contains("val a = range(0, n).map((x) => x)"), "2-call chain should stay inline:\n{}", two);
+    assert!(two.contains("val a = range(0, n).map(x => x)"), "2-call chain should stay inline:\n{}", two);
     assert_eq!(out, fmt(&out), "Rule 1 not idempotent:\n{}", out);
 }
 
@@ -4795,7 +4823,7 @@ fn test_fmt_rule5b_fully_split_args() {
     // `param =>` then body indented, close paren on its own line.
     let source = "var total = 0\nval acc = worker(n =>\n  total = total + n\n  total, () => null)\n";
     let out = fmt(source);
-    let expected = "val acc = worker(\n  (n) =>\n    total = total + n\n    total,\n  () => null\n)";
+    let expected = "val acc = worker(\n  n =>\n    total = total + n\n    total,\n  () => null\n)";
     assert!(out.contains(expected), "Rule 5b fully-split layout wrong:\n{}", out);
     assert_eq!(out, fmt(&out), "Rule 5b not idempotent:\n{}", out);
 }
@@ -4925,7 +4953,7 @@ fn test_fmt_ruleC_author_multiline_2chain_stays_multiline() {
     // Rule C: a 2-call chain the author broke across lines stays multiline.
     let source = "import { range, map, reduce } from \"std/array\"\nimport { toString, length } from \"std/string\"\nval totalLen = range(0, n)\n  .map(i => \"item-${toString(i)}\")\n  .reduce(0, (acc, s) => acc + length(s))\n";
     let out = fmt(source);
-    let expected = "val totalLen = range(0, n)\n  .map((i) => \"item-${toString(i)}\")\n  .reduce(0, (acc, s) => acc + length(s))";
+    let expected = "val totalLen = range(0, n)\n  .map(i => \"item-${toString(i)}\")\n  .reduce(0, (acc, s) => acc + length(s))";
     assert!(out.contains(expected), "Rule C author-multiline 2-chain collapsed:\n{}", out);
     assert_eq!(out, fmt(&out), "Rule C not idempotent:\n{}", out);
 }
@@ -4944,7 +4972,7 @@ fn test_fmt_ruleC_over_two_chain_always_multiline() {
     // Rule C / Rule 1: a chain with >2 calls is ALWAYS multiline even if written inline.
     let source = "import { range, map, filter, reduce } from \"std/array\"\nval t = range(0, n).map(x => x).filter(x => x > 0).reduce(0, (a, b) => a + b)\n";
     let out = fmt(source);
-    let expected = "val t = range(0, n)\n  .map((x) => x)\n  .filter((x) => x > 0)\n  .reduce(0, (a, b) => a + b)";
+    let expected = "val t = range(0, n)\n  .map(x => x)\n  .filter(x => x > 0)\n  .reduce(0, (a, b) => a + b)";
     assert!(out.contains(expected), "Rule C >2 chain not multiline:\n{}", out);
     assert_eq!(out, fmt(&out), "Rule C >2 not idempotent:\n{}", out);
 }
