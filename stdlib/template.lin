@@ -12,8 +12,8 @@ export val renderWith = (template: String, data: {}): Json =>
   lin_template_render(template, data)
 
 // Read a template from `path` and render it, with full layout support (ADR-074):
-// the template may `{% extends "base.lint" %}` and fill `{% block %}`s, or pull in
-// partials via `{% include "_nav.lint" %}` — referenced files are loaded by name
+// the template may `{% extends "base.jinja" %}` and fill `{% block %}`s, or pull in
+// partials via `{% include "_nav.jinja" %}` — referenced files are loaded by name
 // from the same directory as `path`. Returns the rendered String, or an Error
 // object {type:error,message} on a missing file or a syntax/render error (all
 // discriminated via `is Error`).

@@ -81,9 +81,9 @@ val s = suite("std/template", [
     mkdir(tmpDir, { "parents": true })
     // A base layout with a fillable block, and a child that extends it. The loader
     // resolves the `{% extends %}` name against the child's own directory.
-    writeFile("${tmpDir}/base.lint", "<html><body>{% block body %}{% endblock %}</body></html>")
-    writeFile("${tmpDir}/child.lint", "{% extends \"base.lint\" %}{% block body %}Hi {{ name }}{% endblock %}")
-    val result = render("${tmpDir}/child.lint", { "name": "Lin" })
+    writeFile("${tmpDir}/base.jinja", "<html><body>{% block body %}{% endblock %}</body></html>")
+    writeFile("${tmpDir}/child.jinja", "{% extends \"base.jinja\" %}{% block body %}Hi {{ name }}{% endblock %}")
+    val result = render("${tmpDir}/child.jinja", { "name": "Lin" })
     [
       expect(result.contains("<body>Hi Lin</body>")).toBe(true)
     ]

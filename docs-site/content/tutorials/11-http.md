@@ -83,7 +83,7 @@ val createUser = (req: Json): Json =>
 
 ## Templating
 
-`std/template` is Jinja-style (backed by minijinja): it fills `{{ ... }}` holes — plus `{% for %}` loops and `{% if %}` conditionals — with values from a data record. `renderWith` renders a template string; `render` reads a `.lint` template file from disk:
+`std/template` is Jinja-style (backed by minijinja): it fills `{{ ... }}` holes — plus `{% for %}` loops and `{% if %}` conditionals — with values from a data record. `renderWith` renders a template string; `render` reads a `.jinja` template file from disk:
 
 ```lin
 import { print } from "std/io"
@@ -103,7 +103,7 @@ import { text } from "std/http"
 import { render } from "std/template"
 
 val page = (req: Json): Json =>
-  val html = render("views/home.lint", { "title": "Home", "year": 2026 })
+  val html = render("views/home.jinja", { "title": "Home", "year": 2026 })
   match html
     is { "type": "error", "message": _ } => text(500, "template error")
     else => text(200, html)

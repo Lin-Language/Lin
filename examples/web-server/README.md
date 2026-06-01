@@ -11,7 +11,7 @@ port, routes each incoming request to a handler by path, and returns a response.
 - `std/http` response helpers: `json`, `text`, `badRequest`, `matchPath`.
 - HTML templating with `std/template`'s `render` (filling Jinja `{{ ... }}` holes) —
   the rendered HTML is returned in the response body. The view uses a **layout**:
-  `index.lint` `{% extends %}` a shared `base.lint`, which `{% include %}`s `footer.lint`.
+  `index.jinja` `{% extends %}` a shared `base.jinja`, which `{% include %}`s `footer.jinja`.
 - Imported types: `HttpRequest`/`HttpResponse` from `std/http`, brought in under
   `as Request`/`as Response` aliases and used in every handler's signature.
 
@@ -20,14 +20,14 @@ port, routes each incoming request to a handler by path, and returns a response.
 - **`main.lin`** — imports `router` and calls `router.serve(3000)` (blocks forever).
 - **`router.lin`** — `router(req)`: dispatches a `Request` to the right handler by path.
 - **`handlers.lin`** — `getIndex` / `getStatus` / `getUser`: produce responses.
-- **`views/index.lint`** — the page template rendered by `getIndex`; `{% extends "base.lint" %}`.
-- **`views/base.lint`** — the shared HTML layout (skeleton + `{% block content %}`); `{% include "footer.lint" %}`.
-- **`views/footer.lint`** — a partial pulled into the layout.
+- **`views/index.jinja`** — the page template rendered by `getIndex`; `{% extends "base.jinja" %}`.
+- **`views/base.jinja`** — the shared HTML layout (skeleton + `{% block content %}`); `{% include "footer.jinja" %}`.
+- **`views/footer.jinja`** — a partial pulled into the layout.
 - **`router.test.lin` / `handlers.test.lin`** — assert routed/handler responses
   (including that `getIndex` returns the rendered HTML body). These mock
   `std/template.render` (ADR-071) with an inline template, so routing/handler logic
   is tested without depending on the on-disk view path.
-- **`template.test.lin`** — renders the real `index.lint` file and asserts every
+- **`template.test.lin`** — renders the real `index.jinja` file and asserts every
   `{{ ... }}` hole is filled (the one suite that intentionally exercises the file).
 
 ## Run / Test
