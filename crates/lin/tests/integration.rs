@@ -2305,6 +2305,88 @@ print(toString(b))
     assert_eq!(output, vec!["11", "200"]);
 }
 
+// A `match` expression inside a parenthesised lambda body must parse: ADR-004 suppresses the
+// Indent/Dedent that the top-level arm-block relies on, so the parser falls back to the offside
+// rule (arms line up at one column). Single-expression arm bodies. Regression for the
+// "unexpected token Arrow" bug.
+#[test]
+fn test_match_in_inline_lambda() {
+    let output = run(r#"import { print } from "std/io"
+import { range, for } from "std/iter"
+
+range(0, 3).for(i =>
+  val label = match i
+    is 0 => "zero"
+    is 1 => "one"
+    else => "many"
+  print(label)
+)
+"#);
+    assert_eq!(output, vec!["zero", "one", "many"]);
+}
+
+// The statement AFTER a `match` inside a parenthesised lambda body (dedented to the body level)
+// must NOT be swallowed into the last arm — it runs every iteration. Distinguishes "swallowed
+// too little" (arms truncated) from "swallowed too much" (trailing stmt eaten as an arm body).
+#[test]
+fn test_statements_after_match_in_inline_lambda() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+range(0, 2).for(i =>
+  val r = match i
+    is 0 => 10
+    else => 20
+  print(toString(r))
+)
+"#);
+    // Each iteration prints the match result; `print` is after the match, not an arm.
+    assert_eq!(output, vec!["10", "20"]);
+}
+
+// A multi-statement arm body inside a parenthesised match keeps ALL its statements (offside
+// floor = the arm column), while the NEXT arm (aligned at the same column) terminates the body.
+#[test]
+fn test_multi_statement_match_arm_in_inline_lambda() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+range(0, 3).for(i =>
+  val r = match i
+    is 0 =>
+      val a = 1
+      val b = 2
+      a + b
+    is 1 =>
+      val x = 10
+      x + 5
+    else => 99
+  print(toString(r))
+)
+"#);
+    assert_eq!(output, vec!["3", "15", "99"]);
+}
+
+// A parenthesised `match (x is T)` scrutinee inside an inline lambda still parses its inner `is`
+// type-test: the delimited group resets the scrutinee's is/has suppression. Guards against the
+// fix over-suppressing `is`/`has`.
+#[test]
+fn test_match_paren_is_scrutinee_in_inline_lambda() {
+    let output = run(r#"import { print } from "std/io"
+import { range, for } from "std/iter"
+
+range(0, 2).for(i =>
+  val tagged = match (i is Int32)
+    is true => "is-int"
+    else => "no"
+  print(tagged)
+)
+"#);
+    assert_eq!(output, vec!["is-int", "is-int"]);
+}
+
 // A multiline JSON object literal passed as an argument is delimited by `{`/`}`/`,`, NOT by the
 // offside column. The column guard must not fire inside a literal (literals have their own
 // parser). Sanity that the offside change didn't disturb ADR-004 multiline literals in parens.
