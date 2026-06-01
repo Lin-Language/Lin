@@ -18,24 +18,12 @@ import { length } from "std/array"
 // `startCodeAt` trips a pre-existing codegen RC double-free (heap-use-after-free
 // in lin_array_release) — see the report. Driving start-code detection through
 // parseNals exercises the same logic and is memory-clean under ASan.
+
 val s = suite("raspberry-nal", [
   // single_nal_unit: SC4 67 AA BB SC4 68  -> one NAL (type 7, data 67 AA BB),
   // trailing 68 not flushed (matches Rust).
   test("single_nal_unit: one complete NAL, trailing NAL not flushed", () =>
-    val buf: UInt8[] = [
-      0,
-      0,
-      0,
-      1,
-      0x67,
-      0xAA,
-      0xBB,
-      0,
-      0,
-      0,
-      1,
-      0x68
-    ]
+    val buf: UInt8[] = [0, 0, 0, 1, 0x67, 0xAA, 0xBB, 0, 0, 0, 1, 0x68]
     val nals = parseNals(buf)
     val checks = [
       expect(length(nals)).toBe(1),
@@ -50,34 +38,7 @@ val s = suite("raspberry-nal", [
 
   // multiple_nal_units: three NALs, plus trailing SC + 0x41 to flush the third.
   test("multiple_nal_units: SPS, PPS, IDR in order", () =>
-    val buf: UInt8[] = [
-      0,
-      0,
-      0,
-      1,
-      0x67,
-      0x01,
-      0x02,
-      0,
-      0,
-      0,
-      1,
-      0x68,
-      0x03,
-      0,
-      0,
-      0,
-      1,
-      0x65,
-      0x04,
-      0x05,
-      0x06,
-      0,
-      0,
-      0,
-      1,
-      0x41
-    ]
+    val buf: UInt8[] = [0, 0, 0, 1, 0x67, 0x01, 0x02, 0, 0, 0, 1, 0x68, 0x03, 0, 0, 0, 1, 0x65, 0x04, 0x05, 0x06, 0, 0, 0, 1, 0x41]
     val nals = parseNals(buf)
     val checks = [
       expect(length(nals)).toBe(3),
@@ -90,17 +51,7 @@ val s = suite("raspberry-nal", [
 
   // three_byte_start_codes
   test("three_byte_start_codes: 00 00 01 delimiters", () =>
-    val buf: UInt8[] = [
-      0,
-      0,
-      1,
-      0x67,
-      0xAA,
-      0,
-      0,
-      1,
-      0x68
-    ]
+    val buf: UInt8[] = [0, 0, 1, 0x67, 0xAA, 0, 0, 1, 0x68]
     val nals = parseNals(buf)
     val checks = [
       expect(length(nals)).toBe(1),
@@ -111,24 +62,7 @@ val s = suite("raspberry-nal", [
 
   // mixed_start_code_lengths: SC4 ... SC3 ... SC4 -> two complete NALs.
   test("mixed_start_code_lengths: 4- and 3-byte mixed", () =>
-    val buf: UInt8[] = [
-      0,
-      0,
-      0,
-      1,
-      0x67,
-      0x01,
-      0,
-      0,
-      1,
-      0x68,
-      0x02,
-      0,
-      0,
-      0,
-      1,
-      0x65
-    ]
+    val buf: UInt8[] = [0, 0, 0, 1, 0x67, 0x01, 0, 0, 1, 0x68, 0x02, 0, 0, 0, 1, 0x65]
     val nals = parseNals(buf)
     val checks = [
       expect(length(nals)).toBe(2),
@@ -142,7 +76,7 @@ val s = suite("raspberry-nal", [
   test("no_start_code: no NALs", () =>
     val buf: UInt8[] = [0x41, 0x42, 0x43]
     val nals = parseNals(buf)
-    val checks = [expect(length(nals)).toBe(0)]
+    val checks = [ expect(length(nals)).toBe(0) ]
     checks
   ),
 
@@ -150,9 +84,9 @@ val s = suite("raspberry-nal", [
   test("empty_input: no NALs", () =>
     val empty: UInt8[] = []
     val nals = parseNals(empty)
-    val checks = [expect(length(nals)).toBe(0)]
+    val checks = [ expect(length(nals)).toBe(0) ]
     checks
-  )
+  ),
 ])
 
 run(s)

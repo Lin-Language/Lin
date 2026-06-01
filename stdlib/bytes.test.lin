@@ -3,12 +3,21 @@ import { length, push } from "std/array"
 import { for } from "std/iter"
 import { toUInt16, toUInt32, toUInt64 } from "std/number"
 import { toString } from "std/string"
-import { slice, u16FromBe, u32FromBe, u64FromBe, u16ToBe, u32ToBe, u64ToBe, u16FromLe, u32FromLe, u64FromLe, u16ToLe, u32ToLe, u64ToLe, f32ToBits, f32FromBits, f64ToBits, f64FromBits, f32ToBe, f32FromBe, f64ToBe, f64FromBe } from "std/bytes"
+import {
+  slice,
+  u16FromBe, u32FromBe, u64FromBe,
+  u16ToBe, u32ToBe, u64ToBe,
+  u16FromLe, u32FromLe, u64FromLe,
+  u16ToLe, u32ToLe, u64ToLe,
+  f32ToBits, f32FromBits, f64ToBits, f64FromBits,
+  f32ToBe, f32FromBe, f64ToBe, f64FromBe
+} from "std/bytes"
 
 // std/bytes: slicing and endian (de)serialization on UInt8[] byte buffers.
 // Round-trips compare the read-back integer/float against the original value.
 // Large unsigned values now display correctly (unsigned), so a few cases also
 // assert via toString to cover the display path, not just bit-equality.
+
 val s = suite("std/bytes", [
   test("u16 big-endian round-trips", () =>
     val v: UInt16 = 0xBEEF
@@ -64,16 +73,7 @@ val s = suite("std/bytes", [
     // A computed high u32 (all bits set) prints as 4294967295, not -1.
     val maxBytes: UInt8[] = [255, 255, 255, 255]
     // A computed high u64 (all bits set) prints as u64::MAX, not -1.
-    val maxBytes8: UInt8[] = [
-      255,
-      255,
-      255,
-      255,
-      255,
-      255,
-      255,
-      255
-    ]
+    val maxBytes8: UInt8[] = [255, 255, 255, 255, 255, 255, 255, 255]
     [
       expect(u32FromBe(maxBytes, 0).toString()).toBe("4294967295"),
       expect(u64FromBe(maxBytes8, 0).toString()).toBe("18446744073709551615")
@@ -104,7 +104,9 @@ val s = suite("std/bytes", [
   test("read honours the offset", () =>
     val b: UInt8[] = [0x00, 0x00, 0x12, 0x34]
     val v: UInt16 = 0x1234
-    [expect(u16FromBe(b, 2) == v).toBe(true)]
+    [
+      expect(u16FromBe(b, 2) == v).toBe(true)
+    ]
   ),
 
   test("f32 bits round-trip", () =>
@@ -119,7 +121,9 @@ val s = suite("std/bytes", [
   test("f64 bits round-trip", () =>
     val bits: UInt64 = 0x400921FB54442D18
     val f: Float64 = f64FromBits(bits)
-    [expect(f64ToBits(f) == bits).toBe(true)]
+    [
+      expect(f64ToBits(f) == bits).toBe(true)
+    ]
   ),
 
   test("f32 big-endian serialize/deserialize", () =>
@@ -141,13 +145,7 @@ val s = suite("std/bytes", [
   ),
 
   test("slice on a UInt8[] yields a UInt8[]", () =>
-    val buf: UInt8[] = [
-      10,
-      20,
-      30,
-      40,
-      50
-    ]
+    val buf: UInt8[] = [10, 20, 30, 40, 50]
     val sub: UInt8[] = slice(buf, 1, 4)
     [
       expect(sub.length()).toBe(3),
@@ -170,7 +168,7 @@ val s = suite("std/bytes", [
       expect(f32FromBe(packet, 0) == leftMotor).toBe(true),
       expect(f32FromBe(packet, 4) == rightMotor).toBe(true)
     ]
-  )
+  ),
 ])
 
 run(s)

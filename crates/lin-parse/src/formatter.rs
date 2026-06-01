@@ -63,6 +63,11 @@ thread_local! {
     /// be parenthesised (`(i) => …`) to re-parse. `fmt_function` reads this for its OWN params,
     /// then clears it while rendering the body so a nested non-argument lambda isn't affected.
     static IN_ARG_POSITION: RefCell<bool> = const { RefCell::new(false) };
+    /// One-shot HARD break: the NEXT array/object literal renders multi-line even if it fits and
+    /// the author wrote it inline (the author-inline-wins rule yields to this). Set by the
+    /// over-budget trailing-lambda path so `test("long name", () => [ shortbody ])` breaks the
+    /// body rather than splitting the arg list. Consumed by the first literal that reads it.
+    static HARD_BREAK_LITERAL: RefCell<bool> = const { RefCell::new(false) };
     /// One-shot: when set, the NEXT `fmt_function` whose body is a collection literal renders
     /// that body multi-line and clears the flag. Used by `fmt_call_arglist` for an over-budget
     /// `test("long name", () => [ … ])` so the array breaks (keeping `=> [` on the call line)
@@ -853,6 +858,51 @@ fn expr_extent(expr: &Expr) -> (u32, u32) {
 /// non-whitespace char before its extent is `(` and the next non-whitespace char after is `)`.
 /// Used to preserve author-written grouping parens that the parser discarded. False with no
 /// source installed.
+
+/// True if the author wrote an EXPLICIT `else null` (vs the implicit one the parser synthesises
+/// for a missing else). The parser gives an implicit null else the `if` KEYWORD's span — which
+/// sits before the condition — while an explicit `else null` gets the real `null` token span
+/// after the then-branch. So an else whose span starts at/after the condition is explicit. Used
+/// to omit only the implicit `else null` (in statement position) and keep an author-written one.
+fn else_is_explicit(else_branch: &Expr, condition: &Expr) -> bool {
+    else_branch.span().start >= condition.span().start
+}
+
+/// True if the source between char offsets `start` and `end` contains a newline — i.e. the
+/// author wrote this span across multiple lines. Used to RESPECT an author-multilined
+/// array/object literal (never roll a multi-line literal onto one line; we only force one-line
+/// literals to break). False with no source installed (fit-based fallback).
+/// True if the module source is installed (the comment-preserving formatter). When available,
+/// author-intent checks (`source_span_multiline`) drive literal layout; when not (a bare
+/// `Formatter::new()`), the fit-based / FORCE_ML fallback is used.
+fn source_available() -> bool {
+    SOURCE_CHARS.with(|c| !c.borrow().is_empty())
+}
+
+/// Run `f` with HARD_BREAK_LITERAL set to `v`, restoring afterwards.
+fn with_hard_break_literal<R>(v: bool, f: impl FnOnce() -> R) -> R {
+    let prev = HARD_BREAK_LITERAL.with(|c| c.replace(v));
+    let r = f();
+    HARD_BREAK_LITERAL.with(|c| *c.borrow_mut() = prev);
+    r
+}
+
+/// Consume the one-shot HARD_BREAK_LITERAL flag (returns its value and clears it).
+fn take_hard_break_literal() -> bool {
+    HARD_BREAK_LITERAL.with(|c| c.replace(false))
+}
+
+fn source_span_multiline(start: u32, end: u32) -> bool {
+    SOURCE_CHARS.with(|src_c| {
+        let src = src_c.borrow();
+        if src.is_empty() {
+            return false;
+        }
+        let (s, e) = (start as usize, (end as usize).min(src.len()));
+        s < e && src[s..e].iter().any(|&c| c == '\n')
+    })
+}
+
 fn source_parenthesized(expr: &Expr) -> bool {
     SOURCE_CHARS.with(|src_c| {
         let src = src_c.borrow();
@@ -1467,15 +1517,30 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         Expr::DotCall { .. } => fmt_chain(expr, ind),
 
         // ── Array ─────────────────────────────────────────────────────────────
-        Expr::Array(items, _) => {
+        Expr::Array(items, span) => {
             // Inline fast-path — suppressed once an ancestor literal went multiline
             // (Rule 4): a nested literal must then also render multiline. A MULTI-element
             // array whose elements contain function calls (e.g. a list of `expect(...)`
             // assertions) always renders multiline — packing several calls on one line reads
-            // poorly. A single-element array may stay inline regardless.
+            // poorly. A single-element array may stay inline regardless. Finally, respect the
+            // author's choice: an array the author broke across source lines stays multiline
+            // (we never roll a multi-line literal up — only force one-line literals to break).
             let inline_ok = items.len() <= 1
                 || (items.len() <= 4 && items.iter().all(is_atomic) && !items.iter().any(contains_call));
-            if !force_ml() && inline_ok {
+            // Author-multiline check: the array's `[` span is only the bracket, so scan from
+            // the `[` to the last element's end for a newline (the author broke it across lines).
+            let author_ml = items
+                .last()
+                .map(|last| source_span_multiline(span.start, expr_extent(last).1))
+                .unwrap_or(false);
+            // A HARD break (over-budget trailing lambda) forces multi-line even if it fits and
+            // the author wrote it inline; consume the one-shot flag.
+            let hard_break = take_hard_break_literal();
+            // Inline when it fits AND the author didn't break it. FORCE_ML (Rule 4, recursive
+            // JSON) suppresses inline for a nested literal — UNLESS we have the source and can
+            // see the author deliberately wrote that nested literal inline, in which case their
+            // choice wins (so `[ {…inline…}, {…inline…} ]` keeps the inner objects on one line).
+            if inline_ok && !author_ml && !hard_break && (!force_ml() || source_available()) {
                 let inline = fmt_inline(expr);
                 if inline.len() + ind.len() <= 80 {
                     return inline;
@@ -1512,7 +1577,7 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         }
 
         // ── Object ────────────────────────────────────────────────────────────
-        Expr::Object(fields, _) => {
+        Expr::Object(fields, span) => {
             if fields.is_empty() {
                 return "{}".to_string();
             }
@@ -1520,7 +1585,16 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
                 ObjectField::Pair(k, v) => is_atomic(k) && is_atomic(v),
                 ObjectField::Spread(e) => is_atomic(e),
             });
-            if !force_ml() && all_atomic && fields.len() <= 2 {
+            // Respect the author's choice: an object broken across source lines stays multiline.
+            let last_field_end = fields.last().map(|f| match f {
+                ObjectField::Pair(_, v) => expr_extent(v).1,
+                ObjectField::Spread(e) => expr_extent(e).1,
+            });
+            let author_ml = last_field_end
+                .map(|end| source_span_multiline(span.start, end))
+                .unwrap_or(false);
+            let hard_break = take_hard_break_literal();
+            if all_atomic && fields.len() <= 2 && !author_ml && !hard_break && (!force_ml() || source_available()) {
                 let inline = fmt_inline(expr);
                 if inline.len() + ind.len() <= 80 {
                     return inline;
@@ -1558,9 +1632,15 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         }
 
         // ── If ────────────────────────────────────────────────────────────────
-        Expr::If { condition, then_branch, else_branch, .. } => {
+        Expr::If { condition, then_branch, else_branch, span } => {
             let cond = fmt_expr(condition, false, ind);
             let is_null_else = matches!(else_branch.as_ref(), Expr::NullLit(_));
+            // A statement-position `if` with a NULL else: the `else null` is implicit and may
+            // be omitted. Omit it ONLY when the author did NOT write an explicit `else` in the
+            // source (an `else null` they wrote is kept — it may signal intent). `omit_else`
+            // gates both the inline and block forms below.
+            let _ = span;
+            let omit_else = is_stmt && is_null_else && !else_is_explicit(else_branch, condition);
 
             // Try inline. Skipped when any branch body carries an attached comment —
             // the inline form (`if c then a else b`) has nowhere to place it, so we fall
@@ -1576,8 +1656,11 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
                 && !if_has_branch_comment(expr)
             {
                 let t = fmt_inline(then_branch);
-                let e = fmt_inline(else_branch);
-                let inline = format!("if {} then {} else {}", cond, t, e);
+                let inline = if omit_else {
+                    format!("if {} then {}", cond, t)
+                } else {
+                    format!("if {} then {} else {}", cond, t, fmt_inline(else_branch))
+                };
                 if inline.len() + ind.len() <= 80 {
                     return inline;
                 }
@@ -1647,9 +1730,18 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
                         cur_null_else = matches!(else_branch.as_ref(), Expr::NullLit(_));
                         cur_else = else_branch;
                     }
-                    // Terminal else.
+                    // Terminal else. Omit an implicit `else null` (stmt position, author didn't
+                    // write it); keep an author-written one. Only the OUTERMOST `if`'s else is
+                    // gated by `omit_else` (it was computed for `else_branch`); a chained
+                    // `else if`'s own null-else is implicit by construction, so `cur_null_else`
+                    // && is_stmt still omits it.
                     _ => {
-                        if !(cur_null_else && is_stmt) {
+                        let omit = if cur_null_else && std::ptr::eq(cur_else, else_branch.as_ref()) {
+                            omit_else
+                        } else {
+                            cur_null_else && is_stmt
+                        };
+                        if !omit {
                             out.push_str(&format!("\n{}else\n{}", ind, render_body(cur_else)));
                         }
                         break;
@@ -1829,7 +1921,10 @@ fn fmt_function(
         let forced = FORCE_NEXT_LAMBDA_BODY_ML.with(|c| c.replace(false));
         let body_str = with_arg_position(false, || {
             if forced {
-                with_force_ml(true, || fmt_expr(body, false, ind))
+                // HARD break: the over-budget caller needs this body broken even though it
+                // fits and the author wrote it inline. HARD_BREAK_LITERAL overrides the
+                // author-inline-wins rule in the Array/Object inline path.
+                with_hard_break_literal(true, || with_force_ml(true, || fmt_expr(body, false, ind)))
             } else {
                 fmt_expr(body, false, ind)
             }
@@ -1846,7 +1941,9 @@ fn fmt_function(
         || author_body_on_new_line
         || !body_leading.is_empty();
 
-    let mut body_str = with_arg_position(false, || fmt_expr(body, false, &child_ind));
+    // The body is rendered in STATEMENT position: a lambda's body is its own statement context,
+    // so an `if … then …` body with an implicit (author-omitted) null else drops the `else null`.
+    let mut body_str = with_arg_position(false, || fmt_expr(body, true, &child_ind));
     if !body_trailing.is_empty() {
         body_str.push(' ');
         body_str.push_str(&body_trailing);
@@ -2129,17 +2226,16 @@ fn fmt_call_arglist_inner(args: &[Expr], ind: &str) -> String {
         // object/array last arg keeps the `)` glued to its `]`/`}` (Rule 5a).
         let last_is_multiline_lambda =
             matches!(&args[n - 1], Expr::Function { .. }) && last.contains('\n');
-        if n == 1 {
-            if last_is_multiline_lambda {
-                return format!("({}\n{})", last, ind);
-            }
-            return format!("({})", last);
+        // A multi-line lambda last arg puts the call's `)` on its own line at `ind` — UNLESS the
+        // lambda body is a collection literal whose `]`/`}` already sits at `ind` (the `=> [`/
+        // `=> {` collapse), in which case glue `)` directly so the close reads `])` / `})`.
+        let last_line = last.rsplit('\n').next().unwrap_or("");
+        let collapsed_close = last_line == format!("{}]", ind) || last_line == format!("{}}}", ind);
+        let lead = if n == 1 { String::new() } else { format!("{}, ", inline_args[..n - 1].join(", ")) };
+        if last_is_multiline_lambda && !collapsed_close {
+            return format!("({}{}\n{})", lead, last, ind);
         }
-        let lead: Vec<String> = inline_args[..n - 1].to_vec();
-        if last_is_multiline_lambda {
-            return format!("({}, {}\n{})", lead.join(", "), last, ind);
-        }
-        return format!("({}, {})", lead.join(", "), last);
+        return format!("({}{})", lead, last);
     }
 
     // OVER-BUDGET TRAILING LAMBDA-WITH-COLLECTION-BODY: the call exceeds 80 cols but no arg is
