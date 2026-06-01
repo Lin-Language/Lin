@@ -220,13 +220,7 @@ val s = suite("std/async", [
   ),
 
   test("frozen graph read concurrently by many threads", () =>
-    val table = frozen([
-      10,
-      20,
-      30,
-      40,
-      50
-    ])
+    val table = frozen([10, 20, 30, 40, 50])
     val results = parallel([
       () => length(table),
       () => length(table),
@@ -235,7 +229,7 @@ val s = suite("std/async", [
     [
       expect(results.toString()).toBe("[5, 5, 5]")
     ]
-  )
+  ),
 ])
 
 run(s)

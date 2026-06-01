@@ -65,7 +65,7 @@ val s = suite("std/yaml", [
       expect(bad is Error).toBe(true),
       expect(bad["type"]).toBe("error")
     ]
-  )
+  ),
 ])
 
 run(s)

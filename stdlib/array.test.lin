@@ -318,7 +318,9 @@ val s = suite("std/array", [
   ),
 
   test("sort strings lexicographically", () =>
-    val result = ["banana", "apple", "cherry"].sort((a, b) => if a < b then -1 else if a > b then 1 else 0)
+    val result = ["banana", "apple", "cherry"].sort((a, b) =>
+      if a < b then -1 else if a > b then 1 else 0
+    )
     [
       expect(result.toString()).toBe("[\"apple\", \"banana\", \"cherry\"]")
     ]
@@ -355,7 +357,7 @@ val s = suite("std/array", [
   ),
 
   test("sortBy objects by field", () =>
-    val result = [{ "name": "Bob" }, { "name": "Alice" }, { "name": "Charlie" }].sortBy(x => x["name"])
+    val result = [{"name": "Bob"}, {"name": "Alice"}, {"name": "Charlie"}].sortBy(x => x["name"])
     [
       expect(result[0]["name"]).toBe("Alice"),
       expect(result[1]["name"]).toBe("Bob"),
@@ -414,14 +416,14 @@ val s = suite("std/array", [
   ),
 
   test("minBy returns element with smallest key", () =>
-    val result = [{ "n": 3 }, { "n": 1 }, { "n": 2 }].minBy(x => x["n"])
+    val result = [{"n": 3}, {"n": 1}, {"n": 2}].minBy(x => x["n"])
     [
       expect(result["n"]).toBe(1)
     ]
   ),
 
   test("maxBy returns element with largest key", () =>
-    val result = [{ "n": 3 }, { "n": 1 }, { "n": 2 }].maxBy(x => x["n"])
+    val result = [{"n": 3}, {"n": 1}, {"n": 2}].maxBy(x => x["n"])
     [
       expect(result["n"]).toBe(3)
     ]
@@ -708,6 +710,7 @@ val s = suite("std/array", [
   // (heap) elements, where the fresh-vs-borrowed and consume-vs-retain ownership
   // rules matter (scalar elements hide RC bugs). Read the stored value back so a
   // use-after-free corrupts the assertion; the ASan CI leg also runs these.
+
   test("map producing strings (fresh union element)", () =>
     val result = [1, 2, 3].map(x => "n${x}")
     [
@@ -820,7 +823,7 @@ val s = suite("std/array", [
       expect(a.toString()).toBe("[7, 99, 7, 7]"),
       expect(f.toString()).toBe("[2.5, 1.5]")
     ]
-  )
+  ),
 ])
 
 run(s)

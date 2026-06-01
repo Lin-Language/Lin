@@ -71,7 +71,7 @@ val s = suite("std/jq", [
     [
       expect(r is Error).toBe(true)
     ]
-  )
+  ),
 ])
 
 run(s)

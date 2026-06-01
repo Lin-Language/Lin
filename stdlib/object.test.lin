@@ -100,11 +100,7 @@ val s = suite("std/object", [
   ),
 
   test("pick returns only specified keys", () =>
-    val obj = {
-      "a": 1,
-      "b": 2,
-      "c": 3
-    }
+    val obj = { "a": 1, "b": 2, "c": 3 }
     val p = obj.pick(["a", "c"])
     [
       expect(p.keys().length()).toBe(2)
@@ -112,11 +108,7 @@ val s = suite("std/object", [
   ),
 
   test("pick includes correct values", () =>
-    val obj = {
-      "a": 1,
-      "b": 2,
-      "c": 3
-    }
+    val obj = { "a": 1, "b": 2, "c": 3 }
     val p = obj.pick(["a", "c"])
     [
       expect(p["a"]).toBe(1)
@@ -124,11 +116,7 @@ val s = suite("std/object", [
   ),
 
   test("pick second included value is correct", () =>
-    val obj = {
-      "a": 1,
-      "b": 2,
-      "c": 3
-    }
+    val obj = { "a": 1, "b": 2, "c": 3 }
     val p = obj.pick(["a", "c"])
     [
       expect(p["c"]).toBe(3)
@@ -136,11 +124,7 @@ val s = suite("std/object", [
   ),
 
   test("pick excludes unspecified keys", () =>
-    val obj = {
-      "a": 1,
-      "b": 2,
-      "c": 3
-    }
+    val obj = { "a": 1, "b": 2, "c": 3 }
     val p = obj.pick(["a", "c"])
     [
       expect(p["b"]).toBe(null)
@@ -148,11 +132,7 @@ val s = suite("std/object", [
   ),
 
   test("omit returns object without specified keys", () =>
-    val obj = {
-      "a": 1,
-      "b": 2,
-      "c": 3
-    }
+    val obj = { "a": 1, "b": 2, "c": 3 }
     val o = obj.omit(["b"])
     [
       expect(o.keys().length()).toBe(2)
@@ -160,11 +140,7 @@ val s = suite("std/object", [
   ),
 
   test("omit excluded key is absent", () =>
-    val obj = {
-      "a": 1,
-      "b": 2,
-      "c": 3
-    }
+    val obj = { "a": 1, "b": 2, "c": 3 }
     val o = obj.omit(["b"])
     [
       expect(o["b"]).toBe(null)
@@ -172,11 +148,7 @@ val s = suite("std/object", [
   ),
 
   test("omit keeps remaining keys", () =>
-    val obj = {
-      "a": 1,
-      "b": 2,
-      "c": 3
-    }
+    val obj = { "a": 1, "b": 2, "c": 3 }
     val o = obj.omit(["b"])
     [
       expect(o["a"]).toBe(1)
@@ -208,7 +180,7 @@ val s = suite("std/object", [
   ),
 
   test("isEmpty returns true for empty object", () => [
-    expect(isEmpty({  })).toBe(true)
+    expect(isEmpty({})).toBe(true)
   ]),
 
   test("isEmpty returns true for empty array", () => [
@@ -234,6 +206,7 @@ val s = suite("std/object", [
   // --- heap/union value coverage for object index-assign (`result[k] = v`) ---
   // String values exercise the object-set store's retain semantics; scalar values
   // hide RC bugs. The ASan CI leg also runs these.
+
   test("mapValues producing string values", () =>
     val m = { "a": 1, "b": 2 }.mapValues(v => "v${v}")
     [
@@ -266,7 +239,7 @@ val s = suite("std/object", [
       expect(r["a"]).toBe("x"),
       expect(r["b"]).toBe("y")
     ]
-  )
+  ),
 ])
 
 run(s)

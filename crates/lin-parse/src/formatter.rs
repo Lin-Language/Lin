@@ -872,6 +872,36 @@ fn else_is_explicit(else_branch: &Expr, condition: &Expr) -> bool {
 /// author wrote this span across multiple lines. Used to RESPECT an author-multilined
 /// array/object literal (never roll a multi-line literal onto one line; we only force one-line
 /// literals to break). False with no source installed (fit-based fallback).
+/// True if `expr` is (or contains, in argument position) a lambda whose body the AUTHOR wrote
+/// on a different source line than the `=>` — Rule B. The inline fast-paths (`fmt_inline`) don't
+/// consult Rule B, so they would collapse such a body; callers use this to suppress the inline
+/// path and route through `fmt_function`, which honours the author's newline. Only descends the
+/// argument-bearing forms a lambda can hide in (call/method args, the chain receiver).
+fn has_author_newline_lambda(expr: &Expr) -> bool {
+    fn lambda_body_on_new_line(f: &Expr) -> bool {
+        if let Expr::Function { body, span, .. } = f {
+            // The function span starts at the params/`(`; compare to the body's start line.
+            return spans_on_different_source_lines(span.start, body.span().start)
+                && !is_hoist_body(body.span().start);
+        }
+        false
+    }
+    fn scan_args(args: &[Expr]) -> bool {
+        args.iter().any(|a| lambda_body_on_new_line(a) || has_author_newline_lambda(a))
+    }
+    match expr {
+        Expr::Function { .. } => lambda_body_on_new_line(expr),
+        Expr::Call { func, args, .. } => {
+            scan_args(args) || has_author_newline_lambda(func)
+        }
+        Expr::DotCall { receiver, args, .. } => {
+            args.as_deref().map(scan_args).unwrap_or(false) || has_author_newline_lambda(receiver)
+        }
+        Expr::Index { object, .. } => has_author_newline_lambda(object),
+        _ => false,
+    }
+}
+
 /// True if the module source is installed (the comment-preserving formatter). When available,
 /// author-intent checks (`source_span_multiline`) drive literal layout; when not (a bare
 /// `Formatter::new()`), the fit-based / FORCE_ML fallback is used.
@@ -2191,10 +2221,12 @@ fn fmt_call_arglist_inner(args: &[Expr], ind: &str) -> String {
     }
     let child_ind = format!("{}  ", ind);
 
-    // Inline attempt: render each arg at the call's own indent.
+    // Inline attempt: render each arg at the call's own indent. Suppressed when an arg is a
+    // lambda whose body the author put on its own line (Rule B) — inlining would collapse it.
     let inline_args: Vec<String> = args.iter().map(|a| fmt_expr(a, false, ind)).collect();
     let any_inline_multiline = inline_args.iter().any(|s| s.contains('\n'));
-    if !any_inline_multiline {
+    let any_author_newline_lambda = args.iter().any(has_author_newline_lambda);
+    if !any_inline_multiline && !any_author_newline_lambda {
         let joined = inline_args.join(", ");
         if joined.len() + ind.len() <= 80 {
             return format!("({})", joined);
@@ -2321,7 +2353,9 @@ fn fmt_chain(expr: &Expr, ind: &str) -> String {
         broke
     };
 
-    if chain.len() <= CHAIN_INLINE_MAX && !author_multiline {
+    // Don't take the inline path if a lambda arg has an author-newline body (Rule B): the
+    // inline form would collapse it. Route through the per-link rendering instead.
+    if chain.len() <= CHAIN_INLINE_MAX && !author_multiline && !has_author_newline_lambda(expr) {
         let inline = fmt_inline(expr);
         // Only use inline if it truly fits on one line (no newlines and fits in budget).
         if !inline.contains('\n') && inline.len() + ind.len() <= 120 {

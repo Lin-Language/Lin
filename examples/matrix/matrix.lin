@@ -2,45 +2,42 @@ import { sin, cos } from "std/math"
 
 // 3x3 matrix stored as a flat 9-element Float64 array, row-major order.
 // m[i*3+j] is row i, column j.
+
 // A 2D point in the plane — the result of mapping a point through a matrix.
 type Point = { "x": Float64, "y": Float64 }
 
 export val mat3Get = (m: Float64[], i: Int32, j: Int32): Float64 =>
   m[i * 3 + j]
 
-export val mat3 = (a: Float64, b: Float64, c: Float64, d: Float64, e: Float64, f: Float64, g: Float64, h: Float64, k: Float64): Float64[] =>
-  [
-    a,
-    b,
-    c,
-    d,
-    e,
-    f,
-    g,
-    h,
-    k
-  ]
+export val mat3 = (
+  a: Float64, b: Float64, c: Float64,
+  d: Float64, e: Float64, f: Float64,
+  g: Float64, h: Float64, k: Float64
+): Float64[] =>
+  [a, b, c, d, e, f, g, h, k]
 
 export val matMul = (a: Float64[], b: Float64[]): Float64[] =>
   mat3(
-    mat3Get(a, 0, 0) * mat3Get(b, 0, 0) + mat3Get(a, 0, 1) * mat3Get(b, 1, 0) + mat3Get(a, 0, 2) * mat3Get(b, 2, 0),
-    mat3Get(a, 0, 0) * mat3Get(b, 0, 1) + mat3Get(a, 0, 1) * mat3Get(b, 1, 1) + mat3Get(a, 0, 2) * mat3Get(b, 2, 1),
-    mat3Get(a, 0, 0) * mat3Get(b, 0, 2) + mat3Get(a, 0, 1) * mat3Get(b, 1, 2) + mat3Get(a, 0, 2) * mat3Get(b, 2, 2),
-    mat3Get(a, 1, 0) * mat3Get(b, 0, 0) + mat3Get(a, 1, 1) * mat3Get(b, 1, 0) + mat3Get(a, 1, 2) * mat3Get(b, 2, 0),
-    mat3Get(a, 1, 0) * mat3Get(b, 0, 1) + mat3Get(a, 1, 1) * mat3Get(b, 1, 1) + mat3Get(a, 1, 2) * mat3Get(b, 2, 1),
-    mat3Get(a, 1, 0) * mat3Get(b, 0, 2) + mat3Get(a, 1, 1) * mat3Get(b, 1, 2) + mat3Get(a, 1, 2) * mat3Get(b, 2, 2),
-    mat3Get(a, 2, 0) * mat3Get(b, 0, 0) + mat3Get(a, 2, 1) * mat3Get(b, 1, 0) + mat3Get(a, 2, 2) * mat3Get(b, 2, 0),
-    mat3Get(a, 2, 0) * mat3Get(b, 0, 1) + mat3Get(a, 2, 1) * mat3Get(b, 1, 1) + mat3Get(a, 2, 2) * mat3Get(b, 2, 1),
-    mat3Get(a, 2, 0) * mat3Get(b, 0, 2) + mat3Get(a, 2, 1) * mat3Get(b, 1, 2) + mat3Get(a, 2, 2) * mat3Get(b, 2, 2)
+    mat3Get(a,0,0)*mat3Get(b,0,0) + mat3Get(a,0,1)*mat3Get(b,1,0) + mat3Get(a,0,2)*mat3Get(b,2,0),
+    mat3Get(a,0,0)*mat3Get(b,0,1) + mat3Get(a,0,1)*mat3Get(b,1,1) + mat3Get(a,0,2)*mat3Get(b,2,1),
+    mat3Get(a,0,0)*mat3Get(b,0,2) + mat3Get(a,0,1)*mat3Get(b,1,2) + mat3Get(a,0,2)*mat3Get(b,2,2),
+    mat3Get(a,1,0)*mat3Get(b,0,0) + mat3Get(a,1,1)*mat3Get(b,1,0) + mat3Get(a,1,2)*mat3Get(b,2,0),
+    mat3Get(a,1,0)*mat3Get(b,0,1) + mat3Get(a,1,1)*mat3Get(b,1,1) + mat3Get(a,1,2)*mat3Get(b,2,1),
+    mat3Get(a,1,0)*mat3Get(b,0,2) + mat3Get(a,1,1)*mat3Get(b,1,2) + mat3Get(a,1,2)*mat3Get(b,2,2),
+    mat3Get(a,2,0)*mat3Get(b,0,0) + mat3Get(a,2,1)*mat3Get(b,1,0) + mat3Get(a,2,2)*mat3Get(b,2,0),
+    mat3Get(a,2,0)*mat3Get(b,0,1) + mat3Get(a,2,1)*mat3Get(b,1,1) + mat3Get(a,2,2)*mat3Get(b,2,1),
+    mat3Get(a,2,0)*mat3Get(b,0,2) + mat3Get(a,2,1)*mat3Get(b,1,2) + mat3Get(a,2,2)*mat3Get(b,2,2)
   )
 
 export val rotation2D = (theta: Float64): Float64[] =>
   val c = cos(theta)
   val s = sin(theta)
-  mat3(c, 0 - s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0)
+  mat3(c, -s, 0.0,
+       s,  c, 0.0,
+       0.0, 0.0, 1.0)
 
 export val applyToPoint = (mat: Float64[], x: Float64, y: Float64): Point =>
   {
-    "x": mat3Get(mat, 0, 0) * x + mat3Get(mat, 0, 1) * y + mat3Get(mat, 0, 2),
-    "y": mat3Get(mat, 1, 0) * x + mat3Get(mat, 1, 1) * y + mat3Get(mat, 1, 2)
+    "x": mat3Get(mat,0,0)*x + mat3Get(mat,0,1)*y + mat3Get(mat,0,2),
+    "y": mat3Get(mat,1,0)*x + mat3Get(mat,1,1)*y + mat3Get(mat,1,2)
   }
