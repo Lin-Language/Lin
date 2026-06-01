@@ -10,7 +10,7 @@ import { getIndex, getStatus, getUser } from "./handlers"
 // from a file on disk. (The real index.lint file rendering is covered separately in
 // template.test.lin.) A mock may call a DIFFERENT symbol — just not itself.
 replace render = (path: String, data: {}): Json =>
-  renderWith("<!DOCTYPE html><title>\${title}</title><h1>\${heading}</h1>", data)
+  renderWith("<!DOCTYPE html><title>{{ title }}</title><h1>{{ heading }}</h1>", data)
 
 val makeReq = (method: String, path: String): Request =>
   { "method": method, "path": path, "query": "", "headers": {}, "body": "" }

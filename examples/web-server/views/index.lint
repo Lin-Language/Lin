@@ -1,9 +1,7 @@
-<!DOCTYPE html>
-<html>
-<head><title>${title}</title></head>
-<body>
-<h1>${heading}</h1>
-<p>Status: ${status}</p>
-<p>Version: ${version}</p>
-</body>
-</html>
+{% extends "base.lint" %}
+
+{% block content %}
+<h1>{{ heading }}</h1>
+<p>Status: {{ status }}</p>
+<p>Version: {{ version }}</p>
+{% endblock %}

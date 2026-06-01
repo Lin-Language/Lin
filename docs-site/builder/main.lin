@@ -3,7 +3,7 @@ import { readFile, writeFile, readJson, ls, mkdir, cp } from "std/fs"
 import { join } from "std/path"
 import { split, startsWith, contains, trim, substring, indexOf, replaceAll } from "std/string"
 import { for, filter, push, length } from "std/array"
-import { renderWith } from "std/template"
+import { render } from "std/template"
 import { getEnv } from "std/env"
 
 import { markdownToHtml } from "./markdown"
@@ -100,16 +100,18 @@ val processFile = (filePath: String, navEntries: Json): Null =>
     val outputPath = contentPathToOutput(filePath)
     val isHome = urlPath == "/"
     val templatePath = if isHome then homeTemplate else pageTemplate
-    val templateJson = readFile(templatePath)
-    val templateStr = fileContent(templateJson)
     // The home page gets the two-column feature/code-tabs hero above its content.
     val hero = if isHome then buildHero(basePath) else ""
-    val rendered = renderWith(templateStr, { "title": title, "nav": navHtml, "content": htmlContent, "base": basePath, "hero": hero })
-    val outDir = dirName(outputPath)
-    mkdir(outDir, { "parents": true })
-    val writeResult = writeFile(outputPath, rendered)
-    if isError(writeResult) then print("Error writing ${outputPath}: ${errorMsg(writeResult)}")
-    else print("  ${outputPath}")
+    // render() loads the template by path so `{% extends "base.lint" %}` resolves
+    // against templates/ — page.lint and home.lint share the base.lint layout.
+    val rendered = render(templatePath, { "title": title, "nav": navHtml, "content": htmlContent, "base": basePath, "hero": hero })
+    if isError(rendered) then print("Error rendering ${templatePath}: ${errorMsg(rendered)}")
+    else
+      val outDir = dirName(outputPath)
+      mkdir(outDir, { "parents": true })
+      val writeResult = writeFile(outputPath, rendered)
+      if isError(writeResult) then print("Error writing ${outputPath}: ${errorMsg(writeResult)}")
+      else print("  ${outputPath}")
 
 // Copy static assets to output/static/
 val copyStatic = (): Null =>

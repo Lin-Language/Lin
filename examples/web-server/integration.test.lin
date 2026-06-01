@@ -14,7 +14,7 @@ import { router } from "./router"
 // passes is still interpolated and asserted. Rendering the real index.lint file is
 // covered separately in template.test.lin.
 replace render = (path: String, data: {}): Json =>
-  renderWith("<!DOCTYPE html><title>\${title}</title><h1>\${heading}</h1>", data)
+  renderWith("<!DOCTYPE html><title>{{ title }}</title><h1>{{ heading }}</h1>", data)
 
 val makeReq = (method: String, path: String): Request =>
   { "method": method, "path": path, "query": "", "headers": {}, "body": "" }
