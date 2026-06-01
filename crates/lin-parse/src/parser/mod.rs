@@ -15,11 +15,23 @@ pub struct Parser {
     /// Number of diagnostics at the start of the current statement parse.
     /// Used to detect whether an error occurred during a statement so we can synchronize.
     error_count_at_stmt_start: usize,
+    /// When true, `parse_is_has_expr` will NOT consume a trailing `is`/`has` infix operator.
+    /// Set only while parsing an inline (inside-parens) match scrutinee, where ADR-004
+    /// suppresses the Newline that would otherwise terminate the scrutinee before the first
+    /// `has`/`is` arm. Reset to false on entry to any delimited group (`(`/`[`/`{`) so a
+    /// parenthesised `match (x is Foo) ...` scrutinee still parses the inner `is` test.
+    suppress_is_has: bool,
+    /// When set, the arm column of an inline (inside-parens) match currently being parsed. An
+    /// `is`/`has` token at a column <= this floor begins the NEXT arm, not an infix type-test
+    /// on the current arm body, so `parse_is_has_expr` declines to consume it. An `is`/`has`
+    /// written inline within a body (`has 0 => x is Foo`) is at a strictly greater column and so
+    /// is still parsed as an infix test. Reset on entry to any delimited group.
+    match_arm_floor: Option<u32>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0, diagnostics: Vec::new(), error_count_at_stmt_start: 0 }
+        Self { tokens, pos: 0, diagnostics: Vec::new(), error_count_at_stmt_start: 0, suppress_is_has: false, match_arm_floor: None }
     }
 
     pub fn parse_module(&mut self) -> Module {

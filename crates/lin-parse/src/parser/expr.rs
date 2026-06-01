@@ -212,6 +212,21 @@ impl Parser {
 
     pub(crate) fn parse_is_has_expr(&mut self) -> Expr {
         let left = self.parse_shift_expr();
+        // Inside an inline match scrutinee (no Newline to bound it, ADR-004), a following
+        // `is`/`has` begins the FIRST arm, not an infix type-test on the scrutinee — so skip it.
+        if self.suppress_is_has {
+            return left;
+        }
+        // Within an inline match arm body, an `is`/`has` at or left of the arm column is the
+        // next arm's head, not an infix test on this body. (Inline tests like `x is Foo` sit at
+        // a strictly greater column and are still consumed.)
+        if self.check(TokenKind::Is) || self.check(TokenKind::Has) {
+            if let Some(floor) = self.match_arm_floor {
+                if self.current_column() <= floor {
+                    return left;
+                }
+            }
+        }
         if self.check(TokenKind::Is) {
             let span = self.current_span();
             self.advance();
@@ -471,9 +486,11 @@ impl Parser {
                 }
                 Expr::Ident(name, span)
             }
-            TokenKind::LBrace => self.parse_object_expr(),
-            TokenKind::LBracket => self.parse_array_expr(),
-            TokenKind::LParen => self.parse_paren_or_function(),
+            // Delimited groups open a fresh balanced span; the `suppress_is_has` scrutinee guard
+            // does not apply inside them, so `match (x is Foo) ...` parses its inner `is` test.
+            TokenKind::LBrace => self.without_is_has_suppression(Self::parse_object_expr),
+            TokenKind::LBracket => self.without_is_has_suppression(Self::parse_array_expr),
+            TokenKind::LParen => self.without_is_has_suppression(Self::parse_paren_or_function),
             // Generic function literal `<T, ...>(...) => ...`. A primary expression never
             // otherwise begins with `<` (comparison `<` is only reached after a left operand).
             TokenKind::Lt if self.is_generic_function_start() => self.parse_function_expr(),
@@ -664,24 +681,91 @@ impl Parser {
     pub(crate) fn parse_match_expr(&mut self) -> Expr {
         let span = self.current_span();
         self.advance(); // match
+        // Suppress the `is`/`has` infix at the scrutinee's top level so an inline (inside-parens)
+        // `match i has 0 => ...` reads `i` as the scrutinee and `has 0 => ...` as the first arm,
+        // not `(i has 0)` as a type-test. The flag is reset on entry to any `(`/`[`/`{` group, so
+        // a parenthesised `match (x is Foo)` scrutinee still parses its inner `is` test.
+        let prev_suppress = self.suppress_is_has;
+        self.suppress_is_has = true;
         let scrutinee = self.parse_expr();
+        self.suppress_is_has = prev_suppress;
         self.skip_newlines();
 
         let mut arms = Vec::new();
         if self.check(TokenKind::Indent) {
+            // Top-level / block-statement match: arms are an indented block (ADR-004 emits
+            // Indent/Dedent here). Unchanged from the original behaviour.
             self.advance();
             loop {
                 self.skip_newlines();
                 if self.check(TokenKind::Dedent) || self.is_at_end() {
                     break;
                 }
-                arms.push(self.parse_match_arm());
+                arms.push(self.parse_match_arm(None));
             }
             if self.check(TokenKind::Dedent) {
                 self.advance();
             }
+        } else {
+            // Inline / inside parens (ADR-004 suppresses Indent/Dedent/Newline). Use the
+            // offside rule: the arms all line up at one column (`arm_col`, taken from the first
+            // arm's `is`/`has`/`else`/`when` keyword). An arm-starting keyword at exactly that
+            // column is another arm; a token at a column < arm_col, or any non-arm token, ends
+            // the match (so a statement dedented to the lambda-body level after the match — e.g.
+            // `print(label)` — is NOT swallowed). Each arm body is parsed with `arm_col` as its
+            // offside floor so a multi-statement arm body stays together but the next arm (same
+            // column) terminates it.
+            let mut arm_col: Option<u32> = None;
+            loop {
+                if self.is_at_end()
+                    || self.check(TokenKind::RParen)
+                    || self.check(TokenKind::RBracket)
+                    || self.check(TokenKind::RBrace)
+                    || self.check(TokenKind::Comma)
+                    || self.check(TokenKind::Dedent)
+                {
+                    break;
+                }
+                if !self.at_match_arm_start() {
+                    break;
+                }
+                let col = self.current_column();
+                match arm_col {
+                    None => arm_col = Some(col),
+                    Some(ac) => {
+                        // A subsequent arm must align with the first. A dedent below the arm
+                        // column ends the match; a column past it is treated as out-of-block too
+                        // (it cannot belong to this match's arm list).
+                        if col != ac {
+                            break;
+                        }
+                    }
+                }
+                arms.push(self.parse_match_arm(arm_col));
+            }
         }
 
         Expr::Match { scrutinee: Box::new(scrutinee), arms, span }
+    }
+
+    /// Run `f` with the `suppress_is_has` scrutinee guard cleared, restoring it afterwards.
+    /// Used at delimited-group entry so an inner `is`/`has` type-test parses normally.
+    fn without_is_has_suppression(&mut self, f: fn(&mut Self) -> Expr) -> Expr {
+        let prev = self.suppress_is_has;
+        let prev_floor = self.match_arm_floor;
+        self.suppress_is_has = false;
+        self.match_arm_floor = None;
+        let e = f(self);
+        self.suppress_is_has = prev;
+        self.match_arm_floor = prev_floor;
+        e
+    }
+
+    /// True when the cursor is on a token that can begin a match arm (`is`/`has`/`else`/`when`).
+    fn at_match_arm_start(&self) -> bool {
+        matches!(
+            self.peek_kind(),
+            TokenKind::Is | TokenKind::Has | TokenKind::Else | TokenKind::When
+        )
     }
 }
