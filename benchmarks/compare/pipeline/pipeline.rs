@@ -1,6 +1,6 @@
 // pipeline.rs — range -> map -> filter -> reduce, materializing each stage into
 // an explicit Vec (no lazy iterator fusion). Prints "RESULT=<int>".
-const N: i64 = 2_000_000;
+const N: i64 = 20_000_000;
 
 fn main() {
     let a: Vec<i64> = (0..N).collect();

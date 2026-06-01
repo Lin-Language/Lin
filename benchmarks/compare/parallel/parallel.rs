@@ -3,7 +3,7 @@
 use std::thread;
 
 const START: i32 = 27;
-const ITERS: i32 = 30_000_000;
+const ITERS: i32 = 300_000_000;
 const CHUNKS: usize = 8;
 
 fn chunk() -> i64 {

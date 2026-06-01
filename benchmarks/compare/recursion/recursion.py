@@ -1,7 +1,7 @@
 # recursion.py — naive recursive fib + iterative sumTo. Prints "RESULT=<int>".
 import sys
 
-FIB_N = 38
+FIB_N = 42
 SUM_N = 50000000
 
 sys.setrecursionlimit(10000)

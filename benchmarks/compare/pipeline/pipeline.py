@@ -1,6 +1,6 @@
 # pipeline.py — range -> map -> filter -> reduce, materializing each stage
 # (list(map(...)) / list(filter(...)) so no lazy fusion). Prints "RESULT=<int>".
-N = 2000000
+N = 20000000
 
 
 def main():
