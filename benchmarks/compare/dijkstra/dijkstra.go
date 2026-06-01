@@ -2,9 +2,6 @@
 //
 // Reads the line-based graph (no JSON library, single `go build`) INSIDE the
 // timed region. Prints exactly one stdout line "RESULT=<int>"; logs to stderr.
-//
-// UNTESTED on the reference machine (no Go toolchain installed); written to be
-// correct and to match the other languages' checksum.
 package main
 
 import (

@@ -1,9 +1,6 @@
 // async_io.go — I/O-bound concurrency: 200 goroutines bounded to 50 in flight
 // via a buffered channel semaphore; each sleeps 50ms then returns i*2+1. Sum
 // accumulated under a mutex. Prints exactly one stdout line "RESULT=<int>".
-//
-// UNTESTED on the reference machine (no Go toolchain installed); written to be
-// correct and to match the other languages' checksum.
 package main
 
 import (

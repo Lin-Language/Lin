@@ -1,8 +1,5 @@
 // parallel.go — CPU-bound fan-out: 8 goroutines + sync.WaitGroup, results into
 // a slice. Prints exactly one stdout line "RESULT=<int>".
-//
-// UNTESTED on the reference machine (no Go toolchain installed); written to be
-// correct and to match the other languages' checksum.
 package main
 
 import (
