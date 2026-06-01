@@ -106,7 +106,7 @@ export val unique = (arr: Json): Json =>
   arr.for(item =>
     val key = lin_value_key(item)
     if seen[key] == null then push(result, item)
-    if seen[key] == null then seen[key] = true
+    if seen[key] == null then seen[key] = true else null
   )
   result
 
@@ -134,20 +134,20 @@ val _swap = (arr: Json, i: Int32, j: Int32): Null =>
 val _qsort = (arr: Json, cmp: (Json, Json) => Int32, lo: Int32, hi: Int32): Null =>
   if lo < hi then
     val pivot = arr[hi]
-      var i = lo - 1
-      var j = lo
-      lin_while(lin_range(lo, hi), _ =>
-        val should_swap = cmp(arr[j], pivot) <= 0
-        if should_swap then i = i + 1
-        if should_swap then _swap(arr, i, j)
-        j = j + 1
-        j < hi
-      )
-      i = i + 1
-      _swap(arr, i, hi)
-      val p = i
-      _qsort(arr, cmp, lo, p - 1)
-      _qsort(arr, cmp, p + 1, hi)
+    var i = lo - 1
+    var j = lo
+    lin_while(lin_range(lo, hi), _ =>
+      val should_swap = cmp(arr[j], pivot) <= 0
+      if should_swap then i = i + 1
+      if should_swap then _swap(arr, i, j)
+      j = j + 1
+      j < hi
+    )
+    i = i + 1
+    _swap(arr, i, hi)
+    val p = i
+    _qsort(arr, cmp, lo, p - 1)
+    _qsort(arr, cmp, p + 1, hi)
 
 export val sort = (arr: Json, cmp: (Json, Json) => Int32): Json =>
   val result = concat(arr, [])
@@ -156,7 +156,10 @@ export val sort = (arr: Json, cmp: (Json, Json) => Int32): Json =>
   result
 
 export val sortBy = (arr: Json, keyFn: (Json) => Json): Json =>
-  val pairs = _mapJ(arr, item => [keyFn(item), item])
+  val pairs = _mapJ(arr, item => [
+    keyFn(item),
+    item
+  ])
   val sorted = sort(pairs, (a, b) =>
     if a[0] < b[0] then -1 else if a[0] > b[0] then 1 else 0
   )
@@ -175,13 +178,19 @@ export val max = (arr: Json[]): Json =>
   _reduceJ(arr, arr[0], (acc, x) => if x > acc then x else acc)
 
 export val minBy = (arr: Json[], keyFn: (Json) => Json): Json =>
-  val pairs = _mapJ(arr, item => [keyFn(item), item])
+  val pairs = _mapJ(arr, item => [
+    keyFn(item),
+    item
+  ])
   _reduceJ(pairs, pairs[0], (acc, x) =>
     if x[0] < acc[0] then x else acc
   )[1]
 
 export val maxBy = (arr: Json[], keyFn: (Json) => Json): Json =>
-  val pairs = _mapJ(arr, item => [keyFn(item), item])
+  val pairs = _mapJ(arr, item => [
+    keyFn(item),
+    item
+  ])
   _reduceJ(pairs, pairs[0], (acc, x) =>
     if x[0] > acc[0] then x else acc
   )[1]

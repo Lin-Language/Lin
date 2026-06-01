@@ -15,40 +15,79 @@ var execCount = 0
 
 replace exec = (command: String, args: String[]): Json =>
   execCount = execCount + 1
-  if command == "ok" then { "status": 0, "stdout": "hello\n", "stderr": "" }
-  else if command == "boom" then { "status": 1, "stdout": "", "stderr": "nope" }
-  else if command == "missing" then { "type": "error", "message": "command not found" }
-  else { "status": 0, "stdout": "", "stderr": "" }
+  if command == "ok" then
+    {
+      "status": 0,
+      "stdout": "hello\n",
+      "stderr": ""
+    }
+  else if command == "boom" then
+    {
+      "status": 1,
+      "stdout": "",
+      "stderr": "nope"
+    }
+  else if command == "missing" then
+    { "type": "error", "message": "command not found" }
+  else
+    {
+      "status": 0,
+      "stdout": "",
+      "stderr": ""
+    }
 
 val s = suite("task", [
   test("a zero-exit command passes and captures trimmed stdout", () =>
-    val r = runTask({ "name": "echo", "command": "ok", "args": ["hi"] })
+    val r = runTask({
+      "name": "echo",
+      "command": "ok",
+      "args": ["hi"]
+    })
     [
       expect(r["outcome"]).toBe("pass"),
       expect(r["status"]).toBe(0),
       expect(r["output"]).toBe("hello")
     ]
   ),
+
   test("a non-zero exit is a fail carrying its status", () =>
-    val r = runTask({ "name": "f", "command": "boom", "args": [] })
+    val r = runTask({
+      "name": "f",
+      "command": "boom",
+      "args": []
+    })
     [
       expect(r["outcome"]).toBe("fail"),
       expect(r["status"]).toBe(1)
     ]
   ),
+
   test("an unlaunchable command is an error, not a crash", () =>
-    val r = runTask({ "name": "x", "command": "missing", "args": [] })
+    val r = runTask({
+      "name": "x",
+      "command": "missing",
+      "args": []
+    })
     [
       expect(r["outcome"]).toBe("error"),
       expect(r["status"]).toBe(-1),
       expect(r["output"]).toBe("command not found")
     ]
   ),
+
   test("runAll runs every task in order, invoking exec once each", () =>
     val before = execCount
     val results = runAll([
-      { "name": "a", "command": "ok",   "args": [] },
-      { "name": "b", "command": "boom", "args": [] }
+      {
+        "name": "a",
+        "command": "ok",
+        "args": []
+      },
+      {
+        "name": "b",
+        "command": "boom",
+        "args": []
+      }
     ])
     [
       expect(length(results)).toBe(2),
@@ -56,6 +95,6 @@ val s = suite("task", [
       expect(results[1]["outcome"]).toBe("fail"),
       expect(execCount - before).toBe(2)
     ]
-  ),
+  )
 ])
 run(s)

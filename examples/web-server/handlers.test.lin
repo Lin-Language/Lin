@@ -9,11 +9,17 @@ import { getIndex, getStatus, getUser } from "./handlers"
 // inline template via `renderWith` decouples the handler/routing logic under test
 // from a file on disk. (The real index.jinja file rendering is covered separately in
 // template.test.lin.) A mock may call a DIFFERENT symbol — just not itself.
-replace render = (path: String, data: {}): Json =>
+replace render = (path: String, data: {  }): Json =>
   renderWith("<!DOCTYPE html><title>{{ title }}</title><h1>{{ heading }}</h1>", data)
 
 val makeReq = (method: String, path: String): Request =>
-  { "method": method, "path": path, "query": "", "headers": {}, "body": "" }
+  {
+    "method": method,
+    "path": path,
+    "query": "",
+    "headers": {},
+    "body": ""
+  }
 
 val s = suite("handlers", [
   test("getIndex returns the rendered template HTML in the body", () =>
@@ -30,23 +36,26 @@ val s = suite("handlers", [
       expect(resp["body"] == "index").toBe(false)
     ]
   ),
+
   test("getStatus returns 200", () =>
     val resp = getStatus(makeReq("GET", "/api/status"))
     [
       expect(resp["status"]).toBe(200)
     ]
   ),
+
   test("getUser returns 200 for valid path", () =>
     val resp = getUser(makeReq("GET", "/users/42"))
     [
       expect(resp["status"]).toBe(200)
     ]
   ),
+
   test("getUser returns 404 for non-matching path", () =>
     val resp = getUser(makeReq("GET", "/other"))
     [
       expect(resp["status"]).toBe(404)
     ]
-  ),
+  )
 ])
 run(s)

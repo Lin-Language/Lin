@@ -3,12 +3,12 @@ import { toString } from "std/string"
 import { length } from "std/array"
 import { readFile, writeFile, appendFile, readLines, readJson, writeJson, exists, isFile, isDir, stat, ls, mkdir, rm, cp, mv, readFileBytes, writeFileBytes, writeLines } from "std/fs"
 
-val tmpRead   = "/tmp/lin_test_fs_read.txt"
+val tmpRead = "/tmp/lin_test_fs_read.txt"
 val tmpExists = "/tmp/lin_test_fs_exists.txt"
 val tmpAppend = "/tmp/lin_test_fs_append.txt"
-val tmpJson   = "/tmp/lin_test_fs_json.json"
-val tmpStat   = "/tmp/lin_test_fs_stat.txt"
-val tmpDir    = "/tmp/lin_test_fs_dir"
+val tmpJson = "/tmp/lin_test_fs_json.json"
+val tmpStat = "/tmp/lin_test_fs_stat.txt"
+val tmpDir = "/tmp/lin_test_fs_dir"
 val tmpRename = "/tmp/lin_test_fs_rename_src.txt"
 val tmpRenameDst = "/tmp/lin_test_fs_rename_dst.txt"
 
@@ -29,11 +29,14 @@ val s = suite("std/fs", [
   ),
 
   test("exists false before write, true after", () =>
-    tmpExists.rm({})
+    tmpExists.rm({  })
     val before = tmpExists.exists()
     tmpExists.writeFile("x")
     val after = tmpExists.exists()
-    [expect(before).toBe(false), expect(after).toBe(true)]
+    [
+      expect(before).toBe(false),
+      expect(after).toBe(true)
+    ]
   ),
 
   test("appendFile accumulates content", () =>
@@ -62,7 +65,7 @@ val s = suite("std/fs", [
 
   test("writeJson then readJson round-trips", () =>
     val data = { "name": "lin", "version": 1 }
-    tmpJson.writeJson(data, {})
+    tmpJson.writeJson(data, {  })
     val loaded = tmpJson.readJson()
     [
       expect(loaded["name"]).toBe("lin")
@@ -71,7 +74,7 @@ val s = suite("std/fs", [
 
   test("writeJson default is pretty (multiline)", () =>
     val data = { "name": "lin" }
-    tmpJson.writeJson(data, {})
+    tmpJson.writeJson(data, {  })
     val content = tmpJson.readFile()
     [
       expect(tmpJson.isFile()).toBe(true)
@@ -89,22 +92,32 @@ val s = suite("std/fs", [
 
   test("isFile false before write, true after", () =>
     val tmpIsFile = "/tmp/lin_test_fs_isfile.txt"
-    tmpIsFile.rm({})
+    tmpIsFile.rm({  })
     val before = tmpIsFile.isFile()
     tmpIsFile.writeFile("hello")
     val after = tmpIsFile.isFile()
-    [expect(before).toBe(false), expect(after).toBe(true)]
+    [
+      expect(before).toBe(false),
+      expect(after).toBe(true)
+    ]
   ),
 
   test("isDir returns true for temp dir, false for file", () =>
     tmpRead.writeFile("x")
-    [expect("/tmp".isDir()).toBe(true), expect(tmpRead.isDir()).toBe(false)]
+    [
+      expect("/tmp".isDir()).toBe(true),
+      expect(tmpRead.isDir()).toBe(false)
+    ]
   ),
 
   test("stat returns metadata for existing file", () =>
     tmpStat.writeFile("hello lin")
     val s = tmpStat.stat()
-    [expect(s["size"]).toBe(9), expect(s["isFile"]).toBe(true), expect(s["isDir"]).toBe(false)]
+    [
+      expect(s["size"]).toBe(9),
+      expect(s["isFile"]).toBe(true),
+      expect(s["isDir"]).toBe(false)
+    ]
   ),
 
   test("stat returns error for missing path", () =>
@@ -125,7 +138,7 @@ val s = suite("std/fs", [
 
   test("mkdir creates directory", () =>
     val mkdirPath = "/tmp/lin_test_fs_mkdir_once"
-    mkdirPath.mkdir({})
+    mkdirPath.mkdir({  })
     [
       expect(mkdirPath.isDir()).toBe(true)
     ]
@@ -144,14 +157,14 @@ val s = suite("std/fs", [
     listTmpDir.mkdir({ "parents": true })
     "/tmp/lin_test_fs_listdir/x.txt".writeFile("x")
     "/tmp/lin_test_fs_listdir/y.txt".writeFile("y")
-    val entries = listTmpDir.ls({})
+    val entries = listTmpDir.ls({  })
     [
       expect(entries.length()).toBe(2)
     ]
   ),
 
   test("ls returns error for missing directory", () =>
-    val result = "/nonexistent/path/that/does/not/exist".ls({})
+    val result = "/nonexistent/path/that/does/not/exist".ls({  })
     [
       expect(result["type"]).toBe("error")
     ]
@@ -172,13 +185,16 @@ val s = suite("std/fs", [
   test("rm removes a file", () =>
     tmpRename.writeFile("to delete")
     val before = tmpRename.exists()
-    tmpRename.rm({})
+    tmpRename.rm({  })
     val after = tmpRename.exists()
-    [expect(before).toBe(true), expect(after).toBe(false)]
+    [
+      expect(before).toBe(true),
+      expect(after).toBe(false)
+    ]
   ),
 
   test("rm returns error for missing file", () =>
-    val result = "/nonexistent/path/that/does/not/exist.txt".rm({})
+    val result = "/nonexistent/path/that/does/not/exist.txt".rm({  })
     [
       expect(result["type"]).toBe("error")
     ]
@@ -197,16 +213,24 @@ val s = suite("std/fs", [
   test("mv moves a file", () =>
     tmpRename.writeFile("hello rename")
     tmpRename.mv(tmpRenameDst)
-    [expect(tmpRename.exists()).toBe(false), expect(tmpRenameDst.exists()).toBe(true), expect(tmpRenameDst.readFile()).toBe("hello rename")]
+    [
+      expect(tmpRename.exists()).toBe(false),
+      expect(tmpRenameDst.exists()).toBe(true),
+      expect(tmpRenameDst.readFile()).toBe("hello rename")
+    ]
   ),
 
   test("cp copies a file", () =>
     val cpSrc = "/tmp/lin_test_fs_cp_src.txt"
     val cpDst = "/tmp/lin_test_fs_cp_dst.txt"
     cpSrc.writeFile("copy me")
-    cpDst.rm({})
+    cpDst.rm({  })
     cpSrc.cp(cpDst)
-    [expect(cpSrc.exists()).toBe(true), expect(cpDst.exists()).toBe(true), expect(cpDst.readFile()).toBe("copy me")]
+    [
+      expect(cpSrc.exists()).toBe(true),
+      expect(cpDst.exists()).toBe(true),
+      expect(cpDst.readFile()).toBe("copy me")
+    ]
   ),
 
   test("readFileBytes and writeFileBytes round-trip", () =>
@@ -228,7 +252,7 @@ val s = suite("std/fs", [
     [
       expect(result.length()).toBe(3)
     ]
-  ),
+  )
 ])
 
 run(s)

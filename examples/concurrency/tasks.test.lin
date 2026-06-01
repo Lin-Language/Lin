@@ -1,8 +1,5 @@
 import { expect, toBe, toSatisfy, test, suite, run } from "std/test"
-import {
-  squareAsync, weightedTriple, firstToFinish, withDeadline,
-  retryDivide, safeDivide, nestedValue
-} from "./tasks"
+import { squareAsync, weightedTriple, firstToFinish, withDeadline, retryDivide, safeDivide, nestedValue } from "./tasks"
 
 val s = suite("concurrency/tasks", [
   test("async/await computes on another thread", () => [
@@ -48,7 +45,7 @@ val s = suite("concurrency/tasks", [
 
   test("await auto-flattens nested promises", () => [
     expect(nestedValue(42)).toBe(42)
-  ]),
+  ])
 ])
 
 run(s)

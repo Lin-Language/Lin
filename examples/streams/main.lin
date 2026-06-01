@@ -7,7 +7,6 @@
 //
 // Run:   lin run examples/streams/main.lin
 // Test:  lin test examples/streams/
-
 import { print } from "std/io"
 import { readStream, lines, writeStream, drain } from "std/stream"
 import { writeFile, readFile } from "std/fs"
