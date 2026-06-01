@@ -2400,7 +2400,8 @@ fn test_array_allocate_filled_concrete_heap_no_double_free() {
     // missing retain corrupts the heap; correctness of the printed values is the visible check.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { arrayAllocateFilled, range, for } from "std/array"
+import { arrayAllocateFilled } from "std/array"
+import { range, for } from "std/iter"
 
 val make = (): Null =>
   val arrs = arrayAllocateFilled(3, [1, 2])
@@ -2427,7 +2428,8 @@ fn test_iterator_arg_to_array_param_free_call() {
     // `x.f(y)` agree. Plain assignment (`val a: Int32[] = range(..)`) still rejects.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map, filter, reduce, range, length } from "std/array"
+import { length } from "std/array"
+import { map, filter, reduce, range } from "std/iter"
 
 val a = map(range(0, 5), i => i * 10)
 print("${toString(length(a))} ${toString(a[0])} ${toString(a[4])}")
@@ -7409,7 +7411,8 @@ fn test_borrowed_index_read_write_loops_are_correct() {
     // pq-array access pattern that motivated the optimization.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { arrayAllocateFilled, for } from "std/array"
+import { arrayAllocateFilled } from "std/array"
+import { for } from "std/iter"
 
 var a = arrayAllocateFilled(5, 0)
 // direct index-set writes through the global-var array
