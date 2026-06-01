@@ -19,8 +19,10 @@ match solve(graphPath, source, target, outputPath)
   has { "type": "error", message } =>
     print("error reading graph: ${message}")
     exit(1)
-  has { "type": "no-path" } => print("no path from ${source} to ${target}")
+  has { "type": "no-path" } =>
+    print("no path from ${source} to ${target}")
   has { "type": "ok", path, distance } =>
     print("path: ${join(path, " ")}")
     print("distance: ${toString(distance)}")
-  else => print("unexpected result")
+  else =>
+    print("unexpected result")

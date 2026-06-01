@@ -36,8 +36,8 @@ val CLOCK_RATE = 90000
 export val TIMESTAMP_INCREMENT: UInt32 = 3000 // CLOCK_RATE / 30 (30 fps)
 
 // Byte-0 is constant (V=2, P=0, X=0, CC=0). Byte-1 is M-bit + payload type.
-val hdrNoMarker: UInt8[] = [0x80, 0x60]
-val hdrMarker: UInt8[] = [0x80, 0xE0]
+val hdrNoMarker: UInt8[] = [0x80, 0x60] // 0x60 = PAYLOAD_TYPE (96)
+val hdrMarker: UInt8[] = [0x80, 0xE0]   // 0xE0 = 0x80 | 96
 
 // Advance the timestamp by one frame period. (u32 wrap is not modelled — frames
 // would have to run for ~16 hours at 30fps before TIMESTAMP_INCREMENT overflows.)

@@ -20,7 +20,8 @@ val UNREACHABLE = 999999999
 export val solve = (graphPath: String, source: String, target: String, outputPath: Json): SolveResult =>
   val graphData = readJson(graphPath)
   match graphData
-    has { "type": "error", message } => { "type": "error", "message": message }
+    has { "type": "error", message } =>
+      { "type": "error", "message": message }
     else =>
       val adj = buildAdj(graphData["edges"])
       val result = dijkstra(adj, source, graphData["nodes"])

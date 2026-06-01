@@ -48,27 +48,15 @@ export val encodePacket = (left: Float64, right: Float64): UInt8[] =>
 // Any other key leaves the speeds unchanged.
 export val applyKey = (key: Int32, left: Float64, right: Float64): Float64[] =>
   if key == 113 then
-    [
-      clampSpeed(left + STEP),
-      right // q: left +
-    ]
+    [clampSpeed(left + STEP), right] // q: left +
   else if key == 97 then
-    [
-      clampSpeed(left - STEP),
-      right // a: left -
-    ]
+    [clampSpeed(left - STEP), right] // a: left -
   else if key == 119 then
-    [
-      left,
-      clampSpeed(right + STEP) // w: right +
-    ]
+    [left, clampSpeed(right + STEP)] // w: right +
   else if key == 115 then
-    [
-      left,
-      clampSpeed(right - STEP) // s: right -
-    ]
+    [left, clampSpeed(right - STEP)] // s: right -
   else if key == 32 then
-    [0.0, 0.0]
+    [0.0, 0.0] // space: stop
   else
     [left, right]
 
