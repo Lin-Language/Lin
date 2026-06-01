@@ -18,7 +18,7 @@ val s = suite("std/process", [
       0,
       0,
       0,
-      0,
+      0
     ]
     val n = readStdout(h, buf)
     val code = wait(h)
@@ -29,7 +29,7 @@ val s = suite("std/process", [
       expect(buf[2]).toBe(108),
       expect(buf[3]).toBe(108),
       expect(buf[4]).toBe(111),
-      expect(code).toBe(0),
+      expect(code).toBe(0)
     ]),
   test("wait returns the child's exit code", () =>
     val h = spawn("sh", ["-c", "exit 3"])
@@ -47,7 +47,7 @@ val s = suite("std/process", [
     [expect(r["status"]).toBe(0), expect(r["stdout"]).toBe("onetwo")]),
   test("cwd returns a non-empty absolute path", () =>
     val here = cwd()
-    [expect(contains(here, "/")).toBe(true)]),
+    [expect(contains(here, "/")).toBe(true)])
 ])
 
 run(s)

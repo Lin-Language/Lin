@@ -21,7 +21,7 @@ export val firstToFinish = (slowMs: Int64, fastMs: Int64): Json =>
       "slow"),
     async(() =>
       sleep(fastMs)
-      "fast"),
+      "fast")
   ]))
 
 // timeout — resolves with the value if the promise finishes within `ms`, else Null

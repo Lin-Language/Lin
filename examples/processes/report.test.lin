@@ -7,29 +7,26 @@ import { TaskResult } from "./task"
 import { contains } from "std/string"
 
 // Pure unit tests over synthetic TaskResults — no subprocesses spawned.
-val pass = (n: String): TaskResult =>
-  {
-    "name": n,
-    "outcome": "pass",
-    "status": 0,
-    "output": "",
-  }
+val pass = (n: String): TaskResult => {
+  "name": n,
+  "outcome": "pass",
+  "status": 0,
+  "output": ""
+}
 
-val fail = (n: String): TaskResult =>
-  {
-    "name": n,
-    "outcome": "fail",
-    "status": 1,
-    "output": "",
-  }
+val fail = (n: String): TaskResult => {
+  "name": n,
+  "outcome": "fail",
+  "status": 1,
+  "output": ""
+}
 
-val err = (n: String): TaskResult =>
-  {
-    "name": n,
-    "outcome": "error",
-    "status": -1,
-    "output": "boom",
-  }
+val err = (n: String): TaskResult => {
+  "name": n,
+  "outcome": "error",
+  "status": -1,
+  "output": "boom"
+}
 
 val s = suite("report", [
   test("summarize counts an all-pass run as ok", () =>
@@ -38,14 +35,14 @@ val s = suite("report", [
       expect(sm["total"]).toBe(2),
       expect(sm["passed"]).toBe(2),
       expect(sm["failed"]).toBe(0),
-      expect(sm["ok"]).toBe(true),
+      expect(sm["ok"]).toBe(true)
     ]),
   test("summarize counts fail and error as failed", () =>
     val sm = summarize([pass("a"), fail("b"), err("c")])
     [
       expect(sm["passed"]).toBe(1),
       expect(sm["failed"]).toBe(2),
-      expect(sm["ok"]).toBe(false),
+      expect(sm["ok"]).toBe(false)
     ]),
   test("summarize of an empty run is vacuously ok", () =>
     val sm = summarize([])
@@ -55,9 +52,12 @@ val s = suite("report", [
     [
       expect(out.contains("[pass] build (exit 0)")).toBe(true),
       expect(out.contains("[fail] lint (exit 1)")).toBe(true),
-      expect(out.contains("1 of 2 task(s) failed")).toBe(true),
+      expect(out.contains("1 of 2 task(s) failed")).toBe(true)
     ]),
-  test("render footer reports all-passed", () => [expect(render([pass("a")]).contains("all 1 task(s) passed")).toBe(true)]),
+  test(
+    "render footer reports all-passed",
+    () => [expect(render([pass("a")]).contains("all 1 task(s) passed")).toBe(true)]
+  )
 ])
 
 run(s)

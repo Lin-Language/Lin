@@ -44,7 +44,7 @@ val s = suite("raspberry-controller integration", [
       expect(leftCmd["channel"]).toBe("rpwm"),
       expect(leftCmd["duty"]).toBe(100),
       expect(rightCmd["channel"]).toBe("rpwm"),
-      expect(rightCmd["duty"]).toBe(100),
+      expect(rightCmd["duty"]).toBe(100)
     ]),
   test("control path: reverse then stop maps to lpwm then stop", () =>
     // two big-endian f32
@@ -67,7 +67,7 @@ val s = suite("raspberry-controller integration", [
       expect(stopDec[0]).toBe(0.0),
       expect(stopDec[1]).toBe(0.0),
       expect(stopCmd["channel"]).toBe("stop"),
-      expect(stopCmd["duty"]).toBe(0),
+      expect(stopCmd["duty"]).toBe(0)
     ]),
   test("video path: parse Annex-B stream -> RTP packetize", () =>
     // reverse -> lpwm
@@ -91,7 +91,7 @@ val s = suite("raspberry-controller integration", [
       0,
       0,
       1,
-      65,
+      65
     ]
     val nals: NalUnit[] = parseNals(buf) // emits 2 complete NALs
     val firstNal: UInt8[] = nals[0]["data"]
@@ -106,8 +106,8 @@ val s = suite("raspberry-controller integration", [
       expect(pkt[0]).toBe(128),
       expect(pkt[8]).toBe(18),
       expect(pkt[12]).toBe(103),
-      expect(seqAfter).toBe(1),
-    ]),
+      expect(seqAfter).toBe(1)
+    ])
 ])
 
 // SPS(7) + PPS(8), 0x41 flushes

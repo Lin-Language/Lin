@@ -19,7 +19,7 @@ val s = suite("matrix integration", [
     val pt = applyToPoint(composed, 1.0, 0.0)
     [
       expect(pt["x"].toFixed(4)).toBe("0.0000"),
-      expect(pt["y"].toFixed(4)).toBe("1.0000"),
+      expect(pt["y"].toFixed(4)).toBe("1.0000")
     ]),
   test("rotation preserves vector magnitude", () =>
     // Matrix → vector pipeline: rotating a vector by 90° preserves its magnitude
@@ -35,14 +35,14 @@ val s = suite("matrix integration", [
     val pt = applyToPoint(rot, 1.0, 0.0)
     val rotated = [pt["x"], pt["y"]]
     [
-      expect(angleBetween([1.0, 0.0], rotated).toFixed(4)).toBe(toFixed(PI / 2.0, 4)),
+      expect(angleBetween([1.0, 0.0], rotated).toFixed(4)).toBe(toFixed(PI / 2.0, 4))
     ]),
   test("rotated unit vector is orthogonal to the original", () =>
     // The rotated unit vector is still perpendicular to the original (dot == 0).
     val rot = rotation2D(PI / 2.0)
     val pt = applyToPoint(rot, 1.0, 0.0)
     val rotated = [pt["x"], pt["y"]]
-    [expect(dot2([1.0, 0.0], rotated).toFixed(4)).toBe("0.0000")]),
+    [expect(dot2([1.0, 0.0], rotated).toFixed(4)).toBe("0.0000")])
 ])
 
 run(s)

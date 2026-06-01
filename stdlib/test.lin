@@ -26,7 +26,7 @@ val _evalResult = (name: String, results: Assertion[]): Json =>
     {
       "type": "fail",
       "name": name,
-      "failures": failures,
+      "failures": failures
     }
 
 val _printFail = (r: Json): Null =>

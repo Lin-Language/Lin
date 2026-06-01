@@ -79,7 +79,7 @@ val s = suite("std/fs", [
     [
       expect(s["size"]).toBe(9),
       expect(s["isFile"]).toBe(true),
-      expect(s["isDir"]).toBe(false),
+      expect(s["isDir"]).toBe(false)
     ]),
   test("stat returns error for missing path", () =>
     val s = "/nonexistent/path/that/does/not/exist.txt".stat()
@@ -136,7 +136,7 @@ val s = suite("std/fs", [
     [
       expect(tmpRename.exists()).toBe(false),
       expect(tmpRenameDst.exists()).toBe(true),
-      expect(tmpRenameDst.readFile()).toBe("hello rename"),
+      expect(tmpRenameDst.readFile()).toBe("hello rename")
     ]),
   test("cp copies a file", () =>
     val cpSrc = "/tmp/lin_test_fs_cp_src.txt"
@@ -147,7 +147,7 @@ val s = suite("std/fs", [
     [
       expect(cpSrc.exists()).toBe(true),
       expect(cpDst.exists()).toBe(true),
-      expect(cpDst.readFile()).toBe("copy me"),
+      expect(cpDst.readFile()).toBe("copy me")
     ]),
   test("readFileBytes and writeFileBytes round-trip", () =>
     val byteFile = "/tmp/lin_test_fs_bytes.bin"
@@ -157,13 +157,13 @@ val s = suite("std/fs", [
     val bytesOut = byteFile.readFileBytes()
     [
       expect(bytesIn.length()).toBe(bytesOut.length()),
-      expect(bytesIn[0]).toBe(bytesOut[0]),
+      expect(bytesIn[0]).toBe(bytesOut[0])
     ]),
   test("writeLines and readLines round-trip", () =>
     val linesFile = "/tmp/lin_test_fs_lines_rt.txt"
     linesFile.writeLines(["foo", "bar", "baz"])
     val result = linesFile.readLines()
-    [expect(result.length()).toBe(3)]),
+    [expect(result.length()).toBe(3)])
 ])
 
 run(s)

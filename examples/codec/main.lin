@@ -24,12 +24,16 @@ print("packed (${toString(length(packed))} bytes): ${toString(packed)}")
 
 val decoded = decode(packed)
 
-print("decoded ${toString(length(decoded))} field(s); first tag=${toString(decoded[0]["tag"])}")
+print(
+  "decoded ${toString(length(decoded))} field(s); first tag=${toString(decoded[0]["tag"])}"
+)
 
 // --- Bit twiddling ---
 val byte = packNibbles(10, 5)
 
-print("packed nibbles 0xA,0x5 = ${toString(byte)} (hi=${toString(highNibble(byte))} lo=${toString(lowNibble(byte))})")
+print(
+  "packed nibbles 0xA,0x5 = ${toString(byte)} (hi=${toString(highNibble(byte))} lo=${toString(lowNibble(byte))})"
+)
 
 print("NAL type of 0x67 = ${toString(nalType(103))}")
 

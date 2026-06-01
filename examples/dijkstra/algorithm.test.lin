@@ -18,18 +18,18 @@ val s = suite("dijkstra algorithm", [
       {
         "from": "A",
         "to": "C",
-        "weight": 1,
+        "weight": 1
       },
       {
         "from": "C",
         "to": "B",
-        "weight": 2,
+        "weight": 2
       },
       {
         "from": "A",
         "to": "B",
-        "weight": 10,
-      },
+        "weight": 10
+      }
     ])
     val result = dijkstra(adj, "A", ["A", "B", "C"])
     [expect(result["dist"]["B"]).toBe(3)]),
@@ -42,21 +42,21 @@ val s = suite("dijkstra algorithm", [
       {
         "from": "A",
         "to": "C",
-        "weight": 1,
+        "weight": 1
       },
       {
         "from": "C",
         "to": "B",
-        "weight": 2,
+        "weight": 2
       },
       {
         "from": "A",
         "to": "B",
-        "weight": 10,
-      },
+        "weight": 10
+      }
     ])
     val result = dijkstra(adj, "A", ["A", "B", "C"])
-    [expect(result["prev"]["B"]).toBe("C")]),
+    [expect(result["prev"]["B"]).toBe("C")])
 ])
 
 run(s)

@@ -11,31 +11,38 @@ val s = suite("config decode (fromJson)", [
     val r = decodePerson({
       "name": "Ada",
       "age": 36,
-      "address": { "city": "London" },
+      "address": {
+        "city": "London"
+      }
     })
     [
       expect(isError(r)).toBe(false),
       expect(r["name"]).toBe("Ada"),
       expect(r["age"]).toBe(36),
-      expect(r["address"]["city"]).toBe("London"),
+      expect(r["address"]["city"]).toBe("London")
     ]),
   test("decodes with the optional field present", () =>
     val r = decodePerson({
       "name": "Bo",
       "age": 1,
-      "address": { "city": "X", "zip": "00000" },
+      "address": {
+        "city": "X",
+        "zip": "00000"
+      }
     })
     [expect(isError(r)).toBe(false), expect(r["address"]["zip"]).toBe("00000")]),
   test("rejects a wrong nested type with a path", () =>
     val r = decodePerson({
       "name": "Bob",
       "age": "old",
-      "address": { "city": "Paris" },
+      "address": {
+        "city": "Paris"
+      }
     })
     [expect(isError(r)).toBe(true), expect(r["path"]).toSatisfy(p => p != null)]),
   test("rejects a missing required field", () =>
     val r = decodePerson({ "name": "Cleo", "age": 12 })
-    [expect(isError(r)).toBe(true)]),
+    [expect(isError(r)).toBe(true)])
 ])
 
 run(s)

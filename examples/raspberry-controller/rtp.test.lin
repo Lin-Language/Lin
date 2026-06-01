@@ -34,7 +34,7 @@ val s = suite("raspberry-rtp", [
       expect(pkt[11]).toBe(120),
       expect(length(pkt)).toBe(16),
       expect(pkt[12]).toBe(103),
-      expect(pkt[15]).toBe(3),
+      expect(pkt[15]).toBe(3)
     ]
     // V=2
     // 0x80 | 96 (marker set)
@@ -61,7 +61,7 @@ val s = suite("raspberry-rtp", [
       expect(p1[3]).toBe(0),
       expect(p2[2]).toBe(0),
       expect(p2[3]).toBe(1),
-      expect(seq1).toBe(1),
+      expect(seq1).toBe(1)
     ]
     // seq high byte
     // seq low byte = 0
@@ -79,7 +79,7 @@ val s = suite("raspberry-rtp", [
       expect(p1[7]).toBe(0),
       expect(p2[6]).toBe(11),
       expect(p2[7]).toBe(184),
-      expect(ts2).toBe(TIMESTAMP_INCREMENT),
+      expect(ts2).toBe(TIMESTAMP_INCREMENT)
     ]
     // ts1 = 0
     // ts2 = 3000
@@ -96,7 +96,7 @@ val s = suite("raspberry-rtp", [
       221,
       238,
       255,
-      17,
+      17
     ]
     val nal = doubleUp(seed, MAX_RTP_PAYLOAD + 100) // IDR header (0x65) + big body
     val packets = packetize(0, 0, 1, nal, true)
@@ -112,7 +112,7 @@ val s = suite("raspberry-rtp", [
       expect(first[13] & 31).toBe(5),
       expect(last[1]).toBe(224),
       expect((last[13] & 128) == 0).toBe(true),
-      expect((last[13] & 64) != 0).toBe(true),
+      expect((last[13] & 64) != 0).toBe(true)
     ]
     // V=2
     // no marker on first fragment
@@ -133,7 +133,7 @@ val s = suite("raspberry-rtp", [
     val checks = [
       expect(packetCount(atMax)).toBe(1),
       expect(packetCount(overMax)).toBe(2),
-      expect(packetCount(empty)).toBe(0),
+      expect(packetCount(empty)).toBe(0)
     ]
     // fits in one packet
     // fragments into two
@@ -144,7 +144,7 @@ val s = suite("raspberry-rtp", [
     val empty: UInt8[] = []
     val packets = packetize(0, 0, 1, empty, false)
     val checks = [expect(length(packets)).toBe(0)]
-    checks),
+    checks)
 ])
 
 run(s)

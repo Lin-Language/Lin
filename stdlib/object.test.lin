@@ -54,7 +54,7 @@ val s = suite("std/object", [
     val obj = {
       "a": 1,
       "b": 2,
-      "c": 3,
+      "c": 3
     }
     val p = obj.pick(["a", "c"])
     [expect(p.keys().length()).toBe(2)]),
@@ -62,7 +62,7 @@ val s = suite("std/object", [
     val obj = {
       "a": 1,
       "b": 2,
-      "c": 3,
+      "c": 3
     }
     val p = obj.pick(["a", "c"])
     [expect(p["a"]).toBe(1)]),
@@ -70,7 +70,7 @@ val s = suite("std/object", [
     val obj = {
       "a": 1,
       "b": 2,
-      "c": 3,
+      "c": 3
     }
     val p = obj.pick(["a", "c"])
     [expect(p["c"]).toBe(3)]),
@@ -78,7 +78,7 @@ val s = suite("std/object", [
     val obj = {
       "a": 1,
       "b": 2,
-      "c": 3,
+      "c": 3
     }
     val p = obj.pick(["a", "c"])
     [expect(p["b"]).toBe(null)]),
@@ -86,7 +86,7 @@ val s = suite("std/object", [
     val obj = {
       "a": 1,
       "b": 2,
-      "c": 3,
+      "c": 3
     }
     val o = obj.omit(["b"])
     [expect(o.keys().length()).toBe(2)]),
@@ -94,7 +94,7 @@ val s = suite("std/object", [
     val obj = {
       "a": 1,
       "b": 2,
-      "c": 3,
+      "c": 3
     }
     val o = obj.omit(["b"])
     [expect(o["b"]).toBe(null)]),
@@ -102,7 +102,7 @@ val s = suite("std/object", [
     val obj = {
       "a": 1,
       "b": 2,
-      "c": 3,
+      "c": 3
     }
     val o = obj.omit(["b"])
     [expect(o["a"]).toBe(1)]),
@@ -118,12 +118,27 @@ val s = suite("std/object", [
     val obj = { "a": 1, "b": 2 }
     val m = obj.mapValues(x => x * 2)
     [expect(m.keys().length()).toBe(2)]),
-  test("isEmpty returns true for empty object", () => [expect(isEmpty({  })).toBe(true)]),
+  test(
+    "isEmpty returns true for empty object",
+    () => [expect(isEmpty({  })).toBe(true)]
+  ),
   test("isEmpty returns true for empty array", () => [expect(isEmpty([])).toBe(true)]),
-  test("isEmpty returns true for empty string", () => [expect(isEmpty("")).toBe(true)]),
-  test("isEmpty returns false for non-empty object", () => [expect(isEmpty({ "a": 1 })).toBe(false)]),
-  test("isEmpty returns false for non-empty array", () => [expect(isEmpty([1])).toBe(false)]),
-  test("isEmpty returns false for non-empty string", () => [expect(isEmpty("hi")).toBe(false)]),
+  test(
+    "isEmpty returns true for empty string",
+    () => [expect(isEmpty("")).toBe(true)]
+  ),
+  test(
+    "isEmpty returns false for non-empty object",
+    () => [expect(isEmpty({ "a": 1 })).toBe(false)]
+  ),
+  test(
+    "isEmpty returns false for non-empty array",
+    () => [expect(isEmpty([1])).toBe(false)]
+  ),
+  test(
+    "isEmpty returns false for non-empty string",
+    () => [expect(isEmpty("hi")).toBe(false)]
+  ),
   test("mapValues producing string values", () =>
     // --- heap/union value coverage for object index-assign (`result[k] = v`) ---
     // String values exercise the object-set store's retain semantics; scalar values
@@ -135,18 +150,18 @@ val s = suite("std/object", [
     [
       expect(p["a"]).toBe("x"),
       expect(p["c"]).toBe("z"),
-      expect(p["b"]).toBe(null),
+      expect(p["b"]).toBe(null)
     ]),
   test("omit copies remaining string values", () =>
     val o = { "a": "x", "b": "y", "c": "z" }.omit(["b"])
     [
       expect(o["a"]).toBe("x"),
       expect(o["c"]).toBe("z"),
-      expect(o["b"]).toBe(null),
+      expect(o["b"]).toBe(null)
     ]),
   test("fromEntries with string values", () =>
     val r = fromEntries([["a", "x"], ["b", "y"]])
-    [expect(r["a"]).toBe("x"), expect(r["b"]).toBe("y")]),
+    [expect(r["a"]).toBe("x"), expect(r["b"]).toBe("y")])
 ])
 
 run(s)

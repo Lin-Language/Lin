@@ -36,7 +36,7 @@ val results = parallel([
   () => chunk(),
   () => chunk(),
   () => chunk(),
-  () => chunk(),
+  () => chunk()
 ])
 
 var sum = 0

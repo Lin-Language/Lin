@@ -7,7 +7,7 @@ export val getIndex = (req: Request): Response =>
     "title": "Lin Web Server",
     "heading": "Welcome",
     "status": "running",
-    "version": "1.0",
+    "version": "1.0"
   }
   val html = render("examples/web-server/views/index.lint", data)
   match html
@@ -18,7 +18,7 @@ export val getStatus = (req: Request): Response =>
   json(200, {
     "status": "ok",
     "uptime": 0,
-    "version": "1.0",
+    "version": "1.0"
   })
 
 export val getUser = (req: Request): Response =>

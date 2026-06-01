@@ -20,7 +20,7 @@ val s = suite("std/bytes", [
       expect(b.length()).toBe(2),
       expect(b[0]).toBe(190),
       expect(b[1]).toBe(239),
-      expect(u16FromBe(b, 0) == v).toBe(true),
+      expect(u16FromBe(b, 0) == v).toBe(true)
     ]),
   test("u16 little-endian round-trips", () =>
     val v: UInt16 = 48879
@@ -28,7 +28,7 @@ val s = suite("std/bytes", [
     [
       expect(b[0]).toBe(239),
       expect(b[1]).toBe(190),
-      expect(u16FromLe(b, 0) == v).toBe(true),
+      expect(u16FromLe(b, 0) == v).toBe(true)
     ]),
   test("u32 big-endian round-trips", () =>
     val v: UInt32 = 287454020
@@ -37,7 +37,7 @@ val s = suite("std/bytes", [
       expect(b.length()).toBe(4),
       expect(b[0]).toBe(17),
       expect(b[3]).toBe(68),
-      expect(u32FromBe(b, 0) == v).toBe(true),
+      expect(u32FromBe(b, 0) == v).toBe(true)
     ]),
   test("u32 little-endian round-trips", () =>
     val v: UInt32 = 287454020
@@ -45,13 +45,13 @@ val s = suite("std/bytes", [
     [
       expect(b[0]).toBe(68),
       expect(b[3]).toBe(17),
-      expect(u32FromLe(b, 0) == v).toBe(true),
+      expect(u32FromLe(b, 0) == v).toBe(true)
     ]),
   test("u32 with the high bit set round-trips", () =>
     val v: UInt32 = 4278255361
     [
       expect(u32FromBe(u32ToBe(v), 0) == v).toBe(true),
-      expect(u32FromLe(u32ToLe(v), 0) == v).toBe(true),
+      expect(u32FromLe(u32ToLe(v), 0) == v).toBe(true)
     ]),
   test("high unsigned values display unsigned", () =>
     // A computed high u32 (all bits set) prints as 4294967295, not -1.
@@ -65,11 +65,11 @@ val s = suite("std/bytes", [
       255,
       255,
       255,
-      255,
+      255
     ]
     [
       expect(u32FromBe(maxBytes, 0).toString()).toBe("4294967295"),
-      expect(u64FromBe(maxBytes8, 0).toString()).toBe("18446744073709551615"),
+      expect(u64FromBe(maxBytes8, 0).toString()).toBe("18446744073709551615")
     ]),
   test("u64 big-endian round-trips", () =>
     val v: UInt64 = 81985529216486895
@@ -78,7 +78,7 @@ val s = suite("std/bytes", [
       expect(b.length()).toBe(8),
       expect(b[0]).toBe(1),
       expect(b[7]).toBe(239),
-      expect(u64FromBe(b, 0) == v).toBe(true),
+      expect(u64FromBe(b, 0) == v).toBe(true)
     ]),
   test("u64 little-endian round-trips", () =>
     val v: UInt64 = 81985529216486895
@@ -86,7 +86,7 @@ val s = suite("std/bytes", [
     [
       expect(b[0]).toBe(239),
       expect(b[7]).toBe(1),
-      expect(u64FromLe(b, 0) == v).toBe(true),
+      expect(u64FromLe(b, 0) == v).toBe(true)
     ]),
   test("read honours the offset", () =>
     val b: UInt8[] = [0, 0, 18, 52]
@@ -97,7 +97,7 @@ val s = suite("std/bytes", [
     val f: Float32 = f32FromBits(bits)
     [
       expect(f32ToBits(f) == bits).toBe(true),
-      expect(f).toBe(f32FromBits(1080033280)),
+      expect(f).toBe(f32FromBits(1080033280))
     ]),
   test("f64 bits round-trip", () =>
     val bits: UInt64 = 4614256656552045848
@@ -117,13 +117,13 @@ val s = suite("std/bytes", [
       20,
       30,
       40,
-      50,
+      50
     ]
     val sub: UInt8[] = slice(buf, 1, 4)
     [
       expect(sub.length()).toBe(3),
       expect(sub[0]).toBe(20),
-      expect(sub[2]).toBe(40),
+      expect(sub[2]).toBe(40)
     ]),
   test("8-byte two-f32 control packet round-trips", () =>
     // Two motor speeds: 1.5f (0x3FC00000) and -2.25f (0xC0100000).
@@ -137,8 +137,8 @@ val s = suite("std/bytes", [
     [
       expect(packet.length()).toBe(8),
       expect(f32FromBe(packet, 0) == leftMotor).toBe(true),
-      expect(f32FromBe(packet, 4) == rightMotor).toBe(true),
-    ]),
+      expect(f32FromBe(packet, 4) == rightMotor).toBe(true)
+    ])
 ])
 
 run(s)

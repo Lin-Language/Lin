@@ -33,7 +33,7 @@ val s = suite("matrix", [
   test("rotation 0 deg is identity y", () =>
     val rot = rotation2D(0.0)
     val pt = applyToPoint(rot, 3.0, 4.0)
-    [expect(pt["y"].toFixed(4)).toBe("4.0000")]),
+    [expect(pt["y"].toFixed(4)).toBe("4.0000")])
 ])
 
 run(s)

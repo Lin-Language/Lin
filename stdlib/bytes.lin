@@ -65,7 +65,7 @@ export val u64ToBe = (v: UInt64): UInt8[] =>
     b4,
     b5,
     b6,
-    b7,
+    b7
   ]
   out
 
@@ -101,7 +101,7 @@ export val u64ToLe = (v: UInt64): UInt8[] =>
     b4,
     b5,
     b6,
-    b7,
+    b7
   ]
   out
 

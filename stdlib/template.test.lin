@@ -19,7 +19,7 @@ val s = suite("std/template", [
     [expect(result).toBe("Value: 42")]),
   test("render returns error for missing file", () =>
     val result = render("/nonexistent/template.tpl", {})
-    [expect(result["type"]).toBe("error")]),
+    [expect(result["type"]).toBe("error")])
 ])
 
 run(s)

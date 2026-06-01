@@ -17,7 +17,7 @@ val sample = [
   "bad-row",
   "Charlie, 78",
   ", 50",
-  "Diana, 100",
+  "Diana, 100"
 ]
 
 val s = suite("report-integration", [
@@ -28,13 +28,13 @@ val s = suite("report-integration", [
       expect(out.contains("=== Report ===")).toBe(true),
       expect(out.contains("Diana: 100")).toBe(true),
       expect(out.contains("count=4 avg=88 top=Diana")).toBe(true),
-      expect(out.contains("skipped 2 bad row(s)")).toBe(true),
+      expect(out.contains("skipped 2 bad row(s)")).toBe(true)
     ]),
   test("omits the skipped-row note when every row parses", () =>
     val out = render(["Alice, 85", "Bob, 92"])
     [
       expect(out.contains("=== Report ===")).toBe(true),
-      expect(out.contains("skipped")).toBe(false),
+      expect(out.contains("skipped")).toBe(false)
     ]),
   test("handles a larger batch without corruption", () =>
     // --- Churn: a large batch must render without RC corruption (ASan guard) ---
@@ -54,14 +54,14 @@ val s = suite("report-integration", [
       "E, 5",
       "F, 6",
       "G, 7",
-      "H, 8",
+      "H, 8"
     ]
     val out = render(many)
     [
       expect(length(validRecords(many))).toBe(16),
       expect(stats(validRecords(many))["total"]).toBe(72),
-      expect(out.contains("=== Report ===")).toBe(true),
-    ]),
+      expect(out.contains("=== Report ===")).toBe(true)
+    ])
 ])
 
 run(s)

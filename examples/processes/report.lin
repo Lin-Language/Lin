@@ -20,7 +20,7 @@ export val summarize = (results: TaskResult[]): Summary =>
     "total": total,
     "passed": passed,
     "failed": total - passed,
-    "ok": passed == total,
+    "ok": passed == total
   }
 
 // One status line per task, e.g. "  [pass] build (exit 0)".
