@@ -5,10 +5,7 @@ import { json, text, redirect, notFound, badRequest, parseBody, matchPath } from
 val s = suite("std/http", [
   test("json helper sets status and content-type", () =>
     val resp = json(200, { "ok": true })
-    [
-      expect(resp["status"]).toBe(200),
-      expect(resp["headers"]["Content-Type"]).toBe("application/json")
-    ]
+    [expect(resp["status"]).toBe(200), expect(resp["headers"]["Content-Type"]).toBe("application/json")]
   ),
 
   test("text helper sets status and body", () =>
@@ -18,13 +15,12 @@ val s = suite("std/http", [
 
   test("redirect sets 302 and Location header", () =>
     val resp = redirect("/home")
-    [
-      expect(resp["status"]).toBe(302),
-      expect(resp["headers"]["Location"]).toBe("/home")
-    ]
+    [expect(resp["status"]).toBe(302), expect(resp["headers"]["Location"]).toBe("/home")]
   ),
 
-  test("notFound has status 404", () => [expect(notFound["status"]).toBe(404)]),
+  test("notFound has status 404", () => [
+    expect(notFound["status"]).toBe(404)
+  ]),
 
   test("badRequest has status 400", () =>
     val resp = badRequest("missing field")
@@ -32,13 +28,7 @@ val s = suite("std/http", [
   ),
 
   test("parseBody parses JSON body", () =>
-    val req = {
-      "method": "POST",
-      "path": "/",
-      "query": "",
-      "headers": {},
-      "body": "{\"x\": 99}"
-    }
+    val req = { "method": "POST", "path": "/", "query": "", "headers": {}, "body": "{\"x\": 99}" }
     val body = req.parseBody()
     [expect(body["x"]).toBe(99)]
   ),
@@ -51,7 +41,7 @@ val s = suite("std/http", [
   test("matchPath returns null on mismatch", () =>
     val m = matchPath("/products/5", "/users/:id")
     [expect(m).toBe(null)]
-  )
+  ),
 ])
 
 run(s)

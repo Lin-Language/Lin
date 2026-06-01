@@ -1,6 +1,6 @@
 import foreign "lin-runtime"
-  val lin_template_render: (String, {  }) => Json
-  val lin_template_render_path: (String, {  }) => Json
+  val lin_template_render: (String, {}) => Json
+  val lin_template_render_path: (String, {}) => Json
 
 // Render a Jinja-style template string (minijinja-backed, ADR-073) against `data`.
 // Returns the rendered String, or an Error object {type:error,message} if the
@@ -8,7 +8,7 @@ import foreign "lin-runtime"
 //
 // This takes an in-memory string, so `{% extends %}` / `{% include %}` cannot resolve
 // (there is no directory to load from). Use `render` for layout/inheritance.
-export val renderWith = (template: String, data: {  }): Json =>
+export val renderWith = (template: String, data: {}): Json =>
   lin_template_render(template, data)
 
 // Read a template from `path` and render it, with full layout support (ADR-074):
@@ -17,5 +17,5 @@ export val renderWith = (template: String, data: {  }): Json =>
 // from the same directory as `path`. Returns the rendered String, or an Error
 // object {type:error,message} on a missing file or a syntax/render error (all
 // discriminated via `is Error`).
-export val render = (path: String, data: {  }): Json =>
+export val render = (path: String, data: {}): Json =>
   lin_template_render_path(path, data)

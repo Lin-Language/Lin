@@ -10,6 +10,7 @@
 // only thing you can do with one is call these adapters/terminals. Transform closures operate on
 // boxed `Json` items (a chunk is `UInt8[]`, a line is `String` — both JSON-compatible), so map/
 // filter take `(Json) => Json` / `(Json) => Boolean`.
+
 // Source: open a file as a byte stream (`Stream<UInt8[]> | Error`). Return type inferred from the
 // intrinsic (the opaque Stream type cannot drive a clean re-export annotation here).
 export val readStream = (path: String) =>
@@ -37,6 +38,7 @@ export val chunks = (s: Stream, n: Int32): Stream =>
 //   import { map, filter, take, reduce, for } from "std/iter"
 //   import { readStream, writeStream, drain } from "std/stream"
 // and `readStream(p).map(f).filter(g).take(10).reduce(...)` works lazily.
+
 // Sink: build a node that writes each item to `path`, one per line (lazy; nothing happens until
 // a terminal driver runs it).
 export val writeStream = (s: Stream, path: String): Stream =>
@@ -63,6 +65,7 @@ export val close = (s: Stream): Null =>
 // `for` is NOT exported here (std/iter unification): the single unified `for` comes from std/iter
 // and dispatches to the stream backend (`lin_stream_for`) on a stream receiver via the IR redirect.
 // Import `for` from std/iter to consume a stream: `stream.lines().for(println)`.
+
 // `.promise()` — drive the pipeline on a WORKER thread → `Promise<Null | Error>` (brief §5).
 // The stream is MOVED onto the worker (legal via CAP_MOVE, Stage 7): the worker owns the whole
 // pipeline, drives it to EOF, and the result resolves to `Null` (success) or an `Error` (a

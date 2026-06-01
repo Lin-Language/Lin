@@ -11,28 +11,24 @@ import foreign "examples/ffi/libmathlib.a"
   val gcd: (Int32, Int32) => Int32
 
 val s = suite("ffi integration", [
-  test(
-    "add: integer C ABI",
-    () => [expect(add(3, 4)).toBe(7), expect(add(-5, 5)).toBe(0)]
-  ),
-
-  test("square: double C ABI", () => [expect(square(2.5)).toBe(6.25)]),
-
+  test("add: integer C ABI", () => [
+    expect(add(3, 4)).toBe(7),
+    expect(add(-5, 5)).toBe(0)
+  ]),
+  test("square: double C ABI", () => [
+    expect(square(2.5)).toBe(6.25)
+  ]),
   test("clampf: 3-arg double", () => [
     expect(clampf(1.5, 0.0, 1.0)).toBe(1.0),
     expect(clampf(-0.5, 0.0, 1.0)).toBe(0.0),
     expect(clampf(0.3, 0.0, 1.0)).toBe(0.3)
-  ]
-  ),
-
-  test(
-    "magnitude2: links libm (sqrt)",
-    () => [expect(magnitude2(3.0, 4.0)).toBe(5.0)]
-  ),
-
-  test(
-    "gcd: Euclid over the integer ABI",
-    () => [expect(gcd(48, 36)).toBe(12), expect(gcd(17, 5)).toBe(1)]
-  )
+  ]),
+  test("magnitude2: links libm (sqrt)", () => [
+    expect(magnitude2(3.0, 4.0)).toBe(5.0)
+  ]),
+  test("gcd: Euclid over the integer ABI", () => [
+    expect(gcd(48, 36)).toBe(12),
+    expect(gcd(17, 5)).toBe(1)
+  ]),
 ])
 run(s)

@@ -2,6 +2,7 @@
 //
 // No subprocesses here: this module is pure data → text, so it unit-tests with
 // synthetic TaskResult values (report.test.lin) without spawning anything.
+
 import { TaskResult } from "./task"
 import { length } from "std/array"
 import { filter, map } from "std/iter"
@@ -10,18 +11,13 @@ import { toString, join } from "std/string"
 export type Summary = { "total": Int32, "passed": Int32, "failed": Int32, "ok": Boolean }
 
 val countOutcome = (results: TaskResult[], outcome: String): Int32 =>
-  length(results.filter((r) => r["outcome"] == outcome))
+  length(results.filter(r => r["outcome"] == outcome))
 
 // Tally results: a run is `ok` only if every task passed.
 export val summarize = (results: TaskResult[]): Summary =>
   val total = length(results)
   val passed = countOutcome(results, "pass")
-  {
-    "total": total,
-    "passed": passed,
-    "failed": total - passed,
-    "ok": passed == total
-  }
+  { "total": total, "passed": passed, "failed": total - passed, "ok": passed == total }
 
 // One status line per task, e.g. "  [pass] build (exit 0)".
 val line = (r: TaskResult): String =>
@@ -29,12 +25,10 @@ val line = (r: TaskResult): String =>
 
 // The one-line footer summarizing a run.
 val footerFor = (s: Summary): String =>
-  if s["ok"] then
-    "all ${toString(s["total"])} task(s) passed"
-  else
-    "${toString(s["failed"])} of ${toString(s["total"])} task(s) failed"
+  if s["ok"] then "all ${toString(s["total"])} task(s) passed"
+  else "${toString(s["failed"])} of ${toString(s["total"])} task(s) failed"
 
 // Render the full report: a line per task plus a summary footer.
 export val render = (results: TaskResult[]): String =>
-  val body = results.map((r) => line(r)).join("\n")
+  val body = results.map(r => line(r)).join("\n")
   "=== task run ===\n${body}\n${footerFor(summarize(results))}"

@@ -16,5 +16,6 @@
 // checker rewrites those into the decode special form before this signature is consulted. The
 // first argument is a TYPE (for example `Person`), which is why no ordinary value-level
 // wrapper can express it.
-export val fromJson = (_: Json, value: Json): Json =>
+
+export val fromJson = (type: Json, value: Json): Json =>
   value

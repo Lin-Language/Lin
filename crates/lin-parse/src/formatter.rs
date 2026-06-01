@@ -149,6 +149,79 @@ fn trailing_text(anchor_start: u32) -> String {
     })
 }
 
+/// True if the author column-aligned a match's `=>` — any arm has MORE than one space
+/// immediately before its `=>` in source. Opt-in signal; false with no source installed.
+fn match_arms_aligned_in_source(arms: &[MatchArm]) -> bool {
+    SOURCE_CHARS.with(|src_c| {
+        let src = src_c.borrow();
+        if src.is_empty() { return false; }
+        arms.iter().any(|arm| {
+            let lo = arm.span.start as usize;
+            let hi = (arm.body.span().start as usize).min(src.len());
+            if lo >= hi { return false; }
+            let slice = &src[lo..hi];
+            let mut arrow = None;
+            let mut i = 0;
+            while i + 1 < slice.len() {
+                if slice[i] == '=' && slice[i + 1] == '>' { arrow = Some(i); }
+                i += 1;
+            }
+            match arrow {
+                Some(a) => {
+                    let mut spaces = 0; let mut j = a;
+                    while j > 0 && slice[j - 1] == ' ' { spaces += 1; j -= 1; }
+                    spaces > 1
+                }
+                None => false,
+            }
+        })
+    })
+}
+
+/// True if the trailing comment on `anchor_start` was column-aligned by the author — >1 space
+/// before its `//` in source. Opt-in signal; false with no source. Requires a non-space,
+/// non-newline char before the space run (so an own-line comment doesn't count).
+fn trailing_aligned_in_source(anchor_start: u32) -> bool {
+    let cm_start = CTX.with(|c| c.borrow().trailing.get(&anchor_start).map(|cm| cm.span.start as usize));
+    let Some(start) = cm_start else { return false };
+    SOURCE_CHARS.with(|src_c| {
+        let src = src_c.borrow();
+        if src.is_empty() || start == 0 || start > src.len() { return false; }
+        let mut spaces = 0; let mut j = start;
+        while j > 0 && src[j - 1] == ' ' { spaces += 1; j -= 1; }
+        spaces > 1 && j > 0 && src[j - 1] != '\n'
+    })
+}
+
+/// Emit a maximal run of consecutive statements with run-based trailing-comment alignment.
+/// Each entry is `(code, trailing, aligned)` where `code` is the rendered statement (no
+/// trailing comment), `trailing` is the comment text ("" = none), and `aligned` is the
+/// author's opt-in signal. If ANY member opted in, align all trailing `//` to the widest
+/// code member (the widest keeps a single space); otherwise single space. Clears `run`.
+fn flush_aligned_run(run: &mut Vec<(String, String, bool)>, lines: &mut Vec<String>) {
+    if run.is_empty() { return; }
+    let any_aligned = run.iter().any(|(_, t, a)| *a && !t.is_empty());
+    let width = if any_aligned {
+        run.iter()
+            .filter(|(_, t, _)| !t.is_empty())
+            .map(|(code, _, _)| code.chars().count())
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    for (code, trailing, _) in run.drain(..) {
+        if trailing.is_empty() {
+            lines.push(code);
+        } else if any_aligned {
+            let pad = width.saturating_sub(code.chars().count());
+            lines.push(format!("{}{} {}", code, " ".repeat(pad), trailing));
+        } else {
+            lines.push(format!("{} {}", code, trailing));
+        }
+    }
+}
+
 /// The source char offset where the statement at `anchor_start` effectively begins for
 /// blank-line purposes: the start of its first leading comment if it has any, else
 /// `anchor_start` itself. This keeps a blank line that precedes a leading comment.
@@ -254,7 +327,12 @@ impl Formatter {
         let hoist_bodies = build_hoist_redirects(module).collapse_bodies;
         HOIST_BODIES.with(|c| *c.borrow_mut() = hoist_bodies);
 
-        let mut out = String::new();
+        // Top-level statements, with run-based trailing-comment alignment. A run is a
+        // maximal sequence of consecutive statements; a blank line or a leading comment
+        // breaks the run. We accumulate `lines` (each entry = one emitted output line,
+        // joined by '\n' at the end). A blank line is an empty entry.
+        let mut lines: Vec<String> = Vec::new();
+        let mut run: Vec<(String, String, bool)> = Vec::new();
         let mut first = true;
         for stmt in &module.statements {
             // Skip bare NullLit statements — they are either no-ops or artifacts
@@ -266,21 +344,38 @@ impl Formatter {
             if !first {
                 // Rule 2: emit a blank line before this statement only if the source had a
                 // blank line just before it (or its leading comment). Runs collapse to one.
-                // The previous statement already emitted its terminating newline, so a blank
-                // line is exactly one extra '\n' here (no unconditional separator).
                 if source_blank_before(leading_start(anchor)) {
-                    out.push('\n');
+                    flush_aligned_run(&mut run, &mut lines);
+                    lines.push(String::new());
                 }
             }
             first = false;
-            out.push_str(&take_leading(anchor, ""));
-            let mut s = fmt_stmt(stmt, "");
-            let trailing = trailing_text(anchor);
-            if !trailing.is_empty() {
-                s.push(' ');
-                s.push_str(&trailing);
+            // A leading comment breaks the alignment run.
+            let leading = take_leading(anchor, "");
+            if !leading.is_empty() {
+                flush_aligned_run(&mut run, &mut lines);
+                lines.push(leading.trim_end_matches('\n').to_string());
             }
-            out.push_str(&s);
+            let s = fmt_stmt(stmt, "");
+            let trailing = trailing_text(anchor);
+            // A multi-line statement (or a comment-less one) flushes the run, then emits
+            // standalone — only single-line statements participate in alignment.
+            if s.contains('\n') {
+                flush_aligned_run(&mut run, &mut lines);
+                if trailing.is_empty() {
+                    lines.push(s);
+                } else {
+                    lines.push(format!("{} {}", s, trailing));
+                }
+            } else {
+                run.push((s, trailing, trailing_aligned_in_source(anchor)));
+            }
+        }
+        flush_aligned_run(&mut run, &mut lines);
+
+        let mut out = String::new();
+        for line in &lines {
+            out.push_str(line);
             out.push('\n');
         }
 
@@ -1406,8 +1501,17 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         // ── Match ─────────────────────────────────────────────────────────────
         Expr::Match { scrutinee, arms, .. } => {
             let scr = fmt_expr(scrutinee, false, ind);
-            // Arm lines are at child_ind.
-            let arm_strs: Vec<String> = arms
+            let arm_body_ind = format!("{}  ", child_ind);
+            // Opt-in: align `=>` only if the author already column-aligned some arm.
+            let align = match_arms_aligned_in_source(arms);
+            // Build (head, body, multiline) for each arm. `head` is the `{kw} {pat}{guard}`
+            // (or "else") WITHOUT leading indent and WITHOUT ` =>`.
+            struct ArmR {
+                head: String,
+                body: String,
+                multiline: bool,
+            }
+            let rendered: Vec<ArmR> = arms
                 .iter()
                 .map(|arm| {
                     let (pat, kw) = fmt_match_pattern(&arm.pattern);
@@ -1416,19 +1520,39 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
                         .as_ref()
                         .map(|g| format!(" when {}", fmt_expr(g, false, &child_ind)))
                         .unwrap_or_default();
-                    let arm_body_ind = format!("{}  ", child_ind);
-                    let body_s = fmt_expr(&arm.body, false, &arm_body_ind);
-                    let header = if kw == "else" {
-                        format!("{}else =>", child_ind)
+                    let body = fmt_expr(&arm.body, false, &arm_body_ind);
+                    let multiline = body.contains('\n');
+                    let head = if kw == "else" {
+                        "else".to_string()
                     } else {
-                        format!("{}{} {}{} =>", child_ind, kw, pat, guard)
+                        format!("{} {}{}", kw, pat, guard)
                     };
-                    // If body is multi-line, put it on the next line (indented block form).
-                    if body_s.contains('\n') {
-                        let indented = indent_first(&body_s, &arm_body_ind);
-                        format!("{}\n{}", header, indented)
+                    ArmR { head, body, multiline }
+                })
+                .collect();
+            // Align target: widest head among NON-multiline arms (recomputed from FORMATTED
+            // widths, so it stays idempotent even when content reflows).
+            let pad_to = if align {
+                rendered
+                    .iter()
+                    .filter(|a| !a.multiline)
+                    .map(|a| a.head.chars().count())
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let arm_strs: Vec<String> = rendered
+                .iter()
+                .map(|a| {
+                    if a.multiline {
+                        let indented = indent_first(&a.body, &arm_body_ind);
+                        format!("{}{} =>\n{}", child_ind, a.head, indented)
+                    } else if align {
+                        let pad = pad_to.saturating_sub(a.head.chars().count());
+                        format!("{}{}{} => {}", child_ind, a.head, " ".repeat(pad), a.body)
                     } else {
-                        format!("{} {}", header, body_s)
+                        format!("{}{} => {}", child_ind, a.head, a.body)
                     }
                 })
                 .collect();
@@ -1561,6 +1685,9 @@ fn fmt_function(
 /// - All subsequent lines have `ind` as their leading indentation.
 fn fmt_block(stmts: &[Stmt], tail: &Expr, ind: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
+    // Run-based trailing-comment alignment: a maximal run of consecutive single-line
+    // statements; a blank line, a leading comment, or a multi-line statement breaks it.
+    let mut run: Vec<(String, String, bool)> = Vec::new();
 
     // Each stmt is rendered as a fully-indented multi-line string at `ind`.
     // Skip bare NullLit statements (DEDENT artifacts).
@@ -1575,23 +1702,34 @@ fn fmt_block(stmts: &[Stmt], tail: &Expr, ind: &str) -> String {
         // entry becomes a blank line via the final `join("\n")`. Not applied before the
         // first statement of the block (no leading blank inside a block body).
         if seen_stmt && source_blank_before(leading_start(anchor)) {
+            flush_aligned_run(&mut run, &mut lines);
             lines.push(String::new());
         }
         seen_stmt = true;
         // Leading comments at `ind` (each its own line) — already include trailing newlines,
-        // so trim the final one and push as a separate joined-by-\n line entry.
+        // so trim the final one and push as a separate joined-by-\n line entry. A leading
+        // comment breaks the alignment run.
         let leading = take_leading(anchor, ind);
         if !leading.is_empty() {
+            flush_aligned_run(&mut run, &mut lines);
             lines.push(leading.trim_end_matches('\n').to_string());
         }
-        let mut s = fmt_stmt_in_block(stmt, ind);
+        let s = fmt_stmt_in_block(stmt, ind);
         let trailing = trailing_text(anchor);
-        if !trailing.is_empty() {
-            s.push(' ');
-            s.push_str(&trailing);
+        // Only single-line statements participate in alignment; a multi-line one flushes
+        // the run, then emits standalone.
+        if s.contains('\n') {
+            flush_aligned_run(&mut run, &mut lines);
+            if trailing.is_empty() {
+                lines.push(s);
+            } else {
+                lines.push(format!("{} {}", s, trailing));
+            }
+        } else {
+            run.push((s, trailing, trailing_aligned_in_source(anchor)));
         }
-        lines.push(s);
     }
+    flush_aligned_run(&mut run, &mut lines);
 
     // Tail: leading comments, then the tail expr.
     let tail_anchor = tail.span().start;
