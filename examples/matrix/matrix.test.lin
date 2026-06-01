@@ -2,8 +2,8 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { matMul, rotation2D, applyToPoint, mat3, mat3Get } from "./matrix"
 import { toFixed, PI } from "std/math"
 
-val identity: Float64[] = mat3(1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0)
-val m: Float64[] = mat3(2.0,3.0,0.0, 4.0,5.0,0.0, 0.0,0.0,1.0)
+val identity: Float64[] = mat3(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+val m: Float64[] = mat3(2.0, 3.0, 0.0, 4.0, 5.0, 0.0, 0.0, 0.0, 1.0)
 
 val s = suite("matrix", [
   test("identity * M row 0 col 0", () =>
@@ -12,45 +12,51 @@ val s = suite("matrix", [
       expect(mat3Get(p, 0, 0).toFixed(1)).toBe("2.0")
     ]
   ),
+
   test("identity * M row 1 col 1", () =>
     val p = matMul(identity, m)
     [
       expect(mat3Get(p, 1, 1).toFixed(1)).toBe("5.0")
     ]
   ),
+
   test("identity * M row 2 col 2", () =>
     val p = matMul(identity, m)
     [
       expect(mat3Get(p, 2, 2).toFixed(1)).toBe("1.0")
     ]
   ),
+
   test("rotation 90 deg maps x to 0", () =>
     val rot = rotation2D(PI / 2.0)
-    val pt  = applyToPoint(rot, 1.0, 0.0)
+    val pt = applyToPoint(rot, 1.0, 0.0)
     [
       expect(pt["x"].toFixed(4)).toBe("0.0000")
     ]
   ),
+
   test("rotation 90 deg maps y to 1", () =>
     val rot = rotation2D(PI / 2.0)
-    val pt  = applyToPoint(rot, 1.0, 0.0)
+    val pt = applyToPoint(rot, 1.0, 0.0)
     [
       expect(pt["y"].toFixed(4)).toBe("1.0000")
     ]
   ),
+
   test("rotation 0 deg is identity x", () =>
     val rot = rotation2D(0.0)
-    val pt  = applyToPoint(rot, 3.0, 4.0)
+    val pt = applyToPoint(rot, 3.0, 4.0)
     [
       expect(pt["x"].toFixed(4)).toBe("3.0000")
     ]
   ),
+
   test("rotation 0 deg is identity y", () =>
     val rot = rotation2D(0.0)
-    val pt  = applyToPoint(rot, 3.0, 4.0)
+    val pt = applyToPoint(rot, 3.0, 4.0)
     [
       expect(pt["y"].toFixed(4)).toBe("4.0000")
     ]
-  ),
+  )
 ])
 run(s)

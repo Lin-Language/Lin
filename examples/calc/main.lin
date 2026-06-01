@@ -5,7 +5,6 @@
 //
 // Run:   lin run examples/calc/main.lin
 // Test:  lin test examples/calc/
-
 import { calc } from "./calc"
 import { print } from "std/io"
 import { toString } from "std/string"

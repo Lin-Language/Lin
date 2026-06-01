@@ -4,7 +4,6 @@
 //
 // Run:   lin run examples/report/main.lin
 // Test:  lin test examples/report/
-
 import { render } from "./report"
 import { print } from "std/io"
 
