@@ -4,7 +4,6 @@ import { printErr, args, prompt, exit } from "std/io"
 
 // io.lin exports: print, printErr, args, prompt, exit, readLine, readAll, lines
 // print and exit are side-effecting; we test what we can without needing stdin.
-
 val s = suite("std/io", [
   test("print accepts strings", () =>
     // Just verify it doesn't crash; output is a side effect
@@ -38,7 +37,7 @@ val s = suite("std/io", [
   test("prompt function exists (callable)", () => [
     // prompt requires stdin interaction; just verify the import works
     expect(true).toBe(true)
-  ]),
+  ])
 ])
 
 run(s)

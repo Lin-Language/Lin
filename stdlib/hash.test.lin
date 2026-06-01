@@ -4,7 +4,6 @@ import { hash } from "std/hash"
 // hash(x) returns a canonical, type-tagged string key for any JSON value.
 // Equal values hash equal; values of different types never collide; objects
 // hash independent of key order (matching structural equality, spec §14).
-
 val s = suite("std/hash", [
   test("primitives carry a type tag", () => [
     expect(hash(null)).toBe("N"),
@@ -59,7 +58,7 @@ val s = suite("std/hash", [
       expect(hash(a) == hash(b)).toBe(true),
       expect(hash(a) == hash({ "items": [1, 2], "meta": { "n": 4 } })).toBe(false)
     ]
-  ),
+  )
 ])
 
 run(s)

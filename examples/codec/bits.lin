@@ -1,6 +1,5 @@
 // Bit-twiddling helpers used by the codec, and a home for the low-level / byte
 // language features (bitwise operators, small integer types, nibble packing).
-
 import { length } from "std/array"
 
 // Pack two 4-bit nibbles into one byte.
@@ -21,8 +20,10 @@ export val nalType = (header: Int32): Int32 =>
 
 // A simple 1-byte XOR checksum over a byte list.
 val checksumFrom = (bytes: Int32[], i: Int32, acc: Int32): Int32 =>
-  if i >= length(bytes) then acc
-  else checksumFrom(bytes, i + 1, acc ^ bytes[i])
+  if i >= length(bytes) then
+    acc
+  else
+    checksumFrom(bytes, i + 1, acc ^ bytes[i])
 
 export val checksum = (bytes: Int32[]): Int32 =>
   checksumFrom(bytes, 0, 0)

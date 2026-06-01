@@ -46,10 +46,12 @@ val s = suite("std/template", [
 
   test("renderWith combines loop and conditional", () =>
     val tpl = "{% for u in users %}{{ u.name }}{% if u.admin %}*{% endif %} {% endfor %}"
-    val result = renderWith(tpl, { "users": [
-      { "name": "ada", "admin": true },
-      { "name": "bob", "admin": false }
-    ] })
+    val result = renderWith(tpl, {
+      "users": [
+        { "name": "ada", "admin": true },
+        { "name": "bob", "admin": false }
+      ]
+    })
     [
       expect(result).toBe("ada* bob ")
     ]
@@ -81,13 +83,19 @@ val s = suite("std/template", [
     mkdir(tmpDir, { "parents": true })
     // A base layout with a fillable block, and a child that extends it. The loader
     // resolves the `{% extends %}` name against the child's own directory.
-    writeFile("${tmpDir}/base.jinja", "<html><body>{% block body %}{% endblock %}</body></html>")
-    writeFile("${tmpDir}/child.jinja", "{% extends \"base.jinja\" %}{% block body %}Hi {{ name }}{% endblock %}")
+    writeFile(
+      "${tmpDir}/base.jinja",
+      "<html><body>{% block body %}{% endblock %}</body></html>"
+    )
+    writeFile(
+      "${tmpDir}/child.jinja",
+      "{% extends \"base.jinja\" %}{% block body %}Hi {{ name }}{% endblock %}"
+    )
     val result = render("${tmpDir}/child.jinja", { "name": "Lin" })
     [
       expect(result.contains("<body>Hi Lin</body>")).toBe(true)
     ]
-  ),
+  )
 ])
 
 run(s)
