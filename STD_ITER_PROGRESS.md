@@ -242,5 +242,17 @@ drop/takeWhile/dropWhile/flatMap/flatten/concat (adapters) + reduce/find/some/ev
      `lin test examples/` = 42; all example `lin check` clean; examples/streams builds+runs (pipeline
      ok). ASan: `cargo +nightly test -p lin-runtime stream` = 20/20 CLEAN, no AddressSanitizer errors.
      Arrays/iterators COMPLETELY unaffected (only STREAM args are marked consumed).
-6. Flat-producer recognition + docs (ADR-075) + final sweep — PENDING
-6. Flat-producer recognition + docs (ADR-075) + final sweep — PENDING
+6. Flat-producer recognition + docs (ADR-075) + final sweep — DONE (code side)
+   - FLAT-PRODUCER fast path VERIFIED BY ME: array map/filter/reduce chain = 24 (correct);
+     is_flat_producer_export still matches the trailing wrapper name regardless of module, so the
+     unboxed-scalar fast path still fires post-consolidation. No change needed.
+   - AFFINE FIX (Stage 5) VERIFIED BY ME: all 5 attacks reject; all 4 positives pass.
+   - FINAL (my verification): clean build, cargo 524/0, stdlib 22, examples 42, ASan 20/20.
+   - Docs (ADR-075 + STDLIB + SPEC) on docs/streams branch.
+6. Flat-producer recognition + docs (ADR-075) + final sweep — DONE (code side)
+   - FLAT-PRODUCER fast path VERIFIED BY ME: array map/filter/reduce chain = 24 (correct);
+     is_flat_producer_export still matches the trailing wrapper name regardless of module, so the
+     unboxed-scalar fast path still fires post-consolidation. No change needed.
+   - AFFINE FIX (Stage 5) VERIFIED BY ME: all 5 attacks reject; all 4 positives pass.
+   - FINAL (my verification): clean build, cargo 524/0, stdlib 22, examples 42, ASan 20/20.
+   - Docs (ADR-075 + STDLIB + SPEC) on docs/streams branch.
