@@ -404,6 +404,37 @@ impl LinFn {
         call(env_ptr, arg)
     }
 
+    /// Call a 2-arg closure `closure(arg0, arg1)` — the reduce ABI `(env, acc, item) -> acc`.
+    /// Both args follow the boxed-TaggedVal* ABI; returns the boxed result.
+    unsafe fn call2(&self, arg0: *mut u8, arg1: *mut u8) -> *mut u8 {
+        if self.closure.is_null() {
+            return std::ptr::null_mut();
+        }
+        let fn_ptr = *(self.closure.add(8) as *const *mut u8);
+        let env_ptr = *(self.closure.add(16) as *const *mut u8);
+        let call: unsafe extern "C-unwind" fn(*mut u8, *mut u8, *mut u8) -> *mut u8 =
+            std::mem::transmute(fn_ptr);
+        call(env_ptr, arg0, arg1)
+    }
+
+    /// 2-arg `call2` with the same fault-catching discipline as `call_caught` (see its doc). The
+    /// caller releases `arg0`/`arg1` after a catch; we do not re-touch them.
+    unsafe fn call2_caught(&self, arg0: *mut u8, arg1: *mut u8) -> Result<*mut u8, String> {
+        let closure_addr = self.closure as usize;
+        let a0 = arg0 as usize;
+        let a1 = arg1 as usize;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let f = LinFn { closure: closure_addr as *mut u8 };
+            let r = f.call2(a0 as *mut u8, a1 as *mut u8);
+            std::mem::forget(f); // do not release the borrowed closure here
+            r
+        }));
+        match result {
+            Ok(v) => Ok(v),
+            Err(_) => Err("stream transform faulted".to_string()),
+        }
+    }
+
     /// Call the transform, CATCHING any unwinding fault (array OOB, division-by-zero, an explicit
     /// `panic`, …) and converting it to an in-band `Err(message)` (streams brief §8 fault
     /// boundary). This MUST wrap every transform call, because the surrounding drive path crosses
@@ -663,6 +694,296 @@ impl StreamSource for ChunksSource {
     }
 }
 
+// -------------------------------------------------------------------------
+// Net-new lazy adapter sources (std/iter unification Stage 3). Each mirrors the MapSource/
+// FilterSource/TakeSource RC discipline EXACTLY: pull the upstream item, transform/decide,
+// release the pulled item after the closure consumes it, return an independently-owned box,
+// propagate `Err` straight through, and close the upstream in `close()`.
+// -------------------------------------------------------------------------
+
+/// True if a boxed tagged value is "truthy" for predicate purposes: a Bool reads its bit; any
+/// other non-null value is truthy; null is falsy. Matches the filter adapter's Bool check but is
+/// tolerant of non-Bool predicate results (a predicate returning e.g. an object is truthy).
+unsafe fn is_truthy(v: *const u8) -> bool {
+    use crate::tagged::{lin_get_tag, lin_unbox_bool, TAG_BOOL, TAG_NULL};
+    match lin_get_tag(v) {
+        TAG_NULL => false,
+        TAG_BOOL => lin_unbox_bool(v) != 0,
+        _ => true,
+    }
+}
+
+/// `drop(s, n)`: discard the first `n` items, then pass through. Pulls-and-discards on the first
+/// reads until `n` items have been dropped (propagating Err during the skip), then yields.
+struct DropSource {
+    up: Upstream,
+    remaining: i64,
+}
+impl StreamSource for DropSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        while self.remaining > 0 {
+            match pull_tagged(self.up.boxptr) {
+                TaggedOutcome::Eof => return TaggedOutcome::Eof,
+                TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
+                TaggedOutcome::Item(item) => {
+                    crate::tagged::lin_tagged_release(item);
+                    self.remaining -= 1;
+                }
+            }
+        }
+        pull_tagged(self.up.boxptr)
+    }
+    fn close(&mut self) {
+        unsafe { self.up.close(); }
+    }
+}
+
+/// `takeWhile(s, p)`: yield items while `p(item)` is truthy; on the first false, EOF and stop
+/// pulling upstream entirely (a `done` latch makes subsequent reads return Eof without a pull).
+struct TakeWhileSource {
+    up: Upstream,
+    p: LinFn,
+    done: bool,
+}
+impl StreamSource for TakeWhileSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        if self.done {
+            return TaggedOutcome::Eof;
+        }
+        match pull_tagged(self.up.boxptr) {
+            TaggedOutcome::Eof => {
+                self.done = true;
+                TaggedOutcome::Eof
+            }
+            TaggedOutcome::Err(m) => TaggedOutcome::Err(m),
+            TaggedOutcome::Item(item) => {
+                let verdict = match self.p.call_caught(item) {
+                    Ok(v) => v,
+                    Err(m) => {
+                        crate::tagged::lin_tagged_release(item);
+                        return TaggedOutcome::Err(m);
+                    }
+                };
+                let keep = is_truthy(verdict);
+                crate::tagged::lin_tagged_release(verdict);
+                if keep {
+                    TaggedOutcome::Item(item)
+                } else {
+                    // First false: drop this item, latch done, and stop pulling upstream.
+                    crate::tagged::lin_tagged_release(item);
+                    self.done = true;
+                    TaggedOutcome::Eof
+                }
+            }
+        }
+    }
+    fn close(&mut self) {
+        unsafe { self.up.close(); }
+    }
+}
+
+/// `dropWhile(s, p)`: skip items while `p(item)` is truthy; once `p` is first false, yield that
+/// item and every subsequent item unconditionally (a `dropping` latch records the transition).
+struct DropWhileSource {
+    up: Upstream,
+    p: LinFn,
+    dropping: bool,
+}
+impl StreamSource for DropWhileSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        loop {
+            match pull_tagged(self.up.boxptr) {
+                TaggedOutcome::Eof => return TaggedOutcome::Eof,
+                TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
+                TaggedOutcome::Item(item) => {
+                    if !self.dropping {
+                        return TaggedOutcome::Item(item);
+                    }
+                    let verdict = match self.p.call_caught(item) {
+                        Ok(v) => v,
+                        Err(m) => {
+                            crate::tagged::lin_tagged_release(item);
+                            return TaggedOutcome::Err(m);
+                        }
+                    };
+                    let still_drop = is_truthy(verdict);
+                    crate::tagged::lin_tagged_release(verdict);
+                    if still_drop {
+                        // Still in the dropping phase: discard and pull the next.
+                        crate::tagged::lin_tagged_release(item);
+                    } else {
+                        // Transition: stop dropping and yield this first kept item.
+                        self.dropping = false;
+                        return TaggedOutcome::Item(item);
+                    }
+                }
+            }
+        }
+    }
+    fn close(&mut self) {
+        unsafe { self.up.close(); }
+    }
+}
+
+/// A lazily-flattened inner collection: a boxed array `arr` (TAG_ARRAY) we hold ONE owned
+/// reference to, plus a cursor. `next()` yields each element as a freshly-owned box (via
+/// `lin_array_get_tagged`, which retains the element); when exhausted it releases the held array.
+struct InnerCursor {
+    /// One owned reference to a boxed array; released when the cursor is exhausted or dropped.
+    arr_box: *mut u8,
+    idx: i64,
+    len: i64,
+}
+// Same single-owner-thread invariant as `LinFn`/`Upstream`: a stream pipeline (cursor included)
+// is only ever touched by the thread that drives it.
+unsafe impl Send for InnerCursor {}
+impl InnerCursor {
+    /// Build a cursor over a boxed item that should be an array. Non-array items (or null) yield
+    /// an empty cursor (the boxed item is released immediately). Takes ownership of `item`.
+    unsafe fn new(item: *mut u8) -> InnerCursor {
+        use crate::tagged::{lin_get_tag, lin_unbox_ptr, TAG_ARRAY};
+        if lin_get_tag(item) == TAG_ARRAY {
+            let arr = lin_unbox_ptr(item) as *const crate::array::LinArray;
+            let len = crate::array::lin_array_length(arr);
+            InnerCursor { arr_box: item, idx: 0, len }
+        } else {
+            // Not a flattenable collection — discard and present as empty.
+            crate::tagged::lin_tagged_release(item);
+            InnerCursor { arr_box: std::ptr::null_mut(), idx: 0, len: 0 }
+        }
+    }
+    /// Yield the next element as a freshly-owned box, or None when exhausted (releasing the array).
+    unsafe fn next(&mut self) -> Option<*mut u8> {
+        if self.arr_box.is_null() || self.idx >= self.len {
+            self.release();
+            return None;
+        }
+        let arr = crate::tagged::lin_unbox_ptr(self.arr_box) as *const crate::array::LinArray;
+        let elem = crate::array::lin_array_get_tagged(arr, self.idx) as *mut u8;
+        self.idx += 1;
+        Some(elem)
+    }
+    unsafe fn release(&mut self) {
+        if !self.arr_box.is_null() {
+            crate::tagged::lin_tagged_release(self.arr_box);
+            self.arr_box = std::ptr::null_mut();
+        }
+    }
+}
+
+/// `flatMap(s, f)`: `f(item)` returns a collection (array) per item; flatten lazily. Holds an
+/// optional CURRENT inner cursor; drains it before pulling the next upstream item and calling `f`.
+struct FlatMapSource {
+    up: Upstream,
+    f: LinFn,
+    current: Option<InnerCursor>,
+}
+impl StreamSource for FlatMapSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        loop {
+            // Drain the current inner collection first.
+            if let Some(cur) = self.current.as_mut() {
+                if let Some(elem) = cur.next() {
+                    return TaggedOutcome::Item(elem);
+                }
+                // Exhausted (next() released the held array): drop the cursor and pull next.
+                self.current = None;
+            }
+            match pull_tagged(self.up.boxptr) {
+                TaggedOutcome::Eof => return TaggedOutcome::Eof,
+                TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
+                TaggedOutcome::Item(item) => {
+                    let inner = match self.f.call_caught(item) {
+                        Ok(v) => v,
+                        Err(m) => {
+                            crate::tagged::lin_tagged_release(item);
+                            return TaggedOutcome::Err(m);
+                        }
+                    };
+                    // The closure consumed/derived `item`; release our pulled reference. The
+                    // returned `inner` collection is independently owned — hand it to a cursor.
+                    crate::tagged::lin_tagged_release(item);
+                    self.current = Some(InnerCursor::new(inner));
+                }
+            }
+        }
+    }
+    fn close(&mut self) {
+        unsafe {
+            if let Some(mut cur) = self.current.take() {
+                cur.release();
+            }
+            self.up.close();
+        }
+    }
+}
+
+/// `flatten(s)`: `s` is a stream of collections; flatten lazily (flatMap with the identity
+/// transform). Reuses `InnerCursor` directly over each pulled item, no closure call.
+struct FlattenSource {
+    up: Upstream,
+    current: Option<InnerCursor>,
+}
+impl StreamSource for FlattenSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        loop {
+            if let Some(cur) = self.current.as_mut() {
+                if let Some(elem) = cur.next() {
+                    return TaggedOutcome::Item(elem);
+                }
+                self.current = None;
+            }
+            match pull_tagged(self.up.boxptr) {
+                TaggedOutcome::Eof => return TaggedOutcome::Eof,
+                TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
+                // The pulled item IS the inner collection; the cursor takes ownership of it.
+                TaggedOutcome::Item(item) => {
+                    self.current = Some(InnerCursor::new(item));
+                }
+            }
+        }
+    }
+    fn close(&mut self) {
+        unsafe {
+            if let Some(mut cur) = self.current.take() {
+                cur.release();
+            }
+            self.up.close();
+        }
+    }
+}
+
+/// `concat(a, b)`: yield every item of `a`, then every item of `b`. Holds BOTH upstreams (each
+/// retained via `own_upstream`); `close()` closes both. RC: the active upstream's items are
+/// returned verbatim to the driver (no extra release — each item is independently owned by its
+/// source's `read_tagged`).
+struct ConcatSource {
+    a: Upstream,
+    b: Upstream,
+    on_b: bool,
+}
+impl StreamSource for ConcatSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        if !self.on_b {
+            match pull_tagged(self.a.boxptr) {
+                TaggedOutcome::Eof => {
+                    // First stream exhausted: close it eagerly, switch to the second.
+                    self.a.close();
+                    self.on_b = true;
+                }
+                other => return other,
+            }
+        }
+        pull_tagged(self.b.boxptr)
+    }
+    fn close(&mut self) {
+        unsafe {
+            self.a.close();
+            self.b.close();
+        }
+    }
+}
+
 /// Append the bytes of a tagged `UInt8[]` array `item` to `buf`. Non-array items contribute
 /// nothing (defensive; a byte pipeline only ever carries UInt8[] here).
 unsafe fn append_u8_array_to(buf: &mut Vec<u8>, item: *mut u8) {
@@ -855,6 +1176,52 @@ pub unsafe extern "C" fn lin_stream_take(s: *const u8, n: i64) -> *mut u8 {
     StreamBox::new_boxed(Box::new(TakeSource { up, remaining: n }))
 }
 
+/// `drop(s, n)` → a new `Stream` that skips the first `n` items then passes through.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_drop(s: *const u8, n: i64) -> *mut u8 {
+    let up = own_upstream(s);
+    StreamBox::new_boxed(Box::new(DropSource { up, remaining: n }))
+}
+
+/// `takeWhile(s, p)` → a new `Stream` yielding items while `p(item)` is truthy.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_take_while(s: *const u8, p: *mut u8) -> *mut u8 {
+    let up = own_upstream(s);
+    let closure = retain_closure(as_closure(p));
+    StreamBox::new_boxed(Box::new(TakeWhileSource { up, p: LinFn::from_owned(closure), done: false }))
+}
+
+/// `dropWhile(s, p)` → a new `Stream` skipping items while `p(item)` is truthy, then passing through.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_drop_while(s: *const u8, p: *mut u8) -> *mut u8 {
+    let up = own_upstream(s);
+    let closure = retain_closure(as_closure(p));
+    StreamBox::new_boxed(Box::new(DropWhileSource { up, p: LinFn::from_owned(closure), dropping: true }))
+}
+
+/// `flatMap(s, f)` → a new `Stream` flattening each `f(item)` collection lazily.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_flat_map(s: *const u8, f: *mut u8) -> *mut u8 {
+    let up = own_upstream(s);
+    let closure = retain_closure(as_closure(f));
+    StreamBox::new_boxed(Box::new(FlatMapSource { up, f: LinFn::from_owned(closure), current: None }))
+}
+
+/// `flatten(s)` → a new `Stream` flattening each item (a collection) lazily.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_flatten(s: *const u8) -> *mut u8 {
+    let up = own_upstream(s);
+    StreamBox::new_boxed(Box::new(FlattenSource { up, current: None }))
+}
+
+/// `concat(a, b)` → a new `Stream` yielding all of `a`, then all of `b`. BOTH are retained.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_concat(a: *const u8, b: *const u8) -> *mut u8 {
+    let ua = own_upstream(a);
+    let ub = own_upstream(b);
+    StreamBox::new_boxed(Box::new(ConcatSource { a: ua, b: ub, on_b: false }))
+}
+
 /// `lines(s)` → a `Stream<String>` of newline-delimited lines over the byte stream `s`.
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_lines(s: *const u8, max_bytes: i64) -> *mut u8 {
@@ -927,6 +1294,170 @@ pub unsafe extern "C" fn lin_stream_for(s: *const u8, body: *mut u8) -> *mut u8 
                     Ok(r) => crate::tagged::lin_tagged_release(r), // body's return is discarded
                     // A body fault ends the for-expr with an Error (consistent with a read Error).
                     Err(m) => break crate::fs::make_error_tagged(&m),
+                }
+            }
+        }
+    };
+    close_box(b);
+    result
+}
+
+/// `reduce(s, init, f)` → fold every item into an accumulator via `f(acc, item)` → `U | Error`.
+/// Drives on the calling thread; a read or transform fault short-circuits to an Error. The
+/// accumulator starts at `init` (the caller hands us an owned +1 ref) and is replaced each step
+/// (the old acc is released, the new one — the closure's result — is owned). Closes the stream.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_reduce(s: *const u8, init: *mut u8, f: *mut u8) -> *mut u8 {
+    let b = unwrap_stream(s);
+    let func = LinFn::from_owned(retain_closure(as_closure(f)));
+    // `init` arrives as an owned +1 reference (the caller suppressed its own release / it is a
+    // fresh box); we own the running accumulator and release the previous on each replacement.
+    let mut acc = init;
+    let result = loop {
+        match pull_tagged(b) {
+            TaggedOutcome::Eof => break acc, // success → the final accumulator
+            TaggedOutcome::Err(m) => {
+                crate::tagged::lin_tagged_release(acc);
+                break crate::fs::make_error_tagged(&m);
+            }
+            TaggedOutcome::Item(item) => {
+                let next = func.call2_caught(acc, item);
+                crate::tagged::lin_tagged_release(item);
+                match next {
+                    Ok(v) => {
+                        // Release the previous accumulator; adopt the closure's result.
+                        crate::tagged::lin_tagged_release(acc);
+                        acc = v;
+                    }
+                    Err(m) => {
+                        crate::tagged::lin_tagged_release(acc);
+                        break crate::fs::make_error_tagged(&m);
+                    }
+                }
+            }
+        }
+    };
+    close_box(b);
+    result
+}
+
+/// `find(s, p)` → the first item where `p(item)` is truthy → `T | Null | Error` (Null if none).
+/// Closes the stream when it ends (match, EOF, or error).
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_find(s: *const u8, p: *mut u8) -> *mut u8 {
+    let b = unwrap_stream(s);
+    let pred = LinFn::from_owned(retain_closure(as_closure(p)));
+    let result = loop {
+        match pull_tagged(b) {
+            TaggedOutcome::Eof => break std::ptr::null_mut(), // none found → Null
+            TaggedOutcome::Err(m) => break crate::fs::make_error_tagged(&m),
+            TaggedOutcome::Item(item) => {
+                let verdict = match pred.call_caught(item) {
+                    Ok(v) => v,
+                    Err(m) => {
+                        crate::tagged::lin_tagged_release(item);
+                        break crate::fs::make_error_tagged(&m);
+                    }
+                };
+                let hit = is_truthy(verdict);
+                crate::tagged::lin_tagged_release(verdict);
+                if hit {
+                    break item; // the found item is returned (owned)
+                }
+                crate::tagged::lin_tagged_release(item);
+            }
+        }
+    };
+    close_box(b);
+    result
+}
+
+/// `some(s, p)` → `Boolean | Error`: true on the first truthy `p(item)` (short-circuit), false if
+/// none. A read/transform fault → Error. Closes the stream.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_some(s: *const u8, p: *mut u8) -> *mut u8 {
+    let b = unwrap_stream(s);
+    let pred = LinFn::from_owned(retain_closure(as_closure(p)));
+    let result = loop {
+        match pull_tagged(b) {
+            TaggedOutcome::Eof => break crate::tagged::lin_box_bool(0),
+            TaggedOutcome::Err(m) => break crate::fs::make_error_tagged(&m),
+            TaggedOutcome::Item(item) => {
+                let verdict = match pred.call_caught(item) {
+                    Ok(v) => v,
+                    Err(m) => {
+                        crate::tagged::lin_tagged_release(item);
+                        break crate::fs::make_error_tagged(&m);
+                    }
+                };
+                let hit = is_truthy(verdict);
+                crate::tagged::lin_tagged_release(verdict);
+                crate::tagged::lin_tagged_release(item);
+                if hit {
+                    break crate::tagged::lin_box_bool(1);
+                }
+            }
+        }
+    };
+    close_box(b);
+    result
+}
+
+/// `every(s, p)` → `Boolean | Error`: false on the first falsy `p(item)` (short-circuit), true if
+/// all pass (or empty). A read/transform fault → Error. Closes the stream.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_every(s: *const u8, p: *mut u8) -> *mut u8 {
+    let b = unwrap_stream(s);
+    let pred = LinFn::from_owned(retain_closure(as_closure(p)));
+    let result = loop {
+        match pull_tagged(b) {
+            TaggedOutcome::Eof => break crate::tagged::lin_box_bool(1),
+            TaggedOutcome::Err(m) => break crate::fs::make_error_tagged(&m),
+            TaggedOutcome::Item(item) => {
+                let verdict = match pred.call_caught(item) {
+                    Ok(v) => v,
+                    Err(m) => {
+                        crate::tagged::lin_tagged_release(item);
+                        break crate::fs::make_error_tagged(&m);
+                    }
+                };
+                let pass = is_truthy(verdict);
+                crate::tagged::lin_tagged_release(verdict);
+                crate::tagged::lin_tagged_release(item);
+                if !pass {
+                    break crate::tagged::lin_box_bool(0);
+                }
+            }
+        }
+    };
+    close_box(b);
+    result
+}
+
+/// `while(s, f)` → drive each item through `f(item)` until it returns a falsy value or EOF →
+/// `Null | Error`. Like `for` but with early stop on a falsy predicate result. A read/transform
+/// fault → Error. Closes the stream.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_while(s: *const u8, f: *mut u8) -> *mut u8 {
+    let b = unwrap_stream(s);
+    let func = LinFn::from_owned(retain_closure(as_closure(f)));
+    let result = loop {
+        match pull_tagged(b) {
+            TaggedOutcome::Eof => break std::ptr::null_mut(), // normal end → Null
+            TaggedOutcome::Err(m) => break crate::fs::make_error_tagged(&m),
+            TaggedOutcome::Item(item) => {
+                let verdict = match func.call_caught(item) {
+                    Ok(v) => v,
+                    Err(m) => {
+                        crate::tagged::lin_tagged_release(item);
+                        break crate::fs::make_error_tagged(&m);
+                    }
+                };
+                let keep = is_truthy(verdict);
+                crate::tagged::lin_tagged_release(verdict);
+                crate::tagged::lin_tagged_release(item);
+                if !keep {
+                    break std::ptr::null_mut(); // predicate false → stop, Null
                 }
             }
         }
@@ -1360,6 +1891,220 @@ mod tests {
 
             std::alloc::dealloc(desc, desc_layout);
         }
+    }
+
+    // Stage 3 net-new backend tests. These exercise the closure-free paths (drop/flatten/concat)
+    // directly, plus a Rust-level closure shim for the closure-bearing ones (flatMap/reduce/find)
+    // so ASan can verify the RC discipline without a full Lin pipeline. The closure shim builds a
+    // minimal LinClosure-shaped object: [rc:u32 | _pad | fn_ptr | env_ptr]. We never release it
+    // through `lin_closure_release` here (no real descriptor), so we free the raw allocation
+    // ourselves after the terminal/adapter has dropped its `LinFn` (which calls lin_closure_release
+    // — guarded to be a no-op for our shim by giving it a zeroed env so the release walk is inert).
+
+    /// Build a single-element tagged array box holding `v` (an owned int box). Returns an owned
+    /// TAG_ARRAY box. Used to fabricate flatMap inner collections.
+    unsafe fn arr_of_one_int(v: i32) -> *mut u8 {
+        let arr = crate::array::lin_array_alloc(1);
+        let elem = crate::tagged::lin_box_int32(v);
+        crate::array::lin_array_push_tagged(arr, elem);
+        crate::tagged::lin_tagged_release(elem);
+        crate::tagged::alloc_tagged(crate::tagged::TAG_ARRAY, arr as u64)
+    }
+
+    #[test]
+    fn drop_adapter_skips_then_passes_through_and_closes_once() {
+        unsafe {
+            let cc = Arc::new(AtomicUsize::new(0));
+            let src = make(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()], cc.clone(), None);
+            let dropped = lin_stream_drop(src as *const u8, 2);
+            crate::tagged::lin_tagged_release(src);
+            // First two ("a","b") skipped; "c","d" pass through.
+            let mut got: Vec<Vec<u8>> = Vec::new();
+            loop {
+                match pull_tagged(unwrap_stream(dropped)) {
+                    TaggedOutcome::Item(item) => {
+                        let a = crate::tagged::lin_unbox_ptr(item) as *const crate::array::LinArray;
+                        let n = crate::array::lin_array_length(a) as usize;
+                        let data = (*a).data as *const u8;
+                        got.push(std::slice::from_raw_parts(data, n).to_vec());
+                        crate::tagged::lin_tagged_release(item);
+                    }
+                    TaggedOutcome::Eof => break,
+                    TaggedOutcome::Err(_) => panic!("unexpected err"),
+                }
+            }
+            assert_eq!(got, vec![b"c".to_vec(), b"d".to_vec()]);
+            crate::tagged::lin_tagged_release(dropped);
+            assert_eq!(cc.load(Ordering::SeqCst), 1, "drop closed upstream once");
+        }
+    }
+
+    #[test]
+    fn concat_two_upstreams_close_once_each() {
+        unsafe {
+            let cca = Arc::new(AtomicUsize::new(0));
+            let ccb = Arc::new(AtomicUsize::new(0));
+            let a = make(vec![b"a1".to_vec(), b"a2".to_vec()], cca.clone(), None);
+            let b = make(vec![b"b1".to_vec()], ccb.clone(), None);
+            let cat = lin_stream_concat(a as *const u8, b as *const u8);
+            crate::tagged::lin_tagged_release(a);
+            crate::tagged::lin_tagged_release(b);
+            let mut count = 0;
+            loop {
+                match pull_tagged(unwrap_stream(cat)) {
+                    TaggedOutcome::Item(item) => { count += 1; crate::tagged::lin_tagged_release(item); }
+                    TaggedOutcome::Eof => break,
+                    TaggedOutcome::Err(_) => panic!("unexpected err"),
+                }
+            }
+            assert_eq!(count, 3, "yields all of a then b");
+            crate::tagged::lin_tagged_release(cat);
+            assert_eq!(cca.load(Ordering::SeqCst), 1, "first upstream closed exactly once");
+            assert_eq!(ccb.load(Ordering::SeqCst), 1, "second upstream closed exactly once");
+        }
+    }
+
+    #[test]
+    fn flatten_adapter_flattens_arrays_and_closes_once() {
+        unsafe {
+            let cc = Arc::new(AtomicUsize::new(0));
+            // Build a stream of two arrays: [10], [20]. We can't use the byte `make` helper for
+            // tagged-array items, so build a custom source.
+            struct ArrSource { items: Vec<*mut u8>, idx: usize, close_count: Arc<AtomicUsize> }
+            unsafe impl Send for ArrSource {}
+            impl StreamSource for ArrSource {
+                unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+                    if self.idx >= self.items.len() { return TaggedOutcome::Eof; }
+                    let it = self.items[self.idx];
+                    self.idx += 1;
+                    TaggedOutcome::Item(it)
+                }
+                fn close(&mut self) { self.close_count.fetch_add(1, Ordering::SeqCst); }
+            }
+            let src = StreamBox::new_boxed(Box::new(ArrSource {
+                items: vec![arr_of_one_int(10), arr_of_one_int(20)],
+                idx: 0,
+                close_count: cc.clone(),
+            }));
+            let flat = lin_stream_flatten(src as *const u8);
+            crate::tagged::lin_tagged_release(src);
+            let mut vals: Vec<i32> = Vec::new();
+            loop {
+                match pull_tagged(unwrap_stream(flat)) {
+                    TaggedOutcome::Item(item) => {
+                        vals.push(crate::tagged::lin_unbox_int32(item) as i32);
+                        crate::tagged::lin_tagged_release(item);
+                    }
+                    TaggedOutcome::Eof => break,
+                    TaggedOutcome::Err(_) => panic!("unexpected err"),
+                }
+            }
+            assert_eq!(vals, vec![10, 20]);
+            crate::tagged::lin_tagged_release(flat);
+            assert_eq!(cc.load(Ordering::SeqCst), 1, "flatten closed upstream once");
+        }
+    }
+
+    #[test]
+    fn find_returns_first_match_and_closes_once() {
+        unsafe {
+            // A predicate closure that returns true iff the item's byte-array length == 2. We build
+            // a minimal closure that ignores its env and checks the arg. Implement via a real
+            // extern fn matching the (env, arg) -> ret ABI.
+            unsafe extern "C-unwind" fn pred_len2(_env: *mut u8, arg: *mut u8) -> *mut u8 {
+                let a = crate::tagged::lin_unbox_ptr(arg) as *const crate::array::LinArray;
+                let n = crate::array::lin_array_length(a);
+                crate::tagged::lin_box_bool((n == 2) as u8)
+            }
+            let cc = Arc::new(AtomicUsize::new(0));
+            let src = make(vec![b"a".to_vec(), b"bb".to_vec(), b"c".to_vec()], cc.clone(), None);
+            let closure = make_test_closure(pred_len2 as *mut u8);
+            let found = lin_stream_find(src as *const u8, closure);
+            // "bb" has length 2 → the found item is a 2-byte UInt8[].
+            let a = crate::tagged::lin_unbox_ptr(found) as *const crate::array::LinArray;
+            assert_eq!(crate::array::lin_array_length(a), 2);
+            crate::tagged::lin_tagged_release(found);
+            crate::tagged::lin_tagged_release(src);
+            free_test_closure(closure);
+            assert_eq!(cc.load(Ordering::SeqCst), 1, "find closed the stream once");
+        }
+    }
+
+    #[test]
+    fn reduce_folds_and_closes_once() {
+        unsafe {
+            // acc + item.length  (acc is an int box, item a UInt8[]).
+            unsafe extern "C-unwind" fn add_len(_env: *mut u8, acc: *mut u8, item: *mut u8) -> *mut u8 {
+                let a = crate::tagged::lin_unbox_int32(acc);
+                let arr = crate::tagged::lin_unbox_ptr(item) as *const crate::array::LinArray;
+                let n = crate::array::lin_array_length(arr);
+                crate::tagged::lin_box_int32((a as i64 + n) as i32)
+            }
+            let cc = Arc::new(AtomicUsize::new(0));
+            let src = make(vec![b"a".to_vec(), b"bb".to_vec(), b"ccc".to_vec()], cc.clone(), None);
+            let closure = make_test_closure(add_len as *mut u8);
+            let init = crate::tagged::lin_box_int32(0);
+            let total = lin_stream_reduce(src as *const u8, init, closure);
+            assert_eq!(crate::tagged::lin_unbox_int32(total), 6, "1+2+3 byte lengths");
+            crate::tagged::lin_tagged_release(total);
+            crate::tagged::lin_tagged_release(src);
+            free_test_closure(closure);
+            assert_eq!(cc.load(Ordering::SeqCst), 1, "reduce closed the stream once");
+        }
+    }
+
+    #[test]
+    fn flat_map_flattens_and_closes_once() {
+        unsafe {
+            // f(item) → a single-element array [item.length].
+            unsafe extern "C-unwind" fn to_len_arr(_env: *mut u8, item: *mut u8) -> *mut u8 {
+                let arr = crate::tagged::lin_unbox_ptr(item) as *const crate::array::LinArray;
+                let n = crate::array::lin_array_length(arr) as i32;
+                // build [n]
+                let out = crate::array::lin_array_alloc(1);
+                let e = crate::tagged::lin_box_int32(n);
+                crate::array::lin_array_push_tagged(out, e);
+                crate::tagged::lin_tagged_release(e);
+                crate::tagged::alloc_tagged(crate::tagged::TAG_ARRAY, out as u64)
+            }
+            let cc = Arc::new(AtomicUsize::new(0));
+            let src = make(vec![b"a".to_vec(), b"bb".to_vec()], cc.clone(), None);
+            let closure = make_test_closure(to_len_arr as *mut u8);
+            let fm = lin_stream_flat_map(src as *const u8, closure);
+            crate::tagged::lin_tagged_release(src);
+            let mut vals: Vec<i32> = Vec::new();
+            loop {
+                match pull_tagged(unwrap_stream(fm)) {
+                    TaggedOutcome::Item(item) => {
+                        vals.push(crate::tagged::lin_unbox_int32(item) as i32);
+                        crate::tagged::lin_tagged_release(item);
+                    }
+                    TaggedOutcome::Eof => break,
+                    TaggedOutcome::Err(_) => panic!("unexpected err"),
+                }
+            }
+            assert_eq!(vals, vec![1, 2], "byte lengths flattened");
+            crate::tagged::lin_tagged_release(fm);
+            free_test_closure(closure);
+            assert_eq!(cc.load(Ordering::SeqCst), 1, "flatMap closed upstream once");
+        }
+    }
+
+    /// Build a minimal LinClosure-shaped object [rc:u32 | _pad | fn_ptr | env_ptr] with rc=1 and a
+    /// null env. The layout matches `LinFn`'s field offsets (8 = fn_ptr, 16 = env_ptr). We bump rc
+    /// to a high value so the adapter's `LinFn::Drop` → `lin_closure_release` never reaches 0 and
+    /// thus never walks a (nonexistent) capture descriptor. The test frees it manually afterwards.
+    unsafe fn make_test_closure(fn_ptr: *mut u8) -> *mut u8 {
+        let size = 24usize;
+        let p = crate::memory::lin_alloc(size);
+        // rc = large so the runtime release never frees/walks it.
+        *(p as *mut u32) = 1000;
+        *(p.add(8) as *mut *mut u8) = fn_ptr;
+        *(p.add(16) as *mut *mut u8) = std::ptr::null_mut();
+        p
+    }
+    unsafe fn free_test_closure(p: *mut u8) {
+        crate::memory::lin_cell_free(p, 24);
     }
 
     #[test]

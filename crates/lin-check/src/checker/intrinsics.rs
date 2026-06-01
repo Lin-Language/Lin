@@ -253,6 +253,49 @@ impl Checker {
             ], any_stream()));
         self.define_intrinsic("lin_stream_take",
             Type::func(vec![any_stream(), Type::Int32], any_stream()));
+        // Net-new lazy adapters (Stage 3): drop(s, n); takeWhile/dropWhile(s, p); flatMap(s, f);
+        // flatten(s); concat(a, b) — all return a fresh Stream. Closures operate on boxed Json.
+        self.define_intrinsic("lin_stream_drop",
+            Type::func(vec![any_stream(), Type::Int32], any_stream()));
+        self.define_intrinsic("lin_stream_take_while", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::Bool),
+            ], any_stream()));
+        self.define_intrinsic("lin_stream_drop_while", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::Bool),
+            ], any_stream()));
+        self.define_intrinsic("lin_stream_flat_map", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::TypeVar(u32::MAX)),
+            ], any_stream()));
+        self.define_intrinsic("lin_stream_flatten",
+            Type::func(vec![any_stream()], any_stream()));
+        self.define_intrinsic("lin_stream_concat",
+            Type::func(vec![any_stream(), any_stream()], any_stream()));
+        // Net-new terminals (Stage 4): reduce → U | Error; find → T | Null | Error; some/every →
+        // Boolean | Error; while → Null | Error. All consume + close the stream.
+        self.define_intrinsic("lin_stream_reduce", Type::func(vec![
+                any_stream(),
+                Type::TypeVar(u32::MAX),
+                Type::func(vec![Type::TypeVar(u32::MAX), Type::TypeVar(u32::MAX)], Type::TypeVar(u32::MAX)),
+            ], Type::TypeVar(u32::MAX)));
+        self.define_intrinsic("lin_stream_find", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::Bool),
+            ], Type::Union(vec![Type::TypeVar(u32::MAX), Type::Null, crate::resolve::error_type()])));
+        self.define_intrinsic("lin_stream_some", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::Bool),
+            ], Type::Union(vec![Type::Bool, crate::resolve::error_type()])));
+        self.define_intrinsic("lin_stream_every", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::Bool),
+            ], Type::Union(vec![Type::Bool, crate::resolve::error_type()])));
+        self.define_intrinsic("lin_stream_while", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::Bool),
+            ], Type::Union(vec![Type::Null, crate::resolve::error_type()])));
         // lines(s, maxBytes): maxBytes ≤ 0 selects the default per-line cap; a positive value sets
         // an explicit bound. Stdlib exposes `lines(s)` (default) and `linesMax(s, n)` over this.
         self.define_intrinsic("lin_stream_lines",

@@ -2181,6 +2181,16 @@ fn lower_call(
         // Imported function: call the compiled symbol by its mangled name, boxing
         // concrete args passed to Json/union-typed parameters.
         if let Some((sym, param_tys)) = ctx.import_fn_slots.get(slot).cloned() {
+            // STREAM COMBINATOR DISPATCH (std/iter unification Stage 3/4): when a genuine
+            // `std/iter` combinator is called with a DEFINITELY-stream receiver (arg0), redirect to
+            // the lazy `lin_stream_*` backend instead of running the eager array body. Keyed on the
+            // import symbol (`std_iter_<name>`) so a user-defined same-named function is never
+            // affected — the mirror of the checker's `streamish_combinator_ret`. The redirect
+            // delegates to `lower_intrinsic_call` so the stream-arg RC + result ownership match the
+            // proven std/stream wrapper path exactly.
+            if let Some(stream_intr) = stream_combinator_intrinsic_name(&sym, args) {
+                return lower_intrinsic_call(stream_intr, args, result_type, builder, ctx);
+            }
             let mut shell_boxes: Vec<Temp> = Vec::new();
             let mut escape_lits: Vec<Temp> = Vec::new();
             let lowered_args: Vec<Temp> = args
@@ -2404,6 +2414,17 @@ fn lower_intrinsic_call(
         "lin_stream_map" => Intrinsic::StreamMap,
         "lin_stream_filter" => Intrinsic::StreamFilter,
         "lin_stream_take" => Intrinsic::StreamTake,
+        "lin_stream_drop" => Intrinsic::StreamDrop,
+        "lin_stream_take_while" => Intrinsic::StreamTakeWhile,
+        "lin_stream_drop_while" => Intrinsic::StreamDropWhile,
+        "lin_stream_flat_map" => Intrinsic::StreamFlatMap,
+        "lin_stream_flatten" => Intrinsic::StreamFlatten,
+        "lin_stream_concat" => Intrinsic::StreamConcat,
+        "lin_stream_reduce" => Intrinsic::StreamReduce,
+        "lin_stream_find" => Intrinsic::StreamFind,
+        "lin_stream_some" => Intrinsic::StreamSome,
+        "lin_stream_every" => Intrinsic::StreamEvery,
+        "lin_stream_while" => Intrinsic::StreamWhile,
         "lin_stream_lines" => Intrinsic::StreamLines,
         "lin_stream_chunks" => Intrinsic::StreamChunks,
         "lin_stream_write" => Intrinsic::StreamWrite,
@@ -2504,6 +2525,46 @@ fn iter_elem_type(iterable_ty: &Type) -> Type {
 /// are safe to free at the creating function's scope exit. CONSERVATIVE: only these exact names
 /// are trusted; every other callee leaves the captured cell escaping (leaking, but sound).
 /// `reduce` takes (arr, init, f) — its callback is arg index 2; the rest take (arr, f) — index 1.
+/// STREAM COMBINATOR DISPATCH (std/iter unification Stage 3/4). Given an imported function's
+/// mangled symbol and the call's args, return the `lin_stream_*` intrinsic NAME to redirect to
+/// when the callee is a genuine `std/iter` combinator AND its receiver (arg0) is DEFINITELY a
+/// Stream. Returns None otherwise (the call proceeds as a normal Named import call / eager body).
+///
+/// Keyed on the `std_iter_` symbol prefix so only the real std/iter exports are redirected — a
+/// user-defined `map`/`for`/… is mangled under a different module key and never matches. This is
+/// the IR-side mirror of the checker's `streamish_combinator_ret` (which re-typed the result):
+/// here we re-route the runtime dispatch to the lazy backend so the typed-stream result is backed
+/// by an actual lazy pipeline. The eager pure-Lin / `lin_map` bodies are bypassed entirely for a
+/// stream receiver.
+fn stream_combinator_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option<&'static str> {
+    let export = sym.strip_prefix("std_iter_")?;
+    // The receiver must be DEFINITELY a stream — not a mixed `Array | Iterator | Stream` union
+    // (which would mean the eager array body must still run). A bare `Stream(_)` is the only shape
+    // that reaches a concrete call site here (the checker resolves the receiver before lowering).
+    let arg0_is_stream = args.first().map(|a| matches!(a.ty(), Type::Stream(_))).unwrap_or(false);
+    if !arg0_is_stream {
+        return None;
+    }
+    Some(match export {
+        "map" => "lin_stream_map",
+        "filter" => "lin_stream_filter",
+        "take" => "lin_stream_take",
+        "drop" => "lin_stream_drop",
+        "takeWhile" => "lin_stream_take_while",
+        "dropWhile" => "lin_stream_drop_while",
+        "flatMap" => "lin_stream_flat_map",
+        "flatten" => "lin_stream_flatten",
+        "concat" => "lin_stream_concat",
+        "reduce" => "lin_stream_reduce",
+        "find" => "lin_stream_find",
+        "some" => "lin_stream_some",
+        "every" => "lin_stream_every",
+        "while" => "lin_stream_while",
+        "for" => "lin_stream_for",
+        _ => return None,
+    })
+}
+
 fn safe_combinator_callback_index(name: &str) -> Option<usize> {
     match name {
         "for" | "while" | "map" | "filter" | "find" | "some" | "every" => Some(1),

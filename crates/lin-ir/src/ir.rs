@@ -135,6 +135,15 @@ pub enum Intrinsic {
     StreamTake,
     StreamLines,
     StreamChunks,
+    // Net-new lazy adapters (std/iter unification Stage 3): drop/takeWhile/dropWhile/flatMap/
+    // flatten/concat. drop carries an Int count; takeWhile/dropWhile/flatMap carry a closure;
+    // flatten takes only the stream; concat takes TWO streams (both retained, both closed).
+    StreamDrop,
+    StreamTakeWhile,
+    StreamDropWhile,
+    StreamFlatMap,
+    StreamFlatten,
+    StreamConcat,
     // Sink + terminal drivers (Stage 4). writeStream builds a sink; drain drives on the calling
     // thread; collect/readText pull-all-into-one-value. All terminals close the stream.
     StreamWrite,
@@ -148,6 +157,18 @@ pub enum Intrinsic {
     // `.for(fn)` over a Stream (Stage 5): drive each item through `fn` on the calling thread →
     // Null | Error (EOF → Null; a read error → the Error value). Closes the stream at the end.
     StreamFor,
+    // Net-new stream terminals (std/iter unification Stage 4). Each drives the stream on the
+    // calling thread, returns a boxed `X | Error`, and closes the stream:
+    //   StreamReduce  → U | Error        (fold with init + (acc,item)=>acc)
+    //   StreamFind    → T | Null | Error (first truthy predicate match; Null if none)
+    //   StreamSome    → Boolean | Error  (true on first truthy, short-circuit)
+    //   StreamEvery   → Boolean | Error  (false on first falsy, short-circuit)
+    //   StreamWhile   → Null | Error     (drive until predicate false or EOF)
+    StreamReduce,
+    StreamFind,
+    StreamSome,
+    StreamEvery,
+    StreamWhile,
     // `.promise()` (Stage 8): MOVE the pipeline onto a worker thread that drives it to EOF →
     // Promise<Null | Error>. The stream arg is moved (caller release suppressed).
     StreamPromise,

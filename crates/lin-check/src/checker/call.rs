@@ -159,19 +159,31 @@ impl Checker {
         }
         match export_name.as_str() {
             // Lazy adapters: receiver-dependent element type wrapped in a fresh Stream. The
-            // array_ret is `U[]` (map) / `T[]` (filter); unwrap its element to re-wrap as Stream<…>.
-            "map" | "filter" => {
+            // array_ret is `U[]` (map) / `T[]` (filter) / a bare `Json` (the pure-Lin wrappers
+            // declare `Json`); unwrap an array element to re-wrap as Stream<…>, else Stream<Json>.
+            // These all back onto a lazy `lin_stream_*` adapter (the IR redirects on a stream
+            // receiver), so the result is the next Stream node in the pipeline — keeping the chain
+            // typed as a Stream so a following `.take`/`.reduce`/… also sees a definite-stream
+            // receiver and dispatches lazily.
+            "map" | "filter" | "take" | "drop" | "flatMap" | "takeWhile" | "dropWhile"
+            | "flatten" | "concat" => {
                 let elem = match &array_ret {
                     Type::Array(inner) => (**inner).clone(),
-                    other => other.clone(),
+                    Type::Stream(inner) => (**inner).clone(),
+                    _ => Type::TypeVar(u32::MAX),
                 };
                 Type::Stream(Box::new(elem))
             }
             // Terminal: the array_ret is the accumulator/result type U; a stream read can fault, so
             // surface `U | Error`.
             "reduce" => Type::flatten_union(vec![array_ret, crate::resolve::error_type()]),
+            // Terminal: first matching item or Null if none; a read fault → Error. `T | Null | Error`
+            // (the array `find` already returns `T | Null` ≈ Json, so just add the Error arm).
+            "find" => Type::flatten_union(vec![array_ret, Type::Null, crate::resolve::error_type()]),
+            // Terminals returning a Boolean over the stream: `Boolean | Error`.
+            "some" | "every" => Type::flatten_union(vec![Type::Bool, crate::resolve::error_type()]),
             // Terminal-ish: array_ret is Null; stream form is `Null | Error`.
-            "while" => Type::flatten_union(vec![Type::Null, crate::resolve::error_type()]),
+            "while" | "for" => Type::flatten_union(vec![Type::Null, crate::resolve::error_type()]),
             _ => array_ret,
         }
     }
