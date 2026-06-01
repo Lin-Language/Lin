@@ -3559,15 +3559,18 @@ fn test_stream_promise_concurrent() {
     for p in [&in1, &in2, &out1, &out2] { let _ = fs::remove_file(p); }
     fs::write(&in1, "a\nb").unwrap();
     fs::write(&in2, "c\nd").unwrap();
+    // Drive both stream pipelines concurrently with the real `parallel([...])` primitive (each
+    // `.promise()` is an already-spawned worker that moved its stream across the thread boundary;
+    // `parallel` awaits both, preserving order). Exercises the parallel-over-promises path fixed
+    // on master alongside the cross-thread stream move.
     let output = run(&format!(r#"import {{ print }} from "std/io"
 import {{ readStream, lines, writeStream, promise }} from "std/stream"
-import {{ await }} from "std/async"
+import {{ parallel }} from "std/async"
 import {{ readFile }} from "std/fs"
 
 val p1 = readStream("{i1}").lines().writeStream("{o1}").promise()
 val p2 = readStream("{i2}").lines().writeStream("{o2}").promise()
-val r1 = await(p1)
-val r2 = await(p2)
+val results = parallel([p1, p2])
 print(readFile("{o1}"))
 print(readFile("{o2}"))
 "#, i1 = in1.display(), i2 = in2.display(), o1 = out1.display(), o2 = out2.display()));
