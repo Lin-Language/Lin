@@ -3539,7 +3539,7 @@ print(toString(total))
 }
 
 // Stage 4 (streams): the worked CSV example from the design brief. readStream → lines → filter
-// → map → writeStream → drain, run on the calling thread. Asserts the exact transformed output
+// → map → writeLines → drain, run on the calling thread. Asserts the exact transformed output
 // file (`a,b,c` -> `"a"|"b"|"c"`), plus lazy adapters + in-band drain + sink working together.
 #[test]
 fn test_stream_csv_pipeline_drain() {
@@ -3552,7 +3552,7 @@ fn test_stream_csv_pipeline_drain() {
     let inp_s = inp.display().to_string();
     let outp_s = outp.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
-import {{ readStream, lines, writeStream, drain }} from "std/stream"
+import {{ readStream, lines, writeLines, drain }} from "std/stream"
 import {{ split, join }} from "std/string"
 import {{ length }} from "std/array"
 import {{ map as amap, map, filter }} from "std/iter"
@@ -3561,7 +3561,7 @@ val notEmpty = (line: String): Boolean => length(line) > 0
 val quoteFields = (line: String): String =>
   amap(split(line, ","), f => "\"${{f}}\"").join("|")
 
-readStream("{inp_s}").lines().filter(notEmpty).map(quoteFields).writeStream("{outp_s}").drain()
+readStream("{inp_s}").lines().filter(notEmpty).map(quoteFields).writeLines("{outp_s}").drain()
 print("ok")
 "#));
     let written = fs::read_to_string(&outp).unwrap_or_default();
@@ -3825,12 +3825,12 @@ fn test_stream_promise_concurrent() {
     // `parallel` awaits both, preserving order). Exercises the parallel-over-promises path fixed
     // on master alongside the cross-thread stream move.
     let output = run(&format!(r#"import {{ print }} from "std/io"
-import {{ readStream, lines, writeStream, promise }} from "std/stream"
+import {{ readStream, lines, writeLines, promise }} from "std/stream"
 import {{ parallel }} from "std/async"
 import {{ readFile }} from "std/fs"
 
-val p1 = readStream("{i1}").lines().writeStream("{o1}").promise()
-val p2 = readStream("{i2}").lines().writeStream("{o2}").promise()
+val p1 = readStream("{i1}").lines().writeLines("{o1}").promise()
+val p2 = readStream("{i2}").lines().writeLines("{o2}").promise()
 val results = parallel([p1, p2])
 print(readFile("{o1}"))
 print(readFile("{o2}"))
@@ -3849,7 +3849,7 @@ fn test_stream_promise_fault_isolation() {
     let _ = fs::remove_file(&out);
     fs::write(&tmp, "a\nb\nc").unwrap();
     let output = run(&format!(r#"import {{ print }} from "std/io"
-import {{ readStream, lines, writeStream, promise }} from "std/stream"
+import {{ readStream, lines, writeLines, promise }} from "std/stream"
 import {{ map }} from "std/iter"
 import {{ await }} from "std/async"
 
@@ -3857,7 +3857,7 @@ val boom = (line: Json): Json =>
   val arr = [1, 2]
   arr[100]
 
-val p = readStream("{inp}").lines().map(boom).writeStream("{outp}").promise()
+val p = readStream("{inp}").lines().map(boom).writeLines("{outp}").promise()
 val r = await(p)
 val status = match r
   is Error => "caught error"
