@@ -1,5 +1,5 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { readStream, lines, linesMax, chunks, writeStream, drain, collect, readText, close } from "std/stream"
+import { readStream, lines, linesMax, chunks, writeStream, writeLines, drain, collect, readText, close } from "std/stream"
 import { writeFile, readFile } from "std/fs"
 import { length } from "std/array"
 import { split, join } from "std/string"
@@ -112,9 +112,9 @@ val s = suite("std/stream", [
     ]
   ),
 
-  test("writeStream + drain runs the CSV pipeline end-to-end", () =>
+  test("writeLines + drain runs the CSV pipeline end-to-end", () =>
     writeFile(csvIn, "a,b,c\nx,y,z\n\nfoo,bar,baz")
-    readStream(csvIn).lines().filter(notEmpty).map(quoteFields).writeStream(csvOut).drain()
+    readStream(csvIn).lines().filter(notEmpty).map(quoteFields).writeLines(csvOut).drain()
     val written = readFile(csvOut)
     [
       expect(written).toBe("\"a\"|\"b\"|\"c\"\n\"x\"|\"y\"|\"z\"\n\"foo\"|\"bar\"|\"baz\"\n")
@@ -123,9 +123,20 @@ val s = suite("std/stream", [
 
   test("drain returns Null on success", () =>
     writeFile(fixture, "p\nq")
-    val r = readStream(fixture).lines().writeStream(csvOut).drain()
+    val r = readStream(fixture).lines().writeLines(csvOut).drain()
     [
       expect(r is Error).toBe(false)
+    ]
+  ),
+
+  test("writeStream is RAW (verbatim bytes, no newline separators)", () =>
+    // The raw sink copies the source bytes through unchanged — no '\n' is injected between the
+    // upstream chunks, so a byte stream round-trips exactly. (writeLines would add separators.)
+    writeFile(fixture, "no-trailing-newline-here")
+    readStream(fixture).writeStream(csvOut).drain()
+    val written = readFile(csvOut)
+    [
+      expect(written).toBe("no-trailing-newline-here")
     ]
   ),
 

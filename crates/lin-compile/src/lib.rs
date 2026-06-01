@@ -450,6 +450,8 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/yaml"     => Some(include_str!("../../../stdlib/yaml.lin")),
         "std/jq"       => Some(include_str!("../../../stdlib/jq.lin")),
         "std/stream"   => Some(include_str!("../../../stdlib/stream.lin")),
+        "std/compress" => Some(include_str!("../../../stdlib/compress.lin")),
+        "std/archive"  => Some(include_str!("../../../stdlib/archive.lin")),
         _ => None,
     }
 }

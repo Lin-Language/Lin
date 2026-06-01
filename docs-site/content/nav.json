@@ -32,6 +32,8 @@
   { "title": "std/jq", "path": "/stdlib/jq", "section": "Standard Library" },
   { "title": "std/fs", "path": "/stdlib/fs", "section": "Standard Library" },
   { "title": "std/stream", "path": "/stdlib/stream", "section": "Standard Library" },
+  { "title": "std/compress", "path": "/stdlib/compress", "section": "Standard Library" },
+  { "title": "std/archive", "path": "/stdlib/archive", "section": "Standard Library" },
   { "title": "std/path", "path": "/stdlib/path", "section": "Standard Library" },
   { "title": "std/http", "path": "/stdlib/http", "section": "Standard Library" },
   { "title": "std/net", "path": "/stdlib/net", "section": "Standard Library" },
