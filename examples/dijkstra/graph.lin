@@ -1,4 +1,5 @@
-import { for, push, reverse, length } from "std/array"
+import { push, reverse, length } from "std/array"
+import { for } from "std/iter"
 import { toString } from "std/string"
 
 // A weighted directed edge as it appears in the input graph.

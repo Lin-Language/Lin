@@ -1,5 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { length, push, for } from "std/array"
+import { length, push } from "std/array"
+import { for } from "std/iter"
 import { toUInt16, toUInt32, toUInt64 } from "std/number"
 import { toString } from "std/string"
 import {

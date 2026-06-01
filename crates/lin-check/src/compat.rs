@@ -77,6 +77,34 @@ pub fn is_compatible_env(
         (Type::Shared(_), _) => false,
         (_, Type::Shared(_)) => false,
 
+        // `Stream<T>` is covariant in T (a `Stream<U>` flows into a `Stream<T>` when `U` is
+        // compatible with `T`) but, like `Shared`, is opaque: it does NOT widen to `Json` nor
+        // unify with any other CONCRETE type, so the only legal operations are the stream-API
+        // intrinsics whose signatures take `Stream<T>` explicitly. These arms come BEFORE the
+        // `Json` wildcard so a stream can never silently flow into a `Json` sink (brief §1).
+        //
+        // The one exception is an inference/generic TypeVar on the OTHER side: `Stream` IS
+        // spellable only via the intrinsic returns, so the stdlib's thin wrappers take it through
+        // UNANNOTATED params (`readChunk = (s) => lin_stream_read(s)`) whose fresh inference var
+        // must unify with `Stream<T>`. We therefore DON'T reject when the other side is a TypeVar
+        // — that case falls through to the bidirectional-permissive TypeVar arm below (which both
+        // accepts and lets the arg's inference var bind to the stream type). The `u32::MAX` Json
+        // wildcard is NOT a TypeVar exception here: a `Stream` must never widen to `Json`, so the
+        // explicit guards below reject it before the permissive arm.
+        (Type::Stream(a), Type::Stream(b)) => is_compatible_env(a, b, env, lenient_json, depth),
+        (Type::Stream(_), Type::TypeVar(n)) if *n == u32::MAX => false,
+        (Type::TypeVar(n), Type::Stream(_)) if *n == u32::MAX => false,
+        (Type::Stream(_), Type::TypeVar(_)) | (Type::TypeVar(_), Type::Stream(_)) => true,
+        // A `Stream` flowing into / out of a UNION must consult the union (e.g. `Stream<UInt8[]>`
+        // into `Array | Iterator | Stream<T>` — the stream-`for`/intrinsic iterable param — must
+        // match the `Stream` variant). Defer to the union rules below rather than rejecting here.
+        (Type::Stream(_), Type::Union(_)) | (Type::Union(_), Type::Stream(_)) => {
+            // fall through to the Union arms (handled after this match block via a re-dispatch).
+            return union_compat(value_type, target_type, env, lenient_json, depth);
+        }
+        (Type::Stream(_), _) => false,
+        (_, Type::Stream(_)) => false,
+
         // Anything is assignable INTO Json (covariant sink): concrete T -> Json. (ADR-046)
         (_, Type::TypeVar(n)) if *n == u32::MAX => true,
         // Json -> a concrete structured Object (one with a required, non-nullable field):
@@ -174,6 +202,27 @@ pub fn is_compatible_env(
         // Iterator covariance
         (Type::Iterator(a), Type::Iterator(b)) => is_compatible_env(a, b, env, lenient_json, depth),
 
+        _ => false,
+    }
+}
+
+/// Apply the union compatibility rules (used by the `Stream`↔`Union` arms, which must defer to
+/// the union logic instead of the opaque `Stream` rejection): a union VALUE is compatible when
+/// every variant is; a union TARGET is compatible when at least one variant matches.
+fn union_compat(
+    value_type: &Type,
+    target_type: &Type,
+    env: Option<&TypeEnv>,
+    lenient_json: bool,
+    depth: &mut usize,
+) -> bool {
+    match (value_type, target_type) {
+        (Type::Union(variants), target) => {
+            variants.iter().all(|v| is_compatible_env(v, target, env, lenient_json, depth))
+        }
+        (value, Type::Union(variants)) => {
+            variants.iter().any(|v| is_compatible_env(value, v, env, lenient_json, depth))
+        }
         _ => false,
     }
 }

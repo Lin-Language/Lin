@@ -255,6 +255,46 @@ pub unsafe extern "C" fn lin_async_spawn(thunk: *mut u8) -> *mut LinPromise {
     p
 }
 
+/// `.promise()` (streams brief §5, Stage 8): MOVE the stream pipeline `s` onto a NEW worker
+/// thread that drives it to EOF, and return a `Promise<Null | Error>`. The stream pointer is
+/// handed off VERBATIM (the IR suppresses the caller's release via the move), so the worker owns
+/// the whole pipeline graph — disjoint from the parent's, keeping non-atomic RC sound. A fault
+/// inside a transform closure is caught at the async boundary (`with_async_boundary`) and surfaces
+/// as the awaited `Error` (ADR-070 / §32.2.2). The worker closes the fd exactly once.
+///
+/// A null stream resolves immediately to Null. Unlike `lin_async_spawn`, there is no closure env
+/// to deep-copy — the single moved resource pointer IS the whole transfer, so this always runs on
+/// a real worker (never the inline fallback).
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_promise(s: *mut u8) -> *mut LinPromise {
+    crate::fault::install_quiet_fault_hook();
+    if s.is_null() {
+        return lin_make_promise(std::ptr::null_mut());
+    }
+    let inner = Arc::new((Mutex::new(PromiseState::Pending), Condvar::new()));
+    let inner_for_thread = Arc::clone(&inner);
+    // The stream box pointer is Send-by-handoff: the parent will not touch it again (the move
+    // suppressed its release), so the worker is its sole owner. Carry it as a usize.
+    let stream_addr = s as usize;
+    let handle = std::thread::spawn(move || {
+        let s = stream_addr as *mut u8;
+        let outcome = crate::fault::with_async_boundary(|| {
+            // Drive + consume the moved stream on this worker; closes the fd exactly once here.
+            crate::stream::lin_stream_drive_owned(s)
+        });
+        let (lock, cvar) = &*inner_for_thread;
+        let mut state = lock.lock().unwrap();
+        *state = match outcome {
+            Ok(v) => PromiseState::Resolved(SendPtr(v)),
+            Err(msg) => PromiseState::Failed(msg),
+        };
+        cvar.notify_all();
+    });
+    let p = lin_alloc(std::mem::size_of::<LinPromise>()) as *mut LinPromise;
+    std::ptr::write(p, LinPromise { inner, handle: Some(handle) });
+    p
+}
+
 /// Await a promise: block until the worker publishes a result, join the thread, and return
 /// the resolved `TaggedVal*` (or a freshly-built `Error` object on fault). Ownership of the
 /// result transfers to the caller. Null promise → null (the Json null value).

@@ -1,4 +1,4 @@
-import { for, range } from "std/array"
+import { for, range } from "std/iter"
 
 import foreign "lin-runtime"
   val lin_path_basename: (String) => String

@@ -135,6 +135,11 @@ pub const CAP_ARRAY: u8 = 2; // *mut LinArray
 pub const CAP_OBJECT: u8 = 3; // *mut LinObject
 pub const CAP_CLOSURE: u8 = 4; // *mut LinClosure — NOT deep-copyable across a thread boundary
 pub const CAP_TAGGED: u8 = 5; // *mut TaggedVal (boxed Json/union) — deep-copy via lin_transfer_clone
+/// MOVED resource capture (streams brief §9): a `Stream` crosses by MOVE, not copy. The env-clone
+/// path hands the pointer off VERBATIM (no clone, no retain) — the source env will not be released
+/// for this slot (its scope release is suppressed by the IR), and the worker's `release_env_copy`
+/// releases it via `lin_tagged_release` (TAG_STREAM finalizer). Mirrors `ir::CaptureRelease::Move`.
+pub const CAP_MOVE: u8 = 6;
 
 /// Deep-copy a closure env allocation given its capture descriptor `desc` (a static read-only
 /// `{u32 count, u8 kinds[]}` global from the closure's offset-40 slot). `env_ptr` layout:
@@ -159,6 +164,10 @@ pub unsafe fn transfer_clone_env(env_ptr: *const u8, desc: *const u8) -> *mut u8
             CAP_ARRAY => clone_array(src_word as *const LinArray) as u64,
             CAP_OBJECT => clone_object(src_word as *const LinObject) as u64,
             CAP_TAGGED => lin_transfer_clone(src_word as *const u8) as u64,
+            // CAP_MOVE: hand the resource pointer off VERBATIM — no clone, no retain. The source
+            // env will not release this slot (the IR suppresses its scope release); the worker's
+            // `release_env_copy` releases it, so the fd closes exactly once, on the worker.
+            CAP_MOVE => src_word,
             _ => src_word,
         };
         *(new_env.add(off) as *mut u64) = new_word;
@@ -186,6 +195,9 @@ pub unsafe fn release_env_copy(env_ptr: *mut u8, desc: *const u8, env_size: u64)
                 CAP_OBJECT => crate::object::lin_object_release(word as *mut LinObject),
                 CAP_CLOSURE => crate::memory::lin_closure_release(word as *mut u8),
                 CAP_TAGGED => crate::tagged::lin_tagged_release(word as *mut u8),
+                // CAP_MOVE: the worker OWNS the moved resource — release it here (TAG_STREAM
+                // finalizer closes the fd exactly once, on the worker thread).
+                CAP_MOVE => crate::tagged::lin_tagged_release(word as *mut u8),
                 _ => {} // CAP_NONE: no owned heap payload to release
             }
         }

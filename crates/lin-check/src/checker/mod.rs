@@ -48,6 +48,12 @@ pub struct Checker {
     protected_type_vars: std::collections::HashSet<u32>,
     /// Slots of mutable global (`var`) bindings. Used by the async var-capture check.
     mutable_global_slots: std::collections::HashMap<usize, String>,
+    /// Affine resource tracking (streams brief §7): slots of `Stream`-typed `val` bindings that
+    /// have already been CONSUMED (read as a value). A `Stream` is use-at-most-once; reading the
+    /// same binding twice is a use-after-move ERROR. Flow-sensitive: if/match snapshot this set
+    /// per branch and merge conservatively (a binding consumed in ANY branch is consumed after).
+    /// Dropping (never consuming) is FINE — the RC finalizer closes the fd; only double-use errors.
+    consumed_streams: std::collections::HashSet<usize>,
     /// When true, a `Json` value is permitted to flow into a fully-concrete target without
     /// an explicit `fromJson` decode (ADR-046). Set only for the trusted stdlib, whose
     /// wrappers forward `Json` handles into concrete intrinsic/foreign params by design.
@@ -101,6 +107,7 @@ impl Checker {
             solved_type_vars: std::collections::HashMap::new(),
             protected_type_vars: std::collections::HashSet::new(),
             mutable_global_slots: std::collections::HashMap::new(),
+            consumed_streams: std::collections::HashSet::new(),
             lenient_json: false,
             generic_fn_params: std::collections::HashMap::new(),
             // Start above the intrinsic generic slot (9000) so quantified generics never
@@ -194,7 +201,7 @@ impl Checker {
     fn collect_typevar_ids(ty: &Type, out: &mut std::collections::HashSet<u32>) {
         match ty {
             Type::TypeVar(id) => { out.insert(*id); }
-            Type::Array(t) | Type::Iterator(t) | Type::Shared(t) => Self::collect_typevar_ids(t, out),
+            Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) => Self::collect_typevar_ids(t, out),
             Type::FixedArray(ts) => { for t in ts { Self::collect_typevar_ids(t, out); } }
             Type::Union(ts) => { for t in ts { Self::collect_typevar_ids(t, out); } }
             Type::Function { params, ret, .. } => {

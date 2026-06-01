@@ -1149,8 +1149,21 @@ pub fn mangle_module_key(path: &str) -> String {
 /// Mirrors codegen's `Codegen::is_union_type`. `Shared<T>` is a boxed `TaggedVal*(TAG_SHARED)`,
 /// so it belongs here: it follows the OWNING model and its RC dispatches through the tag-aware
 /// `lin_tagged_retain`/`lin_tagged_release`, whose TAG_SHARED arm does the atomic box rc.
+/// `Stream<T>` is likewise a boxed `TaggedVal*(TAG_STREAM)` whose RC dispatches through the
+/// tag-aware path (the TAG_STREAM arm decrements the stream box's refcount, closing the fd at
+/// zero) — so it is owning too.
 fn is_union_ty(ty: &Type) -> bool {
-    matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_))
+    matches!(ty, Type::Union(_) | Type::TypeVar(_) | Type::Named(_) | Type::Shared(_) | Type::Stream(_))
+}
+
+/// True if `ty` IS a `Stream` or a `Union` containing one. A streamish capture crosses a thread
+/// boundary by MOVE (CAP_MOVE), not copy. Mirrors `lin_check::checker::expr::type_is_streamish`.
+fn type_is_streamish_ir(ty: &Type) -> bool {
+    match ty {
+        Type::Stream(_) => true,
+        Type::Union(variants) => variants.iter().any(type_is_streamish_ir),
+        _ => false,
+    }
 }
 
 /// A concrete heap-allocated value type whose box wraps a refcounted heap pointer
@@ -2206,7 +2219,19 @@ fn lower_call_arg(a: &TypedExpr, param_ty: Option<&Type>, builder: &mut FuncBuil
         }
     }
     let t = lower_expr(a, builder, ctx);
-    lower_coerce_arg(t, &a.ty(), param_ty, builder)
+    let coerced = lower_coerce_arg(t, &a.ty(), param_ty, builder);
+    move_streamish_arg(&a.ty(), coerced, builder);
+    coerced
+}
+
+/// A streamish ARGUMENT is MOVED into the callee (streams brief §7/§9): the callee/worker takes
+/// ownership of the boxed-stream pointer, so the caller must NOT release it at scope exit.
+/// Unregister the lowered arg temp from the caller's owning scope. The affine check guarantees
+/// the caller never uses it again. No-op for non-stream args.
+fn move_streamish_arg(arg_ty: &Type, t: Temp, builder: &mut FuncBuilder) {
+    if type_is_streamish_ir(arg_ty) {
+        builder.unregister_owned(t);
+    }
 }
 
 /// Lower argument `i` of a call, combining two concerns:
@@ -2232,6 +2257,7 @@ fn lower_call_arg_tracked(
         let raw = lower_expr(a, builder, ctx);
         let coerced = lower_coerce_arg(raw, &a.ty(), param_ty, builder);
         let tracked = if coerced != raw { Some(raw) } else { None };
+        move_streamish_arg(&a.ty(), coerced, builder);
         return (coerced, tracked);
     }
     // Combinator callback position: enable the safe captured-cell context while lowering.
@@ -2272,6 +2298,16 @@ fn lower_call(
         // Imported function: call the compiled symbol by its mangled name, boxing
         // concrete args passed to Json/union-typed parameters.
         if let Some((sym, param_tys)) = ctx.import_fn_slots.get(slot).cloned() {
+            // STREAM COMBINATOR DISPATCH (std/iter unification Stage 3/4): when a genuine
+            // `std/iter` combinator is called with a DEFINITELY-stream receiver (arg0), redirect to
+            // the lazy `lin_stream_*` backend instead of running the eager array body. Keyed on the
+            // import symbol (`std_iter_<name>`) so a user-defined same-named function is never
+            // affected — the mirror of the checker's `streamish_combinator_ret`. The redirect
+            // delegates to `lower_intrinsic_call` so the stream-arg RC + result ownership match the
+            // proven std/stream wrapper path exactly.
+            if let Some(stream_intr) = stream_combinator_intrinsic_name(&sym, args) {
+                return lower_intrinsic_call(stream_intr, args, result_type, builder, ctx);
+            }
             let mut shell_boxes: Vec<Temp> = Vec::new();
             let mut escape_lits: Vec<Temp> = Vec::new();
             let lowered_args: Vec<Temp> = args
@@ -2489,6 +2525,33 @@ fn lower_intrinsic_call(
         "lin_request" => Intrinsic::Request,
         "lin_message" => Intrinsic::Message,
         "lin_close" => Intrinsic::Close,
+        "lin_fs_open" => Intrinsic::StreamOpen,
+        "lin_stream_read" => Intrinsic::StreamRead,
+        "lin_stream_close" => Intrinsic::StreamClose,
+        "lin_stream_map" => Intrinsic::StreamMap,
+        "lin_stream_filter" => Intrinsic::StreamFilter,
+        "lin_stream_take" => Intrinsic::StreamTake,
+        "lin_stream_drop" => Intrinsic::StreamDrop,
+        "lin_stream_take_while" => Intrinsic::StreamTakeWhile,
+        "lin_stream_drop_while" => Intrinsic::StreamDropWhile,
+        "lin_stream_flat_map" => Intrinsic::StreamFlatMap,
+        "lin_stream_flatten" => Intrinsic::StreamFlatten,
+        "lin_stream_concat" => Intrinsic::StreamConcat,
+        "lin_stream_reduce" => Intrinsic::StreamReduce,
+        "lin_stream_find" => Intrinsic::StreamFind,
+        "lin_stream_some" => Intrinsic::StreamSome,
+        "lin_stream_every" => Intrinsic::StreamEvery,
+        "lin_stream_while" => Intrinsic::StreamWhile,
+        "lin_stream_lines" => Intrinsic::StreamLines,
+        "lin_stream_chunks" => Intrinsic::StreamChunks,
+        "lin_stream_write" => Intrinsic::StreamWrite,
+        "lin_stream_drain" => Intrinsic::StreamDrain,
+        "lin_stream_collect" => Intrinsic::StreamCollect,
+        "lin_stream_read_text" => Intrinsic::StreamReadText,
+        "lin_net_tcp_stream" => Intrinsic::StreamTcp,
+        "lin_process_stdout_stream" => Intrinsic::StreamStdout,
+        "lin_io_stdin_stream" => Intrinsic::StreamStdin,
+        "lin_stream_promise" => Intrinsic::StreamPromise,
         _ => {
             // Unknown intrinsic: lower as indirect call fallback.
             let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();
@@ -2504,6 +2567,16 @@ fn lower_intrinsic_call(
         }
     };
     let lowered_args: Vec<Temp> = args.iter().map(|a| lower_expr(a, builder, ctx)).collect();
+
+    // `.promise()` MOVES its stream argument onto the worker (Stage 8): the runtime takes
+    // ownership of the boxed-stream pointer, so the caller must NOT release it (handoff). Suppress
+    // the source temp's scope-exit release — without this the caller AND the worker would both
+    // release the box (double-free / double-close). The affine check guarantees no further use.
+    if matches!(intrinsic, Intrinsic::StreamPromise) {
+        if let Some(&arg0) = lowered_args.first() {
+            builder.unregister_owned(arg0);
+        }
+    }
 
     // `push(arr, elem)` / `set(arr, idx, elem)` / `object_set(obj, key, val)` all transfer a
     // reference to their LAST argument into the container. For push/set, codegen stores the
@@ -2569,6 +2642,46 @@ fn iter_elem_type(iterable_ty: &Type) -> Type {
 /// are safe to free at the creating function's scope exit. CONSERVATIVE: only these exact names
 /// are trusted; every other callee leaves the captured cell escaping (leaking, but sound).
 /// `reduce` takes (arr, init, f) — its callback is arg index 2; the rest take (arr, f) — index 1.
+/// STREAM COMBINATOR DISPATCH (std/iter unification Stage 3/4). Given an imported function's
+/// mangled symbol and the call's args, return the `lin_stream_*` intrinsic NAME to redirect to
+/// when the callee is a genuine `std/iter` combinator AND its receiver (arg0) is DEFINITELY a
+/// Stream. Returns None otherwise (the call proceeds as a normal Named import call / eager body).
+///
+/// Keyed on the `std_iter_` symbol prefix so only the real std/iter exports are redirected — a
+/// user-defined `map`/`for`/… is mangled under a different module key and never matches. This is
+/// the IR-side mirror of the checker's `streamish_combinator_ret` (which re-typed the result):
+/// here we re-route the runtime dispatch to the lazy backend so the typed-stream result is backed
+/// by an actual lazy pipeline. The eager pure-Lin / `lin_map` bodies are bypassed entirely for a
+/// stream receiver.
+fn stream_combinator_intrinsic_name(sym: &str, args: &[TypedExpr]) -> Option<&'static str> {
+    let export = sym.strip_prefix("std_iter_")?;
+    // The receiver must be DEFINITELY a stream — not a mixed `Array | Iterator | Stream` union
+    // (which would mean the eager array body must still run). A bare `Stream(_)` is the only shape
+    // that reaches a concrete call site here (the checker resolves the receiver before lowering).
+    let arg0_is_stream = args.first().map(|a| matches!(a.ty(), Type::Stream(_))).unwrap_or(false);
+    if !arg0_is_stream {
+        return None;
+    }
+    Some(match export {
+        "map" => "lin_stream_map",
+        "filter" => "lin_stream_filter",
+        "take" => "lin_stream_take",
+        "drop" => "lin_stream_drop",
+        "takeWhile" => "lin_stream_take_while",
+        "dropWhile" => "lin_stream_drop_while",
+        "flatMap" => "lin_stream_flat_map",
+        "flatten" => "lin_stream_flatten",
+        "concat" => "lin_stream_concat",
+        "reduce" => "lin_stream_reduce",
+        "find" => "lin_stream_find",
+        "some" => "lin_stream_some",
+        "every" => "lin_stream_every",
+        "while" => "lin_stream_while",
+        "for" => "lin_stream_for",
+        _ => return None,
+    })
+}
+
 fn safe_combinator_callback_index(name: &str) -> Option<usize> {
     match name {
         "for" | "while" | "map" | "filter" | "find" | "some" | "every" => Some(1),
@@ -3168,6 +3281,24 @@ fn emit_index_loop<F: FnOnce(Temp, Temp, &mut FuncBuilder, &mut LowerCtx)>(
 /// `for(iterable, body)` → index loop calling `body(elem)` for side effects; returns Null.
 fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
+    // STREAM `.for(fn)` (Stage 5): a `for` over a Stream is driven by the runtime, not the
+    // index-loop. EOF ends the loop normally (→ Null); the first read Error becomes the for-expr's
+    // value (→ Error). So a stream `for` has result type `Null | Error`. The body closure ESCAPES
+    // into the runtime call, so it is lowered as an ordinary (non-safe-ctx) closure value.
+    if matches!(iterable_ty, Type::Stream(_)) {
+        let stream = lower_expr(&args[0], builder, ctx);
+        let body = lower_expr(&args[1], builder, ctx);
+        let ret_ty = Type::Union(vec![Type::Null, lin_check::resolve::error_type()]);
+        let dst = builder.alloc_temp(ret_ty.clone());
+        builder.emit(Instruction::CallIntrinsic {
+            dst,
+            intrinsic: Intrinsic::StreamFor,
+            args: vec![stream, body],
+            ret_ty: ret_ty.clone(),
+        });
+        builder.register_owned(dst, ret_ty);
+        return dst;
+    }
     let (param_tys, _) = callback_signature(&args[1]);
     // Read elements at the source's PROVABLE runtime representation: flat-scalar only when the
     // source is a provably-flat producer, else the tagged Json read (sound for a `[]`+push array
@@ -4621,7 +4752,20 @@ fn lower_function_expr_with_id(
             capture_kinds.push(CaptureRelease::None);
             continue;
         }
-        if is_union_ty(&cap.ty) {
+        if type_is_streamish_ir(&cap.ty) {
+            // MOVE capture (streams brief §9): a Stream crosses by MOVE, not copy. Hand the
+            // boxed-stream pointer off VERBATIM — NO CloneBox, NO Retain. The env takes the
+            // source's reference; the source's scope-exit release is SUPPRESSED (the slot is
+            // recorded as moved-out below) so the fd closes exactly once, on the worker that owns
+            // the env copy. The affine check (Stage 6) guarantees the source never touches it again.
+            capture_temps.push(base);
+            capture_kinds.push(CaptureRelease::Move);
+            // Suppress the source's scope-exit release of this very temp — its +1 has been
+            // transferred to the env. Without this, the source scope AND the worker's
+            // `release_env_copy` would both release the same boxed-stream pointer (double-free /
+            // double-close). `unregister_owned` is the established "ownership moved out" hook.
+            builder.unregister_owned(base);
+        } else if is_union_ty(&cap.ty) {
             // Env owns its own boxed TaggedVal*.
             let owned = builder.alloc_temp(cap.ty.clone());
             builder.emit(Instruction::CloneBox { dst: owned, src: base, ty: cap.ty.clone() });
