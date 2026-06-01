@@ -39,7 +39,8 @@ var ai = 0
 nodes
   .for((_) =>
     set(adj, ai, [])
-    ai = ai + 1)
+    ai = ai + 1
+  )
 edges.for((e) => push(adj[idOf(e["from"])], { "to": idOf(e["to"]), "w": e["weight"] }))
 
 var dist = arrayAllocateFilled(n, INF)
@@ -87,7 +88,8 @@ val step = (): Null =>
             set(dist, v, nd)
           set(pqNode, pqLen, v)
           set(pqDist, pqLen, nd)
-          pqLen = pqLen + 1)
+          pqLen = pqLen + 1
+        )
     step()
   else
     null
@@ -99,7 +101,8 @@ nodes
   .for((_) =>
     val d = dist[k]
     if d < INF then total = total + d else null
-    k = k + 1)
+    k = k + 1
+  )
 
 val targetDist: Int64 = dist[idOf("n999")]
 val checksum = targetDist * 1000003i64 + (total - total / 1000000000i64 * 1000000000i64)

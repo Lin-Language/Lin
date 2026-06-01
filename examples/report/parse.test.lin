@@ -6,23 +6,33 @@ import { expect, toBe, toSucceed, toFail, test, suite, run } from "std/test"
 import { parseRow } from "./parse"
 
 val s = suite("parse", [
+  // --- Valid rows ---
   test("parses a well-formed row", () =>
-    // --- Valid rows ---
-    [expect(parseRow("Alice, 85")).toSucceed()]),
+    [expect(parseRow("Alice, 85")).toSucceed()]
+  ),
+
   test("extracts and trims name and score", () =>
     val r = parseRow("Alice, 85")["value"]
-    [expect(r["name"]).toBe("Alice"), expect(r["score"]).toBe(85)]),
+    [expect(r["name"]).toBe("Alice"), expect(r["score"]).toBe(85)]
+  ),
+
   test("tolerates surrounding whitespace", () =>
     val r = parseRow("  Bob ,  92 ")["value"]
-    [expect(r["name"]).toBe("Bob"), expect(r["score"]).toBe(92)]),
+    [expect(r["name"]).toBe("Bob"), expect(r["score"]).toBe(92)]
+  ),
+
+  // --- Rejections (malformed rows are reported, not fatal) ---
   test("rejects a row without a comma", () =>
-    // --- Rejections (malformed rows are reported, not fatal) ---
-    [expect(parseRow("bad-row")).toFail()]),
+    [expect(parseRow("bad-row")).toFail()]
+  ),
+
   test(
     "rejects a row with too many fields",
     () => [expect(parseRow("a, 1, extra")).toFail()]
   ),
+
   test("rejects an empty name", () => [expect(parseRow(", 50")).toFail()]),
+
   test("rejects a non-numeric score", () => [expect(parseRow("Eve, abc")).toFail()])
 ])
 run(s)

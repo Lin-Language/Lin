@@ -33,16 +33,23 @@ val s = suite("handlers", [
       expect(contains(resp["body"], "Lin Web Server")).toBe(true),
       expect(contains(resp["body"], "Welcome")).toBe(true),
       expect(resp["body"] == "index").toBe(false)
-    ]),
+    ]
+  ),
+
   test("getStatus returns 200", () =>
     // The old bug returned the literal "index"; a rendered body never equals it.
     val resp = getStatus(makeReq("GET", "/api/status"))
-    [expect(resp["status"]).toBe(200)]),
+    [expect(resp["status"]).toBe(200)]
+  ),
+
   test("getUser returns 200 for valid path", () =>
     val resp = getUser(makeReq("GET", "/users/42"))
-    [expect(resp["status"]).toBe(200)]),
+    [expect(resp["status"]).toBe(200)]
+  ),
+
   test("getUser returns 404 for non-matching path", () =>
     val resp = getUser(makeReq("GET", "/other"))
-    [expect(resp["status"]).toBe(404)])
+    [expect(resp["status"]).toBe(404)]
+  )
 ])
 run(s)

@@ -49,7 +49,9 @@ val s = suite("task", [
       expect(r["outcome"]).toBe("pass"),
       expect(r["status"]).toBe(0),
       expect(r["output"]).toBe("hello")
-    ]),
+    ]
+  ),
+
   test("a non-zero exit is a fail carrying its status", () =>
     val r = runTask({
       "name": "f",
@@ -58,7 +60,9 @@ val s = suite("task", [
 
       ]
     })
-    [expect(r["outcome"]).toBe("fail"), expect(r["status"]).toBe(1)]),
+    [expect(r["outcome"]).toBe("fail"), expect(r["status"]).toBe(1)]
+  ),
+
   test("an unlaunchable command is an error, not a crash", () =>
     val r = runTask({
       "name": "x",
@@ -71,7 +75,9 @@ val s = suite("task", [
       expect(r["outcome"]).toBe("error"),
       expect(r["status"]).toBe(-1),
       expect(r["output"]).toBe("command not found")
-    ]),
+    ]
+  ),
+
   test("runAll runs every task in order, invoking exec once each", () =>
     val before = execCount
     val results = runAll([
@@ -95,6 +101,7 @@ val s = suite("task", [
       expect(results[0]["outcome"]).toBe("pass"),
       expect(results[1]["outcome"]).toBe("fail"),
       expect(execCount - before).toBe(2)
-    ])
+    ]
+  )
 ])
 run(s)

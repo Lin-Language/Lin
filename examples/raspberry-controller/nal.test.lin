@@ -45,7 +45,9 @@ val s = suite("raspberry-nal", [
       expect(nals[0]["data"][1]).toBe(0xAA),
       expect(nals[0]["data"][2]).toBe(0xBB)
     ]
-    checks),
+    checks
+  ),
+
   test("multiple_nal_units: SPS, PPS, IDR in order", () =>
     // multiple_nal_units: three NALs, plus trailing SC + 0x41 to flush the third.
     val buf: UInt8[] = [
@@ -83,7 +85,9 @@ val s = suite("raspberry-nal", [
       expect(nals[1]["nalType"]).toBe(8),
       expect(nals[2]["nalType"]).toBe(5)
     ]
-    checks),
+    checks
+  ),
+
   test("three_byte_start_codes: 00 00 01 delimiters", () =>
     // three_byte_start_codes
     val buf: UInt8[] = [
@@ -99,7 +103,9 @@ val s = suite("raspberry-nal", [
     ]
     val nals = parseNals(buf)
     val checks = [expect(length(nals)).toBe(1), expect(nals[0]["nalType"]).toBe(7)]
-    checks),
+    checks
+  ),
+
   test("mixed_start_code_lengths: 4- and 3-byte mixed", () =>
     // mixed_start_code_lengths: SC4 ... SC3 ... SC4 -> two complete NALs.
     val buf: UInt8[] = [
@@ -126,19 +132,24 @@ val s = suite("raspberry-nal", [
       expect(nals[0]["nalType"]).toBe(7),
       expect(nals[1]["nalType"]).toBe(8)
     ]
-    checks),
+    checks
+  ),
+
   test("no_start_code: no NALs", () =>
     // no_start_code: bytes with no start code yield nothing.
     val buf: UInt8[] = [0x41, 0x42, 0x43]
     val nals = parseNals(buf)
     val checks = [expect(length(nals)).toBe(0)]
-    checks),
+    checks
+  ),
+
   test("empty_input: no NALs", () =>
     // empty_input
     val empty: UInt8[] = []
     val nals = parseNals(empty)
     val checks = [expect(length(nals)).toBe(0)]
-    checks)
+    checks
+  )
 ])
 
 run(s)

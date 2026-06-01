@@ -15,25 +15,31 @@ val s = suite("raspberry-controller", [
     expect(clampSpeed(0.24)).toBe(0.2),
     expect(clampSpeed(1.5)).toBe(1.0),
     expect(clampSpeed(0.0 - 1.5)).toBe(0.0 - 1.0)
-  ]),
+  ]
+  ),
+
+  // rounds to nearest 0.1
+  // clamps high
+  // clamps low
   test("encodePacket is 8 bytes: two big-endian f32 motor speeds", () =>
-    // rounds to nearest 0.1
-    // clamps high
-    // clamps low
     [
       expect(length(encodePacket(0.0, 0.0))).toBe(8),
       expect(length(encodePacket(0.5, 0.0 - 0.25))).toBe(8),
       expect(f32FromBe(encodePacket(0.5, 0.0 - 0.25), 0)).toBe(0.5),
       expect(f32FromBe(encodePacket(0.5, 0.0 - 0.25), 4)).toBe(0.0 - 0.25)
-    ]),
+    ]
+  ),
+
+  // decode the two f32s back out (0.5 and -0.25 are exact in f32). This is the
+  // byte-level read that the flat-concat fix makes correct.
   test("encodePacket stop is all zero bytes", () =>
-    // decode the two f32s back out (0.5 and -0.25 are exact in f32). This is the
-    // byte-level read that the flat-concat fix makes correct.
     [
       expect(encodePacket(0.0, 0.0)[0]).toBe(0),
       expect(encodePacket(0.0, 0.0)[3]).toBe(0),
       expect(encodePacket(0.0, 0.0)[7]).toBe(0)
-    ]),
+    ]
+  ),
+
   test("applyKey: q/a step left, w/s step right, space stops", () => [
     expect(applyKey(113, 0.0, 0.0)[0]).toBe(0.1),
     expect(applyKey(97, 0.0, 0.0)[0]).toBe(0.0 - 0.1),
@@ -41,31 +47,38 @@ val s = suite("raspberry-controller", [
     expect(applyKey(115, 0.0, 0.0)[1]).toBe(0.0 - 0.1),
     expect(applyKey(32, 0.7, 0.0 - 0.4)[0]).toBe(0.0),
     expect(applyKey(32, 0.7, 0.0 - 0.4)[1]).toBe(0.0)
-  ]),
+  ]
+  ),
+
+  // q: left +
+  // a: left -
+  // w: right +
+  // s: right -
+  // space: both zero
   test("applyKey leaves the other wheel untouched", () =>
-    // q: left +
-    // a: left -
-    // w: right +
-    // s: right -
-    // space: both zero
     [
       expect(applyKey(113, 0.0, 0.3)[1]).toBe(0.3),
       expect(applyKey(119, 0.6, 0.0)[0]).toBe(0.6)
-    ]),
+    ]
+  ),
+
+  // q doesn't change right
+  // w doesn't change left
   test("applyKey clamps at the boundary", () =>
-    // q doesn't change right
-    // w doesn't change left
     [
       expect(applyKey(113, 1.0, 0.0)[0]).toBe(1.0),
       expect(applyKey(115, 0.0, 0.0 - 1.0)[1]).toBe(0.0 - 1.0)
-    ]),
+    ]
+  ),
+
+  // q at max stays 1.0
+  // s at min stays -1.0
   test("applyKey ignores unknown keys", () =>
-    // q at max stays 1.0
-    // s at min stays -1.0
     [
       expect(applyKey(120, 0.5, 0.3)[0]).toBe(0.5),
       expect(applyKey(120, 0.5, 0.3)[1]).toBe(0.3)
-    ])
+    ]
+  )
 ])
 // x: unchanged
 run(s)

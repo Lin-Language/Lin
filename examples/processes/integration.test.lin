@@ -71,7 +71,9 @@ val s = suite("processes integration", [
       expect(sm["passed"]).toBe(2),
       expect(sm["failed"]).toBe(2),
       expect(sm["ok"]).toBe(false)
-    ]),
+    ]
+  ),
+
   test("renders a report naming each task and the failure count", () =>
     val out = render(runAll(tasks))
     [
@@ -79,6 +81,7 @@ val s = suite("processes integration", [
       expect(out.contains("[fail] bad (exit 1)")).toBe(true),
       expect(out.contains("[error] missing")).toBe(true),
       expect(out.contains("2 of 4 task(s) failed")).toBe(true)
-    ])
+    ]
+  )
 ])
 run(s)

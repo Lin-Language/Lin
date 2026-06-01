@@ -15,7 +15,8 @@ val total = range(0, n)
     "x": i,
     "y": i * 2,
     "z": i * 3
-  })
+  }
+  )
   .reduce(0, (acc, p) => acc + p["x"] + p["y"] + p["z"])
 
 print(toString(total))

@@ -19,10 +19,12 @@ export val firstToFinish = (slowMs: Int64, fastMs: Int64): Json =>
   await(race([
     async(() =>
       sleep(slowMs)
-      "slow"),
+      "slow"
+    ),
     async(() =>
       sleep(fastMs)
-      "fast")
+      "fast"
+    )
   ]))
 
 // timeout — resolves with the value if the promise finishes within `ms`, else Null
@@ -30,7 +32,8 @@ export val firstToFinish = (slowMs: Int64, fastMs: Int64): Json =>
 export val withDeadline = (workMs: Int64, ms: Int32): Json =>
   val slow = async(() =>
     sleep(workMs)
-    "done")
+    "done"
+  )
   await(timeout(slow, ms))
 
 // retry — spawn the thunk up to `times`; return the first non-Error result. A thunk that

@@ -27,7 +27,9 @@ val s = suite("concurrency integration", [
       expect(pushes).toBe(5),
       expect(frozenSum).toBe(100),
       expect(total).toBe(295)
-    ]),
+    ]
+  ),
+
   test("error and recovery paths compose across the async flow", () =>
     // individual stage outputs
     // the combined aggregate of the whole flow
@@ -45,7 +47,8 @@ val s = suite("concurrency integration", [
       expect(ok).toBe(5),
       expect(nested).toBe(42),
       expect(combined).toBe(46)
-    ])
+    ]
+  )
 ])
 
 run(s)

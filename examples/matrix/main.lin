@@ -18,7 +18,8 @@ range(0, 3)
   .for((i) =>
     print(
       "  ${mat3Get(p, i, 0).toFixed(1)} ${mat3Get(p, i, 1).toFixed(1)} ${mat3Get(p, i, 2).toFixed(1)}"
-    ))
+    )
+  )
 
 // 2. Rotate (1.0, 0.0) by 90° → "(0.0000, 1.0000)".
 val rot90 = rotation2D(PI / 2.0)

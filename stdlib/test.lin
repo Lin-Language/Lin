@@ -99,7 +99,8 @@ export val withFixture = (setup: () => Json, teardown: (Json) => Null, name: Str
     val fixture = setup()
     val results = body(fixture)
     teardown(fixture)
-    results)
+    results
+  )
 
 export val suite = (name: String, tests: Json[]): Json =>
   { "name": name, "tests": tests }

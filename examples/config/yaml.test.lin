@@ -16,17 +16,23 @@ val s = suite("config yaml + jq", [
       expect(cfg["host"]).toBe("10.0.0.1"),
       expect(cfg["port"]).toBe(7000),
       expect(cfg["debug"]).toBe(true)
-    ]),
+    ]
+  ),
+
   test(
     "a parsed YAML config loads successfully",
     () => [expect(load(parse(yamlSrc))).toSucceed()]
   ),
+
   test("jqFirst reads a single field (yq pattern)", () => [
     expect(yamlSrc.parse().jqFirst(".port")).toBe(7000),
     expect(yamlSrc.parse().jqFirst(".missing")).toBe(null)
-  ]),
+  ]
+  ),
+
   test("jq collects a filtered stream of values", () =>
     val r = parse(yamlSrc).jq(".host, .port")
-    [expect(r[0]).toBe("10.0.0.1"), expect(r[1]).toBe(7000)])
+    [expect(r[0]).toBe("10.0.0.1"), expect(r[1]).toBe(7000)]
+  )
 ])
 run(s)
