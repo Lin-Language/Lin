@@ -8,8 +8,7 @@
 // guard that it does.
 import { print } from "std/io"
 import { toString } from "std/string"
-import { range, map, filter, reduce } from "std/array"
-
+import { range, map, filter, reduce } from "std/iter"
 val n = 2000000
 
 // `base`, `lo`, `hi`, `seed` are captured by the callbacks below (closures over outer vals).

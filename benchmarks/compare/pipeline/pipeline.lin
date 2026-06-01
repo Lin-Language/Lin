@@ -7,7 +7,7 @@
 // Parameters (identical across all languages): N=200000000.
 import { print } from "std/io"
 import { toString } from "std/string"
-import { range, map, filter, reduce } from "std/array"
+import { range, map, filter, reduce } from "std/iter"
 
 val n = 20000000
 

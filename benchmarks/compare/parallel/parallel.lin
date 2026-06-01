@@ -9,7 +9,7 @@
 import { print } from "std/io"
 import { toString } from "std/string"
 import { parallel } from "std/async"
-import { for } from "std/array"
+import { for } from "std/iter"
 
 // `start`/`n` stay Int32 (start never exceeds ~9232 here, so 3*start+1 and
 // start/2 never overflow Int32); only `steps` accumulates into Int64. The
