@@ -878,7 +878,9 @@ accumulator with a capture-less literal reducer, the accumulator is carried unbo
 
 ```txt
 [1, 2, 3, 4].reduce(0, (acc, x) => acc + x)   // 10
-val n = readStream("nums.txt").lines().reduce(0, (acc, line) => acc + line.parseInt32())   // Int32 | Error
+val n = readStream("nums.txt")
+  .lines()
+  .reduce(0, (acc, line) => acc + line.parseInt32())   // Int32 | Error
 ```
 
 ---
@@ -932,7 +934,10 @@ The first `n` elements. **Array/Iterator** → eager `T[]` (a copy of the whole 
 
 ```txt
 take([1, 2, 3, 4], 2)   // [1, 2]
-readStream("huge.log").lines().take(100).for(line => print(line))   // first 100 lines only
+readStream("huge.log")
+  .lines()
+  .take(100)
+  .for(line => print(line))   // first 100 lines only
 ```
 
 ---
@@ -3598,7 +3603,12 @@ is a `Stream` (ADR-077). A stream pipeline imports its **sources and sinks** fro
 import { readStream, writeStream, drain } from "std/stream"
 import { map, filter, take, for } from "std/iter"
 
-readStream("in.csv").lines().map(transform).filter(notEmpty).writeStream("out.csv").drain()
+readStream("in.csv")
+  .lines()
+  .map(transform)
+  .filter(notEmpty)
+  .writeStream("out.csv")
+  .drain()
 ```
 
 Byte sources also come from other modules — `tcpStream` (`std/net`), `stdoutStream` (`std/process`), and `stdinStream` (`std/io`) all return `Stream<UInt8[]>` (spec §27.9.2) and feed the same adapters and terminals documented here.
@@ -3703,7 +3713,11 @@ val writeStream: <T>(Stream<T>, path: String) -> Stream<T>
 Builds a **sink** node that writes each upstream item to the file at `path`. It returns a `Stream` whose terminal op (`drain`/`promise`) runs the whole pipeline — pulling one item at a time and writing it — so memory stays bounded regardless of input size. Building the sink does not write anything; a terminal op must drive it.
 
 ```txt
-readStream("in.csv").lines().map(transform).writeStream("out.csv").drain()
+readStream("in.csv")
+  .lines()
+  .map(transform)
+  .writeStream("out.csv")
+  .drain()
 ```
 
 ---
@@ -3717,7 +3731,10 @@ val drain: <T>(Stream<T>) -> Null | Error
 Terminal. Drives the pipeline on the **calling thread** and returns `Null` on normal completion (EOF) or `Error` if a read or write fails. This is the synchronous driver — no worker thread, no new runtime machinery.
 
 ```txt
-val outcome = readStream("in.csv").lines().writeStream("out.csv").drain()
+val outcome = readStream("in.csv")
+  .lines()
+  .writeStream("out.csv")
+  .drain()
 match outcome
   is Error => print("copy failed: ${outcome["message"]}")
   else     => print("done")
@@ -3736,7 +3753,11 @@ Terminal. **Moves** the whole pipeline onto a **worker OS thread** (ADR-075) and
 The promise type is conceptually `Promise<Null | Error>`; like all promise handles it is erased to `Json` in annotations (spec §24.1). `await` reattaches the `Null | Error` union, so the `Error` case must be handled (ADR-070).
 
 ```txt
-val p = readStream("big.log").lines().filter(isError).writeStream("errors.log").promise()
+val p = readStream("big.log")
+  .lines()
+  .filter(isError)
+  .writeStream("errors.log")
+  .promise()
 match await(p)
   is Error => print("pipeline failed")
   else     => print("done")
