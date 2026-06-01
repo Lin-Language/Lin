@@ -1350,7 +1350,7 @@ range(0, 10).for(i =>
 
 ### 18.5 Iterator Functions
 
-The standard iterator functions accept arrays or `Iterator<T>` values and use dot application for fluent chaining.
+The standard iterator functions accept arrays or `Iterator<T>` values and use dot application for fluent chaining. They live in `std/iter` and, when applied to a `Stream` receiver instead, dispatch to a lazy/fallible form (§18.7).
 
 ```txt
 for:    <T>(arr-or-iterator, (T) => Null) => Null
@@ -1387,6 +1387,49 @@ type Iterator<T> = {
 ```
 
 This is not used because JSON-shaped types should describe JSON-shaped data. Iterators are runtime traversal values, not JSON data.
+
+### 18.7 Receiver-Dispatched Combinators
+
+The iterable combinators — `map`, `filter`, `reduce`, `for`, `while`, `take`, `drop`, `flatMap`, `takeWhile`, `dropWhile`, `flatten`, `concat`, `find`, `some`, `every` — and the iterator constructors `range`, `rangeStep`, `iter`, `iterOf` are a **single** vocabulary that works over any iterable source: an array, an `Iterator`, or a `Stream` (§27.9). They live in one module, `std/iter`, and **dispatch on the static type of the receiver** (their first argument, in dot-application terms). This is Lin's first-argument-dispatch model (§4.4) applied to the combinator set.
+
+The same name behaves differently depending on the receiver:
+
+- Over an **array** or `Iterator` the combinator is **eager**: it materialises and returns an array (`U[]`) or a scalar terminal value.
+- Over a **`Stream`** an *adapter* combinator is **lazy**: it returns a new `Stream<U>` node and reads nothing until a terminal drives it; a *terminal* combinator drives the stream on the calling thread and returns its result.
+
+Because a stream read is fallible (§27.9.4), a combinator that **terminates** a stream gains an `| Error` arm:
+
+```txt
+                          Array / Iterator        Stream<T>
+map(f)                    U[]                     Stream<U>            (lazy adapter)
+filter(p)                 T[]                     Stream<T>            (lazy adapter)
+take(n) / drop(n)         T[]                     Stream<T>            (lazy adapter)
+flatMap / take|dropWhile  ...[]                   Stream<...>          (lazy adapter)
+flatten / concat          Json[]                  Stream               (lazy adapter)
+for(f)                    Null                    Null | Error         (terminal)
+while(p)                  Null                    Null | Error         (terminal)
+reduce(init, f)           U                       U | Error            (terminal)
+find(p)                   T | Null                T | Null | Error     (terminal)
+some(p) / every(p)        Boolean                 Boolean | Error      (terminal)
+```
+
+The dispatch is a closed, type-directed special-case over this fixed name set, not general function overloading. The precedent is `for` (§18.1), which already returns `Null` over an array and `Null | Error` over a stream. One import gives a single fluent chain that runs eagerly over an array and lazily, with bounded memory, over a stream:
+
+```txt
+import { map, filter, take, reduce } from "std/iter"
+import { readStream } from "std/stream"
+
+val total = readStream("data.csv")
+  .lines()                                   // Stream<String>
+  .drop(1)                                   // Stream<String>  (lazy)
+  .take(4)                                   // Stream<String>  (lazy)
+  .map(line => line.split(",").at(2).parseInt32())   // Stream<Int32>
+  .reduce(0, (acc, n) => acc + n)            // Int32 | Error  (terminal)
+```
+
+The combinators are **not** dual-exported: each name has exactly one home (`std/iter`). The array-shaped operations that genuinely require a materialised, indexable, ordered array — `push`, `slice`, `set`, `at`, `length`, `reverse`, `sort`/`sortBy`, `zip`, `unique`, `chunk`, `compact`, `partition`, `sum`/`product`/`min`/`max`, etc. — stay in `std/array`; `std/stream` exports only stream-specific sources, sinks, and terminals (`readStream`/`writeStream`/`drain`/`collect`/`readText`/`promise`/`close`/`lines`/`chunks`).
+
+Receiver dispatch fires at a **concrete** combinator call whose receiver is statically a `Stream`. A stream passed through a user-defined generic `Iterable` parameter (a `T[] | Iterator | Stream` union) and combined inside that function stays **array-shaped**: the lazy form is forgone there, which is the safe resolution (the eager path is always correct). Streams are also affine resources (§27.9.5): a combinator that routes to the stream backend **consumes** (moves) the stream, so a stream chain is single-use. See ADR-075.
 
 ## 19. Tagged Unions
 
@@ -2378,7 +2421,7 @@ filter:  <T>(Stream<T>, (T) => Boolean)     => Stream<T>
 take:    <T>(Stream<T>, n: Int32)           => Stream<T>      // first n items then end
 ```
 
-`map`/`filter` callbacks use the same dot-application and lambda forms as the array combinators (§18.5). They are pure transforms over each item; effects (printing, side outputs) are allowed but the item flow is one-at-a-time.
+`lines`/`chunks` are stream-specific adapters (`std/stream`). The transform combinators `map`/`filter`/`take`/`drop`/`flatMap`/`takeWhile`/`dropWhile`/`flatten`/`concat` shown here are **not** stream-only: they are the unified `std/iter` combinators (§18.7), which return a lazy `Stream` node when their receiver is a stream and an eager array otherwise. Their callbacks use the same dot-application and lambda forms as over an array (§18.5); they are pure transforms over each item, run one at a time as items are pulled (effects such as printing are allowed).
 
 #### 27.9.4 Terminal Operations
 
@@ -2431,7 +2474,7 @@ A streaming CSV transform — quote each field and re-join with `|`, dropping bl
 
 ```txt
 import { readStream, lines, writeStream, drain } from "std/stream"
-import { map, filter } from "std/array"
+import { map, filter } from "std/iter"
 
 val transform = (line: String): String =>
   line.split(",").map(f => "\"${f}\"").join("|")   // a,b,c -> "a"|"b"|"c"
