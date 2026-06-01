@@ -105,7 +105,9 @@ Folds left-to-right from `init`; the accumulator is the **first** argument to th
 
 ```lin
 [1, 2, 3, 4].reduce(0, (acc, x) => acc + x)   // 10
-readStream("nums.txt").lines().reduce(0, (acc, line) => acc + line.parseInt32())   // Int32 | Error
+readStream("nums.txt")
+  .lines()
+  .reduce(0, (acc, line) => acc + line.parseInt32())   // Int32 | Error
 ```
 
 ---
@@ -133,7 +135,10 @@ match outcome
 ```lin
 take([1, 2, 3, 4], 2)   // [1, 2]
 drop([1, 2, 3, 4], 2)   // [3, 4]
-readStream("huge.log").lines().take(100).for(line => print(line))   // first 100 lines only
+readStream("huge.log")
+  .lines()
+  .take(100)
+  .for(line => print(line))   // first 100 lines only
 readStream("data.csv").lines().drop(1)                              // skip the header, lazily
 ```
 

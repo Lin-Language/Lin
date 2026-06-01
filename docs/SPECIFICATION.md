@@ -2451,7 +2451,11 @@ match outcome
 **`.promise()`** **moves** the whole pipeline onto a **worker OS thread** (ADR-075 move-transfer) and returns `Promise<Null | Error>`. This gives real concurrency and **fault isolation**: a runtime fault while the worker drives the stream is caught at the thread boundary and surfaces as an `Error` when the promise is awaited, exactly as for any `async` thunk (§24.2.2). Awaiting follows the usual rule — the result is `Null | Error` and the `Error` case must be handled (§24.2.2, ADR-070).
 
 ```txt
-val p = readStream("big.log").lines().filter(isError).writeStream("errors.log").promise()
+val p = readStream("big.log")
+  .lines()
+  .filter(isError)
+  .writeStream("errors.log")
+  .promise()
 match await(p)
   is Error => print("pipeline failed")
   else     => print("done")
@@ -2483,8 +2487,12 @@ val removeEmptyLines = (line: String): Boolean =>
   !line.isBlank()
 
 val run = (): Null | Error =>
-  readStream("in.csv").lines().map(transform).filter(removeEmptyLines)
-    .writeStream("out.csv").drain()
+  readStream("in.csv")
+    .lines()
+    .map(transform)
+    .filter(removeEmptyLines)
+    .writeStream("out.csv")
+    .drain()
 ```
 
 ### 27.10 What Is Deliberately Absent

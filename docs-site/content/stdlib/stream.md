@@ -8,7 +8,12 @@ Errors are threaded **in-band**: the first read error poisons the upstream and s
 import { readStream, writeStream, drain } from "std/stream"
 import { map, filter, take, for } from "std/iter"
 
-readStream("in.csv").lines().map(transform).filter(notEmpty).writeStream("out.csv").drain()
+readStream("in.csv")
+  .lines()
+  .map(transform)
+  .filter(notEmpty)
+  .writeStream("out.csv")
+  .drain()
 ```
 
 > The generic combinators (`map`, `filter`, `take`, `drop`, `reduce`, `for`, …) are **not** part of `std/stream` — they come from [`std/iter`](/stdlib/iter.html) and dispatch to the lazy stream backend automatically when the receiver is a `Stream`. A stream pipeline imports its **sources and sinks** from `std/stream` and its **combinators** from `std/iter`.
@@ -83,7 +88,11 @@ readStream("frames.bin").chunks(188).for(frame => process(frame))
 Builds a **sink** node that writes each upstream item to the file at `path`. It returns a `Stream` whose terminal op (`drain`/`promise`) runs the whole pipeline — pulling one item at a time and writing it — so memory stays bounded regardless of input size. Building the sink writes nothing; a terminal op must drive it.
 
 ```lin
-readStream("in.csv").lines().map(transform).writeStream("out.csv").drain()
+readStream("in.csv")
+  .lines()
+  .map(transform)
+  .writeStream("out.csv")
+  .drain()
 ```
 
 ---
@@ -104,7 +113,10 @@ val buf  = readStream("data.bin").collect()      // UInt8[] | Error
 Terminal. Drives the pipeline on the **calling thread** and returns `Null` on normal completion (EOF) or `Error` if a read or write fails. This is the synchronous driver — no worker thread.
 
 ```lin
-val outcome = readStream("in.csv").lines().writeStream("out.csv").drain()
+val outcome = readStream("in.csv")
+  .lines()
+  .writeStream("out.csv")
+  .drain()
 match outcome
   is Error => print("copy failed: ${outcome["message"]}")
   else     => print("done")
@@ -119,7 +131,11 @@ Terminal. **Moves** the whole pipeline onto a **worker OS thread** and immediate
 `await` reattaches the `Null | Error` union, so the `Error` case must be handled (see [`std/async`](/stdlib/async.html)).
 
 ```lin
-val p = readStream("big.log").lines().filter(isError).writeStream("errors.log").promise()
+val p = readStream("big.log")
+  .lines()
+  .filter(isError)
+  .writeStream("errors.log")
+  .promise()
 match await(p)
   is Error => print("pipeline failed")
   else     => print("done")
