@@ -72,6 +72,12 @@ stream backends.
      passed in this run); `lin test stdlib/` = 22 files pass; `lin test examples/` = 42 files pass;
      `lin check` over all 13 example main.lin + 42 example source .lin = zero failures. ZERO behaviour
      change confirmed.
+   - VERIFIED BY ME (clean build, stale cache cleared): cargo test 502 passed / 0 failed;
+     lin test stdlib/ = 22 files; lin test examples/ = 42 files; worked stream example builds+runs.
+   - KNOWN MINOR WART (accepted, not a blocker): iter.lin duplicates `length`/`push` as private
+     thin wrappers over lin_length/lin_push to break the array↔iter cycle. They're one-line
+     forwarders over compiler builtins — can't drift in behaviour. Alternative (a 3rd lower
+     module for two one-liners) would be over-engineering. Revisit only if more sharing is needed.
 2. Union params + receiver-dependent return typing (checker) — PENDING
 3. Stream branches for lazy adapters — PENDING
 4. New stream terminals (reduce/find/some/every) + while — PENDING
