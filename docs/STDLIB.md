@@ -9,7 +9,8 @@ This document specifies the standard library for the Lin language. All modules a
 | Module | Description |
 | --- | --- |
 | [`std/string`](#stdstring) | String manipulation functions |
-| [`std/array`](#stdarray) | Array and iterator functions |
+| [`std/iter`](#stditer) | Iterable combinators (over arrays, iterators, and streams) and iterator constructors |
+| [`std/array`](#stdarray) | Array-shaped functions (indexable, materialised, ordered) |
 | [`std/number`](#stdnumber) | Numeric parsing and conversion functions |
 | [`std/bytes`](#stdbytes) | Byte-buffer slicing and endian (de)serialization |
 | [`std/math`](#stdmath) | Mathematical functions |
@@ -65,7 +66,39 @@ This document specifies the standard library for the Lin language. All modules a
 | [`trimEnd`](#trimEnd) | `(String) -> String` | Remove trailing whitespace only |
 | [`trimStart`](#trimStart) | `(String) -> String` | Remove leading whitespace only |
 
+**std/iter**
+
+Combinators dispatch on the receiver type: **eager** (`U[]`) over an array or iterator, **lazy**
+(`Stream<U>`) over a stream; terminals over a stream gain an `| Error` arm (ADR-075). The signatures
+below show the array/iterator (eager) form; the per-function reference notes the stream form.
+
+| Function | Signature | Summary |
+| --- | --- | --- |
+| [`concat`](#concat-iter) | `(Json[], Json[]) -> Json[]` | Concatenate two iterables |
+| [`drop`](#drop-iter) | `(Json[], Int32) -> Json[]` | All elements after first n |
+| [`dropWhile`](#dropWhile-iter) | `(Json[], (Json) -> Boolean) -> Json[]` | Skip elements while predicate holds |
+| [`every`](#every-iter) | `(Json[], (Json) -> Boolean) -> Boolean` | True if all elements match |
+| [`filter`](#filter-iter) | `<T>(T[], (T) -> Boolean) -> T[]` | Keep elements matching predicate |
+| [`find`](#find-iter) | `(Json[], (Json) -> Boolean) -> Json` | First matching element, or null |
+| [`flatMap`](#flatMap-iter) | `(Json[], (Json) -> Json[]) -> Json[]` | Map then flatten one level |
+| [`flatten`](#flatten-iter) | `(Json[]) -> Json[]` | Flatten one level of nesting |
+| [`for`](#for-iter) | `(Iterable, (Json) -> Json) -> Null` | Iterate over array, iterator, or stream |
+| [`iter`](#iter) | `(() -> S, (S) -> Boolean, (S) -> S, (S) -> T) -> Iterator` | Build a custom iterator |
+| [`iterOf`](#iterOf) | `(Json[]) -> Iterator` | Iterator over an array |
+| [`map`](#map-iter) | `<T, U>(T[], (T) -> U) -> U[]` | Transform each element |
+| [`range`](#range) | `(Int32, Int32) -> Iterator` | Integer range `[start, end)`, step 1 |
+| [`rangeStep`](#rangeStep) | `(Int32, Int32, Int32) -> Iterator` | Integer range with an explicit (possibly negative) step |
+| [`reduce`](#reduce-iter) | `<T, U>(T[], U, (U, T) -> U) -> U` | Fold left with an accumulator |
+| [`some`](#some-iter) | `(Json[], (Json) -> Boolean) -> Boolean` | True if any element matches |
+| [`take`](#take-iter) | `(Json[], Int32) -> Json[]` | First n elements |
+| [`takeWhile`](#takeWhile-iter) | `(Json[], (Json) -> Boolean) -> Json[]` | Elements until predicate fails |
+| [`while`](#while-iter) | `(Json[], (Json) -> Boolean) -> Null` | Iterate, stopping when callback returns false |
+
 **std/array**
+
+Array-shaped functions only — these need a materialised, indexable, ordered array. For the iterable
+combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors (`range`/`iter`/…), see
+[`std/iter`](#stditer).
 
 | Function | Signature | Summary |
 | --- | --- | --- |
@@ -75,23 +108,10 @@ This document specifies the standard library for the Lin language. All modules a
 | [`at`](#at-array) | `<T>(T[], Int32) -> T \| Null` | Element at index, or `null` if out of bounds; negative indices count from end |
 | [`chunk`](#chunk) | `(Json[], Int32) -> Json[][]` | Split into n-sized sub-arrays |
 | [`compact`](#compact) | `(Json[]) -> Json[]` | Remove null elements |
-| [`concat`](#concat) | `(Json[], Json[]) -> Json[]` | Concatenate two arrays |
 | [`countBy`](#countBy) | `(Json[], (Json) -> String) -> { ...Int32 }` | Frequency map by key function |
-| [`drop`](#drop) | `(Json[], Int32) -> Json[]` | All elements after first n |
-| [`dropWhile`](#dropWhile) | `(Json[], (Json) -> Boolean) -> Json[]` | Skip elements while predicate holds |
-| [`every`](#every) | `(Json[], (Json) -> Boolean) -> Boolean` | True if all elements match |
-| [`filter`](#filter) | `<T>(T[], (T) -> Boolean) -> T[]` | Keep elements matching predicate |
-| [`find`](#find) | `(Json[], (Json) -> Boolean) -> Json` | First matching element, or null |
-| [`flatMap`](#flatMap) | `(Json[], (Json) -> Json[]) -> Json[]` | Map then flatten one level |
-| [`flatten`](#flatten) | `(Json[]) -> Json[]` | Flatten one level of nesting |
-| [`for`](#for) | `(Iterable, (Json) -> Json) -> Null` | Iterate over array or iterator |
-| [`while`](#while) | `(Json[], (Json) -> Boolean) -> Null` | Iterate, stopping when callback returns false |
 | [`groupBy`](#groupBy) | `(Json[], (Json) -> String) -> { ...Json[] }` | Group into object of arrays by key function |
 | [`indexOf`](#indexOf-array) | `<T>(T[], T) -> Int32` | First index of value, or -1 |
-| [`iter`](#iter) | `(() -> S, (S) -> Boolean, (S) -> S, (S) -> T) -> Iterator` | Build a custom iterator |
-| [`iterOf`](#iterOf) | `(Json[]) -> Iterator` | Iterator over an array |
 | [`length`](#length-array) | `(Json) -> Int32` | Length of array, string, or object |
-| [`map`](#map) | `<T, U>(T[], (T) -> U) -> U[]` | Transform each element |
 | [`max`](#max-array) | `(Number[]) -> Number` | Maximum element |
 | [`maxBy`](#maxBy) | `(Json[], (Json) -> Number) -> Json` | Element with the largest key |
 | [`min`](#min-array) | `(Number[]) -> Number` | Minimum element |
@@ -100,19 +120,13 @@ This document specifies the standard library for the Lin language. All modules a
 | [`prepend`](#prepend) | `(Json[], Json) -> Json[]` | Non-mutating single-element prepend |
 | [`product`](#product) | `(Number[]) -> Number` | Product of all elements |
 | [`push`](#push) | `(Json[], Json) -> Null` | Append an element to an array in place |
-| [`range`](#range) | `(Int32, Int32) -> Iterator` | Integer range `[start, end)`, step 1 |
-| [`rangeStep`](#rangeStep) | `(Int32, Int32, Int32) -> Iterator` | Integer range with an explicit (possibly negative) step |
-| [`reduce`](#reduce) | `<T, U>(T[], U, (U, T) -> U) -> U` | Fold left with an accumulator |
 | [`reverse`](#reverse) | `(Json[]) -> Json[]` | Return a reversed copy |
 | [`scan`](#scan) | `(Json[], Json, (Json, Json) -> Json) -> Json[]` | Reduce returning all intermediate values |
 | [`set`](#set-array) | `<T>(T[], Int32, T) -> Null` | Set an element by index in place |
 | [`slice`](#slice) | `(T[], Int32, Int32) -> T[]` | Sub-buffer copy; preserves element type |
-| [`some`](#some) | `(Json[], (Json) -> Boolean) -> Boolean` | True if any element matches |
 | [`sort`](#sort) | `(Json[], (Json, Json) -> Int32) -> Json[]` | Return sorted copy using comparator |
 | [`sortBy`](#sortBy) | `(Json[], (Json) -> Json) -> Json[]` | Return sorted copy using key extractor |
 | [`sum`](#sum) | `(Number[]) -> Number` | Sum all elements |
-| [`take`](#take) | `(Json[], Int32) -> Json[]` | First n elements |
-| [`takeWhile`](#takeWhile) | `(Json[], (Json) -> Boolean) -> Json[]` | Elements until predicate fails |
 | [`unique`](#unique) | `(Json[]) -> Json[]` | Remove duplicate elements (deep equality) |
 | [`zip`](#zip) | `(Json[], Json[]) -> [Json, Json][]` | Pair elements by index |
 
@@ -320,20 +334,21 @@ This document specifies the standard library for the Lin language. All modules a
 
 **std/stream**
 
+Stream-specific sources, adapters, sinks, and terminals. The unified combinators
+(`map`/`filter`/`take`/`drop`/`reduce`/`for`/…) are **not** exported here — they come from
+[`std/iter`](#stditer) and dispatch to the lazy stream backend on a stream receiver (ADR-075).
+
 | Function | Signature | Summary |
 | --- | --- | --- |
 | [`readStream`](#readStream) | `(String) -> Stream<UInt8[]>` | Open a file as a lazy byte stream |
 | [`lines`](#lines-stream) | `(Stream<UInt8[]>) -> Stream<String>` | View a byte stream as a stream of lines |
+| [`linesMax`](#linesMax) | `(Stream<UInt8[]>, Int32) -> Stream<String>` | Like `lines` with an explicit per-line byte cap |
 | [`chunks`](#chunks) | `(Stream<UInt8[]>, Int32) -> Stream<UInt8[]>` | Re-chunk a byte stream to fixed-size windows |
-| [`map`](#map-stream) | `<T,U>(Stream<T>, (T) -> U) -> Stream<U>` | Lazily transform each item |
-| [`filter`](#filter-stream) | `<T>(Stream<T>, (T) -> Boolean) -> Stream<T>` | Lazily keep items matching a predicate |
-| [`take`](#take-stream) | `<T>(Stream<T>, Int32) -> Stream<T>` | Take the first n items then end |
 | [`readText`](#readText) | `(Stream<UInt8[]>) -> String \| Error` | Drain a byte stream to one String |
 | [`collect`](#collect) | `(Stream<UInt8[]>) -> UInt8[] \| Error` | Drain a byte stream to one byte buffer |
 | [`writeStream`](#writeStream) | `<T>(Stream<T>, String) -> Stream<T>` | Build a sink that writes upstream items to a file |
 | [`drain`](#drain) | `<T>(Stream<T>) -> Null \| Error` | Run a pipeline on the calling thread |
 | [`promise`](#promise-stream) | `<T>(Stream<T>) -> Json` | Move a pipeline to a worker thread; `Promise<Null \| Error>` |
-| [`for`](#for-stream) | `<T>(Stream<T>, (T) -> Null) -> Null \| Error` | Consume each item (EOF -> Null, read error -> Error) |
 | [`close`](#close-stream) | `(Stream<T>) -> Null` | Close the underlying fd; idempotent |
 
 **std/template**
@@ -768,14 +783,378 @@ trimStart("\t\ndata")    // "data"
 
 ---
 
-## std/array
+## std/iter
 
-Array and iterator functions. All transformation functions are non-mutating and return new values.
+Iterable combinators and iterator constructors. A *combinator* works over any **iterable source** — an
+array, an `Iterator`, or a `Stream` — and **dispatches on the receiver's static type** (its first
+argument, in dot-application terms): the same name is **eager** over an array/iterator (returning a
+materialised `U[]`) and **lazy** over a stream (returning a `Stream<U>` adapter that reads nothing until
+a terminal drives it). Terminals over a stream gain an `| Error` arm, because a stream read can fail
+mid-traversal (ADR-075; stream semantics in spec §27.9). Eager combinators are non-mutating and return
+new values.
 
 Import:
 
 ```txt
-import { map, filter, for, range } from "std/array"
+import { map, filter, reduce, take } from "std/iter"
+import { range, iter } from "std/iter"
+```
+
+The headline win — one combinator vocabulary across arrays and streams. The same chain that runs eagerly
+over an array runs **lazily, with bounded memory** over a stream, simply because the receiver is a
+`Stream`:
+
+```txt
+import { map, filter, take, reduce } from "std/iter"
+import { readStream } from "std/stream"
+
+// Drop a header line, take 4 records, sum a parsed column — lazily, one line at a time:
+val total = readStream("data.csv")
+  .lines()                       // Stream<String>
+  .drop(1)                       // Stream<String>  (lazy adapter)
+  .take(4)                       // Stream<String>  (lazy adapter)
+  .map(line => line.split(",").at(2).parseInt32())   // Stream<Int32>
+  .reduce(0, (acc, n) => acc + n)                     // Int32 | Error  (terminal)
+
+match total
+  is Error => print("read failed: ${total["message"]}")
+  else     => print("sum = ${total}")
+```
+
+> A stream is an **affine resource** (ADR-073): a combinator that routes to the stream backend
+> **consumes** (moves) the stream, so the chain is single-use. Using the same stream value twice is a
+> compile-time error. See [`std/stream`](#stdstream) for the lifetime rules.
+>
+> v1 limitation: dispatch fires at a **concrete** combinator call with a `Stream` receiver. A stream
+> passed through a user-defined generic `Iterable` parameter and combined inside that function stays
+> **array-shaped** (eager) — the safe resolution; the lazy form is forgone, never miscompiled.
+
+---
+
+### map (iter) {#map-iter}
+
+```txt
+val map: <T, U>(src: T[] | Iterator | Stream<T>, f: (T) -> U) -> U[] | Stream<U>
+```
+
+Applies `f` to each element in order. **Array/Iterator** → eager `U[]`. **Stream** → lazy `Stream<U>`
+(a transform adapter; `f` runs once per item as the item is pulled). For a monomorphic scalar array with
+a capture-less literal lambda, the body is inlined into a flat loop with no per-element boxing (ADR-069).
+
+```txt
+[1, 2, 3].map(x => x * 2)                 // [2, 4, 6]
+["a", "b"].map(s => s.toUpper())          // ["A", "B"]
+readStream("in.csv").lines().map(line => line.toUpper())   // Stream<String> (lazy)
+```
+
+---
+
+### filter (iter) {#filter-iter}
+
+```txt
+val filter: <T>(src: T[] | Iterator | Stream<T>, f: (T) -> Boolean) -> T[] | Stream<T>
+```
+
+Keeps elements for which `f` returns `true`. **Array/Iterator** → eager `T[]`. **Stream** → lazy
+`Stream<T>`.
+
+```txt
+[1, 2, 3, 4].filter(x => x > 2)           // [3, 4]
+readStream("app.log").lines().filter(line => line.contains("ERROR"))   // Stream<String> (lazy)
+```
+
+---
+
+### reduce (iter) {#reduce-iter}
+
+```txt
+val reduce: <T, U>(src: T[] | Iterator | Stream<T>, init: U, f: (U, T) -> U) -> U | (U | Error)
+```
+
+Folds left-to-right from `init`. `f` receives the accumulator first and the current element second.
+**Array/Iterator** → eager `U`. **Stream** → **terminal** returning `U | Error` (it drives the stream to
+completion on the calling thread; a read fault surfaces as `Error`). For a monomorphic scalar
+accumulator with a capture-less literal reducer, the accumulator is carried unboxed (ADR-069).
+
+```txt
+[1, 2, 3, 4].reduce(0, (acc, x) => acc + x)   // 10
+val n = readStream("nums.txt").lines().reduce(0, (acc, line) => acc + line.parseInt32())   // Int32 | Error
+```
+
+---
+
+### for (iter) {#for-iter}
+
+```txt
+val for: (src: Json[] | Iterator | Stream, f: (Json) -> Json) -> Null | (Null | Error)
+```
+
+Iterates over each element, calling `f` (its return value is discarded). **Array/Iterator** → `Null`.
+**Stream** → **terminal** returning `Null | Error`: EOF ends the loop normally (`Null`), and a read
+`Error` mid-traversal becomes the result (spec §27.9.4). Lin has no `for…in`; iteration is always
+`.for(fn)`.
+
+```txt
+[1, 2, 3].for(x => print(toString(x)))
+range(0, 5).for(i => print(toString(i)))
+
+val outcome = readStream("in.log").lines().for(line => print(line))
+match outcome
+  is Error => print("read failed: ${outcome["message"]}")
+  else     => null
+```
+
+---
+
+### while (iter) {#while-iter}
+
+```txt
+val while: <T>(src: T[] | Iterator | Stream, f: (T) -> Boolean) -> Null | (Null | Error)
+```
+
+Iterates calling `f` with each element, stopping as soon as `f` returns `false`. **Array/Iterator** →
+`Null`; the short-circuit primitive behind `some`/`every`/`find`. **Stream** → terminal `Null | Error`.
+
+```txt
+[1, 2, -3, 4].while(x => x >= 0)   // visits 1, 2, stops at -3
+```
+
+---
+
+### take (iter) {#take-iter}
+
+```txt
+val take: <T>(src: T[] | Iterator | Stream<T>, n: Int32) -> T[] | Stream<T>
+```
+
+The first `n` elements. **Array/Iterator** → eager `T[]` (a copy of the whole array if `n >= length`).
+**Stream** → lazy `Stream<T>` that ends after `n` items and stops pulling upstream.
+
+```txt
+take([1, 2, 3, 4], 2)   // [1, 2]
+readStream("huge.log").lines().take(100).for(line => print(line))   // first 100 lines only
+```
+
+---
+
+### drop (iter) {#drop-iter}
+
+```txt
+val drop: <T>(src: T[] | Iterator | Stream<T>, n: Int32) -> T[] | Stream<T>
+```
+
+Skips the first `n` elements. **Array/Iterator** → eager `T[]` (`[]` if `n >= length`). **Stream** →
+lazy `Stream<T>`.
+
+```txt
+drop([1, 2, 3, 4], 2)   // [3, 4]
+readStream("data.csv").lines().drop(1)   // skip the header line, lazily
+```
+
+---
+
+### takeWhile (iter) {#takeWhile-iter}
+
+```txt
+val takeWhile: <T>(src: T[] | Iterator | Stream<T>, f: (T) -> Boolean) -> T[] | Stream<T>
+```
+
+Leading elements for which `f` returns `true`; stops at the first `false`. **Array/Iterator** → eager
+`T[]`. **Stream** → lazy `Stream<T>`.
+
+```txt
+[1, 2, 3, 4, 1].takeWhile(x => x < 3)   // [1, 2]
+```
+
+---
+
+### dropWhile (iter) {#dropWhile-iter}
+
+```txt
+val dropWhile: <T>(src: T[] | Iterator | Stream<T>, f: (T) -> Boolean) -> T[] | Stream<T>
+```
+
+Drops leading elements while `f` returns `true`, then keeps the rest unchanged. **Array/Iterator** →
+eager `T[]`. **Stream** → lazy `Stream<T>`.
+
+```txt
+[1, 2, 3, 4, 1].dropWhile(x => x < 3)   // [3, 4, 1]
+```
+
+---
+
+### flatMap (iter) {#flatMap-iter}
+
+```txt
+val flatMap: (src: Json[] | Iterator | Stream, f: (Json) -> Json[]) -> Json[] | Stream
+```
+
+Applies `f` to each element and concatenates the resulting arrays. **Array/Iterator** → eager `Json[]`.
+**Stream** → lazy stream that yields each inner element in turn.
+
+```txt
+[1, 2, 3].flatMap(x => [x, x * 2])   // [1, 2, 2, 4, 3, 6]
+```
+
+---
+
+### flatten (iter) {#flatten-iter}
+
+```txt
+val flatten: (src: Json[] | Iterator | Stream) -> Json[] | Stream
+```
+
+Removes one level of nesting. **Array/Iterator** → eager `Json[]`. **Stream** → lazy.
+
+```txt
+flatten([[1, 2], [3, 4]])   // [1, 2, 3, 4]
+```
+
+---
+
+### concat (iter) {#concat-iter}
+
+```txt
+val concat: (a: Json[] | Iterator | Stream, b: Json[] | Iterator | Stream) -> Json[] | Stream
+```
+
+Yields all of `a` followed by all of `b`. **Arrays/Iterators** → eager `Json[]`. **Streams** → lazy
+(both stream arguments are consumed/moved into the concatenated source).
+
+```txt
+concat([1, 2], [3, 4])   // [1, 2, 3, 4]
+```
+
+---
+
+### find (iter) {#find-iter}
+
+```txt
+val find: (src: Json[] | Iterator | Stream, f: (Json) -> Boolean) -> Json | (Json | Null | Error)
+```
+
+The first element for which `f` returns `true`, or `null` if none. **Array/Iterator** → `Json` (the
+match or `null`). **Stream** → **terminal** `Json | Null | Error`.
+
+```txt
+[1, 2, 3].find(x => x > 1)   // 2
+```
+
+---
+
+### some (iter) {#some-iter}
+
+```txt
+val some: (src: Json[] | Iterator | Stream, f: (Json) -> Boolean) -> Boolean | (Boolean | Error)
+```
+
+`true` if `f` returns `true` for at least one element (short-circuits). **Array/Iterator** → `Boolean`.
+**Stream** → **terminal** `Boolean | Error`.
+
+```txt
+[1, 2, 3].some(x => x > 2)   // true
+```
+
+---
+
+### every (iter) {#every-iter}
+
+```txt
+val every: (src: Json[] | Iterator | Stream, f: (Json) -> Boolean) -> Boolean | (Boolean | Error)
+```
+
+`true` if `f` returns `true` for every element (short-circuits on the first `false`); `true` for an
+empty source. **Array/Iterator** → `Boolean`. **Stream** → **terminal** `Boolean | Error`.
+
+```txt
+[1, 2, 3].every(x => x > 0)   // true
+```
+
+---
+
+### range
+
+```txt
+val range: (start: Int32, end: Int32) -> Iterator
+```
+
+Returns an iterator yielding integers from `start` up to (but not including) `end`, stepping by `1`. If
+`start >= end`, the iterator is empty. For a custom or negative step, use [`rangeStep`](#rangeStep).
+
+```txt
+range(0, 3).for(i => print(toString(i)))   // prints 0, 1, 2
+range(1, 4).map(i => i * 2)                // [2, 4, 6]
+```
+
+---
+
+### rangeStep
+
+```txt
+val rangeStep: (start: Int32, end: Int32, step: Int32) -> Iterator
+```
+
+Returns an iterator yielding integers from `start` toward `end` (exclusive), advancing by `step`. A
+positive `step` counts up while `i < end`; a negative `step` counts down while `i > end`; a `step` of
+`0` yields an empty iterator.
+
+```txt
+rangeStep(0, 10, 2).for(i => print(toString(i)))   // 0, 2, 4, 6, 8
+rangeStep(5, 0, -1).map(i => i)                    // [5, 4, 3, 2, 1]
+```
+
+---
+
+### iter
+
+```txt
+val iter: (init: () -> S, hasNext: (S) -> Boolean, next: (S) -> S, value: (S) -> T) -> Iterator
+```
+
+Constructs a custom iterator from four functions: `init` produces the initial state, `hasNext` tests
+whether to continue, `next` advances the state, and `value` extracts the current element.
+
+```txt
+// Fibonacci iterator
+val fibs = iter(
+  () => { "a": 0, "b": 1 },
+  s => s["a"] < 100,
+  s => { "a": s["b"], "b": s["a"] + s["b"] },
+  s => s["a"]
+)
+fibs.for(n => print(toString(n)))
+```
+
+---
+
+### iterOf
+
+```txt
+val iterOf: (arr: Json[]) -> Iterator
+```
+
+Returns an iterator that yields each element of `arr` in order. Produces a first-class iterator value
+that can be passed around before consumption.
+
+```txt
+val it = iterOf([10, 20, 30])
+it.for(x => print(toString(x)))   // prints 10, 20, 30
+```
+
+---
+
+## std/array
+
+Array-shaped functions — these operate on a materialised, indexable, ordered array. The iterable
+combinators (`map`/`filter`/`reduce`/`for`/`while`/`take`/`drop`/`flatMap`/`takeWhile`/`dropWhile`/
+`flatten`/`concat`/`find`/`some`/`every`) and the iterator constructors (`range`/`rangeStep`/`iter`/
+`iterOf`) now live in [`std/iter`](#stditer). All transformation functions here are non-mutating and
+return new values (except the in-place `push`/`set`).
+
+Import:
+
+```txt
+import { push, slice, sort, sum } from "std/array"
 ```
 
 ---
@@ -877,21 +1256,6 @@ compact([1, 2, 3])               // [1, 2, 3]
 
 ---
 
-### concat
-
-```txt
-val concat: (a: Json[], b: Json[]) -> Json[]
-```
-
-Returns a new array containing all elements of `a` followed by all elements of `b`.
-
-```txt
-concat([1, 2], [3, 4])   // [1, 2, 3, 4]
-concat([], [1])           // [1]
-```
-
----
-
 ### countBy
 
 ```txt
@@ -906,148 +1270,6 @@ Returns an object mapping each distinct key (produced by `f`) to the number of e
 
 [1, 2, 3, 4, 5].countBy(n => if n % 2 == 0 then "even" else "odd")
 // { "odd": 3, "even": 2 }
-```
-
----
-
-### drop
-
-```txt
-val drop: (arr: Json[], n: Int32) -> Json[]
-```
-
-Returns a new array with the first `n` elements removed. If `n >= length(arr)`, returns `[]`.
-
-```txt
-drop([1, 2, 3, 4], 2)   // [3, 4]
-drop([1, 2], 5)          // []
-drop([1, 2, 3], 0)       // [1, 2, 3]
-```
-
----
-
-### dropWhile
-
-```txt
-val dropWhile: (arr: Json[], f: (Json) -> Boolean) -> Json[]
-```
-
-Returns a new array with leading elements removed while `f` returns `true`. As soon as `f` returns `false`, the remaining elements are kept unchanged.
-
-```txt
-[1, 2, 3, 4, 1].dropWhile(x => x < 3)   // [3, 4, 1]
-[1, 2, 3].dropWhile(x => x > 0)          // []
-[1, 2, 3].dropWhile(x => x > 9)          // [1, 2, 3]
-```
-
----
-
-### every
-
-```txt
-val every: (arr: Json[], f: (Json) -> Boolean) -> Boolean
-```
-
-Returns `true` if `f` returns `true` for every element. Returns `true` for an empty array.
-
-```txt
-[1, 2, 3].every(x => x > 0)   // true
-[1, 2, 3].every(x => x > 1)   // false
-```
-
----
-
-### filter
-
-```txt
-val filter: <T>(arr: T[], f: (T) -> Boolean) -> T[]
-```
-
-Returns a new array containing only the elements for which `f` returns `true`. Generic: the result
-element type is the input element type. For a monomorphic scalar array with a capture-less literal
-predicate, the predicate is inlined into a flat loop with no per-element boxing (ADR-069).
-
-```txt
-[1, 2, 3, 4].filter(x => x > 2)   // [3, 4]
-```
-
----
-
-### find
-
-```txt
-val find: (arr: Json[], f: (Json) -> Boolean) -> Json
-```
-
-Returns the first element for which `f` returns `true`, or `null` if none.
-
-```txt
-[1, 2, 3].find(x => x > 1)   // 2
-[1, 2, 3].find(x => x > 9)   // null
-```
-
----
-
-### flatMap
-
-```txt
-val flatMap: (arr: Json[], f: (Json) -> Json[]) -> Json[]
-```
-
-Applies `f` to each element and concatenates the resulting arrays into a single flat array.
-
-```txt
-[1, 2, 3].flatMap(x => [x, x * 2])   // [1, 2, 2, 4, 3, 6]
-```
-
----
-
-### flatten
-
-```txt
-val flatten: (arr: Json[]) -> Json[]
-```
-
-Returns a new array with one level of nesting removed. Non-array elements are kept as-is.
-
-```txt
-flatten([[1, 2], [3, 4]])      // [1, 2, 3, 4]
-flatten([[1, [2]], [3]])       // [1, [2], 3]
-flatten([1, 2, 3])             // [1, 2, 3]
-```
-
----
-
-### for
-
-```txt
-val for: (iterable: Json[] | Iterator, f: (Json) -> Json) -> Null
-```
-
-Iterates over each element of `iterable`, calling `f` with each element. The return value of `f` is discarded. Works on arrays and iterators.
-
-```txt
-[1, 2, 3].for(x => print(toString(x)))
-range(0, 5).for(i => print(toString(i)))
-```
-
----
-
-### while
-
-```txt
-val while: (arr: Json[], f: (Json) -> Boolean) -> Null
-```
-
-Iterates over each element of `arr`, calling `f` with each element. Stops as soon as `f` returns `false`. If `f` always returns `true`, the entire array is visited. This is the primitive used to implement short-circuiting operations such as `some`, `every`, `find`, `indexOf`, and `takeWhile`.
-
-```txt
-// stop at first negative number
-[1, 2, -3, 4].while(x => x >= 0)   // visits 1, 2, stops at -3
-
-// equivalent to some — stop on first match
-var found = false
-arr.while(x => val m = x > 5; if m then found = true; !m)
 ```
 
 ---
@@ -1087,42 +1309,6 @@ Returns the zero-based index of the first element deeply equal to `target`, or `
 
 ---
 
-### iter
-
-```txt
-val iter: (init: () -> S, hasNext: (S) -> Boolean, next: (S) -> S, value: (S) -> T) -> Iterator
-```
-
-Constructs a custom iterator from four functions: `init` produces the initial state, `hasNext` tests whether to continue, `next` advances the state, and `value` extracts the current element.
-
-```txt
-// Fibonacci iterator
-val fibs = iter(
-  () => { "a": 0, "b": 1 },
-  s => s["a"] < 100,
-  s => { "a": s["b"], "b": s["a"] + s["b"] },
-  s => s["a"]
-)
-fibs.for(n => print(toString(n)))
-```
-
----
-
-### iterOf
-
-```txt
-val iterOf: (arr: Json[]) -> Iterator
-```
-
-Returns an iterator that yields each element of `arr` in order. Produces a first-class iterator value that can be passed around before consumption.
-
-```txt
-val it = iterOf([10, 20, 30])
-it.for(x => print(toString(x)))   // prints 10, 20, 30
-```
-
----
-
 ### length (array) {#length-array}
 
 ```txt
@@ -1135,24 +1321,6 @@ Returns the length of an array, string, or object (number of keys).
 length([1, 2, 3])        // 3
 length("hello")          // 5
 length({ "a": 1 })       // 1
-```
-
----
-
-### map
-
-```txt
-val map: <T, U>(arr: T[], f: (T) -> U) -> U[]
-```
-
-Returns a new array formed by applying `f` to each element of `arr` in order. Generic: the result
-element type is the callback's return type. For a monomorphic scalar array with a capture-less literal
-lambda, the lambda body is inlined into a flat loop with no per-element boxing or closure call
-(ADR-069).
-
-```txt
-[1, 2, 3].map(x => x * 2)        // [2, 4, 6]
-["a", "b"].map(s => toUpper(s))   // ["A", "B"]
 ```
 
 ---
@@ -1281,51 +1449,6 @@ push(xs, 2)
 
 ---
 
-### range
-
-```txt
-val range: (start: Int32, end: Int32) -> Iterator
-```
-
-Returns an iterator that yields integers from `start` up to (but not including) `end`, stepping by `1`. If `start >= end`, the iterator is empty. For a custom or negative step, use [`rangeStep`](#rangeStep).
-
-```txt
-range(0, 3).for(i => print(toString(i)))   // prints 0, 1, 2
-range(1, 4).map(i => i * 2)               // [2, 4, 6]
-range(5, 5)                               // empty
-```
-
----
-
-### rangeStep
-
-```txt
-val rangeStep: (start: Int32, end: Int32, step: Int32) -> Iterator
-```
-
-Returns an iterator that yields integers from `start` toward `end` (exclusive), advancing by `step` each time. With a positive `step` it counts up while `i < end`; with a negative `step` it counts down while `i > end`. A `step` of `0` yields an empty iterator.
-
-```txt
-rangeStep(0, 10, 2).for(i => print(toString(i)))   // 0, 2, 4, 6, 8
-rangeStep(5, 0, -1).map(i => i)                    // [5, 4, 3, 2, 1]
-```
-
----
-
-### reduce
-
-```txt
-val reduce: <T, U>(arr: T[], init: U, f: (U, T) -> U) -> U
-```
-
-Folds `arr` left-to-right starting from `init`. `f` receives the accumulator as its first argument and the current element as its second. Generic: the accumulator/result type is the type of `init`. For a monomorphic scalar accumulator with a capture-less literal reducer, the accumulator is carried unboxed through the loop and the reducer body is inlined with no per-element boxing or closure call (ADR-069).
-
-```txt
-[1, 2, 3, 4].reduce(0, (acc, x) => acc + x)   // 10
-```
-
----
-
 ### reverse
 
 ```txt
@@ -1386,21 +1509,6 @@ Returns a copy of the elements in the half-open range `[start, end)`. `start` an
 
 ---
 
-### some
-
-```txt
-val some: (arr: Json[], f: (Json) -> Boolean) -> Boolean
-```
-
-Returns `true` if `f` returns `true` for at least one element. Returns `false` for an empty array.
-
-```txt
-[1, 2, 3].some(x => x > 2)   // true
-[1, 2, 3].some(x => x > 9)   // false
-```
-
----
-
 ### sort
 
 ```txt
@@ -1450,38 +1558,6 @@ Returns the sum of all elements in `arr`. Returns `0` for an empty array.
 ```txt
 sum([1, 2, 3, 4])   // 10
 sum([])              // 0
-```
-
----
-
-### take
-
-```txt
-val take: (arr: Json[], n: Int32) -> Json[]
-```
-
-Returns a new array containing only the first `n` elements. If `n >= length(arr)`, returns a copy of the full array.
-
-```txt
-take([1, 2, 3, 4], 2)   // [1, 2]
-take([1, 2], 5)          // [1, 2]
-take([1, 2, 3], 0)       // []
-```
-
----
-
-### takeWhile
-
-```txt
-val takeWhile: (arr: Json[], f: (Json) -> Boolean) -> Json[]
-```
-
-Returns a new array of leading elements for which `f` returns `true`. Stops at the first element where `f` returns `false`.
-
-```txt
-[1, 2, 3, 4, 1].takeWhile(x => x < 3)   // [1, 2]
-[1, 2, 3].takeWhile(x => x > 0)          // [1, 2, 3]
-[1, 2, 3].takeWhile(x => x > 9)          // []
 ```
 
 ---
@@ -3508,14 +3584,20 @@ print("exited ${code}")
 
 ## std/stream
 
-Lazy, fallible streams over OS resources — files, sockets, subprocess stdout, and stdin (spec §27.9). A `Stream<T>` is an opaque runtime value built as a **lazy pull graph**: a source node, zero or more adapters (`lines`/`chunks`/`map`/`filter`/`take`), and a terminal operation that drives the graph one item at a time with bounded memory. Errors are threaded **in-band** — the first read error poisons the upstream and short-circuits to the terminal op, so error handling lives only at the terminal, not at every adapter.
+Lazy, fallible streams over OS resources — files, sockets, subprocess stdout, and stdin (spec §27.9). A `Stream<T>` is an opaque runtime value built as a **lazy pull graph**: a source node (`readStream`), zero or more adapters (`lines`/`linesMax`/`chunks`, plus the `std/iter` combinators `map`/`filter`/`take`/… which dispatch lazily on a stream receiver), and a terminal operation that drives the graph one item at a time with bounded memory. Errors are threaded **in-band** — the first read error poisons the upstream and short-circuits to the terminal op, so error handling lives only at the terminal, not at every adapter.
 
 A `Stream<T>` is an **affine resource** (ADR-073): it may be consumed at most once (using it again after a terminal op or after `.promise()` moves it to a worker is a compile-time error), but dropping an unused stream is fine — the runtime closes the fd via an RC-drop finalizer. In v1 a stream may live only in a `val`, a function parameter, or a return value; storing one in an object/array field or a `var` is a compile-time error.
 
-Import:
+The combinators (`map`/`filter`/`take`/`drop`/`reduce`/`for`/…) are **not** part of `std/stream` — they
+come from [`std/iter`](#stditer) and dispatch to the lazy stream backend automatically when the receiver
+is a `Stream` (ADR-075). A stream pipeline imports its **sources and sinks** from `std/stream` and its
+**combinators** from `std/iter`:
 
 ```txt
-import { readStream, lines, map, filter, writeStream, drain } from "std/stream"
+import { readStream, writeStream, drain } from "std/stream"
+import { map, filter, take, for } from "std/iter"
+
+readStream("in.csv").lines().map(transform).filter(notEmpty).writeStream("out.csv").drain()
 ```
 
 Byte sources also come from other modules — `tcpStream` (`std/net`), `stdoutStream` (`std/process`), and `stdinStream` (`std/io`) all return `Stream<UInt8[]>` (spec §27.9.2) and feed the same adapters and terminals documented here.
@@ -3554,7 +3636,25 @@ val lines: (Stream<UInt8[]>) -> Stream<String>
 Lazily views a byte stream as a stream of lines (splitting on newlines, decoding UTF-8 per line). An adapter — it reads nothing until driven.
 
 ```txt
-readStream("access.log").lines().for(line => print(line))
+readStream("access.log").lines().for(line => print(line))   // `for` from std/iter
+```
+
+A single line is capped (default 64 MiB) so a newline-less input fails in-band with an `Error` rather
+than buffering the whole stream; use [`linesMax`](#linesMax) to set an explicit cap.
+
+---
+
+### linesMax
+
+```txt
+val linesMax: (Stream<UInt8[]>, maxBytes: Int32) -> Stream<String>
+```
+
+Like [`lines`](#lines-stream), but with an explicit per-line byte cap. A line longer than `maxBytes`
+fails in-band with an `Error`. A `maxBytes` of `0` or less keeps the default cap.
+
+```txt
+readStream("untrusted.txt").linesMax(1024).for(line => print(line))
 ```
 
 ---
@@ -3569,48 +3669,6 @@ Re-chunks a byte stream into fixed-size `n`-byte windows (the final window may b
 
 ```txt
 readStream("frames.bin").chunks(188).for(frame => process(frame))
-```
-
----
-
-### map (stream) {#map-stream}
-
-```txt
-val map: <T, U>(Stream<T>, f: (T) -> U) -> Stream<U>
-```
-
-Lazily transforms each item with `f`. The callback uses the same dot-application and lambda forms as the array combinators (spec §18.5); it runs once per item as the item is pulled.
-
-```txt
-readStream("in.csv").lines().map(line => line.toUpper())
-```
-
----
-
-### filter (stream) {#filter-stream}
-
-```txt
-val filter: <T>(Stream<T>, p: (T) -> Boolean) -> Stream<T>
-```
-
-Lazily keeps only items for which `p` returns `true`.
-
-```txt
-readStream("app.log").lines().filter(line => line.contains("ERROR"))
-```
-
----
-
-### take (stream) {#take-stream}
-
-```txt
-val take: <T>(Stream<T>, n: Int32) -> Stream<T>
-```
-
-Yields the first `n` items then ends the stream normally. Driving stops pulling upstream once `n` items have passed.
-
-```txt
-readStream("huge.log").lines().take(100).for(line => print(line))
 ```
 
 ---
@@ -3681,25 +3739,6 @@ val p = readStream("big.log").lines().filter(isError).writeStream("errors.log").
 match await(p)
   is Error => print("pipeline failed")
   else     => print("done")
-```
-
----
-
-### for (stream) {#for-stream}
-
-```txt
-val for: <T>(Stream<T>, (T) -> Null) -> Null | Error
-```
-
-Terminal. Consumes the stream item by item via dot application — `s.for(fn)` (Lin has no `for…in`; iteration is always `.for(fn)`, spec §18). Unlike `for` over an array or iterator (which returns `Null`, spec §18.1), a stream `for` returns **`Null | Error`**: **EOF ends the loop normally** (the expression is `Null`) and **a read `Error` mid-traversal becomes the expression's value**.
-
-```txt
-val outcome = readStream("in.log").lines().for(line =>
-  print(line)
-)
-match outcome
-  is Error => print("read failed: ${outcome["message"]}")
-  else     => null
 ```
 
 ---
