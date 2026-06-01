@@ -82,23 +82,17 @@ val s = suite("std/path", [
     expect([].join()).toBe("")
   ]),
 
-  test("join handles single segment", () => [
-    expect(["foo"].join()).toBe("foo")
-  ]),
+  test("join handles single segment", () => [expect(["foo"].join()).toBe("foo")]),
 
   test("split splits path on slash", () =>
     val parts = "a/b/c".split()
-    [
-      expect(parts[1]).toBe("b")
-    ]
+    [expect(parts[1]).toBe("b")]
   ),
 
   test("split returns array with one element for bare name", () =>
     val parts = "file.txt".split()
-    [
-      expect(parts[0]).toBe("file.txt")
-    ]
-  ),
+    [expect(parts[0]).toBe("file.txt")]
+  )
 ])
 
 run(s)

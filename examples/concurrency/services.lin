@@ -1,6 +1,5 @@
 // Higher-level concurrency primitives: ThreadPool, Worker, Shared<T>, Frozen<T>.
 // Each helper is self-contained so the tests can drive it and assert the outcome.
-
 import { async, await, parallel, threadPool, poolAsync, worker, request, close, shared, get, set, withLock, frozen } from "std/async"
 import { push, length } from "std/array"
 import { for, range } from "std/iter"
@@ -77,12 +76,7 @@ export val sharedSnapshot = (): Json =>
 // looked-up values (proving every thread saw the same frozen data).
 export val frozenLookup = (): Int32 =>
   val table = frozen([10, 20, 30, 40])
-  val results = parallel([
-    () => table[0],
-    () => table[1],
-    () => table[2],
-    () => table[3]
-  ])
+  val results = parallel([() => table[0], () => table[1], () => table[2], () => table[3]])
   var sum = 0
   results.for(v => sum = sum + v)
   sum

@@ -1,7 +1,6 @@
 // result.lin — a generic Result<T, E> tagged union and the combinators that make it
 // composable. The discriminant `"type"` uses singleton string-literal types
 // ("success" / "failure"), so a wrongly-tagged object is a compile-time error.
-
 export type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
 
 export val ok = (v: Json): Json =>

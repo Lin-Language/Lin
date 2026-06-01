@@ -4,7 +4,6 @@
 // explicit narrowing casts from std/number (§26), and the float bit-reinterpret
 // intrinsics declared below (a float's bit pattern cannot be obtained by
 // shift-and-mask, so those four are runtime intrinsics).
-
 import { slice as arraySlice } from "std/array"
 import { toUInt8, toUInt16, toUInt32, toUInt64 } from "std/number"
 
@@ -15,17 +14,14 @@ import foreign "lin-runtime"
   val lin_f64_from_bits: (UInt64) => Float64
 
 // --- slice -----------------------------------------------------------------
-
 // Sub-buffer copy. Re-exported from std/array; slicing a UInt8[] yields a
 // UInt8[]. `start`/`end` clamp to [0, length]; `end` is exclusive.
 export val slice = (buf: UInt8[], start: Int32, end: Int32): UInt8[] =>
   arraySlice(buf, start, end)
 
 // --- big-endian reads ------------------------------------------------------
-
 export val u16FromBe = (b: UInt8[], off: Int32): UInt16 =>
   toUInt16((toUInt16(b[off]) << 8) | toUInt16(b[off + 1]))
-
 
 export val u32FromBe = (b: UInt8[], off: Int32): UInt32 =>
   (toUInt32(b[off]) << 24) | (toUInt32(b[off + 1]) << 16) | (toUInt32(b[off + 2]) << 8) | toUInt32(b[off + 3])
@@ -34,7 +30,6 @@ export val u64FromBe = (b: UInt8[], off: Int32): UInt64 =>
   (toUInt64(b[off]) << 56) | (toUInt64(b[off + 1]) << 48) | (toUInt64(b[off + 2]) << 40) | (toUInt64(b[off + 3]) << 32) | (toUInt64(b[off + 4]) << 24) | (toUInt64(b[off + 5]) << 16) | (toUInt64(b[off + 6]) << 8) | toUInt64(b[off + 7])
 
 // --- little-endian reads ---------------------------------------------------
-
 export val u16FromLe = (b: UInt8[], off: Int32): UInt16 =>
   toUInt16((toUInt16(b[off + 1]) << 8) | toUInt16(b[off]))
 
@@ -45,7 +40,6 @@ export val u64FromLe = (b: UInt8[], off: Int32): UInt64 =>
   (toUInt64(b[off + 7]) << 56) | (toUInt64(b[off + 6]) << 48) | (toUInt64(b[off + 5]) << 40) | (toUInt64(b[off + 4]) << 32) | (toUInt64(b[off + 3]) << 24) | (toUInt64(b[off + 2]) << 16) | (toUInt64(b[off + 1]) << 8) | toUInt64(b[off])
 
 // --- big-endian writes -----------------------------------------------------
-
 export val u16ToBe = (v: UInt16): UInt8[] =>
   val b0: UInt8 = toUInt8((v >> 8) & 0xFF)
   val b1: UInt8 = toUInt8(v & 0xFF)
@@ -69,11 +63,19 @@ export val u64ToBe = (v: UInt64): UInt8[] =>
   val b5: UInt8 = toUInt8((v >> 16) & 0xFF)
   val b6: UInt8 = toUInt8((v >> 8) & 0xFF)
   val b7: UInt8 = toUInt8(v & 0xFF)
-  val out: UInt8[] = [b0, b1, b2, b3, b4, b5, b6, b7]
+  val out: UInt8[] = [
+    b0,
+    b1,
+    b2,
+    b3,
+    b4,
+    b5,
+    b6,
+    b7
+  ]
   out
 
 // --- little-endian writes --------------------------------------------------
-
 export val u16ToLe = (v: UInt16): UInt8[] =>
   val b0: UInt8 = toUInt8(v & 0xFF)
   val b1: UInt8 = toUInt8((v >> 8) & 0xFF)
@@ -97,11 +99,19 @@ export val u64ToLe = (v: UInt64): UInt8[] =>
   val b5: UInt8 = toUInt8((v >> 40) & 0xFF)
   val b6: UInt8 = toUInt8((v >> 48) & 0xFF)
   val b7: UInt8 = toUInt8((v >> 56) & 0xFF)
-  val out: UInt8[] = [b0, b1, b2, b3, b4, b5, b6, b7]
+  val out: UInt8[] = [
+    b0,
+    b1,
+    b2,
+    b3,
+    b4,
+    b5,
+    b6,
+    b7
+  ]
   out
 
 // --- float bit reinterpret -------------------------------------------------
-
 export val f32ToBits = (f: Float32): UInt32 =>
   lin_f32_to_bits(f)
 
@@ -115,7 +125,6 @@ export val f64FromBits = (u: UInt64): Float64 =>
   lin_f64_from_bits(u)
 
 // --- float (de)serialization (big-endian) ----------------------------------
-
 export val f32ToBe = (f: Float32): UInt8[] =>
   u32ToBe(f32ToBits(f))
 
@@ -129,7 +138,6 @@ export val f64FromBe = (b: UInt8[], off: Int32): Float64 =>
   f64FromBits(u64FromBe(b, off))
 
 // --- float (de)serialization (little-endian) --------------------------------
-
 export val f32ToLe = (f: Float32): UInt8[] =>
   u32ToLe(f32ToBits(f))
 
