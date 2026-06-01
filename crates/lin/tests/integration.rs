@@ -8113,3 +8113,147 @@ print(x)
     assert!(build_ok, "build should accept the good program");
     assert_eq!(check_ok, build_ok, "check and build must agree (accept)");
 }
+
+// -----------------------------------------------------------------------------
+// std/iter unification — Stage 2: receiver-dependent combinator return TYPING.
+//
+// A `std/iter` combinator (`map`/`filter`/`reduce`/`while`) applied to a Stream receiver yields a
+// stream-shaped result (`Stream<U>` / `U | Error` / `Null | Error`), while the same combinator on an
+// array keeps its eager array-shaped result UNCHANGED. These are `lin check`-level assertions: the
+// stream combinator backends do not codegen until Stage 3, so no run tests here. Stream values come
+// from `stdinStream()` (a bare `Stream`, no `| Error` open arm) to keep the receiver concrete.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_iter_stream_map_yields_stream_not_array() {
+    // `stream.map(f)` must type-check AND its result must be a `Stream`, NOT an array: assert via a
+    // `: Stream` annotation (accept) and a `: Int32[]` annotation (reject — the result is a Stream).
+    let ok_src = r#"import { stdinStream } from "std/io"
+import { map } from "std/iter"
+val s: Stream = stdinStream()
+val mapped: Stream = s.map(x => x)
+"#;
+    let (ok, out) = check_source(ok_src);
+    assert!(ok, "stream.map(f) should type-check as a Stream:\n{}", out);
+
+    let bad_src = r#"import { stdinStream } from "std/io"
+import { map } from "std/iter"
+val s: Stream = stdinStream()
+val mapped: Int32[] = s.map(x => x)
+"#;
+    let (ok, out) = check_source(bad_src);
+    assert!(
+        !ok,
+        "stream.map(f) is a Stream, must NOT satisfy an Int32[] annotation:\n{}",
+        out
+    );
+    assert!(
+        out.contains("Stream"),
+        "rejection should mention the Stream result type:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_iter_stream_reduce_and_while_widen_to_error() {
+    // reduce over a stream → `U | Error`; while over a stream → `Null | Error`. Assert the `| Error`
+    // arm is present (accept the union annotation) and absent forms are rejected.
+    let ok_src = r#"import { stdinStream } from "std/io"
+import { reduce, while } from "std/iter"
+val s: Stream = stdinStream()
+val r: Int32 | Error = s.reduce(0, (acc, x) => acc)
+val w: Null | Error = s.while(x => true)
+"#;
+    let (ok, out) = check_source(ok_src);
+    assert!(ok, "stream reduce/while should widen to `| Error`:\n{}", out);
+
+    // reduce over a stream is `Int32 | Error`, so a bare `Int32` annotation must be rejected.
+    let bad_src = r#"import { stdinStream } from "std/io"
+import { reduce } from "std/iter"
+val s: Stream = stdinStream()
+val r: Int32 = s.reduce(0, (acc, x) => acc)
+"#;
+    let (ok, out) = check_source(bad_src);
+    assert!(
+        !ok,
+        "stream reduce is `Int32 | Error`, must NOT satisfy a bare `Int32`:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_iter_array_map_still_yields_array_unchanged() {
+    // The HARD GATE: an array receiver keeps the eager `U[]` result. Assert by chaining an
+    // array-only op (`.length()` from std/array) on the map result, and by an explicit `Int32[]`
+    // annotation. A `: Stream` annotation on the array result must be REJECTED.
+    let ok_src = r#"import { print } from "std/io"
+import { range, map } from "std/iter"
+import { length } from "std/array"
+val xs: Int32[] = range(0, 5).map(x => x * 2)
+print(xs.length())
+"#;
+    let (ok, out) = check_source(ok_src);
+    assert!(ok, "array map must still yield an array (chain .length()):\n{}", out);
+
+    let bad_src = r#"import { range, map } from "std/iter"
+val xs: Stream = range(0, 5).map(x => x * 2)
+"#;
+    let (ok, out) = check_source(bad_src);
+    assert!(
+        !ok,
+        "array map yields an array, must NOT satisfy a `: Stream` annotation:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_iter_generic_iterable_mixed_call_sites() {
+    // Verification #3: a USER-DEFINED generic over the Iterable union, called with both an array and
+    // a stream. Its OWN return type is monomorphized ONCE to the eager array shape (a mixed
+    // `Array | Iterator | Stream` param is not DEFINITELY a stream, so the receiver-dependent
+    // re-typing is deliberately suppressed inside the generic body — this is what prevents the
+    // stream return from LEAKING into the generic's array call sites). The array call site therefore
+    // type-checks as an array; the stream call site ALSO returns the array shape (documented Stage-2
+    // limitation — per-call-site stream return needs a direct combinator call, not a user generic).
+    let array_site = r#"import { map } from "std/iter"
+val passthru = <T>(xs: T[] | Iterator | Stream, f: (T) => T) =>
+  xs.map(f)
+val a: Int32[] = passthru([1, 2, 3], x => x)
+"#;
+    let (ok, out) = check_source(array_site);
+    assert!(
+        ok,
+        "array call site of a generic Iterable function must yield an array (no stream leak):\n{}",
+        out
+    );
+
+    // The generic does NOT give a stream call site a Stream return (it is fixed to the array shape):
+    // a `: Stream` annotation on the stream call site is rejected. This documents the boundary.
+    let stream_site = r#"import { stdinStream } from "std/io"
+import { map } from "std/iter"
+val passthru = <T>(xs: T[] | Iterator | Stream, f: (T) => T) =>
+  xs.map(f)
+val s: Stream = stdinStream()
+val b: Stream = passthru(s, x => x)
+"#;
+    let (ok, out) = check_source(stream_site);
+    assert!(
+        !ok,
+        "a user generic's return is monomorphized to the array shape; the stream call site does NOT \
+         produce a Stream (Stage-2 boundary):\n{}",
+        out
+    );
+
+    // A direct (non-generic) combinator call on the same concrete stream DOES yield a Stream.
+    let direct = r#"import { stdinStream } from "std/io"
+import { map } from "std/iter"
+val s: Stream = stdinStream()
+val b: Stream = s.map(x => x)
+"#;
+    let (ok, out) = check_source(direct);
+    assert!(
+        ok,
+        "a direct combinator call on a concrete stream must yield a Stream:\n{}",
+        out
+    );
+}

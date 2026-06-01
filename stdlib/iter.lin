@@ -22,7 +22,15 @@ val push = (arr: Json, item: Json): Null =>
 export val for = (iterable: Json, f: Function): Null =>
   lin_for(iterable, f)
 
-export val while = (arr: Json, f: Function): Null =>
+// `while` over an Array/Iterator runs to predicate-false / exhaustion → `Null`. Over a `Stream`
+// it is driven by the runtime (Stage 3) and a read fault surfaces in-band → `Null | Error`. The
+// iterable param is the `Array | Iterator | Stream` union (so a Stream is accepted; the opaque
+// Stream type does NOT flow into a bare `Json` param) and the return annotation is DROPPED so the
+// call-site result is `Null` for arrays and re-typed to `Null | Error` for a stream receiver by the
+// checker's `streamish_combinator_ret`. `Iterator`/`Stream` are written WITHOUT a type argument
+// (= `Iterator<Json>`/`Stream<Json>`): the array `T[]` arm carries the element-type inference for
+// the callback, and the source formatter cannot round-trip a parametric `Iterator<T>` annotation.
+export val while = <T>(arr: T[] | Iterator | Stream, f: (T) => Boolean) =>
   lin_while(arr, f)
 
 export val range = (start: Int32, end: Int32) =>
@@ -77,13 +85,22 @@ export val concat = (a: Json, b: Json): Json =>
 // call, and carrying a scalar reduce accumulator unboxed through the loop phi (ADR-069).
 // Heterogeneous/union/object call sites monomorphize at the `$Json` tagged representation, keeping
 // the boxed path correct.
-export val map = <T, U>(arr: T[], f: (T) => U): U[] =>
+// The iterable param is the `Array | Iterator | Stream` union (a `Stream` is accepted; the opaque
+// Stream type does NOT flow into a bare `Json` param). `Iterator`/`Stream` are written WITHOUT a
+// type argument (= `Iterator<Json>`/`Stream<Json>`): the array `T[]` arm carries the element-type
+// inference that drives the callback's concrete element type (and the flat-path optimization), and
+// the source formatter cannot round-trip a parametric `Iterator<T>`/`Stream<T>` annotation. The
+// RETURN annotations are DROPPED so each wrapper INFERS its array-shaped return from the intrinsic
+// body (`U[]`/`T[]`/`U`); the checker's `streamish_combinator_ret` then re-types the call-site
+// result to the stream-shaped form (`Stream<U>`/`Stream<T>`/`U | Error`) when arg0 is DEFINITELY a
+// Stream. Arrays/iterators are UNCHANGED.
+export val map = <T, U>(arr: T[] | Iterator | Stream, f: (T) => U) =>
   lin_map(arr, f)
 
-export val filter = <T>(arr: T[], f: (T) => Boolean): T[] =>
+export val filter = <T>(arr: T[] | Iterator | Stream, f: (T) => Boolean) =>
   lin_filter(arr, f)
 
-export val reduce = <T, U>(arr: T[], init: U, f: (U, T) => U): U =>
+export val reduce = <T, U>(arr: T[] | Iterator | Stream, init: U, f: (U, T) => U) =>
   lin_reduce(arr, init, f)
 
 export val find = (arr: Json, f: Function): Json =>

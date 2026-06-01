@@ -80,13 +80,17 @@ impl Checker {
                 ], Type::Null),
         );
 
-        // while: (Array<T> | Iterator<T>, (T) => Boolean) => Null
+        // while: (Array<T> | Iterator<T> | Stream<T>, (T) => Boolean) => Null
+        // Streamish receiver accepted (std/iter unification Stage 2): the array/iterator return
+        // stays `Null`; the std/iter `while` wrapper's call-site result is widened to `Null | Error`
+        // by `streamish_combinator_ret` when arg0 is a stream (the read Error becomes the result).
         self.define_intrinsic(
             "lin_while",
             Type::func(vec![
                     Type::Union(vec![
                         Type::Array(Box::new(Type::TypeVar(9011))),
                         Type::Iterator(Box::new(Type::TypeVar(9011))),
+                        Type::Stream(Box::new(Type::TypeVar(9011))),
                     ]),
                     Type::func(vec![Type::TypeVar(9011)], Type::Bool),
                 ], Type::Null),
@@ -109,40 +113,44 @@ impl Checker {
             Type::func(vec![Type::Int32, Type::Int32], Type::Iterator(Box::new(Type::Int32))),
         );
 
-        // map: (Iterable<T>, (T) => U) => U[]
-        // The lowering MATERIALIZES a concrete array (flat for scalar U, tagged otherwise), so the
-        // return type is `U[]` — the stdlib `map` thin wrapper declares the same, and callers chain
-        // `.filter`/`.reduce`/index on it as an array.
+        // map: (Iterable<T>, (T) => U) => U[]   (Iterable = Array | Iterator | Stream)
+        // For Array/Iterator the lowering MATERIALIZES a concrete array (flat for scalar U, tagged
+        // otherwise), so the declared return is `U[]`. A `Stream<T>` receiver is also accepted (std/
+        // iter unification Stage 2): the call-site result is then re-typed to `Stream<U>` by
+        // `streamish_combinator_ret` (lazy adapter — codegen lands in Stage 3).
         self.define_intrinsic(
             "lin_map",
             Type::func(vec![
                     Type::Union(vec![
                         Type::Array(Box::new(Type::TypeVar(9030))),
                         Type::Iterator(Box::new(Type::TypeVar(9030))),
+                        Type::Stream(Box::new(Type::TypeVar(9030))),
                     ]),
                     Type::func(vec![Type::TypeVar(9030)], Type::TypeVar(9031)),
                 ], Type::Array(Box::new(Type::TypeVar(9031)))),
         );
 
-        // filter: (Iterable<T>, (T) => Boolean) => T[]
+        // filter: (Iterable<T>, (T) => Boolean) => T[]   (Stream receiver → Stream<T> at call site)
         self.define_intrinsic(
             "lin_filter",
             Type::func(vec![
                     Type::Union(vec![
                         Type::Array(Box::new(Type::TypeVar(9040))),
                         Type::Iterator(Box::new(Type::TypeVar(9040))),
+                        Type::Stream(Box::new(Type::TypeVar(9040))),
                     ]),
                     Type::func(vec![Type::TypeVar(9040)], Type::Bool),
                 ], Type::Array(Box::new(Type::TypeVar(9040)))),
         );
 
-        // reduce: (Iterable<T>, U, (U, T) => U) => U
+        // reduce: (Iterable<T>, U, (U, T) => U) => U   (Stream receiver → U | Error at call site)
         self.define_intrinsic(
             "lin_reduce",
             Type::func(vec![
                     Type::Union(vec![
                         Type::Array(Box::new(Type::TypeVar(9050))),
                         Type::Iterator(Box::new(Type::TypeVar(9050))),
+                        Type::Stream(Box::new(Type::TypeVar(9050))),
                     ]),
                     Type::TypeVar(9051),
                     Type::func(vec![Type::TypeVar(9051), Type::TypeVar(9050)], Type::TypeVar(9051)),
