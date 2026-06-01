@@ -2795,6 +2795,30 @@ print(toString(keys(merged)))
 }
 
 #[test]
+fn test_object_grow_past_inline_capacity() {
+    // Single-allocation objects (header + entries in one block, FLAG_INLINE) must correctly
+    // MIGRATE their entries to a separately-heap-allocated buffer when grown past the initial
+    // capacity via dynamic `lin_object_set` — preserving every prior key/value through the
+    // migration. A literal `{...}` is alloc'd at exactly its field count, and `{}` at cap 1, so
+    // adding 30 fields forces several inline→heap migrations (cap 1→2→4→…→32). The full
+    // set-then-sum round-trip confirms every migrated entry is intact and the value RC balances.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { keys } from "std/object"
+import { length } from "std/array"
+import { for, range } from "std/iter"
+
+var o = {}
+range(0, 30).for(i => lin_object_set(o, "k${toString(i)}", i * 10))
+var sum = 0i64
+range(0, 30).for(i => sum = sum + o["k${toString(i)}"])
+print(toString(length(keys(o))))
+print(toString(sum))
+"#);
+    assert_eq!(output, vec!["30", "4350"]);
+}
+
+#[test]
 fn test_object_spread_null_noop() {
     // Spreading null contributes no fields (it is not a runtime error).
     let output = run(r#"import { print } from "std/io"
