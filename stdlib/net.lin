@@ -14,7 +14,6 @@ import foreign "lin-runtime"
   val lin_tcp_close: (Int32) => Json
 
 // --- UDP ---
-
 export val udpBind = (port: Int32): Json =>
   lin_udp_bind(port)
 
@@ -34,7 +33,6 @@ export val udpClose = (fd: Int32): Json =>
   lin_udp_close(fd)
 
 // --- TCP ---
-
 export val tcpListen = (port: Int32): Json =>
   lin_tcp_listen(port)
 

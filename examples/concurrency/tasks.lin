@@ -1,7 +1,6 @@
 // Core async primitives: async/await, parallel, race, timeout, retry, fault
 // isolation, and nested-promise flattening. Each is a small reusable function so the
 // accompanying tests can assert on its result.
-
 import { async, await, parallel, race, timeout, retry } from "std/async"
 import { sleep } from "std/time"
 
@@ -12,11 +11,7 @@ export val squareAsync = (n: Int32): Json =>
 // parallel — run three independent computations concurrently; results stay in
 // submission order. Returns [a*1, b*2, c*3].
 export val weightedTriple = (a: Int32, b: Int32, c: Int32): Json[] =>
-  parallel([
-    () => a * 1,
-    () => b * 2,
-    () => c * 3
-  ])
+  parallel([() => a * 1, () => b * 2, () => c * 3])
 
 // race — the first promise to complete wins; the loser keeps running but is ignored.
 // `slowMs`/`fastMs` are the two thunks' sleeps; the faster value comes back.
