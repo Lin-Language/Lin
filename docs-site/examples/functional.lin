@@ -1,6 +1,6 @@
 import { print } from "std/io"
-import { map, filter, reduce, sortBy, for } from "std/array"
-
+import { sortBy } from "std/array"
+import { map, filter, reduce, for } from "std/iter"
 type Order = { "id": Int32, "total": Float64, "paid": Boolean }
 
 val orders: Order[] = [
