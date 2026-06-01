@@ -3894,7 +3894,40 @@ Import:
 import { render, renderWith } from "std/template"
 ```
 
-Template syntax uses `${key}` holes where `key` is a field name or dot-separated path into the data record.
+Templating is **Jinja-style**, backed by the [minijinja](https://crates.io/crates/minijinja) engine. Templates support:
+
+- **Substitutions** — `{{ name }}`, `{{ user.email }}` (dot paths into the data record).
+- **Loops** — `{% for item in items %}...{% endfor %}`.
+- **Conditionals** — `{% if cond %}...{% else %}...{% endif %}`.
+- **Filters** — the standard minijinja builtin filter set, e.g. `{{ name | upper }}`.
+- **Layouts / inheritance** — `{% extends "base.lint" %}` + `{% block %}`, and partials via `{% include "footer.lint" %}`. **Only available through [`render`](#render)** (file-based): the referenced templates are loaded by name from the same directory as the entry file. [`renderWith`](#renderWith) takes an in-memory string with no directory to load from, so it cannot resolve `extends`/`include`.
+
+**Undefined / missing variables render as the empty string** (not an error). A **template syntax error or render failure** is returned as an `Error` (`{ "type": "error", "message": ... }`), discriminated with `is Error` like other fallible stdlib operations.
+
+#### Layouts
+
+A base layout declares the page skeleton with fillable blocks:
+
+```txt
+<!-- templates/base.lint -->
+<!DOCTYPE html>
+<html>
+<head><title>{{ title }}</title></head>
+<body{% block body_attrs %}{% endblock %}>
+  {% block main %}{% endblock %}
+</body>
+</html>
+```
+
+A page extends it and fills the blocks; an unfilled block keeps the base's default content:
+
+```txt
+<!-- templates/page.lint -->
+{% extends "base.lint" %}
+{% block main %}<article>{{ content }}</article>{% endblock %}
+```
+
+`render("templates/page.lint", data)` resolves `base.lint` from `templates/` and produces the merged document. `{% include "footer.lint" %}` pulls another file in from the same directory. See `docs-site/templates/` and `examples/web-server/views/` for worked examples.
 
 ---
 
@@ -3904,7 +3937,7 @@ Template syntax uses `${key}` holes where `key` is a field name or dot-separated
 val render: (path: String, data: {}) -> String | Error
 ```
 
-Reads the file at `path` and renders it as a template against `data`. Intended for `.lint` template files. Returns an `Error` (`{ "type": "error", "message": ... }`) if the file cannot be read.
+Reads the file at `path` and renders it as a template against `data`, **with layout support**: the template may `{% extends %}` a base and fill `{% block %}`s, or `{% include %}` partials — referenced files are loaded by name from `path`'s directory. Intended for `.lint` template files. Returns an `Error` (`{ "type": "error", "message": ... }`) if the file cannot be read or the template fails to render.
 
 ```txt
 val s = render("greet.lint", { "name": "Alice", "score": 42 })
@@ -3918,14 +3951,17 @@ match s
 ### renderWith
 
 ```txt
-val renderWith: (template: String, data: {}) -> String
+val renderWith: (template: String, data: {}) -> String | Error
 ```
 
-Renders a template string directly against `data`. Missing keys render as `"null"`.
+Renders a template string directly against `data`. Missing keys render as the empty string; a syntax/render error is returned as an `Error`. Because the template is an in-memory string with no source directory, `{% extends %}` / `{% include %}` cannot be resolved — use [`render`](#render) for layouts.
 
 ```txt
-renderWith("Hello, ${name}!", { "name": "Alice" })
+renderWith("Hello, {{ name }}!", { "name": "Alice" })
 // "Hello, Alice!"
+
+renderWith("{% for n in nums %}{{ n }} {% endfor %}", { "nums": [1, 2, 3] })
+// "1 2 3 "
 ```
 
 ---
