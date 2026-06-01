@@ -40,7 +40,9 @@ nodes.for(_ =>
   set(adj, ai, [])
   ai = ai + 1
 )
-edges.for(e => push(adj[idOf(e["from"])], { "to": idOf(e["to"]), "w": e["weight"] }))
+edges.for(e =>
+  push(adj[idOf(e["from"])], { "to": idOf(e["to"]), "w": e["weight"] })
+)
 
 var dist = arrayAllocateFilled(n, INF)
 var visited = arrayAllocateFilled(n, false)
@@ -60,12 +62,9 @@ var pqLen = 1
 // Tail-recursive min-scan over pq[j .. pqLen) — TCO turns it into a loop with no
 // per-pop allocation (range().for would allocate a fresh range array each pop).
 val minFrom = (j: Int32, best: Int32): Int32 =>
-  if j >= pqLen then
-    best
-  else if pqDist[j] < pqDist[best] then
-    minFrom(j + 1, j)
-  else
-    minFrom(j + 1, best)
+  if j >= pqLen then best
+  else if pqDist[j] < pqDist[best] then minFrom(j + 1, j)
+  else minFrom(j + 1, best)
 
 val step = (): Null =>
   if pqLen > 0 then
@@ -84,9 +83,9 @@ val step = (): Null =>
         val nd = du + edge["w"]
         if nd < dist[v] then
           set(dist, v, nd)
-        set(pqNode, pqLen, v)
-        set(pqDist, pqLen, nd)
-        pqLen = pqLen + 1
+          set(pqNode, pqLen, v)
+          set(pqDist, pqLen, nd)
+          pqLen = pqLen + 1
       )
     step()
 step()

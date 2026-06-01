@@ -101,7 +101,7 @@ val s = suite("std/number", [
   test("a small u8-suffixed literal types as UInt8", () => [
     // toString works regardless of width; the point is it compiles and keeps its value.
     expect(toString(200u8)).toBe("200")
-  ])
+  ]),
 ])
 
 run(s)

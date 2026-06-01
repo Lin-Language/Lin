@@ -8,6 +8,7 @@
 // `push` — are duplicated here as PRIVATE helpers (byte-identical thin wrappers over the same
 // lin_length/lin_push intrinsics std/array wraps), so the moved bodies stay verbatim and std/iter
 // stays self-contained.
+
 import foreign "lin-runtime"
   val lin_array_concat_dyn: (Json, Json) => Json
 
@@ -39,15 +40,32 @@ export val range = (start: Int32, end: Int32) =>
   lin_range(start, end)
 
 export val rangeStep = (start: Int32, end: Int32, step: Int32): Json =>
-  if step > 0 then
-    lin_iter(() => start, i => i < end, i => i + step, i => i)
-  else if step < 0 then
-    lin_iter(() => start, i => i > end, i => i + step, i => i)
-  else
-    lin_iter(() => start, i => false, i => i, i => i)
+  if step > 0 then lin_iter(
+    () => start,
+    i => i < end,
+    i => i + step,
+    i => i
+  )
+  else if step < 0 then lin_iter(
+    () => start,
+    i => i > end,
+    i => i + step,
+    i => i
+  )
+  else lin_iter(
+    () => start,
+    i => false,
+    i => i,
+    i => i
+  )
 
 export val iterOf = (arr: Json) =>
-  lin_iter(() => 0, i => i < length(arr), i => i + 1, i => arr[i])
+  lin_iter(
+    () => 0,
+    i => i < length(arr),
+    i => i + 1,
+    i => arr[i]
+  )
 
 export val iter = (init: Json, hasNext: Json, next: Json, value: Json) =>
   lin_iter(init, hasNext, next, value)
@@ -124,7 +142,7 @@ export val take = (arr: Json, n: Int32): Json =>
   arr.for(item =>
     if i < end then
       result[i] = item
-    i = i + 1
+      i = i + 1
   )
   result
 
@@ -153,7 +171,7 @@ export val dropWhile = (arr: Json, f: Function): Json =>
   arr.for(item =>
     val keep = !dropping || !f(item)
     dropping = if keep then false else dropping
-    if keep then push(result, item) else null
+    if keep then push(result, item)
   )
   result
 

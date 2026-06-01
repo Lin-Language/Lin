@@ -98,7 +98,7 @@ val s = suite("std/path", [
     [
       expect(parts[0]).toBe("file.txt")
     ]
-  )
+  ),
 ])
 
 run(s)

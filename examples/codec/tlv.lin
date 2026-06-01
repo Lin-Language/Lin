@@ -10,6 +10,7 @@
 // Exercises flat scalar arrays (UInt8[]), in-place push with runtime element
 // coercion, big-endian byte packing via std/bytes, and recursion over a buffer
 // with an index cursor.
+
 import { push, length, slice } from "std/array"
 import { u16ToBe, u16FromBe } from "std/bytes"
 import { toUInt16, toInt32, toUInt64, toFloat64 } from "std/number"
@@ -50,8 +51,7 @@ export val encode = (fields: Field[]): UInt8[] =>
 
 // Decode from byte offset `pos`, accumulating { tag, bytes } records into `out`.
 val decodeFrom = (buf: UInt8[], pos: Int32, out: Field[]): Field[] =>
-  if pos >= length(buf) then
-    out
+  if pos >= length(buf) then out
   else
     val tag = buf[pos]
     val len = u16FromBe(buf, pos + 1).toFloat64().toInt32()
