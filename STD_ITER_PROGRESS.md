@@ -191,5 +191,56 @@ drop/takeWhile/dropWhile/flatMap/flatten/concat (adapters) + reduce/find/some/ev
      37 type_check + … all green; test_http_fetch_json passes in isolation; `lin test stdlib/` = 22;
      `lin test examples/` = 42; 6 NEW end-to-end integration tests (drop/take/reduce, flatMap,
      takeWhile/dropWhile, concat, find/some/every, array non-regression) all pass.
-5. Re-key affine consume-set off dispatch; delete name allowlist; 5 attacks as tests — PENDING
+5. Re-key affine consume-set off dispatch; delete name allowlist; 5 attacks as tests — DONE
+   - THE BUG (confirmed reproduced before): the affine use-after-move check keyed consumption on a
+     hardcoded NAME allowlist `is_stream_consuming_op` (call.rs) =
+     lines|map|filter|take|chunks|writeStream|drain|collect|readText|for. Several ownership-taking
+     ops were ABSENT, so the checker permitted a use-after-move that the IR's `move_streamish_arg`
+     (lin-ir/src/lower.rs — moves ANY streamish arg) actually performed. Confirmed holes (all 3
+     type-checked OK before, MUST reject): `linesMax`-then-reuse, `promise`-then-reuse (WORST:
+     promise moves the pipeline onto a WORKER thread → cross-thread UAF), `close`-then-reuse.
+   - THE FIX (re-keyed off the DISPATCH FACT, not a name list): deleted `is_stream_consuming_op`.
+     Consumption now derives from the SAME machinery as the result re-typing and the IR redirect:
+       * `Checker::callee_routes_to_stream_op(local_name)` resolves the callee's IMPORT ORIGIN via
+         `self.import_origins` (so a user-defined same-named fn is NEVER affected) and returns true
+         for a genuine `std/iter` stream combinator (`is_std_iter_stream_combinator` — the SAME set
+         as lin-ir's `stream_combinator_intrinsic_name` and call.rs's `streamish_combinator_ret`:
+         map/filter/take/drop/flatMap/takeWhile/dropWhile/flatten/concat/reduce/find/some/every/
+         while/for) OR a genuine `std/stream` op (`is_std_stream_consuming_export`: lines/linesMax/
+         chunks/writeStream/drain/collect/readText/close/promise).
+       * `Checker::consume_definite_stream_args` then marks CONSUMED every argument whose inferred
+         type `is_definitely_stream` — the affine MIRROR of `move_streamish_arg`. Applied
+         per-argument at all three call sites (free `infer_call`, dot-call typed-method path,
+         dot-call fallback path) AFTER args are inferred.
+   - CURATED SET KEPT (not pure dispatch-derived) + WHY: the two `matches!` sets (std/iter combinators,
+     std/stream exports) are tiny and live in ONE place in call.rs, each with a comment that they MUST
+     stay in sync with `move_streamish_arg`. They exist only to GATE on "the callee is a stream op",
+     avoiding consuming a stream handed to a hypothetical non-stream callee. In practice Stream is
+     opaque (rejected everywhere else), so the gate is belt-and-braces; the actual move decision is
+     the dispatch-derived per-argument `is_definitely_stream` test, which cannot diverge from the IR.
+   - CONCAT (two stream args): handled by PER-ARGUMENT consumption — both `a` and `b` in
+     `a.concat(b)` are definitely-stream, so BOTH are marked consumed (not arity-special-cased).
+     Test reuses each arg independently; both rejected.
+   - BORROW DECISION: there is NO `read` export (verified — std/stream exports only readStream/lines/
+     linesMax/chunks/writeStream/drain/collect/readText/close/promise). `close` CONSUMES (it ends the
+     stream — the box is released; reuse is a UAF). `promise` CONSUMES (moves onto a worker thread).
+     So there are NO borrow ops among the exports — every std/stream/std/iter op taking a Stream
+     consumes it. Simplest sound rule, exactly mirroring `move_streamish_arg`.
+   - REGRESSION TESTS (crates/lin/tests/integration.rs, `lin check`-level), all 5 attacks now REJECT:
+     `test_stream_affine_lines_then_reuse_rejected` (control — was already caught),
+     `test_stream_affine_linesmax_then_reuse_rejected` (HOLE #1),
+     `test_stream_affine_promise_then_reuse_rejected` (HOLE #2, cross-thread),
+     `test_stream_affine_close_then_reuse_rejected` (HOLE #3),
+     `test_stream_affine_concat_then_reuse_of_either_arg_rejected` (BOTH args). PLUS positive
+     `test_stream_affine_single_use_chain_and_arrays_unaffected` (single-use chain passes; array/
+     iterator combinator chains — incl. reusing an array across map/filter/reduce/concat — totally
+     unaffected). Updated `test_iter_stream_reduce_and_while_widen_to_error` to use two separate
+     streams (reduce+while on ONE stream is now correctly a use-after-move — the test was written
+     under the old unsound allowlist where reduce/while weren't consuming).
+   - GATE (verified by me, clean build): `cargo test --workspace` = 408 integration + 60 lin-runtime
+     + 37 type_check + … ALL green (test_http_fetch_json passed in this run); `lin test stdlib/` = 22;
+     `lin test examples/` = 42; all example `lin check` clean; examples/streams builds+runs (pipeline
+     ok). ASan: `cargo +nightly test -p lin-runtime stream` = 20/20 CLEAN, no AddressSanitizer errors.
+     Arrays/iterators COMPLETELY unaffected (only STREAM args are marked consumed).
+6. Flat-producer recognition + docs (ADR-075) + final sweep — PENDING
 6. Flat-producer recognition + docs (ADR-075) + final sweep — PENDING

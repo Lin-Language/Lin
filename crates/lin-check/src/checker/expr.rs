@@ -353,9 +353,11 @@ impl Checker {
                 span,
                 format!(
                     "Stream `{}` is used after it was consumed — a Stream is an affine resource \
-                     (use-at-most-once); it is moved into the first ownership-taking adapter/\
-                     terminal it flows into (`lines`/`map`/`filter`/`take`/`chunks`/`writeStream`/\
-                     `drain`/`collect`/`readText`/`for`). Re-open the source for a second pass.",
+                     (use-at-most-once); it is moved into the first stream operation it flows into \
+                     (any std/iter combinator dispatched to a stream backend — map/filter/take/\
+                     drop/flatMap/takeWhile/dropWhile/flatten/concat/reduce/find/some/every/while/\
+                     for — or any std/stream op: lines/linesMax/chunks/writeStream/drain/collect/\
+                     readText/close/promise). Re-open the source for a second pass.",
                     name
                 ),
             ).with_note(def_span.unwrap_or(span), "first bound here"));

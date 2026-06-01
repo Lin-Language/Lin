@@ -8334,11 +8334,14 @@ val mapped: Int32[] = s.map(x => x)
 fn test_iter_stream_reduce_and_while_widen_to_error() {
     // reduce over a stream → `U | Error`; while over a stream → `Null | Error`. Assert the `| Error`
     // arm is present (accept the union annotation) and absent forms are rejected.
+    // Each terminal consumes its stream (affine resource), so use TWO separate streams — a
+    // single stream cannot feed both `reduce` and `while`.
     let ok_src = r#"import { stdinStream } from "std/io"
 import { reduce, while } from "std/iter"
-val s: Stream = stdinStream()
-val r: Int32 | Error = s.reduce(0, (acc, x) => acc)
-val w: Null | Error = s.while(x => true)
+val s1: Stream = stdinStream()
+val r: Int32 | Error = s1.reduce(0, (acc, x) => acc)
+val s2: Stream = stdinStream()
+val w: Null | Error = s2.while(x => true)
 "#;
     let (ok, out) = check_source(ok_src);
     assert!(ok, "stream reduce/while should widen to `| Error`:\n{}", out);
@@ -8432,4 +8435,160 @@ val b: Stream = s.map(x => x)
         "a direct combinator call on a concrete stream must yield a Stream:\n{}",
         out
     );
+}
+
+// -----------------------------------------------------------------------------
+// std/iter unification — Stage 5: affine consume-check re-keyed off the DISPATCH FACT.
+//
+// The use-after-move check no longer keys on a hardcoded name allowlist; it consumes any
+// DEFINITELY-stream argument passed to a call that ROUTES to a stream op (a std/iter combinator
+// dispatched to a stream backend, or a std/stream stream-specific op). This mirrors the IR's
+// `move_streamish_arg` (lin-ir/src/lower.rs) exactly, so the checker and IR cannot diverge. These
+// adversarial programs reuse a stream AFTER it was moved and MUST be rejected; the positives reuse
+// fresh pipeline values / arrays and MUST pass. `stdinStream()` gives a bare concrete `Stream`.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_stream_affine_lines_then_reuse_rejected() {
+    // Control (was already caught): `lines` moves the stream; a later `collect` of the same
+    // binding is a use-after-move.
+    let src = r#"import { stdinStream } from "std/io"
+import { lines, collect } from "std/stream"
+val s: Stream = stdinStream()
+val a: Stream = s.lines()
+val b: Json = s.collect()
+"#;
+    let (ok, out) = check_source(src);
+    assert!(!ok, "lines-then-reuse must be rejected:\n{}", out);
+    assert!(
+        out.contains("used after it was consumed"),
+        "rejection should be the affine use-after-move error:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_stream_affine_linesmax_then_reuse_rejected() {
+    // HOLE #1 (was wrongly accepted): `linesMax` was absent from the old allowlist, so the checker
+    // permitted a later `collect` while the IR moved the stream into `linesMax`.
+    let src = r#"import { stdinStream } from "std/io"
+import { linesMax, collect } from "std/stream"
+val s: Stream = stdinStream()
+val a: Stream = s.linesMax(1024)
+val b: Json = s.collect()
+"#;
+    let (ok, out) = check_source(src);
+    assert!(!ok, "linesMax-then-reuse must be rejected:\n{}", out);
+    assert!(
+        out.contains("used after it was consumed"),
+        "rejection should be the affine use-after-move error:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_stream_affine_promise_then_reuse_rejected() {
+    // HOLE #2 (the worst — cross-thread UAF): `promise` MOVES the whole pipeline onto a worker
+    // thread (the worker is its sole owner); a later `collect` on the parent is a cross-thread
+    // use-after-move. `promise` was absent from the old allowlist.
+    let src = r#"import { stdinStream } from "std/io"
+import { lines, writeStream, promise, collect } from "std/stream"
+val s0: Stream = stdinStream()
+val s: Stream = s0.lines().writeStream("out.txt")
+val pr: Json = s.promise()
+val c: Json = s.collect()
+"#;
+    let (ok, out) = check_source(src);
+    assert!(!ok, "promise-then-reuse must be rejected:\n{}", out);
+    assert!(
+        out.contains("used after it was consumed"),
+        "rejection should be the affine use-after-move error:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_stream_affine_close_then_reuse_rejected() {
+    // HOLE #3: `close` ENDS the stream's life (releases the box); a later use is meaningless and
+    // a use-after-free. `close` was absent from the old allowlist (there are NO borrow ops).
+    let src = r#"import { stdinStream } from "std/io"
+import { close, collect } from "std/stream"
+val s: Stream = stdinStream()
+val unit: Null = s.close()
+val c: Json = s.collect()
+"#;
+    let (ok, out) = check_source(src);
+    assert!(!ok, "close-then-reuse must be rejected:\n{}", out);
+    assert!(
+        out.contains("used after it was consumed"),
+        "rejection should be the affine use-after-move error:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_stream_affine_concat_then_reuse_of_either_arg_rejected() {
+    // `concat` takes TWO streams; BOTH are moved into the ConcatSource. Reusing EITHER arg
+    // afterwards is a use-after-move — the per-argument consume rule must mark both, not just arg0.
+    let reuse_second = r#"import { stdinStream } from "std/io"
+import { concat } from "std/iter"
+import { collect } from "std/stream"
+val a: Stream = stdinStream()
+val b: Stream = stdinStream()
+val c: Stream = a.concat(b)
+val reuse: Json = b.collect()
+"#;
+    let (ok, out) = check_source(reuse_second);
+    assert!(!ok, "concat then reuse of the SECOND arg must be rejected:\n{}", out);
+    assert!(
+        out.contains("used after it was consumed"),
+        "rejection should be the affine use-after-move error:\n{}",
+        out
+    );
+
+    let reuse_first = r#"import { stdinStream } from "std/io"
+import { concat } from "std/iter"
+import { collect } from "std/stream"
+val a: Stream = stdinStream()
+val b: Stream = stdinStream()
+val c: Stream = a.concat(b)
+val reuse: Json = a.collect()
+"#;
+    let (ok, out) = check_source(reuse_first);
+    assert!(!ok, "concat then reuse of the FIRST arg must be rejected:\n{}", out);
+    assert!(
+        out.contains("used after it was consumed"),
+        "rejection should be the affine use-after-move error:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_stream_affine_single_use_chain_and_arrays_unaffected() {
+    // POSITIVE: a single-use pipeline chain passes (each stage consumes the PREVIOUS stage's fresh
+    // value, which is not a reuse of an already-moved binding).
+    let chain = r#"import { stdinStream } from "std/io"
+import { lines, drain } from "std/stream"
+import { map } from "std/iter"
+val s: Stream = stdinStream()
+val r: Null | Error = s.lines().map(x => x).drain()
+"#;
+    let (ok, out) = check_source(chain);
+    assert!(ok, "single-use stream chain must pass:\n{}", out);
+
+    // POSITIVE: arrays/iterators are COMPLETELY unaffected — an array may be reused freely across
+    // any combinator, including concat, with no affine restriction.
+    let arrays = r#"import { print } from "std/io"
+import { map, filter, reduce, concat } from "std/iter"
+import { length } from "std/array"
+val a: Int32[] = [1, 2, 3]
+val b: Int32[] = a.map(x => x + 1)
+val c: Int32[] = a.filter(x => x > 1)
+val d: Int32 = a.reduce(0, (acc, x) => acc + x)
+val e: Int32[] = a.concat([4, 5])
+val f: Int32[] = a.map(x => x * 2)
+print(length(a))
+"#;
+    let (ok, out) = check_source(arrays);
+    assert!(ok, "array combinator chains must be unaffected (free reuse):\n{}", out);
 }
