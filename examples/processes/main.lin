@@ -15,23 +15,31 @@ val tasks = [
   {
     "name": "echo",
     "command": "printf",
-    "args": ["hello"],
+    "args": [
+      "hello"
+    ]
   },
   {
     "name": "true",
     "command": "true",
-    "args": [],
+    "args": [
+
+    ]
   },
   {
     "name": "false",
     "command": "false",
-    "args": [],
+    "args": [
+
+    ]
   },
   {
     "name": "missing",
     "command": "definitely-not-a-real-command-xyz",
-    "args": [],
-  },
+    "args": [
+
+    ]
+  }
 ]
 
 print(render(runAll(tasks)))

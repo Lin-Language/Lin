@@ -15,30 +15,33 @@ import { toString } from "std/string"
 
 val show = (label: String, raw: RawForm): Null =>
   match validateForm(raw)
-    has { "type": "success", value } => print("${label}: ok — ${value["name"]} <${value["email"]}>, age ${toString(value["age"])}")
+    has { "type": "success", value } =>
+      print(
+        "${label}: ok — ${value["name"]} <${value["email"]}>, age ${toString(value["age"])}"
+      )
     has { "type": "failure", error } => print("${label}: rejected — ${error}")
     else => print("${label}: ?")
 
 show("valid", {
   "name": "Ada",
   "email": "ada@example.com",
-  "age": "36",
+  "age": "36"
 })
 
 show("no-name", {
   "name": "   ",
   "email": "ada@example.com",
-  "age": "36",
+  "age": "36"
 })
 
 show("bad-mail", {
   "name": "Bo",
   "email": "nope",
-  "age": "36",
+  "age": "36"
 })
 
 show("bad-age", {
   "name": "Cleo",
   "email": "c@x.io",
-  "age": "999",
+  "age": "999"
 })

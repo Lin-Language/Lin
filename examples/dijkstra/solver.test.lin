@@ -20,45 +20,45 @@ val sampleGraph = {
     "C",
     "D",
     "E",
-    "F",
+    "F"
   ],
   "edges": [
     {
       "from": "A",
       "to": "B",
-      "weight": 10,
+      "weight": 10
     },
     {
       "from": "A",
       "to": "C",
-      "weight": 3,
+      "weight": 3
     },
     {
       "from": "C",
       "to": "B",
-      "weight": 4,
+      "weight": 4
     },
     {
       "from": "C",
       "to": "D",
-      "weight": 8,
+      "weight": 8
     },
     {
       "from": "B",
       "to": "D",
-      "weight": 2,
+      "weight": 2
     },
     {
       "from": "D",
       "to": "E",
-      "weight": 5,
+      "weight": 5
     },
     {
       "from": "B",
       "to": "E",
-      "weight": 11,
-    },
-  ],
+      "weight": 11
+    }
+  ]
 }
 
 // readJson dispatches on the path: a known file yields the graph, anything else an
@@ -86,13 +86,13 @@ val s = suite("solver", [
     [
       expect(r["type"]).toBe("ok"),
       expect(r["path"].join(" ")).toBe("A C B D E"),
-      expect(r["distance"]).toBe(14),
+      expect(r["distance"]).toBe(14)
     ]),
   test("surfaces a read error as a tagged error result", () =>
     val r = solve("missing.json", "A", "E", null)
     [
       expect(r["type"]).toBe("error"),
-      expect(r["message"]).toBe("no such file: missing.json"),
+      expect(r["message"]).toBe("no such file: missing.json")
     ]),
   test("reports no-path when the target is unreachable", () =>
     // "F" is in the graph but has no incoming edges, so it stays at the sentinel.
@@ -103,12 +103,12 @@ val s = suite("solver", [
     [
       expect(r["type"]).toBe("ok"),
       expect(wroteToPath).toBe("out.json"),
-      expect(wroteDistance).toBe(14),
+      expect(wroteDistance).toBe(14)
     ]),
   test("does not write when no output path is given", () =>
     // wroteToPath still holds the previous write; a null outputPath must not change it.
     val r = solve("graph.json", "A", "E", null)
-    [expect(r["type"]).toBe("ok"), expect(wroteToPath).toBe("out.json")]),
+    [expect(r["type"]).toBe("ok"), expect(wroteToPath).toBe("out.json")])
 ])
 
 run(s)

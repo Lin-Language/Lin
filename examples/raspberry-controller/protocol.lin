@@ -23,11 +23,10 @@ import { clamp } from "std/math"
 // [-1, 1]. Mirrors Rust parse_packet: `f32::from_be_bytes(buf[0..4]) as f64`,
 // then `.clamp(-1.0, 1.0)`. f32FromBe yields a Float32 that widens to Float64
 // for the clamp — exactly the Rust `as f64`.
-export val parsePacket = (buf: UInt8[]): Float64[] =>
-  [
-    clamp(f32FromBe(buf, 0), 0.0 - 1.0, 1.0),
-    clamp(f32FromBe(buf, 4), 0.0 - 1.0, 1.0),
-  ]
+export val parsePacket = (buf: UInt8[]): Float64[] => [
+  clamp(f32FromBe(buf, 0), 0.0 - 1.0, 1.0),
+  clamp(f32FromBe(buf, 4), 0.0 - 1.0, 1.0)
+]
 
 // Encode a [left, right] speed pair into the 8-byte packet. Mirrors the client's
 // `encode`: each speed narrowed to f32, serialized big-endian, concatenated.

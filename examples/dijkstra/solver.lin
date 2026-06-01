@@ -36,5 +36,5 @@ export val solve = (graphPath: String, source: String, target: String, outputPat
         {
           "type": "ok",
           "path": path,
-          "distance": d,
+          "distance": d
         }

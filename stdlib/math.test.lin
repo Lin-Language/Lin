@@ -3,9 +3,18 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { PI, E, INFINITY, NAN, floor, ceil, round, trunc, sqrt, pow, exp, log, log2, log10, sin, cos, tan, asin, acos, atan, atan2, abs, min, max, clamp, sign, isNaN, isFinite, random, toFixed } from "std/math"
 
 val s = suite("std/math", [
-  test("PI is approximately 3.14159", () => [expect((PI * 100000.0).floor() / 100000.0).toBe(3.14159)]),
-  test("E is approximately 2.71828", () => [expect((E * 100000.0).floor() / 100000.0).toBe(2.71828)]),
-  test("INFINITY is positive infinity", () => [expect(INFINITY.isFinite()).toBe(false)]),
+  test(
+    "PI is approximately 3.14159",
+    () => [expect((PI * 100000.0).floor() / 100000.0).toBe(3.14159)]
+  ),
+  test(
+    "E is approximately 2.71828",
+    () => [expect((E * 100000.0).floor() / 100000.0).toBe(2.71828)]
+  ),
+  test(
+    "INFINITY is positive infinity",
+    () => [expect(INFINITY.isFinite()).toBe(false)]
+  ),
   test("NAN is not a number", () => [expect(NAN.isNaN()).toBe(true)]),
   test("floor rounds down", () => [expect(3.7.floor()).toBe(3.0)]),
   test("floor rounds down negative", () => [expect(-3.2.floor()).toBe(-4.0)]),
@@ -14,7 +23,10 @@ val s = suite("std/math", [
   test("round rounds to nearest", () => [expect(3.5.round()).toBe(4.0)]),
   test("round rounds down when below 0.5", () => [expect(3.4.round()).toBe(3.0)]),
   test("trunc truncates toward zero", () => [expect(3.9.trunc()).toBe(3.0)]),
-  test("trunc truncates negative toward zero", () => [expect(-3.9.trunc()).toBe(-3.0)]),
+  test(
+    "trunc truncates negative toward zero",
+    () => [expect(-3.9.trunc()).toBe(-3.0)]
+  ),
   test("sqrt of 4 is 2", () => [expect(4.0.sqrt()).toBe(2.0)]),
   test("sqrt of 9 is 3", () => [expect(9.0.sqrt()).toBe(3.0)]),
   test("pow 2 to the 10", () => [expect(2.0.pow(10.0)).toBe(1024.0)]),
@@ -44,12 +56,21 @@ val s = suite("std/math", [
   test("isNaN of NAN is true", () => [expect(NAN.isNaN()).toBe(true)]),
   test("isNaN of 1.0 is false", () => [expect(1.0.isNaN()).toBe(false)]),
   test("isFinite of 1.0 is true", () => [expect(1.0.isFinite()).toBe(true)]),
-  test("isFinite of INFINITY is false", () => [expect(INFINITY.isFinite()).toBe(false)]),
+  test(
+    "isFinite of INFINITY is false",
+    () => [expect(INFINITY.isFinite()).toBe(false)]
+  ),
   test("random returns value in [0, 1)", () =>
     val r = random()
     [expect(r >= 0.0 && r < 1.0).toBe(true)]),
-  test("toFixed formats to 2 decimal places", () => [expect(3.14159.toFixed(2)).toBe("3.14")]),
-  test("toFixed formats to 0 decimal places", () => [expect(3.7.toFixed(0)).toBe("4")]),
+  test(
+    "toFixed formats to 2 decimal places",
+    () => [expect(3.14159.toFixed(2)).toBe("3.14")]
+  ),
+  test(
+    "toFixed formats to 0 decimal places",
+    () => [expect(3.7.toFixed(0)).toBe("4")]
+  )
 ])
 
 run(s)

@@ -14,7 +14,7 @@ val s = suite("config schema", [
       expect(sch["host"]["type"]).toBe("string"),
       expect(sch["host"]["default"]).toBe("localhost"),
       expect(sch["port"]["default"]).toBe(8080),
-      expect(sch["name"]["default"]).toBe(null),
+      expect(sch["name"]["default"]).toBe(null)
     ]),
   test("fills all defaults when only required field present", () =>
     // --- applyDefaults ---
@@ -22,19 +22,25 @@ val s = suite("config schema", [
     [
       expect(cfg["host"]).toBe("localhost"),
       expect(cfg["port"]).toBe(8080),
-      expect(cfg["debug"]).toBe(false),
+      expect(cfg["debug"]).toBe(false)
     ]),
   test("keeps provided values over defaults", () =>
     val cfg = applyDefaults({ "name": "svc", "port": 9090 })
     [expect(cfg["port"]).toBe(9090), expect(cfg["host"]).toBe("localhost")]),
-  test("does not invent a value for a required field", () => [expect(applyDefaults({ "port": 1 })["name"]).toBe(null)]),
+  test(
+    "does not invent a value for a required field",
+    () => [expect(applyDefaults({ "port": 1 })["name"]).toBe(null)]
+  ),
   test("a complete config validates with no errors", () =>
     // --- validate (the boxed-key projection equality that was broken) ---
     [expect(length(validate(applyDefaults({ "name": "svc" })))).toBe(0)]),
-  test("flags a missing required field", () => [expect(length(validate(applyDefaults({ "port": 1 })))).toBe(1)]),
+  test(
+    "flags a missing required field",
+    () => [expect(length(validate(applyDefaults({ "port": 1 })))).toBe(1)]
+  ),
   test("flags a wrong-typed field", () =>
     val cfg = applyDefaults({ "name": "svc", "port": "nope" })
-    [expect(length(validate(cfg))).toBe(1)]),
+    [expect(length(validate(cfg))).toBe(1)])
 ])
 
 run(s)

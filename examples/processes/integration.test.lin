@@ -18,19 +18,19 @@ replace exec = (command: String, args: String[]): Json =>
     {
       "status": 0,
       "stdout": "hi",
-      "stderr": "",
+      "stderr": ""
     }
   else if command == "true" then
     {
       "status": 0,
       "stdout": "",
-      "stderr": "",
+      "stderr": ""
     }
   else if command == "false" then
     {
       "status": 1,
       "stdout": "",
-      "stderr": "",
+      "stderr": ""
     }
   else
     { "type": "error", "message": "command not found" }
@@ -39,23 +39,31 @@ val tasks = [
   {
     "name": "echo",
     "command": "printf",
-    "args": ["hi"],
+    "args": [
+      "hi"
+    ]
   },
   {
     "name": "ok",
     "command": "true",
-    "args": [],
+    "args": [
+
+    ]
   },
   {
     "name": "bad",
     "command": "false",
-    "args": [],
+    "args": [
+
+    ]
   },
   {
     "name": "missing",
     "command": "nope",
-    "args": [],
-  },
+    "args": [
+
+    ]
+  }
 ]
 
 val s = suite("processes integration", [
@@ -66,7 +74,7 @@ val s = suite("processes integration", [
       expect(sm["total"]).toBe(4),
       expect(sm["passed"]).toBe(2),
       expect(sm["failed"]).toBe(2),
-      expect(sm["ok"]).toBe(false),
+      expect(sm["ok"]).toBe(false)
     ]),
   test("renders a report naming each task and the failure count", () =>
     val out = render(runAll(tasks))
@@ -74,8 +82,8 @@ val s = suite("processes integration", [
       expect(out.contains("[pass] echo")).toBe(true),
       expect(out.contains("[fail] bad (exit 1)")).toBe(true),
       expect(out.contains("[error] missing")).toBe(true),
-      expect(out.contains("2 of 4 task(s) failed")).toBe(true),
-    ]),
+      expect(out.contains("2 of 4 task(s) failed")).toBe(true)
+    ])
 ])
 
 run(s)

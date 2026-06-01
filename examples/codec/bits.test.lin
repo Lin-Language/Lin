@@ -18,9 +18,12 @@ val s = suite("bits", [
     [
       expect(b).toBe(165),
       expect(highNibble(b)).toBe(10),
-      expect(lowNibble(b)).toBe(5),
+      expect(lowNibble(b)).toBe(5)
     ]),
-  test("masks the low nibble of its low argument", () => [expect(packNibbles(1, 255)).toBe(31)]),
+  test(
+    "masks the low nibble of its low argument",
+    () => [expect(packNibbles(1, 255)).toBe(31)]
+  ),
   test("highNibble / lowNibble split a byte", () =>
     // high bits of `low` must be dropped
     [expect(highNibble(171)).toBe(10), expect(lowNibble(171)).toBe(11)]),
@@ -32,7 +35,7 @@ val s = suite("bits", [
     [
       expect(checksum([1, 2, 3])).toBe(0),
       expect(checksum([255, 1, 2])).toBe(252),
-      expect(checksum([])).toBe(0),
+      expect(checksum([])).toBe(0)
     ]),
   test("plain bitwise operators", () =>
     // --- Plain bitwise operators (the byte-language features bits.lin homes) ---
@@ -41,7 +44,7 @@ val s = suite("bits", [
       expect(12 | 10).toBe(14),
       expect(12 ^ 10).toBe(6),
       expect(1 << 4).toBe(16),
-      expect(255 >> 4).toBe(15),
+      expect(255 >> 4).toBe(15)
     ]),
   test("UInt8 flat array holds 0..255 unboxed", () =>
     // --- Flat-array element typing for small integer types ---
@@ -52,7 +55,7 @@ val s = suite("bits", [
     [
       expect(signed[0]).toBe(-1),
       expect(signed[1]).toBe(-128),
-      expect(signed[2]).toBe(127),
+      expect(signed[2]).toBe(127)
     ]),
   test("slice preserves the flat element type", () =>
     val buf: UInt8[] = [
@@ -60,7 +63,7 @@ val s = suite("bits", [
       2,
       3,
       4,
-      5,
+      5
     ]
     [expect(buf.slice(1, 4)).toBe([2, 3, 4])]),
   test("concat preserves the flat element type (byte-level reads still work)", () =>
@@ -73,8 +76,8 @@ val s = suite("bits", [
     val bytes = u32ToBe(v)
     [
       expect(length(bytes)).toBe(4),
-      expect(u32FromBe(bytes, 0).toFloat64().toInt32()).toBe(305419896),
-    ]),
+      expect(u32FromBe(bytes, 0).toFloat64().toInt32()).toBe(305419896)
+    ])
 ])
 
 run(s)

@@ -14,7 +14,7 @@ val lines = [
   "bad-row",
   "Charlie, 78",
   ", 50",
-  "Diana, 100",
+  "Diana, 100"
 ]
 
 print(render(lines))

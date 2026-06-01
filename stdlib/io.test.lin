@@ -21,7 +21,7 @@ val s = suite("std/io", [
     val result = args()
     // args() returns String[] — just verify it's callable and the type is right
     [expect(true).toBe(true)]),
-  test("prompt function exists (callable)", () => [expect(true).toBe(true)]),
+  test("prompt function exists (callable)", () => [expect(true).toBe(true)])
 ])
 
 // prompt requires stdin interaction; just verify the import works

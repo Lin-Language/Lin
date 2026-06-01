@@ -16,13 +16,23 @@ export type SchemaEntry = { "type": String, "default": Json }
 
 // The schema for our app config. Each entry: { "type", "default" } (default omitted
 // for required fields).
-export val schema = (): Json =>
-  {
-    "host": { "type": "string", "default": "localhost" },
-    "port": { "type": "int", "default": 8080 },
-    "debug": { "type": "bool", "default": false },
-    "name": { "type": "string" },
+export val schema = (): Json => {
+  "host": {
+    "type": "string",
+    "default": "localhost"
+  },
+  "port": {
+    "type": "int",
+    "default": 8080
+  },
+  "debug": {
+    "type": "bool",
+    "default": false
+  },
+  "name": {
+    "type": "string"
   }
+}
 
 // The runtime type tag of a Json value, as one of our schema type names.
 val typeName = (v: Json): String =>

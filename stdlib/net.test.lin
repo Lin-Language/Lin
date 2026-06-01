@@ -34,7 +34,7 @@ val s = suite("std/net", [
       0,
       0,
       0,
-      0,
+      0
     ]
     val res = udpRecvFrom(sock, buf)
     udpClose(sock)
@@ -44,8 +44,8 @@ val s = suite("std/net", [
       expect(res["addr"]).toBe("127.0.0.1"),
       expect(buf[0]).toBe(72),
       expect(buf[1]).toBe(105),
-      expect(buf[2]).toBe(33),
-    ]),
+      expect(buf[2]).toBe(33)
+    ])
 ])
 
 run(s)

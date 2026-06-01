@@ -25,7 +25,7 @@ export val runTask = (t: Task): TaskResult =>
       "name": t["name"],
       "outcome": "error",
       "status": -1,
-      "output": r["message"],
+      "output": r["message"]
     }
   else
     val status = r["status"]
@@ -34,7 +34,7 @@ export val runTask = (t: Task): TaskResult =>
       "name": t["name"],
       "outcome": outcome,
       "status": status,
-      "output": r["stdout"].trim(),
+      "output": r["stdout"].trim()
     }
 
 // Run a list of tasks in order, collecting their results.

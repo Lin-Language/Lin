@@ -42,7 +42,7 @@ val s = suite("std/array", [
       expect(length(kept)).toBe(2),
       expect(kept[0]["v"]).toBe(1),
       expect(kept[1]["v"]).toBe(3),
-      expect(length(items)).toBe(3),
+      expect(length(items)).toBe(3)
     ]),
   test("reduce sums values", () =>
     // the source must remain intact and independently usable after the filter
@@ -81,7 +81,10 @@ val s = suite("std/array", [
     // representation-consistent. Cover both element representations and the
     // negative-index wrap.
     [expect([10, 20, 30].at(1)).toBe(20)]),
-  test("at wraps negative index on String[]", () => [expect(["a", "b", "c"].at(-1)).toBe("c")]),
+  test(
+    "at wraps negative index on String[]",
+    () => [expect(["a", "b", "c"].at(-1)).toBe("c")]
+  ),
   test("indexOf on String[]", () => [expect(["a", "b", "c"].indexOf("c")).toBe(2)]),
   test("set then at round-trips on Int32[]", () =>
     val a = [1, 2, 3]
@@ -94,7 +97,7 @@ val s = suite("std/array", [
     val result = [1, 2, 3, 4, 5].partition(x => x % 2 == 0)
     [
       expect(result[0].toString()).toBe("[2, 4]"),
-      expect(result[1].toString()).toBe("[1, 3, 5]"),
+      expect(result[1].toString()).toBe("[1, 3, 5]")
     ]),
   test("partition with empty array", () =>
     val result = [].partition(x => x == 1)
@@ -149,7 +152,7 @@ val s = suite("std/array", [
     val result = original.sort((a, b) => a - b)
     [
       expect(original.toString()).toBe("[3, 1, 2]"),
-      expect(result.toString()).toBe("[1, 2, 3]"),
+      expect(result.toString()).toBe("[1, 2, 3]")
     ]),
   test("sort empty array returns empty array", () =>
     val result = [].sort((a, b) => a - b)
@@ -165,7 +168,7 @@ val s = suite("std/array", [
     [
       expect(result[0]["name"]).toBe("Alice"),
       expect(result[1]["name"]).toBe("Bob"),
-      expect(result[2]["name"]).toBe("Charlie"),
+      expect(result[2]["name"]).toBe("Charlie")
     ]),
   test("sortBy does not mutate original array", () =>
     val original = [3, 1, 2]
@@ -254,7 +257,7 @@ val s = suite("std/array", [
     val result = original.append(4)
     [
       expect(original.toString()).toBe("[1, 2, 3]"),
-      expect(result.toString()).toBe("[1, 2, 3, 4]"),
+      expect(result.toString()).toBe("[1, 2, 3, 4]")
     ]),
   test("append on empty array returns single-element array", () =>
     val result = [].append(1)
@@ -267,7 +270,7 @@ val s = suite("std/array", [
     val result = original.prepend(1)
     [
       expect(original.toString()).toBe("[2, 3]"),
-      expect(result.toString()).toBe("[1, 2, 3]"),
+      expect(result.toString()).toBe("[1, 2, 3]")
     ]),
   test("prepend on empty array returns single-element array", () =>
     val result = [].prepend(1)
@@ -286,7 +289,7 @@ val s = suite("std/array", [
     [
       expect(ss.append("c").toString()).toBe("[\"a\", \"b\", \"c\"]"),
       expect(ss.prepend("z").toString()).toBe("[\"z\", \"a\", \"b\"]"),
-      expect(ss.toString()).toBe("[\"a\", \"b\"]"),
+      expect(ss.toString()).toBe("[\"a\", \"b\"]")
     ]),
   test("scan returns all intermediate accumulator values including initial", () =>
     // original unchanged
@@ -302,7 +305,7 @@ val s = suite("std/array", [
     val result = [1, 2, 3, 4].groupBy(x => if x % 2 == 0 then "even" else "odd")
     [
       expect(result["odd"].toString()).toBe("[1, 3]"),
-      expect(result["even"].toString()).toBe("[2, 4]"),
+      expect(result["even"].toString()).toBe("[2, 4]")
     ]),
   test("groupBy with single key puts all in one group", () =>
     val result = [1, 2, 3].groupBy(x => "all")
@@ -316,7 +319,7 @@ val s = suite("std/array", [
     val result = [1, 2, 3, 4, 5, 6].groupBy(x => if x % 2 == 0 then "even" else "odd")
     [
       expect(result["odd"].toString()).toBe("[1, 3, 5]"),
-      expect(result["even"].toString()).toBe("[2, 4, 6]"),
+      expect(result["even"].toString()).toBe("[2, 4, 6]")
     ]),
   test("groupBy of strings keeps the values (heap-element RC)", () =>
     // String elements stress the tagged-payload retain path: the group arrays must own their
@@ -326,14 +329,14 @@ val s = suite("std/array", [
     [
       expect(result["a"].toString()).toBe("[\"apple\", \"avocado\"]"),
       expect(result["b"].toString()).toBe("[\"banana\"]"),
-      expect(result["c"].toString()).toBe("[\"cherry\"]"),
+      expect(result["c"].toString()).toBe("[\"cherry\"]")
     ]),
   test("countBy counts occurrences of each key", () =>
     val result = ["a", "b", "a", "c", "b", "a"].countBy(x => x)
     [
       expect(result["a"]).toBe(3),
       expect(result["b"]).toBe(2),
-      expect(result["c"]).toBe(1),
+      expect(result["c"]).toBe(1)
     ]),
   test("countBy groups even and odd counts", () =>
     val result = [1, 2, 3, 4, 5].countBy(x => if x % 2 == 0 then "even" else "odd")
@@ -374,31 +377,33 @@ val s = suite("std/array", [
     val result = ["a", "a", "b"].groupBy(x => x)
     [
       expect(result["a"].toString()).toBe("[\"a\", \"a\"]"),
-      expect(result["b"].toString()).toBe("[\"b\"]"),
+      expect(result["b"].toString()).toBe("[\"b\"]")
     ]),
   test("arrayAllocate produces n nulls", () =>
     val b = arrayAllocate(3)
     [expect(length(b)).toBe(3), expect(b.toString()).toBe("[null, null, null]")]),
-  test("arrayAllocateFilled fills with a scalar", () =>
-    [
-      expect(arrayAllocateFilled(3, 0).toString()).toBe("[0, 0, 0]"),
-      expect(arrayAllocateFilled(2, 7).toString()).toBe("[7, 7]"),
-      expect(arrayAllocateFilled(3, true).toString()).toBe("[true, true, true]"),
-      expect(arrayAllocateFilled(0, 9).toString()).toBe("[]"),
-    ]),
-  test("arrayAllocateFilled fills with a string", () => [expect(arrayAllocateFilled(2, "x").toString()).toBe("[\"x\", \"x\"]")]),
+  test("arrayAllocateFilled fills with a scalar", () => [
+    expect(arrayAllocateFilled(3, 0).toString()).toBe("[0, 0, 0]"),
+    expect(arrayAllocateFilled(2, 7).toString()).toBe("[7, 7]"),
+    expect(arrayAllocateFilled(3, true).toString()).toBe("[true, true, true]"),
+    expect(arrayAllocateFilled(0, 9).toString()).toBe("[]")
+  ]),
+  test(
+    "arrayAllocateFilled fills with a string",
+    () => [expect(arrayAllocateFilled(2, "x").toString()).toBe("[\"x\", \"x\"]")]
+  ),
   test("arrayAllocateFilled fills with a heap value (shared, but each slot reads it back)", () =>
     val b = arrayAllocateFilled(3, [1, 2])
     [
       expect(b.toString()).toBe("[[1, 2], [1, 2], [1, 2]]"),
       expect(b[0].toString()).toBe("[1, 2]"),
-      expect(b[2].toString()).toBe("[1, 2]"),
+      expect(b[2].toString()).toBe("[1, 2]")
     ]),
   test("arrayAllocate + set fills a pre-sized buffer by index", () =>
     val b = arrayAllocate(3)
     set(b, 0, "a")
     set(b, 1, "b")
-    [expect(b.toString()).toBe("[\"a\", \"b\", null]")]),
+    [expect(b.toString()).toBe("[\"a\", \"b\", null]")])
 ])
 
 run(s)

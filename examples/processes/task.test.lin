@@ -22,13 +22,13 @@ replace exec = (command: String, args: String[]): Json =>
     {
       "status": 0,
       "stdout": "hello\n",
-      "stderr": "",
+      "stderr": ""
     }
   else if command == "boom" then
     {
       "status": 1,
       "stdout": "",
-      "stderr": "nope",
+      "stderr": "nope"
     }
   else if command == "missing" then
     { "type": "error", "message": "command not found" }
@@ -36,7 +36,7 @@ replace exec = (command: String, args: String[]): Json =>
     {
       "status": 0,
       "stdout": "",
-      "stderr": "",
+      "stderr": ""
     }
 
 val s = suite("task", [
@@ -44,30 +44,36 @@ val s = suite("task", [
     val r = runTask({
       "name": "echo",
       "command": "ok",
-      "args": ["hi"],
+      "args": [
+        "hi"
+      ]
     })
     [
       expect(r["outcome"]).toBe("pass"),
       expect(r["status"]).toBe(0),
-      expect(r["output"]).toBe("hello"),
+      expect(r["output"]).toBe("hello")
     ]),
   test("a non-zero exit is a fail carrying its status", () =>
     val r = runTask({
       "name": "f",
       "command": "boom",
-      "args": [],
+      "args": [
+
+      ]
     })
     [expect(r["outcome"]).toBe("fail"), expect(r["status"]).toBe(1)]),
   test("an unlaunchable command is an error, not a crash", () =>
     val r = runTask({
       "name": "x",
       "command": "missing",
-      "args": [],
+      "args": [
+
+      ]
     })
     [
       expect(r["outcome"]).toBe("error"),
       expect(r["status"]).toBe(-1),
-      expect(r["output"]).toBe("command not found"),
+      expect(r["output"]).toBe("command not found")
     ]),
   test("runAll runs every task in order, invoking exec once each", () =>
     val before = execCount
@@ -75,20 +81,24 @@ val s = suite("task", [
       {
         "name": "a",
         "command": "ok",
-        "args": [],
+        "args": [
+
+        ]
       },
       {
         "name": "b",
         "command": "boom",
-        "args": [],
-      },
+        "args": [
+
+        ]
+      }
     ])
     [
       expect(length(results)).toBe(2),
       expect(results[0]["outcome"]).toBe("pass"),
       expect(results[1]["outcome"]).toBe("fail"),
-      expect(execCount - before).toBe(2),
-    ]),
+      expect(execCount - before).toBe(2)
+    ])
 ])
 
 run(s)

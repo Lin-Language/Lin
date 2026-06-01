@@ -12,7 +12,10 @@ import { toString } from "std/string"
 
 val show = (label: String, raw: Json): Null =>
   match load(raw)
-    has { "type": "success", value } => print("${label}: ok host=${value["host"]} port=${toString(value["port"])} debug=${toString(value["debug"])} name=${value["name"]}")
+    has { "type": "success", value } =>
+      print(
+        "${label}: ok host=${value["host"]} port=${toString(value["port"])} debug=${toString(value["debug"])} name=${value["name"]}"
+      )
     has { "type": "failure", error } => print("${label}: invalid — ${error}")
     else => print("${label}: ?")
 
@@ -24,7 +27,7 @@ show("override", {
   "host": "0.0.0.0",
   "port": 9090,
   "debug": true,
-  "name": "api",
+  "name": "api"
 })
 
 // Missing the required `name` field.

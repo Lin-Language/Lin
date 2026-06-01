@@ -35,9 +35,12 @@ val s = suite("std/async", [
     [expect(reply).toBe(42)]),
   test("worker holds confined var state across requests", () =>
     var total = 0
-    val acc = worker(n =>
-      total = total + n
-      total, () => null)
+    val acc = worker(
+      n =>
+        total = total + n
+        total,
+      () => null
+    )
     val a = request(acc, 10)
     val b = request(acc, 5)
     close(acc)
@@ -89,7 +92,7 @@ val s = suite("std/async", [
         "slow"),
       async(() =>
         sleep(5)
-        "fast"),
+        "fast")
     ]))
     val checks = [expect(w).toBe("fast")]
     checks),
@@ -99,8 +102,14 @@ val s = suite("std/async", [
       "done")
     val checks = [expect(await(timeout(slow, 20))).toBe(null)]
     checks),
-  test("timeout passes the value through when fast", () => [expect(await(timeout(async(() => 5), 1000))).toBe(5)]),
-  test("retry returns value on first success", () => [expect(await(retry(() => 7, 3))).toBe(7)]),
+  test(
+    "timeout passes the value through when fast",
+    () => [expect(await(timeout(async(() => 5), 1000))).toBe(5)]
+  ),
+  test(
+    "retry returns value on first success",
+    () => [expect(await(retry(() => 7, 3))).toBe(7)]
+  ),
   test("retry surfaces Error when all attempts fail", () =>
     val z = 0
     val r = await(retry(() => 1 / z, 3))
@@ -130,7 +139,7 @@ val s = suite("std/async", [
     val tasks = parallel([
       () => withLock(box, a => push(a, 1)),
       () => withLock(box, a => push(a, 1)),
-      () => withLock(box, a => push(a, 1)),
+      () => withLock(box, a => push(a, 1))
     ])
     [expect(length(get(box))).toBe(3)]),
   test("frozen graph read concurrently by many threads", () =>
@@ -139,10 +148,10 @@ val s = suite("std/async", [
       20,
       30,
       40,
-      50,
+      50
     ])
     val results = parallel([() => length(table), () => length(table), () => length(table)])
-    [expect(results.toString()).toBe("[5, 5, 5]")]),
+    [expect(results.toString()).toBe("[5, 5, 5]")])
 ])
 
 run(s)

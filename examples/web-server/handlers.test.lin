@@ -15,14 +15,13 @@ import { getIndex, getStatus, getUser } from "./handlers"
 // template.test.lin.) A mock may call a DIFFERENT symbol — just not itself.
 replace render = (path: String, data: {  }): Json => renderWith("<!DOCTYPE html><title>\${title}</title><h1>\${heading}</h1>", data)
 
-val makeReq = (method: String, path: String): Request =>
-  {
-    "method": method,
-    "path": path,
-    "query": "",
-    "headers": {},
-    "body": "",
-  }
+val makeReq = (method: String, path: String): Request => {
+  "method": method,
+  "path": path,
+  "query": "",
+  "headers": {},
+  "body": ""
+}
 
 val s = suite("handlers", [
   test("getIndex returns the rendered template HTML in the body", () =>
@@ -35,7 +34,7 @@ val s = suite("handlers", [
       expect(contains(resp["body"], "<!DOCTYPE html>")).toBe(true),
       expect(contains(resp["body"], "Lin Web Server")).toBe(true),
       expect(contains(resp["body"], "Welcome")).toBe(true),
-      expect(resp["body"] == "index").toBe(false),
+      expect(resp["body"] == "index").toBe(false)
     ]),
   test("getStatus returns 200", () =>
     // The old bug returned the literal "index"; a rendered body never equals it.
@@ -46,7 +45,7 @@ val s = suite("handlers", [
     [expect(resp["status"]).toBe(200)]),
   test("getUser returns 404 for non-matching path", () =>
     val resp = getUser(makeReq("GET", "/other"))
-    [expect(resp["status"]).toBe(404)]),
+    [expect(resp["status"]).toBe(404)])
 ])
 
 run(s)

@@ -19,9 +19,12 @@ val s = suite("parse", [
   test("rejects a row without a comma", () =>
     // --- Rejections (malformed rows are reported, not fatal) ---
     [expect(parseRow("bad-row")).toFail()]),
-  test("rejects a row with too many fields", () => [expect(parseRow("a, 1, extra")).toFail()]),
+  test(
+    "rejects a row with too many fields",
+    () => [expect(parseRow("a, 1, extra")).toFail()]
+  ),
   test("rejects an empty name", () => [expect(parseRow(", 50")).toFail()]),
-  test("rejects a non-numeric score", () => [expect(parseRow("Eve, abc")).toFail()]),
+  test("rejects a non-numeric score", () => [expect(parseRow("Eve, abc")).toFail()])
 ])
 
 run(s)

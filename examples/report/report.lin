@@ -34,10 +34,18 @@ val errorOf = (r: Parsed): String =>
     else => ""
 
 // Parse every line into a result, keep the successful records' values.
-export val validRecords = (lines: String[]): Record[] => lines.map(line => parseRow(line)).filter(r => r["type"] == "success").map(r => recordOf(r))
+export val validRecords = (lines: String[]): Record[] =>
+  lines
+    .map(line => parseRow(line))
+    .filter(r => r["type"] == "success")
+    .map(r => recordOf(r))
 
 // The error messages from the rows that failed to parse.
-export val parseErrors = (lines: String[]): String[] => lines.map(line => parseRow(line)).filter(r => r["type"] == "failure").map(r => errorOf(r))
+export val parseErrors = (lines: String[]): String[] =>
+  lines
+    .map(line => parseRow(line))
+    .filter(r => r["type"] == "failure")
+    .map(r => errorOf(r))
 
 // Statistics over the valid records: count, total, average (integer), and the
 // top scorer's name. Returns an object; `count == 0` is handled by the caller.
@@ -48,7 +56,7 @@ export val stats = (records: Record[]): Stats =>
       "count": 0,
       "total": 0,
       "average": 0,
-      "top": "",
+      "top": ""
     }
   else
     val total = records.reduce(0, (sum, r) => sum + r["score"])
@@ -57,7 +65,7 @@ export val stats = (records: Record[]): Stats =>
       "count": count,
       "total": total,
       "average": total / count,
-      "top": ranked[0]["name"],
+      "top": ranked[0]["name"]
     }
 
 // A trailing "skipped N bad row(s)" note, or "" when every row parsed.
@@ -71,6 +79,9 @@ val errorNote = (errs: String[]): String =>
 export val render = (lines: String[]): String =>
   val records = validRecords(lines)
   val st = stats(records)
-  val rows = records.sortBy(r => 0 - r["score"]).map(r => "  ${r["name"]}: ${toString(r["score"])}").join("\n")
+  val rows = records
+    .sortBy(r => 0 - r["score"])
+    .map(r => "  ${r["name"]}: ${toString(r["score"])}")
+    .join("\n")
   val errLines = errorNote(parseErrors(lines))
   "=== Report ===\n${rows}\ncount=${toString(st["count"])} avg=${toString(st["average"])} top=${st["top"]}${errLines}"

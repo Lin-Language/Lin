@@ -29,7 +29,7 @@ val tasks = parallel([
   () => hammer(20000),
   () => hammer(20000),
   () => hammer(20000),
-  () => hammer(20000),
+  () => hammer(20000)
 ])
 
 // 8 workers x 20000 locked pushes = 160000 elements if no update is lost.

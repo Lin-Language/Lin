@@ -38,5 +38,8 @@ export val parseRow = (line: String): Parsed =>
     else
       {
         "type": "success",
-        "value": { "name": name, "score": scoreStr.parseInt32() },
+        "value": {
+          "name": name,
+          "score": scoreStr.parseInt32()
+        }
       }
