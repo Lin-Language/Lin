@@ -106,7 +106,7 @@ export val unique = (arr: Json): Json =>
   arr.for(item =>
     val key = lin_value_key(item)
     if seen[key] == null then push(result, item)
-    if seen[key] == null then seen[key] = true else null
+    if seen[key] == null then seen[key] = true
   )
   result
 

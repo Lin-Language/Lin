@@ -61,7 +61,5 @@ export val validate = (cfg: Json): String[] =>
         push(errors, "missing required field: ${k}")
       else if typeName(actual) != expected then
         push(errors, "field ${k}: expected ${expected}, got ${typeName(actual)}")
-      else
-        null
     )
   errors

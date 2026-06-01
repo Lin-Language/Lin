@@ -50,29 +50,25 @@ export val applyKey = (key: Int32, left: Float64, right: Float64): Float64[] =>
   if key == 113 then
     [
       clampSpeed(left + STEP),
-      right
+      right // q: left +
     ]
   else if key == 97 then
     [
-      // q: left +
       clampSpeed(left - STEP),
-      right
+      right // a: left -
     ]
   else if key == 119 then
     [
-      // a: left -
       left,
-      clampSpeed(right + STEP)
+      clampSpeed(right + STEP) // w: right +
     ]
   else if key == 115 then
     [
-      // w: right +
       left,
-      clampSpeed(right - STEP)
+      clampSpeed(right - STEP) // s: right -
     ]
   else if key == 32 then
-    // s: right -
-    [0.0, 0.0] // space: stop
+    [0.0, 0.0]
   else
     [left, right]
 

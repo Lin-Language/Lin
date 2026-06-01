@@ -4626,6 +4626,25 @@ fn test_fmt_implicit_else_null_omitted() {
         fmt("val g = (d: Int32): Null =>\n  if d < INF then total = total + d else null\n").trim(),
         "val g = (d: Int32): Null =>\n  if d < INF then total = total + d else null"
     );
+    // The `if` as the TAIL of a multi-statement lambda body is also statement position — an
+    // implicit null else there is dropped too (regression: it came back when the body is a block).
+    let block_tail = fmt("val h = arr.for(item =>\n  val keep = f(item)\n  if keep then push(result, item)\n)\n");
+    assert!(!block_tail.contains("else null"), "implicit else null re-added on block tail:\n{}", block_tail);
+    assert_eq!(block_tail, fmt(&block_tail), "not idempotent:\n{}", block_tail);
+}
+
+#[test]
+fn test_fmt_array_element_trailing_comment() {
+    // A trailing comment on a single-line array element stays trailing (after its comma); it is
+    // NOT demoted to a leading comment on the next line. An own-line comment before an element
+    // stays leading.
+    let src = "val a = [\n  expect(x).toBe(1), // note\n  expect(y).toBe(2)\n]\n";
+    let out = fmt(src);
+    assert!(out.contains("expect(x).toBe(1), // note"), "array-element trailing comment demoted:\n{}", out);
+    assert_eq!(out, fmt(&out), "not idempotent:\n{}", out);
+    // Own-line comment before an element stays leading.
+    let lead = fmt("val b = [\n  // group\n  expect(x).toBe(1),\n  expect(y).toBe(2)\n]\n");
+    assert!(lead.contains("  // group\n  expect(x).toBe(1)"), "own-line array comment changed:\n{}", lead);
 }
 
 #[test]
