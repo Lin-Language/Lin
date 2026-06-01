@@ -98,6 +98,7 @@ pub(crate) fn collect_type_subs(pattern: &Type, actual: &Type, subs: &mut std::c
             for at in ats { collect_type_subs(pt, at, subs); }
         }
         (Type::Shared(pt), Type::Shared(at)) => collect_type_subs(pt, at, subs),
+        (Type::Stream(pt), Type::Stream(at)) => collect_type_subs(pt, at, subs),
         (Type::Union(pts), actual) => {
             for pt in pts { collect_type_subs(pt, actual, subs); }
         }
@@ -116,6 +117,7 @@ pub(crate) fn apply_type_subs(ty: &Type, subs: &std::collections::HashMap<u32, T
         Type::Array(t) => Type::Array(Box::new(apply_type_subs(t, subs))),
         Type::Iterator(t) => Type::Iterator(Box::new(apply_type_subs(t, subs))),
         Type::Shared(t) => Type::Shared(Box::new(apply_type_subs(t, subs))),
+        Type::Stream(t) => Type::Stream(Box::new(apply_type_subs(t, subs))),
         Type::Union(ts) => Type::Union(ts.iter().map(|t| apply_type_subs(t, subs)).collect()),
         Type::Function { params, ret, required } => Type::Function {
             params: params.iter().map(|p| apply_type_subs(p, subs)).collect(),
@@ -143,12 +145,14 @@ pub(crate) fn integer_range(ty: &Type) -> Option<(i128, i128)> {
 }
 
 /// Returns true if `ty` is definitely non-transferable across thread boundaries.
-/// Non-transferable: Function, Iterator, Never.
+/// Non-transferable: Function, Iterator, Stream, Never.
 /// TypeVar (unknown), Promise/Worker/ThreadPool (TypeVar-resolved), are not flagged —
 /// we only reject types we can statically prove are non-transferable (spec §24.3).
+/// `Stream` owns an OS resource, so it can never be COPIED across a thread boundary; it crosses
+/// only by MOVE (CAP_MOVE, Stage 7), which the transfer-copy path must never attempt (brief §9).
 pub(crate) fn is_definitely_non_transferable(ty: &Type) -> bool {
     match ty {
-        Type::Function { .. } | Type::Iterator(_) | Type::Never => true,
+        Type::Function { .. } | Type::Iterator(_) | Type::Stream(_) | Type::Never => true,
         Type::Array(inner) => is_definitely_non_transferable(inner),
         Type::Union(ts) => ts.iter().any(is_definitely_non_transferable),
         _ => false,

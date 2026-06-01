@@ -96,6 +96,14 @@ fn resolve_named_cycle(
         // Shared without a type argument: Shared<Json>. The opaque shared-mutable-state box
         // (ADR-044); only the shared/get/set/withLock accessors operate on it.
         "Shared" => Ok(Type::Shared(Box::new(json_type()))),
+        // Stream without a type argument: Stream<Json>. The opaque pull-source (streams brief).
+        // NOTE: the brief's locked decision was "not spellable in source"; we relaxed that to
+        // EXACTLY the Shared precedent (a bare `Stream` annotation) so the trusted stdlib's thin
+        // wrappers can annotate their `Stream` params (`(s: Stream)`) — the formatter mis-renders
+        // an UNANNOTATED single param as an arg-position bare lambda, which is invalid at a
+        // `val =` RHS. Opacity is unchanged: `compat.rs` still forbids any non-stream op on a
+        // `Stream`, so naming it buys a user nothing but the type itself.
+        "Stream" => Ok(Type::Stream(Box::new(json_type()))),
         _ => {
             // Cycle detected: return Named(name) as an opaque reference instead of expanding.
             if visiting.contains(name) {
@@ -151,6 +159,7 @@ fn expand_named_body(
             required: *required,
         }),
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(expand_named_body(inner, env, visiting)?))),
+        Type::Stream(inner) => Ok(Type::Stream(Box::new(expand_named_body(inner, env, visiting)?))),
         other => Ok(other.clone()),
     }
 }
@@ -173,6 +182,12 @@ fn resolve_generic(
                 return Err("Shared takes exactly 1 type argument".to_string());
             }
             Ok(Type::Shared(Box::new(args[0].clone())))
+        }
+        "Stream" => {
+            if args.len() != 1 {
+                return Err("Stream takes exactly 1 type argument".to_string());
+            }
+            Ok(Type::Stream(Box::new(args[0].clone())))
         }
         _ => {
             if let Some(decl) = env.lookup_type(name) {
@@ -239,6 +254,7 @@ fn substitute(
             required: *required,
         }),
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(substitute(inner, params, args, env, visiting)?))),
+        Type::Stream(inner) => Ok(Type::Stream(Box::new(substitute(inner, params, args, env, visiting)?))),
         _ => Ok(ty.clone()),
     }
 }

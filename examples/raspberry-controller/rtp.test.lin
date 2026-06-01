@@ -1,6 +1,7 @@
 import { suite, test, expect, run, toBe } from "std/test"
 import { packetize, nextSequence, advanceTimestamp, writeHeader, packetCount, MAX_RTP_PAYLOAD, PAYLOAD_TYPE, TIMESTAMP_INCREMENT } from "./rtp"
-import { length, concat, slice } from "std/array"
+import { length, slice } from "std/array"
+import { concat } from "std/iter"
 
 // Ports the RTP packetizer tests from server/src/rtp.rs. Test bodies are
 // Assertion[] arrays (assigned to `checks` then returned) so every assertion

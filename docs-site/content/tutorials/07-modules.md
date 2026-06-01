@@ -60,7 +60,7 @@ Standard library modules use the `std/` prefix:
 
 ```lin
 import { print } from "std/io"
-import { map, filter, reduce } from "std/array"
+import { map, filter, reduce } from "std/iter"
 import { trim, toUpper } from "std/string"
 import { readFile, writeFile } from "std/fs"
 import { parseInt32 } from "std/number"

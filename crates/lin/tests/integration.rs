@@ -460,8 +460,8 @@ print(toString(factorial(0)))
 fn test_for_and_range() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { range } from "std/array"
-import { for } from "std/array"
+import { range } from "std/iter"
+import { for } from "std/iter"
 
 range(1, 4).for(i => print(toString(i)))
 "#);
@@ -477,7 +477,7 @@ range(1, 4).for(i => print(toString(i)))
 fn test_split_result_iterates_as_strings() {
     let output = run(r#"import { print } from "std/io"
 import { split } from "std/string"
-import { for, map } from "std/array"
+import { for, map } from "std/iter"
 
 val parts = split("alpha,beta,gamma", ",")
 parts.for(s => print(s))
@@ -498,7 +498,7 @@ wrapped.for(s => print(s))
 fn test_loop_accumulates_toplevel_var() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { range, for } from "std/array"
+import { range, for } from "std/iter"
 
 var total = 0
 range(0, 5).for(i => total = total + i)
@@ -513,7 +513,7 @@ print(toString(total))
 fn test_nested_loops_with_var_accumulators() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { range, for } from "std/array"
+import { range, for } from "std/iter"
 
 val work = (n: Int32): Int32 =>
   var s = 0
@@ -539,7 +539,7 @@ print(toString(total))
 fn test_map_in_loop_discarded_cell_free() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { range, for, map } from "std/array"
+import { range, for, map } from "std/iter"
 
 val outer = range(0, 5000)
 var c = 0
@@ -581,7 +581,7 @@ print(toString(c()))
 fn test_combinators_with_var_cells_correct_after_free() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map, filter, reduce, find, some, every } from "std/array"
+import { map, filter, reduce, find, some, every } from "std/iter"
 
 print(toString([1, 2, 3].map(x => x * 2)))
 print(toString([1, 2, 3, 4].filter(x => x > 2)))
@@ -602,7 +602,7 @@ print(toString([1, 2, 3].every(x => x > 0)))
 fn test_nested_for_over_concrete_array_arg_box() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { range, for } from "std/array"
+import { range, for } from "std/iter"
 
 var k = 0
 val xs = [1, 2, 3]
@@ -619,7 +619,8 @@ print(toString(k))
 fn test_object_to_json_param_under_churn() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { range, for, length } from "std/array"
+import { length } from "std/array"
+import { range, for } from "std/iter"
 import { keys } from "std/object"
 
 val o = {"a": 1, "b": 2}
@@ -635,8 +636,8 @@ print(toString(n))
 fn test_map_filter_reduce() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map, filter, reduce } from "std/array"
-import { for } from "std/array"
+import { map, filter, reduce } from "std/iter"
+import { for } from "std/iter"
 
 val doubled = [1, 2, 3].map(x => x * 2)
 doubled.for(x => print(toString(x)))
@@ -654,7 +655,7 @@ print(toString(total))
 fn test_chaining() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map, filter, reduce } from "std/array"
+import { map, filter, reduce } from "std/iter"
 
 val result = [1, 2, 3, 4, 5]
   .map(x => x * x)
@@ -762,7 +763,7 @@ print(toString(x))
 fn test_multi_param_lambda() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { reduce } from "std/array"
+import { reduce } from "std/iter"
 
 val total = [1, 2, 3].reduce(0, (sum, x) => sum + x)
 print(toString(total))
@@ -1476,7 +1477,7 @@ print(toString(length({ "a": 1, "b": 2 })))
 fn test_multiline_chain() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map, filter, reduce } from "std/array"
+import { map, filter, reduce } from "std/iter"
 
 val nums = [1, 2, 3, 4, 5, 6]
 val result = nums
@@ -1499,7 +1500,7 @@ fn test_val_bound_multiline_chain_in_fn_body() {
     // mirroring its `&&`/`||` continuation handling. (block/dot-chain indent-balance bug)
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map, filter } from "std/array"
+import { map, filter } from "std/iter"
 
 val f = (xs: Json): Json =>
   val ys = xs
@@ -1661,7 +1662,7 @@ fn test_imported_fn_passed_as_value() {
         "export val double = (x: Int32): Int32 => x * 2\n").unwrap();
     let main = format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
-import {{ map }} from "std/array"
+import {{ map }} from "std/iter"
 import {{ double }} from "{}/lib"
 val doubled = [1, 2, 3].map(double)
 print(toString(doubled))
@@ -1819,8 +1820,8 @@ val bad = (a: Int32, b: Int32 = 1, c: Int32) => a + b + c
 fn test_iter_builtin() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { iter } from "std/array"
-import { for } from "std/array"
+import { iter } from "std/iter"
+import { for } from "std/iter"
 
 val myIter = iter(
   () => 0,
@@ -2081,7 +2082,7 @@ fn test_map_returns_capturing_closures() {
     // because the captured value pointed at freed-then-reused memory.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map } from "std/array"
+import { map } from "std/iter"
 
 val thunks = map([5, 6, 7], i => () => i)
 print(toString(thunks[0]()))
@@ -2142,7 +2143,7 @@ fn test_named_fn_in_map() {
     // `Function` value to `map`, hitting the same boxed-vs-concrete closure-wrapper mismatch.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map, for } from "std/array"
+import { map, for } from "std/iter"
 
 val dbl = (x: Int32): Int32 => x * 2
 [1, 2, 3].map(dbl).for(v => print(toString(v)))
@@ -2229,7 +2230,7 @@ print(classify(5))
 fn test_multi_statement_lambda_in_parens() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { for } from "std/array"
+import { for } from "std/iter"
 
 val data = [1, 2, 3]
 data.for(x =>
@@ -2243,7 +2244,7 @@ data.for(x =>
 #[test]
 fn test_bare_expr_side_effects_in_inline_lambda() {
     let output = run(r#"import { print } from "std/io"
-import { for } from "std/array"
+import { for } from "std/iter"
 
 val data = [1, 2, 3]
 data.for(x =>
@@ -2298,8 +2299,8 @@ print(toString(result))
 fn test_multi_statement_paren_function() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map } from "std/array"
-import { for } from "std/array"
+import { map } from "std/iter"
+import { for } from "std/iter"
 
 val result = [10, 20, 30].map((x) =>
   val y = x + 1
@@ -2314,8 +2315,9 @@ result.for(r => print(toString(r)))
 fn test_push_and_concat() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { length, push, concat } from "std/array"
-import { for } from "std/array"
+import { length, push } from "std/array"
+import { concat } from "std/iter"
+import { for } from "std/iter"
 
 val arr = [1, 2]
 push(arr, 3)
@@ -2398,7 +2400,8 @@ fn test_array_allocate_filled_concrete_heap_no_double_free() {
     // missing retain corrupts the heap; correctness of the printed values is the visible check.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { arrayAllocateFilled, range, for } from "std/array"
+import { arrayAllocateFilled } from "std/array"
+import { range, for } from "std/iter"
 
 val make = (): Null =>
   val arrs = arrayAllocateFilled(3, [1, 2])
@@ -2425,7 +2428,8 @@ fn test_iterator_arg_to_array_param_free_call() {
     // `x.f(y)` agree. Plain assignment (`val a: Int32[] = range(..)`) still rejects.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map, filter, reduce, range, length } from "std/array"
+import { length } from "std/array"
+import { map, filter, reduce, range } from "std/iter"
 
 val a = map(range(0, 5), i => i * 10)
 print("${toString(length(a))} ${toString(a[0])} ${toString(a[4])}")
@@ -2444,7 +2448,7 @@ fn test_keys_values_entries() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { keys, values } from "std/object"
-import { for } from "std/array"
+import { for } from "std/iter"
 
 val obj = { "a": 1, "b": 2 }
 val ks = keys(obj)
@@ -2460,7 +2464,7 @@ fn test_stdlib_array_find_some_every() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 
-import { find, some, every } from "std/array"
+import { find, some, every } from "std/iter"
 val nums = [1, 2, 3, 4, 5]
 print(toString(nums.find(x => x > 3)))
 print(toString(nums.find(x => x > 10)))
@@ -2476,8 +2480,9 @@ print(toString(nums.every(x => x > 2)))
 fn test_stdlib_array_flatmap_indexof_reverse() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { flatMap, indexOf, reverse } from "std/array"
-import { for } from "std/array"
+import { indexOf, reverse } from "std/array"
+import { flatMap } from "std/iter"
+import { for } from "std/iter"
 
 val nums = [1, 2, 3]
 val pairs = nums.flatMap(x => [x, x * 10])
@@ -2513,8 +2518,8 @@ print(isEvenDesc(3))
 fn test_forward_reference_in_closure() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map } from "std/array"
-import { for } from "std/array"
+import { map } from "std/iter"
+import { for } from "std/iter"
 
 val process = (items: Json): Json =>
   items.map(x => transform(x))
@@ -2926,7 +2931,7 @@ fn test_stress_high_fanout_parallel() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { parallel } from "std/async"
-import { reduce } from "std/array"
+import { reduce } from "std/iter"
 
 val results = parallel([
   () => 1, () => 2, () => 3, () => 4, () => 5, () => 6,
@@ -2945,7 +2950,7 @@ fn test_stress_pool_many_short_tasks() {
 import { toString } from "std/string"
 import { await, threadPool, poolAsync } from "std/async"
 import { push, length } from "std/array"
-import { for, range } from "std/array"
+import { for, range } from "std/iter"
 
 val unwrap = (r: Json): Int32 =>
   match r
@@ -2967,7 +2972,7 @@ fn test_stress_worker_churn() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { worker, request, close } from "std/async"
-import { for, range } from "std/array"
+import { for, range } from "std/iter"
 
 var total = 0
 range(0, 30).for(i =>
@@ -3469,8 +3474,8 @@ print(toString(await(p)))
 fn test_iterator_restart() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { iter } from "std/array"
-import { for } from "std/array"
+import { iter } from "std/iter"
+import { for } from "std/iter"
 
 val counter = iter(
   () => 0,
@@ -3499,6 +3504,369 @@ print(content)
 "#));
     let _ = fs::remove_file(&tmp);
     assert_eq!(output, vec!["hello from lin"]);
+}
+
+// Stage 3 (streams): open a file as a byte Stream<UInt8[]>, pull chunks until EOF, and count
+// the bytes read. Exercises lin_fs_open → lin_stream_read end-to-end (open + read bytes), the
+// TAG_STREAM box flowing through a `val`, and the EOF (Null) / chunk discrimination.
+#[test]
+fn test_stream_open_read_bytes_end_to_end() {
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_stream_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let path = tmp.display().to_string();
+    // 13 bytes of content.
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ length }} from "std/array"
+import {{ writeFile, openRead, readChunk }} from "std/fs"
+
+val countBytes = (s, acc: Int32): Int32 =>
+  val chunk = readChunk(s)
+  match chunk
+    is Null => acc
+    is Error => acc
+    else => countBytes(s, acc + length(chunk))
+
+writeFile("{path}", "hello, stream")
+val stream = openRead("{path}")
+val total = match stream
+  is Error => 0 - 1
+  else => countBytes(stream, 0)
+print(toString(total))
+"#));
+    let _ = fs::remove_file(&tmp);
+    assert_eq!(output, vec!["13"]);
+}
+
+// Stage 4 (streams): the worked CSV example from the design brief. readStream → lines → filter
+// → map → writeStream → drain, run on the calling thread. Asserts the exact transformed output
+// file (`a,b,c` -> `"a"|"b"|"c"`), plus lazy adapters + in-band drain + sink working together.
+#[test]
+fn test_stream_csv_pipeline_drain() {
+    let indir = std::env::temp_dir();
+    let inp = indir.join(format!("lin_ctest_csvin_{}.csv", std::process::id()));
+    let outp = indir.join(format!("lin_ctest_csvout_{}.csv", std::process::id()));
+    let _ = fs::remove_file(&inp);
+    let _ = fs::remove_file(&outp);
+    fs::write(&inp, "a,b,c\nx,y,z\n\nfoo,bar,baz").unwrap();
+    let inp_s = inp.display().to_string();
+    let outp_s = outp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines, writeStream, drain }} from "std/stream"
+import {{ split, join }} from "std/string"
+import {{ length }} from "std/array"
+import {{ map as amap, map, filter }} from "std/iter"
+
+val notEmpty = (line: String): Boolean => length(line) > 0
+val quoteFields = (line: String): String =>
+  amap(split(line, ","), f => "\"${{f}}\"").join("|")
+
+readStream("{inp_s}").lines().filter(notEmpty).map(quoteFields).writeStream("{outp_s}").drain()
+print("ok")
+"#));
+    let written = fs::read_to_string(&outp).unwrap_or_default();
+    let _ = fs::remove_file(&inp);
+    let _ = fs::remove_file(&outp);
+    assert_eq!(output, vec!["ok"]);
+    assert_eq!(written, "\"a\"|\"b\"|\"c\"\n\"x\"|\"y\"|\"z\"\n\"foo\"|\"bar\"|\"baz\"\n");
+}
+
+// std/iter unification (Stage 3/4): a lazy stream chain using the NET-NEW combinators that now
+// dispatch to the `lin_stream_*` backend on a stream receiver. drop + take + reduce on a 5-line
+// file: drop 1 → take 2 → fold count = 2.
+#[test]
+fn test_stream_iter_drop_take_reduce() {
+    let inp = std::env::temp_dir().join(format!("lin_ctest_dtr_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&inp);
+    fs::write(&inp, "l0\nl1\nl2\nl3\nl4\n").unwrap();
+    let inp_s = inp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines }} from "std/stream"
+import {{ drop, take, reduce }} from "std/iter"
+
+val r = readStream("{inp_s}")
+val out = match r
+  is Error => "open-error"
+  else =>
+    val total = r.lines().drop(1).take(2).reduce(0, (acc, line) => acc + 1)
+    match total
+      is Error => "drive-error"
+      else => "count=${{total}}"
+print(out)
+"#));
+    let _ = fs::remove_file(&inp);
+    assert_eq!(output, vec!["count=2"]);
+}
+
+// std/iter unification (Stage 3/4): flatMap over a stream (each line split into fields, flattened),
+// counted via reduce. "a,b,c\nd,e\nf" → 6 fields.
+#[test]
+fn test_stream_iter_flat_map() {
+    let inp = std::env::temp_dir().join(format!("lin_ctest_fm_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&inp);
+    fs::write(&inp, "a,b,c\nd,e\nf").unwrap();
+    let inp_s = inp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines }} from "std/stream"
+import {{ flatMap, reduce }} from "std/iter"
+import {{ split }} from "std/string"
+
+val r = readStream("{inp_s}")
+val out = match r
+  is Error => "open-error"
+  else =>
+    val total = r.lines().flatMap(l => split(l, ",")).reduce(0, (a, f) => a + 1)
+    match total
+      is Error => "drive-error"
+      else => "fields=${{total}}"
+print(out)
+"#));
+    let _ = fs::remove_file(&inp);
+    assert_eq!(output, vec!["fields=6"]);
+}
+
+// std/iter unification (Stage 3/4): takeWhile + dropWhile over a stream. Lines "aa\nbb\nc\ndd":
+// takeWhile(len==2) → 2 items; dropWhile(len==2) → 2 items (c, dd).
+#[test]
+fn test_stream_iter_take_while_drop_while() {
+    let inp = std::env::temp_dir().join(format!("lin_ctest_twdw_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&inp);
+    fs::write(&inp, "aa\nbb\nc\ndd").unwrap();
+    let inp_s = inp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines }} from "std/stream"
+import {{ takeWhile, dropWhile, reduce }} from "std/iter"
+import {{ length }} from "std/array"
+
+val tw = match readStream("{inp_s}")
+  is Error => -1
+  else => unwrapTw(readStream("{inp_s}").lines().takeWhile(l => length(l) == 2).reduce(0, (a, l) => a + 1))
+val dw = match readStream("{inp_s}")
+  is Error => -1
+  else => unwrapTw(readStream("{inp_s}").lines().dropWhile(l => length(l) == 2).reduce(0, (a, l) => a + 1))
+print("tw=${{tw}} dw=${{dw}}")
+
+val unwrapTw = (r: Json): Int32 =>
+  match r
+    is Error => -1
+    else => r
+"#));
+    let _ = fs::remove_file(&inp);
+    assert_eq!(output, vec!["tw=2 dw=2"]);
+}
+
+// std/iter unification (Stage 3/4): concat two streams (3 lines each = 6), counted via reduce.
+#[test]
+fn test_stream_iter_concat() {
+    let inp = std::env::temp_dir().join(format!("lin_ctest_cat_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&inp);
+    fs::write(&inp, "a\nb\nc").unwrap();
+    let inp_s = inp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines }} from "std/stream"
+import {{ concat, reduce }} from "std/iter"
+
+val a = readStream("{inp_s}")
+val b = readStream("{inp_s}")
+val out = match a
+  is Error => "ea"
+  else => match b
+    is Error => "eb"
+    else =>
+      val n = a.lines().concat(b.lines()).reduce(0, (acc, l) => acc + 1)
+      match n
+        is Error => "drive-error"
+        else => "n=${{n}}"
+print(out)
+"#));
+    let _ = fs::remove_file(&inp);
+    assert_eq!(output, vec!["n=6"]);
+}
+
+// std/iter unification (Stage 3/4): find/some/every terminals over a stream.
+#[test]
+fn test_stream_iter_find_some_every() {
+    let inp = std::env::temp_dir().join(format!("lin_ctest_fse_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&inp);
+    fs::write(&inp, "x\ny\nz").unwrap();
+    let inp_s = inp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines }} from "std/stream"
+import {{ find, some, every }} from "std/iter"
+import {{ length }} from "std/array"
+
+val f = match readStream("{inp_s}")
+  is Error => "e"
+  else => unwrapS(readStream("{inp_s}").lines().find(l => l == "y"))
+val s = match readStream("{inp_s}")
+  is Error => false
+  else => unwrapB(readStream("{inp_s}").lines().some(l => l == "z"))
+val e = match readStream("{inp_s}")
+  is Error => false
+  else => unwrapB(readStream("{inp_s}").lines().every(l => length(l) == 1))
+print("find=${{f}} some=${{s}} every=${{e}}")
+
+val unwrapS = (r: Json): String =>
+  match r
+    is Error => "err"
+    else => r
+val unwrapB = (r: Json): Boolean =>
+  match r
+    is Error => false
+    else => r
+"#));
+    let _ = fs::remove_file(&inp);
+    assert_eq!(output, vec!["find=y some=true every=true"]);
+}
+
+// NON-REGRESSION: the SAME net-new combinators over an ARRAY (not a stream) must stay eager and
+// unchanged — drop/take/flatMap/takeWhile/dropWhile/find/some/every/concat on a plain array.
+#[test]
+fn test_iter_array_combinators_unchanged() {
+    let output = run(r#"import { print } from "std/io"
+import { drop, take, flatMap, takeWhile, dropWhile, find, some, every, concat, reduce } from "std/iter"
+import { length } from "std/array"
+
+val xs = [1, 2, 3, 4, 5]
+print("drop=${length(xs.drop(2))}")        // [3,4,5] -> 3
+print("take=${length(xs.take(2))}")        // [1,2] -> 2
+print("flatMap=${length(xs.flatMap(x => [x, x]))}")  // 10
+print("takeWhile=${length(xs.takeWhile(x => x < 3))}") // [1,2] -> 2
+print("dropWhile=${length(xs.dropWhile(x => x < 3))}") // [3,4,5] -> 3
+print("find=${xs.find(x => x == 4)}")      // 4
+print("some=${xs.some(x => x == 5)}")      // true
+print("every=${xs.every(x => x > 0)}")     // true
+print("concat=${length(xs.concat([6, 7]))}") // 7
+print("reduce=${xs.reduce(0, (a, x) => a + x)}") // 15
+"#);
+    assert_eq!(output, vec![
+        "drop=3", "take=2", "flatMap=10", "takeWhile=2", "dropWhile=3",
+        "find=4", "some=true", "every=true", "concat=7", "reduce=15",
+    ]);
+}
+
+// Stage 6 (streams): affine use-after-move + placement restriction (negative cases).
+#[test]
+fn test_stream_use_after_move_rejected() {
+    let err = run_expect_err(r#"import { readStream, lines, readText } from "std/stream"
+import { writeFile } from "std/fs"
+writeFile("/tmp/lin_uam.txt", "x")
+val s = readStream("/tmp/lin_uam.txt")
+val a = s.lines()
+val b = s.readText()
+"#);
+    assert!(
+        err.contains("used more than once") || err.contains("affine"),
+        "expected a use-after-move error, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_stream_in_var_rejected() {
+    let err = run_expect_err(r#"import { readStream } from "std/stream"
+import { writeFile } from "std/fs"
+writeFile("/tmp/lin_sv.txt", "x")
+var s = readStream("/tmp/lin_sv.txt")
+"#);
+    assert!(
+        err.contains("cannot be stored in a `var`") || err.contains("Stream"),
+        "expected a var-placement error, got:\n{err}"
+    );
+}
+
+#[test]
+fn test_stream_in_object_field_rejected() {
+    let err = run_expect_err(r#"import { readStream } from "std/stream"
+import { writeFile } from "std/fs"
+writeFile("/tmp/lin_so.txt", "x")
+val s = readStream("/tmp/lin_so.txt")
+val o = { "s": s }
+"#);
+    assert!(
+        err.contains("object field") || err.contains("Stream"),
+        "expected an object-field placement error, got:\n{err}"
+    );
+}
+
+// Positive: a stream used exactly once (bound, then consumed by one terminal) type-checks + runs.
+#[test]
+fn test_stream_single_use_ok() {
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_single_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let path = tmp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, readText }} from "std/stream"
+import {{ writeFile }} from "std/fs"
+
+writeFile("{path}", "hello affine")
+val s = readStream("{path}")
+val text = s.readText()
+print(text)
+"#));
+    let _ = fs::remove_file(&tmp);
+    assert_eq!(output, vec!["hello affine"]);
+}
+
+// Stage 8 (streams): `.promise()` drives a pipeline on a WORKER thread; two run concurrently and
+// are awaited. Real cross-thread move (the stream is moved onto each worker). Verifies both
+// outputs are correct (the workers ran the pipelines and closed their fds).
+#[test]
+fn test_stream_promise_concurrent() {
+    let dir = std::env::temp_dir();
+    let in1 = dir.join(format!("lin_ctest_pc_in1_{}.txt", std::process::id()));
+    let in2 = dir.join(format!("lin_ctest_pc_in2_{}.txt", std::process::id()));
+    let out1 = dir.join(format!("lin_ctest_pc_out1_{}.txt", std::process::id()));
+    let out2 = dir.join(format!("lin_ctest_pc_out2_{}.txt", std::process::id()));
+    for p in [&in1, &in2, &out1, &out2] { let _ = fs::remove_file(p); }
+    fs::write(&in1, "a\nb").unwrap();
+    fs::write(&in2, "c\nd").unwrap();
+    // Drive both stream pipelines concurrently with the real `parallel([...])` primitive (each
+    // `.promise()` is an already-spawned worker that moved its stream across the thread boundary;
+    // `parallel` awaits both, preserving order). Exercises the parallel-over-promises path fixed
+    // on master alongside the cross-thread stream move.
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines, writeStream, promise }} from "std/stream"
+import {{ parallel }} from "std/async"
+import {{ readFile }} from "std/fs"
+
+val p1 = readStream("{i1}").lines().writeStream("{o1}").promise()
+val p2 = readStream("{i2}").lines().writeStream("{o2}").promise()
+val results = parallel([p1, p2])
+print(readFile("{o1}"))
+print(readFile("{o2}"))
+"#, i1 = in1.display(), i2 = in2.display(), o1 = out1.display(), o2 = out2.display()));
+    for p in [&in1, &in2, &out1, &out2] { let _ = fs::remove_file(p); }
+    assert_eq!(output, vec!["a", "b", "c", "d"]);
+}
+
+// Stage 8 (streams): a fault inside a transform on a `.promise()` worker is caught at the async
+// boundary and surfaces as an `Error` at `await` (ADR-070 / §32.2.2), NOT a crash.
+#[test]
+fn test_stream_promise_fault_isolation() {
+    let tmp = std::env::temp_dir().join(format!("lin_ctest_pf_{}.txt", std::process::id()));
+    let out = std::env::temp_dir().join(format!("lin_ctest_pfo_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(&out);
+    fs::write(&tmp, "a\nb\nc").unwrap();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines, writeStream, promise }} from "std/stream"
+import {{ map }} from "std/iter"
+import {{ await }} from "std/async"
+
+val boom = (line: Json): Json =>
+  val arr = [1, 2]
+  arr[100]
+
+val p = readStream("{inp}").lines().map(boom).writeStream("{outp}").promise()
+val r = await(p)
+val status = match r
+  is Error => "caught error"
+  else => "ok"
+print(status)
+"#, inp = tmp.display(), outp = out.display()));
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(&out);
+    assert_eq!(output, vec!["caught error"]);
 }
 
 #[test]
@@ -3994,7 +4362,7 @@ print(toString(isOdd(3)))
 #[test]
 fn test_io_lines_reads_all_stdin_lines() {
     let output = run_with_stdin(r#"import { print } from "std/io"
-import { for } from "std/array"
+import { for } from "std/iter"
 import { lines } from "std/io"
 val all = lines()
 all.for(line => print(line))
@@ -4136,7 +4504,7 @@ fn fmt(source: &str) -> String {
 fn test_fmt_idempotent() {
     // Source with varied constructs: if/match/function/objects/arrays/imports/types.
     let source = r#"import { print } from "std/io"
-import { map, filter, reduce, for } from "std/array"
+import { map, filter, reduce, for } from "std/iter"
 import { toString } from "std/string"
 
 type Point = { "x": Int32, "y": Int32 }
@@ -4363,7 +4731,7 @@ fn test_bitwise_boxed_operands() {
     // `.into_int_value()` was called on a pointer value.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { reduce } from "std/array"
+import { reduce } from "std/iter"
 
 print(toString([1, 2, 4, 8].reduce(0, (acc, x) => acc | x)))
 print(toString([15, 7, 3].reduce(255, (acc, x) => acc & x)))
@@ -4430,7 +4798,7 @@ fn test_concrete_rc_cell_reassignment_in_loop() {
     // garbage output). A 5000-iteration loop would corrupt or leak; with the fix it runs
     // cleanly and yields the final value deterministically.
     let output = run(r#"import { print } from "std/io"
-import { for, range } from "std/array"
+import { for, range } from "std/iter"
 import { trim, repeat } from "std/string"
 
 val build = (): String =>
@@ -4451,7 +4819,7 @@ fn test_concrete_rc_global_var_reassignment_in_loop() {
     // Same fix, exercised through the top-level `var` (module-global) path: a concrete-rc
     // global reassigned inside a closure must release its old value and retain the new one.
     let output = run(r#"import { print } from "std/io"
-import { for, range } from "std/array"
+import { for, range } from "std/iter"
 import { repeat } from "std/string"
 
 var acc = "seed"
@@ -4872,7 +5240,7 @@ fn test_json_var_object_reassign_loop_no_uaf() {
     // reassigned to a freshly-allocated OBJECT literal each iteration. Before the owning model
     // (clone-on-store/read, release-old, balanced teardown) the cell aliased a temp object that
     // was freed at closure-scope exit, so the final read saw freed/garbage memory.
-    let out = run(r#"import { range, for } from "std/array"
+    let out = run(r#"import { range, for } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -4887,7 +5255,8 @@ print(toString(acc["v"]))
 fn test_json_var_array_reassign_loop_no_uaf() {
     // Same bug, ARRAY literal variant: a captured `var: Json` reassigned to a fresh array each
     // iteration. A use-after-free here corrupted the length read (or crashed).
-    let out = run(r#"import { range, for, length } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { range, for } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -4906,7 +5275,8 @@ fn test_reduce_minby_maxby_churn_no_double_free() {
     // owning model the accumulator cell owns its own box and never frees the borrowed inputs.
     // 2000 iterations of sum/min/max over churned arrays — a double-free corrupts results or
     // aborts the process.
-    let out = run(r#"import { range, for, map, reduce, minBy, maxBy, length } from "std/array"
+    let out = run(r#"import { minBy, maxBy, length } from "std/array"
+import { range, for, map, reduce } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -4935,7 +5305,7 @@ fn test_generic_combinator_pipeline_inlined() {
     // pipeline `range(0,n).map(x=>x*2).filter(x=>x%3==0).reduce(0,(a,x)=>a+x)` lowers to a fully
     // unboxed flat loop (verified separately: zero per-element box/unbox in `main`). Here we assert
     // the VALUE is correct over a small n so a representation/RC bug in the inliner shows up.
-    let out = run(r#"import { range, map, filter, reduce } from "std/array"
+    let out = run(r#"import { range, map, filter, reduce } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 val total = range(0, 10).map(x => x * 2).filter(x => x % 3 == 0).reduce(0, (a, x) => a + x)
@@ -4951,7 +5321,7 @@ fn test_generic_combinator_inline_vs_closure_paths() {
     // stored/passed `Function` value must keep the (correct, boxed) closure path. Also exercises the
     // tagged String element path and a non-scalar (array) reduce accumulator (the boxed Json-phi
     // path). All four must produce the right values.
-    let out = run(r#"import { map, filter, reduce } from "std/array"
+    let out = run(r#"import { map, filter, reduce } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -4983,7 +5353,8 @@ fn test_concat_fresh_strings_no_use_after_free() {
     // copy now retains; the result owns its elements independently. Uses interpolated (non-interned
     // per-iteration) strings so the elements are genuinely heap-owned and a missing retain faults.
     let out = run(r#"import { print } from "std/io"
-import { concat, range, for, length } from "std/array"
+import { length } from "std/array"
+import { concat, range, for } from "std/iter"
 import { toString } from "std/string"
 val mk = (n: Int32): String => "item-${n}-${n * 13}"
 var acc: String[] = []
@@ -5007,7 +5378,8 @@ fn test_for_callback_json_assign_loop_correct() {
     // discarded return and never the value the cell keeps. Over 5000 iterations a wrong release
     // (double-free / use-after-free) corrupts the final length or aborts. The final array must
     // contain all 5000 appended elements.
-    let out = run(r#"import { range, for, concat, length } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { range, for, concat } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5025,7 +5397,7 @@ fn test_for_callback_side_effect_sum_loop_correct() {
     // each iteration (a fresh, independently-owned box once `s` grows past the small-int cache);
     // the fix releases that discarded box every iteration. Correctness must be unaffected:
     // sum(0..10000) = 10000*9999/2 = 49995000.
-    let out = run(r#"import { range, for } from "std/array"
+    let out = run(r#"import { range, for } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5044,7 +5416,7 @@ fn test_for_element_box_flat_array_churn_correct() {
     // `lin_tagged_free_box_if_distinct` (skipping when the callback returned that very box, e.g.
     // an identity body). Over 50000 iterations correctness must be unaffected: a wrong (double)
     // free would abort or corrupt the accumulator. sum(0..50000) = 50000*49999/2 = 1249975000.
-    let out = run(r#"import { range, for } from "std/array"
+    let out = run(r#"import { range, for } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5063,7 +5435,7 @@ fn test_for_element_box_tagged_array_churn_correct() {
     // read again on every pass. Also covers a callback that PASSES the element to another function
     // (`contains`), proving the shared inner is intact. 20000 passes over the 3-element array; a
     // wrong inner release would free a live string and abort/corrupt the count.
-    let out = run(r#"import { for, range } from "std/array"
+    let out = run(r#"import { for, range } from "std/iter"
 import { contains } from "std/string"
 import { print } from "std/io"
 import { toString } from "std/string"
@@ -5122,7 +5494,8 @@ fn test_concat_preserves_flat_element_type() {
     // TaggedVal bytes and decoded garbage (e.g. 33554432 instead of 2864434397).
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { concat, length } from "std/array"
+import { length } from "std/array"
+import { concat } from "std/iter"
 import { u32FromBe } from "std/bytes"
 
 val a: UInt8[] = [170, 187]
@@ -5500,6 +5873,61 @@ print("code: ${toString(code)}")
     );
 }
 
+// Stage 5 (streams): the unified process-stdout source. `spawn` a child, wrap its piped stdout
+// as a Stream<UInt8[]>, and `readText` the whole output through the stream layer.
+#[test]
+fn test_stream_process_stdout_source() {
+    let out = run(r#"import { spawn } from "std/process"
+import { stdoutStream } from "std/process"
+import { readText } from "std/stream"
+import { print } from "std/io"
+
+val h = spawn("sh", ["-c", "printf 'line1\nline2\n'"])
+val text = stdoutStream(h).readText()
+print(text)
+"#);
+    assert_eq!(out, vec!["line1", "line2"]);
+}
+
+// Stage 5 (streams): the unified stdin source. Feed lines on stdin, read them back through a
+// stdinStream → lines → for pipeline.
+#[test]
+fn test_stream_stdin_source() {
+    let output = run_with_stdin(r#"import { stdinStream } from "std/io"
+import { lines } from "std/stream"
+import { for } from "std/iter"
+import { print } from "std/io"
+
+stdinStream().lines().for(line => print("got: ${line}"))
+"#, "aaa\nbbb\nccc\n");
+    let parts: Vec<&str> = output.lines().collect();
+    assert_eq!(parts, vec!["got: aaa", "got: bbb", "got: ccc"]);
+}
+
+// Stage 5 (streams): the unified TCP source. Loopback connect, send bytes, close the client, and
+// read the server side through a tcpStream → readText. The client close makes the server stream
+// reach EOF, so readText returns the full payload.
+#[test]
+fn test_stream_tcp_source() {
+    let out = run(r#"import { tcpListen, tcpAccept, tcpConnect, tcpSend, tcpClose, tcpStream } from "std/net"
+import { readText } from "std/stream"
+import { print } from "std/io"
+
+val port = 39271
+val listener = tcpListen(port)
+val client = tcpConnect("127.0.0.1", port)
+val accepted = tcpAccept(listener)
+val server = accepted["fd"]
+val payload: UInt8[] = [72, 105, 33]
+tcpSend(client, payload)
+tcpClose(client)
+val text = tcpStream(server).readText()
+print("got: ${text}")
+tcpClose(listener)
+"#);
+    assert_eq!(out, vec!["got: Hi!"]);
+}
+
 #[test]
 fn test_process_wait_exit_code() {
     // `sh -c 'exit 3'` exits with code 3.
@@ -5617,7 +6045,7 @@ fn test_concrete_string_into_json_var_loop() {
     // but never freed the transient shell, leaking ~36 bytes per iteration. The fix frees the
     // shell (FreeBoxShell) after both clones. This asserts correctness: the var must hold the
     // last assigned value and the program must not crash (no use-after-free / double-free).
-    let out = run(r#"import { range, for } from "std/array"
+    let out = run(r#"import { range, for } from "std/iter"
 import { toString } from "std/string"
 import { print } from "std/io"
 
@@ -5633,7 +6061,7 @@ fn test_concrete_object_into_json_var_loop() {
     // Regression companion to the String case: a fresh concrete Object boxed into a Json var
     // each iteration. Exercises the same transient-coercion-box free path with an Object payload
     // and confirms the final stored value is correct.
-    let out = run(r#"import { range, for } from "std/array"
+    let out = run(r#"import { range, for } from "std/iter"
 import { toString } from "std/string"
 import { print } from "std/io"
 
@@ -5726,7 +6154,8 @@ fn test_discarded_map_result_in_loop_correct() {
     // iteration leak. The fix registers union import-fn call results so scope exit tag-releases
     // them. Correctness gate: over 20000 iterations, summing the lengths must stay exact and the
     // process must not abort (a wrong release would double-free the map result). 20000 * 3 = 60000.
-    let out = run(r#"import { range, for, map, length } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { range, for, map } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5747,7 +6176,8 @@ fn test_discarded_filter_result_in_loop_correct() {
     // the source literal or the count. 20000 iterations; each filter keeps the 2 elements > 0
     // (1 and 2 are always > i is false for i>=1, so use a fixed predicate): [1,2,3,4] filtered by
     // x > 2 yields [3,4] every time → 20000 * 2 = 40000.
-    let out = run(r#"import { range, for, filter, length } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { range, for, filter } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5769,7 +6199,8 @@ fn test_map_result_bound_and_returned_from_function() {
     // [..]; r` must return the array at exactly +1 (the read-retain of the trailing expression is
     // released as a redundant extra registration, fixing the return-retain leak). Calling it many
     // times and summing lengths must stay exact.
-    let out = run(r#"import { range, for, map, length } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { range, for, map } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5809,7 +6240,7 @@ print(pluck({ "name": "Alice" }))
     // Projection returned from a map CALLBACK closure, result stored into an array then iterated:
     // each element must be an owned box the array releases exactly once.
     let out = run(r#"import { print } from "std/io"
-import { for, map } from "std/array"
+import { for, map } from "std/iter"
 val records = [{ "name": "Alice" }, { "name": "Bob" }]
 records.map(r => r["name"]).for(n => print(n))
 "#);
@@ -5818,7 +6249,7 @@ records.map(r => r["name"]).for(n => print(n))
     // Nested projection (`r["value"]["name"]`) through a map callback: the inner projection is a
     // transient read, the outer escapes — only the escaping result is cloned.
     let out = run(r#"import { print } from "std/io"
-import { map, for } from "std/array"
+import { map, for } from "std/iter"
 val records = [{ "value": { "name": "Alice" } }, { "value": { "name": "Bob" } }]
 val names = records.map(r => r["value"]["name"])
 names.for(n => print(n))
@@ -5840,7 +6271,7 @@ print(pluck({ "name": "Carol" }))
     // per-call clone is released each iteration; a relapse to the borrowed-return double-free,
     // or a per-iteration over-clone leak, would surface here / under the ASan CI leg).
     let out = run(r#"import { print } from "std/io"
-import { range, for } from "std/array"
+import { range, for } from "std/iter"
 import { toString } from "std/string"
 val pluck = (x: Json): Json => x["v"]
 var c = 0
@@ -5928,7 +6359,7 @@ print(toString(top([1, 2])))
     // re-cloned by the function return) would surface here under the ASan CI leg; functionally
     // it must just run to completion.
     let out = run(r#"import { print } from "std/io"
-import { for, range } from "std/array"
+import { for, range } from "std/iter"
 val mk = (): Json => { "type": "failure", "k": "v" }
 val pick = (i: Int32): Json =>
   val r = mk()
@@ -5956,7 +6387,7 @@ fn object_index_assign_of_callback_param() {
     // Int value via `for` callback param.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { for } from "std/array"
+import { for } from "std/iter"
 [5].for(n =>
   var o = {}
   o["x"] = n
@@ -5968,7 +6399,7 @@ import { for } from "std/array"
     // Int values accumulated via `map` callback, returning the built object.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map } from "std/array"
+import { map } from "std/iter"
 val rs = [5, 6].map(n =>
   var o = {}
   o["x"] = n
@@ -5981,7 +6412,7 @@ print(toString(rs))
     // String value via callback param.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { for } from "std/array"
+import { for } from "std/iter"
 ["hi"].for(s =>
   var o = {}
   o["msg"] = s
@@ -5994,7 +6425,7 @@ import { for } from "std/array"
     // (a boxed string key must be unboxed to a raw LinString*).
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { for } from "std/array"
+import { for } from "std/iter"
 var out = {}
 ["a", "b", "c"].for(k =>
   out[k] = 1
@@ -6006,7 +6437,7 @@ print(toString(out))
     // Churn loop: building an object via index-assign of a callback param across many
     // iterations must not leak (verified under the ASan CI leg); functionally just completes.
     let out = run(r#"import { print } from "std/io"
-import { for, range } from "std/array"
+import { for, range } from "std/iter"
 val main = (): Null =>
   range(0, 2000).for(i =>
     var o = {}
@@ -6032,7 +6463,7 @@ fn eq_boxed_key_projection_is_order_symmetric() {
     // String: boxed-key projection vs literal, both orderings.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { for } from "std/array"
+import { for } from "std/iter"
 val m = { "host": "abc" }
 ["host"].for(k =>
   print(toString(m[k] == "abc"))
@@ -6046,7 +6477,7 @@ val m = { "host": "abc" }
     // Int: boxed-key projection vs literal, both orderings.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { for } from "std/array"
+import { for } from "std/iter"
 val m = { "n": 42 }
 ["n"].for(k =>
   print(toString(m[k] == 42))
@@ -6061,7 +6492,7 @@ val m = { "n": 42 }
     // compared both orderings (and `!=`).
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { for } from "std/array"
+import { for } from "std/iter"
 val sch = { "host": { "type": "string" }, "port": { "type": "number" } }
 ["host", "port"].for(k =>
   print(toString(sch[k]["type"] == "string"))
@@ -6980,7 +7411,8 @@ fn test_borrowed_index_read_write_loops_are_correct() {
     // pq-array access pattern that motivated the optimization.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { arrayAllocateFilled, for } from "std/array"
+import { arrayAllocateFilled } from "std/array"
+import { for } from "std/iter"
 
 var a = arrayAllocateFilled(5, 0)
 // direct index-set writes through the global-var array
@@ -7077,7 +7509,8 @@ fn test_generic_map_intermediate_alloc_int32_is_flat_and_correct() {
     // `val result = lin_array_allocate(n)`, written in a for-loop, returned bare.
     // Monomorphized at U=Int32 it must produce a FLAT array read flat. Before the
     // fix this printed garbage (a tagged producer read through the flat i32 accessor).
-    let out = run(r#"import { length, for as afor } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { for as afor } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
@@ -7108,7 +7541,8 @@ fn test_generic_map_intermediate_alloc_flat_path_in_ir() {
     let bin_path = ws.join(format!("target/lin_test_imap_{}", id));
     let ll_path = bin_path.with_extension("ll");
 
-    fs::write(&src_path, r#"import { length, for as afor } from "std/array"
+    fs::write(&src_path, r#"import { length } from "std/array"
+import { for as afor } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
@@ -7157,7 +7591,8 @@ fn test_generic_map_intermediate_alloc_string_stays_tagged() {
     // The SAME generic map-shape combinator instantiated at U=String (heap element):
     // must stay TAGGED and correct. Proves the intermediate-alloc refinement is gated
     // strictly to flat scalars and never corrupts a heap-element result.
-    let out = run(r#"import { length, for as afor } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { for as afor } from "std/iter"
 import { print } from "std/io"
 val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
   val n = length(arr)
@@ -7179,7 +7614,8 @@ print(tagged[1])
 fn test_generic_map_intermediate_alloc_mixed_instantiations() {
     // The SAME generic instantiated at BOTH Int32 (flat) and String (tagged) in one
     // program — each monomorph picks its own representation; both must be correct.
-    let out = run(r#"import { length, for as afor } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { for as afor } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
@@ -7205,7 +7641,8 @@ print(strs[1])
 fn test_generic_map_intermediate_alloc_json_stays_tagged() {
     // A Json (wildcard) instantiation of the same combinator stays TAGGED and correct —
     // the heterogeneous element representation is preserved.
-    let out = run(r#"import { length, for as afor } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { for as afor } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
@@ -7232,7 +7669,8 @@ fn test_intermediate_alloc_user_annotation_is_respected() {
     // must NOT be re-pinned by the refinement — the explicit annotation wins, so the
     // binding stays tagged and the program is correct under the tagged accessor it uses.
     // Guards the `type_ann.is_some()` bail in intermediate_array_allocate_binding.
-    let out = run(r#"import { length, for as afor } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { for as afor } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 val mymap = <T>(arr: T[]): Json[] =>
@@ -7533,14 +7971,15 @@ fn test_generic_cross_module_higher_order_map() {
     let dir = std::env::temp_dir().join(format!("lin_xgen_map_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(dir.join("helpers.lin"),
-        "import { for, push } from \"std/array\"\n\
+        "import { push } from \"std/array\"\n\
+         import { for } from \"std/iter\"\n\
          export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
            val result = []\n  \
            arr.for(item => push(result, f(item)))\n  \
            result\n").unwrap();
     let main = format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
-import {{ reduce }} from "std/array"
+import {{ reduce }} from "std/iter"
 import {{ mymap }} from "{}/helpers"
 val doubled = mymap([1, 2, 3], x => x * 2)
 print(toString(doubled.reduce(0, (acc, x) => acc + x)))
@@ -7557,14 +7996,16 @@ fn test_generic_cross_module_two_instantiations() {
     let dir = std::env::temp_dir().join(format!("lin_xgen_two_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(dir.join("helpers.lin"),
-        "import { for, push } from \"std/array\"\n\
+        "import { push } from \"std/array\"\n\
+         import { for } from \"std/iter\"\n\
          export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
            val result = []\n  \
            arr.for(item => push(result, f(item)))\n  \
            result\n").unwrap();
     let main = format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
-import {{ reduce, length }} from "std/array"
+import {{ length }} from "std/array"
+import {{ reduce }} from "std/iter"
 import {{ mymap }} from "{}/helpers"
 val ints = mymap([1, 2, 3], x => x * 10)
 val strs = mymap(["a", "b"], s => s)
@@ -7653,7 +8094,8 @@ fn test_generic_import_path_unbound_typevar_is_safe() {
     let dir = std::env::temp_dir().join(format!("lin_gap2_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(dir.join("helpers.lin"),
-        "import { for, push } from \"std/array\"\n\
+        "import { push } from \"std/array\"\n\
+         import { for } from \"std/iter\"\n\
          export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
            val result = []\n  \
            arr.for(item => push(result, f(item)))\n  \
@@ -7662,7 +8104,7 @@ fn test_generic_import_path_unbound_typevar_is_safe() {
            mymap(arr, x => x * 2)\n").unwrap();
     let main = format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
-import {{ reduce }} from "std/array"
+import {{ reduce }} from "std/iter"
 import {{ doubleAll }} from "{}/helpers"
 val r: Json = doubleAll([5, 6, 7])
 print(toString(r.reduce(0, (acc, x) => acc + x)))
@@ -7682,7 +8124,8 @@ fn test_generic_import_path_unbound_typevar_no_garbage_monomorph_in_ir() {
     let dir = ws.join(format!("target/lin_gap2_ir_{}", id));
     let _ = fs::create_dir_all(&dir);
     fs::write(dir.join("helpers.lin"),
-        "import { for, push } from \"std/array\"\n\
+        "import { push } from \"std/array\"\n\
+         import { for } from \"std/iter\"\n\
          export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
            val result = []\n  \
            arr.for(item => push(result, f(item)))\n  \
@@ -7694,7 +8137,7 @@ fn test_generic_import_path_unbound_typevar_no_garbage_monomorph_in_ir() {
     let ll_path = bin_path.with_extension("ll");
     fs::write(&src_path, format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
-import {{ reduce }} from "std/array"
+import {{ reduce }} from "std/iter"
 import {{ doubleAll }} from "{}/helpers"
 val r: Json = doubleAll([5, 6, 7])
 print(toString(r.reduce(0, (acc, x) => acc + x)))
@@ -7767,7 +8210,7 @@ fn test_map_callback_returns_curried_closure_full_apply() {
     // vs arity disambiguation it returned garbage (a pointer reinterpreted as the value).
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map } from "std/array"
+import { map } from "std/iter"
 val thunks = map([5, 6, 7], i => () => i)
 print(toString(thunks[0]()))
 print(toString(thunks[1]()))
@@ -7784,7 +8227,8 @@ fn test_reduce_over_push_built_flat_typed_array_reads_correctly() {
     // back to the tagged read.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { push, reduce } from "std/array"
+import { push } from "std/array"
+import { reduce } from "std/iter"
 val build = (): Int32[] =>
   val result = []
   push(result, 5)
@@ -7803,7 +8247,7 @@ fn test_filter_then_reduce_flat_pipeline_correct() {
     // reduce flat pipeline must produce the right sum and valid IR.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { range, filter, reduce } from "std/array"
+import { range, filter, reduce } from "std/iter"
 val total = range(0, 10).filter(x => x % 2 == 0).reduce(0, (acc, x) => acc + x)
 print(toString(total))
 "#);
@@ -7821,7 +8265,8 @@ fn test_filter_object_array_no_double_free() {
     // usable after the filter. Exercised both as a freshly-built source and re-read afterwards.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { filter, length } from "std/array"
+import { length } from "std/array"
+import { filter } from "std/iter"
 type Item = { "type": String, "v": Int32 }
 val items: Item[] = [
   { "type": "a", "v": 1 },
@@ -7853,7 +8298,8 @@ fn test_combinator_over_non_array_json_is_safe_noop() {
     // (array length, else 0), so iterating a non-array Json is a clean no-op and the result is empty.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { filter, map, reduce, for, length } from "std/array"
+import { length } from "std/array"
+import { filter, map, reduce, for } from "std/iter"
 import { contains } from "std/string"
 val mkObj = (): Json => { "type": "error", "message": "boom" }
 val v = mkObj()
@@ -8004,4 +8450,307 @@ print(x)
     assert!(check_ok, "check should accept the good program:\n{}", check_out);
     assert!(build_ok, "build should accept the good program");
     assert_eq!(check_ok, build_ok, "check and build must agree (accept)");
+}
+
+// -----------------------------------------------------------------------------
+// std/iter unification — Stage 2: receiver-dependent combinator return TYPING.
+//
+// A `std/iter` combinator (`map`/`filter`/`reduce`/`while`) applied to a Stream receiver yields a
+// stream-shaped result (`Stream<U>` / `U | Error` / `Null | Error`), while the same combinator on an
+// array keeps its eager array-shaped result UNCHANGED. These are `lin check`-level assertions: the
+// stream combinator backends do not codegen until Stage 3, so no run tests here. Stream values come
+// from `stdinStream()` (a bare `Stream`, no `| Error` open arm) to keep the receiver concrete.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_iter_stream_map_yields_stream_not_array() {
+    // `stream.map(f)` must type-check AND its result must be a `Stream`, NOT an array: assert via a
+    // `: Stream` annotation (accept) and a `: Int32[]` annotation (reject — the result is a Stream).
+    let ok_src = r#"import { stdinStream } from "std/io"
+import { map } from "std/iter"
+val s: Stream = stdinStream()
+val mapped: Stream = s.map(x => x)
+"#;
+    let (ok, out) = check_source(ok_src);
+    assert!(ok, "stream.map(f) should type-check as a Stream:\n{}", out);
+
+    let bad_src = r#"import { stdinStream } from "std/io"
+import { map } from "std/iter"
+val s: Stream = stdinStream()
+val mapped: Int32[] = s.map(x => x)
+"#;
+    let (ok, out) = check_source(bad_src);
+    assert!(
+        !ok,
+        "stream.map(f) is a Stream, must NOT satisfy an Int32[] annotation:\n{}",
+        out
+    );
+    assert!(
+        out.contains("Stream"),
+        "rejection should mention the Stream result type:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_iter_stream_reduce_and_while_widen_to_error() {
+    // reduce over a stream → `U | Error`; while over a stream → `Null | Error`. Assert the `| Error`
+    // arm is present (accept the union annotation) and absent forms are rejected.
+    // Each terminal consumes its stream (affine resource), so use TWO separate streams — a
+    // single stream cannot feed both `reduce` and `while`.
+    let ok_src = r#"import { stdinStream } from "std/io"
+import { reduce, while } from "std/iter"
+val s1: Stream = stdinStream()
+val r: Int32 | Error = s1.reduce(0, (acc, x) => acc)
+val s2: Stream = stdinStream()
+val w: Null | Error = s2.while(x => true)
+"#;
+    let (ok, out) = check_source(ok_src);
+    assert!(ok, "stream reduce/while should widen to `| Error`:\n{}", out);
+
+    // reduce over a stream is `Int32 | Error`, so a bare `Int32` annotation must be rejected.
+    let bad_src = r#"import { stdinStream } from "std/io"
+import { reduce } from "std/iter"
+val s: Stream = stdinStream()
+val r: Int32 = s.reduce(0, (acc, x) => acc)
+"#;
+    let (ok, out) = check_source(bad_src);
+    assert!(
+        !ok,
+        "stream reduce is `Int32 | Error`, must NOT satisfy a bare `Int32`:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_iter_array_map_still_yields_array_unchanged() {
+    // The HARD GATE: an array receiver keeps the eager `U[]` result. Assert by chaining an
+    // array-only op (`.length()` from std/array) on the map result, and by an explicit `Int32[]`
+    // annotation. A `: Stream` annotation on the array result must be REJECTED.
+    let ok_src = r#"import { print } from "std/io"
+import { range, map } from "std/iter"
+import { length } from "std/array"
+val xs: Int32[] = range(0, 5).map(x => x * 2)
+print(xs.length())
+"#;
+    let (ok, out) = check_source(ok_src);
+    assert!(ok, "array map must still yield an array (chain .length()):\n{}", out);
+
+    let bad_src = r#"import { range, map } from "std/iter"
+val xs: Stream = range(0, 5).map(x => x * 2)
+"#;
+    let (ok, out) = check_source(bad_src);
+    assert!(
+        !ok,
+        "array map yields an array, must NOT satisfy a `: Stream` annotation:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_iter_generic_iterable_mixed_call_sites() {
+    // Verification #3: a USER-DEFINED generic over the Iterable union, called with both an array and
+    // a stream. Its OWN return type is monomorphized ONCE to the eager array shape (a mixed
+    // `Array | Iterator | Stream` param is not DEFINITELY a stream, so the receiver-dependent
+    // re-typing is deliberately suppressed inside the generic body — this is what prevents the
+    // stream return from LEAKING into the generic's array call sites). The array call site therefore
+    // type-checks as an array; the stream call site ALSO returns the array shape (documented Stage-2
+    // limitation — per-call-site stream return needs a direct combinator call, not a user generic).
+    let array_site = r#"import { map } from "std/iter"
+val passthru = <T>(xs: T[] | Iterator | Stream, f: (T) => T) =>
+  xs.map(f)
+val a: Int32[] = passthru([1, 2, 3], x => x)
+"#;
+    let (ok, out) = check_source(array_site);
+    assert!(
+        ok,
+        "array call site of a generic Iterable function must yield an array (no stream leak):\n{}",
+        out
+    );
+
+    // The generic does NOT give a stream call site a Stream return (it is fixed to the array shape):
+    // a `: Stream` annotation on the stream call site is rejected. This documents the boundary.
+    let stream_site = r#"import { stdinStream } from "std/io"
+import { map } from "std/iter"
+val passthru = <T>(xs: T[] | Iterator | Stream, f: (T) => T) =>
+  xs.map(f)
+val s: Stream = stdinStream()
+val b: Stream = passthru(s, x => x)
+"#;
+    let (ok, out) = check_source(stream_site);
+    assert!(
+        !ok,
+        "a user generic's return is monomorphized to the array shape; the stream call site does NOT \
+         produce a Stream (Stage-2 boundary):\n{}",
+        out
+    );
+
+    // A direct (non-generic) combinator call on the same concrete stream DOES yield a Stream.
+    let direct = r#"import { stdinStream } from "std/io"
+import { map } from "std/iter"
+val s: Stream = stdinStream()
+val b: Stream = s.map(x => x)
+"#;
+    let (ok, out) = check_source(direct);
+    assert!(
+        ok,
+        "a direct combinator call on a concrete stream must yield a Stream:\n{}",
+        out
+    );
+}
+
+// -----------------------------------------------------------------------------
+// std/iter unification — Stage 5: affine consume-check re-keyed off the DISPATCH FACT.
+//
+// The use-after-move check no longer keys on a hardcoded name allowlist; it consumes any
+// DEFINITELY-stream argument passed to a call that ROUTES to a stream op (a std/iter combinator
+// dispatched to a stream backend, or a std/stream stream-specific op). This mirrors the IR's
+// `move_streamish_arg` (lin-ir/src/lower.rs) exactly, so the checker and IR cannot diverge. These
+// adversarial programs reuse a stream AFTER it was moved and MUST be rejected; the positives reuse
+// fresh pipeline values / arrays and MUST pass. `stdinStream()` gives a bare concrete `Stream`.
+// -----------------------------------------------------------------------------
+
+#[test]
+fn test_stream_affine_lines_then_reuse_rejected() {
+    // Control (was already caught): `lines` moves the stream; a later `collect` of the same
+    // binding is a use-after-move.
+    let src = r#"import { stdinStream } from "std/io"
+import { lines, collect } from "std/stream"
+val s: Stream = stdinStream()
+val a: Stream = s.lines()
+val b: Json = s.collect()
+"#;
+    let (ok, out) = check_source(src);
+    assert!(!ok, "lines-then-reuse must be rejected:\n{}", out);
+    assert!(
+        out.contains("used after it was consumed"),
+        "rejection should be the affine use-after-move error:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_stream_affine_linesmax_then_reuse_rejected() {
+    // HOLE #1 (was wrongly accepted): `linesMax` was absent from the old allowlist, so the checker
+    // permitted a later `collect` while the IR moved the stream into `linesMax`.
+    let src = r#"import { stdinStream } from "std/io"
+import { linesMax, collect } from "std/stream"
+val s: Stream = stdinStream()
+val a: Stream = s.linesMax(1024)
+val b: Json = s.collect()
+"#;
+    let (ok, out) = check_source(src);
+    assert!(!ok, "linesMax-then-reuse must be rejected:\n{}", out);
+    assert!(
+        out.contains("used after it was consumed"),
+        "rejection should be the affine use-after-move error:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_stream_affine_promise_then_reuse_rejected() {
+    // HOLE #2 (the worst — cross-thread UAF): `promise` MOVES the whole pipeline onto a worker
+    // thread (the worker is its sole owner); a later `collect` on the parent is a cross-thread
+    // use-after-move. `promise` was absent from the old allowlist.
+    let src = r#"import { stdinStream } from "std/io"
+import { lines, writeStream, promise, collect } from "std/stream"
+val s0: Stream = stdinStream()
+val s: Stream = s0.lines().writeStream("out.txt")
+val pr: Json = s.promise()
+val c: Json = s.collect()
+"#;
+    let (ok, out) = check_source(src);
+    assert!(!ok, "promise-then-reuse must be rejected:\n{}", out);
+    assert!(
+        out.contains("used after it was consumed"),
+        "rejection should be the affine use-after-move error:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_stream_affine_close_then_reuse_rejected() {
+    // HOLE #3: `close` ENDS the stream's life (releases the box); a later use is meaningless and
+    // a use-after-free. `close` was absent from the old allowlist (there are NO borrow ops).
+    let src = r#"import { stdinStream } from "std/io"
+import { close, collect } from "std/stream"
+val s: Stream = stdinStream()
+val unit: Null = s.close()
+val c: Json = s.collect()
+"#;
+    let (ok, out) = check_source(src);
+    assert!(!ok, "close-then-reuse must be rejected:\n{}", out);
+    assert!(
+        out.contains("used after it was consumed"),
+        "rejection should be the affine use-after-move error:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_stream_affine_concat_then_reuse_of_either_arg_rejected() {
+    // `concat` takes TWO streams; BOTH are moved into the ConcatSource. Reusing EITHER arg
+    // afterwards is a use-after-move — the per-argument consume rule must mark both, not just arg0.
+    let reuse_second = r#"import { stdinStream } from "std/io"
+import { concat } from "std/iter"
+import { collect } from "std/stream"
+val a: Stream = stdinStream()
+val b: Stream = stdinStream()
+val c: Stream = a.concat(b)
+val reuse: Json = b.collect()
+"#;
+    let (ok, out) = check_source(reuse_second);
+    assert!(!ok, "concat then reuse of the SECOND arg must be rejected:\n{}", out);
+    assert!(
+        out.contains("used after it was consumed"),
+        "rejection should be the affine use-after-move error:\n{}",
+        out
+    );
+
+    let reuse_first = r#"import { stdinStream } from "std/io"
+import { concat } from "std/iter"
+import { collect } from "std/stream"
+val a: Stream = stdinStream()
+val b: Stream = stdinStream()
+val c: Stream = a.concat(b)
+val reuse: Json = a.collect()
+"#;
+    let (ok, out) = check_source(reuse_first);
+    assert!(!ok, "concat then reuse of the FIRST arg must be rejected:\n{}", out);
+    assert!(
+        out.contains("used after it was consumed"),
+        "rejection should be the affine use-after-move error:\n{}",
+        out
+    );
+}
+
+#[test]
+fn test_stream_affine_single_use_chain_and_arrays_unaffected() {
+    // POSITIVE: a single-use pipeline chain passes (each stage consumes the PREVIOUS stage's fresh
+    // value, which is not a reuse of an already-moved binding).
+    let chain = r#"import { stdinStream } from "std/io"
+import { lines, drain } from "std/stream"
+import { map } from "std/iter"
+val s: Stream = stdinStream()
+val r: Null | Error = s.lines().map(x => x).drain()
+"#;
+    let (ok, out) = check_source(chain);
+    assert!(ok, "single-use stream chain must pass:\n{}", out);
+
+    // POSITIVE: arrays/iterators are COMPLETELY unaffected — an array may be reused freely across
+    // any combinator, including concat, with no affine restriction.
+    let arrays = r#"import { print } from "std/io"
+import { map, filter, reduce, concat } from "std/iter"
+import { length } from "std/array"
+val a: Int32[] = [1, 2, 3]
+val b: Int32[] = a.map(x => x + 1)
+val c: Int32[] = a.filter(x => x > 1)
+val d: Int32 = a.reduce(0, (acc, x) => acc + x)
+val e: Int32[] = a.concat([4, 5])
+val f: Int32[] = a.map(x => x * 2)
+print(length(a))
+"#;
+    let (ok, out) = check_source(arrays);
+    assert!(ok, "array combinator chains must be unaffected (free reuse):\n{}", out);
 }

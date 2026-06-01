@@ -29,3 +29,8 @@ export val prompt = (message: String): Json =>
 
 export val exit = (code: Int32): Null =>
   lin_exit(code)
+
+// stdinStream(): wrap the process's standard input as a lazy byte Stream<UInt8[]> (streams
+// brief §4). Reading pulls from stdin until EOF; pair with `lines`/`map`/… from std/stream.
+export val stdinStream = (): Stream =>
+  lin_io_stdin_stream()

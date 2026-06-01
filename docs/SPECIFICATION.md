@@ -1350,7 +1350,7 @@ range(0, 10).for(i =>
 
 ### 18.5 Iterator Functions
 
-The standard iterator functions accept arrays or `Iterator<T>` values and use dot application for fluent chaining.
+The standard iterator functions accept arrays or `Iterator<T>` values and use dot application for fluent chaining. They live in `std/iter` and, when applied to a `Stream` receiver instead, dispatch to a lazy/fallible form (§18.7).
 
 ```txt
 for:    <T>(arr-or-iterator, (T) => Null) => Null
@@ -1387,6 +1387,49 @@ type Iterator<T> = {
 ```
 
 This is not used because JSON-shaped types should describe JSON-shaped data. Iterators are runtime traversal values, not JSON data.
+
+### 18.7 Receiver-Dispatched Combinators
+
+The iterable combinators — `map`, `filter`, `reduce`, `for`, `while`, `take`, `drop`, `flatMap`, `takeWhile`, `dropWhile`, `flatten`, `concat`, `find`, `some`, `every` — and the iterator constructors `range`, `rangeStep`, `iter`, `iterOf` are a **single** vocabulary that works over any iterable source: an array, an `Iterator`, or a `Stream` (§27.9). They live in one module, `std/iter`, and **dispatch on the static type of the receiver** (their first argument, in dot-application terms). This is Lin's first-argument-dispatch model (§4.4) applied to the combinator set.
+
+The same name behaves differently depending on the receiver:
+
+- Over an **array** or `Iterator` the combinator is **eager**: it materialises and returns an array (`U[]`) or a scalar terminal value.
+- Over a **`Stream`** an *adapter* combinator is **lazy**: it returns a new `Stream<U>` node and reads nothing until a terminal drives it; a *terminal* combinator drives the stream on the calling thread and returns its result.
+
+Because a stream read is fallible (§27.9.4), a combinator that **terminates** a stream gains an `| Error` arm:
+
+```txt
+                          Array / Iterator        Stream<T>
+map(f)                    U[]                     Stream<U>            (lazy adapter)
+filter(p)                 T[]                     Stream<T>            (lazy adapter)
+take(n) / drop(n)         T[]                     Stream<T>            (lazy adapter)
+flatMap / take|dropWhile  ...[]                   Stream<...>          (lazy adapter)
+flatten / concat          Json[]                  Stream               (lazy adapter)
+for(f)                    Null                    Null | Error         (terminal)
+while(p)                  Null                    Null | Error         (terminal)
+reduce(init, f)           U                       U | Error            (terminal)
+find(p)                   T | Null                T | Null | Error     (terminal)
+some(p) / every(p)        Boolean                 Boolean | Error      (terminal)
+```
+
+The dispatch is a closed, type-directed special-case over this fixed name set, not general function overloading. The precedent is `for` (§18.1), which already returns `Null` over an array and `Null | Error` over a stream. One import gives a single fluent chain that runs eagerly over an array and lazily, with bounded memory, over a stream:
+
+```txt
+import { map, drop, take, reduce } from "std/iter"
+import { readStream } from "std/stream"
+
+val total = readStream("data.csv")
+  .lines()                                   // Stream<String>
+  .drop(1)                                   // Stream<String>  (lazy)
+  .take(4)                                   // Stream<String>  (lazy)
+  .map(line => line.length())                // Stream<Int32>
+  .reduce(0, (acc, n) => acc + n)            // Int32 | Error  (terminal)
+```
+
+The combinators are **not** dual-exported: each name has exactly one home (`std/iter`). The array-shaped operations that genuinely require a materialised, indexable, ordered array — `push`, `slice`, `set`, `at`, `length`, `reverse`, `sort`/`sortBy`, `zip`, `unique`, `chunk`, `compact`, `partition`, `sum`/`product`/`min`/`max`, etc. — stay in `std/array`; `std/stream` exports only stream-specific sources, sinks, and terminals (`readStream`/`writeStream`/`drain`/`collect`/`readText`/`promise`/`close`/`lines`/`chunks`).
+
+Receiver dispatch fires at a **concrete** combinator call whose receiver is statically a `Stream`. A stream passed through a user-defined generic `Iterable` parameter (a `T[] | Iterator | Stream` union) and combined inside that function stays **array-shaped**: the lazy form is forgone there, which is the safe resolution (the eager path is always correct). Streams are also affine resources (§27.9.5): a combinator that routes to the stream backend **consumes** (moves) the stream, so a stream chain is single-use. See ADR-077.
 
 ## 19. Tagged Unions
 
@@ -2332,7 +2375,127 @@ sleepMicros: (n: Int64) => Null
 waitSignal: (sig: Int32) => Int32           // block until the signal is delivered
 ```
 
-### 27.9 What Is Deliberately Absent
+### 27.9 Streams
+
+A `Stream<T>` is an opaque runtime value (§18, §28) representing a **lazy, effectful, fallible sequence** of values pulled from an OS resource. It is a sibling of `Iterator<T>` but a distinct type: an iterator is a pure, restartable description built from side-effect-free state functions (§18.2), whereas a stream owns an fd, advances a read position with each pull, and can fail mid-traversal. For that reason a stream is **not** modelled as an iterator, and its protocol is private (it is not JSON, and not subscriptable). See ADR-076.
+
+`Stream<T>` is covariant in `T`. The conceptual notation `Stream<T>` is a resolvable type name in `val`/parameter/return annotations (subject to the placement restriction in §27.9.5).
+
+#### 27.9.1 The Pull Graph and Push Sink Model
+
+A stream is built as a **lazy pull graph**. A *source* node is at the root (a file, socket, subprocess, or stdin); each *adapter* (`lines`, `chunks`, `map`, `filter`, `take`) wraps an upstream stream and transforms items as they are pulled. Nothing is read until a **terminal** operation drives the graph. A `writeStream` builds a **push sink** node: pulling the sink pulls one item from upstream and writes it to the destination, so the whole pipeline runs one item at a time with bounded memory.
+
+```txt
+readStream("in.csv")        // source:  Stream<UInt8[]>
+  .lines()                  // adapter: Stream<String>
+  .map(transform)           // adapter: Stream<String>
+  .filter(removeEmptyLines) // adapter: Stream<String>
+  .writeStream("out.csv")   // sink node (a Stream whose terminal writes upstream items)
+  .drain()                  // terminal: drive on this thread -> Null | Error
+```
+
+Errors are threaded **in-band** through the graph: a read error poisons the upstream, and every downstream adapter becomes a passthrough, so the first error short-circuits straight to the terminal op without an `is Error` check at every step. This is the §20 value-based error convention applied to the lazy graph (ADR-076).
+
+#### 27.9.2 Unified Sources
+
+File, TCP, subprocess-stdout, and stdin are all **byte streams** — `Stream<UInt8[]>` — each supplying a different read backend. Bytes are fundamental; line- and text-oriented views are adapters.
+
+```txt
+readStream:        (path: String)        => Stream<UInt8[]>   // std/stream
+tcpStream:         (fd: Int32)           => Stream<UInt8[]>   // std/net
+stdoutStream:      (h: ProcessHandle)    => Stream<UInt8[]>   // std/process
+stdinStream:       ()                    => Stream<UInt8[]>   // std/io
+```
+
+A would-block / EOF condition ends the stream normally; a hard read failure ends it with an `Error` (the exact ending is source-kind-dependent, §27.9.4).
+
+#### 27.9.3 Adapters
+
+Adapters are lazy: they return a new `Stream` and read nothing until driven.
+
+```txt
+lines:   (Stream<UInt8[]>)               => Stream<String>    // split byte stream into lines
+chunks:  (Stream<UInt8[]>, n: Int32)     => Stream<UInt8[]>   // re-chunk to n-byte windows
+map:     <T, U>(Stream<T>, (T) => U)        => Stream<U>
+filter:  <T>(Stream<T>, (T) => Boolean)     => Stream<T>
+take:    <T>(Stream<T>, n: Int32)           => Stream<T>      // first n items then end
+```
+
+`lines`/`chunks` are stream-specific adapters (`std/stream`). The transform combinators `map`/`filter`/`take`/`drop`/`flatMap`/`takeWhile`/`dropWhile`/`flatten`/`concat` shown here are **not** stream-only: they are the unified `std/iter` combinators (§18.7), which return a lazy `Stream` node when their receiver is a stream and an eager array otherwise. Their callbacks use the same dot-application and lambda forms as over an array (§18.5); they are pure transforms over each item, run one at a time as items are pulled (effects such as printing are allowed).
+
+#### 27.9.4 Terminal Operations
+
+A terminal operation drives the pull graph. There are synchronous reads, a `for`-consumer, and two pipeline drivers.
+
+```txt
+readText: (Stream<UInt8[]>)              => String | Error    // drain a byte stream to one String
+collect:  (Stream<UInt8[]>)              => UInt8[] | Error    // drain to one byte buffer
+for:      <T>(Stream<T>, (T) => Null)       => Null | Error    // consume each item (dot form .for(fn))
+drain:    (Stream<T>)                    => Null | Error       // run a sink pipeline on this thread
+promise:  (Stream<T>)                    => Promise<Null | Error>  // run on a worker thread
+```
+
+**`.for(fn)`** consumes a stream item by item (Lin has no `for…in`; iteration is always `.for(fn)`, §18). It returns **`Null | Error`** — not `Null` like an array `for` (§18.1) — because driving a stream can end two ways: **EOF ends the loop normally** (the expression is `Null`), and **a read `Error` mid-traversal becomes the expression's value**.
+
+```txt
+val outcome = readStream("in.log").lines().for(line =>
+  print(line)
+)
+match outcome
+  is Error => print("read failed: ${outcome["message"]}")
+  else     => null
+```
+
+**`.drain()`** drives a sink pipeline (typically ending in a `writeStream`) on the **calling thread** and returns `Null | Error`. It uses no new runtime machinery — it is the synchronous driver.
+
+**`.promise()`** **moves** the whole pipeline onto a **worker OS thread** (ADR-075 move-transfer) and returns `Promise<Null | Error>`. This gives real concurrency and **fault isolation**: a runtime fault while the worker drives the stream is caught at the thread boundary and surfaces as an `Error` when the promise is awaited, exactly as for any `async` thunk (§24.2.2). Awaiting follows the usual rule — the result is `Null | Error` and the `Error` case must be handled (§24.2.2, ADR-070).
+
+```txt
+val p = readStream("big.log")
+  .lines()
+  .filter(isError)
+  .writeStream("errors.log")
+  .promise()
+match await(p)
+  is Error => print("pipeline failed")
+  else     => print("done")
+```
+
+Because the pipeline is moved (not copied) and the worker becomes its sole owner, the worker's RC-drop finalizer closes the fd — no value is shared across threads, so non-atomic refcounting stays sound (§28, ADR-075).
+
+#### 27.9.5 Affine Semantics and Lifetime
+
+A `Stream<T>` is an **affine resource** (use-at-most-once; ADR-075):
+
+- **Single use.** A stream is consumed by passing it as an argument, returning it, or applying a terminal op. Using a stream again after it has been consumed (or moved to a worker by `.promise()`) is a **compile-time error** (`use of moved value`).
+- **Dropping is fine.** A stream that is never consumed is **not** an error — its fd is closed deterministically by the **RC-drop finalizer** when the last reference goes away (§28, ADR-076). Building a stream and never driving it is almost certainly a mistake, so the checker emits a **warning** (`stream is never consumed`), but it does not block compilation.
+- **Explicit close.** `close(s)` (`std/stream`) closes the fd eagerly and is **idempotent**; it is for callers who want deterministic timing rather than scope-end cleanup.
+- **Placement restriction (v1).** A `Stream` value may live only in a `val` binding, a function parameter, or a return position. It may **not** be stored in an object field, an array element, or a `var`. This is a deliberately narrow v1 rule (it keeps the use-after-move check confined to local single-name bindings) and is relaxable later. Storing a stream in a container or `var` is a compile-time error.
+
+#### 27.9.6 Worked Example
+
+A streaming CSV transform — quote each field and re-join with `|`, dropping blank lines — running line by line with bounded memory:
+
+```txt
+import { readStream, lines, writeStream, drain } from "std/stream"
+import { map, filter } from "std/iter"
+
+val transform = (line: String): String =>
+  line.split(",").map(f => "\"${f}\"").join("|")   // a,b,c -> "a"|"b"|"c"
+
+val removeEmptyLines = (line: String): Boolean =>
+  !line.isBlank()
+
+val run = (): Null | Error =>
+  readStream("in.csv")
+    .lines()
+    .map(transform)
+    .filter(removeEmptyLines)
+    .writeStream("out.csv")
+    .drain()
+```
+
+### 27.10 What Is Deliberately Absent
 
 Two systems facilities are **not** provided as core primitives, by design:
 

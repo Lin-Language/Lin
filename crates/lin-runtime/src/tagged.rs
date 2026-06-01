@@ -53,6 +53,14 @@ pub const TAG_HANDLE: u8 = 17;
 /// through `lin_shared_retain`/`lin_shared_release`. The thread-transfer copy path shares it by
 /// an atomic bump rather than deep-copying through it (the nesting rule).
 pub const TAG_SHARED: u8 = 18;
+/// `Stream<T>` box — payload is a `*const StreamBox` (an opaque, refcounted, OS-resource-owning
+/// pull-source, streams brief / ADR-072). Like `Shared`, its refcount is held inside the box and
+/// accessed through the tag-aware retain/release path (`lin_stream_retain_box`/
+/// `lin_stream_release_box`); the release path's final drop runs the auto-close FINALIZER that
+/// closes the fd if it was not explicitly closed. A boxed stream round-trips through TypeVar
+/// slots like any tagged value, but the placement restriction (Stage 6) keeps it out of
+/// arrays/objects/`var`, and it crosses threads only by MOVE (CAP_MOVE, Stage 7), never by copy.
+pub const TAG_STREAM: u8 = 19;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -507,6 +515,7 @@ pub unsafe extern "C" fn lin_tagged_release(p: *mut u8) {
         TAG_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
         TAG_OBJECT => crate::object::lin_object_release(payload as *mut crate::object::LinObject),
         TAG_SHARED => crate::shared::lin_shared_release_box(payload as *const u8),
+        TAG_STREAM => crate::stream::lin_stream_release_box(payload as *const u8),
         _ => {} // Scalars (null, bool, int, float) have no heap payload.
     }
     // Cached scalar boxes (small ints, bools) are immutable statics — never free them.

@@ -62,25 +62,35 @@ impl Checker {
             Type::func(vec![Type::Object(IndexMap::new()), Type::Str, Type::TypeVar(u32::MAX)], Type::Null),
         );
 
-        // for: (Iterable<T>, (T) => Json) => Null  — callback return type is ignored
+        // for: (Iterable<T>, (T) => Json) => Null  — callback return type is ignored. A `Stream<T>`
+        // is ALSO accepted as the iterable (streams brief §3): a stream `for` is driven by the
+        // runtime (the IR lowerer branches on the Stream type → `lin_stream_for`), ends normally
+        // at EOF, and a read Error becomes the for-expr's value. The declared result stays `Null`
+        // so the array/iterator `for` wrappers (`: Null`) are unchanged; std/stream's `for` wrapper
+        // widens its OWN declared return to `Null | Error` to surface the stream error arm.
         self.define_intrinsic(
             "lin_for",
             Type::func(vec![
                     Type::Union(vec![
                         Type::Array(Box::new(Type::TypeVar(9010))),
                         Type::Iterator(Box::new(Type::TypeVar(9010))),
+                        Type::Stream(Box::new(Type::TypeVar(9010))),
                     ]),
                     Type::func(vec![Type::TypeVar(9010)], Type::TypeVar(u32::MAX)),
                 ], Type::Null),
         );
 
-        // while: (Array<T> | Iterator<T>, (T) => Boolean) => Null
+        // while: (Array<T> | Iterator<T> | Stream<T>, (T) => Boolean) => Null
+        // Streamish receiver accepted (std/iter unification Stage 2): the array/iterator return
+        // stays `Null`; the std/iter `while` wrapper's call-site result is widened to `Null | Error`
+        // by `streamish_combinator_ret` when arg0 is a stream (the read Error becomes the result).
         self.define_intrinsic(
             "lin_while",
             Type::func(vec![
                     Type::Union(vec![
                         Type::Array(Box::new(Type::TypeVar(9011))),
                         Type::Iterator(Box::new(Type::TypeVar(9011))),
+                        Type::Stream(Box::new(Type::TypeVar(9011))),
                     ]),
                     Type::func(vec![Type::TypeVar(9011)], Type::Bool),
                 ], Type::Null),
@@ -103,40 +113,44 @@ impl Checker {
             Type::func(vec![Type::Int32, Type::Int32], Type::Iterator(Box::new(Type::Int32))),
         );
 
-        // map: (Iterable<T>, (T) => U) => U[]
-        // The lowering MATERIALIZES a concrete array (flat for scalar U, tagged otherwise), so the
-        // return type is `U[]` — the stdlib `map` thin wrapper declares the same, and callers chain
-        // `.filter`/`.reduce`/index on it as an array.
+        // map: (Iterable<T>, (T) => U) => U[]   (Iterable = Array | Iterator | Stream)
+        // For Array/Iterator the lowering MATERIALIZES a concrete array (flat for scalar U, tagged
+        // otherwise), so the declared return is `U[]`. A `Stream<T>` receiver is also accepted (std/
+        // iter unification Stage 2): the call-site result is then re-typed to `Stream<U>` by
+        // `streamish_combinator_ret` (lazy adapter — codegen lands in Stage 3).
         self.define_intrinsic(
             "lin_map",
             Type::func(vec![
                     Type::Union(vec![
                         Type::Array(Box::new(Type::TypeVar(9030))),
                         Type::Iterator(Box::new(Type::TypeVar(9030))),
+                        Type::Stream(Box::new(Type::TypeVar(9030))),
                     ]),
                     Type::func(vec![Type::TypeVar(9030)], Type::TypeVar(9031)),
                 ], Type::Array(Box::new(Type::TypeVar(9031)))),
         );
 
-        // filter: (Iterable<T>, (T) => Boolean) => T[]
+        // filter: (Iterable<T>, (T) => Boolean) => T[]   (Stream receiver → Stream<T> at call site)
         self.define_intrinsic(
             "lin_filter",
             Type::func(vec![
                     Type::Union(vec![
                         Type::Array(Box::new(Type::TypeVar(9040))),
                         Type::Iterator(Box::new(Type::TypeVar(9040))),
+                        Type::Stream(Box::new(Type::TypeVar(9040))),
                     ]),
                     Type::func(vec![Type::TypeVar(9040)], Type::Bool),
                 ], Type::Array(Box::new(Type::TypeVar(9040)))),
         );
 
-        // reduce: (Iterable<T>, U, (U, T) => U) => U
+        // reduce: (Iterable<T>, U, (U, T) => U) => U   (Stream receiver → U | Error at call site)
         self.define_intrinsic(
             "lin_reduce",
             Type::func(vec![
                     Type::Union(vec![
                         Type::Array(Box::new(Type::TypeVar(9050))),
                         Type::Iterator(Box::new(Type::TypeVar(9050))),
+                        Type::Stream(Box::new(Type::TypeVar(9050))),
                     ]),
                     Type::TypeVar(9051),
                     Type::func(vec![Type::TypeVar(9051), Type::TypeVar(9050)], Type::TypeVar(9051)),
@@ -206,6 +220,111 @@ impl Checker {
         self.define_intrinsic("lin_message", Type::func(vec![Type::TypeVar(9109), Type::TypeVar(9107)], Type::Null));
         // worker.close(): (Worker) => Null
         self.define_intrinsic("lin_close", Type::func(vec![Type::TypeVar(9109)], Type::Null));
+
+        // Stream<T> — opaque, effectful, fallible pull-source (streams brief, ADR-072). These
+        // intrinsic signatures are the SOLE source of a `Stream<T>` type: `Stream` is not
+        // spellable in source annotations (no `resolve.rs` case), so stdlib wrappers obtain it by
+        // inference from these returns. Reading yields `T | Null | Error` (Null = EOF, the
+        // fallible-stdlib error shape on I/O failure); opening yields `Stream<UInt8[]> | Error`.
+        //   openRead: (String) => Stream<UInt8[]> | Error
+        //   read:     <T>(Stream<T>) => T | Null | Error
+        //   close:    <T>(Stream<T>) => Null
+        let byte_chunk = || Type::Array(Box::new(Type::UInt8));
+        self.define_intrinsic("lin_fs_open", Type::func(vec![Type::Str],
+            Type::Union(vec![Type::Stream(Box::new(byte_chunk())), crate::resolve::error_type()])));
+        let stream_t = || Type::TypeVar(9160);
+        self.define_intrinsic("lin_stream_read", Type::func(vec![Type::Stream(Box::new(stream_t()))],
+            Type::Union(vec![stream_t(), Type::Null, crate::resolve::error_type()])));
+        self.define_intrinsic("lin_stream_close",
+            Type::func(vec![Type::Stream(Box::new(Type::TypeVar(9161)))], Type::Null));
+
+        // Lazy adapters (Stage 4). Transform closures operate on BOXED items (Json-in/Json-out)
+        // so the runtime can call them uniformly regardless of the concrete item type — stream
+        // items (UInt8[] chunks, String lines, …) are all JSON-compatible. Each adapter returns a
+        // fresh `Stream` (= Stream<Json>); the opaque Stream type confines ops to this API.
+        let any_stream = || Type::Stream(Box::new(Type::TypeVar(u32::MAX)));
+        self.define_intrinsic("lin_stream_map", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::TypeVar(u32::MAX)),
+            ], any_stream()));
+        self.define_intrinsic("lin_stream_filter", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::Bool),
+            ], any_stream()));
+        self.define_intrinsic("lin_stream_take",
+            Type::func(vec![any_stream(), Type::Int32], any_stream()));
+        // Net-new lazy adapters (Stage 3): drop(s, n); takeWhile/dropWhile(s, p); flatMap(s, f);
+        // flatten(s); concat(a, b) — all return a fresh Stream. Closures operate on boxed Json.
+        self.define_intrinsic("lin_stream_drop",
+            Type::func(vec![any_stream(), Type::Int32], any_stream()));
+        self.define_intrinsic("lin_stream_take_while", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::Bool),
+            ], any_stream()));
+        self.define_intrinsic("lin_stream_drop_while", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::Bool),
+            ], any_stream()));
+        self.define_intrinsic("lin_stream_flat_map", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::TypeVar(u32::MAX)),
+            ], any_stream()));
+        self.define_intrinsic("lin_stream_flatten",
+            Type::func(vec![any_stream()], any_stream()));
+        self.define_intrinsic("lin_stream_concat",
+            Type::func(vec![any_stream(), any_stream()], any_stream()));
+        // Net-new terminals (Stage 4): reduce → U | Error; find → T | Null | Error; some/every →
+        // Boolean | Error; while → Null | Error. All consume + close the stream.
+        self.define_intrinsic("lin_stream_reduce", Type::func(vec![
+                any_stream(),
+                Type::TypeVar(u32::MAX),
+                Type::func(vec![Type::TypeVar(u32::MAX), Type::TypeVar(u32::MAX)], Type::TypeVar(u32::MAX)),
+            ], Type::TypeVar(u32::MAX)));
+        self.define_intrinsic("lin_stream_find", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::Bool),
+            ], Type::Union(vec![Type::TypeVar(u32::MAX), Type::Null, crate::resolve::error_type()])));
+        self.define_intrinsic("lin_stream_some", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::Bool),
+            ], Type::Union(vec![Type::Bool, crate::resolve::error_type()])));
+        self.define_intrinsic("lin_stream_every", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::Bool),
+            ], Type::Union(vec![Type::Bool, crate::resolve::error_type()])));
+        self.define_intrinsic("lin_stream_while", Type::func(vec![
+                any_stream(),
+                Type::func(vec![Type::TypeVar(u32::MAX)], Type::Bool),
+            ], Type::Union(vec![Type::Null, crate::resolve::error_type()])));
+        // lines(s, maxBytes): maxBytes ≤ 0 selects the default per-line cap; a positive value sets
+        // an explicit bound. Stdlib exposes `lines(s)` (default) and `linesMax(s, n)` over this.
+        self.define_intrinsic("lin_stream_lines",
+            Type::func(vec![any_stream(), Type::Int32], any_stream()));
+        self.define_intrinsic("lin_stream_chunks",
+            Type::func(vec![any_stream(), Type::Int32], any_stream()));
+        // Sink + terminals. writeStream → a sink Stream; drain → Null|Error; collect → UInt8[]|
+        // Error; readText → String|Error. All terminals consume + close the stream.
+        self.define_intrinsic("lin_stream_write",
+            Type::func(vec![any_stream(), Type::Str], any_stream()));
+        self.define_intrinsic("lin_stream_drain",
+            Type::func(vec![any_stream()], Type::Union(vec![Type::Null, crate::resolve::error_type()])));
+        self.define_intrinsic("lin_stream_collect",
+            Type::func(vec![any_stream()], Type::Union(vec![Type::Array(Box::new(Type::UInt8)), crate::resolve::error_type()])));
+        self.define_intrinsic("lin_stream_read_text",
+            Type::func(vec![any_stream()], Type::Union(vec![Type::Str, crate::resolve::error_type()])));
+
+        // Unified OS sources (Stage 5): each yields a Stream<UInt8[]> over a different backend.
+        // tcpStream(fd) / stdoutStream(handle) take an integer fd/handle; stdinStream() is nullary.
+        let byte_stream = || Type::Stream(Box::new(Type::Array(Box::new(Type::UInt8))));
+        self.define_intrinsic("lin_net_tcp_stream", Type::func(vec![Type::Int32], byte_stream()));
+        self.define_intrinsic("lin_process_stdout_stream", Type::func(vec![Type::Int64], byte_stream()));
+        self.define_intrinsic("lin_io_stdin_stream", Type::func(vec![], byte_stream()));
+
+        // promise(s): (Stream) => Promise<Null | Error> (Stage 8). The promise handle round-trips
+        // as a Json/TypeVar value (TAG_PROMISE), like every other promise; `await` then yields the
+        // `Null | Error` result. Typed `Json` result so it flows through await/parallel uniformly.
+        self.define_intrinsic("lin_stream_promise",
+            Type::func(vec![any_stream()], Type::TypeVar(u32::MAX)));
 
         // serve: ((Request) => Response, Int32) => Null  (spec §25.5). Handler-first so
         // `router.serve(port)` desugars to `serve(router, port)`. Blocks forever; typed Null.

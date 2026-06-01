@@ -8,7 +8,8 @@
 // parser and the renderer stay independent and each block is a plain data record.
 
 import { split, join, startsWith, contains, replaceAll, trim, substring, indexOf, toLower } from "std/string"
-import { for, append, concat, length } from "std/array"
+import { append, length } from "std/array"
+import { for, concat } from "std/iter"
 
 // ---------------------------------------------------------------------------
 // Inline formatting (applied at render time to heading/paragraph/list/quote text)
