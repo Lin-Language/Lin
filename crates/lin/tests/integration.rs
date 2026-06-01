@@ -4334,7 +4334,9 @@ fn test_fmt_rule5a_trailing_lambda() {
     let source = "val t = test(\"evaluates a single number\", () => [expect(valueOf(\"forty-two-ish\")).toBe(42), expect(valueOf(\"seventy-seven\")).toBe(77)])\n";
     let out = fmt(source);
     assert!(out.contains("test(\"evaluates a single number\", () => [\n"), "Rule 5a `() => [` not kept together:\n{}", out);
-    assert!(out.contains("\n  expect(valueOf(\"forty-two-ish\")).toBe(42),\n  expect(valueOf(\"seventy-seven\")).toBe(77)\n])"), "Rule 5a body/close not laid out:\n{}", out);
+    // Rule i: the last arg is a lambda whose body renders multi-line, so the call's closing `)`
+    // is on its OWN line, dedented to the call indent (the `]` is at the lambda-body indent).
+    assert!(out.contains("\n  expect(valueOf(\"forty-two-ish\")).toBe(42),\n  expect(valueOf(\"seventy-seven\")).toBe(77)\n]\n)"), "Rule 5a body/close not laid out:\n{}", out);
     assert_eq!(out, fmt(&out), "Rule 5a not idempotent:\n{}", out);
 }
 
@@ -4360,6 +4362,74 @@ fn test_fmt_rule6_comment_hoist() {
     assert!(out.contains("() => [\n"), "Rule 6 `() => [` not collapsed:\n{}", out);
     assert_eq!(out.matches("//").count(), 1, "Rule 6 comment count changed:\n{}", out);
     assert_eq!(out, fmt(&out), "Rule 6 not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rulei_iii_test_array_full_target() {
+    // Full target for the three test-suite-array rules combined: comment hoisted above the
+    // first test (Rule ii), closing `)` on its own line (Rule i), and a blank line between the
+    // two consecutive `test(...)` elements (Rule iii). The short second test stays inline.
+    let source = "import { test, expect, toBe, suite } from \"std/test\"\nval s = suite(\"bits\", [\n  test(\"plain bitwise operators\", () =>\n    // --- Plain bitwise operators ---\n    [\n      expect(12 & 10).toBe(8),\n      expect(12 | 10).toBe(14),\n      expect(255 >> 4).toBe(15)\n    ]),\n  test(\"UInt8 flat array holds 0..255 unboxed\", () => [expect(1).toBe(1)])\n])\n";
+    let out = fmt(source);
+    let expected = "import { test, expect, toBe, suite } from \"std/test\"\nval s = suite(\"bits\", [\n  // --- Plain bitwise operators ---\n  test(\"plain bitwise operators\", () =>\n    [\n      expect(12 & 10).toBe(8),\n      expect(12 | 10).toBe(14),\n      expect(255 >> 4).toBe(15)\n    ]\n  ),\n\n  test(\"UInt8 flat array holds 0..255 unboxed\", () => [expect(1).toBe(1)])\n])\n";
+    assert_eq!(out, expected, "full target mismatch:\n{}", out);
+    assert_eq!(out.matches("//").count(), 1, "comment count changed:\n{}", out);
+    assert_eq!(out, fmt(&out), "not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rulei_close_paren_own_line() {
+    // Rule i: a call whose last arg is a lambda with a multi-line body puts the call's closing
+    // `)` on its own line, dedented to the call indent (the `]` stays at the body indent). This
+    // is a statement-level call, so Rule 6 collapses `() => [` (the body stays attached); Rule i
+    // only moves the closing `)`.
+    let source = "val t = test(\"plain bitwise operators\", () =>\n  [\n    expect(valueOf(\"forty-two-ish\")).toBe(42),\n    expect(valueOf(\"seventy-seven\")).toBe(77)\n  ])\n";
+    let out = fmt(source);
+    let expected = "val t = test(\"plain bitwise operators\", () => [\n  expect(valueOf(\"forty-two-ish\")).toBe(42),\n  expect(valueOf(\"seventy-seven\")).toBe(77)\n]\n)\n";
+    assert_eq!(out, expected, "Rule i close-paren layout wrong:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule i not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rulei_single_line_lambda_keeps_paren_glued() {
+    // Rule i scope: a single-line lambda arg (body does NOT span multiple lines) keeps the `)`
+    // glued — the close-paren-on-own-line rule applies only to multi-line lambda bodies.
+    let source = "val t = test(\"name\", () => [expect(1).toBe(1)])\n";
+    let out = fmt(source);
+    assert_eq!(out, "val t = test(\"name\", () => [expect(1).toBe(1)])\n", "single-line lambda `)` not glued:\n{}", out);
+    assert_eq!(out, fmt(&out), "not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rulei_comment_in_array_hoist() {
+    // Rule ii: a comment between a lambda's `=>` and its array body, where the lambda is the
+    // last arg of a `test(...)` array element, hoists to a leading comment of that element.
+    let source = "val s = suite(\"bitwise behaviour\", [\n  test(\"plain bitwise operators\", () =>\n    // note A\n    [\n      expect(120000 & 100000).toBe(34464),\n      expect(255000 >> 4).toBe(15937)\n    ])\n])\n";
+    let out = fmt(source);
+    assert!(out.contains("  // note A\n  test(\"plain bitwise operators\", () =>\n"), "Rule ii comment not hoisted above element:\n{}", out);
+    assert_eq!(out.matches("//").count(), 1, "Rule ii comment count changed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule ii not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleiii_blank_between_test_elements() {
+    // Rule iii: exactly one blank line between two consecutive `test(...)` array elements,
+    // even when the source had none. Idempotent (a second pass adds no further blank).
+    let source = "val s = suite(\"x\", [\n  test(\"alpha case\", () =>\n    [\n      expect(120000 & 100000).toBe(34464),\n      expect(255000 >> 4).toBe(15937)\n    ]),\n  test(\"beta case\", () =>\n    [\n      expect(120000 | 100000).toBe(185536),\n      expect(4 << 8).toBe(1024)\n    ])\n])\n";
+    let out = fmt(source);
+    assert!(out.contains("  ),\n\n  test(\"beta case\""), "Rule iii blank not injected between tests:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule iii not idempotent:\n{}", out);
+    // No double blank on a re-sweep.
+    assert!(!out.contains("\n\n\n"), "Rule iii produced a double blank:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleiii_non_test_array_gets_no_blank() {
+    // Rule iii scope: a non-`test` call array gets NO blank line injected between elements.
+    let source = "val xs = [\n  foo(\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", () =>\n    [\n      aaaaaaaaaaaaaaa(1),\n      bbbbbbbbbbbbbbb(2)\n    ]),\n  foo(\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", () =>\n    [\n      ccccccccccccccc(3),\n      ddddddddddddddd(4)\n    ])\n]\n";
+    let out = fmt(source);
+    assert!(!out.contains("\n\n"), "non-test array got a blank line injected:\n{}", out);
+    assert_eq!(out, fmt(&out), "non-test array not idempotent:\n{}", out);
 }
 
 #[test]
