@@ -3,7 +3,13 @@ use crate::ast::*;
 use super::Parser;
 
 impl Parser {
-    pub(crate) fn parse_match_arm(&mut self) -> MatchArm {
+    /// Parse one match arm. `arm_col`, when set, is the offside column of the match's arms
+    /// (inline / inside-parens mode, where ADR-004 suppresses Indent/Dedent). The arm body is
+    /// then parsed as a column-delimited block whose exclusive floor is `arm_col - 1`: a
+    /// multi-statement arm body stays together, but the next arm — aligned at `arm_col` — ends
+    /// it, and a statement dedented below the arm column ends the whole match. `None` means the
+    /// arms are an Indent/Dedent block (top-level), where the body uses the existing logic.
+    pub(crate) fn parse_match_arm(&mut self, arm_col: Option<u32>) -> MatchArm {
         let span = self.current_span();
         let pattern = match self.peek_kind() {
             TokenKind::Is => {
@@ -35,6 +41,18 @@ impl Parser {
         self.skip_newlines();
         let body = if self.check(TokenKind::Indent) {
             self.parse_block()
+        } else if let Some(ac) = arm_col {
+            // Inline / inside-parens arm: column-delimited block whose EXCLUSIVE floor is the arm
+            // column itself. Continuation statements of a multi-statement body are indented past
+            // `ac` (kept); the next arm (aligned at `ac`) and any dedent to/below `ac` end this
+            // body. The arm head (`has 1 => ...`) shares the arm column, so it correctly ends the
+            // previous arm's body rather than being swallowed into it. `match_arm_floor` makes a
+            // following `is`/`has` at <= `ac` read as the next arm, not an infix test on the body.
+            let prev_floor = self.match_arm_floor;
+            self.match_arm_floor = Some(ac);
+            let body = self.parse_branch_block(ac);
+            self.match_arm_floor = prev_floor;
+            body
         } else {
             self.parse_expr()
         };
