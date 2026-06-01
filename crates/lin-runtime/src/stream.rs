@@ -567,6 +567,9 @@ struct LinesSource {
     up: Upstream,
     buf: Vec<u8>,
     upstream_done: bool,
+    /// Cap on a single partial line before failing in-band (see `MAX_LINE_BYTES`). Configurable
+    /// via `linesMax(s, n)`; `lines(s)` uses the default.
+    max_line_bytes: usize,
 }
 impl LinesSource {
     /// Pop the next complete line from `buf` (up to and including a `\n`), returning the line
@@ -606,11 +609,12 @@ impl StreamSource for LinesSource {
                     crate::tagged::lin_tagged_release(item);
                     // Bound the partial-line buffer: a stream with no newline must not grow an
                     // unbounded allocation. Fail in-band once a single line exceeds the cap.
-                    if self.buf.len() > MAX_LINE_BYTES {
+                    if self.buf.len() > self.max_line_bytes {
+                        let cap = self.max_line_bytes;
                         self.buf.clear();
                         return TaggedOutcome::Err(format!(
                             "lines(): a single line exceeded {} bytes without a newline — refusing to buffer unbounded input",
-                            MAX_LINE_BYTES
+                            cap
                         ));
                     }
                 }
@@ -853,9 +857,11 @@ pub unsafe extern "C" fn lin_stream_take(s: *const u8, n: i64) -> *mut u8 {
 
 /// `lines(s)` → a `Stream<String>` of newline-delimited lines over the byte stream `s`.
 #[no_mangle]
-pub unsafe extern "C" fn lin_stream_lines(s: *const u8) -> *mut u8 {
+pub unsafe extern "C" fn lin_stream_lines(s: *const u8, max_bytes: i64) -> *mut u8 {
     let up = own_upstream(s);
-    StreamBox::new_boxed(Box::new(LinesSource { up, buf: Vec::new(), upstream_done: false }))
+    // `max_bytes <= 0` selects the default cap; a positive value sets an explicit per-line bound.
+    let max_line_bytes = if max_bytes > 0 { max_bytes as usize } else { MAX_LINE_BYTES };
+    StreamBox::new_boxed(Box::new(LinesSource { up, buf: Vec::new(), upstream_done: false, max_line_bytes }))
 }
 
 /// `chunks(s, n)` → a `Stream<UInt8[]>` re-chunked to `n` bytes per item.
@@ -1193,7 +1199,7 @@ mod tests {
         unsafe {
             let cc = Arc::new(AtomicUsize::new(0));
             let src = make(vec![b"one\ntwo\n".to_vec(), b"three".to_vec()], cc.clone(), None);
-            let lines = lin_stream_lines(src as *const u8);
+            let lines = lin_stream_lines(src as *const u8, 0);
             // Pull lines: "one", "two", "three", then EOF.
             for expected in ["one", "two", "three"] {
                 match pull_tagged(unwrap_stream(lines)) {
@@ -1222,11 +1228,14 @@ mod tests {
     fn lines_adapter_caps_unbounded_line() {
         unsafe {
             let cc = Arc::new(AtomicUsize::new(0));
-            let chunk = vec![b'x'; 1024 * 1024]; // 1 MiB, no newline
-            let n_chunks = MAX_LINE_BYTES / chunk.len() + 2; // enough to cross the cap
+            // Use a small EXPLICIT cap (1 KiB) so the test is fast and also exercises the
+            // configurable `linesMax`/`lin_stream_lines(s, n)` path, not just the 64 MiB default.
+            let cap = 1024i64;
+            let chunk = vec![b'x'; 512]; // 512 B, no newline
+            let n_chunks = (cap as usize / chunk.len()) + 4; // enough to cross the cap
             let chunks: Vec<Vec<u8>> = (0..n_chunks).map(|_| chunk.clone()).collect();
             let src = make(chunks, cc.clone(), None);
-            let lines = lin_stream_lines(src as *const u8);
+            let lines = lin_stream_lines(src as *const u8, cap);
             // Driving the adapter must surface an Err once the line buffer exceeds the cap,
             // rather than buffering the whole stream.
             let mut saw_err = false;
@@ -1300,7 +1309,7 @@ mod tests {
             let cc = Arc::new(AtomicUsize::new(0));
             // Fail on the 2nd read; collect must short-circuit to an Error object.
             let src = make(vec![b"x".to_vec()], cc.clone(), Some(1));
-            let lines = lin_stream_lines(src as *const u8);
+            let lines = lin_stream_lines(src as *const u8, 0);
             crate::tagged::lin_tagged_release(src);
             let r = lin_stream_collect(lines as *const u8);
             assert_eq!(crate::tagged::lin_get_tag(r), crate::tagged::TAG_OBJECT, "error object");

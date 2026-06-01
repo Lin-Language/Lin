@@ -245,8 +245,10 @@ impl Checker {
             ], any_stream()));
         self.define_intrinsic("lin_stream_take",
             Type::func(vec![any_stream(), Type::Int32], any_stream()));
+        // lines(s, maxBytes): maxBytes ≤ 0 selects the default per-line cap; a positive value sets
+        // an explicit bound. Stdlib exposes `lines(s)` (default) and `linesMax(s, n)` over this.
         self.define_intrinsic("lin_stream_lines",
-            Type::func(vec![any_stream()], any_stream()));
+            Type::func(vec![any_stream(), Type::Int32], any_stream()));
         self.define_intrinsic("lin_stream_chunks",
             Type::func(vec![any_stream(), Type::Int32], any_stream()));
         // Sink + terminals. writeStream → a sink Stream; drain → Null|Error; collect → UInt8[]|

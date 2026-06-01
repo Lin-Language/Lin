@@ -559,21 +559,22 @@ impl<'ctx> Codegen<'ctx> {
                 let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                 self.builder.call(fnv, &[s.into(), func.into()], "ir_stream_adapt").try_as_basic_value().unwrap_basic()
             }
-            Intrinsic::StreamTake | Intrinsic::StreamChunks => {
+            Intrinsic::StreamTake | Intrinsic::StreamChunks | Intrinsic::StreamLines => {
+                // All three take (stream, i64): take→count, chunks→size, lines→max line bytes
+                // (≤0 selects the default cap). A one-arg `lines(s)` call lowers `n` to 0 here.
                 let i64_ty = self.context.i64_type();
                 let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let n = args.get(1).copied().unwrap_or_else(|| i64_ty.const_zero().into());
                 let n_i64 = if n.is_int_value() {
                     self.builder.int_s_extend_or_bit_cast(n.into_int_value(), i64_ty, "ir_stream_n")
                 } else { i64_ty.const_zero() };
-                let name = if matches!(intrinsic, Intrinsic::StreamTake) { "lin_stream_take" } else { "lin_stream_chunks" };
+                let name = match intrinsic {
+                    Intrinsic::StreamTake => "lin_stream_take",
+                    Intrinsic::StreamChunks => "lin_stream_chunks",
+                    _ => "lin_stream_lines",
+                };
                 let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
-                self.builder.call(fnv, &[s.into(), n_i64.into()], "ir_stream_take_chunks").try_as_basic_value().unwrap_basic()
-            }
-            Intrinsic::StreamLines => {
-                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
-                let fnv = self.get_or_declare_fn("lin_stream_lines", ptr_ty.fn_type(&[ptr_ty.into()], false));
-                self.builder.call(fnv, &[s.into()], "ir_stream_lines").try_as_basic_value().unwrap_basic()
+                self.builder.call(fnv, &[s.into(), n_i64.into()], "ir_stream_take_chunks_lines").try_as_basic_value().unwrap_basic()
             }
             Intrinsic::StreamWrite => {
                 let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
