@@ -3,6 +3,13 @@ use lin_lex::TokenKind;
 use crate::ast::*;
 use super::Parser;
 
+/// True when `LIN_FMT_ALLOW_TRAILING_COMMA` is set — an escape hatch so `lin fmt` can parse
+/// legacy files that still contain literal trailing commas and rewrite them away. Normal
+/// compilation leaves it unset, so trailing commas in array/object literals stay an error.
+fn allow_trailing_comma() -> bool {
+    std::env::var_os("LIN_FMT_ALLOW_TRAILING_COMMA").is_some()
+}
+
 impl Parser {
     pub(crate) fn parse_expr(&mut self) -> Expr {
         self.parse_or_expr()
@@ -591,7 +598,20 @@ impl Parser {
                 fields.push(ObjectField::Pair(key, value));
             }
             if self.check(TokenKind::Comma) {
+                let comma_span = self.current_span();
                 self.advance();
+                self.skip_newlines();
+                // A comma immediately before the closing `}` is a trailing comma, which is
+                // not allowed in object literals (the formatter never emits one). Function
+                // calls still accept `f(x,)` for partial application — that's parse_call_args.
+                // LIN_FMT_ALLOW_TRAILING_COMMA lets `lin fmt` read legacy files that still
+                // contain trailing commas so it can strip them; normal compilation rejects.
+                if self.check(TokenKind::RBrace) && !allow_trailing_comma() {
+                    self.diagnostics.push(Diagnostic::error(
+                        comma_span,
+                        "trailing comma is not allowed in object literals".to_string(),
+                    ));
+                }
             }
             self.skip_newlines();
         }
@@ -607,7 +627,17 @@ impl Parser {
         while !self.check(TokenKind::RBracket) && !self.is_at_end() {
             elements.push(self.parse_expr());
             if self.check(TokenKind::Comma) {
+                let comma_span = self.current_span();
                 self.advance();
+                self.skip_newlines();
+                // A comma immediately before the closing `]` is a trailing comma, which is
+                // not allowed in array literals (the formatter never emits one).
+                if self.check(TokenKind::RBracket) && !allow_trailing_comma() {
+                    self.diagnostics.push(Diagnostic::error(
+                        comma_span,
+                        "trailing comma is not allowed in array literals".to_string(),
+                    ));
+                }
             }
             self.skip_newlines();
         }

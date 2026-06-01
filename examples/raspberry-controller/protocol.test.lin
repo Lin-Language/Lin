@@ -10,7 +10,6 @@ import { length } from "std/array"
 // exactly like Rust `parse_packet` returning `(f64, f64)`. The values used
 // (1.0, -1.0, 0.0, 0.5, 0.25) are all exact in f32, so they survive the
 // f32 round-trip and widen to exact Float64, making == comparison safe.
-
 val s = suite("raspberry-protocol", [
   // parse_forward
   test("parsePacket forward = [1, 1]", () => [
@@ -54,7 +53,7 @@ val s = suite("raspberry-protocol", [
     expect(encodePacket(0.0, 0.0)[0]).toBe(0),
     expect(encodePacket(0.0, 0.0)[3]).toBe(0),
     expect(encodePacket(0.0, 0.0)[7]).toBe(0)
-  ]),
+  ])
 ])
 
 run(s)

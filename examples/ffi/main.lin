@@ -12,7 +12,6 @@
 // Rebuild the C archive after editing mathlib.c:
 //   cc -c examples/ffi/mathlib.c -o examples/ffi/mathlib.o
 //   ar rcs examples/ffi/libmathlib.a examples/ffi/mathlib.o
-
 import { print } from "std/io"
 import { toString } from "std/string"
 

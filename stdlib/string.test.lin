@@ -4,7 +4,7 @@ import { map } from "std/iter"
 
 val s = suite("std/string", [
   test("toString of int", () => [
-    expect((42).toString()).toBe("42")
+    expect(42.toString()).toBe("42")
   ]),
 
   test("toString of null", () => [
@@ -108,12 +108,14 @@ val s = suite("std/string", [
 
   test("split result iterates as strings (not null)", () =>
     // Regression: split elements were tagged TAG_NULL, so generic map/for read them as null.
-    val wrapped = "a,b,c".split(",").map(s => "<${s}>").join("|")
+    val wrapped = "a,b,c"
+      .split(",")
+      .map(s => "<${s}>")
+      .join("|")
     [
       expect(wrapped).toBe("<a>|<b>|<c>")
     ]
   ),
-
 
   test("join joins with separator", () =>
     val result = ["a", "b", "c"].join("-")
@@ -221,7 +223,7 @@ val s = suite("std/string", [
       expect(viaToString).toBe("a,b,c"),
       expect(joined).toBe("a,b,c")
     ]
-  ),
+  )
 ])
 
 run(s)

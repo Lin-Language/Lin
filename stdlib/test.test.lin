@@ -117,17 +117,14 @@ val s = suite("std/test", [
       expect(err).toSatisfy(r => r has { "type": "failure", error })
     ]
   ),
-
   // withFixture injects the fixture into the body and runs setup/teardown around it. These two
   // entries each fire setup once and teardown once; the meta-test below asserts the counts.
-  withFixture(fxSetup, fxTeardown, "withFixture injects the fixture", (db) => [
+  withFixture(fxSetup, fxTeardown, "withFixture injects the fixture", db => [
     expect(db["conn"]).toBe(7)
   ]),
-
-  withFixture(fxSetup, fxTeardown, "withFixture runs again independently", (db) => [
+  withFixture(fxSetup, fxTeardown, "withFixture runs again independently", db => [
     expect(db["conn"]).toBe(7)
   ]),
-
   // Eager evaluation: the two withFixture entries above already ran (the tests array is built
   // before this entry), so setup and teardown have each fired exactly twice.
   test("withFixture ran setup and teardown for each use", () => [
@@ -139,11 +136,12 @@ val s = suite("std/test", [
   // block for guaranteed afterAll teardown. A two-pass / one-fail suite reports 1.
   test("report returns the failure count without exiting", () =>
     val sub = suite("sub", [
-      test("ok", () => [ expect(1).toBe(1) ]),
-      test("bad", () => [ expect(1).toBe(2) ])
+      test("ok", () => [expect(1).toBe(1)]),
+
+      test("bad", () => [expect(1).toBe(2)])
     ])
-    [ expect(report(sub)).toBe(1) ]
-  ),
+    [expect(report(sub)).toBe(1)]
+  )
 ])
 
 run(s)

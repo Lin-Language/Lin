@@ -2399,7 +2399,7 @@ val show = (o): Null =>
   print(toString(o["a"] + o["b"]))
 show({
   "a": 1,
-  "b": 2,
+  "b": 2
 })
 "#);
     assert_eq!(output, vec!["3"]);
@@ -4695,6 +4695,167 @@ fn fmt(source: &str) -> String {
     lin_parse::Formatter::with_comments(source, comments).format_module(&module)
 }
 
+// ── Formatter must never change program meaning ───────────────────────────────
+// The formatter rebuilds source from the AST, which discards parentheses and the
+// generic `<T>` list. If it doesn't re-emit them correctly the formatted code can
+// silently MISCOMPILE (wrong operator precedence) or fail to compile (lost generics).
+// These guard the specific defects found when first sweeping the stdlib, plus a
+// general "format then run produces identical output" equivalence check.
+
+#[test]
+fn test_fmt_preserves_grouping_parens() {
+    // `(a + b) / c` must keep its parens — `/` binds tighter than `+`, so dropping
+    // them changes the value. Author-written parens are PRESERVED (we never strip a
+    // grouping the author wrote, even when precedence makes it redundant — it reads worse
+    // stripped, e.g. `(a / b) * c`), and parens are never ADDED where the author had none.
+    assert_eq!(fmt("val x = (1 + 2) / 3\n").trim(), "val x = (1 + 2) / 3");
+    assert_eq!(fmt("val x = (1 + 2 - 1) / 4\n").trim(), "val x = (1 + 2 - 1) / 4");
+    assert_eq!(fmt("val x = a - (b - c)\n").trim(), "val x = a - (b - c)");
+    // Author parens preserved even when redundant; none added when absent.
+    assert_eq!(fmt("val x = (a - b) - c\n").trim(), "val x = (a - b) - c");
+    assert_eq!(fmt("val x = a - b - c\n").trim(), "val x = a - b - c");
+    assert_eq!(fmt("val x = (a || b) && c\n").trim(), "val x = (a || b) && c");
+    // And it must actually still evaluate correctly end-to-end.
+    let out = run("import { print } from \"std/io\"\nimport { toString } from \"std/string\"\nval r = (1 + 2) / 3\nprint(toString(r))\n");
+    assert_eq!(out, vec!["1"], "( 1 + 2 ) / 3 should be 1, not 1 + (2/3) = 1");
+}
+
+#[test]
+fn test_fmt_implicit_else_null_omitted() {
+    // A statement-position `if` with an IMPLICIT null else drops the `else null`; an
+    // author-written `else null` is kept (it may signal intent).
+    assert_eq!(
+        fmt("val f = (d: Int32): Null =>\n  if d < INF then total = total + d\n").trim(),
+        "val f = (d: Int32): Null =>\n  if d < INF then total = total + d"
+    );
+    assert_eq!(
+        fmt("val g = (d: Int32): Null =>\n  if d < INF then total = total + d else null\n").trim(),
+        "val g = (d: Int32): Null =>\n  if d < INF then total = total + d else null"
+    );
+    // The `if` as the TAIL of a multi-statement lambda body is also statement position — an
+    // implicit null else there is dropped too (regression: it came back when the body is a block).
+    let block_tail = fmt("val h = arr.for(item =>\n  val keep = f(item)\n  if keep then push(result, item)\n)\n");
+    assert!(!block_tail.contains("else null"), "implicit else null re-added on block tail:\n{}", block_tail);
+    assert_eq!(block_tail, fmt(&block_tail), "not idempotent:\n{}", block_tail);
+}
+
+#[test]
+fn test_fmt_array_element_trailing_comment() {
+    // A trailing comment on a single-line array element stays trailing (after its comma); it is
+    // NOT demoted to a leading comment on the next line. An own-line comment before an element
+    // stays leading.
+    let src = "val a = [\n  expect(x).toBe(1), // note\n  expect(y).toBe(2)\n]\n";
+    let out = fmt(src);
+    assert!(out.contains("expect(x).toBe(1), // note"), "array-element trailing comment demoted:\n{}", out);
+    assert_eq!(out, fmt(&out), "not idempotent:\n{}", out);
+    // Own-line comment before an element stays leading.
+    let lead = fmt("val b = [\n  // group\n  expect(x).toBe(1),\n  expect(y).toBe(2)\n]\n");
+    assert!(lead.contains("  // group\n  expect(x).toBe(1)"), "own-line array comment changed:\n{}", lead);
+}
+
+#[test]
+fn test_fmt_preserves_author_multiline_literals() {
+    // A literal the author broke across lines stays multi-line (never rolled up); an author-
+    // inline literal stays inline (never rolled out).
+    let ml = "val a = [\n  expect(valueOf(ok(numNode(42)))).toBe(42)\n]\n";
+    assert_eq!(fmt(ml), ml, "author-multilined single-item array rolled up:\n{}", fmt(ml));
+    let inline = "val b = [1, 2, 3]\n";
+    assert_eq!(fmt(inline), inline, "inline array changed:\n{}", fmt(inline));
+}
+
+#[test]
+fn test_fmt_multi_call_array_multiline() {
+    // A multi-element array whose elements contain calls renders multi-line (packing several
+    // calls on one line reads poorly). A single-call array and a plain-literal array stay inline.
+    let out = fmt("val a = [expect(x).toBe(1), expect(y).toBe(2)]\n");
+    assert!(out.contains("[\n  expect(x).toBe(1),\n  expect(y).toBe(2)\n]"), "multi-call array not multiline:\n{}", out);
+    assert_eq!(fmt("val b = [expect(x).toBe(1)]\n").trim(), "val b = [expect(x).toBe(1)]");
+    assert_eq!(fmt("val c = [1, 2, 3]\n").trim(), "val c = [1, 2, 3]");
+    assert_eq!(out, fmt(&out), "not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_bare_lambda_in_arg_position() {
+    // A single-ident / wildcard, type-less lambda is bare in ARGUMENT position, parenthesised
+    // elsewhere (round-trip safe — bare doesn't parse on a `val` RHS).
+    assert_eq!(fmt("val x = items.map(i => i + 1)\n").trim(), "val x = items.map(i => i + 1)");
+    assert_eq!(fmt("val x = items.for(_ => g())\n").trim(), "val x = items.for(_ => g())");
+    assert_eq!(fmt("val f = (x) => x + 1\n").trim(), "val f = (x) => x + 1");
+    // A single-call chain whose lambda arg is multi-line stays unsplit (receiver.method(...) on
+    // one line); the multi-line lambda body flows beneath.
+    let chain = fmt("val x = nodes.for(_ =>\n  set(adj, ai, [])\n  ai = ai + 1\n)\n");
+    assert!(chain.contains("val x = nodes.for(_ =>"), "single-call chain split or lambda parenthesised:\n{}", chain);
+    assert_eq!(chain, fmt(&chain), "chain not idempotent:\n{}", chain);
+}
+
+#[test]
+fn test_fmt_preserves_postfix_base_parens() {
+    // A binary-op (or other non-primary) used as a postfix base must stay parenthesised:
+    // postfix `.`/`[]`/`()` bind tighter than binary operators.
+    assert_eq!(fmt("val a = (x + y).foo()\n").trim(), "val a = (x + y).foo()");
+    assert_eq!(fmt("val b = (x + y)[0]\n").trim(), "val b = (x + y)[0]");
+    assert_eq!(fmt("val c = (f + g)(3)\n").trim(), "val c = (f + g)(3)");
+    // Atomic / chain bases keep NO parens. (Lambda params are always parenthesised for
+    // round-trip safety — ADR-007 / d6e7bdb.)
+    assert_eq!(fmt("val d = arr.map(x => x).length()\n").trim(), "val d = arr.map(x => x).length()");
+}
+
+#[test]
+fn test_fmt_preserves_radix_literals() {
+    // The lexer discards the radix (stores only the value), so the formatter recovers the
+    // original 0x/0b/0o spelling from source — flattening 0x0F to 15 would lose intent.
+    assert_eq!(fmt("val m = 0x0F\n").trim(), "val m = 0x0F");
+    assert_eq!(fmt("val m = 0xFF\n").trim(), "val m = 0xFF");
+    assert_eq!(fmt("val b = 0b1010\n").trim(), "val b = 0b1010");
+    assert_eq!(fmt("val o = 0o17\n").trim(), "val o = 0o17");
+    // Decimal stays decimal; suffix, digit separators, and a negated hex literal preserved.
+    assert_eq!(fmt("val d = 15\n").trim(), "val d = 15");
+    assert_eq!(fmt("val s = 0xFFu8\n").trim(), "val s = 0xFFu8");
+    assert_eq!(fmt("val g = 0xDEAD_BEEF\n").trim(), "val g = 0xDEAD_BEEF");
+    assert_eq!(fmt("val n = -0x10\n").trim(), "val n = -0x10");
+    // The motivating case: hex preserved AND the author's grouping parens preserved.
+    assert_eq!(
+        fmt("val packNibbles = (high: Int32, low: Int32): Int32 =>\n  (high << 4) | (low & 0x0F)\n").trim(),
+        "val packNibbles = (high: Int32, low: Int32): Int32 =>\n  (high << 4) | (low & 0x0F)"
+    );
+    // Idempotent.
+    assert_eq!(fmt("val m = 0x0F\n"), fmt(&fmt("val m = 0x0F\n")));
+}
+
+#[test]
+fn test_fmt_preserves_generic_type_params() {
+    // The `<T, U>` list is not in the surface text the parser keeps as tokens — the
+    // formatter must re-emit it from `Expr::Function::type_params` or the body's T/U
+    // become "Unknown type". This is exactly what broke stdlib `map`/`filter`/`reduce`.
+    assert_eq!(
+        fmt("val map = <T, U>(arr: T[], f: (T) => U): U[] => lin_map(arr, f)\n").trim(),
+        "val map = <T, U>(arr: T[], f: (T) => U): U[] => lin_map(arr, f)"
+    );
+    assert_eq!(
+        fmt("val id = <T>(x: T): T => x\n").trim(),
+        "val id = <T>(x: T): T => x"
+    );
+}
+
+#[test]
+fn test_fmt_run_equivalence() {
+    // The strongest guard: formatting must not change runtime behaviour. Compile+run a
+    // program with precedence-sensitive arithmetic and a generic call both before and
+    // after formatting; the output must be identical.
+    let source = "import { print } from \"std/io\"\n\
+import { toString } from \"std/string\"\n\
+import { map, reduce, range } from \"std/iter\"\n\
+val poly = (n: Int32): Int32 => (n + 1) * (n - 1) / 2\n\
+val doubled = <T>(xs: T[], f: (T) => T): T[] => xs.map(f)\n\
+val xs = range(1, 5).map(i => poly(i))\n\
+val total = xs.reduce(0, (a, x) => a + x)\n\
+print(toString(total))\n";
+    let formatted = fmt(source);
+    let before = run(source);
+    let after = run(&formatted);
+    assert_eq!(before, after, "formatting changed program output\nformatted:\n{}", formatted);
+}
+
 #[test]
 fn test_fmt_idempotent() {
     // Source with varied constructs: if/match/function/objects/arrays/imports/types.
@@ -4819,6 +4980,381 @@ val classify = (n: Int32): String =>
     }
 }
 
+#[test]
+fn test_fmt_rule1_chain_threshold() {
+    // Rule 1: a chain with MORE than CHAIN_INLINE_MAX (2) calls is always multiline,
+    // regardless of length. 4 calls → one `.method(...)` per line.
+    let source = "import { range, map, filter, reduce } from \"std/array\"\nval total = range(0, n).map(x => x * 2).filter(x => x % 3 == 0).reduce(0, (acc, x) => acc + x)\n";
+    let out = fmt(source);
+    let expected = "val total = range(0, n)\n  .map(x => x * 2)\n  .filter(x => x % 3 == 0)\n  .reduce(0, (acc, x) => acc + x)";
+    assert!(out.contains(expected), "Rule 1 chain not multiline:\n{}", out);
+    // A 2-call chain still stays inline.
+    let two = fmt("import { range, map } from \"std/array\"\nval a = range(0, n).map(x => x)\n");
+    assert!(two.contains("val a = range(0, n).map(x => x)"), "2-call chain should stay inline:\n{}", two);
+    assert_eq!(out, fmt(&out), "Rule 1 not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rule2_preserve_blank_lines() {
+    // Rule 2: a source blank between two statements is preserved; adjacent statements
+    // stay tight (no auto-injected blank); runs of 2+ blanks collapse to one.
+    let adjacent = "import { print } from \"std/io\"\nimport { toString } from \"std/string\"\n";
+    let out = fmt(adjacent);
+    assert_eq!(out, "import { print } from \"std/io\"\nimport { toString } from \"std/string\"\n", "adjacent imports must stay tight:\n{:?}", out);
+
+    let with_blank = "val a = 1\n\nval b = 2\n";
+    assert_eq!(fmt(with_blank), "val a = 1\n\nval b = 2\n", "source blank not preserved");
+
+    let many_blanks = "val a = 1\n\n\n\nval b = 2\n";
+    assert_eq!(fmt(many_blanks), "val a = 1\n\nval b = 2\n", "blank run not collapsed to one");
+
+    let no_blank = "val a = 1\nval b = 2\n";
+    assert_eq!(fmt(no_blank), "val a = 1\nval b = 2\n", "blank auto-injected between adjacent vals");
+
+    assert_eq!(fmt(with_blank), fmt(&fmt(with_blank)), "Rule 2 not idempotent");
+}
+
+#[test]
+fn test_fmt_rule3_no_trailing_commas() {
+    // Rule 3 (formatter half): multiline array/object literals have NO trailing comma.
+    let arr = "val xs = [1000000000, 2000000000, 3000000000, 4000000000, 5000000000, 6000000000]\n";
+    let out = fmt(arr);
+    assert!(out.contains('\n'), "array should be multiline:\n{}", out);
+    assert!(!out.contains(",\n]"), "trailing comma before ]:\n{}", out);
+    let obj = "val o = { \"aaaaaaaaaaaaaaaaaaaaaaa\": 1, \"bbbbbbbbbbbbbbbbbbbbbbb\": 2, \"ccccccccccccccccccc\": 3 }\n";
+    let out2 = fmt(obj);
+    assert!(out2.contains('\n'), "object should be multiline:\n{}", out2);
+    assert!(!out2.contains(",\n}"), "trailing comma before }}:\n{}", out2);
+    assert_eq!(out, fmt(&out), "Rule 3 array not idempotent");
+    assert_eq!(out2, fmt(&out2), "Rule 3 object not idempotent");
+}
+
+#[test]
+fn test_fmt_rule4_recursive_multiline() {
+    // Author-intent layout: a nested literal the AUTHOR broke across lines stays multi-line; a
+    // nested literal the author wrote INLINE stays inline (we never roll a multi-line literal up,
+    // and never roll an author-inline one out). Here the author broke every level → fully nested.
+    let source = "val node = {\n  \"node\": {\n    \"kind\": \"num\",\n    \"value\": tokens[pos][\"text\"].parseInt32()\n  },\n  \"pos\": pos + 1\n}\n";
+    let out = fmt(source);
+    assert_eq!(out, source, "author-multilined nested object not preserved:\n{}", out);
+    assert_eq!(out, fmt(&out), "not idempotent:\n{}", out);
+
+    // Author wrote the inner object INLINE inside a multi-line outer array → inner stays inline.
+    let mixed = "val fields = [\n  { \"tag\": 1, \"bytes\": [72, 105] },\n  { \"tag\": 2, \"bytes\": [255, 0, 128] }\n]\n";
+    let mout = fmt(mixed);
+    assert_eq!(mout, mixed, "author-inline inner literals not preserved:\n{}", mout);
+    assert_eq!(mout, fmt(&mout), "mixed not idempotent:\n{}", mout);
+}
+
+#[test]
+fn test_fmt_rule5a_trailing_lambda() {
+    // Rule 5a: a call whose last arg is a multiline lambda with an array body keeps
+    // `() => [` together on the call line; earlier short args stay inline. The array body
+    // has two elements so it genuinely renders multiline.
+    let source = "val t = test(\"evaluates a single number\", () => [expect(valueOf(\"forty-two-ish\")).toBe(42), expect(valueOf(\"seventy-seven\")).toBe(77)])\n";
+    let out = fmt(source);
+    assert!(out.contains("test(\"evaluates a single number\", () => [\n"), "Rule 5a `() => [` not kept together:\n{}", out);
+    // The `=> [` collapse puts the array's `]` at the call indent, so the call's `)` glues
+    // directly → the close reads `])` (no stray `)` line).
+    assert!(out.contains("\n  expect(valueOf(\"forty-two-ish\")).toBe(42),\n  expect(valueOf(\"seventy-seven\")).toBe(77)\n])"), "Rule 5a body/close not laid out:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule 5a not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rule5b_fully_split_args() {
+    // Rule 5b: when a NON-last arg is a multiline lambda, fully split the arg list —
+    // open paren, each arg on its own line at child indent, multiline lambda renders
+    // `param =>` then body indented, close paren on its own line.
+    let source = "var total = 0\nval acc = worker(n =>\n  total = total + n\n  total, () => null)\n";
+    let out = fmt(source);
+    let expected = "val acc = worker(\n  n =>\n    total = total + n\n    total,\n  () => null\n)";
+    assert!(out.contains(expected), "Rule 5b fully-split layout wrong:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule 5b not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rule6_comment_hoist() {
+    // Rule 6: a comment between a lambda's `=>` and its array/object body is hoisted to be
+    // a leading comment of the enclosing statement, and `() => [` collapses to one line.
+    let source = "import { test, expect, toBe, tokenize } from \"std/test\"\ntest(\"tokenizes each arithmetic operator\", () =>\n  // --- Operators ---\n  [\n    expect(tokenize(\"+\")[0][\"kind\"]).toBe(\"op\"),\n    expect(tokenize(\"-\")[0][\"kind\"]).toBe(\"op\")\n  ])\n";
+    let out = fmt(source);
+    assert!(out.contains("// --- Operators ---\ntest("), "Rule 6 comment not hoisted above statement:\n{}", out);
+    assert!(out.contains("() => [\n"), "Rule 6 `() => [` not collapsed:\n{}", out);
+    assert_eq!(out.matches("//").count(), 1, "Rule 6 comment count changed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule 6 not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rulei_iii_test_array_full_target() {
+    // Full target for the three test-suite-array rules combined: comment hoisted above the
+    // first test (Rule ii), closing `)` on its own line (Rule i), and a blank line between the
+    // two consecutive `test(...)` elements (Rule iii). The short second test stays inline.
+    let source = "import { test, expect, toBe, suite } from \"std/test\"\nval s = suite(\"bits\", [\n  test(\"plain bitwise operators\", () =>\n    // --- Plain bitwise operators ---\n    [\n      expect(12 & 10).toBe(8),\n      expect(12 | 10).toBe(14),\n      expect(255 >> 4).toBe(15)\n    ]),\n  test(\"UInt8 flat array holds 0..255 unboxed\", () => [expect(1).toBe(1)])\n])\n";
+    let out = fmt(source);
+    let expected = "import { test, expect, toBe, suite } from \"std/test\"\nval s = suite(\"bits\", [\n  // --- Plain bitwise operators ---\n  test(\"plain bitwise operators\", () =>\n    [\n      expect(12 & 10).toBe(8),\n      expect(12 | 10).toBe(14),\n      expect(255 >> 4).toBe(15)\n    ]\n  ),\n\n  test(\"UInt8 flat array holds 0..255 unboxed\", () => [expect(1).toBe(1)])\n])\n";
+    assert_eq!(out, expected, "full target mismatch:\n{}", out);
+    assert_eq!(out.matches("//").count(), 1, "comment count changed:\n{}", out);
+    assert_eq!(out, fmt(&out), "not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rulei_close_paren_own_line() {
+    // A call whose last arg is a lambda with an array body: `() => [` collapses (Rule 6, body
+    // attached), the body breaks, and since the `]` lands at the call indent the closing `)`
+    // glues → `])`.
+    let source = "val t = test(\"plain bitwise operators\", () =>\n  [\n    expect(valueOf(\"forty-two-ish\")).toBe(42),\n    expect(valueOf(\"seventy-seven\")).toBe(77)\n  ])\n";
+    let out = fmt(source);
+    let expected = "val t = test(\"plain bitwise operators\", () => [\n  expect(valueOf(\"forty-two-ish\")).toBe(42),\n  expect(valueOf(\"seventy-seven\")).toBe(77)\n])\n";
+    assert_eq!(out, expected, "Rule i close-paren layout wrong:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule i not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rulei_single_line_lambda_keeps_paren_glued() {
+    // Rule i scope: a single-line lambda arg (body does NOT span multiple lines) keeps the `)`
+    // glued — the close-paren-on-own-line rule applies only to multi-line lambda bodies.
+    let source = "val t = test(\"name\", () => [expect(1).toBe(1)])\n";
+    let out = fmt(source);
+    assert_eq!(out, "val t = test(\"name\", () => [expect(1).toBe(1)])\n", "single-line lambda `)` not glued:\n{}", out);
+    assert_eq!(out, fmt(&out), "not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rulei_comment_in_array_hoist() {
+    // Rule ii: a comment between a lambda's `=>` and its array body, where the lambda is the
+    // last arg of a `test(...)` array element, hoists to a leading comment of that element.
+    let source = "val s = suite(\"bitwise behaviour\", [\n  test(\"plain bitwise operators\", () =>\n    // note A\n    [\n      expect(120000 & 100000).toBe(34464),\n      expect(255000 >> 4).toBe(15937)\n    ])\n])\n";
+    let out = fmt(source);
+    assert!(out.contains("  // note A\n  test(\"plain bitwise operators\", () =>\n"), "Rule ii comment not hoisted above element:\n{}", out);
+    assert_eq!(out.matches("//").count(), 1, "Rule ii comment count changed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule ii not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleiii_blank_between_test_elements() {
+    // Rule iii: exactly one blank line between two consecutive `test(...)` array elements,
+    // even when the source had none. Idempotent (a second pass adds no further blank).
+    let source = "val s = suite(\"x\", [\n  test(\"alpha case\", () =>\n    [\n      expect(120000 & 100000).toBe(34464),\n      expect(255000 >> 4).toBe(15937)\n    ]),\n  test(\"beta case\", () =>\n    [\n      expect(120000 | 100000).toBe(185536),\n      expect(4 << 8).toBe(1024)\n    ])\n])\n";
+    let out = fmt(source);
+    assert!(out.contains("  ),\n\n  test(\"beta case\""), "Rule iii blank not injected between tests:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule iii not idempotent:\n{}", out);
+    // No double blank on a re-sweep.
+    assert!(!out.contains("\n\n\n"), "Rule iii produced a double blank:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleiii_non_test_array_gets_no_blank() {
+    // Rule iii scope: a non-`test` call array gets NO blank line injected between elements.
+    let source = "val xs = [\n  foo(\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", () =>\n    [\n      aaaaaaaaaaaaaaa(1),\n      bbbbbbbbbbbbbbb(2)\n    ]),\n  foo(\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\", () =>\n    [\n      ccccccccccccccc(3),\n      ddddddddddddddd(4)\n    ])\n]\n";
+    let out = fmt(source);
+    assert!(!out.contains("\n\n"), "non-test array got a blank line injected:\n{}", out);
+    assert_eq!(out, fmt(&out), "non-test array not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleA_author_multiline_if_stays_multiline() {
+    // Rule A: an `if` the author wrote multiline (then/else on their own lines) stays
+    // multiline (block form) even though it would fit on one line.
+    let source = "val sumTo = (n: Int32, acc: Int32): Int32 =>\n  if n == 0 then acc\n  else sumTo(n - 1, acc + n)\n";
+    let out = fmt(source);
+    let expected = "val sumTo = (n: Int32, acc: Int32): Int32 =>\n  if n == 0 then\n    acc\n  else\n    sumTo(n - 1, acc + n)\n";
+    assert_eq!(out, expected, "Rule A author-multiline if collapsed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule A not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleA_author_inline_if_stays_inline() {
+    // Rule A: an `if` the author wrote on one line stays inline.
+    let source = "val inlineIf = (n: Int32): Int32 => if n == 0 then 1 else 2\n";
+    let out = fmt(source);
+    assert_eq!(out, "val inlineIf = (n: Int32): Int32 => if n == 0 then 1 else 2\n", "Rule A author-inline if changed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule A inline not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleB_author_newline_body_stays_on_own_line() {
+    // Rule B: a function whose body the author put on a NEW line keeps it on its own
+    // indented line, not collapsed onto the `=> body` single line.
+    let source = "val fail = (msg: String): Failure =>\n  { \"type\": \"failure\", \"error\": msg }\n";
+    let out = fmt(source);
+    let expected = "val fail = (msg: String): Failure =>\n  { \"type\": \"failure\", \"error\": msg }\n";
+    assert_eq!(out, expected, "Rule B author-newline body collapsed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule B not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleB_author_inline_body_stays_inline() {
+    // Rule B: a function whose body the author wrote inline after `=>` stays inline.
+    let source = "val fail = (msg: String): Failure => { \"type\": \"failure\", \"error\": msg }\n";
+    let out = fmt(source);
+    assert_eq!(out, "val fail = (msg: String): Failure => { \"type\": \"failure\", \"error\": msg }\n", "Rule B author-inline body changed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule B inline not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleC_author_multiline_2chain_stays_multiline() {
+    // Rule C: a 2-call chain the author broke across lines stays multiline.
+    let source = "import { range, map, reduce } from \"std/array\"\nimport { toString, length } from \"std/string\"\nval totalLen = range(0, n)\n  .map(i => \"item-${toString(i)}\")\n  .reduce(0, (acc, s) => acc + length(s))\n";
+    let out = fmt(source);
+    let expected = "val totalLen = range(0, n)\n  .map(i => \"item-${toString(i)}\")\n  .reduce(0, (acc, s) => acc + length(s))";
+    assert!(out.contains(expected), "Rule C author-multiline 2-chain collapsed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule C not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleC_author_inline_2chain_stays_inline() {
+    // Rule C: a 2-call chain the author wrote inline (that fits) stays inline.
+    let source = "import { range, map, reduce } from \"std/array\"\nval a = range(0, n).map(f).reduce(0, g)\n";
+    let out = fmt(source);
+    assert!(out.contains("val a = range(0, n).map(f).reduce(0, g)"), "Rule C author-inline 2-chain changed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule C inline not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleC_over_two_chain_always_multiline() {
+    // Rule C / Rule 1: a chain with >2 calls is ALWAYS multiline even if written inline.
+    let source = "import { range, map, filter, reduce } from \"std/array\"\nval t = range(0, n).map(x => x).filter(x => x > 0).reduce(0, (a, b) => a + b)\n";
+    let out = fmt(source);
+    let expected = "val t = range(0, n)\n  .map(x => x)\n  .filter(x => x > 0)\n  .reduce(0, (a, b) => a + b)";
+    assert!(out.contains(expected), "Rule C >2 chain not multiline:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule C >2 not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_overbudget_test_lambda_keeps_name_on_call_line() {
+    // An over-80 `test("long name", () => [ … ])` must NOT fully-split the arg list (which
+    // would strand the name on its own line and lose `=> [`). The lambda's array body breaks
+    // instead, keeping the name + `=>` on the call line.
+    let long = "n".repeat(60);
+    // Single-element body → `=> [` collapse with `])` close.
+    let single = format!(
+        "import {{ test, expect, toBe, suite }} from \"std/test\"\nval s = suite(\"x\", [test(\"{}\", () => [expect(f(1)).toBe(5)])])\n",
+        long
+    );
+    let so = fmt(&single);
+    assert!(so.contains(&format!("test(\"{}\", () => [", long)), "name/=> [ left the call line:\n{}", so);
+    assert!(so.contains("\n  ])"), "single-element close should be `])`:\n{}", so);
+    assert!(!so.contains("\n    () =>"), "arg list should NOT fully-split:\n{}", so);
+    assert_eq!(so, fmt(&so), "not idempotent:\n{}", so);
+
+    // Multi-element body → `=>` then body on its own line, `)` dedented.
+    let multi = format!(
+        "import {{ test, expect, toBe, suite }} from \"std/test\"\nval s = suite(\"x\", [test(\"{}\", () => [expect(f(1)).toBe(5), expect(f(2)).toBe(9)])])\n",
+        long
+    );
+    let mo = fmt(&multi);
+    assert!(mo.contains(&format!("test(\"{}\", () =>", long)), "name/=> left the call line:\n{}", mo);
+    assert_eq!(mo, fmt(&mo), "multi not idempotent:\n{}", mo);
+}
+
+#[test]
+fn test_fmt_opt_in_match_alignment() {
+    // Opt-in: a match whose `=>` the author column-aligned stays aligned, with padding
+    // recomputed from the FORMATTED head widths (so string-key shorthand reflow is fine).
+    let source = "val f = (s: Json): String =>\n  match s\n    has { \"circle\" } when big => \"a\"\n    has { \"rect\" }            => \"bb\"\n    else                      => \"c\"\n";
+    let out = fmt(source);
+    // Pull the three arm lines (indented, no `val`) and check the `=>` byte offset matches.
+    let arrow_cols: Vec<usize> = out
+        .lines()
+        .filter(|l| l.contains("=>") && (l.contains("has") || l.trim_start().starts_with("else")))
+        .map(|l| l.find("=>").unwrap())
+        .collect();
+    assert_eq!(arrow_cols.len(), 3, "expected 3 aligned arms:\n{}", out);
+    assert!(
+        arrow_cols.iter().all(|&c| c == arrow_cols[0]),
+        "match `=>` not column-aligned: {:?}\n{}",
+        arrow_cols,
+        out
+    );
+    // The widest head `has { circle } when big` keeps exactly one space before `=>`.
+    assert!(out.contains("has { circle } when big => \"a\""), "widest head not single-spaced:\n{}", out);
+    assert_eq!(out, fmt(&out), "aligned match not idempotent:\n{}", out);
+
+    // A single-spaced match stays single-spaced (no opt-in signal).
+    let single = "val g = (s: Json): String =>\n  match s\n    has { \"circle\" } => \"a\"\n    has { \"rect\" } => \"bb\"\n    else => \"c\"\n";
+    let so = fmt(single);
+    assert!(so.contains("has { rect } => \"bb\""), "single-spaced match changed:\n{}", so);
+    assert!(!so.contains("  => "), "single-spaced match got padded:\n{}", so);
+    assert_eq!(so, fmt(&so), "single-spaced match not idempotent:\n{}", so);
+}
+
+#[test]
+fn test_fmt_opt_in_trailing_comment_alignment() {
+    // Opt-in: a val-run inside a function body with author-aligned trailing comments keeps
+    // them aligned — the widest code part has one space, narrower ones are padded.
+    let source = "val setup = (): Int32 =>\n  val a = 1       // first\n  val bb = 2      // second\n  val ccc = 3     // third\n  a + bb + ccc\n";
+    let out = fmt(source);
+    let comment_cols: Vec<usize> = out
+        .lines()
+        .filter(|l| l.contains("//"))
+        .map(|l| l.find("//").unwrap())
+        .collect();
+    assert_eq!(comment_cols.len(), 3, "expected 3 aligned comments:\n{}", out);
+    assert!(
+        comment_cols.iter().all(|&c| c == comment_cols[0]),
+        "trailing comments not aligned: {:?}\n{}",
+        comment_cols,
+        out
+    );
+    // Widest code is `  val ccc = 3` — it keeps a single space before its `//`.
+    assert!(out.contains("val ccc = 3 // third"), "widest member not single-spaced:\n{}", out);
+    assert_eq!(out, fmt(&out), "aligned trailing comments not idempotent:\n{}", out);
+
+    // Single-spaced trailing comments stay single-spaced.
+    let single = "val setup = (): Int32 =>\n  val a = 1 // first\n  val bb = 2 // second\n  val ccc = 3 // third\n  a + bb + ccc\n";
+    let so = fmt(single);
+    assert!(so.contains("val a = 1 // first"), "single-spaced trailing changed:\n{}", so);
+    assert!(!so.contains("val a = 1  //"), "single-spaced trailing got padded:\n{}", so);
+    assert_eq!(so, fmt(&so), "single-spaced trailing not idempotent:\n{}", so);
+}
+
+#[test]
+fn test_fmt_opt_in_toplevel_trailing_alignment() {
+    // Opt-in at TOP LEVEL (no enclosing function): an aligned val-run stays aligned.
+    let source = "val a = 1       // first\nval bb = 2      // second\nval ccc = 3     // third\n";
+    let out = fmt(source);
+    let comment_cols: Vec<usize> = out
+        .lines()
+        .filter(|l| l.contains("//"))
+        .map(|l| l.find("//").unwrap())
+        .collect();
+    assert_eq!(comment_cols.len(), 3, "expected 3 aligned top-level comments:\n{}", out);
+    assert!(
+        comment_cols.iter().all(|&c| c == comment_cols[0]),
+        "top-level trailing comments not aligned: {:?}\n{}",
+        comment_cols,
+        out
+    );
+    assert!(out.contains("val ccc = 3 // third"), "widest top-level member not single-spaced:\n{}", out);
+    assert_eq!(out, fmt(&out), "aligned top-level trailing not idempotent:\n{}", out);
+}
+
+/// Parse a source string and return the parser diagnostics' messages (no panic on errors).
+fn parse_diagnostics(source: &str) -> Vec<String> {
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    let mut parser = lin_parse::Parser::new(tokens);
+    let _ = parser.parse_module();
+    parser.diagnostics.iter().map(|d| d.message.clone()).collect()
+}
+
+#[test]
+fn test_fmt_rule3_parser_rejects_trailing_commas() {
+    // Rule 3 (parser half): a trailing comma in an array/object LITERAL is a parse error.
+    let arr = parse_diagnostics("val x = [1, 2,]\n");
+    assert!(arr.iter().any(|m| m.contains("trailing comma is not allowed in array")),
+        "array trailing comma not rejected: {:?}", arr);
+    let obj = parse_diagnostics("val o = { \"a\": 1, }\n");
+    assert!(obj.iter().any(|m| m.contains("trailing comma is not allowed in object")),
+        "object trailing comma not rejected: {:?}", obj);
+    // A function call `f(x,)` (partial application, ADR-041) is STILL accepted.
+    let call = parse_diagnostics("val g = f(x,)\n");
+    assert!(call.is_empty(), "f(x,) partial application must stay valid: {:?}", call);
+    // Non-trailing commas are fine.
+    assert!(parse_diagnostics("val x = [1, 2, 3]\n").is_empty());
+    assert!(parse_diagnostics("val o = { \"a\": 1, \"b\": 2 }\n").is_empty());
+}
+
 /// Count `//` occurrences in a string (proxy for comment count for the corpus sanity check).
 fn count_comments(s: &str) -> usize {
     s.matches("//").count()
@@ -4850,6 +5386,11 @@ fn test_fmt_corpus_idempotent_and_comments_preserved() {
 
     let mut non_idempotent: Vec<String> = Vec::new();
     let mut comment_changed: Vec<String> = Vec::new();
+    // Formatted output that no longer type-checks — the miscompile guard. Re-emitting the
+    // AST drops parentheses and the generic `<T>` list; if the formatter doesn't restore
+    // them the formatted file fails `lin check` (e.g. "Unknown type 'T'"). Idempotency
+    // alone does NOT catch this — broken-but-stable output passes the checks above.
+    let mut check_failed: Vec<String> = Vec::new();
 
     for path in &files {
         let src = std::fs::read_to_string(path).unwrap();
@@ -4863,6 +5404,15 @@ fn test_fmt_corpus_idempotent_and_comments_preserved() {
         if before != after {
             comment_changed.push(format!("{} ({} -> {})", path.display(), before, after));
         }
+        // Type-check the formatted text standalone. Only for SELF-CONTAINED files (no
+        // relative/sibling imports) — a temp file in the workspace root resolves `std/...`
+        // and `foreign` imports against the embedded stdlib, but not `./sibling` modules,
+        // which would spuriously fail to resolve. All stdlib/*.lin are self-contained, so
+        // the generics-critical code (map/filter/reduce/<T>) is fully covered; sibling-
+        // importing example files rely on idempotency + the targeted run-equivalence test.
+        if is_self_contained(&src) && lin_check_ok(path) && !lin_check_ok_source(&pass1) {
+            check_failed.push(path.display().to_string());
+        }
     }
 
     assert!(
@@ -4875,6 +5425,51 @@ fn test_fmt_corpus_idempotent_and_comments_preserved() {
         "comment count changed when formatting corpus files: {:?}",
         comment_changed
     );
+    assert!(
+        check_failed.is_empty(),
+        "formatted output no longer type-checks (miscompile!) for: {:?}",
+        check_failed
+    );
+}
+
+/// True if the source has no relative/sibling import (only `std/...` or `foreign`), so it
+/// can be type-checked as a standalone temp file in the workspace root.
+fn is_self_contained(source: &str) -> bool {
+    !source.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("import") && (t.contains("\"./") || t.contains("\"../"))
+    })
+}
+
+/// `lin check <path>` succeeds.
+fn lin_check_ok(path: &std::path::Path) -> bool {
+    Command::new(lin_bin())
+        .args(["check", path.to_str().unwrap()])
+        .current_dir(workspace_root())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// `lin check` succeeds on a source string (written to a temp file alongside the source
+/// dir so relative imports still resolve). Used to check formatted output in place.
+fn lin_check_ok_source(source: &str) -> bool {
+    // Write into the workspace root so `std/...` imports resolve via the embedded stdlib;
+    // corpus files use only std imports or sibling modules, and a root temp file can't see
+    // siblings — so multi-module files are checked via the real path in lin_check_ok and
+    // this single-file check focuses on the formatted-text validity of self-contained files.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let p = ws.join(format!("target/fmt_check_{}.lin", id));
+    std::fs::write(&p, source).unwrap();
+    let ok = Command::new(lin_bin())
+        .args(["check", p.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let _ = std::fs::remove_file(&p);
+    ok
 }
 
 #[test]

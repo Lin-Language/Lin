@@ -1,6 +1,6 @@
 import foreign "lin-runtime"
-  val lin_object_values: ({}) => Json[]
-  val lin_object_entries: ({}) => Json[]
+  val lin_object_values: ({  }) => Json[]
+  val lin_object_entries: ({  }) => Json[]
 
 import { push, length } from "std/array"
 import { for, some } from "std/iter"

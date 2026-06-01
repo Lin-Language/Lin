@@ -41,12 +41,12 @@ val s = suite("std/time", [
   test("format renders date and time fields", () => [
     expect(format(1705314600000, "%Y-%m-%dT%H:%M:%S")).toBe("2024-01-15T10:30:00"),
     expect(format(1705314600000, "%Y-%m-%d")).toBe("2024-01-15"),
-    expect(format(1705314600000, "%H:%M:%S")).toBe("10:30:00"),
+    expect(format(1705314600000, "%H:%M:%S")).toBe("10:30:00")
   ]),
 
   test("format renders weekday/month names and literal percent", () => [
     expect(format(1705314600000, "%a %B %d")).toBe("Mon January 15"),
-    expect(format(1705314600000, "%H%%")).toBe("10%"),
+    expect(format(1705314600000, "%H%%")).toBe("10%")
   ]),
 
   // --- fromIso ---
@@ -77,7 +77,7 @@ val s = suite("std/time", [
     val withTime: Int64 = 1705314600000
     [
       expect(parse("2024-01-15", "%Y-%m-%d")).toBe(midnight),
-      expect(parse("15/01/2024 10:30", "%d/%m/%Y %H:%M")).toBe(withTime),
+      expect(parse("15/01/2024 10:30", "%d/%m/%Y %H:%M")).toBe(withTime)
     ]
   ),
 
@@ -89,8 +89,10 @@ val s = suite("std/time", [
   // format and parse round-trip
   test("format and parse round-trip a timestamp", () =>
     val ts: Int64 = 1705314600000
-    [expect(parse(format(ts, "%Y-%m-%dT%H:%M:%S"), "%Y-%m-%dT%H:%M:%S")).toBe(ts)]
-  ),
+    [
+      expect(parse(format(ts, "%Y-%m-%dT%H:%M:%S"), "%Y-%m-%dT%H:%M:%S")).toBe(ts)
+    ]
+  )
 ])
 
 run(s)

@@ -57,6 +57,10 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      - name: Check formatting
+        if: runner.os == 'Linux'
+        run: cargo run -p lin -- fmt --check stdlib/ examples/ benchmarks/
+
       - name: Test
         run: cargo test --workspace
 

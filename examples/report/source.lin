@@ -9,7 +9,6 @@
 // `untar` hands each member's body to the callback as a `data` sub-stream; we pull
 // the whole entry as text and split it into rows. The sub-stream is valid only
 // inside the callback (sync-only), so we drain it there via `readText`.
-
 import { readStream, readText } from "std/stream"
 import { gunzip } from "std/compress"
 import { untar, manifest } from "std/archive"
@@ -28,7 +27,8 @@ val textOf = (r: Json): String =>
 
 // Split one member's body into its non-blank, trimmed CSV rows.
 val rowsOf = (body: String): String[] =>
-  body.splitLines()
+  body
+    .splitLines()
     .map(line => line.trim())
     .filter(line => length(line) > 0)
 
@@ -38,9 +38,11 @@ val rowsOf = (body: String): String[] =>
 // empty batch (the caller's report then shows count=0).
 export val rowsFromArchive = (path: String): String[] =>
   var rows = []
-  val result = readStream(path).gunzip().untar((meta, data) =>
-    rowsOf(textOf(data.readText())).for(line => rows.push(line))
-  )
+  val result = readStream(path)
+    .gunzip()
+    .untar((meta, data) =>
+      rowsOf(textOf(data.readText())).for(line => rows.push(line))
+    )
   match result
     is Error => []
     else => rows
@@ -49,7 +51,10 @@ export val rowsFromArchive = (path: String): String[] =>
 // pass that reads each tar header and skips the body. Returns the member names.
 export val archiveMembers = (path: String): String[] =>
   var names = []
-  readStream(path).gunzip().manifest().for(m =>
-    names.push(m["name"])
-  )
+  readStream(path)
+    .gunzip()
+    .manifest()
+    .for(m =>
+      names.push(m["name"])
+    )
   names
