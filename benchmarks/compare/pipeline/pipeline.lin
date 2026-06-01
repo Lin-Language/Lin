@@ -14,8 +14,8 @@ val n = 20000000
 // reduce accumulates into an Int64 (the sum ~1.3e12 overflows Int32); each
 // Int32 element widens into the accumulator at the `acc + x` site.
 val total: Int64 = range(0, n)
-  .map(x => x * 2)
-  .filter(x => x - (x / 3) * 3 == 0)
+  .map((x) => x * 2)
+  .filter((x) => x - x / 3 * 3 == 0)
   .reduce(0i64, (acc, x) => acc + x)
 
 print("RESULT=${toString(total)}")

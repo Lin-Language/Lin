@@ -1,8 +1,5 @@
 import { expect, toBe, toSatisfy, test, suite, run } from "std/test"
-import {
-  squareAsync, weightedTriple, firstToFinish, withDeadline,
-  retryDivide, safeDivide, nestedValue
-} from "./tasks"
+import { squareAsync, weightedTriple, firstToFinish, withDeadline, retryDivide, safeDivide, nestedValue } from "./tasks"
 
 val s = suite("concurrency/tasks", [
   test("async/await computes on another thread", () => [
@@ -11,11 +8,7 @@ val s = suite("concurrency/tasks", [
 
   test("parallel runs tasks order-preserving", () =>
     val r = weightedTriple(1, 2, 3)
-    [
-      expect(r[0]).toBe(1),
-      expect(r[1]).toBe(4),
-      expect(r[2]).toBe(9)
-    ]
+    [expect(r[0]).toBe(1), expect(r[1]).toBe(4), expect(r[2]).toBe(9)]
   ),
 
   test("race resolves with the first to complete", () => [
@@ -36,9 +29,7 @@ val s = suite("concurrency/tasks", [
 
   test("retry surfaces an Error when every attempt faults", () =>
     val r = retryDivide(10, 0, 3)
-    [
-      expect(r["type"]).toBe("error")
-    ]
+    [expect(r["type"]).toBe("error")]
   ),
 
   test("fault isolation: a thunk fault becomes a recoverable value", () => [
@@ -48,7 +39,7 @@ val s = suite("concurrency/tasks", [
 
   test("await auto-flattens nested promises", () => [
     expect(nestedValue(42)).toBe(42)
-  ]),
+  ])
 ])
 
 run(s)

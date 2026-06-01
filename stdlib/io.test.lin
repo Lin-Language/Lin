@@ -4,41 +4,28 @@ import { printErr, args, prompt, exit } from "std/io"
 
 // io.lin exports: print, printErr, args, prompt, exit, readLine, readAll, lines
 // print and exit are side-effecting; we test what we can without needing stdin.
-
 val s = suite("std/io", [
   test("print accepts strings", () =>
     // Just verify it doesn't crash; output is a side effect
     val _ = true
-    [
-      expect(true).toBe(true)
-    ]
+    [expect(true).toBe(true)]
   ),
 
-  test("exit function exists (callable)", () => [
-    // We don't call exit(1) in a test suite — just confirm the import works
-    expect(true).toBe(true)
-  ]),
+  test("exit function exists (callable)", () => [expect(true).toBe(true)]),
 
   test("printErr accepts strings", () =>
     // printErr writes to stderr; verify it doesn't crash
     val _ = true
-    [
-      expect(true).toBe(true)
-    ]
+    [expect(true).toBe(true)]
   ),
 
   test("args returns an array", () =>
     val result = args()
     // args() returns String[] — just verify it's callable and the type is right
-    [
-      expect(true).toBe(true)
-    ]
+    [expect(true).toBe(true)]
   ),
 
-  test("prompt function exists (callable)", () => [
-    // prompt requires stdin interaction; just verify the import works
-    expect(true).toBe(true)
-  ]),
+  test("prompt function exists (callable)", () => [expect(true).toBe(true)])
 ])
 
 run(s)

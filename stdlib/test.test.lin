@@ -13,24 +13,16 @@ val fxTeardown = (fixture: Json): Null =>
   null
 
 val s = suite("std/test", [
-  test("toBe passes when equal", () => [
-    expect(42).toBe(42)
-  ]),
+  test("toBe passes when equal", () => [expect(42).toBe(42)]),
 
-  test("toBe passes for strings", () => [
-    expect("hello").toBe("hello")
-  ]),
+  test("toBe passes for strings", () => [expect("hello").toBe("hello")]),
 
-  test("toBe passes for booleans", () => [
-    expect(true).toBe(true)
-  ]),
+  test("toBe passes for booleans", () => [expect(true).toBe(true)]),
 
-  test("toBeNull passes for null", () => [
-    expect(null).toBeNull()
-  ]),
+  test("toBeNull passes for null", () => [expect(null).toBeNull()]),
 
   test("toSatisfy passes when predicate holds", () => [
-    expect(10).toSatisfy(x => x > 5)
+    expect(10).toSatisfy((x) => x > 5)
   ]),
 
   test("toSucceed passes for success tagged value", () => [
@@ -46,11 +38,7 @@ val s = suite("std/test", [
   ]),
 
   test("multiple assertions in one test via array", () =>
-    [
-      expect(1).toBe(1),
-      expect(2).toBe(2),
-      expect(3).toBe(3)
-    ]
+    [expect(1).toBe(1), expect(2).toBe(2), expect(3).toBe(3)]
   ),
 
   test("toBe fails on unequal values", () =>
@@ -85,49 +73,40 @@ val s = suite("std/test", [
   ),
 
   test("toSatisfy fails when predicate does not hold", () => [
-    expect(expect(1).toSatisfy(x => x > 10)["type"]).toBe("fail")
+    expect(expect(1).toSatisfy((x) => x > 10)["type"]).toBe("fail")
   ]),
 
   test("toFailWith fails when error message differs", () =>
     val r = { "type": "failure", "error": "oops" }
-    [
-      expect(expect(r).toFailWith("wrong")["type"]).toBe("fail")
-    ]
+    [expect(expect(r).toFailWith("wrong")["type"]).toBe("fail")]
   ),
 
   test("toSucceed fails when given a failure", () =>
     val r = { "type": "failure", "error": "oops" }
-    [
-      expect(expect(r).toSucceed()["type"]).toBe("fail")
-    ]
+    [expect(expect(r).toSucceed()["type"]).toBe("fail")]
   ),
 
   test("toFail fails when given a success", () =>
     val r = { "type": "success", "value": 1 }
-    [
-      expect(expect(r).toFail()["type"]).toBe("fail")
-    ]
+    [expect(expect(r).toFail()["type"]).toBe("fail")]
   ),
 
   test("toSatisfy can inspect union shapes via has-pattern", () =>
     val ok = { "type": "success", "value": 42 }
     val err = { "type": "failure", "error": "boom" }
     [
-      expect(ok).toSatisfy(r => r has { "type": "success", value }),
-      expect(err).toSatisfy(r => r has { "type": "failure", error })
+      expect(ok).toSatisfy((r) => r has { "type": "success", value }),
+      expect(err).toSatisfy((r) => r has { "type": "failure", error })
     ]
   ),
-
   // withFixture injects the fixture into the body and runs setup/teardown around it. These two
   // entries each fire setup once and teardown once; the meta-test below asserts the counts.
   withFixture(fxSetup, fxTeardown, "withFixture injects the fixture", (db) => [
     expect(db["conn"]).toBe(7)
   ]),
-
   withFixture(fxSetup, fxTeardown, "withFixture runs again independently", (db) => [
     expect(db["conn"]).toBe(7)
   ]),
-
   // Eager evaluation: the two withFixture entries above already ran (the tests array is built
   // before this entry), so setup and teardown have each fired exactly twice.
   test("withFixture ran setup and teardown for each use", () => [
@@ -139,11 +118,12 @@ val s = suite("std/test", [
   // block for guaranteed afterAll teardown. A two-pass / one-fail suite reports 1.
   test("report returns the failure count without exiting", () =>
     val sub = suite("sub", [
-      test("ok", () => [ expect(1).toBe(1) ]),
-      test("bad", () => [ expect(1).toBe(2) ])
+      test("ok", () => [expect(1).toBe(1)]),
+
+      test("bad", () => [expect(1).toBe(2)])
     ])
-    [ expect(report(sub)).toBe(1) ]
-  ),
+    [expect(report(sub)).toBe(1)]
+  )
 ])
 
 run(s)
