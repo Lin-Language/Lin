@@ -4076,6 +4076,102 @@ val classify = (n: Int32): String =>
     }
 }
 
+#[test]
+fn test_fmt_rule1_chain_threshold() {
+    // Rule 1: a chain with MORE than CHAIN_INLINE_MAX (2) calls is always multiline,
+    // regardless of length. 4 calls → one `.method(...)` per line.
+    let source = "import { range, map, filter, reduce } from \"std/array\"\nval total = range(0, n).map(x => x * 2).filter(x => x % 3 == 0).reduce(0, (acc, x) => acc + x)\n";
+    let out = fmt(source);
+    let expected = "val total = range(0, n)\n  .map(x => x * 2)\n  .filter(x => x % 3 == 0)\n  .reduce(0, (acc, x) => acc + x)";
+    assert!(out.contains(expected), "Rule 1 chain not multiline:\n{}", out);
+    // A 2-call chain still stays inline.
+    let two = fmt("import { range, map } from \"std/array\"\nval a = range(0, n).map(x => x)\n");
+    assert!(two.contains("val a = range(0, n).map(x => x)"), "2-call chain should stay inline:\n{}", two);
+    assert_eq!(out, fmt(&out), "Rule 1 not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rule2_preserve_blank_lines() {
+    // Rule 2: a source blank between two statements is preserved; adjacent statements
+    // stay tight (no auto-injected blank); runs of 2+ blanks collapse to one.
+    let adjacent = "import { print } from \"std/io\"\nimport { toString } from \"std/string\"\n";
+    let out = fmt(adjacent);
+    assert_eq!(out, "import { print } from \"std/io\"\nimport { toString } from \"std/string\"\n", "adjacent imports must stay tight:\n{:?}", out);
+
+    let with_blank = "val a = 1\n\nval b = 2\n";
+    assert_eq!(fmt(with_blank), "val a = 1\n\nval b = 2\n", "source blank not preserved");
+
+    let many_blanks = "val a = 1\n\n\n\nval b = 2\n";
+    assert_eq!(fmt(many_blanks), "val a = 1\n\nval b = 2\n", "blank run not collapsed to one");
+
+    let no_blank = "val a = 1\nval b = 2\n";
+    assert_eq!(fmt(no_blank), "val a = 1\nval b = 2\n", "blank auto-injected between adjacent vals");
+
+    assert_eq!(fmt(with_blank), fmt(&fmt(with_blank)), "Rule 2 not idempotent");
+}
+
+#[test]
+fn test_fmt_rule3_no_trailing_commas() {
+    // Rule 3 (formatter half): multiline array/object literals have NO trailing comma.
+    let arr = "val xs = [1000000000, 2000000000, 3000000000, 4000000000, 5000000000, 6000000000]\n";
+    let out = fmt(arr);
+    assert!(out.contains('\n'), "array should be multiline:\n{}", out);
+    assert!(!out.contains(",\n]"), "trailing comma before ]:\n{}", out);
+    let obj = "val o = { \"aaaaaaaaaaaaaaaaaaaaaaa\": 1, \"bbbbbbbbbbbbbbbbbbbbbbb\": 2, \"ccccccccccccccccccc\": 3 }\n";
+    let out2 = fmt(obj);
+    assert!(out2.contains('\n'), "object should be multiline:\n{}", out2);
+    assert!(!out2.contains(",\n}"), "trailing comma before }}:\n{}", out2);
+    assert_eq!(out, fmt(&out), "Rule 3 array not idempotent");
+    assert_eq!(out2, fmt(&out2), "Rule 3 object not idempotent");
+}
+
+#[test]
+fn test_fmt_rule4_recursive_multiline() {
+    // Rule 4: once a literal goes multiline, every nested literal is also multiline,
+    // even if it would fit inline.
+    let source = "val node = { \"node\": { \"kind\": \"num\", \"value\": tokens[pos][\"text\"].parseInt32() }, \"pos\": pos + 1 }\n";
+    let out = fmt(source);
+    let expected = "val node = {\n  \"node\": {\n    \"kind\": \"num\",\n    \"value\": tokens[pos][\"text\"].parseInt32()\n  },\n  \"pos\": pos + 1\n}";
+    assert_eq!(out.trim_end(), expected, "Rule 4 nested object not fully multiline:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule 4 not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rule5a_trailing_lambda() {
+    // Rule 5a: a call whose last arg is a multiline lambda with an array body keeps
+    // `() => [` together on the call line; earlier short args stay inline. The array body
+    // has two elements so it genuinely renders multiline.
+    let source = "val t = test(\"evaluates a single number\", () => [expect(valueOf(\"forty-two-ish\")).toBe(42), expect(valueOf(\"seventy-seven\")).toBe(77)])\n";
+    let out = fmt(source);
+    assert!(out.contains("test(\"evaluates a single number\", () => [\n"), "Rule 5a `() => [` not kept together:\n{}", out);
+    assert!(out.contains("\n  expect(valueOf(\"forty-two-ish\")).toBe(42),\n  expect(valueOf(\"seventy-seven\")).toBe(77)\n])"), "Rule 5a body/close not laid out:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule 5a not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rule5b_fully_split_args() {
+    // Rule 5b: when a NON-last arg is a multiline lambda, fully split the arg list —
+    // open paren, each arg on its own line at child indent, multiline lambda renders
+    // `param =>` then body indented, close paren on its own line.
+    let source = "var total = 0\nval acc = worker(n =>\n  total = total + n\n  total, () => null)\n";
+    let out = fmt(source);
+    let expected = "val acc = worker(\n  n =>\n    total = total + n\n    total,\n  () => null\n)";
+    assert!(out.contains(expected), "Rule 5b fully-split layout wrong:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule 5b not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_rule6_comment_hoist() {
+    // Rule 6: a comment between a lambda's `=>` and its array/object body is hoisted to be
+    // a leading comment of the enclosing statement, and `() => [` collapses to one line.
+    let source = "import { test, expect, toBe, tokenize } from \"std/test\"\ntest(\"tokenizes each arithmetic operator\", () =>\n  // --- Operators ---\n  [\n    expect(tokenize(\"+\")[0][\"kind\"]).toBe(\"op\"),\n    expect(tokenize(\"-\")[0][\"kind\"]).toBe(\"op\")\n  ])\n";
+    let out = fmt(source);
+    assert!(out.contains("// --- Operators ---\ntest("), "Rule 6 comment not hoisted above statement:\n{}", out);
+    assert!(out.contains("() => [\n"), "Rule 6 `() => [` not collapsed:\n{}", out);
+    assert_eq!(out.matches("//").count(), 1, "Rule 6 comment count changed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule 6 not idempotent:\n{}", out);
+}
+
 /// Count `//` occurrences in a string (proxy for comment count for the corpus sanity check).
 fn count_comments(s: &str) -> usize {
     s.matches("//").count()
