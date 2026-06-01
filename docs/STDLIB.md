@@ -805,15 +805,15 @@ over an array runs **lazily, with bounded memory** over a stream, simply because
 `Stream`:
 
 ```txt
-import { map, filter, take, reduce } from "std/iter"
+import { map, drop, take, reduce } from "std/iter"
 import { readStream } from "std/stream"
 
-// Drop a header line, take 4 records, sum a parsed column — lazily, one line at a time:
+// Drop a header line, take 4 records, sum each line's length — lazily, one line at a time:
 val total = readStream("data.csv")
   .lines()                       // Stream<String>
   .drop(1)                       // Stream<String>  (lazy adapter)
   .take(4)                       // Stream<String>  (lazy adapter)
-  .map(line => line.split(",").at(2).parseInt32())   // Stream<Int32>
+  .map(line => line.length())    // Stream<Int32>
   .reduce(0, (acc, n) => acc + n)                     // Int32 | Error  (terminal)
 
 match total
