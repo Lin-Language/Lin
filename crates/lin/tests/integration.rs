@@ -4172,6 +4172,75 @@ fn test_fmt_rule6_comment_hoist() {
     assert_eq!(out, fmt(&out), "Rule 6 not idempotent:\n{}", out);
 }
 
+#[test]
+fn test_fmt_ruleA_author_multiline_if_stays_multiline() {
+    // Rule A: an `if` the author wrote multiline (then/else on their own lines) stays
+    // multiline (block form) even though it would fit on one line.
+    let source = "val sumTo = (n: Int32, acc: Int32): Int32 =>\n  if n == 0 then acc\n  else sumTo(n - 1, acc + n)\n";
+    let out = fmt(source);
+    let expected = "val sumTo = (n: Int32, acc: Int32): Int32 =>\n  if n == 0 then\n    acc\n  else\n    sumTo(n - 1, acc + n)\n";
+    assert_eq!(out, expected, "Rule A author-multiline if collapsed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule A not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleA_author_inline_if_stays_inline() {
+    // Rule A: an `if` the author wrote on one line stays inline.
+    let source = "val inlineIf = (n: Int32): Int32 => if n == 0 then 1 else 2\n";
+    let out = fmt(source);
+    assert_eq!(out, "val inlineIf = (n: Int32): Int32 => if n == 0 then 1 else 2\n", "Rule A author-inline if changed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule A inline not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleB_author_newline_body_stays_on_own_line() {
+    // Rule B: a function whose body the author put on a NEW line keeps it on its own
+    // indented line, not collapsed onto the `=> body` single line.
+    let source = "val fail = (msg: String): Failure =>\n  { \"type\": \"failure\", \"error\": msg }\n";
+    let out = fmt(source);
+    let expected = "val fail = (msg: String): Failure =>\n  { \"type\": \"failure\", \"error\": msg }\n";
+    assert_eq!(out, expected, "Rule B author-newline body collapsed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule B not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleB_author_inline_body_stays_inline() {
+    // Rule B: a function whose body the author wrote inline after `=>` stays inline.
+    let source = "val fail = (msg: String): Failure => { \"type\": \"failure\", \"error\": msg }\n";
+    let out = fmt(source);
+    assert_eq!(out, "val fail = (msg: String): Failure => { \"type\": \"failure\", \"error\": msg }\n", "Rule B author-inline body changed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule B inline not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleC_author_multiline_2chain_stays_multiline() {
+    // Rule C: a 2-call chain the author broke across lines stays multiline.
+    let source = "import { range, map, reduce } from \"std/array\"\nimport { toString, length } from \"std/string\"\nval totalLen = range(0, n)\n  .map(i => \"item-${toString(i)}\")\n  .reduce(0, (acc, s) => acc + length(s))\n";
+    let out = fmt(source);
+    let expected = "val totalLen = range(0, n)\n  .map(i => \"item-${toString(i)}\")\n  .reduce(0, (acc, s) => acc + length(s))";
+    assert!(out.contains(expected), "Rule C author-multiline 2-chain collapsed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule C not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleC_author_inline_2chain_stays_inline() {
+    // Rule C: a 2-call chain the author wrote inline (that fits) stays inline.
+    let source = "import { range, map, reduce } from \"std/array\"\nval a = range(0, n).map(f).reduce(0, g)\n";
+    let out = fmt(source);
+    assert!(out.contains("val a = range(0, n).map(f).reduce(0, g)"), "Rule C author-inline 2-chain changed:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule C inline not idempotent:\n{}", out);
+}
+
+#[test]
+fn test_fmt_ruleC_over_two_chain_always_multiline() {
+    // Rule C / Rule 1: a chain with >2 calls is ALWAYS multiline even if written inline.
+    let source = "import { range, map, filter, reduce } from \"std/array\"\nval t = range(0, n).map(x => x).filter(x => x > 0).reduce(0, (a, b) => a + b)\n";
+    let out = fmt(source);
+    let expected = "val t = range(0, n)\n  .map(x => x)\n  .filter(x => x > 0)\n  .reduce(0, (a, b) => a + b)";
+    assert!(out.contains(expected), "Rule C >2 chain not multiline:\n{}", out);
+    assert_eq!(out, fmt(&out), "Rule C >2 not idempotent:\n{}", out);
+}
+
 /// Parse a source string and return the parser diagnostics' messages (no panic on errors).
 fn parse_diagnostics(source: &str) -> Vec<String> {
     let mut lexer = lin_lex::Lexer::new(source, 0);

@@ -1,5 +1,4 @@
 import { expect, toBe, toSatisfy, test, suite, run } from "std/test"
-
 import { decodePerson } from "./decode"
 
 // Type-directed JSON decode (fromJson): a valid Json shape decodes; structural
@@ -8,41 +7,33 @@ val isError = (x: Json): Boolean => x["type"] == "error"
 
 val s = suite("config decode (fromJson)", [
   test("decodes a well-shaped person (optional zip omitted)", () =>
-    val r = decodePerson({
-      "name": "Ada",
-      "age": 36,
-      "address": {
-        "city": "London"
-      }
-    })
+    val r = decodePerson({ "name": "Ada", "age": 36, "address": { "city": "London" } })
     [
       expect(isError(r)).toBe(false),
       expect(r["name"]).toBe("Ada"),
       expect(r["age"]).toBe(36),
       expect(r["address"]["city"]).toBe("London")
-    ]),
+    ]
+  ),
   test("decodes with the optional field present", () =>
-    val r = decodePerson({
-      "name": "Bo",
-      "age": 1,
-      "address": {
-        "city": "X",
-        "zip": "00000"
-      }
-    })
-    [expect(isError(r)).toBe(false), expect(r["address"]["zip"]).toBe("00000")]),
+    val r = decodePerson({ "name": "Bo", "age": 1, "address": { "city": "X", "zip": "00000" } })
+    [
+      expect(isError(r)).toBe(false),
+      expect(r["address"]["zip"]).toBe("00000")
+    ]
+  ),
   test("rejects a wrong nested type with a path", () =>
-    val r = decodePerson({
-      "name": "Bob",
-      "age": "old",
-      "address": {
-        "city": "Paris"
-      }
-    })
-    [expect(isError(r)).toBe(true), expect(r["path"]).toSatisfy(p => p != null)]),
+    val r = decodePerson({ "name": "Bob", "age": "old", "address": { "city": "Paris" } })
+    [
+      expect(isError(r)).toBe(true),
+      expect(r["path"]).toSatisfy(p => p != null)
+    ]
+  ),
   test("rejects a missing required field", () =>
     val r = decodePerson({ "name": "Cleo", "age": 12 })
-    [expect(isError(r)).toBe(true)])
+    [
+      expect(isError(r)).toBe(true)
+    ]
+  ),
 ])
-
 run(s)

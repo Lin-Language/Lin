@@ -1,13 +1,8 @@
 import { expect, toBe, test, suite, run } from "std/test"
-
 import { solve } from "./solver"
-
 import { dijkstra } from "./algorithm"
-
 import { buildAdj, reconstructPath } from "./graph"
-
 import { readJson, writeJson } from "std/fs"
-
 import { join } from "std/string"
 
 // End-to-end over the real entry point: drive solve() — the same fs -> buildAdj ->
@@ -17,73 +12,30 @@ import { join } from "std/string"
 // captured by a spy. A final test checks the algorithm core directly, as a guard
 // that the two agree.
 val graph = {
-  "nodes": [
-    "A",
-    "B",
-    "C",
-    "D",
-    "E"
-  ],
+  "nodes": ["A", "B", "C", "D", "E"],
   "edges": [
-    {
-      "from": "A",
-      "to": "B",
-      "weight": 10
-    },
-    {
-      "from": "A",
-      "to": "C",
-      "weight": 3
-    },
-    {
-      "from": "C",
-      "to": "B",
-      "weight": 4
-    },
-    {
-      "from": "C",
-      "to": "D",
-      "weight": 8
-    },
-    {
-      "from": "B",
-      "to": "D",
-      "weight": 2
-    },
-    {
-      "from": "D",
-      "to": "E",
-      "weight": 5
-    },
-    {
-      "from": "B",
-      "to": "E",
-      "weight": 11
-    }
+    { "from": "A", "to": "B", "weight": 10 },
+    { "from": "A", "to": "C", "weight": 3 },
+    { "from": "C", "to": "B", "weight": 4 },
+    { "from": "C", "to": "D", "weight": 8 },
+    { "from": "B", "to": "D", "weight": 2 },
+    { "from": "D", "to": "E", "weight": 5 },
+    { "from": "B", "to": "E", "weight": 11 }
   ]
 }
 
 replace readJson = (path: String): Json => graph
 
 var savedPath = ""
-
 var savedDistance = 0
-
 var savedPathStr = ""
-
 replace writeJson = (path: String, value: Json, opts: Json): Json =>
   savedPath = path
   savedDistance = value["distance"]
   savedPathStr = value["path"].join(" ")
   null
 
-val nodes = [
-  "A",
-  "B",
-  "C",
-  "D",
-  "E"
-]
+val nodes = ["A", "B", "C", "D", "E"]
 
 val s = suite("dijkstra end-to-end", [
   test("solve drives read -> dijkstra -> path for the optimal A -> E route", () =>
@@ -92,14 +44,16 @@ val s = suite("dijkstra end-to-end", [
       expect(r["type"]).toBe("ok"),
       expect(r["path"].join(" ")).toBe("A C B D E"),
       expect(r["distance"]).toBe(14)
-    ]),
+    ]
+  ),
   test("solve writes the resolved path + distance JSON to the output path", () =>
     val r = solve("graph.json", "A", "E", "result.json")
     [
       expect(savedPath).toBe("result.json"),
       expect(savedDistance).toBe(14),
       expect(savedPathStr).toBe("A C B D E")
-    ]),
+    ]
+  ),
   test("the algorithm core agrees with solve on distances from A", () =>
     val result = dijkstra(buildAdj(graph["edges"]), "A", nodes)
     val dist = result["dist"]
@@ -109,7 +63,7 @@ val s = suite("dijkstra end-to-end", [
       expect(dist["B"]).toBe(7),
       expect(dist["D"]).toBe(9),
       expect(dist["E"]).toBe(14)
-    ])
+    ]
+  ),
 ])
-
 run(s)

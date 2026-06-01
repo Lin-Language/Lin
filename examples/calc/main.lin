@@ -5,10 +5,9 @@
 //
 // Run:   lin run examples/calc/main.lin
 // Test:  lin test examples/calc/
+
 import { calc } from "./calc"
-
 import { print } from "std/io"
-
 import { toString } from "std/string"
 
 // Print "<expr> = <result>" or "<expr> -> error: <msg>" for one input.
@@ -19,15 +18,9 @@ val show = (src: String): Null =>
     else => print("${src} -> ?")
 
 show("2 + 3 * 4")
-
 show("(2 + 3) * 4")
-
 show("100 / 5 / 2")
-
 show("2 * (3 + (4 - 1)) * 2")
-
 show("7 / 0")
-
 show("1 +")
-
 show("@")

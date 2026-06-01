@@ -2,9 +2,7 @@
 // lookup in lin_object, plus object allocation and RC. Builds many small
 // objects and reads several fields from each in a loop.
 import { print } from "std/io"
-
 import { toString } from "std/string"
-
 import { range, map, reduce } from "std/array"
 
 val n = 1000000
@@ -12,6 +10,8 @@ val n = 1000000
 // Build a record per element, then sum a derived value that touches three
 // fields. Field reads are the linear scan we want to measure; chained
 // access (point["x"] etc.) multiplies it.
-val total = range(0, n).map(i => { "x": i, "y": i * 2, "z": i * 3 }).reduce(0, (acc, p) => acc + p["x"] + p["y"] + p["z"])
+val total = range(0, n)
+  .map(i => { "x": i, "y": i * 2, "z": i * 3 })
+  .reduce(0, (acc, p) => acc + p["x"] + p["y"] + p["z"])
 
 print(toString(total))

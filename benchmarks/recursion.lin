@@ -2,20 +2,21 @@
 // and (for fib) non-tail self-recursion. Heavy on Int32 arithmetic which
 // stays unboxed, so this isolates call/return + branch cost.
 import { print } from "std/io"
-
 import { toString } from "std/string"
 
 // Non-tail recursion: naive Fibonacci. Exponential call count.
-val fib = (n: Int32): Int32 => if n < 2 then n else fib(n - 1) + fib(n - 2)
+val fib = (n: Int32): Int32 =>
+  if n < 2 then n
+  else fib(n - 1) + fib(n - 2)
 
 // Tail-recursive sum with an accumulator — should hit the TCO trampoline
 // (direct self-call in tail position becomes a jump).
-val sumTo = (n: Int32, acc: Int32): Int32 => if n == 0 then acc else sumTo(n - 1, acc + n)
+val sumTo = (n: Int32, acc: Int32): Int32 =>
+  if n == 0 then acc
+  else sumTo(n - 1, acc + n)
 
 val a = fib(38)
-
 val b = sumTo(50000000, 0)
 
 print(toString(a))
-
 print(toString(b))

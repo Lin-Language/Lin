@@ -1,21 +1,13 @@
 import { expect, toBe, test, suite, run } from "std/test"
-
 import { fromJson } from "std/json"
 
 type Person = { "name": String, "age": Int32 }
-
 type Opt = { "name": String, "nick": String | Null }
-
 type Addr = { "city": String }
-
 type Nested = { "name": String, "address": Addr }
-
 type IntArr = Int32[]
-
 type Pair = [String, Int32]
-
 type Shape = { "k": String, "r": Float64 } | { "k": String, "w": Int32 }
-
 type Tree = { "value": Int32, "children": Tree[] }
 
 val s = suite("std/json", [
@@ -25,54 +17,122 @@ val s = suite("std/json", [
       expect(p["type"]).toBe(null),
       expect(p["name"]).toBe("Bob"),
       expect(p["age"]).toBe(30)
-    ]),
+    ]
+  ),
+
   test("direct call form fromJson(T, j)", () =>
     val p = fromJson(Person, { "name": "Zoe", "age": 9 })
-    [expect(p["name"]).toBe("Zoe")]),
+    [
+      expect(p["name"]).toBe("Zoe")
+    ]
+  ),
+
   test("missing required field is an error", () =>
     val p = Person.fromJson({ "name": "Bob" })
-    [expect(p["type"]).toBe("error")]),
+    [
+      expect(p["type"]).toBe("error")
+    ]
+  ),
+
   test("missing nullable field is ok", () =>
     val p = Opt.fromJson({ "name": "Bob" })
-    [expect(p["type"]).toBe(null), expect(p["name"]).toBe("Bob")]),
+    [
+      expect(p["type"]).toBe(null),
+      expect(p["name"]).toBe("Bob")
+    ]
+  ),
+
   test("extra field is ignored", () =>
     val p = Person.fromJson({ "name": "Bob", "age": 30, "extra": true })
-    [expect(p["name"]).toBe("Bob")]),
+    [
+      expect(p["name"]).toBe("Bob")
+    ]
+  ),
+
   test("wrong type reports path", () =>
     val p = Person.fromJson({ "name": "Bob", "age": "x" })
-    [expect(p["type"]).toBe("error"), expect(p["path"]).toBe("$.age")]),
+    [
+      expect(p["type"]).toBe("error"),
+      expect(p["path"]).toBe("$.age")
+    ]
+  ),
+
   test("non-integral number rejected for Int target", () =>
     val p = Person.fromJson({ "name": "Bob", "age": 3.14 })
-    [expect(p["type"]).toBe("error")]),
+    [
+      expect(p["type"]).toBe("error")
+    ]
+  ),
+
   test("out-of-range integer rejected", () =>
     val p = Person.fromJson({ "name": "Bob", "age": 5000000000.0 })
-    [expect(p["type"]).toBe("error")]),
+    [
+      expect(p["type"]).toBe("error")
+    ]
+  ),
+
   test("float target accepts an integer", () =>
     val x = Float64.fromJson(5)
-    [expect(x["type"]).toBe(null)]),
+    [
+      expect(x["type"]).toBe(null)
+    ]
+  ),
+
   test("nested object error path", () =>
     val p = Nested.fromJson({ "name": "A", "address": { "city": 5 } })
-    [expect(p["type"]).toBe("error"), expect(p["path"]).toBe("$.address.city")]),
+    [
+      expect(p["type"]).toBe("error"),
+      expect(p["path"]).toBe("$.address.city")
+    ]
+  ),
+
   test("array element error path", () =>
     val a = IntArr.fromJson([1, 2, "x"])
-    [expect(a["type"]).toBe("error"), expect(a["path"]).toBe("$[2]")]),
+    [
+      expect(a["type"]).toBe("error"),
+      expect(a["path"]).toBe("$[2]")
+    ]
+  ),
+
   test("fixed array length mismatch", () =>
     val p = Pair.fromJson(["a", 7, 9])
-    [expect(p["type"]).toBe("error")]),
+    [
+      expect(p["type"]).toBe("error")
+    ]
+  ),
+
   test("union picks first matching variant", () =>
     val ok = Shape.fromJson({ "k": "circle", "r": 1.5 })
     val none = Shape.fromJson({ "k": "x", "z": 9 })
-    [expect(ok["k"]).toBe("circle"), expect(none["type"]).toBe("error")]),
+    [
+      expect(ok["k"]).toBe("circle"),
+      expect(none["type"]).toBe("error")
+    ]
+  ),
+
   test("recursive type decodes", () =>
     val t = Tree.fromJson({ "value": 1, "children": [{ "value": 2, "children": [] }] })
-    [expect(t["children"][0]["value"]).toBe(2)]),
+    [
+      expect(t["children"][0]["value"]).toBe(2)
+    ]
+  ),
+
   test("error value carries type, message, path", () =>
     val e = Person.fromJson({ "name": "Bob", "age": "x" })
-    [expect(e["type"]).toBe("error"), expect(e["path"]).toBe("$.age")]),
+    [
+      expect(e["type"]).toBe("error"),
+      expect(e["path"]).toBe("$.age")
+    ]
+  ),
+
   test("is Error discriminates decoded value from failure", () =>
     val good = Person.fromJson({ "name": "Ada", "age": 36 })
     val bad = Person.fromJson({ "name": "Bob", "age": "x" })
-    [expect(good is Error).toBe(false), expect(bad is Error).toBe(true)])
+    [
+      expect(good is Error).toBe(false),
+      expect(bad is Error).toBe(true)
+    ]
+  ),
 ])
 
 run(s)

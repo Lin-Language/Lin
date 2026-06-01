@@ -1,5 +1,4 @@
 import { for, push, length } from "std/array"
-
 import { toString } from "std/string"
 
 // A priority-queue entry: a node and its current tentative distance.
@@ -17,21 +16,21 @@ val toInt = (v: Json): Int32 =>
 val findMinIdx = (pq: PqEntry[]): Int32 =>
   var minIdx = 0
   var i = 0
-  pq
-    .for(_ =>
-      val di = toInt(pq[i]["dist"])
-      val dm = toInt(pq[minIdx]["dist"])
-      if di < dm then minIdx = i else null
-      i = i + 1)
+  pq.for(_ =>
+    val di = toInt(pq[i]["dist"])
+    val dm = toInt(pq[minIdx]["dist"])
+    if di < dm then minIdx = i
+    i = i + 1
+  )
   minIdx
 
 val removeAt = (pq: PqEntry[], idx: Int32): PqEntry[] =>
   var result = []
   var i = 0
-  pq
-    .for(_ =>
-      if i != idx then push(result, pq[i]) else null
-      i = i + 1)
+  pq.for(_ =>
+    if i != idx then push(result, pq[i])
+    i = i + 1
+  )
   result
 
 val processQueue = (pq: PqEntry[], adj: Json, dist: Json, prev: Json, visited: Json): Null =>
@@ -43,19 +42,18 @@ val processQueue = (pq: PqEntry[], adj: Json, dist: Json, prev: Json, visited: J
     if visited[u] == null then
       lin_object_set(visited, u, true)
       val neighbors = if adj[u] == null then [] else adj[u]
-      neighbors
-        .for(edge =>
-          val v = toString(edge["to"])
-          val du = toInt(dist[u])
-          val ew = toInt(edge["weight"])
-          val dv = toInt(dist[v])
-          val newDist = du + ew
-          if newDist < dv then lin_object_set(dist, v, newDist) else null
+      neighbors.for(edge =>
+        val v = toString(edge["to"])
+        val du = toInt(dist[u])
+        val ew = toInt(edge["weight"])
+        val dv = toInt(dist[v])
+        val newDist = du + ew
+        if newDist < dv then
+          lin_object_set(dist, v, newDist)
           lin_object_set(prev, v, u)
-          push(remaining, { "node": v, "dist": newDist }))
+          push(remaining, { "node": v, "dist": newDist })
+      )
     processQueue(remaining, adj, dist, prev, visited)
-  else
-    null
 
 export val dijkstra = (adj: Json, source: String, allNodes: String[]): DijkstraResult =>
   var dist = {}

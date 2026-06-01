@@ -1,5 +1,4 @@
 import { getIndex, getStatus, getUser } from "./handlers"
-
 import { json, matchPath, HttpRequest as Request, HttpResponse as Response } from "std/http"
 
 export val router = (req: Request): Response =>

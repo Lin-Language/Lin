@@ -3,10 +3,9 @@
 // Each input line is "name,score" (whitespace tolerated). A row parses to a
 // tagged result: { "type": "success", "value": { "name", "score" } } or
 // { "type": "failure", "error": <msg> }. Malformed rows are reported, not fatal.
+
 import { trim, split } from "std/string"
-
 import { isInt32, parseInt32 } from "std/number"
-
 import { length } from "std/array"
 
 // A validated CSV record.
@@ -16,30 +15,19 @@ export type Record = { "name": String, "score": Int32 }
 // type system: string-literal singleton types are not supported), so `Success`
 // and `Failure` are distinguished by pattern-matching on `"type"`.
 export type Success = { "type": String, "value": Record }
-
 export type Failure = { "type": String, "error": String }
-
 export type Parsed = Success | Failure
 
-val fail = (msg: String): Failure => { "type": "failure", "error": msg }
+val fail = (msg: String): Failure =>
+  { "type": "failure", "error": msg }
 
 // Parse one CSV line into a validated record result.
 export val parseRow = (line: String): Parsed =>
   val parts = line.split(",")
-  if length(parts) != 2 then
-    fail("expected 2 fields: ${line}")
+  if length(parts) != 2 then fail("expected 2 fields: ${line}")
   else
     val name = parts[0].trim()
     val scoreStr = parts[1].trim()
-    if name == "" then
-      fail("empty name: ${line}")
-    else if scoreStr.isInt32() == false then
-      fail("bad score: ${line}")
-    else
-      {
-        "type": "success",
-        "value": {
-          "name": name,
-          "score": scoreStr.parseInt32()
-        }
-      }
+    if name == "" then fail("empty name: ${line}")
+    else if scoreStr.isInt32() == false then fail("bad score: ${line}")
+    else { "type": "success", "value": { "name": name, "score": scoreStr.parseInt32() } }

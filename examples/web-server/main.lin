@@ -1,9 +1,6 @@
 import { router } from "./router"
-
 import { serve } from "std/http"
-
 import { print } from "std/io"
 
 print("listening on http://localhost:3000")
-
 router.serve(3000)

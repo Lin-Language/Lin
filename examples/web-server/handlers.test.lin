@@ -1,11 +1,7 @@
 import { expect, toBe, test, suite, run } from "std/test"
-
 import { contains } from "std/string"
-
 import { HttpRequest as Request } from "std/http"
-
 import { render, renderWith } from "std/template"
-
 import { getIndex, getStatus, getUser } from "./handlers"
 
 // Mock `render` (ADR-071): the handler calls `render(path, data)` with a hard-coded
@@ -13,15 +9,11 @@ import { getIndex, getStatus, getUser } from "./handlers"
 // inline template via `renderWith` decouples the handler/routing logic under test
 // from a file on disk. (The real index.lint file rendering is covered separately in
 // template.test.lin.) A mock may call a DIFFERENT symbol — just not itself.
-replace render = (path: String, data: {  }): Json => renderWith("<!DOCTYPE html><title>\${title}</title><h1>\${heading}</h1>", data)
+replace render = (path: String, data: {}): Json =>
+  renderWith("<!DOCTYPE html><title>\${title}</title><h1>\${heading}</h1>", data)
 
-val makeReq = (method: String, path: String): Request => {
-  "method": method,
-  "path": path,
-  "query": "",
-  "headers": {},
-  "body": ""
-}
+val makeReq = (method: String, path: String): Request =>
+  { "method": method, "path": path, "query": "", "headers": {}, "body": "" }
 
 val s = suite("handlers", [
   test("getIndex returns the rendered template HTML in the body", () =>
@@ -34,18 +26,27 @@ val s = suite("handlers", [
       expect(contains(resp["body"], "<!DOCTYPE html>")).toBe(true),
       expect(contains(resp["body"], "Lin Web Server")).toBe(true),
       expect(contains(resp["body"], "Welcome")).toBe(true),
+      // The old bug returned the literal "index"; a rendered body never equals it.
       expect(resp["body"] == "index").toBe(false)
-    ]),
+    ]
+  ),
   test("getStatus returns 200", () =>
-    // The old bug returned the literal "index"; a rendered body never equals it.
     val resp = getStatus(makeReq("GET", "/api/status"))
-    [expect(resp["status"]).toBe(200)]),
+    [
+      expect(resp["status"]).toBe(200)
+    ]
+  ),
   test("getUser returns 200 for valid path", () =>
     val resp = getUser(makeReq("GET", "/users/42"))
-    [expect(resp["status"]).toBe(200)]),
+    [
+      expect(resp["status"]).toBe(200)
+    ]
+  ),
   test("getUser returns 404 for non-matching path", () =>
     val resp = getUser(makeReq("GET", "/other"))
-    [expect(resp["status"]).toBe(404)])
+    [
+      expect(resp["status"]).toBe(404)
+    ]
+  ),
 ])
-
 run(s)

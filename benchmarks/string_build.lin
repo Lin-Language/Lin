@@ -1,15 +1,15 @@
 // Benchmark: string construction — exercises string allocation, the lack of
 // small-string optimisation, RC on strings, and interpolation/concat cost.
 import { print } from "std/io"
-
 import { toString } from "std/string"
-
 import { range, map, reduce, length } from "std/array"
 
 val n = 500000
 
 // Interpolate each integer into a short string, then reduce by total length.
 // Each iteration allocates a fresh LinString (no SSO today) and releases it.
-val totalLen = range(0, n).map(i => "item-${toString(i)}").reduce(0, (acc, s) => acc + length(s))
+val totalLen = range(0, n)
+  .map(i => "item-${toString(i)}")
+  .reduce(0, (acc, s) => acc + length(s))
 
 print(toString(totalLen))

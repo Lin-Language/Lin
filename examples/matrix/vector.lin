@@ -1,8 +1,10 @@
 import { sqrt, atan2 } from "std/math"
 
-export val dot2 = (a: Float64[], b: Float64[]): Float64 => a[0] * b[0] + a[1] * b[1]
+export val dot2 = (a: Float64[], b: Float64[]): Float64 =>
+  a[0] * b[0] + a[1] * b[1]
 
-export val magnitude2 = (v: Float64[]): Float64 => sqrt(v[0] * v[0] + v[1] * v[1])
+export val magnitude2 = (v: Float64[]): Float64 =>
+  sqrt(v[0] * v[0] + v[1] * v[1])
 
 export val angleBetween = (a: Float64[], b: Float64[]): Float64 =>
   val cross = a[0] * b[1] - a[1] * b[0]
