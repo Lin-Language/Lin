@@ -162,7 +162,8 @@ val result = await(p)
 For high-fan-out work, submit many thunks and await each promise:
 
 ```lin
-import { range, push, for } from "std/array"
+import { push } from "std/array"
+import { range, for } from "std/iter"
 
 val promises = []
 range(0, 100).for(i => push(promises, pool.poolAsync(() => work(i))))

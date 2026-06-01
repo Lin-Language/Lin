@@ -65,7 +65,7 @@ The `match` / `is` / `else` pattern is the standard way to inspect union values.
 
 ```lin
 import { print, lines } from "std/io"
-import { for } from "std/array"
+import { for } from "std/iter"
 
 lines().for(line =>
   print("got: ${line}")
@@ -88,7 +88,8 @@ printErr("warning: file not found")
 
 ```lin
 import { print, args } from "std/io"
-import { length, for } from "std/array"
+import { length } from "std/array"
+import { for } from "std/iter"
 
 val arguments = args()
 print("got ${length(arguments)} arguments")

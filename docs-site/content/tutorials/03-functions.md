@@ -138,7 +138,7 @@ val result = fib(1000, 0, 1)   // no stack overflow
 Functions are values. Store them, pass them, return them:
 
 ```lin
-import { map } from "std/array"
+import { map } from "std/iter"
 
 val double = (x: Int32) => x * 2
 val nums = [1, 2, 3, 4]
