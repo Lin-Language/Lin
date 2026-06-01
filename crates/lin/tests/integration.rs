@@ -7353,12 +7353,15 @@ print(toString(a[0] + a[2]))
 }
 
 #[test]
-fn test_index_read_on_var_array_borrows_no_rc() {
-    // RC-elision (borrowed container base): reading an element from a module-`var` (global) array
-    // must NOT retain/release the array — the read borrows it; its owner (the global) outlives the
-    // read. This was the dominant cost of tight index loops (a linear-scan min over `pqDist[j]`
-    // emitted 2 retain + 2 release PER element). The scan fn here reads the global array twice per
-    // step; its body must contain ZERO lin_rc_retain / lin_array_release.
+fn test_index_read_on_var_array_borrows_and_inlines() {
+    // Two optimizations on the flat scalar-array read path, both visible in `scan`:
+    //  1. RC-elision (borrowed base): reading an element from a module-`var` (global) array must
+    //     NOT retain/release the array — the read borrows it; the global outlives the read.
+    //  2. Inline flat read: the element load is emitted INLINE (len-load + bounds check + data
+    //     load), not a `call lin_flat_array_get_i32` — the runtime accessor can't be inlined by
+    //     LLVM (separate staticlib, no LTO), so a call per element dominated tight loops.
+    // Together these were the linear-scan-PQ hot path: `pqDist[j] < pqDist[best]` was 2 retain +
+    // 2 release + 2 calls per element; it is now plain loads.
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
     let ws = workspace_root();
     let src_path = ws.join(format!("target/lin_test_borrow_{}.lin", id));
@@ -7392,15 +7395,70 @@ print(toString(scan(1, 0)))
     let _ = fs::remove_file(&bin_path);
     let _ = fs::remove_file(&ll_path);
 
-    // Isolate the scan function body and assert it borrows (flat read, no RC on the array).
+    // Isolate the scan function body and assert it borrows (no RC on the array) AND reads the
+    // element INLINE — the fast path is a direct load (`flat_get_ok` block + `flat_elem_p` GEP),
+    // not a `call lin_flat_array_get_i32`. The runtime accessor only appears on the cold OOB path
+    // (`flat_get_oob`), so a `call` to it inside the function is allowed but must NOT be on the
+    // straight-line read path.
     let start = ll.find("define i32 @scan(").expect("missing scan fn");
     let body = &ll[start..];
     let end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
     let body = &body[..end];
-    assert!(body.contains("lin_flat_array_get_i32"),
-        "scan must read the array via the flat getter, got:\n{}", body);
+    assert!(body.contains("flat_get_ok") && body.contains("flat_elem_p"),
+        "scan must read the flat array INLINE (fast-path load), got:\n{}", body);
+    // The only `lin_flat_array_get_i32` reference may be the cold OOB fault path; the fast path
+    // must be inline loads, so every such call sits in a `flat_get_oob` block.
     assert!(!body.contains("lin_rc_retain") && !body.contains("lin_array_release"),
         "scan must NOT retain/release the borrowed var array, got:\n{}", body);
+}
+
+#[test]
+fn test_inline_flat_read_index_semantics() {
+    // The inlined flat read must preserve `lin_flat_array_get`'s exact semantics: in-bounds
+    // reads, Python-style negative indexing (`-1` = last, `-len` = first), and the boundary
+    // indices `0` / `len-1`. (OOB faulting is covered separately; here every index is valid.)
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { arrayAllocateFilled, set } from "std/array"
+val a: Int32[] = arrayAllocateFilled(4, 0)
+set(a, 0, 10)
+set(a, 1, 20)
+set(a, 3, 40)
+print("${toString(a[0])} ${toString(a[3])} ${toString(a[-1])} ${toString(a[-4])} ${toString(a[1])}")
+"#);
+    // a[0]=10, a[3]=40, a[-1]=a[3]=40, a[-4]=a[0]=10, a[1]=20
+    assert_eq!(out, vec!["10 40 40 10 20"]);
+}
+
+#[test]
+fn test_inline_flat_read_oob_still_faults() {
+    // The inlined fast path's bounds check must still fault on out-of-bounds (spec §6.1), with the
+    // same message the runtime accessor produced (the cold path defers to it). A non-zero exit +
+    // the "out of bounds" diagnostic on stderr proves the inline bounds check fires.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_oob_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_oob_{}", id));
+    fs::write(&src_path, r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { arrayAllocateFilled } from "std/array"
+val a: Int32[] = arrayAllocateFilled(3, 7)
+print(toString(a[5]))
+"#).unwrap();
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+    let run_out = Command::new(&bin_path).output().expect("failed to run compiled binary");
+    let _ = fs::remove_file(&bin_path);
+    assert!(!run_out.status.success(), "out-of-bounds read must fault (non-zero exit)");
+    let stderr = String::from_utf8_lossy(&run_out.stderr);
+    assert!(stderr.contains("out of bounds"),
+        "expected an out-of-bounds runtime fault, got stderr:\n{}", stderr);
 }
 
 #[test]

@@ -18,18 +18,75 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.call(push_fn, &[arr.into(), val.into()], "");
     }
 
-    /// Load a scalar element from a flat unboxed array (lin_flat_array_get_<suffix>).
+    /// Load a scalar element from a flat unboxed array.
+    ///
+    /// This is INLINED rather than a `call lin_flat_array_get_<suffix>`: the runtime accessor
+    /// lives in the separately-compiled `lin-runtime` staticlib, so LLVM can't inline it (no LTO
+    /// across that boundary), and every read paid a full call + prologue + bounds-check. In a tight
+    /// scalar loop (e.g. Dijkstra's linear-scan min over `pqDist[j]`, ~21M reads) that call
+    /// dominated. Emitting the load inline lets LLVM keep the array pointer in a register, hoist
+    /// the length, and fold the bounds check — matching what Rust/Go compile `a[i]` to.
+    ///
+    /// Semantics mirror `lin_flat_array_get_<sfx>` exactly (lin-runtime/src/array.rs): Python-style
+    /// negative indexing (`idx < 0 → len + idx`) and an OOB runtime fault (spec §6.1). The cold OOB
+    /// path defers to the runtime accessor so the fault message/behaviour stays identical and there
+    /// is no new runtime symbol. LinArray layout (repr(C)): len @ byte 8 (u64), data ptr @ byte 24.
     pub(crate) fn flat_array_get(&mut self, arr: BasicValueEnum<'ctx>, idx: inkwell::values::IntValue<'ctx>, elem_ty: &Type) -> BasicValueEnum<'ctx> {
-        let suffix = Self::flat_suffix(elem_ty);
-        let get_name = format!("lin_flat_array_get_{}", suffix);
         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
         let i64_ty = self.context.i64_type();
         let llvm_elem_ty = self.llvm_type(elem_ty);
-        let get_fn = self.get_or_declare_fn(&get_name,
+        let arr_ptr = arr.into_pointer_value();
+        // Index arrives as i64 (sign-extended at the call site).
+        let idx = if idx.get_type().get_bit_width() == 64 {
+            idx
+        } else {
+            self.builder.int_s_extend(idx, i64_ty, "flat_idx64")
+        };
+
+        // len = *(u64*)(arr + 8)
+        let len_ptr = unsafe {
+            self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(8, false)], "flat_len_p")
+        };
+        let len = self.builder.load(i64_ty, len_ptr, "flat_len").into_int_value();
+
+        // actual = idx < 0 ? len + idx : idx   (matches the runtime's negative-index handling)
+        let zero = i64_ty.const_zero();
+        let is_neg = self.builder.int_compare(IntPredicate::SLT, idx, zero, "flat_idx_neg");
+        let wrapped = self.builder.int_add(len, idx, "flat_idx_wrap");
+        let actual = self.builder
+            .build_select(is_neg, wrapped, idx, "flat_idx_actual")
+            .unwrap()
+            .into_int_value();
+
+        // Bounds check: actual < 0 || actual >= len  → cold OOB path (defers to runtime fault).
+        let below = self.builder.int_compare(IntPredicate::SLT, actual, zero, "flat_oob_lo");
+        let above = self.builder.int_compare(IntPredicate::SGE, actual, len, "flat_oob_hi");
+        let oob = self.builder.or(below, above, "flat_oob");
+
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let ok_b = self.context.append_basic_block(llvm_fn, "flat_get_ok");
+        let oob_b = self.context.append_basic_block(llvm_fn, "flat_get_oob");
+        self.builder.conditional_branch(oob, oob_b, ok_b);
+
+        // Cold OOB path: call the runtime accessor with the ORIGINAL index so its fault message
+        // ("array index {idx} out of bounds") is byte-identical. It does not return.
+        self.builder.position_at_end(oob_b);
+        let suffix = Self::flat_suffix(elem_ty);
+        let get_fn = self.get_or_declare_fn(&format!("lin_flat_array_get_{}", suffix),
             llvm_elem_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
-        self.builder.call(get_fn, &[arr.into(), idx.into()], "flat_get")
-            .try_as_basic_value()
-            .unwrap_basic()
+        self.builder.call(get_fn, &[arr_ptr.into(), idx.into()], "flat_get_oob");
+        self.builder.unreachable();
+
+        // Fast path: data = *(ptr*)(arr + 24); return data[actual]
+        self.builder.position_at_end(ok_b);
+        let data_ptr_ptr = unsafe {
+            self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(24, false)], "flat_data_pp")
+        };
+        let data_ptr = self.builder.load(ptr_ty, data_ptr_ptr, "flat_data").into_pointer_value();
+        let elem_ptr = unsafe {
+            self.builder.in_bounds_gep(llvm_elem_ty, data_ptr, &[actual], "flat_elem_p")
+        };
+        self.builder.load(llvm_elem_ty, elem_ptr, "flat_get")
     }
 
     /// Push a dynamically-typed value (TypeVar or Union) into a tagged LinArray*.
