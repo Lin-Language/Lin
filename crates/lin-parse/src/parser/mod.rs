@@ -126,6 +126,18 @@ impl Parser {
         }
     }
 
+    /// 1-based source column of the current token (0 at end of stream). Used ONLY by the
+    /// inline-block / control-flow-branch parsers to apply the offside rule inside `()`/`[]`/`{}`
+    /// where ADR-004 suppresses Indent/Dedent/Newline. Does not consult or alter the token
+    /// stream shape.
+    pub(crate) fn current_column(&self) -> u32 {
+        if self.pos < self.tokens.len() {
+            self.tokens[self.pos].column
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn expect(&mut self, kind: TokenKind) {
         if self.check(kind.clone()) {
             self.advance();

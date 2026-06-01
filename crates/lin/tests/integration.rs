@@ -2255,6 +2255,95 @@ data.for(x =>
     assert_eq!(output, vec!["a", "b", "a", "b", "a", "b"]);
 }
 
+// Inside a parenthesised lambda body, a multi-statement `if`-then block must keep ALL its
+// statements (the ADR-004 newline-suppression bug used to drop all but the first, making the
+// rest run unconditionally). The offside rule (column > the `if` keyword) delimits the block.
+#[test]
+fn test_multi_statement_if_then_in_inline_lambda() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+var hits = 0
+val run = (): Null =>
+  range(0, 3).for(i =>
+    if i == 0 then
+      hits = hits + 1
+      hits = hits + 10
+      hits = hits + 100
+  )
+run()
+print(toString(hits))
+"#);
+    // Only i == 0 runs the three statements: 1 + 10 + 100 == 111.
+    assert_eq!(output, vec!["111"]);
+}
+
+// The statement AFTER a nested multi-statement `if` (dedented to the if's column) belongs to
+// the enclosing lambda body and runs every iteration; the if-block statements run only when the
+// condition holds. Distinguishes "swallowed too little" from "swallowed too much".
+#[test]
+fn test_statements_after_nested_if_in_inline_lambda() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+var a = 0
+var b = 0
+val run = (): Null =>
+  range(0, 2).for(i =>
+    if i == 0 then
+      a = a + 1
+      a = a + 10
+    b = b + 100
+  )
+run()
+print(toString(a))
+print(toString(b))
+"#);
+    // a: only i == 0 → 1 + 10 == 11. b: both iterations → 200.
+    assert_eq!(output, vec!["11", "200"]);
+}
+
+// A multiline JSON object literal passed as an argument is delimited by `{`/`}`/`,`, NOT by the
+// offside column. The column guard must not fire inside a literal (literals have their own
+// parser). Sanity that the offside change didn't disturb ADR-004 multiline literals in parens.
+#[test]
+fn test_multiline_json_literal_in_parens_unaffected() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val show = (o): Null =>
+  print(toString(o["a"] + o["b"]))
+show({
+  "a": 1,
+  "b": 2,
+})
+"#);
+    assert_eq!(output, vec!["3"]);
+}
+
+// A dot-chain split across newlines inside a parenthesised lambda body must parse as ONE
+// expression (ADR-006). The offside guard only runs BETWEEN statements, never within a single
+// `parse_expr()`, so continuation lines of one expression are never split.
+#[test]
+fn test_dot_chain_across_newlines_in_inline_lambda() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for, map, filter } from "std/iter"
+
+val run = (): Null =>
+  range(0, 5)
+    .map(x => x * 2)
+    .filter(x => x > 2)
+    .for(x =>
+      print(toString(x))
+    )
+run()
+"#);
+    assert_eq!(output, vec!["4", "6", "8"]);
+}
+
 // A line-leading `[` after a statement inside an inline lambda body starts a NEW array-literal
 // statement, not a postfix index on the previous expression. Inside `()` the line break is
 // suppressed as a token (ADR-004), so the parser relies on each token's `newline_before` flag.
