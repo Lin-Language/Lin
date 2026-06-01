@@ -8,26 +8,32 @@ val s = suite("validate", [
   test("nonEmpty accepts a real string", () => [
     expect(isOk(nonEmpty("name", "Ada"))).toBe(true)
   ]),
+
   test("nonEmpty rejects blank/whitespace", () => [
     expect(isOk(nonEmpty("name", "   "))).toBe(false),
     expect(nonEmpty("name", "")["error"]).toBe("name must not be empty")
   ]),
+
   test("email accepts addresses with @ and .", () => [
     expect(isOk(email("a@b.io"))).toBe(true)
   ]),
+
   test("email rejects malformed addresses", () => [
     expect(isOk(email("nope"))).toBe(false),
     expect(isOk(email("a@b"))).toBe(false)
   ]),
+
   test("intInRange accepts an in-range integer string", () => [
     expect(intInRange("age", "36", 0, 150)["value"]).toBe(36)
   ]),
+
   test("intInRange rejects a non-number", () => [
     expect(intInRange("age", "old", 0, 150)["error"]).toBe("age must be a number")
   ]),
+
   test("intInRange rejects out-of-range", () => [
     expect(isOk(intInRange("age", "999", 0, 150))).toBe(false),
     expect(isOk(intInRange("age", "-1", 0, 150))).toBe(false)
-  ]),
+  ])
 ])
 run(s)

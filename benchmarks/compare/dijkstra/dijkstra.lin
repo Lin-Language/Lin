@@ -62,9 +62,12 @@ var pqLen = 1
 // Tail-recursive min-scan over pq[j .. pqLen) — TCO turns it into a loop with no
 // per-pop allocation (range().for would allocate a fresh range array each pop).
 val minFrom = (j: Int32, best: Int32): Int32 =>
-  if j >= pqLen then best
-  else if pqDist[j] < pqDist[best] then minFrom(j + 1, j)
-  else minFrom(j + 1, best)
+  if j >= pqLen then
+    best
+  else if pqDist[j] < pqDist[best] then
+    minFrom(j + 1, j)
+  else
+    minFrom(j + 1, best)
 
 val step = (): Null =>
   if pqLen > 0 then

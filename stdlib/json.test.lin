@@ -132,7 +132,7 @@ val s = suite("std/json", [
       expect(good is Error).toBe(false),
       expect(bad is Error).toBe(true)
     ]
-  ),
+  )
 ])
 
 run(s)

@@ -30,14 +30,18 @@ val isDigit = (c: Int32): Boolean => c >= 48 && c <= 57
 val isSpace = (c: Int32): Boolean => c == 32 || c == 9 || c == 10 || c == 13
 
 val scanNumberEnd = (src: String, i: Int32, n: Int32): Int32 =>
-  if i < n && isDigit(charCode(src, i)) then scanNumberEnd(src, i + 1, n)
-  else i
+  if i < n && isDigit(charCode(src, i)) then
+    scanNumberEnd(src, i + 1, n)
+  else
+    i
 
 val scan = (src: String, i: Int32, n: Int32, tokens: Token[]): Token[] =>
-  if i >= n then tokens
+  if i >= n then
+    tokens
   else
     val c = charCode(src, i)
-    if isSpace(c) then scan(src, i + 1, n, tokens)
+    if isSpace(c) then
+      scan(src, i + 1, n, tokens)
     else if isDigit(c) then
       val end = scanNumberEnd(src, i, n)
       push(tokens, { "kind": "num", "text": src.substring(i, end) })
@@ -57,26 +61,38 @@ val tokenize = (src: String): Token[] =>
 
 // ---- Parser (returns a cursor { node, pos } as dynamic Json) ---------------
 val kindAt = (tokens: Token[], pos: Int32): String =>
-  if pos >= length(tokens) then "eof"
-  else tokens[pos]["kind"]
+  if pos >= length(tokens) then
+    "eof"
+  else
+    tokens[pos]["kind"]
 
 val parseFactor = (tokens: Token[], pos: Int32): Json =>
   val k = kindAt(tokens, pos)
   if k == "num" then
-    { "node": { "kind": "num", "value": tokens[pos]["text"].parseInt32() }, "pos": pos + 1 }
+    {
+      "node": { "kind": "num", "value": tokens[pos]["text"].parseInt32() },
+      "pos": pos + 1
+    }
   else
     val inner = parseExpr(tokens, pos + 1)
     { "node": inner["node"], "pos": inner["pos"] + 1 }
 
 val parseTermLoop = (tokens: Token[], left: Json, pos: Int32): Json =>
   val k = kindAt(tokens, pos)
-  if k != "op" then { "node": left, "pos": pos }
+  if k != "op" then
+    { "node": left, "pos": pos }
   else
     val op = tokens[pos]["text"]
-    if op != "*" && op != "/" then { "node": left, "pos": pos }
+    if op != "*" && op != "/" then
+      { "node": left, "pos": pos }
     else
       val right = parseFactor(tokens, pos + 1)
-      val node = { "kind": "binop", "op": op, "left": left, "right": right["node"] }
+      val node = {
+        "kind": "binop",
+        "op": op,
+        "left": left,
+        "right": right["node"]
+      }
       parseTermLoop(tokens, node, right["pos"])
 
 val parseTerm = (tokens: Token[], pos: Int32): Json =>
@@ -85,13 +101,20 @@ val parseTerm = (tokens: Token[], pos: Int32): Json =>
 
 val parseExprLoop = (tokens: Token[], left: Json, pos: Int32): Json =>
   val k = kindAt(tokens, pos)
-  if k != "op" then { "node": left, "pos": pos }
+  if k != "op" then
+    { "node": left, "pos": pos }
   else
     val op = tokens[pos]["text"]
-    if op != "+" && op != "-" then { "node": left, "pos": pos }
+    if op != "+" && op != "-" then
+      { "node": left, "pos": pos }
     else
       val right = parseTerm(tokens, pos + 1)
-      val node = { "kind": "binop", "op": op, "left": left, "right": right["node"] }
+      val node = {
+        "kind": "binop",
+        "op": op,
+        "left": left,
+        "right": right["node"]
+      }
       parseExprLoop(tokens, node, right["pos"])
 
 val parseExpr = (tokens: Token[], pos: Int32): Json =>
@@ -100,15 +123,20 @@ val parseExpr = (tokens: Token[], pos: Int32): Json =>
 
 // ---- Evaluator -------------------------------------------------------------
 val evalNode = (node: Json): Int32 =>
-  if node["kind"] == "num" then node["value"]
+  if node["kind"] == "num" then
+    node["value"]
   else
     val a = evalNode(node["left"])
     val b = evalNode(node["right"])
     val op = node["op"]
-    if op == "+" then a + b
-    else if op == "-" then a - b
-    else if op == "*" then a * b
-    else a / b
+    if op == "+" then
+      a + b
+    else if op == "-" then
+      a - b
+    else if op == "*" then
+      a * b
+    else
+      a / b
 
 val eval1 = (src: String): Int32 =>
   val parsed = parseExpr(tokenize(src), 0)

@@ -7,7 +7,6 @@ import { length } from "std/array"
 // Each test writes a plaintext fixture, compresses a stream over it to disk (as raw bytes), then
 // decompresses the on-disk compressed file back through a stream and asserts the round-trip.
 // Streams are affine (single-use), so a fresh stream is opened per stage.
-
 val plain = "/tmp/lin_compress_plain.txt"
 val gzPath = "/tmp/lin_compress_out.gz"
 val dfPath = "/tmp/lin_compress_out.deflate"
@@ -74,7 +73,10 @@ val s = suite("std/compress", [
   // gzip directly to a file via writeStream, then gunzip that file and recover the input.
   test("gzip via writeStream then gunzip round-trips a valid gzip file", () =>
     writeFile(plain, "the quick brown fox jumps over the lazy dog\nand a second line\n")
-    readStream(plain).gzip().writeStream(gzPath).drain()
+    readStream(plain)
+      .gzip()
+      .writeStream(gzPath)
+      .drain()
     val recovered = readStream(gzPath).gunzip().readText()
     [
       expect(unwrapStr(recovered)).toBe("the quick brown fox jumps over the lazy dog\nand a second line\n")

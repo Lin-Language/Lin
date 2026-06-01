@@ -8,7 +8,6 @@ import { udpBind, udpRecv, udpRecvFrom, udpSendTo, udpSetNonblocking, udpClose }
 // controlled; we keep only the deterministic UDP round-trip here. A high port
 // is used to avoid privileged-port issues; the integration tests use different
 // ports to avoid collision.
-
 val s = suite("std/net", [
   test("udpBind returns a non-error fd handle", () =>
     val sock = udpBind(39301)
@@ -34,7 +33,16 @@ val s = suite("std/net", [
     val sock = udpBind(39303)
     val msg: UInt8[] = [72, 105, 33]
     val sent = udpSendTo(sock, "127.0.0.1", 39303, msg)
-    val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
+    val buf: UInt8[] = [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
     val res = udpRecvFrom(sock, buf)
     udpClose(sock)
     [
@@ -43,9 +51,9 @@ val s = suite("std/net", [
       expect(res["addr"]).toBe("127.0.0.1"),
       expect(buf[0]).toBe(72),
       expect(buf[1]).toBe(105),
-      expect(buf[2]).toBe(33),
+      expect(buf[2]).toBe(33)
     ]
-  ),
+  )
 ])
 
 run(s)

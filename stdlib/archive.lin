@@ -19,7 +19,6 @@
 // worker via `.promise()`, stored in a field/var/array, or otherwise outlive the callback. The
 // ADR-075 stream placement restriction enforces the lifetime bound; a `.promise()` on `data` would
 // race the shared cursor and is UNSUPPORTED (a dedicated compile-time check for that is a known gap).
-
 // untar(s, body) — drive the whole archive on the calling thread, calling `body(meta, data)` per
 // entry. `meta` is `{ name, size, typeflag, isDir }`; `data` is a `Stream<UInt8[]>` sub-stream over
 // the entry's body (sync-only, see the module caveat). The body's return is ignored. Constant

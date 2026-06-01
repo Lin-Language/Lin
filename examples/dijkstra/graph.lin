@@ -31,7 +31,8 @@ val walkPath = (prev: Json, source: String, path: String[], current: String): Nu
     walkPath(prev, source, path, p)
 
 export val reconstructPath = (prev: Json, source: String, target: String): String[] =>
-  if target == source then [source]
+  if target == source then
+    [source]
   else
     var path = [target]
     walkPath(prev, source, path, target)
