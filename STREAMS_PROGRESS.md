@@ -14,6 +14,15 @@ Commits (oldest→newest): stage 1 plumbing, 2 TAG_STREAM+finalizer, 3 fs.openRe
 6 affine+placement, 7 CAP_MOVE, 8 .promise()+fault-isolation.
 
 TOP THINGS TO REVIEW IN THE MORNING:
+- BACKPRESSURE (bounded-buffer guard landed): `lines()` previously buffered upstream bytes
+  until a newline with NO bound — a newline-less input (e.g. a huge file with no '\n') would
+  grow one unbounded allocation, defeating the constant-memory streaming promise. FIXED: a
+  64 MiB `MAX_LINE_BYTES` cap; exceeding it fails in-band with an Error (surfaced at the
+  terminal like any read error). Regression test `lines_adapter_caps_unbounded_line` (verified
+  fails without the guard). `chunks()` was already self-bounded (drains at `size`). NOTE: this
+  is the *unbounded-buffer* hazard only — single pull-pipelines are self-throttling (each stage
+  pulls one item, writes, repeats). A full demand/credit-based backpressure model (for future
+  buffering / fan-out / merge adapters) is NOT yet designed — flagged as the next design step.
 - DESIGN DEVIATION #5: I made `Stream` SPELLABLE (resolve.rs case, like `Shared`) — the brief
   locked "not spellable". Needed for stdlib wrappers + a formatter bug. Opacity preserved. If you
   want the brief's letter, the alternative is a formatter fix (#5 explains). **Please confirm.**

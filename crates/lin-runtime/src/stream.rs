@@ -232,6 +232,15 @@ unsafe fn close_box(b: *const StreamBox) {
 /// tail still produces a chunk, and the following read returns EOF.
 const FILE_CHUNK: usize = 64 * 1024;
 
+/// Maximum length (bytes) of a single line buffered by `lines()` before its terminator is seen.
+/// `LinesSource` accumulates upstream bytes until it finds a `\n`; without a bound, a pathological
+/// input (a huge file with no newline) would buffer the entire stream into one allocation — an
+/// unbounded-memory hazard that defeats the constant-memory promise of streaming. When a partial
+/// line exceeds this cap, `lines()` fails in-band with an `Error` value (surfaced at the terminal,
+/// like any other read error) rather than growing without limit. 64 MiB is far above any realistic
+/// text line while still bounding the worst case.
+const MAX_LINE_BYTES: usize = 64 * 1024 * 1024;
+
 /// A read backend over an open file. Owns the `File` (closing it drops the fd).
 struct FileSource {
     file: Option<std::fs::File>,
@@ -595,6 +604,15 @@ impl StreamSource for LinesSource {
                 TaggedOutcome::Item(item) => {
                     append_u8_array_to(&mut self.buf, item);
                     crate::tagged::lin_tagged_release(item);
+                    // Bound the partial-line buffer: a stream with no newline must not grow an
+                    // unbounded allocation. Fail in-band once a single line exceeds the cap.
+                    if self.buf.len() > MAX_LINE_BYTES {
+                        self.buf.clear();
+                        return TaggedOutcome::Err(format!(
+                            "lines(): a single line exceeded {} bytes without a newline — refusing to buffer unbounded input",
+                            MAX_LINE_BYTES
+                        ));
+                    }
                 }
             }
         }
@@ -1193,6 +1211,43 @@ mod tests {
             crate::tagged::lin_tagged_release(lines);
             crate::tagged::lin_tagged_release(src); // drop our local ref to the upstream box
             assert_eq!(cc.load(Ordering::SeqCst), 1, "upstream closed exactly once via adapter");
+        }
+    }
+
+    // Backpressure guard: a newline-less stream must NOT buffer unbounded. `lines()` caps the
+    // partial-line buffer at MAX_LINE_BYTES and fails in-band once exceeded. We feed 1 MiB chunks
+    // with no '\n' and assert the adapter returns Err (not OOM) once the cap is crossed, and that
+    // the upstream still closes exactly once afterwards.
+    #[test]
+    fn lines_adapter_caps_unbounded_line() {
+        unsafe {
+            let cc = Arc::new(AtomicUsize::new(0));
+            let chunk = vec![b'x'; 1024 * 1024]; // 1 MiB, no newline
+            let n_chunks = MAX_LINE_BYTES / chunk.len() + 2; // enough to cross the cap
+            let chunks: Vec<Vec<u8>> = (0..n_chunks).map(|_| chunk.clone()).collect();
+            let src = make(chunks, cc.clone(), None);
+            let lines = lin_stream_lines(src as *const u8);
+            // Driving the adapter must surface an Err once the line buffer exceeds the cap,
+            // rather than buffering the whole stream.
+            let mut saw_err = false;
+            for _ in 0..(n_chunks + 4) {
+                match pull_tagged(unwrap_stream(lines)) {
+                    TaggedOutcome::Err(m) => {
+                        assert!(m.contains("without a newline"), "unexpected err: {m}");
+                        saw_err = true;
+                        break;
+                    }
+                    TaggedOutcome::Eof => panic!("hit EOF before the cap fired — buffer was unbounded"),
+                    TaggedOutcome::Item(item) => {
+                        crate::tagged::lin_tagged_release(item);
+                        panic!("emitted a line for newline-less input before the cap");
+                    }
+                }
+            }
+            assert!(saw_err, "lines() never enforced MAX_LINE_BYTES");
+            crate::tagged::lin_tagged_release(lines);
+            crate::tagged::lin_tagged_release(src);
+            assert_eq!(cc.load(Ordering::SeqCst), 1, "upstream closed exactly once after cap error");
         }
     }
 
