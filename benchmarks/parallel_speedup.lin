@@ -8,8 +8,7 @@
 import { print } from "std/io"
 import { toString } from "std/string"
 import { parallel } from "std/async"
-import { for } from "std/array"
-
+import { for } from "std/iter"
 // Data-dependent integer walk; `n` iterations accumulating a running sum.
 val walk = (start: Int32, n: Int32, steps: Int32): Int32 =>
   if n == 0 then steps

@@ -19,7 +19,8 @@
 import { print } from "std/io"
 import { toString } from "std/string"
 import { threadPool, poolAsync, await } from "std/async"
-import { push, for, range } from "std/array"
+import { push } from "std/array"
+import { for, range } from "std/iter"
 import { sleep } from "std/time"
 
 val task = (i: Int32): Int32 =>

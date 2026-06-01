@@ -2,8 +2,8 @@
 // small-string optimisation, RC on strings, and interpolation/concat cost.
 import { print } from "std/io"
 import { toString } from "std/string"
-import { range, map, reduce, length } from "std/array"
-
+import { length } from "std/array"
+import { range, map, reduce } from "std/iter"
 val n = 500000
 
 // Interpolate each integer into a short string, then reduce by total length.
