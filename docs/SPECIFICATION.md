@@ -1416,14 +1416,14 @@ some(p) / every(p)        Boolean                 Boolean | Error      (terminal
 The dispatch is a closed, type-directed special-case over this fixed name set, not general function overloading. The precedent is `for` (§18.1), which already returns `Null` over an array and `Null | Error` over a stream. One import gives a single fluent chain that runs eagerly over an array and lazily, with bounded memory, over a stream:
 
 ```txt
-import { map, filter, take, reduce } from "std/iter"
+import { map, drop, take, reduce } from "std/iter"
 import { readStream } from "std/stream"
 
 val total = readStream("data.csv")
   .lines()                                   // Stream<String>
   .drop(1)                                   // Stream<String>  (lazy)
   .take(4)                                   // Stream<String>  (lazy)
-  .map(line => line.split(",").at(2).parseInt32())   // Stream<Int32>
+  .map(line => line.length())                // Stream<Int32>
   .reduce(0, (acc, n) => acc + n)            // Int32 | Error  (terminal)
 ```
 
