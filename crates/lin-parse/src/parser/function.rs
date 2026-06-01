@@ -146,9 +146,37 @@ impl Parser {
     }
 
     pub(crate) fn parse_inline_block(&mut self) -> Expr {
+        // The offside column is anchored on the FIRST statement of the block. Subsequent
+        // statements that dedent below it belong to an enclosing block. Using 0 as the base
+        // until the first statement is read means the very first statement is always accepted.
+        self.parse_inline_block_inner(None)
+    }
+
+    /// Parse a column-delimited block of an `if`/`else` branch inside parens. `if_col` is the
+    /// 1-based column of the controlling `if` keyword; statements with column STRICTLY GREATER
+    /// than `if_col` belong to the branch, and the first statement at column <= `if_col` ends it.
+    /// Also stops at `else`, the closing delimiters, comma and EOF (handled in the inner loop).
+    pub(crate) fn parse_branch_block(&mut self, if_col: u32) -> Expr {
+        self.parse_inline_block_inner(Some(if_col))
+    }
+
+    /// Shared inline-block loop. `min_col`, when set, is an EXCLUSIVE column floor: a statement
+    /// whose column is <= `min_col` ends the block (offside rule for `if`/`else` branches).
+    /// When `None`, the floor is taken from the first statement's column and applied to
+    /// subsequent statements (so an inline lambda body's own statements stay together but a
+    /// statement that dedents below the body's start belongs to the enclosing block).
+    ///
+    /// IMPORTANT: the column is only checked BETWEEN statements, never within a single
+    /// `parse_expr()` call. Continuation lines of one expression (`x\n  + y`) and dot-chains
+    /// across newlines (`foo\n  .bar()`, ADR-006) are consumed whole by one `parse_expr()` and
+    /// are therefore never split by this guard.
+    fn parse_inline_block_inner(&mut self, min_col: Option<u32>) -> Expr {
         let span = self.current_span();
         let mut stmts = Vec::new();
         let mut last_expr: Option<Expr> = None;
+        // The exclusive column floor. For a branch block this is the `if` column. For a plain
+        // inline lambda body it is (first-statement-column - 1), established lazily below.
+        let mut floor: Option<u32> = min_col;
 
         loop {
             if self.check(TokenKind::Newline)
@@ -160,6 +188,21 @@ impl Parser {
                 || self.is_at_end()
             {
                 break;
+            }
+            // A branch block also ends at `else` (it belongs to the enclosing `if`).
+            if min_col.is_some() && self.check(TokenKind::Else) {
+                break;
+            }
+            // Offside guard: a statement that dedents to or below the floor ends this block.
+            // Only consulted between statements (the leading token of each statement).
+            if let Some(f) = floor {
+                if self.current_column() <= f {
+                    break;
+                }
+            } else {
+                // First statement of a plain inline body: anchor the floor just below its
+                // column so equal-column siblings continue the block but dedents break out.
+                floor = Some(self.current_column().saturating_sub(1));
             }
 
             match self.peek_kind() {

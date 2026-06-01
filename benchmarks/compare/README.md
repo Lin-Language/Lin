@@ -1,7 +1,7 @@
 # Lin cross-language comparison suite
 
 A self-contained suite that compares **Lin** against **Go, Rust, Python and
-Node.js** on five identical workloads, and prints a single table of min
+Node.js** on six identical workloads, and prints a single table of min
 wall-clock milliseconds (lower = faster).
 
 This is **indicative, not authoritative**. It measures whole-process wall-clock
@@ -26,7 +26,7 @@ factored out.
 Lin and Rust binaries are built once per run and timed; Go is built with
 `go build`; Python and Node run their scripts directly.
 
-## The five workloads
+## The six workloads
 
 Every implementation prints **exactly one** stdout line `RESULT=<int>` (all
 other logging goes to stderr); the runner uses that value as a correctness gate
@@ -36,6 +36,7 @@ all languages and are the single source of truth:
 | Workload   | What it exercises | Fixed parameters | Pinned `RESULT` |
 |------------|-------------------|------------------|-----------------|
 | `dijkstra` | Graph build + linear-scan-PQ shortest path + input parsing | N=4000 nodes, ~33163 edges, source `n0`, target `n3999` | `121789671` |
+| `interp`   | Expression interpreter: tokenize → recursive-descent parse → tree-walk eval | REPS=10000 over 8 fixed exprs | `10460000` |
 | `parallel` | CPU-bound fan-out across threads/processes | START=27, ITERS=300000000, CHUNKS=8 | `2173714077200` |
 | `recursion`| Recursive call overhead (`fib`) + iterative loop (`sumTo`) | FIB_N=42, SUM_N=50000000 | `269164297900400072` |
 | `pipeline` | Eager `map`/`filter`/`reduce`, materializing each stage | N=20000000 | `133333326666666` |
@@ -51,6 +52,15 @@ Per-workload checksum definitions:
 - **dijkstra**: `dist[n3999] * 1000003 + (sum of all finite dist values mod 1e9)`,
   in 64-bit. "Finite" means `dist < 1000000000` (the infinity sentinel). For the
   committed graph: `dist[n3999]=121`, `sumFinite=789308` → `121789671`.
+- **interp**: a faithful port of `examples/calc/` — a tokenizer → recursive-descent
+  parser (`expr = term (('+'|'-') term)*`, standard precedence) → tree-walking
+  evaluator, run over 8 fixed integer expressions REPS=10000 times. Every
+  expression evaluates successfully (no div-by-zero) and uses truncating integer
+  division, so the result is deterministic. `RESULT` = sum of all evaluated values
+  = (14+20+10+24+21+10+31+916) × 10000 = `10460000`. This is a second *generalized*
+  workload (like dijkstra): unlike the micro-benchmarks below it stresses
+  per-iteration allocation (token arrays + AST nodes), string scanning, recursion,
+  and tagged-union dispatch — representative of real interpreter/parser code.
 - **parallel**: sum of the 8 chunk results. Each chunk runs `walk(27, 300000000)`,
   a Collatz-style integer walk (`next = 27 if start==1 else start/2 if even else
   3*start+1`) accumulating `steps + start` in 64-bit. One chunk = `271714259650`,

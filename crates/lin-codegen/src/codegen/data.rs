@@ -58,10 +58,10 @@ impl<'ctx> Codegen<'ctx> {
             .unwrap()
             .into_int_value();
 
-        // Bounds check: actual < 0 || actual >= len  → cold OOB path (defers to runtime fault).
-        let below = self.builder.int_compare(IntPredicate::SLT, actual, zero, "flat_oob_lo");
-        let above = self.builder.int_compare(IntPredicate::SGE, actual, len, "flat_oob_hi");
-        let oob = self.builder.or(below, above, "flat_oob");
+        // Bounds check folded to a single UNSIGNED compare: `(u64)actual >= (u64)len` catches
+        // BOTH `actual < 0` (a still-negative wrap reads as a huge unsigned value ≥ len) and
+        // `actual >= len`. Equivalent to the runtime's two signed compares, one instruction.
+        let oob = self.builder.int_compare(IntPredicate::UGE, actual, len, "flat_oob");
 
         let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
         let ok_b = self.context.append_basic_block(llvm_fn, "flat_get_ok");

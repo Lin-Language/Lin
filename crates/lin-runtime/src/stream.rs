@@ -984,6 +984,130 @@ impl StreamSource for ConcatSource {
     }
 }
 
+// -------------------------------------------------------------------------
+// Streaming compression byte-adapters (std/compress). gzip/gunzip use the gzip container;
+// deflate/inflate use the raw DEFLATE bitstream. Each wraps a `Stream<UInt8[]>` and runs its bytes
+// through the low-level streaming flate2 `Compress`/`Decompress` engine INCREMENTALLY: each
+// `read_tagged` pulls ONE upstream chunk, feeds it through the codec, and emits whatever output
+// bytes were produced. At upstream EOF the codec is FINISHED (flushed) and the tail emitted. A
+// decode/encode fault becomes an in-band `TaggedOutcome::Err`. RC discipline mirrors the other
+// adapters EXACTLY: release each pulled item after consuming its bytes; return a freshly-owned
+// `UInt8[]` box; propagate upstream `Err` straight through; close the upstream in `close()`.
+// -------------------------------------------------------------------------
+
+use flate2::write::{DeflateDecoder, DeflateEncoder, GzEncoder, MultiGzDecoder};
+use flate2::Compression;
+use std::io::Write;
+
+// The (de)compression engine behind a `CodecSource`. We use flate2's WRITE-based streaming
+// wrappers, each writing into an owned `Vec<u8>` sink: feeding a chunk via `write_all` runs it
+// through the engine and appends whatever output bytes were produced to the sink — i.e. genuinely
+// INCREMENTAL, one upstream chunk at a time (no whole-buffer convenience fns). After each feed we
+// drain the sink; at upstream EOF we `try_finish()` and drain the tail.
+//
+// (Deviation note: the brief asked for the low-level `Compress`/`Decompress` mem API. With the
+// pure-Rust `miniz_oxide` backend the gzip CONTAINER framing is only reachable through these
+// write wrappers — `Compress::new_gzip`/`Decompress::new_gzip` are gated behind a C-zlib feature
+// we deliberately do not enable. The write wrappers give the same incremental, chunk-at-a-time
+// behaviour, so all four codecs share this one uniform driver.)
+enum Codec {
+    GzEnc(GzEncoder<Vec<u8>>),
+    GzDec(MultiGzDecoder<Vec<u8>>),
+    DfEnc(DeflateEncoder<Vec<u8>>),
+    DfDec(DeflateDecoder<Vec<u8>>),
+}
+
+impl Codec {
+    /// Feed `input` through the engine; the engine appends produced bytes to its internal sink.
+    fn feed(&mut self, input: &[u8]) -> std::io::Result<()> {
+        match self {
+            Codec::GzEnc(w) => w.write_all(input),
+            Codec::GzDec(w) => w.write_all(input),
+            Codec::DfEnc(w) => w.write_all(input),
+            Codec::DfDec(w) => w.write_all(input),
+        }
+    }
+    /// Finish the engine (flush the tail into the sink).
+    fn finish(&mut self) -> std::io::Result<()> {
+        match self {
+            Codec::GzEnc(w) => w.try_finish(),
+            Codec::GzDec(w) => w.try_finish(),
+            Codec::DfEnc(w) => w.try_finish(),
+            Codec::DfDec(w) => w.try_finish(),
+        }
+    }
+    /// Drain (take) the bytes accumulated in the engine's sink so far.
+    fn take_sink(&mut self) -> Vec<u8> {
+        match self {
+            Codec::GzEnc(w) => std::mem::take(w.get_mut()),
+            Codec::GzDec(w) => std::mem::take(w.get_mut()),
+            Codec::DfEnc(w) => std::mem::take(w.get_mut()),
+            Codec::DfDec(w) => std::mem::take(w.get_mut()),
+        }
+    }
+}
+
+/// A streaming (de)compression adapter over an upstream byte stream.
+struct CodecSource {
+    up: Upstream,
+    codec: Codec,
+    /// True once the upstream has signalled EOF; the next drive FINISHES the codec.
+    upstream_done: bool,
+    /// True once the codec has been finished+flushed and its tail emitted — further reads → EOF.
+    finished: bool,
+}
+// Same single-owner-thread invariant as the other adapter sources: a stream pipeline is only ever
+// touched by the thread that drives it (Send asserted on that invariant).
+unsafe impl Send for CodecSource {}
+
+impl StreamSource for CodecSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        loop {
+            if self.finished {
+                return TaggedOutcome::Eof;
+            }
+            // At upstream EOF, finish the codec once and emit the flushed tail.
+            if self.upstream_done {
+                let fin = self.codec.finish();
+                let tail = self.codec.take_sink();
+                self.finished = true;
+                if let Err(e) = fin {
+                    return TaggedOutcome::Err(e.to_string());
+                }
+                if !tail.is_empty() {
+                    return TaggedOutcome::Item(bytes_to_u8_array(&tail));
+                }
+                return TaggedOutcome::Eof;
+            }
+            match pull_tagged(self.up.boxptr) {
+                TaggedOutcome::Eof => {
+                    self.upstream_done = true;
+                    // Loop back to run the finish flush.
+                }
+                TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
+                TaggedOutcome::Item(item) => {
+                    // Gather the chunk's bytes, release our pulled reference, feed the engine.
+                    let mut chunk = Vec::new();
+                    append_u8_array_to(&mut chunk, item);
+                    crate::tagged::lin_tagged_release(item);
+                    if let Err(e) = self.codec.feed(&chunk) {
+                        self.finished = true;
+                        return TaggedOutcome::Err(e.to_string());
+                    }
+                    let out = self.codec.take_sink();
+                    if !out.is_empty() {
+                        return TaggedOutcome::Item(bytes_to_u8_array(&out));
+                    }
+                    // Produced nothing this chunk (codec buffering) — pull the next.
+                }
+            }
+        }
+    }
+    fn close(&mut self) {
+        unsafe { self.up.close(); }
+    }
+}
+
 /// Append the bytes of a tagged `UInt8[]` array `item` to `buf`. Non-array items contribute
 /// nothing (defensive; a byte pipeline only ever carries UInt8[] here).
 unsafe fn append_u8_array_to(buf: &mut Vec<u8>, item: *mut u8) {
@@ -1012,14 +1136,20 @@ unsafe fn string_to_tagged(bytes: &[u8]) -> *mut u8 {
 // Sink + terminal drivers (Stage 4).
 // -------------------------------------------------------------------------
 
-/// A push sink that writes every upstream item to a file, one item per line. Built lazily by
-/// `writeStream`; nothing happens until a terminal driver (`.drain()`) pulls it. The sink is
-/// itself a `StreamBox` whose `read_tagged` is never meant to be pulled item-by-item by an
-/// adapter — instead `lin_stream_drain` recognises it and runs the write loop. We still model it
-/// as a source so it composes uniformly and shares the close/finalizer machinery.
+/// A push sink that writes every upstream item to a file. Built lazily by `writeStream`
+/// (RAW: each item's bytes verbatim, concatenated, no separator) or `writeLines`
+/// (`line_mode = true`: each item's bytes followed by `\n`). Nothing happens until a terminal
+/// driver (`.drain()`) pulls it. The sink is itself a `StreamBox` whose `read_tagged` is never
+/// meant to be pulled item-by-item by an adapter — instead `lin_stream_drain` recognises it and
+/// runs the write loop. We still model it as a source so it composes uniformly and shares the
+/// close/finalizer machinery.
 struct WriteSink {
     up: Upstream,
     path: String,
+    /// When true, append `\n` after every item (line-oriented `writeLines`). When false, write
+    /// each item's bytes verbatim with no separator (raw `writeStream`) — required so binary
+    /// output (e.g. `gzip(s).writeStream(...)`) is not corrupted by injected newlines.
+    line_mode: bool,
 }
 impl StreamSource for WriteSink {
     unsafe fn read_tagged(&mut self) -> TaggedOutcome {
@@ -1034,23 +1164,30 @@ impl StreamSource for WriteSink {
     }
 }
 
-/// Drive a `WriteSink` to completion on the CALLING thread (brief §5): pull every upstream item,
-/// write each as a UTF-8 line, until EOF (success → Null) or the first Err (→ Error object). The
-/// file is opened once; an open/write failure short-circuits to an Error.
+/// Drive a `WriteSink` to completion on the CALLING thread (brief §5): pull every upstream item
+/// and write its bytes to the file, until EOF (success → Null) or the first Err (→ Error object).
+/// In raw mode the items' bytes are concatenated verbatim (no separator); in line mode each item
+/// is followed by a `\n`. The file is opened once; an open/write failure short-circuits to Error.
 unsafe fn drive_sink(sink: &mut WriteSink) -> *mut u8 {
     use std::io::Write;
     let mut file = match std::fs::File::create(&sink.path) {
         Ok(f) => f,
         Err(e) => return crate::fs::make_error_tagged(&e.to_string()),
     };
+    let line_mode = sink.line_mode;
     loop {
         match pull_tagged(sink.up.boxptr) {
             TaggedOutcome::Eof => return std::ptr::null_mut(), // Null = success
             TaggedOutcome::Err(m) => return crate::fs::make_error_tagged(&m),
             TaggedOutcome::Item(item) => {
-                let line = item_to_line_bytes(item);
+                let bytes = item_to_line_bytes(item);
                 crate::tagged::lin_tagged_release(item);
-                if let Err(e) = file.write_all(&line).and_then(|_| file.write_all(b"\n")) {
+                let write = if line_mode {
+                    file.write_all(&bytes).and_then(|_| file.write_all(b"\n"))
+                } else {
+                    file.write_all(&bytes)
+                };
+                if let Err(e) = write {
                     return crate::fs::make_error_tagged(&e.to_string());
                 }
             }
@@ -1058,8 +1195,9 @@ unsafe fn drive_sink(sink: &mut WriteSink) -> *mut u8 {
     }
 }
 
-/// Render a tagged item as the bytes to write for one sink line: a String writes its UTF-8
+/// Render a tagged item as the bytes to write for one sink item: a String writes its UTF-8
 /// bytes; a UInt8[] writes its raw bytes; anything else writes its `toString` rendering.
+/// (The line-mode `\n` separator is appended by `drive_sink`, NOT here.)
 unsafe fn item_to_line_bytes(item: *mut u8) -> Vec<u8> {
     use crate::tagged::{lin_get_tag, lin_unbox_ptr, TAG_STR, TAG_ARRAY, TAG_UINT8, TAG_INT8};
     match lin_get_tag(item) {
@@ -1222,6 +1360,54 @@ pub unsafe extern "C" fn lin_stream_concat(a: *const u8, b: *const u8) -> *mut u
     StreamBox::new_boxed(Box::new(ConcatSource { a: ua, b: ub, on_b: false }))
 }
 
+/// `gunzip(s)` → a `Stream<UInt8[]>` that decompresses a gzip-framed byte stream incrementally.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_gunzip(s: *const u8) -> *mut u8 {
+    let up = own_upstream(s);
+    StreamBox::new_boxed(Box::new(CodecSource {
+        up,
+        codec: Codec::GzDec(MultiGzDecoder::new(Vec::new())),
+        upstream_done: false,
+        finished: false,
+    }))
+}
+
+/// `gzip(s)` → a `Stream<UInt8[]>` that compresses a byte stream into the gzip container format.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_gzip(s: *const u8) -> *mut u8 {
+    let up = own_upstream(s);
+    StreamBox::new_boxed(Box::new(CodecSource {
+        up,
+        codec: Codec::GzEnc(GzEncoder::new(Vec::new(), Compression::default())),
+        upstream_done: false,
+        finished: false,
+    }))
+}
+
+/// `inflate(s)` → a `Stream<UInt8[]>` that decompresses a raw DEFLATE byte stream incrementally.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_inflate(s: *const u8) -> *mut u8 {
+    let up = own_upstream(s);
+    StreamBox::new_boxed(Box::new(CodecSource {
+        up,
+        codec: Codec::DfDec(DeflateDecoder::new(Vec::new())),
+        upstream_done: false,
+        finished: false,
+    }))
+}
+
+/// `deflate(s)` → a `Stream<UInt8[]>` that compresses a byte stream as a raw DEFLATE bitstream.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_deflate(s: *const u8) -> *mut u8 {
+    let up = own_upstream(s);
+    StreamBox::new_boxed(Box::new(CodecSource {
+        up,
+        codec: Codec::DfEnc(DeflateEncoder::new(Vec::new(), Compression::default())),
+        upstream_done: false,
+        finished: false,
+    }))
+}
+
 /// `lines(s)` → a `Stream<String>` of newline-delimited lines over the byte stream `s`.
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_lines(s: *const u8, max_bytes: i64) -> *mut u8 {
@@ -1239,13 +1425,25 @@ pub unsafe extern "C" fn lin_stream_chunks(s: *const u8, n: i64) -> *mut u8 {
     StreamBox::new_boxed(Box::new(ChunksSource { up, size, buf: Vec::new(), upstream_done: false }))
 }
 
-/// `writeStream(s, path)` → a sink `Stream` that, when driven, writes each item of `s` to `path`
-/// (one item per line). Lazy: no file is opened until `drain()`/`promise()` drives it.
+/// `writeStream(s, path)` → a RAW sink `Stream` that, when driven, writes each item of `s` to
+/// `path` byte-for-byte, concatenated with NO separator (a String item writes its UTF-8 bytes, a
+/// UInt8[] item its raw bytes, anything else its `toString`). Lazy: no file is opened until
+/// `drain()`/`promise()` drives it. Use `writeLines` for newline-delimited output.
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_write(s: *const u8, path: *const u8) -> *mut u8 {
     let path_str = crate::fs::resolve_lin_str(path).unwrap_or_default();
     let up = own_upstream(s);
-    StreamBox::new_boxed(Box::new(WriteSink { up, path: path_str }))
+    StreamBox::new_boxed(Box::new(WriteSink { up, path: path_str, line_mode: false }))
+}
+
+/// `writeLines(s, path)` → a LINE-oriented sink `Stream` that, when driven, writes each item of
+/// `s` to `path` followed by a `\n` (one item per line). Lazy: no file is opened until
+/// `drain()`/`promise()` drives it. Use `writeStream` for raw, verbatim byte output.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_write_lines(s: *const u8, path: *const u8) -> *mut u8 {
+    let path_str = crate::fs::resolve_lin_str(path).unwrap_or_default();
+    let up = own_upstream(s);
+    StreamBox::new_boxed(Box::new(WriteSink { up, path: path_str, line_mode: true }))
 }
 
 /// `.drain()` → drive the pipeline to completion on the CALLING thread → `Null | Error`
@@ -1547,6 +1745,455 @@ pub unsafe extern "C" fn lin_stream_release_box(b: *const u8) {
         close_box(b);
         drop(Box::from_raw(b as *mut StreamBox));
     }
+}
+
+// =====================================================================================
+// `std/archive` — tar splitting over a `Stream<UInt8[]>` (ADR-072 streams; std/archive surface).
+//
+// A tar archive is a flat concatenation of 512-byte-aligned (header + body) records. This module
+// turns a byte stream into archive entries WITHOUT buffering the whole archive — the parent stream
+// is pulled one chunk at a time and the active entry's body is yielded as a bounded SUB-STREAM.
+//
+// Three surfaces (all CONSUME the parent stream by move):
+//   * `lin_stream_untar(s, body)` — TERMINAL. Drives the whole archive on the calling thread,
+//     calling `body(meta, data)` per entry where `data` is a `Stream<UInt8[]>` sub-stream over that
+//     entry's body. Returns `Null | Error`. The constant-memory primitive.
+//   * `lin_stream_manifest(s)` — ADAPTER → `Stream<Object>`: yields each entry's meta object and
+//     SKIPS its body (meta-only listing).
+//   * `lin_stream_files(s)` — ADAPTER → `Stream<Object>`: yields `{name, data, size, …}` where
+//     `data` is the entry's full body buffered into a `UInt8[]`.
+//
+// SUB-STREAM RC CONTRACT (untar): `untar` owns the parent via an `Arc<Mutex<TarReaderState>>`. Per
+// entry it MINTS a `BoundedSource` boxed as TAG_STREAM (rc=1), passes it BORROWED to `body` (the
+// 2-arg `call2_caught` ABI; the caller owns it), then releases the body's return value, reads back
+// `current_entry_remaining` from the shared state, skips that many bytes + tar padding, and finally
+// releases its OWN ref to the sub-stream box (rc→0; the no-op `close` leaves the parent untouched).
+// SYNC-ONLY: the sub-stream is valid only DURING the body's synchronous execution (the driver is
+// paused). Handing `data` to a worker (`.promise()`) would race the shared cursor and is UNSUPPORTED
+// (bounded by the ADR-075 placement restriction — `data` cannot be stored in a field/var/array).
+// =====================================================================================
+
+/// Shared cursor over the parent byte stream + the active entry's remaining body length. `untar`
+/// owns the parent (one ref); a per-entry `BoundedSource` holds a clone of the `Arc`.
+struct TarReaderState {
+    /// The parent upstream (one owned ref). Closed exactly once when the reader finishes.
+    up: Upstream,
+    /// Bytes pulled from upstream but not yet consumed (header bytes, body bytes, padding).
+    buf: Vec<u8>,
+    /// True once the parent has signalled EOF (or errored).
+    upstream_done: bool,
+    /// True once the parent has produced an in-band read Error (short-circuits the driver).
+    upstream_err: Option<String>,
+    /// Bytes of the CURRENT entry's body not yet handed out by the BoundedSource.
+    current_entry_remaining: usize,
+}
+unsafe impl Send for TarReaderState {}
+
+impl TarReaderState {
+    /// Pull from the parent until `buf` holds at least `n` bytes or the parent is exhausted.
+    /// An in-band read Error sets `upstream_err` and stops. Returns true if `buf.len() >= n`.
+    unsafe fn fill_at_least(&mut self, n: usize) -> bool {
+        while self.buf.len() < n && !self.upstream_done {
+            match pull_tagged(self.up.boxptr) {
+                TaggedOutcome::Item(item) => {
+                    append_u8_array_to(&mut self.buf, item);
+                    crate::tagged::lin_tagged_release(item);
+                }
+                TaggedOutcome::Eof => self.upstream_done = true,
+                TaggedOutcome::Err(m) => {
+                    self.upstream_done = true;
+                    if self.upstream_err.is_none() {
+                        self.upstream_err = Some(m);
+                    }
+                }
+            }
+        }
+        self.buf.len() >= n
+    }
+
+    /// Take up to `n` bytes off the front of `buf` (filling from upstream as needed).
+    unsafe fn take_front(&mut self, n: usize) -> Vec<u8> {
+        self.fill_at_least(n);
+        let take = n.min(self.buf.len());
+        self.buf.drain(..take).collect()
+    }
+}
+
+/// Parsed tar header fields we care about.
+struct TarEntryMeta {
+    name: String,
+    size: usize,
+    typeflag: u8,
+}
+
+/// Parse a 512-byte tar (ustar) header. An all-zero block (end-of-archive) returns None. Tolerant:
+/// a truncated/short block returns None; an empty ustar `prefix` field degrades to the bare name
+/// (no full GNU/pax long-name support in v1, but never crashes on it).
+fn parse_tar_header(block: &[u8]) -> Option<TarEntryMeta> {
+    if block.len() < 512 || block[..512].iter().all(|&b| b == 0) {
+        return None;
+    }
+    // name: 100 bytes at offset 0, NUL-trimmed.
+    let name_end = block[0..100].iter().position(|&b| b == 0).unwrap_or(100);
+    let mut name = String::from_utf8_lossy(&block[0..name_end]).into_owned();
+    // ustar `prefix`: 155 bytes at offset 345 (a path prefix joined with '/'). Tolerate an empty
+    // prefix (the common case) — degrade gracefully if present but malformed.
+    if block.len() >= 500 {
+        let prefix_end = block[345..345 + 155].iter().position(|&b| b == 0).unwrap_or(155);
+        if prefix_end > 0 {
+            let prefix = String::from_utf8_lossy(&block[345..345 + prefix_end]);
+            name = format!("{}/{}", prefix, name);
+        }
+    }
+    // size: 12 bytes at offset 124, octal ASCII (NUL/space-trimmed).
+    let size_field = &block[124..136];
+    let size_str: String = size_field
+        .iter()
+        .take_while(|&&b| b != 0 && b != b' ')
+        .map(|&b| b as char)
+        .collect();
+    let size = usize::from_str_radix(size_str.trim(), 8).unwrap_or(0);
+    // typeflag: 1 byte at offset 156.
+    let typeflag = block[156];
+    Some(TarEntryMeta { name, size, typeflag })
+}
+
+/// Round a body size up to the next 512-byte boundary (tar pads each body with NULs).
+fn padded_len(size: usize) -> usize {
+    size.div_ceil(512) * 512
+}
+
+/// Build the pure-JSON `meta` object for a tar entry:
+///   `{ name: String, size: Int64, typeflag: String, isDir: Boolean }`.
+/// Returned value is independently owned (release with `lin_tagged_release`). Leak-clean: each
+/// `lin_object_set` retains its own key/value, so the local +1 from each `make_string` is released.
+unsafe fn make_meta_object(meta: &TarEntryMeta) -> *mut u8 {
+    use crate::object::{lin_object_alloc, lin_object_set};
+    use crate::string::lin_string_release;
+    use crate::tagged::{alloc_tagged, TAG_OBJECT, TAG_STR, TAG_INT64, TAG_BOOL};
+
+    let obj = lin_object_alloc(4);
+
+    // name
+    let k_name = crate::fs::make_string("name");
+    let v_name = crate::fs::make_string(&meta.name);
+    let mut tv_name: TaggedVal = std::mem::zeroed();
+    tv_name.tag = TAG_STR;
+    tv_name.payload = v_name as u64;
+    lin_object_set(obj, k_name, &tv_name);
+    lin_string_release(k_name);
+    lin_string_release(v_name);
+
+    // size (Int64)
+    let k_size = crate::fs::make_string("size");
+    let mut tv_size: TaggedVal = std::mem::zeroed();
+    tv_size.tag = TAG_INT64;
+    tv_size.payload = meta.size as u64;
+    lin_object_set(obj, k_size, &tv_size);
+    lin_string_release(k_size);
+
+    // typeflag (the raw single byte as a 1-char String; '0'/'\0' = file, '5' = directory)
+    let tf = if meta.typeflag == 0 { '0' } else { meta.typeflag as char };
+    let tf_str = tf.to_string();
+    let k_tf = crate::fs::make_string("typeflag");
+    let v_tf = crate::fs::make_string(&tf_str);
+    let mut tv_tf: TaggedVal = std::mem::zeroed();
+    tv_tf.tag = TAG_STR;
+    tv_tf.payload = v_tf as u64;
+    lin_object_set(obj, k_tf, &tv_tf);
+    lin_string_release(k_tf);
+    lin_string_release(v_tf);
+
+    // isDir (Boolean)
+    let is_dir = meta.typeflag == b'5';
+    let k_dir = crate::fs::make_string("isDir");
+    let mut tv_dir: TaggedVal = std::mem::zeroed();
+    tv_dir.tag = TAG_BOOL;
+    tv_dir.payload = is_dir as u64;
+    lin_object_set(obj, k_dir, &tv_dir);
+    lin_string_release(k_dir);
+
+    alloc_tagged(TAG_OBJECT, obj as u64)
+}
+
+/// The per-entry `data` sub-stream (untar): yields at most `current_entry_remaining` bytes from the
+/// shared buffer, then EOF for that entry. Holds a CLONE of the shared `Arc` — the shared cursor.
+struct BoundedSource {
+    state: std::sync::Arc<std::sync::Mutex<TarReaderState>>,
+}
+unsafe impl Send for BoundedSource {}
+impl StreamSource for BoundedSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        let mut st = self.state.lock().unwrap();
+        if st.current_entry_remaining == 0 {
+            return TaggedOutcome::Eof;
+        }
+        // Yield up to 64 KiB of the entry's remaining body per read.
+        let want = st.current_entry_remaining.min(64 * 1024);
+        let bytes = st.take_front(want);
+        if bytes.is_empty() {
+            // Parent ended mid-body — present as EOF for this entry.
+            st.current_entry_remaining = 0;
+            return TaggedOutcome::Eof;
+        }
+        st.current_entry_remaining -= bytes.len();
+        TaggedOutcome::Item(bytes_to_u8_array(&bytes))
+    }
+    // The sub-stream does NOT own the parent — closing it must NOT close the shared upstream (the
+    // driver still needs it for the next entry). No-op close (sub-stream RC contract).
+    fn close(&mut self) {}
+}
+
+/// `untar(s, body)` — drive the whole archive on the calling thread, calling `body(meta, data)` per
+/// entry. Returns `Null | Error`. Constant-memory: the parent is pulled one chunk at a time and the
+/// active entry's body is exposed as a bounded sub-stream. A body fault → in-band Error (like
+/// `lin_stream_for`); a parent read Error short-circuits to that Error. Closes the parent at the end.
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_untar(s: *const u8, body: *mut u8) -> *mut u8 {
+    // Own the parent (one ref) inside the shared state; release the caller-suppressed boxed value.
+    let state = std::sync::Arc::new(std::sync::Mutex::new(TarReaderState {
+        up: own_upstream(s),
+        buf: Vec::new(),
+        upstream_done: false,
+        upstream_err: None,
+        current_entry_remaining: 0,
+    }));
+    let f = LinFn::from_owned(retain_closure(as_closure(body)));
+
+    let result: *mut u8 = loop {
+        // Parse the next 512-byte header.
+        let header = { state.lock().unwrap().take_front(512) };
+        // A parent read Error surfaces as the driver's Error.
+        if let Some(m) = { state.lock().unwrap().upstream_err.take() } {
+            break crate::fs::make_error_tagged(&m);
+        }
+        let meta = match parse_tar_header(&header) {
+            Some(m) => m,
+            None => break std::ptr::null_mut(), // end-of-archive (or no more data) → Null
+        };
+        { state.lock().unwrap().current_entry_remaining = meta.size; }
+
+        // Build the per-entry meta object + the bounded `data` sub-stream box (rc=1).
+        let meta_obj = make_meta_object(&meta);
+        let data_box = StreamBox::new_boxed(Box::new(BoundedSource { state: state.clone() }));
+
+        // Call body(meta, data) — args are BORROWED (caller owns them, per the call2 ABI).
+        let ret = f.call2_caught(meta_obj, data_box);
+
+        // Release our refs to the args we minted (the meta object + the sub-stream box). For the
+        // sub-stream this drops untar's OWN ref → rc 0 → frees the box; the no-op close means the
+        // shared parent is untouched.
+        crate::tagged::lin_tagged_release(meta_obj);
+        crate::tagged::lin_tagged_release(data_box);
+
+        match ret {
+            Ok(r) => crate::tagged::lin_tagged_release(r), // the body's return is discarded
+            Err(m) => break crate::fs::make_error_tagged(&m),
+        }
+
+        // Read back how many body bytes remain undrained; skip them + the body padding to land on
+        // the next header. Whether the body drained the sub-stream or ignored it, this is correct.
+        {
+            let mut st = state.lock().unwrap();
+            let undrained = st.current_entry_remaining;
+            let body_padding = padded_len(meta.size) - meta.size;
+            let skip = undrained + body_padding;
+            let _ = st.take_front(skip);
+            st.current_entry_remaining = 0;
+        }
+        // A parent read Error during the skip also surfaces.
+        if let Some(m) = { state.lock().unwrap().upstream_err.take() } {
+            break crate::fs::make_error_tagged(&m);
+        }
+    };
+
+    // Close the parent exactly once. The `Arc` may still be alive in a leaked sub-stream box only if
+    // the body stored it (forbidden by ADR-075) — under the supported contract this is the last ref.
+    {
+        let mut st = state.lock().unwrap();
+        st.up.close();
+    }
+    result
+}
+
+/// `manifest(s)` adapter source: each `read_tagged` parses the next header, builds the meta object,
+/// SKIPS the entry's body + padding, and returns the meta Item. Owns + closes the parent like other
+/// adapters. Zero-block (end-of-archive) → Eof.
+struct ManifestSource {
+    up: Upstream,
+    buf: Vec<u8>,
+    upstream_done: bool,
+}
+unsafe impl Send for ManifestSource {}
+impl ManifestSource {
+    unsafe fn fill_at_least(&mut self, n: usize) -> Result<bool, String> {
+        while self.buf.len() < n && !self.upstream_done {
+            match pull_tagged(self.up.boxptr) {
+                TaggedOutcome::Item(item) => {
+                    append_u8_array_to(&mut self.buf, item);
+                    crate::tagged::lin_tagged_release(item);
+                }
+                TaggedOutcome::Eof => self.upstream_done = true,
+                TaggedOutcome::Err(m) => return Err(m),
+            }
+        }
+        Ok(self.buf.len() >= n)
+    }
+    unsafe fn take_front(&mut self, n: usize) -> Result<Vec<u8>, String> {
+        self.fill_at_least(n)?;
+        let take = n.min(self.buf.len());
+        Ok(self.buf.drain(..take).collect())
+    }
+}
+impl StreamSource for ManifestSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        let header = match self.take_front(512) {
+            Ok(h) => h,
+            Err(m) => return TaggedOutcome::Err(m),
+        };
+        let meta = match parse_tar_header(&header) {
+            Some(m) => m,
+            None => return TaggedOutcome::Eof, // end-of-archive
+        };
+        let obj = make_meta_object(&meta);
+        // Skip the body + padding so the next read lands on the next header.
+        if let Err(m) = self.take_front(padded_len(meta.size)) {
+            crate::tagged::lin_tagged_release(obj);
+            return TaggedOutcome::Err(m);
+        }
+        TaggedOutcome::Item(obj)
+    }
+    fn close(&mut self) {
+        unsafe { self.up.close(); }
+    }
+}
+
+/// `manifest(s)` → a `Stream<Object>` of entry meta objects (body skipped).
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_manifest(s: *const u8) -> *mut u8 {
+    StreamBox::new_boxed(Box::new(ManifestSource {
+        up: own_upstream(s),
+        buf: Vec::new(),
+        upstream_done: false,
+    }))
+}
+
+/// `files(s)` adapter source: each `read_tagged` parses the header, reads the FULL body into a
+/// `UInt8[]`, builds `{name, data, size, typeflag, isDir}`, and returns it. Owns + closes the
+/// parent. Zero-block → Eof.
+struct FilesSource {
+    up: Upstream,
+    buf: Vec<u8>,
+    upstream_done: bool,
+}
+unsafe impl Send for FilesSource {}
+impl FilesSource {
+    unsafe fn fill_at_least(&mut self, n: usize) -> Result<bool, String> {
+        while self.buf.len() < n && !self.upstream_done {
+            match pull_tagged(self.up.boxptr) {
+                TaggedOutcome::Item(item) => {
+                    append_u8_array_to(&mut self.buf, item);
+                    crate::tagged::lin_tagged_release(item);
+                }
+                TaggedOutcome::Eof => self.upstream_done = true,
+                TaggedOutcome::Err(m) => return Err(m),
+            }
+        }
+        Ok(self.buf.len() >= n)
+    }
+    unsafe fn take_front(&mut self, n: usize) -> Result<Vec<u8>, String> {
+        self.fill_at_least(n)?;
+        let take = n.min(self.buf.len());
+        Ok(self.buf.drain(..take).collect())
+    }
+}
+impl StreamSource for FilesSource {
+    unsafe fn read_tagged(&mut self) -> TaggedOutcome {
+        use crate::object::{lin_object_alloc, lin_object_set};
+        use crate::string::lin_string_release;
+        use crate::tagged::{alloc_tagged, TAG_OBJECT, TAG_STR, TAG_INT64, TAG_BOOL, TAG_ARRAY};
+
+        let header = match self.take_front(512) {
+            Ok(h) => h,
+            Err(m) => return TaggedOutcome::Err(m),
+        };
+        let meta = match parse_tar_header(&header) {
+            Some(m) => m,
+            None => return TaggedOutcome::Eof,
+        };
+        // Read the FULL body, then skip the padding to the next header.
+        let body = match self.take_front(meta.size) {
+            Ok(b) => b,
+            Err(m) => return TaggedOutcome::Err(m),
+        };
+        let pad = padded_len(meta.size) - meta.size;
+        if let Err(m) = self.take_front(pad) {
+            return TaggedOutcome::Err(m);
+        }
+
+        // Build { name, data, size, typeflag, isDir }.
+        let obj = lin_object_alloc(8);
+
+        let k_name = crate::fs::make_string("name");
+        let v_name = crate::fs::make_string(&meta.name);
+        let mut tv_name: TaggedVal = std::mem::zeroed();
+        tv_name.tag = TAG_STR;
+        tv_name.payload = v_name as u64;
+        lin_object_set(obj, k_name, &tv_name);
+        lin_string_release(k_name);
+        lin_string_release(v_name);
+
+        // data: the entry's body as a fresh UInt8[] box.
+        let data_box = bytes_to_u8_array(&body);
+        let k_data = crate::fs::make_string("data");
+        let mut tv_data: TaggedVal = std::mem::zeroed();
+        tv_data.tag = TAG_ARRAY;
+        tv_data.payload = crate::tagged::lin_unbox_ptr(data_box) as u64;
+        lin_object_set(obj, k_data, &tv_data);
+        lin_string_release(k_data);
+        crate::tagged::lin_tagged_release(data_box); // object now owns its own ref to the array
+
+        let k_size = crate::fs::make_string("size");
+        let mut tv_size: TaggedVal = std::mem::zeroed();
+        tv_size.tag = TAG_INT64;
+        tv_size.payload = meta.size as u64;
+        lin_object_set(obj, k_size, &tv_size);
+        lin_string_release(k_size);
+
+        let tf = if meta.typeflag == 0 { '0' } else { meta.typeflag as char };
+        let tf_str = tf.to_string();
+        let k_tf = crate::fs::make_string("typeflag");
+        let v_tf = crate::fs::make_string(&tf_str);
+        let mut tv_tf: TaggedVal = std::mem::zeroed();
+        tv_tf.tag = TAG_STR;
+        tv_tf.payload = v_tf as u64;
+        lin_object_set(obj, k_tf, &tv_tf);
+        lin_string_release(k_tf);
+        lin_string_release(v_tf);
+
+        let is_dir = meta.typeflag == b'5';
+        let k_dir = crate::fs::make_string("isDir");
+        let mut tv_dir: TaggedVal = std::mem::zeroed();
+        tv_dir.tag = TAG_BOOL;
+        tv_dir.payload = is_dir as u64;
+        lin_object_set(obj, k_dir, &tv_dir);
+        lin_string_release(k_dir);
+
+        TaggedOutcome::Item(alloc_tagged(TAG_OBJECT, obj as u64))
+    }
+    fn close(&mut self) {
+        unsafe { self.up.close(); }
+    }
+}
+
+/// `files(s)` → a `Stream<Object>` of `{name, data, size, typeflag, isDir}` (each body buffered).
+#[no_mangle]
+pub unsafe extern "C" fn lin_stream_files(s: *const u8) -> *mut u8 {
+    StreamBox::new_boxed(Box::new(FilesSource {
+        up: own_upstream(s),
+        buf: Vec::new(),
+        upstream_done: false,
+    }))
 }
 
 #[cfg(test)]
@@ -2107,6 +2754,112 @@ mod tests {
         crate::memory::lin_cell_free(p, 24);
     }
 
+    // std/compress adapter tests. Round-trip through the streaming codecs (deflate→inflate,
+    // gzip→gunzip) and assert the codec adapter closes its upstream EXACTLY ONCE — the
+    // ASan-relevant close-propagation check the brief mandates.
+
+    /// Drain every item of a codec adapter stream into one Vec<u8>, asserting no in-band error.
+    unsafe fn drain_codec_bytes(s: *mut u8) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            match pull_tagged(unwrap_stream(s)) {
+                TaggedOutcome::Item(item) => {
+                    let a = crate::tagged::lin_unbox_ptr(item) as *const crate::array::LinArray;
+                    let n = crate::array::lin_array_length(a) as usize;
+                    let data = (*a).data as *const u8;
+                    out.extend_from_slice(std::slice::from_raw_parts(data, n));
+                    crate::tagged::lin_tagged_release(item);
+                }
+                TaggedOutcome::Eof => break,
+                TaggedOutcome::Err(m) => panic!("codec adapter erred: {m}"),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn deflate_then_inflate_round_trips_and_closes_once() {
+        unsafe {
+            // A payload spread across several upstream chunks (and large enough to exercise the
+            // multi-pass scratch loop) round-trips byte-for-byte through deflate→inflate.
+            let mut payload = Vec::new();
+            for i in 0..50_000u32 { payload.push((i % 251) as u8); }
+            let chunks: Vec<Vec<u8>> = payload.chunks(4096).map(|c| c.to_vec()).collect();
+
+            // deflate the source.
+            let cc_src = Arc::new(AtomicUsize::new(0));
+            let src = make(chunks, cc_src.clone(), None);
+            let deflated_stream = lin_stream_deflate(src as *const u8);
+            crate::tagged::lin_tagged_release(src); // adapter holds its own ref
+            let compressed = drain_codec_bytes(deflated_stream);
+            crate::tagged::lin_tagged_release(deflated_stream);
+            assert_eq!(cc_src.load(Ordering::SeqCst), 1, "deflate closed upstream exactly once");
+            assert!(compressed.len() < payload.len(), "compressed smaller than input");
+
+            // inflate the compressed bytes (fed in small chunks to exercise carry-over).
+            let cc_cmp = Arc::new(AtomicUsize::new(0));
+            let cmp_chunks: Vec<Vec<u8>> = compressed.chunks(100).map(|c| c.to_vec()).collect();
+            let cmp_src = make(cmp_chunks, cc_cmp.clone(), None);
+            let inflated_stream = lin_stream_inflate(cmp_src as *const u8);
+            crate::tagged::lin_tagged_release(cmp_src);
+            let recovered = drain_codec_bytes(inflated_stream);
+            crate::tagged::lin_tagged_release(inflated_stream);
+            assert_eq!(cc_cmp.load(Ordering::SeqCst), 1, "inflate closed upstream exactly once");
+            assert_eq!(recovered, payload, "deflate→inflate recovers the input");
+        }
+    }
+
+    #[test]
+    fn gzip_then_gunzip_round_trips_and_closes_once() {
+        unsafe {
+            let payload = b"the quick brown fox jumps over the lazy dog\n".repeat(500);
+            let chunks: Vec<Vec<u8>> = payload.chunks(1000).map(|c| c.to_vec()).collect();
+
+            let cc_src = Arc::new(AtomicUsize::new(0));
+            let src = make(chunks, cc_src.clone(), None);
+            let gz_stream = lin_stream_gzip(src as *const u8);
+            crate::tagged::lin_tagged_release(src);
+            let compressed = drain_codec_bytes(gz_stream);
+            crate::tagged::lin_tagged_release(gz_stream);
+            assert_eq!(cc_src.load(Ordering::SeqCst), 1, "gzip closed upstream exactly once");
+            // gzip magic bytes 0x1f 0x8b.
+            assert_eq!(&compressed[..2], &[0x1f, 0x8b], "gzip container magic");
+
+            let cc_cmp = Arc::new(AtomicUsize::new(0));
+            let cmp_chunks: Vec<Vec<u8>> = compressed.chunks(64).map(|c| c.to_vec()).collect();
+            let cmp_src = make(cmp_chunks, cc_cmp.clone(), None);
+            let gunzip_stream = lin_stream_gunzip(cmp_src as *const u8);
+            crate::tagged::lin_tagged_release(cmp_src);
+            let recovered = drain_codec_bytes(gunzip_stream);
+            crate::tagged::lin_tagged_release(gunzip_stream);
+            assert_eq!(cc_cmp.load(Ordering::SeqCst), 1, "gunzip closed upstream exactly once");
+            assert_eq!(recovered, payload, "gzip→gunzip recovers the input");
+        }
+    }
+
+    #[test]
+    fn gunzip_of_garbage_errors_in_band_and_closes_once() {
+        unsafe {
+            // Feeding non-gzip bytes into gunzip must surface an in-band Err (not a panic/abort),
+            // and the upstream must still close exactly once.
+            let cc = Arc::new(AtomicUsize::new(0));
+            let src = make(vec![vec![0u8; 64], vec![1u8; 64]], cc.clone(), None);
+            let gunzip_stream = lin_stream_gunzip(src as *const u8);
+            crate::tagged::lin_tagged_release(src);
+            let mut saw_err = false;
+            loop {
+                match pull_tagged(unwrap_stream(gunzip_stream)) {
+                    TaggedOutcome::Err(_) => { saw_err = true; break; }
+                    TaggedOutcome::Eof => break,
+                    TaggedOutcome::Item(item) => crate::tagged::lin_tagged_release(item),
+                }
+            }
+            assert!(saw_err, "gunzip of garbage surfaces an in-band Err");
+            crate::tagged::lin_tagged_release(gunzip_stream);
+            assert_eq!(cc.load(Ordering::SeqCst), 1, "errored codec still closed upstream once");
+        }
+    }
+
     #[test]
     fn drain_default_forces_and_closes() {
         unsafe {
@@ -2117,6 +2870,240 @@ mod tests {
             assert!(r.is_null(), "drain of a successful non-sink stream → Null");
             crate::tagged::lin_tagged_release(src);
             assert_eq!(cc.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// Build a boxed `path` String tagged value for the sink entry points.
+    unsafe fn path_tagged(path: &str) -> *mut u8 {
+        let s = crate::string::lin_string_from_bytes(path.as_ptr(), path.len() as u32);
+        crate::tagged::alloc_tagged(crate::tagged::TAG_STR, s as u64)
+    }
+
+    #[test]
+    fn write_stream_raw_concatenates_bytes_verbatim_and_closes_once() {
+        unsafe {
+            // The RAW sink must write each UInt8[] item's bytes back-to-back with NO separator —
+            // the property that makes binary output (e.g. gzip chunks) round-trip uncorrupted.
+            let path = "/tmp/lin_stream_write_raw_test.bin";
+            let _ = std::fs::remove_file(path);
+            let cc = Arc::new(AtomicUsize::new(0));
+            let src = make(vec![vec![0u8, 1, 2, 3], vec![4u8, 5, 6, 7]], cc.clone(), None);
+            let p = path_tagged(path);
+            let sink = lin_stream_write(src as *const u8, p as *const u8);
+            crate::tagged::lin_tagged_release(src); // sink holds its own ref
+            // Drive the sink → Null on success.
+            let r = lin_stream_drain(sink as *const u8);
+            assert!(r.is_null(), "raw write of a clean stream → Null");
+            crate::tagged::lin_tagged_release(sink);
+            crate::tagged::lin_tagged_release(p);
+            assert_eq!(cc.load(Ordering::SeqCst), 1, "raw sink closed upstream exactly once");
+
+            let written = std::fs::read(path).unwrap();
+            assert_eq!(written, vec![0u8, 1, 2, 3, 4, 5, 6, 7],
+                "raw sink writes the exact concatenation with no \\n separators");
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn write_lines_separates_items_with_newlines_and_closes_once() {
+        unsafe {
+            // The line-oriented sink writes each item's bytes followed by a single '\n'.
+            let path = "/tmp/lin_stream_write_lines_test.txt";
+            let _ = std::fs::remove_file(path);
+            let cc = Arc::new(AtomicUsize::new(0));
+            let src = make(vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()], cc.clone(), None);
+            let p = path_tagged(path);
+            let sink = lin_stream_write_lines(src as *const u8, p as *const u8);
+            crate::tagged::lin_tagged_release(src);
+            let r = lin_stream_drain(sink as *const u8);
+            assert!(r.is_null(), "line write of a clean stream → Null");
+            crate::tagged::lin_tagged_release(sink);
+            crate::tagged::lin_tagged_release(p);
+            assert_eq!(cc.load(Ordering::SeqCst), 1, "line sink closed upstream exactly once");
+
+            let written = std::fs::read(path).unwrap();
+            assert_eq!(written, b"one\ntwo\nthree\n",
+                "line sink writes each item followed by a newline");
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    // =====================================================================================
+    // `std/archive` — tar splitting tests. These drive the REAL `lin_stream_untar` /
+    // `lin_stream_manifest` / `lin_stream_files` entry points (the spike's struct/parse/BoundedSource
+    // are now production code above, not redefined here). Each test asserts the parent stream closes
+    // EXACTLY ONCE and that an undrained body is skipped so the next header parses correctly.
+    // =====================================================================================
+
+    /// Build a tiny in-memory tar: a 512-byte header per entry (name/size/typeflag) + the padded
+    /// body. ustar checksum is not validated by our parser, so we leave it blank (NUL).
+    fn tar_header(name: &str, size: usize, typeflag: u8) -> Vec<u8> {
+        let mut h = vec![0u8; 512];
+        let nb = name.as_bytes();
+        h[0..nb.len()].copy_from_slice(nb);
+        // size as octal ASCII in 11 chars + NUL at offset 124.
+        let octal = format!("{:011o}", size);
+        h[124..124 + 11].copy_from_slice(octal.as_bytes());
+        h[135] = 0;
+        h[156] = typeflag;
+        h
+    }
+    fn tar_entry(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut e = tar_header(name, body.len(), b'0');
+        e.extend_from_slice(body);
+        let pad = padded_len(body.len()) - body.len();
+        e.extend(std::iter::repeat(0u8).take(pad));
+        e
+    }
+
+    /// A 2-arg test closure shim `(env, arg0, arg1) -> ret` over `make_test_closure`'s layout.
+    unsafe fn make_test_closure2(fn_ptr: *mut u8) -> *mut u8 {
+        make_test_closure(fn_ptr)
+    }
+
+    #[test]
+    fn untar_drains_skips_and_closes_once() {
+        unsafe {
+            // A 2-arg body: drains entry 0 fully (recording its bytes via a global), IGNORES entry 1.
+            // We can't capture state in an extern fn, so use a thread-local accumulator.
+            thread_local! {
+                static DRAINED: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
+                static SEEN_NAMES: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+            }
+            unsafe extern "C-unwind" fn body(_env: *mut u8, meta: *mut u8, data: *mut u8) -> *mut u8 {
+                // Record the entry name from the meta object.
+                let obj = crate::tagged::lin_unbox_ptr(meta) as *const crate::object::LinObject;
+                let k = crate::fs::make_string("name");
+                let v = crate::object::lin_object_get(obj, k);
+                crate::string::lin_string_release(k);
+                if !v.is_null() {
+                    let name_s = crate::fs::resolve_lin_str(v as *const u8).unwrap_or_default();
+                    SEEN_NAMES.with(|s| s.borrow_mut().push(name_s.clone()));
+                    // Drain entry "big.bin" fully; ignore everything else (proves skip-undrained).
+                    if name_s == "big.bin" {
+                        loop {
+                            match pull_tagged(unwrap_stream(data)) {
+                                TaggedOutcome::Item(item) => {
+                                    let a = crate::tagged::lin_unbox_ptr(item) as *const crate::array::LinArray;
+                                    let n = crate::array::lin_array_length(a) as usize;
+                                    let d = (*a).data as *const u8;
+                                    let slice = std::slice::from_raw_parts(d, n).to_vec();
+                                    DRAINED.with(|x| x.borrow_mut().extend_from_slice(&slice));
+                                    crate::tagged::lin_tagged_release(item);
+                                }
+                                TaggedOutcome::Eof => break,
+                                TaggedOutcome::Err(_) => break,
+                            }
+                        }
+                    }
+                }
+                std::ptr::null_mut()
+            }
+
+            let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+            let small = b"hello, small entry".to_vec();
+            let mut archive = Vec::new();
+            archive.extend(tar_entry("big.bin", &big));
+            archive.extend(tar_entry("small.txt", &small));
+            archive.extend(vec![0u8; 1024]); // two zero blocks = end-of-archive
+
+            let cc = Arc::new(AtomicUsize::new(0));
+            let chunks: Vec<Vec<u8>> = archive.chunks(3000).map(|c| c.to_vec()).collect();
+            let parent = make(chunks, cc.clone(), None);
+
+            let closure = make_test_closure2(body as *mut u8);
+            let r = lin_stream_untar(parent as *const u8, closure);
+            assert!(r.is_null(), "clean archive → Null");
+            crate::tagged::lin_tagged_release(parent); // drop the caller's ref (untar held its own)
+            free_test_closure(closure);
+
+            DRAINED.with(|d| assert_eq!(*d.borrow(), big,
+                "(1) fully-drained sub-stream yields exactly the entry's bytes"));
+            SEEN_NAMES.with(|s| assert_eq!(*s.borrow(), vec!["big.bin".to_string(), "small.txt".to_string()],
+                "(2) the IGNORED entry's body was skipped so the next header parsed correctly"));
+            assert_eq!(cc.load(Ordering::SeqCst), 1, "(3) parent upstream closed exactly once");
+        }
+    }
+
+    #[test]
+    fn manifest_lists_entries_and_closes_once() {
+        unsafe {
+            let mut archive = Vec::new();
+            archive.extend(tar_entry("a.txt", b"alpha"));
+            archive.extend(tar_entry("b.txt", b"bravo bravo"));
+            archive.extend(vec![0u8; 1024]);
+
+            let cc = Arc::new(AtomicUsize::new(0));
+            let chunks: Vec<Vec<u8>> = archive.chunks(700).map(|c| c.to_vec()).collect();
+            let parent = make(chunks, cc.clone(), None);
+
+            let m = lin_stream_manifest(parent as *const u8);
+            crate::tagged::lin_tagged_release(parent);
+
+            let mut names = Vec::new();
+            let mut sizes = Vec::new();
+            loop {
+                match pull_tagged(unwrap_stream(m)) {
+                    TaggedOutcome::Item(item) => {
+                        let obj = crate::tagged::lin_unbox_ptr(item) as *const crate::object::LinObject;
+                        let kn = crate::fs::make_string("name");
+                        let vn = crate::object::lin_object_get(obj, kn);
+                        names.push(crate::fs::resolve_lin_str(vn as *const u8).unwrap());
+                        crate::string::lin_string_release(kn);
+                        let ks = crate::fs::make_string("size");
+                        let vs = crate::object::lin_object_get(obj, ks);
+                        sizes.push((*vs).payload as i64);
+                        crate::string::lin_string_release(ks);
+                        crate::tagged::lin_tagged_release(item);
+                    }
+                    TaggedOutcome::Eof => break,
+                    TaggedOutcome::Err(m) => panic!("manifest erred: {m}"),
+                }
+            }
+            assert_eq!(names, vec!["a.txt".to_string(), "b.txt".to_string()]);
+            assert_eq!(sizes, vec![5, 11]);
+            crate::tagged::lin_tagged_release(m);
+            assert_eq!(cc.load(Ordering::SeqCst), 1, "manifest closed the parent once");
+        }
+    }
+
+    #[test]
+    fn files_recovers_bodies_and_closes_once() {
+        unsafe {
+            let mut archive = Vec::new();
+            archive.extend(tar_entry("a.txt", b"alpha"));
+            archive.extend(tar_entry("b.txt", b"bravo bravo"));
+            archive.extend(vec![0u8; 1024]);
+
+            let cc = Arc::new(AtomicUsize::new(0));
+            let chunks: Vec<Vec<u8>> = archive.chunks(64).map(|c| c.to_vec()).collect();
+            let parent = make(chunks, cc.clone(), None);
+
+            let fs = lin_stream_files(parent as *const u8);
+            crate::tagged::lin_tagged_release(parent);
+
+            let mut bodies: Vec<Vec<u8>> = Vec::new();
+            loop {
+                match pull_tagged(unwrap_stream(fs)) {
+                    TaggedOutcome::Item(item) => {
+                        let obj = crate::tagged::lin_unbox_ptr(item) as *const crate::object::LinObject;
+                        let kd = crate::fs::make_string("data");
+                        let vd = crate::object::lin_object_get(obj, kd);
+                        let a = (*vd).payload as *const crate::array::LinArray;
+                        let n = crate::array::lin_array_length(a) as usize;
+                        let d = (*a).data as *const u8;
+                        bodies.push(std::slice::from_raw_parts(d, n).to_vec());
+                        crate::string::lin_string_release(kd);
+                        crate::tagged::lin_tagged_release(item);
+                    }
+                    TaggedOutcome::Eof => break,
+                    TaggedOutcome::Err(m) => panic!("files erred: {m}"),
+                }
+            }
+            assert_eq!(bodies, vec![b"alpha".to_vec(), b"bravo bravo".to_vec()]);
+            crate::tagged::lin_tagged_release(fs);
+            assert_eq!(cc.load(Ordering::SeqCst), 1, "files closed the parent once");
         }
     }
 }

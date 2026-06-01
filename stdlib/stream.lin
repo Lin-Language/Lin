@@ -10,6 +10,7 @@
 // only thing you can do with one is call these adapters/terminals. Transform closures operate on
 // boxed `Json` items (a chunk is `UInt8[]`, a line is `String` — both JSON-compatible), so map/
 // filter take `(Json) => Json` / `(Json) => Boolean`.
+
 // Source: open a file as a byte stream (`Stream<UInt8[]> | Error`). Return type inferred from the
 // intrinsic (the opaque Stream type cannot drive a clean re-export annotation here).
 export val readStream = (path: String) =>
@@ -32,15 +33,25 @@ export val chunks = (s: Stream, n: Int32): Stream =>
 // for/find/some/every/flatMap/takeWhile/dropWhile/flatten/concat) are NO LONGER exported here.
 // They come from `std/iter` and dispatch to the lazy `lin_stream_*` backend on a stream receiver
 // (the IR's `lower_call` redirect, mirroring the checker's `streamish_combinator_ret`). std/stream
-// keeps only stream-SPECIFIC ops (readStream/writeStream/drain/collect/readText/promise/close/
-// lines/linesMax/chunks). A user writes:
+// keeps only stream-SPECIFIC ops (readStream/writeStream/writeLines/drain/collect/readText/promise/
+// close/lines/linesMax/chunks). A user writes:
 //   import { map, filter, take, reduce, for } from "std/iter"
 //   import { readStream, writeStream, drain } from "std/stream"
 // and `readStream(p).map(f).filter(g).take(10).reduce(...)` works lazily.
-// Sink: build a node that writes each item to `path`, one per line (lazy; nothing happens until
-// a terminal driver runs it).
+
+// Sink: build a node that writes each item's bytes verbatim (raw) to `path` — items are
+// concatenated with NO separator (a String writes its UTF-8 bytes, a UInt8[] its raw bytes).
+// Use `writeLines` for newline-delimited output. Lazy: nothing happens until a terminal driver
+// runs it. The raw sink is what lets binary pipelines (e.g. `gzip(s).writeStream("x.gz")`)
+// produce an uncorrupted file.
 export val writeStream = (s: Stream, path: String): Stream =>
   lin_stream_write(s, path)
+
+// Sink: build a node that writes each item to `path` followed by a newline (one item per line).
+// Use this for text/line-delimited output (e.g. CSV rows, log lines); use `writeStream` for raw,
+// verbatim bytes. Lazy: nothing happens until a terminal driver runs it.
+export val writeLines = (s: Stream, path: String): Stream =>
+  lin_stream_write_lines(s, path)
 
 // Terminal drivers — these consume the stream on the CALLING thread and close it afterwards.
 // `drain` forces a sink (or any pipeline) to completion → `Null | Error`.
@@ -63,6 +74,7 @@ export val close = (s: Stream): Null =>
 // `for` is NOT exported here (std/iter unification): the single unified `for` comes from std/iter
 // and dispatches to the stream backend (`lin_stream_for`) on a stream receiver via the IR redirect.
 // Import `for` from std/iter to consume a stream: `stream.lines().for(println)`.
+
 // `.promise()` — drive the pipeline on a WORKER thread → `Promise<Null | Error>` (brief §5).
 // The stream is MOVED onto the worker (legal via CAP_MOVE, Stage 7): the worker owns the whole
 // pipeline, drives it to EOF, and the result resolves to `Null` (success) or an `Error` (a

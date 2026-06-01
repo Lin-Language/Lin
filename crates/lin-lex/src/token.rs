@@ -21,6 +21,12 @@ pub struct Token {
     /// glued to the previous expression as an index/call inside an inline lambda body, so a
     /// line-leading array literal reads as its own statement. Defaults to false.
     pub newline_before: bool,
+    /// 1-based column of this token's first char on its source line (number of chars from the
+    /// line start, +1). Computed in the same post-tokenize pass that sets `newline_before`.
+    /// Used ONLY by the inline-block / control-flow-branch parsers to apply the offside rule
+    /// inside `()`/`[]`/`{}` where ADR-004 suppresses Indent/Dedent/Newline — it does not add
+    /// any tokens, so all ADR-004-dependent behaviour is unchanged. Defaults to 0.
+    pub column: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,6 +116,6 @@ pub enum InterpPart {
 
 impl Token {
     pub fn new(kind: TokenKind, span: Span) -> Self {
-        Self { kind, span, newline_before: false }
+        Self { kind, span, newline_before: false, column: 0 }
     }
 }

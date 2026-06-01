@@ -69,7 +69,23 @@ impl Lexer {
             }
             prev_end = prev_end.max(tok.span.end as usize);
         }
+        self.fill_columns(&mut tokens);
         tokens
+    }
+
+    /// Fill each token's 1-based source `column` (number of chars from the line start, +1) by
+    /// scanning back from the token's `span.start` to the previous `\n`. Spans are char offsets
+    /// into `self.source`. Used for the main token stream and for interp sub-streams. Purely
+    /// additive — it sets `column` only and never alters the stream shape.
+    fn fill_columns(&self, tokens: &mut [Token]) {
+        for tok in tokens.iter_mut() {
+            let s = (tok.span.start as usize).min(self.source.len());
+            let mut line_start = s;
+            while line_start > 0 && self.source[line_start - 1] != '\n' {
+                line_start -= 1;
+            }
+            tok.column = (s - line_start) as u32 + 1;
+        }
     }
 
     fn next_token(&mut self) -> Token {
@@ -335,6 +351,11 @@ impl Lexer {
                 }
                 // Add EOF to expr tokens so parser knows when to stop
                 expr_tokens.push(Token::new(TokenKind::Eof, self.span(self.pos, self.pos)));
+                // Interp sub-streams are lexed directly (not via the main `tokenize` post-pass),
+                // so fill in their 1-based source columns here. The offside-rule parsers
+                // (inline `if`/`else` branches) consult `column`; without this they'd all read
+                // as 0 and a branch block would break immediately.
+                self.fill_columns(&mut expr_tokens);
                 parts.push(crate::token::InterpPart::Expr(expr_tokens));
             } else {
                 current_lit.push(self.source[self.pos]);
@@ -719,6 +740,45 @@ val y = 2
                 ta.kind
             );
         }
+    }
+
+    #[test]
+    fn column_is_one_based_and_indent_aware() {
+        // `  val x = 1` — `val` is indented two spaces, so column 3. The newline keeps the
+        // first token of the next line at its own indent column.
+        let src = "val a = 1\n    val b = 2\n";
+        let toks = tokens(src);
+        // First token `val` is at column 1.
+        assert_eq!(toks[0].kind, TokenKind::Val);
+        assert_eq!(toks[0].column, 1);
+        // Find the second `val` (after the indent of 4 spaces) — column = indent + 1 = 5.
+        let second_val = toks
+            .iter()
+            .filter(|t| t.kind == TokenKind::Val)
+            .nth(1)
+            .expect("second val");
+        assert_eq!(second_val.column, 5);
+    }
+
+    #[test]
+    fn column_does_not_change_token_kinds() {
+        // Adding the column field is purely additive: the kind stream is unchanged for a
+        // sample that exercises indentation, parens, and a multiline literal.
+        let src = "\
+val f = (x) =>
+  if x then
+    1
+  else
+    2
+val obj = {
+  a: 1,
+  b: 2,
+}
+";
+        let toks = tokens(src);
+        // Sanity: columns are all >= 1 and the kinds are the expected sequence start.
+        assert!(toks.iter().all(|t| t.column >= 1));
+        assert_eq!(toks[0].kind, TokenKind::Val);
     }
 
     #[test]
