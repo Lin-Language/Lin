@@ -18,8 +18,8 @@ val sample = [
 ]
 
 val s = suite("report-integration", [
+  // --- End-to-end render: header, ranked rows, summary line, skipped-row note ---
   test("renders a report with header, top scorer, summary, and skipped-row note", () =>
-    // --- End-to-end render: header, ranked rows, summary line, skipped-row note ---
     val out = render(sample)
     [
       expect(out.contains("=== Report ===")).toBe(true),
@@ -37,8 +37,8 @@ val s = suite("report-integration", [
     ]
   ),
 
+  // --- Churn: a large batch must render without RC corruption (ASan guard) ---
   test("handles a larger batch without corruption", () =>
-    // --- Churn: a large batch must render without RC corruption (ASan guard) ---
     val many = [
       "A, 1",
       "B, 2",

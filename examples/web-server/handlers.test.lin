@@ -32,12 +32,12 @@ val s = suite("handlers", [
       expect(contains(resp["body"], "<!DOCTYPE html>")).toBe(true),
       expect(contains(resp["body"], "Lin Web Server")).toBe(true),
       expect(contains(resp["body"], "Welcome")).toBe(true),
+      // The old bug returned the literal "index"; a rendered body never equals it.
       expect(resp["body"] == "index").toBe(false)
     ]
   ),
 
   test("getStatus returns 200", () =>
-    // The old bug returned the literal "index"; a rendered body never equals it.
     val resp = getStatus(makeReq("GET", "/api/status"))
     [expect(resp["status"]).toBe(200)]
   ),

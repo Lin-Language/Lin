@@ -19,9 +19,9 @@ import { length } from "std/array"
 // in lin_array_release) — see the report. Driving start-code detection through
 // parseNals exercises the same logic and is memory-clean under ASan.
 val s = suite("raspberry-nal", [
+  // single_nal_unit: SC4 67 AA BB SC4 68  -> one NAL (type 7, data 67 AA BB),
+  // trailing 68 not flushed (matches Rust).
   test("single_nal_unit: one complete NAL, trailing NAL not flushed", () =>
-    // single_nal_unit: SC4 67 AA BB SC4 68  -> one NAL (type 7, data 67 AA BB),
-    // trailing 68 not flushed (matches Rust).
     val buf: UInt8[] = [
       0,
       0,
@@ -48,8 +48,8 @@ val s = suite("raspberry-nal", [
     checks
   ),
 
+  // multiple_nal_units: three NALs, plus trailing SC + 0x41 to flush the third.
   test("multiple_nal_units: SPS, PPS, IDR in order", () =>
-    // multiple_nal_units: three NALs, plus trailing SC + 0x41 to flush the third.
     val buf: UInt8[] = [
       0,
       0,
@@ -88,8 +88,8 @@ val s = suite("raspberry-nal", [
     checks
   ),
 
+  // three_byte_start_codes
   test("three_byte_start_codes: 00 00 01 delimiters", () =>
-    // three_byte_start_codes
     val buf: UInt8[] = [
       0,
       0,
@@ -106,8 +106,8 @@ val s = suite("raspberry-nal", [
     checks
   ),
 
+  // mixed_start_code_lengths: SC4 ... SC3 ... SC4 -> two complete NALs.
   test("mixed_start_code_lengths: 4- and 3-byte mixed", () =>
-    // mixed_start_code_lengths: SC4 ... SC3 ... SC4 -> two complete NALs.
     val buf: UInt8[] = [
       0,
       0,
@@ -135,16 +135,16 @@ val s = suite("raspberry-nal", [
     checks
   ),
 
+  // no_start_code: bytes with no start code yield nothing.
   test("no_start_code: no NALs", () =>
-    // no_start_code: bytes with no start code yield nothing.
     val buf: UInt8[] = [0x41, 0x42, 0x43]
     val nals = parseNals(buf)
     val checks = [expect(length(nals)).toBe(0)]
     checks
   ),
 
+  // empty_input
   test("empty_input: no NALs", () =>
-    // empty_input
     val empty: UInt8[] = []
     val nals = parseNals(empty)
     val checks = [expect(length(nals)).toBe(0)]

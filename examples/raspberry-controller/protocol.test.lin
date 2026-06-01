@@ -12,61 +12,54 @@ import { length } from "std/array"
 // f32 round-trip and widen to exact Float64, making == comparison safe.
 val s = suite("raspberry-protocol", [
   // parse_forward
-  test("parsePacket forward = [1, 1]", () =>
-    [
-      expect(parsePacket(encodePacket(1.0, 1.0))[0]).toBe(1.0),
-      expect(parsePacket(encodePacket(1.0, 1.0))[1]).toBe(1.0)
-    ]
+  test("parsePacket forward = [1, 1]", () => [
+    expect(parsePacket(encodePacket(1.0, 1.0))[0]).toBe(1.0),
+    expect(parsePacket(encodePacket(1.0, 1.0))[1]).toBe(1.0)
+  ]
   ),
 
   // parse_reverse
-  test("parsePacket reverse = [-1, -1]", () =>
-    [
-      expect(parsePacket(encodePacket(0.0 - 1.0, 0.0 - 1.0))[0]).toBe(0.0 - 1.0),
-      expect(parsePacket(encodePacket(0.0 - 1.0, 0.0 - 1.0))[1]).toBe(0.0 - 1.0)
-    ]
+  test("parsePacket reverse = [-1, -1]", () => [
+    expect(parsePacket(encodePacket(0.0 - 1.0, 0.0 - 1.0))[0]).toBe(0.0 - 1.0),
+    expect(parsePacket(encodePacket(0.0 - 1.0, 0.0 - 1.0))[1]).toBe(0.0 - 1.0)
+  ]
   ),
 
   // parse_stop
-  test("parsePacket stop = [0, 0]", () =>
-    [
-      expect(parsePacket(encodePacket(0.0, 0.0))[0]).toBe(0.0),
-      expect(parsePacket(encodePacket(0.0, 0.0))[1]).toBe(0.0)
-    ]
+  test("parsePacket stop = [0, 0]", () => [
+    expect(parsePacket(encodePacket(0.0, 0.0))[0]).toBe(0.0),
+    expect(parsePacket(encodePacket(0.0, 0.0))[1]).toBe(0.0)
+  ]
   ),
 
   // parse_turn (0.5 and 0.25 are exact in f32 so == is safe)
-  test("parsePacket turn preserves distinct speeds", () =>
-    [
-      expect(parsePacket(encodePacket(0.5, 0.25))[0]).toBe(0.5),
-      expect(parsePacket(encodePacket(0.5, 0.25))[1]).toBe(0.25)
-    ]
+  test("parsePacket turn preserves distinct speeds", () => [
+    expect(parsePacket(encodePacket(0.5, 0.25))[0]).toBe(0.5),
+    expect(parsePacket(encodePacket(0.5, 0.25))[1]).toBe(0.25)
+  ]
   ),
 
   // parse_clamps_out_of_range: 5.0 -> 1.0, -3.0 -> -1.0
-  test("parsePacket clamps out-of-range speeds to [-1, 1]", () =>
-    [
-      expect(parsePacket(encodePacket(5.0, 0.0 - 3.0))[0]).toBe(1.0),
-      expect(parsePacket(encodePacket(5.0, 0.0 - 3.0))[1]).toBe(0.0 - 1.0)
-    ]
+  test("parsePacket clamps out-of-range speeds to [-1, 1]", () => [
+    expect(parsePacket(encodePacket(5.0, 0.0 - 3.0))[0]).toBe(1.0),
+    expect(parsePacket(encodePacket(5.0, 0.0 - 3.0))[1]).toBe(0.0 - 1.0)
+  ]
   ),
 
   // roundtrip_with_client_encoding: encode 0.5/-0.25, decode back exactly.
-  test("encode/parse round-trip (f32-exact values)", () =>
-    [
-      expect(parsePacket(encodePacket(0.5, 0.0 - 0.25))[0]).toBe(0.5),
-      expect(parsePacket(encodePacket(0.5, 0.0 - 0.25))[1]).toBe(0.0 - 0.25)
-    ]
+  test("encode/parse round-trip (f32-exact values)", () => [
+    expect(parsePacket(encodePacket(0.5, 0.0 - 0.25))[0]).toBe(0.5),
+    expect(parsePacket(encodePacket(0.5, 0.0 - 0.25))[1]).toBe(0.0 - 0.25)
+  ]
   ),
 
   // encode_stop: stop packet is all zero bytes
-  test("encodePacket stop is 8 zero bytes", () =>
-    [
-      expect(length(encodePacket(0.0, 0.0))).toBe(8),
-      expect(encodePacket(0.0, 0.0)[0]).toBe(0),
-      expect(encodePacket(0.0, 0.0)[3]).toBe(0),
-      expect(encodePacket(0.0, 0.0)[7]).toBe(0)
-    ]
+  test("encodePacket stop is 8 zero bytes", () => [
+    expect(length(encodePacket(0.0, 0.0))).toBe(8),
+    expect(encodePacket(0.0, 0.0)[0]).toBe(0),
+    expect(encodePacket(0.0, 0.0)[3]).toBe(0),
+    expect(encodePacket(0.0, 0.0)[7]).toBe(0)
+  ]
   )
 ])
 

@@ -8,12 +8,11 @@ import { length } from "std/array"
 
 val s = suite("lexer", [
   // --- Numbers ---
-  test("tokenizes a single-digit number as one token", () =>
-    [
-      expect(length(tokenize("7"))).toBe(1),
-      expect(tokenize("7")[0]["kind"]).toBe("num"),
-      expect(tokenize("7")[0]["text"]).toBe("7")
-    ]
+  test("tokenizes a single-digit number as one token", () => [
+    expect(length(tokenize("7"))).toBe(1),
+    expect(tokenize("7")[0]["kind"]).toBe("num"),
+    expect(tokenize("7")[0]["text"]).toBe("7")
+  ]
   ),
 
   test("tokenizes a multi-digit number as one token", () => [
@@ -23,22 +22,20 @@ val s = suite("lexer", [
   ),
 
   // --- Operators ---
-  test("tokenizes each arithmetic operator", () =>
-    [
-      expect(tokenize("+")[0]["kind"]).toBe("op"),
-      expect(tokenize("+")[0]["text"]).toBe("+"),
-      expect(tokenize("-")[0]["text"]).toBe("-"),
-      expect(tokenize("*")[0]["text"]).toBe("*"),
-      expect(tokenize("/")[0]["text"]).toBe("/")
-    ]
+  test("tokenizes each arithmetic operator", () => [
+    expect(tokenize("+")[0]["kind"]).toBe("op"),
+    expect(tokenize("+")[0]["text"]).toBe("+"),
+    expect(tokenize("-")[0]["text"]).toBe("-"),
+    expect(tokenize("*")[0]["text"]).toBe("*"),
+    expect(tokenize("/")[0]["text"]).toBe("/")
+  ]
   ),
 
   // --- Parens ---
-  test("tokenizes parentheses as lparen/rparen", () =>
-    [
-      expect(tokenize("(")[0]["kind"]).toBe("lparen"),
-      expect(tokenize(")")[0]["kind"]).toBe("rparen")
-    ]
+  test("tokenizes parentheses as lparen/rparen", () => [
+    expect(tokenize("(")[0]["kind"]).toBe("lparen"),
+    expect(tokenize(")")[0]["kind"]).toBe("rparen")
+  ]
   ),
 
   test(
@@ -46,9 +43,8 @@ val s = suite("lexer", [
     () => [expect(length(tokenize("(1+2)"))).toBe(5)]
   ),
 
+  // --- Whitespace ---
   test("skips spaces, tabs, and the surrounding stream stays stable", () =>
-    // ( 1 + 2 ) => lparen num op num rparen
-    // --- Whitespace ---
     val toks = tokenize("  1 +  2 ")
     [
       expect(length(toks)).toBe(3),
@@ -64,8 +60,8 @@ val s = suite("lexer", [
   ]
   ),
 
+  // --- Bad characters ---
   test("emits a bad token for an unknown character", () =>
-    // --- Bad characters ---
     val toks = tokenize("@")
     [
       expect(length(toks)).toBe(1),

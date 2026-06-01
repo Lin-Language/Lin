@@ -5,8 +5,8 @@ import { spawn, readStdout, wait, exec, shell, cwd } from "std/process"
 // std/process over real subprocesses is deterministic. We run small `sh`/`printf`
 // commands, so this touches no stdin/TTY state and is CI-safe.
 val s = suite("std/process", [
+  // --- streaming: spawn / readStdout / wait ---
   test("spawn + readStdout returns the child's output bytes", () =>
-    // --- streaming: spawn / readStdout / wait ---
     val h = spawn("sh", ["-c", "printf hello"])
     val buf: UInt8[] = [
       0,
@@ -37,8 +37,8 @@ val s = suite("std/process", [
     [expect(code).toBe(3)]
   ),
 
+  // --- batch: exec / shell / cwd ---
   test("exec collects status and stdout", () =>
-    // --- batch: exec / shell / cwd ---
     val r = exec("printf", ["batch-out"])
     [expect(r["status"]).toBe(0), expect(r["stdout"]).toBe("batch-out")]
   ),

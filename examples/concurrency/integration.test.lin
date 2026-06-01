@@ -7,10 +7,10 @@ import { poolSum, accumulate, sharedCounter, frozenLookup } from "./services"
 // concurrency structures (services.lin) together and assert one combined result.
 // Each unit suite covers a module alone; this proves the pieces compose.
 val s = suite("concurrency integration", [
+  // A realistic mixed workload: compute several values across the two modules and
+  // fold them into a single aggregate, then assert the total. This exercises
+  // async/await, parallel, ThreadPool, Worker, Shared and Frozen in one flow.
   test("combined async + parallel + pooled + shared + frozen workload", () =>
-    // A realistic mixed workload: compute several values across the two modules and
-    // fold them into a single aggregate, then assert the total. This exercises
-    // async/await, parallel, ThreadPool, Worker, Shared and Frozen in one flow.
     val sq = squareAsync(7) // tasks: async/await   -> 49
     val triple = weightedTriple(1, 2, 3) // tasks: parallel      -> [1,4,9]
     val tripleSum = triple[0] + triple[1] + triple[2] // -> 14
@@ -20,22 +20,22 @@ val s = suite("concurrency integration", [
     val frozenSum = frozenLookup() // services: Frozen     -> 100
     val total = sq + tripleSum + pooled + deposited + pushes + frozenSum
     [
+      // individual stage outputs
       expect(sq).toBe(49),
       expect(tripleSum).toBe(14),
       expect(pooled).toBe(12),
       expect(deposited).toBe(115),
       expect(pushes).toBe(5),
       expect(frozenSum).toBe(100),
+      // the combined aggregate of the whole flow
       expect(total).toBe(295)
     ]
   ),
 
+  // Error/recovery path threaded through the async layer: a faulting retry yields
+  // an Error, while fault isolation recovers a faulting divide to a sentinel, and a
+  // nested promise auto-flattens. The recovered values feed one aggregate.
   test("error and recovery paths compose across the async flow", () =>
-    // individual stage outputs
-    // the combined aggregate of the whole flow
-    // Error/recovery path threaded through the async layer: a faulting retry yields
-    // an Error, while fault isolation recovers a faulting divide to a sentinel, and a
-    // nested promise auto-flattens. The recovered values feed one aggregate.
     val failed = retryDivide(10, 0, 3) // every attempt faults -> Error
     val recovered = safeDivide(10, 0) // fault isolated       -> -1
     val ok = retryDivide(10, 2, 3) // first attempt wins   -> 5

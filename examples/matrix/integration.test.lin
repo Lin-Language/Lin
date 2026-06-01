@@ -7,10 +7,10 @@ import { toFixed, PI } from "std/math"
 val identity: Float64[] = mat3(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
 
 val s = suite("matrix integration", [
+  // Compose two transforms via matrix multiplication, then map a point through the
+  // combined matrix. A 90° rotation applied to (1,0) lands on (0,1); composing
+  // identity * rot must not change that.
   test("composed transform maps (1,0) to (0,1)", () =>
-    // Compose two transforms via matrix multiplication, then map a point through the
-    // combined matrix. A 90° rotation applied to (1,0) lands on (0,1); composing
-    // identity * rot must not change that.
     val rot = rotation2D(PI / 2.0)
     val composed = matMul(identity, rot)
     val pt = applyToPoint(composed, 1.0, 0.0)
@@ -20,18 +20,18 @@ val s = suite("matrix integration", [
     ]
   ),
 
+  // Matrix → vector pipeline: rotating a vector by 90° preserves its magnitude
+  // (matrix maps the point, vector measures it). [3,4] has magnitude 5 before and
+  // after the rotation that sends it to (-4,3).
   test("rotation preserves vector magnitude", () =>
-    // Matrix → vector pipeline: rotating a vector by 90° preserves its magnitude
-    // (matrix maps the point, vector measures it). [3,4] has magnitude 5 before and
-    // after the rotation that sends it to (-4,3).
     val rot = rotation2D(PI / 2.0)
     val pt = applyToPoint(rot, 3.0, 4.0)
     val rotated = [pt["x"], pt["y"]]
     [expect(magnitude2(rotated).toFixed(4)).toBe("5.0000")]
   ),
 
+  // The angle between the original and the rotated vector is 90° (PI/2).
   test("rotation by 90 deg yields a 90 deg angle between in and out", () =>
-    // The angle between the original and the rotated vector is 90° (PI/2).
     val rot = rotation2D(PI / 2.0)
     val pt = applyToPoint(rot, 1.0, 0.0)
     val rotated = [pt["x"], pt["y"]]
@@ -40,8 +40,8 @@ val s = suite("matrix integration", [
     ]
   ),
 
+  // The rotated unit vector is still perpendicular to the original (dot == 0).
   test("rotated unit vector is orthogonal to the original", () =>
-    // The rotated unit vector is still perpendicular to the original (dot == 0).
     val rot = rotation2D(PI / 2.0)
     val pt = applyToPoint(rot, 1.0, 0.0)
     val rotated = [pt["x"], pt["y"]]

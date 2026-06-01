@@ -14,10 +14,21 @@ export val push = (arr: Json, item: Json): Null =>
 export val slice = (arr: Json, start: Int32, end: Int32): Json =>
   lin_array_slice_dyn(arr, start, end)
 
+// Returns an uninitialised length-`n` array. Stays `Json` (boxed/tagged) so the common
+// untyped use `val buf = arrayAllocate(n)` needs no annotation: making it generic over a
+// RETURN-ONLY `T` would force every use site to pin `T`, breaking that ergonomic. A scalar
+// flat array is best built with `arrayAllocateFilled` (its `T` is pinned by the fill arg).
 export val arrayAllocate = (n: Int32): Json =>
   lin_array_allocate(n)
 
-export val arrayAllocateFilled = (n: Int32, fill: Json): Json =>
+// Generic so the element type flows to the `lin_array_allocate_filled` intrinsic at the call
+// site: codegen then allocates a FLAT unboxed array for a concrete scalar element (Int32[],
+// Float64[], …) and a TAGGED array otherwise. A non-generic `Json` signature erased the
+// element type, so the wrapper always built a tagged array while a caller annotated `Int32[]`
+// read it via the flat path — reinterpreting 16-byte TaggedVal slots as packed scalars
+// (garbage). `T` is inferred from `fill`, so untyped use (`arrayAllocateFilled(n, 0)`) still
+// works with no annotation. See array.test.lin.
+export val arrayAllocateFilled = <T>(n: Int32, fill: T): T[] =>
   lin_array_allocate_filled(n, fill)
 
 export val length = (x: Json): Int32 =>

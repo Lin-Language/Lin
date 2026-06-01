@@ -46,22 +46,22 @@ val s = suite("std/array", [
     [expect(result.toString()).toBe("[2, 4]")]
   ),
 
+  // Regression (ADR-069 R2): filtering an array of OBJECTS pushes each kept element (BORROWED from
+  // the source) into the result; the result array must take its own reference, else releasing both
+  // the source and the filtered array at teardown double-frees the shared objects (heap UAF).
   test("filter over object array does not double-free kept elements", () =>
-    // Regression (ADR-069 R2): filtering an array of OBJECTS pushes each kept element (BORROWED from
-    // the source) into the result; the result array must take its own reference, else releasing both
-    // the source and the filtered array at teardown double-frees the shared objects (heap UAF).
     val items = [{ "type": "a", "v": 1 }, { "type": "b", "v": 2 }, { "type": "a", "v": 3 }]
     val kept = items.filter((i) => i["type"] == "a")
     [
       expect(length(kept)).toBe(2),
       expect(kept[0]["v"]).toBe(1),
       expect(kept[1]["v"]).toBe(3),
+      // the source must remain intact and independently usable after the filter
       expect(length(items)).toBe(3)
     ]
   ),
 
   test("reduce sums values", () =>
-    // the source must remain intact and independently usable after the filter
     val result = [1, 2, 3, 4].reduce(0, (acc, x) => acc + x)
     [expect(result).toBe(10)]
   ),
@@ -439,7 +439,6 @@ val s = suite("std/array", [
   ),
 
   test("prepend on a flat UInt8[] preserves the byte value", () =>
-    // The latent-bug check: a tagged result would read 0 here.
     val b: UInt8[] = [2, 3]
     val b2: UInt8[] = b.prepend(1)
     [expect(b2.toString()).toBe("[1, 2, 3]"), expect(b2[0]).toBe(1)]
@@ -450,12 +449,12 @@ val s = suite("std/array", [
     [
       expect(ss.append("c").toString()).toBe("[\"a\", \"b\", \"c\"]"),
       expect(ss.prepend("z").toString()).toBe("[\"z\", \"a\", \"b\"]"),
+      // original unchanged
       expect(ss.toString()).toBe("[\"a\", \"b\"]")
     ]
   ),
 
   test("scan returns all intermediate accumulator values including initial", () =>
-    // original unchanged
     val result = [1, 2, 3].scan(0, (acc, x) => acc + x)
     [expect(result.toString()).toBe("[0, 1, 3, 6]")]
   ),
@@ -531,12 +530,12 @@ val s = suite("std/array", [
     [expect(result["anything"]).toBe(null)]
   ),
 
+  // --- heap/union element coverage for index-assign (`result[i] = x`) ---
+  // These exercise the array/object index-assign store with STRING and ARRAY
+  // (heap) elements, where the fresh-vs-borrowed and consume-vs-retain ownership
+  // rules matter (scalar elements hide RC bugs). Read the stored value back so a
+  // use-after-free corrupts the assertion; the ASan CI leg also runs these.
   test("map producing strings (fresh union element)", () =>
-    // --- heap/union element coverage for index-assign (`result[i] = x`) ---
-    // These exercise the array/object index-assign store with STRING and ARRAY
-    // (heap) elements, where the fresh-vs-borrowed and consume-vs-retain ownership
-    // rules matter (scalar elements hide RC bugs). Read the stored value back so a
-    // use-after-free corrupts the assertion; the ASan CI leg also runs these.
     val result = [1, 2, 3].map((x) => "n${x}")
     [expect(result.toString()).toBe("[\"n1\", \"n2\", \"n3\"]")]
   ),
@@ -616,6 +615,19 @@ val s = suite("std/array", [
     set(b, 0, "a")
     set(b, 1, "b")
     [expect(b.toString()).toBe("[\"a\", \"b\", null]")]
+  ),
+
+  test("arrayAllocateFilled with a concrete scalar element type is flat and correct", () =>
+    // An annotated scalar element type must allocate a FLAT array matching the flat read path
+    // (a tagged array read flat returns garbage). `set` then writes the same representation.
+    val a: Int32[] = arrayAllocateFilled(4, 7)
+    set(a, 1, 99)
+    val f: Float64[] = arrayAllocateFilled(2, 1.5)
+    set(f, 0, 2.5)
+    [
+      expect(a.toString()).toBe("[7, 99, 7, 7]"),
+      expect(f.toString()).toBe("[2.5, 1.5]")
+    ]
   )
 ])
 
