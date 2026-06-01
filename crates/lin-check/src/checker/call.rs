@@ -206,6 +206,7 @@ impl Checker {
         match module_path.as_str() {
             "std/iter" => is_std_iter_stream_combinator(export_name),
             "std/stream" => is_std_stream_consuming_export(export_name),
+            "std/archive" => is_std_archive_consuming_export(export_name),
             _ => false,
         }
     }
@@ -838,6 +839,14 @@ fn is_std_iter_stream_combinator(export_name: &str) -> bool {
         "map" | "filter" | "take" | "drop" | "flatMap" | "takeWhile" | "dropWhile"
             | "flatten" | "concat" | "reduce" | "find" | "some" | "every" | "while" | "for"
     )
+}
+
+/// The std/archive exports that CONSUME their `Stream` argument: `untar` (terminal driver),
+/// `manifest`/`files` (adapters that move the parent stream into the splitter). All three route to a
+/// `lin_stream_*` intrinsic that moves the boxed-stream pointer, so a later use of the same binding
+/// must be a compile-time error — mirrors the IR's type-based `move_streamish_arg`.
+fn is_std_archive_consuming_export(export_name: &str) -> bool {
+    matches!(export_name, "untar" | "manifest" | "files")
 }
 
 /// True when `ty` can ONLY be a `Stream` at runtime — a bare `Stream`, or a union whose every

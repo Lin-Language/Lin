@@ -1,0 +1,30 @@
+// std/compress — streaming gzip/deflate byte-adapters over `Stream<UInt8[]>` (ADR-072 streams).
+//
+// Each adapter is LAZY: it wraps an upstream byte stream and (de)compresses incrementally — one
+// upstream chunk in, whatever output bytes were produced out — so a multi-gigabyte file flows
+// through in constant memory. A decode/encode fault surfaces IN-BAND as the canonical `Error`
+// value at the terminal op (no `is Error` between steps), exactly like every other adapter.
+//
+//   gunzip(s) / gzip(s)     — the gzip container format (header + CRC32 + ISIZE trailer).
+//   inflate(s) / deflate(s) — raw DEFLATE bitstream (no gzip header/CRC).
+//
+// Build a pipeline with std/stream + std/iter as usual, e.g.
+//   import { readStream, writeStream, drain } from "std/stream"
+//   import { gunzip } from "std/compress"
+//   readStream("data.gz").gunzip().writeStream("data.txt").drain()
+
+// Decompress a gzip-framed byte stream → a stream of decompressed `UInt8[]` chunks.
+export val gunzip = (s: Stream): Stream =>
+  lin_stream_gunzip(s)
+
+// Compress a byte stream into the gzip container format.
+export val gzip = (s: Stream): Stream =>
+  lin_stream_gzip(s)
+
+// Decompress a raw DEFLATE byte stream (no gzip header/CRC).
+export val inflate = (s: Stream): Stream =>
+  lin_stream_inflate(s)
+
+// Compress a byte stream as a raw DEFLATE bitstream (no gzip header/CRC).
+export val deflate = (s: Stream): Stream =>
+  lin_stream_deflate(s)

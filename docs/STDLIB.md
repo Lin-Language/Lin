@@ -26,6 +26,8 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/net`](#stdnet) | UDP and TCP sockets |
 | [`std/process`](#stdprocess) | Run and manage external processes |
 | [`std/stream`](#stdstream) | Lazy, fallible byte/value streams over OS resources |
+| [`std/compress`](#stdcompress) | Streaming gzip/DEFLATE byte-stream adapters |
+| [`std/archive`](#stdarchive) | Tar splitting over a byte stream (untar / manifest / files) |
 | [`std/tty`](#stdtty) | Raw terminal mode and key reads |
 | [`std/signal`](#stdsignal) | Blocking wait for OS signals |
 | [`std/async`](#stdasync) | Async, concurrency and workers |
@@ -346,10 +348,23 @@ Stream-specific sources, adapters, sinks, and terminals. The unified combinators
 | [`chunks`](#chunks) | `(Stream<UInt8[]>, Int32) -> Stream<UInt8[]>` | Re-chunk a byte stream to fixed-size windows |
 | [`readText`](#readText) | `(Stream<UInt8[]>) -> String \| Error` | Drain a byte stream to one String |
 | [`collect`](#collect) | `(Stream<UInt8[]>) -> UInt8[] \| Error` | Drain a byte stream to one byte buffer |
-| [`writeStream`](#writeStream) | `<T>(Stream<T>, String) -> Stream<T>` | Build a sink that writes upstream items to a file |
+| [`writeStream`](#writeStream) | `<T>(Stream<T>, String) -> Stream<T>` | Build a RAW sink: write each item's bytes verbatim, no separator |
+| [`writeLines`](#writeLines) | `<T>(Stream<T>, String) -> Stream<T>` | Build a line-oriented sink: write each item followed by a newline |
 | [`drain`](#drain) | `<T>(Stream<T>) -> Null \| Error` | Run a pipeline on the calling thread |
 | [`promise`](#promise-stream) | `<T>(Stream<T>) -> Json` | Move a pipeline to a worker thread; `Promise<Null \| Error>` |
 | [`close`](#close-stream) | `(Stream<T>) -> Null` | Release the file/socket now (optional; idempotent) |
+
+**std/compress**
+
+Lazy streaming (de)compression adapters over a `Stream<UInt8[]>`. Each transforms bytes
+incrementally (constant memory) and threads decode errors in-band like every other adapter.
+
+| Function | Signature | Summary |
+| --- | --- | --- |
+| [`gunzip`](#gunzip) | `(Stream<UInt8[]>) -> Stream<UInt8[]>` | Decompress a gzip-framed byte stream |
+| [`gzip`](#gzip) | `(Stream<UInt8[]>) -> Stream<UInt8[]>` | Compress a byte stream into the gzip container |
+| [`inflate`](#inflate) | `(Stream<UInt8[]>) -> Stream<UInt8[]>` | Decompress a raw DEFLATE byte stream |
+| [`deflate`](#deflate) | `(Stream<UInt8[]>) -> Stream<UInt8[]>` | Compress a byte stream as raw DEFLATE |
 
 **std/template**
 
@@ -3599,14 +3614,14 @@ is a `Stream` (ADR-077). A stream pipeline imports its **sources and sinks** fro
 **combinators** from `std/iter`:
 
 ```txt
-import { readStream, writeStream, drain } from "std/stream"
+import { readStream, writeLines, drain } from "std/stream"
 import { map, filter, take, for } from "std/iter"
 
 readStream("in.csv")
   .lines()
   .map(transform)
   .filter(notEmpty)
-  .writeStream("out.csv")
+  .writeLines("out.csv")
   .drain()
 ```
 
@@ -3709,13 +3724,35 @@ Terminal. Drives a byte stream to completion and returns its full contents as on
 val writeStream: <T>(Stream<T>, path: String) -> Stream<T>
 ```
 
-Builds a **sink** node that writes each upstream item to the file at `path`. It returns a `Stream` whose terminal op (`drain`/`promise`) runs the whole pipeline — pulling one item at a time and writing it — so memory stays bounded regardless of input size. Building the sink does not write anything; a terminal op must drive it.
+Builds a **raw sink** node that writes each upstream item's bytes to the file at `path` **verbatim**, concatenated with **no separator**: a `String` item writes its UTF-8 bytes, a `UInt8[]` item writes its raw bytes, and anything else writes its `toString` rendering. It returns a `Stream` whose terminal op (`drain`/`promise`) runs the whole pipeline — pulling one item at a time and writing it — so memory stays bounded regardless of input size. Building the sink does not write anything; a terminal op must drive it.
+
+Because it injects no newlines, `writeStream` is the correct sink for **binary** output — e.g. compressing a file to disk, where any inserted separator would corrupt the result:
+
+```txt
+readStream("data.txt")
+  .gzip()                  // from std/compress
+  .writeStream("data.gz")  // raw bytes — a valid .gz file
+  .drain()
+```
+
+For newline-delimited text output (CSV rows, log lines), use [`writeLines`](#writeLines).
+
+---
+
+### writeLines
+
+```txt
+val writeLines: <T>(Stream<T>, path: String) -> Stream<T>
+```
+
+Builds a **line-oriented sink** node that writes each upstream item to the file at `path` followed by a newline (`\n`) — i.e. one item per line. Item bytes are rendered the same way as [`writeStream`](#writeStream) (String → UTF-8, `UInt8[]` → raw bytes, otherwise `toString`); the difference is the trailing `\n` after each item. Like `writeStream` it is lazy — a terminal op (`drain`/`promise`) must drive it.
 
 ```txt
 readStream("in.csv")
   .lines()
   .map(transform)
-  .writeStream("out.csv")
+  .filter(notEmpty)
+  .writeLines("out.csv")   // each transformed row on its own line
   .drain()
 ```
 
@@ -3732,7 +3769,7 @@ Terminal. Drives the pipeline on the **calling thread** and returns `Null` on no
 ```txt
 val outcome = readStream("in.csv")
   .lines()
-  .writeStream("out.csv")
+  .writeLines("out.csv")
   .drain()
 match outcome
   is Error => print("copy failed: ${outcome["message"]}")
@@ -3755,7 +3792,7 @@ The promise type is conceptually `Promise<Null | Error>`; like all promise handl
 val p = readStream("big.log")
   .lines()
   .filter(isError)
-  .writeStream("errors.log")
+  .writeLines("errors.log")
   .promise()
 match await(p)
   is Error => print("pipeline failed")
@@ -3771,6 +3808,144 @@ val close: (Stream<T>) -> Null
 ```
 
 Closes the stream now, releasing the file (or socket) it holds. **Optional** — a stream cleans up on its own once you're done with it; `close` is only for when you want to release the resource at a specific point rather than waiting for that. **Idempotent** — closing an already-closed or already-drained stream does nothing.
+
+---
+
+## std/compress
+
+Streaming gzip/DEFLATE adapters over a byte stream (`Stream<UInt8[]>`). Each is a **lazy adapter**:
+it wraps an upstream byte stream and (de)compresses bytes **incrementally** — one upstream chunk in,
+whatever output bytes the codec produced out — so a multi-gigabyte file flows through in constant
+memory. A decode/encode fault is threaded **in-band**: the first such error short-circuits straight
+to the terminal op as the canonical `Error` value, exactly like every other stream adapter (no
+`is Error` between steps).
+
+Two container formats are supported: `gzip`/`gunzip` use the **gzip** container (header + CRC32 +
+length trailer); `deflate`/`inflate` use the **raw DEFLATE** bitstream (no header/CRC).
+
+```txt
+import { readStream, writeStream, drain } from "std/stream"
+import { gunzip } from "std/compress"
+
+// Decompress a .gz file to disk as a streaming pipeline:
+readStream("data.txt.gz")
+  .gunzip()
+  .writeStream("data.txt")
+  .drain()
+```
+
+### gunzip
+
+```txt
+val gunzip: (Stream<UInt8[]>) -> Stream<UInt8[]>
+```
+
+Decompresses a **gzip-framed** byte stream, yielding the decompressed bytes as a new byte stream.
+Invalid gzip input surfaces an `Error` in-band at the terminal op.
+
+### gzip
+
+```txt
+val gzip: (Stream<UInt8[]>) -> Stream<UInt8[]>
+```
+
+Compresses a byte stream into the **gzip container** format (the output a `.gz` file would hold).
+
+### inflate
+
+```txt
+val inflate: (Stream<UInt8[]>) -> Stream<UInt8[]>
+```
+
+Decompresses a **raw DEFLATE** byte stream (no gzip header/CRC). Invalid input surfaces an `Error`
+in-band.
+
+### deflate
+
+```txt
+val deflate: (Stream<UInt8[]>) -> Stream<UInt8[]>
+```
+
+Compresses a byte stream as a **raw DEFLATE** bitstream (no gzip header/CRC).
+
+---
+
+## std/archive
+
+Tar splitting over a byte stream (`Stream<UInt8[]>`). A **tar** archive is a flat sequence of
+512-byte-aligned (header + body) records; these surfaces turn a byte stream into archive entries
+**without buffering the whole archive** — the parent stream is pulled one chunk at a time. A
+`.tar.gz` is just `gunzip()` (`std/compress`) composed with the tar splitter. **Only the tar format
+is supported** (zip is not).
+
+All three surfaces **consume** the parent stream (it is moved in); the source binding may not be used
+again after the call — the affine stream check rejects a reuse (re-open the source for a second pass).
+
+Each entry's **`meta`** object is pure JSON:
+
+```txt
+{ name: String, size: Int64, typeflag: String, isDir: Boolean }
+```
+
+where `typeflag` is the tar type byte as a one-character string (`"0"` = regular file, `"5"` =
+directory) and `isDir` is `true` iff `typeflag == "5"`.
+
+```txt
+import { readStream, drain, writeStream } from "std/stream"
+import { gunzip } from "std/compress"
+import { untar, manifest, files } from "std/archive"
+import { for } from "std/iter"
+
+// List a .tar.gz's contents without extracting anything:
+readStream("data.tar.gz").gunzip().manifest().for((m) => print(m["name"]))
+
+// Extract every member to disk in constant memory (each body streamed straight to its file):
+readStream("data.tar.gz").gunzip().untar((meta, data) =>
+  data.writeStream("out/${meta["name"]}").drain()
+)
+```
+
+### untar
+
+```txt
+val untar: (Stream<UInt8[]>, body: (Json, Stream<UInt8[]>) -> Json) -> Null | Error
+```
+
+The **terminal** driver: drives the whole archive on the calling thread, calling `body(meta, data)`
+once per entry, where `data` is a `Stream<UInt8[]>` **sub-stream** over that entry's body. The body's
+return value is ignored. Returns `Null` on a clean archive, or an `Error` if a read fault or a body
+fault occurs. This is the **constant-memory primitive** — an arbitrarily large member flows through
+its `data` sub-stream without ever being fully buffered.
+
+Whether the body **drains** `data` or **ignores** it, the driver always skips to the next entry
+correctly (an undrained body is skipped automatically).
+
+> **Sync-only sub-stream.** Inside the body, `data` is valid **only during the body's synchronous
+> execution** — the driver is paused while the body runs and resumes (advancing to the next entry)
+> the moment the body returns. `data` must therefore be consumed (drained / read) **inside the
+> callback**; it shares a cursor with the paused driver. Handing it to a worker via `.promise()`
+> would race that cursor and is **unsupported**. The ADR-075 stream placement restriction bounds
+> `data`'s lifetime to the callback (it cannot be stored in a field, `var`, or array); a dedicated
+> compile-time check specifically for `.promise()` on a sub-stream is a known gap.
+
+### manifest
+
+```txt
+val manifest: (Stream<UInt8[]>) -> Stream<Object>
+```
+
+An **adapter** yielding each entry's `meta` object, with its body **skipped** (a meta-only listing).
+Composes with `std/iter` (`filter`/`map`/`for`) like any other `Stream`. No sub-streams are minted.
+
+### files
+
+```txt
+val files: (Stream<UInt8[]>) -> Stream<Object>
+```
+
+An **adapter** yielding `{ name, data, size, typeflag, isDir }` per entry, where `data` is the
+entry's **full body buffered** into a `UInt8[]`. A convenience for normal-sized files; composes with
+`std/iter`. Because each body is buffered in memory, prefer `untar` for arbitrarily large entries.
 
 ---
 

@@ -5,14 +5,14 @@ Lazy, fallible streams over OS resources — files, sockets, subprocess stdout, 
 Errors are threaded **in-band**: the first read error poisons the upstream and short-circuits to the terminal op, so error handling lives only at the terminal, not at every adapter.
 
 ```lin
-import { readStream, writeStream, drain } from "std/stream"
+import { readStream, writeLines, drain } from "std/stream"
 import { map, filter, take, for } from "std/iter"
 
 readStream("in.csv")
   .lines()
   .map(transform)
   .filter(notEmpty)
-  .writeStream("out.csv")
+  .writeLines("out.csv")
   .drain()
 ```
 
@@ -50,7 +50,8 @@ Stream<T>   // opaque; covariant in T; not JSON, not subscriptable
 | `lines` | `(Stream<UInt8[]>) -> Stream<String>` | adapter | View bytes as a stream of UTF-8 lines |
 | `linesMax` | `(Stream<UInt8[]>, Int32) -> Stream<String>` | adapter | Like `lines`, with an explicit per-line byte cap |
 | `chunks` | `(Stream<UInt8[]>, Int32) -> Stream<UInt8[]>` | adapter | Re-chunk into fixed-size `n`-byte windows |
-| `writeStream` | `(Stream<T>, String) -> Stream<T>` | sink | Write each item to a file; drive with a terminal |
+| `writeStream` | `(Stream<T>, String) -> Stream<T>` | sink | RAW sink: write each item's bytes verbatim, no separator |
+| `writeLines` | `(Stream<T>, String) -> Stream<T>` | sink | Line sink: write each item followed by a newline |
 | `readText` | `(Stream<UInt8[]>) -> String \| Error` | terminal | Drive to completion, return the contents as a `String` |
 | `collect` | `(Stream<UInt8[]>) -> UInt8[] \| Error` | terminal | Drive to completion, return the contents as a `UInt8[]` |
 | `drain` | `(Stream<T>) -> Null \| Error` | terminal | Drive the pipeline on the calling thread |
@@ -95,13 +96,30 @@ readStream("frames.bin").chunks(188).for(frame => process(frame))
 
 ### `writeStream`
 
-Builds a **sink** node that writes each upstream item to the file at `path`. It returns a `Stream` whose terminal op (`drain`/`promise`) runs the whole pipeline — pulling one item at a time and writing it — so memory stays bounded regardless of input size. Building the sink writes nothing; a terminal op must drive it.
+Builds a **raw sink** node that writes each upstream item's bytes to the file at `path` **verbatim**, concatenated with **no separator** (a `String` writes its UTF-8 bytes, a `UInt8[]` its raw bytes, anything else its `toString`). It returns a `Stream` whose terminal op (`drain`/`promise`) runs the whole pipeline — pulling one item at a time and writing it — so memory stays bounded regardless of input size. Building the sink writes nothing; a terminal op must drive it.
+
+Because it injects no newlines, `writeStream` is the correct sink for **binary** output — e.g. compressing a file to disk, where any inserted separator would corrupt the result:
+
+```lin
+readStream("data.txt")
+  .gzip()                  // from std/compress
+  .writeStream("data.gz")  // raw bytes — a valid .gz file
+  .drain()
+```
+
+For newline-delimited text output, use `writeLines`.
+
+---
+
+### `writeLines`
+
+Builds a **line-oriented sink** node that writes each upstream item to the file at `path` followed by a newline (`\n`) — one item per line. Item bytes are rendered the same way as `writeStream`; the difference is the trailing `\n` after each item. Like `writeStream` it is lazy — a terminal op must drive it.
 
 ```lin
 readStream("in.csv")
   .lines()
   .map(transform)
-  .writeStream("out.csv")
+  .writeLines("out.csv")
   .drain()
 ```
 
@@ -125,7 +143,7 @@ Terminal. Drives the pipeline on the **calling thread** and returns `Null` on no
 ```lin
 val outcome = readStream("in.csv")
   .lines()
-  .writeStream("out.csv")
+  .writeLines("out.csv")
   .drain()
 match outcome
   is Error => print("copy failed: ${outcome["message"]}")
@@ -144,7 +162,7 @@ Terminal. Runs the whole pipeline on a **background thread** and returns a promi
 val p = readStream("big.log")
   .lines()
   .filter(isError)
-  .writeStream("errors.log")
+  .writeLines("errors.log")
   .promise()
 match await(p)
   is Error => print("pipeline failed")

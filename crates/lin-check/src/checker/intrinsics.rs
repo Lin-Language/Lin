@@ -273,6 +273,34 @@ impl Checker {
             Type::func(vec![any_stream()], any_stream()));
         self.define_intrinsic("lin_stream_concat",
             Type::func(vec![any_stream(), any_stream()], any_stream()));
+        // Streaming compression byte-adapters (std/compress): each Stream<UInt8[]> → Stream<UInt8[]>.
+        // gunzip/gzip use the gzip container; inflate/deflate use raw DEFLATE.
+        self.define_intrinsic("lin_stream_gunzip",
+            Type::func(vec![any_stream()], any_stream()));
+        self.define_intrinsic("lin_stream_gzip",
+            Type::func(vec![any_stream()], any_stream()));
+        self.define_intrinsic("lin_stream_inflate",
+            Type::func(vec![any_stream()], any_stream()));
+        self.define_intrinsic("lin_stream_deflate",
+            Type::func(vec![any_stream()], any_stream()));
+        // tar splitting (std/archive). `untar(s, body)` is a TERMINAL: it drives the whole archive on
+        // the calling thread, calling `body(meta, data)` per entry where `meta` is an Object and
+        // `data` is a `Stream<UInt8[]>` SUB-STREAM (a legal stream PARAMETER position per ADR-075).
+        // Returns `Null | Error`. The body's return is ignored, so it is typed `Json` (TypeVar(MAX)).
+        // `manifest(s)`/`files(s)` are ADAPTERS returning a fresh `Stream` (of Objects). All three
+        // CONSUME the parent stream (the affine move is type-based in the IR; the checker mirrors it
+        // via `callee_routes_to_stream_op`'s std/archive arm).
+        self.define_intrinsic("lin_stream_untar", Type::func(vec![
+                any_stream(),
+                Type::func(vec![
+                        Type::TypeVar(u32::MAX),
+                        Type::Stream(Box::new(Type::Array(Box::new(Type::UInt8)))),
+                    ], Type::TypeVar(u32::MAX)),
+            ], Type::Union(vec![Type::Null, crate::resolve::error_type()])));
+        self.define_intrinsic("lin_stream_manifest",
+            Type::func(vec![any_stream()], any_stream()));
+        self.define_intrinsic("lin_stream_files",
+            Type::func(vec![any_stream()], any_stream()));
         // Net-new terminals (Stage 4): reduce → U | Error; find → T | Null | Error; some/every →
         // Boolean | Error; while → Null | Error. All consume + close the stream.
         self.define_intrinsic("lin_stream_reduce", Type::func(vec![
@@ -305,6 +333,8 @@ impl Checker {
         // Sink + terminals. writeStream → a sink Stream; drain → Null|Error; collect → UInt8[]|
         // Error; readText → String|Error. All terminals consume + close the stream.
         self.define_intrinsic("lin_stream_write",
+            Type::func(vec![any_stream(), Type::Str], any_stream()));
+        self.define_intrinsic("lin_stream_write_lines",
             Type::func(vec![any_stream(), Type::Str], any_stream()));
         self.define_intrinsic("lin_stream_drain",
             Type::func(vec![any_stream()], Type::Union(vec![Type::Null, crate::resolve::error_type()])));
