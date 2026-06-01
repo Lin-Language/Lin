@@ -9,6 +9,14 @@ crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 serde_json = { version = "1", default-features = false, features = ["std"] }
+# Jinja-style templating for std/template. default-features off to keep deps minimal;
+# `builtins` re-enables {% for %}/{% if %} control flow and the standard filter set
+# (which `default-features = false` drops). `serde` lets minijinja consume a
+# serde_json::Value as the render context directly. `multi_template` enables the
+# `{% extends %}`/`{% block %}`/`{% include %}` inheritance statements, and `loader`
+# enables path_loader to resolve referenced templates against a directory — together
+# the basis for the layout system used by `render(path, data)` (ADR-074).
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "multi_template", "loader"] }
 ureq = { workspace = true }
 libc = "0.2"
 serde_yml = "0.0.13"
