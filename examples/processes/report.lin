@@ -4,7 +4,8 @@
 // synthetic TaskResult values (report.test.lin) without spawning anything.
 
 import { TaskResult } from "./task"
-import { filter, length, map } from "std/array"
+import { length } from "std/array"
+import { filter, map } from "std/iter"
 import { toString, join } from "std/string"
 
 export type Summary = { "total": Int32, "passed": Int32, "failed": Int32, "ok": Boolean }

@@ -57,7 +57,7 @@ const GENERIC_TV_BASE: u32 = 9001;
 fn mentions_generic_tv(ty: &Type) -> bool {
     match ty {
         Type::TypeVar(id) => *id >= GENERIC_TV_BASE && *id != u32::MAX,
-        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) => mentions_generic_tv(t),
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) => mentions_generic_tv(t),
         Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(mentions_generic_tv),
         Type::Object(fields) => fields.values().any(mentions_generic_tv),
         Type::Function { params, ret, .. } => {
@@ -87,6 +87,7 @@ fn subst_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
         Type::Array(t) => Type::Array(Box::new(subst_type(t, subs))),
         Type::Iterator(t) => Type::Iterator(Box::new(subst_type(t, subs))),
         Type::Shared(t) => Type::Shared(Box::new(subst_type(t, subs))),
+        Type::Stream(t) => Type::Stream(Box::new(subst_type(t, subs))),
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| subst_type(t, subs)).collect()),
         Type::Union(ts) => Type::Union(ts.iter().map(|t| subst_type(t, subs)).collect()),
         Type::Object(fields) => Type::Object(
@@ -125,6 +126,7 @@ fn erase_nonconcrete_typevars(ty: &Type) -> Type {
         Type::Array(t) => Type::Array(Box::new(erase_nonconcrete_typevars(t))),
         Type::Iterator(t) => Type::Iterator(Box::new(erase_nonconcrete_typevars(t))),
         Type::Shared(t) => Type::Shared(Box::new(erase_nonconcrete_typevars(t))),
+        Type::Stream(t) => Type::Stream(Box::new(erase_nonconcrete_typevars(t))),
         Type::FixedArray(ts) => {
             Type::FixedArray(ts.iter().map(erase_nonconcrete_typevars).collect())
         }
@@ -175,6 +177,7 @@ fn collect_subs(pattern: &Type, actual: &Type, subs: &mut HashMap<u32, Type>) {
         }
         (Type::Iterator(p), Type::Iterator(a)) => collect_subs(p, a, subs),
         (Type::Shared(p), Type::Shared(a)) => collect_subs(p, a, subs),
+        (Type::Stream(p), Type::Stream(a)) => collect_subs(p, a, subs),
         (Type::Object(pf), Type::Object(af)) => {
             for (k, pv) in pf {
                 if let Some(av) = af.get(k) { collect_subs(pv, av, subs); }
@@ -207,6 +210,7 @@ fn mangle_type(ty: &Type) -> String {
         Type::StrLit(_) => "String".into(),
         Type::Array(t) => format!("Arr_{}", mangle_type(t)),
         Type::Iterator(t) => format!("Iter_{}", mangle_type(t)),
+        Type::Stream(t) => format!("Stream_{}", mangle_type(t)),
         Type::Object(_) => "Object".into(),
         Type::Union(_) => "Union".into(),
         Type::Function { .. } => "Fn".into(),
@@ -1154,7 +1158,13 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
     // Handle a call to a generic function (directly by name, or through a `val f = id` alias).
     if let TypedExpr::Call { func, args, result_type, span, .. } = expr {
         if let TypedExpr::LocalGet { .. } = func.as_ref() {
-            let generic_slot = callee_generic_slot;
+            // STREAM RECEIVER: a generic combinator (`map`/`filter`/`reduce`/`while`) called with a
+            // DEFINITELY-stream arg0 must NOT be native-specialized to its eager array body. Leave
+            // the call as a plain Named import call so the IR lowerer (`lower_call`) redirects it to
+            // the lazy `lin_stream_*` backend (mirrors the inline-bail above). Skipping the generic
+            // path keeps the original import-binding `func` slot intact for that redirect.
+            let arg0_is_stream = args.first().map(|a| matches!(a.ty(), Type::Stream(_))).unwrap_or(false);
+            let generic_slot = if arg0_is_stream { None } else { callee_generic_slot };
             if let Some(gslot) = generic_slot {
                 let g = &state.generics[&gslot];
                 if let TypedExpr::Function { params, ret_type, .. } = &g.func {
@@ -1309,6 +1319,12 @@ fn try_inline_combinator_wrapper(
     };
 
     let TypedExpr::Call { args, .. } = expr else { return false };
+    // A STREAM receiver (arg0) must NOT inline to `lin_map`/… (the eager array loop). Stream
+    // combinator dispatch happens at the call site (`lower_call`), redirecting to the lazy
+    // `lin_stream_*` backend. Bail so the call stays a Named import call the lowerer intercepts.
+    if args.first().map(|a| matches!(a.ty(), Type::Stream(_))).unwrap_or(false) {
+        return false;
+    }
     // Exactly one capture-less literal-lambda argument qualifies.
     let mut lambda_args = 0;
     for a in args.iter() {
@@ -1473,7 +1489,7 @@ fn collect_quantified_ids(ty: &Type, out: &mut std::collections::HashSet<u32>) {
         Type::TypeVar(id) if *id >= GENERIC_TV_BASE && *id != u32::MAX => {
             out.insert(*id);
         }
-        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) => collect_quantified_ids(t, out),
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) => collect_quantified_ids(t, out),
         Type::FixedArray(ts) | Type::Union(ts) => {
             ts.iter().for_each(|t| collect_quantified_ids(t, out))
         }

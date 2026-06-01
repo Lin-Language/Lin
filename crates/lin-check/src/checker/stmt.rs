@@ -191,6 +191,17 @@ impl Checker {
                 };
 
                 let ty = expected.unwrap_or_else(|| typed_value.ty());
+                // Placement restriction (streams brief §8): a `Stream` may live only in a `val`
+                // binding, function arg, or return value — NOT in a mutable `var` (which would
+                // let a single resource be aliased through reassignment, defeating the affine
+                // single-use guarantee). This is a hard ERROR.
+                if super::expr::type_is_streamish(&ty) {
+                    return Err(Diagnostic::error(
+                        *span,
+                        "a Stream cannot be stored in a `var` — bind it with `val` (a Stream is an \
+                         affine resource, used at most once; `var` reassignment would alias it)",
+                    ));
+                }
                 let slot = self.env.define(name.clone(), ty.clone(), true);
                 // Track mutable globals for the async var-capture check.
                 if self.function_scope_depths.is_empty() {
@@ -378,6 +389,23 @@ impl Checker {
             }
             Stmt::Expr(expr) => {
                 let typed = self.infer_expr(expr)?;
+                // Must-use WARNING for a dropped Stream (streams brief §7): a `Stream` is an
+                // affine resource — building a pipeline that is discarded as a bare statement (no
+                // terminal `drain`/`for`/`collect`/`readText`/`close`) wastes it. Dropping is not
+                // an ERROR (the RC finalizer still closes the fd), so this is a warning, not a
+                // hard failure. A pipeline ENDED by a terminal has type `Null|Error`/`UInt8[]|…`,
+                // not `Stream`, so a properly-consumed stream never triggers this.
+                if super::expr::type_is_streamish(&typed.ty()) {
+                    self.diagnostics.push(
+                        lin_common::Diagnostic::warning(
+                            expr.span(),
+                            "this Stream value is unused — its pipeline is never driven \
+                             (add a terminal like `.drain()`, `.for(...)`, `.collect()`, \
+                             `.readText()`, or `.close()`)",
+                        )
+                        .with_note(expr.span(), "a dropped Stream is closed by its finalizer, but no data is ever read"),
+                    );
+                }
                 Ok(TypedStmt::Expr(typed))
             }
         }

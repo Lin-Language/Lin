@@ -47,6 +47,38 @@ fn with_registry<R>(f: impl FnOnce(&mut HashMap<i32, SocketKind>) -> R) -> R {
     f(map)
 }
 
+/// Stream-source read: pull up to `max` bytes from the connected TCP socket `fd`. Returns
+/// `Ok(None)` at EOF (0 bytes read on a blocking stream), `Ok(Some(bytes))` for a chunk, or
+/// `Err` on an I/O error or a non-TCP/unknown fd. Used by `std/stream`'s `tcpStream` backend
+/// (the registry stays encapsulated here). Blocking read — `WouldBlock` is surfaced as Eof so a
+/// non-blocking socket terminates the stream rather than spinning.
+pub fn tcp_stream_read(fd: i32, max: usize) -> Result<Option<Vec<u8>>, String> {
+    use std::io::Read;
+    let mut buf = vec![0u8; max];
+    let result = with_registry(|m| match m.get_mut(&fd) {
+        Some(SocketKind::TcpStream(stream)) => Some(stream.read(&mut buf)),
+        _ => None,
+    });
+    match result {
+        None => Err("not a connected TCP socket".to_string()),
+        Some(Ok(0)) => Ok(None),
+        Some(Ok(n)) => {
+            buf.truncate(n);
+            Ok(Some(buf))
+        }
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+        Some(Err(e)) => Err(e.to_string()),
+    }
+}
+
+/// Close + remove the TCP socket `fd` from the registry (dropping the stream → closing the fd).
+/// Idempotent (a missing fd is a no-op). Used by `std/stream`'s `tcpStream` backend on close.
+pub fn tcp_stream_close(fd: i32) {
+    with_registry(|m| {
+        m.remove(&fd);
+    });
+}
+
 /// Resolve the caller's UInt8[] buffer to (data ptr, capacity in bytes).
 /// `buf` may be a TaggedVal*(Array) or a raw LinArray*; the inner array is a flat
 /// UInt8 buffer whose element count bounds the read/send.

@@ -4,7 +4,8 @@
 
 import { expect, toBe, test, suite, run } from "std/test"
 import { packNibbles, highNibble, lowNibble, nalType, checksum } from "./bits"
-import { length, slice, concat } from "std/array"
+import { length, slice } from "std/array"
+import { concat } from "std/iter"
 import { u32ToBe, u32FromBe } from "std/bytes"
 import { toUInt64, toUInt32, toFloat64, toInt32 } from "std/number"
 

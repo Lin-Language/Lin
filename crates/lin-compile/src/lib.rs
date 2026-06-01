@@ -104,7 +104,9 @@ fn check_front_end(source_path: &Path) -> Result<CheckedFrontEnd, CompileError> 
     pre_resolve_imports_from_ast(&ast_module, &base_dir, source_path, &mut imported_modules, &mut import_order, &mut import_sources)?;
 
     // 3b. Type check main module with pre-resolved import types.
-    let (typed_module, warnings) = check_module_with_imports(&ast_module, &imported_modules, false)
+    // `check_warnings` carries non-error diagnostics (e.g. the streams must-use WARNING); the
+    // callers (`check()` / `compile()`) render them — `check_front_end` only collects.
+    let (typed_module, check_warnings) = check_module_with_imports(&ast_module, &imported_modules, false)
         .map_err(CompileError::TypeCheck)?;
 
     Ok(CheckedFrontEnd {
@@ -114,7 +116,7 @@ fn check_front_end(source_path: &Path) -> Result<CheckedFrontEnd, CompileError> 
         imported_modules,
         import_order,
         import_sources,
-        warnings,
+        warnings: check_warnings,
     })
 }
 
@@ -408,8 +410,15 @@ fn check_module_with_imports(
     checker.lenient_json = lenient_json;
     checker.protect_import_typevars();
     let typed = checker.check_module(ast_module)?;
-    // On success, `check_module` leaves only non-error diagnostics (warnings) on the checker.
-    let warnings = checker.diagnostics().to_vec();
+    // Surface non-error diagnostics (e.g. the streams must-use WARNING) collected during a
+    // SUCCESSFUL check — `check_module` only returns `Err` for hard errors, leaving warnings in
+    // the checker, which would otherwise be dropped with it. Returned to the caller to render.
+    let warnings: Vec<lin_common::Diagnostic> = checker
+        .diagnostics()
+        .iter()
+        .filter(|d| !matches!(d.severity, lin_common::Severity::Error))
+        .cloned()
+        .collect();
     Ok((typed, warnings))
 }
 
@@ -421,6 +430,7 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/string" => Some(include_str!("../../../stdlib/string.lin")),
         "std/number" => Some(include_str!("../../../stdlib/number.lin")),
         "std/array"  => Some(include_str!("../../../stdlib/array.lin")),
+        "std/iter"   => Some(include_str!("../../../stdlib/iter.lin")),
         "std/fs"     => Some(include_str!("../../../stdlib/fs.lin")),
         "std/http"   => Some(include_str!("../../../stdlib/http.lin")),
         "std/object"   => Some(include_str!("../../../stdlib/object.lin")),
@@ -439,6 +449,7 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/signal"   => Some(include_str!("../../../stdlib/signal.lin")),
         "std/yaml"     => Some(include_str!("../../../stdlib/yaml.lin")),
         "std/jq"       => Some(include_str!("../../../stdlib/jq.lin")),
+        "std/stream"   => Some(include_str!("../../../stdlib/stream.lin")),
         _ => None,
     }
 }
@@ -541,7 +552,9 @@ fn pre_resolve_imports_inner(
         // Only the embedded stdlib is trusted to forward Json into concrete params (ADR-046);
         // user-defined imported modules are checked strictly, like the main module.
         let is_stdlib = stdlib_source(path.as_str()).is_some();
-        let (typed, _warnings) = check_module_with_imports(&ast_mod, cache, is_stdlib)
+        // Imported-module check warnings (e.g. a dropped Stream in a user import) are not rendered
+        // here — the must-use surface is the main module; `.0` takes the typed module.
+        let (typed, _import_warnings) = check_module_with_imports(&ast_mod, cache, is_stdlib)
             .map_err(CompileError::TypeCheck)?;
         let sig = ModuleSignature::from_module(&typed);
         save_cache(&src_text, &typed, &imported_base);

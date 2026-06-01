@@ -7,7 +7,7 @@
 import { matMul, rotation2D, applyToPoint, mat3, mat3Get } from "./matrix"
 import { dot2, magnitude2, angleBetween } from "./vector"
 import { sin, cos, atan2, PI, toFixed } from "std/math"
-import { range, for } from "std/array"
+import { range, for } from "std/iter"
 import { print } from "std/io"
 
 // 1. Identity × M = M — print 3 rows formatted to 1dp.

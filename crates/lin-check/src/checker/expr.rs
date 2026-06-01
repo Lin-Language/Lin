@@ -343,8 +343,43 @@ impl Checker {
                 }
             }
         }
+        // Affine use-after-move check (streams brief §7): ANY read of a `Stream`-typed binding
+        // that has ALREADY been consumed (moved into an ownership-taking adapter/terminal) is a
+        // use-after-move ERROR. The CONSUMING happens at the call site (`mark_stream_consumed`),
+        // not here — low-level BORROWS (`read`/`close`) read the binding without consuming it, so
+        // a recursive pull loop may read it repeatedly; only an ownership-taking op moves it.
+        if type_is_streamish(&ty) && self.consumed_streams.contains(&slot) {
+            return Err(Diagnostic::error(
+                span,
+                format!(
+                    "Stream `{}` is used after it was consumed — a Stream is an affine resource \
+                     (use-at-most-once); it is moved into the first stream operation it flows into \
+                     (any std/iter combinator dispatched to a stream backend — map/filter/take/\
+                     drop/flatMap/takeWhile/dropWhile/flatten/concat/reduce/find/some/every/while/\
+                     for — or any std/stream op: lines/linesMax/chunks/writeStream/drain/collect/\
+                     readText/close/promise). Re-open the source for a second pass.",
+                    name
+                ),
+            ).with_note(def_span.unwrap_or(span), "first bound here"));
+        }
         self.span_type_map.push((span, ty.to_string(), def_span));
         Ok(TypedExpr::LocalGet { slot, ty, span })
+    }
+
+    /// Mark the Stream binding referenced by `arg` (a simple identifier bound to a streamish type)
+    /// as CONSUMED — called at an OWNERSHIP-TAKING stream call site (an adapter/terminal). A later
+    /// read of the same binding then errors in `infer_ident`. No-op for non-identifier args (a
+    /// freshly-built pipeline expression owns itself) or non-stream bindings.
+    pub(crate) fn mark_stream_consumed(&mut self, arg: &Expr) {
+        if let Expr::Ident(name, _) = arg {
+            if let Some((_, info)) = self.env.lookup_with_depth(name) {
+                let slot = info.slot;
+                let ty = info.ty.clone();
+                if type_is_streamish(&ty) {
+                    self.consumed_streams.insert(slot);
+                }
+            }
+        }
     }
 
     pub(crate) fn infer_index(&mut self, object: &Expr, key: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
@@ -431,9 +466,18 @@ impl Checker {
         self.in_tail_position = false;
         let typed_cond = self.check_expr(condition, &Type::Bool)?;
         self.in_tail_position = in_tail;
+        // Affine branch merge (streams brief §7): each branch starts from the consumed set as it
+        // was BEFORE the `if`; afterwards a Stream is consumed if it was consumed in EITHER branch
+        // (conservative — prevents a use after a possible move). The condition runs before both
+        // branches, so any consume there is shared by both.
+        let consumed_before = self.consumed_streams.clone();
         let typed_then = self.infer_expr(then_branch)?;
+        let consumed_then = self.consumed_streams.clone();
+        self.consumed_streams = consumed_before;
         self.in_tail_position = in_tail;
         let typed_else = self.infer_expr(else_branch)?;
+        // Merge: union of both branches' consumed sets.
+        self.consumed_streams.extend(consumed_then);
         let then_ty = typed_then.ty();
         let else_ty = typed_else.ty();
         // A branch typed `Null` (or a TypeVar that is structurally compatible with everything,
@@ -556,11 +600,19 @@ impl Checker {
         };
         let mut typed_arms = Vec::new();
         let mut arm_types = Vec::new();
+        // Affine branch merge (streams brief §7): each arm starts from the consumed set AFTER the
+        // scrutinee (the scrutinee runs once, before every arm); afterwards a Stream is consumed
+        // if it was consumed in ANY arm (conservative). Mirrors `infer_if`.
+        let consumed_before_arms = self.consumed_streams.clone();
+        let mut consumed_union = consumed_before_arms.clone();
         for arm in arms {
+            self.consumed_streams = consumed_before_arms.clone();
             let typed_arm = self.check_match_arm(arm, &scrutinee_ty, scrutinee_name)?;
+            consumed_union.extend(self.consumed_streams.iter().copied());
             arm_types.push(typed_arm.body.ty());
             typed_arms.push(typed_arm);
         }
+        self.consumed_streams = consumed_union;
         let result_type = if arm_types.is_empty() { Type::Never } else { unify_types(&arm_types) };
 
         // Exhaustiveness check: emit diagnostics but don't fail — warnings stay as warnings,
@@ -604,6 +656,16 @@ impl Checker {
                 ObjectField::Pair(key_expr, val_expr) => {
                     let typed_val = self.infer_expr(val_expr)?;
                     let val_ty = typed_val.ty();
+                    // Placement restriction (streams brief §8): a Stream may not live in an object
+                    // field — confining the affine move-checker to local bindings (no container
+                    // linearity). Hard ERROR.
+                    if type_is_streamish(&val_ty) {
+                        return Err(Diagnostic::error(
+                            val_expr.span(),
+                            "a Stream cannot be stored in an object field — keep it in a `val` \
+                             binding (a Stream is an affine resource; v1 confines it to local bindings)",
+                        ));
+                    }
                     if let Expr::StringLit(key, _) = key_expr {
                         obj_type.insert(key.clone(), val_ty);
                         typed_fields.push((key.clone(), typed_val));
@@ -751,6 +813,14 @@ impl Checker {
         let typed_elements: Result<Vec<_>, _> = elements.iter().map(|e| self.infer_expr(e)).collect();
         let typed_elements = typed_elements?;
         let elem_types: Vec<Type> = typed_elements.iter().map(|t| t.ty()).collect();
+        // Placement restriction (streams brief §8): a Stream may not live in an array element.
+        if let Some((i, _)) = elem_types.iter().enumerate().find(|(_, t)| type_is_streamish(t)) {
+            return Err(Diagnostic::error(
+                elements[i].span(),
+                "a Stream cannot be stored in an array element — keep it in a `val` binding \
+                 (a Stream is an affine resource; v1 confines it to local bindings)",
+            ));
+        }
         let ty = if elem_types.is_empty() {
             Type::Array(Box::new(Type::Never))
         } else {
@@ -866,10 +936,22 @@ pub(crate) fn is_json_dynamic(ty: &Type) -> bool {
     matches!(ty, Type::TypeVar(n) if *n == u32::MAX)
 }
 
+/// True if `ty` IS a `Stream` or a `Union` that includes a `Stream` variant. The source
+/// intrinsics return `Stream<…> | Error`, so a binding's static type is usually the union; the
+/// affine/placement checks must treat the union-with-Stream the same as a bare Stream (a stream
+/// pipeline `.lines()` narrows the union to the Stream variant at the dot-call boundary).
+pub(crate) fn type_is_streamish(ty: &Type) -> bool {
+    match ty {
+        Type::Stream(_) => true,
+        Type::Union(variants) => variants.iter().any(type_is_streamish),
+        _ => false,
+    }
+}
+
 pub(crate) fn type_mentions_strlit(ty: &Type) -> bool {
     match ty {
         Type::StrLit(_) => true,
-        Type::Array(inner) | Type::Iterator(inner) | Type::Shared(inner) => type_mentions_strlit(inner),
+        Type::Array(inner) | Type::Iterator(inner) | Type::Shared(inner) | Type::Stream(inner) => type_mentions_strlit(inner),
         Type::FixedArray(elems) => elems.iter().any(type_mentions_strlit),
         Type::Union(variants) => variants.iter().any(type_mentions_strlit),
         Type::Object(fields) => fields.values().any(type_mentions_strlit),
