@@ -64,7 +64,7 @@ export val startCodeAt = (b: UInt8[], i: Int32): Int32 =>
 val emitNal = (b: UInt8[], lo: Int32, hi: Int32, acc: NalUnit[]): Null =>
   if hi > lo then
     val data: UInt8[] = slice(b, lo, hi)
-    push(acc, { "nalType": data[0] & 31, "data": data })
+    push(acc, { "nalType": data[0] & 0x1F, "data": data })
   else
     null
 

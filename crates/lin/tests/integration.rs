@@ -4086,6 +4086,28 @@ fn test_fmt_preserves_postfix_base_parens() {
 }
 
 #[test]
+fn test_fmt_preserves_radix_literals() {
+    // The lexer discards the radix (stores only the value), so the formatter recovers the
+    // original 0x/0b/0o spelling from source — flattening 0x0F to 15 would lose intent.
+    assert_eq!(fmt("val m = 0x0F\n").trim(), "val m = 0x0F");
+    assert_eq!(fmt("val m = 0xFF\n").trim(), "val m = 0xFF");
+    assert_eq!(fmt("val b = 0b1010\n").trim(), "val b = 0b1010");
+    assert_eq!(fmt("val o = 0o17\n").trim(), "val o = 0o17");
+    // Decimal stays decimal; suffix, digit separators, and a negated hex literal preserved.
+    assert_eq!(fmt("val d = 15\n").trim(), "val d = 15");
+    assert_eq!(fmt("val s = 0xFFu8\n").trim(), "val s = 0xFFu8");
+    assert_eq!(fmt("val g = 0xDEAD_BEEF\n").trim(), "val g = 0xDEAD_BEEF");
+    assert_eq!(fmt("val n = -0x10\n").trim(), "val n = -0x10");
+    // The motivating case: parens safely stripped, hex preserved.
+    assert_eq!(
+        fmt("val packNibbles = (high: Int32, low: Int32): Int32 =>\n  (high << 4) | (low & 0x0F)\n").trim(),
+        "val packNibbles = (high: Int32, low: Int32): Int32 =>\n  high << 4 | low & 0x0F"
+    );
+    // Idempotent.
+    assert_eq!(fmt("val m = 0x0F\n"), fmt(&fmt("val m = 0x0F\n")));
+}
+
+#[test]
 fn test_fmt_preserves_generic_type_params() {
     // The `<T, U>` list is not in the surface text the parser keeps as tokens — the
     // formatter must re-emit it from `Expr::Function::type_params` or the body's T/U

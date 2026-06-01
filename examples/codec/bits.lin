@@ -4,7 +4,7 @@ import { length } from "std/array"
 
 // Pack two 4-bit nibbles into one byte.
 export val packNibbles = (high: Int32, low: Int32): Int32 =>
-  high << 4 | low & 15
+  high << 4 | low & 0x0F
 
 // The high nibble of a byte.
 export val highNibble = (b: Int32): Int32 =>
@@ -12,11 +12,11 @@ export val highNibble = (b: Int32): Int32 =>
 
 // The low nibble of a byte.
 export val lowNibble = (b: Int32): Int32 =>
-  b & 15
+  b & 0x0F
 
 // Extract a NAL-unit-type-style field: the low 5 bits of a header byte.
 export val nalType = (header: Int32): Int32 =>
-  header & 31
+  header & 0x1F
 
 // A simple 1-byte XOR checksum over a byte list.
 val checksumFrom = (bytes: Int32[], i: Int32, acc: Int32): Int32 =>

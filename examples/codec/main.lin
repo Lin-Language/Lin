@@ -21,9 +21,9 @@ print(
 )
 
 // --- Bit twiddling ---
-val byte = packNibbles(10, 5)
+val byte = packNibbles(0xA, 0x5)
 print(
   "packed nibbles 0xA,0x5 = ${toString(byte)} (hi=${toString(highNibble(byte))} lo=${toString(lowNibble(byte))})"
 )
-print("NAL type of 0x67 = ${toString(nalType(103))}")
+print("NAL type of 0x67 = ${toString(nalType(0x67))}")
 print("XOR checksum of [1,2,3] = ${toString(checksum([1, 2, 3]))}")
