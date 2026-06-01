@@ -7,7 +7,7 @@
 
 import { substring, indexOf, trim, toUpper } from "std/string"
 import { parseInt32, parseFloat64 } from "std/number"
-import { map, filter, reduce } from "std/array"
+import { map, filter, reduce } from "std/iter"
 import { print } from "std/io"
 
 import { substring as substr } from "std/string"
