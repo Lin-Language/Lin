@@ -41,7 +41,7 @@ match total
   else     => print("sum = ${total}")
 ```
 
-A stream is an **affine resource**: a combinator that routes to the stream backend *consumes* (moves) the stream, so the chain is single-use — using the same stream value twice is a compile-time error. See [`std/stream`](/stdlib/stream.html) for the lifetime rules.
+Over a stream, a combinator **consumes** its input, so a stream flows through a single chain — using the same stream value twice is a compile-time error. To process the data again, open a fresh stream. See [`std/stream`](/stdlib/stream.html) for details.
 
 > v1 limitation: lazy dispatch fires at a concrete combinator call with a `Stream` receiver. A stream passed through a user-defined generic `Iterable` parameter stays array-shaped (eager) inside that function — the safe resolution.
 
