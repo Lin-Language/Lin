@@ -2694,6 +2694,39 @@ print(toString(results))
 }
 
 #[test]
+fn test_parallel_already_spawned_promises() {
+    // Regression: parallel([p1, p2]) where the array elements are ALREADY-SPAWNED promises
+    // (TAG_PROMISE) rather than thunk closures (TAG_FUNCTION). The runtime must dispatch on
+    // each element's tag and await the existing promise instead of re-spawning it as a closure
+    // (which read garbage at the closure's capture-descriptor offset → misaligned-pointer abort).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, parallel } from "std/async"
+
+val p1 = async(() => 1)
+val p2 = async(() => 2)
+val results = parallel([p1, p2])
+print(toString(results))
+"#);
+    assert_eq!(output, vec!["[1, 2]"]);
+}
+
+#[test]
+fn test_parallel_mixed_promises_and_thunks() {
+    // parallel must handle a mixed array: some elements already-spawned promises, some thunks.
+    // Order is preserved exactly.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, parallel } from "std/async"
+
+val p1 = async(() => 1)
+val results = parallel([p1, () => 2, async(() => 3)])
+print(toString(results))
+"#);
+    assert_eq!(output, vec!["[1, 2, 3]"]);
+}
+
+#[test]
 fn test_thread_pool_async() {
     // await now yields `T | Error` (§24.2.2), so each result is handled before arithmetic.
     let output = run(r#"import { print } from "std/io"
