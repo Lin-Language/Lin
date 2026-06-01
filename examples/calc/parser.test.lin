@@ -15,8 +15,8 @@ val rp = (): Token => { "kind": "rparen", "text": ")" }
 val bad = (t: String): Token => { "kind": "bad", "text": t }
 
 val s = suite("parser", [
+  // --- Happy paths: AST shape ---
   test("parses a single number into a num node", () =>
-    // --- Happy paths: AST shape ---
     val ast = parse([num("42")])["value"]
     [expect(ast["kind"]).toBe("num"), expect(ast["value"]).toBe(42)]
   ),
@@ -31,8 +31,8 @@ val s = suite("parser", [
     ]
   ),
 
+  // --- Precedence: * binds tighter than +, encoded in the tree shape ---
   test("builds a precedence-correct tree for 2 + 3 * 4", () =>
-    // --- Precedence: * binds tighter than +, encoded in the tree shape ---
     // expect + at the root with 3*4 on the right
     val ast = parse([
       num("2"),
@@ -64,8 +64,8 @@ val s = suite("parser", [
     ]
   ),
 
+  // --- Parentheses override precedence ---
   test("parentheses regroup (2 + 3) * 4", () =>
-    // --- Parentheses override precedence ---
     val ast = parse([
       lp(),
       num("2"),
@@ -83,8 +83,9 @@ val s = suite("parser", [
   ),
 
   // --- Success/failure results ---
-  test("a complete expression succeeds", () =>
-    [expect(parse([num("3"), op("*"), num("3")])).toSucceed()]
+  test(
+    "a complete expression succeeds",
+    () => [expect(parse([num("3"), op("*"), num("3")])).toSucceed()]
   ),
 
   test("an empty token stream fails to parse", () => [expect(parse([])).toFail()]),

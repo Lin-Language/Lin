@@ -36,12 +36,11 @@ val s = suite("std/time", [
   ),
 
   // --- format (strftime-style, UTC) ---
-  test("format renders date and time fields", () =>
-    [
-      expect(format(1705314600000, "%Y-%m-%dT%H:%M:%S")).toBe("2024-01-15T10:30:00"),
-      expect(format(1705314600000, "%Y-%m-%d")).toBe("2024-01-15"),
-      expect(format(1705314600000, "%H:%M:%S")).toBe("10:30:00")
-    ]
+  test("format renders date and time fields", () => [
+    expect(format(1705314600000, "%Y-%m-%dT%H:%M:%S")).toBe("2024-01-15T10:30:00"),
+    expect(format(1705314600000, "%Y-%m-%d")).toBe("2024-01-15"),
+    expect(format(1705314600000, "%H:%M:%S")).toBe("10:30:00")
+  ]
   ),
 
   test("format renders weekday/month names and literal percent", () => [
@@ -50,10 +49,10 @@ val s = suite("std/time", [
   ]
   ),
 
+  // --- fromIso ---
+  // NOTE: expected timestamps are bound as `Int64` vals; a bare >Int32 literal in
+  // `toBe(...)` would default to Int32 and truncate (a separate literal-typing issue).
   test("fromIso parses a UTC datetime", () =>
-    // --- fromIso ---
-    // NOTE: expected timestamps are bound as `Int64` vals; a bare >Int32 literal in
-    // `toBe(...)` would default to Int32 and truncate (a separate literal-typing issue).
     val expected: Int64 = 1705314600000
     [expect(fromIso("2024-01-15T10:30:00Z")).toBe(expected)]
   ),
@@ -73,8 +72,8 @@ val s = suite("std/time", [
     [expect(r["type"]).toBe("error")]
   ),
 
+  // --- parse (strftime-style pattern) ---
   test("parse reads a pattern into a timestamp", () =>
-    // --- parse (strftime-style pattern) ---
     val midnight: Int64 = 1705276800000
     val withTime: Int64 = 1705314600000
     [
@@ -88,8 +87,8 @@ val s = suite("std/time", [
     [expect(r["type"]).toBe("error")]
   ),
 
+  // format and parse round-trip
   test("format and parse round-trip a timestamp", () =>
-    // format and parse round-trip
     val ts: Int64 = 1705314600000
     [
       expect(parse(format(ts, "%Y-%m-%dT%H:%M:%S"), "%Y-%m-%dT%H:%M:%S")).toBe(ts)

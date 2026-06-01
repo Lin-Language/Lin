@@ -28,20 +28,19 @@ val s = suite("std/hash", [
   ),
 
   test("types do not collide: 42 vs \"42\"", () => [
+    // The whole point of a type-tagged key: an int and a string that print the
+    // same must not be treated as equal.
     expect(hash(42) == hash("42")).toBe(false),
     expect(hash(true) == hash("true")).toBe(false),
     expect(hash(null) == hash("null")).toBe(false)
   ]
   ),
 
-  // The whole point of a type-tagged key: an int and a string that print the
-  // same must not be treated as equal.
-  test("arrays hash element-wise and order-sensitively", () =>
-    [
-      expect(hash([1, 2]) == hash([1, 2])).toBe(true),
-      expect(hash([1, 2]) == hash([2, 1])).toBe(false),
-      expect(hash([])).toBe("a:[]")
-    ]
+  test("arrays hash element-wise and order-sensitively", () => [
+    expect(hash([1, 2]) == hash([1, 2])).toBe(true),
+    expect(hash([1, 2]) == hash([2, 1])).toBe(false),
+    expect(hash([])).toBe("a:[]")
+  ]
   ),
 
   test("objects hash independent of key order", () =>

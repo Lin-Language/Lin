@@ -188,10 +188,10 @@ val s = suite("std/object", [
     () => [expect(isEmpty("hi")).toBe(false)]
   ),
 
+  // --- heap/union value coverage for object index-assign (`result[k] = v`) ---
+  // String values exercise the object-set store's retain semantics; scalar values
+  // hide RC bugs. The ASan CI leg also runs these.
   test("mapValues producing string values", () =>
-    // --- heap/union value coverage for object index-assign (`result[k] = v`) ---
-    // String values exercise the object-set store's retain semantics; scalar values
-    // hide RC bugs. The ASan CI leg also runs these.
     val m = { "a": 1, "b": 2 }.mapValues((v) => "v${v}")
     [expect(m["a"]).toBe("v1"), expect(m["b"]).toBe("v2")]
   ),

@@ -17,17 +17,15 @@ val s = suite("std/number", [
   test("toFloat64 converts int to float", () => [expect(5.toFloat64()).toBe(5.0)]),
 
   test("toFloat32 narrows Float64 to a Float32 usable by f32ToBe", () => [
+    // The only way to get a Float32 from a computed Float64. 0.5 is exact in f32:
+    // big-endian bytes are 0x3F000000.
     expect(length(f32ToBe(toFloat32(0.5)))).toBe(4),
     expect(f32ToBe(toFloat32(0.5))[0]).toBe(63),
     expect(f32ToBe(toFloat32(0.5))[1]).toBe(0)
   ]
   ),
 
-  // The only way to get a Float32 from a computed Float64. 0.5 is exact in f32:
-  // big-endian bytes are 0x3F000000.
-  test("isInt32 true for integer string", () =>
-    [expect("42".isInt32()).toBe(true)]
-  ),
+  test("isInt32 true for integer string", () => [expect("42".isInt32()).toBe(true)]),
 
   test("isInt32 false for float string", () => [expect("3.14".isInt32()).toBe(false)]),
 
@@ -83,8 +81,9 @@ val s = suite("std/number", [
   // An `i64` suffix pins the literal to Int64, so a value far larger than Int32's range
   // (1_705_314_600_000) is preserved exactly rather than truncated to its low 32 bits
   // (212583488). Regression for the silent-truncation bug.
-  test("i64 suffix preserves a value beyond Int32 range", () =>
-    [expect(toString(1705314600000i64)).toBe("1705314600000")]
+  test(
+    "i64 suffix preserves a value beyond Int32 range",
+    () => [expect(toString(1705314600000i64)).toBe("1705314600000")]
   ),
 
   test("i64-suffixed literal round-trips through arithmetic", () =>
@@ -105,5 +104,5 @@ val s = suite("std/number", [
     () => [expect(toString(200u8)).toBe("200")]
   )
 ])
-// toString works regardless of width; the point is it compiles and keeps its value.
+
 run(s)

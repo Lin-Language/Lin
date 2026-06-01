@@ -16,9 +16,7 @@ val valueOf = (src: String): Int32 =>
 
 val s = suite("calc-integration", [
   // --- End-to-end evaluation ---
-  test("evaluates a single number", () =>
-    [expect(valueOf("42")).toBe(42)]
-  ),
+  test("evaluates a single number", () => [expect(valueOf("42")).toBe(42)]),
 
   test("respects * over + precedence", () => [expect(valueOf("2 + 3 * 4")).toBe(14)]),
 
@@ -49,8 +47,9 @@ val s = suite("calc-integration", [
   test("a valid expression succeeds", () => [expect(calc("3 * 3")).toSucceed()]),
 
   // --- Recoverable failures (tagged results, not aborts) ---
-  test("division by zero is a recoverable failure", () =>
-    [expect(calc("7 / 0")).toFailWith("division by zero")]
+  test(
+    "division by zero is a recoverable failure",
+    () => [expect(calc("7 / 0")).toFailWith("division by zero")]
   ),
 
   test(
@@ -59,9 +58,7 @@ val s = suite("calc-integration", [
   ),
 
   // --- Parse errors surfaced end-to-end ---
-  test("incomplete expression fails to parse", () =>
-    [expect(calc("1 +")).toFail()]
-  ),
+  test("incomplete expression fails to parse", () => [expect(calc("1 +")).toFail()]),
 
   test("unknown character fails to parse", () => [expect(calc("1 @ 2")).toFail()]),
 

@@ -18,8 +18,9 @@ val sample = [
 
 val s = suite("report", [
   // --- Splitting valid from invalid ---
-  test("keeps only the valid records", () =>
-    [expect(length(validRecords(sample))).toBe(4)]
+  test(
+    "keeps only the valid records",
+    () => [expect(length(validRecords(sample))).toBe(4)]
   ),
 
   test(
@@ -33,8 +34,9 @@ val s = suite("report", [
   ),
 
   // --- Statistics over the valid records ---
-  test("computes count over valid records", () =>
-    [expect(stats(validRecords(sample))["count"]).toBe(4)]
+  test(
+    "computes count over valid records",
+    () => [expect(stats(validRecords(sample))["count"]).toBe(4)]
   ),
 
   test(

@@ -7,9 +7,7 @@ import { parseRow } from "./parse"
 
 val s = suite("parse", [
   // --- Valid rows ---
-  test("parses a well-formed row", () =>
-    [expect(parseRow("Alice, 85")).toSucceed()]
-  ),
+  test("parses a well-formed row", () => [expect(parseRow("Alice, 85")).toSucceed()]),
 
   test("extracts and trims name and score", () =>
     val r = parseRow("Alice, 85")["value"]
@@ -22,9 +20,7 @@ val s = suite("parse", [
   ),
 
   // --- Rejections (malformed rows are reported, not fatal) ---
-  test("rejects a row without a comma", () =>
-    [expect(parseRow("bad-row")).toFail()]
-  ),
+  test("rejects a row without a comma", () => [expect(parseRow("bad-row")).toFail()]),
 
   test(
     "rejects a row with too many fields",

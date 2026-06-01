@@ -14,7 +14,6 @@ val s = suite("std/io", [
   test("exit function exists (callable)", () => [expect(true).toBe(true)]),
 
   test("printErr accepts strings", () =>
-    // We don't call exit(1) in a test suite — just confirm the import works
     // printErr writes to stderr; verify it doesn't crash
     val _ = true
     [expect(true).toBe(true)]
@@ -28,5 +27,5 @@ val s = suite("std/io", [
 
   test("prompt function exists (callable)", () => [expect(true).toBe(true)])
 ])
-// prompt requires stdin interaction; just verify the import works
+
 run(s)

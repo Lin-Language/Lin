@@ -8,8 +8,8 @@ import { u32ToBe, u32FromBe } from "std/bytes"
 import { toUInt64, toUInt32, toFloat64, toInt32 } from "std/number"
 
 val s = suite("bits", [
+  // --- Nibble packing ---
   test("packs and unpacks nibbles", () =>
-    // --- Nibble packing ---
     val b = packNibbles(0xA, 0x5)
     [
       expect(b).toBe(165),
@@ -23,38 +23,37 @@ val s = suite("bits", [
     () => [expect(packNibbles(0x1, 0xFF)).toBe(0x1F)]
   ),
 
-  // high bits of `low` must be dropped
-  test("highNibble / lowNibble split a byte", () =>
-    [expect(highNibble(0xAB)).toBe(0xA), expect(lowNibble(0xAB)).toBe(0xB)]
+  test(
+    "highNibble / lowNibble split a byte",
+    () => [expect(highNibble(0xAB)).toBe(0xA), expect(lowNibble(0xAB)).toBe(0xB)]
   ),
 
   // --- Field extraction ---
-  test("extracts a NAL-type field (low 5 bits)", () =>
-    [expect(nalType(0x67)).toBe(7), expect(nalType(0x1F)).toBe(31)]
+  test(
+    "extracts a NAL-type field (low 5 bits)",
+    () => [expect(nalType(0x67)).toBe(7), expect(nalType(0x1F)).toBe(31)]
   ),
 
   // --- Checksum ---
-  test("XOR checksum over a byte list", () =>
-    [
-      expect(checksum([1, 2, 3])).toBe(0),
-      expect(checksum([255, 1, 2])).toBe(252),
-      expect(checksum([])).toBe(0)
-    ]
+  test("XOR checksum over a byte list", () => [
+    expect(checksum([1, 2, 3])).toBe(0),
+    expect(checksum([255, 1, 2])).toBe(252),
+    expect(checksum([])).toBe(0)
+  ]
   ),
 
   // --- Plain bitwise operators (the byte-language features bits.lin homes) ---
-  test("plain bitwise operators", () =>
-    [
-      expect(0b1100 & 0b1010).toBe(8),
-      expect(0b1100 | 0b1010).toBe(14),
-      expect(0b1100 ^ 0b1010).toBe(6),
-      expect(1 << 4).toBe(16),
-      expect(255 >> 4).toBe(15)
-    ]
+  test("plain bitwise operators", () => [
+    expect(0b1100 & 0b1010).toBe(8),
+    expect(0b1100 | 0b1010).toBe(14),
+    expect(0b1100 ^ 0b1010).toBe(6),
+    expect(1 << 4).toBe(16),
+    expect(255 >> 4).toBe(15)
+  ]
   ),
 
+  // --- Flat-array element typing for small integer types ---
   test("UInt8 flat array holds 0..255 unboxed", () =>
-    // --- Flat-array element typing for small integer types ---
     val buf: UInt8[] = [0x48, 0x49, 0xFF]
     [expect(length(buf)).toBe(3), expect(buf[2]).toBe(255)]
   ),

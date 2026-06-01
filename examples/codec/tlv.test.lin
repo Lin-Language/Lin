@@ -9,10 +9,9 @@ import { length } from "std/array"
 
 val s = suite("tlv", [
   // --- Byte-exact framing ---
-  test("encodes one field as tag, len-hi, len-lo, value", () =>
-    [
-      expect(encode([{ "tag": 1, "bytes": [65, 66, 67] }])).toBe([1, 0, 3, 65, 66, 67])
-    ]
+  test("encodes one field as tag, len-hi, len-lo, value", () => [
+    expect(encode([{ "tag": 1, "bytes": [65, 66, 67] }])).toBe([1, 0, 3, 65, 66, 67])
+  ]
   ),
 
   test(
@@ -36,9 +35,8 @@ val s = suite("tlv", [
   ]
   ),
 
+  // --- Round-trips: decode(encode(x)) preserves structure ---
   test("round-trips a single field", () =>
-    // field1 = 1+2+1 = 4 bytes; field2 = 1+2+2 = 5 bytes; total 9
-    // --- Round-trips: decode(encode(x)) preserves structure ---
     val back = decode(encode([{ "tag": 7, "bytes": [1, 2, 3, 4] }]))
     [
       expect(length(back)).toBe(1),
