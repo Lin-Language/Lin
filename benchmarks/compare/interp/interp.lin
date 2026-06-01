@@ -1,0 +1,138 @@
+// interp.lin — a realistic generalized benchmark: an arithmetic expression
+// interpreter (tokenizer -> recursive-descent parser -> tree-walking evaluator),
+// run over a fixed set of expressions REPS times. This is "real program" shaped
+// like dijkstra — it exercises string scanning, recursion, tagged-union AST
+// nodes, pattern-matching, and per-iteration allocation — unlike the micro-
+// benchmarks (parallel/recursion/pipeline). Ported faithfully from
+// examples/calc/ so the SAME algorithm runs in every language.
+//
+// Grammar (standard precedence, left-associative):
+//   expr   = term (('+' | '-') term)*
+//   term   = factor (('*' | '/') factor)*
+//   factor = number | '(' expr ')'
+//
+// Every expression here evaluates successfully (no div-by-zero), so the result
+// is deterministic. RESULT = sum of all evaluated values across all REPS.
+// Prints exactly one stdout line "RESULT=<int>".
+//
+// Parameters (identical across all languages): REPS=10000 over 8 fixed exprs.
+// Pinned RESULT = 1046 (sum of the 8 expr values) * 10000 = 10460000.
+import { print } from "std/io"
+import { toString, charCode, substring, at } from "std/string"
+import { parseInt32 } from "std/number"
+import { push, length } from "std/array"
+import { for, range } from "std/iter"
+
+type Token = { "kind": String, "text": String }
+
+// ---- Lexer ----------------------------------------------------------------
+val isDigit = (c: Int32): Boolean => c >= 48 && c <= 57
+val isSpace = (c: Int32): Boolean => c == 32 || c == 9 || c == 10 || c == 13
+
+val scanNumberEnd = (src: String, i: Int32, n: Int32): Int32 =>
+  if i < n && isDigit(charCode(src, i)) then scanNumberEnd(src, i + 1, n)
+  else i
+
+val scan = (src: String, i: Int32, n: Int32, tokens: Token[]): Token[] =>
+  if i >= n then tokens
+  else
+    val c = charCode(src, i)
+    if isSpace(c) then scan(src, i + 1, n, tokens)
+    else if isDigit(c) then
+      val end = scanNumberEnd(src, i, n)
+      push(tokens, { "kind": "num", "text": src.substring(i, end) })
+      scan(src, end, n, tokens)
+    else if c == 40 then
+      push(tokens, { "kind": "lparen", "text": "(" })
+      scan(src, i + 1, n, tokens)
+    else if c == 41 then
+      push(tokens, { "kind": "rparen", "text": ")" })
+      scan(src, i + 1, n, tokens)
+    else
+      push(tokens, { "kind": "op", "text": src.at(i) })
+      scan(src, i + 1, n, tokens)
+
+val tokenize = (src: String): Token[] =>
+  src.scan(0, length(src), [])
+
+// ---- Parser (returns a cursor { node, pos } as dynamic Json) ---------------
+val kindAt = (tokens: Token[], pos: Int32): String =>
+  if pos >= length(tokens) then "eof"
+  else tokens[pos]["kind"]
+
+val parseFactor = (tokens: Token[], pos: Int32): Json =>
+  val k = kindAt(tokens, pos)
+  if k == "num" then
+    { "node": { "kind": "num", "value": tokens[pos]["text"].parseInt32() }, "pos": pos + 1 }
+  else
+    val inner = parseExpr(tokens, pos + 1)
+    { "node": inner["node"], "pos": inner["pos"] + 1 }
+
+val parseTermLoop = (tokens: Token[], left: Json, pos: Int32): Json =>
+  val k = kindAt(tokens, pos)
+  if k != "op" then { "node": left, "pos": pos }
+  else
+    val op = tokens[pos]["text"]
+    if op != "*" && op != "/" then { "node": left, "pos": pos }
+    else
+      val right = parseFactor(tokens, pos + 1)
+      val node = { "kind": "binop", "op": op, "left": left, "right": right["node"] }
+      parseTermLoop(tokens, node, right["pos"])
+
+val parseTerm = (tokens: Token[], pos: Int32): Json =>
+  val first = parseFactor(tokens, pos)
+  parseTermLoop(tokens, first["node"], first["pos"])
+
+val parseExprLoop = (tokens: Token[], left: Json, pos: Int32): Json =>
+  val k = kindAt(tokens, pos)
+  if k != "op" then { "node": left, "pos": pos }
+  else
+    val op = tokens[pos]["text"]
+    if op != "+" && op != "-" then { "node": left, "pos": pos }
+    else
+      val right = parseTerm(tokens, pos + 1)
+      val node = { "kind": "binop", "op": op, "left": left, "right": right["node"] }
+      parseExprLoop(tokens, node, right["pos"])
+
+val parseExpr = (tokens: Token[], pos: Int32): Json =>
+  val first = parseTerm(tokens, pos)
+  parseExprLoop(tokens, first["node"], first["pos"])
+
+// ---- Evaluator -------------------------------------------------------------
+val evalNode = (node: Json): Int32 =>
+  if node["kind"] == "num" then node["value"]
+  else
+    val a = evalNode(node["left"])
+    val b = evalNode(node["right"])
+    val op = node["op"]
+    if op == "+" then a + b
+    else if op == "-" then a - b
+    else if op == "*" then a * b
+    else a / b
+
+val eval1 = (src: String): Int32 =>
+  val parsed = parseExpr(tokenize(src), 0)
+  evalNode(parsed["node"])
+
+// ---- Driver ----------------------------------------------------------------
+// 8 fixed expressions exercising precedence, parens, and all four operators.
+// All divisions are exact and non-zero, so each evaluates deterministically.
+val exprs = [
+  "2 + 3 * 4",
+  "(2 + 3) * 4",
+  "100 / 5 / 2",
+  "2 * (3 + (4 - 1)) * 2",
+  "1 + 2 + 3 + 4 + 5 + 6",
+  "((8 - 2) * (4 + 1)) / 3",
+  "9 * 9 - 8 * 7 + 6",
+  "1000 - 7 * (11 + 13) / 2"
+]
+
+val REPS = 10000
+
+var total = 0i64
+range(0, REPS).for(_ =>
+  exprs.for(e => total = total + eval1(e))
+)
+
+print("RESULT=${toString(total)}")
