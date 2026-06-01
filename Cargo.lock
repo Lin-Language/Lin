@@ -1033,6 +1033,7 @@ dependencies = [
 name = "lin-runtime"
 version = "0.1.0"
 dependencies = [
+ "flate2",
  "jaq-core",
  "jaq-json",
  "jaq-std",

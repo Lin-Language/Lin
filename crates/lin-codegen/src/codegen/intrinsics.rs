@@ -610,6 +610,23 @@ impl<'ctx> Codegen<'ctx> {
                 let fnv = self.get_or_declare_fn("lin_stream_flatten", ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(fnv, &[s.into()], "ir_stream_flatten").try_as_basic_value().unwrap_basic()
             }
+            // Streaming compression byte-adapters (std/compress): (stream) → Stream. Each wraps an
+            // upstream Stream<UInt8[]> in a (de)compressing adapter. Single-stream-arg shape,
+            // modelled on flatten.
+            Intrinsic::StreamGunzip
+            | Intrinsic::StreamGzip
+            | Intrinsic::StreamInflate
+            | Intrinsic::StreamDeflate => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let name = match intrinsic {
+                    Intrinsic::StreamGunzip => "lin_stream_gunzip",
+                    Intrinsic::StreamGzip => "lin_stream_gzip",
+                    Intrinsic::StreamInflate => "lin_stream_inflate",
+                    _ => "lin_stream_deflate",
+                };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into()], "ir_stream_compress").try_as_basic_value().unwrap_basic()
+            }
             // concat(a, b): (stream, stream) → Stream. BOTH streams are moved into the adapter.
             Intrinsic::StreamConcat => {
                 let a = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
@@ -617,10 +634,14 @@ impl<'ctx> Codegen<'ctx> {
                 let fnv = self.get_or_declare_fn("lin_stream_concat", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                 self.builder.call(fnv, &[a.into(), b.into()], "ir_stream_concat").try_as_basic_value().unwrap_basic()
             }
-            Intrinsic::StreamWrite => {
+            Intrinsic::StreamWrite | Intrinsic::StreamWriteLines => {
                 let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let path = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
-                let fnv = self.get_or_declare_fn("lin_stream_write", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                let name = match intrinsic {
+                    Intrinsic::StreamWriteLines => "lin_stream_write_lines",
+                    _ => "lin_stream_write",
+                };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                 self.builder.call(fnv, &[s.into(), path.into()], "ir_stream_write").try_as_basic_value().unwrap_basic()
             }
             // Terminal drivers (sync, calling thread). Each returns a boxed union value

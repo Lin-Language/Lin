@@ -273,6 +273,16 @@ impl Checker {
             Type::func(vec![any_stream()], any_stream()));
         self.define_intrinsic("lin_stream_concat",
             Type::func(vec![any_stream(), any_stream()], any_stream()));
+        // Streaming compression byte-adapters (std/compress): each Stream<UInt8[]> → Stream<UInt8[]>.
+        // gunzip/gzip use the gzip container; inflate/deflate use raw DEFLATE.
+        self.define_intrinsic("lin_stream_gunzip",
+            Type::func(vec![any_stream()], any_stream()));
+        self.define_intrinsic("lin_stream_gzip",
+            Type::func(vec![any_stream()], any_stream()));
+        self.define_intrinsic("lin_stream_inflate",
+            Type::func(vec![any_stream()], any_stream()));
+        self.define_intrinsic("lin_stream_deflate",
+            Type::func(vec![any_stream()], any_stream()));
         // Net-new terminals (Stage 4): reduce → U | Error; find → T | Null | Error; some/every →
         // Boolean | Error; while → Null | Error. All consume + close the stream.
         self.define_intrinsic("lin_stream_reduce", Type::func(vec![
@@ -305,6 +315,8 @@ impl Checker {
         // Sink + terminals. writeStream → a sink Stream; drain → Null|Error; collect → UInt8[]|
         // Error; readText → String|Error. All terminals consume + close the stream.
         self.define_intrinsic("lin_stream_write",
+            Type::func(vec![any_stream(), Type::Str], any_stream()));
+        self.define_intrinsic("lin_stream_write_lines",
             Type::func(vec![any_stream(), Type::Str], any_stream()));
         self.define_intrinsic("lin_stream_drain",
             Type::func(vec![any_stream()], Type::Union(vec![Type::Null, crate::resolve::error_type()])));

@@ -144,9 +144,18 @@ pub enum Intrinsic {
     StreamFlatMap,
     StreamFlatten,
     StreamConcat,
-    // Sink + terminal drivers (Stage 4). writeStream builds a sink; drain drives on the calling
-    // thread; collect/readText pull-all-into-one-value. All terminals close the stream.
+    // Streaming compression byte-adapters (std/compress): each takes ONE Stream<UInt8[]> and
+    // returns a new Stream<UInt8[]> that (de)compresses bytes incrementally. gunzip/gzip use the
+    // gzip container; inflate/deflate use raw DEFLATE.
+    StreamGunzip,
+    StreamGzip,
+    StreamInflate,
+    StreamDeflate,
+    // Sink + terminal drivers (Stage 4). writeStream builds a RAW sink (item bytes verbatim, no
+    // separator); writeLines builds a line-oriented sink (each item + '\n'); drain drives on the
+    // calling thread; collect/readText pull-all-into-one-value. All terminals close the stream.
     StreamWrite,
+    StreamWriteLines,
     StreamDrain,
     StreamCollect,
     StreamReadText,
