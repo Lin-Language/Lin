@@ -146,12 +146,16 @@ val isTableSeparator = (line: String): Boolean =>
     contains(t, "-") && ok
 
 // Split a table row into trimmed cells, dropping the leading/trailing empty
-// cells produced by the surrounding pipes. "| a | b |" -> ["a", "b"].
+// cells produced by the surrounding pipes. "| a | b |" -> ["a", "b"]. A
+// backslash-escaped pipe (`\|`, common in union types like `String \| Error`)
+// is a LITERAL pipe, not a cell separator: protect it with a sentinel before
+// splitting, then restore it (as a bare `|`) inside each cell.
 val tableCells = (line: String): String[] =>
-  val raw = trim(line).split("|")
+  val guarded = replaceAll(trim(line), "\\|", "PIPE")
+  val raw = guarded.split("|")
   val inner = slice(raw, 1, length(raw) - 1)
   var cells: String[] = []
-  inner.for(cell => cells = cells.append(trim(cell)))
+  inner.for(cell => cells = cells.append(replaceAll(trim(cell), "PIPE", "|")))
   cells
 
 // The parser threads an immutable state record through one call per line. A record
