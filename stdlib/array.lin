@@ -156,10 +156,7 @@ export val sort = (arr: Json, cmp: (Json, Json) => Int32): Json =>
   result
 
 export val sortBy = (arr: Json, keyFn: (Json) => Json): Json =>
-  val pairs = _mapJ(arr, item => [
-    keyFn(item),
-    item
-  ])
+  val pairs = _mapJ(arr, item => [keyFn(item), item])
   val sorted = sort(pairs, (a, b) =>
     if a[0] < b[0] then -1 else if a[0] > b[0] then 1 else 0
   )
@@ -178,19 +175,13 @@ export val max = (arr: Json[]): Json =>
   _reduceJ(arr, arr[0], (acc, x) => if x > acc then x else acc)
 
 export val minBy = (arr: Json[], keyFn: (Json) => Json): Json =>
-  val pairs = _mapJ(arr, item => [
-    keyFn(item),
-    item
-  ])
+  val pairs = _mapJ(arr, item => [keyFn(item), item])
   _reduceJ(pairs, pairs[0], (acc, x) =>
     if x[0] < acc[0] then x else acc
   )[1]
 
 export val maxBy = (arr: Json[], keyFn: (Json) => Json): Json =>
-  val pairs = _mapJ(arr, item => [
-    keyFn(item),
-    item
-  ])
+  val pairs = _mapJ(arr, item => [keyFn(item), item])
   _reduceJ(pairs, pairs[0], (acc, x) =>
     if x[0] > acc[0] then x else acc
   )[1]

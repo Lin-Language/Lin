@@ -698,6 +698,13 @@ fn build_comment_ctx(comments: &[Comment], line_starts: &[usize], module: &Modul
             // would re-attach it differently. Comments with no single-line anchor are demoted
             // to a leading own-line comment of the next anchor (lossless, deterministic).
             let cm_line = line_of(line_starts, cm.span.start as usize);
+            // Among same-line trailing-ok anchors ending before the comment, prefer the
+            // OUTERMOST (smallest start) — a trailing comment belongs to the whole statement/
+            // line, not a nested sub-expression. E.g. `val a = [96]   // c` must attach to the
+            // val statement, not the inner array element `96` (which, in an inline array, would
+            // never be emitted, dropping the comment). A genuinely element-level comment in a
+            // MULTI-LINE array sits on the element's OWN line, so the statement isn't a same-
+            // line competitor there. Tiebreak on larger end for stability.
             let anchor = anchors
                 .iter()
                 .filter(|a| {
@@ -706,7 +713,7 @@ fn build_comment_ctx(comments: &[Comment], line_starts: &[usize], module: &Modul
                         && line_of(line_starts, a.start as usize) == cm_line
                         && line_of(line_starts, a.end.saturating_sub(1) as usize) == cm_line
                 })
-                .max_by_key(|a| a.end);
+                .min_by_key(|a| (a.start, std::cmp::Reverse(a.end)));
             match anchor {
                 // Keep only the first trailing comment per anchor (canonical: one per line).
                 Some(a) => {
@@ -1226,7 +1233,9 @@ fn renders_single_line(expr: &Expr) -> bool {
         return false;
     }
     if let Expr::Array(items, _) = expr {
-        if items.len() > 1 && items.iter().any(contains_call) {
+        // Matches the array inline rule: forced multi-line only when MORE THAN ONE element
+        // contains a call. A single call among simple elements still renders single-line.
+        if items.len() > 1 && items.iter().filter(|it| contains_call(it)).count() > 1 {
             return false;
         }
     }
@@ -1555,8 +1564,12 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
             // poorly. A single-element array may stay inline regardless. Finally, respect the
             // author's choice: an array the author broke across source lines stays multiline
             // (we never roll a multi-line literal up — only force one-line literals to break).
+            // Force multi-line only when MORE THAN ONE element contains a function call (a list
+            // of `expect(...)` assertions reads poorly packed on one line). A single call among
+            // simple elements — e.g. `[clampSpeed(left + STEP), right]` — stays inline.
+            let call_elems = items.iter().filter(|it| contains_call(it)).count();
             let inline_ok = items.len() <= 1
-                || (items.len() <= 4 && items.iter().all(is_atomic) && !items.iter().any(contains_call));
+                || (items.len() <= 4 && items.iter().all(is_atomic) && call_elems <= 1);
             // Author-multiline check: the array's `[` span is only the bracket, so scan from
             // the `[` to the last element's end for a newline (the author broke it across lines).
             let author_ml = items
@@ -1570,7 +1583,12 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
             // JSON) suppresses inline for a nested literal — UNLESS we have the source and can
             // see the author deliberately wrote that nested literal inline, in which case their
             // choice wins (so `[ {…inline…}, {…inline…} ]` keeps the inner objects on one line).
-            if inline_ok && !author_ml && !hard_break && (!force_ml() || source_available()) {
+            // An element with an attached comment (leading or trailing) forces multi-line — the
+            // inline path can't render element comments, so inlining would DROP them.
+            let any_element_comment = items.iter().any(|it| anchor_has_comment(it.span().start));
+            if inline_ok && !author_ml && !hard_break && !any_element_comment
+                && (!force_ml() || source_available())
+            {
                 let inline = fmt_inline(expr);
                 if inline.len() + ind.len() <= 80 {
                     return inline;
@@ -1815,7 +1833,11 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
                         .map(|g| format!(" when {}", fmt_expr(g, false, &child_ind)))
                         .unwrap_or_default();
                     let body = fmt_expr(&arm.body, false, &arm_body_ind);
-                    let multiline = body.contains('\n');
+                    // Multi-line if it doesn't fit on one line, OR the author put the body on a
+                    // different source line than the arm (`has … =>\n  body`) — respect that
+                    // choice (Rule B for match arms), don't collapse it onto the `=>` line.
+                    let multiline = body.contains('\n')
+                        || spans_on_different_source_lines(arm.span.start, arm.body.span().start);
                     let head = if kw == "else" {
                         "else".to_string()
                     } else {
@@ -1960,11 +1982,17 @@ fn fmt_function(
         // arm clears it at the lambda boundary (Rule 4). When set, render the body with FORCE_ML
         // so its (and only its top-level) literal breaks.
         let forced = FORCE_NEXT_LAMBDA_BODY_ML.with(|c| c.replace(false));
+        // Also hard-break when an element of the array/object body carries a comment: an inline
+        // body can't render element comments, so a single-element `() => [ //c elem ]` would
+        // otherwise DROP the comment. Forcing multi-line lets the element's comment emit.
+        let body_has_element_comment = match body {
+            Expr::Array(items, _) => items.iter().any(|it| anchor_has_comment(it.span().start)),
+            _ => false,
+        };
+        let do_force = forced || body_has_element_comment;
         let body_str = with_arg_position(false, || {
-            if forced {
-                // HARD break: the over-budget caller needs this body broken even though it
-                // fits and the author wrote it inline. HARD_BREAK_LITERAL overrides the
-                // author-inline-wins rule in the Array/Object inline path.
+            if do_force {
+                // HARD break: break the body even though it fits / the author wrote it inline.
                 with_hard_break_literal(true, || with_force_ml(true, || fmt_expr(body, false, ind)))
             } else {
                 fmt_expr(body, false, ind)
