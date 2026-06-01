@@ -2,7 +2,6 @@
 //
 // `calc(src)` returns a tagged result: { "type": "success", "value": <Int32> } or
 // { "type": "failure", "error": <String> }. This is the module the tests drive.
-
 import { tokenize } from "./lexer"
 import { parse } from "./parser"
 import { evalAst } from "./eval"

@@ -10,8 +10,8 @@ val n = 2000000
 // runs an indirect closure call per element; the Int32 values flow through
 // the polymorphic Json slot, so this is the canonical box/unbox hot path.
 val total = range(0, n)
-  .map(x => x * 2)
-  .filter(x => x % 3 == 0)
+  .map((x) => x * 2)
+  .filter((x) => x % 3 == 0)
   .reduce(0, (acc, x) => acc + x)
 
 print(toString(total))

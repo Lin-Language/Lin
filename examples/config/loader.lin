@@ -1,6 +1,5 @@
 // Config loader: combine defaults + validation into a single load step that
 // returns a tagged result the caller pattern-matches on.
-
 import { applyDefaults, validate } from "./schema"
 import { length } from "std/array"
 import { join } from "std/string"
@@ -21,5 +20,7 @@ export type LoadResult = Success | Failure
 export val load = (raw: Json): LoadResult =>
   val cfg = applyDefaults(raw)
   val errors = validate(cfg)
-  if length(errors) == 0 then { "type": "success", "value": cfg }
-  else { "type": "failure", "error": errors.join("; ") }
+  if length(errors) == 0 then
+    { "type": "success", "value": cfg }
+  else
+    { "type": "failure", "error": errors.join("; ") }

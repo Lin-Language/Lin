@@ -6,30 +6,44 @@ val dbl = (n: Int32): Int32 => n * 2
 val checkPos = (n: Int32): Json => if n > 0 then ok(n) else err("not positive")
 
 val s = suite("result combinators", [
-  test("ok / err construct the tagged shapes", () => [
-    expect(isOk(ok(1))).toBe(true),
-    expect(isOk(err("e"))).toBe(false)
-  ]),
-  test("andThen runs f on success", () => [
-    expect(andThen(ok(5), checkPos)["value"]).toBe(5)
-  ]),
-  test("andThen short-circuits on failure (f not run)", () => [
-    expect(andThen(err("boom"), checkPos)["error"]).toBe("boom")
-  ]),
-  test("andThen can turn success into failure", () => [
-    expect(isOk(andThen(ok(-3), checkPos))).toBe(false)
-  ]),
-  test("map transforms a success value", () => [
-    expect(map(ok(21), dbl)["value"]).toBe(42)
-  ]),
-  test("map leaves a failure unchanged", () => [
-    expect(map(err("e"), dbl)["error"]).toBe("e")
-  ]),
-  test("unwrapOr returns the value on success", () => [
-    expect(unwrapOr(ok(7), 0)).toBe(7)
-  ]),
-  test("unwrapOr returns the default on failure", () => [
-    expect(unwrapOr(err("e"), 99)).toBe(99)
-  ]),
+  test(
+    "ok / err construct the tagged shapes",
+    () => [expect(isOk(ok(1))).toBe(true), expect(isOk(err("e"))).toBe(false)]
+  ),
+
+  test(
+    "andThen runs f on success",
+    () => [expect(andThen(ok(5), checkPos)["value"]).toBe(5)]
+  ),
+
+  test(
+    "andThen short-circuits on failure (f not run)",
+    () => [expect(andThen(err("boom"), checkPos)["error"]).toBe("boom")]
+  ),
+
+  test(
+    "andThen can turn success into failure",
+    () => [expect(isOk(andThen(ok(-3), checkPos))).toBe(false)]
+  ),
+
+  test(
+    "map transforms a success value",
+    () => [expect(map(ok(21), dbl)["value"]).toBe(42)]
+  ),
+
+  test(
+    "map leaves a failure unchanged",
+    () => [expect(map(err("e"), dbl)["error"]).toBe("e")]
+  ),
+
+  test(
+    "unwrapOr returns the value on success",
+    () => [expect(unwrapOr(ok(7), 0)).toBe(7)]
+  ),
+
+  test(
+    "unwrapOr returns the default on failure",
+    () => [expect(unwrapOr(err("e"), 99)).toBe(99)]
+  )
 ])
 run(s)
