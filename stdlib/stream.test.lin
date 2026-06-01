@@ -1,5 +1,5 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { readStream, lines, map, filter, take, chunks, writeStream, drain, collect, readText, close } from "std/stream"
+import { readStream, lines, linesMax, map, filter, take, chunks, writeStream, drain, collect, readText, close } from "std/stream"
 import { writeFile, readFile } from "std/fs"
 import { length } from "std/array"
 import { split, join } from "std/string"
@@ -48,6 +48,23 @@ val s = suite("std/stream", [
     // first two lines "a","b" concatenated = "ab" = 2 bytes
     [
       expect(length(out)).toBe(2)
+    ]
+  ),
+
+  test("linesMax surfaces an Error when a line exceeds the cap", () =>
+    // A 20-char single line with a 5-byte cap: lines() must fail in-band rather than buffer it.
+    writeFile(fixture, "aaaaaaaaaaaaaaaaaaaa")
+    val out = readStream(fixture).linesMax(5).readText()
+    [
+      expect(out["type"]).toBe("error")
+    ]
+  ),
+
+  test("linesMax with a generous cap reads normally", () =>
+    writeFile(fixture, "one\ntwo\nthree")
+    val out = readStream(fixture).linesMax(1024).collect()
+    [
+      expect(length(out)).toBe(11)
     ]
   ),
 
