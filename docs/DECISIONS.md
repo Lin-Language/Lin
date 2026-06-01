@@ -1077,3 +1077,96 @@ Diamonds and ordinary deep import graphs are unaffected. Spec §22.5/§20.1 and
 decision-list #29 updated to "circular import is a compile-time error." Regressions:
 `test_circular_import_is_diagnosed_not_stack_overflow` and
 `test_diamond_imports_are_not_false_cycles` in `crates/lin/tests/integration.rs`.
+
+## ADR-073: `std/template` delegates to minijinja (Jinja syntax; undefined→empty; render errors→Error)
+
+**Decision**: `std/template` is now backed by the [minijinja](https://crates.io/crates/minijinja)
+crate instead of the hand-rolled `${ }` substituter. Template syntax is Jinja-style:
+`{{ var }}` substitutions, `{% for %}` / `{% if %}` control flow, and the standard
+builtin filter set. This is a **clean break** — the old `${ }` delimiters are gone.
+minijinja is added to `lin-runtime` with `default-features = false, features =
+["builtins", "serde"]`: `builtins` re-enables control flow + filters (which the
+default-off baseline drops); `serde` lets minijinja consume a `serde_json::Value` as
+the render context directly. **Undefined / missing variables render as the empty
+string** — minijinja's default `Undefined` behaviour; strict/undefined-is-error mode is
+deliberately *not* enabled.
+
+**Data bridge**: the runtime already exposes `json::tagged_to_json(tv: *const u8) ->
+serde_json::Value`, and minijinja renders against a `serde_json::Value` directly. So
+`lin_template_render` is just: resolve the template `LinString` to `&str` →
+`tagged_to_json(data)` → fresh `minijinja::Environment` → `render(&ctx)`. The `{}` data
+arg may arrive either as a `TaggedVal*(TAG_OBJECT)` or a bare `LinObject*` (the foreign
+`{}` param does not force boxing on every path), so the FFI detects the leading tag and
+synthesises a stack `TaggedVal(TAG_OBJECT)` for the bare-pointer case before calling
+`tagged_to_json` (which only reads tag+payload — it neither frees nor owns the input).
+
+**Error handling (option a)**: the FFI return type changed from `*mut LinString` to a
+tagged value `*mut u8` (`Json`), matching the established `readFile`/`lin_fs_read_json`
+convention (declared `=> Json` in the `import foreign "lin-runtime"` block, documented
+conceptually as `String | Error`). Success boxes the rendered string into a
+`TAG_STR` tagged value; a template **syntax error or render failure** returns
+`make_error_tagged(...)` → `{ "type": "error", "message": ... }`, discriminated with
+`is Error` exactly like other fallible stdlib operations. Typing the wrappers as `Json`
+(rather than a literal `String | Error` annotation) is what keeps callers that use the
+result directly as a string working unchanged — `out.contains(...)` in the web-server
+tests and `writeFile(path, rendered)` in the docs-site builder both rely on the `Json`
+wildcard, and a hard `String | Error` annotation would reject those (`Error` has no
+`.contains`; `writeFile` wants a `String`). This mirrors how the docs already describe
+`readFile` as `String | Error` while its signature is `Json`.
+
+**Ownership**: `lin_string_from_bytes` returns an OWNED (+1) string; that owned
+reference transfers into the `TAG_STR` tagged box, and the standard owned-release
+lowering contract drops it exactly once. No borrowed-string return path is introduced,
+so the recurring owned-vs-borrowed UAF/double-free class does not apply.
+
+**Consequence**: templates gain real loops/conditionals/filters. Migrated `.lint` files
+(`examples/web-server/views/index.lint`, `docs-site/templates/{page,home}.lint`) and
+all call sites/tests from `${x}` to `{{ x }}`. The "missing key → empty string" change
+replaces the old "missing key → `null`". HTML in template variable *values* is passed
+through unescaped (the environment uses a non-`.html` template name, so autoescaping is
+off) and is not re-parsed as Jinja. Regressions: new `{% for %}` / `{% if %}` /
+missing-var / syntax-error cases in `stdlib/template.test.lin`; web-server and docs-site
+(44 pages) render verified end-to-end.
+
+## ADR-074: `std/template` layout system via minijinja path loader (`render` is file-based)
+
+**Decision**: `std/template` gains a real layout/inheritance system — `{% extends %}`,
+`{% block %}`, `{% include %}` — rather than the flat substitution it had after ADR-073.
+This is exactly the capability the old hand-rolled `${ }` engine could not express and
+was the motivation for moving to minijinja.
+
+**Why `render` had to become path-based**: template inheritance needs a *loader* — when
+a template says `{% extends "base.lint" %}`, the engine must fetch `base.lint` by name.
+After ADR-073, `render(path, data)` was implemented in Lin as `readFile(path)` →
+`lin_template_render(string, data)`, i.e. it handed minijinja a single anonymous
+in-memory string with no directory context, so `extends`/`include` had nothing to
+resolve against. The fix is a second FFI entry point, `lin_template_render_path(path,
+data)`, that splits `path` into `(dir, basename)`, sets `env.set_loader(path_loader(dir))`,
+and renders the basename. minijinja then lazily loads any referenced template by name
+from `dir`. `std/template.render` now calls this directly (no more `readFile` in Lin);
+the "file not found" Error is produced by the loader instead of an explicit `readFile`
+check, and still surfaces as `{ "type": "error", "message": ... }`.
+
+**`renderWith` stays string-based**: it takes an in-memory template with no source
+directory, so it deliberately *cannot* resolve `extends`/`include` — documented as such.
+The two entry points are the natural split: inline string vs. file-with-neighbours.
+
+**minijinja features**: this required adding **`multi_template`** (the `{% extends %}` /
+`{% block %}` / `{% include %}` statements — gated separately from `builtins`; without it
+the parser reports `unknown statement extends`) and **`loader`** (`path_loader`) to the
+existing `["builtins", "serde"]` set. Both are pulled in with `default-features = false`.
+
+**Consequence**: the two example projects that use templating now demonstrate proper
+layouts instead of duplicated page chrome:
+- `docs-site/templates/` — new `base.lint` holds the shared `<head>`/nav/scripts with
+  `{% block body_attrs %}` and `{% block main %}`; `page.lint` and `home.lint` shrink to
+  `{% extends "base.lint" %}` + their block overrides (home adds `class="home"` and the
+  hero). The builder (`docs-site/builder/main.lin`) switched from `renderWith(readFile…)`
+  to `render(path, …)` and now guards the render result as an `Error`.
+- `examples/web-server/views/` — `index.lint` extends a new `base.lint`, which itself
+  `{% include "footer.lint" %}` to show partials.
+
+Verified end-to-end: `stdlib/template.test.lin` gains an inheritance case (writes
+base+child to a temp dir, renders the child); `examples/web-server/template.test.lin`
+asserts the base skeleton + included footer appear; the docs-site builder regenerates all
+44 pages with the home/regular layouts distinct and no unrendered tags or error objects.

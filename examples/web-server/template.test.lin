@@ -3,7 +3,9 @@ import { render } from "std/template"
 import { contains } from "std/string"
 
 // Templating coverage (absorbed from the standalone template demo): render the
-// server's HTML view and assert the ${...} holes are filled from the data object.
+// server's HTML view and assert the {{ ... }} holes are filled from the data object.
+// index.lint `{% extends "base.lint" %}` and the base `{% include "footer.lint" %}`,
+// so this also exercises the layout/inheritance loader (ADR-074).
 val s = suite("template", [
   test("renders index.lint filling all holes", () =>
     val out = render("examples/web-server/views/index.lint", {
@@ -16,12 +18,23 @@ val s = suite("template", [
       expect(out.contains("Version: 1.0")).toBe(true)
     ]
   ),
-  test("leaves no unfilled ${ } holes", () =>
+  test("inherits base layout and includes the footer partial", () =>
     val out = render("examples/web-server/views/index.lint", {
       "title": "T", "heading": "H", "status": "ok", "version": "1.0"
     })
     [
-      expect(out.contains("\${")).toBe(false)
+      // <!DOCTYPE>/<body> come from base.lint, not index.lint — proves {% extends %}.
+      expect(out.contains("<!DOCTYPE html>")).toBe(true),
+      // The footer comes from the {% include "footer.lint" %} partial.
+      expect(out.contains("<footer>Lin Web Server — v1.0</footer>")).toBe(true)
+    ]
+  ),
+  test("leaves no unfilled {{ }} holes", () =>
+    val out = render("examples/web-server/views/index.lint", {
+      "title": "T", "heading": "H", "status": "ok", "version": "1.0"
+    })
+    [
+      expect(out.contains("{{")).toBe(false)
     ]
   ),
 ])
