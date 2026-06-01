@@ -1,0 +1,52 @@
+// Tests for source.lin — reading CSV rows out of the gzipped tar of CSV files via
+// the streaming gunzip + untar path. Verifies the archive is listed, every member's
+// rows are pulled (blank lines dropped), and the rows feed render end to end.
+
+import { expect, toBe, test, suite, run } from "std/test"
+import { rowsFromArchive, archiveMembers } from "./source"
+import { render, validRecords } from "./report"
+import { length } from "std/array"
+import { contains, join } from "std/string"
+
+val archive = "examples/report/report-data.tar.gz"
+
+val s = suite("report-source", [
+  // --- manifest: lists both CSV members without extracting them ---
+  test("lists the archive's CSV members", () =>
+    val names = archiveMembers(archive)
+    [
+      expect(length(names)).toBe(2),
+      expect(names.join(",")).toBe("q1.csv,q2.csv")
+    ]
+  ),
+
+  // --- untar: pulls every non-blank row out of every member ---
+  test("streams all non-blank CSV rows across members", () =>
+    val rows = rowsFromArchive(archive)
+    [
+      // 8 raw lines across q1+q2; "bad-row" and ", 50" are still present here
+      // (parsing/validation happens later in report.lin), only blanks are dropped.
+      expect(length(rows)).toBe(8),
+      expect(rows.join("|").contains("Alice, 85")).toBe(true),
+      expect(rows.join("|").contains("Diana, 100")).toBe(true)
+    ]
+  ),
+
+  // --- end to end: archive rows render into the validated report ---
+  test("archive rows render the validated report", () =>
+    val out = render(rowsFromArchive(archive))
+    [
+      expect(length(validRecords(rowsFromArchive(archive)))).toBe(6),
+      expect(out.contains("count=6 avg=86 top=Diana")).toBe(true),
+      expect(out.contains("skipped 2 bad row(s)")).toBe(true)
+    ]
+  ),
+
+  // --- a missing archive degrades to an empty batch, not a crash ---
+  test("a missing archive yields no rows", () =>
+    [
+      expect(length(rowsFromArchive("examples/report/does-not-exist.tar.gz"))).toBe(0)
+    ]
+  ),
+])
+run(s)
