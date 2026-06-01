@@ -6,6 +6,15 @@
 // a plain Int32 (JSON-transferable) and capture only the loop value `i`. Prints
 // exactly one stdout line "RESULT=<int>".
 //
+// NOTE — what this measures: this is a LATENCY/OVERLAP test, not a runtime-speed
+// one. Wall-clock is dominated by `sleep`, so every language pins to the same
+// ~ceil(TASKS/CONCURRENCY)*SLEEP_MS floor regardless of runtime quality (measured:
+// Lin tracks it to within ~1% at 200/2000/10000 tasks). It verifies that a runtime
+// actually OVERLAPS the bounded waits — a broken pool that serialized would take
+// TASKS*SLEEP_MS. It does NOT surface per-operation runtime cost; exposing that
+// needs a different workload (CPU work per task, or huge fan-out with tiny sleeps
+// to stress the scheduler), which is a redesign, not a parameter bump.
+//
 // Parameters (identical across all languages): TASKS=200 SLEEP_MS=50 CONCURRENCY=50.
 import { print } from "std/io"
 import { toString } from "std/string"

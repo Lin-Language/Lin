@@ -4,7 +4,7 @@ package main
 
 import "fmt"
 
-const n = 2000000
+const n = 20000000
 
 func main() {
 	a := make([]int64, n)

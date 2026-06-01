@@ -6,11 +6,11 @@
 // frame), so there is no stack-overflow asymmetry versus the looping languages.
 // Prints exactly one stdout line "RESULT=<int>".
 //
-// Parameters (identical across all languages): FIB_N=38 SUM_N=50000000.
+// Parameters (identical across all languages): FIB_N=42 SUM_N=50000000.
 import { print } from "std/io"
 import { toString } from "std/string"
 
-// fib(38) = 39088169, fits Int32; widened to Int64 only for the final fold.
+// fib(42) = 267914296, fits Int32; widened to Int64 only for the final fold.
 val fib = (n: Int32): Int32 =>
   if n < 2 then n
   else fib(n - 1) + fib(n - 2)
@@ -20,7 +20,7 @@ val sumTo = (n: Int64, acc: Int64): Int64 =>
   if n == 0i64 then acc
   else sumTo(n - 1i64, acc + n)
 
-val f: Int64 = fib(38)
+val f: Int64 = fib(42)
 val s = sumTo(50000000i64, 0i64)
 val result = f * 1000000007i64 + s
 

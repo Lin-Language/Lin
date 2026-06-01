@@ -2,7 +2,7 @@
 // 64-bit fold (sumTo overflows Number's safe-integer range). Prints "RESULT=<int>".
 'use strict';
 
-const FIB_N = 38;
+const FIB_N = 42;
 const SUM_N = 50000000;
 
 function fib(n) {

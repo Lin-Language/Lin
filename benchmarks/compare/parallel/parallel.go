@@ -9,7 +9,7 @@ import (
 
 const (
 	start  = 27
-	iters  = 30000000
+	iters  = 300000000
 	chunks = 8
 )
 

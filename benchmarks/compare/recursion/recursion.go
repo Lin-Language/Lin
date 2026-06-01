@@ -4,7 +4,7 @@ package main
 import "fmt"
 
 const (
-	fibN = 38
+	fibN = 42
 	sumN = 50000000
 )
 

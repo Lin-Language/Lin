@@ -3,7 +3,7 @@
 // exact in a Number; printed as an integer. Prints "RESULT=<int>".
 'use strict';
 
-const N = 2000000;
+const N = 20000000;
 
 function main() {
   const a = new Array(N);
