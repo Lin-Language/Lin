@@ -17,8 +17,11 @@ TOP THINGS TO REVIEW IN THE MORNING:
 - DESIGN DEVIATION #5: I made `Stream` SPELLABLE (resolve.rs case, like `Shared`) — the brief
   locked "not spellable". Needed for stdlib wrappers + a formatter bug. Opacity preserved. If you
   want the brief's letter, the alternative is a formatter fix (#5 explains). **Please confirm.**
-- PRE-EXISTING BUG #19: `parallel([thunks-with-side-effects])` segfaults at exit (reproduced
-  WITHOUT streams). So the concurrent gate uses multiple `.promise()` instead of `parallel`.
+- RESOLVED #19: `parallel([p1, p2])` over already-spawned promises was a pre-existing
+  memory-safety bug (misaligned deref in transfer.rs); FIXED on master and rebased in. The
+  concurrent gate (`test_stream_promise_concurrent`) now uses the real `parallel([...])`
+  primitive over `.promise()` stream-workers, verified 5/5 + full suite green. (The separate
+  `parallel([thunks-with-side-effects])` exit-teardown report did NOT reproduce, 20/20 clean.)
 - Affine model #15: consume-on-ownership-take (adapters/terminals MOVE; read/close BORROW) — the
   borrow/move split is the subtle bit; double-check it matches your intent.
 - The `lin_for` return type stays `Null` (#10) — widening it broke all of std/array.
@@ -346,9 +349,10 @@ Files touched:
 
 ## Stage 8 — .promise() true-threaded + fault isolation
 - Commit: <pending>
-- Gate: MET. Concurrent pipelines (`test_stream_promise_concurrent`, two `.promise()` workers) +
-  fault injection (`test_stream_promise_fault_isolation`, a transform OOB → `Error` at await).
-  Full workspace: 387 integration + all unit tests, 0 failures. Runtime stream tests clean under
+- Gate: MET. Concurrent pipelines (`test_stream_promise_concurrent`, two `.promise()` workers
+  driven together by the real `parallel([p1, p2])` primitive) + fault injection
+  (`test_stream_promise_fault_isolation`, a transform OOB → `Error` at await).
+  Full workspace: 391 integration + all unit tests, 0 failures. Runtime stream tests clean under
   ASan (covers alloc/retain/release/close/move/fault).
 
 ### What was added
@@ -375,14 +379,13 @@ Files touched:
     the `extern "C-unwind"` closure unwinds into) and convert it to an in-band `Err`. This is the
     correct place anyway — it threads the fault in-band to the terminal, matching brief §6/§8.
 
-### KNOWN PRE-EXISTING BUG (not streams; flag for the morning)
-19. `parallel([...])` over THUNKS that have side effects / return Json (`parallel([() =>
-    writeFile(...), …])`) SEGFAULTS at program exit — REPRODUCED WITHOUT STREAMS (a plain
-    `parallel([() => writeFile("a","x"), () => writeFile("b","y")])` crashes the same way; the
-    files are written correctly, the crash is at teardown). And `parallel([p1, p2])` over
-    already-spawned PROMISES panics with a misaligned-pointer deref in `transfer.rs:220` (the
-    promise box is deep-copied as an env capture). Both are PRE-EXISTING `parallel`/pool issues,
-    NOT introduced by streams. CONSEQUENCE: the brief's "concurrent pipelines via parallel([...])"
-    is demonstrated instead with MULTIPLE `.promise()` calls (the real streams concurrency
-    primitive), which is stable across repeated runs. If you want `parallel`-of-stream-thunks to
-    work, the underlying `parallel`/pool teardown bug needs a separate fix (out of streams scope).
+### RESOLVED PRE-EXISTING BUG (fixed on master, rebased in)
+19. `parallel([p1, p2])` over already-spawned PROMISES panicked with a misaligned-pointer deref
+    in `transfer.rs` — `lin_parallel` assumed every array element was a thunk closure and read
+    the closure layout (`cap_desc@40`) off each element; a `TAG_PROMISE` element made `cap_desc`
+    garbage. FIXED on master (`lin_parallel` now dispatches on element tag: thunks spawn,
+    promises are awaited + value deep-copied), ASan-clean, regression-tested. feat/streams was
+    rebased onto that master, and the Stage-8 concurrent gate now uses the real
+    `parallel([p1, p2])` over `.promise()` stream-workers (verified 5/5 + full suite green).
+    NOTE: the separately-reported `parallel([thunks-with-side-effects])` "exit segfault" did NOT
+    reproduce (20/20 clean) — treated as a non-bug, no fix invented.
