@@ -153,7 +153,7 @@ export val dropWhile = (arr: Json, f: Function): Json =>
   arr.for(item =>
     val keep = !dropping || !f(item)
     dropping = if keep then false else dropping
-    if keep then push(result, item) else null
+    if keep then push(result, item)
   )
   result
 

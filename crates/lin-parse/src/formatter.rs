@@ -551,12 +551,12 @@ fn collect_anchors_expr(expr: &Expr, out: &mut Vec<Anchor>) {
         Expr::Assign { value, .. } => collect_anchors_expr(value, out),
         Expr::Array(items, _) => {
             // Rule ii: each array element is a comment anchor, so an own-line comment before
-            // an element renders above it at the element's indent. Trailing comments on an
-            // element are unreliable for multi-line elements, so leading-only (trailing_ok
-            // false) — a same-line trailing comment demotes to the next anchor's leading.
+            // an element renders above it at the element's indent. A trailing comment on a
+            // SINGLE-LINE element is stable (kept trailing); a multi-line element's last line is
+            // an unreliable anchor, so there it stays leading-only (demotes to the next anchor).
             for it in items {
                 let sp = it.span();
-                out.push(Anchor { start: sp.start, end: sp.end, trailing_ok: false });
+                out.push(Anchor { start: sp.start, end: sp.end, trailing_ok: renders_single_line(it) });
                 collect_anchors_expr(it, out);
             }
         }
@@ -1586,18 +1586,29 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
             // elements (after the first's comma, before the second's leading comment).
             with_force_ml(true, || {
                 let mut out = String::from("[\n");
+                let last = items.len() - 1;
                 for (idx, i) in items.iter().enumerate() {
-                    if idx > 0 {
-                        out.push_str(",\n");
-                        // Rule iii: blank line between consecutive `test(...)` elements.
-                        if is_test_call(&items[idx - 1]) && is_test_call(i) {
-                            out.push('\n');
-                        }
-                    }
                     out.push_str(&take_leading(i.span().start, &child_ind));
                     let s = fmt_expr(i, false, &child_ind);
                     out.push_str(&child_ind);
                     out.push_str(&s);
+                    if idx != last {
+                        out.push(',');
+                    }
+                    // A trailing comment on a single-line element renders after its comma,
+                    // on the same line (kept stable by the `renders_single_line` anchor above).
+                    let trailing = trailing_text(i.span().start);
+                    if !trailing.is_empty() {
+                        out.push(' ');
+                        out.push_str(&trailing);
+                    }
+                    if idx != last {
+                        out.push('\n');
+                        // Rule iii: blank line between consecutive `test(...)` elements.
+                        if is_test_call(i) && is_test_call(&items[idx + 1]) {
+                            out.push('\n');
+                        }
+                    }
                 }
                 out.push('\n');
                 out.push_str(ind);
@@ -2055,8 +2066,10 @@ fn fmt_block(stmts: &[Stmt], tail: &Expr, ind: &str) -> String {
     if !tail_leading.is_empty() {
         lines.push(tail_leading.trim_end_matches('\n').to_string());
     }
-    // fmt_expr with `ind` → first line NO indent, rest have `ind`.
-    let tail_s = fmt_expr(tail, false, ind);
+    // fmt_expr with `ind` → first line NO indent, rest have `ind`. The tail is rendered in
+    // STATEMENT position: as the block's final expression it's effectively a statement, so an
+    // `if … then …` tail with an implicit (author-omitted) null else drops the `else null`.
+    let tail_s = fmt_expr(tail, true, ind);
     // Prefix the first line of tail_s with `ind` so all lines have uniform indent.
     let mut tail_line = format!("{}{}", ind, tail_s);
     let tail_trailing = trailing_text(tail_anchor);
