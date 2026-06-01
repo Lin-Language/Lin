@@ -976,6 +976,85 @@ fn own_for_read(t: Temp, ty: &Type, builder: &mut FuncBuilder) -> Temp {
     }
 }
 
+/// Borrowed lowering of an `Index`/`FieldGet` BASE — the array/object container is only read
+/// through (one element/field extracted), never stored, so it needs no owning reference. This
+/// skips the `own_for_read` Retain+scope-release that `lower_expr` of a `LocalGet` would emit
+/// for a CONCRETE-RC container (Array/FixedArray/Object), eliminating a retain/release PAIR per
+/// element read — the dominant cost of tight index loops over a module-`var`/captured array
+/// (e.g. a linear-scan PQ: `pqDist[j] < pqDist[best]` was 2 retain + 2 release per element).
+///
+/// Soundness: the container's true owner — the module global, the heap cell, or the enclosing
+/// owned local — outlives this single read (nothing reassigns it between the load and the
+/// `Index`/`FieldGet` that immediately consumes the returned temp). The element-dup at the
+/// `Index`/`FieldGet` site still gives the projected VALUE its own reference when that value is
+/// itself RC, so consumers are unaffected.
+///
+/// Returns `Some(borrowed_temp)` when the borrow shortcut applies; `None` to fall back to the
+/// normal owning `lower_expr`. Conservative: only a bare `LocalGet` of a concrete-RC container
+/// (never a union/Json container, never a non-`LocalGet` expression whose own evaluation might
+/// allocate or call) qualifies. Whenever this returns `Some`, `lower_container_base_borrowed_check`
+/// for the same `object`/`ctx` returns `true` (the eligibility predicate the caller uses to pick
+/// key/base lowering order).
+fn lower_container_base_borrowed(
+    object: &TypedExpr,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<Temp> {
+    let TypedExpr::LocalGet { slot, ty, .. } = object else { return None };
+    if is_union_ty(ty) || !is_rc_type(ty) {
+        return None;
+    }
+    // Module-level mutable `var` (global): plain load, no owning clone.
+    if ctx.global_var_slots.contains(slot) {
+        let gty = ctx.global_val_slots.get(slot).cloned().unwrap_or_else(|| ty.clone());
+        // A narrowed (union global read as concrete) base would need a Coerce + in-place retain;
+        // keep that on the owning path. Only the same-representation concrete case borrows.
+        if is_union_ty(&gty) {
+            return None;
+        }
+        let dst = builder.alloc_temp(gty.clone());
+        builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty });
+        return Some(dst);
+    }
+    // Mutably-captured `var` (heap cell): plain load through the cell, no owning clone.
+    if let Some(cell_ty) = builder.cell_slots.get(slot).cloned() {
+        if is_union_ty(&cell_ty) {
+            return None;
+        }
+        if let Some(&cell) = builder.slots.get(slot) {
+            let dst = builder.alloc_temp(cell_ty.clone());
+            builder.emit(Instruction::CellGet { dst, cell, ty: cell_ty });
+            return Some(dst);
+        }
+    }
+    // Plain local slot: the temp already holds the container; reuse it directly (no retain).
+    if let Some(&t) = builder.slots.get(slot) {
+        let stored_ty = builder.temp_types.get(&t).cloned().unwrap_or_else(|| ty.clone());
+        if is_union_ty(&stored_ty) {
+            return None;
+        }
+        return Some(t);
+    }
+    None
+}
+
+/// Eligibility predicate for `lower_container_base_borrowed`, WITHOUT emitting any IR. Mirrors its
+/// guards exactly so the `Index` caller can decide key/base lowering order before committing.
+/// Must stay in lockstep with `lower_container_base_borrowed` (every `Some` path here is `true`).
+fn lower_container_base_borrowed_check(object: &TypedExpr, ctx: &LowerCtx) -> bool {
+    let TypedExpr::LocalGet { slot, ty, .. } = object else { return false };
+    if is_union_ty(ty) || !is_rc_type(ty) {
+        return false;
+    }
+    if ctx.global_var_slots.contains(slot) {
+        let gty = ctx.global_val_slots.get(slot).unwrap_or(ty);
+        return !is_union_ty(gty);
+    }
+    // Cell or plain-local container: eligible unless its stored representation is a union/Json.
+    // (Both load paths in the emitter borrow without a retain; the emitter re-checks the type.)
+    true
+}
+
 /// Collect `var` slots that are mutably captured by any (possibly nested) closure within
 /// a statement. Such slots are stored as heap cells shared by reference.
 fn collect_mutable_capture_slots_stmt(stmt: &TypedStmt, out: &mut std::collections::HashSet<usize>) {
@@ -1914,8 +1993,30 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         TypedExpr::Index { object, key, result_type, .. } => {
             let obj_ty = object.ty();
             let key_ty = key.ty();
-            let obj_temp = lower_expr(object, builder, ctx);
-            let key_temp = lower_expr(key, builder, ctx);
+            // Borrow the container if it is a bare `LocalGet` of a concrete-RC array/object: the
+            // element read does not need an owning reference, so skip the retain/release pair the
+            // owning load would emit (the dominant cost of tight index loops over a var array).
+            // Falls back to the owning `lower_expr` for any container that doesn't qualify.
+            //
+            // Lower the KEY FIRST, then the borrowed base: a borrowed base is a bare load with no
+            // owning reference, so the base load must be the LAST thing before the `Index` — were
+            // the key evaluation to reassign the container global (`arr[mutate()]`), an
+            // already-loaded borrowed base would dangle. Evaluating the key first makes the borrow
+            // load strictly dominate the read. (The owning fallback keeps the original
+            // base-then-key order; its retain makes ordering immaterial.)
+            let (obj_temp, key_temp) = match lower_container_base_borrowed_check(object, ctx) {
+                true => {
+                    let key_temp = lower_expr(key, builder, ctx);
+                    let obj_temp = lower_container_base_borrowed(object, builder, ctx)
+                        .unwrap_or_else(|| lower_expr(object, builder, ctx));
+                    (obj_temp, key_temp)
+                }
+                false => {
+                    let obj_temp = lower_expr(object, builder, ctx);
+                    let key_temp = lower_expr(key, builder, ctx);
+                    (obj_temp, key_temp)
+                }
+            };
             let dst = builder.alloc_temp(result_type.clone());
             builder.emit(Instruction::Index {
                 dst,
@@ -2027,9 +2128,25 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         TypedExpr::IndexSet { object, key, value, obj_ty, .. } => {
             let key_ty = key.ty();
             let val_ty = value.ty();
-            let obj_temp = lower_expr(object, builder, ctx);
-            let key_temp = lower_expr(key, builder, ctx);
-            let val_temp = lower_expr(value, builder, ctx);
+            // Borrow the container (a bare `LocalGet` of a concrete-RC array/object): a store
+            // writes THROUGH the container without needing to own it, so skip the retain/release
+            // the owning load would emit. The KEY and VALUE are lowered FIRST so the borrowed base
+            // load is the last thing before the `IndexSet` — neither sub-expression can then leave
+            // a dangling borrow by reassigning the container global. The owning fallback keeps the
+            // original base→key→value order (its retain makes ordering immaterial).
+            let (obj_temp, key_temp, val_temp) =
+                if lower_container_base_borrowed_check(object, ctx) {
+                    let key_temp = lower_expr(key, builder, ctx);
+                    let val_temp = lower_expr(value, builder, ctx);
+                    let obj_temp = lower_container_base_borrowed(object, builder, ctx)
+                        .unwrap_or_else(|| lower_expr(object, builder, ctx));
+                    (obj_temp, key_temp, val_temp)
+                } else {
+                    let obj_temp = lower_expr(object, builder, ctx);
+                    let key_temp = lower_expr(key, builder, ctx);
+                    let val_temp = lower_expr(value, builder, ctx);
+                    (obj_temp, key_temp, val_temp)
+                };
             // `arr[i] = v` transfers a reference into the container exactly like the
             // `lin_array_set`/`lin_object_set` intrinsics (codegen routes both through the
             // same `emit_array_set`/`emit_object_set` helpers). Balance ownership of the
