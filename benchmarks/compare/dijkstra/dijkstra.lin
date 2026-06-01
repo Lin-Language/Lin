@@ -86,9 +86,11 @@ val step = (): Null =>
         val nd = du + edge["w"]
         if nd < dist[v] then
           set(dist, v, nd)
-        set(pqNode, pqLen, v)
-        set(pqDist, pqLen, nd)
-        pqLen = pqLen + 1
+          set(pqNode, pqLen, v)
+          set(pqDist, pqLen, nd)
+          pqLen = pqLen + 1
+        else
+          null
       )
     step()
 step()

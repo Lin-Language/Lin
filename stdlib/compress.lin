@@ -12,7 +12,6 @@
 //   import { readStream, writeStream, drain } from "std/stream"
 //   import { gunzip } from "std/compress"
 //   readStream("data.gz").gunzip().writeStream("data.txt").drain()
-
 // Decompress a gzip-framed byte stream → a stream of decompressed `UInt8[]` chunks.
 export val gunzip = (s: Stream): Stream =>
   lin_stream_gunzip(s)

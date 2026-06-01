@@ -26,9 +26,11 @@ val s = suite("std/archive", [
   // (a) manifest() lists the expected entry names (body skipped, meta-only).
   test("manifest lists entry names", () =>
     val names = []
-    readStream(tarPath).manifest().for((m) =>
-      names.push(m["name"])
-    )
+    readStream(tarPath)
+      .manifest()
+      .for(m =>
+        names.push(m["name"])
+      )
     [
       expect(length(names)).toBe(3),
       expect(names[0]).toBe("alpha.txt"),
@@ -40,9 +42,12 @@ val s = suite("std/archive", [
   // manifest over a gzipped archive (tar.gz = gunzip composed with the splitter).
   test("manifest works over a tar.gz via gunzip", () =>
     val sizes = []
-    readStream(gzPath).gunzip().manifest().for((m) =>
-      sizes.push(m["size"])
-    )
+    readStream(gzPath)
+      .gunzip()
+      .manifest()
+      .for(m =>
+        sizes.push(m["size"])
+      )
     [
       expect(length(sizes)).toBe(3),
       expect(sizes[0]).toBe(17),
@@ -54,9 +59,11 @@ val s = suite("std/archive", [
   // (b) files() recovers each entry's full content (buffered into a UInt8[]).
   test("files recovers entry contents", () =>
     val dataLens = []
-    readStream(tarPath).files().for((f) =>
-      dataLens.push(length(f["data"]))
-    )
+    readStream(tarPath)
+      .files()
+      .for(f =>
+        dataLens.push(length(f["data"]))
+      )
     [
       expect(dataLens[0]).toBe(17),
       expect(dataLens[1]).toBe(31),

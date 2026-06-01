@@ -63,18 +63,23 @@ val outDir = "/tmp/lin_streams_archive_out"
 mkdir(outDir, { "parents": true })
 
 print("--- archive manifest ---")
-readStream(archivePath).gunzip().manifest().for((m) =>
-  print("  ${m["name"]} — ${toString(m["size"])} bytes")
-)
+readStream(archivePath)
+  .gunzip()
+  .manifest()
+  .for(m =>
+    print("  ${m["name"]} — ${toString(m["size"])} bytes")
+  )
 
 print("--- extracting entries ---")
-val extract = readStream(archivePath).gunzip().untar((meta, data) =>
-  // Stream this member's bytes verbatim to its own file (the raw sink — binary-safe). The `data`
-  // sub-stream is valid only inside this callback (sync-only); drain it here.
-  val name = meta["name"]
-  data.writeStream("${outDir}/${name}").drain()
-  print("  extracted ${name} (${toString(meta["size"])} bytes)")
-)
+val extract = readStream(archivePath)
+  .gunzip()
+  .untar((meta, data) =>
+    // Stream this member's bytes verbatim to its own file (the raw sink — binary-safe). The `data`
+    // sub-stream is valid only inside this callback (sync-only); drain it here.
+    val name = meta["name"]
+    data.writeStream("${outDir}/${name}").drain()
+    print("  extracted ${name} (${toString(meta["size"])} bytes)")
+  )
 val extractStatus = match extract
   is Error => "error: ${extract["message"]}"
   else => "ok"

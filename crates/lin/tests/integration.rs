@@ -2317,7 +2317,7 @@ val show = (o): Null =>
   print(toString(o["a"] + o["b"]))
 show({
   "a": 1,
-  "b": 2,
+  "b": 2
 })
 "#);
     assert_eq!(output, vec!["3"]);
