@@ -20,7 +20,7 @@ fn main() {
     let target = header[2].to_string();
 
     // Intern node names to indices as we read; preserve first-seen order so the
-    // node set matches graph.json's "nodes" array (n0..n999 in order).
+    // node set matches graph.json's "nodes" array (n0..n{N-1} in order).
     let mut id_of: HashMap<String, usize> = HashMap::new();
     let mut adj: Vec<Vec<(usize, i64)>> = Vec::new();
 

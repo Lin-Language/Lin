@@ -98,7 +98,7 @@ nodes.for(_ =>
   k = k + 1
 )
 
-val targetDist: Int64 = dist[idOf("n999")]
+val targetDist: Int64 = dist[n - 1]
 val checksum = targetDist * 1000003i64 + (total - (total / 1000000000i64) * 1000000000i64)
 
 print("RESULT=${toString(checksum)}")
