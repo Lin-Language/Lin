@@ -1119,8 +1119,8 @@ reference transfers into the `TAG_STR` tagged box, and the standard owned-releas
 lowering contract drops it exactly once. No borrowed-string return path is introduced,
 so the recurring owned-vs-borrowed UAF/double-free class does not apply.
 
-**Consequence**: templates gain real loops/conditionals/filters. Migrated `.lint` files
-(`examples/web-server/views/index.lint`, `docs-site/templates/{page,home}.lint`) and
+**Consequence**: templates gain real loops/conditionals/filters. Migrated `.jinja` files
+(`examples/web-server/views/index.jinja`, `docs-site/templates/{page,home}.jinja`) and
 all call sites/tests from `${x}` to `{{ x }}`. The "missing key → empty string" change
 replaces the old "missing key → `null`". HTML in template variable *values* is passed
 through unescaped (the environment uses a non-`.html` template name, so autoescaping is
@@ -1136,7 +1136,7 @@ This is exactly the capability the old hand-rolled `${ }` engine could not expre
 was the motivation for moving to minijinja.
 
 **Why `render` had to become path-based**: template inheritance needs a *loader* — when
-a template says `{% extends "base.lint" %}`, the engine must fetch `base.lint` by name.
+a template says `{% extends "base.jinja" %}`, the engine must fetch `base.jinja` by name.
 After ADR-073, `render(path, data)` was implemented in Lin as `readFile(path)` →
 `lin_template_render(string, data)`, i.e. it handed minijinja a single anonymous
 in-memory string with no directory context, so `extends`/`include` had nothing to
@@ -1158,13 +1158,13 @@ existing `["builtins", "serde"]` set. Both are pulled in with `default-features 
 
 **Consequence**: the two example projects that use templating now demonstrate proper
 layouts instead of duplicated page chrome:
-- `docs-site/templates/` — new `base.lint` holds the shared `<head>`/nav/scripts with
-  `{% block body_attrs %}` and `{% block main %}`; `page.lint` and `home.lint` shrink to
-  `{% extends "base.lint" %}` + their block overrides (home adds `class="home"` and the
+- `docs-site/templates/` — new `base.jinja` holds the shared `<head>`/nav/scripts with
+  `{% block body_attrs %}` and `{% block main %}`; `page.jinja` and `home.jinja` shrink to
+  `{% extends "base.jinja" %}` + their block overrides (home adds `class="home"` and the
   hero). The builder (`docs-site/builder/main.lin`) switched from `renderWith(readFile…)`
   to `render(path, …)` and now guards the render result as an `Error`.
-- `examples/web-server/views/` — `index.lint` extends a new `base.lint`, which itself
-  `{% include "footer.lint" %}` to show partials.
+- `examples/web-server/views/` — `index.jinja` extends a new `base.jinja`, which itself
+  `{% include "footer.jinja" %}` to show partials.
 
 Verified end-to-end: `stdlib/template.test.lin` gains an inheritance case (writes
 base+child to a temp dir, renders the child); `examples/web-server/template.test.lin`

@@ -10,7 +10,7 @@ import { render, renderWith } from "std/template"
 
 | Function | Signature | Description |
 | --- | --- | --- |
-| `render` | `(String, {}) -> String \| Error` | Load a `.lint` file and render with data |
+| `render` | `(String, {}) -> String \| Error` | Load a `.jinja` file and render with data |
 | `renderWith` | `(String, {}) -> String \| Error` | Render a template string directly |
 
 ## Template syntax
@@ -21,7 +21,7 @@ Templates use Jinja syntax. The data record `{}` is the render context.
 - **Loops** — `{% for item in items %}...{% endfor %}`.
 - **Conditionals** — `{% if cond %}...{% else %}...{% endif %}`.
 - **Filters** — the standard minijinja builtin filters, e.g. `{{ name | upper }}`.
-- **Layouts** — `{% extends "base.lint" %}` + `{% block %}`, and partials via `{% include "footer.lint" %}` (file-based `render` only — see [Layouts](#layouts)).
+- **Layouts** — `{% extends "base.jinja" %}` + `{% block %}`, and partials via `{% include "footer.jinja" %}` (file-based `render` only — see [Layouts](#layouts)).
 
 ```
 Hello, {{ name }}!
@@ -60,7 +60,7 @@ A missing variable renders as the empty string; a malformed template returns an 
 ### `render`
 
 ```lin
-val result = render("templates/email.lint", {
+val result = render("templates/email.jinja", {
   "name": "Alice",
   "subject": "Welcome"
 })
@@ -73,9 +73,9 @@ match result
 
 ---
 
-### Template files (`.lint`)
+### Template files (`.jinja`)
 
-Create a `greeting.lint` file:
+Create a `greeting.jinja` file:
 
 ```
 Hello, {{ name }}!
@@ -89,7 +89,7 @@ Load and render it:
 import { render } from "std/template"
 import { print } from "std/io"
 
-val result = render("greeting.lint", {
+val result = render("greeting.jinja", {
   "name": "Bob",
   "stats": { "score": 42 }
 })
@@ -118,13 +118,13 @@ from the same directory as the file passed to `render`.
 A base layout declares the skeleton with fillable blocks:
 
 ```
-<!-- templates/base.lint -->
+<!-- templates/base.jinja -->
 <!DOCTYPE html>
 <html>
 <head><title>{{ title }}</title></head>
 <body{% block body_attrs %}{% endblock %}>
   {% block main %}{% endblock %}
-  {% include "footer.lint" %}
+  {% include "footer.jinja" %}
 </body>
 </html>
 ```
@@ -132,8 +132,8 @@ A base layout declares the skeleton with fillable blocks:
 A page extends it and fills in the blocks (an unfilled block keeps the base's default):
 
 ```
-<!-- templates/page.lint -->
-{% extends "base.lint" %}
+<!-- templates/page.jinja -->
+{% extends "base.jinja" %}
 
 {% block main %}
   <article>{{ content }}</article>
@@ -141,10 +141,10 @@ A page extends it and fills in the blocks (an unfilled block keeps the base's de
 ```
 
 ```lin
-render("templates/page.lint", { "title": "Docs", "content": "<p>Hi</p>" })
+render("templates/page.jinja", { "title": "Docs", "content": "<p>Hi</p>" })
 ```
 
-`base.lint` and `footer.lint` are resolved from `templates/` automatically. This is how the
+`base.jinja` and `footer.jinja` are resolved from `templates/` automatically. This is how the
 docs site itself is built — see `docs-site/templates/`.
 
 > `renderWith` takes an in-memory string with no source directory, so it **cannot** resolve

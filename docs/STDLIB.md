@@ -321,7 +321,7 @@ This document specifies the standard library for the Lin language. All modules a
 
 | Function | Signature | Summary |
 | --- | --- | --- |
-| [`render`](#render) | `(String, {}) -> String \| Error` | Load a `.lint` file and render it with a data record |
+| [`render`](#render) | `(String, {}) -> String \| Error` | Load a `.jinja` file and render it with a data record |
 | [`renderWith`](#renderWith) | `(String, {}) -> String` | Render a template string with a data record |
 
 **std/test**
@@ -3900,7 +3900,7 @@ Templating is **Jinja-style**, backed by the [minijinja](https://crates.io/crate
 - **Loops** — `{% for item in items %}...{% endfor %}`.
 - **Conditionals** — `{% if cond %}...{% else %}...{% endif %}`.
 - **Filters** — the standard minijinja builtin filter set, e.g. `{{ name | upper }}`.
-- **Layouts / inheritance** — `{% extends "base.lint" %}` + `{% block %}`, and partials via `{% include "footer.lint" %}`. **Only available through [`render`](#render)** (file-based): the referenced templates are loaded by name from the same directory as the entry file. [`renderWith`](#renderWith) takes an in-memory string with no directory to load from, so it cannot resolve `extends`/`include`.
+- **Layouts / inheritance** — `{% extends "base.jinja" %}` + `{% block %}`, and partials via `{% include "footer.jinja" %}`. **Only available through [`render`](#render)** (file-based): the referenced templates are loaded by name from the same directory as the entry file. [`renderWith`](#renderWith) takes an in-memory string with no directory to load from, so it cannot resolve `extends`/`include`.
 
 **Undefined / missing variables render as the empty string** (not an error). A **template syntax error or render failure** is returned as an `Error` (`{ "type": "error", "message": ... }`), discriminated with `is Error` like other fallible stdlib operations.
 
@@ -3909,7 +3909,7 @@ Templating is **Jinja-style**, backed by the [minijinja](https://crates.io/crate
 A base layout declares the page skeleton with fillable blocks:
 
 ```txt
-<!-- templates/base.lint -->
+<!-- templates/base.jinja -->
 <!DOCTYPE html>
 <html>
 <head><title>{{ title }}</title></head>
@@ -3922,12 +3922,12 @@ A base layout declares the page skeleton with fillable blocks:
 A page extends it and fills the blocks; an unfilled block keeps the base's default content:
 
 ```txt
-<!-- templates/page.lint -->
-{% extends "base.lint" %}
+<!-- templates/page.jinja -->
+{% extends "base.jinja" %}
 {% block main %}<article>{{ content }}</article>{% endblock %}
 ```
 
-`render("templates/page.lint", data)` resolves `base.lint` from `templates/` and produces the merged document. `{% include "footer.lint" %}` pulls another file in from the same directory. See `docs-site/templates/` and `examples/web-server/views/` for worked examples.
+`render("templates/page.jinja", data)` resolves `base.jinja` from `templates/` and produces the merged document. `{% include "footer.jinja" %}` pulls another file in from the same directory. See `docs-site/templates/` and `examples/web-server/views/` for worked examples.
 
 ---
 
@@ -3937,10 +3937,10 @@ A page extends it and fills the blocks; an unfilled block keeps the base's defau
 val render: (path: String, data: {}) -> String | Error
 ```
 
-Reads the file at `path` and renders it as a template against `data`, **with layout support**: the template may `{% extends %}` a base and fill `{% block %}`s, or `{% include %}` partials — referenced files are loaded by name from `path`'s directory. Intended for `.lint` template files. Returns an `Error` (`{ "type": "error", "message": ... }`) if the file cannot be read or the template fails to render.
+Reads the file at `path` and renders it as a template against `data`, **with layout support**: the template may `{% extends %}` a base and fill `{% block %}`s, or `{% include %}` partials — referenced files are loaded by name from `path`'s directory. Intended for `.jinja` template files. Returns an `Error` (`{ "type": "error", "message": ... }`) if the file cannot be read or the template fails to render.
 
 ```txt
-val s = render("greet.lint", { "name": "Alice", "score": 42 })
+val s = render("greet.jinja", { "name": "Alice", "score": 42 })
 match s
   is Error => print("error: ${s["message"]}")
   else     => print(s)

@@ -80,11 +80,11 @@ pub unsafe extern "C" fn lin_template_render(
 ///
 /// Unlike `lin_template_render`, this resolves the template through minijinja's
 /// `path_loader` rooted at the template file's own directory. That makes template
-/// inheritance work: a page template can `{% extends "base.lint" %}` and fill
-/// `{% block %}`s, or pull in partials with `{% include "_nav.lint" %}`, and the
+/// inheritance work: a page template can `{% extends "base.jinja" %}` and fill
+/// `{% block %}`s, or pull in partials with `{% include "_nav.jinja" %}`, and the
 /// referenced files are loaded by name from the same directory.
 ///
-/// The loaded template name is the file's basename (e.g. `page.lint`); referenced
+/// The loaded template name is the file's basename (e.g. `page.jinja`); referenced
 /// templates use their basename too (they live alongside it). Loading is lazy — only
 /// templates actually referenced are read from disk.
 ///

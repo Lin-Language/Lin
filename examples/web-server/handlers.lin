@@ -3,7 +3,7 @@ import { render } from "std/template"
 
 export val getIndex = (req: Request): Response =>
   val data = { "title": "Lin Web Server", "heading": "Welcome", "status": "running", "version": "1.0" }
-  val html = render("examples/web-server/views/index.lint", data)
+  val html = render("examples/web-server/views/index.jinja", data)
   match html
     has { "type": "error", message } => badRequest("template error: ${message}")
     else => text(200, html)
