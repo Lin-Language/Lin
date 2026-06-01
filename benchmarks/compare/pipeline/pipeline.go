@@ -1,8 +1,5 @@
 // pipeline.go — range -> map -> filter -> reduce, materializing each stage into
 // an explicit slice (no lazy fusion). Prints "RESULT=<int>".
-//
-// UNTESTED on the reference machine (no Go toolchain installed); written to be
-// correct and to match the other languages' checksum.
 package main
 
 import "fmt"

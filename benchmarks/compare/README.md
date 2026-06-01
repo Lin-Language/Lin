@@ -114,10 +114,15 @@ cell `MISMATCH` and adds a line to the correctness footer
 1. **Matched algorithm beats matched idiom.** Every language runs the same
    complexity, even when that isn't the most idiomatic local form.
 2. **Dijkstra uses a linear-scan priority queue in ALL languages** (O(V²)), not a
-   binary heap. This reuses Lin's already-tested
-   `examples/dijkstra/algorithm.lin` (zero new Lin algorithm code), avoids
-   writing/diverging five different heaps, and keeps the benchmark about each
-   language's runtime on identical work rather than about its heap library.
+   binary heap. This avoids writing/diverging five different heaps and keeps the
+   benchmark about each language's runtime on identical work rather than about its
+   heap library. All five implementations also use the **same data structures**:
+   node names `n<k>` are interned to the integer index `k`, and `dist`/`visited`/
+   `adj` are integer-indexed arrays with O(1) access, with the PQ as parallel
+   arrays + an O(1) swap-remove. (An earlier Lin version reused the string-keyed
+   `Json` maps from `examples/dijkstra/` — whose field lookup is an O(n) linear
+   scan — which was a data-structure handicap, not a fair language comparison; it
+   has been rewritten to match.)
 3. **Identical sizes / iteration counts** — the fixed parameters above; each
    impl hard-codes the same numbers or reads the same graph files.
 4. **Same opt level:** Rust `rustc -O`, Go default-optimized `go build`, Lin
@@ -147,15 +152,16 @@ cell `MISMATCH` and adds a line to the correctness footer
 ## Missing-toolchain behaviour
 
 The runner detects each toolchain once at startup, prints a banner
-(`toolchains: lin=ok rust=1.95 go=MISSING python=3.11 node=v24 hyperfine=MISSING`)
-and a `skipped:` line, then **continues with whatever is present** — it never
-hard-fails on a missing toolchain and never requires `hyperfine`. A skipped
-language's cells are `--`, and the run still exits 0 and writes a complete table.
+(`toolchains: lin=ok rust=1.95 go=1.26 python=3.11 node=v24 hyperfine=MISSING`)
+and a `skipped:` line for anything absent, then **continues with whatever is
+present** — it never hard-fails on a missing toolchain and never requires
+`hyperfine`. A skipped language's cells are `--`, and the run still exits 0 and
+writes a complete table.
 
-On the reference machine `go` and `hyperfine` are **not installed**, so the Go
-column is `--` and the bash timer is used. The Go implementations are written and
-committed (and are syntactically/algorithmically correct), but were **not
-executed there** — install Go for the full five-column comparison.
+The devcontainer provisions `lin`'s toolchain (Rust + LLVM) plus Node, Python and
+Go, so all five languages run out of the box. `hyperfine` is optional and not
+installed by default — the bash `EPOCHREALTIME` timer is used unless you install
+it and pass `USE_HYPERFINE=1`.
 
 ## Caveats
 

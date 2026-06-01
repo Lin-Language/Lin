@@ -1,7 +1,4 @@
 // recursion.go — naive recursive fib + iterative sumTo. Prints "RESULT=<int>".
-//
-// UNTESTED on the reference machine (no Go toolchain installed); written to be
-// correct and to match the other languages' checksum.
 package main
 
 import "fmt"

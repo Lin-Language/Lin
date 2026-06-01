@@ -24,7 +24,7 @@ fn main() {
     let mut id_of: HashMap<String, usize> = HashMap::new();
     let mut adj: Vec<Vec<(usize, i64)>> = Vec::new();
 
-    let mut intern = |name: &str, id_of: &mut HashMap<String, usize>, adj: &mut Vec<Vec<(usize, i64)>>| -> usize {
+    let intern = |name: &str, id_of: &mut HashMap<String, usize>, adj: &mut Vec<Vec<(usize, i64)>>| -> usize {
         if let Some(&id) = id_of.get(name) {
             id
         } else {
