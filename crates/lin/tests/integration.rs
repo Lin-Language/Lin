@@ -4526,6 +4526,30 @@ fn test_fmt_preserves_grouping_parens() {
 }
 
 #[test]
+fn test_fmt_implicit_else_null_omitted() {
+    // A statement-position `if` with an IMPLICIT null else drops the `else null`; an
+    // author-written `else null` is kept (it may signal intent).
+    assert_eq!(
+        fmt("val f = (d: Int32): Null =>\n  if d < INF then total = total + d\n").trim(),
+        "val f = (d: Int32): Null =>\n  if d < INF then total = total + d"
+    );
+    assert_eq!(
+        fmt("val g = (d: Int32): Null =>\n  if d < INF then total = total + d else null\n").trim(),
+        "val g = (d: Int32): Null =>\n  if d < INF then total = total + d else null"
+    );
+}
+
+#[test]
+fn test_fmt_preserves_author_multiline_literals() {
+    // A literal the author broke across lines stays multi-line (never rolled up); an author-
+    // inline literal stays inline (never rolled out).
+    let ml = "val a = [\n  expect(valueOf(ok(numNode(42)))).toBe(42)\n]\n";
+    assert_eq!(fmt(ml), ml, "author-multilined single-item array rolled up:\n{}", fmt(ml));
+    let inline = "val b = [1, 2, 3]\n";
+    assert_eq!(fmt(inline), inline, "inline array changed:\n{}", fmt(inline));
+}
+
+#[test]
 fn test_fmt_multi_call_array_multiline() {
     // A multi-element array whose elements contain calls renders multi-line (packing several
     // calls on one line reads poorly). A single-call array and a plain-literal array stay inline.
@@ -4793,13 +4817,19 @@ fn test_fmt_rule3_no_trailing_commas() {
 
 #[test]
 fn test_fmt_rule4_recursive_multiline() {
-    // Rule 4: once a literal goes multiline, every nested literal is also multiline,
-    // even if it would fit inline.
-    let source = "val node = { \"node\": { \"kind\": \"num\", \"value\": tokens[pos][\"text\"].parseInt32() }, \"pos\": pos + 1 }\n";
+    // Author-intent layout: a nested literal the AUTHOR broke across lines stays multi-line; a
+    // nested literal the author wrote INLINE stays inline (we never roll a multi-line literal up,
+    // and never roll an author-inline one out). Here the author broke every level → fully nested.
+    let source = "val node = {\n  \"node\": {\n    \"kind\": \"num\",\n    \"value\": tokens[pos][\"text\"].parseInt32()\n  },\n  \"pos\": pos + 1\n}\n";
     let out = fmt(source);
-    let expected = "val node = {\n  \"node\": {\n    \"kind\": \"num\",\n    \"value\": tokens[pos][\"text\"].parseInt32()\n  },\n  \"pos\": pos + 1\n}";
-    assert_eq!(out.trim_end(), expected, "Rule 4 nested object not fully multiline:\n{}", out);
-    assert_eq!(out, fmt(&out), "Rule 4 not idempotent:\n{}", out);
+    assert_eq!(out, source, "author-multilined nested object not preserved:\n{}", out);
+    assert_eq!(out, fmt(&out), "not idempotent:\n{}", out);
+
+    // Author wrote the inner object INLINE inside a multi-line outer array → inner stays inline.
+    let mixed = "val fields = [\n  { \"tag\": 1, \"bytes\": [72, 105] },\n  { \"tag\": 2, \"bytes\": [255, 0, 128] }\n]\n";
+    let mout = fmt(mixed);
+    assert_eq!(mout, mixed, "author-inline inner literals not preserved:\n{}", mout);
+    assert_eq!(mout, fmt(&mout), "mixed not idempotent:\n{}", mout);
 }
 
 #[test]
@@ -4810,9 +4840,9 @@ fn test_fmt_rule5a_trailing_lambda() {
     let source = "val t = test(\"evaluates a single number\", () => [expect(valueOf(\"forty-two-ish\")).toBe(42), expect(valueOf(\"seventy-seven\")).toBe(77)])\n";
     let out = fmt(source);
     assert!(out.contains("test(\"evaluates a single number\", () => [\n"), "Rule 5a `() => [` not kept together:\n{}", out);
-    // Rule i: the last arg is a lambda whose body renders multi-line, so the call's closing `)`
-    // is on its OWN line, dedented to the call indent (the `]` is at the lambda-body indent).
-    assert!(out.contains("\n  expect(valueOf(\"forty-two-ish\")).toBe(42),\n  expect(valueOf(\"seventy-seven\")).toBe(77)\n]\n)"), "Rule 5a body/close not laid out:\n{}", out);
+    // The `=> [` collapse puts the array's `]` at the call indent, so the call's `)` glues
+    // directly → the close reads `])` (no stray `)` line).
+    assert!(out.contains("\n  expect(valueOf(\"forty-two-ish\")).toBe(42),\n  expect(valueOf(\"seventy-seven\")).toBe(77)\n])"), "Rule 5a body/close not laid out:\n{}", out);
     assert_eq!(out, fmt(&out), "Rule 5a not idempotent:\n{}", out);
 }
 
@@ -4855,13 +4885,12 @@ fn test_fmt_rulei_iii_test_array_full_target() {
 
 #[test]
 fn test_fmt_rulei_close_paren_own_line() {
-    // Rule i: a call whose last arg is a lambda with a multi-line body puts the call's closing
-    // `)` on its own line, dedented to the call indent (the `]` stays at the body indent). This
-    // is a statement-level call, so Rule 6 collapses `() => [` (the body stays attached); Rule i
-    // only moves the closing `)`.
+    // A call whose last arg is a lambda with an array body: `() => [` collapses (Rule 6, body
+    // attached), the body breaks, and since the `]` lands at the call indent the closing `)`
+    // glues → `])`.
     let source = "val t = test(\"plain bitwise operators\", () =>\n  [\n    expect(valueOf(\"forty-two-ish\")).toBe(42),\n    expect(valueOf(\"seventy-seven\")).toBe(77)\n  ])\n";
     let out = fmt(source);
-    let expected = "val t = test(\"plain bitwise operators\", () => [\n  expect(valueOf(\"forty-two-ish\")).toBe(42),\n  expect(valueOf(\"seventy-seven\")).toBe(77)\n]\n)\n";
+    let expected = "val t = test(\"plain bitwise operators\", () => [\n  expect(valueOf(\"forty-two-ish\")).toBe(42),\n  expect(valueOf(\"seventy-seven\")).toBe(77)\n])\n";
     assert_eq!(out, expected, "Rule i close-paren layout wrong:\n{}", out);
     assert_eq!(out, fmt(&out), "Rule i not idempotent:\n{}", out);
 }

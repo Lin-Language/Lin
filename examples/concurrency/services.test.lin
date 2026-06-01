@@ -1,5 +1,7 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { poolSum, accumulate, workerFaults, sharedCounter, sharedSnapshot, frozenLookup } from "./services"
+import {
+  poolSum, accumulate, workerFaults, sharedCounter, sharedSnapshot, frozenLookup
+} from "./services"
 
 val s = suite("concurrency/services", [
   test("ThreadPool runs all queued tasks (bounded concurrency)", () => [
@@ -33,7 +35,7 @@ val s = suite("concurrency/services", [
 
   test("Frozen table read in parallel sees the same data on every thread", () => [
     expect(frozenLookup()).toBe(100)
-  ])
+  ]),
 ])
 
 run(s)

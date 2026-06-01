@@ -4,7 +4,7 @@ import { dot2, magnitude2, angleBetween } from "./vector"
 import { toFixed, PI } from "std/math"
 
 // End-to-end: drive matrix + vector together on a composed transform.
-val identity: Float64[] = mat3(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+val identity: Float64[] = mat3(1.0,0.0,0.0, 0.0,1.0,0.0, 0.0,0.0,1.0)
 
 val s = suite("matrix integration", [
   // Compose two transforms via matrix multiplication, then map a point through the
@@ -19,7 +19,6 @@ val s = suite("matrix integration", [
       expect(pt["y"].toFixed(4)).toBe("1.0000")
     ]
   ),
-
   // Matrix → vector pipeline: rotating a vector by 90° preserves its magnitude
   // (matrix maps the point, vector measures it). [3,4] has magnitude 5 before and
   // after the rotation that sends it to (-4,3).
@@ -27,9 +26,10 @@ val s = suite("matrix integration", [
     val rot = rotation2D(PI / 2.0)
     val pt = applyToPoint(rot, 3.0, 4.0)
     val rotated = [pt["x"], pt["y"]]
-    [expect(magnitude2(rotated).toFixed(4)).toBe("5.0000")]
+    [
+      expect(magnitude2(rotated).toFixed(4)).toBe("5.0000")
+    ]
   ),
-
   // The angle between the original and the rotated vector is 90° (PI/2).
   test("rotation by 90 deg yields a 90 deg angle between in and out", () =>
     val rot = rotation2D(PI / 2.0)
@@ -39,13 +39,14 @@ val s = suite("matrix integration", [
       expect(angleBetween([1.0, 0.0], rotated).toFixed(4)).toBe(toFixed(PI / 2.0, 4))
     ]
   ),
-
   // The rotated unit vector is still perpendicular to the original (dot == 0).
   test("rotated unit vector is orthogonal to the original", () =>
     val rot = rotation2D(PI / 2.0)
     val pt = applyToPoint(rot, 1.0, 0.0)
     val rotated = [pt["x"], pt["y"]]
-    [expect(dot2([1.0, 0.0], rotated).toFixed(4)).toBe("0.0000")]
-  )
+    [
+      expect(dot2([1.0, 0.0], rotated).toFixed(4)).toBe("0.0000")
+    ]
+  ),
 ])
 run(s)

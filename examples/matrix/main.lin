@@ -3,6 +3,7 @@
 //
 // Run:   lin run examples/matrix/main.lin
 // Test:  lin test examples/matrix/
+
 import { matMul, rotation2D, applyToPoint, mat3, mat3Get } from "./matrix"
 import { dot2, magnitude2, angleBetween } from "./vector"
 import { sin, cos, atan2, PI, toFixed } from "std/math"
@@ -11,21 +12,17 @@ import { print } from "std/io"
 
 // 1. Identity × M = M — print 3 rows formatted to 1dp.
 val id = mat3(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
-val m = mat3(2.0, 3.0, 0.0, 4.0, 5.0, 0.0, 0.0, 0.0, 1.0)
-val p = matMul(id, m)
+val m  = mat3(2.0, 3.0, 0.0, 4.0, 5.0, 0.0, 0.0, 0.0, 1.0)
+val p  = matMul(id, m)
 print("matrix multiply identity * M:")
 range(0, 3).for(i =>
-  print(
-    "  ${mat3Get(p, i, 0).toFixed(1)} ${mat3Get(p, i, 1).toFixed(1)} ${mat3Get(p, i, 2).toFixed(1)}"
-  )
+  print("  ${mat3Get(p, i, 0).toFixed(1)} ${mat3Get(p, i, 1).toFixed(1)} ${mat3Get(p, i, 2).toFixed(1)}")
 )
 
 // 2. Rotate (1.0, 0.0) by 90° → "(0.0000, 1.0000)".
 val rot90 = rotation2D(PI / 2.0)
 val rotated = applyToPoint(rot90, 1.0, 0.0)
-print(
-  "rotate (1,0) by 90 deg: (${rotated["x"].toFixed(4)}, ${rotated["y"].toFixed(4)})"
-)
+print("rotate (1,0) by 90 deg: (${rotated["x"].toFixed(4)}, ${rotated["y"].toFixed(4)})")
 
 // 3. Dot product and magnitude of [3.0, 4.0].
 val v = [3.0, 4.0]

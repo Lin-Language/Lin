@@ -4,6 +4,7 @@
 //
 // This complements the schema-based loader: `fromJson` is the language's built-in
 // structural decode, where loader.lin/schema.lin show a hand-rolled validator.
+
 import { fromJson } from "std/json"
 
 export type Address = { "city": String, "zip": String | Null }

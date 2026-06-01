@@ -29,12 +29,9 @@ val walkPath = (prev: Json, source: String, path: String[], current: String): Nu
     val p = toString(pRaw)
     push(path, p)
     walkPath(prev, source, path, p)
-  else
-    null
 
 export val reconstructPath = (prev: Json, source: String, target: String): String[] =>
-  if target == source then
-    [source]
+  if target == source then [source]
   else
     var path = [target]
     walkPath(prev, source, path, target)
