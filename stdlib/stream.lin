@@ -17,6 +17,8 @@ export val readStream = (path: String) =>
   lin_fs_open(path)
 
 // Adapters — each returns a new Stream node; they are LAZY (no reads happen yet).
+// `lines` buffers bytes only until the next newline; a single line is capped at 64 MiB so a
+// newline-less input fails in-band with an Error rather than buffering the whole stream.
 export val lines = (s: Stream): Stream =>
   lin_stream_lines(s)
 
