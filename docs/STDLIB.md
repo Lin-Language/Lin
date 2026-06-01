@@ -1775,7 +1775,8 @@ Reads take a buffer and a byte offset; writes return a freshly allocated `UInt8[
 Example — an 8-byte two-`Float32` control packet (e.g. two motor speeds) round-tripped through a big-endian buffer:
 
 ```txt
-import { push, length, for } from "std/array"
+import { push, length } from "std/array"
+import { for } from "std/iter"
 import { f32ToBe, f32FromBe, f32FromBits } from "std/bytes"
 
 // Float32 literals are not yet context-narrowed, so build them from bit patterns:
