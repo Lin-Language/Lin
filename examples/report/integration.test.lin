@@ -3,7 +3,6 @@
 // Drives report.lin's public entry (render) end to end over a realistic batch
 // that includes malformed rows (which must be skipped and noted), and a large
 // batch as an ASan guard against RC corruption in the map/filter/reduce churn.
-
 import { expect, toBe, test, suite, run } from "std/test"
 import { render, validRecords, stats } from "./report"
 import { length } from "std/array"
@@ -19,36 +18,46 @@ val sample = [
 ]
 
 val s = suite("report-integration", [
-  // --- End-to-end render: header, ranked rows, summary line, skipped-row note ---
   test("renders a report with header, top scorer, summary, and skipped-row note", () =>
+    // --- End-to-end render: header, ranked rows, summary line, skipped-row note ---
     val out = render(sample)
     [
       expect(out.contains("=== Report ===")).toBe(true),
       expect(out.contains("Diana: 100")).toBe(true),
       expect(out.contains("count=4 avg=88 top=Diana")).toBe(true),
       expect(out.contains("skipped 2 bad row(s)")).toBe(true)
-    ]
-  ),
+    ]),
   test("omits the skipped-row note when every row parses", () =>
     val out = render(["Alice, 85", "Bob, 92"])
     [
       expect(out.contains("=== Report ===")).toBe(true),
       expect(out.contains("skipped")).toBe(false)
-    ]
-  ),
-
-  // --- Churn: a large batch must render without RC corruption (ASan guard) ---
+    ]),
   test("handles a larger batch without corruption", () =>
+    // --- Churn: a large batch must render without RC corruption (ASan guard) ---
     val many = [
-      "A, 1", "B, 2", "C, 3", "D, 4", "E, 5", "F, 6", "G, 7", "H, 8",
-      "A, 1", "B, 2", "C, 3", "D, 4", "E, 5", "F, 6", "G, 7", "H, 8"
+      "A, 1",
+      "B, 2",
+      "C, 3",
+      "D, 4",
+      "E, 5",
+      "F, 6",
+      "G, 7",
+      "H, 8",
+      "A, 1",
+      "B, 2",
+      "C, 3",
+      "D, 4",
+      "E, 5",
+      "F, 6",
+      "G, 7",
+      "H, 8"
     ]
     val out = render(many)
     [
       expect(length(validRecords(many))).toBe(16),
       expect(stats(validRecords(many))["total"]).toBe(72),
       expect(out.contains("=== Report ===")).toBe(true)
-    ]
-  ),
+    ])
 ])
 run(s)

@@ -2,7 +2,6 @@
 // Result combinators. Validation short-circuits on the FIRST failing field via
 // `andThen`, so a valid form yields a typed record and an invalid one yields the
 // first error message.
-
 import { ok, err, andThen, isOk } from "./result"
 import { nonEmpty, email, intInRange } from "./validate"
 
@@ -18,6 +17,4 @@ export val validateForm = (raw: RawForm): Json =>
     .andThen(name =>
       email(raw["email"])
         .andThen(em =>
-          intInRange("age", raw["age"], 0, 150)
-            .andThen(age =>
-              ok({ "name": name, "email": em, "age": age }))))
+          intInRange("age", raw["age"], 0, 150).andThen(age => ok({ "name": name, "email": em, "age": age }))))

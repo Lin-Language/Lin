@@ -5,43 +5,39 @@ import { json, text, redirect, notFound, badRequest, parseBody, matchPath } from
 val s = suite("std/http", [
   test("json helper sets status and content-type", () =>
     val resp = json(200, { "ok": true })
-    [expect(resp["status"]).toBe(200), expect(resp["headers"]["Content-Type"]).toBe("application/json")]
-  ),
-
+    [
+      expect(resp["status"]).toBe(200),
+      expect(resp["headers"]["Content-Type"]).toBe("application/json")
+    ]),
   test("text helper sets status and body", () =>
     val resp = text(200, "hello world")
-    [expect(resp["status"]).toBe(200), expect(resp["body"]).toBe("hello world")]
-  ),
-
+    [expect(resp["status"]).toBe(200), expect(resp["body"]).toBe("hello world")]),
   test("redirect sets 302 and Location header", () =>
     val resp = redirect("/home")
-    [expect(resp["status"]).toBe(302), expect(resp["headers"]["Location"]).toBe("/home")]
-  ),
-
-  test("notFound has status 404", () => [
-    expect(notFound["status"]).toBe(404)
-  ]),
-
+    [
+      expect(resp["status"]).toBe(302),
+      expect(resp["headers"]["Location"]).toBe("/home")
+    ]),
+  test("notFound has status 404", () => [expect(notFound["status"]).toBe(404)]),
   test("badRequest has status 400", () =>
     val resp = badRequest("missing field")
-    [expect(resp["status"]).toBe(400)]
-  ),
-
+    [expect(resp["status"]).toBe(400)]),
   test("parseBody parses JSON body", () =>
-    val req = { "method": "POST", "path": "/", "query": "", "headers": {}, "body": "{\"x\": 99}" }
+    val req = {
+      "method": "POST",
+      "path": "/",
+      "query": "",
+      "headers": {},
+      "body": "{\"x\": 99}"
+    }
     val body = req.parseBody()
-    [expect(body["x"]).toBe(99)]
-  ),
-
+    [expect(body["x"]).toBe(99)]),
   test("matchPath extracts named segments", () =>
     val m = matchPath("/users/42/posts/7", "/users/:id/posts/:postId")
-    [expect(m["id"]).toBe("42"), expect(m["postId"]).toBe("7")]
-  ),
-
+    [expect(m["id"]).toBe("42"), expect(m["postId"]).toBe("7")]),
   test("matchPath returns null on mismatch", () =>
     val m = matchPath("/products/5", "/users/:id")
-    [expect(m).toBe(null)]
-  ),
+    [expect(m).toBe(null)])
 ])
 
 run(s)

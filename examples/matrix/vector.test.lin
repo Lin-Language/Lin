@@ -3,20 +3,21 @@ import { dot2, magnitude2, angleBetween } from "./vector"
 import { toFixed, PI } from "std/math"
 
 val s = suite("vector", [
-  test("dot product of orthogonal vectors is 0", () => [
-    expect(dot2([1.0, 0.0], [0.0, 1.0])).toBe(0.0)
-  ]),
-  test("dot product of [3,4] with itself is 25", () => [
-    expect(dot2([3.0, 4.0], [3.0, 4.0])).toBe(25.0)
-  ]),
-  test("magnitude of [3,4] is 5", () => [
-    expect(magnitude2([3.0, 4.0])).toBe(5.0)
-  ]),
-  test("magnitude of unit vector is 1", () => [
-    expect(magnitude2([1.0, 0.0])).toBe(1.0)
-  ]),
+  test(
+    "dot product of orthogonal vectors is 0",
+    () => [expect(dot2([1.0, 0.0], [0.0, 1.0])).toBe(0.0)]
+  ),
+  test(
+    "dot product of [3,4] with itself is 25",
+    () => [expect(dot2([3.0, 4.0], [3.0, 4.0])).toBe(25.0)]
+  ),
+  test("magnitude of [3,4] is 5", () => [expect(magnitude2([3.0, 4.0])).toBe(5.0)]),
+  test(
+    "magnitude of unit vector is 1",
+    () => [expect(magnitude2([1.0, 0.0])).toBe(1.0)]
+  ),
   test("angle between orthogonal unit vectors is PI/2", () => [
     expect(toFixed(angleBetween([1.0, 0.0], [0.0, 1.0]), 4)).toBe(toFixed(PI / 2.0, 4))
-  ]),
+  ])
 ])
 run(s)
