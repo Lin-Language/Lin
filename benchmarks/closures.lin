@@ -20,9 +20,9 @@ val seed = 3
 // map/filter/reduce where EVERY callback captures an outer value → each is a capturing
 // closure with a one-slot env, created once and consumed synchronously by the combinator.
 val total = range(0, n)
-  .map((x) => x * base)
-  .filter((x) => x > lo)
-  .filter((x) => x < hi)
+  .map(x => x * base)
+  .filter(x => x > lo)
+  .filter(x => x < hi)
   .reduce(seed, (acc, x) => acc + x)
 
 print(toString(total))

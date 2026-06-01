@@ -5,6 +5,7 @@
 //
 // Run:   lin run examples/codec/main.lin
 // Test:  lin test examples/codec/
+
 import { encode, decode } from "./tlv"
 import { packNibbles, highNibble, lowNibble, nalType, checksum } from "./bits"
 import { print } from "std/io"
@@ -12,18 +13,17 @@ import { toString } from "std/string"
 import { length } from "std/array"
 
 // --- TLV round-trip ---
-val fields = [{ "tag": 1, "bytes": [72, 105] }, { "tag": 2, "bytes": [255, 0, 128] }]
+val fields = [
+  { "tag": 1, "bytes": [72, 105] },
+  { "tag": 2, "bytes": [255, 0, 128] }
+]
 val packed = encode(fields)
 print("packed (${toString(length(packed))} bytes): ${toString(packed)}")
 val decoded = decode(packed)
-print(
-  "decoded ${toString(length(decoded))} field(s); first tag=${toString(decoded[0]["tag"])}"
-)
+print("decoded ${toString(length(decoded))} field(s); first tag=${toString(decoded[0]["tag"])}")
 
 // --- Bit twiddling ---
 val byte = packNibbles(0xA, 0x5)
-print(
-  "packed nibbles 0xA,0x5 = ${toString(byte)} (hi=${toString(highNibble(byte))} lo=${toString(lowNibble(byte))})"
-)
+print("packed nibbles 0xA,0x5 = ${toString(byte)} (hi=${toString(highNibble(byte))} lo=${toString(lowNibble(byte))})")
 print("NAL type of 0x67 = ${toString(nalType(0x67))}")
 print("XOR checksum of [1,2,3] = ${toString(checksum([1, 2, 3]))}")

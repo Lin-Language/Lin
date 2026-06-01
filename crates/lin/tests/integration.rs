@@ -4949,6 +4949,88 @@ fn test_fmt_ruleC_over_two_chain_always_multiline() {
     assert_eq!(out, fmt(&out), "Rule C >2 not idempotent:\n{}", out);
 }
 
+#[test]
+fn test_fmt_opt_in_match_alignment() {
+    // Opt-in: a match whose `=>` the author column-aligned stays aligned, with padding
+    // recomputed from the FORMATTED head widths (so string-key shorthand reflow is fine).
+    let source = "val f = (s: Json): String =>\n  match s\n    has { \"circle\" } when big => \"a\"\n    has { \"rect\" }            => \"bb\"\n    else                      => \"c\"\n";
+    let out = fmt(source);
+    // Pull the three arm lines (indented, no `val`) and check the `=>` byte offset matches.
+    let arrow_cols: Vec<usize> = out
+        .lines()
+        .filter(|l| l.contains("=>") && (l.contains("has") || l.trim_start().starts_with("else")))
+        .map(|l| l.find("=>").unwrap())
+        .collect();
+    assert_eq!(arrow_cols.len(), 3, "expected 3 aligned arms:\n{}", out);
+    assert!(
+        arrow_cols.iter().all(|&c| c == arrow_cols[0]),
+        "match `=>` not column-aligned: {:?}\n{}",
+        arrow_cols,
+        out
+    );
+    // The widest head `has { circle } when big` keeps exactly one space before `=>`.
+    assert!(out.contains("has { circle } when big => \"a\""), "widest head not single-spaced:\n{}", out);
+    assert_eq!(out, fmt(&out), "aligned match not idempotent:\n{}", out);
+
+    // A single-spaced match stays single-spaced (no opt-in signal).
+    let single = "val g = (s: Json): String =>\n  match s\n    has { \"circle\" } => \"a\"\n    has { \"rect\" } => \"bb\"\n    else => \"c\"\n";
+    let so = fmt(single);
+    assert!(so.contains("has { rect } => \"bb\""), "single-spaced match changed:\n{}", so);
+    assert!(!so.contains("  => "), "single-spaced match got padded:\n{}", so);
+    assert_eq!(so, fmt(&so), "single-spaced match not idempotent:\n{}", so);
+}
+
+#[test]
+fn test_fmt_opt_in_trailing_comment_alignment() {
+    // Opt-in: a val-run inside a function body with author-aligned trailing comments keeps
+    // them aligned — the widest code part has one space, narrower ones are padded.
+    let source = "val setup = (): Int32 =>\n  val a = 1       // first\n  val bb = 2      // second\n  val ccc = 3     // third\n  a + bb + ccc\n";
+    let out = fmt(source);
+    let comment_cols: Vec<usize> = out
+        .lines()
+        .filter(|l| l.contains("//"))
+        .map(|l| l.find("//").unwrap())
+        .collect();
+    assert_eq!(comment_cols.len(), 3, "expected 3 aligned comments:\n{}", out);
+    assert!(
+        comment_cols.iter().all(|&c| c == comment_cols[0]),
+        "trailing comments not aligned: {:?}\n{}",
+        comment_cols,
+        out
+    );
+    // Widest code is `  val ccc = 3` — it keeps a single space before its `//`.
+    assert!(out.contains("val ccc = 3 // third"), "widest member not single-spaced:\n{}", out);
+    assert_eq!(out, fmt(&out), "aligned trailing comments not idempotent:\n{}", out);
+
+    // Single-spaced trailing comments stay single-spaced.
+    let single = "val setup = (): Int32 =>\n  val a = 1 // first\n  val bb = 2 // second\n  val ccc = 3 // third\n  a + bb + ccc\n";
+    let so = fmt(single);
+    assert!(so.contains("val a = 1 // first"), "single-spaced trailing changed:\n{}", so);
+    assert!(!so.contains("val a = 1  //"), "single-spaced trailing got padded:\n{}", so);
+    assert_eq!(so, fmt(&so), "single-spaced trailing not idempotent:\n{}", so);
+}
+
+#[test]
+fn test_fmt_opt_in_toplevel_trailing_alignment() {
+    // Opt-in at TOP LEVEL (no enclosing function): an aligned val-run stays aligned.
+    let source = "val a = 1       // first\nval bb = 2      // second\nval ccc = 3     // third\n";
+    let out = fmt(source);
+    let comment_cols: Vec<usize> = out
+        .lines()
+        .filter(|l| l.contains("//"))
+        .map(|l| l.find("//").unwrap())
+        .collect();
+    assert_eq!(comment_cols.len(), 3, "expected 3 aligned top-level comments:\n{}", out);
+    assert!(
+        comment_cols.iter().all(|&c| c == comment_cols[0]),
+        "top-level trailing comments not aligned: {:?}\n{}",
+        comment_cols,
+        out
+    );
+    assert!(out.contains("val ccc = 3 // third"), "widest top-level member not single-spaced:\n{}", out);
+    assert_eq!(out, fmt(&out), "aligned top-level trailing not idempotent:\n{}", out);
+}
+
 /// Parse a source string and return the parser diagnostics' messages (no panic on errors).
 fn parse_diagnostics(source: &str) -> Vec<String> {
     let mut lexer = lin_lex::Lexer::new(source, 0);

@@ -9,10 +9,7 @@ import { contains } from "std/string"
 val s = suite("template", [
   test("renders index.jinja filling all holes", () =>
     val out = render("examples/web-server/views/index.jinja", {
-      "title": "T",
-      "heading": "H",
-      "status": "ok",
-      "version": "1.0"
+      "title": "T", "heading": "H", "status": "ok", "version": "1.0"
     })
     [
       expect(out.contains("<title>T</title>")).toBe(true),
@@ -21,13 +18,9 @@ val s = suite("template", [
       expect(out.contains("Version: 1.0")).toBe(true)
     ]
   ),
-
   test("inherits base layout and includes the footer partial", () =>
     val out = render("examples/web-server/views/index.jinja", {
-      "title": "T",
-      "heading": "H",
-      "status": "ok",
-      "version": "1.0"
+      "title": "T", "heading": "H", "status": "ok", "version": "1.0"
     })
     [
       // <!DOCTYPE>/<body> come from base.jinja, not index.jinja — proves {% extends %}.
@@ -36,15 +29,13 @@ val s = suite("template", [
       expect(out.contains("<footer>Lin Web Server — v1.0</footer>")).toBe(true)
     ]
   ),
-
   test("leaves no unfilled {{ }} holes", () =>
     val out = render("examples/web-server/views/index.jinja", {
-      "title": "T",
-      "heading": "H",
-      "status": "ok",
-      "version": "1.0"
+      "title": "T", "heading": "H", "status": "ok", "version": "1.0"
     })
-    [expect(out.contains("{{")).toBe(false)]
-  )
+    [
+      expect(out.contains("{{")).toBe(false)
+    ]
+  ),
 ])
 run(s)

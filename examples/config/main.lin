@@ -4,6 +4,7 @@
 //
 // Run:   lin run examples/config/main.lin
 // Test:  lin test examples/config/
+
 import { load } from "./loader"
 import { print } from "std/io"
 import { toString } from "std/string"
@@ -13,9 +14,7 @@ import { jqFirst } from "std/jq"
 val show = (label: String, raw: Json): Null =>
   match load(raw)
     has { "type": "success", value } =>
-      print(
-        "${label}: ok host=${value["host"]} port=${toString(value["port"])} debug=${toString(value["debug"])} name=${value["name"]}"
-      )
+      print("${label}: ok host=${value["host"]} port=${toString(value["port"])} debug=${toString(value["debug"])} name=${value["name"]}")
     has { "type": "failure", error } => print("${label}: invalid — ${error}")
     else => print("${label}: ?")
 
@@ -23,12 +22,7 @@ val show = (label: String, raw: Json): Null =>
 show("minimal", { "name": "svc" })
 
 // Full override.
-show("override", {
-  "host": "0.0.0.0",
-  "port": 9090,
-  "debug": true,
-  "name": "api"
-})
+show("override", { "host": "0.0.0.0", "port": 9090, "debug": true, "name": "api" })
 
 // Missing the required `name` field.
 show("missing-name", { "port": 3000 })
@@ -41,7 +35,7 @@ show("bad-type", { "name": "svc", "port": "not-a-number" })
 val yamlSrc = "name: from-yaml\nhost: 10.0.0.1\nport: 7000\ndebug: true\n"
 match parse(yamlSrc)
   is Error => print("yaml: parse failed")
-  else => show("yaml", parse(yamlSrc))
+  else     => show("yaml", parse(yamlSrc))
 
 // Query the parsed config with a jq filter (the "yq" pattern: yaml.parse(...).jq(...)).
 // jqFirst returns the single matched value, or null if the path is absent.
