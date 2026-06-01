@@ -574,7 +574,18 @@ impl Parser {
                 fields.push(ObjectField::Pair(key, value));
             }
             if self.check(TokenKind::Comma) {
+                let comma_span = self.current_span();
                 self.advance();
+                self.skip_newlines();
+                // A comma immediately before the closing `}` is a trailing comma, which is
+                // not allowed in object literals (the formatter never emits one). Function
+                // calls still accept `f(x,)` for partial application — that's parse_call_args.
+                if self.check(TokenKind::RBrace) {
+                    self.diagnostics.push(Diagnostic::error(
+                        comma_span,
+                        "trailing comma is not allowed in object literals".to_string(),
+                    ));
+                }
             }
             self.skip_newlines();
         }
@@ -590,7 +601,17 @@ impl Parser {
         while !self.check(TokenKind::RBracket) && !self.is_at_end() {
             elements.push(self.parse_expr());
             if self.check(TokenKind::Comma) {
+                let comma_span = self.current_span();
                 self.advance();
+                self.skip_newlines();
+                // A comma immediately before the closing `]` is a trailing comma, which is
+                // not allowed in array literals (the formatter never emits one).
+                if self.check(TokenKind::RBracket) {
+                    self.diagnostics.push(Diagnostic::error(
+                        comma_span,
+                        "trailing comma is not allowed in array literals".to_string(),
+                    ));
+                }
             }
             self.skip_newlines();
         }

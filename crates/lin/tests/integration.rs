@@ -4172,6 +4172,32 @@ fn test_fmt_rule6_comment_hoist() {
     assert_eq!(out, fmt(&out), "Rule 6 not idempotent:\n{}", out);
 }
 
+/// Parse a source string and return the parser diagnostics' messages (no panic on errors).
+fn parse_diagnostics(source: &str) -> Vec<String> {
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    let mut parser = lin_parse::Parser::new(tokens);
+    let _ = parser.parse_module();
+    parser.diagnostics.iter().map(|d| d.message.clone()).collect()
+}
+
+#[test]
+fn test_fmt_rule3_parser_rejects_trailing_commas() {
+    // Rule 3 (parser half): a trailing comma in an array/object LITERAL is a parse error.
+    let arr = parse_diagnostics("val x = [1, 2,]\n");
+    assert!(arr.iter().any(|m| m.contains("trailing comma is not allowed in array")),
+        "array trailing comma not rejected: {:?}", arr);
+    let obj = parse_diagnostics("val o = { \"a\": 1, }\n");
+    assert!(obj.iter().any(|m| m.contains("trailing comma is not allowed in object")),
+        "object trailing comma not rejected: {:?}", obj);
+    // A function call `f(x,)` (partial application, ADR-041) is STILL accepted.
+    let call = parse_diagnostics("val g = f(x,)\n");
+    assert!(call.is_empty(), "f(x,) partial application must stay valid: {:?}", call);
+    // Non-trailing commas are fine.
+    assert!(parse_diagnostics("val x = [1, 2, 3]\n").is_empty());
+    assert!(parse_diagnostics("val o = { \"a\": 1, \"b\": 2 }\n").is_empty());
+}
+
 /// Count `//` occurrences in a string (proxy for comment count for the corpus sanity check).
 fn count_comments(s: &str) -> usize {
     s.matches("//").count()
