@@ -1307,7 +1307,7 @@ gains a stream branch that drives the pull-graph and produces the `Null | Error`
 every adapter re-check `is Error`, a **poisoned upstream makes every downstream adapter a passthrough**.
 The first read error propagates *as data* straight to the terminal op, which surfaces it as the
 `Null | Error` (`for`/`drain`) or `Promise<Null | Error>` (`promise`) result. This keeps the chain
-fluent — `readStream(p).lines().map(f).filter(g).writeStream(q).drain()` has no error handling at each
+fluent — `readStream(p).lines().map(f).filter(g).writeLines(q).drain()` has no error handling at each
 step, only at the terminal — and it short-circuits: once poisoned, no further reads or user callbacks
 run. It is the stream analog of the §20 value-based error convention: errors are ordinary values flowing
 through the graph, not exceptions.
@@ -1377,7 +1377,7 @@ own combinator-using helpers import the combinators back from `std/iter`.
 **Combinators are NOT dual-exported.** Exporting the same combinator from both `std/iter` and (say)
 `std/array`/`std/stream` was **rejected** as confusing — there must be exactly one source of each name.
 `std/stream` therefore **stopped exporting** `map`/`filter`/`take`/`for`/etc.; it keeps only
-stream-specific ops (`readStream`/`writeStream`/`drain`/`collect`/`readText`/`promise`/`close`/`lines`/
+stream-specific ops (`readStream`/`writeStream`/`writeLines`/`drain`/`collect`/`readText`/`promise`/`close`/`lines`/
 `linesMax`/`chunks`). A stream pipeline imports its combinators from `std/iter` and its sources/sinks
 from `std/stream`.
 

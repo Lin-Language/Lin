@@ -610,6 +610,34 @@ impl<'ctx> Codegen<'ctx> {
                 let fnv = self.get_or_declare_fn("lin_stream_flatten", ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(fnv, &[s.into()], "ir_stream_flatten").try_as_basic_value().unwrap_basic()
             }
+            // manifest(stream)/files(stream): (stream) → Stream<Object>. Single-stream-arg adapters
+            // (the parent is moved in), modelled on flatten.
+            Intrinsic::StreamManifest | Intrinsic::StreamFiles => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let name = match intrinsic {
+                    Intrinsic::StreamManifest => "lin_stream_manifest",
+                    _ => "lin_stream_files",
+                };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into()], "ir_stream_archive_adapt").try_as_basic_value().unwrap_basic()
+            }
+            // Streaming compression byte-adapters (std/compress): (stream) → Stream. Each wraps an
+            // upstream Stream<UInt8[]> in a (de)compressing adapter. Single-stream-arg shape,
+            // modelled on flatten.
+            Intrinsic::StreamGunzip
+            | Intrinsic::StreamGzip
+            | Intrinsic::StreamInflate
+            | Intrinsic::StreamDeflate => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let name = match intrinsic {
+                    Intrinsic::StreamGunzip => "lin_stream_gunzip",
+                    Intrinsic::StreamGzip => "lin_stream_gzip",
+                    Intrinsic::StreamInflate => "lin_stream_inflate",
+                    _ => "lin_stream_deflate",
+                };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into()], "ir_stream_compress").try_as_basic_value().unwrap_basic()
+            }
             // concat(a, b): (stream, stream) → Stream. BOTH streams are moved into the adapter.
             Intrinsic::StreamConcat => {
                 let a = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
@@ -617,10 +645,14 @@ impl<'ctx> Codegen<'ctx> {
                 let fnv = self.get_or_declare_fn("lin_stream_concat", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                 self.builder.call(fnv, &[a.into(), b.into()], "ir_stream_concat").try_as_basic_value().unwrap_basic()
             }
-            Intrinsic::StreamWrite => {
+            Intrinsic::StreamWrite | Intrinsic::StreamWriteLines => {
                 let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let path = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
-                let fnv = self.get_or_declare_fn("lin_stream_write", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                let name = match intrinsic {
+                    Intrinsic::StreamWriteLines => "lin_stream_write_lines",
+                    _ => "lin_stream_write",
+                };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                 self.builder.call(fnv, &[s.into(), path.into()], "ir_stream_write").try_as_basic_value().unwrap_basic()
             }
             // Terminal drivers (sync, calling thread). Each returns a boxed union value
@@ -679,6 +711,18 @@ impl<'ctx> Codegen<'ctx> {
                 } else { func };
                 let fnv = self.get_or_declare_fn("lin_stream_for", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                 self.builder.call(fnv, &[s.into(), func.into()], "ir_stream_for").try_as_basic_value().unwrap_basic()
+            }
+            // untar(stream, body) → lin_stream_untar(stream, closure) → boxed Null | Error. A TERMINAL
+            // driver taking a 2-arg body (meta, data); the closure may arrive boxed, unbox it like for.
+            Intrinsic::StreamUntar => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                let func = if Self::is_union_type(&func_ty) && func.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[func.into()], "ir_untar_cls").try_as_basic_value().unwrap_basic()
+                } else { func };
+                let fnv = self.get_or_declare_fn("lin_stream_untar", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), func.into()], "ir_stream_untar").try_as_basic_value().unwrap_basic()
             }
             // Stream terminals taking a single predicate/body closure: find/some/every/while →
             // (stream, closure) → boxed (X | Error). The closure may arrive boxed; unbox it.

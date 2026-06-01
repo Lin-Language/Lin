@@ -1,0 +1,85 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { readStream, collect, readText, writeStream, drain } from "std/stream"
+import { gzip, gunzip, deflate, inflate } from "std/compress"
+import { writeFile, readFile, writeFileBytes } from "std/fs"
+import { length } from "std/array"
+
+// Each test writes a plaintext fixture, compresses a stream over it to disk (as raw bytes), then
+// decompresses the on-disk compressed file back through a stream and asserts the round-trip.
+// Streams are affine (single-use), so a fresh stream is opened per stage.
+
+val plain = "/tmp/lin_compress_plain.txt"
+val gzPath = "/tmp/lin_compress_out.gz"
+val dfPath = "/tmp/lin_compress_out.deflate"
+
+// `collect` / `readText` return `X | Error`; unwrap the success arm (Error stands in as "err").
+val unwrapStr = (r: Json): String =>
+  match r
+    is Error => "err"
+    else => r
+
+val s = suite("std/compress", [
+  test("gzip then gunzip recovers the input (round-trip via disk)", () =>
+    writeFile(plain, "the quick brown fox jumps over the lazy dog")
+    // Compress the plaintext stream into the gzip container, write the raw bytes to disk.
+    val compressed = readStream(plain).gzip().collect()
+    writeFileBytes(gzPath, compressed)
+    // Decompress the on-disk gzip file back through a stream.
+    val recovered = readStream(gzPath).gunzip().readText()
+    [
+      expect(unwrapStr(recovered)).toBe("the quick brown fox jumps over the lazy dog")
+    ]
+  ),
+
+  test("gzip output starts with the gzip magic bytes", () =>
+    writeFile(plain, "hello gzip")
+    val compressed = readStream(plain).gzip().collect()
+    // gzip magic: 0x1f 0x8b.
+    [
+      expect(compressed[0]).toBe(31),
+      expect(compressed[1]).toBe(139)
+    ]
+  ),
+
+  test("deflate then inflate recovers the input (raw DEFLATE, via disk)", () =>
+    writeFile(plain, "round-trip through raw deflate with no gzip header")
+    val compressed = readStream(plain).deflate().collect()
+    writeFileBytes(dfPath, compressed)
+    val recovered = readStream(dfPath).inflate().readText()
+    [
+      expect(unwrapStr(recovered)).toBe("round-trip through raw deflate with no gzip header")
+    ]
+  ),
+
+  test("compressing a repetitive payload shrinks it", () =>
+    writeFile(plain, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    val original = readFile(plain)
+    val compressed = readStream(plain).gzip().collect()
+    [
+      // 64 highly-compressible bytes compress to well under their original size.
+      expect(length(compressed) < length(original)).toBe(true)
+    ]
+  ),
+
+  test("gunzip of non-gzip data surfaces an Error in-band", () =>
+    writeFile(plain, "this is plainly not gzip data")
+    val recovered = readStream(plain).gunzip().readText()
+    [
+      expect(recovered is Error).toBe(true)
+    ]
+  ),
+
+  // The raw `writeStream` sink must NOT inject newlines between the compressed chunks, or the
+  // on-disk gzip file would be corrupt. This proves the raw sink fixed the binary-write gap:
+  // gzip directly to a file via writeStream, then gunzip that file and recover the input.
+  test("gzip via writeStream then gunzip round-trips a valid gzip file", () =>
+    writeFile(plain, "the quick brown fox jumps over the lazy dog\nand a second line\n")
+    readStream(plain).gzip().writeStream(gzPath).drain()
+    val recovered = readStream(gzPath).gunzip().readText()
+    [
+      expect(unwrapStr(recovered)).toBe("the quick brown fox jumps over the lazy dog\nand a second line\n")
+    ]
+  )
+])
+
+run(s)
