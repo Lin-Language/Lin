@@ -10,7 +10,7 @@ import { toUInt64, toUInt32, toFloat64, toInt32 } from "std/number"
 val s = suite("bits", [
   test("packs and unpacks nibbles", () =>
     // --- Nibble packing ---
-    val b = packNibbles(10, 5)
+    val b = packNibbles(0xA, 0x5)
     [
       expect(b).toBe(165),
       expect(highNibble(b)).toBe(10),
@@ -18,14 +18,14 @@ val s = suite("bits", [
     ]),
   test(
     "masks the low nibble of its low argument",
-    () => [expect(packNibbles(1, 255)).toBe(31)]
+    () => [expect(packNibbles(0x1, 0xFF)).toBe(0x1F)]
   ),
   test("highNibble / lowNibble split a byte", () =>
     // high bits of `low` must be dropped
-    [expect(highNibble(171)).toBe(10), expect(lowNibble(171)).toBe(11)]),
+    [expect(highNibble(0xAB)).toBe(0xA), expect(lowNibble(0xAB)).toBe(0xB)]),
   test("extracts a NAL-type field (low 5 bits)", () =>
     // --- Field extraction ---
-    [expect(nalType(103)).toBe(7), expect(nalType(31)).toBe(31)]),
+    [expect(nalType(0x67)).toBe(7), expect(nalType(0x1F)).toBe(31)]),
   test("XOR checksum over a byte list", () =>
     // --- Checksum ---
     [
@@ -36,15 +36,15 @@ val s = suite("bits", [
   test("plain bitwise operators", () =>
     // --- Plain bitwise operators (the byte-language features bits.lin homes) ---
     [
-      expect(12 & 10).toBe(8),
-      expect(12 | 10).toBe(14),
-      expect(12 ^ 10).toBe(6),
+      expect(0b1100 & 0b1010).toBe(8),
+      expect(0b1100 | 0b1010).toBe(14),
+      expect(0b1100 ^ 0b1010).toBe(6),
       expect(1 << 4).toBe(16),
       expect(255 >> 4).toBe(15)
     ]),
   test("UInt8 flat array holds 0..255 unboxed", () =>
     // --- Flat-array element typing for small integer types ---
-    val buf: UInt8[] = [72, 73, 255]
+    val buf: UInt8[] = [0x48, 0x49, 0xFF]
     [expect(length(buf)).toBe(3), expect(buf[2]).toBe(255)]),
   test("Int8 flat array round-trips negatives", () =>
     val signed: Int8[] = [-1, -128, 127]

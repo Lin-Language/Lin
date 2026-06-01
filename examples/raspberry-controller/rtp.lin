@@ -35,8 +35,8 @@ val CLOCK_RATE = 90000
 export val TIMESTAMP_INCREMENT: UInt32 = 3000 // CLOCK_RATE / 30 (30 fps)
 
 // Byte-0 is constant (V=2, P=0, X=0, CC=0). Byte-1 is M-bit + payload type.
-val hdrNoMarker: UInt8[] = [128, 96] // 0x60 = PAYLOAD_TYPE (96)
-val hdrMarker: UInt8[] = [128, 224] // 0xE0 = 0x80 | 96
+val hdrNoMarker: UInt8[] = [0x80, 0x60] // 0x60 = PAYLOAD_TYPE (96)
+val hdrMarker: UInt8[] = [0x80, 0xE0] // 0xE0 = 0x80 | 96
 
 // Advance the timestamp by one frame period. (u32 wrap is not modelled — frames
 // would have to run for ~16 hours at 30fps before TIMESTAMP_INCREMENT overflows.)
@@ -78,10 +78,10 @@ val makeSingleNal = (seq: UInt16, ts: UInt32, ssrc: UInt32, nal: UInt8[], marker
 // Compose the [FU-indicator, FU-header] two-byte prefix for an FU-A fragment.
 // fu_indicator = (nal[0] & 0x60) | 28 ; fu_header = (nal[0] & 0x1F) | start | end.
 val fuPrefix = (nalHdr: UInt8, first: Boolean, last: Boolean): UInt8[] =>
-  val nri: UInt8 = nalHdr & 96
-  val nt: UInt8 = nalHdr & 31
-  val withStart: UInt8 = if first then toUInt8(nt | 128) else nt
-  val withEnd: UInt8 = if last then toUInt8(withStart | 64) else withStart
+  val nri: UInt8 = nalHdr & 0x60
+  val nt: UInt8 = nalHdr & 0x1F
+  val withStart: UInt8 = if first then toUInt8(nt | 0x80) else nt
+  val withEnd: UInt8 = if last then toUInt8(withStart | 0x40) else withStart
   val fuInd: UInt8 = toUInt8(nri | 28)
   [fuInd, withEnd]
 

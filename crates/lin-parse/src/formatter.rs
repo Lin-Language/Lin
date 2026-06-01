@@ -12,7 +12,7 @@
 /// comment side channel handy.
 
 use crate::ast::*;
-use lin_common::NumSuffix;
+use lin_common::{NumSuffix, Span};
 use lin_lex::Comment;
 use std::collections::HashMap;
 use std::cell::RefCell;
@@ -665,6 +665,68 @@ fn format_float(f: f64) -> String {
 }
 
 /// The source spelling of a numeric type suffix, for round-tripping in the formatter.
+/// Render an integer literal, PRESERVING a radix-prefixed source spelling (`0xFF`, `0b1010`,
+/// `0o17`) so the author's intent isn't flattened to decimal (e.g. `0x0F` must not become `15`).
+/// The lexer discards the radix (it stores only the value), so we recover the spelling from the
+/// original source at the literal's span. We use the source spelling only when it is genuinely a
+/// radix-prefixed literal whose value matches `n` — this guards against synthetic IntLit nodes
+/// (e.g. the `0` in unary-minus desugaring, whose span points at `-`) and any value mismatch,
+/// falling back to plain decimal. Decimal literals are always rendered as decimal.
+fn fmt_int_lit(n: i64, suffix: &Option<NumSuffix>, span: &Span) -> String {
+    if let Some(spelled) = radix_spelling_at(span, n) {
+        format!("{}{}", spelled, suffix_str(suffix))
+    } else {
+        format!("{}{}", n, suffix_str(suffix))
+    }
+}
+
+/// If the source text at `span` is a radix-prefixed integer literal (`0x`/`0b`/`0o`, optional
+/// leading `-`, optional `_` digit separators, optional type suffix) whose value equals `n`,
+/// return its digit spelling INCLUDING the prefix (and sign), without the type suffix. Else None.
+fn radix_spelling_at(span: &Span, n: i64) -> Option<String> {
+    SOURCE_CHARS.with(|src_c| {
+        let src = src_c.borrow();
+        if src.is_empty() {
+            return None;
+        }
+        let (s, e) = (span.start as usize, span.end as usize);
+        if e > src.len() || s >= e {
+            return None;
+        }
+        let text: String = src[s..e].iter().collect();
+        let body = text.trim();
+        let (neg, digits) = match body.strip_prefix('-') {
+            Some(rest) => (true, rest.trim_start()),
+            None => (false, body),
+        };
+        // Strip an optional type suffix (i8/u32/…) so just the numeric part remains.
+        let core = digits.split(|c: char| c == 'i' || c == 'u').next().unwrap_or(digits);
+        let lower = core.to_ascii_lowercase();
+        let (radix, rest) = if let Some(r) = lower.strip_prefix("0x") {
+            (16u32, r)
+        } else if let Some(r) = lower.strip_prefix("0b") {
+            (2, r)
+        } else if let Some(r) = lower.strip_prefix("0o") {
+            (8, r)
+        } else {
+            return None; // decimal — render as decimal
+        };
+        let cleaned = rest.replace('_', "");
+        if cleaned.is_empty() {
+            return None;
+        }
+        // Verify the spelling actually denotes `n` (using the original-case core digits).
+        let parsed = i64::from_str_radix(&cleaned, radix).ok()?;
+        let value = if neg { parsed.checked_neg()? } else { parsed };
+        if value != n {
+            return None;
+        }
+        // Re-emit the prefix + original digits (preserve author case, drop `_`? keep them).
+        let core_digits = core.trim();
+        Some(if neg { format!("-{}", core_digits) } else { core_digits.to_string() })
+    })
+}
+
 fn suffix_str(suffix: &Option<NumSuffix>) -> &'static str {
     match suffix {
         None => "",
@@ -853,7 +915,7 @@ fn is_atomic(expr: &Expr) -> bool {
 /// the expression fits on one line.
 fn fmt_inline(expr: &Expr) -> String {
     match expr {
-        Expr::IntLit(n, suffix, _) => format!("{}{}", n, suffix_str(suffix)),
+        Expr::IntLit(n, suffix, span) => fmt_int_lit(*n, suffix, span),
         Expr::FloatLit(f, suffix, _) => format!("{}{}", format_float(*f), suffix_str(suffix)),
         Expr::StringLit(s, _) => format!("\"{}\"", escape_string(s)),
         Expr::BoolLit(b, _) => b.to_string(),
@@ -1060,7 +1122,7 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
 
     match expr {
         // ── atomics ───────────────────────────────────────────────────────────
-        Expr::IntLit(n, suffix, _) => format!("{}{}", n, suffix_str(suffix)),
+        Expr::IntLit(n, suffix, span) => fmt_int_lit(*n, suffix, span),
         Expr::FloatLit(f, suffix, _) => format!("{}{}", format_float(*f), suffix_str(suffix)),
         Expr::StringLit(s, _) => format!("\"{}\"", escape_string(s)),
         Expr::BoolLit(b, _) => b.to_string(),

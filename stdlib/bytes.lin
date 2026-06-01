@@ -41,28 +41,28 @@ export val u64FromLe = (b: UInt8[], off: Int32): UInt64 =>
 
 // --- big-endian writes -----------------------------------------------------
 export val u16ToBe = (v: UInt16): UInt8[] =>
-  val b0: UInt8 = toUInt8(v >> 8 & 255)
-  val b1: UInt8 = toUInt8(v & 255)
+  val b0: UInt8 = toUInt8(v >> 8 & 0xFF)
+  val b1: UInt8 = toUInt8(v & 0xFF)
   val out: UInt8[] = [b0, b1]
   out
 
 export val u32ToBe = (v: UInt32): UInt8[] =>
-  val b0: UInt8 = toUInt8(v >> 24 & 255)
-  val b1: UInt8 = toUInt8(v >> 16 & 255)
-  val b2: UInt8 = toUInt8(v >> 8 & 255)
-  val b3: UInt8 = toUInt8(v & 255)
+  val b0: UInt8 = toUInt8(v >> 24 & 0xFF)
+  val b1: UInt8 = toUInt8(v >> 16 & 0xFF)
+  val b2: UInt8 = toUInt8(v >> 8 & 0xFF)
+  val b3: UInt8 = toUInt8(v & 0xFF)
   val out: UInt8[] = [b0, b1, b2, b3]
   out
 
 export val u64ToBe = (v: UInt64): UInt8[] =>
-  val b0: UInt8 = toUInt8(v >> 56 & 255)
-  val b1: UInt8 = toUInt8(v >> 48 & 255)
-  val b2: UInt8 = toUInt8(v >> 40 & 255)
-  val b3: UInt8 = toUInt8(v >> 32 & 255)
-  val b4: UInt8 = toUInt8(v >> 24 & 255)
-  val b5: UInt8 = toUInt8(v >> 16 & 255)
-  val b6: UInt8 = toUInt8(v >> 8 & 255)
-  val b7: UInt8 = toUInt8(v & 255)
+  val b0: UInt8 = toUInt8(v >> 56 & 0xFF)
+  val b1: UInt8 = toUInt8(v >> 48 & 0xFF)
+  val b2: UInt8 = toUInt8(v >> 40 & 0xFF)
+  val b3: UInt8 = toUInt8(v >> 32 & 0xFF)
+  val b4: UInt8 = toUInt8(v >> 24 & 0xFF)
+  val b5: UInt8 = toUInt8(v >> 16 & 0xFF)
+  val b6: UInt8 = toUInt8(v >> 8 & 0xFF)
+  val b7: UInt8 = toUInt8(v & 0xFF)
   val out: UInt8[] = [
     b0,
     b1,
@@ -77,28 +77,28 @@ export val u64ToBe = (v: UInt64): UInt8[] =>
 
 // --- little-endian writes --------------------------------------------------
 export val u16ToLe = (v: UInt16): UInt8[] =>
-  val b0: UInt8 = toUInt8(v & 255)
-  val b1: UInt8 = toUInt8(v >> 8 & 255)
+  val b0: UInt8 = toUInt8(v & 0xFF)
+  val b1: UInt8 = toUInt8(v >> 8 & 0xFF)
   val out: UInt8[] = [b0, b1]
   out
 
 export val u32ToLe = (v: UInt32): UInt8[] =>
-  val b0: UInt8 = toUInt8(v & 255)
-  val b1: UInt8 = toUInt8(v >> 8 & 255)
-  val b2: UInt8 = toUInt8(v >> 16 & 255)
-  val b3: UInt8 = toUInt8(v >> 24 & 255)
+  val b0: UInt8 = toUInt8(v & 0xFF)
+  val b1: UInt8 = toUInt8(v >> 8 & 0xFF)
+  val b2: UInt8 = toUInt8(v >> 16 & 0xFF)
+  val b3: UInt8 = toUInt8(v >> 24 & 0xFF)
   val out: UInt8[] = [b0, b1, b2, b3]
   out
 
 export val u64ToLe = (v: UInt64): UInt8[] =>
-  val b0: UInt8 = toUInt8(v & 255)
-  val b1: UInt8 = toUInt8(v >> 8 & 255)
-  val b2: UInt8 = toUInt8(v >> 16 & 255)
-  val b3: UInt8 = toUInt8(v >> 24 & 255)
-  val b4: UInt8 = toUInt8(v >> 32 & 255)
-  val b5: UInt8 = toUInt8(v >> 40 & 255)
-  val b6: UInt8 = toUInt8(v >> 48 & 255)
-  val b7: UInt8 = toUInt8(v >> 56 & 255)
+  val b0: UInt8 = toUInt8(v & 0xFF)
+  val b1: UInt8 = toUInt8(v >> 8 & 0xFF)
+  val b2: UInt8 = toUInt8(v >> 16 & 0xFF)
+  val b3: UInt8 = toUInt8(v >> 24 & 0xFF)
+  val b4: UInt8 = toUInt8(v >> 32 & 0xFF)
+  val b5: UInt8 = toUInt8(v >> 40 & 0xFF)
+  val b6: UInt8 = toUInt8(v >> 48 & 0xFF)
+  val b7: UInt8 = toUInt8(v >> 56 & 0xFF)
   val out: UInt8[] = [
     b0,
     b1,

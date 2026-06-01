@@ -72,24 +72,24 @@ val s = suite("raspberry-controller integration", [
       0,
       0,
       1,
-      103,
-      170,
-      187,
+      0x67,
+      0xAA,
+      0xBB,
       0,
       0,
       0,
       1,
-      104,
-      204,
+      0x68,
+      0xCC,
       0,
       0,
       0,
       1,
-      65
+      0x41
     ]
     val nals: NalUnit[] = parseNals(buf) // emits 2 complete NALs
     val firstNal: UInt8[] = nals[0]["data"]
-    val packets = packetize(0, 0, 305419896, firstNal, false)
+    val packets = packetize(0, 0, 0x12345678, firstNal, false)
     val seqAfter = nextSequence(0, firstNal)
     val pkt: UInt8[] = packets[0]
     [
@@ -97,9 +97,9 @@ val s = suite("raspberry-controller integration", [
       expect(nals[0]["nalType"]).toBe(7),
       expect(nals[1]["nalType"]).toBe(8),
       expect(length(packets)).toBe(1),
-      expect(pkt[0]).toBe(128),
-      expect(pkt[8]).toBe(18),
-      expect(pkt[12]).toBe(103),
+      expect(pkt[0]).toBe(0x80),
+      expect(pkt[8]).toBe(0x12),
+      expect(pkt[12]).toBe(0x67),
       expect(seqAfter).toBe(1)
     ])
 ])
