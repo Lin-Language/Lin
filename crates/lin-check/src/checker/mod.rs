@@ -172,6 +172,24 @@ impl Checker {
         is_compatible_env(value, target, Some(&self.env), self.lenient_json, &mut 0)
     }
 
+    /// Argument compatibility for a (non-dot) function call. Identical to `types_compatible`
+    /// except it additionally accepts an `Iterator<T>` argument where an `Array<U>` parameter
+    /// is expected (elements compatible). The standard iterator functions (`map`/`filter`/
+    /// `reduce`/…) are specified to accept "an array or an `Iterator<T>`" (spec §17.6), and the
+    /// dot form `it.map(f)` already does — its arg-binding path never runs the strict array
+    /// check. This makes the equivalent free-call form `map(it, f)` accept the same arguments,
+    /// so `f(x, y)` and `x.f(y)` agree (the lowering handles either iterable identically). The
+    /// leniency is confined to call arguments — plain assignment (`val a: T[] = someIterator`)
+    /// still rejects, since an iterator is not indexable.
+    pub(crate) fn arg_compatible(&self, value: &Type, target: &Type) -> bool {
+        if let (Type::Iterator(v_elem), Type::Array(t_elem)) = (value, target) {
+            if self.types_compatible(v_elem, t_elem) {
+                return true;
+            }
+        }
+        self.types_compatible(value, target)
+    }
+
     /// Collect all TypeVar IDs recursively from a type into `out`.
     fn collect_typevar_ids(ty: &Type, out: &mut std::collections::HashSet<u32>) {
         match ty {

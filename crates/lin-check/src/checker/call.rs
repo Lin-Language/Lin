@@ -270,7 +270,7 @@ impl Checker {
                     typed_args.iter().zip(concrete_params.iter()).enumerate()
                 {
                     let arg_ty = arg.ty();
-                    if !self.types_compatible(&arg_ty, param_ty) {
+                    if !self.arg_compatible(&arg_ty, param_ty) {
                         return Err(Diagnostic::error(
                             args[i].span(),
                             format!(

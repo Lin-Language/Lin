@@ -810,6 +810,19 @@ val s = suite("std/array", [
       expect(b.toString()).toBe("[\"a\", \"b\", null]")
     ]
   ),
+
+  test("arrayAllocateFilled with a concrete scalar element type is flat and correct", () =>
+    // An annotated scalar element type must allocate a FLAT array matching the flat read path
+    // (a tagged array read flat returns garbage). `set` then writes the same representation.
+    val a: Int32[] = arrayAllocateFilled(4, 7)
+    set(a, 1, 99)
+    val f: Float64[] = arrayAllocateFilled(2, 1.5)
+    set(f, 0, 2.5)
+    [
+      expect(a.toString()).toBe("[7, 99, 7, 7]"),
+      expect(f.toString()).toBe("[2.5, 1.5]")
+    ]
+  ),
 ])
 
 run(s)

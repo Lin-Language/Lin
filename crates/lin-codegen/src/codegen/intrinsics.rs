@@ -637,15 +637,21 @@ impl<'ctx> Codegen<'ctx> {
                     } else {
                         self.build_tagged_val_alloca(&fill_val, &fill_ty)
                     };
+                    // Does the fill carry a heap (refcounted) payload? A boxed union/Json arrives as
+                    // a TaggedVal* that may wrap one; a CONCRETE heap type (String/Array/Object/
+                    // Function — `ty_is_concrete_rc`) also does. Either way the SAME heap value is
+                    // stored into all n slots, and `lin_array_release` will release each slot's
+                    // payload, so each slot needs its OWN reference. A flat scalar / Bool / Null fill
+                    // carries no heap payload and needs no retain. (Before generics, `arrayAllocateFilled`
+                    // was `(n, fill: Json)`, so this was ALWAYS the boxed-union case; a monomorphized
+                    // concrete heap fill like `arrayAllocateFilled(3, [1,2])` now hits the concrete-rc
+                    // branch — without this retain, releasing the result double-freed the shared array.)
+                    let fill_has_heap_payload = is_boxed_union || Self::ty_is_concrete_rc(&fill_ty);
                     let set_fn = self.get_or_declare_fn("lin_array_set",
                         self.context.void_type().fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
                     // `lin_array_set` raw-copies the 16-byte TaggedVal into the slot WITHOUT
-                    // retaining the inner payload (it CONSUMES one owning reference). We store the
-                    // SAME box into all n slots, so each slot needs its own reference to the inner
-                    // heap value: retain the inner once per iteration. (A concrete scalar has no
-                    // heap payload, so no retain — `lin_tagged_retain` is a no-op there anyway, but
-                    // we only have a stack TaggedVal in that case, so guard on the boxed-union case.)
-                    // The caller's original borrowed reference is left intact for its own scope.
+                    // retaining the inner payload (it CONSUMES one owning reference). The caller's
+                    // original borrowed reference is left intact for its own scope.
                     let retain_fn = self.get_or_declare_fn("lin_tagged_retain",
                         self.context.void_type().fn_type(&[ptr_ty.into()], false));
                     let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
@@ -660,7 +666,7 @@ impl<'ctx> Codegen<'ctx> {
                     let cond = self.builder.int_compare(inkwell::IntPredicate::SLT, cur, n_i64, "ir_fill_cond");
                     self.builder.conditional_branch(cond, body, exit);
                     self.builder.position_at_end(body);
-                    if is_boxed_union {
+                    if fill_has_heap_payload {
                         self.builder.call(retain_fn, &[tagged.into()], "");
                     }
                     self.builder.call(set_fn, &[arr.into(), cur.into(), tagged.into()], "");

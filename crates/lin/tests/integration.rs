@@ -2359,6 +2359,87 @@ print(buf.toString())
 }
 
 #[test]
+fn test_array_allocate_filled_flat_scalar_annotated() {
+    // Regression: `val a: Int32[] = arrayAllocateFilled(n, v)` (a CONCRETE scalar element type
+    // via an annotation) must allocate a FLAT unboxed array, matching the flat read path. The
+    // wrapper used to be `(n, fill: Json): Json` — erasing the element type, so it always built
+    // a TAGGED array while the `Int32[]`-typed reader read it flat, reinterpreting 16-byte
+    // TaggedVal slots as packed scalars (garbage). Making the wrapper generic (`<T>(n, fill: T):
+    // T[]`) lets the concrete element type reach the allocator. Covers fill, in-place `set`, and
+    // a wider scalar (Int64) so a slot-size mismatch would corrupt neighbours.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { arrayAllocateFilled, set } from "std/array"
+
+val a: Int32[] = arrayAllocateFilled(4, 7)
+set(a, 1, 99)
+print("${toString(a[0])},${toString(a[1])},${toString(a[2])},${toString(a[3])}")
+
+val b: Float64[] = arrayAllocateFilled(2, 1.5)
+set(b, 0, 2.5)
+print("${toString(b[0])},${toString(b[1])}")
+
+val c: Int64[] = arrayAllocateFilled(2, 7i64)
+set(c, 0, 5000000000i64)
+print("${toString(c[0])},${toString(c[1])}")
+"#);
+    assert_eq!(output, vec!["7,99,7,7", "2.5,1.5", "5000000000,7"]);
+}
+
+#[test]
+fn test_array_allocate_filled_concrete_heap_no_double_free() {
+    // Regression (heap UAF): `arrayAllocateFilled(n, <heap value>)` stores the SAME heap value
+    // into all n slots, so each slot needs its own reference — else releasing the result frees
+    // the shared value n times (double-free / heap-use-after-free, caught by ASan, intermittent
+    // under cargo test). When the wrapper became generic, a CONCRETE heap fill (`[1,2]`, a
+    // `String`) monomorphized to a non-union element type and bypassed the per-slot retain that
+    // the old `fill: Json` path always took. The fix retains per slot for any heap-payload fill
+    // (`ty_is_concrete_rc` || boxed union). This builds and DROPS such arrays in a loop so a
+    // missing retain corrupts the heap; correctness of the printed values is the visible check.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { arrayAllocateFilled, range, for } from "std/array"
+
+val make = (): Null =>
+  val arrs = arrayAllocateFilled(3, [1, 2])
+  val strs = arrayAllocateFilled(2, "shared")
+  print("${arrs[0].toString()} ${strs[1]}")
+
+range(0, 4).for(_ => make())
+print("ok")
+"#);
+    assert_eq!(
+        output,
+        vec!["[1, 2] shared", "[1, 2] shared", "[1, 2] shared", "[1, 2] shared", "ok"]
+    );
+}
+
+#[test]
+fn test_iterator_arg_to_array_param_free_call() {
+    // Regression: the free-function form `map(range(0,n), f)` rejected a `range` result
+    // (`Iterator<Int32>`) against `map`'s `T[]` param with "Argument 1 has type Iterator<Int32>,
+    // expected Int32[]" (and a spurious "Undefined variable" cascade from the dropped binding),
+    // even though the equivalent dot form `range(0,n).map(f)` was accepted and the spec (§17.6)
+    // says the iterator functions accept "an array or an Iterator<T>". A function call argument
+    // of `Iterator<T>` is now accepted where an `Array<U>` param is expected, so `f(x,y)` and
+    // `x.f(y)` agree. Plain assignment (`val a: Int32[] = range(..)`) still rejects.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter, reduce, range, length } from "std/array"
+
+val a = map(range(0, 5), i => i * 10)
+print("${toString(length(a))} ${toString(a[0])} ${toString(a[4])}")
+
+val b = filter(range(0, 6), i => i % 2 == 0)
+print("${toString(length(b))} ${toString(b[0])} ${toString(b[2])}")
+
+val s = reduce(range(1, 5), 0, (acc, i) => acc + i)
+print(toString(s))
+"#);
+    assert_eq!(output, vec!["5 0 40", "3 0 4", "10"]);
+}
+
+#[test]
 fn test_keys_values_entries() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
