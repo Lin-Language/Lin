@@ -7698,3 +7698,118 @@ print(readFile("x"))
         err
     );
 }
+
+// -----------------------------------------------------------------------------
+// `lin check` resolves imports (regression: it previously type-checked the bare
+// parsed module without loading imports, so any error that depended on an
+// imported symbol's real type was silently accepted — `check` passed programs
+// that `build` correctly rejected).
+// -----------------------------------------------------------------------------
+
+/// Run `lin check <file>` on `source`. Returns (success, combined stderr+stdout).
+fn check_source(source: &str) -> (bool, String) {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_check_{}.lin", id));
+    fs::write(&src_path, source).unwrap();
+
+    let out = Command::new(lin_bin())
+        .args(["check", src_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+
+    let _ = fs::remove_file(&src_path);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    (out.status.success(), combined)
+}
+
+/// Run `lin build <file>` on `source` (no run). Returns whether it compiled.
+fn build_succeeds(source: &str) -> bool {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_build_only_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_build_only_{}", id));
+    fs::write(&src_path, source).unwrap();
+
+    let out = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary");
+
+    let _ = fs::remove_file(&src_path);
+    let _ = fs::remove_file(&bin_path);
+    out.status.success()
+}
+
+#[test]
+fn test_check_rejects_import_dependent_type_error() {
+    // `trim` is imported as `(s: String): String`; calling it with an Int32 is a type error
+    // that is only visible once the import has been resolved.
+    let (ok, output) = check_source(
+        r#"import { trim } from "std/string"
+val x = trim(42)
+"#,
+    );
+    assert!(
+        !ok,
+        "expected `lin check` to reject trim(42), but it passed:\n{}",
+        output
+    );
+    assert!(
+        output.contains("expected String"),
+        "expected an argument-type error, got:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_check_accepts_valid_imported_symbol_program() {
+    let (ok, output) = check_source(
+        r#"import { trim } from "std/string"
+import { print } from "std/io"
+val x = trim("  hi  ")
+print(x)
+"#,
+    );
+    assert!(
+        ok,
+        "expected `lin check` to accept a valid imported-symbol program, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("Type check passed"),
+        "expected success message, got:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_check_and_build_agree_on_import_dependent_case() {
+    // The bad program: both `check` and `build` must reject it.
+    let bad = r#"import { trim } from "std/string"
+val x = trim(42)
+"#;
+    let (check_ok, _) = check_source(bad);
+    let build_ok = build_succeeds(bad);
+    assert!(!check_ok, "check should reject the bad program");
+    assert!(!build_ok, "build should reject the bad program");
+    assert_eq!(check_ok, build_ok, "check and build must agree (reject)");
+
+    // The good program: both must accept it.
+    let good = r#"import { trim } from "std/string"
+import { print } from "std/io"
+val x = trim("  hi  ")
+print(x)
+"#;
+    let (check_ok, check_out) = check_source(good);
+    let build_ok = build_succeeds(good);
+    assert!(check_ok, "check should accept the good program:\n{}", check_out);
+    assert!(build_ok, "build should accept the good program");
+    assert_eq!(check_ok, build_ok, "check and build must agree (accept)");
+}
