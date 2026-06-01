@@ -1,20 +1,26 @@
-// report — a CSV → validated report generator. Reads "name,score" rows, validates
-// them, computes statistics, and prints a text report (skipping malformed rows).
-// A realistic data-pipeline exercising map/filter/reduce/sort over heap records.
+// report — a CSV → validated report generator. Reads "name,score" rows from a
+// gzipped tar of CSV files, validates them, computes statistics, and prints a text
+// report (skipping malformed rows). A realistic data-pipeline exercising
+// map/filter/reduce/sort over heap records — fed by a streaming, constant-memory
+// decompress + untar of the input archive (see source.lin).
 //
 // Run:   lin run examples/report/main.lin
 // Test:  lin test examples/report/
 
 import { render } from "./report"
+import { rowsFromArchive, archiveMembers } from "./source"
 import { print } from "std/io"
+import { join } from "std/string"
 
-val lines = [
-  "Alice, 85",
-  "Bob, 92",
-  "bad-row",
-  "Charlie, 78",
-  ", 50",
-  "Diana, 100"
-]
+// The input is a gzipped tar of CSV files (committed beside this example). It is
+// decompressed and split member-by-member with bounded memory — no step ever holds
+// the whole archive (or even a whole member) more than momentarily.
+val archive = "examples/report/report-data.tar.gz"
 
+// First, a cheap listing pass: what CSV files does the archive hold? (`manifest`
+// reads each tar header and skips the body, so this extracts nothing.)
+print("input archive members: ${archiveMembers(archive).join(", ")}")
+
+// Then the real pass: stream every CSV row out of every member and render the report.
+val lines = rowsFromArchive(archive)
 print(render(lines))
