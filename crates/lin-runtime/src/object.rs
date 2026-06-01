@@ -3,20 +3,44 @@ use crate::string::LinString;
 use crate::tagged::TaggedVal;
 
 /// Dynamic object (Json-typed) represented as an array of key-value pairs.
-/// Layout: refcount (u32) | len (u32) | cap (u32) | _pad (u32) | entries (*mut LinObjectEntry)
+/// Layout: refcount (u32) | len (u32) | cap (u32) | flags (u32) | entries (*mut LinObjectEntry)
+///
+/// SINGLE-ALLOCATION optimization: a freshly-`alloc`'d object places its entries buffer
+/// *immediately after the header in the same allocation* (`entries` points just past the
+/// header) and sets `FLAG_INLINE`. This halves the per-object allocator traffic (1 malloc/free
+/// instead of header + separate entries) and co-locates header + entries on the same cache line
+/// — a big win for record-heavy code that builds millions of small objects. The `entries`
+/// pointer field is RETAINED (not removed), so every reader/writer is unchanged: they keep
+/// loading `(*obj).entries` and indexing it. On the rare GROW, an inline object MIGRATES its
+/// entries to a separate heap buffer (clearing `FLAG_INLINE`); the *header* never moves, so
+/// shared `LinObject*` holders stay valid (they already re-read `(*obj).entries` each access).
 #[repr(C)]
 pub struct LinObject {
     pub refcount: u32,
     pub len: u32,
     pub cap: u32,
-    _pad: u32,
+    flags: u32,
     pub entries: *mut LinObjectEntry,
 }
+
+/// `flags` bit: the entries buffer is inline (part of the header allocation), so it must NOT be
+/// freed separately and a grow must migrate it to a heap buffer first.
+const FLAG_INLINE: u32 = 1;
 
 #[repr(C)]
 pub struct LinObjectEntry {
     pub key: *mut LinString,
     pub value: TaggedVal,
+}
+
+/// Layout for a one-block object: the `LinObject` header followed by `cap` inline entries.
+unsafe fn inline_object_layout(cap: u32) -> Layout {
+    let size = std::mem::size_of::<LinObject>()
+        + std::mem::size_of::<LinObjectEntry>() * cap as usize;
+    // Both types are 8-aligned; the header size is a multiple of the entry alignment so the
+    // inline entries start correctly aligned right after it.
+    let align = std::mem::align_of::<LinObject>().max(std::mem::align_of::<LinObjectEntry>());
+    Layout::from_size_align_unchecked(size, align)
 }
 
 unsafe fn object_layout() -> Layout {
@@ -33,19 +57,42 @@ unsafe fn entries_layout(cap: u32) -> Layout {
     )
 }
 
+/// Pointer to the inline entries region (immediately past the header).
+#[inline]
+unsafe fn inline_entries_ptr(obj: *mut LinObject) -> *mut LinObjectEntry {
+    (obj as *mut u8).add(std::mem::size_of::<LinObject>()) as *mut LinObjectEntry
+}
+
+/// Migrate an inline-entries object to a separately-heap-allocated entries buffer of `new_cap`
+/// (copying the existing `len` entries by raw bytes — ownership of keys/values moves with them).
+/// Clears `FLAG_INLINE`. Used on the first grow of an inline object. The header does not move.
+#[inline]
+unsafe fn migrate_inline_to_heap(obj: *mut LinObject, new_cap: u32) {
+    let len = (*obj).len as usize;
+    let buf = alloc(entries_layout(new_cap)) as *mut LinObjectEntry;
+    if len > 0 {
+        std::ptr::copy_nonoverlapping(inline_entries_ptr(obj), buf, len);
+    }
+    (*obj).entries = buf;
+    (*obj).cap = new_cap;
+    (*obj).flags &= !FLAG_INLINE;
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_object_alloc(initial_cap: u32) -> *mut LinObject {
-    // Honor the caller's exact capacity hint (codegen now passes the literal's field count for
-    // the no-spread case, so a 3-field literal allocates 3 entries rather than over-allocating).
-    // Keep a minimum of 1 so the entries buffer is never a zero-size allocation (UB), and so the
-    // grow path's `cap * 2` always makes progress (an empty `{}` asks for 0 → cap 1).
+    // Honor the caller's exact capacity hint (codegen passes the literal's field count for the
+    // no-spread case, so a 3-field literal allocates 3 entries). Keep a minimum of 1 so the
+    // entries region is never zero-size and the grow path's `cap * 2` always makes progress.
+    //
+    // SINGLE ALLOCATION: header + `cap` entries in one block; `entries` points just past the
+    // header; FLAG_INLINE set. One malloc instead of two, header+entries on one cache line.
     let cap = initial_cap.max(1);
-    let ptr = alloc(object_layout()) as *mut LinObject;
+    let ptr = alloc(inline_object_layout(cap)) as *mut LinObject;
     (*ptr).refcount = 1;
     (*ptr).len = 0;
     (*ptr).cap = cap;
-    (*ptr)._pad = 0;
-    (*ptr).entries = alloc(entries_layout(cap)) as *mut LinObjectEntry;
+    (*ptr).flags = FLAG_INLINE;
+    (*ptr).entries = inline_entries_ptr(ptr);
     ptr
 }
 
@@ -169,10 +216,16 @@ pub unsafe extern "C" fn lin_object_set(obj: *mut LinObject, key: *mut LinString
     let cap = (*obj).cap;
     if len == cap {
         let new_cap = cap * 2;
-        let old_layout = entries_layout(cap);
-        let new_layout = entries_layout(new_cap);
-        (*obj).entries = realloc((*obj).entries as *mut u8, old_layout, new_layout.size()) as *mut LinObjectEntry;
-        (*obj).cap = new_cap;
+        if (*obj).flags & FLAG_INLINE != 0 {
+            // Inline entries can't be realloc'd in place (they're part of the header block, and
+            // the header must not move). Migrate to a separate heap buffer of the new capacity.
+            migrate_inline_to_heap(obj, new_cap);
+        } else {
+            let old_layout = entries_layout(cap);
+            let new_layout = entries_layout(new_cap);
+            (*obj).entries = realloc((*obj).entries as *mut u8, old_layout, new_layout.size()) as *mut LinObjectEntry;
+            (*obj).cap = new_cap;
+        }
     }
     let slot = (*obj).entries.add(len as usize);
     // Retain the key: the object owns one reference.
@@ -211,10 +264,14 @@ pub unsafe extern "C" fn lin_object_set_fresh(obj: *mut LinObject, key: *mut Lin
     let cap = (*obj).cap;
     if len == cap {
         let new_cap = if cap == 0 { 1 } else { cap * 2 };
-        let old_layout = entries_layout(cap);
-        let new_layout = entries_layout(new_cap);
-        (*obj).entries = realloc((*obj).entries as *mut u8, old_layout, new_layout.size()) as *mut LinObjectEntry;
-        (*obj).cap = new_cap;
+        if (*obj).flags & FLAG_INLINE != 0 {
+            migrate_inline_to_heap(obj, new_cap);
+        } else {
+            let old_layout = entries_layout(cap);
+            let new_layout = entries_layout(new_cap);
+            (*obj).entries = realloc((*obj).entries as *mut u8, old_layout, new_layout.size()) as *mut LinObjectEntry;
+            (*obj).cap = new_cap;
+        }
     }
     let slot = (*obj).entries.add(len as usize);
     // inc_ref is a no-op for interned literal keys (saturated refcount).
@@ -235,10 +292,14 @@ pub unsafe fn object_push_owned(obj: *mut LinObject, key: *mut LinString, value:
     let cap = (*obj).cap;
     if len == cap {
         let new_cap = cap * 2;
-        let old_layout = entries_layout(cap);
-        let new_layout = entries_layout(new_cap);
-        (*obj).entries = realloc((*obj).entries as *mut u8, old_layout, new_layout.size()) as *mut LinObjectEntry;
-        (*obj).cap = new_cap;
+        if (*obj).flags & FLAG_INLINE != 0 {
+            migrate_inline_to_heap(obj, new_cap);
+        } else {
+            let old_layout = entries_layout(cap);
+            let new_layout = entries_layout(new_cap);
+            (*obj).entries = realloc((*obj).entries as *mut u8, old_layout, new_layout.size()) as *mut LinObjectEntry;
+            (*obj).cap = new_cap;
+        }
     }
     let slot = (*obj).entries.add(len as usize);
     (*slot).key = key;
@@ -635,8 +696,14 @@ pub unsafe extern "C" fn lin_object_release(obj: *mut LinObject) {
             }
         }
         let cap = (*obj).cap;
-        std::alloc::dealloc((*obj).entries as *mut u8, entries_layout(cap));
-        std::alloc::dealloc(obj as *mut u8, object_layout());
+        if (*obj).flags & FLAG_INLINE != 0 {
+            // Entries live inside the header allocation — one dealloc frees both.
+            std::alloc::dealloc(obj as *mut u8, inline_object_layout(cap));
+        } else {
+            // Entries were migrated to a separate heap buffer (object grew).
+            std::alloc::dealloc((*obj).entries as *mut u8, entries_layout(cap));
+            std::alloc::dealloc(obj as *mut u8, object_layout());
+        }
     }
 }
 
