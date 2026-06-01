@@ -14,7 +14,7 @@
 
 import { toFloat32 } from "std/number"
 import { f32ToBe, f32FromBe } from "std/bytes"
-import { concat } from "std/array"
+import { concat } from "std/iter"
 import { clamp } from "std/math"
 
 // Decode the 8-byte packet into a [left, right] Float64 speed pair, clamped to

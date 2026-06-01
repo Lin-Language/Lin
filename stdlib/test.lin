@@ -1,6 +1,7 @@
 import { print } from "std/io"
 import { toString } from "std/string"
-import { filter, length, for, map } from "std/array"
+import { length } from "std/array"
+import { filter, for, map } from "std/iter"
 import { exit } from "std/io"
 
 // An Assertion is the result of a single matcher: a pass, or a fail carrying a message.
