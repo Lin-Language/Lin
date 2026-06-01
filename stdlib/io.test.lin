@@ -8,17 +8,24 @@ val s = suite("std/io", [
   test("print accepts strings", () =>
     // Just verify it doesn't crash; output is a side effect
     val _ = true
-    [expect(true).toBe(true)]),
+    [expect(true).toBe(true)]
+  ),
+
   test("exit function exists (callable)", () => [expect(true).toBe(true)]),
+
   test("printErr accepts strings", () =>
     // We don't call exit(1) in a test suite — just confirm the import works
     // printErr writes to stderr; verify it doesn't crash
     val _ = true
-    [expect(true).toBe(true)]),
+    [expect(true).toBe(true)]
+  ),
+
   test("args returns an array", () =>
     val result = args()
     // args() returns String[] — just verify it's callable and the type is right
-    [expect(true).toBe(true)]),
+    [expect(true).toBe(true)]
+  ),
+
   test("prompt function exists (callable)", () => [expect(true).toBe(true)])
 ])
 // prompt requires stdin interaction; just verify the import works

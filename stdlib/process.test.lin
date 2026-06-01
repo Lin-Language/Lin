@@ -28,24 +28,35 @@ val s = suite("std/process", [
       expect(buf[3]).toBe(108),
       expect(buf[4]).toBe(111),
       expect(code).toBe(0)
-    ]),
+    ]
+  ),
+
   test("wait returns the child's exit code", () =>
     val h = spawn("sh", ["-c", "exit 3"])
     val code = wait(h)
-    [expect(code).toBe(3)]),
+    [expect(code).toBe(3)]
+  ),
+
   test("exec collects status and stdout", () =>
     // --- batch: exec / shell / cwd ---
     val r = exec("printf", ["batch-out"])
-    [expect(r["status"]).toBe(0), expect(r["stdout"]).toBe("batch-out")]),
+    [expect(r["status"]).toBe(0), expect(r["stdout"]).toBe("batch-out")]
+  ),
+
   test("exec reports a non-zero exit status", () =>
     val r = exec("sh", ["-c", "exit 7"])
-    [expect(r["status"]).toBe(7)]),
+    [expect(r["status"]).toBe(7)]
+  ),
+
   test("shell runs a command through /bin/sh", () =>
     val r = shell("printf one; printf two")
-    [expect(r["status"]).toBe(0), expect(r["stdout"]).toBe("onetwo")]),
+    [expect(r["status"]).toBe(0), expect(r["stdout"]).toBe("onetwo")]
+  ),
+
   test("cwd returns a non-empty absolute path", () =>
     val here = cwd()
-    [expect(contains(here, "/")).toBe(true)])
+    [expect(contains(here, "/")).toBe(true)]
+  )
 ])
 
 run(s)

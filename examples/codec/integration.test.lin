@@ -16,7 +16,9 @@ val s = suite("codec-integration", [
       expect(back[0]["bytes"]).toBe([72, 105]),
       expect(back[1]["tag"]).toBe(2),
       expect(back[1]["bytes"]).toBe([255, 0, 128])
-    ]),
+    ]
+  ),
+
   test("round-trips a large multi-field message", () =>
     // --- Churn: many fields encode/decode without flat-array RC corruption ---
     val many = [
@@ -85,6 +87,7 @@ val s = suite("codec-integration", [
       }
     ]
     val back = decode(encode(many))
-    [expect(length(back)).toBe(9), expect(back[8]["bytes"]).toBe([9, 9, 9])])
+    [expect(length(back)).toBe(9), expect(back[8]["bytes"]).toBe([9, 9, 9])]
+  )
 ])
 run(s)

@@ -27,45 +27,60 @@ val valueOf = (parsed: Json): Int32 =>
     else => -999999
 
 val s = suite("eval", [
+  // --- Leaves and the four operators ---
   test("evaluates a bare number", () =>
-    // --- Leaves and the four operators ---
-    [expect(valueOf(ok(numNode(42)))).toBe(42)]),
+    [expect(valueOf(ok(numNode(42)))).toBe(42)]
+  ),
+
   test(
     "evaluates addition",
     () => [expect(valueOf(ok(binop("+", numNode(2), numNode(3))))).toBe(5)]
   ),
+
   test(
     "evaluates subtraction",
     () => [expect(valueOf(ok(binop("-", numNode(10), numNode(4))))).toBe(6)]
   ),
+
   test(
     "evaluates multiplication",
     () => [expect(valueOf(ok(binop("*", numNode(6), numNode(7))))).toBe(42)]
   ),
+
   test(
     "evaluates integer division",
     () => [expect(valueOf(ok(binop("/", numNode(20), numNode(4))))).toBe(5)]
   ),
+
+  // --- Nested trees (precedence already baked into the AST) ---
   test("evaluates 2 + 3 * 4 (mul subtree on the right)", () =>
-    // --- Nested trees (precedence already baked into the AST) ---
     [
       expect(valueOf(ok(binop("+", numNode(2), binop("*", numNode(3), numNode(4)))))).toBe(14)
-    ]),
+    ]
+  ),
+
   test("evaluates a deep left-associative chain", () => [
     expect(valueOf(ok(binop("/", binop("/", numNode(100), numNode(5)), numNode(2))))).toBe(10)
-  ]),
+  ]
+  ),
+
+  // ((100 / 5) / 2) = 10
+  // --- Recoverable failures ---
   test("division by zero is a recoverable failure", () =>
-    // ((100 / 5) / 2) = 10
-    // --- Recoverable failures ---
     [
       expect(evalAst(ok(binop("/", numNode(7), numNode(0))))).toFailWith("division by zero")
-    ]),
+    ]
+  ),
+
   test("nested division by zero propagates", () => [
     expect(evalAst(ok(binop("+", numNode(1), binop("/", numNode(6), numNode(0)))))).toFailWith("division by zero")
-  ]),
+  ]
+  ),
+
   test("an incoming parse failure passes straight through", () =>
     [
       expect(evalAst(parseFail("expected number"))).toFailWith("expected number")
-    ])
+    ]
+  )
 ])
 run(s)

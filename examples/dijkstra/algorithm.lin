@@ -21,7 +21,8 @@ val findMinIdx = (pq: PqEntry[]): Int32 =>
       val di = toInt(pq[i]["dist"])
       val dm = toInt(pq[minIdx]["dist"])
       if di < dm then minIdx = i else null
-      i = i + 1)
+      i = i + 1
+    )
   minIdx
 
 val removeAt = (pq: PqEntry[], idx: Int32): PqEntry[] =>
@@ -30,7 +31,8 @@ val removeAt = (pq: PqEntry[], idx: Int32): PqEntry[] =>
   pq
     .for((_) =>
       if i != idx then push(result, pq[i]) else null
-      i = i + 1)
+      i = i + 1
+    )
   result
 
 val processQueue = (pq: PqEntry[], adj: Json, dist: Json, prev: Json, visited: Json): Null =>
@@ -52,7 +54,8 @@ val processQueue = (pq: PqEntry[], adj: Json, dist: Json, prev: Json, visited: J
           if newDist < dv then
             lin_object_set(dist, v, newDist)
           lin_object_set(prev, v, u)
-          push(remaining, { "node": v, "dist": newDist }))
+          push(remaining, { "node": v, "dist": newDist })
+        )
     processQueue(remaining, adj, dist, prev, visited)
   else
     null

@@ -44,7 +44,9 @@ val s = suite("raspberry-rtp", [
     // SSRC big-endian
     // 12-byte header + 4-byte NAL
     // payload = NAL verbatim
-    checks),
+    checks
+  ),
+
   test("single_nal_no_marker: marker bit clear", () =>
     // single_nal_no_marker: byte 1 = PAYLOAD_TYPE with no marker bit.
     val nal: UInt8[] = [0x67, 0xAA]
@@ -52,7 +54,9 @@ val s = suite("raspberry-rtp", [
     val pkt: UInt8[] = packets[0]
     val checks = [expect(length(packets)).toBe(1), expect(pkt[1]).toBe(96)]
     // PAYLOAD_TYPE, no marker
-    checks),
+    checks
+  ),
+
   test("sequence_increments across packetize calls", () =>
     // sequence_increments: two single-NAL packets, seq 0 then 1 (read from header).
     val nal: UInt8[] = [0x67, 0x01]
@@ -69,7 +73,9 @@ val s = suite("raspberry-rtp", [
     // seq high byte
     // seq low byte = 0
     // seq = 1
-    checks),
+    checks
+  ),
+
   test("timestamp_advances by one frame period", () =>
     // timestamp_advances: bytes [4..8] go from 0 to TIMESTAMP_INCREMENT (3000).
     // 3000 = 0x00000BB8 -> bytes 0,0,0x0B,0xB8.
@@ -86,7 +92,9 @@ val s = suite("raspberry-rtp", [
     ]
     // ts1 = 0
     // ts2 = 3000
-    checks),
+    checks
+  ),
+
   test("fu_a_fragmentation: multi-packet with FU-A headers", () =>
     // fu_a_fragmentation: NAL bigger than MAX_RTP_PAYLOAD fragments into >= 2
     // packets; first has start bit + FU type 28 + no marker; last has end bit +
@@ -126,7 +134,9 @@ val s = suite("raspberry-rtp", [
     // marker set on last fragment
     // start bit clear
     // end bit set
-    checks),
+    checks
+  ),
+
   test("packetCount boundary around MAX_RTP_PAYLOAD", () =>
     // exactly_max_payload / one_byte_over_max boundary (via packetCount).
     val seed: UInt8[] = [0x67, 0x67, 0x67, 0x67]
@@ -141,13 +151,16 @@ val s = suite("raspberry-rtp", [
     // fits in one packet
     // fragments into two
     // empty NAL -> no packets
-    checks),
+    checks
+  ),
+
   test("empty_nal produces no packets", () =>
     // empty_nal: produces no packets.
     val empty: UInt8[] = []
     val packets = packetize(0, 0, 1, empty, false)
     val checks = [expect(length(packets)).toBe(0)]
-    checks)
+    checks
+  )
 ])
 
 run(s)

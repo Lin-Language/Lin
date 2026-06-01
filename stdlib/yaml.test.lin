@@ -8,17 +8,23 @@ val s = suite("std/yaml", [
       expect(parse("42")).toBe(42),
       expect(parse("hello")).toBe("hello"),
       expect(parse("true")).toBe(true)
-    ]),
+    ]
+  ),
+
   test("parses a map", () =>
     val m = parse("name: Bob\nage: 30\n")
-    [expect(m["name"]).toBe("Bob"), expect(m["age"]).toBe(30)]),
+    [expect(m["name"]).toBe("Bob"), expect(m["age"]).toBe(30)]
+  ),
+
   test("parses a sequence", () =>
     val seq = parse("- a\n- b\n- c\n")
     [
       expect(length(seq)).toBe(3),
       expect(seq[0]).toBe("a"),
       expect(seq[2]).toBe("c")
-    ]),
+    ]
+  ),
+
   test("round-trips parse -> stringify -> parse", () =>
     val original = parse("name: Ada\nage: 36\ntags:\n  - x\n  - y\n")
     val back = parse(stringify(original))
@@ -27,7 +33,9 @@ val s = suite("std/yaml", [
       expect(back["age"]).toBe(36),
       expect(back["tags"][0]).toBe("x"),
       expect(back["tags"][1]).toBe("y")
-    ]),
+    ]
+  ),
+
   test("parseAll handles a --- separated stream", () =>
     val docs = parseAll("a: 1\n---\nb: 2\n---\nc: 3\n")
     [
@@ -35,7 +43,9 @@ val s = suite("std/yaml", [
       expect(docs[0]["a"]).toBe(1),
       expect(docs[1]["b"]).toBe(2),
       expect(docs[2]["c"]).toBe(3)
-    ]),
+    ]
+  ),
+
   test("stringifyAll emits multiple docs that parseAll reads back", () =>
     val out = stringifyAll([{ "a": 1 }, { "b": 2 }])
     val docs = parseAll(out)
@@ -43,10 +53,13 @@ val s = suite("std/yaml", [
       expect(length(docs)).toBe(2),
       expect(docs[0]["a"]).toBe(1),
       expect(docs[1]["b"]).toBe(2)
-    ]),
+    ]
+  ),
+
   test("parse error returns an Error value", () =>
     val bad = parse("key: : :\n  - [unbalanced\n")
-    [expect(bad is Error).toBe(true), expect(bad["type"]).toBe("error")])
+    [expect(bad is Error).toBe(true), expect(bad["type"]).toBe("error")]
+  )
 ])
 
 run(s)

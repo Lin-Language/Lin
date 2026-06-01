@@ -55,7 +55,8 @@ export val applyDefaults = (cfg: Json): Json =>
       else if sch[k]["default"] != null then
         out[k] = sch[k]["default"]
       else
-        null)
+        null
+    )
   out
 
 // Validate a (defaults-applied) config against the schema. Returns an array of
@@ -73,5 +74,6 @@ export val validate = (cfg: Json): String[] =>
       else if typeName(actual) != expected then
         push(errors, "field ${k}: expected ${expected}, got ${typeName(actual)}")
       else
-        null)
+        null
+    )
   errors

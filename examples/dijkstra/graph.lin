@@ -19,7 +19,8 @@ export val buildAdj = (edges: Edge[]): Json =>
       if existing == null then
         lin_object_set(adj, src, [{ "to": edge["to"], "weight": edge["weight"] }])
       else
-        push(existing, { "to": edge["to"], "weight": edge["weight"] }))
+        push(existing, { "to": edge["to"], "weight": edge["weight"] })
+    )
   adj
 
 val walkPath = (prev: Json, source: String, path: String[], current: String): Null =>

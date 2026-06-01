@@ -82,27 +82,36 @@ val s = suite("solver", [
       expect(r["type"]).toBe("ok"),
       expect(r["path"].join(" ")).toBe("A C B D E"),
       expect(r["distance"]).toBe(14)
-    ]),
+    ]
+  ),
+
   test("surfaces a read error as a tagged error result", () =>
     val r = solve("missing.json", "A", "E", null)
     [
       expect(r["type"]).toBe("error"),
       expect(r["message"]).toBe("no such file: missing.json")
-    ]),
+    ]
+  ),
+
   test("reports no-path when the target is unreachable", () =>
     // "F" is in the graph but has no incoming edges, so it stays at the sentinel.
     val r = solve("graph.json", "A", "F", null)
-    [expect(r["type"]).toBe("no-path")]),
+    [expect(r["type"]).toBe("no-path")]
+  ),
+
   test("writes the result JSON when an output path is given", () =>
     val r = solve("graph.json", "A", "E", "out.json")
     [
       expect(r["type"]).toBe("ok"),
       expect(wroteToPath).toBe("out.json"),
       expect(wroteDistance).toBe(14)
-    ]),
+    ]
+  ),
+
   test("does not write when no output path is given", () =>
     // wroteToPath still holds the previous write; a null outputPath must not change it.
     val r = solve("graph.json", "A", "E", null)
-    [expect(r["type"]).toBe("ok"), expect(wroteToPath).toBe("out.json")])
+    [expect(r["type"]).toBe("ok"), expect(wroteToPath).toBe("out.json")]
+  )
 ])
 run(s)

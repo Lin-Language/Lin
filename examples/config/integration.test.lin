@@ -28,7 +28,9 @@ val s = suite("config integration", [
       expect(cfg["port"]).toBe(8080),
       expect(cfg["debug"]).toBe(false),
       expect(cfg["name"]).toBe("svc")
-    ]),
+    ]
+  ),
+
   test("full override flows through unchanged", () =>
     val cfg = loaded({
       "host": "0.0.0.0",
@@ -41,17 +43,22 @@ val s = suite("config integration", [
       expect(cfg["port"]).toBe(9090),
       expect(cfg["debug"]).toBe(true),
       expect(cfg["name"]).toBe("api")
-    ]),
+    ]
+  ),
+
   test(
     "missing required field surfaces as a load failure",
     () => [expect(load({ "port": 3000 })).toFail()]
   ),
+
   test(
     "wrong-typed field surfaces as a load failure",
     () => [expect(load({ "name": "svc", "port": "not-a-number" })).toFail()]
   ),
+
   test("deep nested access returns null safely for missing keys", () =>
     val r = load({ "name": "svc" })
-    [expect(r["value"]["missing"]["deeper"]).toBe(null)])
+    [expect(r["value"]["missing"]["deeper"]).toBe(null)]
+  )
 ])
 run(s)

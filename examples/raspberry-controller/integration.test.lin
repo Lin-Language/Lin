@@ -39,7 +39,9 @@ val s = suite("raspberry-controller integration", [
       expect(leftCmd["duty"]).toBe(100),
       expect(rightCmd["channel"]).toBe("rpwm"),
       expect(rightCmd["duty"]).toBe(100)
-    ]),
+    ]
+  ),
+
   test("control path: reverse then stop maps to lpwm then stop", () =>
     // two big-endian f32
     // 0.1 is not f32-exact, so the decoded speed is ~0.1 (not == 0.1); assert
@@ -62,7 +64,9 @@ val s = suite("raspberry-controller integration", [
       expect(stopDec[1]).toBe(0.0),
       expect(stopCmd["channel"]).toBe("stop"),
       expect(stopCmd["duty"]).toBe(0)
-    ]),
+    ]
+  ),
+
   test("video path: parse Annex-B stream -> RTP packetize", () =>
     // reverse -> lpwm
     // Drive the video path: parse a small Annex-B buffer into NAL units, then
@@ -101,7 +105,8 @@ val s = suite("raspberry-controller integration", [
       expect(pkt[8]).toBe(0x12),
       expect(pkt[12]).toBe(0x67),
       expect(seqAfter).toBe(1)
-    ])
+    ]
+  )
 ])
 // SPS(7) + PPS(8), 0x41 flushes
 // small NAL -> single packet

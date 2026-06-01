@@ -12,23 +12,31 @@ val s = suite("raspberry-motor", [
     expect(motorCommand(0.5)["channel"]).toBe("rpwm"),
     expect(motorCommand(0.5)["duty"]).toBe(500),
     expect(motorCommand(0.25)["duty"]).toBe(250)
-  ]),
+  ]
+  ),
+
   test("reverse speed drives lpwm with proportional duty", () => [
     expect(motorCommand(0.0 - 1.0)["channel"]).toBe("lpwm"),
     expect(motorCommand(0.0 - 1.0)["duty"]).toBe(1000),
     expect(motorCommand(0.0 - 0.5)["channel"]).toBe("lpwm"),
     expect(motorCommand(0.0 - 0.5)["duty"]).toBe(500)
-  ]),
+  ]
+  ),
+
   test("zero speed stops both pins (duty 0)", () => [
     expect(motorCommand(0.0)["channel"]).toBe("stop"),
     expect(motorCommand(0.0)["duty"]).toBe(0)
-  ]),
+  ]
+  ),
+
   test("out-of-range speed is clamped before mapping", () => [
     expect(motorCommand(5.0)["channel"]).toBe("rpwm"),
     expect(motorCommand(5.0)["duty"]).toBe(1000),
     expect(motorCommand(0.0 - 3.0)["channel"]).toBe("lpwm"),
     expect(motorCommand(0.0 - 3.0)["duty"]).toBe(1000)
-  ]),
+  ]
+  ),
+
   test("PWM_PERIOD is 1000us (1 kHz)", () => [expect(PWM_PERIOD).toBe(1000.0)])
 ])
 
