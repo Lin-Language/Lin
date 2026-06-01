@@ -1,6 +1,6 @@
 import foreign "lin-runtime"
-  val lin_object_values: ({}) => Json[]
-  val lin_object_entries: ({}) => Json[]
+  val lin_object_values: ({  }) => Json[]
+  val lin_object_entries: ({  }) => Json[]
 
 import { push, length } from "std/array"
 import { for, some } from "std/iter"
@@ -16,9 +16,7 @@ export val entries = (obj: Json): Json =>
 
 export val fromEntries = (pairs: Json): Json =>
   var result = {}
-  pairs.for(pair =>
-    result[pair[0]] = pair[1]
-  )
+  pairs.for(pair => result[pair[0]] = pair[1])
   result
 
 export val merge = (a: Json, b: Json): Json =>
@@ -26,9 +24,7 @@ export val merge = (a: Json, b: Json): Json =>
 
 export val pick = (obj: Json, ks: String[]): Json =>
   var result = {}
-  ks.for(k =>
-    if obj[k] != null then result[k] = obj[k]
-  )
+  ks.for(k => if obj[k] != null then result[k] = obj[k] else null)
   result
 
 export val omit = (obj: Json, ks: String[]): Json =>
@@ -36,17 +32,13 @@ export val omit = (obj: Json, ks: String[]): Json =>
   ks.for(k => skip[k] = true)
   val allKeys = lin_keys(obj)
   var result = {}
-  allKeys.for(k =>
-    if skip[k] == null then result[k] = obj[k]
-  )
+  allKeys.for(k => if skip[k] == null then result[k] = obj[k] else null)
   result
 
 export val mapValues = (obj: Json, f: (Json) => Json): Json =>
   val ks = lin_keys(obj)
   var result = {}
-  ks.for(k =>
-    result[k] = f(obj[k])
-  )
+  ks.for(k => result[k] = f(obj[k]))
   result
 
 export val isEmpty = (x: Json): Boolean =>

@@ -2,16 +2,27 @@ import { json, text, badRequest, matchPath, HttpRequest as Request, HttpResponse
 import { render } from "std/template"
 
 export val getIndex = (req: Request): Response =>
-  val data = { "title": "Lin Web Server", "heading": "Welcome", "status": "running", "version": "1.0" }
+  val data = {
+    "title": "Lin Web Server",
+    "heading": "Welcome",
+    "status": "running",
+    "version": "1.0"
+  }
   val html = render("examples/web-server/views/index.jinja", data)
   match html
     has { "type": "error", message } => badRequest("template error: ${message}")
     else => text(200, html)
 
 export val getStatus = (req: Request): Response =>
-  json(200, { "status": "ok", "uptime": 0, "version": "1.0" })
+  json(200, {
+    "status": "ok",
+    "uptime": 0,
+    "version": "1.0"
+  })
 
 export val getUser = (req: Request): Response =>
   val m = matchPath(req["path"], "/users/:id")
-  if m == null then json(404, { "error": "Not Found" })
-  else json(200, { "id": m["id"], "name": "User ${m["id"]}" })
+  if m == null then
+    json(404, { "error": "Not Found" })
+  else
+    json(200, { "id": m["id"], "name": "User ${m["id"]}" })

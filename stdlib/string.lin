@@ -71,7 +71,8 @@ export val join = (arr: String[], separator: String): String =>
 
 export val replace = (s: String, pattern: String, replacement: String): String =>
   val idx = lin_string_index_of(s, pattern)
-  if idx == -1 then s
+  if idx == -1 then
+    s
   else
     val before = _substring(s, 0, idx)
     val after = _substring(s, idx + _length(pattern), _length(s))
@@ -106,7 +107,8 @@ export val fromCodePoints = (codes: Int32[]): String =>
 
 export val padStart = (s: String, width: Int32, pad: String): String =>
   val len = _length(s)
-  if len >= width then s
+  if len >= width then
+    s
   else
     val needed = width - len
     val padLen = _length(pad)
@@ -115,7 +117,8 @@ export val padStart = (s: String, width: Int32, pad: String): String =>
 
 export val padEnd = (s: String, width: Int32, pad: String): String =>
   val len = _length(s)
-  if len >= width then s
+  if len >= width then
+    s
   else
     val needed = width - len
     val padLen = _length(pad)

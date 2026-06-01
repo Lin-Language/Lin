@@ -6,40 +6,60 @@ import { length } from "std/array"
 val s = suite("graph", [
   test("buildAdj groups edges by from-node", () =>
     val adj = buildAdj([
-      { "from": "A", "to": "B", "weight": 1 },
-      { "from": "A", "to": "C", "weight": 2 }
+      {
+        "from": "A",
+        "to": "B",
+        "weight": 1
+      },
+      {
+        "from": "A",
+        "to": "C",
+        "weight": 2
+      }
     ])
-    [
-      expect(adj["A"].length()).toBe(2)
-    ]
+    [expect(adj["A"].length()).toBe(2)]
   ),
+
   test("buildAdj A has 1 neighbor", () =>
     val adj = buildAdj([
-      { "from": "A", "to": "B", "weight": 1 },
-      { "from": "B", "to": "C", "weight": 2 }
+      {
+        "from": "A",
+        "to": "B",
+        "weight": 1
+      },
+      {
+        "from": "B",
+        "to": "C",
+        "weight": 2
+      }
     ])
-    [
-      expect(adj["A"].length()).toBe(1)
-    ]
+    [expect(adj["A"].length()).toBe(1)]
   ),
+
   test("buildAdj B has 1 neighbor", () =>
     val adj = buildAdj([
-      { "from": "A", "to": "B", "weight": 1 },
-      { "from": "B", "to": "C", "weight": 2 }
+      {
+        "from": "A",
+        "to": "B",
+        "weight": 1
+      },
+      {
+        "from": "B",
+        "to": "C",
+        "weight": 2
+      }
     ])
-    [
-      expect(adj["B"].length()).toBe(1)
-    ]
+    [expect(adj["B"].length()).toBe(1)]
   ),
+
   test("reconstructPath source==target returns single node", () => [
-    expect(toString(reconstructPath({}, "A", "A"))).toBe("[\"A\"]")
+    expect(toString(reconstructPath({  }, "A", "A"))).toBe("[\"A\"]")
   ]),
+
   test("reconstructPath follows prev pointers", () =>
     val prev = { "C": "B", "B": "A" }
     val path = reconstructPath(prev, "A", "C")
-    [
-      expect(path.toString()).toBe("[\"A\", \"B\", \"C\"]")
-    ]
-  ),
+    [expect(path.toString()).toBe("[\"A\", \"B\", \"C\"]")]
+  )
 ])
 run(s)

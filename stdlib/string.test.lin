@@ -3,21 +3,13 @@ import { toString, trim, trimStart, trimEnd, toUpper, toLower, substring, indexO
 import { map } from "std/iter"
 
 val s = suite("std/string", [
-  test("toString of int", () => [
-    expect((42).toString()).toBe("42")
-  ]),
+  test("toString of int", () => [expect(42.toString()).toBe("42")]),
 
-  test("toString of null", () => [
-    expect(null.toString()).toBe("null")
-  ]),
+  test("toString of null", () => [expect(null.toString()).toBe("null")]),
 
-  test("toString of bool", () => [
-    expect(true.toString()).toBe("true")
-  ]),
+  test("toString of bool", () => [expect(true.toString()).toBe("true")]),
 
-  test("trim removes whitespace", () => [
-    expect("  hello  ".trim()).toBe("hello")
-  ]),
+  test("trim removes whitespace", () => [expect("  hello  ".trim()).toBe("hello")]),
 
   test("trimStart removes leading whitespace", () => [
     expect("  hello  ".trimStart()).toBe("hello  ")
@@ -101,25 +93,21 @@ val s = suite("std/string", [
 
   test("split splits on delimiter", () =>
     val parts = "a,b,c".split(",")
-    [
-      expect(parts[0]).toBe("a")
-    ]
+    [expect(parts[0]).toBe("a")]
   ),
 
   test("split result iterates as strings (not null)", () =>
     // Regression: split elements were tagged TAG_NULL, so generic map/for read them as null.
-    val wrapped = "a,b,c".split(",").map(s => "<${s}>").join("|")
-    [
-      expect(wrapped).toBe("<a>|<b>|<c>")
-    ]
+    val wrapped = "a,b,c"
+      .split(",")
+      .map(s => "<${s}>")
+      .join("|")
+    [expect(wrapped).toBe("<a>|<b>|<c>")]
   ),
-
 
   test("join joins with separator", () =>
     val result = ["a", "b", "c"].join("-")
-    [
-      expect(result).toBe("a-b-c")
-    ]
+    [expect(result).toBe("a-b-c")]
   ),
 
   test("replace substitutes first match", () => [
@@ -142,35 +130,23 @@ val s = suite("std/string", [
     expect("hello".replaceAll("", "x")).toBe("hello")
   ]),
 
-  test("repeat repeats string", () => [
-    expect("ab".repeat(3)).toBe("ababab")
-  ]),
+  test("repeat repeats string", () => [expect("ab".repeat(3)).toBe("ababab")]),
 
-  test("at returns character at index", () => [
-    expect("hello".at(1)).toBe("e")
-  ]),
+  test("at returns character at index", () => [expect("hello".at(1)).toBe("e")]),
 
-  test("at supports negative index", () => [
-    expect("hello".at(-1)).toBe("o")
-  ]),
+  test("at supports negative index", () => [expect("hello".at(-1)).toBe("o")]),
 
   test("lines splits on newline", () =>
     val parts = "a\nb\nc".lines()
-    [
-      expect(parts[0]).toBe("a")
-    ]
+    [expect(parts[0]).toBe("a")]
   ),
 
   test("lines returns single line when no newline", () =>
     val parts = "hello".lines()
-    [
-      expect(parts[0]).toBe("hello")
-    ]
+    [expect(parts[0]).toBe("hello")]
   ),
 
-  test("codePointAt returns code point", () => [
-    expect("A".codePointAt(0)).toBe(65)
-  ]),
+  test("codePointAt returns code point", () => [expect("A".codePointAt(0)).toBe(65)]),
 
   test("codePointAt returns -1 for out of bounds", () => [
     expect("A".codePointAt(5)).toBe(-1)
@@ -221,7 +197,7 @@ val s = suite("std/string", [
       expect(viaToString).toBe("a,b,c"),
       expect(joined).toBe("a,b,c")
     ]
-  ),
+  )
 ])
 
 run(s)

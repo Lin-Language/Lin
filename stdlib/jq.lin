@@ -8,6 +8,9 @@ export val jq = (input: Json, filter: String): Json =>
 
 export val jqFirst = (input: Json, filter: String): Json =>
   val result = lin_jq_query(input, filter)
-  if result["type"] == "error" then result
-  else if length(result) == 0 then null
-  else result[0]
+  if result["type"] == "error" then
+    result
+  else if length(result) == 0 then
+    null
+  else
+    result[0]

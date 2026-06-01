@@ -38,9 +38,12 @@ export val readJson = (path: String): Json =>
   lin_fs_read_json(path)
 
 export val writeJson = (path: String, value: Json, opts: Json): Json =>
-  if opts == null then lin_fs_write_json(path, value)
-  else if opts["compact"] == true then lin_fs_write_json_compact(path, value)
-  else lin_fs_write_json(path, value)
+  if opts == null then
+    lin_fs_write_json(path, value)
+  else if opts["compact"] == true then
+    lin_fs_write_json_compact(path, value)
+  else
+    lin_fs_write_json(path, value)
 
 export val exists = (path: String): Boolean =>
   lin_fs_exists(path)
@@ -55,19 +58,28 @@ export val stat = (path: String): Json =>
   lin_fs_stat(path)
 
 export val ls = (path: String, opts: Json): Json =>
-  if opts == null then lin_fs_list_dir(path)
-  else if opts["recursive"] == true then lin_fs_list_dir_all(path)
-  else lin_fs_list_dir(path)
+  if opts == null then
+    lin_fs_list_dir(path)
+  else if opts["recursive"] == true then
+    lin_fs_list_dir_all(path)
+  else
+    lin_fs_list_dir(path)
 
 export val mkdir = (path: String, opts: Json): Json =>
-  if opts == null then lin_fs_mkdir(path)
-  else if opts["parents"] == true then lin_fs_mkdir_all(path)
-  else lin_fs_mkdir(path)
+  if opts == null then
+    lin_fs_mkdir(path)
+  else if opts["parents"] == true then
+    lin_fs_mkdir_all(path)
+  else
+    lin_fs_mkdir(path)
 
 export val rm = (path: String, opts: Json): Json =>
-  if opts == null then lin_fs_rm(path, 0)
-  else if opts["recursive"] == true then lin_fs_rm(path, 1)
-  else lin_fs_rm(path, 0)
+  if opts == null then
+    lin_fs_rm(path, 0)
+  else if opts["recursive"] == true then
+    lin_fs_rm(path, 1)
+  else
+    lin_fs_rm(path, 0)
 
 export val cp = (src: String, dst: String): Json =>
   lin_fs_cp(src, dst)
