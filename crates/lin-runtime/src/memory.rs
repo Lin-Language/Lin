@@ -99,7 +99,13 @@ unsafe fn release_captures(env_ptr: *mut u8, cap_desc: *const u8) {
             3 => crate::object::lin_object_release(word as *mut crate::object::LinObject),
             4 => lin_closure_release(word),
             5 => crate::tagged::lin_tagged_release(word),
-            _ => {} // 0: scalar or borrowed cell pointer — nothing to release
+            // 6 Move: a MOVED resource (Stream) was HANDED OFF to a worker — the LOCAL closure
+            // must NOT release it (the worker's `release_env_copy` owns + releases it). Falls to
+            // the no-op arm deliberately. (If a moved-capture closure is ever torn down WITHOUT a
+            // handoff — e.g. an inline-fallback spawn — see the note in async_rt: the inline path
+            // does not use a deep env copy, so the move degenerates to the source owning it; that
+            // is handled there, not here.)
+            _ => {} // 0: scalar or borrowed cell pointer (or 6 Move: handed off) — nothing to release
         }
     }
 }

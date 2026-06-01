@@ -3,7 +3,8 @@
 // heap (object) values — the pattern that historically broke RC.
 
 import { parseRow, Parsed } from "./parse"
-import { map, filter, reduce, length, sortBy } from "std/array"
+import { length, sortBy } from "std/array"
+import { map, filter, reduce } from "std/iter"
 import { toString, join } from "std/string"
 
 // A validated CSV record (structurally identical to parse.lin's `Record`; Lin's

@@ -16,6 +16,11 @@ impl<'ctx> Codegen<'ctx> {
             Type::Object(_) => { self.builder.call(self.rt.object_release, &[ptr.into()], ""); }
             Type::Function { .. } => { self.builder.call(self.rt.closure_release, &[ptr.into()], ""); }
             Type::TypeVar(_) | Type::Union(_) => { self.builder.call(self.rt.tagged_release, &[ptr.into()], ""); }
+            // Stream<T> is a boxed TaggedVal*(TAG_STREAM); its release dispatches the tag-aware
+            // `lin_tagged_release`, whose TAG_STREAM arm decrements the stream box's refcount and
+            // closes the fd when it hits zero (Stage 2). Owning model (is_union_ty), so scope-exit
+            // and global-reassign releases land here.
+            Type::Stream(_) => { self.builder.call(self.rt.tagged_release, &[ptr.into()], ""); }
             _ => {} // scalars: nothing to release
         }
     }

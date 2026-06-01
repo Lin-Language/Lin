@@ -83,3 +83,17 @@ export val writeFileBytes = (path: String, bytes: UInt8[]): Json =>
 
 export val writeLines = (path: String, lines: String[]): Json =>
   lin_fs_write_lines(path, lines)
+
+// openRead(path) opens a file as a byte Stream (`Stream<UInt8[]> | Error`). The return type is
+// inferred from the `lin_fs_open` intrinsic; the opaque `Stream` annotation (= `Stream<Json>`)
+// is used on the pull params. The low-level chunk read / close primitives below are the
+// stream-pull surface that std/stream builds its lazy adapters on (Stage 4). `readChunk` returns
+// `UInt8[] | Null | Error` where Null signals end-of-stream; `closeStream` is idempotent.
+export val openRead = (path: String) =>
+  lin_fs_open(path)
+
+export val readChunk = (s: Stream): Json =>
+  lin_stream_read(s)
+
+export val closeStream = (s: Stream): Null =>
+  lin_stream_close(s)
