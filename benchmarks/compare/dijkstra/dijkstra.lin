@@ -36,12 +36,13 @@ val n = length(nodes)
 // (arrayAllocateFilled(n, []) would alias one array into every slot).
 var adj = arrayAllocate(n)
 var ai = 0
-nodes
-  .for((_) =>
-    set(adj, ai, [])
-    ai = ai + 1
-  )
-edges.for((e) => push(adj[idOf(e["from"])], { "to": idOf(e["to"]), "w": e["weight"] }))
+nodes.for(_ =>
+  set(adj, ai, [])
+  ai = ai + 1
+)
+edges.for(e =>
+  push(adj[idOf(e["from"])], { "to": idOf(e["to"]), "w": e["weight"] })
+)
 
 var dist = arrayAllocateFilled(n, INF)
 var visited = arrayAllocateFilled(n, false)
@@ -61,12 +62,9 @@ var pqLen = 1
 // Tail-recursive min-scan over pq[j .. pqLen) — TCO turns it into a loop with no
 // per-pop allocation (range().for would allocate a fresh range array each pop).
 val minFrom = (j: Int32, best: Int32): Int32 =>
-  if j >= pqLen then
-    best
-  else if pqDist[j] < pqDist[best] then
-    minFrom(j + 1, j)
-  else
-    minFrom(j + 1, best)
+  if j >= pqLen then best
+  else if pqDist[j] < pqDist[best] then minFrom(j + 1, j)
+  else minFrom(j + 1, best)
 
 val step = (): Null =>
   if pqLen > 0 then
@@ -80,31 +78,27 @@ val step = (): Null =>
     if visited[u] == false then
       set(visited, u, true)
       val du = dist[u]
-      adj[u]
-        .for((edge) =>
-          val v = edge["to"]
-          val nd = du + edge["w"]
-          if nd < dist[v] then
-            set(dist, v, nd)
+      adj[u].for(edge =>
+        val v = edge["to"]
+        val nd = du + edge["w"]
+        if nd < dist[v] then
+          set(dist, v, nd)
           set(pqNode, pqLen, v)
           set(pqDist, pqLen, nd)
           pqLen = pqLen + 1
-        )
+      )
     step()
-  else
-    null
 step()
 
 var total = 0i64
 var k = 0
-nodes
-  .for((_) =>
-    val d = dist[k]
-    if d < INF then total = total + d else null
-    k = k + 1
-  )
+nodes.for(_ =>
+  val d = dist[k]
+  if d < INF then total = total + d
+  k = k + 1
+)
 
 val targetDist: Int64 = dist[n - 1]
-val checksum = targetDist * 1000003i64 + (total - total / 1000000000i64 * 1000000000i64)
+val checksum = targetDist * 1000003i64 + (total - (total / 1000000000i64) * 1000000000i64)
 
 print("RESULT=${toString(checksum)}")

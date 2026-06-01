@@ -15,7 +15,7 @@ val box = shared([])
 // `box` is a top-level val captured by the thunk; the Shared box is shared by
 // reference across threads (atomic refcount), not copied (the nesting rule).
 val hammer = (iters: Int32): Int32 =>
-  range(0, iters).for((i) => withLock(box, (a) => push(a, 1)))
+  range(0, iters).for(i => withLock(box, a => push(a, 1)))
   0
 
 val tasks = parallel([

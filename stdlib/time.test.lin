@@ -2,52 +2,52 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { now, sleep, sleepMicros, startTimer, elapsed, toIso, format, fromIso, parse } from "std/time"
 
 val s = suite("std/time", [
-  test("now returns a positive timestamp", () => [expect(now() > 0).toBe(true)]),
+  test("now returns a positive timestamp", () => [
+    expect(now() > 0).toBe(true)
+  ]),
 
-  test(
-    "startTimer returns a positive value",
-    () => [expect(startTimer() > 0).toBe(true)]
-  ),
+  test("startTimer returns a positive value", () => [
+    expect(startTimer() > 0).toBe(true)
+  ]),
 
   test("elapsed is non-negative", () =>
     val t = startTimer()
-    [expect(t.elapsed() >= 0).toBe(true)]
+    [
+      expect(t.elapsed() >= 0).toBe(true)
+    ]
   ),
 
-  test(
-    "toIso of Unix epoch",
-    () => [expect(toIso(0)).toBe("1970-01-01T00:00:00.000Z")]
-  ),
+  test("toIso of Unix epoch", () => [
+    expect(toIso(0)).toBe("1970-01-01T00:00:00.000Z")
+  ]),
 
-  test(
-    "toIso of a known timestamp",
-    () => [expect(toIso(1000)).toBe("1970-01-01T00:00:01.000Z")]
-  ),
+  test("toIso of a known timestamp", () => [
+    expect(toIso(1000)).toBe("1970-01-01T00:00:01.000Z")
+  ]),
 
-  test(
-    "toIso includes milliseconds",
-    () => [expect(toIso(1500)).toBe("1970-01-01T00:00:01.500Z")]
-  ),
+  test("toIso includes milliseconds", () => [
+    expect(toIso(1500)).toBe("1970-01-01T00:00:01.500Z")
+  ]),
 
   test("sleepMicros runs and elapsed stays non-negative", () =>
     val t = startTimer()
     sleepMicros(500)
-    [expect(t.elapsed() >= 0).toBe(true)]
+    [
+      expect(t.elapsed() >= 0).toBe(true)
+    ]
   ),
 
   // --- format (strftime-style, UTC) ---
   test("format renders date and time fields", () => [
     expect(format(1705314600000, "%Y-%m-%dT%H:%M:%S")).toBe("2024-01-15T10:30:00"),
     expect(format(1705314600000, "%Y-%m-%d")).toBe("2024-01-15"),
-    expect(format(1705314600000, "%H:%M:%S")).toBe("10:30:00")
-  ]
-  ),
+    expect(format(1705314600000, "%H:%M:%S")).toBe("10:30:00"),
+  ]),
 
   test("format renders weekday/month names and literal percent", () => [
     expect(format(1705314600000, "%a %B %d")).toBe("Mon January 15"),
-    expect(format(1705314600000, "%H%%")).toBe("10%")
-  ]
-  ),
+    expect(format(1705314600000, "%H%%")).toBe("10%"),
+  ]),
 
   // --- fromIso ---
   // NOTE: expected timestamps are bound as `Int64` vals; a bare >Int32 literal in
@@ -64,8 +64,7 @@ val s = suite("std/time", [
 
   test("fromIso respects a timezone offset", () => [
     expect(fromIso("2024-01-15T10:30:00+01:00")).toBe(fromIso("2024-01-15T09:30:00Z"))
-  ]
-  ),
+  ]),
 
   test("fromIso returns an Error on garbage", () =>
     val r = fromIso("not a date")
@@ -78,7 +77,7 @@ val s = suite("std/time", [
     val withTime: Int64 = 1705314600000
     [
       expect(parse("2024-01-15", "%Y-%m-%d")).toBe(midnight),
-      expect(parse("15/01/2024 10:30", "%d/%m/%Y %H:%M")).toBe(withTime)
+      expect(parse("15/01/2024 10:30", "%d/%m/%Y %H:%M")).toBe(withTime),
     ]
   ),
 
@@ -90,10 +89,8 @@ val s = suite("std/time", [
   // format and parse round-trip
   test("format and parse round-trip a timestamp", () =>
     val ts: Int64 = 1705314600000
-    [
-      expect(parse(format(ts, "%Y-%m-%dT%H:%M:%S"), "%Y-%m-%dT%H:%M:%S")).toBe(ts)
-    ]
-  )
+    [expect(parse(format(ts, "%Y-%m-%dT%H:%M:%S"), "%Y-%m-%dT%H:%M:%S")).toBe(ts)]
+  ),
 ])
 
 run(s)

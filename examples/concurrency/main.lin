@@ -4,10 +4,16 @@
 // Modules:
 //   tasks.lin    — async/await, parallel, race, timeout, retry, fault isolation, nested flatten
 //   services.lin — ThreadPool, Worker, Shared<T>, Frozen<T>
+
 import { print } from "std/io"
 import { toString } from "std/string"
-import { squareAsync, weightedTriple, firstToFinish, withDeadline, retryDivide, safeDivide, nestedValue } from "./tasks"
-import { poolSum, accumulate, workerFaults, sharedCounter, sharedSnapshot, frozenLookup } from "./services"
+import {
+  squareAsync, weightedTriple, firstToFinish, withDeadline,
+  retryDivide, safeDivide, nestedValue
+} from "./tasks"
+import {
+  poolSum, accumulate, workerFaults, sharedCounter, sharedSnapshot, frozenLookup
+} from "./services"
 
 print("== async / await ==")
 print("7 squared on another thread: ${toString(squareAsync(7))}")

@@ -6,18 +6,13 @@ import { toString } from "std/string"
 // success/failure outcome, matched the way main.lin consumes it. Covers the
 // defaults-applied happy path, missing/wrong-typed failures, and the deep
 // null-propagation access that doubles as an ASan churn guard.
+
 // Pull the resolved config out of a successful load, typed as Config so the
 // integration asserts against named-type fields rather than raw Json.
 val loaded = (raw: Json): Config =>
   match load(raw)
     has { "type": "success", value } => value
-    else =>
-      {
-        "host": "",
-        "port": 0,
-        "debug": false,
-        "name": ""
-      }
+    else => { "host": "", "port": 0, "debug": false, "name": "" }
 
 val s = suite("config integration", [
   test("minimal input loads and gets every default filled", () =>
@@ -30,14 +25,8 @@ val s = suite("config integration", [
       expect(cfg["name"]).toBe("svc")
     ]
   ),
-
   test("full override flows through unchanged", () =>
-    val cfg = loaded({
-      "host": "0.0.0.0",
-      "port": 9090,
-      "debug": true,
-      "name": "api"
-    })
+    val cfg = loaded({ "host": "0.0.0.0", "port": 9090, "debug": true, "name": "api" })
     [
       expect(cfg["host"]).toBe("0.0.0.0"),
       expect(cfg["port"]).toBe(9090),
@@ -45,20 +34,17 @@ val s = suite("config integration", [
       expect(cfg["name"]).toBe("api")
     ]
   ),
-
-  test(
-    "missing required field surfaces as a load failure",
-    () => [expect(load({ "port": 3000 })).toFail()]
-  ),
-
-  test(
-    "wrong-typed field surfaces as a load failure",
-    () => [expect(load({ "name": "svc", "port": "not-a-number" })).toFail()]
-  ),
-
+  test("missing required field surfaces as a load failure", () => [
+    expect(load({ "port": 3000 })).toFail()
+  ]),
+  test("wrong-typed field surfaces as a load failure", () => [
+    expect(load({ "name": "svc", "port": "not-a-number" })).toFail()
+  ]),
   test("deep nested access returns null safely for missing keys", () =>
     val r = load({ "name": "svc" })
-    [expect(r["value"]["missing"]["deeper"]).toBe(null)]
-  )
+    [
+      expect(r["value"]["missing"]["deeper"]).toBe(null)
+    ]
+  ),
 ])
 run(s)
