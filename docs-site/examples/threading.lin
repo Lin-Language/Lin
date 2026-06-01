@@ -1,7 +1,7 @@
 import { print } from "std/io"
 import { parallel, shared, withLock, get, frozen } from "std/async"
-import { map, range, push, length, for } from "std/array"
-
+import { push, length } from "std/array"
+import { map, range, for } from "std/iter"
 // `shared(v)` is mutable state safe to touch from many threads. Every access goes
 // through an accessor; `withLock` holds the lock for a read-modify-write, mutating
 // the inner value in place — here each of 8 threads appends to the shared list.
