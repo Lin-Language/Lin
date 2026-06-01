@@ -20,11 +20,21 @@ readStream("in.csv")
 
 Byte sources also come from other modules — `tcpStream` ([`std/net`](/stdlib/net.html)), `stdoutStream` ([`std/process`](/stdlib/process.html)), and `stdinStream` ([`std/io`](/stdlib/io.html)) all return `Stream<UInt8[]>` and feed the same adapters and terminals documented here.
 
-## Lifetime — affine, single-use
+## A stream can only be read once
 
-A `Stream<T>` is an **affine resource**: it may be consumed at most once. Using it again after a terminal op (or after `.promise()` moves it to a worker) is a compile-time error. Dropping an unused stream is fine — the runtime closes the fd via an RC-drop finalizer.
+A stream is consumed as you read it — so each one flows through a **single** pipeline. Once you've called a combinator or a terminal on a stream, that stream is used up; reaching for it again is a compile-time error. To make a second pass over the same data, open a fresh stream.
 
-In v1 a stream may live only in a `val`, a function parameter, or a return value. Storing one in an object/array field or a `var` is a compile-time error.
+```lin
+val s = readStream("data.txt")
+val a = s.lines().collect()
+val b = s.lines().collect()   // error: `s` was already used above
+
+// To read it twice, open it twice:
+val a = readStream("data.txt").lines().collect()
+val b = readStream("data.txt").lines().collect()
+```
+
+You don't have to consume a stream — opening one and never reading it is fine; it cleans up after itself. Keep a stream in a local `val` (or pass it to/return it from a function); they can't be stashed in objects, arrays, or `var`s.
 
 ## Types
 
@@ -44,8 +54,8 @@ Stream<T>   // opaque; covariant in T; not JSON, not subscriptable
 | `readText` | `(Stream<UInt8[]>) -> String \| Error` | terminal | Drive to completion, return the contents as a `String` |
 | `collect` | `(Stream<UInt8[]>) -> UInt8[] \| Error` | terminal | Drive to completion, return the contents as a `UInt8[]` |
 | `drain` | `(Stream<T>) -> Null \| Error` | terminal | Drive the pipeline on the calling thread |
-| `promise` | `(Stream<T>) -> Json` | terminal | Move the pipeline to a worker thread; return a promise |
-| `close` | `(Stream<T>) -> Null` | — | Close the fd eagerly (idempotent) |
+| `promise` | `(Stream<T>) -> Json` | terminal | Run the pipeline on a background thread; return a promise |
+| `close` | `(Stream<T>) -> Null` | — | Release the file/socket now (optional; idempotent) |
 
 ---
 
@@ -126,7 +136,7 @@ match outcome
 
 ### `promise`
 
-Terminal. **Moves** the whole pipeline onto a **worker OS thread** and immediately returns a promise (conceptually `Promise<Null | Error>`, erased to `Json` like all promise handles). This gives real concurrency plus **fault isolation**: a runtime fault while the worker drives the stream is caught at the thread boundary and surfaces as an `Error` when the promise is awaited. Because the pipeline is moved (not copied) and the worker becomes its sole owner, non-atomic refcounting stays sound and the worker's RC-drop finalizer closes the fd.
+Terminal. Runs the whole pipeline on a **background thread** and returns a promise immediately, so your program can do other work while the stream is processed. `await` the promise to get the result — `Null` on success, or an `Error` if anything went wrong while processing (including a crash mid-stream, which is caught and handed back rather than taking down your program). Use `.drain()` instead when you just want to run the pipeline and wait for it.
 
 `await` reattaches the `Null | Error` union, so the `Error` case must be handled (see [`std/async`](/stdlib/async.html)).
 
@@ -145,7 +155,7 @@ match await(p)
 
 ### `close`
 
-Closes the underlying fd eagerly. **Idempotent** — closing an already-closed (or already-drained) stream is a no-op. Optional: the RC-drop finalizer closes the fd automatically when the last reference goes away; `close` is for callers who want deterministic timing rather than scope-end cleanup.
+Closes the stream now, releasing the file (or socket) it holds. **Optional** — a stream cleans up on its own once you're done with it; `close` is only for when you want to release the resource at a specific point rather than waiting for that. **Idempotent** — closing an already-closed or already-drained stream does nothing.
 
 ---
 

@@ -349,7 +349,7 @@ Stream-specific sources, adapters, sinks, and terminals. The unified combinators
 | [`writeStream`](#writeStream) | `<T>(Stream<T>, String) -> Stream<T>` | Build a sink that writes upstream items to a file |
 | [`drain`](#drain) | `<T>(Stream<T>) -> Null \| Error` | Run a pipeline on the calling thread |
 | [`promise`](#promise-stream) | `<T>(Stream<T>) -> Json` | Move a pipeline to a worker thread; `Promise<Null \| Error>` |
-| [`close`](#close-stream) | `(Stream<T>) -> Null` | Close the underlying fd; idempotent |
+| [`close`](#close-stream) | `(Stream<T>) -> Null` | Release the file/socket now (optional; idempotent) |
 
 **std/template**
 
@@ -821,9 +821,8 @@ match total
   else     => print("sum = ${total}")
 ```
 
-> A stream is an **affine resource** (ADR-075): a combinator that routes to the stream backend
-> **consumes** (moves) the stream, so the chain is single-use. Using the same stream value twice is a
-> compile-time error. See [`std/stream`](#stdstream) for the lifetime rules.
+> Over a stream, a combinator **consumes** its input, so a stream flows through a single chain —
+> using the same stream value twice is a compile-time error. See [`std/stream`](#stdstream) for details.
 >
 > v1 limitation: dispatch fires at a **concrete** combinator call with a `Stream` receiver. A stream
 > passed through a user-defined generic `Iterable` parameter and combined inside that function stays
@@ -3592,7 +3591,7 @@ print("exited ${code}")
 
 Lazy, fallible streams over OS resources — files, sockets, subprocess stdout, and stdin (spec §27.9). A `Stream<T>` is an opaque runtime value built as a **lazy pull graph**: a source node (`readStream`), zero or more adapters (`lines`/`linesMax`/`chunks`, plus the `std/iter` combinators `map`/`filter`/`take`/… which dispatch lazily on a stream receiver), and a terminal operation that drives the graph one item at a time with bounded memory. Errors are threaded **in-band** — the first read error poisons the upstream and short-circuits to the terminal op, so error handling lives only at the terminal, not at every adapter.
 
-A `Stream<T>` is an **affine resource** (ADR-075): it may be consumed at most once (using it again after a terminal op or after `.promise()` moves it to a worker is a compile-time error), but dropping an unused stream is fine — the runtime closes the fd via an RC-drop finalizer. In v1 a stream may live only in a `val`, a function parameter, or a return value; storing one in an object/array field or a `var` is a compile-time error.
+**A stream can only be read once.** Reading consumes it, so each stream flows through a single pipeline — once you've called a combinator or terminal on it, using that stream again is a compile-time error. To make a second pass over the same data, open a fresh stream. You don't have to consume a stream (opening one and never reading it is fine — it cleans up after itself), and a stream lives in a local `val`, a function parameter, or a return value — not in an object field, array, or `var`. (The single-use rule is what lets `.promise()` safely hand the whole pipeline to a worker thread; design rationale in ADR-075.)
 
 The combinators (`map`/`filter`/`take`/`drop`/`reduce`/`for`/…) are **not** part of `std/stream` — they
 come from [`std/iter`](#stditer) and dispatch to the lazy stream backend automatically when the receiver
@@ -3748,7 +3747,7 @@ match outcome
 val promise: <T>(Stream<T>) -> Json    // Promise<Null | Error>
 ```
 
-Terminal. **Moves** the whole pipeline onto a **worker OS thread** (ADR-075) and immediately returns a promise. This gives real concurrency plus fault isolation: a runtime fault while the worker drives the stream is caught at the thread boundary and surfaces as an `Error` when the promise is awaited (spec §24.2.2). Because the pipeline is moved (not copied) and the worker becomes its sole owner, non-atomic refcounting stays sound and the worker's RC-drop finalizer closes the fd.
+Terminal. Runs the whole pipeline on a **background thread** and returns a promise immediately, so your program can do other work while the stream is processed. `await` the promise for the result — `Null` on success, or an `Error` if anything went wrong while processing (a crash mid-stream is caught at the thread boundary and handed back as an `Error` rather than aborting the program; spec §24.2.2). Use `.drain()` when you simply want to run the pipeline and wait. (Design rationale — how the pipeline is safely handed to the worker — is in ADR-075.)
 
 The promise type is conceptually `Promise<Null | Error>`; like all promise handles it is erased to `Json` in annotations (spec §24.1). `await` reattaches the `Null | Error` union, so the `Error` case must be handled (ADR-070).
 
@@ -3771,7 +3770,7 @@ match await(p)
 val close: (Stream<T>) -> Null
 ```
 
-Closes the underlying fd eagerly. **Idempotent** — closing an already-closed (or already-drained) stream is a no-op. Optional: the RC-drop finalizer closes the fd automatically when the last reference goes away (spec §27.9.5); `close` is for callers who want deterministic timing rather than scope-end cleanup.
+Closes the stream now, releasing the file (or socket) it holds. **Optional** — a stream cleans up on its own once you're done with it; `close` is only for when you want to release the resource at a specific point rather than waiting for that. **Idempotent** — closing an already-closed or already-drained stream does nothing.
 
 ---
 
