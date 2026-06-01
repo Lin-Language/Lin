@@ -188,6 +188,44 @@ impl Checker {
         }
     }
 
+    /// Does a call to the callee bound to `local_name` ROUTE to a stream operation that takes
+    /// ownership of its stream argument(s)? Keyed on the callee's IMPORT ORIGIN
+    /// `(module_path, export_name)` — the SAME dispatch fact that `streamish_combinator_ret`
+    /// (re-typing) and `stream_combinator_intrinsic_name` (IR redirect) use — so the affine
+    /// consume-check, the result re-typing, and the IR move can never diverge. A user-defined
+    /// function with one of these names is never affected (it has no std/iter|std/stream origin).
+    ///
+    /// True for: the genuine std/iter combinators that dispatch to a `lin_stream_*` backend on a
+    /// stream receiver, and the genuine std/stream stream-specific ops. The actual consumption is
+    /// then applied PER ARGUMENT to every definitely-stream argument (mirroring the IR's
+    /// `move_streamish_arg`), which handles `concat`'s two stream args automatically.
+    fn callee_routes_to_stream_op(&self, local_name: &str) -> bool {
+        let Some((module_path, export_name)) = self.import_origins.get(local_name) else {
+            return false;
+        };
+        match module_path.as_str() {
+            "std/iter" => is_std_iter_stream_combinator(export_name),
+            "std/stream" => is_std_stream_consuming_export(export_name),
+            _ => false,
+        }
+    }
+
+    /// Mark CONSUMED every argument in `arg_exprs` whose inferred type (from the parallel
+    /// `arg_tys`) is DEFINITELY a stream — the affine mirror of the IR's `move_streamish_arg`,
+    /// which unregisters any streamish arg from the caller's owning scope. Applies only when the
+    /// callee routes to a stream op (gated by the caller). Per-argument so `concat(a, b)` consumes
+    /// BOTH stream arguments, not just arg0.
+    fn consume_definite_stream_args<'a>(
+        &mut self,
+        arg_exprs: impl Iterator<Item = (&'a Expr, &'a Type)>,
+    ) {
+        for (expr, ty) in arg_exprs {
+            if is_definitely_stream(ty) {
+                self.mark_stream_consumed(expr);
+            }
+        }
+    }
+
     pub(crate) fn infer_call(
         &mut self,
         func: &Expr,
@@ -467,13 +505,20 @@ impl Checker {
             result_type
         };
 
-        // Affine consume (streams brief §7): an OWNERSHIP-TAKING stream op (adapter/terminal/`for`)
-        // MOVES its stream argument — mark it consumed so a later use of the same binding errors.
-        // Borrows (`read`/`close`) are NOT in the consuming set, so a pull loop reads freely.
+        // Affine consume (streams brief §7): a call that ROUTES to a stream op MOVES its
+        // stream argument(s) — mark each definitely-stream argument consumed so a later use of the
+        // same binding errors. Keyed on the callee's import origin (the dispatch fact), not a name
+        // list, and applied PER ARGUMENT so `concat(a, b)` consumes BOTH streams. This mirrors the
+        // IR's `move_streamish_arg` exactly; the two cannot diverge.
         if !partial {
-            if let (Expr::Ident(callee, _), Some(arg0)) = (func, args.first()) {
-                if is_stream_consuming_op(callee) {
-                    self.mark_stream_consumed(arg0);
+            if let Expr::Ident(callee, _) = func {
+                if self.callee_routes_to_stream_op(callee) {
+                    let pairs: Vec<(&Expr, Type)> = args
+                        .iter()
+                        .zip(typed_args.iter())
+                        .map(|(e, t)| (e, t.ty()))
+                        .collect();
+                    self.consume_definite_stream_args(pairs.iter().map(|(e, t)| (*e, t)));
                 }
             }
         }
@@ -534,13 +579,9 @@ impl Checker {
 
         let typed_receiver = self.infer_expr(receiver)?;
 
-        // Affine consume (streams brief §7): a dot-call `s.lines()`/`s.drain()`/… MOVES the
-        // receiver stream into the ownership-taking op. Mark it consumed AFTER inferring the
-        // receiver (so reading it AS the receiver is fine) so a later use of `s` errors. Borrows
-        // (`s.read()`/`s.close()`) are not in the consuming set. Skipped for partial application.
-        if !partial && is_stream_consuming_op(method) {
-            self.mark_stream_consumed(receiver);
-        }
+        // Affine consume for a dot-call routing to a stream op is applied per-argument AFTER all
+        // arguments are inferred (so `concat`'s second stream arg is also covered) — see the
+        // `consume_definite_stream_args` calls below, gated on `callee_routes_to_stream_op(method)`.
 
         // Look up method type for TypeVar substitution.
         if let Some(method_ty) = self.env.effective_type(method) {
@@ -638,6 +679,19 @@ impl Checker {
                     }
                 }
 
+                // Affine consume (streams brief §7): if `method` routes to a stream op, mark each
+                // definitely-stream argument consumed (mirrors the IR's `move_streamish_arg`).
+                // `all_arg_exprs[0]` is the receiver; `concat`'s second stream arg is also covered.
+                if !partial && self.callee_routes_to_stream_op(method) {
+                    let pairs: Vec<(&Expr, Type)> = all_arg_exprs
+                        .iter()
+                        .copied()
+                        .zip(all_args.iter())
+                        .map(|(e, t)| (e, t.ty()))
+                        .collect();
+                    self.consume_definite_stream_args(pairs.iter().map(|(e, t)| (*e, t)));
+                }
+
                 // Receiver-dependent std/iter combinator return (unification Stage 2): when the dot
                 // receiver is a Stream and `method` is a std/iter combinator, re-type the eager
                 // array result to its stream-shaped form. Skipped for partial application.
@@ -667,6 +721,20 @@ impl Checker {
             for arg in arg_exprs {
                 all_args.push(self.infer_expr(arg)?);
             }
+        }
+        // Affine consume (fallback path): mirror the typed-method path so a stream-routing op that
+        // somehow reaches here still consumes its definitely-stream argument(s).
+        if !partial && self.callee_routes_to_stream_op(method) {
+            let all_arg_exprs: Vec<&Expr> = std::iter::once(receiver)
+                .chain(args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]).iter())
+                .collect();
+            let pairs: Vec<(&Expr, Type)> = all_arg_exprs
+                .iter()
+                .copied()
+                .zip(all_args.iter())
+                .map(|(e, t)| (e, t.ty()))
+                .collect();
+            self.consume_definite_stream_args(pairs.iter().map(|(e, t)| (*e, t)));
         }
         // var-capture check for pool.async(f) / pool.async(fs) (fallback path).
         if method == "lin_async" || method == "lin_pool_async" {
@@ -740,17 +808,35 @@ impl Checker {
     }
 }
 
-/// True for an OWNERSHIP-TAKING stream operation (streams brief §7): the adapters and terminal
-/// drivers that MOVE their stream argument and must not be followed by another use of the same
-/// binding. Borrowing ops that read/close a stream in place without consuming the whole pipeline
-/// (`read`/`readChunk`/`close`/`closeStream`) are deliberately ABSENT, so a low-level pull loop
-/// may read the same stream binding repeatedly. Keyed on the std/stream (and std/net/process/io)
-/// wrapper names, which are how user code names these ops at the call/dot-call site.
-pub(crate) fn is_stream_consuming_op(name: &str) -> bool {
+/// The std/stream exports that take OWNERSHIP of their `Stream` argument (streams brief §7/§9):
+/// every stream-specific op in `stdlib/stream.lin`. Each is a wrapper over a `lin_stream_*`
+/// intrinsic that moves the boxed-stream pointer, so the IR's `move_streamish_arg`
+/// (lin-ir/src/lower.rs) unregisters the arg from the caller's owning scope — the caller must
+/// never use it again. There are NO borrow ops among the exports: even `close` ENDS the stream's
+/// life (its box is released), and `promise` MOVES the whole pipeline onto a worker thread (the
+/// worker becomes its sole owner — a parent reuse is a cross-thread use-after-move). This set MUST
+/// stay in sync with `move_streamish_arg`'s rule (any streamish arg is moved); it exists only to
+/// avoid consuming a stream passed to a NON-stream callee (none exist today — Stream is opaque and
+/// rejected everywhere else — but the gate keeps the rule precise and divergence-proof).
+fn is_std_stream_consuming_export(export_name: &str) -> bool {
     matches!(
-        name,
-        "lines" | "map" | "filter" | "take" | "chunks" | "writeStream"
-            | "drain" | "collect" | "readText" | "for"
+        export_name,
+        "lines" | "linesMax" | "chunks" | "writeStream" | "drain" | "collect"
+            | "readText" | "close" | "promise"
+    )
+}
+
+/// The std/iter combinator exports that dispatch to a `lin_stream_*` backend when their iterable
+/// arg0 is a Stream (the SAME set as `stream_combinator_intrinsic_name` in lin-ir/src/lower.rs and
+/// the re-typing set in `streamish_combinator_ret` above). On a definitely-stream arg0 the IR
+/// redirects the call to the lazy backend, which MOVES the stream — so these consume it too.
+/// `concat` takes TWO streams; BOTH are moved into the ConcatSource (handled by per-argument
+/// consumption below, not arity-special-cased here).
+fn is_std_iter_stream_combinator(export_name: &str) -> bool {
+    matches!(
+        export_name,
+        "map" | "filter" | "take" | "drop" | "flatMap" | "takeWhile" | "dropWhile"
+            | "flatten" | "concat" | "reduce" | "find" | "some" | "every" | "while" | "for"
     )
 }
 
