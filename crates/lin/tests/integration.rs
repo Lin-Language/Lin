@@ -4950,6 +4950,33 @@ fn test_fmt_ruleC_over_two_chain_always_multiline() {
 }
 
 #[test]
+fn test_fmt_overbudget_test_lambda_keeps_name_on_call_line() {
+    // An over-80 `test("long name", () => [ … ])` must NOT fully-split the arg list (which
+    // would strand the name on its own line and lose `=> [`). The lambda's array body breaks
+    // instead, keeping the name + `=>` on the call line.
+    let long = "n".repeat(60);
+    // Single-element body → `=> [` collapse with `])` close.
+    let single = format!(
+        "import {{ test, expect, toBe, suite }} from \"std/test\"\nval s = suite(\"x\", [test(\"{}\", () => [expect(f(1)).toBe(5)])])\n",
+        long
+    );
+    let so = fmt(&single);
+    assert!(so.contains(&format!("test(\"{}\", () => [", long)), "name/=> [ left the call line:\n{}", so);
+    assert!(so.contains("\n  ])"), "single-element close should be `])`:\n{}", so);
+    assert!(!so.contains("\n    () =>"), "arg list should NOT fully-split:\n{}", so);
+    assert_eq!(so, fmt(&so), "not idempotent:\n{}", so);
+
+    // Multi-element body → `=>` then body on its own line, `)` dedented.
+    let multi = format!(
+        "import {{ test, expect, toBe, suite }} from \"std/test\"\nval s = suite(\"x\", [test(\"{}\", () => [expect(f(1)).toBe(5), expect(f(2)).toBe(9)])])\n",
+        long
+    );
+    let mo = fmt(&multi);
+    assert!(mo.contains(&format!("test(\"{}\", () =>", long)), "name/=> left the call line:\n{}", mo);
+    assert_eq!(mo, fmt(&mo), "multi not idempotent:\n{}", mo);
+}
+
+#[test]
 fn test_fmt_opt_in_match_alignment() {
     // Opt-in: a match whose `=>` the author column-aligned stays aligned, with padding
     // recomputed from the FORMATTED head widths (so string-key shorthand reflow is fine).

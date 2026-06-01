@@ -35,9 +35,9 @@ val recoverInt = (result: Json): Int32 =>
 
 val pool = threadPool(50)
 var promises = []
-range(0, 200).for((i) => push(promises, pool.poolAsync(() => task(i))))
+range(0, 200).for(i => push(promises, pool.poolAsync(() => task(i))))
 
 var sum = 0
-promises.for((p) => sum = sum + recoverInt(await(p)))
+promises.for(p => sum = sum + recoverInt(await(p)))
 
 print("RESULT=${toString(sum)}")

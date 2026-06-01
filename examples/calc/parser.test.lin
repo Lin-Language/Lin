@@ -3,6 +3,7 @@
 // Token fixtures are built directly (not via the lexer) so this suite tests the
 // parser alone: precedence in the produced AST, paren grouping, full-stream
 // consumption, and the failure results for malformed / trailing / bad input.
+
 import { expect, toBe, toSucceed, toFail, test, suite, run } from "std/test"
 import { parse, Token } from "./parser"
 
@@ -18,9 +19,11 @@ val s = suite("parser", [
   // --- Happy paths: AST shape ---
   test("parses a single number into a num node", () =>
     val ast = parse([num("42")])["value"]
-    [expect(ast["kind"]).toBe("num"), expect(ast["value"]).toBe(42)]
+    [
+      expect(ast["kind"]).toBe("num"),
+      expect(ast["value"]).toBe(42)
+    ]
   ),
-
   test("parses addition into a binop node", () =>
     val ast = parse([num("1"), op("+"), num("2")])["value"]
     [
@@ -34,29 +37,16 @@ val s = suite("parser", [
   // --- Precedence: * binds tighter than +, encoded in the tree shape ---
   test("builds a precedence-correct tree for 2 + 3 * 4", () =>
     // expect + at the root with 3*4 on the right
-    val ast = parse([
-      num("2"),
-      op("+"),
-      num("3"),
-      op("*"),
-      num("4")
-    ])["value"]
+    val ast = parse([num("2"), op("+"), num("3"), op("*"), num("4")])["value"]
     [
       expect(ast["op"]).toBe("+"),
       expect(ast["left"]["value"]).toBe(2),
       expect(ast["right"]["op"]).toBe("*")
     ]
   ),
-
   test("subtraction is left-associative (10 - 3 - 2)", () =>
     // ((10 - 3) - 2): root '-' with a '-' on the left
-    val ast = parse([
-      num("10"),
-      op("-"),
-      num("3"),
-      op("-"),
-      num("2")
-    ])["value"]
+    val ast = parse([num("10"), op("-"), num("3"), op("-"), num("2")])["value"]
     [
       expect(ast["op"]).toBe("-"),
       expect(ast["left"]["op"]).toBe("-"),
@@ -66,15 +56,7 @@ val s = suite("parser", [
 
   // --- Parentheses override precedence ---
   test("parentheses regroup (2 + 3) * 4", () =>
-    val ast = parse([
-      lp(),
-      num("2"),
-      op("+"),
-      num("3"),
-      rp(),
-      op("*"),
-      num("4")
-    ])["value"]
+    val ast = parse([lp(), num("2"), op("+"), num("3"), rp(), op("*"), num("4")])["value"]
     [
       expect(ast["op"]).toBe("*"),
       expect(ast["left"]["op"]).toBe("+"),
@@ -83,31 +65,23 @@ val s = suite("parser", [
   ),
 
   // --- Success/failure results ---
-  test(
-    "a complete expression succeeds",
-    () => [expect(parse([num("3"), op("*"), num("3")])).toSucceed()]
-  ),
-
-  test("an empty token stream fails to parse", () => [expect(parse([])).toFail()]),
-
-  test(
-    "a trailing operand fails (incomplete expression)",
-    () => [expect(parse([num("1"), op("+")])).toFail()]
-  ),
-
-  test(
-    "an unbalanced paren fails",
-    () => [expect(parse([lp(), num("1"), op("+"), num("2")])).toFail()]
-  ),
-
-  test(
-    "trailing input after a complete expression fails",
-    () => [expect(parse([num("1"), num("2")])).toFail()]
-  ),
-
-  test(
-    "a bad token fails to parse",
-    () => [expect(parse([num("1"), bad("@"), num("2")])).toFail()]
-  )
+  test("a complete expression succeeds", () => [
+    expect(parse([num("3"), op("*"), num("3")])).toSucceed()
+  ]),
+  test("an empty token stream fails to parse", () => [
+    expect(parse([])).toFail()
+  ]),
+  test("a trailing operand fails (incomplete expression)", () => [
+    expect(parse([num("1"), op("+")])).toFail()
+  ]),
+  test("an unbalanced paren fails", () => [
+    expect(parse([lp(), num("1"), op("+"), num("2")])).toFail()
+  ]),
+  test("trailing input after a complete expression fails", () => [
+    expect(parse([num("1"), num("2")])).toFail()
+  ]),
+  test("a bad token fails to parse", () => [
+    expect(parse([num("1"), bad("@"), num("2")])).toFail()
+  ]),
 ])
 run(s)

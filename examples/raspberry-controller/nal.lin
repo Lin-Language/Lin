@@ -28,6 +28,7 @@
 // `data` is the NAL bytes WITHOUT the start code (matching NalUnit.data).
 //
 // Stdlib used: std/array — slice, length, push.
+
 import { slice, length, push } from "std/array"
 
 // One parsed NAL unit: its type (low 5 bits of the first byte) and the unit's
@@ -44,20 +45,11 @@ export val startCodeAt = (b: UInt8[], i: Int32): Int32 =>
         if i + 4 <= length(b) then
           if b[i + 2] == 0 then
             if b[i + 3] == 1 then 4 else 0
-          else if b[i + 2] == 1 then
-            3
-          else
-            0
-        else if b[i + 2] == 1 then
-          3
-        else
-          0
-      else
-        0
-    else
-      0
-  else
-    0
+          else if b[i + 2] == 1 then 3 else 0
+        else if b[i + 2] == 1 then 3 else 0
+      else 0
+    else 0
+  else 0
 
 // Emit the NAL spanning [lo, hi) into acc (skipping empties), nal_type = data[0]
 // & 0x1F. Matches the Rust `if !nal_data.is_empty()` guard.
@@ -65,15 +57,13 @@ val emitNal = (b: UInt8[], lo: Int32, hi: Int32, acc: NalUnit[]): Null =>
   if hi > lo then
     val data: UInt8[] = slice(b, lo, hi)
     push(acc, { "nalType": data[0] & 0x1F, "data": data })
-  else
-    null
+  else null
 
 // Recursive scan: i = cursor, start = index of the current NAL's first byte
 // (start < 0 means "no NAL open yet"), acc = accumulating result array. On each
 // start code, flush the open NAL (if any) and begin a new one after the code.
 val scan = (b: UInt8[], i: Int32, start: Int32, acc: NalUnit[]): Null =>
-  if i >= length(b) then
-    null
+  if i >= length(b) then null
   else
     val sc = startCodeAt(b, i)
     if sc > 0 then

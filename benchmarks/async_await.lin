@@ -15,7 +15,7 @@ val roundTrip = (k: Int32): Int32 =>
   await(async(() => k * 2 + 1))
 
 var sum = 0
-range(0, 20000).for((i) => sum = sum + roundTrip(i))
+range(0, 20000).for(i => sum = sum + roundTrip(i))
 
 // Checksum keeps the whole computation live (prevents dead-code elimination).
 print(toString(sum))

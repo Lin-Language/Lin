@@ -1,6 +1,7 @@
 // Unit suite for bits.lin — the bit-twiddling helpers in isolation, plus the
 // low-level language coverage that lives with them (plain bitwise operators and
 // flat-array element typing for small integer types).
+
 import { expect, toBe, test, suite, run } from "std/test"
 import { packNibbles, highNibble, lowNibble, nalType, checksum } from "./bits"
 import { length, slice } from "std/array"
@@ -18,30 +19,27 @@ val s = suite("bits", [
       expect(lowNibble(b)).toBe(5)
     ]
   ),
-
-  test(
-    "masks the low nibble of its low argument",
-    () => [expect(packNibbles(0x1, 0xFF)).toBe(0x1F)]
-  ),
-
-  test(
-    "highNibble / lowNibble split a byte",
-    () => [expect(highNibble(0xAB)).toBe(0xA), expect(lowNibble(0xAB)).toBe(0xB)]
-  ),
+  test("masks the low nibble of its low argument", () => [
+    // high bits of `low` must be dropped
+    expect(packNibbles(0x1, 0xFF)).toBe(0x1F)
+  ]),
+  test("highNibble / lowNibble split a byte", () => [
+    expect(highNibble(0xAB)).toBe(0xA),
+    expect(lowNibble(0xAB)).toBe(0xB)
+  ]),
 
   // --- Field extraction ---
-  test(
-    "extracts a NAL-type field (low 5 bits)",
-    () => [expect(nalType(0x67)).toBe(7), expect(nalType(0x1F)).toBe(31)]
-  ),
+  test("extracts a NAL-type field (low 5 bits)", () => [
+    expect(nalType(0x67)).toBe(7),
+    expect(nalType(0x1F)).toBe(31)
+  ]),
 
   // --- Checksum ---
   test("XOR checksum over a byte list", () => [
     expect(checksum([1, 2, 3])).toBe(0),
     expect(checksum([255, 1, 2])).toBe(252),
     expect(checksum([])).toBe(0)
-  ]
-  ),
+  ]),
 
   // --- Plain bitwise operators (the byte-language features bits.lin homes) ---
   test("plain bitwise operators", () => [
@@ -50,49 +48,46 @@ val s = suite("bits", [
     expect(0b1100 ^ 0b1010).toBe(6),
     expect(1 << 4).toBe(16),
     expect(255 >> 4).toBe(15)
-  ]
-  ),
+  ]),
 
   // --- Flat-array element typing for small integer types ---
   test("UInt8 flat array holds 0..255 unboxed", () =>
     val buf: UInt8[] = [0x48, 0x49, 0xFF]
-    [expect(length(buf)).toBe(3), expect(buf[2]).toBe(255)]
+    [
+      expect(length(buf)).toBe(3),
+      expect(buf[2]).toBe(255)
+    ]
   ),
-
   test("Int8 flat array round-trips negatives", () =>
-    val signed: Int8[] = [-1, -128, 127]
+    val signed: Int8[] = [ -1, -128, 127]
     [
       expect(signed[0]).toBe(-1),
       expect(signed[1]).toBe(-128),
       expect(signed[2]).toBe(127)
     ]
   ),
-
   test("slice preserves the flat element type", () =>
-    val buf: UInt8[] = [
-      1,
-      2,
-      3,
-      4,
-      5
+    val buf: UInt8[] = [1, 2, 3, 4, 5]
+    [
+      expect(buf.slice(1, 4)).toBe([2, 3, 4])
     ]
-    [expect(buf.slice(1, 4)).toBe([2, 3, 4])]
   ),
-
   test("concat preserves the flat element type (byte-level reads still work)", () =>
     val a: UInt8[] = [0, 1]
     val b: UInt8[] = [2, 3]
     val joined = a.concat(b)
-    [expect(length(joined)).toBe(4), expect(joined[3]).toBe(3)]
+    [
+      expect(length(joined)).toBe(4),
+      expect(joined[3]).toBe(3)
+    ]
   ),
-
   test("u32 big-endian round-trip", () =>
-    val v = 305419896.toUInt64().toUInt32()
+    val v = (305419896).toUInt64().toUInt32()
     val bytes = u32ToBe(v)
     [
       expect(length(bytes)).toBe(4),
       expect(u32FromBe(bytes, 0).toFloat64().toInt32()).toBe(305419896)
     ]
-  )
+  ),
 ])
 run(s)

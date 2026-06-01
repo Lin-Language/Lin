@@ -58,6 +58,12 @@ thread_local! {
     /// canonical and a between-`=>`-and-body comment is hoisted to the statement.
     static HOIST_BODIES: RefCell<std::collections::HashSet<u32>> =
         RefCell::new(std::collections::HashSet::new());
+    /// One-shot: when set, the NEXT `fmt_function` whose body is a collection literal renders
+    /// that body multi-line and clears the flag. Used by `fmt_call_arglist` for an over-budget
+    /// `test("long name", () => [ … ])` so the array breaks (keeping `=> [` on the call line)
+    /// rather than the arg list fully splitting. Distinct from FORCE_ML, which `fmt_function`
+    /// deliberately clears at a lambda boundary (Rule 4 is about nested JSON, not lambda code).
+    static FORCE_NEXT_LAMBDA_BODY_ML: RefCell<bool> = const { RefCell::new(false) };
 }
 
 /// True if `body_start` is a Rule 6 hoist target (a last-arg lambda array/object body of a
@@ -391,6 +397,7 @@ impl Formatter {
         LINE_STARTS.with(|c| c.borrow_mut().clear());
         SOURCE_CHARS.with(|c| c.borrow_mut().clear());
         HOIST_BODIES.with(|c| c.borrow_mut().clear());
+        FORCE_NEXT_LAMBDA_BODY_ML.with(|c| *c.borrow_mut() = false);
         out
     }
 }
@@ -1646,7 +1653,18 @@ fn fmt_function(
         && !author_body_on_new_line
         && matches!(body, Expr::Array(..) | Expr::Object(..))
     {
-        let body_str = fmt_expr(body, false, ind);
+        // An over-budget enclosing call (e.g. `test("long name", () => [ … ])`) sets
+        // FORCE_NEXT_LAMBDA_BODY_ML so this collection body breaks — keeping `=> [` on the call
+        // line rather than fully splitting the arg list. The flag is one-shot (consumed here,
+        // not propagated into nested lambdas). FORCE_ML can't be reused: `fmt_expr`'s Function
+        // arm clears it at the lambda boundary (Rule 4). When set, render the body with FORCE_ML
+        // so its (and only its top-level) literal breaks.
+        let forced = FORCE_NEXT_LAMBDA_BODY_ML.with(|c| c.replace(false));
+        let body_str = if forced {
+            with_force_ml(true, || fmt_expr(body, false, ind))
+        } else {
+            fmt_expr(body, false, ind)
+        };
         if body_str.contains('\n') {
             return format!("{} => {}", param_part, body_str);
         }
@@ -1949,6 +1967,38 @@ fn fmt_call_arglist(args: &[Expr], ind: &str) -> String {
             return format!("({}, {}\n{})", lead.join(", "), last, ind);
         }
         return format!("({}, {})", lead.join(", "), last);
+    }
+
+    // OVER-BUDGET TRAILING LAMBDA-WITH-COLLECTION-BODY: the call exceeds 80 cols but no arg is
+    // multi-line on its own — `test("long name", () => [ … ])`. Fully splitting the arg list
+    // would strand the leading string on its own line and lose the idiomatic `=> [`. Instead,
+    // FORCE the trailing lambda's collection body multi-line (a lambda with a *block* body is
+    // already multi-line and took the 5a path above), keeping the leading args + `=> [` on the
+    // call line and breaking the array beneath, `)` dedented on its own line.
+    let n = args.len();
+    let last_is_lambda_collection = matches!(
+        &args[n - 1],
+        Expr::Function { body, .. } if matches!(**body, Expr::Array(..) | Expr::Object(..))
+    );
+    let leading_single = multiline_flags[..n - 1].iter().all(|b| !b);
+    if last_is_lambda_collection && leading_single {
+        FORCE_NEXT_LAMBDA_BODY_ML.with(|c| *c.borrow_mut() = true);
+        let last = fmt_expr(&args[n - 1], false, ind);
+        FORCE_NEXT_LAMBDA_BODY_ML.with(|c| *c.borrow_mut() = false); // clear if unused
+        if last.contains('\n') {
+            // Two shapes for the forced body, both acceptable:
+            //  - `=> [` collapsed (Rule 5a): `last` ends with the literal's `]`/`}` at the call
+            //    indent — glue `)` directly so the close reads `])` / `})` (no stray line).
+            //  - `=>` then body on its own line: `last`'s `]`/`}` is at child indent — put `)`
+            //    on its own line at the call indent.
+            let last_line = last.rsplit('\n').next().unwrap_or("");
+            let collapsed = last_line == format!("{}]", ind) || last_line == format!("{}}}", ind);
+            let lead = if n == 1 { String::new() } else { format!("{}, ", inline_args[..n - 1].join(", ")) };
+            if collapsed {
+                return format!("({}{})", lead, last);
+            }
+            return format!("({}{}\n{})", lead, last, ind);
+        }
     }
 
     // FULLY-SPLIT style (5b): one arg per line at child_ind, close paren at `ind`.
