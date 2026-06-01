@@ -460,8 +460,8 @@ print(toString(factorial(0)))
 fn test_for_and_range() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { range } from "std/array"
-import { for } from "std/array"
+import { range } from "std/iter"
+import { for } from "std/iter"
 
 range(1, 4).for(i => print(toString(i)))
 "#);
@@ -477,7 +477,7 @@ range(1, 4).for(i => print(toString(i)))
 fn test_split_result_iterates_as_strings() {
     let output = run(r#"import { print } from "std/io"
 import { split } from "std/string"
-import { for, map } from "std/array"
+import { for, map } from "std/iter"
 
 val parts = split("alpha,beta,gamma", ",")
 parts.for(s => print(s))
@@ -498,7 +498,7 @@ wrapped.for(s => print(s))
 fn test_loop_accumulates_toplevel_var() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { range, for } from "std/array"
+import { range, for } from "std/iter"
 
 var total = 0
 range(0, 5).for(i => total = total + i)
@@ -513,7 +513,7 @@ print(toString(total))
 fn test_nested_loops_with_var_accumulators() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { range, for } from "std/array"
+import { range, for } from "std/iter"
 
 val work = (n: Int32): Int32 =>
   var s = 0
@@ -539,7 +539,7 @@ print(toString(total))
 fn test_map_in_loop_discarded_cell_free() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { range, for, map } from "std/array"
+import { range, for, map } from "std/iter"
 
 val outer = range(0, 5000)
 var c = 0
@@ -581,7 +581,7 @@ print(toString(c()))
 fn test_combinators_with_var_cells_correct_after_free() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map, filter, reduce, find, some, every } from "std/array"
+import { map, filter, reduce, find, some, every } from "std/iter"
 
 print(toString([1, 2, 3].map(x => x * 2)))
 print(toString([1, 2, 3, 4].filter(x => x > 2)))
@@ -602,7 +602,7 @@ print(toString([1, 2, 3].every(x => x > 0)))
 fn test_nested_for_over_concrete_array_arg_box() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { range, for } from "std/array"
+import { range, for } from "std/iter"
 
 var k = 0
 val xs = [1, 2, 3]
@@ -619,7 +619,8 @@ print(toString(k))
 fn test_object_to_json_param_under_churn() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { range, for, length } from "std/array"
+import { length } from "std/array"
+import { range, for } from "std/iter"
 import { keys } from "std/object"
 
 val o = {"a": 1, "b": 2}
@@ -635,8 +636,8 @@ print(toString(n))
 fn test_map_filter_reduce() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map, filter, reduce } from "std/array"
-import { for } from "std/array"
+import { map, filter, reduce } from "std/iter"
+import { for } from "std/iter"
 
 val doubled = [1, 2, 3].map(x => x * 2)
 doubled.for(x => print(toString(x)))
@@ -654,7 +655,7 @@ print(toString(total))
 fn test_chaining() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map, filter, reduce } from "std/array"
+import { map, filter, reduce } from "std/iter"
 
 val result = [1, 2, 3, 4, 5]
   .map(x => x * x)
@@ -762,7 +763,7 @@ print(toString(x))
 fn test_multi_param_lambda() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { reduce } from "std/array"
+import { reduce } from "std/iter"
 
 val total = [1, 2, 3].reduce(0, (sum, x) => sum + x)
 print(toString(total))
@@ -1476,7 +1477,7 @@ print(toString(length({ "a": 1, "b": 2 })))
 fn test_multiline_chain() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map, filter, reduce } from "std/array"
+import { map, filter, reduce } from "std/iter"
 
 val nums = [1, 2, 3, 4, 5, 6]
 val result = nums
@@ -1499,7 +1500,7 @@ fn test_val_bound_multiline_chain_in_fn_body() {
     // mirroring its `&&`/`||` continuation handling. (block/dot-chain indent-balance bug)
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map, filter } from "std/array"
+import { map, filter } from "std/iter"
 
 val f = (xs: Json): Json =>
   val ys = xs
@@ -1661,7 +1662,7 @@ fn test_imported_fn_passed_as_value() {
         "export val double = (x: Int32): Int32 => x * 2\n").unwrap();
     let main = format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
-import {{ map }} from "std/array"
+import {{ map }} from "std/iter"
 import {{ double }} from "{}/lib"
 val doubled = [1, 2, 3].map(double)
 print(toString(doubled))
@@ -1819,8 +1820,8 @@ val bad = (a: Int32, b: Int32 = 1, c: Int32) => a + b + c
 fn test_iter_builtin() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { iter } from "std/array"
-import { for } from "std/array"
+import { iter } from "std/iter"
+import { for } from "std/iter"
 
 val myIter = iter(
   () => 0,
@@ -2081,7 +2082,7 @@ fn test_map_returns_capturing_closures() {
     // because the captured value pointed at freed-then-reused memory.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map } from "std/array"
+import { map } from "std/iter"
 
 val thunks = map([5, 6, 7], i => () => i)
 print(toString(thunks[0]()))
@@ -2142,7 +2143,7 @@ fn test_named_fn_in_map() {
     // `Function` value to `map`, hitting the same boxed-vs-concrete closure-wrapper mismatch.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map, for } from "std/array"
+import { map, for } from "std/iter"
 
 val dbl = (x: Int32): Int32 => x * 2
 [1, 2, 3].map(dbl).for(v => print(toString(v)))
@@ -2229,7 +2230,7 @@ print(classify(5))
 fn test_multi_statement_lambda_in_parens() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { for } from "std/array"
+import { for } from "std/iter"
 
 val data = [1, 2, 3]
 data.for(x =>
@@ -2243,7 +2244,7 @@ data.for(x =>
 #[test]
 fn test_bare_expr_side_effects_in_inline_lambda() {
     let output = run(r#"import { print } from "std/io"
-import { for } from "std/array"
+import { for } from "std/iter"
 
 val data = [1, 2, 3]
 data.for(x =>
@@ -2298,8 +2299,8 @@ print(toString(result))
 fn test_multi_statement_paren_function() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map } from "std/array"
-import { for } from "std/array"
+import { map } from "std/iter"
+import { for } from "std/iter"
 
 val result = [10, 20, 30].map((x) =>
   val y = x + 1
@@ -2314,8 +2315,9 @@ result.for(r => print(toString(r)))
 fn test_push_and_concat() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { length, push, concat } from "std/array"
-import { for } from "std/array"
+import { length, push } from "std/array"
+import { concat } from "std/iter"
+import { for } from "std/iter"
 
 val arr = [1, 2]
 push(arr, 3)
@@ -2363,7 +2365,7 @@ fn test_keys_values_entries() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { keys, values } from "std/object"
-import { for } from "std/array"
+import { for } from "std/iter"
 
 val obj = { "a": 1, "b": 2 }
 val ks = keys(obj)
@@ -2379,7 +2381,7 @@ fn test_stdlib_array_find_some_every() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 
-import { find, some, every } from "std/array"
+import { find, some, every } from "std/iter"
 val nums = [1, 2, 3, 4, 5]
 print(toString(nums.find(x => x > 3)))
 print(toString(nums.find(x => x > 10)))
@@ -2395,8 +2397,9 @@ print(toString(nums.every(x => x > 2)))
 fn test_stdlib_array_flatmap_indexof_reverse() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { flatMap, indexOf, reverse } from "std/array"
-import { for } from "std/array"
+import { indexOf, reverse } from "std/array"
+import { flatMap } from "std/iter"
+import { for } from "std/iter"
 
 val nums = [1, 2, 3]
 val pairs = nums.flatMap(x => [x, x * 10])
@@ -2432,8 +2435,8 @@ print(isEvenDesc(3))
 fn test_forward_reference_in_closure() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map } from "std/array"
-import { for } from "std/array"
+import { map } from "std/iter"
+import { for } from "std/iter"
 
 val process = (items: Json): Json =>
   items.map(x => transform(x))
@@ -2845,7 +2848,7 @@ fn test_stress_high_fanout_parallel() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { parallel } from "std/async"
-import { reduce } from "std/array"
+import { reduce } from "std/iter"
 
 val results = parallel([
   () => 1, () => 2, () => 3, () => 4, () => 5, () => 6,
@@ -2864,7 +2867,7 @@ fn test_stress_pool_many_short_tasks() {
 import { toString } from "std/string"
 import { await, threadPool, poolAsync } from "std/async"
 import { push, length } from "std/array"
-import { for, range } from "std/array"
+import { for, range } from "std/iter"
 
 val unwrap = (r: Json): Int32 =>
   match r
@@ -2886,7 +2889,7 @@ fn test_stress_worker_churn() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { worker, request, close } from "std/async"
-import { for, range } from "std/array"
+import { for, range } from "std/iter"
 
 var total = 0
 range(0, 30).for(i =>
@@ -3388,8 +3391,8 @@ print(toString(await(p)))
 fn test_iterator_restart() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { iter } from "std/array"
-import { for } from "std/array"
+import { iter } from "std/iter"
+import { for } from "std/iter"
 
 val counter = iter(
   () => 0,
@@ -3468,7 +3471,8 @@ fn test_stream_csv_pipeline_drain() {
     let output = run(&format!(r#"import {{ print }} from "std/io"
 import {{ readStream, lines, map, filter, writeStream, drain }} from "std/stream"
 import {{ split, join }} from "std/string"
-import {{ map as amap, length }} from "std/array"
+import {{ length }} from "std/array"
+import {{ map as amap }} from "std/iter"
 
 val notEmpty = (line: String): Boolean => length(line) > 0
 val quoteFields = (line: String): String =>
@@ -4100,7 +4104,7 @@ print(toString(isOdd(3)))
 #[test]
 fn test_io_lines_reads_all_stdin_lines() {
     let output = run_with_stdin(r#"import { print } from "std/io"
-import { for } from "std/array"
+import { for } from "std/iter"
 import { lines } from "std/io"
 val all = lines()
 all.for(line => print(line))
@@ -4242,7 +4246,7 @@ fn fmt(source: &str) -> String {
 fn test_fmt_idempotent() {
     // Source with varied constructs: if/match/function/objects/arrays/imports/types.
     let source = r#"import { print } from "std/io"
-import { map, filter, reduce, for } from "std/array"
+import { map, filter, reduce, for } from "std/iter"
 import { toString } from "std/string"
 
 type Point = { "x": Int32, "y": Int32 }
@@ -4469,7 +4473,7 @@ fn test_bitwise_boxed_operands() {
     // `.into_int_value()` was called on a pointer value.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { reduce } from "std/array"
+import { reduce } from "std/iter"
 
 print(toString([1, 2, 4, 8].reduce(0, (acc, x) => acc | x)))
 print(toString([15, 7, 3].reduce(255, (acc, x) => acc & x)))
@@ -4536,7 +4540,7 @@ fn test_concrete_rc_cell_reassignment_in_loop() {
     // garbage output). A 5000-iteration loop would corrupt or leak; with the fix it runs
     // cleanly and yields the final value deterministically.
     let output = run(r#"import { print } from "std/io"
-import { for, range } from "std/array"
+import { for, range } from "std/iter"
 import { trim, repeat } from "std/string"
 
 val build = (): String =>
@@ -4557,7 +4561,7 @@ fn test_concrete_rc_global_var_reassignment_in_loop() {
     // Same fix, exercised through the top-level `var` (module-global) path: a concrete-rc
     // global reassigned inside a closure must release its old value and retain the new one.
     let output = run(r#"import { print } from "std/io"
-import { for, range } from "std/array"
+import { for, range } from "std/iter"
 import { repeat } from "std/string"
 
 var acc = "seed"
@@ -4978,7 +4982,7 @@ fn test_json_var_object_reassign_loop_no_uaf() {
     // reassigned to a freshly-allocated OBJECT literal each iteration. Before the owning model
     // (clone-on-store/read, release-old, balanced teardown) the cell aliased a temp object that
     // was freed at closure-scope exit, so the final read saw freed/garbage memory.
-    let out = run(r#"import { range, for } from "std/array"
+    let out = run(r#"import { range, for } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -4993,7 +4997,8 @@ print(toString(acc["v"]))
 fn test_json_var_array_reassign_loop_no_uaf() {
     // Same bug, ARRAY literal variant: a captured `var: Json` reassigned to a fresh array each
     // iteration. A use-after-free here corrupted the length read (or crashed).
-    let out = run(r#"import { range, for, length } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { range, for } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5012,7 +5017,8 @@ fn test_reduce_minby_maxby_churn_no_double_free() {
     // owning model the accumulator cell owns its own box and never frees the borrowed inputs.
     // 2000 iterations of sum/min/max over churned arrays — a double-free corrupts results or
     // aborts the process.
-    let out = run(r#"import { range, for, map, reduce, minBy, maxBy, length } from "std/array"
+    let out = run(r#"import { minBy, maxBy, length } from "std/array"
+import { range, for, map, reduce } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5041,7 +5047,7 @@ fn test_generic_combinator_pipeline_inlined() {
     // pipeline `range(0,n).map(x=>x*2).filter(x=>x%3==0).reduce(0,(a,x)=>a+x)` lowers to a fully
     // unboxed flat loop (verified separately: zero per-element box/unbox in `main`). Here we assert
     // the VALUE is correct over a small n so a representation/RC bug in the inliner shows up.
-    let out = run(r#"import { range, map, filter, reduce } from "std/array"
+    let out = run(r#"import { range, map, filter, reduce } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 val total = range(0, 10).map(x => x * 2).filter(x => x % 3 == 0).reduce(0, (a, x) => a + x)
@@ -5057,7 +5063,7 @@ fn test_generic_combinator_inline_vs_closure_paths() {
     // stored/passed `Function` value must keep the (correct, boxed) closure path. Also exercises the
     // tagged String element path and a non-scalar (array) reduce accumulator (the boxed Json-phi
     // path). All four must produce the right values.
-    let out = run(r#"import { map, filter, reduce } from "std/array"
+    let out = run(r#"import { map, filter, reduce } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5089,7 +5095,8 @@ fn test_concat_fresh_strings_no_use_after_free() {
     // copy now retains; the result owns its elements independently. Uses interpolated (non-interned
     // per-iteration) strings so the elements are genuinely heap-owned and a missing retain faults.
     let out = run(r#"import { print } from "std/io"
-import { concat, range, for, length } from "std/array"
+import { length } from "std/array"
+import { concat, range, for } from "std/iter"
 import { toString } from "std/string"
 val mk = (n: Int32): String => "item-${n}-${n * 13}"
 var acc: String[] = []
@@ -5113,7 +5120,8 @@ fn test_for_callback_json_assign_loop_correct() {
     // discarded return and never the value the cell keeps. Over 5000 iterations a wrong release
     // (double-free / use-after-free) corrupts the final length or aborts. The final array must
     // contain all 5000 appended elements.
-    let out = run(r#"import { range, for, concat, length } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { range, for, concat } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5131,7 +5139,7 @@ fn test_for_callback_side_effect_sum_loop_correct() {
     // each iteration (a fresh, independently-owned box once `s` grows past the small-int cache);
     // the fix releases that discarded box every iteration. Correctness must be unaffected:
     // sum(0..10000) = 10000*9999/2 = 49995000.
-    let out = run(r#"import { range, for } from "std/array"
+    let out = run(r#"import { range, for } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5150,7 +5158,7 @@ fn test_for_element_box_flat_array_churn_correct() {
     // `lin_tagged_free_box_if_distinct` (skipping when the callback returned that very box, e.g.
     // an identity body). Over 50000 iterations correctness must be unaffected: a wrong (double)
     // free would abort or corrupt the accumulator. sum(0..50000) = 50000*49999/2 = 1249975000.
-    let out = run(r#"import { range, for } from "std/array"
+    let out = run(r#"import { range, for } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5169,7 +5177,7 @@ fn test_for_element_box_tagged_array_churn_correct() {
     // read again on every pass. Also covers a callback that PASSES the element to another function
     // (`contains`), proving the shared inner is intact. 20000 passes over the 3-element array; a
     // wrong inner release would free a live string and abort/corrupt the count.
-    let out = run(r#"import { for, range } from "std/array"
+    let out = run(r#"import { for, range } from "std/iter"
 import { contains } from "std/string"
 import { print } from "std/io"
 import { toString } from "std/string"
@@ -5228,7 +5236,8 @@ fn test_concat_preserves_flat_element_type() {
     // TaggedVal bytes and decoded garbage (e.g. 33554432 instead of 2864434397).
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { concat, length } from "std/array"
+import { length } from "std/array"
+import { concat } from "std/iter"
 import { u32FromBe } from "std/bytes"
 
 val a: UInt8[] = [170, 187]
@@ -5777,7 +5786,7 @@ fn test_concrete_string_into_json_var_loop() {
     // but never freed the transient shell, leaking ~36 bytes per iteration. The fix frees the
     // shell (FreeBoxShell) after both clones. This asserts correctness: the var must hold the
     // last assigned value and the program must not crash (no use-after-free / double-free).
-    let out = run(r#"import { range, for } from "std/array"
+    let out = run(r#"import { range, for } from "std/iter"
 import { toString } from "std/string"
 import { print } from "std/io"
 
@@ -5793,7 +5802,7 @@ fn test_concrete_object_into_json_var_loop() {
     // Regression companion to the String case: a fresh concrete Object boxed into a Json var
     // each iteration. Exercises the same transient-coercion-box free path with an Object payload
     // and confirms the final stored value is correct.
-    let out = run(r#"import { range, for } from "std/array"
+    let out = run(r#"import { range, for } from "std/iter"
 import { toString } from "std/string"
 import { print } from "std/io"
 
@@ -5886,7 +5895,8 @@ fn test_discarded_map_result_in_loop_correct() {
     // iteration leak. The fix registers union import-fn call results so scope exit tag-releases
     // them. Correctness gate: over 20000 iterations, summing the lengths must stay exact and the
     // process must not abort (a wrong release would double-free the map result). 20000 * 3 = 60000.
-    let out = run(r#"import { range, for, map, length } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { range, for, map } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5907,7 +5917,8 @@ fn test_discarded_filter_result_in_loop_correct() {
     // the source literal or the count. 20000 iterations; each filter keeps the 2 elements > 0
     // (1 and 2 are always > i is false for i>=1, so use a fixed predicate): [1,2,3,4] filtered by
     // x > 2 yields [3,4] every time → 20000 * 2 = 40000.
-    let out = run(r#"import { range, for, filter, length } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { range, for, filter } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5929,7 +5940,8 @@ fn test_map_result_bound_and_returned_from_function() {
     // [..]; r` must return the array at exactly +1 (the read-retain of the trailing expression is
     // released as a redundant extra registration, fixing the return-retain leak). Calling it many
     // times and summing lengths must stay exact.
-    let out = run(r#"import { range, for, map, length } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { range, for, map } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -5969,7 +5981,7 @@ print(pluck({ "name": "Alice" }))
     // Projection returned from a map CALLBACK closure, result stored into an array then iterated:
     // each element must be an owned box the array releases exactly once.
     let out = run(r#"import { print } from "std/io"
-import { for, map } from "std/array"
+import { for, map } from "std/iter"
 val records = [{ "name": "Alice" }, { "name": "Bob" }]
 records.map(r => r["name"]).for(n => print(n))
 "#);
@@ -5978,7 +5990,7 @@ records.map(r => r["name"]).for(n => print(n))
     // Nested projection (`r["value"]["name"]`) through a map callback: the inner projection is a
     // transient read, the outer escapes — only the escaping result is cloned.
     let out = run(r#"import { print } from "std/io"
-import { map, for } from "std/array"
+import { map, for } from "std/iter"
 val records = [{ "value": { "name": "Alice" } }, { "value": { "name": "Bob" } }]
 val names = records.map(r => r["value"]["name"])
 names.for(n => print(n))
@@ -6000,7 +6012,7 @@ print(pluck({ "name": "Carol" }))
     // per-call clone is released each iteration; a relapse to the borrowed-return double-free,
     // or a per-iteration over-clone leak, would surface here / under the ASan CI leg).
     let out = run(r#"import { print } from "std/io"
-import { range, for } from "std/array"
+import { range, for } from "std/iter"
 import { toString } from "std/string"
 val pluck = (x: Json): Json => x["v"]
 var c = 0
@@ -6088,7 +6100,7 @@ print(toString(top([1, 2])))
     // re-cloned by the function return) would surface here under the ASan CI leg; functionally
     // it must just run to completion.
     let out = run(r#"import { print } from "std/io"
-import { for, range } from "std/array"
+import { for, range } from "std/iter"
 val mk = (): Json => { "type": "failure", "k": "v" }
 val pick = (i: Int32): Json =>
   val r = mk()
@@ -6116,7 +6128,7 @@ fn object_index_assign_of_callback_param() {
     // Int value via `for` callback param.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { for } from "std/array"
+import { for } from "std/iter"
 [5].for(n =>
   var o = {}
   o["x"] = n
@@ -6128,7 +6140,7 @@ import { for } from "std/array"
     // Int values accumulated via `map` callback, returning the built object.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map } from "std/array"
+import { map } from "std/iter"
 val rs = [5, 6].map(n =>
   var o = {}
   o["x"] = n
@@ -6141,7 +6153,7 @@ print(toString(rs))
     // String value via callback param.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { for } from "std/array"
+import { for } from "std/iter"
 ["hi"].for(s =>
   var o = {}
   o["msg"] = s
@@ -6154,7 +6166,7 @@ import { for } from "std/array"
     // (a boxed string key must be unboxed to a raw LinString*).
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { for } from "std/array"
+import { for } from "std/iter"
 var out = {}
 ["a", "b", "c"].for(k =>
   out[k] = 1
@@ -6166,7 +6178,7 @@ print(toString(out))
     // Churn loop: building an object via index-assign of a callback param across many
     // iterations must not leak (verified under the ASan CI leg); functionally just completes.
     let out = run(r#"import { print } from "std/io"
-import { for, range } from "std/array"
+import { for, range } from "std/iter"
 val main = (): Null =>
   range(0, 2000).for(i =>
     var o = {}
@@ -6192,7 +6204,7 @@ fn eq_boxed_key_projection_is_order_symmetric() {
     // String: boxed-key projection vs literal, both orderings.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { for } from "std/array"
+import { for } from "std/iter"
 val m = { "host": "abc" }
 ["host"].for(k =>
   print(toString(m[k] == "abc"))
@@ -6206,7 +6218,7 @@ val m = { "host": "abc" }
     // Int: boxed-key projection vs literal, both orderings.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { for } from "std/array"
+import { for } from "std/iter"
 val m = { "n": 42 }
 ["n"].for(k =>
   print(toString(m[k] == 42))
@@ -6221,7 +6233,7 @@ val m = { "n": 42 }
     // compared both orderings (and `!=`).
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { for } from "std/array"
+import { for } from "std/iter"
 val sch = { "host": { "type": "string" }, "port": { "type": "number" } }
 ["host", "port"].for(k =>
   print(toString(sch[k]["type"] == "string"))
@@ -7159,7 +7171,8 @@ fn test_generic_map_intermediate_alloc_int32_is_flat_and_correct() {
     // `val result = lin_array_allocate(n)`, written in a for-loop, returned bare.
     // Monomorphized at U=Int32 it must produce a FLAT array read flat. Before the
     // fix this printed garbage (a tagged producer read through the flat i32 accessor).
-    let out = run(r#"import { length, for as afor } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { for as afor } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
@@ -7190,7 +7203,8 @@ fn test_generic_map_intermediate_alloc_flat_path_in_ir() {
     let bin_path = ws.join(format!("target/lin_test_imap_{}", id));
     let ll_path = bin_path.with_extension("ll");
 
-    fs::write(&src_path, r#"import { length, for as afor } from "std/array"
+    fs::write(&src_path, r#"import { length } from "std/array"
+import { for as afor } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
@@ -7239,7 +7253,8 @@ fn test_generic_map_intermediate_alloc_string_stays_tagged() {
     // The SAME generic map-shape combinator instantiated at U=String (heap element):
     // must stay TAGGED and correct. Proves the intermediate-alloc refinement is gated
     // strictly to flat scalars and never corrupts a heap-element result.
-    let out = run(r#"import { length, for as afor } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { for as afor } from "std/iter"
 import { print } from "std/io"
 val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
   val n = length(arr)
@@ -7261,7 +7276,8 @@ print(tagged[1])
 fn test_generic_map_intermediate_alloc_mixed_instantiations() {
     // The SAME generic instantiated at BOTH Int32 (flat) and String (tagged) in one
     // program — each monomorph picks its own representation; both must be correct.
-    let out = run(r#"import { length, for as afor } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { for as afor } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
@@ -7287,7 +7303,8 @@ print(strs[1])
 fn test_generic_map_intermediate_alloc_json_stays_tagged() {
     // A Json (wildcard) instantiation of the same combinator stays TAGGED and correct —
     // the heterogeneous element representation is preserved.
-    let out = run(r#"import { length, for as afor } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { for as afor } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>
@@ -7314,7 +7331,8 @@ fn test_intermediate_alloc_user_annotation_is_respected() {
     // must NOT be re-pinned by the refinement — the explicit annotation wins, so the
     // binding stays tagged and the program is correct under the tagged accessor it uses.
     // Guards the `type_ann.is_some()` bail in intermediate_array_allocate_binding.
-    let out = run(r#"import { length, for as afor } from "std/array"
+    let out = run(r#"import { length } from "std/array"
+import { for as afor } from "std/iter"
 import { print } from "std/io"
 import { toString } from "std/string"
 val mymap = <T>(arr: T[]): Json[] =>
@@ -7615,14 +7633,15 @@ fn test_generic_cross_module_higher_order_map() {
     let dir = std::env::temp_dir().join(format!("lin_xgen_map_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(dir.join("helpers.lin"),
-        "import { for, push } from \"std/array\"\n\
+        "import { push } from \"std/array\"\n\
+         import { for } from \"std/iter\"\n\
          export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
            val result = []\n  \
            arr.for(item => push(result, f(item)))\n  \
            result\n").unwrap();
     let main = format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
-import {{ reduce }} from "std/array"
+import {{ reduce }} from "std/iter"
 import {{ mymap }} from "{}/helpers"
 val doubled = mymap([1, 2, 3], x => x * 2)
 print(toString(doubled.reduce(0, (acc, x) => acc + x)))
@@ -7639,14 +7658,16 @@ fn test_generic_cross_module_two_instantiations() {
     let dir = std::env::temp_dir().join(format!("lin_xgen_two_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(dir.join("helpers.lin"),
-        "import { for, push } from \"std/array\"\n\
+        "import { push } from \"std/array\"\n\
+         import { for } from \"std/iter\"\n\
          export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
            val result = []\n  \
            arr.for(item => push(result, f(item)))\n  \
            result\n").unwrap();
     let main = format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
-import {{ reduce, length }} from "std/array"
+import {{ length }} from "std/array"
+import {{ reduce }} from "std/iter"
 import {{ mymap }} from "{}/helpers"
 val ints = mymap([1, 2, 3], x => x * 10)
 val strs = mymap(["a", "b"], s => s)
@@ -7735,7 +7756,8 @@ fn test_generic_import_path_unbound_typevar_is_safe() {
     let dir = std::env::temp_dir().join(format!("lin_gap2_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(dir.join("helpers.lin"),
-        "import { for, push } from \"std/array\"\n\
+        "import { push } from \"std/array\"\n\
+         import { for } from \"std/iter\"\n\
          export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
            val result = []\n  \
            arr.for(item => push(result, f(item)))\n  \
@@ -7744,7 +7766,7 @@ fn test_generic_import_path_unbound_typevar_is_safe() {
            mymap(arr, x => x * 2)\n").unwrap();
     let main = format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
-import {{ reduce }} from "std/array"
+import {{ reduce }} from "std/iter"
 import {{ doubleAll }} from "{}/helpers"
 val r: Json = doubleAll([5, 6, 7])
 print(toString(r.reduce(0, (acc, x) => acc + x)))
@@ -7764,7 +7786,8 @@ fn test_generic_import_path_unbound_typevar_no_garbage_monomorph_in_ir() {
     let dir = ws.join(format!("target/lin_gap2_ir_{}", id));
     let _ = fs::create_dir_all(&dir);
     fs::write(dir.join("helpers.lin"),
-        "import { for, push } from \"std/array\"\n\
+        "import { push } from \"std/array\"\n\
+         import { for } from \"std/iter\"\n\
          export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
            val result = []\n  \
            arr.for(item => push(result, f(item)))\n  \
@@ -7776,7 +7799,7 @@ fn test_generic_import_path_unbound_typevar_no_garbage_monomorph_in_ir() {
     let ll_path = bin_path.with_extension("ll");
     fs::write(&src_path, format!(r#"import {{ print }} from "std/io"
 import {{ toString }} from "std/string"
-import {{ reduce }} from "std/array"
+import {{ reduce }} from "std/iter"
 import {{ doubleAll }} from "{}/helpers"
 val r: Json = doubleAll([5, 6, 7])
 print(toString(r.reduce(0, (acc, x) => acc + x)))
@@ -7849,7 +7872,7 @@ fn test_map_callback_returns_curried_closure_full_apply() {
     // vs arity disambiguation it returned garbage (a pointer reinterpreted as the value).
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { map } from "std/array"
+import { map } from "std/iter"
 val thunks = map([5, 6, 7], i => () => i)
 print(toString(thunks[0]()))
 print(toString(thunks[1]()))
@@ -7866,7 +7889,8 @@ fn test_reduce_over_push_built_flat_typed_array_reads_correctly() {
     // back to the tagged read.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { push, reduce } from "std/array"
+import { push } from "std/array"
+import { reduce } from "std/iter"
 val build = (): Int32[] =>
   val result = []
   push(result, 5)
@@ -7885,7 +7909,7 @@ fn test_filter_then_reduce_flat_pipeline_correct() {
     // reduce flat pipeline must produce the right sum and valid IR.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { range, filter, reduce } from "std/array"
+import { range, filter, reduce } from "std/iter"
 val total = range(0, 10).filter(x => x % 2 == 0).reduce(0, (acc, x) => acc + x)
 print(toString(total))
 "#);
@@ -7903,7 +7927,8 @@ fn test_filter_object_array_no_double_free() {
     // usable after the filter. Exercised both as a freshly-built source and re-read afterwards.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { filter, length } from "std/array"
+import { length } from "std/array"
+import { filter } from "std/iter"
 type Item = { "type": String, "v": Int32 }
 val items: Item[] = [
   { "type": "a", "v": 1 },
@@ -7935,7 +7960,8 @@ fn test_combinator_over_non_array_json_is_safe_noop() {
     // (array length, else 0), so iterating a non-array Json is a clean no-op and the result is empty.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-import { filter, map, reduce, for, length } from "std/array"
+import { length } from "std/array"
+import { filter, map, reduce, for } from "std/iter"
 import { contains } from "std/string"
 val mkObj = (): Json => { "type": "error", "message": "boom" }
 val v = mkObj()

@@ -1,4 +1,5 @@
-import { for, push, length } from "std/array"
+import { push, length } from "std/array"
+import { for } from "std/iter"
 import { toString } from "std/string"
 
 // A priority-queue entry: a node and its current tentative distance.

@@ -1,0 +1,162 @@
+// std/iter — iterable combinators and iterator constructors.
+//
+// These were relocated verbatim out of std/array (Stage 1 of the std/iter unification). The
+// combinators are eager over Array/Iterator; their bodies are unchanged from their original
+// std/array implementations. std/iter is the LOWER-LEVEL module in the dependency graph: it does
+// NOT import from std/array (that would form an array->iter->array import cycle, which is a
+// compile-time error). The two array primitives these combinators need internally — `length` and
+// `push` — are duplicated here as PRIVATE helpers (byte-identical thin wrappers over the same
+// lin_length/lin_push intrinsics std/array wraps), so the moved bodies stay verbatim and std/iter
+// stays self-contained.
+
+import foreign "lin-runtime"
+  val lin_array_concat_dyn: (Json, Json) => Json
+
+// Private intrinsic wrappers (see header): NOT exported. Identical to std/array's `length`/`push`.
+val length = (x: Json): Int32 =>
+  lin_length(x)
+
+val push = (arr: Json, item: Json): Null =>
+  lin_push(arr, item)
+
+export val for = (iterable: Json, f: Function): Null =>
+  lin_for(iterable, f)
+
+export val while = (arr: Json, f: Function): Null =>
+  lin_while(arr, f)
+
+export val range = (start: Int32, end: Int32) =>
+  // Delegate to the lin_range builtin, which materialises a flat Int32 array directly with
+  // no per-call closures. The general lin_iter form (4 closures + envs, called per element)
+  // is needlessly expensive for the overwhelmingly common integer-range case.
+  lin_range(start, end)
+
+export val rangeStep = (start: Int32, end: Int32, step: Int32): Json =>
+  if step > 0 then lin_iter(
+    () => start,
+    i => i < end,
+    i => i + step,
+    i => i
+  )
+  else if step < 0 then lin_iter(
+    () => start,
+    i => i > end,
+    i => i + step,
+    i => i
+  )
+  else lin_iter(
+    () => start,
+    i => false,
+    i => i,
+    i => i
+  )
+
+export val iterOf = (arr: Json) =>
+  lin_iter(
+    () => 0,
+    i => i < length(arr),
+    i => i + 1,
+    i => arr[i]
+  )
+
+export val iter = (init: Json, hasNext: Json, next: Json, value: Json) =>
+  lin_iter(init, hasNext, next, value)
+
+// Concatenate two arrays. Dispatches on the runtime element type so two flat arrays
+// of the same type (e.g. UInt8[] ++ UInt8[]) yield a flat array — byte-level consumers
+// (u32FromBe, fs writes, FFI) then read packed bytes, not boxed TaggedVal elements.
+// Mixed/tagged element types yield a Json[].
+export val concat = (a: Json, b: Json): Json =>
+  lin_array_concat_dyn(a, b)
+
+// map/filter/reduce are GENERIC thin wrappers over the lin_map/lin_filter/lin_reduce builtins.
+// At a monomorphic scalar call site (`range(0,n).map(x => x*2)`), the call-site combinator-wrapper
+// inline (lin-ir monomorphize) replaces the wrapper with `lin_map(arr, <lambda>)` so the literal
+// lambda is visible to the intrinsic's lowering, which then INLINES a capture-less lambda body
+// directly into the loop — binding the param to the flat element, no per-element box/unbox/closure
+// call, and carrying a scalar reduce accumulator unboxed through the loop phi (ADR-069).
+// Heterogeneous/union/object call sites monomorphize at the `$Json` tagged representation, keeping
+// the boxed path correct.
+export val map = <T, U>(arr: T[], f: (T) => U): U[] =>
+  lin_map(arr, f)
+
+export val filter = <T>(arr: T[], f: (T) => Boolean): T[] =>
+  lin_filter(arr, f)
+
+export val reduce = <T, U>(arr: T[], init: U, f: (U, T) => U): U =>
+  lin_reduce(arr, init, f)
+
+export val find = (arr: Json, f: Function): Json =>
+  var found = null
+  lin_while(arr, item =>
+    if f(item) then found = item
+    found == null
+  )
+  found
+
+export val some = (arr: Json, f: Function): Boolean =>
+  var result = false
+  lin_while(arr, item =>
+    if f(item) then result = true
+    !result
+  )
+  result
+
+export val every = (arr: Json, f: Function): Boolean =>
+  var result = true
+  lin_while(arr, item =>
+    if !f(item) then result = false
+    result
+  )
+  result
+
+export val flatMap = (arr: Json, f: Function): Json =>
+  val result = []
+  arr.for(item =>
+    val inner = f(item)
+    inner.for(x => push(result, x))
+  )
+  result
+
+export val take = (arr: Json, n: Int32): Json =>
+  val end = if n < length(arr) then n else length(arr)
+  val result = lin_array_allocate(end)
+  var i = 0
+  arr.for(item =>
+    if i < end then
+      result[i] = item
+      i = i + 1
+  )
+  result
+
+export val drop = (arr: Json, n: Int32): Json =>
+  val result = []
+  val start = if n < length(arr) then n else length(arr)
+  var i = 0
+  arr.for(item =>
+    if i >= start then push(result, item)
+    i = i + 1
+  )
+  result
+
+export val takeWhile = (arr: Json, f: Function): Json =>
+  val result = []
+  lin_while(arr, item =>
+    val keep = f(item)
+    if keep then push(result, item)
+    keep
+  )
+  result
+
+export val dropWhile = (arr: Json, f: Function): Json =>
+  val result = []
+  var dropping = true
+  arr.for(item =>
+    val keep = !dropping || !f(item)
+    dropping = if keep then false else dropping
+    if keep then push(result, item)
+  )
+  result
+
+export val flatten = (arr: Json): Json =>
+  arr.flatMap(x => x)

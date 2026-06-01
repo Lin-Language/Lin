@@ -3,7 +3,7 @@ import { readStream, lines, linesMax, map, filter, take, chunks, writeStream, dr
 import { writeFile, readFile } from "std/fs"
 import { length } from "std/array"
 import { split, join } from "std/string"
-import { map as amap } from "std/array"
+import { map as amap } from "std/iter"
 
 // Each test writes its own fixture file (a unique path) then reads it back through a stream.
 // Streams are affine (single-use), so a fresh stream is opened per test.

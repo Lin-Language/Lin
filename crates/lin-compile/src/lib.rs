@@ -430,6 +430,7 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/string" => Some(include_str!("../../../stdlib/string.lin")),
         "std/number" => Some(include_str!("../../../stdlib/number.lin")),
         "std/array"  => Some(include_str!("../../../stdlib/array.lin")),
+        "std/iter"   => Some(include_str!("../../../stdlib/iter.lin")),
         "std/fs"     => Some(include_str!("../../../stdlib/fs.lin")),
         "std/http"   => Some(include_str!("../../../stdlib/http.lin")),
         "std/object"   => Some(include_str!("../../../stdlib/object.lin")),

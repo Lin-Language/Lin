@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString, trim, trimStart, trimEnd, toUpper, toLower, substring, indexOf, lastIndexOf, isBlank, contains, startsWith, endsWith, split, join, replace, replaceAll, repeat, at, lines, codePointAt, fromCodePoints, padStart, padEnd } from "std/string"
-import { map } from "std/array"
+import { map } from "std/iter"
 
 val s = suite("std/string", [
   test("toString of int", () => [
