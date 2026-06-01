@@ -1,0 +1,92 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { readStream, readText } from "std/stream"
+import { gunzip } from "std/compress"
+import { untar, manifest, files } from "std/archive"
+import { for } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+// Fixtures committed under stdlib/fixtures/ (paths relative to the repo root, the cwd the test
+// runner is invoked from). They were generated with:
+//   printf 'hello from alpha\n'                  > alpha.txt
+//   printf 'bravo file content\nsecond line\n'   > bravo.txt
+//   <500 lines "line N\n">                       > large.txt   # ~4.3 KB, multi-chunk body
+//   tar -cf sample.tar alpha.txt bravo.txt large.txt
+//   gzip -c sample.tar > sample.tar.gz
+val tarPath = "stdlib/fixtures/sample.tar"
+val gzPath = "stdlib/fixtures/sample.tar.gz"
+
+// `readText` returns `String | Error`; unwrap the success arm for the assertion.
+val unwrapStr = (r: Json): String =>
+  match r
+    is Error => "err"
+    else => r
+
+val s = suite("std/archive", [
+  // (a) manifest() lists the expected entry names (body skipped, meta-only).
+  test("manifest lists entry names", () =>
+    val names = []
+    readStream(tarPath).manifest().for((m) =>
+      names.push(m["name"])
+    )
+    [
+      expect(length(names)).toBe(3),
+      expect(names[0]).toBe("alpha.txt"),
+      expect(names[1]).toBe("bravo.txt"),
+      expect(names[2]).toBe("large.txt")
+    ]
+  ),
+
+  // manifest over a gzipped archive (tar.gz = gunzip composed with the splitter).
+  test("manifest works over a tar.gz via gunzip", () =>
+    val sizes = []
+    readStream(gzPath).gunzip().manifest().for((m) =>
+      sizes.push(m["size"])
+    )
+    [
+      expect(length(sizes)).toBe(3),
+      expect(sizes[0]).toBe(17),
+      expect(sizes[1]).toBe(31),
+      expect(sizes[2]).toBe(4390)
+    ]
+  ),
+
+  // (b) files() recovers each entry's full content (buffered into a UInt8[]).
+  test("files recovers entry contents", () =>
+    val dataLens = []
+    readStream(tarPath).files().for((f) =>
+      dataLens.push(length(f["data"]))
+    )
+    [
+      expect(dataLens[0]).toBe(17),
+      expect(dataLens[1]).toBe(31),
+      expect(dataLens[2]).toBe(4390)
+    ]
+  ),
+
+  // (c) untar() extracts each entry's bytes via the per-entry `data` sub-stream (readText). We
+  // collect every entry's recovered text in order and assert known contents.
+  test("untar extracts entry bodies via the data sub-stream", () =>
+    val texts = []
+    readStream(tarPath).untar((meta, data) =>
+      texts.push(unwrapStr(data.readText()))
+    )
+    [
+      expect(texts[0]).toBe("hello from alpha\n"),
+      expect(texts[1]).toBe("bravo file content\nsecond line\n")
+    ]
+  ),
+
+  // untar returns Null on a clean archive even when the body is IGNORED (the driver still skips it
+  // and reaches the end-of-archive cleanly — the skip-undrained path).
+  test("untar returns Null when bodies are ignored", () =>
+    val r = readStream(tarPath).untar((meta, data) =>
+      null
+    )
+    [
+      expect(r).toBe(null)
+    ]
+  )
+])
+
+run(s)
