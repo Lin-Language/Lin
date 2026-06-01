@@ -12,17 +12,13 @@ import { toString } from "std/string"
 
 // fib(42) = 267914296, fits Int32; widened to Int64 only for the final fold.
 val fib = (n: Int32): Int32 =>
-  if n < 2 then
-    n
-  else
-    fib(n - 1) + fib(n - 2)
+  if n < 2 then n
+  else fib(n - 1) + fib(n - 2)
 
 // sumTo(50000000) ~= 1.25e15, needs Int64. Tail-recursive accumulator -> TCO loop.
 val sumTo = (n: Int64, acc: Int64): Int64 =>
-  if n == 0i64 then
-    acc
-  else
-    sumTo(n - 1i64, acc + n)
+  if n == 0i64 then acc
+  else sumTo(n - 1i64, acc + n)
 
 val f: Int64 = fib(42)
 val s = sumTo(50000000i64, 0i64)

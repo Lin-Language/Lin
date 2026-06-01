@@ -6,6 +6,7 @@ import { jq, jqFirst } from "std/jq"
 // A YAML config document loads through the same path as inline JSON: parse() to a
 // Json value, then load() for defaults + validation. Also exercises a jq query
 // over the parsed document (the "yq" pattern).
+
 val yamlSrc = "name: from-yaml\nhost: 10.0.0.1\nport: 7000\ndebug: true\n"
 
 val s = suite("config yaml + jq", [
@@ -26,12 +27,14 @@ val s = suite("config yaml + jq", [
   test("jqFirst reads a single field (yq pattern)", () => [
     expect(yamlSrc.parse().jqFirst(".port")).toBe(7000),
     expect(yamlSrc.parse().jqFirst(".missing")).toBe(null)
-  ]
-  ),
+  ]),
 
   test("jq collects a filtered stream of values", () =>
     val r = parse(yamlSrc).jq(".host, .port")
-    [expect(r[0]).toBe("10.0.0.1"), expect(r[1]).toBe(7000)]
-  )
+    [
+      expect(r[0]).toBe("10.0.0.1"),
+      expect(r[1]).toBe(7000)
+    ]
+  ),
 ])
 run(s)

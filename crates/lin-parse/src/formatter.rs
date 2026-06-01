@@ -58,6 +58,11 @@ thread_local! {
     /// canonical and a between-`=>`-and-body comment is hoisted to the statement.
     static HOIST_BODIES: RefCell<std::collections::HashSet<u32>> =
         RefCell::new(std::collections::HashSet::new());
+    /// True while rendering a call/method ARGUMENT. A single-identifier, type-less lambda in
+    /// argument position renders bare (`i => …`, ADR-007); elsewhere (a `val` RHS etc.) it must
+    /// be parenthesised (`(i) => …`) to re-parse. `fmt_function` reads this for its OWN params,
+    /// then clears it while rendering the body so a nested non-argument lambda isn't affected.
+    static IN_ARG_POSITION: RefCell<bool> = const { RefCell::new(false) };
     /// One-shot: when set, the NEXT `fmt_function` whose body is a collection literal renders
     /// that body multi-line and clears the flag. Used by `fmt_call_arglist` for an over-budget
     /// `test("long name", () => [ … ])` so the array breaks (keeping `=> [` on the call line)
@@ -123,6 +128,19 @@ fn with_force_ml<R>(v: bool, f: impl FnOnce() -> R) -> R {
 
 fn force_ml() -> bool {
     FORCE_ML.with(|c| *c.borrow())
+}
+
+/// Run `f` with IN_ARG_POSITION set to `v`, restoring the previous value afterwards. Used to
+/// mark call/method argument rendering so a single-ident lambda there renders bare.
+fn with_arg_position<R>(v: bool, f: impl FnOnce() -> R) -> R {
+    let prev = IN_ARG_POSITION.with(|c| c.replace(v));
+    let r = f();
+    IN_ARG_POSITION.with(|c| *c.borrow_mut() = prev);
+    r
+}
+
+fn in_arg_position() -> bool {
+    IN_ARG_POSITION.with(|c| *c.borrow())
 }
 
 /// Leading comments for `anchor_start`, rendered as `"{ind}{text}\n"` lines (joined), or empty.
@@ -478,14 +496,14 @@ fn collect_anchors_expr(expr: &Expr, out: &mut Vec<Anchor>) {
             // NOT anchored here: its inner statements/tail are already anchors, and adding
             // a competing anchor at the body's span (which `render_body` won't emit for a
             // non-atomic body) would swallow a demoted comment and drop it.
-            if is_atomic(then_branch) {
+            if renders_single_line(then_branch) {
                 let tb = then_branch.span();
                 out.push(Anchor { start: tb.start, end: tb.end, trailing_ok: true });
             }
             collect_anchors_expr(then_branch, out);
             // A chained `else if` recurses into the nested `If` (adding its own branch
             // anchors). A terminal `else` with a single-line body gets its own anchor.
-            if !matches!(**else_branch, Expr::If { .. }) && is_atomic(else_branch) {
+            if !matches!(**else_branch, Expr::If { .. }) && renders_single_line(else_branch) {
                 let eb = else_branch.span();
                 out.push(Anchor { start: eb.start, end: eb.end, trailing_ok: true });
             }
@@ -795,12 +813,91 @@ fn fmt_binop_operand(operand: &Expr, parent: &BinOp, is_right: bool, render: imp
     let s = render(operand);
     if let Expr::BinaryOp { op: child_op, .. } = operand {
         let (cp, pp) = (binop_prec(child_op), binop_prec(parent));
-        let needs = cp < pp || (cp == pp && is_right);
+        // Parenthesise when precedence REQUIRES it (a looser child, or equal precedence on the
+        // right under left-associativity), OR when the AUTHOR wrote parens around this
+        // sub-expression in the source. The parser discards parens, so we recover the author's
+        // grouping from the source extent and preserve it rather than stripping "redundant"
+        // parens (which, though value-equal, read worse — e.g. `(a / b) * c`).
+        let needs = cp < pp || (cp == pp && is_right) || source_parenthesized(operand);
         if needs {
             return format!("({})", s);
         }
     }
     s
+}
+
+/// The source extent [start, end) of an expression — start of its leftmost leaf to end of its
+/// rightmost leaf. The `BinaryOp` span only covers the operator token, so paren detection needs
+/// the operand's true bounds, computed by descending the leftmost/rightmost children.
+fn expr_extent(expr: &Expr) -> (u32, u32) {
+    fn leftmost(e: &Expr) -> u32 {
+        match e {
+            Expr::BinaryOp { left, .. } => leftmost(left),
+            Expr::DotCall { receiver, .. } => leftmost(receiver),
+            Expr::Call { func, .. } => leftmost(func),
+            Expr::Index { object, .. } => leftmost(object),
+            Expr::Is { expr, .. } | Expr::Has { expr, .. } => leftmost(expr),
+            other => other.span().start,
+        }
+    }
+    fn rightmost(e: &Expr) -> u32 {
+        match e {
+            Expr::BinaryOp { right, .. } => rightmost(right),
+            other => other.span().end,
+        }
+    }
+    (leftmost(expr), rightmost(expr))
+}
+
+/// True if, in the source, the expression is immediately wrapped in parentheses — the next
+/// non-whitespace char before its extent is `(` and the next non-whitespace char after is `)`.
+/// Used to preserve author-written grouping parens that the parser discarded. False with no
+/// source installed.
+fn source_parenthesized(expr: &Expr) -> bool {
+    SOURCE_CHARS.with(|src_c| {
+        let src = src_c.borrow();
+        if src.is_empty() {
+            return false;
+        }
+        let (start, end) = expr_extent(expr);
+        let (start, end) = (start as usize, end as usize);
+        if start == 0 || end > src.len() {
+            return false;
+        }
+        let mut i = start;
+        while i > 0 && src[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        if i == 0 || src[i - 1] != '(' {
+            return false;
+        }
+        let open = i - 1;
+        let mut j = end;
+        while j < src.len() && src[j].is_whitespace() {
+            j += 1;
+        }
+        if j >= src.len() || src[j] != ')' {
+            return false;
+        }
+        // The `(` at `open` and `)` at `j` must be a MATCHING pair (paren depth returns to 0
+        // exactly at `j`). Otherwise the leading `(` belongs to a child sub-expression — e.g.
+        // in `(total / X) * X`, the product's leftmost char is preceded by the INNER `(`, which
+        // does not wrap the product. Without this, a spurious outer pair would be added.
+        let mut depth = 0i32;
+        for k in open..=j {
+            match src[k] {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return k == j;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    })
 }
 
 fn format_float(f: f64) -> String {
@@ -1026,6 +1123,36 @@ fn is_test_call(expr: &Expr) -> bool {
 
 // ── atomicity check ───────────────────────────────────────────────────────────
 
+/// True if `expr` contains a function or method call anywhere (directly or nested). Used to
+/// force a multi-element array literal multi-line when its elements are calls (e.g. a list of
+/// `expect(...).toBe(...)` assertions): several calls packed on one line read poorly.
+fn contains_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call { .. } | Expr::DotCall { .. } => true,
+        Expr::BinaryOp { left, right, .. } => contains_call(left) || contains_call(right),
+        Expr::UnaryOp { operand, .. } => contains_call(operand),
+        Expr::Index { object, key, .. } => contains_call(object) || contains_call(key),
+        Expr::Is { expr, .. } | Expr::Has { expr, .. } => contains_call(expr),
+        _ => false,
+    }
+}
+
+/// True if `expr` will render on a single line — `is_atomic` AND not a multi-element array
+/// whose elements contain calls (which Fix 1 forces multi-line). Used to decide whether a
+/// trailing comment can stably anchor to it; a multi-line body must not (it would oscillate
+/// between trailing on the last line and leading on the next pass).
+fn renders_single_line(expr: &Expr) -> bool {
+    if !is_atomic(expr) {
+        return false;
+    }
+    if let Expr::Array(items, _) = expr {
+        if items.len() > 1 && items.iter().any(contains_call) {
+            return false;
+        }
+    }
+    true
+}
+
 fn is_atomic(expr: &Expr) -> bool {
     match expr {
         Expr::IntLit(..)
@@ -1090,7 +1217,7 @@ fn fmt_inline(expr: &Expr) -> String {
         }
         Expr::Call { func, args, .. } => {
             let fs = fmt_postfix_base(func, fmt_inline);
-            let as_: Vec<String> = args.iter().map(fmt_inline).collect();
+            let as_: Vec<String> = with_arg_position(true, || args.iter().map(fmt_inline).collect());
             format!("{}({})", fs, as_.join(", "))
         }
         Expr::DotCall { receiver, method, args, .. } => {
@@ -1098,7 +1225,7 @@ fn fmt_inline(expr: &Expr) -> String {
             match args {
                 None => format!("{}.{}", r, method),
                 Some(a) => {
-                    let as_: Vec<String> = a.iter().map(fmt_inline).collect();
+                    let as_: Vec<String> = with_arg_position(true, || a.iter().map(fmt_inline).collect());
                     format!("{}.{}({})", r, method, as_.join(", "))
                 }
             }
@@ -1159,14 +1286,21 @@ fn fmt_inline(expr: &Expr) -> String {
                 .map(|t| format!(": {}", fmt_type(t)))
                 .unwrap_or_default();
             let generics = fmt_type_params(type_params);
-            let body = fmt_inline(body);
-            // Always parenthesise the parameter list. A bare-identifier lambda (`x => x`) is
-            // only legal in argument position (ADR-007), and `fmt_inline` has no notion of its
-            // context — it is used for `val` RHS, block tails, etc. as well as arguments. The
-            // parenthesised form `(x) => x` is valid in every position, so emitting it
-            // unconditionally guarantees the formatter's output always re-parses. A generic
-            // function additionally carries its `<T>` list (which the bare form can't).
-            format!("{}({}){} => {}", generics, ps.join(", "), ret, body)
+            // A single-ident, type-less, non-generic lambda renders BARE only in argument
+            // position (ADR-007); elsewhere it is parenthesised so the output re-parses. The
+            // body is the lambda's own scope, not argument position — render it with the flag
+            // cleared so a nested non-argument lambda stays parenthesised.
+            let bare_ok = in_arg_position()
+                && generics.is_empty()
+                && params.len() == 1
+                && params[0].type_ann.is_none()
+                && matches!(&params[0].pattern, Pattern::Ident(..) | Pattern::Wildcard(..));
+            let body = with_arg_position(false, || fmt_inline(body));
+            if bare_ok {
+                format!("{}{} => {}", ps[0], ret, body)
+            } else {
+                format!("{}({}){} => {}", generics, ps.join(", "), ret, body)
+            }
         }
         Expr::Block(stmts, tail, _) => {
             // In Lin, there's no semicolon separator. An inline block with stmts
@@ -1335,8 +1469,13 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         // ── Array ─────────────────────────────────────────────────────────────
         Expr::Array(items, _) => {
             // Inline fast-path — suppressed once an ancestor literal went multiline
-            // (Rule 4): a nested literal must then also render multiline.
-            if !force_ml() && items.len() <= 4 && items.iter().all(is_atomic) {
+            // (Rule 4): a nested literal must then also render multiline. A MULTI-element
+            // array whose elements contain function calls (e.g. a list of `expect(...)`
+            // assertions) always renders multiline — packing several calls on one line reads
+            // poorly. A single-element array may stay inline regardless.
+            let inline_ok = items.len() <= 1
+                || (items.len() <= 4 && items.iter().all(is_atomic) && !items.iter().any(contains_call));
+            if !force_ml() && inline_ok {
                 let inline = fmt_inline(expr);
                 if inline.len() + ind.len() <= 80 {
                     return inline;
@@ -1458,12 +1597,27 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
             // would wrongly re-emit (and, each pass, duplicate) the inner statement's comment.
             let render_body = |body: &Expr| -> String {
                 let block = indent_first(&fmt_expr(body, false, &child_ind), &child_ind);
-                if !is_atomic(body) {
-                    return block;
-                }
                 let anchor = body.span().start;
                 let lead = take_leading(anchor, &child_ind);
+                // A Block/if/match body owns its comments via its OWN inner anchors (fmt_block
+                // etc. emit them) — and its span start collides with its first statement's, so
+                // reading `trailing_text` here would DOUBLE-emit that statement's comment. Only
+                // a single-expression body (e.g. a multi-element array) is handled here.
+                let body_owns_comments = matches!(body, Expr::Block(..) | Expr::If { .. } | Expr::Match { .. });
+                if body_owns_comments {
+                    return format!("{}{}", lead, block);
+                }
                 let trailing = trailing_text(anchor);
+                if !is_atomic(body) {
+                    // A multi-line single-expression body renders across several lines, so a
+                    // trailing comment on its LAST line (e.g. on a `]`) is not a stable anchor —
+                    // re-formatting would re-attach it as a leading comment, breaking
+                    // idempotency. Hoist it ABOVE the body (own line at the body indent).
+                    if trailing.is_empty() {
+                        return format!("{}{}", lead, block);
+                    }
+                    return format!("{}{}{}\n{}", lead, child_ind, trailing, block);
+                }
                 if trailing.is_empty() {
                     format!("{}{}", lead, block)
                 } else {
@@ -1611,12 +1765,25 @@ fn fmt_function(
         .unwrap_or_default();
     let generics = fmt_type_params(type_params);
 
-    // Always parenthesise the parameter list. A bare-identifier lambda (`x => x`) is only legal
-    // in argument position (ADR-007), and this formatter has no notion of its context, so the
-    // paren-less form could land on a `val` RHS or other non-argument position where it does
-    // not parse. The parenthesised form `(x) => x` is valid everywhere, keeping the formatter's
-    // output round-trip safe. A generic function additionally carries its `<T>` list.
-    let param_part = format!("{}({}){}", generics, ps.join(", "), ret);
+    // A single-identifier, type-less, non-generic lambda renders BARE (`x => …`) ONLY in
+    // argument position, where ADR-007 allows it (and idiomatic Lin prefers it: `.for(i => …)`).
+    // Anywhere else (a `val` RHS, a block tail, …) the bare form does not re-parse, so the
+    // parameter list is parenthesised (`(x) => …`) to keep the formatter's output round-trip
+    // safe. A generic function always uses the parenthesised form.
+    let bare_ok = in_arg_position()
+        && generics.is_empty()
+        && params.len() == 1
+        && params[0].type_ann.is_none()
+        && matches!(&params[0].pattern, Pattern::Ident(..) | Pattern::Wildcard(..));
+    let param_part = if bare_ok {
+        format!("{}{}", ps[0], ret)
+    } else {
+        format!("{}({}){}", generics, ps.join(", "), ret)
+    };
+    // The body is NOT in argument position (it's the lambda's own scope). Bodies below are
+    // rendered inside `with_arg_position(false, …)` so a nested lambda on a `val` RHS inside the
+    // body is parenthesised — WITHOUT corrupting the flag for sibling renders in the caller
+    // (a bare global set here would leak `false` into the call-arglist's measurement renders).
 
     // Leading comments attached to a single-expression body (Block bodies carry their own
     // comments inside `fmt_block`). A leading comment forces the multi-line form so the
@@ -1660,11 +1827,13 @@ fn fmt_function(
         // arm clears it at the lambda boundary (Rule 4). When set, render the body with FORCE_ML
         // so its (and only its top-level) literal breaks.
         let forced = FORCE_NEXT_LAMBDA_BODY_ML.with(|c| c.replace(false));
-        let body_str = if forced {
-            with_force_ml(true, || fmt_expr(body, false, ind))
-        } else {
-            fmt_expr(body, false, ind)
-        };
+        let body_str = with_arg_position(false, || {
+            if forced {
+                with_force_ml(true, || fmt_expr(body, false, ind))
+            } else {
+                fmt_expr(body, false, ind)
+            }
+        });
         if body_str.contains('\n') {
             return format!("{} => {}", param_part, body_str);
         }
@@ -1677,7 +1846,7 @@ fn fmt_function(
         || author_body_on_new_line
         || !body_leading.is_empty();
 
-    let mut body_str = fmt_expr(body, false, &child_ind);
+    let mut body_str = with_arg_position(false, || fmt_expr(body, false, &child_ind));
     if !body_trailing.is_empty() {
         body_str.push(' ');
         body_str.push_str(&body_trailing);
@@ -1916,6 +2085,10 @@ fn fmt_stmt(stmt: &Stmt, ind: &str) -> String {
 ///   multi-line lambda arg renders `param =>` then its body indented beneath, comma between
 ///   args, closing paren on its own line at `ind`.
 fn fmt_call_arglist(args: &[Expr], ind: &str) -> String {
+    with_arg_position(true, || fmt_call_arglist_inner(args, ind))
+}
+
+fn fmt_call_arglist_inner(args: &[Expr], ind: &str) -> String {
     if args.is_empty() {
         return "()".to_string();
     }
@@ -2058,6 +2231,20 @@ fn fmt_chain(expr: &Expr, ind: &str) -> String {
         if !inline.contains('\n') && inline.len() + ind.len() <= 120 {
             return inline;
         }
+    }
+
+    // Single-call chain that the author did NOT break across lines (e.g.
+    // `nodes.for(_ => …multiline lambda…)`): the chain itself stays on one line —
+    // `receiver.method(<arglist>)` — and the multi-line argument flows via `fmt_call_arglist`,
+    // rather than splitting the receiver onto its own `.method` line (which would be wrong for
+    // a 1-call chain whose only multi-line-ness comes from its argument).
+    if chain.len() == 1 && !author_multiline {
+        let (method, args, _) = &chain[0];
+        let r = fmt_postfix_base(root, |e| fmt_expr(e, false, ind));
+        if let Some(a) = args {
+            return format!("{}.{}{}", r, method, fmt_call_arglist(a, ind));
+        }
+        return format!("{}.{}", r, method);
     }
 
     // Multi-line.
