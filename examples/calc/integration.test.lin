@@ -3,7 +3,6 @@
 // Drives the public glue entry (calc.lin) on real source strings and asserts the
 // final tagged result: evaluated values, precedence/associativity end-to-end,
 // whitespace handling, and the recoverable / parse error paths.
-
 import { expect, toBe, toSucceed, toFail, toFailWith, test, suite, run } from "std/test"
 import { calc } from "./calc"
 
@@ -20,27 +19,35 @@ val s = suite("calc-integration", [
   test("evaluates a single number", () => [
     expect(valueOf("42")).toBe(42)
   ]),
+
   test("respects * over + precedence", () => [
     expect(valueOf("2 + 3 * 4")).toBe(14)
   ]),
+
   test("parentheses override precedence", () => [
     expect(valueOf("(2 + 3) * 4")).toBe(20)
   ]),
+
   test("subtraction is left-associative", () => [
     expect(valueOf("10 - 3 - 2")).toBe(5)
   ]),
+
   test("division is left-associative", () => [
     expect(valueOf("100 / 5 / 2")).toBe(10)
   ]),
+
   test("deeply nested expression", () => [
     expect(valueOf("2 * (3 + (4 - 1)) * 2")).toBe(24)
   ]),
+
   test("whitespace is ignored", () => [
     expect(valueOf("  1+2  *  3 ")).toBe(7)
   ]),
+
   test("a chain of additions", () => [
     expect(valueOf("1 + 2 + 3 + 4 + 5")).toBe(15)
   ]),
+
   test("a valid expression succeeds", () => [
     expect(calc("3 * 3")).toSucceed()
   ]),
@@ -49,6 +56,7 @@ val s = suite("calc-integration", [
   test("division by zero is a recoverable failure", () => [
     expect(calc("7 / 0")).toFailWith("division by zero")
   ]),
+
   test("nested division by zero propagates", () => [
     expect(calc("1 + (6 / (3 - 3))")).toFailWith("division by zero")
   ]),
@@ -57,14 +65,17 @@ val s = suite("calc-integration", [
   test("incomplete expression fails to parse", () => [
     expect(calc("1 +")).toFail()
   ]),
+
   test("unknown character fails to parse", () => [
     expect(calc("1 @ 2")).toFail()
   ]),
+
   test("unbalanced paren fails to parse", () => [
     expect(calc("(1 + 2")).toFail()
   ]),
+
   test("trailing input fails to parse", () => [
     expect(calc("1 2")).toFail()
-  ]),
+  ])
 ])
 run(s)
