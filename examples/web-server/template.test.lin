@@ -7,22 +7,24 @@ import { contains } from "std/string"
 val s = suite("template", [
   test("renders index.lint filling all holes", () =>
     val out = render("examples/web-server/views/index.lint", {
-      "title": "T", "heading": "H", "status": "ok", "version": "1.0"
+      "title": "T",
+      "heading": "H",
+      "status": "ok",
+      "version": "1.0"
     })
     [
       expect(out.contains("<title>T</title>")).toBe(true),
       expect(out.contains("<h1>H</h1>")).toBe(true),
       expect(out.contains("Status: ok")).toBe(true),
       expect(out.contains("Version: 1.0")).toBe(true)
-    ]
-  ),
-  test("leaves no unfilled ${ } holes", () =>
+    ]),
+  test("leaves no unfilled ${null} holes", () =>
     val out = render("examples/web-server/views/index.lint", {
-      "title": "T", "heading": "H", "status": "ok", "version": "1.0"
+      "title": "T",
+      "heading": "H",
+      "status": "ok",
+      "version": "1.0"
     })
-    [
-      expect(out.contains("\${")).toBe(false)
-    ]
-  ),
+    [expect(out.contains("\${")).toBe(false)])
 ])
 run(s)

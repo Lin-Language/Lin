@@ -19,8 +19,14 @@ val _fail = (message: String): Assertion =>
 
 val _evalResult = (name: String, results: Assertion[]): Json =>
   val failures = results.filter(a => a["type"] == "fail")
-  if length(failures) == 0 then { "type": "pass", "name": name }
-  else { "type": "fail", "name": name, "failures": failures }
+  if length(failures) == 0 then
+    { "type": "pass", "name": name }
+  else
+    {
+      "type": "fail",
+      "name": name,
+      "failures": failures
+    }
 
 val _printFail = (r: Json): Null =>
   print("  FAIL  ${r["name"]}")
@@ -28,45 +34,53 @@ val _printFail = (r: Json): Null =>
 
 val _printSuiteResults = (suiteResult: Json): Null =>
   print(suiteResult["name"])
-  suiteResult["results"].for(r =>
-    if r["type"] == "pass" then print("  ok  ${r["name"]}")
-    else _printFail(r)
-  )
+  suiteResult["results"].for(r => if r["type"] == "pass" then print("  ok  ${r["name"]}") else _printFail(r))
 
 // An Asserter is { "value": Json } — assertion methods take it as first arg via dot-syntax.
-
 export val expect = (value: Json): Json =>
   { "value": value }
 
 export val toBe = (asserter: Json, expected: Json): Assertion =>
   val value = asserter["value"]
-  if value == expected then _pass()
-  else _fail("expected: ${toString(expected)}\n    actual:   ${toString(value)}")
+  if value == expected then
+    _pass()
+  else
+    _fail("expected: ${toString(expected)}\n    actual:   ${toString(value)}")
 
 export val toBeNull = (asserter: Json): Assertion =>
   val value = asserter["value"]
-  if value == null then _pass()
-  else _fail("expected null, got: ${toString(value)}")
+  if value == null then
+    _pass()
+  else
+    _fail("expected null, got: ${toString(value)}")
 
 export val toSatisfy = (asserter: Json, pred: Function): Assertion =>
   val value = asserter["value"]
-  if pred(value) then _pass()
-  else _fail("value did not satisfy predicate: ${toString(value)}")
+  if pred(value) then
+    _pass()
+  else
+    _fail("value did not satisfy predicate: ${toString(value)}")
 
 export val toSucceed = (asserter: Json): Assertion =>
   val value = asserter["value"]
-  if value["type"] == "success" then _pass()
-  else _fail("expected success, got: ${toString(value)}")
+  if value["type"] == "success" then
+    _pass()
+  else
+    _fail("expected success, got: ${toString(value)}")
 
 export val toFail = (asserter: Json): Assertion =>
   val value = asserter["value"]
-  if value["type"] == "failure" then _pass()
-  else _fail("expected failure, got: ${toString(value)}")
+  if value["type"] == "failure" then
+    _pass()
+  else
+    _fail("expected failure, got: ${toString(value)}")
 
 export val toFailWith = (asserter: Json, message: String): Assertion =>
   val value = asserter["value"]
-  if value["type"] == "failure" && value["error"] == message then _pass()
-  else _fail("expected failure with \"${message}\", got: ${toString(value)}")
+  if value["type"] == "failure" && value["error"] == message then
+    _pass()
+  else
+    _fail("expected failure with \"${message}\", got: ${toString(value)}")
 
 // A test eagerly runs the body and stores the result alongside the name. The body must return
 // an `Assertion[]` (use the `[ expect(...).toBe(...), ... ]` form, even for a single assertion);
@@ -80,18 +94,12 @@ export val test = (name: String, body: () => Assertion[]): Json =>
 // when the body's assertions fail. This is the functional alternative to keyword
 // beforeEach/afterEach: compose it (often via partial application) into a per-fixture helper,
 // e.g. `val withDb = withFixture(openDb, closeDb,)`, then `withDb("name", db => [ ... ])`.
-export val withFixture = (
-  setup: () => Json,
-  teardown: (Json) => Null,
-  name: String,
-  body: (Json) => Assertion[],
-): Json =>
+export val withFixture = (setup: () => Json, teardown: (Json) => Null, name: String, body: (Json) => Assertion[]): Json =>
   test(name, () =>
     val fixture = setup()
     val results = body(fixture)
     teardown(fixture)
-    results
-  )
+    results)
 
 export val suite = (name: String, tests: Json[]): Json =>
   { "name": name, "tests": tests }
@@ -105,12 +113,16 @@ export val report = (s: Json): Int32 =>
   val passCount = length(s["tests"]) - length(failed)
   val failCount = length(failed)
   _printSuiteResults({ "name": s["name"], "results": s["tests"] })
-  if failCount == 0 then print("${toString(passCount)} passed")
-  else print("${toString(failCount)} failed, ${toString(passCount)} passed")
+  if failCount == 0 then
+    print("${toString(passCount)} passed")
+  else
+    print("${toString(failCount)} failed, ${toString(passCount)} passed")
   failCount
 
 // Run a suite: print results and `exit(1)` if any test failed (the common case — a non-zero
 // status fails CI). For guaranteed post-run teardown even on failure, use `report` instead.
 export val run = (s: Json): Null =>
-  if report(s) > 0 then exit(1)
-  else null
+  if report(s) > 0 then
+    exit(1)
+  else
+    null

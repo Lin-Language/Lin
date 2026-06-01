@@ -13,11 +13,17 @@ import { router } from "./router"
 // drives real templating via renderWith with an inline template, so the data it
 // passes is still interpolated and asserted. Rendering the real index.lint file is
 // covered separately in template.test.lin.
-replace render = (path: String, data: {}): Json =>
+replace render = (path: String, data: {  }): Json =>
   renderWith("<!DOCTYPE html><title>\${title}</title><h1>\${heading}</h1>", data)
 
 val makeReq = (method: String, path: String): Request =>
-  { "method": method, "path": path, "query": "", "headers": {}, "body": "" }
+  {
+    "method": method,
+    "path": path,
+    "query": "",
+    "headers": {},
+    "body": ""
+  }
 
 val s = suite("web-server integration", [
   test("GET / routes to getIndex and returns the rendered HTML page", () =>
@@ -27,29 +33,25 @@ val s = suite("web-server integration", [
       expect(contains(resp["body"], "<!DOCTYPE html>")).toBe(true),
       expect(contains(resp["body"], "Lin Web Server")).toBe(true),
       expect(contains(resp["body"], "Welcome")).toBe(true)
-    ]
-  ),
+    ]),
   test("GET /api/status routes to getStatus and returns ok JSON", () =>
     val resp = router(makeReq("GET", "/api/status"))
     [
       expect(resp["status"]).toBe(200),
       expect(contains(resp["body"], "\"status\": \"ok\"")).toBe(true)
-    ]
-  ),
+    ]),
   test("GET /users/:id routes to getUser and returns the user JSON", () =>
     val resp = router(makeReq("GET", "/users/42"))
     [
       expect(resp["status"]).toBe(200),
       expect(contains(resp["body"], "\"id\": \"42\"")).toBe(true),
       expect(contains(resp["body"], "User 42")).toBe(true)
-    ]
-  ),
+    ]),
   test("an unmatched path falls through to a 404 Not Found", () =>
     val resp = router(makeReq("GET", "/no/such/route"))
     [
       expect(resp["status"]).toBe(404),
       expect(contains(resp["body"], "Not Found")).toBe(true)
-    ]
-  ),
+    ])
 ])
 run(s)

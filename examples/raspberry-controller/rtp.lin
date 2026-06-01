@@ -24,20 +24,19 @@
 //   std/bytes  — u16ToBe / u32ToBe (big-endian header fields)
 //   std/array  — concat (flat UInt8[]), slice, length, push
 //   std/number — toUInt8 (compose FU indicator / header bytes)
-
 import { u16ToBe, u32ToBe } from "std/bytes"
 import { concat, slice, length, push } from "std/array"
 import { toUInt8 } from "std/number"
 
 export val RTP_HEADER_SIZE = 12
-export val MAX_RTP_PAYLOAD = 1200      // smaller fragments survive lossy WiFi
-export val PAYLOAD_TYPE = 96           // dynamic PT for H.264
+export val MAX_RTP_PAYLOAD = 1200 // smaller fragments survive lossy WiFi
+export val PAYLOAD_TYPE = 96 // dynamic PT for H.264
 val CLOCK_RATE = 90000
-export val TIMESTAMP_INCREMENT: UInt32 = 3000  // CLOCK_RATE / 30 (30 fps)
+export val TIMESTAMP_INCREMENT: UInt32 = 3000 // CLOCK_RATE / 30 (30 fps)
 
 // Byte-0 is constant (V=2, P=0, X=0, CC=0). Byte-1 is M-bit + payload type.
-val hdrNoMarker: UInt8[] = [0x80, 0x60]   // 0x60 = PAYLOAD_TYPE (96)
-val hdrMarker: UInt8[] = [0x80, 0xE0]     // 0xE0 = 0x80 | 96
+val hdrNoMarker: UInt8[] = [128, 96] // 0x60 = PAYLOAD_TYPE (96)
+val hdrMarker: UInt8[] = [128, 224] // 0xE0 = 0x80 | 96
 
 // Advance the timestamp by one frame period. (u32 wrap is not modelled — frames
 // would have to run for ~16 hours at 30fps before TIMESTAMP_INCREMENT overflows.)
@@ -46,12 +45,14 @@ export val advanceTimestamp = (ts: UInt32): UInt32 => ts + TIMESTAMP_INCREMENT
 // How many RTP packets a NAL produces: 0 if empty, 1 if it fits in one packet,
 // else the FU-A fragment count (ceil(payloadLen / maxFragment)).
 export val packetCount = (nal: UInt8[]): Int32 =>
-  if length(nal) == 0 then 0
-  else if length(nal) <= MAX_RTP_PAYLOAD then 1
+  if length(nal) == 0 then
+    0
+  else if length(nal) <= MAX_RTP_PAYLOAD then
+    1
   else
-    val payloadLen = length(nal) - 1            // skip the NAL header byte
-    val maxFrag = MAX_RTP_PAYLOAD - 2           // FU indicator + FU header
-    (payloadLen + maxFrag - 1) / maxFrag        // ceil division
+    val payloadLen = length(nal) - 1 // skip the NAL header byte
+    val maxFrag = MAX_RTP_PAYLOAD - 2 // FU indicator + FU header
+    (payloadLen + maxFrag - 1) / maxFrag // ceil division
 
 // Advance a UInt16 sequence by n (one +1 step per packet). `seq + 1` stays
 // UInt16; an Int32 count does not coerce into a UInt16 add, so step it.
@@ -77,10 +78,10 @@ val makeSingleNal = (seq: UInt16, ts: UInt32, ssrc: UInt32, nal: UInt8[], marker
 // Compose the [FU-indicator, FU-header] two-byte prefix for an FU-A fragment.
 // fu_indicator = (nal[0] & 0x60) | 28 ; fu_header = (nal[0] & 0x1F) | start | end.
 val fuPrefix = (nalHdr: UInt8, first: Boolean, last: Boolean): UInt8[] =>
-  val nri: UInt8 = nalHdr & 0x60
-  val nt: UInt8 = nalHdr & 0x1F
-  val withStart: UInt8 = if first then toUInt8(nt | 0x80) else nt
-  val withEnd: UInt8 = if last then toUInt8(withStart | 0x40) else withStart
+  val nri: UInt8 = nalHdr & 96
+  val nt: UInt8 = nalHdr & 31
+  val withStart: UInt8 = if first then toUInt8(nt | 128) else nt
+  val withEnd: UInt8 = if last then toUInt8(withStart | 64) else withStart
   val fuInd: UInt8 = toUInt8(nri | 28)
   [fuInd, withEnd]
 
@@ -88,7 +89,8 @@ val fuPrefix = (nalHdr: UInt8, first: Boolean, last: Boolean): UInt8[] =>
 // `seq` advances per fragment. Each fragment: RTP header (marker only on the last
 // fragment, when `marker`) ++ [FU-I, FU-H] ++ fragment bytes.
 val fragLoop = (seq: UInt16, ts: UInt32, ssrc: UInt32, nalHdr: UInt8, payload: UInt8[], offset: Int32, maxFrag: Int32, marker: Boolean, acc: Json[]): Null =>
-  if offset >= length(payload) then null
+  if offset >= length(payload) then
+    null
   else
     val plen = length(payload)
     val end = if offset + maxFrag < plen then offset + maxFrag else plen

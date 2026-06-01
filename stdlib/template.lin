@@ -1,12 +1,12 @@
 import foreign "lin-runtime"
-  val lin_template_render: (String, {}) => String
+  val lin_template_render: (String, {  }) => String
 
 import { readFile } from "std/fs"
 
-export val renderWith = (template: String, data: {}) =>
+export val renderWith = (template: String, data: {  }) =>
   lin_template_render(template, data)
 
-export val render = (path: String, data: {}) =>
+export val render = (path: String, data: {  }) =>
   val content = readFile(path)
   match content
     is { "type": "error", "message": _ } => content

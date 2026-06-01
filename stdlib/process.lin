@@ -9,18 +9,13 @@ import foreign "lin-runtime"
   val lin_process_wait: (Int64) => Json
 
 // The captured result of a finished process: its exit status and full output.
-export type ExecResult = {
-  "status": Int32,
-  "stdout": String,
-  "stderr": String
-}
+export type ExecResult = { "status": Int32, "stdout": String, "stderr": String }
 
 // An opaque handle to a spawned process (an Int64 id, not an OS pid). Used with
 // readStdout / kill / wait.
 export type ProcessHandle = Int64
 
 // --- Batch: run to completion, collect all output ---
-
 // Run `command` with `args`, wait for it to exit, and return its status code and
 // captured stdout/stderr as an ExecResult. Returns an Error if it cannot be launched.
 export val exec = (command: String, args: String[]): Json =>
@@ -40,7 +35,6 @@ export val chdir = (path: String): Json =>
   lin_process_chdir(path)
 
 // --- Streaming: spawn and read incrementally ---
-
 // Start `command` with `args` without waiting. stdout is piped (read it with
 // readStdout); stderr is inherited. Returns an opaque ProcessHandle, or an Error.
 export val spawn = (command: String, args: String[]): Json =>

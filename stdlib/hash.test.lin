@@ -4,7 +4,6 @@ import { hash } from "std/hash"
 // hash(x) returns a canonical, type-tagged string key for any JSON value.
 // Equal values hash equal; values of different types never collide; objects
 // hash independent of key order (matching structural equality, spec §14).
-
 val s = suite("std/hash", [
   test("primitives carry a type tag", () => [
     expect(hash(null)).toBe("N"),
@@ -13,53 +12,43 @@ val s = suite("std/hash", [
     expect(hash(42)).toBe("i:42"),
     expect(hash("hello")).toBe("s:hello")
   ]),
-
   test("equal values hash equal", () => [
     expect(hash(42) == hash(42)).toBe(true),
     expect(hash("abc") == hash("abc")).toBe(true),
     expect(hash([1, 2, 3]) == hash([1, 2, 3])).toBe(true)
   ]),
-
   test("different values hash differently", () => [
     expect(hash(1) == hash(2)).toBe(false),
     expect(hash("a") == hash("b")).toBe(false)
   ]),
-
   test("types do not collide: 42 vs \"42\"", () => [
-    // The whole point of a type-tagged key: an int and a string that print the
-    // same must not be treated as equal.
     expect(hash(42) == hash("42")).toBe(false),
     expect(hash(true) == hash("true")).toBe(false),
     expect(hash(null) == hash("null")).toBe(false)
   ]),
-
-  test("arrays hash element-wise and order-sensitively", () => [
-    expect(hash([1, 2]) == hash([1, 2])).toBe(true),
-    expect(hash([1, 2]) == hash([2, 1])).toBe(false),
-    expect(hash([])).toBe("a:[]")
-  ]),
-
+  test("arrays hash element-wise and order-sensitively", () =>
+    // The whole point of a type-tagged key: an int and a string that print the
+    // same must not be treated as equal.
+    [
+      expect(hash([1, 2]) == hash([1, 2])).toBe(true),
+      expect(hash([1, 2]) == hash([2, 1])).toBe(false),
+      expect(hash([])).toBe("a:[]")
+    ]),
   test("objects hash independent of key order", () =>
     val a = { "x": 1, "y": 2 }
     val b = { "y": 2, "x": 1 }
-    [
-      expect(hash(a) == hash(b)).toBe(true)
-    ]
-  ),
-
+    [expect(hash(a) == hash(b)).toBe(true)]),
   test("objects with different values hash differently", () => [
     expect(hash({ "x": 1 }) == hash({ "x": 2 })).toBe(false),
     expect(hash({ "x": 1 }) == hash({ "y": 1 })).toBe(false)
   ]),
-
   test("nested structures hash deeply", () =>
     val a = { "items": [1, 2], "meta": { "n": 3 } }
     val b = { "meta": { "n": 3 }, "items": [1, 2] }
     [
       expect(hash(a) == hash(b)).toBe(true),
       expect(hash(a) == hash({ "items": [1, 2], "meta": { "n": 4 } })).toBe(false)
-    ]
-  ),
+    ])
 ])
 
 run(s)

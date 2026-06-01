@@ -18,27 +18,64 @@ import { length } from "std/array"
 // `startCodeAt` trips a pre-existing codegen RC double-free (heap-use-after-free
 // in lin_array_release) — see the report. Driving start-code detection through
 // parseNals exercises the same logic and is memory-clean under ASan.
-
 val s = suite("raspberry-nal", [
-  // single_nal_unit: SC4 67 AA BB SC4 68  -> one NAL (type 7, data 67 AA BB),
-  // trailing 68 not flushed (matches Rust).
   test("single_nal_unit: one complete NAL, trailing NAL not flushed", () =>
-    val buf: UInt8[] = [0, 0, 0, 1, 0x67, 0xAA, 0xBB, 0, 0, 0, 1, 0x68]
+    // single_nal_unit: SC4 67 AA BB SC4 68  -> one NAL (type 7, data 67 AA BB),
+    // trailing 68 not flushed (matches Rust).
+    val buf: UInt8[] = [
+      0,
+      0,
+      0,
+      1,
+      103,
+      170,
+      187,
+      0,
+      0,
+      0,
+      1,
+      104
+    ]
     val nals = parseNals(buf)
     val checks = [
       expect(length(nals)).toBe(1),
       expect(nals[0]["nalType"]).toBe(7),
       expect(length(nals[0]["data"])).toBe(3),
-      expect(nals[0]["data"][0]).toBe(0x67),
-      expect(nals[0]["data"][1]).toBe(0xAA),
-      expect(nals[0]["data"][2]).toBe(0xBB)
+      expect(nals[0]["data"][0]).toBe(103),
+      expect(nals[0]["data"][1]).toBe(170),
+      expect(nals[0]["data"][2]).toBe(187)
     ]
-    checks
-  ),
-
-  // multiple_nal_units: three NALs, plus trailing SC + 0x41 to flush the third.
+    checks),
   test("multiple_nal_units: SPS, PPS, IDR in order", () =>
-    val buf: UInt8[] = [0, 0, 0, 1, 0x67, 0x01, 0x02, 0, 0, 0, 1, 0x68, 0x03, 0, 0, 0, 1, 0x65, 0x04, 0x05, 0x06, 0, 0, 0, 1, 0x41]
+    // multiple_nal_units: three NALs, plus trailing SC + 0x41 to flush the third.
+    val buf: UInt8[] = [
+      0,
+      0,
+      0,
+      1,
+      103,
+      1,
+      2,
+      0,
+      0,
+      0,
+      1,
+      104,
+      3,
+      0,
+      0,
+      0,
+      1,
+      101,
+      4,
+      5,
+      6,
+      0,
+      0,
+      0,
+      1,
+      65
+    ]
     val nals = parseNals(buf)
     val checks = [
       expect(length(nals)).toBe(3),
@@ -46,47 +83,62 @@ val s = suite("raspberry-nal", [
       expect(nals[1]["nalType"]).toBe(8),
       expect(nals[2]["nalType"]).toBe(5)
     ]
-    checks
-  ),
-
-  // three_byte_start_codes
+    checks),
   test("three_byte_start_codes: 00 00 01 delimiters", () =>
-    val buf: UInt8[] = [0, 0, 1, 0x67, 0xAA, 0, 0, 1, 0x68]
-    val nals = parseNals(buf)
-    val checks = [
-      expect(length(nals)).toBe(1),
-      expect(nals[0]["nalType"]).toBe(7)
+    // three_byte_start_codes
+    val buf: UInt8[] = [
+      0,
+      0,
+      1,
+      103,
+      170,
+      0,
+      0,
+      1,
+      104
     ]
-    checks
-  ),
-
-  // mixed_start_code_lengths: SC4 ... SC3 ... SC4 -> two complete NALs.
+    val nals = parseNals(buf)
+    val checks = [expect(length(nals)).toBe(1), expect(nals[0]["nalType"]).toBe(7)]
+    checks),
   test("mixed_start_code_lengths: 4- and 3-byte mixed", () =>
-    val buf: UInt8[] = [0, 0, 0, 1, 0x67, 0x01, 0, 0, 1, 0x68, 0x02, 0, 0, 0, 1, 0x65]
+    // mixed_start_code_lengths: SC4 ... SC3 ... SC4 -> two complete NALs.
+    val buf: UInt8[] = [
+      0,
+      0,
+      0,
+      1,
+      103,
+      1,
+      0,
+      0,
+      1,
+      104,
+      2,
+      0,
+      0,
+      0,
+      1,
+      101
+    ]
     val nals = parseNals(buf)
     val checks = [
       expect(length(nals)).toBe(2),
       expect(nals[0]["nalType"]).toBe(7),
       expect(nals[1]["nalType"]).toBe(8)
     ]
-    checks
-  ),
-
-  // no_start_code: bytes with no start code yield nothing.
+    checks),
   test("no_start_code: no NALs", () =>
-    val buf: UInt8[] = [0x41, 0x42, 0x43]
+    // no_start_code: bytes with no start code yield nothing.
+    val buf: UInt8[] = [65, 66, 67]
     val nals = parseNals(buf)
-    val checks = [ expect(length(nals)).toBe(0) ]
-    checks
-  ),
-
-  // empty_input
+    val checks = [expect(length(nals)).toBe(0)]
+    checks),
   test("empty_input: no NALs", () =>
+    // empty_input
     val empty: UInt8[] = []
     val nals = parseNals(empty)
-    val checks = [ expect(length(nals)).toBe(0) ]
-    checks
-  ),
+    val checks = [expect(length(nals)).toBe(0)]
+    checks)
 ])
 
 run(s)
