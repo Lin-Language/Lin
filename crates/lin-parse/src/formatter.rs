@@ -17,6 +17,11 @@ use lin_lex::Comment;
 use std::collections::HashMap;
 use std::cell::RefCell;
 
+/// Method-chain inlining threshold. A dot-call chain with MORE than this many calls is
+/// ALWAYS rendered multiline (one `.method(...)` per line), regardless of length. Chains
+/// with this many or fewer calls keep the inline-if-fits behaviour.
+const CHAIN_INLINE_MAX: usize = 2;
+
 /// Comment attachment, computed once in `with_comments` and consulted by the free-function
 /// formatters via a thread-local for the duration of a single `format_module` call. Keys are
 /// anchor span starts (char offsets).
@@ -32,6 +37,59 @@ struct CommentCtx {
 
 thread_local! {
     static CTX: RefCell<CommentCtx> = RefCell::new(CommentCtx::default());
+    /// When true, an array/object literal must render multiline even if it would fit
+    /// inline — set while rendering the contents of a multiline literal so that every
+    /// nested literal is also multiline (Rule 4, fully-recursive JSON). A top-level
+    /// literal decides inline-vs-multiline by its own fit; once it goes multiline its
+    /// descendants inherit the force flag.
+    static FORCE_ML: RefCell<bool> = const { RefCell::new(false) };
+    /// The current module's source line starts (char offsets), installed for the duration
+    /// of a `format_module` call so the free-function formatters can compute the source
+    /// line gap between consecutive statements (Rule 2, blank-line preservation).
+    static LINE_STARTS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// The current module's source text (as chars), installed alongside LINE_STARTS, used
+    /// to detect whether the line preceding a statement is blank (Rule 2). Statement span
+    /// ends are unreliable (e.g. an `import` span covers only the keyword), so blank-line
+    /// detection works from the FOLLOWING statement's position, scanning the source.
+    static SOURCE_CHARS: RefCell<Vec<char>> = const { RefCell::new(Vec::new()) };
+}
+
+/// True if, in the source, the line immediately preceding the line containing char offset
+/// `pos` is empty (whitespace only) — i.e. there's a blank line just before the statement
+/// (or its leading comment) at `pos`. This is the Rule 2 signal: a single source blank is
+/// preserved as exactly one blank line; runs collapse because only one blank is emitted.
+/// Returns false when no source info is installed (comment-free formatter).
+fn source_blank_before(pos: u32) -> bool {
+    LINE_STARTS.with(|ls_c| {
+        SOURCE_CHARS.with(|src_c| {
+            let ls = ls_c.borrow();
+            let src = src_c.borrow();
+            if ls.is_empty() {
+                return false;
+            }
+            let line = line_of(&ls, pos as usize);
+            if line == 0 {
+                return false;
+            }
+            // The preceding line spans [ls[line-1], ls[line]).
+            let start = ls[line - 1];
+            let end = ls[line].saturating_sub(1); // exclude the '\n'
+            let slice = &src[start..end.min(src.len())];
+            slice.iter().all(|c| c.is_whitespace())
+        })
+    })
+}
+
+/// Run `f` with the FORCE_ML flag set to `v`, restoring the previous value afterwards.
+fn with_force_ml<R>(v: bool, f: impl FnOnce() -> R) -> R {
+    let prev = FORCE_ML.with(|c| c.replace(v));
+    let r = f();
+    FORCE_ML.with(|c| *c.borrow_mut() = prev);
+    r
+}
+
+fn force_ml() -> bool {
+    FORCE_ML.with(|c| *c.borrow())
 }
 
 /// Leading comments for `anchor_start`, rendered as `"{ind}{text}\n"` lines (joined), or empty.
@@ -61,6 +119,20 @@ fn trailing_text(anchor_start: u32) -> String {
             .get(&anchor_start)
             .map(|cm| cm.text.clone())
             .unwrap_or_default()
+    })
+}
+
+/// The source char offset where the statement at `anchor_start` effectively begins for
+/// blank-line purposes: the start of its first leading comment if it has any, else
+/// `anchor_start` itself. This keeps a blank line that precedes a leading comment.
+fn leading_start(anchor_start: u32) -> u32 {
+    CTX.with(|c| {
+        let c = c.borrow();
+        c.leading
+            .get(&anchor_start)
+            .and_then(|cs| cs.first())
+            .map(|cm| cm.span.start)
+            .unwrap_or(anchor_start)
     })
 }
 
@@ -100,6 +172,9 @@ pub struct Formatter {
     /// Char offset of each source line's start (`line_starts[i]` = start of line `i`). Used to
     /// decide whether a trailing comment is on the same source line as an anchor's code.
     line_starts: Vec<usize>,
+    /// The source text as a char vector (for blank-line detection, Rule 2). Empty for the
+    /// comment-free `Formatter::new()`.
+    source_chars: Vec<char>,
 }
 
 /// Char offsets at which each source line begins. `line_starts[0] == 0`; each `\n` opens a new
@@ -126,7 +201,7 @@ impl Formatter {
     /// Comment-free formatter (legacy behaviour). Used by callers without a comment side
     /// channel; produces identical output to before comment preservation existed.
     pub fn new() -> Self {
-        Formatter { comments: Vec::new(), line_starts: Vec::new() }
+        Formatter { comments: Vec::new(), line_starts: Vec::new(), source_chars: Vec::new() }
     }
 
     /// Comment-preserving formatter. `comments` is the lexer's side channel for the SAME
@@ -135,6 +210,7 @@ impl Formatter {
         Formatter {
             comments,
             line_starts: compute_line_starts(source),
+            source_chars: source.chars().collect(),
         }
     }
 
@@ -144,6 +220,8 @@ impl Formatter {
         // call doesn't see stale state from a previous run).
         let ctx = build_comment_ctx(&self.comments, &self.line_starts, module);
         CTX.with(|c| *c.borrow_mut() = ctx);
+        LINE_STARTS.with(|c| *c.borrow_mut() = self.line_starts.clone());
+        SOURCE_CHARS.with(|c| *c.borrow_mut() = self.source_chars.clone());
 
         let mut out = String::new();
         let mut first = true;
@@ -153,11 +231,17 @@ impl Formatter {
             if matches!(stmt, Stmt::Expr(Expr::NullLit(_))) {
                 continue;
             }
+            let anchor = stmt.span().start;
             if !first {
-                out.push('\n');
+                // Rule 2: emit a blank line before this statement only if the source had a
+                // blank line just before it (or its leading comment). Runs collapse to one.
+                // The previous statement already emitted its terminating newline, so a blank
+                // line is exactly one extra '\n' here (no unconditional separator).
+                if source_blank_before(leading_start(anchor)) {
+                    out.push('\n');
+                }
             }
             first = false;
-            let anchor = stmt.span().start;
             out.push_str(&take_leading(anchor, ""));
             let mut s = fmt_stmt(stmt, "");
             let trailing = trailing_text(anchor);
@@ -176,8 +260,10 @@ impl Formatter {
             out.push('\n');
         }
 
-        // Clear the thread-local so it doesn't leak into a later comment-free format.
+        // Clear the thread-locals so they don't leak into a later comment-free format.
         CTX.with(|c| *c.borrow_mut() = CommentCtx::default());
+        LINE_STARTS.with(|c| c.borrow_mut().clear());
+        SOURCE_CHARS.with(|c| c.borrow_mut().clear());
         out
     }
 }
@@ -334,6 +420,47 @@ fn collect_anchors_expr(expr: &Expr, out: &mut Vec<Anchor>) {
     }
 }
 
+/// Build the Rule 6 redirect map: a leading comment that would attach to a lambda body which
+/// is an array/object literal AND that lambda is the last argument of a call that is itself a
+/// statement's whole expression/value, is re-anchored to the ENCLOSING STATEMENT. This hoists
+/// `() =>` `// comment` `[ … ]` to a leading comment above the statement, letting `() => [`
+/// collapse onto one line. Keys = lambda body span start; values = statement span start.
+fn build_hoist_redirects(module: &Module) -> HashMap<u32, u32> {
+    let mut map = HashMap::new();
+    for stmt in &module.statements {
+        let (stmt_start, value) = match stmt {
+            Stmt::Val { value, span, .. }
+            | Stmt::Var { value, span, .. }
+            | Stmt::Replace { value, span, .. } => (span.start, Some(value)),
+            Stmt::Expr(e) => (e.span().start, Some(e)),
+            _ => (0, None),
+        };
+        if let Some(value) = value {
+            collect_hoist_redirects(value, stmt_start, &mut map);
+        }
+    }
+    map
+}
+
+/// If `expr` is a call (`Call`/`DotCall`) whose LAST argument is a lambda with an array/object
+/// body, map that body's span start to `stmt_start`. Only the outermost call of a statement is
+/// considered (the lambda-body comment then belongs to the statement). Recurses into the call's
+/// last lambda arg's body so a nested `test(..., () => [ test(..., () => [ … ]) ])` also hoists.
+fn collect_hoist_redirects(expr: &Expr, stmt_start: u32, map: &mut HashMap<u32, u32>) {
+    let args = match expr {
+        Expr::Call { args, .. } => Some(args.as_slice()),
+        Expr::DotCall { args: Some(args), .. } => Some(args.as_slice()),
+        _ => return,
+    };
+    if let Some(args) = args {
+        if let Some(Expr::Function { body, .. }) = args.last() {
+            if matches!(**body, Expr::Array(..) | Expr::Object(..)) {
+                map.insert(body.span().start, stmt_start);
+            }
+        }
+    }
+}
+
 /// Compute leading/trailing/dangling attachment for `comments` against the module's anchors.
 fn build_comment_ctx(comments: &[Comment], line_starts: &[usize], module: &Module) -> CommentCtx {
     let mut ctx = CommentCtx::default();
@@ -341,12 +468,19 @@ fn build_comment_ctx(comments: &[Comment], line_starts: &[usize], module: &Modul
         return ctx;
     }
     let anchors = collect_anchors(module);
+    let redirects = build_hoist_redirects(module);
+
+    // Apply the Rule 6 hoist: if a leading comment's anchor is a lambda array/object body that
+    // is the last arg of a statement-level call, re-anchor it to the enclosing statement.
+    let redirect = |start: u32| -> u32 { redirects.get(&start).copied().unwrap_or(start) };
 
     for cm in comments {
         if cm.own_line {
             // Leading: attach to the first anchor that starts strictly after the comment.
             match anchors.iter().find(|a| a.start > cm.span.start) {
-                Some(a) => ctx.leading.entry(a.start).or_default().push(cm.clone()),
+                Some(a) => {
+                    ctx.leading.entry(redirect(a.start)).or_default().push(cm.clone())
+                }
                 None => ctx.dangling.push(cm.clone()),
             }
         } else {
@@ -943,8 +1077,7 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         // ── Call ──────────────────────────────────────────────────────────────
         Expr::Call { func, args, .. } => {
             let fs = fmt_postfix_base(func, |e| fmt_expr(e, false, ind));
-            let as_: Vec<String> = args.iter().map(|a| fmt_expr(a, false, ind)).collect();
-            format!("{}({})", fs, as_.join(", "))
+            format!("{}{}", fs, fmt_call_arglist(args, ind))
         }
 
         // ── DotCall / method chain ────────────────────────────────────────────
@@ -952,21 +1085,27 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
 
         // ── Array ─────────────────────────────────────────────────────────────
         Expr::Array(items, _) => {
-            if items.len() <= 4 && items.iter().all(is_atomic) {
+            // Inline fast-path — suppressed once an ancestor literal went multiline
+            // (Rule 4): a nested literal must then also render multiline.
+            if !force_ml() && items.len() <= 4 && items.iter().all(is_atomic) {
                 let inline = fmt_inline(expr);
                 if inline.len() + ind.len() <= 80 {
                     return inline;
                 }
             }
-            // Multi-line. Each item is at child_ind.
-            let item_strs: Vec<String> = items
-                .iter()
-                .map(|i| {
-                    let s = fmt_expr(i, false, &child_ind);
-                    format!("{}{},", child_ind, s)
-                })
-                .collect();
-            format!("[\n{}\n{}]", item_strs.join("\n"), ind)
+            // Multi-line. Each item is at child_ind. No trailing comma (Rule 3); the
+            // separator sits between items only. Contents render with FORCE_ML set so
+            // every nested literal is also multiline (Rule 4).
+            let item_strs: Vec<String> = with_force_ml(true, || {
+                items
+                    .iter()
+                    .map(|i| {
+                        let s = fmt_expr(i, false, &child_ind);
+                        format!("{}{}", child_ind, s)
+                    })
+                    .collect()
+            });
+            format!("[\n{}\n{}]", item_strs.join(",\n"), ind)
         }
 
         // ── Object ────────────────────────────────────────────────────────────
@@ -978,31 +1117,41 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
                 ObjectField::Pair(k, v) => is_atomic(k) && is_atomic(v),
                 ObjectField::Spread(e) => is_atomic(e),
             });
-            if all_atomic && fields.len() <= 2 {
+            if !force_ml() && all_atomic && fields.len() <= 2 {
                 let inline = fmt_inline(expr);
                 if inline.len() + ind.len() <= 80 {
                     return inline;
                 }
             }
-            let field_strs: Vec<String> = fields
-                .iter()
-                .map(|f| match f {
-                    ObjectField::Pair(k, v) => {
-                        let ks = fmt_expr(k, false, &child_ind);
-                        let vs = fmt_expr(v, false, &child_ind);
-                        format!("{}{}: {},", child_ind, ks, vs)
-                    }
-                    ObjectField::Spread(e) => {
-                        format!("{}...{},", child_ind, fmt_expr(e, false, &child_ind))
-                    }
-                })
-                .collect();
-            format!("{{\n{}\n{}}}", field_strs.join("\n"), ind)
+            // No trailing comma (Rule 3); contents forced multiline (Rule 4).
+            let field_strs: Vec<String> = with_force_ml(true, || {
+                fields
+                    .iter()
+                    .map(|f| match f {
+                        ObjectField::Pair(k, v) => {
+                            let ks = fmt_expr(k, false, &child_ind);
+                            let vs = fmt_expr(v, false, &child_ind);
+                            format!("{}{}: {}", child_ind, ks, vs)
+                        }
+                        ObjectField::Spread(e) => {
+                            format!("{}...{}", child_ind, fmt_expr(e, false, &child_ind))
+                        }
+                    })
+                    .collect()
+            });
+            format!("{{\n{}\n{}}}", field_strs.join(",\n"), ind)
         }
 
         // ── Function ──────────────────────────────────────────────────────────
         Expr::Function { type_params, params, return_type, body, .. } => {
-            fmt_function(type_params, params, return_type.as_ref(), body, ind)
+            // A lambda body is a fresh layout scope: a multiline ancestor literal must NOT
+            // force literals inside the lambda's body to be multiline (Rule 4 is about JSON
+            // data nesting, not code buried in a lambda). Clearing FORCE_ML here also keeps
+            // formatting idempotent — otherwise a `val x = [1, 2, 3]` inside a lambda body
+            // that is an argument to a call inside a literal would flip layout between passes.
+            with_force_ml(false, || {
+                fmt_function(type_params, params, return_type.as_ref(), body, ind)
+            })
         }
 
         // ── If ────────────────────────────────────────────────────────────────
@@ -1190,6 +1339,21 @@ fn fmt_function(
         trailing_text(body_anchor)
     };
 
+    // Rule 5a: a lambda whose body is an array/object literal keeps `=> [` / `=> {`
+    // attached on the param line, with the literal's contents flowing beneath. The literal
+    // renders at the FUNCTION's own indent (not child_ind), so its closing `]`/`}` lines up
+    // under the `=>` line and a leading comment between `=>` and the body has been hoisted
+    // away (handled by the caller / comment anchoring). Only when there's no leading comment
+    // forcing the split.
+    if body_leading.is_empty()
+        && matches!(body, Expr::Array(..) | Expr::Object(..))
+    {
+        let body_str = fmt_expr(body, false, ind);
+        if body_str.contains('\n') {
+            return format!("{} => {}", param_part, body_str);
+        }
+    }
+
     // Block / match / complex if → multi-line.
     let needs_multiline = matches!(body, Expr::Block(..) | Expr::Match { .. })
         || (matches!(body, Expr::If { .. }) && !is_atomic(body))
@@ -1224,11 +1388,20 @@ fn fmt_block(stmts: &[Stmt], tail: &Expr, ind: &str) -> String {
 
     // Each stmt is rendered as a fully-indented multi-line string at `ind`.
     // Skip bare NullLit statements (DEDENT artifacts).
+    let mut seen_stmt = false;
     for stmt in stmts {
         if matches!(stmt, Stmt::Expr(Expr::NullLit(_))) {
             continue;
         }
         let anchor = stmt.span().start;
+        // Rule 2: a blank source line before this statement (or its leading comment) is
+        // preserved as exactly one blank entry; runs collapse to one. An empty `lines`
+        // entry becomes a blank line via the final `join("\n")`. Not applied before the
+        // first statement of the block (no leading blank inside a block body).
+        if seen_stmt && source_blank_before(leading_start(anchor)) {
+            lines.push(String::new());
+        }
+        seen_stmt = true;
         // Leading comments at `ind` (each its own line) — already include trailing newlines,
         // so trim the final one and push as a separate joined-by-\n line entry.
         let leading = take_leading(anchor, ind);
@@ -1246,6 +1419,10 @@ fn fmt_block(stmts: &[Stmt], tail: &Expr, ind: &str) -> String {
 
     // Tail: leading comments, then the tail expr.
     let tail_anchor = tail.span().start;
+    // A blank source line between the last statement and the tail is preserved.
+    if seen_stmt && source_blank_before(leading_start(tail_anchor)) {
+        lines.push(String::new());
+    }
     let tail_leading = take_leading(tail_anchor, ind);
     if !tail_leading.is_empty() {
         lines.push(tail_leading.trim_end_matches('\n').to_string());
@@ -1392,6 +1569,69 @@ fn fmt_stmt(stmt: &Stmt, ind: &str) -> String {
     }
 }
 
+// ── call argument lists ─────────────────────────────────────────────────────────
+
+/// Render the parenthesised argument list of a call (`(a, b, c)`), at the call's own
+/// indentation `ind`. Implements Rule 5:
+///
+/// - INLINE when every argument renders single-line and the joined list fits the budget.
+/// - TRAILING style (5a) when ALL-but-the-last argument render single-line and only the
+///   LAST argument is multi-line: `(a, b, <lastArgFirstLine>` stays on the call's line and
+///   the last argument's body flows beneath at `ind`. A trailing lambda `() => [ … ]` keeps
+///   its `() => [` on the call line.
+/// - FULLY-SPLIT style (5b) otherwise (multiple multi-line args, or a non-last multi-line
+///   arg): open paren on the call line, each argument on its own line at child indent, a
+///   multi-line lambda arg renders `param =>` then its body indented beneath, comma between
+///   args, closing paren on its own line at `ind`.
+fn fmt_call_arglist(args: &[Expr], ind: &str) -> String {
+    if args.is_empty() {
+        return "()".to_string();
+    }
+    let child_ind = format!("{}  ", ind);
+
+    // Inline attempt: render each arg at the call's own indent.
+    let inline_args: Vec<String> = args.iter().map(|a| fmt_expr(a, false, ind)).collect();
+    let any_inline_multiline = inline_args.iter().any(|s| s.contains('\n'));
+    if !any_inline_multiline {
+        let joined = inline_args.join(", ");
+        if joined.len() + ind.len() <= 80 {
+            return format!("({})", joined);
+        }
+    }
+
+    // Decide between trailing (5a) and fully-split (5b). Render every arg at child_ind to
+    // see which are multi-line in that position.
+    let rendered: Vec<String> = args
+        .iter()
+        .map(|a| fmt_expr(a, false, &child_ind))
+        .collect();
+    let multiline_flags: Vec<bool> = rendered.iter().map(|s| s.contains('\n')).collect();
+    let multiline_count = multiline_flags.iter().filter(|b| **b).count();
+    let only_last_multiline = multiline_count >= 1
+        && multiline_flags[..multiline_flags.len() - 1].iter().all(|b| !b)
+        && multiline_flags[multiline_flags.len() - 1];
+
+    if only_last_multiline {
+        // TRAILING style (5a): leading args inline on the call line, last arg flows. The
+        // last arg is rendered at `ind` so its body (and closing `]`/`}`) line up under the
+        // call, and a trailing lambda keeps `=> [`/`=> {` on the same line.
+        let n = args.len();
+        let last = fmt_expr(&args[n - 1], false, ind);
+        if n == 1 {
+            return format!("({})", last);
+        }
+        let lead: Vec<String> = inline_args[..n - 1].to_vec();
+        return format!("({}, {})", lead.join(", "), last);
+    }
+
+    // FULLY-SPLIT style (5b): one arg per line at child_ind, close paren at `ind`.
+    let arg_lines: Vec<String> = rendered
+        .iter()
+        .map(|s| format!("{}{}", child_ind, s))
+        .collect();
+    format!("(\n{}\n{})", arg_lines.join(",\n"), ind)
+}
+
 // ── dot chain ─────────────────────────────────────────────────────────────────
 
 fn collect_chain(expr: &Expr) -> (&Expr, Vec<(&str, &Option<Vec<Expr>>)>) {
@@ -1413,8 +1653,9 @@ fn fmt_chain(expr: &Expr, ind: &str) -> String {
     let (root, chain) = collect_chain(expr);
     let child_ind = format!("{}  ", ind);
 
-    // Try inline for short chains.
-    if chain.len() < 4 {
+    // Try inline for short chains. A chain with more than CHAIN_INLINE_MAX calls is
+    // ALWAYS rendered multiline regardless of length (Rule 1).
+    if chain.len() <= CHAIN_INLINE_MAX {
         let inline = fmt_inline(expr);
         // Only use inline if it truly fits on one line (no newlines and fits in budget).
         if !inline.contains('\n') && inline.len() + ind.len() <= 120 {
@@ -1429,8 +1670,7 @@ fn fmt_chain(expr: &Expr, ind: &str) -> String {
         .map(|(method, args)| match args {
             None => format!("{}.{}", child_ind, method),
             Some(a) => {
-                let as_: Vec<String> = a.iter().map(|x| fmt_expr(x, false, &child_ind)).collect();
-                format!("{}.{}({})", child_ind, method, as_.join(", "))
+                format!("{}.{}{}", child_ind, method, fmt_call_arglist(a, &child_ind))
             }
         })
         .collect();
