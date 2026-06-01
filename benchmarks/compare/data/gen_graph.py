@@ -18,21 +18,22 @@
 #     (space-separated; edges in the SAME order as graph.json)
 #
 # Graph shape (fixed seed -> fully reproducible):
-#   N = 1000 nodes named n0..n999.
+#   N = 4000 nodes named n0..n3999.
 #   For each i, edges i -> i+1 .. i+8 (skipping out-of-range targets). The
-#   i -> i+1 chain guarantees n0 reaches n999, so the graph is connected.
+#   i -> i+1 chain guarantees n0 reaches n3999, so the graph is connected.
 #   Plus a handful of long "skip" edges: each i with probability ~0.3 gets one
 #   extra edge to a random j > i. Weights are random ints in [1, 100].
-#   Total ~8000 edges.
+#   Total ~32000 edges. (Sized for the O(V^2) linear-scan PQ: large enough that
+#   the inner min-scan dominates and language/runtime differences are visible.)
 
 import json
 import os
 import random
 
 SEED = 1234          # hardcoded: must be reproducible, never system time
-N = 1000
+N = 4000
 SOURCE = "n0"
-TARGET = "n999"
+TARGET = "n" + str(N - 1)
 FANOUT = 8           # i -> i+1 .. i+FANOUT
 SKIP_PROB = 0.3      # chance i gets one extra long edge to a random j > i
 

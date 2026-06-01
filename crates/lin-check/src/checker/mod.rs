@@ -48,6 +48,12 @@ pub struct Checker {
     protected_type_vars: std::collections::HashSet<u32>,
     /// Slots of mutable global (`var`) bindings. Used by the async var-capture check.
     mutable_global_slots: std::collections::HashMap<usize, String>,
+    /// Affine resource tracking (streams brief §7): slots of `Stream`-typed `val` bindings that
+    /// have already been CONSUMED (read as a value). A `Stream` is use-at-most-once; reading the
+    /// same binding twice is a use-after-move ERROR. Flow-sensitive: if/match snapshot this set
+    /// per branch and merge conservatively (a binding consumed in ANY branch is consumed after).
+    /// Dropping (never consuming) is FINE — the RC finalizer closes the fd; only double-use errors.
+    consumed_streams: std::collections::HashSet<usize>,
     /// When true, a `Json` value is permitted to flow into a fully-concrete target without
     /// an explicit `fromJson` decode (ADR-046). Set only for the trusted stdlib, whose
     /// wrappers forward `Json` handles into concrete intrinsic/foreign params by design.
@@ -101,6 +107,7 @@ impl Checker {
             solved_type_vars: std::collections::HashMap::new(),
             protected_type_vars: std::collections::HashSet::new(),
             mutable_global_slots: std::collections::HashMap::new(),
+            consumed_streams: std::collections::HashSet::new(),
             lenient_json: false,
             generic_fn_params: std::collections::HashMap::new(),
             // Start above the intrinsic generic slot (9000) so quantified generics never
@@ -172,11 +179,29 @@ impl Checker {
         is_compatible_env(value, target, Some(&self.env), self.lenient_json, &mut 0)
     }
 
+    /// Argument compatibility for a (non-dot) function call. Identical to `types_compatible`
+    /// except it additionally accepts an `Iterator<T>` argument where an `Array<U>` parameter
+    /// is expected (elements compatible). The standard iterator functions (`map`/`filter`/
+    /// `reduce`/…) are specified to accept "an array or an `Iterator<T>`" (spec §17.6), and the
+    /// dot form `it.map(f)` already does — its arg-binding path never runs the strict array
+    /// check. This makes the equivalent free-call form `map(it, f)` accept the same arguments,
+    /// so `f(x, y)` and `x.f(y)` agree (the lowering handles either iterable identically). The
+    /// leniency is confined to call arguments — plain assignment (`val a: T[] = someIterator`)
+    /// still rejects, since an iterator is not indexable.
+    pub(crate) fn arg_compatible(&self, value: &Type, target: &Type) -> bool {
+        if let (Type::Iterator(v_elem), Type::Array(t_elem)) = (value, target) {
+            if self.types_compatible(v_elem, t_elem) {
+                return true;
+            }
+        }
+        self.types_compatible(value, target)
+    }
+
     /// Collect all TypeVar IDs recursively from a type into `out`.
     fn collect_typevar_ids(ty: &Type, out: &mut std::collections::HashSet<u32>) {
         match ty {
             Type::TypeVar(id) => { out.insert(*id); }
-            Type::Array(t) | Type::Iterator(t) | Type::Shared(t) => Self::collect_typevar_ids(t, out),
+            Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) => Self::collect_typevar_ids(t, out),
             Type::FixedArray(ts) => { for t in ts { Self::collect_typevar_ids(t, out); } }
             Type::Union(ts) => { for t in ts { Self::collect_typevar_ids(t, out); } }
             Type::Function { params, ret, .. } => {

@@ -1,0 +1,12 @@
+{% extends "base.jinja" %}
+
+{% block body_attrs %} class="home"{% endblock %}
+
+{% block main %}
+  <main class="home-main">
+    {{ hero }}
+    <article class="hero-article">
+      {{ content }}
+    </article>
+  </main>
+{% endblock %}

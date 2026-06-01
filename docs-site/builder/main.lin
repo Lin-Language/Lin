@@ -2,8 +2,9 @@ import { print } from "std/io"
 import { readFile, writeFile, readJson, ls, mkdir, cp } from "std/fs"
 import { join } from "std/path"
 import { split, startsWith, contains, trim, substring, indexOf, replaceAll } from "std/string"
-import { for, filter, push, length } from "std/array"
-import { renderWith } from "std/template"
+import { push, length } from "std/array"
+import { for, filter } from "std/iter"
+import { render } from "std/template"
 import { getEnv } from "std/env"
 
 import { markdownToHtml } from "./markdown"
@@ -15,8 +16,8 @@ import { buildHero } from "./hero"
 val contentDir = "docs-site/content"
 val outputDir = "docs-site/output"
 val staticDir = "docs-site/static"
-val pageTemplate = "docs-site/templates/page.lint"
-val homeTemplate = "docs-site/templates/home.lint"
+val pageTemplate = "docs-site/templates/page.jinja"
+val homeTemplate = "docs-site/templates/home.jinja"
 
 // Deployment base path. GitHub Pages serves a project site under "/<repo>", so all
 // internal links and asset URLs are prefixed with this. Set LIN_DOCS_BASE=/Lin in CI;
@@ -100,16 +101,18 @@ val processFile = (filePath: String, navEntries: Json): Null =>
     val outputPath = contentPathToOutput(filePath)
     val isHome = urlPath == "/"
     val templatePath = if isHome then homeTemplate else pageTemplate
-    val templateJson = readFile(templatePath)
-    val templateStr = fileContent(templateJson)
     // The home page gets the two-column feature/code-tabs hero above its content.
     val hero = if isHome then buildHero(basePath) else ""
-    val rendered = renderWith(templateStr, { "title": title, "nav": navHtml, "content": htmlContent, "base": basePath, "hero": hero })
-    val outDir = dirName(outputPath)
-    mkdir(outDir, { "parents": true })
-    val writeResult = writeFile(outputPath, rendered)
-    if isError(writeResult) then print("Error writing ${outputPath}: ${errorMsg(writeResult)}")
-    else print("  ${outputPath}")
+    // render() loads the template by path so `{% extends "base.jinja" %}` resolves
+    // against templates/ — page.jinja and home.jinja share the base.jinja layout.
+    val rendered = render(templatePath, { "title": title, "nav": navHtml, "content": htmlContent, "base": basePath, "hero": hero })
+    if isError(rendered) then print("Error rendering ${templatePath}: ${errorMsg(rendered)}")
+    else
+      val outDir = dirName(outputPath)
+      mkdir(outDir, { "parents": true })
+      val writeResult = writeFile(outputPath, rendered)
+      if isError(writeResult) then print("Error writing ${outputPath}: ${errorMsg(writeResult)}")
+      else print("  ${outputPath}")
 
 // Copy static assets to output/static/
 val copyStatic = (): Null =>

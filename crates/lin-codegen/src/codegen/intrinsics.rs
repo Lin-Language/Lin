@@ -521,6 +521,204 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(close_fn, &[worker.into()], "");
                 ptr_ty.const_null().into()
             }
+            // openRead(path) → lin_fs_open(path) → boxed Stream<UInt8[]> (TAG_STREAM) OR a
+            // boxed Error object. Both are TaggedVal*, so the union result needs no unboxing.
+            // The path arg is a String (raw LinString* or boxed Str); pass it through — the
+            // runtime's resolve_lin_str tolerates both shapes (mirrors the lin_fs_* family).
+            Intrinsic::StreamOpen => {
+                let path = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let f = self.get_or_declare_fn("lin_fs_open", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(f, &[path.into()], "ir_stream_open").try_as_basic_value().unwrap_basic()
+            }
+            // read(stream) → lin_stream_read(stream) → boxed `T | Null | Error` (chunk = flat
+            // UInt8[] array box, EOF = null, error = Error object). Always a TaggedVal*; the
+            // result type is a union, so leave it boxed for the caller to inspect.
+            Intrinsic::StreamRead => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let f = self.get_or_declare_fn("lin_stream_read", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(f, &[s.into()], "ir_stream_read").try_as_basic_value().unwrap_basic()
+            }
+            // close(stream) → lin_stream_close(stream) → Null (idempotent).
+            Intrinsic::StreamClose => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let f = self.get_or_declare_fn("lin_stream_close", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(f, &[s.into()], "ir_stream_close").try_as_basic_value().unwrap_basic()
+            }
+            // Lazy adapters returning a new Stream (TaggedVal*(TAG_STREAM)). map/filter pass a
+            // transform closure (unboxed to a raw closure ptr if it arrived boxed); take/chunks an
+            // Int64 count; lines no extra arg; write a String path. All return a boxed Stream.
+            Intrinsic::StreamMap | Intrinsic::StreamFilter => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                // The runtime tolerates either a boxed Function or a raw closure ptr; pass through.
+                let func = if Self::is_union_type(&func_ty) && func.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[func.into()], "ir_stream_cls").try_as_basic_value().unwrap_basic()
+                } else { func };
+                let name = if matches!(intrinsic, Intrinsic::StreamMap) { "lin_stream_map" } else { "lin_stream_filter" };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), func.into()], "ir_stream_adapt").try_as_basic_value().unwrap_basic()
+            }
+            Intrinsic::StreamTake | Intrinsic::StreamChunks | Intrinsic::StreamLines => {
+                // All three take (stream, i64): take→count, chunks→size, lines→max line bytes
+                // (≤0 selects the default cap). A one-arg `lines(s)` call lowers `n` to 0 here.
+                let i64_ty = self.context.i64_type();
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let n = args.get(1).copied().unwrap_or_else(|| i64_ty.const_zero().into());
+                let n_i64 = if n.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(n.into_int_value(), i64_ty, "ir_stream_n")
+                } else { i64_ty.const_zero() };
+                let name = match intrinsic {
+                    Intrinsic::StreamTake => "lin_stream_take",
+                    Intrinsic::StreamChunks => "lin_stream_chunks",
+                    _ => "lin_stream_lines",
+                };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), n_i64.into()], "ir_stream_take_chunks_lines").try_as_basic_value().unwrap_basic()
+            }
+            // drop(stream, n): (stream, i64) → Stream. Mirrors take's int-count handling.
+            Intrinsic::StreamDrop => {
+                let i64_ty = self.context.i64_type();
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let n = args.get(1).copied().unwrap_or_else(|| i64_ty.const_zero().into());
+                let n_i64 = if n.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(n.into_int_value(), i64_ty, "ir_stream_drop_n")
+                } else { i64_ty.const_zero() };
+                let fnv = self.get_or_declare_fn("lin_stream_drop", ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), n_i64.into()], "ir_stream_drop").try_as_basic_value().unwrap_basic()
+            }
+            // Closure-bearing lazy adapters: (stream, closure) → Stream. Unbox a boxed Function
+            // arg to a raw closure ptr exactly like map/filter.
+            Intrinsic::StreamTakeWhile | Intrinsic::StreamDropWhile | Intrinsic::StreamFlatMap => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                let func = if Self::is_union_type(&func_ty) && func.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[func.into()], "ir_stream_cls").try_as_basic_value().unwrap_basic()
+                } else { func };
+                let name = match intrinsic {
+                    Intrinsic::StreamTakeWhile => "lin_stream_take_while",
+                    Intrinsic::StreamDropWhile => "lin_stream_drop_while",
+                    _ => "lin_stream_flat_map",
+                };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), func.into()], "ir_stream_adapt2").try_as_basic_value().unwrap_basic()
+            }
+            // flatten(stream): (stream) → Stream.
+            Intrinsic::StreamFlatten => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let fnv = self.get_or_declare_fn("lin_stream_flatten", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into()], "ir_stream_flatten").try_as_basic_value().unwrap_basic()
+            }
+            // concat(a, b): (stream, stream) → Stream. BOTH streams are moved into the adapter.
+            Intrinsic::StreamConcat => {
+                let a = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let b = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let fnv = self.get_or_declare_fn("lin_stream_concat", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(fnv, &[a.into(), b.into()], "ir_stream_concat").try_as_basic_value().unwrap_basic()
+            }
+            Intrinsic::StreamWrite => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let path = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let fnv = self.get_or_declare_fn("lin_stream_write", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), path.into()], "ir_stream_write").try_as_basic_value().unwrap_basic()
+            }
+            // Terminal drivers (sync, calling thread). Each returns a boxed union value
+            // (Null|Error / UInt8[]|Error / String|Error) — leave it boxed.
+            Intrinsic::StreamDrain | Intrinsic::StreamCollect | Intrinsic::StreamReadText => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let name = match intrinsic {
+                    Intrinsic::StreamDrain => "lin_stream_drain",
+                    Intrinsic::StreamCollect => "lin_stream_collect",
+                    _ => "lin_stream_read_text",
+                };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into()], "ir_stream_term").try_as_basic_value().unwrap_basic()
+            }
+            // Unified OS sources → boxed Stream<UInt8[]>. tcp takes an i32 fd; stdout an i64
+            // handle; stdin takes no args.
+            Intrinsic::StreamTcp => {
+                let i32_ty = self.context.i32_type();
+                let fd = args.first().copied().unwrap_or_else(|| i32_ty.const_zero().into());
+                let fd_i32 = if fd.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(fd.into_int_value(), i32_ty, "ir_tcp_fd")
+                } else { i32_ty.const_zero() };
+                let fnv = self.get_or_declare_fn("lin_net_tcp_stream", ptr_ty.fn_type(&[i32_ty.into()], false));
+                self.builder.call(fnv, &[fd_i32.into()], "ir_stream_tcp").try_as_basic_value().unwrap_basic()
+            }
+            Intrinsic::StreamStdout => {
+                let i64_ty = self.context.i64_type();
+                let h = args.first().copied().unwrap_or_else(|| i64_ty.const_zero().into());
+                let h_i64 = if h.is_int_value() {
+                    self.builder.int_s_extend_or_bit_cast(h.into_int_value(), i64_ty, "ir_proc_h")
+                } else { i64_ty.const_zero() };
+                let fnv = self.get_or_declare_fn("lin_process_stdout_stream", ptr_ty.fn_type(&[i64_ty.into()], false));
+                self.builder.call(fnv, &[h_i64.into()], "ir_stream_stdout").try_as_basic_value().unwrap_basic()
+            }
+            Intrinsic::StreamStdin => {
+                let fnv = self.get_or_declare_fn("lin_io_stdin_stream", ptr_ty.fn_type(&[], false));
+                self.builder.call(fnv, &[], "ir_stream_stdin").try_as_basic_value().unwrap_basic()
+            }
+            // .promise() → lin_stream_promise(s) → *LinPromise, boxed as TAG_PROMISE so it
+            // round-trips through await/parallel like any other promise. The stream is MOVED in
+            // (the IR suppressed the caller's release).
+            Intrinsic::StreamPromise => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let fnv = self.get_or_declare_fn("lin_stream_promise", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                let raw = self.builder.call(fnv, &[s.into()], "ir_stream_promise").try_as_basic_value().unwrap_basic();
+                self.box_promise(raw)
+            }
+            // .for(fn) over a Stream → lin_stream_for(stream, closure) → boxed Null | Error. The
+            // body closure may arrive boxed; unbox to the raw closure ptr like map/filter.
+            Intrinsic::StreamFor => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                let func = if Self::is_union_type(&func_ty) && func.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[func.into()], "ir_streamfor_cls").try_as_basic_value().unwrap_basic()
+                } else { func };
+                let fnv = self.get_or_declare_fn("lin_stream_for", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), func.into()], "ir_stream_for").try_as_basic_value().unwrap_basic()
+            }
+            // Stream terminals taking a single predicate/body closure: find/some/every/while →
+            // (stream, closure) → boxed (X | Error). The closure may arrive boxed; unbox it.
+            Intrinsic::StreamFind | Intrinsic::StreamSome | Intrinsic::StreamEvery | Intrinsic::StreamWhile => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                let func = if Self::is_union_type(&func_ty) && func.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[func.into()], "ir_streamterm_cls").try_as_basic_value().unwrap_basic()
+                } else { func };
+                let name = match intrinsic {
+                    Intrinsic::StreamFind => "lin_stream_find",
+                    Intrinsic::StreamSome => "lin_stream_some",
+                    Intrinsic::StreamEvery => "lin_stream_every",
+                    _ => "lin_stream_while",
+                };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), func.into()], "ir_stream_term1").try_as_basic_value().unwrap_basic()
+            }
+            // reduce(stream, init, f) → (stream, boxed init, closure) → boxed (U | Error). The init
+            // accumulator is passed boxed (TaggedVal*); the closure may arrive boxed (unbox it).
+            Intrinsic::StreamReduce => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let init = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let init_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                // The runtime takes the accumulator as a boxed TaggedVal*; box a concrete/scalar
+                // init. An already-boxed union/Json init is passed through (no double-box).
+                let init = if Self::is_union_type(&init_ty) {
+                    init
+                } else {
+                    self.box_value(init, &init_ty)
+                };
+                let func = args.get(2).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func_ty = arg_tys.get(2).cloned().unwrap_or(Type::Null);
+                let func = if Self::is_union_type(&func_ty) && func.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[func.into()], "ir_streamreduce_cls").try_as_basic_value().unwrap_basic()
+                } else { func };
+                let fnv = self.get_or_declare_fn("lin_stream_reduce", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), init.into(), func.into()], "ir_stream_reduce").try_as_basic_value().unwrap_basic()
+            }
             // lin_object_set(obj, key, val) => Null. Unbox obj→LinObject*, key→LinString*,
             // box val→TaggedVal*, then call the runtime. Mirrors the AST handler.
             Intrinsic::ObjectSetDyn => {
@@ -637,15 +835,21 @@ impl<'ctx> Codegen<'ctx> {
                     } else {
                         self.build_tagged_val_alloca(&fill_val, &fill_ty)
                     };
+                    // Does the fill carry a heap (refcounted) payload? A boxed union/Json arrives as
+                    // a TaggedVal* that may wrap one; a CONCRETE heap type (String/Array/Object/
+                    // Function — `ty_is_concrete_rc`) also does. Either way the SAME heap value is
+                    // stored into all n slots, and `lin_array_release` will release each slot's
+                    // payload, so each slot needs its OWN reference. A flat scalar / Bool / Null fill
+                    // carries no heap payload and needs no retain. (Before generics, `arrayAllocateFilled`
+                    // was `(n, fill: Json)`, so this was ALWAYS the boxed-union case; a monomorphized
+                    // concrete heap fill like `arrayAllocateFilled(3, [1,2])` now hits the concrete-rc
+                    // branch — without this retain, releasing the result double-freed the shared array.)
+                    let fill_has_heap_payload = is_boxed_union || Self::ty_is_concrete_rc(&fill_ty);
                     let set_fn = self.get_or_declare_fn("lin_array_set",
                         self.context.void_type().fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
                     // `lin_array_set` raw-copies the 16-byte TaggedVal into the slot WITHOUT
-                    // retaining the inner payload (it CONSUMES one owning reference). We store the
-                    // SAME box into all n slots, so each slot needs its own reference to the inner
-                    // heap value: retain the inner once per iteration. (A concrete scalar has no
-                    // heap payload, so no retain — `lin_tagged_retain` is a no-op there anyway, but
-                    // we only have a stack TaggedVal in that case, so guard on the boxed-union case.)
-                    // The caller's original borrowed reference is left intact for its own scope.
+                    // retaining the inner payload (it CONSUMES one owning reference). The caller's
+                    // original borrowed reference is left intact for its own scope.
                     let retain_fn = self.get_or_declare_fn("lin_tagged_retain",
                         self.context.void_type().fn_type(&[ptr_ty.into()], false));
                     let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
@@ -660,7 +864,7 @@ impl<'ctx> Codegen<'ctx> {
                     let cond = self.builder.int_compare(inkwell::IntPredicate::SLT, cur, n_i64, "ir_fill_cond");
                     self.builder.conditional_branch(cond, body, exit);
                     self.builder.position_at_end(body);
-                    if is_boxed_union {
+                    if fill_has_heap_payload {
                         self.builder.call(retain_fn, &[tagged.into()], "");
                     }
                     self.builder.call(set_fn, &[arr.into(), cur.into(), tagged.into()], "");
@@ -919,7 +1123,10 @@ impl<'a> DescEncoder<'a> {
             | Type::Iterator(_)
             | Type::Function { .. }
             | Type::Never
-            | Type::Shared(_) => self.put_u8(KIND_JSON),
+            | Type::Shared(_)
+            // `Stream<T>` is opaque and never a `fromJson` target (not JSON-shaped, not
+            // spellable in annotations); included only for match exhaustiveness — accept-any.
+            | Type::Stream(_) => self.put_u8(KIND_JSON),
             Type::Array(inner) => {
                 self.put_u8(KIND_ARRAY);
                 let slot = self.reserve_u32();

@@ -1,6 +1,7 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
-import { map, filter, reduce, find, some, every, flatMap, indexOf, reverse, concat, push, length, range, rangeStep, for, partition, zip, unique, take, drop, takeWhile, dropWhile, flatten, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, iterOf, arrayAllocate, arrayAllocateFilled, set, at } from "std/array"
+import { indexOf, reverse, push, length, partition, zip, unique, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, arrayAllocate, arrayAllocateFilled, set, at } from "std/array"
+import { map, filter, reduce, find, some, every, flatMap, concat, range, rangeStep, for, take, drop, takeWhile, dropWhile, flatten, iterOf } from "std/iter"
 
 val s = suite("std/array", [
   test("length of array", () => [expect([1, 2, 3].length()).toBe(3)]),

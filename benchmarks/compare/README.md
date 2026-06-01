@@ -35,26 +35,34 @@ all languages and are the single source of truth:
 
 | Workload   | What it exercises | Fixed parameters | Pinned `RESULT` |
 |------------|-------------------|------------------|-----------------|
-| `dijkstra` | Graph build + linear-scan-PQ shortest path + input parsing | N=1000 nodes, ~8256 edges, source `n0`, target `n999` | `115153677` |
-| `parallel` | CPU-bound fan-out across threads/processes | START=27, ITERS=30000000, CHUNKS=8 | `217371330648` |
-| `recursion`| Recursive call overhead (`fib`) + iterative loop (`sumTo`) | FIB_N=38, SUM_N=50000000 | `40338169298617183` |
-| `pipeline` | Eager `map`/`filter`/`reduce`, materializing each stage | N=2000000 | `1333332666666` |
-| `async_io` | I/O-bound bounded concurrency | TASKS=200, SLEEP_MS=50, CONCURRENCY=50 | `40000` |
+| `dijkstra` | Graph build + linear-scan-PQ shortest path + input parsing | N=4000 nodes, ~33163 edges, source `n0`, target `n3999` | `121789671` |
+| `parallel` | CPU-bound fan-out across threads/processes | START=27, ITERS=300000000, CHUNKS=8 | `2173714077200` |
+| `recursion`| Recursive call overhead (`fib`) + iterative loop (`sumTo`) | FIB_N=42, SUM_N=50000000 | `269164297900400072` |
+| `pipeline` | Eager `map`/`filter`/`reduce`, materializing each stage | N=20000000 | `133333326666666` |
+| `async_io` | I/O-bound bounded concurrency (latency/overlap, not runtime speed) | TASKS=200, SLEEP_MS=50, CONCURRENCY=50 | `40000` |
+
+Workload sizes are chosen so each runs long enough that fixed overhead (process
+start, thread spawn) is a small fraction and the cross-language ratio is stable —
+a workload that finishes in ~10-20ms hides the real per-operation gap behind
+startup cost (see the scaling notes in `## Caveats`).
 
 Per-workload checksum definitions:
 
-- **dijkstra**: `dist[n999] * 1000003 + (sum of all finite dist values mod 1e9)`,
+- **dijkstra**: `dist[n3999] * 1000003 + (sum of all finite dist values mod 1e9)`,
   in 64-bit. "Finite" means `dist < 1000000000` (the infinity sentinel). For the
-  committed graph: `dist[n999]=115`, `sumFinite=153332` → `115153677`.
-- **parallel**: sum of the 8 chunk results. Each chunk runs `walk(27, 30000000)`,
+  committed graph: `dist[n3999]=121`, `sumFinite=789308` → `121789671`.
+- **parallel**: sum of the 8 chunk results. Each chunk runs `walk(27, 300000000)`,
   a Collatz-style integer walk (`next = 27 if start==1 else start/2 if even else
-  3*start+1`) accumulating `steps + start` in 64-bit. One chunk = `27171416331`,
-  ×8 = `217371330648`.
-- **recursion**: `fib(38) * 1000000007 + sumTo(50000000)`. `fib(38)=39088169`,
-  `sumTo(50000000)=1250000025000000` → `40338169298617183`.
+  3*start+1`) accumulating `steps + start` in 64-bit. One chunk = `271714259650`,
+  ×8 = `2173714077200`.
+- **recursion**: `fib(42) * 1000000007 + sumTo(50000000)`. `fib(42)=267914296`,
+  `sumTo(50000000)=1250000025000000` → `269164297900400072`.
 - **pipeline**: `range(0,N).map(x=>x*2).filter(x=>x%3==0).reduce(0,+)` for
-  N=2000000 → `1333332666666`.
-- **async_io**: `sum_{i=0..199}(i*2+1) = 200*200 = 40000`.
+  N=20000000 → `133333326666666`.
+- **async_io**: `sum_{i=0..199}(i*2+1) = 200*200 = 40000`. NOTE: this workload is
+  latency-bound — every language pins to the `ceil(TASKS/CONCURRENCY)*SLEEP_MS`
+  sleep floor, so it tests concurrency *overlap*, not runtime speed (see the source
+  comment in `async_io.lin`).
 
 ## How to run
 
@@ -174,6 +182,16 @@ it and pass `USE_HYPERFINE=1`.
   same-machine snapshot for orientation.
 - Compare runs only from the **same machine in the same session**. Commit a
   results file only as a dated reference point, never as a pass/fail gate.
+- **Scale matters — a too-small workload hides the real gap.** Below ~50-100ms,
+  fixed overhead (process start, thread spawn) dominates and the cross-language
+  ratio collapses toward 1×. Measured examples that drove the current sizes:
+  recursion at FIB_N=38 showed a *false* 1.1× (the sumTo loop masked the recursive
+  call cost) but 7× at FIB_N=42; parallel at ITERS=30M showed 1.5× (thread-spawn
+  bound) but 15× at 300M; dijkstra showed 67× at N=1000 but the ratio *grew* with N
+  (super-quadratic Lin cost), settling the choice of N=4000. When adding or
+  resizing a workload, target ~150-600ms so the ratio is stable and meaningful.
+  (`async_io` is the exception — it is latency-bound by `sleep`, so no size makes
+  it reflect runtime speed; it stays as an overlap-correctness check.)
 
 ## How the Dijkstra graph was generated
 
@@ -189,16 +207,16 @@ the identical graph:
 
 - `graph.json` — `{"nodes":["n0",...],"edges":[{"from","to","weight"},...]}`
   (read by Lin/Python/Node).
-- `graph.txt` — line 1 is `<num_nodes> <source> <target>` (e.g. `1000 n0 n999`),
+- `graph.txt` — line 1 is `<num_nodes> <source> <target>` (e.g. `4000 n0 n3999`),
   then one `from to weight` line per edge (e.g. `n0 n1 7`), in the same order as
   the JSON (read by Go/Rust, so they need no JSON library and stay a single-file
   build).
 
-Graph shape (seed `1234`, fully reproducible): 1000 nodes `n0..n999`; for each
+Graph shape (seed `1234`, fully reproducible): 4000 nodes `n0..n3999`; for each
 `i`, edges `i -> i+1 .. i+8` (skipping out-of-range), which guarantees `n0`
-reaches `n999`; plus an occasional long forward "skip" edge (each `i` with
+reaches `n3999`; plus an occasional long forward "skip" edge (each `i` with
 probability ~0.3 gets one extra edge to a random `j > i`); weights are random
-ints in `[1, 100]`; ~8256 edges total.
+ints in `[1, 100]`; ~33163 edges total.
 
 ## Relationship to the Lin-only harness
 

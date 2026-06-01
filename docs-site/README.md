@@ -13,7 +13,7 @@ docs-site/
     nav.lin       navigation manifest → sidebar HTML
     main.lin      orchestrates: read content, render, write output, copy assets
   content/        documentation source (Markdown) + nav.json manifest
-  templates/      page.lint / home.lint — the HTML shell (flat ${title}/${nav}/${content})
+  templates/      base.jinja + page.jinja / home.jinja — the HTML shell (Jinja layout)
   static/         style.css, highlight.js, theme.js (copied verbatim into output/)
   output/         generated HTML (gitignored; produced by the builder, deployed to Pages)
 ```
@@ -26,12 +26,15 @@ docs-site/
    and the renderer independent.
 2. `nav.lin` turns `content/nav.json` into the sidebar, marking the current page.
 3. `main.lin` walks `content/`, renders each page's fragment, injects `title`/`nav`/
-   `content` into the `.lint` template via `std/template`'s `renderWith`, and writes
+   `content` into the `.jinja` template via `std/template`'s `render`, and writes
    the result under `output/`. Static assets are copied last.
 
-The template engine does flat `${key}` substitution only (no loops/conditionals),
-so all repeating structure (nav, lists) is built as HTML strings in Lin and injected
-into the template's holes.
+The templates use a Jinja layout (minijinja-backed): `page.jinja` and `home.jinja`
+both `{% extends "base.jinja" %}` and fill `{% block %}`s, so the shared `<head>`,
+nav, and scripts live in one place. Repeating *content* structure (nav, lists) is
+still built as HTML strings in Lin and injected into the template's holes; the
+fragments are passed through unescaped (the `.jinja` extension leaves minijinja
+autoescaping off).
 
 ## Build locally
 

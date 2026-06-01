@@ -3,10 +3,12 @@ import { render } from "std/template"
 import { contains } from "std/string"
 
 // Templating coverage (absorbed from the standalone template demo): render the
-// server's HTML view and assert the ${...} holes are filled from the data object.
+// server's HTML view and assert the {{ ... }} holes are filled from the data object.
+// index.jinja `{% extends "base.jinja" %}` and the base `{% include "footer.jinja" %}`,
+// so this also exercises the layout/inheritance loader (ADR-074).
 val s = suite("template", [
-  test("renders index.lint filling all holes", () =>
-    val out = render("examples/web-server/views/index.lint", {
+  test("renders index.jinja filling all holes", () =>
+    val out = render("examples/web-server/views/index.jinja", {
       "title": "T",
       "heading": "H",
       "status": "ok",
@@ -20,14 +22,29 @@ val s = suite("template", [
     ]
   ),
 
-  test("leaves no unfilled ${null} holes", () =>
-    val out = render("examples/web-server/views/index.lint", {
+  test("inherits base layout and includes the footer partial", () =>
+    val out = render("examples/web-server/views/index.jinja", {
       "title": "T",
       "heading": "H",
       "status": "ok",
       "version": "1.0"
     })
-    [expect(out.contains("\${")).toBe(false)]
+    [
+      // <!DOCTYPE>/<body> come from base.jinja, not index.jinja — proves {% extends %}.
+      expect(out.contains("<!DOCTYPE html>")).toBe(true),
+      // The footer comes from the {% include "footer.jinja" %} partial.
+      expect(out.contains("<footer>Lin Web Server — v1.0</footer>")).toBe(true)
+    ]
+  ),
+
+  test("leaves no unfilled {{ }} holes", () =>
+    val out = render("examples/web-server/views/index.jinja", {
+      "title": "T",
+      "heading": "H",
+      "status": "ok",
+      "version": "1.0"
+    })
+    [expect(out.contains("{{")).toBe(false)]
   )
 ])
 run(s)

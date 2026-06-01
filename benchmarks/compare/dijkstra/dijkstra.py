@@ -19,7 +19,7 @@ def main():
 
     nodes = graph["nodes"]
     source = "n0"
-    target = "n999"
+    target = nodes[-1]
 
     # adjacency: node -> list of (to, weight)
     adj = {}

@@ -1,7 +1,8 @@
 // Higher-level concurrency primitives: ThreadPool, Worker, Shared<T>, Frozen<T>.
 // Each helper is self-contained so the tests can drive it and assert the outcome.
 import { async, await, parallel, threadPool, poolAsync, worker, request, close, shared, get, set, withLock, frozen } from "std/async"
-import { push, length, for, range } from "std/array"
+import { push, length } from "std/array"
+import { for, range } from "std/iter"
 
 // ThreadPool — a bounded pool runs queued work on a fixed set of threads. We submit `n`
 // trivial tasks (the thunk `() => 1` captures nothing) and sum their results; with a real

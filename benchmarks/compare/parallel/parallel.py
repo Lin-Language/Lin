@@ -4,7 +4,7 @@
 import sys
 
 START = 27
-ITERS = 30000000
+ITERS = 300000000
 CHUNKS = 8
 
 

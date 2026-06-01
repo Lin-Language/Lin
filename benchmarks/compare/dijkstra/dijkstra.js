@@ -12,7 +12,7 @@ function main() {
   const graph = JSON.parse(fs.readFileSync(graphPath, 'utf8'));
   const nodes = graph.nodes;
   const source = 'n0';
-  const target = 'n999';
+  const target = nodes[nodes.length - 1];
 
   const adj = new Map();
   for (const e of graph.edges) {

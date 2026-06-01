@@ -4,12 +4,12 @@
 // the other languages match this by materializing each stage too (no lazy/fused
 // iterators). Prints exactly one stdout line "RESULT=<int>".
 //
-// Parameters (identical across all languages): N=2000000.
+// Parameters (identical across all languages): N=200000000.
 import { print } from "std/io"
 import { toString } from "std/string"
-import { range, map, filter, reduce } from "std/array"
+import { range, map, filter, reduce } from "std/iter"
 
-val n = 2000000
+val n = 20000000
 
 // reduce accumulates into an Int64 (the sum ~1.3e12 overflows Int32); each
 // Int32 element widens into the accumulator at the `acc + x` site.

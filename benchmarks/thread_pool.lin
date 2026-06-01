@@ -7,8 +7,8 @@
 import { print } from "std/io"
 import { toString } from "std/string"
 import { await, threadPool, poolAsync } from "std/async"
-import { push, for, range } from "std/array"
-
+import { push } from "std/array"
+import { for, range } from "std/iter"
 val pool = threadPool(8)
 
 // Submit many trivial tasks, collecting their promises (the thunk `() => 1`

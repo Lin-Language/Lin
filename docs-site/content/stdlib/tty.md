@@ -50,7 +50,7 @@ A real application polls `readKey` repeatedly, treating `Null` as "nothing yet" 
 ```lin
 import { rawMode, readKey } from "std/tty"
 import { sleepMicros } from "std/time"
-import { range, for } from "std/array"
+import { range, for } from "std/iter"
 import { print } from "std/io"
 
 rawMode(true)

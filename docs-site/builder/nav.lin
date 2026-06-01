@@ -1,4 +1,5 @@
-import { for, filter, push } from "std/array"
+import { push } from "std/array"
+import { for, filter } from "std/iter"
 import { contains } from "std/string"
 
 // Build navigation HTML from an array of nav entries.

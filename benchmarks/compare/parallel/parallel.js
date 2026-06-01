@@ -6,7 +6,7 @@
 const { Worker, isMainThread, parentPort } = require('worker_threads');
 
 const START = 27;
-const ITERS = 30000000;
+const ITERS = 300000000;
 const CHUNKS = 8;
 
 function chunk() {

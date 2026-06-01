@@ -1,0 +1,72 @@
+// std/stream — opaque, lazy, effectful byte/value streams (streams brief, ADR-072).
+//
+// A `Stream<T>` is a lazy pull-source that owns an OS resource. Building a pipeline
+// (readStream → lines → map → filter → writeStream) allocates lazy adapter nodes but reads
+// NOTHING; a terminal driver (`.drain()`, `collect`, `readText`) pulls the graph to completion.
+// IN-BAND error threading: the first read/transform Error short-circuits straight to the
+// terminal op, so the chain stays fluent (no `is Error` between steps).
+//
+// Stream is opaque: `compat.rs` forbids every non-stream operation on a `Stream` value, so the
+// only thing you can do with one is call these adapters/terminals. Transform closures operate on
+// boxed `Json` items (a chunk is `UInt8[]`, a line is `String` — both JSON-compatible), so map/
+// filter take `(Json) => Json` / `(Json) => Boolean`.
+// Source: open a file as a byte stream (`Stream<UInt8[]> | Error`). Return type inferred from the
+// intrinsic (the opaque Stream type cannot drive a clean re-export annotation here).
+export val readStream = (path: String) =>
+  lin_fs_open(path)
+
+// Adapters — each returns a new Stream node; they are LAZY (no reads happen yet).
+// `lines` buffers bytes only until the next newline; a single line is capped (default 64 MiB) so a
+// newline-less input fails in-band with an Error rather than buffering the whole stream. Use
+// `linesMax(s, n)` to set an explicit per-line byte cap (n ≤ 0 keeps the default).
+export val lines = (s: Stream): Stream =>
+  lin_stream_lines(s, 0)
+
+export val linesMax = (s: Stream, maxBytes: Int32): Stream =>
+  lin_stream_lines(s, maxBytes)
+
+export val chunks = (s: Stream, n: Int32): Stream =>
+  lin_stream_chunks(s, n)
+
+// NOTE (std/iter unification, Stage 3/4): the GENERIC combinators (map/filter/take/drop/reduce/
+// for/find/some/every/flatMap/takeWhile/dropWhile/flatten/concat) are NO LONGER exported here.
+// They come from `std/iter` and dispatch to the lazy `lin_stream_*` backend on a stream receiver
+// (the IR's `lower_call` redirect, mirroring the checker's `streamish_combinator_ret`). std/stream
+// keeps only stream-SPECIFIC ops (readStream/writeStream/drain/collect/readText/promise/close/
+// lines/linesMax/chunks). A user writes:
+//   import { map, filter, take, reduce, for } from "std/iter"
+//   import { readStream, writeStream, drain } from "std/stream"
+// and `readStream(p).map(f).filter(g).take(10).reduce(...)` works lazily.
+// Sink: build a node that writes each item to `path`, one per line (lazy; nothing happens until
+// a terminal driver runs it).
+export val writeStream = (s: Stream, path: String): Stream =>
+  lin_stream_write(s, path)
+
+// Terminal drivers — these consume the stream on the CALLING thread and close it afterwards.
+// `drain` forces a sink (or any pipeline) to completion → `Null | Error`.
+export val drain = (s: Stream): Json =>
+  lin_stream_drain(s)
+
+// `collect` pulls all bytes into a single `UInt8[]` → `UInt8[] | Error`.
+export val collect = (s: Stream): Json =>
+  lin_stream_collect(s)
+
+// `readText` pulls all bytes into a single UTF-8 `String` → `String | Error`.
+export val readText = (s: Stream): Json =>
+  lin_stream_read_text(s)
+
+// `close` releases the underlying resource explicitly (idempotent; the RC finalizer also closes
+// a dropped stream, so this is for determinism).
+export val close = (s: Stream): Null =>
+  lin_stream_close(s)
+
+// `for` is NOT exported here (std/iter unification): the single unified `for` comes from std/iter
+// and dispatches to the stream backend (`lin_stream_for`) on a stream receiver via the IR redirect.
+// Import `for` from std/iter to consume a stream: `stream.lines().for(println)`.
+// `.promise()` — drive the pipeline on a WORKER thread → `Promise<Null | Error>` (brief §5).
+// The stream is MOVED onto the worker (legal via CAP_MOVE, Stage 7): the worker owns the whole
+// pipeline, drives it to EOF, and the result resolves to `Null` (success) or an `Error` (a
+// read/transform fault is caught at the async boundary — ADR-070 / §32.2.2 — and surfaces as the
+// awaited `Error`). Real concurrency + fault isolation: run several with `parallel([...])`.
+export val promise = (s: Stream): Json =>
+  lin_stream_promise(s)
