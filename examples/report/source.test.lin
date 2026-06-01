@@ -1,7 +1,6 @@
 // Tests for source.lin — reading CSV rows out of the gzipped tar of CSV files via
 // the streaming gunzip + untar path. Verifies the archive is listed, every member's
 // rows are pulled (blank lines dropped), and the rows feed render end to end.
-
 import { expect, toBe, test, suite, run } from "std/test"
 import { rowsFromArchive, archiveMembers } from "./source"
 import { render, validRecords } from "./report"
@@ -47,6 +46,6 @@ val s = suite("report-source", [
     [
       expect(length(rowsFromArchive("examples/report/does-not-exist.tar.gz"))).toBe(0)
     ]
-  ),
+  )
 ])
 run(s)
