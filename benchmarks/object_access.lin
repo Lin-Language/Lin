@@ -11,7 +11,7 @@ val n = 1000000
 // fields. Field reads are the linear scan we want to measure; chained
 // access (point["x"] etc.) multiplies it.
 val total = range(0, n)
-  .map(i => {
+  .map((i) => {
     "x": i,
     "y": i * 2,
     "z": i * 3

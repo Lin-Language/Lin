@@ -1,0 +1,107 @@
+// dijkstra.lin — linear-scan priority-queue Dijkstra (O(V^2)) over graph.json.
+//
+// Matches the algorithm AND the data-structure choices of the other languages:
+// node names "n<k>" are interned to the integer index k, and dist/visited/adj are
+// integer-indexed arrays (O(1) access), exactly like dijkstra.rs / dijkstra.go.
+// The PQ is two parallel pre-allocated arrays (node, dist) with a manual length
+// counter, so removal is an O(1) swap-remove — mirroring Rust's `Vec<(usize,i64)>`
+// + `swap_remove` — and the min-scan never reallocates.
+// (The earlier version reused the examples/dijkstra string-keyed Json maps, whose
+// field lookup is an O(n) linear scan, and rebuilt the PQ array on every pop via
+// slice() — together an O(V*E*V) handicap. Switching to integer-indexed arrays
+// cut this benchmark ~5x. The remaining gap to Rust/Go is Lin's boxed-scalar
+// array reads, an honest language characteristic, not an algorithmic handicap.)
+//
+// The graph read + parse happens inside the timed region (std/fs readJson). Prints
+// exactly one stdout line "RESULT=<int>".
+import { print } from "std/io"
+import { toString, substring } from "std/string"
+import { parseInt32 } from "std/number"
+import { readJson } from "std/fs"
+import { for, length, arrayAllocate, arrayAllocateFilled, set, push } from "std/array"
+
+// "infinity" sentinel; finite distances are < INF.
+val INF = 1000000000
+
+// "n427" -> 427. Node names are "n" followed by the integer index.
+val idOf = (name: String): Int32 =>
+  parseInt32(substring(name, 1, length(name)))
+
+val graph = readJson("benchmarks/compare/data/graph.json")
+val nodes = graph["nodes"]
+val edges = graph["edges"]
+val n = length(nodes)
+
+// adj[u] = array of { "to": Int32, "w": Int32 }. Each slot gets its OWN array
+// (arrayAllocateFilled(n, []) would alias one array into every slot).
+var adj = arrayAllocate(n)
+var ai = 0
+nodes
+  .for((_) =>
+    set(adj, ai, [])
+    ai = ai + 1)
+edges.for((e) => push(adj[idOf(e["from"])], { "to": idOf(e["to"]), "w": e["weight"] }))
+
+var dist = arrayAllocateFilled(n, INF)
+var visited = arrayAllocateFilled(n, false)
+val source = idOf("n0")
+set(dist, source, 0)
+
+// Linear-scan priority queue as two parallel Int32 arrays + a length counter.
+// Capacity = one slot per edge relaxation plus the initial entry; each edge pushes
+// at most once, so length(edges)+1 never overflows.
+val cap = length(edges) + 1
+var pqNode = arrayAllocateFilled(cap, 0)
+var pqDist = arrayAllocateFilled(cap, 0)
+set(pqNode, 0, source)
+set(pqDist, 0, 0)
+var pqLen = 1
+
+// Tail-recursive min-scan over pq[j .. pqLen) — TCO turns it into a loop with no
+// per-pop allocation (range().for would allocate a fresh range array each pop).
+val minFrom = (j: Int32, best: Int32): Int32 =>
+  if j >= pqLen then
+    best
+  else if pqDist[j] < pqDist[best] then
+    minFrom(j + 1, j)
+  else
+    minFrom(j + 1, best)
+
+val step = (): Null =>
+  if pqLen > 0 then
+    val minIdx = minFrom(1, 0)
+    val u = pqNode[minIdx]
+    // swap-remove: move the last live entry into minIdx, shrink by one.
+    val last = pqLen - 1
+    set(pqNode, minIdx, pqNode[last])
+    set(pqDist, minIdx, pqDist[last])
+    pqLen = last
+    if visited[u] == false then
+      set(visited, u, true)
+      val du = dist[u]
+      adj[u]
+        .for((edge) =>
+          val v = edge["to"]
+          val nd = du + edge["w"]
+          if nd < dist[v] then
+            set(dist, v, nd)
+          set(pqNode, pqLen, v)
+          set(pqDist, pqLen, nd)
+          pqLen = pqLen + 1)
+    step()
+  else
+    null
+step()
+
+var total = 0i64
+var k = 0
+nodes
+  .for((_) =>
+    val d = dist[k]
+    if d < INF then total = total + d else null
+    k = k + 1)
+
+val targetDist: Int64 = dist[idOf("n999")]
+val checksum = targetDist * 1000003i64 + (total - total / 1000000000i64 * 1000000000i64)
+
+print("RESULT=${toString(checksum)}")

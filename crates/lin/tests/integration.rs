@@ -1058,7 +1058,7 @@ print(toString(c))
 
 #[test]
 fn test_logical_operators_short_circuit_evaluation() {
-    // Spec §24: `&&` / `||` are SHORT-CIRCUITING — the RHS must NOT be evaluated when the LHS
+    // Spec §8: `&&` / `||` are SHORT-CIRCUITING — the RHS must NOT be evaluated when the LHS
     // already decides the result. This asserts EVALUATION order, not just the boolean value:
     //  - a side-effecting RHS (a print) must be absent from the output when short-circuited;
     //  - the canonical bounds-check guard `i < length(arr) && arr[i] > 0` must not index OOB.
@@ -1173,7 +1173,7 @@ print(toString(mmul))
 
 #[test]
 fn test_float32_widens_to_float64() {
-    // A Float32 must widen to Float64 (fpext) across every numeric context, per spec §26
+    // A Float32 must widen to Float64 (fpext) across every numeric context, per spec §21
     // (widening is always to a type that represents both). Codegen's Coerce had no
     // float→float arm and its binary-op path didn't reconcile two floats of different
     // widths, so each of these failed with "Call parameter type does not match" /
@@ -1718,6 +1718,71 @@ print("unused")
 }
 
 #[test]
+fn test_circular_import_is_diagnosed_not_stack_overflow() {
+    // Regression: import resolution recursed before caching, so a cyclic import
+    // (a -> b -> a) recursed forever and overflowed the stack (SIGABRT) instead of
+    // producing a diagnostic. The DFS now tracks an on-stack `visiting` set and reports
+    // a clean "circular import detected" error with the cycle chain.
+    let dir = std::env::temp_dir().join(format!("lin_import_cycle_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("a.lin"),
+        "import { fromB } from \"b\"\n\
+         export val fromA = (): Int32 => 1\n\
+         val x = fromB()\n").unwrap();
+    std::fs::write(dir.join("b.lin"),
+        "import { fromA } from \"a\"\n\
+         export val fromB = (): Int32 => fromA()\n").unwrap();
+
+    let bin_path = dir.join("a.out");
+    let compile = Command::new(lin_bin())
+        .args(["build", dir.join("a.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+
+    let stderr = String::from_utf8_lossy(&compile.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&compile.stdout).to_string();
+    let combined = format!("{stderr}{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Must fail cleanly, not crash: a stack overflow aborts with SIGABRT (signal 6),
+    // which is neither a normal exit nor the diagnostic we expect.
+    assert!(!compile.status.success(), "expected failure, got success: {combined}");
+    assert!(
+        combined.contains("circular import detected"),
+        "expected a circular-import diagnostic, got: {combined}"
+    );
+    // The chain should name both modules in the cycle.
+    assert!(combined.contains("a.lin") && combined.contains("b.lin"),
+        "expected the cycle chain to name a.lin and b.lin, got: {combined}");
+}
+
+#[test]
+fn test_diamond_imports_are_not_false_cycles() {
+    // A module imported by two different paths (a diamond) is NOT a cycle. Resolution
+    // pops each module from the visiting stack when done, so the shared dependency is
+    // reached twice without being flagged.
+    let dir = std::env::temp_dir().join(format!("lin_import_diamond_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("shared.lin"),
+        "export val base = (): Int32 => 10\n").unwrap();
+    std::fs::write(dir.join("left.lin"),
+        "import { base } from \"shared\"\n\
+         export val viaLeft = (): Int32 => base() + 1\n").unwrap();
+    std::fs::write(dir.join("right.lin"),
+        "import { base } from \"shared\"\n\
+         export val viaRight = (): Int32 => base() + 2\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ viaLeft }} from "{d}/left"
+import {{ viaRight }} from "{d}/right"
+print(toString(viaLeft() + viaRight()))
+"#, d = dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["23"]);
+}
+
+#[test]
 fn test_default_args_trailing_comma_still_curries() {
     // A trailing comma requests partial application even when defaults exist,
     // rather than filling the default.
@@ -1918,7 +1983,7 @@ print(toString(result))
     assert_eq!(output, vec!["7"]);
 }
 
-// Fixed-length array types (`[T1, T2, ...]`, spec §8.3). An array literal checked
+// Fixed-length array types (`[T1, T2, ...]`, spec §5.3). An array literal checked
 // against a fixed-length type is stored as a TAGGED array (heterogeneous positional
 // element types); indexing reads the tagged slot and unboxes to the positional type.
 // Regression: before, the literal inferred to the unbounded `T[]` and failed the type
@@ -2473,13 +2538,53 @@ print(toString(keys(merged)))
 }
 
 #[test]
-fn test_object_spread_null_error() {
-    let err = run_expect_err(r#"import { print } from "std/io"
+fn test_object_spread_null_noop() {
+    // Spreading null contributes no fields (it is not a runtime error).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { keys } from "std/object"
 
 val merged = { ...null, "a": 1 }
-print(merged["a"])
+print(toString(merged["a"]))
+print(toString(keys(merged)))
 "#);
-    assert!(err.contains("Object") || err.contains("spread") || err.contains("null"), "got: {}", err);
+    assert_eq!(output, vec!["1", "[\"a\"]"]);
+}
+
+#[test]
+fn test_union_if_null_nested_dedups_to_single_null() {
+    // `if … then null else (if … then v else null)` unions a literal Null with a nested
+    // union that also ends in Null. `flatten_union` must drop the NON-adjacent duplicate
+    // Null (it uses order-preserving set-insert, not consecutive `Vec::dedup`), so the
+    // missing-arm diagnostic reads "not covered: Null", never the malformed "Null | Null".
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val a = true
+val b = false
+val x = if a then null else (if b then 5 else null)
+val y = match x
+  is Int32 => x
+print(toString(y))
+"#);
+    assert!(err.contains("not covered: Null") && !err.contains("Null | Null"), "got: {}", err);
+}
+
+#[test]
+fn test_union_if_null_else_json_collapses_to_json() {
+    // When exactly one branch is literal Null and the other is `Json` (the dynamic top type
+    // that already subsumes Null), the result collapses to `Json` rather than `Json | Null`.
+    // This both avoids a redundant union and keeps the internal `?T…` sentinel out of
+    // diagnostics. A `Json` result is assignable to `Int32` under the lenient-json rule.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val j: Json = 7
+val c = false
+val x: Int32 = if c then null else j
+print(toString(x))
+"#);
+    assert_eq!(output, vec!["7"]);
 }
 
 #[test]
@@ -2531,7 +2636,7 @@ print(toString(result))
 
 #[test]
 fn test_await_result_must_handle_error() {
-    // §32.2.2 enforcement (ADR-070): await yields `T | Error`, so assigning it to a bare
+    // §24.2.2 enforcement (ADR-070): await yields `T | Error`, so assigning it to a bare
     // binding that does not handle the Error case is a compile-time type error. The diagnostic
     // names the union vs. the bare target. (Goes through the full `build` pipeline because the
     // standalone `check` subcommand does not resolve imports.)
@@ -2589,8 +2694,41 @@ print(toString(results))
 }
 
 #[test]
+fn test_parallel_already_spawned_promises() {
+    // Regression: parallel([p1, p2]) where the array elements are ALREADY-SPAWNED promises
+    // (TAG_PROMISE) rather than thunk closures (TAG_FUNCTION). The runtime must dispatch on
+    // each element's tag and await the existing promise instead of re-spawning it as a closure
+    // (which read garbage at the closure's capture-descriptor offset → misaligned-pointer abort).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, parallel } from "std/async"
+
+val p1 = async(() => 1)
+val p2 = async(() => 2)
+val results = parallel([p1, p2])
+print(toString(results))
+"#);
+    assert_eq!(output, vec!["[1, 2]"]);
+}
+
+#[test]
+fn test_parallel_mixed_promises_and_thunks() {
+    // parallel must handle a mixed array: some elements already-spawned promises, some thunks.
+    // Order is preserved exactly.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, parallel } from "std/async"
+
+val p1 = async(() => 1)
+val results = parallel([p1, () => 2, async(() => 3)])
+print(toString(results))
+"#);
+    assert_eq!(output, vec!["[1, 2, 3]"]);
+}
+
+#[test]
 fn test_thread_pool_async() {
-    // await now yields `T | Error` (§32.2.2), so each result is handled before arithmetic.
+    // await now yields `T | Error` (§24.2.2), so each result is handled before arithmetic.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { async, await, threadPool } from "std/async"
@@ -2625,7 +2763,7 @@ print(toString(reply))
 
 #[test]
 fn test_worker_stateful_var_capture() {
-    // A worker handler may close over `var` (§32.6.4): the accumulator state is confined to
+    // A worker handler may close over `var` (§24.6.4): the accumulator state is confined to
     // the worker thread and updated across sequential requests. onShutdown sees the final state.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -2672,7 +2810,7 @@ print(toString(count))
 #[test]
 fn test_worker_handler_fault_surfaces_error() {
     // A fault in the worker handler is caught at the boundary and returned as an Error to the
-    // in-flight request (§32.6.5); the program continues.
+    // in-flight request (§24.6.5); the program continues.
     let output = run(r#"import { print } from "std/io"
 import { worker, request, close } from "std/async"
 
@@ -2687,7 +2825,7 @@ print(r["type"])
 
 #[test]
 fn test_worker_send_after_close_errors() {
-    // Sending to a closed worker yields an Error (§32.6.5), not a crash.
+    // Sending to a closed worker yields an Error (§24.6.5), not a crash.
     let output = run(r#"import { print } from "std/io"
 import { worker, request, close } from "std/async"
 
@@ -2764,7 +2902,7 @@ print(toString(total))
 
 #[test]
 fn test_await_flattens_nested_promise() {
-    // §32.2.3: await auto-flattens — a thunk that itself returns a Promise resolves through.
+    // §24.2.3: await auto-flattens — a thunk that itself returns a Promise resolves through.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { async, await } from "std/async"
@@ -2777,7 +2915,7 @@ print(toString(await(async(() => async(() => async(() => 7))))))
 
 #[test]
 fn test_is_error_matches_faulted_thunk() {
-    // §32.2.2: a thunk fault surfaces as an Error value; `is Error` discriminates it, and a
+    // §24.2.2: a thunk fault surfaces as an Error value; `is Error` discriminates it, and a
     // successful result falls through to `else`.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -3000,7 +3138,7 @@ if elapsed < 290 then print("PARALLEL") else print("SEQUENTIAL")
 #[test]
 fn test_async_fault_isolation_div_by_zero() {
     // A runtime fault (division by zero) inside an async thunk must be caught at the thread
-    // boundary and surface as an Error value at await — the program continues (spec §32.2.2),
+    // boundary and surface as an Error value at await — the program continues (spec §24.2.2),
     // it does not abort.
     let output = run(r#"import { print } from "std/io"
 import { async, await } from "std/async"
@@ -3367,6 +3505,35 @@ print(toString(loaded["version"]))
 }
 
 #[test]
+fn test_yaml_parse_and_stringify() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { parse, stringify } from "std/yaml"
+
+val doc = parse("name: Bob\nage: 30\n")
+print(doc["name"])
+print(toString(doc["age"]))
+val back = parse(stringify(doc))
+print(back["name"])
+"#);
+    assert_eq!(output, vec!["Bob", "30", "Bob"]);
+}
+
+#[test]
+fn test_jq_query() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { jq, jqFirst } from "std/jq"
+
+val data = { "users": [{ "name": "Ada", "age": 36 }, { "name": "Bob", "age": 30 }] }
+print(toString(jq(data, ".users[] | .name")))
+print(toString(jq(data, ".users | map(.age) | add")))
+print(toString(jqFirst(data, ".users[] | .name")))
+"#);
+    assert_eq!(output, vec![r#"["Ada", "Bob"]"#, "[66]", "Ada"]);
+}
+
+#[test]
 fn test_fs_is_file() {
     let tmp = std::env::temp_dir().join(format!("lin_ctest_isfile_{}.txt", std::process::id()));
     let _ = fs::remove_file(&tmp);
@@ -3564,7 +3731,7 @@ print(toString(none))
     assert_eq!(output, vec!["42", "7", "null"]);
 }
 
-/// End-to-end test of the real HTTP `serve` intrinsic (spec §33.5). `serve` blocks
+/// End-to-end test of the real HTTP `serve` intrinsic (spec §25.5). `serve` blocks
 /// forever, so the compiled program runs as a background child process; we poll-connect
 /// a raw TCP client, send an HTTP/1.1 request, and assert the wire response. The child is
 /// always killed via a guard so a hung server never leaks past the test.
@@ -3913,8 +4080,9 @@ fn test_fmt_preserves_postfix_base_parens() {
     assert_eq!(fmt("val a = (x + y).foo()\n").trim(), "val a = (x + y).foo()");
     assert_eq!(fmt("val b = (x + y)[0]\n").trim(), "val b = (x + y)[0]");
     assert_eq!(fmt("val c = (f + g)(3)\n").trim(), "val c = (f + g)(3)");
-    // Atomic / chain bases keep NO parens.
-    assert_eq!(fmt("val d = arr.map(x => x).length()\n").trim(), "val d = arr.map(x => x).length()");
+    // Atomic / chain bases keep NO parens. (Lambda params are always parenthesised for
+    // round-trip safety — ADR-007 / d6e7bdb.)
+    assert_eq!(fmt("val d = arr.map(x => x).length()\n").trim(), "val d = arr.map((x) => x).length()");
 }
 
 #[test]
@@ -4082,11 +4250,11 @@ fn test_fmt_rule1_chain_threshold() {
     // regardless of length. 4 calls → one `.method(...)` per line.
     let source = "import { range, map, filter, reduce } from \"std/array\"\nval total = range(0, n).map(x => x * 2).filter(x => x % 3 == 0).reduce(0, (acc, x) => acc + x)\n";
     let out = fmt(source);
-    let expected = "val total = range(0, n)\n  .map(x => x * 2)\n  .filter(x => x % 3 == 0)\n  .reduce(0, (acc, x) => acc + x)";
+    let expected = "val total = range(0, n)\n  .map((x) => x * 2)\n  .filter((x) => x % 3 == 0)\n  .reduce(0, (acc, x) => acc + x)";
     assert!(out.contains(expected), "Rule 1 chain not multiline:\n{}", out);
     // A 2-call chain still stays inline.
     let two = fmt("import { range, map } from \"std/array\"\nval a = range(0, n).map(x => x)\n");
-    assert!(two.contains("val a = range(0, n).map(x => x)"), "2-call chain should stay inline:\n{}", two);
+    assert!(two.contains("val a = range(0, n).map((x) => x)"), "2-call chain should stay inline:\n{}", two);
     assert_eq!(out, fmt(&out), "Rule 1 not idempotent:\n{}", out);
 }
 
@@ -4155,7 +4323,7 @@ fn test_fmt_rule5b_fully_split_args() {
     // `param =>` then body indented, close paren on its own line.
     let source = "var total = 0\nval acc = worker(n =>\n  total = total + n\n  total, () => null)\n";
     let out = fmt(source);
-    let expected = "val acc = worker(\n  n =>\n    total = total + n\n    total,\n  () => null\n)";
+    let expected = "val acc = worker(\n  (n) =>\n    total = total + n\n    total,\n  () => null\n)";
     assert!(out.contains(expected), "Rule 5b fully-split layout wrong:\n{}", out);
     assert_eq!(out, fmt(&out), "Rule 5b not idempotent:\n{}", out);
 }
@@ -4217,7 +4385,7 @@ fn test_fmt_ruleC_author_multiline_2chain_stays_multiline() {
     // Rule C: a 2-call chain the author broke across lines stays multiline.
     let source = "import { range, map, reduce } from \"std/array\"\nimport { toString, length } from \"std/string\"\nval totalLen = range(0, n)\n  .map(i => \"item-${toString(i)}\")\n  .reduce(0, (acc, s) => acc + length(s))\n";
     let out = fmt(source);
-    let expected = "val totalLen = range(0, n)\n  .map(i => \"item-${toString(i)}\")\n  .reduce(0, (acc, s) => acc + length(s))";
+    let expected = "val totalLen = range(0, n)\n  .map((i) => \"item-${toString(i)}\")\n  .reduce(0, (acc, s) => acc + length(s))";
     assert!(out.contains(expected), "Rule C author-multiline 2-chain collapsed:\n{}", out);
     assert_eq!(out, fmt(&out), "Rule C not idempotent:\n{}", out);
 }
@@ -4236,7 +4404,7 @@ fn test_fmt_ruleC_over_two_chain_always_multiline() {
     // Rule C / Rule 1: a chain with >2 calls is ALWAYS multiline even if written inline.
     let source = "import { range, map, filter, reduce } from \"std/array\"\nval t = range(0, n).map(x => x).filter(x => x > 0).reduce(0, (a, b) => a + b)\n";
     let out = fmt(source);
-    let expected = "val t = range(0, n)\n  .map(x => x)\n  .filter(x => x > 0)\n  .reduce(0, (a, b) => a + b)";
+    let expected = "val t = range(0, n)\n  .map((x) => x)\n  .filter((x) => x > 0)\n  .reduce(0, (a, b) => a + b)";
     assert!(out.contains(expected), "Rule C >2 chain not multiline:\n{}", out);
     assert_eq!(out, fmt(&out), "Rule C >2 not idempotent:\n{}", out);
 }
@@ -4416,7 +4584,7 @@ print(toString(0xFF & 0x0F))
 
 #[test]
 fn test_bitwise_nal_masking() {
-    // The NAL-type extraction example from spec §35.2.
+    // The NAL-type extraction example from spec §27.2.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 
@@ -4779,7 +4947,7 @@ print(toString(a == c))
 #[test]
 fn test_uint8_literal_out_of_range_rejected() {
     // A suffixless integer literal that does not fit the target small-integer type's range
-    // is a compile-time error (spec §26 context-typed literal + range check).
+    // is a compile-time error (spec §21 context-typed literal + range check).
     let err = run_expect_err(r#"import { print } from "std/io"
 val bad: UInt8[] = [256]
 print("unreachable")
@@ -4823,7 +4991,7 @@ print(toString(big))
 
 #[test]
 fn test_i64_suffix_preserves_large_literal() {
-    // An `i64` suffix pins the literal to Int64 (spec §3.6), so a value beyond Int32's range
+    // An `i64` suffix pins the literal to Int64 (spec §2.6), so a value beyond Int32's range
     // is preserved exactly rather than truncated. (The suffix used to be lexed then discarded.)
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -4880,7 +5048,7 @@ print("unreachable")
 #[test]
 fn test_smallint_value_with_bare_literal_arith() {
     // A small-int value combined with a bare integer literal must keep the small-int width:
-    // the literal adopts the operand's type (spec §26) so no spurious widening crashes codegen
+    // the literal adopts the operand's type (spec §21) so no spurious widening crashes codegen
     // and the arithmetic result is correct.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -6217,7 +6385,7 @@ print(if p["type"] == "error" then "ERR ${p["path"]}" else "OK")
 fn test_from_json_int_range_reject() {
     // `3.14` is non-integral; `5000000000.0` is integral but exceeds Int32's range. (A bare
     // suffixless integer literal like 5000000000 is truncated to Int32 by the lexer before it
-    // ever reaches the decoder — spec §26 — so the overflow case is expressed as a float.)
+    // ever reaches the decoder — spec §21 — so the overflow case is expressed as a float.)
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
 type T = { "n": Int32 }
@@ -6641,7 +6809,7 @@ print(s)
 
 #[test]
 fn test_bare_string_literal_still_string() {
-    // §33: a bare string-literal VALUE still infers to String, usable everywhere a String is.
+    // §25: a bare string-literal VALUE still infers to String, usable everywhere a String is.
     let out = run(r#"import { print } from "std/io"
 val x = "foo"
 val y: String = x
@@ -6654,7 +6822,7 @@ print(y)
 
 #[test]
 fn test_spec18_divide_discriminates() {
-    // The spec §18 divide()/Result example runs and discriminates both branches at runtime.
+    // The spec §19 divide()/Result example runs and discriminates both branches at runtime.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
@@ -6733,7 +6901,7 @@ print(handle(false)["body"])
 
 #[test]
 fn test_multiline_union_leading_pipe() {
-    // The spec §18 canonical form: a multi-line tagged union with a leading `|` on each
+    // The spec §19 canonical form: a multi-line tagged union with a leading `|` on each
     // variant in a `type` alias. Previously failed to parse ("unexpected token Pipe")
     // because the indented body's INDENT token sat between `=` and the first `|`.
     let out = run(r#"import { print } from "std/io"
@@ -7881,4 +8049,119 @@ print(readFile("x"))
         "expected test-only rejection, got:\n{}",
         err
     );
+}
+
+// -----------------------------------------------------------------------------
+// `lin check` resolves imports (regression: it previously type-checked the bare
+// parsed module without loading imports, so any error that depended on an
+// imported symbol's real type was silently accepted — `check` passed programs
+// that `build` correctly rejected).
+// -----------------------------------------------------------------------------
+
+/// Run `lin check <file>` on `source`. Returns (success, combined stderr+stdout).
+fn check_source(source: &str) -> (bool, String) {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_check_{}.lin", id));
+    fs::write(&src_path, source).unwrap();
+
+    let out = Command::new(lin_bin())
+        .args(["check", src_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+
+    let _ = fs::remove_file(&src_path);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    );
+    (out.status.success(), combined)
+}
+
+/// Run `lin build <file>` on `source` (no run). Returns whether it compiled.
+fn build_succeeds(source: &str) -> bool {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_build_only_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_build_only_{}", id));
+    fs::write(&src_path, source).unwrap();
+
+    let out = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary");
+
+    let _ = fs::remove_file(&src_path);
+    let _ = fs::remove_file(&bin_path);
+    out.status.success()
+}
+
+#[test]
+fn test_check_rejects_import_dependent_type_error() {
+    // `trim` is imported as `(s: String): String`; calling it with an Int32 is a type error
+    // that is only visible once the import has been resolved.
+    let (ok, output) = check_source(
+        r#"import { trim } from "std/string"
+val x = trim(42)
+"#,
+    );
+    assert!(
+        !ok,
+        "expected `lin check` to reject trim(42), but it passed:\n{}",
+        output
+    );
+    assert!(
+        output.contains("expected String"),
+        "expected an argument-type error, got:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_check_accepts_valid_imported_symbol_program() {
+    let (ok, output) = check_source(
+        r#"import { trim } from "std/string"
+import { print } from "std/io"
+val x = trim("  hi  ")
+print(x)
+"#,
+    );
+    assert!(
+        ok,
+        "expected `lin check` to accept a valid imported-symbol program, got:\n{}",
+        output
+    );
+    assert!(
+        output.contains("Type check passed"),
+        "expected success message, got:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_check_and_build_agree_on_import_dependent_case() {
+    // The bad program: both `check` and `build` must reject it.
+    let bad = r#"import { trim } from "std/string"
+val x = trim(42)
+"#;
+    let (check_ok, _) = check_source(bad);
+    let build_ok = build_succeeds(bad);
+    assert!(!check_ok, "check should reject the bad program");
+    assert!(!build_ok, "build should reject the bad program");
+    assert_eq!(check_ok, build_ok, "check and build must agree (reject)");
+
+    // The good program: both must accept it.
+    let good = r#"import { trim } from "std/string"
+import { print } from "std/io"
+val x = trim("  hi  ")
+print(x)
+"#;
+    let (check_ok, check_out) = check_source(good);
+    let build_ok = build_succeeds(good);
+    assert!(check_ok, "check should accept the good program:\n{}", check_out);
+    assert!(build_ok, "build should accept the good program");
+    assert_eq!(check_ok, build_ok, "check and build must agree (accept)");
 }

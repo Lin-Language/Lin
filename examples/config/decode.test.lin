@@ -38,7 +38,10 @@ val s = suite("config decode (fromJson)", [
         "city": "Paris"
       }
     })
-    [expect(isError(r)).toBe(true), expect(r["path"]).toSatisfy(p => p != null)]),
+    [
+      expect(isError(r)).toBe(true),
+      expect(r["path"]).toSatisfy((p) => p != null)
+    ]),
   test("rejects a missing required field", () =>
     val r = decodePerson({ "name": "Cleo", "age": 12 })
     [expect(isError(r)).toBe(true)])

@@ -15,6 +15,8 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/math`](#stdmath) | Mathematical functions |
 | [`std/object`](#stdobject) | Object introspection functions |
 | [`std/json`](#stdjson) | Type-directed JSON decode |
+| [`std/yaml`](#stdyaml) | YAML parse and serialise |
+| [`std/jq`](#stdjq) | Query Json values with jq filters |
 | [`std/hash`](#stdhash) | Stable structural hash of any value |
 | [`std/io`](#stdio) | stdin/stdout and terminal input |
 | [`std/fs`](#stdfs) | Filesystem read and write |
@@ -69,7 +71,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`append`](#append) | `(Json[], Json) -> Json[]` | Non-mutating single-element append |
 | [`arrayAllocate`](#arrayAllocate) | `(Int32) -> Json[]` | Allocate an array of n nulls |
 | [`arrayAllocateFilled`](#arrayAllocateFilled) | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
-| [`at`](#at-array) | `<T>(T[], Int32) -> T` | Element at index; negative indices count from end |
+| [`at`](#at-array) | `<T>(T[], Int32) -> T \| Null` | Element at index, or `null` if out of bounds; negative indices count from end |
 | [`chunk`](#chunk) | `(Json[], Int32) -> Json[][]` | Split into n-sized sub-arrays |
 | [`compact`](#compact) | `(Json[]) -> Json[]` | Remove null elements |
 | [`concat`](#concat) | `(Json[], Json[]) -> Json[]` | Concatenate two arrays |
@@ -181,6 +183,22 @@ This document specifies the standard library for the Lin language. All modules a
 | [`omit`](#omit) | `({}, String[]) -> {}` | Return object without specified keys |
 | [`pick`](#pick) | `({}, String[]) -> {}` | Return object with only specified keys |
 | [`values`](#values) | `(Json) -> Json[]` | Array of object values |
+
+**std/yaml**
+
+| Function | Signature | Summary |
+| --- | --- | --- |
+| [`parse`](#parse-yaml) | `(String) -> Json \| Error` | Parse one YAML document |
+| [`parseAll`](#parseAll) | `(String) -> Json[] \| Error` | Parse a `---`-separated multi-document stream |
+| [`stringify`](#stringify-yaml) | `(Json) -> String` | Serialise a value to block-style YAML |
+| [`stringifyAll`](#stringifyAll) | `(Json[]) -> String` | Serialise values to a `---`-separated YAML stream |
+
+**std/jq**
+
+| Function | Signature | Summary |
+| --- | --- | --- |
+| [`jq`](#jq) | `(Json, String) -> Json[] \| Error` | Run a jq filter, collecting all outputs |
+| [`jqFirst`](#jqFirst) | `(Json, String) -> Json \| Error` | Run a jq filter, returning the first output or `Null` |
 
 **std/io**
 
@@ -794,10 +812,10 @@ arrayAllocateFilled(0, 9)        // []
 ### at (array) {#at-array}
 
 ```txt
-val at: <T>(arr: T[], index: Int32) -> T
+val at: <T>(arr: T[], index: Int32) -> T | Null
 ```
 
-Returns the element at `index`. Negative indices count from the end: `-1` is the last element, `-2` is second-to-last. If the resolved index is out of bounds, returns `null`.
+Safe accessor. Returns the element at `index`, or `null` if the resolved index is out of bounds (so it never traps). Negative indices count from the end: `-1` is the last element, `-2` is second-to-last. The `null`-on-out-of-bounds case widens the return type to `T | Null`.
 
 ```txt
 at([10, 20, 30], 0)    // 10
@@ -1596,7 +1614,7 @@ val toInt64:  (v: UInt64) -> Int64
 val toUInt64: (v: UInt64) -> UInt64
 ```
 
-Explicit integer narrowing (spec §26). Implicit narrowing — assigning a wider numeric to a narrower one — is a compile-time error; these casts perform it explicitly, truncating to the target width with two's-complement (`as`-cast) semantics. The input is taken as `UInt64` (the widest unsigned), so any narrower *unsigned* integer — or a value masked down to a byte/word — widens into the parameter without range loss; a bare integer literal in range is accepted directly. They are the byte-extraction mechanism used by `std/bytes`, but are generally useful wherever explicit width control is needed.
+Explicit integer narrowing (spec §21). Implicit narrowing — assigning a wider numeric to a narrower one — is a compile-time error; these casts perform it explicitly, truncating to the target width with two's-complement (`as`-cast) semantics. The input is taken as `UInt64` (the widest unsigned), so any narrower *unsigned* integer — or a value masked down to a byte/word — widens into the parameter without range loss; a bare integer literal in range is accepted directly. They are the byte-extraction mechanism used by `std/bytes`, but are generally useful wherever explicit width control is needed.
 
 ```txt
 toUInt8(0x1234)              // 0x34  (52)
@@ -1639,7 +1657,7 @@ tryParseInt32("bad")   // null
 
 ## std/bytes
 
-Slicing and endian (de)serialization on `UInt8[]` byte buffers (spec §35.1–§35.3). The endian helpers are written in Lin on top of the bitwise operators (§35.2) and the `std/number` narrowing casts (extracting a byte from a wider integer needs an explicit narrowing cast). The four float bit-reinterpret functions are runtime intrinsics, since a float's bit pattern cannot be obtained by shift-and-mask.
+Slicing and endian (de)serialization on `UInt8[]` byte buffers (spec §27.1–§27.3). The endian helpers are written in Lin on top of the bitwise operators (§27.2) and the `std/number` narrowing casts (extracting a byte from a wider integer needs an explicit narrowing cast). The four float bit-reinterpret functions are runtime intrinsics, since a float's bit pattern cannot be obtained by shift-and-mask.
 
 | Function | Signature | Description |
 | --- | --- | --- |
@@ -2374,7 +2392,7 @@ import { hash } from "std/hash"
 val hash: (x: Json) -> String
 ```
 
-Returns a canonical, type-tagged string key for any JSON value. The key is stable and matches Lin's structural equality (spec §14): equal values produce equal keys, objects hash independently of key order, and arrays hash order-sensitively. Values of different types never collide — the key carries a type tag, so `hash(42)` (`"i:42"`) differs from `hash("42")` (`"s:42"`). Use it to deduplicate or index values by structural identity (e.g. as object keys in a manual set/map).
+Returns a canonical, type-tagged string key for any JSON value. The key is stable and matches Lin's structural equality (spec §9): equal values produce equal keys, objects hash independently of key order, and arrays hash order-sensitively. Values of different types never collide — the key carries a type tag, so `hash(42)` (`"i:42"`) differs from `hash("42")` (`"s:42"`). Use it to deduplicate or index values by structural identity (e.g. as object keys in a manual set/map).
 
 ```txt
 hash(null)        // "N"
@@ -2517,6 +2535,144 @@ val name = readLine()
 match name
   is Null => print("no input")
   else    => print("hello ${name}")
+```
+
+---
+
+## std/yaml
+
+Import:
+
+```txt
+import { parse, parseAll, stringify, stringifyAll } from "std/yaml"
+```
+
+YAML maps to the same data model as JSON: a parsed document is an ordinary Json value (object, array, string, number, boolean, or `null`). Fallible functions return the canonical `Error` value (`{ "type": "error", "message": String }`) on a parse failure, detectable with `is Error`.
+
+---
+
+### parse <a name="parse-yaml"></a>
+
+```txt
+val parse: (src: String) -> Json | Error
+```
+
+Parses a single YAML document into a Json value. Returns an `Error` value if `src` is not well-formed YAML.
+
+```txt
+val cfg = parse("name: web\nreplicas: 3\n")
+print(cfg["name"])      // web
+print(cfg["replicas"])  // 3
+```
+
+Combine with `std/fs` and `std/jq` to query a config file (a "yq"-style pipeline):
+
+```txt
+readFile("deploy.yaml").parse().jq(".spec.containers[].image")
+```
+
+---
+
+### parseAll
+
+```txt
+val parseAll: (src: String) -> Json[] | Error
+```
+
+Parses a multi-document YAML stream — documents separated by a `---` line — into an array of Json values. Returns an `Error` value if any document is malformed.
+
+```txt
+val docs = parseAll("a: 1\n---\nb: 2\n")
+print(docs.length())  // 2
+```
+
+---
+
+### stringify <a name="stringify-yaml"></a>
+
+```txt
+val stringify: (value: Json) -> String
+```
+
+Serialises a Json value to a block-style YAML document.
+
+```txt
+print(stringify({ "name": "web", "ports": [80, 443] }))
+// name: web
+// ports:
+// - 80
+// - 443
+```
+
+---
+
+### stringifyAll
+
+```txt
+val stringifyAll: (values: Json[]) -> String
+```
+
+Serialises an array of Json values to a multi-document YAML stream, each document preceded by a `---` separator. The result round-trips through `parseAll`.
+
+```txt
+print(stringifyAll([{ "a": 1 }, { "b": 2 }]))
+// ---
+// a: 1
+// ---
+// b: 2
+```
+
+---
+
+## std/jq
+
+Import:
+
+```txt
+import { jq, jqFirst } from "std/jq"
+```
+
+Runs [jq](https://jqlang.github.io/jq/) filter programs against a Json value, using a pure-Rust jq implementation. A filter can produce zero, one, or many output values; the full result set is returned as a Json array. Both compile errors (invalid filter syntax) and runtime errors return the canonical `Error` value, detectable with `is Error`.
+
+---
+
+### jq
+
+```txt
+val jq: (input: Json, filter: String) -> Json[] | Error
+```
+
+Runs `filter` against `input` and returns every output value as a Json array. Returns an `Error` value if the filter fails to compile or errors at runtime.
+
+```txt
+val data = { "users": [{ "name": "Ada", "age": 36 }, { "name": "Bob", "age": 30 }] }
+
+jq(data, ".users[] | .name")        // ["Ada", "Bob"]
+jq(data, ".users | map(.age) | add") // [66]
+jq(data, ".users[] | select(.age > 32) | .name") // ["Ada"]
+```
+
+Because of dot-application, this reads naturally as a pipeline:
+
+```txt
+readFile("deploy.yaml").parse().jq(".spec.containers[].image")
+```
+
+---
+
+### jqFirst
+
+```txt
+val jqFirst: (input: Json, filter: String) -> Json | Error
+```
+
+Like [`jq`](#jq), but returns just the first output value instead of an array. Returns `Null` when the filter produces no output, and propagates an `Error` value unchanged.
+
+```txt
+val data = { "users": [{ "name": "Ada" }, { "name": "Bob" }] }
+
+jqFirst(data, ".users[] | .name")           // "Ada"
+jqFirst(data, ".users[] | select(false)")   // null
 ```
 
 ---
@@ -2682,7 +2838,7 @@ match readFile("config.txt")
 val readFileBytes: (path: String) -> UInt8[] | Error
 ```
 
-Reads the file at `path` as a packed `UInt8[]` byte buffer (§35.1) — one byte per element. Returns an `Error` if the file cannot be read.
+Reads the file at `path` as a packed `UInt8[]` byte buffer (§27.1) — one byte per element. Returns an `Error` if the file cannot be read.
 
 ```txt
 val bytes = readFileBytes("image.png")
@@ -2764,7 +2920,7 @@ Writes `content` to the file at `path`, replacing existing contents.
 val writeFileBytes: (path: String, bytes: UInt8[]) -> Null | Error
 ```
 
-Writes a `UInt8[]` byte buffer (§35.1) to the file at `path`. Returns `Null` on success, `Error` on failure.
+Writes a `UInt8[]` byte buffer (§27.1) to the file at `path`. Returns `Null` on success, `Error` on failure.
 
 ---
 
@@ -3198,7 +3354,7 @@ match body
 
 ## std/net
 
-Low-level UDP and TCP sockets — the byte-stream layer beneath `std/http`, for non-HTTP protocols and custom framing. Every socket is an opaque integer fd handle (spec §35.4): there are no open-socket objects in user code, just the raw OS fd as an `Int32`. Every fallible call returns the `T | Error` result shape; a non-blocking read with no data available yet returns `Null` (so a poll loop reads naturally). IPv4 only; `bind`/`listen` bind to `0.0.0.0`.
+Low-level UDP and TCP sockets — the byte-stream layer beneath `std/http`, for non-HTTP protocols and custom framing. Every socket is an opaque integer fd handle (spec §27.4): there are no open-socket objects in user code, just the raw OS fd as an `Int32`. Every fallible call returns the `T | Error` result shape; a non-blocking read with no data available yet returns `Null` (so a poll loop reads naturally). IPv4 only; `bind`/`listen` bind to `0.0.0.0`.
 
 `recv`/`recvFrom`/`tcpRecv` fill a **caller-owned** `UInt8[]` and return the number of bytes read; the buffer is never transferred across the boundary. The buffer's length bounds the read — pre-size it to the maximum datagram/chunk you want to accept (e.g. `[0,0,...]` of N elements).
 
@@ -3276,7 +3432,7 @@ Run and manage external processes. Two styles share one module:
 - **Batch** — `exec`/`shell` run a command to completion and collect its full stdout/stderr into an `ExecResult`. `cwd`/`chdir` query/change the working directory.
 - **Streaming** — `spawn` starts a child and returns an opaque `ProcessHandle`; `readStdout` reads its piped stdout incrementally; `kill` signals it; `wait` blocks for the exit code.
 
-Every fallible call returns the `T | Error` result shape (spec §35.6).
+Every fallible call returns the `T | Error` result shape (spec §27.6).
 
 ### Types
 
@@ -3333,7 +3489,7 @@ print("exited ${code}")
 
 ## std/tty
 
-Raw terminal mode and non-blocking key input on stdin (spec §35.7).
+Raw terminal mode and non-blocking key input on stdin (spec §27.7).
 
 ```txt
 rawMode:  (on: Boolean)  => Null | Error    // enable/disable terminal raw mode
@@ -3427,7 +3583,7 @@ val [users, posts] = await([
 ])
 ```
 
-`await` auto-flattens nested promises (§32.2.3): if the thunk itself returns a `Promise`, `await`
+`await` auto-flattens nested promises (§24.2.3): if the thunk itself returns a `Promise`, `await`
 resolves through every layer (`await(async(() => async(() => 42)))` is `42`).
 
 If the thunk faults (array out of bounds, division by zero, …), the fault is caught at the thread
@@ -3440,7 +3596,7 @@ match await(p)
   else     => use(result)
 ```
 
-The static check from §32.2.2 *is* enforced: because `await` returns `T | Error`, assigning the
+The static check from §24.2.2 *is* enforced: because `await` returns `T | Error`, assigning the
 result to a binding that does not handle the `Error` case is a compile-time error.
 
 ```txt

@@ -27,7 +27,9 @@ value  : <length> bytes
 | `tlv.lin` | `encode(Field[]): UInt8[]` and `decode(UInt8[]): Field[]`. |
 | `bits.lin` | Nibble packing, NAL-type extraction, XOR checksum (Int32-typed). |
 | `main.lin` | A round-trip demo plus bit-twiddling examples. |
-| `codec.test.lin` | Byte-exact encoding, round-trips, bitwise, flat-array typing. |
+| `tlv.test.lin` | Byte-exact TLV encoding, decoding, and round-trips. |
+| `bits.test.lin` | Bitwise ops, nibble packing, and flat-array typing. |
+| `integration.test.lin` | End-to-end encode/decode round-trip tests. |
 
 Note: `appendBytes`'s `src` parameter stays `Json` on purpose — it is called
 with both a `Field`'s `Int32[]` value and the `UInt8[]` length prefix, whose

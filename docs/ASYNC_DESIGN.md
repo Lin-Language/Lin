@@ -2,7 +2,7 @@
 
 Status: **implemented** (Phases 0–8). This document described turning Lin's
 concurrency primitives from their synchronous stub into real OS-thread
-concurrency (`SPECIFICATION.md` §32); that work has landed. As-built decisions:
+concurrency (`SPECIFICATION.md` §24); that work has landed. As-built decisions:
 ADR-043 (model: copy-by-default RC + catchable faults), ADR-044 (`Shared<T>`),
 ADR-045 (`Frozen<T>`) in `docs/DECISIONS.md`; RC-under-threads model in
 `MEMORY_MANAGEMENT.md`.
@@ -32,7 +32,7 @@ through the compiler. The **runtime** is a synchronous stub. Concretely:
 
 | Layer | State |
 | --- | --- |
-| Spec (§32) | Complete: OS threads, `Promise<T \| Error>`, transferable types, fault isolation, combinators, `ThreadPool`, `Worker`. |
+| Spec (§24) | Complete: OS threads, `Promise<T \| Error>`, transferable types, fault isolation, combinators, `ThreadPool`, `Worker`. |
 | Parser | Done — no new syntax; async is just built-in functions. |
 | Type checker | Done — `lin_async`/`pool.async` enforce the `var`-capture ban (`checker/call.rs`) and transferable-return check (`is_definitely_non_transferable`, `checker/helpers.rs`); intrinsic signatures defined (`checker/intrinsics.rs`). |
 | IR | Done — `Intrinsic::{Async,Await,Parallel,Race,Timeout,Retry,ThreadPool,Worker,Request,Message,Close}` (`lin-ir/src/ir.rs`, lowered in `lower.rs`). |
@@ -51,7 +51,7 @@ depth:
 
 1. **Runtime errors abort the process.** `lin_panic` and every runtime fault
    (array OOB `array.rs:335`, division by zero, non-exhaustive match) call
-   `std::process::exit(1)`. Spec §32.2.2 requires a thunk's runtime error to be
+   `std::process::exit(1)`. Spec §24.2.2 requires a thunk's runtime error to be
    *caught at the thread boundary* and surfaced as an `Error` value at `await`.
    That is the entire point of `async` being Lin's only fault-isolation
    boundary — and it is fundamentally incompatible with `process::exit`.
@@ -104,7 +104,7 @@ The checker already guarantees a thunk:
   `ThreadPool`).
 
 Workers are the deliberate exception: a worker handler *may* close over `var`
-(spec §32.6.4) because the worker thread processes messages sequentially — the
+(spec §24.6.4) because the worker thread processes messages sequentially — the
 state is confined to one thread, never concurrently accessed.
 
 **Consequence for RC (see 2.3):** what actually gets shared across threads is
@@ -169,7 +169,7 @@ Rationale:
 - It composes with the **immortal interned strings** just merged: an immortal
   literal can be referenced from a copy without issue (never mutated / freed).
 - Workers' `var` state never crosses a boundary (it's confined to the worker
-  thread), so this doesn't conflict with §32.6.4.
+  thread), so this doesn't conflict with §24.6.4.
 - Making `Shared<T>` an explicit *type* dissolves Option D's flip hazard: a value
   is shared-or-not **statically**, so there is no runtime flip, no mixed-mode
   access, and no barrier to get wrong.
@@ -177,7 +177,7 @@ Rationale:
 The one subtlety for the copy path: the **closure env of a spawned thunk** must
 also be transferred by copy. Since the thunk may capture only `val`s (no `var`)
 and the captured values are transferable-or-functions-over-transferables, the
-env is copyable. Captured *functions* (allowed by §32.2.1 if they close over no
+env is copyable. Captured *functions* (allowed by §24.2.1 if they close over no
 `var`) need their own env deep-copied transitively. This is the trickiest part
 of the copy path and needs care (see Phase 3 risks).
 
@@ -315,7 +315,7 @@ same rule as crossing a thread boundary; `shared(aFunction)`/`shared(anIterator)
 is a compile-time error. `Shared<T>` makes reference cycles reachable (two boxes
 referencing each other) and Lin's RC has no cycle collector (ADR-039) — document
 the hazard. Any lock primitive reintroduces **deadlock** potential, and Lin has
-no cancellation (§32.4 `timeout` only "abandons"); scoped `withLock` plus a
+no cancellation (§24.4 `timeout` only "abandons"); scoped `withLock` plus a
 documented no-reentrancy / lock-ordering rule mitigates but does not remove it.
 
 ### 2.3.2 `Frozen<T>` — opt-in shared **read-only** state (zero-copy, lock-free)
@@ -456,7 +456,7 @@ Rule of thumb: reach for `Worker` when the state has logic or a lifecycle;
 
 ### 2.4 Fault isolation (problem #1)
 
-Spec §32.2.2: a runtime error inside a thunk becomes an `Error` value at
+Spec §24.2.2: a runtime error inside a thunk becomes an `Error` value at
 `await`, not a process abort. Required mechanism:
 
 1. **A catch boundary at the thread entry.** The spawned thread runs the thunk
@@ -466,7 +466,7 @@ Spec §32.2.2: a runtime error inside a thunk becomes an `Error` value at
    (array OOB, div-by-zero, non-exhaustive match) need a thread-local "are we
    inside an async boundary?" flag. Inside a boundary → `panic!`
    (unwinds to the `catch_unwind`, becomes an `Error`); outside → keep current
-   `process::exit(1)` (uncatchable, per §19.1).
+   `process::exit(1)` (uncatchable, per §20.1).
 3. **`nounwind` interaction.** We just marked user functions `nounwind` (sound
    because they currently never unwind). If runtime faults inside async thunks
    begin to unwind through user frames, `nounwind` becomes **unsound** for the
@@ -513,9 +513,9 @@ not a patch.
 - **Transfer/copy fns**: `lin_transfer_clone(TaggedVal) -> TaggedVal` that deep-
   copies a transferable graph (and a parallel one for closure envs). Must reject
   / never-receive non-transferable tags (checker guarantees the static cases;
-  runtime guards the dynamic `Json` case per spec §32.2).
+  runtime guards the dynamic `Json` case per spec §24.2).
 
-### 2.7 `print` ordering (§32.7)
+### 2.7 `print` ordering (§24.7)
 
 Spec requires line-atomic `print` across threads. Wrap stdout writes in a global
 `Mutex` (or use `std::io::Stdout`'s internal lock and write whole lines). Cheap,
@@ -572,17 +572,17 @@ with a spike but landed in the middle once the threading scaffolding exists.
 
 ### Phase 4 — `ThreadPool`
 - Bounded pool + work queue; `pool.async` single + array overloads.
-- `pool.serve` for multi-threaded HTTP (ties into §33.5 — coordinate with the
+- `pool.serve` for multi-threaded HTTP (ties into §25.5 — coordinate with the
   http runtime).
 
 ### Phase 5 — `Worker`
 - Long-lived thread + mailbox; `request` (blocking, oneshot reply), `message`
   (fire-and-forget), `close` (drain + `onShutdown` + join).
-- This is where `var`-capturing handlers are legal (§32.6.4) — verify the state
+- This is where `var`-capturing handlers are legal (§24.6.4) — verify the state
   stays thread-confined (no copy of the worker's own `var` env; it lives on the
   worker thread for the worker's lifetime).
 - Worker fault kills the worker; in-flight `request` surfaces the diagnostic;
-  later sends to a dead worker are runtime errors (§32.6.5).
+  later sends to a dead worker are runtime errors (§24.6.5).
 
 ### Phase 6 — `Shared<T>` (opt-in shared mutable state)
 This is a genuinely new language feature (not in the current spec) — comparable
@@ -596,7 +596,7 @@ in size to adding Workers — so it lands after the spec'd primitives work.
   copy-in on `shared`/`set`, copy-out on `get`/`withLock` (runtime). Add the
   nesting/boundary rule: the copy path shares a `Shared` box by atomic-refcount
   bump, never deep-copies through it.
-- Spec amendment: add a `Shared<T>` section to `SPECIFICATION.md` §32 and the
+- Spec amendment: add a `Shared<T>` section to `SPECIFICATION.md` §24 and the
   `Worker`-vs-`Shared` guidance (§2.3.4); revise the TODO "share-nothing upheld"
   line. New ADR.
 - Tests: TSan stress (N threads: concurrent `get`s + serialized `withLock`
@@ -621,7 +621,7 @@ string-interning work, generalized to whole graphs.
 - Reuse `IMMORTAL_RC`: frozen nodes are immortal, so existing non-atomic
   retain/release become guarded no-ops on them — read-only functions run on
   shared frozen data **with no recompilation, no lock, no atomics**.
-- Spec amendment: `Frozen<T>` section in §32; document the immortal⇒never-freed
+- Spec amendment: `Frozen<T>` section in §24; document the immortal⇒never-freed
   lifetime (load-once data, not loop-allocated). New ADR.
 - Tests: the timetable pattern (one `frozen` graph, N threads reading via the
   plain-typed planner) under TSan — zero races, zero copies; passing a `Frozen`
@@ -660,14 +660,14 @@ string-interning work, generalized to whole graphs.
   dependency from the optimization work. Must be settled in Phase 1.
 - **Deadlocks / blocking semantics**: `await`, `request`, and `close` all block.
   A worker that `request`s itself, or a cyclic worker topology, can deadlock.
-  Spec has no cancellation in v1 (§32.4 `timeout` "abandons"); document the
+  Spec has no cancellation in v1 (§24.4 `timeout` "abandons"); document the
   hazards.
 - **Determinism of tests**: thread timing is nondeterministic. Lean on
   sleep-based wall-clock assertions sparingly; prefer result-correctness +
   TSan/ASan for the race class.
 - **`print` interleaving** beyond line-atomicity (e.g. a multi-line report from
   one thread) is explicitly *not* guaranteed by the spec — don't over-engineer.
-- **HTTP server** (`pool.serve`, §33.5) is downstream of Phase 4; the current
+- **HTTP server** (`pool.serve`, §25.5) is downstream of Phase 4; the current
   http runtime may assume single-threaded — audit before Phase 4.
 
 ---

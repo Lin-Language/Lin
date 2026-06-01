@@ -24,7 +24,10 @@ errors as recoverable tagged results rather than aborting.
 | `eval.lin` | AST walker, `Parsed` → `Evaluated` (`Int32` or failure). |
 | `calc.lin` | The full pipeline as one `calc(src): CalcResult`. |
 | `main.lin` | Prints a handful of example evaluations. |
-| `calc.test.lin` | End-to-end, lexer, and parser unit tests. |
+| `lexer.test.lin` | Lexer unit tests (`String` → `Token[]`). |
+| `parser.test.lin` | Parser unit tests (`Token[]` → AST). |
+| `eval.test.lin` | Evaluator unit tests (AST → `Int32`). |
+| `integration.test.lin` | End-to-end `calc(src)` pipeline tests. |
 
 Note: precise types annotate every public boundary; the intermediate
 cursor/AST values inside the parser and evaluator stay `Json` because they are

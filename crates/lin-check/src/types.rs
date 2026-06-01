@@ -157,14 +157,29 @@ impl Type {
     }
 
     pub fn flatten_union(types: Vec<Type>) -> Type {
-        let mut flat = Vec::new();
+        let mut flat: Vec<Type> = Vec::new();
         for t in types {
             match t {
-                Type::Union(inner) => flat.extend(inner),
-                other => flat.push(other),
+                Type::Union(inner) => {
+                    // Order-preserving set insert. `Type` derives only `PartialEq` (no `Hash`/`Eq`),
+                    // and union members can be NON-adjacent duplicates — e.g. `Null | Int32 | Null`
+                    // arises from nesting `if … else null` (the literal-Null branch is unioned first,
+                    // then a nested `if … else null` contributes another `Null` later). A
+                    // consecutive-only `Vec::dedup()` would leave that duplicate in place and leak
+                    // malformed types like `Null | Null` into diagnostics.
+                    for m in inner {
+                        if !flat.contains(&m) {
+                            flat.push(m);
+                        }
+                    }
+                }
+                other => {
+                    if !flat.contains(&other) {
+                        flat.push(other);
+                    }
+                }
             }
         }
-        flat.dedup();
         if flat.len() == 1 {
             flat.into_iter().next().unwrap()
         } else {

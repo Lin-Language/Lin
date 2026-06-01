@@ -18,7 +18,7 @@ val _fail = (message: String): Assertion =>
   { "type": "fail", "message": message }
 
 val _evalResult = (name: String, results: Assertion[]): Json =>
-  val failures = results.filter(a => a["type"] == "fail")
+  val failures = results.filter((a) => a["type"] == "fail")
   if length(failures) == 0 then
     { "type": "pass", "name": name }
   else
@@ -30,11 +30,11 @@ val _evalResult = (name: String, results: Assertion[]): Json =>
 
 val _printFail = (r: Json): Null =>
   print("  FAIL  ${r["name"]}")
-  r["failures"].for(f => print("    ${f["message"]}"))
+  r["failures"].for((f) => print("    ${f["message"]}"))
 
 val _printSuiteResults = (suiteResult: Json): Null =>
   print(suiteResult["name"])
-  suiteResult["results"].for(r => if r["type"] == "pass" then print("  ok  ${r["name"]}") else _printFail(r))
+  suiteResult["results"].for((r) => if r["type"] == "pass" then print("  ok  ${r["name"]}") else _printFail(r))
 
 // An Asserter is { "value": Json } — assertion methods take it as first arg via dot-syntax.
 export val expect = (value: Json): Json =>
@@ -109,7 +109,7 @@ export val suite = (name: String, tests: Json[]): Json =>
 // block for guaranteed afterAll teardown. Inspect the count and `exit` yourself if you want a
 // failing process status: `val failures = report(s); cleanup(); if failures > 0 then exit(1)`.
 export val report = (s: Json): Int32 =>
-  val failed = s["tests"].filter(r => r["type"] == "fail")
+  val failed = s["tests"].filter((r) => r["type"] == "fail")
   val passCount = length(s["tests"]) - length(failed)
   val failCount = length(failed)
   _printSuiteResults({ "name": s["name"], "results": s["tests"] })

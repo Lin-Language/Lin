@@ -102,7 +102,7 @@ export val codePointAt = (s: String, index: Int32): Int32 =>
 
 export val fromCodePoints = (codes: Int32[]): String =>
   val chars = []
-  codes.for(code => lin_push(chars, lin_string_from_char_code(code)))
+  codes.for((code) => lin_push(chars, lin_string_from_char_code(code)))
   lin_string_join_arr(chars, "")
 
 export val padStart = (s: String, width: Int32, pad: String): String =>

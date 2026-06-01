@@ -11,3 +11,7 @@ crate-type = ["staticlib", "rlib"]
 serde_json = { version = "1", default-features = false, features = ["std"] }
 ureq = { workspace = true }
 libc = "0.2"
+serde_yml = "0.0.13"
+jaq-core = "3.0.0"
+jaq-std = "3.0.0"
+jaq-json = "2.0.0"

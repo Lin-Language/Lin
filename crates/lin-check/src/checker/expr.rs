@@ -16,8 +16,8 @@ impl Checker {
         }
 
         // Integer literal against an expected type. A suffixless literal takes its context
-        // type (spec §26), re-typed at that width if the value fits (else a compile error,
-        // not a silent truncation). A *suffixed* literal pins its own type (spec §3.6) — it
+        // type (spec §21), re-typed at that width if the value fits (else a compile error,
+        // not a silent truncation). A *suffixed* literal pins its own type (spec §2.6) — it
         // falls through to `infer_expr` below, and the tail's compatibility check verifies it
         // against `expected` like any other typed expression.
         if let Expr::IntLit(v, None, span) = expr {
@@ -42,7 +42,7 @@ impl Checker {
             });
         }
 
-        // Array literal against an expected FIXED-LENGTH array type (`[T1, T2, ...]`, §8.3).
+        // Array literal against an expected FIXED-LENGTH array type (`[T1, T2, ...]`, §5.3).
         // Without this, the literal infers to the unbounded `T[]` (with a unioned element type
         // for heterogeneous literals) and then fails the compatibility check against the
         // positional type. Check arity, then push each positional expected type into the
@@ -238,7 +238,7 @@ impl Checker {
     pub(crate) fn infer_expr(&mut self, expr: &Expr) -> Result<TypedExpr, Diagnostic> {
         match expr {
             // Integer literal with no surrounding context. An explicit suffix pins the type
-            // (spec §3.6). Otherwise the literal defaults to Int32 (spec §26) when it fits,
+            // (spec §2.6). Otherwise the literal defaults to Int32 (spec §21) when it fits,
             // but a value beyond Int32 widens its default to the smallest type that holds it
             // (Int64, then UInt64 for decimals above i64::MAX) so the value is PRESERVED —
             // never silently truncated. The value is still available for context re-typing at
@@ -436,7 +436,27 @@ impl Checker {
         let typed_else = self.infer_expr(else_branch)?;
         let then_ty = typed_then.ty();
         let else_ty = typed_else.ty();
-        let result_type = if self.types_compatible(&then_ty, &else_ty) {
+        // A branch typed `Null` (or a TypeVar that is structurally compatible with everything,
+        // incl. Null) must NOT collapse the merged type onto the OTHER branch via
+        // `types_compatible`. The old collapse silently dropped the value-producing branch: e.g.
+        // `if cond then arr[i] else null` (where `arr[i]` is a generic `T` or a `Json` element)
+        // computed `result_type = Null`, so lowering built an if-merge phi/return typed `Null`
+        // and the value branch was replaced by `null` at runtime (`at` returning null on a valid
+        // index). When exactly one branch is `Null` and the other is not, form the union so both
+        // branches survive (and survive monomorphization substitution of any generic `T`).
+        let result_type = if (then_ty == Type::Null) != (else_ty == Type::Null) {
+            // Exactly one branch is the literal Null type. Keep both as a union so the
+            // value-producing branch survives — UNLESS the other branch is `Json` (the dynamic
+            // top type, `TypeVar(u32::MAX)`), which already subsumes `Null`: there `Json | Null`
+            // is redundant and would leak the internal `?T4294967295` sentinel into diagnostics,
+            // so collapse to `Json` (the pre-change behaviour for this specific pairing).
+            let other = if then_ty == Type::Null { &else_ty } else { &then_ty };
+            if is_json_dynamic(other) {
+                other.clone()
+            } else {
+                Type::flatten_union(vec![then_ty, else_ty])
+            }
+        } else if self.types_compatible(&then_ty, &else_ty) {
             else_ty
         } else if self.types_compatible(&else_ty, &then_ty) {
             then_ty

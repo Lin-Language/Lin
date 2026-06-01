@@ -283,7 +283,7 @@ impl Checker {
                     if !valid {
                         self.diagnostics.push(Diagnostic::error(
                             binding.span,
-                            format!("Foreign binding '{}' has illegal FFI type '{}'; only numeric primitives, Boolean, Null (return only), and String (argument only) are allowed (spec §34.3)", binding.name, ty),
+                            format!("Foreign binding '{}' has illegal FFI type '{}'; only numeric primitives, Boolean, Null (return only), and String (argument only) are allowed (spec §26.3)", binding.name, ty),
                         ));
                     }
                     let slot = self.env.define(binding.name.clone(), ty.clone(), false);

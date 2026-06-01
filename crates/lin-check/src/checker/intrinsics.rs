@@ -143,7 +143,7 @@ impl Checker {
                 ], Type::TypeVar(9051)),
         );
 
-        // Concurrency intrinsics (spec §32)
+        // Concurrency intrinsics (spec §24)
         // async: (() => T) => Promise<T>  (TypeVar-based, overloaded: also accepts T[])
         let promise_t = Type::TypeVar(9100);
         self.define_intrinsic("lin_async", Type::func(vec![Type::Union(vec![
@@ -207,7 +207,7 @@ impl Checker {
         // worker.close(): (Worker) => Null
         self.define_intrinsic("lin_close", Type::func(vec![Type::TypeVar(9109)], Type::Null));
 
-        // serve: ((Request) => Response, Int32) => Null  (spec §33.5). Handler-first so
+        // serve: ((Request) => Response, Int32) => Null  (spec §25.5). Handler-first so
         // `router.serve(port)` desugars to `serve(router, port)`. Blocks forever; typed Null.
         self.define_intrinsic("lin_serve", Type::func(vec![
                 Type::func(vec![Type::TypeVar(9150)], Type::TypeVar(9151)),

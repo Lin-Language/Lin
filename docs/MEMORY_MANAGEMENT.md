@@ -174,7 +174,7 @@ When a uniquely-owned value is destroyed at the same point a same-shaped allocat
 ## Reference counting under threads (async / concurrency)
 
 Lin's RC is **non-atomic** on the single-threaded hot path. Real OS-thread concurrency (spec
-§32, ADR-043/044/045) keeps that hot path free by **never sharing ordinary mutable heap values
+§24, ADR-043/044/045) keeps that hot path free by **never sharing ordinary mutable heap values
 across threads** — three mechanisms cover every cross-thread case:
 
 1. **Transfer by deep copy (Option C) — the default.** When a value crosses a thread boundary

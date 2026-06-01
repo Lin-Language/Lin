@@ -117,7 +117,7 @@ impl Parser {
             Vec::new()
         };
         self.expect(TokenKind::Eq);
-        // A type body may continue on indented lines (spec §18 tagged-union form:
+        // A type body may continue on indented lines (spec §19 tagged-union form:
         // `type R =⏎  | { .. }⏎  | { .. }`). The lexer emits `Newline Indent` after `=`,
         // so skip the Indent too — otherwise the leading `|` is unreachable and parsing
         // fails with `unexpected token Pipe`. Track whether we opened an indented block so

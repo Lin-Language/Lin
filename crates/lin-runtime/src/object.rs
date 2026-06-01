@@ -326,7 +326,7 @@ pub unsafe extern "C" fn lin_object_get_or_insert_array(obj: *const u8, key: *co
 #[no_mangle]
 pub unsafe extern "C-unwind" fn lin_object_merge(dst: *mut LinObject, src: *const LinObject) {
     if src.is_null() {
-        crate::fault::runtime_fault("Runtime error: cannot spread null into object");
+        return; // spreading null contributes nothing
     }
     let src_len = (*src).len;
     for i in 0..src_len {

@@ -94,6 +94,6 @@ pub unsafe extern "C-unwind" fn lin_panic(msg: *const LinString, file_id: i32, o
     let slice = std::slice::from_raw_parts((*msg).data.as_ptr(), (*msg).len as usize);
     let string = std::str::from_utf8_unchecked(slice);
     // Inside an async boundary this unwinds to the thread boundary (caught → Error);
-    // at the top level it prints and exits (uncatchable, spec §19.1).
+    // at the top level it prints and exits (uncatchable, spec §20.1).
     crate::fault::runtime_fault(&format!("Runtime error at {}:{}: {}", file_id, offset, string));
 }
