@@ -1427,7 +1427,7 @@ val total = readStream("data.csv")
   .reduce(0, (acc, n) => acc + n)            // Int32 | Error  (terminal)
 ```
 
-The combinators are **not** dual-exported: each name has exactly one home (`std/iter`). The array-shaped operations that genuinely require a materialised, indexable, ordered array — `push`, `slice`, `set`, `at`, `length`, `reverse`, `sort`/`sortBy`, `zip`, `unique`, `chunk`, `compact`, `partition`, `sum`/`product`/`min`/`max`, etc. — stay in `std/array`; `std/stream` exports only stream-specific sources, sinks, and terminals (`readStream`/`writeStream`/`drain`/`collect`/`readText`/`promise`/`close`/`lines`/`chunks`).
+The combinators are **not** dual-exported: each name has exactly one home (`std/iter`). The array-shaped operations that genuinely require a materialised, indexable, ordered array — `push`, `slice`, `set`, `at`, `length`, `reverse`, `sort`/`sortBy`, `zip`, `unique`, `chunk`, `compact`, `partition`, `sum`/`product`/`min`/`max`, etc. — stay in `std/array`; `std/stream` exports only stream-specific sources, sinks, and terminals (`readStream`/`writeStream`/`writeLines`/`drain`/`collect`/`readText`/`promise`/`close`/`lines`/`chunks`).
 
 Receiver dispatch fires at a **concrete** combinator call whose receiver is statically a `Stream`. A stream passed through a user-defined generic `Iterable` parameter (a `T[] | Iterator | Stream` union) and combined inside that function stays **array-shaped**: the lazy form is forgone there, which is the safe resolution (the eager path is always correct). Streams are also affine resources (§27.9.5): a combinator that routes to the stream backend **consumes** (moves) the stream, so a stream chain is single-use. See ADR-077.
 
@@ -2383,14 +2383,14 @@ A `Stream<T>` is an opaque runtime value (§18, §28) representing a **lazy, eff
 
 #### 27.9.1 The Pull Graph and Push Sink Model
 
-A stream is built as a **lazy pull graph**. A *source* node is at the root (a file, socket, subprocess, or stdin); each *adapter* (`lines`, `chunks`, `map`, `filter`, `take`) wraps an upstream stream and transforms items as they are pulled. Nothing is read until a **terminal** operation drives the graph. A `writeStream` builds a **push sink** node: pulling the sink pulls one item from upstream and writes it to the destination, so the whole pipeline runs one item at a time with bounded memory.
+A stream is built as a **lazy pull graph**. A *source* node is at the root (a file, socket, subprocess, or stdin); each *adapter* (`lines`, `chunks`, `map`, `filter`, `take`) wraps an upstream stream and transforms items as they are pulled. Nothing is read until a **terminal** operation drives the graph. A `writeStream`/`writeLines` builds a **push sink** node: pulling the sink pulls one item from upstream and writes it to the destination, so the whole pipeline runs one item at a time with bounded memory. `writeStream` writes each item's bytes **verbatim** (raw — no separator, the correct sink for binary output); `writeLines` writes each item followed by a newline (one item per line).
 
 ```txt
 readStream("in.csv")        // source:  Stream<UInt8[]>
   .lines()                  // adapter: Stream<String>
   .map(transform)           // adapter: Stream<String>
   .filter(removeEmptyLines) // adapter: Stream<String>
-  .writeStream("out.csv")   // sink node (a Stream whose terminal writes upstream items)
+  .writeLines("out.csv")    // sink node (a Stream whose terminal writes each line)
   .drain()                  // terminal: drive on this thread -> Null | Error
 ```
 
@@ -2446,7 +2446,7 @@ match outcome
   else     => null
 ```
 
-**`.drain()`** drives a sink pipeline (typically ending in a `writeStream`) on the **calling thread** and returns `Null | Error`. It uses no new runtime machinery — it is the synchronous driver.
+**`.drain()`** drives a sink pipeline (typically ending in a `writeStream` or `writeLines`) on the **calling thread** and returns `Null | Error`. It uses no new runtime machinery — it is the synchronous driver.
 
 **`.promise()`** **moves** the whole pipeline onto a **worker OS thread** (ADR-075 move-transfer) and returns `Promise<Null | Error>`. This gives real concurrency and **fault isolation**: a runtime fault while the worker drives the stream is caught at the thread boundary and surfaces as an `Error` when the promise is awaited, exactly as for any `async` thunk (§24.2.2). Awaiting follows the usual rule — the result is `Null | Error` and the `Error` case must be handled (§24.2.2, ADR-070).
 
@@ -2454,7 +2454,7 @@ match outcome
 val p = readStream("big.log")
   .lines()
   .filter(isError)
-  .writeStream("errors.log")
+  .writeLines("errors.log")
   .promise()
 match await(p)
   is Error => print("pipeline failed")
@@ -2477,7 +2477,7 @@ A `Stream<T>` is an **affine resource** (use-at-most-once; ADR-075):
 A streaming CSV transform — quote each field and re-join with `|`, dropping blank lines — running line by line with bounded memory:
 
 ```txt
-import { readStream, lines, writeStream, drain } from "std/stream"
+import { readStream, lines, writeLines, drain } from "std/stream"
 import { map, filter } from "std/iter"
 
 val transform = (line: String): String =>
@@ -2491,7 +2491,7 @@ val run = (): Null | Error =>
     .lines()
     .map(transform)
     .filter(removeEmptyLines)
-    .writeStream("out.csv")
+    .writeLines("out.csv")
     .drain()
 ```
 

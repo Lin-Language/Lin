@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # compare.sh — cross-language benchmark comparison runner.
 #
-# Compiles/runs five identical workloads (dijkstra, parallel, recursion,
+# Compiles/runs six identical workloads (dijkstra, interp, parallel, recursion,
 # pipeline, async_io) across Lin, Rust, Go, Python and Node.js, then prints a
 # single table of min wall-clock ms (lower = faster). Each implementation prints
 # exactly one stdout line "RESULT=<int>"; the runner uses that to verify every
@@ -44,7 +44,7 @@ trap 'rm -rf "$TMPDIR"' EXIT
 mkdir -p "$OUTDIR"
 
 # The fixed workload order (also the row order in the table). Filtered by $1.
-ALL_WORKLOADS=(dijkstra parallel recursion pipeline async_io)
+ALL_WORKLOADS=(dijkstra interp parallel recursion pipeline async_io)
 # The fixed language/column order, regardless of LANGS filtering — absent or
 # unselected columns render as "--".
 ALL_LANGS=(lin rs go py js)

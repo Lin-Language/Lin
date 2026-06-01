@@ -1,5 +1,5 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { readStream, lines, linesMax, chunks, writeStream, drain, collect, readText, close } from "std/stream"
+import { readStream, lines, linesMax, chunks, writeStream, writeLines, drain, collect, readText, close } from "std/stream"
 import { writeFile, readFile } from "std/fs"
 import { length } from "std/array"
 import { split, join } from "std/string"
@@ -9,6 +9,7 @@ import { map as amap, map, filter, take, drop, reduce, for, find, some, every, f
 
 // Each test writes its own fixture file (a unique path) then reads it back through a stream.
 // Streams are affine (single-use), so a fresh stream is opened per test.
+
 val fixture = "/tmp/lin_stream_test_fixture.txt"
 val csvIn = "/tmp/lin_stream_test_in.csv"
 val csvOut = "/tmp/lin_stream_test_out.csv"
@@ -61,10 +62,7 @@ val s = suite("std/stream", [
 
   test("lines + take limits the number of lines pulled", () =>
     writeFile(fixture, "a\nb\nc\nd\ne")
-    val out = readStream(fixture)
-      .lines()
-      .take(2)
-      .collect()
+    val out = readStream(fixture).lines().take(2).collect()
     // first two lines "a","b" concatenated = "ab" = 2 bytes
     [
       expect(length(out)).toBe(2)
@@ -90,10 +88,7 @@ val s = suite("std/stream", [
 
   test("filter drops lines that fail the predicate", () =>
     writeFile(fixture, "x\n\ny\n\nz")
-    val out = readStream(fixture)
-      .lines()
-      .filter(notEmpty)
-      .collect()
+    val out = readStream(fixture).lines().filter(notEmpty).collect()
     // non-empty lines x,y,z concatenated = "xyz" = 3 bytes
     [
       expect(length(out)).toBe(3)
@@ -102,10 +97,7 @@ val s = suite("std/stream", [
 
   test("map transforms each line", () =>
     writeFile(fixture, "ab\ncd")
-    val out = readStream(fixture)
-      .lines()
-      .map(line => "<${line}>")
-      .readText()
+    val out = readStream(fixture).lines().map(line => "<${line}>").readText()
     // "<ab>" + "<cd>" = 8 chars
     [
       expect(length(out)).toBe(8)
@@ -120,14 +112,9 @@ val s = suite("std/stream", [
     ]
   ),
 
-  test("writeStream + drain runs the CSV pipeline end-to-end", () =>
+  test("writeLines + drain runs the CSV pipeline end-to-end", () =>
     writeFile(csvIn, "a,b,c\nx,y,z\n\nfoo,bar,baz")
-    readStream(csvIn)
-      .lines()
-      .filter(notEmpty)
-      .map(quoteFields)
-      .writeStream(csvOut)
-      .drain()
+    readStream(csvIn).lines().filter(notEmpty).map(quoteFields).writeLines(csvOut).drain()
     val written = readFile(csvOut)
     [
       expect(written).toBe("\"a\"|\"b\"|\"c\"\n\"x\"|\"y\"|\"z\"\n\"foo\"|\"bar\"|\"baz\"\n")
@@ -136,12 +123,20 @@ val s = suite("std/stream", [
 
   test("drain returns Null on success", () =>
     writeFile(fixture, "p\nq")
-    val r = readStream(fixture)
-      .lines()
-      .writeStream(csvOut)
-      .drain()
+    val r = readStream(fixture).lines().writeLines(csvOut).drain()
     [
       expect(r is Error).toBe(false)
+    ]
+  ),
+
+  test("writeStream is RAW (verbatim bytes, no newline separators)", () =>
+    // The raw sink copies the source bytes through unchanged — no '\n' is injected between the
+    // upstream chunks, so a byte stream round-trips exactly. (writeLines would add separators.)
+    writeFile(fixture, "no-trailing-newline-here")
+    readStream(fixture).writeStream(csvOut).drain()
+    val written = readFile(csvOut)
+    [
+      expect(written).toBe("no-trailing-newline-here")
     ]
   ),
 
@@ -154,12 +149,10 @@ val s = suite("std/stream", [
   ),
 
   // std/iter unification (Stage 3/4): generic combinators dispatch to the lazy stream backend.
+
   test("drop skips the first n lines (lazy stream backend)", () =>
     writeFile(fixture, "a\nb\nc\nd\ne")
-    val out = readStream(fixture)
-      .lines()
-      .drop(2)
-      .collect()
+    val out = readStream(fixture).lines().drop(2).collect()
     // lines c,d,e concatenated = "cde" = 3 bytes
     [
       expect(length(out)).toBe(3)
@@ -177,10 +170,7 @@ val s = suite("std/stream", [
   test("takeWhile yields until the predicate fails", () =>
     writeFile(fixture, "aa\nbb\nc\ndd")
     // keep lines of length 2 until the first shorter line ("c")
-    val n = readStream(fixture)
-      .lines()
-      .takeWhile(l => length(l) == 2)
-      .reduce(0, (a, l) => a + 1)
+    val n = readStream(fixture).lines().takeWhile(l => length(l) == 2).reduce(0, (a, l) => a + 1)
     [
       expect(unwrapInt(n)).toBe(2)
     ]
@@ -188,10 +178,7 @@ val s = suite("std/stream", [
 
   test("dropWhile skips the leading run then keeps the rest", () =>
     writeFile(fixture, "aa\nbb\nc\ndd")
-    val n = readStream(fixture)
-      .lines()
-      .dropWhile(l => length(l) == 2)
-      .reduce(0, (a, l) => a + 1)
+    val n = readStream(fixture).lines().dropWhile(l => length(l) == 2).reduce(0, (a, l) => a + 1)
     [
       expect(unwrapInt(n)).toBe(2)
     ]
@@ -199,10 +186,7 @@ val s = suite("std/stream", [
 
   test("flatMap flattens each line's split fields", () =>
     writeFile(fixture, "a,b,c\nd,e\nf")
-    val n = readStream(fixture)
-      .lines()
-      .flatMap(l => split(l, ","))
-      .reduce(0, (a, f) => a + 1)
+    val n = readStream(fixture).lines().flatMap(l => split(l, ",")).reduce(0, (a, f) => a + 1)
     [
       expect(unwrapInt(n)).toBe(6)
     ]
@@ -234,10 +218,7 @@ val s = suite("std/stream", [
 
   test("concat yields all of the first stream then the second", () =>
     writeFile(fixture, "a\nb\nc")
-    val n = readStream(fixture)
-      .lines()
-      .concat(readStream(fixture).lines())
-      .reduce(0, (a, l) => a + 1)
+    val n = readStream(fixture).lines().concat(readStream(fixture).lines()).reduce(0, (a, l) => a + 1)
     [
       expect(unwrapInt(n)).toBe(6)
     ]

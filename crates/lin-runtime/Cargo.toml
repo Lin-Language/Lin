@@ -23,3 +23,7 @@ serde_yml = "0.0.13"
 jaq-core = "3.0.0"
 jaq-std = "3.0.0"
 jaq-json = "2.0.0"
+# Streaming gzip/DEFLATE for std/compress. Pure-Rust miniz_oxide backend (no libz C dep) —
+# already in the workspace lockfile via ureq. We use the low-level Compress/Decompress streaming
+# API (not the whole-buffer convenience fns) so the stream adapters work chunk-by-chunk.
+flate2 = "1"

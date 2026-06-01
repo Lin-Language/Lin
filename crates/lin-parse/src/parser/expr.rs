@@ -629,6 +629,20 @@ impl Parser {
     }
 
     pub(crate) fn parse_if_expr(&mut self) -> Expr {
+        // The offside floor for an inline (no-Indent) branch is the column of the `if`
+        // keyword that opens the chain. An `else if` continuation reuses the SAME floor as
+        // the `if` it continues (so a trailing `else` aligned with the outer `if` still
+        // belongs to the chain, not to the inner branch) — see `parse_if_expr_with_col`.
+        let branch_col = self.current_column();
+        self.parse_if_expr_with_col(branch_col)
+    }
+
+    /// Parse an `if` expression using `branch_col` as the exclusive offside floor for any
+    /// inline (no-Indent) then/else branch — i.e. inside `()`/`[]`/`{}` where ADR-004
+    /// suppresses Indent/Dedent. Statements indented past `branch_col` belong to the branch;
+    /// the first statement at or before it ends the branch. An `else if` continuation is
+    /// parsed with the SAME `branch_col` so the whole chain shares one offside anchor.
+    fn parse_if_expr_with_col(&mut self, branch_col: u32) -> Expr {
         let span = self.current_span();
         self.advance(); // if
         self.skip_newlines();
@@ -647,7 +661,10 @@ impl Parser {
         let then_branch = if self.check(TokenKind::Indent) {
             self.parse_block()   // consumes INDENT … DEDENT
         } else {
-            self.parse_expr()
+            // No Indent (inline / inside parens): collect the column-delimited then-block so a
+            // multi-statement then-branch isn't truncated to its first statement (the ADR-004
+            // newline-suppression bug). Single-line `if c then e` reads as a one-expr block.
+            self.parse_branch_block(branch_col)
         };
 
         self.skip_newlines();
@@ -657,9 +674,10 @@ impl Parser {
             if self.check(TokenKind::Indent) {
                 self.parse_block()
             } else if self.check(TokenKind::If) {
-                self.parse_if_expr()
+                // `else if` continues the chain: reuse the opening `if`'s offside floor.
+                self.parse_if_expr_with_col(branch_col)
             } else {
-                self.parse_expr()
+                self.parse_branch_block(branch_col)
             }
         } else {
             Expr::NullLit(span)
