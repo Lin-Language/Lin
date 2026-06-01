@@ -78,6 +78,20 @@ stream backends.
      thin wrappers over lin_length/lin_push to break the array↔iter cycle. They're one-line
      forwarders over compiler builtins — can't drift in behaviour. Alternative (a 3rd lower
      module for two one-liners) would be over-engineering. Revisit only if more sharing is needed.
+   - VERIFIED BY ME (clean build, cache cleared): cargo 506/0, stdlib 22, examples 42. By-hand:
+     stream.map().filter().writeStream().drain() checks; [1,2,3].map().length() checks (array
+     preserved); stream.reduce → Int|Error (match-narrow required). NEGATIVES reject correctly:
+     length(stream.map(..)) → "Stream ≠ array"; stream.reduce result + without narrowing →
+     rejected. Typing is discriminating, not permissive. Stray-fmt incident left NO residue
+     (working tree clean, commit = exactly 5 intended files).
+   - RECONCILIATION TODO for Stage 3: `take` is DOUBLE-IMPLEMENTED — std/stream exports a lazy
+     `take` (lin_stream_take, already exists) AND std/iter has the eager array `take` (pure-Lin).
+     This is exactly the dual-impl confusion we're eliminating. Stage 3: std/iter.take must
+     dispatch to lin_stream_take for a stream receiver; std/stream must STOP exporting take (and
+     likewise map/filter/lines/chunks that std/iter will own). The std/stream module should end
+     up with only stream-SPECIFIC ops (readStream/writeStream/drain/collect/readText/promise/
+     close/lines/linesMax/chunks) — the generic combinators (map/filter/take/reduce/…) come from
+     std/iter via receiver dispatch. CONFIRM this consolidation in Stage 3.
 2. Union params + receiver-dependent return typing (checker) — DONE (checker-only; no Stage-3 codegen)
    - INTRINSIC-BACKED combinators (typed this stage to accept a Stream receiver): `map`→lin_map,
      `filter`→lin_filter, `reduce`→lin_reduce, `while`→lin_while (`for`→lin_for was already done).
