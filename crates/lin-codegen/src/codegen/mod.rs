@@ -1150,7 +1150,14 @@ impl<'ctx> Codegen<'ctx> {
                                     };
                                     let set_fn = if use_fresh { self.rt.object_set_fresh } else { self.rt.object_set };
                                     self.builder.call(set_fn, &[obj_ptr.into(), key_str.into(), tagged.into()], "");
-                                    self.builder.call(self.rt.string_release, &[key_str.into()], "");
+                                    // No string_release: `compile_string_lit` returns an INTERNED,
+                                    // immortal LinString (refcount == IMMORTAL_RC), so both the
+                                    // `inc_ref` inside object_set* and a release here are runtime
+                                    // no-ops — but the release is still an emitted call, hit once
+                                    // per field per object construction. Object-heavy code builds
+                                    // millions of objects, so dropping the dead call is a real win.
+                                    // SOUND: the key is never freed (immortal), and object_set*'s
+                                    // own inc_ref is also a no-op on it, so RC stays balanced.
                                 }
                             }
                             let _ = ty;

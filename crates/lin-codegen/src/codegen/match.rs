@@ -33,7 +33,8 @@ impl<'ctx> Codegen<'ctx> {
         for field in &pattern.required_fields {
             let key_str = self.compile_string_lit(field).into_pointer_value();
             let has_i8 = self.builder.call(has_fn, &[val.into(), key_str.into()], "ir_has").try_as_basic_value().unwrap_basic().into_int_value();
-            self.builder.call(self.rt.string_release, &[key_str.into()], "");
+            // No string_release: compile_string_lit returns an immortal interned key
+            // (refcount == IMMORTAL_RC), so releasing it is a runtime no-op call. Drop it.
             let has_bool = self.builder.int_truncate_or_bit_cast(has_i8, bool_ty, "has_b");
             all_present = self.builder.and(all_present, has_bool, "has_acc");
         }

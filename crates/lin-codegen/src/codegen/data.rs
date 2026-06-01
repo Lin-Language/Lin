@@ -456,7 +456,9 @@ impl<'ctx> Codegen<'ctx> {
             };
             let key_str = self.compile_string_lit(field).into_pointer_value();
             let tagged = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "ir_fget").try_as_basic_value().unwrap_basic();
-            self.builder.call(self.rt.string_release, &[key_str.into()], "");
+            // No string_release: `compile_string_lit` returns an interned, immortal
+            // LinString (refcount == IMMORTAL_RC), so the release is a runtime no-op
+            // — but still an emitted call, hit on every typed field read. Drop it.
             self.unbox_tagged_val_to_type(tagged, result_ty)
         } else { ptr_ty.const_null().into() }
     }
