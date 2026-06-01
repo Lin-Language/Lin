@@ -1232,3 +1232,89 @@ its `Null | Error` result trips the same union-vs-bare-target check as `await` (
 to a bare type. Distinct from `Shared<T>` (ADR-044, shared mutable, atomic-RC, copy-in/out) and
 `Frozen<T>` (ADR-045, immortal read-only): a stream is single-owner, moved not shared (ADR-073). Full
 surface spec in §27.9; stdlib API in `std/stream` (STDLIB.md).
+
+## ADR-075: Unified iterable combinators via receiver dispatch (`std/iter`)
+
+**Decision**: The iterable combinators — `map`/`filter`/`reduce`/`for`/`while`/`take`/`drop`/`flatMap`/
+`takeWhile`/`dropWhile`/`flatten`/`concat`/`find`/`some`/`every` — plus the iterator constructors
+`range`/`rangeStep`/`iter`/`iterOf` live in **one** module, `std/iter`, and dispatch on the **static
+type of the receiver** (arg0): **eager** (a materialised `U[]`) for an `Array`/`Iterator` receiver,
+**lazy** (a `Stream<U>` adapter node) for a `Stream` receiver. Terminals over a stream gain an `| Error`
+arm (a stream read is fallible). One name, one import, one fluent chain over any iterable source — the
+receiver's type picks eager-vs-lazy. This is Lin's first-argument-dispatch philosophy (§4.4) applied to
+the combinator set.
+
+**Why this is not a new mechanism.** `for` ALREADY dispatched this way: `lower_for` branched on
+`Type::Stream(_)` to emit a stream driver (`Null | Error`) versus the array index-loop (`Null`).
+Arrays and iterators were ALREADY unified under one name via a `T[] | Iterator` union param. ADR-075
+folds the third source — `Stream` — into a unification that already covered two of three, rather than
+inventing function overloading. The combinator name set is **closed** (the fixed builtin list above), so
+this is a restricted special-case, not general overloading.
+
+**Mechanism (one dispatch fact, three readers).** The receiver type at a concrete call site drives all
+three of:
+1. **Return typing** — `streamish_combinator_ret` (`lin-check/src/checker/call.rs`) re-types the
+   call-site result when arg0 is *definitely* a stream: adapters return `Stream<T>`/`Stream<U>`
+   (keeping the chain lazy for the next link); terminals return `U | Error` (`reduce`),
+   `T | Null | Error` (`find`), `Boolean | Error` (`some`/`every`), `Null | Error` (`for`/`while`).
+   For an `Array`/`Iterator` receiver the eager array-shaped type flows through unchanged.
+2. **IR redirect** — `stream_combinator_intrinsic_name` (`lin-ir/src/lower.rs`) re-routes a
+   `std_iter_*` call whose arg0 is `Type::Stream(_)` to the lazy `lin_stream_*` backend, bypassing the
+   eager pure-Lin/`lin_map` body entirely.
+3. **Affine consumption** — `callee_routes_to_stream_op` keys the use-after-move check on the SAME
+   `(module, export)` dispatch fact.
+
+The std/iter wrappers spell their iterable param as the union `T[] | Iterator | Stream` (so a `Stream`
+is accepted without the opaque type leaking into a bare `Json` param) and **drop their return
+annotations** so the checker-computed receiver-dependent type flows through. The "definitely a stream"
+predicate (`is_definitely_stream`) accepts a bare `Stream<…>` or a `Stream<…> | Error` (a source
+intrinsic's result), but NOT a mixed `Array | Iterator | Stream` union — a union with a live array
+branch keeps its eager return.
+
+**Module boundary — combinators in `std/iter`, array-shaped ops in `std/array`.** The combinators work
+over *any* iterable, so they belong to the iterable module. The genuinely array-shaped ops — those that
+need a materialised, indexable, ordered array (`push`/`slice`/`set`/`at`/`length`/`reverse`/`sort`/
+`sortBy`/`zip`/`unique`/`chunk`/`compact`/`indexOf`/`partition`/`sum`/`product`/`min`/`max`/`minBy`/
+`maxBy`/`append`/`prepend`/`scan`/`groupBy`/`countBy`/`arrayAllocate*`) — stay in `std/array`.
+`std/iter` is the **lower** module in the dependency graph: it must NOT import from `std/array` (that
+would form an `array → iter → array` cycle, a compile-time error, ADR-072), so the two array primitives
+its bodies need internally (`length`/`push`) are duplicated there as private thin wrappers; `std/array`'s
+own combinator-using helpers import the combinators back from `std/iter`.
+
+**Combinators are NOT dual-exported.** Exporting the same combinator from both `std/iter` and (say)
+`std/array`/`std/stream` was **rejected** as confusing — there must be exactly one source of each name.
+`std/stream` therefore **stopped exporting** `map`/`filter`/`take`/`for`/etc.; it keeps only
+stream-specific ops (`readStream`/`writeStream`/`drain`/`collect`/`readText`/`promise`/`close`/`lines`/
+`linesMax`/`chunks`). A stream pipeline imports its combinators from `std/iter` and its sources/sinks
+from `std/stream`.
+
+**Affine subsumption — the prior soundness hole is closed.** The old affine check consumed a stream off
+a fragile NAME allowlist (`is_stream_consuming_op`) while the IR moved a stream on ANY streamish-typed
+arg; the two lists drifted (`linesMax`/`promise`/`close` slipped through, and `promise` is a cross-thread
+UAF locus). Receiver dispatch makes consumption read the SAME fact the dispatch computes: any
+definitely-stream value flowing into any stream-dispatched combinator or stream-specific op is MOVED, per
+argument (so `concat`'s two stream args are both consumed). The checker, the IR redirect, and the affine
+consume-set now read one fact, not three lists, so they cannot diverge. The five adversarial
+use-after-move attacks became regression tests (all reject at check time). Cross-ref ADR-073 (affine
+resource types + move-transfer).
+
+**v1 limitation — dispatch is at the concrete call site only.** Receiver dispatch fires when a combinator
+is called with a *concrete* `Stream` receiver. A stream passed THROUGH a user-defined generic `Iterable`
+parameter and combined inside that function stays **array-shaped** (the param is the union, not a definite
+stream), so it does not become lazy. This is the safe resolution: the eager array path is always correct;
+only the lazy optimisation is forgone. Relaxable later without changing the surface API.
+
+**Rationale**: One combinator vocabulary over arrays, iterators, and streams is the user-facing payoff —
+`readStream(p).lines().drop(1).take(4).map(f).reduce(0, g)` reads identically to the array form yet runs
+lazily with bounded memory. Reusing the `for` dispatch precedent (a closed name set, type-directed
+return) avoids general overloading. Keying affine consumption off the dispatch fact eliminates the
+allowlist-vs-IR divergence class outright rather than patching it.
+
+**Consequence**: `std/iter` is a new stdlib module; `std/array` and `std/stream` shed the moved
+combinators (existing imports migrate to `std/iter`). New lazy stream backends
+(`lin_stream_map`/`filter`/`take`/`drop`/`take_while`/`drop_while`/`flat_map`/`flatten`/`concat`/`while`)
+and stream terminals (`lin_stream_reduce`/`find`/`some`/`every`, alongside the existing `lin_stream_for`)
+back the lazy arm; each drives-and-consumes the stream on the calling thread, fault-isolated. The
+flat-producer recognition (the unboxed-scalar fast path, ADR-069) follows the moved names. Verified on
+`feat/streams`: full suite green, ASan clean, all five affine attacks reject. Full stream semantics in
+§27.9 (ADR-074); combinator surface in §18; stdlib API in `std/iter` (STDLIB.md).
