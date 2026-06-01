@@ -1,13 +1,17 @@
 // result.lin — a generic Result<T, E> tagged union and the combinators that make it
 // composable. The discriminant `"type"` uses singleton string-literal types
 // ("success" / "failure"), so a wrongly-tagged object is a compile-time error.
+
 export type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
 
-export val ok = (v: Json): Json => { "type": "success", "value": v }
+export val ok = (v: Json): Json =>
+  { "type": "success", "value": v }
 
-export val err = (e: Json): Json => { "type": "failure", "error": e }
+export val err = (e: Json): Json =>
+  { "type": "failure", "error": e }
 
-export val isOk = (r: Json): Boolean => r["type"] == "success"
+export val isOk = (r: Json): Boolean =>
+  r["type"] == "success"
 
 // Chain a fallible step: run `f(value)` only on success; propagate failure unchanged.
 export val andThen = (r: Json, f: Function): Json =>

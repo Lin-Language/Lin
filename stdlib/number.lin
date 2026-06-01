@@ -14,39 +14,55 @@ import foreign "lin-runtime"
   val lin_to_int64: (UInt64) => Int64
   val lin_to_uint64: (UInt64) => UInt64
 
-export val parseInt32 = (s: String): Int32 => lin_parse_int32(s)
+export val parseInt32 = (s: String): Int32 =>
+  lin_parse_int32(s)
 
-export val parseFloat64 = (s: String): Float64 => lin_parse_float64(s)
+export val parseFloat64 = (s: String): Float64 =>
+  lin_parse_float64(s)
 
-export val toInt32 = (v: Float64): Int32 => lin_to_int32(v)
+export val toInt32 = (v: Float64): Int32 =>
+  lin_to_int32(v)
 
-export val toFloat64 = (v: Int32): Float64 => lin_to_float64(v)
+export val toFloat64 = (v: Int32): Float64 =>
+  lin_to_float64(v)
 
-export val toFloat32 = (v: Float64): Float32 => lin_to_float32(v)
+export val toFloat32 = (v: Float64): Float32 =>
+  lin_to_float32(v)
 
 // Explicit narrowing integer casts (spec §26). Each truncates the input to the
 // target width using two's-complement / `as`-cast semantics. The input is taken
 // as UInt64 (the widest unsigned) so any narrower unsigned integer — or a value
 // masked down to a byte/word — widens into it at the call site without range
 // loss; truncation to the target width is then well defined.
-export val toUInt8 = (v: UInt64): UInt8 => lin_to_uint8(v)
+export val toUInt8 = (v: UInt64): UInt8 =>
+  lin_to_uint8(v)
 
-export val toInt8 = (v: UInt64): Int8 => lin_to_int8(v)
+export val toInt8 = (v: UInt64): Int8 =>
+  lin_to_int8(v)
 
-export val toUInt16 = (v: UInt64): UInt16 => lin_to_uint16(v)
+export val toUInt16 = (v: UInt64): UInt16 =>
+  lin_to_uint16(v)
 
-export val toInt16 = (v: UInt64): Int16 => lin_to_int16(v)
+export val toInt16 = (v: UInt64): Int16 =>
+  lin_to_int16(v)
 
-export val toUInt32 = (v: UInt64): UInt32 => lin_to_uint32(v)
+export val toUInt32 = (v: UInt64): UInt32 =>
+  lin_to_uint32(v)
 
-export val toInt64 = (v: UInt64): Int64 => lin_to_int64(v)
+export val toInt64 = (v: UInt64): Int64 =>
+  lin_to_int64(v)
 
-export val toUInt64 = (v: UInt64): UInt64 => lin_to_uint64(v)
+export val toUInt64 = (v: UInt64): UInt64 =>
+  lin_to_uint64(v)
 
-export val isInt32 = (s: String): Boolean => lin_is_int32(s)
+export val isInt32 = (s: String): Boolean =>
+  lin_is_int32(s)
 
-export val isFloat64 = (s: String): Boolean => lin_is_float64(s)
+export val isFloat64 = (s: String): Boolean =>
+  lin_is_float64(s)
 
-export val tryParseInt32 = (s: String): Json => if lin_is_int32(s) then lin_parse_int32(s) else null
+export val tryParseInt32 = (s: String): Json =>
+  if lin_is_int32(s) then lin_parse_int32(s)
 
-export val tryParseFloat64 = (s: String): Json => if lin_is_float64(s) then lin_parse_float64(s) else null
+export val tryParseFloat64 = (s: String): Json =>
+  if lin_is_float64(s) then lin_parse_float64(s)

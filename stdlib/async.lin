@@ -2,42 +2,54 @@
 // the await site, so wrapping it in `T | Error` here would mis-type the live promise handle
 // (codegen would try to box the promise pointer as a `T`). The Error injection happens in
 // `await`, where the value is actually produced. See ADR-070.
-export val async = (f: Json): Json => lin_async(f)
+export val async = (f: Json): Json =>
+  lin_async(f)
 
 // await resolves a promise to its value, wrapping it in `T | Error` (spec §32.2.2). A faulted
 // thunk surfaces as an Error here, so the result is a union; assigning it to a bare binding
 // that does not handle the Error case is a compile-time error (the existing union-assignment
 // check, the same one `fromJson` relies on). Handle it with `match … is Error => … else => …`.
-export val await = <T>(p: T): T | Error => lin_await(p)
+export val await = <T>(p: T): T | Error =>
+  lin_await(p)
 
 // parallel keeps the Json signature: the element type `(() => T)[]` is not expressible in the
 // surface type grammar (no parenthesised function type before `[]`), and `lin_parallel`
 // deliberately returns a tagged `Json[]` to keep codegen from picking a flat-scalar array
 // representation. See ADR-070.
-export val parallel = (tasks: Json): Json[] => lin_parallel(tasks)
+export val parallel = (tasks: Json): Json[] =>
+  lin_parallel(tasks)
 
 // race/timeout/retry/poolAsync all return a Promise handle (lin_race/_timeout/_retry/
 // _pool_async return `*mut LinPromise` in the runtime), NOT a resolved value, so they keep the
 // opaque Json typing — exactly like `async`. The `T | Error` Error injection happens once, at
 // `await`, where the value is actually produced. Typing these as `T | Error` would mis-type the
 // live promise pointer and crash codegen (it would box the promise as a scalar). See ADR-070.
-export val race = (promises: Json): Json => lin_race(promises)
+export val race = (promises: Json): Json =>
+  lin_race(promises)
 
-export val timeout = (p: Json, ms: Int32): Json => lin_timeout(p, ms)
+export val timeout = (p: Json, ms: Int32): Json =>
+  lin_timeout(p, ms)
 
-export val retry = (f: Json, times: Int32): Json => lin_retry(f, times)
+export val retry = (f: Json, times: Int32): Json =>
+  lin_retry(f, times)
 
-export val threadPool = (size: Int32): Json => lin_thread_pool(size)
+export val threadPool = (size: Int32): Json =>
+  lin_thread_pool(size)
 
-export val poolAsync = (pool: Json, f: Json): Json => lin_pool_async(pool, f)
+export val poolAsync = (pool: Json, f: Json): Json =>
+  lin_pool_async(pool, f)
 
-export val worker = (handler: Json, onClose: Json): Json => lin_worker(handler, onClose)
+export val worker = (handler: Json, onClose: Json): Json =>
+  lin_worker(handler, onClose)
 
-export val request = (w: Json, msg: Json): Json => lin_request(w, msg)
+export val request = (w: Json, msg: Json): Json =>
+  lin_request(w, msg)
 
-export val message = (w: Json, msg: Json): Null => lin_message(w, msg)
+export val message = (w: Json, msg: Json): Null =>
+  lin_message(w, msg)
 
-export val close = (w: Json): Null => lin_close(w)
+export val close = (w: Json): Null =>
+  lin_close(w)
 
 // Shared<T> — opt-in shared mutable state (ADR-043 §2.3.1). `shared` boxes a private copy;
 // `get` snapshots out, `set` copies in, `withLock` mutates in place under the write lock.
@@ -45,14 +57,19 @@ export val close = (w: Json): Null => lin_close(w)
 // the caller and the accessor-only guard holds: a non-accessor op on a `Shared` value (push,
 // indexing, …) is a compile-time type error (ADR-044). `shared(v)` produces a `Shared`; the
 // other three only accept a `Shared` first argument.
-export val shared = (v: Json): Shared => lin_shared(v)
+export val shared = (v: Json): Shared =>
+  lin_shared(v)
 
-export val get = (s: Shared): Json => lin_shared_get(s)
+export val get = (s: Shared): Json =>
+  lin_shared_get(s)
 
-export val set = (s: Shared, v: Json): Null => lin_shared_set(s, v)
+export val set = (s: Shared, v: Json): Null =>
+  lin_shared_set(s, v)
 
-export val withLock = (s: Shared, f: Function): Json => lin_shared_with_lock(s, f)
+export val withLock = (s: Shared, f: Function): Json =>
+  lin_shared_with_lock(s, f)
 
 // Frozen<T> — opt-in shared READ-ONLY state (ADR-043 §2.3.2). Deep-freezes a transferable
 // graph into an immortal, immutable, lock-free-readable value; readers use the plain type.
-export val frozen = (v: Json): Json => lin_freeze(v)
+export val frozen = (v: Json): Json =>
+  lin_freeze(v)

@@ -17,8 +17,8 @@
 // Stdlib used:
 //   std/math   — clamp, round, abs
 //   std/number — toInt32 (Float64 duty → Int32)
-import { clamp, round, abs } from "std/math"
 
+import { clamp, round, abs } from "std/math"
 import { toInt32 } from "std/number"
 
 // A PWM command: which channel to drive ("rpwm"|"lpwm"|"stop") and its duty

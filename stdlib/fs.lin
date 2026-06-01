@@ -22,62 +22,64 @@ import foreign "lin-runtime"
   val lin_fs_write_file_bytes: (String, UInt8[]) => Json
   val lin_fs_write_lines: (String, String[]) => Json
 
-export val readFile = (path: String): Json => lin_fs_read_file(path)
+export val readFile = (path: String): Json =>
+  lin_fs_read_file(path)
 
-export val writeFile = (path: String, content: String): Json => lin_fs_write_file(path, content)
+export val writeFile = (path: String, content: String): Json =>
+  lin_fs_write_file(path, content)
 
-export val appendFile = (path: String, content: String): Json => lin_fs_append_file(path, content)
+export val appendFile = (path: String, content: String): Json =>
+  lin_fs_append_file(path, content)
 
-export val readLines = (path: String): Json => lin_fs_read_lines(path)
+export val readLines = (path: String): Json =>
+  lin_fs_read_lines(path)
 
-export val readJson = (path: String): Json => lin_fs_read_json(path)
+export val readJson = (path: String): Json =>
+  lin_fs_read_json(path)
 
 export val writeJson = (path: String, value: Json, opts: Json): Json =>
-  if opts == null then
-    lin_fs_write_json(path, value)
-  else if opts["compact"] == true then
-    lin_fs_write_json_compact(path, value)
-  else
-    lin_fs_write_json(path, value)
+  if opts == null then lin_fs_write_json(path, value)
+  else if opts["compact"] == true then lin_fs_write_json_compact(path, value)
+  else lin_fs_write_json(path, value)
 
-export val exists = (path: String): Boolean => lin_fs_exists(path)
+export val exists = (path: String): Boolean =>
+  lin_fs_exists(path)
 
-export val isFile = (path: String): Boolean => lin_fs_is_file(path)
+export val isFile = (path: String): Boolean =>
+  lin_fs_is_file(path)
 
-export val isDir = (path: String): Boolean => lin_fs_is_dir(path)
+export val isDir = (path: String): Boolean =>
+  lin_fs_is_dir(path)
 
-export val stat = (path: String): Json => lin_fs_stat(path)
+export val stat = (path: String): Json =>
+  lin_fs_stat(path)
 
 export val ls = (path: String, opts: Json): Json =>
-  if opts == null then
-    lin_fs_list_dir(path)
-  else if opts["recursive"] == true then
-    lin_fs_list_dir_all(path)
-  else
-    lin_fs_list_dir(path)
+  if opts == null then lin_fs_list_dir(path)
+  else if opts["recursive"] == true then lin_fs_list_dir_all(path)
+  else lin_fs_list_dir(path)
 
 export val mkdir = (path: String, opts: Json): Json =>
-  if opts == null then
-    lin_fs_mkdir(path)
-  else if opts["parents"] == true then
-    lin_fs_mkdir_all(path)
-  else
-    lin_fs_mkdir(path)
+  if opts == null then lin_fs_mkdir(path)
+  else if opts["parents"] == true then lin_fs_mkdir_all(path)
+  else lin_fs_mkdir(path)
 
 export val rm = (path: String, opts: Json): Json =>
-  if opts == null then
-    lin_fs_rm(path, 0)
-  else if opts["recursive"] == true then
-    lin_fs_rm(path, 1)
-  else
-    lin_fs_rm(path, 0)
+  if opts == null then lin_fs_rm(path, 0)
+  else if opts["recursive"] == true then lin_fs_rm(path, 1)
+  else lin_fs_rm(path, 0)
 
-export val cp = (src: String, dst: String): Json => lin_fs_cp(src, dst)
+export val cp = (src: String, dst: String): Json =>
+  lin_fs_cp(src, dst)
 
-export val mv = (src: String, dst: String): Json => lin_fs_rename(src, dst)
+export val mv = (src: String, dst: String): Json =>
+  lin_fs_rename(src, dst)
 
-export val readFileBytes = (path: String): Json => lin_fs_read_file_bytes(path)
+export val readFileBytes = (path: String): Json =>
+  lin_fs_read_file_bytes(path)
 
-export val writeFileBytes = (path: String, bytes: UInt8[]): Json => lin_fs_write_file_bytes(path, bytes)
+export val writeFileBytes = (path: String, bytes: UInt8[]): Json =>
+  lin_fs_write_file_bytes(path, bytes)
 
-export val writeLines = (path: String, lines: String[]): Json => lin_fs_write_lines(path, lines)
+export val writeLines = (path: String, lines: String[]): Json =>
+  lin_fs_write_lines(path, lines)

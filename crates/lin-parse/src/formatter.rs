@@ -52,6 +52,18 @@ thread_local! {
     /// ends are unreliable (e.g. an `import` span covers only the keyword), so blank-line
     /// detection works from the FOLLOWING statement's position, scanning the source.
     static SOURCE_CHARS: RefCell<Vec<char>> = const { RefCell::new(Vec::new()) };
+    /// Body-span starts of last-arg lambda array/object literals that are hoist targets
+    /// (Rule 6). For these, the trailing-lambda `=> [`/`=> {` collapse (Rule 5a) must win
+    /// over the author-newline rule (Rule B): the call-form `f(..., () => [` layout is
+    /// canonical and a between-`=>`-and-body comment is hoisted to the statement.
+    static HOIST_BODIES: RefCell<std::collections::HashSet<u32>> =
+        RefCell::new(std::collections::HashSet::new());
+}
+
+/// True if `body_start` is a Rule 6 hoist target (a last-arg lambda array/object body of a
+/// statement-level call), so Rule 5a `=> [` collapse should win over Rule B.
+fn is_hoist_body(body_start: u32) -> bool {
+    HOIST_BODIES.with(|s| s.borrow().contains(&body_start))
 }
 
 /// True if, in the source, the line immediately preceding the line containing char offset
@@ -77,6 +89,21 @@ fn source_blank_before(pos: u32) -> bool {
             let slice = &src[start..end.min(src.len())];
             slice.iter().all(|c| c.is_whitespace())
         })
+    })
+}
+
+/// True if the two char offsets are on different source lines (per the installed
+/// LINE_STARTS). False if no source info installed (comment-free formatter) — callers
+/// then fall back to fit-based layout. This is how the formatter respects the AUTHOR'S
+/// newline choice: an `if`/function-body/2-chain that the author wrote multiline stays
+/// multiline, and one written inline stays inline.
+fn spans_on_different_source_lines(a: u32, b: u32) -> bool {
+    LINE_STARTS.with(|ls_c| {
+        let ls = ls_c.borrow();
+        if ls.is_empty() {
+            return false;
+        }
+        line_of(&ls, a as usize) != line_of(&ls, b as usize)
     })
 }
 
@@ -222,6 +249,11 @@ impl Formatter {
         CTX.with(|c| *c.borrow_mut() = ctx);
         LINE_STARTS.with(|c| *c.borrow_mut() = self.line_starts.clone());
         SOURCE_CHARS.with(|c| *c.borrow_mut() = self.source_chars.clone());
+        // Hoist targets: last-arg lambda array/object bodies of statement-level calls. For
+        // these the Rule 5a `=> [` collapse wins over the author-newline rule (Rule B).
+        let hoist_bodies: std::collections::HashSet<u32> =
+            build_hoist_redirects(module).keys().copied().collect();
+        HOIST_BODIES.with(|c| *c.borrow_mut() = hoist_bodies);
 
         let mut out = String::new();
         let mut first = true;
@@ -264,6 +296,7 @@ impl Formatter {
         CTX.with(|c| *c.borrow_mut() = CommentCtx::default());
         LINE_STARTS.with(|c| c.borrow_mut().clear());
         SOURCE_CHARS.with(|c| c.borrow_mut().clear());
+        HOIST_BODIES.with(|c| c.borrow_mut().clear());
         out
     }
 }
@@ -1143,14 +1176,14 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         }
 
         // ── Function ──────────────────────────────────────────────────────────
-        Expr::Function { type_params, params, return_type, body, .. } => {
+        Expr::Function { type_params, params, return_type, body, span } => {
             // A lambda body is a fresh layout scope: a multiline ancestor literal must NOT
             // force literals inside the lambda's body to be multiline (Rule 4 is about JSON
             // data nesting, not code buried in a lambda). Clearing FORCE_ML here also keeps
             // formatting idempotent — otherwise a `val x = [1, 2, 3]` inside a lambda body
             // that is an argument to a call inside a literal would flip layout between passes.
             with_force_ml(false, || {
-                fmt_function(type_params, params, return_type.as_ref(), body, ind)
+                fmt_function(type_params, params, return_type.as_ref(), body, span.start, ind)
             })
         }
 
@@ -1162,7 +1195,16 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
             // Try inline. Skipped when any branch body carries an attached comment —
             // the inline form (`if c then a else b`) has nowhere to place it, so we fall
             // through to block form where each branch renders on its own commented line.
-            if is_atomic(then_branch) && is_atomic(else_branch) && !if_has_branch_comment(expr) {
+            // Rule A: only take the inline path if the author ALSO wrote the `if` inline,
+            // i.e. condition, then_branch and else_branch all START on the same source
+            // line. An author-multiline `if` stays multiline even though it would fit.
+            let author_inline = !spans_on_different_source_lines(condition.span().start, then_branch.span().start)
+                && !spans_on_different_source_lines(condition.span().start, else_branch.span().start);
+            if author_inline
+                && is_atomic(then_branch)
+                && is_atomic(else_branch)
+                && !if_has_branch_comment(expr)
+            {
                 let t = fmt_inline(then_branch);
                 let e = fmt_inline(else_branch);
                 let inline = format!("if {} then {} else {}", cond, t, e);
@@ -1287,6 +1329,7 @@ fn fmt_function(
     params: &[Param],
     return_type: Option<&TypeExpr>,
     body: &Expr,
+    fn_start: u32,
     ind: &str,
 ) -> String {
     let child_ind = format!("{}  ", ind);
@@ -1339,13 +1382,24 @@ fn fmt_function(
         trailing_text(body_anchor)
     };
 
+    // Rule B: respect the author's newline choice for the body. If the author wrote the
+    // body on a DIFFERENT source line than the function's `=>` (detected via the function
+    // span start's line vs the body span start's line), keep the body on its own indented
+    // line; if they wrote it inline after `=>`, keep it inline (subject to fit). False when
+    // no source info is installed (comment-free formatter falls back to fit-based layout).
+    // A Rule 6 hoist body is exempt: its canonical layout is the Rule 5a `=> [` collapse.
+    let author_body_on_new_line = spans_on_different_source_lines(fn_start, body.span().start)
+        && !is_hoist_body(body.span().start);
+
     // Rule 5a: a lambda whose body is an array/object literal keeps `=> [` / `=> {`
     // attached on the param line, with the literal's contents flowing beneath. The literal
     // renders at the FUNCTION's own indent (not child_ind), so its closing `]`/`}` lines up
     // under the `=>` line and a leading comment between `=>` and the body has been hoisted
     // away (handled by the caller / comment anchoring). Only when there's no leading comment
-    // forcing the split.
+    // forcing the split, and only when the author did NOT put the literal on its own line
+    // (Rule B): an author who wrote the `[`/`{` on the next line keeps it on its own line.
     if body_leading.is_empty()
+        && !author_body_on_new_line
         && matches!(body, Expr::Array(..) | Expr::Object(..))
     {
         let body_str = fmt_expr(body, false, ind);
@@ -1354,9 +1408,11 @@ fn fmt_function(
         }
     }
 
-    // Block / match / complex if → multi-line.
+    // Block / match / complex if → multi-line. Rule B: an author-newline body is also
+    // multi-line (rendered on its own indented line under `=>`).
     let needs_multiline = matches!(body, Expr::Block(..) | Expr::Match { .. })
         || (matches!(body, Expr::If { .. }) && !is_atomic(body))
+        || author_body_on_new_line
         || !body_leading.is_empty();
 
     let mut body_str = fmt_expr(body, false, &child_ind);
@@ -1634,12 +1690,17 @@ fn fmt_call_arglist(args: &[Expr], ind: &str) -> String {
 
 // ── dot chain ─────────────────────────────────────────────────────────────────
 
-fn collect_chain(expr: &Expr) -> (&Expr, Vec<(&str, &Option<Vec<Expr>>)>) {
+type ChainLink<'a> = (&'a str, &'a Option<Vec<Expr>>, u32);
+
+fn collect_chain(expr: &Expr) -> (&Expr, Vec<ChainLink<'_>>) {
     let mut chain = Vec::new();
     let mut cur = expr;
     loop {
         if let Expr::DotCall { receiver, method, args, .. } = cur {
-            chain.push((method.as_str(), args));
+            // The link's source position: the receiver's span end is where `.method`
+            // begins, which is the offset that tells us whether the author broke the
+            // chain across lines (the `.` sits just after the receiver).
+            chain.push((method.as_str(), args, receiver.span().end));
             cur = receiver;
         } else {
             break;
@@ -1653,9 +1714,24 @@ fn fmt_chain(expr: &Expr, ind: &str) -> String {
     let (root, chain) = collect_chain(expr);
     let child_ind = format!("{}  ", ind);
 
-    // Try inline for short chains. A chain with more than CHAIN_INLINE_MAX calls is
-    // ALWAYS rendered multiline regardless of length (Rule 1).
-    if chain.len() <= CHAIN_INLINE_MAX {
+    // Rule C: a chain with MORE than CHAIN_INLINE_MAX (2) calls is ALWAYS multiline. For a
+    // chain with ≤2 calls, preserve the author's newline choice: if the author broke any
+    // `.method` onto a different source line than the previous link (or the root), keep it
+    // multiline; if the author wrote it inline, keep it inline (subject to fit). A single
+    // `.method` (1-call chain) stays inline if it fits.
+    let author_multiline = {
+        let mut prev = root.span().end;
+        let mut broke = false;
+        for (_, _, link_pos) in &chain {
+            if spans_on_different_source_lines(prev, *link_pos) {
+                broke = true;
+            }
+            prev = *link_pos;
+        }
+        broke
+    };
+
+    if chain.len() <= CHAIN_INLINE_MAX && !author_multiline {
         let inline = fmt_inline(expr);
         // Only use inline if it truly fits on one line (no newlines and fits in budget).
         if !inline.contains('\n') && inline.len() + ind.len() <= 120 {
@@ -1667,7 +1743,7 @@ fn fmt_chain(expr: &Expr, ind: &str) -> String {
     let root_str = fmt_postfix_base(root, |e| fmt_expr(e, false, ind));
     let call_strs: Vec<String> = chain
         .iter()
-        .map(|(method, args)| match args {
+        .map(|(method, args, _)| match args {
             None => format!("{}.{}", child_ind, method),
             Some(a) => {
                 format!("{}.{}{}", child_ind, method, fmt_call_arglist(a, &child_ind))

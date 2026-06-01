@@ -1,28 +1,23 @@
 // validate.lin — field-level validators that return a Result (the value on success,
 // an error message on failure). These are the reusable, composable checks.
+
 import { ok, err } from "./result"
-
 import { isBlank, contains } from "std/string"
-
 import { isInt32, parseInt32 } from "std/number"
 
 // A non-empty, non-whitespace string.
-export val nonEmpty = (field: String, s: String): Json => if isBlank(s) then err("${field} must not be empty") else ok(s)
+export val nonEmpty = (field: String, s: String): Json =>
+  if isBlank(s) then err("${field} must not be empty") else ok(s)
 
 // A crude e-mail check: contains "@" and a ".".
 export val email = (s: String): Json =>
-  if contains(s, "@") && contains(s, ".") then
-    ok(s)
-  else
-    err("invalid email: ${s}")
+  if contains(s, "@") && contains(s, ".") then ok(s)
+  else err("invalid email: ${s}")
 
 // Parse an integer in [min, max].
 export val intInRange = (field: String, s: String, min: Int32, max: Int32): Json =>
-  if isInt32(s) == false then
-    err("${field} must be a number")
+  if isInt32(s) == false then err("${field} must be a number")
   else
     val n = parseInt32(s)
-    if n < min || n > max then
-      err("${field} must be between ${min} and ${max}")
-    else
-      ok(n)
+    if n < min || n > max then err("${field} must be between ${min} and ${max}")
+    else ok(n)

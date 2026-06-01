@@ -5,11 +5,8 @@
 // measures RwLock acquire/release cost plus the copy-in/out at the lock boundary
 // under real cross-thread contention — the price of opt-in shared mutable state.
 import { print } from "std/io"
-
 import { toString } from "std/string"
-
 import { parallel, shared, get, withLock } from "std/async"
-
 import { push, length, for, range } from "std/array"
 
 val box = shared([])

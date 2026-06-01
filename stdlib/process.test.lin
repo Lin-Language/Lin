@@ -1,25 +1,15 @@
 import { expect, toBe, test, suite, run } from "std/test"
-
 import { contains } from "std/string"
-
 import { spawn, readStdout, wait, exec, shell, cwd } from "std/process"
 
 // std/process over real subprocesses is deterministic. We run small `sh`/`printf`
 // commands, so this touches no stdin/TTY state and is CI-safe.
+
 val s = suite("std/process", [
+  // --- streaming: spawn / readStdout / wait ---
   test("spawn + readStdout returns the child's output bytes", () =>
-    // --- streaming: spawn / readStdout / wait ---
     val h = spawn("sh", ["-c", "printf hello"])
-    val buf: UInt8[] = [
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0
-    ]
+    val buf: UInt8[] = [0, 0, 0, 0, 0, 0, 0, 0]
     val n = readStdout(h, buf)
     val code = wait(h)
     [
@@ -29,25 +19,48 @@ val s = suite("std/process", [
       expect(buf[2]).toBe(108),
       expect(buf[3]).toBe(108),
       expect(buf[4]).toBe(111),
-      expect(code).toBe(0)
-    ]),
+      expect(code).toBe(0),
+    ]
+  ),
+
   test("wait returns the child's exit code", () =>
     val h = spawn("sh", ["-c", "exit 3"])
     val code = wait(h)
-    [expect(code).toBe(3)]),
+    [
+      expect(code).toBe(3)
+    ]
+  ),
+
+  // --- batch: exec / shell / cwd ---
   test("exec collects status and stdout", () =>
-    // --- batch: exec / shell / cwd ---
     val r = exec("printf", ["batch-out"])
-    [expect(r["status"]).toBe(0), expect(r["stdout"]).toBe("batch-out")]),
+    [
+      expect(r["status"]).toBe(0),
+      expect(r["stdout"]).toBe("batch-out"),
+    ]
+  ),
+
   test("exec reports a non-zero exit status", () =>
     val r = exec("sh", ["-c", "exit 7"])
-    [expect(r["status"]).toBe(7)]),
+    [
+      expect(r["status"]).toBe(7)
+    ]
+  ),
+
   test("shell runs a command through /bin/sh", () =>
     val r = shell("printf one; printf two")
-    [expect(r["status"]).toBe(0), expect(r["stdout"]).toBe("onetwo")]),
+    [
+      expect(r["status"]).toBe(0),
+      expect(r["stdout"]).toBe("onetwo"),
+    ]
+  ),
+
   test("cwd returns a non-empty absolute path", () =>
     val here = cwd()
-    [expect(contains(here, "/")).toBe(true)])
+    [
+      expect(contains(here, "/")).toBe(true)
+    ]
+  ),
 ])
 
 run(s)

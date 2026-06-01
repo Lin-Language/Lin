@@ -5,20 +5,17 @@
 // spawn + transfer + join cost of a single async/await round-trip (the thunk
 // itself is trivial, so the time is dominated by thread machinery, not compute).
 import { print } from "std/io"
-
 import { toString } from "std/string"
-
 import { async, await } from "std/async"
-
 import { for, range } from "std/array"
 
 // One async round-trip returning a small value derived from its argument (so the
 // thunk can't be folded away). Captures the function parameter `k` (transferred
 // to the worker by deep copy).
-val roundTrip = (k: Int32): Int32 => await(async(() => k * 2 + 1))
+val roundTrip = (k: Int32): Int32 =>
+  await(async(() => k * 2 + 1))
 
 var sum = 0
-
 range(0, 20000).for(i => sum = sum + roundTrip(i))
 
 // Checksum keeps the whole computation live (prevents dead-code elimination).

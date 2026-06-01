@@ -5,28 +5,25 @@
 //
 // Run:  lin run examples/dijkstra/main.lin -- examples/dijkstra/graph.json A E out.json
 // Test: lin test examples/dijkstra/
+
 import { solve } from "./solver"
-
 import { print, args, exit } from "std/io"
-
 import { toString, join } from "std/string"
 
 val argv = args()
-
 val graphPath = argv[0]
-
 val source = argv[1]
-
 val target = argv[2]
-
 val outputPath = argv[3]
 
 match solve(graphPath, source, target, outputPath)
   has { "type": "error", message } =>
     print("error reading graph: ${message}")
     exit(1)
-  has { "type": "no-path" } => print("no path from ${source} to ${target}")
+  has { "type": "no-path" } =>
+    print("no path from ${source} to ${target}")
   has { "type": "ok", path, distance } =>
     print("path: ${join(path, " ")}")
     print("distance: ${toString(distance)}")
-  else => print("unexpected result")
+  else =>
+    print("unexpected result")

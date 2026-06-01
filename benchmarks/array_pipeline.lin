@@ -2,9 +2,7 @@
 // Exercises closure calls (indirect), boxing/unboxing of Int32 through the
 // Json element type, RC traffic on intermediate arrays, and allocation.
 import { print } from "std/io"
-
 import { toString } from "std/string"
-
 import { range, map, filter, reduce } from "std/array"
 
 val n = 2000000

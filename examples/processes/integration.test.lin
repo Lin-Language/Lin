@@ -1,11 +1,7 @@
 import { expect, toBe, test, suite, run } from "std/test"
-
 import { runAll } from "./task"
-
 import { summarize, render } from "./report"
-
 import { exec } from "std/process"
-
 import { contains } from "std/string"
 
 // End-to-end: a mixed task list through the whole pipeline (run each → classify →
@@ -14,56 +10,16 @@ import { contains } from "std/string"
 // on platform exit-code conventions, and the "command could not launch" case (an
 // Error return) is reproduced exactly, which a real `exec` cannot do portably.
 replace exec = (command: String, args: String[]): Json =>
-  if command == "printf" then
-    {
-      "status": 0,
-      "stdout": "hi",
-      "stderr": ""
-    }
-  else if command == "true" then
-    {
-      "status": 0,
-      "stdout": "",
-      "stderr": ""
-    }
-  else if command == "false" then
-    {
-      "status": 1,
-      "stdout": "",
-      "stderr": ""
-    }
-  else
-    { "type": "error", "message": "command not found" }
+  if command == "printf" then { "status": 0, "stdout": "hi", "stderr": "" }
+  else if command == "true" then { "status": 0, "stdout": "", "stderr": "" }
+  else if command == "false" then { "status": 1, "stdout": "", "stderr": "" }
+  else { "type": "error", "message": "command not found" }
 
 val tasks = [
-  {
-    "name": "echo",
-    "command": "printf",
-    "args": [
-      "hi"
-    ]
-  },
-  {
-    "name": "ok",
-    "command": "true",
-    "args": [
-
-    ]
-  },
-  {
-    "name": "bad",
-    "command": "false",
-    "args": [
-
-    ]
-  },
-  {
-    "name": "missing",
-    "command": "nope",
-    "args": [
-
-    ]
-  }
+  { "name": "echo",    "command": "printf", "args": ["hi"] },
+  { "name": "ok",      "command": "true",   "args": [] },
+  { "name": "bad",     "command": "false",  "args": [] },
+  { "name": "missing", "command": "nope",   "args": [] }
 ]
 
 val s = suite("processes integration", [
@@ -75,7 +31,8 @@ val s = suite("processes integration", [
       expect(sm["passed"]).toBe(2),
       expect(sm["failed"]).toBe(2),
       expect(sm["ok"]).toBe(false)
-    ]),
+    ]
+  ),
   test("renders a report naming each task and the failure count", () =>
     val out = render(runAll(tasks))
     [
@@ -83,7 +40,7 @@ val s = suite("processes integration", [
       expect(out.contains("[fail] bad (exit 1)")).toBe(true),
       expect(out.contains("[error] missing")).toBe(true),
       expect(out.contains("2 of 4 task(s) failed")).toBe(true)
-    ])
+    ]
+  ),
 ])
-
 run(s)

@@ -2,10 +2,9 @@
 //
 // `calc(src)` returns a tagged result: { "type": "success", "value": <Int32> } or
 // { "type": "failure", "error": <String> }. This is the module the tests drive.
+
 import { tokenize } from "./lexer"
-
 import { parse } from "./parser"
-
 import { evalAst } from "./eval"
 
 // The end-to-end result: { "type": "success", "value": <Int32> } on a valid
@@ -13,9 +12,8 @@ import { evalAst } from "./eval"
 // a named union whose discriminant `type` is String (spec: literals are base-
 // typed, not singletons), matched by callers with `has { "type": ... }`.
 type Failure = { "type": String, "error": String }
-
 type Success = { "type": String, "value": Int32 }
-
 type CalcResult = Success | Failure
 
-export val calc = (src: String): CalcResult => evalAst(parse(tokenize(src)))
+export val calc = (src: String): CalcResult =>
+  evalAst(parse(tokenize(src)))

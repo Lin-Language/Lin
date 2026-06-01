@@ -2,10 +2,9 @@
 // optionally write the result out. Kept separate from main.lin so the whole flow
 // (including the read-error and no-path branches and the file write) is unit-testable
 // by mocking std/fs — main.lin is then just argv parsing + printing.
+
 import { buildAdj, reconstructPath } from "./graph"
-
 import { dijkstra } from "./algorithm"
-
 import { readJson, writeJson } from "std/fs"
 
 // The outcome of a solve, as a tagged union main.lin pattern-matches to print:
@@ -22,19 +21,15 @@ val UNREACHABLE = 999999999
 export val solve = (graphPath: String, source: String, target: String, outputPath: Json): SolveResult =>
   val graphData = readJson(graphPath)
   match graphData
-    has { "type": "error", message } => { "type": "error", "message": message }
+    has { "type": "error", message } =>
+      { "type": "error", "message": message }
     else =>
       val adj = buildAdj(graphData["edges"])
       val result = dijkstra(adj, source, graphData["nodes"])
       val d = result["dist"][target]
-      if d >= UNREACHABLE then
-        { "type": "no-path" }
+      if d >= UNREACHABLE then { "type": "no-path" }
       else
         val path = reconstructPath(result["prev"], source, target)
         if outputPath != null then
           writeJson(outputPath, { "path": path, "distance": d }, {})
-        {
-          "type": "ok",
-          "path": path,
-          "distance": d
-        }
+        { "type": "ok", "path": path, "distance": d }

@@ -7,20 +7,15 @@
 // non-escaping, so RC elision should drive the added traffic to ~zero — this benchmark is the
 // guard that it does.
 import { print } from "std/io"
-
 import { toString } from "std/string"
-
 import { range, map, filter, reduce } from "std/array"
 
 val n = 2000000
 
 // `base`, `lo`, `hi`, `seed` are captured by the callbacks below (closures over outer vals).
 val base = 7
-
 val lo = 100
-
 val hi = 1700000
-
 val seed = 3
 
 // map/filter/reduce where EVERY callback captures an outer value → each is a capturing

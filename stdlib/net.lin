@@ -14,29 +14,44 @@ import foreign "lin-runtime"
   val lin_tcp_close: (Int32) => Json
 
 // --- UDP ---
-export val udpBind = (port: Int32): Json => lin_udp_bind(port)
 
-export val udpRecv = (fd: Int32, buf: UInt8[]): Json => lin_udp_recv(fd, buf)
+export val udpBind = (port: Int32): Json =>
+  lin_udp_bind(port)
 
-export val udpRecvFrom = (fd: Int32, buf: UInt8[]): Json => lin_udp_recv_from(fd, buf)
+export val udpRecv = (fd: Int32, buf: UInt8[]): Json =>
+  lin_udp_recv(fd, buf)
 
-export val udpSendTo = (fd: Int32, addr: String, port: Int32, buf: UInt8[]): Json => lin_udp_send_to(fd, addr, port, buf)
+export val udpRecvFrom = (fd: Int32, buf: UInt8[]): Json =>
+  lin_udp_recv_from(fd, buf)
 
-export val udpSetNonblocking = (fd: Int32, on: Boolean): Json => if on then lin_udp_set_nonblocking(fd, 1) else lin_udp_set_nonblocking(fd, 0)
+export val udpSendTo = (fd: Int32, addr: String, port: Int32, buf: UInt8[]): Json =>
+  lin_udp_send_to(fd, addr, port, buf)
 
-export val udpClose = (fd: Int32): Json => lin_udp_close(fd)
+export val udpSetNonblocking = (fd: Int32, on: Boolean): Json =>
+  if on then lin_udp_set_nonblocking(fd, 1) else lin_udp_set_nonblocking(fd, 0)
+
+export val udpClose = (fd: Int32): Json =>
+  lin_udp_close(fd)
 
 // --- TCP ---
-export val tcpListen = (port: Int32): Json => lin_tcp_listen(port)
 
-export val tcpAccept = (fd: Int32): Json => lin_tcp_accept(fd)
+export val tcpListen = (port: Int32): Json =>
+  lin_tcp_listen(port)
 
-export val tcpConnect = (host: String, port: Int32): Json => lin_tcp_connect(host, port)
+export val tcpAccept = (fd: Int32): Json =>
+  lin_tcp_accept(fd)
 
-export val tcpRecv = (fd: Int32, buf: UInt8[]): Json => lin_tcp_recv(fd, buf)
+export val tcpConnect = (host: String, port: Int32): Json =>
+  lin_tcp_connect(host, port)
 
-export val tcpSend = (fd: Int32, buf: UInt8[]): Json => lin_tcp_send(fd, buf)
+export val tcpRecv = (fd: Int32, buf: UInt8[]): Json =>
+  lin_tcp_recv(fd, buf)
 
-export val tcpSetNonblocking = (fd: Int32, on: Boolean): Json => if on then lin_tcp_set_nonblocking(fd, 1) else lin_tcp_set_nonblocking(fd, 0)
+export val tcpSend = (fd: Int32, buf: UInt8[]): Json =>
+  lin_tcp_send(fd, buf)
 
-export val tcpClose = (fd: Int32): Json => lin_tcp_close(fd)
+export val tcpSetNonblocking = (fd: Int32, on: Boolean): Json =>
+  if on then lin_tcp_set_nonblocking(fd, 1) else lin_tcp_set_nonblocking(fd, 0)
+
+export val tcpClose = (fd: Int32): Json =>
+  lin_tcp_close(fd)
