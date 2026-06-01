@@ -6922,6 +6922,84 @@ print(toString(a[0] + a[2]))
 }
 
 #[test]
+fn test_index_read_on_var_array_borrows_no_rc() {
+    // RC-elision (borrowed container base): reading an element from a module-`var` (global) array
+    // must NOT retain/release the array — the read borrows it; its owner (the global) outlives the
+    // read. This was the dominant cost of tight index loops (a linear-scan min over `pqDist[j]`
+    // emitted 2 retain + 2 release PER element). The scan fn here reads the global array twice per
+    // step; its body must contain ZERO lin_rc_retain / lin_array_release.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_borrow_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_borrow_{}", id));
+    let ll_path = bin_path.with_extension("ll");
+
+    fs::write(&src_path, r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { arrayAllocateFilled, set } from "std/array"
+var a = arrayAllocateFilled(8, 0)
+set(a, 3, 9)
+val scan = (j: Int32, best: Int32): Int32 =>
+  if j >= 8 then best
+  else if a[j] < a[best] then scan(j + 1, j)
+  else scan(j + 1, best)
+print(toString(scan(1, 0)))
+"#).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_EMIT_IR", "1")
+        .env("LIN_NO_OPT", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+
+    let ll = fs::read_to_string(&ll_path).expect("LLVM IR not emitted");
+    let _ = fs::remove_file(&bin_path);
+    let _ = fs::remove_file(&ll_path);
+
+    // Isolate the scan function body and assert it borrows (flat read, no RC on the array).
+    let start = ll.find("define i32 @scan(").expect("missing scan fn");
+    let body = &ll[start..];
+    let end = body.find("\n}").map(|e| e + 2).unwrap_or(body.len());
+    let body = &body[..end];
+    assert!(body.contains("lin_flat_array_get_i32"),
+        "scan must read the array via the flat getter, got:\n{}", body);
+    assert!(!body.contains("lin_rc_retain") && !body.contains("lin_array_release"),
+        "scan must NOT retain/release the borrowed var array, got:\n{}", body);
+}
+
+#[test]
+fn test_borrowed_index_read_write_loops_are_correct() {
+    // Behavioural guard for the borrowed Index / IndexSet container base: a global-`var` array
+    // read in a loop, and direct `arr[i] = v` writes through a global-var array, must produce
+    // correct results (the borrow must not drop/alias the container). Mirrors the dijkstra
+    // pq-array access pattern that motivated the optimization.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { arrayAllocateFilled, for } from "std/array"
+
+var a = arrayAllocateFilled(5, 0)
+// direct index-set writes through the global-var array
+var i = 0
+[10, 20, 30, 40, 50].for(v =>
+  a[i] = v
+  i = i + 1
+)
+// repeated borrowed reads in a recursive scan
+val sumFrom = (j: Int32, acc: Int32): Int32 =>
+  if j >= 5 then acc else sumFrom(j + 1, acc + a[j])
+print(toString(a[0]))
+print(toString(a[4]))
+print(toString(sumFrom(0, 0)))
+"#);
+    assert_eq!(out, vec!["10", "50", "150"]);
+}
+
+#[test]
 fn test_generic_array_allocate_string_stays_tagged() {
     // A heap (NON-flat-scalar) element type must stay TAGGED: String[] is allocated tagged and
     // read tagged. Allocate, index-set string elements, read them back. Proves the flat path is
