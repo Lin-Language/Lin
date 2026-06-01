@@ -9,13 +9,16 @@
 // Test:  lin test examples/streams/
 
 import { print } from "std/io"
-import { readStream, lines, writeLines, drain } from "std/stream"
-import { writeFile, readFile } from "std/fs"
-import { split, join } from "std/string"
+import { readStream, lines, writeStream, writeLines, drain } from "std/stream"
+import { gunzip } from "std/compress"
+import { untar, manifest } from "std/archive"
+import { writeFile, readFile, mkdir } from "std/fs"
+import { split, join, toString } from "std/string"
 import { length } from "std/array"
 // map/filter come from std/iter (the unified combinators) and dispatch to the lazy stream backend
-// on a stream receiver. `map as amap` is the array map used inside quoteFields.
-import { map as amap, map, filter } from "std/iter"
+// on a stream receiver. `map as amap` is the array map used inside quoteFields. `for` drives a
+// manifest/files Stream<Object>.
+import { map as amap, map, filter, for } from "std/iter"
 
 val inPath = "/tmp/lin_streams_example_in.csv"
 val outPath = "/tmp/lin_streams_example_out.csv"
@@ -43,3 +46,40 @@ val status = match result
   else => "ok"
 print("pipeline: ${status}")
 print(readFile(outPath))
+
+// ---------------------------------------------------------------------------------------------
+// std/archive — splitting a .tar.gz with constant memory.
+//
+// `sample.tar.gz` (committed beside this file) holds three small text members. We compose the
+// shipped streaming codec (`gunzip`) with the tar splitter:
+//   * `manifest()` lists the archive's contents WITHOUT extracting anything (bodies skipped).
+//   * `untar(body)` drives the whole archive, handing each member's bytes to `body` as a `data`
+//     sub-stream — here we stream each member straight to disk via the RAW `writeStream` sink
+//     (no newline corruption) and `.drain()` it, printing each member's name + size.
+//
+// Streams are affine (single-use), so we open the archive twice — once per pass.
+// ---------------------------------------------------------------------------------------------
+val archivePath = "examples/streams/sample.tar.gz"
+val outDir = "/tmp/lin_streams_archive_out"
+mkdir(outDir, { "parents": true })
+
+print("--- archive manifest ---")
+readStream(archivePath).gunzip().manifest().for((m) =>
+  print("  ${m["name"]} — ${toString(m["size"])} bytes")
+)
+
+print("--- extracting entries ---")
+val extract = readStream(archivePath).gunzip().untar((meta, data) =>
+  // Stream this member's bytes verbatim to its own file (the raw sink — binary-safe). The `data`
+  // sub-stream is valid only inside this callback (sync-only); drain it here.
+  val name = meta["name"]
+  data.writeStream("${outDir}/${name}").drain()
+  print("  extracted ${name} (${toString(meta["size"])} bytes)")
+)
+val extractStatus = match extract
+  is Error => "error: ${extract["message"]}"
+  else => "ok"
+print("untar: ${extractStatus}")
+// Show one extracted member to prove the bytes round-tripped through gunzip + untar + writeStream.
+print("readme.txt contents:")
+print(readFile("${outDir}/readme.txt"))

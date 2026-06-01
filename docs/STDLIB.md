@@ -27,6 +27,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/process`](#stdprocess) | Run and manage external processes |
 | [`std/stream`](#stdstream) | Lazy, fallible byte/value streams over OS resources |
 | [`std/compress`](#stdcompress) | Streaming gzip/DEFLATE byte-stream adapters |
+| [`std/archive`](#stdarchive) | Tar splitting over a byte stream (untar / manifest / files) |
 | [`std/tty`](#stdtty) | Raw terminal mode and key reads |
 | [`std/signal`](#stdsignal) | Blocking wait for OS signals |
 | [`std/async`](#stdasync) | Async, concurrency and workers |
@@ -3866,6 +3867,85 @@ val deflate: (Stream<UInt8[]>) -> Stream<UInt8[]>
 ```
 
 Compresses a byte stream as a **raw DEFLATE** bitstream (no gzip header/CRC).
+
+---
+
+## std/archive
+
+Tar splitting over a byte stream (`Stream<UInt8[]>`). A **tar** archive is a flat sequence of
+512-byte-aligned (header + body) records; these surfaces turn a byte stream into archive entries
+**without buffering the whole archive** — the parent stream is pulled one chunk at a time. A
+`.tar.gz` is just `gunzip()` (`std/compress`) composed with the tar splitter. **Only the tar format
+is supported** (zip is not).
+
+All three surfaces **consume** the parent stream (it is moved in); the source binding may not be used
+again after the call — the affine stream check rejects a reuse (re-open the source for a second pass).
+
+Each entry's **`meta`** object is pure JSON:
+
+```txt
+{ name: String, size: Int64, typeflag: String, isDir: Boolean }
+```
+
+where `typeflag` is the tar type byte as a one-character string (`"0"` = regular file, `"5"` =
+directory) and `isDir` is `true` iff `typeflag == "5"`.
+
+```txt
+import { readStream, drain, writeStream } from "std/stream"
+import { gunzip } from "std/compress"
+import { untar, manifest, files } from "std/archive"
+import { for } from "std/iter"
+
+// List a .tar.gz's contents without extracting anything:
+readStream("data.tar.gz").gunzip().manifest().for((m) => print(m["name"]))
+
+// Extract every member to disk in constant memory (each body streamed straight to its file):
+readStream("data.tar.gz").gunzip().untar((meta, data) =>
+  data.writeStream("out/${meta["name"]}").drain()
+)
+```
+
+### untar
+
+```txt
+val untar: (Stream<UInt8[]>, body: (Json, Stream<UInt8[]>) -> Json) -> Null | Error
+```
+
+The **terminal** driver: drives the whole archive on the calling thread, calling `body(meta, data)`
+once per entry, where `data` is a `Stream<UInt8[]>` **sub-stream** over that entry's body. The body's
+return value is ignored. Returns `Null` on a clean archive, or an `Error` if a read fault or a body
+fault occurs. This is the **constant-memory primitive** — an arbitrarily large member flows through
+its `data` sub-stream without ever being fully buffered.
+
+Whether the body **drains** `data` or **ignores** it, the driver always skips to the next entry
+correctly (an undrained body is skipped automatically).
+
+> **Sync-only sub-stream.** Inside the body, `data` is valid **only during the body's synchronous
+> execution** — the driver is paused while the body runs and resumes (advancing to the next entry)
+> the moment the body returns. `data` must therefore be consumed (drained / read) **inside the
+> callback**; it shares a cursor with the paused driver. Handing it to a worker via `.promise()`
+> would race that cursor and is **unsupported**. The ADR-075 stream placement restriction bounds
+> `data`'s lifetime to the callback (it cannot be stored in a field, `var`, or array); a dedicated
+> compile-time check specifically for `.promise()` on a sub-stream is a known gap.
+
+### manifest
+
+```txt
+val manifest: (Stream<UInt8[]>) -> Stream<Object>
+```
+
+An **adapter** yielding each entry's `meta` object, with its body **skipped** (a meta-only listing).
+Composes with `std/iter` (`filter`/`map`/`for`) like any other `Stream`. No sub-streams are minted.
+
+### files
+
+```txt
+val files: (Stream<UInt8[]>) -> Stream<Object>
+```
+
+An **adapter** yielding `{ name, data, size, typeflag, isDir }` per entry, where `data` is the
+entry's **full body buffered** into a `UInt8[]`. A convenience for normal-sized files; composes with
+`std/iter`. Because each body is buffered in memory, prefer `untar` for arbitrarily large entries.
 
 ---
 

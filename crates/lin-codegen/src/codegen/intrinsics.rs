@@ -610,6 +610,17 @@ impl<'ctx> Codegen<'ctx> {
                 let fnv = self.get_or_declare_fn("lin_stream_flatten", ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(fnv, &[s.into()], "ir_stream_flatten").try_as_basic_value().unwrap_basic()
             }
+            // manifest(stream)/files(stream): (stream) → Stream<Object>. Single-stream-arg adapters
+            // (the parent is moved in), modelled on flatten.
+            Intrinsic::StreamManifest | Intrinsic::StreamFiles => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let name = match intrinsic {
+                    Intrinsic::StreamManifest => "lin_stream_manifest",
+                    _ => "lin_stream_files",
+                };
+                let fnv = self.get_or_declare_fn(name, ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into()], "ir_stream_archive_adapt").try_as_basic_value().unwrap_basic()
+            }
             // Streaming compression byte-adapters (std/compress): (stream) → Stream. Each wraps an
             // upstream Stream<UInt8[]> in a (de)compressing adapter. Single-stream-arg shape,
             // modelled on flatten.
@@ -700,6 +711,18 @@ impl<'ctx> Codegen<'ctx> {
                 } else { func };
                 let fnv = self.get_or_declare_fn("lin_stream_for", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                 self.builder.call(fnv, &[s.into(), func.into()], "ir_stream_for").try_as_basic_value().unwrap_basic()
+            }
+            // untar(stream, body) → lin_stream_untar(stream, closure) → boxed Null | Error. A TERMINAL
+            // driver taking a 2-arg body (meta, data); the closure may arrive boxed, unbox it like for.
+            Intrinsic::StreamUntar => {
+                let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
+                let func_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
+                let func = if Self::is_union_type(&func_ty) && func.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[func.into()], "ir_untar_cls").try_as_basic_value().unwrap_basic()
+                } else { func };
+                let fnv = self.get_or_declare_fn("lin_stream_untar", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(fnv, &[s.into(), func.into()], "ir_stream_untar").try_as_basic_value().unwrap_basic()
             }
             // Stream terminals taking a single predicate/body closure: find/some/every/while →
             // (stream, closure) → boxed (X | Error). The closure may arrive boxed; unbox it.
