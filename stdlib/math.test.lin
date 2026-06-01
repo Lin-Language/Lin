@@ -2,188 +2,119 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { PI, E, INFINITY, NAN, floor, ceil, round, trunc, sqrt, pow, exp, log, log2, log10, sin, cos, tan, asin, acos, atan, atan2, abs, min, max, clamp, sign, isNaN, isFinite, random, toFixed } from "std/math"
 
 val s = suite("std/math", [
-  test("PI is approximately 3.14159", () => [
-    expect((PI * 100000.0).floor() / 100000.0).toBe(3.14159)
-  ]),
+  test(
+    "PI is approximately 3.14159",
+    () => [expect((PI * 100000.0).floor() / 100000.0).toBe(3.14159)]
+  ),
 
-  test("E is approximately 2.71828", () => [
-    expect((E * 100000.0).floor() / 100000.0).toBe(2.71828)
-  ]),
+  test(
+    "E is approximately 2.71828",
+    () => [expect((E * 100000.0).floor() / 100000.0).toBe(2.71828)]
+  ),
 
-  test("INFINITY is positive infinity", () => [
-    expect(INFINITY.isFinite()).toBe(false)
-  ]),
+  test(
+    "INFINITY is positive infinity",
+    () => [expect(INFINITY.isFinite()).toBe(false)]
+  ),
 
-  test("NAN is not a number", () => [
-    expect(NAN.isNaN()).toBe(true)
-  ]),
+  test("NAN is not a number", () => [expect(NAN.isNaN()).toBe(true)]),
 
-  test("floor rounds down", () => [
-    expect((3.7).floor()).toBe(3.0)
-  ]),
+  test("floor rounds down", () => [expect(3.7.floor()).toBe(3.0)]),
 
-  test("floor rounds down negative", () => [
-    expect((-3.2).floor()).toBe(-4.0)
-  ]),
+  test("floor rounds down negative", () => [expect(-3.2.floor()).toBe(-4.0)]),
 
-  test("ceil rounds up", () => [
-    expect((3.2).ceil()).toBe(4.0)
-  ]),
+  test("ceil rounds up", () => [expect(3.2.ceil()).toBe(4.0)]),
 
-  test("ceil rounds up negative", () => [
-    expect((-3.7).ceil()).toBe(-3.0)
-  ]),
+  test("ceil rounds up negative", () => [expect(-3.7.ceil()).toBe(-3.0)]),
 
-  test("round rounds to nearest", () => [
-    expect((3.5).round()).toBe(4.0)
-  ]),
+  test("round rounds to nearest", () => [expect(3.5.round()).toBe(4.0)]),
 
-  test("round rounds down when below 0.5", () => [
-    expect((3.4).round()).toBe(3.0)
-  ]),
+  test("round rounds down when below 0.5", () => [expect(3.4.round()).toBe(3.0)]),
 
-  test("trunc truncates toward zero", () => [
-    expect((3.9).trunc()).toBe(3.0)
-  ]),
+  test("trunc truncates toward zero", () => [expect(3.9.trunc()).toBe(3.0)]),
 
-  test("trunc truncates negative toward zero", () => [
-    expect((-3.9).trunc()).toBe(-3.0)
-  ]),
+  test(
+    "trunc truncates negative toward zero",
+    () => [expect(-3.9.trunc()).toBe(-3.0)]
+  ),
 
-  test("sqrt of 4 is 2", () => [
-    expect((4.0).sqrt()).toBe(2.0)
-  ]),
+  test("sqrt of 4 is 2", () => [expect(4.0.sqrt()).toBe(2.0)]),
 
-  test("sqrt of 9 is 3", () => [
-    expect((9.0).sqrt()).toBe(3.0)
-  ]),
+  test("sqrt of 9 is 3", () => [expect(9.0.sqrt()).toBe(3.0)]),
 
-  test("pow 2 to the 10", () => [
-    expect((2.0).pow(10.0)).toBe(1024.0)
-  ]),
+  test("pow 2 to the 10", () => [expect(2.0.pow(10.0)).toBe(1024.0)]),
 
-  test("pow 3 squared is 9", () => [
-    expect((3.0).pow(2.0)).toBe(9.0)
-  ]),
+  test("pow 3 squared is 9", () => [expect(3.0.pow(2.0)).toBe(9.0)]),
 
-  test("log of e is 1", () => [
-    expect(E.log().round()).toBe(1.0)
-  ]),
+  test("log of e is 1", () => [expect(E.log().round()).toBe(1.0)]),
 
-  test("log2 of 8 is 3", () => [
-    expect((8.0).log2()).toBe(3.0)
-  ]),
+  test("log2 of 8 is 3", () => [expect(8.0.log2()).toBe(3.0)]),
 
-  test("log10 of 1000 is 3", () => [
-    expect((1000.0).log10()).toBe(3.0)
-  ]),
+  test("log10 of 1000 is 3", () => [expect(1000.0.log10()).toBe(3.0)]),
 
-  test("sin of 0 is 0", () => [
-    expect((0.0).sin()).toBe(0.0)
-  ]),
+  test("sin of 0 is 0", () => [expect(0.0.sin()).toBe(0.0)]),
 
-  test("cos of 0 is 1", () => [
-    expect((0.0).cos()).toBe(1.0)
-  ]),
+  test("cos of 0 is 1", () => [expect(0.0.cos()).toBe(1.0)]),
 
-  test("tan of 0 is 0", () => [
-    expect((0.0).tan()).toBe(0.0)
-  ]),
+  test("tan of 0 is 0", () => [expect(0.0.tan()).toBe(0.0)]),
 
-  test("asin of 0 is 0", () => [
-    expect((0.0).asin()).toBe(0.0)
-  ]),
+  test("asin of 0 is 0", () => [expect(0.0.asin()).toBe(0.0)]),
 
-  test("acos of 1 is 0", () => [
-    expect((1.0).acos()).toBe(0.0)
-  ]),
+  test("acos of 1 is 0", () => [expect(1.0.acos()).toBe(0.0)]),
 
-  test("atan of 0 is 0", () => [
-    expect((0.0).atan()).toBe(0.0)
-  ]),
+  test("atan of 0 is 0", () => [expect(0.0.atan()).toBe(0.0)]),
 
-  test("atan2 of (0, 1) is 0", () => [
-    expect((0.0).atan2(1.0)).toBe(0.0)
-  ]),
+  test("atan2 of (0, 1) is 0", () => [expect(0.0.atan2(1.0)).toBe(0.0)]),
 
-  test("abs of -5 is 5", () => [
-    expect((-5.0).abs()).toBe(5.0)
-  ]),
+  test("abs of -5 is 5", () => [expect(-5.0.abs()).toBe(5.0)]),
 
-  test("abs of 5 is 5", () => [
-    expect((5.0).abs()).toBe(5.0)
-  ]),
+  test("abs of 5 is 5", () => [expect(5.0.abs()).toBe(5.0)]),
 
-  test("min of 3 and 5 is 3", () => [
-    expect((3.0).min(5.0)).toBe(3.0)
-  ]),
+  test("min of 3 and 5 is 3", () => [expect(3.0.min(5.0)).toBe(3.0)]),
 
-  test("min of 5 and 3 is 3", () => [
-    expect((5.0).min(3.0)).toBe(3.0)
-  ]),
+  test("min of 5 and 3 is 3", () => [expect(5.0.min(3.0)).toBe(3.0)]),
 
-  test("max of 3 and 5 is 5", () => [
-    expect((3.0).max(5.0)).toBe(5.0)
-  ]),
+  test("max of 3 and 5 is 5", () => [expect(3.0.max(5.0)).toBe(5.0)]),
 
-  test("max of 5 and 3 is 5", () => [
-    expect((5.0).max(3.0)).toBe(5.0)
-  ]),
+  test("max of 5 and 3 is 5", () => [expect(5.0.max(3.0)).toBe(5.0)]),
 
-  test("clamp in range returns value", () => [
-    expect((5.0).clamp(1.0, 10.0)).toBe(5.0)
-  ]),
+  test("clamp in range returns value", () => [expect(5.0.clamp(1.0, 10.0)).toBe(5.0)]),
 
-  test("clamp below lo returns lo", () => [
-    expect((-5.0).clamp(1.0, 10.0)).toBe(1.0)
-  ]),
+  test("clamp below lo returns lo", () => [expect(-5.0.clamp(1.0, 10.0)).toBe(1.0)]),
 
-  test("clamp above hi returns hi", () => [
-    expect((15.0).clamp(1.0, 10.0)).toBe(10.0)
-  ]),
+  test("clamp above hi returns hi", () => [expect(15.0.clamp(1.0, 10.0)).toBe(10.0)]),
 
-  test("sign of positive is 1", () => [
-    expect((5.0).sign()).toBe(1)
-  ]),
+  test("sign of positive is 1", () => [expect(5.0.sign()).toBe(1)]),
 
-  test("sign of negative is -1", () => [
-    expect((-5.0).sign()).toBe(-1)
-  ]),
+  test("sign of negative is -1", () => [expect(-5.0.sign()).toBe(-1)]),
 
-  test("sign of zero is 0", () => [
-    expect((0.0).sign()).toBe(0)
-  ]),
+  test("sign of zero is 0", () => [expect(0.0.sign()).toBe(0)]),
 
-  test("isNaN of NAN is true", () => [
-    expect(NAN.isNaN()).toBe(true)
-  ]),
+  test("isNaN of NAN is true", () => [expect(NAN.isNaN()).toBe(true)]),
 
-  test("isNaN of 1.0 is false", () => [
-    expect((1.0).isNaN()).toBe(false)
-  ]),
+  test("isNaN of 1.0 is false", () => [expect(1.0.isNaN()).toBe(false)]),
 
-  test("isFinite of 1.0 is true", () => [
-    expect((1.0).isFinite()).toBe(true)
-  ]),
+  test("isFinite of 1.0 is true", () => [expect(1.0.isFinite()).toBe(true)]),
 
-  test("isFinite of INFINITY is false", () => [
-    expect(INFINITY.isFinite()).toBe(false)
-  ]),
+  test(
+    "isFinite of INFINITY is false",
+    () => [expect(INFINITY.isFinite()).toBe(false)]
+  ),
 
   test("random returns value in [0, 1)", () =>
     val r = random()
-    [
-      expect(r >= 0.0 && r < 1.0).toBe(true)
-    ]
+    [expect(r >= 0.0 && r < 1.0).toBe(true)]
   ),
 
-  test("toFixed formats to 2 decimal places", () => [
-    expect((3.14159).toFixed(2)).toBe("3.14")
-  ]),
+  test(
+    "toFixed formats to 2 decimal places",
+    () => [expect(3.14159.toFixed(2)).toBe("3.14")]
+  ),
 
-  test("toFixed formats to 0 decimal places", () => [
-    expect((3.7).toFixed(0)).toBe("4")
-  ]),
+  test(
+    "toFixed formats to 0 decimal places",
+    () => [expect(3.7.toFixed(0)).toBe("4")]
+  )
 ])
 
 run(s)

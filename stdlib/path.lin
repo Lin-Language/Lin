@@ -34,16 +34,15 @@ export val resolve = (p: String): String =>
 
 export val join = (parts: String[]): String =>
   val n = lin_length(parts)
-  if n == 0 then ""
+  if n == 0 then
+    ""
   else
     var result = parts[0]
-    range(1, n).for(i =>
-      result = lin_path_join2(result, parts[i])
-    )
+    range(1, n).for((i) => result = lin_path_join2(result, parts[i]))
     normalize(result)
 
 export val split = (p: String): String[] =>
   lin_string_split(p, "/")
 
-export val relative = (from: String, to: String): String =>
+export val relative = (_: String, to: String): String =>
   to

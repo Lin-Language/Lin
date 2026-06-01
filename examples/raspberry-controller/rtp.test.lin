@@ -10,7 +10,6 @@ import { concat } from "std/iter"
 //
 // SSRC 0x12345678 -> big-endian bytes 0x12 0x34 0x56 0x78 = 18 52 86 120.
 // PAYLOAD_TYPE = 96; with marker, byte 1 = 0x80 | 96 = 224.
-
 // Build a NAL longer than MAX_RTP_PAYLOAD by doubling a seed with concat. It
 // overshoots `n`; the FU-A test only needs "> MAX_RTP_PAYLOAD", not an exact size.
 val doubleUp = (b: UInt8[], n: Int32): UInt8[] =>
@@ -18,8 +17,10 @@ val doubleUp = (b: UInt8[], n: Int32): UInt8[] =>
 
 // `grow` produces an EXACT length via slice (used where an exact size matters).
 val grow = (b: UInt8[], n: Int32): UInt8[] =>
-  if length(b) >= n then slice(b, 0, n)
-  else grow(concat(b, b), n)
+  if length(b) >= n then
+    slice(b, 0, n)
+  else
+    grow(concat(b, b), n)
 
 val s = suite("raspberry-rtp", [
   // single_nal_small_packet: header bytes, SSRC at [8..12], payload verbatim.
@@ -29,14 +30,19 @@ val s = suite("raspberry-rtp", [
     val pkt: UInt8[] = packets[0]
     val checks = [
       expect(length(packets)).toBe(1),
-      expect(pkt[0]).toBe(0x80),                 // V=2
-      expect(pkt[1]).toBe(0xE0),                 // 0x80 | 96 (marker set)
-      expect(pkt[8]).toBe(0x12),                 // SSRC big-endian
+      expect(pkt[0]).toBe(0x80),
+      // V=2
+      expect(pkt[1]).toBe(0xE0),
+      // 0x80 | 96 (marker set)
+      expect(pkt[8]).toBe(0x12),
+      // SSRC big-endian
       expect(pkt[9]).toBe(0x34),
       expect(pkt[10]).toBe(0x56),
       expect(pkt[11]).toBe(0x78),
-      expect(length(pkt)).toBe(16),              // 12-byte header + 4-byte NAL
-      expect(pkt[12]).toBe(0x67),                // payload = NAL verbatim
+      expect(length(pkt)).toBe(16),
+      // 12-byte header + 4-byte NAL
+      expect(pkt[12]).toBe(0x67),
+      // payload = NAL verbatim
       expect(pkt[15]).toBe(0x03)
     ]
     checks
@@ -47,10 +53,8 @@ val s = suite("raspberry-rtp", [
     val nal: UInt8[] = [0x67, 0xAA]
     val packets = packetize(0, 0, 1, nal, false)
     val pkt: UInt8[] = packets[0]
-    val checks = [
-      expect(length(packets)).toBe(1),
-      expect(pkt[1]).toBe(96)                    // PAYLOAD_TYPE, no marker
-    ]
+    val checks = [expect(length(packets)).toBe(1), expect(pkt[1]).toBe(96)]
+    // PAYLOAD_TYPE, no marker
     checks
   ),
 
@@ -58,13 +62,16 @@ val s = suite("raspberry-rtp", [
   test("sequence_increments across packetize calls", () =>
     val nal: UInt8[] = [0x67, 0x01]
     val p1: UInt8[] = packetize(0, 0, 1, nal, false)[0]
-    val seq1 = nextSequence(0, nal)              // -> 1
+    val seq1 = nextSequence(0, nal) // -> 1
     val p2: UInt8[] = packetize(seq1, 0, 1, nal, false)[0]
     val checks = [
-      expect(p1[2]).toBe(0),                     // seq high byte
-      expect(p1[3]).toBe(0),                     // seq low byte = 0
+      expect(p1[2]).toBe(0),
+      // seq high byte
+      expect(p1[3]).toBe(0),
+      // seq low byte = 0
       expect(p2[2]).toBe(0),
-      expect(p2[3]).toBe(1),                     // seq = 1
+      expect(p2[3]).toBe(1),
+      // seq = 1
       expect(seq1).toBe(1)
     ]
     checks
@@ -79,9 +86,11 @@ val s = suite("raspberry-rtp", [
     val p2: UInt8[] = packetize(0, ts2, 1, nal, false)[0]
     val checks = [
       expect(p1[4]).toBe(0),
-      expect(p1[7]).toBe(0),                     // ts1 = 0
+      expect(p1[7]).toBe(0),
+      // ts1 = 0
       expect(p2[6]).toBe(0x0B),
-      expect(p2[7]).toBe(0xB8),                  // ts2 = 3000
+      expect(p2[7]).toBe(0xB8),
+      // ts2 = 3000
       expect(ts2).toBe(TIMESTAMP_INCREMENT)
     ]
     checks
@@ -91,23 +100,41 @@ val s = suite("raspberry-rtp", [
   // packets; first has start bit + FU type 28 + no marker; last has end bit +
   // marker; the original NAL type (0x65 & 0x1F = 5) is preserved in the FU header.
   test("fu_a_fragmentation: multi-packet with FU-A headers", () =>
-    val seed: UInt8[] = [0x65, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11]
-    val nal = doubleUp(seed, MAX_RTP_PAYLOAD + 100)  // IDR header (0x65) + big body
+    val seed: UInt8[] = [
+      0x65,
+      0xAA,
+      0xBB,
+      0xCC,
+      0xDD,
+      0xEE,
+      0xFF,
+      0x11
+    ]
+    val nal = doubleUp(seed, MAX_RTP_PAYLOAD + 100) // IDR header (0x65) + big body
     val packets = packetize(0, 0, 1, nal, true)
     val first: UInt8[] = packets[0]
     val last: UInt8[] = packets[length(packets) - 1]
     val checks = [
       expect(length(packets) >= 2).toBe(true),
-      expect(first[0]).toBe(0x80),               // V=2
-      expect(first[1]).toBe(96),                 // no marker on first fragment
-      expect(first[12] & 0x1F).toBe(28),         // FU-A type
-      expect((first[13] & 0x80) != 0).toBe(true),// start bit set
-      expect((first[13] & 0x40) == 0).toBe(true),// end bit clear
-      expect(first[13] & 0x1F).toBe(5),          // original NAL type (0x65 & 0x1F)
-      expect(last[1]).toBe(0xE0),                // marker set on last fragment
-      expect((last[13] & 0x80) == 0).toBe(true), // start bit clear
-      expect((last[13] & 0x40) != 0).toBe(true)  // end bit set
+      expect(first[0]).toBe(0x80),
+      // V=2
+      expect(first[1]).toBe(96),
+      // no marker on first fragment
+      expect(first[12] & 0x1F).toBe(28),
+      // FU-A type
+      expect((first[13] & 0x80) != 0).toBe(true),
+      // start bit set
+      expect((first[13] & 0x40) == 0).toBe(true),
+      // end bit clear
+      expect(first[13] & 0x1F).toBe(5),
+      // original NAL type (0x65 & 0x1F)
+      expect(last[1]).toBe(0xE0),
+      // marker set on last fragment
+      expect((last[13] & 0x80) == 0).toBe(true),
+      // start bit clear
+      expect((last[13] & 0x40) != 0).toBe(true)
     ]
+    // end bit set
     checks
   ),
 
@@ -118,10 +145,13 @@ val s = suite("raspberry-rtp", [
     val overMax = grow(seed, MAX_RTP_PAYLOAD + 1)
     val empty: UInt8[] = []
     val checks = [
-      expect(packetCount(atMax)).toBe(1),        // fits in one packet
-      expect(packetCount(overMax)).toBe(2),      // fragments into two
-      expect(packetCount(empty)).toBe(0)         // empty NAL -> no packets
+      expect(packetCount(atMax)).toBe(1),
+      // fits in one packet
+      expect(packetCount(overMax)).toBe(2),
+      // fragments into two
+      expect(packetCount(empty)).toBe(0)
     ]
+    // empty NAL -> no packets
     checks
   ),
 
@@ -129,9 +159,9 @@ val s = suite("raspberry-rtp", [
   test("empty_nal produces no packets", () =>
     val empty: UInt8[] = []
     val packets = packetize(0, 0, 1, empty, false)
-    val checks = [ expect(length(packets)).toBe(0) ]
+    val checks = [expect(length(packets)).toBe(0)]
     checks
-  ),
+  )
 ])
 
 run(s)

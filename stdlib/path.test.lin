@@ -2,103 +2,117 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { basename, dirname, extname, stem, isAbsolute, normalize, join, split } from "std/path"
 
 val s = suite("std/path", [
-  test("basename returns filename from absolute path", () => [
-    expect("/foo/bar.txt".basename()).toBe("bar.txt")
-  ]),
+  test(
+    "basename returns filename from absolute path",
+    () => [expect("/foo/bar.txt".basename()).toBe("bar.txt")]
+  ),
 
-  test("basename returns filename from relative path", () => [
-    expect("a/b/c.lin".basename()).toBe("c.lin")
-  ]),
+  test(
+    "basename returns filename from relative path",
+    () => [expect("a/b/c.lin".basename()).toBe("c.lin")]
+  ),
 
-  test("basename returns name when no directory component", () => [
-    expect("file.txt".basename()).toBe("file.txt")
-  ]),
+  test(
+    "basename returns name when no directory component",
+    () => [expect("file.txt".basename()).toBe("file.txt")]
+  ),
 
-  test("dirname returns parent directory of absolute path", () => [
-    expect("/foo/bar.txt".dirname()).toBe("/foo")
-  ]),
+  test(
+    "dirname returns parent directory of absolute path",
+    () => [expect("/foo/bar.txt".dirname()).toBe("/foo")]
+  ),
 
-  test("dirname returns parent directory of nested path", () => [
-    expect("a/b/c".dirname()).toBe("a/b")
-  ]),
+  test(
+    "dirname returns parent directory of nested path",
+    () => [expect("a/b/c".dirname()).toBe("a/b")]
+  ),
 
-  test("dirname returns dot for bare filename", () => [
-    expect("file.txt".dirname()).toBe(".")
-  ]),
+  test(
+    "dirname returns dot for bare filename",
+    () => [expect("file.txt".dirname()).toBe(".")]
+  ),
 
-  test("extname returns extension with dot", () => [
-    expect("file.txt".extname()).toBe(".txt")
-  ]),
+  test(
+    "extname returns extension with dot",
+    () => [expect("file.txt".extname()).toBe(".txt")]
+  ),
 
-  test("extname returns extension for dotfile", () => [
-    expect("archive.tar.gz".extname()).toBe(".gz")
-  ]),
+  test(
+    "extname returns extension for dotfile",
+    () => [expect("archive.tar.gz".extname()).toBe(".gz")]
+  ),
 
-  test("extname returns empty string when no extension", () => [
-    expect("Makefile".extname()).toBe("")
-  ]),
+  test(
+    "extname returns empty string when no extension",
+    () => [expect("Makefile".extname()).toBe("")]
+  ),
 
-  test("stem returns filename without extension", () => [
-    expect("file.txt".stem()).toBe("file")
-  ]),
+  test(
+    "stem returns filename without extension",
+    () => [expect("file.txt".stem()).toBe("file")]
+  ),
 
-  test("stem returns full name when no extension", () => [
-    expect("Makefile".stem()).toBe("Makefile")
-  ]),
+  test(
+    "stem returns full name when no extension",
+    () => [expect("Makefile".stem()).toBe("Makefile")]
+  ),
 
-  test("isAbsolute returns true for absolute path", () => [
-    expect("/foo/bar".isAbsolute()).toBe(true)
-  ]),
+  test(
+    "isAbsolute returns true for absolute path",
+    () => [expect("/foo/bar".isAbsolute()).toBe(true)]
+  ),
 
-  test("isAbsolute returns false for relative path", () => [
-    expect("foo/bar".isAbsolute()).toBe(false)
-  ]),
+  test(
+    "isAbsolute returns false for relative path",
+    () => [expect("foo/bar".isAbsolute()).toBe(false)]
+  ),
 
-  test("isAbsolute returns false for bare filename", () => [
-    expect("file.txt".isAbsolute()).toBe(false)
-  ]),
+  test(
+    "isAbsolute returns false for bare filename",
+    () => [expect("file.txt".isAbsolute()).toBe(false)]
+  ),
 
-  test("normalize resolves double dot", () => [
-    expect("/foo/../bar".normalize()).toBe("/bar")
-  ]),
+  test(
+    "normalize resolves double dot",
+    () => [expect("/foo/../bar".normalize()).toBe("/bar")]
+  ),
 
-  test("normalize resolves single dot", () => [
-    expect("/foo/./bar".normalize()).toBe("/foo/bar")
-  ]),
+  test(
+    "normalize resolves single dot",
+    () => [expect("/foo/./bar".normalize()).toBe("/foo/bar")]
+  ),
 
-  test("normalize collapses double slashes", () => [
-    expect("a//b".normalize()).toBe("a/b")
-  ]),
+  test(
+    "normalize collapses double slashes",
+    () => [expect("a//b".normalize()).toBe("a/b")]
+  ),
 
-  test("normalize returns dot for empty relative result", () => [
-    expect("a/..".normalize()).toBe(".")
-  ]),
+  test(
+    "normalize returns dot for empty relative result",
+    () => [expect("a/..".normalize()).toBe(".")]
+  ),
 
-  test("join joins array of path segments", () => [
-    expect(["a", "b", "c"].join()).toBe("a/b/c")
-  ]),
+  test(
+    "join joins array of path segments",
+    () => [expect(["a", "b", "c"].join()).toBe("a/b/c")]
+  ),
 
-  test("join returns empty string for empty array", () => [
-    expect([].join()).toBe("")
-  ]),
+  test(
+    "join returns empty string for empty array",
+    () => [expect([].join()).toBe("")]
+  ),
 
-  test("join handles single segment", () => [
-    expect(["foo"].join()).toBe("foo")
-  ]),
+  test("join handles single segment", () => [expect(["foo"].join()).toBe("foo")]),
 
   test("split splits path on slash", () =>
     val parts = "a/b/c".split()
-    [
-      expect(parts[1]).toBe("b")
-    ]
+    [expect(parts[1]).toBe("b")]
   ),
 
   test("split returns array with one element for bare name", () =>
     val parts = "file.txt".split()
-    [
-      expect(parts[0]).toBe("file.txt")
-    ]
-  ),
+    [expect(parts[0]).toBe("file.txt")]
+  )
 ])
 
 run(s)

@@ -7,7 +7,11 @@ import { isOk } from "./result"
 // FIRST failing field short-circuits the chain.
 val s = suite("result integration", [
   test("a fully valid form decodes to a Registration", () =>
-    val r = validateForm({ "name": "Ada", "email": "ada@example.com", "age": "36" })
+    val r = validateForm({
+      "name": "Ada",
+      "email": "ada@example.com",
+      "age": "36"
+    })
     [
       expect(isOk(r)).toBe(true),
       expect(r["value"]["name"]).toBe("Ada"),
@@ -15,14 +19,20 @@ val s = suite("result integration", [
       expect(r["value"]["age"]).toBe(36)
     ]
   ),
+
   test("an empty name fails first (before email/age)", () => [
     expect(validateForm({ "name": "", "email": "bad", "age": "999" })["error"]).toBe("name must not be empty")
-  ]),
+  ]
+  ),
+
   test("a valid name but bad email fails at email", () => [
     expect(validateForm({ "name": "Bo", "email": "nope", "age": "999" })["error"]).toBe("invalid email: nope")
-  ]),
+  ]
+  ),
+
   test("name+email valid but bad age fails at age", () => [
     expect(isOk(validateForm({ "name": "Cleo", "email": "c@x.io", "age": "999" }))).toBe(false)
-  ]),
+  ]
+  )
 ])
 run(s)

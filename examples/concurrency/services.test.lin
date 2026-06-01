@@ -1,41 +1,41 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import {
-  poolSum, accumulate, workerFaults, sharedCounter, sharedSnapshot, frozenLookup
-} from "./services"
+import { poolSum, accumulate, workerFaults, sharedCounter, sharedSnapshot, frozenLookup } from "./services"
 
 val s = suite("concurrency/services", [
-  test("ThreadPool runs all queued tasks (bounded concurrency)", () => [
-    expect(poolSum(3, 12)).toBe(12)
-  ]),
+  test(
+    "ThreadPool runs all queued tasks (bounded concurrency)",
+    () => [expect(poolSum(3, 12)).toBe(12)]
+  ),
 
-  test("ThreadPool with a single worker still completes every task", () => [
-    expect(poolSum(1, 8)).toBe(8)
-  ]),
+  test(
+    "ThreadPool with a single worker still completes every task",
+    () => [expect(poolSum(1, 8)).toBe(8)]
+  ),
 
-  test("Worker accumulates confined state across requests", () => [
-    expect(accumulate([10, 5, 100])).toBe(115)
-  ]),
+  test(
+    "Worker accumulates confined state across requests",
+    () => [expect(accumulate([10, 5, 100])).toBe(115)]
+  ),
 
-  test("Worker handler fault is isolated as an Error reply", () => [
-    expect(workerFaults()).toBe(true)
-  ]),
+  test(
+    "Worker handler fault is isolated as an Error reply",
+    () => [expect(workerFaults()).toBe(true)]
+  ),
 
-  test("Shared withLock: concurrent pushes lose no updates", () => [
-    expect(sharedCounter()).toBe(5)
-  ]),
+  test(
+    "Shared withLock: concurrent pushes lose no updates",
+    () => [expect(sharedCounter()).toBe(5)]
+  ),
 
   test("Shared get() is an independent snapshot, not a live view", () =>
     val snap = sharedSnapshot()
-    [
-      expect(snap[0]).toBe(1),
-      expect(snap[1]).toBe(2),
-      expect(snap[2]).toBe(3)
-    ]
+    [expect(snap[0]).toBe(1), expect(snap[1]).toBe(2), expect(snap[2]).toBe(3)]
   ),
 
-  test("Frozen table read in parallel sees the same data on every thread", () => [
-    expect(frozenLookup()).toBe(100)
-  ]),
+  test(
+    "Frozen table read in parallel sees the same data on every thread",
+    () => [expect(frozenLookup()).toBe(100)]
+  )
 ])
 
 run(s)

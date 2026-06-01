@@ -13,14 +13,14 @@ import { for, range } from "std/iter"
 // the worker thread, and replies with the new total.
 var total = 0
 val acc = worker(
-  n =>
+  (n) =>
     total = total + n
     total,
   () => null
 )
 
 var last = 0
-range(0, 50000).for(i => last = request(acc, 1))
+range(0, 50000).for((i) => last = request(acc, 1))
 close(acc)
 
 // `last` is the final running total = number of requests.

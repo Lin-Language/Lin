@@ -15,22 +15,31 @@ import { for } from "std/iter"
 // start/2 never overflow Int32); only `steps` accumulates into Int64. The
 // `steps + s2` site widens the Int32 `start` into the Int64 accumulator.
 val walk = (start: Int32, n: Int32, steps: Int64): Int64 =>
-  if n == 0 then steps
+  if n == 0 then
+    steps
   else
-    val next =
-      if start == 1 then 27
-      else if start - (start / 2) * 2 == 0 then start / 2
-      else 3 * start + 1
+    val next = if start == 1 then
+      27
+    else if start - start / 2 * 2 == 0 then
+      start / 2
+    else
+      3 * start + 1
     val s2: Int64 = start
     walk(next, n - 1, steps + s2)
 
 val chunk = (): Int64 => walk(27, 300000000, 0i64)
 
 val results = parallel([
-  () => chunk(), () => chunk(), () => chunk(), () => chunk(),
-  () => chunk(), () => chunk(), () => chunk(), () => chunk()
+  () => chunk(),
+  () => chunk(),
+  () => chunk(),
+  () => chunk(),
+  () => chunk(),
+  () => chunk(),
+  () => chunk(),
+  () => chunk()
 ])
 
 var sum = 0i64
-results.for(v => sum = sum + v)
+results.for((v) => sum = sum + v)
 print("RESULT=${toString(sum)}")

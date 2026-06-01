@@ -13,10 +13,7 @@ val s = suite("std/yaml", [
 
   test("parses a map", () =>
     val m = parse("name: Bob\nage: 30\n")
-    [
-      expect(m["name"]).toBe("Bob"),
-      expect(m["age"]).toBe(30)
-    ]
+    [expect(m["name"]).toBe("Bob"), expect(m["age"]).toBe(30)]
   ),
 
   test("parses a sequence", () =>
@@ -61,11 +58,8 @@ val s = suite("std/yaml", [
 
   test("parse error returns an Error value", () =>
     val bad = parse("key: : :\n  - [unbalanced\n")
-    [
-      expect(bad is Error).toBe(true),
-      expect(bad["type"]).toBe("error")
-    ]
-  ),
+    [expect(bad is Error).toBe(true), expect(bad["type"]).toBe("error")]
+  )
 ])
 
 run(s)
