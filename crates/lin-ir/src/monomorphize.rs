@@ -1158,7 +1158,13 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
     // Handle a call to a generic function (directly by name, or through a `val f = id` alias).
     if let TypedExpr::Call { func, args, result_type, span, .. } = expr {
         if let TypedExpr::LocalGet { .. } = func.as_ref() {
-            let generic_slot = callee_generic_slot;
+            // STREAM RECEIVER: a generic combinator (`map`/`filter`/`reduce`/`while`) called with a
+            // DEFINITELY-stream arg0 must NOT be native-specialized to its eager array body. Leave
+            // the call as a plain Named import call so the IR lowerer (`lower_call`) redirects it to
+            // the lazy `lin_stream_*` backend (mirrors the inline-bail above). Skipping the generic
+            // path keeps the original import-binding `func` slot intact for that redirect.
+            let arg0_is_stream = args.first().map(|a| matches!(a.ty(), Type::Stream(_))).unwrap_or(false);
+            let generic_slot = if arg0_is_stream { None } else { callee_generic_slot };
             if let Some(gslot) = generic_slot {
                 let g = &state.generics[&gslot];
                 if let TypedExpr::Function { params, ret_type, .. } = &g.func {
@@ -1313,6 +1319,12 @@ fn try_inline_combinator_wrapper(
     };
 
     let TypedExpr::Call { args, .. } = expr else { return false };
+    // A STREAM receiver (arg0) must NOT inline to `lin_map`/… (the eager array loop). Stream
+    // combinator dispatch happens at the call site (`lower_call`), redirecting to the lazy
+    // `lin_stream_*` backend. Bail so the call stays a Named import call the lowerer intercepts.
+    if args.first().map(|a| matches!(a.ty(), Type::Stream(_))).unwrap_or(false) {
+        return false;
+    }
     // Exactly one capture-less literal-lambda argument qualifies.
     let mut lambda_args = 0;
     for a in args.iter() {

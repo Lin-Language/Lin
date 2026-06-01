@@ -19,30 +19,29 @@ Stream. This table tracks the stream backend status per fn. Update as Stages 3-4
 
 | fn         | kind            | Array/Iter (eager) | Stream backend          | status        |
 |------------|-----------------|--------------------|-------------------------|---------------|
-| for        | terminal        | ✅ Null             | ✅ StreamFor (Null|Error)| DONE (Stage 5 pre-existing) |
-| map        | lazy adapter    | ✅ U[]              | StreamMap (Stream<U>)   | TYPED (S2, intrinsic); backend lazy-pending (S3) |
-| filter     | lazy adapter    | ✅ T[]              | StreamFilter            | TYPED (S2, intrinsic); backend lazy-pending (S3) |
-| take       | lazy adapter    | ✅ T[]              | StreamTake              | lazy-pending (PURE-LIN; needs S3 backend) |
-| drop       | lazy adapter    | ✅ T[]              | StreamDrop (NEW)        | lazy-pending (PURE-LIN; needs S3 backend) |
-| flatMap    | lazy adapter    | ✅ U[]              | StreamFlatMap (NEW)     | lazy-pending (PURE-LIN; needs S3 backend) |
-| takeWhile  | lazy adapter    | ✅ T[]              | StreamTakeWhile (NEW)   | lazy-pending (PURE-LIN; needs S3 backend) |
-| dropWhile  | lazy adapter    | ✅ T[]              | StreamDropWhile (NEW)   | lazy-pending (PURE-LIN; needs S3 backend) |
-| flatten    | lazy adapter    | ✅ flat             | StreamFlatten (NEW)     | lazy-pending (PURE-LIN; needs S3 backend) |
-| concat     | lazy adapter    | ✅ array            | StreamConcat (NEW)      | lazy-pending (PURE-LIN; needs S3 backend) |
-| reduce     | terminal        | ✅ U                | StreamReduce (NEW, U|Error) | TYPED (S2, intrinsic, U|Error); backend lazy-pending (S3) |
-| while      | terminal-ish    | ✅ Null             | StreamWhile (NEW)       | TYPED (S2, intrinsic, Null|Error); backend lazy-pending (S3) |
-| find       | terminal        | ✅ T|Null           | StreamFind (NEW, T|Null|Error) | lazy-pending (PURE-LIN; needs S3 backend) |
-| some       | terminal        | ✅ Boolean          | StreamSome (NEW, Boolean|Error) | lazy-pending (PURE-LIN; needs S3 backend) |
-| every      | terminal        | ✅ Boolean          | StreamEvery (NEW, Boolean|Error) | lazy-pending (PURE-LIN; needs S3 backend) |
+| for        | terminal        | ✅ Null             | ✅ StreamFor (Null|Error)| DONE (Stage 5 pre-existing; now the SINGLE `for` — removed from std/stream) |
+| map        | lazy adapter    | ✅ U[]              | ✅ Intrinsic::StreamMap (`lin_stream_map`) | DONE (S3) |
+| filter     | lazy adapter    | ✅ T[]              | ✅ Intrinsic::StreamFilter (`lin_stream_filter`) | DONE (S3) |
+| take       | lazy adapter    | ✅ T[]              | ✅ Intrinsic::StreamTake (`lin_stream_take`) | DONE (S3) |
+| drop       | lazy adapter    | ✅ T[]              | ✅ Intrinsic::StreamDrop (`lin_stream_drop`) | DONE (S3) |
+| flatMap    | lazy adapter    | ✅ U[]              | ✅ Intrinsic::StreamFlatMap (`lin_stream_flat_map`) | DONE (S3) |
+| takeWhile  | lazy adapter    | ✅ T[]              | ✅ Intrinsic::StreamTakeWhile (`lin_stream_take_while`) | DONE (S3) |
+| dropWhile  | lazy adapter    | ✅ T[]              | ✅ Intrinsic::StreamDropWhile (`lin_stream_drop_while`) | DONE (S3) |
+| flatten    | lazy adapter    | ✅ flat             | ✅ Intrinsic::StreamFlatten (`lin_stream_flatten`) | DONE (S3) |
+| concat     | lazy adapter    | ✅ array            | ✅ Intrinsic::StreamConcat (`lin_stream_concat`, TWO streams) | DONE (S3) |
+| reduce     | terminal        | ✅ U                | ✅ Intrinsic::StreamReduce (`lin_stream_reduce`, U|Error) | DONE (S4) |
+| while      | terminal-ish    | ✅ Null             | ✅ Intrinsic::StreamWhile (`lin_stream_while`, Null|Error) | DONE (S4) |
+| find       | terminal        | ✅ T|Null           | ✅ Intrinsic::StreamFind (`lin_stream_find`, T|Null|Error) | DONE (S4) |
+| some       | terminal        | ✅ Boolean          | ✅ Intrinsic::StreamSome (`lin_stream_some`, Boolean|Error) | DONE (S4) |
+| every      | terminal        | ✅ Boolean          | ✅ Intrinsic::StreamEvery (`lin_stream_every`, Boolean|Error) | DONE (S4) |
 | range      | constructor     | ✅ Iterator         | n/a (produces)          | n/a           |
 | rangeStep  | constructor     | ✅                  | n/a                     | n/a           |
 | iter       | constructor     | ✅ Iterator         | n/a                     | n/a           |
 | iterOf     | constructor     | ✅ Iterator         | n/a                     | n/a           |
 
-NOTE: lin_stream_map/filter/take/lines/chunks ALREADY exist (Stage 4 of streams). So map/
-filter/take stream backends are mostly wiring the unified name to the existing intrinsic;
-drop/flatMap/takeWhile/dropWhile/flatten/concat/reduce/while/find/some/every are NET-NEW
-stream backends.
+ALL 14 stream-backend combinators DONE (Stages 3+4). The net-new backends added in stream.rs:
+drop/takeWhile/dropWhile/flatMap/flatten/concat (adapters) + reduce/find/some/every/while
+(terminals). map/filter/take/for re-used the pre-existing intrinsics.
 
 ## Stage status
 1. Create std/iter, relocate eager combinators, migrate imports — DONE (see git log; this entry
@@ -145,7 +144,52 @@ stream backends.
      failed (was 502 + 4 new), incl. the formatter corpus idempotency test; `lin test stdlib/` = 22
      files; `lin test examples/` = 42 files; `lin check` over all example main.lin = zero failures.
      ZERO array/iterator behaviour change confirmed.
-3. Stream branches for lazy adapters — PENDING
-4. New stream terminals (reduce/find/some/every) + while — PENDING
+3. Stream branches for lazy adapters — DONE
+   - NET-NEW runtime backends in `crates/lin-runtime/src/stream.rs`, each mirroring MapSource/
+     TakeSource RC discipline EXACTLY (release pulled item after the closure consumes it; close
+     upstream in close(); return independently-owned boxes; propagate Err in-band):
+     DropSource, TakeWhileSource (done-latch), DropWhileSource (dropping-latch), FlatMapSource +
+     FlattenSource (both via a shared `InnerCursor` holding ONE owned ref to the inner array +
+     cursor; release on exhaust/close), ConcatSource (TWO retained upstreams, close BOTH; first
+     stream closed eagerly on its EOF). Constructors: lin_stream_drop/_take_while/_drop_while/
+     _flat_map/_flatten/_concat.
+   - IR: `Intrinsic::Stream{Drop,TakeWhile,DropWhile,FlatMap,Flatten,Concat}` (ir.rs); name→intr
+     in lower.rs; codegen dispatch in lin-codegen/src/codegen/intrinsics.rs; checker sigs in
+     lin-check/src/checker/intrinsics.rs.
+   - DISPATCH WIRING (the key Stage-3 mechanism): a genuine `std/iter` combinator called with a
+     DEFINITELY-stream arg0 is redirected to the `lin_stream_*` backend at `lower_call`
+     (`stream_combinator_intrinsic_name`, keyed on the `std_iter_` symbol prefix) — delegating to
+     `lower_intrinsic_call` so stream-arg RC matches the proven std/stream wrapper path. To make
+     the redirect reachable: (a) `try_inline_combinator_wrapper` (monomorphize.rs) BAILS when arg0
+     is a Stream (so map/filter/reduce don't inline to the eager `lin_map` loop); (b) the generic
+     specialization path is SKIPPED for a stream arg0 (so map/filter/reduce/while stay Named import
+     calls). The checker's `streamish_combinator_ret` (call.rs) was EXTENDED to re-type the result
+     of drop/take/flatMap/takeWhile/dropWhile/flatten/concat → `Stream<elem>`, find → T|Null|Error,
+     some/every → Boolean|Error, for → Null|Error — so a chain stays typed Stream and each step
+     re-dispatches. The pure-Lin wrapper PARAMS stay `Json` (a definite/narrowed Stream coerces to
+     a Json param — verified), so NO wrapper body/param changes were needed for the pure-Lin set.
+4. New stream terminals (reduce/find/some/every) + while — DONE
+   - Runtime terminals in stream.rs: lin_stream_reduce (fold, releases prev acc each step, adopts
+     closure result; init owned +1), lin_stream_find (returns the found item owned, or Null),
+     lin_stream_some/_every (short-circuit, return a fresh Bool box), lin_stream_while (drive until
+     predicate falsy or EOF → Null). All close the stream. reduce uses a NEW `LinFn::call2_caught`
+     (3-arg env,acc,item ABI) added to stream.rs.
+   - ASan: `RUSTFLAGS=-Zsanitizer=address ASAN_OPTIONS=detect_leaks=0 cargo +nightly test -p
+     lin-runtime --target x86_64-unknown-linux-gnu stream` = 20/20 CLEAN, incl. 6 net-new focused
+     unit tests (drop, concat two-upstream close-once, flatten, find, reduce, flatMap) asserting
+     close-once via shared counters.
+   - std/stream CONSOLIDATION: removed `map`, `filter`, `take`, `for` exports from stdlib/stream.lin
+     (they now come from std/iter via receiver dispatch). std/stream keeps only stream-SPECIFIC
+     ops: readStream/writeStream/drain/collect/readText/promise/close/lines/linesMax/chunks. The
+     `for` ambiguity (std/iter AND std/stream both exporting `for`) is RESOLVED by making std/iter's
+     `for` the single one (removed from std/stream); it dispatches to `lin_stream_for` on a stream
+     receiver via the `lower_call` redirect (verified: `stdinStream().lines().for(...)` works).
+   - Migrated imports: stdlib/stream.test.lin (+11 new combinator tests), examples/streams/main.lin,
+     and crates/lin/tests/integration.rs (csv pipeline, promise fault-isolation, stdin source) now
+     import map/filter/take/for from std/iter.
+   - GATE (verified by me): cargo test --workspace = 402 integration + 60 lin-runtime (was 54) +
+     37 type_check + … all green; test_http_fetch_json passes in isolation; `lin test stdlib/` = 22;
+     `lin test examples/` = 42; 6 NEW end-to-end integration tests (drop/take/reduce, flatMap,
+     takeWhile/dropWhile, concat, find/some/every, array non-regression) all pass.
 5. Re-key affine consume-set off dispatch; delete name allowlist; 5 attacks as tests — PENDING
 6. Flat-producer recognition + docs (ADR-075) + final sweep — PENDING

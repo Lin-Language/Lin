@@ -9,11 +9,13 @@
 // Test:  lin test examples/streams/
 
 import { print } from "std/io"
-import { readStream, lines, map, filter, writeStream, drain } from "std/stream"
+import { readStream, lines, writeStream, drain } from "std/stream"
 import { writeFile, readFile } from "std/fs"
 import { split, join } from "std/string"
 import { length } from "std/array"
-import { map as amap } from "std/iter"
+// map/filter come from std/iter (the unified combinators) and dispatch to the lazy stream backend
+// on a stream receiver. `map as amap` is the array map used inside quoteFields.
+import { map as amap, map, filter } from "std/iter"
 
 val inPath = "/tmp/lin_streams_example_in.csv"
 val outPath = "/tmp/lin_streams_example_out.csv"

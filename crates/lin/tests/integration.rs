@@ -3469,10 +3469,10 @@ fn test_stream_csv_pipeline_drain() {
     let inp_s = inp.display().to_string();
     let outp_s = outp.display().to_string();
     let output = run(&format!(r#"import {{ print }} from "std/io"
-import {{ readStream, lines, map, filter, writeStream, drain }} from "std/stream"
+import {{ readStream, lines, writeStream, drain }} from "std/stream"
 import {{ split, join }} from "std/string"
 import {{ length }} from "std/array"
-import {{ map as amap }} from "std/iter"
+import {{ map as amap, map, filter }} from "std/iter"
 
 val notEmpty = (line: String): Boolean => length(line) > 0
 val quoteFields = (line: String): String =>
@@ -3486,6 +3486,180 @@ print("ok")
     let _ = fs::remove_file(&outp);
     assert_eq!(output, vec!["ok"]);
     assert_eq!(written, "\"a\"|\"b\"|\"c\"\n\"x\"|\"y\"|\"z\"\n\"foo\"|\"bar\"|\"baz\"\n");
+}
+
+// std/iter unification (Stage 3/4): a lazy stream chain using the NET-NEW combinators that now
+// dispatch to the `lin_stream_*` backend on a stream receiver. drop + take + reduce on a 5-line
+// file: drop 1 → take 2 → fold count = 2.
+#[test]
+fn test_stream_iter_drop_take_reduce() {
+    let inp = std::env::temp_dir().join(format!("lin_ctest_dtr_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&inp);
+    fs::write(&inp, "l0\nl1\nl2\nl3\nl4\n").unwrap();
+    let inp_s = inp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines }} from "std/stream"
+import {{ drop, take, reduce }} from "std/iter"
+
+val r = readStream("{inp_s}")
+val out = match r
+  is Error => "open-error"
+  else =>
+    val total = r.lines().drop(1).take(2).reduce(0, (acc, line) => acc + 1)
+    match total
+      is Error => "drive-error"
+      else => "count=${{total}}"
+print(out)
+"#));
+    let _ = fs::remove_file(&inp);
+    assert_eq!(output, vec!["count=2"]);
+}
+
+// std/iter unification (Stage 3/4): flatMap over a stream (each line split into fields, flattened),
+// counted via reduce. "a,b,c\nd,e\nf" → 6 fields.
+#[test]
+fn test_stream_iter_flat_map() {
+    let inp = std::env::temp_dir().join(format!("lin_ctest_fm_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&inp);
+    fs::write(&inp, "a,b,c\nd,e\nf").unwrap();
+    let inp_s = inp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines }} from "std/stream"
+import {{ flatMap, reduce }} from "std/iter"
+import {{ split }} from "std/string"
+
+val r = readStream("{inp_s}")
+val out = match r
+  is Error => "open-error"
+  else =>
+    val total = r.lines().flatMap(l => split(l, ",")).reduce(0, (a, f) => a + 1)
+    match total
+      is Error => "drive-error"
+      else => "fields=${{total}}"
+print(out)
+"#));
+    let _ = fs::remove_file(&inp);
+    assert_eq!(output, vec!["fields=6"]);
+}
+
+// std/iter unification (Stage 3/4): takeWhile + dropWhile over a stream. Lines "aa\nbb\nc\ndd":
+// takeWhile(len==2) → 2 items; dropWhile(len==2) → 2 items (c, dd).
+#[test]
+fn test_stream_iter_take_while_drop_while() {
+    let inp = std::env::temp_dir().join(format!("lin_ctest_twdw_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&inp);
+    fs::write(&inp, "aa\nbb\nc\ndd").unwrap();
+    let inp_s = inp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines }} from "std/stream"
+import {{ takeWhile, dropWhile, reduce }} from "std/iter"
+import {{ length }} from "std/array"
+
+val tw = match readStream("{inp_s}")
+  is Error => -1
+  else => unwrapTw(readStream("{inp_s}").lines().takeWhile(l => length(l) == 2).reduce(0, (a, l) => a + 1))
+val dw = match readStream("{inp_s}")
+  is Error => -1
+  else => unwrapTw(readStream("{inp_s}").lines().dropWhile(l => length(l) == 2).reduce(0, (a, l) => a + 1))
+print("tw=${{tw}} dw=${{dw}}")
+
+val unwrapTw = (r: Json): Int32 =>
+  match r
+    is Error => -1
+    else => r
+"#));
+    let _ = fs::remove_file(&inp);
+    assert_eq!(output, vec!["tw=2 dw=2"]);
+}
+
+// std/iter unification (Stage 3/4): concat two streams (3 lines each = 6), counted via reduce.
+#[test]
+fn test_stream_iter_concat() {
+    let inp = std::env::temp_dir().join(format!("lin_ctest_cat_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&inp);
+    fs::write(&inp, "a\nb\nc").unwrap();
+    let inp_s = inp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines }} from "std/stream"
+import {{ concat, reduce }} from "std/iter"
+
+val a = readStream("{inp_s}")
+val b = readStream("{inp_s}")
+val out = match a
+  is Error => "ea"
+  else => match b
+    is Error => "eb"
+    else =>
+      val n = a.lines().concat(b.lines()).reduce(0, (acc, l) => acc + 1)
+      match n
+        is Error => "drive-error"
+        else => "n=${{n}}"
+print(out)
+"#));
+    let _ = fs::remove_file(&inp);
+    assert_eq!(output, vec!["n=6"]);
+}
+
+// std/iter unification (Stage 3/4): find/some/every terminals over a stream.
+#[test]
+fn test_stream_iter_find_some_every() {
+    let inp = std::env::temp_dir().join(format!("lin_ctest_fse_{}.txt", std::process::id()));
+    let _ = fs::remove_file(&inp);
+    fs::write(&inp, "x\ny\nz").unwrap();
+    let inp_s = inp.display().to_string();
+    let output = run(&format!(r#"import {{ print }} from "std/io"
+import {{ readStream, lines }} from "std/stream"
+import {{ find, some, every }} from "std/iter"
+import {{ length }} from "std/array"
+
+val f = match readStream("{inp_s}")
+  is Error => "e"
+  else => unwrapS(readStream("{inp_s}").lines().find(l => l == "y"))
+val s = match readStream("{inp_s}")
+  is Error => false
+  else => unwrapB(readStream("{inp_s}").lines().some(l => l == "z"))
+val e = match readStream("{inp_s}")
+  is Error => false
+  else => unwrapB(readStream("{inp_s}").lines().every(l => length(l) == 1))
+print("find=${{f}} some=${{s}} every=${{e}}")
+
+val unwrapS = (r: Json): String =>
+  match r
+    is Error => "err"
+    else => r
+val unwrapB = (r: Json): Boolean =>
+  match r
+    is Error => false
+    else => r
+"#));
+    let _ = fs::remove_file(&inp);
+    assert_eq!(output, vec!["find=y some=true every=true"]);
+}
+
+// NON-REGRESSION: the SAME net-new combinators over an ARRAY (not a stream) must stay eager and
+// unchanged — drop/take/flatMap/takeWhile/dropWhile/find/some/every/concat on a plain array.
+#[test]
+fn test_iter_array_combinators_unchanged() {
+    let output = run(r#"import { print } from "std/io"
+import { drop, take, flatMap, takeWhile, dropWhile, find, some, every, concat, reduce } from "std/iter"
+import { length } from "std/array"
+
+val xs = [1, 2, 3, 4, 5]
+print("drop=${length(xs.drop(2))}")        // [3,4,5] -> 3
+print("take=${length(xs.take(2))}")        // [1,2] -> 2
+print("flatMap=${length(xs.flatMap(x => [x, x]))}")  // 10
+print("takeWhile=${length(xs.takeWhile(x => x < 3))}") // [1,2] -> 2
+print("dropWhile=${length(xs.dropWhile(x => x < 3))}") // [3,4,5] -> 3
+print("find=${xs.find(x => x == 4)}")      // 4
+print("some=${xs.some(x => x == 5)}")      // true
+print("every=${xs.every(x => x > 0)}")     // true
+print("concat=${length(xs.concat([6, 7]))}") // 7
+print("reduce=${xs.reduce(0, (a, x) => a + x)}") // 15
+"#);
+    assert_eq!(output, vec![
+        "drop=3", "take=2", "flatMap=10", "takeWhile=2", "dropWhile=3",
+        "find=4", "some=true", "every=true", "concat=7", "reduce=15",
+    ]);
 }
 
 // Stage 6 (streams): affine use-after-move + placement restriction (negative cases).
@@ -3592,7 +3766,8 @@ fn test_stream_promise_fault_isolation() {
     let _ = fs::remove_file(&out);
     fs::write(&tmp, "a\nb\nc").unwrap();
     let output = run(&format!(r#"import {{ print }} from "std/io"
-import {{ readStream, lines, map, writeStream, promise }} from "std/stream"
+import {{ readStream, lines, writeStream, promise }} from "std/stream"
+import {{ map }} from "std/iter"
 import {{ await }} from "std/async"
 
 val boom = (line: Json): Json =>
@@ -5636,7 +5811,8 @@ print(text)
 #[test]
 fn test_stream_stdin_source() {
     let output = run_with_stdin(r#"import { stdinStream } from "std/io"
-import { lines, for } from "std/stream"
+import { lines } from "std/stream"
+import { for } from "std/iter"
 import { print } from "std/io"
 
 stdinStream().lines().for(line => print("got: ${line}"))
