@@ -251,8 +251,7 @@ impl Formatter {
         SOURCE_CHARS.with(|c| *c.borrow_mut() = self.source_chars.clone());
         // Hoist targets: last-arg lambda array/object bodies of statement-level calls. For
         // these the Rule 5a `=> [` collapse wins over the author-newline rule (Rule B).
-        let hoist_bodies: std::collections::HashSet<u32> =
-            build_hoist_redirects(module).keys().copied().collect();
+        let hoist_bodies = build_hoist_redirects(module).collapse_bodies;
         HOIST_BODIES.with(|c| *c.borrow_mut() = hoist_bodies);
 
         let mut out = String::new();
@@ -425,7 +424,18 @@ fn collect_anchors_expr(expr: &Expr, out: &mut Vec<Anchor>) {
             collect_anchors_expr(value, out);
         }
         Expr::Assign { value, .. } => collect_anchors_expr(value, out),
-        Expr::Array(items, _) | Expr::TupleArgs(items, _) => {
+        Expr::Array(items, _) => {
+            // Rule ii: each array element is a comment anchor, so an own-line comment before
+            // an element renders above it at the element's indent. Trailing comments on an
+            // element are unreliable for multi-line elements, so leading-only (trailing_ok
+            // false) — a same-line trailing comment demotes to the next anchor's leading.
+            for it in items {
+                let sp = it.span();
+                out.push(Anchor { start: sp.start, end: sp.end, trailing_ok: false });
+                collect_anchors_expr(it, out);
+            }
+        }
+        Expr::TupleArgs(items, _) => {
             for it in items {
                 collect_anchors_expr(it, out);
             }
@@ -453,13 +463,27 @@ fn collect_anchors_expr(expr: &Expr, out: &mut Vec<Anchor>) {
     }
 }
 
-/// Build the Rule 6 redirect map: a leading comment that would attach to a lambda body which
-/// is an array/object literal AND that lambda is the last argument of a call that is itself a
-/// statement's whole expression/value, is re-anchored to the ENCLOSING STATEMENT. This hoists
-/// `() =>` `// comment` `[ … ]` to a leading comment above the statement, letting `() => [`
-/// collapse onto one line. Keys = lambda body span start; values = statement span start.
-fn build_hoist_redirects(module: &Module) -> HashMap<u32, u32> {
-    let mut map = HashMap::new();
+/// The result of the hoist analysis. `redirects` re-anchors a comment that would attach to a
+/// lambda array/object body to an enclosing anchor (so `() =>` `// comment` `[ … ]` becomes a
+/// leading comment of that anchor). `collapse_bodies` is the subset of those lambda bodies whose
+/// `=> [`/`=> {` Rule 5a collapse must win over Rule B (statement-level last-arg lambdas only).
+struct HoistResult {
+    redirects: HashMap<u32, u32>,
+    collapse_bodies: std::collections::HashSet<u32>,
+}
+
+/// Build the Rule 6 / Rule ii hoist analysis.
+///
+/// Rule 6 (statement-level): a leading comment that would attach to a lambda array/object body
+/// which is the last argument of a call that is itself a statement's whole expression/value is
+/// re-anchored to the ENCLOSING STATEMENT, and `() => [` collapses onto one line (collapse body).
+///
+/// Rule ii (array element): a leading comment between a lambda's `=>` and its array/object body,
+/// where the lambda is the last arg of a call that is an ARRAY ELEMENT, is re-anchored to that
+/// array element. Here Rule B is preserved (the body keeps the author's own-line layout), so the
+/// body is NOT a collapse body. Keys = lambda body span start; values = enclosing anchor start.
+fn build_hoist_redirects(module: &Module) -> HoistResult {
+    let mut res = HoistResult { redirects: HashMap::new(), collapse_bodies: Default::default() };
     for stmt in &module.statements {
         let (stmt_start, value) = match stmt {
             Stmt::Val { value, span, .. }
@@ -469,28 +493,49 @@ fn build_hoist_redirects(module: &Module) -> HashMap<u32, u32> {
             _ => (0, None),
         };
         if let Some(value) = value {
-            collect_hoist_redirects(value, stmt_start, &mut map);
+            collect_hoist_redirects(value, stmt_start, true, &mut res);
         }
     }
-    map
+    res
 }
 
-/// If `expr` is a call (`Call`/`DotCall`) whose LAST argument is a lambda with an array/object
-/// body, map that body's span start to `stmt_start`. Only the outermost call of a statement is
-/// considered (the lambda-body comment then belongs to the statement). Recurses into the call's
-/// last lambda arg's body so a nested `test(..., () => [ test(..., () => [ … ]) ])` also hoists.
-fn collect_hoist_redirects(expr: &Expr, stmt_start: u32, map: &mut HashMap<u32, u32>) {
-    let args = match expr {
-        Expr::Call { args, .. } => Some(args.as_slice()),
-        Expr::DotCall { args: Some(args), .. } => Some(args.as_slice()),
-        _ => return,
-    };
-    if let Some(args) = args {
-        if let Some(Expr::Function { body, .. }) = args.last() {
-            if matches!(**body, Expr::Array(..) | Expr::Object(..)) {
-                map.insert(body.span().start, stmt_start);
+/// Walk `expr`, recording lambda-body → enclosing-anchor hoist redirects.
+///
+/// `anchor_start` is the start of the nearest enclosing comment anchor (statement, or array
+/// element). `collapse` is true when that anchor is the statement-level outermost call (so the
+/// `=> [` collapse should win — Rule 6) and false for an array-element call (Rule ii, Rule B kept).
+fn collect_hoist_redirects(expr: &Expr, anchor_start: u32, collapse: bool, res: &mut HoistResult) {
+    match expr {
+        Expr::Call { args, .. } | Expr::DotCall { args: Some(args), .. } => {
+            if let Some(Expr::Function { body, .. }) = args.last() {
+                if matches!(**body, Expr::Array(..) | Expr::Object(..)) {
+                    res.redirects.insert(body.span().start, anchor_start);
+                    if collapse {
+                        res.collapse_bodies.insert(body.span().start);
+                    }
+                }
+            }
+            // Recurse into every argument so a nested array argument (e.g. `suite("…", [ … ])`)
+            // and the lambda bodies inside its elements are processed with their own anchors. A
+            // lambda arg's body is recursed through explicitly (the arg itself is a Function,
+            // which `collect_hoist_redirects` does not descend into directly).
+            for a in args {
+                if let Expr::Function { body, .. } = a {
+                    collect_hoist_redirects(body, anchor_start, collapse, res);
+                } else {
+                    collect_hoist_redirects(a, anchor_start, collapse, res);
+                }
             }
         }
+        // An array literal: each element is its own comment anchor (Rule ii). A call element
+        // whose last-arg lambda body carries a between-`=>`-and-body comment hoists that comment
+        // to the element (no collapse — Rule B keeps the author's own-line body layout).
+        Expr::Array(items, _) => {
+            for it in items {
+                collect_hoist_redirects(it, it.span().start, false, res);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -501,10 +546,11 @@ fn build_comment_ctx(comments: &[Comment], line_starts: &[usize], module: &Modul
         return ctx;
     }
     let anchors = collect_anchors(module);
-    let redirects = build_hoist_redirects(module);
+    let redirects = build_hoist_redirects(module).redirects;
 
-    // Apply the Rule 6 hoist: if a leading comment's anchor is a lambda array/object body that
-    // is the last arg of a statement-level call, re-anchor it to the enclosing statement.
+    // Apply the Rule 6 / Rule ii hoist: if a leading comment's anchor is a lambda array/object
+    // body that is the last arg of a statement-level or array-element call, re-anchor it to the
+    // enclosing statement / array element.
     let redirect = |start: u32| -> u32 { redirects.get(&start).copied().unwrap_or(start) };
 
     for cm in comments {
@@ -869,6 +915,13 @@ fn fmt_match_pattern(mp: &MatchPattern) -> (String, &'static str) {
     }
 }
 
+/// True if `expr` is a call whose callee is the bare identifier `test` (e.g. `test("…", () => …)`).
+/// Used for Rule iii: a blank line is auto-injected between two consecutive `test(...)` elements
+/// of an array literal (a test suite's case list). Only the literal callee name `test` qualifies.
+fn is_test_call(expr: &Expr) -> bool {
+    matches!(expr, Expr::Call { func, .. } if matches!(func.as_ref(), Expr::Ident(name, _) if name == "test"))
+}
+
 // ── atomicity check ───────────────────────────────────────────────────────────
 
 fn is_atomic(expr: &Expr) -> bool {
@@ -1190,16 +1243,31 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
             // Multi-line. Each item is at child_ind. No trailing comma (Rule 3); the
             // separator sits between items only. Contents render with FORCE_ML set so
             // every nested literal is also multiline (Rule 4).
-            let item_strs: Vec<String> = with_force_ml(true, || {
-                items
-                    .iter()
-                    .map(|i| {
-                        let s = fmt_expr(i, false, &child_ind);
-                        format!("{}{}", child_ind, s)
-                    })
-                    .collect()
-            });
-            format!("[\n{}\n{}]", item_strs.join(",\n"), ind)
+            //
+            // Rule ii: each element is a comment anchor — emit its own-line leading comments
+            // above it at child_ind.
+            // Rule iii: emit exactly one blank line between two consecutive `test(...)` call
+            // elements (after the first's comma, before the second's leading comment).
+            with_force_ml(true, || {
+                let mut out = String::from("[\n");
+                for (idx, i) in items.iter().enumerate() {
+                    if idx > 0 {
+                        out.push_str(",\n");
+                        // Rule iii: blank line between consecutive `test(...)` elements.
+                        if is_test_call(&items[idx - 1]) && is_test_call(i) {
+                            out.push('\n');
+                        }
+                    }
+                    out.push_str(&take_leading(i.span().start, &child_ind));
+                    let s = fmt_expr(i, false, &child_ind);
+                    out.push_str(&child_ind);
+                    out.push_str(&s);
+                }
+                out.push('\n');
+                out.push_str(ind);
+                out.push(']');
+                out
+            })
         }
 
         // ── Object ────────────────────────────────────────────────────────────
@@ -1725,10 +1793,23 @@ fn fmt_call_arglist(args: &[Expr], ind: &str) -> String {
         // call, and a trailing lambda keeps `=> [`/`=> {` on the same line.
         let n = args.len();
         let last = fmt_expr(&args[n - 1], false, ind);
+        // Rule i: when the last arg is a lambda whose BODY renders multi-line, put the
+        // call's closing `)` on its OWN line, dedented to the call's indentation. A
+        // single-line lambda arg keeps `)` glued (handled by the inline fast-path above,
+        // which never reaches here). This applies only to lambda last args — a multi-line
+        // object/array last arg keeps the `)` glued to its `]`/`}` (Rule 5a).
+        let last_is_multiline_lambda =
+            matches!(&args[n - 1], Expr::Function { .. }) && last.contains('\n');
         if n == 1 {
+            if last_is_multiline_lambda {
+                return format!("({}\n{})", last, ind);
+            }
             return format!("({})", last);
         }
         let lead: Vec<String> = inline_args[..n - 1].to_vec();
+        if last_is_multiline_lambda {
+            return format!("({}, {}\n{})", lead.join(", "), last, ind);
+        }
         return format!("({}, {})", lead.join(", "), last);
     }
 
