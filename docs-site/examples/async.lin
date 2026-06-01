@@ -1,8 +1,7 @@
 import { print } from "std/io"
 import { async, await, parallel } from "std/async"
 import { fetchJson } from "std/http"
-import { map } from "std/array"
-
+import { map } from "std/iter"
 // Any function can run on a thread — there is no async/await colouring. You
 // decide at the call site. async() spawns, await() joins and yields T | Error.
 val slow = (n: Int32): Int32 => n * n

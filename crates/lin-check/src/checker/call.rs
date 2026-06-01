@@ -98,7 +98,7 @@ impl Checker {
                     }
                 }
             }
-            Type::Array(inner) | Type::Iterator(inner) => self.collect_named_defs(inner, seen, out),
+            Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner) => self.collect_named_defs(inner, seen, out),
             Type::FixedArray(elems) => {
                 for e in elems {
                     self.collect_named_defs(e, seen, out);
@@ -121,6 +121,108 @@ impl Checker {
                 self.collect_named_defs(ret, seen, out);
             }
             _ => {}
+        }
+    }
+
+    /// Receiver-dependent return typing for the std/iter combinators (unification Stage 2).
+    ///
+    /// The intrinsic-backed combinators (`map`/`filter`/`reduce`/`while`) accept an
+    /// `Array | Iterator | Stream` receiver, but their stdlib wrapper INFERS an array-shaped return
+    /// (`U[]` for map, `T[]` for filter, `U` for reduce, `Null` for while) — the eager array
+    /// behaviour. When arg0 (the iterable receiver) is actually a `Stream`, the result must instead
+    /// be the stream-shaped type from the return-type table:
+    ///   map → Stream<U>, filter → Stream<T>, reduce → U | Error, while → Null | Error.
+    /// (`for` is handled by its own wrapper, which already declares `Null` / widens to `Null|Error`.)
+    ///
+    /// This is keyed on the IMPORT ORIGIN `(module_path, export_name)` of the callee — NOT just the
+    /// surface name — so a user-defined `map`/`reduce`/etc. is never affected, and only the genuine
+    /// `std/iter` exports are re-typed. `array_ret` is the already-computed array-shaped result;
+    /// `arg0_ty` is the receiver type. Returns the overridden type, or `array_ret` unchanged when the
+    /// callee is not a stream-aware std/iter combinator or the receiver is not DEFINITELY a stream.
+    ///
+    /// Crucially the receiver must be DEFINITELY a stream (`is_definitely_stream`), NOT merely
+    /// streamish (a union that *includes* a Stream). A mixed `Array | Iterator | Stream` union —
+    /// e.g. a user GENERIC `<T>(xs: T[] | Iterator<T> | Stream<T>)` param, or the std/iter wrapper's
+    /// own param while its body is being checked — has a live array branch, so its eager array
+    /// return must be preserved (the per-call-site stream re-typing then happens when the generic is
+    /// actually called WITH a concrete stream). Using the looser `type_is_streamish` here would leak
+    /// the stream return into the array call sites of any such generic.
+    fn streamish_combinator_ret(&self, local_name: &str, array_ret: Type, arg0_ty: &Type) -> Type {
+        if !is_definitely_stream(arg0_ty) {
+            return array_ret;
+        }
+        let Some((module_path, export_name)) = self.import_origins.get(local_name) else {
+            return array_ret;
+        };
+        if module_path != "std/iter" {
+            return array_ret;
+        }
+        match export_name.as_str() {
+            // Lazy adapters: receiver-dependent element type wrapped in a fresh Stream. The
+            // array_ret is `U[]` (map) / `T[]` (filter) / a bare `Json` (the pure-Lin wrappers
+            // declare `Json`); unwrap an array element to re-wrap as Stream<…>, else Stream<Json>.
+            // These all back onto a lazy `lin_stream_*` adapter (the IR redirects on a stream
+            // receiver), so the result is the next Stream node in the pipeline — keeping the chain
+            // typed as a Stream so a following `.take`/`.reduce`/… also sees a definite-stream
+            // receiver and dispatches lazily.
+            "map" | "filter" | "take" | "drop" | "flatMap" | "takeWhile" | "dropWhile"
+            | "flatten" | "concat" => {
+                let elem = match &array_ret {
+                    Type::Array(inner) => (**inner).clone(),
+                    Type::Stream(inner) => (**inner).clone(),
+                    _ => Type::TypeVar(u32::MAX),
+                };
+                Type::Stream(Box::new(elem))
+            }
+            // Terminal: the array_ret is the accumulator/result type U; a stream read can fault, so
+            // surface `U | Error`.
+            "reduce" => Type::flatten_union(vec![array_ret, crate::resolve::error_type()]),
+            // Terminal: first matching item or Null if none; a read fault → Error. `T | Null | Error`
+            // (the array `find` already returns `T | Null` ≈ Json, so just add the Error arm).
+            "find" => Type::flatten_union(vec![array_ret, Type::Null, crate::resolve::error_type()]),
+            // Terminals returning a Boolean over the stream: `Boolean | Error`.
+            "some" | "every" => Type::flatten_union(vec![Type::Bool, crate::resolve::error_type()]),
+            // Terminal-ish: array_ret is Null; stream form is `Null | Error`.
+            "while" | "for" => Type::flatten_union(vec![Type::Null, crate::resolve::error_type()]),
+            _ => array_ret,
+        }
+    }
+
+    /// Does a call to the callee bound to `local_name` ROUTE to a stream operation that takes
+    /// ownership of its stream argument(s)? Keyed on the callee's IMPORT ORIGIN
+    /// `(module_path, export_name)` — the SAME dispatch fact that `streamish_combinator_ret`
+    /// (re-typing) and `stream_combinator_intrinsic_name` (IR redirect) use — so the affine
+    /// consume-check, the result re-typing, and the IR move can never diverge. A user-defined
+    /// function with one of these names is never affected (it has no std/iter|std/stream origin).
+    ///
+    /// True for: the genuine std/iter combinators that dispatch to a `lin_stream_*` backend on a
+    /// stream receiver, and the genuine std/stream stream-specific ops. The actual consumption is
+    /// then applied PER ARGUMENT to every definitely-stream argument (mirroring the IR's
+    /// `move_streamish_arg`), which handles `concat`'s two stream args automatically.
+    fn callee_routes_to_stream_op(&self, local_name: &str) -> bool {
+        let Some((module_path, export_name)) = self.import_origins.get(local_name) else {
+            return false;
+        };
+        match module_path.as_str() {
+            "std/iter" => is_std_iter_stream_combinator(export_name),
+            "std/stream" => is_std_stream_consuming_export(export_name),
+            _ => false,
+        }
+    }
+
+    /// Mark CONSUMED every argument in `arg_exprs` whose inferred type (from the parallel
+    /// `arg_tys`) is DEFINITELY a stream — the affine mirror of the IR's `move_streamish_arg`,
+    /// which unregisters any streamish arg from the caller's owning scope. Applies only when the
+    /// callee routes to a stream op (gated by the caller). Per-argument so `concat(a, b)` consumes
+    /// BOTH stream arguments, not just arg0.
+    fn consume_definite_stream_args<'a>(
+        &mut self,
+        arg_exprs: impl Iterator<Item = (&'a Expr, &'a Type)>,
+    ) {
+        for (expr, ty) in arg_exprs {
+            if is_definitely_stream(ty) {
+                self.mark_stream_consumed(expr);
+            }
         }
     }
 
@@ -270,7 +372,7 @@ impl Checker {
                     typed_args.iter().zip(concrete_params.iter()).enumerate()
                 {
                     let arg_ty = arg.ty();
-                    if !self.types_compatible(&arg_ty, param_ty) {
+                    if !self.arg_compatible(&arg_ty, param_ty) {
                         return Err(Diagnostic::error(
                             args[i].span(),
                             format!(
@@ -390,6 +492,37 @@ impl Checker {
 
         let is_tail = self.is_tail_call(func);
 
+        // Receiver-dependent std/iter combinator return (unification Stage 2): re-type the eager
+        // array result to its stream-shaped form when the callee is a std/iter combinator and the
+        // iterable arg0 is a Stream. Skipped for partial application (no concrete arg0 yet).
+        let result_type = if !partial {
+            if let (Expr::Ident(callee, _), Some(arg0)) = (func, typed_args.first()) {
+                self.streamish_combinator_ret(callee, result_type, &arg0.ty())
+            } else {
+                result_type
+            }
+        } else {
+            result_type
+        };
+
+        // Affine consume (streams brief §7): a call that ROUTES to a stream op MOVES its
+        // stream argument(s) — mark each definitely-stream argument consumed so a later use of the
+        // same binding errors. Keyed on the callee's import origin (the dispatch fact), not a name
+        // list, and applied PER ARGUMENT so `concat(a, b)` consumes BOTH streams. This mirrors the
+        // IR's `move_streamish_arg` exactly; the two cannot diverge.
+        if !partial {
+            if let Expr::Ident(callee, _) = func {
+                if self.callee_routes_to_stream_op(callee) {
+                    let pairs: Vec<(&Expr, Type)> = args
+                        .iter()
+                        .zip(typed_args.iter())
+                        .map(|(e, t)| (e, t.ty()))
+                        .collect();
+                    self.consume_definite_stream_args(pairs.iter().map(|(e, t)| (*e, t)));
+                }
+            }
+        }
+
         Ok(TypedExpr::Call {
             func: Box::new(typed_func),
             args: typed_args,
@@ -445,6 +578,10 @@ impl Checker {
         }
 
         let typed_receiver = self.infer_expr(receiver)?;
+
+        // Affine consume for a dot-call routing to a stream op is applied per-argument AFTER all
+        // arguments are inferred (so `concat`'s second stream arg is also covered) — see the
+        // `consume_definite_stream_args` calls below, gated on `callee_routes_to_stream_op(method)`.
 
         // Look up method type for TypeVar substitution.
         if let Some(method_ty) = self.env.effective_type(method) {
@@ -542,6 +679,29 @@ impl Checker {
                     }
                 }
 
+                // Affine consume (streams brief §7): if `method` routes to a stream op, mark each
+                // definitely-stream argument consumed (mirrors the IR's `move_streamish_arg`).
+                // `all_arg_exprs[0]` is the receiver; `concat`'s second stream arg is also covered.
+                if !partial && self.callee_routes_to_stream_op(method) {
+                    let pairs: Vec<(&Expr, Type)> = all_arg_exprs
+                        .iter()
+                        .copied()
+                        .zip(all_args.iter())
+                        .map(|(e, t)| (e, t.ty()))
+                        .collect();
+                    self.consume_definite_stream_args(pairs.iter().map(|(e, t)| (*e, t)));
+                }
+
+                // Receiver-dependent std/iter combinator return (unification Stage 2): when the dot
+                // receiver is a Stream and `method` is a std/iter combinator, re-type the eager
+                // array result to its stream-shaped form. Skipped for partial application.
+                let result_type = if !partial {
+                    let arg0_ty = all_args.first().map(|a| a.ty()).unwrap_or(Type::Null);
+                    self.streamish_combinator_ret(method, result_type, &arg0_ty)
+                } else {
+                    result_type
+                };
+
                 let info = self.env.lookup(method).unwrap();
                 let func_expr = TypedExpr::LocalGet { slot: info.slot, ty: method_ty, span };
                 return Ok(TypedExpr::Call {
@@ -561,6 +721,20 @@ impl Checker {
             for arg in arg_exprs {
                 all_args.push(self.infer_expr(arg)?);
             }
+        }
+        // Affine consume (fallback path): mirror the typed-method path so a stream-routing op that
+        // somehow reaches here still consumes its definitely-stream argument(s).
+        if !partial && self.callee_routes_to_stream_op(method) {
+            let all_arg_exprs: Vec<&Expr> = std::iter::once(receiver)
+                .chain(args.as_ref().map(|a| a.as_slice()).unwrap_or(&[]).iter())
+                .collect();
+            let pairs: Vec<(&Expr, Type)> = all_arg_exprs
+                .iter()
+                .copied()
+                .zip(all_args.iter())
+                .map(|(e, t)| (e, t.ty()))
+                .collect();
+            self.consume_definite_stream_args(pairs.iter().map(|(e, t)| (*e, t)));
         }
         // var-capture check for pool.async(f) / pool.async(fs) (fallback path).
         if method == "lin_async" || method == "lin_pool_async" {
@@ -632,4 +806,68 @@ impl Checker {
         }
         false
     }
+}
+
+/// The std/stream exports that take OWNERSHIP of their `Stream` argument (streams brief §7/§9):
+/// every stream-specific op in `stdlib/stream.lin`. Each is a wrapper over a `lin_stream_*`
+/// intrinsic that moves the boxed-stream pointer, so the IR's `move_streamish_arg`
+/// (lin-ir/src/lower.rs) unregisters the arg from the caller's owning scope — the caller must
+/// never use it again. There are NO borrow ops among the exports: even `close` ENDS the stream's
+/// life (its box is released), and `promise` MOVES the whole pipeline onto a worker thread (the
+/// worker becomes its sole owner — a parent reuse is a cross-thread use-after-move). This set MUST
+/// stay in sync with `move_streamish_arg`'s rule (any streamish arg is moved); it exists only to
+/// avoid consuming a stream passed to a NON-stream callee (none exist today — Stream is opaque and
+/// rejected everywhere else — but the gate keeps the rule precise and divergence-proof).
+fn is_std_stream_consuming_export(export_name: &str) -> bool {
+    matches!(
+        export_name,
+        "lines" | "linesMax" | "chunks" | "writeStream" | "drain" | "collect"
+            | "readText" | "close" | "promise"
+    )
+}
+
+/// The std/iter combinator exports that dispatch to a `lin_stream_*` backend when their iterable
+/// arg0 is a Stream (the SAME set as `stream_combinator_intrinsic_name` in lin-ir/src/lower.rs and
+/// the re-typing set in `streamish_combinator_ret` above). On a definitely-stream arg0 the IR
+/// redirects the call to the lazy backend, which MOVES the stream — so these consume it too.
+/// `concat` takes TWO streams; BOTH are moved into the ConcatSource (handled by per-argument
+/// consumption below, not arity-special-cased here).
+fn is_std_iter_stream_combinator(export_name: &str) -> bool {
+    matches!(
+        export_name,
+        "map" | "filter" | "take" | "drop" | "flatMap" | "takeWhile" | "dropWhile"
+            | "flatten" | "concat" | "reduce" | "find" | "some" | "every" | "while" | "for"
+    )
+}
+
+/// True when `ty` can ONLY be a `Stream` at runtime — a bare `Stream`, or a union whose every
+/// non-`Error` member is a Stream (e.g. the `Stream<…> | Error` shape a source intrinsic returns).
+/// Distinct from `type_is_streamish`, which is true for ANY union that merely *includes* a Stream
+/// (e.g. the `Array | Iterator | Stream` Iterable union). Receiver-dependent combinator re-typing
+/// keys on THIS predicate: a mixed Iterable union has a live array branch, so its eager array
+/// return must survive; only a definite-stream receiver flips the result to the stream-shaped type.
+fn is_definitely_stream(ty: &Type) -> bool {
+    match ty {
+        Type::Stream(_) => true,
+        Type::Union(variants) => {
+            let mut saw_stream = false;
+            for v in variants {
+                match v {
+                    Type::Stream(_) => saw_stream = true,
+                    // An Error arm is tolerated (a source intrinsic's `Stream | Error`); any other
+                    // non-stream member means the receiver could be a non-stream → not definite.
+                    other if is_error_shape(other) => {}
+                    _ => return false,
+                }
+            }
+            saw_stream
+        }
+        _ => false,
+    }
+}
+
+/// True if `ty` is the canonical fallible-stdlib Error object shape (`{type, message}`), the arm a
+/// source intrinsic unions onto a `Stream`. Compared structurally against `resolve::error_type()`.
+fn is_error_shape(ty: &Type) -> bool {
+    ty == &crate::resolve::error_type()
 }

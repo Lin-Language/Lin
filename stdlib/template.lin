@@ -1,13 +1,21 @@
 import foreign "lin-runtime"
-  val lin_template_render: (String, {  }) => String
+  val lin_template_render: (String, {  }) => Json
+  val lin_template_render_path: (String, {  }) => Json
 
-import { readFile } from "std/fs"
-
-export val renderWith = (template: String, data: {  }) =>
+// Render a Jinja-style template string (minijinja-backed, ADR-073) against `data`.
+// Returns the rendered String, or an Error object {type:error,message} if the
+// template has a syntax/render error. Undefined variables render as "".
+//
+// This takes an in-memory string, so `{% extends %}` / `{% include %}` cannot resolve
+// (there is no directory to load from). Use `render` for layout/inheritance.
+export val renderWith = (template: String, data: {  }): Json =>
   lin_template_render(template, data)
 
-export val render = (path: String, data: {  }) =>
-  val content = readFile(path)
-  match content
-    is { "type": "error", "message": _ } => content
-    else => lin_template_render(content, data)
+// Read a template from `path` and render it, with full layout support (ADR-074):
+// the template may `{% extends "base.jinja" %}` and fill `{% block %}`s, or pull in
+// partials via `{% include "_nav.jinja" %}` — referenced files are loaded by name
+// from the same directory as `path`. Returns the rendered String, or an Error
+// object {type:error,message} on a missing file or a syntax/render error (all
+// discriminated via `is Error`).
+export val render = (path: String, data: {  }): Json =>
+  lin_template_render_path(path, data)

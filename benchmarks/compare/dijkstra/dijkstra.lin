@@ -18,8 +18,8 @@ import { print } from "std/io"
 import { toString, substring } from "std/string"
 import { parseInt32 } from "std/number"
 import { readJson } from "std/fs"
-import { for, length, arrayAllocate, arrayAllocateFilled, set, push } from "std/array"
-
+import { length, arrayAllocate, arrayAllocateFilled, set, push } from "std/array"
+import { for } from "std/iter"
 // "infinity" sentinel; finite distances are < INF.
 val INF = 1000000000
 
@@ -104,7 +104,7 @@ nodes
     k = k + 1
   )
 
-val targetDist: Int64 = dist[idOf("n999")]
+val targetDist: Int64 = dist[n - 1]
 val checksum = targetDist * 1000003i64 + (total - total / 1000000000i64 * 1000000000i64)
 
 print("RESULT=${toString(checksum)}")

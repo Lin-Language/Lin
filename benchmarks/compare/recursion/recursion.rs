@@ -1,5 +1,5 @@
 // recursion.rs — naive recursive fib + iterative sumTo. Prints "RESULT=<int>".
-const FIB_N: i32 = 38;
+const FIB_N: i32 = 42;
 const SUM_N: i64 = 50_000_000;
 
 fn fib(n: i32) -> i64 {

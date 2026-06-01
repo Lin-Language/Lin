@@ -1,4 +1,4 @@
-import { for } from "std/array"
+import { for } from "std/iter"
 
 import foreign "lin-runtime"
   val lin_string_trim: (String) => String

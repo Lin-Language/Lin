@@ -4,7 +4,8 @@
 // "bool") and an optional default. `applyDefaults` fills missing fields; `validate`
 // checks that present fields have the right type, returning a list of error strings.
 import { keys } from "std/object"
-import { for, length, push } from "std/array"
+import { length, push } from "std/array"
+import { for } from "std/iter"
 import { toString } from "std/string"
 
 // One schema entry: the expected type tag ("string" | "int" | "bool") and an

@@ -7,10 +7,10 @@ import { getIndex, getStatus, getUser } from "./handlers"
 // Mock `render` (ADR-071): the handler calls `render(path, data)` with a hard-coded
 // view path that only resolves when run from the repo root. Replacing it with an
 // inline template via `renderWith` decouples the handler/routing logic under test
-// from a file on disk. (The real index.lint file rendering is covered separately in
+// from a file on disk. (The real index.jinja file rendering is covered separately in
 // template.test.lin.) A mock may call a DIFFERENT symbol — just not itself.
 replace render = (path: String, data: {  }): Json =>
-  renderWith("<!DOCTYPE html><title>\${title}</title><h1>\${heading}</h1>", data)
+  renderWith("<!DOCTYPE html><title>{{ title }}</title><h1>{{ heading }}</h1>", data)
 
 val makeReq = (method: String, path: String): Request =>
   {

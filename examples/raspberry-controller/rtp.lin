@@ -25,7 +25,8 @@
 //   std/array  — concat (flat UInt8[]), slice, length, push
 //   std/number — toUInt8 (compose FU indicator / header bytes)
 import { u16ToBe, u32ToBe } from "std/bytes"
-import { concat, slice, length, push } from "std/array"
+import { slice, length, push } from "std/array"
+import { concat } from "std/iter"
 import { toUInt8 } from "std/number"
 
 export val RTP_HEADER_SIZE = 12

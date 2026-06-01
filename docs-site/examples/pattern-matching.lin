@@ -1,6 +1,5 @@
 import { print } from "std/io"
-import { for } from "std/array"
-
+import { for } from "std/iter"
 type Shape =
   | { "kind": "circle", "r": Float64 }
   | { "kind": "rect", "w": Float64, "h": Float64 }

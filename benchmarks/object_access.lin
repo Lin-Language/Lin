@@ -3,8 +3,7 @@
 // objects and reads several fields from each in a loop.
 import { print } from "std/io"
 import { toString } from "std/string"
-import { range, map, reduce } from "std/array"
-
+import { range, map, reduce } from "std/iter"
 val n = 1000000
 
 // Build a record per element, then sum a derived value that touches three

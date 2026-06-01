@@ -3,22 +3,18 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>${title} — Lin Language</title>
-  <link rel="stylesheet" href="${base}/static/style.css">
+  <title>{{ title }} — Lin Language</title>
+  <link rel="stylesheet" href="{{ base }}/static/style.css">
 </head>
-<body>
+<body{% block body_attrs %}{% endblock %}>
   <button id="nav-toggle" aria-label="Toggle navigation">&#9776;</button>
   <button id="theme-toggle" aria-label="Toggle dark/light mode">&#9788;</button>
 
-  ${nav}
+  {{ nav }}
 
-  <main>
-    <article>
-      ${content}
-    </article>
-  </main>
+  {% block main %}{% endblock %}
 
-  <script src="${base}/static/highlight.js"></script>
-  <script src="${base}/static/theme.js"></script>
+  <script src="{{ base }}/static/highlight.js"></script>
+  <script src="{{ base }}/static/theme.js"></script>
 </body>
 </html>

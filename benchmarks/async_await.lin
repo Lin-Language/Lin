@@ -7,8 +7,7 @@
 import { print } from "std/io"
 import { toString } from "std/string"
 import { async, await } from "std/async"
-import { for, range } from "std/array"
-
+import { for, range } from "std/iter"
 // One async round-trip returning a small value derived from its argument (so the
 // thunk can't be folded away). Captures the function parameter `k` (transferred
 // to the worker by deep copy).
