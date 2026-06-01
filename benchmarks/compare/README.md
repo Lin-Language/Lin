@@ -35,7 +35,7 @@ all languages and are the single source of truth:
 
 | Workload   | What it exercises | Fixed parameters | Pinned `RESULT` |
 |------------|-------------------|------------------|-----------------|
-| `dijkstra` | Graph build + linear-scan-PQ shortest path + input parsing | N=1000 nodes, ~8256 edges, source `n0`, target `n999` | `115153677` |
+| `dijkstra` | Graph build + linear-scan-PQ shortest path + input parsing | N=4000 nodes, ~33163 edges, source `n0`, target `n3999` | `121789671` |
 | `parallel` | CPU-bound fan-out across threads/processes | START=27, ITERS=30000000, CHUNKS=8 | `217371330648` |
 | `recursion`| Recursive call overhead (`fib`) + iterative loop (`sumTo`) | FIB_N=38, SUM_N=50000000 | `40338169298617183` |
 | `pipeline` | Eager `map`/`filter`/`reduce`, materializing each stage | N=2000000 | `1333332666666` |
@@ -43,9 +43,9 @@ all languages and are the single source of truth:
 
 Per-workload checksum definitions:
 
-- **dijkstra**: `dist[n999] * 1000003 + (sum of all finite dist values mod 1e9)`,
+- **dijkstra**: `dist[n3999] * 1000003 + (sum of all finite dist values mod 1e9)`,
   in 64-bit. "Finite" means `dist < 1000000000` (the infinity sentinel). For the
-  committed graph: `dist[n999]=115`, `sumFinite=153332` → `115153677`.
+  committed graph: `dist[n3999]=121`, `sumFinite=789308` → `121789671`.
 - **parallel**: sum of the 8 chunk results. Each chunk runs `walk(27, 30000000)`,
   a Collatz-style integer walk (`next = 27 if start==1 else start/2 if even else
   3*start+1`) accumulating `steps + start` in 64-bit. One chunk = `27171416331`,
@@ -189,16 +189,16 @@ the identical graph:
 
 - `graph.json` — `{"nodes":["n0",...],"edges":[{"from","to","weight"},...]}`
   (read by Lin/Python/Node).
-- `graph.txt` — line 1 is `<num_nodes> <source> <target>` (e.g. `1000 n0 n999`),
+- `graph.txt` — line 1 is `<num_nodes> <source> <target>` (e.g. `4000 n0 n3999`),
   then one `from to weight` line per edge (e.g. `n0 n1 7`), in the same order as
   the JSON (read by Go/Rust, so they need no JSON library and stay a single-file
   build).
 
-Graph shape (seed `1234`, fully reproducible): 1000 nodes `n0..n999`; for each
+Graph shape (seed `1234`, fully reproducible): 4000 nodes `n0..n3999`; for each
 `i`, edges `i -> i+1 .. i+8` (skipping out-of-range), which guarantees `n0`
-reaches `n999`; plus an occasional long forward "skip" edge (each `i` with
+reaches `n3999`; plus an occasional long forward "skip" edge (each `i` with
 probability ~0.3 gets one extra edge to a random `j > i`); weights are random
-ints in `[1, 100]`; ~8256 edges total.
+ints in `[1, 100]`; ~33163 edges total.
 
 ## Relationship to the Lin-only harness
 
