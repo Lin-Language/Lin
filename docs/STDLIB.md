@@ -2508,6 +2508,32 @@ toJsonString("x\ny")         // "\"x\\ny\""
 This is the primitive the test runner uses to build machine-readable records for
 `lin test --reporter json` (see below).
 
+### toJson
+
+```txt
+val toJson: (value: Json) -> String
+```
+
+Recursively serializes ANY Lin value to a strict, valid JSON string:
+
+- strings are escaped and quoted (same escaping as `toJsonString`);
+- object **keys** are escaped and quoted too;
+- ints/floats become numeric literals; non-finite floats (`NaN`, `±Infinity`) become `null`,
+  matching JavaScript's `JSON.stringify`;
+- `true`/`false`/`null` become their JSON literals;
+- arrays and objects recurse arbitrarily deep.
+
+Unlike `toString` on an object/array (which is a lossy human display that does not escape string
+contents or keys), `toJson` always produces output that round-trips through any conforming JSON
+parser.
+
+```txt
+toJson(42)                               // "42"
+toJson("a\"b")                           // "\"a\\\"b\""
+toJson([1, 2, 3])                        // "[1,2,3]"
+toJson({ "name": "Bob", "tags": ["a"] }) // "{\"name\":\"Bob\",\"tags\":[\"a\"]}"
+```
+
 ---
 
 ## std/hash

@@ -2501,6 +2501,7 @@ fn lower_intrinsic_call(
         "lin_array_set" => Intrinsic::ArraySetDyn,
         "lin_keys" => Intrinsic::Keys,
         "lin_value_key" => Intrinsic::ValueKey,
+        "lin_to_json" => Intrinsic::ToJson,
         "lin_array_allocate" => Intrinsic::ArrayAllocate,
         "lin_array_allocate_filled" => Intrinsic::ArrayAllocateFilled,
         "concat" => Intrinsic::Concat,
