@@ -2489,6 +2489,25 @@ bare type name): `type IntArr = Int32[]; IntArr.fromJson([1, 2, 3])`.
 A `Json` value cannot be assigned to a concrete structured object without decoding — `fromJson`
 (or `is`/`has` narrowing) is the sound conversion (ADR-046).
 
+### toJsonString
+
+```txt
+val toJsonString: (s: String) -> String
+```
+
+Escapes a string and wraps it in double quotes, producing a valid JSON string literal. The
+returned value includes the surrounding quotes and escapes `"`, `\`, newline (`\n`), carriage
+return (`\r`), tab (`\t`), and other control characters (as `\uXXXX`).
+
+```txt
+toJsonString("hello")        // "\"hello\""  (the 7 chars: " h e l l o ")
+toJsonString("a\"b")         // "\"a\\\"b\""
+toJsonString("x\ny")         // "\"x\\ny\""
+```
+
+This is the primitive the test runner uses to build machine-readable records for
+`lin test --reporter json` (see below).
+
 ---
 
 ## std/hash
@@ -4687,6 +4706,38 @@ replace readFile = (path: String): Json => "mock contents of ${path}"
 For worked examples see `examples/processes/` (mocking `std/process.exec`),
 `examples/dijkstra/` (mocking `std/fs` read/write), and `examples/web-server/`
 (mocking `std/template.render`); ADR-071 has the design.
+
+---
+
+### Machine-readable output (`lin test --reporter json`)
+
+By default `lin test` prints a human-readable summary to stderr. Pass `--reporter json` to
+emit **newline-delimited JSON (NDJSON)** on **stdout** instead — one record per line — for
+consumption by tooling (e.g. the VSCode Test Explorer integration). The process exit code is
+unchanged: non-zero if any test file failed.
+
+Each line is one of two record shapes:
+
+```jsonc
+// One per test (from the suite's results)
+{ "event": "test", "file": "<path>", "name": "<test name>", "status": "pass" }
+{ "event": "test", "file": "<path>", "name": "<test name>", "status": "fail", "message": "<joined failure messages>" }
+
+// One per test file (always emitted, after its test records)
+{ "event": "file", "file": "<path>", "status": "pass" | "fail" | "timeout" | "compile_error", "durationMs": <int>, "message"?: "<diagnostic>" }
+```
+
+- `status` on a `test` record is `pass` or `fail`; the `message` (failures only) is the
+  test's failure messages joined with `\n` (so a `toBe` mismatch carries its
+  `expected: …\nactual: …` text). All strings are properly JSON-escaped.
+- The `file` record reports the whole file's outcome and is the only signal for files that
+  never produced per-test records — e.g. a `compile_error` (with the diagnostic in `message`)
+  or a `timeout`.
+
+Internally the runner (`std/test`) emits each record as a `##LINTEST## `-prefixed line gated on
+the `LIN_TEST_JSON` environment variable; the CLI strips the prefix, attaches the file path,
+and re-serializes each record canonically. The marker lets the CLI separate runner records from
+any `print` output your own test code emits on the same stdout stream.
 
 ---
 
