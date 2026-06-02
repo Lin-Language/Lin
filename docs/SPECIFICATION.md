@@ -285,12 +285,24 @@ compiler **monomorphizes** a specialized copy (`isEven$Int32`, `isEven$Float64`)
 the same native unboxed code as a hand-written concrete function — true parity, no boxing.
 
 Each `Number` occurrence in a signature is its own independent bounded variable, so
-`(a: Number, b: Number)` admits `a` and `b` at different families. Limitations (first cut): a
-*dynamic* `Json` value can't be proven numeric, so it cannot be passed to a `Number` parameter
-(decode it to a family with `Int32.fromJson(v)` etc.); and a single call that combines two distinct
-`Number` parameters at *different* families in a `Number`-returning function (e.g. `add(10, 2.5)` for
-`(a: Number, b: Number) => a + b`) is rejected — annotate the families explicitly or convert the
-arguments. For genuinely dynamic numerics, use `Json`. See §21 for coercion and inference rules.
+`(a: Number, b: Number)` admits `a` and `b` at different families. A single call that combines two
+distinct `Number` parameters at *different* families (e.g. `add(10, 2.5)` for
+`(a: Number, b: Number) => a + b`) is **supported** and **widens exactly like concrete families**:
+`add(10, 2.5)` yields `Float64` (`12.5`), `add(10, 2)` stays `Int` (both `Int32`), `add(1.5, 2.5)`
+is `Float64`. The monomorphized `add$Int32_Float64` emits native `sitofp`+`fadd` — no boxing.
+
+`Number` also works in **nested positions**: `Number[]` (an array element — homogeneous, one shared
+bounded family per array) and combinator callbacks over it. For example
+`(xs: Number[]) => xs.map((v: Number) => v * 2)` specializes the element family from the argument
+(`f([1, 2, 3])` ⇒ `Int32`, `f([1.5, 2.5])` ⇒ `Float64`) and runs as a native unboxed loop. The
+callback's `Number` parameter is tied to the array element it consumes.
+
+Limitations: a *dynamic* `Json` value can't be proven numeric, so it cannot be passed to a `Number`
+parameter (decode it to a family with `Int32.fromJson(v)` etc.) — for genuinely dynamic numerics use
+`Json`. And `Number` in a **higher-order function-typed parameter** (e.g.
+`(f: (Number) => Number, x: Number) => f(x)`) cannot yet be inferred at the call site (the same
+inference gap that affects an explicit `<T>` callback param); use a concrete numeric family there.
+See §21 for coercion and inference rules.
 
 ### 3.3 Strict JSON Object Literals
 

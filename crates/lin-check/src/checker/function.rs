@@ -465,7 +465,24 @@ impl Checker {
         for (i, param) in params.iter().enumerate() {
             // Use the declared annotation if present; otherwise use the hint from expected_params.
             let ty = if let Some(ref type_ann) = param.type_ann {
-                self.resolve_type_with_number(type_ann).map_err(|e| Diagnostic::error(span, e))?
+                // NESTED-`Number` UNIFICATION (ADR-018, reversed): a bare `Number` lambda parameter
+                // whose EXPECTED type (from the enclosing combinator — e.g. `.map`'s callback param,
+                // which is the receiver's element type) is ALSO a numeric-bounded var should REUSE
+                // that var rather than mint a fresh independent one. This ties the inner callback's
+                // numeric family to the array element it consumes, so a function like
+                // `(xs: Number[]) => xs.map((v: Number) => v*2)` has its return pinned by `xs`'s
+                // element family at the call site instead of leaving an un-inferrable free body var.
+                // Both bounds are `numeric`, so reusing the outer var is sound (same constraint). A
+                // non-`Number` annotation, or a hint that isn't a numeric-bounded var, resolves
+                // normally (each `Number` otherwise mints its own var — the independent-param design).
+                if Self::is_bare_number(type_ann)
+                    && i < expected_params.len()
+                    && matches!(&expected_params[i], Type::TypeVar(id) if self.numeric_tvs.contains(id))
+                {
+                    expected_params[i].clone()
+                } else {
+                    self.resolve_type_with_number(type_ann).map_err(|e| Diagnostic::error(span, e))?
+                }
             } else if i < expected_params.len() && !matches!(expected_params[i], Type::TypeVar(_)) {
                 expected_params[i].clone()
             } else {
@@ -636,7 +653,8 @@ impl Checker {
             declared
         } else if matches!(expected_ret, Type::TypeVar(id)
             if *id >= 9001 && *id != u32::MAX)
-            && !matches!(body_ty, Type::TypeVar(_))
+            && (!matches!(body_ty, Type::TypeVar(_))
+                || matches!(body_ty, Type::TypeVar(id) if self.numeric_tvs.contains(&id)))
         {
             // Expected return is a QUANTIFIED GENERIC type parameter (`<U>`, id ≥ 9001) and the
             // body has a concrete type: surface the concrete `body_ty` as the lambda's return.
@@ -646,6 +664,11 @@ impl Checker {
             // `U[]` becomes `Int32[]`, so monomorphization can specialize. Forcing the bare
             // generic TypeVar here (as the polymorphic-slot case below does) would leave `U`
             // uninferrable and the call would fall back to a boxed copy.
+            // A body that is a numeric-bounded `Number` var (ADR-018, reversed) is ALSO surfaced
+            // here (not a free polymorphic slot): it pins the combinator's `U` to that var so a
+            // nested `(xs: Number[]) => xs.map((v: Number) => v*2)` propagates the element family
+            // (`v` reuses `xs`'s element var) into the return — otherwise `U` stays an independent
+            // free var and the outer call can't infer it (the bug-#4 nested-callback case).
             body_ty
         } else if matches!(expected_ret, Type::TypeVar(_)) {
             // Expected return is a TypeVar (e.g. worker reply, promise result, or a Json/`Function`
