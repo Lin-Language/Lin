@@ -1269,7 +1269,7 @@ fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: 
 /// differ (box concrete → union, or unbox union → concrete). Returns the (possibly new)
 /// temp; a no-op when representations match.
 fn coerce_to_slot_type(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
-    if type_repr_differs(value_ty, slot_ty) {
+    if type_repr_differs(value_ty, slot_ty) || scalar_numeric_repr_differs(value_ty, slot_ty) {
         let dst = builder.alloc_temp(slot_ty.clone());
         builder.emit(Instruction::Coerce {
             dst, src: t, from_ty: value_ty.clone(), to_ty: slot_ty.clone(),
@@ -3046,6 +3046,26 @@ fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp,
 /// union/Json (TaggedVal*) and the other is a concrete type.
 fn type_repr_differs(from: &Type, to: &Type) -> bool {
     is_union_ty(from) != is_union_ty(to)
+}
+
+/// True when two CONCRETE numeric types have a different unboxed machine representation, so a
+/// value of one must be converted (sitofp/fptrunc/sext/...) to be stored as the other. This is
+/// distinct from `type_repr_differs`, which only covers the union/Json box boundary.
+///
+/// The trigger case is a mixed numeric array literal like `[0, 3.14]`: the checker unifies the
+/// element type to Float64 (so the array uses the flat f64 scalar repr), but each integer
+/// literal element keeps its own Int32 type. Without this conversion the i32 element flowed
+/// straight into `lin_flat_array_push_f64`, producing an i32-arg-to-f64-param type mismatch in
+/// the emitted IR. Reusing the existing `Coerce` instruction lets codegen's `compile_ir_coerce`
+/// emit the proper int→float / float-width conversion at the push site.
+fn scalar_numeric_repr_differs(from: &Type, to: &Type) -> bool {
+    if !from.is_numeric() || !to.is_numeric() {
+        return false;
+    }
+    // Int vs float: representation differs. Float vs float: differs only across widths
+    // (Float32 vs Float64). Int vs int width changes are handled at their own use sites and a
+    // flat-int array's element type matches its members, so don't widen those here.
+    from.is_float() != to.is_float() || (from.is_float() && to.is_float() && from != to)
 }
 
 /// Box a value to Json (TaggedVal*) if it is a concrete (non-union) type.

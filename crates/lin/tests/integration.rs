@@ -1205,6 +1205,39 @@ print(toString(c))                 // 0.5
 }
 
 #[test]
+fn test_mixed_int_float_array_literal_widens_elements() {
+    // A `[int, ..., float, ...]` literal unifies its element type to Float64 (the checker
+    // widens via unify_types), so the array is stored in the FLAT f64 scalar repr. The
+    // integer literal elements must be converted to f64 BEFORE the flat push — otherwise
+    // codegen emitted `lin_flat_array_push_f64(ptr, i32 0)`, an i32 arg to an f64 push
+    // ("Call parameter type does not match function signature"). Order must not matter, so
+    // exercise int-first, float-first, and float-in-the-middle. Read elements back (sum and
+    // direct index) to prove the int operands became the CORRECT floats, not bit garbage.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+import { reduce } from "std/iter"
+
+val a = [0, -17, 3.14, 1000000]
+print(toString(length(a)))                 // 4
+print(toString(a[0]))                       // 0.0  (int element widened to float)
+print(toString(a[1]))                       // -17.0
+print(toString(a[3]))                       // 1000000.0
+print(toString(reduce(a, 0.0, (acc, x) => acc + x)))  // 999986.14
+
+val b = [3.0, 1, 2]                          // float first
+print(toString(reduce(b, 0.0, (acc, x) => acc + x)))  // 6.0
+
+val c = [1, 2, 3.0]                          // float last
+print(toString(reduce(c, 0.0, (acc, x) => acc + x)))  // 6.0
+"#);
+    assert_eq!(
+        output,
+        vec!["4", "0.0", "-17.0", "1000000.0", "999986.14", "6.0", "6.0"]
+    );
+}
+
+#[test]
 fn test_float_constants_link_under_pie() {
     // Float constants land in .rodata and, with a non-PIC reloc model, emit
     // R_X86_64_32S absolute relocations that the system `cc`'s default PIE link
