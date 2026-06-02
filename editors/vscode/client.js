@@ -2,7 +2,9 @@
 
 const fs = require("fs");
 const path = require("path");
-const { workspace, window, commands, Uri } = require("vscode");
+const os = require("os");
+const cp = require("child_process");
+const { workspace, window, commands, languages, Range, TextEdit, Uri } = require("vscode");
 const { LanguageClient, TransportKind } = require("vscode-languageclient/node");
 
 let client;
@@ -103,6 +105,39 @@ async function installOnPath(context) {
   }
 }
 
+// `lin fmt` only reformats files in place on disk and the editor buffer may
+// hold unsaved edits, so we round-trip the in-memory text through a temp file:
+// write it out, run the formatter, read the result back, and return it as a
+// single full-document replacement. On any failure (parse error, missing
+// binary) we surface the message and return no edits, leaving the buffer alone.
+function makeFormattingProvider(linBin) {
+  return {
+    provideDocumentFormattingEdits(document) {
+      let tmpDir;
+      try {
+        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "lin-fmt-"));
+        const tmpFile = path.join(tmpDir, "buffer.lin");
+        fs.writeFileSync(tmpFile, document.getText());
+        cp.execFileSync(linBin, ["fmt", tmpFile]);
+        const formatted = fs.readFileSync(tmpFile, "utf8");
+        const fullRange = new Range(
+          document.positionAt(0),
+          document.positionAt(document.getText().length)
+        );
+        return [TextEdit.replace(fullRange, formatted)];
+      } catch (err) {
+        const detail = (err.stderr && err.stderr.toString()) || err.message;
+        window.showErrorMessage(`Lin: formatting failed: ${detail}`);
+        return [];
+      } finally {
+        if (tmpDir) {
+          try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
+        }
+      }
+    },
+  };
+}
+
 function activate(context) {
   const lspBin = resolveBin(context, "lin-lsp");
   const linBin = resolveBin(context, "lin");
@@ -149,6 +184,14 @@ function activate(context) {
     terminal.sendText(`"${linBin}" ${subcommand} "${file}"`);
   };
 
+  // Standard "Format Document" (Shift+Alt+F) and format-on-save go through this.
+  context.subscriptions.push(
+    languages.registerDocumentFormattingEditProvider(
+      { scheme: "file", language: "lin" },
+      makeFormattingProvider(linBin)
+    )
+  );
+
   context.subscriptions.push(
     commands.registerCommand("lin.build", () => runLinCommand("build")),
     commands.registerCommand("lin.run",   () => runLinCommand("run")),
@@ -159,6 +202,19 @@ function activate(context) {
       const terminal = window.createTerminal("Lin Test");
       terminal.show(true);
       terminal.sendText(`"${linBin}" test "${dir}"`);
+    }),
+    // Route through the provider above so it behaves identically to Format Document.
+    commands.registerCommand("lin.format", () => {
+      const editor = window.activeTextEditor;
+      if (!editor) {
+        window.showWarningMessage("Lin: No active file.");
+        return;
+      }
+      if (!editor.document.uri.fsPath.endsWith(".lin")) {
+        window.showWarningMessage("Lin: Active file is not a .lin file.");
+        return;
+      }
+      commands.executeCommand("editor.action.formatDocument");
     }),
     commands.registerCommand("lin.installOnPath", () => installOnPath(context)),
   );
