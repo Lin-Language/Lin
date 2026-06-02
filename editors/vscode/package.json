@@ -22,6 +22,8 @@
     "onCommand:lin.build",
     "onCommand:lin.run",
     "onCommand:lin.test",
+    "onCommand:lin.testFile",
+    "onCommand:lin.testProject",
     "onCommand:lin.format",
     "onCommand:lin.installOnPath"
   ],
@@ -56,6 +58,16 @@
       {
         "command": "lin.test",
         "title": "Test",
+        "category": "Lin"
+      },
+      {
+        "command": "lin.testFile",
+        "title": "Test File",
+        "category": "Lin"
+      },
+      {
+        "command": "lin.testProject",
+        "title": "Test Project",
         "category": "Lin"
       },
       {
