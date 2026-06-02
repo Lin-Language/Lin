@@ -72,7 +72,7 @@ val errorNote = (errs: String[]): String =>
   if length(errs) == 0 then
     ""
   else
-    "\nskipped ${toString(length(errs))} bad row(s)"
+    "\nskipped ${errs.length()} bad row(s)"
 
 // Render a multi-line text report from a batch of CSV lines.
 export val render = (lines: String[]): String =>

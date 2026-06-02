@@ -55,15 +55,15 @@ val processLinks = (text: String): String =>
   if mid == -1 then text
   else
     val before = substring(text, 0, mid)
-    val after = substring(text, mid + 2, length(text))
+    val after = text.substring(mid + 2, text.length())
     val open = indexOf(before, "[")
     val close = indexOf(after, ")")
     if open == -1 || close == -1 then text
     else
       val prefix = substring(before, 0, open)
-      val linkText = substring(before, open + 1, length(before))
+      val linkText = before.substring(open + 1, before.length())
       val url = substring(after, 0, close)
-      val rest = substring(after, close + 1, length(after))
+      val rest = after.substring(close + 1, after.length())
       // Bind the recursive result before interpolating: calling processLinks inline
       // inside the interpolation releases the sibling substring locals early (the same
       // projection/recursion RC bug recorded in KNOWN_ISSUES.md).
@@ -153,7 +153,7 @@ val isTableSeparator = (line: String): Boolean =>
 val tableCells = (line: String): String[] =>
   val guarded = replaceAll(trim(line), "\\|", "PIPE")
   val raw = guarded.split("|")
-  val inner = slice(raw, 1, length(raw) - 1)
+  val inner = raw.slice(1, raw.length() - 1)
   var cells: String[] = []
   inner.for(cell => cells = cells.append(replaceAll(trim(cell), "PIPE", "|")))
   cells
@@ -230,11 +230,11 @@ val handleCodeLine = (st: Json, line: String, trimmed: String): Json =>
   else { ...st, "codeLines": st["codeLines"].append(line) }
 
 val openFence = (st: Json, trimmed: String): Json =>
-  val lang = if length(trimmed) > 3 then trim(substring(trimmed, 3, length(trimmed))) else ""
+  val lang = if trimmed.length() > 3 then trimmed.substring(3, trimmed.length()).trim() else ""
   { ...flushBuffers(st), "inCode": true, "codeLang": lang, "codeLines": [] }
 
 val addHeading = (st: Json, line: String, level: Int32): Json =>
-  val blocks = flushedBlocks(st).append({ "kind": "heading", "level": level, "text": trim(substring(line, level + 1, length(line))) })
+  val blocks = flushedBlocks(st).append({ "kind": "heading", "level": level, "text": line.substring(level + 1, line.length()).trim() })
   { ...st, "blocks": blocks, "para": [], "quote": [], "items": [], "tableRows": [], "tableOn": false }
 
 val addHr = (st: Json): Json =>
@@ -244,7 +244,7 @@ val addHr = (st: Json): Json =>
 // Flush paragraph, list and table, but keep accumulating consecutive quote lines.
 val addQuoteLine = (st: Json, line: String): Json =>
   val blocks = withTableFlushed(withListFlushed(withParagraphFlushed(st["blocks"], st), st), st)
-  { ...st, "blocks": blocks, "para": [], "items": [], "tableRows": [], "tableOn": false, "quote": st["quote"].append(substring(line, 2, length(line))) }
+  { ...st, "blocks": blocks, "para": [], "items": [], "tableRows": [], "tableOn": false, "quote": st["quote"].append(line.substring(2, line.length())) }
 
 // Append a list item; a change of list kind (ordered vs unordered) closes the previous list.
 val addListItem = (st: Json, text: String, ordered: Boolean): Json =>
@@ -289,7 +289,7 @@ val parseLine = (st: Json, line: String): Json =>
   else if trimmed == "---" then addHr(st)
   else if headingLevel(line) > 0 then addHeading(st, line, headingLevel(line))
   else if startsWith(line, "> ") then addQuoteLine(st, line)
-  else if startsWith(line, "- ") then addListItem(st, substring(line, 2, length(line)), false)
+  else if startsWith(line, "- ") then addListItem(st, line.substring(2, line.length()), false)
   else if isOrderedItem(line) then addListItem(st, substring(line, indexOf(line, ". ") + 2, length(line)), true)
   else if isTableRow(line) then addTableRow(st, line)
   else addParagraphLine(st, line)

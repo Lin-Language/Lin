@@ -28,7 +28,7 @@ val basePath =
 
 // Extract the text from a heading line "# Foo" -> "Foo"
 val headingText = (line: String): String =>
-  trim(substring(line, 2, length(line)))
+  line.substring(2, line.length()).trim()
 
 // Extract the first H1 heading from markdown source, or fall back to the default
 val extractTitle = (source: String): String =>
@@ -46,16 +46,16 @@ val extractTitle = (source: String): String =>
 val contentPathToOutput = (path: String): String =>
   val prefix = "${contentDir}/"
   val prefixLen = length(prefix)
-  val relative = if startsWith(path, prefix) then substring(path, prefixLen, length(path)) else path
-  val noExt = if contains(relative, ".md") then substring(relative, 0, length(relative) - 3) else relative
+  val relative = if path.startsWith(prefix) then path.substring(prefixLen, path.length()) else path
+  val noExt = if relative.contains(".md") then relative.substring(0, relative.length() - 3) else relative
   "${outputDir}/${noExt}.html"
 
 // Convert a content file path to its URL path
 val contentPathToUrl = (path: String): String =>
   val prefix = "${contentDir}/"
   val prefixLen = length(prefix)
-  val relative = if startsWith(path, prefix) then substring(path, prefixLen, length(path)) else path
-  val noExt = if contains(relative, ".md") then substring(relative, 0, length(relative) - 3) else relative
+  val relative = if path.startsWith(prefix) then path.substring(prefixLen, path.length()) else path
+  val noExt = if relative.contains(".md") then relative.substring(0, relative.length() - 3) else relative
   if noExt == "index" then "/" else "/${noExt}"
 
 // Get the directory portion of a file path

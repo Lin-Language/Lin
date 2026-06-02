@@ -114,9 +114,9 @@ val demo = (): Null =>
   val stop = encodePacket(0.0, 0.0)
   val fwd = encodePacket(1.0, 1.0)
   val mixed = encodePacket(0.5, 0.0 - 0.3)
-  print("stop packet bytes: ${toString(length(stop))}")
-  print("forward packet bytes: ${toString(length(fwd))}")
-  print("mixed packet bytes: ${toString(length(mixed))}")
+  print("stop packet bytes: ${stop.length()}")
+  print("forward packet bytes: ${fwd.length()}")
+  print("mixed packet bytes: ${mixed.length()}")
   print("clampSpeed(1.5) = ${toString(clampSpeed(1.5))}")
   print("clampSpeed(0.15) = ${toString(clampSpeed(0.15))}")
 

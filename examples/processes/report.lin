@@ -10,7 +10,7 @@ import { toString, join } from "std/string"
 export type Summary = { "total": Int32, "passed": Int32, "failed": Int32, "ok": Boolean }
 
 val countOutcome = (results: TaskResult[], outcome: String): Int32 =>
-  length(results.filter(r => r["outcome"] == outcome))
+  results.filter(r => r["outcome"] == outcome).length()
 
 // Tally results: a run is `ok` only if every task passed.
 export val summarize = (results: TaskResult[]): Summary =>
