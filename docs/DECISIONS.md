@@ -146,9 +146,9 @@ independently). The function body type-checks because the bound guarantees a num
 arithmetic on a `Number`-typed operand is permitted; the operator's result type IS the bounded var,
 so it flows through. At each call site the concrete family flows in from the argument, and Lin's
 existing single-module **monomorphization** (`crates/lin-ir/src/monomorphize.rs`) materializes a
-specialized copy (`isEven$Int32`, `isEven$Float64`) compiled to native unboxed ops. A non-numeric
-argument (`String`/`Bool`/`Object`/array) is rejected at the call site with
-"expected a numeric type (Number)".
+specialized copy (`isEven$Int32`, `isEven$Float64`) compiled to native unboxed ops. A genuinely
+non-numeric argument (`String`/`Bool`/`Object`/array) is rejected at the call site with
+"expected a numeric type (Number)". A dynamic `Json` value IS accepted (see **§Json** below).
 
 **Rationale**: We measured the boxed-union representation at ~3.6× slower than concrete `Int32`
 (every op a tagged `lin_tagged_arith` over heap-boxed operands). The bounded-generic model is the
@@ -206,11 +206,31 @@ type (so the spec signature and the call site agree). Before this fix the result
 while codegen emitted a `double` → the `lin_box_int32(double)` / `ret double`-vs-`i32` ABI crash;
 the earlier reject in `checker/call.rs` was a workaround that is now removed.
 
+**§Json: a `Json` value is ACCEPTED at a `Number` parameter** (direct OR projected), consistent with
+the existing `Json → Int32` scalar coercion gap (ADR-048). It monomorphizes the bounded var to the
+default **`Int32`** family and unboxes **unchecked** — a `Json` holding a non-integer number unboxes
+as garbage, exactly the same accepted, documented unsoundness as `val n: Int32 = jsonValue` today.
+The safe path for validated extraction is `Int32.fromJson(v)` (ADR-047), which range-checks and
+returns `T | Error`. This replaces an earlier inconsistency: a DIRECT `Json` argument
+(`val x: Json = 42`, the bare `TypeVar(u32::MAX)` marker) was REJECTED while a `Json` PROJECTION
+(`config["count"]`, a fresh inference var) slipped past the call-site bound guard and ran — so the
+same value produced a compile error or a result depending only on whether it was indexed. Both now
+compile and produce the SAME answer. Mechanically: (1) `arg_satisfies_numeric_bound`
+(`checker/call.rs`) accepts ANY `TypeVar`, including the `u32::MAX` Json wildcard (it previously
+excluded it); (2) the `Number` var unifies against the Json arg's wildcard type and
+`lin-ir::monomorphize` binds it to the wildcard, minting a `$Json`-named spec whose param is a boxed
+`ptr` unboxed as `Int32`; (3) for a `Number`-RETURNING body over a Json operand (`x * 3`), the
+arithmetic op's result and the spec/return type are re-derived to the concrete unboxed family
+(`Int32`) — mirroring the IR's unbox-to-concrete-operand behaviour — so the spec signature
+(`define i32 triple$Json`) matches the native scalar it returns instead of a stale boxed `ptr` (the
+historical `triple$Json` codegen crash), and the call site re-coerces (boxes) the scalar back to the
+`Json` the surrounding context expects.
+
 **Consequence / limitations** (first cut):
-- **Dynamic numerics use `Json`, not `Number`.** A `Json` (statically-unknown) value cannot be
-  proven numeric and cannot monomorphize to a native op, so passing one to a `Number` parameter is a
-  compile error (decode it to a family first, e.g. `Int32.fromJson(v)`). We deliberately do NOT fall
-  back to a silent boxed slow path under a `Number` annotation.
+- **Validated dynamic numerics use `fromJson`.** A `Json` value passed to a `Number` parameter is
+  accepted (§Json above) but decoded as `Int32` with an unchecked unbox; for a range-checked decode
+  to a specific family use `Int32.fromJson(v)` etc. We do NOT promote a `Json` `Number` argument to a
+  boxed slow path — it specializes to the concrete `Int32` family like every other argument.
 - `Number` is no longer part of the structural definition of `Json` (it never resolved to a union).
 - **Nested `Number` works** for `Number[]` and combinator callbacks over it (see the implementation
   note above) — `(xs: Number[]) => xs.map((v: Number) => v*2)` specializes and runs natively.

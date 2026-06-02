@@ -297,9 +297,13 @@ bounded family per array) and combinator callbacks over it. For example
 (`f([1, 2, 3])` ⇒ `Int32`, `f([1.5, 2.5])` ⇒ `Float64`) and runs as a native unboxed loop. The
 callback's `Number` parameter is tied to the array element it consumes.
 
-Limitations: a *dynamic* `Json` value can't be proven numeric, so it cannot be passed to a `Number`
-parameter (decode it to a family with `Int32.fromJson(v)` etc.) — for genuinely dynamic numerics use
-`Json`. And `Number` in a **higher-order function-typed parameter** (e.g.
+A dynamic `Json` value (direct or projected, e.g. `config["count"]`) **is accepted** at a `Number`
+parameter, consistent with the `Json → Int32` scalar coercion (ADR-048). It specializes to the
+default `Int32` family and unboxes **unchecked** — a `Json` holding a non-integer number unboxes as
+garbage, the same accepted unsoundness as `val n: Int32 = jsonValue`. For a range-checked decode use
+`Int32.fromJson(v)` (which returns `T | Error`).
+
+Limitations: `Number` in a **higher-order function-typed parameter** (e.g.
 `(f: (Number) => Number, x: Number) => f(x)`) cannot yet be inferred at the call site (the same
 inference gap that affects an explicit `<T>` callback param); use a concrete numeric family there.
 See §21 for coercion and inference rules.

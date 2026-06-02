@@ -8,15 +8,24 @@ use crate::typed_ir::*;
 use crate::types::Type;
 
 /// Whether an argument type may satisfy a `Number` (numeric-bounded) parameter (ADR-018, reversed).
-/// Accepts a concrete numeric family (the monomorphizable case) and a generic/unsolved type var
-/// other than the `Json` wildcard (the bound flows on to the outer specialization, or is zonked to
-/// a concrete family). REJECTS the `Json` wildcard (`TypeVar(u32::MAX)`): a dynamically-typed value
-/// can't be statically proven numeric and can't be monomorphized to a native op — the honest
-/// outcome is a compile error directing the user to a concrete family, NOT a silent boxed slow path.
+/// Accepts:
+///   * a concrete numeric family (the monomorphizable case),
+///   * a generic/unsolved type var (the bound flows on to the outer specialization, or is zonked to
+///     a concrete family), AND
+///   * the `Json` wildcard (`TypeVar(u32::MAX)`) — a dynamic `Json` value (ADR-018 §Json policy).
+///     This matches the existing `Json → Int32` scalar coercion (ADR-048): a `Json` argument is
+///     ACCEPTED at a `Number` parameter and monomorphizes to the default `Int32` family, unboxing
+///     unchecked. Previously a DIRECT `Json` (the bare `u32::MAX` marker) was rejected here while a
+///     `Json` PROJECTION (`config["k"]`, a fresh inference var) slipped past — an inconsistency now
+///     removed. A `Json` holding a non-number unboxes as garbage, the SAME accepted, documented
+///     unsoundness as `Json → Int32` today; `fromJson` is the validated extraction path.
+/// REJECTS only genuinely non-numeric concrete types (`String`/`Bool`/`Object`/array).
 fn arg_satisfies_numeric_bound(arg_ty: &Type) -> bool {
     match arg_ty {
         t if t.is_numeric() => true,
-        Type::TypeVar(id) => *id != u32::MAX,
+        // Any type var, INCLUDING the `Json` wildcard (`u32::MAX`): a generic/unsolved bound flows
+        // on; a `Json` value monomorphizes to the default `Int32` family (see doc above).
+        Type::TypeVar(_) => true,
         _ => false,
     }
 }
@@ -395,7 +404,6 @@ impl Checker {
                         if self.numeric_tvs.contains(id) {
                             let arg_ty = typed_args[i].ty();
                             if !arg_satisfies_numeric_bound(&arg_ty) {
-                                let dyn_hint = arg_ty.is_json();
                                 return Err(Diagnostic::error(
                                     args[i].span(),
                                     format!(
@@ -403,14 +411,11 @@ impl Checker {
                                         i + 1,
                                         arg_ty
                                     ),
-                                ).with_help(if dyn_hint {
-                                    "a `Number` parameter must be a STATICALLY numeric value so it can \
-                                     compile to a native op; a dynamic `Json` value can't be proven numeric \
-                                     — decode it to a family first (e.g. `Int32.fromJson(v)`)".to_string()
-                                } else {
-                                    "a `Number` parameter accepts any numeric family (Int8…Float64); \
-                                     for dynamic non-numeric data use `Json`".to_string()
-                                }));
+                                ).with_help(
+                                    "a `Number` parameter accepts any numeric family (Int8…Float64), \
+                                     or a dynamic `Json` value (decoded as Int32, unchecked — use \
+                                     `Int32.fromJson(v)` for a validated decode)".to_string()
+                                ));
                             }
                         }
                     }
@@ -701,7 +706,6 @@ impl Checker {
                         if self.numeric_tvs.contains(id) {
                             let arg_ty = all_args[i].ty();
                             if !arg_satisfies_numeric_bound(&arg_ty) {
-                                let dyn_hint = arg_ty.is_json();
                                 return Err(Diagnostic::error(
                                     all_arg_exprs.get(i).map(|e| e.span()).unwrap_or(span),
                                     format!(
@@ -709,14 +713,11 @@ impl Checker {
                                         i + 1,
                                         arg_ty
                                     ),
-                                ).with_help(if dyn_hint {
-                                    "a `Number` parameter must be a STATICALLY numeric value so it can \
-                                     compile to a native op; a dynamic `Json` value can't be proven numeric \
-                                     — decode it to a family first (e.g. `Int32.fromJson(v)`)".to_string()
-                                } else {
-                                    "a `Number` parameter accepts any numeric family (Int8…Float64); \
-                                     for dynamic non-numeric data use `Json`".to_string()
-                                }));
+                                ).with_help(
+                                    "a `Number` parameter accepts any numeric family (Int8…Float64), \
+                                     or a dynamic `Json` value (decoded as Int32, unchecked — use \
+                                     `Int32.fromJson(v)` for a validated decode)".to_string()
+                                ));
                             }
                         }
                     }

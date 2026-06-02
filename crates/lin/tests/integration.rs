@@ -10179,3 +10179,40 @@ print(toString(firstTwo([5, 6])))
 "#);
     assert_eq!(out, vec!["60", "11"]);
 }
+
+#[test]
+fn test_number_json_arg_accepted_direct_and_projected_consistent() {
+    // ADR-018 (reversed) §Json: a `Json` value is ACCEPTED at a `Number` parameter — consistent
+    // with the `Json → Int32` scalar coercion gap (ADR-048), monomorphizing to the default `Int32`
+    // family with an unchecked unbox. This was previously INCONSISTENT: a DIRECT `Json`
+    // (`val x: Json = 42`, the bare `TypeVar(u32::MAX)` marker) was REJECTED while a `Json`
+    // PROJECTION (`config["count"]`, a fresh inference var) slipped past the bound guard and ran.
+    // BOTH forms must now compile AND produce the SAME runtime answer (`isEven$Json` unboxes the
+    // Json as Int32 and `srem`s — byte-identical specializations). 42 is even ⇒ `true` for both.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val isEven = (x: Number) => x % 2 == 0
+val direct: Json = 42
+val config: Json = { "count": 42 }
+print(toString(isEven(direct)))
+print(toString(isEven(config["count"])))
+"#);
+    assert_eq!(out, vec!["true", "true"]);
+}
+
+#[test]
+fn test_number_json_arg_arithmetic_returns_right_number() {
+    // A Json-int through a `Number` param USED IN ARITHMETIC (a Number-returning body, not just a
+    // Bool predicate) must monomorphize to `triple$Json` (param unboxed Int32, native `mul i32`),
+    // box the scalar result back to the Json the surrounding `toString` expects, and return the
+    // RIGHT number. Both the direct `Json` binding and the `config[...]` projection of 14 ⇒ 42.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val triple = (x: Number) => x * 3
+val direct: Json = 14
+val config: Json = { "count": 14 }
+print(toString(triple(direct)))
+print(toString(triple(config["count"])))
+"#);
+    assert_eq!(out, vec!["42", "42"]);
+}
