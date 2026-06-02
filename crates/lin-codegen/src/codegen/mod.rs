@@ -1131,33 +1131,54 @@ impl<'ctx> Codegen<'ctx> {
                                 std::collections::HashMap::new()
                             };
 
-                            // ── PHASE 1: inline scalar-only construction ──────────────────
-                            // When the literal has no spreads and EVERY materialised field is a
-                            // concrete scalar (Int/Float/Bool/Null — no heap payload, no union),
-                            // emit the entry stores INLINE instead of calling lin_object_set_fresh
-                            // per field. This removes one non-inlined runtime call per field (the
-                            // ~46% construction half of per-object cost, see perf profiling) while
-                            // staying RC-trivial: scalars need no payload retain and immortal
-                            // interned keys need no inc_ref, so reference counts are untouched and
-                            // there is zero use-after-free / double-free risk.
+                            // ── PHASES 1+2: inline object literal construction ────────────
+                            // When the literal has no spreads and EVERY materialised field has a
+                            // known concrete representation, emit the LinObject entry stores INLINE
+                            // instead of calling lin_object_set_fresh per field. This removes one
+                            // non-inlined runtime call per field — the ~46% construction half of
+                            // per-object cost (see perf profiling: inlining the per-field CALL is the
+                            // lever, the allocator is only ~3-4%).
                             //
-                            // lin_object_alloc(N) gives an object with cap==N, len==0, entries
-                            // pointing at the inline buffer; we write each entry's key/tag/payload
-                            // directly and set len at the end. cap==N (= field count for a no-spread
-                            // literal) guarantees no grow, so the inline entries buffer never moves.
-                            let inline_scalar = use_fresh && fields.iter().enumerate().all(|(idx, (key, vt))| {
+                            // Eligible field types and their RC handling, mirroring the runtime's
+                            // lin_object_set_fresh → retain_tagged_payload EXACTLY:
+                            //   • scalars (Int/Float/Bool/Null): no heap payload → no retain (Phase 1)
+                            //   • Str/StrLit/Array/FixedArray/Object: heap payload retained via the
+                            //     offset-0 refcount with the immortal guard — which is PRECISELY what
+                            //     lin_rc_retain does — so we emit one lin_rc_retain on the stored
+                            //     pointer, the object takes ownership of a +1 reference (Phase 2).
+                            // EXCLUDED (fall back to the runtime set_fresh path, identical behaviour):
+                            //   • Function: retain_tagged_payload is a NO-OP for TAG_FUNCTION (it is
+                            //     asymmetric with release); replicating that inline is error-prone, so
+                            //     any Function field disqualifies the whole object.
+                            //   • union/TypeVar/Named/Shared/Stream: already a boxed TaggedVal* with
+                            //     its own tag/retain semantics; not a plain (tag,payload) pair here.
+                            //
+                            // lin_object_alloc(N) gives cap==N, len==0, entries → inline buffer; we
+                            // write each entry's key/tag/payload directly and set len at the end.
+                            // cap==N (the field count for a no-spread literal) guarantees no grow, so
+                            // the inline entries buffer never moves.
+                            fn inline_field_kind(t: &Type) -> Option<bool> {
+                                // Some(needs_retain) if eligible for the inline path; None otherwise.
+                                match t {
+                                    Type::Null | Type::Bool
+                                    | Type::Int8 | Type::Int16 | Type::Int32
+                                    | Type::UInt8 | Type::UInt16 | Type::UInt32
+                                    | Type::Int64 | Type::UInt64
+                                    | Type::Float32 | Type::Float64 => Some(false),
+                                    Type::Str | Type::StrLit(_)
+                                    | Type::Array(_) | Type::FixedArray(_)
+                                    | Type::Object(_) => Some(true),
+                                    _ => None,
+                                }
+                            }
+                            let inline_eligible = use_fresh && fields.iter().enumerate().all(|(idx, (key, vt))| {
                                 // Only the surviving (last-wins) fields are materialised.
                                 last_idx.get(key) != Some(&idx) || {
                                     let t = func.temp_types.get(vt).cloned().unwrap_or(Type::Null);
-                                    matches!(t,
-                                        Type::Null | Type::Bool
-                                        | Type::Int8 | Type::Int16 | Type::Int32
-                                        | Type::UInt8 | Type::UInt16 | Type::UInt32
-                                        | Type::Int64 | Type::UInt64
-                                        | Type::Float32 | Type::Float64)
+                                    inline_field_kind(&t).is_some()
                                 }
                             });
-                            if inline_scalar {
+                            if inline_eligible {
                                 let i8_ty = self.context.i8_type();
                                 // entries = *(ptr*)(obj + 16)
                                 let entries_pp = unsafe {
@@ -1170,6 +1191,7 @@ impl<'ctx> Codegen<'ctx> {
                                     if last_idx.get(key) != Some(&idx) { continue; }
                                     if let Some(&val) = temp_map.get(val_temp) {
                                         let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
+                                        let needs_retain = inline_field_kind(&val_ty) == Some(true);
                                         let key_str = self.compile_string_lit(key).into_pointer_value();
                                         let base = slot * 24;
                                         // key@base
@@ -1188,6 +1210,14 @@ impl<'ctx> Codegen<'ctx> {
                                             self.builder.gep(i8_ty, entries, &[i64_ty.const_int(base + 16, false)], "ent_pay_p")
                                         };
                                         self.builder.store(pay_p, payload);
+                                        // The object now owns a reference to a heap payload — retain it,
+                                        // mirroring retain_tagged_payload. lin_rc_retain bumps the
+                                        // offset-0 refcount and no-ops on immortal (interned literal /
+                                        // frozen) values, exactly matching the runtime for Str/Array/
+                                        // Object. The matching release happens in lin_object_release.
+                                        if needs_retain && val.is_pointer_value() {
+                                            self.builder.call(self.rt.rc_retain, &[val.into_pointer_value().into()], "");
+                                        }
                                     }
                                     slot += 1;
                                 }
