@@ -1411,3 +1411,51 @@ back the lazy arm; each drives-and-consumes the stream on the calling thread, fa
 flat-producer recognition (the unboxed-scalar fast path, ADR-069) follows the moved names. Verified on
 `feat/streams`: full suite green, ASan clean, all five affine attacks reject. Full stream semantics in
 §27.9 (ADR-076); combinator surface in §18; stdlib API in `std/iter` (STDLIB.md).
+
+## ADR-078: Stdlib stays Rust where it's pure computation too — the Rust→Lin migration is rejected on evidence
+
+**Status.** Accepted. Records why the stdlib's Rust-backed functions are NOT being rewritten in native Lin,
+even the ones that are "just pure computation" and could be.
+
+**Context.** A recurring instinct is that `lin-runtime` "uses Rust everywhere" and that pure, non-syscall
+functions (path splitting, string ops, number parsing, math predicates) ought to be written in Lin to shrink
+the Rust surface and make the language more self-hosting. This ADR is the durable answer so the question isn't
+re-litigated each time someone reads `stdlib/*.lin` and sees a thin FFI wrapper over a `lin_*` symbol.
+
+**The migration surface is narrow.** Most of `lin-runtime` is irreducibly Rust: syscalls (fs/net/process/
+tty/signal/env/time-now/io/server), memory + the tagged value representation, async/threads/transfer, the
+stream engine, and `inkwell`-adjacent glue. Beyond that, several "pure" functions still cannot move:
+- **Unicode case-folding and whitespace trim** (`toUpper`/`toLower`/`trim`) — locale/codepoint-table logic.
+- **Correctly-rounded float parsing** (`parseFloat64`, `isFloat64`) — Rust's `str::parse::<f64>` is an
+  Eisel-Lemire-class parser; reimplementing it in Lin is the single highest-correctness-risk item and has no
+  upside.
+- **`lin_value_key`** (the `hash` backend) — reads the runtime flat-vs-tagged representation and decodes flat
+  scalar arrays per `elem_tag`; Lin has no access to that representation, so it is impossible in Lin.
+That leaves a genuinely small candidate set: path basename/dirname/extname/stem, math constants/predicates,
+and a couple of structural string ops (`repeat`).
+
+**The pilot (path).** We migrated `std/path`'s four pure splitters (`basename`/`dirname`/`extname`/`stem`)
+from Rust FFI to native Lin, built on `std/string` (`lastIndexOf`/`substring`/`length`), as a measured pilot.
+Correctness was a clean success — a probe over 13 edge-case inputs (trailing slash, `/`, `.gitignore`,
+`a.b.c`, `..`, `.`, empty, multi-dot, no-ext) matched the Rust `std::path` output **byte-for-byte**, and
+`path.test.lin` was expanded to 51 tests, all green; full suite and `fmt --check` clean. But the trade was
+poor:
+- **LOC: net-negative-to-neutral.** ~42 Rust lines removed; ~53 Lin lines + helpers added. No maintainability
+  win — the `std::path` one-liners are clearer than the hand-rolled Lin index math.
+- **Perf: ~6–10× slower** on a path-heavy microbench (Rust FFI ~0.24s vs native Lin ~1.5s for the same work;
+  a heavier loop showed ~10×). Root cause: each Lin call does several `substring`/`lastIndexOf` heap
+  allocations plus an FFI hop for `length`, where the Rust version does one FFI call and zero-copy slicing.
+Path operations are realistically hot in file-processing/build-tool code, so this is a real regression risk,
+not synthetic. The pilot was **not merged**.
+
+**Decision.** Keep the stdlib's pure-computation functions in Rust. Do NOT pursue the broad Rust→Lin
+migration. A thin Lin wrapper over a `lin_*` Rust symbol is the better engineering choice when the Rust does
+real string/byte work, because Lin string ops are allocation-heavy and pay an FFI hop for primitives like
+`length`.
+
+**When to revisit.** This decision is contingent on the string-op cost model, not a principle against
+self-hosting. It is worth re-opening only if codegen first gains **inlined, zero-copy `substring`/`length`/
+slice** for native string ops (so a Lin reimplementation isn't dominated by per-call allocation + FFI
+overhead) — the same class of win that flat-array read inlining (ADR-069) delivered for arrays. Until then,
+the line stays where it is: Lin for orchestration and data shape, Rust for the byte/char/number kernels and
+everything touching syscalls or the runtime representation.
