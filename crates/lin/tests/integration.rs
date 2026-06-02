@@ -9840,7 +9840,7 @@ fn test_json_reporter_ndjson_contract() {
     // First line is the schema meta record.
     assert_eq!(
         records[0],
-        serde_json::json!({"event": "meta", "schema": 1}),
+        serde_json::json!({"event": "meta", "schema": 2}),
         "first NDJSON line must be the meta/schema record"
     );
 
@@ -9865,6 +9865,61 @@ fn test_json_reporter_ndjson_contract() {
     // A `file` record with the right (fail) status.
     let has_file_fail = records.iter().any(|r| r["event"] == "file" && r["status"] == "fail");
     assert!(has_file_fail, "expected a file record with status fail; got:\n{:?}", records);
+}
+
+// A test that calls `print(...)` must have that stdout forwarded as an `output` NDJSON record
+// (schema 2). This is what populates the VSCode Test Results output tab; without it the runner's
+// `##LINTEST##` records swallow all other stdout.
+const PRINT_FIXTURE: &str = r#"import { expect, toBe, test, suite, run } from "std/test"
+import { print } from "std/io"
+
+val s = suite("with output", [
+  test("prints then passes", () =>
+    val _: Null = print("hello from test")
+    [
+      expect(1).toBe(1)
+    ]
+  )
+])
+
+run(s)
+"#;
+
+#[test]
+fn test_json_reporter_forwards_user_print() {
+    let fixture = write_test_fixture(PRINT_FIXTURE);
+    let (_success, lines) = run_test_json(&fixture, &[]);
+    let _ = fs::remove_file(&fixture);
+
+    let records: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON line {:?}: {}", l, e)))
+        .collect();
+
+    // Meta record carries schema 2.
+    assert_eq!(
+        records[0],
+        serde_json::json!({"event": "meta", "schema": 2}),
+        "meta record must report schema 2"
+    );
+
+    // The user's print output is forwarded as an `output` record containing the printed text.
+    let out_rec = records
+        .iter()
+        .find(|r| r["event"] == "output")
+        .unwrap_or_else(|| panic!("expected an output record; got:\n{:?}", records));
+    let text = out_rec["text"].as_str().unwrap_or("");
+    assert!(
+        text.contains("hello from test"),
+        "output record should carry the printed text; got {:?}",
+        text
+    );
+    // It must NOT leak any `##LINTEST##` runner line into the output blob.
+    assert!(
+        !text.contains("##LINTEST##"),
+        "output record must exclude runner records; got {:?}",
+        text
+    );
 }
 
 #[test]

@@ -127,7 +127,7 @@ async function installOnPath(context) {
 // The NDJSON schema version this extension was written against. The CLI emits a leading
 // `{"event":"meta","schema":N}` record; if N is newer than this we warn (once) that the
 // extension may not understand the stream, but keep parsing best-effort.
-const SUPPORTED_SCHEMA = 1;
+const SUPPORTED_SCHEMA = 2;
 
 const TEST_DECL_RE = /\btest\s*\(\s*"((?:[^"\\]|\\.)*)"/g;
 const WITHFIXTURE_DECL_RE = /\bwithFixture\s*\([^,]*,[^,]*,\s*"((?:[^"\\]|\\.)*)"/g;
@@ -446,14 +446,29 @@ function setupTestController(context, linBin) {
             `(v${SUPPORTED_SCHEMA}). Update the Lin extension; results may be incomplete.`
           );
         }
+      } else if (rec.event === "output") {
+        // User `print(...)` output forwarded by the CLI. VSCode's appendOutput requires CRLF
+        // line endings, so normalize "\n" → "\r\n". A trailing CRLF separates it from later lines.
+        if (typeof rec.text === "string" && rec.text.length > 0) {
+          const header = rec.file ? `--- ${rec.file} (stdout) ---\r\n` : "";
+          run.appendOutput(header + rec.text.replace(/\r?\n/g, "\r\n") + "\r\n");
+        }
       } else if (rec.event === "test") {
         const item = findOrCreateTestItem(controller, rec.file, rec.name);
         run.started(item);
         const durationMs = typeof rec.durationMs === "number" ? rec.durationMs : undefined;
+        // Always record a per-test summary line in the output tab (pass AND fail) so the run
+        // produces output even without any user prints — this is what stops VSCode showing
+        // "Test run did not record any output". CRLF-terminated as appendOutput requires.
+        const mark = rec.status === "pass" ? "✓" : "✗";
+        const durSuffix = typeof durationMs === "number" ? ` (${durationMs}ms)` : "";
+        run.appendOutput(`${mark} ${rec.name}${durSuffix}\r\n`, undefined, item);
         if (rec.status === "pass") {
           run.passed(item, durationMs);
         } else {
           const msg = rec.message || "test failed";
+          // Surface the failure message (indented) in the output tab too.
+          run.appendOutput(`    ${msg.replace(/\r?\n/g, "\r\n    ")}\r\n`, undefined, item);
           const tm = new TestMessage(msg);
           // Prefer the STRUCTURED expected/actual the runner now attaches (equality-style
           // failures). They may be any JSON shape, but TestMessage wants strings, so non-strings

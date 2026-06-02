@@ -4765,17 +4765,21 @@ The stream is **versioned**: the first line is always a `meta` record carrying t
 version. Consumers should read it and refuse (or warn) on an unrecognized version rather than
 mis-parsing newer shapes.
 
-Each line is one of three record shapes:
+Each line is one of four record shapes:
 
 ```jsonc
 // Always the FIRST line — the NDJSON schema version
-{ "event": "meta", "schema": 1 }
+{ "event": "meta", "schema": 2 }
 
 // One per test (from the suite's results)
 { "event": "test", "file": "<path>", "name": "<test name>", "status": "pass", "durationMs": <int> }
 { "event": "test", "file": "<path>", "name": "<test name>", "status": "fail", "message": "<joined failure messages>", "expected"?: <any JSON>, "actual"?: <any JSON>, "durationMs": <int> }
 
-// One per test file (always emitted, after its test records)
+// OPTIONAL: the user's own `print(...)` output for a file, emitted before that file's
+// `file` record. Absent when the file produced no non-runner stdout. (Added in schema 2.)
+{ "event": "output", "file": "<path>", "text": "<joined stdout lines>" }
+
+// One per test file (always emitted, after its test/output records)
 { "event": "file", "file": "<path>", "status": "pass" | "fail" | "timeout" | "compile_error", "durationMs": <int>, "message"?: "<diagnostic>" }
 ```
 
@@ -4794,6 +4798,10 @@ Each line is one of three record shapes:
 - The `file` record reports the whole file's outcome and is the only signal for files that
   never produced per-test records — e.g. a `compile_error` (with the diagnostic in `message`)
   or a `timeout`.
+- The `output` record (schema 2+) carries any stdout the test binary wrote that wasn't a runner
+  record — i.e. the user's own `print(...)` calls. All such lines for a file are joined with `\n`
+  into one `text` blob and emitted just before that file's `file` record. It is omitted entirely
+  when there was no such output. Consumers predating schema 2 can safely ignore unknown events.
 
 Internally the runner (`std/test`) emits each record as a `##LINTEST## `-prefixed line gated on
 the `LIN_TEST_JSON` environment variable; the CLI strips the prefix, attaches the file path,
