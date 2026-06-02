@@ -37,7 +37,7 @@ export val toUpper = (s: String): String =>
 export val toLower = (s: String): String =>
   lin_string_to_lower(s)
 
-export val substring = (s: String, start: Int32, end: Int32): String =>
+export val substring = (s: String, start: Int32, end: Int32 = _length(s)): String =>
   lin_string_slice(s, start, end)
 
 val _length = (s: String): Int32 =>
