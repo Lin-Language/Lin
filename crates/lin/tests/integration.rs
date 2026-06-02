@@ -4914,6 +4914,59 @@ fn test_fmt_implicit_else_null_omitted() {
 }
 
 #[test]
+fn test_fmt_block_bodied_val_round_trips() {
+    // A `val` whose RHS is a multi-statement BLOCK must render the block on its own
+    // indented lines, not inlined after `= ` (which collapsed it onto one line and
+    // produced unparseable source). The canonical form below must round-trip identically.
+    let src = "\
+val basePath =
+  val env = getEnv(\"LIN_DOCS_BASE\")
+  if env == null then \"\" else env
+";
+    let out = fmt(src);
+    assert_eq!(out, src, "block-bodied val not rendered as indented block:\n{}", out);
+    assert_eq!(out, fmt(&out), "block-bodied val not idempotent:\n{}", out);
+    // And the formatted text must re-parse + type-check.
+    let prog = format!(
+        "import {{ print }} from \"std/io\"\n\
+         val getEnv = (k: String): String|Null => null\n\
+         {}\nprint(basePath)\n",
+        out
+    );
+    assert!(
+        lin_check_ok_source(&prog),
+        "formatted block-bodied val no longer type-checks:\n{}",
+        prog
+    );
+}
+
+#[test]
+fn test_fmt_else_if_block_branch_comment_preserved_once() {
+    // A leading own-line comment on the first statement of an `else if ... then` Block
+    // branch body was emitted TWICE (the If arm's `take_leading` and `fmt_block` both
+    // emitted it), compounding each pass. It must appear exactly once and be idempotent.
+    let src = "\
+val f = (n: Int32): Int32 =>
+  if n == 0 then
+    1
+  else if n == 1 then
+    // first branch comment
+    val a = 2
+    a
+  else
+    3
+";
+    let out = fmt(src);
+    assert_eq!(
+        out.matches("// first branch comment").count(),
+        1,
+        "branch-body leading comment not preserved exactly once:\n{}",
+        out
+    );
+    assert_eq!(out, fmt(&out), "else-if branch comment fmt not idempotent:\n{}", out);
+}
+
+#[test]
 fn test_fmt_array_element_trailing_comment() {
     // A trailing comment on a single-line array element stays trailing (after its comma); it is
     // NOT demoted to a leading comment on the next line. An own-line comment before an element
@@ -5547,7 +5600,11 @@ fn test_fmt_corpus_idempotent_and_comments_preserved() {
         .to_path_buf();
 
     let mut files: Vec<std::path::PathBuf> = Vec::new();
-    for dir in ["stdlib", "examples"] {
+    // `docs-site/builder` is outside CI's fmt scope but exercises block-bodied `val` and
+    // own-line comments inside `else if` Block branch bodies — the two bugs this guard now
+    // covers. Its files use sibling imports, so they hit the idempotency + comment-count
+    // checks (not the standalone type-check, which `is_self_contained` skips for them).
+    for dir in ["stdlib", "examples", "docs-site/builder"] {
         let pattern = format!("{}/{}/**/*.lin", root.display(), dir);
         for entry in glob::glob(&pattern).unwrap().flatten() {
             if entry.components().any(|c| c.as_os_str() == ".lin-cache") {

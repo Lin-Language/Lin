@@ -7,7 +7,6 @@ import { contains } from "std/string"
 // currentPath: the path of the page being rendered (e.g. "/tutorials/01-hello-world")
 //
 // Outputs a <nav> block with sections grouped.
-
 // Get the href for a nav entry path. `base` is the deployment subpath prefix (e.g.
 // "/Lin" for a project Pages site, or "" for a root deployment).
 val navHref = (base: String, path: String): String =>
@@ -31,7 +30,8 @@ val renderSection = (section: String, sectionEntries: Json, currentPath: String,
   val entriesHtml = renderSectionEntries(sectionEntries, currentPath, base)
   if section != "" then
     "<div class=\"nav-section\">\n<h3 class=\"nav-section-title\">${section}</h3>\n${entriesHtml}</div>\n"
-  else entriesHtml
+  else
+    entriesHtml
 
 export val buildNav = (entries: Json, currentPath: String, base: String): String =>
   // Collect unique section names in order

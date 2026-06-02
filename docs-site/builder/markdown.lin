@@ -6,7 +6,6 @@
 //
 // markdownToHtml composes the two. Keeping the JSON model in the middle means the
 // parser and the renderer stay independent and each block is a plain data record.
-
 import { split, join, startsWith, endsWith, contains, replaceAll, trim, substring, indexOf, toLower } from "std/string"
 import { append, length, slice } from "std/array"
 import { for, concat } from "std/iter"
@@ -14,7 +13,6 @@ import { for, concat } from "std/iter"
 // ---------------------------------------------------------------------------
 // Inline formatting (applied at render time to heading/paragraph/list/quote text)
 // ---------------------------------------------------------------------------
-
 // Slugify heading text into an anchor id: lowercase, drop punctuation, spaces -> hyphens.
 val slugify = (text: String): String =>
   val lower = toLower(text)
@@ -37,14 +35,17 @@ val escapeHtml = (text: String): String =>
 // Wrap the odd-indexed segments produced by splitting on a delimiter.
 // "a `b` c".split("`") -> ["a ", "b", " c"]; segments 1,3,5,... are the wrapped spans.
 val wrapAlternating = (text: String, delim: String, open: String, close: String): String =>
-  if contains(text, delim) == false then text
+  if contains(text, delim) == false then
+    text
   else
     val parts = split(text, delim)
     var out = ""
     var i = 0
     parts.for(part =>
-      if i % 2 == 0 then out = "${out}${part}"
-      else out = "${out}${open}${part}${close}"
+      if i % 2 == 0 then
+        out = "${out}${part}"
+      else
+        out = "${out}${open}${part}${close}"
       i = i + 1
     )
     out
@@ -52,13 +53,15 @@ val wrapAlternating = (text: String, delim: String, open: String, close: String)
 // Replace the first [text](url) with an anchor tag, recursing on the remainder.
 val processLinks = (text: String): String =>
   val mid = indexOf(text, "](")
-  if mid == -1 then text
+  if mid == -1 then
+    text
   else
     val before = substring(text, 0, mid)
     val after = text.substring(mid + 2, text.length())
     val open = indexOf(before, "[")
     val close = indexOf(after, ")")
-    if open == -1 || close == -1 then text
+    if open == -1 || close == -1 then
+      text
     else
       val prefix = substring(before, 0, open)
       val linkText = before.substring(open + 1, before.length())
@@ -74,14 +77,17 @@ val processLinks = (text: String): String =>
 // characters like < and & render verbatim. Done separately from wrapAlternating so the
 // span content is escaped while surrounding prose is left for the other formatters.
 val processInlineCode = (text: String): String =>
-  if contains(text, "`") == false then text
+  if contains(text, "`") == false then
+    text
   else
     val parts = split(text, "`")
     var out = ""
     var i = 0
     parts.for(part =>
-      if i % 2 == 0 then out = "${out}${part}"
-      else out = "${out}<code>${escapeHtml(part)}</code>"
+      if i % 2 == 0 then
+        out = "${out}${part}"
+      else
+        out = "${out}<code>${escapeHtml(part)}</code>"
       i = i + 1
     )
     out
@@ -96,7 +102,6 @@ val inline = (text: String): String =>
 // ---------------------------------------------------------------------------
 // Phase 1: parse markdown source into a JSON array of block records
 // ---------------------------------------------------------------------------
-
 // Block records:
 //   { "kind": "heading",    "level": Int32, "text": String }
 //   { "kind": "paragraph",  "text": String }
@@ -104,28 +109,37 @@ val inline = (text: String): String =>
 //   { "kind": "list",       "ordered": Boolean, "items": String[] }
 //   { "kind": "blockquote", "lines": String[] }
 //   { "kind": "hr" }
-
 // Heading prefix length for levels 1..5 ("# " = 2, "## " = 3, ...), or 0 if not a heading.
 val headingLevel = (line: String): Int32 =>
-  if startsWith(line, "##### ") then 5
-  else if startsWith(line, "#### ") then 4
-  else if startsWith(line, "### ") then 3
-  else if startsWith(line, "## ") then 2
-  else if startsWith(line, "# ") then 1
-  else 0
+  if startsWith(line, "##### ") then
+    5
+  else if startsWith(line, "#### ") then
+    4
+  else if startsWith(line, "### ") then
+    3
+  else if startsWith(line, "## ") then
+    2
+  else if startsWith(line, "# ") then
+    1
+  else
+    0
 
 // Is this an ordered list item? "1. text", "2. text", ...
 val isOrderedItem = (line: String): Boolean =>
   val dot = indexOf(line, ". ")
-  if dot <= 0 then false
+  if dot <= 0 then
+    false
   else
     val head = substring(line, 0, dot)
     var allDigits = true
     var i = 0
-    head.split("").for(ch =>
-      if ch != "" && contains("0123456789", ch) == false then allDigits = false
-      i = i + 1
-    )
+    head
+      .split("")
+      .for(ch =>
+        if ch != "" && contains("0123456789", ch) == false then
+          allDigits = false
+        i = i + 1
+      )
     allDigits
 
 // Is this a GFM table row? A trimmed line that both starts and ends with `|`.
@@ -137,12 +151,15 @@ val isTableRow = (line: String): Boolean =>
 // dashes, colons, spaces and pipes (e.g. "| --- | :--: |").
 val isTableSeparator = (line: String): Boolean =>
   val t = trim(line)
-  if isTableRow(line) == false then false
+  if isTableRow(line) == false then
+    false
   else
     var ok = true
-    t.split("").for(ch =>
-      if ch != "" && contains("-:| ", ch) == false then ok = false
-    )
+    t
+      .split("")
+      .for(ch =>
+        if ch != "" && contains("-:| ", ch) == false then ok = false
+      )
     contains(t, "-") && ok
 
 // Split a table row into trimmed cells, dropping the leading/trailing empty
@@ -174,37 +191,52 @@ val tableCells = (line: String): String[] =>
 //   "codeLang":    String   — language tag of the open fence
 //   "codeLines":   String[] — buffered code lines
 // }
-
 // State threading is purely functional: every handler returns a NEW state record
 // built with the non-mutating `append`, never by reading a field and `push`-ing into
 // it. Reading `st["blocks"]` and mutating it would alias the value still referenced by
 // the caller (and by the shared starting record), corrupting the parse.
 val freshState = (): Json => {
-  "blocks": [], "para": [], "quote": [], "items": [],
-  "ordered": false, "inCode": false, "codeLang": "", "codeLines": [],
-  // Table buffering. `tableRows` holds the raw row lines seen so far; `tableOn`
-  // flips true once the header is confirmed by a following separator row. A single
-  // buffered row with tableOn=false is a *candidate* header awaiting that separator.
-  "tableRows": [], "tableOn": false
+  "blocks": [],
+  "para": [],
+  "quote": [],
+  "items": [],
+  "ordered": false,
+  "inCode": false,
+  "codeLang": "",
+  "codeLines": [],
+  "tableRows": [],
+  "tableOn": false
 }
-
+// Table buffering. `tableRows` holds the raw row lines seen so far; `tableOn`
+// flips true once the header is confirmed by a following separator row. A single
+// buffered row with tableOn=false is a *candidate* header awaiting that separator.
 // Append the buffered paragraph/quote/list (whichever is open) as completed blocks.
 // Each is independent, so this is safe to call before starting any new block.
 val withParagraphFlushed = (blocks: Json, st: Json): Json =>
-  if length(st["para"]) > 0 then blocks.append({ "kind": "paragraph", "text": join(st["para"], " ") }) else blocks
+  if length(st["para"]) > 0 then
+    blocks.append({ "kind": "paragraph", "text": join(st["para"], " ") })
+  else
+    blocks
 
 val withQuoteFlushed = (blocks: Json, st: Json): Json =>
-  if length(st["quote"]) > 0 then blocks.append({ "kind": "blockquote", "lines": st["quote"] }) else blocks
+  if length(st["quote"]) > 0 then
+    blocks.append({ "kind": "blockquote", "lines": st["quote"] })
+  else
+    blocks
 
 val withListFlushed = (blocks: Json, st: Json): Json =>
-  if length(st["items"]) > 0 then blocks.append({ "kind": "list", "ordered": st["ordered"], "items": st["items"] }) else blocks
+  if length(st["items"]) > 0 then
+    blocks.append({ "kind": "list", "ordered": st["ordered"], "items": st["items"] })
+  else
+    blocks
 
 // Flush the buffered table rows. When confirmed (`tableOn`), emit a table block:
 // row 0 is the header, row 1 is the separator (dropped), the rest are body rows.
 // When NOT confirmed, the buffered rows were just pipe-prose — emit them as a
 // paragraph so a lone `| x | y |` with no separator below renders verbatim.
 val withTableFlushed = (blocks: Json, st: Json): Json =>
-  if length(st["tableRows"]) == 0 then blocks
+  if length(st["tableRows"]) == 0 then
+    blocks
   else if st["tableOn"] then
     val header = tableCells(st["tableRows"][0])
     var rows: Json[] = []
@@ -217,34 +249,88 @@ val withTableFlushed = (blocks: Json, st: Json): Json =>
 
 // All open buffers flushed into the completed-blocks array.
 val flushedBlocks = (st: Json): Json =>
-  withTableFlushed(withListFlushed(withQuoteFlushed(withParagraphFlushed(st["blocks"], st), st), st), st)
+  withTableFlushed(
+    withListFlushed(withQuoteFlushed(withParagraphFlushed(st["blocks"], st), st), st),
+    st
+  )
 
 // Flush every buffer and clear them.
 val flushBuffers = (st: Json): Json =>
-  { ...st, "blocks": flushedBlocks(st), "para": [], "quote": [], "items": [], "tableRows": [], "tableOn": false }
+  {
+    ...st,
+    "blocks": flushedBlocks(st),
+    "para": [],
+    "quote": [],
+    "items": [],
+    "tableRows": [],
+    "tableOn": false
+  }
 
 val handleCodeLine = (st: Json, line: String, trimmed: String): Json =>
   if startsWith(trimmed, "```") then
     val blocks = st["blocks"].append({ "kind": "code", "lang": st["codeLang"], "code": join(st["codeLines"], "\n") })
-    { ...st, "blocks": blocks, "inCode": false, "codeLang": "", "codeLines": [] }
-  else { ...st, "codeLines": st["codeLines"].append(line) }
+    {
+      ...st,
+      "blocks": blocks,
+      "inCode": false,
+      "codeLang": "",
+      "codeLines": []
+    }
+  else
+    { ...st, "codeLines": st["codeLines"].append(line) }
 
 val openFence = (st: Json, trimmed: String): Json =>
-  val lang = if trimmed.length() > 3 then trimmed.substring(3, trimmed.length()).trim() else ""
-  { ...flushBuffers(st), "inCode": true, "codeLang": lang, "codeLines": [] }
+  val lang = if trimmed.length() > 3 then
+    trimmed.substring(3, trimmed.length()).trim()
+  else
+    ""
+  {
+    ...flushBuffers(st),
+    "inCode": true,
+    "codeLang": lang,
+    "codeLines": []
+  }
 
 val addHeading = (st: Json, line: String, level: Int32): Json =>
-  val blocks = flushedBlocks(st).append({ "kind": "heading", "level": level, "text": line.substring(level + 1, line.length()).trim() })
-  { ...st, "blocks": blocks, "para": [], "quote": [], "items": [], "tableRows": [], "tableOn": false }
+  val blocks = flushedBlocks(st).append({
+    "kind": "heading",
+    "level": level,
+    "text": line.substring(level + 1, line.length()).trim()
+  })
+  {
+    ...st,
+    "blocks": blocks,
+    "para": [],
+    "quote": [],
+    "items": [],
+    "tableRows": [],
+    "tableOn": false
+  }
 
 val addHr = (st: Json): Json =>
   val blocks = flushedBlocks(st).append({ "kind": "hr" })
-  { ...st, "blocks": blocks, "para": [], "quote": [], "items": [], "tableRows": [], "tableOn": false }
+  {
+    ...st,
+    "blocks": blocks,
+    "para": [],
+    "quote": [],
+    "items": [],
+    "tableRows": [],
+    "tableOn": false
+  }
 
 // Flush paragraph, list and table, but keep accumulating consecutive quote lines.
 val addQuoteLine = (st: Json, line: String): Json =>
   val blocks = withTableFlushed(withListFlushed(withParagraphFlushed(st["blocks"], st), st), st)
-  { ...st, "blocks": blocks, "para": [], "items": [], "tableRows": [], "tableOn": false, "quote": st["quote"].append(line.substring(2, line.length())) }
+  {
+    ...st,
+    "blocks": blocks,
+    "para": [],
+    "items": [],
+    "tableRows": [],
+    "tableOn": false,
+    "quote": st["quote"].append(line.substring(2, line.length()))
+  }
 
 // Append a list item; a change of list kind (ordered vs unordered) closes the previous list.
 val addListItem = (st: Json, text: String, ordered: Boolean): Json =>
@@ -252,11 +338,28 @@ val addListItem = (st: Json, text: String, ordered: Boolean): Json =>
   val kindChanged = length(st["items"]) > 0 && st["ordered"] != ordered
   val blocks = if kindChanged then withListFlushed(base, st) else base
   val items = if kindChanged then [] else st["items"]
-  { ...st, "blocks": blocks, "para": [], "quote": [], "tableRows": [], "tableOn": false, "items": items.append(text), "ordered": ordered }
+  {
+    ...st,
+    "blocks": blocks,
+    "para": [],
+    "quote": [],
+    "tableRows": [],
+    "tableOn": false,
+    "items": items.append(text),
+    "ordered": ordered
+  }
 
 val addParagraphLine = (st: Json, line: String): Json =>
   val blocks = withTableFlushed(withListFlushed(withQuoteFlushed(st["blocks"], st), st), st)
-  { ...st, "blocks": blocks, "quote": [], "items": [], "tableRows": [], "tableOn": false, "para": st["para"].append(line) }
+  {
+    ...st,
+    "blocks": blocks,
+    "quote": [],
+    "items": [],
+    "tableRows": [],
+    "tableOn": false,
+    "para": st["para"].append(line)
+  }
 
 // Buffer a `|`-delimited line, applying the GFM rule that a table only forms when a
 // header row is immediately followed by a separator row. One line of lookahead, held in
@@ -267,39 +370,73 @@ val addParagraphLine = (st: Json, line: String): Json =>
 //   - candidate present + non-separator-> the candidate was never a table: flush it as a
 //                                          paragraph and treat this line as a new candidate
 val addTableRow = (st: Json, line: String): Json =>
-  if st["tableOn"] then { ...st, "tableRows": st["tableRows"].append(line) }
+  if st["tableOn"] then
+    { ...st, "tableRows": st["tableRows"].append(line) }
   else if length(st["tableRows"]) == 0 then
     // Starting a fresh candidate: close any open paragraph/quote/list first.
     val blocks = withListFlushed(withQuoteFlushed(withParagraphFlushed(st["blocks"], st), st), st)
-    { ...st, "blocks": blocks, "para": [], "quote": [], "items": [], "tableRows": [line], "tableOn": false }
+    {
+      ...st,
+      "blocks": blocks,
+      "para": [],
+      "quote": [],
+      "items": [],
+      "tableRows": [line],
+      "tableOn": false
+    }
   else if isTableSeparator(line) then
-    { ...st, "tableRows": st["tableRows"].append(line), "tableOn": true }
+    {
+      ...st,
+      "tableRows": st["tableRows"].append(line),
+      "tableOn": true
+    }
   else
     // Candidate header not followed by a separator: it was plain pipe-prose.
     var blocks = st["blocks"]
     st["tableRows"].for(row => blocks = blocks.append({ "kind": "paragraph", "text": row }))
-    { ...st, "blocks": blocks, "tableRows": [line], "tableOn": false }
+    {
+      ...st,
+      "blocks": blocks,
+      "tableRows": [line],
+      "tableOn": false
+    }
 
 // Dispatch one line to the handler that matches its markdown role.
 val parseLine = (st: Json, line: String): Json =>
   val trimmed = trim(line)
-  if st["inCode"] then handleCodeLine(st, line, trimmed)
-  else if startsWith(trimmed, "```") then openFence(st, trimmed)
-  else if trimmed == "" then flushBuffers(st)
-  else if trimmed == "---" then addHr(st)
-  else if headingLevel(line) > 0 then addHeading(st, line, headingLevel(line))
-  else if startsWith(line, "> ") then addQuoteLine(st, line)
-  else if startsWith(line, "- ") then addListItem(st, line.substring(2, line.length()), false)
-  else if isOrderedItem(line) then addListItem(st, substring(line, indexOf(line, ". ") + 2, length(line)), true)
-  else if isTableRow(line) then addTableRow(st, line)
-  else addParagraphLine(st, line)
+  if st["inCode"] then
+    handleCodeLine(st, line, trimmed)
+  else if startsWith(trimmed, "```") then
+    openFence(st, trimmed)
+  else if trimmed == "" then
+    flushBuffers(st)
+  else if trimmed == "---" then
+    addHr(st)
+  else if headingLevel(line) > 0 then
+    addHeading(st, line, headingLevel(line))
+  else if startsWith(line, "> ") then
+    addQuoteLine(st, line)
+  else if startsWith(line, "- ") then
+    addListItem(st, line.substring(2, line.length()), false)
+  else if isOrderedItem(line) then
+    addListItem(st, substring(line, indexOf(line, ". ") + 2, length(line)), true)
+  else if isTableRow(line) then
+    addTableRow(st, line)
+  else
+    addParagraphLine(st, line)
 
 // Close a code fence left open at end-of-input by emitting the buffered code block.
 val closeOpenCode = (st: Json): Json =>
-  if st["inCode"] == false then st
+  if st["inCode"] == false then
+    st
   else
     val blocks = st["blocks"].append({ "kind": "code", "lang": st["codeLang"], "code": join(st["codeLines"], "\n") })
-    { ...st, "blocks": blocks, "inCode": false, "codeLines": [] }
+    {
+      ...st,
+      "blocks": blocks,
+      "inCode": false,
+      "codeLines": []
+    }
 
 export val parseBlocks = (source: String): Json =>
   var state: Json = freshState()
@@ -314,7 +451,6 @@ export val parseBlocks = (source: String): Json =>
 // ---------------------------------------------------------------------------
 // Phase 2: render the JSON block model to an HTML fragment
 // ---------------------------------------------------------------------------
-
 val renderBlock = (block: Json): String =>
   val kind = block["kind"]
   if kind == "heading" then
@@ -347,8 +483,10 @@ val renderBlock = (block: Json): String =>
       body = "${body}<tr>${cells}</tr>\n"
     )
     "<table>\n<thead>\n<tr>${head}</tr>\n</thead>\n<tbody>\n${body}</tbody>\n</table>\n"
-  else if kind == "hr" then "<hr>\n"
-  else ""
+  else if kind == "hr" then
+    "<hr>\n"
+  else
+    ""
 
 export val renderBlocks = (blocks: Json): String =>
   var html = ""

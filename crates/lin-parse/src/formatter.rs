@@ -1747,6 +1747,14 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
                 // a single-expression body (e.g. a multi-element array) is handled here.
                 let body_owns_comments = matches!(body, Expr::Block(..) | Expr::If { .. } | Expr::Match { .. });
                 if body_owns_comments {
+                    // A Block body's span.start IS its first statement's start, and `fmt_block`
+                    // already emits that statement's leading comment. Prepending `lead` here
+                    // would emit it a SECOND time, compounding on every fmt pass. So for a
+                    // Block, drop `lead`. (If/Match bodies don't register an anchor at their
+                    // span start, so `lead` is empty for them — emit it harmlessly.)
+                    if matches!(body, Expr::Block(..)) {
+                        return block;
+                    }
                     return format!("{}{}", lead, block);
                 }
                 let trailing = trailing_text(anchor);
@@ -2128,9 +2136,8 @@ fn fmt_stmt_in_block(stmt: &Stmt, ind: &str) -> String {
                 .map(|t| format!(": {}", fmt_type(t)))
                 .unwrap_or_default();
             // Pass `ind` so function bodies are at ind + "  ".
-            let rhs = fmt_expr(value, false, ind);
             let header = format!("{}{}{}{}{} = ", ind, pfx, "val ", pat, ty);
-            multiline_concat(&header, &rhs)
+            fmt_binding_rhs(&header, value, ind)
         }
         Stmt::Var { name, type_ann, value, exported, .. } => {
             let pfx = if *exported { "export " } else { "" };
@@ -2138,9 +2145,8 @@ fn fmt_stmt_in_block(stmt: &Stmt, ind: &str) -> String {
                 .as_ref()
                 .map(|t| format!(": {}", fmt_type(t)))
                 .unwrap_or_default();
-            let rhs = fmt_expr(value, false, ind);
             let header = format!("{}{}var {}{} = ", ind, pfx, name, ty);
-            multiline_concat(&header, &rhs)
+            fmt_binding_rhs(&header, value, ind)
         }
         Stmt::Expr(e) => {
             let s = fmt_expr(e, true, ind);
@@ -2164,6 +2170,24 @@ fn multiline_concat(header: &str, body: &str) -> String {
         out.push_str(line);
     }
     out
+}
+
+/// Render the RHS of a binding (`val`/`var`/`replace`) given an already-built
+/// `header` ending in `"= "` (with trailing space) at indentation `ind`.
+/// A block-bodied RHS cannot be inlined after `= `: `fmt_block` puts its first
+/// statement on the first line (no indent), so `multiline_concat` would collapse
+/// the block onto the header line, producing unparseable source. Instead emit
+/// `=` (no trailing space), a newline, then the block body at `ind + "  "`.
+fn fmt_binding_rhs(header: &str, value: &Expr, ind: &str) -> String {
+    if matches!(value, Expr::Block(..)) {
+        let child_ind = format!("{}  ", ind);
+        let body = fmt_expr(value, false, &child_ind);
+        let header = header.strip_suffix(' ').unwrap_or(header);
+        format!("{}\n{}{}", header, child_ind, body)
+    } else {
+        let rhs = fmt_expr(value, false, ind);
+        multiline_concat(header, &rhs)
+    }
 }
 
 // ── top-level statement formatting ───────────────────────────────────────────
@@ -2199,9 +2223,8 @@ fn fmt_stmt(stmt: &Stmt, ind: &str) -> String {
                 .map(|t| format!(": {}", fmt_type(t)))
                 .unwrap_or_default();
             // Pass `ind` (not child_ind) so function bodies are at ind + "  ".
-            let rhs = fmt_expr(value, false, ind);
             let header = format!("{}{}{}{}{} = ", ind, pfx, "val ", pat, ty);
-            multiline_concat(&header, &rhs)
+            fmt_binding_rhs(&header, value, ind)
         }
 
         Stmt::Var { name, type_ann, value, exported, .. } => {
@@ -2210,9 +2233,8 @@ fn fmt_stmt(stmt: &Stmt, ind: &str) -> String {
                 .as_ref()
                 .map(|t| format!(": {}", fmt_type(t)))
                 .unwrap_or_default();
-            let rhs = fmt_expr(value, false, ind);
             let header = format!("{}{}var {}{} = ", ind, pfx, name, ty);
-            multiline_concat(&header, &rhs)
+            fmt_binding_rhs(&header, value, ind)
         }
 
         Stmt::TypeDecl { name, params, body, exported, .. } => {
@@ -2231,9 +2253,8 @@ fn fmt_stmt(stmt: &Stmt, ind: &str) -> String {
         }
 
         Stmt::Replace { name, value, .. } => {
-            let rhs = fmt_expr(value, false, ind);
             let header = format!("{}replace {} = ", ind, name);
-            multiline_concat(&header, &rhs)
+            fmt_binding_rhs(&header, value, ind)
         }
     }
 }
