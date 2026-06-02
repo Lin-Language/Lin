@@ -1,0 +1,34 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { waitSignal } from "std/signal"
+
+// std/signal: waitSignal(sig) blocks the calling thread until `sig` is delivered,
+// then returns the caught signal number.
+//
+// IMPORTANT — why this suite does NOT call waitSignal:
+//   waitSignal is a BLOCKING syscall (sigwait). The runtime (crates/lin-runtime/
+//   src/signal.rs) blocks `sig` in the thread mask and then calls sigwait, which
+//   suspends the thread until that signal becomes pending. There is no way from
+//   the Lin surface to deliver a signal to *this* process at a controlled moment:
+//     - std/process exposes kill() only for a *spawned child*, not for self.
+//     - Raising the signal to self via a shell child (e.g. `kill -USR1 $PPID`)
+//       races against waitSignal arming its mask; the signal would arrive while
+//       still unblocked and could terminate the process (default SIGUSR1 action),
+//       or arrive before sigwait and hang the suite forever.
+//   A race-free self-delivery requires pre-blocking the signal then raise()-ing it
+//   (see the Rust unit test `sigwait_roundtrip` in signal.rs, which DOES cover the
+//   real round-trip), but Lin code cannot pre-block a signal. So a live waitSignal
+//   call here would risk hanging or killing the test runner — strictly worse than
+//   no live test. The behavioural round-trip is covered by that Rust unit test.
+//
+// This suite therefore only guarantees that std/signal parses, type-checks, and
+// links: `waitSignal` is imported and referenced as a value (without being called),
+// so a regression that breaks the module's compilation is caught by `lin test`.
+val signalIsImported = waitSignal != null
+
+val s = suite("std/signal", [
+  test("waitSignal is importable and links (module compiles)", () => [
+    expect(signalIsImported).toBe(true)
+  ])
+])
+
+run(s)
