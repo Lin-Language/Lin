@@ -237,12 +237,29 @@ pub unsafe extern "C" fn lin_string_char_at(s: *const LinString, index: i32) -> 
     ptr
 }
 
-/// Return the Unicode code point at char index `index`. Returns -1 if OOB or negative index.
+/// Return the Unicode code point at CHAR index `index`. Returns -1 if OOB or negative index.
+/// O(n): walks the UTF-8 string from the start (codepoint-correct). For O(1) ASCII/byte
+/// scanning use `lin_string_byte_at` (exposed as `std/string.byteAt`).
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_char_code(s: *const LinString, index: i32) -> i32 {
     if index < 0 { return -1; }
     let st = (*s).as_str();
     st.chars().nth(index as usize).map(|c| c as i32).unwrap_or(-1)
+}
+
+/// Return the raw UTF-8 BYTE at byte index `index` (0..len), or -1 if OOB / negative.
+/// O(1) — a direct indexed load from the string's byte buffer (same byte-index space as
+/// `lin_string_char_at`). This is the primitive that makes Lin-side string scanning viable:
+/// indexing `0..length(s)` with `byteAt` is O(n) total, whereas `charCode` (codepoint-indexed,
+/// O(n) per call) makes the same loop O(n²). For pure-ASCII text `byteAt(s,i) == charCode(s,i)`.
+/// Inlined in codegen (see codegen/intrinsics.rs) so the per-byte cost is a single load, not a
+/// non-inlinable staticlib call — the same lever as the flat-array-read inlining (ADR-069).
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_byte_at(s: *const LinString, index: i32) -> i32 {
+    if s.is_null() || index < 0 || index >= (*s).len as i32 {
+        return -1;
+    }
+    *(*s).data.as_ptr().add(index as usize) as i32
 }
 
 /// Create a single-character string from a Unicode code point. Returns "" for invalid code points.

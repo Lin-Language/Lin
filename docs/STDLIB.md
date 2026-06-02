@@ -43,7 +43,8 @@ This document specifies the standard library for the Lin language. All modules a
 | Function | Signature | Summary |
 | --- | --- | --- |
 | [`at`](#at) | `(String, Int32) -> String` | Character at index; negative indices count from end |
-| [`codePointAt`](#codePointAt) | `(String, Int32) -> Int32` | Numeric codepoint value at index |
+| [`codePointAt`](#codePointAt) | `(String, Int32) -> Int32` | Numeric codepoint value at index (O(n)) |
+| [`byteAt`](#byteAt) | `(String, Int32) -> Int32` | Raw UTF-8 byte at byte-index, O(1); fast scanning |
 | [`contains`](#contains) | `(String, String) -> Boolean` | Test whether needle is a substring |
 | [`endsWith`](#endsWith) | `(String, String) -> Boolean` | Test whether string ends with suffix |
 | [`fromCodePoints`](#fromCodePoints) | `(Int32[]) -> String` | Build a string from codepoint values |
@@ -438,6 +439,24 @@ Returns the numeric Unicode codepoint value of the character at `index`. Negativ
 codePointAt("A", 0)      // 65
 codePointAt("café", 3)   // 233   (é)
 codePointAt("hi", -1)    // 105   (i)
+```
+
+`codePointAt` is codepoint-indexed and therefore **O(n)** per call — a loop indexing `0..length(s)` with it is O(n²). For fast byte/ASCII scanning use [`byteAt`](#byteAt), which is O(1).
+
+---
+
+### byteAt
+
+```txt
+val byteAt: (s: String, index: Int32) -> Int32
+```
+
+Returns the raw UTF-8 **byte** (`0..255`) at byte-index `index`, or `-1` if the index is negative or out of range. Unlike [`codePointAt`](#codePointAt) this is **O(1)** — a direct indexed load — so scanning a whole string (`0..length(s)`) is O(n) rather than O(n²). For pure-ASCII text `byteAt(s, i) == codePointAt(s, i)`; for multi-byte UTF-8 it exposes the individual encoding bytes. Use it for tokenizers, parsers, and other byte-level string scanning written in Lin.
+
+```txt
+byteAt("ABC", 0)   // 65
+byteAt("ABC", 2)   // 67
+byteAt("AB", 5)    // -1
 ```
 
 ---
