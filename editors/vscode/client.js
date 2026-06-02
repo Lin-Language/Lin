@@ -364,8 +364,9 @@ function setupTestController(context, linBin) {
       } else if (rec.event === "test") {
         const item = findOrCreateTestItem(controller, rec.file, rec.name);
         run.started(item);
+        const durationMs = typeof rec.durationMs === "number" ? rec.durationMs : undefined;
         if (rec.status === "pass") {
-          run.passed(item);
+          run.passed(item, durationMs);
         } else {
           const msg = rec.message || "test failed";
           const tm = new TestMessage(msg);
@@ -374,7 +375,7 @@ function setupTestController(context, linBin) {
             tm.expectedOutput = ea.expected;
             tm.actualOutput = ea.actual;
           }
-          run.failed(item, tm);
+          run.failed(item, tm, durationMs);
         }
       } else if (rec.event === "file") {
         if (rec.status === "compile_error" || rec.status === "timeout") {
