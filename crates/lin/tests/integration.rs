@@ -1872,6 +1872,62 @@ fn test_cyclic_imports_value_init_cycle_still_errors() {
 }
 
 #[test]
+fn test_cyclic_imports_peer_dependent_return_boundary_gap() {
+    // Documents the KNOWN boundary-soundness gap in cyclic-import inference (ADR-078).
+    // A 3-module cycle a -> b -> c -> a where the only literal lives in `fromC`, and
+    // `fromA`/`fromB` get their return type only by calling through a peer.
+    //
+    // RUNTIME is correct: codegen calls the real symbol, so `fromA(3)` returns "done".
+    // STATIC TYPE is lost at the boundary: `fromA`'s return type flows through a peer call,
+    // so the single-round SCC fixed point leaves it permissive/unsolved — a consumer can
+    // bind the (actually-String) result to Int32 with NO type error. That missed error is
+    // the gap. If a future change iterates Phase 2 to convergence (or fails closed by
+    // requiring an annotation), the second half of this test should start failing — update
+    // ADR-078 and flip the assertion when it does.
+    let dir = std::env::temp_dir().join(format!("lin_cyc_peerret_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("a.lin"),
+        "import { fromB } from \"b\"\n\
+         export val fromA = (n: Int32) => fromB(n)\n").unwrap();
+    std::fs::write(dir.join("b.lin"),
+        "import { fromC } from \"c\"\n\
+         export val fromB = (n: Int32) => fromC(n)\n").unwrap();
+    std::fs::write(dir.join("c.lin"),
+        "import { fromA } from \"a\"\n\
+         export val fromC = (n: Int32) => if n == 0 then \"done\" else fromA(n - 1)\n").unwrap();
+
+    // 1. It compiles and RUNS correctly (prints "done").
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ fromA }} from "{d}/a"
+print(fromA(3))
+"#, d = dir.to_str().unwrap());
+    let output = run(&main);
+    assert_eq!(output, vec!["done"], "runtime result must be correct regardless of the type gap");
+
+    // 2. The gap: binding the (actually-String) result to Int32 is wrongly ACCEPTED,
+    //    because the peer-dependent return type is permissive at the module boundary.
+    let bad = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ fromA }} from "{d}/a"
+val k: Int32 = fromA(3)
+print(toString(k))
+"#, d = dir.to_str().unwrap());
+    let bad_path = dir.join("bad.lin");
+    std::fs::write(&bad_path, &bad).unwrap();
+    let check = Command::new(lin_bin())
+        .args(["check", bad_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let check_out = format!("{}{}",
+        String::from_utf8_lossy(&check.stderr), String::from_utf8_lossy(&check.stdout));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(check.status.success(),
+        "ADR-078 boundary gap: binding a peer-dependent cyclic return to Int32 is currently \
+         accepted. If this now FAILS, the gap was closed — flip this assertion and update ADR-078. \
+         got: {check_out}");
+}
+
+#[test]
 fn test_default_args_trailing_comma_still_curries() {
     // A trailing comma requests partial application even when defaults exist,
     // rather than filling the default.

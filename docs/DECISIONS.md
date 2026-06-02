@@ -1438,8 +1438,10 @@ fast path); and (4) type-checks a true multi-module (or self-importing) SCC toge
   §7.3) → `CompileError::ImportCycle`. Binding/calling a peer *function* is fine (resolved by
   symbol, never recomputed at init).
 - **Phase 2** re-checks each member with all provisional peer signatures seeded into `import_types`
-  (`check_module_with_seeded_imports`), so a cross-module call resolves to a peer's concrete
-  (provisional) type — letting an unannotated mutually-recursive function infer its return type.
+  (`check_module_with_seeded_imports`), so a cross-module call resolves to a peer's
+  *Phase-1* provisional type. This grounds a member whose return type is locally determinable
+  (a literal/annotation in its own body); it does **not** ground one whose return type flows
+  *through* a peer call — see the boundary-soundness gap under **Known limitation**.
 The Phase 2 modules are registered; cyclic members are never read from `.lin-cache` (their type
 depends on peers), though their `.sig` is persisted for out-of-SCC dependents.
 
@@ -1451,9 +1453,9 @@ seed-and-recheck work without sharing a checker (no ADR-008 break). Per-path-str
 preserved (each spelling gets its own compiled copy + mangled symbols, matching long-standing
 absolute-vs-relative behaviour).
 
-**Consequence**: Mutually-recursive functions across modules — including chains of 3+ modules and the
-case where one module's return type is only knowable from a peer — compile and run with zero
-userland annotations. The entry module may itself participate in a cycle (its body is then also
+**Consequence**: Mutually-recursive functions across modules — including chains of 3+ modules —
+compile and run correctly with zero userland annotations (the runtime calls the real symbol, so
+results are always right). The entry module may itself participate in a cycle (its body is then also
 emitted under the import-mangled symbol a peer calls; a duplicated definition, code-size only).
 Regressions in `crates/lin/tests/integration.rs`:
 `test_cyclic_imports_mutual_recursion_unannotated`,
@@ -1461,7 +1463,16 @@ Regressions in `crates/lin/tests/integration.rs`:
 `test_circular_import_function_reference_compiles_not_stack_overflow` (the former
 reject-expectation, repurposed), `test_diamond_imports_are_not_false_cycles`.
 
-**Known limitation**: the SCC fixed point is a single re-check, not iterated to convergence. Deep
-mutual *inference* chains where a return type is only knowable after more than one round may still
-under-infer; annotated params + at least one grounding literal/annotation in the cycle (the
-idiomatic case) always resolve.
+**Known limitation (boundary-soundness gap)**: the SCC fixed point is a single re-check, not
+iterated to convergence, and the trigger is *whether a return type flows through a peer call* — not
+hop-count. A cyclic export whose body returns a locally-determinable value (literal/annotation, even
+inside a cyclic module) infers correctly. But a cyclic export whose return type depends on a peer
+call ends up with a **permissive/unsolved type at the module boundary**: its consumers get no return
+type, so `val k: Int32 = peerRecursiveFn(x)` type-*checks* even when the function returns `String`.
+Verified: in an `a→b→c→a` cycle where `fromC = (n) => if n==0 then "done" else fromA(n-1)`, binding
+`fromA`/`fromB`/`fromC`'s result to `Int32` *or* `Bool` is wrongly accepted; the same `fromC` outside
+any cycle correctly infers `String` and rejects `Int32`. This is a **missed-error soundness gap, not a
+miscompile** — runtime behaviour is correct because codegen calls the real symbol. The fix is to
+iterate Phase 2 to a fixed point (re-seed with each round's signatures until they stop changing), or
+to fail closed by *requiring* an explicit return annotation on a peer-call-dependent cyclic export.
+Not yet done; tracked as follow-up.
