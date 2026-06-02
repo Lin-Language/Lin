@@ -935,6 +935,8 @@ dependencies = [
  "lin-parse",
  "notify",
  "rayon",
+ "serde",
+ "serde_json",
  "tempfile",
  "tiny_http",
 ]

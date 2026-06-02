@@ -18,3 +18,11 @@
 // wrapper can express it.
 export val fromJson = (_: Json, value: Json): Json =>
   value
+
+import foreign "lin-runtime"
+  val lin_json_escape: (String) => String
+
+// Escape a string and wrap it in double quotes, producing a valid JSON string literal.
+// Used by std/test to emit machine-readable NDJSON test records.
+export val toJsonString = (s: String): String =>
+  lin_json_escape(s)
