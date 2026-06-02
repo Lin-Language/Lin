@@ -4,7 +4,7 @@ import { length } from "std/array"
 import { filter, for, map } from "std/iter"
 import { exit } from "std/io"
 import { getEnv } from "std/env"
-import { toJsonString } from "std/json"
+import { toJsonString, toJson } from "std/json"
 import { startTimer, elapsed } from "std/time"
 
 // An Assertion is the result of a single matcher: a pass, or a fail carrying a message.
@@ -20,6 +20,19 @@ val _pass = (): Assertion =>
 
 val _fail = (message: String): Assertion =>
   { "type": "fail", "message": message }
+
+// A failing assertion that ALSO carries the raw expected/actual pair, so consumers (the VSCode
+// Test Explorer) can render a structured diff without re-parsing the human message. The extra
+// keys are harmless under structural typing (the declared `Assertion` is the open `{ "type":
+// String }`, so a wider literal is assignable). Only equality-style matchers with a meaningful
+// scalar/value pair use this — matchers like `toSatisfy` have no natural pair and stay on `_fail`.
+val _failCompare = (message: String, expected: Json, actual: Json): Assertion =>
+  {
+    "type": "fail",
+    "message": message,
+    "expected": expected,
+    "actual": actual
+  }
 
 val _evalResult = (name: String, results: Assertion[], ms: Int64): Json =>
   val failures = results.filter(a => a["type"] == "fail")
@@ -59,14 +72,18 @@ export val toBe = (asserter: Json, expected: Json): Assertion =>
   if value == expected then
     _pass()
   else
-    _fail("expected: ${toString(expected)}\n    actual:   ${toString(value)}")
+    _failCompare(
+      "expected: ${toString(expected)}\n    actual:   ${toString(value)}",
+      expected,
+      value
+    )
 
 export val toBeNull = (asserter: Json): Assertion =>
   val value = asserter["value"]
   if value == null then
     _pass()
   else
-    _fail("expected null, got: ${toString(value)}")
+    _failCompare("expected null, got: ${toString(value)}", null, value)
 
 export val toSatisfy = (asserter: Json, pred: Function): Assertion =>
   val value = asserter["value"]
@@ -94,7 +111,11 @@ export val toFailWith = (asserter: Json, message: String): Assertion =>
   if value["type"] == "failure" && value["error"] == message then
     _pass()
   else
-    _fail("expected failure with \"${message}\", got: ${toString(value)}")
+    _failCompare(
+      "expected failure with \"${message}\", got: ${toString(value)}",
+      message,
+      value["error"]
+    )
 
 // Is this test selected to run? When the `LIN_TEST_ONLY` env var is set (by `lin test
 // --filter-test`), it holds the newline-separated set of test names to run; a test whose name
@@ -156,9 +177,21 @@ val _reportJsonResult = (r: Json): Null =>
   else
     val messages = r["failures"].map(f => f["message"])
     val joined = messages.join("\n")
-    print(
-      "##LINTEST## {\"event\":\"test\",\"name\":${toJsonString(r["name"])},\"status\":\"fail\",\"message\":${toJsonString(joined)},\"ms\":${toString(r["ms"])}}"
-    )
+    // Structured expected/actual is emitted ONLY when EXACTLY ONE failure carries a pair (the
+    // common one-assertion-per-test case). With multiple failing assertions there is no single
+    // pair to surface, so we omit the fields and let the joined `message` convey everything. The
+    // values are arbitrary Json (objects/arrays/quoted strings), so they MUST go through `toJson`
+    // (the recursive serializer), never raw interpolation or the string-only `toJsonString`.
+    val structured = r["failures"].filter(f => f["expected"] != null || f["actual"] != null)
+    if length(structured) == 1 then
+      val f = structured[0]
+      print(
+        "##LINTEST## {\"event\":\"test\",\"name\":${toJsonString(r["name"])},\"status\":\"fail\",\"message\":${toJsonString(joined)},\"expected\":${toJson(f["expected"])},\"actual\":${toJson(f["actual"])},\"ms\":${toString(r["ms"])}}"
+      )
+    else
+      print(
+        "##LINTEST## {\"event\":\"test\",\"name\":${toJsonString(r["name"])},\"status\":\"fail\",\"message\":${toJsonString(joined)},\"ms\":${toString(r["ms"])}}"
+      )
 
 // Print a suite's results and return the failure count (0 = all passed). Unlike `run`, this
 // does NOT call `exit`, so statements AFTER it execute regardless of outcome — the building
