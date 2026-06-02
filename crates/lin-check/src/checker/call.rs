@@ -7,6 +7,29 @@ use crate::resolve::{error_type, json_type};
 use crate::typed_ir::*;
 use crate::types::Type;
 
+/// Whether an argument type may satisfy a `Number` (numeric-bounded) parameter (ADR-018, reversed).
+/// Accepts:
+///   * a concrete numeric family (the monomorphizable case),
+///   * a generic/unsolved type var (the bound flows on to the outer specialization, or is zonked to
+///     a concrete family), AND
+///   * the `Json` wildcard (`TypeVar(u32::MAX)`) — a dynamic `Json` value (ADR-018 §Json policy).
+///     This matches the existing `Json → Int32` scalar coercion (ADR-048): a `Json` argument is
+///     ACCEPTED at a `Number` parameter and monomorphizes to the default `Int32` family, unboxing
+///     unchecked. Previously a DIRECT `Json` (the bare `u32::MAX` marker) was rejected here while a
+///     `Json` PROJECTION (`config["k"]`, a fresh inference var) slipped past — an inconsistency now
+///     removed. A `Json` holding a non-number unboxes as garbage, the SAME accepted, documented
+///     unsoundness as `Json → Int32` today; `fromJson` is the validated extraction path.
+/// REJECTS only genuinely non-numeric concrete types (`String`/`Bool`/`Object`/array).
+fn arg_satisfies_numeric_bound(arg_ty: &Type) -> bool {
+    match arg_ty {
+        t if t.is_numeric() => true,
+        // Any type var, INCLUDING the `Json` wildcard (`u32::MAX`): a generic/unsolved bound flows
+        // on; a `Json` value monomorphizes to the default `Int32` family (see doc above).
+        Type::TypeVar(_) => true,
+        _ => false,
+    }
+}
+
 impl Checker {
     /// `fromJson` special form (ADR-047). `T.fromJson(value)` desugars to a DotCall and
     /// `fromJson(T, value)` to a Call; both reach here BEFORE arg0/receiver is inferred as a
@@ -368,6 +391,36 @@ impl Checker {
                     }
                 }
 
+                // Enforce the NUMERIC bound (ADR-018, reversed). A `Number` parameter resolved to a
+                // numerically-constrained generic TypeVar; at this call site it is being bound to the
+                // argument's concrete family. That family must be numeric (an `Int*`/`UInt*`/`Float*`),
+                // OR another numeric-constrained / unconstrained generic TypeVar (the bound flows on to
+                // the outer specialization). A `String`/`Bool`/`Object`/array/`Json` argument is a
+                // compile error — caught HERE rather than via `arg_compatible`, which would otherwise
+                // accept any type into a bare TypeVar param.
+                for (i, param_ty) in params.iter().enumerate() {
+                    if i >= typed_args.len() { break; }
+                    if let Type::TypeVar(id) = param_ty {
+                        if self.numeric_tvs.contains(id) {
+                            let arg_ty = typed_args[i].ty();
+                            if !arg_satisfies_numeric_bound(&arg_ty) {
+                                return Err(Diagnostic::error(
+                                    args[i].span(),
+                                    format!(
+                                        "Argument {} has type {}, expected a numeric type (Number)",
+                                        i + 1,
+                                        arg_ty
+                                    ),
+                                ).with_help(
+                                    "a `Number` parameter accepts any numeric family (Int8…Float64), \
+                                     or a dynamic `Json` value (decoded as Int32, unchecked — use \
+                                     `Int32.fromJson(v)` for a validated decode)".to_string()
+                                ));
+                            }
+                        }
+                    }
+                }
+
                 // Check argument compatibility against concrete params.
                 for (i, (arg, param_ty)) in
                     typed_args.iter().zip(concrete_params.iter()).enumerate()
@@ -385,6 +438,13 @@ impl Checker {
                         ));
                     }
                 }
+
+                // Mixed numeric families in ONE call of a `Number`-returning function (e.g.
+                // `(a:Number,b:Number)=>a+b` at `add(10, 2.5)`) ARE supported (ADR-018, reversed):
+                // monomorphization specializes `add$Int32_Float64` and re-widens the arithmetic
+                // result to the same family the concrete `(a:Int32,b:Float64)` equivalent produces
+                // (Float64 here). No guard — the previous reject was a workaround for a codegen ABI
+                // mismatch (frozen-result-type) now fixed in `lin-ir::monomorphize`.
 
                 let concrete_ret = apply_type_subs(ret, &subs);
                 let required = *required;
@@ -638,6 +698,30 @@ impl Checker {
                 let concrete_params: Vec<Type> = method_params.iter()
                     .map(|p| apply_type_subs(p, &subs))
                     .collect();
+                // Enforce the NUMERIC bound on a dot-call to a `Number`-parameter function (ADR-018,
+                // reversed). Mirrors the direct-call check; the receiver is arg 0.
+                for (i, param_ty) in method_params.iter().enumerate() {
+                    if i >= all_args.len() { break; }
+                    if let Type::TypeVar(id) = param_ty {
+                        if self.numeric_tvs.contains(id) {
+                            let arg_ty = all_args[i].ty();
+                            if !arg_satisfies_numeric_bound(&arg_ty) {
+                                return Err(Diagnostic::error(
+                                    all_arg_exprs.get(i).map(|e| e.span()).unwrap_or(span),
+                                    format!(
+                                        "Argument {} has type {}, expected a numeric type (Number)",
+                                        i + 1,
+                                        arg_ty
+                                    ),
+                                ).with_help(
+                                    "a `Number` parameter accepts any numeric family (Int8…Float64), \
+                                     or a dynamic `Json` value (decoded as Int32, unchecked — use \
+                                     `Int32.fromJson(v)` for a validated decode)".to_string()
+                                ));
+                            }
+                        }
+                    }
+                }
                 let concrete_ret = apply_type_subs(&ret, &subs);
                 let result_type = if partial {
                     if all_args.len() < method_params.len() {

@@ -10072,3 +10072,165 @@ fn test_json_reporter_structured_expected_actual() {
     assert!(sat.get("actual").is_none(), "toSatisfy must not carry 'actual'; got:\n{:?}", sat);
     assert!(sat["message"].as_str().unwrap_or("").contains("predicate"), "satisfy message preserved");
 }
+
+// ── `Number` as a numerically-bounded generic parameter (ADR-018, reversed) ─────────────────────
+// `(x: Number)` is sugar for `<T: numeric>(x: T)`: the body type-checks (the bound permits
+// arithmetic), and monomorphization specializes per call-site family to native unboxed ops.
+
+#[test]
+fn test_number_param_specializes_int_and_float() {
+    // The canonical example: one `Number` parameter, called at Int32 AND Float64. Each call
+    // monomorphizes to a native specialization (`isEven$Int32` srem, `isEven$Float64` frem).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val isEven = (x: Number) => x % 2 == 0
+print(toString(isEven(4)))
+print(toString(isEven(3.0)))
+print(toString(isEven(7)))
+print(toString(isEven(8.0)))
+"#);
+    assert_eq!(out, vec!["true", "false", "false", "true"]);
+}
+
+#[test]
+fn test_number_param_string_arg_is_compile_error() {
+    // A `String` argument fails the numeric bound at the call site — a clear compile error.
+    let err = run_expect_err(r#"import { print } from "std/io"
+val isEven = (x: Number) => x % 2 == 0
+print(isEven("hi"))
+"#);
+    assert!(
+        err.contains("expected a numeric type") && err.contains("String"),
+        "String into a Number param should be a numeric-bound error; got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_number_binding_position_is_clear_error() {
+    // `Number` is a parameter/return CONSTRAINT, not a value type — using it on a `val`/`var`
+    // binding has no concrete representation. The error must point the user at a concrete family
+    // rather than the misleading "Unknown type 'Number'".
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val total: Number = 0
+print(toString(total))
+"#);
+    assert!(
+        err.contains("parameter constraint, not a value type")
+            && (err.contains("Int32") || err.contains("Float64")),
+        "Number in binding position should give the constraint-guidance error; got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_number_multi_param_same_family_per_call() {
+    // Two `Number` params; each CALL uses a single family. Distinct calls specialize independently
+    // (`add$Int32_Int32`, `add$Float64_Float64`).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val add = (a: Number, b: Number) => a + b
+print(toString(add(3, 4)))
+print(toString(add(1.5, 2.5)))
+"#);
+    assert_eq!(out, vec!["7", "4.0"]);
+}
+
+#[test]
+fn test_number_return_type_annotation() {
+    // `Number` is also usable as a return-type annotation (its own fresh bounded var).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val twice = (x: Number): Number => x + x
+print(toString(twice(21)))
+print(toString(twice(1.25)))
+"#);
+    assert_eq!(out, vec!["42", "2.5"]);
+}
+
+#[test]
+fn test_number_mixed_family_in_one_call_widens() {
+    // Mixed numeric families in ONE call of a `Number`-returning function are SUPPORTED (ADR-018,
+    // reversed): `add$Int32_Float64` is monomorphized and the arithmetic re-widens to the same
+    // family the concrete `(a:Int32,b:Float64)` equivalent produces. `add(10, 2.5)` ⇒ Float64
+    // `12.5`; `add(10, 2)` stays Int (both Int32); `add(1.5, 2.5)` is Float64. Native widening
+    // (sitofp+fadd), no boxed `lin_tagged_arith` — see the monomorphize fix.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val add = (a: Number, b: Number) => a + b
+print(toString(add(10, 2.5)))
+print(toString(add(10, 2)))
+print(toString(add(1.5, 2.5)))
+print(toString(add(2.5, 10)))
+"#);
+    assert_eq!(out, vec!["12.5", "12", "4.0", "12.5"]);
+}
+
+#[test]
+fn test_number_nested_array_map_specializes() {
+    // Nested `Number` (ADR-018, reversed, bug #4): `Number[]` and a `Number` callback over it.
+    // `resolve_type_with_number_in` recurses into the Array element; the callback's `Number` param
+    // reuses the receiver element's bounded var (so its family is pinned by the argument) and its
+    // body type is surfaced as the lambda return, letting the outer call infer. `f([1,2,3])` ⇒
+    // element Int32 (native `mul i32` loop); `f([1.5,2.5])` ⇒ Float64.
+    let out = run(r#"import { print } from "std/io"
+import { map } from "std/iter"
+import { toString } from "std/string"
+val f = (xs: Number[]) => xs.map((v: Number) => v * 2)
+print(toString(f([1, 2, 3])))
+print(toString(f([1.5, 2.5])))
+"#);
+    assert_eq!(out, vec!["[2, 4, 6]", "[3.0, 5.0]"]);
+}
+
+#[test]
+fn test_number_nested_array_reduce_and_index() {
+    // `Number[]` direct numeric use also works: indexing and a reduce whose seed pins the family.
+    let out = run(r#"import { print } from "std/io"
+import { reduce } from "std/iter"
+import { toString } from "std/string"
+val sum = (xs: Number[]) => xs.reduce(0, (a, b) => a + b)
+val firstTwo = (xs: Number[]) => xs[0] + xs[1]
+print(toString(sum([10, 20, 30])))
+print(toString(firstTwo([5, 6])))
+"#);
+    assert_eq!(out, vec!["60", "11"]);
+}
+
+#[test]
+fn test_number_json_arg_accepted_direct_and_projected_consistent() {
+    // ADR-018 (reversed) §Json: a `Json` value is ACCEPTED at a `Number` parameter — consistent
+    // with the `Json → Int32` scalar coercion gap (ADR-048), monomorphizing to the default `Int32`
+    // family with an unchecked unbox. This was previously INCONSISTENT: a DIRECT `Json`
+    // (`val x: Json = 42`, the bare `TypeVar(u32::MAX)` marker) was REJECTED while a `Json`
+    // PROJECTION (`config["count"]`, a fresh inference var) slipped past the bound guard and ran.
+    // BOTH forms must now compile AND produce the SAME runtime answer (`isEven$Json` unboxes the
+    // Json as Int32 and `srem`s — byte-identical specializations). 42 is even ⇒ `true` for both.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val isEven = (x: Number) => x % 2 == 0
+val direct: Json = 42
+val config: Json = { "count": 42 }
+print(toString(isEven(direct)))
+print(toString(isEven(config["count"])))
+"#);
+    assert_eq!(out, vec!["true", "true"]);
+}
+
+#[test]
+fn test_number_json_arg_arithmetic_returns_right_number() {
+    // A Json-int through a `Number` param USED IN ARITHMETIC (a Number-returning body, not just a
+    // Bool predicate) must monomorphize to `triple$Json` (param unboxed Int32, native `mul i32`),
+    // box the scalar result back to the Json the surrounding `toString` expects, and return the
+    // RIGHT number. Both the direct `Json` binding and the `config[...]` projection of 14 ⇒ 42.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val triple = (x: Number) => x * 3
+val direct: Json = 14
+val config: Json = { "count": 14 }
+print(toString(triple(direct)))
+print(toString(triple(config["count"])))
+"#);
+    assert_eq!(out, vec!["42", "42"]);
+}
