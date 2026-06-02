@@ -295,7 +295,7 @@ val addHeading = (st: Json, line: String, level: Int32): Json =>
   val blocks = flushedBlocks(st).append({
     "kind": "heading",
     "level": level,
-    "text": line.substring(level + 1, line.length()).trim()
+    "text": line.substring(level + 1).trim()
   })
   {
     ...st,
@@ -329,7 +329,7 @@ val addQuoteLine = (st: Json, line: String): Json =>
     "items": [],
     "tableRows": [],
     "tableOn": false,
-    "quote": st["quote"].append(line.substring(2, line.length()))
+    "quote": st["quote"].append(line.substring(2))
   }
 
 // Append a list item; a change of list kind (ordered vs unordered) closes the previous list.
@@ -417,7 +417,7 @@ val parseLine = (st: Json, line: String): Json =>
   else if startsWith(line, "> ") then
     addQuoteLine(st, line)
   else if startsWith(line, "- ") then
-    addListItem(st, line.substring(2, line.length()), false)
+    addListItem(st, line.substring(2), false)
   else if isOrderedItem(line) then
     addListItem(st, substring(line, indexOf(line, ". ") + 2, length(line)), true)
   else if isTableRow(line) then

@@ -210,6 +210,9 @@ pub unsafe extern "C" fn lin_string_slice(
     end: i32,
 ) -> *mut LinString {
     let len = (*s).len as i32;
+    // Negative indices count from the end of the string (Python-style).
+    let start = if start < 0 { start + len } else { start };
+    let end = if end < 0 { end + len } else { end };
     let start = start.clamp(0, len) as usize;
     let end = end.clamp(0, len) as usize;
     let end = end.max(start);
