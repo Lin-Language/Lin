@@ -1048,6 +1048,10 @@ test-only + intrinsic/unused diagnostics).
 
 ## ADR-072: Circular imports are a compile-time error (DFS visiting-stack)
 
+> **Superseded in part by ADR-078**: cyclic *function* references are now supported via SCC
+> type-checking. The stack-overflow protection and the value-init rejection described here remain
+> in force (the value cycle is now reported as `a <-> b (… reads an imported VALUE …)`).
+
 **Decision**: A circular import is rejected at compile time with a
 `CompileError::ImportCycle` carrying the cycle as a readable chain
 (`circular import detected: a -> b -> a`). Import resolution
@@ -1411,3 +1415,53 @@ back the lazy arm; each drives-and-consumes the stream on the calling thread, fa
 flat-producer recognition (the unboxed-scalar fast path, ADR-069) follows the moved names. Verified on
 `feat/streams`: full suite green, ASan clean, all five affine attacks reject. Full stream semantics in
 §27.9 (ADR-076); combinator surface in §18; stdlib API in `std/iter` (STDLIB.md).
+
+## ADR-078: Cyclic function imports compile via SCC type-checking (no userland change)
+
+**Decision**: A true import cycle whose cross-module edges are *function* references now compiles
+**as written**, with no annotations and no syntax changes. Import resolution in `lin-compile`
+(`pre_resolve_imports_from_ast`) no longer rejects on a back-edge. Instead it: (1) loads the whole
+import graph up front (`build_import_graph`, keyed by stable module identity, recording every
+path-string spelling each module is reached by); (2) decomposes it into strongly-connected
+components (`tarjan_sccs`, emitted in reverse-topological order); (3) resolves a singleton SCC with
+no self-edge through exactly the old per-module path (`resolve_singleton`, incl. the `.lin-cache`
+fast path); and (4) type-checks a true multi-module (or self-importing) SCC together via
+`check_scc`. A genuine **value-init** cycle is still rejected.
+
+`check_scc` is a two-pass seed-and-recheck fixed point:
+- **Phase 1** checks each member against the already-resolved `cache` — a peer not yet checked
+  falls back to a fresh TypeVar at the existing import-binding seam (`checker/stmt.rs` Import arm),
+  yielding a provisional `ModuleSignature` for every member.
+- **Value-init guard** (between the phases, using the Phase 1 signatures to distinguish function
+  from eager-value peer exports): a top-level non-function `val`/`var` whose initialiser reads a
+  peer export that is itself a *non-function value* is unbreakable module-init recursion (spec
+  §7.3) → `CompileError::ImportCycle`. Binding/calling a peer *function* is fine (resolved by
+  symbol, never recomputed at init).
+- **Phase 2** re-checks each member with all provisional peer signatures seeded into `import_types`
+  (`check_module_with_seeded_imports`), so a cross-module call resolves to a peer's concrete
+  (provisional) type — letting an unannotated mutually-recursive function infer its return type.
+The Phase 2 modules are registered; cyclic members are never read from `.lin-cache` (their type
+depends on peers), though their `.sig` is persisted for out-of-SCC dependents.
+
+**Rationale**: The codegen/IR layer was already cycle-ready — imported functions are called by
+mangled `Named` symbol resolved at link time, and codegen pre-declares all symbols, so a back-edge
+needs no special lowering. The only barrier was the front-end's hard reject plus per-module checker
+isolation (ADR-008). The fresh-TypeVar fallback at the import-binding seam is the hook that makes
+seed-and-recheck work without sharing a checker (no ADR-008 break). Per-path-string registration is
+preserved (each spelling gets its own compiled copy + mangled symbols, matching long-standing
+absolute-vs-relative behaviour).
+
+**Consequence**: Mutually-recursive functions across modules — including chains of 3+ modules and the
+case where one module's return type is only knowable from a peer — compile and run with zero
+userland annotations. The entry module may itself participate in a cycle (its body is then also
+emitted under the import-mangled symbol a peer calls; a duplicated definition, code-size only).
+Regressions in `crates/lin/tests/integration.rs`:
+`test_cyclic_imports_mutual_recursion_unannotated`,
+`test_cyclic_imports_value_init_cycle_still_errors`,
+`test_circular_import_function_reference_compiles_not_stack_overflow` (the former
+reject-expectation, repurposed), `test_diamond_imports_are_not_false_cycles`.
+
+**Known limitation**: the SCC fixed point is a single re-check, not iterated to convergence. Deep
+mutual *inference* chains where a return type is only knowable after more than one round may still
+under-infer; annotated params + at least one grounding literal/annotation in the cycle (the
+idiomatic case) always resolve.

@@ -422,6 +422,49 @@ fn check_module_with_imports(
     Ok((typed, warnings))
 }
 
+/// Like `check_module_with_imports`, but additionally seeds `seeded` provisional export types
+/// (keyed by `(import-path-string, export-name)`) into the checker's `import_types` BEFORE the
+/// resolved `imported_modules` signatures. Used by `check_scc` Phase 2 so a cyclic member's
+/// cross-module references resolve to a peer's (provisional) inferred type instead of falling back
+/// to a fresh TypeVar — the seam that lets unannotated mutual recursion type-check.
+fn check_module_with_seeded_imports(
+    ast_module: &Module,
+    imported_modules: &HashMap<String, TypedModule>,
+    seeded: &HashMap<(String, String), Type>,
+    lenient_json: bool,
+) -> Result<(TypedModule, Vec<lin_common::Diagnostic>), Vec<lin_common::Diagnostic>> {
+    let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
+    let mut import_type_decls: HashMap<(String, String), (Vec<String>, Type)> = HashMap::new();
+    // Already-resolved (acyclic) imports first.
+    for (path, imp_module) in imported_modules {
+        let sig = ModuleSignature::from_module(imp_module);
+        for (name, ty) in sig.exports {
+            import_type_map.insert((path.clone(), name), ty);
+        }
+        for (name, decl) in sig.type_exports {
+            import_type_decls.insert((path.clone(), name), decl);
+        }
+    }
+    // Provisional peer signatures from within the SCC override/augment the map (a peer is not in
+    // `imported_modules` yet, so this is the only source of its type).
+    for ((path, name), ty) in seeded {
+        import_type_map.insert((path.clone(), name.clone()), ty.clone());
+    }
+    let mut checker = Checker::new();
+    checker.import_types = import_type_map;
+    checker.import_type_decls = import_type_decls;
+    checker.lenient_json = lenient_json;
+    checker.protect_import_typevars();
+    let typed = checker.check_module(ast_module)?;
+    let warnings: Vec<lin_common::Diagnostic> = checker
+        .diagnostics()
+        .iter()
+        .filter(|d| !matches!(d.severity, lin_common::Severity::Error))
+        .cloned()
+        .collect();
+    Ok((typed, warnings))
+}
+
 /// Embedded stdlib source files (mirrors interpreter's include_str! approach).
 fn stdlib_source(path: &str) -> Option<&'static str> {
     match path {
@@ -456,29 +499,6 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
     }
 }
 
-/// Recursively type-check all imported modules, populating `cache` in dependency order.
-/// `import_sources` is populated with (abs_path, source_text) for user-defined (non-stdlib) imports.
-fn pre_resolve_imports_from_ast(
-    ast_module: &Module,
-    base_dir: &Path,
-    entry_path: &Path,
-    cache: &mut HashMap<String, TypedModule>,
-    order: &mut Vec<String>,
-    import_sources: &mut HashMap<String, (String, String)>,
-) -> Result<(), CompileError> {
-    // `visiting` is the DFS stack of module identities currently being resolved; it both
-    // detects cycles and supplies the chain for the diagnostic. Seed it with the entry
-    // module so a cycle that loops back to the entry point is also caught and reported
-    // with a complete chain.
-    let entry_identity = entry_path
-        .canonicalize()
-        .unwrap_or_else(|_| entry_path.to_path_buf())
-        .to_string_lossy()
-        .to_string();
-    let mut visiting: Vec<String> = vec![entry_identity];
-    pre_resolve_imports_inner(ast_module, base_dir, cache, order, import_sources, &mut visiting)
-}
-
 /// A module's stable identity for cycle detection. Stdlib paths (`std/...`) are already
 /// canonical; user modules are keyed by their canonicalised absolute file path so that two
 /// different spellings of the same file (`../a` vs `a`) map to one identity.
@@ -494,79 +514,424 @@ fn module_identity(path: &str, base_dir: &Path) -> String {
         .to_string()
 }
 
-fn pre_resolve_imports_inner(
+/// A loaded-but-not-yet-checked import module, keyed in `ImportGraph` by its stable identity.
+struct LoadedModule {
+    /// Every import-path string this module was reached by, in first-seen order. Codegen mangles
+    /// an imported symbol from the importer's path string, so each distinct spelling needs its own
+    /// compiled copy (the registration loop emits one `cache`/`order` entry per path string).
+    paths: Vec<String>,
+    ast: Module,
+    src_text: String,
+    /// Directory imports inside this module resolve relative to.
+    base_dir: PathBuf,
+    /// `Some(abs_path)` for user (non-stdlib) modules; `None` for the embedded stdlib.
+    abs_path: Option<String>,
+    is_stdlib: bool,
+    /// Identities of the modules this module imports (graph adjacency).
+    deps: Vec<String>,
+}
+
+/// The full import graph, loaded by parsing every transitively-reachable module exactly once
+/// (keyed by stable identity). SCC analysis runs over this graph so genuine cycles can be
+/// type-checked together instead of being rejected outright.
+struct ImportGraph {
+    /// identity -> loaded module.
+    modules: HashMap<String, LoadedModule>,
+    /// Insertion order of identities (first-seen DFS order), used to keep SCC processing and the
+    /// resulting `import_order` deterministic.
+    order: Vec<String>,
+}
+
+/// Parse `ast_module`'s imports and, recursively, the whole reachable module graph, loading each
+/// module once keyed by identity. Records adjacency (and every path string each module is reached
+/// by) without type-checking anything yet.
+fn build_import_graph(
     ast_module: &Module,
     base_dir: &Path,
+    graph: &mut ImportGraph,
+) -> Result<Vec<String>, CompileError> {
+    let mut deps = Vec::new();
+    for stmt in &ast_module.statements {
+        let Stmt::Import { path, .. } = stmt else { continue };
+        let identity = module_identity(path, base_dir);
+        deps.push(identity.clone());
+
+        if let Some(existing) = graph.modules.get_mut(&identity) {
+            // Already loaded — just record this additional path spelling (so it gets its own
+            // compiled copy + mangled symbols, matching the per-path-string registration the
+            // non-cyclic resolver has always produced for absolute-vs-relative spellings).
+            if !existing.paths.contains(path) {
+                existing.paths.push(path.clone());
+            }
+            continue;
+        }
+
+        let (ast, src_text, imported_base, abs_path, is_stdlib) =
+            if let Some(src) = stdlib_source(path.as_str()) {
+                let ast = parse_source(src).map_err(CompileError::TypeCheck)?;
+                (ast, src.to_string(), base_dir.to_path_buf(), None, true)
+            } else {
+                let file_path = base_dir.join(format!("{}.lin", path));
+                let src = std::fs::read_to_string(&file_path)?;
+                let ast = parse_source(&src).map_err(CompileError::TypeCheck)?;
+                let imported_base = file_path.parent().unwrap_or(base_dir).to_path_buf();
+                let abs = file_path.canonicalize().unwrap_or(file_path);
+                (ast, src, imported_base, Some(abs.to_string_lossy().to_string()), false)
+            };
+
+        // Insert a placeholder before recursing so a cycle back to this identity finds it
+        // (and does not reload it). `deps` is filled in after the recursive load returns.
+        graph.modules.insert(identity.clone(), LoadedModule {
+            paths: vec![path.clone()],
+            ast: ast.clone(),
+            src_text,
+            base_dir: imported_base.clone(),
+            abs_path,
+            is_stdlib,
+            deps: Vec::new(),
+        });
+        graph.order.push(identity.clone());
+
+        let child_deps = build_import_graph(&ast, &imported_base, graph)?;
+        if let Some(m) = graph.modules.get_mut(&identity) {
+            m.deps = child_deps;
+        }
+    }
+    Ok(deps)
+}
+
+/// Tarjan's strongly-connected-components over the import graph, restricted to identities reachable
+/// from `graph.order`. Returns the SCCs in reverse-topological order (dependencies before
+/// dependents) — exactly the order codegen needs imports registered in. Each SCC is a list of
+/// member identities; a singleton with no self-edge is an ordinary acyclic module.
+fn tarjan_sccs(graph: &ImportGraph) -> Vec<Vec<String>> {
+    struct State<'a> {
+        graph: &'a ImportGraph,
+        index: u32,
+        indices: HashMap<String, u32>,
+        lowlink: HashMap<String, u32>,
+        on_stack: std::collections::HashSet<String>,
+        stack: Vec<String>,
+        sccs: Vec<Vec<String>>,
+    }
+    fn strongconnect(s: &mut State, v: &str) {
+        s.indices.insert(v.to_string(), s.index);
+        s.lowlink.insert(v.to_string(), s.index);
+        s.index += 1;
+        s.stack.push(v.to_string());
+        s.on_stack.insert(v.to_string());
+
+        let deps = s.graph.modules.get(v).map(|m| m.deps.clone()).unwrap_or_default();
+        for w in &deps {
+            if !s.indices.contains_key(w) {
+                strongconnect(s, w);
+                let lw = s.lowlink[w];
+                let lv = s.lowlink[v];
+                s.lowlink.insert(v.to_string(), lv.min(lw));
+            } else if s.on_stack.contains(w) {
+                let iw = s.indices[w];
+                let lv = s.lowlink[v];
+                s.lowlink.insert(v.to_string(), lv.min(iw));
+            }
+        }
+
+        if s.lowlink[v] == s.indices[v] {
+            let mut scc = Vec::new();
+            loop {
+                let w = s.stack.pop().unwrap();
+                s.on_stack.remove(&w);
+                let done = w == v;
+                scc.push(w);
+                if done { break; }
+            }
+            s.sccs.push(scc);
+        }
+    }
+
+    let mut s = State {
+        graph,
+        index: 0,
+        indices: HashMap::new(),
+        lowlink: HashMap::new(),
+        on_stack: std::collections::HashSet::new(),
+        stack: Vec::new(),
+        sccs: Vec::new(),
+    };
+    for id in &graph.order {
+        if !s.indices.contains_key(id) {
+            strongconnect(&mut s, id);
+        }
+    }
+    // Tarjan already emits SCCs in reverse-topological order (a dependency's SCC is finished and
+    // popped before its dependents'), which is the order we want.
+    s.sccs
+}
+
+/// True if `expr` references any name in `names` (a free identifier). Conservative — it descends
+/// the whole expression tree, so a nested function body counts too; callers pass non-function
+/// initializers only, where that is exactly the init-order dependency we must catch.
+fn expr_references_any(expr: &lin_parse::ast::Expr, names: &std::collections::HashSet<String>) -> bool {
+    use lin_parse::ast::Expr;
+    let mut found = false;
+    walk_expr(expr, &mut |e| {
+        if let Expr::Ident(n, _) = e {
+            if names.contains(n) {
+                found = true;
+            }
+        }
+    });
+    found
+}
+
+/// Visit every sub-expression of `expr`, applying `f` to each node (pre-order).
+fn walk_expr(expr: &lin_parse::ast::Expr, f: &mut impl FnMut(&lin_parse::ast::Expr)) {
+    use lin_parse::ast::{Expr, ObjectField, StringPart};
+    f(expr);
+    macro_rules! go { ($e:expr) => { walk_expr($e, f) }; }
+    match expr {
+        Expr::BinaryOp { left, right, .. } => { go!(left); go!(right); }
+        Expr::UnaryOp { operand, .. } => go!(operand),
+        Expr::Call { func, args, .. } => { go!(func); for a in args { go!(a); } }
+        Expr::DotCall { receiver, args, .. } => {
+            go!(receiver);
+            if let Some(args) = args { for a in args { go!(a); } }
+        }
+        Expr::Index { object, key, .. } => { go!(object); go!(key); }
+        Expr::If { condition, then_branch, else_branch, .. } => {
+            go!(condition); go!(then_branch); go!(else_branch);
+        }
+        Expr::Match { scrutinee, arms, .. } => {
+            go!(scrutinee);
+            for arm in arms {
+                if let Some(g) = &arm.guard { go!(g); }
+                go!(&arm.body);
+            }
+        }
+        Expr::Block(stmts, tail, _) => {
+            for s in stmts { walk_stmt_exprs(s, f); }
+            go!(tail);
+        }
+        Expr::Function { body, .. } => go!(body),
+        Expr::Array(elems, _) => for e in elems { go!(e); },
+        Expr::Object(fields, _) => for field in fields {
+            match field {
+                ObjectField::Pair(k, v) => { go!(k); go!(v); }
+                ObjectField::Spread(e) => go!(e),
+            }
+        },
+        Expr::Assign { value, .. } => go!(value),
+        Expr::IndexAssign { object, key, value, .. } => { go!(object); go!(key); go!(value); }
+        Expr::Is { expr, .. } | Expr::Has { expr, .. } => go!(expr),
+        Expr::StringInterp(parts, _) => {
+            for p in parts {
+                if let StringPart::Expr(e) = p { go!(e); }
+            }
+        }
+        Expr::TupleArgs(elems, _) => for e in elems { go!(e); },
+        _ => {}
+    }
+}
+
+fn walk_stmt_exprs(stmt: &Stmt, f: &mut impl FnMut(&lin_parse::ast::Expr)) {
+    match stmt {
+        Stmt::Val { value, .. } | Stmt::Var { value, .. } => walk_expr(value, f),
+        Stmt::Expr(e) | Stmt::Replace { value: e, .. } => walk_expr(e, f),
+        _ => {}
+    }
+}
+
+/// Recursively type-check all imported modules, populating `cache` in dependency order.
+/// `import_sources` is populated with (abs_path, source_text) for user-defined (non-stdlib) imports.
+///
+/// Replaces the old DFS-with-hard-cycle-reject: the import graph is loaded up front, decomposed
+/// into strongly-connected components, and each SCC is checked together. A singleton SCC (no
+/// self-edge) takes exactly the old per-module path (incl. the `.lin-cache` fast path); a true
+/// multi-module cycle is type-checked via `check_scc` so inference flows across the boundary with
+/// no userland annotations required (function-reference cycles). Genuine value-init cycles are
+/// still rejected with a clean diagnostic.
+fn pre_resolve_imports_from_ast(
+    ast_module: &Module,
+    base_dir: &Path,
+    _entry_path: &Path,
     cache: &mut HashMap<String, TypedModule>,
     order: &mut Vec<String>,
     import_sources: &mut HashMap<String, (String, String)>,
-    visiting: &mut Vec<String>,
 ) -> Result<(), CompileError> {
-    for stmt in &ast_module.statements {
-        let Stmt::Import { path, .. } = stmt else { continue };
-        if cache.contains_key(path.as_str()) {
-            continue;
-        }
+    let mut graph = ImportGraph { modules: HashMap::new(), order: Vec::new() };
+    build_import_graph(ast_module, base_dir, &mut graph)?;
+    let sccs = tarjan_sccs(&graph);
 
-        // Detect a circular import before descending: if this module is already on the
-        // DFS stack, recursing would loop forever (and overflow the stack). Report the
-        // cycle as a readable `a -> b -> a` chain instead.
-        let identity = module_identity(path, base_dir);
-        if let Some(start) = visiting.iter().position(|m| m == &identity) {
-            let mut chain: Vec<String> = visiting[start..].to_vec();
-            chain.push(identity);
-            return Err(CompileError::ImportCycle(chain.join(" -> ")));
-        }
-        visiting.push(identity);
-
-        // From here, any early `?` aborts the whole compile, so `visiting` is discarded;
-        // we only need to `pop` on the paths that fall through to the next sibling import.
-        let (ast_mod, src_text, imported_base, abs_path) = if let Some(src) = stdlib_source(path.as_str()) {
-            let ast = parse_source(src).map_err(CompileError::TypeCheck)?;
-            pre_resolve_imports_inner(&ast, base_dir, cache, order, import_sources, visiting)?;
-            (ast, src.to_string(), base_dir.to_path_buf(), None)
-        } else {
-            let file_path = base_dir.join(format!("{}.lin", path));
-            let src = std::fs::read_to_string(&file_path)?;
-            let ast = parse_source(&src).map_err(CompileError::TypeCheck)?;
-            let imported_base = file_path.parent().unwrap_or(base_dir).to_path_buf();
-            pre_resolve_imports_inner(&ast, &imported_base, cache, order, import_sources, visiting)?;
-            let abs = file_path.canonicalize().unwrap_or(file_path);
-            (ast, src, imported_base, Some(abs.to_string_lossy().to_string()))
+    for scc in &sccs {
+        let is_cycle = scc.len() > 1 || {
+            // A singleton is still a cycle if it imports itself.
+            let id = &scc[0];
+            graph.modules.get(id).map(|m| m.deps.contains(id)).unwrap_or(false)
         };
+        if !is_cycle {
+            resolve_singleton(&scc[0], &graph, cache, order, import_sources)?;
+        } else {
+            check_scc(scc, &graph, cache, order, import_sources)?;
+        }
+    }
+    Ok(())
+}
 
-        // Try cache hit first (skip re-checking if source unchanged).
-        if let Some(cached) = load_cache(&src_text, &imported_base) {
-            // Ensure signature is also cached (for dependent modules to use).
-            if load_signature(&src_text, &imported_base).is_none() {
-                let sig = ModuleSignature::from_module(&cached);
-                save_signature(&src_text, &sig, &imported_base);
-            }
-            if let Some(ap) = abs_path {
-                import_sources.entry(path.clone()).or_insert((ap, src_text));
-            }
-            order.push(path.clone());
-            cache.insert(path.clone(), cached);
-            visiting.pop();
+/// Resolve one acyclic module: consult the `.lin-cache`, else type-check it against the already
+/// resolved `cache`, then register it under every path string it was imported by. This is the
+/// unchanged single-module path, lifted out of the old recursive DFS.
+fn resolve_singleton(
+    identity: &str,
+    graph: &ImportGraph,
+    cache: &mut HashMap<String, TypedModule>,
+    order: &mut Vec<String>,
+    import_sources: &mut HashMap<String, (String, String)>,
+) -> Result<(), CompileError> {
+    let m = graph.modules.get(identity).expect("scc member loaded");
+
+    // Cache fast path.
+    if let Some(cached) = load_cache(&m.src_text, &m.base_dir) {
+        if load_signature(&m.src_text, &m.base_dir).is_none() {
+            let sig = ModuleSignature::from_module(&cached);
+            save_signature(&m.src_text, &sig, &m.base_dir);
+        }
+        register_resolved(m, cached, cache, order, import_sources);
+        return Ok(());
+    }
+
+    let (typed, _warnings) = check_module_with_imports(&m.ast, cache, m.is_stdlib)
+        .map_err(CompileError::TypeCheck)?;
+    let sig = ModuleSignature::from_module(&typed);
+    save_cache(&m.src_text, &typed, &m.base_dir);
+    save_signature(&m.src_text, &sig, &m.base_dir);
+    register_resolved(m, typed, cache, order, import_sources);
+    Ok(())
+}
+
+/// Register a resolved `TypedModule` into `cache`/`order`/`import_sources` under EVERY path string
+/// the module was imported by — codegen mangles symbols from the importer's path string, so each
+/// distinct spelling needs its own compiled copy (preserving long-standing absolute-vs-relative
+/// duplication behaviour).
+fn register_resolved(
+    m: &LoadedModule,
+    typed: TypedModule,
+    cache: &mut HashMap<String, TypedModule>,
+    order: &mut Vec<String>,
+    import_sources: &mut HashMap<String, (String, String)>,
+) {
+    for path in &m.paths {
+        if cache.contains_key(path) {
             continue;
         }
-
-        // Only the embedded stdlib is trusted to forward Json into concrete params (ADR-046);
-        // user-defined imported modules are checked strictly, like the main module.
-        let is_stdlib = stdlib_source(path.as_str()).is_some();
-        // Imported-module check warnings (e.g. a dropped Stream in a user import) are not rendered
-        // here — the must-use surface is the main module; `.0` takes the typed module.
-        let (typed, _import_warnings) = check_module_with_imports(&ast_mod, cache, is_stdlib)
-            .map_err(CompileError::TypeCheck)?;
-        let sig = ModuleSignature::from_module(&typed);
-        save_cache(&src_text, &typed, &imported_base);
-        save_signature(&src_text, &sig, &imported_base);
-        if let Some(ap) = abs_path {
-            import_sources.entry(path.clone()).or_insert((ap, src_text.clone()));
+        if let Some(ap) = &m.abs_path {
+            import_sources.entry(path.clone()).or_insert((ap.clone(), m.src_text.clone()));
         }
         order.push(path.clone());
-        cache.insert(path.clone(), typed);
-        visiting.pop();
+        cache.insert(path.clone(), typed.clone());
+    }
+}
+
+/// Type-check the members of a true import cycle (a multi-module SCC, or a self-importing module)
+/// together, so inference flows across the import boundary without requiring userland annotations.
+///
+/// Strategy (seed-and-recheck fixed point, Route A.a):
+///   1. Phase 1 — check every member with whatever peer signatures are available so far (peers not
+///      yet checked fall back to fresh TypeVars at the existing import-binding seam). Extract each
+///      member's provisional `ModuleSignature` (this also tells us which peer exports are functions
+///      vs. eager values).
+///   2. Reject genuine VALUE-init cycles: a top-level non-function `val`/`var` whose initializer
+///      reads a peer export that is ITSELF a non-function value is infinite module-init recursion
+///      (spec §7.3) and stays a hard error. Binding a peer FUNCTION as a value, or calling one, is
+///      fine — function symbols are resolved by name, not recomputed at init.
+///   3. Phase 2 — re-check every member with ALL provisional peer signatures seeded into
+///      `import_types`. Cross-module calls now resolve to concrete (provisional) types, so an
+///      unannotated mutually-recursive function infers correctly.
+/// The Phase 2 `TypedModule`s are the ones registered. (Cyclic members are not consulted from the
+/// `.lin-cache` — their types depend on peers, so they are always freshly checked.)
+fn check_scc(
+    scc: &[String],
+    graph: &ImportGraph,
+    cache: &mut HashMap<String, TypedModule>,
+    order: &mut Vec<String>,
+    import_sources: &mut HashMap<String, (String, String)>,
+) -> Result<(), CompileError> {
+    let members: Vec<&LoadedModule> = scc
+        .iter()
+        .map(|id| graph.modules.get(id).expect("scc member loaded"))
+        .collect();
+
+    // (1) Phase 1: provisional check of each member against the current `cache` (peers fall back
+    // to fresh TypeVars). Collect provisional signatures keyed by (path-string, export-name).
+    let mut provisional: HashMap<(String, String), Type> = HashMap::new();
+    for m in &members {
+        let (typed, _w) = check_module_with_imports(&m.ast, cache, m.is_stdlib)
+            .map_err(CompileError::TypeCheck)?;
+        let sig = ModuleSignature::from_module(&typed);
+        for (name, ty) in sig.exports {
+            // Seed under every path string this member is reached by, so a peer importing it by
+            // any spelling finds the provisional type.
+            for p in &m.paths {
+                provisional.insert((p.clone(), name.clone()), ty.clone());
+            }
+        }
+    }
+
+    // (2) Reject value-init cycles, using the Phase 1 signatures to tell function exports (safe to
+    // reference — resolved by symbol) from eager value exports (an init-time read that recurses).
+    for m in &members {
+        // Names imported by THIS module that resolve into the SCC AND name a peer NON-function
+        // export — reading one of these at init time is the unbreakable cycle.
+        let mut peer_value_imports: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for stmt in &m.ast.statements {
+            if let Stmt::Import { bindings, path, .. } = stmt {
+                let dep_identity = module_identity(path, &m.base_dir);
+                if !scc.iter().any(|s| s == &dep_identity) {
+                    continue;
+                }
+                for b in bindings {
+                    let is_value = matches!(
+                        provisional.get(&(path.clone(), b.name.clone())),
+                        Some(t) if !matches!(t, Type::Function { .. })
+                    );
+                    if is_value {
+                        peer_value_imports.insert(b.alias.clone().unwrap_or_else(|| b.name.clone()));
+                    }
+                }
+            }
+        }
+        if peer_value_imports.is_empty() {
+            continue;
+        }
+        for stmt in &m.ast.statements {
+            let value = match stmt {
+                Stmt::Val { value, .. } | Stmt::Var { value, .. } => value,
+                _ => continue,
+            };
+            // A function-literal initializer is lazy — referencing a peer in its BODY is the
+            // legitimate mutual-recursion case. Only eager (non-function) initializers can recurse.
+            if matches!(value, lin_parse::ast::Expr::Function { .. }) {
+                continue;
+            }
+            if expr_references_any(value, &peer_value_imports) {
+                return Err(CompileError::ImportCycle(format!(
+                    "{} (a top-level value initializer reads an imported VALUE from a module that \
+                     imports it back — module initialization would recurse forever; break the cycle \
+                     by moving the value behind a function, spec §7.3)",
+                    scc.join(" <-> ")
+                )));
+            }
+        }
+    }
+
+    // (3) Phase 2: re-check each member with the provisional peer signatures merged into the
+    // import-type map, so cross-module references resolve to concrete types.
+    for m in &members {
+        let (typed, _w) = check_module_with_seeded_imports(&m.ast, cache, &provisional, m.is_stdlib)
+            .map_err(CompileError::TypeCheck)?;
+        let sig = ModuleSignature::from_module(&typed);
+        // Cyclic members are always freshly checked (their type depends on peers), but persist the
+        // signature so dependents OUTSIDE the SCC can still use the `.sig` fast path.
+        save_signature(&m.src_text, &sig, &m.base_dir);
+        register_resolved(m, typed, cache, order, import_sources);
     }
     Ok(())
 }

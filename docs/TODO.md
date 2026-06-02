@@ -299,7 +299,7 @@ End state: multi-file programs with `import` and `export`.
 
 ### Tests
 - [x] Multi-file fixture.
-- [x] Cyclic-import success: mutual recursion via forward-declaration tested. File-level cyclic import is a compile-time error.
+- [x] Cyclic-import success: mutually-recursive functions across modules compile unannotated via SCC type-checking (ADR-078). A cyclic value initialisation is still a compile-time error.
 
 ---
 

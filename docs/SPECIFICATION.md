@@ -1495,7 +1495,7 @@ Object key access never causes a runtime error — missing keys produce `Null` (
 
 Floating-point operations follow IEEE 754: division by zero produces `±Infinity` or `NaN`, not an error. Integer `%` follows the sign of the dividend (Rust convention).
 
-> **Note on import cycles.** Imports are resolved eagerly at compile time (§22.5). A circular import is a **compile-time error** (`circular import detected: a -> b -> a`), not a runtime fault.
+> **Note on import cycles.** Imports are resolved eagerly at compile time (§22.5). Cyclic **function** references between modules are supported and compile as written; only a cyclic **value** initialisation (a top-level value reading an imported value from a module that imports it back) is a compile-time error.
 
 ---
 
@@ -1595,7 +1595,9 @@ resolves to `myDir/anotherDir/aFile.lin`, located relative to the importing file
 
 Imports are resolved **eagerly at compile time**: the entry-point module and all of its transitive imports are parsed and type-checked before code generation. Each imported module is type-checked once and cached by source hash (`.lin-cache/`), and a separate signature file records just its exported name→type map so dependents can verify their usage without re-checking the full module. Module-level `val`/`var` initialise in dependency order at program start.
 
-A **circular import is a compile-time error**: resolution tracks the chain of modules currently being resolved and, if an import re-enters one already on that chain, reports `circular import detected: a -> b -> a` rather than looping. (This differs from the original design, which called for lazy initialisation with a *runtime* error on a cycle; the implemented behaviour rejects the cycle earlier, at compile time.) A diamond — the same module reached by two independent import paths — is not a cycle and is resolved once.
+**Import cycles are supported for function references.** Resolution loads the whole import graph up front and decomposes it into strongly-connected components; the members of a true cycle are type-checked together (a two-pass seed-and-recheck), so mutually-recursive functions across the import boundary compile **as written**, with no extra annotations. A diamond — the same module reached by two independent import paths — is not a cycle and is resolved once.
+
+A cyclic **value** initialisation is still a compile-time error: a top-level `val`/`var` whose initialiser reads an imported *value* (not a function) from a module that imports it back would recurse forever during module init, and is reported as `circular import detected: a <-> b (a top-level value initializer reads an imported VALUE …)`. Binding or calling a peer *function* is fine — function symbols are resolved by name, not recomputed at init.
 
 ### 22.6 Naming Conventions
 
@@ -2741,7 +2743,7 @@ val parseAge = (input: String): Result<Int32, String> =>
 26. Numeric widening is always to a type that can fully represent both operand ranges; widening is applied everywhere (operators, calls, returns, assignments) but narrowing is never implicit.
 27. The standard-library module list and signatures live in `docs/STDLIB.md`; names are imported explicitly (nothing is auto-imported as a global). `range`/`iterOf` are in `std/array`; there is no `std/iter` or `std/result` module.
 28. Two-space indentation; `&&`/`||` may begin a continuation line at any deeper indent.
-29. Imports are resolved eagerly at compile time; each module is checked once and cached. A circular import is a compile-time error (§22.5); a diamond is not a cycle.
+29. Imports are resolved eagerly at compile time; each module is checked once and cached (cyclic members are checked together). Cyclic function references are supported (§22.5); only a cyclic value initialisation is a compile-time error. A diamond is not a cycle.
 30. Bracket access is safe: missing object key → `Null`, `Null` propagates; array OOB is a runtime error.
 31. Generic types are covariant in producer positions, contravariant in consumer positions.
 32. Type-expression precedence: `[]` > `<>` > `=>` > `|`.
