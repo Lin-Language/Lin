@@ -1167,9 +1167,10 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
             let generic_slot = if arg0_is_stream { None } else { callee_generic_slot };
             if let Some(gslot) = generic_slot {
                 let g = &state.generics[&gslot];
-                if let TypedExpr::Function { params, ret_type, .. } = &g.func {
+                if let TypedExpr::Function { params, ret_type, body, .. } = &g.func {
                     let params = params.clone();
                     let ret_type = ret_type.clone();
+                    let body = (**body).clone();
                     // Unify the generic signature against the concrete call types.
                     let mut subs: HashMap<u32, Type> = HashMap::new();
                     for (p, a) in params.iter().zip(args.iter()) {
@@ -1210,7 +1211,7 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                         if known || count < state.budget {
                             let base_name = g_name(state, gslot);
                             let spec_slot = native_spec_slot(state, gslot, &base_name, key, subs.clone());
-                            repoint_call_native(expr, &params, &ret_type, &subs, spec_slot);
+                            repoint_call_native(expr, &params, &ret_type, &body, &subs, spec_slot);
                         } else {
                             // Budget exceeded: fall back to one shared boxed copy of the original.
                             if state.boxed_fallback_used.insert(gslot) {
@@ -1379,11 +1380,27 @@ fn repoint_call_native(
     expr: &mut TypedExpr,
     params: &[TypedParam],
     ret_type: &Type,
+    body: &TypedExpr,
     subs: &HashMap<u32, Type>,
     spec_slot: usize,
 ) {
     let concrete_params: Vec<Type> = params.iter().map(|p| subst_type(&p.ty, subs)).collect();
-    let concrete_ret = subst_type(ret_type, subs);
+    let mut concrete_ret = subst_type(ret_type, subs);
+    // ADR-018 (reversed) mixed-family fix: a bare `Number` return whose value comes from arithmetic
+    // over two DISTINCT bounded vars (`(a:Number,b:Number)=>a+b`) had `ret_type` recorded as ONE of
+    // those vars, so `subst_type` freezes it to the first family. The materialized spec actually
+    // returns the WIDENED family (`function_tail_type` over the substituted body — same as the spec
+    // function's own re-synced `ret_type`). Re-derive it here so the Call's recorded result type and
+    // the spec's signature agree (otherwise the caller reads an `i32` slot the spec fills with a
+    // `double`). Only when the substituted return is numeric.
+    if concrete_ret.is_numeric() {
+        let mut sb = body.clone();
+        subst_expr(&mut sb, subs);
+        let body_ty = function_tail_type(&sb);
+        if body_ty.is_numeric() {
+            concrete_ret = body_ty;
+        }
+    }
     let required = params.iter().filter(|p| p.default.is_none()).count();
     let fn_ty = Type::Function {
         params: concrete_params,
@@ -1559,6 +1576,58 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
     }
     // Recurse into children to substitute nested types.
     for_each_child_mut(expr, &mut |c| subst_expr(c, subs));
+
+    // ADR-018 (reversed) mixed-family fix: a `Number` arithmetic op's result type was recorded by
+    // the checker as ONE of its bounded operand vars (e.g. `a + b` with `a: TypeVar(9001)`,
+    // `b: TypeVar(9002)` stored `result_type = TypeVar(9001)`). Plain `subst_type` then freezes it
+    // to the FIRST family (Int32) — but when the two vars bind to DIFFERENT families (`add(10,2.5)`
+    // ⇒ {9001→Int32, 9002→Float64}) the value actually WIDENS to Float64, so the slot type must be
+    // re-derived from the now-concrete operands via `widen_numeric` (exactly what a concrete
+    // `(a:Int32,b:Float64)` param pair produces). Without this the result slot is `Int32` while
+    // codegen emits a `double` → `lin_box_int32(double)` / `ret double` ABI mismatch (the historical
+    // crash). Re-widen AFTER children are substituted so operand `.ty()` is concrete. Only touches
+    // arithmetic ops with two concrete numeric operands; comparisons (Bool) and boxed/union operands
+    // are left as substituted.
+    if let TypedExpr::BinaryOp { op, left, right, result_type, .. } = expr {
+        use lin_parse::ast::BinOp;
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod) {
+            let lt = left.ty();
+            let rt = right.ty();
+            if lt.is_numeric() && rt.is_numeric() {
+                if let Some(widened) = lin_check::widen::widen_numeric(&lt, &rt) {
+                    *result_type = widened;
+                }
+            }
+        }
+    }
+
+    // Same mixed-family fix, one level up: a function whose declared return is a `Number` var
+    // (e.g. `(a:Number,b:Number)=>a+b`, `ret_type = TypeVar(9001)`) had `ret_type` frozen to the
+    // first family by `subst_type`. After the body is substituted (and its tail arithmetic
+    // re-widened above), the function's actual return is the body's tail type — re-sync `ret_type`
+    // to it so the emitted function signature matches the value the body returns (no `ret double`
+    // vs declared-`i32` mismatch). Only when the original `ret_type` mentioned a numeric-bounded
+    // var (i.e. it was a `Number` return) AND the re-derived body type is numeric — a structural or
+    // already-concrete return is left exactly as `subst_type` produced it.
+    if let TypedExpr::Function { ret_type, body, .. } = expr {
+        if ret_type.is_numeric() {
+            let body_ty = function_tail_type(body);
+            if body_ty.is_numeric() && body_ty != *ret_type {
+                *ret_type = body_ty;
+            }
+        }
+    }
+}
+
+/// The type a function body ultimately evaluates to: the trailing expression of a Block (skipping
+/// statements), peeking through a transparent Coerce, otherwise the expression's own type. Used to
+/// re-sync a `Number` function's return type to its (re-widened) body after substitution.
+fn function_tail_type(body: &TypedExpr) -> Type {
+    match body {
+        TypedExpr::Block { expr, .. } => function_tail_type(expr),
+        TypedExpr::Coerce { to, .. } => to.clone(),
+        other => other.ty(),
+    }
 }
 
 /// Substitute generic TypeVars in the declared-type fields of a statement (the value expression's

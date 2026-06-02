@@ -10132,18 +10132,19 @@ print(toString(twice(1.25)))
 }
 
 #[test]
-fn test_number_mixed_family_in_one_call_is_compile_error() {
-    // First-cut limitation: combining two independent `Number` params at DIFFERENT families in a
-    // single call (where the result flows from them) is rejected with a clear message rather than
-    // mis-lowered. Same-family-per-call (above) is unaffected.
-    let err = run_expect_err(r#"import { print } from "std/io"
+fn test_number_mixed_family_in_one_call_widens() {
+    // Mixed numeric families in ONE call of a `Number`-returning function are SUPPORTED (ADR-018,
+    // reversed): `add$Int32_Float64` is monomorphized and the arithmetic re-widens to the same
+    // family the concrete `(a:Int32,b:Float64)` equivalent produces. `add(10, 2.5)` ⇒ Float64
+    // `12.5`; `add(10, 2)` stays Int (both Int32); `add(1.5, 2.5)` is Float64. Native widening
+    // (sitofp+fadd), no boxed `lin_tagged_arith` — see the monomorphize fix.
+    let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 val add = (a: Number, b: Number) => a + b
 print(toString(add(10, 2.5)))
+print(toString(add(10, 2)))
+print(toString(add(1.5, 2.5)))
+print(toString(add(2.5, 10)))
 "#);
-    assert!(
-        err.contains("mixes different numeric families"),
-        "mixed-family-in-one-call should be a clear compile error; got:\n{}",
-        err
-    );
+    assert_eq!(out, vec!["12.5", "12", "4.0", "12.5"]);
 }

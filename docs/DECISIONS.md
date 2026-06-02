@@ -172,15 +172,27 @@ and dot-call paths). `lin-codegen/src/codegen/arith.rs` widens a mixed int/float
 it can't be pinned from arguments, so the body's (numeric, bound-guaranteed) type is surfaced as the
 function's return and the body is checked numeric.
 
+**Mixed families in ONE call** of a `Number`-returning function (e.g.
+`(a: Number, b: Number) => a + b` at `add(10, 2.5)`) **are supported**. Each `Number` is its own
+bounded var, so the call monomorphizes to `add$Int32_Float64` and the arithmetic result is
+**re-widened at monomorphization time** to exactly the family the concrete `(a: Int32, b: Float64)`
+equivalent produces (`Float64` here, value `12.5`). `add(10, 2)` stays `Int` (both args `Int32`),
+`add(1.5, 2.5)` is `Float64` — identical to the concrete-param widening rule. The emitted spec is
+native (`sitofp`+`fadd`+`ret double`), no boxing. `infer_binary_op` records an arithmetic op over a
+bounded var with the bounded var as its result type (so it survives substitution), but when two
+DISTINCT bounded vars feed one op, that single recorded var would freeze to the FIRST family under
+plain `subst_type`. So `lin-ir::monomorphize::subst_expr` re-derives an arithmetic op's result type
+from its now-concrete operands via `widen_numeric` AFTER substitution, and re-syncs both the
+specialized function's `ret_type` and the call's recorded result type to the body's widened tail
+type (so the spec signature and the call site agree). Before this fix the result slot stayed `Int32`
+while codegen emitted a `double` → the `lin_box_int32(double)` / `ret double`-vs-`i32` ABI crash;
+the earlier reject in `checker/call.rs` was a workaround that is now removed.
+
 **Consequence / limitations** (first cut):
 - **Dynamic numerics use `Json`, not `Number`.** A `Json` (statically-unknown) value cannot be
   proven numeric and cannot monomorphize to a native op, so passing one to a `Number` parameter is a
   compile error (decode it to a family first, e.g. `Int32.fromJson(v)`). We deliberately do NOT fall
   back to a silent boxed slow path under a `Number` annotation.
-- **Mixed families in ONE call of a `Number`-returning function** (e.g.
-  `(a: Number, b: Number) => a + b` at `add(10, 2.5)`) is rejected with a clear message: each
-  `Number` is an independent var, so the widened return isn't expressible by single-var
-  monomorphization. Same-family-per-call (distinct calls at distinct families) is fully supported.
 - `Number` is no longer part of the structural definition of `Json` (it never resolved to a union).
 - A `Number` nested inside a generic type ARGUMENT (`Iterator<Number>`) is not lowered to a bounded
   var (documented edge; resolves via the standard resolver where `Number` is still unknown).
