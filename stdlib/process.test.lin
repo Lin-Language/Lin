@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { contains } from "std/string"
-import { spawn, readStdout, wait, exec, shell, cwd } from "std/process"
+import { spawn, readStdout, wait, exec, shell, cwd, chdir, kill } from "std/process"
 
 // std/process over real subprocesses is deterministic. We run small `sh`/`printf`
 // commands, so this touches no stdin/TTY state and is CI-safe.
@@ -67,6 +67,44 @@ val s = suite("std/process", [
     val here = cwd()
     [
       expect(contains(here, "/")).toBe(true)
+    ]
+  ),
+
+  test("exec captures the child's stderr", () =>
+    // Write to fd 2 only; stdout stays empty, stderr carries the text.
+    val r = exec("sh", ["-c", "printf oops 1>&2"])
+    [
+      expect(r["status"]).toBe(0),
+      expect(r["stdout"]).toBe(""),
+      expect(r["stderr"]).toBe("oops")
+    ]
+  ),
+
+  test("chdir moves the cwd and reports an Error for a bad path", () =>
+    // cwd is process-wide, so capture it first and restore it before returning
+    // to keep this test self-contained and order-independent.
+    val original = cwd()
+    val ok = chdir("/")
+    val moved = cwd()
+    val bad = chdir("/no/such/dir/lin-test-xyz")
+    chdir(original)
+    [
+      expect(ok == null).toBe(true),
+      expect(moved).toBe("/"),
+      expect(bad is Error).toBe(true),
+      expect(cwd()).toBe(original)
+    ]
+  ),
+
+  test("kill terminates a spawned child", () =>
+    // Spawn a long sleeper, kill it (SIGTERM), then reap it. A child killed by a
+    // signal reports a -1 exit code via wait().
+    val h = spawn("sh", ["-c", "sleep 30"])
+    val k = kill(h)
+    val code = wait(h)
+    [
+      expect(k == null).toBe(true),
+      expect(code).toBe(-1)
     ]
   )
 ])

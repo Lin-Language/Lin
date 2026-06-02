@@ -1,6 +1,21 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
-import { json, text, redirect, notFound, badRequest, parseBody, matchPath } from "std/http"
+import { length } from "std/array"
+import { json, text, redirect, notFound, badRequest, parseBody, matchPath, fetch, fetchWith, fetchJson, postJson, serve } from "std/http"
+
+// std/http response-builder and path-matching helpers are pure and fully
+// deterministic, so we exercise them directly. The network/server functions
+// (fetch, fetchWith, fetchJson, postJson, serve) require a live HTTP endpoint
+// and are NOT called here — hitting the network from the test suite would be
+// flaky and non-hermetic. We bind them as values so they stay imported and
+// type-checked, guarding the module against compilation regressions. (A live
+// fetch round-trip against a localhost server lives in the Rust integration
+// suite, crates/lin/tests/integration.rs.)
+val fetchRef = fetch
+val fetchWithRef = fetchWith
+val fetchJsonRef = fetchJson
+val postJsonRef = postJson
+val serveRef = serve
 
 val s = suite("std/http", [
   test("json helper sets status and content-type", () =>
@@ -59,7 +74,64 @@ val s = suite("std/http", [
   test("matchPath returns null on mismatch", () =>
     val m = matchPath("/products/5", "/users/:id")
     [expect(m).toBe(null)]
-  )
+  ),
+
+  test("matchPath returns an empty object for an exact paramless match", () =>
+    // A literal route that matches with no captures yields {} (a successful
+    // match), distinct from null (no match).
+    val m = matchPath("/health", "/health")
+    [
+      expect(m != null).toBe(true),
+      expect(m.length()).toBe(0)
+    ]
+  ),
+
+  test("matchPath returns null when the path has an extra segment", () =>
+    val m = matchPath("/a/b/c", "/a/b")
+    [expect(m).toBe(null)]
+  ),
+
+  test("json helper serialises the data into the body", () =>
+    val resp = json(201, { "name": "x" })
+    [
+      expect(resp["status"]).toBe(201),
+      expect(resp["body"]).toBe("{\"name\": \"x\"}")
+    ]
+  ),
+
+  test("text helper sets a text/plain content-type", () =>
+    val resp = text(200, "hi")
+    [
+      expect(resp["headers"]["Content-Type"]).toBe("text/plain; charset=utf-8")
+    ]
+  ),
+
+  test("redirect has an empty body", () =>
+    val resp = redirect("/elsewhere")
+    [expect(resp["body"]).toBe("")]
+  ),
+
+  test("badRequest carries the message as its body", () =>
+    val resp = badRequest("missing field")
+    [
+      expect(resp["status"]).toBe(400),
+      expect(resp["body"]).toBe("missing field")
+    ]
+  ),
+
+  test("notFound carries the Not Found body", () => [
+    expect(notFound["body"]).toBe("Not Found")
+  ]),
+
+  test("network/server helpers are importable (not called)", () => [
+    // Bound as values above; calling them needs a live endpoint, so this only
+    // guards against the module failing to compile.
+    expect(fetchRef != null).toBe(true),
+    expect(fetchWithRef != null).toBe(true),
+    expect(fetchJsonRef != null).toBe(true),
+    expect(postJsonRef != null).toBe(true),
+    expect(serveRef != null).toBe(true)
+  ])
 ])
 
 run(s)
