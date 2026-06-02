@@ -2489,6 +2489,51 @@ bare type name): `type IntArr = Int32[]; IntArr.fromJson([1, 2, 3])`.
 A `Json` value cannot be assigned to a concrete structured object without decoding — `fromJson`
 (or `is`/`has` narrowing) is the sound conversion (ADR-046).
 
+### toJsonString
+
+```txt
+val toJsonString: (s: String) -> String
+```
+
+Escapes a string and wraps it in double quotes, producing a valid JSON string literal. The
+returned value includes the surrounding quotes and escapes `"`, `\`, newline (`\n`), carriage
+return (`\r`), tab (`\t`), and other control characters (as `\uXXXX`).
+
+```txt
+toJsonString("hello")        // "\"hello\""  (the 7 chars: " h e l l o ")
+toJsonString("a\"b")         // "\"a\\\"b\""
+toJsonString("x\ny")         // "\"x\\ny\""
+```
+
+This is the primitive the test runner uses to build machine-readable records for
+`lin test --reporter json` (see below).
+
+### toJson
+
+```txt
+val toJson: (value: Json) -> String
+```
+
+Recursively serializes ANY Lin value to a strict, valid JSON string:
+
+- strings are escaped and quoted (same escaping as `toJsonString`);
+- object **keys** are escaped and quoted too;
+- ints/floats become numeric literals; non-finite floats (`NaN`, `±Infinity`) become `null`,
+  matching JavaScript's `JSON.stringify`;
+- `true`/`false`/`null` become their JSON literals;
+- arrays and objects recurse arbitrarily deep.
+
+Unlike `toString` on an object/array (which is a lossy human display that does not escape string
+contents or keys), `toJson` always produces output that round-trips through any conforming JSON
+parser.
+
+```txt
+toJson(42)                               // "42"
+toJson("a\"b")                           // "\"a\\\"b\""
+toJson([1, 2, 3])                        // "[1,2,3]"
+toJson({ "name": "Bob", "tags": ["a"] }) // "{\"name\":\"Bob\",\"tags\":[\"a\"]}"
+```
+
 ---
 
 ## std/hash
@@ -4687,6 +4732,53 @@ replace readFile = (path: String): Json => "mock contents of ${path}"
 For worked examples see `examples/processes/` (mocking `std/process.exec`),
 `examples/dijkstra/` (mocking `std/fs` read/write), and `examples/web-server/`
 (mocking `std/template.render`); ADR-071 has the design.
+
+---
+
+### Machine-readable output (`lin test --reporter json`)
+
+By default `lin test` prints a human-readable summary to stderr. Pass `--reporter json` to
+emit **newline-delimited JSON (NDJSON)** on **stdout** instead — one record per line — for
+consumption by tooling (e.g. the VSCode Test Explorer integration). The process exit code is
+unchanged: non-zero if any test file failed.
+
+The stream is **versioned**: the first line is always a `meta` record carrying the schema
+version. Consumers should read it and refuse (or warn) on an unrecognized version rather than
+mis-parsing newer shapes.
+
+Each line is one of three record shapes:
+
+```jsonc
+// Always the FIRST line — the NDJSON schema version
+{ "event": "meta", "schema": 1 }
+
+// One per test (from the suite's results)
+{ "event": "test", "file": "<path>", "name": "<test name>", "status": "pass", "durationMs": <int> }
+{ "event": "test", "file": "<path>", "name": "<test name>", "status": "fail", "message": "<joined failure messages>", "durationMs": <int> }
+
+// One per test file (always emitted, after its test records)
+{ "event": "file", "file": "<path>", "status": "pass" | "fail" | "timeout" | "compile_error", "durationMs": <int>, "message"?: "<diagnostic>" }
+```
+
+- `status` on a `test` record is `pass` or `fail`; the `message` (failures only) is the
+  test's failure messages joined with `\n` (so a `toBe` mismatch carries its
+  `expected: …\nactual: …` text). All strings are properly JSON-escaped.
+- `durationMs` on a `test` record is the monotonic wall-clock time (in milliseconds) spent
+  evaluating that test's body, measured by `std/test`.
+- The `file` record reports the whole file's outcome and is the only signal for files that
+  never produced per-test records — e.g. a `compile_error` (with the diagnostic in `message`)
+  or a `timeout`.
+
+Internally the runner (`std/test`) emits each record as a `##LINTEST## `-prefixed line gated on
+the `LIN_TEST_JSON` environment variable; the CLI strips the prefix, attaches the file path,
+and re-serializes each record canonically. The marker lets the CLI separate runner records from
+any `print` output your own test code emits on the same stdout stream.
+
+**Running a subset by name.** Pass `--filter-test "<name>"` (repeatable) to run only the named
+test(s) within the matched files; every other test is *skipped* — its body is never evaluated
+(so no side effects, and no `withFixture` setup/teardown) and it emits no record. A skipped test
+counts as neither pass nor fail, so a filtered run that omits a failing test still exits zero.
+This backs the VSCode Test Explorer's single-test gutter run.
 
 ---
 

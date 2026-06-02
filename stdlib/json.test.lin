@@ -1,5 +1,5 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { fromJson } from "std/json"
+import { fromJson, toJsonString, toJson } from "std/json"
 
 type Person = { "name": String, "age": Int32 }
 type Opt = { "name": String, "nick": String | Null }
@@ -131,6 +131,70 @@ val s = suite("std/json", [
     [
       expect(good is Error).toBe(false),
       expect(bad is Error).toBe(true)
+    ]
+  ),
+
+  test("toJsonString quotes a plain string", () =>
+    [
+      expect(toJsonString("hello")).toBe("\"hello\"")
+    ]
+  ),
+
+  // input is the 6 chars: a " b \ c <newline>
+  // expected JSON literal: "a\"b\\c\n" (with surrounding quotes)
+  test("toJsonString escapes quote, backslash and newline", () =>
+    [
+      expect(toJsonString("a\"b\\c\n")).toBe("\"a\\\"b\\\\c\\n\"")
+    ]
+  ),
+
+  test("toJson serializes scalars", () =>
+    [
+      expect(toJson(42)).toBe("42"),
+      expect(toJson(true)).toBe("true"),
+      expect(toJson(false)).toBe("false"),
+      expect(toJson(null)).toBe("null"),
+      expect(toJson(3.5)).toBe("3.5")
+    ]
+  ),
+
+  test("toJson quotes and escapes a string value", () =>
+    [
+      expect(toJson("hi")).toBe("\"hi\""),
+      // value: a " b \ c <newline>  →  "a\"b\\c\n"
+      expect(toJson("a\"b\\c\n")).toBe("\"a\\\"b\\\\c\\n\"")
+    ]
+  ),
+
+  test("toJson empty array and object", () =>
+    [
+      expect(toJson([])).toBe("[]"),
+      expect(toJson({  })).toBe("{}")
+    ]
+  ),
+
+  test("toJson serializes a flat array", () =>
+    [
+      expect(toJson([1, 2, 3])).toBe("[1,2,3]")
+    ]
+  ),
+
+  test("toJson nested object with array", () =>
+    [
+      expect(toJson({ "name": "Bob", "tags": ["a", "b"] })).toBe("{\"name\":\"Bob\",\"tags\":[\"a\",\"b\"]}")
+    ]
+  ),
+
+  // key is the 3 chars: a " b  → object {"a\"b": 1}
+  test("toJson escapes object keys", () =>
+    [
+      expect(toJson({ "a\"b": 1 })).toBe("{\"a\\\"b\":1}")
+    ]
+  ),
+
+  test("toJson deeply nested structure", () =>
+    [
+      expect(toJson({ "a": { "b": { "c": [1, { "d": true }] } } })).toBe("{\"a\":{\"b\":{\"c\":[1,{\"d\":true}]}}}")
     ]
   )
 ])

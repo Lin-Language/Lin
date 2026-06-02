@@ -9665,3 +9665,122 @@ print(length(a))
     let (ok, out) = check_source(arrays);
     assert!(ok, "array combinator chains must be unaffected (free reuse):\n{}", out);
 }
+
+// --- `lin test --reporter json` NDJSON contract tests --------------------------
+//
+// These run a fixture .test.lin through the real `lin test --reporter json` subprocess
+// and assert the NDJSON contract the VSCode extension relies on. They are the guard that
+// keeps the schema stable.
+
+/// Write `source` to a uniquely-named `<name>.test.lin` under target/ and return its path.
+fn write_test_fixture(source: &str) -> PathBuf {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let path = ws.join(format!("target/lin_jsonrep_{}.test.lin", id));
+    fs::write(&path, source).unwrap();
+    path
+}
+
+/// Run `lin test <fixture> --reporter json [extra...]` and return (exit_success, stdout_lines).
+fn run_test_json(fixture: &Path, extra: &[&str]) -> (bool, Vec<String>) {
+    let ws = workspace_root();
+    let mut args = vec!["test", fixture.to_str().unwrap(), "--reporter", "json"];
+    args.extend_from_slice(extra);
+    let out = Command::new(lin_bin())
+        .args(&args)
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin test — run `cargo build -p lin` first");
+    let success = out.status.success();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<String> = stdout.lines().map(|l| l.to_string()).filter(|l| !l.trim().is_empty()).collect();
+    (success, lines)
+}
+
+const TWO_TEST_FIXTURE: &str = r#"import { expect, toBe, test, suite, run } from "std/test"
+
+val s = suite("contract", [
+  test("passing test", () =>
+    [expect(1).toBe(1)]
+  ),
+  test("failing test", () =>
+    [expect(1).toBe(2)]
+  )
+])
+
+run(s)
+"#;
+
+#[test]
+fn test_json_reporter_ndjson_contract() {
+    let fixture = write_test_fixture(TWO_TEST_FIXTURE);
+    let (success, lines) = run_test_json(&fixture, &[]);
+    let _ = fs::remove_file(&fixture);
+
+    // A file with a failing test exits non-zero.
+    assert!(!success, "fixture with a failing test should exit non-zero");
+
+    // Every non-empty stdout line must be valid JSON (the core contract guard).
+    let records: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON line {:?}: {}", l, e)))
+        .collect();
+
+    // First line is the schema meta record.
+    assert_eq!(
+        records[0],
+        serde_json::json!({"event": "meta", "schema": 1}),
+        "first NDJSON line must be the meta/schema record"
+    );
+
+    // A passing `test` record exists.
+    let has_pass = records.iter().any(|r| {
+        r["event"] == "test" && r["status"] == "pass" && r["name"] == "passing test"
+    });
+    assert!(has_pass, "expected a pass test record; got:\n{:?}", records);
+
+    // A failing `test` record exists with a diff message.
+    let fail_rec = records.iter().find(|r| {
+        r["event"] == "test" && r["status"] == "fail" && r["name"] == "failing test"
+    });
+    let fail_rec = fail_rec.unwrap_or_else(|| panic!("expected a fail test record; got:\n{:?}", records));
+    let msg = fail_rec["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("expected") && msg.contains("actual"),
+        "fail message should contain expected/actual diff; got {:?}",
+        msg
+    );
+
+    // A `file` record with the right (fail) status.
+    let has_file_fail = records.iter().any(|r| r["event"] == "file" && r["status"] == "fail");
+    assert!(has_file_fail, "expected a file record with status fail; got:\n{:?}", records);
+}
+
+#[test]
+fn test_json_reporter_filter_test() {
+    let fixture = write_test_fixture(TWO_TEST_FIXTURE);
+    // Select ONLY the passing test by exact name. The unselected "failing test" must be
+    // skipped (no record) AND must not cause a non-zero exit.
+    let (success, lines) = run_test_json(&fixture, &["--filter-test", "passing test"]);
+    let _ = fs::remove_file(&fixture);
+
+    let records: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON line {:?}: {}", l, e)))
+        .collect();
+
+    // The selected test's record appears.
+    let test_recs: Vec<&serde_json::Value> = records.iter().filter(|r| r["event"] == "test").collect();
+    assert_eq!(test_recs.len(), 1, "exactly one test record expected; got:\n{:?}", records);
+    assert_eq!(test_recs[0]["name"], "passing test");
+    assert_eq!(test_recs[0]["status"], "pass");
+
+    // The unselected (deliberately failing) test produced NO record...
+    let has_failing = records.iter().any(|r| r["event"] == "test" && r["name"] == "failing test");
+    assert!(!has_failing, "unselected test must not emit a record; got:\n{:?}", records);
+
+    // ...and skipping it means the run does NOT fail.
+    assert!(success, "filtered run with only a passing test must exit zero");
+    let file_rec = records.iter().find(|r| r["event"] == "file").expect("expected a file record");
+    assert_eq!(file_rec["status"], "pass", "file status should be pass when the only failing test is skipped");
+}

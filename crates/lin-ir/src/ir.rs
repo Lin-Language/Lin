@@ -89,6 +89,7 @@ pub enum Intrinsic {
     ArraySetDyn,
     Keys,
     ValueKey,
+    ToJson,
     ArrayAllocate,
     ArrayAllocateFilled,
     // Concurrency / process intrinsics (see std/async). In this runtime async is
