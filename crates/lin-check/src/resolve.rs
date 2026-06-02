@@ -122,6 +122,16 @@ fn resolve_named_cycle(
                         decl.params.len()
                     ))
                 }
+            } else if name == "Number" {
+                // `Number` is a parameter/return CONSTRAINT (a numerically-bounded generic,
+                // ADR-018), not a value type — it only lowers to a bounded var in a function
+                // signature. Reaching here means it was used in a binding/other position (e.g.
+                // `val total: Number = 0`), where it has no concrete representation. Point the
+                // user at a concrete family rather than the misleading "Unknown type 'Number'".
+                Err("`Number` is a parameter constraint, not a value type; it is only valid on a \
+                     function parameter or return (e.g. `(x: Number) => …`). Annotate this binding \
+                     with a concrete numeric family such as `Int32` or `Float64`."
+                    .to_string())
             } else {
                 Err(format!("Unknown type '{}'", name))
             }

@@ -240,6 +240,12 @@ historical `triple$Json` codegen crash), and the call site re-coerces (boxes) th
 - A `Number` nested inside a `<…>` GENERIC type ARGUMENT (`Iterator<Number>`) is still not lowered
   to a bounded var (`resolve_type_with_number_in` recurses into structural forms — Array, Function,
   Object — but defers a `<…>`-application's args to the standard resolver where `Number` is unknown).
+- **`Number` is a parameter/return CONSTRAINT, not a value type.** It only lowers to a bounded var in
+  a function signature; in a binding position (`val total: Number = 0`) it has no concrete
+  representation. `resolve.rs` special-cases this with a guidance error — *"`Number` is a parameter
+  constraint, not a value type; … annotate this binding with a concrete numeric family such as
+  `Int32` or `Float64`."* — rather than the misleading bare "Unknown type 'Number'". A binding has a
+  concrete initializer, so it already has a concrete family; name it.
 
 ## ADR-019: LLVM 22 via inkwell with dynamic linking
 

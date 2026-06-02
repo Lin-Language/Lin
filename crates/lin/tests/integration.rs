@@ -10107,6 +10107,24 @@ print(isEven("hi"))
 }
 
 #[test]
+fn test_number_binding_position_is_clear_error() {
+    // `Number` is a parameter/return CONSTRAINT, not a value type — using it on a `val`/`var`
+    // binding has no concrete representation. The error must point the user at a concrete family
+    // rather than the misleading "Unknown type 'Number'".
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val total: Number = 0
+print(toString(total))
+"#);
+    assert!(
+        err.contains("parameter constraint, not a value type")
+            && (err.contains("Int32") || err.contains("Float64")),
+        "Number in binding position should give the constraint-guidance error; got:\n{}",
+        err
+    );
+}
+
+#[test]
 fn test_number_multi_param_same_family_per_call() {
     // Two `Number` params; each CALL uses a single family. Distinct calls specialize independently
     // (`add$Int32_Int32`, `add$Float64_Float64`).
