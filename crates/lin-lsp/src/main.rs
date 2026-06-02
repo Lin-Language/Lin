@@ -216,17 +216,46 @@ impl LanguageServer for Backend {
             }
         }
 
-        // 4. Stdlib exports — with auto-import edits and optional dot-filtering.
-        // In dot context with no category, pass Some("any") so all stdlib items show
-        // but keywords/types/bindings are still suppressed.
+        // 4. Imported symbols — derived from THIS file's `import` statements (never a hardcoded
+        // list). In dot context, filter to functions whose first parameter matches the receiver
+        // category; otherwise offer every imported name. Keywords/types/bindings are suppressed in
+        // dot context (handled above).
         let filter_cat = if in_dot_context {
             Some(receiver_category.as_deref().unwrap_or("any"))
         } else {
             None
         };
-        for item in stdlib_completion_items(&source, prefix, filter_cat) {
-            items.push(item);
+        for imp in &analysis.imported_names {
+            if !imp.name.starts_with(prefix) {
+                continue;
+            }
+            // Dot-context filtering: only show items applicable to the receiver type. We use the
+            // resolved signature's first parameter category; items with no signature or a
+            // non-matching first param are dropped unless the receiver type is unknown ("any").
+            if let Some(cat) = filter_cat {
+                if cat != "any" {
+                    let first_param_cat = imp
+                        .ty
+                        .as_deref()
+                        .and_then(first_param_category);
+                    if first_param_cat.as_deref() != Some(cat) {
+                        continue;
+                    }
+                }
+            }
+            let kind = match imp.ty.as_deref() {
+                Some(t) if t.contains("=>") => CompletionItemKind::FUNCTION,
+                _ => CompletionItemKind::VALUE,
+            };
+            items.push(CompletionItem {
+                label: imp.name.clone(),
+                kind: Some(kind),
+                detail: imp.ty.clone(),
+                documentation: Some(Documentation::String(format!("from {}", imp.module))),
+                ..Default::default()
+            });
         }
+        items.dedup_by(|a, b| a.label == b.label && a.detail == b.detail);
 
         Ok(Some(CompletionResponse::Array(items)))
     }
@@ -283,6 +312,37 @@ impl Backend {
 struct Analysis {
     diagnostics: Vec<Diagnostic>,
     span_type_map: Vec<(lin_common::Span, String, Option<lin_common::Span>)>,
+    /// Names this file imports (local name as it appears in scope), each with its module
+    /// path and resolved type signature when known. Derived from the file's `import` statements
+    /// + the resolved exports of those modules — never a hardcoded list, so it can't go stale.
+    imported_names: Vec<ImportedName>,
+}
+
+/// One importable symbol surfaced for completion. `name` is the local (possibly aliased) name;
+/// `module` is the source module path; `ty` is the resolved type signature string when the
+/// module type-checked (used to enrich the completion detail), else `None`.
+#[derive(Clone)]
+struct ImportedName {
+    name: String,
+    module: String,
+    ty: Option<String>,
+}
+
+/// Collect the names a parsed module imports as `(local, export, module)` triples. This is a pure
+/// function over the AST (no I/O), so it's unit-testable in isolation. `local` is the name bound
+/// in scope (the alias when present, else the export name); `export` is the original exported
+/// name (used to look up the resolved type); `module` is the source module path.
+fn collect_import_names(module: &lin_parse::ast::Module) -> Vec<(String, String, String)> {
+    let mut out = Vec::new();
+    for stmt in &module.statements {
+        if let Stmt::Import { bindings, path, .. } = stmt {
+            for binding in bindings {
+                let local = binding.alias.as_ref().unwrap_or(&binding.name).clone();
+                out.push((local, binding.name.clone(), path.clone()));
+            }
+        }
+    }
+    out
 }
 
 fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
@@ -325,9 +385,25 @@ fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
     // Warn on unused imports.
     diags.extend(unused_import_warnings(source, &module));
 
+    // Derive the set of importable names for completion straight from this file's `import`
+    // statements, enriched with the resolved export type when the imported module checked.
+    // `binding.name` is the EXPORT name (used to look up the type); the local alias is what we
+    // surface as the completion label.
+    let imported_names: Vec<ImportedName> = collect_import_names(&module)
+        .into_iter()
+        .map(|(local, export, module)| {
+            let ty = checker
+                .import_types
+                .get(&(module.clone(), export))
+                .map(|t| t.to_string());
+            ImportedName { name: local, module, ty }
+        })
+        .collect();
+
     Analysis {
         diagnostics: diags,
         span_type_map: checker.span_type_map,
+        imported_names,
     }
 }
 
@@ -543,185 +619,36 @@ fn type_to_category(ty: &str) -> &'static str {
     }
 }
 
-// ── auto-import helpers ───────────────────────────────────────────────────────
-
-/// Returns true if `name` is already imported from `module` in `source`.
-fn already_imported(source: &str, name: &str, module: &str) -> bool {
-    let from_pattern = format!("from \"{}\"", module);
-    for line in source.lines() {
-        if !line.contains(&from_pattern) {
-            continue;
-        }
-        if let (Some(open), Some(close)) = (line.find('{'), line.rfind('}')) {
-            for n in line[open + 1..close].split(',') {
-                if n.trim() == name {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Builds `additionalTextEdits` to ensure `name` is imported from `module`.
-/// Returns `None` if the import is already present (no edit needed).
-fn make_import_edit(source: &str, name: &str, module: &str) -> Option<Vec<TextEdit>> {
-    if already_imported(source, name, module) {
-        return None;
-    }
-
-    let from_pattern = format!("from \"{}\"", module);
-
-    // Module already imported but this specific name is missing — insert into existing braces.
-    for (line_idx, line) in source.lines().enumerate() {
-        if line.contains(&from_pattern) {
-            if let Some(brace_pos) = line.rfind('}') {
-                let insert_pos = Position {
-                    line: line_idx as u32,
-                    character: brace_pos as u32,
-                };
-                return Some(vec![TextEdit {
-                    range: Range { start: insert_pos, end: insert_pos },
-                    new_text: format!(", {}", name),
-                }]);
-            }
-        }
-    }
-
-    // Module not imported at all — prepend a new import line at the top.
-    Some(vec![TextEdit {
-        range: Range {
-            start: Position { line: 0, character: 0 },
-            end: Position { line: 0, character: 0 },
-        },
-        new_text: format!("import {{ {} }} from \"{}\"\n", name, module),
-    }])
-}
-
 // ── completion helpers ────────────────────────────────────────────────────────
 
-/// Returns stdlib completion items filtered by `prefix` and optionally by `receiver_category`.
-/// Each item carries `additionalTextEdits` to auto-insert its import if absent.
-///
-/// `receiver_category` is `Some("array"|"string"|"number"|"object"|"any")` when in dot context.
-/// When `None` (not in dot context), all items are returned (filtered only by prefix).
-fn stdlib_completion_items(
-    source: &str,
-    prefix: &str,
-    receiver_category: Option<&str>,
-) -> Vec<CompletionItem> {
-    // (label, detail, module, category)
-    // category: "array" | "string" | "number" | "object" | "any"
-    let entries: &[(&str, &str, &str, &str)] = &[
-        // std/string — category "string"
-        ("trim",          "(String) => String",                       "std/string", "string"),
-        ("trimStart",     "(String) => String",                       "std/string", "string"),
-        ("trimEnd",       "(String) => String",                       "std/string", "string"),
-        ("toUpper",       "(String) => String",                       "std/string", "string"),
-        ("toLower",       "(String) => String",                       "std/string", "string"),
-        ("substring",     "(String, Int32, Int32) => String",         "std/string", "string"),
-        ("indexOf",       "(String, String) => Int32",                "std/string", "string"),
-        ("lastIndexOf",   "(String, String) => Int32",                "std/string", "string"),
-        ("isBlank",       "(String) => Boolean",                      "std/string", "string"),
-        ("contains",      "(String, String) => Boolean",              "std/string", "string"),
-        ("startsWith",    "(String, String) => Boolean",              "std/string", "string"),
-        ("endsWith",      "(String, String) => Boolean",              "std/string", "string"),
-        ("split",         "(String, String) => String[]",             "std/string", "string"),
-        ("replace",       "(String, String, String) => String",       "std/string", "string"),
-        ("replaceAll",    "(String, String, String) => String",       "std/string", "string"),
-        ("charAt",        "(String, Int32) => String",                "std/string", "string"),
-        ("at",            "(String, Int32) => String",                "std/string", "string"),
-        ("repeat",        "(String, Int32) => String",                "std/string", "string"),
-        ("padStart",      "(String, Int32, String) => String",        "std/string", "string"),
-        ("padEnd",        "(String, Int32, String) => String",        "std/string", "string"),
-        ("lines",         "(String) => String[]",                     "std/string", "string"),
-        ("charCode",      "(String, Int32) => Int32",                 "std/string", "string"),
-        ("toString",      "(Json) => String",                         "std/string", "any"),
-        // std/number — category "number"
-        ("parseInt32",    "(String) => Int32",                        "std/number", "number"),
-        ("parseFloat64",  "(String) => Float64",                      "std/number", "number"),
-        ("toInt32",       "(Float64) => Int32",                       "std/number", "number"),
-        ("toFloat64",     "(Int32) => Float64",                       "std/number", "number"),
-        ("isInt32",       "(String) => Boolean",                      "std/number", "number"),
-        // std/iter — category "iter" (iterable combinators, moved out of std/array)
-        ("map",           "(Json, (Json) => Json) => Json",           "std/iter",   "iter"),
-        ("filter",        "(Json, (Json) => Boolean) => Json",        "std/iter",   "iter"),
-        ("reduce",        "(Json, Json, (Json, Json) => Json) => Json","std/iter",  "iter"),
-        ("find",          "(Json, (Json) => Boolean) => Json",        "std/iter",   "iter"),
-        ("some",          "(Json, (Json) => Boolean) => Boolean",     "std/iter",   "iter"),
-        ("every",         "(Json, (Json) => Boolean) => Boolean",     "std/iter",   "iter"),
-        ("flatMap",       "(Json, (Json) => Json) => Json",           "std/iter",   "iter"),
-        ("concat",        "(Json, Json) => Json",                     "std/iter",   "iter"),
-        ("take",          "(Json, Int32) => Json",                    "std/iter",   "iter"),
-        ("drop",          "(Json, Int32) => Json",                    "std/iter",   "iter"),
-        ("takeWhile",     "(Json, (Json) => Boolean) => Json",        "std/iter",   "iter"),
-        ("dropWhile",     "(Json, (Json) => Boolean) => Json",        "std/iter",   "iter"),
-        ("flatten",       "(Json) => Json",                           "std/iter",   "iter"),
-        ("range",         "(Int32, Int32) => Json",                   "std/iter",   "iter"),
-        ("for",           "(Json, (Json) => Null) => Null",           "std/iter",   "iter"),
-        // std/array — category "array"
-        ("reverse",       "(Json) => Json",                           "std/array",  "array"),
-        ("indexOf",       "(Json, Json) => Int32",                    "std/array",  "array"),
-        ("length",        "(Json) => Int32",                          "std/array",  "array"),
-        ("push",          "(Json, Json) => Null",                     "std/array",  "array"),
-        ("chunk",         "(Json, Int32) => Json",                    "std/array",  "array"),
-        ("partition",     "(Json, (Json) => Boolean) => Json",        "std/array",  "array"),
-        ("zip",           "(Json, Json) => Json",                     "std/array",  "array"),
-        ("unique",        "(Json) => Json",                           "std/array",  "array"),
-        ("compact",       "(Json) => Json",                           "std/array",  "array"),
-        ("at",            "(Json, Int32) => Json",                    "std/array",  "array"),
-        ("set",           "(Json, Int32, Json) => Null",              "std/array",  "array"),
-        ("join",          "(String[], String) => String",             "std/array",  "array"),
-        // std/object — category "object"
-        ("keys",          "(Json) => String[]",                       "std/object", "object"),
-        ("values",        "(Json) => Json",                           "std/object", "object"),
-        ("entries",       "(Json) => Json",                           "std/object", "object"),
-        ("fromEntries",   "(Json) => Json",                           "std/object", "object"),
-        ("merge",         "(Json, Json) => Json",                     "std/object", "object"),
-        ("pick",          "(Json, String[]) => Json",                 "std/object", "object"),
-        ("omit",          "(Json, String[]) => Json",                 "std/object", "object"),
-        ("mapValues",     "(Json, (Json) => Json) => Json",           "std/object", "object"),
-        ("isEmpty",       "(Json) => Boolean",                        "std/object", "object"),
-        // std/io — category "any"
-        ("print",         "(Json) => Null",                           "std/io",     "any"),
-        ("readLine",      "() => String",                             "std/io",     "any"),
-        ("readAll",       "() => String",                             "std/io",     "any"),
-    ];
-
-    entries
-        .iter()
-        .filter(|(label, _, _, category)| {
-            // Prefix filter.
-            if !label.starts_with(prefix) {
-                return false;
+/// Extract the broad category of a function signature's FIRST parameter, used to decide whether
+/// an imported function applies to a dot-receiver of a given category. e.g. `(String, ...) => X`
+/// → "string". Returns `None` when the string isn't a function type or has no parameters.
+fn first_param_category(sig: &str) -> Option<String> {
+    // Signatures render as `(P1, P2, ...) => R`. Grab the text inside the leading parens.
+    if !sig.starts_with('(') {
+        return None;
+    }
+    let close = sig.find(')')?;
+    let params = &sig[1..close];
+    if params.trim().is_empty() {
+        return None;
+    }
+    // Take the first top-level parameter (split on the first comma that isn't nested).
+    let mut depth = 0i32;
+    let mut first = params;
+    for (i, c) in params.char_indices() {
+        match c {
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' | ']' | '}' | '>' => depth -= 1,
+            ',' if depth == 0 => {
+                first = &params[..i];
+                break;
             }
-            // In dot context, filter by receiver type compatibility.
-            if let Some(cat) = receiver_category {
-                if cat == "any" {
-                    // Unknown receiver type — show everything.
-                    true
-                } else {
-                    // Known type — filter to matching category only.
-                    // Items categorised "any" (like print) don't belong in dot context.
-                    *category != "any" && *category == cat
-                }
-            } else {
-                true
-            }
-        })
-        .map(|(label, detail, module, _)| {
-            let edits = make_import_edit(source, label, module)
-                .map(|e| e);
-            CompletionItem {
-                label: label.to_string(),
-                kind: Some(CompletionItemKind::FUNCTION),
-                detail: Some(detail.to_string()),
-                documentation: Some(Documentation::String(format!("from {}", module))),
-                additional_text_edits: edits,
-                ..Default::default()
-            }
-        })
-        .collect()
+            _ => {}
+        }
+    }
+    Some(type_to_category(first.trim()).to_string())
 }
 
 fn word_before(source: &str, offset: usize) -> &str {
@@ -822,4 +749,46 @@ async fn main() {
         docs: RwLock::new(HashMap::new()),
     });
     Server::new(stdin, stdout, socket).serve(service).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> lin_parse::ast::Module {
+        let mut lexer = lin_lex::Lexer::new(src, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = lin_parse::Parser::new(tokens);
+        parser.parse_module()
+    }
+
+    #[test]
+    fn collect_import_names_yields_imported_symbols() {
+        let module = parse("import { suite, test, expect } from \"std/test\"\n");
+        let triples = collect_import_names(&module);
+        let names: Vec<&str> = triples.iter().map(|(local, _, _)| local.as_str()).collect();
+        assert!(names.contains(&"suite"), "expected suite, got {:?}", names);
+        assert!(names.contains(&"test"), "expected test, got {:?}", names);
+        assert!(names.contains(&"expect"), "expected expect, got {:?}", names);
+    }
+
+    #[test]
+    fn collect_import_names_honours_aliases_and_module() {
+        let module = parse("import { test as t } from \"std/test\"\n");
+        let triples = collect_import_names(&module);
+        assert_eq!(triples.len(), 1);
+        let (local, export, module_path) = &triples[0];
+        assert_eq!(local, "t"); // local binding is the alias
+        assert_eq!(export, "test"); // export name preserved for type lookup
+        assert_eq!(module_path, "std/test");
+    }
+
+    #[test]
+    fn first_param_category_classifies_receiver() {
+        assert_eq!(first_param_category("(String, String) => Boolean").as_deref(), Some("string"));
+        assert_eq!(first_param_category("(String[], String) => String").as_deref(), Some("array"));
+        assert_eq!(first_param_category("(Int32) => Float64").as_deref(), Some("number"));
+        assert_eq!(first_param_category("() => String"), None);
+        assert_eq!(first_param_category("String"), None);
+    }
 }
