@@ -1,13 +1,21 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { udpBind, udpRecv, udpRecvFrom, udpSendTo, udpSetNonblocking, udpClose } from "std/net"
+import { udpBind, udpRecv, udpRecvFrom, udpSendTo, udpSetNonblocking, udpClose, tcpListen, tcpAccept, tcpConnect, tcpRecv, tcpSend, tcpSetNonblocking, tcpClose } from "std/net"
 
 // std/net: UDP loopback on a single thread is deterministic — send to self on
-// 127.0.0.1, then a blocking recv returns the buffered datagram. The TCP echo
-// path needs cross-call accept/connect ordering and lives in the Rust
-// integration suite (crates/lin/tests/integration.rs) where ordering is
-// controlled; we keep only the deterministic UDP round-trip here. A high port
-// is used to avoid privileged-port issues; the integration tests use different
-// ports to avoid collision.
+// 127.0.0.1, then a blocking recv returns the buffered datagram. The TCP
+// round-trip is ALSO deterministic single-threaded on loopback, because:
+//   - a non-blocking listener's accept() returns Null (would-block) until a
+//     connection is pending, and never blocks;
+//   - connect() to a listening loopback socket completes immediately against
+//     the listen backlog (before accept), so a later accept() returns the
+//     server-side socket;
+//   - data written with send() is buffered in the kernel and is available to a
+//     recv() on the peer fd straight away on loopback.
+// Verified by `lin build` + run: listen=>fd, accept-before-connect=>null,
+// connect=>fd, accept-after-connect=>{fd,addr,port}, send=>3, recv=>3 with the
+// bytes intact. High ports are used to avoid privileged-port and collision
+// issues. Nothing here can block: the listener is non-blocking, and recv only
+// runs after a successful send has buffered the bytes on loopback.
 val s = suite("std/net", [
   test("udpBind returns a non-error fd handle", () =>
     val sock = udpBind(39301)
@@ -52,6 +60,55 @@ val s = suite("std/net", [
       expect(buf[0]).toBe(72),
       expect(buf[1]).toBe(105),
       expect(buf[2]).toBe(33)
+    ]
+  ),
+
+  test("tcpListen returns a non-error fd handle", () =>
+    val lis = tcpListen(39401)
+    val ok = lis["type"] != "error"
+    tcpClose(lis)
+    [
+      expect(ok).toBe(true)
+    ]
+  ),
+
+  test("non-blocking tcpAccept with no pending connection returns Null", () =>
+    val lis = tcpListen(39402)
+    tcpSetNonblocking(lis, true)
+    val acc = tcpAccept(lis)
+    tcpClose(lis)
+    [
+      expect(acc == null).toBe(true)
+    ]
+  ),
+
+  test("TCP loopback connect/accept/send/recv round-trips bytes", () =>
+    val lis = tcpListen(39403)
+    tcpSetNonblocking(lis, true)
+    val cli = tcpConnect("127.0.0.1", 39403)
+    val connectOk = cli["type"] != "error"
+    val acc = tcpAccept(lis)
+    val srvFd = acc["fd"]
+    val msg: UInt8[] = [65, 66, 67]
+    val sent = tcpSend(cli, msg)
+    val buf: UInt8[] = [
+      0,
+      0,
+      0,
+      0
+    ]
+    val got = tcpRecv(srvFd, buf)
+    tcpClose(cli)
+    tcpClose(srvFd)
+    tcpClose(lis)
+    [
+      expect(connectOk).toBe(true),
+      expect(acc["addr"]).toBe("127.0.0.1"),
+      expect(sent).toBe(3),
+      expect(got).toBe(3),
+      expect(buf[0]).toBe(65),
+      expect(buf[1]).toBe(66),
+      expect(buf[2]).toBe(67)
     ]
   )
 ])
