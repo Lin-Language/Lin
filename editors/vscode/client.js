@@ -7,6 +7,7 @@ const cp = require("child_process");
 const {
   workspace, window, commands, languages, Range, TextEdit, Uri,
   tests, TestRunRequest, TestRunProfileKind, TestMessage, Position,
+  FileCoverage, StatementCoverage,
 } = require("vscode");
 const { LanguageClient, TransportKind } = require("vscode-languageclient/node");
 
@@ -300,6 +301,59 @@ function parseExpectedActual(message) {
   return null;
 }
 
+// Minimal lcov parser. lcov groups per-file sections:
+//   SF:<path>            begins a file section
+//   DA:<line>,<hits>     one record per instrumented line (hits = execution count)
+//   end_of_record        ends the section
+// Returns an array of { file, lines: [{ line, hits }] }.
+function parseLcov(text) {
+  const files = [];
+  let current = null;
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line.startsWith("SF:")) {
+      current = { file: line.slice(3), lines: [] };
+    } else if (line.startsWith("DA:") && current) {
+      const [lineNoStr, hitsStr] = line.slice(3).split(",");
+      const lineNo = parseInt(lineNoStr, 10);
+      const hits = parseInt(hitsStr, 10);
+      if (Number.isFinite(lineNo) && Number.isFinite(hits)) {
+        current.lines.push({ line: lineNo, hits });
+      }
+    } else if (line === "end_of_record" && current) {
+      files.push(current);
+      current = null;
+    }
+  }
+  if (current) files.push(current);
+  return files;
+}
+
+// Per-run cache mapping a file uri string → its parsed line records, so the profile's
+// loadDetailedCoverage resolver can materialize StatementCoverage on demand.
+const coverageDetailCache = new WeakMap();
+
+// Parse an lcov file and attach a FileCoverage per source file to the TestRun. The detailed
+// per-line StatementCoverage is materialized lazily via the profile's loadDetailedCoverage.
+function attachLcovCoverage(run, lcovFile) {
+  let text;
+  try {
+    text = fs.readFileSync(lcovFile, "utf8");
+  } catch (_) {
+    return; // No lcov produced (e.g. llvm tools missing) — best effort.
+  }
+  const detail = new Map();
+  for (const fileCov of parseLcov(text)) {
+    const uri = Uri.file(fileCov.file);
+    const total = fileCov.lines.length;
+    const covered = fileCov.lines.filter((l) => l.hits > 0).length;
+    const fc = new FileCoverage(uri, { covered, total });
+    detail.set(uri.toString(), fileCov.lines);
+    run.addCoverage(fc);
+  }
+  coverageDetailCache.set(run, detail);
+}
+
 function setupTestController(context, linBin) {
   const controller = tests.createTestController("lin", "Lin Tests");
   context.subscriptions.push(controller);
@@ -333,7 +387,11 @@ function setupTestController(context, linBin) {
   // Kick off initial discovery (don't block activation on it).
   discoverAllTestFiles(controller);
 
-  const runHandler = (request, token) => {
+  // Shared run/coverage session. Spawns `lin test ... --reporter json` (plus coverage flags
+  // when `opts.coverage` is set), streams NDJSON, and maps records onto TestItems. On close, if
+  // a coverage lcov file was requested, parses it and attaches coverage to the TestRun.
+  const runTestSession = (request, token, opts) => {
+    opts = opts || {};
     const run = controller.createTestRun(request);
     const targetFiles = collectTargetFiles(controller, request);
 
@@ -355,6 +413,13 @@ function setupTestController(context, linBin) {
       ? workspace.workspaceFolders[0].uri.fsPath
       : undefined;
     const args = buildTestArgs(request, targetFiles, wsRoot);
+
+    // For a coverage run, write lcov to an OS temp file and ask the CLI to emit it.
+    let lcovFile;
+    if (opts.coverage) {
+      lcovFile = path.join(os.tmpdir(), `lin-cov-${Date.now()}-${Math.random().toString(36).slice(2)}.lcov`);
+      args.push("--coverage", "--format", "llvm-cov", "--output", lcovFile);
+    }
 
     let child;
     try {
@@ -432,11 +497,29 @@ function setupTestController(context, linBin) {
       if (buffer.trim()) {
         try { handleRecord(JSON.parse(buffer.trim())); } catch (_) { /* ignore */ }
       }
+      if (lcovFile) {
+        attachLcovCoverage(run, lcovFile);
+        try { fs.unlinkSync(lcovFile); } catch (_) { /* best effort */ }
+      }
       run.end();
     });
   };
 
+  const runHandler = (request, token) => runTestSession(request, token, { coverage: false });
+  const coverageHandler = (request, token) => runTestSession(request, token, { coverage: true });
+
   controller.createRunProfile("Run", TestRunProfileKind.Run, runHandler, true);
+  const coverageProfile = controller.createRunProfile(
+    "Run with Coverage", TestRunProfileKind.Coverage, coverageHandler, false
+  );
+  // Resolve per-file detailed coverage lazily from the lines cached during the run.
+  coverageProfile.loadDetailedCoverage = async (testRun, fileCoverage) => {
+    const detail = coverageDetailCache.get(testRun);
+    const lines = detail && detail.get(fileCoverage.uri.toString());
+    if (!lines) return [];
+    // lcov line numbers are 1-based; VSCode Positions are 0-based.
+    return lines.map((l) => new StatementCoverage(l.hits, new Position(Math.max(0, l.line - 1), 0)));
+  };
   // Expose the handler so the palette commands can drive a run directly.
   return { controller, runHandler };
 }
