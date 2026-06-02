@@ -28,7 +28,7 @@ val basePath =
 
 // Extract the text from a heading line "# Foo" -> "Foo"
 val headingText = (line: String): String =>
-  line.substring(2, line.length()).trim()
+  line.substring(2).trim()
 
 // Extract the first H1 heading from markdown source, or fall back to the default
 val extractTitle = (source: String): String =>

@@ -61,7 +61,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`replaceAll`](#replaceAll) | `(String, String, String) -> String` | Replace all occurrences |
 | [`split`](#split) | `(String, String) -> String[]` | Split by delimiter |
 | [`startsWith`](#startsWith) | `(String, String) -> Boolean` | Test whether string begins with prefix |
-| [`substring`](#substring) | `(String, Int32, Int32) -> String` | Extract a slice by codepoint indices |
+| [`substring`](#substring) | `(String, Int32, Int32 = length(s)) -> String` | Extract a slice by codepoint indices |
 | [`toLower`](#toLower) | `(String) -> String` | Convert to lowercase |
 | [`toString`](#toString) | `(Json) -> String` | Convert any value to its string representation |
 | [`toUpper`](#toUpper) | `(String) -> String` | Convert to uppercase |
@@ -711,16 +711,18 @@ startsWith("hello", "llo")   // false
 ### substring
 
 ```txt
-val substring: (s: String, start: Int32, end: Int32) -> String
+val substring: (s: String, start: Int32, end: Int32 = length(s)) -> String
 ```
 
-Returns the slice of `s` covering codepoint indices `[start, end)`. Negative indices count from the end: `-1` refers to one past the last character (equivalent to `length(s)`), `-2` to the last character, etc. If `end` exceeds the codepoint count it is clamped. If `start >= end` (after resolving negatives), returns `""`.
+Returns the slice of `s` covering codepoint indices `[start, end)`. `end` is optional and defaults to the string length, so `substring(s, start)` returns the slice from `start` to the end. Negative indices count from the end: `-1` refers to the last character's position (`length - 1`), `-2` to the second-to-last, etc. Indices are resolved by adding `length` to any negative value, then clamping to `[0, length]`. If `start >= end` (after resolving negatives), returns `""`.
 
 ```txt
 substring("hello", 1, 3)    // "el"
 substring("hello", 0, 5)    // "hello"
+substring("hello", 2)       // "llo"    (omitted end defaults to length)
 substring("hello", 0, -1)   // "hell"   (strip last character)
 substring("hello", 1, -1)   // "ell"
+substring("hello", -3, -1)  // "ll"
 ```
 
 ---
