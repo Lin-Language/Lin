@@ -13,6 +13,7 @@ import foreign "lin-runtime"
   val lin_string_repeat: (String, Int32) => String
   val lin_string_char_at: (String, Int32) => String
   val lin_string_char_code: (String, Int32) => Int32
+  val lin_string_byte_at: (String, Int32) => Int32
   val lin_string_from_char_code: (Int32) => String
   val lin_string_last_index_of: (String, String) => Int32
   val lin_string_join_arr: (String[], String) => String
@@ -90,6 +91,12 @@ export val at = (s: String, index: Int32): String =>
 
 export val charCode = (s: String, index: Int32): Int32 =>
   lin_string_char_code(s, index)
+
+// O(1) raw UTF-8 byte at byte-index `index` (-1 if out of range). Use this for fast
+// byte/ASCII scanning: a loop over `0..length(s)` with `byteAt` is O(n), whereas the same
+// loop with `charCode` (codepoint-indexed) is O(n²). For ASCII text the two agree.
+export val byteAt = (s: String, index: Int32): Int32 =>
+  lin_string_byte_at(s, index)
 
 export val fromCharCode = (code: Int32): String =>
   lin_string_from_char_code(code)
