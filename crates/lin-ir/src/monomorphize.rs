@@ -1392,8 +1392,13 @@ fn repoint_call_native(
     // returns the WIDENED family (`function_tail_type` over the substituted body — same as the spec
     // function's own re-synced `ret_type`). Re-derive it here so the Call's recorded result type and
     // the spec's signature agree (otherwise the caller reads an `i32` slot the spec fills with a
-    // `double`). Only when the substituted return is numeric.
-    if concrete_ret.is_numeric() {
+    // `double`). Fires when the substituted return is numeric, OR (ADR-018 §Json) when it is the
+    // Json wildcard: a `Json` argument binds the `Number` var to `u32::MAX`, so `subst_type` makes
+    // `concrete_ret = Json` (a `ptr`) while the spec body's arithmetic re-widens to a native scalar.
+    // Mirrors the spec function's own ret-type re-sync in `subst_expr`; the `repr_differs` Coerce
+    // below then boxes the native result back to the Json the surrounding context expects.
+    let ret_is_json_wildcard = matches!(concrete_ret, Type::TypeVar(id) if id == u32::MAX);
+    if concrete_ret.is_numeric() || ret_is_json_wildcard {
         let mut sb = body.clone();
         subst_expr(&mut sb, subs);
         let body_ty = function_tail_type(&sb);
@@ -1593,10 +1598,21 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
         if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod) {
             let lt = left.ty();
             let rt = right.ty();
+            let is_json = |t: &Type| matches!(t, Type::TypeVar(id) if *id == u32::MAX);
             if lt.is_numeric() && rt.is_numeric() {
                 if let Some(widened) = lin_check::widen::widen_numeric(&lt, &rt) {
                     *result_type = widened;
                 }
+            } else if lt.is_numeric() && is_json(&rt) {
+                // ADR-018 (reversed) §Json: a `Number` operand bound to the Json wildcard. The IR
+                // (`lower_expr` BinaryOp) unboxes the wildcard side to the CONCRETE operand's family
+                // and emits a native scalar op — so the result is that concrete numeric family, not
+                // the boxed `result_type` the checker recorded (the bounded var → Json). Mirror that
+                // here so the slot type matches the value codegen produces (else `ret i32` vs a
+                // declared `ptr`/boxed slot — the `triple$Json` mismatch).
+                *result_type = lt;
+            } else if rt.is_numeric() && is_json(&lt) {
+                *result_type = rt;
             }
         }
     }
@@ -1606,11 +1622,21 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
     // first family by `subst_type`. After the body is substituted (and its tail arithmetic
     // re-widened above), the function's actual return is the body's tail type — re-sync `ret_type`
     // to it so the emitted function signature matches the value the body returns (no `ret double`
-    // vs declared-`i32` mismatch). Only when the original `ret_type` mentioned a numeric-bounded
-    // var (i.e. it was a `Number` return) AND the re-derived body type is numeric — a structural or
-    // already-concrete return is left exactly as `subst_type` produced it.
+    // vs declared-`i32` mismatch). Fires when `subst_type` left the return either numeric (the
+    // mixed-family case) OR as the Json wildcard (the ADR-018 §Json case below) AND the re-derived
+    // body type is numeric — a structural or already-concrete-non-wildcard return is left exactly as
+    // `subst_type` produced it.
+    //
+    // ADR-018 (reversed) §Json: a `Json` argument binds the `Number` param's bounded var to the Json
+    // wildcard (`u32::MAX`), so `subst_type` makes the spec's `ret_type = Json` (a `ptr`). But the
+    // body's arithmetic over the (Int32-unboxed) operand re-widens to a NATIVE scalar (e.g. `x*3` ⇒
+    // `i32`) — so the function returns `i32` against a declared `ptr` (the `triple$Json` mismatch).
+    // Re-syncing `ret_type` to the concrete body tail makes the signature honest; the call site's
+    // `repoint_call_native` then sees the differing representation and re-coerces (boxes) the scalar
+    // back to the Json the surrounding context expects.
     if let TypedExpr::Function { ret_type, body, .. } = expr {
-        if ret_type.is_numeric() {
+        let ret_is_json_wildcard = matches!(ret_type, Type::TypeVar(id) if *id == u32::MAX);
+        if ret_type.is_numeric() || ret_is_json_wildcard {
             let body_ty = function_tail_type(body);
             if body_ty.is_numeric() && body_ty != *ret_type {
                 *ret_type = body_ty;
@@ -1622,9 +1648,16 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
 /// The type a function body ultimately evaluates to: the trailing expression of a Block (skipping
 /// statements), peeking through a transparent Coerce, otherwise the expression's own type. Used to
 /// re-sync a `Number` function's return type to its (re-widened) body after substitution.
+///
+/// A Coerce normally reports its `to` type. But a `from == to` Coerce is a REPRESENTATION NO-OP that
+/// codegen elides — passing the inner value through unchanged. After substitution this arises for a
+/// `Number` body whose value flows through a `Coerce { from: numvar, to: numvar }` that both
+/// substituted to the SAME type (e.g. the Json wildcard, ADR-018 §Json): codegen returns the inner
+/// (re-widened) scalar, so the tail type must be the INNER expression's type, not the elided `to`.
 fn function_tail_type(body: &TypedExpr) -> Type {
     match body {
         TypedExpr::Block { expr, .. } => function_tail_type(expr),
+        TypedExpr::Coerce { expr, from, to, .. } if from == to => function_tail_type(expr),
         TypedExpr::Coerce { to, .. } => to.clone(),
         other => other.ty(),
     }
