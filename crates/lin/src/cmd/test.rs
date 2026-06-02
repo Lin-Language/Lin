@@ -34,7 +34,7 @@ const MARKER: &str = "##LINTEST## ";
 /// The NDJSON schema version emitted as the first `meta` record. Bump when the record shapes
 /// change incompatibly so consumers (the VSCode extension) can detect a mismatch. The extension
 /// defines its own `SUPPORTED_SCHEMA` and warns when it sees a newer one.
-const NDJSON_SCHEMA: u32 = 1;
+const NDJSON_SCHEMA: u32 = 2;
 
 #[derive(Serialize)]
 #[serde(tag = "event")]
@@ -67,6 +67,11 @@ enum JsonRecord {
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    // Free-form stdout the test binary produced that ISN'T a `##LINTEST##` runner record —
+    // i.e. the user's own `print(...)` output. Accumulated per file into one blob (newline-joined)
+    // so the VSCode extension can surface it in the Test Results output tab. Schema v2.
+    #[serde(rename = "output")]
+    Output { file: String, text: String },
 }
 
 fn emit_record(rec: &JsonRecord) {
@@ -363,8 +368,15 @@ fn emit_json_for_result(result: &TestResult, lock: &Arc<Mutex<()>>) {
     let _guard = lock.lock().unwrap();
     let file = result.path.display().to_string();
 
+    // Collect the user's own stdout (every non-marker line) so it can be forwarded as an
+    // `output` record. Runner records (`##LINTEST## ...`) are handled separately below.
+    let mut user_output: Vec<&str> = Vec::new();
+
     for line in result.stdout.lines() {
-        let Some(rest) = line.strip_prefix(MARKER) else { continue };
+        let Some(rest) = line.strip_prefix(MARKER) else {
+            user_output.push(line);
+            continue;
+        };
         // Parse the runner's record, then rebuild a canonical one with the file attached.
         let Ok(val) = serde_json::from_str::<serde_json::Value>(rest) else { continue };
         let name = val.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -385,6 +397,15 @@ fn emit_json_for_result(result: &TestResult, lock: &Arc<Mutex<()>>) {
             expected,
             actual,
             duration_ms,
+        });
+    }
+
+    // Forward the user's `print(...)` output (if any) as one `output` record, emitted before the
+    // file-summary record. Skip when empty so consumers don't get noise.
+    if !user_output.is_empty() {
+        emit_record(&JsonRecord::Output {
+            file: file.clone(),
+            text: user_output.join("\n"),
         });
     }
 
@@ -442,6 +463,20 @@ fn print_result(result: &TestResult, verbose: bool, lock: &Arc<Mutex<()>>) {
     }
 }
 
+/// Resolve an LLVM tool name, preferring the version-matched binary (`<tool>-22`) but falling
+/// back to the unversioned `<tool>` when the versioned one isn't on PATH. This keeps coverage
+/// working on hosts whose LLVM 22 tools aren't suffixed (e.g. a `clang`-only install).
+fn llvm_tool(tool: &str) -> String {
+    use std::process::Command;
+    let versioned = format!("{}-22", tool);
+    let found = Command::new(&versioned)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if found { versioned } else { tool.to_string() }
+}
+
 fn run_coverage_report(
     test_files: &[PathBuf],
     compiled: &[Result<PathBuf, String>],
@@ -449,6 +484,9 @@ fn run_coverage_report(
 ) {
     use std::fs;
     use std::process::Command;
+
+    let profdata_tool = llvm_tool("llvm-profdata");
+    let cov_tool = llvm_tool("llvm-cov");
 
     // Collect the profraw files that actually exist.
     let pairs: Vec<(&PathBuf, &PathBuf)> = test_files
@@ -472,14 +510,14 @@ fn run_coverage_report(
     let profdata_path = root.join("coverage.profdata");
 
     // Merge .profraw → .profdata.
-    let mut merge_cmd = Command::new("llvm-profdata-22");
+    let mut merge_cmd = Command::new(&profdata_tool);
     merge_cmd.arg("merge").arg("-sparse").arg("-o").arg(&profdata_path);
     for (src, _) in &pairs {
         merge_cmd.arg(src.with_extension("profraw"));
     }
     match merge_cmd.status() {
-        Err(e) => { eprintln!("llvm-profdata-22 failed: {}", e); return; }
-        Ok(s) if !s.success() => { eprintln!("llvm-profdata-22 exited non-zero"); return; }
+        Err(e) => { eprintln!("{} failed: {}", profdata_tool, e); return; }
+        Ok(s) if !s.success() => { eprintln!("{} exited non-zero", profdata_tool); return; }
         Ok(_) => {}
     }
 
@@ -487,7 +525,7 @@ fn run_coverage_report(
         CoverageFormat::Console => {
             // Print a text summary for each binary.
             for (_, bin) in &pairs {
-                let out = Command::new("llvm-cov-22")
+                let out = Command::new(&cov_tool)
                     .arg("report")
                     .arg(bin)
                     .arg(format!("-instr-profile={}", profdata_path.display()))
@@ -497,7 +535,7 @@ fn run_coverage_report(
                         print!("{}", String::from_utf8_lossy(&o.stdout));
                     }
                     Ok(o) => eprintln!("{}", String::from_utf8_lossy(&o.stderr)),
-                    Err(e) => eprintln!("llvm-cov-22 failed: {}", e),
+                    Err(e) => eprintln!("{} failed: {}", cov_tool, e),
                 }
             }
         }
@@ -505,7 +543,7 @@ fn run_coverage_report(
             let lcov_path = args.output.clone().unwrap_or_else(|| root.join("lcov.info"));
             let mut lcov_data = String::new();
             for (_, bin) in &pairs {
-                let out = Command::new("llvm-cov-22")
+                let out = Command::new(&cov_tool)
                     .arg("export")
                     .arg(bin)
                     .arg(format!("-instr-profile={}", profdata_path.display()))
@@ -516,7 +554,7 @@ fn run_coverage_report(
                         lcov_data.push_str(&String::from_utf8_lossy(&o.stdout));
                     }
                     Ok(o) => eprintln!("{}", String::from_utf8_lossy(&o.stderr)),
-                    Err(e) => eprintln!("llvm-cov-22 failed: {}", e),
+                    Err(e) => eprintln!("{} failed: {}", cov_tool, e),
                 }
             }
             fs::write(&lcov_path, &lcov_data).unwrap_or_else(|e| {
