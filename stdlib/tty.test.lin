@@ -1,0 +1,32 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { rawMode, readKey } from "std/tty"
+
+// std/tty: terminal raw-mode toggling and non-blocking single-key reads.
+//
+// These functions are syscall-bound on a real TTY. Under `lin test` stdin is
+// NOT a terminal, so we test the documented no-terminal contract rather than
+// interactive behaviour (which cannot be driven without a real PTY here):
+//   - rawMode(true)/rawMode(false) call tcgetattr on stdin, which fails when
+//     stdin is not a terminal, so both return an Error value (`is Error`).
+//   - readKey() returns Null when no key is available / stdin is not a TTY.
+// Verified by `lin build` + run with stdin redirected from /dev/null:
+//   rawMode(true)  => {"type":"error","message":"tcgetattr: Inappropriate ioctl ..."}
+//   rawMode(false) => (same Error)
+//   readKey()      => null
+// We deliberately do NOT attempt to read an actual keypress, as there is no
+// terminal to deliver one and a blocking read could stall the suite.
+val s = suite("std/tty", [
+  test("rawMode(true) returns an Error when stdin is not a terminal", () => [
+    expect(rawMode(true) is Error).toBe(true)
+  ]),
+
+  test("rawMode(false) returns an Error when stdin is not a terminal", () => [
+    expect(rawMode(false) is Error).toBe(true)
+  ]),
+
+  test("readKey returns Null when no key is available", () => [
+    expect(readKey() == null).toBe(true)
+  ])
+])
+
+run(s)
