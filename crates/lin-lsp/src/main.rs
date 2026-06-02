@@ -246,16 +246,12 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let tokens = lin_lex::Lexer::new(&source, 0).tokenize();
-        let mut parser = lin_parse::Parser::new(tokens);
-        let module = parser.parse_module();
-
-        if !parser.diagnostics.is_empty() {
-            // Don't format files with parse errors.
-            return Ok(None);
-        }
-
-        let formatted = lin_parse::Formatter::new().format_module(&module);
+        // Single canonical, comment-preserving formatter shared with the CLI.
+        // On parse errors, don't format the file (return no edits).
+        let formatted = match lin_parse::format_source(&source) {
+            Ok(formatted) => formatted,
+            Err(_) => return Ok(None),
+        };
         let end_pos = offset_to_position(&source, source.len());
 
         Ok(Some(vec![TextEdit {

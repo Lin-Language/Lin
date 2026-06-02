@@ -72,22 +72,16 @@ fn process_file(path: &PathBuf, check: bool) -> Result<bool, String> {
 /// Lex, parse, and format a Lin source string.
 /// Returns an error string if there are parse errors.
 pub fn format_source(source: &str) -> Result<String, String> {
-    let mut lexer = lin_lex::Lexer::new(source, 0);
-    let tokens = lexer.tokenize();
-    let comments = lexer.comments().to_vec();
-    let mut parser = lin_parse::Parser::new(tokens);
-    let module = parser.parse_module();
-
-    if !parser.diagnostics.is_empty() {
-        let msgs: Vec<String> = parser
-            .diagnostics
+    // Delegates to the single canonical formatter (`lin_parse::format_source`),
+    // mapping its `Vec<Diagnostic>` parse error to the CLI's existing "; "-joined
+    // message string so output/tests are unchanged.
+    lin_parse::format_source(source).map_err(|diags| {
+        diags
             .iter()
             .map(|d| d.message.clone())
-            .collect();
-        return Err(msgs.join("; "));
-    }
-
-    Ok(lin_parse::Formatter::with_comments(source, comments).format_module(&module))
+            .collect::<Vec<String>>()
+            .join("; ")
+    })
 }
 
 /// Collect .lin files from the given paths. If a path is a directory, glob

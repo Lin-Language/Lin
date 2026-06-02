@@ -29,6 +29,11 @@
   ],
   "main": "./client.js",
   "contributes": {
+    "configurationDefaults": {
+      "[lin]": {
+        "editor.defaultFormatter": "LinusN.lin-lang"
+      }
+    },
     "languages": [
       {
         "id": "lin",

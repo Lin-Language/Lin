@@ -5,7 +5,7 @@ const path = require("path");
 const os = require("os");
 const cp = require("child_process");
 const {
-  workspace, window, commands, languages, Range, TextEdit, Uri,
+  workspace, window, commands, Range, Uri,
   tests, TestRunRequest, TestRunProfileKind, TestMessage, Position,
   FileCoverage, StatementCoverage, CancellationTokenSource,
 } = require("vscode");
@@ -109,38 +109,10 @@ async function installOnPath(context) {
   }
 }
 
-// `lin fmt` only reformats files in place on disk and the editor buffer may
-// hold unsaved edits, so we round-trip the in-memory text through a temp file:
-// write it out, run the formatter, read the result back, and return it as a
-// single full-document replacement. On any failure (parse error, missing
-// binary) we surface the message and return no edits, leaving the buffer alone.
-function makeFormattingProvider(linBin) {
-  return {
-    provideDocumentFormattingEdits(document) {
-      let tmpDir;
-      try {
-        tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "lin-fmt-"));
-        const tmpFile = path.join(tmpDir, "buffer.lin");
-        fs.writeFileSync(tmpFile, document.getText());
-        cp.execFileSync(linBin, ["fmt", tmpFile]);
-        const formatted = fs.readFileSync(tmpFile, "utf8");
-        const fullRange = new Range(
-          document.positionAt(0),
-          document.positionAt(document.getText().length)
-        );
-        return [TextEdit.replace(fullRange, formatted)];
-      } catch (err) {
-        const detail = (err.stderr && err.stderr.toString()) || err.message;
-        window.showErrorMessage(`Lin: formatting failed: ${detail}`);
-        return [];
-      } finally {
-        if (tmpDir) {
-          try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) { /* best effort */ }
-        }
-      }
-    },
-  };
-}
+// Document formatting is provided exclusively by the LSP (lin-lsp advertises
+// `document_formatting_provider`, and vscode-languageclient auto-registers it).
+// We intentionally do NOT register a second formatter here — that previously
+// caused VSCode's "multiple formatters configured" warning.
 
 // --- Test Explorer integration (VSCode Testing API) ---------------------------
 //
@@ -603,13 +575,9 @@ function activate(context) {
     terminal.sendText(`"${linBin}" ${subcommand} "${file}"`);
   };
 
-  // Standard "Format Document" (Shift+Alt+F) and format-on-save go through this.
-  context.subscriptions.push(
-    languages.registerDocumentFormattingEditProvider(
-      { scheme: "file", language: "lin" },
-      makeFormattingProvider(linBin)
-    )
-  );
+  // "Format Document" (Shift+Alt+F), format-on-save, and the `lin.format` command
+  // below all route to the LSP's single formatter (auto-registered by the language
+  // client). We deliberately register no formatter here to avoid a duplicate.
 
   // Test Explorer integration. Returns the controller + its run handler so the
   // palette commands below can trigger runs through it.
