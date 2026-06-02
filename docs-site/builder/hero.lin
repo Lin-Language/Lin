@@ -4,7 +4,6 @@
 // The examples are the real, compilable .lin files under docs-site/examples/ — they
 // are read at build time, HTML-escaped, and wrapped as <pre><code class="language-lin">
 // blocks so the client-side highlighter styles them. Tab switching is in theme.js.
-
 import { readFile } from "std/fs"
 import { replaceAll, length } from "std/string"
 import { for } from "std/iter"
@@ -49,13 +48,41 @@ val tabPanel = (id: String, exampleFile: String, active: Boolean): String =>
 export val buildHero = (base: String): String =>
   // (id, label, example filename) for each tab. The first is active.
   val tabs = [
-    { "id": "functional", "label": "Functional", "file": "functional.lin" },
-    { "id": "pattern", "label": "Pattern Matching", "file": "pattern-matching.lin" },
-    { "id": "union", "label": "Union Types", "file": "union-types.lin" },
-    { "id": "async", "label": "Async", "file": "async.lin" },
-    { "id": "threading", "label": "Threading", "file": "threading.lin" },
-    { "id": "http", "label": "HTTP", "file": "http.lin" },
-    { "id": "lowlevel", "label": "Low Level", "file": "low-level.lin" }
+    {
+      "id": "functional",
+      "label": "Functional",
+      "file": "functional.lin"
+    },
+    {
+      "id": "pattern",
+      "label": "Pattern Matching",
+      "file": "pattern-matching.lin"
+    },
+    {
+      "id": "union",
+      "label": "Union Types",
+      "file": "union-types.lin"
+    },
+    {
+      "id": "async",
+      "label": "Async",
+      "file": "async.lin"
+    },
+    {
+      "id": "threading",
+      "label": "Threading",
+      "file": "threading.lin"
+    },
+    {
+      "id": "http",
+      "label": "HTTP",
+      "file": "http.lin"
+    },
+    {
+      "id": "lowlevel",
+      "label": "Low Level",
+      "file": "low-level.lin"
+    }
   ]
 
   var buttons = ""

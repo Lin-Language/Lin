@@ -59,7 +59,7 @@ jobs:
 
       - name: Check formatting
         if: runner.os == 'Linux'
-        run: cargo run -p lin -- fmt --check stdlib/ examples/ benchmarks/
+        run: cargo run -p lin -- fmt --check stdlib/ examples/ benchmarks/ docs-site/builder/
 
       - name: Test
         run: cargo test --workspace

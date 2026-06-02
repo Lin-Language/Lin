@@ -46,16 +46,28 @@ val extractTitle = (source: String): String =>
 val contentPathToOutput = (path: String): String =>
   val prefix = "${contentDir}/"
   val prefixLen = length(prefix)
-  val relative = if path.startsWith(prefix) then path.substring(prefixLen, path.length()) else path
-  val noExt = if relative.contains(".md") then relative.substring(0, relative.length() - 3) else relative
+  val relative = if path.startsWith(prefix) then
+    path.substring(prefixLen, path.length())
+  else
+    path
+  val noExt = if relative.contains(".md") then
+    relative.substring(0, relative.length() - 3)
+  else
+    relative
   "${outputDir}/${noExt}.html"
 
 // Convert a content file path to its URL path
 val contentPathToUrl = (path: String): String =>
   val prefix = "${contentDir}/"
   val prefixLen = length(prefix)
-  val relative = if path.startsWith(prefix) then path.substring(prefixLen, path.length()) else path
-  val noExt = if relative.contains(".md") then relative.substring(0, relative.length() - 3) else relative
+  val relative = if path.startsWith(prefix) then
+    path.substring(prefixLen, path.length())
+  else
+    path
+  val noExt = if relative.contains(".md") then
+    relative.substring(0, relative.length() - 3)
+  else
+    relative
   if noExt == "index" then "/" else "/${noExt}"
 
 // Get the directory portion of a file path
@@ -76,19 +88,25 @@ val isError = (v: Json): Boolean =>
 
 // Get file content string from readFile result (returns "" on error)
 val fileContent = (v: Json): String =>
-  if isError(v) then ""
-  else v
+  if isError(v) then
+    ""
+  else
+    v
 
 // Get error message from an Error value
 val errorMsg = (v: Json): String =>
-  if v == null then "unknown error"
-  else if v["message"] == null then "unknown error"
-  else v["message"]
+  if v == null then
+    "unknown error"
+  else if v["message"] == null then
+    "unknown error"
+  else
+    v["message"]
 
 // Process a single markdown file, returning Null
 val processFile = (filePath: String, navEntries: Json): Null =>
   val sourceJson = readFile(filePath)
-  if isError(sourceJson) then print("Error reading ${filePath}: ${errorMsg(sourceJson)}")
+  if isError(sourceJson) then
+    print("Error reading ${filePath}: ${errorMsg(sourceJson)}")
   else
     val source = fileContent(sourceJson)
     val title = extractTitle(source)
@@ -105,28 +123,39 @@ val processFile = (filePath: String, navEntries: Json): Null =>
     val hero = if isHome then buildHero(basePath) else ""
     // render() loads the template by path so `{% extends "base.jinja" %}` resolves
     // against templates/ — page.jinja and home.jinja share the base.jinja layout.
-    val rendered = render(templatePath, { "title": title, "nav": navHtml, "content": htmlContent, "base": basePath, "hero": hero })
-    if isError(rendered) then print("Error rendering ${templatePath}: ${errorMsg(rendered)}")
+    val rendered = render(templatePath, {
+      "title": title,
+      "nav": navHtml,
+      "content": htmlContent,
+      "base": basePath,
+      "hero": hero
+    })
+    if isError(rendered) then
+      print("Error rendering ${templatePath}: ${errorMsg(rendered)}")
     else
       val outDir = dirName(outputPath)
       mkdir(outDir, { "parents": true })
       val writeResult = writeFile(outputPath, rendered)
-      if isError(writeResult) then print("Error writing ${outputPath}: ${errorMsg(writeResult)}")
-      else print("  ${outputPath}")
+      if isError(writeResult) then
+        print("Error writing ${outputPath}: ${errorMsg(writeResult)}")
+      else
+        print("  ${outputPath}")
 
 // Copy static assets to output/static/
 val copyStatic = (): Null =>
   val outStaticDir = "${outputDir}/static"
   mkdir(outStaticDir, { "parents": true })
   val filesJson = ls(staticDir, {})
-  if isError(filesJson) then print("Error listing static dir: ${errorMsg(filesJson)}")
+  if isError(filesJson) then
+    print("Error listing static dir: ${errorMsg(filesJson)}")
   else
     val files = filesJson
     files.for(filename =>
       val srcPath = "${staticDir}/${filename}"
       val dstPath = "${outStaticDir}/${filename}"
       val copyResult = cp(srcPath, dstPath)
-      if isError(copyResult) then print("Error copying ${filename}: ${errorMsg(copyResult)}")
+      if isError(copyResult) then
+        print("Error copying ${filename}: ${errorMsg(copyResult)}")
     )
 
 // Main entry point
