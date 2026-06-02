@@ -220,28 +220,18 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Build a stack-allocated TaggedVal from a value + type, return its alloca ptr.
-    pub(crate) fn build_tagged_val_alloca(&mut self, val: &BasicValueEnum<'ctx>, val_ty: &Type) -> PointerValue<'ctx> {
-        // TaggedVal layout: { tag: u8, pad: [u8;7], payload: u64 } = 16 bytes total
-        let i8_ty = self.context.i8_type();
+    /// Compute the 64-bit TaggedVal payload bits for `val` of type `val_ty`. This is the value
+    /// half of a TaggedVal (scalars zero/sign-extended or float-bitcast to i64; pointers
+    /// `ptrtoint`-ed). Shared by `build_tagged_val_alloca` and the inline object-construction
+    /// fast path, so the two never drift on how a payload is encoded.
+    pub(crate) fn tagged_payload_i64(&mut self, val: &BasicValueEnum<'ctx>, val_ty: &Type) -> inkwell::values::IntValue<'ctx> {
         let i64_ty = self.context.i64_type();
-        let tagged_ty = self.context.struct_type(&[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false);
-        let alloca = self.builder.alloca(tagged_ty, "tv");
-
-        let tag = Self::type_tag(val_ty);
-        let tag_val = i8_ty.const_int(tag as u64, false);
-        let tag_ptr = self.builder.struct_gep(tagged_ty, alloca, 0, "tv_tag");
-        self.builder.store(tag_ptr, tag_val);
-
-        // Write payload as u64.
-        let payload_ptr = self.builder.struct_gep(tagged_ty, alloca, 2, "tv_payload");
-        let payload: inkwell::values::IntValue<'ctx> = match val_ty {
+        match val_ty {
             Type::Null => i64_ty.const_zero(),
             Type::Bool => {
-                let b = if val.is_int_value() {
+                if val.is_int_value() {
                     self.builder.int_z_extend(val.into_int_value(), i64_ty, "bext")
-                } else { i64_ty.const_zero() };
-                b
+                } else { i64_ty.const_zero() }
             }
             Type::Int8 | Type::Int16 | Type::Int32 | Type::UInt8 | Type::UInt16 | Type::UInt32 => {
                 if val.is_int_value() {
@@ -270,7 +260,25 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.ptr_to_int(val.into_pointer_value(), i64_ty, "pti")
                 } else { i64_ty.const_zero() }
             }
-        };
+        }
+    }
+
+    /// Build a stack-allocated TaggedVal from a value + type, return its alloca ptr.
+    pub(crate) fn build_tagged_val_alloca(&mut self, val: &BasicValueEnum<'ctx>, val_ty: &Type) -> PointerValue<'ctx> {
+        // TaggedVal layout: { tag: u8, pad: [u8;7], payload: u64 } = 16 bytes total
+        let i8_ty = self.context.i8_type();
+        let i64_ty = self.context.i64_type();
+        let tagged_ty = self.context.struct_type(&[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false);
+        let alloca = self.builder.alloca(tagged_ty, "tv");
+
+        let tag = Self::type_tag(val_ty);
+        let tag_val = i8_ty.const_int(tag as u64, false);
+        let tag_ptr = self.builder.struct_gep(tagged_ty, alloca, 0, "tv_tag");
+        self.builder.store(tag_ptr, tag_val);
+
+        // Write payload as u64.
+        let payload_ptr = self.builder.struct_gep(tagged_ty, alloca, 2, "tv_payload");
+        let payload = self.tagged_payload_i64(val, val_ty);
         self.builder.store(payload_ptr, payload);
         alloca
     }
