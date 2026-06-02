@@ -1130,6 +1130,77 @@ impl<'ctx> Codegen<'ctx> {
                             } else {
                                 std::collections::HashMap::new()
                             };
+
+                            // ── PHASE 1: inline scalar-only construction ──────────────────
+                            // When the literal has no spreads and EVERY materialised field is a
+                            // concrete scalar (Int/Float/Bool/Null — no heap payload, no union),
+                            // emit the entry stores INLINE instead of calling lin_object_set_fresh
+                            // per field. This removes one non-inlined runtime call per field (the
+                            // ~46% construction half of per-object cost, see perf profiling) while
+                            // staying RC-trivial: scalars need no payload retain and immortal
+                            // interned keys need no inc_ref, so reference counts are untouched and
+                            // there is zero use-after-free / double-free risk.
+                            //
+                            // lin_object_alloc(N) gives an object with cap==N, len==0, entries
+                            // pointing at the inline buffer; we write each entry's key/tag/payload
+                            // directly and set len at the end. cap==N (= field count for a no-spread
+                            // literal) guarantees no grow, so the inline entries buffer never moves.
+                            let inline_scalar = use_fresh && fields.iter().enumerate().all(|(idx, (key, vt))| {
+                                // Only the surviving (last-wins) fields are materialised.
+                                last_idx.get(key) != Some(&idx) || {
+                                    let t = func.temp_types.get(vt).cloned().unwrap_or(Type::Null);
+                                    matches!(t,
+                                        Type::Null | Type::Bool
+                                        | Type::Int8 | Type::Int16 | Type::Int32
+                                        | Type::UInt8 | Type::UInt16 | Type::UInt32
+                                        | Type::Int64 | Type::UInt64
+                                        | Type::Float32 | Type::Float64)
+                                }
+                            });
+                            if inline_scalar {
+                                let i8_ty = self.context.i8_type();
+                                // entries = *(ptr*)(obj + 16)
+                                let entries_pp = unsafe {
+                                    self.builder.gep(i8_ty, obj_ptr, &[i64_ty.const_int(16, false)], "obj_entries_pp")
+                                };
+                                let entries = self.builder.load(ptr_ty, entries_pp, "obj_entries").into_pointer_value();
+                                // LinObjectEntry stride = 24 bytes: key@0, value.tag@8, value.payload@16.
+                                let mut slot: u64 = 0;
+                                for (idx, (key, val_temp)) in fields.iter().enumerate() {
+                                    if last_idx.get(key) != Some(&idx) { continue; }
+                                    if let Some(&val) = temp_map.get(val_temp) {
+                                        let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
+                                        let key_str = self.compile_string_lit(key).into_pointer_value();
+                                        let base = slot * 24;
+                                        // key@base
+                                        let key_p = unsafe {
+                                            self.builder.gep(i8_ty, entries, &[i64_ty.const_int(base, false)], "ent_key_p")
+                                        };
+                                        self.builder.store(key_p, key_str);
+                                        // tag@base+8
+                                        let tag_p = unsafe {
+                                            self.builder.gep(i8_ty, entries, &[i64_ty.const_int(base + 8, false)], "ent_tag_p")
+                                        };
+                                        self.builder.store(tag_p, i8_ty.const_int(Self::type_tag(&val_ty) as u64, false));
+                                        // payload@base+16
+                                        let payload = self.tagged_payload_i64(&val, &val_ty);
+                                        let pay_p = unsafe {
+                                            self.builder.gep(i8_ty, entries, &[i64_ty.const_int(base + 16, false)], "ent_pay_p")
+                                        };
+                                        self.builder.store(pay_p, payload);
+                                    }
+                                    slot += 1;
+                                }
+                                // len = slot  (*(u32*)(obj + 4))
+                                let len_p = unsafe {
+                                    self.builder.gep(i8_ty, obj_ptr, &[i64_ty.const_int(4, false)], "obj_len_p")
+                                };
+                                self.builder.store(len_p, i32_ty.const_int(slot, false));
+                                let _ = ty;
+                                temp_map.insert(*dst, obj_ptr.into());
+                                continue;
+                            }
+
                             for (idx, (key, val_temp)) in fields.iter().enumerate() {
                                 // Skip earlier duplicates in the no-spread fast path so only the
                                 // last write for a key is materialised (last-wins).
