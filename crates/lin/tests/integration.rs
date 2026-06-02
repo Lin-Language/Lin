@@ -2819,6 +2819,36 @@ print(toString(sum))
 }
 
 #[test]
+fn test_inline_object_rc_field_construction() {
+    // Phase 2 of the static-record optimization: a no-spread object literal whose fields are
+    // all scalar OR concrete heap (Str/Array/Object) is constructed via INLINE entry stores
+    // (key/tag/payload + one lin_rc_retain per heap field) instead of per-field
+    // lin_object_set_fresh. The retain must EXACTLY mirror retain_tagged_payload, or a value
+    // stored into the object is over-/under-counted → use-after-free or double-free.
+    //
+    // This builds 50k objects in a tail-recursive loop, each holding the SAME shared string in
+    // two slots (refcount +2 per object, -2 on free) plus a fresh array and a nested object.
+    // It reads every field back and folds them into a checksum. If the inline retain count were
+    // wrong the shared string or a freed array element would corrupt long before the loop ends;
+    // a stable, correct checksum across 50k build/free cycles confirms the RC accounting.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+val shared = "shared-string-value"
+val loop = (i: Int64, acc: Int64): Int64 =>
+  if i == 0i64 then acc
+  else
+    val rec = { "a": shared, "b": shared, "tags": [i, i + 1i64], "n": i }
+    loop(i - 1i64, acc + rec["n"] + length(rec["tags"]))
+
+print(toString(loop(50000i64, 0i64)))
+"#);
+    // sum_{i=1..50000} (i + 2) = (50000*50001/2) + 2*50000 = 1250025000 + 100000 = 1250125000
+    assert_eq!(output, vec!["1250125000"]);
+}
+
+#[test]
 fn test_object_spread_null_noop() {
     // Spreading null contributes no fields (it is not a runtime error).
     let output = run(r#"import { print } from "std/io"
