@@ -9784,3 +9784,68 @@ fn test_json_reporter_filter_test() {
     let file_rec = records.iter().find(|r| r["event"] == "file").expect("expected a file record");
     assert_eq!(file_rec["status"], "pass", "file status should be pass when the only failing test is skipped");
 }
+
+// A failing equality matcher (`toBe`) must carry STRUCTURED `expected`/`actual` as proper JSON
+// values (not regex-scraped strings), while a non-comparison matcher (`toSatisfy`) must NOT —
+// it stays message-only. This is the end-to-end contract the VSCode diff relies on.
+const STRUCTURED_FIXTURE: &str = r#"import { expect, toBe, toSatisfy, test, suite, run } from "std/test"
+
+val s = suite("structured", [
+  test("equality fail", () =>
+    [expect(2).toBe(3)]
+  ),
+  test("string with quotes", () =>
+    [expect("he said \"hi\"").toBe("bye")]
+  ),
+  test("satisfy fail", () =>
+    [expect(5).toSatisfy(x => x > 10)]
+  )
+])
+
+run(s)
+"#;
+
+#[test]
+fn test_json_reporter_structured_expected_actual() {
+    let fixture = write_test_fixture(STRUCTURED_FIXTURE);
+    let (success, lines) = run_test_json(&fixture, &[]);
+    let _ = fs::remove_file(&fixture);
+
+    assert!(!success, "fixture with failing tests should exit non-zero");
+
+    let records: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON line {:?}: {}", l, e)))
+        .collect();
+
+    // The numeric `toBe` failure carries structured expected/actual as JSON NUMBERS.
+    let eq = records
+        .iter()
+        .find(|r| r["event"] == "test" && r["name"] == "equality fail")
+        .unwrap_or_else(|| panic!("missing 'equality fail' record; got:\n{:?}", records));
+    assert_eq!(eq["status"], "fail");
+    assert_eq!(eq["expected"], serde_json::json!(3), "expected should be the JSON number 3");
+    assert_eq!(eq["actual"], serde_json::json!(2), "actual should be the JSON number 2");
+
+    // A string containing quotes round-trips through toJson escaping as a proper JSON string.
+    let q = records
+        .iter()
+        .find(|r| r["event"] == "test" && r["name"] == "string with quotes")
+        .unwrap_or_else(|| panic!("missing 'string with quotes' record; got:\n{:?}", records));
+    assert_eq!(q["expected"], serde_json::json!("bye"));
+    assert_eq!(
+        q["actual"],
+        serde_json::json!("he said \"hi\""),
+        "actual should be the JSON string with embedded quotes intact"
+    );
+
+    // A `toSatisfy` failure has NO structured pair — message only.
+    let sat = records
+        .iter()
+        .find(|r| r["event"] == "test" && r["name"] == "satisfy fail")
+        .unwrap_or_else(|| panic!("missing 'satisfy fail' record; got:\n{:?}", records));
+    assert_eq!(sat["status"], "fail");
+    assert!(sat.get("expected").is_none(), "toSatisfy must not carry 'expected'; got:\n{:?}", sat);
+    assert!(sat.get("actual").is_none(), "toSatisfy must not carry 'actual'; got:\n{:?}", sat);
+    assert!(sat["message"].as_str().unwrap_or("").contains("predicate"), "satisfy message preserved");
+}
