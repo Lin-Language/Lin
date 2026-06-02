@@ -18,3 +18,19 @@
 // wrapper can express it.
 export val fromJson = (_: Json, value: Json): Json =>
   value
+
+import foreign "lin-runtime"
+  val lin_json_escape: (String) => String
+
+// Escape a string and wrap it in double quotes, producing a valid JSON string literal.
+// Used by std/test to emit machine-readable NDJSON test records.
+export val toJsonString = (s: String): String =>
+  lin_json_escape(s)
+
+// Recursively serialize ANY Lin value to a strict, valid JSON string. Strings (and object
+// keys) are escaped+quoted, numbers/bools/null become JSON literals (non-finite floats →
+// `null`, matching JSON.stringify), arrays and objects recurse arbitrarily deep. `lin_to_json`
+// is a compiler intrinsic (it walks the runtime tagged value), so the body below is the
+// surface wrapper the checker dispatches at the call site.
+export val toJson = (value: Json): String =>
+  lin_to_json(value)

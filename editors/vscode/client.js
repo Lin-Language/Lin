@@ -4,7 +4,11 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const cp = require("child_process");
-const { workspace, window, commands, languages, Range, TextEdit, Uri } = require("vscode");
+const {
+  workspace, window, commands, languages, Range, TextEdit, Uri,
+  tests, TestRunRequest, TestRunProfileKind, TestMessage, Position,
+  FileCoverage, StatementCoverage,
+} = require("vscode");
 const { LanguageClient, TransportKind } = require("vscode-languageclient/node");
 
 let client;
@@ -138,6 +142,388 @@ function makeFormattingProvider(linBin) {
   };
 }
 
+// --- Test Explorer integration (VSCode Testing API) ---------------------------
+//
+// Discovery is best-effort regex over *.test.lin: we never compile to enumerate
+// tests. Running shells out to `lin test ... --reporter json`, which emits NDJSON
+// (one record per test + one per file) on stdout; we stream it and map records
+// back onto TestItems. Tests with interpolated/dynamic names aren't discovered
+// statically — they're materialized on the fly from the `test` records at run time.
+
+// Matches `test("name"` and `withFixture(..., "name",` style declarations. We only
+// need the literal-string name; dynamic names simply won't match (handled at run time).
+// The NDJSON schema version this extension was written against. The CLI emits a leading
+// `{"event":"meta","schema":N}` record; if N is newer than this we warn (once) that the
+// extension may not understand the stream, but keep parsing best-effort.
+const SUPPORTED_SCHEMA = 1;
+
+const TEST_DECL_RE = /\btest\s*\(\s*"((?:[^"\\]|\\.)*)"/g;
+const WITHFIXTURE_DECL_RE = /\bwithFixture\s*\([^,]*,[^,]*,\s*"((?:[^"\\]|\\.)*)"/g;
+
+function unescapeLinString(s) {
+  // Best-effort inverse of the common Lin string escapes so the discovered id
+  // matches the runtime `name` (which is the decoded string).
+  return s
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "\t")
+    .replace(/\\r/g, "\r")
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, "\\");
+}
+
+function testItemId(filePath, name) {
+  return `${filePath}::${name}`;
+}
+
+// (Re)build a file's child TestItems from its current text.
+function refreshFileTests(controller, fileItem, text) {
+  fileItem.children.replace([]);
+  const seen = new Set();
+  const lines = text.split("\n");
+  const addMatch = (re) => {
+    for (let i = 0; i < lines.length; i++) {
+      re.lastIndex = 0;
+      let m;
+      while ((m = re.exec(lines[i])) !== null) {
+        const name = unescapeLinString(m[1]);
+        const id = testItemId(fileItem.uri.fsPath, name);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const child = controller.createTestItem(id, name, fileItem.uri);
+        const col = m.index >= 0 ? m.index : 0;
+        child.range = new Range(new Position(i, col), new Position(i, col + name.length));
+        fileItem.children.add(child);
+      }
+    }
+  };
+  addMatch(TEST_DECL_RE);
+  addMatch(WITHFIXTURE_DECL_RE);
+}
+
+function getOrCreateFileItem(controller, uri) {
+  const id = uri.fsPath;
+  let item = controller.items.get(id);
+  if (!item) {
+    item = controller.createTestItem(id, path.basename(uri.fsPath), uri);
+    item.canResolveChildren = true;
+    controller.items.add(item);
+  }
+  return item;
+}
+
+async function discoverAllTestFiles(controller) {
+  const files = await workspace.findFiles("**/*.test.lin");
+  for (const uri of files) {
+    getOrCreateFileItem(controller, uri);
+  }
+}
+
+async function resolveFileChildren(controller, fileItem) {
+  try {
+    const doc = await workspace.openTextDocument(fileItem.uri);
+    refreshFileTests(controller, fileItem, doc.getText());
+  } catch (_) {
+    // Unreadable file: leave it childless (best-effort discovery).
+  }
+}
+
+// Map a requested set of TestItems to the file paths we should pass to `lin test`.
+// A child item resolves to its parent file. An undefined include means "everything".
+function collectTargetFiles(controller, request) {
+  const files = new Set();
+  const items = [];
+  if (request.include && request.include.length > 0) {
+    for (const it of request.include) items.push(it);
+  } else {
+    controller.items.forEach((it) => items.push(it));
+  }
+  for (const it of items) {
+    // A test child has id `<file>::<name>`; a file item's id IS the fsPath.
+    const fsPath = it.parent ? it.parent.uri.fsPath : it.uri.fsPath;
+    files.add(fsPath);
+  }
+  return [...files];
+}
+
+// Build the `lin test` argument vector for a run/coverage request. Whole-project runs (no
+// include) pass the workspace root so the CLI also discovers files we never enumerated. When
+// the request targets INDIVIDUAL test items (gutter arrow on a single test), we additionally
+// pass `--filter-test "<name>"` per selected child so the CLI runs only those tests, not the
+// whole file. File-level selections (and a child mixed with its own file) run the whole file.
+function buildTestArgs(request, targetFiles, wsRoot) {
+  const wholeProject = !(request.include && request.include.length > 0);
+  const args = ["test"];
+  if (wholeProject && wsRoot) {
+    args.push(wsRoot);
+  } else {
+    args.push(...targetFiles);
+  }
+  args.push("--reporter", "json");
+
+  if (!wholeProject) {
+    // Files explicitly included as whole files — don't narrow those by name.
+    const wholeFiles = new Set();
+    for (const it of request.include) {
+      if (!it.parent) wholeFiles.add(it.uri.fsPath);
+    }
+    // Child test items whose file isn't being run wholesale → filter by name.
+    for (const it of request.include) {
+      if (it.parent && !wholeFiles.has(it.parent.uri.fsPath)) {
+        args.push("--filter-test", it.label);
+      }
+    }
+  }
+  return args;
+}
+
+// Find the TestItem for a `<file>::<name>` pair, creating it under the file item
+// if it wasn't statically discovered (e.g. an interpolated/dynamic test name).
+function findOrCreateTestItem(controller, file, name) {
+  const fileUri = Uri.file(file);
+  const fileItem = getOrCreateFileItem(controller, fileUri);
+  const id = testItemId(file, name);
+  let child = fileItem.children.get(id);
+  if (!child) {
+    child = controller.createTestItem(id, name, fileUri);
+    fileItem.children.add(child);
+  }
+  return child;
+}
+
+// Split a `toBe`-style failure message into expected/actual for a richer diff in
+// the Test Explorer. The runner emits `expected: X\n    actual:   Y`.
+function parseExpectedActual(message) {
+  const expMatch = message.match(/expected:\s*([\s\S]*?)(?:\n\s*actual:|$)/);
+  const actMatch = message.match(/actual:\s*([\s\S]*)$/);
+  if (expMatch && actMatch) {
+    return { expected: expMatch[1].trim(), actual: actMatch[1].trim() };
+  }
+  return null;
+}
+
+// Minimal lcov parser. lcov groups per-file sections:
+//   SF:<path>            begins a file section
+//   DA:<line>,<hits>     one record per instrumented line (hits = execution count)
+//   end_of_record        ends the section
+// Returns an array of { file, lines: [{ line, hits }] }.
+function parseLcov(text) {
+  const files = [];
+  let current = null;
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line.startsWith("SF:")) {
+      current = { file: line.slice(3), lines: [] };
+    } else if (line.startsWith("DA:") && current) {
+      const [lineNoStr, hitsStr] = line.slice(3).split(",");
+      const lineNo = parseInt(lineNoStr, 10);
+      const hits = parseInt(hitsStr, 10);
+      if (Number.isFinite(lineNo) && Number.isFinite(hits)) {
+        current.lines.push({ line: lineNo, hits });
+      }
+    } else if (line === "end_of_record" && current) {
+      files.push(current);
+      current = null;
+    }
+  }
+  if (current) files.push(current);
+  return files;
+}
+
+// Per-run cache mapping a file uri string → its parsed line records, so the profile's
+// loadDetailedCoverage resolver can materialize StatementCoverage on demand.
+const coverageDetailCache = new WeakMap();
+
+// Parse an lcov file and attach a FileCoverage per source file to the TestRun. The detailed
+// per-line StatementCoverage is materialized lazily via the profile's loadDetailedCoverage.
+function attachLcovCoverage(run, lcovFile) {
+  let text;
+  try {
+    text = fs.readFileSync(lcovFile, "utf8");
+  } catch (_) {
+    return; // No lcov produced (e.g. llvm tools missing) — best effort.
+  }
+  const detail = new Map();
+  for (const fileCov of parseLcov(text)) {
+    const uri = Uri.file(fileCov.file);
+    const total = fileCov.lines.length;
+    const covered = fileCov.lines.filter((l) => l.hits > 0).length;
+    const fc = new FileCoverage(uri, { covered, total });
+    detail.set(uri.toString(), fileCov.lines);
+    run.addCoverage(fc);
+  }
+  coverageDetailCache.set(run, detail);
+}
+
+function setupTestController(context, linBin) {
+  const controller = tests.createTestController("lin", "Lin Tests");
+  context.subscriptions.push(controller);
+
+  controller.resolveHandler = async (item) => {
+    if (!item) {
+      await discoverAllTestFiles(controller);
+    } else {
+      await resolveFileChildren(controller, item);
+    }
+  };
+
+  // Keep discovery fresh as files change / open / get created.
+  const watcher = workspace.createFileSystemWatcher("**/*.test.lin");
+  context.subscriptions.push(watcher);
+  watcher.onDidCreate((uri) => getOrCreateFileItem(controller, uri));
+  watcher.onDidChange((uri) => {
+    const item = controller.items.get(uri.fsPath);
+    if (item) resolveFileChildren(controller, item);
+  });
+  watcher.onDidDelete((uri) => controller.items.delete(uri.fsPath));
+  context.subscriptions.push(
+    workspace.onDidOpenTextDocument((doc) => {
+      if (doc.uri.fsPath.endsWith(".test.lin")) {
+        const item = getOrCreateFileItem(controller, doc.uri);
+        refreshFileTests(controller, item, doc.getText());
+      }
+    })
+  );
+
+  // Kick off initial discovery (don't block activation on it).
+  discoverAllTestFiles(controller);
+
+  // Shared run/coverage session. Spawns `lin test ... --reporter json` (plus coverage flags
+  // when `opts.coverage` is set), streams NDJSON, and maps records onto TestItems. On close, if
+  // a coverage lcov file was requested, parses it and attaches coverage to the TestRun.
+  const runTestSession = (request, token, opts) => {
+    opts = opts || {};
+    const run = controller.createTestRun(request);
+    const targetFiles = collectTargetFiles(controller, request);
+
+    // Mark requested items enqueued so the UI shows them as pending.
+    const requested = [];
+    if (request.include && request.include.length > 0) {
+      request.include.forEach((it) => requested.push(it));
+    } else {
+      controller.items.forEach((it) => requested.push(it));
+    }
+    for (const it of requested) {
+      run.enqueued(it);
+      it.children.forEach((c) => run.enqueued(c));
+    }
+
+    // Whole-project run: pass the workspace root rather than enumerating files,
+    // so `lin test` also picks up files we never discovered.
+    const wsRoot = workspace.workspaceFolders && workspace.workspaceFolders[0]
+      ? workspace.workspaceFolders[0].uri.fsPath
+      : undefined;
+    const args = buildTestArgs(request, targetFiles, wsRoot);
+
+    // For a coverage run, write lcov to an OS temp file and ask the CLI to emit it.
+    let lcovFile;
+    if (opts.coverage) {
+      lcovFile = path.join(os.tmpdir(), `lin-cov-${Date.now()}-${Math.random().toString(36).slice(2)}.lcov`);
+      args.push("--coverage", "--format", "llvm-cov", "--output", lcovFile);
+    }
+
+    let child;
+    try {
+      child = cp.spawn(linBin, args, { cwd: wsRoot });
+    } catch (err) {
+      window.showErrorMessage(`Lin: failed to start test runner: ${err.message}`);
+      run.end();
+      return;
+    }
+
+    child.on("error", (err) => {
+      window.showErrorMessage(`Lin: test runner error: ${err.message}`);
+      run.end();
+    });
+
+    token.onCancellationRequested(() => {
+      try { child.kill(); } catch (_) { /* already gone */ }
+    });
+
+    let buffer = "";
+    let warnedSchema = false;
+    const handleRecord = (rec) => {
+      if (rec.event === "meta") {
+        if (typeof rec.schema === "number" && rec.schema > SUPPORTED_SCHEMA && !warnedSchema) {
+          warnedSchema = true;
+          window.showWarningMessage(
+            `Lin: test reporter schema v${rec.schema} is newer than this extension supports ` +
+            `(v${SUPPORTED_SCHEMA}). Update the Lin extension; results may be incomplete.`
+          );
+        }
+      } else if (rec.event === "test") {
+        const item = findOrCreateTestItem(controller, rec.file, rec.name);
+        run.started(item);
+        const durationMs = typeof rec.durationMs === "number" ? rec.durationMs : undefined;
+        if (rec.status === "pass") {
+          run.passed(item, durationMs);
+        } else {
+          const msg = rec.message || "test failed";
+          const tm = new TestMessage(msg);
+          const ea = parseExpectedActual(msg);
+          if (ea) {
+            tm.expectedOutput = ea.expected;
+            tm.actualOutput = ea.actual;
+          }
+          run.failed(item, tm, durationMs);
+        }
+      } else if (rec.event === "file") {
+        if (rec.status === "compile_error" || rec.status === "timeout") {
+          const fileItem = getOrCreateFileItem(controller, Uri.file(rec.file));
+          const tm = new TestMessage(rec.message || rec.status);
+          // Mark the file item and any known children as errored so the failure
+          // is visible even when no per-test records were produced.
+          run.errored(fileItem, tm);
+          fileItem.children.forEach((c) => run.errored(c, tm));
+        }
+      }
+    };
+
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk.toString();
+      let nl;
+      while ((nl = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line) continue;
+        try {
+          handleRecord(JSON.parse(line));
+        } catch (_) {
+          // Non-JSON line (stray output) — ignore.
+        }
+      }
+    });
+
+    child.on("close", () => {
+      if (buffer.trim()) {
+        try { handleRecord(JSON.parse(buffer.trim())); } catch (_) { /* ignore */ }
+      }
+      if (lcovFile) {
+        attachLcovCoverage(run, lcovFile);
+        try { fs.unlinkSync(lcovFile); } catch (_) { /* best effort */ }
+      }
+      run.end();
+    });
+  };
+
+  const runHandler = (request, token) => runTestSession(request, token, { coverage: false });
+  const coverageHandler = (request, token) => runTestSession(request, token, { coverage: true });
+
+  controller.createRunProfile("Run", TestRunProfileKind.Run, runHandler, true);
+  const coverageProfile = controller.createRunProfile(
+    "Run with Coverage", TestRunProfileKind.Coverage, coverageHandler, false
+  );
+  // Resolve per-file detailed coverage lazily from the lines cached during the run.
+  coverageProfile.loadDetailedCoverage = async (testRun, fileCoverage) => {
+    const detail = coverageDetailCache.get(testRun);
+    const lines = detail && detail.get(fileCoverage.uri.toString());
+    if (!lines) return [];
+    // lcov line numbers are 1-based; VSCode Positions are 0-based.
+    return lines.map((l) => new StatementCoverage(l.hits, new Position(Math.max(0, l.line - 1), 0)));
+  };
+  // Expose the handler so the palette commands can drive a run directly.
+  return { controller, runHandler };
+}
+
 function activate(context) {
   const lspBin = resolveBin(context, "lin-lsp");
   const linBin = resolveBin(context, "lin");
@@ -192,6 +578,13 @@ function activate(context) {
     )
   );
 
+  // Test Explorer integration. Returns the controller + its run handler so the
+  // palette commands below can trigger runs through it.
+  const { controller: testController, runHandler: runTests } = setupTestController(context, linBin);
+  // A no-op cancellation token for palette-initiated runs (the Testing UI's own
+  // Stop button supplies a real token for gutter-initiated runs).
+  const noopToken = { onCancellationRequested: () => ({ dispose() {} }) };
+
   context.subscriptions.push(
     commands.registerCommand("lin.build", () => runLinCommand("build")),
     commands.registerCommand("lin.run",   () => runLinCommand("run")),
@@ -217,6 +610,22 @@ function activate(context) {
       commands.executeCommand("editor.action.formatDocument");
     }),
     commands.registerCommand("lin.installOnPath", () => installOnPath(context)),
+    // Palette entry points that drive the TestController (discoverability beyond
+    // the Testing view's gutter icons). They construct a TestRunRequest and run
+    // it through the same handler the gutter "Run" profile uses.
+    commands.registerCommand("lin.testFile", async () => {
+      const editor = window.activeTextEditor;
+      if (!editor || !editor.document.uri.fsPath.endsWith(".test.lin")) {
+        window.showWarningMessage("Lin: Active file is not a .test.lin file.");
+        return;
+      }
+      const fileItem = getOrCreateFileItem(testController, editor.document.uri);
+      await resolveFileChildren(testController, fileItem);
+      runTests(new TestRunRequest([fileItem]), noopToken);
+    }),
+    commands.registerCommand("lin.testProject", () => {
+      runTests(new TestRunRequest(), noopToken);
+    }),
   );
 }
 

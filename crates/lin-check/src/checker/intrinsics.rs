@@ -369,6 +369,10 @@ impl Checker {
         // value_key: (any) => String — canonical type-tagged key for any value
         self.define_intrinsic("lin_value_key", Type::func(vec![Type::TypeVar(u32::MAX)], Type::Str));
 
+        // to_json: (Json) => String — recursive strict-JSON serializer for any value.
+        // The param is the Json marker (TypeVar(u32::MAX)) so any value flows in.
+        self.define_intrinsic("lin_to_json", Type::func(vec![Type::TypeVar(u32::MAX)], Type::Str));
+
         // arrayAllocate(n) => Json[] — null-filled tagged array of length n
         self.define_intrinsic("lin_array_allocate", Type::func(vec![Type::Int32], Type::Array(Box::new(Type::TypeVar(u32::MAX)))));
 
