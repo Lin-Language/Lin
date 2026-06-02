@@ -1752,11 +1752,14 @@ print("unused")
 }
 
 #[test]
-fn test_circular_import_is_diagnosed_not_stack_overflow() {
-    // Regression: import resolution recursed before caching, so a cyclic import
-    // (a -> b -> a) recursed forever and overflowed the stack (SIGABRT) instead of
-    // producing a diagnostic. The DFS now tracks an on-stack `visiting` set and reports
-    // a clean "circular import detected" error with the cycle chain.
+fn test_circular_import_function_reference_compiles_not_stack_overflow() {
+    // Originally this was a hard error (and earlier a stack overflow): a cyclic import
+    // (a -> b -> a). Cyclic FUNCTION references are now supported (SCC type-checking), so this
+    // program compiles and runs — `a.fromA` and `b.fromB` reference each other across the import
+    // boundary, and `a`'s top-level `val x = fromB()` calls into the cycle once at init (which
+    // terminates). The stack-overflow regression is still guarded: resolution loads the graph once
+    // and never recurses forever; a genuine non-terminating *value* cycle is rejected cleanly
+    // (see test_cyclic_imports_value_init_cycle_still_errors).
     let dir = std::env::temp_dir().join(format!("lin_import_cycle_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(dir.join("a.lin"),
@@ -1776,18 +1779,15 @@ fn test_circular_import_is_diagnosed_not_stack_overflow() {
     let stderr = String::from_utf8_lossy(&compile.stderr).to_string();
     let stdout = String::from_utf8_lossy(&compile.stdout).to_string();
     let combined = format!("{stderr}{stdout}");
-    let _ = std::fs::remove_dir_all(&dir);
 
-    // Must fail cleanly, not crash: a stack overflow aborts with SIGABRT (signal 6),
-    // which is neither a normal exit nor the diagnostic we expect.
-    assert!(!compile.status.success(), "expected failure, got success: {combined}");
-    assert!(
-        combined.contains("circular import detected"),
-        "expected a circular-import diagnostic, got: {combined}"
-    );
-    // The chain should name both modules in the cycle.
-    assert!(combined.contains("a.lin") && combined.contains("b.lin"),
-        "expected the cycle chain to name a.lin and b.lin, got: {combined}");
+    assert!(compile.status.success(),
+        "expected the function-reference cycle to compile, got: {combined}");
+
+    // It must also run cleanly (terminate, exit 0) — not crash.
+    let run_out = Command::new(&bin_path).output().expect("failed to run compiled binary");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(run_out.status.success(),
+        "expected clean run, got stderr: {}", String::from_utf8_lossy(&run_out.stderr));
 }
 
 #[test]
@@ -1814,6 +1814,61 @@ print(toString(viaLeft() + viaRight()))
     let output = run(&main);
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(output, vec!["23"]);
+}
+
+#[test]
+fn test_cyclic_imports_mutual_recursion_unannotated() {
+    // THE no-userland-change case: two modules whose functions are mutually recursive
+    // across the import boundary, with NO return-type annotations. `a.isEven` calls
+    // `b.isOdd` and vice-versa. This must compile and run as written (SCC type-checking).
+    let dir = std::env::temp_dir().join(format!("lin_cyc_mutrec_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("a.lin"),
+        "import { isOdd } from \"b\"\n\
+         export val isEven = (n: Int32) => if n == 0 then true else isOdd(n - 1)\n").unwrap();
+    std::fs::write(dir.join("b.lin"),
+        "import { isEven } from \"a\"\n\
+         export val isOdd = (n: Int32) => if n == 0 then false else isEven(n - 1)\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ isEven }} from "{d}/a"
+print(toString(isEven(10)))
+print(toString(isEven(7)))
+"#, d = dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["true", "false"]);
+}
+
+#[test]
+fn test_cyclic_imports_value_init_cycle_still_errors() {
+    // A genuine value-init cycle: a.x reads b.y at module-init time and b.y reads a.x.
+    // This is infinite init recursion and must remain a clean compile error (not a hang
+    // or stack overflow), even though function-reference cycles are now allowed.
+    let dir = std::env::temp_dir().join(format!("lin_cyc_valinit_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("a.lin"),
+        "import { y } from \"b\"\n\
+         export val x = y + 1\n").unwrap();
+    std::fs::write(dir.join("b.lin"),
+        "import { x } from \"a\"\n\
+         export val y = x + 1\n").unwrap();
+
+    let bin_path = dir.join("a.out");
+    let compile = Command::new(lin_bin())
+        .args(["build", dir.join("a.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let stderr = String::from_utf8_lossy(&compile.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&compile.stdout).to_string();
+    let combined = format!("{stderr}{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!compile.status.success(), "expected failure, got success: {combined}");
+    assert!(
+        combined.contains("circular") || combined.contains("cycle") || combined.contains("init"),
+        "expected a value-init cycle diagnostic, got: {combined}"
+    );
 }
 
 #[test]
