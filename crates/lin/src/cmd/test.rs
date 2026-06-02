@@ -97,6 +97,10 @@ pub struct TestArgs {
     /// Output reporter: human (default) or json (NDJSON on stdout)
     #[arg(long, value_enum, default_value = "human")]
     pub reporter: Reporter,
+    /// Run only the test(s) with this exact name. Repeatable. When set, every other test in
+    /// the matched files is skipped (its body is not evaluated and it emits no record).
+    #[arg(long)]
+    pub filter_test: Vec<String>,
 }
 
 struct TestResult {
@@ -137,6 +141,7 @@ pub fn run(args: &TestArgs) {
     let verbose = args.verbose;
     let coverage = args.coverage;
     let json = args.reporter == Reporter::Json;
+    let filter_test = args.filter_test.clone();
 
     // Emit the schema-version record as the very FIRST NDJSON line, so a consumer can verify
     // it understands the stream before parsing any per-test/per-file records.
@@ -182,6 +187,7 @@ pub fn run(args: &TestArgs) {
                     if coverage { Some(&profraw) } else { None },
                     timeout,
                     json,
+                    &filter_test,
                 );
                 let elapsed = t.elapsed();
 
@@ -285,6 +291,7 @@ fn run_binary(
     profraw: Option<&PathBuf>,
     timeout: Duration,
     json: bool,
+    filter_test: &[String],
 ) -> (Outcome, String, String) {
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
@@ -298,6 +305,12 @@ fn run_binary(
     // Gate std/test's NDJSON emission on this env var (see stdlib/test.lin `report`).
     if json {
         cmd.env("LIN_TEST_JSON", "1");
+    }
+    // When the user asked for specific tests, pass the names (newline-separated) so std/test's
+    // `test` skips every non-selected body. Test names are single-line string literals, so a
+    // newline separator can never collide with a name.
+    if !filter_test.is_empty() {
+        cmd.env("LIN_TEST_ONLY", filter_test.join("\n"));
     }
 
     let child = match cmd.spawn() {

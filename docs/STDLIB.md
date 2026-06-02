@@ -4774,6 +4774,12 @@ the `LIN_TEST_JSON` environment variable; the CLI strips the prefix, attaches th
 and re-serializes each record canonically. The marker lets the CLI separate runner records from
 any `print` output your own test code emits on the same stdout stream.
 
+**Running a subset by name.** Pass `--filter-test "<name>"` (repeatable) to run only the named
+test(s) within the matched files; every other test is *skipped* — its body is never evaluated
+(so no side effects, and no `withFixture` setup/teardown) and it emits no record. A skipped test
+counts as neither pass nor fail, so a filtered run that omits a failing test still exits zero.
+This backs the VSCode Test Explorer's single-test gutter run.
+
 ---
 
 ## std/time
