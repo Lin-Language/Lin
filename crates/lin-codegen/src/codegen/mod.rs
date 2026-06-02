@@ -884,6 +884,55 @@ impl<'ctx> Codegen<'ctx> {
                                         else { call.try_as_basic_value().unwrap_basic() }
                                     }
                                 }
+                                CallTarget::Named(name) if name == "lin_string_byte_at" && arg_vals.len() == 2 => {
+                                    // INLINE the O(1) byte accessor (mirrors flat_array_get, ADR-069):
+                                    // lin_string_byte_at is a hot per-byte call in Lin-side string
+                                    // scanning. The runtime fn is a non-inlinable staticlib call; emit
+                                    // the bounds-checked indexed load inline so LLVM keeps the string
+                                    // pointer in a register and hoists the length load out of the loop.
+                                    // LinString layout: refcount@0 (u32), len@4 (u32), data@8 ([u8]).
+                                    let s = arg_vals[0];
+                                    let idx = arg_vals[1];
+                                    if s.is_pointer_value() && idx.is_int_value() {
+                                        let i8_ty = self.context.i8_type();
+                                        let i32_ty = self.context.i32_type();
+                                        let i64_ty = self.context.i64_type();
+                                        let sp = s.into_pointer_value();
+                                        let index = idx.into_int_value();
+                                        // len = *(u32*)(s + 4)
+                                        let len_p = unsafe { self.builder.gep(i8_ty, sp, &[i64_ty.const_int(4, false)], "sba_len_p") };
+                                        let len = self.builder.load(i32_ty, len_p, "sba_len").into_int_value();
+                                        // OOB (index < 0 || index >= len) via one unsigned compare on i32.
+                                        let oob = self.builder.int_compare(inkwell::IntPredicate::UGE, index, len, "sba_oob");
+                                        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                                        let oob_b = self.context.append_basic_block(llvm_fn, "sba_oob");
+                                        let ok_b = self.context.append_basic_block(llvm_fn, "sba_ok");
+                                        let mrg = self.context.append_basic_block(llvm_fn, "sba_mrg");
+                                        self.builder.conditional_branch(oob, oob_b, ok_b);
+                                        // OOB → -1
+                                        self.builder.position_at_end(oob_b);
+                                        self.builder.unconditional_branch(mrg);
+                                        // OK → zero-extend the byte at data+index to i32. data@8.
+                                        self.builder.position_at_end(ok_b);
+                                        let idx64 = self.builder.int_z_extend_or_bit_cast(index, i64_ty, "sba_i64");
+                                        let data_p = unsafe { self.builder.gep(i8_ty, sp, &[i64_ty.const_int(8, false)], "sba_data") };
+                                        let byte_p = unsafe { self.builder.in_bounds_gep(i8_ty, data_p, &[idx64], "sba_byte_p") };
+                                        let byte = self.builder.load(i8_ty, byte_p, "sba_byte").into_int_value();
+                                        let byte_i32 = self.builder.int_z_extend(byte, i32_ty, "sba_zext");
+                                        let ok_exit = self.builder.get_insert_block().unwrap();
+                                        self.builder.unconditional_branch(mrg);
+                                        self.builder.position_at_end(mrg);
+                                        let phi = self.builder.phi(i32_ty, "sba_phi");
+                                        let neg1 = i32_ty.const_int((-1i32) as u64, true);
+                                        phi.add_incoming(&[(&neg1, oob_b), (&byte_i32, ok_exit)]);
+                                        phi.as_basic_value()
+                                    } else {
+                                        // Fallback: emit the normal call (shouldn't happen — typed Str,Int32).
+                                        let f = self.get_or_declare_fn("lin_string_byte_at",
+                                            self.context.i32_type().fn_type(&[ptr_ty.into(), self.context.i32_type().into()], false));
+                                        self.builder.call(f, &arg_vals, "call_n").try_as_basic_value().unwrap_basic()
+                                    }
+                                }
                                 CallTarget::Named(name) => {
                                     // Resolve the callee; if it's an undeclared runtime symbol
                                     // (e.g. lin_array_slice_tagged), declare it from the actual
