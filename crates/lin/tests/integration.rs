@@ -10072,3 +10072,78 @@ fn test_json_reporter_structured_expected_actual() {
     assert!(sat.get("actual").is_none(), "toSatisfy must not carry 'actual'; got:\n{:?}", sat);
     assert!(sat["message"].as_str().unwrap_or("").contains("predicate"), "satisfy message preserved");
 }
+
+// ── `Number` as a numerically-bounded generic parameter (ADR-018, reversed) ─────────────────────
+// `(x: Number)` is sugar for `<T: numeric>(x: T)`: the body type-checks (the bound permits
+// arithmetic), and monomorphization specializes per call-site family to native unboxed ops.
+
+#[test]
+fn test_number_param_specializes_int_and_float() {
+    // The canonical example: one `Number` parameter, called at Int32 AND Float64. Each call
+    // monomorphizes to a native specialization (`isEven$Int32` srem, `isEven$Float64` frem).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val isEven = (x: Number) => x % 2 == 0
+print(toString(isEven(4)))
+print(toString(isEven(3.0)))
+print(toString(isEven(7)))
+print(toString(isEven(8.0)))
+"#);
+    assert_eq!(out, vec!["true", "false", "false", "true"]);
+}
+
+#[test]
+fn test_number_param_string_arg_is_compile_error() {
+    // A `String` argument fails the numeric bound at the call site — a clear compile error.
+    let err = run_expect_err(r#"import { print } from "std/io"
+val isEven = (x: Number) => x % 2 == 0
+print(isEven("hi"))
+"#);
+    assert!(
+        err.contains("expected a numeric type") && err.contains("String"),
+        "String into a Number param should be a numeric-bound error; got:\n{}",
+        err
+    );
+}
+
+#[test]
+fn test_number_multi_param_same_family_per_call() {
+    // Two `Number` params; each CALL uses a single family. Distinct calls specialize independently
+    // (`add$Int32_Int32`, `add$Float64_Float64`).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val add = (a: Number, b: Number) => a + b
+print(toString(add(3, 4)))
+print(toString(add(1.5, 2.5)))
+"#);
+    assert_eq!(out, vec!["7", "4.0"]);
+}
+
+#[test]
+fn test_number_return_type_annotation() {
+    // `Number` is also usable as a return-type annotation (its own fresh bounded var).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val twice = (x: Number): Number => x + x
+print(toString(twice(21)))
+print(toString(twice(1.25)))
+"#);
+    assert_eq!(out, vec!["42", "2.5"]);
+}
+
+#[test]
+fn test_number_mixed_family_in_one_call_is_compile_error() {
+    // First-cut limitation: combining two independent `Number` params at DIFFERENT families in a
+    // single call (where the result flows from them) is rejected with a clear message rather than
+    // mis-lowered. Same-family-per-call (above) is unaffected.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val add = (a: Number, b: Number) => a + b
+print(toString(add(10, 2.5)))
+"#);
+    assert!(
+        err.contains("mixes different numeric families"),
+        "mixed-family-in-one-call should be a clear compile error; got:\n{}",
+        err
+    );
+}

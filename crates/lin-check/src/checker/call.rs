@@ -7,6 +7,37 @@ use crate::resolve::{error_type, json_type};
 use crate::typed_ir::*;
 use crate::types::Type;
 
+/// Whether an argument type may satisfy a `Number` (numeric-bounded) parameter (ADR-018, reversed).
+/// Accepts a concrete numeric family (the monomorphizable case) and a generic/unsolved type var
+/// other than the `Json` wildcard (the bound flows on to the outer specialization, or is zonked to
+/// a concrete family). REJECTS the `Json` wildcard (`TypeVar(u32::MAX)`): a dynamically-typed value
+/// can't be statically proven numeric and can't be monomorphized to a native op — the honest
+/// outcome is a compile error directing the user to a concrete family, NOT a silent boxed slow path.
+fn arg_satisfies_numeric_bound(arg_ty: &Type) -> bool {
+    match arg_ty {
+        t if t.is_numeric() => true,
+        Type::TypeVar(id) => *id != u32::MAX,
+        _ => false,
+    }
+}
+
+/// True if `ty` mentions a numeric-bounded generic TypeVar (a `Number` resolved var). Used to gate
+/// the mixed-family-per-call diagnostic to functions whose RETURN flows from such a var.
+fn returns_numeric_bound(ty: &Type, numeric_tvs: &std::collections::HashSet<u32>) -> bool {
+    match ty {
+        Type::TypeVar(id) => numeric_tvs.contains(id),
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) => {
+            returns_numeric_bound(t, numeric_tvs)
+        }
+        Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(|t| returns_numeric_bound(t, numeric_tvs)),
+        Type::Object(fields) => fields.values().any(|t| returns_numeric_bound(t, numeric_tvs)),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(|t| returns_numeric_bound(t, numeric_tvs)) || returns_numeric_bound(ret, numeric_tvs)
+        }
+        _ => false,
+    }
+}
+
 impl Checker {
     /// `fromJson` special form (ADR-047). `T.fromJson(value)` desugars to a DotCall and
     /// `fromJson(T, value)` to a Call; both reach here BEFORE arg0/receiver is inferred as a
@@ -368,6 +399,40 @@ impl Checker {
                     }
                 }
 
+                // Enforce the NUMERIC bound (ADR-018, reversed). A `Number` parameter resolved to a
+                // numerically-constrained generic TypeVar; at this call site it is being bound to the
+                // argument's concrete family. That family must be numeric (an `Int*`/`UInt*`/`Float*`),
+                // OR another numeric-constrained / unconstrained generic TypeVar (the bound flows on to
+                // the outer specialization). A `String`/`Bool`/`Object`/array/`Json` argument is a
+                // compile error — caught HERE rather than via `arg_compatible`, which would otherwise
+                // accept any type into a bare TypeVar param.
+                for (i, param_ty) in params.iter().enumerate() {
+                    if i >= typed_args.len() { break; }
+                    if let Type::TypeVar(id) = param_ty {
+                        if self.numeric_tvs.contains(id) {
+                            let arg_ty = typed_args[i].ty();
+                            if !arg_satisfies_numeric_bound(&arg_ty) {
+                                let dyn_hint = arg_ty.is_json();
+                                return Err(Diagnostic::error(
+                                    args[i].span(),
+                                    format!(
+                                        "Argument {} has type {}, expected a numeric type (Number)",
+                                        i + 1,
+                                        arg_ty
+                                    ),
+                                ).with_help(if dyn_hint {
+                                    "a `Number` parameter must be a STATICALLY numeric value so it can \
+                                     compile to a native op; a dynamic `Json` value can't be proven numeric \
+                                     — decode it to a family first (e.g. `Int32.fromJson(v)`)".to_string()
+                                } else {
+                                    "a `Number` parameter accepts any numeric family (Int8…Float64); \
+                                     for dynamic non-numeric data use `Json`".to_string()
+                                }));
+                            }
+                        }
+                    }
+                }
+
                 // Check argument compatibility against concrete params.
                 for (i, (arg, param_ty)) in
                     typed_args.iter().zip(concrete_params.iter()).enumerate()
@@ -382,6 +447,32 @@ impl Checker {
                                 arg_ty,
                                 param_ty
                             ),
+                        ));
+                    }
+                }
+
+                // First-cut limitation (ADR-018, reversed): when a `Number`-returning function mixes
+                // DISTINCT numeric-bounded params bound to DIFFERENT families IN ONE CALL (e.g.
+                // `(a:Number,b:Number)=>a+b` at `add(10, 2.5)`), the widened return cannot be
+                // expressed by the single-var monomorphization (each `Number` is its own var). Reject
+                // with a clear message rather than mis-lowering. Same-family-per-call is unaffected;
+                // for mixed families annotate the families explicitly or widen at the call site.
+                if returns_numeric_bound(ret, &self.numeric_tvs) {
+                    let mut fams = std::collections::HashSet::new();
+                    for (id, t) in &subs {
+                        if self.numeric_tvs.contains(id) && t.is_numeric() {
+                            fams.insert(format!("{}", t));
+                        }
+                    }
+                    if fams.len() > 1 {
+                        return Err(Diagnostic::error(
+                            span,
+                            "this call mixes different numeric families in a `Number`-returning function".to_string(),
+                        ).with_help(
+                            "each `Number` parameter is an independent numeric type; a call that combines \
+                             them must use a single family (e.g. `add(10, 2)` or `add(1.5, 2.5)`). Give \
+                             the parameters explicit families, or convert the arguments to one family."
+                                .to_string(),
                         ));
                     }
                 }
@@ -638,6 +729,34 @@ impl Checker {
                 let concrete_params: Vec<Type> = method_params.iter()
                     .map(|p| apply_type_subs(p, &subs))
                     .collect();
+                // Enforce the NUMERIC bound on a dot-call to a `Number`-parameter function (ADR-018,
+                // reversed). Mirrors the direct-call check; the receiver is arg 0.
+                for (i, param_ty) in method_params.iter().enumerate() {
+                    if i >= all_args.len() { break; }
+                    if let Type::TypeVar(id) = param_ty {
+                        if self.numeric_tvs.contains(id) {
+                            let arg_ty = all_args[i].ty();
+                            if !arg_satisfies_numeric_bound(&arg_ty) {
+                                let dyn_hint = arg_ty.is_json();
+                                return Err(Diagnostic::error(
+                                    all_arg_exprs.get(i).map(|e| e.span()).unwrap_or(span),
+                                    format!(
+                                        "Argument {} has type {}, expected a numeric type (Number)",
+                                        i + 1,
+                                        arg_ty
+                                    ),
+                                ).with_help(if dyn_hint {
+                                    "a `Number` parameter must be a STATICALLY numeric value so it can \
+                                     compile to a native op; a dynamic `Json` value can't be proven numeric \
+                                     — decode it to a family first (e.g. `Int32.fromJson(v)`)".to_string()
+                                } else {
+                                    "a `Number` parameter accepts any numeric family (Int8…Float64); \
+                                     for dynamic non-numeric data use `Json`".to_string()
+                                }));
+                            }
+                        }
+                    }
+                }
                 let concrete_ret = apply_type_subs(&ret, &subs);
                 let result_type = if partial {
                     if all_args.len() < method_params.len() {

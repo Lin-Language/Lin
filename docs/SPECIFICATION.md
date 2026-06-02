@@ -267,7 +267,30 @@ Floating-point families follow IEEE 754 and are always signed; there is no `UFlo
 
 > **Note.** Only `Float32` and `Float64` exist. `Float8` and `Float16` are not implemented and are not resolvable type names. Integer families span 8/16/32/64-bit signed and unsigned.
 
-The name `Number` is a *conceptual* union over every numeric family, used in this specification and in `docs/STDLIB.md` as shorthand for "any numeric." It is **not** a resolvable type-annotation name in the current implementation: writing `val n: Number = …` is an "Unknown type" error. Code that must accept any numeric uses `Json` or a specific family; the conceptual `Number` exists only so prose and signature tables read concisely. See §21 for coercion and inference rules.
+The name `Number` is a **numerically-bounded generic type parameter**, enforced at compile time with
+zero runtime cost (ADR-018, which reverses the earlier "conceptual union" treatment). A parameter
+(or return) annotated `Number` means "this must be a number"; it is sugar for an implicit
+`<T: numeric>`:
+
+```lin
+val isEven = (x: Number) => x % 2 == 0
+isEven(4)     // compiles & runs as Int32 (native srem) 
+isEven(3.0)   // compiles & runs as Float64 (native frem)
+isEven("hi")  // COMPILE ERROR: expected a numeric type (Number)
+```
+
+The body type-checks because the bound guarantees a numeric family (arithmetic is permitted on a
+`Number`-typed operand). At each call site the concrete family flows in from the argument and the
+compiler **monomorphizes** a specialized copy (`isEven$Int32`, `isEven$Float64`) that compiles to
+the same native unboxed code as a hand-written concrete function — true parity, no boxing.
+
+Each `Number` occurrence in a signature is its own independent bounded variable, so
+`(a: Number, b: Number)` admits `a` and `b` at different families. Limitations (first cut): a
+*dynamic* `Json` value can't be proven numeric, so it cannot be passed to a `Number` parameter
+(decode it to a family with `Int32.fromJson(v)` etc.); and a single call that combines two distinct
+`Number` parameters at *different* families in a `Number`-returning function (e.g. `add(10, 2.5)` for
+`(a: Number, b: Number) => a + b`) is rejected — annotate the families explicitly or convert the
+arguments. For genuinely dynamic numerics, use `Json`. See §21 for coercion and inference rules.
 
 ### 3.3 Strict JSON Object Literals
 
