@@ -267,7 +267,46 @@ Floating-point families follow IEEE 754 and are always signed; there is no `UFlo
 
 > **Note.** Only `Float32` and `Float64` exist. `Float8` and `Float16` are not implemented and are not resolvable type names. Integer families span 8/16/32/64-bit signed and unsigned.
 
-The name `Number` is a *conceptual* union over every numeric family, used in this specification and in `docs/STDLIB.md` as shorthand for "any numeric." It is **not** a resolvable type-annotation name in the current implementation: writing `val n: Number = …` is an "Unknown type" error. Code that must accept any numeric uses `Json` or a specific family; the conceptual `Number` exists only so prose and signature tables read concisely. See §21 for coercion and inference rules.
+The name `Number` is a **numerically-bounded generic type parameter**, enforced at compile time with
+zero runtime cost (ADR-018, which reverses the earlier "conceptual union" treatment). A parameter
+(or return) annotated `Number` means "this must be a number"; it is sugar for an implicit
+`<T: numeric>`:
+
+```lin
+val isEven = (x: Number) => x % 2 == 0
+isEven(4)     // compiles & runs as Int32 (native srem) 
+isEven(3.0)   // compiles & runs as Float64 (native frem)
+isEven("hi")  // COMPILE ERROR: expected a numeric type (Number)
+```
+
+The body type-checks because the bound guarantees a numeric family (arithmetic is permitted on a
+`Number`-typed operand). At each call site the concrete family flows in from the argument and the
+compiler **monomorphizes** a specialized copy (`isEven$Int32`, `isEven$Float64`) that compiles to
+the same native unboxed code as a hand-written concrete function — true parity, no boxing.
+
+Each `Number` occurrence in a signature is its own independent bounded variable, so
+`(a: Number, b: Number)` admits `a` and `b` at different families. A single call that combines two
+distinct `Number` parameters at *different* families (e.g. `add(10, 2.5)` for
+`(a: Number, b: Number) => a + b`) is **supported** and **widens exactly like concrete families**:
+`add(10, 2.5)` yields `Float64` (`12.5`), `add(10, 2)` stays `Int` (both `Int32`), `add(1.5, 2.5)`
+is `Float64`. The monomorphized `add$Int32_Float64` emits native `sitofp`+`fadd` — no boxing.
+
+`Number` also works in **nested positions**: `Number[]` (an array element — homogeneous, one shared
+bounded family per array) and combinator callbacks over it. For example
+`(xs: Number[]) => xs.map((v: Number) => v * 2)` specializes the element family from the argument
+(`f([1, 2, 3])` ⇒ `Int32`, `f([1.5, 2.5])` ⇒ `Float64`) and runs as a native unboxed loop. The
+callback's `Number` parameter is tied to the array element it consumes.
+
+A dynamic `Json` value (direct or projected, e.g. `config["count"]`) **is accepted** at a `Number`
+parameter, consistent with the `Json → Int32` scalar coercion (ADR-048). It specializes to the
+default `Int32` family and unboxes **unchecked** — a `Json` holding a non-integer number unboxes as
+garbage, the same accepted unsoundness as `val n: Int32 = jsonValue`. For a range-checked decode use
+`Int32.fromJson(v)` (which returns `T | Error`).
+
+Limitations: `Number` in a **higher-order function-typed parameter** (e.g.
+`(f: (Number) => Number, x: Number) => f(x)`) cannot yet be inferred at the call site (the same
+inference gap that affects an explicit `<T>` callback param); use a concrete numeric family there.
+See §21 for coercion and inference rules.
 
 ### 3.3 Strict JSON Object Literals
 

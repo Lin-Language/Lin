@@ -133,13 +133,119 @@ val myFunc = () =>
 
 **Consequence**: `import { x } from "lib/math"` in `examples/main.lin` loads `examples/lib/math.lin`. Absolute paths and `..` traversal work naturally via the filesystem.
 
-## ADR-018: `Number` as a built-in union alias
+## ADR-018: `Number` as a numerically-bounded generic parameter (REVERSED — was: union alias)
 
-**Decision**: Add `Number` to the built-in types as a union alias for every numeric family (`Int8 | … | Float64`), and use it in the definition of `Json`. `Number` does not introduce a new runtime kind, a new subtype relation, or any new narrowing rule — it is exactly the union it expands to.
+**Status**: REVERSED. The original decision (modelling `Number` as the union `Int8 | … | Float64`,
+and as a runtime tagged value when used as a parameter type) is superseded. `Number` is now a
+**numerically-bounded, monomorphized generic type parameter** with **zero runtime cost**.
 
-**Rationale**: Without a name for "any numeric," the `Json` type has to enumerate all sixteen numeric families to be accurate, and signatures that accept any numeric have no concise spelling. A true supertype with subtype assignability would introduce a third kind of type relation alongside structural typing and unions, and would force decisions about `is Number` narrowing, arithmetic on a `Number`-typed operand, and how widening (§21) interacts with the supertype. A union alias avoids all of that: `is Int32`, widening, and operator dispatch keep working exactly as they did, because under the hood there is still only a concrete numeric family at every site.
+**Decision**: A parameter (or return) annotated `Number` is sugar for an implicit, numerically-constrained
+type variable — conceptually `<T: numeric>(x: T)`. Each occurrence mints its OWN fresh bounded
+type-var (so `(a: Number, b: Number)` lets `a` and `b` specialize to different families
+independently). The function body type-checks because the bound guarantees a numeric family, so
+arithmetic on a `Number`-typed operand is permitted; the operator's result type IS the bounded var,
+so it flows through. At each call site the concrete family flows in from the argument, and Lin's
+existing single-module **monomorphization** (`crates/lin-ir/src/monomorphize.rs`) materializes a
+specialized copy (`isEven$Int32`, `isEven$Float64`) compiled to native unboxed ops. A genuinely
+non-numeric argument (`String`/`Bool`/`Object`/array) is rejected at the call site with
+"expected a numeric type (Number)". A dynamic `Json` value IS accepted (see **§Json** below).
 
-**Consequence**: Spec-only change in v0 (no type checker exists yet — `Number` already parses as a `TypeExpr::Named`). The future type checker treats `Number` as a union alias when resolving assignability and exhaustiveness. Runtime is unchanged: §28.4 still says every numeric value carries its specific family tag and there is no single `Number` representation.
+**Rationale**: We measured the boxed-union representation at ~3.6× slower than concrete `Int32`
+(every op a tagged `lin_tagged_arith` over heap-boxed operands). The bounded-generic model is the
+Rust/Swift approach: the *compile-time guarantee* ("this is a number") is decoupled from the
+*runtime representation* (always a concrete family at each specialization). It reuses the
+monomorphization machinery that already specializes `<T>` functions, so it adds a constraint table
+and a call-site bound check rather than a new type relation or a new runtime kind. We verified the
+emitted LLVM: `isEven$Float64` is a bare `frem`+`fcmp`, `isEven$Int32` a bare `srem`+`icmp` — no
+`lin_tagged_arith`, no `lin_box_*`/`lin_unbox_*` per op. A 50M-iteration benchmark with a statically
+concrete loop variable runs at **1.0×** of the hand-annotated `Int32` version (2.70s vs 2.72s).
+
+**Implementation**: `lin-check` carries a `numeric_tvs: HashSet<u32>` constraint table on the
+`Checker`. `resolve_type_with_number[_in]` (in `checker/function.rs`) lowers each `Number`
+parameter occurrence — including nested forms like `Number[]` and `(Number) => Number` — to a fresh
+quantified generic TypeVar (≥9001) recorded in that table; `forward_declare_functions` and both
+`infer_function`/`infer_function_with_hints` use it so the call-driving signature and the body
+agree. `infer_binary_op` (`checker/ops.rs`) makes a bounded-var operand drive the result type so it
+survives substitution. The call-site numeric bound is enforced in `checker/call.rs` (both the direct
+and dot-call paths). `lin-codegen/src/codegen/arith.rs` widens a mixed int/float `Mod` (so a
+`Number`→Float64 specialization lowers `x % 2` to `frem`). A bare `Number` RETURN is special-cased:
+it can't be pinned from arguments, so the body's (numeric, bound-guaranteed) type is surfaced as the
+function's return and the body is checked numeric.
+
+**Nested `Number` (`Number[]`, callbacks).** `resolve_type_with_number_in` recurses into Array,
+FixedArray, Union, Function-param/return, and Object-field positions, so every `Number` occurrence
+anywhere in an annotation mints its own bounded var — `(xs: Number[])` lowers to
+`Array(TypeVar)`. For a `Number[]` argument the element var is pinned from the literal's element
+family at the call site (homogeneous array → one shared element family). To make a combinator
+callback over such an array specialize, two checker tweaks (`infer_function_with_hints`): (1) a bare
+`Number` lambda PARAMETER whose expected type (from the enclosing combinator, e.g. `.map`'s callback
+param = the receiver element) is itself a numeric-bounded var REUSES that var instead of minting a
+fresh independent one — tying the callback's family to the array element it consumes; (2) a lambda
+whose body type is a numeric-bounded var is surfaced as the lambda's RETURN (not erased to the
+combinator's free `U` slot), so the call site pins `U` and the outer `(xs: Number[]) => xs.map(…)`
+return is inferred. Result: `f([1,2,3])` ⇒ `f$Int32` native `mul i32`, `f([1.5,2.5])` ⇒ Float64.
+A `Number` in a **higher-order function-typed parameter** (`(f: (Number) => Number, …)`) still
+cannot be inferred at the call site — that is the SAME monomorphization-inference gap an explicit
+`<T>` callback param hits (`<T>(f: (T) => T, x: T)` fails identically), not Number-specific; the call
+reports the generic "cannot infer a concrete type for the type parameter(s)" error. Use a concrete
+numeric family in that position.
+
+**Mixed families in ONE call** of a `Number`-returning function (e.g.
+`(a: Number, b: Number) => a + b` at `add(10, 2.5)`) **are supported**. Each `Number` is its own
+bounded var, so the call monomorphizes to `add$Int32_Float64` and the arithmetic result is
+**re-widened at monomorphization time** to exactly the family the concrete `(a: Int32, b: Float64)`
+equivalent produces (`Float64` here, value `12.5`). `add(10, 2)` stays `Int` (both args `Int32`),
+`add(1.5, 2.5)` is `Float64` — identical to the concrete-param widening rule. The emitted spec is
+native (`sitofp`+`fadd`+`ret double`), no boxing. `infer_binary_op` records an arithmetic op over a
+bounded var with the bounded var as its result type (so it survives substitution), but when two
+DISTINCT bounded vars feed one op, that single recorded var would freeze to the FIRST family under
+plain `subst_type`. So `lin-ir::monomorphize::subst_expr` re-derives an arithmetic op's result type
+from its now-concrete operands via `widen_numeric` AFTER substitution, and re-syncs both the
+specialized function's `ret_type` and the call's recorded result type to the body's widened tail
+type (so the spec signature and the call site agree). Before this fix the result slot stayed `Int32`
+while codegen emitted a `double` → the `lin_box_int32(double)` / `ret double`-vs-`i32` ABI crash;
+the earlier reject in `checker/call.rs` was a workaround that is now removed.
+
+**§Json: a `Json` value is ACCEPTED at a `Number` parameter** (direct OR projected), consistent with
+the existing `Json → Int32` scalar coercion gap (ADR-048). It monomorphizes the bounded var to the
+default **`Int32`** family and unboxes **unchecked** — a `Json` holding a non-integer number unboxes
+as garbage, exactly the same accepted, documented unsoundness as `val n: Int32 = jsonValue` today.
+The safe path for validated extraction is `Int32.fromJson(v)` (ADR-047), which range-checks and
+returns `T | Error`. This replaces an earlier inconsistency: a DIRECT `Json` argument
+(`val x: Json = 42`, the bare `TypeVar(u32::MAX)` marker) was REJECTED while a `Json` PROJECTION
+(`config["count"]`, a fresh inference var) slipped past the call-site bound guard and ran — so the
+same value produced a compile error or a result depending only on whether it was indexed. Both now
+compile and produce the SAME answer. Mechanically: (1) `arg_satisfies_numeric_bound`
+(`checker/call.rs`) accepts ANY `TypeVar`, including the `u32::MAX` Json wildcard (it previously
+excluded it); (2) the `Number` var unifies against the Json arg's wildcard type and
+`lin-ir::monomorphize` binds it to the wildcard, minting a `$Json`-named spec whose param is a boxed
+`ptr` unboxed as `Int32`; (3) for a `Number`-RETURNING body over a Json operand (`x * 3`), the
+arithmetic op's result and the spec/return type are re-derived to the concrete unboxed family
+(`Int32`) — mirroring the IR's unbox-to-concrete-operand behaviour — so the spec signature
+(`define i32 triple$Json`) matches the native scalar it returns instead of a stale boxed `ptr` (the
+historical `triple$Json` codegen crash), and the call site re-coerces (boxes) the scalar back to the
+`Json` the surrounding context expects.
+
+**Consequence / limitations** (first cut):
+- **Validated dynamic numerics use `fromJson`.** A `Json` value passed to a `Number` parameter is
+  accepted (§Json above) but decoded as `Int32` with an unchecked unbox; for a range-checked decode
+  to a specific family use `Int32.fromJson(v)` etc. We do NOT promote a `Json` `Number` argument to a
+  boxed slow path — it specializes to the concrete `Int32` family like every other argument.
+- `Number` is no longer part of the structural definition of `Json` (it never resolved to a union).
+- **Nested `Number` works** for `Number[]` and combinator callbacks over it (see the implementation
+  note above) — `(xs: Number[]) => xs.map((v: Number) => v*2)` specializes and runs natively.
+- A `Number` in a **higher-order function-typed parameter** (`(f: (Number) => Number, x: Number)`)
+  can't be inferred at the call site — the shared generic-callback inference gap (an explicit `<T>`
+  callback param fails identically); use a concrete numeric family there.
+- A `Number` nested inside a `<…>` GENERIC type ARGUMENT (`Iterator<Number>`) is still not lowered
+  to a bounded var (`resolve_type_with_number_in` recurses into structural forms — Array, Function,
+  Object — but defers a `<…>`-application's args to the standard resolver where `Number` is unknown).
+- **`Number` is a parameter/return CONSTRAINT, not a value type.** It only lowers to a bounded var in
+  a function signature; in a binding position (`val total: Number = 0`) it has no concrete
+  representation. `resolve.rs` special-cases this with a guidance error — *"`Number` is a parameter
+  constraint, not a value type; … annotate this binding with a concrete numeric family such as
+  `Int32` or `Float64`."* — rather than the misleading bare "Unknown type 'Number'". A binding has a
+  concrete initializer, so it already has a concrete family; name it.
 
 ## ADR-019: LLVM 22 via inkwell with dynamic linking
 
