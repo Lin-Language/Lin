@@ -21,23 +21,6 @@ fn arg_satisfies_numeric_bound(arg_ty: &Type) -> bool {
     }
 }
 
-/// True if `ty` mentions a numeric-bounded generic TypeVar (a `Number` resolved var). Used to gate
-/// the mixed-family-per-call diagnostic to functions whose RETURN flows from such a var.
-fn returns_numeric_bound(ty: &Type, numeric_tvs: &std::collections::HashSet<u32>) -> bool {
-    match ty {
-        Type::TypeVar(id) => numeric_tvs.contains(id),
-        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) => {
-            returns_numeric_bound(t, numeric_tvs)
-        }
-        Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(|t| returns_numeric_bound(t, numeric_tvs)),
-        Type::Object(fields) => fields.values().any(|t| returns_numeric_bound(t, numeric_tvs)),
-        Type::Function { params, ret, .. } => {
-            params.iter().any(|t| returns_numeric_bound(t, numeric_tvs)) || returns_numeric_bound(ret, numeric_tvs)
-        }
-        _ => false,
-    }
-}
-
 impl Checker {
     /// `fromJson` special form (ADR-047). `T.fromJson(value)` desugars to a DotCall and
     /// `fromJson(T, value)` to a Call; both reach here BEFORE arg0/receiver is inferred as a
@@ -451,31 +434,12 @@ impl Checker {
                     }
                 }
 
-                // First-cut limitation (ADR-018, reversed): when a `Number`-returning function mixes
-                // DISTINCT numeric-bounded params bound to DIFFERENT families IN ONE CALL (e.g.
-                // `(a:Number,b:Number)=>a+b` at `add(10, 2.5)`), the widened return cannot be
-                // expressed by the single-var monomorphization (each `Number` is its own var). Reject
-                // with a clear message rather than mis-lowering. Same-family-per-call is unaffected;
-                // for mixed families annotate the families explicitly or widen at the call site.
-                if returns_numeric_bound(ret, &self.numeric_tvs) {
-                    let mut fams = std::collections::HashSet::new();
-                    for (id, t) in &subs {
-                        if self.numeric_tvs.contains(id) && t.is_numeric() {
-                            fams.insert(format!("{}", t));
-                        }
-                    }
-                    if fams.len() > 1 {
-                        return Err(Diagnostic::error(
-                            span,
-                            "this call mixes different numeric families in a `Number`-returning function".to_string(),
-                        ).with_help(
-                            "each `Number` parameter is an independent numeric type; a call that combines \
-                             them must use a single family (e.g. `add(10, 2)` or `add(1.5, 2.5)`). Give \
-                             the parameters explicit families, or convert the arguments to one family."
-                                .to_string(),
-                        ));
-                    }
-                }
+                // Mixed numeric families in ONE call of a `Number`-returning function (e.g.
+                // `(a:Number,b:Number)=>a+b` at `add(10, 2.5)`) ARE supported (ADR-018, reversed):
+                // monomorphization specializes `add$Int32_Float64` and re-widens the arithmetic
+                // result to the same family the concrete `(a:Int32,b:Float64)` equivalent produces
+                // (Float64 here). No guard — the previous reject was a workaround for a codegen ABI
+                // mismatch (frozen-result-type) now fixed in `lin-ir::monomorphize`.
 
                 let concrete_ret = apply_type_subs(ret, &subs);
                 let required = *required;
