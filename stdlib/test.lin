@@ -1,5 +1,5 @@
 import { print } from "std/io"
-import { toString, join } from "std/string"
+import { toString, join, split } from "std/string"
 import { length } from "std/array"
 import { filter, for, map } from "std/iter"
 import { exit } from "std/io"
@@ -96,13 +96,32 @@ export val toFailWith = (asserter: Json, message: String): Assertion =>
   else
     _fail("expected failure with \"${message}\", got: ${toString(value)}")
 
+// Is this test selected to run? When the `LIN_TEST_ONLY` env var is set (by `lin test
+// --filter-test`), it holds the newline-separated set of test names to run; a test whose name
+// isn't in that set is skipped. When the var is unset, every test is selected (the default).
+val _isSelected = (name: String): Boolean =>
+  val only = getEnv("LIN_TEST_ONLY")
+  if only == null then
+    true
+  else
+    val wanted = split(only, "\n").filter(n => n == name)
+    length(wanted) > 0
+
 // A test eagerly runs the body and stores the result alongside the name. The body must return
 // an `Assertion[]` (use the `[ expect(...).toBe(...), ... ]` form, even for a single assertion);
 // every assertion in the array is evaluated and a test fails if any one of them fails.
+//
+// When `--filter-test` selected a subset (via LIN_TEST_ONLY), a non-selected test SHORT-CIRCUITS
+// here: its body is NOT evaluated (so no side effects, no fixture setup/teardown when called via
+// `withFixture`) and it produces a `{ "type": "skip" }` sentinel that `report` counts as neither
+// pass nor fail and emits no record for.
 export val test = (name: String, body: () => Assertion[]): Json =>
-  val timer = startTimer()
-  val results = body()
-  _evalResult(name, results, elapsed(timer))
+  if _isSelected(name) then
+    val timer = startTimer()
+    val results = body()
+    _evalResult(name, results, elapsed(timer))
+  else
+    { "type": "skip", "name": name }
 
 // `withFixture` is the per-test setup/teardown + dependency-injection combinator (ADR-071):
 // it builds a fixture, injects it into the body, and tears it down — all within a single
@@ -128,7 +147,9 @@ export val suite = (name: String, tests: Json[]): Json =>
 // are interpolated raw. Failure messages (which themselves contain `expected:…\nactual:…`
 // newlines) are joined with `\n` and handed to `toJsonString` for escaping.
 val _reportJsonResult = (r: Json): Null =>
-  if r["type"] == "pass" then
+  if r["type"] == "skip" then
+    null
+  else if r["type"] == "pass" then
     print(
       "##LINTEST## {\"event\":\"test\",\"name\":${toJsonString(r["name"])},\"status\":\"pass\",\"ms\":${toString(r["ms"])}}"
     )
@@ -148,14 +169,20 @@ val _reportJsonResult = (r: Json): Null =>
 // / summary line are suppressed; instead one NDJSON record is emitted per test (consumed by
 // `lin test --reporter json`). The return value (failCount) and `run`'s exit-code behaviour are
 // identical in both modes — the exit code is how the CLI determines file-level pass/fail.
+// Skipped tests (from `--filter-test`) are excluded from BOTH pass and fail counts and never
+// emit a record: the consumer only asked for the selected tests, so silence for the rest is
+// correct. `failCount` (the return value and the basis for `run`'s exit code) therefore reflects
+// only real failures.
 export val report = (s: Json): Int32 =>
   val failed = s["tests"].filter(r => r["type"] == "fail")
-  val passCount = length(s["tests"]) - length(failed)
+  val skipped = s["tests"].filter(r => r["type"] == "skip")
+  val passCount = length(s["tests"]) - length(failed) - length(skipped)
   val failCount = length(failed)
   if getEnv("LIN_TEST_JSON") != null then
     s["tests"].for(r => _reportJsonResult(r))
   else
-    _printSuiteResults({ "name": s["name"], "results": s["tests"] })
+    val shown = s["tests"].filter(r => r["type"] != "skip")
+    _printSuiteResults({ "name": s["name"], "results": shown })
     if failCount == 0 then
       print("${toString(passCount)} passed")
     else

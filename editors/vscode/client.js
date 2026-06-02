@@ -244,6 +244,37 @@ function collectTargetFiles(controller, request) {
   return [...files];
 }
 
+// Build the `lin test` argument vector for a run/coverage request. Whole-project runs (no
+// include) pass the workspace root so the CLI also discovers files we never enumerated. When
+// the request targets INDIVIDUAL test items (gutter arrow on a single test), we additionally
+// pass `--filter-test "<name>"` per selected child so the CLI runs only those tests, not the
+// whole file. File-level selections (and a child mixed with its own file) run the whole file.
+function buildTestArgs(request, targetFiles, wsRoot) {
+  const wholeProject = !(request.include && request.include.length > 0);
+  const args = ["test"];
+  if (wholeProject && wsRoot) {
+    args.push(wsRoot);
+  } else {
+    args.push(...targetFiles);
+  }
+  args.push("--reporter", "json");
+
+  if (!wholeProject) {
+    // Files explicitly included as whole files — don't narrow those by name.
+    const wholeFiles = new Set();
+    for (const it of request.include) {
+      if (!it.parent) wholeFiles.add(it.uri.fsPath);
+    }
+    // Child test items whose file isn't being run wholesale → filter by name.
+    for (const it of request.include) {
+      if (it.parent && !wholeFiles.has(it.parent.uri.fsPath)) {
+        args.push("--filter-test", it.label);
+      }
+    }
+  }
+  return args;
+}
+
 // Find the TestItem for a `<file>::<name>` pair, creating it under the file item
 // if it wasn't statically discovered (e.g. an interpolated/dynamic test name).
 function findOrCreateTestItem(controller, file, name) {
@@ -323,14 +354,7 @@ function setupTestController(context, linBin) {
     const wsRoot = workspace.workspaceFolders && workspace.workspaceFolders[0]
       ? workspace.workspaceFolders[0].uri.fsPath
       : undefined;
-    const wholeProject = !(request.include && request.include.length > 0);
-    const args = ["test"];
-    if (wholeProject && wsRoot) {
-      args.push(wsRoot);
-    } else {
-      args.push(...targetFiles);
-    }
-    args.push("--reporter", "json");
+    const args = buildTestArgs(request, targetFiles, wsRoot);
 
     let child;
     try {

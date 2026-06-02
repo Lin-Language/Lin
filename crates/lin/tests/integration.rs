@@ -9755,3 +9755,32 @@ fn test_json_reporter_ndjson_contract() {
     let has_file_fail = records.iter().any(|r| r["event"] == "file" && r["status"] == "fail");
     assert!(has_file_fail, "expected a file record with status fail; got:\n{:?}", records);
 }
+
+#[test]
+fn test_json_reporter_filter_test() {
+    let fixture = write_test_fixture(TWO_TEST_FIXTURE);
+    // Select ONLY the passing test by exact name. The unselected "failing test" must be
+    // skipped (no record) AND must not cause a non-zero exit.
+    let (success, lines) = run_test_json(&fixture, &["--filter-test", "passing test"]);
+    let _ = fs::remove_file(&fixture);
+
+    let records: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("invalid JSON line {:?}: {}", l, e)))
+        .collect();
+
+    // The selected test's record appears.
+    let test_recs: Vec<&serde_json::Value> = records.iter().filter(|r| r["event"] == "test").collect();
+    assert_eq!(test_recs.len(), 1, "exactly one test record expected; got:\n{:?}", records);
+    assert_eq!(test_recs[0]["name"], "passing test");
+    assert_eq!(test_recs[0]["status"], "pass");
+
+    // The unselected (deliberately failing) test produced NO record...
+    let has_failing = records.iter().any(|r| r["event"] == "test" && r["name"] == "failing test");
+    assert!(!has_failing, "unselected test must not emit a record; got:\n{:?}", records);
+
+    // ...and skipping it means the run does NOT fail.
+    assert!(success, "filtered run with only a passing test must exit zero");
+    let file_rec = records.iter().find(|r| r["event"] == "file").expect("expected a file record");
+    assert_eq!(file_rec["status"], "pass", "file status should be pass when the only failing test is skipped");
+}

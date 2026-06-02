@@ -145,6 +145,7 @@ fn execute_command(args: &WatchArgs) {
                 format: super::test::CoverageFormat::Console,
                 output: None,
                 reporter: super::test::Reporter::Human,
+                filter_test: Vec::new(),
             });
         }
     }
