@@ -26,3 +26,11 @@ import foreign "lin-runtime"
 // Used by std/test to emit machine-readable NDJSON test records.
 export val toJsonString = (s: String): String =>
   lin_json_escape(s)
+
+// Recursively serialize ANY Lin value to a strict, valid JSON string. Strings (and object
+// keys) are escaped+quoted, numbers/bools/null become JSON literals (non-finite floats →
+// `null`, matching JSON.stringify), arrays and objects recurse arbitrarily deep. `lin_to_json`
+// is a compiler intrinsic (it walks the runtime tagged value), so the body below is the
+// surface wrapper the checker dispatches at the call site.
+export val toJson = (value: Json): String =>
+  lin_to_json(value)

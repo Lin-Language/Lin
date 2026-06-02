@@ -331,11 +331,11 @@ pub unsafe extern "C" fn lin_string_trim_end(s: *const LinString) -> *mut LinStr
     lin_string_from_bytes(trimmed.as_ptr(), trimmed.len() as u32)
 }
 
-/// Escape a string and wrap it in double quotes, producing a valid JSON string literal.
-#[no_mangle]
-pub unsafe extern "C" fn lin_json_escape(s: *const LinString) -> *mut LinString {
-    let st = (*s).as_str();
-    let mut out = String::with_capacity(st.len() + 2);
+/// Append the JSON-escaped, double-quoted representation of `st` to `out`.
+/// Single source of truth for JSON string escaping, shared by `lin_json_escape` (the
+/// string-only entry point used by std/test) and `lin_to_json` (the recursive value
+/// serializer) so the two can never drift. Produces a valid JSON string literal.
+fn push_json_escaped(out: &mut String, st: &str) {
     out.push('"');
     for c in st.chars() {
         match c {
@@ -349,6 +349,14 @@ pub unsafe extern "C" fn lin_json_escape(s: *const LinString) -> *mut LinString 
         }
     }
     out.push('"');
+}
+
+/// Escape a string and wrap it in double quotes, producing a valid JSON string literal.
+#[no_mangle]
+pub unsafe extern "C" fn lin_json_escape(s: *const LinString) -> *mut LinString {
+    let st = (*s).as_str();
+    let mut out = String::with_capacity(st.len() + 2);
+    push_json_escaped(&mut out, st);
     lin_string_from_bytes(out.as_ptr(), out.len() as u32)
 }
 
@@ -805,4 +813,136 @@ pub unsafe extern "C" fn lin_tagged_to_string(tagged: *const TaggedVal) -> *mut 
     } else {
         lin_string_from_bytes(b"[object]".as_ptr(), 8)
     }
+}
+
+/// Recursively serialize a TaggedVal to STRICT, valid JSON, appending to `out`.
+///
+/// Differs from `tagged_to_json_string` (the lossy display stringifier above) in two ways
+/// required for valid JSON: string VALUES and object KEYS are escaped via the same
+/// `push_json_escaped` helper that backs `lin_json_escape`, and non-finite floats
+/// (NaN/±Inf, which are not representable in JSON) are emitted as `null` — matching
+/// JavaScript's `JSON.stringify`. This is a READ-ONLY walk: it borrows the value and never
+/// retains/releases or frees anything.
+unsafe fn push_json_value(out: &mut String, tagged: *const TaggedVal) {
+    use crate::tagged::*;
+    if tagged.is_null() {
+        out.push_str("null");
+        return;
+    }
+    let tag = (*tagged).tag;
+    let payload = (*tagged).payload;
+    match tag {
+        TAG_NULL => out.push_str("null"),
+        TAG_BOOL => out.push_str(if payload != 0 { "true" } else { "false" }),
+        TAG_INT32 => out.push_str(&(payload as i32).to_string()),
+        TAG_INT64 => out.push_str(&(payload as i64).to_string()),
+        TAG_UINT64 => out.push_str(&payload.to_string()),
+        TAG_FLOAT32 => push_json_float(out, f32::from_bits(payload as u32) as f64),
+        TAG_FLOAT64 => push_json_float(out, f64::from_bits(payload)),
+        TAG_STR => {
+            let s = payload as *const LinString;
+            if s.is_null() {
+                out.push_str("null");
+            } else {
+                push_json_escaped(out, (*s).as_str());
+            }
+        }
+        TAG_ARRAY => {
+            let arr = payload as *const crate::array::LinArray;
+            push_json_array(out, arr);
+        }
+        TAG_OBJECT => {
+            let obj = payload as *const crate::object::LinObject;
+            push_json_object(out, obj);
+        }
+        // Functions/iterators and any unknown tag are not JSON values → null.
+        _ => out.push_str("null"),
+    }
+}
+
+/// Emit a finite float as a JSON number; non-finite (NaN/Inf) becomes `null` (matches
+/// JSON.stringify, since JSON has no representation for them).
+fn push_json_float(out: &mut String, f: f64) {
+    if !f.is_finite() {
+        out.push_str("null");
+    } else if f.fract() == 0.0 && f.abs() < 1e15 {
+        out.push_str(&format!("{:.1}", f));
+    } else {
+        out.push_str(&format!("{}", f));
+    }
+}
+
+unsafe fn push_json_array(out: &mut String, arr: *const crate::array::LinArray) {
+    use crate::tagged::*;
+    if arr.is_null() {
+        out.push_str("[]");
+        return;
+    }
+    let len = (*arr).len as usize;
+    let elem_tag = (*arr).elem_tag;
+    out.push('[');
+    for i in 0..len {
+        if i > 0 {
+            out.push(',');
+        }
+        match elem_tag {
+            0xFF => {
+                // Tagged array: elements are TaggedVal structs.
+                let elem = (*arr).data.add(i) as *const TaggedVal;
+                push_json_value(out, elem);
+            }
+            TAG_INT32 => out.push_str(&(*((*arr).data as *const i32).add(i)).to_string()),
+            TAG_INT64 => out.push_str(&(*((*arr).data as *const i64).add(i)).to_string()),
+            TAG_FLOAT32 => push_json_float(out, *((*arr).data as *const f32).add(i) as f64),
+            TAG_FLOAT64 => push_json_float(out, *((*arr).data as *const f64).add(i)),
+            TAG_BOOL => out.push_str(if *((*arr).data as *const u8).add(i) != 0 { "true" } else { "false" }),
+            TAG_UINT8 => out.push_str(&(*((*arr).data as *const u8).add(i)).to_string()),
+            TAG_INT8 => out.push_str(&(*((*arr).data as *const i8).add(i)).to_string()),
+            TAG_UINT16 => out.push_str(&(*((*arr).data as *const u16).add(i)).to_string()),
+            TAG_INT16 => out.push_str(&(*((*arr).data as *const i16).add(i)).to_string()),
+            TAG_UINT32 => out.push_str(&(*((*arr).data as *const u32).add(i)).to_string()),
+            TAG_UINT64 => out.push_str(&(*((*arr).data as *const u64).add(i)).to_string()),
+            _ => out.push_str("null"),
+        }
+    }
+    out.push(']');
+}
+
+unsafe fn push_json_object(out: &mut String, obj: *const crate::object::LinObject) {
+    if obj.is_null() {
+        out.push_str("{}");
+        return;
+    }
+    let len = (*obj).len as usize;
+    out.push('{');
+    for i in 0..len {
+        if i > 0 {
+            out.push(',');
+        }
+        let entry = (*obj).entries.add(i);
+        let key = (*entry).key;
+        // Keys are escaped+quoted exactly like string values (the lossy stringifier above
+        // leaves them unescaped — strict JSON requires escaping).
+        if key.is_null() {
+            out.push_str("\"\"");
+        } else {
+            push_json_escaped(out, (*key).as_str());
+        }
+        out.push(':');
+        push_json_value(out, &(*entry).value as *const TaggedVal);
+    }
+    out.push('}');
+}
+
+/// Serialize ANY Lin value (passed as a boxed TaggedVal*) to a strict, valid JSON string.
+///
+/// OWNERSHIP: this BORROWS `tagged` (a read-only walk) and returns a freshly-allocated OWNED
+/// (+1) LinString the caller must release. It never retains/releases the input and never frees
+/// anything it did not allocate — so, unlike `lin_tagged_to_string`'s TAG_STR fast path, there
+/// is no aliasing of the input string and thus no double-free risk on the input.
+#[no_mangle]
+pub unsafe extern "C" fn lin_to_json(tagged: *const TaggedVal) -> *mut LinString {
+    let mut out = String::new();
+    push_json_value(&mut out, tagged);
+    lin_string_from_bytes(out.as_ptr(), out.len() as u32)
 }

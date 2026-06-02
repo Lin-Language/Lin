@@ -813,6 +813,28 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.call(vk_fn, &[tagged.into()], "ir_vkey").try_as_basic_value().unwrap_basic()
                 } else { ptr_ty.const_null().into() }
             }
+            // lin_to_json(val) => String. The arg is declared Json, so it may already be a boxed
+            // TaggedVal* (union/Json) or a concrete value needing boxing. Box if concrete, then
+            // call the read-only recursive serializer. lin_to_json BORROWS its input (no RC
+            // balancing needed) and returns a fresh owned String.
+            Intrinsic::ToJson => {
+                if let Some(&v) = args.first() {
+                    let arg_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
+                    // Json/union/TypeVar values are already boxed TaggedVal* — pass through;
+                    // a concrete value (Int, Str, Array, Object, …) needs boxing first.
+                    let already_boxed = (Self::is_union_type(&arg_ty)
+                        || matches!(arg_ty, Type::TypeVar(_)))
+                        && v.is_pointer_value();
+                    let tagged = if already_boxed {
+                        v
+                    } else {
+                        self.box_value(v, &arg_ty)
+                    };
+                    let tj_fn = self.get_or_declare_fn("lin_to_json",
+                        ptr_ty.fn_type(&[ptr_ty.into()], false));
+                    self.builder.call(tj_fn, &[tagged.into()], "ir_tojson").try_as_basic_value().unwrap_basic()
+                } else { ptr_ty.const_null().into() }
+            }
             // lin_array_allocate(n) => T[]. When the result element type is a CONCRETE scalar
             // (e.g. a monomorphized `Int32[]`), allocate a FLAT array so the producer's
             // representation matches the concrete-typed reader (which already reads flat via
