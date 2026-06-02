@@ -94,7 +94,7 @@ project/
 import { toUpper, trim } from "std/string"
 
 export val shout = (s: String): String =>
-  trim(s).toUpper()
+  s.trim().toUpper()
 ```
 
 `main.lin`:

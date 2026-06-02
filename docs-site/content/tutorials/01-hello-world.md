@@ -92,7 +92,7 @@ import { length } from "std/array"
 import { for } from "std/iter"
 
 val arguments = args()
-print("got ${length(arguments)} arguments")
+print("got ${arguments.length()} arguments")
 arguments.for(a => print("  ${a}"))
 ```
 

@@ -44,7 +44,7 @@ val total = [1, 2, 3, 4].reduce(0, (sum, x) => sum + x)
 // 10
 
 val longest = ["cat", "elephant", "dog"].reduce("", (acc, word) =>
-  if length(word) > length(acc) then word else acc
+  if word.length() > acc.length() then word else acc
 )
 // "elephant"
 ```

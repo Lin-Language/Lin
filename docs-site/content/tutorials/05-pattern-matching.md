@@ -119,7 +119,7 @@ val process = (input: String | Int32 | Null): String =>
   match input
     is Null   => "nothing"
     is Int32  => "number times two: ${input * 2}"   // input is Int32 here
-    is String => "length: ${length(input)}"          // input is String here
+    is String => "length: ${input.length()}"         // input is String here
 ```
 
 ## Nested patterns
