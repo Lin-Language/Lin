@@ -34,7 +34,7 @@ const MARKER: &str = "##LINTEST## ";
 /// The NDJSON schema version emitted as the first `meta` record. Bump when the record shapes
 /// change incompatibly so consumers (the VSCode extension) can detect a mismatch. The extension
 /// defines its own `SUPPORTED_SCHEMA` and warns when it sees a newer one.
-const NDJSON_SCHEMA: u32 = 1;
+const NDJSON_SCHEMA: u32 = 2;
 
 #[derive(Serialize)]
 #[serde(tag = "event")]
@@ -67,6 +67,11 @@ enum JsonRecord {
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
+    // Free-form stdout the test binary produced that ISN'T a `##LINTEST##` runner record —
+    // i.e. the user's own `print(...)` output. Accumulated per file into one blob (newline-joined)
+    // so the VSCode extension can surface it in the Test Results output tab. Schema v2.
+    #[serde(rename = "output")]
+    Output { file: String, text: String },
 }
 
 fn emit_record(rec: &JsonRecord) {
@@ -363,8 +368,15 @@ fn emit_json_for_result(result: &TestResult, lock: &Arc<Mutex<()>>) {
     let _guard = lock.lock().unwrap();
     let file = result.path.display().to_string();
 
+    // Collect the user's own stdout (every non-marker line) so it can be forwarded as an
+    // `output` record. Runner records (`##LINTEST## ...`) are handled separately below.
+    let mut user_output: Vec<&str> = Vec::new();
+
     for line in result.stdout.lines() {
-        let Some(rest) = line.strip_prefix(MARKER) else { continue };
+        let Some(rest) = line.strip_prefix(MARKER) else {
+            user_output.push(line);
+            continue;
+        };
         // Parse the runner's record, then rebuild a canonical one with the file attached.
         let Ok(val) = serde_json::from_str::<serde_json::Value>(rest) else { continue };
         let name = val.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -385,6 +397,15 @@ fn emit_json_for_result(result: &TestResult, lock: &Arc<Mutex<()>>) {
             expected,
             actual,
             duration_ms,
+        });
+    }
+
+    // Forward the user's `print(...)` output (if any) as one `output` record, emitted before the
+    // file-summary record. Skip when empty so consumers don't get noise.
+    if !user_output.is_empty() {
+        emit_record(&JsonRecord::Output {
+            file: file.clone(),
+            text: user_output.join("\n"),
         });
     }
 
