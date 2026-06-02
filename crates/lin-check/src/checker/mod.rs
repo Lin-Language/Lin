@@ -3,7 +3,6 @@ use lin_parse::ast::{Expr, Module, Stmt};
 
 use crate::compat::is_compatible_env;
 use crate::env::TypeEnv;
-use crate::resolve::resolve_type;
 use crate::typed_ir::*;
 use crate::types::Type;
 
@@ -68,6 +67,14 @@ pub struct Checker {
     generic_fn_params: std::collections::HashMap<String, Vec<(String, u32)>>,
     /// Next free quantified-generic TypeVar id (≥9000, above the intrinsic slot 9000).
     next_generic_tv: u32,
+    /// Quantified-generic TypeVar ids carrying a NUMERIC bound (ADR-018, reversed). A `Number`
+    /// parameter annotation resolves to a FRESH constrained generic TypeVar in this set: arithmetic
+    /// is permitted on it (the bound guarantees a numeric family), and at each call site the binding
+    /// concrete type must satisfy the bound (a `String`/`Bool`/… argument is rejected). Each `Number`
+    /// occurrence mints its own id, so `(a: Number, b: Number)` lets `a`/`b` specialize independently.
+    /// Monomorphization (`lin-ir`) then produces a native unboxed copy per concrete family — zero
+    /// runtime cost, matching `Int32`. See `resolve_param_type` and the call-site bound check.
+    pub(crate) numeric_tvs: std::collections::HashSet<u32>,
     /// Phase 4.5b: element-type hint for an INTERMEDIATE `val <name> = lin_array_allocate(..)`
     /// binding inside a combinator whose declared return is `Array(elem)`. When the active value
     /// binding's name matches `.0` and its RHS is a fresh `lin_array_allocate` call, `check_stmt`
@@ -113,6 +120,7 @@ impl Checker {
             // Start above the intrinsic generic slot (9000) so quantified generics never
             // collide with `lin_map`/`lin_iter` et al.
             next_generic_tv: 9001,
+            numeric_tvs: std::collections::HashSet::new(),
             array_alloc_elem_hint: None,
             import_origins: std::collections::HashMap::new(),
             replacements: Vec::new(),
@@ -298,19 +306,32 @@ impl Checker {
                             self.generic_fn_params.insert(name.clone(), param_assign);
                         }
 
-                        let param_types: Vec<Type> = params
-                            .iter()
-                            .map(|p| {
-                                p.type_ann
-                                    .as_ref()
-                                    .and_then(|t| resolve_type(t, &env_for_resolve).ok())
-                                    .unwrap_or(Type::TypeVar(self.env.next_slot() as u32))
-                            })
-                            .collect();
-                        let ret_type = return_type
-                            .as_ref()
-                            .and_then(|t| resolve_type(t, &env_for_resolve).ok())
-                            .unwrap_or(Type::TypeVar(self.env.next_slot() as u32));
+                        // Resolve param/return annotations with `Number` support (ADR-018,
+                        // reversed): each `Number` becomes a fresh numerically-constrained generic
+                        // TypeVar recorded in `numeric_tvs`. The forward-declared signature drives
+                        // call-site inference + the numeric-bound check, so the ids minted here are
+                        // the ones a call site binds and validates (the body mints its own, used by
+                        // monomorphization — both are ≥9001 generics, neither is globally solved).
+                        let mut param_types: Vec<Type> = Vec::with_capacity(params.len());
+                        for p in params {
+                            let ty = match &p.type_ann {
+                                Some(t) => self
+                                    .resolve_type_with_number_in(t, &env_for_resolve)
+                                    .unwrap_or(Type::TypeVar(self.env.next_slot() as u32)),
+                                None => Type::TypeVar(self.env.next_slot() as u32),
+                            };
+                            param_types.push(ty);
+                        }
+                        // A bare `Number` RETURN is treated as un-annotated in the signature (the
+                        // body determines it — see `infer_function`). Using a fresh inference var
+                        // here keeps the forward signature from minting an un-inferrable bound var;
+                        // the slot's type is replaced by the body-inferred signature after checking.
+                        let ret_type = match return_type {
+                            Some(t) if !Self::is_bare_number(t) => self
+                                .resolve_type_with_number_in(t, &env_for_resolve)
+                                .unwrap_or(Type::TypeVar(self.env.next_slot() as u32)),
+                            _ => Type::TypeVar(self.env.next_slot() as u32),
+                        };
                         let required = params.iter().filter(|p| p.default.is_none()).count();
                         let fn_type = Type::Function {
                             params: param_types,

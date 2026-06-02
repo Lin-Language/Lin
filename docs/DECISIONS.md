@@ -133,13 +133,57 @@ val myFunc = () =>
 
 **Consequence**: `import { x } from "lib/math"` in `examples/main.lin` loads `examples/lib/math.lin`. Absolute paths and `..` traversal work naturally via the filesystem.
 
-## ADR-018: `Number` as a built-in union alias
+## ADR-018: `Number` as a numerically-bounded generic parameter (REVERSED — was: union alias)
 
-**Decision**: Add `Number` to the built-in types as a union alias for every numeric family (`Int8 | … | Float64`), and use it in the definition of `Json`. `Number` does not introduce a new runtime kind, a new subtype relation, or any new narrowing rule — it is exactly the union it expands to.
+**Status**: REVERSED. The original decision (modelling `Number` as the union `Int8 | … | Float64`,
+and as a runtime tagged value when used as a parameter type) is superseded. `Number` is now a
+**numerically-bounded, monomorphized generic type parameter** with **zero runtime cost**.
 
-**Rationale**: Without a name for "any numeric," the `Json` type has to enumerate all sixteen numeric families to be accurate, and signatures that accept any numeric have no concise spelling. A true supertype with subtype assignability would introduce a third kind of type relation alongside structural typing and unions, and would force decisions about `is Number` narrowing, arithmetic on a `Number`-typed operand, and how widening (§21) interacts with the supertype. A union alias avoids all of that: `is Int32`, widening, and operator dispatch keep working exactly as they did, because under the hood there is still only a concrete numeric family at every site.
+**Decision**: A parameter (or return) annotated `Number` is sugar for an implicit, numerically-constrained
+type variable — conceptually `<T: numeric>(x: T)`. Each occurrence mints its OWN fresh bounded
+type-var (so `(a: Number, b: Number)` lets `a` and `b` specialize to different families
+independently). The function body type-checks because the bound guarantees a numeric family, so
+arithmetic on a `Number`-typed operand is permitted; the operator's result type IS the bounded var,
+so it flows through. At each call site the concrete family flows in from the argument, and Lin's
+existing single-module **monomorphization** (`crates/lin-ir/src/monomorphize.rs`) materializes a
+specialized copy (`isEven$Int32`, `isEven$Float64`) compiled to native unboxed ops. A non-numeric
+argument (`String`/`Bool`/`Object`/array) is rejected at the call site with
+"expected a numeric type (Number)".
 
-**Consequence**: Spec-only change in v0 (no type checker exists yet — `Number` already parses as a `TypeExpr::Named`). The future type checker treats `Number` as a union alias when resolving assignability and exhaustiveness. Runtime is unchanged: §28.4 still says every numeric value carries its specific family tag and there is no single `Number` representation.
+**Rationale**: We measured the boxed-union representation at ~3.6× slower than concrete `Int32`
+(every op a tagged `lin_tagged_arith` over heap-boxed operands). The bounded-generic model is the
+Rust/Swift approach: the *compile-time guarantee* ("this is a number") is decoupled from the
+*runtime representation* (always a concrete family at each specialization). It reuses the
+monomorphization machinery that already specializes `<T>` functions, so it adds a constraint table
+and a call-site bound check rather than a new type relation or a new runtime kind. We verified the
+emitted LLVM: `isEven$Float64` is a bare `frem`+`fcmp`, `isEven$Int32` a bare `srem`+`icmp` — no
+`lin_tagged_arith`, no `lin_box_*`/`lin_unbox_*` per op. A 50M-iteration benchmark with a statically
+concrete loop variable runs at **1.0×** of the hand-annotated `Int32` version (2.70s vs 2.72s).
+
+**Implementation**: `lin-check` carries a `numeric_tvs: HashSet<u32>` constraint table on the
+`Checker`. `resolve_type_with_number[_in]` (in `checker/function.rs`) lowers each `Number`
+parameter occurrence — including nested forms like `Number[]` and `(Number) => Number` — to a fresh
+quantified generic TypeVar (≥9001) recorded in that table; `forward_declare_functions` and both
+`infer_function`/`infer_function_with_hints` use it so the call-driving signature and the body
+agree. `infer_binary_op` (`checker/ops.rs`) makes a bounded-var operand drive the result type so it
+survives substitution. The call-site numeric bound is enforced in `checker/call.rs` (both the direct
+and dot-call paths). `lin-codegen/src/codegen/arith.rs` widens a mixed int/float `Mod` (so a
+`Number`→Float64 specialization lowers `x % 2` to `frem`). A bare `Number` RETURN is special-cased:
+it can't be pinned from arguments, so the body's (numeric, bound-guaranteed) type is surfaced as the
+function's return and the body is checked numeric.
+
+**Consequence / limitations** (first cut):
+- **Dynamic numerics use `Json`, not `Number`.** A `Json` (statically-unknown) value cannot be
+  proven numeric and cannot monomorphize to a native op, so passing one to a `Number` parameter is a
+  compile error (decode it to a family first, e.g. `Int32.fromJson(v)`). We deliberately do NOT fall
+  back to a silent boxed slow path under a `Number` annotation.
+- **Mixed families in ONE call of a `Number`-returning function** (e.g.
+  `(a: Number, b: Number) => a + b` at `add(10, 2.5)`) is rejected with a clear message: each
+  `Number` is an independent var, so the widened return isn't expressible by single-var
+  monomorphization. Same-family-per-call (distinct calls at distinct families) is fully supported.
+- `Number` is no longer part of the structural definition of `Json` (it never resolved to a union).
+- A `Number` nested inside a generic type ARGUMENT (`Iterator<Number>`) is not lowered to a bounded
+  var (documented edge; resolves via the standard resolver where `Number` is still unknown).
 
 ## ADR-019: LLVM 22 via inkwell with dynamic linking
 

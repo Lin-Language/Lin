@@ -74,6 +74,14 @@ impl Checker {
         let left_ty = typed_left.ty();
         let right_ty = typed_right.ty();
 
+        // A `Number`-bounded generic TypeVar operand (ADR-018, reversed) drives an arithmetic op's
+        // result type so it FLOWS THROUGH monomorphization: `x % 2` where `x: <T:numeric>` must yield
+        // `T`, not the literal's Int32 — so the `$Float64` specialization lowers the op to a native
+        // `frem`. The OTHER (literal) operand stays its own type; codegen widens an `Int32` literal
+        // to the float family at the op (mixed int/float arith, incl. Mod). Comparisons yield Bool.
+        let left_num_tv = matches!(left_ty, Type::TypeVar(id) if self.numeric_tvs.contains(&id));
+        let right_num_tv = matches!(right_ty, Type::TypeVar(id) if self.numeric_tvs.contains(&id));
+
         let result_type = match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                 let left_is_any = matches!(left_ty, Type::TypeVar(_));
@@ -83,6 +91,8 @@ impl Checker {
                         span,
                         "String concatenation with + is not supported; use interpolation: \"${a}${b}\"".to_string(),
                     ));
+                } else if left_num_tv || right_num_tv {
+                    if left_num_tv { left_ty.clone() } else { right_ty.clone() }
                 } else if left_ty.is_numeric() && right_ty.is_numeric() {
                     widen_numeric(&left_ty, &right_ty).unwrap_or(Type::Int32)
                 } else if left_is_any || right_is_any {

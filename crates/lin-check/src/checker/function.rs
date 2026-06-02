@@ -133,6 +133,79 @@ impl Checker {
         None
     }
 
+    /// Resolve a parameter/return type annotation, lowering every `Number` occurrence to a FRESH
+    /// numerically-constrained quantified generic TypeVar (ADR-018, reversed). `Number` is sugar for
+    /// an implicit `<T: numeric>`: the body type-checks because the bound guarantees a numeric family
+    /// (arithmetic on the var is permitted in `infer_binary_op`), and monomorphization specializes the
+    /// var per call site to the concrete family — native unboxed ops, zero runtime cost. Each `Number`
+    /// (even nested, e.g. `Number[]` or `(Number) => Number`) mints its OWN id, so independent numeric
+    /// params don't get tied together. A non-`Number` annotation resolves exactly as before.
+    /// True for an annotation that is exactly the bare name `Number`. A `Number` RETURN annotation
+    /// is special-cased (ADR-018, reversed): unlike a `Number` PARAMETER (which mints a fresh bound
+    /// var the call site pins from the argument), a `Number` return can't be pinned from arguments,
+    /// so it would be an un-inferrable free var. Instead the function's actual return is taken from
+    /// the BODY's (already numeric, bound-guaranteed) type, and we only check the body is numeric.
+    pub(crate) fn is_bare_number(type_ann: &lin_parse::ast::TypeExpr) -> bool {
+        matches!(type_ann, lin_parse::ast::TypeExpr::Named(n, _) if n == "Number")
+    }
+
+    pub(crate) fn resolve_type_with_number(
+        &mut self,
+        type_ann: &lin_parse::ast::TypeExpr,
+    ) -> Result<Type, String> {
+        let env = self.env.clone();
+        self.resolve_type_with_number_in(type_ann, &env)
+    }
+
+    /// As `resolve_type_with_number`, but resolves non-`Number` names against an explicitly supplied
+    /// `env` (used by `forward_declare_functions`, whose scratch env binds the function's `<T>` type
+    /// params). The numeric-bound mint still threads through `self` so the constraint table and id
+    /// counter stay shared.
+    pub(crate) fn resolve_type_with_number_in(
+        &mut self,
+        type_ann: &lin_parse::ast::TypeExpr,
+        env: &crate::env::TypeEnv,
+    ) -> Result<Type, String> {
+        use lin_parse::ast::TypeExpr;
+        match type_ann {
+            TypeExpr::Named(name, _) if name == "Number" => {
+                let id = self.next_generic_tv;
+                self.next_generic_tv += 1;
+                self.numeric_tvs.insert(id);
+                Ok(Type::TypeVar(id))
+            }
+            TypeExpr::Array(inner, _) => {
+                Ok(Type::Array(Box::new(self.resolve_type_with_number_in(inner, env)?)))
+            }
+            TypeExpr::FixedArray(types, _) => Ok(Type::FixedArray(
+                types.iter().map(|t| self.resolve_type_with_number_in(t, env)).collect::<Result<_, _>>()?,
+            )),
+            TypeExpr::Union(types, _) | TypeExpr::TaggedUnion(types, _) => {
+                let resolved: Result<Vec<Type>, String> =
+                    types.iter().map(|t| self.resolve_type_with_number_in(t, env)).collect();
+                Ok(Type::flatten_union(resolved?))
+            }
+            TypeExpr::Function(params, ret, _) => {
+                let param_types: Result<Vec<Type>, String> =
+                    params.iter().map(|p| self.resolve_type_with_number_in(p, env)).collect();
+                let ret_type = self.resolve_type_with_number_in(ret, env)?;
+                Ok(Type::func(param_types?, ret_type))
+            }
+            TypeExpr::Object(fields, _) => {
+                let mut resolved = indexmap::IndexMap::new();
+                for (key, te) in fields {
+                    resolved.insert(key.clone(), self.resolve_type_with_number_in(te, env)?);
+                }
+                Ok(Type::Object(resolved))
+            }
+            // Generic constructors (`Iterator<Number>`, alias applications, …) and all other leaves
+            // resolve through the standard path. A `Number` nested inside a generic type ARGUMENT is
+            // not lowered to a constrained var here (a documented first-cut limitation); it would
+            // resolve via the standard resolver where `Number` is still unknown.
+            _ => resolve_type(type_ann, env),
+        }
+    }
+
     pub(crate) fn infer_function(
         &mut self,
         type_params: &[String],
@@ -166,7 +239,7 @@ impl Checker {
 
         for (i, param) in params.iter().enumerate() {
             let ty = if let Some(ref type_ann) = param.type_ann {
-                resolve_type(type_ann, &self.env).map_err(|e| Diagnostic::error(span, e))?
+                self.resolve_type_with_number(type_ann).map_err(|e| Diagnostic::error(span, e))?
             } else {
                 self.env.fresh_type_var()
             };
@@ -250,9 +323,14 @@ impl Checker {
         // Resolve the declared return type up front so the body can be CHECKED against it
         // (bidirectional), pushing the expected type into the body. Needed for singleton
         // string-literal refinement (ADR-051) — see infer_function_with_hints for the rationale.
+        // A bare `Number` RETURN is treated as un-annotated (the body's numeric type flows through);
+        // we record `number_return` so the post-check can require the body to be numeric.
+        let number_return = return_type.as_ref().is_some_and(|rt| Self::is_bare_number(rt));
         let declared_ret = match return_type {
-            Some(rt) => Some(resolve_type(rt, &self.env).map_err(|e| Diagnostic::error(span, e))?),
-            None => None,
+            Some(rt) if !Self::is_bare_number(rt) => {
+                Some(self.resolve_type_with_number(rt).map_err(|e| Diagnostic::error(span, e))?)
+            }
+            _ => None,
         };
         // CHECK the body bidirectionally against the declared return type when that type is
         // structured (an object/named/union, or one mentioning a `StrLit` singleton). This pushes
@@ -334,6 +412,18 @@ impl Checker {
             }
             declared
         } else {
+            // A bare `Number` return (ADR-018, reversed): require the body to be numeric (or itself
+            // a numeric-bounded var that monomorphizes to a numeric family), then return the body's
+            // type so the call site can pin it. A non-numeric body is rejected here.
+            if number_return
+                && !body_ty.is_numeric()
+                && !matches!(body_ty, Type::TypeVar(id) if self.numeric_tvs.contains(&id))
+            {
+                return Err(Diagnostic::error(
+                    span,
+                    format!("Function body has type {}, declared return type is Number (a numeric type)", body_ty),
+                ).with_help("a `Number` return requires the body to evaluate to a numeric family".to_string()));
+            }
             body_ty
         };
 
@@ -375,7 +465,7 @@ impl Checker {
         for (i, param) in params.iter().enumerate() {
             // Use the declared annotation if present; otherwise use the hint from expected_params.
             let ty = if let Some(ref type_ann) = param.type_ann {
-                resolve_type(type_ann, &self.env).map_err(|e| Diagnostic::error(span, e))?
+                self.resolve_type_with_number(type_ann).map_err(|e| Diagnostic::error(span, e))?
             } else if i < expected_params.len() && !matches!(expected_params[i], Type::TypeVar(_)) {
                 expected_params[i].clone()
             } else {
@@ -452,10 +542,14 @@ impl Checker {
         // (bidirectional). This pushes the expected type into the body — needed for singleton
         // string-literal refinement (ADR-051): a `{ "type": "success", .. }` literal in the
         // body narrows its discriminant to the expected `StrLit` variant. Falls back to plain
-        // inference when there is no annotation.
+        // inference when there is no annotation. A bare `Number` return is treated as un-annotated
+        // (see `infer_function`); the body's numeric type flows through.
+        let number_return = return_type.as_ref().is_some_and(|rt| Self::is_bare_number(rt));
         let declared_ret = match return_type {
-            Some(rt) => Some(resolve_type(rt, &self.env).map_err(|e| Diagnostic::error(span, e))?),
-            None => None,
+            Some(rt) if !Self::is_bare_number(rt) => {
+                Some(self.resolve_type_with_number(rt).map_err(|e| Diagnostic::error(span, e))?)
+            }
+            _ => None,
         };
         // See `infer_function` for the rationale: push a structured declared return type into the
         // body's `if`/`match` arms (fixes the match-arm-union-vs-declared-object bug).
@@ -511,6 +605,27 @@ impl Checker {
         let captures_map = self.capture_stack.pop().unwrap_or_default();
         let mut captures: Vec<Capture> = captures_map.into_values().collect();
         captures.sort_by_key(|c| c.outer_slot);
+
+        // A bare `Number` return (ADR-018, reversed): require the body to be numeric (or a
+        // numeric-bounded var), then surface the body's type so the call site can pin it.
+        if number_return {
+            if !body_ty.is_numeric()
+                && !matches!(body_ty, Type::TypeVar(id) if self.numeric_tvs.contains(&id))
+            {
+                return Err(Diagnostic::error(
+                    span,
+                    format!("Function body has type {}, declared return type is Number (a numeric type)", body_ty),
+                ).with_help("a `Number` return requires the body to evaluate to a numeric family".to_string()));
+            }
+            return Ok(TypedExpr::Function {
+                name: None,
+                params: typed_params,
+                body: Box::new(typed_body),
+                ret_type: body_ty,
+                captures,
+                span,
+            });
+        }
 
         let ret_type = if let Some(declared) = declared_ret {
             if !checked_against_declared && !self.types_compatible(&body_ty, &declared) {

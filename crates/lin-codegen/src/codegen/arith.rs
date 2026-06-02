@@ -266,10 +266,12 @@ impl<'ctx> Codegen<'ctx> {
         let box_lhs = |s: &mut Self, v: BasicValueEnum<'ctx>| -> BasicValueEnum<'ctx> {
             if Self::is_union_type(lty) { v } else { s.box_value(v, lty) }
         };
-        // Mixed int/float arithmetic (e.g. `5 + 3.0`): widen the integer operand to float
-        // so both sides agree, and dispatch on the float type. The checker permits these
-        // numeric combinations without inserting explicit Coerce nodes on both operands.
-        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
+        // Mixed int/float arithmetic (e.g. `5 + 3.0`, or `x % 2` in a `Number`→Float64 specialization
+        // where the literal stays Int32): widen the integer operand to float so both sides agree, and
+        // dispatch on the float type. The checker permits these numeric combinations without inserting
+        // explicit Coerce nodes on both operands. `Mod` is included so a `Number` body's `x % 2`
+        // lowers to a native `frem` at Float64 (ADR-018, reversed).
+        if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
             | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq | BinOp::Eq | BinOp::NotEq)
             && lv.is_int_value() != rv.is_int_value()
             && (lv.is_float_value() || rv.is_float_value())
