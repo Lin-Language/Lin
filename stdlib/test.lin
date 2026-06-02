@@ -5,6 +5,7 @@ import { filter, for, map } from "std/iter"
 import { exit } from "std/io"
 import { getEnv } from "std/env"
 import { toJsonString } from "std/json"
+import { startTimer, elapsed } from "std/time"
 
 // An Assertion is the result of a single matcher: a pass, or a fail carrying a message.
 // Matchers return this CONCRETE type (not Json) on purpose: it makes a test body's type
@@ -20,15 +21,20 @@ val _pass = (): Assertion =>
 val _fail = (message: String): Assertion =>
   { "type": "fail", "message": message }
 
-val _evalResult = (name: String, results: Assertion[]): Json =>
+val _evalResult = (name: String, results: Assertion[], ms: Int64): Json =>
   val failures = results.filter(a => a["type"] == "fail")
   if length(failures) == 0 then
-    { "type": "pass", "name": name }
+    {
+      "type": "pass",
+      "name": name,
+      "ms": ms
+    }
   else
     {
       "type": "fail",
       "name": name,
-      "failures": failures
+      "failures": failures,
+      "ms": ms
     }
 
 val _printFail = (r: Json): Null =>
@@ -94,7 +100,9 @@ export val toFailWith = (asserter: Json, message: String): Assertion =>
 // an `Assertion[]` (use the `[ expect(...).toBe(...), ... ]` form, even for a single assertion);
 // every assertion in the array is evaluated and a test fails if any one of them fails.
 export val test = (name: String, body: () => Assertion[]): Json =>
-  _evalResult(name, body())
+  val timer = startTimer()
+  val results = body()
+  _evalResult(name, results, elapsed(timer))
 
 // `withFixture` is the per-test setup/teardown + dependency-injection combinator (ADR-071):
 // it builds a fixture, injects it into the body, and tears it down — all within a single
@@ -122,13 +130,13 @@ export val suite = (name: String, tests: Json[]): Json =>
 val _reportJsonResult = (r: Json): Null =>
   if r["type"] == "pass" then
     print(
-      "##LINTEST## {\"event\":\"test\",\"name\":${toJsonString(r["name"])},\"status\":\"pass\"}"
+      "##LINTEST## {\"event\":\"test\",\"name\":${toJsonString(r["name"])},\"status\":\"pass\",\"ms\":${toString(r["ms"])}}"
     )
   else
     val messages = r["failures"].map(f => f["message"])
     val joined = messages.join("\n")
     print(
-      "##LINTEST## {\"event\":\"test\",\"name\":${toJsonString(r["name"])},\"status\":\"fail\",\"message\":${toJsonString(joined)}}"
+      "##LINTEST## {\"event\":\"test\",\"name\":${toJsonString(r["name"])},\"status\":\"fail\",\"message\":${toJsonString(joined)},\"ms\":${toString(r["ms"])}}"
     )
 
 // Print a suite's results and return the failure count (0 = all passed). Unlike `run`, this

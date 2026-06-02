@@ -4742,12 +4742,19 @@ emit **newline-delimited JSON (NDJSON)** on **stdout** instead — one record pe
 consumption by tooling (e.g. the VSCode Test Explorer integration). The process exit code is
 unchanged: non-zero if any test file failed.
 
-Each line is one of two record shapes:
+The stream is **versioned**: the first line is always a `meta` record carrying the schema
+version. Consumers should read it and refuse (or warn) on an unrecognized version rather than
+mis-parsing newer shapes.
+
+Each line is one of three record shapes:
 
 ```jsonc
+// Always the FIRST line — the NDJSON schema version
+{ "event": "meta", "schema": 1 }
+
 // One per test (from the suite's results)
-{ "event": "test", "file": "<path>", "name": "<test name>", "status": "pass" }
-{ "event": "test", "file": "<path>", "name": "<test name>", "status": "fail", "message": "<joined failure messages>" }
+{ "event": "test", "file": "<path>", "name": "<test name>", "status": "pass", "durationMs": <int> }
+{ "event": "test", "file": "<path>", "name": "<test name>", "status": "fail", "message": "<joined failure messages>", "durationMs": <int> }
 
 // One per test file (always emitted, after its test records)
 { "event": "file", "file": "<path>", "status": "pass" | "fail" | "timeout" | "compile_error", "durationMs": <int>, "message"?: "<diagnostic>" }
@@ -4756,6 +4763,8 @@ Each line is one of two record shapes:
 - `status` on a `test` record is `pass` or `fail`; the `message` (failures only) is the
   test's failure messages joined with `\n` (so a `toBe` mismatch carries its
   `expected: …\nactual: …` text). All strings are properly JSON-escaped.
+- `durationMs` on a `test` record is the monotonic wall-clock time (in milliseconds) spent
+  evaluating that test's body, measured by `std/test`.
 - The `file` record reports the whole file's outcome and is the only signal for files that
   never produced per-test records — e.g. a `compile_error` (with the diagnostic in `message`)
   or a `timeout`.

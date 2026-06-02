@@ -48,6 +48,8 @@ enum JsonRecord {
         status: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     #[serde(rename = "file")]
     File {
@@ -348,7 +350,10 @@ fn emit_json_for_result(result: &TestResult, lock: &Arc<Mutex<()>>) {
         let name = val.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let status = val.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let message = val.get("message").and_then(|v| v.as_str()).map(|s| s.to_string());
-        emit_record(&JsonRecord::Test { file: file.clone(), name, status, message });
+        // Per-test timing comes from std/test's `ms` field (monotonic elapsed millis around the
+        // test body). Clamp negatives to 0; absent/non-numeric → no durationMs.
+        let duration_ms = val.get("ms").and_then(|v| v.as_i64()).map(|m| m.max(0) as u64);
+        emit_record(&JsonRecord::Test { file: file.clone(), name, status, message, duration_ms });
     }
 
     let (status, message) = match result.outcome {
