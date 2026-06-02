@@ -22,6 +22,7 @@
     "onCommand:lin.build",
     "onCommand:lin.run",
     "onCommand:lin.test",
+    "onCommand:lin.format",
     "onCommand:lin.installOnPath"
   ],
   "main": "./client.js",
@@ -55,6 +56,11 @@
       {
         "command": "lin.test",
         "title": "Test",
+        "category": "Lin"
+      },
+      {
+        "command": "lin.format",
+        "title": "Format",
         "category": "Lin"
       },
       {
