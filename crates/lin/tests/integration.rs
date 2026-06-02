@@ -10148,3 +10148,34 @@ print(toString(add(2.5, 10)))
 "#);
     assert_eq!(out, vec!["12.5", "12", "4.0", "12.5"]);
 }
+
+#[test]
+fn test_number_nested_array_map_specializes() {
+    // Nested `Number` (ADR-018, reversed, bug #4): `Number[]` and a `Number` callback over it.
+    // `resolve_type_with_number_in` recurses into the Array element; the callback's `Number` param
+    // reuses the receiver element's bounded var (so its family is pinned by the argument) and its
+    // body type is surfaced as the lambda return, letting the outer call infer. `f([1,2,3])` ⇒
+    // element Int32 (native `mul i32` loop); `f([1.5,2.5])` ⇒ Float64.
+    let out = run(r#"import { print } from "std/io"
+import { map } from "std/iter"
+import { toString } from "std/string"
+val f = (xs: Number[]) => xs.map((v: Number) => v * 2)
+print(toString(f([1, 2, 3])))
+print(toString(f([1.5, 2.5])))
+"#);
+    assert_eq!(out, vec!["[2, 4, 6]", "[3.0, 5.0]"]);
+}
+
+#[test]
+fn test_number_nested_array_reduce_and_index() {
+    // `Number[]` direct numeric use also works: indexing and a reduce whose seed pins the family.
+    let out = run(r#"import { print } from "std/io"
+import { reduce } from "std/iter"
+import { toString } from "std/string"
+val sum = (xs: Number[]) => xs.reduce(0, (a, b) => a + b)
+val firstTwo = (xs: Number[]) => xs[0] + xs[1]
+print(toString(sum([10, 20, 30])))
+print(toString(firstTwo([5, 6])))
+"#);
+    assert_eq!(out, vec!["60", "11"]);
+}

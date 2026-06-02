@@ -172,6 +172,24 @@ and dot-call paths). `lin-codegen/src/codegen/arith.rs` widens a mixed int/float
 it can't be pinned from arguments, so the body's (numeric, bound-guaranteed) type is surfaced as the
 function's return and the body is checked numeric.
 
+**Nested `Number` (`Number[]`, callbacks).** `resolve_type_with_number_in` recurses into Array,
+FixedArray, Union, Function-param/return, and Object-field positions, so every `Number` occurrence
+anywhere in an annotation mints its own bounded var — `(xs: Number[])` lowers to
+`Array(TypeVar)`. For a `Number[]` argument the element var is pinned from the literal's element
+family at the call site (homogeneous array → one shared element family). To make a combinator
+callback over such an array specialize, two checker tweaks (`infer_function_with_hints`): (1) a bare
+`Number` lambda PARAMETER whose expected type (from the enclosing combinator, e.g. `.map`'s callback
+param = the receiver element) is itself a numeric-bounded var REUSES that var instead of minting a
+fresh independent one — tying the callback's family to the array element it consumes; (2) a lambda
+whose body type is a numeric-bounded var is surfaced as the lambda's RETURN (not erased to the
+combinator's free `U` slot), so the call site pins `U` and the outer `(xs: Number[]) => xs.map(…)`
+return is inferred. Result: `f([1,2,3])` ⇒ `f$Int32` native `mul i32`, `f([1.5,2.5])` ⇒ Float64.
+A `Number` in a **higher-order function-typed parameter** (`(f: (Number) => Number, …)`) still
+cannot be inferred at the call site — that is the SAME monomorphization-inference gap an explicit
+`<T>` callback param hits (`<T>(f: (T) => T, x: T)` fails identically), not Number-specific; the call
+reports the generic "cannot infer a concrete type for the type parameter(s)" error. Use a concrete
+numeric family in that position.
+
 **Mixed families in ONE call** of a `Number`-returning function (e.g.
 `(a: Number, b: Number) => a + b` at `add(10, 2.5)`) **are supported**. Each `Number` is its own
 bounded var, so the call monomorphizes to `add$Int32_Float64` and the arithmetic result is
@@ -194,8 +212,14 @@ the earlier reject in `checker/call.rs` was a workaround that is now removed.
   compile error (decode it to a family first, e.g. `Int32.fromJson(v)`). We deliberately do NOT fall
   back to a silent boxed slow path under a `Number` annotation.
 - `Number` is no longer part of the structural definition of `Json` (it never resolved to a union).
-- A `Number` nested inside a generic type ARGUMENT (`Iterator<Number>`) is not lowered to a bounded
-  var (documented edge; resolves via the standard resolver where `Number` is still unknown).
+- **Nested `Number` works** for `Number[]` and combinator callbacks over it (see the implementation
+  note above) — `(xs: Number[]) => xs.map((v: Number) => v*2)` specializes and runs natively.
+- A `Number` in a **higher-order function-typed parameter** (`(f: (Number) => Number, x: Number)`)
+  can't be inferred at the call site — the shared generic-callback inference gap (an explicit `<T>`
+  callback param fails identically); use a concrete numeric family there.
+- A `Number` nested inside a `<…>` GENERIC type ARGUMENT (`Iterator<Number>`) is still not lowered
+  to a bounded var (`resolve_type_with_number_in` recurses into structural forms — Array, Function,
+  Object — but defers a `<…>`-application's args to the standard resolver where `Number` is unknown).
 
 ## ADR-019: LLVM 22 via inkwell with dynamic linking
 
