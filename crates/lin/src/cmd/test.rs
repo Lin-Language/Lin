@@ -463,6 +463,20 @@ fn print_result(result: &TestResult, verbose: bool, lock: &Arc<Mutex<()>>) {
     }
 }
 
+/// Resolve an LLVM tool name, preferring the version-matched binary (`<tool>-22`) but falling
+/// back to the unversioned `<tool>` when the versioned one isn't on PATH. This keeps coverage
+/// working on hosts whose LLVM 22 tools aren't suffixed (e.g. a `clang`-only install).
+fn llvm_tool(tool: &str) -> String {
+    use std::process::Command;
+    let versioned = format!("{}-22", tool);
+    let found = Command::new(&versioned)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if found { versioned } else { tool.to_string() }
+}
+
 fn run_coverage_report(
     test_files: &[PathBuf],
     compiled: &[Result<PathBuf, String>],
@@ -470,6 +484,9 @@ fn run_coverage_report(
 ) {
     use std::fs;
     use std::process::Command;
+
+    let profdata_tool = llvm_tool("llvm-profdata");
+    let cov_tool = llvm_tool("llvm-cov");
 
     // Collect the profraw files that actually exist.
     let pairs: Vec<(&PathBuf, &PathBuf)> = test_files
@@ -493,14 +510,14 @@ fn run_coverage_report(
     let profdata_path = root.join("coverage.profdata");
 
     // Merge .profraw → .profdata.
-    let mut merge_cmd = Command::new("llvm-profdata-22");
+    let mut merge_cmd = Command::new(&profdata_tool);
     merge_cmd.arg("merge").arg("-sparse").arg("-o").arg(&profdata_path);
     for (src, _) in &pairs {
         merge_cmd.arg(src.with_extension("profraw"));
     }
     match merge_cmd.status() {
-        Err(e) => { eprintln!("llvm-profdata-22 failed: {}", e); return; }
-        Ok(s) if !s.success() => { eprintln!("llvm-profdata-22 exited non-zero"); return; }
+        Err(e) => { eprintln!("{} failed: {}", profdata_tool, e); return; }
+        Ok(s) if !s.success() => { eprintln!("{} exited non-zero", profdata_tool); return; }
         Ok(_) => {}
     }
 
@@ -508,7 +525,7 @@ fn run_coverage_report(
         CoverageFormat::Console => {
             // Print a text summary for each binary.
             for (_, bin) in &pairs {
-                let out = Command::new("llvm-cov-22")
+                let out = Command::new(&cov_tool)
                     .arg("report")
                     .arg(bin)
                     .arg(format!("-instr-profile={}", profdata_path.display()))
@@ -518,7 +535,7 @@ fn run_coverage_report(
                         print!("{}", String::from_utf8_lossy(&o.stdout));
                     }
                     Ok(o) => eprintln!("{}", String::from_utf8_lossy(&o.stderr)),
-                    Err(e) => eprintln!("llvm-cov-22 failed: {}", e),
+                    Err(e) => eprintln!("{} failed: {}", cov_tool, e),
                 }
             }
         }
@@ -526,7 +543,7 @@ fn run_coverage_report(
             let lcov_path = args.output.clone().unwrap_or_else(|| root.join("lcov.info"));
             let mut lcov_data = String::new();
             for (_, bin) in &pairs {
-                let out = Command::new("llvm-cov-22")
+                let out = Command::new(&cov_tool)
                     .arg("export")
                     .arg(bin)
                     .arg(format!("-instr-profile={}", profdata_path.display()))
@@ -537,7 +554,7 @@ fn run_coverage_report(
                         lcov_data.push_str(&String::from_utf8_lossy(&o.stdout));
                     }
                     Ok(o) => eprintln!("{}", String::from_utf8_lossy(&o.stderr)),
-                    Err(e) => eprintln!("llvm-cov-22 failed: {}", e),
+                    Err(e) => eprintln!("{} failed: {}", cov_tool, e),
                 }
             }
             fs::write(&lcov_path, &lcov_data).unwrap_or_else(|e| {
