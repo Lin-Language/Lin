@@ -70,11 +70,14 @@ export val nextSequence = (seq: UInt16, nal: UInt8[]): UInt16 =>
 // caller's job via nextSequence).
 export val writeHeader = (seq: UInt16, ts: UInt32, ssrc: UInt32, marker: Boolean): UInt8[] =>
   val b1: UInt8[] = if marker then hdrMarker else hdrNoMarker
-  concat(concat(concat(b1, u16ToBe(seq)), u32ToBe(ts)), u32ToBe(ssrc))
+  b1
+    .concat(u16ToBe(seq))
+    .concat(u32ToBe(ts))
+    .concat(u32ToBe(ssrc))
 
 // Single NAL Unit Mode: header ++ nal verbatim.
 val makeSingleNal = (seq: UInt16, ts: UInt32, ssrc: UInt32, nal: UInt8[], marker: Boolean): UInt8[] =>
-  concat(writeHeader(seq, ts, ssrc, marker), nal)
+  writeHeader(seq, ts, ssrc, marker).concat(nal)
 
 // Compose the [FU-indicator, FU-header] two-byte prefix for an FU-A fragment.
 // fu_indicator = (nal[0] & 0x60) | 28 ; fu_header = (nal[0] & 0x1F) | start | end.
@@ -100,7 +103,7 @@ val fragLoop = (seq: UInt16, ts: UInt32, ssrc: UInt32, nalHdr: UInt8, payload: U
     val header = writeHeader(seq, ts, ssrc, marker && last)
     val prefix = fuPrefix(nalHdr, first, last)
     val fragment: UInt8[] = slice(payload, offset, end)
-    val packet = concat(concat(header, prefix), fragment)
+    val packet = header.concat(prefix).concat(fragment)
     val pushed = push(acc, packet)
     fragLoop(seq + 1, ts, ssrc, nalHdr, payload, end, maxFrag, marker, acc)
 
@@ -116,6 +119,6 @@ export val packetize = (seq: UInt16, ts: UInt32, ssrc: UInt32, nal: UInt8[], mar
     packets
   else
     val maxFrag = MAX_RTP_PAYLOAD - 2
-    val payload: UInt8[] = slice(nal, 1, length(nal))
+    val payload: UInt8[] = nal.slice(1, nal.length())
     val done = fragLoop(seq, ts, ssrc, nal[0], payload, 0, maxFrag, marker, packets)
     packets
