@@ -1359,17 +1359,7 @@ fn fmt_inline(expr: &Expr) -> String {
             )
         }
         Expr::Function { type_params, params, return_type, body, .. } => {
-            let ps: Vec<String> = params
-                .iter()
-                .map(|p| {
-                    let pat = fmt_pattern(&p.pattern);
-                    if let Some(t) = &p.type_ann {
-                        format!("{}: {}", pat, fmt_type(t))
-                    } else {
-                        pat
-                    }
-                })
-                .collect();
+            let ps: Vec<String> = params.iter().map(fmt_param).collect();
             let ret = return_type
                 .as_ref()
                 .map(|t| format!(": {}", fmt_type(t)))
@@ -1383,6 +1373,7 @@ fn fmt_inline(expr: &Expr) -> String {
                 && generics.is_empty()
                 && params.len() == 1
                 && params[0].type_ann.is_none()
+                && params[0].default.is_none()
                 && matches!(&params[0].pattern, Pattern::Ident(..) | Pattern::Wildcard(..));
             let body = with_arg_position(false, || fmt_inline(body));
             if bare_ok {
@@ -1893,6 +1884,22 @@ fn fmt_type_params(type_params: &[String]) -> String {
     }
 }
 
+/// Render a single function parameter, including its type annotation and any
+/// default value (`x: T = expr`). Dropping the default would silently change the
+/// program's meaning, which the formatter must never do.
+fn fmt_param(p: &Param) -> String {
+    let pat = fmt_pattern(&p.pattern);
+    let mut s = if let Some(t) = &p.type_ann {
+        format!("{}: {}", pat, fmt_type(t))
+    } else {
+        pat
+    };
+    if let Some(d) = &p.default {
+        s = format!("{} = {}", s, fmt_inline(d));
+    }
+    s
+}
+
 fn fmt_function(
     type_params: &[String],
     params: &[Param],
@@ -1903,17 +1910,7 @@ fn fmt_function(
 ) -> String {
     let child_ind = format!("{}  ", ind);
 
-    let ps: Vec<String> = params
-        .iter()
-        .map(|p| {
-            let pat = fmt_pattern(&p.pattern);
-            if let Some(t) = &p.type_ann {
-                format!("{}: {}", pat, fmt_type(t))
-            } else {
-                pat
-            }
-        })
-        .collect();
+    let ps: Vec<String> = params.iter().map(fmt_param).collect();
     let ret = return_type
         .as_ref()
         .map(|t| format!(": {}", fmt_type(t)))
@@ -1929,6 +1926,7 @@ fn fmt_function(
         && generics.is_empty()
         && params.len() == 1
         && params[0].type_ann.is_none()
+        && params[0].default.is_none()
         && matches!(&params[0].pattern, Pattern::Ident(..) | Pattern::Wildcard(..));
     let param_part = if bare_ok {
         format!("{}{}", ps[0], ret)
