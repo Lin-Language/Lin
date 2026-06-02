@@ -1,42 +1,53 @@
 import { expect, toBe, test, suite, run } from "std/test"
+import { length } from "std/array"
 import { toString } from "std/string"
-import { printErr, args, prompt, exit } from "std/io"
+import { print, printErr, args, prompt, exit, readLine, readAll, lines, stdinStream } from "std/io"
 
-// io.lin exports: print, printErr, args, prompt, exit, readLine, readAll, lines
-// print and exit are side-effecting; we test what we can without needing stdin.
+// io.lin exports: print, printErr, args, prompt, exit, readLine, readAll,
+// lines, stdinStream.
+//
+// The stdin-reading functions (readLine, readAll, lines, prompt, stdinStream)
+// can BLOCK on a live stdin and their result depends on what is piped in, so we
+// do not invoke them here — under the test runner stdin is not guaranteed to be
+// at EOF, and a blocking read would stall the suite. We bind them as values to
+// keep them imported/type-checked, and exercise the deterministic, non-blocking
+// surface: args() (returns a String[]) and print/printErr (return Null).
+//
+// Observed via `lin build` + run: print("hi") and printErr("err") both return
+// null (and write to stdout/stderr); args() returns a String[] whose length is a
+// non-negative Int.
+val readLineRef = readLine
+val readAllRef = readAll
+val linesRef = lines
+val promptRef = prompt
+val exitRef = exit
+val stdinStreamRef = stdinStream
+
 val s = suite("std/io", [
-  test("print accepts strings", () =>
-    // Just verify it doesn't crash; output is a side effect
-    val _ = true
-    [
-      expect(true).toBe(true)
-    ]
-  ),
-
-  test("exit function exists (callable)", () => [
-    // We don't call exit(1) in a test suite — just confirm the import works
-    expect(true).toBe(true)
+  test("print returns Null", () => [
+    expect(print("io.test: print") == null).toBe(true)
   ]),
 
-  test("printErr accepts strings", () =>
-    // printErr writes to stderr; verify it doesn't crash
-    val _ = true
+  test("printErr returns Null", () => [
+    expect(printErr("io.test: printErr") == null).toBe(true)
+  ]),
+
+  test("args returns a String[] with non-negative length", () =>
+    val a = args()
     [
-      expect(true).toBe(true)
+      expect(a.length() >= 0).toBe(true)
     ]
   ),
 
-  test("args returns an array", () =>
-    val result = args()
-    // args() returns String[] — just verify it's callable and the type is right
-    [
-      expect(true).toBe(true)
-    ]
-  ),
-
-  test("prompt function exists (callable)", () => [
-    // prompt requires stdin interaction; just verify the import works
-    expect(true).toBe(true)
+  test("stdin-reading and process-control exports are importable", () => [
+    // Bound above as values without calling them (they block / terminate the
+    // process). This guards the module against compilation regressions.
+    expect(readLineRef != null).toBe(true),
+    expect(readAllRef != null).toBe(true),
+    expect(linesRef != null).toBe(true),
+    expect(promptRef != null).toBe(true),
+    expect(exitRef != null).toBe(true),
+    expect(stdinStreamRef != null).toBe(true)
   ])
 ])
 
