@@ -7,7 +7,7 @@ const cp = require("child_process");
 const {
   workspace, window, commands, languages, Range, TextEdit, Uri,
   tests, TestRunRequest, TestRunProfileKind, TestMessage, Position,
-  FileCoverage, StatementCoverage,
+  FileCoverage, StatementCoverage, CancellationTokenSource,
 } = require("vscode");
 const { LanguageClient, TransportKind } = require("vscode-languageclient/node");
 
@@ -290,6 +290,19 @@ function findOrCreateTestItem(controller, file, name) {
   return child;
 }
 
+// Render a structured expected/actual JSON value for TestMessage.expectedOutput /
+// actualOutput, which require strings. Strings pass through verbatim (so a quoted value isn't
+// double-quoted); everything else (objects/arrays/numbers/booleans/null) is pretty-printed with
+// 2-space indent for a readable diff.
+function toDiffString(value) {
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch (_) {
+    return String(value);
+  }
+}
+
 // Split a `toBe`-style failure message into expected/actual for a richer diff in
 // the Test Explorer. The runner emits `expected: X\n    actual:   Y`.
 function parseExpectedActual(message) {
@@ -390,7 +403,7 @@ function setupTestController(context, linBin) {
   // Shared run/coverage session. Spawns `lin test ... --reporter json` (plus coverage flags
   // when `opts.coverage` is set), streams NDJSON, and maps records onto TestItems. On close, if
   // a coverage lcov file was requested, parses it and attaches coverage to the TestRun.
-  const runTestSession = (request, token, opts) => {
+  const runTestSession = (request, token, opts, onDone) => {
     opts = opts || {};
     const run = controller.createTestRun(request);
     const targetFiles = collectTargetFiles(controller, request);
@@ -421,18 +434,29 @@ function setupTestController(context, linBin) {
       args.push("--coverage", "--format", "llvm-cov", "--output", lcovFile);
     }
 
+    // End the run exactly once and notify the caller (palette runs use this to dispose their
+    // CancellationTokenSource). Guarded so multiple termination paths (spawn error, child error,
+    // normal close) don't double-end.
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      run.end();
+      if (typeof onDone === "function") onDone();
+    };
+
     let child;
     try {
       child = cp.spawn(linBin, args, { cwd: wsRoot });
     } catch (err) {
       window.showErrorMessage(`Lin: failed to start test runner: ${err.message}`);
-      run.end();
+      finish();
       return;
     }
 
     child.on("error", (err) => {
       window.showErrorMessage(`Lin: test runner error: ${err.message}`);
-      run.end();
+      finish();
     });
 
     token.onCancellationRequested(() => {
@@ -459,10 +483,19 @@ function setupTestController(context, linBin) {
         } else {
           const msg = rec.message || "test failed";
           const tm = new TestMessage(msg);
-          const ea = parseExpectedActual(msg);
-          if (ea) {
-            tm.expectedOutput = ea.expected;
-            tm.actualOutput = ea.actual;
+          // Prefer the STRUCTURED expected/actual the runner now attaches (equality-style
+          // failures). They may be any JSON shape, but TestMessage wants strings, so non-strings
+          // are pretty-printed. Fall back to regex-scraping the human message only when the
+          // structured fields are absent (older runner / matchers without a pair).
+          if (rec.expected !== undefined || rec.actual !== undefined) {
+            tm.expectedOutput = toDiffString(rec.expected);
+            tm.actualOutput = toDiffString(rec.actual);
+          } else {
+            const ea = parseExpectedActual(msg);
+            if (ea) {
+              tm.expectedOutput = ea.expected;
+              tm.actualOutput = ea.actual;
+            }
           }
           run.failed(item, tm, durationMs);
         }
@@ -501,11 +534,11 @@ function setupTestController(context, linBin) {
         attachLcovCoverage(run, lcovFile);
         try { fs.unlinkSync(lcovFile); } catch (_) { /* best effort */ }
       }
-      run.end();
+      finish();
     });
   };
 
-  const runHandler = (request, token) => runTestSession(request, token, { coverage: false });
+  const runHandler = (request, token, onDone) => runTestSession(request, token, { coverage: false }, onDone);
   const coverageHandler = (request, token) => runTestSession(request, token, { coverage: true });
 
   controller.createRunProfile("Run", TestRunProfileKind.Run, runHandler, true);
@@ -581,9 +614,42 @@ function activate(context) {
   // Test Explorer integration. Returns the controller + its run handler so the
   // palette commands below can trigger runs through it.
   const { controller: testController, runHandler: runTests } = setupTestController(context, linBin);
-  // A no-op cancellation token for palette-initiated runs (the Testing UI's own
-  // Stop button supplies a real token for gutter-initiated runs).
-  const noopToken = { onCancellationRequested: () => ({ dispose() {} }) };
+
+  // Palette-initiated runs (gutter runs get a real token from the Testing UI's Stop button, but
+  // palette commands construct their own request). We give each a real CancellationTokenSource so
+  // the run handler's `token.onCancellationRequested(() => child.kill())` can actually fire.
+  // Re-invoking the same command cancels the previous in-flight run for that scope (so a re-run
+  // supersedes it), and we dispose the source when the run completes to free resources.
+  const activeCts = new Map();
+  const runWithFreshToken = (scopeKey, request) => {
+    const prior = activeCts.get(scopeKey);
+    if (prior) {
+      prior.cancel();
+      prior.dispose();
+    }
+    const cts = new CancellationTokenSource();
+    activeCts.set(scopeKey, cts);
+    // Cancel + dispose once this run finishes, so the source doesn't linger and a later Stop on a
+    // stale source is a no-op.
+    cts.token.onCancellationRequested(() => {
+      if (activeCts.get(scopeKey) === cts) activeCts.delete(scopeKey);
+    });
+    runTests(request, cts.token, () => {
+      if (activeCts.get(scopeKey) === cts) {
+        activeCts.delete(scopeKey);
+        cts.dispose();
+      }
+    });
+  };
+  context.subscriptions.push({
+    dispose() {
+      for (const cts of activeCts.values()) {
+        cts.cancel();
+        cts.dispose();
+      }
+      activeCts.clear();
+    },
+  });
 
   context.subscriptions.push(
     commands.registerCommand("lin.build", () => runLinCommand("build")),
@@ -621,10 +687,10 @@ function activate(context) {
       }
       const fileItem = getOrCreateFileItem(testController, editor.document.uri);
       await resolveFileChildren(testController, fileItem);
-      runTests(new TestRunRequest([fileItem]), noopToken);
+      runWithFreshToken(`file:${editor.document.uri.fsPath}`, new TestRunRequest([fileItem]));
     }),
     commands.registerCommand("lin.testProject", () => {
-      runTests(new TestRunRequest(), noopToken);
+      runWithFreshToken("project", new TestRunRequest());
     }),
   );
 }

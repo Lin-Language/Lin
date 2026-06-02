@@ -4773,7 +4773,7 @@ Each line is one of three record shapes:
 
 // One per test (from the suite's results)
 { "event": "test", "file": "<path>", "name": "<test name>", "status": "pass", "durationMs": <int> }
-{ "event": "test", "file": "<path>", "name": "<test name>", "status": "fail", "message": "<joined failure messages>", "durationMs": <int> }
+{ "event": "test", "file": "<path>", "name": "<test name>", "status": "fail", "message": "<joined failure messages>", "expected"?: <any JSON>, "actual"?: <any JSON>, "durationMs": <int> }
 
 // One per test file (always emitted, after its test records)
 { "event": "file", "file": "<path>", "status": "pass" | "fail" | "timeout" | "compile_error", "durationMs": <int>, "message"?: "<diagnostic>" }
@@ -4782,6 +4782,13 @@ Each line is one of three record shapes:
 - `status` on a `test` record is `pass` or `fail`; the `message` (failures only) is the
   test's failure messages joined with `\n` (so a `toBe` mismatch carries its
   `expected: …\nactual: …` text). All strings are properly JSON-escaped.
+- `expected` / `actual` are OPTIONAL structured fields on a `fail` `test` record, carrying the
+  raw compared values as arbitrary JSON (any shape — strings, numbers, objects, arrays). They are
+  emitted by equality-style matchers (`toBe`, `toBeNull`, `toFailWith`) and let consumers render a
+  structured diff without parsing the human `message`. They are present only when EXACTLY ONE of
+  the test's failing assertions carries a pair; with multiple failing assertions, or matchers
+  without a meaningful pair (`toSatisfy`, `toSucceed`, `toFail`), they are omitted and the
+  `message` conveys everything. Values are serialized with `toJson` (the recursive serializer).
 - `durationMs` on a `test` record is the monotonic wall-clock time (in milliseconds) spent
   evaluating that test's body, measured by `std/test`.
 - The `file` record reports the whole file's outcome and is the only signal for files that

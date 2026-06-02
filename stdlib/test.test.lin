@@ -77,6 +77,22 @@ val s = suite("std/test", [
     ]
   ),
 
+  test("toBe failure carries structured expected and actual", () =>
+    val r: Json = expect(2).toBe(3)
+    [
+      expect(r["expected"]).toBe(3),
+      expect(r["actual"]).toBe(2)
+    ]
+  ),
+
+  test("toSatisfy failure carries no structured pair", () =>
+    val r: Json = expect(1).toSatisfy(x => x > 10)
+    [
+      expect(r["expected"]).toBeNull(),
+      expect(r["actual"]).toBeNull()
+    ]
+  ),
+
   test("toBeNull fails on non-null", () =>
     [
       expect(expect(0).toBeNull()["type"]).toBe("fail"),

@@ -48,6 +48,13 @@ enum JsonRecord {
         status: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
+        // Structured expected/actual for equality-style failures (passed through untouched as
+        // arbitrary JSON). Absent for passes, matchers without a meaningful pair, and tests with
+        // multiple failing assertions.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expected: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        actual: Option<serde_json::Value>,
         #[serde(rename = "durationMs", skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
     },
@@ -366,7 +373,19 @@ fn emit_json_for_result(result: &TestResult, lock: &Arc<Mutex<()>>) {
         // Per-test timing comes from std/test's `ms` field (monotonic elapsed millis around the
         // test body). Clamp negatives to 0; absent/non-numeric → no durationMs.
         let duration_ms = val.get("ms").and_then(|v| v.as_i64()).map(|m| m.max(0) as u64);
-        emit_record(&JsonRecord::Test { file: file.clone(), name, status, message, duration_ms });
+        // Structured expected/actual (present only for equality-style single-assertion failures)
+        // flow through untouched as arbitrary JSON.
+        let expected = val.get("expected").cloned();
+        let actual = val.get("actual").cloned();
+        emit_record(&JsonRecord::Test {
+            file: file.clone(),
+            name,
+            status,
+            message,
+            expected,
+            actual,
+            duration_ms,
+        });
     }
 
     let (status, message) = match result.outcome {
