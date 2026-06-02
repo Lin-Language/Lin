@@ -940,7 +940,13 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
     // Find the lin-runtime static library.
     let runtime_lib = find_runtime_lib();
 
-    let mut cmd = Command::new("cc");
+    // The default link driver is the system `cc` (typically gcc). For coverage we instead drive
+    // the link through clang, because the LLVM profile runtime (`libclang_rt.profile`) and the
+    // `-fprofile-instr-generate` flag that pulls it in are clang's — gcc doesn't understand them.
+    // clang locates the correct host-arch runtime itself, so we never hardcode a path or arch.
+    let driver = if coverage { coverage_link_driver() } else { "cc".to_string() };
+
+    let mut cmd = Command::new(&driver);
     cmd.arg(obj_path)
         .arg("-o")
         .arg(output_path);
@@ -969,29 +975,60 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
         }
     }
 
-    // Link clang_rt.profile when coverage instrumentation is enabled.
-    // Use --whole-archive so the profile runtime's constructor and atexit handlers are linked in.
+    // Link the LLVM profile runtime when coverage instrumentation is enabled. Rather than
+    // hardcoding the absolute path to `libclang_rt.profile-<arch>.a` (which bakes in the LLVM
+    // patch version, host arch, and install prefix), let the `cc` driver locate and link the
+    // correct runtime for this host via `-fprofile-instr-generate`. clang resolves the right
+    // libclang_rt.profile itself, including its required deps (pthread/dl/rt on Linux). This is
+    // portable across LLVM minor versions, architectures, and distros.
     if coverage {
-        let profile_lib = "/usr/lib/llvm-22/lib/clang/22/lib/linux/libclang_rt.profile-x86_64.a";
-        cmd.arg("-Wl,--whole-archive")
-           .arg(profile_lib)
-           .arg("-Wl,--no-whole-archive");
-        // profile runtime needs pthread and dl on Linux
-        cmd.arg("-lpthread").arg("-ldl").arg("-lrt");
+        cmd.arg("-fprofile-instr-generate");
     }
 
     // Link system libraries needed by lin-runtime (libc via cc, libm for math).
     cmd.arg("-lm");
-    let status = cmd.status().map_err(|e| CompileError::Link(e.to_string()))?;
 
-    if !status.success() {
-        return Err(CompileError::Link(format!(
-            "linker exited with status {}",
-            status
-        )));
+    // Capture stderr so a link failure surfaces the real linker diagnostic (e.g. "cannot find
+    // libclang_rt.profile...") instead of a bare exit status. A successful link normally writes
+    // nothing, so capturing doesn't change observable behaviour on success.
+    let output = cmd.output().map_err(|e| CompileError::Link(e.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let mut msg = format!("linker exited with status {}", output.status);
+        if !stderr.trim().is_empty() {
+            msg.push_str("\n");
+            msg.push_str(stderr.trim_end());
+        }
+        if !stdout.trim().is_empty() {
+            msg.push_str("\n");
+            msg.push_str(stdout.trim_end());
+        }
+        return Err(CompileError::Link(msg));
     }
 
     Ok(())
+}
+
+/// Pick the clang driver to use for coverage links. Prefers the LLVM-22-matched `clang-22`
+/// (matching the codegen toolchain), falling back to the unversioned `clang`, then bare `clang`
+/// even if not yet probed (the link step surfaces a clear error if it's truly absent). Using
+/// clang lets `-fprofile-instr-generate` resolve the host-correct `libclang_rt.profile` with no
+/// hardcoded path.
+fn coverage_link_driver() -> String {
+    for candidate in ["clang-22", "clang"] {
+        if Command::new(candidate)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return candidate.to_string();
+        }
+    }
+    // Last resort: let the link attempt produce a clear "clang not found" error.
+    "clang".to_string()
 }
 
 fn find_runtime_lib() -> Option<PathBuf> {
