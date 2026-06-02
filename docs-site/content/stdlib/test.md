@@ -74,9 +74,9 @@ system, which is what guarantees every assertion is actually evaluated.
 
 ```lin
 test("string ops", () => [
-  expect(length("hello")).toBe(5),
-  expect(toUpper("hello")).toBe("HELLO"),
-  expect(trim("  hi  ")).toBe("hi")
+  expect("hello".length()).toBe(5),
+  expect("hello".toUpper()).toBe("HELLO"),
+  expect("  hi  ".trim()).toBe("hi")
 ])
 ```
 

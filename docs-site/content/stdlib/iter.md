@@ -82,8 +82,8 @@ Applies `f` to each element in order. Array/Iterator → eager `U[]`. Stream →
 
 ```lin
 [1, 2, 3].map(x => x * 2)                 // [2, 4, 6]
-["a", "b"].map(s => toUpper(s))           // ["A", "B"]
-readStream("in.csv").lines().map(line => toUpper(line))   // Stream<String> (lazy)
+["a", "b"].map(toUpper)                   // ["A", "B"]
+readStream("in.csv").lines().map(toUpper)   // Stream<String> (lazy)
 ```
 
 ---

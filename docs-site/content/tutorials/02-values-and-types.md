@@ -83,7 +83,7 @@ val names: String[] = ["Bob", "Alice"]
 import { length, push } from "std/array"
 
 val first: Int32 = xs[0]      // Int32
-length(xs)                    // 3
+xs.length()                   // 3
 push(xs, 4)                   // xs is now [1, 2, 3, 4]
 ```
 
