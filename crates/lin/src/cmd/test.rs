@@ -31,9 +31,16 @@ const MARKER: &str = "##LINTEST## ";
 /// ones that never produced per-test output, e.g. compile errors / timeouts); `test` records
 /// carry one per-test result with its originating file attached. Re-serialized via serde so the
 /// output is always valid/canonical JSON regardless of what the binary printed.
+/// The NDJSON schema version emitted as the first `meta` record. Bump when the record shapes
+/// change incompatibly so consumers (the VSCode extension) can detect a mismatch. The extension
+/// defines its own `SUPPORTED_SCHEMA` and warns when it sees a newer one.
+const NDJSON_SCHEMA: u32 = 1;
+
 #[derive(Serialize)]
 #[serde(tag = "event")]
 enum JsonRecord {
+    #[serde(rename = "meta")]
+    Meta { schema: u32 },
     #[serde(rename = "test")]
     Test {
         file: String,
@@ -128,6 +135,12 @@ pub fn run(args: &TestArgs) {
     let verbose = args.verbose;
     let coverage = args.coverage;
     let json = args.reporter == Reporter::Json;
+
+    // Emit the schema-version record as the very FIRST NDJSON line, so a consumer can verify
+    // it understands the stream before parsing any per-test/per-file records.
+    if json {
+        emit_record(&JsonRecord::Meta { schema: NDJSON_SCHEMA });
+    }
 
     // Compile phase (sequential — cache writes are atomic but keep it simple).
     let compiled: Vec<Result<PathBuf, String>> = test_files

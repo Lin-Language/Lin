@@ -151,6 +151,11 @@ function makeFormattingProvider(linBin) {
 
 // Matches `test("name"` and `withFixture(..., "name",` style declarations. We only
 // need the literal-string name; dynamic names simply won't match (handled at run time).
+// The NDJSON schema version this extension was written against. The CLI emits a leading
+// `{"event":"meta","schema":N}` record; if N is newer than this we warn (once) that the
+// extension may not understand the stream, but keep parsing best-effort.
+const SUPPORTED_SCHEMA = 1;
+
 const TEST_DECL_RE = /\btest\s*\(\s*"((?:[^"\\]|\\.)*)"/g;
 const WITHFIXTURE_DECL_RE = /\bwithFixture\s*\([^,]*,[^,]*,\s*"((?:[^"\\]|\\.)*)"/g;
 
@@ -346,8 +351,17 @@ function setupTestController(context, linBin) {
     });
 
     let buffer = "";
+    let warnedSchema = false;
     const handleRecord = (rec) => {
-      if (rec.event === "test") {
+      if (rec.event === "meta") {
+        if (typeof rec.schema === "number" && rec.schema > SUPPORTED_SCHEMA && !warnedSchema) {
+          warnedSchema = true;
+          window.showWarningMessage(
+            `Lin: test reporter schema v${rec.schema} is newer than this extension supports ` +
+            `(v${SUPPORTED_SCHEMA}). Update the Lin extension; results may be incomplete.`
+          );
+        }
+      } else if (rec.event === "test") {
         const item = findOrCreateTestItem(controller, rec.file, rec.name);
         run.started(item);
         if (rec.status === "pass") {
