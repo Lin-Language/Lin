@@ -331,6 +331,27 @@ pub unsafe extern "C" fn lin_string_trim_end(s: *const LinString) -> *mut LinStr
     lin_string_from_bytes(trimmed.as_ptr(), trimmed.len() as u32)
 }
 
+/// Escape a string and wrap it in double quotes, producing a valid JSON string literal.
+#[no_mangle]
+pub unsafe extern "C" fn lin_json_escape(s: *const LinString) -> *mut LinString {
+    let st = (*s).as_str();
+    let mut out = String::with_capacity(st.len() + 2);
+    out.push('"');
+    for c in st.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    lin_string_from_bytes(out.as_ptr(), out.len() as u32)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_to_upper(s: *const LinString) -> *mut LinString {
     let st = (*s).as_str();

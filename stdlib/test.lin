@@ -1,8 +1,10 @@
 import { print } from "std/io"
-import { toString } from "std/string"
+import { toString, join } from "std/string"
 import { length } from "std/array"
 import { filter, for, map } from "std/iter"
 import { exit } from "std/io"
+import { getEnv } from "std/env"
+import { toJsonString } from "std/json"
 
 // An Assertion is the result of a single matcher: a pass, or a fail carrying a message.
 // Matchers return this CONCRETE type (not Json) on purpose: it makes a test body's type
@@ -111,19 +113,45 @@ export val withFixture = (setup: () => Json, teardown: (Json) => Null, name: Str
 export val suite = (name: String, tests: Json[]): Json =>
   { "name": name, "tests": tests }
 
+// Machine-readable NDJSON emission, gated on the LIN_TEST_JSON env var (see `report`).
+// Each test result becomes ONE marker-prefixed line. The `##LINTEST## ` prefix lets the CLI
+// distinguish runner records from arbitrary `print` output the user's own code may emit on the
+// same stdout stream. `toJsonString` already quotes+escapes its argument, so the name/message
+// are interpolated raw. Failure messages (which themselves contain `expected:…\nactual:…`
+// newlines) are joined with `\n` and handed to `toJsonString` for escaping.
+val _reportJsonResult = (r: Json): Null =>
+  if r["type"] == "pass" then
+    print(
+      "##LINTEST## {\"event\":\"test\",\"name\":${toJsonString(r["name"])},\"status\":\"pass\"}"
+    )
+  else
+    val messages = r["failures"].map(f => f["message"])
+    val joined = messages.join("\n")
+    print(
+      "##LINTEST## {\"event\":\"test\",\"name\":${toJsonString(r["name"])},\"status\":\"fail\",\"message\":${toJsonString(joined)}}"
+    )
+
 // Print a suite's results and return the failure count (0 = all passed). Unlike `run`, this
 // does NOT call `exit`, so statements AFTER it execute regardless of outcome — the building
 // block for guaranteed afterAll teardown. Inspect the count and `exit` yourself if you want a
 // failing process status: `val failures = report(s); cleanup(); if failures > 0 then exit(1)`.
+//
+// When the LIN_TEST_JSON env var is set, the human-readable suite name / per-test ok|FAIL lines
+// / summary line are suppressed; instead one NDJSON record is emitted per test (consumed by
+// `lin test --reporter json`). The return value (failCount) and `run`'s exit-code behaviour are
+// identical in both modes — the exit code is how the CLI determines file-level pass/fail.
 export val report = (s: Json): Int32 =>
   val failed = s["tests"].filter(r => r["type"] == "fail")
   val passCount = length(s["tests"]) - length(failed)
   val failCount = length(failed)
-  _printSuiteResults({ "name": s["name"], "results": s["tests"] })
-  if failCount == 0 then
-    print("${toString(passCount)} passed")
+  if getEnv("LIN_TEST_JSON") != null then
+    s["tests"].for(r => _reportJsonResult(r))
   else
-    print("${toString(failCount)} failed, ${toString(passCount)} passed")
+    _printSuiteResults({ "name": s["name"], "results": s["tests"] })
+    if failCount == 0 then
+      print("${toString(passCount)} passed")
+    else
+      print("${toString(failCount)} failed, ${toString(passCount)} passed")
   failCount
 
 // Run a suite: print results and `exit(1)` if any test failed (the common case — a non-zero
