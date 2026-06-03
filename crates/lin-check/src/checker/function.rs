@@ -485,6 +485,18 @@ impl Checker {
                 }
             } else if i < expected_params.len() && !matches!(expected_params[i], Type::TypeVar(_)) {
                 expected_params[i].clone()
+            } else if i < expected_params.len()
+                && matches!(expected_params[i], Type::TypeVar(n) if n == u32::MAX)
+            {
+                // The expected param is the `Json` wildcard (`TypeVar(MAX)`) — e.g. the element
+                // param of the `for` wrapper's `(Json, Int32) => Json` callback. Bind the param
+                // DIRECTLY to `Json` rather than minting a fresh inference var: a fresh var here
+                // would be left unsolved for an ambiguous element (a `[]`+push array) and default
+                // to the wrong scalar (the regression that surfaced as an `i8` element). This
+                // matches the opaque `Function` behaviour, where a Json-wildcard param binds to
+                // Json directly. (A non-MAX generic `T`, e.g. map/filter's element, still mints a
+                // fresh var below so the receiver can pin it.)
+                Type::TypeVar(u32::MAX)
             } else {
                 self.env.fresh_type_var()
             };
@@ -547,6 +559,59 @@ impl Checker {
                     rest: rest_slot,
                     span,
                 });
+            }
+        }
+
+        // OPTIONAL ITERATOR-CALLBACK INDEX PARAM (arity-width subtyping, in-place adapter).
+        // The iterable combinators expect a callback whose trailing parameter(s) are the 0-based
+        // `Int32` SOURCE index (`for`/`map`/`filter`/`while`: `(item, i)`; `reduce`: `(acc, item, i)`).
+        // A user may write a SHORTER callback (`item => …`) — compat.rs's arity-width subtyping makes
+        // that assignable. But the COMPILED closure must still have the full arity the caller invokes
+        // it with: the intrinsic loop passes the index unconditionally, and a Tier-B wrapper calls
+        // `f(item, idx)`. So when the EXPECTED type declares MORE params than the lambda, and each
+        // extra trailing expected param is `Int32`, PAD the typed function with synthetic, unused
+        // `Int32` parameters (`__idx{n}`). This is the in-place "adapter": the runtime closure gains
+        // the trailing index slot(s) the caller supplies, the body ignores them, and the inline fast
+        // path (ADR-069) is preserved (no captures added, no thunk). A non-`Int32` extra expected
+        // param is NOT padded (it would be a genuine arity mismatch, rejected at the call site).
+        if params.len() < expected_params.len() {
+            for (k, extra) in expected_params[params.len()..].iter().enumerate() {
+                if matches!(extra, Type::Int32) {
+                    let name = format!("__idx{}", k);
+                    let slot = self.env.define(name.clone(), Type::Int32, false);
+                    typed_params.push(TypedParam {
+                        slot,
+                        name,
+                        ty: Type::Int32,
+                        default: None,
+                    });
+                }
+            }
+        }
+        // INDEX-PARAM ANNOTATION VALIDATION: if the user explicitly annotated a parameter that lines
+        // up with an EXPECTED trailing `Int32` index slot, it must be annotated `Int32` (an
+        // unannotated param already infers `Int32` via the `expected_params[i]` hint above). Any other
+        // annotation (e.g. `(x, i: String) => …`) is a clear, dedicated error rather than the generic
+        // "Argument has type …" mismatch surfaced later at the call site.
+        for (i, param) in params.iter().enumerate() {
+            if i < expected_params.len()
+                && matches!(expected_params[i], Type::Int32)
+                && param.type_ann.is_some()
+                && !matches!(typed_params[i].ty, Type::Int32)
+            {
+                let pspan = match &param.pattern {
+                    Pattern::Ident(_, s) => *s,
+                    _ => span,
+                };
+                return Err(Diagnostic::error(
+                    pspan,
+                    "the index parameter of an iterator callback must be Int32".to_string(),
+                )
+                .with_help(
+                    "the optional trailing parameter of for/map/filter/reduce/while (and find/some/\
+                     every/…) is the 0-based source index; annotate it `Int32` or leave it \
+                     unannotated".to_string(),
+                ));
             }
         }
 

@@ -504,6 +504,19 @@ Concretely:
 - `(Person) => Int32` is assignable to `(Bob) => Int32` for any `Bob` compatible with `Person`.
 - A function returning `Person` is assignable to one returning `Json`.
 
+#### Callback arity-width subtyping
+
+A function value that declares **fewer** parameters is assignable where a function with **more**
+parameters is expected, provided every **extra expected trailing parameter is `Int32`** and the
+common leading parameters and the return type are compatible. This is the type-system rule behind the
+**optional 0-based index parameter** on the iterable combinators (§18.7): the combinator declares a
+callback such as `(T, Int32) => U` (or `reduce`'s `(U, T, Int32) => U`), but a caller's 1-arg (reduce:
+2-arg) lambda still flows through — the omitted trailing `Int32` index is simply ignored. The leniency
+is tight: only extra trailing `Int32` parameters are tolerated (arbitrary arity subtyping is **not**
+allowed; a value with more parameters than expected, or extra non-`Int32` expected parameters, is
+rejected). An explicit annotation on the index parameter must be `Int32`; any other annotation is a
+compile error.
+
 ### 5.9 Structural Typing
 
 Types are structural by default.

@@ -1582,3 +1582,52 @@ miscompile** — runtime behaviour is correct because codegen calls the real sym
 iterate Phase 2 to a fixed point (re-seed with each round's signatures until they stop changing), or
 to fail closed by *requiring* an explicit return annotation on a peer-call-dependent cyclic export.
 Not yet done; tracked as follow-up.
+
+## ADR-079: Optional 0-based index parameter on iterable combinators
+
+**Decision.** The iterable combinators expose an OPTIONAL 0-based `Int32` **source** index as a
+trailing callback parameter (`(item, i) => …`; `reduce`: `(acc, item, i) => …`), the JS
+`forEach((item, idx) => …)` model. A 1-arg (reduce: 2-arg) callback stays valid and unchanged — the
+index is opt-in by arity, fully backward-compatible. Scope: `for`/`map`/`filter`/`reduce`/`while` and
+the derived `find`/`some`/`every`/`flatMap`/`takeWhile`/`dropWhile` plus `std/array`'s `partition`.
+The index is always the **source** position (even for `filter`/`takeWhile`/`dropWhile`, whose output
+position differs). EXCLUDED: the key-extractor/aggregator combinators `sortBy`/`minBy`/`maxBy`/
+`groupBy`/`countBy` (element position is meaningless to a key function); and **streams** — the runtime
+`Stream` combinators keep 1-arg callbacks (a pull-driven stream has no materialised source position).
+
+**Type system.** The enabling rule is **arity-width subtyping** on callbacks (spec §5.8): a function
+value declaring FEWER parameters is assignable where MORE are expected, provided the extra expected
+trailing parameters are all `Int32`. This is deliberately tight — it does not open arbitrary arity
+subtyping; a value with more parameters than expected, or extra non-`Int32` expected parameters, still
+rejects. The intrinsic signatures (`lin_for`/`lin_map`/`lin_filter`/`lin_while`/`lin_reduce`) declare
+the index param `Int32`; an unannotated index param infers `Int32` via the existing bidirectional
+hinting, an explicit `Int32` annotation is allowed, and any other annotation is a clear compile error.
+
+**Lowering — two tiers.**
+- **Tier A — intrinsic combinators** (`for`/`map`/`filter`/`reduce`/`while`) are codegen-inlined LLVM
+  loops (`emit_index_loop`, `lin-ir/src/lower.rs`). The loop counter already exists; it is narrowed
+  Int64→Int32 (a `Coerce`/`trunc`) and passed as the trailing callback argument. The inline fast path
+  (ADR-069) is **preserved** — no closure, no thunk; a 1-param inline lambda simply ignores the
+  surplus index temp (`inline_lambda_body` binds by the lambda's own param count, and the dead
+  narrowing temp is DCE'd).
+- **Tier B — derived combinators** are pure-Lin wrappers that call `f(item, idx)` with a threaded
+  counter. They re-type their callback param to the indexed form and operate on **`Json` elements**
+  (matching their original `arr: Json` shape — keeping the boxed monomorphization unchanged).
+
+**In-place adapter (not a thunk).** When a user passes a SHORTER callback, the checker PADS the typed
+lambda with synthetic unused trailing `Int32` parameters (`infer_function_with_hints`), so the compiled
+closure actually has the arity the caller invokes it with. This is the "adapter" the design called for,
+done in place: no wrapper-closure allocation (which would defeat the Tier-A inline), and it makes the
+Tier-B `f(item, idx)` call always match the closure's true arity. As defence-in-depth, the boxed
+closure-call helpers (`call_body_closure`/`call_body_closure_with_elem_boxes`) TRUNCATE their argument
+list to the closure's declared arity, so a 1-param closure value reaching there is never over-called
+(the one ABI hazard — a 1-param closure called with 2 args is UB).
+
+**No runtime/ABI change.** `lin-runtime` is untouched; the stream combinators keep their 1-arg ABI.
+
+**Inference note.** A `for`-style callback whose expected element param is the `Json` wildcard
+(`TypeVar(MAX)`) binds the param DIRECTLY to `Json` rather than to a fresh inference var. Minting a
+fresh var there left an ambiguous element (a `[]`+push array) unsolved and defaulted to the wrong
+scalar (surfaced as an `i8` element — a real regression caught by the pool stress test). This matches
+the prior opaque-`Function` behaviour; a non-MAX generic `T` (map/filter's element) still mints a fresh
+var so the receiver can pin it.

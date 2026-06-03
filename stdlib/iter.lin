@@ -18,7 +18,12 @@ val length = (x: Json): Int32 =>
 val push = (arr: Json, item: Json): Null =>
   lin_push(arr, item)
 
-export val for = (iterable: Json, f: Function): Null =>
+// The callback OPTIONALLY receives a 0-based `Int32` SOURCE index as a trailing parameter
+// (`(item, i) => …`). A 1-arg callback stays valid (arity-width subtyping). The element stays the
+// opaque `Json` (this wrapper accepts ANY iterable — Array/Iterator/Stream — through a bare `Json`,
+// exactly as before); ONLY the index param's `Int32` type is added so a user's unannotated index
+// param infers `Int32` rather than `Json`.
+export val for = (iterable: Json, f: (Json, Int32) => Json): Null =>
   lin_for(iterable, f)
 
 // `while` over an Array/Iterator runs to predicate-false / exhaustion → `Null`. Over a `Stream`
@@ -29,7 +34,7 @@ export val for = (iterable: Json, f: Function): Null =>
 // checker's `streamish_combinator_ret`. `Iterator`/`Stream` are written WITHOUT a type argument
 // (= `Iterator<Json>`/`Stream<Json>`): the array `T[]` arm carries the element-type inference for
 // the callback, and the source formatter cannot round-trip a parametric `Iterator<T>` annotation.
-export val while = <T>(arr: T[] | Iterator | Stream, f: (T) => Boolean) =>
+export val while = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean) =>
   lin_while(arr, f)
 
 export val range = (start: Int32, end: Int32) =>
@@ -76,43 +81,59 @@ export val concat = (a: Json, b: Json): Json =>
 // body (`U[]`/`T[]`/`U`); the checker's `streamish_combinator_ret` then re-types the call-site
 // result to the stream-shaped form (`Stream<U>`/`Stream<T>`/`U | Error`) when arg0 is DEFINITELY a
 // Stream. Arrays/iterators are UNCHANGED.
-export val map = <T, U>(arr: T[] | Iterator | Stream, f: (T) => U) =>
+export val map = <T, U>(arr: T[] | Iterator | Stream, f: (T, Int32) => U) =>
   lin_map(arr, f)
 
-export val filter = <T>(arr: T[] | Iterator | Stream, f: (T) => Boolean) =>
+export val filter = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean) =>
   lin_filter(arr, f)
 
-export val reduce = <T, U>(arr: T[] | Iterator | Stream, init: U, f: (U, T) => U) =>
+export val reduce = <T, U>(arr: T[] | Iterator | Stream, init: U, f: (U, T, Int32) => U) =>
   lin_reduce(arr, init, f)
 
-export val find = (arr: Json, f: Function): Json =>
+// Tier B derived combinators. The callback OPTIONALLY receives a 0-based `Int32` SOURCE index
+// (`(item, i) => …`); a 1-arg callback stays valid via arity-width subtyping. We thread an `idx`
+// counter and call `f(item, idx)` — the checker PADS a user's 1-arg lambda to 2 params (an unused
+// trailing `Int32`), so the call always matches the closure's true arity (no ABI mismatch). The
+// element stays the opaque `Json` (these wrappers operate on a bare `Json` iterable, exactly as
+// before — keeping their boxed monomorphization); ONLY the callback's index param gains its `Int32`
+// type so a user's unannotated index infers `Int32`. The INNER `lin_while`/`for` callbacks below
+// are 1-arg over `item` and do not use the index.
+export val find = (arr: Json, f: (Json, Int32) => Boolean): Json =>
   var found = null
+  var idx = 0
   lin_while(arr, item =>
-    if f(item) then found = item
+    if f(item, idx) then found = item
+    idx = idx + 1
     found == null
   )
   found
 
-export val some = (arr: Json, f: Function): Boolean =>
+export val some = (arr: Json, f: (Json, Int32) => Boolean): Boolean =>
   var result = false
+  var idx = 0
   lin_while(arr, item =>
-    if f(item) then result = true
+    if f(item, idx) then result = true
+    idx = idx + 1
     !result
   )
   result
 
-export val every = (arr: Json, f: Function): Boolean =>
+export val every = (arr: Json, f: (Json, Int32) => Boolean): Boolean =>
   var result = true
+  var idx = 0
   lin_while(arr, item =>
-    if !f(item) then result = false
+    if !f(item, idx) then result = false
+    idx = idx + 1
     result
   )
   result
 
-export val flatMap = (arr: Json, f: Function): Json =>
+export val flatMap = (arr: Json, f: (Json, Int32) => Json): Json =>
   val result = []
+  var idx = 0
   arr.for(item =>
-    val inner = f(item)
+    val inner = f(item, idx)
+    idx = idx + 1
     inner.for(x => push(result, x))
   )
   result
@@ -138,20 +159,24 @@ export val drop = (arr: Json, n: Int32): Json =>
   )
   result
 
-export val takeWhile = (arr: Json, f: Function): Json =>
+export val takeWhile = (arr: Json, f: (Json, Int32) => Boolean): Json =>
   val result = []
+  var idx = 0
   lin_while(arr, item =>
-    val keep = f(item)
+    val keep = f(item, idx)
+    idx = idx + 1
     if keep then push(result, item)
     keep
   )
   result
 
-export val dropWhile = (arr: Json, f: Function): Json =>
+export val dropWhile = (arr: Json, f: (Json, Int32) => Boolean): Json =>
   val result = []
   var dropping = true
+  var idx = 0
   arr.for(item =>
-    val keep = !dropping || !f(item)
+    val keep = !dropping || !f(item, idx)
+    idx = idx + 1
     dropping = if keep then false else dropping
     if keep then push(result, item)
   )

@@ -76,7 +76,10 @@ impl Checker {
                         Type::Iterator(Box::new(Type::TypeVar(9010))),
                         Type::Stream(Box::new(Type::TypeVar(9010))),
                     ]),
-                    Type::func(vec![Type::TypeVar(9010)], Type::TypeVar(u32::MAX)),
+                    // The callback OPTIONALLY receives a 0-based `Int32` SOURCE index as a trailing
+                    // parameter (`(item, i) => …`). A 1-arg callback stays valid via arity-width
+                    // subtyping (compat.rs). The index is threaded by the IR loop (Tier A inline).
+                    Type::func(vec![Type::TypeVar(9010), Type::Int32], Type::TypeVar(u32::MAX)),
                 ], Type::Null),
         );
 
@@ -92,7 +95,8 @@ impl Checker {
                         Type::Iterator(Box::new(Type::TypeVar(9011))),
                         Type::Stream(Box::new(Type::TypeVar(9011))),
                     ]),
-                    Type::func(vec![Type::TypeVar(9011)], Type::Bool),
+                    // Optional 0-based `Int32` source index trailing param (see `lin_for`).
+                    Type::func(vec![Type::TypeVar(9011), Type::Int32], Type::Bool),
                 ], Type::Null),
         );
 
@@ -126,7 +130,8 @@ impl Checker {
                         Type::Iterator(Box::new(Type::TypeVar(9030))),
                         Type::Stream(Box::new(Type::TypeVar(9030))),
                     ]),
-                    Type::func(vec![Type::TypeVar(9030)], Type::TypeVar(9031)),
+                    // Optional 0-based `Int32` source index trailing param (see `lin_for`).
+                    Type::func(vec![Type::TypeVar(9030), Type::Int32], Type::TypeVar(9031)),
                 ], Type::Array(Box::new(Type::TypeVar(9031)))),
         );
 
@@ -139,7 +144,9 @@ impl Checker {
                         Type::Iterator(Box::new(Type::TypeVar(9040))),
                         Type::Stream(Box::new(Type::TypeVar(9040))),
                     ]),
-                    Type::func(vec![Type::TypeVar(9040)], Type::Bool),
+                    // Optional 0-based `Int32` SOURCE index trailing param (see `lin_for`). The
+                    // index is the source position even though filter's output position differs.
+                    Type::func(vec![Type::TypeVar(9040), Type::Int32], Type::Bool),
                 ], Type::Array(Box::new(Type::TypeVar(9040)))),
         );
 
@@ -153,7 +160,8 @@ impl Checker {
                         Type::Stream(Box::new(Type::TypeVar(9050))),
                     ]),
                     Type::TypeVar(9051),
-                    Type::func(vec![Type::TypeVar(9051), Type::TypeVar(9050)], Type::TypeVar(9051)),
+                    // Optional 0-based `Int32` source index as the THIRD param (`(acc, item, i)`).
+                    Type::func(vec![Type::TypeVar(9051), Type::TypeVar(9050), Type::Int32], Type::TypeVar(9051)),
                 ], Type::TypeVar(9051)),
         );
 
