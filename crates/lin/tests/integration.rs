@@ -5093,6 +5093,13 @@ fn test_sdl_bounce_headless() {
         eprintln!("SKIP: lin binary not built; run `cargo build -p lin` first");
         return;
     }
+    // The committed libSDL3.so is a Linux x86-64 ELF; it will not link/load on macOS. macOS SDL
+    // would need a macOS dylib (future enhancement); the rpath MECHANISM itself is covered cross-
+    // platform by test_ffi_vendored_shared_lib_relocatable.
+    if !cfg!(target_os = "linux") {
+        eprintln!("SKIP: committed libSDL3 is a Linux ELF; SDL demo tests run on Linux only");
+        return;
+    }
     // The real libSDL3.so is committed; skip only if it is somehow absent on this platform.
     if !ws.join("examples/sdl/libs/libSDL3.so").exists() {
         eprintln!("SKIP: examples/sdl/libs/libSDL3.so not present");
@@ -5122,6 +5129,12 @@ fn test_sdl_ai_worker_headless() {
         eprintln!("SKIP: lin binary not built; run `cargo build -p lin` first");
         return;
     }
+    // Linux-only: committed libSDL3 is a Linux ELF (see test_sdl_bounce_headless). The rpath
+    // mechanism is covered cross-platform by test_ffi_vendored_shared_lib_relocatable.
+    if !cfg!(target_os = "linux") {
+        eprintln!("SKIP: committed libSDL3 is a Linux ELF; SDL demo tests run on Linux only");
+        return;
+    }
     if !ws.join("examples/sdl/libs/libSDL3.so").exists() {
         eprintln!("SKIP: examples/sdl/libs/libSDL3.so not present");
         return;
@@ -5133,6 +5146,150 @@ fn test_sdl_ai_worker_headless() {
     assert!(stdout.contains("pixel[148,92] = 0,200,120"), "got: {}", stdout);
     assert!(stdout.contains("rendered pixel matches fill: true"), "got: {}", stdout);
     assert!(stdout.contains("done"), "got: {}", stdout);
+}
+
+// Cross-platform proof that the vendored-shared-library rpath mechanism is RELOCATABLE on whatever
+// OS this test runs on (ubuntu-22.04 and macos-latest in CI). Unlike the SDL tests, this builds its
+// OWN tiny shared library from C source at test time — so there is no committed platform binary, and
+// the SAME test exercises the Linux ($ORIGIN) and macOS (@loader_path + @rpath install_name) paths.
+//
+// The build binary lives in a SUBDIR (build/) distinct from the lib dir (libs/) so the emitted rpath
+// is a NON-EMPTY relative token (e.g. `$ORIGIN/../libs` or `@loader_path/../libs`). We then relocate
+// the binary + lib to a fresh tree PRESERVING that relative layout (binary at reloc/build/prog, lib
+// at reloc/libs/...) and run the relocated binary from an unrelated cwd with the library search-path
+// env stripped — so the only way the lib resolves is the baked-in relative rpath.
+#[test]
+fn test_ffi_vendored_shared_lib_relocatable() {
+    let lin_bin = lin_bin();
+    if !lin_bin.exists() {
+        eprintln!("SKIP: lin binary not built; run `cargo build -p lin` first");
+        return;
+    }
+
+    // Platform specifics.
+    let is_macos = cfg!(target_os = "macos");
+    let ext = if is_macos { "dylib" } else { "so" };
+
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let tmp = std::env::temp_dir().join(format!("lin_relo_{}", id));
+    let _ = fs::remove_dir_all(&tmp);
+    let libs_dir = tmp.join("libs");
+    let build_dir = tmp.join("build");
+    fs::create_dir_all(&libs_dir).unwrap();
+    fs::create_dir_all(&build_dir).unwrap();
+
+    // 1. Write + compile the tiny shared library into <tmp>/libs/librelo.<ext>.
+    let src_c = tmp.join("mylib.c");
+    fs::write(
+        &src_c,
+        "#include <stdint.h>\nint32_t lin_relo_add(int32_t a, int32_t b){ return a + b; }\n",
+    )
+    .unwrap();
+    let lib_path = libs_dir.join(format!("librelo.{}", ext));
+    let cc_args: Vec<String> = if is_macos {
+        // -install_name @rpath/<leaf> makes the executable's reference to the dylib `@rpath/...`,
+        // so the @loader_path rpath is consulted (we control this dylib).
+        vec![
+            "-dynamiclib".into(),
+            "-install_name".into(),
+            "@rpath/librelo.dylib".into(),
+            "-o".into(),
+            lib_path.display().to_string(),
+            src_c.display().to_string(),
+        ]
+    } else {
+        vec![
+            "-shared".into(),
+            "-fPIC".into(),
+            "-o".into(),
+            lib_path.display().to_string(),
+            src_c.display().to_string(),
+        ]
+    };
+    let cc_status = Command::new("cc").args(&cc_args).status();
+    if cc_status.map(|s| !s.success()).unwrap_or(true) {
+        eprintln!("SKIP: failed to compile relocatable shared library (cc unavailable?)");
+        let _ = fs::remove_dir_all(&tmp);
+        return;
+    }
+
+    // 2. Write the Lin program. The foreign-library path is resolved relative to the `lin build`
+    //    process CWD, which we set to <tmp> below — so "libs/librelo.<ext>" points at the lib we
+    //    just built. (Both the .lin file and the libs dir live under <tmp>.)
+    let prog_lin = tmp.join("prog.lin");
+    fs::write(
+        &prog_lin,
+        format!(
+            r#"import foreign "libs/librelo.{ext}"
+  val lin_relo_add: (Int32, Int32) => Int32
+
+import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+
+print("relo: ${{toString(lin_relo_add(40, 2))}}")
+"#,
+            ext = ext
+        ),
+    )
+    .unwrap();
+
+    // 3. Build into <tmp>/build/prog so the binary dir (build/) differs from the lib dir (libs/),
+    //    forcing a non-empty relative rpath like `<token>/../libs`.
+    let built_bin = build_dir.join("prog");
+    let compile_out = Command::new(&lin_bin)
+        .args(["build", prog_lin.to_str().unwrap(), "-o", built_bin.to_str().unwrap()])
+        // Resolve the foreign-library import path (libs/librelo.<ext>) relative to <tmp>.
+        .current_dir(&tmp)
+        .output()
+        .expect("failed to run lin build");
+    assert!(
+        compile_out.status.success(),
+        "lin build failed: {}",
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+
+    // 4. RELOCATION: copy the built binary + libs dir into a FRESH tree, preserving the SAME
+    //    relative layout the rpath encodes (binary at reloc/build/prog, lib at reloc/libs/...).
+    let reloc = tmp.join("reloc");
+    let reloc_build = reloc.join("build");
+    let reloc_libs = reloc.join("libs");
+    fs::create_dir_all(&reloc_build).unwrap();
+    fs::create_dir_all(&reloc_libs).unwrap();
+    let reloc_bin = reloc_build.join("prog");
+    fs::copy(&built_bin, &reloc_bin).unwrap();
+    fs::copy(&lib_path, reloc_libs.join(format!("librelo.{}", ext))).unwrap();
+    // Preserve the executable bit on the copied binary.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&reloc_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&reloc_bin, perms).unwrap();
+    }
+
+    // 5. Run the relocated binary from an UNRELATED cwd with the lib search-path env stripped, so
+    //    the only resolution path is the baked-in relative rpath.
+    let mut run_cmd = Command::new(&reloc_bin);
+    run_cmd.current_dir(std::env::temp_dir());
+    // Strip the platform's lib search-path env. On macOS DYLD_* vars are generally not inherited
+    // into a spawned child and are SIP-stripped; remove DYLD_LIBRARY_PATH for good measure anyway.
+    run_cmd.env_remove("LD_LIBRARY_PATH");
+    run_cmd.env_remove("DYLD_LIBRARY_PATH");
+    let run_out = run_cmd.output().expect("failed to run relocated binary");
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    let stderr = String::from_utf8_lossy(&run_out.stderr);
+    assert!(
+        run_out.status.success(),
+        "relocated binary failed (relative rpath did not resolve the vendored lib): status={} stdout={} stderr={}",
+        run_out.status, stdout, stderr
+    );
+    assert!(
+        stdout.contains("relo: 42"),
+        "expected 'relo: 42', got stdout={} stderr={}",
+        stdout, stderr
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
 }
 
 // ── Formatter idempotency ─────────────────────────────────────────────────────
