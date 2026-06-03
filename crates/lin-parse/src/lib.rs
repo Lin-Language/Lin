@@ -40,4 +40,74 @@ mod format_source_tests {
             "comment was stripped by format_source; got:\n{out}"
         );
     }
+
+    /// Re-parse `source` and find the first top-level `Call`/`DotCall`, returning its
+    /// `partial` flag. Used to assert the formatter round-trips the partial-application
+    /// trailing comma (`f(x,)`) — dropping it would silently change call semantics.
+    fn first_call_partial(source: &str) -> bool {
+        let mut lexer = lin_lex::Lexer::new(source, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let module = parser.parse_module();
+        assert!(parser.diagnostics.is_empty(), "round-trip output did not parse: {source:?}");
+        fn find(e: &Expr) -> Option<bool> {
+            match e {
+                Expr::Call { partial, .. } => Some(*partial),
+                Expr::DotCall { partial, .. } => Some(*partial),
+                _ => None,
+            }
+        }
+        for stmt in &module.statements {
+            if let Stmt::Val { value, .. } = stmt {
+                if let Some(p) = find(value) {
+                    return p;
+                }
+            }
+        }
+        panic!("no Call/DotCall found in {source:?}");
+    }
+
+    #[test]
+    fn format_source_preserves_partial_application_comma() {
+        // BUG: the formatter never read `partial` and dropped the trailing comma, turning
+        // a partial application `add(1,)` into a different-typed full call `add(1)`.
+        let src = "val f = add(1,)\n";
+        let out = format_source(src).expect("should parse");
+        assert!(
+            out.contains("add(1,)"),
+            "partial-application trailing comma was dropped; got:\n{out}"
+        );
+        assert!(first_call_partial(&out), "re-parsed call lost partial == true");
+    }
+
+    #[test]
+    fn format_source_preserves_partial_application_dotcall() {
+        let src = "val f = x.add(1,)\n";
+        let out = format_source(src).expect("should parse");
+        assert!(
+            out.contains("add(1,)"),
+            "partial-application trailing comma was dropped on DotCall; got:\n{out}"
+        );
+        assert!(first_call_partial(&out), "re-parsed DotCall lost partial == true");
+    }
+
+    #[test]
+    fn format_source_non_partial_call_has_no_trailing_comma() {
+        // The inverse guard: a normal call must NOT gain a spurious trailing comma.
+        let src = "val f = add(1)\n";
+        let out = format_source(src).expect("should parse");
+        assert!(!out.contains(",)"), "spurious trailing comma added; got:\n{out}");
+        assert!(!first_call_partial(&out), "non-partial call gained partial == true");
+    }
+
+    #[test]
+    fn format_source_preserves_partial_multiline_call() {
+        // A long argument list that the formatter splits across lines must still re-emit
+        // the trailing comma after the final argument.
+        let long = "a".repeat(90);
+        let src = format!("val f = add({long}, 2,)\n");
+        let out = format_source(&src).expect("should parse");
+        assert!(out.contains('\n'), "expected a multi-line arglist; got:\n{out}");
+        assert!(first_call_partial(&out), "multi-line partial call lost partial == true");
+    }
 }

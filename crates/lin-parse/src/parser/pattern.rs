@@ -130,6 +130,7 @@ impl Parser {
         let mut rest = None;
 
         while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+            let loop_start = self.pos;
             if self.check(TokenKind::DotDotDot) {
                 self.advance();
                 rest = Some(self.expect_ident());
@@ -195,6 +196,9 @@ impl Parser {
                 self.advance();
             }
             self.skip_newlines();
+            if self.ensure_progress(loop_start) {
+                continue;
+            }
         }
         self.expect(TokenKind::RBrace);
         Pattern::Object(fields, rest, span)
@@ -208,6 +212,7 @@ impl Parser {
         let mut rest = None;
 
         while !self.check(TokenKind::RBracket) && !self.is_at_end() {
+            let loop_start = self.pos;
             if self.check(TokenKind::DotDotDot) {
                 self.advance();
                 rest = Some(self.expect_ident());
@@ -218,6 +223,9 @@ impl Parser {
                 self.advance();
             }
             self.skip_newlines();
+            if self.ensure_progress(loop_start) {
+                continue;
+            }
         }
         self.expect(TokenKind::RBracket);
         Pattern::Array(elements, rest, span)

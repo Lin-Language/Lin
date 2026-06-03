@@ -1304,18 +1304,20 @@ fn fmt_inline(expr: &Expr) -> String {
         Expr::UnaryOp { op, operand, .. } => {
             format!("{}{}", unaryop_symbol(op), fmt_inline(operand))
         }
-        Expr::Call { func, args, .. } => {
+        Expr::Call { func, args, partial, .. } => {
             let fs = fmt_postfix_base(func, fmt_inline);
             let as_: Vec<String> = with_arg_position(true, || args.iter().map(fmt_inline).collect());
-            format!("{}({})", fs, as_.join(", "))
+            let trailing = if *partial && !args.is_empty() { "," } else { "" };
+            format!("{}({}{})", fs, as_.join(", "), trailing)
         }
-        Expr::DotCall { receiver, method, args, .. } => {
+        Expr::DotCall { receiver, method, args, partial, .. } => {
             let r = fmt_postfix_base(receiver, fmt_inline);
             match args {
                 None => format!("{}.{}", r, method),
                 Some(a) => {
                     let as_: Vec<String> = with_arg_position(true, || a.iter().map(fmt_inline).collect());
-                    format!("{}.{}({})", r, method, as_.join(", "))
+                    let trailing = if *partial && !a.is_empty() { "," } else { "" };
+                    format!("{}.{}({}{})", r, method, as_.join(", "), trailing)
                 }
             }
         }
@@ -1538,9 +1540,9 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         }
 
         // ── Call ──────────────────────────────────────────────────────────────
-        Expr::Call { func, args, .. } => {
+        Expr::Call { func, args, partial, .. } => {
             let fs = fmt_postfix_base(func, |e| fmt_expr(e, false, ind));
-            format!("{}{}", fs, fmt_call_arglist(args, ind))
+            format!("{}{}", fs, fmt_call_arglist(args, *partial, ind))
         }
 
         // ── DotCall / method chain ────────────────────────────────────────────
@@ -2271,11 +2273,17 @@ fn fmt_stmt(stmt: &Stmt, ind: &str) -> String {
 ///   arg): open paren on the call line, each argument on its own line at child indent, a
 ///   multi-line lambda arg renders `param =>` then its body indented beneath, comma between
 ///   args, closing paren on its own line at `ind`.
-fn fmt_call_arglist(args: &[Expr], ind: &str) -> String {
-    with_arg_position(true, || fmt_call_arglist_inner(args, ind))
+fn fmt_call_arglist(args: &[Expr], partial: bool, ind: &str) -> String {
+    with_arg_position(true, || fmt_call_arglist_inner(args, partial, ind))
 }
 
-fn fmt_call_arglist_inner(args: &[Expr], ind: &str) -> String {
+fn fmt_call_arglist_inner(args: &[Expr], partial: bool, ind: &str) -> String {
+    // A trailing comma after the LAST argument requests partial application (`f(x,)`,
+    // AST `partial == true`). The checker dispatches partial vs full call on this flag
+    // (lin-check call.rs), so the formatter MUST re-emit the comma — dropping it would
+    // silently change `add(1,)` (partial) into `add(1)` (full call), changing meaning.
+    // An empty arg list cannot be partial (there is no preceding arg for the comma).
+    let trailing = if partial && !args.is_empty() { "," } else { "" };
     if args.is_empty() {
         return "()".to_string();
     }
@@ -2289,7 +2297,7 @@ fn fmt_call_arglist_inner(args: &[Expr], ind: &str) -> String {
     if !any_inline_multiline && !any_author_newline_lambda {
         let joined = inline_args.join(", ");
         if joined.len() + ind.len() <= 80 {
-            return format!("({})", joined);
+            return format!("({}{})", joined, trailing);
         }
     }
 
@@ -2325,9 +2333,9 @@ fn fmt_call_arglist_inner(args: &[Expr], ind: &str) -> String {
         let collapsed_close = last_line == format!("{}]", ind) || last_line == format!("{}}}", ind);
         let lead = if n == 1 { String::new() } else { format!("{}, ", inline_args[..n - 1].join(", ")) };
         if last_is_multiline_lambda && !collapsed_close {
-            return format!("({}{}\n{})", lead, last, ind);
+            return format!("({}{}{}\n{})", lead, last, trailing, ind);
         }
-        return format!("({}{})", lead, last);
+        return format!("({}{}{})", lead, last, trailing);
     }
 
     // OVER-BUDGET TRAILING LAMBDA-WITH-COLLECTION-BODY: the call exceeds 80 cols but no arg is
@@ -2356,9 +2364,9 @@ fn fmt_call_arglist_inner(args: &[Expr], ind: &str) -> String {
             let collapsed = last_line == format!("{}]", ind) || last_line == format!("{}}}", ind);
             let lead = if n == 1 { String::new() } else { format!("{}, ", inline_args[..n - 1].join(", ")) };
             if collapsed {
-                return format!("({}{})", lead, last);
+                return format!("({}{}{})", lead, last, trailing);
             }
-            return format!("({}{}\n{})", lead, last, ind);
+            return format!("({}{}{}\n{})", lead, last, trailing, ind);
         }
     }
 
@@ -2367,22 +2375,23 @@ fn fmt_call_arglist_inner(args: &[Expr], ind: &str) -> String {
         .iter()
         .map(|s| format!("{}{}", child_ind, s))
         .collect();
-    format!("(\n{}\n{})", arg_lines.join(",\n"), ind)
+    format!("(\n{}{}\n{})", arg_lines.join(",\n"), trailing, ind)
 }
 
 // ── dot chain ─────────────────────────────────────────────────────────────────
 
-type ChainLink<'a> = (&'a str, &'a Option<Vec<Expr>>, u32);
+type ChainLink<'a> = (&'a str, &'a Option<Vec<Expr>>, bool, u32);
 
 fn collect_chain(expr: &Expr) -> (&Expr, Vec<ChainLink<'_>>) {
     let mut chain = Vec::new();
     let mut cur = expr;
     loop {
-        if let Expr::DotCall { receiver, method, args, .. } = cur {
+        if let Expr::DotCall { receiver, method, args, partial, .. } = cur {
             // The link's source position: the receiver's span end is where `.method`
             // begins, which is the offset that tells us whether the author broke the
-            // chain across lines (the `.` sits just after the receiver).
-            chain.push((method.as_str(), args, receiver.span().end));
+            // chain across lines (the `.` sits just after the receiver). `partial` is the
+            // trailing-comma flag (`x.f(a,)`) — must be re-emitted (see fmt_call_arglist).
+            chain.push((method.as_str(), args, *partial, receiver.span().end));
             cur = receiver;
         } else {
             break;
@@ -2404,7 +2413,7 @@ fn fmt_chain(expr: &Expr, ind: &str) -> String {
     let author_multiline = {
         let mut prev = root.span().end;
         let mut broke = false;
-        for (_, _, link_pos) in &chain {
+        for (_, _, _, link_pos) in &chain {
             if spans_on_different_source_lines(prev, *link_pos) {
                 broke = true;
             }
@@ -2429,10 +2438,10 @@ fn fmt_chain(expr: &Expr, ind: &str) -> String {
     // rather than splitting the receiver onto its own `.method` line (which would be wrong for
     // a 1-call chain whose only multi-line-ness comes from its argument).
     if chain.len() == 1 && !author_multiline {
-        let (method, args, _) = &chain[0];
+        let (method, args, partial, _) = &chain[0];
         let r = fmt_postfix_base(root, |e| fmt_expr(e, false, ind));
         if let Some(a) = args {
-            return format!("{}.{}{}", r, method, fmt_call_arglist(a, ind));
+            return format!("{}.{}{}", r, method, fmt_call_arglist(a, *partial, ind));
         }
         return format!("{}.{}", r, method);
     }
@@ -2441,10 +2450,10 @@ fn fmt_chain(expr: &Expr, ind: &str) -> String {
     let root_str = fmt_postfix_base(root, |e| fmt_expr(e, false, ind));
     let call_strs: Vec<String> = chain
         .iter()
-        .map(|(method, args, _)| match args {
+        .map(|(method, args, partial, _)| match args {
             None => format!("{}.{}", child_ind, method),
             Some(a) => {
-                format!("{}.{}{}", child_ind, method, fmt_call_arglist(a, &child_ind))
+                format!("{}.{}{}", child_ind, method, fmt_call_arglist(a, *partial, &child_ind))
             }
         })
         .collect();

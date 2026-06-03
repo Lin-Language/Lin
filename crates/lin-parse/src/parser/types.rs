@@ -53,9 +53,13 @@ impl Parser {
                 self.advance();
                 let mut params = Vec::new();
                 while !self.check(TokenKind::RParen) && !self.is_at_end() {
+                    let loop_start = self.pos;
                     params.push(self.parse_type_expr());
                     if self.check(TokenKind::Comma) {
                         self.advance();
+                    }
+                    if self.ensure_progress(loop_start) {
+                        continue;
                     }
                 }
                 self.expect(TokenKind::RParen);
@@ -92,9 +96,13 @@ impl Parser {
                 self.advance();
                 let mut types = Vec::new();
                 while !self.check(TokenKind::RBracket) && !self.is_at_end() {
+                    let loop_start = self.pos;
                     types.push(self.parse_type_expr());
                     if self.check(TokenKind::Comma) {
                         self.advance();
+                    }
+                    if self.ensure_progress(loop_start) {
+                        continue;
                     }
                 }
                 self.expect(TokenKind::RBracket);
