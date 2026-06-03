@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
@@ -363,7 +363,8 @@ fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
         .or_else(|| WORKSPACE_ROOT.read().unwrap().clone())
         .unwrap_or_else(|| PathBuf::from("."));
 
-    pre_resolve_imports(&module, &effective_base, &mut imported);
+    let mut visiting: HashSet<String> = HashSet::new();
+    pre_resolve_imports(&module, &effective_base, &mut imported, &mut visiting);
 
     let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
     for (path, imp_module) in &imported {
@@ -477,9 +478,16 @@ fn find_name_in_import(source: &str, import_start: usize, name: &str) -> Option<
 
 // ── import resolution (mirrors lin-compile logic) ────────────────────────────
 
+// NOTE: this list MUST stay in sync with `lin_compile::stdlib_source`
+// (crates/lin-compile/src/lib.rs). The LSP can't simply call that function
+// because `lin-compile` pulls in LLVM/inkwell, which we don't want to link into
+// the language server. The `stdlib_modules_match_compiler` test below pins the
+// two lists together so any future drift fails CI rather than silently breaking
+// editor support for a module. If you add a stdlib module, add it in BOTH places.
 fn stdlib_source(path: &str) -> Option<&'static str> {
     match path {
         "std/io"       => Some(include_str!("../../../stdlib/io.lin")),
+        "std/json"     => Some(include_str!("../../../stdlib/json.lin")),
         "std/string"   => Some(include_str!("../../../stdlib/string.lin")),
         "std/number"   => Some(include_str!("../../../stdlib/number.lin")),
         "std/array"    => Some(include_str!("../../../stdlib/array.lin")),
@@ -496,18 +504,54 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/env"      => Some(include_str!("../../../stdlib/env.lin")),
         "std/hash"     => Some(include_str!("../../../stdlib/hash.lin")),
         "std/bytes"    => Some(include_str!("../../../stdlib/bytes.lin")),
+        "std/net"      => Some(include_str!("../../../stdlib/net.lin")),
+        "std/process"  => Some(include_str!("../../../stdlib/process.lin")),
+        "std/tty"      => Some(include_str!("../../../stdlib/tty.lin")),
+        "std/signal"   => Some(include_str!("../../../stdlib/signal.lin")),
+        "std/yaml"     => Some(include_str!("../../../stdlib/yaml.lin")),
+        "std/jq"       => Some(include_str!("../../../stdlib/jq.lin")),
+        "std/stream"   => Some(include_str!("../../../stdlib/stream.lin")),
+        "std/compress" => Some(include_str!("../../../stdlib/compress.lin")),
+        "std/archive"  => Some(include_str!("../../../stdlib/archive.lin")),
         _ => None,
     }
+}
+
+/// A module's stable identity for cycle detection. Mirrors
+/// `lin_compile::module_identity`: stdlib paths (`std/...`) are already canonical;
+/// user modules are keyed by their canonicalised absolute file path so two spellings
+/// of the same file map to one identity.
+fn module_identity(path: &str, base_dir: &Path) -> String {
+    if stdlib_source(path).is_some() {
+        return path.to_string();
+    }
+    let file_path = base_dir.join(format!("{}.lin", path));
+    file_path
+        .canonicalize()
+        .unwrap_or(file_path)
+        .to_string_lossy()
+        .to_string()
 }
 
 fn pre_resolve_imports(
     ast_module: &lin_parse::ast::Module,
     base_dir: &Path,
     cache: &mut HashMap<String, TypedModule>,
+    // Identities of modules currently being resolved or already resolved. Guards
+    // against infinite recursion on cyclic import graphs (a now-supported language
+    // feature; cf. lin-compile's Tarjan SCC handling). Unlike the compiler, the LSP
+    // only needs to resolve each module once and not crash — it doesn't need SCC
+    // seed-and-recheck for accurate cross-cycle types.
+    visiting: &mut HashSet<String>,
 ) {
     for stmt in &ast_module.statements {
         if let Stmt::Import { path, .. } = stmt {
             if cache.contains_key(path.as_str()) {
+                continue;
+            }
+            let identity = module_identity(path.as_str(), base_dir);
+            // Already resolved or currently on the resolution stack: skip to break cycles.
+            if !visiting.insert(identity) {
                 continue;
             }
             let (ast_mod, child_base) = if let Some(src) = stdlib_source(path.as_str()) {
@@ -533,7 +577,7 @@ fn pre_resolve_imports(
                 }
             };
 
-            pre_resolve_imports(&ast_mod, &child_base, cache);
+            pre_resolve_imports(&ast_mod, &child_base, cache, visiting);
 
             let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
             for (dep_path, dep_module) in cache.iter() {
@@ -790,5 +834,71 @@ mod tests {
         assert_eq!(first_param_category("(Int32) => Float64").as_deref(), Some("number"));
         assert_eq!(first_param_category("() => String"), None);
         assert_eq!(first_param_category("String"), None);
+    }
+
+    /// Cyclic import graph (A imports B, B imports A) must terminate, not
+    /// stack-overflow. Cyclic imports are a supported language feature; the LSP
+    /// previously recursed unconditionally and crashed the server on open/edit.
+    #[test]
+    fn pre_resolve_imports_terminates_on_import_cycle() {
+        let dir = std::env::temp_dir().join(format!("lin_lsp_cycle_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // a imports b, b imports a.
+        std::fs::write(dir.join("a.lin"), "import { fromB } from \"b\"\nval fromA = 1\n").unwrap();
+        std::fs::write(dir.join("b.lin"), "import { fromA } from \"a\"\nval fromB = 2\n").unwrap();
+
+        let entry = parse("import { fromA } from \"a\"\n");
+        let mut cache: HashMap<String, TypedModule> = HashMap::new();
+        let mut visiting: HashSet<String> = HashSet::new();
+        // The assertion is simply that this call returns (does not overflow the stack).
+        pre_resolve_imports(&entry, &dir, &mut cache, &mut visiting);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Non-cyclic imports still resolve normally (the cycle guard must not regress them).
+    #[test]
+    fn pre_resolve_imports_resolves_acyclic_chain() {
+        let dir = std::env::temp_dir().join(format!("lin_lsp_acyclic_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("leaf.lin"), "val leafVal = 42\n").unwrap();
+
+        let entry = parse("import { leafVal } from \"leaf\"\n");
+        let mut cache: HashMap<String, TypedModule> = HashMap::new();
+        let mut visiting: HashSet<String> = HashSet::new();
+        pre_resolve_imports(&entry, &dir, &mut cache, &mut visiting);
+
+        assert!(cache.contains_key("leaf"), "acyclic import should resolve: {:?}", cache.keys().collect::<Vec<_>>());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every stdlib module on disk must be resolvable by the LSP's `stdlib_source`,
+    /// which in turn must match `lin_compile::stdlib_source` (kept in sync by hand;
+    /// see the note on `stdlib_source`). This pins the two lists together: if a new
+    /// stdlib module is added but not wired into the LSP, this fails.
+    #[test]
+    fn stdlib_modules_match_compiler() {
+        // Canonical set = every non-test .lin file in stdlib/.
+        let stdlib_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../stdlib");
+        let mut missing = Vec::new();
+        for entry in std::fs::read_dir(&stdlib_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(stem) = name.strip_suffix(".lin") else { continue };
+            if stem.ends_with(".test") {
+                continue;
+            }
+            let module = format!("std/{}", stem);
+            if stdlib_source(&module).is_none() {
+                missing.push(module);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "LSP stdlib_source is missing modules (sync with lin_compile::stdlib_source): {:?}",
+            missing
+        );
     }
 }
