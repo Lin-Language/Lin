@@ -47,8 +47,20 @@ impl<'ctx> Codegen<'ctx> {
         }
         match ty {
             Type::Str | Type::StrLit(_) => val,
+            // UInt64 must stringify UNSIGNED: a value >= 2^63 read as a signed i64 prints a
+            // negative number. UInt8/16/32 zero-extend into an always-positive i64, so the
+            // signed lin_int_to_string is correct for them.
+            Type::UInt64 => {
+                let i64_ty = self.context.i64_type();
+                let u64_val = self.builder.int_z_extend_or_bit_cast(val.into_int_value(), i64_ty, "uext");
+                self.builder
+                    .build_call(self.rt.uint_to_string, &[u64_val.into()], "utos")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic()
+            }
             Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64
-            | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64 => {
+            | Type::UInt8 | Type::UInt16 | Type::UInt32 => {
                 let i64_ty = self.context.i64_type();
                 let i64_val = if ty.is_signed() {
                     self.builder.int_s_extend_or_bit_cast(val.into_int_value(), i64_ty, "iext")

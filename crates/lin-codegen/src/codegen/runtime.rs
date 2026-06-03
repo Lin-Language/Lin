@@ -25,6 +25,7 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub array_push: FunctionValue<'ctx>,
     pub array_get: FunctionValue<'ctx>,
     pub int_to_string: FunctionValue<'ctx>,
+    pub uint_to_string: FunctionValue<'ctx>,
     pub float_to_string: FunctionValue<'ctx>,
     pub bool_to_string: FunctionValue<'ctx>,
     pub null_to_string: FunctionValue<'ctx>,
@@ -126,6 +127,13 @@ impl<'ctx> RuntimeFns<'ctx> {
             string_ptr_type.fn_type(&[i64_type.into()], false),
             None,
         );
+        // Unsigned 64-bit → string (the payload bits are interpreted as u64). Used for UInt64
+        // values, which lin_int_to_string would print as a negative number when >= 2^63.
+        let uint_to_string = module.add_function(
+            "lin_uint_to_string",
+            string_ptr_type.fn_type(&[i64_type.into()], false),
+            None,
+        );
         let float_to_string = module.add_function(
             "lin_float_to_string",
             string_ptr_type.fn_type(&[context.f64_type().into()], false),
@@ -190,6 +198,7 @@ impl<'ctx> RuntimeFns<'ctx> {
             array_push,
             array_get,
             int_to_string,
+            uint_to_string,
             float_to_string,
             bool_to_string,
             null_to_string,

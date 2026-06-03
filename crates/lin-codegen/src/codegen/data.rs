@@ -1,6 +1,7 @@
 use super::builder_ext::BuilderExt;
-use inkwell::types::{BasicType, BasicTypeEnum};
+use inkwell::types::BasicType;
 use inkwell::values::BasicValueEnum;
+use lin_common::tags::{TAG_INT32, TAG_INT64, TAG_OBJECT};
 use inkwell::{AddressSpace, IntPredicate};
 
 use lin_check::types::Type;
@@ -114,21 +115,28 @@ impl<'ctx> Codegen<'ctx> {
                 let tag_val = Self::type_tag(val_ty);
                 let tag = i8_ty.const_int(tag_val as u64, false);
                 // lin_array_push copies a full 8 bytes from the cell into the payload, so the
-                // cell must hold 8 defined bytes. Pointers are 8 bytes; small integers/bools
-                // are zero-extended to i64; f32 is bit-widened via an i64 cell.
-                let (store_val, store_llvm_ty): (BasicValueEnum<'ctx>, BasicTypeEnum<'ctx>) = match val_ty {
+                // cell must hold 8 defined bytes. Pointers are stored as the raw 8-byte pointer;
+                // every scalar (int/bool/float) is encoded into its 8-byte TaggedVal payload via
+                // tagged_payload_i64 — the SAME encoder box_value uses — and stored as an i64
+                // cell. This is critical for Float32: it is fpext'd to f64 and stored as f64 bits
+                // under TAG_FLOAT64, so the runtime (which reads a TAG_FLOAT64 payload as f64)
+                // round-trips it. (Storing a native 4-byte f32 cell under TAG_FLOAT64 would have
+                // the runtime read 8 bytes including 4 undefined bytes → garbage.)
+                let cell = match val_ty {
                     Type::Str | Type::StrLit(_) | Type::Array(_) | Type::Object(_) | Type::Iterator(_) | Type::Function { .. } => {
-                        (val, self.context.ptr_type(inkwell::AddressSpace::default()).as_basic_type_enum())
+                        let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                        let cell = self.builder.alloca(ptr_ty, "arr_cell");
+                        self.builder.store(cell, val);
+                        cell
                     }
-                    _ if val.is_int_value() => {
+                    _ => {
                         let i64_ty = self.context.i64_type();
-                        let ext = self.builder.int_z_extend_or_bit_cast(val.into_int_value(), i64_ty, "arr_cell_ext");
-                        (ext.into(), i64_ty.as_basic_type_enum())
+                        let payload = self.tagged_payload_i64(&val, val_ty);
+                        let cell = self.builder.alloca(i64_ty, "arr_cell");
+                        self.builder.store(cell, payload);
+                        cell
                     }
-                    _ => (val, self.llvm_type(val_ty)),
                 };
-                let cell = self.builder.alloca(store_llvm_ty, "arr_cell");
-                self.builder.store(cell, store_val);
                 self.builder.call(self.rt.array_push, &[arr.into(), cell.into(), tag.into()], "arr_push");
             }
         }
@@ -188,8 +196,8 @@ impl<'ctx> Codegen<'ctx> {
             let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
             let k_tag = self.builder.call(self.rt.get_tag, &[key.into()], "ir_idxk_tag").try_as_basic_value().unwrap_basic().into_int_value();
             let i8t = self.context.i8_type();
-            let is_i32 = self.builder.int_compare(IntPredicate::EQ, k_tag, i8t.const_int(2, false), "ir_k_i32");
-            let is_i64 = self.builder.int_compare(IntPredicate::EQ, k_tag, i8t.const_int(3, false), "ir_k_i64");
+            let is_i32 = self.builder.int_compare(IntPredicate::EQ, k_tag, i8t.const_int(TAG_INT32 as u64, false), "ir_k_i32");
+            let is_i64 = self.builder.int_compare(IntPredicate::EQ, k_tag, i8t.const_int(TAG_INT64 as u64, false), "ir_k_i64");
             let is_int = self.builder.or(is_i32, is_i64, "ir_k_int");
             let int_b = self.context.append_basic_block(llvm_fn, "ir_idx_intk");
             let str_b = self.context.append_basic_block(llvm_fn, "ir_idx_strk");
@@ -207,7 +215,7 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.position_at_end(str_b);
             let key_raw = self.builder.call(self.rt.unbox_ptr, &[key.into()], "ir_idxk_str").try_as_basic_value().unwrap_basic();
             let obj_tag = self.builder.call(self.rt.get_tag, &[obj.into()], "ir_idx_otag").try_as_basic_value().unwrap_basic().into_int_value();
-            let is_obj = self.builder.int_compare(IntPredicate::EQ, obj_tag, i8t.const_int(7, false), "ir_idx_isobj");
+            let is_obj = self.builder.int_compare(IntPredicate::EQ, obj_tag, i8t.const_int(TAG_OBJECT as u64, false), "ir_idx_isobj");
             let oget_b = self.context.append_basic_block(llvm_fn, "ir_idx_oget");
             let onull_b = self.context.append_basic_block(llvm_fn, "ir_idx_onull");
             let omrg = self.context.append_basic_block(llvm_fn, "ir_idx_omrg");
@@ -280,7 +288,7 @@ impl<'ctx> Codegen<'ctx> {
             let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
             let obj_tag = self.builder.call(self.rt.get_tag, &[obj.into()], "ir_idx_tag").try_as_basic_value().unwrap_basic().into_int_value();
             let is_obj = self.builder.int_compare(
-                IntPredicate::EQ, obj_tag, self.context.i8_type().const_int(7, false), "ir_idx_is_obj");
+                IntPredicate::EQ, obj_tag, self.context.i8_type().const_int(TAG_OBJECT as u64, false), "ir_idx_is_obj");
             let ok = self.context.append_basic_block(llvm_fn, "ir_idx_obj_ok");
             let no = self.context.append_basic_block(llvm_fn, "ir_idx_obj_no");
             let mrg = self.context.append_basic_block(llvm_fn, "ir_idx_obj_mrg");
@@ -397,8 +405,8 @@ impl<'ctx> Codegen<'ctx> {
                     let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
                     let i8t = self.context.i8_type();
                     let k_tag = self.builder.call(self.rt.get_tag, &[key.into()], "iset_ktag").try_as_basic_value().unwrap_basic().into_int_value();
-                    let is_i32 = self.builder.int_compare(IntPredicate::EQ, k_tag, i8t.const_int(2, false), "iset_k_i32");
-                    let is_i64 = self.builder.int_compare(IntPredicate::EQ, k_tag, i8t.const_int(3, false), "iset_k_i64");
+                    let is_i32 = self.builder.int_compare(IntPredicate::EQ, k_tag, i8t.const_int(TAG_INT32 as u64, false), "iset_k_i32");
+                    let is_i64 = self.builder.int_compare(IntPredicate::EQ, k_tag, i8t.const_int(TAG_INT64 as u64, false), "iset_k_i64");
                     let is_int = self.builder.or(is_i32, is_i64, "iset_k_int");
                     let int_b = self.context.append_basic_block(llvm_fn, "iset_intk");
                     let str_b = self.context.append_basic_block(llvm_fn, "iset_strk");

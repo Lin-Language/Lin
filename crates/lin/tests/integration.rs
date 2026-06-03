@@ -6938,6 +6938,81 @@ print(toString(b))   // 4294967293
 }
 
 #[test]
+fn test_float_is_type_matches_runtime_tag() {
+    // A boxed float in a union must satisfy `is Float64` / `is Float32`. Codegen's tag table
+    // (type_tag_const, used by the `is` check) once mapped Float64 to TAG_FLOAT32 (4) while
+    // box_value tagged it TAG_FLOAT64 (5), so `x is Float64` compared 5 against a value tagged
+    // 4 → always-false dead arm. Both float widths box as TAG_FLOAT64, so both must match.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { toFloat32 } from "std/number"
+
+val mk64 = (b: Boolean): Float64 | String =>
+  match (b)
+    is true => 3.5
+    else => "hi"
+
+print(toString(mk64(true) is Float64))    // true
+print(toString(mk64(false) is Float64))   // false
+
+val mk32 = (b: Boolean): Float32 | String =>
+  match (b)
+    is true => toFloat32(2.5)
+    else => "hi"
+
+print(toString(mk32(true) is Float32))     // true
+print(toString(mk32(false) is Float32))    // false
+"#);
+    assert_eq!(out, vec!["true", "false", "true", "false"]);
+}
+
+#[test]
+fn test_float32_object_field_roundtrips() {
+    // A statically-Float32 field stored into an object TaggedVal then read DYNAMICALLY (the
+    // object is Json-typed, so the read routes through the runtime's tag-driven
+    // lin_tagged_to_string). Codegen tagged the slot TAG_FLOAT32 (4) but wrote an f64-bits
+    // payload (the value is fpext'd to f64 before storing); the runtime reads a TAG_FLOAT32
+    // payload as `f32::from_bits(payload as u32)` → the low 32 bits of 1.5f64's pattern are 0
+    // → it printed 0.0 / JSON "f": 0. Now stored as TAG_FLOAT64 with f64 bits → reads back 1.5.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val obj: Json = { "f": 1.5f32, "n": 7 }
+print(toString(obj["f"]))   // 1.5  (was 0.0)
+print(toString(obj["n"]))   // 7
+print(toString(obj))        // {"f": 1.5, "n": 7}  (was "f": 0)
+"#);
+    assert_eq!(out, vec!["1.5", "7", "{\"f\": 1.5, \"n\": 7}"]);
+}
+
+#[test]
+fn test_uint64_high_bit_compare_and_stringify() {
+    // A UInt64 with the high bit set (>= 2^63) must compare UNSIGNED and stringify UNSIGNED.
+    // The compare predicate selection forced signed predicates for any 64-bit operand, so a
+    // UInt64 >= 2^63 compared as negative; direct stringification routed UInt64 through the
+    // signed lin_int_to_string. Both now treat UInt64 as unsigned.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val big: UInt64 = 18446744073709551615
+val mid: UInt64 = 9223372036854775808
+val one: UInt64 = 1
+
+print(toString(big > one))     // true  (was false: big read as -1)
+print(toString(mid > one))     // true  (was false: mid read as i64::MIN)
+print(toString(one < mid))     // true
+print(toString(mid >= mid))    // true
+print(toString(mid))           // 9223372036854775808 (was -9223372036854775808)
+print(toString(big))           // 18446744073709551615 (was -1)
+"#);
+    assert_eq!(out, vec![
+        "true", "true", "true", "true",
+        "9223372036854775808",
+        "18446744073709551615",
+    ]);
+}
+
+#[test]
 fn test_computed_high_u32_display() {
     // A UInt32 computed at runtime (not a literal) from all-0xFF bytes prints 4294967295,
     // exercising the display path rather than only bit-equality.

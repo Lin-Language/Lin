@@ -200,8 +200,11 @@ impl<'ctx> Codegen<'ctx> {
         }
 
         let i64_ty = self.context.i64_type();
-        // Normalize operand types: if either is a pointer, convert both to i64.
-        let (lv, rv) = if lv.is_pointer_value() || rv.is_pointer_value() {
+        // Normalize operand types: if either is a pointer, convert both to i64. Such a compare
+        // is an ADDRESS comparison and must use the UNSIGNED predicate (addresses are unsigned;
+        // a high-half address would otherwise read as negative).
+        let is_ptr_cmp = lv.is_pointer_value() || rv.is_pointer_value();
+        let (lv, rv) = if is_ptr_cmp {
             let l = if lv.is_pointer_value() {
                 self.builder.ptr_to_int(lv.into_pointer_value(), i64_ty, "lpc").into()
             } else {
@@ -219,7 +222,13 @@ impl<'ctx> Codegen<'ctx> {
 
         if ty.is_float() {
             self.builder.float_compare(float_pred, lv.into_float_value(), rv.into_float_value(), "fcmp").into()
-        } else if ty.is_signed() || lv.is_int_value() && lv.into_int_value().get_type().get_bit_width() == 64 {
+        } else if is_ptr_cmp {
+            // Address comparison — unsigned (see normalization above).
+            self.builder.int_compare(unsigned_pred, lv.into_int_value(), rv.into_int_value(), "pcmp").into()
+        } else if ty.is_signed() {
+            // Signedness is determined SOLELY by the operand type. The old `bit_width == 64`
+            // fallback forced signed predicates for any 64-bit operand, which made a UInt64
+            // >= 2^63 (high bit set) compare as negative. UInt64 is unsigned → unsigned predicate.
             self.builder.int_compare(signed_pred, lv.into_int_value(), rv.into_int_value(), "scmp").into()
         } else {
             self.builder.int_compare(unsigned_pred, lv.into_int_value(), rv.into_int_value(), "ucmp").into()
