@@ -332,12 +332,16 @@ impl Parser {
         self.skip_newlines();
         let mut params = Vec::new();
         while !self.check(TokenKind::RParen) && !self.is_at_end() {
+            let loop_start = self.pos;
             let param = self.parse_param();
             params.push(param);
             if self.check(TokenKind::Comma) {
                 self.advance();
             }
             self.skip_newlines();
+            if self.ensure_progress(loop_start) {
+                continue;
+            }
         }
         self.expect(TokenKind::RParen);
 

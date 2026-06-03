@@ -562,6 +562,7 @@ impl Parser {
         self.skip_newlines();
         let mut fields = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+            let loop_start = self.pos;
             if self.check(TokenKind::DotDotDot) {
                 self.advance();
                 let expr = self.parse_expr();
@@ -614,6 +615,9 @@ impl Parser {
                 }
             }
             self.skip_newlines();
+            if self.ensure_progress(loop_start) {
+                continue;
+            }
         }
         self.expect(TokenKind::RBrace);
         Expr::Object(fields, span)
@@ -625,6 +629,7 @@ impl Parser {
         self.skip_newlines();
         let mut elements = Vec::new();
         while !self.check(TokenKind::RBracket) && !self.is_at_end() {
+            let loop_start = self.pos;
             elements.push(self.parse_expr());
             if self.check(TokenKind::Comma) {
                 let comma_span = self.current_span();
@@ -640,6 +645,9 @@ impl Parser {
                 }
             }
             self.skip_newlines();
+            if self.ensure_progress(loop_start) {
+                continue;
+            }
         }
         self.expect(TokenKind::RBracket);
         Expr::Array(elements, span)
@@ -731,7 +739,11 @@ impl Parser {
                 if self.check(TokenKind::Dedent) || self.is_at_end() {
                     break;
                 }
+                let loop_start = self.pos;
                 arms.push(self.parse_match_arm(None));
+                if self.ensure_progress(loop_start) {
+                    continue;
+                }
             }
             if self.check(TokenKind::Dedent) {
                 self.advance();

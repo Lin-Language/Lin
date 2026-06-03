@@ -150,6 +150,7 @@ impl Parser {
         self.skip_newlines();
         let mut bindings = Vec::new();
         while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+            let loop_start = self.pos;
             let name = self.expect_ident();
             let alias = if self.check(TokenKind::As) {
                 self.advance();
@@ -162,6 +163,9 @@ impl Parser {
                 self.advance();
             }
             self.skip_newlines();
+            if self.ensure_progress(loop_start) {
+                continue;
+            }
         }
         self.expect(TokenKind::RBrace);
         self.skip_newlines();
@@ -194,6 +198,7 @@ impl Parser {
                 if self.check(TokenKind::Dedent) || self.is_at_end() {
                     break;
                 }
+                let loop_start = self.pos;
                 let binding_span = self.current_span();
                 self.expect_keyword(TokenKind::Val);
                 let name = self.expect_ident();
@@ -201,6 +206,9 @@ impl Parser {
                 let type_ann = self.parse_type_expr();
                 bindings.push(ForeignBinding { name, type_ann, span: binding_span });
                 self.skip_newlines();
+                if self.ensure_progress(loop_start) {
+                    continue;
+                }
             }
             if self.check(TokenKind::Dedent) {
                 self.advance(); // consume Dedent
