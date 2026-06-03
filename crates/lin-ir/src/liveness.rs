@@ -108,6 +108,32 @@ impl Liveness {
             .map(|s| s.contains(&temp))
             .unwrap_or(false)
     }
+
+    /// Returns true if `temp` is live immediately AFTER instruction `idx` in
+    /// `block` (i.e. some later instruction in this block, the terminator, or a
+    /// successor block still uses it).
+    ///
+    /// `block_len` is the number of instructions in the block. When `idx` is the
+    /// final instruction, "live after" means "live at the block exit", which is
+    /// `live_out[block]`. Otherwise it is `live_before[idx + 1]`.
+    ///
+    /// NOTE: for the final instruction this checks `live_out` only; a temp used
+    /// directly by the terminator (e.g. `Return(temp)`) is NOT folded into
+    /// `live_out`, so callers that care about that case must check the terminator
+    /// separately (see `rc_elide::release_is_last_use`).
+    pub fn is_live_after(&self, block: BlockId, idx: usize, block_len: usize, temp: Temp) -> bool {
+        if idx + 1 < block_len {
+            self.instr_live_before
+                .get(&(block, idx + 1))
+                .map(|s| s.contains(&temp))
+                .unwrap_or(false)
+        } else {
+            self.live_out
+                .get(&block)
+                .map(|s| s.contains(&temp))
+                .unwrap_or(false)
+        }
+    }
 }
 
 // -------------------------------------------------------------------------

@@ -1,25 +1,48 @@
 //! RC elision pass for LinIR.
 //!
-//! Eliminates Retain/Release pairs where the retained value's live range
-//! does not span any allocation or call site that could trigger GC or reuse.
+//! Eliminates Retain/Release pairs where the retained value's live range does
+//! not span any allocation, call site, or escape that could observe the
+//! refcount or create an independent owner.
 //!
-//! Algorithm (simplified Perceus):
-//! 1. Run liveness analysis on the function.
-//! 2. For each Retain instruction at position (block, i):
-//!    - Search forward for the paired Release in the same block.
-//!    - If not found in the same block, do a BFS across CFG successors (up to
-//!      BFS_BLOCK_LIMIT blocks) looking for the Release.
-//!    - The path is "clean" if every block on the path (from Retain up to and
-//!      including the Release) has no call, allocation, or another Release of
-//!      the same temp.
-//!    - If the Release is a "last-use" (the temp is NOT in live_out of the
-//!      block containing the Release), the Release is semantically correct to
-//!      keep as-is; we only elide the Retain.
-//!    - If both are provably redundant (path clean, no sharing), elide both.
-//! 3. Remove elided Retain/Release pairs from the instruction list.
+//! # Soundness invariant
+//!
+//! The ONLY safe transformation here is to remove a *balanced* Retain/Release
+//! pair: removing exactly one Retain and exactly one matching Release leaves the
+//! program's net refcount of the temp unchanged on every control-flow path. It
+//! is always acceptable to elide LESS (a kept redundant pair is a perf cost, not
+//! a bug); it is NEVER acceptable to leave the program unbalanced on any path.
+//! The pass therefore fails *toward not eliding* whenever pairing or
+//! post-dominance is uncertain.
+//!
+//! # Algorithm
+//!
+//! 1. Run liveness analysis on the function (`liveness`) and compute
+//!    post-dominators (`PostDom`) over the CFG.
+//! 2. For each Retain of an RC-typed temp at (block, i):
+//!    - **Same block**: pair with the first *unclaimed* Release of the temp
+//!      after the Retain (one-to-one — a Release already claimed by an earlier
+//!      Retain is skipped). The span between them must have *no interference*:
+//!      no call/alloc/escape, no Release of the temp, and no further Retain of
+//!      the temp (an intervening same-temp Retain is treated as interference so
+//!      the one-to-one pairing stays unambiguous and we never elide across it).
+//!    - **Cross block**: a BFS across CFG successors finds the block holding the
+//!      matching unclaimed Release. The pair is only elided when **the Release's
+//!      block post-dominates the Retain's block** — i.e. the Release is reached
+//!      on *every* path leaving the Retain. Without post-dominance the Release
+//!      covers only some successor paths and eliding the Retain would leak on
+//!      the others (the original cross-block soundness hole).
+//! 3. **Liveness gate (the documented safety net)**: a pair is elided only when
+//!    liveness confirms the temp is *dead immediately after the matched
+//!    Release* (a true last-use). If the temp is still live past the Release,
+//!    that Release is not the final drop — another owning reference is in play —
+//!    so the pair is kept. This is what actually drives the elision decision;
+//!    the structural path/post-dominance checks narrow the candidate set, and
+//!    liveness has the final say.
+//! 4. Remove the elided Retain/Release pairs from the instruction lists.
 //!
 //! This is a conservative approximation: we err on the side of keeping RC ops
-//! when the path analysis is uncertain (aliasing, indirect calls).
+//! when pairing, the path, post-dominance, or liveness is uncertain (aliasing,
+//! indirect calls, branchy releases).
 //!
 //! Reference: Reinking et al., "Perceus: Garbage Free Reference Counting with
 //! Reuse", PLDI 2021.
@@ -44,6 +67,9 @@ pub fn elide_rc(module: &mut LinModule) {
 
 fn elide_rc_fn(func: &mut LinFunction) {
     let liveness = Liveness::compute(func);
+    // Post-dominators over the CFG: used to require that a cross-block Release is
+    // reached on every path leaving the Retain before we elide the pair.
+    let postdom = PostDom::compute(func);
 
     // Build a map from BlockId → index in func.blocks for fast lookup.
     let block_index: HashMap<BlockId, usize> = func
@@ -82,7 +108,14 @@ fn elide_rc_fn(func: &mut LinFunction) {
                     to_remove.contains(&(block_idx, i))
                 })
             {
-                if path_has_no_interference(*retain_val, retain_idx, release_idx, &instrs) {
+                if path_has_no_interference(*retain_val, retain_idx, release_idx, &instrs)
+                    && release_is_last_use(
+                        &liveness,
+                        &func.blocks[block_idx],
+                        release_idx,
+                        *retain_val,
+                    )
+                {
                     to_remove.insert((block_idx, retain_idx));
                     to_remove.insert((block_idx, release_idx));
                 }
@@ -120,6 +153,8 @@ fn elide_rc_fn(func: &mut LinFunction) {
                 &block_index,
                 &to_remove,
             ) {
+                let release_block_id = func.blocks[release_block_idx].id;
+                let retain_block_id = func.blocks[block_idx].id;
                 // The release block's prefix (before the Release) must also be clean.
                 let prefix_clean = path_has_no_interference(
                     *retain_val,
@@ -127,24 +162,25 @@ fn elide_rc_fn(func: &mut LinFunction) {
                     release_instr_idx,
                     &func.blocks[release_block_idx].instructions,
                 );
-                if prefix_clean {
+                // SOUNDNESS: the Release must be reached on EVERY path leaving the
+                // Retain. If the release block only post-dominates the retain block
+                // along some successor edges, eliding the Retain leaks on the others.
+                let release_postdominates =
+                    postdom.post_dominates(release_block_id, retain_block_id);
+                // And the Release must be the temp's last use (liveness gate).
+                let last_use = release_is_last_use(
+                    &liveness,
+                    &func.blocks[release_block_idx],
+                    release_instr_idx,
+                    *retain_val,
+                );
+                if prefix_clean && release_postdominates && last_use {
                     to_remove.insert((block_idx, retain_idx));
                     to_remove.insert((release_block_idx, release_instr_idx));
                 }
             }
         }
     }
-
-    // Also apply last-use liveness check: for each Release that is NOT in
-    // to_remove, if the temp is not in live_out of that block, it is a true
-    // last-use Release — correct to keep. (This is informational; we don't need
-    // to do anything extra because we never speculatively remove Releases.)
-    //
-    // What we *do* want: if a Retain was not elided by the above (perhaps because
-    // no cross-block Release was found within the BFS limit), we leave it in place.
-    // The liveness check helps verify correctness but does not drive additional
-    // elision here.
-    let _ = &liveness; // confirm it's used (liveness was used in cross-block search)
 
     // Remove instructions in reverse order so indices stay valid.
     for block_idx in 0..func.blocks.len() {
@@ -347,6 +383,12 @@ fn instr_is_interference(temp: Temp, instr: &Instruction) -> bool {
         | Instruction::IndexSet { .. }
         | Instruction::GlobalValSet { .. } => true,
         Instruction::Release { val, .. } if *val == temp => true,
+        // An intervening SECOND Retain of the same temp disqualifies eliding ACROSS it:
+        // the one-to-one pairing of this Retain to a later Release would otherwise span a
+        // sibling Retain whose own Release lies further on. Treating it as interference keeps
+        // each Retain paired only with a Release in its own clean span and never elides over a
+        // nested same-temp retain (fail toward not-eliding; ADR rc-elide-liveness).
+        Instruction::Retain { val, .. } if *val == temp => true,
         _ => false,
     }
 }
@@ -366,6 +408,122 @@ fn block_temp_survives(temp: Temp, block: &BasicBlock) -> bool {
         }
     }
     true
+}
+
+/// The documented liveness safety net: a Retain/Release pair is only elided when
+/// the temp is dead immediately AFTER the matched Release — i.e. the Release is a
+/// true last-use (the final drop of that reference). If the temp is still live
+/// past the Release, another owning reference is in play and dropping this pair
+/// would either over-release that path or leave a live value with too few
+/// references; we keep the pair.
+///
+/// Conservative on the block-exit case: if the Release is the block's last
+/// instruction we treat the temp as live-after when EITHER `live_out` contains it
+/// OR the terminator uses it directly (the latter is not folded into `live_out`).
+fn release_is_last_use(
+    liveness: &Liveness,
+    block: &BasicBlock,
+    release_idx: usize,
+    temp: Temp,
+) -> bool {
+    let len = block.instructions.len();
+    let live_after_instr = liveness.is_live_after(block.id, release_idx, len, temp);
+    if live_after_instr {
+        return false;
+    }
+    // If this is the final instruction, also reject if the terminator uses the temp.
+    if release_idx + 1 >= len && terminator_uses_temp(&block.terminator, temp) {
+        return false;
+    }
+    true
+}
+
+/// True if the terminator directly uses `temp` (return value / branch condition /
+/// switch scrutinee / tail-call argument).
+fn terminator_uses_temp(term: &Terminator, temp: Temp) -> bool {
+    match term {
+        Terminator::Return(Some(t)) => *t == temp,
+        Terminator::CondJump { cond, .. } => *cond == temp,
+        Terminator::Switch { val, .. } => *val == temp,
+        Terminator::TailCall { args } => args.contains(&temp),
+        _ => false,
+    }
+}
+
+/// Post-dominator information over a function's CFG.
+///
+/// A block `p` post-dominates block `b` if every path from `b` to a function
+/// exit (a `Return`/`TailCall`/`Unreachable` block) passes through `p`. We use
+/// this so that a cross-block Release is only paired+elided with a Retain when
+/// the Release is reached on EVERY path leaving the Retain — otherwise the
+/// Retain leaks on the paths that bypass the Release.
+struct PostDom {
+    /// `post_dom[b]` = the set of blocks that post-dominate `b` (including `b`).
+    post_dom: HashMap<BlockId, HashSet<BlockId>>,
+}
+
+impl PostDom {
+    fn compute(func: &LinFunction) -> Self {
+        let all: HashSet<BlockId> = func.blocks.iter().map(|b| b.id).collect();
+        let succs: HashMap<BlockId, Vec<BlockId>> = func
+            .blocks
+            .iter()
+            .map(|b| (b.id, terminator_successors(&b.terminator)))
+            .collect();
+
+        // Standard iterative post-dominator dataflow:
+        //   pdom[exit]  = {exit}
+        //   pdom[b]     = {b} ∪ (⋂ over successors s of pdom[s])
+        // Initialise every non-exit block's set to the full set so the
+        // intersection converges downward to a fixpoint.
+        let mut post_dom: HashMap<BlockId, HashSet<BlockId>> = HashMap::new();
+        for b in &func.blocks {
+            let s = terminator_successors(&b.terminator);
+            if s.is_empty() {
+                // Exit block: post-dominated only by itself.
+                let mut set = HashSet::new();
+                set.insert(b.id);
+                post_dom.insert(b.id, set);
+            } else {
+                post_dom.insert(b.id, all.clone());
+            }
+        }
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for b in &func.blocks {
+                let s = &succs[&b.id];
+                if s.is_empty() {
+                    continue; // exit block: fixed at {b}
+                }
+                // Intersection of successors' post-dom sets.
+                let mut inter: Option<HashSet<BlockId>> = None;
+                for succ in s {
+                    let Some(sd) = post_dom.get(succ) else { continue };
+                    inter = Some(match inter {
+                        None => sd.clone(),
+                        Some(acc) => acc.intersection(sd).copied().collect(),
+                    });
+                }
+                let mut new_set = inter.unwrap_or_default();
+                new_set.insert(b.id);
+                if new_set != post_dom[&b.id] {
+                    post_dom.insert(b.id, new_set);
+                    changed = true;
+                }
+            }
+        }
+
+        PostDom { post_dom }
+    }
+
+    /// True if `p` post-dominates `b` (every path from `b` to an exit goes
+    /// through `p`). When `b` has no recorded post-dom set (unreachable), this
+    /// returns false — we never elide on the basis of unreachable info.
+    fn post_dominates(&self, p: BlockId, b: BlockId) -> bool {
+        self.post_dom.get(&b).map(|set| set.contains(&p)).unwrap_or(false)
+    }
 }
 
 /// Extract successor BlockIds from a terminator.
@@ -752,5 +910,141 @@ mod tests {
             !b1.iter().any(|i| matches!(i, Instruction::Release { .. })),
             "Release should be elided on last-use clean path"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Soundness regression tests for the two RC-elision holes (fix/rc-elide-liveness)
+    // -------------------------------------------------------------------------
+
+    /// Count remaining Retain/Release of a temp in a whole function.
+    fn count_rc(func: &LinFunction, temp: Temp) -> (usize, usize) {
+        let mut retains = 0;
+        let mut releases = 0;
+        for block in &func.blocks {
+            for instr in &block.instructions {
+                match instr {
+                    Instruction::Retain { val, .. } if *val == temp => retains += 1,
+                    Instruction::Release { val, .. } if *val == temp => releases += 1,
+                    _ => {}
+                }
+            }
+        }
+        (retains, releases)
+    }
+
+    /// HOLE 1: an intervening SECOND Retain of the same temp between an outer
+    /// Retain and the single Release. The temp is retained TWICE but released
+    /// ONCE (net +1 — e.g. the second retain balances an escape/return that is
+    /// off the modelled path). RC elision must preserve the net refcount: it may
+    /// only remove a *balanced* pair, never change the net count.
+    #[test]
+    fn does_not_unbalance_with_intervening_same_temp_retain() {
+        // Retain(t0); Copy(t1,t0); Retain(t0); Copy(t2,t0); Release(t0)
+        // 2 retains, 1 release (net +1).
+        let instrs = vec![
+            Instruction::Retain { val: Temp(0), ty: Type::Str },
+            Instruction::Copy { dst: Temp(1), src: Temp(0) },
+            Instruction::Retain { val: Temp(0), ty: Type::Str },
+            Instruction::Copy { dst: Temp(2), src: Temp(0) },
+            Instruction::Release { val: Temp(0), ty: Type::Str },
+        ];
+        let mut module = make_module(make_fn(FuncId(0), instrs));
+        let before = count_rc(&module.functions[0], Temp(0));
+        assert_eq!(before, (2, 1), "precondition: input is net +1");
+        elide_rc(&mut module);
+        let (retains, releases) = count_rc(&module.functions[0], Temp(0));
+        let net_before = before.0 as i64 - before.1 as i64;
+        let net_after = retains as i64 - releases as i64;
+        assert_eq!(
+            net_after, net_before,
+            "RC elision must preserve net refcount (before net {net_before}, after net {net_after}); \
+             got {retains} retains, {releases} releases"
+        );
+    }
+
+    /// HOLE 1 (balanced variant): Retain; Retain; Copy; Release; Release — two of
+    /// each, net 0. The pass may elide pairs but must keep retains == releases.
+    #[test]
+    fn balanced_double_retain_adjacent_stays_balanced() {
+        let instrs = vec![
+            Instruction::Retain { val: Temp(0), ty: Type::Str },
+            Instruction::Retain { val: Temp(0), ty: Type::Str },
+            Instruction::Copy { dst: Temp(1), src: Temp(0) },
+            Instruction::Release { val: Temp(0), ty: Type::Str },
+            Instruction::Release { val: Temp(0), ty: Type::Str },
+        ];
+        let mut module = make_module(make_fn(FuncId(0), instrs));
+        elide_rc(&mut module);
+        let (retains, releases) = count_rc(&module.functions[0], Temp(0));
+        assert_eq!(
+            retains, releases,
+            "retain/release counts must stay balanced (got {retains} retains, {releases} releases)"
+        );
+    }
+
+    /// HOLE 3: cross-block Release that does NOT post-dominate the Retain.
+    /// block0 retains t0 then CondJumps to block1 (releases t0) or block2 (does
+    /// NOT release t0). Eliding the Retain against the block1 Release leaks on the
+    /// block2 path. The pass must NOT elide unless the Release post-dominates the
+    /// Retain — here it does not, so both must survive.
+    #[test]
+    fn cross_block_keeps_when_release_does_not_postdominate() {
+        let block0 = BasicBlock {
+            id: BlockId(0),
+            label: None,
+            instructions: vec![Instruction::Retain { val: Temp(0), ty: Type::Str }],
+            terminator: Terminator::CondJump {
+                cond: Temp(1),
+                then_block: BlockId(1),
+                else_block: BlockId(2),
+            },
+            span: None,
+        };
+        let block1 = BasicBlock {
+            id: BlockId(1),
+            label: None,
+            instructions: vec![Instruction::Release { val: Temp(0), ty: Type::Str }],
+            terminator: Terminator::Return(None),
+            span: None,
+        };
+        let block2 = BasicBlock {
+            id: BlockId(2),
+            label: None,
+            instructions: vec![],
+            terminator: Terminator::Return(None),
+            span: None,
+        };
+        let mut temp_types = std::collections::HashMap::new();
+        temp_types.insert(Temp(0), Type::Str);
+        temp_types.insert(Temp(1), Type::Bool);
+        let func = LinFunction {
+            id: FuncId(0),
+            name: None,
+            params: vec![],
+            is_closure: false,
+            ret_ty: Type::Null,
+            blocks: vec![block0, block1, block2],
+            temp_types,
+            temp_count: 2,
+            intrinsic_slots: std::collections::HashMap::new(),
+        };
+        let mut module = make_module(func);
+        elide_rc(&mut module);
+        let func = &module.functions[0];
+        let (retains, releases) = count_rc(func, Temp(0));
+        assert_eq!(retains, 1, "Retain must be kept (release does not post-dominate)");
+        assert_eq!(releases, 1, "Release must be kept (release does not post-dominate)");
+    }
+
+    /// Cross-block POSITIVE control: the Release DOES post-dominate (single
+    /// successor chain), so eliding the pair is sound and must still happen.
+    #[test]
+    fn cross_block_elides_when_release_postdominates() {
+        let instrs0 = vec![Instruction::Retain { val: Temp(0), ty: Type::Str }];
+        let instrs1 = vec![Instruction::Release { val: Temp(0), ty: Type::Str }];
+        let mut module = make_module(make_two_block_fn(FuncId(0), instrs0, instrs1));
+        elide_rc(&mut module);
+        let (retains, releases) = count_rc(&module.functions[0], Temp(0));
+        assert_eq!((retains, releases), (0, 0), "clean post-dominating pair should elide");
     }
 }
