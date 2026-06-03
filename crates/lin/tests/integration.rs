@@ -4959,6 +4959,103 @@ fn test_ffi_end_to_end_c_library() {
     assert!(stdout.contains("2.5^2 = 6.25"), "Expected '2.5^2 = 6.25', got: {}", stdout);
 }
 
+// End-to-end richer-FFI + concurrency keystone tests: the examples/sdl/ project drives the REAL
+// SDL3 3.4.10 C ABI (SDL_Init / SDL_CreateWindow / SDL_RenderFillRect / SDL_RenderReadPixels / …)
+// against the committed REAL libSDL3.so (examples/sdl/libs/, soname chain
+// libSDL3.so -> .so.0 -> .so.0.4.10). Each demo is compiled with `lin build`, then RUN from a
+// directory other than the workspace with LD_LIBRARY_PATH cleared — so the only way the vendored
+// .so resolves is the baked-in $ORIGIN-relative rpath (NEEDED is the soname libSDL3.so.0). Real
+// SDL3 emits no synthetic QUIT, so each demo runs a FIXED frame count and self-terminates, then
+// proves rendering by reading a pixel back with SDL_RenderReadPixels. The demos require the dummy
+// video driver (no display in CI), so the spawned binary is run with SDL_VIDEODRIVER=dummy.
+
+/// Build `example` with `lin build`, run it from the temp dir with LD_LIBRARY_PATH cleared (proving
+/// the $ORIGIN rpath finds the vendored .so) and SDL_VIDEODRIVER=dummy (headless), assert exit 0,
+/// and return its stdout.
+fn run_sdl_demo(ws: &std::path::Path, lin_bin: &std::path::Path, example: &str, out_name: &str) -> String {
+    let example_path = ws.join(example);
+    let output_bin = ws.join("target").join(out_name);
+    let compile_out = Command::new(lin_bin)
+        .args(["build", example_path.to_str().unwrap(), "-o", output_bin.to_str().unwrap()])
+        .current_dir(ws)
+        .output()
+        .expect("failed to run lin build");
+    assert!(
+        compile_out.status.success(),
+        "lin build {} failed: {}",
+        example,
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+    let run_out = Command::new(&output_bin)
+        .current_dir(std::env::temp_dir())
+        .env_remove("LD_LIBRARY_PATH")
+        .env("SDL_VIDEODRIVER", "dummy")
+        .output()
+        .expect("failed to run sdl demo binary");
+    assert!(
+        run_out.status.success(),
+        "{} failed (rpath not resolving the vendored .so, or SDL init failed): status={} stderr={}",
+        example,
+        run_out.status,
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    String::from_utf8_lossy(&run_out.stdout).into_owned()
+}
+
+// bounce.lin: Ptr handles (window/renderer/surface/pixels) round-trip; a String title marshalled
+// via withCstr; an SDL_FRect built in a poked buffer (four f32); a FIXED 60-frame loop that
+// self-terminates; and a SDL_RenderReadPixels readback that PROVES real rendering — the pixel at
+// the centre of the ball's final rect equals the fill colour (255,128,0) in XRGB8888 B,G,R order.
+#[test]
+fn test_sdl_bounce_headless() {
+    let ws = workspace_root();
+    let lin_bin = lin_bin();
+    if !lin_bin.exists() {
+        eprintln!("SKIP: lin binary not built; run `cargo build -p lin` first");
+        return;
+    }
+    // The real libSDL3.so is committed; skip only if it is somehow absent on this platform.
+    if !ws.join("examples/sdl/libs/libSDL3.so").exists() {
+        eprintln!("SKIP: examples/sdl/libs/libSDL3.so not present");
+        return;
+    }
+    let stdout = run_sdl_demo(&ws, &lin_bin, "examples/sdl/bounce.lin", "sdl_bounce_test");
+    assert!(stdout.contains("window handle non-null: true"), "got: {}", stdout);
+    assert!(stdout.contains("renderer handle non-null: true"), "got: {}", stdout);
+    // Fixed frame count — the demo self-terminates (real SDL3 emits no QUIT headless).
+    assert!(stdout.contains("frames drawn: 60"), "got: {}", stdout);
+    // SDL_RenderReadPixels readback proves real software rendering happened.
+    assert!(stdout.contains("pixel[184,124] = 255,128,0"), "got: {}", stdout);
+    assert!(stdout.contains("rendered pixel matches fill: true"), "got: {}", stdout);
+    assert!(stdout.contains("done"), "got: {}", stdout);
+}
+
+// ai_worker.lin: same real-SDL main-thread loop PLUS an `async` PURE worker. Each frame deep-copies
+// a plain World snapshot into the thunk and deep-copies the planned {x,y} back — no SDL handle or
+// var crosses the boundary. Deterministic: the agent steps one cell/axis toward the goal each frame
+// (capped at the goal), so over 60 frames from (0,0) it reaches the goal (18,11). The agent's final
+// pixel is read back and asserted to be its fill colour (0,200,120).
+#[test]
+fn test_sdl_ai_worker_headless() {
+    let ws = workspace_root();
+    let lin_bin = lin_bin();
+    if !lin_bin.exists() {
+        eprintln!("SKIP: lin binary not built; run `cargo build -p lin` first");
+        return;
+    }
+    if !ws.join("examples/sdl/libs/libSDL3.so").exists() {
+        eprintln!("SKIP: examples/sdl/libs/libSDL3.so not present");
+        return;
+    }
+    let stdout = run_sdl_demo(&ws, &lin_bin, "examples/sdl/ai_worker.lin", "sdl_ai_worker_test");
+    assert!(stdout.contains("window handle non-null: true"), "got: {}", stdout);
+    assert!(stdout.contains("frames drawn: 60"), "got: {}", stdout);
+    assert!(stdout.contains("final agent: 18,11"), "got: {}", stdout);
+    assert!(stdout.contains("pixel[148,92] = 0,200,120"), "got: {}", stdout);
+    assert!(stdout.contains("rendered pixel matches fill: true"), "got: {}", stdout);
+    assert!(stdout.contains("done"), "got: {}", stdout);
+}
+
 // ── Formatter idempotency ─────────────────────────────────────────────────────
 
 /// Lex, parse, and format a Lin source string, preserving comments. Panics on parse errors.

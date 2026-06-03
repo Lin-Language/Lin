@@ -1631,3 +1631,64 @@ fresh var there left an ambiguous element (a `[]`+push array) unsolved and defau
 scalar (surfaced as an `i8` element — a real regression caught by the pool stress test). This matches
 the prior opaque-`Function` behaviour; a non-MAX generic `T` (map/filter's element) still mints a fresh
 var so the receiver can pin it.
+
+## ADR-080: Richer FFI — `Ptr`(=Int64) + `$ORIGIN` rpath + `std/ffi` raw-memory island
+
+**Decision**: Pure Lin can drive a vendored C shared library through three cooperating pieces, none
+of which extend the type system or codegen with a new pointer kind:
+
+1. **`Ptr` is a zero-cost alias to `Int64`** (`lin-check/src/resolve.rs`: `"Ptr" => Ok(Type::Int64)`).
+   A pointer/handle crossing the FFI boundary is just a 64-bit scalar — never refcounted, ABI-identical
+   to a C `void*`, and freely passed back into another foreign function. It is purely a *documentation*
+   alias at the source level.
+2. **`std/ffi`** (`stdlib/ffi.lin` over `crates/lin-runtime/src/ffi.rs`) is a small "island" of unsafe
+   raw-memory primitives — `cstr`/`withCstr`/`alloc`/`free`/`peek*`/`poke*` — for marshalling `String`
+   arguments into NUL-terminated C strings and reading/writing fixed-layout structs returned through a
+   `void*` out-param. `withCstr(s, body)` is the recommended leak-free idiom: allocate, run the
+   callback, free, return its result. Bare `cstr` does not free (the caller owns the buffer) for the
+   case where the C API retains the pointer.
+3. **Auto `$ORIGIN`-relative rpath** (`lin-compile` `fn link`): for each foreign `.so`/`.dylib` the
+   linker is given `-Wl,-rpath,$ORIGIN/<relpath-from-binary-dir-to-so-dir>`, computed with a small
+   pure-Rust `relative_path` helper (no `pathdiff` dependency). The link runs via `std::process::Command`
+   (no shell), so `$ORIGIN` reaches the ELF dynamic loader literally; `readelf -d` confirms RUNPATH
+   carries a literal `$ORIGIN`. The produced binary + co-located `.so` are therefore **relocatable** —
+   move both together and the library still resolves at runtime with no `LD_LIBRARY_PATH`.
+
+**Rationale**: The goal was a keystone proving Lin can talk to real C libraries (SDL-shaped) without
+adding a foreign-function bindgen, a GC-visible pointer type, or system-path linking. Keeping `Ptr` an
+`Int64` alias means zero churn across the ~20 exhaustive `Type` matches in check/IR/codegen, and the raw
+primitives live entirely behind a stdlib wrapper over existing `lin_*` runtime symbols.
+
+**Rejected alternatives**:
+- **A distinct `Ptr` newtype `Type` variant** — would let the checker forbid arithmetic on raw handles,
+  but buys no runtime benefit and fans a new case across every exhaustive `Type` match in the
+  compiler. Rejected; the alias is sufficient for the prototype. (A future opaque newtype remains a
+  possible follow-up purely for checker ergonomics.)
+- **System-path linking (ldconfig / `LD_LIBRARY_PATH` / absolute rpath)** — rejected in favour of a
+  *vendored* `.so` reached by a `$ORIGIN`-relative rpath, so a built artifact is self-contained and
+  relocatable. An absolute canonicalized rpath remains only as a **fallback** when a relative path
+  can't be expressed (different mount / no common ancestor): robust but not relocatable.
+
+**Consequence**: `examples/sdl/` is a two-demo "SDL game" project (`bounce.lin`, `ai_worker.lin`)
+that drives the **real SDL3 C ABI** (`SDL_Init`/`SDL_CreateWindow`/`SDL_RenderFillRect`/
+`SDL_PollEvent`/`SDL_RenderReadPixels`/…) from pure Lin via `Ptr` handles, a `withCstr` `char*` title,
+and an `SDL_FRect` built with four `pokeF32`. Each demo runs a FIXED frame count and self-terminates
+(headless SDL3 emits no scripted quit event), then PROVES rendering actually happened by reading a
+pixel back with `SDL_RenderReadPixels` — peeking the returned `SDL_Surface`'s `pixels`/`pitch` fields
+and asserting the drawn pixel's exact color (XRGB8888 channel order decoded from the surface `format`).
+A **real, vendored `libSDL3.so` 3.4.10** (built headless with `SDL_UNIX_CONSOLE_BUILD`, ~2.9 MB,
+committed with its `libSDL3.so → .so.0 → .so.0.4.10` soname symlink chain) is linked by relative path;
+the binary records `NEEDED libSDL3.so.0` and finds it via the `$ORIGIN` rpath. `ai_worker.lin` adds an
+`async` PURE worker (a `World` snapshot deep-copied in, a planned point deep-copied back) to show that
+SDL handles stay on the main thread while only values cross the share-nothing boundary. The integration
+tests `test_sdl_bounce_headless` / `test_sdl_ai_worker_headless` build each demo and run the binary from
+another cwd with `LD_LIBRARY_PATH` cleared and `SDL_VIDEODRIVER=dummy`, proving the rpath chain
+end-to-end against the real library. `stdlib/ffi.test.lin` covers the raw-memory helpers and `withCstr`
+without needing `lin build`.
+
+**Known limitations**: macOS relocatability (`@loader_path` + dylib `install_name`) is **not** handled —
+`$ORIGIN` is meaningless to the macOS loader; this is Linux/ELF-only and a tracked follow-up. The
+vendored SDL3 is Linux x86-64, software-rendered via the dummy driver (proves the ABI + rasterisation,
+not GPU output). `withCstr` leaks its buffer only if the callback faults (Lin has no try/finally). A
+real bindgen / struct-layout DSL is future work — struct offsets are hand-computed by the programmer
+today.

@@ -1,0 +1,128 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { alloc, free, peekU8, peekU16, peekU32, peekI32, peekF32, pokeU8, pokeU16, pokeU32, pokeI32, pokeF32, withCstr } from "std/ffi"
+import { toFloat32 } from "std/number"
+
+// These exercise the raw-memory helpers without any foreign library: write into a scratch buffer
+// with poke, read it back with peek, at distinct byte offsets. (Real FFI calls need `lin build`,
+// but alloc/poke/peek are plain runtime symbols and run here.)
+val s = suite("std/ffi", [
+  test("alloc returns a non-null Ptr", () =>
+    val p = alloc(8)
+    val ok = p != 0
+    free(p)
+    [
+      expect(ok).toBe(true)
+    ]
+  ),
+
+  test("pokeU32 then peekU32 round-trips at offset 0", () =>
+    val p = alloc(8)
+    pokeU32(p, 0, 305419896)
+    val v = peekU32(p, 0)
+    free(p)
+    [
+      expect(v).toBe(305419896)
+    ]
+  ),
+
+  test("two u32 fields are independent at offsets 0 and 4", () =>
+    val p = alloc(8)
+    pokeU32(p, 0, 1)
+    pokeU32(p, 4, 41)
+    val a = peekU32(p, 0)
+    val b = peekU32(p, 4)
+    free(p)
+    [
+      expect(a).toBe(1),
+      expect(b).toBe(41)
+    ]
+  ),
+
+  test("pokeU8 then peekU8 round-trips a byte", () =>
+    val p = alloc(4)
+    pokeU8(p, 2, 200)
+    val v = peekU8(p, 2)
+    free(p)
+    [
+      expect(v).toBe(200)
+    ]
+  ),
+
+  test("withCstr returns the callback's value", () =>
+    val n = withCstr("hello", p => 42)
+    [
+      expect(n).toBe(42)
+    ]
+  ),
+
+  test("withCstr exposes a readable NUL-terminated buffer to the callback", () =>
+    // "Ab" is bytes 0x41, 0x62, then a NUL terminator at offset 2. Read them back via peekU8
+    // inside the scope; withCstr frees the buffer after the callback returns.
+    val bytes = withCstr("Ab", p =>
+      [
+        peekU8(p, 0),
+        peekU8(p, 1),
+        peekU8(p, 2)
+      ]
+    )
+    [
+      expect(bytes[0]).toBe(65),
+      expect(bytes[1]).toBe(98),
+      expect(bytes[2]).toBe(0)
+    ]
+  ),
+
+  test("pokeF32 then peekF32 round-trips a float at offset 0", () =>
+    // 3.5 is exact in f32, so the round-trip is bit-for-bit. toFloat32 narrows the Float64
+    // literal to the Float32 these helpers traffic in.
+    val p = alloc(4)
+    pokeF32(p, 0, toFloat32(3.5))
+    val v = peekF32(p, 0)
+    free(p)
+    [
+      expect(v).toBe(toFloat32(3.5))
+    ]
+  ),
+
+  test("four pokeF32 build an SDL_FRect-style 16-byte struct", () =>
+    // Mimic an SDL_FRect { float x, y, w, h; } — four f32 fields at offsets 0,4,8,12. All four
+    // values are exact in f32, so the reads are exact.
+    val p = alloc(16)
+    pokeF32(p, 0, toFloat32(1.5))
+    pokeF32(p, 4, toFloat32(2.25))
+    pokeF32(p, 8, toFloat32(100.0))
+    pokeF32(p, 12, toFloat32(200.0))
+    val x = peekF32(p, 0)
+    val y = peekF32(p, 4)
+    val w = peekF32(p, 8)
+    val h = peekF32(p, 12)
+    free(p)
+    [
+      expect(x).toBe(toFloat32(1.5)),
+      expect(y).toBe(toFloat32(2.25)),
+      expect(w).toBe(toFloat32(100.0)),
+      expect(h).toBe(toFloat32(200.0))
+    ]
+  ),
+
+  test("pokeI32 then peekI32 round-trips a signed int", () =>
+    val p = alloc(4)
+    pokeI32(p, 0, -12345)
+    val v = peekI32(p, 0)
+    free(p)
+    [
+      expect(v).toBe(-12345)
+    ]
+  ),
+
+  test("pokeU16 then peekU16 round-trips at offset 2", () =>
+    val p = alloc(4)
+    pokeU16(p, 2, 65000)
+    val v = peekU16(p, 2)
+    free(p)
+    [
+      expect(v).toBe(65000)
+    ]
+  )
+])
+run(s)
