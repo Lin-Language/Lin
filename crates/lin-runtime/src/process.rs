@@ -45,7 +45,12 @@ static PROC_REGISTRY: Mutex<Option<HashMap<i64, ProcEntry>>> = Mutex::new(None);
 static NEXT_ID: AtomicI64 = AtomicI64::new(1);
 
 fn with_registry<R>(f: impl FnOnce(&mut HashMap<i64, ProcEntry>) -> R) -> R {
-    let mut guard = PROC_REGISTRY.lock().unwrap();
+    // Recover from a poisoned lock instead of `.unwrap()`-panicking: these registry ops run
+    // from `extern "C"` functions, where unwinding is UB / process abort. Poisoning only means a
+    // prior thread panicked while holding the guard (plausible: spawned children are managed
+    // across worker/async paths). The HashMap itself stays consistent, so we take the inner guard
+    // and carry on.
+    let mut guard = PROC_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
     f(map)
 }
