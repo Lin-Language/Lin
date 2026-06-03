@@ -9,6 +9,8 @@ import foreign "lin-runtime"
   val lin_string_length: (String) => Int32
   val lin_string_slice: (String, Int32, Int32) => String
   val lin_string_index_of: (String, String) => Int32
+  val lin_string_index_of_from: (String, String, Int32) => Int32
+  val lin_string_last_index_of_from: (String, String, Int32) => Int32
   val lin_string_split: (String, String) => String[]
   val lin_string_repeat: (String, Int32) => String
   val lin_string_char_at: (String, Int32) => String
@@ -46,11 +48,11 @@ val _length = (s: String): Int32 =>
 val _substring = (s: String, start: Int32, end: Int32): String =>
   lin_string_slice(s, start, end)
 
-export val indexOf = (s: String, needle: String): Int32 =>
-  lin_string_index_of(s, needle)
+export val indexOf = (s: String, needle: String, fromIndex: Int32 = 0): Int32 =>
+  lin_string_index_of_from(s, needle, fromIndex)
 
-export val lastIndexOf = (s: String, needle: String): Int32 =>
-  lin_string_last_index_of(s, needle)
+export val lastIndexOf = (s: String, needle: String, fromIndex: Int32 = _length(s)): Int32 =>
+  lin_string_last_index_of_from(s, needle, fromIndex)
 
 export val isBlank = (s: String): Boolean =>
   lin_string_is_blank(s)
@@ -112,7 +114,7 @@ export val fromCodePoints = (codes: Int32[]): String =>
   codes.for(code => lin_push(chars, lin_string_from_char_code(code)))
   lin_string_join_arr(chars, "")
 
-export val padStart = (s: String, width: Int32, pad: String): String =>
+export val padStart = (s: String, width: Int32, pad: String = " "): String =>
   val len = _length(s)
   if len >= width then
     s
@@ -122,7 +124,7 @@ export val padStart = (s: String, width: Int32, pad: String): String =>
     val padded = lin_string_repeat(pad, (needed / padLen) + 1)
     "${_substring(padded, 0, needed)}${s}"
 
-export val padEnd = (s: String, width: Int32, pad: String): String =>
+export val padEnd = (s: String, width: Int32, pad: String = " "): String =>
   val len = _length(s)
   if len >= width then
     s

@@ -16,8 +16,11 @@ export val push = (arr: Json, item: Json): Null =>
 // Polymorphic sub-buffer copy. Dispatches on the array's runtime element type,
 // so a UInt8[] yields a UInt8[], an Int32[] an Int32[], a Json[] a Json[].
 // `start`/`end` clamp to [0, length]; `end` is exclusive.
-export val slice = (arr: Json, start: Int32, end: Int32): Json =>
-  lin_array_slice_dyn(arr, start, end)
+export val slice = (arr: Json, start: Int32, end: Int32 = length(arr)): Json =>
+  val n = length(arr)
+  val s = if start < 0 then n + start else start
+  val e = if end < 0 then n + end else end
+  lin_array_slice_dyn(arr, s, e)
 
 // Returns an uninitialised length-`n` array. Stays `Json` (boxed/tagged) so the common
 // untyped use `val buf = arrayAllocate(n)` needs no annotation: making it generic over a
@@ -56,11 +59,13 @@ val _filterJ = (arr: Json, f: Function): Json =>
 val _reduceJ = (arr: Json, init: Json, f: (Json, Json) => Json): Json =>
   lin_reduce(arr, init, f)
 
-export val indexOf = <T>(arr: T[], target: T): Int32 =>
+export val indexOf = <T>(arr: T[], target: T, fromIndex: Int32 = 0): Int32 =>
+  val start = if fromIndex < 0 then length(arr) + fromIndex else fromIndex
   var result = -1
   var i = 0
   lin_while(arr, item =>
-    if item == target then result = i else i = i + 1
+    if result == -1 && i >= start && item == target then result = i
+    i = i + 1
     result == -1
   )
   result

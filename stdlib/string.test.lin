@@ -75,6 +75,23 @@ val s = suite("std/string", [
     expect("hello".lastIndexOf("x")).toBe(-1)
   ]),
 
+  // fromIndex defaults: indexOf from 0, lastIndexOf from end — both unchanged when omitted.
+  test("indexOf without fromIndex is unchanged", () => [
+    expect("abcabc".indexOf("bc")).toBe(1)
+  ]),
+
+  test("indexOf with fromIndex finds later occurrence", () => [
+    expect("abcabc".indexOf("bc", 2)).toBe(4)
+  ]),
+
+  test("lastIndexOf without fromIndex is unchanged", () => [
+    expect("abcabc".lastIndexOf("bc")).toBe(4)
+  ]),
+
+  test("lastIndexOf with fromIndex bounds the search", () => [
+    expect("abcabc".lastIndexOf("bc", 2)).toBe(1)
+  ]),
+
   test("isBlank returns true for empty string", () => [
     expect("".isBlank()).toBe(true)
   ]),
@@ -190,6 +207,20 @@ val s = suite("std/string", [
     expect("A".codePointAt(5)).toBe(-1)
   ]),
 
+  // Negative index counts codepoints from the end on charCode / codePointAt.
+  test("charCode with negative index counts from the end", () => [
+    expect("hello".charCode(-1)).toBe(111),
+    expect("hello".charCode(-5)).toBe(104)
+  ]),
+
+  test("codePointAt with negative index counts from the end", () => [
+    expect("hello".codePointAt(-1)).toBe(111)
+  ]),
+
+  test("charCode negative index out of range returns -1", () => [
+    expect("hi".charCode(-3)).toBe(-1)
+  ]),
+
   test("byteAt returns the UTF-8 byte at index", () => [
     expect("ABC".byteAt(0)).toBe(65),
     expect("ABC".byteAt(2)).toBe(67)
@@ -225,6 +256,10 @@ val s = suite("std/string", [
     expect("x".padStart(5, "ab")).toBe("ababx")
   ]),
 
+  test("padStart defaults pad to a space", () => [
+    expect("5".padStart(3)).toBe("  5")
+  ]),
+
   test("padEnd pads right with character", () => [
     expect("hi".padEnd(5, ".")).toBe("hi...")
   ]),
@@ -235,6 +270,10 @@ val s = suite("std/string", [
 
   test("padEnd handles multi-char pad with truncation", () => [
     expect("ab".padEnd(5, "xy")).toBe("abxyx")
+  ]),
+
+  test("padEnd defaults pad to a space", () => [
+    expect("hi".padEnd(4)).toBe("hi  ")
   ]),
 
   // Regression: toString of a STRING value must return an OWNED (+1) reference, like every
