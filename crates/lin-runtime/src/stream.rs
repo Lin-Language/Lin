@@ -391,41 +391,53 @@ impl LinFn {
     unsafe fn from_owned(closure: *mut u8) -> LinFn {
         LinFn { closure }
     }
-    /// Call `closure(arg)` — arg is a boxed TaggedVal* (consumed/borrowed per the closure's ABI);
-    /// returns the boxed result. The closure ABI is `(env, arg) -> ret`.
-    unsafe fn call(&self, arg: *mut u8) -> *mut u8 {
+    /// Call `closure(arg, index)` — `arg` is a boxed TaggedVal* (consumed/borrowed per the
+    /// closure's ABI), `index` the element's 0-based ordinal. Returns the boxed result.
+    ///
+    /// ABI NOTE (the macOS/arm64 fault, fixed here): every combinator callback is type-checked
+    /// against the std/iter signature `(T, Int32) => U`, so codegen emits the closure's boxed
+    /// trampoline expecting a TRAILING boxed `Int32` index argument — `(env, item, index)`. The
+    /// stream runtime previously called it as `(env, item)`, leaving the trailing `index` register
+    /// uninitialised; the trampoline then unboxed that garbage as an `Int32` (`lin_unbox_int32`).
+    /// On x86-64 the stale value was usually a benign 8-aligned pointer; on arm64 it was 4-aligned
+    /// garbage, tripping Rust's debug `misaligned pointer dereference` abort. We now always pass a
+    /// real boxed index so the trampoline's unbox reads a valid TaggedVal.
+    unsafe fn call(&self, arg: *mut u8, index: i64) -> *mut u8 {
         if self.closure.is_null() {
             return std::ptr::null_mut();
         }
         let fn_ptr = *(self.closure.add(8) as *const *mut u8);
         let env_ptr = *(self.closure.add(16) as *const *mut u8);
-        let call: unsafe extern "C-unwind" fn(*mut u8, *mut u8) -> *mut u8 =
-            std::mem::transmute(fn_ptr);
-        call(env_ptr, arg)
-    }
-
-    /// Call a 2-arg closure `closure(arg0, arg1)` — the reduce ABI `(env, acc, item) -> acc`.
-    /// Both args follow the boxed-TaggedVal* ABI; returns the boxed result.
-    unsafe fn call2(&self, arg0: *mut u8, arg1: *mut u8) -> *mut u8 {
-        if self.closure.is_null() {
-            return std::ptr::null_mut();
-        }
-        let fn_ptr = *(self.closure.add(8) as *const *mut u8);
-        let env_ptr = *(self.closure.add(16) as *const *mut u8);
+        let idx = crate::tagged::lin_box_int32(index as i32);
         let call: unsafe extern "C-unwind" fn(*mut u8, *mut u8, *mut u8) -> *mut u8 =
             std::mem::transmute(fn_ptr);
-        call(env_ptr, arg0, arg1)
+        call(env_ptr, arg, idx)
+    }
+
+    /// Call a 2-arg closure `closure(arg0, arg1, index)` — the reduce ABI `(env, acc, item, index)
+    /// -> acc`. All value args follow the boxed-TaggedVal* ABI; `index` is the boxed 0-based
+    /// ordinal (see `call` for why the trailing index is required). Returns the boxed result.
+    unsafe fn call2(&self, arg0: *mut u8, arg1: *mut u8, index: i64) -> *mut u8 {
+        if self.closure.is_null() {
+            return std::ptr::null_mut();
+        }
+        let fn_ptr = *(self.closure.add(8) as *const *mut u8);
+        let env_ptr = *(self.closure.add(16) as *const *mut u8);
+        let idx = crate::tagged::lin_box_int32(index as i32);
+        let call: unsafe extern "C-unwind" fn(*mut u8, *mut u8, *mut u8, *mut u8) -> *mut u8 =
+            std::mem::transmute(fn_ptr);
+        call(env_ptr, arg0, arg1, idx)
     }
 
     /// 2-arg `call2` with the same fault-catching discipline as `call_caught` (see its doc). The
     /// caller releases `arg0`/`arg1` after a catch; we do not re-touch them.
-    unsafe fn call2_caught(&self, arg0: *mut u8, arg1: *mut u8) -> Result<*mut u8, String> {
+    unsafe fn call2_caught(&self, arg0: *mut u8, arg1: *mut u8, index: i64) -> Result<*mut u8, String> {
         let closure_addr = self.closure as usize;
         let a0 = arg0 as usize;
         let a1 = arg1 as usize;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let f = LinFn { closure: closure_addr as *mut u8 };
-            let r = f.call2(a0 as *mut u8, a1 as *mut u8);
+            let r = f.call2(a0 as *mut u8, a1 as *mut u8, index);
             std::mem::forget(f); // do not release the borrowed closure here
             r
         }));
@@ -442,7 +454,7 @@ impl LinFn {
     /// uncaught panic there would ABORT the process ("panic in a function that cannot unwind")
     /// rather than surface as the awaited `Error`. The closure call itself is `extern "C-unwind"`,
     /// so the panic unwinds INTO this Rust frame, where `catch_unwind` can intercept it.
-    unsafe fn call_caught(&self, arg: *mut u8) -> Result<*mut u8, String> {
+    unsafe fn call_caught(&self, arg: *mut u8, index: i64) -> Result<*mut u8, String> {
         let this = self.closure;
         let arg_addr = arg as usize;
         // `AssertUnwindSafe`: the closure pointer + arg are raw and not Rust-UnwindSafe, but a
@@ -451,7 +463,7 @@ impl LinFn {
         let closure_addr = this as usize;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let f = LinFn { closure: closure_addr as *mut u8 };
-            let r = f.call(arg_addr as *mut u8);
+            let r = f.call(arg_addr as *mut u8, index);
             std::mem::forget(f); // do not drop (release) the borrowed closure here
             r
         }));
@@ -507,6 +519,8 @@ impl Upstream {
 struct MapSource {
     up: Upstream,
     f: LinFn,
+    /// 0-based ordinal of the next item, passed as the callback's trailing `Int32` index arg.
+    idx: i64,
 }
 impl StreamSource for MapSource {
     unsafe fn read_tagged(&mut self) -> TaggedOutcome {
@@ -514,7 +528,9 @@ impl StreamSource for MapSource {
             TaggedOutcome::Eof => TaggedOutcome::Eof,
             TaggedOutcome::Err(m) => TaggedOutcome::Err(m),
             TaggedOutcome::Item(item) => {
-                let out = self.f.call_caught(item);
+                let i = self.idx;
+                self.idx += 1;
+                let out = self.f.call_caught(item, i);
                 // The closure consumed/derived `item`; release our reference to it. (The boxed
                 // result `out` is independently owned and returned to the driver.)
                 crate::tagged::lin_tagged_release(item);
@@ -535,6 +551,8 @@ impl StreamSource for MapSource {
 struct FilterSource {
     up: Upstream,
     p: LinFn,
+    /// 0-based ordinal of the next item, passed as the callback's trailing `Int32` index arg.
+    idx: i64,
 }
 impl StreamSource for FilterSource {
     unsafe fn read_tagged(&mut self) -> TaggedOutcome {
@@ -543,7 +561,9 @@ impl StreamSource for FilterSource {
                 TaggedOutcome::Eof => return TaggedOutcome::Eof,
                 TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
                 TaggedOutcome::Item(item) => {
-                    let verdict = match self.p.call_caught(item) {
+                    let i = self.idx;
+                    self.idx += 1;
+                    let verdict = match self.p.call_caught(item, i) {
                         Ok(v) => v,
                         Err(m) => {
                             crate::tagged::lin_tagged_release(item);
@@ -744,6 +764,8 @@ struct TakeWhileSource {
     up: Upstream,
     p: LinFn,
     done: bool,
+    /// 0-based ordinal of the next item, passed as the callback's trailing `Int32` index arg.
+    idx: i64,
 }
 impl StreamSource for TakeWhileSource {
     unsafe fn read_tagged(&mut self) -> TaggedOutcome {
@@ -757,7 +779,9 @@ impl StreamSource for TakeWhileSource {
             }
             TaggedOutcome::Err(m) => TaggedOutcome::Err(m),
             TaggedOutcome::Item(item) => {
-                let verdict = match self.p.call_caught(item) {
+                let i = self.idx;
+                self.idx += 1;
+                let verdict = match self.p.call_caught(item, i) {
                     Ok(v) => v,
                     Err(m) => {
                         crate::tagged::lin_tagged_release(item);
@@ -788,6 +812,9 @@ struct DropWhileSource {
     up: Upstream,
     p: LinFn,
     dropping: bool,
+    /// 0-based ordinal of the next item evaluated by `p` (the dropping phase), passed as the
+    /// callback's trailing `Int32` index arg. Frozen once `dropping` ends (p is no longer called).
+    idx: i64,
 }
 impl StreamSource for DropWhileSource {
     unsafe fn read_tagged(&mut self) -> TaggedOutcome {
@@ -799,7 +826,9 @@ impl StreamSource for DropWhileSource {
                     if !self.dropping {
                         return TaggedOutcome::Item(item);
                     }
-                    let verdict = match self.p.call_caught(item) {
+                    let i = self.idx;
+                    self.idx += 1;
+                    let verdict = match self.p.call_caught(item, i) {
                         Ok(v) => v,
                         Err(m) => {
                             crate::tagged::lin_tagged_release(item);
@@ -877,6 +906,8 @@ struct FlatMapSource {
     up: Upstream,
     f: LinFn,
     current: Option<InnerCursor>,
+    /// 0-based ordinal of the next UPSTREAM item passed to `f`, as the trailing `Int32` index arg.
+    idx: i64,
 }
 impl StreamSource for FlatMapSource {
     unsafe fn read_tagged(&mut self) -> TaggedOutcome {
@@ -893,7 +924,9 @@ impl StreamSource for FlatMapSource {
                 TaggedOutcome::Eof => return TaggedOutcome::Eof,
                 TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
                 TaggedOutcome::Item(item) => {
-                    let inner = match self.f.call_caught(item) {
+                    let i = self.idx;
+                    self.idx += 1;
+                    let inner = match self.f.call_caught(item, i) {
                         Ok(v) => v,
                         Err(m) => {
                             crate::tagged::lin_tagged_release(item);
@@ -1296,7 +1329,7 @@ unsafe fn as_closure(f: *mut u8) -> *mut u8 {
 pub unsafe extern "C" fn lin_stream_map(s: *const u8, f: *mut u8) -> *mut u8 {
     let up = own_upstream(s);
     let closure = retain_closure(as_closure(f));
-    StreamBox::new_boxed(Box::new(MapSource { up, f: LinFn::from_owned(closure) }))
+    StreamBox::new_boxed(Box::new(MapSource { up, f: LinFn::from_owned(closure), idx: 0 }))
 }
 
 /// `filter(s, p)` → a new `Stream` keeping items where `p(item)` is truthy.
@@ -1304,7 +1337,7 @@ pub unsafe extern "C" fn lin_stream_map(s: *const u8, f: *mut u8) -> *mut u8 {
 pub unsafe extern "C" fn lin_stream_filter(s: *const u8, p: *mut u8) -> *mut u8 {
     let up = own_upstream(s);
     let closure = retain_closure(as_closure(p));
-    StreamBox::new_boxed(Box::new(FilterSource { up, p: LinFn::from_owned(closure) }))
+    StreamBox::new_boxed(Box::new(FilterSource { up, p: LinFn::from_owned(closure), idx: 0 }))
 }
 
 /// `take(s, n)` → a new `Stream` yielding at most `n` items.
@@ -1326,7 +1359,7 @@ pub unsafe extern "C" fn lin_stream_drop(s: *const u8, n: i64) -> *mut u8 {
 pub unsafe extern "C" fn lin_stream_take_while(s: *const u8, p: *mut u8) -> *mut u8 {
     let up = own_upstream(s);
     let closure = retain_closure(as_closure(p));
-    StreamBox::new_boxed(Box::new(TakeWhileSource { up, p: LinFn::from_owned(closure), done: false }))
+    StreamBox::new_boxed(Box::new(TakeWhileSource { up, p: LinFn::from_owned(closure), done: false, idx: 0 }))
 }
 
 /// `dropWhile(s, p)` → a new `Stream` skipping items while `p(item)` is truthy, then passing through.
@@ -1334,7 +1367,7 @@ pub unsafe extern "C" fn lin_stream_take_while(s: *const u8, p: *mut u8) -> *mut
 pub unsafe extern "C" fn lin_stream_drop_while(s: *const u8, p: *mut u8) -> *mut u8 {
     let up = own_upstream(s);
     let closure = retain_closure(as_closure(p));
-    StreamBox::new_boxed(Box::new(DropWhileSource { up, p: LinFn::from_owned(closure), dropping: true }))
+    StreamBox::new_boxed(Box::new(DropWhileSource { up, p: LinFn::from_owned(closure), dropping: true, idx: 0 }))
 }
 
 /// `flatMap(s, f)` → a new `Stream` flattening each `f(item)` collection lazily.
@@ -1342,7 +1375,7 @@ pub unsafe extern "C" fn lin_stream_drop_while(s: *const u8, p: *mut u8) -> *mut
 pub unsafe extern "C" fn lin_stream_flat_map(s: *const u8, f: *mut u8) -> *mut u8 {
     let up = own_upstream(s);
     let closure = retain_closure(as_closure(f));
-    StreamBox::new_boxed(Box::new(FlatMapSource { up, f: LinFn::from_owned(closure), current: None }))
+    StreamBox::new_boxed(Box::new(FlatMapSource { up, f: LinFn::from_owned(closure), current: None, idx: 0 }))
 }
 
 /// `flatten(s)` → a new `Stream` flattening each item (a collection) lazily.
@@ -1481,12 +1514,15 @@ pub unsafe extern "C" fn lin_stream_drain(s: *const u8) -> *mut u8 {
 pub unsafe extern "C" fn lin_stream_for(s: *const u8, body: *mut u8) -> *mut u8 {
     let b = unwrap_stream(s);
     let f = LinFn::from_owned(retain_closure(as_closure(body)));
+    let mut idx: i64 = 0;
     let result = loop {
         match pull_tagged(b) {
             TaggedOutcome::Eof => break std::ptr::null_mut(), // normal end → Null
             TaggedOutcome::Err(m) => break crate::fs::make_error_tagged(&m),
             TaggedOutcome::Item(item) => {
-                let ret = f.call_caught(item);
+                let i = idx;
+                idx += 1;
+                let ret = f.call_caught(item, i);
                 crate::tagged::lin_tagged_release(item);
                 match ret {
                     Ok(r) => crate::tagged::lin_tagged_release(r), // body's return is discarded
@@ -1511,6 +1547,7 @@ pub unsafe extern "C" fn lin_stream_reduce(s: *const u8, init: *mut u8, f: *mut 
     // `init` arrives as an owned +1 reference (the caller suppressed its own release / it is a
     // fresh box); we own the running accumulator and release the previous on each replacement.
     let mut acc = init;
+    let mut idx: i64 = 0;
     let result = loop {
         match pull_tagged(b) {
             TaggedOutcome::Eof => break acc, // success → the final accumulator
@@ -1519,7 +1556,9 @@ pub unsafe extern "C" fn lin_stream_reduce(s: *const u8, init: *mut u8, f: *mut 
                 break crate::fs::make_error_tagged(&m);
             }
             TaggedOutcome::Item(item) => {
-                let next = func.call2_caught(acc, item);
+                let i = idx;
+                idx += 1;
+                let next = func.call2_caught(acc, item, i);
                 crate::tagged::lin_tagged_release(item);
                 match next {
                     Ok(v) => {
@@ -1545,12 +1584,15 @@ pub unsafe extern "C" fn lin_stream_reduce(s: *const u8, init: *mut u8, f: *mut 
 pub unsafe extern "C" fn lin_stream_find(s: *const u8, p: *mut u8) -> *mut u8 {
     let b = unwrap_stream(s);
     let pred = LinFn::from_owned(retain_closure(as_closure(p)));
+    let mut idx: i64 = 0;
     let result = loop {
         match pull_tagged(b) {
             TaggedOutcome::Eof => break std::ptr::null_mut(), // none found → Null
             TaggedOutcome::Err(m) => break crate::fs::make_error_tagged(&m),
             TaggedOutcome::Item(item) => {
-                let verdict = match pred.call_caught(item) {
+                let i = idx;
+                idx += 1;
+                let verdict = match pred.call_caught(item, i) {
                     Ok(v) => v,
                     Err(m) => {
                         crate::tagged::lin_tagged_release(item);
@@ -1576,12 +1618,15 @@ pub unsafe extern "C" fn lin_stream_find(s: *const u8, p: *mut u8) -> *mut u8 {
 pub unsafe extern "C" fn lin_stream_some(s: *const u8, p: *mut u8) -> *mut u8 {
     let b = unwrap_stream(s);
     let pred = LinFn::from_owned(retain_closure(as_closure(p)));
+    let mut idx: i64 = 0;
     let result = loop {
         match pull_tagged(b) {
             TaggedOutcome::Eof => break crate::tagged::lin_box_bool(0),
             TaggedOutcome::Err(m) => break crate::fs::make_error_tagged(&m),
             TaggedOutcome::Item(item) => {
-                let verdict = match pred.call_caught(item) {
+                let i = idx;
+                idx += 1;
+                let verdict = match pred.call_caught(item, i) {
                     Ok(v) => v,
                     Err(m) => {
                         crate::tagged::lin_tagged_release(item);
@@ -1607,12 +1652,15 @@ pub unsafe extern "C" fn lin_stream_some(s: *const u8, p: *mut u8) -> *mut u8 {
 pub unsafe extern "C" fn lin_stream_every(s: *const u8, p: *mut u8) -> *mut u8 {
     let b = unwrap_stream(s);
     let pred = LinFn::from_owned(retain_closure(as_closure(p)));
+    let mut idx: i64 = 0;
     let result = loop {
         match pull_tagged(b) {
             TaggedOutcome::Eof => break crate::tagged::lin_box_bool(1),
             TaggedOutcome::Err(m) => break crate::fs::make_error_tagged(&m),
             TaggedOutcome::Item(item) => {
-                let verdict = match pred.call_caught(item) {
+                let i = idx;
+                idx += 1;
+                let verdict = match pred.call_caught(item, i) {
                     Ok(v) => v,
                     Err(m) => {
                         crate::tagged::lin_tagged_release(item);
@@ -1639,12 +1687,15 @@ pub unsafe extern "C" fn lin_stream_every(s: *const u8, p: *mut u8) -> *mut u8 {
 pub unsafe extern "C" fn lin_stream_while(s: *const u8, f: *mut u8) -> *mut u8 {
     let b = unwrap_stream(s);
     let func = LinFn::from_owned(retain_closure(as_closure(f)));
+    let mut idx: i64 = 0;
     let result = loop {
         match pull_tagged(b) {
             TaggedOutcome::Eof => break std::ptr::null_mut(), // normal end → Null
             TaggedOutcome::Err(m) => break crate::fs::make_error_tagged(&m),
             TaggedOutcome::Item(item) => {
-                let verdict = match func.call_caught(item) {
+                let i = idx;
+                idx += 1;
+                let verdict = match func.call_caught(item, i) {
                     Ok(v) => v,
                     Err(m) => {
                         crate::tagged::lin_tagged_release(item);
@@ -1959,6 +2010,10 @@ pub unsafe extern "C" fn lin_stream_untar(s: *const u8, body: *mut u8) -> *mut u
         current_entry_remaining: 0,
     }));
     let f = LinFn::from_owned(retain_closure(as_closure(body)));
+    // Entry ordinal, passed as call2's trailing index arg. The untar body is `(meta, data)` (2
+    // params, no index), so its wrapper ignores this trailing arg — but call2 always supplies one,
+    // keeping the ABI uniform across all stream callbacks.
+    let mut idx: i64 = 0;
 
     let result: *mut u8 = loop {
         // Parse the next 512-byte header.
@@ -1978,7 +2033,9 @@ pub unsafe extern "C" fn lin_stream_untar(s: *const u8, body: *mut u8) -> *mut u
         let data_box = StreamBox::new_boxed(Box::new(BoundedSource { state: state.clone() }));
 
         // Call body(meta, data) — args are BORROWED (caller owns them, per the call2 ABI).
-        let ret = f.call2_caught(meta_obj, data_box);
+        let i = idx;
+        idx += 1;
+        let ret = f.call2_caught(meta_obj, data_box, i);
 
         // Release our refs to the args we minted (the meta object + the sub-stream box). For the
         // sub-stream this drops untar's OWN ref → rc 0 → frees the box; the no-op close means the
