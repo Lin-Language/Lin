@@ -1,0 +1,56 @@
+// constants — SDL3 constants and struct byte-offsets shared by both demos.
+//
+// Plain `export val`s are re-exportable across modules, so the two demos import their shared
+// numbers from here. (Foreign `import foreign` bindings are NOT re-exportable — they are
+// file-local — so each demo declares its own `import foreign "…/libSDL3.so"` block; see the
+// README and DECISIONS ADR for why.)
+//
+// Values mirror the REAL SDL3 3.4.10 headers (vendored at examples/sdl/libs/libSDL3.so).
+//
+// SDL_InitFlags — SDL_INIT_VIDEO opens the video subsystem (the only one the demos use).
+// Typed UInt64 so it passes straight to SDL_Init's UInt64 parameter: a *named* Int32 constant
+// does not implicitly widen to UInt64 at a call site (only bare integer literals do), so we fix
+// the width here once rather than wrapping it at every use.
+export val SDL_INIT_VIDEO: UInt64 = 32
+
+// SDL_EventType — QUIT (0x100). The demos drain the event queue each frame and discard events;
+// real headless SDL3 generally emits none, so the loops DO NOT depend on this to terminate — they
+// run a fixed frame count. Kept for the poll-drain to inspect a drained event's `type`.
+export val EVENT_QUIT = 256 // 0x100
+
+// SDL_FRect is { float x, y, w, h; } — four f32 = 16 bytes; fields at offsets 0, 4, 8, 12.
+// (SDL3 SDL_rect.h: typedef struct SDL_FRect { float x; float y; float w; float h; } SDL_FRect;)
+export val FRECT_BYTES = 16
+export val FRECT_X_OFF = 0
+export val FRECT_Y_OFF = 4
+export val FRECT_W_OFF = 8
+export val FRECT_H_OFF = 12
+
+// SDL_Event is a 128-byte union; we read `type` (Uint32) at offset 0.
+export val EVENT_BYTES = 128
+export val EVENT_TYPE_OFF = 0
+
+// SDL_Surface field byte-offsets (SDL3 SDL_surface.h, struct SDL_Surface @ lines 138-150):
+//   SDL_SurfaceFlags flags;  // Uint32              @ 0
+//   SDL_PixelFormat  format; // enum (int, 4 bytes) @ 4
+//   int w;                   //                     @ 8
+//   int h;                   //                     @ 12
+//   int pitch;               //                     @ 16
+//   void *pixels;            // 8-byte aligned       @ 24  (4 bytes padding at 20..23)
+// Verified with offsetof on the real header (sizeof=48): format=4 w=8 h=12 pitch=16 pixels=24.
+export val SURFACE_FORMAT_OFF = 4
+export val SURFACE_W_OFF = 8
+export val SURFACE_H_OFF = 12
+export val SURFACE_PITCH_OFF = 16
+export val SURFACE_PIXELS_OFF = 24
+
+// The software renderer (headless dummy driver) returns surfaces in SDL_PIXELFORMAT_XRGB8888
+// (= 0x16161804 = 370546692). On little-endian, each 4-byte pixel is laid out in memory as
+// B, G, R, X (offsets +0,+1,+2,+3 within the pixel). So to read channel values from a pixel we
+// peekU8 at pixels + y*pitch + x*4 + {B:0, G:1, R:2}. Verified by C probe against the vendored .so:
+// a fill of (255,128,0) read back bytes 0,128,255,0; a clear of (10,20,30) read back 30,20,10,0.
+export val SURFACE_XRGB8888 = 370546692
+export val PIXEL_BYTES = 4
+export val PIXEL_B_OFF = 0
+export val PIXEL_G_OFF = 1
+export val PIXEL_R_OFF = 2

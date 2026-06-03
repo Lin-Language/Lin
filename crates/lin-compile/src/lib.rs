@@ -475,6 +475,7 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/array"  => Some(include_str!("../../../stdlib/array.lin")),
         "std/iter"   => Some(include_str!("../../../stdlib/iter.lin")),
         "std/fs"     => Some(include_str!("../../../stdlib/fs.lin")),
+        "std/ffi"    => Some(include_str!("../../../stdlib/ffi.lin")),
         "std/http"   => Some(include_str!("../../../stdlib/http.lin")),
         "std/object"   => Some(include_str!("../../../stdlib/object.lin")),
         "std/template" => Some(include_str!("../../../stdlib/template.lin")),
@@ -936,6 +937,44 @@ fn check_scc(
     Ok(())
 }
 
+/// Compute a relative path from `from` to `to`, both assumed absolute and normalized
+/// (canonicalized) directories. Returns `Some(rel)` where joining `from/rel` reaches `to`, using
+/// `..` segments to ascend to a common ancestor. Returns `Some("")` when `from == to`. Returns
+/// `None` if no relative path can be expressed (e.g. different roots / mounts) — callers fall back
+/// to an absolute path. This is a small pure-Rust helper (no `pathdiff` dependency) covering the
+/// common case where the binary and the .so share an ancestor directory.
+fn relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let from_comps: Vec<Component> = from.components().collect();
+    let to_comps: Vec<Component> = to.components().collect();
+
+    // Find the length of the shared prefix.
+    let mut common = 0;
+    while common < from_comps.len()
+        && common < to_comps.len()
+        && from_comps[common] == to_comps[common]
+    {
+        common += 1;
+    }
+
+    // If there is no shared component at all, the paths have no common base (different roots /
+    // mounts); a relative path can't be expressed.
+    if common == 0 {
+        return None;
+    }
+
+    let mut rel = PathBuf::new();
+    // Ascend out of `from` down to the common ancestor.
+    for _ in common..from_comps.len() {
+        rel.push("..");
+    }
+    // Descend into `to` from the common ancestor.
+    for comp in &to_comps[common..] {
+        rel.push(comp.as_os_str());
+    }
+    Some(rel)
+}
+
 fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: bool) -> Result<(), CompileError> {
     // Find the lin-runtime static library.
     let runtime_lib = find_runtime_lib();
@@ -957,7 +996,24 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
         eprintln!("Warning: lin-runtime library not found, linking may fail");
     }
 
-    // Add foreign library paths.
+    // Add foreign library paths. For shared libraries we also emit an rpath so the produced
+    // binary can locate the vendored .so at RUNTIME without it being on the system path
+    // (LD_LIBRARY_PATH / ldconfig). rpath dirs are deduped so each distinct rpath string is added
+    // once.
+    //
+    // We prefer a `$ORIGIN`-relative rpath so the produced binary + its vendored .so are
+    // RELOCATABLE: copy both together (preserving their relative layout) anywhere and the binary
+    // still resolves the library, because `$ORIGIN` is expanded by the dynamic loader to the
+    // directory the binary lives in at launch. This is the Linux/ELF mechanism. macOS uses
+    // `@loader_path` plus the dylib's `install_name` instead — that is a deliberate FOLLOW-UP and
+    // is not handled here (the `$ORIGIN` token is meaningless to the macOS loader).
+    //
+    // `$ORIGIN` must reach the dynamic loader LITERALLY (the loader, not the linker or shell, does
+    // the expansion). The link command runs via std::process::Command — not a shell — so the
+    // `$ORIGIN` in `-Wl,-rpath,$ORIGIN/...` is passed as a literal argv element and is NOT
+    // shell-expanded. `readelf -d` on the output confirms RUNPATH carries a literal `$ORIGIN`.
+    let mut rpath_specs: Vec<String> = Vec::new();
+    let out_dir = output_path.parent().unwrap_or(Path::new("."));
     for lib in foreign_libs {
         let lib_path = Path::new(lib);
         if lib.ends_with(".a") || lib.ends_with(".o") {
@@ -970,6 +1026,22 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
             let lib_name = stem.strip_prefix("lib").unwrap_or(stem);
             cmd.arg(format!("-L{}", parent.display()))
                .arg(format!("-l{}", lib_name));
+
+            // Compute a `$ORIGIN`-relative rpath from the output binary's directory to the .so's
+            // directory. If a clean relative path can't be derived (e.g. the two live on different
+            // mounts with no common base, or canonicalization fails), fall back to an ABSOLUTE
+            // canonicalized rpath — robust, just not relocatable.
+            let abs_out_dir = out_dir.canonicalize().unwrap_or_else(|_| out_dir.to_path_buf());
+            let abs_parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+            let rpath = match relative_path(&abs_out_dir, &abs_parent) {
+                Some(rel) if rel.as_os_str().is_empty() => "$ORIGIN".to_string(),
+                Some(rel) => format!("$ORIGIN/{}", rel.display()),
+                None => abs_parent.display().to_string(),
+            };
+            if !rpath_specs.contains(&rpath) {
+                rpath_specs.push(rpath.clone());
+                cmd.arg(format!("-Wl,-rpath,{}", rpath));
+            }
         } else {
             cmd.arg(lib_path);
         }

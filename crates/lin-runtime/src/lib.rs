@@ -7,6 +7,7 @@ pub mod async_rt;
 pub mod decode;
 pub mod env;
 pub mod fault;
+pub mod ffi;
 pub mod frozen;
 pub mod fs;
 pub mod http;

@@ -1,0 +1,164 @@
+// ai_worker — SDL3 main-thread render loop + an async PURE worker, showing Lin's share-nothing
+// concurrency story alongside the richer FFI, against the REAL SDL3 3.4.10 C ABI.
+//
+// SDL3's window, event, and render calls MUST run on the main thread (the thread that called
+// SDL_Init) — see the README. So this demo keeps ALL SDL handles (Ptr) on the main thread and
+// offloads only a PURE computation to a worker: each frame it deep-copies a plain-data World
+// snapshot into an `async` thunk that computes the agent's next step toward a goal, awaits the
+// result (a plain {x, y} record, deep-copied back), then draws the agent on the main thread.
+//
+// KEY INVARIANT demonstrated: no SDL handle and no `var` ever crosses the async boundary — the
+// thunk captures a `val world` (immutable plain data) and returns a plain value. That is exactly
+// what Lin's deep-copy thread transfer permits; a Ptr handle or Function would be rejected.
+//
+// HEADLESS: run with SDL_VIDEODRIVER=dummy (dummy video driver + software renderer, no display).
+// Real SDL3 emits no synthetic QUIT, so the loop runs a FIXED frame count and self-terminates;
+// after it finishes we prove rendering with SDL_RenderReadPixels (peek the agent's final pixel).
+// Foreign bindings are file-local, so this file declares its own `import foreign` block.
+//
+// Run headless:  SDL_VIDEODRIVER=dummy lin run examples/sdl/ai_worker.lin
+import { print } from "std/io"
+import { toString } from "std/string"
+import { toFloat32, toFloat64, toInt64 } from "std/number"
+import { async, await } from "std/async"
+import { alloc, free, pokeF32, peekU8, peekI32, peekPtr, withCstr } from "std/ffi"
+import { SDL_INIT_VIDEO, FRECT_BYTES, FRECT_X_OFF, FRECT_Y_OFF, FRECT_W_OFF, FRECT_H_OFF, EVENT_BYTES, SURFACE_PITCH_OFF, SURFACE_PIXELS_OFF, PIXEL_BYTES, PIXEL_B_OFF, PIXEL_G_OFF, PIXEL_R_OFF } from "./constants"
+
+// Real SDL3 signatures (see bounce.lin for the field-by-field notes).
+import foreign "examples/sdl/libs/libSDL3.so"
+  val SDL_Init: (UInt64) => Int32
+  val SDL_CreateWindow: (Ptr, Int32, Int32, UInt64) => Ptr
+  val SDL_CreateRenderer: (Ptr, Ptr) => Ptr
+  val SDL_SetRenderDrawColor: (Ptr, UInt8, UInt8, UInt8, UInt8) => Int32
+  val SDL_RenderClear: (Ptr) => Int32
+  val SDL_RenderFillRect: (Ptr, Ptr) => Int32
+  val SDL_RenderPresent: (Ptr) => Int32
+  val SDL_RenderReadPixels: (Ptr, Ptr) => Ptr
+  val SDL_DestroySurface: (Ptr) => Null
+  val SDL_PollEvent: (Ptr) => Int32
+  val SDL_Delay: (UInt32) => Null
+  val SDL_DestroyWindow: (Ptr) => Null
+  val SDL_Quit: () => Null
+
+val WIDTH = 320
+val HEIGHT = 240
+val AGENT = 12.0
+val SCALE = 8.0
+val GOAL_X = 18
+val GOAL_Y = 11
+val FRAMES = 60
+
+// -1/0/+1 step direction. No sqrt in std/number, so the worker uses a MANHATTAN / sign metric
+// (one grid step per axis toward the goal) rather than Euclidean distance — fully integer,
+// deterministic, and dependency-free.
+val sign = (n: Int32): Int32 =>
+  if n > 0 then 1 else if n < 0 then 0 - 1 else 0
+
+// The PURE worker payload: given a plain World snapshot {ax, ay, gx, gy}, return the agent's next
+// {x, y}. No SDL, no Ptr, no var — just data in, data out, so it is safe to run on another thread
+// and deep-copy the result back.
+val planStep = (world: Json): Json =>
+  {
+    "x": world["ax"] + sign(world["gx"] - world["ax"]),
+    "y": world["ay"] + sign(world["gy"] - world["ay"])
+  }
+
+// Recover an awaited plan: await yields `Json | Error` (a faulted thunk surfaces as Error per
+// §24.2.2); on Error we hold position. Here the computation can't fault, but we handle it to honour
+// the union contract (a bare assignment of a `T | Error` is a compile-time error).
+val recoverStep = (r: Json, fallback: Json): Json =>
+  match r
+    is Error => fallback
+    else => r
+
+// Offload one planning step to a worker thread and block for the result. The `val world` captured
+// here is plain data (deep-copied into the thunk); the returned {x, y} is deep-copied back.
+//
+// CAVEAT (honest): this spawns ONE async thunk PER FRAME. That is the clearest illustration of the
+// by-value transfer, but thread-spawn-per-frame is real overhead — a production loop would use a
+// persistent Worker (std/async `worker`/`request`) or a ThreadPool and only marshal the snapshot.
+// We keep per-frame spawning here for clarity; the frame count is small so the cost is negligible.
+val planAsync = (world: Json): Json =>
+  recoverStep(await(async(() => planStep(world))), { "x": world["ax"], "y": world["ay"] })
+
+// Drain and discard the per-frame event queue. We DO NOT use it to terminate (real headless SDL3
+// emits no QUIT); the loop runs a fixed frame count.
+val drainEvents = (eventBuf: Ptr): Null =>
+  if SDL_PollEvent(eventBuf) == 0 then
+    null
+  else
+    drainEvents(eventBuf)
+
+// Draw the agent (a 12x12 square) at integer grid position (ax, ay) scaled to pixels. Builds an
+// SDL_FRect in `rectBuf` via four pokeF32 and renders on the MAIN thread.
+val drawAgent = (ren: Ptr, rectBuf: Ptr, ax: Int32, ay: Int32): Null =>
+  SDL_SetRenderDrawColor(ren, 10, 20, 30, 255)
+  SDL_RenderClear(ren)
+  pokeF32(rectBuf, FRECT_X_OFF, toFloat32(toFloat64(ax) * SCALE))
+  pokeF32(rectBuf, FRECT_Y_OFF, toFloat32(toFloat64(ay) * SCALE))
+  pokeF32(rectBuf, FRECT_W_OFF, toFloat32(AGENT))
+  pokeF32(rectBuf, FRECT_H_OFF, toFloat32(AGENT))
+  SDL_SetRenderDrawColor(ren, 0, 200, 120, 255)
+  SDL_RenderFillRect(ren, rectBuf)
+  SDL_RenderPresent(ren)
+  null
+
+// Tail-recursive frame loop over a FIXED count. Each frame: drain events, offload a planning step
+// to a worker (plain values only cross the boundary), draw the new agent position on the main
+// thread, recurse. Self-terminating.
+val loop = (ren: Ptr, rectBuf: Ptr, eventBuf: Ptr, agent: Json, n: Int32): Json =>
+  if n <= 0 then
+    agent
+  else
+    drainEvents(eventBuf)
+    val world = {
+      "ax": agent["x"],
+      "ay": agent["y"],
+      "gx": GOAL_X,
+      "gy": GOAL_Y
+    }
+    val next = planAsync(world)
+    drawAgent(ren, rectBuf, next["x"], next["y"])
+    loop(ren, rectBuf, eventBuf, next, n - 1)
+
+// Read channel `chanOff` (B/G/R) of pixel (x,y) out of a read-back SDL_Surface as an Int64 in
+// [0,255]. (See bounce.lin for the XRGB8888 byte-order rationale.)
+val pixelChannel = (surf: Ptr, x: Int32, y: Int32, chanOff: Int32): Int64 =>
+  val pitch = peekI32(surf, SURFACE_PITCH_OFF)
+  val pixels = peekPtr(surf, SURFACE_PIXELS_OFF)
+  val off = y * pitch + x * PIXEL_BYTES + chanOff
+  toInt64(peekU8(pixels, off))
+
+SDL_Init(SDL_INIT_VIDEO)
+val win = withCstr("lin-sdl-ai-worker", title => SDL_CreateWindow(title, WIDTH, HEIGHT, 0))
+print("window handle non-null: ${toString(win != 0)}")
+val ren = SDL_CreateRenderer(win, 0)
+
+val rectBuf = alloc(FRECT_BYTES)
+val eventBuf = alloc(EVENT_BYTES)
+
+val finalAgent = loop(ren, rectBuf, eventBuf, { "x": 0, "y": 0 }, FRAMES)
+
+print("frames drawn: ${toString(FRAMES)}")
+print("final agent: ${toString(finalAgent["x"])},${toString(finalAgent["y"])}")
+
+// PROOF OF RENDERING: read back a pixel near the centre of the agent's final 12x12 rect (top-left
+// at agent*SCALE) and assert it is the agent's fill colour (0,200,120). Bytes B,G,R for XRGB8888.
+val surf = SDL_RenderReadPixels(ren, 0)
+val px = finalAgent["x"] * 8 + 4
+val py = finalAgent["y"] * 8 + 4
+val r = pixelChannel(surf, px, py, PIXEL_R_OFF)
+val g = pixelChannel(surf, px, py, PIXEL_G_OFF)
+val b = pixelChannel(surf, px, py, PIXEL_B_OFF)
+val matches = r == 0 && g == 200 && b == 120
+print(
+  "pixel[${toString(px)},${toString(py)}] = ${toString(r)},${toString(g)},${toString(b)}"
+)
+print("rendered pixel matches fill: ${toString(matches)}")
+SDL_DestroySurface(surf)
+
+free(rectBuf)
+free(eventBuf)
+SDL_DestroyWindow(win)
+SDL_Quit()
+print("done")

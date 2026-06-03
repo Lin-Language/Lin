@@ -1,0 +1,155 @@
+// bounce — a bouncing-ball SDL3 demo driven entirely from pure Lin via the richer FFI.
+//
+// It calls the REAL SDL3 3.4.10 C ABI (SDL_Init, SDL_CreateWindow, SDL_CreateRenderer,
+// SDL_SetRenderDrawColor, SDL_RenderClear, SDL_RenderFillRect, SDL_RenderPresent, SDL_PollEvent,
+// SDL_RenderReadPixels, SDL_DestroySurface, SDL_Delay, SDL_DestroyWindow, SDL_Quit). The real
+// libSDL3.so is vendored at examples/sdl/libs/ (soname chain libSDL3.so -> .so.0 -> .so.0.4.10).
+//
+// HEADLESS: run with the env var SDL_VIDEODRIVER=dummy and SDL3 selects the dummy video driver +
+// software renderer — no display needed. Real SDL3 emits no synthetic QUIT, so this demo DOES NOT
+// poll-to-quit (that would hang forever): it runs a FIXED frame count and self-terminates.
+//
+// PROOF OF RENDERING: after the loop it calls SDL_RenderReadPixels to copy the framebuffer back
+// into an SDL_Surface, then peeks the surface's pixel bytes and asserts the colour at a pixel
+// inside the ball's final rect matches the fill colour (channel order B,G,R for XRGB8888).
+//
+// FFI works only through `lin build`/`lin run` (the compiler emits LLVM `declare`s, links the .so,
+// and bakes a $ORIGIN-relative rpath so the binary finds the vendored .so at runtime with no
+// LD_LIBRARY_PATH). Foreign bindings are FILE-LOCAL, so this file declares its own `import foreign`
+// block (it cannot import one from a wrapper module).
+//
+// Run headless:  SDL_VIDEODRIVER=dummy lin run examples/sdl/bounce.lin
+import { print } from "std/io"
+import { toString } from "std/string"
+import { toFloat32, toFloat64, toInt32, toInt64 } from "std/number"
+import { alloc, free, pokeF32, peekU8, peekI32, peekPtr, withCstr } from "std/ffi"
+import { SDL_INIT_VIDEO, FRECT_BYTES, FRECT_X_OFF, FRECT_Y_OFF, FRECT_W_OFF, FRECT_H_OFF, EVENT_BYTES, SURFACE_PITCH_OFF, SURFACE_PIXELS_OFF, PIXEL_BYTES, PIXEL_B_OFF, PIXEL_G_OFF, PIXEL_R_OFF } from "./constants"
+
+// Real SDL3 signatures. `void*`/handles (window, renderer, surface, pixels) are carried as `Ptr`
+// (an Int64 alias, never refcounted); `bool` comes back as Int32 (0/1) over the C ABI.
+import foreign "examples/sdl/libs/libSDL3.so"
+  val SDL_Init: (UInt64) => Int32
+  val SDL_CreateWindow: (Ptr, Int32, Int32, UInt64) => Ptr
+  val SDL_CreateRenderer: (Ptr, Ptr) => Ptr
+  val SDL_SetRenderDrawColor: (Ptr, UInt8, UInt8, UInt8, UInt8) => Int32
+  val SDL_RenderClear: (Ptr) => Int32
+  val SDL_RenderFillRect: (Ptr, Ptr) => Int32
+  val SDL_RenderPresent: (Ptr) => Int32
+  val SDL_RenderReadPixels: (Ptr, Ptr) => Ptr
+  val SDL_DestroySurface: (Ptr) => Null
+  val SDL_PollEvent: (Ptr) => Int32
+  val SDL_Delay: (UInt32) => Null
+  val SDL_DestroyWindow: (Ptr) => Null
+  val SDL_Quit: () => Null
+
+val WIDTH = 320
+val HEIGHT = 240
+val BALL = 16.0
+val FRAMES = 60
+
+// Drain the per-frame event queue and discard everything. Real headless SDL3 generally produces
+// no events; we still pump so the queue never backs up. We DO NOT use this to terminate — the loop
+// runs a fixed frame count.
+val drainEvents = (eventBuf: Ptr): Null =>
+  if SDL_PollEvent(eventBuf) == 0 then
+    null
+  else
+    drainEvents(eventBuf)
+
+// Reflect a 1-D position/velocity off the [0, hi] walls. Returns an immutable {p, v} record.
+val step1d = (p: Float64, v: Float64, hi: Float64): Json =>
+  val np = p + v
+  if np < 0.0 then
+    { "p": 0.0 - np, "v": 0.0 - v }
+  else if np > hi then
+    { "p": hi - (np - hi), "v": 0.0 - v }
+  else
+    { "p": np, "v": v }
+
+// One frame: drain events, clear to a known background, advance the ball, build an SDL_FRect in
+// `rectBuf` (four f32 via pokeF32), set the fill colour, fill, present. The ball is an immutable
+// record {x,y,vx,vy} threaded through and returned updated. Float literals are Float64; pokeF32
+// takes Float32, so each rect component is narrowed with toFloat32.
+val drawFrame = (ren: Ptr, rectBuf: Ptr, eventBuf: Ptr, ball: Json): Json =>
+  drainEvents(eventBuf)
+  SDL_SetRenderDrawColor(ren, 10, 20, 30, 255)
+  SDL_RenderClear(ren)
+  val nx = step1d(ball["x"], ball["vx"], toFloat64(WIDTH) - BALL)
+  val ny = step1d(ball["y"], ball["vy"], toFloat64(HEIGHT) - BALL)
+  pokeF32(rectBuf, FRECT_X_OFF, toFloat32(nx["p"]))
+  pokeF32(rectBuf, FRECT_Y_OFF, toFloat32(ny["p"]))
+  pokeF32(rectBuf, FRECT_W_OFF, toFloat32(BALL))
+  pokeF32(rectBuf, FRECT_H_OFF, toFloat32(BALL))
+  SDL_SetRenderDrawColor(ren, 255, 128, 0, 255)
+  SDL_RenderFillRect(ren, rectBuf)
+  SDL_RenderPresent(ren)
+  {
+    "x": nx["p"],
+    "y": ny["p"],
+    "vx": nx["v"],
+    "vy": ny["v"]
+  }
+
+// Tail-recursive frame loop over a FIXED count. Self-terminating (no event dependency).
+val loop = (ren: Ptr, rectBuf: Ptr, eventBuf: Ptr, ball: Json, n: Int32): Json =>
+  if n <= 0 then
+    ball
+  else
+    loop(ren, rectBuf, eventBuf, drawFrame(ren, rectBuf, eventBuf, ball), n - 1)
+
+// Read channel `chanOff` (B/G/R) of pixel (x,y) out of a read-back SDL_Surface as an Int64 in
+// [0,255]. Byte address = pixels + y*pitch + x*PIXEL_BYTES + chanOff. The Int32 byte offset widens
+// to the Int64 `peek` offset param at the call site; toInt64 widens the UInt8 channel for
+// printing/comparison against integer literals.
+val pixelChannel = (surf: Ptr, x: Int32, y: Int32, chanOff: Int32): Int64 =>
+  val pitch = peekI32(surf, SURFACE_PITCH_OFF)
+  val pixels = peekPtr(surf, SURFACE_PIXELS_OFF)
+  val off = y * pitch + x * PIXEL_BYTES + chanOff
+  toInt64(peekU8(pixels, off))
+
+SDL_Init(SDL_INIT_VIDEO)
+val win = withCstr("lin-sdl-bounce", title => SDL_CreateWindow(title, WIDTH, HEIGHT, 0))
+print("window handle non-null: ${toString(win != 0)}")
+val ren = SDL_CreateRenderer(win, 0)
+print("renderer handle non-null: ${toString(ren != 0)}")
+
+val rectBuf = alloc(FRECT_BYTES)
+val eventBuf = alloc(EVENT_BYTES)
+
+val finalBall = loop(
+  ren,
+  rectBuf,
+  eventBuf,
+  {
+    "x": 0.0,
+    "y": 0.0,
+    "vx": 3.0,
+    "vy": 2.0
+  },
+  FRAMES
+)
+
+print("frames drawn: ${toString(FRAMES)}")
+print("final ball: ${toString(finalBall["x"])},${toString(finalBall["y"])}")
+
+// PROOF OF RENDERING: copy the framebuffer back and assert a pixel inside the ball's last rect is
+// the fill colour. The rect's top-left is (finalBall.x, finalBall.y); pixel (px+4, py+4) is well
+// inside the 16x16 ball. XRGB8888 little-endian → bytes B,G,R at offsets 0,1,2.
+val surf = SDL_RenderReadPixels(ren, 0)
+val px = toInt32(finalBall["x"]) + 4
+val py = toInt32(finalBall["y"]) + 4
+val r = pixelChannel(surf, px, py, PIXEL_R_OFF)
+val g = pixelChannel(surf, px, py, PIXEL_G_OFF)
+val b = pixelChannel(surf, px, py, PIXEL_B_OFF)
+val matches = r == 255 && g == 128 && b == 0
+print(
+  "pixel[${toString(px)},${toString(py)}] = ${toString(r)},${toString(g)},${toString(b)}"
+)
+print("rendered pixel matches fill: ${toString(matches)}")
+SDL_DestroySurface(surf)
+
+free(rectBuf)
+free(eventBuf)
+SDL_DestroyWindow(win)
+SDL_Quit()
+print("done")

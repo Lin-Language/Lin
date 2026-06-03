@@ -76,6 +76,13 @@ fn resolve_named_cycle(
         "UInt64" => Ok(Type::UInt64),
         "Float32" => Ok(Type::Float32),
         "Float64" => Ok(Type::Float64),
+        // `Ptr` is a prototype FFI pointer type aliased to Int64 (the pointer-width int on the
+        // 64-bit target, ABI-identical to void*). Keeping it a scalar Int64 means it is already a
+        // legal FFI value type, already maps to LLVM i64, and never gets entangled in refcounting
+        // — no new `Type` variant fanning across the ~20 exhaustive Type matches. FOLLOW-UP: a
+        // distinct opaque newtype (e.g. `Type::Ptr`) would let the checker forbid arithmetic on
+        // raw handles and prevent accidental Int64↔Ptr confusion; this alias is the prototype shortcut.
+        "Ptr" => Ok(Type::Int64),
         "String" => Ok(Type::Str),
         "Json" => Ok(json_type()),
         // `Error` is the conventional error value (spec §20, §24.2.2) and a structural object

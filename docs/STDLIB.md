@@ -3652,6 +3652,62 @@ tcpClose(listener)
 
 ---
 
+## std/ffi
+
+Raw-memory and C-string helpers for **richer FFI** — calling C libraries that traffic in pointers and out-param structs, beyond the scalar-only `import foreign` surface (spec §26.3). This is a **prototype keystone**: it lets pure Lin marshal `String` arguments into NUL-terminated C strings, allocate scratch/out-param buffers, and read/write fixed-layout structs returned through a C `void*`.
+
+These are inherently unsafe primitives — they do raw memory access with no bounds checking. They are the trusted boundary between Lin's managed values and arbitrary C memory; the caller is responsible for offsets being in-bounds and for the lifetime of any pointer handed to a C API.
+
+`Ptr` is a pointer type aliased to `Int64` (ABI-identical to a 64-bit `void*`). It stays a scalar, so a `Ptr` value is never refcounted and can be passed straight back into another foreign function. (Follow-up: a distinct opaque newtype would let the checker forbid arithmetic on raw handles.)
+
+```txt
+cstr:     (s: String)            => Ptr        // NUL-terminated C-string copy of s (caller frees)
+withCstr: <T>(s: String, body: (Ptr) => T) => T  // scoped cstr: alloc, run body, free, return T
+alloc:    (n: Int64)             => Ptr        // n bytes of raw scratch memory
+free:     (p: Ptr)               => Null       // free a buffer from alloc/cstr
+peekU8:   (p: Ptr, off: Int64)   => UInt8      // read a u8 at byte offset off
+peekU16:  (p: Ptr, off: Int64)   => UInt16     // read a u16 at byte offset off
+peekU32:  (p: Ptr, off: Int64)   => UInt32     // read a u32 at byte offset off
+peekU64:  (p: Ptr, off: Int64)   => UInt64     // read a u64 at byte offset off
+peekI32:  (p: Ptr, off: Int64)   => Int32      // read an i32 at byte offset off
+peekI64:  (p: Ptr, off: Int64)   => Int64      // read an i64 at byte offset off
+peekF32:  (p: Ptr, off: Int64)   => Float32    // read an f32 at byte offset off
+peekF64:  (p: Ptr, off: Int64)   => Float64    // read an f64 at byte offset off
+peekPtr:  (p: Ptr, off: Int64)   => Ptr        // read a pointer-width field at byte offset off
+pokeU8:   (p: Ptr, off: Int64, v: UInt8)   => Null   // write a u8 at byte offset off
+pokeU16:  (p: Ptr, off: Int64, v: UInt16)  => Null   // write a u16 at byte offset off
+pokeU32:  (p: Ptr, off: Int64, v: UInt32)  => Null   // write a u32 at byte offset off
+pokeU64:  (p: Ptr, off: Int64, v: UInt64)  => Null   // write a u64 at byte offset off
+pokeI32:  (p: Ptr, off: Int64, v: Int32)   => Null   // write an i32 at byte offset off
+pokeI64:  (p: Ptr, off: Int64, v: Int64)   => Null   // write an i64 at byte offset off
+pokeF32:  (p: Ptr, off: Int64, v: Float32) => Null   // write an f32 at byte offset off (SDL_FRect etc.)
+pokeF64:  (p: Ptr, off: Int64, v: Float64) => Null   // write an f64 at byte offset off
+pokePtr:  (p: Ptr, off: Int64, v: Ptr)     => Null   // write a pointer-width field at byte offset off
+```
+
+**Prefer `withCstr` to avoid leaks.** It allocates a NUL-terminated copy, runs your callback with the pointer, frees the buffer, and returns the callback's value — the leak-free idiom for the common "the C API copies the string during the call" case:
+
+```lin
+val win = withCstr("title", (p) => create_window_titled(p, 320, 240))
+```
+
+The bare `cstr` does **not** free its allocation — use it (paired with `free`) only when the C API *retains* the pointer and you must manage its lifetime explicitly. Calling `cstr` without a matching `free` leaks; in a hot loop that leaks unboundedly. (`withCstr` itself can only leak if the callback faults, since Lin has no try/finally — accepted for this prototype.)
+
+Real foreign calls (`import foreign "lib.so"`) require `lin build`; `alloc`/`poke`/`peek`/`free`/`withCstr` are plain runtime symbols and also run under `lin test`. The compiler emits a **`$ORIGIN`-relative rpath** to a vendored `.so`'s directory (Linux/ELF): the produced binary and its co-located `.so` are **relocatable** — copy both together (preserving their relative layout) anywhere and the binary still finds the library at runtime without `LD_LIBRARY_PATH`, because `$ORIGIN` is resolved by the loader to wherever the binary actually lives. Vendor the `.so` next to (or at a fixed relative path from) the binary. If a relative path can't be computed the compiler falls back to an absolute rpath (robust, not relocatable). macOS `@loader_path`/`install_name` is a follow-up. See `examples/sdl/` for an end-to-end demo: two programs (`bounce.lin`, `ai_worker.lin`) drive the real SDL3 C ABI from pure Lin via `Ptr` handles, a `withCstr` title, and an `SDL_FRect` built with `pokeF32`, linking a committed headless SDL3 stub (`libs/libSDL3.so`) so they run without a display; `ai_worker.lin` also offloads a pure planning step to an `async` worker (values cross the boundary, SDL handles stay on the main thread).
+
+```lin
+import { alloc, free, peekU32, pokeU32 } from "std/ffi"
+
+val buf = alloc(8)         // an 8-byte struct: u32 @0, u32 @4
+pokeU32(buf, 0, 1)         // type
+pokeU32(buf, 4, 41)        // scancode
+val ty = peekU32(buf, 0)   // 1
+val sc = peekU32(buf, 4)   // 41
+free(buf)
+```
+
+---
+
 ## std/process
 
 Run and manage external processes. Two styles share one module:
