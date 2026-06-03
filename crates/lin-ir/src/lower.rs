@@ -2945,8 +2945,15 @@ fn coerce_arg_to_param_repr(arg: Temp, arg_ty: &Type, param_ty: &Type, builder: 
 /// is Json) so the closure ABI lines up. Returns the result temp typed as the closure's
 /// declared return type.
 fn call_body_closure(body: Temp, raw_args: &[(Temp, Type)], param_tys: &[Type], ret_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+    // TRUNCATE to the closure's REAL arity: a combinator may offer MORE arguments (e.g. the
+    // trailing 0-based index) than the callback declares. A closure's compiled wrapper has exactly
+    // `param_tys.len()` parameters, so calling it with surplus args would be ABI UB — drop them.
+    // (The checker normally PADS a shorter callback to the expected arity, but this stays correct
+    // even for a callback value that reached here un-padded.)
+    let n = param_tys.len();
     let call_args: Vec<Temp> = raw_args
         .iter()
+        .take(n)
         .enumerate()
         .map(|(i, (t, ty))| {
             let pty = param_tys.get(i);
@@ -2981,9 +2988,13 @@ fn call_body_closure(body: Temp, raw_args: &[(Temp, Type)], param_tys: &[Type], 
 /// conventions to change, out of scope). `map`/`filter`/`reduce` use the plain
 /// `call_body_closure` and never reach this path, so their element-into-result moves are intact.
 fn call_body_closure_with_elem_boxes(body: Temp, raw_args: &[(Temp, Type)], param_tys: &[Type], ret_ty: &Type, builder: &mut FuncBuilder) -> (Temp, Vec<Temp>) {
+    // TRUNCATE to the closure's REAL arity (see `call_body_closure`): never pass surplus
+    // combinator args (e.g. the trailing index) to a callback that declares fewer parameters.
+    let n = param_tys.len();
     let mut elem_boxes = Vec::new();
     let call_args: Vec<Temp> = raw_args
         .iter()
+        .take(n)
         .enumerate()
         .map(|(i, (t, ty))| {
             let pty = param_tys.get(i);
@@ -3007,6 +3018,18 @@ fn call_body_closure_with_elem_boxes(body: Temp, raw_args: &[(Temp, Type)], para
         ret_ty: ret_ty.clone(),
     });
     (dst, elem_boxes)
+}
+
+/// Narrow the `Int64` combinator loop counter to the `Int32` the callback's index parameter
+/// expects. `emit_index_loop` carries `i` as `Int64`, but the optional iterator-callback index
+/// param is `Int32` (checker + intrinsic signatures), so an explicit truncation is emitted here
+/// via `Coerce` (codegen lowers Int64→Int32 as a `trunc`). Returns a fresh `Int32` temp.
+fn narrow_loop_index(i: Temp, builder: &mut FuncBuilder) -> Temp {
+    let dst = builder.alloc_temp(Type::Int32);
+    builder.emit(Instruction::Coerce {
+        dst, src: i, from_ty: Type::Int64, to_ty: Type::Int32,
+    });
+    dst
 }
 
 /// Coerce a concrete argument to a union/Json parameter (box it); pass through otherwise.
@@ -3383,8 +3406,11 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
     // tag-aware release it every iteration, inside the loop body before the back-edge — never
     // registered as scope-owned (that would release once AFTER the loop, leaking per-iteration).
     let boxed = Type::TypeVar(u32::MAX);
-    emit_index_loop(iterable, &iterable_ty, &read_elem_ty, builder, ctx, |_, elem, b, _| {
-        let (ret, elem_boxes) = call_body_closure_with_elem_boxes(body, &[(elem, elem_ty.clone())], &param_tys, &boxed, b);
+    emit_index_loop(iterable, &iterable_ty, &read_elem_ty, builder, ctx, |i, elem, b, _| {
+        // The optional 0-based SOURCE index (`(item, i) => …`); narrowed Int64→Int32. Truncated
+        // away by `call_body_closure_with_elem_boxes` when the callback declares only `(item)`.
+        let idx = narrow_loop_index(i, b);
+        let (ret, elem_boxes) = call_body_closure_with_elem_boxes(body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &param_tys, &boxed, b);
         // Release the callback-RETURN box (a fresh, independently-owned +1; `for` discards it).
         // This fully reclaims it (inner + shell). The callback CAN return (an alias of) the
         // element box — e.g. `x => x`, or `acc = f(acc, x)` where `f` yields its element — in which
@@ -3446,8 +3472,10 @@ fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx
         dst: elem, object: iterable, key: i,
         obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
     });
-    // keep = body(elem) : Bool — continue only while true.
-    let (keep, elem_boxes) = call_body_closure_with_elem_boxes(body, &[(elem, elem_ty.clone())], &param_tys, &Type::Bool, builder);
+    // keep = body(elem, i) : Bool — continue only while true. `i` (the 0-based SOURCE index) is
+    // narrowed Int64→Int32; truncated away when the callback declares only `(item)`.
+    let idx = narrow_loop_index(i, builder);
+    let (keep, elem_boxes) = call_body_closure_with_elem_boxes(body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &param_tys, &Type::Bool, builder);
     // Reclaim the per-iteration element BOX SHELL (same mechanism + safety as `lower_for`):
     // `FreeBoxShell` frees only the 16-byte shell, never the inner. The predicate's `Bool` return
     // is an unboxed scalar, so it can NEVER alias the element box — no de-aliasing needed here.
@@ -3491,9 +3519,12 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
         let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
-        emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |_, elem, b, c| {
+        emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |i, elem, b, c| {
+            // Optional 0-based SOURCE index; narrowed Int64→Int32. `inline_lambda_body` binds by the
+            // lambda's OWN param count, so a 1-param `x => …` simply ignores this surplus arg.
+            let idx = narrow_loop_index(i, b);
             let (mapped, mapped_ty) =
-                inline_lambda_body(&lam_params, &lam_body, &[(elem, elem_ty.clone())], b, c);
+                inline_lambda_body(&lam_params, &lam_body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], b, c);
             // `mapped` is the lambda's freshly-owned result (+1) — MOVE it into the result array.
             push_output(out, flat, &out_elem_ty, mapped, &mapped_ty, false, b);
         });
@@ -3503,8 +3534,9 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
     let f = lower_callback_in_safe_ctx(&args[1], builder, ctx);
     let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
 
-    emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |_, elem, b, _| {
-        let mapped = call_body_closure(f, &[(elem, elem_ty.clone())], &param_tys, &cb_ret, b);
+    emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |i, elem, b, _| {
+        let idx = narrow_loop_index(i, b);
+        let mapped = call_body_closure(f, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &param_tys, &cb_ret, b);
         // `mapped` is the callback's freshly-owned result (+1) — MOVE it into the result array.
         push_output(out, flat, &out_elem_ty, mapped, &cb_ret, false, b);
     });
@@ -3533,9 +3565,12 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
         let lam_params = lam_params.to_vec();
         let lam_body = lam_body.clone();
         let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
-        emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |_, elem, b, c| {
+        emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |i, elem, b, c| {
+            // Optional 0-based SOURCE index (the source position, even though filter's OUTPUT
+            // position differs); narrowed Int64→Int32. Ignored by a 1-param predicate.
+            let idx = narrow_loop_index(i, b);
             let (pred_raw, pred_ty) =
-                inline_lambda_body(&lam_params, &lam_body, &[(elem, elem_ty.clone())], b, c);
+                inline_lambda_body(&lam_params, &lam_body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], b, c);
             // Coerce the predicate result to an i1 Bool (a concrete-Bool body needs no coercion;
             // a Json/boxed-bool body is unboxed via Coerce).
             let keep = if matches!(pred_ty, Type::Bool) {
@@ -3560,8 +3595,9 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
 
     let pred = lower_callback_in_safe_ctx(&args[1], builder, ctx);
     let (out, flat) = alloc_output_array(&out_elem_ty, result_type, builder);
-    emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |_, elem, b, _| {
-        let keep = call_body_closure(pred, &[(elem, elem_ty.clone())], &param_tys, &Type::Bool, b);
+    emit_index_loop(iterable, &iterable_ty, &elem_ty, builder, ctx, |i, elem, b, _| {
+        let idx = narrow_loop_index(i, b);
+        let keep = call_body_closure(pred, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &param_tys, &Type::Bool, b);
         let keep_block = b.alloc_block("filter_keep");
         let skip_block = b.alloc_block("filter_skip");
         b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: skip_block });
@@ -3637,10 +3673,14 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
                 dst: elem, object: iterable, key: i,
                 obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
             });
-            // acc_next = <lambda body>(acc, elem), inlined. The reducer params are (acc, elem).
+            // acc_next = <lambda body>(acc, elem, i), inlined. The reducer params are (acc, elem)
+            // plus the OPTIONAL 0-based SOURCE index `i` (narrowed Int64→Int32). A 2-param
+            // `(acc, x) => …` reducer ignores the surplus index arg (`inline_lambda_body` binds by
+            // the lambda's own param count).
+            let idx = narrow_loop_index(i, builder);
             let (acc_next_raw, acc_next_ty) = inline_lambda_body(
                 &lam_params, &lam_body,
-                &[(acc, acc_ty.clone()), (elem, elem_ty.clone())], builder, ctx,
+                &[(acc, acc_ty.clone()), (elem, elem_ty.clone()), (idx, Type::Int32)], builder, ctx,
             );
             let acc_next = coerce_arg_to_param_repr(acc_next_raw, &acc_next_ty, &acc_ty, builder);
             let one = builder.const_temp(Const::Int(1, Type::Int64));
@@ -3697,12 +3737,20 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
         dst: elem, object: iterable, key: i,
         obj_ty: iterable_ty.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone(),
     });
-    // acc_next = f(acc, elem). acc is carried as Json; coerce both args to the reducer's
-    // declared param types.
+    // acc_next = f(acc, elem[, i]). acc is carried as Json; coerce both args to the reducer's
+    // declared param types. A 3-param reducer `(acc, item, i) => …` also receives the OPTIONAL
+    // 0-based SOURCE index (narrowed Int64→Int32); a 2-param reducer omits it (its closure wrapper
+    // has only two parameters, so passing a third would be ABI UB).
     let acc_arg = coerce_arg_to_param(acc, &json, param_tys.first(), builder);
     let elem_arg = coerce_arg_to_param(elem, &elem_ty, param_tys.get(1), builder);
+    let mut call_args = vec![acc_arg, elem_arg];
+    if param_tys.len() >= 3 {
+        let idx = narrow_loop_index(i, builder);
+        let idx_arg = coerce_arg_to_param(idx, &Type::Int32, param_tys.get(2), builder);
+        call_args.push(idx_arg);
+    }
     builder.emit(Instruction::Call {
-        dst: acc_next, callee: CallTarget::Indirect(f), args: vec![acc_arg, elem_arg], ret_ty: json.clone(),
+        dst: acc_next, callee: CallTarget::Indirect(f), args: call_args, ret_ty: json.clone(),
     });
     let one = builder.const_temp(Const::Int(1, Type::Int64));
     builder.emit(Instruction::Binary {

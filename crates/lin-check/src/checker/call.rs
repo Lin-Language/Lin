@@ -698,6 +698,31 @@ impl Checker {
                 let concrete_params: Vec<Type> = method_params.iter()
                     .map(|p| apply_type_subs(p, &subs))
                     .collect();
+
+                // Spec §21: a suffixless integer literal takes its context type. Mirror of the
+                // prefix `infer_call` pass — re-type a bare integer-literal argument at the
+                // parameter's concrete integer width (if it fits) so e.g. `305419896.toUInt64()`
+                // (a literal receiver into a `UInt64` param) passes, exactly as `toUInt64(305419896)`
+                // does. Without this the new compatibility loop below would reject the dot form on
+                // a signed-Int32-literal → unsigned/wider-integer param while the prefix form passes.
+                for (i, param_ty) in concrete_params.iter().enumerate() {
+                    if i >= all_args.len() { break; }
+                    if let TypedExpr::IntLit(v, _, lit_span) = &all_args[i] {
+                        if let Some((lo, hi)) = integer_range(param_ty) {
+                            let (v, lit_span) = (*v, *lit_span);
+                            let signed = v as i128;
+                            let fits = (signed >= lo && signed <= hi)
+                                || (!param_ty.is_signed() && {
+                                    let unsigned = (v as u64) as i128;
+                                    unsigned >= lo && unsigned <= hi
+                                });
+                            if fits {
+                                all_args[i] = TypedExpr::IntLit(v, param_ty.clone(), lit_span);
+                            }
+                        }
+                    }
+                }
+
                 // Enforce the NUMERIC bound on a dot-call to a `Number`-parameter function (ADR-018,
                 // reversed). Mirrors the direct-call check; the receiver is arg 0.
                 for (i, param_ty) in method_params.iter().enumerate() {
@@ -722,6 +747,63 @@ impl Checker {
                         }
                     }
                 }
+
+                // Check argument compatibility against concrete params (mirror of the prefix
+                // `infer_call` loop). The dot path previously omitted this entirely, so a wrong
+                // callback PARAM ANNOTATION — e.g. `[1,2,3].map((x: String) => x)` or
+                // `[1,2,3].map((x, i: String) => x)` — was silently accepted. (A bad callback
+                // annotation pollutes the substitution for the element TypeVar, so the mismatch can
+                // surface on EITHER the callback arg or the receiver arg, exactly as in the prefix
+                // path; the loop therefore covers ALL args, including the receiver at index 0.)
+                //
+                // `arg_compatible` is the SAME helper the prefix path runs workspace-wide; it
+                // tolerates unsubstituted generic TypeVars, opaque `Function` params, Json, and the
+                // arity-width subtyping for shorter callbacks, so legitimate callbacks survive.
+                //
+                // ONE carve-out: a STREAMISH ARGUMENT flowing into a STREAM-ACCEPTING param. A
+                // stream source intrinsic returns `Stream<T> | Error` (the fault-propagation shape),
+                // and the stdlib stream adapters/combinators declare their stream params as either
+                // `Stream` (e.g. `gzip = (s: Stream)`, `readText = (s: Stream)`) or the `Json`
+                // wildcard (e.g. `concat = (a: Json, b: Json)` — the stream form dispatches on the
+                // receiver). `arg_compatible` does NOT accept a `Stream<T>` (nor `Stream<T> | Error`)
+                // against either: a Stream must never widen to `Json` (compat.rs), and the `| Error`
+                // arm fails the union all-arms rule against a bare `Stream<U>`. The prefix path
+                // rejects these too, but stream pipelines are written ONLY in dot form, so they
+                // historically never ran any arg check. Compatibility/consumption for stream
+                // arguments is instead governed by the dedicated streamish logic above
+                // (`streamish_combinator_ret`, `consume_definite_stream_args`).
+                //
+                // So we skip the structural check for any STREAMISH argument whose parameter can
+                // structurally ACCEPT a stream — `Stream<U>` or the `Json`/inference wildcard. This
+                // is a STRUCTURAL gate (no stdlib name list), so it covers std/iter, std/stream,
+                // std/archive AND std/compress (`gzip`/`gunzip`/`inflate`/`deflate`) uniformly,
+                // including `concat`'s SECOND stream arg. A non-stream argument (an array/object
+                // receiver, or the element-type conflict on `[1,2,3].map((x:String)=>x)`'s
+                // receiver) is NOT streamish, so it is still checked exactly as the prefix path
+                // does; and a stream flowing into a genuinely non-stream-accepting param is still
+                // rejected.
+                for (i, (arg, param_ty)) in
+                    all_args.iter().zip(concrete_params.iter()).enumerate()
+                {
+                    let arg_ty = arg.ty();
+                    if super::expr::type_is_streamish(&arg_ty)
+                        && param_accepts_stream(param_ty)
+                    {
+                        continue;
+                    }
+                    if !self.arg_compatible(&arg_ty, param_ty) {
+                        return Err(Diagnostic::error(
+                            all_arg_exprs.get(i).map(|e| e.span()).unwrap_or(span),
+                            format!(
+                                "Argument {} has type {}, expected {}",
+                                i + 1,
+                                arg_ty,
+                                param_ty
+                            ),
+                        ));
+                    }
+                }
+
                 let concrete_ret = apply_type_subs(&ret, &subs);
                 let result_type = if partial {
                     if all_args.len() < method_params.len() {
@@ -931,6 +1013,21 @@ fn is_std_iter_stream_combinator(export_name: &str) -> bool {
 /// must be a compile-time error — mirrors the IR's type-based `move_streamish_arg`.
 fn is_std_archive_consuming_export(export_name: &str) -> bool {
     matches!(export_name, "untar" | "manifest" | "files")
+}
+
+/// True when `param_ty` can structurally ACCEPT a `Stream` argument: a `Stream<U>` (incl. the
+/// bare `Stream` = `Stream<Json>` the stdlib adapters declare), the `Json`/inference wildcard
+/// (`TypeVar` — the `Json`-typed combinator params like `concat`'s, or an unsubstituted generic),
+/// or a union that has any such member (a streamish iterable union). Used by the dot-call arg
+/// compatibility carve-out: a streamish argument flowing into a stream-accepting param is governed
+/// by the dedicated streamish typing/consume logic, not the structural `arg_compatible` check.
+fn param_accepts_stream(param_ty: &Type) -> bool {
+    match param_ty {
+        Type::Stream(_) => true,
+        Type::TypeVar(_) => true,
+        Type::Union(variants) => variants.iter().any(param_accepts_stream),
+        _ => false,
+    }
 }
 
 /// True when `ty` can ONLY be a `Stream` at runtime — a bare `Stream`, or a union whose every

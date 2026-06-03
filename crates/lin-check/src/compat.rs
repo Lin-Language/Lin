@@ -186,6 +186,30 @@ pub fn is_compatible_env(
             if is_opaque_target || is_opaque_value {
                 return true;
             }
+            // ARITY-WIDTH SUBTYPING (iterator-callback index param). A callback that declares
+            // FEWER parameters is assignable where MORE are expected, PROVIDED every EXTRA expected
+            // trailing parameter is `Int32`. This is the type-system half of the optional 0-based
+            // index parameter on the iterable combinators (`for`/`map`/`filter`/`reduce`/`while`
+            // and the derived `find`/`some`/…): the intrinsic / wrapper signatures expect a
+            // `(T, Int32) => …` (or reduce's `(U, T, Int32) => U`) callback, but a user's 1-arg
+            // (reduce: 2-arg) lambda must still flow through. The leniency is TIGHT: only extra
+            // trailing `Int32` params are tolerated, so this does NOT open up arbitrary arity
+            // subtyping (a value with EXTRA params, or extra non-`Int32` expected params, still
+            // rejects). The common (leading) params and the return type are checked as usual.
+            if vp.len() < tp.len() {
+                let extra_all_int32 = tp[vp.len()..]
+                    .iter()
+                    .all(|t| matches!(t, Type::Int32));
+                if extra_all_int32 {
+                    let params_ok = vp
+                        .iter()
+                        .zip(tp.iter())
+                        .all(|(v, t)| is_compatible_env(t, v, env, lenient_json, depth));
+                    let ret_ok = is_compatible_env(vr, tr, env, lenient_json, depth);
+                    return params_ok && ret_ok;
+                }
+                return false;
+            }
             if vp.len() != tp.len() {
                 return false;
             }

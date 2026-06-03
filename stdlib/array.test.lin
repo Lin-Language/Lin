@@ -867,6 +867,89 @@ val s = suite("std/array", [
       expect(a.toString()).toBe("[7, 99, 7, 7]"),
       expect(f.toString()).toBe("[2.5, 1.5]")
     ]
+  ),
+
+  // --- Optional 0-based Int32 source index callback parameter ---
+  test("map with an optional index param", () =>
+    val r = ["a", "b", "c"].map((x, i) => i)
+    [
+      expect(r.toString()).toBe("[0, 1, 2]")
+    ]
+  ),
+
+  test("map without an index param still works (regression)", () =>
+    [
+      expect([1, 2, 3].map(x => x * 2).toString()).toBe("[2, 4, 6]")
+    ]
+  ),
+
+  test("for accumulates with the index", () =>
+    var acc = ""
+    ["a", "b", "c"].for((x, i) => acc = "${acc}${i}:${x},")
+    [
+      expect(acc).toBe("0:a,1:b,2:c,")
+    ]
+  ),
+
+  test("filter index is the SOURCE position", () =>
+    // Keeps source indices 0 and 2 (values 10 and 30), even though output positions differ.
+    val r = [10, 20, 30, 40].filter((x, i) => i % 2 == 0)
+    [
+      expect(r.toString()).toBe("[10, 30]")
+    ]
+  ),
+
+  // 0 + 0 + 1 + 2 = 3
+  test("reduce with a third index param", () =>
+    [
+      expect([1, 1, 1].reduce(0, (acc, x, i) => acc + i)).toBe(3)
+    ]
+  ),
+
+  test("reduce without an index param still works (regression)", () =>
+    [
+      expect([1, 2, 3].reduce(0, (acc, x) => acc + x)).toBe(6)
+    ]
+  ),
+
+  test("find with a 2-arg index callback", () =>
+    [
+      expect([10, 20, 30].find((x, i) => i == 2)).toBe(30)
+    ]
+  ),
+
+  test("some/every with an index callback", () =>
+    [
+      expect([10, 20, 30].some((x, i) => i == 1)).toBe(true),
+      expect([5, 6, 7].every((x, i) => i < 3)).toBe(true)
+    ]
+  ),
+
+  test("takeWhile index correctness", () =>
+    [
+      expect([5, 6, 7, 8].takeWhile((x, i) => i < 2).toString()).toBe("[5, 6]")
+    ]
+  ),
+
+  test("dropWhile index correctness", () =>
+    [
+      expect([5, 6, 7, 8].dropWhile((x, i) => i < 2).toString()).toBe("[7, 8]")
+    ]
+  ),
+
+  test("flatMap with an index callback", () =>
+    val r = ["a", "b"].flatMap((x, i) => [x, "${i}"])
+    [
+      expect(r.toString()).toBe("[\"a\", \"0\", \"b\", \"1\"]")
+    ]
+  ),
+
+  test("partition with an index callback", () =>
+    val parts = [10, 20, 30, 40].partition((x, i) => i % 2 == 0)
+    [
+      expect(parts[0].toString()).toBe("[10, 30]"),
+      expect(parts[1].toString()).toBe("[20, 40]")
+    ]
   )
 ])
 

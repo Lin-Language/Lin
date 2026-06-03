@@ -1,0 +1,34 @@
+// indexed — the optional 0-based index parameter on iterator combinators.
+//
+// Every iterable combinator (for/map/filter/reduce/while and the derived find/some/every/
+// flatMap/takeWhile/dropWhile/partition) OPTIONALLY passes a 0-based `Int32` SOURCE index as a
+// trailing callback parameter, JS `forEach((item, idx) => …)` style. A 1-arg callback stays valid
+// and unchanged — the index is opt-in by arity. The index is always the SOURCE position, even for
+// filter/takeWhile where the OUTPUT position differs.
+//
+// Run:   lin run examples/indexed/main.lin
+import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter, for, reduce, find, takeWhile } from "std/iter"
+
+val rows = ["alpha", "beta", "gamma"]
+
+// 2-arg map: tag each row with its source index.
+print(toString(rows.map((row, i) => "${i}: ${row}")))
+
+// 1-arg map still works (backward compatible).
+print(toString([1, 2, 3].map(n => n * n)))
+
+// for with the index, side-effecting.
+rows.for((row, i) => print("row ${i} = ${row}"))
+
+// filter index is the SOURCE position: keep even-indexed rows.
+print(toString(rows.filter((row, i) => i % 2 == 0)))
+
+// reduce's index is the THIRD parameter (acc, item, i).
+val weighted = [10, 10, 10].reduce(0, (acc, n, i) => acc + n * i)
+print(toString(weighted))
+
+// derived combinators: find by index, takeWhile by index.
+print(toString([100, 200, 300].find((n, i) => i == 1)))
+print(toString([5, 6, 7, 8].takeWhile((n, i) => i < 3)))

@@ -872,15 +872,43 @@ match total
 > passed through a user-defined generic `Iterable` parameter and combined inside that function stays
 > **array-shaped** (eager) — the safe resolution; the lazy form is forgone, never miscompiled.
 
+### Optional index parameter
+
+Every combinator callback OPTIONALLY receives a **0-based `Int32` SOURCE index** as a trailing
+parameter — the JS `forEach((item, idx) => …)` model. A 1-arg callback stays valid and unchanged
+(this is opt-in by arity, fully backward-compatible). It applies to `for`/`map`/`filter`/`reduce`/
+`while` and the derived `find`/`some`/`every`/`flatMap`/`takeWhile`/`dropWhile` (and
+`std/array`'s `partition`). For `reduce`, the index is the **third** parameter: `(acc, item, i)`.
+
+```txt
+["a", "b", "c"].map((x, i) => "${i}: ${x}")   // ["0: a", "1: b", "2: c"]
+["a", "b"].for((item, i) => print("${i}: ${item}"))
+[1, 1, 1].reduce(0, (acc, x, i) => acc + i)    // 0 + 0 + 1 + 2 = 3
+```
+
+The index is always the **source position**, even for `filter`/`takeWhile`/`dropWhile` where the
+output position differs:
+
+```txt
+[10, 20, 30, 40].filter((x, i) => i % 2 == 0)  // [10, 30]  (source indices 0, 2)
+```
+
+The index parameter is `Int32`: an unannotated index param infers `Int32`; an explicit `Int32`
+annotation is allowed; any other annotation (e.g. `(x, i: String) => …`) is a compile error. The
+key-extractor/aggregator combinators (`sortBy`/`minBy`/`maxBy`/`groupBy`/`countBy`) do **not** take an
+index — element position is meaningless to a key function. Indexed callbacks are **array/iterator-only**;
+the runtime `Stream` combinators keep 1-arg callbacks (see [`std/stream`](#stdstream)).
+
 ---
 
 ### map (iter) {#map-iter}
 
 ```txt
-val map: <T, U>(src: T[] | Iterator | Stream<T>, f: (T) -> U) -> U[] | Stream<U>
+val map: <T, U>(src: T[] | Iterator | Stream<T>, f: (T[, i: Int32]) -> U) -> U[] | Stream<U>
 ```
 
-Applies `f` to each element in order. **Array/Iterator** → eager `U[]`. **Stream** → lazy `Stream<U>`
+Applies `f` to each element in order. `f` optionally receives the 0-based source index as a second
+parameter (`(x, i) => …`); a 1-arg `f` is unchanged. **Array/Iterator** → eager `U[]`. **Stream** → lazy `Stream<U>`
 (a transform adapter; `f` runs once per item as the item is pulled). For a monomorphic scalar array with
 a capture-less literal lambda, the body is inlined into a flat loop with no per-element boxing (ADR-069).
 
@@ -895,10 +923,11 @@ readStream("in.csv").lines().map(line => line.toUpper())   // Stream<String> (la
 ### filter (iter) {#filter-iter}
 
 ```txt
-val filter: <T>(src: T[] | Iterator | Stream<T>, f: (T) -> Boolean) -> T[] | Stream<T>
+val filter: <T>(src: T[] | Iterator | Stream<T>, f: (T[, i: Int32]) -> Boolean) -> T[] | Stream<T>
 ```
 
-Keeps elements for which `f` returns `true`. **Array/Iterator** → eager `T[]`. **Stream** → lazy
+Keeps elements for which `f` returns `true`. `f` optionally receives the 0-based source index as a
+second parameter; the index is the source position, even though output positions differ. **Array/Iterator** → eager `T[]`. **Stream** → lazy
 `Stream<T>`.
 
 ```txt
@@ -911,10 +940,11 @@ readStream("app.log").lines().filter(line => line.contains("ERROR"))   // Stream
 ### reduce (iter) {#reduce-iter}
 
 ```txt
-val reduce: <T, U>(src: T[] | Iterator | Stream<T>, init: U, f: (U, T) -> U) -> U | (U | Error)
+val reduce: <T, U>(src: T[] | Iterator | Stream<T>, init: U, f: (U, T[, i: Int32]) -> U) -> U | (U | Error)
 ```
 
-Folds left-to-right from `init`. `f` receives the accumulator first and the current element second.
+Folds left-to-right from `init`. `f` receives the accumulator first and the current element second; it
+optionally receives the 0-based source index as a **third** parameter (`(acc, x, i) => …`).
 **Array/Iterator** → eager `U`. **Stream** → **terminal** returning `U | Error` (it drives the stream to
 completion on the calling thread; a read fault surfaces as `Error`). For a monomorphic scalar
 accumulator with a capture-less literal reducer, the accumulator is carried unboxed (ADR-069).
@@ -931,10 +961,11 @@ val n = readStream("nums.txt")
 ### for (iter) {#for-iter}
 
 ```txt
-val for: (src: Json[] | Iterator | Stream, f: (Json) -> Json) -> Null | (Null | Error)
+val for: (src: Json[] | Iterator | Stream, f: (Json[, i: Int32]) -> Json) -> Null | (Null | Error)
 ```
 
-Iterates over each element, calling `f` (its return value is discarded). **Array/Iterator** → `Null`.
+Iterates over each element, calling `f` (its return value is discarded). `f` optionally receives the
+0-based source index as a second parameter (`(item, i) => …`); array/iterator only. **Array/Iterator** → `Null`.
 **Stream** → **terminal** returning `Null | Error`: EOF ends the loop normally (`Null`), and a read
 `Error` mid-traversal becomes the result (spec §27.9.4). Lin has no `for…in`; iteration is always
 `.for(fn)`.
@@ -954,8 +985,10 @@ match outcome
 ### while (iter) {#while-iter}
 
 ```txt
-val while: <T>(src: T[] | Iterator | Stream, f: (T) -> Boolean) -> Null | (Null | Error)
+val while: <T>(src: T[] | Iterator | Stream, f: (T[, i: Int32]) -> Boolean) -> Null | (Null | Error)
 ```
+
+`f` optionally receives the 0-based source index as a second parameter; array/iterator only.
 
 Iterates calling `f` with each element, stopping as soon as `f` returns `false`. **Array/Iterator** →
 `Null`; the short-circuit primitive behind `some`/`every`/`find`. **Stream** → terminal `Null | Error`.
@@ -1004,7 +1037,7 @@ readStream("data.csv").lines().drop(1)   // skip the header line, lazily
 ### takeWhile (iter) {#takeWhile-iter}
 
 ```txt
-val takeWhile: <T>(src: T[] | Iterator | Stream<T>, f: (T) -> Boolean) -> T[] | Stream<T>
+val takeWhile: <T>(src: T[] | Iterator | Stream<T>, f: (T[, i: Int32]) -> Boolean) -> T[] | Stream<T>
 ```
 
 Leading elements for which `f` returns `true`; stops at the first `false`. **Array/Iterator** → eager
@@ -1019,7 +1052,7 @@ Leading elements for which `f` returns `true`; stops at the first `false`. **Arr
 ### dropWhile (iter) {#dropWhile-iter}
 
 ```txt
-val dropWhile: <T>(src: T[] | Iterator | Stream<T>, f: (T) -> Boolean) -> T[] | Stream<T>
+val dropWhile: <T>(src: T[] | Iterator | Stream<T>, f: (T[, i: Int32]) -> Boolean) -> T[] | Stream<T>
 ```
 
 Drops leading elements while `f` returns `true`, then keeps the rest unchanged. **Array/Iterator** →
@@ -1034,7 +1067,7 @@ eager `T[]`. **Stream** → lazy `Stream<T>`.
 ### flatMap (iter) {#flatMap-iter}
 
 ```txt
-val flatMap: (src: Json[] | Iterator | Stream, f: (Json) -> Json[]) -> Json[] | Stream
+val flatMap: (src: Json[] | Iterator | Stream, f: (Json[, i: Int32]) -> Json[]) -> Json[] | Stream
 ```
 
 Applies `f` to each element and concatenates the resulting arrays. **Array/Iterator** → eager `Json[]`.
@@ -1078,7 +1111,7 @@ concat([1, 2], [3, 4])   // [1, 2, 3, 4]
 ### find (iter) {#find-iter}
 
 ```txt
-val find: (src: Json[] | Iterator | Stream, f: (Json) -> Boolean) -> Json | (Json | Null | Error)
+val find: (src: Json[] | Iterator | Stream, f: (Json[, i: Int32]) -> Boolean) -> Json | (Json | Null | Error)
 ```
 
 The first element for which `f` returns `true`, or `null` if none. **Array/Iterator** → `Json` (the
@@ -1093,7 +1126,7 @@ match or `null`). **Stream** → **terminal** `Json | Null | Error`.
 ### some (iter) {#some-iter}
 
 ```txt
-val some: (src: Json[] | Iterator | Stream, f: (Json) -> Boolean) -> Boolean | (Boolean | Error)
+val some: (src: Json[] | Iterator | Stream, f: (Json[, i: Int32]) -> Boolean) -> Boolean | (Boolean | Error)
 ```
 
 `true` if `f` returns `true` for at least one element (short-circuits). **Array/Iterator** → `Boolean`.
@@ -1108,7 +1141,7 @@ val some: (src: Json[] | Iterator | Stream, f: (Json) -> Boolean) -> Boolean | (
 ### every (iter) {#every-iter}
 
 ```txt
-val every: (src: Json[] | Iterator | Stream, f: (Json) -> Boolean) -> Boolean | (Boolean | Error)
+val every: (src: Json[] | Iterator | Stream, f: (Json[, i: Int32]) -> Boolean) -> Boolean | (Boolean | Error)
 ```
 
 `true` if `f` returns `true` for every element (short-circuits on the first `false`); `true` for an
@@ -1440,7 +1473,7 @@ Returns the element of `arr` for which `f` produces the smallest value. The arra
 ### partition
 
 ```txt
-val partition: (arr: Json[], f: (Json) -> Boolean) -> [Json[], Json[]]
+val partition: (arr: Json[], f: (Json[, i: Int32]) -> Boolean) -> [Json[], Json[]]
 ```
 
 Returns a two-element array `[passing, failing]` where `passing` contains all elements for which `f` returned `true` and `failing` contains the rest, both in their original order.
@@ -3705,6 +3738,8 @@ readStream("in.csv")
 ```
 
 Byte sources also come from other modules — `tcpStream` (`std/net`), `stdoutStream` (`std/process`), and `stdinStream` (`std/io`) all return `Stream<UInt8[]>` (spec §27.9.2) and feed the same adapters and terminals documented here.
+
+> The optional 0-based callback **index parameter** (`(item, i) => …`) on the `std/iter` combinators is **array/iterator-only**: over a `Stream`, the lazy combinators (`map`/`filter`/`for`/…) keep their 1-arg callbacks (a stream is pull-driven with no materialised source position).
 
 ### Types
 

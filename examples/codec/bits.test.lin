@@ -6,7 +6,7 @@ import { packNibbles, highNibble, lowNibble, nalType, checksum } from "./bits"
 import { length, slice } from "std/array"
 import { concat } from "std/iter"
 import { u32ToBe, u32FromBe } from "std/bytes"
-import { toUInt64, toUInt32, toFloat64, toInt32 } from "std/number"
+import { toUInt64, toUInt32, toInt64 } from "std/number"
 
 val s = suite("bits", [
   // --- Nibble packing ---
@@ -97,7 +97,7 @@ val s = suite("bits", [
     val bytes = u32ToBe(v)
     [
       expect(length(bytes)).toBe(4),
-      expect(u32FromBe(bytes, 0).toFloat64().toInt32()).toBe(305419896)
+      expect(u32FromBe(bytes, 0).toInt64()).toBe(305419896)
     ]
   )
 ])

@@ -1979,6 +1979,114 @@ myIter.for(x => print(toString(x)))
 }
 
 #[test]
+fn test_combinator_optional_index_param() {
+    // The iterator combinators OPTIONALLY pass a 0-based Int32 SOURCE index as a trailing
+    // callback parameter (`(item, i) => …`); a 1-arg callback stays valid (backward compatible).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter, for, reduce, find, takeWhile, dropWhile } from "std/iter"
+
+// map with index, and 1-arg map regression
+print(toString(["a", "b", "c"].map((x, i) => i)))
+print(toString([1, 2, 3].map(x => x * 2)))
+// for accumulates "${i}:${x}"
+["a", "b"].for((x, i) => print("${i}:${x}"))
+// filter index is SOURCE position (keeps 10, 30 at indices 0, 2)
+print(toString([10, 20, 30, 40].filter((x, i) => i % 2 == 0)))
+// reduce 3-arg: 0 + 0 + 1 + 2 = 3
+print(toString([1, 1, 1].reduce(0, (acc, x, i) => acc + i)))
+// reduce 2-arg regression: 1 + 2 + 3 = 6
+print(toString([1, 2, 3].reduce(0, (acc, x) => acc + x)))
+// derived combinator with a 2-arg callback
+print(toString([10, 20, 30].find((x, i) => i == 2)))
+// takeWhile / dropWhile index correctness
+print(toString([5, 6, 7, 8].takeWhile((x, i) => i < 2)))
+print(toString([5, 6, 7, 8].dropWhile((x, i) => i < 2)))
+"#);
+    assert_eq!(
+        output,
+        vec![
+            "[0, 1, 2]", "[2, 4, 6]", "0:a", "1:b", "[10, 30]", "3", "6", "30", "[5, 6]", "[7, 8]",
+        ]
+    );
+}
+
+#[test]
+fn test_combinator_index_param_non_int32_annotation_is_error() {
+    // An explicitly-annotated index parameter must be Int32; any other annotation is a compile
+    // error. Both the PREFIX form `map([..], (x, i: String) => x)` and the DOT form
+    // `[..].map((x, i: String) => x)` reject — the dot path now runs the same argument-
+    // compatibility loop as the prefix path, so the wrong `String` index annotation is no longer
+    // silently ignored.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { map } from "std/iter"
+print(map([1, 2, 3], (x, i: String) => x))
+"#);
+    assert!(
+        err.contains("Int32"),
+        "expected an Int32-index diagnostic (prefix form), got: {}",
+        err
+    );
+
+    // DOT form: previously slipped past the type check; now rejected.
+    let err_dot = run_expect_err(r#"import { print } from "std/io"
+import { map } from "std/iter"
+import { toString } from "std/string"
+print(toString([1, 2, 3].map((x, i: String) => x)))
+"#);
+    assert!(
+        err_dot.contains("Int32"),
+        "expected an Int32-index diagnostic (dot form), got: {}",
+        err_dot
+    );
+
+    // The dedicated diagnostic surfaces when the callback is checked against an explicit
+    // `(T, Int32) => …` expected type that is NOT swallowed by the combinator-arg fallback.
+    let err2 = run_expect_err(r#"
+val apply = (f: (Int32, Int32) => Int32) => f(1, 2)
+val r = apply((x, i: String) => x)
+"#);
+    assert!(
+        err2.contains("index parameter of an iterator callback must be Int32")
+            || err2.contains("Int32"),
+        "got: {}",
+        err2
+    );
+}
+
+#[test]
+fn test_dot_call_callback_annotation_checked() {
+    // GENERAL regression (independent of the index feature): the DOT-application path now runs the
+    // same argument-compatibility check the PREFIX path does, so a wrong callback PARAM ANNOTATION
+    // in dot form — `[1,2,3].map((x: String) => x)` — is rejected. Previously the annotation was
+    // silently ignored and the program type-checked.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { map } from "std/iter"
+import { toString } from "std/string"
+print(toString([1, 2, 3].map((x: String) => x)))
+"#);
+    assert!(
+        !err.is_empty() && (err.contains("String") || err.contains("expected")),
+        "expected a callback-arg mismatch diagnostic for the dot form, got: {}",
+        err
+    );
+
+    // POSITIVE guards — all must STILL type-check and run:
+    //  * an unannotated callback param that infers from the receiver,
+    //  * a CORRECT annotation,
+    //  * a SHORTER-arity callback accepted where the indexed `(x, i)` shape is expected
+    //    (arity-width subtyping must survive the new gate).
+    let output = run(r#"import { print } from "std/io"
+import { map } from "std/iter"
+import { toString } from "std/string"
+print(toString([1, 2, 3].map(x => x)))
+print(toString([1, 2, 3].map((x: Int32) => x * 2)))
+print(toString([1, 2, 3].map((x, i) => x + i)))
+"#);
+    assert_eq!(output, vec!["[1, 2, 3]", "[2, 4, 6]", "[1, 3, 5]"]);
+}
+
+#[test]
 fn test_undefined_variable_error() {
     let err = run_expect_err(r#"import { print } from "std/io"
 import { toString } from "std/string"
