@@ -8,15 +8,65 @@ use lin_check::types::Type;
 use super::Codegen;
 
 impl<'ctx> Codegen<'ctx> {
-    /// Push a scalar into a flat unboxed array (lin_flat_array_push_<suffix>).
+    /// Push a scalar into a flat unboxed array.
+    ///
+    /// INLINED (like `flat_array_get`): `lin_flat_array_push_<sfx>` lives in the separately
+    /// compiled `lin-runtime` staticlib, so LLVM cannot inline it across that boundary (no LTO).
+    /// Every element of an eager combinator chain over a flat scalar array (e.g. the pipeline
+    /// benchmark `range(0,20M).map(...).filter(...).reduce(...)`) paid a full call + prologue. The
+    /// common case is the FAST path (`len < cap`): bump-append the element. The COLD grow path
+    /// (`len == cap`) still defers to the runtime push so the realloc/layout logic is never
+    /// duplicated and the behaviour stays byte-identical.
+    ///
+    /// LinArray layout (repr(C), in sync with `flat_array_get`/lin-runtime): refcount u32 @ byte 0,
+    /// elem_tag u8 @ byte 4, len u64 @ byte 8, cap u64 @ byte 16, data ptr @ byte 24.
     pub(crate) fn flat_array_push(&mut self, arr: BasicValueEnum<'ctx>, val: BasicValueEnum<'ctx>, elem_ty: &Type) {
         let suffix = Self::flat_suffix(elem_ty);
         let push_name = format!("lin_flat_array_push_{}", suffix);
         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+        let i64_ty = self.context.i64_type();
         let llvm_elem_ty = self.llvm_type(elem_ty);
         let push_fn = self.get_or_declare_fn(&push_name,
             self.context.void_type().fn_type(&[ptr_ty.into(), llvm_elem_ty.into()], false));
-        self.builder.call(push_fn, &[arr.into(), val.into()], "");
+        let arr_ptr = arr.into_pointer_value();
+
+        // len = *(u64*)(arr + 8); cap = *(u64*)(arr + 16)
+        let len_ptr = unsafe {
+            self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(8, false)], "fpush_len_p")
+        };
+        let len = self.builder.load(i64_ty, len_ptr, "fpush_len").into_int_value();
+        let cap_ptr = unsafe {
+            self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(16, false)], "fpush_cap_p")
+        };
+        let cap = self.builder.load(i64_ty, cap_ptr, "fpush_cap").into_int_value();
+        let full = self.builder.int_compare(IntPredicate::EQ, len, cap, "fpush_full");
+
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let grow_b = self.context.append_basic_block(llvm_fn, "fpush_grow");
+        let fast_b = self.context.append_basic_block(llvm_fn, "fpush_fast");
+        let cont_b = self.context.append_basic_block(llvm_fn, "fpush_cont");
+        self.builder.conditional_branch(full, grow_b, fast_b);
+
+        // Cold grow path: the runtime push reallocates, stores, and bumps len — byte-identical.
+        self.builder.position_at_end(grow_b);
+        self.builder.call(push_fn, &[arr_ptr.into(), val.into()], "");
+        self.builder.unconditional_branch(cont_b);
+
+        // Fast path: data = *(ptr*)(arr + 24); data[len] = val; len = len + 1
+        self.builder.position_at_end(fast_b);
+        let data_ptr_ptr = unsafe {
+            self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(24, false)], "fpush_data_pp")
+        };
+        let data_ptr = self.builder.load(ptr_ty, data_ptr_ptr, "fpush_data").into_pointer_value();
+        let elem_ptr = unsafe {
+            self.builder.in_bounds_gep(llvm_elem_ty, data_ptr, &[len], "fpush_elem_p")
+        };
+        self.builder.store(elem_ptr, val);
+        let new_len = self.builder.int_add(len, i64_ty.const_int(1, false), "fpush_newlen");
+        self.builder.store(len_ptr, new_len);
+        self.builder.unconditional_branch(cont_b);
+
+        self.builder.position_at_end(cont_b);
     }
 
     /// Load a scalar element from a flat unboxed array.
@@ -346,6 +396,77 @@ impl<'ctx> Codegen<'ctx> {
     ///     fresh source box's orphaned shell is freed by the `FreeBoxShell` the IR emits.
     /// The slot's owning reference is supplied by the IR `transfer_into_container` emitted in
     /// `IndexSet`/`ArraySetDyn` lowering. Shared by `compile_ir_index_set` and `ArraySetDyn`.
+    /// Store a scalar into a flat unboxed array slot, INLINED.
+    ///
+    /// The symmetric write twin of `flat_array_get`: the generic `emit_array_set` always boxes the
+    /// value into a stack `TaggedVal` and calls the cross-staticlib `lin_array_set`, which then
+    /// re-decodes the tag and stores the raw scalar. For a flat `Int32[]`/`Float64[]` whose value
+    /// type already matches the element type, that round-trip is pure overhead. This emits the
+    /// bounds-checked raw store directly. The COLD OOB path defers to `lin_array_set` (a silent
+    /// no-op on OOB, spec §6.1 — array set never faults) so the behaviour stays byte-identical and
+    /// no new runtime symbol is needed.
+    ///
+    /// Only valid when the value's static type equals the flat element type (no widening/narrowing
+    /// conversion needed); the caller guarantees this. LinArray layout: len u64 @ byte 8, data ptr
+    /// @ byte 24 (in sync with `flat_array_get`/`flat_array_push`).
+    pub(crate) fn flat_array_set(&mut self, arr_ptr: BasicValueEnum<'ctx>, idx_i64: inkwell::values::IntValue<'ctx>, value: BasicValueEnum<'ctx>, elem_ty: &Type) {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        let llvm_elem_ty = self.llvm_type(elem_ty);
+        let arr_ptr = arr_ptr.into_pointer_value();
+        let idx = if idx_i64.get_type().get_bit_width() == 64 {
+            idx_i64
+        } else {
+            self.builder.int_s_extend(idx_i64, i64_ty, "fset_idx64")
+        };
+
+        // len = *(u64*)(arr + 8)
+        let len_ptr = unsafe {
+            self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(8, false)], "fset_len_p")
+        };
+        let len = self.builder.load(i64_ty, len_ptr, "fset_len").into_int_value();
+
+        // actual = idx < 0 ? len + idx : idx  (matches lin_array_set negative-index handling)
+        let zero = i64_ty.const_zero();
+        let is_neg = self.builder.int_compare(IntPredicate::SLT, idx, zero, "fset_idx_neg");
+        let wrapped = self.builder.int_add(len, idx, "fset_idx_wrap");
+        let actual = self.builder
+            .build_select(is_neg, wrapped, idx, "fset_idx_actual")
+            .unwrap()
+            .into_int_value();
+        // Single unsigned compare catches both a still-negative wrap and actual >= len.
+        let oob = self.builder.int_compare(IntPredicate::UGE, actual, len, "fset_oob");
+
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let ok_b = self.context.append_basic_block(llvm_fn, "fset_ok");
+        let oob_b = self.context.append_basic_block(llvm_fn, "fset_oob");
+        let cont_b = self.context.append_basic_block(llvm_fn, "fset_cont");
+        self.builder.conditional_branch(oob, oob_b, ok_b);
+
+        // Cold OOB path: defer to the runtime set with the ORIGINAL index (silent no-op on OOB),
+        // so out-of-range writes behave byte-identically to the generic path.
+        self.builder.position_at_end(oob_b);
+        let stack_tagged = self.build_tagged_val_alloca(&value, elem_ty);
+        let set_fn = self.get_or_declare_fn("lin_array_set",
+            self.context.void_type().fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
+        self.builder.call(set_fn, &[arr_ptr.into(), idx.into(), stack_tagged.into()], "");
+        self.builder.unconditional_branch(cont_b);
+
+        // Fast path: data = *(ptr*)(arr + 24); data[actual] = value
+        self.builder.position_at_end(ok_b);
+        let data_ptr_ptr = unsafe {
+            self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(24, false)], "fset_data_pp")
+        };
+        let data_ptr = self.builder.load(ptr_ty, data_ptr_ptr, "fset_data").into_pointer_value();
+        let elem_ptr = unsafe {
+            self.builder.in_bounds_gep(llvm_elem_ty, data_ptr, &[actual], "fset_elem_p")
+        };
+        self.builder.store(elem_ptr, value);
+        self.builder.unconditional_branch(cont_b);
+
+        self.builder.position_at_end(cont_b);
+    }
+
     pub(crate) fn emit_array_set(&mut self, arr_ptr: BasicValueEnum<'ctx>, idx_i64: inkwell::values::IntValue<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type) {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
@@ -385,7 +506,19 @@ impl<'ctx> Codegen<'ctx> {
                     self.emit_object_set(obj, key_str, value, val_ty);
                 }
             }
-            Type::Array(_) | Type::FixedArray(_) => {
+            Type::Array(elem) => {
+                let idx = self.index_value_to_i64(key);
+                // Flat scalar element AND the value already has the matching scalar type ⇒ inline a
+                // bounds-checked raw store (no box + cross-staticlib `lin_array_set` round-trip).
+                // A differing scalar width/kind would need the runtime's value conversion, so fall
+                // back. A FixedArray is always stored tagged (heterogeneous slots) — handled below.
+                if Self::is_flat_scalar(elem) && elem.as_ref() == val_ty {
+                    self.flat_array_set(obj, idx, value, val_ty);
+                } else {
+                    self.emit_array_set(obj, idx, value, val_ty);
+                }
+            }
+            Type::FixedArray(_) => {
                 let idx = self.index_value_to_i64(key);
                 self.emit_array_set(obj, idx, value, val_ty);
             }
