@@ -8,6 +8,7 @@ name = "lin_runtime"
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]
+lin-common = { path = "../lin-common" }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # Jinja-style templating for std/template. default-features off to keep deps minimal;
 # `builtins` re-enables {% for %}/{% if %} control flow and the standard filter set

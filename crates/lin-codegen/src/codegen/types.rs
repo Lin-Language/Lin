@@ -4,6 +4,7 @@ use inkwell::values::BasicValueEnum;
 use inkwell::AddressSpace;
 
 use lin_check::types::Type;
+use lin_common::tags::*;
 use super::Codegen;
 
 impl<'ctx> Codegen<'ctx> {
@@ -106,25 +107,33 @@ impl<'ctx> Codegen<'ctx> {
         )
     }
 
-    /// Tag constant for a concrete type (for `is` type checks).
+    /// Tag for how a value of `ty` is BOXED as a scalar TaggedVal — i.e. the byte stored in
+    /// the tag field and matched by `is`-checks. This must EXACTLY mirror `box_value` /
+    /// `tagged_payload_i64` so the runtime reads the payload back the same way it was written.
+    ///
+    /// Floats: both Float32 and Float64 box as TAG_FLOAT64 with an f64-bits payload (codegen
+    /// fpext's a Float32 to f64 before boxing), so TAG_FLOAT32 (a flat-array elem_tag only)
+    /// must NEVER be emitted for a boxed scalar — doing so made the runtime read an f64-bits
+    /// payload as `f32::from_bits(payload as u32)` → garbage, and made `x is Float64` compare
+    /// 5 against a value tagged 4 → dead arm.
     pub(crate) fn type_tag(ty: &Type) -> u8 {
         match ty {
-            Type::Null => 0,
-            Type::Bool => 1,
-            Type::Int8 | Type::Int16 | Type::Int32 => 2,
+            Type::Null => TAG_NULL,
+            Type::Bool => TAG_BOOL,
+            Type::Int8 | Type::Int16 | Type::Int32 => TAG_INT32,
             // UInt8/16/32 are zero-extended and boxed as TAG_INT64 (always-positive i64) so
             // a u32 >= 2^31 reads back correctly. Must match box_value / build_tagged_val_alloca.
-            Type::UInt8 | Type::UInt16 | Type::UInt32 => 3,
-            Type::Int64 => 3,
-            // UInt64 — read back unsigned. TAG_UINT64 = 14 in lin-runtime/src/tagged.rs.
-            Type::UInt64 => 14,
-            Type::Float32 => 4,
-            Type::Float64 => 5,
-            Type::Str | Type::StrLit(_) => 6,
-            Type::Object(_) => 7,
-            Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => 8,
-            Type::Function { .. } => 9,
-            _ => 0,
+            Type::UInt8 | Type::UInt16 | Type::UInt32 => TAG_INT64,
+            Type::Int64 => TAG_INT64,
+            // UInt64 — read back unsigned.
+            Type::UInt64 => TAG_UINT64,
+            // Both float widths box as f64 bits (see doc above).
+            Type::Float32 | Type::Float64 => TAG_FLOAT64,
+            Type::Str | Type::StrLit(_) => TAG_STR,
+            Type::Object(_) => TAG_OBJECT,
+            Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => TAG_ARRAY,
+            Type::Function { .. } => TAG_FUNCTION,
+            _ => TAG_NULL,
         }
     }
 
@@ -183,25 +192,24 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Return the i8 constant for the runtime tag of a type.
+    /// Return the i8 constant for the runtime tag a value of `ty` is boxed under (used by
+    /// `is`-checks in match.rs). Delegates to `type_tag` so the two can never disagree — the
+    /// previous hand-copied table is what let Float32/Float64 drift to TAG_FLOAT32 (4) here
+    /// while box_value wrote TAG_FLOAT64 (5).
     pub(crate) fn type_tag_const(&self, ty: &Type) -> inkwell::values::IntValue<'ctx> {
         let i8_ty = self.context.i8_type();
-        let tag: u64 = match ty {
-            Type::Null => 0,
-            Type::Bool => 1,
-            Type::Int32 => 2,
-            // UInt8/16/32 boxed as TAG_INT64; UInt64 as TAG_UINT64. Keep in sync with type_tag
-            // / box_value so `is`-checks against a boxed value match its actual runtime tag.
-            Type::UInt32 | Type::Int64 => 3,
-            Type::UInt64 => 14,
-            Type::Float32 | Type::Float64 => 4,
-            Type::Str | Type::StrLit(_) => 6,
-            Type::Object(_) => 7,
-            Type::Array(_) | Type::FixedArray(_) => 8,
-            Type::Function { .. } => 9,
+        // Types that are never boxed as a recognised scalar tag (TypeVar/Union/etc.) used to
+        // map to a sentinel 0xFF; preserve that so an `is`-check never spuriously matches.
+        let tag: u8 = match ty {
+            Type::Null | Type::Bool | Type::Int8 | Type::Int16 | Type::Int32
+            | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::Int64 | Type::UInt64
+            | Type::Float32 | Type::Float64 | Type::Str | Type::StrLit(_) | Type::Object(_)
+            | Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) | Type::Function { .. } => {
+                Self::type_tag(ty)
+            }
             _ => 0xFF,
         };
-        i8_ty.const_int(tag, false)
+        i8_ty.const_int(tag as u64, false)
     }
 
 }

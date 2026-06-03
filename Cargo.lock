@@ -1040,6 +1040,7 @@ dependencies = [
  "jaq-json",
  "jaq-std",
  "libc",
+ "lin-common",
  "minijinja",
  "serde_json",
  "serde_yml",
