@@ -311,35 +311,100 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
 // Module cache
 // -------------------------------------------------------------------------
 
-/// Compute the SHA-256 hash of source bytes, returned as a hex string.
-fn source_hash(source: &str) -> String {
+/// On-disk cache format version. Bump this whenever the layout of the serialized `TypedModule`
+/// or any `Type`/`TypedStmt`/`ModuleSignature` it embeds changes, OR when the cache-key derivation
+/// below changes. A bump invalidates every existing `.typed`/`.sig` entry: the embedded stamp no
+/// longer matches, so a stale entry written by an older binary is rejected (not silently
+/// bincode-deserialized into a wrong-but-structurally-valid struct).
+const CACHE_FORMAT_VERSION: u32 = 1;
+
+/// Magic prefix written at the head of every `.typed`/`.sig` cache file. Combined with the
+/// compiler version and `CACHE_FORMAT_VERSION`, this is the on-disk compatibility stamp checked
+/// before any bincode payload is deserialized.
+const CACHE_MAGIC: &[u8] = b"LINC";
+
+/// The version stamp that prefixes every cache payload on disk: magic + format version + the
+/// compiler package version. Any mismatch (older binary, layout bump, different `lin` build)
+/// rejects the cache entry at read time.
+fn cache_stamp() -> Vec<u8> {
+    let mut stamp = Vec::new();
+    stamp.extend_from_slice(CACHE_MAGIC);
+    stamp.extend_from_slice(&CACHE_FORMAT_VERSION.to_le_bytes());
+    let pkg = env!("CARGO_PKG_VERSION").as_bytes();
+    stamp.extend_from_slice(&(pkg.len() as u32).to_le_bytes());
+    stamp.extend_from_slice(pkg);
+    stamp
+}
+
+/// The cache-key salt folded into every module's cache key alongside its source and import
+/// signatures. Distinct from `cache_stamp` (which gates on-disk *deserialization*); this salt
+/// changes the *filename* so a key computed by an incompatible binary never even names the same
+/// file. Kept in sync with the stamp components.
+fn cache_key_salt() -> String {
+    format!("linc:v{}:{}", CACHE_FORMAT_VERSION, env!("CARGO_PKG_VERSION"))
+}
+
+/// Compute a module's cache key. Folds in (a) the module's own source bytes, (b) a stable,
+/// order-independent fingerprint of every imported module's resolved signature (each import's
+/// `ModuleSignature::content_hash()`), and (c) the compiler-version/format salt. Two builds with
+/// byte-identical source but a changed import signature produce DIFFERENT keys, so a dependent is
+/// never served a `.typed` that was checked against an older version of its imports (the core
+/// stale-cache bug). `import_content_hashes` are sorted so the key is independent of import order.
+fn compute_cache_key(source: &str, import_content_hashes: &[String]) -> String {
     use sha2::{Sha256, Digest};
+    let mut sorted: Vec<&String> = import_content_hashes.iter().collect();
+    sorted.sort();
     let mut hasher = Sha256::new();
+    hasher.update(cache_key_salt().as_bytes());
+    hasher.update(b"\0src\0");
     hasher.update(source.as_bytes());
+    hasher.update(b"\0imports\0");
+    for h in sorted {
+        hasher.update(h.as_bytes());
+        hasher.update(b"\0");
+    }
     format!("{:x}", hasher.finalize())
 }
 
-/// Try to load a cached `TypedModule` for `source` from `.lin-cache/`.
-/// Returns `None` if no cache entry exists or it is unreadable.
-fn load_cache(source: &str, base_dir: &Path) -> Option<TypedModule> {
-    let hash = source_hash(source);
-    let cache_path = base_dir.join(".lin-cache").join(format!("{}.typed", hash));
-    let bytes = std::fs::read(&cache_path).ok()?;
-    bincode::deserialize(&bytes).ok()
+/// Strip and verify the cache stamp at the head of a cache file, returning the bincode payload
+/// slice if (and only if) the stamp matches this binary. A mismatch yields `None` so the caller
+/// falls back to a fresh check instead of deserializing incompatible bytes.
+fn verify_stamp(bytes: &[u8]) -> Option<&[u8]> {
+    let stamp = cache_stamp();
+    if bytes.len() < stamp.len() || bytes[..stamp.len()] != stamp[..] {
+        return None;
+    }
+    Some(&bytes[stamp.len()..])
 }
 
-/// Save a `TypedModule` to `.lin-cache/` keyed by the SHA-256 of `source`.
+/// Prepend the cache stamp to a serialized payload before writing it to disk.
+fn with_stamp(payload: &[u8]) -> Vec<u8> {
+    let mut out = cache_stamp();
+    out.extend_from_slice(payload);
+    out
+}
+
+/// Try to load a cached `TypedModule` for cache `key` from `.lin-cache/`.
+/// Returns `None` if no cache entry exists, it is unreadable, or its version stamp is incompatible.
+fn load_cache(key: &str, base_dir: &Path) -> Option<TypedModule> {
+    let cache_path = base_dir.join(".lin-cache").join(format!("{}.typed", key));
+    let bytes = std::fs::read(&cache_path).ok()?;
+    let payload = verify_stamp(&bytes)?;
+    bincode::deserialize(payload).ok()
+}
+
+/// Save a `TypedModule` to `.lin-cache/` keyed by `key`.
 /// Uses write-to-temp-then-rename for atomic, concurrent-safe cache writes.
-fn save_cache(source: &str, module: &TypedModule, base_dir: &Path) {
-    let hash = source_hash(source);
+fn save_cache(key: &str, module: &TypedModule, base_dir: &Path) {
     let cache_dir = base_dir.join(".lin-cache");
     if std::fs::create_dir_all(&cache_dir).is_err() {
         return;
     }
-    let final_path = cache_dir.join(format!("{}.typed", hash));
-    let tmp_path = cache_dir.join(format!("{}.typed.tmp.{}", hash, std::process::id()));
+    let final_path = cache_dir.join(format!("{}.typed", key));
+    let tmp_path = cache_dir.join(format!("{}.typed.tmp.{}", key, std::process::id()));
     if let Ok(bytes) = bincode::serialize(module) {
-        if std::fs::write(&tmp_path, &bytes).is_ok() {
+        let stamped = with_stamp(&bytes);
+        if std::fs::write(&tmp_path, &stamped).is_ok() {
             let _ = std::fs::rename(&tmp_path, &final_path);
         }
     }
@@ -347,27 +412,28 @@ fn save_cache(source: &str, module: &TypedModule, base_dir: &Path) {
 
 /// Save the `ModuleSignature` for a module alongside its TypedModule cache.
 /// Uses write-to-temp-then-rename for atomic, concurrent-safe cache writes.
-fn save_signature(source: &str, sig: &ModuleSignature, base_dir: &Path) {
-    let hash = source_hash(source);
+fn save_signature(key: &str, sig: &ModuleSignature, base_dir: &Path) {
     let cache_dir = base_dir.join(".lin-cache");
     if std::fs::create_dir_all(&cache_dir).is_err() {
         return;
     }
-    let final_path = cache_dir.join(format!("{}.sig", hash));
-    let tmp_path = cache_dir.join(format!("{}.sig.tmp.{}", hash, std::process::id()));
+    let final_path = cache_dir.join(format!("{}.sig", key));
+    let tmp_path = cache_dir.join(format!("{}.sig.tmp.{}", key, std::process::id()));
     if let Some(bytes) = sig.to_bytes() {
-        if std::fs::write(&tmp_path, &bytes).is_ok() {
+        let stamped = with_stamp(&bytes);
+        if std::fs::write(&tmp_path, &stamped).is_ok() {
             let _ = std::fs::rename(&tmp_path, &final_path);
         }
     }
 }
 
-/// Load a cached `ModuleSignature` for `source`. Returns `None` if not found or unreadable.
-fn load_signature(source: &str, base_dir: &Path) -> Option<ModuleSignature> {
-    let hash = source_hash(source);
-    let sig_path = base_dir.join(".lin-cache").join(format!("{}.sig", hash));
+/// Load a cached `ModuleSignature` for cache `key`. Returns `None` if not found, unreadable, or
+/// its version stamp is incompatible.
+fn load_signature(key: &str, base_dir: &Path) -> Option<ModuleSignature> {
+    let sig_path = base_dir.join(".lin-cache").join(format!("{}.sig", key));
     let bytes = std::fs::read(&sig_path).ok()?;
-    ModuleSignature::from_bytes(&bytes)
+    let payload = verify_stamp(&bytes)?;
+    ModuleSignature::from_bytes(payload)
 }
 
 /// Lex and parse a Lin source string into an AST module.
@@ -762,6 +828,13 @@ fn pre_resolve_imports_from_ast(
     build_import_graph(ast_module, base_dir, &mut graph)?;
     let sccs = tarjan_sccs(&graph);
 
+    // identity -> content_hash of that module's resolved `ModuleSignature`. Populated as each SCC
+    // resolves. Because Tarjan emits SCCs in reverse-topological order (dependencies before
+    // dependents), every dependency of a module is already present here by the time we compute that
+    // module's cache key — so a dependent's key can fold in its imports' (post-check) content
+    // hashes. This is the ordering assumption that makes import-signature-aware keys correct.
+    let mut dep_hashes: HashMap<String, String> = HashMap::new();
+
     for scc in &sccs {
         let is_cycle = scc.len() > 1 || {
             // A singleton is still a cycle if it imports itself.
@@ -769,12 +842,26 @@ fn pre_resolve_imports_from_ast(
             graph.modules.get(id).map(|m| m.deps.contains(id)).unwrap_or(false)
         };
         if !is_cycle {
-            resolve_singleton(&scc[0], &graph, cache, order, import_sources)?;
+            resolve_singleton(&scc[0], &graph, cache, order, import_sources, &mut dep_hashes)?;
         } else {
-            check_scc(scc, &graph, cache, order, import_sources)?;
+            check_scc(scc, &graph, cache, order, import_sources, &mut dep_hashes)?;
         }
     }
     Ok(())
+}
+
+/// The cache key for `m`: its own source folded together with the resolved-signature content
+/// hashes of every module it imports (looked up from `dep_hashes`, which holds every dependency
+/// by the reverse-topological ordering invariant). A dependency we somehow have no recorded hash
+/// for (should not happen for an acyclic module, but is possible for a self/peer reference inside
+/// an SCC) contributes nothing, which is sound: SCC members are never read from the `.typed` cache.
+fn module_cache_key(m: &LoadedModule, dep_hashes: &HashMap<String, String>) -> String {
+    let import_hashes: Vec<String> = m
+        .deps
+        .iter()
+        .filter_map(|dep| dep_hashes.get(dep).cloned())
+        .collect();
+    compute_cache_key(&m.src_text, &import_hashes)
 }
 
 /// Resolve one acyclic module: consult the `.lin-cache`, else type-check it against the already
@@ -786,15 +873,21 @@ fn resolve_singleton(
     cache: &mut HashMap<String, TypedModule>,
     order: &mut Vec<String>,
     import_sources: &mut HashMap<String, (String, String)>,
+    dep_hashes: &mut HashMap<String, String>,
 ) -> Result<(), CompileError> {
     let m = graph.modules.get(identity).expect("scc member loaded");
 
+    // Cache key folds in this module's source AND the resolved-signature content hashes of its
+    // imports, so a changed import signature invalidates this entry even when the source is
+    // byte-identical (the stale-cache bug).
+    let key = module_cache_key(m, dep_hashes);
+
     // Cache fast path.
-    if let Some(cached) = load_cache(&m.src_text, &m.base_dir) {
-        if load_signature(&m.src_text, &m.base_dir).is_none() {
-            let sig = ModuleSignature::from_module(&cached);
-            save_signature(&m.src_text, &sig, &m.base_dir);
-        }
+    if let Some(cached) = load_cache(&key, &m.base_dir) {
+        let sig = load_signature(&key, &m.base_dir)
+            .unwrap_or_else(|| ModuleSignature::from_module(&cached));
+        save_signature(&key, &sig, &m.base_dir);
+        dep_hashes.insert(identity.to_string(), sig.content_hash());
         register_resolved(m, cached, cache, order, import_sources);
         return Ok(());
     }
@@ -802,8 +895,9 @@ fn resolve_singleton(
     let (typed, _warnings) = check_module_with_imports(&m.ast, cache, m.is_stdlib)
         .map_err(CompileError::TypeCheck)?;
     let sig = ModuleSignature::from_module(&typed);
-    save_cache(&m.src_text, &typed, &m.base_dir);
-    save_signature(&m.src_text, &sig, &m.base_dir);
+    save_cache(&key, &typed, &m.base_dir);
+    save_signature(&key, &sig, &m.base_dir);
+    dep_hashes.insert(identity.to_string(), sig.content_hash());
     register_resolved(m, typed, cache, order, import_sources);
     Ok(())
 }
@@ -854,6 +948,7 @@ fn check_scc(
     cache: &mut HashMap<String, TypedModule>,
     order: &mut Vec<String>,
     import_sources: &mut HashMap<String, (String, String)>,
+    dep_hashes: &mut HashMap<String, String>,
 ) -> Result<(), CompileError> {
     let members: Vec<&LoadedModule> = scc
         .iter()
@@ -925,13 +1020,19 @@ fn check_scc(
 
     // (3) Phase 2: re-check each member with the provisional peer signatures merged into the
     // import-type map, so cross-module references resolve to concrete types.
-    for m in &members {
+    for (identity, m) in scc.iter().zip(members.iter()) {
         let (typed, _w) = check_module_with_seeded_imports(&m.ast, cache, &provisional, m.is_stdlib)
             .map_err(CompileError::TypeCheck)?;
         let sig = ModuleSignature::from_module(&typed);
-        // Cyclic members are always freshly checked (their type depends on peers), but persist the
-        // signature so dependents OUTSIDE the SCC can still use the `.sig` fast path.
-        save_signature(&m.src_text, &sig, &m.base_dir);
+        // Cyclic members are always freshly checked (their type depends on peers), so their `.typed`
+        // is never read back from the cache. We still persist the signature — under the same
+        // import-signature-aware key scheme — so dependents OUTSIDE the SCC can fold this member's
+        // content hash into their own keys and use the `.sig`/`.typed` fast path. Peer hashes within
+        // the SCC are not yet recorded; `module_cache_key` skips them (sound, since SCC `.typed`
+        // entries are never consulted).
+        let key = module_cache_key(m, dep_hashes);
+        save_signature(&key, &sig, &m.base_dir);
+        dep_hashes.insert(identity.clone(), sig.content_hash());
         register_resolved(m, typed, cache, order, import_sources);
     }
     Ok(())
