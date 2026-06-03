@@ -494,6 +494,7 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/iter"     => Some(include_str!("../../../stdlib/iter.lin")),
         "std/object"   => Some(include_str!("../../../stdlib/object.lin")),
         "std/fs"       => Some(include_str!("../../../stdlib/fs.lin")),
+        "std/ffi"      => Some(include_str!("../../../stdlib/ffi.lin")),
         "std/http"     => Some(include_str!("../../../stdlib/http.lin")),
         "std/template" => Some(include_str!("../../../stdlib/template.lin")),
         "std/async"    => Some(include_str!("../../../stdlib/async.lin")),
