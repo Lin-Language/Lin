@@ -240,14 +240,16 @@ pub unsafe extern "C" fn lin_string_char_at(s: *const LinString, index: i32) -> 
     ptr
 }
 
-/// Return the Unicode code point at CHAR index `index`. Returns -1 if OOB or negative index.
+/// Return the Unicode code point at CHAR index `index`. Returns -1 if OOB.
+/// A negative `index` counts from the end (codepoint-wise): -1 is the last codepoint.
 /// O(n): walks the UTF-8 string from the start (codepoint-correct). For O(1) ASCII/byte
 /// scanning use `lin_string_byte_at` (exposed as `std/string.byteAt`).
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_char_code(s: *const LinString, index: i32) -> i32 {
-    if index < 0 { return -1; }
     let st = (*s).as_str();
-    st.chars().nth(index as usize).map(|c| c as i32).unwrap_or(-1)
+    let idx = if index < 0 { index + st.chars().count() as i32 } else { index };
+    if idx < 0 { return -1; }
+    st.chars().nth(idx as usize).map(|c| c as i32).unwrap_or(-1)
 }
 
 /// Return the raw UTF-8 BYTE at byte index `index` (0..len), or -1 if OOB / negative.
@@ -409,6 +411,35 @@ pub unsafe extern "C" fn lin_string_last_index_of(s: *const LinString, needle: *
     let st = (*s).as_str();
     let nd = (*needle).as_str();
     match st.rfind(nd) {
+        Some(byte_pos) => st[..byte_pos].chars().count() as i32,
+        None => -1,
+    }
+}
+
+/// Index of first occurrence of `needle` at or after byte index `from`. -1 if none.
+/// Returns a BYTE offset (consistent with `lin_string_index_of`).
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_index_of_from(s: *const LinString, needle: *const LinString, from: i32) -> i32 {
+    let st = (*s).as_str();
+    let nd = (*needle).as_str();
+    let from = from.max(0) as usize;
+    if from > st.len() { return -1; }
+    match st[from..].find(nd) {
+        Some(i) => (from + i) as i32,
+        None => -1,
+    }
+}
+
+/// Index of last occurrence of `needle` whose start is at or before byte index `before`. -1 if none.
+/// Returns a CODEPOINT count (consistent with `lin_string_last_index_of`).
+#[no_mangle]
+pub unsafe extern "C" fn lin_string_last_index_of_from(s: *const LinString, needle: *const LinString, before: i32) -> i32 {
+    let st = (*s).as_str();
+    let nd = (*needle).as_str();
+    if before < 0 { return -1; }
+    // A match may START at <= before, so search the prefix ending at before + needle.len().
+    let end = ((before as usize).saturating_add(nd.len())).min(st.len());
+    match st[..end].rfind(nd) {
         Some(byte_pos) => st[..byte_pos].chars().count() as i32,
         None => -1,
     }

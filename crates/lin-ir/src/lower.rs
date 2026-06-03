@@ -93,6 +93,25 @@ pub fn lower_module_with_imports(
         }
     }
 
+    // Pre-register default-argument adapters for EVERY top-level function before lowering any
+    // body. A default-fill call dispatches to `default_adapters[(fid, k)]`; that entry must exist
+    // by the time the call is lowered. Because a call site (in `main` or an earlier function) can
+    // precede the callee's own `Val` statement — most acutely for monomorphized generic specs,
+    // which are appended AFTER the call sites that reference them — registering lazily per-`Val`
+    // (as `lower_stmt` also does, idempotently) is too late. Do it up front here.
+    for stmt in &module.statements {
+        if let TypedStmt::Val {
+            slot,
+            value: TypedExpr::Function { name: Some(name), params, ret_type, span: fn_span, .. },
+            ..
+        } = stmt
+        {
+            if let Some(&fid) = ctx.global_fn_slots.get(slot) {
+                register_default_adapters(fid, *slot, name, params, ret_type, *fn_span, &mut ctx);
+            }
+        }
+    }
+
     // Build the top-level "main" function containing module-level statements.
     let mut builder = FuncBuilder::new(main_id, None, vec![], false, Type::Int32, ctx.intrinsics.clone());
 
@@ -261,6 +280,25 @@ pub fn lower_import_module_with_imports(
     for stmt in &module.statements {
         if matches!(stmt, TypedStmt::Import { .. } | TypedStmt::ForeignImport { .. }) {
             lower_stmt(stmt, &mut resolver, &mut ctx);
+        }
+    }
+
+    // Pre-register default-fill adapters for every exported function before lowering any body, so
+    // a default-fill call from an EARLIER function body to a LATER one (or to a monomorphized spec
+    // appended after the call site) finds its adapter. Mirrors the main-module pre-scan; the
+    // per-body call below is idempotent.
+    for stmt in &module.statements {
+        if let TypedStmt::Val {
+            slot,
+            value: TypedExpr::Function { params, ret_type, span: fn_span, .. },
+            ..
+        } = stmt
+        {
+            if let Some(&fid) = ctx.global_fn_slots.get(slot) {
+                if let Some(real_name) = fn_names.get(&fid).cloned() {
+                    register_default_adapters(fid, *slot, &real_name, params, ret_type, *fn_span, &mut ctx);
+                }
+            }
         }
     }
 
@@ -4288,6 +4326,12 @@ fn register_default_adapters(
     let required = params.iter().filter(|p| p.default.is_none()).count();
     if required == total {
         return; // no optional parameters
+    }
+    // Idempotent: a pre-scan may register a function's adapters before its body is lowered, so the
+    // per-`Val` call in `lower_stmt` must not register them a second time (which would mint a
+    // duplicate adapter FuncId/symbol and emit two LLVM definitions of the same `$default` symbol).
+    if ctx.default_descriptors.contains_key(&real_fid) {
+        return;
     }
     let real_fn_ty = Type::Function {
         params: params.iter().map(|p| p.ty.clone()).collect(),

@@ -43,19 +43,19 @@ This document specifies the standard library for the Lin language. All modules a
 | Function | Signature | Summary |
 | --- | --- | --- |
 | [`at`](#at) | `(String, Int32) -> String` | Character at index; negative indices count from end |
-| [`codePointAt`](#codePointAt) | `(String, Int32) -> Int32` | Numeric codepoint value at index (O(n)) |
-| [`byteAt`](#byteAt) | `(String, Int32) -> Int32` | Raw UTF-8 byte at byte-index, O(1); fast scanning |
+| [`codePointAt`](#codePointAt) | `(String, Int32) -> Int32` | Numeric codepoint value at index (O(n)); negative indices count from end |
+| [`byteAt`](#byteAt) | `(String, Int32) -> Int32` | Raw UTF-8 byte at byte-index, O(1); fast scanning (no negative indices) |
 | [`contains`](#contains) | `(String, String) -> Boolean` | Test whether needle is a substring |
 | [`endsWith`](#endsWith) | `(String, String) -> Boolean` | Test whether string ends with suffix |
 | [`fromCodePoints`](#fromCodePoints) | `(Int32[]) -> String` | Build a string from codepoint values |
-| [`indexOf`](#indexOf-string) | `(String, String) -> Int32` | First occurrence of needle, or -1 |
+| [`indexOf`](#indexOf-string) | `(String, String, Int32 = 0) -> Int32` | First occurrence of needle at/after `fromIndex`, or -1 |
 | [`isBlank`](#isBlank) | `(String) -> Boolean` | True if string is empty or all whitespace |
 | [`join`](#join) | `(String[], String) -> String` | Join array of strings with separator |
-| [`lastIndexOf`](#lastIndexOf) | `(String, String) -> Int32` | Last occurrence of needle, or -1 |
+| [`lastIndexOf`](#lastIndexOf) | `(String, String, Int32 = length(s)) -> Int32` | Last occurrence of needle starting at/before `fromIndex`, or -1 |
 | [`length`](#length-string) | `(String) -> Int32` | Codepoint count |
 | [`lines`](#lines-string) | `(String) -> String[]` | Split a string into lines |
-| [`padEnd`](#padEnd) | `(String, Int32, String) -> String` | Pad to width on the right |
-| [`padStart`](#padStart) | `(String, Int32, String) -> String` | Pad to width on the left |
+| [`padEnd`](#padEnd) | `(String, Int32, String = " ") -> String` | Pad to width on the right (pad defaults to a space) |
+| [`padStart`](#padStart) | `(String, Int32, String = " ") -> String` | Pad to width on the left (pad defaults to a space) |
 | [`repeat`](#repeat) | `(String, Int32) -> String` | Repeat a string n times |
 | [`replace`](#replace) | `(String, String, String) -> String` | Replace first occurrence |
 | [`replaceAll`](#replaceAll) | `(String, String, String) -> String` | Replace all occurrences |
@@ -113,7 +113,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`compact`](#compact) | `(Json[]) -> Json[]` | Remove null elements |
 | [`countBy`](#countBy) | `(Json[], (Json) -> String) -> { ...Int32 }` | Frequency map by key function |
 | [`groupBy`](#groupBy) | `(Json[], (Json) -> String) -> { ...Json[] }` | Group into object of arrays by key function |
-| [`indexOf`](#indexOf-array) | `<T>(T[], T) -> Int32` | First index of value, or -1 |
+| [`indexOf`](#indexOf-array) | `<T>(T[], T, Int32 = 0) -> Int32` | First index of value at/after `fromIndex` (negatives count from end), or -1 |
 | [`length`](#length-array) | `(Json) -> Int32` | Length of array, string, or object |
 | [`max`](#max-array) | `(Number[]) -> Number` | Maximum element |
 | [`maxBy`](#maxBy) | `(Json[], (Json) -> Number) -> Json` | Element with the largest key |
@@ -126,7 +126,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`reverse`](#reverse) | `(Json[]) -> Json[]` | Return a reversed copy |
 | [`scan`](#scan) | `(Json[], Json, (Json, Json) -> Json) -> Json[]` | Reduce returning all intermediate values |
 | [`set`](#set-array) | `<T>(T[], Int32, T) -> Null` | Set an element by index in place |
-| [`slice`](#slice) | `(T[], Int32, Int32) -> T[]` | Sub-buffer copy; preserves element type |
+| [`slice`](#slice) | `(T[], Int32, Int32 = length(arr)) -> T[]` | Sub-buffer copy; preserves element type; `end` optional, negatives count from end |
 | [`sort`](#sort) | `(Json[], (Json, Json) -> Int32) -> Json[]` | Return sorted copy using comparator |
 | [`sortBy`](#sortBy) | `(Json[], (Json) -> Json) -> Json[]` | Return sorted copy using key extractor |
 | [`sum`](#sum) | `(Number[]) -> Number` | Sum all elements |
@@ -453,6 +453,8 @@ val byteAt: (s: String, index: Int32) -> Int32
 
 Returns the raw UTF-8 **byte** (`0..255`) at byte-index `index`, or `-1` if the index is negative or out of range. Unlike [`codePointAt`](#codePointAt) this is **O(1)** — a direct indexed load — so scanning a whole string (`0..length(s)`) is O(n) rather than O(n²). For pure-ASCII text `byteAt(s, i) == codePointAt(s, i)`; for multi-byte UTF-8 it exposes the individual encoding bytes. Use it for tokenizers, parsers, and other byte-level string scanning written in Lin.
 
+Unlike [`at`](#at) and [`codePointAt`](#codePointAt), `byteAt` does **not** support negative indexing from the end: it is a raw byte primitive (a negative index simply returns `-1`). Negative-from-end indexing belongs on the codepoint/element accessors, not the byte primitive.
+
 ```txt
 byteAt("ABC", 0)   // 65
 byteAt("ABC", 2)   // 67
@@ -510,14 +512,16 @@ fromCodePoints([])                          // ""
 ### indexOf (string) {#indexOf-string}
 
 ```txt
-val indexOf: (s: String, needle: String) -> Int32
+val indexOf: (s: String, needle: String, fromIndex: Int32 = 0) -> Int32
 ```
 
-Returns the zero-based codepoint index of the first occurrence of `needle` within `s`, or `-1` if not found.
+Returns the zero-based codepoint index of the first occurrence of `needle` within `s` at or after `fromIndex`, or `-1` if not found. `fromIndex` is optional and defaults to `0` (search the whole string).
 
 ```txt
 indexOf("hello world", "world")   // 6
 indexOf("hello", "xyz")           // -1
+indexOf("abcabc", "bc")           // 1
+indexOf("abcabc", "bc", 2)        // 4
 ```
 
 ---
@@ -556,15 +560,17 @@ join([], "-")                 // ""
 ### lastIndexOf
 
 ```txt
-val lastIndexOf: (s: String, needle: String) -> Int32
+val lastIndexOf: (s: String, needle: String, fromIndex: Int32 = length(s)) -> Int32
 ```
 
-Returns the zero-based codepoint index of the **last** occurrence of `needle` within `s`, or `-1` if not found.
+Returns the zero-based codepoint index of the **last** occurrence of `needle` within `s` whose start is at or before `fromIndex`, or `-1` if not found. `fromIndex` is optional and defaults to the string length (search the whole string).
 
 ```txt
 lastIndexOf("abcabc", "b")         // 4
 lastIndexOf("/usr/local/bin", "/")  // 10
 lastIndexOf("hello", "xyz")        // -1
+lastIndexOf("abcabc", "bc")        // 4
+lastIndexOf("abcabc", "bc", 2)     // 1
 ```
 
 ---
@@ -603,15 +609,16 @@ lines("")            // [""]
 ### padEnd
 
 ```txt
-val padEnd: (s: String, width: Int32, pad: String) -> String
+val padEnd: (s: String, width: Int32, pad: String = " ") -> String
 ```
 
-Returns `s` padded on the right with repetitions of `pad` until the total codepoint length reaches `width`. If `s` is already at least `width` codepoints long, returns `s` unchanged. `pad` defaults to `" "` if empty.
+Returns `s` padded on the right with repetitions of `pad` until the total codepoint length reaches `width`. If `s` is already at least `width` codepoints long, returns `s` unchanged. `pad` is optional and defaults to a single space `" "`.
 
 ```txt
 padEnd("hi", 5, ".")    // "hi..."
 padEnd("hi", 5, "-*")   // "hi-*-"
 padEnd("hello", 3, ".")  // "hello"
+padEnd("hi", 4)          // "hi  "
 ```
 
 ---
@@ -619,15 +626,16 @@ padEnd("hello", 3, ".")  // "hello"
 ### padStart
 
 ```txt
-val padStart: (s: String, width: Int32, pad: String) -> String
+val padStart: (s: String, width: Int32, pad: String = " ") -> String
 ```
 
-Returns `s` padded on the left with repetitions of `pad` until the total codepoint length reaches `width`. If `s` is already at least `width` codepoints long, returns `s` unchanged. `pad` defaults to `" "` if empty.
+Returns `s` padded on the left with repetitions of `pad` until the total codepoint length reaches `width`. If `s` is already at least `width` codepoints long, returns `s` unchanged. `pad` is optional and defaults to a single space `" "`.
 
 ```txt
 padStart("42", 5, "0")    // "00042"
 padStart("hi", 5, ".")    // "...hi"
 padStart("hello", 3, ".")  // "hello"
+padStart("5", 3)           // "  5"
 ```
 
 ---
@@ -1337,14 +1345,16 @@ Returns an object where each key is a value returned by `f`, and the correspondi
 ### indexOf (array) {#indexOf-array}
 
 ```txt
-val indexOf: <T>(arr: T[], target: T) -> Int32
+val indexOf: <T>(arr: T[], target: T, fromIndex: Int32 = 0) -> Int32
 ```
 
-Returns the zero-based index of the first element deeply equal to `target`, or `-1` if not found.
+Returns the zero-based index of the first element deeply equal to `target` at or after `fromIndex`, or `-1` if not found. `fromIndex` is optional and defaults to `0` (search the whole array); a negative `fromIndex` counts from the end (`length(arr) + fromIndex`).
 
 ```txt
 [10, 20, 30].indexOf(20)   // 1
 [1, 2, 3].indexOf(9)       // -1
+[1, 2, 1, 2].indexOf(2, 2) // 3
+[1, 2, 1, 2].indexOf(1, -1) // -1   (search starts at index 3)
 ```
 
 ---
@@ -1538,13 +1548,16 @@ set(buf, 1, "b")
 ### slice
 
 ```txt
-val slice: (arr: T[], start: Int32, end: Int32) -> T[]
+val slice: (arr: T[], start: Int32, end: Int32 = length(arr)) -> T[]
 ```
 
-Returns a copy of the elements in the half-open range `[start, end)`. `start` and `end` are clamped to `[0, length(arr)]`. The element type is preserved: slicing a `UInt8[]` yields a `UInt8[]`, an `Int32[]` an `Int32[]`, and a `Json[]` a `Json[]`. Also re-exported from `std/bytes`. There is no range-index syntax (`arr[a..b]`).
+Returns a copy of the elements in the half-open range `[start, end)`. `end` is optional and defaults to the array length, so `slice(arr, start)` returns the elements from `start` to the end. Negative indices count from the end (`-1` is the last element's position): they are resolved by adding `length(arr)` to any negative value, then clamped to `[0, length(arr)]`. The element type is preserved: slicing a `UInt8[]` yields a `UInt8[]`, an `Int32[]` an `Int32[]`, and a `Json[]` a `Json[]`. Also re-exported from `std/bytes` (with both bounds explicit). There is no range-index syntax (`arr[a..b]`).
 
 ```txt
 [10, 20, 30, 40, 50].slice(1, 4)   // [20, 30, 40]
+[1, 2, 3, 4, 5].slice(1)            // [2, 3, 4, 5]
+[1, 2, 3, 4, 5].slice(1, -1)        // [2, 3, 4]
+[1, 2, 3, 4, 5].slice(-2)           // [4, 5]
 ```
 
 ---
