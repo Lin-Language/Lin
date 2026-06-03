@@ -65,6 +65,20 @@ Over a stream, a combinator **consumes** its input, so a stream flows through a 
 | `some` | `Boolean` | `Boolean \| Error` (terminal) | True if any element matches |
 | `every` | `Boolean` | `Boolean \| Error` (terminal) | True if all elements match |
 
+### Optional index parameter
+
+Every combinator callback **optionally** receives a 0-based `Int32` **source** index as a trailing parameter — the JS `forEach((item, idx) => …)` model. A 1-arg callback stays valid and unchanged (this is opt-in by arity, fully backward-compatible). It applies to `map`/`filter`/`for`/`while`/`takeWhile`/`dropWhile`/`flatMap`/`find`/`some`/`every` and (in `std/array`) `partition`. For `reduce` the index is the **third** parameter: `(acc, item, i)`. Below, the indexed callback shape is written `(T[, i: Int32]) -> …`.
+
+The index is always the **source position**, even for `filter`/`takeWhile`/`dropWhile` where the output position differs:
+
+```lin
+["a", "b", "c"].map((x, i) => "${i}: ${x}")     // ["0: a", "1: b", "2: c"]
+[10, 20, 30, 40].filter((x, i) => i % 2 == 0)   // [10, 30]  (source indices 0, 2)
+[1, 1, 1].reduce(0, (acc, x, i) => acc + i)     // 0 + 0 + 1 + 2 = 3
+```
+
+The key-extractor/aggregator combinators (`sortBy`/`minBy`/`maxBy`/`groupBy`/`countBy`) do **not** take an index — element position is meaningless to a key function. Indexed callbacks are **array/iterator-only**; the lazy `Stream` combinators keep 1-arg callbacks (see [`std/stream`](/stdlib/stream.html)).
+
 ## Iterator constructors
 
 | Function | Signature | Description |
@@ -78,7 +92,7 @@ Over a stream, a combinator **consumes** its input, so a stream flows through a 
 
 ### `map`
 
-Applies `f` to each element in order. Array/Iterator → eager `U[]`. Stream → lazy `Stream<U>` (`f` runs once per item as the item is pulled).
+Applies `f: (T[, i: Int32]) -> U` to each element in order; `f` optionally receives the 0-based source index as a second parameter. Array/Iterator → eager `U[]`. Stream → lazy `Stream<U>` (`f` runs once per item as the item is pulled).
 
 ```lin
 [1, 2, 3].map(x => x * 2)                 // [2, 4, 6]
@@ -90,7 +104,7 @@ readStream("in.csv").lines().map(toUpper)   // Stream<String> (lazy)
 
 ### `filter`
 
-Keeps elements for which `f` returns `true`. Array/Iterator → eager `T[]`. Stream → lazy `Stream<T>`.
+Keeps elements for which `f: (T[, i: Int32]) -> Boolean` returns `true`; `f` optionally receives the source index (it is the source position, even though output positions differ). Array/Iterator → eager `T[]`. Stream → lazy `Stream<T>`.
 
 ```lin
 [1, 2, 3, 4].filter(x => x % 2 == 0)      // [2, 4]
@@ -101,7 +115,7 @@ readStream("app.log").lines().filter(line => line.contains("ERROR"))   // Stream
 
 ### `reduce`
 
-Folds left-to-right from `init`; the accumulator is the **first** argument to the combining function. Array/Iterator → eager `U`. Stream → terminal `U | Error` (drives the stream on the calling thread; a read fault surfaces as `Error`).
+Folds left-to-right from `init` with `f: (U, T[, i: Int32]) -> U`; the accumulator is the **first** argument and the current element the second. `f` optionally receives the 0-based source index as a **third** parameter (`(acc, x, i) => …`). Array/Iterator → eager `U`. Stream → terminal `U | Error` (drives the stream on the calling thread; a read fault surfaces as `Error`).
 
 ```lin
 [1, 2, 3, 4].reduce(0, (acc, x) => acc + x)   // 10
@@ -114,7 +128,7 @@ readStream("nums.txt")
 
 ### `for`
 
-Iterates over each element, calling `f` (its return value is discarded). Array/Iterator → `Null`. Stream → terminal `Null | Error` (EOF ends normally as `Null`; a read error mid-traversal becomes the result). Lin has no `for…in`; iteration is always `.for(fn)`.
+Iterates over each element, calling `f: (item[, i: Int32]) -> …` (its return value is discarded); `f` optionally receives the 0-based source index as a second parameter. Array/Iterator → `Null`. Stream → terminal `Null | Error` (EOF ends normally as `Null`; a read error mid-traversal becomes the result). Lin has no `for…in`; iteration is always `.for(fn)`.
 
 ```lin
 [1, 2, 3].for(x => print(x))
@@ -146,7 +160,7 @@ readStream("data.csv").lines().drop(1)                              // skip the 
 
 ### `takeWhile` / `dropWhile`
 
-`takeWhile` keeps leading elements while `f` returns `true`, stopping at the first `false`; `dropWhile` skips them and keeps the rest unchanged. Array/Iterator → eager `T[]`. Stream → lazy `Stream<T>`.
+`takeWhile` keeps leading elements while `f: (T[, i: Int32]) -> Boolean` returns `true`, stopping at the first `false`; `dropWhile` skips them and keeps the rest unchanged. `f` optionally receives the 0-based source index as a second parameter. Array/Iterator → eager `T[]`. Stream → lazy `Stream<T>`.
 
 ```lin
 [1, 2, 3, 4, 1].takeWhile(x => x < 3)   // [1, 2]
@@ -163,13 +177,15 @@ flatten([[1, 2], [3, 4]])            // [1, 2, 3, 4]
 concat([1, 2], [3, 4])               // [1, 2, 3, 4]
 ```
 
+`flatMap`'s callback is `(item[, i: Int32]) -> Json[]` — it optionally receives the 0-based source index as a second parameter.
+
 Over streams these are lazy: `flatMap`/`flatten` yield each inner element in turn, and `concat` yields all of the first stream followed by the second (both stream arguments are consumed).
 
 ---
 
 ### `find`
 
-The first element for which `f` returns `true`, or `null` if none. Array/Iterator → `Json`. Stream → terminal `Json | Null | Error`.
+The first element for which `f: (item[, i: Int32]) -> Boolean` returns `true`, or `null` if none; `f` optionally receives the 0-based source index. Array/Iterator → `Json`. Stream → terminal `Json | Null | Error`.
 
 ```lin
 [1, 3, 5, 6].find(x => x % 2 == 0)   // 6
@@ -180,7 +196,7 @@ The first element for which `f` returns `true`, or `null` if none. Array/Iterato
 
 ### `some` / `every`
 
-`some` is `true` if `f` matches at least one element; `every` is `true` if it matches all (and for an empty source). Both short-circuit. Array/Iterator → `Boolean`. Stream → terminal `Boolean | Error`.
+`some` is `true` if `f: (item[, i: Int32]) -> Boolean` matches at least one element; `every` is `true` if it matches all (and for an empty source). The callback optionally receives the 0-based source index. Both short-circuit. Array/Iterator → `Boolean`. Stream → terminal `Boolean | Error`.
 
 ```lin
 [1, 2, 3].some(x => x > 2)    // true
@@ -192,7 +208,7 @@ The first element for which `f` returns `true`, or `null` if none. Array/Iterato
 
 ### `while`
 
-Iterates calling `f` with each element, stopping as soon as `f` returns `false`. Array/Iterator → `Null` (the short-circuit primitive behind `some`/`every`/`find`). Stream → terminal `Null | Error`.
+Iterates calling `f: (T[, i: Int32]) -> Boolean` with each element, stopping as soon as `f` returns `false`; `f` optionally receives the 0-based source index. Array/Iterator → `Null` (the short-circuit primitive behind `some`/`every`/`find`). Stream → terminal `Null | Error`.
 
 ```lin
 [1, 2, -3, 4].while(x => x >= 0)   // visits 1, 2, stops at -3

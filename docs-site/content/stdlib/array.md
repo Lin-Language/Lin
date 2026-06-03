@@ -15,25 +15,25 @@ import { sort, sortBy, length, push, slice, sum } from "std/array"
 | `append` | `(Json[], Json) -> Json[]` | Non-mutating single-element append |
 | `arrayAllocate` | `(Int32) -> Json[]` | Allocate an array of n nulls |
 | `arrayAllocateFilled` | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
-| `at` | `(Json[], Int32) -> Json` | Element at index; negative from end |
+| `at` | `<T>(T[], Int32) -> T \| Null` | Element at index, or null if out of bounds; negative counts from end |
 | `chunk` | `(Json[], Int32) -> Json[][]` | Split into n-sized sub-arrays |
 | `compact` | `(Json[]) -> Json[]` | Remove null elements |
 | `countBy` | `(Json[], (Json) -> String) -> {}` | Frequency map by key function |
 | `groupBy` | `(Json[], (Json) -> String) -> {}` | Group into object of arrays |
-| `indexOf` | `(Json[], Json) -> Int32` | First index of value, or -1 |
+| `indexOf` | `<T>(T[], T, Int32 = 0) -> Int32` | First index of value at or after `fromIndex`, or -1 (negative counts from end) |
 | `length` | `(Json) -> Int32` | Length of array, string, or object |
 | `max` | `(Number[]) -> Number` | Maximum element |
 | `maxBy` | `(Json[], (Json) -> Number) -> Json` | Element with largest key |
 | `min` | `(Number[]) -> Number` | Minimum element |
 | `minBy` | `(Json[], (Json) -> Number) -> Json` | Element with smallest key |
-| `partition` | `(Json[], (Json) -> Boolean) -> [Json[], Json[]]` | Split into passing and failing |
+| `partition` | `(Json[], (Json[, i: Int32]) -> Boolean) -> [Json[], Json[]]` | Split into passing and failing (predicate gets an optional source index) |
 | `prepend` | `(Json[], Json) -> Json[]` | Non-mutating prepend |
 | `product` | `(Number[]) -> Number` | Product of all elements |
 | `push` | `(Json[], Json) -> Null` | Append in place (mutating) |
 | `reverse` | `(Json[]) -> Json[]` | Reversed copy |
 | `scan` | `(Json[], Json, (Json, Json) -> Json) -> Json[]` | Reduce returning all intermediate values |
 | `set` | `(Json[], Int32, Json) -> Null` | Set an element by index in place (mutating) |
-| `slice` | `(T[], Int32, Int32) -> T[]` | Copy of `[start, end)`; preserves element type |
+| `slice` | `(T[], Int32, Int32 = length(arr)) -> T[]` | Copy of `[start, end)`; end defaults to length, negatives count from end; preserves element type |
 | `sort` | `(Json[], (Json, Json) -> Int32) -> Json[]` | Sort with comparator |
 | `sortBy` | `(Json[], (Json) -> Json) -> Json[]` | Sort by key extractor |
 | `sum` | `(Number[]) -> Number` | Sum all elements |
@@ -72,4 +72,52 @@ xs.push(2)
 length([1, 2, 3])     // 3
 length("hello")       // 5
 length({ "a": 1 })    // 1
+```
+
+---
+
+### `at`
+
+Safe accessor: returns the element at `index`, or `null` if the resolved index is out of bounds (it never traps), widening the return type to `T | Null`. A negative index counts from the end.
+
+```lin
+at([10, 20, 30], 0)    // 10
+at([10, 20, 30], -1)   // 30
+at([], 0)              // null
+```
+
+---
+
+### `slice`
+
+`end` is optional and defaults to the array length, so `slice(arr, start)` returns the elements from `start` to the end. Negative `start`/`end` count from the end.
+
+```lin
+[10, 20, 30, 40, 50].slice(1, 4)   // [20, 30, 40]
+[1, 2, 3, 4, 5].slice(1)           // [2, 3, 4, 5]
+[1, 2, 3, 4, 5].slice(1, -1)       // [2, 3, 4]
+[1, 2, 3, 4, 5].slice(-2)          // [4, 5]
+```
+
+---
+
+### `indexOf`
+
+Returns the index of the first element deeply equal to `target` at or after `fromIndex`, or `-1`. `fromIndex` is optional and defaults to `0`; a negative `fromIndex` counts from the end.
+
+```lin
+[10, 20, 30].indexOf(20)     // 1
+[1, 2, 1, 2].indexOf(2, 2)   // 3
+[1, 2, 1, 2].indexOf(1, -1)  // -1   (search starts at index 3)
+```
+
+---
+
+### `partition`
+
+Splits into `[passing, failing]`. The predicate optionally receives the element's 0-based source index as a second argument.
+
+```lin
+val [evens, odds] = [1, 2, 3, 4, 5].partition(x => x % 2 == 0)
+// evens: [2, 4],  odds: [1, 3, 5]
 ```
