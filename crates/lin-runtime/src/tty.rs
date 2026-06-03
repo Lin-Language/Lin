@@ -47,7 +47,10 @@ pub unsafe extern "C" fn lin_tty_raw_mode(on: i32) -> *mut u8 {
     if on != 0 {
         // Save the original attributes once (only if not already in raw mode).
         {
-            let mut saved = SAVED_TERMIOS.lock().unwrap();
+            // Recover a poisoned lock rather than panic across this `extern "C"` boundary
+            // (unwinding here is UB / abort). Poisoning is not memory-unsafe — it just means a
+            // prior thread panicked holding the guard — so take the inner guard.
+            let mut saved = SAVED_TERMIOS.lock().unwrap_or_else(|e| e.into_inner());
             if saved.is_none() {
                 *saved = Some(term);
             }
@@ -63,7 +66,8 @@ pub unsafe extern "C" fn lin_tty_raw_mode(on: i32) -> *mut u8 {
     } else {
         // Restore the saved attributes, or fall back to a sane cooked default.
         let restore = {
-            let mut saved = SAVED_TERMIOS.lock().unwrap();
+            // Recover a poisoned lock rather than panic across this `extern "C"` boundary.
+            let mut saved = SAVED_TERMIOS.lock().unwrap_or_else(|e| e.into_inner());
             saved.take()
         };
         match restore {

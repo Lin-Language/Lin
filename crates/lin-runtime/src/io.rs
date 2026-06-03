@@ -56,7 +56,19 @@ pub unsafe extern "C" fn lin_print(s: *const LinString) {
     let string = std::str::from_utf8_unchecked(slice);
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    writeln!(handle, "{}", string).unwrap();
+    // A bare `.unwrap()` here would PANIC across this `extern "C"` boundary on any write
+    // error (UB / process abort). The common case is a closed downstream pipe
+    // (`lin-prog | head` — the reader exits early): Rust installs SIG_IGN for SIGPIPE at
+    // startup, so the EPIPE surfaces as a `BrokenPipe` error rather than a signal. Match the
+    // conventional Unix-tool behaviour and exit cleanly. Any other write error (e.g. disk
+    // full) is non-recoverable for a print call, so exit with a failure code rather than
+    // unwinding through C.
+    if let Err(e) = writeln!(handle, "{}", string) {
+        match e.kind() {
+            std::io::ErrorKind::BrokenPipe => std::process::exit(0),
+            _ => std::process::exit(1),
+        }
+    }
 }
 
 #[no_mangle]
