@@ -5787,6 +5787,25 @@ fn test_fmt_rule3_parser_rejects_trailing_commas() {
     assert!(parse_diagnostics("val o = { \"a\": 1, \"b\": 2 }\n").is_empty());
 }
 
+#[test]
+fn test_fmt_preserves_partial_application_comma() {
+    // BUG: the formatter never read the `partial` flag and dropped the trailing comma,
+    // turning a partial application `add(1,)` into a different-typed full call `add(1)`.
+    // That changes program meaning, violating the formatter's core invariant.
+    // Single-line plain call.
+    let out = fmt("val f = add(1,)\n");
+    assert!(out.contains("add(1,)"), "dropped partial comma (Call); got:\n{}", out);
+    assert!(parse_diagnostics(&out).is_empty(), "formatted output must re-parse: {:?}\n{}", parse_diagnostics(&out), out);
+    // Single-line dot call.
+    let outd = fmt("val f = x.add(1,)\n");
+    assert!(outd.contains("add(1,)"), "dropped partial comma (DotCall); got:\n{}", outd);
+    // Idempotent: re-formatting keeps the comma.
+    assert_eq!(out, fmt(&out), "partial-comma format not idempotent:\n{}", out);
+    // A normal (non-partial) call must NOT gain a spurious trailing comma.
+    let plain = fmt("val f = add(1)\n");
+    assert!(!plain.contains(",)"), "spurious trailing comma added; got:\n{}", plain);
+}
+
 /// Count `//` occurrences in a string (proxy for comment count for the corpus sanity check).
 fn count_comments(s: &str) -> usize {
     s.matches("//").count()
