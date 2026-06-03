@@ -204,6 +204,28 @@ impl Parser {
         }
     }
 
+    /// No-progress backstop for delimiter-bounded loops. Call at the bottom of a loop
+    /// body with the cursor position recorded at the top. If the cursor did not advance,
+    /// the loop would spin forever on an unexpected token whose handler (e.g. a
+    /// non-advancing `expect_*`) consumed nothing — so emit a diagnostic, skip one token
+    /// to guarantee termination, and return `true` to signal the caller may continue.
+    /// Returns `false` when progress was made (the common case). A parser must always
+    /// make progress and emit diagnostics — it must never hang.
+    pub(crate) fn ensure_progress(&mut self, start_pos: usize) -> bool {
+        if self.pos == start_pos {
+            let span = self.current_span();
+            let got = self.peek_kind();
+            self.diagnostics.push(Diagnostic::error(
+                span,
+                format!("unexpected {:?}", got),
+            ));
+            self.advance();
+            true
+        } else {
+            false
+        }
+    }
+
     /// True when the upcoming token(s) are one or more Newlines followed by a `|`.
     /// Pure lookahead — does not advance. Used to recognise a union-variant `|` that
     /// continues onto the next line when the first variant had no leading pipe.
@@ -251,5 +273,62 @@ impl Parser {
                 _ => { self.advance(); }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hang_regression_tests {
+    use super::*;
+    use lin_lex::Lexer;
+
+    /// Parse `source` and return the diagnostics. The mere fact that this function
+    /// RETURNS is the regression assertion: on the pre-fix parser each of these inputs
+    /// spun forever in a delimiter-bounded loop whose unexpected token was neither the
+    /// closing delimiter nor a comma, and whose handler (a non-advancing `expect_*`)
+    /// made no progress. A parser must always terminate and emit diagnostics.
+    fn diagnostics_for(source: &str) -> Vec<Diagnostic> {
+        let mut lexer = Lexer::new(source, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let _module = parser.parse_module();
+        parser.diagnostics
+    }
+
+    #[test]
+    fn object_pattern_with_non_ident_shorthand_terminates_with_error() {
+        // `parse_object_pattern` shorthand branch called the non-advancing `expect_ident`
+        // on an IntLit → infinite loop. Must terminate and report an error.
+        let diags = diagnostics_for("val { 1 } = x\n");
+        assert!(!diags.is_empty(), "expected a diagnostic for `val {{ 1 }} = x`");
+    }
+
+    #[test]
+    fn import_with_non_ident_binding_terminates_with_error() {
+        let diags = diagnostics_for("import { 1 } from \"x\"\n");
+        assert!(!diags.is_empty(), "expected a diagnostic for `import {{ 1 }} from`");
+    }
+
+    #[test]
+    fn foreign_import_with_non_val_line_terminates_with_error() {
+        // `parse_foreign_import` expected `val` to open each binding; a non-`val` first
+        // line left `expect_keyword(Val)` non-advancing → infinite loop.
+        let src = "import foreign \"x\"\n  notval y: Int32\n";
+        let diags = diagnostics_for(src);
+        assert!(!diags.is_empty(), "expected a diagnostic for foreign import non-val line");
+    }
+
+    #[test]
+    fn param_object_pattern_with_non_ident_terminates_with_error() {
+        // Reached via `parse_param` → `parse_object_pattern`: `({ 1 }) => 0`.
+        let diags = diagnostics_for("val f = ({ 1 }) => 0\n");
+        assert!(!diags.is_empty(), "expected a diagnostic for `({{ 1 }}) =>`");
+    }
+
+    #[test]
+    fn match_arm_object_pattern_with_non_ident_terminates_with_error() {
+        // Reached via a match arm pattern: `has { 1 } => ...`.
+        let src = "val r = match x\n  has { 1 } => 0\n  else => 1\n";
+        let diags = diagnostics_for(src);
+        assert!(!diags.is_empty(), "expected a diagnostic for `has {{ 1 }} =>`");
     }
 }
