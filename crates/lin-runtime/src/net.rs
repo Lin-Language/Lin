@@ -42,7 +42,12 @@ enum SocketKind {
 static REGISTRY: Mutex<Option<HashMap<i32, SocketKind>>> = Mutex::new(None);
 
 fn with_registry<R>(f: impl FnOnce(&mut HashMap<i32, SocketKind>) -> R) -> R {
-    let mut guard = REGISTRY.lock().unwrap();
+    // Recover from a poisoned lock instead of `.unwrap()`-panicking: these registry ops run
+    // from `extern "C"` functions, where unwinding is UB / process abort. Poisoning only means a
+    // prior thread panicked while holding the guard (plausible: handler closures run user code
+    // under this registry on worker/async paths). The HashMap itself stays consistent, so we take
+    // the inner guard and carry on.
+    let mut guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
     f(map)
 }
@@ -387,4 +392,40 @@ pub unsafe extern "C" fn lin_tcp_set_nonblocking(fd: i32, on: i32) -> *mut u8 {
 pub unsafe extern "C" fn lin_tcp_close(fd: i32) -> *mut u8 {
     with_registry(|m| m.remove(&fd));
     std::ptr::null_mut()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Poison the REGISTRY mutex (panic in a closure while holding the guard, caught), then
+    /// confirm `with_registry` recovers the inner guard instead of panicking. A panic here would,
+    /// in a real `extern "C"` runtime call, abort the process — this is the FFI-safety guarantee.
+    #[test]
+    fn with_registry_recovers_from_poison() {
+        // Force the lock into a poisoned state by panicking while holding it.
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = REGISTRY.lock().unwrap();
+            panic!("simulated panic while holding the registry lock");
+        });
+        assert!(poisoned.is_err(), "the closure should have panicked");
+        assert!(
+            REGISTRY.is_poisoned(),
+            "the registry mutex should now be poisoned"
+        );
+
+        // The next access must NOT panic — it recovers the inner guard.
+        let n = with_registry(|m| {
+            m.insert(424242, SocketKind::Udp(
+                UdpSocket::bind(("127.0.0.1", 0)).expect("bind ephemeral UDP socket"),
+            ));
+            m.len()
+        });
+        assert!(n >= 1, "insert should succeed after poison recovery");
+
+        // Clean up so we don't leak the test entry / leave the registry dirty.
+        with_registry(|m| {
+            m.remove(&424242);
+        });
+    }
 }
