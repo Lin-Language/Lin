@@ -292,11 +292,7 @@ val openFence = (st: Json, trimmed: String): Json =>
   }
 
 val addHeading = (st: Json, line: String, level: Int32): Json =>
-  val blocks = flushedBlocks(st).append({
-    "kind": "heading",
-    "level": level,
-    "text": line.substring(level + 1).trim()
-  })
+  val blocks = flushedBlocks(st).append({ "kind": "heading", "level": level, "text": line.substring(level + 1).trim() })
   {
     ...st,
     "blocks": blocks,
