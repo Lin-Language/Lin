@@ -16,7 +16,7 @@ readStream("in.csv")
   .drain()
 ```
 
-> The generic combinators (`map`, `filter`, `take`, `drop`, `reduce`, `for`, …) are **not** part of `std/stream` — they come from [`std/iter`](/stdlib/iter.html) and dispatch to the lazy stream backend automatically when the receiver is a `Stream`. A stream pipeline imports its **sources and sinks** from `std/stream` and its **combinators** from `std/iter`.
+> The generic combinators (`map`, `filter`, `take`, `drop`, `reduce`, `for`, …) are **not** part of `std/stream` — they come from [`std/iter`](/stdlib/iter.html) and dispatch to the lazy stream backend automatically when the receiver is a `Stream`. A stream pipeline imports its **sources and sinks** from `std/stream` and its **combinators** from `std/iter`. The optional callback **index** parameter documented in `std/iter` is for array/iterator receivers only — lazy stream combinators keep 1-arg callbacks.
 
 Byte sources also come from other modules — `tcpStream` ([`std/net`](/stdlib/net.html)), `stdoutStream` ([`std/process`](/stdlib/process.html)), and `stdinStream` ([`std/io`](/stdlib/io.html)) all return `Stream<UInt8[]>` and feed the same adapters and terminals documented here.
 
