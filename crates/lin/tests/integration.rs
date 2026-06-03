@@ -1872,6 +1872,85 @@ fn test_cyclic_imports_value_init_cycle_still_errors() {
 }
 
 #[test]
+fn test_cache_invalidated_when_import_signature_changes() {
+    // Regression for the stale-cache bug: a CACHED imported module's cache key MUST incorporate the
+    // signatures of the modules IT imports, not just its own source bytes.
+    //
+    // Three modules: main.lin -> m.lin -> a.lin. `m.lin` is the cached intermediary — it imports
+    // `getVal` from `a.lin` and uses the result as an Int32 (`getVal() + 1`). The main module is
+    // always re-checked, so the bug only manifests through an imported (cacheable) module like m.lin.
+    //   - Build #1: `a.lin` exports `getVal(): Int32`. m.lin checks clean and its `.typed` is cached.
+    //   - Build #2: `a.lin`'s `getVal` is changed to return `String` (its SIGNATURE changes), while
+    //     m.lin AND main.lin are left BYTE-IDENTICAL.
+    //
+    // With the old key (sha256 of m.lin's own source only), m.lin's `.typed` from build #1 — checked
+    // against the OLD Int32 `getVal` — is reloaded unchanged. `getVal() + 1` is never re-checked, so
+    // codegen lowers it as integer arithmetic over a value that is now a String pointer: a silent
+    // miscompilation (on current master this surfaces as a codegen panic). With the fix, m.lin's key
+    // folds in a.lin's NEW signature hash, so m.lin is re-checked against the String `getVal` and a
+    // clean type error surfaces. This test FAILS on master (build #2 panics / wrongly succeeds) and
+    // passes after the fix (build #2 fails with a clean type error).
+    let dir = std::env::temp_dir().join(format!("lin_cache_import_sig_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+
+    // a.lin v1: getVal returns Int32.
+    std::fs::write(dir.join("a.lin"),
+        "export val getVal = (): Int32 => 42\n").unwrap();
+    // m.lin (the cached intermediary): uses getVal() as an Int32. Written once and NEVER changed.
+    let m_src = "import { getVal } from \"a\"\nexport val total = (): Int32 => getVal() + 1\n";
+    std::fs::write(dir.join("m.lin"), m_src).unwrap();
+    // main.lin: drives m.lin's `total`. Written once and NEVER changed.
+    let main_src = "import { total } from \"m\"\n\
+         import { print } from \"std/io\"\n\
+         import { toString } from \"std/string\"\n\
+         print(toString(total()))\n";
+    std::fs::write(dir.join("main.lin"), main_src).unwrap();
+
+    let bin_path = dir.join("main.out");
+
+    // Build #1: must succeed and populate .lin-cache (m.lin checked against Int32 getVal).
+    let build1 = Command::new(lin_bin())
+        .args(["build", dir.join("main.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    assert!(build1.status.success(),
+        "build #1 should succeed, got:\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&build1.stderr),
+        String::from_utf8_lossy(&build1.stdout));
+    assert!(dir.join(".lin-cache").exists(), "build #1 should have written a .lin-cache");
+
+    // Change a.lin's EXPORTED SIGNATURE: getVal now returns String. m.lin / main.lin are untouched.
+    std::fs::write(dir.join("a.lin"),
+        "export val getVal = (): String => \"hi\"\n").unwrap();
+    // Sanity: the cached intermediary and entry point are still byte-identical.
+    assert_eq!(std::fs::read_to_string(dir.join("m.lin")).unwrap(), m_src);
+    assert_eq!(std::fs::read_to_string(dir.join("main.lin")).unwrap(), main_src);
+
+    // Build #2: m.lin must be re-checked against the NEW (String) getVal, so `getVal() + 1` is now a
+    // type error. If the cache key ignored a.lin's signature, the stale m.lin .typed would be reused
+    // (codegen panic / silent miscompile).
+    let build2 = Command::new(lin_bin())
+        .args(["build", dir.join("main.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary");
+    let stderr = String::from_utf8_lossy(&build2.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&build2.stdout).to_string();
+    let combined = format!("{stderr}{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!build2.status.success(),
+        "build #2 should FAIL: m.lin must be re-checked against the changed `getVal` signature \
+         (String, not Int32), making `getVal() + 1` a type error. A success means the stale \
+         (import-signature-blind) cache entry was reused. Output:\n{combined}");
+    // It must fail CLEANLY (a type/check error), not panic in codegen on the stale IR.
+    assert!(!combined.contains("panicked"),
+        "build #2 should fail with a clean type error, not a codegen panic on stale cached IR:\n{combined}");
+    assert!(combined.contains("String") || combined.contains("Int32") || combined.to_lowercase().contains("type"),
+        "expected a type error mentioning the String/Int32 mismatch, got:\n{combined}");
+}
+
+#[test]
 fn test_cyclic_imports_peer_dependent_return_boundary_gap() {
     // Documents the KNOWN boundary-soundness gap in cyclic-import inference (ADR-078).
     // A 3-module cycle a -> b -> c -> a where the only literal lives in `fromC`, and
