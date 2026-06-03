@@ -10439,3 +10439,82 @@ print(toString(triple(config["count"])))
 "#);
     assert_eq!(out, vec!["42", "42"]);
 }
+
+#[test]
+#[cfg(unix)]
+fn test_print_broken_pipe_exits_cleanly() {
+    // A Lin program that prints a lot, piped into a reader that closes early (`head -1`), must
+    // NOT panic across the `extern "C"` boundary in `lin_print` (a `writeln!(..).unwrap()` on
+    // EPIPE used to abort the process). We assert the Lin process terminates without an abort
+    // signal (SIGABRT/SIGSEGV) and emits no Rust panic message.
+    use std::os::unix::process::ExitStatusExt;
+
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_pipe_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_pipe_{}", id));
+
+    fs::write(
+        &src_path,
+        r#"import { print } from "std/io"
+import { range, for } from "std/iter"
+range(0, 1000000).for(i => print("line ${i}"))
+"#,
+    )
+    .unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(
+        compile.status.success(),
+        "compilation failed:\nstderr: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    // Spawn the Lin program with piped stdout, feed it into `head -1`, then drop the reader so
+    // the pipe closes while the Lin process is still trying to print.
+    let mut producer = Command::new(&bin_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn lin producer");
+
+    let producer_stdout = producer.stdout.take().unwrap();
+    let head = Command::new("head")
+        .arg("-1")
+        .stdin(Stdio::from(producer_stdout))
+        .stdout(Stdio::null())
+        .output()
+        .expect("failed to run head");
+    assert!(head.status.success(), "head should succeed");
+
+    let out = producer.wait_with_output().expect("failed to wait on producer");
+    let _ = fs::remove_file(&bin_path);
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+
+    // Must not have been killed by an abort/segv signal (a panic-across-FFI aborts with SIGABRT).
+    if let Some(sig) = out.status.signal() {
+        assert!(
+            sig != libc_sigabrt() && sig != 11,
+            "lin process died from signal {} (abort/segv) on broken pipe:\nstderr: {}",
+            sig,
+            stderr
+        );
+    }
+    // And no Rust panic should have leaked to stderr.
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("BrokenPipe"),
+        "lin process panicked on broken pipe:\nstderr: {}",
+        stderr
+    );
+}
+
+#[cfg(unix)]
+fn libc_sigabrt() -> i32 {
+    6
+}
