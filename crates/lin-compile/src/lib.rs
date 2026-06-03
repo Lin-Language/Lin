@@ -1102,17 +1102,34 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
     // (LD_LIBRARY_PATH / ldconfig). rpath dirs are deduped so each distinct rpath string is added
     // once.
     //
-    // We prefer a `$ORIGIN`-relative rpath so the produced binary + its vendored .so are
+    // We prefer a loader-relative rpath so the produced binary + its vendored shared library are
     // RELOCATABLE: copy both together (preserving their relative layout) anywhere and the binary
-    // still resolves the library, because `$ORIGIN` is expanded by the dynamic loader to the
-    // directory the binary lives in at launch. This is the Linux/ELF mechanism. macOS uses
-    // `@loader_path` plus the dylib's `install_name` instead — that is a deliberate FOLLOW-UP and
-    // is not handled here (the `$ORIGIN` token is meaningless to the macOS loader).
+    // still resolves the library, because the rpath token is expanded by the dynamic loader to the
+    // directory the binary lives in at launch.
     //
-    // `$ORIGIN` must reach the dynamic loader LITERALLY (the loader, not the linker or shell, does
-    // the expansion). The link command runs via std::process::Command — not a shell — so the
-    // `$ORIGIN` in `-Wl,-rpath,$ORIGIN/...` is passed as a literal argv element and is NOT
-    // shell-expanded. `readelf -d` on the output confirms RUNPATH carries a literal `$ORIGIN`.
+    // The token is PLATFORM-SPECIFIC:
+    //   * Linux/ELF: `$ORIGIN` — the relative-path math below produces e.g. `$ORIGIN/../libs`.
+    //   * macOS/Mach-O: `@loader_path` — `$ORIGIN` is meaningless to dyld. (`@executable_path` is
+    //     the sibling token; `@loader_path` is correct for the main executable too and is what we
+    //     emit.)
+    // We pick the token via `cfg!(target_os = "macos")`. This is HOST cfg, which is correct because
+    // `lin` compiles for its own host (host == target). A cross-compiling Lin would need target-
+    // aware selection; Lin does not cross-compile today. Using the runtime `cfg!(...)` (not
+    // `#[cfg]`) keeps BOTH arms type-checked on every host.
+    //
+    // The token must reach the dynamic loader LITERALLY (the loader, not the linker or shell, does
+    // the expansion). The link command runs via std::process::Command — not a shell — so the token
+    // in `-Wl,-rpath,<token>/...` is passed as a literal argv element and is NOT shell-expanded.
+    // `readelf -d` (Linux) / `otool -l` (macOS) on the output confirms the literal token survives.
+    //
+    // macOS install_name subtlety (handled by `macos_fixup_dylib_rpaths` after a successful link):
+    // an executable's load command for a dylib records the DYLIB'S OWN install_name (LC_ID_DYLIB),
+    // NOT the path we linked against. If that install_name is absolute or a bare leaf, dyld uses it
+    // and NEVER consults the rpath. For the rpath to matter, the executable's reference must be
+    // `@rpath/<leaf>`. A dylib we build ourselves can set `-install_name @rpath/<leaf>`; for a
+    // vendored dylib we did not build we post-link rewrite the load command with
+    // `install_name_tool -change <recorded> @rpath/<leaf> <exe>` (best-effort).
+    let rpath_token = if cfg!(target_os = "macos") { "@loader_path" } else { "$ORIGIN" };
     let mut rpath_specs: Vec<String> = Vec::new();
     let out_dir = output_path.parent().unwrap_or(Path::new("."));
     for lib in foreign_libs {
@@ -1128,15 +1145,16 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
             cmd.arg(format!("-L{}", parent.display()))
                .arg(format!("-l{}", lib_name));
 
-            // Compute a `$ORIGIN`-relative rpath from the output binary's directory to the .so's
+            // Compute a loader-relative rpath from the output binary's directory to the library's
             // directory. If a clean relative path can't be derived (e.g. the two live on different
             // mounts with no common base, or canonicalization fails), fall back to an ABSOLUTE
-            // canonicalized rpath — robust, just not relocatable.
+            // canonicalized rpath — robust, just not relocatable. dyld accepts a plain absolute
+            // rpath too, so the fallback is identical on both OSes.
             let abs_out_dir = out_dir.canonicalize().unwrap_or_else(|_| out_dir.to_path_buf());
             let abs_parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
             let rpath = match relative_path(&abs_out_dir, &abs_parent) {
-                Some(rel) if rel.as_os_str().is_empty() => "$ORIGIN".to_string(),
-                Some(rel) => format!("$ORIGIN/{}", rel.display()),
+                Some(rel) if rel.as_os_str().is_empty() => rpath_token.to_string(),
+                Some(rel) => format!("{}/{}", rpath_token, rel.display()),
                 None => abs_parent.display().to_string(),
             };
             if !rpath_specs.contains(&rpath) {
@@ -1181,7 +1199,131 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
         return Err(CompileError::Link(msg));
     }
 
+    // macOS-only, best-effort: rewrite the executable's load commands for each vendored dylib to
+    // `@rpath/<leaf>` so the `@loader_path` rpath emitted above is actually consulted by dyld.
+    // No-op on Linux (the `cfg!` guard inside is a runtime false there, but BOTH arms compile).
+    macos_fixup_dylib_rpaths(output_path, foreign_libs);
+
     Ok(())
+}
+
+/// macOS post-link fixup (best-effort, no-op on every other OS).
+///
+/// dyld resolves a dependent dylib by the path RECORDED in the executable's load command — which is
+/// the dylib's own install_name (LC_ID_DYLIB), not the path we linked against. If that recorded
+/// path is absolute or a bare leaf, the `@loader_path` rpath we baked in is never consulted. For a
+/// dylib WE built we can set `-install_name @rpath/<leaf>` at build time; for a VENDORED dylib we
+/// did not build, we rewrite the executable's reference to `@rpath/<leaf>` here, so the rpath is
+/// used.
+///
+/// Mechanism: parse `otool -L <exe>` (each dependency line is whitespace-indented
+/// `<path> (compatibility version ..., current version ...)`), find the recorded path whose leaf
+/// filename matches the vendored dylib's leaf (allowing a soname-versioned variant such as
+/// `libfoo.1.dylib`), and if it is not already `@rpath/<leaf>` run
+/// `install_name_tool -change <recorded> @rpath/<leaf> <exe>`.
+///
+/// This is BEST-EFFORT: if `otool` / `install_name_tool` are missing or fail (e.g. a self-built
+/// dylib that already records `@rpath/...`, so there is nothing to change), we warn and continue —
+/// the link itself is NOT failed. The whole body is guarded by `cfg!(target_os = "macos")` so it
+/// compiles on Linux (both arms are type-checked) but does nothing at runtime there.
+fn macos_fixup_dylib_rpaths(output_path: &Path, foreign_libs: &[String]) {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+
+    // Collect the leaf filenames of the vendored dylibs we linked.
+    let dylib_leaves: Vec<String> = foreign_libs
+        .iter()
+        .filter(|lib| lib.ends_with(".dylib"))
+        .filter_map(|lib| {
+            Path::new(lib)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    if dylib_leaves.is_empty() {
+        return;
+    }
+
+    // Read the executable's recorded dependency paths via `otool -L`.
+    let otool_out = match Command::new("otool")
+        .args(["-L", &output_path.display().to_string()])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        Ok(_) | Err(_) => {
+            eprintln!(
+                "Warning: macOS rpath fixup skipped — `otool -L` unavailable or failed; the \
+                 vendored dylib may not be found at runtime unless it records an @rpath \
+                 install_name"
+            );
+            return;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&otool_out.stdout);
+
+    // Each dependency line looks like:
+    //   \t/abs/or/relative/path/libfoo.1.dylib (compatibility version 1.0.0, current version 1.0.0)
+    // The first whitespace-indented token up to " (" is the recorded path.
+    for line in stdout.lines() {
+        if !line.starts_with(char::is_whitespace) {
+            // The first line is the binary's own name (not indented); skip non-dependency lines.
+            continue;
+        }
+        let trimmed = line.trim();
+        // Strip the trailing " (compatibility ...)" annotation to isolate the path.
+        let recorded = match trimmed.split(" (").next() {
+            Some(p) if !p.is_empty() => p,
+            _ => continue,
+        };
+        let recorded_leaf = Path::new(recorded)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        // Match this recorded entry to one of our vendored dylibs by leaf filename. Accept an
+        // exact match (libfoo.dylib) or a soname-versioned variant (libfoo.1.dylib) for the same
+        // base stem (the part before the first '.').
+        let matched_leaf = dylib_leaves.iter().find(|leaf| {
+            recorded_leaf == leaf.as_str() || dylib_leaf_matches(recorded_leaf, leaf)
+        });
+        let leaf = match matched_leaf {
+            Some(l) => l,
+            None => continue,
+        };
+
+        let desired = format!("@rpath/{}", leaf);
+        if recorded == desired {
+            continue; // Already @rpath/<leaf> (e.g. a self-built dylib) — nothing to do.
+        }
+
+        let status = Command::new("install_name_tool")
+            .args(["-change", recorded, &desired, &output_path.display().to_string()])
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            _ => {
+                eprintln!(
+                    "Warning: macOS rpath fixup — `install_name_tool -change {} {}` failed; the \
+                     vendored dylib may not be found via the @loader_path rpath at runtime",
+                    recorded, desired
+                );
+            }
+        }
+    }
+}
+
+/// True if `recorded_leaf` is a soname-versioned variant of vendored dylib leaf `leaf` — i.e. they
+/// share the same base stem (the substring before the first `.`) and both end in `.dylib`. This
+/// matches e.g. recorded `libfoo.1.dylib` against vendored `libfoo.dylib`. The exact-equality case
+/// is handled by the caller; this only covers the versioned variant.
+fn dylib_leaf_matches(recorded_leaf: &str, leaf: &str) -> bool {
+    if !recorded_leaf.ends_with(".dylib") || !leaf.ends_with(".dylib") {
+        return false;
+    }
+    let base = |s: &str| s.split('.').next().unwrap_or(s).to_string();
+    base(recorded_leaf) == base(leaf)
 }
 
 /// Pick the clang driver to use for coverage links. Prefers the LLVM-22-matched `clang-22`

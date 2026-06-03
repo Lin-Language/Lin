@@ -1686,8 +1686,18 @@ another cwd with `LD_LIBRARY_PATH` cleared and `SDL_VIDEODRIVER=dummy`, proving 
 end-to-end against the real library. `stdlib/ffi.test.lin` covers the raw-memory helpers and `withCstr`
 without needing `lin build`.
 
-**Known limitations**: macOS relocatability (`@loader_path` + dylib `install_name`) is **not** handled —
-`$ORIGIN` is meaningless to the macOS loader; this is Linux/ELF-only and a tracked follow-up. The
+**macOS relocatability**: now handled. The rpath token is platform-selected via `cfg!(target_os = "macos")`
+— `@loader_path` on macOS (`$ORIGIN` is meaningless to dyld), `$ORIGIN` on Linux. Because an
+executable records a dylib's own `install_name` (LC_ID_DYLIB) rather than the linked path, the rpath
+is only consulted when that reference is `@rpath/<leaf>`; after a successful link on macOS we do a
+best-effort `install_name_tool -change <recorded> @rpath/<leaf> <exe>` (recorded path found by
+parsing `otool -L`, matching by leaf incl. soname-versioned variants), and skip silently if the
+tools are missing or the entry is already `@rpath/...`. Validated by
+`test_ffi_vendored_shared_lib_relocatable` (builds its own dylib with `-install_name @rpath/...`) on
+the macos-latest CI leg. The committed SDL3 lib remains a Linux x86-64 ELF, so the SDL demo tests are
+Linux-gated.
+
+**Known limitations**: The
 vendored SDL3 is Linux x86-64, software-rendered via the dummy driver (proves the ABI + rasterisation,
 not GPU output). `withCstr` leaks its buffer only if the callback faults (Lin has no try/finally). A
 real bindgen / struct-layout DSL is future work — struct offsets are hand-computed by the programmer
