@@ -156,8 +156,9 @@ cp SDL/build/libSDL3.so.0.4.10 examples/sdl/libs/
   a different driver/format would need its channel order re-derived from `format`.
 - `Ptr` is an `Int64` alias, not a distinct opaque type — the checker can't yet forbid arithmetic
   on raw handles or `Int64`↔`Ptr` confusion.
-- The `$ORIGIN` rpath is **Linux-first** (`@loader_path` + install_name would be the macOS
-  analogue); the vendored `.so` is a Linux x86-64 build.
+- The rpath mechanism works on **macOS too** (`@loader_path` token + a best-effort
+  `install_name_tool -change` to `@rpath/<leaf>`); the committed `libSDL3.so` is a Linux x86-64
+  build, so swap in a macOS SDL3 dylib to run these demos there.
 - Committing a ~2.9 MB binary blob in the repo is a deliberate convenience for reproducible
   headless tests; a real project would depend on a system/package-managed SDL3.
 - `ai_worker.lin` spawns a worker per frame (see the caveat above).
