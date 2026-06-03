@@ -15,52 +15,26 @@
 
 use std::alloc::{Layout, alloc};
 
-pub const TAG_NULL: u8 = 0;
-pub const TAG_BOOL: u8 = 1;
-pub const TAG_INT32: u8 = 2;
-pub const TAG_INT64: u8 = 3;
-pub const TAG_FLOAT32: u8 = 4;
-pub const TAG_FLOAT64: u8 = 5;
-pub const TAG_STR: u8 = 6;
-pub const TAG_OBJECT: u8 = 7;
-pub const TAG_ARRAY: u8 = 8;
-pub const TAG_FUNCTION: u8 = 9;
-pub const TAG_UINT8: u8 = 10;
-pub const TAG_INT8: u8 = 11;
-pub const TAG_UINT16: u8 = 12;
-pub const TAG_INT16: u8 = 13;
-/// UInt64 — payload interpreted as `u64` (unsigned). For *boxed scalars* all other unsigned
-/// widths (UInt8/16/32) are zero-extended and boxed as TAG_INT64 (always-positive i64), so
-/// for boxed scalars this is the only tag whose payload must be read unsigned. (As a *flat
-/// array elem_tag* it likewise marks unsigned-64-bit storage — shared numeric space.)
-pub const TAG_UINT64: u8 = 14;
-/// UInt32 flat-array elem_tag — marks a flat array whose raw elements are `u32`, so display/
-/// JSON reads them unsigned. (Boxed UInt32 *scalars* still use TAG_INT64 positive; this tag
-/// only ever appears as a flat-array elem_tag, never on a boxed TaggedVal.)
-pub const TAG_UINT32: u8 = 15;
-/// Promise (async) — payload is a `*mut LinPromise` (an opaque, non-refcounted runtime handle).
-/// A boxed promise round-trips through TypeVar slots and arrays like any other tagged value;
-/// codegen boxes a freshly-spawned promise and unboxes it at `await`/combinator boundaries. RC
-/// is a no-op for this tag (promises are not refcounted; `await` reaps the underlying thread).
-pub const TAG_PROMISE: u8 = 16;
-/// ThreadPool / Worker handle — payload is a `*mut LinThreadPool` / `*mut LinWorker` (opaque,
-/// non-refcounted, program-lifetime runtime handles). Boxed like a promise so the handle
-/// round-trips through TypeVar slots; codegen boxes the constructor result and unboxes at the
-/// method boundary (`pool.async`, `w.request`/`message`/`close`). RC is a no-op for this tag.
-pub const TAG_HANDLE: u8 = 17;
-/// `Shared<T>` box — payload is a `*const SharedBox` (atomic-refcounted, RwLock-guarded shared
-/// mutable state, §2.3.1). Unlike other heap tags, its refcount is ATOMIC: retain/release go
-/// through `lin_shared_retain`/`lin_shared_release`. The thread-transfer copy path shares it by
-/// an atomic bump rather than deep-copying through it (the nesting rule).
-pub const TAG_SHARED: u8 = 18;
-/// `Stream<T>` box — payload is a `*const StreamBox` (an opaque, refcounted, OS-resource-owning
-/// pull-source, streams brief / ADR-072). Like `Shared`, its refcount is held inside the box and
-/// accessed through the tag-aware retain/release path (`lin_stream_retain_box`/
-/// `lin_stream_release_box`); the release path's final drop runs the auto-close FINALIZER that
-/// closes the fd if it was not explicitly closed. A boxed stream round-trips through TypeVar
-/// slots like any tagged value, but the placement restriction (Stage 6) keeps it out of
-/// arrays/objects/`var`, and it crosses threads only by MOVE (CAP_MOVE, Stage 7), never by copy.
-pub const TAG_STREAM: u8 = 19;
+// The canonical tag values live in `lin_common::tags` — the SINGLE source of truth shared
+// with the compiler backend (`lin-codegen`) so a tag byte can never drift from how the
+// runtime reads it. Re-exported here so existing `crate::tagged::TAG_*` references keep
+// working. Semantic notes on the non-obvious tags:
+//   TAG_UINT64 — payload read as `u64` (unsigned). For *boxed scalars* the other unsigned
+//     widths (UInt8/16/32) are zero-extended and boxed as TAG_INT64 (always-positive i64),
+//     so for boxed scalars this is the only tag whose payload must be read unsigned. (As a
+//     *flat array elem_tag* it likewise marks unsigned-64-bit storage.)
+//   TAG_UINT32 — only ever a flat-array elem_tag (raw u32 elements, read unsigned for
+//     display/JSON). Boxed UInt32 *scalars* still use TAG_INT64-positive.
+//   TAG_FLOAT32 — only ever a flat-array elem_tag (dense f32 storage). Boxed float
+//     *scalars* are ALWAYS TAG_FLOAT64 with an f64-bits payload.
+//   TAG_PROMISE / TAG_HANDLE — opaque, non-refcounted runtime handles; RC is a no-op.
+//   TAG_SHARED — `*const SharedBox`, ATOMIC refcount via lin_shared_retain/release.
+//   TAG_STREAM — `*const StreamBox`, refcount inside the box; final drop runs auto-close.
+pub use lin_common::tags::{
+    TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT32, TAG_FLOAT64, TAG_STR, TAG_OBJECT,
+    TAG_ARRAY, TAG_FUNCTION, TAG_UINT8, TAG_INT8, TAG_UINT16, TAG_INT16, TAG_UINT64, TAG_UINT32,
+    TAG_PROMISE, TAG_HANDLE, TAG_SHARED, TAG_STREAM,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy)]

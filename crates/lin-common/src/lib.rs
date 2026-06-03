@@ -1,3 +1,5 @@
+pub mod tags;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Span {
     pub file_id: u32,
