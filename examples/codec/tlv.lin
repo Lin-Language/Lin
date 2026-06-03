@@ -11,8 +11,8 @@
 // coercion, big-endian byte packing via std/bytes, and recursion over a buffer
 // with an index cursor.
 import { push, length, slice } from "std/array"
-import { u16ToBe, u16FromBe } from "std/bytes"
-import { toUInt16, toInt32, toUInt64, toFloat64 } from "std/number"
+import { u16FromBe } from "std/bytes"
+import { toInt32, toFloat64 } from "std/number"
 
 // One TLV field: a tag byte (0..255) plus its raw value bytes. The value is a
 // flat byte array; decode rebuilds these from slices of the packed buffer.
@@ -20,20 +20,24 @@ import { toUInt16, toInt32, toUInt64, toFloat64 } from "std/number"
 export type Field = { "tag": Int32, "bytes": Int32[] }
 
 // Append every byte of `src` (a byte list) onto the UInt8[] accumulator `buf`.
-// `src` stays dynamic Json: it's called with both the field's Int32[] value and
-// the UInt8[] length prefix from u16ToBe, whose flat element widths differ, so a
-// single typed element stride here would misread one of them.
+// `src` stays dynamic Json so it can take the field's Int32[] value bytes; `push`
+// coerces each Int32 element to a byte.
 val appendBytes = (buf: UInt8[], src: Json, i: Int32): Null =>
   if i < length(src) then
     push(buf, src[i])
     appendBytes(buf, src, i + 1)
 
 // Append one field's TLV encoding onto the UInt8[] accumulator `buf`:
-// [tag] ++ u16be(len) ++ value-bytes. `push`/append coerce each Int into a byte.
+// [tag] ++ u16be(len) ++ value-bytes. `push` coerces each Int32 down to a byte at
+// runtime (same as the tag), so the big-endian length prefix is written directly
+// as two masked bytes — `len` comes from `length` as a signed Int32 (the count
+// type), which the explicit narrowing casts (UInt64-in) intentionally do not
+// accept, so we mask-and-push rather than route it through `u16ToBe`.
 val encodeField = (buf: UInt8[], field: Field): Null =>
   push(buf, field["tag"])
   val len = length(field["bytes"])
-  appendBytes(buf, u16ToBe(len.toUInt64().toUInt16()), 0)
+  push(buf, (len >> 8) & 0xFF)
+  push(buf, len & 0xFF)
   appendBytes(buf, field["bytes"], 0)
 
 // Encode each field in turn into the shared accumulator (recursion threads the index).
