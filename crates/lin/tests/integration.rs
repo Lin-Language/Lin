@@ -1238,6 +1238,77 @@ print(toString(reduce(c, 0.0, (acc, x) => acc + x)))  // 6.0
 }
 
 #[test]
+fn test_flat_array_push_grows_inline() {
+    // The flat-scalar PUSH is INLINED in codegen (fast bump-append when len < cap; cold grow
+    // path defers to the runtime `lin_flat_array_push_<sfx>` realloc). Exercise the grow boundary
+    // hard: a flat array starts at cap 4 (a 1-element literal), then push ~40-50 elements in place
+    // via a recursive accumulator-threading builder so EVERY element hits the inline path and the
+    // array reallocates several times. Cover BOTH Int32 and Float64 element reprs, plus a
+    // map/filter/reduce chain (whose intermediates are flat arrays grown the same way). Read the
+    // contents back (length + sum) so a mis-stored element or a stale post-realloc data pointer
+    // corrupts the assertion. ASan-clean (verified separately): flat scalars carry no refcount.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length, push } from "std/array"
+import { range, reduce, map, filter } from "std/iter"
+
+val buildInts = (i: Int32, n: Int32, acc: Int32[]): Int32[] =>
+  if i >= n then acc
+  else
+    push(acc, i)
+    buildInts(i + 1, n, acc)
+val ints: Int32[] = buildInts(1, 50, [0])
+print(toString(length(ints)))                       // 50 (grew from cap 4)
+val intsB: Int32[] = buildInts(1, 50, [0])
+print(toString(reduce(intsB, 0, (a, x) => a + x)))  // 0+1+...+49 = 1225
+
+val buildFloats = (i: Int32, n: Int32, acc: Float64[]): Float64[] =>
+  if i >= n then acc
+  else
+    push(acc, i + 0.5)
+    buildFloats(i + 1, n, acc)
+val floats: Float64[] = buildFloats(1, 40, [0.5])
+print(toString(length(floats)))                     // 40
+val floatsB: Float64[] = buildFloats(1, 40, [0.5])
+print(toString(reduce(floatsB, 0.0, (a, x) => a + x)))  // 800.0
+
+// map/filter/reduce chain over flat int arrays (each combinator pushes into a fresh flat array)
+print(toString(range(0, 1000).map(x => x * 2).filter(x => x % 3 == 0).reduce(0, (a, x) => a + x)))
+"#);
+    assert_eq!(output, vec!["50", "1225", "40", "800.0", "333666"]);
+}
+
+#[test]
+fn test_flat_array_index_set_inline() {
+    // The flat-scalar index-assign (`arr[i] = x`) is INLINED in codegen when the element type is a
+    // flat scalar AND the value type matches it: a bounds-checked raw store instead of boxing +
+    // the cross-staticlib `lin_array_set`. OOB and negative indices must stay byte-identical to the
+    // runtime: OOB is a SILENT no-op (array set never faults, spec §6.1) and `arr[-1]` addresses
+    // the last element. Cover Int32 and Float64, the in-bounds store, the negative-index store, and
+    // an out-of-bounds store (must not corrupt or fault). Read every slot back.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+val a: Int32[] = [10, 20, 30, 40]
+a[1] = 99            // in-bounds inline store
+a[100] = 7           // OOB -> silent no-op (cold path defers to runtime set)
+a[-1] = 55           // negative index -> last element
+print(toString(a[0]))      // 10
+print(toString(a[1]))      // 99
+print(toString(a[3]))      // 55
+print(toString(length(a))) // 4 (OOB store did not grow)
+
+val f: Float64[] = [1.5, 2.5, 3.5]
+f[0] = 9.25
+f[-1] = 8.75         // last element via negative index
+print(toString(f[0]))      // 9.25
+print(toString(f[2]))      // 8.75
+"#);
+    assert_eq!(output, vec!["10", "99", "55", "4", "9.25", "8.75"]);
+}
+
+#[test]
 fn test_float_constants_link_under_pie() {
     // Float constants land in .rodata and, with a non-PIC reloc model, emit
     // R_X86_64_32S absolute relocations that the system `cc`'s default PIE link
