@@ -16,16 +16,31 @@ use crate::tagged::TaggedVal;
 /// shared `LinObject*` holders stay valid (they already re-read `(*obj).entries` each access).
 #[repr(C)]
 pub struct LinObject {
-    pub refcount: u32,
-    pub len: u32,
-    pub cap: u32,
-    flags: u32,
-    pub entries: *mut LinObjectEntry,
+    pub refcount: u32,        // @0   unchanged (codegen never touches)
+    pub len: u32,             // @4   unchanged (codegen writes this)
+    pub cap: u32,             // @8   unchanged
+    flags: u32,               // @12  unchanged
+    pub entries: *mut LinObjectEntry, // @16 unchanged (codegen reads this)
+    // ── O(1)-lookup hash side-index (RAPTOR #4b) ──────────────────────────────────────────
+    // ALL new fields live at offset >= 24, which the codegen inline `MakeObject` path never
+    // reads or writes (audited: it touches only len@4, entries@16, and the 24-byte entries).
+    // The index is OPTIONAL and LAZY: small objects (len < HASH_INDEX_THRESHOLD) never build it
+    // and keep the byte-for-byte linear-scan code path. The codegen inline-literal path builds
+    // large literals with `index == null`, so the lazy build MUST key off `index.is_null() ||
+    // index_dirty != 0` — never assume any constructor maintained the index.
+    index: *mut u32,          // @24  open-addressing table of (entry_slot+1); 0 = empty; null = none
+    index_cap: u32,           // @32  power-of-two table size, or 0 when `index` is null
+    index_dirty: u32,         // @36  set when entries changed without index maintenance
 }
 
 /// `flags` bit: the entries buffer is inline (part of the header allocation), so it must NOT be
 /// freed separately and a grow must migrate it to a heap buffer first.
 const FLAG_INLINE: u32 = 1;
+
+/// Objects with at least this many entries get a lazily-built open-addressing hash index for
+/// O(1)-average key lookup. Below this, the linear scan is faster (no hashing, no allocation)
+/// and the layout/code paths are byte-for-byte unchanged. RAPTOR #4b.
+const HASH_INDEX_THRESHOLD: u32 = 16;
 
 #[repr(C)]
 pub struct LinObjectEntry {
@@ -78,6 +93,137 @@ unsafe fn migrate_inline_to_heap(obj: *mut LinObject, new_cap: u32) {
     (*obj).flags &= !FLAG_INLINE;
 }
 
+// ── Hash side-index (RAPTOR #4b) ──────────────────────────────────────────────────────────
+//
+// An open-addressing table mapping `hash(key bytes) -> entry_slot + 1` (0 means empty). It is
+// a pure ACCELERATOR over the existing `entries` association list: `entries` remains the source
+// of truth (insertion order, ownership, equality, keys/values all read it directly). The index
+// stores only u32 slot indices — no refcounted pointers — so it can never cause a UAF / double
+// free; the worst a bug here can do is point at the wrong slot, which is why every probe HIT is
+// reconfirmed with `lin_string_key_eq` before it is trusted, and the fuzz/oracle test asserts
+// agreement with a linear scan on every key including absent ones.
+
+/// FNV-1a over the key bytes. Cheap, good enough distribution for short string keys.
+#[inline]
+unsafe fn hash_key(key: *const LinString) -> u64 {
+    if key.is_null() {
+        return 0;
+    }
+    let len = (*key).len as usize;
+    let data = (*key).data.as_ptr();
+    let bytes = std::slice::from_raw_parts(data, len);
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+unsafe fn index_table_layout(cap: u32) -> Layout {
+    Layout::from_size_align_unchecked(
+        std::mem::size_of::<u32>() * cap as usize,
+        std::mem::align_of::<u32>(),
+    )
+}
+
+/// Free the index table (if any) and reset the index fields to "none". Called on release and
+/// whenever the table must be discarded (it is cheap to rebuild lazily from `entries`).
+#[inline]
+unsafe fn free_index(obj: *mut LinObject) {
+    if !(*obj).index.is_null() {
+        std::alloc::dealloc((*obj).index as *mut u8, index_table_layout((*obj).index_cap));
+        (*obj).index = std::ptr::null_mut();
+        (*obj).index_cap = 0;
+    }
+    (*obj).index_dirty = 0;
+}
+
+/// Choose a power-of-two table capacity giving a load factor <= ~0.7 for `len` live entries
+/// (with headroom so a few post-build appends don't immediately force a rebuild).
+#[inline]
+fn index_cap_for(len: u32) -> u32 {
+    // Target capacity ~= 2 * len, rounded up to a power of two, min 16.
+    let want = (len as u64).saturating_mul(2).max(16);
+    let mut cap: u32 = 16;
+    while (cap as u64) < want {
+        cap <<= 1;
+    }
+    cap
+}
+
+/// Insert `slot` (an entry index) into the open-addressing table for its key. Assumes the table
+/// has room (load factor kept < 1 by `index_cap_for`). Linear probing on a power-of-two table.
+#[inline]
+unsafe fn index_insert(table: *mut u32, cap: u32, key: *const LinString, slot: u32) {
+    let mask = (cap - 1) as u64;
+    let mut i = hash_key(key) & mask;
+    loop {
+        let cell = table.add(i as usize);
+        if *cell == 0 {
+            *cell = slot + 1;
+            return;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+/// (Re)build the hash index from the current `entries`. One O(n) pass. Frees any prior table.
+unsafe fn rebuild_index(obj: *mut LinObject) {
+    let len = (*obj).len;
+    free_index(obj);
+    let cap = index_cap_for(len);
+    let table = alloc(index_table_layout(cap)) as *mut u32;
+    // alloc does not zero — explicitly clear (0 = empty).
+    std::ptr::write_bytes(table, 0, cap as usize);
+    for slot in 0..len {
+        let entry = (*obj).entries.add(slot as usize);
+        index_insert(table, cap, (*entry).key, slot);
+    }
+    (*obj).index = table;
+    (*obj).index_cap = cap;
+    (*obj).index_dirty = 0;
+}
+
+/// Probe the index for `key`. Returns the matching entry slot, or `u32::MAX` if absent.
+/// Caller must have ensured the index is built and clean. Reconfirms each probe hit with
+/// `lin_string_key_eq` (the index stores hash-derived positions; collisions must be verified).
+#[inline]
+unsafe fn index_probe(obj: *const LinObject, key: *const LinString) -> u32 {
+    let table = (*obj).index;
+    let cap = (*obj).index_cap;
+    let mask = (cap - 1) as u64;
+    let mut i = hash_key(key) & mask;
+    loop {
+        let cell = *table.add(i as usize);
+        if cell == 0 {
+            return u32::MAX; // empty slot ⇒ key not present
+        }
+        let slot = cell - 1;
+        let entry = (*obj).entries.add(slot as usize);
+        if lin_string_key_eq((*entry).key, key) {
+            return slot;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+/// Ensure a usable index exists for a lookup: build (or rebuild if dirty) when the object is at
+/// or above the threshold. `obj` is logically const for a lookup, but the lazy build mutates the
+/// index fields (which are not observable through the assoc-list API), so we take `*mut`.
+/// Returns true if the index is now usable (so the caller should probe), false to fall back to
+/// the linear scan (small object, or a zero-length table edge case).
+#[inline]
+unsafe fn ensure_index(obj: *mut LinObject) -> bool {
+    if (*obj).len < HASH_INDEX_THRESHOLD {
+        return false;
+    }
+    if (*obj).index.is_null() || (*obj).index_dirty != 0 {
+        rebuild_index(obj);
+    }
+    !(*obj).index.is_null()
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn lin_object_alloc(initial_cap: u32) -> *mut LinObject {
     // Honor the caller's exact capacity hint (codegen passes the literal's field count for the
@@ -93,6 +239,10 @@ pub unsafe extern "C" fn lin_object_alloc(initial_cap: u32) -> *mut LinObject {
     (*ptr).cap = cap;
     (*ptr).flags = FLAG_INLINE;
     (*ptr).entries = inline_entries_ptr(ptr);
+    // No hash index yet — built lazily on the first lookup past the threshold.
+    (*ptr).index = std::ptr::null_mut();
+    (*ptr).index_cap = 0;
+    (*ptr).index_dirty = 0;
     ptr
 }
 
@@ -200,17 +350,31 @@ pub unsafe extern "C" fn lin_object_set(obj: *mut LinObject, key: *mut LinString
     // Null pointer represents the null Json value — use a local null TaggedVal instead.
     let val_ref: &TaggedVal = if val.is_null() { &null_tv } else { &*val };
     let len = (*obj).len;
-    // Check if key already exists.
-    for i in 0..len {
-        let entry = (*obj).entries.add(i as usize);
-        if lin_string_key_eq((*entry).key, key) {
-            // Update existing entry: release old value, copy new, retain new.
-            // The caller is responsible for releasing the new key they passed in.
-            release_tagged_payload(&(*entry).value);
-            std::ptr::copy_nonoverlapping(val_ref, &mut (*entry).value, 1);
-            retain_tagged_payload(val_ref);
-            return;
+    // Check if key already exists — via the O(1) index when available, else a linear scan.
+    // (Using the index here is what turns a build-by-repeated-`set` from O(n²) into O(n):
+    // the dup-check is otherwise the second linear scan per insert.)
+    let existing_slot = if ensure_index(obj) {
+        index_probe(obj, key)
+    } else {
+        let mut found = u32::MAX;
+        for i in 0..len {
+            let entry = (*obj).entries.add(i as usize);
+            if lin_string_key_eq((*entry).key, key) {
+                found = i;
+                break;
+            }
         }
+        found
+    };
+    if existing_slot != u32::MAX {
+        // Update existing entry: release old value, copy new, retain new.
+        // The caller is responsible for releasing the new key they passed in. The index
+        // is unaffected (same key, same slot).
+        let entry = (*obj).entries.add(existing_slot as usize);
+        release_tagged_payload(&(*entry).value);
+        std::ptr::copy_nonoverlapping(val_ref, &mut (*entry).value, 1);
+        retain_tagged_payload(val_ref);
+        return;
     }
     // New key — grow if needed.
     let cap = (*obj).cap;
@@ -237,6 +401,31 @@ pub unsafe extern "C" fn lin_object_set(obj: *mut LinObject, key: *mut LinString
     // Retain the value's inner payload — the object now owns a reference.
     retain_tagged_payload(val_ref);
     (*obj).len = len + 1;
+    // Maintain the hash index for the appended slot (no-op if no index is built yet — the
+    // first lookup past the threshold will build it from scratch). Slot indices are stable
+    // across an entries realloc (only the buffer base moves), so the table survives a grow.
+    index_after_append(obj, key, len);
+}
+
+/// Maintain the hash index after appending an entry at `slot` with key `key`. If no index is
+/// built, do nothing (it will be built lazily). If the appended slot would push the load factor
+/// too high, mark the index dirty so the next lookup rebuilds a larger table; otherwise insert
+/// the single new slot in O(1).
+#[inline]
+unsafe fn index_after_append(obj: *mut LinObject, key: *const LinString, slot: u32) {
+    if (*obj).index.is_null() {
+        return;
+    }
+    if (*obj).index_dirty != 0 {
+        return; // already scheduled for rebuild
+    }
+    // Keep load factor < ~0.7: rebuild (lazily) once live count exceeds 0.7 * cap.
+    let live = slot + 1; // new len
+    if (live as u64) * 10 >= (*obj).index_cap as u64 * 7 {
+        (*obj).index_dirty = 1;
+        return;
+    }
+    index_insert((*obj).index, (*obj).index_cap, key, slot);
 }
 
 /// Append a field for a statically-known-distinct key, with the SAME ownership semantics as
@@ -281,6 +470,9 @@ pub unsafe extern "C" fn lin_object_set_fresh(obj: *mut LinObject, key: *mut Lin
     // Retain the value's inner payload — the object now owns a reference.
     retain_tagged_payload(val_ref);
     (*obj).len = len + 1;
+    // Maintain the index if one was lazily built mid-construction (rare for this path, which
+    // is mostly used by the literal-construction fast path before any lookup happens).
+    index_after_append(obj, key, len);
 }
 
 /// Append an entry taking OWNERSHIP of an already-owned `key` and `value` (no retain). The
@@ -305,6 +497,8 @@ pub unsafe fn object_push_owned(obj: *mut LinObject, key: *mut LinString, value:
     (*slot).key = key;
     (*slot).value = value;
     (*obj).len = len + 1;
+    // Deep-copy path: keep any built index consistent (cheap O(1) insert / lazy rebuild).
+    index_after_append(obj, key, len);
 }
 
 /// Get a field value as a pointer to TaggedVal. Returns null if key not found.
@@ -312,6 +506,16 @@ pub unsafe fn object_push_owned(obj: *mut LinObject, key: *mut LinString, value:
 pub unsafe extern "C" fn lin_object_get(obj: *const LinObject, key: *const LinString) -> *const TaggedVal {
     if obj.is_null() {
         return std::ptr::null();
+    }
+    // Large objects: lazily build/probe the O(1) hash index. The build mutates only the
+    // (non-observable) index cache fields, so the const→mut cast is sound. Below the threshold
+    // (or a degenerate empty table) we keep the linear scan — faster for tiny N, no allocation.
+    if ensure_index(obj as *mut LinObject) {
+        let slot = index_probe(obj, key);
+        if slot == u32::MAX {
+            return std::ptr::null();
+        }
+        return &(*(*obj).entries.add(slot as usize)).value;
     }
     let len = (*obj).len;
     for i in 0..len {
@@ -479,6 +683,9 @@ unsafe fn lin_string_key_eq(a: *const LinString, b: *const LinString) -> bool {
 #[no_mangle]
 pub unsafe extern "C" fn lin_object_has(obj: *const LinObject, key: *const LinString) -> u8 {
     if obj.is_null() { return 0; }
+    if ensure_index(obj as *mut LinObject) {
+        return (index_probe(obj, key) != u32::MAX) as u8;
+    }
     let len = (*obj).len;
     for i in 0..len {
         let entry = (*obj).entries.add(i as usize);
@@ -695,6 +902,10 @@ pub unsafe extern "C" fn lin_object_release(obj: *mut LinObject) {
                 _ => {} // scalars: no heap payload
             }
         }
+        // Free the hash side-index (if built) BEFORE freeing the object header. The table
+        // holds only u32 slot indices — no refcounted pointers — so there is nothing to
+        // release inside it; just its backing allocation.
+        free_index(obj);
         let cap = (*obj).cap;
         if (*obj).flags & FLAG_INLINE != 0 {
             // Entries live inside the header allocation — one dealloc frees both.
