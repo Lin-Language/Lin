@@ -11740,6 +11740,139 @@ print("${toString(final["a"] + final["b"] + final["c"])}")
     assert_eq!(out, vec!["50035001"]);
 }
 
+// ───────────────────── Arrays of sealed scalar records (Stage 3) ─────────────────────
+// A `MyType[]` of an ALL-SCALAR sealed record is stored as a CONTIGUOUS, UNBOXED, header-less
+// buffer (elem_tag 0xFE), not an array of boxed LinObjects. `arr[i].f` is a constant-stride GEP +
+// scalar load (no per-element box / lin_object_get). See §3.11 / §5 Stage 3.
+
+#[test]
+fn test_sealed_array_construct_index_field_read() {
+    // Construct a Point[] literal, read whole elements and their fields by constant-offset.
+    let out = run(r#"
+import { print } from "std/io"
+type Point = { "x": Int32, "y": Int32 }
+val pts: Point[] = [{ "x": 1, "y": 2 }, { "x": 3, "y": 4 }, { "x": 5, "y": 6 }]
+print("${pts[0]["x"]} ${pts[0]["y"]}")
+print("${pts[1]["x"]} ${pts[2]["y"]}")
+val first = pts[0]
+print("${first["x"] + first["y"]}")
+"#);
+    assert_eq!(out, vec!["1 2", "3 6", "3"]);
+}
+
+#[test]
+fn test_sealed_array_sum_field_via_recursion_and_length() {
+    // Sum a field across the array (fused arr[i].field reads) and read length().
+    let out = run(r#"
+import { print } from "std/io"
+import { length } from "std/array"
+type Point = { "x": Int64, "y": Int64 }
+val pts: Point[] = [{ "x": 10i64, "y": 1i64 }, { "x": 20i64, "y": 2i64 }, { "x": 30i64, "y": 3i64 }]
+val sumX = (arr: Point[], i: Int64, acc: Int64): Int64 =>
+  if i == 3i64 then acc else sumX(arr, i + 1i64, acc + arr[i]["x"])
+print("${sumX(pts, 0i64, 0i64)}")
+print("${length(pts)}")
+"#);
+    assert_eq!(out, vec!["60", "3"]);
+}
+
+#[test]
+fn test_sealed_array_to_json_tostring() {
+    // A sealed array flowing to a Json slot / toString MATERIALIZES a boxed Object[] (the fail-safe
+    // boundary view) and serializes identically to a boxed array of objects.
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Point = { "x": Int32, "y": Int32 }
+val pts: Point[] = [{ "x": 1, "y": 2 }, { "x": 3, "y": 4 }]
+print(toString(pts))
+val j: Json = pts
+print(toString(j))
+"#);
+    assert_eq!(
+        out,
+        vec![
+            r#"[{"x": 1, "y": 2}, {"x": 3, "y": 4}]"#,
+            r#"[{"x": 1, "y": 2}, {"x": 3, "y": 4}]"#,
+        ]
+    );
+}
+
+#[test]
+fn test_sealed_array_equality_same_shape() {
+    // Two sealed arrays of equal shape compare equal (via the materialized tagged view); a differing
+    // element makes them unequal.
+    let out = run(r#"
+import { print } from "std/io"
+type P = { "x": Int32, "y": Int32 }
+val a: P[] = [{ "x": 1, "y": 2 }, { "x": 3, "y": 4 }]
+val b: P[] = [{ "x": 1, "y": 2 }, { "x": 3, "y": 4 }]
+val c: P[] = [{ "x": 1, "y": 2 }, { "x": 9, "y": 4 }]
+print("${a == b}")
+print("${a == c}")
+"#);
+    assert_eq!(out, vec!["true", "false"]);
+}
+
+#[test]
+fn test_sealed_array_in_loop_build_drop() {
+    // Build + read + drop a fresh sealed array each iteration of a non-tail-recursive driver: the
+    // array drop is a single free (scalar-only record). ASan-gated in CI; functional + deterministic
+    // here. (Exercises lin_sealed_array_alloc + per-element struct release + lin_array_release.)
+    let out = run(r#"
+import { print } from "std/io"
+type Point = { "x": Int32, "y": Int32 }
+val build = (i: Int32): Int32 =>
+  val pts: Point[] = [{ "x": i, "y": i + 1 }, { "x": i + 2, "y": i + 3 }]
+  pts[0]["x"] + pts[1]["y"]
+val loop = (i: Int32, acc: Int32): Int32 =>
+  if i == 0 then acc else loop(i - 1, acc + build(i))
+print("${loop(1000, 0)}")
+"#);
+    // sum over i in 1..=1000 of (i + (i+3)) = sum(2i+3) = 2*500500 + 3000 = 1004000.
+    assert_eq!(out, vec!["1004000"]);
+}
+
+#[test]
+fn test_sealed_array_regression_flat_scalar_array_unchanged() {
+    // REGRESSION: a flat scalar Int32[] (NOT a sealed-record array) must keep its flat
+    // representation and behavior — the new SEALED_ARRAY_TAG path must not perturb flat arrays.
+    let out = run(r#"
+import { print } from "std/io"
+import { length } from "std/array"
+val nums: Int32[] = [3, 1, 4, 1, 5, 9]
+print("${nums[0]} ${nums[5]} ${length(nums)}")
+val sum = (a: Int32[], i: Int32, acc: Int32): Int32 =>
+  if i == length(a) then acc else sum(a, i + 1, acc + a[i])
+print("${sum(nums, 0, 0)}")
+"#);
+    assert_eq!(out, vec!["3 9 6", "23"]);
+}
+
+#[test]
+fn test_sealed_array_regression_heap_field_records_stay_boxed() {
+    // A `Person[]` where Person has a STRING field is NOT a Stage-3 sealed-scalar array (heap-field
+    // element → deferred to Stage 3b), so it stays a boxed Object[] and must still index/serialize
+    // correctly. This proves the fail-safe gate keeps heap-field element arrays on the boxed path.
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Person = { "name": String, "age": Int32 }
+val ps: Person[] = [{ "name": "ann", "age": 30 }, { "name": "bob", "age": 41 }]
+print("${ps[0]["name"]} ${ps[0]["age"]}")
+print("${ps[1]["name"]} ${ps[1]["age"]}")
+print(toString(ps))
+"#);
+    assert_eq!(
+        out,
+        vec![
+            "ann 30",
+            "bob 41",
+            r#"[{"name": "ann", "age": 30}, {"name": "bob", "age": 41}]"#
+        ]
+    );
+}
+
 /// Regression (LIN_ISSUES #2): a top-level mutable `var` in an IMPORTED module, mutated by an
 /// EXPORTED function, used to panic codegen ("Binary: undefined lhs temp Temp(0)") because the
 /// import lowering never set up the module global / its initialiser — the exported mutator
