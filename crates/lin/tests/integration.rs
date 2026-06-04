@@ -11116,3 +11116,147 @@ print("extra=${wide["extra"]}")
         vec!["named=3", "fromAnon=9", "wide=30", "eq=true", "extra=99"]
     );
 }
+
+// ───────────────────────── Sealed records — Stage 1 ─────────────────────────
+// Unboxed packed-struct layout + constant-offset field access for sealed all-scalar record
+// types. See SEALED_RECORDS_DESIGN.md §3 (semantics matrix) and §5 (Stage 1).
+
+#[test]
+fn test_sealed_scalar_construct_and_field_read() {
+    // (a) Construct a sealed all-scalar record and read every field — correct values via the
+    // constant-offset unboxed-struct path.
+    let out = run(r#"
+import { print } from "std/io"
+type Point3 = { "x": Int32, "y": Int32, "z": Float64 }
+val p: Point3 = { "x": 10, "y": 20, "z": 1.5 }
+print("${p["x"]} ${p["y"]} ${p["z"]}")
+print("${p["x"] + p["y"]}")
+"#);
+    assert_eq!(out, vec!["10 20 1.5", "30"]);
+}
+
+#[test]
+fn test_sealed_boundary_projection_drops_extras_source_untouched() {
+    // (b) A wider Json/anonymous literal with an EXTRA field passed to a sealed-scalar param: the
+    // param sees only its own fields (extras dropped in the projecting copy), and the ORIGINAL
+    // keeps its extra outside the call (non-mutating projection).
+    let out = run(r#"
+import { print } from "std/io"
+type Vec2 = { "a": Int32, "b": Int32 }
+val sumv = (v: Vec2): Int32 => v["a"] + v["b"]
+val wide = { "a": 3, "b": 4, "extra": 99 }
+print("${sumv(wide)}")
+print("${wide["extra"]}")
+print("${wide["a"]}")
+"#);
+    assert_eq!(out, vec!["7", "99", "3"]);
+}
+
+#[test]
+fn test_sealed_to_json_roundtrip_prints() {
+    // (c) A sealed value flowing into a Json slot materializes a boxed object that prints/serializes
+    // correctly (sealed → Json boundary).
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Pair = { "lo": Int32, "hi": Int32 }
+val p: Pair = { "lo": 7, "hi": 42 }
+val j: Json = p
+print(toString(j))
+print("${j["lo"]} ${j["hi"]}")
+"#);
+    assert_eq!(out, vec![r#"{"lo": 7, "hi": 42}"#, "7 42"]);
+}
+
+#[test]
+fn test_sealed_eq_same_shape_as_json_is_true() {
+    // (d) Equality is order-independent and crosses representations: a sealed value equals a
+    // same-shape boxed Json/anonymous value, and two sealed values of the same type compare
+    // field-wise.
+    let out = run(r#"
+import { print } from "std/io"
+type P = { "x": Int32, "y": Int32 }
+val a: P = { "x": 1, "y": 2 }
+val b: P = { "x": 1, "y": 2 }
+val c: P = { "x": 9, "y": 2 }
+val anon = { "x": 1, "y": 2 }
+print("${a == b}")
+print("${a == c}")
+print("${a == anon}")
+print("${anon == a}")
+"#);
+    assert_eq!(out, vec!["true", "false", "true", "true"]);
+}
+
+#[test]
+fn test_sealed_in_match_is_arm() {
+    // (e) A sealed record narrowed in a match/`is` arm: field reads on the narrowed binding work.
+    let out = run(r#"
+import { print } from "std/io"
+type Cmd = { "kind": Int32, "arg": Int32 }
+val describe = (c: Json): String =>
+  match c
+    is Cmd => "cmd ${c["kind"]}/${c["arg"]}"
+    else => "other"
+val x: Cmd = { "kind": 2, "arg": 5 }
+print(describe(x))
+print(describe({ "kind": 7, "arg": 8 }))
+print(describe(42))
+"#);
+    assert_eq!(out, vec!["cmd 2/5", "cmd 7/8", "other"]);
+}
+
+#[test]
+fn test_sealed_regression_string_field_stays_boxed() {
+    // (f) REGRESSION: a named record with a NON-scalar (String) field is NOT a sealed-scalar
+    // record — it keeps the boxed LinObject path and behaves exactly as before. An anonymous
+    // all-scalar literal (unsealed) likewise stays boxed (it is never struct-laid-out).
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Named = { "id": Int32, "name": String }
+val n: Named = { "id": 1, "name": "ada" }
+print("${n["id"]} ${n["name"]}")
+val nn: Named = { "id": 1, "name": "ada" }
+print("${n == nn}")
+// An anonymous all-scalar literal: unsealed, stays boxed; field read + extra all still work.
+val anon = { "p": 3, "q": 4, "r": 5 }
+print("${anon["p"] + anon["q"] + anon["r"]}")
+print(toString(n))
+"#);
+    assert_eq!(out, vec!["1 ada", "true", "12", r#"{"id": 1, "name": "ada"}"#]);
+}
+
+#[test]
+fn test_sealed_captured_by_closure() {
+    // A sealed scalar record CAPTURED by a closure: the env owns it (retained on capture) and
+    // releases it via the sealed self-sized release on closure teardown — NOT lin_object_release
+    // (which would mis-walk the packed struct). ASan-gated in the asan CI job; here we check the
+    // functional result.
+    let out = run(r#"
+import { print } from "std/io"
+type Point = { "x": Int32, "y": Int32 }
+val makeGetter = (): Int32 =>
+  val p: Point = { "x": 3, "y": 4 }
+  val getX = (): Int32 => p["x"] + p["y"]
+  getX()
+print("${makeGetter()}")
+"#);
+    assert_eq!(out, vec!["7"]);
+}
+
+#[test]
+fn test_sealed_transferred_across_async_boundary() {
+    // A sealed scalar record captured into an `async` thunk crosses the share-nothing thread
+    // boundary by a deep byte-copy (CAP_SEALED) and rematerializes on the worker. ASan/TSan-gated
+    // in CI; functional check here.
+    let out = run(r#"
+import { print } from "std/io"
+import { async, await } from "std/async"
+type Point = { "x": Int32, "y": Int32 }
+val p: Point = { "x": 5, "y": 6 }
+val job = async(() => p["x"] + p["y"])
+print("${await(job)}")
+"#);
+    assert_eq!(out, vec!["11"]);
+}

@@ -1131,6 +1131,28 @@ impl<'ctx> Codegen<'ctx> {
                             temp_map.insert(*dst, result);
                         }
                         Instruction::MakeObject { dst, fields, spreads, ty } => {
+                            // Sealed scalar record (Stage 1): allocate the packed struct and store
+                            // each scalar field by offset — no string keys, no per-field box. Only
+                            // a no-spread literal whose field set EXACTLY matches the type qualifies
+                            // (a spread would add unknown fields → keep boxed; the checker only
+                            // produces a sealed literal type when the fields line up). If a field
+                            // value is missing (shouldn't happen for a well-typed sealed literal),
+                            // fall through to the boxed path for safety.
+                            if let Some(sf) = Self::sealed_scalar_fields(ty) {
+                                let all_present = spreads.is_empty()
+                                    && sf.keys().all(|k| fields.iter().any(|(fk, _)| fk == k));
+                                if all_present {
+                                    let field_vals: Vec<(String, BasicValueEnum<'ctx>, Type)> = fields.iter().filter_map(|(k, t)| {
+                                        temp_map.get(t).map(|v| {
+                                            let vty = func.temp_types.get(t).cloned().unwrap_or(Type::Null);
+                                            (k.clone(), *v, vty)
+                                        })
+                                    }).collect();
+                                    let obj = self.sealed_construct(sf, &field_vals);
+                                    temp_map.insert(*dst, obj);
+                                    continue;
+                                }
+                            }
                             // Right-size the capacity. For a plain (no-spread) literal the final
                             // size is exactly the field count (after de-duplicating literal keys,
                             // below). With spreads the final size is unknown (spread sources add
