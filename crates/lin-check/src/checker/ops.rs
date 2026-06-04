@@ -8,17 +8,27 @@ use crate::types::Type;
 use crate::widen::widen_numeric;
 
 impl Checker {
-    /// If `cand` is a bare integer literal and `other` has a concrete integer type T, re-type
-    /// `cand` to T (spec §21). Errors if the literal value doesn't fit T's range. `op_span` is
-    /// used for the error location. No-op when `cand` isn't an `IntLit` or `other` isn't a
-    /// concrete integer type.
+    /// If `cand` is a *suffixless* integer literal and `other` has a concrete integer type T,
+    /// re-type `cand` to T (spec §21). Errors if the literal value doesn't fit T's range.
+    /// `op_span` is used for the error location. No-op when `cand` isn't an `IntLit`, was
+    /// explicitly suffixed (`cand_suffixed`), or `other` isn't a concrete integer type.
+    ///
+    /// The suffix guard is load-bearing. A literal whose width was chosen EXPLICITLY (e.g.
+    /// `1000003i64`) must NOT be re-typed to match the other operand — otherwise `x * 1000003i64`
+    /// with `x: Int32` re-types the `i64` literal DOWN to Int32, the multiply overflows at Int32,
+    /// and only the result is widened to Int64 (a silent overflow). A suffixless literal still
+    /// adopts the operand's (possibly narrower) width, e.g. `a + 5` with `a: UInt8` (spec §21).
     pub(crate) fn retype_literal_operand(
         &mut self,
         cand: &mut TypedExpr,
         other: &TypedExpr,
+        cand_suffixed: bool,
         op_span: Span,
     ) -> Result<(), Diagnostic> {
-        if let TypedExpr::IntLit(v, _, lit_span) = cand {
+        if cand_suffixed {
+            return Ok(());
+        }
+        if let TypedExpr::IntLit(v, _cur_ty, lit_span) = cand {
             let target = other.ty();
             // Only re-type against a concrete integer width (not Int32-default unless the
             // other side genuinely is Int32; widening to the same width is harmless).
@@ -56,17 +66,22 @@ impl Checker {
         // sides share a width. This avoids a width mismatch between the checker's result type
         // and the value codegen produces. For shifts, only the LEFT operand drives the result
         // type, so we only re-type a literal LEFT against a concrete-int RIGHT.
+        // An explicit numeric suffix (e.g. `1000003i64`) PINS the literal's type; such a
+        // literal must never be re-typed to match the other operand (which could narrow it and
+        // overflow). A suffixless literal still adopts the operand's width.
+        let left_suffixed = matches!(left, Expr::IntLit(_, Some(_), _));
+        let right_suffixed = matches!(right, Expr::IntLit(_, Some(_), _));
         let (mut typed_left, mut typed_right) = (typed_left, typed_right);
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
             | BinOp::BAnd | BinOp::BOr | BinOp::BXor => {
-                self.retype_literal_operand(&mut typed_left, &typed_right, span)?;
-                self.retype_literal_operand(&mut typed_right, &typed_left, span)?;
+                self.retype_literal_operand(&mut typed_left, &typed_right, left_suffixed, span)?;
+                self.retype_literal_operand(&mut typed_right, &typed_left, right_suffixed, span)?;
             }
             BinOp::Shl | BinOp::Shr => {
                 // Only the left operand's type matters for the result; retype a literal LEFT
                 // against a concrete-int RIGHT. A literal RIGHT (shift count) stays Int32.
-                self.retype_literal_operand(&mut typed_left, &typed_right, span)?;
+                self.retype_literal_operand(&mut typed_left, &typed_right, left_suffixed, span)?;
             }
             _ => {}
         }

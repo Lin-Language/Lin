@@ -6686,6 +6686,29 @@ print(toString(x + 1i64))
 }
 
 #[test]
+fn test_mixed_int32_int64_arithmetic_widens_int32_operand() {
+    // Regression (LIN_ISSUES #3): `x * 1000003i64` where `x: Int32` used to compute the
+    // product in Int32 (overflowing to -194043216) and only THEN widen the result to Int64.
+    // The `i64` literal operand was being re-typed DOWN to Int32 to match `x` before the op.
+    // A mixed Int32 * Int64 op must now widen the Int32 operand to Int64 so the arithmetic
+    // happens at Int64. Cover both operand orders, +, and -. Pure-Int32 arithmetic must STILL
+    // wrap (semantics unchanged): 90000 * 50000 = 4_500_000_000 wraps to 205032704 in Int32.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val run = (): Null =>
+  val x = 90000
+  val mulR: Int64 = x * 1000003i64
+  val mulL: Int64 = 1000003i64 * x
+  val add: Int64 = x + 3000000000i64
+  val sub: Int64 = 5000000000i64 - x
+  val pureI32 = 90000 * 50000
+  print("${toString(mulR)} ${toString(mulL)} ${toString(add)} ${toString(sub)} ${toString(pureI32)}")
+run()
+"#);
+    assert_eq!(out, vec!["90000270000 90000270000 3000090000 4999910000 205032704"]);
+}
+
+#[test]
 fn test_int64_annotation_preserves_large_literal() {
     // The annotation route to the same value: `: Int64` gives the literal Int64 context.
     let out = run(r#"import { print } from "std/io"
