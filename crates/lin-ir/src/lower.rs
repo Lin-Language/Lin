@@ -75,6 +75,19 @@ pub fn lower_module_with_imports(
     for stmt in &module.statements {
         collect_mutable_capture_slots_stmt(stmt, &mut ctx.mutable_cell_slots);
     }
+    // Pre-scan for owning-typed `var` slots reassigned inside an `if`/`match` branch — these also
+    // become heap cells (a plain SSA temp can't release-old / merge ownership across the join).
+    {
+        let mut owning_vars: HashMap<usize, Type> = HashMap::new();
+        for stmt in &module.statements {
+            collect_branch_reassigned_var_slots_stmt(
+                stmt,
+                false,
+                &mut owning_vars,
+                &mut ctx.branch_reassigned_var_slots,
+            );
+        }
+    }
 
     // Top-level non-function vals AND top-level vars become module globals so closures can
     // read them (closures can't see `main`'s SSA temps). A top-level `var` additionally needs
@@ -270,6 +283,18 @@ pub fn lower_import_module_with_imports(
     for stmt in &module.statements {
         collect_mutable_capture_slots_stmt(stmt, &mut ctx.mutable_cell_slots);
     }
+    // Branch-reassigned owning-`var` pre-scan (heap cells) — same as the main lowering.
+    {
+        let mut owning_vars: HashMap<usize, Type> = HashMap::new();
+        for stmt in &module.statements {
+            collect_branch_reassigned_var_slots_stmt(
+                stmt,
+                false,
+                &mut owning_vars,
+                &mut ctx.branch_reassigned_var_slots,
+            );
+        }
+    }
 
     // Resolve this module's OWN imports/foreign bindings into the slot maps so function
     // bodies can call them. We run the relevant arms of `lower_stmt` against a throwaway
@@ -404,6 +429,15 @@ struct LowerCtx {
     /// heap cells (MakeCell) shared by reference; reads/writes go through CellGet/CellSet
     /// and closures capture the cell pointer (ADR-015).
     mutable_cell_slots: std::collections::HashSet<usize>,
+    /// `var` slots of an OWNING (rc/union) type that are REASSIGNED inside conditional control
+    /// flow (an `if`/`match` branch). A plain SSA temp cannot model release-old-on-overwrite and
+    /// per-branch ownership across a join: the superseded initial value leaks on the taken branch
+    /// and the slot can dangle / double-free. So — like a mutably-captured var — these are routed
+    /// through a heap CELL (MakeCell/CellGet/CellSet), which RELEASES the old value on each write
+    /// and reads the current value coherently after the join. Scalars and straight-line-only
+    /// reassignments stay on the plain-SSA fast path. (Module-global vars handle this via the
+    /// global slot and are excluded.)
+    branch_reassigned_var_slots: std::collections::HashSet<usize>,
     /// Top-level non-function `val` slots (with their type). These are emitted as LLVM
     /// globals so closures — which can't see `main`'s SSA temps — can read them.
     global_val_slots: HashMap<usize, Type>,
@@ -456,6 +490,15 @@ struct AdapterSpec {
 }
 
 impl LowerCtx {
+    /// True if `slot` should be lowered as a heap CELL rather than a plain SSA temp: either it is
+    /// mutably captured by a closure (ADR-015) or it is an owning-typed `var` reassigned inside a
+    /// branch (release-old + post-join coherence). A top-level (module-global) var is excluded —
+    /// it is handled through its module global slot, which is already join-coherent.
+    fn slot_is_cell(&self, slot: usize) -> bool {
+        self.mutable_cell_slots.contains(&slot)
+            || (self.branch_reassigned_var_slots.contains(&slot) && !self.global_var_slots.contains(&slot))
+    }
+
     fn new() -> Self {
         Self {
             functions: Vec::new(),
@@ -467,6 +510,7 @@ impl LowerCtx {
             import_fn_slots: HashMap::new(),
             import_val_slots: HashMap::new(),
             mutable_cell_slots: std::collections::HashSet::new(),
+            branch_reassigned_var_slots: std::collections::HashSet::new(),
             global_val_slots: HashMap::new(),
             default_adapters: HashMap::new(),
             pending_adapters: Vec::new(),
@@ -832,7 +876,16 @@ impl FuncBuilder {
     /// beyond the first unless the extras are released — so keep each temp's FIRST occurrence and
     /// RELEASE the rest. (Mirrors `pop_scope_releasing_keep`.)
     fn pop_scope_releasing(&mut self, keep: Temp) {
-        let keep = self.expand_keep_for_escape(&[keep]);
+        self.pop_scope_releasing_keep_transfer(&[keep]);
+    }
+
+    /// Like `pop_scope_releasing` but keeps SEVERAL survivors (the block result PLUS any outer
+    /// `var` slots reassigned inside the block, whose freshly-owned temp must transfer up to the
+    /// enclosing scope rather than be released at the block boundary). Each kept temp transfers
+    /// EXACTLY ONE reference (the first occurrence) and is re-registered owned in the parent
+    /// scope so the parent — or a containing `if`/match merge — releases it exactly once.
+    fn pop_scope_releasing_keep_transfer(&mut self, keep: &[Temp]) {
+        let keep = self.expand_keep_for_escape(keep);
         if let Some(frame) = self.scope_owned.pop() {
             let mut kept: Vec<(Temp, Type)> = Vec::new();
             for (t, ty) in frame {
@@ -915,6 +968,50 @@ impl FuncBuilder {
     /// would be unreachable / handled by the terminating construct.
     fn discard_scope(&mut self) {
         self.scope_owned.pop();
+    }
+
+    /// Snapshot the plain SSA var-slot → (temp, type) bindings before lowering a branch. Excludes
+    /// heap-cell slots (their `slots` entry is a stable cell pointer — reassignment goes through
+    /// the cell, not by rebinding the slot) and global var slots (read/written through the module
+    /// global, so reassignment is already join-coherent). What remains is exactly the set of slots
+    /// whose value lives in a function-local SSA temp that a branch can rebind — the slots that
+    /// need a join phi if mutated. Vals never reassign, so although vals are included here they
+    /// can never be detected as "reassigned" and so never get a (harmless) phi.
+    fn plain_var_slot_snapshot(&self, ctx: &LowerCtx) -> Vec<(usize, Temp, Type)> {
+        self.slots
+            .iter()
+            .filter(|(slot, _)| {
+                !self.cell_slots.contains_key(*slot) && !ctx.global_var_slots.contains(*slot)
+            })
+            .map(|(slot, temp)| {
+                let ty = self.temp_types.get(temp).cloned().unwrap_or(Type::Null);
+                (*slot, *temp, ty)
+            })
+            .collect()
+    }
+
+    /// Given a pre-branch slot snapshot, return the slots whose `slots` entry the branch REBOUND
+    /// to a different temp (i.e. a `var` reassigned inside the branch), as (slot, new temp).
+    fn collect_reassigned_slots(&self, pre: &[(usize, Temp, Type)], ctx: &LowerCtx) -> Vec<(usize, Temp)> {
+        pre.iter()
+            .filter_map(|(slot, old_temp, _)| {
+                if self.cell_slots.contains_key(slot) || ctx.global_var_slots.contains(slot) {
+                    return None;
+                }
+                match self.slots.get(slot) {
+                    Some(new_temp) if new_temp != old_temp => Some((*slot, *new_temp)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Restore the plain var-slot bindings captured by `plain_var_slot_snapshot` so a sibling
+    /// branch lowers against the pre-if slot temps rather than the previous branch's rebindings.
+    fn restore_plain_var_slots(&mut self, pre: &[(usize, Temp, Type)]) {
+        for (slot, temp, _) in pre {
+            self.slots.insert(*slot, *temp);
+        }
     }
 
     fn is_current_block_terminated(&self) -> bool {
@@ -1095,6 +1192,131 @@ fn lower_container_base_borrowed_check(object: &TypedExpr, ctx: &LowerCtx) -> bo
 
 /// Collect `var` slots that are mutably captured by any (possibly nested) closure within
 /// a statement. Such slots are stored as heap cells shared by reference.
+/// Collect `var` slots of an OWNING (rc/union) type that are reassigned INSIDE an `if`/`match`
+/// branch. Such a var cannot be a plain SSA temp (release-old-on-overwrite and per-branch join
+/// ownership are unrepresentable — the superseded initial value leaks on the taken branch and the
+/// slot can dangle), so it is routed through a heap cell (which handles release-old + coherent
+/// post-join reads). We record the declared type of every `var` we descend past so that when a
+/// reassignment to it is seen inside a branch we can tell whether it needs owning. Nested function
+/// bodies are NOT descended into here: their `var`s have their own slot namespace and their own
+/// pre-scan; a capture of an OUTER var becomes a cell via the capture analysis instead.
+fn collect_branch_reassigned_var_slots_stmt(
+    stmt: &TypedStmt,
+    in_branch: bool,
+    owning_vars: &mut HashMap<usize, Type>,
+    out: &mut std::collections::HashSet<usize>,
+) {
+    match stmt {
+        TypedStmt::Var { slot, ty, value, .. } => {
+            if needs_owning(ty) {
+                owning_vars.insert(*slot, ty.clone());
+            }
+            collect_branch_reassigned_var_slots_expr(value, in_branch, owning_vars, out);
+        }
+        TypedStmt::Val { value, .. } => {
+            collect_branch_reassigned_var_slots_expr(value, in_branch, owning_vars, out);
+        }
+        TypedStmt::Expr(e) => collect_branch_reassigned_var_slots_expr(e, in_branch, owning_vars, out),
+        TypedStmt::Destructure { value, .. } | TypedStmt::ArrayDestructure { value, .. } => {
+            collect_branch_reassigned_var_slots_expr(value, in_branch, owning_vars, out);
+        }
+        TypedStmt::Import { .. } | TypedStmt::ForeignImport { .. } => {}
+    }
+}
+
+fn collect_branch_reassigned_var_slots_expr(
+    expr: &TypedExpr,
+    in_branch: bool,
+    owning_vars: &mut HashMap<usize, Type>,
+    out: &mut std::collections::HashSet<usize>,
+) {
+    let recur =
+        |e: &TypedExpr, b: bool, ov: &mut HashMap<usize, Type>, o: &mut std::collections::HashSet<usize>| {
+            collect_branch_reassigned_var_slots_expr(e, b, ov, o)
+        };
+    match expr {
+        TypedExpr::LocalSet { slot, value, .. } => {
+            if in_branch && owning_vars.contains_key(slot) {
+                out.insert(*slot);
+            }
+            recur(value, in_branch, owning_vars, out);
+        }
+        // A nested function body owns its own slot namespace; descend with a FRESH owning-var map
+        // and reset the branch flag — its declarations and reassignments are scoped to it.
+        TypedExpr::Function { body, .. } => {
+            let mut inner_owning: HashMap<usize, Type> = HashMap::new();
+            collect_branch_reassigned_var_slots_expr(body, false, &mut inner_owning, out);
+        }
+        TypedExpr::Block { stmts, expr, .. } => {
+            for s in stmts {
+                collect_branch_reassigned_var_slots_stmt(s, in_branch, owning_vars, out);
+            }
+            recur(expr, in_branch, owning_vars, out);
+        }
+        // Reassignments inside ANY branch arm need a cell. The condition/scrutinee runs
+        // unconditionally, but descending it with `in_branch` unchanged is harmless (a reassign in
+        // a condition is itself only sound as a cell anyway).
+        TypedExpr::If { cond, then_br, else_br, .. } => {
+            recur(cond, in_branch, owning_vars, out);
+            recur(then_br, true, owning_vars, out);
+            recur(else_br, true, owning_vars, out);
+        }
+        TypedExpr::Match { scrutinee, arms, .. } => {
+            recur(scrutinee, in_branch, owning_vars, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    recur(g, true, owning_vars, out);
+                }
+                recur(&arm.body, true, owning_vars, out);
+            }
+        }
+        TypedExpr::Call { func, args, .. } => {
+            recur(func, in_branch, owning_vars, out);
+            for a in args {
+                recur(a, in_branch, owning_vars, out);
+            }
+        }
+        TypedExpr::BinaryOp { left, right, .. } => {
+            recur(left, in_branch, owning_vars, out);
+            recur(right, in_branch, owning_vars, out);
+        }
+        TypedExpr::UnaryOp { operand, .. } => recur(operand, in_branch, owning_vars, out),
+        TypedExpr::Coerce { expr, .. } => recur(expr, in_branch, owning_vars, out),
+        TypedExpr::MakeArray { elements, .. } => {
+            for e in elements {
+                recur(e, in_branch, owning_vars, out);
+            }
+        }
+        TypedExpr::MakeObject { fields, spreads, .. } => {
+            for (_, v) in fields {
+                recur(v, in_branch, owning_vars, out);
+            }
+            for s in spreads {
+                recur(s, in_branch, owning_vars, out);
+            }
+        }
+        TypedExpr::Index { object, key, .. } => {
+            recur(object, in_branch, owning_vars, out);
+            recur(key, in_branch, owning_vars, out);
+        }
+        TypedExpr::IndexSet { object, key, value, .. } => {
+            recur(object, in_branch, owning_vars, out);
+            recur(key, in_branch, owning_vars, out);
+            recur(value, in_branch, owning_vars, out);
+        }
+        TypedExpr::FieldGet { object, .. } => recur(object, in_branch, owning_vars, out),
+        TypedExpr::Is { expr, .. } | TypedExpr::Has { expr, .. } => recur(expr, in_branch, owning_vars, out),
+        TypedExpr::StringInterp { parts, .. } => {
+            for p in parts {
+                if let TypedStringPart::Expr(e) = p {
+                    recur(e, in_branch, owning_vars, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn collect_mutable_capture_slots_stmt(stmt: &TypedStmt, out: &mut std::collections::HashSet<usize>) {
     match stmt {
         TypedStmt::Val { value, .. } | TypedStmt::Var { value, .. } => {
@@ -1436,8 +1658,9 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
             }
         }
         TypedStmt::Var { slot, value, ty, .. } => {
-            if ctx.mutable_cell_slots.contains(slot) {
-                // Mutably captured by a closure: store in a heap cell shared by reference.
+            if ctx.slot_is_cell(*slot) {
+                // Mutably captured by a closure, or an owning-typed var reassigned inside a branch:
+                // store in a heap cell shared by reference.
                 // The slot maps to the cell-pointer temp; reads/writes go through it.
                 //
                 // Cell type: a `var x = null` is typed `Null` by the checker even when later
@@ -1760,7 +1983,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             }
         }
 
-        TypedExpr::LocalSet { slot, value, .. } => {
+        TypedExpr::LocalSet { slot, value, ty, .. } => {
             let val_temp = lower_expr(value, builder, ctx);
             // Heap-cell slot: write through the cell so captured closures see the update.
             if let Some(cell_ty) = builder.cell_slots.get(slot).cloned() {
@@ -1850,9 +2073,39 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 // there is no transient box to free and `v` is the raw value itself.
                 return v;
             }
-            builder.slots.insert(*slot, val_temp);
-            // LocalSet returns the value.
-            val_temp
+            // Plain SSA-temp slot (a `var` neither captured into a heap cell nor a module global).
+            // Coerce the value to the slot's DECLARED representation before rebinding: a `var sts:
+            // Json` holds a boxed TaggedVal*, so a concrete reassignment (`sts = groups[g]`, an
+            // unboxed array) must be boxed to match — otherwise a later read (and any join phi over
+            // the slot) sees a raw pointer where a box is expected (type/representation mismatch,
+            // wrong-tag reads). The slot's previous value was registered owned at its definition /
+            // a prior reassignment; this new value becomes the slot's value. The OLD owned
+            // reference is reconciled at the next control-flow join (an enclosing `if`/match merge
+            // drops the superseded registrations — see `merge_var_slots`); within straight-line
+            // code the slot simply advances to the new temp and both end up released at scope exit.
+            if needs_owning(ty) {
+                // The slot must OWN exactly ONE independent reference to its new value: a
+                // reassignment from a BORROWED projection (`sts = groups[g]`, an interior array
+                // pointer the container still owns) would otherwise leave the slot aliasing the
+                // container's element, so releasing the slot at scope exit AND releasing the
+                // container double-frees that element. `coerce_and_own_store` boxes/coerces to the
+                // slot representation and takes a single owned reference (clone the box for unions
+                // / retain in place for concrete rc), reclaiming any transient coercion shell —
+                // mirroring the captured-cell var path. We register that ONE reference and return
+                // the SAME temp as the assignment-expression result: a `var x = e` statement is
+                // value-discarded (it is not consumed/released by an enclosing block result or a
+                // `for` callback-return release, which only act on the BLOCK's final expression),
+                // so the slot and the result safely share the single +1. The slot's single live
+                // owner is reconciled across a branch at the join (`merge_var_slots`).
+                let stored = coerce_and_own_store(val_temp, &value.ty(), ty, builder);
+                builder.register_owned(stored, ty.clone());
+                builder.slots.insert(*slot, stored);
+                return stored;
+            }
+            // Non-owning (scalar) slot: store the coerced value directly.
+            let v = coerce_to_slot_type(val_temp, &value.ty(), ty, builder);
+            builder.slots.insert(*slot, v);
+            v
         }
 
         TypedExpr::BinaryOp { left, op, right, result_type, .. } => {
@@ -1967,12 +2220,36 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 lower_stmt(stmt, builder, ctx);
             }
             let result = lower_expr(expr, builder, ctx);
-            // Release all owned temps in this scope except the result.
-            builder.pop_scope_releasing(result);
-            // Restore outer scope (block-local bindings don't leak).
-            // But keep slots that were already present (var updates).
+            // An OUTER `var` reassigned inside this block (a `LocalSet`) now binds the slot to a
+            // freshly-owned temp registered in THIS block scope. That temp must SURVIVE the block
+            // pop — the slot (an enclosing-scope var) still references it after the block, so
+            // releasing it here would leave the slot dangling (use-after-free on the next read /
+            // at the enclosing scope-exit release). Keep each such slot's current temp across the
+            // pop so its +1 transfers up to the enclosing scope, which owns it from then on
+            // (an enclosing `if`/match merge reconciles it at the join via `merge_var_slots`).
+            let kept_slot_temps: Vec<Temp> = outer_slots
+                .keys()
+                .filter(|k| {
+                    !stmts.iter().any(|s| stmt_defines_slot(s, **k))
+                        && stmts.iter().any(|s| stmt_reassigns_slot(s, **k))
+                })
+                .filter_map(|k| builder.slots.get(k).copied())
+                .collect();
+            let mut keep = kept_slot_temps;
+            keep.push(result);
+            builder.pop_scope_releasing_keep_transfer(&keep);
+            // Restore outer scope (block-local bindings don't leak), but PRESERVE outer slots
+            // the block mutated: a `var` REASSIGNED inside the block (a `LocalSet`, e.g. `if c
+            // then sts = e`) must keep its new value after the block — restoring the pre-block
+            // temp would drop the write. A slot the block locally DEFINES (var/val/destructure)
+            // gets a fresh distinct slot number not present in `outer_slots`, so the only outer
+            // slots reached here are genuine outer bindings; we restore those untouched and keep
+            // any that were reassigned. (`stmt_reassigns_slot` walks nested control flow so a
+            // reassignment buried in an inner `if`/`match` is detected.)
             for (k, v) in &outer_slots {
-                if !stmts.iter().any(|s| stmt_defines_slot(s, *k)) {
+                if !stmts.iter().any(|s| stmt_defines_slot(s, *k))
+                    && !stmts.iter().any(|s| stmt_reassigns_slot(s, *k))
+                {
                     builder.slots.insert(*k, *v);
                 }
             }
@@ -3844,35 +4121,86 @@ fn lower_if(
     // result representation). Defaults to the concrete-rc rule if neither branch falls through.
     let mut merge_owned = is_rc_type(result_type) || is_union_ty(result_type);
 
+    // Snapshot the plain SSA var-slot → temp map BEFORE the branches. A `var` mutated inside a
+    // branch (`LocalSet` for a plain SSA-temp slot, line ~1853) just rebinds `slots[slot]` to a
+    // NEW temp that is only defined inside that branch's block. Without merging, a read of the
+    // slot AFTER the join sees either a temp that doesn't dominate the merge (SSA violation) or
+    // the wrong branch's value — the closure-local-var-in-if bug. We record per-branch which
+    // slots were rebound, then emit join phis below (mirroring the if-result phi). Cells and
+    // global vars are NOT in this set: their `slots` entry is a stable cell pointer / they read
+    // through GlobalValGet, so reassignment is already visible across the join.
+    let pre_slots = builder.plain_var_slot_snapshot(ctx);
+
     // --- then branch ---
     builder.switch_to(then_block);
     builder.push_scope();
     let then_raw = lower_expr(then_br, builder, ctx);
-    if !builder.is_current_block_terminated() {
-        let (then_val, keep, owned) = coerce_if_branch(then_raw, &then_br.ty(), result_type, builder);
+    let mut then_reassigned: Vec<(usize, Temp)> = Vec::new();
+    let mut then_pred = builder.current_block;
+    let then_live = if !builder.is_current_block_terminated() {
+        let (then_val, mut keep, owned) = coerce_if_branch(then_raw, &then_br.ty(), result_type, builder);
         merge_owned = owned;
+        // A slot the branch rebound holds a value registered owned in THIS branch scope (the
+        // LocalSet's value temp). It must survive the branch pop so the join phi can forward it,
+        // so add it to the keep-set: its +1 transfers up to the enclosing scope, where the phi
+        // result becomes the slot's single owner (see below).
+        then_reassigned = builder.collect_reassigned_slots(&pre_slots, ctx);
+        for (_, t) in &then_reassigned {
+            keep.push(*t);
+        }
         builder.pop_scope_releasing_keep(&keep);
+        then_pred = builder.current_block;
         incomings.push((then_val, builder.current_block));
         builder.terminate(Terminator::Jump(merge_block));
+        true
     } else {
         builder.discard_scope();
-    }
+        false
+    };
+    // Restore the slot map to its pre-if state so the else branch sees the ORIGINAL slot temps,
+    // not the then-branch's rebindings (each branch must lower against the pre-if values).
+    builder.restore_plain_var_slots(&pre_slots);
 
     // --- else branch ---
     builder.switch_to(else_block);
     builder.push_scope();
     let else_raw = lower_expr(else_br, builder, ctx);
-    if !builder.is_current_block_terminated() {
-        let (else_val, keep, owned) = coerce_if_branch(else_raw, &else_br.ty(), result_type, builder);
+    let mut else_reassigned: Vec<(usize, Temp)> = Vec::new();
+    let mut else_pred = builder.current_block;
+    let else_live = if !builder.is_current_block_terminated() {
+        let (else_val, mut keep, owned) = coerce_if_branch(else_raw, &else_br.ty(), result_type, builder);
         merge_owned = owned;
+        else_reassigned = builder.collect_reassigned_slots(&pre_slots, ctx);
+        for (_, t) in &else_reassigned {
+            keep.push(*t);
+        }
         builder.pop_scope_releasing_keep(&keep);
+        else_pred = builder.current_block;
         incomings.push((else_val, builder.current_block));
         builder.terminate(Terminator::Jump(merge_block));
+        true
     } else {
         builder.discard_scope();
-    }
+        false
+    };
 
     builder.switch_to(merge_block);
+
+    // Merge any plain `var` slot mutated in a branch with a join phi (the slot now reads the phi
+    // result after the if). For each slot reassigned in EITHER branch, the incoming value is the
+    // branch's rebound temp if it reassigned, otherwise the pre-if temp (the value flowing in
+    // unchanged on that edge). Exactly one phi incoming reference is live at runtime, so the phi
+    // result holds a single +1 the enclosing scope owns; we drop the per-branch and pre-if
+    // registrations and register the phi result once to keep ownership balanced.
+    merge_var_slots(
+        builder,
+        &pre_slots,
+        &then_reassigned,
+        if then_live { Some(then_pred) } else { None },
+        &else_reassigned,
+        if else_live { Some(else_pred) } else { None },
+    );
+
     // Merge the per-branch results with a Phi. (A plain Copy into a shared temp is wrong:
     // the single-pass codegen would let the last-compiled branch's value win for both paths.)
     builder.emit(Instruction::Phi {
@@ -3886,6 +4214,74 @@ fn lower_if(
         builder.register_owned(result_dst, result_type.clone());
     }
     result_dst
+}
+
+/// After both branches of an `if` have jumped to `merge_block`, reconcile any plain SSA `var`
+/// slot that was reassigned in at least one branch by emitting a join phi. `pre_slots` is the
+/// (slot, temp, type) snapshot taken before the branches; `*_reassigned` are the slots each branch
+/// rebound (slot → branch-local temp). `*_pred` is the actual predecessor block at the end of the
+/// branch (it may differ from the branch entry if the branch had nested control flow), or None if
+/// that branch diverged (no edge into the merge — its slot values are unreachable there).
+fn merge_var_slots(
+    builder: &mut FuncBuilder,
+    pre_slots: &[(usize, Temp, Type)],
+    then_reassigned: &[(usize, Temp)],
+    then_pred: Option<BlockId>,
+    else_reassigned: &[(usize, Temp)],
+    else_pred: Option<BlockId>,
+) {
+    // The set of slots needing a join phi = those reassigned in either live branch.
+    use std::collections::HashSet;
+    let mut changed: HashSet<usize> = HashSet::new();
+    if then_pred.is_some() {
+        for (s, _) in then_reassigned {
+            changed.insert(*s);
+        }
+    }
+    if else_pred.is_some() {
+        for (s, _) in else_reassigned {
+            changed.insert(*s);
+        }
+    }
+    if changed.is_empty() {
+        return;
+    }
+    let then_map: std::collections::HashMap<usize, Temp> = then_reassigned.iter().copied().collect();
+    let else_map: std::collections::HashMap<usize, Temp> = else_reassigned.iter().copied().collect();
+    for (slot, pre_temp, ty) in pre_slots {
+        if !changed.contains(slot) {
+            continue;
+        }
+        // Build the phi incomings: the rebound temp on a branch that reassigned, the pre-if temp
+        // on a branch that left the slot alone. Only include an edge if that branch is live
+        // (didn't diverge); if one branch diverged, control reaches the merge solely via the other
+        // edge and a single-incoming phi is correct.
+        let mut incomings: Vec<(Temp, BlockId)> = Vec::new();
+        if let Some(tp) = then_pred {
+            incomings.push((then_map.get(slot).copied().unwrap_or(*pre_temp), tp));
+        }
+        if let Some(ep) = else_pred {
+            incomings.push((else_map.get(slot).copied().unwrap_or(*pre_temp), ep));
+        }
+        let phi_dst = builder.alloc_temp(ty.clone());
+        builder.emit(Instruction::Phi { dst: phi_dst, ty: ty.clone(), incomings });
+        // The pre-if value and each branch-rebound value were registered owned in the enclosing
+        // scope (the pre-if init / read, plus each branch's kept LocalSet value transferred up).
+        // After the join exactly ONE of them is live, reachable only as the phi result — so drop
+        // those individual registrations and register the phi as the slot's single owner.
+        if needs_owning(ty) {
+            builder.unregister_owned(*pre_temp);
+            if let Some(&t) = then_map.get(slot) {
+                builder.unregister_owned(t);
+            }
+            if let Some(&t) = else_map.get(slot) {
+                builder.unregister_owned(t);
+            }
+            builder.register_owned(phi_dst, ty.clone());
+        }
+        // The slot now reads the merged phi after the if.
+        builder.slots.insert(*slot, phi_dst);
+    }
 }
 
 /// Lower a short-circuiting `&&` / `||` (spec §8) as branch + merge + Phi, so the RHS is
@@ -5283,6 +5679,80 @@ fn stmt_defines_slot(stmt: &TypedStmt, slot: usize) -> bool {
         TypedStmt::Destructure { obj_slot, fields, .. } => {
             *obj_slot == slot || fields.iter().any(|(_, s, _)| *s == slot)
         }
+        _ => false,
+    }
+}
+
+/// True if the statement REASSIGNS `slot` (a `var x = ...` reassignment, i.e. a `LocalSet`)
+/// anywhere within it, including inside nested control flow / sub-expressions. Used by `Block`
+/// lowering to decide whether an outer slot's value was mutated inside the block and so must
+/// PERSIST after the block — as opposed to a block-local definition, whose binding is restored.
+/// Without this, a reassignment of an outer plain-SSA `var` inside a block (e.g. `if c then sts =
+/// e`) was reverted to the pre-block temp on block exit, dropping the write (the closure-local-
+/// `var`-mutated-in-`if` bug).
+fn stmt_reassigns_slot(stmt: &TypedStmt, slot: usize) -> bool {
+    match stmt {
+        TypedStmt::Val { value, .. } | TypedStmt::Var { value, .. } => expr_reassigns_slot(value, slot),
+        TypedStmt::Expr(e) => expr_reassigns_slot(e, slot),
+        TypedStmt::Destructure { value, .. } | TypedStmt::ArrayDestructure { value, .. } => {
+            expr_reassigns_slot(value, slot)
+        }
+        TypedStmt::Import { .. } | TypedStmt::ForeignImport { .. } => false,
+    }
+}
+
+fn expr_reassigns_slot(expr: &TypedExpr, slot: usize) -> bool {
+    match expr {
+        TypedExpr::LocalSet { slot: s, value, .. } => *s == slot || expr_reassigns_slot(value, slot),
+        // A nested function body has its OWN slot namespace; a reassignment of the SAME outer
+        // slot inside it is a captured-`var` mutation handled through the cell, not a plain-SSA
+        // rebind of the enclosing block's slot — so do not recurse into nested functions here.
+        TypedExpr::Function { .. } => false,
+        TypedExpr::Block { stmts, expr, .. } => {
+            stmts.iter().any(|s| stmt_reassigns_slot(s, slot)) || expr_reassigns_slot(expr, slot)
+        }
+        TypedExpr::If { cond, then_br, else_br, .. } => {
+            expr_reassigns_slot(cond, slot)
+                || expr_reassigns_slot(then_br, slot)
+                || expr_reassigns_slot(else_br, slot)
+        }
+        TypedExpr::Match { scrutinee, arms, .. } => {
+            expr_reassigns_slot(scrutinee, slot)
+                || arms.iter().any(|arm| {
+                    arm.guard.as_ref().is_some_and(|g| expr_reassigns_slot(g, slot))
+                        || expr_reassigns_slot(&arm.body, slot)
+                })
+        }
+        TypedExpr::Call { func, args, .. } => {
+            expr_reassigns_slot(func, slot) || args.iter().any(|a| expr_reassigns_slot(a, slot))
+        }
+        TypedExpr::BinaryOp { left, right, .. } => {
+            expr_reassigns_slot(left, slot) || expr_reassigns_slot(right, slot)
+        }
+        TypedExpr::UnaryOp { operand, .. } => expr_reassigns_slot(operand, slot),
+        TypedExpr::Coerce { expr, .. } => expr_reassigns_slot(expr, slot),
+        TypedExpr::MakeArray { elements, .. } => elements.iter().any(|e| expr_reassigns_slot(e, slot)),
+        TypedExpr::MakeObject { fields, spreads, .. } => {
+            fields.iter().any(|(_, v)| expr_reassigns_slot(v, slot))
+                || spreads.iter().any(|s| expr_reassigns_slot(s, slot))
+        }
+        TypedExpr::Index { object, key, .. } => {
+            expr_reassigns_slot(object, slot) || expr_reassigns_slot(key, slot)
+        }
+        TypedExpr::IndexSet { object, key, value, .. } => {
+            expr_reassigns_slot(object, slot)
+                || expr_reassigns_slot(key, slot)
+                || expr_reassigns_slot(value, slot)
+        }
+        TypedExpr::FieldGet { object, .. } => expr_reassigns_slot(object, slot),
+        TypedExpr::Is { expr, .. } | TypedExpr::Has { expr, .. } => expr_reassigns_slot(expr, slot),
+        TypedExpr::StringInterp { parts, .. } => parts.iter().any(|p| {
+            if let TypedStringPart::Expr(e) = p {
+                expr_reassigns_slot(e, slot)
+            } else {
+                false
+            }
+        }),
         _ => false,
     }
 }
