@@ -29,12 +29,76 @@ target/debug/lin test benchmarks/compare/raptor/lin/
 
 ## Modules
 
-`service.lin`, `timeParser.lin`, `dateUtil.lin`, `queueFactory.lin`,
-`routeScanner.lin`, `scanResults.lin`, `raptor.lin` (RaptorAlgorithm + factory),
-`journeyFactory.lin`, `filter.lin` (MultipleCriteriaFilter), `query.lin`
-(GroupStation/DepartAfter/Range), `graphResults.lin`, `stringResults.lin`,
-`roundKeys.lin` (shared numeric round-key sort), plus `testutil.lin`
-(t/st/tf/j/setDefaultTrip + trip-ignoring deep journey equality).
+`types.lin` (shared named record/union types), `service.lin`, `timeParser.lin`,
+`dateUtil.lin`, `queueFactory.lin`, `routeScanner.lin`, `scanResults.lin`,
+`raptor.lin` (RaptorAlgorithm + factory), `journeyFactory.lin`, `filter.lin`
+(MultipleCriteriaFilter), `query.lin` (GroupStation/DepartAfter/Range),
+`graphResults.lin`, `stringResults.lin`, `roundKeys.lin` (shared numeric
+round-key sort), plus `testutil.lin` (t/st/tf/j/setDefaultTrip + trip-ignoring
+deep journey equality).
+
+## Typed records (what's typed, what stays `Json`, and why)
+
+The fixed-shape data is now expressed with **named record + union types**
+(`types.lin`), mirroring the reference TypeScript types — the port is no longer
+100% `Json`. The dynamic-key MAP structures must stay `Json` until the
+accepted-but-unimplemented `{ String: T }` map type lands (see
+`docs/proposals/typed-map-index-signature.md`).
+
+**Types introduced (`types.lin`):** `Date`, `StopTime`, `Service`, `Trip`,
+`Transfer`, `TimetableLeg`, `Leg = Transfer | TimetableLeg`, `Journey`.
+
+**Actively threaded through code:**
+
+- `Date` — `parseDate(): Date`, `getDateNumber`/`dayOfWeek`/`addDay` take/return
+  `Date` (`dateUtil.lin`); the live query path is `date: Date`
+  (`query.lin`: `planDepartAfter`/`planGroup`/`planRange`/`getJourneys`/`searchDay`).
+- `Service` — `makeService(): Service`, `runsOn(service: Service, …)`
+  (`service.lin`); the `days`/`dates` fields stay `Json` (dynamic-key indexes).
+- `StopTime` + `Transfer` — typed leaf constructors `makeStopTime`/`makeTransfer`
+  (`gtfsLoader.lin`) build fully-typed sealed records from the CSV row scalars.
+
+**Left `Json` at the map / union-narrowing boundaries (the real signal for the
+map-type work):**
+
+- All the dictionaries: `kConnections`, `kArrivals`, `bestArrivals`,
+  `routeStopIndex`, `routesAtStop`, `tripsByRoute`, `routePath`, and the loader's
+  intermediate maps (`datesList`, `transfers`, `interchange`, `servicesSorted`, …).
+- `Trip`/`Journey`/`Leg`/`TimetableLeg` values **as consumed**: every one of them
+  is read out of the `kConnections` `Json` map (or a `Json[]` built from it) and
+  inspected via a boolean field-test (`isTransfer`/`isTimetableLeg`) followed by
+  field/index access — the calc-parser idiom. Lin does **not** narrow a union (or
+  refine `Json`) across a plain boolean guard, so these consumers
+  (`journeyFactory.lin`, `graphResults.lin`, `stringResults.lin`, `run.lin`,
+  `filter.lin`) stay `Json`. The `Leg`/`TimetableLeg`/`Journey` types are kept in
+  `types.lin` as the reference shapes for when the map type lets the maps — and
+  therefore their typed values — be expressed.
+
+**Type-system friction found (useful for the map-type / narrowing work):**
+
+1. A bare `Json`-typed binding does **not** flow into a named-record parameter
+   (`getDateNumber(jsonVal)` is rejected `?T … expected Date`). Only a `Json`
+   *literal* or a `Json` *scalar-index* (`row[i]`) coerces on the spot into a
+   concrete `String`/`Int32` field/param — composite `Json` (`stopTimes`,
+   `service`) does not, which is exactly why trips/journeys built from `Json`-map
+   sources can't be typed today.
+2. The `if`-expression form does **not** narrow a `T | Null` named-record union to
+   `T` — neither `if x != null`, `if x is Null then … else`, nor `if x is T`
+   refines it. Only a `match … is Null / is T` narrows. `raptor.lin`'s optional
+   date pre-filter therefore uses a `match` (not the original `if date != null`)
+   to get `Date | Null` down to `Date`; the branch is dead in practice (every
+   caller passes `null`) but it now type-checks cleanly.
+
+**Sealed-record / unboxed status:** the concrete records (`Date`, `StopTime`,
+`Transfer`) are sealed-eligible at the type level, but **codegen still ignores the
+`sealed` marker** — `crates/lin-codegen/src/codegen/types.rs` (Stage 0.5) lowers
+every object, sealed or not, to the boxed string-keyed `LinObject`. So typing
+these records is currently a **fidelity** win (and a latent perf win once the
+sealed-record codegen stage lands), not yet a measured speedup; runtime behaviour
+is byte-for-byte identical, which is why the gate is unchanged.
+
+**Gate after typing:** unit tests still 9/9 pass; `run.lin` still builds and
+prints `RESULT dep=29400 arr=40680 legs=3 count=1` on the full feed.
 
 ## Design
 
