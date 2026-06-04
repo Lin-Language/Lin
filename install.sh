@@ -7,7 +7,10 @@
 # Environment overrides:
 #   LIN_LIB_DIR   where the three co-located files go   (default: /usr/local/lib/lin)
 #   LIN_BIN_DIR   where the `lin` symlink is placed      (default: /usr/local/bin)
-#   LIN_VERSION   release tag to install                 (default: latest)
+#   LIN_VERSION   release tag to install                 (default: newest stable release)
+#                 e.g. "1.2.0" or "v1.2.0" both resolve to tag v1.2.0.
+#                 Unset or "latest" installs the newest stable (non-prerelease)
+#                 release — NOT the rolling `latest` bleeding-edge prerelease.
 
 set -eu
 
@@ -78,14 +81,26 @@ if need_sudo_for "$LIB_DIR" || need_sudo_for "$BIN_DIR"; then
 fi
 
 # ---- download -------------------------------------------------------------
-url="https://github.com/${REPO}/releases/download/${VERSION}/${artifact}.tar.gz"
+# By default (LIN_VERSION unset or "latest") resolve GitHub's newest *stable*
+# release via the /releases/latest redirect, which skips prereleases (so the
+# rolling `latest` bleeding-edge prerelease is intentionally NOT installed).
+# An explicit version resolves to the tag v<X.Y.Z>, accepting both "1.2.0" and
+# "v1.2.0".
+if [ -z "${LIN_VERSION:-}" ] || [ "$VERSION" = "latest" ]; then
+  release_label="newest stable release"
+  url="https://github.com/${REPO}/releases/latest/download/${artifact}.tar.gz"
+else
+  release_label="v${VERSION#v}"
+  url="https://github.com/${REPO}/releases/download/v${VERSION#v}/${artifact}.tar.gz"
+fi
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
-info "downloading ${artifact} (${VERSION})"
+info "downloading ${artifact} (${release_label})"
 if ! curl -fSL --progress-bar "$url" -o "$tmp/lin.tar.gz"; then
   error "download failed: $url
-       (check the release exists and you have network access)"
+       (check that a stable release exists for ${release_label} and you have network access.
+        Set LIN_VERSION=vX.Y.Z to pin a specific stable release.)"
 fi
 
 info "extracting"
