@@ -170,7 +170,11 @@ but a documented divergence worth a lint or a defined `Json` numeric-coercion ru
 
 ## 7. [CORRECTNESS] multi-line `if/else` is unparseable inside parentheses (one parser bug)
 
-**Severity: high — the parser rejects valid, canonical Lin.**
+**Severity: high — the parser rejects valid, canonical Lin. RESOLVED** — fixed by
+anchoring the inline `if`-branch offside floor on the indentation of the line the `if`
+sits on (new `line_start_column()`), not the `if` keyword's column. Regression test
+`test_if_else_wrapped_inside_parens_parses_and_round_trips` both runs the program and
+round-trips it through `lin fmt`. The RAPTOR `lin/` dir is now `lin fmt`-clean.
 
 A **wrapped (multi-line) `if … then <newline> A <newline> else <newline> B`** expression
 fails to parse with `unexpected token Else` when it appears **inside parentheses** — e.g.
@@ -219,6 +223,5 @@ non-reparseable output has a hole: it evidently doesn't cover a wrapped `if/else
 parenthesized closure, so adding such a fixture would have caught this and will guard the
 fix.
 
-NOTE: the committed RAPTOR `lin/` files are intentionally NOT `lin fmt`-clean, because
-running the formatter over them trips this parser bug. Fix #7 (the parser) before
-formatting that directory (and before relying on CI's `fmt --check` over `benchmarks/`).
+RESOLVED: the parser fix landed and the RAPTOR `lin/` dir has been `lin fmt`-cleaned;
+CI's `fmt --check` over `benchmarks/` now passes.

@@ -11,7 +11,6 @@
 //
 // In Lin a missing object key reads as `null`, a present `false` reads as `false`, so
 // `dates[d] == null` is exactly `!hasOwn`, and `dates[d] == true` is the include short-circuit.
-
 export val makeService = (startDate: Int32, endDate: Int32, days: Json, dates: Json): Json =>
   {
     "startDate": startDate,
@@ -28,7 +27,4 @@ export val runsOn = (service: Json, date: Int32, dow: Int32): Boolean =>
   else
     val notAKey = entry == null
     val days = service["days"]
-    notAKey
-      && service["startDate"] <= date
-      && service["endDate"] >= date
-      && days["${dow}"] == true
+    notAKey && service["startDate"] <= date && service["endDate"] >= date && days["${dow}"] == true

@@ -55,15 +55,17 @@ val indexOfColumns = (header: Json): Json =>
 val forEachRow = (path: String, onRow: (Json, Json) => Json): Json =>
   var colIndex: Json = {}
   var headerDone = false
-  readStream(path).lines().for(line =>
-    if length(line) > 0 then
-      val fields = split(line, ",")
-      if headerDone == false then
-        colIndex = indexOfColumns(fields)
-        headerDone = true
-      else
-        onRow(fields, colIndex)
-  )
+  readStream(path)
+    .lines()
+    .for(line =>
+      if length(line) > 0 then
+        val fields = split(line, ",")
+        if headerDone == false then
+          colIndex = indexOfColumns(fields)
+          headerDone = true
+        else
+          onRow(fields, colIndex)
+    )
 
 // Binary search a list of { "key": String, ... } sorted ascending by "key".
 // Returns the matching record or null.
@@ -138,7 +140,7 @@ export val loadGTFS = (dataDir: String): Json =>
       "6": row[cc["saturday"]] == "1"
     }
     val dRec = bsearch(datesSorted, serviceId)
-    val d = if dRec != null then dRec["dates"] else {}
+    val d = if dRec != null then dRec["dates"] else {  }
     val service = makeService(parseInt32(row[cc["start_date"]]), parseInt32(row[cc["end_date"]]), days, d)
     push(serviceList, { "key": serviceId, "service": service })
   )

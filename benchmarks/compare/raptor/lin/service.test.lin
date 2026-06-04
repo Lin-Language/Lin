@@ -2,25 +2,30 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { makeService, runsOn } from "./service"
 
 val allDays = {
-  "0": true, "1": true, "2": true, "3": true,
-  "4": true, "5": true, "6": true
+  "0": true,
+  "1": true,
+  "2": true,
+  "3": true,
+  "4": true,
+  "5": true,
+  "6": true
 }
 
 val s = suite("Service", [
   test("checks the start date", () => [
-    expect(runsOn(makeService(20181001, 20181015, allDays, {}), 20180930, 1)).toBe(false)
+    expect(runsOn(makeService(20181001, 20181015, allDays, {  }), 20180930, 1)).toBe(false)
   ]),
 
   test("checks the end date", () => [
-    expect(runsOn(makeService(20181001, 20181015, allDays, {}), 20181016, 1)).toBe(false)
+    expect(runsOn(makeService(20181001, 20181015, allDays, {  }), 20181016, 1)).toBe(false)
   ]),
 
   test("checks dates within range", () => [
-    expect(runsOn(makeService(20181001, 20181015, allDays, {}), 20181010, 1)).toBe(true)
+    expect(runsOn(makeService(20181001, 20181015, allDays, {  }), 20181010, 1)).toBe(true)
   ]),
 
   test("checks the day of the week", () => [
-    expect(runsOn(makeService(20181001, 20991231, { ...allDays, "1": false }, {}), 20181016, 1)).toBe(false)
+    expect(runsOn(makeService(20181001, 20991231, { ...allDays, "1": false }, {  }), 20181016, 1)).toBe(false)
   ]),
 
   test("checks include days", () => [

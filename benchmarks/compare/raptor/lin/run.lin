@@ -38,8 +38,7 @@ val sortJourneys = (journeys: Json): Json =>
     var inserted = false
     var out: Json = []
     sorted.for(x =>
-      if inserted == false && (j["departureTime"] < x["departureTime"]
-          || (j["departureTime"] == x["departureTime"] && j["arrivalTime"] < x["arrivalTime"])) then
+      if inserted == false && (j["departureTime"] < x["departureTime"] || j["departureTime"] == x["departureTime"] && j["arrivalTime"] < x["arrivalTime"]) then
         push(out, j)
         inserted = true
       push(out, x)
@@ -60,15 +59,21 @@ val main = (): Null =>
   val journeys = sortJourneys(journeysRaw)
 
   journeys.for(journey =>
-    print("JOURNEY dep=${fmt(journey["departureTime"])} arr=${fmt(journey["arrivalTime"])} legs=${length(journey["legs"])}")
+    print(
+      "JOURNEY dep=${fmt(journey["departureTime"])} arr=${fmt(journey["arrivalTime"])} legs=${length(journey["legs"])}"
+    )
     journey["legs"].for(leg =>
       if isTimetableLeg(leg) then
         val sts = leg["stopTimes"]
         val first = sts[0]
         val last = sts[length(sts) - 1]
-        print("  ${first["stop"]} ${fmt(first["departureTime"])} -> ${last["stop"]} ${fmt(last["arrivalTime"])}")
+        print(
+          "  ${first["stop"]} ${fmt(first["departureTime"])} -> ${last["stop"]} ${fmt(last["arrivalTime"])}"
+        )
       else
-        print("  TRANSFER ${leg["origin"]} -> ${leg["destination"]} (${leg["duration"]}s)")
+        print(
+          "  TRANSFER ${leg["origin"]} -> ${leg["destination"]} (${leg["duration"]}s)"
+        )
     )
   )
 
@@ -78,17 +83,16 @@ val main = (): Null =>
   var bestIdx = -1
   var idx = 0
   journeys.for(journey =>
-    if bestIdx < 0
-        || journey["arrivalTime"] < journeys[bestIdx]["arrivalTime"]
-        || (journey["arrivalTime"] == journeys[bestIdx]["arrivalTime"]
-            && length(journey["legs"]) < length(journeys[bestIdx]["legs"])) then
+    if bestIdx < 0 || journey["arrivalTime"] < journeys[bestIdx]["arrivalTime"] || journey["arrivalTime"] == journeys[bestIdx]["arrivalTime"] && length(journey["legs"]) < length(journeys[bestIdx]["legs"]) then
       bestIdx = idx
     idx = idx + 1
   )
 
   if bestIdx >= 0 then
     val best = journeys[bestIdx]
-    print("RESULT dep=${best["departureTime"]} arr=${best["arrivalTime"]} legs=${length(best["legs"])} count=${length(journeys)}")
+    print(
+      "RESULT dep=${best["departureTime"]} arr=${best["arrivalTime"]} legs=${length(best["legs"])} count=${length(journeys)}"
+    )
   else
     print("RESULT dep=0 arr=0 legs=0 count=0")
 
