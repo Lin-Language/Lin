@@ -1,0 +1,55 @@
+// Shared named record + union types for the RAPTOR port.
+//
+// These mirror the reference TypeScript types (planarnetwork/raptor:
+// src/gtfs/GTFS.ts, src/gtfs/Service.ts, src/results/Journey.ts). Lin type
+// aliases live in one module and are imported where needed (§22.3 ADR-053).
+//
+// FIXED-SHAPE records are typed here; the DYNAMIC-KEY map structures
+// (kConnections, kArrivals, routeStopIndex, routesAtStop, bestArrivals,
+// tripsByRoute, routePath, the loader's intermediate maps, and the
+// Service.days/Service.dates indexes) have NO type until the accepted-but-
+// unimplemented `{ String: T }` map type lands (docs/proposals/
+// typed-map-index-signature.md), so they stay `Json`. Where a typed record
+// flows INTO one of those maps or comes OUT via obj[k] it is `Json` at that
+// boundary — only the record-shaped locals are typed.
+//
+// USAGE STATUS (see NOTES.md "Typed records" section for the full map):
+//   ACTIVELY THREADED through code: Date (dateUtil/query/raptor), Service
+//   (service/routeScanner/raptor), StopTime + Transfer (gtfsLoader constructors).
+//   Trip is referenced as the typed field of Service-carrying records but trips
+//   themselves stay `Json` (built from `Json`-map sources). Leg/TimetableLeg/
+//   Journey are REFERENCE-ONLY here: every journey/leg/connection value is read
+//   out of the `kConnections` `Json` map and consumed via a boolean field-test
+//   then field/index access (the calc-parser idiom), which Lin does not narrow —
+//   so those consumers stay `Json` and these types document the intended shape
+//   for when the `{ String: T }` map type lands and the maps can be typed.
+//
+// A calendar date (UTC), modelling the reference's JS Date. month is 1-12,
+// day is 1-31. Fully concrete -> sealed-record unboxed-struct candidate.
+export type Date = { "year": Int32, "month": Int32, "day": Int32 }
+
+// GTFS stop time. Fully concrete -> sealed-record unboxed-struct candidate.
+export type StopTime = { "stop": String, "arrivalTime": Int32, "departureTime": Int32, "pickUp": Boolean, "dropOff": Boolean }
+
+// GTFS calendar service ("runsOn") record. startDate/endDate are YYYYMMDD
+// integers. `days` ({ "<dow>": Bool }) and `dates` ({ "<date>": Bool }) are
+// dynamic-key index maps -> stay `Json` (a record FIELD may be typed `Json`).
+export type Service = { "startDate": Int32, "endDate": Int32, "days": Json, "dates": Json }
+
+// GTFS trip. stopTimes is a typed StopTime[]; service is the typed Service.
+export type Trip = { "tripId": String, "serviceId": String, "stopTimes": StopTime[], "service": Service }
+
+// A footpath / interchange transfer. endTime can be the MAX sentinel
+// (9007199254740991), so it is Int64 (the existing representation).
+export type Transfer = { "origin": String, "destination": String, "duration": Int32, "startTime": Int32, "endTime": Int64 }
+
+// A timetable leg (a ride on a trip between two stops on its path).
+export type TimetableLeg = { "stopTimes": StopTime[], "origin": String, "destination": String, "trip": Trip }
+
+// AnyLeg: a journey leg is either a Transfer or a TimetableLeg. Discriminated
+// structurally — a Transfer has "origin", a TimetableLeg has "stopTimes".
+export type Leg = Transfer | TimetableLeg
+
+// A planned journey. legs is a typed Leg[]; departure/arrival are
+// seconds-from-midnight (may exceed 24h, but fit Int32 for these feeds).
+export type Journey = { "legs": Leg[], "departureTime": Int32, "arrivalTime": Int32 }
