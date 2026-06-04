@@ -93,6 +93,10 @@ pub enum TokenKind {
     RBracket,
     Comma,
     Colon,
+    // `;` — Lin has no semicolons (spec §1.2). Lexed as a distinct token (rather than
+    // falling into the `Ident` catch-all) so the parser can emit an actionable diagnostic
+    // pointing the user at newline-separated statements instead of "Undefined variable ';'".
+    Semicolon,
 
     // String interpolation
     InterpolStart, // ${
