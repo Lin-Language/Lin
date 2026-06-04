@@ -1,0 +1,10 @@
+[package]
+name = "raptor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+indexmap = "2"
+
+# Detach this crate from the parent cargo workspace so `cargo test` works in isolation.
+[workspace]

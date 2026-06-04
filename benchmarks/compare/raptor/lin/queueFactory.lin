@@ -1,0 +1,29 @@
+// raptor/QueueFactory — getQueue.
+//
+// Given marked stops, return an index { routeId -> stopId } of the earliest stop on
+// each route through the marked set. routesAtStop: { stopId -> routeId[] }.
+// routeStopIndex: { routeId -> { stopId -> position } }.
+//
+// Reference: for each stop, for each route at that stop, keep the existing queue entry
+// only if it is strictly earlier than the new stop; otherwise replace with the new stop.
+import { for } from "std/iter"
+
+val isStopBefore = (routeStopIndex: Json, routeId: String, stopA: String, stopB: String): Boolean =>
+  routeStopIndex[routeId][stopA] < routeStopIndex[routeId][stopB]
+
+export val getQueue = (routesAtStop: Json, routeStopIndex: Json, markedStops: Json): Json =>
+  var queue = {}
+  markedStops.for(stop =>
+    val routes = if routesAtStop[stop] == null then [] else routesAtStop[stop]
+    routes.for(routeId =>
+      val existing = queue[routeId]
+      // keep `existing` (no write) if it is strictly earlier on the route; otherwise
+      // set the new stop. (A self-write `queue[routeId] = existing` triggers an aliased
+      // copy_nonoverlapping fault in the runtime — see NOTES.md — so we only write when changing.)
+      if existing != null && isStopBefore(routeStopIndex, routeId, existing, stop) then
+        null
+      else
+        queue[routeId] = stop
+    )
+  )
+  queue

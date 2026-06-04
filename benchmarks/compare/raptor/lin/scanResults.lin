@@ -1,0 +1,65 @@
+// raptor/ScanResults (+Factory) — per-round arrivals + connection index.
+//
+// State record:
+//   { "k": Int, "bestArrivals": { stop -> time }, "kArrivals": { roundStr -> { stop -> time } },
+//     "kConnections": { stop -> { roundStr -> connection } } }
+// A connection is either a Transfer (object with "origin") or [trip, startIndex, endIndex].
+//
+// Round keys are stored as strings ("${k}") because Lin object keys are strings.
+// `k` starts at 0; addRound increments and seeds an empty arrivals map.
+import { for } from "std/iter"
+import { keys } from "std/object"
+
+val MAX = 9007199254740991i64
+
+export val createScanResults = (stops: Json, origins: Json): Json =>
+  var bestArrivals = {}
+  var kArrival0 = {}
+  var kConnections = {}
+  stops.for(stop =>
+    val t = if origins[stop] != null then origins[stop] else MAX
+    bestArrivals[stop] = t
+    kArrival0[stop] = t
+    kConnections[stop] = {}
+  )
+  var kArrivals = {}
+  kArrivals["0"] = kArrival0
+  {
+    "k": 0,
+    "bestArrivals": bestArrivals,
+    "kArrivals": kArrivals,
+    "kConnections": kConnections
+  }
+
+export val addRound = (results: Json): Null =>
+  val k = results["k"] + 1
+  results["k"] = k
+  results["kArrivals"]["${k}"] = {}
+
+export val previousArrival = (results: Json, stop: String): Json =>
+  results["kArrivals"]["${results["k"] - 1}"][stop]
+
+export val setTrip = (results: Json, trip: Json, startIndex: Int32, endIndex: Int32, interchange: Int32): Null =>
+  val time = trip["stopTimes"][endIndex]["arrivalTime"] + interchange
+  val stop = trip["stopTimes"][endIndex]["stop"]
+  val k = results["k"]
+  results["kArrivals"]["${k}"][stop] = time
+  results["bestArrivals"][stop] = time
+  results["kConnections"][stop]["${k}"] = [trip, startIndex, endIndex]
+
+export val setTransfer = (results: Json, transfer: Json, time: Json): Null =>
+  val stop = transfer["destination"]
+  val k = results["k"]
+  results["kArrivals"]["${k}"][stop] = time
+  results["bestArrivals"][stop] = time
+  results["kConnections"][stop]["${k}"] = transfer
+
+export val bestArrival = (results: Json, stop: String): Json =>
+  results["bestArrivals"][stop]
+
+export val getMarkedStops = (results: Json): Json =>
+  keys(results["kArrivals"]["${results["k"]}"])
+
+// finalize returns [kConnections, bestArrivals]
+export val finalize = (results: Json): Json =>
+  [results["kConnections"], results["bestArrivals"]]

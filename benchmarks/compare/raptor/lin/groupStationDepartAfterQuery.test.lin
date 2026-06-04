@@ -1,0 +1,48 @@
+// GroupStationDepartAfterQuery.spec.ts — multi-origin / multi-destination plans
+// with the default MultipleCriteriaFilter applied.
+//
+// planGroup(raptor, origins[], destinations[], date, time, maxSearchDays, filters)
+// takes filters as an array of journey-array transforms; the reference's default
+// filter set is [new MultipleCriteriaFilter()], i.e. our exported `apply`.
+import { expect, toSatisfy, test, suite, run } from "std/test"
+import { t, st, j, setDefaultTrip, journeysEq } from "./testutil"
+import { createRaptor } from "./raptor"
+import { planGroup } from "./query"
+import { apply } from "./filter"
+import { parseDate } from "./dateUtil"
+
+// maxSearchDays = 1, filters = [apply] — mirrors `new GroupStationDepartAfterQuery(raptor, jf, 1, filters)`.
+val plan = (trips: Json, origins: Json, destinations: Json, dateStr: String, time: Int32): Json =>
+  val raptor = createRaptor(trips, {}, {}, null)
+  val result = planGroup(raptor, origins, destinations, parseDate(dateStr), time, 1, [apply])
+  setDefaultTrip(result)
+  result
+
+val s = suite("GroupStationDepartAfterQuery", [
+  test("plans to multiple destinations", () => [
+    expect(plan(
+      [
+        t([st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)]),
+        t([st("A", null, 1200), st("B", 1230, 1235), st("D", 1300, null)])
+      ],
+      ["A"], ["C", "D"], "2019-04-18", 900
+    )).toSatisfy(r => journeysEq(r, [
+      j([[st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)]]),
+      j([[st("A", null, 1200), st("B", 1230, 1235), st("D", 1300, null)]])
+    ]))
+  ]),
+
+  test("plans from multiple origins", () => [
+    expect(plan(
+      [
+        t([st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)]),
+        t([st("A", null, 1200), st("_", 1230, 1235), st("D", 1300, null)])
+      ],
+      ["A", "B"], ["C", "D"], "2019-04-18", 900
+    )).toSatisfy(r => journeysEq(r, [
+      j([[st("B", 1030, 1035), st("C", 1100, null)]]),
+      j([[st("A", null, 1200), st("_", 1230, 1235), st("D", 1300, null)]])
+    ]))
+  ])
+])
+run(s)
