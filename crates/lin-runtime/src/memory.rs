@@ -99,6 +99,10 @@ unsafe fn release_captures(env_ptr: *mut u8, cap_desc: *const u8) {
             3 => crate::object::lin_object_release(word as *mut crate::object::LinObject),
             4 => lin_closure_release(word),
             5 => crate::tagged::lin_tagged_release(word),
+            // 7 Sealed: a captured sealed scalar record (packed struct). Release via its self-sized
+            // release (reads the byte size from the struct's offset-4 header); NEVER lin_object_release
+            // (that would walk the struct as a LinObject — heap-buffer-overflow, ASan-caught).
+            7 => crate::sealed::lin_sealed_release_self(word),
             // 6 Move: a MOVED resource (Stream) was HANDED OFF to a worker — the LOCAL closure
             // must NOT release it (the worker's `release_env_copy` owns + releases it). Falls to
             // the no-op arm deliberately. (If a moved-capture closure is ever torn down WITHOUT a

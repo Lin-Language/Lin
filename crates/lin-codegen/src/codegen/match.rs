@@ -123,6 +123,34 @@ impl<'ctx> Codegen<'ctx> {
             }
             return val;
         }
+        // ── Sealed scalar-record boundaries (sealed-records Stage 1) ──────────────────────
+        // Order matters: handle sealed→X and X→sealed BEFORE the generic union arms, because a
+        // sealed Object is not `is_union_type` but DOES need a representation conversion.
+        let from_sealed = Self::sealed_scalar_fields(from_ty).is_some();
+        let to_sealed = Self::sealed_scalar_fields(to_ty).is_some();
+        if to_sealed {
+            // PROJECTION: a wider/Json/unsealed/other-sealed source → a fresh sealed struct.
+            // Non-mutating; the source keeps its own ownership (released by its own scope).
+            if let Some(target_fields) = Self::sealed_scalar_fields(to_ty) {
+                // Clone so the borrow checker is happy (target_fields borrows self via to_ty).
+                let tf = target_fields.clone();
+                return self.sealed_project_from(val, from_ty, &tf);
+            }
+        }
+        if from_sealed {
+            // MATERIALIZATION: a sealed struct → boxed LinObject (the Json/unsealed representation),
+            // then box to a union/Json TaggedVal if the target is union/Json.
+            if let Some(src_fields) = Self::sealed_scalar_fields(from_ty) {
+                let sf = src_fields.clone();
+                let obj = self.sealed_materialize_to_object(val, &sf);
+                if Self::is_union_type(to_ty) {
+                    // Box the fresh LinObject* as TAG_OBJECT. The +1 of the materialized object
+                    // transfers into the box's inner; the box itself is +1 owned.
+                    return self.box_value(obj, &Type::object(sf));
+                }
+                return obj;
+            }
+        }
         // Box to union. Use heap boxing (lin_box_*) rather than a stack alloca, because
         // a coerced value may escape its defining function (returned, stored in an array,
         // captured) — a stack TaggedVal would dangle.

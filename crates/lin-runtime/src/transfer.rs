@@ -38,6 +38,56 @@ unsafe fn clone_string(s: *const LinString) -> *mut LinString {
     fresh
 }
 
+/// Deep-copy a sealed record (sealed-records Stages 1–2). Share-nothing: allocate a fresh struct of
+/// the same byte `size` (read from offset 4) carrying the same field descriptor (offset 8), copy the
+/// field bytes verbatim (this gets every SCALAR field right in one move), then — for each HEAP field
+/// listed in the descriptor — OVERWRITE its pointer slot with a DEEP CLONE of the payload (string →
+/// clone_string, array → clone_array, nested sealed → clone_sealed recursively). The verbatim copy
+/// would otherwise leave a heap slot ALIASING the source's payload (a cross-thread share, which the
+/// transfer model forbids); replacing each heap slot with a fresh +1 clone makes the copy disjoint.
+/// The fresh struct has refcount 1 (set by `lin_sealed_alloc`); each cloned heap field is +1 owned.
+unsafe fn clone_sealed(src: *const u8) -> *mut u8 {
+    if src.is_null() {
+        return std::ptr::null_mut();
+    }
+    let size = *((src as *const u32).add(1)) as usize;
+    let desc = *((src.add(8)) as *const *const u8);
+    let fresh = crate::sealed::lin_sealed_alloc(size, desc);
+    // Copy the field payload (everything past the 16-byte header). Scalars are now correct; heap
+    // field slots currently ALIAS the source — fixed below. The header's rc/size/desc on `fresh`
+    // are already correct from the alloc.
+    if size > crate::sealed::SEALED_HEADER {
+        std::ptr::copy_nonoverlapping(
+            src.add(crate::sealed::SEALED_HEADER),
+            fresh.add(crate::sealed::SEALED_HEADER),
+            size - crate::sealed::SEALED_HEADER,
+        );
+    }
+    // Deep-clone each heap field, replacing the aliased pointer with a private +1 copy.
+    if !desc.is_null() {
+        let count = *(desc as *const u32);
+        let entries = desc.add(4);
+        for i in 0..count as usize {
+            let ent = entries.add(i * 8);
+            let offset = *(ent as *const u32) as usize;
+            let kind = *((ent.add(4)) as *const u32);
+            let slot = fresh.add(offset) as *mut *mut u8;
+            let payload = *slot;
+            if payload.is_null() {
+                continue;
+            }
+            let cloned: *mut u8 = match kind {
+                crate::sealed::KIND_STRING => clone_string(payload as *const LinString) as *mut u8,
+                crate::sealed::KIND_ARRAY => clone_array(payload as *const LinArray) as *mut u8,
+                crate::sealed::KIND_SEALED => clone_sealed(payload as *const u8),
+                _ => payload,
+            };
+            *slot = cloned;
+        }
+    }
+    fresh
+}
+
 /// Deep-copy a `LinArray`, flat or tagged. Flat scalar arrays copy their raw buffer; tagged
 /// arrays recursively transfer each element.
 pub(crate) unsafe fn clone_array(src: *const LinArray) -> *mut LinArray {
@@ -140,6 +190,11 @@ pub const CAP_TAGGED: u8 = 5; // *mut TaggedVal (boxed Json/union) — deep-copy
 /// for this slot (its scope release is suppressed by the IR), and the worker's `release_env_copy`
 /// releases it via `lin_tagged_release` (TAG_STREAM finalizer). Mirrors `ir::CaptureRelease::Move`.
 pub const CAP_MOVE: u8 = 6;
+/// SEALED scalar record (sealed-records Stage 1): a packed `[u32 rc | u32 size | scalars]` struct
+/// (NOT a `LinObject`). Deep-copied across a thread boundary by a flat byte copy of `size` bytes
+/// (all fields are scalars, no inner heap to clone) and released via `lin_sealed_release_self`
+/// (reads the size from offset 4). Mirrors `ir::CaptureRelease::Sealed`.
+pub const CAP_SEALED: u8 = 7;
 
 /// Deep-copy a closure env allocation given its capture descriptor `desc` (a static read-only
 /// `{u32 count, u8 kinds[]}` global from the closure's offset-40 slot). `env_ptr` layout:
@@ -164,6 +219,7 @@ pub unsafe fn transfer_clone_env(env_ptr: *const u8, desc: *const u8) -> *mut u8
             CAP_ARRAY => clone_array(src_word as *const LinArray) as u64,
             CAP_OBJECT => clone_object(src_word as *const LinObject) as u64,
             CAP_TAGGED => lin_transfer_clone(src_word as *const u8) as u64,
+            CAP_SEALED => clone_sealed(src_word as *const u8) as u64,
             // CAP_MOVE: hand the resource pointer off VERBATIM — no clone, no retain. The source
             // env will not release this slot (the IR suppresses its scope release); the worker's
             // `release_env_copy` releases it, so the fd closes exactly once, on the worker.
@@ -195,6 +251,7 @@ pub unsafe fn release_env_copy(env_ptr: *mut u8, desc: *const u8, env_size: u64)
                 CAP_OBJECT => crate::object::lin_object_release(word as *mut LinObject),
                 CAP_CLOSURE => crate::memory::lin_closure_release(word as *mut u8),
                 CAP_TAGGED => crate::tagged::lin_tagged_release(word as *mut u8),
+                CAP_SEALED => crate::sealed::lin_sealed_release_self(word as *mut u8),
                 // CAP_MOVE: the worker OWNS the moved resource — release it here (TAG_STREAM
                 // finalizer closes the fd exactly once, on the worker thread).
                 CAP_MOVE => crate::tagged::lin_tagged_release(word as *mut u8),

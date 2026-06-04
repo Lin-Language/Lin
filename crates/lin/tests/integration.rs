@@ -11327,6 +11327,419 @@ print(describe(null))
     assert_eq!(out, vec!["ok=9", "null"]);
 }
 
+// Stage 0.5 sealed-records run-equivalence: a NAMED record type now carries an (inert) `sealed`
+// marker through resolution, while anonymous object literals do not. This test proves the marker
+// is BEHAVIOR-INERT: a named-typed value and a structurally-equal anonymous literal still
+// inter-operate exactly as before — assign across in BOTH directions, pass into the named param
+// position, read fields, and compare equal (including a WIDER literal with an extra field, which
+// structural compatibility still permits). See SEALED_RECORDS_DESIGN.md §5 (Stage 0.5).
+#[test]
+fn test_sealed_marker_is_inert_named_vs_anonymous_interop() {
+    let out = run(r#"
+import { print } from "std/io"
+type Point = { "x": Int32, "y": Int32 }
+
+val dist = (p: Point): Int32 => p["x"] + p["y"]
+
+// A named-typed binding.
+val named: Point = { "x": 1, "y": 2 }
+// An anonymous literal whose inferred (unsealed) type still flows into a named Point slot.
+val fromAnon: Point = { "x": 4, "y": 5 }
+// A WIDER anonymous literal (extra field) is still structurally compatible at the param.
+val wide = { "x": 10, "y": 20, "extra": 99 }
+
+print("named=${dist(named)}")
+print("fromAnon=${dist(fromAnon)}")
+print("wide=${dist(wide)}")
+// Equality holds across a named value and an anonymous literal of identical fields.
+val anon = { "x": 1, "y": 2 }
+print("eq=${named == anon}")
+// The wider value keeps its extra field outside the call (source is untouched).
+print("extra=${wide["extra"]}")
+"#);
+    assert_eq!(
+        out,
+        vec!["named=3", "fromAnon=9", "wide=30", "eq=true", "extra=99"]
+    );
+}
+
+// ───────────────────────── Sealed records — Stage 1 ─────────────────────────
+// Unboxed packed-struct layout + constant-offset field access for sealed all-scalar record
+// types. See SEALED_RECORDS_DESIGN.md §3 (semantics matrix) and §5 (Stage 1).
+
+#[test]
+fn test_sealed_scalar_construct_and_field_read() {
+    // (a) Construct a sealed all-scalar record and read every field — correct values via the
+    // constant-offset unboxed-struct path.
+    let out = run(r#"
+import { print } from "std/io"
+type Point3 = { "x": Int32, "y": Int32, "z": Float64 }
+val p: Point3 = { "x": 10, "y": 20, "z": 1.5 }
+print("${p["x"]} ${p["y"]} ${p["z"]}")
+print("${p["x"] + p["y"]}")
+"#);
+    assert_eq!(out, vec!["10 20 1.5", "30"]);
+}
+
+#[test]
+fn test_sealed_boundary_projection_drops_extras_source_untouched() {
+    // (b) A wider Json/anonymous literal with an EXTRA field passed to a sealed-scalar param: the
+    // param sees only its own fields (extras dropped in the projecting copy), and the ORIGINAL
+    // keeps its extra outside the call (non-mutating projection).
+    let out = run(r#"
+import { print } from "std/io"
+type Vec2 = { "a": Int32, "b": Int32 }
+val sumv = (v: Vec2): Int32 => v["a"] + v["b"]
+val wide = { "a": 3, "b": 4, "extra": 99 }
+print("${sumv(wide)}")
+print("${wide["extra"]}")
+print("${wide["a"]}")
+"#);
+    assert_eq!(out, vec!["7", "99", "3"]);
+}
+
+#[test]
+fn test_sealed_to_json_roundtrip_prints() {
+    // (c) A sealed value flowing into a Json slot materializes a boxed object that prints/serializes
+    // correctly (sealed → Json boundary).
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Pair = { "lo": Int32, "hi": Int32 }
+val p: Pair = { "lo": 7, "hi": 42 }
+val j: Json = p
+print(toString(j))
+print("${j["lo"]} ${j["hi"]}")
+"#);
+    assert_eq!(out, vec![r#"{"lo": 7, "hi": 42}"#, "7 42"]);
+}
+
+#[test]
+fn test_sealed_eq_same_shape_as_json_is_true() {
+    // (d) Equality is order-independent and crosses representations: a sealed value equals a
+    // same-shape boxed Json/anonymous value, and two sealed values of the same type compare
+    // field-wise.
+    let out = run(r#"
+import { print } from "std/io"
+type P = { "x": Int32, "y": Int32 }
+val a: P = { "x": 1, "y": 2 }
+val b: P = { "x": 1, "y": 2 }
+val c: P = { "x": 9, "y": 2 }
+val anon = { "x": 1, "y": 2 }
+print("${a == b}")
+print("${a == c}")
+print("${a == anon}")
+print("${anon == a}")
+"#);
+    assert_eq!(out, vec!["true", "false", "true", "true"]);
+}
+
+#[test]
+fn test_sealed_in_match_is_arm() {
+    // (e) A sealed record narrowed in a match/`is` arm: field reads on the narrowed binding work.
+    let out = run(r#"
+import { print } from "std/io"
+type Cmd = { "kind": Int32, "arg": Int32 }
+val describe = (c: Json): String =>
+  match c
+    is Cmd => "cmd ${c["kind"]}/${c["arg"]}"
+    else => "other"
+val x: Cmd = { "kind": 2, "arg": 5 }
+print(describe(x))
+print(describe({ "kind": 7, "arg": 8 }))
+print(describe(42))
+"#);
+    assert_eq!(out, vec!["cmd 2/5", "cmd 7/8", "other"]);
+}
+
+#[test]
+fn test_sealed_regression_string_field_stays_boxed() {
+    // (f) RUN-EQUIVALENCE: a named record with a String field is now a SEALED record (Stage 2 —
+    // String is an eligible heap field), so it uses the packed-struct layout with a pointer slot
+    // for `name`. Its observable behaviour (field read, equality, toString) is IDENTICAL to the
+    // former boxed path. An anonymous all-scalar literal (unsealed) still stays boxed (never
+    // struct-laid-out). The test name is retained for history; the assertions are unchanged.
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Named = { "id": Int32, "name": String }
+val n: Named = { "id": 1, "name": "ada" }
+print("${n["id"]} ${n["name"]}")
+val nn: Named = { "id": 1, "name": "ada" }
+print("${n == nn}")
+// An anonymous all-scalar literal: unsealed, stays boxed; field read + extra all still work.
+val anon = { "p": 3, "q": 4, "r": 5 }
+print("${anon["p"] + anon["q"] + anon["r"]}")
+print(toString(n))
+"#);
+    assert_eq!(out, vec!["1 ada", "true", "12", r#"{"id": 1, "name": "ada"}"#]);
+}
+
+#[test]
+fn test_sealed_captured_by_closure() {
+    // A sealed scalar record CAPTURED by a closure: the env owns it (retained on capture) and
+    // releases it via the sealed self-sized release on closure teardown — NOT lin_object_release
+    // (which would mis-walk the packed struct). ASan-gated in the asan CI job; here we check the
+    // functional result.
+    let out = run(r#"
+import { print } from "std/io"
+type Point = { "x": Int32, "y": Int32 }
+val makeGetter = (): Int32 =>
+  val p: Point = { "x": 3, "y": 4 }
+  val getX = (): Int32 => p["x"] + p["y"]
+  getX()
+print("${makeGetter()}")
+"#);
+    assert_eq!(out, vec!["7"]);
+}
+
+#[test]
+fn test_sealed_transferred_across_async_boundary() {
+    // A sealed scalar record captured into an `async` thunk crosses the share-nothing thread
+    // boundary by a deep byte-copy (CAP_SEALED) and rematerializes on the worker. ASan/TSan-gated
+    // in CI; functional check here.
+    let out = run(r#"
+import { print } from "std/io"
+import { async, await } from "std/async"
+type Point = { "x": Int32, "y": Int32 }
+val p: Point = { "x": 5, "y": 6 }
+val job = async(() => p["x"] + p["y"])
+print("${await(job)}")
+"#);
+    assert_eq!(out, vec!["11"]);
+}
+
+#[test]
+fn test_sealed_spread_into_object_materializes() {
+    // REGRESSION (boundary bug, found finishing Stage 1): spreading a sealed scalar record into a
+    // boxed object literal must MATERIALIZE it first — the packed struct is NOT a LinObject, so
+    // passing it raw to the spread/merge runtime walked it as object entries (null-ptr deref). The
+    // spread source is converted to a boxed view (design §3.5 / §5 Stage 1).
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type P = { "x": Int32, "y": Int32 }
+val p: P = { "x": 1, "y": 2 }
+val q = { ...p, "z": 3 }
+print(toString(q))
+val p2: P = { ...p }
+print("${p2["x"]} ${p2["y"]}")
+"#);
+    assert_eq!(out, vec![r#"{"x": 1, "y": 2, "z": 3}"#, "1 2"]);
+}
+
+#[test]
+fn test_sealed_as_array_element_and_object_field_value() {
+    // REGRESSION (boundary bug, found finishing Stage 1): a sealed scalar record used as an ARRAY
+    // ELEMENT or as a FIELD VALUE in a boxed object literal must be materialized to a boxed
+    // LinObject (arrays of sealed records are Stage 3; a sealed field value is not a LinObject).
+    // Storing the packed struct raw under TAG_OBJECT made later serialize/release mis-walk it.
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type P = { "x": Int32, "y": Int32 }
+val p: P = { "x": 1, "y": 2 }
+val arr = [p, p, p]
+print(toString(arr))
+val wrap: Json = { "pt": p, "n": 9 }
+print(toString(wrap))
+"#);
+    assert_eq!(
+        out,
+        vec![
+            r#"[{"x": 1, "y": 2}, {"x": 1, "y": 2}, {"x": 1, "y": 2}]"#,
+            r#"{"pt": {"x": 1, "y": 2}, "n": 9}"#
+        ]
+    );
+}
+
+#[test]
+fn test_sealed_var_reassign_releases_old() {
+    // A `var` of sealed type reassigned multiple times: each old sealed struct must be released
+    // via the sealed release path (not lin_object_release). ASan-gated in CI; functional here.
+    let out = run(r#"
+import { print } from "std/io"
+type P = { "x": Int32, "y": Int32 }
+var v: P = { "x": 0, "y": 0 }
+v = { "x": 1, "y": 1 }
+v = { "x": 2, "y": 3 }
+print("${v["x"]} ${v["y"]}")
+"#);
+    assert_eq!(out, vec!["2 3"]);
+}
+
+// ───────────────────── Sealed records with HEAP fields (Stage 2) ─────────────────────
+// String / Array / nested-sealed fields are stored as 8-byte owned pointer slots; per-field
+// retain on construct/projection-copy, descriptor-driven release on drop. See §5 Stage 2.
+
+#[test]
+fn test_sealed_heap_string_field_construct_read_drop() {
+    // A sealed record with a String field: construct, read the string and a scalar back, drop.
+    let out = run(r#"
+import { print } from "std/io"
+type User = { "id": Int32, "name": String }
+val u: User = { "id": 7, "name": "ada" }
+print("${u["id"]} ${u["name"]}")
+print("${u["name"]} ${u["name"]}")
+"#);
+    assert_eq!(out, vec!["7 ada", "ada ada"]);
+}
+
+#[test]
+fn test_sealed_heap_array_field() {
+    // A sealed record with an Array field: construct, read the array back, index into it.
+    let out = run(r#"
+import { print } from "std/io"
+import { length } from "std/array"
+type Bag = { "tag": Int32, "items": Int32[] }
+val b: Bag = { "tag": 1, "items": [10, 20, 30] }
+print("${b["tag"]} ${length(b["items"])}")
+print("${b["items"][0]} ${b["items"][2]}")
+"#);
+    assert_eq!(out, vec!["1 3", "10 30"]);
+}
+
+#[test]
+fn test_sealed_nested_record_field() {
+    // A nested sealed record field: `type Line = { a: Pt, b: Pt }` where Pt is sealed. Releasing the
+    // outer must release each inner (descriptor recursion). Read nested fields by chained access.
+    let out = run(r#"
+import { print } from "std/io"
+type Pt = { "x": Int32, "y": Int32 }
+type Line = { "a": Pt, "b": Pt }
+val l: Line = { "a": { "x": 1, "y": 2 }, "b": { "x": 3, "y": 4 } }
+print("${l["a"]["x"]} ${l["a"]["y"]} ${l["b"]["x"]} ${l["b"]["y"]}")
+"#);
+    assert_eq!(out, vec!["1 2 3 4"]);
+}
+
+#[test]
+fn test_sealed_heap_projection_drops_extras_source_untouched() {
+    // Projection of a WIDER concrete object with a String field into a sealed type: extras dropped
+    // from the copy, the source keeps them, no leak. The projected param sees only its own fields.
+    let out = run(r#"
+import { print } from "std/io"
+type Person = { "name": String, "age": Int32 }
+val greet = (p: Person): String => "${p["name"]}=${p["age"]}"
+val wide = { "name": "bob", "age": 30, "email": "b@x.io" }
+print(greet(wide))
+print("${wide["email"]}")
+print("${wide["name"]}")
+"#);
+    assert_eq!(out, vec!["bob=30", "b@x.io", "bob"]);
+}
+
+#[test]
+fn test_sealed_heap_equality_and_to_json() {
+    // Equality crosses representations for heap-field records (deep, order-independent), and
+    // sealed→Json materialization serializes the heap fields correctly.
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type User = { "id": Int32, "name": String }
+val a: User = { "id": 1, "name": "ada" }
+val b: User = { "id": 1, "name": "ada" }
+val c: User = { "id": 1, "name": "bob" }
+val anon = { "id": 1, "name": "ada" }
+print("${a == b} ${a == c} ${a == anon}")
+val j: Json = a
+print(toString(j))
+"#);
+    assert_eq!(out, vec!["true false true", r#"{"id": 1, "name": "ada"}"#]);
+}
+
+#[test]
+fn test_sealed_heap_captured_by_closure() {
+    // A sealed-with-String record captured by a closure: the env owns it (retained on capture),
+    // released via the descriptor-driven sealed self-release on teardown (frees the String too).
+    let out = run(r#"
+import { print } from "std/io"
+type User = { "id": Int32, "name": String }
+val make = (): String =>
+  val u: User = { "id": 5, "name": "zoe" }
+  val get = (): String => "${u["id"]}:${u["name"]}"
+  get()
+print(make())
+"#);
+    assert_eq!(out, vec!["5:zoe"]);
+}
+
+#[test]
+fn test_sealed_heap_transferred_across_async() {
+    // A sealed-with-String record captured into an async thunk crosses the share-nothing thread
+    // boundary: clone_sealed deep-copies the String field per the descriptor, release frees it.
+    let out = run(r#"
+import { print } from "std/io"
+import { async, await } from "std/async"
+type Msg = { "n": Int32, "text": String }
+val m: Msg = { "n": 3, "text": "hello" }
+val t = async((): String => "${m["n"]}:${m["text"]}")
+print(await(t))
+"#);
+    assert_eq!(out, vec!["3:hello"]);
+}
+
+#[test]
+fn test_sealed_heap_var_reassign_releases_old() {
+    // A var of sealed-with-String type reassigned: each old struct's String field released exactly
+    // once via the descriptor walk (ASan-gated in CI). Functional check here.
+    let out = run(r#"
+import { print } from "std/io"
+type Box = { "k": Int32, "s": String }
+var v: Box = { "k": 0, "s": "a" }
+v = { "k": 1, "s": "bb" }
+v = { "k": 2, "s": "ccc" }
+print("${v["k"]} ${v["s"]}")
+"#);
+    assert_eq!(out, vec!["2 ccc"]);
+}
+
+#[test]
+fn test_sealed_heap_in_loop_construct_drop() {
+    // Construct/read/drop a heap-field sealed record in a loop — exercises repeated alloc + String
+    // retain/release. The accumulated result proves each iteration's value was read before drop.
+    let out = run(r#"
+import { print } from "std/io"
+import { range, reduce } from "std/iter"
+type Item = { "v": Int32, "label": String }
+val total = range(0, 100).reduce(0, (acc: Int32, i: Int32): Int32 =>
+  val it: Item = { "v": i, "label": "x" }
+  acc + it["v"]
+)
+print("${total}")
+"#);
+    assert_eq!(out, vec!["4950"]);
+}
+
+#[test]
+fn test_sealed_tail_recursive_self_call_record_literal_arg() {
+    // REGRESSION (found adding the `records` cross-language benchmark): a TAIL-recursive function
+    // taking a sealed-record param and passing a fresh record LITERAL as the self-call argument.
+    // The outer binding's function type resolves the param to the sealed `Object`, but inside the
+    // body the self-reference carries the unexpanded `Named` alias — so at the recursive tail call
+    // `func.ty()` reports `Named(_)` while the callee reads the param as a sealed struct. The arg
+    // literal was being boxed as Json (the `Named`-is-union-ish path), which the TCO loop header
+    // then misread at constant struct offsets → heap corruption / segfault past ~a few thousand
+    // iterations. The fix constructs/projects the literal into the sealed layout at the boundary.
+    // A small N here exercises the path; the benchmark runs 50M iterations under ASan in CI.
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type State = { "a": Int64, "b": Int64, "c": Int64 }
+val step = (i: Int64, s: State): State =>
+  if i == 0i64 then
+    s
+  else
+    step(i - 1i64, { "a": s["a"] + 1i64, "b": s["b"] + s["a"], "c": s["c"] + 2i64 })
+val init: State = { "a": 1i64, "b": 0i64, "c": 0i64 }
+val final = step(10000i64, init)
+print("${toString(final["a"] + final["b"] + final["c"])}")
+"#);
+    // a: 1 + 10000 = 10001; b: sum of a over iters; c: 2*10000 = 20000. The exact total is not the
+    // point — the point is it RUNS (no segfault) and is deterministic.
+    assert_eq!(out, vec!["50035001"]);
+}
+
 /// Regression (LIN_ISSUES #2): a top-level mutable `var` in an IMPORTED module, mutated by an
 /// EXPORTED function, used to panic codegen ("Binary: undefined lhs temp Temp(0)") because the
 /// import lowering never set up the module global / its initialiser — the exported mutator

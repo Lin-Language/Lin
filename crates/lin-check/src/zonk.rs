@@ -41,12 +41,14 @@ fn zonk_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
             ret: Box::new(zonk_type(ret, subs)),
             required: *required,
         },
-        Type::Object(fields) => {
+        Type::Object { fields, sealed } => {
+            // Zonking substitutes TypeVars in field types; it must PRESERVE the sealed marker
+            // so a zonked named-record type stays sealed (and an anonymous one stays unsealed).
             let mut out = indexmap::IndexMap::new();
             for (k, v) in fields {
                 out.insert(k.clone(), zonk_type(v, subs));
             }
-            Type::Object(out)
+            Type::Object { fields: out, sealed: *sealed }
         }
         _ => ty.clone(),
     }
