@@ -61,7 +61,7 @@ Over a stream, a combinator **consumes** its input, so a stream flows through a 
 | `flatMap` | `Json[]` | `Stream` (lazy) | Map then flatten one level |
 | `flatten` | `Json[]` | `Stream` (lazy) | Flatten one level of nesting |
 | `concat` | `Json[]` | `Stream` (lazy) | All of `a` then all of `b` |
-| `find` | `Json` (or `null`) | `Json \| Null \| Error` (terminal) | First matching element |
+| `find` | `T \| Null` | `T \| Null \| Error` (terminal) | First matching element |
 | `some` | `Boolean` | `Boolean \| Error` (terminal) | True if any element matches |
 | `every` | `Boolean` | `Boolean \| Error` (terminal) | True if all elements match |
 
@@ -185,7 +185,7 @@ Over streams these are lazy: `flatMap`/`flatten` yield each inner element in tur
 
 ### `find`
 
-The first element for which `f: (item[, i: Int32]) -> Boolean` returns `true`, or `null` if none; `f` optionally receives the 0-based source index. Array/Iterator → `Json`. Stream → terminal `Json | Null | Error`.
+The first element for which `f: (item[, i: Int32]) -> Boolean` returns `true`, or `null` if none; `f` optionally receives the 0-based source index. Array/Iterator → `T | Null`. Stream → terminal `T | Null | Error`.
 
 ```lin
 [1, 3, 5, 6].find(x => x % 2 == 0)   // 6

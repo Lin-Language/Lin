@@ -1,73 +1,20 @@
 # Stdlib `Json` typing audit — tightening the stdlib once `{ String: T }` lands
 
-Status: proposal / audit. **Category 1 (array/iter generics) is implemented** on branch
-`fix/stdlib-collection-generics`; Categories 2–5 remain. Companion to
-`docs/proposals/typed-map-index-signature.md` (the accepted index-signature `{ String: T }` type).
+Status: proposal / audit. Companion to `docs/proposals/typed-map-index-signature.md` (the accepted
+index-signature `{ String: T }` type).
 
-The stdlib uses `Json` in **145 exported signatures** across 22 modules. Not all of these are lazy —
-they fall into five distinct categories, and only some are fixed by the new map type. This doc
-classifies every `Json`-using module so the implementing agent knows, signature by signature, which to
-tighten and how. The win is real: a `Json`-typed value is opaque (no field/element checking, and the
-runtime boxes it), so every one of these is both a missed type-safety opportunity and, where a concrete
-type would let codegen unbox, a missed performance opportunity.
+> **Category 1 (under-genericized array/iter collection ops) is DONE** — shipped on master, the
+> `std/array` + `std/iter` element-generic ops re-typed from `Json` to `<T>`. It is omitted below; the
+> remaining work is Categories 2–5.
 
-## Counts (non-test, `Json` mentions per module)
+The stdlib uses `Json` across 22 modules. Not all of these are lazy — they fall into distinct
+categories, and only some are fixed by the new map type. This doc classifies every `Json`-using module
+so the implementing agent knows, signature by signature, which to tighten and how. The win is real: a
+`Json`-typed value is opaque (no field/element checking, and the runtime boxes it), so every one of
+these is both a missed type-safety opportunity and, where a concrete type would let codegen unbox, a
+missed performance opportunity.
 
-```
-array 43   fs 36   test 33   net 26   iter 26   async 21   http 15   process 14
-object 11  json 9  yaml 8   stream 6  io 5   tty 4  time 4  template 4  env 4
-jq 3   number 2   hash 2   string 1   archive 1
-```
-
-## The five categories
-
-### Category 1 — under-genericized collections — DONE
-
-**Implemented on branch `fix/stdlib-collection-generics`** (re-typed `std/array` + `std/iter`
-element-generic ops from `Json` to `<T>`).
-
-Re-typed (current → shipped):
-```
-slice     = (arr: Json, …): Json   →  <T>(arr: T[], start, end): T[]
-reverse   = (arr: Json): Json      →  <T>(arr: T[]): T[]
-unique    = (arr: Json): Json      →  <T>(arr: T[]): T[]              (result: T[] annotated, flat-safe)
-chunk     = (arr: Json, size): Json →  <T>(arr: T[], size): T[][]     (inner T[] annotated, flat-safe)
-partition = (arr: Json, f): Json   →  <T>(arr: T[], f): T[][]         (NOT a heterogeneous tuple — see below)
-zip       = (a, b): Json           →  <A,B>(a: A[], b: B[]): [A,B][]
-scan      = (arr, init, f): Json[] →  <T,U>(arr: T[], init: U, f: (U,T)=>U): U[]
-find      = (arr, f): Json         →  <T>(arr: T[]|Iterator|Stream, f): T | Null
-some/every= (arr, f): Boolean      →  <T>(arr: T[]|Iterator|Stream, f): Boolean
-take/drop = (arr, n): Json         →  <T>(arr: T[]|Iterator|Stream, n): T[]
-takeWhile/dropWhile = (arr, f)     →  <T>(arr: T[]|Iterator|Stream, f): T[]
-flatten   = (arr: Json): Json      →  <T>(arr: T[][]): T[]
-```
-The union receiver `T[] | Iterator | Stream` is preserved on every stream-dispatching combinator;
-only the element type `Json` → `T` changed.
-
-Two surface limitations surfaced and are accepted (not language gaps to fix here):
-- **Array literals don't infer as the `FixedArray` tuple type**, so `partition`'s `[pass, fail]` and
-  the like are typed as the homogeneous `T[][]` (still element-typed: `result[0]`/`result[1]` are
-  `T[]`), not the heterogeneous `[T[], T[]]` originally proposed.
-- **Empty array literals can't pin `T`** for the array-only generics, so a couple of empty-literal
-  call sites need an annotation (`val xs: Int32[] = []`).
-
-Deliberately LEFT `Json` (rationale captured in source comments):
-- `push`/`append`/`prepend` — a generic `<T>` pins `T` from a numeric LITERAL item, which splits the
-  declared type from a narrow-scalar flat representation (`UInt8[]`); `push` on an untyped `[]`
-  accumulator additionally mis-monomorphizes and corrupts the store. They dispatch on the runtime
-  element type instead.
-- `for` — the universal iteration driver over `Json`-typed sources (e.g. a `Json[]` of promise
-  handles consumed with `await`); a generic element pin mis-monomorphizes the callback ABI.
-- `concat`/`flatMap` — legitimately MIX element types (`UInt8[]` ++ `String[]` → tagged `Json[]`;
-  `flatMap`'s input vs flattened-output element differ).
-- `compact` — the natural `<T>((T | Null)[]): T[]` is unparseable (no postfix `[]` on a parenthesized
-  union).
-- `iterOf` — opaque Iterator (element erased into the handle); `iterOf([])` can't infer `<T>`.
-- `sum`/`product`/`min`/`max`/`minBy`/`maxBy`/`sort`/`sortBy` — Category 4/5, out of scope.
-
-Validated: `cargo test --workspace`, `lin test stdlib/ examples/` (71 files) + the RAPTOR benchmark
-suite (9 files), and `lin fmt --check stdlib/ examples/ benchmarks/` all green; `docs/STDLIB.md`
-updated for every re-typed signature.
+## The remaining categories
 
 ### Category 2 — the map-type gap (THE reason for `{ String: T }`; fix with the new type)
 
@@ -153,14 +100,14 @@ representation changes; flag any change against that header comment.
 
 ## Suggested order of work
 
-1. ~~**Category 1** (array/iter generics)~~ — **DONE** on `fix/stdlib-collection-generics` (see the
-   Category 1 section above for the shipped signatures and the deliberate `Json` exceptions).
-2. **Category 2** (object/map) — gated on `{ String: T }` landing; this is the headline fix and the
+(Category 1 — array/iter generics — is already shipped.)
+
+1. **Category 2** (object/map) — gated on `{ String: T }` landing; this is the headline fix and the
    performance unlock. Re-type `std/object` + `groupBy`/`countBy`.
-3. **Category 3** (result/error unions) — define the success records (`Stat`, `DirEntry`,
+2. **Category 3** (result/error unions) — define the success records (`Stat`, `DirEntry`,
    process-result), then re-type fs/process/net/http/env/time to `… | Error`. Each module is
    independent; do them one at a time with their tests.
-4. Leave Categories 4 and 5 (and async handles) as `Json` — those are correct or constrained.
+3. Leave Categories 4 and 5 (and async handles) as `Json` — those are correct or constrained.
 
 ## Validation per change
 
