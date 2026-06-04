@@ -2101,13 +2101,61 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         }
 
         TypedExpr::MakeObject { fields, spreads, ty, .. } => {
+            // This is the GENERAL (boxed) MakeObject path — a sealed scalar-record TARGET is
+            // constructed directly as a packed struct elsewhere (`try_lower_sealed_literal`), so
+            // here `ty` is always a boxed object/Json. A field VALUE that is itself a sealed scalar
+            // record is a packed struct, NOT a LinObject; storing it raw under TAG_OBJECT makes the
+            // object's serialize/release walk it as object entries → heap corruption. MATERIALIZE
+            // each sealed field value to a boxed LinObject (sealed→Json Coerce) first.
             let lowered_fields: Vec<(String, Temp)> = fields
                 .iter()
-                .map(|(k, v)| (k.clone(), lower_expr(v, builder, ctx)))
+                .map(|(k, v)| {
+                    let t = lower_expr(v, builder, ctx);
+                    let vty = v.ty();
+                    if is_sealed_scalar_repr(&vty) {
+                        let to = Type::object(match &vty {
+                            Type::Object { fields, .. } => fields.clone(),
+                            _ => unreachable!(),
+                        });
+                        let dst = builder.alloc_temp(to.clone());
+                        builder.emit(Instruction::Coerce {
+                            dst, src: t, from_ty: vty.clone(), to_ty: to.clone(),
+                        });
+                        builder.register_owned(dst, to);
+                        (k.clone(), dst)
+                    } else {
+                        (k.clone(), t)
+                    }
+                })
                 .collect();
+            // A spread source that is a SEALED scalar record is a packed struct, NOT a LinObject;
+            // the MakeObject spread codegen (`lin_object_extend`/spread) walks it as a LinObject
+            // → null-ptr/heap corruption. MATERIALIZE it to a boxed LinObject first (sealed→Json
+            // Coerce), so the spread sees the universal object representation. Stage 1 keeps
+            // spread on the "convert-to-boxed-view" path (design §3.5/§5).
             let lowered_spreads: Vec<Temp> = spreads
                 .iter()
-                .map(|s| lower_expr(s, builder, ctx))
+                .map(|s| {
+                    let st = lower_expr(s, builder, ctx);
+                    let sty = s.ty();
+                    if is_sealed_scalar_repr(&sty) {
+                        let to = Type::object(match &sty {
+                            Type::Object { fields, .. } => fields.clone(),
+                            _ => unreachable!(),
+                        });
+                        let dst = builder.alloc_temp(to.clone());
+                        builder.emit(Instruction::Coerce {
+                            dst,
+                            src: st,
+                            from_ty: sty.clone(),
+                            to_ty: to.clone(),
+                        });
+                        builder.register_owned(dst, to);
+                        dst
+                    } else {
+                        st
+                    }
+                })
                 .collect();
             let dst = builder.alloc_temp(ty.clone());
             builder.emit(Instruction::MakeObject {
@@ -2122,6 +2170,17 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
 
         TypedExpr::MakeArray { elements, ty, .. } => {
             let elem_ty = match ty {
+                // Arrays of sealed scalar records are STAGE 3 (contiguous struct elements); in
+                // Stage 1 a `MyType[]` stores each element as a boxed `LinObject` (the universal
+                // Json element representation), exactly like a Json array. Lower the element type
+                // to the UNSEALED object form so `coerce_to_slot_type` inserts a sealed→Json
+                // MATERIALIZATION per element (the sealed struct is NOT a LinObject — pushing it
+                // raw under TAG_OBJECT makes the array's release/serialize walk it as object
+                // entries → heap corruption).
+                Type::Array(inner) if is_sealed_scalar_repr(inner) => match inner.as_ref() {
+                    Type::Object { fields, .. } => Type::object(fields.clone()),
+                    _ => unreachable!(),
+                },
                 Type::Array(inner) => *inner.clone(),
                 // A fixed-length array (`[T1, T2, ...]`, §5.3) has heterogeneous positional
                 // types, so it is stored as a TAGGED (Json) array — each element boxes to a
