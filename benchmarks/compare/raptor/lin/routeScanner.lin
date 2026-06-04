@@ -1,0 +1,51 @@
+// raptor/RouteScanner — backward trip scan with a stateful routeScanPosition memo.
+//
+// A scanner record: { "tripsByRoute", "date", "dow", "routeScanPosition" }.
+// getTrip remembers, per route, the last index it scanned from (init trips.length-1),
+// iterates BACKWARD, breaks when stopTime.departureTime < time, records the last reachable
+// trip whose service runs that day, and updates the memo under (!lastFound || lastFound === trip).
+// The memo is stateful across calls within one scan (a fresh scanner per scan/day).
+import { length } from "std/array"
+import { runsOn } from "./service"
+
+export val createRouteScanner = (tripsByRoute: Json, date: Int32, dow: Int32): Json =>
+  {
+    "tripsByRoute": tripsByRoute,
+    "date": date,
+    "dow": dow,
+    "routeScanPosition": {}
+  }
+
+// trip identity: tripId comparison (Lin == on objects is structural; tripId is the
+// stable per-trip key used in place of JS reference identity).
+val sameTrip = (a: Json, b: Json): Boolean =>
+  a != null && b != null && a["tripId"] == b["tripId"]
+
+// Returns the chosen trip (or null). Tail-recursive backward scan threading lastFound.
+val scanBack = (scanner: Json, routeId: String, stopIndex: Int32, time: Json, i: Int32, lastFound: Json): Json =>
+  if i < 0 then
+    lastFound
+  else
+    val routeTrips = scanner["tripsByRoute"][routeId]
+    val trip = routeTrips[i]
+    val stopTime = trip["stopTimes"][stopIndex]
+    if stopTime["departureTime"] < time then
+      lastFound
+    else
+      val newLastFound = if runsOn(trip["service"], scanner["date"], scanner["dow"]) then
+        trip
+      else
+        lastFound
+      // update routeScanPosition under the documented condition
+      if newLastFound == null || sameTrip(newLastFound, trip) then
+        scanner["routeScanPosition"][routeId] = i
+      scanBack(scanner, routeId, stopIndex, time, i - 1, newLastFound)
+
+export val getTrip = (scanner: Json, routeId: String, stopIndex: Int32, time: Json): Json =>
+  val pos = scanner["routeScanPosition"]
+  val start = if pos[routeId] == null then
+    length(scanner["tripsByRoute"][routeId]) - 1
+  else
+    pos[routeId]
+  if pos[routeId] == null then scanner["routeScanPosition"][routeId] = start
+  scanBack(scanner, routeId, stopIndex, time, start, null)

@@ -1,0 +1,10 @@
+{
+  "name": "raptor-node",
+  "version": "1.0.0",
+  "description": "Plain-JS golden-reference port of planarnetwork/raptor for the cross-language benchmark.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  }
+}

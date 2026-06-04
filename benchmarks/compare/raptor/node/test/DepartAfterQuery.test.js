@@ -1,0 +1,596 @@
+import { describe, it } from "node:test";
+import { expect } from "./expect.js";
+import { JourneyFactory } from "../src/results/JourneyFactory.js";
+import { allDays, j, services, setDefaultTrip, st, t, tf } from "./util.js";
+import { RaptorAlgorithmFactory } from "../src/raptor/RaptorAlgorithmFactory.js";
+import { DepartAfterQuery } from "../src/query/DepartAfterQuery.js";
+import { Service } from "../src/gtfs/Service.js";
+
+describe("DepartAfterQuery", () => {
+  const journeyFactory = new JourneyFactory();
+
+  it("finds journeys with direct connections", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null))
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "C", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    expect(result).toEqual([
+      j([st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)])
+    ]);
+  });
+
+  it("finds the earliest calendars", () => {
+    const trips = [
+      t(st("A", null, 1400), st("B", 1430, 1435), st("C", 1500, null)),
+      t(st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null))
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "C", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    expect(result).toEqual([
+      j([st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)])
+    ]);
+  });
+
+  it("finds journeys with a single connection", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)),
+      t(st("D", null, 1000), st("B", 1030, 1035), st("E", 1100, null))
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "E", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    expect(result).toEqual([
+      j([
+        st("A", null, 1000), st("B", 1030, 1035),
+      ], [
+        st("B", 1030, 1035), st("E", 1100, null)
+      ])
+    ]);
+  });
+
+  it("does not return journeys that cannot be made", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1035, 1035), st("C", 1100, null)),
+      t(st("D", null, 1000), st("B", 1030, 1030), st("E", 1100, null))
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory, 1);
+    const result = query.plan("A", "E", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    expect(result).toEqual([]);
+  });
+
+  it("returns the fastest and the least changes", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, 1030), st("C", 1200, null)),
+      t(st("B", null, 1030), st("C", 1100, null))
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "C", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    const direct = j([st("A", null, 1000), st("B", 1030, 1030), st("C", 1200, null)]);
+
+    const change = j([
+      st("A", null, 1000), st("B", 1030, 1030),
+    ], [
+      st("B", null, 1030), st("C", 1100, null)
+    ]);
+
+    expect(result).toEqual([direct, change]);
+  });
+
+  it("chooses the fastest journey where the number of journeys is the same", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, 1030), st("C", 1100, null)),
+      t(st("C", null, 1200), st("D", 1230, 1230), st("E", 1300, null)),
+      t(st("A", null, 1100), st("F", 1130, 1130), st("G", 1200, null)),
+      t(st("G", null, 1200), st("H", 1230, 1230), st("E", 1255, null)),
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "E", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    const fastest = j([
+      st("A", null, 1100), st("F", 1130, 1130), st("G", 1200, null)
+    ], [
+      st("G", null, 1200), st("H", 1230, 1230), st("E", 1255, null)
+    ]);
+
+    expect(result).toEqual([fastest]);
+  });
+
+  it("chooses an arbitrary journey when they are the same", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, 1030), st("C", 1100, null)),
+      t(st("C", null, 1200), st("D", 1230, 1230), st("E", 1300, null)),
+      t(st("A", null, 1100), st("F", 1130, 1130), st("G", 1200, null)),
+      t(st("G", null, 1200), st("H", 1230, 1230), st("E", 1300, null)),
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "E", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    const journey1 = j([
+      st("A", null, 1000), st("B", 1030, 1030), st("C", 1100, null)
+    ], [
+      st("C", null, 1200), st("D", 1230, 1230), st("E", 1300, null)
+    ]);
+
+    expect(result).toEqual([journey1]);
+  });
+
+  it("chooses the correct change point", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, null)),
+      t(st("A", null, 1030), st("C", 1200, null)),
+      t(st("C", null, 1000), st("B", 1030, 1030), st("E", 1100, null)),
+      t(st("C", null, 1200), st("B", 1230, 1230), st("E", 1300, null)),
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "E", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    const change = j([
+      st("A", null, 1000), st("B", 1030, null)
+    ], [
+      st("B", 1030, 1030), st("E", 1100, null)
+    ]);
+
+    expect(result).toEqual([change]);
+  });
+
+  it("finds journeys with a transfer", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)),
+      t(st("D", null, 1200), st("E", 1300, null))
+    ];
+
+    const transfers = {
+      "C": [tf("C", "D", 10)]
+    };
+
+    const raptor = RaptorAlgorithmFactory.create(trips, transfers, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "E", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    expect(result).toEqual([
+      j([
+        st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)
+      ],
+      tf("C", "D", 10),
+      [
+        st("D", null, 1200), st("E", 1300, null)
+      ])
+    ]);
+  });
+
+  it("uses a transfer if it is faster", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, 1030), st("C", 1100, null)),
+      t(st("C", null, 1130), st("D", 1200, null))
+    ];
+
+    const transfers = {
+      "C": [tf("C", "D", 10)]
+    };
+
+    const raptor = RaptorAlgorithmFactory.create(trips, transfers, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "D", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    const transfer = j(
+      [st("A", null, 1000), st("B", 1030, 1030), st("C", 1100, null)],
+      tf("C", "D", 10)
+    );
+
+    expect(result).toEqual([transfer]);
+  });
+
+  it("doesn't allow pick up from locations without pickup specified", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, 1030), st("C", 1200, null)),
+      t(st("E", null, 1000), st("B", 1030, null), st("C", 1100, null))
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "C", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    const direct = j([st("A", null, 1000), st("B", 1030, 1030), st("C", 1200, null)]);
+
+    expect(result).toEqual([direct]);
+  });
+
+  it("doesn't allow drop off at non-drop off locations", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", null, 1030), st("C", 1200, null)),
+      t(st("E", null, 1000), st("B", 1030, 1030), st("C", 1100, null))
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "C", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    const direct = j([st("A", null, 1000), st("B", null, 1030), st("C", 1200, null)]);
+
+    expect(result).toEqual([direct]);
+  });
+
+  it("applies interchange times", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, 1030), st("C", 1200, null)),
+      t(st("B", null, 1030), st("C", 1100, null)),
+      t(st("B", null, 1040), st("C", 1110, null))
+    ];
+
+    const transfers = {};
+    const interchange = { B: 10 };
+
+    const raptor = RaptorAlgorithmFactory.create(trips, transfers, interchange);
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "C", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    const direct = j([st("A", null, 1000), st("B", 1030, 1030), st("C", 1200, null)]);
+
+    const change = j([
+      st("A", null, 1000), st("B", 1030, 1030),
+    ], [
+      st("B", null, 1040), st("C", 1110, null)
+    ]);
+
+    expect(result).toEqual([direct, change]);
+  });
+
+  it("applies interchange times to transfers", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, null)),
+      t(st("C", null, 1030), st("D", 1100, null)),
+      t(st("C", null, 1050), st("D", 1110, null)),
+      t(st("C", null, 1100), st("D", 1120, null))
+    ];
+
+    const transfers = {
+      "B": [tf("B", "C", 10)]
+    };
+
+    const interchange = { B: 10, C: 10 };
+
+    const raptor = RaptorAlgorithmFactory.create(trips, transfers, interchange);
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "D", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    const lastPossible = j(
+      [st("A", null, 1000), st("B", 1030, null)],
+      tf("B", "C", 10),
+      [st("C", null, 1100), st("D", 1120, null)]
+    );
+
+    expect(result).toEqual([lastPossible]);
+  });
+
+  it("omits calendars not running that day", () => {
+    const trip = t(st("B", null, 1030), st("C", 1100, null));
+
+    trip.service = new Service(20181001, 20181015, allDays, {});
+
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, null)),
+      trip,
+      t(st("B", null, 1040), st("C", 1110, null))
+    ];
+
+    const transfers = {};
+    const interchange = {};
+    const raptor = RaptorAlgorithmFactory.create(trips, transfers, interchange);
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "C", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    const change = j([
+      st("A", null, 1000), st("B", 1030, null),
+    ], [
+      st("B", null, 1040), st("C", 1110, null)
+    ]);
+
+    expect(result).toEqual([change]);
+  });
+
+  it("omits calendars not running that day of the week", () => {
+    const trip = t(st("B", null, 1030), st("C", 1100, null));
+
+    const days = Object.assign({}, allDays, { 1: false });
+
+    trip.service = new Service(20181001, 20991231, days, {});
+
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, null)),
+      trip,
+      t(st("B", null, 1040), st("C", 1110, null))
+    ];
+
+    const transfers = {};
+    const interchange = {};
+    const raptor = RaptorAlgorithmFactory.create(trips, transfers, interchange);
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "C", new Date("2018-10-22"), 900);
+
+    setDefaultTrip(result);
+
+    const change = j([
+      st("A", null, 1000), st("B", 1030, null),
+    ], [
+      st("B", null, 1040), st("C", 1110, null)
+    ]);
+
+    expect(result).toEqual([change]);
+  });
+
+  it("includes calendars with an include day", () => {
+    const trip = t(st("B", null, 1030), st("C", 1100, null));
+
+    trip.service = new Service(20991231, 20991231, allDays, { 20181022: true });
+
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, null)),
+      trip,
+      t(st("B", null, 1040), st("C", 1110, null))
+    ];
+
+    const transfers = {};
+    const interchange = {};
+    const raptor = RaptorAlgorithmFactory.create(trips, transfers, interchange);
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "C", new Date("2018-10-22"), 900);
+
+    setDefaultTrip(result);
+
+    const change = j([
+      st("A", null, 1000), st("B", 1030, null),
+    ], [
+      st("B", null, 1030), st("C", 1100, null)
+    ]);
+
+    expect(result).toEqual([change]);
+  });
+
+  it("omits calendars with an exclude day", () => {
+    const trip = t(st("B", null, 1030), st("C", 1100, null));
+
+    trip.service = new Service(20181001, 20991231, allDays, { 20181022: false });
+
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, null)),
+      trip,
+      t(st("B", null, 1040), st("C", 1110, null))
+    ];
+
+    const transfers = {};
+    const interchange = {};
+    const raptor = RaptorAlgorithmFactory.create(trips, transfers, interchange);
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "C", new Date("2018-10-22"), 900);
+
+    setDefaultTrip(result);
+
+    const change = j([
+      st("A", null, 1000), st("B", 1030, null),
+    ], [
+      st("B", null, 1040), st("C", 1110, null)
+    ]);
+
+    expect(result).toEqual([change]);
+  });
+
+  it("finds journeys after gaps in rounds", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, 1035), st("C", 1400, null)),
+      t(st("B", null, 1035), st("D", 1100, null)),
+      t(st("D", null, 1100), st("E", 1130, null)),
+      t(st("E", null, 1130), st("C", 1200, null)),
+      t(st("A", null, 1000), st("E", 1135, null)),
+      t(st("E", null, 1135), st("C", 1330, null)),
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "C", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    const direct = j([st("A", null, 1000), st("B", 1030, 1035), st("C", 1400, null)]);
+
+    const slowChange = j(
+      [st("A", null, 1000), st("E", 1135, null)],
+      [st("E", null, 1135), st("C", 1330, null)],
+    );
+
+    const change = j(
+      [st("A", null, 1000), st("B", 1030, 1035)],
+      [st("B", null, 1035), st("D", 1100, null)],
+      [st("D", null, 1100), st("E", 1130, null)],
+      [st("E", null, 1130), st("C", 1200, null)]
+    );
+
+    expect(result).toEqual([direct, slowChange, change]);
+  });
+
+  it("puts overtaken trains in different routes", () => {
+    const trips = [
+      t(
+        st("A", null, 1000), st("B", 1030, 1030), st("C", 1100, 1110),
+        st("D", 1130, 1130), st("E", 1200, null)
+      ),
+      t(
+        st("A", null, 1010), st("B", 1040, 1040), st("C", 1050, 1100),
+        st("D", 1120, 1120), st("E", 1150, null)
+      ),
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory);
+    const result = query.plan("A", "E", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    const faster = j(
+      [
+        st("A", null, 1010), st("B", 1040, 1040), st("C", 1050, 1100),
+        st("D", 1120, 1120), st("E", 1150, null)
+      ]
+    );
+
+    expect(result).toEqual([faster]);
+  });
+
+  it("finds journeys that can only be made by waiting for the next day", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1035, 1035), st("C", 1100, null)),
+      t(st("D", null, 1000), st("B", 1030, 1030), st("E", 1100, null))
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory, 2);
+    const result = query.plan("A", "E", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    const expected = j([
+      st("A", null, 1000), st("B", 1035, 1035),
+    ], [
+      st("B", 1030, 1030), st("E", 1100, null)
+    ]);
+
+    expect(result[0].legs).toEqual(expected.legs);
+  });
+
+  it("adds a day to the arrival time of journeys that are made overnight", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1035, 1035), st("C", 1100, null)),
+      t(st("D", null, 1000), st("B", 1030, 1030), st("E", 1100, null))
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory, 2);
+    const result = query.plan("A", "E", new Date("2018-10-16"), 900);
+
+    setDefaultTrip(result);
+
+    expect(result[0].arrivalTime).toBe(1100 + 86400);
+  });
+
+  it("increments the day when searching subsequent days", () => {
+    const trips = [
+      t(st("A", null, 1000), st("B", 1030, 1030), st("C", 1100, null)),
+      t(st("D", null, 1000), st("B", 1035, 1035), st("E", 1100, null))
+    ];
+
+    trips[1].service = services["2"];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory, 2);
+    const result = query.plan("A", "E", new Date("2018-12-31"), 900);
+
+    setDefaultTrip(result);
+
+    expect(result[0].arrivalTime).toBe(1100 + 86400);
+  });
+
+  it("uses all results from every day", () => {
+    const trips = [
+      t(st("A", null, 1900), st("B", 1930, 1935), st("C", 2000, null)),
+      t(st("B", null, 1035), st("D", 1100, null)),
+      t(st("D", null, 1100), st("E", 1130, null)),
+      t(st("C", null, 1130), st("E", 1200, null))
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory, 2);
+    const result = query.plan("A", "E", new Date("2019-04-23"), 900);
+
+    setDefaultTrip(result);
+    const change = j(
+      [st("A", null, 1900), st("B", 1930, 1935)],
+      [st("B", null, 1035), st("D", 1100, null)],
+      [st("D", null, 1100), st("E", 1130, null)]
+    );
+
+    const noChange = j(
+      [st("A", null, 1900), st("B", 1930, 1935), st("C", 2000, null)],
+      [st("C", null, 1130), st("E", 1200, null)]
+    );
+
+    const expected = [noChange, change];
+
+    for (const journey of expected) {
+      journey.arrivalTime += 86400;
+    }
+
+    expect(result).toEqual(expected);
+  });
+
+  it("does not return overnight journeys that cannot be made", () => {
+    const trips = [
+      t(
+        st("A", null, 86000), st("B", 86400, 86400),
+        st("C", 86400 + 3600 + 3600, null)
+      ),
+      t(st("C", null, 3600), st("D", 3635, 3635), st("E", 3700, null)),
+      t(
+        st("C", null, 3600 + 3600), st("D", 3635 + 3600, 3635 + 3600),
+        st("E", 3700 + 3600, null)
+      )
+    ];
+
+    const raptor = RaptorAlgorithmFactory.create(trips, {}, {});
+    const query = new DepartAfterQuery(raptor, journeyFactory, 2);
+    const result = query.plan("A", "E", new Date("2018-12-31"), 50000);
+
+    setDefaultTrip(result);
+
+    expect(result[0].arrivalTime).toBe(86400 + 3700 + 3600);
+  });
+});

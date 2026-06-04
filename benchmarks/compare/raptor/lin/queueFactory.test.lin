@@ -1,0 +1,29 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { getQueue } from "./queueFactory"
+
+val s = suite("QueueFactory", [
+  test("enqueues stops", () => [
+    expect(getQueue(
+      { "StopA": ["RouteA", "RouteB"], "StopB": ["RouteB", "RouteC"] },
+      {
+        "RouteA": { "StopA": 1 },
+        "RouteB": { "StopA": 2, "StopB": 1 },
+        "RouteC": { "StopB": 1 }
+      },
+      ["StopA", "StopB"]
+    )).toBe({ "RouteA": "StopA", "RouteB": "StopB", "RouteC": "StopB" })
+  ]),
+
+  test("picks the earliest stop on the route", () => [
+    expect(getQueue(
+      { "StopA": ["RouteA", "RouteB"], "StopB": ["RouteB", "RouteC"] },
+      {
+        "RouteA": { "StopA": 1 },
+        "RouteB": { "StopA": 1, "StopB": 2 },
+        "RouteC": { "StopB": 1 }
+      },
+      ["StopB", "StopA"]
+    )).toBe({ "RouteA": "StopA", "RouteB": "StopA", "RouteC": "StopB" })
+  ])
+])
+run(s)
