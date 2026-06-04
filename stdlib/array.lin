@@ -137,34 +137,62 @@ export val chunk = (arr: Json, size: Int32): Json =>
 export val compact = (arr: Json): Json =>
   _filterJ(arr, x => x != null)
 
-val _swap = (arr: Json, i: Int32, j: Int32): Null =>
-  val tmp = arr[i]
-  set(arr, i, arr[j])
-  set(arr, j, tmp)
+// `sort` is a STABLE, O(n log n) sort (bottom-up merge sort, O(n) extra space). Equal elements
+// (cmp returns 0) keep their ORIGINAL input order, and it scales to large inputs. It replaced an
+// earlier non-stable quicksort: stability is relied on by real code (e.g. keying by a secondary
+// field then a primary), and an unstable sort silently reorders ties. `sort` does not mutate `arr`.
+//
+// `cmp(a, b)` returns negative if a should come before b, positive if after, 0 if equal.
+// Merge two already-sorted runs src[i..loB) and src[loB..hi) into dst[k..). On a tie
+// (cmp <= 0, i.e. left not strictly after right) the LEFT run is taken first → stable.
+val _mergeStep = (src: Json, dst: Json, i: Int32, j: Int32, loB: Int32, hi: Int32, k: Int32, cmp: (Json, Json) => Int32): Null =>
+  if k >= hi then
+    null
+  else if i >= loB then
+    set(dst, k, src[j])
+    _mergeStep(src, dst, i, j + 1, loB, hi, k + 1, cmp)
+  else if j >= hi then
+    set(dst, k, src[i])
+    _mergeStep(src, dst, i + 1, j, loB, hi, k + 1, cmp)
+  else if cmp(src[i], src[j]) <= 0 then
+    set(dst, k, src[i])
+    _mergeStep(src, dst, i + 1, j, loB, hi, k + 1, cmp)
+  else
+    set(dst, k, src[j])
+    _mergeStep(src, dst, i, j + 1, loB, hi, k + 1, cmp)
 
-val _qsort = (arr: Json, cmp: (Json, Json) => Int32, lo: Int32, hi: Int32): Null =>
-  if lo < hi then
-    val pivot = arr[hi]
-    var i = lo - 1
-    var j = lo
-    lin_while(lin_range(lo, hi), _ =>
-      val should_swap = cmp(arr[j], pivot) <= 0
-      if should_swap then i = i + 1
-      if should_swap then _swap(arr, i, j)
-      j = j + 1
-      j < hi
-    )
-    i = i + 1
-    _swap(arr, i, hi)
-    val p = i
-    _qsort(arr, cmp, lo, p - 1)
-    _qsort(arr, cmp, p + 1, hi)
+// Merge every adjacent pair of `width`-sized runs across the array (one pass).
+val _mergeRuns = (src: Json, dst: Json, n: Int32, width: Int32, lo: Int32, cmp: (Json, Json) => Int32): Null =>
+  if lo >= n then
+    null
+  else
+    val loB = if lo + width < n then lo + width else n
+    val hi = if lo + width * 2 < n then lo + width * 2 else n
+    _mergeStep(src, dst, lo, loB, loB, hi, lo, cmp)
+    _mergeRuns(src, dst, n, width, lo + width * 2, cmp)
+
+// Run merge passes of doubling width, ping-ponging buf <-> work; returns the buffer holding
+// the fully-sorted result.
+val _mergePass = (buf: Json, work: Json, n: Int32, width: Int32, cmp: (Json, Json) => Int32): Json =>
+  if width >= n then
+    buf
+  else
+    _mergeRuns(buf, work, n, width, 0, cmp)
+    _mergePass(work, buf, n, width * 2, cmp)
 
 export val sort = (arr: Json, cmp: (Json, Json) => Int32): Json =>
-  val result = concat(arr, [])
-  val n = length(result)
-  if n > 1 then _qsort(result, cmp, 0, n - 1)
-  result
+  val n = length(arr)
+  if n <= 1 then
+    concat(arr, [])
+  else
+    val buf = arrayAllocate(n)
+    val work = arrayAllocate(n)
+    var i = 0
+    arr.for(item =>
+      set(buf, i, item)
+      i = i + 1
+    )
+    _mergePass(buf, work, n, 1, cmp)
 
 export val sortBy = (arr: Json, keyFn: (Json) => Json): Json =>
   val pairs = _mapJ(arr, item => [keyFn(item), item])

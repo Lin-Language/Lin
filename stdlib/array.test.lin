@@ -418,6 +418,36 @@ val s = suite("std/array", [
     ]
   ),
 
+  test("sort is stable: equal keys keep input order", () =>
+    // Records share key 1; their `id` field records input order. A stable sort must
+    // emit the key-1 group as 0,3,5 (input order), never reordered.
+    val items = [
+      { "k": 1, "id": 0 },
+      { "k": 0, "id": 1 },
+      { "k": 1, "id": 2 },
+      { "k": 0, "id": 3 },
+      { "k": 1, "id": 4 },
+      { "k": 0, "id": 5 }
+    ]
+    val sorted = items.sort((a, b) => a["k"] - b["k"])
+    [
+      // key-0 group first, stable: ids 1,3,5; then key-1 group, stable: ids 0,2,4
+      expect(sorted[0]["id"]).toBe(1),
+      expect(sorted[1]["id"]).toBe(3),
+      expect(sorted[2]["id"]).toBe(5),
+      expect(sorted[3]["id"]).toBe(0),
+      expect(sorted[4]["id"]).toBe(2),
+      expect(sorted[5]["id"]).toBe(4)
+    ]
+  ),
+
+  test("sort handles non-power-of-two length", () =>
+    val result = [5, 3, 8, 1, 9, 2, 7].sort((a, b) => a - b)
+    [
+      expect(result.toString()).toBe("[1, 2, 3, 5, 7, 8, 9]")
+    ]
+  ),
+
   test("sum of integers", () =>
     val result = [1, 2, 3, 4].sum()
     [
