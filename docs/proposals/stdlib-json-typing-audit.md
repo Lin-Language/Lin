@@ -1,6 +1,7 @@
 # Stdlib `Json` typing audit — tightening the stdlib once `{ String: T }` lands
 
-Status: proposal / audit (not implemented). Companion to
+Status: proposal / audit. **Category 1 (array/iter generics) is implemented** on branch
+`fix/stdlib-collection-generics`; Categories 2–5 remain. Companion to
 `docs/proposals/typed-map-index-signature.md` (the accepted index-signature `{ String: T }` type).
 
 The stdlib uses `Json` in **145 exported signatures** across 22 modules. Not all of these are lazy —
@@ -20,30 +21,53 @@ jq 3   number 2   hash 2   string 1   archive 1
 
 ## The five categories
 
-### Category 1 — under-genericized collections (fix with `<T>`, mostly independent of the map type)
+### Category 1 — under-genericized collections — DONE
 
-`std/array` and `std/iter` type element-generic operations as `Json` instead of `<T>` over `T[]`. These
-don't need the map type — they need the generic parameter the language already supports (`<T>` is used
-elsewhere in these files, e.g. `arrayAllocateFilled<T>`, `map<T,U>`), it just wasn't applied
-consistently.
+**Implemented on branch `fix/stdlib-collection-generics`** (re-typed `std/array` + `std/iter`
+element-generic ops from `Json` to `<T>`).
 
-Examples (current → proposed):
+Re-typed (current → shipped):
 ```
-push    = (arr: Json, item: Json): Null            →  <T>(arr: T[], item: T): Null
-slice   = (arr: Json, start, end): Json            →  <T>(arr: T[], start, end): T[]
-reverse = (arr: Json): Json                        →  <T>(arr: T[]): T[]
-unique  = (arr: Json): Json                        →  <T>(arr: T[]): T[]
-chunk   = (arr: Json, size): Json                  →  <T>(arr: T[], size): T[][]
-partition = (arr: Json, f): Json                   →  <T>(arr: T[], f: (T,Int32)=>Boolean): [T[], T[]]
-zip     = (a: Json, b: Json): Json                 →  <A,B>(a: A[], b: B[]): [A, B][]
-for/find/some/every/take/drop/takeWhile/dropWhile  →  <T> over T[] (already partly done for map/filter)
-flatten = (arr: Json): Json                        →  <T>(arr: T[][]): T[]
-sum/product/min/max  = (arr: Json[]): Json         →  over a numeric T (see Category 5 caveat)
+slice     = (arr: Json, …): Json   →  <T>(arr: T[], start, end): T[]
+reverse   = (arr: Json): Json      →  <T>(arr: T[]): T[]
+unique    = (arr: Json): Json      →  <T>(arr: T[]): T[]              (result: T[] annotated, flat-safe)
+chunk     = (arr: Json, size): Json →  <T>(arr: T[], size): T[][]     (inner T[] annotated, flat-safe)
+partition = (arr: Json, f): Json   →  <T>(arr: T[], f): T[][]         (NOT a heterogeneous tuple — see below)
+zip       = (a, b): Json           →  <A,B>(a: A[], b: B[]): [A,B][]
+scan      = (arr, init, f): Json[] →  <T,U>(arr: T[], init: U, f: (U,T)=>U): U[]
+find      = (arr, f): Json         →  <T>(arr: T[]|Iterator|Stream, f): T | Null
+some/every= (arr, f): Boolean      →  <T>(arr: T[]|Iterator|Stream, f): Boolean
+take/drop = (arr, n): Json         →  <T>(arr: T[]|Iterator|Stream, n): T[]
+takeWhile/dropWhile = (arr, f)     →  <T>(arr: T[]|Iterator|Stream, f): T[]
+flatten   = (arr: Json): Json      →  <T>(arr: T[][]): T[]
 ```
-Caveat: `for`/`map`/`filter`/`take`/… are unified over `T[] | Iterator | Stream` (see `std/iter`
-header) — keep that union; only the element type `Json` → `T` is the change. `flatMap`/`concat` that
-mix element types may legitimately stay wider. This category is the **largest count and the lowest
-risk**; it can land independently of (and before) the map type.
+The union receiver `T[] | Iterator | Stream` is preserved on every stream-dispatching combinator;
+only the element type `Json` → `T` changed.
+
+Two surface limitations surfaced and are accepted (not language gaps to fix here):
+- **Array literals don't infer as the `FixedArray` tuple type**, so `partition`'s `[pass, fail]` and
+  the like are typed as the homogeneous `T[][]` (still element-typed: `result[0]`/`result[1]` are
+  `T[]`), not the heterogeneous `[T[], T[]]` originally proposed.
+- **Empty array literals can't pin `T`** for the array-only generics, so a couple of empty-literal
+  call sites need an annotation (`val xs: Int32[] = []`).
+
+Deliberately LEFT `Json` (rationale captured in source comments):
+- `push`/`append`/`prepend` — a generic `<T>` pins `T` from a numeric LITERAL item, which splits the
+  declared type from a narrow-scalar flat representation (`UInt8[]`); `push` on an untyped `[]`
+  accumulator additionally mis-monomorphizes and corrupts the store. They dispatch on the runtime
+  element type instead.
+- `for` — the universal iteration driver over `Json`-typed sources (e.g. a `Json[]` of promise
+  handles consumed with `await`); a generic element pin mis-monomorphizes the callback ABI.
+- `concat`/`flatMap` — legitimately MIX element types (`UInt8[]` ++ `String[]` → tagged `Json[]`;
+  `flatMap`'s input vs flattened-output element differ).
+- `compact` — the natural `<T>((T | Null)[]): T[]` is unparseable (no postfix `[]` on a parenthesized
+  union).
+- `iterOf` — opaque Iterator (element erased into the handle); `iterOf([])` can't infer `<T>`.
+- `sum`/`product`/`min`/`max`/`minBy`/`maxBy`/`sort`/`sortBy` — Category 4/5, out of scope.
+
+Validated: `cargo test --workspace`, `lin test stdlib/ examples/` (71 files) + the RAPTOR benchmark
+suite (9 files), and `lin fmt --check stdlib/ examples/ benchmarks/` all green; `docs/STDLIB.md`
+updated for every re-typed signature.
 
 ### Category 2 — the map-type gap (THE reason for `{ String: T }`; fix with the new type)
 
@@ -129,8 +153,8 @@ representation changes; flag any change against that header comment.
 
 ## Suggested order of work
 
-1. **Category 1** (array/iter generics) — largest, lowest-risk, independent of the map type. Big
-   readability/safety win immediately; do it first as its own change.
+1. ~~**Category 1** (array/iter generics)~~ — **DONE** on `fix/stdlib-collection-generics` (see the
+   Category 1 section above for the shipped signatures and the deliberate `Json` exceptions).
 2. **Category 2** (object/map) — gated on `{ String: T }` landing; this is the headline fix and the
    performance unlock. Re-type `std/object` + `groupBy`/`countBy`.
 3. **Category 3** (result/error unions) — define the success records (`Stat`, `DirEntry`,

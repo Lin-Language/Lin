@@ -257,7 +257,10 @@ val s = suite("std/array", [
   ),
 
   test("partition with empty array", () =>
-    val result = [].partition(x => x == 1)
+    // `partition` is `<T>(T[], …): T[][]`; an empty literal cannot pin `T`, so the input is
+    // annotated to determine it (the same empty-literal inference limitation as `flatten`).
+    val empty: Int32[] = []
+    val result = empty.partition(x => x == 1)
     [
       expect(result[0].length()).toBe(0),
       expect(result[1].length()).toBe(0)
@@ -560,7 +563,10 @@ val s = suite("std/array", [
   ),
 
   test("flatten with empty inner arrays", () =>
-    val result = [[], [1], []].flatten()
+    // The element type cannot be inferred from the empty inner literals alone, so the outer
+    // array is annotated to pin `flatten`'s `T` to Int32 (the generic <T>(T[][]): T[] signature).
+    val nested: Int32[][] = [[], [1], []]
+    val result = nested.flatten()
     [
       expect(result.toString()).toBe("[1]")
     ]
@@ -979,6 +985,76 @@ val s = suite("std/array", [
     [
       expect(parts[0].toString()).toBe("[10, 30]"),
       expect(parts[1].toString()).toBe("[20, 40]")
+    ]
+  ),
+
+  // --- generic element typing flows through (Category 1 of the stdlib Json-typing audit) ---
+  // These lock in that the re-typed `<T>` collection ops PRESERVE the element type `T` rather than
+  // erasing to `Json`, so the result can be consumed by a `T`-typed context. `reverse`/`slice`/
+  // `unique` over String[] keep String elements; `String`-typed locals below would not type-check
+  // if the result were `Json`-erased.
+  test("reverse preserves the String element type through to a typed binding", () =>
+    val names = ["alice", "bob", "carol"]
+    val first: String = names.reverse()[0]
+    [
+      expect(first).toBe("carol")
+    ]
+  ),
+
+  test("slice preserves the element type", () =>
+    val xs = [10, 20, 30, 40]
+    val mid: Int32 = xs.slice(1, 3)[0]
+    [
+      expect(mid).toBe(20)
+    ]
+  ),
+
+  test("unique result element flows into a String-typed binding", () =>
+    val tags = ["a", "b", "a", "c"]
+    val u: String = tags.unique()[1]
+    [
+      expect(u).toBe("b")
+    ]
+  ),
+
+  // Regression: `unique` returns `T[]`, so a scalar `T` (Int32) element must be read back through
+  // the FLAT array path. `unique` builds its result via `[]` + push, which is tagged unless the
+  // accumulator is annotated `T[]` — without that annotation a typed `u[2]` read decoded garbage
+  // (the tagged bytes reinterpreted as a packed Int32). The `result: T[]` annotation in `unique`
+  // forces the flat representation that matches the declared return type.
+  test("unique preserves the flat Int32 representation for typed element reads", () =>
+    val u = [1, 1, 2, 3].unique()
+    val third: Int32 = u[2]
+    [
+      expect(third).toBe(3),
+      expect(u.toString()).toBe("[1, 2, 3]")
+    ]
+  ),
+
+  test("partition returns T[][] whose inner arrays carry the element type", () =>
+    val parts = [1, 2, 3, 4].partition(x => x > 2)
+    val pass: Int32[] = parts[0]
+    val n: Int32 = pass[0]
+    [
+      expect(n).toBe(3)
+    ]
+  ),
+
+  test("zip pairs flow the two element types into a typed access", () =>
+    val pairs = [1, 2].zip(["a", "b"])
+    val k: Int32 = pairs[0][0]
+    val v: String = pairs[1][1]
+    [
+      expect(k).toBe(1),
+      expect(v).toBe("b")
+    ]
+  ),
+
+  test("chunk preserves the element type in nested chunks", () =>
+    val cs = [1, 2, 3, 4].chunk(2)
+    val firstChunkHead: Int32 = cs[0][0]
+    [
+      expect(firstChunkHead).toBe(1)
     ]
   )
 ])
