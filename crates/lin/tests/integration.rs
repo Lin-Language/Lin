@@ -154,6 +154,47 @@ fn run_with_stdin(source: &str, stdin_data: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Compile source to a binary, run it with `prog_args` appended after argv[0],
+/// and return its trimmed stdout. Panics if compilation or execution fails.
+fn run_with_args(source: &str, prog_args: &[&str]) -> String {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_args_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_args_{}", id));
+
+    fs::write(&src_path, source).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+
+    let _ = fs::remove_file(&src_path);
+
+    assert!(
+        compile.status.success(),
+        "compilation failed:\nstderr: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run_out = Command::new(&bin_path)
+        .args(prog_args)
+        .output()
+        .expect("failed to run compiled binary");
+
+    let _ = fs::remove_file(&bin_path);
+
+    assert!(
+        run_out.status.success(),
+        "runtime error:\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&run_out.stderr),
+        String::from_utf8_lossy(&run_out.stdout),
+    );
+
+    String::from_utf8_lossy(&run_out.stdout).trim().to_string()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Core language tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -11315,4 +11356,36 @@ print("${toString(peek())} ${toString(nextId())} ${toString(nextId())} ${toStrin
     let lines: Vec<String> = stdout.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect();
     // peek=10 (init respected), then two increments to 11 and 12, then peek sees the shared 12.
     assert_eq!(lines, vec!["10 11 12 12"]);
+}
+
+#[test]
+fn test_cli_args_read_in_compiled_binary() {
+    // Regression: a compiled `lin build` binary can read its command-line arguments
+    // via std/io.args(). args() excludes argv[0] and returns the user args in order.
+    let src = r#"
+import { args, print } from "std/io"
+import { for } from "std/iter"
+import { length } from "std/array"
+import { toString } from "std/string"
+val a = args()
+print("count=${toString(length(a))}")
+a.for(x => print(x))
+"#;
+    let out = run_with_args(src, &["alpha", "beta", "gamma"]);
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        vec!["count=3", "alpha", "beta", "gamma"]
+    );
+}
+
+#[test]
+fn test_cli_args_empty_when_none_passed() {
+    let src = r#"
+import { args, print } from "std/io"
+import { length } from "std/array"
+import { toString } from "std/string"
+print("count=${toString(length(args()))}")
+"#;
+    let out = run_with_args(src, &[]);
+    assert_eq!(out, "count=0");
 }
