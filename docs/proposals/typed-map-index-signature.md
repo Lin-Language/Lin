@@ -1,8 +1,12 @@
-# Proposal: a typed map / index-signature type (`{ String: T }` / `Map<K, V>`)
+# Proposal: a typed index-signature object type `{ String: T }`
 
-Status: proposal (not implemented). Motivated by the RAPTOR port (`benchmarks/compare/raptor/lin/`),
-which is written entirely in `Json` (282 `: Json` annotations, zero named types) — not because the
-port was lazy, but because a chunk of its data model has **no type to express it**.
+Status: **accepted — Option A (index-signature `{ String: T }`); not yet implemented.** The language
+owner has chosen the index-signature form over a separate nominal `Map<K, V>` container. Option B is
+recorded below only as the considered-and-rejected alternative; build Option A.
+
+Motivated by the RAPTOR port (`benchmarks/compare/raptor/lin/`), which is written entirely in `Json`
+(282 `: Json` annotations, zero named types) — not because the port was lazy, but because a chunk of
+its data model has **no type to express it**.
 
 ## The gap in one sentence
 
@@ -57,44 +61,47 @@ In the Lin port every one of these is `Json`. They are also the **hot, large** s
    ```
    and the value type flows through instead of collapsing to `Json`.
 
-## Design questions for the implementing agent
-
-This is a real language-surface feature; the doc deliberately leaves the headline choice open because
-it's a design call for the language owner. Two coherent shapes:
-
-### Option A — index-signature object type `{ String: T }`
+## The design to build — index-signature object type `{ String: T }`
 
 A new object-type form where the key is a type (`String`) rather than literal field names, meaning
-"any number of string keys, each mapping to `T`". Reads naturally, composes with the existing object
-syntax, and the value `{}` / `obj[k]` / `obj[k]=v` surface syntax is unchanged — only the *type* is new.
+"any number of string keys, each mapping to `T`". It reads naturally, composes with the existing
+object syntax, and the **value-level surface is unchanged** — `{}` literals, `obj[k]`, `obj[k] = v`,
+`keys(obj)` all work exactly as today; only the *type* `{ String: T }` is new. This is the chosen
+approach (smaller surface change than a nominal `Map`, tightens the existing discoverable `{}` type and
+the `std/object` stdlib, and is exactly the String-keyed shape the RAPTOR maps need).
 
-- Type grammar (§5): add `{ KeyType: ValueType }` alongside the fixed-field `{ "f": T, … }` form.
-  Decide whether the key type is always `String` (matches JS objects / current runtime — keys are
-  `LinString`) or can later widen to `Int`-keyed maps. RAPTOR only needs `String` keys (`kArrivals`'
-  numeric round keys are already stringified — see `scanResults.lin`), so `String`-only is a fine v1.
-- Checker: `obj[k]` on `{ String: T }` yields `T | Null` (missing key → Null, consistent with §6.1
-  bracket access); `obj[k] = v` requires `v: T`; `keys(obj): String[]`. `is`/`has` against a map type
-  (validate "object whose values are all T"?) — decide, or disallow like generic application (§11,
-  `is Result<…>` is already rejected).
-- Mixing: a value can't be *both* a fixed record and a map; decide the conversion/subtyping story
-  (probably: a map type is its own thing; `Json` → map needs `fromJson`/narrowing like §19).
+Spec / implementation points to settle while building:
 
-### Option B — a nominal `Map<K, V>` container (distinct from objects)
+- **Type grammar (§5).** Add `{ String: ValueType }` alongside the fixed-field `{ "f": T, … }` form.
+  Key type is **`String` only for v1** — it matches JS objects and the current runtime (object keys are
+  `LinString`), and it's all RAPTOR needs (`kArrivals`' numeric round keys are already stringified —
+  see `scanResults.lin`). Leave the grammar open enough that an `Int`-keyed form could be added later,
+  but don't build it now.
+- **Checker.** `obj[k]` on `{ String: T }` yields `T | Null` (missing key → `Null`, consistent with the
+  §6.1 safe-bracket-access rule); `obj[k] = v` requires `v : T`; an empty `{}` literal infers
+  `{ String: T }` from context (assignment target / return type) or stays a fixed record otherwise.
+  `keys(obj) : String[]`, `values(obj) : T[]`. Decide `is`/`has` against an index-signature type
+  (either validate "object whose values are all `T`", or disallow it like generic application — `is
+  Result<…>` is already rejected in §11; disallowing is the cheaper v1).
+- **Record vs map.** A value is either a fixed record or an index-signature map, not both. A map type is
+  its own thing; converting a `Json` into one needs `fromJson`/narrowing exactly like §19 (don't make
+  `Json → { String: T }` an implicit coercion — keep parity with the §6.3 `Json`-conversion rule).
+- **Runtime / codegen — the performance point.** Because the value type `T` is known, the backing
+  representation should be **hashed (O(1) average lookup)** and should store/return `T` **unboxed**
+  rather than boxing every value as `Json`. Reusing `LinObject` is possible but inherits the inline
+  `MakeObject` ABI constraint (`codegen/mod.rs` GEPs at `entries@16`, 24-byte stride — see
+  `hashed-json-object.md`); a distinct backing buffer for index-signature objects sidesteps that. Either
+  way, the O(1) + unboxing is the whole performance payoff — a typed map that's still an O(n) assoc-list
+  of boxed values would tighten types but not move the RAPTOR `PREP` number.
 
-A first-class hashed map type, separate from `{}` objects: `Map<K, V>` in the checker, a runtime
-container (`lin_map_*`), and a `std/map` module (`Map.new`, `get`, `set`, `has`, `delete`, `keys`,
-`size`). The "honest" data-structures answer — dictionary use gets a purpose-built O(1) type and `{}`
-stays record-shaped — and it allows non-String keys. Cost: more surface area (new literal syntax or
-constructor, `for`/destructuring/equality interactions) and a **discoverability footgun**: users reach
-for `{}` first and only find `Map` after hitting the wall (the same trap #4a had with `sort` vs a
-missing `sortStable`).
+### Rejected alternative — a nominal `Map<K, V>` container
 
-**Recommendation to weigh, not a mandate:** Option A is the smaller surface change and directly tightens
-the existing, discoverable `{}` type and the `std/object` stdlib — and it's what the RAPTOR maps want
-(String-keyed). Option B is more powerful (non-String keys, a clean separation) but larger and leaves
-the footgun. A reasonable path is A first (String-keyed index signature + hashed backing), with B left
-as a future option if non-String-keyed maps become necessary. The implementing agent should confirm the
-choice with the language owner before building — this is a spec-level decision (new §5 grammar + ADR).
+A first-class hashed map distinct from `{}` objects (`Map<K, V>` type, `lin_map_*` runtime, a `std/map`
+module). More powerful (allows non-String keys, cleanly separates dictionaries from records) but a
+larger surface (new literal/constructor syntax, `for`/destructuring/equality interactions) and it leaves
+a **discoverability footgun** — users reach for `{}` first and only find `Map` after hitting the O(n²)
+wall (the same trap #4a had with `sort` vs a missing `sortStable`). Not chosen. If non-String-keyed
+maps are ever needed, this can be revisited as an addition; it is not a prerequisite.
 
 ## Relationship to the hashed-`Json`-object proposal (#4b)
 
@@ -136,9 +143,10 @@ a map reuses the `LinObject` layout; a distinct `Map` container (Option B) sides
 
 ## Process
 
-Spec/ADR-level change — confirm the Option A vs B decision with the owner first. Then a worktree off
-master, with checker + codegen + runtime + stdlib changes, the microbenchmark, and (ideally) the
-RAPTOR re-typing as the macro validation. Don't merge without review.
+Spec/ADR-level change (the decision — Option A, index-signature `{ String: T }` — is already made;
+write the §5 grammar addition + an ADR as part of the work). Work in a worktree off master, with
+checker + codegen + runtime + stdlib changes, the microbenchmark, and (ideally) the RAPTOR re-typing as
+the macro validation. Don't merge without review.
 
 ## Already resolved (don't redo)
 
