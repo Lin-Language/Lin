@@ -1705,9 +1705,9 @@ today.
 
 ## ADR-082: Typed index-signature object type `{ String: T }` backed by a hashed `LinMap`
 
-**Decision**: Add a typed *index-signature* object type `{ String: T }` (Option A of
-`docs/proposals/typed-map-index-signature.md`) — an object used as a dictionary with arbitrary
-String keys all mapping to value type `T`. It is a **new `Type` variant** (`Type::Map(Box<Type>)`,
+**Decision**: Add a typed *index-signature* object type `{ String: T }` (Option A of the
+now-retired `typed-map-index-signature` proposal; this ADR is the surviving record) — an object used
+as a dictionary with arbitrary String keys all mapping to value type `T`. It is a **new `Type` variant** (`Type::Map(Box<Type>)`,
 surface `TypeExpr::IndexSig`) distinct from the fixed-field `Type::Object` record, and is backed at
 runtime by a **distinct hashed container `LinMap`** (open-addressing, FNV-1a, linear probing) giving
 **O(1) average** lookup/insert — *not* the O(n) association-list `LinObject`.
@@ -1865,8 +1865,8 @@ object grows past a threshold (`HASH_INDEX_THRESHOLD = 16` entries). The change 
 discoverable* `{}` type with zero surface-language change, no small-object perf change, and no codegen
 ABI change. A dedicated `Map<K,V>` runtime/stdlib type (proposal option b) was rejected as the *first*
 move because users reach for `{}` first and would keep hitting the wall; it remains a possible additive
-follow-up for non-string keys. (See the separate `docs/proposals/typed-map-index-signature.md` for the
-typed-map *surface syntax* direction, which is orthogonal to this runtime representation.)
+follow-up for non-string keys. (See ADR-082 for the typed-map `{ String: T }` *surface syntax*
+direction, which is orthogonal to this runtime representation.)
 
 **Correctness/safety**: the index stores **only `u32` slot indices — never refcounted pointers** — so a
 bug here is structurally outside the UAF/double-free class that `object.rs` is otherwise prone to; the
