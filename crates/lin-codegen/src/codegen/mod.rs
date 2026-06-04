@@ -1216,7 +1216,7 @@ impl<'ctx> Codegen<'ctx> {
                                     | Type::Float32 | Type::Float64 => Some(false),
                                     Type::Str | Type::StrLit(_)
                                     | Type::Array(_) | Type::FixedArray(_)
-                                    | Type::Object(_) => Some(true),
+                                    | Type::Object { .. } => Some(true),
                                     _ => None,
                                 }
                             }

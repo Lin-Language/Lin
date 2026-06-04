@@ -216,7 +216,7 @@ impl Checker {
                 for p in params { Self::collect_typevar_ids(p, out); }
                 Self::collect_typevar_ids(ret, out);
             }
-            Type::Object(fields) => { for v in fields.values() { Self::collect_typevar_ids(v, out); } }
+            Type::Object { fields, .. } => { for v in fields.values() { Self::collect_typevar_ids(v, out); } }
             _ => {}
         }
     }

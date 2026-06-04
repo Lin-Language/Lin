@@ -118,7 +118,7 @@ impl<'ctx> Codegen<'ctx> {
                 .try_as_basic_value()
                 .unwrap_basic()
                 .into_int_value()
-        } else if matches!(ty, Type::Object(_)) {
+        } else if matches!(ty, Type::Object { .. }) {
             // Structural object equality via runtime (order-independent).
             let eq_i8 = self.builder
                 .build_call(self.rt.object_eq, &[lv.into(), rv.into()], "oeq")

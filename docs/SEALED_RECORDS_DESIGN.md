@@ -246,7 +246,37 @@ the non-mutating lossy-projection boundary semantics. Write the ADR(s) and spec
 edits (§ on objects, §ADR-048 interaction, narrowing). Pin the semantics matrix
 (§3) as the conformance checklist. No code.
 
+**Stage 0.5 — Named-record identity must survive resolution (PREREQUISITE).**
+A blocking architectural fact, verified in code: `resolve_named_cycle`
+(`crates/lin-check/src/resolve.rs:119-124`) **fully unfolds** a non-recursive
+named type annotation (`: Point`) into `Type::Object(IndexMap<field,Type>)` and
+*discards the name*. Only *recursive/cyclic* types survive as `Type::Named`. So
+by codegen, a `Point`-typed value and an anonymous `{x,y}` literal of the same
+fields are byte-identical `Type::Object` values — the only property left to gate
+on is "all fields are scalars", which would seal every anonymous literal too
+(the broad, RC-heavy, repo-wide variant), not just named types.
+
+To scope struct layout to *named* types (the decided model), named-ness/sealed-
+ness must be carried through resolution **without changing structural
+compatibility**. Approach (modeled on ADR-051, which makes `StrLit` carry
+through as "Str at runtime, distinct at check-time"): mark a record type sealed
+when a `type T = { …concrete fields… }` annotation resolves — e.g. a `sealed`
+flag (and optionally the name) on `Type::Object`, or a dedicated wrapper —
+threaded into `MakeObject.ty`, param/return types, and `temp_types`, reaching
+the `MakeObject`/`FieldGet`/`Coerce`/`Release` sites. `compat.rs` continues to
+unfold to the field map, so structural compatibility ("has this shape") is
+UNCHANGED — only the representation gate keys on the marker. This stage adds the
+marker and threads it through; codegen IGNORES it (no representation change yet),
+so the **gate is pure run-equivalence**: the entire corpus must type-check and
+behave identically, proving the marker is inert until Stage 1 consumes it. The
+built-in `Error` alias and other structural aliases are NOT sealed. Risk: this
+touches type identity across the checker (compat, field inference, equality,
+exhaustiveness, narrowing, zonk) — directly the Open Question 6 corpus risk — so
+run-equivalence over `stdlib/`+`examples/`+benchmarks is mandatory.
+
 **Stage 1 — Scalar-only sealed records, single values (the 16× core).**
+*Now gated on the Stage 0.5 sealed marker (named + all-scalar), not on
+all-scalar-shape, so anonymous literals stay boxed.*
 - Codegen: lay out a named type whose fields are *all unboxed scalars*
   (Int32/Int64/Float64/Bool) as an LLVM struct; field read/write =
   constant-offset load/store; construction = field stores by offset. Gate

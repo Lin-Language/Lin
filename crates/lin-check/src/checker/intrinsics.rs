@@ -53,13 +53,13 @@ impl Checker {
         // keys: (Object) => String[]
         self.define_intrinsic(
             "lin_keys",
-            Type::func(vec![Type::Object(IndexMap::new())], Type::Array(Box::new(Type::Str))),
+            Type::func(vec![Type::object(IndexMap::new())], Type::Array(Box::new(Type::Str))),
         );
 
         // lin_object_set: (Object, String, Json) => Null — in-place object key mutation
         self.define_intrinsic(
             "lin_object_set",
-            Type::func(vec![Type::Object(IndexMap::new()), Type::Str, Type::TypeVar(u32::MAX)], Type::Null),
+            Type::func(vec![Type::object(IndexMap::new()), Type::Str, Type::TypeVar(u32::MAX)], Type::Null),
         );
 
         // for: (Iterable<T>, (T) => Json) => Null  — callback return type is ignored. A `Stream<T>`

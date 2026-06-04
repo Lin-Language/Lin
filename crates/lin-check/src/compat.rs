@@ -163,7 +163,11 @@ pub fn is_compatible_env(
 
         // Object structural compatibility: value has all target fields with compatible types.
         // A missing field is allowed when the target field type includes Null.
-        (Type::Object(value_fields), Type::Object(target_fields)) => {
+        // INVARIANT (Stage 0.5): the `sealed` marker is IGNORED here — a sealed named-record type
+        // and an unsealed anonymous type with the same fields remain mutually compatible, and a
+        // wider Json is still assignable where a named type is expected. Compatibility is purely
+        // structural. See SEALED_RECORDS_DESIGN.md §5 invariant 1.
+        (Type::Object { fields: value_fields, .. }, Type::Object { fields: target_fields, .. }) => {
             target_fields.iter().all(|(key, target_ty)| {
                 match value_fields.get(key) {
                     Some(vt) => is_compatible_env(vt, target_ty, env, lenient_json, depth),
@@ -258,7 +262,7 @@ pub fn is_exact_match(value_type: &Type, target_type: &Type) -> bool {
     }
 
     match (value_type, target_type) {
-        (Type::Object(value_fields), Type::Object(target_fields)) => {
+        (Type::Object { fields: value_fields, .. }, Type::Object { fields: target_fields, .. }) => {
             value_fields.len() == target_fields.len()
                 && target_fields.iter().all(|(key, target_ty)| {
                     value_fields
@@ -303,7 +307,7 @@ fn requires_structured_decode(target: &Type, env: Option<&TypeEnv>, depth: &mut 
         return false;
     }
     match target {
-        Type::Object(fields) => fields.values().any(|t| !includes_null(t)),
+        Type::Object { fields, .. } => fields.values().any(|t| !includes_null(t)),
         Type::Named(n) => {
             if let Some(env) = env {
                 if let Some(decl) = env.lookup_type(n) {

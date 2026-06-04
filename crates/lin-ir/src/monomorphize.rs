@@ -59,7 +59,7 @@ fn mentions_generic_tv(ty: &Type) -> bool {
         Type::TypeVar(id) => *id >= GENERIC_TV_BASE && *id != u32::MAX,
         Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) => mentions_generic_tv(t),
         Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(mentions_generic_tv),
-        Type::Object(fields) => fields.values().any(mentions_generic_tv),
+        Type::Object { fields, .. } => fields.values().any(mentions_generic_tv),
         Type::Function { params, ret, .. } => {
             params.iter().any(mentions_generic_tv) || mentions_generic_tv(ret)
         }
@@ -90,9 +90,10 @@ fn subst_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
         Type::Stream(t) => Type::Stream(Box::new(subst_type(t, subs))),
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| subst_type(t, subs)).collect()),
         Type::Union(ts) => Type::Union(ts.iter().map(|t| subst_type(t, subs)).collect()),
-        Type::Object(fields) => Type::Object(
-            fields.iter().map(|(k, v)| (k.clone(), subst_type(v, subs))).collect(),
-        ),
+        Type::Object { fields, sealed } => Type::Object {
+            fields: fields.iter().map(|(k, v)| (k.clone(), subst_type(v, subs))).collect(),
+            sealed: *sealed,
+        },
         Type::Function { params, ret, required } => Type::Function {
             params: params.iter().map(|p| subst_type(p, subs)).collect(),
             ret: Box::new(subst_type(ret, subs)),
@@ -131,9 +132,10 @@ fn erase_nonconcrete_typevars(ty: &Type) -> Type {
             Type::FixedArray(ts.iter().map(erase_nonconcrete_typevars).collect())
         }
         Type::Union(ts) => Type::Union(ts.iter().map(erase_nonconcrete_typevars).collect()),
-        Type::Object(fields) => Type::Object(
-            fields.iter().map(|(k, v)| (k.clone(), erase_nonconcrete_typevars(v))).collect(),
-        ),
+        Type::Object { fields, sealed } => Type::Object {
+            fields: fields.iter().map(|(k, v)| (k.clone(), erase_nonconcrete_typevars(v))).collect(),
+            sealed: *sealed,
+        },
         Type::Function { params, ret, required } => Type::Function {
             params: params.iter().map(erase_nonconcrete_typevars).collect(),
             ret: Box::new(erase_nonconcrete_typevars(ret)),
@@ -178,7 +180,7 @@ fn collect_subs(pattern: &Type, actual: &Type, subs: &mut HashMap<u32, Type>) {
         (Type::Iterator(p), Type::Iterator(a)) => collect_subs(p, a, subs),
         (Type::Shared(p), Type::Shared(a)) => collect_subs(p, a, subs),
         (Type::Stream(p), Type::Stream(a)) => collect_subs(p, a, subs),
-        (Type::Object(pf), Type::Object(af)) => {
+        (Type::Object { fields: pf, .. }, Type::Object { fields: af, .. }) => {
             for (k, pv) in pf {
                 if let Some(av) = af.get(k) { collect_subs(pv, av, subs); }
             }
@@ -211,7 +213,7 @@ fn mangle_type(ty: &Type) -> String {
         Type::Array(t) => format!("Arr_{}", mangle_type(t)),
         Type::Iterator(t) => format!("Iter_{}", mangle_type(t)),
         Type::Stream(t) => format!("Stream_{}", mangle_type(t)),
-        Type::Object(_) => "Object".into(),
+        Type::Object { .. } => "Object".into(),
         Type::Union(_) => "Union".into(),
         Type::Function { .. } => "Fn".into(),
         // The `u32::MAX` Json wildcard (an erased non-concrete type-arg) mangles to `Json`, so a
@@ -1515,7 +1517,7 @@ fn collect_quantified_ids(ty: &Type, out: &mut std::collections::HashSet<u32>) {
         Type::FixedArray(ts) | Type::Union(ts) => {
             ts.iter().for_each(|t| collect_quantified_ids(t, out))
         }
-        Type::Object(fields) => fields.values().for_each(|t| collect_quantified_ids(t, out)),
+        Type::Object { fields, .. } => fields.values().for_each(|t| collect_quantified_ids(t, out)),
         Type::Function { params, ret, .. } => {
             params.iter().for_each(|t| collect_quantified_ids(t, out));
             collect_quantified_ids(ret, out);

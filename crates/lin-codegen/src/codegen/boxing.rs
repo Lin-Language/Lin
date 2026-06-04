@@ -93,7 +93,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.box_str, &[val.into()], "boxstr")
                     .try_as_basic_value().unwrap_basic()
             }
-            Type::Object(_) => {
+            Type::Object { .. } => {
                 self.builder.call(self.rt.box_object, &[val.into()], "boxobj")
                     .try_as_basic_value().unwrap_basic()
             }
@@ -118,7 +118,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::Union(variants) => {
                 if val.is_pointer_value() {
                     // If all variants are Object types, this is a LinObject*.
-                    let all_objects = variants.iter().all(|v| matches!(v, Type::Object(_)));
+                    let all_objects = variants.iter().all(|v| matches!(v, Type::Object { .. }));
                     if all_objects {
                         self.builder.call(self.rt.box_object, &[val.into()], "boxobj")
                             .try_as_basic_value().unwrap_basic()
@@ -210,7 +210,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.unbox_ptr, &[ptr_val.into()], "ustr")
                     .try_as_basic_value().unwrap_basic()
             }
-            Type::Object(_) | Type::Array(_) | Type::FixedArray(_) | Type::Function { .. } => {
+            Type::Object { .. } | Type::Array(_) | Type::FixedArray(_) | Type::Function { .. } => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr_val.into()], "uptr")
                     .try_as_basic_value().unwrap_basic()
             }
@@ -322,7 +322,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::Str | Type::StrLit(_) => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr.into()], "ir_ustr").try_as_basic_value().unwrap_basic()
             }
-            Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. } => {
+            Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Function { .. } => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr.into()], "ir_uptr").try_as_basic_value().unwrap_basic()
             }
             Type::Null => ptr_ty.const_null().into(),
