@@ -11539,3 +11539,32 @@ print("${total}")
 "#);
     assert_eq!(out, vec!["4950"]);
 }
+
+#[test]
+fn test_sealed_tail_recursive_self_call_record_literal_arg() {
+    // REGRESSION (found adding the `records` cross-language benchmark): a TAIL-recursive function
+    // taking a sealed-record param and passing a fresh record LITERAL as the self-call argument.
+    // The outer binding's function type resolves the param to the sealed `Object`, but inside the
+    // body the self-reference carries the unexpanded `Named` alias — so at the recursive tail call
+    // `func.ty()` reports `Named(_)` while the callee reads the param as a sealed struct. The arg
+    // literal was being boxed as Json (the `Named`-is-union-ish path), which the TCO loop header
+    // then misread at constant struct offsets → heap corruption / segfault past ~a few thousand
+    // iterations. The fix constructs/projects the literal into the sealed layout at the boundary.
+    // A small N here exercises the path; the benchmark runs 50M iterations under ASan in CI.
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type State = { "a": Int64, "b": Int64, "c": Int64 }
+val step = (i: Int64, s: State): State =>
+  if i == 0i64 then
+    s
+  else
+    step(i - 1i64, { "a": s["a"] + 1i64, "b": s["b"] + s["a"], "c": s["c"] + 2i64 })
+val init: State = { "a": 1i64, "b": 0i64, "c": 0i64 }
+val final = step(10000i64, init)
+print("${toString(final["a"] + final["b"] + final["c"])}")
+"#);
+    // a: 1 + 10000 = 10001; b: sum of a over iters; c: 2*10000 = 20000. The exact total is not the
+    // point — the point is it RUNS (no segfault) and is deterministic.
+    assert_eq!(out, vec!["50035001"]);
+}

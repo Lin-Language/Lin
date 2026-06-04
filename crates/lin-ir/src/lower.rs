@@ -1548,6 +1548,31 @@ fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: 
     if is_sealed_scalar_repr(arg_ty) && matches!(param_ty, Type::Named(_)) {
         return arg;
     }
+    // An UNSEALED object value (e.g. a record LITERAL, which `lower_expr` builds as a boxed
+    // LinObject) flowing into a `Named` param that the callee reads as a SEALED struct. This is
+    // the self-recursive-call case: the outer binding's function type resolves the param to the
+    // sealed `Object`, but inside the body the recursive reference still carries the unexpanded
+    // `Named` alias, so `func.ty()` hands us `Named(_)` here. The union arm below would box the
+    // literal as Json — which the callee (reading constant struct offsets) then misreads as a
+    // struct → heap corruption / segfault. Since the literal's fields are all sealed-eligible and
+    // structural compatibility guarantees it has the named type's shape, PROJECT it into the
+    // sealed struct layout (a fresh +1 owned struct) so the representation matches the callee.
+    if matches!(param_ty, Type::Named(_)) {
+        if let Type::Object { fields, sealed: false } = arg_ty {
+            if !fields.is_empty() && fields.values().all(is_sealed_field_ty) {
+                let sealed_ty = Type::sealed_object(fields.clone());
+                let dst = builder.alloc_temp(sealed_ty.clone());
+                builder.emit(Instruction::Coerce {
+                    dst,
+                    src: arg,
+                    from_ty: arg_ty.clone(),
+                    to_ty: sealed_ty.clone(),
+                });
+                builder.register_owned(dst, sealed_ty);
+                return dst;
+            }
+        }
+    }
     // Box/unbox across the union boundary.
     if is_union_ty(param_ty) != is_union_ty(arg_ty) {
         let dst = builder.alloc_temp(param_ty.clone());
@@ -2771,6 +2796,40 @@ fn move_streamish_arg(arg_ty: &Type, t: Temp, builder: &mut FuncBuilder) {
 ///      can transfer its ownership on escape (see `escape_alias`). Returns `None` otherwise.
 /// The two are mutually exclusive in practice (the combinator-callback path lowers a closure,
 /// which is never a boxed fresh heap literal), but composing them keeps the call site uniform.
+/// A record LITERAL flowing into a `Named` param that the callee reads as a SEALED struct (the
+/// self-recursive-call case — `func.ty()` carries the unexpanded `Named` alias while the callee
+/// body resolved it to the sealed `Object`). Construct the sealed struct DIRECTLY (each field
+/// stored by offset) instead of building a boxed `LinObject` and projecting it back — which would
+/// pay a per-call `lin_object_alloc` + N sets + N `lin_object_get` on a hot recursive path. Returns
+/// `Some` having lowered the arg as a sealed struct, `None` to fall through to the generic path.
+/// (The generic path's `lower_coerce_arg` still PROJECTS correctly for the cases this misses, e.g.
+/// a non-literal sealed-compatible value flowing into a `Named` param — this is only the
+/// construction fast path.)
+fn try_lower_sealed_literal_into_named(
+    a: &TypedExpr,
+    param_ty: Option<&Type>,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<Temp> {
+    if !matches!(param_ty, Some(Type::Named(_))) {
+        return None;
+    }
+    let TypedExpr::MakeObject { fields, spreads, .. } = a else { return None };
+    if !spreads.is_empty() {
+        return None;
+    }
+    let aty = a.ty();
+    let Type::Object { fields: afields, .. } = &aty else { return None };
+    if afields.is_empty() || !afields.values().all(is_sealed_field_ty) {
+        return None;
+    }
+    if !afields.keys().all(|k| fields.iter().any(|(fk, _)| fk == k)) {
+        return None;
+    }
+    let sealed_ty = Type::sealed_object(afields.clone());
+    try_lower_sealed_literal(a, &sealed_ty, builder, ctx)
+}
+
 fn lower_call_arg_tracked(
     a: &TypedExpr,
     param_ty: Option<&Type>,
@@ -2779,6 +2838,11 @@ fn lower_call_arg_tracked(
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> (Temp, Option<Temp>) {
+    // Sealed record literal → `Named` param: construct the sealed struct directly (see helper).
+    // Checked BEFORE the boxed-shell branch below, which would otherwise box the literal as Json.
+    if let Some(t) = try_lower_sealed_literal_into_named(a, param_ty, builder, ctx) {
+        return (t, None);
+    }
     // Fresh-alloc heap literal boxed into a Json/union param: capture the raw temp for
     // transfer-on-escape tracking. (This path never coincides with a combinator callback.)
     if arg_box_is_caller_owned_shell(&a.ty(), param_ty) && expr_is_fresh_alloc(a) {
