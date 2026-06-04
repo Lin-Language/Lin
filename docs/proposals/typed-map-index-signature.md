@@ -44,8 +44,9 @@ In the Lin port every one of these is `Json`. They are also the **hot, large** s
    Journey + the Leg/Connection unions) *could* be typed today; the other ~40% (the maps above) cannot.
 2. **Performance.** A typed map carries a known value type `T`, so the runtime can (a) use a hashed
    representation for O(1) lookup and (b) store/return `T` unboxed instead of boxing every value as
-   `Json`. This subsumes the separate hashed-`Json`-object proposal
-   (`docs/proposals/hashed-json-object.md`, #4b) — see "Relationship" below.
+   `Json`. The O(1)-lookup half is **already shipped** for plain `Json` objects via the lazy hash
+   side-index (ADR-081, RAPTOR #4b); the win still unique to a typed map is the *unboxed* value storage
+   — see "Relationship" below.
 3. **Stdlib tightening.** A whole cluster of `std/object` signatures is lax *because the return type
    isn't expressible*, not by choice:
    ```
@@ -87,12 +88,13 @@ Spec / implementation points to settle while building:
   its own thing; converting a `Json` into one needs `fromJson`/narrowing exactly like §19 (don't make
   `Json → { String: T }` an implicit coercion — keep parity with the §6.3 `Json`-conversion rule).
 - **Runtime / codegen — the performance point.** Because the value type `T` is known, the backing
-  representation should be **hashed (O(1) average lookup)** and should store/return `T` **unboxed**
-  rather than boxing every value as `Json`. Reusing `LinObject` is possible but inherits the inline
-  `MakeObject` ABI constraint (`codegen/mod.rs` GEPs at `entries@16`, 24-byte stride — see
-  `hashed-json-object.md`); a distinct backing buffer for index-signature objects sidesteps that. Either
-  way, the O(1) + unboxing is the whole performance payoff — a typed map that's still an O(n) assoc-list
-  of boxed values would tighten types but not move the RAPTOR `PREP` number.
+  representation should store/return `T` **unboxed** rather than boxing every value as `Json`. The
+  **O(1)-lookup** part is already done — `LinObject` now carries a lazy hash side-index (ADR-081), so a
+  map reusing `LinObject` inherits O(1) lookup for free and the remaining work is purely the unboxed
+  value storage. Note the inline `MakeObject` ABI constraint that ADR-081 had to respect
+  (`codegen/mod.rs` GEPs at `entries@16`, 24-byte stride; ADR-081 appended its index fields at offset
+  ≥ 24): a distinct backing buffer for index-signature objects sidesteps that constraint entirely.
+  Either way, the unboxing is the payoff a typed map adds *on top of* the now-shipped O(1) lookup.
 
 ### Rejected alternative — a nominal `Map<K, V>` container
 
@@ -103,24 +105,25 @@ a **discoverability footgun** — users reach for `{}` first and only find `Map`
 wall (the same trap #4a had with `sort` vs a missing `sortStable`). Not chosen. If non-String-keyed
 maps are ever needed, this can be revisited as an addition; it is not a prerequisite.
 
-## Relationship to the hashed-`Json`-object proposal (#4b)
+## Relationship to the hashed-`Json`-object change (#4b, ADR-081 — shipped)
 
-`docs/proposals/hashed-json-object.md` proposes a lazy hash side-index on `Json` objects to fix O(n)
-lookup *without* a type-system change. This proposal is the **type-system** route to the same
-performance win, plus fidelity and stdlib benefits. They are not independent:
+The lazy hash side-index on `Json` objects (originally proposed in `docs/proposals/hashed-json-object.md`,
+now **implemented** — see ADR-081) fixed the O(n) lookup *without* a type-system change. This proposal is
+the **type-system** route that adds fidelity, stdlib tightening, and *unboxed* value storage on top:
 
-- If a typed map type lands with a hashed backing representation, it largely **obviates** the need to
-  retrofit a hash index onto generic `Json` objects — code that needs dictionaries uses the map type
-  and gets O(1) by construction, while `Json`/`{}` record literals keep their cheap small-object
-  assoc-list layout (which is optimal for the handful-of-fields case).
-- Conversely, if only the `Json` hash-index lands, the typing gap and the stdlib laxness remain.
-- **The implementing agent should read `hashed-json-object.md` and decide whether to supersede it.**
-  Doing the typed map first is arguably the better order: it fixes performance *and* types *and* the
-  stdlib in one coherent feature, rather than papering over the dynamic type.
+- The O(n²) dictionary wall is **already gone** for plain `{}` objects — code that needs a dictionary
+  today already gets O(1) lookup by construction, while small record literals keep their cheap
+  assoc-list layout (the index is only built past a 16-entry threshold).
+- What this proposal still adds over the shipped index: the **typing gap** (the ~40% of RAPTOR `Json`
+  that can't be expressed) and the **stdlib laxness** (`std/object` returns collapsing to `Json`) — plus
+  **unboxed** value storage, which the side-index does not provide (values are still boxed as `Json`).
+- So this is no longer a competing route to the same perf win; it's a fidelity/types/unboxing layer
+  on top of an already-fast representation.
 
-The codegen ABI constraint documented in `hashed-json-object.md` (the inline `MakeObject` fast path in
-`codegen/mod.rs` GEPs `LinObject` at hardcoded offsets — `entries@16`, 24-byte stride) still applies if
-a map reuses the `LinObject` layout; a distinct `Map` container (Option B) sidesteps it entirely.
+The codegen ABI constraint that ADR-081 respected (the inline `MakeObject` fast path in
+`codegen/mod.rs` GEPs `LinObject` at hardcoded offsets — `entries@16`, 24-byte stride; ADR-081 appended
+its fields at offset ≥ 24) still applies if a map reuses the `LinObject` layout; a distinct `Map`
+container (Option B) sidesteps it entirely.
 
 ## What "done" looks like
 
