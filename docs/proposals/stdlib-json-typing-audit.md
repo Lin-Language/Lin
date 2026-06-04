@@ -152,9 +152,10 @@ representation changes; flag any change against that header comment.
 
 ## Relationship to the other proposals
 
-- `typed-map-index-signature.md` — the prerequisite for Category 2 (and provides the hashed/unboxed
-  perf). Build that first.
-- `hashed-json-object.md` (#4b) — likely **superseded** by the map type for the dictionary use case; see
-  that doc. Category 2 here assumes the map type, not a retrofit hash index on `Json`.
+- `typed-map-index-signature.md` — the prerequisite for Category 2 (and provides the unboxed value
+  storage on top of the already-shipped O(1) lookup). Build that first.
+- The hashed-`Json`-object change (#4b, **ADR-081 — shipped**) already gives plain `{}` objects O(1)
+  lookup. Category 2 here is about the remaining *typing* / *unboxing* gap the map type closes, not the
+  lookup complexity, which is already fixed.
 - Unions, generics, `Error`, and `is`/`has` all already exist — Categories 1 and 3 need **no new
   language feature**, only applying what's there. Only Category 2 waits on `{ String: T }`.
