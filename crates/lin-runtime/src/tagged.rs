@@ -371,14 +371,50 @@ pub(crate) unsafe fn tagged_as_f64(tag: u8, payload: u64) -> f64 {
 /// numeric type is only known at runtime, so unboxing to a fixed type in codegen
 /// would reinterpret a float's bits as an integer. If either operand is a float,
 /// the result is Float64; otherwise the widest integer tag present is preserved.
+// `extern "C-unwind"`: a non-numeric operand raises `runtime_fault`, which PANICS inside an
+// async boundary and must unwind THROUGH this C-ABI frame to the boundary's catch_unwind (a
+// plain `extern "C"` fn aborts the process on unwind since Rust 1.81). Outside a boundary it
+// `process::exit`s and never unwinds, so the ABI change is invisible there. Mirrors `lin_panic`
+// and the array-bounds accessors (`lin_array_get`).
 #[no_mangle]
-pub unsafe extern "C" fn lin_tagged_arith(a: *const u8, b: *const u8, op: i32) -> *mut u8 {
+pub unsafe extern "C-unwind" fn lin_tagged_arith(a: *const u8, b: *const u8, op: i32) -> *mut u8 {
     let av = a as *const TaggedVal;
     let bv = b as *const TaggedVal;
     let at = if av.is_null() { TAG_NULL } else { (*av).tag };
     let bt = if bv.is_null() { TAG_NULL } else { (*bv).tag };
     let ap = if av.is_null() { 0u64 } else { (*av).payload };
     let bp = if bv.is_null() { 0u64 } else { (*bv).payload };
+
+    // Dynamic `Json`/union arithmetic must FAULT on a non-numeric operand instead of silently
+    // coercing it to 0. The motivating case is a missing object key: `obj["absent"]` reads as
+    // `Null` (TAG_NULL), and `obj["present"] + obj["absent"]` previously read the null payload
+    // as `0`, so `5 + null` produced `5` and `5 * null` produced `0` — silent wrong results.
+    // The static path already rejects `Int32 + Null`; this brings the dynamic-Json path in line
+    // (a clear runtime error, NOT JS-style NaN), mirroring array OOB faulting (spec §6.1 / §20.1).
+    // (#5: dynamic Json arithmetic with a missing key.)
+    let tag_is_numeric =
+        |t: u8| (t >= TAG_INT32 && t <= TAG_FLOAT64) || t == TAG_UINT64;
+    if !tag_is_numeric(at) || !tag_is_numeric(bt) {
+        let describe = |t: u8| match t {
+            TAG_NULL => "Null",
+            TAG_BOOL => "Bool",
+            TAG_INT32 | TAG_INT64 | TAG_UINT64 => "Int",
+            TAG_FLOAT32 | TAG_FLOAT64 => "Float",
+            TAG_STR => "String",
+            TAG_OBJECT => "Object",
+            TAG_ARRAY => "Array",
+            TAG_FUNCTION => "Function",
+            _ => "non-numeric value",
+        };
+        let op_name = match op {
+            0 => "+", 1 => "-", 2 => "*", 3 => "/", 4 => "%", _ => "arithmetic",
+        };
+        crate::fault::runtime_fault(&format!(
+            "Runtime error: cannot apply operator '{}' to dynamic Json operands of kind {} and {} \
+             (a missing object key reads as Null — guard with `is`/`!= null` or `has` before arithmetic)",
+            op_name, describe(at), describe(bt),
+        ));
+    }
 
     let a_is_float = at == TAG_FLOAT32 || at == TAG_FLOAT64;
     let b_is_float = bt == TAG_FLOAT32 || bt == TAG_FLOAT64;
