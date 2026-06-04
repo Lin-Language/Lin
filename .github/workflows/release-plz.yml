@@ -1,0 +1,93 @@
+name: Release-plz
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# Don't cancel an in-flight release run when a new push lands.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Keep the "chore: release" PR up to date. Merging that PR is what cuts a
+  # release: the merge commit lands on master and the `release` job below tags it.
+  release-pr:
+    name: Release PR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz (release-pr)
+        uses: release-plz/[email protected]
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Tag + GitHub release for any version bump that just landed on master
+  # (i.e. when the release PR was merged). No-op on ordinary pushes.
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    outputs:
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
+      releases: ${{ steps.release-plz.outputs.releases }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run release-plz (release)
+        id: release-plz
+        uses: release-plz/[email protected]
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # When a release was just created, build the platform binaries/VSIX stamped
+  # with the released version and attach them to the GitHub release.
+  attach-artifacts:
+    name: Attach release artifacts
+    needs: release
+    if: needs.release.outputs.releases_created == 'true'
+    uses: ./.github/workflows/build-binaries.yml
+    with:
+      version_stamp: ${{ fromJSON(needs.release.outputs.releases)[0].version }}
+      release_kind: stable
+    secrets: inherit
+
+  upload-artifacts:
+    name: Upload artifacts to release
+    needs: [release, attach-artifacts]
+    if: needs.release.outputs.releases_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist/
+      - name: Upload to GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ fromJSON(needs.release.outputs.releases)[0].version }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release upload "v${VERSION}" dist/* --repo "$REPO" --clobber
