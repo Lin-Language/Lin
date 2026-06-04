@@ -9,7 +9,7 @@
 // (the cross-language correctness gate). Gate: group=26203913 range=773022892 journeys=139.
 import { for } from "std/iter"
 import { keys } from "std/object"
-import { length, push, slice } from "std/array"
+import { length, push, slice, sort } from "std/array"
 import { print } from "std/io"
 import { toString } from "std/string"
 import { now } from "std/time"
@@ -185,22 +185,14 @@ val accumulate = (journeys: Json, acc: Int64): Int64 =>
   journeys.for(j => a = (a + journeyDigest(j)) % MOD)
   a
 
-// Stable sort journeys by departureTime asc then arrivalTime asc (for the take-N slice).
+// Sort journeys by departureTime asc, then arrivalTime asc (for the take-N slice).
 val sortJourneys = (journeys: Json): Json =>
-  var sorted: Json = []
-  journeys.for(j =>
-    var inserted = false
-    var out: Json = []
-    sorted.for(x =>
-      if inserted == false && (j["departureTime"] < x["departureTime"] || j["departureTime"] == x["departureTime"] && j["arrivalTime"] < x["arrivalTime"]) then
-        push(out, j)
-        inserted = true
-      push(out, x)
-    )
-    if inserted == false then push(out, j)
-    sorted = out
+  sort(journeys, (a, b) =>
+    if a["departureTime"] != b["departureTime"] then
+      a["departureTime"] - b["departureTime"]
+    else
+      a["arrivalTime"] - b["arrivalTime"]
   )
-  sorted
 
 // "next N journeys departing after startTime" — the RangeQuery profile loop, capped at N.
 val nextN = (raptor: Json, origin: String, destination: String, n: Int32): Json =>

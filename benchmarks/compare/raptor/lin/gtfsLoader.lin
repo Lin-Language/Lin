@@ -1,11 +1,9 @@
 // gtfs/GTFSLoader — read the plain-CSV GTFS feed and return the shapes createRaptor expects.
 //
 // Mirrors node/src/gtfs/GTFSLoader.js (the golden reference) in RESULT, but uses array-based
-// joins instead of large object maps because Lin objects are association lists with O(n) key
-// lookup (crates/lin-runtime/src/object.rs: lin_object_get/set scan all entries). Using a single
-// object as a 240k-key hash map (Node-style) is O(n^2) here and does not complete. See NOTES.md.
-//
-// The feed lets us avoid the big maps entirely:
+// joins instead of large object maps: Lin's Json objects are association lists with O(n) key
+// lookup (crates/lin-runtime/src/object.rs), so a 240k-key object map would make loading O(n^2).
+// We avoid that by exploiting the feed's ordering rather than keying everything by id:
 //   - stop_times.txt rows for a trip_id are CONTIGUOUS -> group by detecting trip_id changes.
 //   - trips.txt and stop_times.txt have IDENTICAL trip_id order, 1:1 -> positional merge-join.
 //   - calendar_dates.txt rows for a service_id are CONTIGUOUS -> group per service.
@@ -26,7 +24,7 @@ import { for } from "std/iter"
 import { keys } from "std/object"
 import { split } from "std/string"
 import { parseInt32 } from "std/number"
-import { length, push } from "std/array"
+import { length, push, sort } from "std/array"
 import { readStream, lines } from "std/stream"
 import { makeService } from "./service"
 
@@ -85,23 +83,11 @@ val bsearchAt = (list: Json, key: String, lo: Int32, hi: Int32): Json =>
     else
       bsearchAt(list, key, lo, mid - 1)
 
-// Insertion sort an array of { "key": String, ... } ascending by "key".
-// n is small (<= ~7147), so insertion sort is fine and stable.
+// Sort an array of { "key": String, ... } ascending by "key" for binary search.
 val sortByKey = (list: Json): Json =>
-  var out: Json = []
-  list.for(rec =>
-    var inserted = false
-    var next: Json = []
-    out.for(x =>
-      if inserted == false && rec["key"] < x["key"] then
-        push(next, rec)
-        inserted = true
-      push(next, x)
-    )
-    if inserted == false then push(next, rec)
-    out = next
+  sort(list, (a, b) =>
+    if a["key"] < b["key"] then -1 else if a["key"] > b["key"] then 1 else 0
   )
-  out
 
 export val loadGTFS = (dataDir: String): Json =>
   // --- calendar_dates.txt -> datesList [{ key: service_id, dates: { "<+date>": include } }] ---

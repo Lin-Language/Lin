@@ -13,49 +13,21 @@
 // origin = isTransfer ? connection.origin : connection[0].stopTimes[connection[1]].stop
 import { for } from "std/iter"
 import { keys } from "std/object"
-import { join, split } from "std/string"
+import { join } from "std/string"
 import { parseInt32 } from "std/number"
 import { length, push, reverse, slice } from "std/array"
-
-val MAX = 9007199254740991i64
+import { sortedRoundKeys } from "./roundKeys"
 
 val isTransfer = (connection: Json): Boolean =>
   connection["origin"] != null
 
-// Numeric-ascending iteration of the round keys of a per-destination map. Lin objects
-// preserve insertion order, not numeric order, so the integer-like round keys must be
-// sorted by value (see contract trap #1).
-val sortedRoundKeys = (m: Json): Json =>
-  val ks = keys(m)
-  var nums = []
-  ks.for(k => push(nums, parseInt32(k)))
-  // insertion sort (small k counts)
-  var sorted = []
-  nums.for(n =>
-    var inserted = false
-    var out = []
-    sorted.for(x =>
-      if inserted == false && n < x then
-        push(out, n)
-        inserted = true
-      push(out, x)
-    )
-    if inserted == false then push(out, n)
-    sorted = out
-  )
-  var result = []
-  sorted.for(n => push(result, "${n}"))
-  result
-
-// Returns the path array (origins, in journey order via prepend).
+// Walk the connections from finalDestination back to k=1, PREPENDING each origin, so the
+// returned path is in journey order (reference getPath uses unshift). State is threaded by
+// tail recursion (Lin's loop form).
 val getPath = (kConnections: Json, k: String, finalDestination: String): Json =>
-  var path = []
-  var destination = finalDestination
-  var i = parseInt32(k)
-  while_loop(kConnections, i, destination, path)
+  walkPath(kConnections, parseInt32(k), finalDestination, [])
 
-// Lin has no general while-loop statement; thread state via tail recursion.
-val while_loop = (kConnections: Json, i: Int32, destination: String, path: Json): Json =>
+val walkPath = (kConnections: Json, i: Int32, destination: String, path: Json): Json =>
   if i <= 0 then
     path
   else
@@ -64,10 +36,9 @@ val while_loop = (kConnections: Json, i: Int32, destination: String, path: Json)
       connection["origin"]
     else
       connection[0]["stopTimes"][connection[1]]["stop"]
-    // unshift(origin): prepend
     var next = [origin]
     path.for(p => push(next, p))
-    while_loop(kConnections, i - 1, origin, next)
+    walkPath(kConnections, i - 1, origin, next)
 
 export val makeStringResults = (): Json =>
   { "results": {  } }
