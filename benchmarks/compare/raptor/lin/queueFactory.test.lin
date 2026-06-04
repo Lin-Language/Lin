@@ -11,7 +11,11 @@ val s = suite("QueueFactory", [
         "RouteC": { "StopB": 1 }
       },
       ["StopA", "StopB"]
-    )).toBe({ "RouteA": "StopA", "RouteB": "StopB", "RouteC": "StopB" })
+    )).toBe({
+      "RouteA": "StopA",
+      "RouteB": "StopB",
+      "RouteC": "StopB"
+    })
   ]),
 
   test("picks the earliest stop on the route", () => [
@@ -23,7 +27,11 @@ val s = suite("QueueFactory", [
         "RouteC": { "StopB": 1 }
       },
       ["StopB", "StopA"]
-    )).toBe({ "RouteA": "StopA", "RouteB": "StopA", "RouteC": "StopB" })
+    )).toBe({
+      "RouteA": "StopA",
+      "RouteB": "StopA",
+      "RouteC": "StopB"
+    })
   ])
 ])
 run(s)

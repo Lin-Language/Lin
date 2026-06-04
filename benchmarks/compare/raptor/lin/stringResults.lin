@@ -70,7 +70,7 @@ val while_loop = (kConnections: Json, i: Int32, destination: String, path: Json)
     while_loop(kConnections, i - 1, origin, next)
 
 export val makeStringResults = (): Json =>
-  { "results": {} }
+  { "results": {  } }
 
 export val add = (sr: Json, kConnections: Json): Null =>
   val results = sr["results"]
@@ -80,9 +80,15 @@ export val add = (sr: Json, kConnections: Json): Null =>
       if length(path) >= 1 then
         val origin = path[0]
         val tail = slice(path, 1, length(path))
-        val journeyKey = if origin > destination then "${destination}${origin}" else "${origin}${destination}"
-        val pathString = if origin > destination then join(reverse(tail), ",") else join(tail, ",")
-        if results[journeyKey] == null then results[journeyKey] = {}
+        val journeyKey = if origin > destination then
+          "${destination}${origin}"
+        else
+          "${origin}${destination}"
+        val pathString = if origin > destination then
+          join(reverse(tail), ",")
+        else
+          join(tail, ",")
+        if results[journeyKey] == null then results[journeyKey] = {  }
         results[journeyKey][pathString] = true
     )
   )

@@ -47,11 +47,121 @@ val GROUP_QUERIES = [
   [["DVP"], ["BHM", "BMO", "BSW", "BHI"]],
   [["BXB"], ["DVP"]],
   [["MCO", "MAN", "MCV", "EXD"], ["CBW", "CBE"]],
-  [["MCO", "MAN", "MCV", "EXD"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]],
-  [["BHM", "BMO", "BSW", "BHI"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]],
-  [["ORP"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]],
-  [["EDB"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]],
-  [["CBE", "CBW"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]]
+  [
+    ["MCO", "MAN", "MCV", "EXD"],
+    [
+      "EUS",
+      "MYB",
+      "STP",
+      "PAD",
+      "BFR",
+      "CTK",
+      "CST",
+      "CHX",
+      "LBG",
+      "WAE",
+      "VIC",
+      "VXH",
+      "WAT",
+      "OLD",
+      "MOG",
+      "KGX",
+      "LST",
+      "FST"
+    ]
+  ],
+  [
+    ["BHM", "BMO", "BSW", "BHI"],
+    [
+      "EUS",
+      "MYB",
+      "STP",
+      "PAD",
+      "BFR",
+      "CTK",
+      "CST",
+      "CHX",
+      "LBG",
+      "WAE",
+      "VIC",
+      "VXH",
+      "WAT",
+      "OLD",
+      "MOG",
+      "KGX",
+      "LST",
+      "FST"
+    ]
+  ],
+  [
+    ["ORP"],
+    [
+      "EUS",
+      "MYB",
+      "STP",
+      "PAD",
+      "BFR",
+      "CTK",
+      "CST",
+      "CHX",
+      "LBG",
+      "WAE",
+      "VIC",
+      "VXH",
+      "WAT",
+      "OLD",
+      "MOG",
+      "KGX",
+      "LST",
+      "FST"
+    ]
+  ],
+  [
+    ["EDB"],
+    [
+      "EUS",
+      "MYB",
+      "STP",
+      "PAD",
+      "BFR",
+      "CTK",
+      "CST",
+      "CHX",
+      "LBG",
+      "WAE",
+      "VIC",
+      "VXH",
+      "WAT",
+      "OLD",
+      "MOG",
+      "KGX",
+      "LST",
+      "FST"
+    ]
+  ],
+  [
+    ["CBE", "CBW"],
+    [
+      "EUS",
+      "MYB",
+      "STP",
+      "PAD",
+      "BFR",
+      "CTK",
+      "CST",
+      "CHX",
+      "LBG",
+      "WAE",
+      "VIC",
+      "VXH",
+      "WAT",
+      "OLD",
+      "MOG",
+      "KGX",
+      "LST",
+      "FST"
+    ]
+  ]
 ]
 
 val RANGE_QUERIES = [
@@ -82,8 +192,7 @@ val sortJourneys = (journeys: Json): Json =>
     var inserted = false
     var out: Json = []
     sorted.for(x =>
-      if inserted == false && (j["departureTime"] < x["departureTime"]
-          || (j["departureTime"] == x["departureTime"] && j["arrivalTime"] < x["arrivalTime"])) then
+      if inserted == false && (j["departureTime"] < x["departureTime"] || j["departureTime"] == x["departureTime"] && j["arrivalTime"] < x["arrivalTime"]) then
         push(out, j)
         inserted = true
       push(out, x)
@@ -139,7 +248,9 @@ val main = (): Null =>
     groupDigest = accumulate(results, groupDigest)
   )
   val groupMs = now() - tg
-  print("GROUP queries=${length(GROUP_QUERIES)} journeys=${groupCount} digest=${toString(groupDigest)} ms=${toString(groupMs)}")
+  print(
+    "GROUP queries=${length(GROUP_QUERIES)} journeys=${groupCount} digest=${toString(groupDigest)} ms=${toString(groupMs)}"
+  )
 
   // RANGE workload ("next 20", no filter)
   val tr = now()
@@ -151,8 +262,12 @@ val main = (): Null =>
     rangeDigest = accumulate(results, rangeDigest)
   )
   val rangeMs = now() - tr
-  print("RANGE queries=${length(RANGE_QUERIES)} journeys=${rangeCount} digest=${toString(rangeDigest)} ms=${toString(rangeMs)}")
+  print(
+    "RANGE queries=${length(RANGE_QUERIES)} journeys=${rangeCount} digest=${toString(rangeDigest)} ms=${toString(rangeMs)}"
+  )
 
-  print("DIGEST group=${toString(groupDigest)} range=${toString(rangeDigest)} journeys=${groupCount + rangeCount}")
+  print(
+    "DIGEST group=${toString(groupDigest)} range=${toString(rangeDigest)} journeys=${groupCount + rangeCount}"
+  )
 
 main()

@@ -19,16 +19,32 @@ val s = suite("RangeQuery", [
   test("performs profile queries", () => [
     expect(plan(
       [
-        t([st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)]),
-        t([st("A", null, 1100), st("B", 1130, 1135), st("C", 1200, null)]),
-        t([st("A", null, 1200), st("B", 1230, 1235), st("C", 1300, null)])
+        t([
+          st("A", null, 1000),
+          st("B", 1030, 1035),
+          st("C", 1100, null)
+        ]),
+        t([
+          st("A", null, 1100),
+          st("B", 1130, 1135),
+          st("C", 1200, null)
+        ]),
+        t([
+          st("A", null, 1200),
+          st("B", 1230, 1235),
+          st("C", 1300, null)
+        ])
       ],
-      "A", "C", "2018-10-16"
-    )).toSatisfy(r => journeysEq(r, [
-      j([[st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)]]),
-      j([[st("A", null, 1100), st("B", 1130, 1135), st("C", 1200, null)]]),
-      j([[st("A", null, 1200), st("B", 1230, 1235), st("C", 1300, null)]])
-    ]))
+      "A",
+      "C",
+      "2018-10-16"
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([[st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)]]),
+        j([[st("A", null, 1100), st("B", 1130, 1135), st("C", 1200, null)]]),
+        j([[st("A", null, 1200), st("B", 1230, 1235), st("C", 1300, null)]])
+      ])
+    )
   ]),
 
   // Profile queries do not share bestArrivals or the route scanner between departure
@@ -37,16 +53,47 @@ val s = suite("RangeQuery", [
   test("does not share bestArrivals or routeScanner", () => [
     expect(plan(
       [
-        t([st("A", null, 1359), st("C", 1501, null)]),
-        t([st("A", null, 1400), st("B", 1430, null)]),
-        t([st("B", null, 1430), st("C", 1500, null)])
+        t([
+          st("A", null, 1359),
+          st("C", 1501, null)
+        ]),
+        t([
+          st("A", null, 1400),
+          st("B", 1430, null)
+        ]),
+        t([
+          st("B", null, 1430),
+          st("C", 1500, null)
+        ])
       ],
-      "A", "C", "2018-10-16"
-    )).toSatisfy(r => journeysEq(r, [
-      j([[st("A", null, 1359), st("C", 1501, null)]]),
-      j([[st("A", null, 1400), st("B", 1430, null)], [st("B", null, 1430), st("C", 1500, null)]]),
-      j([[st("A", null, 1400), st("B", 1430, null)], [st("B", null, 1430), st("C", 1500, null)]])
-    ]))
+      "A",
+      "C",
+      "2018-10-16"
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([[st("A", null, 1359), st("C", 1501, null)]]),
+        j([
+          [
+            st("A", null, 1400),
+            st("B", 1430, null)
+          ],
+          [
+            st("B", null, 1430),
+            st("C", 1500, null)
+          ]
+        ]),
+        j([
+          [
+            st("A", null, 1400),
+            st("B", 1430, null)
+          ],
+          [
+            st("B", null, 1430),
+            st("C", 1500, null)
+          ]
+        ])
+      ])
+    )
   ])
 ])
 run(s)

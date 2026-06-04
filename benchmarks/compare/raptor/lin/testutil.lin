@@ -13,8 +13,13 @@ import { makeService } from "./service"
 val MAX = 9007199254740991i64
 
 export val allDays = {
-  "0": true, "1": true, "2": true, "3": true,
-  "4": true, "5": true, "6": true
+  "0": true,
+  "1": true,
+  "2": true,
+  "3": true,
+  "4": true,
+  "5": true,
+  "6": true
 }
 
 // services["1"] and services["2"] from util.ts
@@ -93,7 +98,12 @@ val arrTimeAt = (legs: Json, i: Int32, transferDuration: Int32): Int32 =>
     else
       leg[length(leg) - 1]["arrivalTime"] + transferDuration
 
-export val defaultTrip = { "tripId": "1", "serviceId": "1", "stopTimes": [], "service": service1 }
+export val defaultTrip = {
+  "tripId": "1",
+  "serviceId": "1",
+  "stopTimes": [],
+  "service": service1
+}
 
 export val j = (legArgs: Json): Json =>
   var legs: Json = []
@@ -124,13 +134,8 @@ export val setDefaultTrip = (results: Json): Null =>
   )
 
 // --- Deep equality for journeys (ignores trip; distinguishes leg kinds) ---
-
 val stopTimeEq = (a: Json, b: Json): Boolean =>
-  a["stop"] == b["stop"]
-    && a["arrivalTime"] == b["arrivalTime"]
-    && a["departureTime"] == b["departureTime"]
-    && a["dropOff"] == b["dropOff"]
-    && a["pickUp"] == b["pickUp"]
+  a["stop"] == b["stop"] && a["arrivalTime"] == b["arrivalTime"] && a["departureTime"] == b["departureTime"] && a["dropOff"] == b["dropOff"] && a["pickUp"] == b["pickUp"]
 
 val stopTimesEq = (a: Json, b: Json): Boolean =>
   if length(a) != length(b) then
@@ -150,15 +155,9 @@ val legEq = (a: Json, b: Json): Boolean =>
   if aTransfer != bTransfer then
     false
   else if aTransfer then
-    a["origin"] == b["origin"]
-      && a["destination"] == b["destination"]
-      && a["duration"] == b["duration"]
-      && a["startTime"] == b["startTime"]
-      && a["endTime"] == b["endTime"]
+    a["origin"] == b["origin"] && a["destination"] == b["destination"] && a["duration"] == b["duration"] && a["startTime"] == b["startTime"] && a["endTime"] == b["endTime"]
   else
-    a["origin"] == b["origin"]
-      && a["destination"] == b["destination"]
-      && stopTimesEq(a["stopTimes"], b["stopTimes"])
+    a["origin"] == b["origin"] && a["destination"] == b["destination"] && stopTimesEq(a["stopTimes"], b["stopTimes"])
 
 val legsEq = (a: Json, b: Json): Boolean =>
   if length(a) != length(b) then
@@ -173,9 +172,7 @@ val legsEq = (a: Json, b: Json): Boolean =>
     ok
 
 export val journeyEq = (a: Json, b: Json): Boolean =>
-  a["departureTime"] == b["departureTime"]
-    && a["arrivalTime"] == b["arrivalTime"]
-    && legsEq(a["legs"], b["legs"])
+  a["departureTime"] == b["departureTime"] && a["arrivalTime"] == b["arrivalTime"] && legsEq(a["legs"], b["legs"])
 
 // Deep-equality of a journey ARRAY against an expected array.
 export val journeysEq = (actual: Json, expected: Json): Boolean =>

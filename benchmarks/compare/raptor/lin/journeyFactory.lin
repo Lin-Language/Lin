@@ -92,7 +92,7 @@ val arrAt = (legs: Json, i: Int32, transferDuration: Int32): Json =>
 
 export val getResults = (kConnections: Json, destination: String): Json =>
   var results: Json = []
-  val destMap = if kConnections[destination] != null then kConnections[destination] else {}
+  val destMap = if kConnections[destination] != null then kConnections[destination] else {  }
   sortedRoundKeys(destMap).for(k =>
     val legs = getJourneyLegs(kConnections, k, destination)
     push(results, {

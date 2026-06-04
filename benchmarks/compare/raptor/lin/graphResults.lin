@@ -86,7 +86,7 @@ val mergePathInto = (results: Json, path: Json): Json =>
     node
 
 export val makeGraphResults = (): Json =>
-  { "results": {} }
+  { "results": {  } }
 
 export val add = (gr: Json, kConnections: Json): Null =>
   val results = gr["results"]
