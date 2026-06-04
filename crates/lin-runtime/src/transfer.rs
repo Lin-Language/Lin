@@ -38,17 +38,23 @@ unsafe fn clone_string(s: *const LinString) -> *mut LinString {
     fresh
 }
 
-/// Deep-copy a sealed scalar record (sealed-records Stage 1): allocate a fresh struct of the same
-/// byte `size` (read from offset 4) and copy the field bytes verbatim. All fields are scalars, so
-/// there is no inner heap to recurse into — a flat byte copy is a complete deep copy. The fresh
-/// struct has refcount 1 (set by `lin_sealed_alloc`).
+/// Deep-copy a sealed record (sealed-records Stages 1–2). Share-nothing: allocate a fresh struct of
+/// the same byte `size` (read from offset 4) carrying the same field descriptor (offset 8), copy the
+/// field bytes verbatim (this gets every SCALAR field right in one move), then — for each HEAP field
+/// listed in the descriptor — OVERWRITE its pointer slot with a DEEP CLONE of the payload (string →
+/// clone_string, array → clone_array, nested sealed → clone_sealed recursively). The verbatim copy
+/// would otherwise leave a heap slot ALIASING the source's payload (a cross-thread share, which the
+/// transfer model forbids); replacing each heap slot with a fresh +1 clone makes the copy disjoint.
+/// The fresh struct has refcount 1 (set by `lin_sealed_alloc`); each cloned heap field is +1 owned.
 unsafe fn clone_sealed(src: *const u8) -> *mut u8 {
     if src.is_null() {
         return std::ptr::null_mut();
     }
     let size = *((src as *const u32).add(1)) as usize;
-    let fresh = crate::sealed::lin_sealed_alloc(size);
-    // Copy the field payload (everything past the 8-byte header). The header's rc/size on `fresh`
+    let desc = *((src.add(8)) as *const *const u8);
+    let fresh = crate::sealed::lin_sealed_alloc(size, desc);
+    // Copy the field payload (everything past the 16-byte header). Scalars are now correct; heap
+    // field slots currently ALIAS the source — fixed below. The header's rc/size/desc on `fresh`
     // are already correct from the alloc.
     if size > crate::sealed::SEALED_HEADER {
         std::ptr::copy_nonoverlapping(
@@ -56,6 +62,28 @@ unsafe fn clone_sealed(src: *const u8) -> *mut u8 {
             fresh.add(crate::sealed::SEALED_HEADER),
             size - crate::sealed::SEALED_HEADER,
         );
+    }
+    // Deep-clone each heap field, replacing the aliased pointer with a private +1 copy.
+    if !desc.is_null() {
+        let count = *(desc as *const u32);
+        let entries = desc.add(4);
+        for i in 0..count as usize {
+            let ent = entries.add(i * 8);
+            let offset = *(ent as *const u32) as usize;
+            let kind = *((ent.add(4)) as *const u32);
+            let slot = fresh.add(offset) as *mut *mut u8;
+            let payload = *slot;
+            if payload.is_null() {
+                continue;
+            }
+            let cloned: *mut u8 = match kind {
+                crate::sealed::KIND_STRING => clone_string(payload as *const LinString) as *mut u8,
+                crate::sealed::KIND_ARRAY => clone_array(payload as *const LinArray) as *mut u8,
+                crate::sealed::KIND_SEALED => clone_sealed(payload as *const u8),
+                _ => payload,
+            };
+            *slot = cloned;
+        }
     }
     fresh
 }

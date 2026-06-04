@@ -59,9 +59,10 @@ pub(crate) struct RuntimeFns<'ctx> {
     pub object_release: FunctionValue<'ctx>,
     pub closure_release: FunctionValue<'ctx>,
     pub tagged_release: FunctionValue<'ctx>,
-    /// Sealed scalar-record (sealed-records Stage 1): `lin_sealed_alloc(size: i64) -> ptr`
-    /// allocates a zeroed, refcount-1 packed struct; `lin_sealed_release(ptr, size: i64)`
-    /// decrements its refcount and frees on zero (no per-field release — all fields are scalars).
+    /// Sealed-record (sealed-records Stages 1–2): `lin_sealed_alloc(size: i64, desc: ptr) -> ptr`
+    /// allocates a zeroed, refcount-1 packed struct carrying the static field descriptor `desc`
+    /// (NULL for a scalar-only record); `lin_sealed_release(ptr, size: i64)` decrements its
+    /// refcount and, on zero, releases each HEAP field per the descriptor then frees the struct.
     pub sealed_alloc: FunctionValue<'ctx>,
     pub sealed_release: FunctionValue<'ctx>,
 }
@@ -192,7 +193,7 @@ impl<'ctx> RuntimeFns<'ctx> {
         let object_release = module.add_function("lin_object_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let closure_release = module.add_function("lin_closure_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let tagged_release = module.add_function("lin_tagged_release", void_type.fn_type(&[ptr_type.into()], false), None);
-        let sealed_alloc = module.add_function("lin_sealed_alloc", ptr_type.fn_type(&[i64_type.into()], false), None);
+        let sealed_alloc = module.add_function("lin_sealed_alloc", ptr_type.fn_type(&[i64_type.into(), ptr_type.into()], false), None);
         let sealed_release = module.add_function("lin_sealed_release", void_type.fn_type(&[ptr_type.into(), i64_type.into()], false), None);
 
         Self {

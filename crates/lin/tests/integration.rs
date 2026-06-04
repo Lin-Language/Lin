@@ -11283,9 +11283,11 @@ print(describe(42))
 
 #[test]
 fn test_sealed_regression_string_field_stays_boxed() {
-    // (f) REGRESSION: a named record with a NON-scalar (String) field is NOT a sealed-scalar
-    // record — it keeps the boxed LinObject path and behaves exactly as before. An anonymous
-    // all-scalar literal (unsealed) likewise stays boxed (it is never struct-laid-out).
+    // (f) RUN-EQUIVALENCE: a named record with a String field is now a SEALED record (Stage 2 —
+    // String is an eligible heap field), so it uses the packed-struct layout with a pointer slot
+    // for `name`. Its observable behaviour (field read, equality, toString) is IDENTICAL to the
+    // former boxed path. An anonymous all-scalar literal (unsealed) still stays boxed (never
+    // struct-laid-out). The test name is retained for history; the assertions are unchanged.
     let out = run(r#"
 import { print } from "std/io"
 import { toString } from "std/string"
@@ -11393,4 +11395,147 @@ v = { "x": 2, "y": 3 }
 print("${v["x"]} ${v["y"]}")
 "#);
     assert_eq!(out, vec!["2 3"]);
+}
+
+// ───────────────────── Sealed records with HEAP fields (Stage 2) ─────────────────────
+// String / Array / nested-sealed fields are stored as 8-byte owned pointer slots; per-field
+// retain on construct/projection-copy, descriptor-driven release on drop. See §5 Stage 2.
+
+#[test]
+fn test_sealed_heap_string_field_construct_read_drop() {
+    // A sealed record with a String field: construct, read the string and a scalar back, drop.
+    let out = run(r#"
+import { print } from "std/io"
+type User = { "id": Int32, "name": String }
+val u: User = { "id": 7, "name": "ada" }
+print("${u["id"]} ${u["name"]}")
+print("${u["name"]} ${u["name"]}")
+"#);
+    assert_eq!(out, vec!["7 ada", "ada ada"]);
+}
+
+#[test]
+fn test_sealed_heap_array_field() {
+    // A sealed record with an Array field: construct, read the array back, index into it.
+    let out = run(r#"
+import { print } from "std/io"
+import { length } from "std/array"
+type Bag = { "tag": Int32, "items": Int32[] }
+val b: Bag = { "tag": 1, "items": [10, 20, 30] }
+print("${b["tag"]} ${length(b["items"])}")
+print("${b["items"][0]} ${b["items"][2]}")
+"#);
+    assert_eq!(out, vec!["1 3", "10 30"]);
+}
+
+#[test]
+fn test_sealed_nested_record_field() {
+    // A nested sealed record field: `type Line = { a: Pt, b: Pt }` where Pt is sealed. Releasing the
+    // outer must release each inner (descriptor recursion). Read nested fields by chained access.
+    let out = run(r#"
+import { print } from "std/io"
+type Pt = { "x": Int32, "y": Int32 }
+type Line = { "a": Pt, "b": Pt }
+val l: Line = { "a": { "x": 1, "y": 2 }, "b": { "x": 3, "y": 4 } }
+print("${l["a"]["x"]} ${l["a"]["y"]} ${l["b"]["x"]} ${l["b"]["y"]}")
+"#);
+    assert_eq!(out, vec!["1 2 3 4"]);
+}
+
+#[test]
+fn test_sealed_heap_projection_drops_extras_source_untouched() {
+    // Projection of a WIDER concrete object with a String field into a sealed type: extras dropped
+    // from the copy, the source keeps them, no leak. The projected param sees only its own fields.
+    let out = run(r#"
+import { print } from "std/io"
+type Person = { "name": String, "age": Int32 }
+val greet = (p: Person): String => "${p["name"]}=${p["age"]}"
+val wide = { "name": "bob", "age": 30, "email": "b@x.io" }
+print(greet(wide))
+print("${wide["email"]}")
+print("${wide["name"]}")
+"#);
+    assert_eq!(out, vec!["bob=30", "b@x.io", "bob"]);
+}
+
+#[test]
+fn test_sealed_heap_equality_and_to_json() {
+    // Equality crosses representations for heap-field records (deep, order-independent), and
+    // sealed→Json materialization serializes the heap fields correctly.
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type User = { "id": Int32, "name": String }
+val a: User = { "id": 1, "name": "ada" }
+val b: User = { "id": 1, "name": "ada" }
+val c: User = { "id": 1, "name": "bob" }
+val anon = { "id": 1, "name": "ada" }
+print("${a == b} ${a == c} ${a == anon}")
+val j: Json = a
+print(toString(j))
+"#);
+    assert_eq!(out, vec!["true false true", r#"{"id": 1, "name": "ada"}"#]);
+}
+
+#[test]
+fn test_sealed_heap_captured_by_closure() {
+    // A sealed-with-String record captured by a closure: the env owns it (retained on capture),
+    // released via the descriptor-driven sealed self-release on teardown (frees the String too).
+    let out = run(r#"
+import { print } from "std/io"
+type User = { "id": Int32, "name": String }
+val make = (): String =>
+  val u: User = { "id": 5, "name": "zoe" }
+  val get = (): String => "${u["id"]}:${u["name"]}"
+  get()
+print(make())
+"#);
+    assert_eq!(out, vec!["5:zoe"]);
+}
+
+#[test]
+fn test_sealed_heap_transferred_across_async() {
+    // A sealed-with-String record captured into an async thunk crosses the share-nothing thread
+    // boundary: clone_sealed deep-copies the String field per the descriptor, release frees it.
+    let out = run(r#"
+import { print } from "std/io"
+import { async, await } from "std/async"
+type Msg = { "n": Int32, "text": String }
+val m: Msg = { "n": 3, "text": "hello" }
+val t = async((): String => "${m["n"]}:${m["text"]}")
+print(await(t))
+"#);
+    assert_eq!(out, vec!["3:hello"]);
+}
+
+#[test]
+fn test_sealed_heap_var_reassign_releases_old() {
+    // A var of sealed-with-String type reassigned: each old struct's String field released exactly
+    // once via the descriptor walk (ASan-gated in CI). Functional check here.
+    let out = run(r#"
+import { print } from "std/io"
+type Box = { "k": Int32, "s": String }
+var v: Box = { "k": 0, "s": "a" }
+v = { "k": 1, "s": "bb" }
+v = { "k": 2, "s": "ccc" }
+print("${v["k"]} ${v["s"]}")
+"#);
+    assert_eq!(out, vec!["2 ccc"]);
+}
+
+#[test]
+fn test_sealed_heap_in_loop_construct_drop() {
+    // Construct/read/drop a heap-field sealed record in a loop — exercises repeated alloc + String
+    // retain/release. The accumulated result proves each iteration's value was read before drop.
+    let out = run(r#"
+import { print } from "std/io"
+import { range, reduce } from "std/iter"
+type Item = { "v": Int32, "label": String }
+val total = range(0, 100).reduce(0, (acc: Int32, i: Int32): Int32 =>
+  val it: Item = { "v": i, "label": "x" }
+  acc + it["v"]
+)
+print("${total}")
+"#);
+    assert_eq!(out, vec!["4950"]);
 }

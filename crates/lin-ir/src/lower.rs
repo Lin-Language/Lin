@@ -1036,22 +1036,30 @@ fn is_rc_type(ty: &Type) -> bool {
     )
 }
 
-/// True when `ty` is a SEALED SCALAR RECORD — a `Type::Object { sealed: true }` all of whose
-/// fields are unboxed scalars (numeric or Bool). MUST mirror `Codegen::sealed_scalar_fields`
-/// exactly: the two decide, independently, when the unboxed packed-struct layout applies, so any
-/// disagreement would make the lowerer's Coerce-insertion and codegen's representation diverge
-/// (a UAF / mis-read). A sealed scalar record is still a concrete refcounted heap value
-/// (`is_rc_type` true), so the owning model treats it like any object — only its physical layout
-/// and its `emit_release`/construct/field-read codegen differ (routed via the sealed runtime).
+/// True when `ty` is a SEALED RECORD — a `Type::Object { sealed: true }` all of whose fields are
+/// either unboxed scalars (numeric or Bool) — Stage 1 — OR eligible HEAP fields (String, Array,
+/// nested sealed record) — Stage 2. MUST mirror `Codegen::sealed_fields` EXACTLY: the two decide,
+/// independently, when the unboxed packed-struct layout applies, so any disagreement would make the
+/// lowerer's Coerce-insertion and codegen's representation diverge (a UAF / mis-read). A sealed
+/// record is still a concrete refcounted heap value (`is_rc_type` true), so the owning model treats
+/// it like any object — only its physical layout and its `emit_release`/construct/field-read codegen
+/// differ (routed via the sealed runtime). The function name is kept for call-site stability across
+/// the (now generalized) Stage 1 + Stage 2 gate.
 fn is_sealed_scalar_repr(ty: &Type) -> bool {
     matches!(ty, Type::Object { fields, sealed: true }
-        if !fields.is_empty() && fields.values().all(is_sealed_scalar_field_ty))
+        if !fields.is_empty() && fields.values().all(is_sealed_field_ty))
 }
 
-/// A field type permitted in a sealed scalar record: a fixed-width numeric or Bool. Mirrors
-/// `Codegen::is_sealed_scalar_field`.
-fn is_sealed_scalar_field_ty(ty: &Type) -> bool {
-    ty.is_flat_scalar() || matches!(ty, Type::Bool)
+/// A field type permitted in a sealed record: a scalar (numeric or Bool) OR an eligible heap field
+/// (String/Array/nested-sealed). Mirrors `Codegen::is_sealed_field`. A nested-sealed field recurses
+/// into `is_sealed_scalar_repr`; a self-recursive type survives resolution as `Type::Named` (not an
+/// inlined `Object`), so the recursion terminates and a cyclic record stays boxed (fail-safe).
+fn is_sealed_field_ty(ty: &Type) -> bool {
+    ty.is_flat_scalar()
+        || matches!(ty, Type::Bool)
+        || ty.is_string_ish()
+        || matches!(ty, Type::Array(_) | Type::FixedArray(_))
+        || is_sealed_scalar_repr(ty)
 }
 
 /// A type that participates in the OWNING reference model for var cells / module globals:
