@@ -7,9 +7,9 @@
 // FIXED-SHAPE records are typed here; the DYNAMIC-KEY map structures
 // (kConnections, kArrivals, routeStopIndex, routesAtStop, bestArrivals,
 // tripsByRoute, routePath, the loader's intermediate maps, and the
-// Service.days/Service.dates indexes) have NO type until the accepted-but-
-// unimplemented `{ String: T }` map type lands (docs/proposals/
-// typed-map-index-signature.md), so they stay `Json`. Where a typed record
+// Service.days/Service.dates indexes) stay `Json` pending a RAPTOR re-typing
+// pass to the now-implemented `{ String: T }` map type (ADR-082 / spec
+// §5.1.1). Where a typed record
 // flows INTO one of those maps or comes OUT via obj[k] it is `Json` at that
 // boundary — only the record-shaped locals are typed.
 //

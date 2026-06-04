@@ -1,8 +1,8 @@
 # Stdlib `Json` typing audit — tightening the stdlib once `{ String: T }` lands
 
 Status: proposal / audit. **Category 1 (array/iter generics) is implemented** on branch
-`fix/stdlib-collection-generics`; Categories 2–5 remain. Companion to
-`docs/proposals/typed-map-index-signature.md` (the accepted index-signature `{ String: T }` type).
+`fix/stdlib-collection-generics`; Categories 2–5 remain. Companion to the implemented
+index-signature `{ String: T }` type (ADR-082 / spec §5.1.1).
 
 The stdlib uses `Json` in **145 exported signatures** across 22 modules. Not all of these are lazy —
 they fall into five distinct categories, and only some are fixed by the new map type. This doc
@@ -176,8 +176,8 @@ representation changes; flag any change against that header comment.
 
 ## Relationship to the other proposals
 
-- `typed-map-index-signature.md` — the prerequisite for Category 2 (and provides the unboxed value
-  storage on top of the already-shipped O(1) lookup). Build that first.
+- The index-signature `{ String: T }` type (**ADR-082 — shipped**, spec §5.1.1) — the prerequisite
+  for Category 2 (and provides the unboxed value storage on top of the already-shipped O(1) lookup).
 - The hashed-`Json`-object change (#4b, **ADR-081 — shipped**) already gives plain `{}` objects O(1)
   lookup. Category 2 here is about the remaining *typing* / *unboxing* gap the map type closes, not the
   lookup complexity, which is already fixed.

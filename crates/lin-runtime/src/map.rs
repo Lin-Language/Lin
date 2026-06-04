@@ -1,7 +1,7 @@
 //! `LinMap` — the runtime backing for the typed index-signature object type `{ String: T }`
 //! (ADR-082). A String-keyed hashed dictionary giving O(1) average lookup/insert, in contrast
 //! to `LinObject`'s O(n) association-list scan (which is optimal for record-shaped objects but
-//! catastrophic for dictionary-shaped ones — see `docs/proposals/typed-map-index-signature.md`).
+//! catastrophic for dictionary-shaped ones — see ADR-082 / spec §5.1.1).
 //!
 //! Backing representation: a single open-addressing (linear-probing) hash table. Each occupied
 //! slot stores `(key: *mut LinString, value: TaggedVal)`. Values are boxed inside the 16-byte

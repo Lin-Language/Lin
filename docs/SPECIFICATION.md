@@ -385,7 +385,7 @@ type Json =
   | { ...Json }      // any object whose values are Json
 ```
 
-The last form is informal: there is no general index-signature syntax; in practice a `Json`-valued object is any object whose fields are themselves `Json`.
+The last form above is informal shorthand: a `Json`-valued object is any object whose fields are themselves `Json`. A *typed* index signature with a concrete value type does exist as real syntax — `{ String: T }` (§5.1.1).
 
 `Error` is a built-in structural alias for the conventional error value `{ "type": String, "message": String }` (§20). It composes in unions and is discriminated with `is Error`.
 
