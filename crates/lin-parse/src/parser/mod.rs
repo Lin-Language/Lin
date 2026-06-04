@@ -150,6 +150,27 @@ impl Parser {
         }
     }
 
+    /// 1-based column of the FIRST token on the current token's source line — i.e. the
+    /// indentation of the statement/line the current token sits on, found by scanning back
+    /// over tokens with no source newline before them (`newline_before == false`).
+    ///
+    /// This is the right offside anchor for a control-flow branch whose keyword is NOT at the
+    /// start of its line — e.g. `val x = if cond then\n  A\nelse\n  B`: the `if` keyword is far
+    /// to the right, but its wrapped branches are indented relative to the enclosing statement
+    /// (`val`), not the keyword. Anchoring on the keyword column would set an impossibly high
+    /// floor and collapse the branch to empty (then orphan the `else`). Inside `()`/`[]`/`{}`
+    /// the lexer still records real columns (ADR-004 suppresses Indent/Dedent, not columns).
+    pub(crate) fn line_start_column(&self) -> u32 {
+        if self.pos >= self.tokens.len() {
+            return 0;
+        }
+        let mut i = self.pos;
+        while i > 0 && !self.tokens[i].newline_before {
+            i -= 1;
+        }
+        self.tokens[i].column
+    }
+
     pub(crate) fn expect(&mut self, kind: TokenKind) {
         if self.check(kind.clone()) {
             self.advance();

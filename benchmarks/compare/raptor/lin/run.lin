@@ -4,7 +4,7 @@
 // 2025-09-02 (Tuesday) departing 08:00 (28800s), maxSearchDays = 3. Prints one block per
 // journey then a final RESULT line (the cross-language gate). Timing goes to stderr.
 import { for } from "std/iter"
-import { length, push } from "std/array"
+import { length, push, sort } from "std/array"
 import { print, printErr } from "std/io"
 import { parseDate } from "./dateUtil"
 import { createRaptor } from "./raptor"
@@ -31,23 +31,14 @@ val fmt = (s: Int32): String =>
 val isTimetableLeg = (leg: Json): Boolean =>
   leg["stopTimes"] != null
 
-// Stable insertion sort by departureTime asc, then arrivalTime asc.
+// Sort by departureTime asc, then arrivalTime asc.
 val sortJourneys = (journeys: Json): Json =>
-  var sorted: Json = []
-  journeys.for(j =>
-    var inserted = false
-    var out: Json = []
-    sorted.for(x =>
-      if inserted == false && (j["departureTime"] < x["departureTime"]
-          || (j["departureTime"] == x["departureTime"] && j["arrivalTime"] < x["arrivalTime"])) then
-        push(out, j)
-        inserted = true
-      push(out, x)
-    )
-    if inserted == false then push(out, j)
-    sorted = out
+  sort(journeys, (a, b) =>
+    if a["departureTime"] != b["departureTime"] then
+      a["departureTime"] - b["departureTime"]
+    else
+      a["arrivalTime"] - b["arrivalTime"]
   )
-  sorted
 
 val main = (): Null =>
   val loaded = loadGTFS(DATA_DIR)
@@ -60,35 +51,39 @@ val main = (): Null =>
   val journeys = sortJourneys(journeysRaw)
 
   journeys.for(journey =>
-    print("JOURNEY dep=${fmt(journey["departureTime"])} arr=${fmt(journey["arrivalTime"])} legs=${length(journey["legs"])}")
+    print(
+      "JOURNEY dep=${fmt(journey["departureTime"])} arr=${fmt(journey["arrivalTime"])} legs=${length(journey["legs"])}"
+    )
     journey["legs"].for(leg =>
       if isTimetableLeg(leg) then
         val sts = leg["stopTimes"]
         val first = sts[0]
         val last = sts[length(sts) - 1]
-        print("  ${first["stop"]} ${fmt(first["departureTime"])} -> ${last["stop"]} ${fmt(last["arrivalTime"])}")
+        print(
+          "  ${first["stop"]} ${fmt(first["departureTime"])} -> ${last["stop"]} ${fmt(last["arrivalTime"])}"
+        )
       else
-        print("  TRANSFER ${leg["origin"]} -> ${leg["destination"]} (${leg["duration"]}s)")
+        print(
+          "  TRANSFER ${leg["origin"]} -> ${leg["destination"]} (${leg["duration"]}s)"
+        )
     )
   )
 
-  // RESULT: from the journey with the earliest arrival (ties: fewest legs).
-  // Track best by INDEX (a null-initialised `var` mutated in a `.for` closure does not
-  // persist in current Lin codegen — see NOTES.md — so we avoid `var best = null`).
+  // RESULT: from the journey with the earliest arrival (ties: fewest legs). Tracked by
+  // index over the sorted list.
   var bestIdx = -1
   var idx = 0
   journeys.for(journey =>
-    if bestIdx < 0
-        || journey["arrivalTime"] < journeys[bestIdx]["arrivalTime"]
-        || (journey["arrivalTime"] == journeys[bestIdx]["arrivalTime"]
-            && length(journey["legs"]) < length(journeys[bestIdx]["legs"])) then
+    if bestIdx < 0 || journey["arrivalTime"] < journeys[bestIdx]["arrivalTime"] || journey["arrivalTime"] == journeys[bestIdx]["arrivalTime"] && length(journey["legs"]) < length(journeys[bestIdx]["legs"]) then
       bestIdx = idx
     idx = idx + 1
   )
 
   if bestIdx >= 0 then
     val best = journeys[bestIdx]
-    print("RESULT dep=${best["departureTime"]} arr=${best["arrivalTime"]} legs=${length(best["legs"])} count=${length(journeys)}")
+    print(
+      "RESULT dep=${best["departureTime"]} arr=${best["arrivalTime"]} legs=${length(best["legs"])} count=${length(journeys)}"
+    )
   else
     print("RESULT dep=0 arr=0 legs=0 count=0")
 

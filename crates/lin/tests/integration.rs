@@ -154,6 +154,47 @@ fn run_with_stdin(source: &str, stdin_data: &str) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// Compile source to a binary, run it with `prog_args` appended after argv[0],
+/// and return its trimmed stdout. Panics if compilation or execution fails.
+fn run_with_args(source: &str, prog_args: &[&str]) -> String {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_args_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_args_{}", id));
+
+    fs::write(&src_path, source).unwrap();
+
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+
+    let _ = fs::remove_file(&src_path);
+
+    assert!(
+        compile.status.success(),
+        "compilation failed:\nstderr: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let run_out = Command::new(&bin_path)
+        .args(prog_args)
+        .output()
+        .expect("failed to run compiled binary");
+
+    let _ = fs::remove_file(&bin_path);
+
+    assert!(
+        run_out.status.success(),
+        "runtime error:\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&run_out.stderr),
+        String::from_utf8_lossy(&run_out.stdout),
+    );
+
+    String::from_utf8_lossy(&run_out.stdout).trim().to_string()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Core language tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1245,6 +1286,82 @@ val mmul = match om
 print(toString(mmul))
 "#);
     assert_eq!(output, vec!["12.0", "7.0", "0.75", "12", "12.0"]);
+}
+
+#[test]
+fn test_dynamic_json_arith_missing_key_faults() {
+    // #5: dynamic `Json` arithmetic where an operand is a missing object key. The key reads
+    // as `Null` at runtime; the static path already rejects `Int32 + Null`, but two boxed
+    // `Json` operands type-check, so the runtime previously read the null payload as 0 and
+    // silently produced `5 + null = 5` / `5 * null = 0`. It must now FAULT with a clear
+    // message (not silently garble, and NOT invent JS NaN) — mirroring array-OOB faulting.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_json_arith_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_json_arith_{}", id));
+    fs::write(&src_path, r#"import { print } from "std/io"
+import { toString } from "std/string"
+val run = (): Null =>
+  val obj: Json = { "a": 5 }
+  val x: Json = obj["b"]
+  val sum: Json = obj["a"] + x
+  print(toString(sum))
+run()
+"#).unwrap();
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+    let run_out = Command::new(&bin_path).output().expect("failed to run compiled binary");
+    let _ = fs::remove_file(&bin_path);
+    assert!(!run_out.status.success(),
+        "dynamic Json arithmetic with a missing (Null) key must fault (non-zero exit)");
+    let stderr = String::from_utf8_lossy(&run_out.stderr);
+    assert!(stderr.contains("dynamic Json operands") && stderr.contains("Null"),
+        "expected a clear Json-arithmetic runtime fault naming Null, got stderr:\n{}", stderr);
+    // And it must NOT have printed a silently-garbled numeric result on stdout.
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    assert!(stdout.trim().is_empty(),
+        "must not silently produce a numeric result before faulting, got stdout:\n{}", stdout);
+}
+
+#[test]
+fn test_dynamic_json_arith_present_keys_still_works() {
+    // The fault must be narrow: arithmetic over two PRESENT numeric Json keys is unaffected.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val run = (): Null =>
+  val obj: Json = { "a": 5, "b": 3 }
+  print(toString(obj["a"] + obj["b"]))
+  print(toString(obj["a"] * obj["b"]))
+run()
+"#);
+    assert_eq!(output, vec!["8", "15"]);
+}
+
+#[test]
+fn test_dynamic_json_arith_fault_catchable_in_async() {
+    // A Json-arithmetic fault raised inside an async thunk unwinds to the boundary and is
+    // caught as an `Error` (proving lin_tagged_arith's `extern "C-unwind"` ABI), exactly like
+    // a division-by-zero / OOB fault inside a boundary.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await } from "std/async"
+val run = (): Null =>
+  val obj: Json = { "a": 5 }
+  val p = async((): Json =>
+    val x: Json = obj["b"]
+    obj["a"] + x
+  )
+  val r = await(p)
+  if r is Error then print("caught") else print(toString(r))
+run()
+"#);
+    assert_eq!(output, vec!["caught"]);
 }
 
 #[test]
@@ -5529,6 +5646,37 @@ val basePath =
 }
 
 #[test]
+fn test_if_else_wrapped_inside_parens_parses_and_round_trips() {
+    // Regression (LIN_ISSUES #7): a WRAPPED (multi-line) `if/else` as the RHS of a `val`
+    // INSIDE a parenthesised closure body (`.for(... => …)`) used to fail with
+    // `unexpected token Else`. ADR-004 suppresses Indent/Dedent inside `()`, so the branch
+    // offside floor must anchor on the indentation of the LINE the `if` sits on, not on the
+    // `if` keyword's (far-right) column — else the then-branch collapses to empty and the
+    // newline `else` is orphaned. The one-line form always parsed; only the wrapped form broke.
+    let src = "\
+import { print } from \"std/io\"
+import { for } from \"std/iter\"
+val f = (raptor: Json, marked: Json): Null =>
+  marked.for(stopP =>
+    val transfers = if raptor[stopP] != null then
+      raptor[stopP]
+    else
+      []
+    transfers.for(t => print(t))
+  )
+val run = (): Null => f({ \"a\": [\"x\"] }, [\"a\"])
+run()
+";
+    // It must compile and run (this was the original failure).
+    assert_eq!(run(src), vec!["x"], "wrapped if/else inside .for(...) should run");
+
+    // And the formatter must round-trip it: `fmt()` panics on a parse error, so if the
+    // formatted output were unparseable (the bug that corrupted raptor.lin), this fails.
+    let out = fmt(src);
+    assert_eq!(out, fmt(&out), "wrapped if/else inside parens not idempotent:\n{}", out);
+}
+
+#[test]
 fn test_fmt_else_if_block_branch_comment_preserved_once() {
     // A leading own-line comment on the first statement of an `else if ... then` Block
     // branch body was emitted TWICE (the If arm's `take_leading` and `fmt_block` both
@@ -6758,6 +6906,29 @@ val x = 1705314600000i64
 print(toString(x + 1i64))
 "#);
     assert_eq!(out, vec!["1705314600000", "1705314600001"]);
+}
+
+#[test]
+fn test_mixed_int32_int64_arithmetic_widens_int32_operand() {
+    // Regression (LIN_ISSUES #3): `x * 1000003i64` where `x: Int32` used to compute the
+    // product in Int32 (overflowing to -194043216) and only THEN widen the result to Int64.
+    // The `i64` literal operand was being re-typed DOWN to Int32 to match `x` before the op.
+    // A mixed Int32 * Int64 op must now widen the Int32 operand to Int64 so the arithmetic
+    // happens at Int64. Cover both operand orders, +, and -. Pure-Int32 arithmetic must STILL
+    // wrap (semantics unchanged): 90000 * 50000 = 4_500_000_000 wraps to 205032704 in Int32.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val run = (): Null =>
+  val x = 90000
+  val mulR: Int64 = x * 1000003i64
+  val mulL: Int64 = 1000003i64 * x
+  val add: Int64 = x + 3000000000i64
+  val sub: Int64 = 5000000000i64 - x
+  val pureI32 = 90000 * 50000
+  print("${toString(mulR)} ${toString(mulL)} ${toString(add)} ${toString(sub)} ${toString(pureI32)}")
+run()
+"#);
+    assert_eq!(out, vec!["90000270000 90000270000 3000090000 4999910000 205032704"]);
 }
 
 #[test]
@@ -11567,4 +11738,98 @@ print("${toString(final["a"] + final["b"] + final["c"])}")
     // a: 1 + 10000 = 10001; b: sum of a over iters; c: 2*10000 = 20000. The exact total is not the
     // point — the point is it RUNS (no segfault) and is deterministic.
     assert_eq!(out, vec!["50035001"]);
+}
+
+/// Regression (LIN_ISSUES #2): a top-level mutable `var` in an IMPORTED module, mutated by an
+/// EXPORTED function, used to panic codegen ("Binary: undefined lhs temp Temp(0)") because the
+/// import lowering never set up the module global / its initialiser — the exported mutator
+/// referenced an SSA temp that the (non-existent) `main` would have produced. The var must now be
+/// a once-initialised module global with shared, persistent state across exported entry points.
+#[test]
+fn test_imported_module_var_mutated_by_export() {
+    let lin_bin = lin_bin();
+    if !lin_bin.exists() {
+        eprintln!("SKIP test_imported_module_var_mutated_by_export: lin binary not built");
+        return;
+    }
+
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let dir = ws.join(format!("target/lin_impvar_{}", id));
+    let _ = fs::create_dir_all(&dir);
+    let src_path = dir.join("main.lin");
+    let bin_path = dir.join("impvar_bin");
+
+    // Imported module: non-zero-initialised top-level `var`, an exported mutator that
+    // increments it, and an exported reader that observes the shared persistent state.
+    fs::write(dir.join("counter.lin"),
+        r#"var counter = 10
+export val nextId = (): Int32 =>
+  counter = counter + 1
+  counter
+export val peek = (): Int32 => counter
+"#).unwrap();
+
+    fs::write(&src_path,
+        r#"import { nextId, peek } from "./counter"
+import { print } from "std/io"
+import { toString } from "std/string"
+print("${toString(peek())} ${toString(nextId())} ${toString(nextId())} ${toString(peek())}")
+"#).unwrap();
+
+    let compile = Command::new(&lin_bin)
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary");
+    assert!(
+        compile.status.success(),
+        "imported-var program compilation failed:\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&compile.stderr),
+        String::from_utf8_lossy(&compile.stdout),
+    );
+
+    let run_out = Command::new(&bin_path).output().expect("failed to run compiled binary");
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        run_out.status.success(),
+        "runtime error:\nstderr: {}",
+        String::from_utf8_lossy(&run_out.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    let lines: Vec<String> = stdout.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect();
+    // peek=10 (init respected), then two increments to 11 and 12, then peek sees the shared 12.
+    assert_eq!(lines, vec!["10 11 12 12"]);
+}
+
+#[test]
+fn test_cli_args_read_in_compiled_binary() {
+    // Regression: a compiled `lin build` binary can read its command-line arguments
+    // via std/io.args(). args() excludes argv[0] and returns the user args in order.
+    let src = r#"
+import { args, print } from "std/io"
+import { for } from "std/iter"
+import { length } from "std/array"
+import { toString } from "std/string"
+val a = args()
+print("count=${toString(length(a))}")
+a.for(x => print(x))
+"#;
+    let out = run_with_args(src, &["alpha", "beta", "gamma"]);
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        vec!["count=3", "alpha", "beta", "gamma"]
+    );
+}
+
+#[test]
+fn test_cli_args_empty_when_none_passed() {
+    let src = r#"
+import { args, print } from "std/io"
+import { length } from "std/array"
+import { toString } from "std/string"
+print("count=${toString(length(args()))}")
+"#;
+    let out = run_with_args(src, &[]);
+    assert_eq!(out, "count=0");
 }

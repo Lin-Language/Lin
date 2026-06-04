@@ -22,27 +22,53 @@ val s = suite("GroupStationDepartAfterQuery", [
   test("plans to multiple destinations", () => [
     expect(plan(
       [
-        t([st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)]),
-        t([st("A", null, 1200), st("B", 1230, 1235), st("D", 1300, null)])
+        t([
+          st("A", null, 1000),
+          st("B", 1030, 1035),
+          st("C", 1100, null)
+        ]),
+        t([
+          st("A", null, 1200),
+          st("B", 1230, 1235),
+          st("D", 1300, null)
+        ])
       ],
-      ["A"], ["C", "D"], "2019-04-18", 900
-    )).toSatisfy(r => journeysEq(r, [
-      j([[st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)]]),
-      j([[st("A", null, 1200), st("B", 1230, 1235), st("D", 1300, null)]])
-    ]))
+      ["A"],
+      ["C", "D"],
+      "2019-04-18",
+      900
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([[st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)]]),
+        j([[st("A", null, 1200), st("B", 1230, 1235), st("D", 1300, null)]])
+      ])
+    )
   ]),
 
   test("plans from multiple origins", () => [
     expect(plan(
       [
-        t([st("A", null, 1000), st("B", 1030, 1035), st("C", 1100, null)]),
-        t([st("A", null, 1200), st("_", 1230, 1235), st("D", 1300, null)])
+        t([
+          st("A", null, 1000),
+          st("B", 1030, 1035),
+          st("C", 1100, null)
+        ]),
+        t([
+          st("A", null, 1200),
+          st("_", 1230, 1235),
+          st("D", 1300, null)
+        ])
       ],
-      ["A", "B"], ["C", "D"], "2019-04-18", 900
-    )).toSatisfy(r => journeysEq(r, [
-      j([[st("B", 1030, 1035), st("C", 1100, null)]]),
-      j([[st("A", null, 1200), st("_", 1230, 1235), st("D", 1300, null)]])
-    ]))
+      ["A", "B"],
+      ["C", "D"],
+      "2019-04-18",
+      900
+    )).toSatisfy(r =>
+      journeysEq(r, [
+        j([[st("B", 1030, 1035), st("C", 1100, null)]]),
+        j([[st("A", null, 1200), st("_", 1230, 1235), st("D", 1300, null)]])
+      ])
+    )
   ])
 ])
 run(s)

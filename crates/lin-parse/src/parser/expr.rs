@@ -514,6 +514,22 @@ impl Parser {
                     span,
                 }
             }
+            // Lin has no semicolons (spec §1.2). A `;` here is almost always someone
+            // separating statements C-style (e.g. inside an inline closure body
+            // `c => idx[c] = i; i = i + 1`). Emit an actionable diagnostic rather than the
+            // misleading "Undefined variable ';'" that the old Ident-catch-all produced.
+            TokenKind::Semicolon => {
+                let span = self.current_span();
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        span,
+                        "unexpected ';' — Lin has no semicolons",
+                    )
+                    .with_help("separate statements with newlines, not ';'"),
+                );
+                self.advance();
+                Expr::NullLit(span)
+            }
             _ => {
                 let span = self.current_span();
                 let got = self.peek_kind();
@@ -654,11 +670,15 @@ impl Parser {
     }
 
     pub(crate) fn parse_if_expr(&mut self) -> Expr {
-        // The offside floor for an inline (no-Indent) branch is the column of the `if`
-        // keyword that opens the chain. An `else if` continuation reuses the SAME floor as
-        // the `if` it continues (so a trailing `else` aligned with the outer `if` still
-        // belongs to the chain, not to the inner branch) — see `parse_if_expr_with_col`.
-        let branch_col = self.current_column();
+        // The offside floor for an inline (no-Indent) branch is the indentation of the LINE the
+        // `if` sits on — not the `if` keyword's own column. When `if` starts its statement the
+        // two coincide (unchanged behaviour); when `if` is a right-hand side
+        // (`val x = if c then\n  A\nelse\n  B`) its wrapped branches indent relative to the
+        // enclosing statement, which is left of the keyword, so anchoring on the keyword would
+        // set an impossibly high floor and collapse the branch (orphaning the `else`). An
+        // `else if` continuation reuses the SAME floor as the `if` it continues — see
+        // `parse_if_expr_with_col`.
+        let branch_col = self.line_start_column();
         self.parse_if_expr_with_col(branch_col)
     }
 

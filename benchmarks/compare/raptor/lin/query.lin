@@ -85,7 +85,15 @@ val searchDay = (raptor: Json, origins: Json, destinations: Json, date: Json, ma
       var nextIndexes: Json = []
       connectionIndexes.for(c => push(nextIndexes, c))
       push(nextIndexes, kConnections)
-      searchDay(raptor, nextOrigins, destinations, addDay(date), maxSearchDays, i + 1, nextIndexes)
+      searchDay(
+        raptor,
+        nextOrigins,
+        destinations,
+        addDay(date),
+        maxSearchDays,
+        i + 1,
+        nextIndexes
+      )
 
 // Group-station plan: set the same departure time on every origin, search, apply filters.
 export val planGroup = (raptor: Json, origins: Json, destinations: Json, date: Json, time: Int32, maxSearchDays: Int32, filters: Json): Json =>
@@ -122,4 +130,13 @@ val rangeStep = (raptor: Json, origin: String, destination: String, date: Json, 
       newResults.for(j =>
         if j["departureTime"] < minDep then minDep = j["departureTime"]
       )
-      rangeStep(raptor, origin, destination, date, maxSearchDays, minDep + 1, endTime, results)
+      rangeStep(
+        raptor,
+        origin,
+        destination,
+        date,
+        maxSearchDays,
+        minDep + 1,
+        endTime,
+        results
+      )

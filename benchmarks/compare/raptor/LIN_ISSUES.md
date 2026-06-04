@@ -165,3 +165,63 @@ but a documented divergence worth a lint or a defined `Json` numeric-coercion ru
 - **Inline multi-statement closures need newlines**, not `;` — `c => idx[c]=i; i=i+1`
   fails to parse (`Undefined variable ';'`); the newline form works. Expected per the
   grammar, noted only because the error message is misleading.
+
+---
+
+## 7. [CORRECTNESS] multi-line `if/else` is unparseable inside parentheses (one parser bug)
+
+**Severity: high — the parser rejects valid, canonical Lin. RESOLVED** — fixed by
+anchoring the inline `if`-branch offside floor on the indentation of the line the `if`
+sits on (new `line_start_column()`), not the `if` keyword's column. Regression test
+`test_if_else_wrapped_inside_parens_parses_and_round_trips` both runs the program and
+round-trips it through `lin fmt`. The RAPTOR `lin/` dir is now `lin fmt`-clean.
+
+A **wrapped (multi-line) `if … then <newline> A <newline> else <newline> B`** expression
+fails to parse with `unexpected token Else` when it appears **inside parentheses** — e.g.
+as the RHS of a `val` inside a `.for(... => …)` closure body. The exact same wrapped
+`if/else` parses fine in a plain (non-parenthesized) function body, and the **one-line**
+form parses fine everywhere, including inside the parens.
+
+This is **one bug, in the parser** — not a formatter bug. `lin fmt` wrapping a long
+`if/else` onto multiple lines is correct, idiomatic behaviour (it's the canonical shape
+that parses everywhere outside parens); the formatter is emitting valid-looking Lin. The
+fault is entirely that the parser cannot accept that valid shape inside parens. A
+hand-written wrapped `if/else` inside a `.for(...)` fails identically with no formatter
+involved. Forcing the formatter to keep `if/else` inline inside parens would be a
+workaround that hides the parser hole and yields inconsistent formatting — once the
+parser is fixed, the formatter's existing output just works, untouched.
+
+Minimal repro (fails: `unexpected token Else`):
+```lin
+marked.for(stopP =>
+  val transfers = if raptor[stopP] != null then
+    raptor[stopP]
+  else
+    []
+  transfers.for(t => print(t))
+)
+```
+All three of these BUILD fine, isolating the trigger to "wrapped + inside parens":
+- the same code with the `if/else` on one line inside the `.for`;
+- the wrapped `if/else` in a plain function body (no enclosing parens);
+- the one-line `if/else` in a plain function body.
+
+**Root cause:** indentation lexing is suppressed inside `( ) [ ] { }` (ADR-004, so JSON
+literals can span lines), so inside a `.for(...)` there are no INDENT/DEDENT tokens. The
+`if`-expression parser relies on that layout to know the `then`-branch expression ended
+and a new-line `else` continues the same `if`; with layout suppressed it can't, and bails
+at the `else`. The fix is analogous to dot-chaining across newlines (ADR-006): the
+`then`/`else` continuation should use save/restore newline lookahead rather than depend on
+suppressed INDENT/DEDENT.
+
+**How it surfaced:** `lin fmt` wraps a long one-line `if/else` onto multiple lines (correct
+behaviour), which inside a parenthesized closure hits the parser bug — so formatting
+`raptor.lin` and `stringResults.lin` produced unparseable output (2 files unbuildable, 4
+unit-test files failed). That's a symptom of the parser gap, not a formatter defect. It
+does mean the **corpus round-trip gate** that is supposed to catch the formatter producing
+non-reparseable output has a hole: it evidently doesn't cover a wrapped `if/else` inside a
+parenthesized closure, so adding such a fixture would have caught this and will guard the
+fix.
+
+RESOLVED: the parser fix landed and the RAPTOR `lin/` dir has been `lin fmt`-cleaned;
+CI's `fmt --check` over `benchmarks/` now passes.

@@ -9,7 +9,7 @@
 // (the cross-language correctness gate). Gate: group=26203913 range=773022892 journeys=139.
 import { for } from "std/iter"
 import { keys } from "std/object"
-import { length, push, slice } from "std/array"
+import { length, push, slice, sort } from "std/array"
 import { print } from "std/io"
 import { toString } from "std/string"
 import { now } from "std/time"
@@ -47,11 +47,121 @@ val GROUP_QUERIES = [
   [["DVP"], ["BHM", "BMO", "BSW", "BHI"]],
   [["BXB"], ["DVP"]],
   [["MCO", "MAN", "MCV", "EXD"], ["CBW", "CBE"]],
-  [["MCO", "MAN", "MCV", "EXD"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]],
-  [["BHM", "BMO", "BSW", "BHI"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]],
-  [["ORP"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]],
-  [["EDB"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]],
-  [["CBE", "CBW"], ["EUS", "MYB", "STP", "PAD", "BFR", "CTK", "CST", "CHX", "LBG", "WAE", "VIC", "VXH", "WAT", "OLD", "MOG", "KGX", "LST", "FST"]]
+  [
+    ["MCO", "MAN", "MCV", "EXD"],
+    [
+      "EUS",
+      "MYB",
+      "STP",
+      "PAD",
+      "BFR",
+      "CTK",
+      "CST",
+      "CHX",
+      "LBG",
+      "WAE",
+      "VIC",
+      "VXH",
+      "WAT",
+      "OLD",
+      "MOG",
+      "KGX",
+      "LST",
+      "FST"
+    ]
+  ],
+  [
+    ["BHM", "BMO", "BSW", "BHI"],
+    [
+      "EUS",
+      "MYB",
+      "STP",
+      "PAD",
+      "BFR",
+      "CTK",
+      "CST",
+      "CHX",
+      "LBG",
+      "WAE",
+      "VIC",
+      "VXH",
+      "WAT",
+      "OLD",
+      "MOG",
+      "KGX",
+      "LST",
+      "FST"
+    ]
+  ],
+  [
+    ["ORP"],
+    [
+      "EUS",
+      "MYB",
+      "STP",
+      "PAD",
+      "BFR",
+      "CTK",
+      "CST",
+      "CHX",
+      "LBG",
+      "WAE",
+      "VIC",
+      "VXH",
+      "WAT",
+      "OLD",
+      "MOG",
+      "KGX",
+      "LST",
+      "FST"
+    ]
+  ],
+  [
+    ["EDB"],
+    [
+      "EUS",
+      "MYB",
+      "STP",
+      "PAD",
+      "BFR",
+      "CTK",
+      "CST",
+      "CHX",
+      "LBG",
+      "WAE",
+      "VIC",
+      "VXH",
+      "WAT",
+      "OLD",
+      "MOG",
+      "KGX",
+      "LST",
+      "FST"
+    ]
+  ],
+  [
+    ["CBE", "CBW"],
+    [
+      "EUS",
+      "MYB",
+      "STP",
+      "PAD",
+      "BFR",
+      "CTK",
+      "CST",
+      "CHX",
+      "LBG",
+      "WAE",
+      "VIC",
+      "VXH",
+      "WAT",
+      "OLD",
+      "MOG",
+      "KGX",
+      "LST",
+      "FST"
+    ]
+  ]
 ]
 
 val RANGE_QUERIES = [
@@ -62,15 +172,11 @@ val RANGE_QUERIES = [
   ["RDG", "IPS"]
 ]
 
-// Order-independent digest contribution of one journey.
-// NOTE: dep/arr are Int32; `dep * 1000003i64` would compute the product in Int32 FIRST
-// and overflow (an Int64 literal operand does NOT widen the other operand). So widen each
-// term to an Int64 binding before multiplying. (Lin friction — see NOTES.md.)
+// Order-independent digest contribution of one journey. Mixed Int32 * Int64-literal
+// arithmetic widens the Int32 operand to Int64 before multiplying (so no overflow).
 val journeyDigest = (j: Json): Int64 =>
-  val depI: Int32 = j["departureTime"] % 1000000000
-  val arrI: Int32 = j["arrivalTime"] % 1000000000
-  val dep: Int64 = depI
-  val arr: Int64 = arrI
+  val dep: Int32 = j["departureTime"] % 1000000000
+  val arr: Int32 = j["arrivalTime"] % 1000000000
   val legs: Int64 = length(j["legs"])
   (dep * 1000003i64 + arr * 31i64 + legs) % MOD
 
@@ -79,23 +185,14 @@ val accumulate = (journeys: Json, acc: Int64): Int64 =>
   journeys.for(j => a = (a + journeyDigest(j)) % MOD)
   a
 
-// Stable sort journeys by departureTime asc then arrivalTime asc (for the take-N slice).
+// Sort journeys by departureTime asc, then arrivalTime asc (for the take-N slice).
 val sortJourneys = (journeys: Json): Json =>
-  var sorted: Json = []
-  journeys.for(j =>
-    var inserted = false
-    var out: Json = []
-    sorted.for(x =>
-      if inserted == false && (j["departureTime"] < x["departureTime"]
-          || (j["departureTime"] == x["departureTime"] && j["arrivalTime"] < x["arrivalTime"])) then
-        push(out, j)
-        inserted = true
-      push(out, x)
-    )
-    if inserted == false then push(out, j)
-    sorted = out
+  sort(journeys, (a, b) =>
+    if a["departureTime"] != b["departureTime"] then
+      a["departureTime"] - b["departureTime"]
+    else
+      a["arrivalTime"] - b["arrivalTime"]
   )
-  sorted
 
 // "next N journeys departing after startTime" — the RangeQuery profile loop, capped at N.
 val nextN = (raptor: Json, origin: String, destination: String, n: Int32): Json =>
@@ -143,7 +240,9 @@ val main = (): Null =>
     groupDigest = accumulate(results, groupDigest)
   )
   val groupMs = now() - tg
-  print("GROUP queries=${length(GROUP_QUERIES)} journeys=${groupCount} digest=${toString(groupDigest)} ms=${toString(groupMs)}")
+  print(
+    "GROUP queries=${length(GROUP_QUERIES)} journeys=${groupCount} digest=${toString(groupDigest)} ms=${toString(groupMs)}"
+  )
 
   // RANGE workload ("next 20", no filter)
   val tr = now()
@@ -155,8 +254,12 @@ val main = (): Null =>
     rangeDigest = accumulate(results, rangeDigest)
   )
   val rangeMs = now() - tr
-  print("RANGE queries=${length(RANGE_QUERIES)} journeys=${rangeCount} digest=${toString(rangeDigest)} ms=${toString(rangeMs)}")
+  print(
+    "RANGE queries=${length(RANGE_QUERIES)} journeys=${rangeCount} digest=${toString(rangeDigest)} ms=${toString(rangeMs)}"
+  )
 
-  print("DIGEST group=${toString(groupDigest)} range=${toString(rangeDigest)} journeys=${groupCount + rangeCount}")
+  print(
+    "DIGEST group=${toString(groupDigest)} range=${toString(rangeDigest)} journeys=${groupCount + rangeCount}"
+  )
 
 main()
