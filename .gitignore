@@ -10,3 +10,4 @@ examples/ffi/*.o
 benchmarks/results/
 docs-site/output/
 /docs-builder
+tmp/
