@@ -24,7 +24,7 @@ pub enum Type {
     Array(Box<Type>),
     FixedArray(Vec<Type>),
     /// A structural object type. `sealed` is an INERT representation marker (Stage 0.5 of the
-    /// sealed-records design, `docs/SEALED_RECORDS_DESIGN.md` §5): it is `true` ONLY when this
+    /// sealed-records design, ADR-082): it is `true` ONLY when this
     /// object originates from resolving a NAMED record-type declaration (`type T = { … }`) in
     /// `resolve.rs`, and `false` for every anonymous object literal type, inferred structural
     /// type, and built-in structural alias (e.g. `Error`).
@@ -79,7 +79,7 @@ pub enum Type {
 /// adding the Stage-0.5 sealed flag cannot perturb any equality-driven behavior (union
 /// dedup/flatten via `Vec::contains`, narrowing/exhaustiveness comparisons, `temp_types`
 /// identity, zonk fixpoints, cache keys). The flag rides along structurally but is invisible to
-/// `==`. See `docs/SEALED_RECORDS_DESIGN.md` §5 (Stage 0.5) and ADR-051 (the `StrLit` precedent).
+/// `==`. See ADR-082 (Stage 0.5) and ADR-051 (the `StrLit` precedent).
 impl PartialEq for Type {
     fn eq(&self, other: &Self) -> bool {
         use Type::*;

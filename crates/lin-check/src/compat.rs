@@ -166,7 +166,7 @@ pub fn is_compatible_env(
         // INVARIANT (Stage 0.5): the `sealed` marker is IGNORED here — a sealed named-record type
         // and an unsealed anonymous type with the same fields remain mutually compatible, and a
         // wider Json is still assignable where a named type is expected. Compatibility is purely
-        // structural. See SEALED_RECORDS_DESIGN.md §5 invariant 1.
+        // structural. See ADR-082 (sealed = representation-only; compat stays structural).
         (Type::Object { fields: value_fields, .. }, Type::Object { fields: target_fields, .. }) => {
             target_fields.iter().all(|(key, target_ty)| {
                 match value_fields.get(key) {
