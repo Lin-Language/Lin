@@ -108,6 +108,13 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.box_object, &[val.into()], "boxobj")
                     .try_as_basic_value().unwrap_basic()
             }
+            // Typed index-signature map (`{ String: T }`, ADR-082): box the LinMap* as TAG_MAP.
+            Type::Map(_) => {
+                let box_map_fn = self.get_or_declare_fn("lin_box_map",
+                    self.context.ptr_type(AddressSpace::default()).fn_type(&[self.context.ptr_type(AddressSpace::default()).into()], false));
+                self.builder.call(box_map_fn, &[val.into()], "boxmap")
+                    .try_as_basic_value().unwrap_basic()
+            }
             Type::Array(_) if val.is_pointer_value() => {
                 // Box the LinArray* directly (flat or tagged). The elem_tag field in LinArray
                 // lets runtime functions (lin_array_get_tagged, lin_push_dyn, etc.) dispatch

@@ -288,6 +288,25 @@ impl<'ctx> Codegen<'ctx> {
             let res = phi.as_basic_value();
             return if Self::is_union_type(result_ty) { res } else { self.unbox_tagged_val_to_type(res, result_ty) };
         }
+        // Typed index-signature map `{ String: T }` (ADR-082): `m[k]` is an O(1) hashed lookup.
+        // The key is a String (raw LinString*, or unbox a Json/union-boxed key); the result is
+        // `T | Null` — `lin_map_get` returns null for a missing key, which `unbox_tagged_val_to_type`
+        // maps to the language Null.
+        if let Type::Map(_) = obj_ty {
+            let key_str = if key_ty.is_string_ish() {
+                key
+            } else if Self::is_union_type(key_ty) && key.is_pointer_value() {
+                self.builder.call(self.rt.unbox_ptr, &[key.into()], "ir_mkey_unbox").try_as_basic_value().unwrap_basic()
+            } else {
+                key
+            };
+            let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget").try_as_basic_value().unwrap_basic();
+            return if Self::is_union_type(result_ty) {
+                tagged
+            } else {
+                self.unbox_tagged_val_to_type(tagged, result_ty)
+            };
+        }
         // Array indexing when the object is an array type or the key is numeric (any int
         // width — e.g. an Int32 literal index like `lines[0]`, not just i64).
         let is_array_access = matches!(obj_ty, Type::Array(_) | Type::FixedArray(_))
@@ -378,6 +397,24 @@ impl<'ctx> Codegen<'ctx> {
         } else { value };
         self.builder.call(self.rt.object_set,
             &[obj_ptr.into(), key_ptr.into(), val_tagged.into()], "");
+        if val_is_fresh_box && val_tagged.is_pointer_value() {
+            self.builder.call(self.rt.tagged_release, &[val_tagged.into()], "");
+        }
+    }
+
+    /// Store `value` into a typed index-signature map (`lin_map_set`, ADR-082). Identical
+    /// ownership contract to `emit_object_set`: `lin_map_set` RETAINS the value's inner payload,
+    /// so for a freshly-boxed concrete value we release the fresh box shell afterwards (net zero on
+    /// the inner; the slot's single reference is supplied by the IR `transfer_into_container`
+    /// emitted in `IndexSet` lowering). A union/Json value (already a `TaggedVal*`) is passed
+    /// straight through.
+    pub(crate) fn emit_map_set(&mut self, map_ptr: BasicValueEnum<'ctx>, key_ptr: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type) {
+        let val_is_fresh_box = !Self::is_union_type(val_ty);
+        let val_tagged = if val_is_fresh_box {
+            self.box_value(value, val_ty)
+        } else { value };
+        self.builder.call(self.rt.map_set,
+            &[map_ptr.into(), key_ptr.into(), val_tagged.into()], "");
         if val_is_fresh_box && val_tagged.is_pointer_value() {
             self.builder.call(self.rt.tagged_release, &[val_tagged.into()], "");
         }
@@ -504,6 +541,13 @@ impl<'ctx> Codegen<'ctx> {
                 if obj.is_pointer_value() && key.is_pointer_value() {
                     let key_str = resolve_obj_key(self, key);
                     self.emit_object_set(obj, key_str, value, val_ty);
+                }
+            }
+            // Typed index-signature map `{ String: T }` (ADR-082): O(1) hashed insert/overwrite.
+            Type::Map(_) => {
+                if obj.is_pointer_value() && key.is_pointer_value() {
+                    let key_str = resolve_obj_key(self, key);
+                    self.emit_map_set(obj, key_str, value, val_ty);
                 }
             }
             Type::Array(elem) => {

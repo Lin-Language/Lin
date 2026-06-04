@@ -192,6 +192,12 @@ impl<'ctx> Codegen<'ctx> {
                             i64_ty.fn_type(&[ptr_ty.into()], false));
                         self.builder.call(obj_len_fn, &[arg.into()], "ir_olen").try_as_basic_value().unwrap_basic()
                     }
+                    // Typed index-signature map `{ String: T }` (ADR-082): entry count.
+                    Type::Map(_) => {
+                        let map_len_fn = self.get_or_declare_fn("lin_map_length",
+                            i64_ty.fn_type(&[ptr_ty.into()], false));
+                        self.builder.call(map_len_fn, &[arg.into()], "ir_mlen").try_as_basic_value().unwrap_basic()
+                    }
                     _ => {
                         // Json / TypeVar / Union — dynamic dispatch on the runtime tag.
                         let len_dyn_fn = self.get_or_declare_fn("lin_length_dyn",
@@ -1204,7 +1210,12 @@ impl<'a> DescEncoder<'a> {
             | Type::Shared(_)
             // `Stream<T>` is opaque and never a `fromJson` target (not JSON-shaped, not
             // spellable in annotations); included only for match exhaustiveness — accept-any.
-            | Type::Stream(_) => self.put_u8(KIND_JSON),
+            | Type::Stream(_)
+            // A typed index-signature map `{ String: T }` (ADR-082) is NOT a v1 `fromJson` decode
+            // target — the decoder produces a `LinObject`, not a `LinMap`, so decoding INTO a map
+            // would yield the wrong representation. Treated as accept-any here only for
+            // exhaustiveness; a `fromJson<{String:T}>` is not part of v1 (see ADR-082).
+            | Type::Map(_) => self.put_u8(KIND_JSON),
             Type::Array(inner) => {
                 self.put_u8(KIND_ARRAY);
                 let slot = self.reserve_u32();

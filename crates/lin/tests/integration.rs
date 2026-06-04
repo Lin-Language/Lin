@@ -3413,6 +3413,83 @@ print(toString(sum))
 }
 
 #[test]
+fn test_typed_map_index_signature() {
+    // Typed index-signature map `{ String: T }` (ADR-082): the hashed `LinMap` backing.
+    // Insert/lookup of distinct keys, overwrite (length stays put), missing key -> Null,
+    // and keys()/values() over the map. The empty `{}` literal infers `{ String: Int32 }`
+    // from its annotation context.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { keys, values } from "std/object"
+import { length } from "std/array"
+
+var m: { String: Int32 } = {}
+m["apple"] = 3
+m["banana"] = 7
+m["apple"] = 10
+print(toString(m["apple"]))
+print(toString(m["banana"]))
+print(toString(m["missing"]))
+print(toString(length(keys(m))))
+print(toString(length(values(m))))
+"#);
+    assert_eq!(output, vec!["10", "7", "null", "2", "2"]);
+}
+
+#[test]
+fn test_typed_map_scales_linear_not_quadratic() {
+    // The O(1)-average hashed backing: insert N distinct keys then look every one back up.
+    // With the old O(n) assoc-list this is O(n^2); the LinMap makes it O(n). A correctness
+    // check (every key reads back its value, summed) doubles as the bench oracle.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { keys } from "std/object"
+import { length } from "std/array"
+import { for, range } from "std/iter"
+
+var m: { String: Int32 } = {}
+range(0, 5000).for(i => m["k${toString(i)}"] = i)
+var sum = 0i64
+range(0, 5000).for(i =>
+  val v = m["k${toString(i)}"]
+  match v
+    is Int32 => sum = sum + v
+    else => sum = sum
+)
+print(toString(length(keys(m))))
+print(toString(sum))
+"#);
+    // sum_{i=0..4999} i = 4999*5000/2 = 12497500
+    assert_eq!(output, vec!["5000", "12497500"]);
+}
+
+#[test]
+fn test_typed_map_string_values_rc() {
+    // String (heap) values exercise the map's value retain/release discipline (mirrors
+    // lin_object_set's). Building/freeing many maps with heap values that share a string would
+    // surface an RC imbalance as a crash; a stable checksum confirms balance.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val loop = (i: Int64, acc: Int64): Int64 =>
+  if i == 0i64 then acc
+  else
+    var m: { String: String } = {}
+    m["k"] = "value"
+    m["k2"] = "value2"
+    val a = m["k"]
+    val n = match a
+      is String => if a == "value" then 1i64 else 0i64
+      else => 0i64
+    loop(i - 1i64, acc + n)
+
+print(toString(loop(20000i64, 0i64)))
+"#);
+    // Each iter contributes 1 when m["k"] reads back "value"; 20000 iters -> 20000.
+    assert_eq!(output, vec!["20000"]);
+}
+
+#[test]
 fn test_inline_object_rc_field_construction() {
     // Phase 2 of the static-record optimization: a no-spread object literal whose fields are
     // all scalar OR concrete heap (Str/Array/Object) is constructed via INLINE entry stores
