@@ -10,13 +10,19 @@ import foreign "lin-runtime"
 // from std/array (avoids an array->iter->array import cycle).
 import { for, take, concat } from "std/iter"
 
+// Stays `Json`/`Json` (NOT `<T>(arr: T[], item: T)`): `push` is the primitive for building up an
+// UNTYPED accumulator (`val acc = []; xs.for(x => acc.push(x))`) — the single most common array
+// idiom. With a generic signature the empty `[]` accumulator never pins `T`, so `push` falls back to
+// an unmonomorphized instantiation that mis-stores elements (observed: a fresh `[]` filled via
+// `push` reads back as all-`null`, and a cross-type module fails LLVM verification). The element
+// type therefore stays opaque; `lin_push` dispatches on the runtime element representation.
 export val push = (arr: Json, item: Json): Null =>
   lin_push(arr, item)
 
 // Polymorphic sub-buffer copy. Dispatches on the array's runtime element type,
 // so a UInt8[] yields a UInt8[], an Int32[] an Int32[], a Json[] a Json[].
 // `start`/`end` clamp to [0, length]; `end` is exclusive.
-export val slice = (arr: Json, start: Int32, end: Int32 = length(arr)): Json =>
+export val slice = <T>(arr: T[], start: Int32, end: Int32 = length(arr)): T[] =>
   val n = length(arr)
   val s = if start < 0 then n + start else start
   val e = if end < 0 then n + end else end
@@ -70,7 +76,7 @@ export val indexOf = <T>(arr: T[], target: T, fromIndex: Int32 = 0): Int32 =>
   )
   result
 
-export val reverse = (arr: Json): Json =>
+export val reverse = <T>(arr: T[]): T[] =>
   val n = length(arr)
   val result = lin_array_allocate(n)
   var i = n - 1
@@ -89,11 +95,13 @@ export val at = <T>(arr: T[], index: Int32): T | Null =>
 
 // The predicate OPTIONALLY receives a 0-based `Int32` SOURCE index (`(item, i) => …`); a 1-arg
 // predicate stays valid via arity-width subtyping. We thread `idx` and call `f(item, idx)` — the
-// checker pads a 1-arg lambda to 2 params so the closure-call arity always matches. The element
-// stays the opaque `Json` (as before); only the index param's `Int32` type is added.
-export val partition = (arr: Json, f: (Json, Int32) => Boolean): Json =>
-  val pass = []
-  val fail = []
+// checker pads a 1-arg lambda to 2 params so the closure-call arity always matches. Generic over the
+// element `T`: both partitions preserve it. The result is `T[][]` (a 2-element array `[pass, fail]`,
+// each a `T[]`) rather than the heterogeneous tuple `[T[], T[]]` — an array literal of two `T[]`
+// infers as the homogeneous `T[][]`, and `result[0]`/`result[1]` are each `T[]`.
+export val partition = <T>(arr: T[], f: (T, Int32) => Boolean): T[][] =>
+  val pass: T[] = []
+  val fail: T[] = []
   var idx = 0
   arr.for(item =>
     if f(item, idx) then push(pass, item) else push(fail, item)
@@ -101,7 +109,9 @@ export val partition = (arr: Json, f: (Json, Int32) => Boolean): Json =>
   )
   [pass, fail]
 
-export val zip = (a: Json, b: Json): Json =>
+// Pair up elements at the same index, truncating to the shorter input. Generic over the two element
+// types, so `[A]` zipped with `[B]` yields `[A, B][]`.
+export val zip = <A, B>(a: A[], b: B[]): [A, B][] =>
   val n = if length(a) < length(b) then length(a) else length(b)
   val result = lin_array_allocate(n)
   var i = 0
@@ -111,9 +121,9 @@ export val zip = (a: Json, b: Json): Json =>
   )
   result
 
-export val unique = (arr: Json): Json =>
+export val unique = <T>(arr: T[]): T[] =>
   val seen = {}
-  val result = []
+  val result: T[] = []
   arr.for(item =>
     val key = lin_value_key(item)
     if seen[key] == null then push(result, item)
@@ -121,19 +131,22 @@ export val unique = (arr: Json): Json =>
   )
   result
 
-export val chunk = (arr: Json, size: Int32): Json =>
+export val chunk = <T>(arr: T[], size: Int32): T[][] =>
   val n = length(arr)
-  val result = []
+  val result: T[][] = []
   val s = if size < 1 then 1 else size
   lin_range(0, (n + s - 1) / s).for(i =>
     val start = i * s
     val end = if start + s < n then start + s else n
-    val c = []
+    val c: T[] = []
     lin_range(start, end).for(j => push(c, arr[j]))
     push(result, c)
   )
   result
 
+// Drop `null` elements. Stays `Json`: the natural signature is `<T>((T | Null)[]): T[]`, but the
+// parser does not accept a postfix `[]` on a parenthesized union type (`(T | Null)[]`), so the
+// element narrowing cannot be expressed today. Leaving it `Json` keeps it usable on any array.
 export val compact = (arr: Json): Json =>
   _filterJ(arr, x => x != null)
 
@@ -228,15 +241,24 @@ export val maxBy = (arr: Json[], keyFn: (Json) => Json): Json =>
 // Append `item` to the end of `arr`, returning a new array. Dispatches on the runtime element
 // type so a flat array (e.g. UInt8[]) stays flat — the item is coerced into the element type —
 // and a tagged Json[] stays tagged with each element/item RC-retained into the result.
+// Stays `Json[]`/`Json` (NOT `<T>`): with a `<T>(arr: T[], item: T): T[]` signature an integer
+// LITERAL item (e.g. `b.append(3)` on a `UInt8[]`) widens `T` to `Int32`, so the result is typed
+// `Int32[]` even though the runtime keeps the `UInt8` flat representation — a type/representation
+// split that miscompiles the flat-array read path. The element type is therefore deliberately left
+// opaque; `lin_array_append_dyn` dispatches on the runtime element type to preserve flatness.
 export val append = (arr: Json[], item: Json): Json[] =>
   lin_array_append_dyn(arr, item)
 
 // Prepend `item` to the front of `arr`, returning a new array. Same flat-preservation and RC
 // discipline as `append`.
+// Stays `Json[]`/`Json` for the same reason as `append` (a literal item would widen a narrow-scalar
+// `T` to `Int32` and split the type from the flat runtime representation).
 export val prepend = (arr: Json[], item: Json): Json[] =>
   lin_array_prepend_dyn(arr, item)
 
-export val scan = (arr: Json[], init: Json, f: (Json, Json) => Json): Json[] =>
+// Like `reduce` but returns every intermediate accumulator (including `init`). Generic over the
+// element `T` and the accumulator `U`: the result is `U[]`.
+export val scan = <T, U>(arr: T[], init: U, f: (U, T) => U): U[] =>
   val result = [init]
   var acc = init
   arr.for(item =>

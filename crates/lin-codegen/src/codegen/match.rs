@@ -151,6 +151,24 @@ impl<'ctx> Codegen<'ctx> {
                 return obj;
             }
         }
+        // ── Sealed-record ARRAY boundaries (sealed-records Stage 3) ───────────────────────
+        // A `MyType[]` is a contiguous unboxed buffer (elem_tag 0xFE); a Json/Object[] is a tagged
+        // array of boxed LinObjects. Crossing between them is a per-element PROJECTION /
+        // MATERIALIZATION, not a pointer reinterpret. Handle BEFORE the generic union arms.
+        let to_sealed_arr = Self::sealed_array_elem(to_ty).is_some();
+        let from_sealed_arr = Self::sealed_array_elem(from_ty).is_some();
+        if to_sealed_arr && !from_sealed_arr {
+            // Wider/Json/Object[] source → fresh sealed-record array (each element projected).
+            return self.sealed_array_project_from(val, from_ty, to_ty);
+        }
+        if from_sealed_arr && !to_sealed_arr {
+            // Sealed-record array → tagged Object[] (Json) view, then box if the target is union.
+            let tagged = self.sealed_array_to_tagged(val, from_ty);
+            if Self::is_union_type(to_ty) {
+                return self.box_value(tagged, &Type::Array(Box::new(Type::object(Default::default()))));
+            }
+            return tagged;
+        }
         // Box to union. Use heap boxing (lin_box_*) rather than a stack alloca, because
         // a coerced value may escape its defining function (returned, stored in an array,
         // captured) — a stack TaggedVal would dangle.

@@ -102,6 +102,16 @@ impl<'ctx> Codegen<'ctx> {
                     .try_as_basic_value()
                     .unwrap_basic()
             }
+            Type::Array(_) if Self::sealed_array_elem(ty).is_some() => {
+                // Sealed-record array (Stage 3): materialize to the tagged Object[] view, stringify,
+                // release the temp. Produces the same JSON-ish output as a boxed Object[].
+                let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                let tagged = self.sealed_array_to_tagged(val, ty);
+                let f = self.get_or_declare_fn("lin_array_to_string", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                let s = self.builder.call(f, &[tagged.into()], "satos").try_as_basic_value().unwrap_basic();
+                self.builder.call(self.rt.array_release, &[tagged.into()], "");
+                s
+            }
             Type::Array(elem_box) => {
                 let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
                 // For flat scalar arrays, convert to tagged format first.

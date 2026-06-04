@@ -78,23 +78,23 @@ below show the array/iterator (eager) form; the per-function reference notes the
 | Function | Signature | Summary |
 | --- | --- | --- |
 | [`concat`](#concat-iter) | `(Json[], Json[]) -> Json[]` | Concatenate two iterables |
-| [`drop`](#drop-iter) | `(Json[], Int32) -> Json[]` | All elements after first n |
-| [`dropWhile`](#dropWhile-iter) | `(Json[], (Json) -> Boolean) -> Json[]` | Skip elements while predicate holds |
-| [`every`](#every-iter) | `(Json[], (Json) -> Boolean) -> Boolean` | True if all elements match |
+| [`drop`](#drop-iter) | `<T>(T[], Int32) -> T[]` | All elements after first n |
+| [`dropWhile`](#dropWhile-iter) | `<T>(T[], (T) -> Boolean) -> T[]` | Skip elements while predicate holds |
+| [`every`](#every-iter) | `<T>(T[], (T) -> Boolean) -> Boolean` | True if all elements match |
 | [`filter`](#filter-iter) | `<T>(T[], (T) -> Boolean) -> T[]` | Keep elements matching predicate |
-| [`find`](#find-iter) | `(Json[], (Json) -> Boolean) -> Json` | First matching element, or null |
+| [`find`](#find-iter) | `<T>(T[], (T) -> Boolean) -> T \| Null` | First matching element, or null |
 | [`flatMap`](#flatMap-iter) | `(Json[], (Json) -> Json[]) -> Json[]` | Map then flatten one level |
-| [`flatten`](#flatten-iter) | `(Json[]) -> Json[]` | Flatten one level of nesting |
+| [`flatten`](#flatten-iter) | `<T>(T[][]) -> T[]` | Flatten one level of nesting |
 | [`for`](#for-iter) | `(Iterable, (Json) -> Json) -> Null` | Iterate over array, iterator, or stream |
 | [`iter`](#iter) | `(() -> S, (S) -> Boolean, (S) -> S, (S) -> T) -> Iterator` | Build a custom iterator |
-| [`iterOf`](#iterOf) | `(Json[]) -> Iterator` | Iterator over an array |
+| [`iterOf`](#iterOf) | `(Json[]) -> Iterator` | Iterator over an array (element type erased into the iterator) |
 | [`map`](#map-iter) | `<T, U>(T[], (T) -> U) -> U[]` | Transform each element |
 | [`range`](#range) | `(Int32, Int32) -> Iterator` | Integer range `[start, end)`, step 1 |
 | [`rangeStep`](#rangeStep) | `(Int32, Int32, Int32) -> Iterator` | Integer range with an explicit (possibly negative) step |
 | [`reduce`](#reduce-iter) | `<T, U>(T[], U, (U, T) -> U) -> U` | Fold left with an accumulator |
-| [`some`](#some-iter) | `(Json[], (Json) -> Boolean) -> Boolean` | True if any element matches |
-| [`take`](#take-iter) | `(Json[], Int32) -> Json[]` | First n elements |
-| [`takeWhile`](#takeWhile-iter) | `(Json[], (Json) -> Boolean) -> Json[]` | Elements until predicate fails |
+| [`some`](#some-iter) | `<T>(T[], (T) -> Boolean) -> Boolean` | True if any element matches |
+| [`take`](#take-iter) | `<T>(T[], Int32) -> T[]` | First n elements |
+| [`takeWhile`](#takeWhile-iter) | `<T>(T[], (T) -> Boolean) -> T[]` | Elements until predicate fails |
 | [`while`](#while-iter) | `(Json[], (Json) -> Boolean) -> Null` | Iterate, stopping when callback returns false |
 
 **std/array**
@@ -109,7 +109,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`arrayAllocate`](#arrayAllocate) | `(Int32) -> Json[]` | Allocate an array of n nulls |
 | [`arrayAllocateFilled`](#arrayAllocateFilled) | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
 | [`at`](#at-array) | `<T>(T[], Int32) -> T \| Null` | Element at index, or `null` if out of bounds; negative indices count from end |
-| [`chunk`](#chunk) | `(Json[], Int32) -> Json[][]` | Split into n-sized sub-arrays |
+| [`chunk`](#chunk) | `<T>(T[], Int32) -> T[][]` | Split into n-sized sub-arrays |
 | [`compact`](#compact) | `(Json[]) -> Json[]` | Remove null elements |
 | [`countBy`](#countBy) | `(Json[], (Json) -> String) -> { ...Int32 }` | Frequency map by key function |
 | [`groupBy`](#groupBy) | `(Json[], (Json) -> String) -> { ...Json[] }` | Group into object of arrays by key function |
@@ -119,19 +119,19 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`maxBy`](#maxBy) | `(Json[], (Json) -> Number) -> Json` | Element with the largest key |
 | [`min`](#min-array) | `(Number[]) -> Number` | Minimum element |
 | [`minBy`](#minBy) | `(Json[], (Json) -> Number) -> Json` | Element with the smallest key |
-| [`partition`](#partition) | `(Json[], (Json) -> Boolean) -> [Json[], Json[]]` | Split into passing and failing |
+| [`partition`](#partition) | `<T>(T[], (T) -> Boolean) -> T[][]` | Split into passing and failing (`result[0]` pass, `result[1]` fail) |
 | [`prepend`](#prepend) | `(Json[], Json) -> Json[]` | Non-mutating single-element prepend |
 | [`product`](#product) | `(Number[]) -> Number` | Product of all elements |
 | [`push`](#push) | `(Json[], Json) -> Null` | Append an element to an array in place |
-| [`reverse`](#reverse) | `(Json[]) -> Json[]` | Return a reversed copy |
-| [`scan`](#scan) | `(Json[], Json, (Json, Json) -> Json) -> Json[]` | Reduce returning all intermediate values |
+| [`reverse`](#reverse) | `<T>(T[]) -> T[]` | Return a reversed copy |
+| [`scan`](#scan) | `<T, U>(T[], U, (U, T) -> U) -> U[]` | Reduce returning all intermediate values |
 | [`set`](#set-array) | `<T>(T[], Int32, T) -> Null` | Set an element by index in place |
-| [`slice`](#slice) | `(T[], Int32, Int32 = length(arr)) -> T[]` | Sub-buffer copy; preserves element type; `end` optional, negatives count from end |
+| [`slice`](#slice) | `<T>(T[], Int32, Int32 = length(arr)) -> T[]` | Sub-buffer copy; preserves element type; `end` optional, negatives count from end |
 | [`sort`](#sort) | `(Json[], (Json, Json) -> Int32) -> Json[]` | Return sorted copy using comparator |
 | [`sortBy`](#sortBy) | `(Json[], (Json) -> Json) -> Json[]` | Return sorted copy using key extractor |
 | [`sum`](#sum) | `(Number[]) -> Number` | Sum all elements |
-| [`unique`](#unique) | `(Json[]) -> Json[]` | Remove duplicate elements (deep equality) |
-| [`zip`](#zip) | `(Json[], Json[]) -> [Json, Json][]` | Pair elements by index |
+| [`unique`](#unique) | `<T>(T[]) -> T[]` | Remove duplicate elements (deep equality) |
+| [`zip`](#zip) | `<A, B>(A[], B[]) -> [A, B][]` | Pair elements by index |
 
 **std/number**
 
@@ -1082,10 +1082,11 @@ Applies `f` to each element and concatenates the resulting arrays. **Array/Itera
 ### flatten (iter) {#flatten-iter}
 
 ```txt
-val flatten: (src: Json[] | Iterator | Stream) -> Json[] | Stream
+val flatten: <T>(src: T[][]) -> T[]
 ```
 
-Removes one level of nesting. **Array/Iterator** → eager `Json[]`. **Stream** → lazy.
+Removes one level of nesting: a `T[][]` becomes a `T[]`. (Backed by `flatMap(x => x)`, so a stream of
+arrays also flattens lazily; the array form is generic over the inner element type `T`.)
 
 ```txt
 flatten([[1, 2], [3, 4]])   // [1, 2, 3, 4]
@@ -1111,11 +1112,11 @@ concat([1, 2], [3, 4])   // [1, 2, 3, 4]
 ### find (iter) {#find-iter}
 
 ```txt
-val find: (src: Json[] | Iterator | Stream, f: (Json[, i: Int32]) -> Boolean) -> Json | (Json | Null | Error)
+val find: <T>(src: T[] | Iterator | Stream, f: (T[, i: Int32]) -> Boolean) -> T | Null | (T | Null | Error)
 ```
 
-The first element for which `f` returns `true`, or `null` if none. **Array/Iterator** → `Json` (the
-match or `null`). **Stream** → **terminal** `Json | Null | Error`.
+The first element for which `f` returns `true`, or `null` if none. **Array/Iterator** → `T | Null`
+(the match or `null`). **Stream** → **terminal** `T | Null | Error`.
 
 ```txt
 [1, 2, 3].find(x => x > 1)   // 2
@@ -1126,7 +1127,7 @@ match or `null`). **Stream** → **terminal** `Json | Null | Error`.
 ### some (iter) {#some-iter}
 
 ```txt
-val some: (src: Json[] | Iterator | Stream, f: (Json[, i: Int32]) -> Boolean) -> Boolean | (Boolean | Error)
+val some: <T>(src: T[] | Iterator | Stream, f: (T[, i: Int32]) -> Boolean) -> Boolean | (Boolean | Error)
 ```
 
 `true` if `f` returns `true` for at least one element (short-circuits). **Array/Iterator** → `Boolean`.
@@ -1141,7 +1142,7 @@ val some: (src: Json[] | Iterator | Stream, f: (Json[, i: Int32]) -> Boolean) ->
 ### every (iter) {#every-iter}
 
 ```txt
-val every: (src: Json[] | Iterator | Stream, f: (Json[, i: Int32]) -> Boolean) -> Boolean | (Boolean | Error)
+val every: <T>(src: T[] | Iterator | Stream, f: (T[, i: Int32]) -> Boolean) -> Boolean | (Boolean | Error)
 ```
 
 `true` if `f` returns `true` for every element (short-circuits on the first `false`); `true` for an
@@ -1308,10 +1309,10 @@ at([], 0)              // null
 ### chunk
 
 ```txt
-val chunk: (arr: Json[], size: Int32) -> Json[][]
+val chunk: <T>(arr: T[], size: Int32) -> T[][]
 ```
 
-Splits `arr` into sub-arrays of length `size`. The final chunk may be shorter if `arr` does not divide evenly. `size` must be at least 1.
+Splits `arr` into sub-arrays of length `size`, preserving the element type `T`. The final chunk may be shorter if `arr` does not divide evenly. `size` must be at least 1. An empty array literal cannot pin `T` — annotate the input (e.g. `val xs: Int32[] = []`) in that case.
 
 ```txt
 chunk([1, 2, 3, 4, 5], 2)   // [[1, 2], [3, 4], [5]]
@@ -1473,10 +1474,10 @@ Returns the element of `arr` for which `f` produces the smallest value. The arra
 ### partition
 
 ```txt
-val partition: (arr: Json[], f: (Json[, i: Int32]) -> Boolean) -> [Json[], Json[]]
+val partition: <T>(arr: T[], f: (T[, i: Int32]) -> Boolean) -> T[][]
 ```
 
-Returns a two-element array `[passing, failing]` where `passing` contains all elements for which `f` returned `true` and `failing` contains the rest, both in their original order.
+Returns a two-element array `[passing, failing]` (typed `T[][]`) where `passing` (`result[0]`) contains all elements for which `f` returned `true` and `failing` (`result[1]`) contains the rest, both in their original order. An empty array literal cannot pin `T` — annotate the input in that case.
 
 ```txt
 val [evens, odds] = [1, 2, 3, 4, 5].partition(x => x % 2 == 0)
@@ -1535,10 +1536,10 @@ push(xs, 2)
 ### reverse
 
 ```txt
-val reverse: (arr: Json[]) -> Json[]
+val reverse: <T>(arr: T[]) -> T[]
 ```
 
-Returns a new array with the elements in reversed order.
+Returns a new array with the elements in reversed order, preserving the element type `T`.
 
 ```txt
 [1, 2, 3].reverse()   // [3, 2, 1]
@@ -1549,10 +1550,10 @@ Returns a new array with the elements in reversed order.
 ### scan
 
 ```txt
-val scan: (arr: Json[], init: Json, f: (Json, Json) -> Json) -> Json[]
+val scan: <T, U>(arr: T[], init: U, f: (U, T) -> U) -> U[]
 ```
 
-Like `reduce`, but returns an array of all intermediate accumulator values including the initial value. The result always has `length(arr) + 1` elements.
+Like `reduce`, but returns an array (`U[]`) of all intermediate accumulator values including the initial value. The result always has `length(arr) + 1` elements.
 
 ```txt
 [1, 2, 3, 4].scan(0, (acc, x) => acc + x)   // [0, 1, 3, 6, 10]
@@ -1581,7 +1582,7 @@ set(buf, 1, "b")
 ### slice
 
 ```txt
-val slice: (arr: T[], start: Int32, end: Int32 = length(arr)) -> T[]
+val slice: <T>(arr: T[], start: Int32, end: Int32 = length(arr)) -> T[]
 ```
 
 Returns a copy of the elements in the half-open range `[start, end)`. `end` is optional and defaults to the array length, so `slice(arr, start)` returns the elements from `start` to the end. Negative indices count from the end (`-1` is the last element's position): they are resolved by adding `length(arr)` to any negative value, then clamped to `[0, length(arr)]`. The element type is preserved: slicing a `UInt8[]` yields a `UInt8[]`, an `Int32[]` an `Int32[]`, and a `Json[]` a `Json[]`. Also re-exported from `std/bytes` (with both bounds explicit). There is no range-index syntax (`arr[a..b]`).
@@ -1651,10 +1652,10 @@ sum([])              // 0
 ### unique
 
 ```txt
-val unique: (arr: Json[]) -> Json[]
+val unique: <T>(arr: T[]) -> T[]
 ```
 
-Returns a new array with duplicate elements removed, preserving the order of first occurrence. Equality uses deep structural comparison.
+Returns a new array with duplicate elements removed, preserving the order of first occurrence and the element type `T`. Equality uses deep structural comparison.
 
 ```txt
 unique([1, 2, 1, 3, 2])                      // [1, 2, 3]
@@ -1667,10 +1668,10 @@ unique([{ "x": 1 }, { "x": 1 }, { "x": 2 }]) // [{ "x": 1 }, { "x": 2 }]
 ### zip
 
 ```txt
-val zip: (a: Json[], b: Json[]) -> [Json, Json][]
+val zip: <A, B>(a: A[], b: B[]) -> [A, B][]
 ```
 
-Returns an array of two-element arrays pairing elements from `a` and `b` by index. The length of the result equals the length of the shorter input.
+Returns an array of two-element tuples pairing elements from `a` and `b` by index, preserving each input's element type (`[A, B]`). The length of the result equals the length of the shorter input.
 
 ```txt
 zip([1, 2, 3], ["a", "b", "c"])   // [[1, "a"], [2, "b"], [3, "c"]]
