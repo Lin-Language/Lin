@@ -1738,9 +1738,38 @@ the byte-for-byte proven `object.rs` discipline; only the *lookup* changes from 
 hash probe. This was chosen deliberately for **correctness margin**: the recurring UAF/double-free
 bug class lives in exactly these value RC paths, and reusing the proven discipline keeps the risk in
 the (well-tested) hashing logic, not in novel value ownership. The map's `refcount` sits at offset 0
-(u32), so the generic `lin_rc_retain` works for it unchanged. The O(1) lookup is the headline win;
-**unboxing scalar values** (storing `T` inline when `T` is a flat scalar) is a documented follow-up,
-not part of v1.
+(u32), so the generic `lin_rc_retain` works for it unchanged.
+
+**Flat-scalar value unboxing — IMPLEMENTED (follow-up, was deferred from v1).** When the value type
+`T` is a *flat scalar* (the `is_flat_scalar` set the codebase already unboxes for flat scalar arrays:
+`Int8/16/32/64`, `UInt8/16/32/64`, `Float32/64` — Bool excluded, as for flat arrays), the value is
+stored **unboxed**: the raw scalar lives **inline in the slot's existing 16-byte `TaggedVal`**
+(`tag` = `T`'s boxed-scalar convention, `payload` = the raw scalar bits), with **NO per-value heap
+box, NO refcount, and NO box-shell to free**. No `LinMap`/`Slot` layout change was needed and the
+runtime container is untouched — the change is entirely in **codegen**:
+- *Store* (`emit_map_set`, and the `MakeObject` map-literal path): marshal the scalar through a
+  **stack** `TaggedVal` (`build_tagged_val_alloca`) instead of a heap `box_value` + `tagged_release`,
+  exactly as a flat scalar **array** slot is written. `lin_map_set` copies the 16 bytes inline and
+  `retain_tagged_payload` is already a no-op for a scalar tag (`_ => {}` arm), so the proven set/
+  overwrite/free/grow/keys/values/entries RC discipline stays byte-identical — there is simply
+  nothing to retain or release for a scalar payload.
+- *Width-normalisation*: the value is first coerced (`compile_ir_coerce`) to `T`'s representation, so
+  a narrower source (an `Int32` variable stored into a `{ String: Int64 }` map) reads back
+  `T`-correct (signed-extended to Int64, `is Int64` matches), **fixing** the v1 width limitation
+  noted below.
+- *Missing-key / `T | Null` representation*: presence is tracked **solely by the slot's `key`**
+  (`key.is_null()` = empty slot), entirely independent of the value bytes — so unboxing introduces no
+  sentinel ambiguity. `m[k]` is typed `T | Null` (a union), so codegen returns the **borrowed
+  interior `&slot.value`** (a `TaggedVal*`) verbatim — null pointer for a missing key (→ language
+  `Null`), or the inline scalar `TaggedVal` for a present key. Because the union result of a
+  projection is *not* `is_rc_type`, the IR treats it as a borrowed interior pointer (identical to the
+  established `lin_object_get` projection contract) and never retains/releases it — which is trivially
+  sound for a scalar (no inner heap payload). `match m[k] is Int64 => …` unboxes by reading those
+  bytes via the normal tag-dispatch. **Verified under AddressSanitizer**: the flat-scalar store/
+  lookup/keys/values/entries/free path is corruption-clean (no UAF/double-free/overflow), and a
+  String-valued map exercising the unchanged boxed path leaks identically — i.e. the only ASan
+  finding (a `var`-local map not released at recursive-function scope exit) is **pre-existing and
+  representation-independent**, not introduced by unboxing.
 
 **Supersedes `hashed-json-object.md` (#4b).** That proposal's lazy-hash-side-index on generic `Json`
 objects is **obviated** by this work for the dictionary use case: code that needs a dictionary uses
@@ -1772,6 +1801,18 @@ keys, debug-built compiler / O2 output):**
 The map roughly doubles as N doubles (linear); the `Json` object roughly quadruples (quadratic). At
 N=200000 the `Json` version exceeds 120 s while the map finishes in ~0.4 s.
 
+**Flat-scalar unboxing — measured delta.** A value-churn microbenchmark
+(`benchmarks/map_flat_scalar.lin`: an `{ String: Int64 }` map, 64-key set × 100k rounds of overwrite
++ read-back, debug-built compiler / O2 output, median of 7) goes ~5575 ms (boxed) → ~5314 ms
+(unboxed), about **5% faster** — the unboxed store does NO heap box allocation, NO box-shell free, and
+NO value refcount, vs a `lin_box_int64` + `lin_tagged_release` per store on the boxed path
+(confirmed in the emitted IR). The win is bounded because the dominant per-store cost is the
+non-inlined `lin_map_set` (hash + probe) and the small-integer box cache already makes scalar boxing
+cheap; the structural payoff is **zero value heap traffic / zero value RC** for scalar maps plus the
+width-correctness fix above (the boxed path mis-tagged an `Int32`→`{String:Int64}` store, reading
+back as `Int32` and yielding wrong results under an `is Int64` match; the unboxed path widens to `T`
+and reads back correctly).
+
 **Rejected alternative — a nominal `Map<K, V>` container (Option B).** More powerful (non-String
 keys, cleanly separates dictionaries from records) but a larger surface (new literal/constructor
 syntax, `for`/destructuring/equality interactions) and a discoverability footgun (users reach for
@@ -1779,9 +1820,13 @@ syntax, `for`/destructuring/equality interactions) and a discoverability footgun
 type, and is exactly the String-keyed shape the RAPTOR maps need. Non-String-keyed maps can be
 revisited later as an addition.
 
-**Known limitations / follow-ups**: values are boxed (unboxing flat-scalar values inline is the next
-perf step); `fromJson<{String:T}>` is not a v1 decode target (the decoder produces a `LinObject`, not
-a `LinMap` — the descriptor writer treats `Map` as accept-any only for match exhaustiveness); a
-variable's concrete numeric type is preserved through a store (an `Int32` variable stored into a
-`{ String: Int64 }` reads back tagged Int32 — identical to existing `Object` field-store behaviour,
-not a regression); `keys`/`values`/`entries` over a map are hash-order, not insertion-order.
+**Known limitations / follow-ups**: a flat-scalar value `T` is now stored **unboxed** and reads back
+`T`-width-correct (see "Flat-scalar value unboxing" above — both the old "values are boxed" and the
+old "an `Int32` stored into a `{ String: Int64 }` reads back tagged Int32" limitations are now
+resolved for flat-scalar maps). A **non-scalar** `T` (String/Array/Object/nested-Map/union) is still
+stored boxed (the proven `object.rs` value RC discipline). `fromJson<{String:T}>` is not a v1 decode
+target (the decoder produces a `LinObject`, not a `LinMap` — the descriptor writer treats `Map` as
+accept-any only for match exhaustiveness); `keys`/`values`/`entries` over a map are hash-order, not
+insertion-order. A `var`-local map that goes out of scope inside a recursive function is not released
+at scope exit (a **pre-existing**, representation-independent IR-lowering gap — reproduces on the
+boxed String-valued path too; unrelated to unboxing).

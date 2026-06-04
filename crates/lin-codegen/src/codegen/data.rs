@@ -402,13 +402,41 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Store `value` into a typed index-signature map (`lin_map_set`, ADR-082). Identical
-    /// ownership contract to `emit_object_set`: `lin_map_set` RETAINS the value's inner payload,
-    /// so for a freshly-boxed concrete value we release the fresh box shell afterwards (net zero on
-    /// the inner; the slot's single reference is supplied by the IR `transfer_into_container`
-    /// emitted in `IndexSet` lowering). A union/Json value (already a `TaggedVal*`) is passed
-    /// straight through.
-    pub(crate) fn emit_map_set(&mut self, map_ptr: BasicValueEnum<'ctx>, key_ptr: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type) {
+    /// Store `value` into a typed index-signature map (`lin_map_set`, ADR-082).
+    ///
+    /// `elem_ty` is the map's value type `T` (from `Type::Map(T)`); `val_ty` is the source
+    /// expression's static type, which may be a NARROWER numeric (e.g. an `Int32` variable stored
+    /// into a `{ String: Int64 }` map). The value is normalised to `T`'s representation before
+    /// storage so the slot reads back `T`-correct regardless of the source width (ADR-082).
+    ///
+    /// FLAT-SCALAR UNBOXING (ADR-082 follow-up): when `T` is a flat scalar (`is_flat_scalar` —
+    /// Int8/16/32/64, UInt8/16/32/64, Float32/64), the scalar is marshalled through a STACK
+    /// `TaggedVal` (tag+payload = `T`'s boxed-scalar convention, identical to what an array slot
+    /// stores) rather than `box_value`'s HEAP box. `lin_map_set` copies the 16 bytes INLINE into the
+    /// slot and `retain_tagged_payload` is a no-op for a scalar tag, so the value lives unboxed in
+    /// the slot with NO per-value heap allocation, NO RC, and NO box-shell to free — the analogue of
+    /// the flat scalar array store. (The stack TaggedVal is reclaimed automatically; `lin_map_set`
+    /// never takes ownership of the passed pointer, it copies from it.)
+    ///
+    /// Otherwise (a heap value `T`, or a union/Json value): identical ownership contract to
+    /// `emit_object_set` — a concrete heap value is freshly heap-boxed and the box shell released
+    /// after the set (net zero on the inner; the slot's reference comes from the IR
+    /// `transfer_into_container`), a union value (already a `TaggedVal*`) passes straight through.
+    pub(crate) fn emit_map_set(&mut self, map_ptr: BasicValueEnum<'ctx>, key_ptr: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type, elem_ty: &Type) {
+        // Flat-scalar value: store unboxed via a stack TaggedVal carrying T's tag/payload. Coerce
+        // the (possibly narrower) source value to T's numeric representation first so the stored
+        // payload is T-correct (e.g. a signed Int32 -1 sign-extends to Int64 -1, not 4294967295).
+        if Self::is_flat_scalar(elem_ty) {
+            let coerced = if val_ty == elem_ty {
+                value
+            } else {
+                self.compile_ir_coerce(value, val_ty, elem_ty)
+            };
+            let stack_tagged = self.build_tagged_val_alloca(&coerced, elem_ty);
+            self.builder.call(self.rt.map_set,
+                &[map_ptr.into(), key_ptr.into(), stack_tagged.into()], "");
+            return;
+        }
         let val_is_fresh_box = !Self::is_union_type(val_ty);
         let val_tagged = if val_is_fresh_box {
             self.box_value(value, val_ty)
@@ -544,10 +572,12 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
             // Typed index-signature map `{ String: T }` (ADR-082): O(1) hashed insert/overwrite.
-            Type::Map(_) => {
+            // Pass the map's value type `T` so a flat-scalar `T` is stored UNBOXED (inline in the
+            // slot's TaggedVal, no heap box) and a narrower source value is widened to `T`.
+            Type::Map(elem) => {
                 if obj.is_pointer_value() && key.is_pointer_value() {
                     let key_str = resolve_obj_key(self, key);
-                    self.emit_map_set(obj, key_str, value, val_ty);
+                    self.emit_map_set(obj, key_str, value, val_ty, elem);
                 }
             }
             Type::Array(elem) => {

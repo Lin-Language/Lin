@@ -3490,6 +3490,128 @@ print(toString(loop(20000i64, 0i64)))
 }
 
 #[test]
+fn test_typed_map_flat_scalar_unboxed() {
+    // ADR-082 follow-up: a flat-scalar value type `T` (Int64 here) stores the scalar UNBOXED
+    // inline in the slot (no per-value heap box). Exercises insert/overwrite/lookup, a missing
+    // key -> Null, and keys/values/entries over an unboxed-value map. The values must read back
+    // T-correct (the union `T|Null` carries the boxed-scalar tag for T).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { keys, values, entries } from "std/object"
+import { length } from "std/array"
+
+var m: { String: Int64 } = {}
+m["a"] = 100i64
+m["b"] = 200i64
+m["a"] = 111i64
+print(toString(m["a"]))
+print(toString(m["b"]))
+print(toString(m["nope"]))
+print(toString(length(keys(m))))
+print(toString(length(values(m))))
+print(toString(length(entries(m))))
+"#);
+    assert_eq!(output, vec!["111", "200", "null", "2", "2", "2"]);
+}
+
+#[test]
+fn test_typed_map_flat_scalar_numeric_width() {
+    // An Int32-typed source value stored into a `{ String: Int64 }` map must read back as a
+    // T(=Int64)-correct value — the store widens to T before storing, so `is Int64` matches and
+    // the value is byte-correct (ADR-082 follow-up width-normalisation). A plain Int32 literal
+    // (`i`) flows in; the slot must carry an Int64.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for, range } from "std/iter"
+
+var m: { String: Int64 } = {}
+range(0, 1000).for(i => m["k${toString(i)}"] = i)
+var sum = 0i64
+range(0, 1000).for(i =>
+  val v = m["k${toString(i)}"]
+  match v
+    is Int64 => sum = sum + v
+    else => sum = sum
+)
+print(toString(sum))
+"#);
+    // sum_{i=0..999} i = 999*1000/2 = 499500. A wrong tag (TAG_INT32) would miss the `is Int64`
+    // arm and yield 0.
+    assert_eq!(output, vec!["499500"]);
+}
+
+#[test]
+fn test_typed_map_flat_scalar_float() {
+    // Float64 flat-scalar values: stored unboxed (TAG_FLOAT64 payload = f64 bits), read back via
+    // the same boxed-scalar convention as a normally-boxed float.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+var m: { String: Float64 } = {}
+m["pi"] = 3.5
+m["e"] = 2.5
+m["pi"] = 1.25
+val a = m["pi"]
+val b = m["e"]
+val sum = match a
+  is Float64 => match b
+    is Float64 => a + b
+    else => 0.0
+  else => 0.0
+print(toString(sum))
+"#);
+    assert_eq!(output, vec!["3.75"]);
+}
+
+#[test]
+fn test_typed_map_flat_scalar_rc_stress() {
+    // Build/free many flat-scalar-value maps in a tail-recursive loop. A scalar value carries NO
+    // heap payload, so set/overwrite/free must do NO retain/release on it — an erroneous RC op on
+    // an unboxed scalar (treating the raw payload as a heap pointer) would crash or corrupt long
+    // before the loop ends. A stable checksum across 30k build/free cycles confirms balance.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val loop = (i: Int64, acc: Int64): Int64 =>
+  if i == 0i64 then acc
+  else
+    var m: { String: Int64 } = {}
+    m["x"] = i
+    m["y"] = i + 1i64
+    m["x"] = i + 2i64
+    val a = m["x"]
+    val n = match a
+      is Int64 => a
+      else => 0i64
+    loop(i - 1i64, acc + n)
+
+print(toString(loop(30000i64, 0i64)))
+"#);
+    // Each iter contributes m["x"] = i + 2. sum_{i=1..30000}(i+2)
+    //   = (30000*30001/2) + 2*30000 = 450015000 + 60000 = 450075000
+    assert_eq!(output, vec!["450075000"]);
+}
+
+#[test]
+fn test_typed_map_flat_scalar_literal() {
+    // A non-empty flat-scalar map LITERAL `{ "a": 1, ... }` checked against a `{ String: Int64 }`
+    // context: each literal value is stored unboxed (and a narrower literal widened to T) via the
+    // same path as `m[k]=v`.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { values } from "std/object"
+import { length } from "std/array"
+
+val m: { String: Int64 } = { "a": 1, "b": 2, "c": 3 }
+print(toString(m["a"]))
+print(toString(m["c"]))
+print(toString(m["z"]))
+print(toString(length(values(m))))
+"#);
+    assert_eq!(output, vec!["1", "3", "null", "3"]);
+}
+
+#[test]
 fn test_inline_object_rc_field_construction() {
     // Phase 2 of the static-record optimization: a no-spread object literal whose fields are
     // all scalar OR concrete heap (Str/Array/Object) is constructed via INLINE entry stores
