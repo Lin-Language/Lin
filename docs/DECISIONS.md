@@ -1702,3 +1702,54 @@ vendored SDL3 is Linux x86-64, software-rendered via the dummy driver (proves th
 not GPU output). `withCstr` leaks its buffer only if the callback faults (Lin has no try/finally). A
 real bindgen / struct-layout DSL is future work — struct offsets are hand-computed by the programmer
 today.
+
+## ADR-081: Large `Json` objects get a lazy O(1) hash side-index (RAPTOR #4b)
+
+**Decision**: `Json` objects keep their association-list `entries` buffer as the source of truth, but
+gain an **optional, lazily-built open-addressing hash side-index** for O(1)-average key lookup once an
+object grows past a threshold (`HASH_INDEX_THRESHOLD = 16` entries). The change lives entirely in
+`crates/lin-runtime/src/object.rs`; no codegen change was required.
+
+- **Layout**: three fields are *appended* to `LinObject` at byte offsets ≥ 24 — `index: *mut u32`
+  (@24, open-addressing table of `entry_slot + 1`; `0` = empty cell, `null` = no table yet),
+  `index_cap: u32` (@32, power-of-two table size or 0), `index_dirty: u32` (@36). The existing header
+  fields are **untouched**: `refcount`@0, `len`@4, `cap`@8, `flags`@12, `entries`@16, and the 24-byte
+  `LinObjectEntry` stride. This preserves the ABI contract codegen's `MakeObject` inline-literal path
+  depends on (it does direct GEP at those hardcoded offsets and reads only `len`@4 / `entries`@16 / the
+  24-byte entries — audited on HEAD, never touches ≥ 24).
+- **Lazy build + probe**: `lin_object_get` / `lin_object_has` build the table on first access when
+  `len >= THRESHOLD` and (`index.is_null() || index_dirty != 0`), then probe in O(1) average. Below the
+  threshold the linear scan is kept — faster for tiny N and allocation-free, and small objects stay
+  byte-for-byte unchanged. The lazy trigger **must** key off `index == null || index_dirty` because the
+  codegen inline-literal path builds large literals **without** calling `lin_object_set`, so no
+  constructor can be assumed to have maintained the index.
+- **Maintenance**: `lin_object_set`'s append branch inserts the new slot in O(1) when a table exists
+  (entry *slot indices* are stable across an `entries` realloc — only the buffer base moves — so the
+  table survives a grow); the overwrite branch is a no-op for the index (same key, same slot). When an
+  append would push the load factor past ~0.7, the table is marked `index_dirty` for a larger rebuild on
+  next lookup. `lin_object_merge` / `lin_object_copy_except` route through `lin_object_set`, so they are
+  maintained automatically. `lin_object_release` frees the table before the header.
+- **Hash**: FNV-1a over the key bytes; linear probing on a power-of-two table.
+
+**Why a side-index over the alternatives** (full write-up was in the now-deleted
+`docs/proposals/hashed-json-object.md`): it removes the O(n²) wall for the language's *existing,
+discoverable* `{}` type with zero surface-language change, no small-object perf change, and no codegen
+ABI change. A dedicated `Map<K,V>` runtime/stdlib type (proposal option b) was rejected as the *first*
+move because users reach for `{}` first and would keep hitting the wall; it remains a possible additive
+follow-up for non-string keys. (See the separate `docs/proposals/typed-map-index-signature.md` for the
+typed-map *surface syntax* direction, which is orthogonal to this runtime representation.)
+
+**Correctness/safety**: the index stores **only `u32` slot indices — never refcounted pointers** — so a
+bug here is structurally outside the UAF/double-free class that `object.rs` is otherwise prone to; the
+worst a stale index can do is point at the wrong slot, which is defended against by reconfirming **every
+probe hit** with `lin_string_key_eq`. Proven by a Rust fuzz/oracle test
+(`crates/lin-runtime/tests/object_index_fuzz.rs`): for N = 0,1,15,16,17,64,1000 it interleaves
+set/overwrite/merge/copy_except/release and asserts `get`/`has`/`keys` agree with a linear-scan oracle on
+every key including absent ones, validated under ASan for leaks/UAF.
+
+**Consequence**: building an N-key dictionary by repeated `set`/`get` drops from O(n²) to O(n)
+(microbench: 16k-key build 142ms → 0.7ms). The motivating RAPTOR port's index-build (`PREP`) phase fell
+from ~145s to ~27s with the cross-language correctness digest unchanged
+(`group=26203913 range=773022892 journeys=139`). The RAPTOR loader's sorted-array `bsearch` /
+contiguous-run grouping workarounds (adopted to avoid big object maps) are now unnecessary and could be
+simplified back to plain `{}` maps — a follow-up, not part of this change.
