@@ -2,8 +2,17 @@ use std::alloc::{alloc, alloc_zeroed, dealloc, realloc, Layout};
 
 /// Heap-allocated growable array.
 /// Layout: refcount (u32) | elem_tag (u8) | _pad3 ([u8;3]) | len (u64) | cap (u64) | data (*mut LinArrayElem)
+///         | elem_stride (u64) | elem_desc (*const u8)
 /// elem_tag == 0xFF → tagged elements (LinArrayElem 16-byte layout).
 /// elem_tag == TAG_INT32/INT64/FLOAT32/FLOAT64 → flat scalar elements (raw T-sized layout).
+/// elem_tag == 0xFE (SEALED_ARRAY_TAG) → inline contiguous HEADER-LESS sealed-record payloads of
+///   `elem_stride` bytes each, with `elem_desc` the field descriptor (sealed-records Stage 3). For
+///   ALL other tags `elem_stride`/`elem_desc` are 0/NULL and unused.
+///
+/// The two trailing fields are appended AFTER `data` (offset 32+) so they never disturb the fixed
+/// offsets the codegen and flat/tagged runtime paths read (refcount@0, elem_tag@4, len@8, cap@16,
+/// data@24). All allocations use `size_of::<LinArray>()`, so growing the struct is transparent to
+/// the existing families.
 #[repr(C)]
 pub struct LinArray {
     pub refcount: u32,
@@ -12,7 +21,17 @@ pub struct LinArray {
     pub len: u64,
     pub cap: u64,
     pub data: *mut LinArrayElem,
+    /// Byte stride of one element (sealed-record arrays only; 0 otherwise).
+    pub elem_stride: u64,
+    /// Field descriptor for sealed-record elements (`lin_runtime::sealed` layout), or NULL when the
+    /// record is scalar-only / the array is not a sealed-record array.
+    pub elem_desc: *const u8,
 }
+
+/// `elem_tag` sentinel for an array of inline contiguous sealed-record payloads (Stage 3). Distinct
+/// from `0xFF` (tagged) and the scalar `TAG_*` flat tags. Kept in lockstep with
+/// `Codegen::SEALED_ARRAY_TAG`.
+pub const SEALED_ARRAY_TAG: u8 = 0xFE;
 
 #[repr(C)]
 pub struct LinArrayElem {
@@ -114,6 +133,14 @@ pub unsafe extern "C" fn lin_array_free(arr: *mut LinArray) {
     // arrays use their element's natural width, not the 16-byte tagged element size —
     // freeing a flat u8 array with the tagged layout deallocs 16x too much and corrupts
     // the heap (surfaces as a SEGV in a much later, unrelated allocation).
+    if (*arr).elem_tag == SEALED_ARRAY_TAG {
+        // Sealed-record arrays store inline header-less payloads of `elem_stride` bytes, 8-aligned.
+        let stride = (*arr).elem_stride.max(1) as usize;
+        let data_layout = Layout::from_size_align_unchecked(stride * cap, 8);
+        dealloc((*arr).data as *mut u8, data_layout);
+        dealloc(arr as *mut u8, array_layout());
+        return;
+    }
     let (esize, ealign) = flat_elem_size_align((*arr).elem_tag);
     let data_layout = Layout::from_size_align_unchecked(esize * cap, ealign);
     dealloc((*arr).data as *mut u8, data_layout);
@@ -161,9 +188,160 @@ pub unsafe extern "C" fn lin_array_release(arr: *mut LinArray) {
                     _ => {} // scalars: no heap payload
                 }
             }
+        } else if (*arr).elem_tag == SEALED_ARRAY_TAG {
+            // Sealed-record array: walk each inline element's field descriptor and release its heap
+            // fields BEFORE freeing the buffer. A scalar-only record has a NULL `elem_desc` (no heap
+            // fields) → this loop is skipped and the array is a single free.
+            crate::sealed::release_sealed_array_elems((*arr).data as *mut u8, (*arr).len, (*arr).elem_stride, (*arr).elem_desc);
         }
         lin_array_free(arr);
     }
+}
+
+// -------------------------------------------------------------------------
+// Sealed-record arrays (sealed-records Stage 3): contiguous, unboxed elements.
+// -------------------------------------------------------------------------
+//
+// A `MyType[]` where `MyType` is a sealed record is laid out as a LinArray with
+// `elem_tag == SEALED_ARRAY_TAG (0xFE)` whose `data` buffer holds inline HEADER-LESS sealed-record
+// payloads of `elem_stride` bytes each, 8-byte aligned. There is NO per-element refcount/size/desc
+// header — the ARRAY owns its elements; the stride + descriptor live in the array header
+// (`elem_stride`/`elem_desc`). Field offsets WITHIN an element are the standalone sealed offsets
+// MINUS `SEALED_HEADER` (codegen handles that shift). Heap FIELDS inside each element (Stage 3b)
+// are still individually refcounted; on array drop `release_sealed_array_elems` releases them per
+// the descriptor (a scalar-only record has a NULL descriptor → drop is a single free).
+
+unsafe fn sealed_array_data_layout(stride: u64, cap: u64) -> Layout {
+    Layout::from_size_align_unchecked((stride.max(1) * cap) as usize, 8)
+}
+
+/// Allocate an empty (len 0) sealed-record array with the given per-element `stride` and field
+/// `desc` (NULL for a scalar-only record). `initial_cap` is the element capacity.
+#[no_mangle]
+pub unsafe extern "C" fn lin_sealed_array_alloc(initial_cap: u64, stride: u64, desc: *const u8) -> *mut LinArray {
+    let cap = initial_cap.max(4);
+    let ptr = alloc(array_layout()) as *mut LinArray;
+    (*ptr).refcount = 1;
+    (*ptr).elem_tag = SEALED_ARRAY_TAG;
+    (*ptr)._pad3 = [0; 3];
+    (*ptr).len = 0;
+    (*ptr).cap = cap;
+    (*ptr).data = alloc(sealed_array_data_layout(stride, cap)) as *mut LinArrayElem;
+    (*ptr).elem_stride = stride;
+    (*ptr).elem_desc = desc;
+    ptr
+}
+
+/// Return a pointer to element `i`'s inline payload (`data + i*stride`). Python-style negative
+/// indices supported; OOB is a runtime fault (spec §6.1). This is an INTERIOR borrowed pointer into
+/// the array buffer — the codegen field-read path GEPs into it directly.
+#[no_mangle]
+pub unsafe extern "C-unwind" fn lin_sealed_array_elem_ptr(arr: *const LinArray, idx: i64) -> *mut u8 {
+    let len = (*arr).len as i64;
+    let actual = if idx < 0 { len + idx } else { idx };
+    if actual < 0 || actual >= len {
+        crate::fault::runtime_fault(&format!("Runtime error: array index {} out of bounds (len {})", idx, len));
+    }
+    ((*arr).data as *mut u8).add((actual as u64 * (*arr).elem_stride) as usize)
+}
+
+/// Reserve room for one more element and return a pointer to the (uninitialised) new slot, bumping
+/// `len`. Codegen then byte-copies the element payload into it. Grows by doubling, mirroring the
+/// flat families.
+#[no_mangle]
+pub unsafe extern "C" fn lin_sealed_array_push_slot(arr: *mut LinArray) -> *mut u8 {
+    let len = (*arr).len;
+    let cap = (*arr).cap;
+    let stride = (*arr).elem_stride;
+    if len == cap {
+        let new_cap = cap * 2;
+        let old_layout = sealed_array_data_layout(stride, cap);
+        (*arr).data = realloc((*arr).data as *mut u8, old_layout, (stride.max(1) * new_cap) as usize) as *mut LinArrayElem;
+        (*arr).cap = new_cap;
+    }
+    (*arr).len = len + 1;
+    ((*arr).data as *mut u8).add((len * stride) as usize)
+}
+
+/// Push an element by COPYING `stride` bytes from `src` (a borrowed sealed-record struct's field
+/// payload, i.e. `src + SEALED_HEADER`) into a fresh slot. For a record with heap fields the caller
+/// must have already arranged the per-field ownership transfer/retain into `src`'s payload; this is
+/// a verbatim byte copy of the payload (the heap pointers move into the array slot).
+#[no_mangle]
+pub unsafe extern "C" fn lin_sealed_array_push(arr: *mut LinArray, src: *const u8) {
+    let slot = lin_sealed_array_push_slot(arr);
+    std::ptr::copy_nonoverlapping(src, slot, (*arr).elem_stride as usize);
+}
+
+/// Push an element by copying `stride` bytes from a STANDALONE sealed struct `obj` (skipping its
+/// 16-byte header). Used by the `MyType[]` literal/push paths where the element value is produced as
+/// a normal sealed struct pointer.
+#[no_mangle]
+pub unsafe extern "C" fn lin_sealed_array_push_struct(arr: *mut LinArray, obj: *const u8) {
+    if obj.is_null() { return; }
+    let slot = lin_sealed_array_push_slot(arr);
+    std::ptr::copy_nonoverlapping(obj.add(crate::sealed::SEALED_HEADER), slot, (*arr).elem_stride as usize);
+}
+
+/// Push an element by copying its payload AND retaining each heap field per the descriptor, leaving
+/// `obj` (a borrowed standalone sealed struct) unchanged. This is the BORROWED-source push used by
+/// `[a, b]` literals / `push(arr, x)` where `x` stays owned by its caller. For a scalar-only record
+/// (NULL descriptor) it is identical to `lin_sealed_array_push_struct`.
+#[no_mangle]
+pub unsafe extern "C" fn lin_sealed_array_push_struct_retaining(arr: *mut LinArray, obj: *const u8) {
+    if obj.is_null() { return; }
+    let stride = (*arr).elem_stride;
+    let desc = (*arr).elem_desc;
+    let slot = lin_sealed_array_push_slot(arr);
+    std::ptr::copy_nonoverlapping(obj.add(crate::sealed::SEALED_HEADER), slot, stride as usize);
+    crate::sealed::retain_sealed_payload_fields(slot, desc);
+}
+
+/// `arr[idx] = record`: overwrite element `idx`'s payload with `stride` bytes from standalone sealed
+/// struct `obj` (skipping its header). For a record with heap fields the OLD element's heap fields
+/// are released first and the NEW ones retained (Stage 3b); a scalar-only record (NULL desc) is a
+/// straight overwrite. Python-style negative index; OOB is a silent no-op (spec §6.1: set never
+/// faults). `obj` stays owned by its caller (borrowed source: retains the copied heap fields).
+#[no_mangle]
+pub unsafe extern "C" fn lin_sealed_array_set(arr: *mut LinArray, idx: i64, obj: *const u8) {
+    if arr.is_null() || obj.is_null() { return; }
+    let len = (*arr).len as i64;
+    let actual = if idx < 0 { len + idx } else { idx };
+    if actual < 0 || actual >= len { return; }
+    let stride = (*arr).elem_stride;
+    let desc = (*arr).elem_desc;
+    let slot = ((*arr).data as *mut u8).add((actual as u64 * stride) as usize);
+    // Release the OLD element's heap fields before overwriting (no-op for a scalar-only record).
+    crate::sealed::release_payload_fields_pub(slot, desc);
+    std::ptr::copy_nonoverlapping(obj.add(crate::sealed::SEALED_HEADER), slot, stride as usize);
+    crate::sealed::retain_sealed_payload_fields(slot, desc);
+}
+
+/// Materialize a sealed-record array into a TAGGED `LinArray` (Json `Object[]`): each inline element
+/// becomes a boxed `LinObject` via the per-type codegen materializer. Stage 3 routes
+/// combinators / Json-boundary through this fail-safe boxed view rather than special-casing every
+/// combinator on the new elem_tag. `mat` is a codegen thunk `(elem_ptr) -> *LinObject` produced per
+/// sealed type; it reads the inline payload at `elem_ptr` and returns a fresh +1 boxed object.
+#[no_mangle]
+pub unsafe extern "C" fn lin_sealed_array_to_tagged(
+    arr: *const LinArray,
+    mat: extern "C" fn(*const u8) -> *mut u8,
+) -> *mut LinArray {
+    use crate::tagged::*;
+    if arr.is_null() { return lin_array_alloc(4); }
+    let len = (*arr).len;
+    let out = lin_array_alloc(len.max(4));
+    let stride = (*arr).elem_stride;
+    for i in 0..len {
+        let elem_ptr = ((*arr).data as *const u8).add((i * stride) as usize);
+        let obj = mat(elem_ptr); // fresh +1 LinObject*
+        let slot = (*out).data.add(i as usize);
+        (*slot).tag = TAG_OBJECT;
+        (*slot)._pad = [0; 7];
+        (*slot).payload = obj as u64;
+    }
+    (*out).len = len;
+    out
 }
 
 /// Push an element. `elem_ptr` points to the value; `tag` is the type tag.

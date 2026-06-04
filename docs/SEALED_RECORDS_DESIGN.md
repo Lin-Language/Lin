@@ -340,9 +340,61 @@ all-scalar-shape, so anonymous literals stay boxed.*
   the "array of assertions" body guard is preserved at the array level (`() => Json[]`). This was the
   ONLY corpus type that relied on extra-field carry-through.
 
-**Stage 3 — Arrays of sealed records (`MyType[]` contiguous, unboxed).**
+**Stage 3 — Arrays of sealed records (`MyType[]` contiguous, unboxed). IMPLEMENTED (scalar-element; heap-element = 3b, deferred boxed).**
 - Contiguous struct arrays, constant-offset element + field addressing. The
   data-heavy win; extends the flat-scalar-array machinery to record elements.
+
+*Implementation notes (as built):*
+
+- **Element layout: HEADER-LESS, packed field payload.** A `MyType[]` is a `LinArray` whose `data`
+  buffer holds inline, contiguous, header-less sealed-record PAYLOADS (just the packed fields, NO
+  per-element 16-byte rc/size/desc header). The ARRAY owns its elements; there is NO per-element
+  refcount. Element STRIDE = `sealed_struct_size - SEALED_HEADER` (payload, 8-padded). Field offsets
+  WITHIN an element are the standalone struct offsets MINUS `SEALED_HEADER`. This mirrors the
+  flat-scalar arrays (raw payloads, no header) and is the cheapest sound model — the open question
+  (headed vs header-less) is resolved to HEADER-LESS.
+
+- **`elem_tag` + stride/descriptor storage.** A new sentinel `elem_tag == 0xFE` (`SEALED_ARRAY_TAG`)
+  means "inline sealed records". The stride + field descriptor are stored in TWO new TRAILING fields
+  appended to `LinArray` (`elem_stride: u64`, `elem_desc: *const u8`) at offset 32+, AFTER `data` —
+  so the fixed offsets every flat/tagged path reads (refcount@0, elem_tag@4, len@8, cap@16, data@24)
+  are UNCHANGED, and growing the struct is transparent (all allocs use `size_of::<LinArray>()`).
+
+- **Ops: STATIC-TYPE dispatch + a fused field read.** Every op has the element type statically
+  (`obj_ty = Array(elem)`), so construction/index/length/push/index-set/drop dispatch in codegen on
+  the static type, not the runtime tag. The HOT path `arr[i].field` is FUSED in IR lowering
+  (`SealedArrayFieldGet`) to a single constant-stride GEP + scalar load — NO per-element box, NO
+  `lin_object_get`. A whole-element `arr[i]` (rare) materializes a fresh standalone sealed struct so
+  the existing owning/retain/release model is unchanged and sound. Construction copies each element
+  literal's payload into the buffer. Drop is `lin_array_release` → for 0xFE it walks the descriptor
+  to release per-element heap fields (NO-OP for a scalar-only record, NULL desc) then a single free.
+
+- **Boundary ops = fail-safe BOXED materialization.** Json-boundary, `toString`, `==`, and combinator
+  iteration MATERIALIZE the sealed array to a tagged `Object[]` (per-type element materializer thunk
+  + `lin_sealed_array_to_tagged`) rather than special-casing the new tag in every dynamic runtime fn.
+  The reverse boundary (`Json`/`Object[]` projected into a `MyType[]`) builds a fresh sealed array
+  per-element. RC of these fresh materialized temps is balanced (full release right after a call, not
+  scope-exit, so a tail-recursive driver doesn't accumulate them).
+
+- **SCOPE: scalar-element records only (Stage 3).** The gate `Codegen::sealed_array_elem` accepts an
+  `Array(elem)` ONLY when `elem` is an all-scalar sealed record — the high-value, lowest-RC-risk case
+  (array drop is a single free, no per-element per-field RC). Arrays of HEAP-FIELD records (e.g.
+  `Person[]` with a String field), anonymous-record arrays, union/Json/opaque-element arrays, and
+  `FixedArray` all stay BOXED (today's `Object[]` behavior). Heap-field element arrays are **Stage
+  3b, deferred** — the runtime drop/retain plumbing (`release_sealed_array_elems` /
+  `retain_sealed_payload_fields`, descriptor-driven) is already in place and the gate flips on by
+  removing the all-scalar restriction, but the per-element per-field RC across overwrite/clone/
+  thread-transfer needs its own ASan campaign and was NOT shipped to avoid a guessed double-free.
+
+- **Measured.** Access-bound `Point[]` field-sum (50 elems, 2M reps): sealed contiguous **368 ms**
+  median vs the same as boxed `Json[]` **24830 ms** median (11 interleaved runs) — **~67×**. IR
+  confirms the sealed hot loop is constant-stride GEP loads with no `lin_object_get`; the boxed one is
+  `lin_array_get` + `lin_object_get` per element. (Exceeds the §1.2 16.6× ceiling because the boxed
+  baseline here is a `Json[]` — boxed array element access + boxed field access — not the doc's
+  flat-`Int32[]` proxy.) ASan-clean (no UAF/double-free) over the full corpus + dedicated
+  build/index/drop fixtures; the per-element struct + array drop reclaim correctly (leak-equivalent to
+  the boxed path — residual "leaks" are the intentional immortal string-literal cache and the
+  pre-existing TCO-loop-body / range-for-callback leaks that affect boxed code identically).
 
 **Stage 4 (optional) — Stack allocation of non-escaping sealed records.**
 - Escape analysis to stack-allocate small sealed records that don't escape,

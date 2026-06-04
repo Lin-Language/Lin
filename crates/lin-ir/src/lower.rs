@@ -1141,6 +1141,24 @@ fn is_sealed_scalar_repr(ty: &Type) -> bool {
         if !fields.is_empty() && fields.values().all(is_sealed_field_ty))
 }
 
+/// True when `ty` is `Array(elem)` whose element is an ALL-SCALAR sealed record — the sealed-record
+/// ARRAY representation (sealed-records Stage 3): contiguous, unboxed, header-less elements. MUST
+/// mirror `Codegen::sealed_array_elem` EXACTLY. Heap-field element records (Stage 3b) are NOT
+/// accepted (they would need per-element per-field RC) — they keep the boxed `Object[]` path.
+fn is_sealed_scalar_array(ty: &Type) -> bool {
+    match ty {
+        Type::Array(elem) => match elem.as_ref() {
+            Type::Object { fields, sealed: true } => {
+                !fields.is_empty()
+                    && fields.values().all(is_sealed_field_ty)
+                    && fields.values().all(|f| f.is_flat_scalar() || matches!(f, Type::Bool))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// A field type permitted in a sealed record: a scalar (numeric or Bool) OR an eligible heap field
 /// (String/Array/nested-sealed). Mirrors `Codegen::is_sealed_field`. A nested-sealed field recurses
 /// into `is_sealed_scalar_repr`; a self-recursive type survives resolution as `Type::Named` (not an
@@ -1563,7 +1581,12 @@ fn is_heap_ty(ty: &Type) -> bool {
 /// belongs to someone else) and scalar args (cached boxes).
 fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool {
     match param_ty {
-        Some(p) => is_union_ty(p) && !is_union_ty(arg_ty) && is_heap_ty(arg_ty),
+        // A SEALED-RECORD ARRAY boxed into a Json param MATERIALIZES a FRESH tagged Object[] (inner
+        // is NOT borrowed), so freeing only the shell would leak the fresh inner array + element
+        // objects. It is fully released via the owning model instead (see the call-arg loop), so it
+        // is NOT a shell-only box.
+        Some(p) => is_union_ty(p) && !is_union_ty(arg_ty) && is_heap_ty(arg_ty)
+            && !is_sealed_scalar_array(arg_ty),
         None => false,
     }
 }
@@ -1728,6 +1751,59 @@ fn try_lower_sealed_literal(
     let dst = builder.alloc_temp(slot_ty.clone());
     builder.emit(Instruction::MakeObject { dst, fields: lowered_fields, spreads: vec![], ty: slot_ty.clone() });
     builder.register_owned(dst, slot_ty.clone());
+    Some(dst)
+}
+
+/// FUSED `arr[i].field` / `arr[i]["field"]` over a SEALED-RECORD ARRAY (Stage 3). When `object`
+/// is `Index{ array, key }` with `array` an all-scalar sealed-record array, and `field` is a SCALAR
+/// field of the element record, emit a single `SealedArrayFieldGet` (a constant-offset load from the
+/// contiguous element) instead of materializing a standalone sealed struct for the element then
+/// reading its field. Returns `Some(dst)` on the fast path, `None` to fall through to the generic
+/// path. Sound because the field is a scalar (no RC, no escaping interior pointer). The array base
+/// is BORROWED where possible (a bare local) so no retain/release pair is paid in the hot loop.
+fn try_lower_sealed_array_field(
+    object: &TypedExpr,
+    field: &str,
+    result_ty: &Type,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<Temp> {
+    let TypedExpr::Index { object: array, key, .. } = object else { return None };
+    let arr_ty = array.ty();
+    if !is_sealed_scalar_array(&arr_ty) {
+        return None;
+    }
+    // The element field must be a scalar (the only sound, RC-free fused read). A heap-field element
+    // record is not a sealed-scalar-array anyway (gated above), so this is belt-and-braces.
+    let elem_field_scalar = match &arr_ty {
+        Type::Array(elem) => matches!(elem.as_ref(), Type::Object { fields, .. }
+            if fields.get(field).map(|f| f.is_flat_scalar() || matches!(f, Type::Bool)).unwrap_or(false)),
+        _ => false,
+    };
+    if !elem_field_scalar {
+        return None;
+    }
+    // Lower the index, then the (borrowed where possible) array base last — mirrors the Index
+    // borrow-ordering rule so a key that reassigns the array global can't dangle a borrowed base.
+    let (array_temp, index_temp) = if lower_container_base_borrowed_check(array, ctx) {
+        let index_temp = lower_expr(key, builder, ctx);
+        let array_temp = lower_container_base_borrowed(array, builder, ctx)
+            .unwrap_or_else(|| lower_expr(array, builder, ctx));
+        (array_temp, index_temp)
+    } else {
+        let array_temp = lower_expr(array, builder, ctx);
+        let index_temp = lower_expr(key, builder, ctx);
+        (array_temp, index_temp)
+    };
+    let dst = builder.alloc_temp(result_ty.clone());
+    builder.emit(Instruction::SealedArrayFieldGet {
+        dst,
+        array: array_temp,
+        index: index_temp,
+        field: field.to_string(),
+        arr_ty,
+        result_ty: result_ty.clone(),
+    });
     Some(dst)
 }
 
@@ -2434,6 +2510,17 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // because `Coerce` does not otherwise register its result.
             if is_sealed_scalar_repr(to) {
                 builder.register_owned(dst, to.clone());
+            } else if is_sealed_scalar_array(from) && needs_owning(to) {
+                // A sealed-record ARRAY coerced to Json/Object[] (Stage 3 boundary) MATERIALIZES a
+                // FRESH +1 tagged `LinArray*` (`sealed_array_to_tagged`). Register the result so the
+                // owning model releases the materialized temp at scope exit (else it leaks — e.g.
+                // `length(sealedArr)` whose `Json` param coerces the array each call). The source
+                // sealed array keeps its own ownership.
+                builder.register_owned(dst, to.clone());
+            } else if is_sealed_scalar_array(to) && needs_owning(to) {
+                // A Json/Object[] PROJECTED into a sealed-record array (the reverse boundary) is a
+                // fresh +1 sealed array — register it for scope-exit release.
+                builder.register_owned(dst, to.clone());
             }
             dst
         }
@@ -2571,13 +2658,18 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
 
         TypedExpr::MakeArray { elements, ty, .. } => {
             let elem_ty = match ty {
-                // Arrays of sealed scalar records are STAGE 3 (contiguous struct elements); in
-                // Stage 1 a `MyType[]` stores each element as a boxed `LinObject` (the universal
-                // Json element representation), exactly like a Json array. Lower the element type
-                // to the UNSEALED object form so `coerce_to_slot_type` inserts a sealed→Json
-                // MATERIALIZATION per element (the sealed struct is NOT a LinObject — pushing it
-                // raw under TAG_OBJECT makes the array's release/serialize walk it as object
-                // entries → heap corruption).
+                // Arrays of ALL-SCALAR sealed records (Stage 3): contiguous UNBOXED elements. Keep
+                // the SEALED element type so each element is lowered to its packed-struct
+                // representation; codegen's MakeArray copies each element's field payload into the
+                // contiguous sealed-array buffer (no per-element box). Heap-field element records
+                // are NOT sealed-scalar-arrays (gated) and fall to the boxed branch below.
+                Type::Array(inner) if is_sealed_scalar_array(ty) => *inner.clone(),
+                // Arrays of HEAP-FIELD sealed records stay BOXED (Stage 3b deferred): store each
+                // element as a boxed `LinObject` (the universal Json element representation). Lower
+                // the element type to the UNSEALED object form so `coerce_to_slot_type` inserts a
+                // sealed→Json MATERIALIZATION per element (the sealed struct is NOT a LinObject —
+                // pushing it raw under TAG_OBJECT makes the array's release/serialize walk it as
+                // object entries → heap corruption).
                 Type::Array(inner) if is_sealed_scalar_repr(inner) => match inner.as_ref() {
                     Type::Object { fields, .. } => Type::object(fields.clone()),
                     _ => unreachable!(),
@@ -2591,12 +2683,24 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 Type::FixedArray(_) => Type::TypeVar(u32::MAX),
                 _ => Type::Null,
             };
+            // Sealed-scalar-array (Stage 3): each element is lowered into its packed sealed-struct
+            // representation and remains OWNED. Codegen's MakeArray COPIES each element's scalar
+            // field payload into the contiguous buffer (no retain — scalar fields carry no RC), and
+            // the source struct is released at scope exit. So we do NOT transfer ownership into the
+            // container (the array has its own copy of the bytes, not the struct pointer).
+            let sealed_arr = is_sealed_scalar_array(ty);
             // Coerce each element to the array's element representation. For a Json/union
             // element type (heterogeneous array) this boxes each concrete element to a
             // TaggedVal*, so codegen can push them uniformly.
             let lowered: Vec<Temp> = elements
                 .iter()
                 .map(|e| {
+                    if sealed_arr {
+                        // Direct sealed-struct construction when the element is a literal; else
+                        // lower + project into the sealed element representation.
+                        let t = lower_value_into_slot(e, &elem_ty, builder, ctx);
+                        return t;
+                    }
                     let t = lower_expr(e, builder, ctx);
                     // The array owns a reference to each heap element (lin_array_release
                     // recursively releases them when the array is freed) — apply the standard
@@ -2621,6 +2725,13 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         TypedExpr::Index { object, key, result_type, .. } => {
             let obj_ty = object.ty();
             let key_ty = key.ty();
+            // FUSED `arr[i]["field"]` over a sealed-record array (Stage 3): same constant-offset
+            // scalar load as `arr[i].field`. `object` is an Index of the array; `key` is a literal.
+            if let TypedExpr::StringLit(name, _, _) = key.as_ref() {
+                if let Some(t) = try_lower_sealed_array_field(object, name, result_type, builder, ctx) {
+                    return t;
+                }
+            }
             // Sealed scalar record + a compile-time-known string key `x["f"]` → constant-offset
             // FieldGet (same as `x.f`). The field is guaranteed present (a missing field on a
             // concrete sealed type is already a compile error). Routes to the unboxed load path
@@ -2693,6 +2804,12 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         }
 
         TypedExpr::FieldGet { object, field, result_type, .. } => {
+            // FUSED `arr[i].field` over a sealed-record array (Stage 3): a constant-offset scalar
+            // load directly from the contiguous element, skipping the per-element struct
+            // materialization the generic Index path would do.
+            if let Some(t) = try_lower_sealed_array_field(object, field, result_type, builder, ctx) {
+                return t;
+            }
             let obj_ty = object.ty();
             let obj_temp = lower_expr(object, builder, ctx);
             let dst = builder.alloc_temp(result_type.clone());
@@ -2816,7 +2933,12 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             //     style) store via `lin_object_set`, which RETAINS the inner ⇒ no consume.
             // A concrete heap value is consumed by every store regardless of this flag.
             let op_consumes_union = matches!(obj_ty, Type::Array(_) | Type::FixedArray(_));
-            builder.transfer_into_container(val_temp, value, op_consumes_union);
+            // A sealed-record array store COPIES the element struct's payload (`lin_sealed_array_set`
+            // retains heap fields per descriptor); the source struct stays OWNED and is released at
+            // scope exit (dropping its heap fields, balancing the retains). Skip the transfer.
+            if !is_sealed_scalar_array(obj_ty) {
+                builder.transfer_into_container(val_temp, value, op_consumes_union);
+            }
             let free_shell = op_consumes_union
                 && is_union_ty(&val_ty)
                 && expr_is_fresh_alloc(value);
@@ -2992,6 +3114,9 @@ fn lower_call(
                 return lower_intrinsic_call(stream_intr, args, result_type, builder, ctx);
             }
             let mut shell_boxes: Vec<Temp> = Vec::new();
+            // Fully-owned arg boxes (sealed-record array materialized to Json) released right after
+            // the call.
+            let mut full_release_boxes: Vec<(Temp, Type)> = Vec::new();
             let mut escape_lits: Vec<Temp> = Vec::new();
             let lowered_args: Vec<Temp> = args
                 .iter()
@@ -2999,7 +3124,16 @@ fn lower_call(
                 .map(|(i, a)| {
                     let (arg, raw_lit) = lower_call_arg_tracked(a, param_tys.get(i), i, cb_idx, builder, ctx);
                     retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
-                    if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
+                    // A sealed-record array boxed into a Json param is a FRESH fully-owned tagged
+                    // array (not a borrowed-inner shell): FULLY release it RIGHT AFTER the call (box
+                    // + inner array + element objects), not at function scope exit — the call may be
+                    // in a tail-recursive (loop) body where a scope-exit release would leak every
+                    // iteration. Other heap args boxed to Json are shell-only (borrowed inner).
+                    if param_tys.get(i).map(|p| is_union_ty(p)).unwrap_or(false)
+                        && is_sealed_scalar_array(&a.ty())
+                    {
+                        full_release_boxes.push((arg, param_tys[i].clone()));
+                    } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
                         shell_boxes.push(arg);
                     }
                     if let Some(lit) = raw_lit {
@@ -3023,6 +3157,9 @@ fn lower_call(
                 ret_ty: result_type.clone(),
             });
             free_arg_box_shells(&shell_boxes, dst, builder);
+            for (b, bty) in &full_release_boxes {
+                builder.emit(Instruction::Release { val: *b, ty: bty.clone() });
+            }
             builder.register_owned(dst, result_type.clone());
             for lit in escape_lits {
                 builder.record_escape_alias(dst, lit);
@@ -3038,6 +3175,9 @@ fn lower_call(
                 _ => vec![],
             };
             let mut shell_boxes: Vec<Temp> = Vec::new();
+            // Fully-owned arg boxes (sealed-record array materialized to Json) released right after
+            // the call.
+            let mut full_release_boxes: Vec<(Temp, Type)> = Vec::new();
             let mut escape_lits: Vec<Temp> = Vec::new();
             let lowered_args: Vec<Temp> = args
                 .iter()
@@ -3045,7 +3185,16 @@ fn lower_call(
                 .map(|(i, a)| {
                     let (arg, raw_lit) = lower_call_arg_tracked(a, param_tys.get(i), i, cb_idx, builder, ctx);
                     retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
-                    if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
+                    // A sealed-record array boxed into a Json param is a FRESH fully-owned tagged
+                    // array (not a borrowed-inner shell): FULLY release it RIGHT AFTER the call (box
+                    // + inner array + element objects), not at function scope exit — the call may be
+                    // in a tail-recursive (loop) body where a scope-exit release would leak every
+                    // iteration. Other heap args boxed to Json are shell-only (borrowed inner).
+                    if param_tys.get(i).map(|p| is_union_ty(p)).unwrap_or(false)
+                        && is_sealed_scalar_array(&a.ty())
+                    {
+                        full_release_boxes.push((arg, param_tys[i].clone()));
+                    } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
                         shell_boxes.push(arg);
                     }
                     if let Some(lit) = raw_lit {
@@ -3086,6 +3235,9 @@ fn lower_call(
                 ret_ty: result_type.clone(),
             });
             free_arg_box_shells(&shell_boxes, dst, builder);
+            for (b, bty) in &full_release_boxes {
+                builder.emit(Instruction::Release { val: *b, ty: bty.clone() });
+            }
             builder.register_owned(dst, result_type.clone());
             for lit in escape_lits {
                 builder.record_escape_alias(dst, lit);
@@ -3283,7 +3435,15 @@ fn lower_intrinsic_call(
     // null/cached-box safe). This is the per-element box leak inside `map`'s
     // `lin_array_set(result, i, f(item))`.
     let mut shell_to_free: Option<Temp> = None;
-    if matches!(intrinsic, Intrinsic::Push | Intrinsic::ArraySetDyn | Intrinsic::ObjectSetDyn) {
+    // `push(arr, elem)` into a SEALED-RECORD ARRAY (Stage 3) COPIES the element struct's payload
+    // (and retains its heap fields per descriptor) — it does NOT take the struct pointer. So the
+    // source struct must STAY OWNED (released at scope exit, which also drops its heap fields,
+    // balancing the per-field retains the copy took). Skip the ownership transfer for this case.
+    let push_into_sealed_array = matches!(intrinsic, Intrinsic::Push)
+        && args.first().map(|a| is_sealed_scalar_array(&a.ty())).unwrap_or(false);
+    if matches!(intrinsic, Intrinsic::Push | Intrinsic::ArraySetDyn | Intrinsic::ObjectSetDyn)
+        && !push_into_sealed_array
+    {
         if let (Some(elem_expr), Some(&elem_temp)) = (args.last(), lowered_args.last()) {
             // For a UNION element, only `lin_array_set` (ArraySetDyn) moves the box (raw struct
             // copy, no inner retain); `Push`/`object_set` retain the inner. Concrete elements are
