@@ -1,0 +1,57 @@
+// records.lin — record-access-bound stateful simulation.
+//
+// Threads a SINGLE record through field-read + reconstruct cycles, so FIELD
+// ACCESS dominates. State is a NAMED all-scalar record type, so it gets Lin's
+// sealed-record struct layout: each `s["a"]` read is a constant-offset load, not
+// a boxed string-keyed `lin_object_get` hash lookup. This is exactly what the
+// sealed-record work (Stages 1/2) accelerates.
+//
+// The mix is a bounded LCG-style update keeping every value in [0, MOD) so it is
+// bit-identical across i64 / int64 / JS-BigInt / Python-int (the transient
+// pre-mod product `a*1103515245` ~ 2.3e18 fits i64 but exceeds 2^53, hence JS
+// uses BigInt). Prints exactly one stdout line "RESULT=<int>".
+//
+// Parameters (identical across all languages): N=50000000, MOD=2147483647.
+import { print } from "std/io"
+import { toString } from "std/string"
+
+type State = { "a": Int64, "b": Int64, "c": Int64, "d": Int64, "e": Int64, "f": Int64 }
+
+val MOD = 2147483647i64
+
+// Tail-recursive step: read all 6 fields, build a fresh State, recurse. TCO turns
+// this into a loop, so the only per-iteration work is the field reads + the new
+// record literal — the field-access path under test.
+val step = (i: Int64, s: State): State =>
+  if i == 0i64 then
+    s
+  else
+    val a = (s["a"] * 1103515245i64 + s["f"] + 12345i64) - (s["a"] * 1103515245i64 + s["f"] + 12345i64) / MOD * MOD
+    val b = (s["b"] + s["a"] * 3i64) - (s["b"] + s["a"] * 3i64) / MOD * MOD
+    val c = s["c"] * 5i64 + s["b"] - (s["c"] * 5i64 + s["b"]) / MOD * MOD
+    val d = (s["d"] + s["c"] * 7i64) - (s["d"] + s["c"] * 7i64) / MOD * MOD
+    val e = s["e"] * 9i64 + s["d"] - (s["e"] * 9i64 + s["d"]) / MOD * MOD
+    val f = (s["f"] + s["e"] * 11i64) - (s["f"] + s["e"] * 11i64) / MOD * MOD
+    step(i - 1i64, {
+      "a": a,
+      "b": b,
+      "c": c,
+      "d": d,
+      "e": e,
+      "f": f
+    })
+
+val init: State = {
+  "a": 1i64,
+  "b": 2i64,
+  "c": 3i64,
+  "d": 4i64,
+  "e": 5i64,
+  "f": 6i64
+}
+val final = step(50000000i64, init)
+
+val sum = final["a"] + final["b"] + final["c"] + final["d"] + final["e"] + final["f"]
+val result = sum - (sum / MOD) * MOD
+
+print("RESULT=${toString(result)}")
