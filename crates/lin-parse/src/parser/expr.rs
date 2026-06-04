@@ -514,6 +514,22 @@ impl Parser {
                     span,
                 }
             }
+            // Lin has no semicolons (spec §1.2). A `;` here is almost always someone
+            // separating statements C-style (e.g. inside an inline closure body
+            // `c => idx[c] = i; i = i + 1`). Emit an actionable diagnostic rather than the
+            // misleading "Undefined variable ';'" that the old Ident-catch-all produced.
+            TokenKind::Semicolon => {
+                let span = self.current_span();
+                self.diagnostics.push(
+                    Diagnostic::error(
+                        span,
+                        "unexpected ';' — Lin has no semicolons",
+                    )
+                    .with_help("separate statements with newlines, not ';'"),
+                );
+                self.advance();
+                Expr::NullLit(span)
+            }
             _ => {
                 let span = self.current_span();
                 let got = self.peek_kind();

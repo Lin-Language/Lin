@@ -608,6 +608,7 @@ impl Lexer {
             ']' => { self.bracket_depth = self.bracket_depth.saturating_sub(1); TokenKind::RBracket }
             ',' => TokenKind::Comma,
             ':' => TokenKind::Colon,
+            ';' => TokenKind::Semicolon,
             '.' => {
                 if self.pos + 1 < self.source.len() && self.source[self.pos] == '.' && self.source[self.pos + 1] == '.' {
                     self.pos += 2;
