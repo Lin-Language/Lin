@@ -11080,3 +11080,65 @@ print(describe(null))
 "#);
     assert_eq!(out, vec!["ok=9", "null"]);
 }
+
+/// Regression (LIN_ISSUES #2): a top-level mutable `var` in an IMPORTED module, mutated by an
+/// EXPORTED function, used to panic codegen ("Binary: undefined lhs temp Temp(0)") because the
+/// import lowering never set up the module global / its initialiser — the exported mutator
+/// referenced an SSA temp that the (non-existent) `main` would have produced. The var must now be
+/// a once-initialised module global with shared, persistent state across exported entry points.
+#[test]
+fn test_imported_module_var_mutated_by_export() {
+    let lin_bin = lin_bin();
+    if !lin_bin.exists() {
+        eprintln!("SKIP test_imported_module_var_mutated_by_export: lin binary not built");
+        return;
+    }
+
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let dir = ws.join(format!("target/lin_impvar_{}", id));
+    let _ = fs::create_dir_all(&dir);
+    let src_path = dir.join("main.lin");
+    let bin_path = dir.join("impvar_bin");
+
+    // Imported module: non-zero-initialised top-level `var`, an exported mutator that
+    // increments it, and an exported reader that observes the shared persistent state.
+    fs::write(dir.join("counter.lin"),
+        r#"var counter = 10
+export val nextId = (): Int32 =>
+  counter = counter + 1
+  counter
+export val peek = (): Int32 => counter
+"#).unwrap();
+
+    fs::write(&src_path,
+        r#"import { nextId, peek } from "./counter"
+import { print } from "std/io"
+import { toString } from "std/string"
+print("${toString(peek())} ${toString(nextId())} ${toString(nextId())} ${toString(peek())}")
+"#).unwrap();
+
+    let compile = Command::new(&lin_bin)
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary");
+    assert!(
+        compile.status.success(),
+        "imported-var program compilation failed:\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&compile.stderr),
+        String::from_utf8_lossy(&compile.stdout),
+    );
+
+    let run_out = Command::new(&bin_path).output().expect("failed to run compiled binary");
+    let _ = fs::remove_dir_all(&dir);
+    assert!(
+        run_out.status.success(),
+        "runtime error:\nstderr: {}",
+        String::from_utf8_lossy(&run_out.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    let lines: Vec<String> = stdout.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect();
+    // peek=10 (init respected), then two increments to 11 and 12, then peek sees the shared 12.
+    assert_eq!(lines, vec!["10 11 12 12"]);
+}
