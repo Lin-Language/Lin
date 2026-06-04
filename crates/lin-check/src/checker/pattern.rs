@@ -141,7 +141,7 @@ impl Checker {
     pub(crate) fn check_pattern(
         &mut self,
         pattern: &Pattern,
-        _scrutinee_ty: &Type,
+        scrutinee_ty: &Type,
     ) -> Result<TypedPattern, Diagnostic> {
         match pattern {
             Pattern::TypeName(name, span) => {
@@ -176,6 +176,15 @@ impl Checker {
                         let mut seen: std::collections::HashSet<String> =
                             std::collections::HashSet::new();
                         self.collect_named_defs(&ty, &mut seen, &mut named_defs);
+                        // Also collect the named-type bodies reachable from the
+                        // SCRUTINEE type (e.g. the `Ast = Num | BinOp` alias and its
+                        // variants). IR lowering uses these to recognise a closed
+                        // concrete union scrutinee and take the cheap discriminator
+                        // fast path instead of the recursive `MatchesSchema`. These
+                        // extra entries are a pure lookup table — they never change
+                        // the schema descriptor (built from `target` only), so adding
+                        // them is behaviour-preserving for the fallback path.
+                        self.collect_named_defs(scrutinee_ty, &mut seen, &mut named_defs);
                         return Ok(TypedPattern::TypeCheckDeep(ty, named_defs, *span));
                     }
                 }
@@ -186,7 +195,7 @@ impl Checker {
                 Ok(TypedPattern::Literal(Box::new(typed)))
             }
             Pattern::Ident(name, span) => {
-                let ty = _scrutinee_ty.clone();
+                let ty = scrutinee_ty.clone();
                 let slot = self.env.define(name.clone(), ty.clone(), false);
                 Ok(TypedPattern::Binding(slot, ty, *span))
             }
@@ -202,7 +211,7 @@ impl Checker {
                         })
                         .unwrap_or_default();
 
-                    let field_ty = if let Type::Object(ref obj_fields) = _scrutinee_ty {
+                    let field_ty = if let Type::Object(ref obj_fields) = scrutinee_ty {
                         obj_fields.get(&key).cloned().unwrap_or(Type::Null)
                     } else {
                         self.env.fresh_type_var()
@@ -243,9 +252,9 @@ impl Checker {
             Pattern::Array(elements, rest, span) => {
                 let mut typed_elements = Vec::new();
                 for (i, elem) in elements.iter().enumerate() {
-                    let elem_ty = if let Type::Array(ref inner) = _scrutinee_ty {
+                    let elem_ty = if let Type::Array(ref inner) = scrutinee_ty {
                         *inner.clone()
-                    } else if let Type::FixedArray(ref types) = _scrutinee_ty {
+                    } else if let Type::FixedArray(ref types) = scrutinee_ty {
                         types.get(i).cloned().unwrap_or(Type::Never)
                     } else {
                         self.env.fresh_type_var()
@@ -254,7 +263,7 @@ impl Checker {
                 }
 
                 let rest_slot = rest.as_ref().map(|name| {
-                    let elem_ty = if let Type::Array(ref inner) = _scrutinee_ty {
+                    let elem_ty = if let Type::Array(ref inner) = scrutinee_ty {
                         Type::Array(inner.clone())
                     } else {
                         Type::Array(Box::new(self.env.fresh_type_var()))
