@@ -40,10 +40,15 @@ autoescaping off).
 
 ```bash
 cargo build --workspace                                  # build the lin compiler
+cp CHANGELOG.md docs-site/content/changelog.md           # only if CHANGELOG.md exists (post-first-release)
 ./target/debug/lin build docs-site/builder/main.lin -o docs-builder
 ./docs-builder                                           # writes docs-site/output/
 # open docs-site/output/index.html
 ```
+
+The `cp` mirrors the release-plz-generated `CHANGELOG.md` onto the site's
+`/changelog` page; skip it before the first release (a placeholder page ships in
+`content/changelog.md` until then). CI does this automatically in `docs.yml`.
 
 `LIN_DOCS_BASE` sets a deployment subpath prefix for all links and assets. It
 defaults to `""` (root) for local builds; CI sets `LIN_DOCS_BASE=/Lin` because the
