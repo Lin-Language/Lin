@@ -1,0 +1,125 @@
+// query — GroupStationDepartAfterQuery, DepartAfterQuery, RangeQuery.
+//
+// planGroup(raptor, origins[], destinations[], date, time, maxSearchDays, filters):
+//   multi-day stitching. Runs scan per day; if no results, increments the day (real
+//   calendar arithmetic) and continues up to maxSearchDays, pre-pending earlier days'
+//   connections to complete overnight journeys.
+import { for } from "std/iter"
+import { keys } from "std/object"
+import { length, push, slice } from "std/array"
+import { getDateNumber, dayOfWeek, addDay } from "./dateUtil"
+import { scan } from "./raptor"
+import { getResults } from "./journeyFactory"
+
+val ONE_DAY = 86400
+
+// getFoundStations: best arrival - 1 day (min 1) for every stop that has an arrival.
+val getFoundStations = (kConnections: Json, bestArrivals: Json): Json =>
+  var origins = {}
+  keys(kConnections).for(stop =>
+    if length(keys(kConnections[stop])) > 0 then
+      val best = bestArrivals[stop]
+      val v = best - ONE_DAY
+      origins[stop] = if v > 1 then v else 1
+  )
+  origins
+
+val mergeJourneys = (journeyA: Json, journeyB: Json): Json =>
+  var legs: Json = []
+  journeyA["legs"].for(l => push(legs, l))
+  journeyB["legs"].for(l => push(legs, l))
+  {
+    "legs": legs,
+    "departureTime": journeyA["departureTime"],
+    "arrivalTime": journeyB["arrivalTime"] + ONE_DAY
+  }
+
+// completeJourneys: for every journey-so-far, find results to its origin in `connections`
+// and merge. (flatMap in the reference.)
+val completeJourneys = (resultsFactoryConnections: Json, journeys: Json): Json =>
+  var out: Json = []
+  journeys.for(journeyB =>
+    val origin = journeyB["legs"][0]["origin"]
+    getResults(resultsFactoryConnections, origin).for(journeyA =>
+      push(out, mergeJourneys(journeyA, journeyB))
+    )
+  )
+  out
+
+// getJourneysFromConnections: initial results for destinations + stitch previous days.
+val getJourneysFromConnections = (kConnections: Json, prevConnections: Json, destinations: Json): Json =>
+  var initial: Json = []
+  destinations.for(d =>
+    if length(keys(kConnections[d])) > 0 then
+      getResults(kConnections, d).for(j => push(initial, j))
+  )
+  // reduce over reversed prevConnections
+  var journeys: Json = initial
+  var idx = length(prevConnections) - 1
+  reduceReversed(prevConnections, idx, journeys, completeJourneys)
+
+val reduceReversed = (prevConnections: Json, idx: Int32, journeys: Json, fn: Function): Json =>
+  if idx < 0 then
+    journeys
+  else
+    reduceReversed(prevConnections, idx - 1, fn(prevConnections[idx], journeys), fn)
+
+// getJourneys: search up to maxSearchDays advancing the calendar each day.
+val getJourneys = (raptor: Json, origins: Json, destinations: Json, date: Json, maxSearchDays: Int32): Json =>
+  searchDay(raptor, origins, destinations, date, maxSearchDays, 0, [])
+
+val searchDay = (raptor: Json, origins: Json, destinations: Json, date: Json, maxSearchDays: Int32, i: Int32, connectionIndexes: Json): Json =>
+  if i >= maxSearchDays then
+    []
+  else
+    val dateNumber = getDateNumber(date)
+    val dow = dayOfWeek(date)
+    val scanned = scan(raptor, origins, dateNumber, dow)
+    val kConnections = scanned[0]
+    val bestArrivals = scanned[1]
+    val results = getJourneysFromConnections(kConnections, connectionIndexes, destinations)
+    if length(results) > 0 then
+      results
+    else
+      val nextOrigins = getFoundStations(kConnections, bestArrivals)
+      var nextIndexes: Json = []
+      connectionIndexes.for(c => push(nextIndexes, c))
+      push(nextIndexes, kConnections)
+      searchDay(raptor, nextOrigins, destinations, addDay(date), maxSearchDays, i + 1, nextIndexes)
+
+// Group-station plan: set the same departure time on every origin, search, apply filters.
+export val planGroup = (raptor: Json, origins: Json, destinations: Json, date: Json, time: Int32, maxSearchDays: Int32, filters: Json): Json =>
+  var originTimes = {}
+  origins.for(o => originTimes[o] = time)
+  val results = getJourneys(raptor, originTimes, destinations, date, maxSearchDays)
+  // apply each filter in turn
+  var rs: Json = results
+  filters.for(filter => rs = filter(rs))
+  rs
+
+// DepartAfterQuery.plan: single origin -> single destination, no filters.
+export val planDepartAfter = (raptor: Json, origin: String, destination: String, date: Json, time: Int32, maxSearchDays: Int32): Json =>
+  planGroup(raptor, [origin], [destination], date, time, maxSearchDays, [])
+
+// RangeQuery.plan: profile query — repeated plans, advancing time past the earliest departure.
+export val planRange = (raptor: Json, origin: String, destination: String, date: Json, maxSearchDays: Int32, filters: Json): Json =>
+  var results: Json = []
+  rangeStep(raptor, origin, destination, date, maxSearchDays, 1, ONE_DAY, results)
+  var rs: Json = results
+  filters.for(filter => rs = filter(rs))
+  rs
+
+val rangeStep = (raptor: Json, origin: String, destination: String, date: Json, maxSearchDays: Int32, time: Int32, endTime: Int32, results: Json): Null =>
+  if time >= endTime then
+    null
+  else
+    val newResults = planGroup(raptor, [origin], [destination], date, time, maxSearchDays, [])
+    newResults.for(j => push(results, j))
+    if length(newResults) == 0 then
+      null
+    else
+      var minDep = newResults[0]["departureTime"]
+      newResults.for(j =>
+        if j["departureTime"] < minDep then minDep = j["departureTime"]
+      )
+      rangeStep(raptor, origin, destination, date, maxSearchDays, minDep + 1, endTime, results)

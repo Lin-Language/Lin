@@ -1,0 +1,195 @@
+// Shared test fixtures + deep journey equality, mirroring test/unit/util.ts.
+//
+// Records (Json objects):
+//   StopTime: { stop, arrivalTime, departureTime, dropOff, pickUp }
+//   Trip:     { tripId, stopTimes, serviceId, service }
+//   Transfer: { origin, destination, duration, startTime, endTime }
+//   TimetableLeg: { stopTimes, origin, destination, trip }
+//   Journey:  { legs, departureTime, arrivalTime }
+import { for } from "std/iter"
+import { length, push } from "std/array"
+import { makeService } from "./service"
+
+val MAX = 9007199254740991i64
+
+export val allDays = {
+  "0": true, "1": true, "2": true, "3": true,
+  "4": true, "5": true, "6": true
+}
+
+// services["1"] and services["2"] from util.ts
+export val service1 = makeService(20180101, 20991231, allDays, {})
+export val service2 = makeService(20190101, 20991231, allDays, {})
+
+// util.ts assigns a globally incrementing `trip${counter++}` id. A top-level `var`
+// mutated by an exported function currently miscompiles in an IMPORTED module (Lin
+// codegen bug — see NOTES.md), so we derive a content-based id from the stop/time
+// signature instead. The tests never assert tripId (setDefaultTrip overwrites trips),
+// and the algorithm only needs trips on one route to be distinguishable, which a
+// content signature guarantees.
+val tripSignature = (stopTimes: Json): String =>
+  var sig: Json = ""
+  stopTimes.for(s =>
+    sig = "${sig}${s["stop"]}:${s["departureTime"]}:${s["arrivalTime"]};"
+  )
+  sig
+
+export val t = (stopTimes: Json): Json =>
+  {
+    "tripId": "trip${tripSignature(stopTimes)}",
+    "stopTimes": stopTimes,
+    "serviceId": "1",
+    "service": service1
+  }
+
+// st(stop, arr, dep): arr/dep may be null (use the JS null-coalescing semantics).
+// arrivalTime = arr ?? dep; departureTime = dep ?? arr; dropOff = arr != null; pickUp = dep != null.
+export val st = (stop: String, arr: Json, dep: Json): Json =>
+  {
+    "stop": stop,
+    "arrivalTime": if arr != null then arr else dep,
+    "departureTime": if dep != null then dep else arr,
+    "dropOff": arr != null,
+    "pickUp": dep != null
+  }
+
+export val tf = (origin: String, destination: String, duration: Int32): Json =>
+  {
+    "origin": origin,
+    "destination": destination,
+    "duration": duration,
+    "startTime": 0,
+    "endTime": MAX
+  }
+
+val isTransferLeg = (leg: Json): Boolean =>
+  leg["origin"] != null && leg["stopTimes"] == null
+
+// j(...legs): each leg is a StopTime[] OR a Transfer. Builds a Journey with computed
+// departure/arrival times (see util.ts getDepartureTime/getArrivalTime).
+val isTransferArg = (arg: Json): Boolean =>
+  // an arg is a Transfer if it is an object with an "origin" key; a StopTime[] is an array.
+  arg["origin"] != null
+
+val depTime = (legs: Json): Int32 =>
+  depTimeAt(legs, 0, 0)
+
+val depTimeAt = (legs: Json, i: Int32, transferDuration: Int32): Int32 =>
+  if i >= length(legs) then
+    0
+  else
+    val leg = legs[i]
+    if isTransferArg(leg) then
+      depTimeAt(legs, i + 1, transferDuration + leg["duration"])
+    else
+      leg[0]["departureTime"] - transferDuration
+
+val arrTime = (legs: Json): Int32 =>
+  arrTimeAt(legs, length(legs) - 1, 0)
+
+val arrTimeAt = (legs: Json, i: Int32, transferDuration: Int32): Int32 =>
+  if i < 0 then
+    0
+  else
+    val leg = legs[i]
+    if isTransferArg(leg) then
+      arrTimeAt(legs, i - 1, transferDuration + leg["duration"])
+    else
+      leg[length(leg) - 1]["arrivalTime"] + transferDuration
+
+export val defaultTrip = { "tripId": "1", "serviceId": "1", "stopTimes": [], "service": service1 }
+
+export val j = (legArgs: Json): Json =>
+  var legs: Json = []
+  legArgs.for(arg =>
+    if isTransferArg(arg) then
+      push(legs, arg)
+    else
+      push(legs, {
+        "stopTimes": arg,
+        "origin": arg[0]["stop"],
+        "destination": arg[length(arg) - 1]["stop"],
+        "trip": defaultTrip
+      })
+  )
+  {
+    "departureTime": depTime(legArgs),
+    "arrivalTime": arrTime(legArgs),
+    "legs": legs
+  }
+
+// setDefaultTrip(results): overwrite each timetable leg's trip with defaultTrip so that
+// journey equality ignores trip identity. Mutates in place.
+export val setDefaultTrip = (results: Json): Null =>
+  results.for(journey =>
+    journey["legs"].for(leg =>
+      if leg["trip"] != null then leg["trip"] = defaultTrip
+    )
+  )
+
+// --- Deep equality for journeys (ignores trip; distinguishes leg kinds) ---
+
+val stopTimeEq = (a: Json, b: Json): Boolean =>
+  a["stop"] == b["stop"]
+    && a["arrivalTime"] == b["arrivalTime"]
+    && a["departureTime"] == b["departureTime"]
+    && a["dropOff"] == b["dropOff"]
+    && a["pickUp"] == b["pickUp"]
+
+val stopTimesEq = (a: Json, b: Json): Boolean =>
+  if length(a) != length(b) then
+    false
+  else
+    var ok = true
+    var i = 0
+    a.for(_ =>
+      if stopTimeEq(a[i], b[i]) == false then ok = false
+      i = i + 1
+    )
+    ok
+
+val legEq = (a: Json, b: Json): Boolean =>
+  val aTransfer = isTransferLeg(a)
+  val bTransfer = isTransferLeg(b)
+  if aTransfer != bTransfer then
+    false
+  else if aTransfer then
+    a["origin"] == b["origin"]
+      && a["destination"] == b["destination"]
+      && a["duration"] == b["duration"]
+      && a["startTime"] == b["startTime"]
+      && a["endTime"] == b["endTime"]
+  else
+    a["origin"] == b["origin"]
+      && a["destination"] == b["destination"]
+      && stopTimesEq(a["stopTimes"], b["stopTimes"])
+
+val legsEq = (a: Json, b: Json): Boolean =>
+  if length(a) != length(b) then
+    false
+  else
+    var ok = true
+    var i = 0
+    a.for(_ =>
+      if legEq(a[i], b[i]) == false then ok = false
+      i = i + 1
+    )
+    ok
+
+export val journeyEq = (a: Json, b: Json): Boolean =>
+  a["departureTime"] == b["departureTime"]
+    && a["arrivalTime"] == b["arrivalTime"]
+    && legsEq(a["legs"], b["legs"])
+
+// Deep-equality of a journey ARRAY against an expected array.
+export val journeysEq = (actual: Json, expected: Json): Boolean =>
+  if length(actual) != length(expected) then
+    false
+  else
+    var ok = true
+    var i = 0
+    actual.for(_ =>
+      if journeyEq(actual[i], expected[i]) == false then ok = false
+      i = i + 1
+    )
+    ok

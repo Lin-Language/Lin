@@ -1,0 +1,65 @@
+import { describe, it } from "node:test";
+import { expect } from "./expect.js";
+import { StringResults } from "../src/transfer-pattern/results/StringResults.js";
+
+describe("StringResults", () => {
+  it("Merges duplicate paths", () => {
+    const tree = new StringResults({});
+
+    const expected = {
+      "AB": new Set([""]),
+      "AC": new Set(["B"]),
+      "AD": new Set(["B,C"])
+    };
+
+    mergePath(["A", "B", "C", "D"], tree);
+    mergePath(["A", "B", "C"], tree);
+
+    expect(tree.finalize()).toEqual(expected);
+  });
+
+  it("Orders results", () => {
+    const tree = new StringResults({});
+
+    const expected = {
+      "AC": new Set(["B"]),
+      "BC": new Set(["", "D"]),
+      "CE": new Set(["B"]),
+      "CD": new Set([""]),
+    };
+
+    mergePath(["C", "B", "A"], tree);
+    mergePath(["C", "D", "B"], tree);
+    mergePath(["C", "B", "E"], tree);
+
+    expect(tree.finalize()).toEqual(expected);
+  });
+
+  it("Adds different paths", () => {
+    const tree = new StringResults({});
+    const expected = {
+      "AC": new Set(["", "B"]),
+      "AB": new Set(["", "C"]),
+      "AD": new Set(["B,C", "C,B"])
+    };
+
+    mergePath(["A", "B", "C", "D"], tree);
+    mergePath(["A", "C", "B", "D"], tree);
+
+    expect(tree.finalize()).toEqual(expected);
+  });
+});
+
+function mergePath(path, tree) {
+  const kConnections = {};
+
+  for (let i = 1; i < path.length; i++) {
+    const origin = path[i - 1];
+    const destination = path[i];
+
+    kConnections[destination] = {};
+    kConnections[destination][i] = [{ stopTimes: [{ stop: origin }] }, 0, 1];
+  }
+
+  tree.add(kConnections);
+}
