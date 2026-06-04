@@ -271,6 +271,30 @@ pub fn lower_import_module_with_imports(
         collect_mutable_capture_slots_stmt(stmt, &mut ctx.mutable_cell_slots);
     }
 
+    // Top-level mutable `var`s in an imported module are genuine persistent shared state
+    // (an exported function mutates the var; subsequent calls must see the update). Unlike a
+    // non-function `val` — which has no state and is recomputed per read through a `__val`
+    // wrapper — a `var` needs ONE module global, read/written via GlobalValGet/Set. Register
+    // each top-level `var` slot here so reads/writes inside exported function bodies route
+    // through the global (LocalGet/LocalSet check `global_var_slots`). Because an imported
+    // module has no `main` to run the initialiser, we emit a once-guarded init function below
+    // and call it on entry to every exported function/val wrapper. A var that is mutably
+    // captured by a closure is already a heap cell (MakeCell) — that path takes priority in
+    // `lower_stmt`, so do NOT also make it a global (the global would never be written and
+    // reads would route to it incorrectly).
+    let var_init_sym = format!("{}__var_init", module_key);
+    let mut import_var_slots: Vec<usize> = Vec::new();
+    for stmt in &module.statements {
+        if let TypedStmt::Var { slot, ty, .. } = stmt {
+            if ctx.mutable_cell_slots.contains(slot) {
+                continue;
+            }
+            ctx.global_val_slots.insert(*slot, ty.clone());
+            ctx.global_var_slots.insert(*slot);
+            import_var_slots.push(*slot);
+        }
+    }
+
     // Resolve this module's OWN imports/foreign bindings into the slot maps so function
     // bodies can call them. We run the relevant arms of `lower_stmt` against a throwaway
     // builder (Import/ForeignImport emit no instructions — they only populate ctx).
@@ -302,6 +326,48 @@ pub fn lower_import_module_with_imports(
         }
     }
 
+    // Emit the once-guarded var-init function for an imported module that has top-level
+    // `var`s. It runs each top-level `var` statement (writing the var's module global via
+    // GlobalValSet) exactly once across the whole program, guarded by a boolean global flag.
+    // Every exported function/val-wrapper calls it on entry, so the var is initialised before
+    // any reader. (A non-function `val` keeps its recompute-per-read `__val` wrapper — only
+    // a `var`, which is persistent mutable state, needs this.)
+    if !import_var_slots.is_empty() {
+        // Reserved synthetic global slot for the init flag. Slot ids come from the checker and
+        // are small indices, so usize::MAX never collides with a real binding. The backing
+        // global is created per-compilation by handle; same-name globals across modules are
+        // disambiguated by LLVM and accessed via the stored handle, so reuse is safe.
+        const VAR_INIT_FLAG_SLOT: usize = usize::MAX;
+        let init_fid = ctx.alloc_func_id();
+        let mut ib = FuncBuilder::new(
+            init_fid, Some(var_init_sym.clone()), vec![], false, Type::Null, ctx.intrinsics.clone(),
+        );
+        let do_init = ib.alloc_block("var_init_do");
+        let done = ib.alloc_block("var_init_done");
+        // if flag { goto done } else { goto do_init }
+        let flag = ib.alloc_temp(Type::Bool);
+        ib.emit(Instruction::GlobalValGet { dst: flag, slot: VAR_INIT_FLAG_SLOT, ty: Type::Bool });
+        ib.terminate(Terminator::CondJump { cond: flag, then_block: done, else_block: do_init });
+        // do_init: set flag, run var initialisers, jump done.
+        ib.switch_to(do_init);
+        let t = ib.const_temp(Const::Bool(true));
+        ib.emit(Instruction::GlobalValSet { slot: VAR_INIT_FLAG_SLOT, value: t, ty: Type::Bool });
+        ib.push_scope();
+        for stmt in &module.statements {
+            if matches!(stmt, TypedStmt::Var { .. }) {
+                lower_stmt(stmt, &mut ib, &mut ctx);
+            }
+        }
+        let sentinel = Temp(u32::MAX);
+        ib.pop_scope_releasing(sentinel);
+        ib.terminate(Terminator::Jump(done));
+        // done: return.
+        ib.switch_to(done);
+        ib.terminate(Terminator::Return(None));
+        ib.seal();
+        ctx.functions.push(ib.finish());
+    }
+
     // Lower each exported top-level function body under its forced mangled symbol name and
     // pre-assigned FuncId. We need a host builder to call `lower_function_expr_with_id`,
     // which appends the finished function to `ctx.pending_functions`.
@@ -323,10 +389,16 @@ pub fn lower_import_module_with_imports(
                 if let Some(real_name) = mangled.as_deref() {
                     register_default_adapters(fid, *slot, real_name, params, ret_type, *fn_span, &mut ctx);
                 }
+                // Run the module's var-init guard on entry to this exported function (no-op
+                // after the first call). Only set if the module has top-level vars.
+                if !import_var_slots.is_empty() {
+                    ctx.import_var_init_prologue = Some(var_init_sym.clone());
+                }
                 lower_function_expr_with_id(
                     Some(fid), None, mangled.as_deref(), params, body, ret_type, captures,
                     &mut host, &mut ctx,
                 );
+                ctx.import_var_init_prologue = None;
             }
         }
     }
@@ -345,6 +417,17 @@ pub fn lower_import_module_with_imports(
                 fid, Some(wrapper_name), vec![], false, ty.clone(), ctx.intrinsics.clone(),
             );
             wb.push_scope();
+            // A non-function exported val may read a sibling top-level `var`; ensure the
+            // module's vars are initialised first (no-op after the first call anywhere).
+            if !import_var_slots.is_empty() {
+                let dst = wb.alloc_temp(Type::Null);
+                wb.emit(Instruction::Call {
+                    dst,
+                    callee: CallTarget::Named(var_init_sym.clone()),
+                    args: vec![],
+                    ret_ty: Type::Null,
+                });
+            }
             let t = lower_expr(value, &mut wb, &mut ctx);
             let t = coerce_to_slot_type(t, &value.ty(), ty, &mut wb);
             // The wrapper hands ownership of the computed value to the caller; keep it.
@@ -435,6 +518,13 @@ struct LowerCtx {
     /// scope exit. When this is 0, any captured cell is conservatively marked escaping (left
     /// leaking). See `FreeCell` and the captured-cell escape analysis.
     safe_callback_depth: u32,
+    /// When lowering an IMPORTED module that has top-level mutable `var`s, this holds the
+    /// once-guarded var-init function symbol (`{module_key}__var_init`). Set just before a
+    /// TOP-LEVEL EXPORTED function body (or `__val` wrapper) is lowered, so the body emits a
+    /// call to it on entry — guaranteeing the module's vars are initialised before any
+    /// exported entry point reads them. Cleared (taken) after one prologue is emitted so
+    /// nested closures within the body do not re-run init.
+    import_var_init_prologue: Option<String>,
 }
 
 /// A default-fill adapter to be synthesized and lowered. `f@k` takes the first `k` parameters
@@ -473,6 +563,7 @@ impl LowerCtx {
             default_descriptors: HashMap::new(),
             safe_combinator_slots: HashMap::new(),
             safe_callback_depth: 0,
+            import_var_init_prologue: None,
         }
     }
 
@@ -4992,6 +5083,20 @@ fn lower_function_expr_with_id(
         }
     }
     inner_builder.push_scope(); // body scope
+    // Imported-module top-level `var` init: if this is an exported entry point, run the
+    // module's once-guarded var initialiser before the body so any `var` it reads/mutates is
+    // already set up. `take()` ensures only this top-level body emits the call; nested
+    // closures lowered within it (which re-enter this function with the flag already cleared)
+    // do not re-run init.
+    if let Some(init_sym) = ctx.import_var_init_prologue.take() {
+        let dst = inner_builder.alloc_temp(Type::Null);
+        inner_builder.emit(Instruction::Call {
+            dst,
+            callee: CallTarget::Named(init_sym),
+            args: vec![],
+            ret_ty: Type::Null,
+        });
+    }
     let raw_ret = lower_expr(body, &mut inner_builder, ctx);
     // Use the lowered temp's ACTUAL type for the return coercion, not the surface
     // `body.ty()`. They can disagree when the body reads a mutably-captured `var` whose
