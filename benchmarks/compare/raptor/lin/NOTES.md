@@ -33,8 +33,8 @@ target/debug/lin test benchmarks/compare/raptor/lin/
 `routeScanner.lin`, `scanResults.lin`, `raptor.lin` (RaptorAlgorithm + factory),
 `journeyFactory.lin`, `filter.lin` (MultipleCriteriaFilter), `query.lin`
 (GroupStation/DepartAfter/Range), `graphResults.lin`, `stringResults.lin`,
-plus `sortutil.lin` (stable sort) and `testutil.lin` (t/st/tf/j/setDefaultTrip +
-trip-ignoring deep journey equality).
+`roundKeys.lin` (shared numeric round-key sort), plus `testutil.lin`
+(t/st/tf/j/setDefaultTrip + trip-ignoring deep journey equality).
 
 ## Design
 
@@ -95,17 +95,15 @@ below): stop_times rows are contiguous by trip_id so they group by detecting cha
 trips↔stop_times share trip_id order so they positional-merge-join; service
 resolution uses a sorted array + binary search instead of a per-trip object lookup.
 
-### THE FIX that made it feasible: stable merge sort, not O(n²) insertion sort
+### What made it feasible: a stable O(n log n) sort
 
-The original `sortutil.lin` `stableSort` was an insertion sort that **rebuilt the
-entire output array on every insertion** — for each of the 240009 trips it allocated
-a fresh array copying all prior (boxed) trips, i.e. ~n²/2 ≈ 29 billion element-copies.
-That, not the loader and not `createRaptor`, was what drove RSS past 80 GB and the
-runtime to many hours. (An earlier version of this note misattributed the blowup to
-`createRaptor`'s object indexing — that was measured with the O(n²) sort still in the
-path and was wrong.) `stableSort` is now a **bottom-up merge sort** (O(n log n) time,
-O(n) space) with the same stable contract, so the trip sort and the
-MultipleCriteriaFilter sort both scale. All 9 unit-test files still pass.
+The trip sort (240009 trips) needs a STABLE O(n log n) sort. An early version used a
+hand-rolled insertion sort that **rebuilt the whole array on every insertion** (~n²/2 ≈
+29 billion boxed copies → RSS past 80 GB, hours) — that, not the loader or
+`createRaptor`, was the original blowup. This is now fixed at the language level:
+`std/array.sort` was made a stable bottom-up merge sort, and the port simply calls it
+(no local sort helper remains). See the shared `sortedRoundKeys` in `roundKeys.lin` and
+the `sort(...)` calls in `raptor.lin`/`filter.lin`/`gtfsLoader.lin`/`run.lin`/`bench.lin`.
 
 ### Known characteristic: O(n) `Json` object key lookup
 
@@ -119,41 +117,6 @@ blocker — the port completes and matches the gate. The loader sidesteps it wit
 sorted-array + binary-search approach above; the algorithm modules keep the
 routeId-keyed objects because they are shared with the unit tests and re-grouping
 would change observable output (`overtakes` detection, journey order/counts).
-
-### scanTransfers null-skip fix (the semantic hazard)
-
-On the FULL feed a transfer/link destination `stopPi` may not lie on any route path,
-so `raptor.interchange[stopPi]` and `bestArrival(results, stopPi)` are `null`. JS
-turns `number + undefined` into `NaN` and every comparison against NaN is false, so
-the transfer is silently skipped. Lin would instead error on `number + null` /
-`number < null`. `raptor.lin`'s `scanTransfers` now guards `ic != null && best !=
-null` before computing/comparing — reproducing JS's skip-on-missing semantics. All 9
-unit-test files still pass (they don't exercise this path).
-
-### Another local-var-in-closure miscompile (worked around in the loader)
-
-While wiring the trips↔stop_times positional merge-join, hit a second instance of the
-mutable-`var`-in-closure codegen bug (same class as the `t()`/global-`var` bug below).
-Inside a `.for` closure, **reassigning a local `var` within an `if` and reading it
-later in the same iteration drops the write** — the read still sees the var's initial
-value. Minimal repro:
-
-```lin
-var g = 0
-ids.for(id =>
-  var sts: Json = []
-  if g < length(groups) then
-    sts = groups[g]      // write is lost...
-    g = g + 1            // ...but THIS write (to an outer var) persists
-  push(out, length(sts)) // reads 0, not groups[g].length
-)
-```
-
-`g` (outer-scope var) advances correctly; `sts` (closure-local var, reassigned in the
-`if`) does not. Workaround in `gtfsLoader.lin`: bind the matched group into a `val`
-via a conditional expression instead of a reassigned `var`
-(`val sts = if matched then stopTimesGroups[g]["stopTimes"] else []`). This bug
-deserves its own minimal regression test + codegen fix.
 
 ## Skipped (as per the porting contract — no unit tests / Node-only I/O)
 
@@ -178,24 +141,37 @@ deserves its own minimal regression test + codegen fix.
 - `setDefaultTrip`-aware journey equality: legs compare by stopTimes + origin +
   destination (timetable) or the transfer fields; trip identity is ignored.
 
-## Lin language finding (compiler bug, worked around)
+## Lin language issues found during the port — all fixed
 
-The faithful port of `util.ts`'s `t()` wants a module-level `var tripId` that an
-exported function increments (`trip${tripId++}`). This **miscompiles**: a top-level
-`var` mutated by an *exported* function in an *imported* module panics codegen:
+The port originally danced around several Lin bugs; each was fixed at the language /
+stdlib level and the workaround removed. The code now reads as a direct port. Full
+detail + repros are in `../LIN_ISSUES.md`; in brief:
 
-```
-thread 'main' panicked at crates/lin-codegen/src/codegen/mod.rs:782:75:
-Binary: undefined lhs temp Temp(0)
-```
+1. **Closure-local `var` written in an `if` lost after the join** (#1) — the loader's
+   trips merge-join and several accumulators used to need a `val`-conditional dance;
+   they now use plain `var` reassignment.
+2. **Top-level `var` mutated by an exported function in an imported module panicked
+   codegen** (#2) — `testutil.lin`'s `t()` had to derive a content-based `tripId`; it
+   now uses a plain `var tripCounter` exactly like the reference `util.ts`.
+3. **`Int32 * Int64`-literal overflowed in Int32** (#3) — `bench.lin`'s digest no
+   longer needs manual per-operand `Int64` widening.
+4. **No stable stdlib sort** (#4a) — `std/array.sort` is now a stable merge sort; the
+   hand-rolled `sortutil.lin` was deleted and three duplicated `sortedRoundKeys`
+   insertion sorts collapsed into the shared `roundKeys.lin`.
+5. **Self-write `obj[k] = obj[k]` aliasing fault** — `queueFactory.lin` now uses the
+   clean `queue[r] = if before then existing else stop` form.
+6. **Wrapped multi-line `if/else` inside parens was unparseable** (#7) — fixed in the
+   parser; the whole `lin/` dir is now `lin fmt`-clean.
 
-Minimal repro: a module with `var counter = 0` and
-`export val nextId = () => counter = counter + 1; counter`, imported and called from
-another file via `lin build`. (Reproduced 2026-06-03 on this worktree.)
+The one remaining honest characteristic (not a bug): Lin `Json` objects have O(n) key
+lookup, so the query phase is far slower than the hashed-map languages — see the
+"O(n) `Json` object key lookup" section above and `LIN_ISSUES.md` #4b.
 
-Workaround in `testutil.lin`: `t()` derives a content-based `tripId` from the stop /
-time signature instead of a global counter. This is behaviorally equivalent for the
-tests — `tripId` is never asserted (`setDefaultTrip` overwrites every leg's trip
-before comparison), and the algorithm only needs trips on a single route to be
-distinguishable, which a content signature guarantees. This bug deserves its own
-regression test + fix outside this benchmark.
+## scanTransfers null guard (a faithful-semantics choice, not a workaround)
+
+On the FULL feed a transfer/link destination may not lie on any route path, so its
+`interchange`/`bestArrival` are `null`. JS turns `number + undefined` into `NaN` and
+every comparison is false, so the transfer is silently skipped. `raptor.lin`'s
+`scanTransfers` guards `ic != null && best != null` to reproduce that skip-on-missing
+semantics (Lin now *faults* on `number + null` rather than miscompiling — LIN_ISSUES
+#5 — so the explicit guard is the correct faithful port, not a bug dodge).
