@@ -385,7 +385,7 @@ type Json =
   | { ...Json }      // any object whose values are Json
 ```
 
-The last form is informal: there is no general index-signature syntax; in practice a `Json`-valued object is any object whose fields are themselves `Json`.
+The last form above is informal shorthand: a `Json`-valued object is any object whose fields are themselves `Json`. A *typed* index signature with a concrete value type does exist as real syntax — `{ String: T }` (§5.1.1).
 
 `Error` is a built-in structural alias for the conventional error value `{ "type": String, "message": String }` (§20). It composes in unions and is discriminated with `is Error`. As a structural alias it is **not** a sealed named record (§5.9.1): an `Error`-typed value may carry extra fields, and `is Error` permits them.
 
@@ -417,6 +417,35 @@ type Person = {
   "age": Int32
 }
 ```
+
+#### 5.1.1 Index-Signature (Typed Map) Object Types
+
+An object used as a *dictionary* — arbitrary, dynamically-computed string keys all mapping to the
+same value type `T` — is typed with an **index signature**:
+
+```txt
+val counts: { String: Int32 } = {}
+counts["apple"] = 3
+val n = counts["apple"]      // type: Int32 | Null
+```
+
+The key type is `String` (the only key type in v1). `{ String: T }` reads "any number of string
+keys, each mapping to `T`". It is a distinct type from a fixed-field record `{ "f": T, … }`: a value
+is *either* a fixed record *or* an index-signature map, never both.
+
+- `m[k]` yields `T | Null` (a missing key is `Null`, consistent with the §6.1 safe-bracket rule).
+- `m[k] = v` requires `v : T` and `k : String`.
+- An empty `{}` literal infers `{ String: T }` from its context (the annotated binding / return
+  type); with no such context it stays a fixed record.
+- `keys(m) : String[]`, `values(m) : T[]`, `entries(m)` are available via `std/object`.
+- There is no implicit `Json → { String: T }` coercion — convert a `Json` value through
+  `fromJson`/narrowing exactly as for any other concrete type (§6.3, §19).
+- An index-signature type cannot be used as the pattern of an `is`/`has` type test in v1 (its
+  type form is not spellable in pattern position).
+
+A `{ String: T }` value is backed at runtime by a hashed container giving **O(1) average**
+lookup/insert (in contrast to a `Json`/`{}` record, whose small association-list layout is O(n) per
+access — optimal for the handful-of-fields case, catastrophic for a large dictionary). See ADR-082.
 
 ### 5.2 Array Types
 

@@ -1,0 +1,35 @@
+// Benchmark: typed index-signature map `{ String: T }` with a FLAT-SCALAR value type (ADR-082
+// follow-up — unboxed scalar values). Relative to `map_index_signature.lin` (which scales the key
+// set and is dominated by key construction + table growth), this churns a SMALL fixed key set with
+// many rounds of overwrite + read-back, so the per-store / per-read VALUE cost dominates.
+//
+// With unboxed flat-scalar values, each `m[k] = v` writes the raw scalar inline into the slot's
+// TaggedVal (no per-value heap box, no refcount), and each `m[k]` reads it back unboxed — the map
+// analogue of the flat scalar array path. Before the follow-up, every store heap-boxed the Int64
+// and released the box shell.
+import { print } from "std/io"
+import { toString } from "std/string"
+import { for, range } from "std/iter"
+
+val k = 64
+val rounds = 100000
+
+var m: { String: Int64 } = {}
+var sum = 0i64
+
+range(0, rounds).for(r =>
+  range(0, k).for(i =>
+    val key = "k${toString(i)}"
+    m[key] = 0i64 + r + i
+    val v = m[key]
+    match v
+      is Int64 => sum = sum + v
+      else => sum = sum
+  )
+)
+
+// Each (r,i) contributes (r+i): sum_{r,i}(r+i) = k*sum_r r + rounds*sum_i i
+//   = 64 * (100000*99999/2) + 100000 * (64*63/2)
+//   = 64 * 4999950000 + 100000 * 2016
+//   = 319996800000 + 201600000 = 320198400000
+print(toString(sum))

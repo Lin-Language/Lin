@@ -230,6 +230,13 @@ pub fn is_compatible_env(
         // Iterator covariance
         (Type::Iterator(a), Type::Iterator(b)) => is_compatible_env(a, b, env, lenient_json, depth),
 
+        // Index-signature map covariance (`{ String: U }` -> `{ String: T }` when U compat T).
+        // A `Map` is its OWN thing — NOT structurally compatible with a fixed `Object` record in
+        // either direction (a value is one or the other; ADR-082). A non-`Map` value can only
+        // flow into a `Map` target via the TypeVar/Json arms above (and `Json -> Map` is gated as a
+        // structured decode in user code).
+        (Type::Map(a), Type::Map(b)) => is_compatible_env(a, b, env, lenient_json, depth),
+
         _ => false,
     }
 }
@@ -308,6 +315,10 @@ fn requires_structured_decode(target: &Type, env: Option<&TypeEnv>, depth: &mut 
     }
     match target {
         Type::Object { fields, .. } => fields.values().any(|t| !includes_null(t)),
+        // A typed index-signature map (`{ String: T }`, ADR-082) is a structured decode target:
+        // a raw `Json` must be decoded via `fromJson`/narrowing, never silently assigned (parity
+        // with the §6.3 Json-conversion rule). The trusted stdlib (lenient_json) stays permissive.
+        Type::Map(_) => true,
         Type::Named(n) => {
             if let Some(env) = env {
                 if let Some(decl) = env.lookup_type(n) {
