@@ -2145,3 +2145,44 @@ IR-proof `Command`s) set it via the shared `lin_cmd()` builder; the negative reg
 `lin_io_read_line`, `lin_string_trim`, …) are NOT in `intrinsic_slots` — they are declared via
 `import foreign "lin-runtime"` — so gating on `intrinsic_slots` membership leaves them alone. Stdlib
 modules check with `allow_intrinsics = true`, so their own intrinsic re-exports keep working.
+
+## ADR-087: Automated semver releases via release-plz
+
+**Decision**: Releases are cut by [release-plz](https://release-plz.dev/), driven entirely by
+Conventional Commits, with a single workspace-wide version number.
+
+1. **Single workspace version.** The version lives in one place — `[workspace.package].version` in the
+   root `Cargo.toml` — and every crate inherits it via `version.workspace = true` (likewise
+   `edition.workspace`/`publish.workspace`). There is no per-crate independent versioning; the whole
+   `lin` toolchain ships as one coherent release.
+2. **Jump to 1.0.0 + strict semver.** The project adopts `1.0.0` as its first release-plz baseline and
+   follows strict semver thereafter: a breaking change (`feat!:`/`fix!:` or a `BREAKING CHANGE:` footer)
+   bumps **major**, a `feat:` bumps **minor**, a `fix:`/`perf:` bumps **patch**. release-plz computes the
+   next version from the commits since the last tag.
+3. **Release-PR trigger model.** `release_always = false`: on every push to `master`, release-plz keeps a
+   "chore: release" PR up to date (version bump + generated `CHANGELOG.md`). **Merging that PR is the act
+   of releasing** — the merge lands on `master`, and the `release` command then creates the `vX.Y.Z` git
+   tag and GitHub release with the changelog notes. Nothing is published to crates.io (`publish = false`;
+   all deps are path-only).
+4. **Rolling `latest` prerelease retained.** The existing `release.yml` still publishes a rolling
+   `latest` *prerelease* on every push to `master` for bleeding-edge users. The two coexist: `latest`
+   tracks `master`, the `vX.Y.Z` tags are curated stable releases.
+5. **Reusable build workflow.** The platform binary/VSIX build matrix is factored into a
+   `workflow_call` reusable workflow (`build-binaries.yml`) parameterised by a `version_stamp`. The
+   rolling-latest caller passes a commit-count-derived stamp; the stable `attach-artifacts` caller passes
+   the released semver, then uploads the tarballs + VSIX onto the `vX.Y.Z` release.
+6. **Docs-site changelog mirror.** `docs.yml` copies `CHANGELOG.md` to `docs-site/content/changelog.md`
+   before building the site (a committed placeholder page covers the pre-first-release case), surfacing
+   release notes at `/changelog`.
+7. **`install.sh` installs newest stable by default.** Unset/`latest` resolves via GitHub's
+   `/releases/latest/download` redirect (newest **stable** release, skipping the rolling prerelease); an
+   explicit `LIN_VERSION` normalises to the `vX.Y.Z` tag.
+
+**Rationale**: A single version removes per-crate bookkeeping for a tightly-coupled toolchain. The
+release-PR model keeps releases human-gated (review the bump + changelog before merging) while making the
+mechanics fully automated and reproducible from commit history. Conventional Commits already structure the
+log, so the changelog and version bump fall out for free.
+
+**Consequence**: Commit messages are load-bearing — `feat`/`fix`/`!`/`BREAKING CHANGE` determine the next
+version and changelog grouping (`chore`/`ci`/`test`/`style` are skipped). To ship a release, merge the
+open "chore: release" PR; to install a stable build, run the install script with no `LIN_VERSION`.
