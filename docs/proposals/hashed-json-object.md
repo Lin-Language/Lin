@@ -37,12 +37,14 @@ migrates entries to a separate heap buffer (header never moves).
 
 **Coupling that constrains any change** — codegen does NOT treat `LinObject` as fully opaque:
 
-- `crates/lin-codegen/src/codegen/mod.rs` (~line 1230, the inline `MakeObject` fast path)
-  writes object-literal fields by **direct GEP at hardcoded byte offsets**: it loads
-  `entries` from `obj+16`, writes each entry at stride 24 (`key@base`, `tag@base+8`,
-  `payload@base+16`), and writes `len` to `obj+4`. Crucially this path **bypasses
-  `lin_object_set` entirely** for spread-free literals (it relies on the literal's keys being
-  pre-deduplicated by codegen).
+- `crates/lin-codegen/src/codegen/mod.rs`, the `Instruction::MakeObject` handler (handler
+  ~line 1133, inline-construction branch ~line 1230 — grep `obj_entries_pp` /
+  `LinObjectEntry stride = 24`, line numbers drift) writes object-literal fields by **direct
+  GEP at hardcoded byte offsets**: it loads `entries` from `obj+16`, writes each entry at
+  stride 24 (`key@base`, `tag@base+8`, `payload@base+16`), and writes `len` separately.
+  Crucially this path **bypasses `lin_object_set`/`set_fresh` entirely** for spread-free
+  literals whose fields all have a concrete representation (it relies on the literal's keys
+  being pre-deduplicated by codegen).
 - Everything else (`obj[k]`, `obj[k]=v`, `keys`, `merge`, `has`, equality, `groupBy`) goes
   through the runtime FFI functions and treats the pointer as opaque.
 
