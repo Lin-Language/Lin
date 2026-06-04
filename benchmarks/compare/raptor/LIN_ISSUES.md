@@ -165,3 +165,38 @@ but a documented divergence worth a lint or a defined `Json` numeric-coercion ru
 - **Inline multi-statement closures need newlines**, not `;` — `c => idx[c]=i; i=i+1`
   fails to parse (`Undefined variable ';'`); the newline form works. Expected per the
   grammar, noted only because the error message is misleading.
+
+---
+
+## 7. [CORRECTNESS] `lin fmt` does not round-trip a multi-line `if/else` assignment
+
+**Severity: high — the formatter emits code it cannot re-parse.** The formatter is
+supposed to be meaning-preserving (enforced by a corpus round-trip gate), but it
+escapes here. A long `lhs = if cond then A else B` assignment that the formatter wraps
+onto multiple lines produces output that fails to parse with `unexpected token Else`
+in some surrounding contexts (it broke `raptor.lin` and `stringResults.lin` when the
+RAPTOR `lin/` dir was formatted — 2 files became unbuildable, 4 unit-test files failed).
+
+Minimal trigger (`lin fmt` rewrites this valid, building input):
+```lin
+val f = (interchange: Json, stop: String): Null =>
+  interchange[stop] = if interchange[stop] != null then interchange[stop] else DEFAULT
+```
+into the wrapped form
+```lin
+  interchange[stop] = if interchange[stop] != null then
+    interchange[stop]
+  else
+    DEFAULT
+```
+which, depending on the enclosing block (e.g. inside the `else` arm of an outer `if`,
+followed by more statements, as in `raptor.lin`'s `indexRoute`), the parser rejects at
+the `else`. The single-line input round-trips fine; only the formatter's own wrapped
+output fails. Two fixes are needed: (1) the parser should accept the wrapped block form
+unambiguously (or the formatter must parenthesize / keep it inline), and (2) the corpus
+round-trip gate should have caught this — it may not cover `if/else`-valued assignments
+inside nested blocks.
+
+NOTE: the committed RAPTOR `lin/` files are intentionally NOT `lin fmt`-clean because
+running the formatter over them corrupts them via this bug. Fix #7 before formatting
+that directory.

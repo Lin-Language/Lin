@@ -104,9 +104,8 @@ val sortByKey = (list: Json): Json =>
 export val loadGTFS = (dataDir: String): Json =>
   // --- calendar_dates.txt -> datesList [{ key: service_id, dates: { "<+date>": include } }] ---
   // Rows are contiguous by service_id; group by detecting changes. Streamed row by row.
-  // NOTE: sentinel vars use "" + a `started` flag rather than `null` init. A `var x = null`
-  // mutated inside a `.for` closure does NOT persist the write in current Lin codegen (the slot
-  // stays its Null-typed initial value); a non-null initial value works. See NOTES.md.
+  // The `started` flag marks the first row so we don't flush an empty group before the
+  // first service_id is seen (standard run-grouping over the contiguous rows).
   var datesList: Json = []
   var curDatesSvc = ""
   var datesStarted = false
@@ -216,10 +215,8 @@ export val loadGTFS = (dataDir: String): Json =>
     val tripId = row[ti["trip_id"]]
     val serviceId = row[ti["service_id"]]
     // positional join: groups are in identical trip_id order, 1:1 with trips here.
-    // NOTE: do NOT reassign a local `var sts` inside an `if` here and read it later in the
-    // same closure iteration — current Lin codegen drops that write (the read still sees the
-    // initial value). See NOTES.md. Read the matched group directly into a `val` instead,
-    // and advance `g` only when it matched (the matched-ness is recomputed, not stored).
+    // Bind the matched group into a `val` and advance `g` only on a match — clean and
+    // cursor-independent, no mutable temp needed.
     val matched = g < numGroups && stopTimesGroups[g]["tripId"] == tripId
     val sts = if matched then stopTimesGroups[g]["stopTimes"] else []
     if matched then g = g + 1

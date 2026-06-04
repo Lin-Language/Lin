@@ -22,21 +22,17 @@ export val service1 = makeService(20180101, 20991231, allDays, {})
 export val service2 = makeService(20190101, 20991231, allDays, {})
 
 // util.ts assigns a globally incrementing `trip${counter++}` id. A top-level `var`
-// mutated by an exported function currently miscompiles in an IMPORTED module (Lin
-// codegen bug — see NOTES.md), so we derive a content-based id from the stop/time
-// signature instead. The tests never assert tripId (setDefaultTrip overwrites trips),
-// and the algorithm only needs trips on one route to be distinguishable, which a
-// content signature guarantees.
-val tripSignature = (stopTimes: Json): String =>
-  var sig: Json = ""
-  stopTimes.for(s =>
-    sig = "${sig}${s["stop"]}:${s["departureTime"]}:${s["arrivalTime"]};"
-  )
-  sig
+// mutated by an exported function in an imported module used to miscompile, so this
+// derived a content-based id; that compiler bug is now fixed, so we match util.ts
+// directly with a global counter. (The tests never assert tripId — setDefaultTrip
+// overwrites trips before comparison — so the exact id only needs to be unique.)
+var tripCounter = 0
 
 export val t = (stopTimes: Json): Json =>
+  val id = tripCounter
+  tripCounter = tripCounter + 1
   {
-    "tripId": "trip${tripSignature(stopTimes)}",
+    "tripId": "trip${id}",
     "stopTimes": stopTimes,
     "serviceId": "1",
     "service": service1
