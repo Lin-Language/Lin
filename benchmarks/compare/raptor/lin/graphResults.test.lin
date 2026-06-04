@@ -1,0 +1,53 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { for, range } from "std/iter"
+import { length } from "std/array"
+import { makeGraphResults, add, finalize } from "./graphResults"
+
+val mergePath = (tree: Json, path: Json): Null =>
+  var kConnections = {}
+  range(1, length(path)).for(i =>
+    val origin = path[i - 1]
+    val destination = path[i]
+    kConnections[destination] = {}
+    kConnections[destination]["${i}"] = [{ "stopTimes": [{ "stop": origin }] }, 0, 1]
+  )
+  add(tree, kConnections)
+
+val build = (paths: Json): Json =>
+  val tree = makeGraphResults()
+  paths.for(p => mergePath(tree, p))
+  finalize(tree)
+
+// Expected TreeNodes: parent chains toward the root (parent null).
+val A = { "label": "A", "parent": null }
+val B = { "label": "B", "parent": A }
+val C = { "label": "C", "parent": B }
+val D = { "label": "D", "parent": C }
+val D1 = { "label": "D", "parent": B }
+
+val s = suite("GraphResults", [
+  test("Merges a path into an empty tree", () => [
+    expect(build([["A", "B", "C"]])).toBe({
+      "A": [A], "B": [B], "C": [C]
+    })
+  ]),
+
+  test("Merges duplicate paths", () => [
+    expect(build([["A", "B", "C"], ["A", "B"]])).toBe({
+      "A": [A], "B": [B], "C": [C]
+    })
+  ]),
+
+  test("Appends to existing paths", () => [
+    expect(build([["A", "B"], ["A", "B", "C"]])).toBe({
+      "A": [A], "B": [B], "C": [C]
+    })
+  ]),
+
+  test("Appends different paths", () => [
+    expect(build([["A", "B", "C", "D"], ["A", "B", "D"]])).toBe({
+      "A": [A], "B": [B], "C": [C], "D": [D, D1]
+    })
+  ])
+])
+run(s)

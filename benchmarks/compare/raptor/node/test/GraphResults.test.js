@@ -1,0 +1,76 @@
+import { describe, it } from "node:test";
+import { expect } from "./expect.js";
+import { GraphResults } from "../src/transfer-pattern/results/GraphResults.js";
+
+describe("GraphResults", () => {
+  it("Merges a path into an empty tree", () => {
+    const tree = new GraphResults();
+    const A = { label: "A", parent: null };
+    const B = { label: "B", parent: A };
+    const C = { label: "C", parent: B };
+
+    const expected = { "A": [A], "B": [B], "C": [C] };
+
+    mergePath(["A", "B", "C"], tree);
+
+    expect(tree.finalize()).toEqual(expected);
+  });
+
+  it("Merges duplicate paths", () => {
+    const tree = new GraphResults();
+    const A = { label: "A", parent: null };
+    const B = { label: "B", parent: A };
+    const C = { label: "C", parent: B };
+
+    const expected = { "A": [A], "B": [B], "C": [C] };
+
+    mergePath(["A", "B", "C"], tree);
+    mergePath(["A", "B"], tree);
+
+    expect(tree.finalize()).toEqual(expected);
+  });
+
+  it("Appends to existing paths", () => {
+    const tree = new GraphResults();
+    const A = { label: "A", parent: null };
+    const B = { label: "B", parent: A };
+    const C = { label: "C", parent: B };
+
+    const expected = { "A": [A], "B": [B], "C": [C] };
+
+    mergePath(["A", "B"], tree);
+    mergePath(["A", "B", "C"], tree);
+
+    expect(tree.finalize()).toEqual(expected);
+  });
+
+  it("Appends different paths", () => {
+    const tree = new GraphResults();
+    const A = { label: "A", parent: null };
+    const B = { label: "B", parent: A };
+    const C = { label: "C", parent: B };
+    const D = { label: "D", parent: C };
+    const D1 = { label: "D", parent: B };
+
+    const expected = { "A": [A], "B": [B], "C": [C], "D": [D, D1] };
+
+    mergePath(["A", "B", "C", "D"], tree);
+    mergePath(["A", "B", "D"], tree);
+
+    expect(tree.finalize()).toEqual(expected);
+  });
+});
+
+function mergePath(path, tree) {
+  const kConnections = {};
+
+  for (let i = 1; i < path.length; i++) {
+    const origin = path[i - 1];
+    const destination = path[i];
+
+    kConnections[destination] = {};
+    kConnections[destination][i] = [{ stopTimes: [{ stop: origin }] }, 0, 1];
+  }
+
+  tree.add(kConnections);
+}

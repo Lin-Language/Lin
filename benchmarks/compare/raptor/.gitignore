@@ -1,0 +1,10 @@
+# Build artifacts from the per-language ports (all regenerable).
+rust/target/
+**/.lin-cache/
+node/node_modules/
+go/go.sum
+__pycache__/
+*.pyc
+data/
+go/run
+go/bench

@@ -1,0 +1,100 @@
+// transfer-pattern/results/GraphResults — kConnections -> DAG merge.
+//
+// Stores a transfer-pattern graph: { label -> TreeNode[] } where a TreeNode is
+// { "label": StopID, "parent": TreeNode | null }. Paths are merged so identical
+// prefixes share node structure.
+//
+// Reference (GraphResults.ts):
+//   mergePath([head, ...tail]): results[head] ||= []; find node whose parent chain
+//   `isSame` as tail; if none, create { label: head, parent: tail?mergePath(tail):null }.
+//   isSame(path, node): walk node.parent chain comparing each label to path[i].
+import { for } from "std/iter"
+import { keys } from "std/object"
+import { parseInt32 } from "std/number"
+import { length, push, slice } from "std/array"
+
+val isTransfer = (connection: Json): Boolean =>
+  connection["origin"] != null
+
+val sortedRoundKeys = (m: Json): Json =>
+  val ks = keys(m)
+  var nums = []
+  ks.for(k => push(nums, parseInt32(k)))
+  var sorted = []
+  nums.for(n =>
+    var inserted = false
+    var out = []
+    sorted.for(x =>
+      if inserted == false && n < x then
+        push(out, n)
+        inserted = true
+      push(out, x)
+    )
+    if inserted == false then push(out, n)
+    sorted = out
+  )
+  var result = []
+  sorted.for(n => push(result, "${n}"))
+  result
+
+// path = [finalDestination, origin1, origin2, ...] built by appending each origin
+// while walking k back to 1 (reference getPath uses push, so this order is correct).
+val getPath = (kConnections: Json, k: String, finalDestination: String): Json =>
+  walk(kConnections, parseInt32(k), finalDestination, [finalDestination])
+
+val walk = (kConnections: Json, i: Int32, destination: String, path: Json): Json =>
+  if i <= 0 then
+    path
+  else
+    val connection = kConnections[destination]["${i}"]
+    val origin = if isTransfer(connection) then
+      connection["origin"]
+    else
+      connection[0]["stopTimes"][connection[1]]["stop"]
+    push(path, origin)
+    walk(kConnections, i - 1, origin, path)
+
+// isSame(path, node): does node's parent chain spell out path[0], path[1], ...?
+val isSame = (path: Json, node: Json): Boolean =>
+  isSameAt(path, node, 0)
+
+val isSameAt = (path: Json, node: Json, i: Int32): Boolean =>
+  if node == null then
+    true
+  else if node["label"] != path[i] then
+    false
+  else
+    isSameAt(path, node["parent"], i + 1)
+
+// mergePath([head, ...tail]) returning the (possibly new) node for head.
+val mergePathInto = (results: Json, path: Json): Json =>
+  val head = path[0]
+  val tail = slice(path, 1, length(path))
+  if results[head] == null then results[head] = []
+  val bucket = results[head]
+  var found: Json = null
+  bucket.for(n =>
+    if found == null && isSame(tail, n["parent"]) then found = n
+  )
+  val existing = found
+  if existing != null then
+    existing
+  else
+    val parent = if length(tail) > 0 then mergePathInto(results, tail) else null
+    val node = { "label": head, "parent": parent }
+    push(bucket, node)
+    node
+
+export val makeGraphResults = (): Json =>
+  { "results": {} }
+
+export val add = (gr: Json, kConnections: Json): Null =>
+  val results = gr["results"]
+  keys(kConnections).for(destination =>
+    sortedRoundKeys(kConnections[destination]).for(k =>
+      mergePathInto(results, getPath(kConnections, k, destination))
+    )
+  )
+
+export val finalize = (gr: Json): Json =>
+  gr["results"]
