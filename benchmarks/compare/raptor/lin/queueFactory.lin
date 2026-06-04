@@ -17,13 +17,12 @@ export val getQueue = (routesAtStop: Json, routeStopIndex: Json, markedStops: Js
     val routes = if routesAtStop[stop] == null then [] else routesAtStop[stop]
     routes.for(routeId =>
       val existing = queue[routeId]
-      // keep `existing` (no write) if it is strictly earlier on the route; otherwise
-      // set the new stop. (A self-write `queue[routeId] = existing` triggers an aliased
-      // copy_nonoverlapping fault in the runtime — see NOTES.md — so we only write when changing.)
-      if existing != null && isStopBefore(routeStopIndex, routeId, existing, stop) then
-        null
+      // Keep the existing entry if it is strictly earlier on the route; otherwise take the
+      // new stop. Mirrors the reference's `queue[r] = (existing && before) ? existing : stop`.
+      queue[routeId] = if existing != null && isStopBefore(routeStopIndex, routeId, existing, stop) then
+        existing
       else
-        queue[routeId] = stop
+        stop
     )
   )
   queue

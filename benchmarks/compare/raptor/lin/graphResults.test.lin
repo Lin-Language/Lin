@@ -27,27 +27,19 @@ val D1 = { "label": "D", "parent": B }
 
 val s = suite("GraphResults", [
   test("Merges a path into an empty tree", () => [
-    expect(build([["A", "B", "C"]])).toBe({
-      "A": [A], "B": [B], "C": [C]
-    })
+    expect(build([["A", "B", "C"]])).toBe({ "A": [A], "B": [B], "C": [C] })
   ]),
 
   test("Merges duplicate paths", () => [
-    expect(build([["A", "B", "C"], ["A", "B"]])).toBe({
-      "A": [A], "B": [B], "C": [C]
-    })
+    expect(build([["A", "B", "C"], ["A", "B"]])).toBe({ "A": [A], "B": [B], "C": [C] })
   ]),
 
   test("Appends to existing paths", () => [
-    expect(build([["A", "B"], ["A", "B", "C"]])).toBe({
-      "A": [A], "B": [B], "C": [C]
-    })
+    expect(build([["A", "B"], ["A", "B", "C"]])).toBe({ "A": [A], "B": [B], "C": [C] })
   ]),
 
   test("Appends different paths", () => [
-    expect(build([["A", "B", "C", "D"], ["A", "B", "D"]])).toBe({
-      "A": [A], "B": [B], "C": [C], "D": [D, D1]
-    })
+    expect(build([["A", "B", "C", "D"], ["A", "B", "D"]])).toBe({ "A": [A], "B": [B], "C": [C], "D": [D, D1] })
   ])
 ])
 run(s)

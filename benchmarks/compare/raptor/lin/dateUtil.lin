@@ -26,7 +26,7 @@ val isLeap = (y: Int32): Boolean =>
 
 val daysInMonth = (y: Int32, m: Int32): Int32 =>
   if m == 2 then
-    (if isLeap(y) then 29 else 28)
+    if isLeap(y) then 29 else 28
   else if m == 4 || m == 6 || m == 9 || m == 11 then
     30
   else
@@ -38,14 +38,39 @@ export val addDay = (date: Json): Json =>
   val d = date["day"]
   val dim = daysInMonth(y, m)
   if d < dim then
-    { "year": y, "month": m, "day": d + 1 }
+    {
+      "year": y,
+      "month": m,
+      "day": d + 1
+    }
   else if m < 12 then
-    { "year": y, "month": m + 1, "day": 1 }
+    {
+      "year": y,
+      "month": m + 1,
+      "day": 1
+    }
   else
-    { "year": y + 1, "month": 1, "day": 1 }
+    {
+      "year": y + 1,
+      "month": 1,
+      "day": 1
+    }
 
 // Day of week via Sakamoto's algorithm. Returns 0=Sunday .. 6=Saturday (JS getDay, UTC).
-val tTable = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+val tTable = [
+  0,
+  3,
+  2,
+  5,
+  0,
+  3,
+  5,
+  1,
+  4,
+  6,
+  2,
+  4
+]
 
 export val dayOfWeek = (date: Json): Int32 =>
   val m = date["month"]

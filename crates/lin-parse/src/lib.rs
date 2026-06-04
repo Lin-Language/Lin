@@ -101,6 +101,34 @@ mod format_source_tests {
     }
 
     #[test]
+    fn semicolon_separator_gives_actionable_diagnostic() {
+        // Lin has no semicolons (spec §1.2). A C-style `;` statement separator inside an
+        // inline closure body must produce a clear, well-spanned diagnostic — NOT the old
+        // misleading "Undefined variable ';'" that the lexer's Ident catch-all caused.
+        let src = "fields.for(c => idx[c] = i; i = i + 1)\n";
+        let mut lexer = lin_lex::Lexer::new(src, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = Parser::new(tokens);
+        let _ = parser.parse_module();
+        let msgs: Vec<&str> = parser.diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert!(
+            msgs.iter().any(|m| m.contains("no semicolons")),
+            "expected a 'no semicolons' diagnostic, got: {msgs:?}"
+        );
+        // The semicolon must be a distinct token, never an identifier.
+        let help = parser
+            .diagnostics
+            .iter()
+            .find(|d| d.message.contains("no semicolons"))
+            .and_then(|d| d.help.clone());
+        assert_eq!(
+            help.as_deref(),
+            Some("separate statements with newlines, not ';'"),
+            "expected actionable newline help text"
+        );
+    }
+
+    #[test]
     fn format_source_preserves_partial_multiline_call() {
         // A long argument list that the formatter splits across lines must still re-emit
         // the trailing comma after the final argument.
