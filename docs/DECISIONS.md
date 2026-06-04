@@ -1753,3 +1753,95 @@ from ~145s to ~27s with the cross-language correctness digest unchanged
 (`group=26203913 range=773022892 journeys=139`). The RAPTOR loader's sorted-array `bsearch` /
 contiguous-run grouping workarounds (adopted to avoid big object maps) are now unnecessary and could be
 simplified back to plain `{}` maps — a follow-up, not part of this change.
+
+## ADR-082: Sealed records — unboxed struct layout for named record types
+
+**Decision**: A **named** record type (`type T = { … }`) is *sealed*: its runtime
+values are laid out as an **unboxed, constant-offset struct** instead of the
+uniform boxed, refcounted, string-keyed `LinObject`. Crucially, this changes
+**representation only** — type **compatibility stays structural**. A wider or
+`Json` value is still assignable where `T` is expected (§5.9 width subtyping is
+unchanged); at that boundary it is **projected** by a *non-mutating copy* into a
+fresh sealed value holding exactly `T`'s fields. The source is untouched and
+keeps any extra fields in its own scope.
+
+This is what makes a fixed-offset layout *sound* under width subtyping: a value
+of a named type is **never reinterpreted in place** as a different layout — it is
+always copied into the canonical layout at the boundary — so a given named type
+always has exactly one physical layout, and field offsets are unambiguous.
+
+Layout (all in `crates/lin-runtime/src/sealed.rs`): `[ u32 rc | u32 size | u64
+desc_ptr | fields… ]`. Scalar fields are stored inline at natural-aligned byte
+offsets (declaration order); heap fields (String/Array/nested-sealed) are 8-byte
+owned pointer slots. `desc_ptr` points at a static, codegen-emitted **field
+descriptor** `{ count, {offset, kind}* }` listing the heap fields — it reaches
+every drop site (scope exit, closure-capture release, thread-transfer, var
+reassign) without the static type, driving per-field retain (on construct /
+projection-copy) and release (on drop, nested recursing). `rc` at offset 0 means
+the existing `lin_rc_retain`/RC machinery works unchanged. Field read is a
+constant-offset load; construction stores fields by offset with no string keys.
+Operations that need the universal JSON shape (`==` cross-representation,
+`toString`, `keys`, spread, dynamic `obj[k]`, `Json` boundary, thread-transfer)
+**materialize** the struct into a boxed `LinObject` at that edge — correct, and
+the slow path is only the rare ops, not field access.
+
+Arrays of **all-scalar** sealed records (`T[]`) are stored as a `LinArray` of
+**contiguous, header-less, packed element payloads** (new `elem_tag = 0xFE`;
+element stride + descriptor in trailing `LinArray` fields, leaving the
+flat/tagged element offsets untouched). The array owns its elements, so there is
+no per-element refcount; `arr[i].field` is a constant-stride GEP + load.
+
+**Rationale**: Object/record-heavy code paid a `lin_object_get` hash lookup +
+boxed-pointer chase + unbox on *every* field access, regardless of how precisely
+typed (`crates/lin-codegen/src/codegen/types.rs` previously discarded the known
+`Type::Object` shape). A sequence of measured experiments (box pool, Perceus
+reuse, box elimination — all in `docs/`/memory) established the cost is the
+representation, not the allocator. Sealed layout removes the call, the lookup,
+and the box in one move. Measured: **~83×** faster field access on an
+access-bound scalar-record loop, **~5.9×** on a mixed String-field record,
+**~87×** on a scalar-record array versus a boxed `Json[]`, and **~5.7×** on the
+`records` cross-language benchmark versus the same code typed `:Json`.
+
+A `Type::Object` carries a `sealed: bool` (set when a named record type resolves;
+`false` for anonymous literals, inferred shapes, and the `Error` alias). The flag
+is **representation-only**: the manual `impl PartialEq for Type` ignores it, and
+`compat.rs` ignores it, so inference, narrowing, exhaustiveness, and structural
+compatibility are exactly as before.
+
+**Rejected / deferred alternatives**:
+- **Sealing by shape (any all-scalar object, named or anonymous)** — rejected: it
+  would seal pervasive anonymous `{x,y}` literals and force conversions at most
+  boundaries. Gating on the *named* `sealed` marker keeps the fast layout where a
+  programmer named a precise shape, and keeps anonymous/`Json` flow boxed.
+- **Opt-in `sealed`/`exact` keyword** — rejected in favour of "all named record
+  types are sealed", which needs no new syntax and matches the intuition that
+  naming a type names an exact shape.
+- **NaN-boxing / a non-copying reinterpretation of a wider value as a narrower
+  layout** — unsound under width subtyping + unordered objects; the non-mutating
+  boundary projection is what restores soundness.
+- **Stack allocation of non-escaping sealed records (would-be Stage 4)** —
+  prototyped with a sound escape analysis, but measured a **~12% regression** on
+  `records`: the lowering owning-model still emits ~25 per-iteration
+  `lin_rc_retain` *calls* on the stack value (made no-ops by an immortal-RC guard,
+  but the guarded calls across the non-inlinable runtime boundary cost more than
+  the cheap heap allocation they replaced). **Not shipped.** The prerequisite is
+  suppressing Retain/Release *emission* in lowering for proven-stack-resident
+  values (so the calls vanish and SROA can promote the struct to registers), not
+  merely making them runtime no-ops.
+
+**Consequence**: One stdlib type required migration, and it is the canonical
+illustration of the one user-visible semantic change. `std/test`'s
+`Assertion = { "type": String }` deliberately used a named type as an **open
+carrier** — a failing assertion stuffed extra keys (`message`/`expected`/
+`actual`) that the reporter reads by name. Under sealed semantics a named-typed
+value drops extra fields on the projection copy, so the assertion helpers/matchers
+now return `Json` (values keep their extra keys; the array-of-assertions test-body
+guard is preserved at the array level). **The idiom that sealed records break:** a
+named record type used as a deliberately-extensible bag of extra fields. Code that
+needs open extra-field carry-through must type the value `Json`, not a named
+record. This is the §5.9.1 lossy-projection rule (see SPECIFICATION). Implemented
+across Stages 0.5 (inert `sealed` marker through resolution), 1 (scalar records),
+2 (heap-field records), and 3 (scalar-record arrays); arrays of heap-field records
+remain boxed (a follow-up). The whole change is ASan-verified (the per-field RC at
+every drop site is the UAF/double-free-prone surface) and run-equivalence-checked
+over `stdlib/`+`examples/`.
