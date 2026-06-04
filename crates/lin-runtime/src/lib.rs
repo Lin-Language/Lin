@@ -14,6 +14,7 @@ pub mod http;
 pub mod io;
 pub mod jq;
 pub mod json;
+pub mod map;
 pub mod math;
 pub mod memory;
 pub mod net;

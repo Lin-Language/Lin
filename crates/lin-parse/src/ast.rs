@@ -294,6 +294,9 @@ pub enum TypeExpr {
     Union(Vec<TypeExpr>, Span),
     Function(Vec<TypeExpr>, Box<TypeExpr>, Span),
     Object(Vec<(String, TypeExpr)>, Span),
+    /// A typed index-signature object type `{ String: T }` (ADR-082): a dictionary keyed by
+    /// arbitrary strings, each mapping to value type `T`. The key type is `String` only for v1.
+    IndexSig(Box<TypeExpr>, Span),
     TaggedUnion(Vec<TypeExpr>, Span),
     /// A string-literal singleton type, e.g. `"success"` in type position.
     StringLit(String, Span),

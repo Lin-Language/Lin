@@ -39,6 +39,11 @@ pub enum Type {
         fields: IndexMap<String, Type>,
         sealed: bool,
     },
+    /// A typed index-signature object type `{ String: T }` (ADR-082): an object used as a
+    /// dictionary — arbitrary string keys all mapping to value type `T`. Distinct from a fixed
+    /// `Object` record. Backed at runtime by the hashed `LinMap` container (O(1) average lookup),
+    /// NOT the assoc-list `LinObject`. `obj[k]` yields `T | Null`; `obj[k] = v` requires `v : T`.
+    Map(Box<Type>),
     Union(Vec<Type>),
     Function {
         params: Vec<Type>,
@@ -103,6 +108,7 @@ impl PartialEq for Type {
             (FixedArray(a), FixedArray(b)) => a == b,
             // Ignore `sealed`: structural identity is the field map only.
             (Object { fields: a, .. }, Object { fields: b, .. }) => a == b,
+            (Map(a), Map(b)) => a == b,
             (Union(a), Union(b)) => a == b,
             (
                 Function { params: p1, ret: r1, required: req1 },
@@ -226,6 +232,7 @@ impl Type {
             Type::FixedArray(elems) => elems.iter().any(|t| t.contains_type_var()),
             Type::Union(variants) => variants.iter().any(|t| t.contains_type_var()),
             Type::Object { fields, .. } => fields.values().any(|t| t.contains_type_var()),
+            Type::Map(v) => v.contains_type_var(),
             Type::Function { params, ret, .. } => {
                 params.iter().any(|t| t.contains_type_var()) || ret.contains_type_var()
             }
@@ -331,6 +338,7 @@ impl fmt::Display for Type {
                 }
                 write!(f, ") => {}", ret)
             }
+            Type::Map(v) => write!(f, "{{ String: {} }}", v),
             Type::Iterator(inner) => write!(f, "Iterator<{}>", inner),
             Type::Shared(inner) => write!(f, "Shared<{}>", inner),
             Type::Stream(inner) => write!(f, "Stream<{}>", inner),

@@ -21,6 +21,8 @@ impl<'ctx> Codegen<'ctx> {
                 self.emit_sealed_release(val, &fields);
             }
             Type::Object { .. } => { self.builder.call(self.rt.object_release, &[ptr.into()], ""); }
+            // Typed index-signature map (`{ String: T }`, ADR-082): the hashed LinMap container.
+            Type::Map(_) => { self.builder.call(self.rt.map_release, &[ptr.into()], ""); }
             Type::Function { .. } => { self.builder.call(self.rt.closure_release, &[ptr.into()], ""); }
             Type::TypeVar(_) | Type::Union(_) => { self.builder.call(self.rt.tagged_release, &[ptr.into()], ""); }
             // Stream<T> is a boxed TaggedVal*(TAG_STREAM); its release dispatches the tag-aware

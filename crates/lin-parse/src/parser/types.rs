@@ -72,23 +72,37 @@ impl Parser {
                 let span = self.current_span();
                 self.advance();
                 self.skip_newlines();
-                let mut fields = Vec::new();
-                while !self.check(TokenKind::RBrace) && !self.is_at_end() {
-                    if let TokenKind::StringLit(_) = self.peek_kind() {
-                        let key = if let TokenKind::StringLit(s) = self.advance_kind() { s } else { String::new() };
-                        self.expect(TokenKind::Colon);
-                        let ty = self.parse_type_expr();
-                        fields.push((key, ty));
-                    } else {
-                        break;
-                    }
-                    if self.check(TokenKind::Comma) {
-                        self.advance();
-                    }
+                // Index-signature form `{ String: T }` (ADR-082): a bare `String` key (an Ident,
+                // not a string literal) followed by `:`. The key type is `String` only for v1; the
+                // grammar is left open for an `Int`-keyed form later, but that is not built.
+                let is_index_sig = matches!(self.peek_kind(), TokenKind::Ident(name) if name == "String")
+                    && self.check_ahead(TokenKind::Colon, 1);
+                if is_index_sig {
+                    self.advance(); // String
+                    self.advance(); // :
+                    let val_ty = self.parse_type_expr();
                     self.skip_newlines();
+                    self.expect(TokenKind::RBrace);
+                    TypeExpr::IndexSig(Box::new(val_ty), span)
+                } else {
+                    let mut fields = Vec::new();
+                    while !self.check(TokenKind::RBrace) && !self.is_at_end() {
+                        if let TokenKind::StringLit(_) = self.peek_kind() {
+                            let key = if let TokenKind::StringLit(s) = self.advance_kind() { s } else { String::new() };
+                            self.expect(TokenKind::Colon);
+                            let ty = self.parse_type_expr();
+                            fields.push((key, ty));
+                        } else {
+                            break;
+                        }
+                        if self.check(TokenKind::Comma) {
+                            self.advance();
+                        }
+                        self.skip_newlines();
+                    }
+                    self.expect(TokenKind::RBrace);
+                    TypeExpr::Object(fields, span)
                 }
-                self.expect(TokenKind::RBrace);
-                TypeExpr::Object(fields, span)
             }
             TokenKind::LBracket => {
                 // Fixed-length array type

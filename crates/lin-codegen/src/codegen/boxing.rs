@@ -108,6 +108,13 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.box_object, &[val.into()], "boxobj")
                     .try_as_basic_value().unwrap_basic()
             }
+            // Typed index-signature map (`{ String: T }`, ADR-082): box the LinMap* as TAG_MAP.
+            Type::Map(_) => {
+                let box_map_fn = self.get_or_declare_fn("lin_box_map",
+                    self.context.ptr_type(AddressSpace::default()).fn_type(&[self.context.ptr_type(AddressSpace::default()).into()], false));
+                self.builder.call(box_map_fn, &[val.into()], "boxmap")
+                    .try_as_basic_value().unwrap_basic()
+            }
             // A SEALED-RECORD ARRAY (Stage 3) is a contiguous unboxed buffer (elem_tag 0xFE), NOT a
             // tagged/flat array the dynamic Json machinery (lin_array_get_tagged / lin_to_string /
             // lin_tagged_eq / combinators) can read. At the Json boundary MATERIALIZE it to a tagged
