@@ -6,10 +6,9 @@
 import { for } from "std/iter"
 import { keys } from "std/object"
 import { join } from "std/string"
-import { length, push, slice } from "std/array"
+import { length, push, slice, sort } from "std/array"
 import { runsOn } from "./service"
 import { getDateNumber, dayOfWeek } from "./dateUtil"
-import { stableSort } from "./sortutil"
 import { getQueue } from "./queueFactory"
 import { createRouteScanner, getTrip } from "./routeScanner"
 import {
@@ -58,8 +57,8 @@ export val createRaptor = (tripsIn: Json, transfers: Json, interchange: Json, da
     )
     trips = filtered
 
-  // stable sort by first departureTime (contract #3)
-  val sorted = stableSort(trips, (a, b) =>
+  // stable sort by first departureTime (contract #3) — std/array.sort is stable
+  val sorted = sort(trips, (a, b) =>
     a["stopTimes"][0]["departureTime"] - b["stopTimes"][0]["departureTime"]
   )
 

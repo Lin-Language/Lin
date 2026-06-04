@@ -62,15 +62,11 @@ val RANGE_QUERIES = [
   ["RDG", "IPS"]
 ]
 
-// Order-independent digest contribution of one journey.
-// NOTE: dep/arr are Int32; `dep * 1000003i64` would compute the product in Int32 FIRST
-// and overflow (an Int64 literal operand does NOT widen the other operand). So widen each
-// term to an Int64 binding before multiplying. (Lin friction — see NOTES.md.)
+// Order-independent digest contribution of one journey. Mixed Int32 * Int64-literal
+// arithmetic widens the Int32 operand to Int64 before multiplying (so no overflow).
 val journeyDigest = (j: Json): Int64 =>
-  val depI: Int32 = j["departureTime"] % 1000000000
-  val arrI: Int32 = j["arrivalTime"] % 1000000000
-  val dep: Int64 = depI
-  val arr: Int64 = arrI
+  val dep: Int32 = j["departureTime"] % 1000000000
+  val arr: Int32 = j["arrivalTime"] % 1000000000
   val legs: Int64 = length(j["legs"])
   (dep * 1000003i64 + arr * 31i64 + legs) % MOD
 
