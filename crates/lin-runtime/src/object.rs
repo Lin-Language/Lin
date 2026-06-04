@@ -255,6 +255,7 @@ unsafe fn release_tagged_payload(tv: &TaggedVal) {
         TAG_STR => crate::string::lin_string_release(payload as *mut crate::string::LinString),
         TAG_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
         TAG_OBJECT => lin_object_release(payload as *mut LinObject),
+        TAG_MAP => crate::map::lin_map_release(payload as *mut crate::map::LinMap),
         TAG_FUNCTION => crate::memory::lin_closure_release(payload as *mut u8),
         TAG_SHARED => crate::shared::lin_shared_release_box(payload as *const u8),
         TAG_STREAM => crate::stream::lin_stream_release_box(payload as *const u8),
@@ -283,6 +284,10 @@ unsafe fn retain_tagged_payload(tv: &TaggedVal) {
             let o = payload as *mut LinObject;
             if !o.is_null() && (*o).refcount < crate::string::IMMORTAL_RC { (*o).refcount += 1; }
         }
+        TAG_MAP => {
+            let m = payload as *mut crate::map::LinMap;
+            if !m.is_null() && (*m).refcount < crate::string::IMMORTAL_RC { (*m).refcount += 1; }
+        }
         TAG_SHARED => {
             // Atomic refcount on the Shared box (cross-thread-shared).
             crate::shared::lin_shared_retain_box(payload as *const u8);
@@ -298,6 +303,12 @@ unsafe fn retain_tagged_payload(tv: &TaggedVal) {
 /// Public wrapper for retain_tagged_payload, used by array.rs when pushing tagged values.
 pub unsafe fn retain_tagged_payload_pub(tv: &TaggedVal) {
     retain_tagged_payload(tv);
+}
+
+/// Public wrapper for release_tagged_payload, used by map.rs (the typed-map container reuses the
+/// exact object value RC discipline; see ADR-082).
+pub unsafe fn release_tagged_payload_pub(tv: &TaggedVal) {
+    release_tagged_payload(tv);
 }
 
 /// Retain the heap payload of a boxed TaggedVal* (tag-aware). The codegen `Retain`

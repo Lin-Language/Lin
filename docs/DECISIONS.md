@@ -1703,6 +1703,135 @@ not GPU output). `withCstr` leaks its buffer only if the callback faults (Lin ha
 real bindgen / struct-layout DSL is future work — struct offsets are hand-computed by the programmer
 today.
 
+## ADR-082: Typed index-signature object type `{ String: T }` backed by a hashed `LinMap`
+
+**Decision**: Add a typed *index-signature* object type `{ String: T }` (Option A of the
+now-retired `typed-map-index-signature` proposal; this ADR is the surviving record) — an object used
+as a dictionary with arbitrary String keys all mapping to value type `T`. It is a **new `Type` variant** (`Type::Map(Box<Type>)`,
+surface `TypeExpr::IndexSig`) distinct from the fixed-field `Type::Object` record, and is backed at
+runtime by a **distinct hashed container `LinMap`** (open-addressing, FNV-1a, linear probing) giving
+**O(1) average** lookup/insert — *not* the O(n) association-list `LinObject`.
+
+Surface and checker rules:
+- `m[k]` yields `T | Null` (the §6.1 safe-bracket missing-key rule); `m[k] = v` requires `v : T` and
+  `k : String`.
+- An empty `{}` literal infers `{ String: T }` from its annotated context (binding target / return
+  type), else stays a fixed record. A non-empty string-keyed literal checked against a `{ String: T }`
+  context produces a `LinMap` whose values are each checked against `T`.
+- No implicit `Json → { String: T }` coercion: a `Map` target is a *structured decode* in user code
+  (`compat::requires_structured_decode`), so a raw `Json` must go through `fromJson`/narrowing,
+  exactly like a structured record (parity with §6.3 / ADR-046). The trusted stdlib stays lenient.
+- A `Map` is its OWN type — not structurally compatible with a fixed `Object` in either direction
+  (`compat.rs`), covariant in `T` (`Map<U>` → `Map<T>` when `U` compat `T`).
+- `is`/`has` against an index-signature type is **disallowed** (the cheaper v1, as the proposal
+  permits) — and it falls out for free: an `is`/`has` pattern parses only a `Pattern::TypeName`
+  (a bare identifier), so `{ String: T }` is simply not spellable in pattern position.
+
+**Backing-representation choice — a distinct `LinMap`, values boxed-but-hashed.** A separate
+container (rather than retrofitting a hash side-index onto `LinObject`, the #4b
+`hashed-json-object.md` route) **sidesteps the inline `MakeObject` codegen ABI constraint** entirely
+(the inline literal path GEPs `LinObject` at `entries@16`, 24-byte stride; `LinMap` is opaque to
+codegen — every access goes through `lin_map_*` FFI). Each `LinMap` slot stores
+`(key: *mut LinString, value: TaggedVal)` — values **boxed inside the 16-byte TaggedVal exactly like
+`LinObject` entries**, so the refcount discipline (retain on store, release on overwrite/free) is
+the byte-for-byte proven `object.rs` discipline; only the *lookup* changes from a linear scan to a
+hash probe. This was chosen deliberately for **correctness margin**: the recurring UAF/double-free
+bug class lives in exactly these value RC paths, and reusing the proven discipline keeps the risk in
+the (well-tested) hashing logic, not in novel value ownership. The map's `refcount` sits at offset 0
+(u32), so the generic `lin_rc_retain` works for it unchanged.
+
+**Flat-scalar value unboxing — IMPLEMENTED (follow-up, was deferred from v1).** When the value type
+`T` is a *flat scalar* (the `is_flat_scalar` set the codebase already unboxes for flat scalar arrays:
+`Int8/16/32/64`, `UInt8/16/32/64`, `Float32/64` — Bool excluded, as for flat arrays), the value is
+stored **unboxed**: the raw scalar lives **inline in the slot's existing 16-byte `TaggedVal`**
+(`tag` = `T`'s boxed-scalar convention, `payload` = the raw scalar bits), with **NO per-value heap
+box, NO refcount, and NO box-shell to free**. No `LinMap`/`Slot` layout change was needed and the
+runtime container is untouched — the change is entirely in **codegen**:
+- *Store* (`emit_map_set`, and the `MakeObject` map-literal path): marshal the scalar through a
+  **stack** `TaggedVal` (`build_tagged_val_alloca`) instead of a heap `box_value` + `tagged_release`,
+  exactly as a flat scalar **array** slot is written. `lin_map_set` copies the 16 bytes inline and
+  `retain_tagged_payload` is already a no-op for a scalar tag (`_ => {}` arm), so the proven set/
+  overwrite/free/grow/keys/values/entries RC discipline stays byte-identical — there is simply
+  nothing to retain or release for a scalar payload.
+- *Width-normalisation*: the value is first coerced (`compile_ir_coerce`) to `T`'s representation, so
+  a narrower source (an `Int32` variable stored into a `{ String: Int64 }` map) reads back
+  `T`-correct (signed-extended to Int64, `is Int64` matches), **fixing** the v1 width limitation
+  noted below.
+- *Missing-key / `T | Null` representation*: presence is tracked **solely by the slot's `key`**
+  (`key.is_null()` = empty slot), entirely independent of the value bytes — so unboxing introduces no
+  sentinel ambiguity. `m[k]` is typed `T | Null` (a union), so codegen returns the **borrowed
+  interior `&slot.value`** (a `TaggedVal*`) verbatim — null pointer for a missing key (→ language
+  `Null`), or the inline scalar `TaggedVal` for a present key. Because the union result of a
+  projection is *not* `is_rc_type`, the IR treats it as a borrowed interior pointer (identical to the
+  established `lin_object_get` projection contract) and never retains/releases it — which is trivially
+  sound for a scalar (no inner heap payload). `match m[k] is Int64 => …` unboxes by reading those
+  bytes via the normal tag-dispatch. **Verified under AddressSanitizer**: the flat-scalar store/
+  lookup/keys/values/entries/free path is corruption-clean (no UAF/double-free/overflow), and a
+  String-valued map exercising the unchanged boxed path leaks identically — i.e. the only ASan
+  finding (a `var`-local map not released at recursive-function scope exit) is **pre-existing and
+  representation-independent**, not introduced by unboxing.
+
+**Relationship to `hashed-json-object.md` / ADR-081 (#4b).** #4b *did* land independently as
+**ADR-081** (a lazy O(1) hash side-index on large generic `Json` objects). The two are
+**complementary, not redundant**, and operate at different layers: ADR-081 makes the *untyped* `{}`
+/ `Json` dictionary O(1) at runtime with zero surface-language change, while this ADR adds a *typed*
+`{ String: T }` surface form (fidelity + a value type that flows through the stdlib) backed by its
+own `LinMap`. Code that wants a typed dictionary uses `{ String: T }` and gets O(1) by construction
+and an unboxed scalar payload; code that stays on dynamic `Json` still gets O(1) lookup from ADR-081.
+The earlier draft of this ADR (written before ADR-081 merged) claimed to *supersede* #4b on the
+assumption it would be left unimplemented — that is no longer accurate: both shipped and coexist.
+
+**Stdlib.** `std/object`'s `keys`/`values`/`entries` are made **tag-aware** (new runtime bridges
+`lin_keys_any`/`lin_values_any`/`lin_entries_any` dispatch on the boxed value's tag — TAG_OBJECT →
+`LinObject`, TAG_MAP → `LinMap`), so the SAME functions work over both a `Json`/`{}` record and a
+typed map. `length`/`isEmpty` likewise handle TAG_MAP (`lin_map_length`, `lin_length_dyn`). The
+constructor cluster (`fromEntries`/`merge`/`pick`/`omit`/`mapValues`) stays on the `Json`/`LinObject`
+representation (a map and a record are different runtime containers; silently re-routing them would
+change behaviour) — they remain `Json`-typed and unchanged.
+
+**Performance (microbenchmark `benchmarks/map_index_signature.lin`, insert+lookup of N distinct
+keys, debug-built compiler / O2 output):**
+
+| N | `{ String: T }` (LinMap) | `Json` object (assoc-list) | speedup |
+|------:|------:|------:|------:|
+| 10000 | 18 ms | 1824 ms | ~101x |
+| 20000 | 35 ms | 5664 ms | ~162x |
+| 40000 | 76 ms | 26920 ms | ~354x |
+| 80000 | 308 ms | 151969 ms | ~493x |
+
+The map roughly doubles as N doubles (linear); the `Json` object roughly quadruples (quadratic). At
+N=200000 the `Json` version exceeds 120 s while the map finishes in ~0.4 s.
+
+**Flat-scalar unboxing — measured delta.** A value-churn microbenchmark
+(`benchmarks/map_flat_scalar.lin`: an `{ String: Int64 }` map, 64-key set × 100k rounds of overwrite
++ read-back, debug-built compiler / O2 output, median of 7) goes ~5575 ms (boxed) → ~5314 ms
+(unboxed), about **5% faster** — the unboxed store does NO heap box allocation, NO box-shell free, and
+NO value refcount, vs a `lin_box_int64` + `lin_tagged_release` per store on the boxed path
+(confirmed in the emitted IR). The win is bounded because the dominant per-store cost is the
+non-inlined `lin_map_set` (hash + probe) and the small-integer box cache already makes scalar boxing
+cheap; the structural payoff is **zero value heap traffic / zero value RC** for scalar maps plus the
+width-correctness fix above (the boxed path mis-tagged an `Int32`→`{String:Int64}` store, reading
+back as `Int32` and yielding wrong results under an `is Int64` match; the unboxed path widens to `T`
+and reads back correctly).
+
+**Rejected alternative — a nominal `Map<K, V>` container (Option B).** More powerful (non-String
+keys, cleanly separates dictionaries from records) but a larger surface (new literal/constructor
+syntax, `for`/destructuring/equality interactions) and a discoverability footgun (users reach for
+`{}` first). The index-signature form is the smaller change, tightens the already-discoverable `{}`
+type, and is exactly the String-keyed shape the RAPTOR maps need. Non-String-keyed maps can be
+revisited later as an addition.
+
+**Known limitations / follow-ups**: a flat-scalar value `T` is now stored **unboxed** and reads back
+`T`-width-correct (see "Flat-scalar value unboxing" above — both the old "values are boxed" and the
+old "an `Int32` stored into a `{ String: Int64 }` reads back tagged Int32" limitations are now
+resolved for flat-scalar maps). A **non-scalar** `T` (String/Array/Object/nested-Map/union) is still
+stored boxed (the proven `object.rs` value RC discipline). `fromJson<{String:T}>` is not a v1 decode
+target (the decoder produces a `LinObject`, not a `LinMap` — the descriptor writer treats `Map` as
+accept-any only for match exhaustiveness); `keys`/`values`/`entries` over a map are hash-order, not
+insertion-order. A `var`-local map that goes out of scope inside a recursive function is not released
+at scope exit (a **pre-existing**, representation-independent IR-lowering gap — reproduces on the
+boxed String-valued path too; unrelated to unboxing).
+
 ## ADR-081: Large `Json` objects get a lazy O(1) hash side-index (RAPTOR #4b)
 
 **Decision**: `Json` objects keep their association-list `entries` buffer as the source of truth, but
@@ -1736,8 +1865,8 @@ object grows past a threshold (`HASH_INDEX_THRESHOLD = 16` entries). The change 
 discoverable* `{}` type with zero surface-language change, no small-object perf change, and no codegen
 ABI change. A dedicated `Map<K,V>` runtime/stdlib type (proposal option b) was rejected as the *first*
 move because users reach for `{}` first and would keep hitting the wall; it remains a possible additive
-follow-up for non-string keys. (See the separate `docs/proposals/typed-map-index-signature.md` for the
-typed-map *surface syntax* direction, which is orthogonal to this runtime representation.)
+follow-up for non-string keys. (See ADR-082 for the typed-map `{ String: T }` *surface syntax*
+direction, which is orthogonal to this runtime representation.)
 
 **Correctness/safety**: the index stores **only `u32` slot indices — never refcounted pointers** — so a
 bug here is structurally outside the UAF/double-free class that `object.rs` is otherwise prone to; the

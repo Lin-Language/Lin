@@ -1131,6 +1131,47 @@ impl<'ctx> Codegen<'ctx> {
                             temp_map.insert(*dst, result);
                         }
                         Instruction::MakeObject { dst, fields, spreads, ty } => {
+                            // Typed index-signature map `{ String: T }` (ADR-082): allocate a hashed
+                            // `LinMap` and set each literal field via `lin_map_set` (key = interned
+                            // LinString, value = boxed TaggedVal). The checker only produces a
+                            // `Type::Map` MakeObject for spread-free string-keyed literals (incl. the
+                            // common empty `{}`), so there are no spreads to merge here.
+                            if let Type::Map(elem_ty) = ty {
+                                let cap = i32_ty.const_int(fields.len().max(1) as u64, false);
+                                let map_ptr = self.builder
+                                    .call(self.rt.map_alloc, &[cap.into()], "ir_map")
+                                    .try_as_basic_value().unwrap_basic().into_pointer_value();
+                                for (key, val_temp) in fields.iter() {
+                                    if let Some(&val) = temp_map.get(val_temp) {
+                                        let key_str = self.compile_string_lit(key).into_pointer_value();
+                                        let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
+                                        // Flat-scalar `T` (ADR-082 follow-up): store the scalar UNBOXED
+                                        // via a stack TaggedVal carrying `T`'s tag/payload, widening a
+                                        // narrower literal value to `T` first. No heap box, no RC.
+                                        let tagged = if Self::is_flat_scalar(elem_ty.as_ref()) {
+                                            let coerced = if &val_ty == elem_ty.as_ref() {
+                                                val
+                                            } else {
+                                                self.compile_ir_coerce(val, &val_ty, elem_ty.as_ref())
+                                            };
+                                            self.build_tagged_val_alloca(&coerced, elem_ty.as_ref())
+                                        } else if Self::is_union_type(&val_ty) && val.is_pointer_value() {
+                                            // A union/Json value is already a TaggedVal* — pass through
+                                            // (lin_map_set retains its inner).
+                                            val.into_pointer_value()
+                                        } else {
+                                            // A heap `T` (String/Array/Object/Map): a STACK TaggedVal,
+                                            // exactly as before. lin_map_set retains the inner so the
+                                            // slot owns its own reference; the literal temp keeps its
+                                            // own +1 (released at scope exit). UNCHANGED RC behaviour.
+                                            self.build_tagged_val_alloca(&val, &val_ty)
+                                        };
+                                        self.builder.call(self.rt.map_set, &[map_ptr.into(), key_str.into(), tagged.into()], "");
+                                    }
+                                }
+                                temp_map.insert(*dst, map_ptr.into());
+                                continue;
+                            }
                             // Sealed record (Stages 1–2): allocate the packed struct and store each
                             // field by offset — no string keys, no per-field box. Only a no-spread
                             // literal whose field set EXACTLY matches the type qualifies (a spread

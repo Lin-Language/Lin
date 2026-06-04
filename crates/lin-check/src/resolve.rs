@@ -52,6 +52,12 @@ fn resolve_type_inner(
             }
             Ok(Type::object(resolved))
         }
+        TypeExpr::IndexSig(value, _span) => {
+            // `{ String: T }` — a typed index-signature object type (ADR-082). Distinct from a
+            // fixed record; backed by the hashed `LinMap` at runtime.
+            let val_ty = resolve_type_inner(value, env, visiting)?;
+            Ok(Type::Map(Box::new(val_ty)))
+        }
         TypeExpr::TaggedUnion(variants, _span) => {
             let resolved: Result<Vec<Type>, String> =
                 variants.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
@@ -184,6 +190,7 @@ fn expand_named_body(
         }),
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(expand_named_body(inner, env, visiting)?))),
         Type::Stream(inner) => Ok(Type::Stream(Box::new(expand_named_body(inner, env, visiting)?))),
+        Type::Map(v) => Ok(Type::Map(Box::new(expand_named_body(v, env, visiting)?))),
         other => Ok(other.clone()),
     }
 }
@@ -282,6 +289,7 @@ fn substitute(
         }),
         Type::Iterator(inner) => Ok(Type::Iterator(Box::new(substitute(inner, params, args, env, visiting)?))),
         Type::Stream(inner) => Ok(Type::Stream(Box::new(substitute(inner, params, args, env, visiting)?))),
+        Type::Map(v) => Ok(Type::Map(Box::new(substitute(v, params, args, env, visiting)?))),
         _ => Ok(ty.clone()),
     }
 }
