@@ -2142,6 +2142,13 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // borrows the boxed value and reads a static descriptor — no ownership change, so the
             // `val_temp` boxing is the same one the former HasPattern path used.
             if let TypedPattern::TypeCheckDeep(target, named_defs, _) = pattern {
+                // FAST PATH (same soundness rule as the match-arm case): a closed
+                // concrete union scrutinee guarantees the value conforms to exactly
+                // one variant, so a cheap discriminator selects V without the
+                // recursive `MatchesSchema` re-validation. Falls back otherwise.
+                if let Some(disc) = union_discriminator(&val_ty, target, named_defs) {
+                    return emit_discriminator(&disc, val_temp, &val_ty, builder);
+                }
                 let dst = builder.alloc_temp(Type::Bool);
                 builder.emit(Instruction::MatchesSchema {
                     dst,
@@ -3952,6 +3959,249 @@ fn lower_short_circuit(
 }
 
 // -------------------------------------------------------------------------
+// Union-variant discrimination (perf, closed-concrete-union fast path)
+//
+// `is V` over an object type normally lowers to a RECURSIVE `MatchesSchema`
+// runtime call that re-validates every field of V (and nested types). That is
+// REDUNDANT precisely when the scrutinee's STATIC TYPE is a *closed concrete
+// union* — `Type::Union(variants)` (optionally with Null) where every non-Null
+// variant resolves to a concrete `Type::Object` containing NO TypeVar/Json
+// anywhere. In that case the value is already type-guaranteed to conform to
+// exactly one variant, so `is V` only needs to DISTINGUISH V from its siblings,
+// not re-validate V's fields.
+//
+// SOUNDNESS: this is sound IFF the scrutinee really is such a closed concrete
+// union. For `Json`/`TypeVar`/any-typevar/open-or-non-object unions, the full
+// `MatchesSchema` is mandatory (ADR-054 narrowing depends on it). When in doubt
+// we return `None` and the caller emits the existing `MatchesSchema`.
+// -------------------------------------------------------------------------
+
+/// A proven-minimal discriminator that uniquely selects a target variant among
+/// the sibling variants of a closed concrete union.
+///
+/// NOTE: ONLY a `StrLit` value comparison is sound here. Field-PRESENCE is NOT,
+/// because Lin objects are structurally width-subtyped: a value conforming to a
+/// SIBLING variant may legally carry the discriminating field as an EXTRA field
+/// (verified: a `{kind,op,left,right,value}` literal type-checks as the BinOp
+/// variant of `Num | BinOp`). Presence-of-`value` would then misclassify that
+/// BinOp value as Num and the narrowed arm would read its `value` at the wrong
+/// type — the exact silent-wrong-field-read the recursive `MatchesSchema` exists
+/// to prevent. A StrLit discriminant forces the variants to be genuinely DISJOINT
+/// (no value can carry two distinct StrLit values at the same key), so a value in
+/// the union with `key == value` cannot inhabit any sibling — making the cheap
+/// equality test exactly equivalent to the recursive validation. See report.
+enum Discriminator {
+    /// `scrut[key] == value` — the target's `key` field is a `StrLit(value)` and
+    /// every sibling's `key` is a StrLit with a DISTINCT value.
+    StrLit { key: String, value: String },
+}
+
+/// Resolve a (possibly `Named`) type to its concrete `Object` field map using
+/// the resolved `named_defs` bodies carried by `TypeCheckDeep`. Returns `None`
+/// for any non-object, or a Named not in `named_defs`.
+fn resolve_object_fields<'a>(
+    ty: &'a Type,
+    named_defs: &'a [(String, Type)],
+) -> Option<&'a indexmap::IndexMap<String, Type>> {
+    resolve_object_fields_bounded(ty, named_defs, 0)
+}
+
+fn resolve_object_fields_bounded<'a>(
+    ty: &'a Type,
+    named_defs: &'a [(String, Type)],
+    depth: usize,
+) -> Option<&'a indexmap::IndexMap<String, Type>> {
+    // A bare alias chain `A = B = …` is finite; cap depth to defend against a
+    // pathological cyclic alias (`A = B; B = A`) rather than recursing forever.
+    if depth > 64 {
+        return None;
+    }
+    match ty {
+        Type::Object(fields) => Some(fields),
+        Type::Named(n) => {
+            let body = &named_defs.iter().find(|(k, _)| k == n)?.1;
+            resolve_object_fields_bounded(body, named_defs, depth + 1)
+        }
+        _ => None,
+    }
+}
+
+/// Unfold a `Named` alias chain to the type it points at (typically a `Union`),
+/// using the resolved `named_defs` bodies. Returns the input unchanged for any
+/// non-`Named` type or an unresolvable/cyclic `Named`. Bounded against alias
+/// cycles.
+fn resolve_union_alias<'a>(ty: &'a Type, named_defs: &'a [(String, Type)], depth: usize) -> &'a Type {
+    if depth > 64 {
+        return ty;
+    }
+    match ty {
+        Type::Named(n) => match named_defs.iter().find(|(k, _)| k == n) {
+            Some((_, body)) => resolve_union_alias(body, named_defs, depth + 1),
+            None => ty,
+        },
+        _ => ty,
+    }
+}
+
+/// Resolve `ty` through `Named` bodies for a contains-type-var check. Returns
+/// `true` if the resolved type contains any TypeVar/Json (so NOT fast-path-safe),
+/// or references a `Named` we cannot resolve (conservative). `seen` guards against
+/// cyclic recursive types (e.g. `Expr = Num | Add` where `Add` references `Expr`):
+/// a `Named` already on the resolution stack is a safe cycle, not a TypeVar.
+fn variant_has_type_var(ty: &Type, named_defs: &[(String, Type)], seen: &mut Vec<String>) -> bool {
+    match ty {
+        Type::Named(n) => {
+            if seen.contains(n) {
+                // Cyclic recursive reference — already being resolved; not a TypeVar.
+                return false;
+            }
+            match named_defs.iter().find(|(k, _)| k == n) {
+                Some((_, body)) => {
+                    seen.push(n.clone());
+                    let r = variant_has_type_var(body, named_defs, seen);
+                    seen.pop();
+                    r
+                }
+                // A Named we couldn't resolve — be conservative.
+                None => true,
+            }
+        }
+        Type::Object(fields) => fields.values().any(|t| variant_has_type_var(t, named_defs, seen)),
+        Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner) => {
+            variant_has_type_var(inner, named_defs, seen)
+        }
+        Type::FixedArray(elems) => elems.iter().any(|t| variant_has_type_var(t, named_defs, seen)),
+        Type::Union(vs) => vs.iter().any(|t| variant_has_type_var(t, named_defs, seen)),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(|t| variant_has_type_var(t, named_defs, seen))
+                || variant_has_type_var(ret, named_defs, seen)
+        }
+        Type::TypeVar(_) => true,
+        _ => false,
+    }
+}
+
+/// Decide whether `is target` over a scrutinee of static type `scrut_ty` may use
+/// the cheap discriminator fast path, and if so which discriminator. Returns
+/// `None` (→ caller emits `MatchesSchema`) whenever the fast path is not PROVEN
+/// sound or no single-field-class discriminator uniquely selects `target`.
+fn union_discriminator(
+    scrut_ty: &Type,
+    target: &Type,
+    named_defs: &[(String, Type)],
+) -> Option<Discriminator> {
+    // The scrutinee must be a (closed) union — possibly behind a `Named` alias
+    // (e.g. `type Ast = Num | BinOp`; `e: Ast` carries `Type::Named("Ast")`).
+    // Unfold the alias through `named_defs` to find the underlying union.
+    let resolved_scrut = resolve_union_alias(scrut_ty, named_defs, 0);
+    // Strip a Null member.
+    let variants: Vec<&Type> = match resolved_scrut {
+        Type::Union(vs) => vs.iter().filter(|v| !matches!(v, Type::Null)).collect(),
+        _ => return None,
+    };
+    if variants.len() < 2 {
+        return None;
+    }
+    // EVERY non-Null variant must resolve to a concrete object with no TypeVar.
+    let mut resolved: Vec<&indexmap::IndexMap<String, Type>> = Vec::with_capacity(variants.len());
+    for v in &variants {
+        if variant_has_type_var(v, named_defs, &mut Vec::new()) {
+            return None;
+        }
+        match resolve_object_fields(v, named_defs) {
+            Some(fields) if !fields.is_empty() => resolved.push(fields),
+            // A non-object variant (or empty object) means we cannot prove the
+            // value already conforms to an object-shaped variant → keep full.
+            _ => return None,
+        }
+    }
+    // The target must be a concrete object.
+    if variant_has_type_var(target, named_defs, &mut Vec::new()) {
+        return None;
+    }
+    let target_fields = resolve_object_fields(target, named_defs)?;
+
+    // The ONLY sound discriminator: a field F where the target's F is a `StrLit`
+    // and EVERY variant of the union carries F as a `StrLit`, with EXACTLY ONE
+    // variant's F equal to the target's value (the rest distinct). Requiring a
+    // distinct StrLit on every variant at F makes the variants genuinely disjoint
+    // there, so `scrut[F] == tval` ⇔ "conforms to the target". (This is identified
+    // purely by the discriminant VALUES, independent of how the variants' other
+    // fields are represented — `Named("Expr")` vs an expanded `Union` for a
+    // recursive type — so a recursive AST union is handled correctly.)
+    //
+    // NOTE: field-PRESENCE is deliberately NOT a discriminator here: Lin objects
+    // are structurally width-subtyped, so a value conforming to a sibling variant
+    // may legally carry the discriminating field as an EXTRA field, which would
+    // misclassify it. Only a value-equality on a StrLit field is sound.
+    'keys: for (key, tty) in target_fields.iter() {
+        let Type::StrLit(tval) = tty else { continue };
+        let mut eq_count = 0usize;
+        for var in &resolved {
+            match var.get(key) {
+                Some(Type::StrLit(sval)) => {
+                    if sval == tval {
+                        eq_count += 1;
+                    }
+                }
+                // A variant lacks the key, or carries a non-StrLit (base String)
+                // there: `scrut[key] == tval` is not provably exclusive of it.
+                _ => continue 'keys,
+            }
+        }
+        if eq_count == 1 {
+            return Some(Discriminator::StrLit { key: key.clone(), value: tval.clone() });
+        }
+    }
+
+    // No SOUND discriminator. Fall back to the full recursive `MatchesSchema`.
+    None
+}
+
+/// Emit the IR for a chosen `Discriminator` over the boxed scrutinee `scrut`,
+/// returning the Bool result temp. Reuses the existing `Index`+`Eq` machinery —
+/// no new instructions.
+fn emit_discriminator(
+    disc: &Discriminator,
+    scrut: Temp,
+    scrut_ty: &Type,
+    builder: &mut FuncBuilder,
+) -> Temp {
+    match disc {
+        Discriminator::StrLit { key, value } => {
+            builder.push_scope();
+            // got = scrut[key]
+            let key_temp = builder.const_temp(Const::Str(key.clone()));
+            let got = builder.alloc_temp(Type::TypeVar(u32::MAX));
+            builder.emit(Instruction::Index {
+                dst: got,
+                object: scrut,
+                key: key_temp,
+                obj_ty: scrut_ty.clone(),
+                key_ty: Type::Str,
+                result_ty: Type::TypeVar(u32::MAX),
+            });
+            // lit = box("value")
+            let lit_raw = builder.const_temp(Const::Str(value.clone()));
+            let lit = box_to_json(lit_raw, &Type::Str, builder);
+            let eq = builder.alloc_temp(Type::Bool);
+            builder.emit(Instruction::Binary {
+                dst: eq,
+                op: BinOp::Eq,
+                lhs: got,
+                rhs: lit,
+                operand_ty: Type::TypeVar(u32::MAX),
+                ty: Type::Bool,
+            });
+            // `eq` is a Bool (not RC) so it survives; transient RC temps (fetched
+            // field, boxed literal) are released in this scope.
+            builder.pop_scope_releasing(Temp(u32::MAX));
+            eq
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
 // Match lowering
 // -------------------------------------------------------------------------
 
@@ -3986,8 +4236,9 @@ fn lower_match(
             builder.alloc_block(format!("arm_{}_next", i))
         };
 
-        // Test the pattern.
-        let matched = lower_match_pattern(&arm.pattern, scrut_temp, &arm.body, builder, ctx);
+        // Test the pattern. `scrut_ty` is threaded so a closed-concrete-union
+        // scrutinee can take the cheap discriminator fast path for an `is V` arm.
+        let matched = lower_match_pattern(&arm.pattern, scrut_temp, &scrut_ty, &arm.body, builder, ctx);
 
         match matched {
             PatternTest::Always => {
@@ -4086,6 +4337,7 @@ enum PatternTest {
 fn lower_match_pattern(
     pattern: &TypedMatchPattern,
     scrut: Temp,
+    scrut_ty: &Type,
     _body: &TypedExpr,
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
@@ -4146,6 +4398,15 @@ fn lower_match_pattern(
         // Deep-validate field types recursively via the `fromJson` structural walker (ADR-054).
         // `scrut` is the already-boxed scrutinee; `MatchesSchema` borrows it (no ownership change).
         TypedMatchPattern::Is(TypedPattern::TypeCheckDeep(target, named_defs, _)) => {
+            // FAST PATH: when the scrutinee's static type is a closed concrete union
+            // the value is type-guaranteed to conform to exactly one variant, so a
+            // cheap discriminator (StrLit field value / field presence) suffices to
+            // SELECT V — the recursive `MatchesSchema` re-validation is redundant.
+            // Falls back to `MatchesSchema` whenever the fast path isn't proven sound.
+            if let Some(disc) = union_discriminator(scrut_ty, target, named_defs) {
+                let cond = emit_discriminator(&disc, scrut, scrut_ty, builder);
+                return PatternTest::Cond(cond);
+            }
             let dst = builder.alloc_temp(Type::Bool);
             builder.emit(Instruction::MatchesSchema {
                 dst,
