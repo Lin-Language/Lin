@@ -28,7 +28,9 @@ impl<'ctx> Codegen<'ctx> {
                 self.context.ptr_type(AddressSpace::default()).into()
             }
             Type::Array(_) | Type::FixedArray(_) => self.array_ptr_type.into(),
-            Type::Object(_) => self.context.ptr_type(AddressSpace::default()).into(),
+            // Stage 0.5: codegen IGNORES the `sealed` marker — every object, sealed or not, is the
+            // boxed string-keyed `LinObject` pointer, exactly as before. Stage 1 will branch here.
+            Type::Object { .. } => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Union(_) => {
                 // Tagged union: { i8 tag, [8 x i8] payload } — 9 bytes total.
                 // We use an opaque pointer to a heap-allocated tagged value.
@@ -102,7 +104,7 @@ impl<'ctx> Codegen<'ctx> {
                 | Type::StrLit(_)
                 | Type::Array(_)
                 | Type::FixedArray(_)
-                | Type::Object(_)
+                | Type::Object { .. }
                 | Type::Function { .. }
         )
     }
@@ -130,7 +132,7 @@ impl<'ctx> Codegen<'ctx> {
             // Both float widths box as f64 bits (see doc above).
             Type::Float32 | Type::Float64 => TAG_FLOAT64,
             Type::Str | Type::StrLit(_) => TAG_STR,
-            Type::Object(_) => TAG_OBJECT,
+            Type::Object { .. } => TAG_OBJECT,
             Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => TAG_ARRAY,
             Type::Function { .. } => TAG_FUNCTION,
             _ => TAG_NULL,
@@ -203,7 +205,7 @@ impl<'ctx> Codegen<'ctx> {
         let tag: u8 = match ty {
             Type::Null | Type::Bool | Type::Int8 | Type::Int16 | Type::Int32
             | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::Int64 | Type::UInt64
-            | Type::Float32 | Type::Float64 | Type::Str | Type::StrLit(_) | Type::Object(_)
+            | Type::Float32 | Type::Float64 | Type::Str | Type::StrLit(_) | Type::Object { .. }
             | Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) | Type::Function { .. } => {
                 Self::type_tag(ty)
             }

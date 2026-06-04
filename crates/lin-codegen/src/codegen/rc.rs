@@ -13,7 +13,7 @@ impl<'ctx> Codegen<'ctx> {
         match ty {
             Type::Str | Type::StrLit(_) => { self.builder.call(self.rt.string_release, &[ptr.into()], ""); }
             Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => { self.builder.call(self.rt.array_release, &[ptr.into()], ""); }
-            Type::Object(_) => { self.builder.call(self.rt.object_release, &[ptr.into()], ""); }
+            Type::Object { .. } => { self.builder.call(self.rt.object_release, &[ptr.into()], ""); }
             Type::Function { .. } => { self.builder.call(self.rt.closure_release, &[ptr.into()], ""); }
             Type::TypeVar(_) | Type::Union(_) => { self.builder.call(self.rt.tagged_release, &[ptr.into()], ""); }
             // Stream<T> is a boxed TaggedVal*(TAG_STREAM); its release dispatches the tag-aware

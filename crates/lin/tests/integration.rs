@@ -11080,3 +11080,39 @@ print(describe(null))
 "#);
     assert_eq!(out, vec!["ok=9", "null"]);
 }
+
+// Stage 0.5 sealed-records run-equivalence: a NAMED record type now carries an (inert) `sealed`
+// marker through resolution, while anonymous object literals do not. This test proves the marker
+// is BEHAVIOR-INERT: a named-typed value and a structurally-equal anonymous literal still
+// inter-operate exactly as before — assign across in BOTH directions, pass into the named param
+// position, read fields, and compare equal (including a WIDER literal with an extra field, which
+// structural compatibility still permits). See SEALED_RECORDS_DESIGN.md §5 (Stage 0.5).
+#[test]
+fn test_sealed_marker_is_inert_named_vs_anonymous_interop() {
+    let out = run(r#"
+import { print } from "std/io"
+type Point = { "x": Int32, "y": Int32 }
+
+val dist = (p: Point): Int32 => p["x"] + p["y"]
+
+// A named-typed binding.
+val named: Point = { "x": 1, "y": 2 }
+// An anonymous literal whose inferred (unsealed) type still flows into a named Point slot.
+val fromAnon: Point = { "x": 4, "y": 5 }
+// A WIDER anonymous literal (extra field) is still structurally compatible at the param.
+val wide = { "x": 10, "y": 20, "extra": 99 }
+
+print("named=${dist(named)}")
+print("fromAnon=${dist(fromAnon)}")
+print("wide=${dist(wide)}")
+// Equality holds across a named value and an anonymous literal of identical fields.
+val anon = { "x": 1, "y": 2 }
+print("eq=${named == anon}")
+// The wider value keeps its extra field outside the call (source is untouched).
+print("extra=${wide["extra"]}")
+"#);
+    assert_eq!(
+        out,
+        vec!["named=3", "fromAnon=9", "wide=30", "eq=true", "extra=99"]
+    );
+}

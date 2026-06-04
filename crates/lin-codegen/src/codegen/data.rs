@@ -173,7 +173,7 @@ impl<'ctx> Codegen<'ctx> {
                 // round-trips it. (Storing a native 4-byte f32 cell under TAG_FLOAT64 would have
                 // the runtime read 8 bytes including 4 undefined bytes → garbage.)
                 let cell = match val_ty {
-                    Type::Str | Type::StrLit(_) | Type::Array(_) | Type::Object(_) | Type::Iterator(_) | Type::Function { .. } => {
+                    Type::Str | Type::StrLit(_) | Type::Array(_) | Type::Object { .. } | Type::Iterator(_) | Type::Function { .. } => {
                         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
                         let cell = self.builder.alloca(ptr_ty, "arr_cell");
                         self.builder.store(cell, val);
@@ -500,7 +500,7 @@ impl<'ctx> Codegen<'ctx> {
             }
         };
         match obj_ty {
-            Type::Object(_) | Type::Named(_) => {
+            Type::Object { .. } | Type::Named(_) => {
                 if obj.is_pointer_value() && key.is_pointer_value() {
                     let key_str = resolve_obj_key(self, key);
                     self.emit_object_set(obj, key_str, value, val_ty);

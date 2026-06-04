@@ -125,7 +125,7 @@ impl<'ctx> Codegen<'ctx> {
                     ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(f, &[val.into()], "atos").try_as_basic_value().unwrap_basic()
             }
-            Type::Object(_) => {
+            Type::Object { .. } => {
                 let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
                 let f = self.get_or_declare_fn("lin_object_to_string",
                     ptr_ty.fn_type(&[ptr_ty.into()], false));
@@ -187,7 +187,7 @@ impl<'ctx> Codegen<'ctx> {
                             i64_ty.fn_type(&[ptr_ty.into()], false));
                         self.builder.call(len_fn, &[arg.into()], "ir_alen").try_as_basic_value().unwrap_basic()
                     }
-                    Type::Object(_) | Type::Named(_) => {
+                    Type::Object { .. } | Type::Named(_) => {
                         let obj_len_fn = self.get_or_declare_fn("lin_object_length",
                             i64_ty.fn_type(&[ptr_ty.into()], false));
                         self.builder.call(obj_len_fn, &[arg.into()], "ir_olen").try_as_basic_value().unwrap_basic()
@@ -1223,7 +1223,7 @@ impl<'a> DescEncoder<'a> {
                     self.patch_u32(slot, off);
                 }
             }
-            Type::Object(fields) => {
+            Type::Object { fields, .. } => {
                 self.put_u8(KIND_OBJECT);
                 self.put_u32(fields.len() as u32);
                 // Header rows are variable-length (inline keys), so emit each row then its value

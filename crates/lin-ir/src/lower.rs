@@ -935,7 +935,7 @@ impl FuncBuilder {
 fn is_rc_type(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. }
+        Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Function { .. }
     )
 }
 
@@ -1212,7 +1212,7 @@ fn type_is_streamish_ir(ty: &Type) -> bool {
 fn is_heap_ty(ty: &Type) -> bool {
     matches!(
         ty,
-        Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Iterator(_)
+        Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Iterator(_)
     )
 }
 
@@ -4017,7 +4017,7 @@ fn resolve_object_fields_bounded<'a>(
         return None;
     }
     match ty {
-        Type::Object(fields) => Some(fields),
+        Type::Object { fields, .. } => Some(fields),
         Type::Named(n) => {
             let body = &named_defs.iter().find(|(k, _)| k == n)?.1;
             resolve_object_fields_bounded(body, named_defs, depth + 1)
@@ -4066,7 +4066,7 @@ fn variant_has_type_var(ty: &Type, named_defs: &[(String, Type)], seen: &mut Vec
                 None => true,
             }
         }
-        Type::Object(fields) => fields.values().any(|t| variant_has_type_var(t, named_defs, seen)),
+        Type::Object { fields, .. } => fields.values().any(|t| variant_has_type_var(t, named_defs, seen)),
         Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner) => {
             variant_has_type_var(inner, named_defs, seen)
         }
@@ -5160,7 +5160,7 @@ fn lower_function_expr_with_id(
             capture_kinds.push(match &cap.ty {
                 Type::Str | Type::StrLit(_) => CaptureRelease::Str,
                 Type::Array(_) | Type::FixedArray(_) => CaptureRelease::Array,
-                Type::Object(_) => CaptureRelease::Object,
+                Type::Object { .. } => CaptureRelease::Object,
                 Type::Function { .. } => CaptureRelease::Closure,
                 // is_rc_type covers exactly the above; any other owning type is union (handled).
                 _ => CaptureRelease::None,

@@ -132,7 +132,7 @@ impl Checker {
                     self.collect_named_defs(v, seen, out);
                 }
             }
-            Type::Object(fields) => {
+            Type::Object { fields, .. } => {
                 for v in fields.values() {
                     self.collect_named_defs(v, seen, out);
                 }

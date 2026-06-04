@@ -1,7 +1,7 @@
 use indexmap::IndexMap;
 use std::fmt;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Type {
     Null,
     Bool,
@@ -23,7 +23,22 @@ pub enum Type {
     StrLit(String),
     Array(Box<Type>),
     FixedArray(Vec<Type>),
-    Object(IndexMap<String, Type>),
+    /// A structural object type. `sealed` is an INERT representation marker (Stage 0.5 of the
+    /// sealed-records design, `docs/SEALED_RECORDS_DESIGN.md` §5): it is `true` ONLY when this
+    /// object originates from resolving a NAMED record-type declaration (`type T = { … }`) in
+    /// `resolve.rs`, and `false` for every anonymous object literal type, inferred structural
+    /// type, and built-in structural alias (e.g. `Error`).
+    ///
+    /// CRITICAL: the flag is invisible to structural compatibility (`compat.rs` ignores it) AND
+    /// to `Type` equality — `PartialEq` for `Type` is implemented manually below to ignore
+    /// `sealed`, so `Object(f, true) == Object(f, false)`. This keeps union dedup/flatten,
+    /// narrowing, exhaustiveness, zonk, and cache identity behaving exactly as before the flag
+    /// existed. Codegen ignores it entirely (no representation change). Stage 1 will be the first
+    /// consumer. Construct via `Type::object(fields)` (unsealed) / `Type::sealed_object(fields)`.
+    Object {
+        fields: IndexMap<String, Type>,
+        sealed: bool,
+    },
     Union(Vec<Type>),
     Function {
         params: Vec<Type>,
@@ -58,7 +73,64 @@ pub enum Type {
     Named(String),
 }
 
+/// Manual `PartialEq` for `Type`. Identical to the previous `#[derive(PartialEq)]` in EVERY
+/// arm EXCEPT `Object`, where the `sealed` representation marker is deliberately ignored:
+/// `Object { fields, sealed: true } == Object { fields, sealed: false }`. This guarantees that
+/// adding the Stage-0.5 sealed flag cannot perturb any equality-driven behavior (union
+/// dedup/flatten via `Vec::contains`, narrowing/exhaustiveness comparisons, `temp_types`
+/// identity, zonk fixpoints, cache keys). The flag rides along structurally but is invisible to
+/// `==`. See `docs/SEALED_RECORDS_DESIGN.md` §5 (Stage 0.5) and ADR-051 (the `StrLit` precedent).
+impl PartialEq for Type {
+    fn eq(&self, other: &Self) -> bool {
+        use Type::*;
+        match (self, other) {
+            (Null, Null)
+            | (Bool, Bool)
+            | (Int8, Int8)
+            | (Int16, Int16)
+            | (Int32, Int32)
+            | (Int64, Int64)
+            | (UInt8, UInt8)
+            | (UInt16, UInt16)
+            | (UInt32, UInt32)
+            | (UInt64, UInt64)
+            | (Float32, Float32)
+            | (Float64, Float64)
+            | (Str, Str)
+            | (Never, Never) => true,
+            (StrLit(a), StrLit(b)) => a == b,
+            (Array(a), Array(b)) => a == b,
+            (FixedArray(a), FixedArray(b)) => a == b,
+            // Ignore `sealed`: structural identity is the field map only.
+            (Object { fields: a, .. }, Object { fields: b, .. }) => a == b,
+            (Union(a), Union(b)) => a == b,
+            (
+                Function { params: p1, ret: r1, required: req1 },
+                Function { params: p2, ret: r2, required: req2 },
+            ) => p1 == p2 && r1 == r2 && req1 == req2,
+            (Iterator(a), Iterator(b)) => a == b,
+            (Shared(a), Shared(b)) => a == b,
+            (Stream(a), Stream(b)) => a == b,
+            (TypeVar(a), TypeVar(b)) => a == b,
+            (Named(a), Named(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 impl Type {
+    /// Construct an UNSEALED structural object type (the default: anonymous literals, inferred
+    /// shapes, built-in aliases). See the `Object` variant docs for the `sealed` semantics.
+    pub fn object(fields: IndexMap<String, Type>) -> Type {
+        Type::Object { fields, sealed: false }
+    }
+
+    /// Construct a SEALED object type — used ONLY when unfolding a named record-type declaration
+    /// in `resolve.rs`. Inert in Stage 0.5 (codegen ignores it).
+    pub fn sealed_object(fields: IndexMap<String, Type>) -> Type {
+        Type::Object { fields, sealed: true }
+    }
+
     /// Construct a function type with no default arguments (`required == params.len()`).
     pub fn func(params: Vec<Type>, ret: Type) -> Type {
         let required = params.len();
@@ -153,7 +225,7 @@ impl Type {
             Type::Array(inner) | Type::Iterator(inner) | Type::Stream(inner) => inner.contains_type_var(),
             Type::FixedArray(elems) => elems.iter().any(|t| t.contains_type_var()),
             Type::Union(variants) => variants.iter().any(|t| t.contains_type_var()),
-            Type::Object(fields) => fields.values().any(|t| t.contains_type_var()),
+            Type::Object { fields, .. } => fields.values().any(|t| t.contains_type_var()),
             Type::Function { params, ret, .. } => {
                 params.iter().any(|t| t.contains_type_var()) || ret.contains_type_var()
             }
@@ -225,7 +297,7 @@ impl fmt::Display for Type {
                 }
                 write!(f, "]")
             }
-            Type::Object(fields) => {
+            Type::Object { fields, .. } => {
                 write!(f, "{{ ")?;
                 for (i, (k, v)) in fields.iter().enumerate() {
                     if i > 0 {

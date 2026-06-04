@@ -92,7 +92,7 @@ impl Checker {
                                 lin_parse::ast::Pattern::Ident(n, _) => Some(n.clone()),
                                 _ => None,
                             }).unwrap_or_default();
-                            let field_ty = if let Type::Object(ref obj_fields) = ty {
+                            let field_ty = if let Type::Object { fields: ref obj_fields, .. } = ty {
                                 obj_fields.get(&key).cloned().unwrap_or(Type::Null)
                             } else { Type::TypeVar(u32::MAX) };
                             let slot = match &f.pattern {

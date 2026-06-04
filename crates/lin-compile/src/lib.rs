@@ -316,7 +316,11 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
 /// below changes. A bump invalidates every existing `.typed`/`.sig` entry: the embedded stamp no
 /// longer matches, so a stale entry written by an older binary is rejected (not silently
 /// bincode-deserialized into a wrong-but-structurally-valid struct).
-const CACHE_FORMAT_VERSION: u32 = 1;
+// Bumped to 2: Stage 0.5 of sealed-records changed `Type::Object` from a tuple variant
+// `Object(IndexMap)` to a struct variant `Object { fields, sealed }`, altering the bincode
+// layout of every serialized `Type`. A `.typed`/`.sig` written by a v1 binary must be rejected
+// rather than mis-deserialized. See docs/SEALED_RECORDS_DESIGN.md §5 invariant 4.
+const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Magic prefix written at the head of every `.typed`/`.sig` cache file. Combined with the
 /// compiler version and `CACHE_FORMAT_VERSION`, this is the on-disk compatibility stamp checked
