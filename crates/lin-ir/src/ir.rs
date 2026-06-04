@@ -362,6 +362,12 @@ pub enum Instruction {
     IndexSet { object: Temp, key: Temp, value: Temp, obj_ty: Type, key_ty: Type, val_ty: Type },
     /// result = object.field  — known-shape field access
     FieldGet { dst: Temp, object: Temp, field: String, obj_ty: Type, result_ty: Type },
+    /// result = array[index].field — FUSED constant-offset read of a SCALAR field of element
+    /// `index` of a sealed-record array (sealed-records Stage 3). Avoids materializing a standalone
+    /// sealed struct for the element: codegen GEPs `data + index*stride + (field_off - HEADER)` and
+    /// loads the scalar directly. `arr_ty` is the `Array(elem)` type (so codegen recovers the
+    /// element fields/stride); `result_ty` is the field's type. Sound only for SCALAR fields (no RC).
+    SealedArrayFieldGet { dst: Temp, array: Temp, index: Temp, field: String, arr_ty: Type, result_ty: Type },
     /// result = env[index]  — load a captured value from a closure's environment struct
     /// (raw pointer load at byte offset 8 + index*8), NOT a Lin object field access.
     EnvCapture { dst: Temp, env: Temp, index: u32, ty: Type },

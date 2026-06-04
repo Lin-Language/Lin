@@ -254,6 +254,39 @@ impl<'ctx> Codegen<'ctx> {
         (offset + 7) / 8 * 8
     }
 
+    // Note: the sealed-record-array `elem_tag` sentinel (0xFE) is set by the runtime
+    // (`lin_runtime::array::SEALED_ARRAY_TAG`) inside `lin_sealed_array_alloc`; codegen never reads
+    // it (all sealed-array ops dispatch on the STATIC element type via `sealed_array_elem`), so no
+    // codegen-side constant is needed.
+
+    /// Per-element byte STRIDE of a sealed-record array: the struct payload WITHOUT the 16-byte
+    /// header (the array owns the elements, so no per-element header), padded to 8 so successive
+    /// elements stay 8-aligned. Equals `sealed_struct_size - SEALED_HEADER`.
+    pub(crate) fn sealed_array_stride(fields: &indexmap::IndexMap<String, Type>) -> u64 {
+        Self::sealed_struct_size(fields) - Self::SEALED_HEADER
+    }
+
+    /// THE sealed-record-ARRAY gate (sealed-records Stage 3). Returns `Some(fields)` iff `ty` is an
+    /// `Array(elem)` (or `FixedArray`) whose element is an ALL-SCALAR sealed record — the high-value,
+    /// lowest-RC-risk case (no per-element heap fields, so array drop is a single free). FAIL SAFE:
+    /// arrays of heap-field sealed records, anonymous-record arrays, union/Json/opaque-element
+    /// arrays, and non-arrays all return `None` (→ keep the boxed/flat path). Stage 3b (heap-field
+    /// element records) is intentionally NOT yet accepted here.
+    pub(crate) fn sealed_array_elem(ty: &Type) -> Option<&indexmap::IndexMap<String, Type>> {
+        let elem = match ty {
+            Type::Array(e) => e.as_ref(),
+            _ => return None,
+        };
+        let fields = Self::sealed_fields(elem)?;
+        // Stage 3 scope: ALL fields must be scalars (no heap fields). A heap field would need
+        // per-element per-field RC on array drop/overwrite — deferred to Stage 3b.
+        if fields.values().all(Self::is_sealed_scalar_field) {
+            Some(fields)
+        } else {
+            None
+        }
+    }
+
     /// Returns true when the element type maps to a flat unboxed scalar array.
     /// Only concrete fixed-width numeric scalars qualify — not Bool (stored as i1,
     /// awkward to pack densely), not pointers, not unions.

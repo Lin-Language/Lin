@@ -115,6 +115,16 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(box_map_fn, &[val.into()], "boxmap")
                     .try_as_basic_value().unwrap_basic()
             }
+            // A SEALED-RECORD ARRAY (Stage 3) is a contiguous unboxed buffer (elem_tag 0xFE), NOT a
+            // tagged/flat array the dynamic Json machinery (lin_array_get_tagged / lin_to_string /
+            // lin_tagged_eq / combinators) can read. At the Json boundary MATERIALIZE it to a tagged
+            // `Object[]` (each element → a boxed LinObject) via the per-type element materializer,
+            // then box the tagged array. This is the fail-safe boxed view (§3 boundary).
+            Type::Array(_) if val.is_pointer_value() && Self::sealed_array_elem(val_ty).is_some() => {
+                let tagged = self.sealed_array_to_tagged(val, val_ty);
+                self.builder.call(self.rt.box_array, &[tagged.into()], "boxsarr")
+                    .try_as_basic_value().unwrap_basic()
+            }
             Type::Array(_) if val.is_pointer_value() => {
                 // Box the LinArray* directly (flat or tagged). The elem_tag field in LinArray
                 // lets runtime functions (lin_array_get_tagged, lin_push_dyn, etc.) dispatch

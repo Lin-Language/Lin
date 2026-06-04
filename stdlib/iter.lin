@@ -23,6 +23,11 @@ val push = (arr: Json, item: Json): Null =>
 // opaque `Json` (this wrapper accepts ANY iterable — Array/Iterator/Stream — through a bare `Json`,
 // exactly as before); ONLY the index param's `Int32` type is added so a user's unannotated index
 // param infers `Int32` rather than `Json`.
+//
+// `for` is deliberately NOT made `<T>` over the iterable union: it is the universal iteration driver
+// used over `Json`-typed sources (e.g. a `Json[]` of promise handles consumed as `p => …await(p)…`),
+// and a generic element pin there mis-monomorphizes the callback's closure ABI (observed in
+// examples/concurrency). The boxed `Json` element is the correct, representation-stable path here.
 export val for = (iterable: Json, f: (Json, Int32) => Json): Null =>
   lin_for(iterable, f)
 
@@ -51,16 +56,24 @@ export val rangeStep = (start: Int32, end: Int32, step: Int32): Json =>
   else
     lin_iter(() => start, i => false, i => i, i => i)
 
+// `iterOf` builds an OPAQUE Iterator handle from an array; the element type is erased into the
+// iterator (it does not appear in the result), and `iterOf([])` is a legitimate empty-iterator use
+// where a `<T>` param would be uninferable. So this stays on `Json` — the iterator's element type
+// is recovered at the consuming combinator (`for`/`map`/…), not pinned here.
 export val iterOf = (arr: Json) =>
   lin_iter(() => 0, i => i < length(arr), i => i + 1, i => arr[i])
 
 export val iter = (init: Json, hasNext: Json, next: Json, value: Json) =>
   lin_iter(init, hasNext, next, value)
 
-// Concatenate two arrays. Dispatches on the runtime element type so two flat arrays
-// of the same type (e.g. UInt8[] ++ UInt8[]) yield a flat array — byte-level consumers
-// (u32FromBe, fs writes, FFI) then read packed bytes, not boxed TaggedVal elements.
-// Mixed/tagged element types yield a Json[].
+// Concatenate two iterables. Dispatches on the runtime element type so two flat arrays of the same
+// type (e.g. UInt8[] ++ UInt8[]) yield a flat array — byte-level consumers (u32FromBe, fs writes,
+// FFI) then read packed bytes, not boxed TaggedVal elements. Mixed/tagged element types yield a
+// Json[]. Stays `Json` (NOT `<T>`): `concat` legitimately MIXES element types (e.g. a `UInt8[]`
+// with a `String[]` → tagged Json[]), which a single `<T>` over both operands cannot express; and a
+// stream pipeline (`s.lines().concat(other.lines())`) flows through this `Json` param while the
+// name-based streamish dispatch still re-types the result to `Stream` and redirects the IR to
+// `lin_stream_concat`. (See the audit's "concat may stay wider" note.)
 export val concat = (a: Json, b: Json): Json =>
   lin_array_concat_dyn(a, b)
 
@@ -94,11 +107,16 @@ export val reduce = <T, U>(arr: T[] | Iterator | Stream, init: U, f: (U, T, Int3
 // (`(item, i) => …`); a 1-arg callback stays valid via arity-width subtyping. We thread an `idx`
 // counter and call `f(item, idx)` — the checker PADS a user's 1-arg lambda to 2 params (an unused
 // trailing `Int32`), so the call always matches the closure's true arity (no ABI mismatch). The
-// element stays the opaque `Json` (these wrappers operate on a bare `Json` iterable, exactly as
-// before — keeping their boxed monomorphization); ONLY the callback's index param gains its `Int32`
-// type so a user's unannotated index infers `Int32`. The INNER `lin_while`/`for` callbacks below
-// are 1-arg over `item` and do not use the index.
-export val find = (arr: Json, f: (Json, Int32) => Boolean): Json =>
+// INNER `lin_while`/`for` callbacks below are 1-arg over `item` and do not use the index.
+//
+// Each iterable is the `T[] | Iterator | Stream` union (a `Stream` is accepted; the opaque Stream
+// type does NOT flow into a bare `Json` param), and the element type `T` flows from the `T[]` arm
+// into the callback's `item` so a user's unannotated `item` infers `T`. `Iterator`/`Stream` are
+// written WITHOUT a type argument (= `Iterator<Json>`/`Stream<Json>`): the array `T[]` arm carries
+// the element-type inference, and the source formatter cannot round-trip a parametric
+// `Iterator<T>`. The array-shaped RETURN annotation (`T[]`) is what `streamish_combinator_ret` reads
+// to re-wrap a stream receiver as the next `Stream<T>` node, so it is kept explicit.
+export val find = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): T | Null =>
   var found = null
   var idx = 0
   lin_while(arr, item =>
@@ -108,7 +126,7 @@ export val find = (arr: Json, f: (Json, Int32) => Boolean): Json =>
   )
   found
 
-export val some = (arr: Json, f: (Json, Int32) => Boolean): Boolean =>
+export val some = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): Boolean =>
   var result = false
   var idx = 0
   lin_while(arr, item =>
@@ -118,7 +136,7 @@ export val some = (arr: Json, f: (Json, Int32) => Boolean): Boolean =>
   )
   result
 
-export val every = (arr: Json, f: (Json, Int32) => Boolean): Boolean =>
+export val every = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): Boolean =>
   var result = true
   var idx = 0
   lin_while(arr, item =>
@@ -128,6 +146,12 @@ export val every = (arr: Json, f: (Json, Int32) => Boolean): Boolean =>
   )
   result
 
+// `flatMap` maps each element to an inner iterable and concatenates the results. It stays on the
+// opaque `Json` element type (NOT `<T>`): the input element and the flattened output element
+// genuinely differ, and a concrete-`U` generic monomorphization corrupts heap (String/Array)
+// elements through the per-element push path — the boxed `Json` monomorphization is the correct one
+// for this mixing combinator (the same reason the audit flags `flatMap`/`concat` as "may stay
+// wider"). The callback's `Int32` index param is preserved.
 export val flatMap = (arr: Json, f: (Json, Int32) => Json): Json =>
   val result = []
   var idx = 0
@@ -138,7 +162,7 @@ export val flatMap = (arr: Json, f: (Json, Int32) => Json): Json =>
   )
   result
 
-export val take = (arr: Json, n: Int32): Json =>
+export val take = <T>(arr: T[] | Iterator | Stream, n: Int32): T[] =>
   val end = if n < length(arr) then n else length(arr)
   val result = lin_array_allocate(end)
   var i = 0
@@ -149,7 +173,7 @@ export val take = (arr: Json, n: Int32): Json =>
   )
   result
 
-export val drop = (arr: Json, n: Int32): Json =>
+export val drop = <T>(arr: T[] | Iterator | Stream, n: Int32): T[] =>
   val result = []
   val start = if n < length(arr) then n else length(arr)
   var i = 0
@@ -159,7 +183,7 @@ export val drop = (arr: Json, n: Int32): Json =>
   )
   result
 
-export val takeWhile = (arr: Json, f: (Json, Int32) => Boolean): Json =>
+export val takeWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): T[] =>
   val result = []
   var idx = 0
   lin_while(arr, item =>
@@ -170,7 +194,7 @@ export val takeWhile = (arr: Json, f: (Json, Int32) => Boolean): Json =>
   )
   result
 
-export val dropWhile = (arr: Json, f: (Json, Int32) => Boolean): Json =>
+export val dropWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): T[] =>
   val result = []
   var dropping = true
   var idx = 0
@@ -182,5 +206,6 @@ export val dropWhile = (arr: Json, f: (Json, Int32) => Boolean): Json =>
   )
   result
 
-export val flatten = (arr: Json): Json =>
+// `flatten` collapses one level of nesting: an array of `T[]` becomes `T[]`.
+export val flatten = <T>(arr: T[][]): T[] =>
   arr.flatMap(x => x)

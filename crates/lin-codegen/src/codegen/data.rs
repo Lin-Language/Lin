@@ -322,6 +322,17 @@ impl<'ctx> Codegen<'ctx> {
             } else {
                 return ptr_ty.const_null().into();
             };
+            // Sealed-record array element (Stage 3): `arr[i]` yields a whole sealed-record value.
+            // Materialize a FRESH standalone sealed struct (header + payload copied) so the result
+            // is an ownable +1 value the standard retain/release/field-read machinery handles. The
+            // hot `arr[i].field` access never reaches here (it is fused upstream to a direct scalar
+            // load); this path covers `val p = arr[i]` / passing an element as a whole value.
+            if Self::sealed_array_elem(obj_ty).is_some() {
+                if let Some(fields) = Self::sealed_fields(result_ty) {
+                    let fields = fields.clone();
+                    return self.sealed_array_materialize_elem(container, idx, &fields);
+                }
+            }
             // Flat scalar element: read the unboxed scalar directly (mirrors AST `flat_array_get`).
             // A fixed-length array (`[T1, T2, ...]`) is always stored TAGGED — its positional
             // element types are heterogeneous — so even when the result type is a scalar the
@@ -582,11 +593,22 @@ impl<'ctx> Codegen<'ctx> {
             }
             Type::Array(elem) => {
                 let idx = self.index_value_to_i64(key);
+                // Sealed-record array element (Stage 3): copy the element struct's payload into the
+                // slot (`lin_sealed_array_set` releases the old element's heap fields and retains the
+                // new ones; a scalar-only record is a straight overwrite). `value` is a sealed
+                // struct ptr; it stays owned by its caller (released at scope exit).
+                if Self::sealed_array_elem(obj_ty).is_some() {
+                    let ptr_ty = self.context.ptr_type(AddressSpace::default());
+                    let i64_ty = self.context.i64_type();
+                    let set_fn = self.get_or_declare_fn("lin_sealed_array_set",
+                        self.context.void_type().fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
+                    self.builder.call(set_fn, &[obj.into(), idx.into(), value.into()], "");
+                }
                 // Flat scalar element AND the value already has the matching scalar type ⇒ inline a
                 // bounds-checked raw store (no box + cross-staticlib `lin_array_set` round-trip).
                 // A differing scalar width/kind would need the runtime's value conversion, so fall
                 // back. A FixedArray is always stored tagged (heterogeneous slots) — handled below.
-                if Self::is_flat_scalar(elem) && elem.as_ref() == val_ty {
+                else if Self::is_flat_scalar(elem) && elem.as_ref() == val_ty {
                     self.flat_array_set(obj, idx, value, val_ty);
                 } else {
                     self.emit_array_set(obj, idx, value, val_ty);
@@ -739,6 +761,235 @@ impl<'ctx> Codegen<'ctx> {
         // The declared result_ty may be a wider numeric than the stored field (e.g. field Int32
         // read into an Int64 slot); reconcile via the standard coerce.
         if &fld_ty == result_ty { loaded } else { self.compile_ir_coerce(loaded, &fld_ty, result_ty) }
+    }
+
+    /// FUSED `arr[idx].field` over a SEALED-RECORD ARRAY (Stage 3): a single constant-offset scalar
+    /// load directly from the contiguous, header-less element — no per-element struct
+    /// materialization. The element payload begins at `data + idx*stride`; the field lives at the
+    /// struct-relative `sealed_field_layout` offset MINUS `SEALED_HEADER` (array elements are
+    /// header-less). Bounds-checked inline (Python-style negative index; OOB defers to the runtime
+    /// `lin_sealed_array_elem_ptr` so the fault message is byte-identical). `arr_ty` is `Array(elem)`.
+    /// LinArray layout: len u64 @ byte 8, data ptr @ byte 24, elem_stride u64 @ byte 32.
+    pub(crate) fn compile_ir_sealed_array_field_get(
+        &mut self,
+        arr: BasicValueEnum<'ctx>,
+        idx: BasicValueEnum<'ctx>,
+        field: &str,
+        arr_ty: &Type,
+        result_ty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        let Some(fields) = Self::sealed_array_elem(arr_ty) else {
+            return ptr_ty.const_null().into();
+        };
+        let fields = fields.clone();
+        let (field_off, _total) = Self::sealed_field_layout(&fields, field);
+        let payload_off = field_off - Self::SEALED_HEADER;
+        let fld_ty = fields.get(field).cloned().unwrap_or(Type::Null);
+        let llvm_fld = self.llvm_type(&fld_ty);
+        let arr_ptr = arr.into_pointer_value();
+
+        // Normalise idx to i64.
+        let idx = if idx.is_int_value() {
+            let iv = idx.into_int_value();
+            if iv.get_type().get_bit_width() == 64 { iv } else { self.builder.int_s_extend(iv, i64_ty, "sarr_idx64") }
+        } else {
+            self.unbox_value(idx, &Type::Int64).into_int_value()
+        };
+
+        // len = *(u64*)(arr + 8); stride = *(u64*)(arr + 32); data = *(ptr*)(arr + 24)
+        let len_ptr = unsafe { self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(8, false)], "sarr_len_p") };
+        let len = self.builder.load(i64_ty, len_ptr, "sarr_len").into_int_value();
+        let zero = i64_ty.const_zero();
+        let is_neg = self.builder.int_compare(IntPredicate::SLT, idx, zero, "sarr_idx_neg");
+        let wrapped = self.builder.int_add(len, idx, "sarr_idx_wrap");
+        let actual = self.builder.build_select(is_neg, wrapped, idx, "sarr_idx_actual").unwrap().into_int_value();
+        let oob = self.builder.int_compare(IntPredicate::UGE, actual, len, "sarr_oob");
+
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let ok_b = self.context.append_basic_block(llvm_fn, "sarr_ok");
+        let oob_b = self.context.append_basic_block(llvm_fn, "sarr_oob");
+        self.builder.conditional_branch(oob, oob_b, ok_b);
+
+        // Cold OOB path: defer to the runtime accessor with the ORIGINAL index for the identical
+        // fault message; it does not return.
+        self.builder.position_at_end(oob_b);
+        let elem_fn = self.get_or_declare_fn("lin_sealed_array_elem_ptr",
+            ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+        self.builder.call(elem_fn, &[arr_ptr.into(), idx.into()], "sarr_oob_call");
+        self.builder.unreachable();
+
+        // Fast path: stride = *(u64*)(arr+32); data = *(ptr*)(arr+24);
+        //            field_ptr = data + actual*stride + payload_off; load.
+        self.builder.position_at_end(ok_b);
+        let stride_ptr = unsafe { self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(32, false)], "sarr_stride_p") };
+        let stride = self.builder.load(i64_ty, stride_ptr, "sarr_stride").into_int_value();
+        let data_pp = unsafe { self.builder.gep(self.context.i8_type(), arr_ptr, &[i64_ty.const_int(24, false)], "sarr_data_pp") };
+        let data = self.builder.load(ptr_ty, data_pp, "sarr_data").into_pointer_value();
+        let elem_off = self.builder.int_mul(actual, stride, "sarr_elem_off");
+        let total_off = self.builder.int_add(elem_off, i64_ty.const_int(payload_off, false), "sarr_fld_off");
+        let fld_p = unsafe { self.builder.gep(self.context.i8_type(), data, &[total_off], "sarr_fld_p") };
+        let loaded = self.builder.load(llvm_fld, fld_p, "sarr_fld");
+        if &fld_ty == result_ty { loaded } else { self.compile_ir_coerce(loaded, &fld_ty, result_ty) }
+    }
+
+    /// Project a wider/Json/`Object[]` source array (`src`, statically `src_ty`) into a FRESH
+    /// SEALED-RECORD ARRAY of `arr_ty`'s element type (sealed-records Stage 3 boundary, §3.2). Builds
+    /// a new contiguous sealed array and, per element, reads the source element as a boxed value,
+    /// projects it into the element record's struct layout, and copies the projected payload into the
+    /// sealed slot. Non-mutating; `src` keeps its own ownership. Rare path; correctness over speed.
+    pub(crate) fn sealed_array_project_from(&mut self, src: BasicValueEnum<'ctx>, src_ty: &Type, arr_ty: &Type) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        let fields = match Self::sealed_array_elem(arr_ty) {
+            Some(f) => f.clone(),
+            None => return ptr_ty.const_null().into(),
+        };
+        let stride = Self::sealed_array_stride(&fields);
+        let desc = self.sealed_descriptor(&fields);
+        // Unbox the source to a raw LinArray* if it is a boxed Json/union value.
+        let src_raw = if Self::is_union_type(src_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[src.into()], "sarrp_unbox").try_as_basic_value().unwrap_basic()
+        } else { src };
+        // len = lin_array_length(src_raw)
+        let len_fn = self.get_or_declare_fn("lin_array_length", i64_ty.fn_type(&[ptr_ty.into()], false));
+        let len = self.builder.call(len_fn, &[src_raw.into()], "sarrp_len").try_as_basic_value().unwrap_basic().into_int_value();
+        // out = lin_sealed_array_alloc(len, stride, desc)
+        let alloc_fn = self.get_or_declare_fn("lin_sealed_array_alloc",
+            ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into()], false));
+        let out = self.builder.call(alloc_fn, &[len.into(), i64_ty.const_int(stride, false).into(), desc.into()], "sarrp_out")
+            .try_as_basic_value().unwrap_basic();
+        let push_fn = self.get_or_declare_fn("lin_sealed_array_push_struct_retaining",
+            self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+        let get_tagged = self.get_or_declare_fn("lin_array_get_tagged", ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+        // Loop i in [0, len): proj = project(boxed src[i]); push proj payload (retaining heap fields).
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let head = self.context.append_basic_block(llvm_fn, "sarrp_head");
+        let body = self.context.append_basic_block(llvm_fn, "sarrp_body");
+        let done = self.context.append_basic_block(llvm_fn, "sarrp_done");
+        let idx_slot = self.builder.alloca(i64_ty, "sarrp_i");
+        self.builder.store(idx_slot, i64_ty.const_zero());
+        self.builder.unconditional_branch(head);
+        self.builder.position_at_end(head);
+        let i = self.builder.load(i64_ty, idx_slot, "sarrp_iv").into_int_value();
+        let cond = self.builder.int_compare(IntPredicate::SLT, i, len, "sarrp_cond");
+        self.builder.conditional_branch(cond, body, done);
+        self.builder.position_at_end(body);
+        let elem_box = self.builder.call(get_tagged, &[src_raw.into(), i.into()], "sarrp_get").try_as_basic_value().unwrap_basic();
+        // Project the boxed element (a Json TaggedVal*) into the element record's struct layout.
+        let proj = self.sealed_project_from(elem_box, &Type::TypeVar(u32::MAX), &fields);
+        self.builder.call(push_fn, &[out.into(), proj.into()], "");
+        // Release the projected struct (its heap fields were retained into the slot) and the boxed
+        // element (lin_array_get_tagged returns a fresh +1 box).
+        self.emit_sealed_release(proj, &fields);
+        if elem_box.is_pointer_value() {
+            self.builder.call(self.rt.tagged_release, &[elem_box.into()], "");
+        }
+        let next = self.builder.int_add(i, i64_ty.const_int(1, false), "sarrp_next");
+        self.builder.store(idx_slot, next);
+        self.builder.unconditional_branch(head);
+        self.builder.position_at_end(done);
+        out
+    }
+
+    /// Materialize a whole SEALED-RECORD ARRAY into a tagged `Object[]` `LinArray*` (the Json view).
+    /// Emits a per-element-type materializer thunk and calls `lin_sealed_array_to_tagged`. The
+    /// thunk reads each element's header-less payload and builds a fresh boxed `LinObject`. Used at
+    /// the Json boundary (boxing / dynamic ops) where the contiguous unboxed buffer can't be read by
+    /// the dynamic machinery.
+    pub(crate) fn sealed_array_to_tagged(&mut self, arr: BasicValueEnum<'ctx>, arr_ty: &Type) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let fields = match Self::sealed_array_elem(arr_ty) {
+            Some(f) => f.clone(),
+            None => return arr,
+        };
+        let mat = self.sealed_array_elem_materializer(&fields);
+        let to_tagged = self.get_or_declare_fn("lin_sealed_array_to_tagged",
+            ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+        self.builder.call(to_tagged, &[arr.into(), mat.as_global_value().as_pointer_value().into()], "sarr_tagged")
+            .try_as_basic_value().unwrap_basic()
+    }
+
+    /// Emit (and cache) a per-sealed-type element materializer thunk `(payload_ptr) -> *LinObject`:
+    /// reads each field from the HEADER-LESS element payload (struct offset minus `SEALED_HEADER`),
+    /// boxes it, and `object_set_fresh`'s it under the interned key — producing a fresh +1 boxed
+    /// object. Mirrors `sealed_materialize_to_object` but the source is a payload pointer, not a
+    /// standalone struct. Scalar-only (Stage 3): no per-field RC to balance (the boxed scalar shell
+    /// is reclaimed by object_set_fresh's retain + a tagged_release).
+    fn sealed_array_elem_materializer(&mut self, fields: &indexmap::IndexMap<String, Type>) -> inkwell::values::FunctionValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        let i32_ty = self.context.i32_type();
+        // Cache key by the field layout (offsets + types reflected via stride + names).
+        let key = format!("__sealedarrmat_{}_{}",
+            Self::sealed_array_stride(fields),
+            fields.iter().map(|(k, t)| format!("{}_{:?}", k, Self::type_tag(t))).collect::<Vec<_>>().join("_"));
+        if let Some(f) = self.module.get_function(&key) {
+            return f;
+        }
+        // Save the current insertion point; the thunk is a separate function.
+        let saved_block = self.builder.get_insert_block();
+        let fn_ty = ptr_ty.fn_type(&[ptr_ty.into()], false);
+        let func = self.module.add_function(&key, fn_ty, None);
+        let entry = self.context.append_basic_block(func, "entry");
+        self.builder.position_at_end(entry);
+        let payload = func.get_nth_param(0).unwrap().into_pointer_value();
+        let new_obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(fields.len() as u64, false).into()], "smat_obj")
+            .try_as_basic_value().unwrap_basic().into_pointer_value();
+        for (k, fty) in fields.iter() {
+            let (off, _) = Self::sealed_field_layout(fields, k);
+            let payload_off = off - Self::SEALED_HEADER;
+            let llvm_fld = self.llvm_type(fty);
+            let p = unsafe { self.builder.gep(self.context.i8_type(), payload, &[i64_ty.const_int(payload_off, false)], "smat_fld_p") };
+            let loaded = self.builder.load(llvm_fld, p, "smat_fld");
+            let boxed = self.box_value(loaded, fty);
+            let key_str = self.compile_string_lit(k).into_pointer_value();
+            self.builder.call(self.rt.object_set_fresh, &[new_obj.into(), key_str.into(), boxed.into()], "");
+            // Scalar field: reclaim the cache-safe box shell (no inner heap).
+            if boxed.is_pointer_value() {
+                self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+            }
+        }
+        self.builder.build_return(Some(&new_obj)).unwrap();
+        if let Some(b) = saved_block {
+            self.builder.position_at_end(b);
+        }
+        func
+    }
+
+    /// Materialize element `idx` of a sealed-record array as a FRESH standalone sealed struct (+1
+    /// owned): allocate the struct, then byte-copy the element's `stride`-byte payload (from
+    /// `lin_sealed_array_elem_ptr`) into the struct payload region (offset `SEALED_HEADER`). For a
+    /// SCALAR-only record this is a complete copy with no per-field RC. Used for `arr[i]` as a whole
+    /// value (the fused `arr[i].field` read never reaches here).
+    pub(crate) fn sealed_array_materialize_elem(
+        &mut self,
+        arr: BasicValueEnum<'ctx>,
+        idx: inkwell::values::IntValue<'ctx>,
+        fields: &indexmap::IndexMap<String, Type>,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        let total = Self::sealed_struct_size(fields);
+        let stride = Self::sealed_array_stride(fields);
+        let desc = self.sealed_descriptor(fields);
+        // Fresh +1 sealed struct.
+        let obj = self.builder.call(self.rt.sealed_alloc,
+            &[i64_ty.const_int(total, false).into(), desc.into()], "sarr_mat")
+            .try_as_basic_value().unwrap_basic().into_pointer_value();
+        // Element payload source pointer (bounds-checked in the runtime).
+        let elem_fn = self.get_or_declare_fn("lin_sealed_array_elem_ptr",
+            ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+        let src = self.builder.call(elem_fn, &[arr.into(), idx.into()], "sarr_mat_src")
+            .try_as_basic_value().unwrap_basic().into_pointer_value();
+        // dst payload begins at obj + SEALED_HEADER.
+        let dst = unsafe {
+            self.builder.gep(self.context.i8_type(), obj, &[i64_ty.const_int(Self::SEALED_HEADER, false)], "sarr_mat_dst")
+        };
+        self.builder.build_memcpy(dst, 8, src, 8, i64_ty.const_int(stride, false))
+            .expect("sealed_array_materialize_elem memcpy");
+        obj.into()
     }
 
     /// Allocate a fresh sealed record (carrying its field descriptor) and store each field by
