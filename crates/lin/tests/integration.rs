@@ -1248,6 +1248,82 @@ print(toString(mmul))
 }
 
 #[test]
+fn test_dynamic_json_arith_missing_key_faults() {
+    // #5: dynamic `Json` arithmetic where an operand is a missing object key. The key reads
+    // as `Null` at runtime; the static path already rejects `Int32 + Null`, but two boxed
+    // `Json` operands type-check, so the runtime previously read the null payload as 0 and
+    // silently produced `5 + null = 5` / `5 * null = 0`. It must now FAULT with a clear
+    // message (not silently garble, and NOT invent JS NaN) — mirroring array-OOB faulting.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_json_arith_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_json_arith_{}", id));
+    fs::write(&src_path, r#"import { print } from "std/io"
+import { toString } from "std/string"
+val run = (): Null =>
+  val obj: Json = { "a": 5 }
+  val x: Json = obj["b"]
+  val sum: Json = obj["a"] + x
+  print(toString(sum))
+run()
+"#).unwrap();
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let _ = fs::remove_file(&src_path);
+    assert!(compile.status.success(), "compilation failed:\n{}",
+        String::from_utf8_lossy(&compile.stderr));
+    let run_out = Command::new(&bin_path).output().expect("failed to run compiled binary");
+    let _ = fs::remove_file(&bin_path);
+    assert!(!run_out.status.success(),
+        "dynamic Json arithmetic with a missing (Null) key must fault (non-zero exit)");
+    let stderr = String::from_utf8_lossy(&run_out.stderr);
+    assert!(stderr.contains("dynamic Json operands") && stderr.contains("Null"),
+        "expected a clear Json-arithmetic runtime fault naming Null, got stderr:\n{}", stderr);
+    // And it must NOT have printed a silently-garbled numeric result on stdout.
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    assert!(stdout.trim().is_empty(),
+        "must not silently produce a numeric result before faulting, got stdout:\n{}", stdout);
+}
+
+#[test]
+fn test_dynamic_json_arith_present_keys_still_works() {
+    // The fault must be narrow: arithmetic over two PRESENT numeric Json keys is unaffected.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val run = (): Null =>
+  val obj: Json = { "a": 5, "b": 3 }
+  print(toString(obj["a"] + obj["b"]))
+  print(toString(obj["a"] * obj["b"]))
+run()
+"#);
+    assert_eq!(output, vec!["8", "15"]);
+}
+
+#[test]
+fn test_dynamic_json_arith_fault_catchable_in_async() {
+    // A Json-arithmetic fault raised inside an async thunk unwinds to the boundary and is
+    // caught as an `Error` (proving lin_tagged_arith's `extern "C-unwind"` ABI), exactly like
+    // a division-by-zero / OOB fault inside a boundary.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await } from "std/async"
+val run = (): Null =>
+  val obj: Json = { "a": 5 }
+  val p = async((): Json =>
+    val x: Json = obj["b"]
+    obj["a"] + x
+  )
+  val r = await(p)
+  if r is Error then print("caught") else print(toString(r))
+run()
+"#);
+    assert_eq!(output, vec!["caught"]);
+}
+
+#[test]
 fn test_float32_widens_to_float64() {
     // A Float32 must widen to Float64 (fpext) across every numeric context, per spec §21
     // (widening is always to a type that represents both). Codegen's Coerce had no
