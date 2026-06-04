@@ -168,15 +168,24 @@ but a documented divergence worth a lint or a defined `Json` numeric-coercion ru
 
 ---
 
-## 7. [CORRECTNESS] multi-line `if/else` is unparseable inside parentheses; `lin fmt` creates exactly that
+## 7. [CORRECTNESS] multi-line `if/else` is unparseable inside parentheses (one parser bug)
 
-**Severity: high — two linked bugs; the formatter emits code it cannot re-parse.**
+**Severity: high — the parser rejects valid, canonical Lin.**
 
 A **wrapped (multi-line) `if … then <newline> A <newline> else <newline> B`** expression
 fails to parse with `unexpected token Else` when it appears **inside parentheses** — e.g.
 as the RHS of a `val` inside a `.for(... => …)` closure body. The exact same wrapped
 `if/else` parses fine in a plain (non-parenthesized) function body, and the **one-line**
 form parses fine everywhere, including inside the parens.
+
+This is **one bug, in the parser** — not a formatter bug. `lin fmt` wrapping a long
+`if/else` onto multiple lines is correct, idiomatic behaviour (it's the canonical shape
+that parses everywhere outside parens); the formatter is emitting valid-looking Lin. The
+fault is entirely that the parser cannot accept that valid shape inside parens. A
+hand-written wrapped `if/else` inside a `.for(...)` fails identically with no formatter
+involved. Forcing the formatter to keep `if/else` inline inside parens would be a
+workaround that hides the parser hole and yields inconsistent formatting — once the
+parser is fixed, the formatter's existing output just works, untouched.
 
 Minimal repro (fails: `unexpected token Else`):
 ```lin
@@ -201,14 +210,15 @@ at the `else`. The fix is analogous to dot-chaining across newlines (ADR-006): t
 `then`/`else` continuation should use save/restore newline lookahead rather than depend on
 suppressed INDENT/DEDENT.
 
-**Second bug (formatter):** `lin fmt` takes a one-line `if/else` (which parses everywhere)
-and *wraps* it onto multiple lines even inside parens, producing the unparseable form. This
-broke `raptor.lin` and `stringResults.lin` when the RAPTOR `lin/` dir was formatted (2 files
-unbuildable, 4 unit-test files failed). Until the parser is fixed, the formatter must keep
-`if/else` inline when it is inside a `( ) [ ] { }` span. The corpus round-trip gate that is
-supposed to catch non-meaning-preserving output evidently doesn't cover a wrapped
-`if/else` inside a parenthesized closure.
+**How it surfaced:** `lin fmt` wraps a long one-line `if/else` onto multiple lines (correct
+behaviour), which inside a parenthesized closure hits the parser bug — so formatting
+`raptor.lin` and `stringResults.lin` produced unparseable output (2 files unbuildable, 4
+unit-test files failed). That's a symptom of the parser gap, not a formatter defect. It
+does mean the **corpus round-trip gate** that is supposed to catch the formatter producing
+non-reparseable output has a hole: it evidently doesn't cover a wrapped `if/else` inside a
+parenthesized closure, so adding such a fixture would have caught this and will guard the
+fix.
 
 NOTE: the committed RAPTOR `lin/` files are intentionally NOT `lin fmt`-clean, because
-running the formatter over them corrupts them via this bug. Fix #7 before formatting that
-directory (and before relying on CI's `fmt --check` over `benchmarks/`).
+running the formatter over them trips this parser bug. Fix #7 (the parser) before
+formatting that directory (and before relying on CI's `fmt --check` over `benchmarks/`).
