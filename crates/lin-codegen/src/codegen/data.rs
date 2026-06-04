@@ -173,7 +173,7 @@ impl<'ctx> Codegen<'ctx> {
                 // round-trips it. (Storing a native 4-byte f32 cell under TAG_FLOAT64 would have
                 // the runtime read 8 bytes including 4 undefined bytes → garbage.)
                 let cell = match val_ty {
-                    Type::Str | Type::StrLit(_) | Type::Array(_) | Type::Object(_) | Type::Iterator(_) | Type::Function { .. } => {
+                    Type::Str | Type::StrLit(_) | Type::Array(_) | Type::Object { .. } | Type::Iterator(_) | Type::Function { .. } => {
                         let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
                         let cell = self.builder.alloca(ptr_ty, "arr_cell");
                         self.builder.store(cell, val);
@@ -500,7 +500,7 @@ impl<'ctx> Codegen<'ctx> {
             }
         };
         match obj_ty {
-            Type::Object(_) | Type::Named(_) => {
+            Type::Object { .. } | Type::Named(_) => {
                 if obj.is_pointer_value() && key.is_pointer_value() {
                     let key_str = resolve_obj_key(self, key);
                     self.emit_object_set(obj, key_str, value, val_ty);
@@ -586,8 +586,304 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    // ───────────────────────── Sealed records (Stages 1–2) ─────────────────────────
+    //
+    // A sealed record (gate: `Codegen::sealed_fields`) is a packed heap struct
+    // `[ u32 rc | u32 size | u64 desc_ptr | fields… ]` allocated by `lin_sealed_alloc`, with fields
+    // at the natural-aligned byte offsets `Codegen::sealed_field_layout` computes (declaration
+    // order). Scalar fields are stored inline; HEAP fields (String/Array/nested-sealed, Stage 2)
+    // are stored as an 8-byte owned (+1) pointer slot. The LLVM value is an opaque `ptr` (so it
+    // flows through the existing object-as-ptr ABI). The descriptor at offset 8 lists the heap
+    // fields so every drop site can release them without the static type (see lin_runtime::sealed).
+
+    /// Emit (and cache) the static field DESCRIPTOR global for a sealed record and return a pointer
+    /// to it (NULL pointer constant when the record has no heap fields — a scalar-only Stage-1
+    /// record). The descriptor is `{ u32 count, { u32 offset, u32 kind } * count }`, listing ONLY
+    /// the heap fields (scalars need no per-field RC). The runtime release/transfer walk it. Cached
+    /// by the field layout so identical sealed types share one descriptor.
+    pub(crate) fn sealed_descriptor(&mut self, fields: &indexmap::IndexMap<String, Type>) -> inkwell::values::PointerValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i32_ty = self.context.i32_type();
+        // Collect (offset, kind) for each heap field, in layout order.
+        let mut heap: Vec<(u64, u32)> = Vec::new();
+        for (k, fty) in fields.iter() {
+            if let Some(kind) = Self::sealed_field_kind(fty) {
+                let (offset, _) = Self::sealed_field_layout(fields, k);
+                heap.push((offset, kind));
+            }
+        }
+        if heap.is_empty() {
+            return ptr_ty.const_null();
+        }
+        // Cache key: the (offset,kind) sequence.
+        let key: String = format!(
+            "__sealeddesc_{}",
+            heap.iter().map(|(o, kd)| format!("{}_{}", o, kd)).collect::<Vec<_>>().join("__")
+        );
+        if let Some(g) = self.module.get_global(&key) {
+            return g.as_pointer_value();
+        }
+        let count_const = i32_ty.const_int(heap.len() as u64, false);
+        // Each entry is two i32s laid out contiguously; model the whole entry block as an [N*2 x i32]
+        // so the in-memory layout is exactly { u32 offset, u32 kind } per entry (8 bytes).
+        let mut words: Vec<inkwell::values::IntValue<'ctx>> = Vec::with_capacity(heap.len() * 2);
+        for (off, kind) in &heap {
+            words.push(i32_ty.const_int(*off, false));
+            words.push(i32_ty.const_int(*kind as u64, false));
+        }
+        let entries_arr = i32_ty.const_array(&words);
+        let desc_ty = self.context.struct_type(&[i32_ty.into(), entries_arr.get_type().into()], false);
+        let desc_val = self.context.const_struct(&[count_const.into(), entries_arr.into()], false);
+        let global = self.module.add_global(desc_ty, None, &key);
+        global.set_initializer(&desc_val);
+        global.set_constant(true);
+        // Plain named constant, no unnamed_addr — same reasoning as emit_capture_descriptor (avoids
+        // the R_X86_64_32S link error from the mergeable .rodata.cstN section under PIE).
+        global.as_pointer_value()
+    }
+
+    /// Load `field` from a sealed record at its constant byte offset — THE win: a single typed load,
+    /// no `lin_object_get` call / hash lookup / unbox. `obj` is the struct ptr. For a HEAP field the
+    /// loaded value is the BORROWED heap pointer (the struct owns it); the IR `FieldGet`/`Index`
+    /// lowering emits the owning `Retain` separately (same contract as a boxed-object field read).
+    pub(crate) fn sealed_field_get(
+        &mut self,
+        obj: BasicValueEnum<'ctx>,
+        field: &str,
+        fields: &indexmap::IndexMap<String, Type>,
+        result_ty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let (offset, _total) = Self::sealed_field_layout(fields, field);
+        let i64_ty = self.context.i64_type();
+        let base = obj.into_pointer_value();
+        let fld_ty = fields.get(field).cloned().unwrap_or(Type::Null);
+        let llvm_fld = self.llvm_type(&fld_ty);
+        let p = unsafe {
+            self.builder.gep(self.context.i8_type(), base, &[i64_ty.const_int(offset, false)], "sealed_fld_p")
+        };
+        let loaded = self.builder.load(llvm_fld, p, "sealed_fld");
+        // The declared result_ty may be a wider numeric than the stored field (e.g. field Int32
+        // read into an Int64 slot); reconcile via the standard coerce.
+        if &fld_ty == result_ty { loaded } else { self.compile_ir_coerce(loaded, &fld_ty, result_ty) }
+    }
+
+    /// Allocate a fresh sealed record (carrying its field descriptor) and store each field by
+    /// offset. `field_vals` are (name, value, value_ty, already_owned) in any order. Returns the
+    /// struct ptr (+1 owned). Scalar fields need no RC. Each HEAP field's payload must end up owned
+    /// by the struct (+1):
+    ///   - `already_owned == true`: the value is a FRESH +1 the caller transfers into the struct
+    ///     (e.g. a projection/materialization the caller produced). Store verbatim, NO retain.
+    ///   - `already_owned == false`: the value is a BORROWED reference (owned by the caller's temp,
+    ///     released at the caller's scope exit). The struct RETAINS it to own its own +1 (mirroring
+    ///     the boxed-object inline construction's per-field `lin_rc_retain`).
+    /// This explicit flag replaces a fragile representation-difference guess — the caller knows the
+    /// ownership of each value it hands in, and getting it wrong is the exact UAF/leak bug class.
+    pub(crate) fn sealed_construct(
+        &mut self,
+        fields: &indexmap::IndexMap<String, Type>,
+        field_vals: &[(String, BasicValueEnum<'ctx>, Type, bool)],
+    ) -> BasicValueEnum<'ctx> {
+        let total = Self::sealed_struct_size(fields);
+        let i64_ty = self.context.i64_type();
+        let desc = self.sealed_descriptor(fields);
+        let obj = self.builder.call(self.rt.sealed_alloc, &[i64_ty.const_int(total, false).into(), desc.into()], "sealed_obj")
+            .try_as_basic_value().unwrap_basic().into_pointer_value();
+        for (name, val, val_ty, already_owned) in field_vals {
+            let (offset, _) = Self::sealed_field_layout(fields, name);
+            let fld_ty = fields.get(name).cloned().unwrap_or(Type::Null);
+            // Convert the supplied value to the field's stored representation if needed. NOTE:
+            // `Type`'s PartialEq IGNORES the `sealed` flag, so an unsealed `{x,y}` literal value
+            // compares EQUAL to a sealed `Pt` field type — but their runtime representations DIFFER
+            // (boxed LinObject vs packed struct). Use the representation-aware `sealed_repr_differs`
+            // (not `!=`) to decide whether to coerce, so a nested sealed field's value is PROJECTED
+            // into the struct layout rather than stored as a raw boxed object (which `release` would
+            // then mis-walk as a sealed struct — the crash this fixes). A coerce that changes
+            // representation produces a FRESH +1, so the stored value is owned regardless of the
+            // caller's flag.
+            let repr_change = Self::sealed_repr_differs(val_ty, &fld_ty);
+            let stored = if repr_change { self.compile_ir_coerce(*val, val_ty, &fld_ty) } else { *val };
+            let p = unsafe {
+                self.builder.gep(self.context.i8_type(), obj, &[i64_ty.const_int(offset, false)], "sealed_set_p")
+            };
+            self.builder.store(p, stored);
+            let owned = *already_owned || repr_change;
+            if Self::sealed_field_kind(&fld_ty).is_some() && !owned && stored.is_pointer_value() {
+                self.builder.call(self.rt.rc_retain, &[stored.into_pointer_value().into()], "sealed_fld_retain");
+            }
+        }
+        obj.into()
+    }
+
+    /// True when storing a value of type `from` into a sealed field of type `to` requires a
+    /// representation-changing coerce (project/materialize → a FRESH +1), as opposed to a verbatim
+    /// pointer store (the value stays BORROWED). REPRESENTATION-AWARE: unlike `Type`'s PartialEq it
+    /// distinguishes a SEALED object from a structurally-equal unsealed/boxed one.
+    ///   - `to` is a SEALED record: a verbatim store is sound ONLY if `from` is the SAME sealed
+    ///     record (same fields AND sealed). An unsealed `{x,y}` or `Json` source MUST be projected.
+    ///   - String↔String, Array↔Array: same runtime pointer representation → no change.
+    ///   - otherwise: a change iff the types differ.
+    fn sealed_repr_differs(from: &Type, to: &Type) -> bool {
+        if let Some(to_fields) = Self::sealed_fields(to) {
+            // Verbatim only when `from` is the identical sealed record (same fields, sealed:true).
+            return match Self::sealed_fields(from) {
+                Some(from_fields) => from_fields != to_fields,
+                None => true, // unsealed/boxed/Json source → project
+            };
+        }
+        if from.is_string_ish() && to.is_string_ish() { return false; }
+        if matches!(from, Type::Array(_) | Type::FixedArray(_)) && matches!(to, Type::Array(_) | Type::FixedArray(_)) {
+            return false;
+        }
+        from != to
+    }
+
+    /// Materialize a sealed record into a fresh boxed `LinObject` (TAG_OBJECT semantics): the
+    /// universal Json representation. Used at the sealed→Json/unsealed boundary so all the existing
+    /// dynamic object machinery (toString/keys/print/dynamic-index/eq-vs-Json) operates unchanged on
+    /// a normal LinObject. Returns the raw `LinObject*` (+1 owned). Each field is loaded by offset,
+    /// boxed, and `lin_object_set_fresh`'d under its interned string key.
+    ///
+    /// RC contract per field: `lin_object_set_fresh` RETAINS the value's inner payload (the object
+    /// takes a +1). For a SCALAR field there is no inner heap, so the fresh box's shell would leak —
+    /// `lin_tagged_release` reclaims it (no-op on the absent inner). For a HEAP field the loaded
+    /// pointer is BORROWED (the struct still owns its original +1); after `object_set_fresh` retains
+    /// the inner (object +1), only the box SHELL is freed (`lin_tagged_free_box`) — NOT
+    /// `lin_tagged_release`, which would also drop the inner and leave the object holding a pointer
+    /// it never accounted for (a use-after-free once the struct releases). The struct keeps its
+    /// reference; the materialized object owns an independent +1. Both balanced.
+    pub(crate) fn sealed_materialize_to_object(
+        &mut self,
+        obj: BasicValueEnum<'ctx>,
+        fields: &indexmap::IndexMap<String, Type>,
+    ) -> BasicValueEnum<'ctx> {
+        let i32_ty = self.context.i32_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let new_obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(fields.len() as u64, false).into()], "sealed_mat")
+            .try_as_basic_value().unwrap_basic().into_pointer_value();
+        let keys: Vec<String> = fields.keys().cloned().collect();
+        let free_box_shell = self.get_or_declare_fn("lin_tagged_free_box", self.context.void_type().fn_type(&[ptr_ty.into()], false));
+        for k in &keys {
+            let fld_ty = fields.get(k).cloned().unwrap_or(Type::Null);
+            let is_heap = Self::sealed_field_kind(&fld_ty).is_some();
+            let v = self.sealed_field_get(obj, k, fields, &fld_ty);
+            // box_value(heap) wraps the BORROWED pointer (no retain); box_value(scalar) wraps the
+            // scalar (cached/heap box). For a nested sealed field, box_value materializes it to its
+            // own boxed LinObject (a fresh +1), which object_set_fresh then retains — handled below.
+            let boxed = self.box_value(v, &fld_ty);
+            let key_str = self.compile_string_lit(k).into_pointer_value();
+            self.builder.call(self.rt.object_set_fresh, &[new_obj.into(), key_str.into(), boxed.into()], "");
+            if boxed.is_pointer_value() {
+                if is_heap {
+                    // A nested SEALED field's box_value produced a FRESH boxed LinObject (+1 inner)
+                    // that object_set_fresh retained (+2 on the materialized inner); full
+                    // tagged_release drops it back to +1 owned by the object, and frees the shell.
+                    // A String/Array field's box wraps a BORROWED inner that object_set_fresh
+                    // retained — free only the shell so the borrowed inner is not dropped.
+                    if matches!(fld_ty, Type::Object { .. }) {
+                        self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                    } else {
+                        self.builder.call(free_box_shell, &[boxed.into()], "");
+                    }
+                } else {
+                    // Scalar: no inner heap — full release reclaims the (cache-safe) box shell.
+                    self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                }
+            }
+        }
+        new_obj.into()
+    }
+
+    /// Project a source value (`src`, statically `src_ty`) into a FRESH sealed scalar record of
+    /// `target_fields`. THE central boundary op. Non-mutating: `src` is untouched (its own owner
+    /// releases it), extras are ignored, and the result is an independent +1 struct. The source
+    /// is read by whatever representation it has:
+    ///   - another sealed scalar record → field copy by offset;
+    ///   - a boxed `LinObject` / Json TaggedVal → `lin_object_get` per target field, unbox, store.
+    pub(crate) fn sealed_project_from(
+        &mut self,
+        src: BasicValueEnum<'ctx>,
+        src_ty: &Type,
+        target_fields: &indexmap::IndexMap<String, Type>,
+    ) -> BasicValueEnum<'ctx> {
+        // Source already a sealed record of (possibly) a different shape: copy fields by offset.
+        // Every field value `sealed_field_get` returns is BORROWED from the source struct (the
+        // source is non-mutating and keeps its own ownership) — including a nested-sealed pointer —
+        // so the fresh struct must RETAIN each heap field (`already_owned = false`).
+        if let Some(src_fields) = Self::sealed_scalar_fields(src_ty) {
+            let src_fields = src_fields.clone();
+            let vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> = target_fields.keys().map(|k| {
+                let fty = target_fields.get(k).cloned().unwrap_or(Type::Null);
+                let v = self.sealed_field_get(src, k, &src_fields, &fty);
+                (k.clone(), v, fty, false)
+            }).collect();
+            return self.sealed_construct(target_fields, &vals);
+        }
+        // Source is a boxed object / Json. Unbox to the raw LinObject* if it is a union/Json box.
+        let container = if Self::is_union_type(src_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[src.into()], "sealed_proj_unbox").try_as_basic_value().unwrap_basic()
+        } else {
+            src
+        };
+        let target_keys: Vec<String> = target_fields.keys().cloned().collect();
+        let mut vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> = Vec::with_capacity(target_keys.len());
+        for k in &target_keys {
+            let fty = target_fields.get(k).cloned().unwrap_or(Type::Null);
+            let key_str = self.compile_string_lit(k).into_pointer_value();
+            // lin_object_get returns an INTERIOR pointer to the entry's TaggedVal (borrowed); unbox
+            // it to the field value. For a scalar nothing is owned. For a String/Array the unbox
+            // yields the BORROWED inner heap pointer (owned by the source object entry) → the struct
+            // must retain it (`already_owned = false`). For a NESTED SEALED field the unbox RECURSES
+            // into `sealed_project_from`, producing a FRESH +1 sealed struct → transfer ownership
+            // (`already_owned = true`, no extra retain).
+            let tagged = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "sealed_proj_get").try_as_basic_value().unwrap_basic();
+            let v = self.unbox_tagged_val_to_type(tagged, &fty);
+            let owned = matches!(fty, Type::Object { .. }) && Self::sealed_fields(&fty).is_some();
+            vals.push((k.clone(), v, fty, owned));
+        }
+        self.sealed_construct(target_fields, &vals)
+    }
+
+    /// Field-wise equality of two sealed scalar records of the SAME type (`fields`). Loads each
+    /// field by offset and compares with the scalar equality for that field type, AND-ing. Returns
+    /// an i1.
+    pub(crate) fn sealed_eq(
+        &mut self,
+        a: BasicValueEnum<'ctx>,
+        b: BasicValueEnum<'ctx>,
+        fields: &indexmap::IndexMap<String, Type>,
+    ) -> inkwell::values::IntValue<'ctx> {
+        let bool_ty = self.context.bool_type();
+        let mut acc = bool_ty.const_int(1, false);
+        for (k, fty) in fields.iter() {
+            let av = self.sealed_field_get(a, k, fields, fty);
+            let bv = self.sealed_field_get(b, k, fields, fty);
+            let eq = if fty.is_float() {
+                self.builder.float_compare(inkwell::FloatPredicate::OEQ, av.into_float_value(), bv.into_float_value(), "sealed_feq")
+            } else {
+                self.builder.int_compare(IntPredicate::EQ, av.into_int_value(), bv.into_int_value(), "sealed_ieq")
+            };
+            acc = self.builder.and(acc, eq, "sealed_eq_acc");
+        }
+        acc
+    }
+
+    /// Release a sealed scalar record: `lin_sealed_release(ptr, size)`. No per-field release.
+    pub(crate) fn emit_sealed_release(&mut self, val: BasicValueEnum<'ctx>, fields: &indexmap::IndexMap<String, Type>) {
+        if !val.is_pointer_value() { return; }
+        let total = Self::sealed_struct_size(fields);
+        let i64_ty = self.context.i64_type();
+        self.builder.call(self.rt.sealed_release, &[val.into(), i64_ty.const_int(total, false).into()], "");
+    }
+
     pub(crate) fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, obj_ty: &Type, result_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        // Sealed scalar record: constant-offset load (the win).
+        if let Some(fields) = Self::sealed_scalar_fields(obj_ty) {
+            if obj.is_pointer_value() {
+                return self.sealed_field_get(obj, field, fields, result_ty);
+            }
+            return ptr_ty.const_null().into();
+        }
         if obj.is_pointer_value() {
             // A Json/union object arrives as a boxed TaggedVal*; unbox to the raw LinObject*.
             let container = if Self::is_union_type(obj_ty) {

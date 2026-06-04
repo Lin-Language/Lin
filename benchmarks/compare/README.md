@@ -1,7 +1,7 @@
 # Lin cross-language comparison suite
 
 A self-contained suite that compares **Lin** against **Go, Rust, Python and
-Node.js** on six identical workloads, and prints a single table of min
+Node.js** on seven identical workloads, and prints a single table of min
 wall-clock milliseconds (lower = faster).
 
 This is **indicative, not authoritative**. It measures whole-process wall-clock
@@ -26,7 +26,7 @@ factored out.
 Lin and Rust binaries are built once per run and timed; Go is built with
 `go build`; Python and Node run their scripts directly.
 
-## The six workloads
+## The seven workloads
 
 Every implementation prints **exactly one** stdout line `RESULT=<int>` (all
 other logging goes to stderr); the runner uses that value as a correctness gate
@@ -40,6 +40,7 @@ all languages and are the single source of truth:
 | `parallel` | CPU-bound fan-out across threads/processes | START=27, ITERS=300000000, CHUNKS=8 | `2173714077200` |
 | `recursion`| Recursive call overhead (`fib`) + iterative loop (`sumTo`) | FIB_N=42, SUM_N=50000000 | `269164297900400072` |
 | `pipeline` | Eager `map`/`filter`/`reduce`, materializing each stage | N=20000000 | `133333326666666` |
+| `records`  | Record-access-bound: thread one struct through field-read + reconstruct cycles (constant-offset struct-layout field access) | N=50000000, MOD=2147483647 | `1298599827` |
 | `async_io` | I/O-bound bounded concurrency (latency/overlap, not runtime speed) | TASKS=200, SLEEP_MS=50, CONCURRENCY=50 | `40000` |
 
 Workload sizes are chosen so each runs long enough that fixed overhead (process
@@ -69,6 +70,17 @@ Per-workload checksum definitions:
   `sumTo(50000000)=1250000025000000` → `269164297900400072`.
 - **pipeline**: `range(0,N).map(x=>x*2).filter(x=>x%3==0).reduce(0,+)` for
   N=20000000 → `133333326666666`.
+- **records**: a single 6-field struct `State{a..f}` (all Int64) initialised `1..6`,
+  threaded through N=50000000 read-all-6 / reconstruct-all-6 cycles via a bounded
+  LCG-style mix kept in `[0, MOD)` (`MOD=2147483647`), then `RESULT = (a+b+c+d+e+f) % MOD`.
+  Because every value stays under 2^31 the per-iteration math is bit-identical across
+  i64/int64/Python-int and JS **BigInt** (the transient pre-mod product
+  `a*1103515245 ≈ 2.3e18` exceeds 2^53, so `records.js` uses BigInt). Field access
+  dominates: this is the workload Lin's **sealed-record struct layout** accelerates —
+  the named all-scalar `type State` is laid out as a packed heap struct, so each field
+  read is a constant-offset load instead of a boxed string-keyed `lin_object_get` hash
+  lookup. (Measured Lin-to-Lin: the same code typed `State: Json` ran ~4× slower.) →
+  `1298599827`.
 - **async_io**: `sum_{i=0..199}(i*2+1) = 200*200 = 40000`. NOTE: this workload is
   latency-bound — every language pins to the `ceil(TASKS/CONCURRENCY)*SLEEP_MS`
   sleep floor, so it tests concurrency *overlap*, not runtime speed (see the source

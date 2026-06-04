@@ -28,7 +28,9 @@ impl<'ctx> Codegen<'ctx> {
                 self.context.ptr_type(AddressSpace::default()).into()
             }
             Type::Array(_) | Type::FixedArray(_) => self.array_ptr_type.into(),
-            Type::Object(_) => self.context.ptr_type(AddressSpace::default()).into(),
+            // Stage 0.5: codegen IGNORES the `sealed` marker — every object, sealed or not, is the
+            // boxed string-keyed `LinObject` pointer, exactly as before. Stage 1 will branch here.
+            Type::Object { .. } => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Union(_) => {
                 // Tagged union: { i8 tag, [8 x i8] payload } — 9 bytes total.
                 // We use an opaque pointer to a heap-allocated tagged value.
@@ -102,7 +104,7 @@ impl<'ctx> Codegen<'ctx> {
                 | Type::StrLit(_)
                 | Type::Array(_)
                 | Type::FixedArray(_)
-                | Type::Object(_)
+                | Type::Object { .. }
                 | Type::Function { .. }
         )
     }
@@ -130,11 +132,121 @@ impl<'ctx> Codegen<'ctx> {
             // Both float widths box as f64 bits (see doc above).
             Type::Float32 | Type::Float64 => TAG_FLOAT64,
             Type::Str | Type::StrLit(_) => TAG_STR,
-            Type::Object(_) => TAG_OBJECT,
+            Type::Object { .. } => TAG_OBJECT,
             Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => TAG_ARRAY,
             Type::Function { .. } => TAG_FUNCTION,
             _ => TAG_NULL,
         }
+    }
+
+    /// Byte size of `SEALED_HEADER` (refcount u32 + size u32 + desc_ptr u64). Kept in lockstep with
+    /// `lin_runtime::sealed::SEALED_HEADER` (16). Sealed-record field payload begins here.
+    pub(crate) const SEALED_HEADER: u64 = 16;
+
+    /// True when `ty` is an unboxed scalar field of a sealed record: a fixed-width numeric (mirrors
+    /// `is_flat_scalar`) OR `Bool`. Scalar fields are stored inline at their natural-aligned offset
+    /// and need NO per-field RC.
+    pub(crate) fn is_sealed_scalar_field(ty: &Type) -> bool {
+        Self::is_flat_scalar(ty) || matches!(ty, Type::Bool)
+    }
+
+    /// The descriptor kind code for a HEAP field of a sealed record, or `None` if `ty` is not an
+    /// eligible heap field. Heap fields are stored as an 8-byte owned pointer slot and need per-field
+    /// retain-on-construct / release-on-drop. MUST stay in lockstep with the `lin_runtime::sealed`
+    /// `KIND_*` constants. Eligible (Stage 2): `String`/`StrLit` → KIND_STRING, `Array`/`FixedArray`
+    /// → KIND_ARRAY, a NESTED SEALED RECORD → KIND_SEALED. Everything else (`Object` that is NOT a
+    /// sealed record, `Union`/`Json`/`TypeVar`, `Iterator`/`Stream`/`Shared`/`Function`, bare
+    /// recursive `Named`) → `None` → the whole record stays BOXED (fail-safe).
+    pub(crate) fn sealed_field_kind(ty: &Type) -> Option<u32> {
+        match ty {
+            Type::Str | Type::StrLit(_) => Some(Self::KIND_STRING),
+            Type::Array(_) | Type::FixedArray(_) => Some(Self::KIND_ARRAY),
+            // A nested sealed record (a field whose type is itself sealed-eligible). The recursion
+            // bottoms out: a field's eligibility is decided by `sealed_fields` on that field type.
+            Type::Object { .. } if Self::sealed_fields(ty).is_some() => Some(Self::KIND_SEALED),
+            _ => None,
+        }
+    }
+
+    /// Descriptor heap-field kind codes. MUST stay in lockstep with `lin_runtime::sealed::KIND_*`.
+    pub(crate) const KIND_STRING: u32 = 1;
+    pub(crate) const KIND_ARRAY: u32 = 2;
+    pub(crate) const KIND_SEALED: u32 = 3;
+
+    /// True when `ty` is a permissible field of a sealed record: a scalar OR an eligible heap field.
+    pub(crate) fn is_sealed_field(ty: &Type) -> bool {
+        Self::is_sealed_scalar_field(ty) || Self::sealed_field_kind(ty).is_some()
+    }
+
+    /// THE sealed-record gate (sealed-records Stages 1–2). Returns `Some(fields)` iff `ty` is a
+    /// `Type::Object { sealed: true }` whose fields are ALL either unboxed scalars OR eligible heap
+    /// fields (String/Array/nested-sealed). Returns `None` (→ keep the boxed `LinObject` path) for:
+    /// an unsealed object (anonymous literal/inferred shape), any object with an INELIGIBLE field
+    /// (union/Json/Iterator/Stream/Shared/Function/unsealed-object), and every non-object type.
+    /// FAIL SAFE: when unsure, `None` (boxed). The field order is the TYPE DECLARATION's `IndexMap`
+    /// order, preserved by Stage 0.5 resolution — this fixes a single canonical physical layout.
+    ///
+    /// Note on recursion termination: a nested-sealed field calls back into `sealed_fields`; a
+    /// directly self-recursive record (a field of its own type) survives resolution as `Type::Named`
+    /// (not an inlined `Type::Object`), so `sealed_field_kind` sees `Named` → `None` → that record
+    /// is kept boxed. Hence `sealed_fields` cannot recurse infinitely on a cyclic type.
+    pub(crate) fn sealed_fields(ty: &Type) -> Option<&indexmap::IndexMap<String, Type>> {
+        match ty {
+            Type::Object { fields, sealed: true } if !fields.is_empty()
+                && fields.values().all(Self::is_sealed_field) =>
+            {
+                Some(fields)
+            }
+            _ => None,
+        }
+    }
+
+    /// Backwards-compatible alias retained for the (now generalized) gate. Stage 1 call sites used
+    /// `sealed_scalar_fields`; it now accepts heap fields too via `sealed_fields`.
+    pub(crate) fn sealed_scalar_fields(ty: &Type) -> Option<&indexmap::IndexMap<String, Type>> {
+        Self::sealed_fields(ty)
+    }
+
+    /// Byte width of a field SLOT in a sealed record. A scalar occupies its natural width (1/2/4/8);
+    /// a HEAP field occupies an 8-byte pointer slot. Used by both layout and size.
+    fn sealed_slot_size(fty: &Type) -> u64 {
+        if Self::sealed_field_kind(fty).is_some() {
+            8 // heap field: pointer slot
+        } else {
+            fty.bit_width().map(|b| (b as u64) / 8).unwrap_or(1).max(1)
+        }
+    }
+
+    /// Byte offset (from the struct base, including the header) of `field` within a sealed record,
+    /// and the total struct byte size. Fields are packed in declaration order with NATURAL alignment
+    /// (each slot aligned to its own width — heap pointer slots to 8); the struct is padded to an
+    /// 8-byte multiple so arrays/successive allocs stay aligned. Returns `(offset_of_field,
+    /// total_size)`. Panics if `field` is not in the record (a compile error rules this out upstream).
+    pub(crate) fn sealed_field_layout(fields: &indexmap::IndexMap<String, Type>, field: &str) -> (u64, u64) {
+        let mut offset = Self::SEALED_HEADER;
+        let mut found: Option<u64> = None;
+        for (k, fty) in fields.iter() {
+            let sz = Self::sealed_slot_size(fty);
+            let align = sz; // natural alignment = slot size (1/2/4/8)
+            offset = (offset + align - 1) / align * align;
+            if k == field {
+                found = Some(offset);
+            }
+            offset += sz;
+        }
+        let total = (offset + 7) / 8 * 8;
+        (found.unwrap_or_else(|| panic!("sealed_field_layout: field {field:?} not in record")), total)
+    }
+
+    /// Total byte size of a sealed record (header + packed fields, padded to 8).
+    pub(crate) fn sealed_struct_size(fields: &indexmap::IndexMap<String, Type>) -> u64 {
+        let mut offset = Self::SEALED_HEADER;
+        for fty in fields.values() {
+            let sz = Self::sealed_slot_size(fty);
+            offset = (offset + sz - 1) / sz * sz;
+            offset += sz;
+        }
+        (offset + 7) / 8 * 8
     }
 
     /// Returns true when the element type maps to a flat unboxed scalar array.
@@ -203,7 +315,7 @@ impl<'ctx> Codegen<'ctx> {
         let tag: u8 = match ty {
             Type::Null | Type::Bool | Type::Int8 | Type::Int16 | Type::Int32
             | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::Int64 | Type::UInt64
-            | Type::Float32 | Type::Float64 | Type::Str | Type::StrLit(_) | Type::Object(_)
+            | Type::Float32 | Type::Float64 | Type::Str | Type::StrLit(_) | Type::Object { .. }
             | Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) | Type::Function { .. } => {
                 Self::type_tag(ty)
             }

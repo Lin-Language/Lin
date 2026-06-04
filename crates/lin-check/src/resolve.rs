@@ -42,12 +42,15 @@ fn resolve_type_inner(
             Ok(Type::func(param_types?, ret_type))
         }
         TypeExpr::Object(fields, _span) => {
+            // An object type spelled inline (anonymous structural shape, NOT a named record
+            // declaration) is UNSEALED. Only the named-type unfold path (`expand_named_body` /
+            // generic `substitute`) seals. See SEALED_RECORDS_DESIGN.md §5.
             let mut resolved = IndexMap::new();
             for (key, type_expr) in fields {
                 let ty = resolve_type_inner(type_expr, env, visiting)?;
                 resolved.insert(key.clone(), ty);
             }
-            Ok(Type::Object(resolved))
+            Ok(Type::object(resolved))
         }
         TypeExpr::TaggedUnion(variants, _span) => {
             let resolved: Result<Vec<Type>, String> =
@@ -163,12 +166,16 @@ fn expand_named_body(
         Type::Union(ts) => Ok(Type::Union(
             ts.iter().map(|t| expand_named_body(t, env, visiting)).collect::<Result<_, _>>()?
         )),
-        Type::Object(fields) => {
+        Type::Object { fields, sealed: _ } => {
+            // STAGE 0.5 SEAL POINT. `expand_named_body` is reached ONLY while unfolding the body
+            // of a named record type declaration (`type T = { … }`) for a non-recursive `: T`
+            // annotation. Mark the unfolded object SEALED so named-record identity survives
+            // resolution (today it was discarded by collapsing to a bare field map).
             let mut out = IndexMap::new();
             for (k, v) in fields {
                 out.insert(k.clone(), expand_named_body(v, env, visiting)?);
             }
-            Ok(Type::Object(out))
+            Ok(Type::sealed_object(out))
         }
         Type::Function { params, ret, required } => Ok(Type::Function {
             params: params.iter().map(|p| expand_named_body(p, env, visiting)).collect::<Result<_, _>>()?,
@@ -244,12 +251,15 @@ fn substitute(
             // Otherwise expand it as a regular named type.
             resolve_named_cycle(n, env, visiting)
         }
-        Type::Object(fields) => {
+        Type::Object { fields, sealed } => {
+            // Generic named-type instantiation (`type Box<T> = { value: T }` → `Box<Int32>`) is
+            // also a named record unfold: preserve the declaration's sealed-ness. Bodies of named
+            // record types arrive here sealed (set when the decl body was first resolved).
             let substituted: Result<IndexMap<String, Type>, String> = fields
                 .iter()
                 .map(|(k, v)| substitute(v, params, args, env, visiting).map(|t| (k.clone(), t)))
                 .collect();
-            Ok(Type::Object(substituted?))
+            Ok(Type::Object { fields: substituted?, sealed: *sealed })
         }
         Type::Array(inner) => Ok(Type::Array(Box::new(substitute(inner, params, args, env, visiting)?))),
         Type::FixedArray(types) => {
@@ -283,7 +293,9 @@ pub fn error_type() -> Type {
     let mut fields = IndexMap::new();
     fields.insert("type".to_string(), Type::Str);
     fields.insert("message".to_string(), Type::Str);
-    Type::Object(fields)
+    // `Error` is a built-in STRUCTURAL alias, NOT a sealed named record — it is used with extra
+    // fields in practice (e.g. the decode-error `"path"`). Keep it UNSEALED. See §6 Q5.
+    Type::object(fields)
 }
 
 pub fn json_type() -> Type {
@@ -291,4 +303,71 @@ pub fn json_type() -> Type {
     // We use TypeVar(u32::MAX) as a special "any" marker that is_compatible always accepts.
     // This allows object literals, arrays, strings, numbers, bools, null to all satisfy Json.
     Type::TypeVar(u32::MAX)
+}
+
+#[cfg(test)]
+mod sealed_marker_tests {
+    //! Stage 0.5 focused marker tests (SEALED_RECORDS_DESIGN.md §5): prove the `sealed` flag is
+    //! SET correctly on resolution without affecting behavior. The bulk of run-equivalence is
+    //! carried by the full corpus; these pin the marker's value at the seal point.
+    use super::*;
+    use crate::env::TypeEnv;
+    use lin_parse::ast::TypeExpr;
+    use lin_common::Span;
+
+    fn sealed_of(ty: &Type) -> Option<bool> {
+        match ty {
+            Type::Object { sealed, .. } => Some(*sealed),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn named_record_resolves_sealed() {
+        // type Point = { x: Int32, y: Int32 } — the decl body is an (unsealed) resolved object,
+        // exactly as the checker stores it. Resolving a `: Point` annotation must seal it.
+        let mut fields = IndexMap::new();
+        fields.insert("x".to_string(), Type::Int32);
+        fields.insert("y".to_string(), Type::Int32);
+        let mut env = TypeEnv::new();
+        env.define_type("Point".to_string(), vec![], Type::object(fields));
+
+        let resolved = resolve_type(&TypeExpr::Named("Point".to_string(), Span::dummy()), &env)
+            .expect("Point resolves");
+        assert_eq!(sealed_of(&resolved), Some(true), "named record must resolve SEALED");
+    }
+
+    #[test]
+    fn anonymous_object_literal_is_unsealed() {
+        // An inline `{ "x": Int32 }` annotation is an anonymous structural type → UNSEALED.
+        let mut obj_fields = Vec::new();
+        obj_fields.push(("x".to_string(), TypeExpr::Named("Int32".to_string(), Span::dummy())));
+        let te = TypeExpr::Object(obj_fields, Span::dummy());
+        let env = TypeEnv::new();
+        let resolved = resolve_type(&te, &env).expect("anon object resolves");
+        assert_eq!(sealed_of(&resolved), Some(false), "anonymous literal must be UNSEALED");
+    }
+
+    #[test]
+    fn error_alias_is_unsealed() {
+        // The built-in `Error` structural alias is NOT a sealed named record.
+        let env = TypeEnv::new();
+        let resolved = resolve_type(&TypeExpr::Named("Error".to_string(), Span::dummy()), &env)
+            .expect("Error resolves");
+        assert_eq!(sealed_of(&resolved), Some(false), "Error alias must be UNSEALED");
+    }
+
+    #[test]
+    fn sealed_and_unsealed_are_equal_and_compatible() {
+        // INVARIANT 2: the flag is invisible to Type equality. A sealed and an unsealed object
+        // with identical fields compare EQUAL (manual PartialEq ignores `sealed`).
+        let mut f = IndexMap::new();
+        f.insert("x".to_string(), Type::Int32);
+        let sealed = Type::sealed_object(f.clone());
+        let unsealed = Type::object(f);
+        assert_eq!(sealed, unsealed, "sealed must equal unsealed with same fields");
+        // And structural compatibility (invariant 1) is symmetric and unaffected.
+        assert!(crate::compat::is_compatible(&sealed, &unsealed));
+        assert!(crate::compat::is_compatible(&unsealed, &sealed));
+    }
 }

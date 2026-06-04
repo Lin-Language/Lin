@@ -170,7 +170,7 @@ impl Checker {
                 // target object type + the resolved bodies of every reachable Named type (so IR
                 // lowering can build the recursive schema descriptor without a type env). An
                 // empty object type `{}` keeps the cheap bare tag check (nothing to validate).
-                if let Type::Object(ref fields) = ty {
+                if let Type::Object { ref fields, .. } = ty {
                     if !fields.is_empty() {
                         let mut named_defs: Vec<(String, Type)> = Vec::new();
                         let mut seen: std::collections::HashSet<String> =
@@ -211,7 +211,7 @@ impl Checker {
                         })
                         .unwrap_or_default();
 
-                    let field_ty = if let Type::Object(ref obj_fields) = scrutinee_ty {
+                    let field_ty = if let Type::Object { fields: ref obj_fields, .. } = scrutinee_ty {
                         obj_fields.get(&key).cloned().unwrap_or(Type::Null)
                     } else {
                         self.env.fresh_type_var()
@@ -240,7 +240,7 @@ impl Checker {
 
                 let rest_slot = rest.as_ref().map(|name| {
                     self.env
-                        .define(name.clone(), Type::Object(IndexMap::new()), false)
+                        .define(name.clone(), Type::object(IndexMap::new()), false)
                 });
 
                 Ok(TypedPattern::Object {
@@ -313,7 +313,7 @@ impl Checker {
                         })
                         .unwrap_or_default();
 
-                    let field_ty = if let Type::Object(ref obj_fields) = ty {
+                    let field_ty = if let Type::Object { fields: ref obj_fields, .. } = ty {
                         obj_fields.get(&key).cloned().unwrap_or(Type::Null)
                     } else if ty.is_json() {
                         crate::resolve::json_type()

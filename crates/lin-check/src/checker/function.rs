@@ -196,7 +196,8 @@ impl Checker {
                 for (key, te) in fields {
                     resolved.insert(key.clone(), self.resolve_type_with_number_in(te, env)?);
                 }
-                Ok(Type::Object(resolved))
+                // Inline (anonymous) object annotation → UNSEALED.
+                Ok(Type::object(resolved))
             }
             // Generic constructors (`Iterator<Number>`, alias applications, …) and all other leaves
             // resolve through the standard path. A `Number` nested inside a generic type ARGUMENT is
@@ -290,7 +291,7 @@ impl Checker {
                         Pattern::Ident(n, _) => Some(n.clone()),
                         _ => None,
                     }).unwrap_or_default();
-                    let field_ty = if let Type::Object(ref obj_fields) = ty {
+                    let field_ty = if let Type::Object { fields: ref obj_fields, .. } = ty {
                         obj_fields.get(&key).cloned().unwrap_or(Type::Null)
                     } else { Type::TypeVar(u32::MAX) };
                     let fslot = match &f.pattern {
@@ -539,7 +540,7 @@ impl Checker {
                         Pattern::Ident(n, _) => Some(n.clone()),
                         _ => None,
                     }).unwrap_or_default();
-                    let field_ty = if let Type::Object(ref obj_fields) = ty {
+                    let field_ty = if let Type::Object { fields: ref obj_fields, .. } = ty {
                         obj_fields.get(&key).cloned().unwrap_or(Type::Null)
                     } else { Type::TypeVar(u32::MAX) };
                     let fslot = match &f.pattern {

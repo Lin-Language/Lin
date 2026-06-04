@@ -93,7 +93,18 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.box_str, &[val.into()], "boxstr")
                     .try_as_basic_value().unwrap_basic()
             }
-            Type::Object(_) => {
+            // A SEALED SCALAR RECORD is a packed struct, NOT a LinObject — box_object would
+            // treat its ptr as a LinObject header and corrupt. Materialize to a fresh boxed
+            // LinObject first, then box that as TAG_OBJECT. (This is the same conversion the
+            // Coerce(sealed → Json) boundary performs; it is the safety net for any path that
+            // boxes a sealed value directly, e.g. heterogeneous array elements or closure args.)
+            Type::Object { .. } if Self::sealed_scalar_fields(val_ty).is_some() => {
+                let fields = Self::sealed_scalar_fields(val_ty).unwrap().clone();
+                let obj = self.sealed_materialize_to_object(val, &fields);
+                self.builder.call(self.rt.box_object, &[obj.into()], "boxsealed")
+                    .try_as_basic_value().unwrap_basic()
+            }
+            Type::Object { .. } => {
                 self.builder.call(self.rt.box_object, &[val.into()], "boxobj")
                     .try_as_basic_value().unwrap_basic()
             }
@@ -118,7 +129,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::Union(variants) => {
                 if val.is_pointer_value() {
                     // If all variants are Object types, this is a LinObject*.
-                    let all_objects = variants.iter().all(|v| matches!(v, Type::Object(_)));
+                    let all_objects = variants.iter().all(|v| matches!(v, Type::Object { .. }));
                     if all_objects {
                         self.builder.call(self.rt.box_object, &[val.into()], "boxobj")
                             .try_as_basic_value().unwrap_basic()
@@ -210,7 +221,11 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.unbox_ptr, &[ptr_val.into()], "ustr")
                     .try_as_basic_value().unwrap_basic()
             }
-            Type::Object(_) | Type::Array(_) | Type::FixedArray(_) | Type::Function { .. } => {
+            Type::Object { .. } if Self::sealed_scalar_fields(target_ty).is_some() => {
+                let fields = Self::sealed_scalar_fields(target_ty).unwrap().clone();
+                self.sealed_project_from(ptr, &Type::TypeVar(u32::MAX), &fields)
+            }
+            Type::Object { .. } | Type::Array(_) | Type::FixedArray(_) | Type::Function { .. } => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr_val.into()], "uptr")
                     .try_as_basic_value().unwrap_basic()
             }
@@ -322,7 +337,17 @@ impl<'ctx> Codegen<'ctx> {
             Type::Str | Type::StrLit(_) => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr.into()], "ir_ustr").try_as_basic_value().unwrap_basic()
             }
-            Type::Array(_) | Type::FixedArray(_) | Type::Object(_) | Type::Function { .. } => {
+            // Unboxing a boxed Json/object into a SEALED scalar record target = a PROJECTION:
+            // the boxed value is a TaggedVal* (or raw LinObject*); project it into a fresh sealed
+            // struct. Routed through the central projection helper so the source representation is
+            // handled correctly (it unboxes a union box to the raw LinObject internally).
+            Type::Object { .. } if Self::sealed_scalar_fields(ty).is_some() => {
+                let fields = Self::sealed_scalar_fields(ty).unwrap().clone();
+                // The incoming `tagged` is a boxed value (Json). Use the union-typed projection
+                // path: sealed_project_from unboxes a union source to the raw LinObject itself.
+                self.sealed_project_from(tagged, &Type::TypeVar(u32::MAX), &fields)
+            }
+            Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Function { .. } => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr.into()], "ir_uptr").try_as_basic_value().unwrap_basic()
             }
             Type::Null => ptr_ty.const_null().into(),

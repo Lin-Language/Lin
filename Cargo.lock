@@ -960,6 +960,7 @@ name = "lin-codegen"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "indexmap",
  "inkwell",
  "lin-check",
  "lin-common",

@@ -395,7 +395,7 @@ impl Checker {
                     unify_types(elems)
                 }
             }
-            Type::Object(fields) => {
+            Type::Object { fields, .. } => {
                 if fields.is_empty() {
                     // Empty schema (e.g. `var result = {}`): object may be populated dynamically,
                     // so any key access must be a runtime lookup → TypeVar.
@@ -432,7 +432,7 @@ impl Checker {
                 } else {
                     let inner = if non_null.len() == 1 {
                         match &non_null[0] {
-                            Type::Object(fields) => {
+                            Type::Object { fields, .. } => {
                                 if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
                                     fields.get(key_str).cloned().unwrap_or(Type::Null)
                                 } else {
@@ -673,14 +673,15 @@ impl Checker {
                 }
                 ObjectField::Spread(expr) => {
                     let typed_spread = self.infer_expr(expr)?;
-                    if let Type::Object(ref fields) = typed_spread.ty() {
+                    if let Type::Object { ref fields, .. } = typed_spread.ty() {
                         for (k, v) in fields { obj_type.insert(k.clone(), v.clone()); }
                     }
                     spreads.push(typed_spread);
                 }
             }
         }
-        Ok(TypedExpr::MakeObject { fields: typed_fields, spreads, ty: Type::Object(obj_type), span })
+        // Object literal → anonymous structural type → UNSEALED.
+        Ok(TypedExpr::MakeObject { fields: typed_fields, spreads, ty: Type::object(obj_type), span })
     }
 
     /// Bidirectional refinement for an object literal against an expected type (ADR-051).
@@ -711,7 +712,7 @@ impl Checker {
                 }
                 Ok(None)
             }
-            Type::Object(expected_fields) => {
+            Type::Object { fields: expected_fields, .. } => {
                 // Only take over when at least one expected field is a literal singleton; this
                 // keeps plain structural objects on the existing inference path.
                 if !expected_fields.values().any(|t| matches!(t, Type::StrLit(_))) {
@@ -726,7 +727,7 @@ impl Checker {
                 let literal_variants: Vec<&IndexMap<String, Type>> = variants
                     .iter()
                     .filter_map(|v| match v {
-                        Type::Object(f) if f.values().any(|t| matches!(t, Type::StrLit(_))) => Some(f),
+                        Type::Object { fields: f, .. } if f.values().any(|t| matches!(t, Type::StrLit(_))) => Some(f),
                         _ => None,
                     })
                     .collect();
@@ -806,7 +807,9 @@ impl Checker {
                 }
             }
         }
-        Ok(TypedExpr::MakeObject { fields: typed_fields, spreads: Vec::new(), ty: Type::Object(obj_type), span })
+        // The refined literal's own type stays UNSEALED (the seal lives on the expected named type;
+        // Stage 1 inserts the projection at the boundary). Inert in Stage 0.5.
+        Ok(TypedExpr::MakeObject { fields: typed_fields, spreads: Vec::new(), ty: Type::object(obj_type), span })
     }
 
     pub(crate) fn infer_array(&mut self, elements: &[Expr], span: Span) -> Result<TypedExpr, Diagnostic> {
@@ -869,7 +872,7 @@ impl Checker {
         let typed_key = self.infer_expr(key)?;
         let obj_ty = typed_obj.ty();
         let typed_value = match &obj_ty {
-            Type::Object(fields) => {
+            Type::Object { fields, .. } => {
                 if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
                     if let Some(field_ty) = fields.get(key_str) {
                         self.check_expr(value, field_ty)?
@@ -925,7 +928,7 @@ impl Checker {
 /// old inference-then-unify path (pushing into them buys nothing and risks behaviour changes).
 pub(crate) fn expected_pushes_into_branches(ty: &Type) -> bool {
     match ty {
-        Type::Object(_) | Type::Named(_) | Type::Union(_) => true,
+        Type::Object { .. } | Type::Named(_) | Type::Union(_) => true,
         _ => type_mentions_strlit(ty),
     }
 }
@@ -954,7 +957,7 @@ pub(crate) fn type_mentions_strlit(ty: &Type) -> bool {
         Type::Array(inner) | Type::Iterator(inner) | Type::Shared(inner) | Type::Stream(inner) => type_mentions_strlit(inner),
         Type::FixedArray(elems) => elems.iter().any(type_mentions_strlit),
         Type::Union(variants) => variants.iter().any(type_mentions_strlit),
-        Type::Object(fields) => fields.values().any(type_mentions_strlit),
+        Type::Object { fields, .. } => fields.values().any(type_mentions_strlit),
         Type::Function { params, ret, .. } => {
             params.iter().any(type_mentions_strlit) || type_mentions_strlit(ret)
         }

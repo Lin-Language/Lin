@@ -160,7 +160,7 @@ fn is_error_pattern(p: &TypedPattern) -> bool {
 
 /// True if `v` is (structurally) the `Error` object variant `{ "type": String, "message": .. }`.
 fn is_error_variant(v: &Type) -> bool {
-    if let Type::Object(fields) = v {
+    if let Type::Object { fields, .. } = v {
         fields.contains_key("type") && fields.contains_key("message")
     } else {
         false
