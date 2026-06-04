@@ -1,7 +1,7 @@
 # Stdlib `Json` typing audit — tightening the stdlib once `{ String: T }` lands
 
-Status: proposal / audit. Companion to `docs/proposals/typed-map-index-signature.md` (the accepted
-index-signature `{ String: T }` type).
+Status: proposal / audit. Companion to the implemented index-signature `{ String: T }` type
+(ADR-082 / spec §5.1.1).
 
 > **Category 1 (under-genericized array/iter collection ops) is DONE** — shipped on master, the
 > `std/array` + `std/iter` element-generic ops re-typed from `Json` to `<T>`. It is omitted below; the
@@ -123,8 +123,8 @@ representation changes; flag any change against that header comment.
 
 ## Relationship to the other proposals
 
-- `typed-map-index-signature.md` — the prerequisite for Category 2 (and provides the unboxed value
-  storage on top of the already-shipped O(1) lookup). Build that first.
+- The index-signature `{ String: T }` type (**ADR-082 — shipped**, spec §5.1.1) — the prerequisite
+  for Category 2 (and provides the unboxed value storage on top of the already-shipped O(1) lookup).
 - The hashed-`Json`-object change (#4b, **ADR-081 — shipped**) already gives plain `{}` objects O(1)
   lookup. Category 2 here is about the remaining *typing* / *unboxing* gap the map type closes, not the
   lookup complexity, which is already fixed.

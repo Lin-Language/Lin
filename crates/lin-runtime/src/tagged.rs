@@ -33,7 +33,7 @@ use std::alloc::{Layout, alloc};
 pub use lin_common::tags::{
     TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT32, TAG_FLOAT64, TAG_STR, TAG_OBJECT,
     TAG_ARRAY, TAG_FUNCTION, TAG_UINT8, TAG_INT8, TAG_UINT16, TAG_INT16, TAG_UINT64, TAG_UINT32,
-    TAG_PROMISE, TAG_HANDLE, TAG_SHARED, TAG_STREAM,
+    TAG_PROMISE, TAG_HANDLE, TAG_SHARED, TAG_STREAM, TAG_MAP,
 };
 
 #[repr(C)]
@@ -212,6 +212,12 @@ pub unsafe extern "C" fn lin_box_array(p: *mut u8) -> *mut u8 {
 #[no_mangle]
 pub unsafe extern "C" fn lin_box_function(p: *mut u8) -> *mut u8 {
     alloc_tagged(TAG_FUNCTION, p as u64)
+}
+
+/// Box a `LinMap*` (the typed index-signature container, ADR-082) as a TaggedVal(TAG_MAP).
+#[no_mangle]
+pub unsafe extern "C" fn lin_box_map(p: *mut u8) -> *mut u8 {
+    alloc_tagged(TAG_MAP, p as u64)
 }
 
 /// Get the type tag of a boxed value. Returns TAG_NULL (0) for null pointer.
@@ -474,6 +480,10 @@ pub unsafe extern "C" fn lin_length_dyn(p: *const u8) -> i32 {
             let n = crate::object::lin_object_length(payload as *const crate::object::LinObject);
             n as i32
         }
+        TAG_MAP => {
+            let n = crate::map::lin_map_length(payload as *const crate::map::LinMap);
+            n as i32
+        }
         _ => 0,
     }
 }
@@ -524,6 +534,7 @@ pub unsafe extern "C" fn lin_tagged_release(p: *mut u8) {
         TAG_STR => crate::string::lin_string_release(payload as *mut crate::string::LinString),
         TAG_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
         TAG_OBJECT => crate::object::lin_object_release(payload as *mut crate::object::LinObject),
+        TAG_MAP => crate::map::lin_map_release(payload as *mut crate::map::LinMap),
         TAG_SHARED => crate::shared::lin_shared_release_box(payload as *const u8),
         TAG_STREAM => crate::stream::lin_stream_release_box(payload as *const u8),
         _ => {} // Scalars (null, bool, int, float) have no heap payload.

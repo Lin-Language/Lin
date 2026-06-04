@@ -1,0 +1,16 @@
+// wordcount — count occurrences of each word using a typed index-signature map
+// `{ String: Int32 }` (the dictionary type, ADR-082). Arbitrary string keys all map to an
+// Int32 count, with O(1) average lookup/insert. Reading a key yields `Int32 | Null`, so a
+// first-seen word (Null) starts at 0.
+import { for } from "std/iter"
+
+export val count = (words: String[]): { String: Int32 } =>
+  var counts: { String: Int32 } = {}
+  words.for(w =>
+    val prev = counts[w]
+    val n = match prev
+      is Int32 => prev
+      else => 0
+    counts[w] = n + 1
+  )
+  counts

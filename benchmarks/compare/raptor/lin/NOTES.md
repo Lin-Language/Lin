@@ -41,9 +41,9 @@ deep journey equality).
 
 The fixed-shape data is now expressed with **named record + union types**
 (`types.lin`), mirroring the reference TypeScript types — the port is no longer
-100% `Json`. The dynamic-key MAP structures must stay `Json` until the
-accepted-but-unimplemented `{ String: T }` map type lands (see
-`docs/proposals/typed-map-index-signature.md`).
+100% `Json`. The dynamic-key MAP structures stay `Json` pending a RAPTOR
+re-typing pass to the now-implemented `{ String: T }` map type (see ADR-082 /
+spec §5.1.1).
 
 **Types introduced (`types.lin`):** `Date`, `StopTime`, `Service`, `Trip`,
 `Transfer`, `TimetableLeg`, `Leg = Transfer | TimetableLeg`, `Journey`.
