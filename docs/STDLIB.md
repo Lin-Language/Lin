@@ -2340,6 +2340,13 @@ Import:
 import { keys, values, entries, fromEntries, merge, pick, omit, mapValues, isEmpty } from "std/object"
 ```
 
+> **Typed maps (`{ String: T }`).** `keys`, `values`, `entries`, `length`, and `isEmpty` are
+> tag-aware: they work on BOTH a plain `Json`/`{}` record AND a typed index-signature map
+> `{ String: T }` (the dictionary type, ADR-082, backed by a hashed O(1) container — see
+> Specification §5.1.1). A typed map also supports the built-in `m[k]` (yields `T | Null`) and
+> `m[k] = v` directly. Note that over a map, `keys`/`values`/`entries` are in **hash order**, not
+> insertion order.
+
 ---
 
 ### entries

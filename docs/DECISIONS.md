@@ -1702,3 +1702,86 @@ vendored SDL3 is Linux x86-64, software-rendered via the dummy driver (proves th
 not GPU output). `withCstr` leaks its buffer only if the callback faults (Lin has no try/finally). A
 real bindgen / struct-layout DSL is future work — struct offsets are hand-computed by the programmer
 today.
+
+## ADR-082: Typed index-signature object type `{ String: T }` backed by a hashed `LinMap`
+
+**Decision**: Add a typed *index-signature* object type `{ String: T }` (Option A of
+`docs/proposals/typed-map-index-signature.md`) — an object used as a dictionary with arbitrary
+String keys all mapping to value type `T`. It is a **new `Type` variant** (`Type::Map(Box<Type>)`,
+surface `TypeExpr::IndexSig`) distinct from the fixed-field `Type::Object` record, and is backed at
+runtime by a **distinct hashed container `LinMap`** (open-addressing, FNV-1a, linear probing) giving
+**O(1) average** lookup/insert — *not* the O(n) association-list `LinObject`.
+
+Surface and checker rules:
+- `m[k]` yields `T | Null` (the §6.1 safe-bracket missing-key rule); `m[k] = v` requires `v : T` and
+  `k : String`.
+- An empty `{}` literal infers `{ String: T }` from its annotated context (binding target / return
+  type), else stays a fixed record. A non-empty string-keyed literal checked against a `{ String: T }`
+  context produces a `LinMap` whose values are each checked against `T`.
+- No implicit `Json → { String: T }` coercion: a `Map` target is a *structured decode* in user code
+  (`compat::requires_structured_decode`), so a raw `Json` must go through `fromJson`/narrowing,
+  exactly like a structured record (parity with §6.3 / ADR-046). The trusted stdlib stays lenient.
+- A `Map` is its OWN type — not structurally compatible with a fixed `Object` in either direction
+  (`compat.rs`), covariant in `T` (`Map<U>` → `Map<T>` when `U` compat `T`).
+- `is`/`has` against an index-signature type is **disallowed** (the cheaper v1, as the proposal
+  permits) — and it falls out for free: an `is`/`has` pattern parses only a `Pattern::TypeName`
+  (a bare identifier), so `{ String: T }` is simply not spellable in pattern position.
+
+**Backing-representation choice — a distinct `LinMap`, values boxed-but-hashed.** A separate
+container (rather than retrofitting a hash side-index onto `LinObject`, the #4b
+`hashed-json-object.md` route) **sidesteps the inline `MakeObject` codegen ABI constraint** entirely
+(the inline literal path GEPs `LinObject` at `entries@16`, 24-byte stride; `LinMap` is opaque to
+codegen — every access goes through `lin_map_*` FFI). Each `LinMap` slot stores
+`(key: *mut LinString, value: TaggedVal)` — values **boxed inside the 16-byte TaggedVal exactly like
+`LinObject` entries**, so the refcount discipline (retain on store, release on overwrite/free) is
+the byte-for-byte proven `object.rs` discipline; only the *lookup* changes from a linear scan to a
+hash probe. This was chosen deliberately for **correctness margin**: the recurring UAF/double-free
+bug class lives in exactly these value RC paths, and reusing the proven discipline keeps the risk in
+the (well-tested) hashing logic, not in novel value ownership. The map's `refcount` sits at offset 0
+(u32), so the generic `lin_rc_retain` works for it unchanged. The O(1) lookup is the headline win;
+**unboxing scalar values** (storing `T` inline when `T` is a flat scalar) is a documented follow-up,
+not part of v1.
+
+**Supersedes `hashed-json-object.md` (#4b).** That proposal's lazy-hash-side-index on generic `Json`
+objects is **obviated** by this work for the dictionary use case: code that needs a dictionary uses
+`{ String: T }` and gets O(1) by construction, while `Json`/`{}` record literals keep their cheap
+small-object assoc-list layout (optimal for the handful-of-fields case). #4b was explicitly left
+*unimplemented* (its own "Decision" section deferred it as not-small-and-safe-enough); doing the
+typed map first fixes performance **and** types **and** the stdlib in one coherent feature rather
+than papering over the dynamic type. #4b is therefore considered superseded for the dictionary
+problem it targeted.
+
+**Stdlib.** `std/object`'s `keys`/`values`/`entries` are made **tag-aware** (new runtime bridges
+`lin_keys_any`/`lin_values_any`/`lin_entries_any` dispatch on the boxed value's tag — TAG_OBJECT →
+`LinObject`, TAG_MAP → `LinMap`), so the SAME functions work over both a `Json`/`{}` record and a
+typed map. `length`/`isEmpty` likewise handle TAG_MAP (`lin_map_length`, `lin_length_dyn`). The
+constructor cluster (`fromEntries`/`merge`/`pick`/`omit`/`mapValues`) stays on the `Json`/`LinObject`
+representation (a map and a record are different runtime containers; silently re-routing them would
+change behaviour) — they remain `Json`-typed and unchanged.
+
+**Performance (microbenchmark `benchmarks/map_index_signature.lin`, insert+lookup of N distinct
+keys, debug-built compiler / O2 output):**
+
+| N | `{ String: T }` (LinMap) | `Json` object (assoc-list) | speedup |
+|------:|------:|------:|------:|
+| 10000 | 18 ms | 1824 ms | ~101x |
+| 20000 | 35 ms | 5664 ms | ~162x |
+| 40000 | 76 ms | 26920 ms | ~354x |
+| 80000 | 308 ms | 151969 ms | ~493x |
+
+The map roughly doubles as N doubles (linear); the `Json` object roughly quadruples (quadratic). At
+N=200000 the `Json` version exceeds 120 s while the map finishes in ~0.4 s.
+
+**Rejected alternative — a nominal `Map<K, V>` container (Option B).** More powerful (non-String
+keys, cleanly separates dictionaries from records) but a larger surface (new literal/constructor
+syntax, `for`/destructuring/equality interactions) and a discoverability footgun (users reach for
+`{}` first). The index-signature form is the smaller change, tightens the already-discoverable `{}`
+type, and is exactly the String-keyed shape the RAPTOR maps need. Non-String-keyed maps can be
+revisited later as an addition.
+
+**Known limitations / follow-ups**: values are boxed (unboxing flat-scalar values inline is the next
+perf step); `fromJson<{String:T}>` is not a v1 decode target (the decoder produces a `LinObject`, not
+a `LinMap` — the descriptor writer treats `Map` as accept-any only for match exhaustiveness); a
+variable's concrete numeric type is preserved through a store (an `Int32` variable stored into a
+`{ String: Int64 }` reads back tagged Int32 — identical to existing `Object` field-store behaviour,
+not a regression); `keys`/`values`/`entries` over a map are hash-order, not insertion-order.

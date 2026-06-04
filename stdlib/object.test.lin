@@ -2,6 +2,7 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
 import { keys, values, entries, fromEntries, merge, pick, omit, mapValues, isEmpty } from "std/object"
 import { length } from "std/array"
+import { range, for } from "std/iter"
 
 val s = suite("std/object", [
   test("keys returns object keys", () =>
@@ -265,6 +266,69 @@ val s = suite("std/object", [
     [
       expect(r["a"]).toBe("x"),
       expect(r["b"]).toBe("y")
+    ]
+  ),
+
+  // --- typed index-signature map `{ String: T }` (ADR-082) ---
+  // The hashed LinMap backing: O(1) lookup, T-typed values, missing key -> Null.
+  test("typed map: insert and lookup", () =>
+    var counts: { String: Int32 } = {}
+    counts["apple"] = 3
+    counts["banana"] = 7
+    [
+      expect(counts["apple"]).toBe(3),
+      expect(counts["banana"]).toBe(7),
+      expect(counts["missing"]).toBe(null)
+    ]
+  ),
+
+  test("typed map: overwrite a key", () =>
+    var m: { String: Int32 } = {}
+    m["k"] = 1
+    m["k"] = 42
+    [
+      expect(m["k"]).toBe(42)
+    ]
+  ),
+
+  test("typed map: keys/values flow over a map", () =>
+    var m: { String: Int32 } = {}
+    m["a"] = 1
+    m["b"] = 2
+    m["c"] = 3
+    [
+      expect(m.keys().length()).toBe(3),
+      expect(m.values().length()).toBe(3)
+    ]
+  ),
+
+  test("typed map: string values (heap RC)", () =>
+    var m: { String: String } = {}
+    m["greeting"] = "hello"
+    m["name"] = "world"
+    [
+      expect(m["greeting"]).toBe("hello"),
+      expect(m["name"]).toBe("world")
+    ]
+  ),
+
+  test("typed map: empty map isEmpty", () =>
+    var m: { String: Int32 } = {}
+    [
+      expect(isEmpty(m)).toBe(true)
+    ]
+  ),
+
+  test("typed map: many distinct keys (forces grow)", () =>
+    var m: { String: Int32 } = {}
+    range(0, 100).for(i =>
+      m["k${toString(i)}"] = i
+    )
+    [
+      expect(m.keys().length()).toBe(100),
+      expect(m["k0"]).toBe(0),
+      expect(m["k99"]).toBe(99),
+      expect(m["k50"]).toBe(50)
     ]
   )
 ])

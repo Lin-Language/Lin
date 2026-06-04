@@ -422,6 +422,10 @@ impl Checker {
                     Type::Union(vec![Type::Union(fields.values().cloned().collect()), Type::Null])
                 }
             }
+            // Typed index-signature map `{ String: T }` (ADR-082): a key access yields `T | Null`
+            // (the missing-key → Null safe-bracket rule, §6.1). No per-key field tracking — the
+            // key set is dynamic by construction.
+            Type::Map(val_ty) => Type::flatten_union(vec![(**val_ty).clone(), Type::Null]),
             Type::Null => Type::Null,
             Type::TypeVar(_) => self.env.fresh_type_var(),
             Type::Union(variants) => {
@@ -720,6 +724,29 @@ impl Checker {
                 }
                 Ok(Some(self.check_object_fields(fields, expected_fields, span)?))
             }
+            // An object literal checked against a typed index-signature map `{ String: T }`
+            // (ADR-082): each literal value must be `T`; the result is typed `Map(T)` and lowered
+            // into a `LinMap`. The empty `{}` literal is the common case (`var m: { String: T } =
+            // {}`), which produces an empty hashed map of the right type — this is how `{}` infers
+            // a map from its assignment-target / return-type context.
+            Type::Map(val_ty) => {
+                let mut typed_fields = Vec::new();
+                for field in fields {
+                    if let ObjectField::Pair(Expr::StringLit(key, _), val_expr) = field {
+                        let typed_val = self.check_expr(val_expr, val_ty)?;
+                        typed_fields.push((key.clone(), typed_val));
+                    } else {
+                        // A non-literal key or a dynamic field shape — defer to ordinary inference.
+                        return Ok(None);
+                    }
+                }
+                Ok(Some(TypedExpr::MakeObject {
+                    fields: typed_fields,
+                    spreads: Vec::new(),
+                    ty: Type::Map(val_ty.clone()),
+                    span,
+                }))
+            }
             Type::Union(variants) => {
                 // Discriminant selection: find the variant whose literal-typed field matches a
                 // matching literal field in the object. Only consider variants that have a
@@ -882,6 +909,18 @@ impl Checker {
                 } else {
                     self.infer_expr(value)?
                 }
+            }
+            // Typed index-signature map `{ String: T }` (ADR-082): the key must be a String and
+            // the value must be `T`.
+            Type::Map(val_ty) => {
+                let key_ty = typed_key.ty();
+                if !key_ty.is_string_ish() && !matches!(key_ty, Type::TypeVar(_)) {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!("a `{}` is keyed by String, but the key is `{}`", obj_ty, key_ty),
+                    ));
+                }
+                self.check_expr(value, val_ty)?
             }
             Type::Array(elem) => self.check_expr(value, elem)?,
             Type::FixedArray(elems) => {

@@ -1,18 +1,22 @@
 import foreign "lin-runtime"
-  val lin_object_values: ({  }) => Json[]
-  val lin_object_entries: ({  }) => Json[]
+  val lin_keys_any: (Json) => String[]
+  val lin_values_any: (Json) => Json[]
+  val lin_entries_any: (Json) => Json[]
 
 import { push, length } from "std/array"
 import { for, some } from "std/iter"
 
+// `keys`/`values`/`entries` are tag-aware (ADR-082): they work on BOTH a `Json`/`{}` record and a
+// typed index-signature map `{ String: T }` (the runtime bridges dispatch on the boxed value's
+// tag). A map argument flows in via the trusted-stdlib `Json` widening.
 export val keys = (obj: Json): String[] =>
-  lin_keys(obj)
+  lin_keys_any(obj)
 
-export val values = (obj: Json): Json =>
-  lin_object_values(obj)
+export val values = (obj: Json): Json[] =>
+  lin_values_any(obj)
 
-export val entries = (obj: Json): Json =>
-  lin_object_entries(obj)
+export val entries = (obj: Json): Json[] =>
+  lin_entries_any(obj)
 
 export val fromEntries = (pairs: Json): Json =>
   var result = {}
@@ -34,7 +38,7 @@ export val pick = (obj: Json, ks: String[]): Json =>
 export val omit = (obj: Json, ks: String[]): Json =>
   val skip = {}
   ks.for(k => skip[k] = true)
-  val allKeys = lin_keys(obj)
+  val allKeys = lin_keys_any(obj)
   var result = {}
   allKeys.for(k =>
     if skip[k] == null then result[k] = obj[k]
@@ -42,7 +46,7 @@ export val omit = (obj: Json, ks: String[]): Json =>
   result
 
 export val mapValues = (obj: Json, f: (Json) => Json): Json =>
-  val ks = lin_keys(obj)
+  val ks = lin_keys_any(obj)
   var result = {}
   ks.for(k =>
     result[k] = f(obj[k])
