@@ -154,6 +154,73 @@ pub unsafe extern "C" fn lin_sealed_release(ptr: *mut u8, size: usize) {
     }
 }
 
+/// Walk a field descriptor over an element PAYLOAD (header-less: a sealed-record array element,
+/// which stores only the packed fields, no 16-byte header) and release each heap field. The
+/// descriptor records STRUCT-relative offsets (from the standalone struct base, including the
+/// header), so each is rebased to the payload by subtracting `SEALED_HEADER`. NULL descriptor (a
+/// scalar-only record) → no heap fields → no-op. Used on sealed-record array drop (Stage 3b).
+#[inline]
+unsafe fn release_payload_fields(payload: *mut u8, desc: *const u8) {
+    if desc.is_null() {
+        return;
+    }
+    let count = *(desc as *const u32);
+    let entries = desc.add(4);
+    for i in 0..count as usize {
+        let ent = entries.add(i * 8);
+        let offset = *(ent as *const u32) as usize;
+        let kind = *((ent.add(4)) as *const u32);
+        // Element offsets are payload-relative; the descriptor stores struct-relative offsets.
+        let slot = payload.add(offset - SEALED_HEADER) as *mut *mut u8;
+        release_field(*slot, kind);
+    }
+}
+
+/// Public wrapper: release the heap fields of one element payload (for the overwrite-old path in
+/// `lin_sealed_array_set`). NULL desc → no-op.
+#[no_mangle]
+pub unsafe extern "C" fn release_payload_fields_pub(payload: *mut u8, desc: *const u8) {
+    release_payload_fields(payload, desc);
+}
+
+/// Release every heap field of every element of a sealed-record array on array drop. `data` is the
+/// element buffer, `len` the element count, `stride` the per-element byte size, `desc` the field
+/// descriptor (NULL for a scalar-only record → no-op). Called by `lin_array_release` for the
+/// `SEALED_ARRAY_TAG` case BEFORE the buffer is freed.
+pub unsafe fn release_sealed_array_elems(data: *mut u8, len: u64, stride: u64, desc: *const u8) {
+    if data.is_null() || desc.is_null() {
+        return; // scalar-only record (or empty): nothing per-field to release.
+    }
+    for i in 0..len {
+        let payload = data.add((i * stride) as usize);
+        release_payload_fields(payload, desc);
+    }
+}
+
+/// Retain each heap field of a sealed-record array element PAYLOAD per the descriptor. Used by the
+/// BORROWED-source push (`lin_sealed_array_push_struct_retaining`): the array slot becomes an
+/// independent +1 owner of each heap field while the source struct keeps its own. NULL descriptor
+/// (scalar-only) → no-op.
+#[no_mangle]
+pub unsafe extern "C" fn retain_sealed_payload_fields(payload: *mut u8, desc: *const u8) {
+    if payload.is_null() || desc.is_null() {
+        return;
+    }
+    let count = *(desc as *const u32);
+    let entries = desc.add(4);
+    for i in 0..count as usize {
+        let ent = entries.add(i * 8);
+        let offset = *(ent as *const u32) as usize;
+        let slot = payload.add(offset - SEALED_HEADER) as *const *mut u8;
+        let p = *slot;
+        if !p.is_null() {
+            // All heap field kinds (String/Array/nested-sealed) carry a u32 refcount at offset 0,
+            // so the uniform retain (bump the u32) is correct for every kind.
+            crate::memory::lin_rc_retain(p as *mut u32);
+        }
+    }
+}
+
 /// Release a sealed-record struct, reading its byte `size` from the header (offset 4) instead of
 /// taking it as an argument. Used where the caller does NOT have the size available — the
 /// closure-capture-release walk (`release_captures`) and the thread-transfer release
