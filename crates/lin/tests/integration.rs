@@ -333,6 +333,81 @@ print(toString(c()))
     assert_eq!(output, vec!["1", "2", "3"]);
 }
 
+// Regression: a closure-local `var` (NOT captured by any inner closure) reassigned inside an
+// `if` branch and READ AFTER the branch joins must observe the in-branch write. Previously the
+// branch's reassignment was dropped: the surrounding block "restored" the slot's pre-block temp
+// (it only preserved slots a stmt DEFINED, not ones a `LocalSet` REASSIGNED), and even with the
+// mapping kept, a plain SSA temp could not model release-old / per-branch ownership at the join.
+// The slot read after the `if` therefore saw its INITIAL value (`length(sts)` was always 0 →
+// `[0, 0, 0]` instead of `[2, 2, 2]`). The fix routes such owning vars through a heap cell and
+// preserves block reassignments. The captured-outer var (`g`) was unaffected (already a cell).
+#[test]
+fn test_closure_local_var_reassigned_in_if_read_after_join() {
+    let output = run(r#"import { for } from "std/iter"
+import { length, push } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+val run = (): Null =>
+  val groups = [[10,11],[20,21],[30,31]]
+  var g = 0
+  var out: Json = []
+  ["a","b","c"].for(id =>
+    var sts: Json = []
+    if g < length(groups) then
+      sts = groups[g]
+      g = g + 1
+    push(out, length(sts))
+  )
+  print("${toString(out)}")
+run()
+"#);
+    assert_eq!(output, vec!["[2, 2, 2]"]);
+}
+
+// Regression (narrowed variant): when the branch condition becomes false partway through the
+// loop, later iterations must read the closure-local var's INITIAL value (the empty `[]`, length
+// 0), and the in-branch writes from the earlier iterations must NOT bleed across iterations
+// (each invocation re-initialises `sts`). Exercises both the then and else join edges.
+#[test]
+fn test_closure_local_var_reassigned_in_if_else_edge() {
+    let output = run(r#"import { for } from "std/iter"
+import { length, push } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+val run = (): Null =>
+  val groups = [[10,11],[20,21],[30,31]]
+  var g = 0
+  var out: Json = []
+  ["a","b","c","d","e"].for(id =>
+    var sts: Json = []
+    if g < length(groups) then
+      sts = groups[g]
+      g = g + 1
+    push(out, length(sts))
+  )
+  print("${toString(out)}")
+run()
+"#);
+    assert_eq!(output, vec!["[2, 2, 2, 0, 0]"]);
+}
+
+// Regression (scalar variant): a non-owning (Int32) plain-SSA `var` reassigned only in the THEN
+// branch and read after the join must merge correctly via the join phi (no heap cell involved).
+#[test]
+fn test_local_int_var_reassigned_in_if_read_after_join() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val f = (c: Boolean): Int32 =>
+  var n = 1
+  if c then
+    n = 42
+  n
+print(toString(f(true)))
+print(toString(f(false)))
+"#);
+    assert_eq!(output, vec!["42", "1"]);
+}
+
 // Regression: an Array (or any heap value) passed as an argument to an INDIRECT call
 // through a closure value must be boxed to Json to match the closure's `Json` parameter,
 // exactly as the named/imported call paths do. Previously the indirect-call lowering passed
