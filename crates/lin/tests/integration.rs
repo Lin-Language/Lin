@@ -11260,3 +11260,62 @@ print("${await(job)}")
 "#);
     assert_eq!(out, vec!["11"]);
 }
+
+#[test]
+fn test_sealed_spread_into_object_materializes() {
+    // REGRESSION (boundary bug, found finishing Stage 1): spreading a sealed scalar record into a
+    // boxed object literal must MATERIALIZE it first — the packed struct is NOT a LinObject, so
+    // passing it raw to the spread/merge runtime walked it as object entries (null-ptr deref). The
+    // spread source is converted to a boxed view (design §3.5 / §5 Stage 1).
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type P = { "x": Int32, "y": Int32 }
+val p: P = { "x": 1, "y": 2 }
+val q = { ...p, "z": 3 }
+print(toString(q))
+val p2: P = { ...p }
+print("${p2["x"]} ${p2["y"]}")
+"#);
+    assert_eq!(out, vec![r#"{"x": 1, "y": 2, "z": 3}"#, "1 2"]);
+}
+
+#[test]
+fn test_sealed_as_array_element_and_object_field_value() {
+    // REGRESSION (boundary bug, found finishing Stage 1): a sealed scalar record used as an ARRAY
+    // ELEMENT or as a FIELD VALUE in a boxed object literal must be materialized to a boxed
+    // LinObject (arrays of sealed records are Stage 3; a sealed field value is not a LinObject).
+    // Storing the packed struct raw under TAG_OBJECT made later serialize/release mis-walk it.
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type P = { "x": Int32, "y": Int32 }
+val p: P = { "x": 1, "y": 2 }
+val arr = [p, p, p]
+print(toString(arr))
+val wrap: Json = { "pt": p, "n": 9 }
+print(toString(wrap))
+"#);
+    assert_eq!(
+        out,
+        vec![
+            r#"[{"x": 1, "y": 2}, {"x": 1, "y": 2}, {"x": 1, "y": 2}]"#,
+            r#"{"pt": {"x": 1, "y": 2}, "n": 9}"#
+        ]
+    );
+}
+
+#[test]
+fn test_sealed_var_reassign_releases_old() {
+    // A `var` of sealed type reassigned multiple times: each old sealed struct must be released
+    // via the sealed release path (not lin_object_release). ASan-gated in CI; functional here.
+    let out = run(r#"
+import { print } from "std/io"
+type P = { "x": Int32, "y": Int32 }
+var v: P = { "x": 0, "y": 0 }
+v = { "x": 1, "y": 1 }
+v = { "x": 2, "y": 3 }
+print("${v["x"]} ${v["y"]}")
+"#);
+    assert_eq!(out, vec!["2 3"]);
+}
