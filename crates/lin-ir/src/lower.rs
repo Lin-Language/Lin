@@ -939,6 +939,24 @@ fn is_rc_type(ty: &Type) -> bool {
     )
 }
 
+/// True when `ty` is a SEALED SCALAR RECORD — a `Type::Object { sealed: true }` all of whose
+/// fields are unboxed scalars (numeric or Bool). MUST mirror `Codegen::sealed_scalar_fields`
+/// exactly: the two decide, independently, when the unboxed packed-struct layout applies, so any
+/// disagreement would make the lowerer's Coerce-insertion and codegen's representation diverge
+/// (a UAF / mis-read). A sealed scalar record is still a concrete refcounted heap value
+/// (`is_rc_type` true), so the owning model treats it like any object — only its physical layout
+/// and its `emit_release`/construct/field-read codegen differ (routed via the sealed runtime).
+fn is_sealed_scalar_repr(ty: &Type) -> bool {
+    matches!(ty, Type::Object { fields, sealed: true }
+        if !fields.is_empty() && fields.values().all(is_sealed_scalar_field_ty))
+}
+
+/// A field type permitted in a sealed scalar record: a fixed-width numeric or Bool. Mirrors
+/// `Codegen::is_sealed_scalar_field`.
+fn is_sealed_scalar_field_ty(ty: &Type) -> bool {
+    ty.is_flat_scalar() || matches!(ty, Type::Bool)
+}
+
 /// A type that participates in the OWNING reference model for var cells / module globals:
 /// a cell/global holding such a value owns one independent reference to it. This covers
 /// both concrete reference-counted heap values (`is_rc_type`) AND boxed Json/union values
@@ -1288,6 +1306,18 @@ fn free_arg_box_shells(shell_boxes: &[Temp], dst: Temp, builder: &mut FuncBuilde
 /// passed to an Int64 param) so the call signature matches.
 fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: &mut FuncBuilder) -> Temp {
     let Some(param_ty) = param_ty else { return arg; };
+    // A sealed scalar-record arg flowing into a `Named` param (a recursive/self-referential type
+    // reference that resolution left unexpanded) is passed THROUGH unchanged: the callee reads
+    // the SAME unresolved `Named` param consistently as the sealed struct (its body's FieldGet
+    // obj_ty is the expanded sealed Object), so the struct pointer flows as an opaque ptr without
+    // a representation change. Without this, the `Named`-is-union-ish check below would box the
+    // sealed struct (materialize → box_object) at e.g. a recursive self-call, storing a boxed
+    // object back into a slot the body reads as a struct → garbage (caught by b_access). For
+    // Stage 1, the only sealed-producing types are non-recursive named records whose `Named`
+    // resolves to that sealed Object, so this pass-through is the correct representation.
+    if is_sealed_scalar_repr(arg_ty) && matches!(param_ty, Type::Named(_)) {
+        return arg;
+    }
     // Box/unbox across the union boundary.
     if is_union_ty(param_ty) != is_union_ty(arg_ty) {
         let dst = builder.alloc_temp(param_ty.clone());
@@ -1300,7 +1330,75 @@ fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: 
         builder.emit(Instruction::Coerce { dst, src: arg, from_ty: arg_ty.clone(), to_ty: param_ty.clone() });
         return dst;
     }
+    // Sealed scalar-record boundary: a wider/Json/unsealed (or differently-shaped sealed) argument
+    // flowing into a sealed scalar-record param must be PROJECTED into the param's struct layout
+    // (and a sealed arg into a Json/unsealed param MATERIALIZED). Without this a DIRECT call passes
+    // a boxed LinObject straight into a function that reads struct offsets → garbage. Mirrors
+    // `type_repr_differs`'s sealed arm.
+    if type_repr_differs(arg_ty, param_ty) {
+        let dst = builder.alloc_temp(param_ty.clone());
+        builder.emit(Instruction::Coerce { dst, src: arg, from_ty: arg_ty.clone(), to_ty: param_ty.clone() });
+        // A projection that produces a sealed scalar record is a fresh +1 owned struct: register
+        // it so the call's arg-scope releases it (sealed release path). Materialization to a boxed
+        // object is likewise fresh and registered by its own (object) owning model downstream.
+        if is_sealed_scalar_repr(param_ty) {
+            builder.register_owned(dst, param_ty.clone());
+        }
+        return dst;
+    }
     arg
+}
+
+/// Lower `value` directly into a sealed scalar-record `slot_ty` AS a packed struct when `value`
+/// is an object LITERAL providing exactly (at least) the target fields, with no spreads. Returns
+/// `Some(temp)` having constructed the struct in place (field values stored by offset) — skipping
+/// the build-boxed-LinObject-then-project round-trip the generic coercion would otherwise pay
+/// (an `lin_object_alloc` + N sets + N `lin_object_get`). Returns `None` when the fast path does
+/// not apply (caller falls back to `lower_expr` + `coerce_to_slot_type`). This is the construction
+/// half of the sealed-records win (sealed-records Stage 1); it fires for `val p: T = { … }`,
+/// `(…): T => { … }` returns, and arg/assignment boundaries.
+fn try_lower_sealed_literal(
+    value: &TypedExpr,
+    slot_ty: &Type,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<Temp> {
+    if !is_sealed_scalar_repr(slot_ty) {
+        return None;
+    }
+    let (fields, spreads) = match value {
+        TypedExpr::MakeObject { fields, spreads, .. } => (fields, spreads),
+        _ => return None,
+    };
+    if !spreads.is_empty() {
+        return None;
+    }
+    let Type::Object { fields: target_fields, .. } = slot_ty else { return None };
+    if !target_fields.keys().all(|k| fields.iter().any(|(fk, _)| fk == k)) {
+        return None;
+    }
+    let lowered_fields: Vec<(String, Temp)> =
+        fields.iter().map(|(k, v)| (k.clone(), lower_expr(v, builder, ctx))).collect();
+    let dst = builder.alloc_temp(slot_ty.clone());
+    builder.emit(Instruction::MakeObject { dst, fields: lowered_fields, spreads: vec![], ty: slot_ty.clone() });
+    builder.register_owned(dst, slot_ty.clone());
+    Some(dst)
+}
+
+/// Lower `value` into a slot of declared type `slot_ty`, producing a temp in the slot's
+/// representation. Uses the sealed-literal direct-construction fast path when applicable
+/// (`try_lower_sealed_literal`), otherwise `lower_expr` + `coerce_to_slot_type`.
+fn lower_value_into_slot(
+    value: &TypedExpr,
+    slot_ty: &Type,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Temp {
+    if let Some(t) = try_lower_sealed_literal(value, slot_ty, builder, ctx) {
+        return t;
+    }
+    let t = lower_expr(value, builder, ctx);
+    coerce_to_slot_type(t, &value.ty(), slot_ty, builder)
 }
 
 /// Coerce a value temp to a slot's declared type when their runtime representations
@@ -1423,11 +1521,11 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 );
                 builder.slots.insert(*slot, t);
             } else {
-                let t = lower_expr(value, builder, ctx);
                 // Store the value in the slot's declared representation: a concrete value
                 // bound to a Json/union slot must be boxed so later reads (LocalGet, is/has)
-                // see a TaggedVal*.
-                let t = coerce_to_slot_type(t, &value.ty(), ty, builder);
+                // see a TaggedVal*. A sealed scalar-record slot bound to an object literal is
+                // constructed directly as a packed struct (fast path inside lower_value_into_slot).
+                let t = lower_value_into_slot(value, ty, builder, ctx);
                 builder.slots.insert(*slot, t);
                 // Also publish top-level vals to their module global (for closure reads).
                 if ctx.global_val_slots.contains_key(slot) {
@@ -1933,6 +2031,16 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         }
 
         TypedExpr::Coerce { expr, from, to, .. } => {
+            // CONSTRUCTION fast path (sealed-records Stage 1): a Coerce of an object LITERAL into a
+            // sealed scalar record `{ … }: T` constructs the packed struct DIRECTLY (each scalar
+            // field stored by offset), instead of building a boxed LinObject and then projecting
+            // it (which would pay an object alloc + N lin_object_set + N lin_object_get). Only when
+            // the literal has no spreads and provides every target field — otherwise fall through
+            // to the general project-from-source coercion. The lowered MakeObject is tagged with
+            // the SEALED target type so codegen lays it out as a struct.
+            if let Some(t) = try_lower_sealed_literal(expr, to, builder, ctx) {
+                return t;
+            }
             let src = lower_expr(expr, builder, ctx);
             let dst = builder.alloc_temp(to.clone());
             builder.emit(Instruction::Coerce {
@@ -1941,6 +2049,15 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 from_ty: from.clone(),
                 to_ty: to.clone(),
             });
+            // A projection / materialization Coerce that PRODUCES a sealed scalar record allocates
+            // a FRESH owned struct (+1) — register it so scope-exit releases it (via the sealed
+            // release path). The source keeps its own ownership. Materialization to a boxed object
+            // is likewise a fresh owned value, already handled by the existing owning model for the
+            // result temp's (object/union) type. Only the sealed-target case needs registering here
+            // because `Coerce` does not otherwise register its result.
+            if is_sealed_scalar_repr(to) {
+                builder.register_owned(dst, to.clone());
+            }
             dst
         }
 
@@ -2044,6 +2161,28 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
         TypedExpr::Index { object, key, result_type, .. } => {
             let obj_ty = object.ty();
             let key_ty = key.ty();
+            // Sealed scalar record + a compile-time-known string key `x["f"]` → constant-offset
+            // FieldGet (same as `x.f`). The field is guaranteed present (a missing field on a
+            // concrete sealed type is already a compile error). Routes to the unboxed load path
+            // rather than the dynamic `lin_object_get` Index path.
+            if is_sealed_scalar_repr(&obj_ty) {
+                if let TypedExpr::StringLit(name, _, _) = key.as_ref() {
+                    let obj_temp = lower_expr(object, builder, ctx);
+                    let dst = builder.alloc_temp(result_type.clone());
+                    builder.emit(Instruction::FieldGet {
+                        dst,
+                        object: obj_temp,
+                        field: name.clone(),
+                        obj_ty,
+                        result_ty: result_type.clone(),
+                    });
+                    if is_rc_type(result_type) {
+                        builder.emit(Instruction::Retain { val: dst, ty: result_type.clone() });
+                        builder.register_owned(dst, result_type.clone());
+                    }
+                    return dst;
+                }
+            }
             // Borrow the container if it is a bare `LocalGet` of a concrete-RC array/object: the
             // element read does not need an owning reference, so skip the retain/release pair the
             // owning load would emit (the dominant cost of tight index loops over a var array).
@@ -3114,7 +3253,38 @@ fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp,
 /// must be coerced (boxed/unboxed) to be used as the other. Specifically: one is a
 /// union/Json (TaggedVal*) and the other is a concrete type.
 fn type_repr_differs(from: &Type, to: &Type) -> bool {
-    is_union_ty(from) != is_union_ty(to)
+    // A sealed scalar record flowing into (or out of) a `Named` type reference: same physical
+    // representation (an opaque struct ptr), no conversion. `Named` is treated as union-ish by
+    // `is_union_ty` (recursive types are boxed), which would otherwise box/materialize the sealed
+    // struct here — see the matching guard + rationale in `lower_coerce_arg`. For Stage 1 a
+    // `Named` that a sealed value is compatible with resolves to that sealed Object.
+    if (is_sealed_scalar_repr(from) && matches!(to, Type::Named(_)))
+        || (is_sealed_scalar_repr(to) && matches!(from, Type::Named(_)))
+    {
+        return false;
+    }
+    // The union/Json box boundary.
+    if is_union_ty(from) != is_union_ty(to) {
+        return true;
+    }
+    // The sealed scalar-record boundary (sealed-records Stage 1). A sealed scalar struct and a
+    // boxed `LinObject` (an unsealed object literal, or — via the union arm above already — a
+    // Json value) are physically DIFFERENT representations even though `Type`'s PartialEq treats
+    // them as structurally equal (it ignores `sealed`). So whenever exactly one side is a sealed
+    // scalar record, a `Coerce` must be inserted: codegen's `compile_ir_coerce` then PROJECTS a
+    // boxed source into a fresh sealed struct (Object→sealed) or MATERIALIZES a sealed struct into
+    // a boxed LinObject (sealed→Object). When BOTH sides are the same sealed scalar record there
+    // is no repr difference (no coercion). (sealed↔union is already covered by the union arm.)
+    if is_sealed_scalar_repr(from) != is_sealed_scalar_repr(to) {
+        return true;
+    }
+    // Both sealed scalar records but a DIFFERENT field layout (e.g. a wider sealed type projected
+    // to a narrower one): their physical layouts differ, so re-project. `Type` PartialEq compares
+    // the field maps, so `from != to` here means a different shape.
+    if is_sealed_scalar_repr(from) && is_sealed_scalar_repr(to) && from != to {
+        return true;
+    }
+    false
 }
 
 /// True when two CONCRETE numeric types have a different unboxed machine representation, so a
@@ -5160,6 +5330,9 @@ fn lower_function_expr_with_id(
             capture_kinds.push(match &cap.ty {
                 Type::Str | Type::StrLit(_) => CaptureRelease::Str,
                 Type::Array(_) | Type::FixedArray(_) => CaptureRelease::Array,
+                // A SEALED scalar record is a packed struct, not a LinObject — its capture must be
+                // released via lin_sealed_release_self (CaptureRelease::Sealed), NOT lin_object_release.
+                Type::Object { .. } if is_sealed_scalar_repr(&cap.ty) => CaptureRelease::Sealed,
                 Type::Object { .. } => CaptureRelease::Object,
                 Type::Function { .. } => CaptureRelease::Closure,
                 // is_rc_type covers exactly the above; any other owning type is union (handled).

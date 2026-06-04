@@ -338,6 +338,53 @@ impl<'ctx> Codegen<'ctx> {
                 return self.compile_binary_op_values(lext, rext, op, wide_ty, wide_ty, result_ty);
             }
         }
+        // Sealed scalar-record equality (sealed-records Stage 1). MUST come before the boxed-union
+        // arms below: a sealed Object is not `is_union_type`, but boxing it via `box_value`
+        // (Type::Object → box_object) would treat its packed-struct ptr as a LinObject and corrupt.
+        // Order-independent per spec §3.4 (a sealed value == a same-shape boxed Json/object).
+        if matches!(op, BinOp::Eq | BinOp::NotEq) {
+            let l_sealed = Self::sealed_scalar_fields(lty).is_some();
+            let r_sealed = Self::sealed_scalar_fields(rty).is_some();
+            if l_sealed || r_sealed {
+                // Fast path: both the SAME sealed scalar type → field-wise compare by offset.
+                if l_sealed && r_sealed && lty == rty && lv.is_pointer_value() && rv.is_pointer_value() {
+                    let fields = Self::sealed_scalar_fields(lty).unwrap().clone();
+                    let eq = self.sealed_eq(lv, rv, &fields);
+                    return if matches!(op, BinOp::NotEq) { self.builder.not(eq, "sealed_ne").into() } else { eq.into() };
+                }
+                // Mixed (sealed vs Json/unsealed, or two different sealed shapes): box BOTH sides
+                // to a TaggedVal* and use the order-independent tagged equality. A MATERIALIZED
+                // (sealed) side wraps a FRESH +1 LinObject owned by the box — reclaim it fully
+                // afterwards (shell + inner). A NON-materialized (unsealed/Json) side wraps a
+                // BORROWED value — its owner (the enclosing scope) frees it, so reclaim only the
+                // 16-byte box SHELL here, never the inner (the historical UAF, ASan-caught).
+                let ptr_t = self.context.ptr_type(AddressSpace::default());
+                let (lboxed, l_materialized) = if l_sealed {
+                    let f = Self::sealed_scalar_fields(lty).unwrap().clone();
+                    let obj = self.sealed_materialize_to_object(lv, &f);
+                    (self.box_value(obj, &Type::object(f)), true)
+                } else { (self.box_value(lv, lty), false) };
+                let (rboxed, r_materialized) = if r_sealed {
+                    let f = Self::sealed_scalar_fields(rty).unwrap().clone();
+                    let obj = self.sealed_materialize_to_object(rv, &f);
+                    (self.box_value(obj, &Type::object(f)), true)
+                } else { (self.box_value(rv, rty), false) };
+                let i8_ty = self.context.i8_type();
+                let eq_fn = self.get_or_declare_fn("lin_tagged_eq", i8_ty.fn_type(&[ptr_t.into(), ptr_t.into()], false));
+                let eq_u8 = self.builder.call(eq_fn, &[lboxed.into(), rboxed.into()], "sealed_teq").try_as_basic_value().unwrap_basic().into_int_value();
+                let eq = self.builder.int_truncate(eq_u8, self.context.bool_type(), "sealed_teq_b");
+                let free_box_shell = self.get_or_declare_fn("lin_tagged_free_box", self.context.void_type().fn_type(&[ptr_t.into()], false));
+                // Materialized box: full release (drops fresh inner +1). A box freshly created by
+                // box_value over a CONCRETE side (a fresh shell wrapping a borrowed inner): free the
+                // SHELL only. An already-union side passed through box_value unchanged: it is owned
+                // elsewhere — touch nothing.
+                if l_materialized { self.builder.call(self.rt.tagged_release, &[lboxed.into()], ""); }
+                else if !Self::is_union_type(lty) && lboxed.is_pointer_value() { self.builder.call(free_box_shell, &[lboxed.into()], ""); }
+                if r_materialized { self.builder.call(self.rt.tagged_release, &[rboxed.into()], ""); }
+                else if !Self::is_union_type(rty) && rboxed.is_pointer_value() { self.builder.call(free_box_shell, &[rboxed.into()], ""); }
+                return if matches!(op, BinOp::NotEq) { self.builder.not(eq, "sealed_tne").into() } else { eq.into() };
+            }
+        }
         // Equality / ordering where EITHER operand is a boxed union (Json/TypeVar). These
         // must be ORDER-SYMMETRIC: `lit == proj` and `proj == lit` have to agree. The boxed
         // operand is a TaggedVal* whose representation differs from a concrete value (e.g. a

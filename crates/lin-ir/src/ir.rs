@@ -215,6 +215,13 @@ pub enum CaptureRelease {
     Closure,
     /// Boxed `TaggedVal*` (union/Json) → `lin_tagged_release` (drops inner payload + frees box).
     Tagged,
+    /// Captured SEALED scalar record (sealed-records Stage 1): a packed `[u32 rc | u32 size |
+    /// scalars]` struct, NOT a `LinObject`. Retained on capture via `lin_rc_retain` (offset-0 rc),
+    /// released by `lin_closure_release` via `lin_sealed_release_self` (which reads the byte size
+    /// from the struct's offset-4 header) — NOT `lin_object_release`, which would mis-walk the
+    /// struct as object entries (a heap-buffer-overflow). Deep-copied across threads by a flat
+    /// byte copy (`transfer::CAP_SEALED`).
+    Sealed,
     /// MOVED resource capture (streams brief §9, ADR-072): a `Stream` (or `Stream | Error`) crosses
     /// the thread boundary by MOVE, not copy. The pointer is handed off verbatim — NO clone on
     /// capture, NO retain — and the SOURCE must not release it (the affine check guarantees it is
@@ -236,6 +243,7 @@ impl CaptureRelease {
             CaptureRelease::Object => 3,
             CaptureRelease::Closure => 4,
             CaptureRelease::Tagged => 5,
+            CaptureRelease::Sealed => 7,
             // CAP_MOVE: the worker releases a moved resource the same way it releases a Tagged
             // capture (`lin_tagged_release` → TAG_STREAM finalizer). The distinction is on the
             // capture/source side, not the release side. Mirrors `transfer::CAP_MOVE`.

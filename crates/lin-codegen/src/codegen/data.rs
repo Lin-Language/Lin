@@ -586,8 +586,172 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    // ───────────────────────── Sealed scalar records (Stage 1) ─────────────────────────
+    //
+    // A sealed scalar record (gate: `Codegen::sealed_scalar_fields`) is a packed heap struct
+    // `[ u32 rc | u32 pad | fields… ]` allocated by `lin_sealed_alloc`, with fields at the
+    // natural-aligned byte offsets `Codegen::sealed_field_layout` computes (declaration order).
+    // The LLVM value is an opaque `ptr` (so it flows through the existing object-as-ptr ABI).
+
+    /// Load `field` from a sealed scalar record at its constant byte offset — THE win: a single
+    /// typed load, no `lin_object_get` call / hash lookup / unbox. `obj` is the struct ptr.
+    pub(crate) fn sealed_field_get(
+        &mut self,
+        obj: BasicValueEnum<'ctx>,
+        field: &str,
+        fields: &indexmap::IndexMap<String, Type>,
+        result_ty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let (offset, _total) = Self::sealed_field_layout(fields, field);
+        let i64_ty = self.context.i64_type();
+        let base = obj.into_pointer_value();
+        let fld_ty = fields.get(field).cloned().unwrap_or(Type::Null);
+        let llvm_fld = self.llvm_type(&fld_ty);
+        let p = unsafe {
+            self.builder.gep(self.context.i8_type(), base, &[i64_ty.const_int(offset, false)], "sealed_fld_p")
+        };
+        let loaded = self.builder.load(llvm_fld, p, "sealed_fld");
+        // The declared result_ty may be a wider numeric than the stored field (e.g. field Int32
+        // read into an Int64 slot); reconcile via the standard coerce.
+        if &fld_ty == result_ty { loaded } else { self.compile_ir_coerce(loaded, &fld_ty, result_ty) }
+    }
+
+    /// Allocate a fresh sealed scalar record and store each field's scalar by offset.
+    /// `field_vals` are (name, value, value_ty) in any order; they are stored at the layout
+    /// offsets. Returns the struct ptr (+1 owned). No per-field RC (all fields scalar).
+    pub(crate) fn sealed_construct(
+        &mut self,
+        fields: &indexmap::IndexMap<String, Type>,
+        field_vals: &[(String, BasicValueEnum<'ctx>, Type)],
+    ) -> BasicValueEnum<'ctx> {
+        let total = Self::sealed_struct_size(fields);
+        let i64_ty = self.context.i64_type();
+        let obj = self.builder.call(self.rt.sealed_alloc, &[i64_ty.const_int(total, false).into()], "sealed_obj")
+            .try_as_basic_value().unwrap_basic().into_pointer_value();
+        for (name, val, val_ty) in field_vals {
+            let (offset, _) = Self::sealed_field_layout(fields, name);
+            let fld_ty = fields.get(name).cloned().unwrap_or(Type::Null);
+            // Convert the supplied value to the field's stored representation if needed.
+            let stored = if val_ty == &fld_ty { *val } else { self.compile_ir_coerce(*val, val_ty, &fld_ty) };
+            let p = unsafe {
+                self.builder.gep(self.context.i8_type(), obj, &[i64_ty.const_int(offset, false)], "sealed_set_p")
+            };
+            self.builder.store(p, stored);
+        }
+        obj.into()
+    }
+
+    /// Materialize a sealed scalar record into a fresh boxed `LinObject` (TAG_OBJECT semantics):
+    /// the universal Json representation. Used at the sealed→Json/unsealed boundary so all the
+    /// existing dynamic object machinery (toString/keys/print/dynamic-index/eq-vs-Json) operates
+    /// unchanged on a normal LinObject. Returns the raw `LinObject*` (+1 owned). Each scalar field
+    /// is loaded by offset, boxed, and `lin_object_set_fresh`'d under its interned string key.
+    pub(crate) fn sealed_materialize_to_object(
+        &mut self,
+        obj: BasicValueEnum<'ctx>,
+        fields: &indexmap::IndexMap<String, Type>,
+    ) -> BasicValueEnum<'ctx> {
+        let i32_ty = self.context.i32_type();
+        let new_obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(fields.len() as u64, false).into()], "sealed_mat")
+            .try_as_basic_value().unwrap_basic().into_pointer_value();
+        let keys: Vec<String> = fields.keys().cloned().collect();
+        for k in &keys {
+            let fld_ty = fields.get(k).cloned().unwrap_or(Type::Null);
+            let scalar = self.sealed_field_get(obj, k, fields, &fld_ty);
+            // Box the scalar to a TaggedVal*; object_set_fresh COPIES the 16-byte TaggedVal and
+            // RETAINS its inner — but a scalar payload has no inner heap, so the fresh box's shell
+            // is leaked unless freed. Mirror `emit_object_set`: release the fresh box afterward.
+            let boxed = self.box_value(scalar, &fld_ty);
+            let key_str = self.compile_string_lit(k).into_pointer_value();
+            self.builder.call(self.rt.object_set_fresh, &[new_obj.into(), key_str.into(), boxed.into()], "");
+            if boxed.is_pointer_value() {
+                self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+            }
+        }
+        new_obj.into()
+    }
+
+    /// Project a source value (`src`, statically `src_ty`) into a FRESH sealed scalar record of
+    /// `target_fields`. THE central boundary op. Non-mutating: `src` is untouched (its own owner
+    /// releases it), extras are ignored, and the result is an independent +1 struct. The source
+    /// is read by whatever representation it has:
+    ///   - another sealed scalar record → field copy by offset;
+    ///   - a boxed `LinObject` / Json TaggedVal → `lin_object_get` per target field, unbox, store.
+    pub(crate) fn sealed_project_from(
+        &mut self,
+        src: BasicValueEnum<'ctx>,
+        src_ty: &Type,
+        target_fields: &indexmap::IndexMap<String, Type>,
+    ) -> BasicValueEnum<'ctx> {
+        // Source already a sealed scalar record of (possibly) a different shape: copy fields by
+        // offset. (`is_sealed_scalar_record` checks the source carries the sealed layout.)
+        if let Some(src_fields) = Self::sealed_scalar_fields(src_ty) {
+            let vals: Vec<(String, BasicValueEnum<'ctx>, Type)> = target_fields.keys().map(|k| {
+                let fty = target_fields.get(k).cloned().unwrap_or(Type::Null);
+                let v = self.sealed_field_get(src, k, src_fields, &fty);
+                (k.clone(), v, fty)
+            }).collect();
+            return self.sealed_construct(target_fields, &vals);
+        }
+        // Source is a boxed object / Json. Unbox to the raw LinObject* if it is a union/Json box.
+        let container = if Self::is_union_type(src_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[src.into()], "sealed_proj_unbox").try_as_basic_value().unwrap_basic()
+        } else {
+            src
+        };
+        let vals: Vec<(String, BasicValueEnum<'ctx>, Type)> = target_fields.keys().map(|k| {
+            let fty = target_fields.get(k).cloned().unwrap_or(Type::Null);
+            let key_str = self.compile_string_lit(k).into_pointer_value();
+            // lin_object_get returns an INTERIOR pointer to the entry's TaggedVal (borrowed); unbox
+            // it to the field's scalar. No ownership taken (scalar, nothing to release).
+            let tagged = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "sealed_proj_get").try_as_basic_value().unwrap_basic();
+            let v = self.unbox_tagged_val_to_type(tagged, &fty);
+            (k.clone(), v, fty)
+        }).collect();
+        self.sealed_construct(target_fields, &vals)
+    }
+
+    /// Field-wise equality of two sealed scalar records of the SAME type (`fields`). Loads each
+    /// field by offset and compares with the scalar equality for that field type, AND-ing. Returns
+    /// an i1.
+    pub(crate) fn sealed_eq(
+        &mut self,
+        a: BasicValueEnum<'ctx>,
+        b: BasicValueEnum<'ctx>,
+        fields: &indexmap::IndexMap<String, Type>,
+    ) -> inkwell::values::IntValue<'ctx> {
+        let bool_ty = self.context.bool_type();
+        let mut acc = bool_ty.const_int(1, false);
+        for (k, fty) in fields.iter() {
+            let av = self.sealed_field_get(a, k, fields, fty);
+            let bv = self.sealed_field_get(b, k, fields, fty);
+            let eq = if fty.is_float() {
+                self.builder.float_compare(inkwell::FloatPredicate::OEQ, av.into_float_value(), bv.into_float_value(), "sealed_feq")
+            } else {
+                self.builder.int_compare(IntPredicate::EQ, av.into_int_value(), bv.into_int_value(), "sealed_ieq")
+            };
+            acc = self.builder.and(acc, eq, "sealed_eq_acc");
+        }
+        acc
+    }
+
+    /// Release a sealed scalar record: `lin_sealed_release(ptr, size)`. No per-field release.
+    pub(crate) fn emit_sealed_release(&mut self, val: BasicValueEnum<'ctx>, fields: &indexmap::IndexMap<String, Type>) {
+        if !val.is_pointer_value() { return; }
+        let total = Self::sealed_struct_size(fields);
+        let i64_ty = self.context.i64_type();
+        self.builder.call(self.rt.sealed_release, &[val.into(), i64_ty.const_int(total, false).into()], "");
+    }
+
     pub(crate) fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, obj_ty: &Type, result_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        // Sealed scalar record: constant-offset load (the win).
+        if let Some(fields) = Self::sealed_scalar_fields(obj_ty) {
+            if obj.is_pointer_value() {
+                return self.sealed_field_get(obj, field, fields, result_ty);
+            }
+            return ptr_ty.const_null().into();
+        }
         if obj.is_pointer_value() {
             // A Json/union object arrives as a boxed TaggedVal*; unbox to the raw LinObject*.
             let container = if Self::is_union_type(obj_ty) {

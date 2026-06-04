@@ -139,6 +139,70 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    /// Byte size of `SEALED_HEADER` (refcount u32 + u32 pad). Kept in lockstep with
+    /// `lin_runtime::sealed::SEALED_HEADER` (8). Sealed-record field payload begins here.
+    pub(crate) const SEALED_HEADER: u64 = 8;
+
+    /// True when `ty` is an unboxed scalar field of a sealed scalar record: a fixed-width
+    /// numeric (mirrors `is_flat_scalar`) OR `Bool`. These are the ONLY field kinds that
+    /// qualify a named record for the unboxed struct layout — any String/Object/Array/union/
+    /// nested/Json field keeps the whole record boxed (Stage 1 scope).
+    pub(crate) fn is_sealed_scalar_field(ty: &Type) -> bool {
+        Self::is_flat_scalar(ty) || matches!(ty, Type::Bool)
+    }
+
+    /// THE sealed-scalar gate (sealed-records Stage 1). Returns `Some(fields)` iff `ty` is a
+    /// `Type::Object { sealed: true }` whose fields are ALL unboxed scalars — the only types that
+    /// get the unboxed packed-struct layout. Returns `None` (→ keep the boxed `LinObject` path)
+    /// for: an unsealed object (anonymous literal/inferred shape), any object with a heap field
+    /// (String/Object/Array/union/nested), and every non-object type. FAIL SAFE: when unsure,
+    /// `None` (boxed). The field order is the TYPE DECLARATION's `IndexMap` order, preserved by
+    /// Stage 0.5 resolution — this fixes a single canonical physical layout per type.
+    pub(crate) fn sealed_scalar_fields(ty: &Type) -> Option<&indexmap::IndexMap<String, Type>> {
+        match ty {
+            Type::Object { fields, sealed: true } if !fields.is_empty()
+                && fields.values().all(Self::is_sealed_scalar_field) =>
+            {
+                Some(fields)
+            }
+            _ => None,
+        }
+    }
+
+    /// Byte offset (from the struct base, including the header) of `field` within a sealed scalar
+    /// record, and the total struct byte size. Fields are packed in declaration order with NATURAL
+    /// alignment (each scalar aligned to its own width); the struct is padded to an 8-byte multiple
+    /// so arrays/successive allocs stay aligned. Returns `(offset_of_field, total_size)`.
+    /// Panics if `field` is not in the record (a compile error already rules this out upstream).
+    pub(crate) fn sealed_field_layout(fields: &indexmap::IndexMap<String, Type>, field: &str) -> (u64, u64) {
+        let mut offset = Self::SEALED_HEADER;
+        let mut found: Option<u64> = None;
+        for (k, fty) in fields.iter() {
+            let sz = fty.bit_width().map(|b| (b as u64) / 8).unwrap_or(1).max(1);
+            // Natural alignment = the field's own size (1/2/4/8). Round offset up.
+            let align = sz;
+            offset = (offset + align - 1) / align * align;
+            if k == field {
+                found = Some(offset);
+            }
+            offset += sz;
+        }
+        // Pad total to 8.
+        let total = (offset + 7) / 8 * 8;
+        (found.unwrap_or_else(|| panic!("sealed_field_layout: field {field:?} not in record")), total)
+    }
+
+    /// Total byte size of a sealed scalar record (header + packed fields, padded to 8).
+    pub(crate) fn sealed_struct_size(fields: &indexmap::IndexMap<String, Type>) -> u64 {
+        let mut offset = Self::SEALED_HEADER;
+        for fty in fields.values() {
+            let sz = fty.bit_width().map(|b| (b as u64) / 8).unwrap_or(1).max(1);
+            offset = (offset + sz - 1) / sz * sz;
+            offset += sz;
+        }
+        (offset + 7) / 8 * 8
+    }
+
     /// Returns true when the element type maps to a flat unboxed scalar array.
     /// Only concrete fixed-width numeric scalars qualify — not Bool (stored as i1,
     /// awkward to pack densely), not pointers, not unions.
