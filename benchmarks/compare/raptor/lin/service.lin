@@ -1,7 +1,10 @@
 // gtfs/Service — calendar runsOn logic.
 //
-// A Service is modelled as a plain record (Json object):
-//   { "startDate": Int, "endDate": Int, "days": { "<dow>": Bool }, "dates": { "<date>": Bool } }
+// A Service is the named record type `Service` (types.lin):
+//   { "startDate": Int32, "endDate": Int32, "days": Json, "dates": Json }
+// `days` ({ "<dow>": Bool }) and `dates` ({ "<date>": Bool }) are dynamic-key
+// index maps, so they stay `Json` field types — pending the `{ String: T }`
+// map type (docs/proposals/typed-map-index-signature.md).
 // `dates` is the include/exclude index: a key present with value `true` includes that
 // date, present with `false` excludes it; absent means "fall through to the range check".
 //
@@ -11,7 +14,9 @@
 //
 // In Lin a missing object key reads as `null`, a present `false` reads as `false`, so
 // `dates[d] == null` is exactly `!hasOwn`, and `dates[d] == true` is the include short-circuit.
-export val makeService = (startDate: Int32, endDate: Int32, days: Json, dates: Json): Json =>
+import { Service } from "./types"
+
+export val makeService = (startDate: Int32, endDate: Int32, days: Json, dates: Json): Service =>
   {
     "startDate": startDate,
     "endDate": endDate,
@@ -19,7 +24,7 @@ export val makeService = (startDate: Int32, endDate: Int32, days: Json, dates: J
     "dates": dates
   }
 
-export val runsOn = (service: Json, date: Int32, dow: Int32): Boolean =>
+export val runsOn = (service: Service, date: Int32, dow: Int32): Boolean =>
   val dates = service["dates"]
   val entry = dates["${date}"]
   if entry == true then

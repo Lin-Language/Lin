@@ -1,7 +1,8 @@
 // query/DateUtil — date handling in UTC.
 //
-// The reference uses a JS `Date` (UTC midnight). We model a calendar date as a record:
-//   { "year": Int, "month": Int (1-12), "day": Int (1-31) }
+// The reference uses a JS `Date` (UTC midnight). We model a calendar date as the
+// named record type `Date` (types.lin): { "year": Int32, "month": Int32 (1-12),
+// "day": Int32 (1-31) } — fully concrete, so a sealed-record unboxed candidate.
 // `getDateNumber` -> YYYYMMDD integer (Service.runsOn comparable).
 // `dayOfWeek`     -> Sunday=0 .. Saturday=6 (matches JS Date.getDay in UTC).
 // `addDays`       -> real calendar arithmetic with month/year rollover.
@@ -9,8 +10,9 @@
 // A date string "2018-10-16" is parsed by `parseDate`.
 import { split } from "std/string"
 import { parseInt32 } from "std/number"
+import { Date } from "./types"
 
-export val parseDate = (s: String): Json =>
+export val parseDate = (s: String): Date =>
   val parts = split(s, "-")
   {
     "year": parseInt32(parts[0]),
@@ -18,7 +20,7 @@ export val parseDate = (s: String): Json =>
     "day": parseInt32(parts[2])
   }
 
-export val getDateNumber = (date: Json): Int32 =>
+export val getDateNumber = (date: Date): Int32 =>
   date["year"] * 10000 + date["month"] * 100 + date["day"]
 
 val isLeap = (y: Int32): Boolean =>
@@ -32,7 +34,7 @@ val daysInMonth = (y: Int32, m: Int32): Int32 =>
   else
     31
 
-export val addDay = (date: Json): Json =>
+export val addDay = (date: Date): Date =>
   val y = date["year"]
   val m = date["month"]
   val d = date["day"]
@@ -72,7 +74,7 @@ val tTable = [
   4
 ]
 
-export val dayOfWeek = (date: Json): Int32 =>
+export val dayOfWeek = (date: Date): Int32 =>
   val m = date["month"]
   val y0 = date["year"]
   val y = if m < 3 then y0 - 1 else y0
