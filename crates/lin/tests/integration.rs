@@ -10920,3 +10920,163 @@ range(0, 1000000).for(i => print("line ${i}"))
 fn libc_sigabrt() -> i32 {
     6
 }
+
+// -------------------------------------------------------------------------
+// Closed-concrete-union discrimination fast path (perf/union-discrimination)
+//
+// `is V` over a closed concrete union no longer recursively re-validates V's
+// fields (`lin_matches_schema`); when V is distinguished from its siblings by a
+// StrLit discriminant field it lowers to a cheap `scrut[key] == "lit"` test. The
+// optimisation MUST be behaviour-preserving and MUST NOT weaken the `:Json`
+// (untrusted-shape) case, which still needs full recursive validation.
+// -------------------------------------------------------------------------
+
+#[test]
+fn test_union_discrim_strlit_closed_concrete() {
+    // Closed concrete union discriminated by a StrLit field VALUE. Both arms must
+    // select the correct variant and the narrowed binding must read the right field.
+    let out = run(r#"
+import { print } from "std/io"
+type Ok = { "type": "ok", "value": Int32 }
+type Err = { "type": "err", "msg": String }
+type Res = Ok | Err
+
+val describe = (r: Res): String =>
+  match r
+    is Ok => "ok=${r["value"]}"
+    is Err => "err=${r["msg"]}"
+
+val a: Res = { "type": "ok", "value": 42 }
+val b: Res = { "type": "err", "msg": "boom" }
+print(describe(a))
+print(describe(b))
+"#);
+    assert_eq!(out, vec!["ok=42", "err=boom"]);
+}
+
+#[test]
+fn test_union_discrim_strlit_three_variants() {
+    // Three-variant StrLit-discriminated closed concrete union: each `is` arm must
+    // be distinguished from BOTH siblings by its distinct StrLit discriminant.
+    let out = run(r#"
+import { print } from "std/io"
+type A = { "tag": "a", "x": Int32 }
+type B = { "tag": "b", "y": String }
+type C = { "tag": "c", "z": Boolean }
+type ABC = A | B | C
+
+val f = (v: ABC): String =>
+  match v
+    is A => "A:${v["x"]}"
+    is B => "B:${v["y"]}"
+    is C => "C:${v["z"]}"
+
+val a: ABC = { "tag": "a", "x": 7 }
+val b: ABC = { "tag": "b", "y": "hi" }
+val c: ABC = { "tag": "c", "z": true }
+print(f(a))
+print(f(b))
+print(f(c))
+"#);
+    assert_eq!(out, vec!["A:7", "B:hi", "C:true"]);
+}
+
+#[test]
+fn test_union_discrim_presence_only_falls_back_but_correct() {
+    // Closed concrete union whose variants are disjoint ONLY by field PRESENCE
+    // (the base-String `kind`, the calc AST `Num | BinOp` shape). Field presence is
+    // UNSOUND under structural width-subtyping, so this case FALLS BACK to the full
+    // recursive `MatchesSchema` — it must still match correctly.
+    let out = run(r#"
+import { print } from "std/io"
+type Num = { "kind": String, "value": Int32 }
+type BinOp = { "kind": String, "op": String, "left": Int32, "right": Int32 }
+type Ast = Num | BinOp
+
+val eval = (n: Ast): Int32 =>
+  match n
+    is Num => n["value"]
+    is BinOp => n["left"] + n["right"]
+
+val a: Ast = { "kind": "num", "value": 5 }
+val b: Ast = { "kind": "binop", "op": "+", "left": 3, "right": 4 }
+print(eval(a))
+print(eval(b))
+"#);
+    assert_eq!(out, vec!["5", "7"]);
+}
+
+#[test]
+fn test_union_discrim_json_scrutinee_full_validation() {
+    // A `:Json` scrutinee against the SAME variant types MUST keep full recursive
+    // validation: extra-field values still match, but a value with the right
+    // discriminant and a WRONG field TYPE must NOT match that variant (it is the
+    // recursive `MatchesSchema` that catches this — the fast path is not used here).
+    let out = run(r#"
+import { print } from "std/io"
+type Ok = { "type": "ok", "value": Int32 }
+type Err = { "type": "err", "msg": String }
+
+val classify = (r: Json): String =>
+  match r
+    is Ok => "ok"
+    is Err => "err"
+    else => "neither"
+
+// well-formed
+print(classify({ "type": "ok", "value": 42 }))
+// well-formed with an EXTRA field — width subtyping, still an Ok
+print(classify({ "type": "ok", "value": 42, "extra": 1 }))
+// right discriminant, WRONG field type — full validation must reject -> neither
+print(classify({ "type": "ok", "value": "wrong" }))
+// missing required field -> neither
+print(classify({ "type": "ok" }))
+// completely wrong shape -> neither
+print(classify({ "random": 1 }))
+print(classify({ "type": "err", "msg": "boom" }))
+"#);
+    assert_eq!(out, vec!["ok", "ok", "neither", "neither", "neither", "err"]);
+}
+
+#[test]
+fn test_union_discrim_standalone_is_expr() {
+    // The fast path also applies to a standalone `is` boolean expression (not just
+    // match arms) over a closed concrete union scrutinee.
+    let out = run(r#"
+import { print } from "std/io"
+type Ok = { "type": "ok", "value": Int32 }
+type Err = { "type": "err", "msg": String }
+type Res = Ok | Err
+
+val label = (r: Res): String => if r is Ok then "yes" else "no"
+
+val a: Res = { "type": "ok", "value": 1 }
+val b: Res = { "type": "err", "msg": "x" }
+print(label(a))
+print(label(b))
+"#);
+    assert_eq!(out, vec!["yes", "no"]);
+}
+
+#[test]
+fn test_union_discrim_nullable_union() {
+    // A closed concrete union WITH a Null member: the Null is stripped for the
+    // discriminator analysis, the object variants still discriminate by StrLit.
+    let out = run(r#"
+import { print } from "std/io"
+type Ok = { "type": "ok", "value": Int32 }
+type Err = { "type": "err", "msg": String }
+type MaybeRes = Ok | Err | Null
+
+val describe = (r: MaybeRes): String =>
+  match r
+    is Ok => "ok=${r["value"]}"
+    is Err => "err"
+    else => "null"
+
+val a: MaybeRes = { "type": "ok", "value": 9 }
+print(describe(a))
+print(describe(null))
+"#);
+    assert_eq!(out, vec!["ok=9", "null"]);
+}
