@@ -1343,7 +1343,34 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::MakeArray { dst, elements, elem_ty } => {
                             let cap = i64_ty.const_int(elements.len().max(4) as u64, false);
-                            let arr = if Self::is_flat_scalar(elem_ty) {
+                            // Sealed-record array (Stage 3): contiguous, unboxed, header-less
+                            // elements. Allocate via lin_sealed_array_alloc(cap, stride, desc) and
+                            // copy each element struct's field payload into the buffer (scalar
+                            // fields → no retain). `elem_ty` is the sealed Object type.
+                            let arr = if let Some(fields) = Self::sealed_fields(elem_ty)
+                                .filter(|f| f.values().all(Self::is_sealed_scalar_field))
+                            {
+                                let fields = fields.clone();
+                                let stride = Self::sealed_array_stride(&fields);
+                                let desc = self.sealed_descriptor(&fields); // NULL for scalar-only
+                                let alloc_fn = self.get_or_declare_fn(
+                                    "lin_sealed_array_alloc",
+                                    ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into()], false));
+                                let arr_v = self.builder.call(alloc_fn,
+                                    &[cap.into(), i64_ty.const_int(stride, false).into(), desc.into()],
+                                    "ir_sarr").try_as_basic_value().unwrap_basic();
+                                let push_fn = self.get_or_declare_fn(
+                                    "lin_sealed_array_push_struct",
+                                    self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                                for e_temp in elements {
+                                    if let Some(&ev) = temp_map.get(e_temp) {
+                                        // Copy the element struct's payload (skipping its header);
+                                        // scalar fields, so a verbatim byte copy is a full copy.
+                                        self.builder.call(push_fn, &[arr_v.into(), ev.into()], "");
+                                    }
+                                }
+                                arr_v
+                            } else if Self::is_flat_scalar(elem_ty) {
                                 let suffix = Self::flat_suffix(elem_ty);
                                 let alloc_fn = self.get_or_declare_fn(
                                     &format!("lin_flat_array_alloc_{}", suffix),
@@ -1473,6 +1500,12 @@ impl<'ctx> Codegen<'ctx> {
                         Instruction::FieldGet { dst, object, field, obj_ty, result_ty } => {
                             if let Some(&obj_v) = temp_map.get(object) {
                                 let result = self.compile_ir_field_get(obj_v, field, obj_ty, result_ty);
+                                temp_map.insert(*dst, result);
+                            }
+                        }
+                        Instruction::SealedArrayFieldGet { dst, array, index, field, arr_ty, result_ty } => {
+                            if let (Some(&arr_v), Some(&idx_v)) = (temp_map.get(array), temp_map.get(index)) {
+                                let result = self.compile_ir_sealed_array_field_get(arr_v, idx_v, field, arr_ty, result_ty);
                                 temp_map.insert(*dst, result);
                             }
                         }

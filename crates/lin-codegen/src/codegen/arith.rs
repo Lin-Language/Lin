@@ -127,6 +127,20 @@ impl<'ctx> Codegen<'ctx> {
                 .unwrap_basic()
                 .into_int_value();
             self.builder.int_truncate(eq_i8, self.context.bool_type(), "oeq_b")
+        } else if Self::sealed_array_elem(ty).is_some() {
+            // Sealed-record array equality (Stage 3): materialize both to the tagged Object[] view
+            // and compare structurally (deep, order-independent per element). Fail-safe; equality is
+            // a rare op for these arrays. The two materialized tagged arrays are released after.
+            let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+            let fn_ty = self.context.i8_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
+            let la = self.sealed_array_to_tagged(lv, ty);
+            let ra = self.sealed_array_to_tagged(rv, ty);
+            let eq_fn = self.get_or_declare_fn("lin_array_eq", fn_ty);
+            let eq_i8 = self.builder.call(eq_fn, &[la.into(), ra.into()], "saeq")
+                .try_as_basic_value().unwrap_basic().into_int_value();
+            self.builder.call(self.rt.array_release, &[la.into()], "");
+            self.builder.call(self.rt.array_release, &[ra.into()], "");
+            self.builder.int_truncate(eq_i8, self.context.bool_type(), "saeq_b")
         } else if let Type::Array(elem) = ty {
             let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
             let fn_ty = self.context.i8_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false);
