@@ -330,6 +330,64 @@ val s = suite("std/object", [
       expect(m["k99"]).toBe(99),
       expect(m["k50"]).toBe(50)
     ]
+  ),
+
+  // --- flat-scalar UNBOXED values (ADR-082 follow-up) ---
+  // A flat-scalar `T` stores the value unboxed inline in the slot (no per-value heap box).
+  test("typed map: Int64 flat-scalar value reads back T-correct", () =>
+    var m: { String: Int64 } = {}
+    m["a"] = 100i64
+    m["b"] = 200i64
+    m["a"] = 111i64
+    [
+      expect(m["a"]).toBe(111i64),
+      expect(m["b"]).toBe(200i64),
+      expect(m["missing"]).toBe(null),
+      expect(m.values().length()).toBe(2),
+      expect(m.entries().length()).toBe(2)
+    ]
+  ),
+
+  test("typed map: Int32 source widens into a { String: Int64 } map", () =>
+    // A narrower Int32 value stored into an Int64 map must read back as Int64-correct (the store
+    // widens to T before storing) — not the source's narrower tag.
+    var m: { String: Int64 } = {}
+    range(0, 50).for(i => m["k${toString(i)}"] = i)
+    var sum = 0i64
+    range(0, 50).for(i =>
+      val v = m["k${toString(i)}"]
+      match v
+        is Int64 => sum = sum + v
+        else => sum = sum
+    )
+    [
+      // sum_{i=0..49} i = 49*50/2 = 1225 (would be 0 if the tag were wrong)
+      expect(sum).toBe(1225i64)
+    ]
+  ),
+
+  test("typed map: Float64 flat-scalar value", () =>
+    var m: { String: Float64 } = {}
+    m["x"] = 1.5
+    m["y"] = 2.25
+    [
+      expect(m["x"]).toBe(1.5),
+      expect(m["y"]).toBe(2.25)
+    ]
+  ),
+
+  test("typed map: flat-scalar map literal", () =>
+    val m: { String: Int64 } = {
+      "a": 1,
+      "b": 2,
+      "c": 3
+    }
+    [
+      expect(m["a"]).toBe(1i64),
+      expect(m["c"]).toBe(3i64),
+      expect(m["z"]).toBe(null),
+      expect(m.values().length()).toBe(3)
+    ]
   )
 ])
 
