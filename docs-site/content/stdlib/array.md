@@ -16,7 +16,7 @@ import { sort, sortBy, length, push, slice, sum } from "std/array"
 | `arrayAllocate` | `(Int32) -> Json[]` | Allocate an array of n nulls |
 | `arrayAllocateFilled` | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
 | `at` | `<T>(T[], Int32) -> T \| Null` | Element at index, or null if out of bounds; negative counts from end |
-| `chunk` | `(Json[], Int32) -> Json[][]` | Split into n-sized sub-arrays |
+| `chunk` | `<T>(T[], Int32) -> T[][]` | Split into n-sized sub-arrays |
 | `compact` | `(Json[]) -> Json[]` | Remove null elements |
 | `countBy` | `(Json[], (Json) -> String) -> {}` | Frequency map by key function |
 | `groupBy` | `(Json[], (Json) -> String) -> {}` | Group into object of arrays |
@@ -26,19 +26,19 @@ import { sort, sortBy, length, push, slice, sum } from "std/array"
 | `maxBy` | `(Json[], (Json) -> Number) -> Json` | Element with largest key |
 | `min` | `(Number[]) -> Number` | Minimum element |
 | `minBy` | `(Json[], (Json) -> Number) -> Json` | Element with smallest key |
-| `partition` | `(Json[], (Json[, i: Int32]) -> Boolean) -> [Json[], Json[]]` | Split into passing and failing (predicate gets an optional source index) |
+| `partition` | `<T>(T[], (T[, i: Int32]) -> Boolean) -> T[][]` | Split into passing and failing (`result[0]` pass, `result[1]` fail; predicate gets an optional source index) |
 | `prepend` | `(Json[], Json) -> Json[]` | Non-mutating prepend |
 | `product` | `(Number[]) -> Number` | Product of all elements |
 | `push` | `(Json[], Json) -> Null` | Append in place (mutating) |
-| `reverse` | `(Json[]) -> Json[]` | Reversed copy |
-| `scan` | `(Json[], Json, (Json, Json) -> Json) -> Json[]` | Reduce returning all intermediate values |
+| `reverse` | `<T>(T[]) -> T[]` | Reversed copy |
+| `scan` | `<T, U>(T[], U, (U, T) -> U) -> U[]` | Reduce returning all intermediate values |
 | `set` | `(Json[], Int32, Json) -> Null` | Set an element by index in place (mutating) |
 | `slice` | `(T[], Int32, Int32 = length(arr)) -> T[]` | Copy of `[start, end)`; end defaults to length, negatives count from end; preserves element type |
 | `sort` | `(Json[], (Json, Json) -> Int32) -> Json[]` | Sort with comparator |
 | `sortBy` | `(Json[], (Json) -> Json) -> Json[]` | Sort by key extractor |
 | `sum` | `(Number[]) -> Number` | Sum all elements |
-| `unique` | `(Json[]) -> Json[]` | Remove duplicates |
-| `zip` | `(Json[], Json[]) -> [Json, Json][]` | Pair elements by index |
+| `unique` | `<T>(T[]) -> T[]` | Remove duplicates |
+| `zip` | `<A, B>(A[], B[]) -> [A, B][]` | Pair elements by index |
 
 > The combinators `map`, `filter`, `reduce`, `for`, `while`, `take`, `drop`, `find`, `some`, `every`, `flatMap`, `takeWhile`, `dropWhile`, `flatten`, `concat` and the iterator constructors `range`, `rangeStep`, `iter`, `iterOf` are documented in [`std/iter`](/stdlib/iter.html).
 
