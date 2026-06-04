@@ -7,26 +7,26 @@ import { getEnv } from "std/env"
 import { toJsonString, toJson } from "std/json"
 import { startTimer, elapsed } from "std/time"
 
-// An Assertion is the result of a single matcher: a pass, or a fail carrying a message.
-// Matchers return this CONCRETE type (not Json) on purpose: it makes a test body's type
-// `Assertion[]`, so the checker forces every test to return an ARRAY of assertions. A bare
-// single assertion or a stray non-assertion body value is then a COMPILE error, which is what
-// guarantees that every `expect(...)` in a multi-assertion test is actually evaluated. See the
-// array-of-assertions test form documented in docs/STDLIB.md.
-type Assertion = { "type": String }
-
-val _pass = (): Assertion =>
+// An Assertion is the result of a single matcher: a pass, or a fail carrying a message (and,
+// for comparison matchers, the raw expected/actual pair). Assertion VALUES flow as `Json`: a
+// failing assertion carries OPEN extra keys (`message`/`expected`/`actual`) that downstream
+// consumers (the reporter, the VSCode Test Explorer) read by name, so the value must NOT be
+// projected to a fixed field set. Under sealed-records (a named `type T = {…}` is a sealed,
+// fixed-layout record that DROPS extra fields on assignment), a concrete `Assertion = {type}`
+// return type would lossily project away those extra keys — so the helpers/matchers return `Json`.
+// The "every test returns an ARRAY of assertions" guard is preserved at the array level: test
+// bodies are typed `() => Json[]` (an array is still required), and `docs/STDLIB.md` documents the
+// `[ expect(...).toBe(...), … ]` form.
+val _pass = (): Json =>
   { "type": "pass" }
 
-val _fail = (message: String): Assertion =>
+val _fail = (message: String): Json =>
   { "type": "fail", "message": message }
 
 // A failing assertion that ALSO carries the raw expected/actual pair, so consumers (the VSCode
-// Test Explorer) can render a structured diff without re-parsing the human message. The extra
-// keys are harmless under structural typing (the declared `Assertion` is the open `{ "type":
-// String }`, so a wider literal is assignable). Only equality-style matchers with a meaningful
-// scalar/value pair use this — matchers like `toSatisfy` have no natural pair and stay on `_fail`.
-val _failCompare = (message: String, expected: Json, actual: Json): Assertion =>
+// Test Explorer) can render a structured diff without re-parsing the human message. Returns `Json`
+// so the open extra keys survive (a sealed concrete return type would project them away).
+val _failCompare = (message: String, expected: Json, actual: Json): Json =>
   {
     "type": "fail",
     "message": message,
@@ -34,7 +34,7 @@ val _failCompare = (message: String, expected: Json, actual: Json): Assertion =>
     "actual": actual
   }
 
-val _evalResult = (name: String, results: Assertion[], ms: Int64): Json =>
+val _evalResult = (name: String, results: Json[], ms: Int64): Json =>
   val failures = results.filter(a => a["type"] == "fail")
   if length(failures) == 0 then
     {
@@ -67,7 +67,7 @@ val _printSuiteResults = (suiteResult: Json): Null =>
 export val expect = (value: Json): Json =>
   { "value": value }
 
-export val toBe = (asserter: Json, expected: Json): Assertion =>
+export val toBe = (asserter: Json, expected: Json): Json =>
   val value = asserter["value"]
   if value == expected then
     _pass()
@@ -78,35 +78,35 @@ export val toBe = (asserter: Json, expected: Json): Assertion =>
       value
     )
 
-export val toBeNull = (asserter: Json): Assertion =>
+export val toBeNull = (asserter: Json): Json =>
   val value = asserter["value"]
   if value == null then
     _pass()
   else
     _failCompare("expected null, got: ${toString(value)}", null, value)
 
-export val toSatisfy = (asserter: Json, pred: Function): Assertion =>
+export val toSatisfy = (asserter: Json, pred: Function): Json =>
   val value = asserter["value"]
   if pred(value) then
     _pass()
   else
     _fail("value did not satisfy predicate: ${toString(value)}")
 
-export val toSucceed = (asserter: Json): Assertion =>
+export val toSucceed = (asserter: Json): Json =>
   val value = asserter["value"]
   if value["type"] == "success" then
     _pass()
   else
     _fail("expected success, got: ${toString(value)}")
 
-export val toFail = (asserter: Json): Assertion =>
+export val toFail = (asserter: Json): Json =>
   val value = asserter["value"]
   if value["type"] == "failure" then
     _pass()
   else
     _fail("expected failure, got: ${toString(value)}")
 
-export val toFailWith = (asserter: Json, message: String): Assertion =>
+export val toFailWith = (asserter: Json, message: String): Json =>
   val value = asserter["value"]
   if value["type"] == "failure" && value["error"] == message then
     _pass()
@@ -136,7 +136,7 @@ val _isSelected = (name: String): Boolean =>
 // here: its body is NOT evaluated (so no side effects, no fixture setup/teardown when called via
 // `withFixture`) and it produces a `{ "type": "skip" }` sentinel that `report` counts as neither
 // pass nor fail and emits no record for.
-export val test = (name: String, body: () => Assertion[]): Json =>
+export val test = (name: String, body: () => Json[]): Json =>
   if _isSelected(name) then
     val timer = startTimer()
     val results = body()
@@ -150,7 +150,7 @@ export val test = (name: String, body: () => Assertion[]): Json =>
 // when the body's assertions fail. This is the functional alternative to keyword
 // beforeEach/afterEach: compose it (often via partial application) into a per-fixture helper,
 // e.g. `val withDb = withFixture(openDb, closeDb,)`, then `withDb("name", db => [ ... ])`.
-export val withFixture = (setup: () => Json, teardown: (Json) => Null, name: String, body: (Json) => Assertion[]): Json =>
+export val withFixture = (setup: () => Json, teardown: (Json) => Null, name: String, body: (Json) => Json[]): Json =>
   test(name, () =>
     val fixture = setup()
     val results = body(fixture)

@@ -290,13 +290,55 @@ all-scalar-shape, so anonymous literals stay boxed.*
   boundary once. Measure on a scalar-record access workload and on `interp`
   rewritten with a scalar-leaf AST.
 
-**Stage 2 — Mixed sealed records (heap fields: String, nested sealed, arrays).**
+**Stage 2 — Mixed sealed records (heap fields: String, nested sealed, arrays).** IMPLEMENTED.
 - Struct slots hold pointers for heap fields, with correct retain/release on
   construct/project/drop (this is the RC-heavy, UAF-prone part — heaviest ASan
   scrutiny). Drop = per-field release by known kind (this is "drop
   specialization" from the earlier RC staircase, now motivated).
 - Full equality / spread / serialization / thread-transfer over heap-field
   structs.
+
+*Implementation notes (as built):*
+
+- **Extended layout / header (16 bytes).** `[ u32 rc | u32 size | u64 desc_ptr | fields… ]`.
+  rc@0 (so `lin_rc_retain` is unchanged), size@4 (self-sized release), `desc_ptr`@8 (the field
+  descriptor, or NULL for a scalar-only record), payload@16 (8-aligned). Scalar fields are stored
+  inline at their natural-aligned offset; HEAP fields (String/Array/nested-sealed) are stored as an
+  8-byte owned (+1) POINTER slot.
+
+- **Field descriptor scheme.** A static, codegen-emitted, cached read-only global
+  `{ u32 count, { u32 offset, u32 kind }*count }` (`Codegen::sealed_descriptor`, mirrors the
+  closure capture descriptor). It lists ONLY the heap fields (scalars need no per-field RC); kinds
+  are `KIND_STRING=1 / KIND_ARRAY=2 / KIND_SEALED=3` (lockstep `lin_runtime::sealed::KIND_*`). The
+  descriptor pointer lives IN the struct header, so EVERY drop site that has the struct pointer —
+  scope-exit `emit_release`, closure-capture release (`release_captures` kind 7), thread-transfer
+  release (`release_env_copy` CAP_SEALED), var-reassign release-old, materialization temporaries —
+  consumes it for free without needing the static type. `lin_sealed_release(ptr, size)` walks the
+  descriptor on rc==0, releases each heap field by kind (String→`lin_string_release`,
+  Array→`lin_array_release`, nested→`lin_sealed_release_self` which recurses via its OWN descriptor),
+  THEN frees the block. `lin_sealed_release_self` reads size+desc from the header. Thread-transfer
+  `clone_sealed` byte-copies the struct then deep-clones each heap field per the descriptor
+  (share-nothing).
+
+- **Per-field RC.** Construct retains each heap field stored VERBATIM (borrowed) and transfers
+  ownership of a coerce-produced fresh value without retaining (`sealed_construct`'s `already_owned`
+  flag + the representation-aware `sealed_repr_differs`, which — unlike `Type`'s `==`, which ignores
+  the `sealed` flag — forces a PROJECTION of an unsealed/Json source into a nested sealed field).
+  Projection-copy retains copied String/Array fields and transfers ownership of recursively-projected
+  nested-sealed fields. Materialization to a boxed `LinObject` frees only the box SHELL for borrowed
+  String/Array inners (object_set_fresh took the +1) and fully releases the fresh inner for a nested
+  sealed field. Verified ASan-clean and leak-equivalent to the boxed path.
+
+- **Equality.** Same-type ALL-SCALAR records use the fast field-wise offset compare; any record with
+  a HEAP field (even same-type) falls through to the materialize-both-to-boxed + tagged
+  (deep, order-independent) equality, which is correct for String/Array/nested-sealed fields.
+
+- **Run-equivalence migration (Open Question 6 sweep).** Sealing single-String-field records changed
+  `std/test`: its `Assertion = { "type": String }` deliberately carried OPEN extra keys
+  (`message`/`expected`/`actual`) read by the reporter — exactly the §2.2.2 lossy-projection change.
+  `std/test`'s assertion-producing helpers/matchers now return `Json` (values keep their extra keys);
+  the "array of assertions" body guard is preserved at the array level (`() => Json[]`). This was the
+  ONLY corpus type that relied on extra-field carry-through.
 
 **Stage 3 — Arrays of sealed records (`MyType[]` contiguous, unboxed).**
 - Contiguous struct arrays, constant-offset element + field addressing. The

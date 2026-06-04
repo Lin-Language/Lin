@@ -346,8 +346,14 @@ impl<'ctx> Codegen<'ctx> {
             let l_sealed = Self::sealed_scalar_fields(lty).is_some();
             let r_sealed = Self::sealed_scalar_fields(rty).is_some();
             if l_sealed || r_sealed {
-                // Fast path: both the SAME sealed scalar type → field-wise compare by offset.
-                if l_sealed && r_sealed && lty == rty && lv.is_pointer_value() && rv.is_pointer_value() {
+                // Fast path: both the SAME sealed type whose fields are ALL SCALARS → field-wise
+                // compare by offset (a direct scalar compare). A record with HEAP fields CANNOT use
+                // this — `sealed_eq` would compare field POINTERS, not values — so it falls through
+                // to the materialize-both-to-boxed + tagged (deep, order-independent) equality below,
+                // which is correct for String/Array/nested-sealed fields.
+                let all_scalar = |t: &Type| Self::sealed_scalar_fields(t)
+                    .map(|f| f.values().all(Self::is_sealed_scalar_field)).unwrap_or(false);
+                if l_sealed && r_sealed && lty == rty && all_scalar(lty) && lv.is_pointer_value() && rv.is_pointer_value() {
                     let fields = Self::sealed_scalar_fields(lty).unwrap().clone();
                     let eq = self.sealed_eq(lv, rv, &fields);
                     return if matches!(op, BinOp::NotEq) { self.builder.not(eq, "sealed_ne").into() } else { eq.into() };
