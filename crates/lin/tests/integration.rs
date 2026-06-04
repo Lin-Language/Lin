@@ -5646,6 +5646,37 @@ val basePath =
 }
 
 #[test]
+fn test_if_else_wrapped_inside_parens_parses_and_round_trips() {
+    // Regression (LIN_ISSUES #7): a WRAPPED (multi-line) `if/else` as the RHS of a `val`
+    // INSIDE a parenthesised closure body (`.for(... => …)`) used to fail with
+    // `unexpected token Else`. ADR-004 suppresses Indent/Dedent inside `()`, so the branch
+    // offside floor must anchor on the indentation of the LINE the `if` sits on, not on the
+    // `if` keyword's (far-right) column — else the then-branch collapses to empty and the
+    // newline `else` is orphaned. The one-line form always parsed; only the wrapped form broke.
+    let src = "\
+import { print } from \"std/io\"
+import { for } from \"std/iter\"
+val f = (raptor: Json, marked: Json): Null =>
+  marked.for(stopP =>
+    val transfers = if raptor[stopP] != null then
+      raptor[stopP]
+    else
+      []
+    transfers.for(t => print(t))
+  )
+val run = (): Null => f({ \"a\": [\"x\"] }, [\"a\"])
+run()
+";
+    // It must compile and run (this was the original failure).
+    assert_eq!(run(src), vec!["x"], "wrapped if/else inside .for(...) should run");
+
+    // And the formatter must round-trip it: `fmt()` panics on a parse error, so if the
+    // formatted output were unparseable (the bug that corrupted raptor.lin), this fails.
+    let out = fmt(src);
+    assert_eq!(out, fmt(&out), "wrapped if/else inside parens not idempotent:\n{}", out);
+}
+
+#[test]
 fn test_fmt_else_if_block_branch_comment_preserved_once() {
     // A leading own-line comment on the first statement of an `else if ... then` Block
     // branch body was emitted TWICE (the If arm's `take_leading` and `fmt_block` both
