@@ -168,35 +168,47 @@ but a documented divergence worth a lint or a defined `Json` numeric-coercion ru
 
 ---
 
-## 7. [CORRECTNESS] `lin fmt` does not round-trip a multi-line `if/else` assignment
+## 7. [CORRECTNESS] multi-line `if/else` is unparseable inside parentheses; `lin fmt` creates exactly that
 
-**Severity: high — the formatter emits code it cannot re-parse.** The formatter is
-supposed to be meaning-preserving (enforced by a corpus round-trip gate), but it
-escapes here. A long `lhs = if cond then A else B` assignment that the formatter wraps
-onto multiple lines produces output that fails to parse with `unexpected token Else`
-in some surrounding contexts (it broke `raptor.lin` and `stringResults.lin` when the
-RAPTOR `lin/` dir was formatted — 2 files became unbuildable, 4 unit-test files failed).
+**Severity: high — two linked bugs; the formatter emits code it cannot re-parse.**
 
-Minimal trigger (`lin fmt` rewrites this valid, building input):
+A **wrapped (multi-line) `if … then <newline> A <newline> else <newline> B`** expression
+fails to parse with `unexpected token Else` when it appears **inside parentheses** — e.g.
+as the RHS of a `val` inside a `.for(... => …)` closure body. The exact same wrapped
+`if/else` parses fine in a plain (non-parenthesized) function body, and the **one-line**
+form parses fine everywhere, including inside the parens.
+
+Minimal repro (fails: `unexpected token Else`):
 ```lin
-val f = (interchange: Json, stop: String): Null =>
-  interchange[stop] = if interchange[stop] != null then interchange[stop] else DEFAULT
-```
-into the wrapped form
-```lin
-  interchange[stop] = if interchange[stop] != null then
-    interchange[stop]
+marked.for(stopP =>
+  val transfers = if raptor[stopP] != null then
+    raptor[stopP]
   else
-    DEFAULT
+    []
+  transfers.for(t => print(t))
+)
 ```
-which, depending on the enclosing block (e.g. inside the `else` arm of an outer `if`,
-followed by more statements, as in `raptor.lin`'s `indexRoute`), the parser rejects at
-the `else`. The single-line input round-trips fine; only the formatter's own wrapped
-output fails. Two fixes are needed: (1) the parser should accept the wrapped block form
-unambiguously (or the formatter must parenthesize / keep it inline), and (2) the corpus
-round-trip gate should have caught this — it may not cover `if/else`-valued assignments
-inside nested blocks.
+All three of these BUILD fine, isolating the trigger to "wrapped + inside parens":
+- the same code with the `if/else` on one line inside the `.for`;
+- the wrapped `if/else` in a plain function body (no enclosing parens);
+- the one-line `if/else` in a plain function body.
 
-NOTE: the committed RAPTOR `lin/` files are intentionally NOT `lin fmt`-clean because
-running the formatter over them corrupts them via this bug. Fix #7 before formatting
-that directory.
+**Root cause:** indentation lexing is suppressed inside `( ) [ ] { }` (ADR-004, so JSON
+literals can span lines), so inside a `.for(...)` there are no INDENT/DEDENT tokens. The
+`if`-expression parser relies on that layout to know the `then`-branch expression ended
+and a new-line `else` continues the same `if`; with layout suppressed it can't, and bails
+at the `else`. The fix is analogous to dot-chaining across newlines (ADR-006): the
+`then`/`else` continuation should use save/restore newline lookahead rather than depend on
+suppressed INDENT/DEDENT.
+
+**Second bug (formatter):** `lin fmt` takes a one-line `if/else` (which parses everywhere)
+and *wraps* it onto multiple lines even inside parens, producing the unparseable form. This
+broke `raptor.lin` and `stringResults.lin` when the RAPTOR `lin/` dir was formatted (2 files
+unbuildable, 4 unit-test files failed). Until the parser is fixed, the formatter must keep
+`if/else` inline when it is inside a `( ) [ ] { }` span. The corpus round-trip gate that is
+supposed to catch non-meaning-preserving output evidently doesn't cover a wrapped
+`if/else` inside a parenthesized closure.
+
+NOTE: the committed RAPTOR `lin/` files are intentionally NOT `lin fmt`-clean, because
+running the formatter over them corrupts them via this bug. Fix #7 before formatting that
+directory (and before relying on CI's `fmt --check` over `benchmarks/`).
