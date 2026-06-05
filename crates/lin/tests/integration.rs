@@ -9571,6 +9571,90 @@ print(describe(null))
     assert_eq!(out, vec!["int:7", "str", "null"]);
 }
 
+// ── Generalized complement narrowing: ANY guard-free `is X` arm subtracts `X` from the union in
+// the branch that excluded it (not just `is Null`). The motivating category is `T | Error`. ──
+
+#[test]
+fn test_complement_narrow_match_error_else() {
+    // The motivating case (fails on master with
+    // "Function body has type String | { ... }, declared return type is String"):
+    // `match r / is Error => fallback / else => r` narrows the else arm to bare `String`,
+    // even though `Error` is the STRUCTURAL alias `{ "type": String, "message": String }`,
+    // not a named union member.
+    let out = run(r#"import { print } from "std/io"
+val unwrap = (r: String | Error): String =>
+  match r
+    is Error => "fallback"
+    else => r
+print(unwrap("hello"))
+print(unwrap({ "type": "error", "message": "boom" }))
+"#);
+    assert_eq!(out, vec!["hello", "fallback"]);
+}
+
+#[test]
+fn test_complement_narrow_if_error_else() {
+    // If-form of the Error case: `if r is Error then fallback else r` narrows the else branch
+    // (Error excluded) to `String`.
+    let out = run(r#"import { print } from "std/io"
+val unwrap = (r: String | Error): String =>
+  if r is Error then "fallback" else r
+print(unwrap("hi"))
+print(unwrap({ "type": "error", "message": "bad" }))
+"#);
+    assert_eq!(out, vec!["hi", "fallback"]);
+}
+
+#[test]
+fn test_complement_narrow_match_nonerror_member() {
+    // Non-Error union: `Int32 | String` minus the `is Int32` arm = `String` in the else arm.
+    let out = run(r#"import { print } from "std/io"
+val pickStr = (v: Int32 | String): String =>
+  match v
+    is Int32 => "was int"
+    else => v
+print(pickStr(42))
+print(pickStr("plain"))
+"#);
+    assert_eq!(out, vec!["was int", "plain"]);
+}
+
+#[test]
+fn test_complement_narrow_three_member_minus_two() {
+    // `A | B | C` minus B (and minus C) = the remaining member. Two guard-free `is` arms before
+    // the `else` subtract BOTH their tested types, leaving the else arm typed `String`.
+    let out = run(r#"import { print } from "std/io"
+val classify = (v: Int32 | String | Boolean): String =>
+  match v
+    is Boolean => "bool"
+    is Int32 => "int"
+    else => v
+print(classify(true))
+print(classify(7))
+print(classify("hi"))
+"#);
+    assert_eq!(out, vec!["bool", "int", "hi"]);
+}
+
+#[test]
+fn test_complement_narrow_guard_does_not_exclude() {
+    // SOUNDNESS: a `when`-guarded `is` arm does NOT guarantee exclusion, so it must NOT contribute
+    // to the complement. The ONLY arm testing `Int32` here is guarded, so the `else` arm can still
+    // be reached with an `Int32` (when the guard is false) — it must therefore STAY typed
+    // `Int32 | String`, NOT narrow to `String`. We prove this by declaring the function's return as
+    // `Int32 | String` and letting the unnarrowed `Int32` value flow straight through `else`.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val f = (v: Int32 | String): Int32 | String =>
+  match v
+    is Int32 when v > 100 => "big"
+    else => v
+print(f(5).toString())
+print(f("hi").toString())
+"#);
+    assert_eq!(out, vec!["5", "hi"]);
+}
+
 #[test]
 fn test_is_objecttype_expr_checks_required_fields() {
     // Regression (ADR-054): the EXPRESSION form `x is Person` must check that the object has
