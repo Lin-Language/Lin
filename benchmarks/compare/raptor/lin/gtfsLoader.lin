@@ -60,7 +60,7 @@ val makeTransfer = (origin: String, destination: String, duration: Int32, startT
   }
 
 val indexOfColumns = (header: Json): Json =>
-  var idx = {}
+  var idx: Json = {}
   var i = 0
   header.for(name =>
     idx[name] = i
@@ -184,8 +184,8 @@ export val loadGTFS = (dataDir: String): Json =>
     push(stopTimesGroups, { "tripId": curTrip, "stopTimes": curStopTimes })
 
   // --- transfers.txt -> interchange + transfers (small maps) ---
-  var transfers = {}
-  var interchange = {}
+  var transfers: Json = {}
+  var interchange: Json = {}
   forEachRow("${dataDir}transfers.txt", (row, tfi) =>
     val fromStop = row[tfi["from_stop_id"]]
     val toStop = row[tfi["to_stop_id"]]

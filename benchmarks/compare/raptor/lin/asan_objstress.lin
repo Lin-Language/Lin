@@ -12,7 +12,7 @@ import { toString } from "std/string"
 val N = 2000
 
 // Build a dictionary keyed by stringified index -> index*7.
-var dict = {}
+var dict: Json = {}
 range(0, N).for(i =>
   dict[toString(i)] = i * 7
 )
