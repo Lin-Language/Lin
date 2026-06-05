@@ -56,10 +56,11 @@ people.sortBy(p => p["name"])
 
 ### `push`
 
-Mutates the array in place:
+Mutates the array in place. An empty accumulator literal needs a type annotation — an
+evidence-free `[]` cannot infer its element type (ADR-084):
 
 ```lin
-val xs = []
+val xs: Int32[] = []
 xs.push(1)
 xs.push(2)
 // xs: [1, 2]

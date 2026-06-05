@@ -12,12 +12,14 @@ import { for, take, concat } from "std/iter"
 
 // Generic (`<T>(arr: T[], item: T): Null`) so element-type checking is enforced: `push(intArr, "s")`
 // is a compile error (closing the prior soundness hole where a `Json` signature accepted any item).
-// `lin_push` is a compiler builtin: it dispatches on the array's RUNTIME element representation
-// (flat scalar via `lin_flat_array_push_*`, tagged/boxed otherwise) and `lin_push_dyn` coerces a
-// boxed element into a flat slot, so a freshly-allocated `[]` accumulator (annotated with its
-// element type per ADR-079) stores elements with the correct representation and RC discipline
-// (scalars carry no refcount; concrete heap / Json elements take exactly one net retain — verified
-// under AddressSanitizer). See array.test.lin.
+// `push` is the primitive for building up an accumulator (`val acc: Int32[] = []; xs.for(x =>
+// acc.push(x))`) — the empty-literal annotation requirement (ADR-084) makes `acc` pin `T` so the
+// monomorphized `push$<T>` stores elements with the correct representation (an UNANNOTATED `[]`
+// would be `Never[]` and mis-store as null; ADR-084 rejects that at compile time). `lin_push` is a
+// compiler builtin: it dispatches on the array's RUNTIME element representation (flat scalar via
+// `lin_flat_array_push_*`, tagged/boxed otherwise) and `lin_push_dyn` coerces a boxed element into
+// a flat slot. RC discipline: scalars carry no refcount; concrete heap / Json elements take exactly
+// one net retain — verified under AddressSanitizer (ADR-085). See array.test.lin.
 export val push = <T>(arr: T[], item: T): Null =>
   lin_push(arr, item)
 
@@ -134,7 +136,7 @@ export val zip = <A, B>(a: A[], b: B[]): [A, B][] =>
   result
 
 export val unique = <T>(arr: T[]): T[] =>
-  val seen = {}
+  val seen: { String: Boolean } = {}
   val result: T[] = []
   arr.for(item =>
     val key = lin_value_key(item)
@@ -257,7 +259,7 @@ export val maxBy = (arr: Json[], keyFn: (Json) => Json): Json =>
 // compile error. The element type flows to `lin_array_append_dyn`, which still dispatches on the
 // array's RUNTIME element type to preserve flatness. The narrow-scalar literal case
 // (`b.append(3)` on a `UInt8[]`) is sound because the checker adopts the flat-scalar param element
-// type for a numeric literal arg (the empty-array-arg / literal-width fix, ADR-079).
+// type for a numeric literal arg (the literal-width fix, d314897/ADR-079).
 export val append = <T>(arr: T[], item: T): T[] =>
   lin_array_append_dyn(arr, item)
 

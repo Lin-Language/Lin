@@ -1541,10 +1541,10 @@ product([])              // 1
 val push: (arr: Json[], item: Json) -> Null
 ```
 
-Appends `item` to `arr` in place. This is one of the few mutating operations in Lin — it modifies the array that was passed in.
+Appends `item` to `arr` in place. This is one of the few mutating operations in Lin — it modifies the array that was passed in. An empty accumulator literal must be annotated: an evidence-free `[]` cannot infer its element type (ADR-084).
 
 ```txt
-val xs = []
+val xs: Int32[] = []
 push(xs, 1)
 push(xs, 2)
 // xs is now [1, 2]

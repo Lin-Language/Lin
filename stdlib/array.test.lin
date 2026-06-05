@@ -28,7 +28,7 @@ val s = suite("std/array", [
   ),
 
   test("range produces correct values", () =>
-    val result = []
+    val result: Int32[] = []
     range(0, 3).for(i => result.push(i))
     [
       expect(result.toString()).toBe("[0, 1, 2]")
@@ -36,7 +36,7 @@ val s = suite("std/array", [
   ),
 
   test("iterOf iterates over array elements", () =>
-    val result = []
+    val result: Int32[] = []
     iterOf([10, 20, 30]).for(x => result.push(x))
     [
       expect(result.toString()).toBe("[10, 20, 30]")
@@ -44,7 +44,7 @@ val s = suite("std/array", [
   ),
 
   test("iterOf over empty array produces nothing", () =>
-    val result = []
+    val result: Int32[] = []
     iterOf([]).for(x => result.push(x))
     [
       expect(result.length()).toBe(0)
@@ -540,7 +540,7 @@ val s = suite("std/array", [
   ),
 
   test("rangeStep with positive step 2", () =>
-    val result = []
+    val result: Int32[] = []
     rangeStep(0, 6, 2).for(x => result.push(x))
     [
       expect(result.toString()).toBe("[0, 2, 4]")
@@ -548,7 +548,7 @@ val s = suite("std/array", [
   ),
 
   test("rangeStep with positive step 3", () =>
-    val result = []
+    val result: Int32[] = []
     rangeStep(0, 10, 3).for(x => result.push(x))
     [
       expect(result.toString()).toBe("[0, 3, 6, 9]")
@@ -556,7 +556,7 @@ val s = suite("std/array", [
   ),
 
   test("rangeStep with negative step", () =>
-    val result = []
+    val result: Int32[] = []
     rangeStep(5, 0, -1).for(x => result.push(x))
     [
       expect(result.toString()).toBe("[5, 4, 3, 2, 1]")
@@ -564,7 +564,7 @@ val s = suite("std/array", [
   ),
 
   test("rangeStep with negative step -2", () =>
-    val result = []
+    val result: Int32[] = []
     rangeStep(10, 0, -2).for(x => result.push(x))
     [
       expect(result.toString()).toBe("[10, 8, 6, 4, 2]")
@@ -572,7 +572,7 @@ val s = suite("std/array", [
   ),
 
   test("rangeStep with step 0 returns empty iterator", () =>
-    val result = []
+    val result: Int32[] = []
     rangeStep(0, 10, 0).for(x => result.push(x))
     [
       expect(result.length()).toBe(0)
@@ -580,7 +580,7 @@ val s = suite("std/array", [
   ),
 
   test("rangeStep with step 1 matches range", () =>
-    val result = []
+    val result: Int32[] = []
     rangeStep(0, 4, 1).for(x => result.push(x))
     [
       expect(result.toString()).toBe("[0, 1, 2, 3]")

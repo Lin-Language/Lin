@@ -25,7 +25,7 @@ val unwrapStr = (r: Json): String =>
 val s = suite("std/archive", [
   // (a) manifest() lists the expected entry names (body skipped, meta-only).
   test("manifest lists entry names", () =>
-    val names = []
+    val names: Json[] = []
     readStream(tarPath)
       .manifest()
       .for(m =>
@@ -41,7 +41,7 @@ val s = suite("std/archive", [
 
   // manifest over a gzipped archive (tar.gz = gunzip composed with the splitter).
   test("manifest works over a tar.gz via gunzip", () =>
-    val sizes = []
+    val sizes: Json[] = []
     readStream(gzPath)
       .gunzip()
       .manifest()
@@ -58,7 +58,7 @@ val s = suite("std/archive", [
 
   // (b) files() recovers each entry's full content (buffered into a UInt8[]).
   test("files recovers entry contents", () =>
-    val dataLens = []
+    val dataLens: Int32[] = []
     readStream(tarPath)
       .files()
       .for(f =>
@@ -74,7 +74,7 @@ val s = suite("std/archive", [
   // (c) untar() extracts each entry's bytes via the per-entry `data` sub-stream (readText). We
   // collect every entry's recovered text in order and assert known contents.
   test("untar extracts entry bodies via the data sub-stream", () =>
-    val texts = []
+    val texts: String[] = []
     readStream(tarPath).untar((meta, data) =>
       texts.push(unwrapStr(data.readText()))
     )

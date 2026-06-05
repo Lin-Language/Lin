@@ -12,7 +12,7 @@ export type Neighbor = { "to": String, "weight": Int32 }
 // map are all keyed by node name at runtime, so they stay dynamic (Json). The
 // adjacency values are Neighbor[]; dist values are Int32; prev values are String.
 export val buildAdj = (edges: Edge[]): Json =>
-  var adj = {}
+  var adj: {  } = {}
   edges.for(edge =>
     val src = edge["from"]
     val existing = adj[src]

@@ -460,7 +460,7 @@ fn test_array_passed_to_closure_value_mutates() {
 import { push, length } from "std/array"
 import { toString } from "std/string"
 
-val acc = []
+val acc: Int32[] = []
 val f = (a: Json) => push(a, 1)
 f(acc)
 f(acc)
@@ -832,7 +832,7 @@ fn test_if_old_syntax_error() {
 fn test_if_without_else() {
     let output = run(r#"import { print } from "std/io"
 
-val arr = []
+val arr: Int32[] = []
 if true then print("ran")
 if false then print("skipped")
 print("done")
@@ -2578,12 +2578,120 @@ fn test_empty_array_and_object() {
 import { toString } from "std/string"
 import { length } from "std/array"
 
-val arr = []
-val obj = {}
+val arr: Int32[] = []
+val obj: { String: Int32 } = {}
 print(toString(length(arr)))
 print(toString(length(obj)))
 "#);
     assert_eq!(output, vec!["0", "0"]);
+}
+
+// ADR-084: an evidence-free empty array literal (no annotation, no contextual type, no contents)
+// cannot infer its element type and must be a compile error pointing the user at an annotation.
+#[test]
+fn test_context_free_empty_array_errors() {
+    let err = run_expect_err(r#"import { print } from "std/io"
+val xs = []
+print("unreachable")
+"#);
+    assert!(
+        err.contains("cannot infer the element type of an empty array literal"),
+        "expected the empty-array annotation error, got: {err}"
+    );
+}
+
+// ADR-084: same for an evidence-free empty map/object literal.
+#[test]
+fn test_context_free_empty_object_errors() {
+    let err = run_expect_err(r#"import { print } from "std/io"
+val m = {}
+print("unreachable")
+"#);
+    assert!(
+        err.contains("cannot infer the value type of an empty map/object literal"),
+        "expected the empty-map annotation error, got: {err}"
+    );
+}
+
+// ADR-084: a `var` (mutable) evidence-free empty literal must error the same way.
+#[test]
+fn test_context_free_empty_var_errors() {
+    let err = run_expect_err(r#"import { print } from "std/io"
+var xs = []
+print("unreachable")
+"#);
+    assert!(
+        err.contains("cannot infer the element type of an empty array literal"),
+        "expected the empty-array annotation error for a var, got: {err}"
+    );
+}
+
+// ADR-084: an empty literal WITH contextual evidence still works — an annotation on the binding,
+// a typed function parameter (argument position), and a typed function return are all evidence.
+#[test]
+fn test_empty_literal_with_context_still_works() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+// annotation on the binding
+val a: Int32[] = []
+// annotation on a map binding
+val m: { String: Int32 } = {}
+// argument position: the typed param supplies the element type
+val sized = (xs: Int32[]): Int32 => length(xs)
+// return position: the declared return supplies the element type
+val mkEmpty = (): Int32[] => []
+print(toString(length(a)))
+print(toString(length(m)))
+print(toString(sized([])))
+print(toString(length(mkEmpty())))
+"#);
+    assert_eq!(output, vec!["0", "0", "0", "0"]);
+}
+
+// ADR-084 (deferred Phase 2): `push` stays `(Json, Json)`, so its element type is still NOT
+// checked — `push(intArr, "str")` type-checks today. Making `push` generic (`<T>(arr: T[],
+// item: T)`) to close that hole is blocked on a separate monomorphized-body/`lin_push`-intrinsic
+// representation bug (see the comment on `push` in stdlib/array.lin). This test PINS the current
+// (intentionally lax) behavior so the deferral is explicit and a future fix flips it deliberately.
+#[test]
+fn test_push_element_type_is_not_yet_checked() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+val xs: Int32[] = []
+push(xs, 1)
+print(toString(length(xs)))
+"#);
+    assert_eq!(output, vec!["1"]);
+}
+
+// ADR-084: the untyped-accumulator idiom WITH an annotation works end to end — build an array via
+// `push` in a loop and read it back, including a String[] accumulator (heap-element push).
+#[test]
+fn test_annotated_push_accumulator_end_to_end() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+import { for, range } from "std/iter"
+
+val nums = (): Int32[] =>
+  val acc: Int32[] = []
+  range(0, 4).for(i => push(acc, i * 2))
+  acc
+val words = (): String[] =>
+  val acc: String[] = []
+  ["a", "b", "c"].for(w => push(acc, w))
+  acc
+val ns = nums()
+val ws = words()
+print(toString(length(ns)))
+print(toString(ns[3]))
+print(toString(length(ws)))
+print(ws[2])
+"#);
+    assert_eq!(output, vec!["4", "6", "3", "c"]);
 }
 
 #[test]
@@ -3521,7 +3629,7 @@ import { keys } from "std/object"
 import { length } from "std/array"
 import { for, range } from "std/iter"
 
-var o = {}
+var o: Json = {}
 range(0, 30).for(i => lin_object_set(o, "k${toString(i)}", i * 10))
 var sum = 0i64
 range(0, 30).for(i => sum = sum + o["k${toString(i)}"])
@@ -4103,7 +4211,7 @@ import { toString } from "std/string"
 import { worker, request, message, close } from "std/async"
 import { push, length } from "std/array"
 
-var log = []
+var log: Int32[] = []
 val w = worker(
   n =>
     push(log, n)
@@ -4183,7 +4291,7 @@ val unwrap = (r: Json): Int32 =>
     is Error => 0
     else => r
 val pool = threadPool(3)
-var promises = []
+var promises: Json[] = []
 range(0, 30).for(i => push(promises, pool.poolAsync(() => 1)))
 var total = 0
 promises.for(p => total = total + unwrap(await(p)))
@@ -8673,7 +8781,7 @@ fn object_index_assign_of_callback_param() {
 import { toString } from "std/string"
 import { for } from "std/iter"
 [5].for(n =>
-  var o = {}
+  var o: {} = {}
   o["x"] = n
   print(toString(o))
 )
@@ -8685,7 +8793,7 @@ import { for } from "std/iter"
 import { toString } from "std/string"
 import { map } from "std/iter"
 val rs = [5, 6].map(n =>
-  var o = {}
+  var o: {} = {}
   o["x"] = n
   o
 )
@@ -8698,7 +8806,7 @@ print(toString(rs))
 import { toString } from "std/string"
 import { for } from "std/iter"
 ["hi"].for(s =>
-  var o = {}
+  var o: {} = {}
   o["msg"] = s
   print(toString(o))
 )
@@ -8710,7 +8818,7 @@ import { for } from "std/iter"
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { for } from "std/iter"
-var out = {}
+var out: {} = {}
 ["a", "b", "c"].for(k =>
   out[k] = 1
 )
@@ -8724,7 +8832,7 @@ print(toString(out))
 import { for, range } from "std/iter"
 val main = (): Null =>
   range(0, 2000).for(i =>
-    var o = {}
+    var o: {} = {}
     o["k"] = i
     null
   )
@@ -10424,7 +10532,7 @@ fn test_generic_cross_module_higher_order_map() {
         "import { push } from \"std/array\"\n\
          import { for } from \"std/iter\"\n\
          export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
-           val result = []\n  \
+           val result: U[] = []\n  \
            arr.for(item => push(result, f(item)))\n  \
            result\n").unwrap();
     let main = format!(r#"import {{ print }} from "std/io"
@@ -10449,7 +10557,7 @@ fn test_generic_cross_module_two_instantiations() {
         "import { push } from \"std/array\"\n\
          import { for } from \"std/iter\"\n\
          export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
-           val result = []\n  \
+           val result: U[] = []\n  \
            arr.for(item => push(result, f(item)))\n  \
            result\n").unwrap();
     let main = format!(r#"import {{ print }} from "std/io"
@@ -10547,7 +10655,7 @@ fn test_generic_import_path_unbound_typevar_is_safe() {
         "import { push } from \"std/array\"\n\
          import { for } from \"std/iter\"\n\
          export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
-           val result = []\n  \
+           val result: U[] = []\n  \
            arr.for(item => push(result, f(item)))\n  \
            result\n\
          export val doubleAll = (arr: Json): Json =>\n  \
@@ -10577,7 +10685,7 @@ fn test_generic_import_path_unbound_typevar_no_garbage_monomorph_in_ir() {
         "import { push } from \"std/array\"\n\
          import { for } from \"std/iter\"\n\
          export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
-           val result = []\n  \
+           val result: U[] = []\n  \
            arr.for(item => push(result, f(item)))\n  \
            result\n\
          export val doubleAll = (arr: Json): Json =>\n  \
@@ -10680,7 +10788,7 @@ import { toString } from "std/string"
 import { push } from "std/array"
 import { reduce } from "std/iter"
 val build = (): Int32[] =>
-  val result = []
+  val result: Int32[] = []
   push(result, 5)
   push(result, 6)
   push(result, 7)

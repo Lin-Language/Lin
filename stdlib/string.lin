@@ -110,7 +110,7 @@ export val codePointAt = (s: String, index: Int32): Int32 =>
   lin_string_char_code(s, index)
 
 export val fromCodePoints = (codes: Int32[]): String =>
-  val chars = []
+  val chars: String[] = []
   codes.for(code => lin_push(chars, lin_string_from_char_code(code)))
   lin_string_join_arr(chars, "")
 

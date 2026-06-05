@@ -35,7 +35,7 @@ val renderSection = (section: String, sectionEntries: Json, currentPath: String,
 
 export val buildNav = (entries: Json, currentPath: String, base: String): String =>
   // Collect unique section names in order
-  var sections = []
+  var sections: Json[] = []
   var seenStr = "|"
   entries.for(entry =>
     val section = entry["section"]

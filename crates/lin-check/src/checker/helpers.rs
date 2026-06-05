@@ -1,4 +1,5 @@
 use lin_common::{Diagnostic, NumSuffix, Span};
+use lin_parse::ast::Expr;
 
 use crate::typed_ir::*;
 use crate::types::Type;
@@ -156,6 +157,46 @@ pub(crate) fn is_definitely_non_transferable(ty: &Type) -> bool {
         Type::Array(inner) => is_definitely_non_transferable(inner),
         Type::Union(ts) => ts.iter().any(is_definitely_non_transferable),
         _ => false,
+    }
+}
+
+/// Detects an evidence-free empty collection literal — an `[]` or `{}` (object literal with no
+/// fields and no spreads) — used in a position where there is NO contextual type to fix its
+/// element/value type. Such a literal otherwise infers a degenerate type (`Array(Never)` /
+/// empty record `{}`) that silently misbehaves and cannot be checked against pushes, so we
+/// require an explicit annotation instead (ADR-084). Returns the kind of empty literal so the
+/// caller can phrase a tailored error, or `None` if the expression is not an evidence-free empty.
+///
+/// Scope is deliberately syntactic and narrow: only a *bare* empty literal triggers it. A literal
+/// with contents (`[1]`, `{ "a": 1 }`) carries its own element evidence; an empty literal in a
+/// context that supplies an expected type never reaches this check (those go through
+/// `check_expr`, not `infer_expr`).
+pub(crate) fn empty_literal_kind(expr: &Expr) -> Option<EmptyLiteralKind> {
+    match expr {
+        Expr::Array(elements, _) if elements.is_empty() => Some(EmptyLiteralKind::Array),
+        Expr::Object(fields, _) if fields.is_empty() => Some(EmptyLiteralKind::Object),
+        _ => None,
+    }
+}
+
+pub(crate) enum EmptyLiteralKind {
+    Array,
+    Object,
+}
+
+impl EmptyLiteralKind {
+    /// The diagnostic message for an evidence-free empty literal of this kind.
+    pub(crate) fn message(&self) -> &'static str {
+        match self {
+            EmptyLiteralKind::Array => {
+                "cannot infer the element type of an empty array literal; add a type annotation, \
+                 e.g. `val xs: Int32[] = []`"
+            }
+            EmptyLiteralKind::Object => {
+                "cannot infer the value type of an empty map/object literal; add a type \
+                 annotation, e.g. `val m: { String: Int32 } = {}`"
+            }
+        }
     }
 }
 
