@@ -8,10 +8,22 @@
 // only if it is strictly earlier than the new stop; otherwise replace with the new stop.
 import { for } from "std/iter"
 
-val isStopBefore = (routeStopIndex: Json, routeId: String, stopA: String, stopB: String): Boolean =>
-  routeStopIndex[routeId][stopA] < routeStopIndex[routeId][stopB]
+// Narrow an `Int32 | Null` typed-map read to `Int32` (positive-arm idiom; ADR-082).
+val intOr = (x: Int32 | Null, d: Int32): Int32 =>
+  match x
+    is Int32 =>
+      x
+    else =>
+      d
 
-export val getQueue = (routesAtStop: Json, routeStopIndex: Json, markedStops: Json): Json =>
+val isStopBefore = (routeStopIndex: { String: { String: Int32 } }, routeId: String, stopA: String, stopB: String): Boolean =>
+  intOr(routeStopIndex[routeId][stopA], 0) < intOr(routeStopIndex[routeId][stopB], 0)
+
+// Returns a `Json` object (routeId -> stopId). The queue is rebuilt every round per the
+// marked-stop set and is short-lived/small — it is NOT a perf hotspot, so it stays the
+// `Json` association-list rep (which also keeps its structural equality + `toString` working
+// for the unit tests; the typed `{ String: T }` map lacks cross-rep eq/display today).
+export val getQueue = (routesAtStop: { String: String[] }, routeStopIndex: { String: { String: Int32 } }, markedStops: Json): Json =>
   var queue = {}
   markedStops.for(stop =>
     val routes = if routesAtStop[stop] == null then [] else routesAtStop[stop]
