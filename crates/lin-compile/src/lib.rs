@@ -262,6 +262,10 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
             return Err(CompileError::TypeCheck(errors));
         }
         rc_elide::elide_rc(&mut ir_module);
+        // Sealed-records Stage 4: mark non-escaping all-scalar sealed-record constructions for
+        // stack allocation AND suppress their Retain/Release emission (see lin_ir::escape). Runs
+        // after RC elision so it sees and removes the surviving Retain/Release on stack values.
+        lin_ir::escape::analyze(&mut ir_module);
         cg.compile_module_from_ir(&ir_module);
     }
 

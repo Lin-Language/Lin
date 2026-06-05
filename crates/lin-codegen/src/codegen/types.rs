@@ -148,6 +148,14 @@ impl<'ctx> Codegen<'ctx> {
     /// `lin_runtime::sealed::SEALED_HEADER` (16). Sealed-record field payload begins here.
     pub(crate) const SEALED_HEADER: u64 = 16;
 
+    /// Immortal-refcount sentinel for STACK-allocated sealed records (sealed-records Stage 4). A
+    /// record whose header rc is `>= IMMORTAL_RC` is inert to refcounting: `lin_rc_retain` and
+    /// `lin_sealed_release` are no-ops on it (it lives on the stack and is never heap-freed). This
+    /// is defense-in-depth — with RC-emission suppression the lowerer omits Retain/Release on a
+    /// stack value entirely. MUST stay in lockstep with `lin_runtime::string::IMMORTAL_RC`
+    /// (0x8000_0000).
+    pub(crate) const SEALED_IMMORTAL_RC: u32 = 0x8000_0000;
+
     /// True when `ty` is an unboxed scalar field of a sealed record: a fixed-width numeric (mirrors
     /// `is_flat_scalar`) OR `Bool`. Scalar fields are stored inline at their natural-aligned offset
     /// and need NO per-field RC.

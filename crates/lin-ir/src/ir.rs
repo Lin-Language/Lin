@@ -352,8 +352,19 @@ pub enum Instruction {
     /// so codegen can build the capture-less boxed-ABI wrapper. Mirrors `MakeClosure` for a
     /// local function, but the callee is resolved by symbol name, not FuncId.
     MakeNamedClosure { dst: Temp, sym: String, ty: Type },
-    /// result = { fields... }  — allocates object on heap
-    MakeObject { dst: Temp, fields: Vec<(String, Temp)>, spreads: Vec<Temp>, ty: Type },
+    /// result = { fields... }  — allocates object on heap.
+    ///
+    /// `stack` (sealed-records Stage 4): when `true`, this constructs an all-scalar SEALED record
+    /// that the escape analysis (`escape.rs`) PROVED non-escaping, so codegen allocates it in a
+    /// REUSED function-entry-block `alloca` (no `lin_sealed_alloc`, no heap, no per-iteration stack
+    /// growth). With RC-emission suppression (this milestone) the lowerer ALSO omits the
+    /// Retain/Release instructions on the value entirely (so the alloca SROA-promotes to registers);
+    /// the immortal-sentinel header refcount remains as defense-in-depth for any RC that slips
+    /// through. ALWAYS `false` for any heap-field record, any non-sealed/anonymous object, or any
+    /// construction whose value can reach a Return / container store / closure capture / async
+    /// boundary / unknown-retaining call — those stay heap. A wrong `true` is a use-after-return;
+    /// the analysis fails safe to `false` (heap) on any doubt.
+    MakeObject { dst: Temp, fields: Vec<(String, Temp)>, spreads: Vec<Temp>, ty: Type, stack: bool },
     /// result = [ elements... ]  — allocates array on heap
     MakeArray { dst: Temp, elements: Vec<Temp>, elem_ty: Type },
     /// result = object[key]  — safe field access (missing key → null temp)

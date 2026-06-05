@@ -1003,6 +1003,79 @@ impl<'ctx> Codegen<'ctx> {
     ///     the boxed-object inline construction's per-field `lin_rc_retain`).
     /// This explicit flag replaces a fragile representation-difference guess — the caller knows the
     /// ownership of each value it hands in, and getting it wrong is the exact UAF/leak bug class.
+    /// Sealed-records Stage 4: construct an ALL-SCALAR sealed record on the STACK. The escape
+    /// analysis (`lin_ir::escape`) proved this construction never escapes its frame, so instead of
+    /// `lin_sealed_alloc` (heap + refcount) we use a function-ENTRY-BLOCK `alloca`.
+    ///
+    /// Two soundness-critical properties:
+    ///  1. **Entry-block alloca, reused per iteration.** The `alloca` is emitted at the START of the
+    ///     function's entry block, NOT at the (loop-body) construction site. So in a TCO loop the
+    ///     SAME stack slot is reused every iteration — the stack does NOT grow per iteration (a fresh
+    ///     in-loop alloca would be a stack overflow at high N). All of the record's field values are
+    ///     already computed into SSA temps before this instruction (MakeObject takes field temps), so
+    ///     overwriting the slot with the new iteration's values cannot corrupt the reads that
+    ///     produced them.
+    ///  2. **Immortal refcount → RC is inert (defense-in-depth).** With RC-emission suppression the
+    ///     lowerer omits Retain/Release on this value entirely, so the alloca can SROA-promote to
+    ///     registers. As a belt-and-braces guard the header refcount is still initialised to the
+    ///     immortal sentinel (`>= IMMORTAL_RC`), so any `lin_rc_retain` / `lin_sealed_release` that
+    ///     DOES slip through (e.g. via a path the suppression missed) is a runtime no-op — a stack
+    ///     pointer is NEVER passed to `dealloc`.
+    ///
+    /// Scalar-only: every field is stored inline by offset; no heap field, no descriptor, no
+    /// per-field retain. `desc_ptr` (header offset 8) is left NULL (no heap fields to walk on drop).
+    pub(crate) fn sealed_construct_stack(
+        &mut self,
+        fields: &indexmap::IndexMap<String, Type>,
+        field_vals: &[(String, BasicValueEnum<'ctx>, Type, bool)],
+        llvm_fn: inkwell::values::FunctionValue<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        let total = Self::sealed_struct_size(fields);
+        let i32_ty = self.context.i32_type();
+        let i64_ty = self.context.i64_type();
+        let i8_ty = self.context.i8_type();
+
+        // Emit the alloca at the start of the function's entry block (the standard LLVM idiom) so it
+        // is allocated ONCE per call and reused across every TCO loop iteration. Save/restore the
+        // builder position around it.
+        let saved = self.builder.get_insert_block();
+        let entry = llvm_fn.get_first_basic_block().expect("function has an entry block");
+        match entry.get_first_instruction() {
+            Some(first) => self.builder.position_before(&first),
+            None => self.builder.position_at_end(entry),
+        }
+        // Allocate as `[N x i64]` (NOT `[total x i8]`) so the slot is 8-ALIGNED — the i64/f64 field
+        // loads/stores at 8-aligned offsets must not be under-aligned (a misaligned 8-byte access is
+        // LLVM UB and faults on stricter arches, e.g. arm64). `total` is always an 8-byte multiple
+        // (`sealed_struct_size` pads to 8), so the division is exact.
+        debug_assert_eq!(total % 8, 0, "sealed struct size must be 8-padded");
+        let slot_ty = i64_ty.array_type((total / 8) as u32);
+        let obj = self.builder.alloca(slot_ty, "sealed_stack");
+        // Restore to the construction site for the header/field stores.
+        if let Some(bb) = saved {
+            self.builder.position_at_end(bb);
+        }
+
+        // Header: rc @ 0 = IMMORTAL_RC, size @ 4 = total, desc_ptr @ 8 = NULL.
+        let rc_p = unsafe { self.builder.gep(i8_ty, obj, &[i64_ty.const_int(0, false)], "sealed_stk_rc") };
+        self.builder.store(rc_p, i32_ty.const_int(Self::SEALED_IMMORTAL_RC as u64, false));
+        let sz_p = unsafe { self.builder.gep(i8_ty, obj, &[i64_ty.const_int(4, false)], "sealed_stk_sz") };
+        self.builder.store(sz_p, i32_ty.const_int(total, false));
+        let desc_p = unsafe { self.builder.gep(i8_ty, obj, &[i64_ty.const_int(8, false)], "sealed_stk_desc") };
+        self.builder.store(desc_p, self.context.ptr_type(AddressSpace::default()).const_null());
+
+        // Fields: all scalars, stored inline by offset. No coerce (scalar field type == value type
+        // under this gate), no retain.
+        for (name, val, _val_ty, _already_owned) in field_vals {
+            let (offset, _) = Self::sealed_field_layout(fields, name);
+            let p = unsafe {
+                self.builder.gep(i8_ty, obj, &[i64_ty.const_int(offset, false)], "sealed_stk_set_p")
+            };
+            self.builder.store(p, *val);
+        }
+        obj.into()
+    }
+
     pub(crate) fn sealed_construct(
         &mut self,
         fields: &indexmap::IndexMap<String, Type>,
