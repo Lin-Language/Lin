@@ -398,4 +398,30 @@ impl Checker {
             }
         }
     }
+
+    /// Like `collect_and_save_subs`, but does NOT clobber an existing local binding for a TypeVar
+    /// when the freshly-collected candidate is `arg_compatible` (assignable) to the established
+    /// binding. This makes the FIRST canonical binding win across multiple arguments that share one
+    /// TypeVar: e.g. `push(out: Field[], { … }: {tag:UInt8,…})` binds `T = Field` from the container
+    /// arg, and the structurally-narrower item (whose `UInt8` fields WIDEN into `Field`'s `Int32`
+    /// fields) must not overwrite it to the narrower object type — which would then reject the
+    /// container arg as "expected {tag:UInt8,…}[]". When the candidate is NOT compatible with the
+    /// existing binding (a genuine conflict), the normal last-wins behaviour is kept so existing
+    /// inference is unchanged.
+    pub(crate) fn collect_and_save_subs_no_clobber(&mut self, pattern: &Type, actual: &Type, local: &mut std::collections::HashMap<u32, Type>) {
+        let mut fresh = std::collections::HashMap::new();
+        collect_type_subs(pattern, actual, &mut fresh);
+        for (id, ty) in fresh {
+            match local.get(&id) {
+                // Keep the established binding when the new candidate is assignable to it.
+                Some(existing) if self.arg_compatible(&ty, existing) => {}
+                _ => {
+                    local.insert(id, ty.clone());
+                    if id < 9000 && !self.protected_type_vars.contains(&id) {
+                        self.solved_type_vars.entry(id).or_insert(ty);
+                    }
+                }
+            }
+        }
+    }
 }
