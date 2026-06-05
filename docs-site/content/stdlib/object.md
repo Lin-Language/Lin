@@ -3,7 +3,7 @@
 Object introspection and transformation functions.
 
 ```lin
-import { keys, values, entries, fromEntries, merge, pick, omit, mapValues, isEmpty } from "std/object"
+import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, isEmpty } from "std/object"
 ```
 
 ## Function reference
@@ -12,6 +12,7 @@ import { keys, values, entries, fromEntries, merge, pick, omit, mapValues, isEmp
 | --- | --- | --- |
 | `entries` | `(Json) -> [String, Json][]` | Array of `[key, value]` pairs (object or typed map) |
 | `fromEntries` | `([String, Json][]) -> {}` | Build object from key-value pairs |
+| `get` | `<T>({ String: T }, String, T) -> T` | Value at key, or a default when absent (`m[k] ?? default`) |
 | `isEmpty` | `(Json) -> Boolean` | True if object, array, or string is empty |
 | `keys` | `(Json) -> String[]` | Array of object keys (object or typed map) |
 | `mapValues` | `<V,W>({ String: V }, (V) -> W) -> { String: W }` | Transform values, keep keys |
@@ -24,7 +25,8 @@ import { keys, values, entries, fromEntries, merge, pick, omit, mapValues, isEmp
 index-signature map `{ String: T }` (ADR-082). `merge`/`pick`/`omit`/`mapValues` are generic over
 `{ String: T }` and *return* a typed map; pass them a value annotated `{ String: T }` (there is no
 implicit `Json -> { String: T }` coercion). Over a typed map, key order is hash order, not insertion
-order.
+order. `get` is the idiomatic *defaulted* read (`m[k] ?? default`) — a bare `m[k]` already yields
+`T | Null`, so only the defaulted form (which returns a bare `T`) is a named helper.
 
 ---
 
@@ -64,6 +66,21 @@ Inverse of `entries`. Transform all values then reconstruct:
 entries(obj)
   .map(([k, v]) => [k, v * 2])
   .fromEntries()
+```
+
+---
+
+### `get`
+
+Defaulted read over a typed `{ String: T }` map — the value at `key`, or `default` when the key is
+absent. Returns a bare `T`, so the result needs no `null` guard.
+
+```lin
+val counts: { String: Int32 } = { "a": 7 }
+
+counts.get("a", 0)         // 7
+counts.get("missing", 0)   // 0
+counts.get("a", 0) + 1     // 8
 ```
 
 ---

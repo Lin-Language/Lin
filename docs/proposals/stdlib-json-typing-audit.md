@@ -38,6 +38,24 @@ array.countBy = (arr: Json, f): Json    →  <T>(arr: T[], f: (T)=>String): { St
 isEmpty    = (x: Json): Boolean         →  kept Json (permissive: object OR array)                     KEPT
 ```
 
+**Defaulted accessors (the `m[k] ?? default` gap, DONE).** The typed map gave `m[k] : T | Null`, but
+a positive `is T` arm on a monomorphized type parameter does not narrow today, so callers either
+hand-rolled a per-type coalescer (the RAPTOR `intOr`) or did a double `if m[k] != null then m[k] else d`
+read. Closed with two generic accessors that return a bare `T`:
+```
+object.get = <T>(m: { String: T }, key: String, default: T): T   DONE   (the m[k] ?? default read)
+array.atOr = <T>(arr: T[], index: Int32, default: T): T          DONE   (bounds-safe at with a default)
+```
+Both are written with the `is Null => default; else => <value>` arm order (the working narrowing
+form). `object.get` requires a genuine `{ String: T }` receiver (no implicit `Json → { String: T }`
+coercion), so a `Json`-typed map or a nested double-index still needs a local coalescer — see the
+RAPTOR `intOr`, retained only for its `Json` interchange map and its nested `routeStopIndex` read.
+A `default`-arg form of `at` is not expressible: a generic `T` has no spellable default (`null` is
+`T | Null`), hence the separate `atOr`. (A monomorphizer fix landed alongside: `Type::Map` was
+missing from `collect_subs`/`mentions_generic_tv`/`subst_type`/`erase_nonconcrete_typevars`, so a
+generic whose type parameter appeared ONLY inside a `{ String: T }` param — like `get` — failed to
+specialize cross-module and emitted an undefined base symbol.)
+
 **Kept `Json` deliberately (each a real constraint, not laziness):**
 
 - `keys` / `values` / `entries` — kept `Json`, tag-aware. The `lin_*_any` runtime bridges dispatch on

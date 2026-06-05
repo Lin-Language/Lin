@@ -57,7 +57,7 @@ const GENERIC_TV_BASE: u32 = 9001;
 fn mentions_generic_tv(ty: &Type) -> bool {
     match ty {
         Type::TypeVar(id) => *id >= GENERIC_TV_BASE && *id != u32::MAX,
-        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) => mentions_generic_tv(t),
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Map(t) => mentions_generic_tv(t),
         Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(mentions_generic_tv),
         Type::Object { fields, .. } => fields.values().any(mentions_generic_tv),
         Type::Function { params, ret, .. } => {
@@ -88,6 +88,7 @@ fn subst_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
         Type::Iterator(t) => Type::Iterator(Box::new(subst_type(t, subs))),
         Type::Shared(t) => Type::Shared(Box::new(subst_type(t, subs))),
         Type::Stream(t) => Type::Stream(Box::new(subst_type(t, subs))),
+        Type::Map(t) => Type::Map(Box::new(subst_type(t, subs))),
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| subst_type(t, subs)).collect()),
         Type::Union(ts) => Type::Union(ts.iter().map(|t| subst_type(t, subs)).collect()),
         Type::Object { fields, sealed } => Type::Object {
@@ -128,6 +129,7 @@ fn erase_nonconcrete_typevars(ty: &Type) -> Type {
         Type::Iterator(t) => Type::Iterator(Box::new(erase_nonconcrete_typevars(t))),
         Type::Shared(t) => Type::Shared(Box::new(erase_nonconcrete_typevars(t))),
         Type::Stream(t) => Type::Stream(Box::new(erase_nonconcrete_typevars(t))),
+        Type::Map(t) => Type::Map(Box::new(erase_nonconcrete_typevars(t))),
         Type::FixedArray(ts) => {
             Type::FixedArray(ts.iter().map(erase_nonconcrete_typevars).collect())
         }
@@ -180,6 +182,13 @@ fn collect_subs(pattern: &Type, actual: &Type, subs: &mut HashMap<u32, Type>) {
         (Type::Iterator(p), Type::Iterator(a)) => collect_subs(p, a, subs),
         (Type::Shared(p), Type::Shared(a)) => collect_subs(p, a, subs),
         (Type::Stream(p), Type::Stream(a)) => collect_subs(p, a, subs),
+        // An index-signature map param `{ String: T }` unified against a concrete `{ String: A }`
+        // value (or the `Json` wildcard): recover the element TypeVar from the value type, exactly
+        // like the `Array`/`Iterator` element cases above.
+        (Type::Map(p), Type::Map(a)) => collect_subs(p, a, subs),
+        (Type::Map(p), Type::TypeVar(id)) if *id == u32::MAX => {
+            collect_subs(p, &Type::TypeVar(u32::MAX), subs)
+        }
         (Type::Object { fields: pf, .. }, Type::Object { fields: af, .. }) => {
             for (k, pv) in pf {
                 if let Some(av) = af.get(k) { collect_subs(pv, av, subs); }

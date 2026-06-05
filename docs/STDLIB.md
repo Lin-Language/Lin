@@ -109,6 +109,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`arrayAllocate`](#arrayAllocate) | `(Int32) -> Json[]` | Allocate an array of n nulls |
 | [`arrayAllocateFilled`](#arrayAllocateFilled) | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
 | [`at`](#at-array) | `<T>(T[], Int32) -> T \| Null` | Element at index, or `null` if out of bounds; negative indices count from end |
+| [`atOr`](#atOr) | `<T>(T[], Int32, T) -> T` | Element at index, or a default when out of bounds; returns a bare `T` |
 | [`chunk`](#chunk) | `<T>(T[], Int32) -> T[][]` | Split into n-sized sub-arrays |
 | [`compact`](#compact) | `(Json[]) -> Json[]` | Remove null elements |
 | [`countBy`](#countBy) | `<T>(T[], (T) -> String) -> { String: Int32 }` | Frequency map by key function |
@@ -194,6 +195,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | --- | --- | --- |
 | [`entries`](#entries) | `(Json) -> [String, Json][]` | Array of `[key, value]` pairs (tag-aware: object or typed map) |
 | [`fromEntries`](#fromEntries) | `([String, Json][]) -> {}` | Build an object from key-value pairs |
+| [`get`](#get) | `<T>({ String: T }, String, T) -> T` | Value at key, or a default when absent (the `m[k] ?? default` idiom) |
 | [`isEmpty`](#isEmpty) | `(Json) -> Boolean` | True if object, array, or string is empty |
 | [`keys`](#keys) | `(Json) -> String[]` | Array of object keys (tag-aware: object or typed map) |
 | [`mapValues`](#mapValues) | `<V,W>({ String: V }, (V) -> W) -> { String: W }` | Transform all values, keeping keys |
@@ -1306,6 +1308,23 @@ at([], 0)              // null
 
 ---
 
+### atOr {#atOr}
+
+```txt
+val atOr: <T>(arr: T[], index: Int32, default: T) -> T
+```
+
+Defaulted bounds-safe accessor. Returns the element at `index`, or `default` when the resolved index is out of bounds (after the same negative-index normalisation as [`at`](#at-array)). Unlike `at`, the result is a bare `T` — usable directly in arithmetic with no `null` guard. There is no `default`-arg form of `at` itself: a generic `T` has no spellable default expression (`null` would be `T | Null`), so the defaulted read is a separate function.
+
+```txt
+[10, 20, 30].atOr(1, -1)    // 20
+[10, 20, 30].atOr(5, -1)    // -1   (out of bounds -> default)
+[10, 20, 30].atOr(-1, -1)   // 30   (negative index wraps)
+[10, 20, 30].atOr(-9, 99)   // 99   (out-of-range negative -> default)
+```
+
+---
+
 ### chunk
 
 ```txt
@@ -2338,7 +2357,7 @@ trunc(3.0)    // 3.0
 Import:
 
 ```txt
-import { keys, values, entries, fromEntries, merge, pick, omit, mapValues, isEmpty } from "std/object"
+import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, isEmpty } from "std/object"
 ```
 
 > **Typed maps (`{ String: T }`).** Two groups of `std/object` ops relate to the typed
@@ -2355,7 +2374,9 @@ import { keys, values, entries, fromEntries, merge, pick, omit, mapValues, isEmp
 >   (not a plain `Json` record — there is no implicit `Json -> { String: T }` coercion, §5.1.1; pass
 >   a value annotated `{ String: T }`).
 >
-> A typed map also supports the built-in `m[k]` (yields `T | Null`) and `m[k] = v` directly.
+> A typed map also supports the built-in `m[k]` (yields `T | Null`) and `m[k] = v` directly. For a
+> *defaulted* read — the `m[k] ?? default` idiom — use [`get`](#get), which returns a bare `T`
+> (the present value or the default), so the result needs no `null` guard.
 > `fromEntries` keeps a `Json` signature pending a compiler fix (a type parameter nested in a
 > `[String, T][]` argument is not yet inferable).
 
@@ -2387,6 +2408,23 @@ Builds an object from an array of `[key, value]` pairs. This is the inverse of `
 fromEntries([["a", 1], ["b", 2]])   // { "a": 1, "b": 2 }
 
 entries(obj).map(([k, v]) => [k, v * 2]).fromEntries()   // double all values
+```
+
+---
+
+### get {#get}
+
+```txt
+val get: <T>(m: { String: T }, key: String, default: T) -> T
+```
+
+Defaulted read over a typed `{ String: T }` map: returns the value at `key`, or `default` when the key is absent. This is the idiomatic `m[k] ?? default` form — a bare `m[k]` already gives you `T | Null` directly, so only the *defaulted* read (which collapses the `| Null` to a bare `T`) earns a named helper. `m` must be a typed map (not a plain `Json` record — there is no implicit `Json -> { String: T }` coercion, §5.1.1).
+
+```txt
+val counts: { String: Int32 } = { "a": 7 }
+counts.get("a", 0)         // 7
+counts.get("missing", 0)   // 0
+counts.get("a", 0) + 1     // 8   (usable directly in arithmetic)
 ```
 
 ---

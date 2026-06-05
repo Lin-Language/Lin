@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
-import { indexOf, reverse, push, length, partition, zip, unique, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, arrayAllocate, arrayAllocateFilled, set, at, slice } from "std/array"
+import { indexOf, reverse, push, length, partition, zip, unique, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, arrayAllocate, arrayAllocateFilled, set, at, atOr, slice } from "std/array"
 import { map, filter, reduce, find, some, every, flatMap, concat, range, rangeStep, for, take, drop, takeWhile, dropWhile, flatten, iterOf } from "std/iter"
 
 val s = suite("std/array", [
@@ -179,6 +179,38 @@ val s = suite("std/array", [
   test("at returns null on out-of-bounds negative index", () =>
     [
       expect([10, 20, 30].at(-5)).toBe(null)
+    ]
+  ),
+
+  test("atOr returns the element when in bounds", () =>
+    [
+      expect([10, 20, 30].atOr(1, -1)).toBe(20)
+    ]
+  ),
+
+  test("atOr returns the default when out of bounds", () =>
+    [
+      expect([10, 20, 30].atOr(5, -1)).toBe(-1)
+    ]
+  ),
+
+  test("atOr wraps a negative index", () =>
+    [
+      expect([10, 20, 30].atOr(-1, -1)).toBe(30)
+    ]
+  ),
+
+  test("atOr returns the default for an out-of-range negative index", () =>
+    [
+      expect([10, 20, 30].atOr(-9, 99)).toBe(99)
+    ]
+  ),
+
+  // The whole point of atOr: the result is a bare T, usable in arithmetic with no null guard.
+  test("atOr returns a bare T usable in arithmetic", () =>
+    val sum: Int32 = [10, 20, 30].atOr(1, 0) + [10, 20, 30].atOr(7, 5)
+    [
+      expect(sum).toBe(25)
     ]
   ),
 

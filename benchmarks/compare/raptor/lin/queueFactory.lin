@@ -7,8 +7,12 @@
 // Reference: for each stop, for each route at that stop, keep the existing queue entry
 // only if it is strictly earlier than the new stop; otherwise replace with the new stop.
 import { for } from "std/iter"
+import { get } from "std/object"
 
-// Narrow an `Int32 | Null` typed-map read to `Int32` (positive-arm idiom; ADR-082).
+// Narrow an `Int32 | Null` typed-map read to `Int32` (positive-arm idiom; ADR-082). Still needed
+// here: the boarding position is a NESTED double-index `routeStopIndex[routeId][stop]` (an inner
+// `{ String: Int32 } | Null` map, then a scalar read off it) — `object.get` is a single-level
+// `m[k] ?? default` and does not apply to a doubly-nested read, so this scalar coalescer stays.
 val intOr = (x: Int32 | Null, d: Int32): Int32 =>
   match x
     is Int32 =>
@@ -26,7 +30,7 @@ val isStopBefore = (routeStopIndex: { String: { String: Int32 } }, routeId: Stri
 export val getQueue = (routesAtStop: { String: String[] }, routeStopIndex: { String: { String: Int32 } }, markedStops: Json): Json =>
   var queue = {}
   markedStops.for(stop =>
-    val routes = if routesAtStop[stop] == null then [] else routesAtStop[stop]
+    val routes = get(routesAtStop, stop, [])
     routes.for(routeId =>
       val existing = queue[routeId]
       // Keep the existing entry if it is strictly earlier on the route; otherwise take the
