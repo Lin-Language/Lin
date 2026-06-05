@@ -88,7 +88,37 @@ order). `groupBy`/`countBy` now return maps; `toString` of a typed map currently
 (TAG_MAP has no structural `toString` yet — an open ADR-082 follow-up, surfaced by the changed
 `groupBy` return type).
 
+### Generic callbacks (`sort`/`sortBy`/`minBy`/`maxBy`) — DONE, with one tracked gap
+
+The remaining `std/array` `Json`-callback fns are now generic:
+```
+sort   = <T>(arr: T[], cmp: (T, T) => Int32): T[]
+sortBy = <T>(arr: T[], keyFn: (T) => Json): T[]   (Json-key fallback: a heterogeneous [key,item] pair array can't carry a 2nd type param)
+minBy  = <T>(arr: T[], keyFn: (T) => Number): T
+maxBy  = <T>(arr: T[], keyFn: (T) => Number): T
+```
+A mistyped comparator caught by **return type** (`(T,T)=>String`) or by **explicit param type**
+(`(a: String, …)` on an `Int32[]`) is now a compile error, and the element type `T` flows through to
+the result.
+
+**Tracked inference gap (general, not sort-specific):** when a callback param is left UNANNOTATED, the
+generic `T` from the array argument is NOT back-inferred into the param's *body*. So
+`intArr.sort((a, b) => a["x"])` still type-checks (the lambda params `a`/`b` are treated as
+unconstrained inside the body), whereas `intArr.sort((a: Int32, b) => a["x"])` correctly errors
+("Cannot index into Int32"). This is the dual of the index-param bidirectional inference that DOES
+work for `map`/`filter` (DECISIONS.md ~§index-param) — the element type needs to flow into a callback
+param's *usage*, not just its arity. Closing it is checker work (bidirectional inference from a generic
+array arg into the callback param's type) worth doing across all the generic combinators at once, not
+bundled into a stdlib signature change. Until then the genericization is a strict improvement over the
+old all-`Json` callbacks (return type + explicit params + arg-array type are all checked) but not a
+*complete* guarantee on unannotated comparator bodies.
+
 ### Category 3 — result/error unions returned as `Json` (fix with `T | Error` / concrete records)
+
+> PARTIALLY DONE: the small modules `time`, `number`, `tty`, and `env` were re-typed by the
+> `chore/stdlib-typing-audit` merge (`5a65e51`). **Remaining: the heavy I/O modules — `fs` (16
+> Json-returning exports), `net` (13), `process` (7), `http` (6).** These are independent and can be
+> done per-module. `env.environ()` (the one env left) is a `{ String: String }` map case.
 
 The I/O modules return a success value OR an `Error`, but type it `Json`. `Error` is already a
 first-class composable union member (`std/async`'s `await` is `<T>(p: T): T | Error`, and `is Error`
