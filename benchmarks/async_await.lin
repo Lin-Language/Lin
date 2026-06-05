@@ -11,8 +11,14 @@ import { for, range } from "std/iter"
 // One async round-trip returning a small value derived from its argument (so the
 // thunk can't be folded away). Captures the function parameter `k` (transferred
 // to the worker by deep copy).
+// `await` returns `T | Error` (a faulted promise surfaces as Error); narrow it
+// to the value type before returning. The thunk always resolves, so the Error
+// arm is never taken — 0 is the correct "this never happens" fallback.
 val roundTrip = (k: Int32): Int32 =>
-  await(async(() => k * 2 + 1))
+  val r = await(async(() => k * 2 + 1))
+  match r
+    is Error => 0
+    else => r
 
 var sum = 0
 range(0, 20000).for(i => sum = sum + roundTrip(i))
