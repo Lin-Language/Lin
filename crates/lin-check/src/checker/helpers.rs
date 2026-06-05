@@ -119,7 +119,15 @@ pub(crate) fn apply_type_subs(ty: &Type, subs: &std::collections::HashMap<u32, T
         Type::Iterator(t) => Type::Iterator(Box::new(apply_type_subs(t, subs))),
         Type::Shared(t) => Type::Shared(Box::new(apply_type_subs(t, subs))),
         Type::Stream(t) => Type::Stream(Box::new(apply_type_subs(t, subs))),
-        Type::Union(ts) => Type::Union(ts.iter().map(|t| apply_type_subs(t, subs)).collect()),
+        Type::Map(t) => Type::Map(Box::new(apply_type_subs(t, subs))),
+        // Substituting a union's members can DUPLICATE or collapse it: `<T, D>(…): T | D` with
+        // `T = D` (e.g. `at(ints, i, 0)` over `Int32[]`, both members `Int32`) naively becomes the
+        // degenerate `Int32 | Int32`. `flatten_union` dedups members and collapses a singleton to
+        // the bare type, so the call-site result is the clean `Int32` a definitely-present read
+        // should have (usable directly in arithmetic) — matching the monomorphizer's `subst_type`.
+        Type::Union(ts) => {
+            Type::flatten_union(ts.iter().map(|t| apply_type_subs(t, subs)).collect())
+        }
         Type::Function { params, ret, required } => Type::Function {
             params: params.iter().map(|p| apply_type_subs(p, subs)).collect(),
             ret: Box::new(apply_type_subs(ret, subs)),

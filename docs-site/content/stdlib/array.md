@@ -15,8 +15,7 @@ import { sort, sortBy, length, push, slice, sum } from "std/array"
 | `append` | `<T>(T[], T) -> T[]` | Non-mutating single-element append |
 | `arrayAllocate` | `(Int32) -> Json[]` | Allocate an array of n nulls |
 | `arrayAllocateFilled` | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
-| `at` | `<T>(T[], Int32) -> T \| Null` | Element at index, or null if out of bounds; negative counts from end |
-| `atOr` | `<T>(T[], Int32, T) -> T` | Element at index, or a default when out of bounds; returns a bare `T` |
+| `at` | `<T, D>(T[], Int32, D = null) -> T \| D` | Element at index, or the default (`null` if omitted) when out of bounds; negative counts from end |
 | `chunk` | `<T>(T[], Int32) -> T[][]` | Split into n-sized sub-arrays |
 | `compact` | `(Json[]) -> Json[]` | Remove null elements |
 | `countBy` | `<T>(T[], (T) -> String) -> { String: Int32 }` | Frequency map by key function |
@@ -81,25 +80,25 @@ length({ "a": 1 })    // 1
 
 ### `at`
 
-Safe accessor: returns the element at `index`, or `null` if the resolved index is out of bounds (it never traps), widening the return type to `T | Null`. A negative index counts from the end.
+Safe accessor with an optional default: returns the element at `index`, or `default` when the resolved index is out of bounds (it never traps). A negative index counts from the end.
+
+The default's type `D` is an **independent** type parameter, so the result is `T | D` and the default's type never pollutes the element type `T`:
+
+- omitting the default gives `default = null`, so `at(arr, i)` is `T | Null` — the safe bounds-checked read;
+- a same-typed default collapses the union: over an `Int32[]`, `at(arr, i, 0)` is `Int32 | Int32 = Int32`, a bare scalar usable directly in arithmetic with no `null` guard;
+- a differently-typed default keeps both arms: `at(arr, i, "n/a")` over an `Int32[]` is `Int32 | String`.
+
+This one function subsumes the old `at`/`atOr` pair.
 
 ```lin
-at([10, 20, 30], 0)    // 10
-at([10, 20, 30], -1)   // 30
-at([], 0)              // null
-```
-
----
-
-### `atOr`
-
-Defaulted bounds-safe accessor: returns the element at `index`, or `default` when the resolved index is out of bounds (negative indices count from the end, like `at`). Unlike `at`, the result is a bare `T` — usable directly in arithmetic with no `null` guard. It is a separate function because a generic `T` has no spellable default expression for a `default`-arg form of `at` (`null` would be `T | Null`).
-
-```lin
-[10, 20, 30].atOr(1, -1)    // 20
-[10, 20, 30].atOr(5, -1)    // -1   (out of bounds -> default)
-[10, 20, 30].atOr(-1, -1)   // 30   (negative wraps)
-[10, 20, 30].atOr(-9, 99)   // 99   (out-of-range negative -> default)
+at([10, 20, 30], 0)         // 10
+at([10, 20, 30], -1)        // 30
+at([], 0)                   // null               (omitted default -> T | Null)
+[10, 20, 30].at(1, -1)      // 20
+[10, 20, 30].at(5, -1)      // -1   (out of bounds -> default)
+[10, 20, 30].at(-1, -1)     // 30   (negative wraps)
+[10, 20, 30].at(-9, 99)     // 99   (out-of-range negative -> default)
+[10, 20, 30].at(9, "n/a")   // "n/a"               (independent default type -> Int32 | String)
 ```
 
 ---
