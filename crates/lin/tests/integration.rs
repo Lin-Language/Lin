@@ -959,6 +959,95 @@ print(toString(isInt))
     assert_eq!(output, vec!["true", "true", "true", "false"]);
 }
 
+// Regression: `is T` where `T` is a generic type parameter. Before the fix the
+// monomorphizer dropped the TypeVar inside the match-arm / `is`-expression pattern,
+// so codegen compiled `is T` to a tag check against the 0xFF sentinel that never
+// matched — the positive arm was silently dead and the DEFAULT was returned. This
+// type-checked fine and returned wrong values at runtime.
+#[test]
+fn test_is_generic_typevar_match_form() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val genIsT = <T>(v: T | Null, d: T): T =>
+  match v
+    is T => v
+    else => d
+
+val run = (): Null =>
+  print(toString(genIsT(7, -1)))
+  print(toString(genIsT("hi", "x")))
+  print(toString(genIsT(true, false)))
+
+run()
+"#);
+    // The PRESENT value must be returned, not the default.
+    assert_eq!(output, vec!["7", "hi", "true"]);
+}
+
+#[test]
+fn test_is_generic_typevar_if_form() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val genIfT = <T>(v: T | Null, d: T): T =>
+  if v is T then v else d
+
+val run = (): Null =>
+  print(toString(genIfT(42, -1)))
+  print(toString(genIfT("yo", "x")))
+
+run()
+"#);
+    assert_eq!(output, vec!["42", "yo"]);
+}
+
+// Concrete (non-generic) `is Int32` must still work — the fix must not disturb the
+// ordinary scalar tag-check path.
+#[test]
+fn test_is_concrete_int32_still_works() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val concreteIsT = (v: Int32 | Null, d: Int32): Int32 =>
+  match v
+    is Int32 => v
+    else => d
+
+val run = (): Null =>
+  print(toString(concreteIsT(7, -1)))
+  print(toString(concreteIsT(null, -1)))
+
+run()
+"#);
+    assert_eq!(output, vec!["7", "-1"]);
+}
+
+// `is T` where `T` resolves to a UNION (Int32 | String): the substituted `is <union>`
+// must match a value whose runtime tag is ANY member of the union.
+#[test]
+fn test_is_generic_typevar_resolves_to_union() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val genIsT = <T>(v: T | Null, d: T): T =>
+  match v
+    is T => v
+    else => d
+
+val pick = (x: Int32 | String, dflt: Int32 | String): Int32 | String =>
+  genIsT(x, dflt)
+
+val run = (): Null =>
+  print(toString(pick(99, "def")))
+  print(toString(pick("hello", 0)))
+
+run()
+"#);
+    // Both an Int32 value and a String value match `is T` (T = Int32 | String).
+    assert_eq!(output, vec!["99", "hello"]);
+}
+
 #[test]
 fn test_string_escape_sequences() {
     // "hello\tworld\n" has an embedded newline; print adds another.

@@ -1539,6 +1539,46 @@ fn collect_quantified_ids(ty: &Type, out: &mut std::collections::HashSet<u32>) {
 // Type substitution over a TypedExpr tree (used to build specialized bodies)
 // ---------------------------------------------------------------------------
 
+/// Substitute the quantified TypeVars in a `match`-arm pattern (`is T` / `has T`). Only the
+/// type-bearing variants matter: `TypeCheck`/`TypeCheckDeep` carry the `is`-target type, which is
+/// the one that was being dropped. The nested patterns (Object/Array/Binding) also carry types and
+/// are recursed for completeness — a generic destructuring `match` arm would otherwise keep a stale
+/// TypeVar on its bound slots.
+fn subst_match_pattern(pat: &mut TypedMatchPattern, subs: &HashMap<u32, Type>) {
+    match pat {
+        TypedMatchPattern::Is(p) | TypedMatchPattern::Has(p) => subst_pattern(p, subs),
+        TypedMatchPattern::Else => {}
+    }
+}
+
+fn subst_pattern(pat: &mut TypedPattern, subs: &HashMap<u32, Type>) {
+    match pat {
+        TypedPattern::TypeCheck(ty, _) => *ty = subst_type(ty, subs),
+        TypedPattern::TypeCheckDeep(ty, named_defs, _) => {
+            *ty = subst_type(ty, subs);
+            for (_, t) in named_defs.iter_mut() {
+                *t = subst_type(t, subs);
+            }
+        }
+        TypedPattern::Literal(e) => subst_expr(e, subs),
+        TypedPattern::Object { fields, .. } => {
+            for f in fields.iter_mut() {
+                f.ty = subst_type(&f.ty, subs);
+                if let Some(vp) = f.value_pattern.as_mut() {
+                    subst_expr(vp, subs);
+                }
+            }
+        }
+        TypedPattern::Array { elements, .. } => {
+            for e in elements.iter_mut() {
+                subst_pattern(e, subs);
+            }
+        }
+        TypedPattern::Binding(_, ty, _) => *ty = subst_type(ty, subs),
+        TypedPattern::Wildcard(_) => {}
+    }
+}
+
 fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
     match expr {
         TypedExpr::IntLit(_, ty, _)
@@ -1561,7 +1601,16 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
             *target = subst_type(target, subs);
             *result_type = subst_type(result_type, subs);
         }
-        TypedExpr::Match { result_type, .. } => *result_type = subst_type(result_type, subs),
+        TypedExpr::Match { result_type, arms, .. } => {
+            *result_type = subst_type(result_type, subs);
+            // The arm PATTERNS carry their own target types (e.g. `is T` → `TypeCheck(TypeVar(T))`).
+            // `for_each_child_mut` only descends into arm guards/bodies, never the pattern type — so
+            // without this an `is T` test inside a generic body keeps its TypeVar after specialization
+            // and codegen's `type_tag_const` maps it to the 0xFF sentinel → the arm is silently dead.
+            for arm in arms.iter_mut() {
+                subst_match_pattern(&mut arm.pattern, subs);
+            }
+        }
         TypedExpr::Block { ty, .. } => *ty = subst_type(ty, subs),
         TypedExpr::Function { params, ret_type, captures, .. } => {
             for p in params.iter_mut() {
@@ -1578,7 +1627,13 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
             *result_type = subst_type(result_type, subs);
         }
         TypedExpr::IndexSet { obj_ty, .. } => *obj_ty = subst_type(obj_ty, subs),
-        TypedExpr::StringInterp { .. } | TypedExpr::Is { .. } | TypedExpr::Has { .. } => {}
+        TypedExpr::Is { pattern, .. } | TypedExpr::Has { pattern, .. } => {
+            // `if v is T then …` (the standalone form). Same reason as the `Match` arms above:
+            // the pattern's target type must be specialized or the `is T` tag check stays a dead
+            // 0xFF comparison.
+            subst_pattern(pattern, subs);
+        }
+        TypedExpr::StringInterp { .. } => {}
     }
     // Substitute the type fields carried on STATEMENTS inside a block. `for_each_child_mut` only
     // descends into a statement's value EXPRESSION, never its declared-type field — so without this
