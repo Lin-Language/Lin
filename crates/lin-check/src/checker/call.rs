@@ -348,7 +348,19 @@ impl Checker {
                         let array_lit_against_concrete_array = matches!(arg, Expr::Array(..))
                             && matches!(param_ty, Type::Array(_) | Type::FixedArray(_))
                             && !param_ty.contains_type_var();
-                        let typed = if array_lit_against_concrete_array {
+                        // Same hazard for an object literal against a typed index-signature
+                        // map `{ String: T }` (`Type::Map`): an empty `{}` infers bottom-up to
+                        // an empty `Object` (no fields to fix a value type), which then fails to
+                        // match the concrete `Map(T)` param. Route object literals through
+                        // expected-type-directed checking so `{}` (and string-keyed literals)
+                        // adopt the param's `Map(T)` representation. Restricted to `Type::Map`
+                        // so structural-`Object` params stay on the inference path (the
+                        // `check_object_against` Object branch defers for them anyway), and
+                        // gated TypeVar-free for the same substitution reasons as arrays.
+                        let object_lit_against_concrete_map = matches!(arg, Expr::Object(..))
+                            && matches!(param_ty, Type::Map(_))
+                            && !param_ty.contains_type_var();
+                        let typed = if array_lit_against_concrete_array || object_lit_against_concrete_map {
                             self.check_expr(arg, param_ty)?
                         } else {
                             self.infer_expr(arg)?
