@@ -16,7 +16,7 @@ val ONE_DAY = 86400
 
 // getFoundStations: best arrival - 1 day (min 1) for every stop that has an arrival.
 val getFoundStations = (kConnections: Json, bestArrivals: Json): Json =>
-  var origins = {}
+  var origins: Json = {}
   keys(kConnections).for(stop =>
     if length(keys(kConnections[stop])) > 0 then
       val best = bestArrivals[stop]
@@ -98,7 +98,7 @@ val searchDay = (raptor: RaptorIndex, origins: Json, destinations: Json, date: D
 
 // Group-station plan: set the same departure time on every origin, search, apply filters.
 export val planGroup = (raptor: RaptorIndex, origins: Json, destinations: Json, date: Date, time: Int32, maxSearchDays: Int32, filters: Json): Json =>
-  var originTimes = {}
+  var originTimes: Json = {}
   origins.for(o => originTimes[o] = time)
   val results = getJourneys(raptor, originTimes, destinations, date, maxSearchDays)
   // apply each filter in turn
