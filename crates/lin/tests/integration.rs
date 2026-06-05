@@ -11939,6 +11939,249 @@ print("${toString(final["a"] + final["b"] + final["c"])}")
     assert_eq!(out, vec!["50035001"]);
 }
 
+// ───────────────── Stack allocation of non-escaping sealed records (Stage 4) ─────────────────
+// The escape analysis (lin_ir::escape) marks an all-scalar sealed-record construction whose value
+// PROVABLY does not escape its frame for stack allocation (a reused function-entry-block alloca,
+// no lin_sealed_alloc) AND suppresses the Retain/Release emission on it (so the alloca SROA-promotes
+// to registers). The KEY soundness property — never stack-allocating a record that escapes (a
+// use-after-return) — is ASan-gated in CI; these tests pin observable behaviour for the stack path,
+// the heap fallbacks, a high-iteration no-stack-overflow loop, and the RC-suppressed IR shape.
+
+/// Build `source` with LIN_EMIT_IR=1 + LIN_NO_OPT=1 and return the raw (pre-optimization) LLVM IR
+/// text. Used to assert the SHAPE of the emitted IR (e.g. no lin_rc_retain / lin_sealed_release /
+/// lin_sealed_alloc on a stack-resident sealed record's hot loop).
+fn build_ir(source: &str) -> String {
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_ir_{}.lin", id));
+    let bin_path = ws.join(format!("target/lin_test_ir_{}", id));
+    let ll_path = ws.join(format!("target/lin_test_ir_{}.ll", id));
+    fs::write(&src_path, source).unwrap();
+    let compile = Command::new(lin_bin())
+        .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .env("LIN_EMIT_IR", "1")
+        .env("LIN_NO_OPT", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary");
+    let _ = fs::remove_file(&src_path);
+    let _ = fs::remove_file(&bin_path);
+    assert!(
+        compile.status.success(),
+        "compilation failed:\nstderr: {}\nsource:\n{}",
+        String::from_utf8_lossy(&compile.stderr),
+        source
+    );
+    let ir = fs::read_to_string(&ll_path).expect("LLVM IR .ll not emitted");
+    let _ = fs::remove_file(&ll_path);
+    ir
+}
+
+#[test]
+fn test_sealed_stack_tco_loop_high_n_no_overflow() {
+    // The records.lin shape at a HIGH iteration count: a TCO loop that builds a FRESH all-scalar
+    // sealed State each iteration and tail-recurses. The fresh State is stack-allocated in a REUSED
+    // entry-block alloca, so 5,000,000 iterations must NOT grow the stack (a per-iteration alloca
+    // would overflow). Correctness: the same bounded LCG-style mix as the benchmark, deterministic.
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type State = { "a": Int64, "b": Int64, "c": Int64 }
+val MOD = 2147483647i64
+val step = (i: Int64, s: State): State =>
+  if i == 0i64 then
+    s
+  else
+    val a = (s["a"] * 7i64 + s["c"] + 1i64) - (s["a"] * 7i64 + s["c"] + 1i64) / MOD * MOD
+    val b = (s["b"] + s["a"] * 3i64) - (s["b"] + s["a"] * 3i64) / MOD * MOD
+    val c = (s["c"] + s["b"] + 5i64) - (s["c"] + s["b"] + 5i64) / MOD * MOD
+    step(i - 1i64, { "a": a, "b": b, "c": c })
+val init: State = { "a": 1i64, "b": 2i64, "c": 3i64 }
+val final = step(5000000i64, init)
+val sum = final["a"] + final["b"] + final["c"]
+print("${toString(sum - (sum / MOD) * MOD)}")
+"#);
+    // Deterministic (matches a reference run); the point is it RUNS at 5M iters with no stack growth.
+    assert_eq!(out, vec!["839929631"]);
+}
+
+#[test]
+fn test_sealed_stack_tco_loop_ir_has_no_rc_or_heap_alloc() {
+    // RC-emission SUPPRESSION (this milestone): the records-style hot loop builds a fresh all-scalar
+    // sealed State each iteration that is PROVEN stack-resident. The emitted IR for that loop must
+    // contain NO heap allocation of the State (lin_sealed_alloc) AND NO refcount traffic on it
+    // (lin_rc_retain / lin_sealed_release) — those are the calls the Stage-4-without-suppression
+    // prototype still emitted (~140 retain / ~37 release) that made it 12% slower than heap. We
+    // assert they are GONE so the alloca can SROA-promote to registers.
+    let ir = build_ir(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+type State = { "a": Int64, "b": Int64, "c": Int64 }
+val MOD = 2147483647i64
+val step = (i: Int64, s: State): State =>
+  if i == 0i64 then
+    s
+  else
+    val a = (s["a"] * 7i64 + s["c"] + 1i64) - (s["a"] * 7i64 + s["c"] + 1i64) / MOD * MOD
+    val b = (s["b"] + s["a"] * 3i64) - (s["b"] + s["a"] * 3i64) / MOD * MOD
+    val c = (s["c"] + s["b"] + 5i64) - (s["c"] + s["b"] + 5i64) / MOD * MOD
+    step(i - 1i64, { "a": a, "b": b, "c": c })
+val init: State = { "a": 1i64, "b": 2i64, "c": 3i64 }
+val final = step(50i64, init)
+print("${toString(final["a"] + final["b"] + final["c"])}")
+"#);
+    // Scope the IR check to the `@step` function (the hot TCO loop). Other functions (stdlib, main)
+    // legitimately use RC; what matters is the loop that rebuilds State every iteration.
+    let step = ir_function(&ir, "step");
+    // The hot-loop construction must use a stack alloca (named "sealed_stack" by
+    // sealed_construct_stack), proving the non-escaping State is NOT heap-allocated there.
+    assert!(step.contains("sealed_stack"), "expected a stack alloca for the non-escaping State:\n{step}");
+    // The TCO loop must carry NO refcount traffic on the State after RC suppression. (The only
+    // remaining @lin_sealed_alloc in `step` is the base-case `return s` materialization, which
+    // correctly escapes and stays heap — so we do NOT forbid lin_sealed_alloc outright, only RC.)
+    assert!(
+        !step.contains("@lin_rc_retain"),
+        "stack State hot loop must carry NO lin_rc_retain after RC suppression:\n{step}"
+    );
+    assert!(
+        !step.contains("@lin_sealed_release"),
+        "stack State hot loop must carry NO lin_sealed_release after RC suppression:\n{step}"
+    );
+}
+
+/// Extract the body text of the LLVM function `define ... @<name>(...) { ... }` from emitted IR.
+/// Matches on `@<name>(` so it doesn't catch a prefixed/suffixed symbol.
+fn ir_function(ir: &str, name: &str) -> String {
+    let needle = format!("@{name}(");
+    let mut out = String::new();
+    let mut in_fn = false;
+    for line in ir.lines() {
+        if !in_fn && line.starts_with("define ") && line.contains(&needle) {
+            in_fn = true;
+        }
+        if in_fn {
+            out.push_str(line);
+            out.push('\n');
+            if line == "}" {
+                break;
+            }
+        }
+    }
+    assert!(!out.is_empty(), "function @{name} not found in IR");
+    out
+}
+
+#[test]
+fn test_sealed_escaping_returned_uses_heap() {
+    // A constructed sealed record that is RETURNED out of the function ESCAPES → must stay heap
+    // (NOT stack-allocated, which would be a use-after-return). Functional check that the returned
+    // record's fields are intact after the call returns.
+    let out = run(r#"
+import { print } from "std/io"
+type Pt = { "x": Int32, "y": Int32 }
+val make = (a: Int32, b: Int32): Pt => { "x": a, "y": b }
+val p = make(11, 22)
+print("${p["x"]} ${p["y"]}")
+val q = make(3, 4)
+print("${q["x"] + q["y"]}")
+print("${p["x"] + q["x"]}")
+"#);
+    assert_eq!(out, vec!["11 22", "7", "14"]);
+}
+
+#[test]
+fn test_sealed_escaping_returned_ir_uses_heap_alloc() {
+    // The returned-record escape case must STILL heap-allocate (lin_sealed_alloc present) — verify
+    // the suppression did not over-reach and stack-allocate an escaping value.
+    let ir = build_ir(r#"
+import { print } from "std/io"
+type Pt = { "x": Int32, "y": Int32 }
+val make = (a: Int32, b: Int32): Pt => { "x": a, "y": b }
+val p = make(11, 22)
+print("${p["x"]} ${p["y"]}")
+"#);
+    assert!(
+        ir.contains("@lin_sealed_alloc"),
+        "a RETURNED sealed record must remain heap-allocated:\n{ir}"
+    );
+}
+
+#[test]
+fn test_sealed_escaping_stored_in_array_uses_heap() {
+    // A constructed sealed record STORED into an array container ESCAPES the constructing scope →
+    // heap. (Stack-allocating it would leave the array holding a dangling stack pointer.)
+    let out = run(r#"
+import { print } from "std/io"
+import { length } from "std/array"
+type Pt = { "x": Int32, "y": Int32 }
+val build = (): Pt[] =>
+  val a: Pt = { "x": 1, "y": 2 }
+  val b: Pt = { "x": 3, "y": 4 }
+  [a, b]
+val arr = build()
+print("${length(arr)}")
+print("${arr[0]["x"]} ${arr[1]["y"]}")
+"#);
+    assert_eq!(out, vec!["2", "1 4"]);
+}
+
+#[test]
+fn test_sealed_escaping_captured_by_closure_uses_heap() {
+    // A sealed record CAPTURED by a closure that escapes (returned as a value) must stay heap — the
+    // closure's env holds the record past the constructing frame.
+    let out = run(r#"
+import { print } from "std/io"
+type Pt = { "x": Int32, "y": Int32 }
+val makeAdder = () =>
+  val p: Pt = { "x": 10, "y": 20 }
+  () => p["x"] + p["y"]
+val f = makeAdder()
+print("${f()}")
+print("${f()}")
+"#);
+    assert_eq!(out, vec!["30", "30"]);
+}
+
+#[test]
+fn test_sealed_stack_local_dies_in_frame_and_heap_escape_mixed() {
+    // MIXED in one program: a purely-local sealed record (constructed, fields read, dies in frame →
+    // stack candidate) alongside one that is returned (→ heap). Both produce correct values.
+    let out = run(r#"
+import { print } from "std/io"
+type Pt = { "x": Int32, "y": Int32 }
+val compute = (n: Int32): Int32 =>
+  val local: Pt = { "x": n, "y": n * 2 }
+  local["x"] + local["y"]
+val makeEscape = (n: Int32): Pt => { "x": n, "y": n }
+print("${compute(5)}")
+val e = makeEscape(9)
+print("${e["x"] + e["y"]}")
+"#);
+    assert_eq!(out, vec!["15", "18"]);
+}
+
+#[test]
+fn test_sealed_stack_return_on_base_path_is_sound() {
+    // The records.lin SUBTLETY: the SAME binding `s` is RETURNED on the base case but the
+    // freshly-constructed intermediates are not. The base-case return materializes `s` and
+    // re-projects a FRESH heap struct (so the param does not escape by pointer), while the
+    // tail-call intermediates are stack-allocated. Returning on the base path must NOT be a
+    // use-after-return. Run a few iterations and read the returned fields — they must be intact.
+    let out = run(r#"
+import { print } from "std/io"
+type State = { "a": Int64, "b": Int64 }
+val step = (i: Int64, s: State): State =>
+  if i == 0i64 then
+    s
+  else
+    step(i - 1i64, { "a": s["a"] + 1i64, "b": s["b"] + s["a"] })
+val r = step(5i64, { "a": 1i64, "b": 0i64 })
+print("${r["a"]} ${r["b"]}")
+"#);
+    // a: 1 + 5 = 6; b accumulates a over 5 steps: 1+2+3+4+5 = 15.
+    assert_eq!(out, vec!["6 15"]);
+}
+
 // ───────────────────── Arrays of sealed scalar records (Stage 3) ─────────────────────
 // A `MyType[]` of an ALL-SCALAR sealed record is stored as a CONTIGUOUS, UNBOXED, header-less
 // buffer (elem_tag 0xFE), not an array of boxed LinObjects. `arr[i].f` is a constant-stride GEP +

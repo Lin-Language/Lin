@@ -1749,7 +1749,7 @@ fn try_lower_sealed_literal(
     let lowered_fields: Vec<(String, Temp)> =
         fields.iter().map(|(k, v)| (k.clone(), lower_expr(v, builder, ctx))).collect();
     let dst = builder.alloc_temp(slot_ty.clone());
-    builder.emit(Instruction::MakeObject { dst, fields: lowered_fields, spreads: vec![], ty: slot_ty.clone() });
+    builder.emit(Instruction::MakeObject { dst, fields: lowered_fields, spreads: vec![], ty: slot_ty.clone(), stack: false });
     builder.register_owned(dst, slot_ty.clone());
     Some(dst)
 }
@@ -2651,6 +2651,9 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 fields: lowered_fields,
                 spreads: lowered_spreads,
                 ty: ty.clone(),
+                // Default heap; the escape-analysis pass (escape.rs) flips this to `true` only for
+                // an all-scalar sealed record it PROVES non-escaping.
+                stack: false,
             });
             builder.register_owned(dst, ty.clone());
             dst
