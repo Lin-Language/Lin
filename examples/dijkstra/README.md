@@ -2,7 +2,7 @@
 
 Reads a weighted directed graph from JSON, runs Dijkstra's algorithm from a source
 node, prints the shortest path and distance to a target, and writes the result to
-a JSON file. Exercises object-as-map mutation, recursion, and a hand-rolled
+a JSON file. Exercises typed dictionary maps, recursion, and a hand-rolled
 priority queue.
 
 ## What it demonstrates
@@ -12,9 +12,10 @@ priority queue.
   (`{ dist, prev }`).
 - **Typed arrays** flowing through the algorithm: `Edge[]` in, `PqEntry[]` queue,
   `String[]` reconstructed path.
-- **Dynamic `Json` maps kept dynamic** where appropriate: the adjacency, distance,
-  and predecessor structures are keyed by node name at runtime and built with
-  `lin_object_set`.
+- **Typed index-signature maps** (`{ String: T }`, ADR-082): the adjacency
+  (`{ String: Neighbor[] }`), distance (`{ String: Int32 }`), and predecessor
+  (`{ String: String }`) structures are keyed by node name and written with plain
+  index assignment (`dist[node] = ...`) — O(1) average lookup, no `Json` unwrapping.
 - Tail-recursive queue processing and path reconstruction.
 - Reading/writing JSON from the filesystem (`std/fs`) and command-line `args()`.
 

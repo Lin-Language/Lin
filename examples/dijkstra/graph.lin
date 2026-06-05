@@ -1,36 +1,31 @@
-import { push, reverse, length } from "std/array"
+import { push, reverse } from "std/array"
 import { for } from "std/iter"
-import { toString } from "std/string"
 
-// A weighted directed edge as it appears in the input graph.
 export type Edge = { "from": String, "to": String, "weight": Int32 }
-
-// An adjacency entry: a reachable node and the cost of the edge to it.
 export type Neighbor = { "to": String, "weight": Int32 }
 
-// The adjacency structure (`buildAdj`'s result), the distance map and the prev
-// map are all keyed by node name at runtime, so they stay dynamic (Json). The
-// adjacency values are Neighbor[]; dist values are Int32; prev values are String.
-export val buildAdj = (edges: Edge[]): Json =>
-  var adj: {  } = {}
+export val buildAdj = (edges: Edge[]): { String: Neighbor[] } =>
+  var adj: { String: Neighbor[] } = {}
   edges.for(edge =>
-    val src = edge["from"]
-    val existing = adj[src]
-    if existing == null then
-      lin_object_set(adj, src, [{ "to": edge["to"], "weight": edge["weight"] }])
-    else
-      push(existing, { "to": edge["to"], "weight": edge["weight"] })
+    val existing = adj[edge["from"]]
+    match existing
+      is Null => adj[edge["from"]] = [{ "to": edge["to"], "weight": edge["weight"] }]
+      else => push(existing, { "to": edge["to"], "weight": edge["weight"] })
   )
   adj
 
-val walkPath = (prev: Json, source: String, path: String[], current: String): Null =>
-  val pRaw = prev[current]
-  if pRaw != null && current != source then
-    val p = toString(pRaw)
-    push(path, p)
-    walkPath(prev, source, path, p)
+val walkPath = (prev: { String: String }, source: String, path: String[], current: String): Null =>
+  val p = prev[current]
+  match p
+    is String =>
+      if current != source then
+        push(path, p)
+        walkPath(prev, source, path, p)
+      else
+        null
+    else => null
 
-export val reconstructPath = (prev: Json, source: String, target: String): String[] =>
+export val reconstructPath = (prev: { String: String }, source: String, target: String): String[] =>
   if target == source then
     [source]
   else

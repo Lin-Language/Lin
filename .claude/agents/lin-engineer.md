@@ -189,18 +189,6 @@ truthy. `sortBy(keyFn)` sorts ascending by the key (negate for descending);
 `String[]`. The lambdas also receive an index as a third arg when you want it:
 `[10, 10, 10].reduce(0, (acc, n, i) => acc + n * i)`.
 
-A multi-arm `match` can be written inline inside a combinator callback — bind it
-to a `val` or return it directly. Reach for a named helper only when it genuinely
-aids readability or reuse, not because the parser forces it:
-
-```lin
-records.map(r =>
-  match r
-    has { "type": "success", value } => value
-    else => { "name": "", "score": 0 }
-)
-```
-
 ### `for` and a typed map — side effects and accumulation (`wordcount/wordcount.lin`)
 
 `for` is the side-effecting terminal (returns `Null`); use it when you want to

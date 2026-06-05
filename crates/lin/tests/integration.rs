@@ -23,6 +23,16 @@ fn lin_bin() -> PathBuf {
     workspace_root().join("target/debug/lin")
 }
 
+/// A `lin` Command pre-armed with the `LIN_ALLOW_INTRINSICS` escape hatch (ADR-086) so the
+/// compiler's own intrinsic-exercising fixtures (which write user-level `.lin` sources that call
+/// `lin_*` directly) keep type-checking. Tests that must exercise the gate REJECTING an intrinsic
+/// build a bare `Command::new(lin_bin())` instead, WITHOUT this env var.
+fn lin_cmd() -> Command {
+    let mut cmd = Command::new(lin_bin());
+    cmd.env("LIN_ALLOW_INTRINSICS", "1");
+    cmd
+}
+
 /// Compile `source` to a temp binary and return stdout lines.
 /// Panics if compilation or execution fails.
 fn run(source: &str) -> Vec<String> {
@@ -33,7 +43,7 @@ fn run(source: &str) -> Vec<String> {
 
     fs::write(&src_path, source).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -80,7 +90,7 @@ fn run_expect_err(source: &str) -> String {
 
     fs::write(&src_path, source).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -125,7 +135,7 @@ fn run_with_stdin(source: &str, stdin_data: &str) -> String {
 
     fs::write(&src_path, source).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -164,7 +174,7 @@ fn run_with_args(source: &str, prog_args: &[&str]) -> String {
 
     fs::write(&src_path, source).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -1397,7 +1407,7 @@ val run = (): Null =>
   print(toString(sum))
 run()
 "#).unwrap();
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -2183,7 +2193,7 @@ fn test_circular_import_function_reference_compiles_not_stack_overflow() {
          export val fromB = (): Int32 => fromA()\n").unwrap();
 
     let bin_path = dir.join("a.out");
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", dir.join("a.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .output()
         .expect("failed to invoke lin binary — run `cargo build -p lin` first");
@@ -2267,7 +2277,7 @@ fn test_cyclic_imports_value_init_cycle_still_errors() {
          export val y = x + 1\n").unwrap();
 
     let bin_path = dir.join("a.out");
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", dir.join("a.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .output()
         .expect("failed to invoke lin binary — run `cargo build -p lin` first");
@@ -2322,7 +2332,7 @@ fn test_cache_invalidated_when_import_signature_changes() {
     let bin_path = dir.join("main.out");
 
     // Build #1: must succeed and populate .lin-cache (m.lin checked against Int32 getVal).
-    let build1 = Command::new(lin_bin())
+    let build1 = lin_cmd()
         .args(["build", dir.join("main.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .output()
         .expect("failed to invoke lin binary — run `cargo build -p lin` first");
@@ -2342,7 +2352,7 @@ fn test_cache_invalidated_when_import_signature_changes() {
     // Build #2: m.lin must be re-checked against the NEW (String) getVal, so `getVal() + 1` is now a
     // type error. If the cache key ignored a.lin's signature, the stale m.lin .typed would be reused
     // (codegen panic / silent miscompile).
-    let build2 = Command::new(lin_bin())
+    let build2 = lin_cmd()
         .args(["build", dir.join("main.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .output()
         .expect("failed to invoke lin binary");
@@ -2405,7 +2415,7 @@ print(toString(k))
 "#, d = dir.to_str().unwrap());
     let bad_path = dir.join("bad.lin");
     std::fs::write(&bad_path, &bad).unwrap();
-    let check = Command::new(lin_bin())
+    let check = lin_cmd()
         .args(["check", bad_path.to_str().unwrap()])
         .output()
         .expect("failed to invoke lin binary — run `cargo build -p lin` first");
@@ -2416,6 +2426,52 @@ print(toString(k))
         "ADR-078 boundary gap: binding a peer-dependent cyclic return to Int32 is currently \
          accepted. If this now FAILS, the gap was closed — flip this assertion and update ADR-078. \
          got: {check_out}");
+}
+
+#[test]
+fn test_intrinsic_rejected_in_user_code() {
+    // ADR-086: `lin_*` compiler intrinsics must not be callable from user code; they are
+    // resolvable only when type-checking a trusted stdlib module (or with the LIN_ALLOW_INTRINSICS
+    // test escape hatch). This test invokes `lin check` WITHOUT the escape hatch.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_intr_{}.lin", id));
+    fs::write(
+        &src_path,
+        "import { print } from \"std/io\"\nvar o: Json = {}\nlin_object_set(o, \"k\", 1)\nprint(\"x\")\n",
+    )
+    .unwrap();
+    // NOTE: bare Command, no .env("LIN_ALLOW_INTRINSICS", ...) — the gate must be ACTIVE.
+    let out = Command::new(lin_bin())
+        .args(["check", src_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "expected check to fail; stderr:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("compiler-internal intrinsic"),
+        "wrong error:\n{}",
+        stderr
+    );
+
+    // The escape hatch re-enables intrinsics for the compiler's own fixtures.
+    let out_hatch = Command::new(lin_bin())
+        .args(["check", src_path.to_str().unwrap()])
+        .env("LIN_ALLOW_INTRINSICS", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary");
+    let _ = fs::remove_file(&src_path);
+    assert!(
+        out_hatch.status.success(),
+        "LIN_ALLOW_INTRINSICS escape hatch should permit the intrinsic; stderr:\n{}",
+        String::from_utf8_lossy(&out_hatch.stderr)
+    );
 }
 
 #[test]
@@ -3691,6 +3747,52 @@ print(toString(length(keys(m))))
 print(toString(length(values(m))))
 "#);
     assert_eq!(output, vec!["10", "7", "null", "2", "2"]);
+}
+
+#[test]
+fn test_json_not_assignable_to_typed_map() {
+    // Type-soundness: there is intentionally NO implicit `Json -> { String: T }` coercion
+    // (§5.1.1, §6.3, ADR-082). A `Json` value's runtime payload is a `LinObject` (or any tag),
+    // NOT a `LinMap`; relabelling it to the index-signature map type at the call boundary does
+    // not convert the representation, so the callee would then read `LinObject` memory as a
+    // `LinMap` and corrupt it. The value must be decoded via `fromJson` / narrowing instead.
+    // This closes the trusted-stdlib (`lenient_json`) hole: even the stdlib's permissive
+    // Json-widening must NOT manufacture this coercion (compat.rs `(TypeVar(MAX), Map) => false`,
+    // which fires AHEAD of the lenient `Json -> concrete` arm). The same rejection holds in user
+    // code, exercised here.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val sink = (m: { String: Int32 }): Int32 => 0
+
+val j: Json = { "a": 1, "b": 2 }
+print(toString(sink(j)))
+"#);
+    assert!(
+        err.contains("expected { String: Int32 }"),
+        "expected a Json -> map argument-type rejection, got: {err}"
+    );
+}
+
+#[test]
+fn test_typed_map_still_widens_to_json_sink() {
+    // The SOUND direction `{ String: T } -> Json` must keep working: a typed map flows into a
+    // `Json` parameter of a tag-aware reader (keys/values/entries dispatch on the runtime tag),
+    // which is representation-safe. This is the companion to `test_json_not_assignable_to_typed_map`
+    // — the carve-out closes only the unsound direction, not this one.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { keys, values } from "std/object"
+import { length } from "std/array"
+
+var m: { String: Int32 } = {}
+m["a"] = 1
+m["b"] = 2
+// `keys`/`values` are typed `(Json): ...`; passing the typed map here is `{String:Int32} -> Json`.
+print(toString(length(keys(m))))
+print(toString(length(values(m))))
+"#);
+    assert_eq!(output, vec!["2", "2"]);
 }
 
 #[test]
@@ -7092,7 +7194,7 @@ fn is_self_contained(source: &str) -> bool {
 
 /// `lin check <path>` succeeds.
 fn lin_check_ok(path: &std::path::Path) -> bool {
-    Command::new(lin_bin())
+    lin_cmd()
         .args(["check", path.to_str().unwrap()])
         .current_dir(workspace_root())
         .output()
@@ -7111,7 +7213,7 @@ fn lin_check_ok_source(source: &str) -> bool {
     let ws = workspace_root();
     let p = ws.join(format!("target/fmt_check_{}.lin", id));
     std::fs::write(&p, source).unwrap();
-    let ok = Command::new(lin_bin())
+    let ok = lin_cmd()
         .args(["check", p.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -10158,7 +10260,7 @@ print(toString(identity(5)))
 print(identity("hello"))
 "#).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -10234,7 +10336,7 @@ a[2] = 30
 print(toString(a[0] + a[2]))
 "#).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -10292,7 +10394,7 @@ val scan = (j: Int32, best: Int32): Int32 =>
 print(toString(scan(1, 0)))
 "#).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -10357,7 +10459,7 @@ import { arrayAllocateFilled } from "std/array"
 val a: Int32[] = arrayAllocateFilled(3, 7)
 print(toString(a[5]))
 "#).unwrap();
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -10436,7 +10538,7 @@ print(a[0])
 print(a[1])
 "#).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -10528,7 +10630,7 @@ val doubled: Int32[] = mymap([10, 20, 30], x => x * 2)
 print(toString(doubled[0]))
 "#).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -10695,7 +10797,7 @@ val wrap = <U>(y: U): U => id(y)
 print(toString(wrap(42)))
 "#).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -10834,7 +10936,7 @@ fn run_with_spec_budget(source: &str, budget: &str) -> (String, Vec<String>) {
     let bin_path = ws.join(format!("target/lin_test_budget_{}", id));
     fs::write(&src_path, source).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_SPEC_BUDGET", budget)
         .current_dir(&ws)
@@ -10914,7 +11016,7 @@ print(toString(id(5)))
 print(id("hi"))
 "#, dir.to_str().unwrap())).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -11025,7 +11127,7 @@ val ints: Int32[] = [10, 20, 30]
 print(toString(firstOf(ints)))
 "#).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -11113,7 +11215,7 @@ val r: Json = doubleAll([5, 6, 7])
 print(toString(r.reduce(0, (acc, x) => acc + x)))
 "#, dir.to_str().unwrap())).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -11321,7 +11423,7 @@ fn check_source(source: &str) -> (bool, String) {
     let src_path = ws.join(format!("target/lin_check_{}.lin", id));
     fs::write(&src_path, source).unwrap();
 
-    let out = Command::new(lin_bin())
+    let out = lin_cmd()
         .args(["check", src_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -11344,7 +11446,7 @@ fn build_succeeds(source: &str) -> bool {
     let bin_path = ws.join(format!("target/lin_build_only_{}", id));
     fs::write(&src_path, source).unwrap();
 
-    let out = Command::new(lin_bin())
+    let out = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -11745,7 +11847,7 @@ fn run_test_json(fixture: &Path, extra: &[&str]) -> (bool, Vec<String>) {
     let ws = workspace_root();
     let mut args = vec!["test", fixture.to_str().unwrap(), "--reporter", "json"];
     args.extend_from_slice(extra);
-    let out = Command::new(lin_bin())
+    let out = lin_cmd()
         .args(&args)
         .current_dir(&ws)
         .output()
@@ -12149,7 +12251,7 @@ range(0, 1000000).for(i => print("line ${i}"))
     )
     .unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -12796,7 +12898,7 @@ fn build_ir(source: &str) -> String {
     let bin_path = ws.join(format!("target/lin_test_ir_{}", id));
     let ll_path = ws.join(format!("target/lin_test_ir_{}.ll", id));
     fs::write(&src_path, source).unwrap();
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -13152,6 +13254,126 @@ print(toString(ps))
             r#"[{"name": "ann", "age": 30}, {"name": "bob", "age": 41}]"#
         ]
     );
+}
+
+#[test]
+fn test_sealed_array_push_scalar_record() {
+    // REGRESSION (heap-corruption bug): pushing a record into a sealed SCALAR-record array.
+    // A `Pt[]` is a contiguous, header-less, packed-scalar-stride buffer (`lin_sealed_array_alloc`,
+    // elem_tag 0xFE). Before the fix the monomorphized `push$<Pt>` body materialized a BOXED
+    // LinObject and tagged-pushed it (TAG_OBJECT) into the packed buffer → pointer-sized write into
+    // a scalar-stride slot → `realloc(): invalid next size` / ASan heap-buffer-overflow in
+    // lin_array_push. Now `Intrinsic::Push` routes a sealed-array receiver to
+    // `lin_sealed_array_push_struct_retaining` (contiguous payload copy). Stage-3 tests dodged this
+    // by using array LITERALS only.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+type Pt = { "x": Int32, "y": Int32 }
+val pts: Pt[] = [{ "x": 0, "y": 0 }]
+push(pts, { "x": 1, "y": 10 })
+push(pts, { "x": 2, "y": 20 })
+push(pts, { "x": 3, "y": 30 })
+push(pts, { "x": 4, "y": 40 })
+push(pts, { "x": 5, "y": 50 })
+print("${length(pts)} ${pts[0]["x"]} ${pts[5]["y"]} ${pts[3]["x"]}")
+"#);
+    assert_eq!(out, vec!["6 0 50 3"]);
+}
+
+#[test]
+fn test_sealed_array_push_scalar_record_into_empty() {
+    // `val a: Pt[] = []; push(a, {..})` over a scalar-only sealed array — the element value arrives
+    // as a standalone sealed-struct pointer and must be copied into the contiguous layout, not
+    // boxed-and-tagged-pushed. Before the fix this printed garbage / crashed.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+type Point = { "x": Int32, "y": Int32 }
+val pts: Point[] = []
+push(pts, { "x": 1, "y": 2 })
+push(pts, { "x": 3, "y": 4 })
+print("${length(pts)}")
+print("${pts[0]["x"]} ${pts[1]["y"]}")
+"#);
+    assert_eq!(out, vec!["2", "1 4"]);
+}
+
+#[test]
+fn test_sealed_array_push_past_grow_boundary() {
+    // Push enough scalar records to force several `lin_sealed_array_push_slot` realloc grows (cap
+    // doubles from 4). Each grow reallocs the packed-scalar buffer; a tagged push would overflow it.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+type Pt = { "x": Int32, "y": Int32 }
+val pts: Pt[] = []
+val build = (i: Int32): Int32 =>
+  if i == 50 then 0 else
+    val _ = push(pts, { "x": i, "y": i * 10 })
+    build(i + 1)
+val _ = build(0)
+print("${length(pts)} ${pts[0]["x"]} ${pts[49]["y"]} ${pts[25]["x"]}")
+"#);
+    // length 50; pts[0].x = 0; pts[49].y = 490; pts[25].x = 25.
+    assert_eq!(out, vec!["50 0 490 25"]);
+}
+
+#[test]
+fn test_sealed_array_push_float64_record() {
+    // A Float64-field scalar record array: the packed stride is 8-byte doubles. Push must copy the
+    // 8-byte-per-field payload into the contiguous slot, not box-and-tag-push.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+type Vec2 = { "x": Float64, "y": Float64 }
+val vs: Vec2[] = [{ "x": 1.5, "y": 2.5 }]
+push(vs, { "x": 3.25, "y": 4.75 })
+push(vs, { "x": 5.5, "y": 6.5 })
+print("${length(vs)} ${vs[0]["x"]} ${vs[2]["y"]} ${vs[1]["x"]}")
+"#);
+    assert_eq!(out, vec!["3 1.5 6.5 3.25"]);
+}
+
+#[test]
+fn test_sealed_array_push_heap_field_records_stay_boxed() {
+    // REGRESSION: a heap-field record array (`Person` with a String field) is NOT a Stage-3 sealed
+    // scalar array, so `push` must keep using the boxed `Object[]` path and still index/serialize
+    // correctly. Proves the Push routing gate (`sealed_array_elem`) does not perturb boxed arrays.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+type Person = { "name": String, "age": Int32 }
+val ps: Person[] = [{ "name": "ann", "age": 30 }]
+push(ps, { "name": "bob", "age": 41 })
+push(ps, { "name": "cat", "age": 7 })
+print("${length(ps)} ${ps[0]["name"]} ${ps[2]["age"]}")
+print(toString(ps))
+"#);
+    assert_eq!(
+        out,
+        vec![
+            "3 ann 7",
+            r#"[{"name": "ann", "age": 30}, {"name": "bob", "age": 41}, {"name": "cat", "age": 7}]"#
+        ]
+    );
+}
+
+#[test]
+fn test_sealed_array_push_regression_flat_int_array_unchanged() {
+    // REGRESSION: pushing into a flat Int32[] must keep the flat representation (lin_push_dyn path),
+    // unaffected by the sealed-array Push routing.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+val nums: Int32[] = [3, 1, 4]
+push(nums, 1)
+push(nums, 5)
+push(nums, 9)
+print("${length(nums)} ${nums[0]} ${nums[5]}")
+"#);
+    assert_eq!(out, vec!["6 3 9"]);
 }
 
 /// Regression (LIN_ISSUES #2): a top-level mutable `var` in an IMPORTED module, mutated by an

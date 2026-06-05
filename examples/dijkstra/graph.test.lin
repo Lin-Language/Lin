@@ -63,7 +63,7 @@ val s = suite("graph", [
   ]),
 
   test("reconstructPath follows prev pointers", () =>
-    val prev = { "C": "B", "B": "A" }
+    val prev: { String: String } = { "C": "B", "B": "A" }
     val path = reconstructPath(prev, "A", "C")
     [
       expect(path.toString()).toBe("[\"A\", \"B\", \"C\"]")
