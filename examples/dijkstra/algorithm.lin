@@ -26,7 +26,7 @@ val findMinIdx = (pq: PqEntry[]): Int32 =>
   minIdx
 
 val removeAt = (pq: PqEntry[], idx: Int32): PqEntry[] =>
-  var result = []
+  var result: PqEntry[] = []
   var i = 0
   pq.for(_ =>
     if i != idx then push(result, pq[i])
@@ -57,9 +57,9 @@ val processQueue = (pq: PqEntry[], adj: Json, dist: Json, prev: Json, visited: J
     processQueue(remaining, adj, dist, prev, visited)
 
 export val dijkstra = (adj: Json, source: String, allNodes: String[]): DijkstraResult =>
-  var dist = {}
-  var prev = {}
-  var visited = {}
+  var dist: {  } = {}
+  var prev: {  } = {}
+  var visited: {  } = {}
   allNodes.for(n => lin_object_set(dist, n, 999999999))
   dist[source] = 0
   val pq = [{ "node": source, "dist": 0 }]

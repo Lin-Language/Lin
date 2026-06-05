@@ -32,7 +32,7 @@ export val entries = (obj: Json): Json[] =>
 // inference engine does not decompose `[String, T][]` to recover `T`. That is a compiler/inference
 // gap, not laxity here; re-type this once nested-tuple inference lands. See ADR-082 follow-up.
 export val fromEntries = (pairs: Json): Json =>
-  var result = {}
+  var result: {  } = {}
   pairs.for(pair =>
     result[pair[0]] = pair[1]
   )
@@ -58,7 +58,7 @@ export val pick = <T>(obj: { String: T }, ks: String[]): { String: T } =>
   result
 
 export val omit = <T>(obj: { String: T }, ks: String[]): { String: T } =>
-  val skip = {}
+  val skip: { String: Boolean } = {}
   ks.for(k => skip[k] = true)
   val allKeys = lin_keys_any(obj)
   var result: { String: T } = {}

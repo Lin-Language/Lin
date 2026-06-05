@@ -12,7 +12,7 @@ import { sort, sortBy, length, push, slice, sum } from "std/array"
 
 | Function | Signature | Description |
 | --- | --- | --- |
-| `append` | `(Json[], Json) -> Json[]` | Non-mutating single-element append |
+| `append` | `<T>(T[], T) -> T[]` | Non-mutating single-element append |
 | `arrayAllocate` | `(Int32) -> Json[]` | Allocate an array of n nulls |
 | `arrayAllocateFilled` | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
 | `at` | `<T>(T[], Int32) -> T \| Null` | Element at index, or null if out of bounds; negative counts from end |
@@ -28,9 +28,9 @@ import { sort, sortBy, length, push, slice, sum } from "std/array"
 | `min` | `(Number[]) -> Number` | Minimum element |
 | `minBy` | `(Json[], (Json) -> Number) -> Json` | Element with smallest key |
 | `partition` | `<T>(T[], (T[, i: Int32]) -> Boolean) -> T[][]` | Split into passing and failing (`result[0]` pass, `result[1]` fail; predicate gets an optional source index) |
-| `prepend` | `(Json[], Json) -> Json[]` | Non-mutating prepend |
+| `prepend` | `<T>(T[], T) -> T[]` | Non-mutating prepend |
 | `product` | `(Number[]) -> Number` | Product of all elements |
-| `push` | `(Json[], Json) -> Null` | Append in place (mutating) |
+| `push` | `<T>(T[], T) -> Null` | Append in place (mutating); element type enforced |
 | `reverse` | `<T>(T[]) -> T[]` | Reversed copy |
 | `scan` | `<T, U>(T[], U, (U, T) -> U) -> U[]` | Reduce returning all intermediate values |
 | `set` | `(Json[], Int32, Json) -> Null` | Set an element by index in place (mutating) |
@@ -56,10 +56,12 @@ people.sortBy(p => p["name"])
 
 ### `push`
 
-Mutates the array in place:
+Mutates the array in place. Generic (`<T>(arr: T[], item: T)`), so the element type is enforced —
+`push(intArr, "s")` is a compile error (ADR-085). An empty accumulator literal needs a type
+annotation so `T` is pinned — an evidence-free `[]` cannot infer its element type (ADR-084):
 
 ```lin
-val xs = []
+val xs: Int32[] = []
 xs.push(1)
 xs.push(2)
 // xs: [1, 2]

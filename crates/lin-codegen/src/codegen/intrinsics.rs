@@ -232,7 +232,16 @@ impl<'ctx> Codegen<'ctx> {
                     // boxed element shell is a fresh cached/heap box freed after the move). This is
                     // the `[]`+push flat-representation consistency fix (ADR-069).
                     let arr_elem_flat = matches!(&arr_ty, Type::Array(e) if Self::is_flat_scalar(e));
-                    if Self::is_union_type(&arr_ty) || arr_elem_flat {
+                    // A `Json[]` array (`Array(TypeVar(MAX))`, the Json/wildcard element) can hold a
+                    // FLAT runtime array at runtime — a concrete `Int32[]` boxed into a `Json`-typed
+                    // slot keeps its flat representation. A static tagged push would do a 16-byte
+                    // TaggedVal write into a 4-byte flat slot → heap corruption (`free(): invalid
+                    // pointer`). Route the dynamic-element case through `lin_push_dyn`, which reads
+                    // the array's runtime `elem_tag` and coerces the boxed element into the correct
+                    // (flat or tagged) slot. This is the `push$Json` / `push(jsonArr, …)` case (e.g.
+                    // `(a: Json) => push(a, 1)` applied to a flat `Int32[]`).
+                    let arr_elem_dynamic = matches!(&arr_ty, Type::Array(e) if Self::is_union_type(e));
+                    if Self::is_union_type(&arr_ty) || arr_elem_flat || arr_elem_dynamic {
                         // arr may be a boxed TaggedVal* wrapping a LinArray* (flat or tagged), or a
                         // raw flat LinArray*. Unbox if boxed, then lin_push_dyn dispatches on elem_tag.
                         let arr_raw = if Self::is_union_type(&arr_ty) {

@@ -36,7 +36,7 @@ val typeName = (v: Json): String =>
 // caller's input is not mutated.
 export val applyDefaults = (cfg: Json): Json =>
   val sch = schema()
-  var out = {}
+  var out: {  } = {}
   sch
     .keys()
     .for(k =>
@@ -51,7 +51,7 @@ export val applyDefaults = (cfg: Json): Json =>
 // error message strings (empty array == valid).
 export val validate = (cfg: Json): String[] =>
   val sch = schema()
-  var errors = []
+  var errors: String[] = []
   sch
     .keys()
     .for(k =>

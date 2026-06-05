@@ -159,6 +159,23 @@ impl<'ctx> Codegen<'ctx> {
     /// Use this when the array was allocated with rt_array_alloc (tagged format).
     pub(crate) fn tagged_array_push_value(&mut self, arr: BasicValueEnum<'ctx>, val: BasicValueEnum<'ctx>, val_ty: &Type) {
         let i8_ty = self.context.i8_type();
+        // A SEALED-repr record element (`{tag:Int32, bytes:Int32[]}` etc.) flowing into a TAGGED
+        // array is a packed struct pointer, NOT a boxed LinObject. Storing it raw under TAG_OBJECT
+        // makes the runtime read the struct as a LinObject header → a misaligned-pointer deref of a
+        // scalar field (`0x5`) on read-back. Materialize it to a fresh boxed LinObject first, then
+        // store that pointer under TAG_OBJECT — the representation the tagged slot (and toString /
+        // index-get) expects. This is the generic `push$Object` / `set` into a `Field[]` case.
+        if let Type::Object { .. } = val_ty {
+            if let Some(fields) = Self::sealed_fields(val_ty).cloned() {
+                let obj = self.sealed_materialize_to_object(val, &fields);
+                let tag = i8_ty.const_int(Self::type_tag(val_ty) as u64, false);
+                let ptr_ty = self.context.ptr_type(inkwell::AddressSpace::default());
+                let cell = self.builder.alloca(ptr_ty, "arr_cell");
+                self.builder.store(cell, obj);
+                self.builder.call(self.rt.array_push, &[arr.into(), cell.into(), tag.into()], "arr_push");
+                return;
+            }
+        }
         match val_ty {
             Type::TypeVar(_) | Type::Union(_) => self.push_tagged_val(arr, val, val_ty),
             _ => {

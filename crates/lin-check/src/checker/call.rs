@@ -365,8 +365,92 @@ impl Checker {
                         } else {
                             self.infer_expr(arg)?
                         };
-                        self.collect_and_save_subs(param_ty, &typed.ty(), &mut subs);
+                        // DEFER substitution collection for a bare integer-literal argument whose
+                        // parameter is a bare TypeVar (`item: T`). A suffixless literal infers as the
+                        // Int32 default (spec §21), which would CLOBBER a binding the same TypeVar
+                        // already received from a non-literal argument — e.g. `append(b, 221)` where
+                        // `arr: T[]` binds `T = UInt8` from `b`, but `221: Int32` then overwrites it
+                        // to `Int32`, splitting the result type (`Int32[]`) from the flat `UInt8`
+                        // runtime representation. Literals defer to the literal-retyping pass below,
+                        // which adopts the resolved param type and re-types the literal at that width.
+                        let defer_literal_sub = matches!(arg, Expr::IntLit(_, None, _))
+                            && matches!(param_ty, Type::TypeVar(id) if *id != u32::MAX);
+                        // Also DEFER an EMPTY array literal `[]` flowing into a generic `T[]` param
+                        // (TypeVar element): inferring it bottom-up yields `Array(Never)` and would
+                        // bind `T = Never`, then a concrete sibling item (`[].append(1)`) fails as
+                        // "expected Never". The deferred pass binds `T` from the sibling, then the
+                        // empty literal is RE-CHECKED against the resolved `T[]` so its element type
+                        // is concrete at codegen.
+                        let defer_empty_array_sub = matches!(arg, Expr::Array(elems, _) if elems.is_empty())
+                            && matches!(param_ty, Type::Array(e) if matches!(**e, Type::TypeVar(id) if id != u32::MAX));
+                        if !defer_literal_sub && !defer_empty_array_sub {
+                            // First arg establishes the canonical TypeVar binding; later args must not
+                            // clobber it with an assignable (narrower) candidate (`push(out, item)`
+                            // where `item` widens into `out`'s element type — see no_clobber doc).
+                            if i == 0 {
+                                self.collect_and_save_subs(param_ty, &typed.ty(), &mut subs);
+                            } else {
+                                self.collect_and_save_subs_no_clobber(param_ty, &typed.ty(), &mut subs);
+                            }
+                        }
                         partially_typed[i] = Some(typed);
+                    }
+                }
+                // Second sub-pass: collect substitutions from the deferred integer-literal and empty
+                // array-literal args, but ONLY for TypeVars that a non-literal arg did NOT already
+                // bind (so a literal's Int32/Never default never clobbers a concrete binding — it
+                // only supplies a binding when the TypeVar is otherwise unconstrained, e.g.
+                // `push(emptyAcc, 1)` with no width evidence elsewhere).
+                for (i, (arg, param_ty)) in args.iter().zip(params.iter()).enumerate() {
+                    if matches!(arg, Expr::IntLit(_, None, _)) {
+                        if let Type::TypeVar(id) = param_ty {
+                            if *id != u32::MAX && !subs.contains_key(id) {
+                                if let Some(typed) = &partially_typed[i] {
+                                    self.collect_and_save_subs(param_ty, &typed.ty(), &mut subs);
+                                }
+                            }
+                        }
+                    }
+                }
+                // Re-check each deferred EMPTY array literal against the now-resolved `T[]` param so
+                // its element type is concrete (the codegen-representation fix). If `T` is still
+                // unbound (no concrete sibling), leave it as the bottom-up `Array(Never)` and let the
+                // later compatibility/empty-literal-annotation gate report it.
+                for (i, (arg, param_ty)) in args.iter().zip(params.iter()).enumerate() {
+                    let is_empty_array = matches!(arg, Expr::Array(elems, _) if elems.is_empty());
+                    if is_empty_array {
+                        let resolved = apply_type_subs(param_ty, &subs);
+                        if let Type::Array(_) = &resolved {
+                            if !resolved.contains_type_var() {
+                                if let Ok(rechecked) = self.check_expr(arg, &resolved) {
+                                    self.collect_and_save_subs(param_ty, &rechecked.ty(), &mut subs);
+                                    partially_typed[i] = Some(rechecked);
+                                }
+                            }
+                        }
+                    }
+                }
+                // A genuinely-`Json` (dynamic) argument flowing into a bare-TypeVar param that a
+                // CONTAINER arg already pinned to a concrete type (`push(uint8Arr, jsonVal)`,
+                // `push(out: Field[], field["bytes"]…)`) must REBIND that TypeVar to `Json` so the
+                // call monomorphizes DYNAMICALLY: a `$Json` push routes through `lin_push_dyn`, which
+                // converts the boxed element into the array's runtime element slot at RUNTIME (the
+                // representation the non-generic `push` used). Keeping the concrete binding instead
+                // forces an unbox-coercion the monomorphized scalar-param body can't express → a
+                // `box_value` on a Json pointer (`zext ptr`) at codegen. Only a NON-first (item) arg
+                // triggers this; the container arg keeps its concrete element type.
+                for (i, param_ty) in params.iter().enumerate() {
+                    if i == 0 { continue; }
+                    if let Type::TypeVar(id) = param_ty {
+                        if *id != u32::MAX {
+                            if let Some(t) = partially_typed.get(i).and_then(|o| o.as_ref()) {
+                                let is_json_item = matches!(t.ty(), Type::TypeVar(_));
+                                let bound_concrete = subs.get(id).map(|b| !b.contains_type_var()).unwrap_or(false);
+                                if is_json_item && bound_concrete {
+                                    subs.insert(*id, Type::TypeVar(u32::MAX));
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -391,7 +475,19 @@ impl Checker {
                         }
                     };
                     // Collect substitutions from function args too (e.g. lambda return types).
-                    self.collect_and_save_subs(&params[i], &typed.ty(), &mut subs);
+                    // A bare integer literal flowing into a TypeVar param must NOT clobber a binding
+                    // already established for that TypeVar (its Int32 default would override a
+                    // concrete width — the `append(uint8Arr, 221)` literal-width split). Mirror the
+                    // first-pass deferral: skip re-collecting a literal's Int32 once the slot is bound.
+                    let literal_into_bound_tv = matches!(arg, Expr::IntLit(_, None, _))
+                        && matches!(&params[i], Type::TypeVar(id) if *id != u32::MAX && subs.contains_key(id));
+                    if !literal_into_bound_tv {
+                        if i == 0 {
+                            self.collect_and_save_subs(&params[i], &typed.ty(), &mut subs);
+                        } else {
+                            self.collect_and_save_subs_no_clobber(&params[i], &typed.ty(), &mut subs);
+                        }
+                    }
                     typed_args.push(typed);
                 }
                 self.in_tail_position = prev_tail;
@@ -689,8 +785,17 @@ impl Checker {
                 // We already have typed_receiver; build partial list.
                 // First pass: collect substitutions from non-lambda args (receiver already typed).
                 let mut subs = std::collections::HashMap::new();
-                if let Some(p0) = method_params.first() {
-                    self.collect_and_save_subs(p0, &typed_receiver.ty(), &mut subs);
+                // Defer an EMPTY array-literal RECEIVER (`[].append(1)`) flowing into a generic `T[]`
+                // param: collecting its bottom-up `Array(Never)` would bind `T = Never`, then the
+                // concrete item fails as "expected Never". Bind `T` from the item first, then re-check
+                // the receiver against the resolved `T[]` (mirror of the `infer_call` empty-array fix).
+                let receiver_is_empty_array = matches!(receiver, Expr::Array(elems, _) if elems.is_empty());
+                let defer_empty_receiver = receiver_is_empty_array
+                    && matches!(method_params.first(), Some(Type::Array(e)) if matches!(**e, Type::TypeVar(id) if id != u32::MAX));
+                if !defer_empty_receiver {
+                    if let Some(p0) = method_params.first() {
+                        self.collect_and_save_subs(p0, &typed_receiver.ty(), &mut subs);
+                    }
                 }
                 let mut partially_typed: Vec<Option<TypedExpr>> = vec![None; all_arg_exprs.len()];
                 partially_typed[0] = Some(typed_receiver);
@@ -698,8 +803,66 @@ impl Checker {
                     for (i, (arg, param_ty)) in arg_exprs.iter().zip(method_params.iter().skip(1)).enumerate() {
                         if !matches!(arg, Expr::Function { .. }) {
                             let typed = self.infer_expr(arg)?;
-                            self.collect_and_save_subs(param_ty, &typed.ty(), &mut subs);
+                            // Defer a bare integer literal's Int32-default substitution for a TypeVar
+                            // param so it can't clobber a binding the receiver already pinned (the
+                            // `uint8Arr.append(221)` literal-width split — mirror of `infer_call`).
+                            let defer_literal_sub = matches!(arg, Expr::IntLit(_, None, _))
+                                && matches!(param_ty, Type::TypeVar(id) if *id != u32::MAX);
+                            if !defer_literal_sub {
+                                // Non-receiver args must not clobber the receiver's canonical binding
+                                // with an assignable candidate (`out.push(item)` element-widen case).
+                                self.collect_and_save_subs_no_clobber(param_ty, &typed.ty(), &mut subs);
+                            }
                             partially_typed[i + 1] = Some(typed);
+                        }
+                    }
+                    // Supply a binding from a deferred literal only when its TypeVar is still unbound.
+                    for (i, (arg, param_ty)) in arg_exprs.iter().zip(method_params.iter().skip(1)).enumerate() {
+                        if matches!(arg, Expr::IntLit(_, None, _)) {
+                            if let Type::TypeVar(id) = param_ty {
+                                if *id != u32::MAX && !subs.contains_key(id) {
+                                    if let Some(typed) = &partially_typed[i + 1] {
+                                        self.collect_and_save_subs(param_ty, &typed.ty(), &mut subs);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Re-check a deferred empty array-literal receiver against the now-resolved `T[]` param
+                // so its element type is concrete at codegen.
+                if defer_empty_receiver {
+                    if let Some(p0) = method_params.first() {
+                        let resolved = apply_type_subs(p0, &subs);
+                        if let Type::Array(_) = &resolved {
+                            if !resolved.contains_type_var() {
+                                if let Ok(rechecked) = self.check_expr(receiver, &resolved) {
+                                    self.collect_and_save_subs(p0, &rechecked.ty(), &mut subs);
+                                    partially_typed[0] = Some(rechecked);
+                                }
+                            }
+                        }
+                        // Whether or not re-check succeeded, fold the (possibly Never) receiver type in
+                        // so an unconstrained call still gets a binding.
+                        if let Some(t) = &partially_typed[0] {
+                            self.collect_and_save_subs(p0, &t.ty(), &mut subs);
+                        }
+                    }
+                }
+                // Rebind a TypeVar bound to a concrete type by the receiver to `Json` when a NON-
+                // receiver item arg is genuinely `Json` (`arr.push(jsonVal)`) — see the `infer_call`
+                // sibling for why (dynamic `$Json` monomorph via `lin_push_dyn`).
+                for (i, param_ty) in method_params.iter().enumerate() {
+                    if i == 0 { continue; }
+                    if let Type::TypeVar(id) = param_ty {
+                        if *id != u32::MAX {
+                            if let Some(t) = partially_typed.get(i).and_then(|o| o.as_ref()) {
+                                let is_json_item = matches!(t.ty(), Type::TypeVar(_));
+                                let bound_concrete = subs.get(id).map(|b| !b.contains_type_var()).unwrap_or(false);
+                                if is_json_item && bound_concrete {
+                                    subs.insert(*id, Type::TypeVar(u32::MAX));
+                                }
+                            }
                         }
                     }
                 }
@@ -724,8 +887,17 @@ impl Checker {
                         }
                     };
                     // Collect substitutions from lambda/function args too (e.g. to resolve return TypeVars).
+                    // Don't let a bare integer literal's Int32 default clobber an already-bound TypeVar.
                     if let Some(param_ty) = method_params.get(i) {
-                        self.collect_and_save_subs(param_ty, &typed.ty(), &mut subs);
+                        let literal_into_bound_tv = matches!(arg_expr, Expr::IntLit(_, None, _))
+                            && matches!(param_ty, Type::TypeVar(id) if *id != u32::MAX && subs.contains_key(id));
+                        if !literal_into_bound_tv {
+                            if i == 0 {
+                                self.collect_and_save_subs(param_ty, &typed.ty(), &mut subs);
+                            } else {
+                                self.collect_and_save_subs_no_clobber(param_ty, &typed.ty(), &mut subs);
+                            }
+                        }
                     }
                     all_args.push(typed);
                 }

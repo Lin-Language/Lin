@@ -438,7 +438,9 @@ is *either* a fixed record *or* an index-signature map, never both.
   idiomatic form is `object.get(m, k, default)` (`std/object`).
 - `m[k] = v` requires `v : T` and `k : String`.
 - An empty `{}` literal infers `{ String: T }` from its context (the annotated binding / return
-  type); with no such context it stays a fixed record.
+  type). An **evidence-free** empty `{}` — no annotation, no contextual type, no contents — is a
+  **compile error** (it cannot infer a value type); annotate it, e.g. `val m: { String: Int32 } =
+  {}` or `val m: {} = {}` for a dynamic record. See ADR-084.
 - `keys(m) : String[]`, `values(m) : T[]`, `entries(m)` are available via `std/object`.
 - There is no implicit `Json → { String: T }` coercion — convert a `Json` value through
   `fromJson`/narrowing exactly as for any other concrete type (§6.3, §19).
@@ -459,6 +461,13 @@ val names: String[] = ["Bob", "Alice"]
 ```
 
 `T[]` describes an array of any length whose every element has type `T`.
+
+A non-empty array literal infers `T` from its contents (`[1, 2, 3] : Int32[]`). An **evidence-free**
+empty array literal — a bare `[]` with no annotation, no contextual type, and no elements — cannot
+infer its element type and is a **compile error**: annotate it, e.g. `val xs: Int32[] = []`. An
+empty `[]` still works wherever context supplies the element type (an annotated binding, a typed
+function parameter in argument position, a declared return type, a typed array element). See
+ADR-084.
 
 ### 5.3 Fixed-Length Array Types
 

@@ -74,7 +74,7 @@ val contentPathToUrl = (path: String): String =>
 val dirName = (filePath: String): String =>
   val parts = split(filePath, "/")
   val n = length(parts)
-  var dirParts = []
+  var dirParts: String[] = []
   var k = 0
   parts.for(part =>
     if k < n - 1 then dirParts.push(part)

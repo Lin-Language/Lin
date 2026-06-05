@@ -10,7 +10,7 @@ import { for, range } from "std/iter"
 // contributes 1, so the sum is the task count `n`).
 export val poolSum = (workers: Int32, n: Int32): Int32 =>
   val pool = threadPool(workers)
-  var promises = []
+  var promises: Json[] = []
   range(0, n).for(i => push(promises, pool.poolAsync(() => 1)))
   var total = 0
   // await yields `T | Error` (§24.2.2); `recoverInt` handles the Error case before summing.
