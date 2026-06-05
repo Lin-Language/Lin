@@ -145,6 +145,16 @@ pub unsafe extern "C" fn lin_sealed_release(ptr: *mut u8, size: usize) {
     if *rc == 0 {
         return;
     }
+    // Immortal / stack-allocated sealed records (sealed-records Stage 4) carry a saturated refcount
+    // (>= IMMORTAL_RC). They live on the stack (an entry-block alloca reused across a TCO loop) and
+    // are NEVER heap-freed — a `dealloc` of a stack pointer is memory corruption. Mirror of the
+    // sentinel guard in `lin_rc_retain` / `lin_string_release`: an immortal record is inert to RC,
+    // so any Retain/Release the codegen owning model emits on it (RC suppression should remove these
+    // in the hot path, but this is defense-in-depth) is a safe no-op. The escape analysis (lin-ir
+    // `escape.rs`) is what guarantees such a value never outlives its frame.
+    if *rc >= crate::string::IMMORTAL_RC {
+        return;
+    }
     *rc -= 1;
     if *rc == 0 {
         release_heap_fields(ptr);

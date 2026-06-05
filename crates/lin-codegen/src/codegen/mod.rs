@@ -214,6 +214,9 @@ impl<'ctx> Codegen<'ctx> {
         let mut ir_module =
             lin_ir::lower_import_module_with_imports(module, &module_key, imports, replaced_exports);
         lin_ir::rc_elide::elide_rc(&mut ir_module);
+        // Sealed-records Stage 4: stack-allocate non-escaping all-scalar sealed records and suppress
+        // their Retain/Release emission (imports get the same analysis as the main module).
+        lin_ir::escape::analyze(&mut ir_module);
         // Prefix this module's anonymous functions so `__lin_fn_<id>` symbols don't collide
         // with the main module's or other imports' (each module numbers FuncIds from 0).
         let saved_prefix = std::mem::replace(&mut self.ir_anon_prefix, format!("{}_", module_key));
@@ -1130,7 +1133,7 @@ impl<'ctx> Codegen<'ctx> {
                             let result = self.compile_ir_intrinsic(intrinsic, &arg_vals, &arg_tys, ret_ty);
                             temp_map.insert(*dst, result);
                         }
-                        Instruction::MakeObject { dst, fields, spreads, ty } => {
+                        Instruction::MakeObject { dst, fields, spreads, ty, stack } => {
                             // Typed index-signature map `{ String: T }` (ADR-082): allocate a hashed
                             // `LinMap` and set each literal field via `lin_map_set` (key = interned
                             // LinString, value = boxed TaggedVal). The checker only produces a
@@ -1195,7 +1198,18 @@ impl<'ctx> Codegen<'ctx> {
                                             (k.clone(), *v, vty, false)
                                         })
                                     }).collect();
-                                    let obj = self.sealed_construct(sf, &field_vals);
+                                    // Sealed-records Stage 4: the escape analysis proved this
+                                    // construction non-escaping → stack-allocate (reused entry-block
+                                    // alloca, immortal refcount, no heap, no per-iteration growth).
+                                    // Extra defensive gate: only when ALL fields are unboxed scalars
+                                    // (no heap field needs RC) — the escape pass only sets `stack`
+                                    // for all-scalar records, but re-check here so a heap-field record
+                                    // can never reach the alloca path.
+                                    let obj = if *stack && sf.values().all(Self::is_sealed_scalar_field) {
+                                        self.sealed_construct_stack(sf, &field_vals, llvm_fn)
+                                    } else {
+                                        self.sealed_construct(sf, &field_vals)
+                                    };
                                     temp_map.insert(*dst, obj);
                                     continue;
                                 }
