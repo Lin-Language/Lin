@@ -248,10 +248,30 @@ impl Type {
     /// for `== null` / `is Null` tests: `T | Null` minus `Null` = `T`; `A | B | Null` minus
     /// `Null` = `A | B`. Returns `None` when `self` is not a union that actually contains a `Null`
     /// member (so the caller leaves the binding's type untouched — there is nothing to narrow).
+    ///
+    /// A thin wrapper over the general `without_variant`.
     pub fn without_null(&self) -> Option<Type> {
+        self.without_variant(&Type::Null)
+    }
+
+    /// Subtract a single member type from a union, returning the complement (the union of the
+    /// remaining members, flattened). The general flow-narrowing primitive: in a branch where an
+    /// `is X` arm has been definitely excluded, the scrutinee narrows to `union minus X`.
+    ///
+    /// Examples (member equality is structural `Type::PartialEq`):
+    ///   - `T | Null`  minus `Null`  = `T`
+    ///   - `Int32 | String` minus `Int32` = `String`
+    ///   - `A | B | C` minus `B` = `A | C`
+    ///   - `String | Error` minus `Error` (`{ "type": String, "message": String }`) = `String`
+    ///
+    /// SOUNDNESS / no-guessing rule: returns `None` (leave the type untouched, narrow nothing)
+    /// unless `self` is a union that contains `excluded` as an EXACTLY-matching member and the
+    /// complement is non-empty. We never partially subtract or approximate: if `excluded` is not
+    /// a member, or removing it would leave nothing, there is no sound narrowing to apply.
+    pub fn without_variant(&self, excluded: &Type) -> Option<Type> {
         if let Type::Union(variants) = self {
-            if variants.iter().any(|t| *t == Type::Null) {
-                let rest: Vec<Type> = variants.iter().filter(|t| **t != Type::Null).cloned().collect();
+            if variants.iter().any(|t| t == excluded) {
+                let rest: Vec<Type> = variants.iter().filter(|t| *t != excluded).cloned().collect();
                 if !rest.is_empty() {
                     return Some(Type::flatten_union(rest));
                 }
