@@ -8,15 +8,16 @@ import { for, some } from "std/iter"
 
 // `keys`/`values`/`entries` are deliberately typed `Json`, NOT `<T>(obj: { String: T })`. They are
 // tag-aware at runtime (the `lin_*_any` bridges dispatch on the boxed value's tag, ADR-082), so the
-// SAME function works on both a plain `Json`/`{}` record (TAG_OBJECT → ordered) and a typed
-// index-signature map `{ String: T }` (TAG_MAP → hash order). A `{ String: T }` argument flows in
-// fine via trusted-stdlib widening. Re-typing the *parameter* to `{ String: T }` is UNSOUND: a
-// genuine `Json`/`{}` value (e.g. the result of `fromEntries`, or any object literal) would then be
-// relabelled to the map type at the call boundary without converting its representation — the
-// callee would read a `LinObject` as a `LinMap` and corrupt memory. There is intentionally no
-// implicit `Json → { String: T }` coercion (§5.1.1); the trusted Json-widening must not manufacture
-// one. So these keep `Json` and stay tag-aware. (`values`/`entries` still report `Json[]` here, but
-// a typed map's element type flows through the call result via the same widening at the use site.)
+// SAME function serves both a plain `Json`/`{}` record (TAG_OBJECT → insertion order) and a typed
+// index-signature map `{ String: T }` (TAG_MAP → hash order): a typed map flows in via the SOUND
+// `{ String: T } → Json` widening direction (a map read back through these tag-aware bridges is
+// safe). Re-typing the *parameter* to `{ String: T }` would NOT work and is not desired:
+//   - it would reject the dominant use — introspecting an arbitrary `Json`/`{}` record (e.g.
+//     `keys(parsedConfig)`), since `Json → { String: T }` is correctly rejected (§5.1.1; enforced
+//     in `compat.rs` — there is no implicit object→map coercion in either user or stdlib code), and
+//   - no caller wants a typed `T[]`/`[String,T][]` back: `values`/`entries` are used for dynamic
+//     introspection, where `Json[]` is the honest result.
+// So these stay `Json` + tag-aware by design, not as a workaround.
 export val keys = (obj: Json): String[] =>
   lin_keys_any(obj)
 
