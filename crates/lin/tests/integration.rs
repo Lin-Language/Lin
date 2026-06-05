@@ -3723,25 +3723,143 @@ print(getOr(s, "z", "fallback"))
 }
 
 #[test]
-fn test_stdlib_object_get_and_array_ator() {
-    // The shipped defaulted accessors (`std/object.get`, `std/array.atOr`) over the cross-module
-    // monomorphization path. Both return a bare `T` usable in arithmetic with no null guard.
+fn test_stdlib_unified_accessors_at_and_get() {
+    // The unified defaulted accessors (`std/object.get`, `std/array.at`) over the cross-module
+    // monomorphization path. Both take an INDEPENDENT default-type param `D` and return `T | D`;
+    // the `D = T` case (a matching-type default) collapses to bare `T` for a known element type.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { get } from "std/object"
-import { atOr } from "std/array"
+import { at } from "std/array"
 
 var m: { String: Int32 } = {}
 m["a"] = 7
-print(toString(m.get("a", 0) + 1))
-print(toString(m.get("missing", 5) + 1))
+// Defaulted map reads; the result is `Int32 | Int32` collapsed to `Int32` via the annotation.
+val a: Int32 = m.get("a", 0)
+val miss: Int32 = m.get("missing", 5)
+print(toString(a + 1))
+print(toString(miss + 1))
 
-print(toString([10, 20, 30].atOr(1, -1)))
-print(toString([10, 20, 30].atOr(5, -1)))
-print(toString([10, 20, 30].atOr(-1, -1)))
-print(toString([10, 20, 30].atOr(-9, 99)))
+// Over an `Int32[]`, `at(i, d)` with an Int32 default is the bare-Int32 "definitely present" form.
+print(toString([10, 20, 30].at(1, -1)))
+print(toString([10, 20, 30].at(5, -1)))
+print(toString([10, 20, 30].at(-1, -1)))
+print(toString([10, 20, 30].at(-9, 99)))
 "#);
     assert_eq!(output, vec!["8", "6", "20", "-1", "30", "99"]);
+}
+
+#[test]
+fn test_at_omitted_default_is_t_or_null_sound() {
+    // SOUNDNESS: with the default OMITTED, `at = <T, D>(…, default: D = null)` must infer `D = Null`,
+    // so `arr.at(i)` is `T | Null` — NOT bare `T`. Binding it to a bare `Int32` must be REJECTED.
+    let err = run_expect_err(
+        r#"import { at } from "std/array"
+import { print } from "std/io"
+
+val ints: Int32[] = [1, 2, 3]
+val bad: Int32 = ints.at(9)
+print("unreachable")
+"#,
+    );
+    assert!(
+        err.contains("Int32 | Null") || (err.contains("Int32") && err.contains("Null")),
+        "expected a `T | Null` type error for an omitted-default `at`, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_at_with_matching_default_is_bare_t() {
+    // The dual of the soundness reject: with a same-typed default supplied, `at(arr, i, 0)` over
+    // an `Int32[]` collapses `Int32 | Int32` to bare `Int32`, so `val x: Int32 = …` MUST pass and
+    // run. In-bounds reads the element; out-of-bounds yields the default.
+    let output = run(r#"import { at } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val ints: Int32[] = [1, 2, 3]
+val present: Int32 = ints.at(1, 0)
+val fallback: Int32 = ints.at(9, 0)
+print(toString(present))
+print(toString(fallback))
+"#);
+    assert_eq!(output, vec!["2", "0"]);
+}
+
+#[test]
+fn test_at_independent_default_type_t_or_d() {
+    // The default's type `D` is INDEPENDENT of the element type `T`: `at(ints, i, "x")` over an
+    // `Int32[]` is `Int32 | String`. Both arms must survive monomorphization (a flat-scalar element
+    // vs a boxed string default in one phi) and dispatch correctly at runtime.
+    let output = run(r#"import { at } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val ints: Int32[] = [10, 20, 30]
+val present = ints.at(1, "n/a")
+match present
+  is String => print("then-str")
+  else => print("then-int")
+val fallback = ints.at(9, "n/a")
+match fallback
+  is String => print(toString(fallback))
+  else => print("else-int")
+"#);
+    assert_eq!(output, vec!["then-int", "n/a"]);
+}
+
+#[test]
+fn test_at_omitted_default_runtime_t_or_null() {
+    // The omitted-default runtime path: `at(arr, i)` => `T | Null`, with the value present
+    // in-bounds and `null` out-of-bounds, over both Int32[] and String[].
+    let output = run(r#"import { at } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val ints: Int32[] = [10, 20, 30]
+val hit = ints.at(1)
+match hit
+  is Null => print("int-null")
+  else => print(toString(hit))
+val miss = ints.at(9)
+match miss
+  is Null => print("int-null")
+  else => print("int-value")
+
+val strs: String[] = ["a", "b"]
+val shit = strs.at(0)
+match shit
+  is Null => print("str-null")
+  else => print(shit)
+val smiss = strs.at(9)
+match smiss
+  is Null => print("str-null")
+  else => print("str-value")
+"#);
+    assert_eq!(output, vec!["20", "int-null", "a", "str-null"]);
+}
+
+#[test]
+fn test_get_independent_default_type_t_or_d() {
+    // `std/object.get` mirrors `at`: an independent default type `D` over a `{ String: Int32 }`
+    // map. `get(k, "x")` is `Int32 | String`; an omitted default would be `Int32 | Null`.
+    let output = run(r#"import { get } from "std/object"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+var m: { String: Int32 } = {}
+m["a"] = 7
+val present = m.get("a", "n/a")
+match present
+  is String => print("then-str")
+  else => print(toString(present))
+val fallback = m.get("z", "n/a")
+match fallback
+  is String => print(fallback)
+  else => print("else-int")
+"#);
+    assert_eq!(output, vec!["7", "n/a"]);
 }
 
 #[test]

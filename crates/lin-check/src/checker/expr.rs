@@ -579,7 +579,31 @@ impl Checker {
         // and the value branch was replaced by `null` at runtime (`at` returning null on a valid
         // index). When exactly one branch is `Null` and the other is not, form the union so both
         // branches survive (and survive monomorphization substitution of any generic `T`).
-        let result_type = if (then_ty == Type::Null) != (else_ty == Type::Null) {
+        // Two DISTINCT quantified-generic type parameters (e.g. `T` and `D` in
+        // `<T, D>(…): T | D`, ids ≥ 9000 and ≠ the Json wildcard) must NOT be collapsed onto each
+        // other by the `types_compatible` arms below. An unconstrained TypeVar unifies with
+        // anything, so `types_compatible(T, D)` is vacuously true and would pick ONE of them —
+        // silently dropping the other arm's type. For an `if … then arr[i] /*: T*/ else default
+        // /*: D*/` body that erases the union to a single param, so after monomorphization the two
+        // arms (a flat-scalar element vs a boxed default) disagree on representation and codegen
+        // emits a malformed phi. Keep them as an honest `T | D` union so both arms survive
+        // substitution and each gets boxed into the union representation. Same-id (`T | T`) still
+        // collapses via the normal path; a generic-vs-concrete pairing also keeps its existing
+        // behaviour (only BOTH being distinct quantified params triggers this).
+        // Quantified-generic TypeVar ids are minted ≥ 9001 (`Checker::next_generic_tv`), above the
+        // intrinsic-slot range; the Json wildcard is `u32::MAX`. A bound type PARAMETER therefore
+        // lives in `[GENERIC_TV_BASE, u32::MAX)`.
+        const GENERIC_TV_BASE: u32 = 9000;
+        let distinct_generic_params = matches!(
+            (&then_ty, &else_ty),
+            (Type::TypeVar(a), Type::TypeVar(b))
+                if a != b
+                    && *a >= GENERIC_TV_BASE && *a != u32::MAX
+                    && *b >= GENERIC_TV_BASE && *b != u32::MAX
+        );
+        let result_type = if distinct_generic_params {
+            Type::flatten_union(vec![then_ty, else_ty])
+        } else if (then_ty == Type::Null) != (else_ty == Type::Null) {
             // Exactly one branch is the literal Null type. Keep both as a union so the
             // value-producing branch survives — UNLESS the other branch is `Json` (the dynamic
             // top type, `TypeVar(u32::MAX)`), which already subsumes `Null`: there `Json | Null`
