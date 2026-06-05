@@ -8,14 +8,47 @@ use super::Codegen;
 
 impl<'ctx> Codegen<'ctx> {
     pub(crate) fn compile_ir_is_type(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) -> inkwell::values::IntValue<'ctx> {
-        // Use get_tag and compare.
-        if val.is_pointer_value() {
-            let tag = self.builder.call(self.rt.get_tag, &[val.into()], "ir_tag").try_as_basic_value().unwrap_basic().into_int_value();
-            let expected = self.type_tag_const(ty);
-            self.builder.int_compare(IntPredicate::EQ, tag, expected, "ir_is")
-        } else {
-            self.context.bool_type().const_zero()
+        let bool_ty = self.context.bool_type();
+        // `is <Json wildcard or unresolved generic TypeVar>`: after monomorphization an `is T`
+        // whose `T` resolved to the Json wildcard (or stayed a generically-erased TypeVar) means
+        // "the type is unknown / Json-erased". A boxed value of any tag conforms to Json, so the
+        // sound answer is "always true" — NOT the historical 0xFF sentinel that matched nothing
+        // (the silent-wrong-result bug for `is <type-variable>`). A non-pointer (unboxed scalar)
+        // still cannot be a Json box here, so it stays false.
+        if matches!(ty, Type::TypeVar(_)) {
+            return if val.is_pointer_value() {
+                bool_ty.const_int(1, false)
+            } else {
+                bool_ty.const_zero()
+            };
         }
+        if !val.is_pointer_value() {
+            return bool_ty.const_zero();
+        }
+        let tag = self
+            .builder
+            .call(self.rt.get_tag, &[val.into()], "ir_tag")
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        // `is <Union>` (e.g. a generic `is T` specialized to `Int32 | String`): match if the
+        // runtime tag equals ANY member's tag. Members that are not a recognised scalar tag
+        // (nested unions / TypeVars) are skipped here — a nested union is flattened by the
+        // checker, and a Json-erased member is the wildcard handled above.
+        if let Type::Union(members) = ty {
+            let mut acc = bool_ty.const_zero();
+            for m in members {
+                if matches!(m, Type::TypeVar(_) | Type::Union(_)) {
+                    continue;
+                }
+                let expected = self.type_tag_const(m);
+                let eq = self.builder.int_compare(IntPredicate::EQ, tag, expected, "ir_is_member");
+                acc = self.builder.or(acc, eq, "ir_is_union_acc");
+            }
+            return acc;
+        }
+        let expected = self.type_tag_const(ty);
+        self.builder.int_compare(IntPredicate::EQ, tag, expected, "ir_is")
     }
 
     pub(crate) fn compile_ir_has_pattern(&mut self, val: BasicValueEnum<'ctx>, pattern: &lir::HasDesc) -> inkwell::values::IntValue<'ctx> {
