@@ -8,7 +8,7 @@
 import { length } from "std/array"
 import { runsOn } from "./service"
 
-export val createRouteScanner = (tripsByRoute: Json, date: Int32, dow: Int32): Json =>
+export val createRouteScanner = (tripsByRoute: { String: Json[] }, date: Int32, dow: Int32): Json =>
   {
     "tripsByRoute": tripsByRoute,
     "date": date,

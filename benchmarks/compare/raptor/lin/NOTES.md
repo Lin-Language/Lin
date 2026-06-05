@@ -37,16 +37,89 @@ target/debug/lin test benchmarks/compare/raptor/lin/
 round-key sort), plus `testutil.lin` (t/st/tf/j/setDefaultTrip + trip-ignoring
 deep journey equality).
 
-## Typed records (what's typed, what stays `Json`, and why)
+## Typed records + maps (what's typed, what stays `Json`, and why)
 
-The fixed-shape data is now expressed with **named record + union types**
-(`types.lin`), mirroring the reference TypeScript types — the port is no longer
-100% `Json`. The dynamic-key MAP structures stay `Json` pending a RAPTOR
-re-typing pass to the now-implemented `{ String: T }` map type (see ADR-082 /
-spec §5.1.1).
+The fixed-shape data is expressed with **named record + union types**
+(`types.lin`), and the **createRaptor index dictionaries are now typed
+`{ String: T }` index-signature maps** (ADR-082 / spec §5.1.1) — a hashed
+**O(1)** container, in place of the `Json` association-list object (O(n) per
+lookup) the port used before this type existed.
 
 **Types introduced (`types.lin`):** `Date`, `StopTime`, `Service`, `Trip`,
-`Transfer`, `TimetableLeg`, `Leg = Transfer | TimetableLeg`, `Journey`.
+`Transfer`, `TimetableLeg`, `Leg = Transfer | TimetableLeg`, `Journey`, and
+`RaptorIndex` (the createRaptor index struct, with typed-map fields).
+
+### Map re-typing pass (PERFORMANCE lever)
+
+Typed → `{ String: T }`, threaded through `RaptorIndex`
+(`raptor.lin`/`query.lin`/`queueFactory.lin`/`routeScanner.lin`/`bench.lin`):
+
+| Structure | Type | Built/read in |
+|---|---|---|
+| `routeStopIndex` | `{ String: { String: Int32 } }` | createRaptor + scan (the ~16k-key hot index) |
+| `routePath` | `{ String: String[] }` | createRaptor + scan |
+| `routesAtStop` | `{ String: String[] }` | createRaptor + getQueue |
+| `tripsByRoute` | `{ String: Json[] }` (trip values stay `Json`) | createRaptor + routeScanner |
+| `stops` | `String[]` | createRaptor |
+
+**Kept `Json` (with reasons):**
+
+- **`kConnections`, `kArrivals`, `bestArrivals`** (scanResults state): the scan/query
+  consumers do heavy `m[k]` *arithmetic/comparison* on the reads, and the `kConnections`
+  value is a `Connection | Transfer` union read out via boolean field-tests — neither is
+  cleanly expressible as a `{ String: T }` value, and `scanResults`/`results` is threaded
+  as `Json` throughout. This is scan/query-phase state, NOT the PREP index, so leaving it
+  `Json` does not affect the headline number.
+- **`transfers`, `interchange`** (the createRaptor inputs / `RaptorIndex` fields): they
+  *originate* from the loader as `Json` maps and there is no implicit `Json → { String: T }`
+  coercion (spec §5.1.1); they are also SMALL per-origin maps (≤ ~3079 keys), so converting
+  them would cost a pass for no measurable payoff.
+- **`getQueue`'s return** (`routeId → stopId`): rebuilt every round, small/short-lived (not
+  a hotspot). It also has to compare structurally / `toString` against an object literal in
+  the unit test — and **a `{ String: T }` map currently lacks cross-rep structural equality
+  and `toString` in the runtime** (`lin_tagged_eq` / `lin_to_string` handle `TAG_OBJECT` but
+  not `TAG_MAP`). So it stays a `Json` object. (REPORTED BLOCKER — see below.)
+- The loader's intermediate maps and `Service.days`/`Service.dates`: unchanged `Json`.
+
+### Narrowing idiom usage (the verified `match … is T` form)
+
+A typed-map scalar read `m[k]` is `T | Null`, and a `{ String: T }` value type is **not
+spellable as an `is`-pattern**, so `if x == null` / `is Null` cannot refine it. The ONLY
+narrowing form is the **positive `is T` match arm**. This port uses it via small helpers and
+inline matches:
+
+- `intOr(x: Int32 | Null, d): Int32` — `raptor.lin` (interchange/routeStopIndex reads feeding
+  arithmetic) and `queueFactory.lin` (`isStopBefore`).
+- An inline `match queue[routeId] is String =>` in `scanRoutes` to narrow the boarding stop
+  key before the `routeStopIndex[routeId][stopP]` read.
+- `pathOr(x: String[] | Null): Json` — note an ARRAY value type also isn't `is`-narrowable,
+  and `if x == null then [] else x` does NOT refine an `T[] | Null` to `T[]` either; the array
+  is handed on as `Json` (the O(1) hashed lookup already happened on the typed-map read).
+
+### Codegen support added for nested typed maps
+
+Nested typed maps (`{ String: { String: T } }`) were the headline structure but exposed two
+codegen gaps that had to be fixed for the maps to round-trip correctly (the maps simply lost
+their entries before the fix). Both are general `{ String: T }` correctness fixes, not
+RAPTOR-specific:
+
+1. `unbox_tagged_val_to_type` had no `Type::Map` arm — a `m[k]` whose value type is itself a
+   map leaked the `TAG_MAP` box through instead of unboxing to the raw `LinMap*`, so a nested
+   store/read operated on the box, not the shared inner container
+   (`crates/lin-codegen/src/codegen/boxing.rs`).
+2. The Union/`T | Null` index read AND string-key write paths only dispatched `TAG_OBJECT`. A
+   nested map's inner index (`outer[a][b]`, where `outer[a]` is `{ String: T } | Null`, not
+   `is`-narrowable) runs through that union path; it now tag-dispatches `TAG_MAP → lin_map_get`
+   / `emit_map_set` alongside the object path (same RETAIN ownership contract)
+   (`crates/lin-codegen/src/codegen/data.rs`, new `emit_obj_or_map_set`).
+
+### Reported blocker (a missing runtime capability)
+
+`{ String: T }` maps lack **structural equality and `toString`** at the `TAG_MAP` tag
+(`lin_tagged_eq` / `lin_to_string` only handle `TAG_OBJECT`/arrays/scalars). Until that lands,
+a typed map cannot be the value compared by a unit test's `toBe(...)` nor interpolated for
+display — which is why `getQueue` returns a `Json` object rather than the `{ String: String }`
+its keys would suggest.
 
 **Actively threaded through code:**
 
@@ -58,12 +131,15 @@ spec §5.1.1).
 - `StopTime` + `Transfer` — typed leaf constructors `makeStopTime`/`makeTransfer`
   (`gtfsLoader.lin`) build fully-typed sealed records from the CSV row scalars.
 
-**Left `Json` at the map / union-narrowing boundaries (the real signal for the
-map-type work):**
+**Typed `{ String: T }` (the map re-typing pass — see the table above):**
+`routeStopIndex`, `routePath`, `routesAtStop`, `tripsByRoute` (via `RaptorIndex`).
 
-- All the dictionaries: `kConnections`, `kArrivals`, `bestArrivals`,
-  `routeStopIndex`, `routesAtStop`, `tripsByRoute`, `routePath`, and the loader's
-  intermediate maps (`datesList`, `transfers`, `interchange`, `servicesSorted`, …).
+**Left `Json` at the map / union-narrowing boundaries:**
+
+- The scan/query-side maps `kConnections`, `kArrivals`, `bestArrivals`; the
+  createRaptor INPUT maps `transfers`/`interchange`; `getQueue`'s return; and the
+  loader's intermediate maps (`datesList`, `servicesSorted`, …). See the
+  "Kept `Json`" list above for the per-structure reason.
 - `Trip`/`Journey`/`Leg`/`TimetableLeg` values **as consumed**: every one of them
   is read out of the `kConnections` `Json` map (or a `Json[]` built from it) and
   inspected via a boolean field-test (`isTransfer`/`isTimetableLeg`) followed by
@@ -98,7 +174,14 @@ sealed-record codegen stage lands), not yet a measured speedup; runtime behaviou
 is byte-for-byte identical, which is why the gate is unchanged.
 
 **Gate after typing:** unit tests still 9/9 pass; `run.lin` still builds and
-prints `RESULT dep=29400 arr=40680 legs=3 count=1` on the full feed.
+prints `RESULT dep=29400 arr=40680 legs=3 count=1` on the full feed; the
+`bench.lin` GROUP digest is unchanged (`26203913`).
+
+**Measured PREP-phase speedup (the point of the map re-typing pass):** the
+createRaptor index build dropped from **~144 s** (when the routeId-keyed indexes were
+O(n) `Json` association lists) to **~25.7 s** with the O(1) hashed `{ String: T }` maps
+— a **~5.6×** speedup on the headline PREP phase. (LOAD ≈ 30 s and the GROUP/RANGE query
+phases are unaffected by the index typing.)
 
 ## Design
 
@@ -169,18 +252,21 @@ hand-rolled insertion sort that **rebuilt the whole array on every insertion** (
 (no local sort helper remains). See the shared `sortedRoundKeys` in `roundKeys.lin` and
 the `sort(...)` calls in `raptor.lin`/`filter.lin`/`gtfsLoader.lin`/`run.lin`/`bench.lin`.
 
-### Known characteristic: O(n) `Json` object key lookup
+### Resolved: createRaptor's O(n) `Json` key lookup → O(1) typed maps
 
 Lin's `Json` objects are association lists — `lin_object_get`/`lin_object_set`
-(`crates/lin-runtime/src/object.rs`) linearly scan all entries; there is no hashed
-container. `createRaptor` keys three indexes by `routeId` (~16k distinct), so the
-per-trip hot path does O(16k) scans × 240k trips. This is why Lin's ~510s dwarfs the
-~1-2s of the hashed-map languages (Node/Go/Rust/Python). It is a real language
-characteristic worth a future `Map`/hashed-object type, but it is NOT a correctness
-blocker — the port completes and matches the gate. The loader sidesteps it with the
-sorted-array + binary-search approach above; the algorithm modules keep the
-routeId-keyed objects because they are shared with the unit tests and re-grouping
-would change observable output (`overtakes` detection, journey order/counts).
+(`crates/lin-runtime/src/object.rs`) linearly scan all entries. `createRaptor` keys its
+indexes by `routeId` (~16k distinct), so when those indexes were `Json` the per-trip hot
+path did O(16k) scans × 240k trips → the PREP phase took ~144 s.
+
+This is now fixed by the **map re-typing pass** above: `routeStopIndex`/`routePath`/
+`routesAtStop`/`tripsByRoute` are typed `{ String: T }` index-signature maps (ADR-082),
+backed by a hashed O(1) container (`crates/lin-runtime/src/map.rs`). PREP dropped to
+~25.7 s (~5.6×). The remaining `Json` maps are the small per-origin `transfers`/
+`interchange` and the scan/query-side state (`kConnections`/`kArrivals`/`bestArrivals`,
+`getQueue`'s return) — see the "Kept `Json`" list for why each stays `Json`. Lin is still
+slower than the hashed-map languages (Node/Go/Rust/Python ~1–2 s) on the full query
+phase, but the index-build hotspot is no longer the dominant cost.
 
 ## Skipped (as per the porting contract — no unit tests / Node-only I/O)
 

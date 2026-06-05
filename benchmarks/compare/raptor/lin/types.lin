@@ -4,25 +4,26 @@
 // src/gtfs/GTFS.ts, src/gtfs/Service.ts, src/results/Journey.ts). Lin type
 // aliases live in one module and are imported where needed (§22.3 ADR-053).
 //
-// FIXED-SHAPE records are typed here; the DYNAMIC-KEY map structures
-// (kConnections, kArrivals, routeStopIndex, routesAtStop, bestArrivals,
-// tripsByRoute, routePath, the loader's intermediate maps, and the
-// Service.days/Service.dates indexes) stay `Json` pending a RAPTOR re-typing
-// pass to the now-implemented `{ String: T }` map type (ADR-082 / spec
-// §5.1.1). Where a typed record
-// flows INTO one of those maps or comes OUT via obj[k] it is `Json` at that
-// boundary — only the record-shaped locals are typed.
+// FIXED-SHAPE records are typed here. The createRaptor index dictionaries are now
+// TYPED `{ String: T }` index-signature maps via the `RaptorIndex` type below
+// (ADR-082 / spec §5.1.1) — routeStopIndex/routePath/routesAtStop/tripsByRoute became
+// hashed O(1) containers (the PREP-phase perf lever, see NOTES.md). The scan/query-side
+// maps (kConnections, kArrivals, bestArrivals) and the loader's intermediate maps stay
+// `Json` — their consumers union-narrow values that `{ String: T }` cannot express, or
+// the structural-equality / `toString` the unit tests rely on is unavailable for the
+// hashed map rep. See NOTES.md "what's typed, what stays Json, and why" for the precise
+// list and blockers.
 //
 // USAGE STATUS (see NOTES.md "Typed records" section for the full map):
 //   ACTIVELY THREADED through code: Date (dateUtil/query/raptor), Service
-//   (service/routeScanner/raptor), StopTime + Transfer (gtfsLoader constructors).
-//   Trip is referenced as the typed field of Service-carrying records but trips
-//   themselves stay `Json` (built from `Json`-map sources). Leg/TimetableLeg/
-//   Journey are REFERENCE-ONLY here: every journey/leg/connection value is read
-//   out of the `kConnections` `Json` map and consumed via a boolean field-test
-//   then field/index access (the calc-parser idiom), which Lin does not narrow —
-//   so those consumers stay `Json` and these types document the intended shape
-//   for when the `{ String: T }` map type lands and the maps can be typed.
+//   (service/routeScanner/raptor), StopTime + Transfer (gtfsLoader constructors),
+//   RaptorIndex (raptor/query/queueFactory/routeScanner/bench). Trip is referenced as
+//   the typed field of Service-carrying records but trips themselves stay `Json` (built
+//   from `Json`-map sources, and stored in the `Json[]`-valued index maps). Leg/
+//   TimetableLeg/Journey are REFERENCE-ONLY here: every journey/leg/connection value is
+//   read out of the `kConnections` `Json` map and consumed via a boolean field-test then
+//   field/index access (the calc-parser idiom), which Lin does not narrow — so those
+//   consumers stay `Json` and these types document the intended shape.
 //
 // A calendar date (UTC), modelling the reference's JS Date. month is 1-12,
 // day is 1-31. Fully concrete -> sealed-record unboxed-struct candidate.
@@ -53,3 +54,22 @@ export type Leg = Transfer | TimetableLeg
 // A planned journey. legs is a typed Leg[]; departure/arrival are
 // seconds-from-midnight (may exceed 24h, but fit Int32 for these feeds).
 export type Journey = { "legs": Leg[], "departureTime": Int32, "arrivalTime": Int32 }
+
+// The createRaptor index struct (mirrors RaptorAlgorithm's constructor fields).
+// The dynamic-key dictionaries that createRaptor BUILDS from scratch are now typed
+// `{ String: T }` index-signature maps (ADR-082 / spec §5.1.1) — a hashed O(1)
+// container, vs the O(n) association-list `Json` object the port used before this type
+// existed. This is the headline PERFORMANCE lever for the index build (PREP phase),
+// where the routeId-keyed indexes (~16k distinct keys) were the O(16k)-scan-per-trip hot
+// path over 240k trips:
+//   - routeStopIndex : RouteID -> (StopID -> position)   nested typed map (Int32)
+//   - routePath      : RouteID -> StopID[]               String[] value
+//   - routesAtStop   : StopID  -> RouteID[]              String[] value
+//   - tripsByRoute   : RouteID -> Trip[]   (trips stay `Json`: read via boolean
+//                       field-test, not `is`-narrowable — value type is `Json[]`)
+//   - stops          : StopID[]  (keys(transfers))
+//
+// `transfers` and `interchange` ORIGINATE from the loader as `Json` maps (there is no
+// implicit `Json -> { String: T }` coercion, spec §5.1.1) and are SMALL per-origin maps
+// (<= ~3079 keys) — they stay `Json` to avoid a conversion pass with no perf payoff.
+export type RaptorIndex = { "routeStopIndex": { String: { String: Int32 } }, "routePath": { String: String[] }, "transfers": Json, "interchange": Json, "stops": String[], "routesAtStop": { String: String[] }, "tripsByRoute": { String: Json[] } }
