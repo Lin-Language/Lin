@@ -75,14 +75,19 @@ export val mapValues = <V, W>(obj: { String: V }, f: (V) => W): { String: W } =>
   )
   result
 
-// Defaulted read: the value at `key`, or `default` when the key is absent. This is the
-// idiomatic `m[k] ?? default` form for an index-signature map — `m[key]` is `T | Null`
-// (§5.1.1), and a bare `m[k]` already gives you that union directly, so only the DEFAULTED
-// read earns a named helper. Written with the `is Null => default; else => m[key]` arm order
-// (NOT `is T => …; else => default`): a positive `is T` arm on a monomorphized type parameter
-// does not select the present-value branch today, whereas the `is Null` + `else` form narrows
-// correctly. The `else` arm returns the present (non-null) value as a bare `T`.
-export val get = <T>(m: { String: T }, key: String, default: T): T =>
+// Defaulted read with an independent default-type param `D`: the value at `key`, or `default`
+// when the key is absent. `m[key]` is `T | Null` (§5.1.1); this helper folds in a fallback whose
+// type `D` is SEPARATE from the value type `T`, so the result is `T | D` and the default never
+// pollutes `T`. With no default supplied, `D` defaults to `Null` (the `default: D = null`
+// parameter), giving the plain `T | Null` you would get from a bare `m[key]`:
+//   - `m.get(k)`       => `T | Null`
+//   - `m.get(k, 0)`    => `T | Int32` (= `T` when `T = Int32`: the "definitely present" form)
+//   - `m.get(k, "n/a")` => `T | String`
+// Written with the `is Null => default; else => m[key]` arm order (NOT `is T => …; else =>
+// default`): a positive `is T` arm on a monomorphized type parameter does not select the
+// present-value branch today, whereas the `is Null` + `else` form narrows correctly. The `else`
+// arm returns the present (non-null) value.
+export val get = <T, D>(m: { String: T }, key: String, default: D = null): T | D =>
   match m[key]
     is Null =>
       default

@@ -90,7 +90,40 @@ fn subst_type(ty: &Type, subs: &HashMap<u32, Type>) -> Type {
         Type::Stream(t) => Type::Stream(Box::new(subst_type(t, subs))),
         Type::Map(t) => Type::Map(Box::new(subst_type(t, subs))),
         Type::FixedArray(ts) => Type::FixedArray(ts.iter().map(|t| subst_type(t, subs)).collect()),
-        Type::Union(ts) => Type::Union(ts.iter().map(|t| subst_type(t, subs)).collect()),
+        Type::Union(ts) => {
+            // Substituting a union's members can produce DUPLICATES or collapse to a single type.
+            // The canonical case is `<T, D>(…): T | D` instantiated with `T = D` (e.g. `at(ints, i,
+            // 0)` over `Int32[]` ⇒ both members `Int32`): naive substitution yields the DEGENERATE
+            // `Union([Int32, Int32])`. A 2-member union is a BOXED (`ptr`) representation, but a
+            // single concrete `Int32` is an unboxed scalar — so a degenerate union makes the spec
+            // return a boxed union while its callers (and arms) read an `i32`, an ABI mismatch
+            // codegen rejects. Flatten: dedup members and collapse a singleton to the bare type, so
+            // `T | D` with `T = D = Int32` becomes `Int32` (exactly what a hand-written `(…): Int32`
+            // would produce). Mirrors `Type::flatten_union` in lin-check.
+            let mut flat: Vec<Type> = Vec::new();
+            for t in ts {
+                let st = subst_type(t, subs);
+                match st {
+                    Type::Union(inner) => {
+                        for m in inner {
+                            if !flat.contains(&m) {
+                                flat.push(m);
+                            }
+                        }
+                    }
+                    other => {
+                        if !flat.contains(&other) {
+                            flat.push(other);
+                        }
+                    }
+                }
+            }
+            if flat.len() == 1 {
+                flat.into_iter().next().unwrap()
+            } else {
+                Type::Union(flat)
+            }
+        }
         Type::Object { fields, sealed } => Type::Object {
             fields: fields.iter().map(|(k, v)| (k.clone(), subst_type(v, subs))).collect(),
             sealed: *sealed,

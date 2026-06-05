@@ -396,6 +396,33 @@ impl Checker {
                 }
                 self.in_tail_position = prev_tail;
 
+                // Omitted optional argument carrying a type-parameter default (`default: D = null`):
+                // an omitted optional arg is filled from its default value, so its type parameter
+                // must be bound by that default's type — exactly as if the caller had written it.
+                // The supplied-arg loop above never visited the omitted params, so a bare
+                // type-parameter `D` would otherwise stay an UNBOUND `TypeVar` in the return type
+                // `T | D`, which `apply_type_subs` leaves free and `arg_compatible` then treats
+                // permissively — unsoundly letting `arr.at(i)` satisfy a bare `T` context.
+                //
+                // The defaults declared on generic params in the stdlib are all `null` (`D = null`);
+                // a generic param has no other spellable defaulting value (a concrete literal would
+                // pin `D` away from the element type and defeat the unified `T | D` shape). We
+                // therefore bind any omitted optional param whose declared type is an unbound,
+                // non-sentinel type-parameter `TypeVar` to `Null`, modelling the omitted `= null`.
+                // This is the missing inference that makes `arr.at(i)` soundly `T | Null` while
+                // `arr.at(i, 0)` stays `T | Int32`. Concrete-typed optional params (e.g.
+                // `pad: String = " "`) are unaffected — their type is not a bare `TypeVar`.
+                if !partial && typed_args.len() < params.len() {
+                    for param_ty in &params[typed_args.len()..] {
+                        if let Type::TypeVar(id) = param_ty {
+                            let is_sentinel = *id == u32::MAX || self.numeric_tvs.contains(id);
+                            if !is_sentinel && !subs.contains_key(id) {
+                                subs.insert(*id, Type::Null);
+                            }
+                        }
+                    }
+                }
+
                 // Re-apply substitutions (may have new entries from lambda args).
                 let concrete_params: Vec<Type> = params.iter()
                     .map(|p| apply_type_subs(p, &subs))
@@ -728,6 +755,24 @@ impl Checker {
                         self.collect_and_save_subs(param_ty, &typed.ty(), &mut subs);
                     }
                     all_args.push(typed);
+                }
+
+                // Omitted optional argument carrying a type-parameter default (`default: D = null`):
+                // mirror of the prefix `infer_call` rule. `all_args` includes the receiver, so the
+                // omitted params are those at index `>= all_args.len()`. Bind any omitted optional
+                // param whose declared type is an unbound, non-sentinel type-parameter `TypeVar` to
+                // `Null`, modelling the omitted `= null` default. This is what makes `arr.at(i)`
+                // soundly `T | Null` (rather than leaving `D` free → unsoundly satisfying bare `T`).
+                // See the prefix-path comment for the full rationale.
+                if !partial && all_args.len() < method_params.len() {
+                    for param_ty in &method_params[all_args.len()..] {
+                        if let Type::TypeVar(id) = param_ty {
+                            let is_sentinel = *id == u32::MAX || self.numeric_tvs.contains(id);
+                            if !is_sentinel && !subs.contains_key(id) {
+                                subs.insert(*id, Type::Null);
+                            }
+                        }
+                    }
                 }
 
                 let concrete_params: Vec<Type> = method_params.iter()

@@ -450,13 +450,30 @@ val s = suite("std/object", [
     ]
   ),
 
-  // The point of get: the result is a bare T usable in arithmetic with no null guard.
-  test("get returns a bare T usable in arithmetic", () =>
+  // The default's type `D` is INDEPENDENT of the value type `T`: the result is `T | D`. With a
+  // matching default (`D = T`, here both Int32) over a known-Int32 map the union collapses, so a
+  // `get(k, 0)` result is usable as a bare `Int32` (annotated, then composed in arithmetic).
+  test("get returns a definitely-present value usable in arithmetic", () =>
     var m: { String: Int32 } = {}
     m["a"] = 7
-    val total: Int32 = m.get("a", 0) + m.get("missing", 5)
+    val present: Int32 = m.get("a", 0)
+    val fallback: Int32 = m.get("missing", 5)
+    val total: Int32 = present + fallback
     [
       expect(total).toBe(12)
+    ]
+  ),
+
+  // An independent default type `D` ≠ value type `T`: `get(k, "n/a")` over an Int32 map is
+  // `Int32 | String` — the default never pollutes `T`.
+  test("get default has an independent type D (T | D)", () =>
+    var m: { String: Int32 } = {}
+    m["a"] = 7
+    val present: Int32 | String = m.get("a", "n/a")
+    val fallback: Int32 | String = m.get("z", "n/a")
+    [
+      expect(present).toBe(7),
+      expect(fallback).toBe("n/a")
     ]
   )
 ])
