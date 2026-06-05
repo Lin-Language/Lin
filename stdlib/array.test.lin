@@ -20,6 +20,31 @@ val s = suite("std/array", [
     ]
   ),
 
+  // Generic push (`<T>(arr: T[], item: T)`, ADR-085): a concrete-OBJECT element pushed into a
+  // record-typed array reads back correctly (the element is materialized into a boxed LinObject
+  // for the tagged array; a sealed-projected struct stored raw under TAG_OBJECT used to crash).
+  test("push a concrete record element reads back", () =>
+    val out: { "tag": Int32, "bytes": Int32[] }[] = []
+    out.push({ "tag": 5, "bytes": [1, 2, 3] })
+    out.push({ "tag": 6, "bytes": [4] })
+    [
+      expect(out[0]["tag"]).toBe(5),
+      expect(out[1]["bytes"].toString()).toBe("[4]")
+    ]
+  ),
+
+  // Generic push of a genuinely-Json (dynamic) element into a CONCRETE flat-scalar array routes
+  // through the dynamic path (lin_push_dyn coerces the boxed element into the flat slot), matching
+  // the non-generic behaviour — no `zext ptr` codegen error.
+  test("push a Json element into a flat UInt8[]", () =>
+    val src: Json = [10, 20, 30]
+    val buf: UInt8[] = []
+    range(0, 3).for(i => buf.push(src[i]))
+    [
+      expect(buf.toString()).toBe("[10, 20, 30]")
+    ]
+  ),
+
   test("concat two arrays", () =>
     val result = [1, 2].concat([3, 4])
     [

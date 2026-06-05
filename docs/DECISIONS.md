@@ -2045,3 +2045,68 @@ their `(Json, …)` signatures for now.
 (the empty-record type, preserving the growable `LinObject` backing) — NOT `Json`, which has a
 pre-existing escaping-object bug, and NOT `{ String: T }`, which switches to the hashed `LinMap`
 backing and changes `toString`/`keys` behavior.
+
+## ADR-085: Generic `push`/`append`/`prepend` (`<T>(arr: T[], item: T)`) — Phase 2 delivered
+
+**Status**: Accepted. (Delivers Phase 2 deferred by ADR-084; depends on ADR-084's empty-literal
+annotation requirement.)
+
+**Context**: ADR-084 deferred making `push`/`append`/`prepend` generic because the generic body
+exposed codegen/RC gaps. On current master several relevant fixes had landed (null-complement
+narrowing, empty-array-arg flat-scalar element adoption, is-pattern TypeVar substitution in
+monomorphization). Re-establishing the gaps on master under AddressSanitizer found that the two RC
+gaps ADR-084 named (borrowed-`Json` double-free; concrete-object `index_probe` crash) **no longer
+reproduce** — the borrowed-`Json` push is RC-balanced, and the concrete-object push reads back
+correctly — and the `append(UInt8[], 3)` literal-width gap is closed at the *empty-array-arg* level.
+But making the signatures generic surfaced four NEW representation gaps, now fixed:
+
+1. **Literal-width clobber across args** (`append(uint8Arr, 221)` → `Int32[]`): the bare integer
+   literal's `Int32` default overwrote the `T = UInt8` binding the array arg established. Fixed in
+   `lin-check` (`checker/call.rs`): a bare `IntLit` item DEFERS its substitution and only binds an
+   otherwise-unbound `T`; the canonical binding is taken from the first (container) arg, and a later
+   compatible arg never clobbers it (`collect_and_save_subs_no_clobber`). Applied to both
+   `infer_call` and `infer_dot_call`.
+2. **Concrete-object element corruption** (`push(out: Field[], {…})` crashed at `object.rs:195` /
+   misaligned scalar deref): the element was projected into a SEALED struct but stored raw into the
+   TAGGED array under `TAG_OBJECT`. Fixed in `lin-codegen` (`codegen/data.rs`,
+   `tagged_array_push_value`): a sealed-repr Object element is MATERIALIZED to a boxed `LinObject`
+   before the tagged store. The matching RC: the source sealed struct STAYS OWNED (the
+   materialization retains its heap fields; scope-exit's `lin_sealed_release` balances them), so
+   the IR's per-element transfer-retain is skipped for this case (`lin-ir` `lower.rs`,
+   `push_sealed_elem_into_tagged`, mirroring `push_into_sealed_array`).
+3. **Nested generic push in a cross-module generic** (`mymap<T,U>`'s `push(result: U[], …)`
+   monomorphized to `mymap$Int32_Int32` heap-buffer-overflowed): the re-homed `push` (an
+   import-of-import thin intrinsic wrapper) was re-homed to the boxed `std_array_push` `$Json`
+   specialization instead of inlined to the `lin_push` intrinsic. Fixed in `lin-ir`
+   (`monomorphize.rs`, `classify_origin_slot`'s `Import` arm): an import-of-import whose source
+   defines a thin intrinsic wrapper is INLINED to the intrinsic, so `lin_push`'s runtime
+   element-tag dispatch keeps the flat representation.
+4. **Dynamic (`Json`) element into a concrete-scalar array** (`push(buf: UInt8[], src[i]: Json)` →
+   `zext ptr` codegen error): a genuinely-`Json` (or leftover inference-var) item flowing into a
+   bare-`TypeVar` param a container arg pinned to a concrete type is REBOUND to the `Json` wildcard,
+   so the call monomorphizes at `$Json` (→ `lin_push_dyn`, which converts the boxed element into the
+   array's runtime slot — the non-generic `push` behaviour). Fixed in both `lin-check`
+   (`infer_call`/`infer_dot_call`) and `lin-ir` (`monomorphize.rs`), since the monomorphizer
+   re-derives subs independently.
+
+**Decision**: `push = <T>(arr: T[], item: T): Null`, `append`/`prepend` = `<T>(arr: T[], item: T):
+T[]`. The element type is now CHECKED — `push(intArr, "str")` / `append(intArr, "s")` are compile
+errors, closing the soundness hole. `compact` stays `(Json): Json` (its natural
+`<T>((T | Null)[]): T[]` is still unparseable — postfix `[]` on a parenthesized union). The
+empty-literal annotation requirement (ADR-084) is a HARD PREREQUISITE: without it an unannotated
+`val acc = []` is `Never[]` and generic push mis-stores elements as `null`; with it the accumulator
+pins `T`. This branch therefore carries ADR-084's checker change and annotations (cherry-picked) and
+**must land at or after Phase 1**.
+
+**Verification**: RC balance verified under AddressSanitizer (runtime built with
+`-Zsanitizer=address`, linked via clang `-fsanitize=address`). The borrowed-`Json`, closure-`Json`,
+concrete-object, and cross-module-generic push churn loops (5000 iters) are clean of
+use-after-free / double-free / heap-overflow. A pre-existing, change-independent leak in the
+sealed-record-array push path remains on master (same magnitude with the old `Json` `push`); it is
+out of scope here.
+
+**Consequence**: No repo-wide call-site sweep was needed beyond ADR-084's annotations — the four
+fixes make every existing `push`/`append`/`prepend` call site (incl. `examples/codec`,
+`examples/raspberry-controller`, the `decode`/`appendBytes` `Json`-element patterns, and the
+cross-module `mymap`) compile and run correctly. Regression tests in
+`crates/lin/tests/integration.rs` and `stdlib/array.test.lin`.

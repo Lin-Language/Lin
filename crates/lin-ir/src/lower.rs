@@ -3444,8 +3444,20 @@ fn lower_intrinsic_call(
     // balancing the per-field retains the copy took). Skip the ownership transfer for this case.
     let push_into_sealed_array = matches!(intrinsic, Intrinsic::Push)
         && args.first().map(|a| is_sealed_scalar_array(&a.ty())).unwrap_or(false);
+    // `push(arr, elem)` where `elem` is a SEALED-repr record (`{tag:Int32, bytes:Int32[]}`, the
+    // generic `push$Object` over a `Field[]`) into a TAGGED array: codegen MATERIALIZES the sealed
+    // struct into a fresh boxed LinObject (retaining its heap fields) and stores THAT — it does NOT
+    // store the sealed struct pointer. So, exactly like `push_into_sealed_array`, the source struct
+    // must STAY OWNED (released at scope exit, dropping its heap fields, balancing the per-field
+    // retains the materialization took). Skipping the transfer here avoids a double-retain of the
+    // sealed source whose +1 the array never holds → a per-push leak of the struct shell + its
+    // heap-field references (caught under ASan as ~7 leaked allocs/iteration).
+    let push_sealed_elem_into_tagged = matches!(intrinsic, Intrinsic::Push)
+        && args.last().map(|a| is_sealed_scalar_repr(&a.ty())).unwrap_or(false)
+        && args.first().map(|a| !is_sealed_scalar_array(&a.ty())).unwrap_or(false);
     if matches!(intrinsic, Intrinsic::Push | Intrinsic::ArraySetDyn | Intrinsic::ObjectSetDyn)
         && !push_into_sealed_array
+        && !push_sealed_elem_into_tagged
     {
         if let (Some(elem_expr), Some(&elem_temp)) = (args.last(), lowered_args.last()) {
             // For a UNION element, only `lin_array_set` (ArraySetDyn) moves the box (raw struct

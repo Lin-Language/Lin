@@ -7878,6 +7878,119 @@ print(prepend(ss, "z")[0])           // z
     );
 }
 
+// Generic push/append/prepend are `<T>(arr: T[], item: T)` (ADR-085), so the element type is
+// enforced — closing the prior soundness hole where a `Json` `push` accepted any item. Pushing a
+// String into an Int32[] is now a COMPILE ERROR.
+#[test]
+fn test_generic_push_element_type_hole_closed() {
+    let err = run_expect_err(r#"import { push } from "std/array"
+val intArr: Int32[] = [1, 2, 3]
+push(intArr, "str")
+"#);
+    // T unifies to String from the item, so the Int32[] container mismatches.
+    assert!(
+        err.contains("String") && err.contains("Int32"),
+        "push(intArr, \"str\") must be a type error mentioning the element-type mismatch, got: {err}"
+    );
+    // append likewise enforces the element type.
+    let err2 = run_expect_err(r#"import { append } from "std/array"
+val intArr: Int32[] = [1, 2, 3]
+append(intArr, "str")
+"#);
+    assert!(err2.contains("String") && err2.contains("Int32"),
+        "append(intArr, \"str\") must error, got: {err2}");
+}
+
+// A bare integer-LITERAL item adopts the array's element WIDTH (the literal-width inference fix):
+// `b.append(3)` on a `UInt8[]` stays `UInt8[]` (not `Int32[]`), preserving the flat representation.
+#[test]
+fn test_generic_append_literal_width_adopts_element_type() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { append, prepend } from "std/array"
+val b: UInt8[] = [10, 20]
+val r: UInt8[] = b.append(30)
+print(toString(r[2]))
+val p: UInt8[] = b.prepend(5)
+print(toString(p[0]))
+"#);
+    assert_eq!(out, vec!["30", "5"]);
+}
+
+// A generic `push` of a CONCRETE-OBJECT element into a record-typed array (`Field[]`) reads back
+// correctly. The element is materialized into a boxed LinObject for the tagged array (gap #2: a
+// sealed-projected struct must NOT be stored raw under TAG_OBJECT — it crashed at object.rs:195 /
+// a misaligned scalar deref). Covers both an exact-type item and a field-WIDENING item (UInt8 →
+// the Int32 field of Field).
+#[test]
+fn test_generic_push_concrete_object_element_reads_back() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push } from "std/array"
+type Field = { "tag": Int32, "bytes": Int32[] }
+val out: Field[] = []
+push(out, { "tag": 5, "bytes": [1, 2, 3] })
+val b: UInt8[] = [7, 8]
+push(out, { "tag": b[0], "bytes": b })
+print(toString(out[0]["tag"]))
+print(toString(out[1]["tag"]))
+print(toString(out[1]["bytes"]))
+"#);
+    assert_eq!(out, vec!["5", "7", "[7, 8]"]);
+}
+
+// A generic `push`/`append` of a genuinely-`Json` (dynamic) element into a CONCRETE flat-scalar
+// array monomorphizes DYNAMICALLY (`$Json` → lin_push_dyn coerces the boxed element into the flat
+// slot at runtime), matching the non-generic `push` behaviour. Previously the concrete `push$UInt8`
+// monomorph received a raw boxed Json pointer it box_value'd as a scalar (`zext ptr` codegen error).
+#[test]
+fn test_generic_push_json_element_into_flat_array() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+val appendBytes = (buf: UInt8[], src: Json, i: Int32): Null =>
+  if i < length(src) then
+    push(buf, src[i])
+    appendBytes(buf, src, i + 1)
+val src: Json = [10, 20, 30]
+val buf: UInt8[] = []
+appendBytes(buf, src, 0)
+print(toString(buf))
+"#);
+    assert_eq!(out, vec!["[10, 20, 30]"]);
+}
+
+// A generic `push` of a generic-`U`-typed element built inside ANOTHER generic function, applied
+// cross-module, monomorphizes the nested push at the OUTER instantiation's concrete element type
+// (`mymap<Int32,Int32>` → flat `push$Int32`), via the import-of-import thin-intrinsic-wrapper
+// inlining of `push`→`lin_push`. Previously this re-homed to the boxed `std_array_push` ($Json),
+// which 16-byte tagged-wrote into a 4-byte flat slot → heap-buffer-overflow.
+#[test]
+fn test_generic_push_nested_in_cross_module_generic() {
+    let dir = std::env::temp_dir().join(format!("lin_genpush_nested_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("helpers.lin"),
+        "import { push } from \"std/array\"\n\
+         import { for } from \"std/iter\"\n\
+         export val mymap = <T, U>(arr: T[], f: (T) => U): U[] =>\n  \
+           val result: U[] = []\n  \
+           arr.for(item => push(result, f(item)))\n  \
+           result\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ length }} from "std/array"
+import {{ reduce }} from "std/iter"
+import {{ mymap }} from "{}/helpers"
+val ints = mymap([1, 2, 3], x => x * 10)
+val strs = mymap(["a", "b"], s => s)
+print(toString(ints.reduce(0, (acc, x) => acc + x)))
+print(toString(length(strs)))
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["60", "2"]);
+}
+
 #[test]
 fn test_group_by_even_odd_and_empty() {
     // groupBy now returns a typed index-signature map `{ String: T[] }` (ADR-082): ONE hash lookup
