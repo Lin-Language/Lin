@@ -1,0 +1,48 @@
+// MINIMAL REPRO: `for`-over-a-borrowed-array-projection use-after-free.
+//
+// `bucket = results[k]` reads (BORROWS) the array stored under key k. `bucket.for(...)`
+// (the std/iter combinator -> lin_for) RELEASES its receiver as if it owned it, dropping the
+// array's refcount to 0 and FREEING it -- even though `results` still owns that entry and the
+// local `bucket` binding is used again afterwards. The later `push(bucket, node)` then writes
+// through a dangling pointer: a SIGSEGV when the slot is unmapped, or silent corruption /
+// null-pointer-deref panic in lin_array_push (crates/lin-runtime/src/array.rs:350) when the
+// freed slot was reused by an intervening allocation.
+//
+// Three distinct keys are needed so the freed bucket-A storage is reclaimed and reused by the
+// bucket-B / node allocations before it is dereferenced -- a single borrow leaves the freed
+// block resident and the bug is latent.
+//
+// This is a LANGUAGE-LEVEL RC bug (borrowed-vs-owned: the combinator-receiver release path does
+// not account for a receiver that is a borrowed object/array projection). It is INDEPENDENT of
+// typed maps -- see NOTES.md "kConnections blocker (RESOLVED: root-caused)". It is the fault that
+// blocks typing RAPTOR's kConnections, because the graphResults transfer-pattern walk's
+// `mergePathInto` does exactly `bucket = results[head]; bucket.for(...); push(bucket, node)`.
+import { for } from "std/iter"
+import { print } from "std/io"
+import { keys } from "std/object"
+import { length, push } from "std/array"
+
+val main = () =>
+  var results: Json = {}
+
+  results["C"] = []
+  val bC = results["C"]
+  bC.for(n => null)
+
+  results["B"] = []
+  val bB = results["B"]
+  bB.for(n => null)
+
+  results["A"] = []
+  val bA = results["A"]
+  bA.for(n => null)
+
+  push(bA, { "label": "A" })
+  push(bB, { "label": "B" })
+  push(bC, { "label": "C" })
+
+  print(
+    "done keys=${length(keys(results))} C=${length(bC)} B=${length(bB)} A=${length(bA)}"
+  )
+
+main()
