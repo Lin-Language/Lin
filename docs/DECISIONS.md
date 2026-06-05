@@ -947,11 +947,12 @@ wrapper `ptr(ptr env, ptr boxedArg…) -> ptr boxedRet`, so a combinator calling
   - **R1 (`examples/report`):** `validRecords()`/`parseErrors()` ended `…filter(…).map(r=>r["value"])`
     over a `Success | Failure` union; with precise generic `map` the element types as `Record | Null`
     (the union member access is nullable, `filter` does not narrow), not assignable to `Record[]`.
-    SOLVED by restructuring the example to be well-typed under precise generics: a named helper
-    `recordOf(r: Parsed): Record` (and `errorOf`) narrows the union via an idiomatic `match … has {
-    "type": "success", value } => value; else => …` and the pipeline maps through it. (The narrowing
-    lives in a named helper, not inline, because a multi-arm `match` can't be written inside the
-    combinator's parentheses — indentation is suppressed there, ADR-004/014.)
+    SOLVED by restructuring the example to be well-typed under precise generics: the pipeline narrows
+    the union via an idiomatic `match … has { "type": "success", value } => value; else => …` and
+    maps through it. (The narrowing is written inline inside `validRecords`' `.map(…)` callback — a
+    multi-arm `match` inside a combinator's parentheses parses fine via offside-rule arm collection,
+    commit 286cfd2; no helper indirection is needed. The earlier draft of this note claimed inline
+    `match` was impossible under ADR-004/014 indentation suppression — that no longer holds.)
   - **R2 (`sortBy`/`minBy`/`maxBy`/`compact`/`sum`/…):** these stdlib combinators call `map`/`reduce`/
     `filter` internally over `Json[]`; a SIBLING call to the now-generic combinator specialized at
     `$Json` cross-module, where the combinator's owned-array result and the surrounding generic body's
