@@ -2790,15 +2790,28 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 key_ty,
                 result_ty: result_type.clone(),
             });
-            // A projection returns a BORROWED reference into the container. Dup it (retain +
-            // register as owned) so the result behaves like any owned value: a consuming var
-            // that releases on reassignment, or a scope-exit release, is then balanced and the
-            // container's own release stays safe. Without this, releasing the container frees
-            // a value still aliased by the projected binding (the AST path masks this by
-            // leaking the container instead). A union/Json result is NOT dup'd here: the
-            // runtime accessor (lin_object_get) returns an INTERIOR pointer to the entry's
-            // TaggedVal, not an ownable heap box — treating it as owned and releasing it would
-            // free an interior address. Concrete heap projections ARE real owned values.
+            // A projection has VALUE (snapshot) semantics (ADR: projection is a value, not a
+            // live view). It must materialize an OWNED, container-independent value so the
+            // binding survives the container being mutated/grown/freed.
+            //
+            // - Concrete heap result (`is_rc_type`, e.g. `Object[]`): the slot holds a stable
+            //   array/object/string POINTER. Dup it (retain + register owned); the binding now
+            //   holds the stable header, not the (movable) slot address.
+            // - Union/Json result: `lin_object_get` / `lin_array_get` return an INTERIOR pointer
+            //   into the container's entries/data buffer — that buffer MOVES when the container
+            //   grows (object inline→heap migration, array realloc), so holding the interior
+            //   pointer is a use-after-free. Relocate the value off the slot immediately:
+            //   `CloneBox` (→ `lin_tagged_clone`) reads the slot's tag+payload into a FRESH owned
+            //   box and retains the inner heap payload, so the binding holds an independent,
+            //   stable box. Register it owned so the matching scope-exit / reassignment release
+            //   is balanced (cached scalar boxes are returned as-is by lin_tagged_clone and
+            //   no-op on release, so no needless alloc on the scalar fast path).
+            if is_union_ty(result_type) {
+                let owned = builder.alloc_temp(result_type.clone());
+                builder.emit(Instruction::CloneBox { dst: owned, src: dst, ty: result_type.clone() });
+                builder.register_owned(owned, result_type.clone());
+                return owned;
+            }
             if is_rc_type(result_type) {
                 builder.emit(Instruction::Retain { val: dst, ty: result_type.clone() });
                 builder.register_owned(dst, result_type.clone());
@@ -2823,8 +2836,17 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 obj_ty,
                 result_ty: result_type.clone(),
             });
-            // Dup the projected heap reference — see the Index case above for the rationale.
-            // (Union/Json results are interior pointers — not dup'd; see the Index case.)
+            // Projection has VALUE (snapshot) semantics — materialize an owned value. See the
+            // Index case above for the full rationale. A union/Json field is an INTERIOR
+            // `*TaggedVal` into the (movable) container storage, so relocate it into a fresh
+            // owned box (`CloneBox` → `lin_tagged_clone`); a concrete heap field is a stable
+            // pointer, dup it (retain + register owned).
+            if is_union_ty(result_type) {
+                let owned = builder.alloc_temp(result_type.clone());
+                builder.emit(Instruction::CloneBox { dst: owned, src: dst, ty: result_type.clone() });
+                builder.register_owned(owned, result_type.clone());
+                return owned;
+            }
             if is_rc_type(result_type) {
                 builder.emit(Instruction::Retain { val: dst, ty: result_type.clone() });
                 builder.register_owned(dst, result_type.clone());
