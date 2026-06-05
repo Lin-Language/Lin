@@ -1221,6 +1221,16 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
         if try_inline_combinator_wrapper(expr, gslot, state) {
             return;
         }
+        // SCALAR-SORT INLINE (the zero-box sort win): `sort(arr, cmp)` over a provably-flat scalar
+        // array with a CAPTURE-LESS LITERAL comparator is rewritten to a `lin_sort(arr, cmp)`
+        // intrinsic, whose IR lowering (`lower_sort`) emits an inline stable merge sort over the flat
+        // unboxed buffer with the comparator body spliced in — NO per-comparison box/unbox/closure
+        // call. Everything else (non-scalar arrays, capturing/stored comparators, `_sortJ`'s boxed
+        // `Json` path) falls through to the normal generic specialization (the pure-Lin merge sort,
+        // still correct). Done before the type-spec path so the inlined intrinsic form is what lowers.
+        if try_inline_scalar_sort(expr, gslot, state) {
+            return;
+        }
     }
 
     // Handle a call to a generic function (directly by name, or through a `val f = id` alias).
@@ -1451,6 +1461,70 @@ fn try_inline_combinator_wrapper(
         state.next_slot += 1;
         state.rehome_intrinsic_cache.insert(key, fresh);
         state.rehomed_intrinsics.insert(fresh, intrinsic.clone());
+        fresh
+    };
+
+    if let TypedExpr::Call { func, .. } = expr {
+        if let TypedExpr::LocalGet { slot: fslot, .. } = func.as_mut() {
+            *fslot = slot;
+        }
+    }
+    true
+}
+
+/// Try to redirect a `sort(arr, cmp)` call to the inline scalar-sort intrinsic (`lin_sort`). On
+/// success, repoints the call's `func` at a (re-homed) `lin_sort` intrinsic slot so the call lowers
+/// through `lower_sort`, which emits an inline stable merge sort over the flat unboxed buffer with
+/// the comparator body spliced in. Returns true if it rewrote the call.
+///
+/// Conditions (all required — gated TIGHTLY, fails safe to the generic boxed merge-sort path):
+///   - the generic is the `std/array` export named `sort`;
+///   - exactly two args: `arr` whose static element type is a flat NUMERIC scalar (Int*/UInt*/Float*),
+///     and a CAPTURE-LESS literal lambda comparator (`(T, T) => Int32`). A capturing/stored comparator
+///     or a non-scalar (object/string/union/Json) array is NOT eligible and keeps the boxed path.
+///
+/// Soundness note: the buffers `lower_sort` allocates are FLAT scalar arrays (sound for a numeric
+/// scalar `T`), and the comparator reads them flat — identical to the element representation the
+/// existing `sort$T` specialization already assumes for a scalar `T`. The copy-IN from `arr` uses the
+/// representation-agnostic tagged read (sound even for a `[]`+push array mistyped as flat).
+fn try_inline_scalar_sort(
+    expr: &mut TypedExpr,
+    gslot: usize,
+    state: &mut MonoState<'_>,
+) -> bool {
+    let g = &state.generics[&gslot];
+    // Must be the std/array `sort` export (origin is an imported stdlib module).
+    if g.name != "sort" || g.origin.is_none() {
+        return false;
+    }
+    let TypedExpr::Call { args, .. } = expr else { return false };
+    if args.len() != 2 {
+        return false;
+    }
+    // arg0: a statically-known flat NUMERIC scalar array element type.
+    let elem_ok = match args[0].ty() {
+        Type::Array(t) | Type::Iterator(t) => t.is_flat_scalar(),
+        _ => false,
+    };
+    if !elem_ok {
+        return false;
+    }
+    // arg1: a capture-less literal lambda comparator (a capturing/stored comparator is NOT inlinable
+    // here — the merge loop would need its captured environment, which the closure path provides).
+    match &args[1] {
+        TypedExpr::Function { captures, .. } if captures.is_empty() => {}
+        _ => return false,
+    }
+
+    // Mint (deduped by name) a fresh importer intrinsic slot for `lin_sort` and repoint the callee.
+    let key = (String::new(), "lin_sort".to_string());
+    let slot = if let Some(&s) = state.rehome_intrinsic_cache.get(&key) {
+        s
+    } else {
+        let fresh = state.next_slot;
+        state.next_slot += 1;
+        state.rehome_intrinsic_cache.insert(key, fresh);
+        state.rehomed_intrinsics.insert(fresh, "lin_sort".to_string());
         fresh
     };
 
