@@ -106,7 +106,24 @@ pub fn is_compatible_env(
         (_, Type::Stream(_)) => false,
 
         // Anything is assignable INTO Json (covariant sink): concrete T -> Json. (ADR-046)
+        // This INCLUDES a typed index-signature map `{ String: T }` -> Json: a `LinMap` widened to
+        // `Json` is only ever read back through the tag-aware `lin_*_any` bridges (keys/values/
+        // entries), which dispatch on the runtime tag, so the widening is representation-safe. This
+        // arm must stay AHEAD of the `Json -> Map` rejection below so `keys(typedMap)` still works.
         (_, Type::TypeVar(n)) if *n == u32::MAX => true,
+
+        // `Json -> { String: T }` (index-signature map, ADR-082): REJECT in BOTH directions of
+        // trust. A `Json` value's runtime payload is a `LinObject` (or any tag), NOT a `LinMap`;
+        // relabelling it to the map type at the call boundary does not convert the representation,
+        // so the callee then reads `LinObject` memory as a `LinMap` and corrupts it. There is
+        // intentionally no implicit `Json -> { String: T }` coercion (§5.1.1, §6.3) — the value
+        // must be decoded via `fromJson`/narrowing. Crucially this guard sits BEFORE the lenient
+        // `Json -> concrete` arm below, so even the trusted stdlib cannot manufacture the coercion
+        // (the same memory-safety precedent as the `Shared`/`Stream` arms above: a representational
+        // mismatch is unsound regardless of who wrote the code). `Map -> Json` is handled by the
+        // covariant-sink arm above and stays sound; `Map -> Map` covariance is below.
+        (Type::TypeVar(s), Type::Map(_)) if *s == u32::MAX => false,
+
         // Json -> a concrete structured Object (one with a required, non-nullable field):
         // this is the silent-unvalidated-decode hazard the cast-hole fix targets — e.g.
         // `val p: Person = readJson(...)`. Reject in user code; the value must be decoded
@@ -317,7 +334,10 @@ fn requires_structured_decode(target: &Type, env: Option<&TypeEnv>, depth: &mut 
         Type::Object { fields, .. } => fields.values().any(|t| !includes_null(t)),
         // A typed index-signature map (`{ String: T }`, ADR-082) is a structured decode target:
         // a raw `Json` must be decoded via `fromJson`/narrowing, never silently assigned (parity
-        // with the §6.3 Json-conversion rule). The trusted stdlib (lenient_json) stays permissive.
+        // with the §6.3 Json-conversion rule). NOTE: `Json -> Map` is now rejected unconditionally
+        // by the dedicated `(TypeVar(MAX), Map) => false` arm in `is_compatible_env` (which fires
+        // BEFORE this lenient-gated path, so it also closes the trusted-stdlib hole). This branch is
+        // retained as defensive intent — it keeps the user-code rejection self-evident here too.
         Type::Map(_) => true,
         Type::Named(n) => {
             if let Some(env) = env {
