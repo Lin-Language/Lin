@@ -231,6 +231,29 @@ impl<'ctx> Codegen<'ctx> {
                     // the flat slot. Scalars carry no refcount, so no RC balancing is needed (the
                     // boxed element shell is a fresh cached/heap box freed after the move). This is
                     // the `[]`+push flat-representation consistency fix (ADR-069).
+                    //
+                    // A SEALED-RECORD ARRAY (Stage 3): contiguous, header-less, unboxed element
+                    // payloads (`lin_sealed_array_alloc`, elem_tag 0xFE, packed-scalar stride). The
+                    // element value arrives as a STANDALONE sealed-struct pointer (the monomorphized
+                    // `push$<T>` body constructs it). Copy its payload into a fresh element slot via
+                    // `lin_sealed_array_push_struct_retaining` (verbatim byte copy for a scalar-only
+                    // record — NULL descriptor; per-field retain otherwise). The source struct stays
+                    // owned — `lower.rs` `push_into_sealed_array` skips the ownership transfer — and
+                    // is released at scope exit, balancing the retain. WITHOUT this, a sealed-array
+                    // `push` fell through to `tagged_array_push_value`, which materialized a BOXED
+                    // LinObject and tagged-pushed it (TAG_OBJECT) into the packed-scalar buffer → a
+                    // pointer-sized tagged element written into a scalar-stride slot → heap-buffer
+                    // overflow (`realloc(): invalid next size`; ASan: heap-buffer-overflow in
+                    // lin_array_push). Stage-3 tests dodged this by using array LITERALS only. Scalar
+                    // sealed arrays ONLY (`sealed_array_elem` gates on all-scalar fields); heap-field
+                    // record arrays fail safe to the boxed `Object[]` path.
+                    if Self::sealed_array_elem(&arr_ty).is_some() {
+                        let push_fn = self.get_or_declare_fn(
+                            "lin_sealed_array_push_struct_retaining",
+                            self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                        self.builder.call(push_fn, &[arr.into(), elem.into()], "");
+                        return ptr_ty.const_null().into();
+                    }
                     let arr_elem_flat = matches!(&arr_ty, Type::Array(e) if Self::is_flat_scalar(e));
                     // A `Json[]` array (`Array(TypeVar(MAX))`, the Json/wildcard element) can hold a
                     // FLAT runtime array at runtime — a concrete `Int32[]` boxed into a `Json`-typed

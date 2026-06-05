@@ -13154,6 +13154,126 @@ print(toString(ps))
     );
 }
 
+#[test]
+fn test_sealed_array_push_scalar_record() {
+    // REGRESSION (heap-corruption bug): pushing a record into a sealed SCALAR-record array.
+    // A `Pt[]` is a contiguous, header-less, packed-scalar-stride buffer (`lin_sealed_array_alloc`,
+    // elem_tag 0xFE). Before the fix the monomorphized `push$<Pt>` body materialized a BOXED
+    // LinObject and tagged-pushed it (TAG_OBJECT) into the packed buffer → pointer-sized write into
+    // a scalar-stride slot → `realloc(): invalid next size` / ASan heap-buffer-overflow in
+    // lin_array_push. Now `Intrinsic::Push` routes a sealed-array receiver to
+    // `lin_sealed_array_push_struct_retaining` (contiguous payload copy). Stage-3 tests dodged this
+    // by using array LITERALS only.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+type Pt = { "x": Int32, "y": Int32 }
+val pts: Pt[] = [{ "x": 0, "y": 0 }]
+push(pts, { "x": 1, "y": 10 })
+push(pts, { "x": 2, "y": 20 })
+push(pts, { "x": 3, "y": 30 })
+push(pts, { "x": 4, "y": 40 })
+push(pts, { "x": 5, "y": 50 })
+print("${length(pts)} ${pts[0]["x"]} ${pts[5]["y"]} ${pts[3]["x"]}")
+"#);
+    assert_eq!(out, vec!["6 0 50 3"]);
+}
+
+#[test]
+fn test_sealed_array_push_scalar_record_into_empty() {
+    // `val a: Pt[] = []; push(a, {..})` over a scalar-only sealed array — the element value arrives
+    // as a standalone sealed-struct pointer and must be copied into the contiguous layout, not
+    // boxed-and-tagged-pushed. Before the fix this printed garbage / crashed.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+type Point = { "x": Int32, "y": Int32 }
+val pts: Point[] = []
+push(pts, { "x": 1, "y": 2 })
+push(pts, { "x": 3, "y": 4 })
+print("${length(pts)}")
+print("${pts[0]["x"]} ${pts[1]["y"]}")
+"#);
+    assert_eq!(out, vec!["2", "1 4"]);
+}
+
+#[test]
+fn test_sealed_array_push_past_grow_boundary() {
+    // Push enough scalar records to force several `lin_sealed_array_push_slot` realloc grows (cap
+    // doubles from 4). Each grow reallocs the packed-scalar buffer; a tagged push would overflow it.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+type Pt = { "x": Int32, "y": Int32 }
+val pts: Pt[] = []
+val build = (i: Int32): Int32 =>
+  if i == 50 then 0 else
+    val _ = push(pts, { "x": i, "y": i * 10 })
+    build(i + 1)
+val _ = build(0)
+print("${length(pts)} ${pts[0]["x"]} ${pts[49]["y"]} ${pts[25]["x"]}")
+"#);
+    // length 50; pts[0].x = 0; pts[49].y = 490; pts[25].x = 25.
+    assert_eq!(out, vec!["50 0 490 25"]);
+}
+
+#[test]
+fn test_sealed_array_push_float64_record() {
+    // A Float64-field scalar record array: the packed stride is 8-byte doubles. Push must copy the
+    // 8-byte-per-field payload into the contiguous slot, not box-and-tag-push.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+type Vec2 = { "x": Float64, "y": Float64 }
+val vs: Vec2[] = [{ "x": 1.5, "y": 2.5 }]
+push(vs, { "x": 3.25, "y": 4.75 })
+push(vs, { "x": 5.5, "y": 6.5 })
+print("${length(vs)} ${vs[0]["x"]} ${vs[2]["y"]} ${vs[1]["x"]}")
+"#);
+    assert_eq!(out, vec!["3 1.5 6.5 3.25"]);
+}
+
+#[test]
+fn test_sealed_array_push_heap_field_records_stay_boxed() {
+    // REGRESSION: a heap-field record array (`Person` with a String field) is NOT a Stage-3 sealed
+    // scalar array, so `push` must keep using the boxed `Object[]` path and still index/serialize
+    // correctly. Proves the Push routing gate (`sealed_array_elem`) does not perturb boxed arrays.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+type Person = { "name": String, "age": Int32 }
+val ps: Person[] = [{ "name": "ann", "age": 30 }]
+push(ps, { "name": "bob", "age": 41 })
+push(ps, { "name": "cat", "age": 7 })
+print("${length(ps)} ${ps[0]["name"]} ${ps[2]["age"]}")
+print(toString(ps))
+"#);
+    assert_eq!(
+        out,
+        vec![
+            "3 ann 7",
+            r#"[{"name": "ann", "age": 30}, {"name": "bob", "age": 41}, {"name": "cat", "age": 7}]"#
+        ]
+    );
+}
+
+#[test]
+fn test_sealed_array_push_regression_flat_int_array_unchanged() {
+    // REGRESSION: pushing into a flat Int32[] must keep the flat representation (lin_push_dyn path),
+    // unaffected by the sealed-array Push routing.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+val nums: Int32[] = [3, 1, 4]
+push(nums, 1)
+push(nums, 5)
+push(nums, 9)
+print("${length(nums)} ${nums[0]} ${nums[5]}")
+"#);
+    assert_eq!(out, vec!["6 3 9"]);
+}
+
 /// Regression (LIN_ISSUES #2): a top-level mutable `var` in an IMPORTED module, mutated by an
 /// EXPORTED function, used to panic codegen ("Binary: undefined lhs temp Temp(0)") because the
 /// import lowering never set up the module global / its initialiser — the exported mutator
