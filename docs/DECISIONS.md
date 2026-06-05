@@ -2110,3 +2110,38 @@ fixes make every existing `push`/`append`/`prepend` call site (incl. `examples/c
 `examples/raspberry-controller`, the `decode`/`appendBytes` `Json`-element patterns, and the
 cross-module `mymap`) compile and run correctly. Regression tests in
 `crates/lin/tests/integration.rs` and `stdlib/array.test.lin`.
+
+## ADR-086: Enforce `lin_*` intrinsics are stdlib-only
+
+**Status**: Accepted. (Enforces the long-standing rule from ADR-002/ADR-009.)
+
+**Context**: Compiler builtins use `lin_*` names (`lin_print`, `lin_object_set`, `lin_array_allocate`,
+`lin_map`, …). Per ADR-002/ADR-009 and CLAUDE.md these are *stdlib-internal only* — user code must
+use the clean stdlib re-exports (`print` from `std/io`, `arrayAllocate` from `std/array`,
+index-assignment `obj[k] = v` instead of `lin_object_set`). The rule was documented but **not
+enforced**: `register_intrinsics()` defines all 72 `lin_*` intrinsics into *every* module's type env,
+so user code could call them directly (`examples/dijkstra` was found doing exactly this).
+
+**Decision**: Gate intrinsic name resolution on a per-module `Checker.allow_intrinsics: bool`. The
+flag is the OR of two things, set by the compile pipeline: `is_stdlib` (the trusted-stdlib signal
+already threaded per module, the same source as `lenient_json`) and the `LIN_ALLOW_INTRINSICS`
+test-only escape-hatch env var. A dedicated flag rather than reusing `lenient_json` keeps the two
+meanings distinct (`lenient_json` is specifically about Json→concrete coercion).
+
+**Choke point**: every bare-name reference — call targets `lin_foo(...)` (via `infer_call` →
+`infer_expr`) and intrinsic-as-value uses — flows through `Checker::infer_ident`. After the binding
+resolves to a `slot`, if `!allow_intrinsics` and `self.intrinsic_slots.contains_key(&slot)`, emit a
+hard error ("`<name>` is a compiler-internal intrinsic and cannot be used in user code") with a help
+pointing at the stdlib equivalent. The check sits before capture-tracking / stream-affine logic.
+
+**Escape hatch**: `LIN_ALLOW_INTRINSICS` re-enables intrinsics for the compiler's own
+monomorphization/codegen fixtures, which legitimately drive `lin_*` directly from user-level `.lin`
+sources (e.g. the IR-proof tests asserting flat-array allocation, the object-grow tests). The
+integration-test helpers (`run`, `run_expect_err`, `check_source`, `lin_check_ok*`, and the inline
+IR-proof `Command`s) set it via the shared `lin_cmd()` builder; the negative regression test
+(`test_intrinsic_rejected_in_user_code`) uses a bare `Command` *without* it.
+
+**Unaffected**: ffi-declared `lin_*` foreign symbols in the stdlib (`lin_signal_wait`,
+`lin_io_read_line`, `lin_string_trim`, …) are NOT in `intrinsic_slots` — they are declared via
+`import foreign "lin-runtime"` — so gating on `intrinsic_slots` membership leaves them alone. Stdlib
+modules check with `allow_intrinsics = true`, so their own intrinsic re-exports keep working.

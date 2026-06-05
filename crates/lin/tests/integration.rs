@@ -23,6 +23,16 @@ fn lin_bin() -> PathBuf {
     workspace_root().join("target/debug/lin")
 }
 
+/// A `lin` Command pre-armed with the `LIN_ALLOW_INTRINSICS` escape hatch (ADR-086) so the
+/// compiler's own intrinsic-exercising fixtures (which write user-level `.lin` sources that call
+/// `lin_*` directly) keep type-checking. Tests that must exercise the gate REJECTING an intrinsic
+/// build a bare `Command::new(lin_bin())` instead, WITHOUT this env var.
+fn lin_cmd() -> Command {
+    let mut cmd = Command::new(lin_bin());
+    cmd.env("LIN_ALLOW_INTRINSICS", "1");
+    cmd
+}
+
 /// Compile `source` to a temp binary and return stdout lines.
 /// Panics if compilation or execution fails.
 fn run(source: &str) -> Vec<String> {
@@ -33,7 +43,7 @@ fn run(source: &str) -> Vec<String> {
 
     fs::write(&src_path, source).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -80,7 +90,7 @@ fn run_expect_err(source: &str) -> String {
 
     fs::write(&src_path, source).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -125,7 +135,7 @@ fn run_with_stdin(source: &str, stdin_data: &str) -> String {
 
     fs::write(&src_path, source).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -164,7 +174,7 @@ fn run_with_args(source: &str, prog_args: &[&str]) -> String {
 
     fs::write(&src_path, source).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -1397,7 +1407,7 @@ val run = (): Null =>
   print(toString(sum))
 run()
 "#).unwrap();
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -2183,7 +2193,7 @@ fn test_circular_import_function_reference_compiles_not_stack_overflow() {
          export val fromB = (): Int32 => fromA()\n").unwrap();
 
     let bin_path = dir.join("a.out");
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", dir.join("a.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .output()
         .expect("failed to invoke lin binary — run `cargo build -p lin` first");
@@ -2267,7 +2277,7 @@ fn test_cyclic_imports_value_init_cycle_still_errors() {
          export val y = x + 1\n").unwrap();
 
     let bin_path = dir.join("a.out");
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", dir.join("a.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .output()
         .expect("failed to invoke lin binary — run `cargo build -p lin` first");
@@ -2322,7 +2332,7 @@ fn test_cache_invalidated_when_import_signature_changes() {
     let bin_path = dir.join("main.out");
 
     // Build #1: must succeed and populate .lin-cache (m.lin checked against Int32 getVal).
-    let build1 = Command::new(lin_bin())
+    let build1 = lin_cmd()
         .args(["build", dir.join("main.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .output()
         .expect("failed to invoke lin binary — run `cargo build -p lin` first");
@@ -2342,7 +2352,7 @@ fn test_cache_invalidated_when_import_signature_changes() {
     // Build #2: m.lin must be re-checked against the NEW (String) getVal, so `getVal() + 1` is now a
     // type error. If the cache key ignored a.lin's signature, the stale m.lin .typed would be reused
     // (codegen panic / silent miscompile).
-    let build2 = Command::new(lin_bin())
+    let build2 = lin_cmd()
         .args(["build", dir.join("main.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .output()
         .expect("failed to invoke lin binary");
@@ -2405,7 +2415,7 @@ print(toString(k))
 "#, d = dir.to_str().unwrap());
     let bad_path = dir.join("bad.lin");
     std::fs::write(&bad_path, &bad).unwrap();
-    let check = Command::new(lin_bin())
+    let check = lin_cmd()
         .args(["check", bad_path.to_str().unwrap()])
         .output()
         .expect("failed to invoke lin binary — run `cargo build -p lin` first");
@@ -2416,6 +2426,52 @@ print(toString(k))
         "ADR-078 boundary gap: binding a peer-dependent cyclic return to Int32 is currently \
          accepted. If this now FAILS, the gap was closed — flip this assertion and update ADR-078. \
          got: {check_out}");
+}
+
+#[test]
+fn test_intrinsic_rejected_in_user_code() {
+    // ADR-086: `lin_*` compiler intrinsics must not be callable from user code; they are
+    // resolvable only when type-checking a trusted stdlib module (or with the LIN_ALLOW_INTRINSICS
+    // test escape hatch). This test invokes `lin check` WITHOUT the escape hatch.
+    let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let ws = workspace_root();
+    let src_path = ws.join(format!("target/lin_test_intr_{}.lin", id));
+    fs::write(
+        &src_path,
+        "import { print } from \"std/io\"\nvar o: Json = {}\nlin_object_set(o, \"k\", 1)\nprint(\"x\")\n",
+    )
+    .unwrap();
+    // NOTE: bare Command, no .env("LIN_ALLOW_INTRINSICS", ...) — the gate must be ACTIVE.
+    let out = Command::new(lin_bin())
+        .args(["check", src_path.to_str().unwrap()])
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "expected check to fail; stderr:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains("compiler-internal intrinsic"),
+        "wrong error:\n{}",
+        stderr
+    );
+
+    // The escape hatch re-enables intrinsics for the compiler's own fixtures.
+    let out_hatch = Command::new(lin_bin())
+        .args(["check", src_path.to_str().unwrap()])
+        .env("LIN_ALLOW_INTRINSICS", "1")
+        .current_dir(&ws)
+        .output()
+        .expect("failed to invoke lin binary");
+    let _ = fs::remove_file(&src_path);
+    assert!(
+        out_hatch.status.success(),
+        "LIN_ALLOW_INTRINSICS escape hatch should permit the intrinsic; stderr:\n{}",
+        String::from_utf8_lossy(&out_hatch.stderr)
+    );
 }
 
 #[test]
@@ -7138,7 +7194,7 @@ fn is_self_contained(source: &str) -> bool {
 
 /// `lin check <path>` succeeds.
 fn lin_check_ok(path: &std::path::Path) -> bool {
-    Command::new(lin_bin())
+    lin_cmd()
         .args(["check", path.to_str().unwrap()])
         .current_dir(workspace_root())
         .output()
@@ -7157,7 +7213,7 @@ fn lin_check_ok_source(source: &str) -> bool {
     let ws = workspace_root();
     let p = ws.join(format!("target/fmt_check_{}.lin", id));
     std::fs::write(&p, source).unwrap();
-    let ok = Command::new(lin_bin())
+    let ok = lin_cmd()
         .args(["check", p.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -10204,7 +10260,7 @@ print(toString(identity(5)))
 print(identity("hello"))
 "#).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -10280,7 +10336,7 @@ a[2] = 30
 print(toString(a[0] + a[2]))
 "#).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -10338,7 +10394,7 @@ val scan = (j: Int32, best: Int32): Int32 =>
 print(toString(scan(1, 0)))
 "#).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -10403,7 +10459,7 @@ import { arrayAllocateFilled } from "std/array"
 val a: Int32[] = arrayAllocateFilled(3, 7)
 print(toString(a[5]))
 "#).unwrap();
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -10482,7 +10538,7 @@ print(a[0])
 print(a[1])
 "#).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -10574,7 +10630,7 @@ val doubled: Int32[] = mymap([10, 20, 30], x => x * 2)
 print(toString(doubled[0]))
 "#).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -10741,7 +10797,7 @@ val wrap = <U>(y: U): U => id(y)
 print(toString(wrap(42)))
 "#).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -10880,7 +10936,7 @@ fn run_with_spec_budget(source: &str, budget: &str) -> (String, Vec<String>) {
     let bin_path = ws.join(format!("target/lin_test_budget_{}", id));
     fs::write(&src_path, source).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_SPEC_BUDGET", budget)
         .current_dir(&ws)
@@ -10960,7 +11016,7 @@ print(toString(id(5)))
 print(id("hi"))
 "#, dir.to_str().unwrap())).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -11071,7 +11127,7 @@ val ints: Int32[] = [10, 20, 30]
 print(toString(firstOf(ints)))
 "#).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -11159,7 +11215,7 @@ val r: Json = doubleAll([5, 6, 7])
 print(toString(r.reduce(0, (acc, x) => acc + x)))
 "#, dir.to_str().unwrap())).unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
@@ -11367,7 +11423,7 @@ fn check_source(source: &str) -> (bool, String) {
     let src_path = ws.join(format!("target/lin_check_{}.lin", id));
     fs::write(&src_path, source).unwrap();
 
-    let out = Command::new(lin_bin())
+    let out = lin_cmd()
         .args(["check", src_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -11390,7 +11446,7 @@ fn build_succeeds(source: &str) -> bool {
     let bin_path = ws.join(format!("target/lin_build_only_{}", id));
     fs::write(&src_path, source).unwrap();
 
-    let out = Command::new(lin_bin())
+    let out = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -11791,7 +11847,7 @@ fn run_test_json(fixture: &Path, extra: &[&str]) -> (bool, Vec<String>) {
     let ws = workspace_root();
     let mut args = vec!["test", fixture.to_str().unwrap(), "--reporter", "json"];
     args.extend_from_slice(extra);
-    let out = Command::new(lin_bin())
+    let out = lin_cmd()
         .args(&args)
         .current_dir(&ws)
         .output()
@@ -12195,7 +12251,7 @@ range(0, 1000000).for(i => print("line ${i}"))
     )
     .unwrap();
 
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .current_dir(&ws)
         .output()
@@ -12842,7 +12898,7 @@ fn build_ir(source: &str) -> String {
     let bin_path = ws.join(format!("target/lin_test_ir_{}", id));
     let ll_path = ws.join(format!("target/lin_test_ir_{}.ll", id));
     fs::write(&src_path, source).unwrap();
-    let compile = Command::new(lin_bin())
+    let compile = lin_cmd()
         .args(["build", src_path.to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
         .env("LIN_EMIT_IR", "1")
         .env("LIN_NO_OPT", "1")
