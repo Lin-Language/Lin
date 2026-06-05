@@ -1,26 +1,20 @@
 import { push, length } from "std/array"
 import { for } from "std/iter"
-import { toString } from "std/string"
+
+import { Neighbor } from "./graph"
 
 // A priority-queue entry: a node and its current tentative distance.
 export type PqEntry = { "node": String, "dist": Int32 }
 
-// Dijkstra's output: a distance map and a predecessor map, both keyed by node
-// name at runtime (so dynamic / Json): dist[node] is Int32, prev[node] is String.
-export type DijkstraResult = { "dist": Json, "prev": Json }
-
-val toInt = (v: Json): Int32 =>
-  match v
-    is Int32 => v
-    else => 0
+// Dijkstra's output: a distance map (node -> shortest distance) and a
+// predecessor map (node -> previous node on the shortest path).
+export type DijkstraResult = { "dist": { String: Int32 }, "prev": { String: String } }
 
 val findMinIdx = (pq: PqEntry[]): Int32 =>
   var minIdx = 0
   var i = 0
   pq.for(_ =>
-    val di = toInt(pq[i]["dist"])
-    val dm = toInt(pq[minIdx]["dist"])
-    if di < dm then minIdx = i
+    if pq[i]["dist"] < pq[minIdx]["dist"] then minIdx = i
     i = i + 1
   )
   minIdx
@@ -34,33 +28,40 @@ val removeAt = (pq: PqEntry[], idx: Int32): PqEntry[] =>
   )
   result
 
-val processQueue = (pq: PqEntry[], adj: Json, dist: Json, prev: Json, visited: Json): Null =>
+val processQueue = (pq: PqEntry[], adj: { String: Neighbor[] }, dist: { String: Int32 }, prev: { String: String }, visited: { String: Boolean }): Null =>
   if length(pq) > 0 then
     val midx = findMinIdx(pq)
     val current = pq[midx]
     val remaining = removeAt(pq, midx)
-    val u = toString(current["node"])
+    val u = current["node"]
     if visited[u] == null then
-      lin_object_set(visited, u, true)
-      val neighbors = if adj[u] == null then [] else adj[u]
+      visited[u] = true
+      val neighbors = match adj[u]
+        is Null => []
+        else => adj[u]
       neighbors.for(edge =>
-        val v = toString(edge["to"])
-        val du = toInt(dist[u])
-        val ew = toInt(edge["weight"])
-        val dv = toInt(dist[v])
-        val newDist = du + ew
+        val v = edge["to"]
+        val distU = dist[u]
+        val du = match distU
+          is Int32 => distU
+          else => 0
+        val distV = dist[v]
+        val dv = match distV
+          is Int32 => distV
+          else => 0
+        val newDist = du + edge["weight"]
         if newDist < dv then
-          lin_object_set(dist, v, newDist)
-          lin_object_set(prev, v, u)
+          dist[v] = newDist
+          prev[v] = u
           push(remaining, { "node": v, "dist": newDist })
       )
     processQueue(remaining, adj, dist, prev, visited)
 
-export val dijkstra = (adj: Json, source: String, allNodes: String[]): DijkstraResult =>
-  var dist: {  } = {}
-  var prev: {  } = {}
-  var visited: {  } = {}
-  allNodes.for(n => lin_object_set(dist, n, 999999999))
+export val dijkstra = (adj: { String: Neighbor[] }, source: String, allNodes: String[]): DijkstraResult =>
+  var dist: { String: Int32 } = {}
+  var prev: { String: String } = {}
+  var visited: { String: Boolean } = {}
+  allNodes.for(n => dist[n] = 999999999)
   dist[source] = 0
   val pq = [{ "node": source, "dist": 0 }]
   processQueue(pq, adj, dist, prev, visited)

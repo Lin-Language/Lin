@@ -8,6 +8,8 @@ fn parse_and_check(source: &str) -> Result<lin_check::TypedModule, Vec<lin_commo
     let mut parser = Parser::new(tokens);
     let module = parser.parse_module();
     let mut checker = Checker::new();
+    // These compiler-internal unit tests legitimately drive `lin_*` intrinsics directly (ADR-086).
+    checker.allow_intrinsics = true;
     checker.check_module(&module)
 }
 

@@ -172,7 +172,7 @@ a stdlib dependency:
 ```lin
 import { readFile } from "std/fs"
 
-replace readFile = (path: String): Json => "mock contents of ${path}"
+replace readFile = (path: String): String | Error => "mock contents of ${path}"
 ```
 
 The override applies to **every** caller of that export — the test file, the module
