@@ -1,20 +1,26 @@
 // raptor/ScanResults (+Factory) — per-round arrivals + connection index.
 //
-// State record:
-//   { "k": Int, "bestArrivals": { stop -> time }, "kArrivals": { roundStr -> { stop -> time } },
-//     "kConnections": { stop -> { roundStr -> connection } } }
+// State record (the typed `ScanResults` in types.lin):
+//   { "k": Int32, "bestArrivals": { String: Int64 }, "kArrivals": { String: { String: Int64 } },
+//     "kConnections": Json }
 // A connection is either a Transfer (object with "origin") or [trip, startIndex, endIndex].
 //
-// Round keys are stored as strings ("${k}") because Lin object keys are strings.
-// `k` starts at 0; addRound increments and seeds an empty arrivals map.
+// The arrival-time dictionaries (`bestArrivals`, `kArrivals`) are typed `{ String: T }`
+// index-signature maps (ADR-082 / spec §5.1.1) — hashed O(1) containers, the GROUP/RANGE-phase
+// perf lever (the index-build PREP lever was the RaptorIndex maps). `kConnections` STAYS `Json`
+// (typing the nested union-valued map triggers a codegen/RC fault in the multi-day / transfer-
+// pattern walks — see types.lin / NOTES.md "kConnections blocker"). Round keys are stored as
+// strings ("${k}") because Lin object keys are strings. `k` starts at 0; addRound increments and
+// seeds an empty arrivals map.
 import { for } from "std/iter"
 import { keys } from "std/object"
+import { ScanResults } from "./types"
 
 val MAX = 9007199254740991i64
 
-export val createScanResults = (stops: Json, origins: Json): Json =>
-  var bestArrivals: Json = {}
-  var kArrival0: Json = {}
+export val createScanResults = (stops: Json, origins: Json): ScanResults =>
+  var bestArrivals: { String: Int64 } = {}
+  var kArrival0: { String: Int64 } = {}
   var kConnections: Json = {}
   stops.for(stop =>
     val t = if origins[stop] != null then origins[stop] else MAX
@@ -22,7 +28,7 @@ export val createScanResults = (stops: Json, origins: Json): Json =>
     kArrival0[stop] = t
     kConnections[stop] = {}
   )
-  var kArrivals: Json = {}
+  var kArrivals: { String: { String: Int64 } } = {}
   kArrivals["0"] = kArrival0
   {
     "k": 0,
@@ -31,15 +37,19 @@ export val createScanResults = (stops: Json, origins: Json): Json =>
     "kConnections": kConnections
   }
 
-export val addRound = (results: Json): Null =>
+export val addRound = (results: ScanResults): Null =>
   val k = results["k"] + 1
   results["k"] = k
   results["kArrivals"]["${k}"] = {}
 
-export val previousArrival = (results: Json, stop: String): Json =>
+// previousArrival/bestArrival read a typed `{ String: Int64 }` slot (so `m[k]` is `Int64 | Null`),
+// but they widen the result to `Json` so the arithmetic/comparison consumers in raptor.lin keep
+// their existing `!= null` guards + Json numeric ops unchanged (faithful skip-on-missing
+// semantics; see scanTransfers). The O(1) hashed read already happened on the typed-map access.
+export val previousArrival = (results: ScanResults, stop: String): Json =>
   results["kArrivals"]["${results["k"] - 1}"][stop]
 
-export val setTrip = (results: Json, trip: Json, startIndex: Int32, endIndex: Int32, interchange: Int32): Null =>
+export val setTrip = (results: ScanResults, trip: Json, startIndex: Int32, endIndex: Int32, interchange: Int32): Null =>
   val time = trip["stopTimes"][endIndex]["arrivalTime"] + interchange
   val stop = trip["stopTimes"][endIndex]["stop"]
   val k = results["k"]
@@ -47,19 +57,23 @@ export val setTrip = (results: Json, trip: Json, startIndex: Int32, endIndex: In
   results["bestArrivals"][stop] = time
   results["kConnections"][stop]["${k}"] = [trip, startIndex, endIndex]
 
-export val setTransfer = (results: Json, transfer: Json, time: Json): Null =>
+export val setTransfer = (results: ScanResults, transfer: Json, time: Json): Null =>
   val stop = transfer["destination"]
   val k = results["k"]
   results["kArrivals"]["${k}"][stop] = time
   results["bestArrivals"][stop] = time
   results["kConnections"][stop]["${k}"] = transfer
 
-export val bestArrival = (results: Json, stop: String): Json =>
+export val bestArrival = (results: ScanResults, stop: String): Json =>
   results["bestArrivals"][stop]
 
-export val getMarkedStops = (results: Json): Json =>
+export val getMarkedStops = (results: ScanResults): Json =>
   keys(results["kArrivals"]["${results["k"]}"])
 
-// finalize returns [kConnections, bestArrivals]
-export val finalize = (results: Json): Json =>
-  [results["kConnections"], results["bestArrivals"]]
+// finalize returns the typed ScanResults record itself (callers read its typed
+// kConnections/bestArrivals fields — see raptor.scan / query). It previously returned a
+// `[kConnections, bestArrivals]` `Json` array, but a heterogeneous typed-map array literal is
+// not inferred as a tuple, and a named tuple-type alias is not indexable, so the record is the
+// clean typed carrier.
+export val finalize = (results: ScanResults): ScanResults =>
+  results
