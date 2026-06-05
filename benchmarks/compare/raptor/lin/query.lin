@@ -15,13 +15,18 @@ import { Date, RaptorIndex } from "./types"
 val ONE_DAY = 86400
 
 // getFoundStations: best arrival - 1 day (min 1) for every stop that has an arrival.
-val getFoundStations = (kConnections: Json, bestArrivals: Json): Json =>
+// bestArrivals is the typed `{ String: Int64 }` scan-state map (it MUST stay typed here, not
+// widened to `Json`: a `Json m[k]` index uses the object path and would misread the TAG_MAP
+// rep). `bestArrivals[stop]` is therefore `Int64 | Null`; the `keys(kConnections[stop]) > 0`
+// guard means the stop always has an arrival, so the `!= null` guard narrows the read.
+val getFoundStations = (kConnections: Json, bestArrivals: { String: Int64 }): Json =>
   var origins: Json = {}
   keys(kConnections).for(stop =>
     if length(keys(kConnections[stop])) > 0 then
       val best = bestArrivals[stop]
-      val v = best - ONE_DAY
-      origins[stop] = if v > 1 then v else 1
+      if best != null then
+        val v = best - ONE_DAY
+        origins[stop] = if v > 1i64 then v else 1i64
   )
   origins
 
@@ -75,9 +80,11 @@ val searchDay = (raptor: RaptorIndex, origins: Json, destinations: Json, date: D
   else
     val dateNumber = getDateNumber(date)
     val dow = dayOfWeek(date)
+    // scan now returns the typed `ScanResults` record (its kConnections stays `Json`; its
+    // bestArrivals is the typed `{ String: Int64 }` map, widened to `Json` for getFoundStations).
     val scanned = scan(raptor, origins, dateNumber, dow)
-    val kConnections = scanned[0]
-    val bestArrivals = scanned[1]
+    val kConnections = scanned["kConnections"]
+    val bestArrivals = scanned["bestArrivals"]
     val results = getJourneysFromConnections(kConnections, connectionIndexes, destinations)
     if length(results) > 0 then
       results

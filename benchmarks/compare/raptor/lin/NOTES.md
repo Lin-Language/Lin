@@ -62,14 +62,74 @@ Typed → `{ String: T }`, threaded through `RaptorIndex`
 | `tripsByRoute` | `{ String: Json[] }` (trip values stay `Json`) | createRaptor + routeScanner |
 | `stops` | `String[]` | createRaptor |
 
+### Scan-state map re-typing pass (the GROUP/RANGE-phase attempt)
+
+A second pass typed the **ScanResults arrival-time maps** (`scanResults.lin`, threaded as the
+named `ScanResults` record through `raptor.lin`/`query.lin`):
+
+| Structure | Type | Built/read in |
+|---|---|---|
+| `bestArrivals` | `{ String: Int64 }` | createScanResults + setTrip/setTransfer + bestArrival |
+| `kArrivals` | `{ String: { String: Int64 } }` | createScanResults + addRound + setTrip/setTransfer + previousArrival/getMarkedStops |
+
+Arrival times are **Int64** (the MAX sentinel `9007199254740991` needs it). `previousArrival`/
+`bestArrival` read the typed slot (so `m[k]` is `Int64 | Null`) but **widen to `Json`** so the
+arithmetic/comparison consumers in `raptor.lin`'s inner scan loop keep their existing `!= null`
+guards + Json numeric ops unchanged. `getFoundStations` (`query.lin`) must keep `bestArrivals`
+typed `{ String: Int64 }` (NOT widened to `Json`): a `Json m[k]` index uses the object path and
+misreads the `TAG_MAP` rep — a typed-map value passed to a `Json` param round-trips fine, but
+indexing it as `Json` does not tag-dispatch `TAG_MAP` (a cross-rep boundary gap; it null-deref'd
+in `lin_unbox_int32` until the param was re-typed).
+
+**Measured payoff: NEUTRAL within heavy noise.** Unlike the PREP/`RaptorIndex` win (~5.6×,
+because those indexes were ~16k-key routeId maps scanned per-trip over 240k trips), the
+scan-state maps are ~3000-key stopId maps hit in the *query* phase, and the rounds map is tiny
+(a handful of keys, so its association-list scan was already cheap). Interleaved GROUP runs
+(controlling for machine drift): master ≈ 86–105 s, typed ≈ 87–88 s — the variant difference is
+inside the per-variant spread, so there is no reliable speedup or regression signal. The digest
+(`26203913`) and journey count (`39`) are byte-identical across all runs, so this is a
+**fidelity** win (the arrival maps now carry their real `{ String: Int64 }` type) with no
+behaviour change and no measurable cost. (This bench is noise-dominated on this host — judge by
+interleaved medians, not single runs.)
+
+### kConnections blocker (a codegen/RC fault — STAYS `Json`)
+
+`kConnections` was NOT typed. Its intended type is `{ String: { String: Conn } }` where
+`Conn = [Json, Int32, Int32] | Transfer` (the `Conn` alias IS defined in `types.lin` for
+documentation; the trip element stays `Json` because composite `Json` does not flow into the
+named `Trip` record). The **simple/single-pass query path works typed** — with `kConnections`
+typed end-to-end, `run.lin`'s TBW→NRW gate is byte-identical (`RESULT dep=29400 arr=40680 legs=3
+count=1`) and `journeyFactory`'s `match … is Transfer` walk narrows correctly. But it triggers a
+**runtime double-free / misaligned-pointer / null-deref fault** in two consumers:
+
+- the **multi-day stitching** (`query.lin` `completeJourneys` / `prevConnections`, exercised by
+  the overnight/"uses all results from every day" `departAfterQuery` tests), and
+- the **transfer-pattern walks** (`graphResults.lin` / `stringResults.lin`).
+
+The common trigger: a `match`-narrowed connection read off the typed nested map is `push`-ed
+into a shared `Json` array, and that array is then consumed by a recursive slicing walk
+(`getJourneyLegs`/`getPath` + `mergePathInto`). Minimal self-contained repro (panics in
+`crates/lin-runtime/src/memory.rs` / `tagged.rs`):
+
+```lin
+type Conn = [Json, Int32, Int32] | Transfer
+// build kc : { String: { String: Conn } } via range().for with path[i] string keys,
+// then walk(kc, ...) match-narrowing kc[dest]["${i}"], push the origin into a shared
+// path array, recurse, and feed the path to a slice-based mergePathInto → SIGSEGV.
+```
+
+This is a **codegen/RC ownership bug** (the connection value / shared array is freed while still
+referenced), not a Lin-level workaround — so per the staging contract `kConnections` is left
+`Json` with its boolean `isTransfer`/`isTimetableLeg` consumers (`journeyFactory.lin`,
+`graphResults.lin`, `stringResults.lin`, `run.lin`) unchanged. Worth a separate language-side
+bug fix (the RC-elision / borrowed-vs-owned rules for union-valued nested-map reads pushed into
+arrays).
+
 **Kept `Json` (with reasons):**
 
-- **`kConnections`, `kArrivals`, `bestArrivals`** (scanResults state): the scan/query
-  consumers do heavy `m[k]` *arithmetic/comparison* on the reads, and the `kConnections`
-  value is a `Connection | Transfer` union read out via boolean field-tests — neither is
-  cleanly expressible as a `{ String: T }` value, and `scanResults`/`results` is threaded
-  as `Json` throughout. This is scan/query-phase state, NOT the PREP index, so leaving it
-  `Json` does not affect the headline number.
+- **`kConnections`** (scanResults state): the connection value is a `[Json,Int32,Int32] |
+  Transfer` union; typing it is supported in the simple path but faults in the multi-day /
+  transfer-pattern walks (the codegen/RC blocker above). Stays `Json`.
 - **`transfers`, `interchange`** (the createRaptor inputs / `RaptorIndex` fields): they
   *originate* from the loader as `Json` maps and there is no implicit `Json → { String: T }`
   coercion (spec §5.1.1); they are also SMALL per-origin maps (≤ ~3079 keys), so converting
@@ -134,12 +194,16 @@ its keys would suggest.
 **Typed `{ String: T }` (the map re-typing pass — see the table above):**
 `routeStopIndex`, `routePath`, `routesAtStop`, `tripsByRoute` (via `RaptorIndex`).
 
+**Typed `{ String: T }` scan-state (the GROUP/RANGE pass — see the table above):**
+`bestArrivals` (`{ String: Int64 }`), `kArrivals` (`{ String: { String: Int64 } }`), threaded
+via the named `ScanResults` record (`scanResults.lin`/`raptor.lin`/`query.lin`).
+
 **Left `Json` at the map / union-narrowing boundaries:**
 
-- The scan/query-side maps `kConnections`, `kArrivals`, `bestArrivals`; the
-  createRaptor INPUT maps `transfers`/`interchange`; `getQueue`'s return; and the
-  loader's intermediate maps (`datesList`, `servicesSorted`, …). See the
-  "Kept `Json`" list above for the per-structure reason.
+- The scan-state map `kConnections` (the codegen/RC blocker above); the createRaptor INPUT maps
+  `transfers`/`interchange`; `getQueue`'s return; and the loader's intermediate maps
+  (`datesList`, `servicesSorted`, …). See the "Kept `Json`" list above for the per-structure
+  reason.
 - `Trip`/`Journey`/`Leg`/`TimetableLeg` values **as consumed**: every one of them
   is read out of the `kConnections` `Json` map (or a `Json[]` built from it) and
   inspected via a boolean field-test (`isTransfer`/`isTimetableLeg`) followed by
@@ -175,13 +239,22 @@ is byte-for-byte identical, which is why the gate is unchanged.
 
 **Gate after typing:** unit tests still 9/9 pass; `run.lin` still builds and
 prints `RESULT dep=29400 arr=40680 legs=3 count=1` on the full feed; the
-`bench.lin` GROUP digest is unchanged (`26203913`).
+`bench.lin` GROUP digest is unchanged (`26203913`, journeys `39`) — across BOTH the
+`RaptorIndex` PREP pass and the `ScanResults` scan-state pass.
 
-**Measured PREP-phase speedup (the point of the map re-typing pass):** the
+**Measured PREP-phase speedup (the point of the index map re-typing pass):** the
 createRaptor index build dropped from **~144 s** (when the routeId-keyed indexes were
 O(n) `Json` association lists) to **~25.7 s** with the O(1) hashed `{ String: T }` maps
 — a **~5.6×** speedup on the headline PREP phase. (LOAD ≈ 30 s and the GROUP/RANGE query
 phases are unaffected by the index typing.)
+
+**Measured GROUP-phase result of the scan-state pass: NEUTRAL within noise.** Typing
+`bestArrivals`/`kArrivals` (the ScanResults pass) did NOT reproduce the PREP win — the
+scan-state maps are smaller (~3000-key stopId maps) and hit in the query phase, so the
+O(n)→O(1) change is in the noise floor. Interleaved GROUP runs: master ≈ 86–105 s, typed
+≈ 87–88 s (variant difference < per-variant spread; this host is noise-dominated). Behaviour
+is byte-identical — a fidelity win at no measurable cost. `kConnections` could not be typed at
+all (codegen/RC fault in the multi-day & transfer-pattern walks; see "kConnections blocker").
 
 ## Design
 
@@ -262,9 +335,11 @@ path did O(16k) scans × 240k trips → the PREP phase took ~144 s.
 This is now fixed by the **map re-typing pass** above: `routeStopIndex`/`routePath`/
 `routesAtStop`/`tripsByRoute` are typed `{ String: T }` index-signature maps (ADR-082),
 backed by a hashed O(1) container (`crates/lin-runtime/src/map.rs`). PREP dropped to
-~25.7 s (~5.6×). The remaining `Json` maps are the small per-origin `transfers`/
-`interchange` and the scan/query-side state (`kConnections`/`kArrivals`/`bestArrivals`,
-`getQueue`'s return) — see the "Kept `Json`" list for why each stays `Json`. Lin is still
+~25.7 s (~5.6×). The scan-state arrival maps (`bestArrivals`/`kArrivals`) were later typed too
+(the ScanResults pass) but that was GROUP-neutral within noise — these are smaller stopId maps
+in the query phase, not the build hotspot. The remaining `Json` maps are the small per-origin
+`transfers`/`interchange`, the scan-state `kConnections` (the codegen/RC blocker), and
+`getQueue`'s return — see the "Kept `Json`" list for why each stays `Json`. Lin is still
 slower than the hashed-map languages (Node/Go/Rust/Python ~1–2 s) on the full query
 phase, but the index-build hotspot is no longer the dominant cost.
 
