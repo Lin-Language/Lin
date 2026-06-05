@@ -561,6 +561,37 @@ pub unsafe extern "C" fn lin_object_get_or_insert_array(obj: *const u8, key: *co
         // No object to mutate; hand back a fresh empty array so `push` is still well-defined.
         return alloc_tagged(TAG_ARRAY, crate::array::lin_array_alloc(4) as u64);
     }
+    // A typed index-signature map `{ String: T[] }` is backed by `LinMap` (TAG_MAP), not
+    // `LinObject`. Dispatch on the tag and route map values through the map intrinsics — without
+    // this branch, treating a `LinMap*` as a `LinObject*` corrupts memory (ADR-082). `groupBy`'s
+    // result is map-typed, so this is the path it actually takes.
+    if *obj == TAG_MAP {
+        let lin_map = (*(obj as *const TaggedVal)).payload as *mut crate::map::LinMap;
+        let key_str = if !key.is_null() && *key == TAG_STR {
+            (*(key as *const TaggedVal)).payload as *const LinString
+        } else {
+            key as *const LinString
+        };
+        let existing = crate::map::lin_map_get(lin_map, key_str);
+        if !existing.is_null() && (*existing).tag == TAG_ARRAY {
+            let arr = (*existing).payload as *mut crate::array::LinArray;
+            if !arr.is_null() && (*arr).refcount < crate::string::IMMORTAL_RC {
+                (*arr).refcount += 1;
+            }
+            return alloc_tagged(TAG_ARRAY, arr as u64);
+        }
+        // Absent (or present-but-not-an-array): create a fresh array and insert it. `lin_map_set`
+        // retains the value's inner payload (arr -> rc 2) and keeps its own key ref.
+        let arr = crate::array::lin_array_alloc(4); // rc = 1
+        let val = TaggedVal { tag: TAG_ARRAY, _pad: [0; 7], payload: arr as u64 };
+        crate::map::lin_map_set(lin_map, key_str as *mut LinString, &val);
+        // Drop our build +1 (map owns its retained ref), then bump once for the returned box.
+        crate::array::lin_array_release(arr);
+        if (*arr).refcount < crate::string::IMMORTAL_RC {
+            (*arr).refcount += 1;
+        }
+        return alloc_tagged(TAG_ARRAY, arr as u64);
+    }
     // Unwrap a boxed Json object to the raw LinObject*; a raw LinObject* is used as-is.
     let lin_obj = if *obj == TAG_OBJECT {
         (*(obj as *const TaggedVal)).payload as *mut LinObject
@@ -962,7 +993,7 @@ pub unsafe extern "C" fn lin_object_copy_except(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tagged::{alloc_tagged, lin_tagged_release, TAG_STR, TAG_ARRAY, TAG_OBJECT, TAG_INT32};
+    use crate::tagged::{alloc_tagged, lin_tagged_release, TAG_STR, TAG_ARRAY, TAG_OBJECT, TAG_INT32, TAG_MAP};
 
     unsafe fn mk_string(s: &str) -> *mut LinString {
         crate::string::lin_string_from_bytes(s.as_ptr(), s.len() as u32)
@@ -1105,6 +1136,53 @@ mod tests {
             // Teardown: releasing the object frees both group arrays exactly once.
             lin_object_release(obj);
             crate::tagged::lin_tagged_free_box(obj_box);
+            crate::string::lin_string_release(even);
+            crate::string::lin_string_release(odd);
+        }
+    }
+
+    // Same get-or-insert-array contract, but over a TAG_MAP (`LinMap`) backing — the typed
+    // `{ String: T[] }` result that std/array.groupBy now produces (ADR-082). Without the TAG_MAP
+    // branch in `lin_object_get_or_insert_array`, the map would be (mis)read as a `LinObject` and
+    // corrupt memory; this guards that the map path inserts/looks-up/RC-balances correctly.
+    #[test]
+    fn get_or_insert_array_groupby_over_map() {
+        unsafe {
+            use crate::array::{lin_array_length, lin_array_get_tagged};
+            use crate::map::{lin_map_alloc, lin_map_get, lin_map_release};
+            let map = lin_map_alloc(2); // the `var result: { String: T[] } = {}`
+            let map_box = alloc_tagged(TAG_MAP, map as u64); // map crosses as a boxed value
+            let even = crate::string::lin_string_from_bytes("even".as_ptr(), 4);
+            let odd = crate::string::lin_string_from_bytes("odd".as_ptr(), 3);
+
+            for i in 0..100i64 {
+                let key = if i % 2 == 0 { even } else { odd };
+                let key_box = alloc_tagged(TAG_STR, key as u64);
+                let group_box = lin_object_get_or_insert_array(
+                    map_box as *const u8, key_box as *const u8,
+                );
+                let group = (*(group_box as *const TaggedVal)).payload as *mut crate::array::LinArray;
+                let item = alloc_tagged(TAG_INT32, i as u64);
+                crate::array::lin_push_dyn(group, item as *const TaggedVal);
+                lin_tagged_release(item as *mut u8);
+                lin_tagged_release(group_box);
+                crate::tagged::lin_tagged_free_box(key_box);
+            }
+
+            let g_even = lin_map_get(map, even);
+            let g_odd = lin_map_get(map, odd);
+            assert!(!g_even.is_null() && (*g_even).tag == TAG_ARRAY);
+            assert!(!g_odd.is_null() && (*g_odd).tag == TAG_ARRAY);
+            let ea = (*g_even).payload as *const crate::array::LinArray;
+            let oa = (*g_odd).payload as *const crate::array::LinArray;
+            assert_eq!(lin_array_length(ea), 50);
+            assert_eq!(lin_array_length(oa), 50);
+            let first_even = lin_array_get_tagged(ea, 0);
+            assert_eq!((*first_even).payload as i32, 0);
+            std::alloc::dealloc(first_even as *mut u8, std::alloc::Layout::new::<TaggedVal>());
+
+            lin_map_release(map);
+            crate::tagged::lin_tagged_free_box(map_box);
             crate::string::lin_string_release(even);
             crate::string::lin_string_release(odd);
         }

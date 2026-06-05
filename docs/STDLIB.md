@@ -111,8 +111,8 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`at`](#at-array) | `<T>(T[], Int32) -> T \| Null` | Element at index, or `null` if out of bounds; negative indices count from end |
 | [`chunk`](#chunk) | `<T>(T[], Int32) -> T[][]` | Split into n-sized sub-arrays |
 | [`compact`](#compact) | `(Json[]) -> Json[]` | Remove null elements |
-| [`countBy`](#countBy) | `(Json[], (Json) -> String) -> { ...Int32 }` | Frequency map by key function |
-| [`groupBy`](#groupBy) | `(Json[], (Json) -> String) -> { ...Json[] }` | Group into object of arrays by key function |
+| [`countBy`](#countBy) | `<T>(T[], (T) -> String) -> { String: Int32 }` | Frequency map by key function |
+| [`groupBy`](#groupBy) | `<T>(T[], (T) -> String) -> { String: T[] }` | Group into a typed map of arrays by key function |
 | [`indexOf`](#indexOf-array) | `<T>(T[], T, Int32 = 0) -> Int32` | First index of value at/after `fromIndex` (negatives count from end), or -1 |
 | [`length`](#length-array) | `(Json) -> Int32` | Length of array, string, or object |
 | [`max`](#max-array) | `(Number[]) -> Number` | Maximum element |
@@ -192,15 +192,15 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 
 | Function | Signature | Summary |
 | --- | --- | --- |
-| [`entries`](#entries) | `(Json) -> [String, Json][]` | Array of `[key, value]` pairs |
+| [`entries`](#entries) | `(Json) -> [String, Json][]` | Array of `[key, value]` pairs (tag-aware: object or typed map) |
 | [`fromEntries`](#fromEntries) | `([String, Json][]) -> {}` | Build an object from key-value pairs |
 | [`isEmpty`](#isEmpty) | `(Json) -> Boolean` | True if object, array, or string is empty |
-| [`keys`](#keys) | `(Json) -> String[]` | Array of object keys |
-| [`mapValues`](#mapValues) | `({}, (Json) -> Json) -> {}` | Transform all values, keeping keys |
-| [`merge`](#merge) | `({}, {}) -> {}` | Shallow-merge two objects (right wins on conflict) |
-| [`omit`](#omit) | `({}, String[]) -> {}` | Return object without specified keys |
-| [`pick`](#pick) | `({}, String[]) -> {}` | Return object with only specified keys |
-| [`values`](#values) | `(Json) -> Json[]` | Array of object values |
+| [`keys`](#keys) | `(Json) -> String[]` | Array of object keys (tag-aware: object or typed map) |
+| [`mapValues`](#mapValues) | `<V,W>({ String: V }, (V) -> W) -> { String: W }` | Transform all values, keeping keys |
+| [`merge`](#merge) | `<T>({ String: T }, { String: T }) -> { String: T }` | Shallow-merge two typed maps (right wins on conflict) |
+| [`omit`](#omit) | `<T>({ String: T }, String[]) -> { String: T }` | Return typed map without specified keys |
+| [`pick`](#pick) | `<T>({ String: T }, String[]) -> { String: T }` | Return typed map with only specified keys |
+| [`values`](#values) | `(Json) -> Json[]` | Array of object values (tag-aware: object or typed map) |
 
 **std/yaml**
 
@@ -1341,10 +1341,10 @@ compact([1, 2, 3])               // [1, 2, 3]
 ### countBy
 
 ```txt
-val countBy: (arr: Json[], f: (Json) -> String) -> { ...Int32 }
+val countBy: <T>(arr: T[], f: (T) -> String) -> { String: Int32 }
 ```
 
-Returns an object mapping each distinct key (produced by `f`) to the number of elements that produced that key.
+Returns a typed map (`{ String: Int32 }`, ADR-082) from each distinct key (produced by `f`) to the number of elements that produced that key.
 
 ```txt
 ["apple", "banana", "avocado", "blueberry"].countBy(s => s.at(0))
@@ -1359,10 +1359,10 @@ Returns an object mapping each distinct key (produced by `f`) to the number of e
 ### groupBy
 
 ```txt
-val groupBy: (arr: Json[], f: (Json) -> String) -> { ...Json[] }
+val groupBy: <T>(arr: T[], f: (T) -> String) -> { String: T[] }
 ```
 
-Returns an object where each key is a value returned by `f`, and the corresponding value is an array of all elements that produced that key. Insertion order of keys follows first occurrence.
+Returns a typed map (`{ String: T[] }`, ADR-082) where each key is a value returned by `f`, and the corresponding value is an array of all elements that produced that key. Within each group, elements keep their encounter order. The map's keys are in **hash order** (the typed-map backing is hashed, not insertion-ordered).
 
 ```txt
 ["one", "two", "three", "four"].groupBy(s => toString(length(s)))
@@ -2341,12 +2341,23 @@ Import:
 import { keys, values, entries, fromEntries, merge, pick, omit, mapValues, isEmpty } from "std/object"
 ```
 
-> **Typed maps (`{ String: T }`).** `keys`, `values`, `entries`, `length`, and `isEmpty` are
-> tag-aware: they work on BOTH a plain `Json`/`{}` record AND a typed index-signature map
-> `{ String: T }` (the dictionary type, ADR-082, backed by a hashed O(1) container — see
-> Specification §5.1.1). A typed map also supports the built-in `m[k]` (yields `T | Null`) and
-> `m[k] = v` directly. Note that over a map, `keys`/`values`/`entries` are in **hash order**, not
-> insertion order.
+> **Typed maps (`{ String: T }`).** Two groups of `std/object` ops relate to the typed
+> index-signature map (the dictionary type, ADR-082, backed by a hashed O(1) container — see
+> Specification §5.1.1):
+>
+> - **Tag-aware introspection** — `keys`, `values`, `entries`, `length`, and `isEmpty` keep a `Json`
+>   parameter and work on BOTH a plain `Json`/`{}` record AND a typed map (the runtime dispatches on
+>   the value's tag). This is deliberate: they are the way to introspect *any* object, and a genuine
+>   `Json` value must be able to flow in. Over a typed map their results are in **hash order**, not
+>   insertion order; over a plain `{}` record they preserve insertion order.
+> - **Typed map producers** — `merge`, `pick`, `omit`, `mapValues` are generic over `{ String: T }`
+>   and *return* a typed map, so the element type flows through statically. They accept a typed map
+>   (not a plain `Json` record — there is no implicit `Json -> { String: T }` coercion, §5.1.1; pass
+>   a value annotated `{ String: T }`).
+>
+> A typed map also supports the built-in `m[k]` (yields `T | Null`) and `m[k] = v` directly.
+> `fromEntries` keeps a `Json` signature pending a compiler fix (a type parameter nested in a
+> `[String, T][]` argument is not yet inferable).
 
 ---
 
@@ -2356,7 +2367,7 @@ import { keys, values, entries, fromEntries, merge, pick, omit, mapValues, isEmp
 val entries: (obj: Json) -> [String, Json][]
 ```
 
-Returns an array of `[key, value]` pairs in insertion order.
+Returns an array of `[key, value]` pairs. Tag-aware: works on a plain `{}`/`Json` record (insertion order) or a typed `{ String: T }` map (hash order).
 
 ```txt
 entries({ "a": 1, "b": 2 })   // [["a", 1], ["b", 2]]
@@ -2405,7 +2416,7 @@ isEmpty("hi")        // false
 val keys: (obj: Json) -> String[]
 ```
 
-Returns an array of the object's keys in insertion order.
+Returns an array of the object's keys. Tag-aware: works on a plain `{}`/`Json` record (insertion order) or a typed `{ String: T }` map (hash order).
 
 ```txt
 keys({ "a": 1, "b": 2 })   // ["a", "b"]
@@ -2416,14 +2427,15 @@ keys({ "a": 1, "b": 2 })   // ["a", "b"]
 ### mapValues
 
 ```txt
-val mapValues: (obj: {}, f: (Json) -> Json) -> {}
+val mapValues: <V, W>(obj: { String: V }, f: (V) -> W) -> { String: W }
 ```
 
-Returns a new object with the same keys as `obj` but with each value transformed by `f`. Key order is preserved.
+Returns a new typed map with the same keys as `obj` but with each value transformed by `f` from `V` to `W`. `obj` must be a typed map `{ String: V }` (annotate it, or build it with `m[k] = v`).
 
 ```txt
-mapValues({ "a": 1, "b": 2 }, v => v * 10)   // { "a": 10, "b": 20 }
-mapValues({ "x": "hello" }, s => toUpper(s))  // { "x": "HELLO" }
+val m: { String: Int32 } = { "a": 1, "b": 2 }
+m.mapValues(v => v * 10)         // { "a": 10, "b": 20 } : { String: Int32 }
+m.mapValues(v => "v${v}")        // { "a": "v1", "b": "v2" } : { String: String }
 ```
 
 ---
@@ -2431,14 +2443,15 @@ mapValues({ "x": "hello" }, s => toUpper(s))  // { "x": "HELLO" }
 ### merge
 
 ```txt
-val merge: (a: {}, b: {}) -> {}
+val merge: <T>(a: { String: T }, b: { String: T }) -> { String: T }
 ```
 
-Returns a new object containing all keys from `a` and `b`. If both objects have the same key, the value from `b` is used. Key order follows `a`'s keys first (preserving insertion order), then any new keys from `b`.
+Returns a new typed map containing all keys from `a` and `b`. If both maps have the same key, the value from `b` is used. Both arguments must be typed maps `{ String: T }`. (Keys are in hash order, as for any typed map.)
 
 ```txt
-merge({ "a": 1, "b": 2 }, { "b": 99, "c": 3 })   // { "a": 1, "b": 99, "c": 3 }
-merge({}, { "x": 1 })                               // { "x": 1 }
+val a: { String: Int32 } = { "a": 1, "b": 2 }
+val b: { String: Int32 } = { "b": 99, "c": 3 }
+a.merge(b)   // { "a": 1, "b": 99, "c": 3 }
 ```
 
 ---
@@ -2446,14 +2459,15 @@ merge({}, { "x": 1 })                               // { "x": 1 }
 ### omit
 
 ```txt
-val omit: (obj: {}, keys: String[]) -> {}
+val omit: <T>(obj: { String: T }, keys: String[]) -> { String: T }
 ```
 
-Returns a new object with all keys from `obj` except those listed in `keys`. Keys not present in `obj` are silently ignored.
+Returns a new typed map with all keys from `obj` except those listed in `keys`. Keys not present in `obj` are silently ignored. `obj` must be a typed map `{ String: T }`.
 
 ```txt
-omit({ "a": 1, "b": 2, "c": 3 }, ["b"])        // { "a": 1, "c": 3 }
-omit({ "a": 1, "b": 2 }, ["a", "b", "x"])       // {}
+val m: { String: Int32 } = { "a": 1, "b": 2, "c": 3 }
+m.omit(["b"])             // { "a": 1, "c": 3 }
+m.omit(["a", "b", "x"])    // { "c": 3 }
 ```
 
 ---
@@ -2461,14 +2475,15 @@ omit({ "a": 1, "b": 2 }, ["a", "b", "x"])       // {}
 ### pick
 
 ```txt
-val pick: (obj: {}, keys: String[]) -> {}
+val pick: <T>(obj: { String: T }, keys: String[]) -> { String: T }
 ```
 
-Returns a new object containing only the keys listed in `keys`. Keys not present in `obj` are omitted from the result.
+Returns a new typed map containing only the keys listed in `keys`. Keys not present in `obj` are omitted from the result. `obj` must be a typed map `{ String: T }`.
 
 ```txt
-pick({ "a": 1, "b": 2, "c": 3 }, ["a", "c"])   // { "a": 1, "c": 3 }
-pick({ "a": 1 }, ["a", "x"])                     // { "a": 1 }
+val m: { String: Int32 } = { "a": 1, "b": 2, "c": 3 }
+m.pick(["a", "c"])   // { "a": 1, "c": 3 }
+m.pick(["a", "x"])   // { "a": 1 }
 ```
 
 ---
@@ -2479,7 +2494,7 @@ pick({ "a": 1 }, ["a", "x"])                     // { "a": 1 }
 val values: (obj: Json) -> Json[]
 ```
 
-Returns an array of the object's values in insertion order.
+Returns an array of the object's values. Tag-aware: works on a plain `{}`/`Json` record (insertion order) or a typed `{ String: T }` map (hash order; the values are the map's `T` elements).
 
 ```txt
 values({ "a": 1, "b": 2 })   // [1, 2]
