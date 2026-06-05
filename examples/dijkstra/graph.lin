@@ -17,7 +17,7 @@ export val buildAdj = (edges: Edge[]): Json =>
     val src = edge["from"]
     val existing = adj[src]
     if existing == null then
-      lin_object_set(adj, src, [{ "to": edge["to"], "weight": edge["weight"] }])
+      adj[src] = [{ "to": edge["to"], "weight": edge["weight"] }]
     else
       push(existing, { "to": edge["to"], "weight": edge["weight"] })
   )
