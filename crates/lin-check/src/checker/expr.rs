@@ -4,6 +4,7 @@ use lin_parse::ast::{Expr, MatchArm, ObjectField, Stmt, StringPart};
 
 use super::Checker;
 use super::helpers::{check_int_literal_fits, default_int_literal_type, suffix_to_type, unify_types};
+use crate::resolve::resolve_type;
 use crate::typed_ir::*;
 use crate::types::Type;
 
@@ -473,20 +474,21 @@ impl Checker {
         Ok(TypedExpr::Index { object: Box::new(typed_obj), key: Box::new(typed_key), result_type, span })
     }
 
-    /// Flow-narrowing for `T | Null` (ADR-082 follow-up): inspect an `if`/`else` condition and,
-    /// when it is a null-test on a simple identifier, narrow that binding to its non-Null
-    /// complement (`T | Null` minus `Null`) in the branch where Null is EXCLUDED.
+    /// Flow-narrowing for an `if`/`else` condition: when it is a type/null test on a simple
+    /// identifier whose static type is a union, narrow that binding to the COMPLEMENT (`union minus
+    /// X`) in the branch where `X` is EXCLUDED. Generalizes the old null-only form to any `is X`
+    /// test (incl. the structural `Error` member).
     ///
     /// Returns `Some((name, narrowed_ty, narrow_in_then))`:
-    ///   - `v == null` / `v is Null`  → Null excluded in the ELSE branch (`narrow_in_then = false`)
-    ///   - `v != null`                → Null excluded in the THEN branch (`narrow_in_then = true`)
+    ///   - `v == null` / `v is X`  → `X` excluded in the ELSE branch (`narrow_in_then = false`)
+    ///   - `v != null`             → `Null` excluded in the THEN branch (`narrow_in_then = true`)
     ///
-    /// Only fires when the binding's static type is a union that actually contains `Null` (so the
-    /// complement is well-defined and non-empty). Composes with — and does not replace — the
-    /// existing `match`/`is` narrowing (this is purely about the null-test guard form).
+    /// Only fires when the binding's static type is a union that contains the tested type as an
+    /// exact member (so the complement is well-defined and non-empty — see `without_variant`).
+    /// Composes with — and does not replace — the existing `match`/`is` narrowing.
     fn null_test_narrowing(&self, condition: &Expr) -> Option<(String, Type, bool)> {
         // `x == null` / `x != null` against the `null` literal (either operand order).
-        let (name, narrow_in_then) = match condition {
+        let (name, excluded, narrow_in_then) = match condition {
             Expr::BinaryOp { left, op, right, .. }
                 if matches!(op, lin_parse::ast::BinOp::Eq | lin_parse::ast::BinOp::NotEq) =>
             {
@@ -498,32 +500,41 @@ impl Checker {
                 // `== null`: Null holds in THEN, excluded in ELSE → narrow in ELSE.
                 // `!= null`: Null excluded in THEN → narrow in THEN.
                 let narrow_in_then = matches!(op, lin_parse::ast::BinOp::NotEq);
-                (ident.clone(), narrow_in_then)
+                (ident.clone(), Type::Null, narrow_in_then)
             }
-            // `x is Null`: Null holds in THEN, excluded in ELSE → narrow in ELSE.
+            // `x is X`: `X` holds in THEN, excluded in ELSE → narrow in ELSE. `X` may be `Null`,
+            // a scalar (`Int32`), a named/structural type, or `Error` (the structural alias).
             Expr::Is { expr, pattern, .. } => {
                 let ident = match expr.as_ref() {
                     Expr::Ident(n, _) => n,
                     _ => return None,
                 };
-                if !matches!(pattern.as_ref(), lin_parse::ast::Pattern::TypeName(t, _) if t == "Null") {
-                    return None;
-                }
-                (ident.clone(), false)
+                let excluded = match pattern.as_ref() {
+                    lin_parse::ast::Pattern::TypeName(name, span) => resolve_type(
+                        &lin_parse::ast::TypeExpr::Named(name.clone(), *span),
+                        &self.env,
+                    )
+                    .ok()?,
+                    lin_parse::ast::Pattern::Literal(e) if matches!(e.as_ref(), Expr::NullLit(_)) => {
+                        Type::Null
+                    }
+                    _ => return None,
+                };
+                (ident.clone(), excluded, false)
             }
             _ => return None,
         };
         let info = self.env.lookup(&name)?;
-        let narrowed = info.ty.without_null()?;
+        let narrowed = info.ty.without_variant(&excluded)?;
         Some((name, narrowed, narrow_in_then))
     }
 
-    /// Apply a null-test narrowing (from `null_test_narrowing`) within the CURRENT scope if it
-    /// targets the branch being entered. `entering_then` says which branch we are about to check;
-    /// the narrowing's third element says which branch excludes Null. Reuses the original slot via
-    /// `define_narrowed` so `LocalGet` reads the same TaggedVal pointer (the value is bit-identical
-    /// — only the static type tightens). Must be called immediately after `push_scope` for the
-    /// branch and undone by the matching `pop_scope`.
+    /// Apply a flow-narrowing (from `null_test_narrowing`) within the CURRENT scope if it targets
+    /// the branch being entered. `entering_then` says which branch we are about to check; the
+    /// narrowing's third element says which branch excludes the tested type. Reuses the original
+    /// slot via `define_narrowed` so `LocalGet` reads the same TaggedVal pointer (the value is
+    /// bit-identical — only the static type tightens). Must be called immediately after
+    /// `push_scope` for the branch and undone by the matching `pop_scope`.
     fn apply_null_narrowing(&mut self, narrowing: &Option<(String, Type, bool)>, entering_then: bool) {
         if let Some((name, narrowed_ty, narrow_in_then)) = narrowing {
             if *narrow_in_then == entering_then {
@@ -579,7 +590,31 @@ impl Checker {
         // and the value branch was replaced by `null` at runtime (`at` returning null on a valid
         // index). When exactly one branch is `Null` and the other is not, form the union so both
         // branches survive (and survive monomorphization substitution of any generic `T`).
-        let result_type = if (then_ty == Type::Null) != (else_ty == Type::Null) {
+        // Two DISTINCT quantified-generic type parameters (e.g. `T` and `D` in
+        // `<T, D>(…): T | D`, ids ≥ 9000 and ≠ the Json wildcard) must NOT be collapsed onto each
+        // other by the `types_compatible` arms below. An unconstrained TypeVar unifies with
+        // anything, so `types_compatible(T, D)` is vacuously true and would pick ONE of them —
+        // silently dropping the other arm's type. For an `if … then arr[i] /*: T*/ else default
+        // /*: D*/` body that erases the union to a single param, so after monomorphization the two
+        // arms (a flat-scalar element vs a boxed default) disagree on representation and codegen
+        // emits a malformed phi. Keep them as an honest `T | D` union so both arms survive
+        // substitution and each gets boxed into the union representation. Same-id (`T | T`) still
+        // collapses via the normal path; a generic-vs-concrete pairing also keeps its existing
+        // behaviour (only BOTH being distinct quantified params triggers this).
+        // Quantified-generic TypeVar ids are minted ≥ 9001 (`Checker::next_generic_tv`), above the
+        // intrinsic-slot range; the Json wildcard is `u32::MAX`. A bound type PARAMETER therefore
+        // lives in `[GENERIC_TV_BASE, u32::MAX)`.
+        const GENERIC_TV_BASE: u32 = 9000;
+        let distinct_generic_params = matches!(
+            (&then_ty, &else_ty),
+            (Type::TypeVar(a), Type::TypeVar(b))
+                if a != b
+                    && *a >= GENERIC_TV_BASE && *a != u32::MAX
+                    && *b >= GENERIC_TV_BASE && *b != u32::MAX
+        );
+        let result_type = if distinct_generic_params {
+            Type::flatten_union(vec![then_ty, else_ty])
+        } else if (then_ty == Type::Null) != (else_ty == Type::Null) {
             // Exactly one branch is the literal Null type. Keep both as a union so the
             // value-producing branch survives — UNLESS the other branch is `Json` (the dynamic
             // top type, `TypeVar(u32::MAX)`), which already subsumes `Null`: there `Json | Null`
@@ -647,25 +682,55 @@ impl Checker {
         }
     }
 
-    /// True when the Null case has been excluded by some arm STRICTLY BEFORE index `idx` — i.e.
-    /// there is an `is Null` (or `is null` literal) arm at a lower index. Match arms are tried
-    /// top-to-bottom, so any arm reached after the Null arm operates on a value that is not Null;
-    /// it is therefore sound to narrow `T | Null` to `T` for those later arms. Conservative: only
-    /// a bare `is Null` / `is null`-literal arm (with no guard) counts as a definite exclusion.
-    fn null_excluded_before(arms: &[MatchArm], idx: usize) -> bool {
-        arms[..idx].iter().any(|a| a.guard.is_none() && Self::is_null_arm(a))
+    /// Compute the COMPLEMENT narrowing for the arm at `idx`: the scrutinee type with every type
+    /// definitely excluded by a guard-free `is`-arm STRICTLY BEFORE `idx` subtracted from it.
+    /// Match arms are tried top-to-bottom, so any arm reached after a guard-free `is X` arm
+    /// operates on a value that is not an `X`; subtracting each such `X` from the union is sound.
+    ///
+    /// Generalizes the old `null_excluded_before`/`without_null` pairing: `is Null` excludes
+    /// `Null` (`T | Null` → `T`), `is Error` excludes the structural `Error` member
+    /// (`String | Error` → `String`), `is Int32` excludes `Int32` from a numeric/mixed union,
+    /// etc. Returns `None` when nothing was excluded or the subtraction is not well-defined (the
+    /// excluded type is not an exact union member) — in that case the arm sees the unnarrowed
+    /// scrutinee type rather than an unsound guess (see `Type::without_variant`).
+    fn complement_narrowing(&self, scrutinee_ty: &Type, arms: &[MatchArm], idx: usize) -> Option<Type> {
+        let mut narrowed: Option<Type> = None;
+        for arm in &arms[..idx] {
+            if arm.guard.is_some() {
+                continue;
+            }
+            let Some(excluded) = self.arm_excluded_type(arm) else { continue };
+            let base = narrowed.as_ref().unwrap_or(scrutinee_ty);
+            if let Some(next) = base.without_variant(&excluded) {
+                narrowed = Some(next);
+            }
+        }
+        narrowed
     }
 
-    /// True when a match arm matches exactly the Null case: `is Null` or `is null` (literal).
-    fn is_null_arm(arm: &MatchArm) -> bool {
-        if let lin_parse::ast::MatchPattern::Is(pat) = &arm.pattern {
-            match pat {
-                lin_parse::ast::Pattern::TypeName(name, _) => name == "Null",
-                lin_parse::ast::Pattern::Literal(e) => matches!(e.as_ref(), Expr::NullLit(_)),
-                _ => false,
+    /// The `Type` an `is`-arm definitely tests for (so a later arm can subtract it from the
+    /// scrutinee union). Returns `None` for non-`is` arms, `is` arms whose pattern is not a plain
+    /// type/`null`-literal check (bindings, destructuring object/array patterns, etc.), and types
+    /// that fail to resolve. `is Null`/`is null` → `Null`; `is Error` → the structural Error alias
+    /// `{ "type": String, "message": String }` (so it subtracts the union's Error member);
+    /// `is Int32` / `is <Name>` → the resolved named/scalar type. Soundness for the resolved type
+    /// is delegated to `without_variant`, which only subtracts an exactly-matching union member.
+    fn arm_excluded_type(&self, arm: &MatchArm) -> Option<Type> {
+        let lin_parse::ast::MatchPattern::Is(pat) = &arm.pattern else { return None };
+        match pat {
+            lin_parse::ast::Pattern::Literal(e) if matches!(e.as_ref(), Expr::NullLit(_)) => {
+                Some(Type::Null)
             }
-        } else {
-            false
+            lin_parse::ast::Pattern::TypeName(name, span) => {
+                // `is Error` resolves to the structural Error alias; resolving "Error" via the
+                // env yields exactly `error_type()`, which is the union member to subtract.
+                resolve_type(
+                    &lin_parse::ast::TypeExpr::Named(name.clone(), *span),
+                    &self.env,
+                )
+                .ok()
+            }
+            _ => None,
         }
     }
 
@@ -686,13 +751,14 @@ impl Checker {
         };
         let mut typed_arms = Vec::new();
         let mut arm_types = Vec::new();
-        // Flow-narrow `T | Null` across arms: once a preceding `is Null` arm has handled the Null
-        // case, every subsequent non-Null arm (notably `else`) sees the scrutinee narrowed to the
-        // non-Null complement (`T | Null` minus `Null`). See `null_excluded_before`.
-        let null_complement = scrutinee_ty.without_null();
+        // Flow-narrow the scrutinee union across arms: once a preceding guard-free `is X` arm has
+        // handled (and thus excluded) the `X` case, every subsequent arm (notably `else`) sees the
+        // scrutinee narrowed to the complement (`union minus X`). Generalizes the old Null-only
+        // narrowing to any `is` test, incl. the structural `Error` member. See
+        // `complement_narrowing`.
         for (i, arm) in arms.iter().enumerate() {
-            let narrow_to = if Self::null_excluded_before(arms, i) { null_complement.as_ref() } else { None };
-            let typed_arm = self.check_match_arm_against(arm, &scrutinee_ty, scrutinee_name, expected, narrow_to)?;
+            let narrowed = self.complement_narrowing(&scrutinee_ty, arms, i);
+            let typed_arm = self.check_match_arm_against(arm, &scrutinee_ty, scrutinee_name, expected, narrowed.as_ref())?;
             arm_types.push(typed_arm.body.ty());
             typed_arms.push(typed_arm);
         }
@@ -723,13 +789,12 @@ impl Checker {
         // if it was consumed in ANY arm (conservative). Mirrors `infer_if`.
         let consumed_before_arms = self.consumed_streams.clone();
         let mut consumed_union = consumed_before_arms.clone();
-        // See `check_match`: narrow the scrutinee to its non-Null complement in arms reached after
-        // a preceding `is Null` arm has excluded the Null case.
-        let null_complement = scrutinee_ty.without_null();
+        // See `check_match`: narrow the scrutinee to the complement of every preceding guard-free
+        // `is X` arm (the `X` cases are already handled) in arms reached after them.
         for (i, arm) in arms.iter().enumerate() {
             self.consumed_streams = consumed_before_arms.clone();
-            let narrow_to = if Self::null_excluded_before(arms, i) { null_complement.as_ref() } else { None };
-            let typed_arm = self.check_match_arm(arm, &scrutinee_ty, scrutinee_name, narrow_to)?;
+            let narrowed = self.complement_narrowing(&scrutinee_ty, arms, i);
+            let typed_arm = self.check_match_arm(arm, &scrutinee_ty, scrutinee_name, narrowed.as_ref())?;
             consumed_union.extend(self.consumed_streams.iter().copied());
             arm_types.push(typed_arm.body.ty());
             typed_arms.push(typed_arm);

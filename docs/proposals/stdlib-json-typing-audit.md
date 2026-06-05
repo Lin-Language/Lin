@@ -174,3 +174,109 @@ representation changes; flag any change against that header comment.
   lookup complexity, which is already fixed.
 - Unions, generics, `Error`, and `is`/`has` all already exist — Categories 1 and 3 need **no new
   language feature**, only applying what's there. Only Category 2 waits on `{ String: T }`.
+
+---
+
+## Pass 3 — fresh audit after the narrowing/index-signature features landed (2026-06)
+
+Three language features have since landed that re-open some previously-blocked tightenings:
+(a) `{ String: T }` index-signature maps (ADR-082); (b) `T | Null` **complement narrowing** —
+`if x == null then … else x` narrows `x` to `T` in the `else` branch, and a `match` arm reached
+after an `is Null` arm sees the non-Null complement; (c) `is T` on a monomorphized generic type
+parameter works at runtime.
+
+This pass re-audited **every** `stdlib/*.lin` (full sweep, not just the headline modules). The new
+verdicts below are exhaustive for the modules not already covered by Categories 1–5; modules already
+classified above are only revisited where a verdict changed.
+
+### Newly FIXED this pass (clear, sound, no new feature needed)
+
+Each was already documented in `docs/STDLIB.md` / `docs-site` with the narrower type — the *impl* was
+lagging. The runtime intrinsic in each case already returns a value matching the narrower type
+(verified against `crates/lin-runtime/src`). No doc edits were needed (docs were ahead).
+
+```
+number.tryParseInt32   = (s: String): Json          →  (s: String): Int32 | Null      FIXED
+number.tryParseFloat64 = (s: String): Json          →  (s: String): Float64 | Null    FIXED
+time.fromIso           = (s: String): Json          →  (s: String): Int64 | Error      FIXED
+time.parse             = (s, pattern): Json          →  (s, pattern): Int64 | Error     FIXED
+tty.rawMode            = (on: Boolean): Json         →  (on: Boolean): Null | Error     FIXED
+tty.readKey            = (): Json                    →  (): Int32 | Null                FIXED
+env.getEnv             = (name: String): Json        →  (name: String): String | Null  FIXED
+```
+
+- `number.tryParse*`: the body is `if lin_is_int32(s) then lin_parse_int32(s)` — an `if … then` with
+  no `else` is `T | Null`, and `lin_parse_int32` returns a raw `Int32`. Only callers were the stdlib
+  defs themselves; zero external ripple.
+- `time.fromIso`/`parse`: `lin_time_from_iso`/`lin_time_parse` return `lin_box_int64(ms)` on success
+  and `make_error_tagged(..)` on failure → exactly `Int64 | Error`, the canonical `{type:error,message}`
+  discriminated by `is Error`. No external callers.
+- `tty.rawMode`/`readKey`: `lin_tty_raw_mode` returns null-ptr (Null) or `make_error_tagged` →
+  `Null | Error`; `lin_tty_read_key` returns `lin_box_int32(byte)` or null-ptr → `Int32 | Null`.
+  **Ripple**: `examples/raspberry-controller/main.lin` fed `readKey()` straight into a
+  `nextPair(key: Int32)` helper. Fixed by widening `nextPair` to `(key: Int32 | Null)` and reordering
+  its branches so the `key == null` test comes first (the `else` then narrows `key` to `Int32` for the
+  `applyKey` call — feature (b)). `rawMode`'s result is discarded at every call site, so its
+  tightening is invisible to callers.
+- `env.getEnv`: `lin_env_get` returns a `TaggedVal*(Str)` or null-ptr → `String | Null`. All three
+  call sites (`stdlib/test.lin` ×2, `docs-site/builder/main.lin`) already use the
+  `if x == null then … else <use x as String>` shape, which now narrows cleanly via feature (b). No
+  call-site edits needed.
+
+### Re-typed but REVERTED this pass — needs Error-complement narrowing (follow-up)
+
+```
+template.renderWith = (template, data): Json   →  …: String | Error   REVERTED (left Json)
+template.render     = (path, data): Json       →  …: String | Error   REVERTED (left Json)
+```
+
+`lin_template_render`/`_path` genuinely return `String | Error`, so the *type* is right. But unlike
+the Null case, **complement narrowing does not extend to a non-Null union member**: the match-arm
+narrowing in `lin-check` is Null-only (`check_match`: `null_complement = scrutinee_ty.without_null()`,
+gated on a preceding `is Null` arm via `null_excluded_before`). So after
+`match r is Error => … else => …`, the `else` arm still sees `r : String | Error`, NOT `String`. Every
+real consumer wants a bare `String`: `docs-site/builder/main.lin` passes the rendered value to
+`writeFile(content: String)`, and `examples/web-server/handlers.lin` to `text(200, html)` — both
+**fail to type-check** once the union can't be narrowed away. Verified concretely:
+`Argument 2 has type String | { "type": String, "message": String }, expected String`. Tightening
+template therefore needs **general union (Error) complement narrowing** — an unlanded feature — so it
+is left `Json` (matching the conservative "note for follow-up rather than force" guidance). Re-type
+both once `else`-arm narrowing after `is Error` (or `!is Error`) lands.
+
+### Audited and LEFT as `Json` / `Function` (with reason) — the rest of the sweep
+
+- `string.toString = (x: Json): String` — Category 5 "any printable value" sink, exactly like
+  `io.print`. Genuinely polymorphic display; `lin_to_string` dispatches on the runtime tag. KEEP.
+- `array._mapJ` / `array._filterJ` `(arr: Json, f: Function)` — **not exported** (private `val`,
+  no `export`). Deliberately on the boxed-`Json` intrinsic path to avoid the cross-module generic
+  RC double-release noted in ADR-069 (see the file comment). Not user-visible. KEEP.
+- `async.withLock = (s: Shared, f: Function): Json` — `Shared` is an opaque handle and the async
+  file header (and the Category-special note above) forbids `T | Error`-style typing of these; `f`'s
+  return relationship to the `Shared`'s element type is not expressible without a `Shared<T>` surface
+  type, which does not exist. KEEP (handle constraint, not laxity).
+- `test.lin` (`expect`/`toBe`/`toSatisfy(pred: Function)`/`suite`/`run`/…) — the test framework is
+  intentionally dynamic end-to-end (`expect(value: Json)`); `toSatisfy`'s `pred: Function` is
+  consistent with that and tightening one param of a uniformly-`Json` module buys nothing. KEEP.
+- `env.environ = (): Json` — a map of ALL env vars; same `Json → { String: String }` map-producer
+  unsoundness as the kept `object.keys`/`values` (trusted widening would relabel without converting
+  representation). KEEP until the widening rejects/realises `Json → { String: T }`.
+- `iter.*` loose sigs (`for`/`concat`/`flatMap`/`iter`/`iterOf`/`rangeStep`) — Category 1 territory
+  (element-generic collection ops); owned by the std/iter unification work, several deliberately
+  `Json` for the lazy-`Stream` dispatch. Out of scope here. CLASSIFY-ONLY.
+- `array.{at,atOr,get-adjacent}` and `object` map-producers — **explicitly out of scope** for this
+  pass (a concurrent agent is reworking `at`/`atOr`/`get` and the object map-producers). Not touched.
+- Categories 3 (fs/process/net/http result-or-Error unions), 4 (json/yaml/jq/readJson dynamic), and
+  5 (numeric sinks) — unchanged from the classification above. The fs/net/process/http `… | Error`
+  re-types remain the largest open Category-3 item; they were left for the dedicated Category-3 pass
+  (each cascades into record definitions and, for http, the headers map). Note that they will hit the
+  SAME Error-complement-narrowing wall the template case exposed wherever a caller wants the bare
+  success payload — so that narrowing feature is now a shared prerequisite for the bulk of Category 3,
+  not just template.
+
+### Net result of pass 3
+
+7 signatures tightened (`number` ×2, `time` ×2, `tty` ×2, `env` ×1); 1 example restructured
+(`raspberry-controller`); template deferred to the Error-complement-narrowing follow-up; everything
+else audited and deliberately left with a recorded reason. `docs/STDLIB.md` and the `docs-site`
+stdlib pages already matched the tightened signatures (impl was the lagging side), so no doc text
+changed for the fixed functions.

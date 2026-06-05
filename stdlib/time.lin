@@ -20,10 +20,11 @@ export val toIso = (ms: Int64): String => lin_time_to_iso(ms)
 export val format = (ms: Int64, pattern: String): String =>
   lin_time_format(ms, pattern)
 
-// Parse an ISO 8601 date/datetime to a Unix ms timestamp, or an Error.
-export val fromIso = (s: String): Json =>
+// Parse an ISO 8601 date/datetime to a Unix ms timestamp, or an Error. The failure
+// arm is the standard `{type:error,message}` value, discriminated with `is Error`.
+export val fromIso = (s: String): Int64 | Error =>
   lin_time_from_iso(s)
 
 // Parse a date string with a strftime-style pattern to a Unix ms timestamp (UTC), or an Error.
-export val parse = (s: String, pattern: String): Json =>
+export val parse = (s: String, pattern: String): Int64 | Error =>
   lin_time_parse(s, pattern)

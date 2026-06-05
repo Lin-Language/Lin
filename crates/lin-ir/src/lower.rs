@@ -5610,6 +5610,38 @@ fn register_default_adapters(
         ret: Box::new(ret_type.clone()),
         required,
     };
+    // A monomorphized spec of a generic optional-default function can be REPRESENTATIONALLY
+    // INVALID to default-fill: `at = <T, D>(…, default: D = null)` instantiated at `D = Int32`
+    // (the SUPPLIED-arg call `at(ints, i, 0)`) yields a spec whose `default` param is `Int32`,
+    // but its default VALUE is `null` (type `Null`, a boxed `ptr`). An adapter that binds the
+    // `Int32` param to `null` emits an `i32`-param call passed a `ptr` — an LLVM ABI mismatch.
+    // Such an adapter is also DEAD: an OMITTED-arg call binds `D` from the default's type (`Null`),
+    // monomorphizing to the DISTINCT `at$…_Null` spec (whose default param IS `Null`-typed and
+    // whose adapter is well-formed), never to the concrete-`D` spec. So when ANY defaultable param's
+    // monomorphized type cannot hold its default value's representation, we skip the descriptor for
+    // this spec entirely: only fully-supplied DIRECT calls reach it, and those need no adapter (no
+    // under-arity indirect call to this spec value can occur). Non-generic optional params (e.g.
+    // `pad: String = " "`) are unaffected — the default's type matches the param representation.
+    // A default whose VALUE type cannot inhabit the (monomorphized) PARAM type. The canonical
+    // hazard is a `Null` default into a concrete-scalar param: `Null` is a boxed `ptr`, while the
+    // param is an unboxed `i32`/`f64`/string-ptr that a `Null` simply cannot represent. (A `Null`
+    // default into a `Null`, union, or `Json` param is fine — the param holds a ptr there.)
+    fn default_cannot_inhabit_param(default_ty: &Type, param_ty: &Type) -> bool {
+        matches!(default_ty, Type::Null)
+            && !matches!(param_ty, Type::Null)
+            && !is_union_ty(param_ty)
+            && !matches!(param_ty, Type::TypeVar(_))
+    }
+    let any_default_repr_invalid = params[required..].iter().any(|p| {
+        match p.default.as_deref() {
+            Some(d) => default_cannot_inhabit_param(&d.ty(), &p.ty),
+            None => false,
+        }
+    });
+    if any_default_repr_invalid {
+        return;
+    }
+
     // Descriptor entries: one per arity in required..=total. The last (k == total) is the
     // real function itself; the rest are default-fill adapters.
     let mut entries: Vec<FuncId> = Vec::with_capacity(total - required + 1);

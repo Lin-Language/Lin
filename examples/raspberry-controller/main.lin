@@ -77,10 +77,10 @@ export val runController = (host: String, port: Int32): Null =>
 
   // Next [left, right] pair for a key: ESC and unknown/no-key leave speeds as-is
   // (ESC's stop is handled in `tick`), space/q/a/w/s go through applyKey.
-  val nextPair = (key: Int32): Float64[] =>
-    if key == 27 then
+  val nextPair = (key: Int32 | Null): Float64[] =>
+    if key == null then
       [left, right]
-    else if key == null then
+    else if key == 27 then
       [left, right]
     else
       applyKey(key, left, right)

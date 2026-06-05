@@ -58,7 +58,7 @@ export val createRaptor = (tripsIn: Json, transfers: Json, interchange: Json, da
   var tripsByRoute: { String: Json[] } = {}
   var routeStopIndex: { String: { String: Int32 } } = {}
   var routePath: { String: String[] } = {}
-  var usefulTransfers = {}
+  var usefulTransfers: Json = {}
 
   // optional date pre-filter. `date` is `Date | Null`; a `match` (not a plain
   // `if date != null`) is required to narrow the named-record union to `Date`
@@ -105,7 +105,7 @@ export val createRaptor = (tripsIn: Json, transfers: Json, interchange: Json, da
         transfers
       )
 
-    push(tripsByRoute[routeId], trip)
+    push(get(tripsByRoute, routeId, []), trip)
   )
 
   {
@@ -131,7 +131,8 @@ val indexRoute = (path: String[], i: Int32, trip: Json, routeId: String, routeSt
     else
       DEFAULT_INTERCHANGE_TIME
     if routesAtStop[stop] == null then routesAtStop[stop] = []
-    if trip["stopTimes"][i]["pickUp"] then push(routesAtStop[stop], routeId)
+    if trip["stopTimes"][i]["pickUp"] then
+      push(get(routesAtStop, stop, []), routeId)
     indexRoute(
       path,
       i - 1,

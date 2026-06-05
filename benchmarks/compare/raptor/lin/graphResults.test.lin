@@ -4,7 +4,7 @@ import { length } from "std/array"
 import { makeGraphResults, add, finalize } from "./graphResults"
 
 val mergePath = (tree: Json, path: Json): Null =>
-  var kConnections = {}
+  var kConnections: Json = {}
   range(1, length(path)).for(i =>
     val origin = path[i - 1]
     val destination = path[i]
