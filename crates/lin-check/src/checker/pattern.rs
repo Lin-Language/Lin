@@ -34,11 +34,11 @@ impl Checker {
         }
     }
 
-    /// Narrow the scrutinee binding to `narrow_to` (the non-Null complement) within the current
-    /// arm scope. Reuses the original slot via `define_narrowed` (the runtime value is identical;
-    /// only the static type tightens). No-op when there is no narrowing to apply. Must be called
-    /// after the arm's `push_scope`.
-    fn apply_arm_null_narrowing(&mut self, scrutinee_name: Option<&str>, narrow_to: Option<&Type>) {
+    /// Narrow the scrutinee binding to `narrow_to` (the complement of preceding excluded `is`
+    /// arms) within the current arm scope. Reuses the original slot via `define_narrowed` (the
+    /// runtime value is identical; only the static type tightens). No-op when there is no
+    /// narrowing to apply. Must be called after the arm's `push_scope`.
+    fn apply_arm_complement_narrowing(&mut self, scrutinee_name: Option<&str>, narrow_to: Option<&Type>) {
         if let (Some(name), Some(ty)) = (scrutinee_name, narrow_to) {
             if let Some(info) = self.env.lookup(name) {
                 let slot = info.slot;
@@ -63,9 +63,13 @@ impl Checker {
                 // Reuse the same slot so LocalGet can unbox the TaggedVal pointer correctly.
                 // `TypeCheckDeep` (ADR-054) narrows to its object type exactly like `TypeCheck`.
                 let narrowed = match &tp {
-                    TypedPattern::TypeCheck(ty, _) => Some(ty),
-                    TypedPattern::TypeCheckDeep(ty, _, _) => Some(ty),
-                    _ => None,
+                    TypedPattern::TypeCheck(ty, _) => Some(ty.clone()),
+                    TypedPattern::TypeCheckDeep(ty, _, _) => Some(ty.clone()),
+                    // No positive narrowing for this `is`-pattern (e.g. `is Error` desugars to an
+                    // object discriminant pattern, a literal check, a binding/destructure). Fall
+                    // back to the complement of preceding excluded arms, if any — this still tightens
+                    // the scrutinee away from cases already handled above.
+                    _ => narrow_to.cloned(),
                 };
                 if let (Some(name), Some(narrowed_ty)) = (scrutinee_name, narrowed) {
                     if let Some(orig_info) = self.env.lookup(name) {
@@ -78,12 +82,14 @@ impl Checker {
                 TypedMatchPattern::Is(tp)
             }
             MatchPattern::Has(pat) => {
+                self.apply_arm_complement_narrowing(scrutinee_name, narrow_to);
                 TypedMatchPattern::Has(self.check_pattern(pat, scrutinee_ty)?)
             }
             MatchPattern::Else => {
-                // Flow-narrow `T | Null` to `T` in an `else` arm reached after a preceding
-                // `is Null` arm (the Null case is already handled). See `null_excluded_before`.
-                self.apply_arm_null_narrowing(scrutinee_name, narrow_to);
+                // Flow-narrow the scrutinee to the complement of every preceding guard-free `is X`
+                // arm (those `X` cases are already handled) in this `else`/later arm. Generalizes
+                // the old Null-only rule. See `complement_narrowing`.
+                self.apply_arm_complement_narrowing(scrutinee_name, narrow_to);
                 TypedMatchPattern::Else
             }
         };
@@ -124,7 +130,14 @@ impl Checker {
         let typed_pattern = match &arm.pattern {
             MatchPattern::Is(pat) => {
                 let tp = self.check_pattern(pat, scrutinee_ty)?;
-                if let (Some(name), TypedPattern::TypeCheck(ref narrowed_ty, _)) = (scrutinee_name, &tp) {
+                let narrowed = match &tp {
+                    TypedPattern::TypeCheck(ty, _) => Some(ty.clone()),
+                    TypedPattern::TypeCheckDeep(ty, _, _) => Some(ty.clone()),
+                    // See `check_match_arm`: fall back to the complement when this `is`-pattern has
+                    // no positive narrowing (e.g. `is Error`).
+                    _ => narrow_to.cloned(),
+                };
+                if let (Some(name), Some(narrowed_ty)) = (scrutinee_name, narrowed) {
                     if let Some(orig_info) = self.env.lookup(name) {
                         let orig_slot = orig_info.slot;
                         self.env.define_narrowed(name.to_string(), narrowed_ty.clone(), orig_slot);
@@ -135,10 +148,11 @@ impl Checker {
                 TypedMatchPattern::Is(tp)
             }
             MatchPattern::Has(pat) => {
+                self.apply_arm_complement_narrowing(scrutinee_name, narrow_to);
                 TypedMatchPattern::Has(self.check_pattern(pat, scrutinee_ty)?)
             }
             MatchPattern::Else => {
-                self.apply_arm_null_narrowing(scrutinee_name, narrow_to);
+                self.apply_arm_complement_narrowing(scrutinee_name, narrow_to);
                 TypedMatchPattern::Else
             }
         };
