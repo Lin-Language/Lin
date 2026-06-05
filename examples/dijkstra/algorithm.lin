@@ -41,7 +41,7 @@ val processQueue = (pq: PqEntry[], adj: Json, dist: Json, prev: Json, visited: J
     val remaining = removeAt(pq, midx)
     val u = toString(current["node"])
     if visited[u] == null then
-      lin_object_set(visited, u, true)
+      visited[u] = true
       val neighbors = if adj[u] == null then [] else adj[u]
       neighbors.for(edge =>
         val v = toString(edge["to"])
@@ -50,8 +50,8 @@ val processQueue = (pq: PqEntry[], adj: Json, dist: Json, prev: Json, visited: J
         val dv = toInt(dist[v])
         val newDist = du + ew
         if newDist < dv then
-          lin_object_set(dist, v, newDist)
-          lin_object_set(prev, v, u)
+          dist[v] = newDist
+          prev[v] = u
           push(remaining, { "node": v, "dist": newDist })
       )
     processQueue(remaining, adj, dist, prev, visited)
@@ -60,7 +60,7 @@ export val dijkstra = (adj: Json, source: String, allNodes: String[]): DijkstraR
   var dist: {  } = {}
   var prev: {  } = {}
   var visited: {  } = {}
-  allNodes.for(n => lin_object_set(dist, n, 999999999))
+  allNodes.for(n => dist[n] = 999999999)
   dist[source] = 0
   val pq = [{ "node": source, "dist": 0 }]
   processQueue(pq, adj, dist, prev, visited)

@@ -329,6 +329,18 @@ impl Checker {
         })?;
         let (var_scope_depth, info) = self.env.lookup_with_depth(name).unwrap();
         let slot = info.slot;
+        // `lin_*` intrinsics are compiler-internal and must only be referenced from the trusted
+        // stdlib (which re-exports them under clean names) — never from user code (ADR-002/ADR-009,
+        // ADR-086). The `allow_intrinsics` flag is true for stdlib modules and when the
+        // LIN_ALLOW_INTRINSICS test escape hatch is set.
+        if !self.allow_intrinsics {
+            if let Some(intr) = self.intrinsic_slots.get(&slot) {
+                return Err(Diagnostic::error(
+                    span,
+                    format!("`{}` is a compiler-internal intrinsic and cannot be used in user code", intr),
+                ).with_help("import the equivalent function from the standard library instead (e.g. `print` from \"std/io\", `arrayAllocate` from \"std/array\", or use index-assignment `obj[key] = value` instead of `lin_object_set`)".to_string()));
+            }
+        }
         let is_mutable = info.mutable;
         let def_span = info.def_span;
         // Record as a capture in every enclosing function where the variable was defined

@@ -14,7 +14,7 @@ priority queue.
   `String[]` reconstructed path.
 - **Dynamic `Json` maps kept dynamic** where appropriate: the adjacency, distance,
   and predecessor structures are keyed by node name at runtime and built with
-  `lin_object_set`.
+  index-assignment (`obj[key] = value`).
 - Tail-recursive queue processing and path reconstruction.
 - Reading/writing JSON from the filesystem (`std/fs`) and command-line `args()`.
 
