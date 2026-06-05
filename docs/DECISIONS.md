@@ -1948,15 +1948,28 @@ compatibility are exactly as before.
 - **NaN-boxing / a non-copying reinterpretation of a wider value as a narrower
   layout** — unsound under width subtyping + unordered objects; the non-mutating
   boundary projection is what restores soundness.
-- **Stack allocation of non-escaping sealed records (would-be Stage 4)** —
-  prototyped with a sound escape analysis, but measured a **~12% regression** on
-  `records`: the lowering owning-model still emits ~25 per-iteration
-  `lin_rc_retain` *calls* on the stack value (made no-ops by an immortal-RC guard,
-  but the guarded calls across the non-inlinable runtime boundary cost more than
-  the cheap heap allocation they replaced). **Not shipped.** The prerequisite is
-  suppressing Retain/Release *emission* in lowering for proven-stack-resident
-  values (so the calls vanish and SROA can promote the struct to registers), not
-  merely making them runtime no-ops.
+- **Stack allocation of non-escaping sealed records (Stage 4)** — *initially*
+  rejected: the first prototype kept the lowering owning-model's per-read
+  `lin_rc_retain`/`lin_sealed_release` *calls* on the stack value (made no-ops by an
+  immortal-RC guard, but the guarded calls across the non-inlinable runtime boundary
+  cost more than the cheap heap allocation they replaced — **~12% slower** on
+  `records`). **Now SHIPPED** once the stated prerequisite was implemented:
+  `lin_ir::escape` is a sound escape analysis (carry-class union-find over
+  representation-preserving aliasing edges + self-`TailCall` arg↔param unification;
+  fail-safe to heap on any Return / container-store / closure-capture / repr-changing
+  coerce / unknown-retaining-call use) that marks each non-escaping all-scalar sealed
+  `MakeObject` with `stack = true` AND **deletes every `Retain`/`Release` instruction
+  on the proven-stack-resident carry class** (so the no-op RC calls vanish from the IR
+  entirely and the entry-block `alloca` SROA-promotes to registers). The immortal-RC
+  header sentinel is kept as defense-in-depth. Result: the `records` `@step` hot loop
+  went from 25 retain / 25 release / heap-alloc per iteration to **0 / 0 / a reused
+  stack alloca**; measured **3532 ms → 583 ms (~6.1×)** on the `records` benchmark
+  (median of 11 interleaved runs vs current master), turning the old regression into
+  a win that **beats Go** (≈717 ms) and closes toward Rust (≈240 ms). ASan-clean over
+  the full `stdlib`+`examples` corpus plus dedicated escaping fixtures (returned /
+  array-stored / closure-captured stay heap; high-N TCO loop has no stack growth and
+  no use-after-return). Heap-field sealed records remain heap (Stage-4 scope =
+  all-scalar only).
 
 **Consequence**: One stdlib type required migration, and it is the canonical
 illustration of the one user-visible semantic change. `std/test`'s

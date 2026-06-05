@@ -1,3 +1,4 @@
+pub mod escape;
 pub mod ir;
 pub mod lower;
 pub mod liveness;
