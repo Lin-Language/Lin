@@ -244,6 +244,22 @@ impl Type {
         }
     }
 
+    /// Drop the `Null` member from a union, returning the complement type. Used by flow-narrowing
+    /// for `== null` / `is Null` tests: `T | Null` minus `Null` = `T`; `A | B | Null` minus
+    /// `Null` = `A | B`. Returns `None` when `self` is not a union that actually contains a `Null`
+    /// member (so the caller leaves the binding's type untouched — there is nothing to narrow).
+    pub fn without_null(&self) -> Option<Type> {
+        if let Type::Union(variants) = self {
+            if variants.iter().any(|t| *t == Type::Null) {
+                let rest: Vec<Type> = variants.iter().filter(|t| **t != Type::Null).cloned().collect();
+                if !rest.is_empty() {
+                    return Some(Type::flatten_union(rest));
+                }
+            }
+        }
+        None
+    }
+
     pub fn flatten_union(types: Vec<Type>) -> Type {
         let mut flat: Vec<Type> = Vec::new();
         for t in types {

@@ -34,11 +34,25 @@ impl Checker {
         }
     }
 
+    /// Narrow the scrutinee binding to `narrow_to` (the non-Null complement) within the current
+    /// arm scope. Reuses the original slot via `define_narrowed` (the runtime value is identical;
+    /// only the static type tightens). No-op when there is no narrowing to apply. Must be called
+    /// after the arm's `push_scope`.
+    fn apply_arm_null_narrowing(&mut self, scrutinee_name: Option<&str>, narrow_to: Option<&Type>) {
+        if let (Some(name), Some(ty)) = (scrutinee_name, narrow_to) {
+            if let Some(info) = self.env.lookup(name) {
+                let slot = info.slot;
+                self.env.define_narrowed(name.to_string(), ty.clone(), slot);
+            }
+        }
+    }
+
     pub(crate) fn check_match_arm(
         &mut self,
         arm: &lin_parse::ast::MatchArm,
         scrutinee_ty: &Type,
         scrutinee_name: Option<&str>,
+        narrow_to: Option<&Type>,
     ) -> Result<TypedMatchArm, Diagnostic> {
         self.env.push_scope();
 
@@ -66,7 +80,12 @@ impl Checker {
             MatchPattern::Has(pat) => {
                 TypedMatchPattern::Has(self.check_pattern(pat, scrutinee_ty)?)
             }
-            MatchPattern::Else => TypedMatchPattern::Else,
+            MatchPattern::Else => {
+                // Flow-narrow `T | Null` to `T` in an `else` arm reached after a preceding
+                // `is Null` arm (the Null case is already handled). See `null_excluded_before`.
+                self.apply_arm_null_narrowing(scrutinee_name, narrow_to);
+                TypedMatchPattern::Else
+            }
         };
 
         let typed_guard = if let Some(ref guard) = arm.guard {
@@ -98,6 +117,7 @@ impl Checker {
         scrutinee_ty: &Type,
         scrutinee_name: Option<&str>,
         expected: &Type,
+        narrow_to: Option<&Type>,
     ) -> Result<TypedMatchArm, Diagnostic> {
         self.env.push_scope();
 
@@ -117,7 +137,10 @@ impl Checker {
             MatchPattern::Has(pat) => {
                 TypedMatchPattern::Has(self.check_pattern(pat, scrutinee_ty)?)
             }
-            MatchPattern::Else => TypedMatchPattern::Else,
+            MatchPattern::Else => {
+                self.apply_arm_null_narrowing(scrutinee_name, narrow_to);
+                TypedMatchPattern::Else
+            }
         };
 
         let typed_guard = if let Some(ref guard) = arm.guard {
