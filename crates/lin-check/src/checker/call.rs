@@ -329,7 +329,30 @@ impl Checker {
                 let mut partially_typed: Vec<Option<TypedExpr>> = vec![None; args.len()];
                 for (i, (arg, param_ty)) in args.iter().zip(params.iter()).enumerate() {
                     if !matches!(arg, Expr::Function { .. }) {
-                        let typed = self.infer_expr(arg)?;
+                        // An array-literal argument must adopt the parameter's element
+                        // representation rather than its own bottom-up inference. Pure
+                        // inference of an EMPTY literal `[]` yields `Array(Never)` (no
+                        // elements to infer a width from), so codegen allocates a boxed
+                        // buffer at the call site while a flat-scalar `T[]` param does
+                        // stride-N push/get in the callee → corruption. Route array
+                        // literals through expected-type-directed checking when the
+                        // parameter is a concrete (TypeVar-free) array type, so the
+                        // literal carries the param's element type at codegen.
+                        //
+                        // Gated to TypeVar-free params so the generic-substitution and
+                        // `Number`-param paths (whose params resolve to constrained
+                        // TypeVars, and the Json wildcard `TypeVar(MAX)`) still go through
+                        // plain inference — there is no concrete expected type to check
+                        // against, and `collect_and_save_subs` below still needs the
+                        // bottom-up arg type to drive substitution.
+                        let array_lit_against_concrete_array = matches!(arg, Expr::Array(..))
+                            && matches!(param_ty, Type::Array(_) | Type::FixedArray(_))
+                            && !param_ty.contains_type_var();
+                        let typed = if array_lit_against_concrete_array {
+                            self.check_expr(arg, param_ty)?
+                        } else {
+                            self.infer_expr(arg)?
+                        };
                         self.collect_and_save_subs(param_ty, &typed.ty(), &mut subs);
                         partially_typed[i] = Some(typed);
                     }

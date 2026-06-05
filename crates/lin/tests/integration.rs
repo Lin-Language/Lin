@@ -1560,6 +1560,36 @@ print(toString(range(0, 1000).map(x => x * 2).filter(x => x % 3 == 0).reduce(0, 
 }
 
 #[test]
+fn test_empty_array_literal_arg_flat_scalar_param() {
+    // Regression: an EMPTY array literal `[]` passed as an argument to a flat-scalar `T[]`
+    // parameter was mis-compiled. Pure bottom-up inference of `[]` yields `Array(Never)` (no
+    // elements to infer a width from), so the call site allocated a TAGGED (boxed) buffer while
+    // the callee's `Int32[]`/`Float64[]` param did flat stride-N push/get → reading back garbage
+    // (`s0=2 s1=0`). The fix routes array-literal args through expected-type-directed checking
+    // against a concrete (TypeVar-free) array param, so the literal adopts the flat element repr.
+    // A NON-empty literal arg (`[9]`) and a locally-annotated empty `val s: Int32[] = []` already
+    // worked, so this guards the empty-in-argument-position case specifically. Cover Int32 and
+    // Float64, push two elements into the passed-in empty array, and read them back.
+    let output = run(r#"import { push, length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+val di = (s: Int32[]): Null =>
+  push(s, 3)
+  push(s, 4)
+  print("i s0=${toString(s[0])} s1=${toString(s[1])} len=${toString(length(s))}")
+di([])
+
+val df = (s: Float64[]): Null =>
+  push(s, 3.5)
+  push(s, 4.5)
+  print("f s0=${toString(s[0])} s1=${toString(s[1])} len=${toString(length(s))}")
+df([])
+"#);
+    assert_eq!(output, vec!["i s0=3 s1=4 len=2", "f s0=3.5 s1=4.5 len=2"]);
+}
+
+#[test]
 fn test_flat_array_index_set_inline() {
     // The flat-scalar index-assign (`arr[i] = x`) is INLINED in codegen when the element type is a
     // flat scalar AND the value type matches it: a bounds-checked raw store instead of boxing +
