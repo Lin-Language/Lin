@@ -7602,8 +7602,10 @@ print(prepend(ss, "z")[0])           // z
 
 #[test]
 fn test_group_by_even_odd_and_empty() {
-    // groupBy now does ONE hash lookup per item (lin_object_get_or_insert_array) + push,
-    // instead of get-then-set. Grouping by even/odd splits correctly; an empty input is {}.
+    // groupBy now returns a typed index-signature map `{ String: T[] }` (ADR-082): ONE hash lookup
+    // per item (lin_object_get_or_insert_array, tag-aware over LinMap) + push. Grouping by even/odd
+    // splits correctly. The map itself stringifies as `[object]` (TAG_MAP has no structural
+    // toString yet — an ADR-082 follow-up); the per-key array values print normally.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { groupBy } from "std/array"
@@ -7612,14 +7614,15 @@ val g = groupBy([1, 2, 3, 4, 5], x => if x % 2 == 0 then "even" else "odd")
 print(toString(g["even"]))   // [2, 4]
 print(toString(g["odd"]))    // [1, 3, 5]
 
-val ge = groupBy([], x => "k")
-print(toString(ge))          // {}
+val empty: Int32[] = []
+val ge = groupBy(empty, x => "k")
+print(toString(ge))          // [object] (empty map)
 
 // Single bucket: every item lands under one key.
 val one = groupBy([7, 9, 11], x => "all")
 print(toString(one["all"]))  // [7, 9, 11]
 "#);
-    assert_eq!(out, vec!["[2, 4]", "[1, 3, 5]", "{}", "[7, 9, 11]"]);
+    assert_eq!(out, vec!["[2, 4]", "[1, 3, 5]", "[object]", "[7, 9, 11]"]);
 }
 
 #[test]

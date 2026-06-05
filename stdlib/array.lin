@@ -267,8 +267,8 @@ export val scan = <T, U>(arr: T[], init: U, f: (U, T) => U): U[] =>
   )
   result
 
-export val groupBy = (arr: Json, keyFn: (Json) => String): Json =>
-  var result = {}
+export val groupBy = <T>(arr: T[], keyFn: (T) => String): { String: T[] } =>
+  var result: { String: T[] } = {}
   arr.for(item =>
     val key = keyFn(item)
     // One hash lookup: fetch the group array for `key`, creating it if absent, then push in
@@ -278,13 +278,15 @@ export val groupBy = (arr: Json, keyFn: (Json) => String): Json =>
   )
   result
 
-export val countBy = (arr: Json, keyFn: (Json) => String): Json =>
-  var result = {}
+export val countBy = <T>(arr: T[], keyFn: (T) => String): { String: Int32 } =>
+  var result: { String: Int32 } = {}
   arr.for(item =>
     val key = keyFn(item)
-    if result[key] == null then
-      result[key] = 1
-    else
-      result[key] = result[key] + 1
+    // `result[key]` is `Int32 | Null`; only the positive `is Int32` match arm narrows it (an
+    // `== null` test does not narrow — ADR-082 / §6.1), so increment via that arm.
+    val current = result[key]
+    match current
+      is Int32 => result[key] = current + 1
+      else => result[key] = 1
   )
   result
