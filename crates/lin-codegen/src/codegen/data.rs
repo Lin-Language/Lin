@@ -1,7 +1,7 @@
 use super::builder_ext::BuilderExt;
 use inkwell::types::BasicType;
 use inkwell::values::BasicValueEnum;
-use lin_common::tags::{TAG_INT32, TAG_INT64, TAG_OBJECT};
+use lin_common::tags::{TAG_INT32, TAG_INT64, TAG_OBJECT, TAG_MAP};
 use inkwell::{AddressSpace, IntPredicate};
 
 use lin_check::types::Type;
@@ -365,13 +365,30 @@ impl<'ctx> Codegen<'ctx> {
         // lin_object_get would read a LinArray*/scalar as a LinObject* and crash. Mirrors the
         // AST compile_index string-key-on-Json path.
         if Self::is_union_type(obj_ty) {
+            // A `{ String: T } | Null` index (e.g. the inner read of a NESTED typed map
+            // `outer[a][b]`, where `outer[a]` is `{ String: T } | Null` and is NOT spellable as
+            // an `is`-pattern to narrow, ADR-082 §5.1.1) runs through this union path. Its runtime
+            // value is a TAG_MAP, so dispatch on the tag: TAG_MAP → `lin_map_get` (O(1) hashed),
+            // TAG_OBJECT → `lin_object_get` (the Json association-list path), otherwise Null. Both
+            // getters return a borrowed `*const TaggedVal`, so the ownership contract is identical.
             let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
             let obj_tag = self.builder.call(self.rt.get_tag, &[obj.into()], "ir_idx_tag").try_as_basic_value().unwrap_basic().into_int_value();
+            let i8t = self.context.i8_type();
+            let is_map = self.builder.int_compare(
+                IntPredicate::EQ, obj_tag, i8t.const_int(TAG_MAP as u64, false), "ir_idx_is_map");
             let is_obj = self.builder.int_compare(
-                IntPredicate::EQ, obj_tag, self.context.i8_type().const_int(TAG_OBJECT as u64, false), "ir_idx_is_obj");
+                IntPredicate::EQ, obj_tag, i8t.const_int(TAG_OBJECT as u64, false), "ir_idx_is_obj");
+            let map_b = self.context.append_basic_block(llvm_fn, "ir_idx_map");
+            let chk_obj = self.context.append_basic_block(llvm_fn, "ir_idx_chk_obj");
             let ok = self.context.append_basic_block(llvm_fn, "ir_idx_obj_ok");
             let no = self.context.append_basic_block(llvm_fn, "ir_idx_obj_no");
             let mrg = self.context.append_basic_block(llvm_fn, "ir_idx_obj_mrg");
+            self.builder.conditional_branch(is_map, map_b, chk_obj);
+            self.builder.position_at_end(map_b);
+            let map_entry = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget_u").try_as_basic_value().unwrap_basic();
+            let map_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(mrg);
+            self.builder.position_at_end(chk_obj);
             self.builder.conditional_branch(is_obj, ok, no);
             self.builder.position_at_end(ok);
             let entry = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "ir_oget").try_as_basic_value().unwrap_basic();
@@ -382,7 +399,7 @@ impl<'ctx> Codegen<'ctx> {
             self.builder.unconditional_branch(mrg);
             self.builder.position_at_end(mrg);
             let phi = self.builder.phi(ptr_ty, "ir_idx_obj_phi");
-            phi.add_incoming(&[(&entry, ok_exit), (&null_res, no)]);
+            phi.add_incoming(&[(&map_entry, map_exit), (&entry, ok_exit), (&null_res, no)]);
             let result_ptr = phi.as_basic_value();
             return self.unbox_tagged_val_to_type(result_ptr, result_ty);
         }
@@ -655,12 +672,12 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.unconditional_branch(mrg);
                     self.builder.position_at_end(str_b);
                     let key_str = self.builder.call(self.rt.unbox_ptr, &[key.into()], "iset_key_unbox").try_as_basic_value().unwrap_basic();
-                    self.emit_object_set(container, key_str, value, val_ty);
+                    self.emit_obj_or_map_set(obj, container, key_str, value, val_ty, obj_ty);
                     self.builder.unconditional_branch(mrg);
                     self.builder.position_at_end(mrg);
                 } else if key.is_pointer_value() {
                     // Statically a string (object) key.
-                    self.emit_object_set(container, key, value, val_ty);
+                    self.emit_obj_or_map_set(obj, container, key, value, val_ty, obj_ty);
                 } else if key.is_int_value() {
                     let idx = self.index_value_to_i64(key);
                     self.emit_array_set(container, idx, value, val_ty);
@@ -668,6 +685,54 @@ impl<'ctx> Codegen<'ctx> {
             }
             _ => {}
         }
+    }
+
+    /// String-keyed store into a union/`T|Null` container that may hold EITHER a Json object
+    /// (TAG_OBJECT) OR a typed index-signature map (TAG_MAP). This is the write analogue of the
+    /// tag-dispatched read in `compile_ir_index`: a NESTED typed map's inner write
+    /// (`outer[a][b] = v`, where `outer[a]` is `{ String: T } | Null` — not `is`-narrowable,
+    /// ADR-082 §5.1.1) reaches here with `obj_ty` a union containing a `Map(elem)` variant.
+    /// When such a variant is present, dispatch on the runtime tag: TAG_MAP → `emit_map_set`
+    /// (O(1) hashed insert), otherwise `emit_object_set`. Both helpers RETAIN the inner payload,
+    /// so the ownership contract is identical on either branch. With no Map variant this is a
+    /// plain `emit_object_set` (no extra branch emitted).
+    pub(crate) fn emit_obj_or_map_set(
+        &mut self,
+        boxed_obj: BasicValueEnum<'ctx>,
+        container: BasicValueEnum<'ctx>,
+        key_str: BasicValueEnum<'ctx>,
+        value: BasicValueEnum<'ctx>,
+        val_ty: &Type,
+        obj_ty: &Type,
+    ) {
+        // Find a Map(elem) variant in the union, if any.
+        let map_elem: Option<Type> = match obj_ty {
+            Type::Union(vs) => vs.iter().find_map(|v| match v {
+                Type::Map(e) => Some((**e).clone()),
+                _ => None,
+            }),
+            Type::Map(e) => Some((**e).clone()),
+            _ => None,
+        };
+        let Some(elem) = map_elem else {
+            self.emit_object_set(container, key_str, value, val_ty);
+            return;
+        };
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let i8t = self.context.i8_type();
+        let tag = self.builder.call(self.rt.get_tag, &[boxed_obj.into()], "set_objtag").try_as_basic_value().unwrap_basic().into_int_value();
+        let is_map = self.builder.int_compare(IntPredicate::EQ, tag, i8t.const_int(TAG_MAP as u64, false), "set_is_map");
+        let map_b = self.context.append_basic_block(llvm_fn, "set_map");
+        let obj_b = self.context.append_basic_block(llvm_fn, "set_obj");
+        let mrg = self.context.append_basic_block(llvm_fn, "set_mrg");
+        self.builder.conditional_branch(is_map, map_b, obj_b);
+        self.builder.position_at_end(map_b);
+        self.emit_map_set(container, key_str, value, val_ty, &elem);
+        self.builder.unconditional_branch(mrg);
+        self.builder.position_at_end(obj_b);
+        self.emit_object_set(container, key_str, value, val_ty);
+        self.builder.unconditional_branch(mrg);
+        self.builder.position_at_end(mrg);
     }
 
     /// Normalise an index value (raw int or boxed TaggedVal*) to an i64.
