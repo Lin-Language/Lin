@@ -3,11 +3,12 @@ import foreign "lin-runtime"
   val lin_tty_read_key: () => Json
 
 // enable (on = true) or disable (on = false) terminal raw mode on stdin.
-// Returns Null on success, or an Error (e.g. when stdin is not a terminal).
-export val rawMode = (on: Boolean): Json =>
+// Returns Null on success, or an Error (e.g. when stdin is not a terminal),
+// discriminated with `is Error`.
+export val rawMode = (on: Boolean): Null | Error =>
   if on then lin_tty_raw_mode(1) else lin_tty_raw_mode(0)
 
 // read a single key (one byte) from stdin without blocking.
 // Returns the byte value as an Int32, or Null if no key is available.
-export val readKey = (): Json =>
+export val readKey = (): Int32 | Null =>
   lin_tty_read_key()
