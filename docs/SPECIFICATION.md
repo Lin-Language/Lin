@@ -387,7 +387,7 @@ type Json =
 
 The last form above is informal shorthand: a `Json`-valued object is any object whose fields are themselves `Json`. A *typed* index signature with a concrete value type does exist as real syntax — `{ String: T }` (§5.1.1).
 
-`Error` is a built-in structural alias for the conventional error value `{ "type": String, "message": String }` (§20). It composes in unions and is discriminated with `is Error`.
+`Error` is a built-in structural alias for the conventional error value `{ "type": String, "message": String }` (§20). It composes in unions and is discriminated with `is Error`. As a structural alias it is **not** a sealed named record (§5.9.1): an `Error`-typed value may carry extra fields, and `is Error` permits them.
 
 `Function` is an opaque type that accepts a function of any arity. `Iterator<T>` is the opaque runtime traversal type (§18). `Shared<T>` is the opt-in shared-mutable-state box used with the concurrency accessors (§24.5).
 
@@ -569,6 +569,39 @@ val greeting = greet({
 ```
 
 This compatibility relationship is the same as `has` — see §11.
+
+#### 5.9.1 Sealed named records and lossy projection
+
+A **named** record type (`type T = { … }`) is *sealed*: a value whose static
+type is `T` holds **exactly** `T`'s fields — no extras. This is a representation
+guarantee that lets the compiler lay sealed records out as unboxed structs with
+constant-offset field access (see ADR-083); it does **not** change the structural
+compatibility above.
+
+The two are reconciled by a **non-mutating projection** at the boundary: when a
+wider value (one with extra fields, or a `Json` value) flows into a slot of named
+type `T` — a parameter, a `val`/`var` with a `T` annotation, a return typed `T`,
+or an element of a `T[]` — it is **copied** into a fresh sealed value containing
+only `T`'s fields. Extra fields are dropped **from the copy**; the original value
+is unchanged and keeps its extra fields in its own scope.
+
+```txt
+type Named = { "name": String }
+
+val wide = { "name": "Alice", "age": 99 }   // an anonymous record with an extra field
+val n: Named = wide                          // projects to a fresh { "name": "Alice" }
+// n["age"]  → compile error: `age` is not a field of Named
+wide["age"]                                  // still 99 — `wide` is untouched
+```
+
+`T.fromJson(json)` projects the same way: it validates and keeps exactly `T`'s
+fields, dropping unknown keys.
+
+**Consequence — the one idiom this changes.** A named record type can no longer be
+used as an *open carrier* that smuggles extra fields through to a later consumer:
+once a value is typed as a named record, its extra fields are gone. Code that must
+preserve arbitrary extra keys (a heterogeneous bag, a pass-through envelope) should
+type the value `Json`, not a named record type.
 
 ---
 

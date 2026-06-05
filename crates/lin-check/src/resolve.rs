@@ -44,7 +44,7 @@ fn resolve_type_inner(
         TypeExpr::Object(fields, _span) => {
             // An object type spelled inline (anonymous structural shape, NOT a named record
             // declaration) is UNSEALED. Only the named-type unfold path (`expand_named_body` /
-            // generic `substitute`) seals. See SEALED_RECORDS_DESIGN.md §5.
+            // generic `substitute`) seals. See ADR-083.
             let mut resolved = IndexMap::new();
             for (key, type_expr) in fields {
                 let ty = resolve_type_inner(type_expr, env, visiting)?;
@@ -315,7 +315,7 @@ pub fn json_type() -> Type {
 
 #[cfg(test)]
 mod sealed_marker_tests {
-    //! Stage 0.5 focused marker tests (SEALED_RECORDS_DESIGN.md §5): prove the `sealed` flag is
+    //! Stage 0.5 focused marker tests (ADR-083): prove the `sealed` flag is
     //! SET correctly on resolution without affecting behavior. The bulk of run-equivalence is
     //! carried by the full corpus; these pin the marker's value at the seal point.
     use super::*;
