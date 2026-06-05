@@ -8049,6 +8049,73 @@ append(intArr, "str")
         "append(intArr, \"str\") must error, got: {err2}");
 }
 
+// `sort`/`sortBy`/`minBy`/`maxBy` are now generic over the element `T` (`sort` is
+// `<T>(arr: T[], cmp: (T, T) => Int32): T[]`), so the comparator/keyFn is element-type-checked at
+// the call site — closing the prior soundness hole where a `Json` `cmp` accepted any operation on
+// its arguments. A comparator that indexes a field the element type lacks is now a COMPILE ERROR.
+#[test]
+fn test_generic_sort_comparator_element_type_hole_closed() {
+    // A comparator typed for String elements, applied to an Int32[]: the comparator's parameter
+    // type now pins `T = String`, which mismatches the `Int32[]` array argument. Under the old
+    // `cmp: (Json, Json) => Int32` signature this was SILENTLY ACCEPTED (a String comparator was
+    // assignable to a Json comparator); it is now a compile error mentioning the element mismatch.
+    let err = run_expect_err(r#"import { sort } from "std/array"
+val xs: Int32[] = [1, 2, 3]
+val cmp = (a: String, b: String): Int32 => if a < b then -1 else 1
+val r = sort(xs, cmp)
+"#);
+    assert!(
+        err.contains("Int32") && err.contains("String"),
+        "sort(Int32[], stringComparator) must be an element-type error mentioning Int32/String, got: {err}"
+    );
+}
+
+// The typed RESULT of a generic `sort` preserves the element type: `[3,1,2].sort(...)` is an
+// `Int32[]`, so a follow-on `push(intArr, intLiteral)` type-checks while `push(intArr, "s")` does
+// not. This proves the element type flows OUT of `sort` (not erased to `Json`).
+#[test]
+fn test_generic_sort_result_element_type_preserved() {
+    // Pushing an Int32 into the sorted Int32[] is fine and reads back.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { sort, push } from "std/array"
+val sorted = [3, 1, 2].sort((a, b) => a - b)
+push(sorted, 4)
+print(toString(sorted))
+"#);
+    assert_eq!(out, vec!["[1, 2, 3, 4]"]);
+
+    // Pushing a String into the sorted Int32[] is a compile error (T = Int32 flowed through sort).
+    let err = run_expect_err(r#"import { sort, push } from "std/array"
+val sorted = [3, 1, 2].sort((a, b) => a - b)
+push(sorted, "s")
+"#);
+    assert!(
+        err.contains("String") && err.contains("Int32"),
+        "push(sortedIntArr, \"s\") must be an element-type error, got: {err}"
+    );
+}
+
+// `minBy`/`maxBy`/`sortBy` over an OBJECT array still work as before (the genericization keeps the
+// heterogeneous `[key, item]` pair path sound — pairs built via the raw `lin_map` builtin on the
+// `T` ABI, the sorted result unpacked back into a `T[]` in the generic body).
+#[test]
+fn test_generic_keyed_array_fns_over_objects() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { sortBy, minBy, maxBy } from "std/array"
+val people = [{ "name": "Bob", "age": 30 }, { "name": "Alice", "age": 25 }, { "name": "Cy", "age": 40 }]
+val byName = people.sortBy(p => p["name"])
+print(byName[0]["name"])
+print(byName[2]["name"])
+val youngest = people.minBy(p => p["age"])
+print(toString(youngest["age"]))
+val oldest = people.maxBy(p => p["age"])
+print(toString(oldest["age"]))
+"#);
+    assert_eq!(out, vec!["Alice", "Cy", "25", "40"]);
+}
+
 // A bare integer-LITERAL item adopts the array's element WIDTH (the literal-width inference fix):
 // `b.append(3)` on a `UInt8[]` stays `UInt8[]` (not `Int32[]`), preserving the flat representation.
 #[test]
