@@ -115,9 +115,18 @@ impl Checker {
                 self.in_tail_position = false;
                 let typed_cond = self.check_expr(condition, &Type::Bool)?;
                 self.in_tail_position = in_tail;
-                let typed_then = self.check_branch_against(then_branch, expected)?;
+                let narrowing = self.null_test_narrowing(condition);
+                self.env.push_scope();
+                self.apply_null_narrowing(&narrowing, true);
+                let typed_then = self.check_branch_against(then_branch, expected);
+                self.env.pop_scope();
+                let typed_then = typed_then?;
                 self.in_tail_position = in_tail;
-                let typed_else = self.check_branch_against(else_branch, expected)?;
+                self.env.push_scope();
+                self.apply_null_narrowing(&narrowing, false);
+                let typed_else = self.check_branch_against(else_branch, expected);
+                self.env.pop_scope();
+                let typed_else = typed_else?;
                 let result_type = unify_types(&[typed_then.ty(), typed_else.ty()]);
                 return Ok(TypedExpr::If {
                     cond: Box::new(typed_cond),
@@ -464,6 +473,68 @@ impl Checker {
         Ok(TypedExpr::Index { object: Box::new(typed_obj), key: Box::new(typed_key), result_type, span })
     }
 
+    /// Flow-narrowing for `T | Null` (ADR-082 follow-up): inspect an `if`/`else` condition and,
+    /// when it is a null-test on a simple identifier, narrow that binding to its non-Null
+    /// complement (`T | Null` minus `Null`) in the branch where Null is EXCLUDED.
+    ///
+    /// Returns `Some((name, narrowed_ty, narrow_in_then))`:
+    ///   - `v == null` / `v is Null`  → Null excluded in the ELSE branch (`narrow_in_then = false`)
+    ///   - `v != null`                → Null excluded in the THEN branch (`narrow_in_then = true`)
+    ///
+    /// Only fires when the binding's static type is a union that actually contains `Null` (so the
+    /// complement is well-defined and non-empty). Composes with — and does not replace — the
+    /// existing `match`/`is` narrowing (this is purely about the null-test guard form).
+    fn null_test_narrowing(&self, condition: &Expr) -> Option<(String, Type, bool)> {
+        // `x == null` / `x != null` against the `null` literal (either operand order).
+        let (name, narrow_in_then) = match condition {
+            Expr::BinaryOp { left, op, right, .. }
+                if matches!(op, lin_parse::ast::BinOp::Eq | lin_parse::ast::BinOp::NotEq) =>
+            {
+                let ident = match (left.as_ref(), right.as_ref()) {
+                    (Expr::Ident(n, _), Expr::NullLit(_)) => Some(n),
+                    (Expr::NullLit(_), Expr::Ident(n, _)) => Some(n),
+                    _ => None,
+                }?;
+                // `== null`: Null holds in THEN, excluded in ELSE → narrow in ELSE.
+                // `!= null`: Null excluded in THEN → narrow in THEN.
+                let narrow_in_then = matches!(op, lin_parse::ast::BinOp::NotEq);
+                (ident.clone(), narrow_in_then)
+            }
+            // `x is Null`: Null holds in THEN, excluded in ELSE → narrow in ELSE.
+            Expr::Is { expr, pattern, .. } => {
+                let ident = match expr.as_ref() {
+                    Expr::Ident(n, _) => n,
+                    _ => return None,
+                };
+                if !matches!(pattern.as_ref(), lin_parse::ast::Pattern::TypeName(t, _) if t == "Null") {
+                    return None;
+                }
+                (ident.clone(), false)
+            }
+            _ => return None,
+        };
+        let info = self.env.lookup(&name)?;
+        let narrowed = info.ty.without_null()?;
+        Some((name, narrowed, narrow_in_then))
+    }
+
+    /// Apply a null-test narrowing (from `null_test_narrowing`) within the CURRENT scope if it
+    /// targets the branch being entered. `entering_then` says which branch we are about to check;
+    /// the narrowing's third element says which branch excludes Null. Reuses the original slot via
+    /// `define_narrowed` so `LocalGet` reads the same TaggedVal pointer (the value is bit-identical
+    /// — only the static type tightens). Must be called immediately after `push_scope` for the
+    /// branch and undone by the matching `pop_scope`.
+    fn apply_null_narrowing(&mut self, narrowing: &Option<(String, Type, bool)>, entering_then: bool) {
+        if let Some((name, narrowed_ty, narrow_in_then)) = narrowing {
+            if *narrow_in_then == entering_then {
+                if let Some(info) = self.env.lookup(name) {
+                    let slot = info.slot;
+                    self.env.define_narrowed(name.clone(), narrowed_ty.clone(), slot);
+                }
+            }
+        }
+    }
+
     pub(crate) fn infer_if(&mut self, condition: &Expr, then_branch: &Expr, else_branch: &Expr, span: Span) -> Result<TypedExpr, Diagnostic> {
         // Condition is not in tail position; branches inherit it.
         let in_tail = self.in_tail_position;
@@ -475,11 +546,27 @@ impl Checker {
         // (conservative — prevents a use after a possible move). The condition runs before both
         // branches, so any consume there is shared by both.
         let consumed_before = self.consumed_streams.clone();
-        let typed_then = self.infer_expr(then_branch)?;
+        // Flow-narrow a `T | Null` binding in the branch that excludes Null (`== null`/`is Null`
+        // → else; `!= null` → then). The narrowing is scoped: pushed before the relevant branch
+        // and popped after, so it never leaks past the `if`.
+        let narrowing = self.null_test_narrowing(condition);
+        let typed_then = {
+            self.env.push_scope();
+            self.apply_null_narrowing(&narrowing, true);
+            let r = self.infer_expr(then_branch);
+            self.env.pop_scope();
+            r?
+        };
         let consumed_then = self.consumed_streams.clone();
         self.consumed_streams = consumed_before;
         self.in_tail_position = in_tail;
-        let typed_else = self.infer_expr(else_branch)?;
+        let typed_else = {
+            self.env.push_scope();
+            self.apply_null_narrowing(&narrowing, false);
+            let r = self.infer_expr(else_branch);
+            self.env.pop_scope();
+            r?
+        };
         // Merge: union of both branches' consumed sets.
         self.consumed_streams.extend(consumed_then);
         let then_ty = typed_then.ty();
@@ -560,6 +647,28 @@ impl Checker {
         }
     }
 
+    /// True when the Null case has been excluded by some arm STRICTLY BEFORE index `idx` — i.e.
+    /// there is an `is Null` (or `is null` literal) arm at a lower index. Match arms are tried
+    /// top-to-bottom, so any arm reached after the Null arm operates on a value that is not Null;
+    /// it is therefore sound to narrow `T | Null` to `T` for those later arms. Conservative: only
+    /// a bare `is Null` / `is null`-literal arm (with no guard) counts as a definite exclusion.
+    fn null_excluded_before(arms: &[MatchArm], idx: usize) -> bool {
+        arms[..idx].iter().any(|a| a.guard.is_none() && Self::is_null_arm(a))
+    }
+
+    /// True when a match arm matches exactly the Null case: `is Null` or `is null` (literal).
+    fn is_null_arm(arm: &MatchArm) -> bool {
+        if let lin_parse::ast::MatchPattern::Is(pat) = &arm.pattern {
+            match pat {
+                lin_parse::ast::Pattern::TypeName(name, _) => name == "Null",
+                lin_parse::ast::Pattern::Literal(e) => matches!(e.as_ref(), Expr::NullLit(_)),
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+
     /// Check a `match` expression with the expected type pushed into each arm body.
     pub(crate) fn check_match(
         &mut self,
@@ -577,8 +686,13 @@ impl Checker {
         };
         let mut typed_arms = Vec::new();
         let mut arm_types = Vec::new();
-        for arm in arms {
-            let typed_arm = self.check_match_arm_against(arm, &scrutinee_ty, scrutinee_name, expected)?;
+        // Flow-narrow `T | Null` across arms: once a preceding `is Null` arm has handled the Null
+        // case, every subsequent non-Null arm (notably `else`) sees the scrutinee narrowed to the
+        // non-Null complement (`T | Null` minus `Null`). See `null_excluded_before`.
+        let null_complement = scrutinee_ty.without_null();
+        for (i, arm) in arms.iter().enumerate() {
+            let narrow_to = if Self::null_excluded_before(arms, i) { null_complement.as_ref() } else { None };
+            let typed_arm = self.check_match_arm_against(arm, &scrutinee_ty, scrutinee_name, expected, narrow_to)?;
             arm_types.push(typed_arm.body.ty());
             typed_arms.push(typed_arm);
         }
@@ -609,9 +723,13 @@ impl Checker {
         // if it was consumed in ANY arm (conservative). Mirrors `infer_if`.
         let consumed_before_arms = self.consumed_streams.clone();
         let mut consumed_union = consumed_before_arms.clone();
-        for arm in arms {
+        // See `check_match`: narrow the scrutinee to its non-Null complement in arms reached after
+        // a preceding `is Null` arm has excluded the Null case.
+        let null_complement = scrutinee_ty.without_null();
+        for (i, arm) in arms.iter().enumerate() {
             self.consumed_streams = consumed_before_arms.clone();
-            let typed_arm = self.check_match_arm(arm, &scrutinee_ty, scrutinee_name)?;
+            let narrow_to = if Self::null_excluded_before(arms, i) { null_complement.as_ref() } else { None };
+            let typed_arm = self.check_match_arm(arm, &scrutinee_ty, scrutinee_name, narrow_to)?;
             consumed_union.extend(self.consumed_streams.iter().copied());
             arm_types.push(typed_arm.body.ty());
             typed_arms.push(typed_arm);

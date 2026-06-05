@@ -8924,6 +8924,114 @@ print(pick(42))
     assert_eq!(out, vec!["hi", "not-a-string"]);
 }
 
+// ── `T | Null` complement narrowing on a null-test guard (== null / != null / is Null) ──
+// Before this change all four forms FAILED to type-check: the branch that excludes Null still
+// saw `v: Int32 | Null`, so a function declared `: Int32` rejected with
+// "Function body has type Int32 | Null, declared return type is Int32".
+
+#[test]
+fn test_null_narrow_if_eq_null_else() {
+    // (a) `if v == null then 0 else v` — Null excluded in ELSE → v narrows to Int32 there.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val f = (v: Int32 | Null): Int32 =>
+  if v == null then 0 else v
+print(f(7).toString())
+print(f(null).toString())
+"#);
+    assert_eq!(out, vec!["7", "0"]);
+}
+
+#[test]
+fn test_null_narrow_if_is_null_else() {
+    // (b) `if v is Null then 0 else v` — Null excluded in ELSE → v narrows to Int32 there.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val f = (v: Int32 | Null): Int32 =>
+  if v is Null then 0 else v
+print(f(7).toString())
+print(f(null).toString())
+"#);
+    assert_eq!(out, vec!["7", "0"]);
+}
+
+#[test]
+fn test_null_narrow_match_is_null_else() {
+    // (c) `match v / is Null => 0 / else => v` — the else arm (reached only when Null was already
+    // matched by the prior `is Null` arm) narrows v to Int32.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val f = (v: Int32 | Null): Int32 =>
+  match v
+    is Null => 0
+    else => v
+print(f(7).toString())
+print(f(null).toString())
+"#);
+    assert_eq!(out, vec!["7", "0"]);
+}
+
+#[test]
+fn test_null_narrow_if_neq_null_then() {
+    // (d) `if v != null then v else 0` — the POSITIVE guard: Null excluded in THEN → v narrows to
+    // Int32 in the then-branch.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val f = (v: Int32 | Null): Int32 =>
+  if v != null then v else 0
+print(f(7).toString())
+print(f(null).toString())
+"#);
+    assert_eq!(out, vec!["7", "0"]);
+}
+
+#[test]
+fn test_null_narrow_json_map_read() {
+    // The motivating case (ADR-082): reading a `{ String: Int32 }` value yields `Int32 | Null`;
+    // binding it and null-testing narrows it to Int32 in the non-null branch. Covers all four
+    // forms over a real index-signature map read (present key + missing key).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val m: { String: Int32 } = { "a": 5 }
+val viaEq = (k: String): Int32 =>
+  val v = m[k]
+  if v == null then 0 else v
+val viaNeq = (k: String): Int32 =>
+  val v = m[k]
+  if v != null then v else -1
+val viaMatch = (k: String): Int32 =>
+  val v = m[k]
+  match v
+    is Null => 0
+    else => v
+print(viaEq("a").toString())
+print(viaEq("missing").toString())
+print(viaNeq("a").toString())
+print(viaNeq("missing").toString())
+print(viaMatch("a").toString())
+print(viaMatch("missing").toString())
+"#);
+    assert_eq!(out, vec!["5", "0", "5", "-1", "5", "0"]);
+}
+
+#[test]
+fn test_null_narrow_three_member_union_keeps_rest() {
+    // `A | B | Null` minus Null = `A | B` (not collapsed to a single member). The narrowed branch
+    // accepts a value typed `Int32 | String`, and a subsequent `is` arm discriminates it.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val describe = (v: Int32 | String | Null): String =>
+  if v == null then "null" else
+    match v
+      is Int32 => "int:${v.toString()}"
+      else => "str"
+print(describe(7))
+print(describe("hi"))
+print(describe(null))
+"#);
+    assert_eq!(out, vec!["int:7", "str", "null"]);
+}
+
 #[test]
 fn test_is_objecttype_expr_checks_required_fields() {
     // Regression (ADR-054): the EXPRESSION form `x is Person` must check that the object has
