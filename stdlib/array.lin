@@ -93,6 +93,16 @@ export val at = <T>(arr: T[], index: Int32): T | Null =>
   val i = if index < 0 then length(arr) + index else index
   if i >= 0 && i < length(arr) then arr[i] else null
 
+// Defaulted bounds-safe read: the element at `index`, or `default` when `index` is out of
+// bounds (after the same negative-index normalisation as `at`). Returns a bare `T` — usable
+// directly in arithmetic with no null guard, which is the whole point. Implemented as a SEPARATE
+// function rather than a `default: T = …` parameter on `at`: a generic `T` has no spellable
+// default expression (`null` would be `T | Null`, defeating the bare-`T` return), so a defaulted
+// param cannot be expressed without breaking the no-default `at`'s `T | Null` result.
+export val atOr = <T>(arr: T[], index: Int32, default: T): T =>
+  val i = if index < 0 then length(arr) + index else index
+  if i >= 0 && i < length(arr) then arr[i] else default
+
 // The predicate OPTIONALLY receives a 0-based `Int32` SOURCE index (`(item, i) => …`); a 1-arg
 // predicate stays valid via arity-width subtyping. We thread `idx` and call `f(item, idx)` — the
 // checker pads a 1-arg lambda to 2 params so the closure-call arity always matches. Generic over the

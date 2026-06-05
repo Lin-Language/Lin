@@ -3437,6 +3437,57 @@ print(toString(length(values(m))))
 }
 
 #[test]
+fn test_generic_over_map_only_param_monomorphizes() {
+    // Regression: a generic whose type parameter `T` appears ONLY inside an index-signature map
+    // parameter `{ String: T }` must still monomorphize. The IR monomorphizer's `collect_subs` /
+    // `mentions_generic_tv` / `subst_type` / `erase_nonconcrete_typevars` were missing a `Type::Map`
+    // arm, so `T` was never recovered from the map argument. `object.get`'s third `default: T`
+    // param made it register as generic but emit an undefined base symbol; this exercises the
+    // map-element binding directly via a user-defined `get`-shaped accessor.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val getOr = <T>(m: { String: T }, key: String, default: T): T =>
+  match m[key]
+    is Null => default
+    else => m[key]
+
+var m: { String: Int32 } = {}
+m["a"] = 7
+print(toString(getOr(m, "a", 0)))
+print(toString(getOr(m, "missing", 99)))
+
+var s: { String: String } = {}
+s["k"] = "hi"
+print(getOr(s, "k", "x"))
+print(getOr(s, "z", "fallback"))
+"#);
+    assert_eq!(output, vec!["7", "99", "hi", "fallback"]);
+}
+
+#[test]
+fn test_stdlib_object_get_and_array_ator() {
+    // The shipped defaulted accessors (`std/object.get`, `std/array.atOr`) over the cross-module
+    // monomorphization path. Both return a bare `T` usable in arithmetic with no null guard.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { get } from "std/object"
+import { atOr } from "std/array"
+
+var m: { String: Int32 } = {}
+m["a"] = 7
+print(toString(m.get("a", 0) + 1))
+print(toString(m.get("missing", 5) + 1))
+
+print(toString([10, 20, 30].atOr(1, -1)))
+print(toString([10, 20, 30].atOr(5, -1)))
+print(toString([10, 20, 30].atOr(-1, -1)))
+print(toString([10, 20, 30].atOr(-9, 99)))
+"#);
+    assert_eq!(output, vec!["8", "6", "20", "-1", "30", "99"]);
+}
+
+#[test]
 fn test_typed_map_scales_linear_not_quadratic() {
     // The O(1)-average hashed backing: insert N distinct keys then look every one back up.
     // With the old O(n) assoc-list this is O(n^2); the LinMap makes it O(n). A correctness

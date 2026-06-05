@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
-import { keys, values, entries, fromEntries, merge, pick, omit, mapValues, isEmpty } from "std/object"
+import { keys, values, entries, fromEntries, merge, pick, omit, mapValues, isEmpty, get } from "std/object"
 import { length } from "std/array"
 import { range, for } from "std/iter"
 
@@ -421,6 +421,42 @@ val s = suite("std/object", [
     [
       expect(doubled["a"]).toBe(2),
       expect(doubled["b"]).toBe(4)
+    ]
+  ),
+
+  // --- get: defaulted read (`m[k] ?? default`) ---
+  test("get returns the value when the key is present", () =>
+    var m: { String: Int32 } = {}
+    m["a"] = 7
+    [
+      expect(m.get("a", 0)).toBe(7)
+    ]
+  ),
+
+  test("get returns the default when the key is absent", () =>
+    var m: { String: Int32 } = {}
+    m["a"] = 7
+    [
+      expect(m.get("missing", 99)).toBe(99)
+    ]
+  ),
+
+  test("get returns string values and defaults", () =>
+    var m: { String: String } = {}
+    m["k"] = "hi"
+    [
+      expect(m.get("k", "x")).toBe("hi"),
+      expect(m.get("z", "fallback")).toBe("fallback")
+    ]
+  ),
+
+  // The point of get: the result is a bare T usable in arithmetic with no null guard.
+  test("get returns a bare T usable in arithmetic", () =>
+    var m: { String: Int32 } = {}
+    m["a"] = 7
+    val total: Int32 = m.get("a", 0) + m.get("missing", 5)
+    [
+      expect(total).toBe(12)
     ]
   )
 ])
