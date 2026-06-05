@@ -12,6 +12,8 @@ val s = suite("std/object", [
     ]
   ),
 
+  // `keys` over a plain `{}`/`Json` record preserves insertion order (TAG_OBJECT). Over a typed
+  // `{ String: T }` map it is hash order — that distinction is covered in the typed-map section.
   test("keys order is insertion order", () =>
     val k = { "x": 1, "y": 2 }.keys()
     [
@@ -80,28 +82,34 @@ val s = suite("std/object", [
   ),
 
   test("merge combines two objects", () =>
-    val merged = { "a": 1, "b": 2 }.merge({ "c": 3 })
+    val a: { String: Int32 } = { "a": 1, "b": 2 }
+    val b: { String: Int32 } = { "c": 3 }
+    val merged = a.merge(b)
     [
       expect(merged["a"]).toBe(1)
     ]
   ),
 
   test("merge right wins on conflict", () =>
-    val merged = { "a": 1, "b": 2 }.merge({ "b": 3, "c": 4 })
+    val a: { String: Int32 } = { "a": 1, "b": 2 }
+    val b: { String: Int32 } = { "b": 3, "c": 4 }
+    val merged = a.merge(b)
     [
       expect(merged["b"]).toBe(3)
     ]
   ),
 
   test("merge includes all keys", () =>
-    val merged = { "a": 1 }.merge({ "b": 2 })
+    val a: { String: Int32 } = { "a": 1 }
+    val b: { String: Int32 } = { "b": 2 }
+    val merged = a.merge(b)
     [
       expect(merged.keys().length()).toBe(2)
     ]
   ),
 
   test("pick returns only specified keys", () =>
-    val obj = {
+    val obj: { String: Int32 } = {
       "a": 1,
       "b": 2,
       "c": 3
@@ -113,7 +121,7 @@ val s = suite("std/object", [
   ),
 
   test("pick includes correct values", () =>
-    val obj = {
+    val obj: { String: Int32 } = {
       "a": 1,
       "b": 2,
       "c": 3
@@ -125,7 +133,7 @@ val s = suite("std/object", [
   ),
 
   test("pick second included value is correct", () =>
-    val obj = {
+    val obj: { String: Int32 } = {
       "a": 1,
       "b": 2,
       "c": 3
@@ -137,7 +145,7 @@ val s = suite("std/object", [
   ),
 
   test("pick excludes unspecified keys", () =>
-    val obj = {
+    val obj: { String: Int32 } = {
       "a": 1,
       "b": 2,
       "c": 3
@@ -149,7 +157,7 @@ val s = suite("std/object", [
   ),
 
   test("omit returns object without specified keys", () =>
-    val obj = {
+    val obj: { String: Int32 } = {
       "a": 1,
       "b": 2,
       "c": 3
@@ -161,7 +169,7 @@ val s = suite("std/object", [
   ),
 
   test("omit excluded key is absent", () =>
-    val obj = {
+    val obj: { String: Int32 } = {
       "a": 1,
       "b": 2,
       "c": 3
@@ -173,7 +181,7 @@ val s = suite("std/object", [
   ),
 
   test("omit keeps remaining keys", () =>
-    val obj = {
+    val obj: { String: Int32 } = {
       "a": 1,
       "b": 2,
       "c": 3
@@ -185,7 +193,7 @@ val s = suite("std/object", [
   ),
 
   test("mapValues transforms all values", () =>
-    val obj = { "a": 1, "b": 2 }
+    val obj: { String: Int32 } = { "a": 1, "b": 2 }
     val m = obj.mapValues(x => x * 2)
     [
       expect(m["a"]).toBe(2)
@@ -193,7 +201,7 @@ val s = suite("std/object", [
   ),
 
   test("mapValues second value is transformed", () =>
-    val obj = { "a": 1, "b": 2 }
+    val obj: { String: Int32 } = { "a": 1, "b": 2 }
     val m = obj.mapValues(x => x * 2)
     [
       expect(m["b"]).toBe(4)
@@ -201,7 +209,7 @@ val s = suite("std/object", [
   ),
 
   test("mapValues preserves all keys", () =>
-    val obj = { "a": 1, "b": 2 }
+    val obj: { String: Int32 } = { "a": 1, "b": 2 }
     val m = obj.mapValues(x => x * 2)
     [
       expect(m.keys().length()).toBe(2)
@@ -236,7 +244,8 @@ val s = suite("std/object", [
   // String values exercise the object-set store's retain semantics; scalar values
   // hide RC bugs. The ASan CI leg also runs these.
   test("mapValues producing string values", () =>
-    val m = { "a": 1, "b": 2 }.mapValues(v => "v${v}")
+    val obj: { String: Int32 } = { "a": 1, "b": 2 }
+    val m = obj.mapValues(v => "v${v}")
     [
       expect(m["a"]).toBe("v1"),
       expect(m["b"]).toBe("v2")
@@ -244,7 +253,12 @@ val s = suite("std/object", [
   ),
 
   test("pick copies string values", () =>
-    val p = { "a": "x", "b": "y", "c": "z" }.pick(["a", "c"])
+    val obj: { String: String } = {
+      "a": "x",
+      "b": "y",
+      "c": "z"
+    }
+    val p = obj.pick(["a", "c"])
     [
       expect(p["a"]).toBe("x"),
       expect(p["c"]).toBe("z"),
@@ -253,7 +267,12 @@ val s = suite("std/object", [
   ),
 
   test("omit copies remaining string values", () =>
-    val o = { "a": "x", "b": "y", "c": "z" }.omit(["b"])
+    val obj: { String: String } = {
+      "a": "x",
+      "b": "y",
+      "c": "z"
+    }
+    val o = obj.omit(["b"])
     [
       expect(o["a"]).toBe("x"),
       expect(o["c"]).toBe("z"),
@@ -387,6 +406,21 @@ val s = suite("std/object", [
       expect(m["c"]).toBe(3i64),
       expect(m["z"]).toBe(null),
       expect(m.values().length()).toBe(3)
+    ]
+  ),
+
+  // The re-typed map-producing ops thread the element type through: `mapValues` over a
+  // `{ String: Int32 }` returns a `{ String: W }` (here `W = Int32`) — a genuinely typed map whose
+  // values read back at the mapped type, not an opaque `Json`. The `: { String: Int32 }` annotation
+  // on `doubled` only type-checks because the result really is that map type.
+  test("typed map: mapValues yields a typed { String: W } result", () =>
+    var src: { String: Int32 } = {}
+    src["a"] = 1
+    src["b"] = 2
+    val doubled: { String: Int32 } = src.mapValues(v => v * 2)
+    [
+      expect(doubled["a"]).toBe(2),
+      expect(doubled["b"]).toBe(4)
     ]
   )
 ])

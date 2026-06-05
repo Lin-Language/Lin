@@ -733,7 +733,8 @@ val s = suite("std/array", [
   ),
 
   test("groupBy empty array returns empty object", () =>
-    val result = [].groupBy(x => "k")
+    val empty: Int32[] = []
+    val result = empty.groupBy(x => "k")
     [
       expect(result["k"]).toBe(null)
     ]
@@ -780,7 +781,8 @@ val s = suite("std/array", [
   ),
 
   test("countBy empty array returns empty object", () =>
-    val result = [].countBy(x => x)
+    val empty: String[] = []
+    val result = empty.countBy(x => x)
     [
       expect(result["anything"]).toBe(null)
     ]

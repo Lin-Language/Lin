@@ -18,8 +18,8 @@ import { sort, sortBy, length, push, slice, sum } from "std/array"
 | `at` | `<T>(T[], Int32) -> T \| Null` | Element at index, or null if out of bounds; negative counts from end |
 | `chunk` | `<T>(T[], Int32) -> T[][]` | Split into n-sized sub-arrays |
 | `compact` | `(Json[]) -> Json[]` | Remove null elements |
-| `countBy` | `(Json[], (Json) -> String) -> {}` | Frequency map by key function |
-| `groupBy` | `(Json[], (Json) -> String) -> {}` | Group into object of arrays |
+| `countBy` | `<T>(T[], (T) -> String) -> { String: Int32 }` | Frequency map by key function |
+| `groupBy` | `<T>(T[], (T) -> String) -> { String: T[] }` | Group into a typed map of arrays |
 | `indexOf` | `<T>(T[], T, Int32 = 0) -> Int32` | First index of value at or after `fromIndex`, or -1 (negative counts from end) |
 | `length` | `(Json) -> Int32` | Length of array, string, or object |
 | `max` | `(Number[]) -> Number` | Maximum element |
