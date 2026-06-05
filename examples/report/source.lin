@@ -28,7 +28,7 @@ val rowsOf = (body: String): String[] =>
 // decompress fault the stream threads an Error in-band; we surface that as an
 // empty batch (the caller's report then shows count=0).
 export val rowsFromArchive = (path: String): String[] =>
-  var rows = []
+  var rows: String[] = []
   val result = readStream(path)
     .gunzip()
     .untar((meta, data) =>
@@ -47,7 +47,7 @@ export val rowsFromArchive = (path: String): String[] =>
 // List the archive's members without extracting them — a cheap "what's in here?"
 // pass that reads each tar header and skips the body. Returns the member names.
 export val archiveMembers = (path: String): String[] =>
-  var names = []
+  var names: String[] = []
   readStream(path)
     .gunzip()
     .manifest()

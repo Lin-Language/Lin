@@ -1988,3 +1988,60 @@ across Stages 0.5 (inert `sealed` marker through resolution), 1 (scalar records)
 remain boxed (a follow-up). The whole change is ASan-verified (the per-field RC at
 every drop site is the UAF/double-free-prone surface) and run-equivalence-checked
 over `stdlib/`+`examples/`.
+
+## ADR-084: An evidence-free empty collection literal requires a type annotation
+
+**Status**: Accepted.
+
+**Context**: A context-free empty literal inferred a degenerate element type — `[]` →
+`Array(Never)`, `{}` → an empty record `{ }`. This silently misbehaved: the type carried no
+usable element information, so it forced array-building primitives (`std/array.push`/`append`/
+`prepend`/`compact`) to keep an opaque `(Json, …)` signature, which in turn meant the element
+type was never checked — `push(intArr, "a string")` type-checked and would corrupt at runtime.
+
+**Decision**: An empty collection literal (`[]` or `{}`) with **neither contextual type evidence
+nor contents** is a compile error that asks for an annotation. "Contextual evidence" is any of: an
+annotation on the binding, a typed function parameter (argument position), a declared return type,
+or a typed array element. The check is deliberately narrow and surgical: it fires only in the
+genuinely contextless position — an un-annotated `val`/`var` binding whose value is a *bare* `[]`
+or `{}` (`checker/stmt.rs`, gated on the `expected.is_none()` branch via `empty_literal_kind` in
+`checker/helpers.rs`). Every contextual empty still flows through `check_expr` with the expected
+type pushed down and is **unaffected** — `val a: Int32[] = []`, `f([])` into a typed param, a
+`(): Int32[] => []` return, `val m: { String: Int32 } = {}`, and `val o: {} = {}` for a dynamic
+record all keep working exactly as before.
+
+Error messages:
+- array: `cannot infer the element type of an empty array literal; add a type annotation, e.g.
+  `val xs: Int32[] = []``
+- map/object: `cannot infer the value type of an empty map/object literal; add a type annotation,
+  e.g. `val m: { String: Int32 } = {}``
+
+**Phase 2 (the array-builder generic payoff) is DEFERRED, not delivered.** With an annotated
+accumulator the natural follow-up is `push = <T>(arr: T[], item: T): Null` (and likewise
+`append`/`prepend`), which would finally CHECK the element type and close the `push(intArr,
+"str")` hole. That generic form does NOT compile correctly today: the monomorphized body
+`push$<T>` calls the `lin_push` intrinsic with its `item: T` param, and the intrinsic mishandles a
+BOXED element arriving across that param boundary for several element representations —
+- a borrowed `Json` element (e.g. `push(acc, m["k"])` over a stream `.for`) **double-frees** (the
+  codegen `Array(Json)` path routes to `lin_array_push_tagged`, which CONSUMES the box without an
+  inner retain, contradicting the IR's `transfer_into_container` retain-semantics assumption); and
+- a concrete heap-object element (e.g. `push(pqEntries, e)` over a `{ … }[]`) is stored as a raw
+  object pointer though it is actually a `TaggedVal*` box → an `index_probe` crash on read.
+
+These are pre-existing monomorphized-body/intrinsic representation gaps that the empty-literal
+requirement does not remove. Making `push`/`append`/`prepend` generic is gated on first fixing that
+representation contract (ASan-verified RC work). `append`/`prepend` carry an additional independent
+blocker: a literal item (`b.append(3)` on a `UInt8[]`) defaults to `Int32` and splits the static
+`T` from the flat runtime representation (a call-site literal-width inference gap). `compact` keeps
+`Json` because its natural `<T>((T | Null)[]): T[]` is still unparseable (postfix `[]` on a
+parenthesized union). `arrayAllocate` stays `(Int32): Json` (a return-only `T` would force an
+annotation at every call site). So Phase 2 remains future work; `push`/`append`/`prepend` keep
+their `(Json, …)` signatures for now.
+
+**Consequence**: The newly-erroring evidence-free empty literals across the repo were annotated
+(`stdlib/string.lin`, `stdlib/array.lin`, `stdlib/iter.lin`, `stdlib/object.lin`, plus
+`*.test.lin` and several `examples/`/`benchmarks/`/`docs-site/builder/` accumulators). The
+`std/test`-style dynamic record accumulator pattern (`var o = {}; o[k] = v`) annotates as `: {}`
+(the empty-record type, preserving the growable `LinObject` backing) — NOT `Json`, which has a
+pre-existing escaping-object bug, and NOT `{ String: T }`, which switches to the hashed `LinMap`
+backing and changes `toString`/`keys` behavior.

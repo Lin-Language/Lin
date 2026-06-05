@@ -2,7 +2,7 @@ use lin_common::{Diagnostic, Span};
 use lin_parse::ast::{Expr, Stmt};
 
 use super::Checker;
-use super::helpers::is_legal_ffi_type;
+use super::helpers::{empty_literal_kind, is_legal_ffi_type};
 use crate::resolve::resolve_type;
 use crate::typed_ir::*;
 use crate::types::Type;
@@ -63,6 +63,13 @@ impl Checker {
                         } else if let Some(ref expected_ty) = expected {
                             self.check_expr(value, expected_ty)?
                         } else {
+                            // No annotation and no allocation hint: this is the genuinely
+                            // evidence-free position. A bare `[]`/`{}` here has no element/value
+                            // type to fix, so require an annotation rather than inferring the
+                            // degenerate `Array(Never)` / empty-record type (ADR-084).
+                            if let Some(kind) = empty_literal_kind(value) {
+                                return Err(Diagnostic::error(value.span(), kind.message()));
+                            }
                             self.infer_expr(value)?
                         }
                     }
@@ -187,6 +194,11 @@ impl Checker {
                 let typed_value = if let Some(ref expected_ty) = expected {
                     self.check_expr(value, expected_ty)?
                 } else {
+                    // Evidence-free empty `[]`/`{}` with no annotation: require an annotation
+                    // rather than inferring the degenerate element/value type (ADR-084).
+                    if let Some(kind) = empty_literal_kind(value) {
+                        return Err(Diagnostic::error(value.span(), kind.message()));
+                    }
                     self.infer_expr(value)?
                 };
 
