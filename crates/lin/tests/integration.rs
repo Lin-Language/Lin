@@ -3694,6 +3694,52 @@ print(toString(length(values(m))))
 }
 
 #[test]
+fn test_json_not_assignable_to_typed_map() {
+    // Type-soundness: there is intentionally NO implicit `Json -> { String: T }` coercion
+    // (§5.1.1, §6.3, ADR-082). A `Json` value's runtime payload is a `LinObject` (or any tag),
+    // NOT a `LinMap`; relabelling it to the index-signature map type at the call boundary does
+    // not convert the representation, so the callee would then read `LinObject` memory as a
+    // `LinMap` and corrupt it. The value must be decoded via `fromJson` / narrowing instead.
+    // This closes the trusted-stdlib (`lenient_json`) hole: even the stdlib's permissive
+    // Json-widening must NOT manufacture this coercion (compat.rs `(TypeVar(MAX), Map) => false`,
+    // which fires AHEAD of the lenient `Json -> concrete` arm). The same rejection holds in user
+    // code, exercised here.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val sink = (m: { String: Int32 }): Int32 => 0
+
+val j: Json = { "a": 1, "b": 2 }
+print(toString(sink(j)))
+"#);
+    assert!(
+        err.contains("expected { String: Int32 }"),
+        "expected a Json -> map argument-type rejection, got: {err}"
+    );
+}
+
+#[test]
+fn test_typed_map_still_widens_to_json_sink() {
+    // The SOUND direction `{ String: T } -> Json` must keep working: a typed map flows into a
+    // `Json` parameter of a tag-aware reader (keys/values/entries dispatch on the runtime tag),
+    // which is representation-safe. This is the companion to `test_json_not_assignable_to_typed_map`
+    // — the carve-out closes only the unsound direction, not this one.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { keys, values } from "std/object"
+import { length } from "std/array"
+
+var m: { String: Int32 } = {}
+m["a"] = 1
+m["b"] = 2
+// `keys`/`values` are typed `(Json): ...`; passing the typed map here is `{String:Int32} -> Json`.
+print(toString(length(keys(m))))
+print(toString(length(values(m))))
+"#);
+    assert_eq!(output, vec!["2", "2"]);
+}
+
+#[test]
 fn test_generic_over_map_only_param_monomorphizes() {
     // Regression: a generic whose type parameter `T` appears ONLY inside an index-signature map
     // parameter `{ String: T }` must still monomorphize. The IR monomorphizer's `collect_subs` /
