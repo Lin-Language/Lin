@@ -105,7 +105,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 
 | Function | Signature | Summary |
 | --- | --- | --- |
-| [`append`](#append) | `(Json[], Json) -> Json[]` | Non-mutating single-element append |
+| [`append`](#append) | `<T>(T[], T) -> T[]` | Non-mutating single-element append |
 | [`arrayAllocate`](#arrayAllocate) | `(Int32) -> Json[]` | Allocate an array of n nulls |
 | [`arrayAllocateFilled`](#arrayAllocateFilled) | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
 | [`at`](#at-array) | `<T>(T[], Int32) -> T \| Null` | Element at index, or `null` if out of bounds; negative indices count from end |
@@ -121,9 +121,9 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`min`](#min-array) | `(Number[]) -> Number` | Minimum element |
 | [`minBy`](#minBy) | `(Json[], (Json) -> Number) -> Json` | Element with the smallest key |
 | [`partition`](#partition) | `<T>(T[], (T) -> Boolean) -> T[][]` | Split into passing and failing (`result[0]` pass, `result[1]` fail) |
-| [`prepend`](#prepend) | `(Json[], Json) -> Json[]` | Non-mutating single-element prepend |
+| [`prepend`](#prepend) | `<T>(T[], T) -> T[]` | Non-mutating single-element prepend |
 | [`product`](#product) | `(Number[]) -> Number` | Product of all elements |
-| [`push`](#push) | `(Json[], Json) -> Null` | Append an element to an array in place |
+| [`push`](#push) | `<T>(T[], T) -> Null` | Append an element to an array in place |
 | [`reverse`](#reverse) | `<T>(T[]) -> T[]` | Return a reversed copy |
 | [`scan`](#scan) | `<T, U>(T[], U, (U, T) -> U) -> U[]` | Reduce returning all intermediate values |
 | [`set`](#set-array) | `<T>(T[], Int32, T) -> Null` | Set an element by index in place |
@@ -1246,14 +1246,15 @@ import { push, slice, sort, sum } from "std/array"
 ### append
 
 ```txt
-val append: (arr: Json[], item: Json) -> Json[]
+val append: <T>(arr: T[], item: T) -> T[]
 ```
 
-Returns a new array with `item` added at the end. Does not modify `arr`. For in-place mutation, use `push`. The result preserves the input's element representation: appending to a flat scalar array (e.g. `UInt8[]`, `Int32[]`) yields a flat array of the same type (the item is coerced into the element type), so byte-level consumers still read packed bytes; a `Json[]` stays tagged.
+Returns a new array with `item` added at the end. Does not modify `arr`. For in-place mutation, use `push`. Generic over the element type `T`, so the element type is enforced: `append(intArr, "s")` is a compile error. The result preserves the input's element representation: appending to a flat scalar array (e.g. `UInt8[]`, `Int32[]`) yields a flat array of the same type (a numeric LITERAL item adopts the array's element width, so `b.append(3)` on a `UInt8[]` stays `UInt8[]`), so byte-level consumers still read packed bytes; a `Json[]` stays tagged.
 
 ```txt
 append([1, 2], 3)    // [1, 2, 3]
-append([], "hello")  // ["hello"]
+val ss: String[] = []
+append(ss, "hello")  // ["hello"]
 ```
 
 ---
@@ -1508,14 +1509,15 @@ val [evens, odds] = [1, 2, 3, 4, 5].partition(x => x % 2 == 0)
 ### prepend
 
 ```txt
-val prepend: (arr: Json[], item: Json) -> Json[]
+val prepend: <T>(arr: T[], item: T) -> T[]
 ```
 
-Returns a new array with `item` added at the beginning. Does not modify `arr`. Like `append`, the result preserves the input's element representation (a flat `UInt8[]`/`Int32[]` stays flat; a `Json[]` stays tagged).
+Returns a new array with `item` added at the beginning. Does not modify `arr`. Generic over `T` (same element-type enforcement as `append`). Like `append`, the result preserves the input's element representation (a flat `UInt8[]`/`Int32[]` stays flat; a `Json[]` stays tagged).
 
 ```txt
 prepend([2, 3], 1)    // [1, 2, 3]
-prepend([], "hello")  // ["hello"]
+val ss: String[] = []
+prepend(ss, "hello")  // ["hello"]
 ```
 
 ---
@@ -1538,13 +1540,13 @@ product([])              // 1
 ### push
 
 ```txt
-val push: (arr: Json[], item: Json) -> Null
+val push: <T>(arr: T[], item: T) -> Null
 ```
 
-Appends `item` to `arr` in place. This is one of the few mutating operations in Lin — it modifies the array that was passed in.
+Appends `item` to `arr` in place. This is one of the few mutating operations in Lin — it modifies the array that was passed in. Generic over the element type `T`, so the element type is enforced: `push(intArr, "s")` is a compile error (ADR-085). An empty accumulator literal must be annotated so `T` is pinned: an evidence-free `[]` cannot infer its element type (ADR-084) — `val xs: Int32[] = []`, not `val xs = []`.
 
 ```txt
-val xs = []
+val xs: Int32[] = []
 push(xs, 1)
 push(xs, 2)
 // xs is now [1, 2]

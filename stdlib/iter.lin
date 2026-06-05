@@ -153,7 +153,7 @@ export val every = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): 
 // for this mixing combinator (the same reason the audit flags `flatMap`/`concat` as "may stay
 // wider"). The callback's `Int32` index param is preserved.
 export val flatMap = (arr: Json, f: (Json, Int32) => Json): Json =>
-  val result = []
+  val result: Json[] = []
   var idx = 0
   arr.for(item =>
     val inner = f(item, idx)
@@ -174,7 +174,7 @@ export val take = <T>(arr: T[] | Iterator | Stream, n: Int32): T[] =>
   result
 
 export val drop = <T>(arr: T[] | Iterator | Stream, n: Int32): T[] =>
-  val result = []
+  val result: T[] = []
   val start = if n < length(arr) then n else length(arr)
   var i = 0
   arr.for(item =>
@@ -184,7 +184,7 @@ export val drop = <T>(arr: T[] | Iterator | Stream, n: Int32): T[] =>
   result
 
 export val takeWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): T[] =>
-  val result = []
+  val result: T[] = []
   var idx = 0
   lin_while(arr, item =>
     val keep = f(item, idx)
@@ -195,7 +195,7 @@ export val takeWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolea
   result
 
 export val dropWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): T[] =>
-  val result = []
+  val result: T[] = []
   var dropping = true
   var idx = 0
   arr.for(item =>

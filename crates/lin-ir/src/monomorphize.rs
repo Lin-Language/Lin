@@ -585,7 +585,12 @@ enum OriginRef {
 /// defines the symbol — the symbol lives under that module's mangled prefix, never the
 /// intermediate's. This is what makes `helpers.lin`'s `import { for, push } from "std/array"`
 /// re-home to `std_array_for` / `std_array_push`, not the non-existent `._helpers_for`.
-fn classify_origin_slot(origin: &TypedModule, origin_path: &str, slot: usize) -> Option<OriginRef> {
+fn classify_origin_slot(
+    origin: &TypedModule,
+    origin_path: &str,
+    slot: usize,
+    imports: &HashMap<String, TypedModule>,
+) -> Option<OriginRef> {
     if let Some(name) = origin.intrinsics.get(&slot) {
         return Some(OriginRef::Intrinsic(name.clone()));
     }
@@ -622,7 +627,26 @@ fn classify_origin_slot(origin: &TypedModule, origin_path: &str, slot: usize) ->
                 for b in bindings {
                     if b.slot == slot {
                         // Import-of-import: the symbol is defined by `path` (the source module),
-                        // not by `origin_path`. Re-home the reference to that source module.
+                        // not by `origin_path`. If the SOURCE module defines it as a thin intrinsic
+                        // wrapper (`push = <T>(a, x) => lin_push(a, x)`), INLINE it to the intrinsic —
+                        // exactly as the direct-sibling arm does. Without this, a generic re-homed
+                        // body that calls a re-exported thin wrapper (e.g. `helpers.lin`'s
+                        // `import { push } from "std/array"` used inside a generic `mymap<T,U>`)
+                        // re-homes to the boxed `std_array_push` $Json specialization, which routes a
+                        // monomorphized FLAT `Int32[]` element through `lin_array_push_tagged` (a
+                        // 16-byte tagged write into a 4-byte flat slot → heap-buffer-overflow). The
+                        // intrinsic dispatches on the array's concrete runtime element type, keeping
+                        // the flat representation correct.
+                        if let Some(src) = imports.get(path) {
+                            if let Some(intr) = src.statements.iter().find_map(|s| match s {
+                                TypedStmt::Val { name: Some(n), value, .. } if *n == b.name =>
+                                    thin_intrinsic_wrapper(src, value),
+                                _ => None,
+                            }) {
+                                return Some(OriginRef::Intrinsic(intr));
+                            }
+                        }
+                        // Re-home the reference to that source module as a sibling Named call.
                         return Some(OriginRef::Sibling {
                             path: path.clone(),
                             name: b.name.clone(),
@@ -765,7 +789,7 @@ fn rehome_free_slot(
     origin_path: &str,
     state: &mut MonoState<'_>,
 ) -> Option<usize> {
-    let origin_ref = classify_origin_slot(origin, origin_path, origin_slot)?;
+    let origin_ref = classify_origin_slot(origin, origin_path, origin_slot, state.imports)?;
     match origin_ref {
         OriginRef::Intrinsic(name) => {
             // Intrinsics are global runtime builtins — dedupe by name alone (not per-origin) so a
@@ -1188,6 +1212,37 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                         collect_subs(&p.ty, &a.ty(), &mut subs);
                     }
                     collect_subs(&ret_type, result_type, &mut subs);
+
+                    // A genuinely-`Json` (wildcard) NON-FIRST argument flowing into a bare-TypeVar
+                    // param that an earlier CONTAINER argument pinned to a concrete type
+                    // (`push(uint8Arr, jsonVal)`, `push(out: Field[], field["bytes"]…)`) must REBIND
+                    // that param's TypeVar to the Json wildcard, so the call monomorphizes at the
+                    // DYNAMIC `$Json` representation. A `$Json` push routes through `lin_push_dyn`,
+                    // which converts the boxed element into the array's runtime element slot at
+                    // RUNTIME — the representation the non-generic `push` used. Keeping the concrete
+                    // binding instead forces the scalar-param body to receive a raw boxed Json
+                    // pointer it then `box_value`s as a scalar (`zext ptr` → codegen verifier error).
+                    // Mirrors lin-check's `infer_call`/`infer_dot_call` Json-item rebind. First arg is
+                    // the container and keeps its concrete element binding.
+                    for (i, p) in params.iter().enumerate() {
+                        if i == 0 { continue; }
+                        if let Type::TypeVar(id) = &p.ty {
+                            if *id != u32::MAX {
+                                // A bare-TypeVar item type — the Json wildcard `MAX` OR a leftover
+                                // unsolved checker inference var (e.g. `src[i]` indexing a `Json` is
+                                // typed `TypeVar(2)`) — is a DYNAMIC value with no concrete scalar
+                                // representation. It cannot be soundly stored into a concrete-scalar
+                                // element slot, so route the push dynamically.
+                                let item_is_json = args.get(i)
+                                    .map(|a| matches!(a.ty(), Type::TypeVar(_)))
+                                    .unwrap_or(false);
+                                let bound_concrete = subs.get(id).map(|b| !b.contains_type_var()).unwrap_or(false);
+                                if item_is_json && bound_concrete {
+                                    subs.insert(*id, Type::TypeVar(u32::MAX));
+                                }
+                            }
+                        }
+                    }
 
                     // GAP 2 SAFETY: a quantified type param may be bound to a type that still
                     // mentions a NON-CONCRETE TypeVar — either the `u32::MAX` Json wildcard (a
