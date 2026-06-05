@@ -1590,6 +1590,36 @@ df([])
 }
 
 #[test]
+fn test_empty_object_literal_arg_map_param() {
+    // Regression (sibling of the array case above): an EMPTY object literal `{}` passed as an
+    // argument to a typed index-signature map param `{ String: T }` (`Type::Map`) was REJECTED at
+    // type-check time. infer_call's first pass typed the arg bottom-up via `infer_expr`, so `{}`
+    // inferred to an empty structural `Object`, which then failed to match the concrete `Map(T)`
+    // param (`Argument 1 has type {  }, expected { String: Int32 }`). A LOCAL annotated `val m:
+    // { String: T } = {}` already worked, so the runtime/Map type are fine — only the empty `{}`
+    // in argument position was broken. The fix routes object-literal args through expected-type-
+    // directed `check_expr` against a concrete (TypeVar-free) `Map` param, so the literal adopts
+    // the param's `Map(T)` representation. Insert two keys and read them back; cover String->Int32
+    // and String->String value types.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val di = (m: { String: Int32 }): Null =>
+  m["a"] = 3
+  m["b"] = 4
+  print("a=${toString(m["a"])} b=${toString(m["b"])}")
+di({})
+
+val ds = (m: { String: String }): Null =>
+  m["x"] = "hi"
+  m["y"] = "bye"
+  print("x=${m["x"]} y=${m["y"]}")
+ds({})
+"#);
+    assert_eq!(output, vec!["a=3 b=4", "x=hi y=bye"]);
+}
+
+#[test]
 fn test_flat_array_index_set_inline() {
     // The flat-scalar index-assign (`arr[i] = x`) is INLINED in codegen when the element type is a
     // flat scalar AND the value type matches it: a bounds-checked raw store instead of boxing +
