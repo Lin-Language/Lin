@@ -16,8 +16,17 @@ val pool = threadPool(8)
 var promises: Json[] = []
 range(0, 20000).for(i => push(promises, pool.poolAsync(() => 1)))
 
-// Drain: await every promise and sum the results.
+// Drain: await every promise and sum the results. `await` returns `T | Error`
+// (a faulted promise surfaces as Error); narrow it before summing. These tasks
+// all resolve successfully (`() => 1`), so the Error arm is never taken — 0 is
+// the correct "this never happens" fallback.
 var total = 0
-promises.for(p => total = total + await(p))
+promises.for(p =>
+  val r = await(p)
+  val n: Int32 = match r
+    is Error => 0
+    else => r
+  total = total + n
+)
 
 print(toString(total))
