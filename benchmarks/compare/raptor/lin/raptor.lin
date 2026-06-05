@@ -9,7 +9,7 @@ import { join } from "std/string"
 import { length, push, slice, sort } from "std/array"
 import { runsOn } from "./service"
 import { getDateNumber, dayOfWeek } from "./dateUtil"
-import { Date, RaptorIndex } from "./types"
+import { Date, RaptorIndex, ScanResults } from "./types"
 import { getQueue } from "./queueFactory"
 import { createRouteScanner, getTrip } from "./routeScanner"
 import { createScanResults, addRound, previousArrival, setTrip, setTransfer, bestArrival, getMarkedStops, finalize } from "./scanResults"
@@ -146,7 +146,7 @@ val indexRoute = (path: String[], i: Int32, trip: Json, routeId: String, routeSt
     )
 
 // --- scan ---
-val scanRoutes = (raptor: RaptorIndex, results: Json, routeScanner: Json, markedStops: Json): Null =>
+val scanRoutes = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json, markedStops: Json): Null =>
   val queue = getQueue(raptor["routesAtStop"], raptor["routeStopIndex"], markedStops)
   keys(queue).for(routeId =>
     // queue[routeId] is `String | Null`; narrow to the boarding stop (always present —
@@ -166,7 +166,7 @@ val scanRoutes = (raptor: RaptorIndex, results: Json, routeScanner: Json, marked
   )
 
 // Per-route forward scan from the boarding position, threading (trip, boardingPoint).
-val scanRoute = (raptor: RaptorIndex, results: Json, routeScanner: Json, routeId: String, startPi: Int32): Null =>
+val scanRoute = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json, routeId: String, startPi: Int32): Null =>
   // The route key is always present (inserted by indexRoute), so the `[]` default is dead — but
   // `get` gives a clean single-level defaulted read over the `{ String: String[] }` routePath map.
   val routePath = get(raptor["routePath"], routeId, [])
@@ -183,7 +183,7 @@ val scanRoute = (raptor: RaptorIndex, results: Json, routeScanner: Json, routeId
     -1
   )
 
-val scanRouteAt = (raptor: RaptorIndex, results: Json, routeScanner: Json, routeId: String, routePath: Json, routePathLength: Int32, pi: Int32, trip: Json, boardingPoint: Int32): Null =>
+val scanRouteAt = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json, routeId: String, routePath: Json, routePathLength: Int32, pi: Int32, trip: Json, boardingPoint: Int32): Null =>
   if pi >= routePathLength then
     null
   else
@@ -282,7 +282,7 @@ val scanRouteAt = (raptor: RaptorIndex, results: Json, routeScanner: Json, route
         boardingPoint
       )
 
-val scanTransfers = (raptor: RaptorIndex, results: Json, markedStops: Json): Null =>
+val scanTransfers = (raptor: RaptorIndex, results: ScanResults, markedStops: Json): Null =>
   markedStops.for(stopP =>
     val transfers = if raptor["transfers"][stopP] == null then
       []
@@ -306,13 +306,13 @@ val scanTransfers = (raptor: RaptorIndex, results: Json, markedStops: Json): Nul
     )
   )
 
-export val scan = (raptor: RaptorIndex, origins: Json, date: Int32, dow: Int32): Json =>
+export val scan = (raptor: RaptorIndex, origins: Json, date: Int32, dow: Int32): ScanResults =>
   val routeScanner = createRouteScanner(raptor["tripsByRoute"], date, dow)
   val results = createScanResults(raptor["stops"], origins)
   scanRounds(raptor, results, routeScanner, keys(origins))
   finalize(results)
 
-val scanRounds = (raptor: RaptorIndex, results: Json, routeScanner: Json, markedStops: Json): Null =>
+val scanRounds = (raptor: RaptorIndex, results: ScanResults, routeScanner: Json, markedStops: Json): Null =>
   if length(markedStops) > 0 then
     addRound(results)
     scanRoutes(raptor, results, routeScanner, markedStops)
