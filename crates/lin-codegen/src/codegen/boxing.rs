@@ -364,7 +364,12 @@ impl<'ctx> Codegen<'ctx> {
                 // path: sealed_project_from unboxes a union source to the raw LinObject itself.
                 self.sealed_project_from(tagged, &Type::TypeVar(u32::MAX), &fields)
             }
-            Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Function { .. } => {
+            // Typed index-signature map (`{ String: T }`, ADR-082): a `m[k]` whose value type is
+            // itself a Map is boxed as TAG_MAP. Unbox the payload back to the raw `LinMap*` so a
+            // nested store (`m[a][b] = v`) and a chained read both operate on the SHARED inner
+            // container, not on the TaggedVal box (which a missing arm here would leak through,
+            // making nested-map mutation a no-op).
+            Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Function { .. } | Type::Map(_) => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr.into()], "ir_uptr").try_as_basic_value().unwrap_basic()
             }
             Type::Null => ptr_ty.const_null().into(),
