@@ -1,17 +1,40 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { getQueue } from "./queueFactory"
 
+// getQueue now takes typed index-signature maps (ADR-082). A NON-EMPTY object literal
+// infers as a fixed record, not `{ String: T }` (only an empty `{}` infers a map from
+// context, spec §5.1.1), so the dictionary fixtures are built into typed-map `var`s.
+val routesAtStop1 = (): { String: String[] } =>
+  var m: { String: String[] } = {}
+  m["StopA"] = ["RouteA", "RouteB"]
+  m["StopB"] = ["RouteB", "RouteC"]
+  m
+
+val routeStopIndex1 = (): { String: { String: Int32 } } =>
+  var m: { String: { String: Int32 } } = {}
+  m["RouteA"] = {}
+  m["RouteA"]["StopA"] = 1
+  m["RouteB"] = {}
+  m["RouteB"]["StopA"] = 2
+  m["RouteB"]["StopB"] = 1
+  m["RouteC"] = {}
+  m["RouteC"]["StopB"] = 1
+  m
+
+val routeStopIndex2 = (): { String: { String: Int32 } } =>
+  var m: { String: { String: Int32 } } = {}
+  m["RouteA"] = {}
+  m["RouteA"]["StopA"] = 1
+  m["RouteB"] = {}
+  m["RouteB"]["StopA"] = 1
+  m["RouteB"]["StopB"] = 2
+  m["RouteC"] = {}
+  m["RouteC"]["StopB"] = 1
+  m
+
 val s = suite("QueueFactory", [
   test("enqueues stops", () => [
-    expect(getQueue(
-      { "StopA": ["RouteA", "RouteB"], "StopB": ["RouteB", "RouteC"] },
-      {
-        "RouteA": { "StopA": 1 },
-        "RouteB": { "StopA": 2, "StopB": 1 },
-        "RouteC": { "StopB": 1 }
-      },
-      ["StopA", "StopB"]
-    )).toBe({
+    expect(getQueue(routesAtStop1(), routeStopIndex1(), ["StopA", "StopB"])).toBe({
       "RouteA": "StopA",
       "RouteB": "StopB",
       "RouteC": "StopB"
@@ -19,15 +42,7 @@ val s = suite("QueueFactory", [
   ]),
 
   test("picks the earliest stop on the route", () => [
-    expect(getQueue(
-      { "StopA": ["RouteA", "RouteB"], "StopB": ["RouteB", "RouteC"] },
-      {
-        "RouteA": { "StopA": 1 },
-        "RouteB": { "StopA": 1, "StopB": 2 },
-        "RouteC": { "StopB": 1 }
-      },
-      ["StopB", "StopA"]
-    )).toBe({
+    expect(getQueue(routesAtStop1(), routeStopIndex2(), ["StopB", "StopA"])).toBe({
       "RouteA": "StopA",
       "RouteB": "StopA",
       "RouteC": "StopB"
