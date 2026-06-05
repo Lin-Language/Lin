@@ -3612,6 +3612,44 @@ print(toString(length(values(m))))
 }
 
 #[test]
+fn test_typed_map_nested() {
+    // Regression: a NESTED typed map `{ String: { String: Int32 } }`. The inner write
+    // `outer[k][k2] = v` and the chained read `outer[k][k2]` go through codegen's union/`T|Null`
+    // string-key write + index paths (the inner `outer[k]` is `{ String: Int32 } | Null`, which is
+    // NOT spellable as an `is`-pattern to narrow — ADR-082 §5.1.1 — so it stays a union at the
+    // store/read site). Before the fix those paths only dispatched TAG_OBJECT, so a TAG_MAP inner
+    // container had its nested writes silently dropped (reads returned the default) — and at scale
+    // the mistyped pointer became a misaligned-pointer crash. With the fix the writes land and read
+    // back correctly.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val intOr = (v: Int32 | Null, d: Int32): Int32 =>
+  match v
+    is Int32 => v
+    else => d
+
+val run = (): Null =>
+  var outer: { String: { String: Int32 } } = {}
+  outer["r1"] = {}
+  outer["r1"]["a"] = 10
+  outer["r1"]["b"] = 20
+  outer["r2"] = {}
+  outer["r2"]["c"] = 30
+  // mutate an existing inner map through the outer key
+  outer["r1"]["a"] = 100
+  print(toString(intOr(outer["r1"]["a"], -1)))
+  print(toString(intOr(outer["r1"]["b"], -1)))
+  print(toString(intOr(outer["r2"]["c"], -1)))
+  print(toString(intOr(outer["r2"]["missing"], -1)))
+
+run()
+"#);
+    // r1.a was overwritten 10 -> 100; r1.b = 20; r2.c = 30; a genuinely-absent key -> default -1.
+    assert_eq!(output, vec!["100", "20", "30", "-1"]);
+}
+
+#[test]
 fn test_inline_object_rc_field_construction() {
     // Phase 2 of the static-record optimization: a no-spread object literal whose fields are
     // all scalar OR concrete heap (Str/Array/Object) is constructed via INLINE entry stores
