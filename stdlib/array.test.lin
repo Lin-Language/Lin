@@ -1,6 +1,6 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
-import { indexOf, reverse, push, length, partition, zip, unique, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, arrayAllocate, arrayAllocateFilled, set, at, atOr, slice } from "std/array"
+import { indexOf, reverse, push, length, partition, zip, unique, chunk, compact, sort, sortBy, sum, product, min, max, minBy, maxBy, append, prepend, scan, groupBy, countBy, arrayAllocate, arrayAllocateFilled, set, at, slice } from "std/array"
 import { map, filter, reduce, find, some, every, flatMap, concat, range, rangeStep, for, take, drop, takeWhile, dropWhile, flatten, iterOf } from "std/iter"
 
 val s = suite("std/array", [
@@ -207,35 +207,49 @@ val s = suite("std/array", [
     ]
   ),
 
-  test("atOr returns the element when in bounds", () =>
+  // Unified `at` with a default (subsumes the old `atOr`): an in-bounds index returns the element.
+  test("at with a default returns the element when in bounds", () =>
     [
-      expect([10, 20, 30].atOr(1, -1)).toBe(20)
+      expect([10, 20, 30].at(1, -1)).toBe(20)
     ]
   ),
 
-  test("atOr returns the default when out of bounds", () =>
+  test("at with a default returns the default when out of bounds", () =>
     [
-      expect([10, 20, 30].atOr(5, -1)).toBe(-1)
+      expect([10, 20, 30].at(5, -1)).toBe(-1)
     ]
   ),
 
-  test("atOr wraps a negative index", () =>
+  test("at with a default wraps a negative index", () =>
     [
-      expect([10, 20, 30].atOr(-1, -1)).toBe(30)
+      expect([10, 20, 30].at(-1, -1)).toBe(30)
     ]
   ),
 
-  test("atOr returns the default for an out-of-range negative index", () =>
+  test("at with a default returns the default for an out-of-range negative index", () =>
     [
-      expect([10, 20, 30].atOr(-9, 99)).toBe(99)
+      expect([10, 20, 30].at(-9, 99)).toBe(99)
     ]
   ),
 
-  // The whole point of atOr: the result is a bare T, usable in arithmetic with no null guard.
-  test("atOr returns a bare T usable in arithmetic", () =>
-    val sum: Int32 = [10, 20, 30].atOr(1, 0) + [10, 20, 30].atOr(7, 5)
+  // The "definitely present" case: over an `Int32[]`, `at(i, 0)` is `Int32 | Int32 = Int32`, a
+  // bare scalar usable directly in arithmetic with no null guard (the old `atOr` ergonomic).
+  test("at with a default returns a bare T usable in arithmetic", () =>
+    val sum: Int32 = [10, 20, 30].at(1, 0) + [10, 20, 30].at(7, 5)
     [
       expect(sum).toBe(25)
+    ]
+  ),
+
+  // The default's type `D` is INDEPENDENT of the element type `T`: the result is `T | D`. A
+  // String default over an `Int32[]` therefore yields `Int32 | String` — the default never
+  // pollutes the element type.
+  test("at default has an independent type D (T | D)", () =>
+    val present: Int32 | String = [10, 20, 30].at(1, "n/a")
+    val fallback: Int32 | String = [10, 20, 30].at(9, "n/a")
+    [
+      expect(present).toBe(20),
+      expect(fallback).toBe("n/a")
     ]
   ),
 
