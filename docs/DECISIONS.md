@@ -1883,7 +1883,7 @@ from ~145s to ~27s with the cross-language correctness digest unchanged
 contiguous-run grouping workarounds (adopted to avoid big object maps) are now unnecessary and could be
 simplified back to plain `{}` maps — a follow-up, not part of this change.
 
-## ADR-082: Sealed records — unboxed struct layout for named record types
+## ADR-083: Sealed records — unboxed struct layout for named record types
 
 **Decision**: A **named** record type (`type T = { … }`) is *sealed*: its runtime
 values are laid out as an **unboxed, constant-offset struct** instead of the
