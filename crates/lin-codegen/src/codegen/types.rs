@@ -356,8 +356,11 @@ impl<'ctx> Codegen<'ctx> {
     /// while box_value wrote TAG_FLOAT64 (5).
     pub(crate) fn type_tag_const(&self, ty: &Type) -> inkwell::values::IntValue<'ctx> {
         let i8_ty = self.context.i8_type();
-        // Types that are never boxed as a recognised scalar tag (TypeVar/Union/etc.) used to
-        // map to a sentinel 0xFF; preserve that so an `is`-check never spuriously matches.
+        // Types that are never boxed as a recognised scalar tag (Union/etc.) map to a sentinel
+        // 0xFF so a stray tag comparison never spuriously matches. `compile_ir_is_type` handles
+        // TypeVar (Json-erased ⇒ always true) and Union (match-any-member) BEFORE reaching here,
+        // so this fallback is only hit for genuinely-untaggable targets where "never match" is
+        // the safe answer.
         let tag: u8 = match ty {
             Type::Null | Type::Bool | Type::Int8 | Type::Int16 | Type::Int32
             | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::Int64 | Type::UInt64
