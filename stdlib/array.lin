@@ -172,7 +172,17 @@ export val compact = (arr: Json): Json =>
 // `cmp(a, b)` returns negative if a should come before b, positive if after, 0 if equal.
 // Merge two already-sorted runs src[i..loB) and src[loB..hi) into dst[k..). On a tie
 // (cmp <= 0, i.e. left not strictly after right) the LEFT run is taken first → stable.
-val _mergeStep = (src: Json, dst: Json, i: Int32, j: Int32, loB: Int32, hi: Int32, k: Int32, cmp: (Json, Json) => Int32): Null =>
+//
+// The merge helpers are generic over the element `T`: `sort` is `<T>(arr: T[], cmp:
+// (T, T) => Int32): T[]`, and `T` threads through the helper chain. CRITICAL: the `src`/`dst`/
+// `buf`/`work` ping-pong buffers must be REAL `T[]` arrays with the SAME runtime representation as
+// `arr` (flat unboxed for a concrete scalar `T`, tagged otherwise). The generic `cmp` is
+// monomorphized to read its args in `T`'s representation, and it is called on `src[i]`/`src[j]` —
+// so the buffer reads must yield that same representation. `sort` therefore allocates the buffers
+// via `arrayAllocateFilled(n, arr[0])` (a FLAT `T[]` whose element type is pinned by `arr[0]`),
+// NOT `arrayAllocate` (which returns a tagged `Json` array — reading a flat-typed slot out of it
+// reinterprets a 16-byte TaggedVal as a packed scalar: a misaligned-pointer crash).
+val _mergeStep = <T>(src: T[], dst: T[], i: Int32, j: Int32, loB: Int32, hi: Int32, k: Int32, cmp: (T, T) => Int32): Null =>
   if k >= hi then
     null
   else if i >= loB then
@@ -189,7 +199,7 @@ val _mergeStep = (src: Json, dst: Json, i: Int32, j: Int32, loB: Int32, hi: Int3
     _mergeStep(src, dst, i, j + 1, loB, hi, k + 1, cmp)
 
 // Merge every adjacent pair of `width`-sized runs across the array (one pass).
-val _mergeRuns = (src: Json, dst: Json, n: Int32, width: Int32, lo: Int32, cmp: (Json, Json) => Int32): Null =>
+val _mergeRuns = <T>(src: T[], dst: T[], n: Int32, width: Int32, lo: Int32, cmp: (T, T) => Int32): Null =>
   if lo >= n then
     null
   else
@@ -200,20 +210,23 @@ val _mergeRuns = (src: Json, dst: Json, n: Int32, width: Int32, lo: Int32, cmp: 
 
 // Run merge passes of doubling width, ping-ponging buf <-> work; returns the buffer holding
 // the fully-sorted result.
-val _mergePass = (buf: Json, work: Json, n: Int32, width: Int32, cmp: (Json, Json) => Int32): Json =>
+val _mergePass = <T>(buf: T[], work: T[], n: Int32, width: Int32, cmp: (T, T) => Int32): T[] =>
   if width >= n then
     buf
   else
     _mergeRuns(buf, work, n, width, 0, cmp)
     _mergePass(work, buf, n, width * 2, cmp)
 
-export val sort = (arr: Json, cmp: (Json, Json) => Int32): Json =>
+export val sort = <T>(arr: T[], cmp: (T, T) => Int32): T[] =>
   val n = length(arr)
   if n <= 1 then
     concat(arr, [])
   else
-    val buf = arrayAllocate(n)
-    val work = arrayAllocate(n)
+    // `arrayAllocateFilled(n, arr[0])` pins the buffer element type to `T` and matches `arr`'s
+    // runtime representation (flat for scalar `T`, tagged otherwise) — so the generic `cmp`, which
+    // reads its args in `T`'s representation, sees the same layout it was monomorphized for.
+    val buf: T[] = arrayAllocateFilled(n, arr[0])
+    val work: T[] = arrayAllocateFilled(n, arr[0])
     var i = 0
     arr.for(item =>
       set(buf, i, item)
@@ -221,12 +234,60 @@ export val sort = (arr: Json, cmp: (Json, Json) => Int32): Json =>
     )
     _mergePass(buf, work, n, 1, cmp)
 
-export val sortBy = (arr: Json, keyFn: (Json) => Json): Json =>
-  val pairs = _mapJ(arr, item => [keyFn(item), item])
-  val sorted = sort(pairs, (a, b) =>
+// Json-internal sort used by `sortBy` (and any heterogeneous helper that sorts `Json` pair
+// arrays). It does NOT route through the generic `sort`: passing a bare `Json` value to
+// `<T>(arr: T[], …)` leaves `T` unresolved at monomorphization (the bare-`Json`-to-generic
+// inference gap also documented in bench.lin). Pinning `T = Json` explicitly here (via the
+// `Json` signature, so the `arrayAllocateFilled` fill and the `_mergePass` element type are all
+// `Json` → a tagged buffer matching the tagged pair elements) keeps the merge sound.
+val _sortJ = (arr: Json, cmp: (Json, Json) => Int32): Json =>
+  val n = length(arr)
+  if n <= 1 then
+    concat(arr, [])
+  else
+    val buf: Json = arrayAllocateFilled(n, arr[0])
+    val work: Json = arrayAllocateFilled(n, arr[0])
+    var i = 0
+    arr.for(item =>
+      set(buf, i, item)
+      i = i + 1
+    )
+    _mergePass(buf, work, n, 1, cmp)
+
+// Build the heterogeneous `[key, item]` pair array for the keyed helpers (`sortBy`/`minBy`/
+// `maxBy`). Generic over `T` so `keyFn` is element-type-checked AND so `keyFn(item)`/the stored
+// `item` see `T`'s native representation. The pairs themselves are a `Json` array (a `[Json, T]`
+// literal infers a `Json` element), which the helpers then sort/reduce via the boxed-`Json` path.
+// It maps with the RAW `lin_map` builtin (NOT the `_mapJ` wrapper, whose `Function`/`Json`-typed
+// params would coerce the generic `keyFn`/`item` into the boxed-`Json` ABI — sound for object `T`
+// but a misaligned read for a scalar `T`). Calling `lin_map` from this generic body keeps `arr`
+// at `T[]` and the lambda's `item` at `T`, so `keyFn(item)` is invoked on the `T` ABI; `lin_map`
+// boxes each result `[key, item]` pair into the returned tagged `Json` array itself.
+val _keyedPairs = <T>(arr: T[], keyFn: (T) => Json): Json =>
+  lin_map(arr, item => [keyFn(item), item])
+
+// Generic over the element `T`; the key is a comparable `Json` (a one-type-param generic). The
+// element-type checking the genericization buys is on `keyFn`'s PARAMETER: `keyFn` must accept the
+// array's element `T` (so a `keyFn` that indexes a field the element type lacks is a compile
+// error). The key VALUE stays `Json` because internally `sortBy` builds heterogeneous `[key, item]`
+// pairs (mixing the key type and `T` in one array literal, which infers a homogeneous `Json`
+// element) and sorts THOSE via the boxed-`Json` `_sortJ`. A second `<K>` key type param would have
+// to flow into that pair array, which infers homogeneously and cannot carry two distinct params —
+// so the `<T>(arr: T[], keyFn: (T) => Json): T[]` fallback is used (the spec'd acceptable fallback:
+// the key only needs to be `<`-comparable, which `Json` is).
+export val sortBy = <T>(arr: T[], keyFn: (T) => Json): T[] =>
+  val pairs = _keyedPairs(arr, keyFn)
+  val sorted = _sortJ(pairs, (a, b) =>
     if a[0] < b[0] then -1 else if a[0] > b[0] then 1 else 0
   )
-  _mapJ(sorted, pair => pair[1])
+  // Unpack the sorted `[key, item]` pairs back to a `T[]` in THIS generic body (each `pair[1]` is
+  // the original element, restored to the `T` representation in the annotated `result`). Building
+  // the result here rather than via `_mapJ(sorted, pair => pair[1])` keeps the returned array a
+  // real `T[]`: the `Json` `_mapJ` result, bound to the `T[]` return, read back element-by-element
+  // is the same erasure hazard that affects a `Json`-returning function consumed as a typed array.
+  val result: T[] = []
+  sorted.for(pair => push(result, pair[1]))
+  result
 
 export val sum = (arr: Json[]): Json =>
   _reduceJ(arr, 0, (acc, x) => acc + x)
@@ -240,14 +301,19 @@ export val min = (arr: Json[]): Json =>
 export val max = (arr: Json[]): Json =>
   _reduceJ(arr, arr[0], (acc, x) => if x > acc then x else acc)
 
-export val minBy = (arr: Json[], keyFn: (Json) => Json): Json =>
-  val pairs = _mapJ(arr, item => [keyFn(item), item])
+// Generic over the element `T`; the key is a `Number` (the existing numeric-key intent — the key
+// is compared with `<`/`>`). `keyFn`'s parameter is checked against the array element type, and
+// the result is a bare `T`. The heterogeneous `[key, item]` pairs are built by the generic
+// `_keyedPairs` (NOT `_mapJ` — see its note) and reduced over via the boxed-`Json` `_reduceJ`; the
+// winning pair's `[1]` element is a `Json` assignable into the `T` result.
+export val minBy = <T>(arr: T[], keyFn: (T) => Number): T =>
+  val pairs = _keyedPairs(arr, x => keyFn(x))
   _reduceJ(pairs, pairs[0], (acc, x) =>
     if x[0] < acc[0] then x else acc
   )[1]
 
-export val maxBy = (arr: Json[], keyFn: (Json) => Json): Json =>
-  val pairs = _mapJ(arr, item => [keyFn(item), item])
+export val maxBy = <T>(arr: T[], keyFn: (T) => Number): T =>
+  val pairs = _keyedPairs(arr, x => keyFn(x))
   _reduceJ(pairs, pairs[0], (acc, x) =>
     if x[0] > acc[0] then x else acc
   )[1]

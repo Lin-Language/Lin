@@ -117,9 +117,9 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`indexOf`](#indexOf-array) | `<T>(T[], T, Int32 = 0) -> Int32` | First index of value at/after `fromIndex` (negatives count from end), or -1 |
 | [`length`](#length-array) | `(Json) -> Int32` | Length of array, string, or object |
 | [`max`](#max-array) | `(Number[]) -> Number` | Maximum element |
-| [`maxBy`](#maxBy) | `(Json[], (Json) -> Number) -> Json` | Element with the largest key |
+| [`maxBy`](#maxBy) | `<T>(T[], (T) -> Number) -> T` | Element with the largest key |
 | [`min`](#min-array) | `(Number[]) -> Number` | Minimum element |
-| [`minBy`](#minBy) | `(Json[], (Json) -> Number) -> Json` | Element with the smallest key |
+| [`minBy`](#minBy) | `<T>(T[], (T) -> Number) -> T` | Element with the smallest key |
 | [`partition`](#partition) | `<T>(T[], (T) -> Boolean) -> T[][]` | Split into passing and failing (`result[0]` pass, `result[1]` fail) |
 | [`prepend`](#prepend) | `<T>(T[], T) -> T[]` | Non-mutating single-element prepend |
 | [`product`](#product) | `(Number[]) -> Number` | Product of all elements |
@@ -128,8 +128,8 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`scan`](#scan) | `<T, U>(T[], U, (U, T) -> U) -> U[]` | Reduce returning all intermediate values |
 | [`set`](#set-array) | `<T>(T[], Int32, T) -> Null` | Set an element by index in place |
 | [`slice`](#slice) | `<T>(T[], Int32, Int32 = length(arr)) -> T[]` | Sub-buffer copy; preserves element type; `end` optional, negatives count from end |
-| [`sort`](#sort) | `(Json[], (Json, Json) -> Int32) -> Json[]` | Return sorted copy using comparator |
-| [`sortBy`](#sortBy) | `(Json[], (Json) -> Json) -> Json[]` | Return sorted copy using key extractor |
+| [`sort`](#sort) | `<T>(T[], (T, T) -> Int32) -> T[]` | Return sorted copy using comparator |
+| [`sortBy`](#sortBy) | `<T>(T[], (T) -> Json) -> T[]` | Return sorted copy using key extractor |
 | [`sum`](#sum) | `(Number[]) -> Number` | Sum all elements |
 | [`unique`](#unique) | `<T>(T[]) -> T[]` | Remove duplicate elements (deep equality) |
 | [`zip`](#zip) | `<A, B>(A[], B[]) -> [A, B][]` | Pair elements by index |
@@ -1447,10 +1447,10 @@ max([42])                   // 42
 ### maxBy
 
 ```txt
-val maxBy: (arr: Json[], f: (Json) -> Number) -> Json
+val maxBy: <T>(arr: T[], f: (T) -> Number) -> T
 ```
 
-Returns the element of `arr` for which `f` produces the largest value. The array must be non-empty.
+Returns the element of `arr` for which `f` produces the largest value. The array must be non-empty. Generic over the element type `T`: `f` is checked against the element type, and the result is a bare `T`.
 
 ```txt
 [{ "name": "Alice", "age": 30 }, { "name": "Bob", "age": 25 }]
@@ -1478,10 +1478,10 @@ min([42])                   // 42
 ### minBy
 
 ```txt
-val minBy: (arr: Json[], f: (Json) -> Number) -> Json
+val minBy: <T>(arr: T[], f: (T) -> Number) -> T
 ```
 
-Returns the element of `arr` for which `f` produces the smallest value. The array must be non-empty.
+Returns the element of `arr` for which `f` produces the smallest value. The array must be non-empty. Generic over the element type `T`: `f` is checked against the element type, and the result is a bare `T`.
 
 ```txt
 [{ "name": "Alice", "age": 30 }, { "name": "Bob", "age": 25 }]
@@ -1620,10 +1620,10 @@ Returns a copy of the elements in the half-open range `[start, end)`. `end` is o
 ### sort
 
 ```txt
-val sort: (arr: Json[], compare: (Json, Json) -> Int32) -> Json[]
+val sort: <T>(arr: T[], compare: (T, T) -> Int32) -> T[]
 ```
 
-Returns a new array with elements sorted according to `compare`. The comparator must return a negative number if the first argument should come first, a positive number if the second should come first, and `0` if they are equal. Does not modify `arr`.
+Returns a new array with elements sorted according to `compare`. The comparator must return a negative number if the first argument should come first, a positive number if the second should come first, and `0` if they are equal. Does not modify `arr`. Generic over the element type `T`: the comparator is checked against the array's element type (a mistyped comparator is a compile error), and the result is a `T[]` that preserves the element type. The sort is **stable** (equal elements keep their input order).
 
 ```txt
 [3, 1, 4, 1, 5].sort((a, b) => a - b)   // [1, 1, 3, 4, 5]
@@ -1639,10 +1639,10 @@ Returns a new array with elements sorted according to `compare`. The comparator 
 ### sortBy
 
 ```txt
-val sortBy: (arr: Json[], f: (Json) -> Json) -> Json[]
+val sortBy: <T>(arr: T[], f: (T) -> Json) -> T[]
 ```
 
-Returns a new array sorted in ascending order by the key extracted by `f`. Keys are compared using Lin's natural ordering (numbers numerically, strings lexicographically). Does not modify `arr`.
+Returns a new array sorted in ascending order by the key extracted by `f`. Keys are compared using Lin's natural ordering (numbers numerically, strings lexicographically). Does not modify `arr`. Generic over the element type `T`: `f` is checked against the element type, and the result is a `T[]` that preserves the element type. The key value is left as `Json` (it only needs to be comparable).
 
 ```txt
 ["banana", "apple", "cherry"].sortBy(s => s)
