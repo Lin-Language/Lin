@@ -13469,3 +13469,48 @@ print("count=${toString(length(args()))}")
     let out = run_with_args(src, &[]);
     assert_eq!(out, "count=0");
 }
+
+// --- Projection value-semantics / use-after-free regression (feat/value-semantics-cow) ---
+
+// Stage A: a `val x = container[k]` projection must materialize an OWNED, container-independent
+// value (a snapshot of the slot's tag+payload). Before the fix, the union/Json projection bound a
+// raw INTERIOR pointer into the container's entries buffer; growing the object (inline→heap
+// migration as more keys are added) reallocs that buffer, leaving the binding dangling — a
+// use-after-free that crashed in `lin_array_push` (array.rs) with a null pointer deref. After the
+// fix the binding holds a stable header, so growing `results` no longer dangles `bC`/`bB`/`bA`.
+#[test]
+fn test_projection_uaf_object_grow_does_not_dangle() {
+    let src = r#"
+import { for } from "std/iter"
+import { print } from "std/io"
+import { keys } from "std/object"
+import { length, push } from "std/array"
+
+val main = () =>
+  var results: Json = {}
+
+  results["C"] = []
+  val bC = results["C"]
+  bC.for(n => null)
+
+  results["B"] = []
+  val bB = results["B"]
+  bB.for(n => null)
+
+  results["A"] = []
+  val bA = results["A"]
+  bA.for(n => null)
+
+  push(bA, { "label": "A" })
+  push(bB, { "label": "B" })
+  push(bC, { "label": "C" })
+
+  print(
+    "done keys=${length(keys(results))} C=${length(bC)} B=${length(bB)} A=${length(bA)}"
+  )
+
+main()
+"#;
+    let out = run(src);
+    assert_eq!(out, vec!["done keys=3 C=1 B=1 A=1".to_string()]);
+}
