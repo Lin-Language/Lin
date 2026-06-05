@@ -108,8 +108,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`append`](#append) | `(Json[], Json) -> Json[]` | Non-mutating single-element append |
 | [`arrayAllocate`](#arrayAllocate) | `(Int32) -> Json[]` | Allocate an array of n nulls |
 | [`arrayAllocateFilled`](#arrayAllocateFilled) | `(Int32, Json) -> Json[]` | Allocate an array of n copies of a fill value |
-| [`at`](#at-array) | `<T>(T[], Int32) -> T \| Null` | Element at index, or `null` if out of bounds; negative indices count from end |
-| [`atOr`](#atOr) | `<T>(T[], Int32, T) -> T` | Element at index, or a default when out of bounds; returns a bare `T` |
+| [`at`](#at-array) | `<T, D>(T[], Int32, D = null) -> T \| D` | Element at index, or the default (`null` if omitted) when out of bounds; negative indices count from end |
 | [`chunk`](#chunk) | `<T>(T[], Int32) -> T[][]` | Split into n-sized sub-arrays |
 | [`compact`](#compact) | `(Json[]) -> Json[]` | Remove null elements |
 | [`countBy`](#countBy) | `<T>(T[], (T) -> String) -> { String: Int32 }` | Frequency map by key function |
@@ -195,7 +194,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | --- | --- | --- |
 | [`entries`](#entries) | `(Json) -> [String, Json][]` | Array of `[key, value]` pairs (tag-aware: object or typed map) |
 | [`fromEntries`](#fromEntries) | `([String, Json][]) -> {}` | Build an object from key-value pairs |
-| [`get`](#get) | `<T>({ String: T }, String, T) -> T` | Value at key, or a default when absent (the `m[k] ?? default` idiom) |
+| [`get`](#get) | `<T, D>({ String: T }, String, D = null) -> T \| D` | Value at key, or the default (`null` if omitted) when absent (the `m[k] ?? default` idiom) |
 | [`isEmpty`](#isEmpty) | `(Json) -> Boolean` | True if object, array, or string is empty |
 | [`keys`](#keys) | `(Json) -> String[]` | Array of object keys (tag-aware: object or typed map) |
 | [`mapValues`](#mapValues) | `<V,W>({ String: V }, (V) -> W) -> { String: W }` | Transform all values, keeping keys |
@@ -1294,33 +1293,28 @@ arrayAllocateFilled(0, 9)        // []
 ### at (array) {#at-array}
 
 ```txt
-val at: <T>(arr: T[], index: Int32) -> T | Null
+val at: <T, D>(arr: T[], index: Int32, default: D = null) -> T | D
 ```
 
-Safe accessor. Returns the element at `index`, or `null` if the resolved index is out of bounds (so it never traps). Negative indices count from the end: `-1` is the last element, `-2` is second-to-last. The `null`-on-out-of-bounds case widens the return type to `T | Null`.
+Safe accessor with an optional default. Returns the element at `index`, or `default` when the resolved index is out of bounds (so it never traps). Negative indices count from the end: `-1` is the last element, `-2` is second-to-last.
+
+The default's type `D` is an **independent** type parameter, so the result is `T | D` and the default's type never pollutes the element type `T`:
+
+- omitting the default gives `default = null`, so `at(arr, i)` is `T | Null` — the safe bounds-checked read;
+- a same-typed default collapses the union: over an `Int32[]`, `at(arr, i, 0)` is `Int32 | Int32 = Int32`, a bare scalar usable directly in arithmetic with no `null` guard (the "definitely present" form);
+- a differently-typed default keeps both arms: `at(arr, i, "n/a")` over an `Int32[]` is `Int32 | String`.
+
+This single function subsumes the old `at`/`atOr` pair.
 
 ```txt
-at([10, 20, 30], 0)    // 10
-at([10, 20, 30], -1)   // 30
-at([10, 20, 30], -2)   // 20
-at([], 0)              // null
-```
-
----
-
-### atOr {#atOr}
-
-```txt
-val atOr: <T>(arr: T[], index: Int32, default: T) -> T
-```
-
-Defaulted bounds-safe accessor. Returns the element at `index`, or `default` when the resolved index is out of bounds (after the same negative-index normalisation as [`at`](#at-array)). Unlike `at`, the result is a bare `T` — usable directly in arithmetic with no `null` guard. There is no `default`-arg form of `at` itself: a generic `T` has no spellable default expression (`null` would be `T | Null`), so the defaulted read is a separate function.
-
-```txt
-[10, 20, 30].atOr(1, -1)    // 20
-[10, 20, 30].atOr(5, -1)    // -1   (out of bounds -> default)
-[10, 20, 30].atOr(-1, -1)   // 30   (negative index wraps)
-[10, 20, 30].atOr(-9, 99)   // 99   (out-of-range negative -> default)
+at([10, 20, 30], 0)         // 10
+at([10, 20, 30], -1)        // 30
+at([], 0)                   // null               (omitted default -> T | Null)
+[10, 20, 30].at(1, -1)      // 20
+[10, 20, 30].at(5, -1)      // -1    (out of bounds -> default)
+[10, 20, 30].at(-1, -1)     // 30    (negative index wraps)
+[10, 20, 30].at(-9, 99)     // 99    (out-of-range negative -> default)
+[10, 20, 30].at(9, "n/a")   // "n/a" (independent default type -> Int32 | String)
 ```
 
 ---
@@ -2415,16 +2409,24 @@ entries(obj).map(([k, v]) => [k, v * 2]).fromEntries()   // double all values
 ### get {#get}
 
 ```txt
-val get: <T>(m: { String: T }, key: String, default: T) -> T
+val get: <T, D>(m: { String: T }, key: String, default: D = null) -> T | D
 ```
 
-Defaulted read over a typed `{ String: T }` map: returns the value at `key`, or `default` when the key is absent. This is the idiomatic `m[k] ?? default` form — a bare `m[k]` already gives you `T | Null` directly, so only the *defaulted* read (which collapses the `| Null` to a bare `T`) earns a named helper. `m` must be a typed map (not a plain `Json` record — there is no implicit `Json -> { String: T }` coercion, §5.1.1).
+Defaulted read over a typed `{ String: T }` map: returns the value at `key`, or `default` when the key is absent. The default's type `D` is an **independent** type parameter (mirroring [`at`](#at-array)), so the result is `T | D` and the default's type never pollutes the value type `T`:
+
+- omitting the default gives `default = null`, so `get(m, k)` is `T | Null` — the same as a bare `m[k]`;
+- a same-typed default collapses the union: over a `{ String: Int32 }` map, `get(m, k, 0)` is `Int32 | Int32 = Int32`, a bare scalar usable in arithmetic;
+- a differently-typed default keeps both arms: `get(m, k, "n/a")` is `Int32 | String`.
+
+`m` must be a typed map (not a plain `Json` record — there is no implicit `Json -> { String: T }` coercion, §5.1.1).
 
 ```txt
 val counts: { String: Int32 } = { "a": 7 }
-counts.get("a", 0)         // 7
-counts.get("missing", 0)   // 0
-counts.get("a", 0) + 1     // 8   (usable directly in arithmetic)
+counts.get("a", 0)             // 7
+counts.get("missing", 0)       // 0
+val present: Int32 = counts.get("a", 0)
+present + 1                    // 8   (bare Int32, usable in arithmetic)
+counts.get("z", "n/a")         // "n/a"   (independent default type -> Int32 | String)
 ```
 
 ---

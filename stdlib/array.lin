@@ -89,17 +89,16 @@ export val reverse = <T>(arr: T[]): T[] =>
 export val set = <T>(arr: T[], idx: Int32, item: T): Null =>
   arr[idx] = item
 
-export val at = <T>(arr: T[], index: Int32): T | Null =>
-  val i = if index < 0 then length(arr) + index else index
-  if i >= 0 && i < length(arr) then arr[i] else null
-
-// Defaulted bounds-safe read: the element at `index`, or `default` when `index` is out of
-// bounds (after the same negative-index normalisation as `at`). Returns a bare `T` — usable
-// directly in arithmetic with no null guard, which is the whole point. Implemented as a SEPARATE
-// function rather than a `default: T = …` parameter on `at`: a generic `T` has no spellable
-// default expression (`null` would be `T | Null`, defeating the bare-`T` return), so a defaulted
-// param cannot be expressed without breaking the no-default `at`'s `T | Null` result.
-export val atOr = <T>(arr: T[], index: Int32, default: T): T =>
+// Bounds-safe read with an independent default-type param `D`: the element at `index`
+// (after negative-index normalisation), or `default` when `index` is out of bounds. The
+// default's type `D` is a SEPARATE type parameter from the element type `T`, so the result is
+// `T | D` and the default never pollutes the element type. With no default supplied, `D`
+// defaults to `Null` (the `default: D = null` parameter), giving the bounds-safe `T | Null`:
+//   - `arr.at(i)`        => `T | Null`  (must be null-checked before use as `T`)
+//   - `arr.at(i, 0)`     => `T | Int32` (= `T` when `T = Int32`: the "definitely present" form)
+//   - `arr.at(i, "n/a")` => `T | String`
+// This single function subsumes the old `at`/`atOr` pair.
+export val at = <T, D>(arr: T[], index: Int32, default: D = null): T | D =>
   val i = if index < 0 then length(arr) + index else index
   if i >= 0 && i < length(arr) then arr[i] else default
 
