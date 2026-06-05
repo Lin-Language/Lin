@@ -28,7 +28,7 @@ val isStopBefore = (routeStopIndex: { String: { String: Int32 } }, routeId: Stri
 // `Json` association-list rep (which also keeps its structural equality + `toString` working
 // for the unit tests; the typed `{ String: T }` map lacks cross-rep eq/display today).
 export val getQueue = (routesAtStop: { String: String[] }, routeStopIndex: { String: { String: Int32 } }, markedStops: Json): Json =>
-  var queue = {}
+  var queue: Json = {}
   markedStops.for(stop =>
     val routes = get(routesAtStop, stop, [])
     routes.for(routeId =>
