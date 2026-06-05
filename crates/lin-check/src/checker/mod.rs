@@ -58,6 +58,11 @@ pub struct Checker {
     /// wrappers forward `Json` handles into concrete intrinsic/foreign params by design.
     /// User modules check with `false`, so `val p: Person = readJson(...)` is a type error.
     pub lenient_json: bool,
+    /// When true, `lin_*` compiler intrinsics may be referenced by name (as call targets or
+    /// values). True for trusted stdlib modules (which re-export them under clean names) and when
+    /// the `LIN_ALLOW_INTRINSICS` test escape hatch is set; false for user code, which must use the
+    /// stdlib wrappers (ADR-002/ADR-009, ADR-086). Set by the compile pipeline from `is_stdlib`.
+    pub allow_intrinsics: bool,
     /// Phase 0 monomorphized generics: maps a generic function's binding name to the
     /// (type-param name → quantified TypeVar id) assignment chosen during forward declaration.
     /// `infer_function` reuses the SAME ids so the forward-declared signature (used by call-site
@@ -116,6 +121,7 @@ impl Checker {
             mutable_global_slots: std::collections::HashMap::new(),
             consumed_streams: std::collections::HashSet::new(),
             lenient_json: false,
+            allow_intrinsics: false,
             generic_fn_params: std::collections::HashMap::new(),
             // Start above the intrinsic generic slot (9000) so quantified generics never
             // collide with `lin_map`/`lin_iter` et al.

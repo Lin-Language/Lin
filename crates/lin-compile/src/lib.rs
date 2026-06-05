@@ -482,6 +482,9 @@ fn check_module_with_imports(
     // The trusted stdlib forwards Json handles into concrete intrinsic/foreign params by
     // design, so it checks Json->concrete leniently (ADR-046). User code does not.
     checker.lenient_json = lenient_json;
+    // `lin_*` intrinsics are accessible only to trusted stdlib modules; the LIN_ALLOW_INTRINSICS
+    // env var is a test-only escape hatch for the compiler's own intrinsic-exercising fixtures.
+    checker.allow_intrinsics = lenient_json || std::env::var_os("LIN_ALLOW_INTRINSICS").is_some();
     checker.protect_import_typevars();
     let typed = checker.check_module(ast_module)?;
     // Surface non-error diagnostics (e.g. the streams must-use WARNING) collected during a
@@ -528,6 +531,9 @@ fn check_module_with_seeded_imports(
     checker.import_types = import_type_map;
     checker.import_type_decls = import_type_decls;
     checker.lenient_json = lenient_json;
+    // `lin_*` intrinsics are accessible only to trusted stdlib modules; the LIN_ALLOW_INTRINSICS
+    // env var is a test-only escape hatch for the compiler's own intrinsic-exercising fixtures.
+    checker.allow_intrinsics = lenient_json || std::env::var_os("LIN_ALLOW_INTRINSICS").is_some();
     checker.protect_import_typevars();
     let typed = checker.check_module(ast_module)?;
     let warnings: Vec<lin_common::Diagnostic> = checker
