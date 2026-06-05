@@ -55,6 +55,32 @@ export type Leg = Transfer | TimetableLeg
 // seconds-from-midnight (may exceed 24h, but fit Int32 for these feeds).
 export type Journey = { "legs": Leg[], "departureTime": Int32, "arrivalTime": Int32 }
 
+// A scan connection: a timetable boarding `[trip, startIndex, endIndex]` (the trip stays
+// `Json` — composite `Json` does not flow into the named `Trip` record, spec §5.1.1 / NOTES)
+// or a footpath `Transfer`. This is the SHAPE of the value stored in `kConnections`; the map
+// itself stays `Json` (see ScanResults / NOTES "kConnections blocker").
+export type Conn = [Json, Int32, Int32] | Transfer
+
+// The per-scan ScanResults state (mirrors ScanResults). The arrival-time dictionaries it
+// threads are now typed `{ String: T }` index-signature maps (ADR-082 / spec §5.1.1) — a
+// hashed O(1) container in place of the O(n) association-list `Json` object — the scan/query
+// (GROUP/RANGE) perf lever:
+//   - bestArrivals  : StopID -> arrival time        { String: Int64 }
+//   - kArrivals      : roundStr -> (StopID -> time)  { String: { String: Int64 } }
+//   - kConnections   : StopID -> (roundStr -> Conn)  STAYS `Json` (see below)
+// Arrival times use Int64 (the MAX sentinel 9007199254740991 needs it; §27 numeric).
+//
+// kConnections stays `Json`: typing it `{ String: { String: Conn } }` (a nested map of a
+// union-valued connection) is SUPPORTED in the simple/single-pass query path (run.lin's
+// TBW->NRW gate is byte-identical when it is typed), but it triggers a runtime
+// double-free / misaligned-pointer fault when a `match`-narrowed connection read off the
+// typed nested map is `push`-ed into a shared array and that array is then consumed by a
+// recursive slicing walk — the multi-day stitching (`completeJourneys`/`prevConnections`) and
+// the transfer-pattern walks (graphResults/stringResults). This is a codegen/RC bug, not a
+// Lin-level workaround, so kConnections is left `Json` per the staging contract. See NOTES.md
+// "kConnections blocker" for the minimal repro.
+export type ScanResults = { "k": Int32, "bestArrivals": { String: Int64 }, "kArrivals": { String: { String: Int64 } }, "kConnections": Json }
+
 // The createRaptor index struct (mirrors RaptorAlgorithm's constructor fields).
 // The dynamic-key dictionaries that createRaptor BUILDS from scratch are now typed
 // `{ String: T }` index-signature maps (ADR-082 / spec §5.1.1) — a hashed O(1)
