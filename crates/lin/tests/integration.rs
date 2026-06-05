@@ -11531,7 +11531,7 @@ print(describe(null))
 // is BEHAVIOR-INERT: a named-typed value and a structurally-equal anonymous literal still
 // inter-operate exactly as before — assign across in BOTH directions, pass into the named param
 // position, read fields, and compare equal (including a WIDER literal with an extra field, which
-// structural compatibility still permits). See SEALED_RECORDS_DESIGN.md §5 (Stage 0.5).
+// structural compatibility still permits). See ADR-082 (Stage 0.5: inert sealed marker).
 #[test]
 fn test_sealed_marker_is_inert_named_vs_anonymous_interop() {
     let out = run(r#"
@@ -11564,7 +11564,7 @@ print("extra=${wide["extra"]}")
 
 // ───────────────────────── Sealed records — Stage 1 ─────────────────────────
 // Unboxed packed-struct layout + constant-offset field access for sealed all-scalar record
-// types. See SEALED_RECORDS_DESIGN.md §3 (semantics matrix) and §5 (Stage 1).
+// types. See ADR-082 + SPECIFICATION §5.9.1 (sealed records, Stage 1).
 
 #[test]
 fn test_sealed_scalar_construct_and_field_read() {
