@@ -16,15 +16,6 @@ import { lines as splitLines, trim } from "std/string"
 import { length, push } from "std/array"
 import { filter, for, map } from "std/iter"
 
-// Narrow a `readText` result (`String | Error`) to a plain String — an Error (a
-// decompress/IO fault threaded in-band) degrades to the empty string. A named
-// helper because a multi-arm `match` cannot be written inline inside the `untar`
-// callback's parentheses (indentation is suppressed there — ADR-004/ADR-014).
-val textOf = (r: Json): String =>
-  match r
-    is Error => ""
-    else => r
-
 // Split one member's body into its non-blank, trimmed CSV rows.
 val rowsOf = (body: String): String[] =>
   body
@@ -41,7 +32,13 @@ export val rowsFromArchive = (path: String): String[] =>
   val result = readStream(path)
     .gunzip()
     .untar((meta, data) =>
-      rowsOf(textOf(data.readText())).for(line => rows.push(line))
+      // Narrow the `readText` result (`String | Error`) to a plain String inline —
+      // an Error (a decompress/IO fault threaded in-band) degrades to "".
+      val raw = data.readText()
+      val text = match raw
+        is Error => ""
+        else => raw
+      rowsOf(text).for(line => rows.push(line))
     )
   match result
     is Error => []
