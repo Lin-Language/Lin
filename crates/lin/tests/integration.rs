@@ -13514,3 +13514,44 @@ main()
     let out = run(src);
     assert_eq!(out, vec!["done keys=3 C=1 B=1 A=1".to_string()]);
 }
+
+// A projected binding `val x = obj[k]` is a SHARED REFERENCE to the stored value, not a snapshot:
+// mutating through it (push) updates what's stored in the container — and this is CONSISTENT with
+// passing the projection to a function (Lin is call-by-sharing, so `f(obj[k])` mutating its param
+// also updates the container). The UAF fix (projection materializes a stable owned box via
+// lin_tagged_clone, a SHALLOW copy retaining the same underlying array) preserves these
+// shared-reference semantics. This locks that in: fn-call and projection paths must agree, and a
+// container-grow between projection and mutation must stay safe.
+#[test]
+fn test_projection_shared_reference_consistent_with_fn_call() {
+    let src = r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+
+val mutate = (a: Json): Null =>
+  push(a, 99)
+
+val main = () =>
+  var o1 = { "a": [1, 2] }
+  mutate(o1["a"])
+  print("fn=${length(o1["a"])}")
+
+  var o2 = { "a": [1, 2] }
+  val x = o2["a"]
+  push(x, 99)
+  print("proj=${length(o2["a"])}")
+
+  var o3 = { "a": [1, 2] }
+  val y = o3["a"]
+  o3["b"] = [0]
+  o3["c"] = [0]
+  o3["d"] = [0]
+  push(y, 99)
+  print("grow=${length(y)}/${length(o3["a"])}")
+
+main()
+"#;
+    let out = run(src);
+    // Both paths mutate the shared array (length 3); the grow case stays safe and still shared.
+    assert_eq!(out, vec!["fn=3".to_string(), "proj=3".to_string(), "grow=3/3".to_string()]);
+}
