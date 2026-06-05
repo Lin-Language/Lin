@@ -5,7 +5,15 @@ Status: proposal / audit. Companion to the implemented index-signature `{ String
 
 > **Category 1 (under-genericized array/iter collection ops) is DONE** — shipped on master, the
 > `std/array` + `std/iter` element-generic ops re-typed from `Json` to `<T>`. It is omitted below; the
-> remaining work is Categories 2–5.
+> remaining work is Categories 3–5.
+>
+> **Category 2 (the map-type gap) is DONE** — `std/object`'s map producers (`merge`, `pick`, `omit`,
+> `mapValues`) and `std/array`'s `groupBy`/`countBy` are now typed over the index-signature map
+> `{ String: T }` (ADR-082); see the summary that replaces the section below. A runtime piece was
+> added: `lin_object_get_or_insert_array` is now TAG_MAP-aware (groupBy's result is map-backed).
+> Three signatures were intentionally **kept `Json`** for soundness/inference reasons documented in
+> the summary: `keys`/`values`/`entries` (tag-aware introspection), `fromEntries`, and
+> `HttpResponse.headers` (deferred to the Category 3 http work). The remaining work is Categories 3–5.
 
 The stdlib uses `Json` across 22 modules. Not all of these are lazy — they fall into distinct
 categories, and only some are fixed by the new map type. This doc classifies every `Json`-using module
@@ -16,32 +24,51 @@ missed performance opportunity.
 
 ## The remaining categories
 
-### Category 2 — the map-type gap (THE reason for `{ String: T }`; fix with the new type)
+### Category 2 — the map-type gap (DONE)
 
-`std/object` operations over dynamic-key objects. These are `Json` precisely because there was no type
-for "object with arbitrary string keys → `T`". Once `{ String: T }` exists:
+The map-producing `std/object` ops and `std/array`'s `groupBy`/`countBy` are now typed over the
+index-signature map `{ String: T }` (ADR-082). Final shapes:
 ```
-keys       = (obj: Json): String[]                 →  <T>(obj: { String: T }): String[]
-values     = (obj: Json): Json                     →  <T>(obj: { String: T }): T[]
-entries    = (obj: Json): Json                     →  <T>(obj: { String: T }): [String, T][]
-fromEntries = (pairs: Json): Json                  →  <T>(pairs: [String, T][]): { String: T }
-merge      = (a: Json, b: Json): Json              →  <T>(a: { String: T }, b: { String: T }): { String: T }
-pick       = (obj: Json, ks: String[]): Json       →  <T>(obj: { String: T }, ks: String[]): { String: T }
-omit       = (obj: Json, ks: String[]): Json       →  <T>(obj: { String: T }, ks: String[]): { String: T }
-mapValues  = (obj: Json, f): Json                  →  <V,W>(obj: { String: V }, f: (V)=>W): { String: W }
-isEmpty    = (x: Json): Boolean                     →  stays permissive (accepts object OR array — keep Json)
+merge      = (a: Json, b: Json): Json   →  <T>(a: { String: T }, b: { String: T }): { String: T }   DONE
+pick       = (obj: Json, ks): Json      →  <T>(obj: { String: T }, ks: String[]): { String: T }      DONE
+omit       = (obj: Json, ks): Json      →  <T>(obj: { String: T }, ks: String[]): { String: T }      DONE
+mapValues  = (obj: Json, f): Json       →  <V,W>(obj: { String: V }, f: (V)=>W): { String: W }        DONE
+array.groupBy = (arr: Json, f): Json    →  <T>(arr: T[], f: (T)=>String): { String: T[] }             DONE
+array.countBy = (arr: Json, f): Json    →  <T>(arr: T[], f: (T)=>String): { String: Int32 }           DONE
+isEmpty    = (x: Json): Boolean         →  kept Json (permissive: object OR array)                     KEPT
 ```
-This is the category that also unlocks the **performance** payoff (hashed backing + unboxed `T`), and
-it's the one the RAPTOR port needs for `kConnections`/`kArrivals`/`routeStopIndex`/`routesAtStop`.
-NOTE the value type must be uniform per object — `groupBy`/`countBy` (in `std/array`) naturally produce
-`{ String: T[] }` / `{ String: Int32 }` and should be re-typed to those:
-```
-array.groupBy = (arr: Json, keyFn): Json           →  <T>(arr: T[], keyFn: (T)=>String): { String: T[] }
-array.countBy = (arr: Json, keyFn): Json           →  <T>(arr: T[], keyFn: (T)=>String): { String: Int32 }
-```
-Existing record types with a `Json` field that is really a string-keyed map should be tightened too —
-e.g. `http.lin` already declares `type HttpResponse = { "status": Int32, "headers": Json, "body":
-String }`; `headers` should become `{ String: String }`.
+
+**Kept `Json` deliberately (each a real constraint, not laziness):**
+
+- `keys` / `values` / `entries` — kept `Json`, tag-aware. The `lin_*_any` runtime bridges dispatch on
+  the boxed value's tag, so the SAME function serves a plain `{}`/`Json` record (the dominant use:
+  introspecting an arbitrary object, e.g. the `examples/config` schema loader, which calls
+  `keys(jsonObject)`) and a typed map. Re-typing the *parameter* to `{ String: T }` is **unsound**:
+  with trusted-stdlib `Json` widening, a genuine `Json`/`LinObject` (e.g. a `fromEntries` result, or
+  any object literal) is relabelled to the map type at the call boundary WITHOUT converting its
+  representation; the body then passes it straight to `lin_keys_any`, which sees a (mis-applied)
+  TAG_MAP and reads `LinObject` memory as a `LinMap` → corruption / crash. `§5.1.1` says there is no
+  implicit `Json → { String: T }` coercion; the trusted widening must not manufacture one. (A clean
+  follow-up would be to make the widening reject `Json → { String: T }`, or insert a real
+  object→map conversion, at which point these could become generic.)
+- `fromEntries` — kept `Json`. The target `<T>(pairs: [String, T][]): { String: T }` fails
+  monomorphization at every call site: the inference engine does not decompose a tuple-in-array
+  parameter `[String, T][]` to bind `T` (verified minimal repro: `<T>(p: [String, T][]): T` won't
+  infer even with the argument annotated). Re-type once nested-tuple inference lands.
+- `HttpResponse.headers` (and `HttpRequest`/`HttpOptions` `headers`) — left `Json`. Tightening to
+  `{ String: String }` cascades into the http server/client constructors (`json`/`text`/`redirect`
+  build `headers` as object literals) and the web-server example, and hits the same Json→map
+  unsoundness. Deferred to the Category 3 http work (which re-types the http module anyway).
+
+**Runtime change:** `lin_object_get_or_insert_array` (used by `groupBy`) is now TAG_MAP-aware — it
+detects a `LinMap`-backed map argument and routes through `lin_map_get`/`lin_map_set` instead of the
+`LinObject` path (covered by `get_or_insert_array_groupby_over_map` in `crates/lin-runtime`).
+
+**Behaviour notes for callers:** a `{ String: T }` map is hash-backed, so `keys`/`values`/`entries`
+over a map are in **hash order**, not insertion order (plain `{}` records still preserve insertion
+order). `groupBy`/`countBy` now return maps; `toString` of a typed map currently renders `[object]`
+(TAG_MAP has no structural `toString` yet — an open ADR-082 follow-up, surfaced by the changed
+`groupBy` return type).
 
 ### Category 3 — result/error unions returned as `Json` (fix with `T | Error` / concrete records)
 
@@ -100,14 +127,13 @@ representation changes; flag any change against that header comment.
 
 ## Suggested order of work
 
-(Category 1 — array/iter generics — is already shipped.)
+(Categories 1 and 2 are shipped.)
 
-1. **Category 2** (object/map) — gated on `{ String: T }` landing; this is the headline fix and the
-   performance unlock. Re-type `std/object` + `groupBy`/`countBy`.
-2. **Category 3** (result/error unions) — define the success records (`Stat`, `DirEntry`,
+1. **Category 3** (result/error unions) — define the success records (`Stat`, `DirEntry`,
    process-result), then re-type fs/process/net/http/env/time to `… | Error`. Each module is
-   independent; do them one at a time with their tests.
-3. Leave Categories 4 and 5 (and async handles) as `Json` — those are correct or constrained.
+   independent; do them one at a time with their tests. Pick up `HttpResponse.headers →
+   { String: String }` here (deferred from Category 2 because it cascades into the http module).
+2. Leave Categories 4 and 5 (and async handles) as `Json` — those are correct or constrained.
 
 ## Validation per change
 

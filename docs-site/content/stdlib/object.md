@@ -10,15 +10,21 @@ import { keys, values, entries, fromEntries, merge, pick, omit, mapValues, isEmp
 
 | Function | Signature | Description |
 | --- | --- | --- |
-| `entries` | `(Json) -> [String, Json][]` | Array of `[key, value]` pairs |
+| `entries` | `(Json) -> [String, Json][]` | Array of `[key, value]` pairs (object or typed map) |
 | `fromEntries` | `([String, Json][]) -> {}` | Build object from key-value pairs |
 | `isEmpty` | `(Json) -> Boolean` | True if object, array, or string is empty |
-| `keys` | `(Json) -> String[]` | Array of object keys |
-| `mapValues` | `({}, (Json) -> Json) -> {}` | Transform values, keep keys |
-| `merge` | `({}, {}) -> {}` | Shallow-merge (right wins on conflict) |
-| `omit` | `({}, String[]) -> {}` | Return object without specified keys |
-| `pick` | `({}, String[]) -> {}` | Return object with only specified keys |
-| `values` | `(Json) -> Json[]` | Array of object values |
+| `keys` | `(Json) -> String[]` | Array of object keys (object or typed map) |
+| `mapValues` | `<V,W>({ String: V }, (V) -> W) -> { String: W }` | Transform values, keep keys |
+| `merge` | `<T>({ String: T }, { String: T }) -> { String: T }` | Shallow-merge typed maps (right wins on conflict) |
+| `omit` | `<T>({ String: T }, String[]) -> { String: T }` | Return typed map without specified keys |
+| `pick` | `<T>({ String: T }, String[]) -> { String: T }` | Return typed map with only specified keys |
+| `values` | `(Json) -> Json[]` | Array of object values (object or typed map) |
+
+`keys`/`values`/`entries` are tag-aware — they work on both a plain `{}`/`Json` record and a typed
+index-signature map `{ String: T }` (ADR-082). `merge`/`pick`/`omit`/`mapValues` are generic over
+`{ String: T }` and *return* a typed map; pass them a value annotated `{ String: T }` (there is no
+implicit `Json -> { String: T }` coercion). Over a typed map, key order is hash order, not insertion
+order.
 
 ---
 
@@ -65,7 +71,9 @@ entries(obj)
 ### `merge`
 
 ```lin
-merge({ "a": 1, "b": 2 }, { "b": 99, "c": 3 })
+val a: { String: Int32 } = { "a": 1, "b": 2 }
+val b: { String: Int32 } = { "b": 99, "c": 3 }
+a.merge(b)
 // { "a": 1, "b": 99, "c": 3 }
 ```
 
@@ -76,7 +84,8 @@ Right-side values win on conflict.
 ### `pick`
 
 ```lin
-pick({ "a": 1, "b": 2, "c": 3 }, ["a", "c"])
+val m: { String: Int32 } = { "a": 1, "b": 2, "c": 3 }
+m.pick(["a", "c"])
 // { "a": 1, "c": 3 }
 ```
 
@@ -85,7 +94,8 @@ pick({ "a": 1, "b": 2, "c": 3 }, ["a", "c"])
 ### `omit`
 
 ```lin
-omit({ "a": 1, "b": 2, "c": 3 }, ["b"])
+val m: { String: Int32 } = { "a": 1, "b": 2, "c": 3 }
+m.omit(["b"])
 // { "a": 1, "c": 3 }
 ```
 
@@ -94,8 +104,9 @@ omit({ "a": 1, "b": 2, "c": 3 }, ["b"])
 ### `mapValues`
 
 ```lin
-mapValues({ "a": 1, "b": 2 }, v => v * 10)
-// { "a": 10, "b": 20 }
+val m: { String: Int32 } = { "a": 1, "b": 2 }
+m.mapValues(v => v * 10)
+// { "a": 10, "b": 20 } : { String: Int32 }
 ```
 
 ---
