@@ -522,6 +522,59 @@ val s = suite("std/array", [
     ]
   ),
 
+  // --- scalar-sort fast path (unboxed inline merge sort) regression tests ---
+  // A scalar `Int32[]` literal with a capture-less literal comparator routes through the inlined
+  // `lin_sort` path (no per-comparison box/closure). It must stay byte-identical to the boxed path.
+  test("scalar Int32 sort with duplicates stays sorted (fast path)", () =>
+    val result = [5, 2, 8, 2, 5, 1, 9, 2, 8, 1, 5].sort((a, b) => a - b)
+    [
+      expect(result.toString()).toBe("[1, 1, 2, 2, 2, 5, 5, 5, 8, 8, 9]")
+    ]
+  ),
+
+  // A larger scalar array built via `[]`+push (TAGGED runtime repr though statically Int32[]): the
+  // copy-IN uses the representation-agnostic tagged read, so the result is still correct.
+  test("scalar Int32 sort over a []+push array (fast path, tagged-read copy-in)", () =>
+    val xs: Int32[] = []
+    range(0, 50).for(i => push(xs, (i * 17 + 7) % 13))
+    val sorted = xs.sort((a, b) => a - b)
+    var ok = true
+    range(1, length(sorted)).for(i =>
+      if sorted[i - 1] > sorted[i] then ok = false
+    )
+    [
+      expect(ok).toBe(true),
+      expect(length(sorted)).toBe(50)
+    ]
+  ),
+
+  // Float64 scalar sort exercises the f64 flat representation in the fast path.
+  test("scalar Float64 sort descending (fast path)", () =>
+    val result = [3.5, 1.25, 2.75, 1.25, 0.5].sort((a, b) => if a > b then -1 else if a < b then 1 else 0)
+    [
+      expect(result.toString()).toBe("[3.5, 2.75, 1.25, 1.25, 0.5]")
+    ]
+  ),
+
+  // Scalar fast path is STABLE: a constant comparator (always 0 = all equal) must preserve input
+  // order. Equal elements (here all distinct values but cmp=0) keep their original positions.
+  test("scalar sort with constant comparator preserves input order (stable fast path)", () =>
+    val result = [5, 3, 8, 1, 9].sort((a, b) => 0)
+    [
+      expect(result.toString()).toBe("[5, 3, 8, 1, 9]")
+    ]
+  ),
+
+  // A CAPTURING comparator (closes over `dir`) is NOT eligible for the inline fast path and must
+  // fall back to the generic boxed merge sort — still correct.
+  test("scalar sort with capturing comparator uses boxed path (still correct)", () =>
+    val dir = -1
+    val result = [3, 1, 2, 1, 3].sort((a, b) => (a - b) * dir)
+    [
+      expect(result.toString()).toBe("[3, 3, 2, 1, 1]")
+    ]
+  ),
+
   test("sum of integers", () =>
     val result = [1, 2, 3, 4].sum()
     [
