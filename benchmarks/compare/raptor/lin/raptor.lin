@@ -4,7 +4,7 @@
 // record { routeStopIndex, routePath, transfers, interchange, stops, routesAtStop, tripsByRoute }.
 // scan(raptor, origins, date, dow) runs the rounds and returns [kConnections, bestArrivals].
 import { for } from "std/iter"
-import { keys } from "std/object"
+import { keys, get } from "std/object"
 import { join } from "std/string"
 import { length, push, slice, sort } from "std/array"
 import { runsOn } from "./service"
@@ -17,10 +17,15 @@ import { createScanResults, addRound, previousArrival, setTrip, setTransfer, bes
 val DEFAULT_INTERCHANGE_TIME = 0
 val OVERTAKING_ROUTE_SUFFIX = "overtakes"
 
-// A typed-map scalar read `m[k]` is `Int32 | Null`. The ONLY narrowing form is the
-// POSITIVE `is Int32` match arm (a `{ String: T }` value type is not spellable as an
-// `is`-pattern, so `is Null`/`!= null` cannot refine it — ADR-082 §5.1.1). This helper
-// realises the `m[k] ?? default` idiom the index build needs.
+// Scalar `Int32 | Null` coalescer (positive `is Int32` match-arm idiom; ADR-082 §5.1.1). The
+// single-level `m[k] ?? default` reads that originate from a bare `{ String: T }` map now use
+// `std/object.get` directly. This helper is RETAINED for the two reads `object.get` cannot
+// express:
+//   1. `raptor["interchange"][stop]` — `interchange` is a `Json` map (it ORIGINATES from the
+//      loader; RaptorIndex types it `Json`, and there is no implicit `Json -> { String: T }`
+//      coercion, §5.1.1), so `get`'s `{ String: T }` first param does not accept it.
+//   2. `raptor["routeStopIndex"][routeId][stop]` — a NESTED double-index whose intermediate is a
+//      `{ String: Int32 } | Null`; `get` is single-level and does not apply to a nested read.
 val intOr = (x: Int32 | Null, d: Int32): Int32 =>
   match x
     is Int32 =>
@@ -38,7 +43,7 @@ val getRouteId = (trip: Json, tripsByRoute: { String: Json[] }): String =>
     push(parts, "${s["stop"]}${pu}${doff}")
   )
   val routeId = join(parts, ",")
-  val existing = if tripsByRoute[routeId] == null then [] else tripsByRoute[routeId]
+  val existing = get(tripsByRoute, routeId, [])
   val lastStop = trip["stopTimes"][length(trip["stopTimes"]) - 1]
   val arrivalTimeA = lastStop["arrivalTime"]
   var overtakes = false
@@ -140,15 +145,6 @@ val indexRoute = (path: String[], i: Int32, trip: Json, routeId: String, routeSt
     )
 
 // --- scan ---
-// Coalesce a `String[] | Null` typed-map read (a route's stop path) to a usable array value.
-// An array value type is NOT spellable as an `is`-pattern and the `if x == null then [] else x`
-// form does not REFINE the type (the result stays `String[] | Null`), so the array is handed on
-// as `Json` — the O(1) hashed lookup already happened on the typed-map read; the subsequent
-// path traversal is plain array indexing either way. The route key is always present here
-// (inserted in indexRoute), so the `[]` branch is dead.
-val pathOr = (x: String[] | Null): Json =>
-  if x == null then [] else x
-
 val scanRoutes = (raptor: RaptorIndex, results: Json, routeScanner: Json, markedStops: Json): Null =>
   val queue = getQueue(raptor["routesAtStop"], raptor["routeStopIndex"], markedStops)
   keys(queue).for(routeId =>
@@ -170,7 +166,9 @@ val scanRoutes = (raptor: RaptorIndex, results: Json, routeScanner: Json, marked
 
 // Per-route forward scan from the boarding position, threading (trip, boardingPoint).
 val scanRoute = (raptor: RaptorIndex, results: Json, routeScanner: Json, routeId: String, startPi: Int32): Null =>
-  val routePath = pathOr(raptor["routePath"][routeId])
+  // The route key is always present (inserted by indexRoute), so the `[]` default is dead — but
+  // `get` gives a clean single-level defaulted read over the `{ String: String[] }` routePath map.
+  val routePath = get(raptor["routePath"], routeId, [])
   val routePathLength = length(routePath)
   scanRouteAt(
     raptor,
