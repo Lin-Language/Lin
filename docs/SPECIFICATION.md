@@ -434,6 +434,8 @@ keys, each mapping to `T`". It is a distinct type from a fixed-field record `{ "
 is *either* a fixed record *or* an index-signature map, never both.
 
 - `m[k]` yields `T | Null` (a missing key is `Null`, consistent with the §6.1 safe-bracket rule).
+  For the *defaulted* read `m[k] ?? default` — collapsing the `| Null` to a bare `T` — the
+  idiomatic form is `object.get(m, k, default)` (`std/object`).
 - `m[k] = v` requires `v : T` and `k : String`.
 - An empty `{}` literal infers `{ String: T }` from its context (the annotated binding / return
   type); with no such context it stays a fixed record.
