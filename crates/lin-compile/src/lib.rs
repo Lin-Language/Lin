@@ -319,7 +319,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
 // Bumped to 2: Stage 0.5 of sealed-records changed `Type::Object` from a tuple variant
 // `Object(IndexMap)` to a struct variant `Object { fields, sealed }`, altering the bincode
 // layout of every serialized `Type`. A `.typed`/`.sig` written by a v1 binary must be rejected
-// rather than mis-deserialized. See ADR-082 (Type serialization changed → cache version bump).
+// rather than mis-deserialized. See ADR-083 (Type serialization changed → cache version bump).
 const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Magic prefix written at the head of every `.typed`/`.sig` cache file. Combined with the

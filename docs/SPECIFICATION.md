@@ -575,7 +575,7 @@ This compatibility relationship is the same as `has` — see §11.
 A **named** record type (`type T = { … }`) is *sealed*: a value whose static
 type is `T` holds **exactly** `T`'s fields — no extras. This is a representation
 guarantee that lets the compiler lay sealed records out as unboxed structs with
-constant-offset field access (see ADR-082); it does **not** change the structural
+constant-offset field access (see ADR-083); it does **not** change the structural
 compatibility above.
 
 The two are reconciled by a **non-mutating projection** at the boundary: when a
