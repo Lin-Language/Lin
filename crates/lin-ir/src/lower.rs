@@ -3349,6 +3349,7 @@ fn lower_intrinsic_call(
         "lin_map" => return lower_map(args, result_type, builder, ctx),
         "lin_filter" => return lower_filter(args, result_type, builder, ctx),
         "lin_reduce" => return lower_reduce(args, result_type, builder, ctx),
+        "lin_sort" => return lower_sort(args, result_type, builder, ctx),
         _ => {}
     }
 
@@ -4642,6 +4643,270 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
         });
         out
     }
+}
+
+/// `sort(arr, cmp)` over a flat NUMERIC scalar array with a CAPTURE-LESS literal comparator → an
+/// inline, STABLE, bottom-up merge sort over the UNBOXED flat buffer with the comparator body spliced
+/// directly into the single comparison site (no per-comparison box/unbox/closure indirection — the
+/// zero-box sort win). Routed here from monomorphize's `try_inline_scalar_sort`; every other `sort`
+/// (non-scalar array, capturing/stored comparator, the `Json` `_sortJ` path) keeps the generic boxed
+/// merge-sort, so this is a TIGHTLY-gated fast path that fails safe.
+///
+/// Semantics are byte-identical to the pure-Lin `stdlib/array.lin` sort: a bottom-up merge of runs of
+/// doubling width, taking the LEFT run first on a tie (`cmp(a,b) <= 0`) → STABLE. We ping-pong by
+/// merging `out -> work` each pass then copying `work` back into `out`, so the result always lives in
+/// `out` (one extra O(n) copy per pass — O(n log n) total, negligible against the comparisons). The
+/// buffers are FLAT scalar arrays (sound for a numeric scalar element); the comparator reads them via
+/// the inlined flat getter. The copy-IN from `arr` uses the representation-agnostic tagged `Index`
+/// (sound even for a `[]`+push array statically typed flat).
+fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+    let arr_ty = args[0].ty();
+    // Element type to STORE (the buffers' flat scalar repr) — from the array's static element type.
+    let elem_ty = match result_type {
+        Type::Array(t) | Type::Iterator(t) => (**t).clone(),
+        _ => iter_elem_type(&arr_ty),
+    };
+    let flat = FlatElemKind::from_type(&elem_ty)
+        .expect("lower_sort gated on a flat scalar element by try_inline_scalar_sort");
+    // Read elements FROM the input array at its provable representation (tagged unless provably flat),
+    // matching `for`/`map` — sound for a `[]`+push array statically typed `Int32[]`.
+    let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
+
+    let (lam_params, lam_body) = inlinable_lambda(&args[1])
+        .expect("lower_sort gated on a capture-less literal comparator by try_inline_scalar_sort");
+    let lam_params = lam_params.to_vec();
+    let lam_body = lam_body.clone();
+
+    let arr = lower_expr(&args[0], builder, ctx);
+    let n = emit_iterable_len(arr, &arr_ty, builder); // Int64
+
+    // out / work: two flat scalar buffers, both of length n (work's contents are overwritten in the
+    // first pass). `out` is the array we ultimately return.
+    let out = builder.alloc_temp(result_type.clone());
+    builder.emit(Instruction::CallIntrinsic {
+        dst: out, intrinsic: Intrinsic::FlatArrayAlloc(flat), args: vec![], ret_ty: result_type.clone(),
+    });
+    builder.register_owned(out, result_type.clone());
+    let work = builder.alloc_temp(result_type.clone());
+    builder.emit(Instruction::CallIntrinsic {
+        dst: work, intrinsic: Intrinsic::FlatArrayAlloc(flat), args: vec![], ret_ty: result_type.clone(),
+    });
+    builder.register_owned(work, result_type.clone());
+
+    let zero = builder.const_temp(Const::Int(0, Type::Int64));
+    let one = builder.const_temp(Const::Int(1, Type::Int64));
+
+    // ---- COPY-IN: out[i] = work[i] = arr[i] for i in 0..n (gives both buffers length n) ----
+    {
+        let pre = builder.current_block;
+        let header = builder.alloc_block("sort_copy_hdr");
+        let body = builder.alloc_block("sort_copy_body");
+        let exit = builder.alloc_block("sort_copy_exit");
+        let i = builder.alloc_temp(Type::Int64);
+        let i_next = builder.alloc_temp(Type::Int64);
+        builder.terminate(Terminator::Jump(header));
+        builder.switch_to(header);
+        builder.emit(Instruction::Phi { dst: i, ty: Type::Int64, incomings: vec![(zero, pre), (i_next, body)] });
+        let cond = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Binary { dst: cond, op: BinOp::Lt, lhs: i, rhs: n, operand_ty: Type::Int64, ty: Type::Bool });
+        builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
+        builder.switch_to(body);
+        // elem = arr[i] (tagged-safe read), coerced to the flat scalar repr.
+        let elem_raw = builder.alloc_temp(read_elem_ty.clone());
+        builder.emit(Instruction::Index {
+            dst: elem_raw, object: arr, key: i,
+            obj_ty: arr_ty.clone(), key_ty: Type::Int64, result_ty: read_elem_ty.clone(),
+        });
+        let elem = coerce_arg_to_param_repr(elem_raw, &read_elem_ty, &elem_ty, builder);
+        let pd1 = builder.alloc_temp(Type::Null);
+        builder.emit(Instruction::CallIntrinsic { dst: pd1, intrinsic: Intrinsic::FlatArrayPush(flat), args: vec![out, elem], ret_ty: Type::Null });
+        let pd2 = builder.alloc_temp(Type::Null);
+        builder.emit(Instruction::CallIntrinsic { dst: pd2, intrinsic: Intrinsic::FlatArrayPush(flat), args: vec![work, elem], ret_ty: Type::Null });
+        builder.emit(Instruction::Binary { dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
+        builder.terminate(Terminator::Jump(header));
+        builder.switch_to(exit);
+    }
+
+    // ---- WIDTH loop: width = 1; while width < n; width *= 2 ----
+    let w_pre = builder.current_block;
+    let w_header = builder.alloc_block("sort_w_hdr");
+    let w_body = builder.alloc_block("sort_w_body");
+    let w_exit = builder.alloc_block("sort_w_exit");
+    let width = builder.alloc_temp(Type::Int64);
+    let width_next = builder.alloc_temp(Type::Int64);
+    builder.terminate(Terminator::Jump(w_header));
+    builder.switch_to(w_header);
+    builder.emit(Instruction::Phi { dst: width, ty: Type::Int64, incomings: vec![(one, w_pre), (width_next, w_body)] });
+    let w_cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary { dst: w_cond, op: BinOp::Lt, lhs: width, rhs: n, operand_ty: Type::Int64, ty: Type::Bool });
+    builder.terminate(Terminator::CondJump { cond: w_cond, then_block: w_body, else_block: w_exit });
+    builder.switch_to(w_body);
+    let two_w = builder.alloc_temp(Type::Int64);
+    let two = builder.const_temp(Const::Int(2, Type::Int64));
+    builder.emit(Instruction::Binary { dst: two_w, op: BinOp::Mul, lhs: width, rhs: two, operand_ty: Type::Int64, ty: Type::Int64 });
+
+    // ---- LO loop: lo = 0; while lo < n; lo += 2*width — merge each run pair out[..] -> work[..] ----
+    let lo_pre = builder.current_block;
+    let lo_header = builder.alloc_block("sort_lo_hdr");
+    let lo_body = builder.alloc_block("sort_lo_body");
+    let lo_exit = builder.alloc_block("sort_lo_exit");
+    let lo = builder.alloc_temp(Type::Int64);
+    let lo_next = builder.alloc_temp(Type::Int64);
+    builder.terminate(Terminator::Jump(lo_header));
+    builder.switch_to(lo_header);
+    builder.emit(Instruction::Phi { dst: lo, ty: Type::Int64, incomings: vec![(zero, lo_pre), (lo_next, lo_body)] });
+    let lo_cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary { dst: lo_cond, op: BinOp::Lt, lhs: lo, rhs: n, operand_ty: Type::Int64, ty: Type::Bool });
+    builder.terminate(Terminator::CondJump { cond: lo_cond, then_block: lo_body, else_block: lo_exit });
+    builder.switch_to(lo_body);
+    // lo_b = min(lo + width, n); hi = min(lo + 2*width, n)
+    let lo_plus_w = builder.alloc_temp(Type::Int64);
+    builder.emit(Instruction::Binary { dst: lo_plus_w, op: BinOp::Add, lhs: lo, rhs: width, operand_ty: Type::Int64, ty: Type::Int64 });
+    let lo_b = emit_min_i64(lo_plus_w, n, builder);
+    let lo_plus_2w = builder.alloc_temp(Type::Int64);
+    builder.emit(Instruction::Binary { dst: lo_plus_2w, op: BinOp::Add, lhs: lo, rhs: two_w, operand_ty: Type::Int64, ty: Type::Int64 });
+    let hi = emit_min_i64(lo_plus_2w, n, builder);
+
+    // ---- MERGE loop: i in [lo, lo_b), j in [lo_b, hi), k in [lo, hi). Stable: tie → take left. ----
+    // Carries i, j, k as phis (k = i + j - lo_b always, but a phi keeps it simple). The comparator body
+    // is inlined at the single `cmp(out[i], out[j]) <= 0` decision — the unboxed hot path.
+    let m_pre = builder.current_block;
+    let m_header = builder.alloc_block("sort_m_hdr");
+    let m_body = builder.alloc_block("sort_m_body");
+    let m_take_l = builder.alloc_block("sort_m_takel");
+    let m_take_r = builder.alloc_block("sort_m_taker");
+    let m_cmp = builder.alloc_block("sort_m_cmp");
+    let m_advance = builder.alloc_block("sort_m_adv");
+    let m_exit = builder.alloc_block("sort_m_exit");
+    let mi = builder.alloc_temp(Type::Int64);
+    let mj = builder.alloc_temp(Type::Int64);
+    let mk = builder.alloc_temp(Type::Int64);
+    let mi_next = builder.alloc_temp(Type::Int64);
+    let mj_next = builder.alloc_temp(Type::Int64);
+    let mk_next = builder.alloc_temp(Type::Int64);
+    builder.terminate(Terminator::Jump(m_header));
+    builder.switch_to(m_header);
+    builder.emit(Instruction::Phi { dst: mi, ty: Type::Int64, incomings: vec![(lo, m_pre), (mi_next, m_advance)] });
+    builder.emit(Instruction::Phi { dst: mj, ty: Type::Int64, incomings: vec![(lo_b, m_pre), (mj_next, m_advance)] });
+    builder.emit(Instruction::Phi { dst: mk, ty: Type::Int64, incomings: vec![(lo, m_pre), (mk_next, m_advance)] });
+    let m_cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary { dst: m_cond, op: BinOp::Lt, lhs: mk, rhs: hi, operand_ty: Type::Int64, ty: Type::Bool });
+    builder.terminate(Terminator::CondJump { cond: m_cond, then_block: m_body, else_block: m_exit });
+
+    // m_body: decide which side to take. If left exhausted (i >= lo_b) → take right; if right exhausted
+    // (j >= hi) → take left; else compare.
+    builder.switch_to(m_body);
+    let l_exhausted = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary { dst: l_exhausted, op: BinOp::GtEq, lhs: mi, rhs: lo_b, operand_ty: Type::Int64, ty: Type::Bool });
+    let after_l = builder.alloc_block("sort_m_chk_r");
+    builder.terminate(Terminator::CondJump { cond: l_exhausted, then_block: m_take_r, else_block: after_l });
+    builder.switch_to(after_l);
+    let r_exhausted = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary { dst: r_exhausted, op: BinOp::GtEq, lhs: mj, rhs: hi, operand_ty: Type::Int64, ty: Type::Bool });
+    builder.terminate(Terminator::CondJump { cond: r_exhausted, then_block: m_take_l, else_block: m_cmp });
+
+    // m_cmp: cmp(out[i], out[j]) <= 0 → take left (stable), else take right. Comparator inlined.
+    builder.switch_to(m_cmp);
+    let a_val = builder.alloc_temp(elem_ty.clone());
+    builder.emit(Instruction::Index { dst: a_val, object: out, key: mi, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() });
+    let b_val = builder.alloc_temp(elem_ty.clone());
+    builder.emit(Instruction::Index { dst: b_val, object: out, key: mj, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() });
+    let (cmp_raw, cmp_ty) = inline_lambda_body(&lam_params, &lam_body, &[(a_val, elem_ty.clone()), (b_val, elem_ty.clone())], builder, ctx);
+    // The comparator returns an Int32 cmp value; coerce a boxed/widened result to a concrete Int32.
+    let cmp_i32 = coerce_arg_to_param_repr(cmp_raw, &cmp_ty, &Type::Int32, builder);
+    let zero32 = builder.const_temp(Const::Int(0, Type::Int32));
+    let take_left = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary { dst: take_left, op: BinOp::LtEq, lhs: cmp_i32, rhs: zero32, operand_ty: Type::Int32, ty: Type::Bool });
+    builder.terminate(Terminator::CondJump { cond: take_left, then_block: m_take_l, else_block: m_take_r });
+
+    // m_take_l: work[k] = out[i]; i += 1
+    builder.switch_to(m_take_l);
+    let lv = builder.alloc_temp(elem_ty.clone());
+    builder.emit(Instruction::Index { dst: lv, object: out, key: mi, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() });
+    builder.emit(Instruction::IndexSet { object: work, key: mk, value: lv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
+    let mi_inc = builder.alloc_temp(Type::Int64);
+    builder.emit(Instruction::Binary { dst: mi_inc, op: BinOp::Add, lhs: mi, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
+    builder.terminate(Terminator::Jump(m_advance));
+    let take_l_block = m_take_l;
+
+    // m_take_r: work[k] = out[j]; j += 1
+    builder.switch_to(m_take_r);
+    let rv = builder.alloc_temp(elem_ty.clone());
+    builder.emit(Instruction::Index { dst: rv, object: out, key: mj, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() });
+    builder.emit(Instruction::IndexSet { object: work, key: mk, value: rv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
+    let mj_inc = builder.alloc_temp(Type::Int64);
+    builder.emit(Instruction::Binary { dst: mj_inc, op: BinOp::Add, lhs: mj, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
+    builder.terminate(Terminator::Jump(m_advance));
+    let take_r_block = m_take_r;
+
+    // m_advance: k += 1; i/j carried via phis from whichever branch ran. Taking LEFT advances i and
+    // leaves j unchanged; taking RIGHT advances j and leaves i unchanged.
+    builder.switch_to(m_advance);
+    builder.emit(Instruction::Phi { dst: mi_next, ty: Type::Int64, incomings: vec![(mi_inc, take_l_block), (mi, take_r_block)] });
+    builder.emit(Instruction::Phi { dst: mj_next, ty: Type::Int64, incomings: vec![(mj, take_l_block), (mj_inc, take_r_block)] });
+    builder.emit(Instruction::Binary { dst: mk_next, op: BinOp::Add, lhs: mk, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
+    builder.terminate(Terminator::Jump(m_header));
+
+    // ---- after merge of this run pair: lo += 2*width ----
+    builder.switch_to(m_exit);
+    builder.emit(Instruction::Binary { dst: lo_next, op: BinOp::Add, lhs: lo, rhs: two_w, operand_ty: Type::Int64, ty: Type::Int64 });
+    // The lo phi's back-edge predecessor is THIS block (`m_exit`), not the provisional `lo_body`: the
+    // run-pair merge spans the merge sub-loop, so control returns to `lo_header` from here.
+    builder.patch_phi_incoming(lo_header, lo, lo_body, m_exit);
+    builder.terminate(Terminator::Jump(lo_header));
+
+    // ---- lo_exit: copy work[0..n) back into out[0..n) so the result lives in `out` ----
+    builder.switch_to(lo_exit);
+    {
+        let pre = builder.current_block;
+        let header = builder.alloc_block("sort_cb_hdr");
+        let body = builder.alloc_block("sort_cb_body");
+        let exit = builder.alloc_block("sort_cb_exit");
+        let i = builder.alloc_temp(Type::Int64);
+        let i_next = builder.alloc_temp(Type::Int64);
+        builder.terminate(Terminator::Jump(header));
+        builder.switch_to(header);
+        builder.emit(Instruction::Phi { dst: i, ty: Type::Int64, incomings: vec![(zero, pre), (i_next, body)] });
+        let cond = builder.alloc_temp(Type::Bool);
+        builder.emit(Instruction::Binary { dst: cond, op: BinOp::Lt, lhs: i, rhs: n, operand_ty: Type::Int64, ty: Type::Bool });
+        builder.terminate(Terminator::CondJump { cond, then_block: body, else_block: exit });
+        builder.switch_to(body);
+        let wv = builder.alloc_temp(elem_ty.clone());
+        builder.emit(Instruction::Index { dst: wv, object: work, key: i, obj_ty: result_type.clone(), key_ty: Type::Int64, result_ty: elem_ty.clone() });
+        builder.emit(Instruction::IndexSet { object: out, key: i, value: wv, obj_ty: result_type.clone(), key_ty: Type::Int64, val_ty: elem_ty.clone() });
+        builder.emit(Instruction::Binary { dst: i_next, op: BinOp::Add, lhs: i, rhs: one, operand_ty: Type::Int64, ty: Type::Int64 });
+        builder.terminate(Terminator::Jump(header));
+        builder.switch_to(exit);
+    }
+    // width *= 2, back to the width header. The width phi's back-edge predecessor is THIS block (the
+    // copy-back exit), not the provisional `w_body`: a full pass spans the lo/merge/copy-back loops.
+    let w_back_block = builder.current_block;
+    builder.emit(Instruction::Binary { dst: width_next, op: BinOp::Mul, lhs: width, rhs: two, operand_ty: Type::Int64, ty: Type::Int64 });
+    builder.patch_phi_incoming(w_header, width, w_body, w_back_block);
+    builder.terminate(Terminator::Jump(w_header));
+
+    // ---- done: `out` holds the fully-sorted result. ----
+    builder.switch_to(w_exit);
+    out
+}
+
+/// `min(a, b)` over two Int64 temps via a select-style CondJump+phi. Used by `lower_sort` for the
+/// run-boundary clamps (`min(lo+width, n)`).
+fn emit_min_i64(a: Temp, b: Temp, builder: &mut FuncBuilder) -> Temp {
+    let cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary { dst: cond, op: BinOp::Lt, lhs: a, rhs: b, operand_ty: Type::Int64, ty: Type::Bool });
+    let then_b = builder.alloc_block("min_a");
+    let else_b = builder.alloc_block("min_b");
+    let mrg = builder.alloc_block("min_mrg");
+    builder.terminate(Terminator::CondJump { cond, then_block: then_b, else_block: else_b });
+    builder.switch_to(then_b);
+    builder.terminate(Terminator::Jump(mrg));
+    builder.switch_to(else_b);
+    builder.terminate(Terminator::Jump(mrg));
+    builder.switch_to(mrg);
+    let out = builder.alloc_temp(Type::Int64);
+    builder.emit(Instruction::Phi { dst: out, ty: Type::Int64, incomings: vec![(a, then_b), (b, else_b)] });
+    out
 }
 
 // -------------------------------------------------------------------------
