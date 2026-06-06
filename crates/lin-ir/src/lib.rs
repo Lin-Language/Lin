@@ -1,3 +1,4 @@
+pub mod carry;
 pub mod escape;
 pub mod ir;
 pub mod lower;
