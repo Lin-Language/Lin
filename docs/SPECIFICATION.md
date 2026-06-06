@@ -442,6 +442,13 @@ is *either* a fixed record *or* an index-signature map, never both.
   type). An **evidence-free** empty `{}` — no annotation, no contextual type, no contents — is a
   **compile error** (it cannot infer a value type); annotate it, e.g. `val m: { String: Int32 } =
   {}` or `val m: {} = {}` for a dynamic record. See ADR-084.
+- A **non-empty** record literal `{ "k1": v1, "k2": v2, … }` (string-literal keys) likewise widens
+  to `{ String: T }` whenever it is checked against that type and every value `vi` is assignable to
+  `T` — the literal becomes a hashed map carrying those entries rather than a fixed record. This
+  applies in any checked position, including a **nested field**: a field typed `{ String: T }`
+  inside an enclosing record (e.g. `{ "headers": { String: String }, … }`) widens the literal given
+  in that field position, transitively through intermediate record fields. (A literal with a
+  non-string-literal/dynamic key is not widened — it defers to ordinary inference.)
 - `keys(m) : String[]`, `values(m) : T[]`, `entries(m)` are available via `std/object`.
 - There is no implicit `Json → { String: T }` coercion — convert a `Json` value through
   `fromJson`/narrowing exactly as for any other concrete type (§6.3, §19).

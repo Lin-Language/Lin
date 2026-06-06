@@ -912,9 +912,14 @@ impl Checker {
                 Ok(None)
             }
             Type::Object { fields: expected_fields, .. } => {
-                // Only take over when at least one expected field is a literal singleton; this
-                // keeps plain structural objects on the existing inference path.
-                if !expected_fields.values().any(|t| matches!(t, Type::StrLit(_))) {
+                // Take over with directed field-by-field checking when it would actually change
+                // the outcome — otherwise stay on the existing undirected inference path so plain
+                // structural objects are unaffected. Two cases need directing:
+                //   (1) a `StrLit` field — so a discriminant literal narrows to its singleton;
+                //   (2) a `Map` field (possibly nested inside a further record field) — so an
+                //       object literal in that field position key-widens to `{ String: T }`
+                //       (a `LinMap`) instead of being inferred to its own fixed-record type.
+                if !expected_fields.values().any(|t| expected_field_needs_directing(t)) {
                     return Ok(None);
                 }
                 Ok(Some(self.check_object_fields(fields, expected_fields, span)?))
@@ -1181,6 +1186,21 @@ pub(crate) fn type_is_streamish(ty: &Type) -> bool {
     match ty {
         Type::Stream(_) => true,
         Type::Union(variants) => variants.iter().any(type_is_streamish),
+        _ => false,
+    }
+}
+
+/// True if an expected field type warrants the directed object-checking path (so an object
+/// literal in that field position is checked AGAINST the type rather than freely inferred).
+/// This is the gate for `check_object_against`'s `Type::Object` arm. It fires when the type is
+/// — or transitively (in a record-field position) contains — either a `StrLit` singleton (so a
+/// discriminant narrows) or a `Map` (so a record literal key-widens to `{ String: T }`). The
+/// transitive walk handles nested records like `{ headers: { String: String } }` where the
+/// outer record has no direct `StrLit`/`Map` field but a nested field does.
+pub(crate) fn expected_field_needs_directing(ty: &Type) -> bool {
+    match ty {
+        Type::StrLit(_) | Type::Map(_) => true,
+        Type::Object { fields, .. } => fields.values().any(expected_field_needs_directing),
         _ => false,
     }
 }
