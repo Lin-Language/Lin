@@ -6,24 +6,26 @@
 //
 // FIXED-SHAPE records are typed here. The createRaptor index dictionaries are now
 // TYPED `{ String: T }` index-signature maps via the `RaptorIndex` type below
-// (ADR-055 / spec §5.1.1) — routeStopIndex/routePath/routesAtStop/tripsByRoute became
-// hashed O(1) containers (the PREP-phase perf lever, see NOTES.md). The scan/query-side
-// maps (kConnections, kArrivals, bestArrivals) and the loader's intermediate maps stay
-// `Json` — their consumers union-narrow values that `{ String: T }` cannot express, or
-// the structural-equality / `toString` the unit tests rely on is unavailable for the
-// hashed map rep. See NOTES.md "what's typed, what stays Json, and why" for the precise
-// list and blockers.
+// (ADR-082 / spec §5.1.1) — routeStopIndex/routePath/routesAtStop/tripsByRoute became
+// hashed O(1) containers (the PREP-phase perf lever, see NOTES.md). The scan-state maps
+// (kArrivals, bestArrivals) AND kConnections — the LAST `Json` dictionary, now typed
+// `{ String: { String: Conn } }` (the projection-aliasing UAF that blocked it is fixed on
+// master) — are typed via the `ScanResults` record. The createRaptor INPUT maps
+// (transfers/interchange), getQueue's return, and the loader's intermediate maps stay
+// `Json` — their consumers need structural-equality / `toString` the hashed map rep lacks,
+// or there is no `Json -> { String: T }` coercion at the loader boundary. See NOTES.md
+// "what's typed, what stays Json, and why" for the precise list.
 //
 // USAGE STATUS (see NOTES.md "Typed records" section for the full map):
 //   ACTIVELY THREADED through code: Date (dateUtil/query/raptor), Service
 //   (service/routeScanner/raptor), StopTime + Transfer (gtfsLoader constructors),
-//   RaptorIndex (raptor/query/queueFactory/routeScanner/bench). Trip is referenced as
-//   the typed field of Service-carrying records but trips themselves stay `Json` (built
-//   from `Json`-map sources, and stored in the `Json[]`-valued index maps). Leg/
-//   TimetableLeg/Journey are REFERENCE-ONLY here: every journey/leg/connection value is
-//   read out of the `kConnections` `Json` map and consumed via a boolean field-test then
-//   field/index access (the calc-parser idiom), which Lin does not narrow — so those
-//   consumers stay `Json` and these types document the intended shape.
+//   RaptorIndex (raptor/query/queueFactory/routeScanner/bench), Conn (the kConnections
+//   value, via ScanResults — scanResults/raptor/query/journeyFactory/graphResults/
+//   stringResults). Trip is referenced as the typed field of Service-carrying records but
+//   trips themselves stay `Json` (built from `Json`-map sources). The kConnections CONNECTION
+//   values now narrow via `match … is Transfer`; the Leg/TimetableLeg/Journey leg OBJECTS that
+//   journeyFactory BUILDS are still `Json` literals consumed via field-tests, so those types
+//   stay REFERENCE-ONLY for now (the intended shape of the built legs).
 //
 // A calendar date (UTC), modelling the reference's JS Date. month is 1-12,
 // day is 1-31. Fully concrete -> sealed-record unboxed-struct candidate.
@@ -55,10 +57,10 @@ export type Leg = Transfer | TimetableLeg
 // seconds-from-midnight (may exceed 24h, but fit Int32 for these feeds).
 export type Journey = { "legs": Leg[], "departureTime": Int32, "arrivalTime": Int32 }
 
-// A scan connection: a timetable boarding `[trip, startIndex, endIndex]` (the trip stays
-// `Json` — composite `Json` does not flow into the named `Trip` record, spec §5.1.1 / NOTES)
-// or a footpath `Transfer`. This is the SHAPE of the value stored in `kConnections`; the map
-// itself stays `Json` (see ScanResults / NOTES "kConnections blocker").
+// A scan connection: a timetable boarding `[trip, startIndex, endIndex]` (the trip element stays
+// `Json` — composite `Json` does not flow into the named `Trip` record, spec §5.1.1 / NOTES) or a
+// footpath `Transfer`. This is the value type stored in the now-TYPED `kConnections` map (the
+// projection-aliasing UAF that previously forced `kConnections : Json` is fixed on master).
 export type Conn = [Json, Int32, Int32] | Transfer
 
 // The per-scan ScanResults state (mirrors ScanResults). The arrival-time dictionaries it
@@ -67,19 +69,18 @@ export type Conn = [Json, Int32, Int32] | Transfer
 // (GROUP/RANGE) perf lever:
 //   - bestArrivals  : StopID -> arrival time        { String: Int64 }
 //   - kArrivals      : roundStr -> (StopID -> time)  { String: { String: Int64 } }
-//   - kConnections   : StopID -> (roundStr -> Conn)  STAYS `Json` (see below)
+//   - kConnections   : StopID -> (roundStr -> Conn)  { String: { String: Conn } }
 // Arrival times use Int64 (the MAX sentinel 9007199254740991 needs it; §27 numeric).
 //
-// kConnections stays `Json`: typing it `{ String: { String: Conn } }` (a nested map of a
-// union-valued connection) is SUPPORTED in the simple/single-pass query path (run.lin's
-// TBW->NRW gate is byte-identical when it is typed), but it triggers a runtime
-// double-free / misaligned-pointer fault when a `match`-narrowed connection read off the
-// typed nested map is `push`-ed into a shared array and that array is then consumed by a
-// recursive slicing walk — the multi-day stitching (`completeJourneys`/`prevConnections`) and
-// the transfer-pattern walks (graphResults/stringResults). This is a codegen/RC bug, not a
-// Lin-level workaround, so kConnections is left `Json` per the staging contract. See NOTES.md
-// "kConnections blocker" for the minimal repro.
-export type ScanResults = { "k": Int32, "bestArrivals": { String: Int64 }, "kArrivals": { String: { String: Int64 } }, "kConnections": Json }
+// kConnections is the LAST `Json` dictionary to be typed. It was kept `Json` because a typed
+// nested union-valued map triggered a use-after-free in the multi-day stitching
+// (`completeJourneys`/`prevConnections`) and the transfer-pattern walks
+// (graphResults/stringResults): a `match`-narrowed connection read off the map, `push`-ed into a
+// shared array, then consumed by a recursive slicing walk. That projection-aliasing UAF is now
+// FIXED on master (`val x = obj[k]` materializes a stable owned box), so kConnections is typed
+// `{ String: { String: Conn } }`. This is a FIDELITY improvement (the query-phase maps were
+// measured perf-neutral — see NOTES.md); behaviour is byte-identical.
+export type ScanResults = { "k": Int32, "bestArrivals": { String: Int64 }, "kArrivals": { String: { String: Int64 } }, "kConnections": { String: { String: Conn } } }
 
 // The createRaptor index struct (mirrors RaptorAlgorithm's constructor fields).
 // The dynamic-key dictionaries that createRaptor BUILDS from scratch are now typed
