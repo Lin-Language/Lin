@@ -288,6 +288,14 @@ impl<'ctx> Codegen<'ctx> {
         let fields = Self::sealed_fields(elem)?;
         // Stage 3 scope: ALL fields must be scalars (no heap fields). A heap field would need
         // per-element per-field RC on array drop/overwrite — deferred to Stage 3b.
+        //
+        // STAGE 3b STATUS (kept scalar-only — fail-safe): widening this to heap-field records (so a
+        // `Person[]`/`Edge[]` becomes a packed pointer-slot array) was attempted and reverted. With
+        // the combinator materialize-to-boxed boundary in place, the COMBINATOR wall clears, but the
+        // ungate still regressed the corpus (72 → 55: calc/codec/dijkstra/report/raspberry/processes)
+        // — heap-field packed arrays need per-element per-field RC across construction / whole-element
+        // read / index-set / drop paths far beyond the combinator boundary. Heap-field arrays stay
+        // BOXED `Object[]` (correct). Re-attempt only after those element-RC paths are descriptor-driven.
         if fields.values().all(Self::is_sealed_scalar_field) {
             Some(fields)
         } else {
