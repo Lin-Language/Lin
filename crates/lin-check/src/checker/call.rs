@@ -20,6 +20,54 @@ use crate::types::Type;
 ///     removed. A `Json` holding a non-number unboxes as garbage, the SAME accepted, documented
 ///     unsoundness as `Json → Int32` today; `fromJson` is the validated extraction path.
 /// REJECTS only genuinely non-numeric concrete types (`String`/`Bool`/`Object`/array).
+/// Whether a callback's EXPECTED function type (after `apply_type_subs`) has every PARAMETER type
+/// resolved to a FULLY CONCRETE type — no `TypeVar` anywhere, INCLUDING the `Json` wildcard
+/// (`u32::MAX`). When so, the generic params that pin those slots have all been bound by an earlier
+/// (type-pinning) argument to concrete types (e.g. `(Int32, Int32) => U` for `sort(xs, cmp)` once
+/// `T = Int32` from `xs`), so the back-inferred lambda-param hints are EXACT and a body type error
+/// against them is GENUINE — propagate it, closing the inference hole.
+///
+/// Two deliberate exclusions keep this conservative (never reject legitimate code):
+///   * The RETURN type is IGNORED — `map`'s `(T, Int32) => U` legitimately leaves `U` unresolved
+///     until the body determines it (`U` is solved FROM the lambda return), so a free return must
+///     not force a strict check.
+///   * A parameter that is (or contains) the `Json` wildcard is a PERMISSIVE/dynamic hint, not an
+///     exact concrete type — e.g. `reduce`'s accumulator `U` resolving to `Json | Int32` when the
+///     receiver's element is itself a `Json`-tainted inference union. Body ops there (`acc + x`)
+///     are intentionally permissive under the dynamic-`Json` policy, so we keep the inference
+///     fallback rather than reject. Requiring `!contains_type_var()` (which counts the wildcard)
+///     excludes exactly these cases.
+///   * A parameter that is (or contains) `Never` is NOT a real pin either: it comes from an EMPTY
+///     collection (`[].sort((a, b) => a - b)` binds `T = Never` because there are no elements to
+///     constrain it). The callback body is legitimate — there is simply no concrete element type to
+///     check it against — so a `Never` param must fall back to inference rather than reject (`a - b`
+///     would be "Sub to Never and Never"). `contains_never` mirrors the `contains_type_var` shape.
+fn expected_fn_params_fully_pinned(expected: &Type) -> bool {
+    match expected {
+        Type::Function { params, .. } => {
+            params.iter().all(|p| !p.contains_type_var() && !type_contains_never(p))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `ty` is, or structurally contains, `Never`. Used to exclude degenerate empty-collection
+/// element pins (`T = Never`) from strict callback-body checking — see `expected_fn_params_fully_pinned`.
+fn type_contains_never(ty: &Type) -> bool {
+    match ty {
+        Type::Never => true,
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Map(t) => {
+            type_contains_never(t)
+        }
+        Type::Union(ts) | Type::FixedArray(ts) => ts.iter().any(type_contains_never),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(type_contains_never) || type_contains_never(ret)
+        }
+        Type::Object { fields, .. } => fields.values().any(type_contains_never),
+        _ => false,
+    }
+}
+
 fn arg_satisfies_numeric_bound(arg_ty: &Type) -> bool {
     match arg_ty {
         t if t.is_numeric() => true,
@@ -465,9 +513,23 @@ impl Checker {
                             // Re-apply subs each iteration so earlier lambdas inform later ones.
                             let expected = apply_type_subs(&params[i], &subs);
                             if matches!(expected, Type::Function { .. }) {
-                                match self.check_expr(arg, &expected) {
-                                    Ok(t) => t,
-                                    Err(_) => self.infer_expr(arg)?,
+                                // When every PARAMETER of the callback's signature has been PINNED
+                                // by an earlier (type-pinning) argument, the param hints are concrete
+                                // (e.g. `(Int32,Int32)=>R` for `sort(xs, cmp)` once `T=Int32` from
+                                // `xs`). The back-inferred param hints are then trustworthy, so a
+                                // body type error (`a["x"]` on an `Int32` param) is GENUINE and must
+                                // propagate — not be swallowed by a hint-free `infer_expr` retry (the
+                                // inference hole this closes). The return is ignored on purpose (an
+                                // unresolved `U` is solved FROM the body). When a param is still an
+                                // unresolved generic, fall back to plain inference so it stays free
+                                // for the call site to solve.
+                                if expected_fn_params_fully_pinned(&expected) {
+                                    self.check_expr(arg, &expected)?
+                                } else {
+                                    match self.check_expr(arg, &expected) {
+                                        Ok(t) => t,
+                                        Err(_) => self.infer_expr(arg)?,
+                                    }
                                 }
                             } else {
                                 self.infer_expr(arg)?
@@ -904,9 +966,20 @@ impl Checker {
                                 .map(|p| apply_type_subs(p, &subs))
                                 .unwrap_or_else(|| self.env.fresh_type_var());
                             if matches!(expected, Type::Function { .. }) {
-                                match self.check_expr(arg_expr, &expected) {
-                                    Ok(t) => t,
-                                    Err(_) => self.infer_expr(arg_expr)?,
+                                // Fully-pinned callback PARAMS: the back-inferred param hints are
+                                // trustworthy, so a body type error must propagate (the dot-call
+                                // mirror of the `infer_call` fix — `xs.map(x => x["k"])` over an
+                                // `Int32[]`, where `map`'s `(T, Int32) => U` pins the param to
+                                // `Int32` via the receiver even though the return `U` is free).
+                                // When a param is still an unresolved generic, fall back to plain
+                                // inference. The Json wildcard does not count (see helper).
+                                if expected_fn_params_fully_pinned(&expected) {
+                                    self.check_expr(arg_expr, &expected)?
+                                } else {
+                                    match self.check_expr(arg_expr, &expected) {
+                                        Ok(t) => t,
+                                        Err(_) => self.infer_expr(arg_expr)?,
+                                    }
                                 }
                             } else {
                                 self.infer_expr(arg_expr)?
