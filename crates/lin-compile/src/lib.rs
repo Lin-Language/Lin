@@ -1193,6 +1193,25 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
     // Link system libraries needed by lin-runtime (libc via cc, libm for math).
     cmd.arg("-lm");
 
+    // Garbage-collect unreferenced sections at link time. `lin-runtime.a` is a single static
+    // archive carrying the WHOLE runtime (every intrinsic, every flat-array variant, all the
+    // refcount/string/object machinery) plus, in dev builds, ~260MB of DWARF debug info across
+    // ~1000 codegen-unit objects. A given Lin program references only a fraction of those symbols,
+    // but the linker pulls in and emits every object that satisfies any reference and drags its
+    // debug info along — so the cold link of a trivial program is ~5s, dominated entirely by the
+    // archive, not the program. `--gc-sections` lets the linker drop sections (functions/data, and
+    // their attached debug sections) that are transitively unreachable from the entry point. rustc
+    // emits per-function/-data sections by default, so this is effective without recompiling the
+    // runtime. Measured: cold link 5.2s -> 1.8s on a minimal program; whole-program reachability is
+    // unchanged, so it never removes a symbol the program actually uses. We deliberately do NOT
+    // strip debug info (e.g. via a `debug=false` profile): the ASan UAF-hunting workflow relies on
+    // runtime symbolization, and `--gc-sections` keeps the debug info for sections that survive.
+    // The flag is linker-specific: GNU ld / lld (Linux) take `--gc-sections`; Apple ld64 (macOS)
+    // spells the same dead-code elimination `-dead_strip`. Pick via host cfg — `lin` always links
+    // for its own host, so host cfg is the target linker.
+    let dead_strip = if cfg!(target_os = "macos") { "-Wl,-dead_strip" } else { "-Wl,--gc-sections" };
+    cmd.arg(dead_strip);
+
     // Capture stderr so a link failure surfaces the real linker diagnostic (e.g. "cannot find
     // libclang_rt.profile...") instead of a bare exit status. A successful link normally writes
     // nothing, so capturing doesn't change observable behaviour on success.
