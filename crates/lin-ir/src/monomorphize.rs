@@ -67,8 +67,11 @@ fn mentions_generic_tv(ty: &Type) -> bool {
     }
 }
 
-/// A field type in a PACKED scalar-only sealed record (Stage 3a gate): a fixed-width scalar or Bool.
-/// Mirrors the scalar-only `Codegen::sealed_array_elem` / lower.rs `is_sealed_scalar_array` gate.
+/// A field type permitted in a PACKED sealed record element (Stage 3a scalar + Stage 3b heap):
+/// a fixed-width scalar / Bool, OR a packable heap field (String / Array / nested-sealed record).
+/// MUST mirror `Codegen::sealed_array_elem_field_packable` / lower.rs `is_sealed_scalar_array`
+/// EXACTLY — a combinator over a packed sealed element (whether scalar- or heap-field) must take the
+/// boxed-fallback detour, else the native specialization reads packed bytes through boxed machinery.
 fn field_packed_scalar(ty: &Type) -> bool {
     ty.is_flat_scalar() || matches!(ty, Type::Bool)
 }
