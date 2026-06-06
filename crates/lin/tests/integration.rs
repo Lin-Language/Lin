@@ -8366,6 +8366,86 @@ print(toString(buf))
     assert_eq!(out, vec!["[10, 20, 30]"]);
 }
 
+// TYPE-SOUNDNESS (record field omission via a generic call). Lin records are STRUCTURALLY typed:
+// a value with MORE fields than the type (extras) is assignable (width subtyping), but a value
+// OMITTING a required field is NOT. The previously-open hole: omission slipped through the generic
+// call path — `push(toks, {kind})` where `toks: Token[]` and the `{kind}` item omits the required
+// `text`. The shared `T` was bound `T = Token` by the container arg, then silently CLOBBERED to the
+// deficient `{kind}` by the item arg (the no-clobber guard's last-wins-on-conflict branch), so the
+// arg-compat gate compared `{kind}` vs `{kind}` and trivially passed. Reading the omitted `text`
+// (a NULL pointer in the boxed path) then SEGFAULTED. Now the canonical first binding `T = Token`
+// is kept and the omitting item is rejected with a clear diagnostic naming the expected full type.
+#[test]
+fn test_generic_push_record_field_omission_rejected() {
+    let err = run_expect_err(
+        r#"import { push } from "std/array"
+type Token = { "kind": String, "text": String }
+val toks: Token[] = []
+push(toks, { "kind": "lparen" })
+"#,
+    );
+    assert!(
+        err.contains("kind") && err.contains("text"),
+        "push of a record OMITTING the required `text` field must be a type error naming the \
+         expected full record type, got: {err}"
+    );
+}
+
+// The asymmetric counterpart of the omission rejection: a record with EXTRA fields (width
+// subtyping) MUST still flow through the generic call, and a COMPLETE record obviously must too.
+// This is the whole point of the fix — close omission WITHOUT breaking width-subtyping.
+#[test]
+fn test_generic_push_record_extras_and_complete_accepted() {
+    let out = run(r#"import { print } from "std/io"
+import { push } from "std/array"
+type Token = { "kind": String, "text": String }
+val toks: Token[] = []
+// COMPLETE record: every required field present.
+push(toks, { "kind": "lparen", "text": "(" })
+// EXTRAS (width subtyping): more fields than the type requires.
+push(toks, { "kind": "rparen", "text": ")", "line": 1 })
+print(toks[0]["text"])
+print(toks[1]["text"])
+"#);
+    assert_eq!(out, vec!["(", ")"]);
+}
+
+// Width subtyping through a normal (non-generic) function parameter: an `OldPerson` value (= Person
+// + an extra `pension` field) is assignable where a `Person` is expected. Extras must NOT be
+// rejected by the omission fix.
+#[test]
+fn test_record_extras_into_fn_param_accepted() {
+    let out = run(r#"import { print } from "std/io"
+type Person = { "name": String, "age": Int32 }
+type OldPerson = { "name": String, "age": Int32, "pension": Int32 }
+val sayHello = (p: Person): String =>
+  "Hello ${p["name"]}"
+val o: OldPerson = { "name": "Bob", "age": 70, "pension": 100 }
+print(sayHello(o))
+"#);
+    assert_eq!(out, vec!["Hello Bob"]);
+}
+
+// REGRESSION GUARD for the omission fix: the legitimate last-wins-clobber case must still work.
+// `push(uint8Buf, int32Val)` binds `T = UInt8` from the container, then the wider-numeric `Int32`
+// item must clobber `T` to `Int32` (the runtime coerces it down to a byte). The narrow
+// record-omission guard must NOT fire here (numeric, not a deficient-record conflict).
+#[test]
+fn test_generic_push_int32_into_uint8_array_still_coerces() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push } from "std/array"
+type Field = { "tag": Int32, "bytes": Int32[] }
+val encodeField = (buf: UInt8[], field: Field): Null =>
+  push(buf, field["tag"])
+val buf: UInt8[] = []
+val f: Field = { "tag": 5, "bytes": [1, 2] }
+encodeField(buf, f)
+print(toString(buf))
+"#);
+    assert_eq!(out, vec!["[5]"]);
+}
+
 // A generic `push` of a generic-`U`-typed element built inside ANOTHER generic function, applied
 // cross-module, monomorphizes the nested push at the OUTER instantiation's concrete element type
 // (`mymap<Int32,Int32>` → flat `push$Int32`), via the import-of-import thin-intrinsic-wrapper
