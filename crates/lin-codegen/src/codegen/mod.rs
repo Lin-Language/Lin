@@ -213,10 +213,10 @@ impl<'ctx> Codegen<'ctx> {
         // type-erased call that crashes a concrete use site.
         let mut ir_module =
             lin_ir::lower_import_module_with_imports(module, &module_key, imports, replaced_exports);
-        // Representation-inference pass (repr.rs) — STAGE 2 observer; runs before rc_elide on the
-        // same IR shape as the main module. Computes the per-temp repr table and (debug builds)
-        // asserts the Stage-2 oracle + verifier. Nothing consumes the table yet.
-        lin_ir::repr::run(&ir_module);
+        // Representation-inference pass (repr.rs) — STAGE 3; runs before rc_elide on the same IR
+        // shape as the main module. Stores the per-temp repr table on each `func.repr` for codegen
+        // to consume at DECIDE / ASSUME sites, and (debug builds) asserts the oracle + verifier.
+        lin_ir::repr::run(&mut ir_module);
         lin_ir::rc_elide::elide_rc(&mut ir_module);
         // Sealed-records Stage 4: stack-allocate non-escaping all-scalar sealed records and suppress
         // their Retain/Release emission (imports get the same analysis as the main module).
@@ -1134,7 +1134,12 @@ impl<'ctx> Codegen<'ctx> {
                                 .iter()
                                 .map(|a| func.temp_types.get(a).cloned().unwrap_or(Type::Null))
                                 .collect();
-                            let result = self.compile_ir_intrinsic(intrinsic, &arg_vals, &arg_tys, ret_ty);
+                            // STAGE 3: the per-operand physical representation (from `func.repr`) so
+                            // repr-deciding intrinsics (Push) dispatch on the proven repr instead of
+                            // re-deriving from the static type.
+                            let arg_reprs: Vec<lin_ir::repr::Repr> =
+                                args.iter().map(|a| func.repr_of(*a)).collect();
+                            let result = self.compile_ir_intrinsic(intrinsic, &arg_vals, &arg_tys, &arg_reprs, ret_ty);
                             temp_map.insert(*dst, result);
                         }
                         Instruction::MakeObject { dst, fields, spreads, ty, stack } => {
@@ -1192,10 +1197,15 @@ impl<'ctx> Codegen<'ctx> {
                             // retains heap fields it stores verbatim, and folds in any
                             // representation-changing coerce (e.g. an unsealed `{x,y}` literal into a
                             // nested sealed `Pt` field) as fresh-owned automatically.
-                            if let Some(sf) = Self::sealed_scalar_fields(ty) {
-                                let all_present = spreads.is_empty()
-                                    && sf.keys().all(|k| fields.iter().any(|(fk, _)| fk == k));
-                                if all_present {
+                            // STAGE 3: the packed-vs-boxed decision is read from `func.repr` (the
+                            // representation-inference pass already folded in the `sealed_scalar_fields`
+                            // gate AND the no-spread/all-present check via `make_object_repr`). When the
+                            // pass labelled this temp `Packed(PackedStruct)`, construct the packed struct;
+                            // otherwise fall through to the boxed `LinObject` path. (Oracle-proven byte
+                            // identical to the former `sealed_scalar_fields(ty) && all_present` gate.)
+                            let repr = func.repr_of(*dst);
+                            if let Some(sf) = repr.packed_struct_fields() {
+                                {
                                     let field_vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> = fields.iter().filter_map(|(k, t)| {
                                         temp_map.get(t).map(|v| {
                                             let vty = func.temp_types.get(t).cloned().unwrap_or(Type::Null);
@@ -1406,9 +1416,13 @@ impl<'ctx> Codegen<'ctx> {
                             // elements. Allocate via lin_sealed_array_alloc(cap, stride, desc) and
                             // copy each element struct's field payload into the buffer (scalar
                             // fields → no retain). `elem_ty` is the sealed Object type.
-                            let arr = if let Some(fields) = Self::sealed_fields(elem_ty)
-                                .filter(|f| f.values().all(Self::sealed_array_elem_field_packable))
-                            {
+                            // STAGE 3: the packed-sealed-array decision comes from `func.repr` (the
+                            // pass's `make_array_repr` already applied the `sealed_array_elem` gate —
+                            // sealed element with all-packable fields). The flat-scalar-vs-boxed split
+                            // below is the ORTHOGONAL pre-existing flat-array path (assume sites dispatch
+                            // on the array TYPE), which repr does not own, so it stays type-driven.
+                            let arr_repr = func.repr_of(*dst);
+                            let arr = if let Some(fields) = arr_repr.packed_sealed_array_layout() {
                                 let fields = fields.clone();
                                 let stride = Self::sealed_array_stride(&fields);
                                 let desc = self.sealed_descriptor(&fields); // NULL for scalar-only
@@ -1556,7 +1570,8 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::Index { dst, object, key, obj_ty, key_ty, result_ty } => {
                             if let (Some(&obj_v), Some(&key_v)) = (temp_map.get(object), temp_map.get(key)) {
-                                let result = self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty);
+                                let obj_repr = func.repr_of(*object);
+                                let result = self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty, &obj_repr);
                                 temp_map.insert(*dst, result);
                             }
                         }
@@ -1569,13 +1584,15 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::FieldGet { dst, object, field, obj_ty, result_ty } => {
                             if let Some(&obj_v) = temp_map.get(object) {
-                                let result = self.compile_ir_field_get(obj_v, field, obj_ty, result_ty);
+                                let obj_repr = func.repr_of(*object);
+                                let result = self.compile_ir_field_get(obj_v, field, obj_ty, result_ty, &obj_repr);
                                 temp_map.insert(*dst, result);
                             }
                         }
                         Instruction::SealedArrayFieldGet { dst, array, index, field, arr_ty, result_ty } => {
                             if let (Some(&arr_v), Some(&idx_v)) = (temp_map.get(array), temp_map.get(index)) {
-                                let result = self.compile_ir_sealed_array_field_get(arr_v, idx_v, field, arr_ty, result_ty);
+                                let arr_repr = func.repr_of(*array);
+                                let result = self.compile_ir_sealed_array_field_get(arr_v, idx_v, field, arr_ty, result_ty, &arr_repr);
                                 temp_map.insert(*dst, result);
                             }
                         }

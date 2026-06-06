@@ -592,6 +592,7 @@ mod tests {
             temp_types,
             temp_count: 3,
             intrinsic_slots: std::collections::HashMap::new(),
+            repr: Vec::new(),
         }
     }
 
@@ -631,6 +632,7 @@ mod tests {
             temp_types,
             temp_count: 3,
             intrinsic_slots: std::collections::HashMap::new(),
+            repr: Vec::new(),
         }
     }
 
@@ -679,6 +681,7 @@ mod tests {
             temp_types,
             temp_count: 3,
             intrinsic_slots: std::collections::HashMap::new(),
+            repr: Vec::new(),
         }
     }
 
@@ -1027,6 +1030,7 @@ mod tests {
             temp_types,
             temp_count: 2,
             intrinsic_slots: std::collections::HashMap::new(),
+            repr: Vec::new(),
         };
         let mut module = make_module(func);
         elide_rc(&mut module);
