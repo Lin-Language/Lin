@@ -13,20 +13,20 @@ import { serve, json, text, redirect, notFound, badRequest, matchPath, parseBody
 type HttpRequest = {
   "method":  String,
   "path":    String,
-  "query":   { ...String },
-  "headers": { ...String },
+  "query":   String,
+  "headers": { String: String },
   "body":    String
 }
 
 type HttpResponse = {
   "status":  Int32,
-  "headers": { ...String },
+  "headers": { String: String },
   "body":    String
 }
 
 type HttpOptions = {
   "method":  String,
-  "headers": { ...String },
+  "headers": { String: String },
   "body":    String
 }
 ```

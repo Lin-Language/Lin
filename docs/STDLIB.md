@@ -3432,20 +3432,20 @@ import { fetch, fetchJson, serve, json, notFound } from "std/http"
 type HttpRequest = {
   "method":  String,
   "path":    String,
-  "query":   { ...String },
-  "headers": { ...String },
+  "query":   String,
+  "headers": { String: String },
   "body":    String
 }
 
 type HttpResponse = {
   "status":  Int32,
-  "headers": { ...String },
+  "headers": { String: String },
   "body":    String
 }
 
 type HttpOptions = {
   "method":  String,
-  "headers": { ...String },
+  "headers": { String: String },
   "body":    String
 }
 ```
