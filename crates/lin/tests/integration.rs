@@ -654,6 +654,32 @@ print(toString(total))
     assert_eq!(output, vec!["225"]);
 }
 
+// Regression (dynamic-arith union result released): a `Binary` op whose RESULT type is a union
+// (`Json`) — the dynamic `lin_tagged_arith` path, or bitwise-on-union — produces a FRESHLY boxed
+// `TaggedVal*` (+1). The lowerer now `register_owned`s it so scope exit (or the move/escape
+// machinery) reclaims it; previously its consumers (a cell store, a return) each `CloneBox`'d a
+// fresh +1 and the original arith-result box was orphaned (the residual after the operand-box
+// leak-#4b fix — `acc = acc + x` with a `Json` `acc` leaked one box/iteration). The accumulator
+// must still compute correctly; an over-eager free would corrupt or crash it.
+#[test]
+fn test_dynamic_arith_union_result_released_and_correct() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+val sumDyn = (): Json =>
+  var acc: Json = 0
+  range(0, 50).for(stop => acc = acc + stop)
+  acc
+
+var total: Json = 0
+range(0, 20).for(i => total = total + sumDyn())
+print(toString(total))
+"#);
+    // sumDyn() = 0+1+..+49 = 1225; summed 20 times = 24500.
+    assert_eq!(output, vec!["24500"]);
+}
+
 // Regression (captured-cell free): `map` uses a `var i` cell captured by its inner `.for`
 // closure. The cell + its value were leaked on every `map` call (a per-call ~31 B leak; in a
 // hot loop, unbounded RSS growth). The lowerer now frees provably-non-escaping captured cells

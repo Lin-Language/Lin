@@ -2653,6 +2653,18 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             for shell in fresh_operand_boxes {
                 builder.emit(Instruction::FreeBoxShell { val: shell });
             }
+            // A UNION-typed Binary result is a FRESHLY boxed `TaggedVal*` (+1): the dynamic-arith
+            // path (`lin_tagged_arith`) and the bitwise-on-union path (`box_value` of the concrete
+            // result) both ALLOCATE a new box; the eq/cmp paths return a concrete `Bool` and never
+            // reach here. Register it owned so scope exit releases it (or the move/escape machinery
+            // transfers it when it's stored/returned). Without this, a dynamic `acc = acc + x` whose
+            // result stays `Json` orphaned the arith result box every iteration — its consumers
+            // (cell store, return) each `CloneBox` a fresh +1 and never consumed the original (the
+            // residual after the leak-#4b operand-box fix). Concrete-result arithmetic returns an
+            // unboxed scalar (not rc) and is unaffected.
+            if is_union_ty(result_type) {
+                builder.register_owned(dst, result_type.clone());
+            }
             dst
         }
 
