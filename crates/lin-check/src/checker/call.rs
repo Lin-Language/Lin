@@ -7,13 +7,13 @@ use crate::resolve::{error_type, json_type};
 use crate::typed_ir::*;
 use crate::types::Type;
 
-/// Whether an argument type may satisfy a `Number` (numeric-bounded) parameter (ADR-018, reversed).
+/// Whether an argument type may satisfy a `Number` (numeric-bounded) parameter (ADR-014, reversed).
 /// Accepts:
 ///   * a concrete numeric family (the monomorphizable case),
 ///   * a generic/unsolved type var (the bound flows on to the outer specialization, or is zonked to
 ///     a concrete family), AND
-///   * the `Json` wildcard (`TypeVar(u32::MAX)`) — a dynamic `Json` value (ADR-018 §Json policy).
-///     This matches the existing `Json → Int32` scalar coercion (ADR-048): a `Json` argument is
+///   * the `Json` wildcard (`TypeVar(u32::MAX)`) — a dynamic `Json` value (ADR-014 §Json policy).
+///     This matches the existing `Json → Int32` scalar coercion (ADR-032): a `Json` argument is
 ///     ACCEPTED at a `Number` parameter and monomorphizes to the default `Int32` family, unboxing
 ///     unchecked. Previously a DIRECT `Json` (the bare `u32::MAX` marker) was rejected here while a
 ///     `Json` PROJECTION (`config["k"]`, a fresh inference var) slipped past — an inconsistency now
@@ -31,7 +31,7 @@ fn arg_satisfies_numeric_bound(arg_ty: &Type) -> bool {
 }
 
 impl Checker {
-    /// `fromJson` special form (ADR-047). `T.fromJson(value)` desugars to a DotCall and
+    /// `fromJson` special form (ADR-031). `T.fromJson(value)` desugars to a DotCall and
     /// `fromJson(T, value)` to a Call; both reach here BEFORE arg0/receiver is inferred as a
     /// value (a type name like `Person` is not a runtime value). Fires only when:
     ///   * the callee/method surface name is `fromJson`, AND
@@ -257,7 +257,7 @@ impl Checker {
         partial: bool,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
-        // fromJson special form: `fromJson(T, value)` (ADR-047). Intercept before the callee
+        // fromJson special form: `fromJson(T, value)` (ADR-031). Intercept before the callee
         // is inferred, since arg0 is a type name, not a value.
         if let Expr::Ident(name, _) = func {
             if name == "fromJson" && !partial && args.len() == 2 {
@@ -279,7 +279,7 @@ impl Checker {
                 // fresh inference var. This must NOT match a *concrete* signature that merely
                 // returns `Json` (`TypeVar(MAX)`), e.g. `(): Json` or `(path: String): Json`:
                 // those have a KNOWN return type (Json) that must flow through the Json→concrete
-                // cast-hole gate (ADR-046), not be freshened into a permissive inference var.
+                // cast-hole gate (ADR-045), not be freshened into a permissive inference var.
                 // The opaque annotation is uniquely identified by having ≥1 param that is the
                 // Json wildcard `TypeVar(MAX)` (a real signature never spells a param as Json's
                 // sentinel — Json params are written `Json`, which is also TypeVar(MAX), but
@@ -549,7 +549,7 @@ impl Checker {
                     }
                 }
 
-                // Enforce the NUMERIC bound (ADR-018, reversed). A `Number` parameter resolved to a
+                // Enforce the NUMERIC bound (ADR-014, reversed). A `Number` parameter resolved to a
                 // numerically-constrained generic TypeVar; at this call site it is being bound to the
                 // argument's concrete family. That family must be numeric (an `Int*`/`UInt*`/`Float*`),
                 // OR another numeric-constrained / unconstrained generic TypeVar (the bound flows on to
@@ -598,7 +598,7 @@ impl Checker {
                 }
 
                 // Mixed numeric families in ONE call of a `Number`-returning function (e.g.
-                // `(a:Number,b:Number)=>a+b` at `add(10, 2.5)`) ARE supported (ADR-018, reversed):
+                // `(a:Number,b:Number)=>a+b` at `add(10, 2.5)`) ARE supported (ADR-014, reversed):
                 // monomorphization specializes `add$Int32_Float64` and re-widens the arithmetic
                 // result to the same family the concrete `(a:Int32,b:Float64)` equivalent produces
                 // (Float64 here). No guard — the previous reject was a workaround for a codegen ABI
@@ -782,7 +782,7 @@ impl Checker {
             }
         }
 
-        // fromJson special form: `T.fromJson(value)` (ADR-047). Intercept before the receiver
+        // fromJson special form: `T.fromJson(value)` (ADR-031). Intercept before the receiver
         // is inferred as a value, since `T` is a type name, not a runtime value.
         if method == "fromJson" && !partial {
             if let Some(arg_exprs) = args {
@@ -975,7 +975,7 @@ impl Checker {
                     }
                 }
 
-                // Enforce the NUMERIC bound on a dot-call to a `Number`-parameter function (ADR-018,
+                // Enforce the NUMERIC bound on a dot-call to a `Number`-parameter function (ADR-014,
                 // reversed). Mirrors the direct-call check; the receiver is arg 0.
                 for (i, param_ty) in method_params.iter().enumerate() {
                     if i >= all_args.len() { break; }

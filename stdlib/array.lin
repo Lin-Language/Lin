@@ -13,13 +13,13 @@ import { for, take, concat } from "std/iter"
 // Generic (`<T>(arr: T[], item: T): Null`) so element-type checking is enforced: `push(intArr, "s")`
 // is a compile error (closing the prior soundness hole where a `Json` signature accepted any item).
 // `push` is the primitive for building up an accumulator (`val acc: Int32[] = []; xs.for(x =>
-// acc.push(x))`) — the empty-literal annotation requirement (ADR-084) makes `acc` pin `T` so the
+// acc.push(x))`) — the empty-literal annotation requirement (ADR-058) makes `acc` pin `T` so the
 // monomorphized `push$<T>` stores elements with the correct representation (an UNANNOTATED `[]`
-// would be `Never[]` and mis-store as null; ADR-084 rejects that at compile time). `lin_push` is a
+// would be `Never[]` and mis-store as null; ADR-058 rejects that at compile time). `lin_push` is a
 // compiler builtin: it dispatches on the array's RUNTIME element representation (flat scalar via
 // `lin_flat_array_push_*`, tagged/boxed otherwise) and `lin_push_dyn` coerces a boxed element into
 // a flat slot. RC discipline: scalars carry no refcount; concrete heap / Json elements take exactly
-// one net retain — verified under AddressSanitizer (ADR-085). See array.test.lin.
+// one net retain — verified under AddressSanitizer (ADR-059). See array.test.lin.
 export val push = <T>(arr: T[], item: T): Null =>
   lin_push(arr, item)
 
@@ -57,7 +57,7 @@ export val length = (x: Json): Int32 =>
 // operate on `Json[]`. A direct sibling call to the generic `map`/`filter`/`reduce` from inside this
 // module would specialize at the `$Json` representation cross-module, where the combinator's
 // owned-array result and the surrounding generic body's RC accounting disagree (a double-release of
-// the intermediate array — the chained-map-over-Json RC mismatch noted in ADR-069). Keeping these
+// the intermediate array — the chained-map-over-Json RC mismatch noted in ADR-044). Keeping these
 // helpers on the non-generic Json signature routes them through the SAME boxed intrinsic path the
 // pre-generics map/filter/reduce used, which is correct.
 val _mapJ = (arr: Json, f: Function): Json =>
@@ -324,7 +324,7 @@ export val maxBy = <T>(arr: T[], keyFn: (T) => Number): T =>
 // compile error. The element type flows to `lin_array_append_dyn`, which still dispatches on the
 // array's RUNTIME element type to preserve flatness. The narrow-scalar literal case
 // (`b.append(3)` on a `UInt8[]`) is sound because the checker adopts the flat-scalar param element
-// type for a numeric literal arg (the literal-width fix, d314897/ADR-079).
+// type for a numeric literal arg (the literal-width fix, d314897/ADR-053).
 export val append = <T>(arr: T[], item: T): T[] =>
   lin_array_append_dyn(arr, item)
 
@@ -360,7 +360,7 @@ export val countBy = <T>(arr: T[], keyFn: (T) => String): { String: Int32 } =>
   arr.for(item =>
     val key = keyFn(item)
     // `result[key]` is `Int32 | Null`; only the positive `is Int32` match arm narrows it (an
-    // `== null` test does not narrow — ADR-082 / §6.1), so increment via that arm.
+    // `== null` test does not narrow — ADR-055 / §6.1), so increment via that arm.
     val current = result[key]
     match current
       is Int32 => result[key] = current + 1

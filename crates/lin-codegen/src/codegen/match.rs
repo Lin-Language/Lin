@@ -74,7 +74,7 @@ impl<'ctx> Codegen<'ctx> {
         all_present
     }
 
-    /// `is <ObjectType>` deep type validation (ADR-054). Emits the SAME schema descriptor the
+    /// `is <ObjectType>` deep type validation (ADR-036). Emits the SAME schema descriptor the
     /// `fromJson` path builds (`emit_from_json_descriptor`) and calls `lin_matches_schema(value,
     /// descriptor)`, which runs the `fromJson` structural walker and returns an `i8` bool (`1` iff
     /// `val` recursively conforms to `target`). `val` is a boxed `TaggedVal*`, borrowed (no

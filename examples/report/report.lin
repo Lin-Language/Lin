@@ -18,7 +18,7 @@ export type Stats = { "count": Int32, "total": Int32, "average": Int32, "top": S
 // concrete `Record` type. A bare `r["value"]` over the union is `Record | Null` (the
 // `Failure` arm has no `value`), and the precise generic `map` PRESERVES that
 // nullability — unlike the old Json-returning combinators that erased it — so a sound
-// narrowing is needed here (ADR-069 R1). The `failure` arm is unreachable after the
+// narrowing is needed here (ADR-044 R1). The `failure` arm is unreachable after the
 // `filter`, but keeps the match total.
 export val validRecords = (lines: String[]): Record[] =>
   lines

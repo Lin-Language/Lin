@@ -172,7 +172,7 @@ pub(crate) fn is_definitely_non_transferable(ty: &Type) -> bool {
 /// fields and no spreads) — used in a position where there is NO contextual type to fix its
 /// element/value type. Such a literal otherwise infers a degenerate type (`Array(Never)` /
 /// empty record `{}`) that silently misbehaves and cannot be checked against pushes, so we
-/// require an explicit annotation instead (ADR-084). Returns the kind of empty literal so the
+/// require an explicit annotation instead (ADR-058). Returns the kind of empty literal so the
 /// caller can phrase a tailored error, or `None` if the expression is not an evidence-free empty.
 ///
 /// Scope is deliberately syntactic and narrow: only a *bare* empty literal triggers it. A literal

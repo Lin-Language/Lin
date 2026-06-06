@@ -1,5 +1,5 @@
 // wordcount — count occurrences of each word using a typed index-signature map
-// `{ String: Int32 }` (the dictionary type, ADR-082). Arbitrary string keys all map to an
+// `{ String: Int32 }` (the dictionary type, ADR-055). Arbitrary string keys all map to an
 // Int32 count, with O(1) average lookup/insert. Reading a key yields `Int32 | Null`, so a
 // first-seen word (Null) starts at 0.
 import { for } from "std/iter"

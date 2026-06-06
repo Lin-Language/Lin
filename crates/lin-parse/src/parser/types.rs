@@ -72,7 +72,7 @@ impl Parser {
                 let span = self.current_span();
                 self.advance();
                 self.skip_newlines();
-                // Index-signature form `{ String: T }` (ADR-082): a bare `String` key (an Ident,
+                // Index-signature form `{ String: T }` (ADR-055): a bare `String` key (an Ident,
                 // not a string literal) followed by `:`. The key type is `String` only for v1; the
                 // grammar is left open for an `Int`-keyed form later, but that is not built.
                 let is_index_sig = matches!(self.peek_kind(), TokenKind::Ident(name) if name == "String")

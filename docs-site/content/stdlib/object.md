@@ -22,7 +22,7 @@ import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, 
 | `values` | `(Json) -> Json[]` | Array of object values (object or typed map) |
 
 `keys`/`values`/`entries` are tag-aware — they work on both a plain `{}`/`Json` record and a typed
-index-signature map `{ String: T }` (ADR-082). `merge`/`pick`/`omit`/`mapValues` are generic over
+index-signature map `{ String: T }` (ADR-055). `merge`/`pick`/`omit`/`mapValues` are generic over
 `{ String: T }` and *return* a typed map; pass them a value annotated `{ String: T }` (there is no
 implicit `Json -> { String: T }` coercion). Over a typed map, key order is hash order, not insertion
 order. `get` is the idiomatic *defaulted* read (`m[k] ?? default`) — a bare `m[k]` already yields

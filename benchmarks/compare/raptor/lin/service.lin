@@ -3,7 +3,7 @@
 // A Service is the named record type `Service` (types.lin):
 //   { "startDate": Int32, "endDate": Int32, "days": Json, "dates": Json }
 // `days` ({ "<dow>": Bool }) and `dates` ({ "<date>": Bool }) are dynamic-key
-// index maps. The `{ String: T }` map type now exists (ADR-082 / spec §5.1.1);
+// index maps. The `{ String: T }` map type now exists (ADR-055 / spec §5.1.1);
 // they stay `Json` here pending a RAPTOR re-typing pass to the map type.
 // `dates` is the include/exclude index: a key present with value `true` includes that
 // date, present with `false` excludes it; absent means "fall through to the range check".

@@ -4,7 +4,7 @@ use super::Parser;
 
 impl Parser {
     /// Parse one match arm. `arm_col`, when set, is the offside column of the match's arms
-    /// (inline / inside-parens mode, where ADR-004 suppresses Indent/Dedent). The arm body is
+    /// (inline / inside-parens mode, where ADR-003 suppresses Indent/Dedent). The arm body is
     /// then parsed as a column-delimited block whose exclusive floor is `arm_col - 1`: a
     /// multi-statement arm body stays together, but the next arm — aligned at `arm_col` — ends
     /// it, and a statement dedented below the arm column ends the whole match. `None` means the

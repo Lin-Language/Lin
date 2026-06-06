@@ -23,7 +23,7 @@ fn lin_bin() -> PathBuf {
     workspace_root().join("target/debug/lin")
 }
 
-/// A `lin` Command pre-armed with the `LIN_ALLOW_INTRINSICS` escape hatch (ADR-086) so the
+/// A `lin` Command pre-armed with the `LIN_ALLOW_INTRINSICS` escape hatch (ADR-060) so the
 /// compiler's own intrinsic-exercising fixtures (which write user-level `.lin` sources that call
 /// `lin_*` directly) keep type-checking. Tests that must exercise the gate REJECTING an intrinsic
 /// build a bare `Command::new(lin_bin())` instead, WITHOUT this env var.
@@ -2374,7 +2374,7 @@ fn test_cache_invalidated_when_import_signature_changes() {
 
 #[test]
 fn test_cyclic_imports_peer_dependent_return_boundary_gap() {
-    // Documents the KNOWN boundary-soundness gap in cyclic-import inference (ADR-078).
+    // Documents the KNOWN boundary-soundness gap in cyclic-import inference (ADR-052).
     // A 3-module cycle a -> b -> c -> a where the only literal lives in `fromC`, and
     // `fromA`/`fromB` get their return type only by calling through a peer.
     //
@@ -2384,7 +2384,7 @@ fn test_cyclic_imports_peer_dependent_return_boundary_gap() {
     // bind the (actually-String) result to Int32 with NO type error. That missed error is
     // the gap. If a future change iterates Phase 2 to convergence (or fails closed by
     // requiring an annotation), the second half of this test should start failing — update
-    // ADR-078 and flip the assertion when it does.
+    // ADR-052 and flip the assertion when it does.
     let dir = std::env::temp_dir().join(format!("lin_cyc_peerret_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(dir.join("a.lin"),
@@ -2423,14 +2423,14 @@ print(toString(k))
         String::from_utf8_lossy(&check.stderr), String::from_utf8_lossy(&check.stdout));
     let _ = std::fs::remove_dir_all(&dir);
     assert!(check.status.success(),
-        "ADR-078 boundary gap: binding a peer-dependent cyclic return to Int32 is currently \
-         accepted. If this now FAILS, the gap was closed — flip this assertion and update ADR-078. \
+        "ADR-052 boundary gap: binding a peer-dependent cyclic return to Int32 is currently \
+         accepted. If this now FAILS, the gap was closed — flip this assertion and update ADR-052. \
          got: {check_out}");
 }
 
 #[test]
 fn test_intrinsic_rejected_in_user_code() {
-    // ADR-086: `lin_*` compiler intrinsics must not be callable from user code; they are
+    // ADR-060: `lin_*` compiler intrinsics must not be callable from user code; they are
     // resolvable only when type-checking a trusted stdlib module (or with the LIN_ALLOW_INTRINSICS
     // test escape hatch). This test invokes `lin check` WITHOUT the escape hatch.
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -2672,7 +2672,7 @@ print(toString(length(obj)))
     assert_eq!(output, vec!["0", "0"]);
 }
 
-// ADR-084: an evidence-free empty array literal (no annotation, no contextual type, no contents)
+// ADR-058: an evidence-free empty array literal (no annotation, no contextual type, no contents)
 // cannot infer its element type and must be a compile error pointing the user at an annotation.
 #[test]
 fn test_context_free_empty_array_errors() {
@@ -2686,7 +2686,7 @@ print("unreachable")
     );
 }
 
-// ADR-084: same for an evidence-free empty map/object literal.
+// ADR-058: same for an evidence-free empty map/object literal.
 #[test]
 fn test_context_free_empty_object_errors() {
     let err = run_expect_err(r#"import { print } from "std/io"
@@ -2699,7 +2699,7 @@ print("unreachable")
     );
 }
 
-// ADR-084: a `var` (mutable) evidence-free empty literal must error the same way.
+// ADR-058: a `var` (mutable) evidence-free empty literal must error the same way.
 #[test]
 fn test_context_free_empty_var_errors() {
     let err = run_expect_err(r#"import { print } from "std/io"
@@ -2712,7 +2712,7 @@ print("unreachable")
     );
 }
 
-// ADR-084: an empty literal WITH contextual evidence still works — an annotation on the binding,
+// ADR-058: an empty literal WITH contextual evidence still works — an annotation on the binding,
 // a typed function parameter (argument position), and a typed function return are all evidence.
 #[test]
 fn test_empty_literal_with_context_still_works() {
@@ -2736,7 +2736,7 @@ print(toString(length(mkEmpty())))
     assert_eq!(output, vec!["0", "0", "0", "0"]);
 }
 
-// ADR-084 (deferred Phase 2): `push` stays `(Json, Json)`, so its element type is still NOT
+// ADR-058 (deferred Phase 2): `push` stays `(Json, Json)`, so its element type is still NOT
 // checked — `push(intArr, "str")` type-checks today. Making `push` generic (`<T>(arr: T[],
 // item: T)`) to close that hole is blocked on a separate monomorphized-body/`lin_push`-intrinsic
 // representation bug (see the comment on `push` in stdlib/array.lin). This test PINS the current
@@ -2753,7 +2753,7 @@ print(toString(length(xs)))
     assert_eq!(output, vec!["1"]);
 }
 
-// ADR-084: the untyped-accumulator idiom WITH an annotation works end to end — build an array via
+// ADR-058: the untyped-accumulator idiom WITH an annotation works end to end — build an array via
 // `push` in a loop and read it back, including a String[] accumulator (heap-element push).
 #[test]
 fn test_annotated_push_accumulator_end_to_end() {
@@ -2982,7 +2982,7 @@ print(toString(add5(10)))
 
 #[test]
 fn test_map_returns_capturing_closures() {
-    // Regression (ADR-060 owning captures): a `map` callback that RETURNS a closure capturing
+    // Regression (ADR-041 owning captures): a `map` callback that RETURNS a closure capturing
     // the callback parameter. The returned thunks ESCAPE into the result array; each must own
     // its captured value (the element box), not borrow a per-iteration box that is freed and
     // reused. Before the owning-capture fix, calling a thunk returned garbage (`[[object]…]`)
@@ -3163,7 +3163,7 @@ data.for(x =>
 }
 
 // Inside a parenthesised lambda body, a multi-statement `if`-then block must keep ALL its
-// statements (the ADR-004 newline-suppression bug used to drop all but the first, making the
+// statements (the ADR-003 newline-suppression bug used to drop all but the first, making the
 // rest run unconditionally). The offside rule (column > the `if` keyword) delimits the block.
 #[test]
 fn test_multi_statement_if_then_in_inline_lambda() {
@@ -3212,7 +3212,7 @@ print(toString(b))
     assert_eq!(output, vec!["11", "200"]);
 }
 
-// A `match` expression inside a parenthesised lambda body must parse: ADR-004 suppresses the
+// A `match` expression inside a parenthesised lambda body must parse: ADR-003 suppresses the
 // Indent/Dedent that the top-level arm-block relies on, so the parser falls back to the offside
 // rule (arms line up at one column). Single-expression arm bodies. Regression for the
 // "unexpected token Arrow" bug.
@@ -3296,7 +3296,7 @@ range(0, 2).for(i =>
 
 // A multiline JSON object literal passed as an argument is delimited by `{`/`}`/`,`, NOT by the
 // offside column. The column guard must not fire inside a literal (literals have their own
-// parser). Sanity that the offside change didn't disturb ADR-004 multiline literals in parens.
+// parser). Sanity that the offside change didn't disturb ADR-003 multiline literals in parens.
 #[test]
 fn test_multiline_json_literal_in_parens_unaffected() {
     let output = run(r#"import { print } from "std/io"
@@ -3313,7 +3313,7 @@ show({
 }
 
 // A dot-chain split across newlines inside a parenthesised lambda body must parse as ONE
-// expression (ADR-006). The offside guard only runs BETWEEN statements, never within a single
+// expression (ADR-005). The offside guard only runs BETWEEN statements, never within a single
 // `parse_expr()`, so continuation lines of one expression are never split.
 #[test]
 fn test_dot_chain_across_newlines_in_inline_lambda() {
@@ -3335,9 +3335,9 @@ run()
 
 // A line-leading `[` after a statement inside an inline lambda body starts a NEW array-literal
 // statement, not a postfix index on the previous expression. Inside `()` the line break is
-// suppressed as a token (ADR-004), so the parser relies on each token's `newline_before` flag.
+// suppressed as a token (ADR-003), so the parser relies on each token's `newline_before` flag.
 // Without this, `f` below parsed as `push(acc, 4)[ ... ]` and the body's value was the index
-// result (Null) instead of the array. Mirrors the post-Dedent `[` suppression of ADR-011.
+// result (Null) instead of the array. Mirrors the post-Dedent `[` suppression of ADR-010.
 #[test]
 fn test_line_leading_array_after_statement_in_inline_lambda() {
     let output = run(r#"import { print } from "std/io"
@@ -3727,7 +3727,7 @@ print(toString(sum))
 
 #[test]
 fn test_typed_map_index_signature() {
-    // Typed index-signature map `{ String: T }` (ADR-082): the hashed `LinMap` backing.
+    // Typed index-signature map `{ String: T }` (ADR-055): the hashed `LinMap` backing.
     // Insert/lookup of distinct keys, overwrite (length stays put), missing key -> Null,
     // and keys()/values() over the map. The empty `{}` literal infers `{ String: Int32 }`
     // from its annotation context.
@@ -3752,7 +3752,7 @@ print(toString(length(values(m))))
 #[test]
 fn test_json_not_assignable_to_typed_map() {
     // Type-soundness: there is intentionally NO implicit `Json -> { String: T }` coercion
-    // (§5.1.1, §6.3, ADR-082). A `Json` value's runtime payload is a `LinObject` (or any tag),
+    // (§5.1.1, §6.3, ADR-055). A `Json` value's runtime payload is a `LinObject` (or any tag),
     // NOT a `LinMap`; relabelling it to the index-signature map type at the call boundary does
     // not convert the representation, so the callee would then read `LinObject` memory as a
     // `LinMap` and corrupt it. The value must be decoded via `fromJson` / narrowing instead.
@@ -4019,7 +4019,7 @@ print(toString(loop(20000i64, 0i64)))
 
 #[test]
 fn test_typed_map_flat_scalar_unboxed() {
-    // ADR-082 follow-up: a flat-scalar value type `T` (Int64 here) stores the scalar UNBOXED
+    // ADR-055 follow-up: a flat-scalar value type `T` (Int64 here) stores the scalar UNBOXED
     // inline in the slot (no per-value heap box). Exercises insert/overwrite/lookup, a missing
     // key -> Null, and keys/values/entries over an unboxed-value map. The values must read back
     // T-correct (the union `T|Null` carries the boxed-scalar tag for T).
@@ -4046,7 +4046,7 @@ print(toString(length(entries(m))))
 fn test_typed_map_flat_scalar_numeric_width() {
     // An Int32-typed source value stored into a `{ String: Int64 }` map must read back as a
     // T(=Int64)-correct value — the store widens to T before storing, so `is Int64` matches and
-    // the value is byte-correct (ADR-082 follow-up width-normalisation). A plain Int32 literal
+    // the value is byte-correct (ADR-055 follow-up width-normalisation). A plain Int32 literal
     // (`i`) flows in; the slot must carry an Int64.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -4144,7 +4144,7 @@ fn test_typed_map_nested() {
     // Regression: a NESTED typed map `{ String: { String: Int32 } }`. The inner write
     // `outer[k][k2] = v` and the chained read `outer[k][k2]` go through codegen's union/`T|Null`
     // string-key write + index paths (the inner `outer[k]` is `{ String: Int32 } | Null`, which is
-    // NOT spellable as an `is`-pattern to narrow — ADR-082 §5.1.1 — so it stays a union at the
+    // NOT spellable as an `is`-pattern to narrow — ADR-055 §5.1.1 — so it stays a union at the
     // store/read site). Before the fix those paths only dispatched TAG_OBJECT, so a TAG_MAP inner
     // container had its nested writes silently dropped (reads returned the default) — and at scale
     // the mistyped pointer became a misaligned-pointer crash. With the fix the writes land and read
@@ -4306,7 +4306,7 @@ print(toString(result))
 
 #[test]
 fn test_await_result_must_handle_error() {
-    // §24.2.2 enforcement (ADR-070): await yields `T | Error`, so assigning it to a bare
+    // §24.2.2 enforcement (ADR-045): await yields `T | Error`, so assigning it to a bare
     // binding that does not handle the Error case is a compile-time type error. The diagnostic
     // names the union vs. the bare target. (Goes through the full `build` pipeline because the
     // standalone `check` subcommand does not resolve imports.)
@@ -4737,7 +4737,7 @@ print(toString(length(get(box))))
 
 #[test]
 fn test_shared_rejects_non_accessor_op() {
-    // ADR-044: Shared<T> is accessor-only. Passing a Shared value to a non-accessor (here
+    // ADR-029: Shared<T> is accessor-only. Passing a Shared value to a non-accessor (here
     // `push`, which wants an array/Json) is a compile-time type error — the Shared box never
     // auto-unwraps to its inner type or to Json.
     let err = run_expect_err(r#"import { print } from "std/io"
@@ -5424,7 +5424,7 @@ print(readFile("{o2}"))
 }
 
 // Stage 8 (streams): a fault inside a transform on a `.promise()` worker is caught at the async
-// boundary and surfaces as an `Error` at `await` (ADR-070 / §32.2.2), NOT a crash.
+// boundary and surfaces as an `Error` at `await` (ADR-045 / §32.2.2), NOT a crash.
 #[test]
 fn test_stream_promise_fault_isolation() {
     let tmp = std::env::temp_dir().join(format!("lin_ctest_pf_{}.txt", std::process::id()));
@@ -6414,7 +6414,7 @@ val basePath =
 fn test_if_else_wrapped_inside_parens_parses_and_round_trips() {
     // Regression (LIN_ISSUES #7): a WRAPPED (multi-line) `if/else` as the RHS of a `val`
     // INSIDE a parenthesised closure body (`.for(... => …)`) used to fail with
-    // `unexpected token Else`. ADR-004 suppresses Indent/Dedent inside `()`, so the branch
+    // `unexpected token Else`. ADR-003 suppresses Indent/Dedent inside `()`, so the branch
     // offside floor must anchor on the indentation of the LINE the `if` sits on, not on the
     // `if` keyword's (far-right) column — else the then-branch collapses to empty and the
     // newline `else` is orphaned. The one-line form always parsed; only the wrapped form broke.
@@ -6524,7 +6524,7 @@ fn test_fmt_preserves_postfix_base_parens() {
     assert_eq!(fmt("val b = (x + y)[0]\n").trim(), "val b = (x + y)[0]");
     assert_eq!(fmt("val c = (f + g)(3)\n").trim(), "val c = (f + g)(3)");
     // Atomic / chain bases keep NO parens. (Lambda params are always parenthesised for
-    // round-trip safety — ADR-007 / d6e7bdb.)
+    // round-trip safety — ADR-006 / d6e7bdb.)
     assert_eq!(fmt("val d = arr.map(x => x).length()\n").trim(), "val d = arr.map(x => x).length()");
 }
 
@@ -7075,7 +7075,7 @@ fn test_fmt_rule3_parser_rejects_trailing_commas() {
     let obj = parse_diagnostics("val o = { \"a\": 1, }\n");
     assert!(obj.iter().any(|m| m.contains("trailing comma is not allowed in object")),
         "object trailing comma not rejected: {:?}", obj);
-    // A function call `f(x,)` (partial application, ADR-041) is STILL accepted.
+    // A function call `f(x,)` (partial application, ADR-026) is STILL accepted.
     let call = parse_diagnostics("val g = f(x,)\n");
     assert!(call.is_empty(), "f(x,) partial application must stay valid: {:?}", call);
     // Non-trailing commas are fine.
@@ -7865,7 +7865,7 @@ print(toString(hi["w"]))
 
 #[test]
 fn test_generic_combinator_pipeline_inlined() {
-    // ADR-069: generic map/filter/reduce + the capture-less-lambda inliner. The monomorphic scalar
+    // ADR-044: generic map/filter/reduce + the capture-less-lambda inliner. The monomorphic scalar
     // pipeline `range(0,n).map(x=>x*2).filter(x=>x%3==0).reduce(0,(a,x)=>a+x)` lowers to a fully
     // unboxed flat loop (verified separately: zero per-element box/unbox in `main`). Here we assert
     // the VALUE is correct over a small n so a representation/RC bug in the inliner shows up.
@@ -7881,7 +7881,7 @@ print(toString(total))
 
 #[test]
 fn test_generic_combinator_inline_vs_closure_paths() {
-    // ADR-069: the inliner fires ONLY for a capture-less literal lambda; a capturing lambda and a
+    // ADR-044: the inliner fires ONLY for a capture-less literal lambda; a capturing lambda and a
     // stored/passed `Function` value must keep the (correct, boxed) closure path. Also exercises the
     // tagged String element path and a non-scalar (array) reduce accumulator (the boxed Json-phi
     // path). All four must produce the right values.
@@ -8128,7 +8128,7 @@ print(prepend(ss, "z")[0])           // z
     );
 }
 
-// Generic push/append/prepend are `<T>(arr: T[], item: T)` (ADR-085), so the element type is
+// Generic push/append/prepend are `<T>(arr: T[], item: T)` (ADR-059), so the element type is
 // enforced — closing the prior soundness hole where a `Json` `push` accepted any item. Pushing a
 // String into an Int32[] is now a COMPILE ERROR.
 #[test]
@@ -8310,10 +8310,10 @@ print(toString(length(strs)))
 
 #[test]
 fn test_group_by_even_odd_and_empty() {
-    // groupBy now returns a typed index-signature map `{ String: T[] }` (ADR-082): ONE hash lookup
+    // groupBy now returns a typed index-signature map `{ String: T[] }` (ADR-055): ONE hash lookup
     // per item (lin_object_get_or_insert_array, tag-aware over LinMap) + push. Grouping by even/odd
     // splits correctly. The map itself stringifies as `[object]` (TAG_MAP has no structural
-    // toString yet — an ADR-082 follow-up); the per-key array values print normally.
+    // toString yet — an ADR-055 follow-up); the per-key array values print normally.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { groupBy } from "std/array"
@@ -9326,7 +9326,7 @@ val sch = { "host": { "type": "string" }, "port": { "type": "number" } }
 }
 
 // ---------------------------------------------------------------------------
-// fromJson type-directed decode (ADR-047)
+// fromJson type-directed decode (ADR-031)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -9463,7 +9463,7 @@ print(if wrong_len["type"] == "error" then "LEN_ERR" else "OK")
 
 #[test]
 fn test_from_json_union_variant() {
-    // First structurally-matching variant wins (ADR-047).
+    // First structurally-matching variant wins (ADR-031).
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
 type Shape = { "k": String, "r": Float64 } | { "k": String, "w": Int32 }
@@ -9505,7 +9505,7 @@ print("${e["path"]}")
 
 #[test]
 fn test_from_json_is_error_discriminates() {
-    // `is Error` (ADR-047) distinguishes a decode FAILURE from a successfully-decoded value:
+    // `is Error` (ADR-031) distinguishes a decode FAILURE from a successfully-decoded value:
     // the Error object carries `"type": "error"`, a decoded Person does not. `is Error`
     // desugars to the value-constrained object pattern `{ "type": "error", .. }`.
     let out = run(r#"import { print } from "std/io"
@@ -9521,7 +9521,7 @@ print(if bad is Error then "bad:ERR" else "bad:OK")
 
 #[test]
 fn test_from_json_match_is_error_idiom() {
-    // The idiom `match result | is Error => .. | is Person => ..`. As of ADR-054 the arm order
+    // The idiom `match result | is Error => .. | is Person => ..`. As of ADR-036 the arm order
     // is no longer load-bearing (`is Person` checks required fields, so it does not match the
     // Error object), but the Error-first form remains valid. Exhaustiveness accepts `is Error`
     // as covering the Error variant of `Person | Error`.
@@ -9542,12 +9542,12 @@ main()
     assert!(out[1].starts_with("err:"), "expected decode error, got {}", out[1]);
 }
 
-// Cast-hole closing (ADR-046): Json -> concrete structured object is now a type error.
+// Cast-hole closing (ADR-045): Json -> concrete structured object is now a type error.
 
 #[test]
 fn test_json_to_concrete_now_errors() {
     // The TWO-STEP form: a Json-typed identifier assigned to a structured concrete object is a
-    // type error (ADR-046). NOTE: this form already worked before the headline fix — see
+    // type error (ADR-045). NOTE: this form already worked before the headline fix — see
     // test_json_call_result_to_concrete_now_errors for the real call-result hazard.
     let err = run_expect_err(r#"type Person = { "name": String, "age": Int32 }
 val j: Json = { "name": "Bob", "age": 30 }
@@ -9562,7 +9562,7 @@ val p: Person = j
 
 #[test]
 fn test_json_call_result_to_concrete_now_errors() {
-    // HEADLINE case (ADR-046): the RHS is a *call* whose return type is Json (here the stdlib
+    // HEADLINE case (ADR-045): the RHS is a *call* whose return type is Json (here the stdlib
     // `readJson`), assigned to a structured concrete object. This must be a type error. Before
     // the fix this type-checked clean because the bidirectional `val` path propagated the
     // expected concrete type down and a zero/Json-param function was misclassified as opaque,
@@ -9596,7 +9596,7 @@ val p: Person = getJson()
 
 #[test]
 fn test_json_arg_to_concrete_param_errors() {
-    // Passing a Json value into a concrete structured-object parameter is rejected (ADR-046).
+    // Passing a Json value into a concrete structured-object parameter is rejected (ADR-045).
     let err = run_expect_err(r#"type Person = { "name": String, "age": Int32 }
 val greet = (p: Person): String => p["name"]
 val j: Json = { "name": "Bob", "age": 30 }
@@ -9695,7 +9695,7 @@ print(f(null).toString())
 
 #[test]
 fn test_null_narrow_json_map_read() {
-    // The motivating case (ADR-082): reading a `{ String: Int32 }` value yields `Int32 | Null`;
+    // The motivating case (ADR-055): reading a `{ String: Int32 }` value yields `Int32 | Null`;
     // binding it and null-testing narrows it to Int32 in the non-null branch. Covers all four
     // forms over a real index-signature map read (present key + missing key).
     let out = run(r#"import { print } from "std/io"
@@ -9826,7 +9826,7 @@ print(f("hi").toString())
 
 #[test]
 fn test_is_objecttype_expr_checks_required_fields() {
-    // Regression (ADR-054): the EXPRESSION form `x is Person` must check that the object has
+    // Regression (ADR-036): the EXPRESSION form `x is Person` must check that the object has
     // Person's required fields, not just that it is some object (bare TAG_OBJECT). Previously a
     // non-Person object matched, then the narrowed `x["name"]` faulted/returned null.
     let out = run(r#"import { print } from "std/io"
@@ -9843,8 +9843,8 @@ print(if other is Person then "other:yes" else "other:no")
 
 #[test]
 fn test_is_person_first_arm_no_longer_faults() {
-    // Regression (ADR-054): with required-field checking, `is Person` as the FIRST arm no longer
-    // swallows a decode-error object — the ADR-049 ordering footgun is gone. A decode failure
+    // Regression (ADR-036): with required-field checking, `is Person` as the FIRST arm no longer
+    // swallows a decode-error object — the ADR-033 ordering footgun is gone. A decode failure
     // (which lacks name/age) falls through to the Error arm instead of faulting on r["name"].
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
@@ -9861,11 +9861,11 @@ main()
     assert_eq!(out, vec!["ok:Ada", "err"]);
 }
 
-// ── `is <ObjectType>` deep type validation (ADR-054) ──────────────────────────
+// ── `is <ObjectType>` deep type validation (ADR-036) ──────────────────────────
 
 #[test]
 fn test_is_objecttype_deep_rejects_wrong_field_type() {
-    // ADR-054: `is Person` deep-validates field TYPES, not just presence. A Json value
+    // ADR-036: `is Person` deep-validates field TYPES, not just presence. A Json value
     // whose `age` is a string (both keys present, WRONG type) must NOT match Person, so the arm
     // falls through to `else` instead of narrowing and operating on the wrong runtime type.
     let out = run(r#"import { print } from "std/io"
@@ -9885,7 +9885,7 @@ main()
 
 #[test]
 fn test_is_objecttype_deep_nested() {
-    // ADR-053: deep validation recurses into NESTED object fields. A wrong type in a nested field
+    // ADR-035: deep validation recurses into NESTED object fields. A wrong type in a nested field
     // (zip as a string) is rejected; a correct nested value matches.
     let out = run(r#"import { print } from "std/io"
 type T = { "addr": { "zip": Int32 } }
@@ -9904,9 +9904,9 @@ main()
 
 #[test]
 fn test_is_objecttype_deep_accepts_valid_and_narrows() {
-    // ADR-053: a fully well-typed value matches AND the narrowed field access is sound — `v["age"]`
+    // ADR-035: a fully well-typed value matches AND the narrowed field access is sound — `v["age"]`
     // is a real Int32, so `v["age"] + 1` produces a correct number (the unsoundness the earlier
-    // presence-only rule left open, now folded into ADR-054, is closed).
+    // presence-only rule left open, now folded into ADR-036, is closed).
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 type Person = { "name": String, "age": Int32 }
@@ -9922,7 +9922,7 @@ main()
 
 #[test]
 fn test_is_objecttype_deep_number_policy() {
-    // ADR-053 inherits fromJson's number policy: a non-integral number fails an Int target;
+    // ADR-035 inherits fromJson's number policy: a non-integral number fails an Int target;
     // an integral float (5.0) satisfies it.
     let out = run(r#"import { print } from "std/io"
 type N = { "n": Int32 }
@@ -9941,7 +9941,7 @@ main()
 
 #[test]
 fn test_is_error_still_discriminates_after_deep() {
-    // ADR-053 regression: `is Error` (a value-constrained object pattern, NOT TypeCheckDeep) is
+    // ADR-035 regression: `is Error` (a value-constrained object pattern, NOT TypeCheckDeep) is
     // untouched and still discriminates a decode failure from a decoded value, in either arm order.
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
@@ -9958,7 +9958,7 @@ main()
     assert_eq!(out, vec!["ok:Ada", "err"]);
 }
 
-// ── singleton string-literal types (ADR-051) ──────────────────────────────────
+// ── singleton string-literal types (ADR-034) ──────────────────────────────────
 
 #[test]
 fn test_literal_type_good_assignment() {
@@ -10004,7 +10004,7 @@ print("x")
 
 #[test]
 fn test_literal_assignable_to_string() {
-    // A literal-typed value widens to String (ADR-053 rule 2).
+    // A literal-typed value widens to String (ADR-035 rule 2).
     let out = run(r#"import { print } from "std/io"
 type Tag = "ok"
 val t: Tag = "ok"
@@ -10160,7 +10160,7 @@ print("${b["value"]} ${o["x"]}")
 
 #[test]
 fn test_from_json_strlit_discriminates_union() {
-    // ADR-049: fromJson validates the exact literal value of a StrLit field, so a tagged-union
+    // ADR-033: fromJson validates the exact literal value of a StrLit field, so a tagged-union
     // decode discriminates by the discriminant tag. Correct tags decode to the right variant;
     // first-match-wins probes each variant's KIND_STRLIT check.
     let out = run(r#"import { print } from "std/io"
@@ -10181,7 +10181,7 @@ print(show({ "type": "failure", "error": "boom" }))
 
 #[test]
 fn test_from_json_strlit_rejects_wrong_tag() {
-    // ADR-049: a wrong discriminant value is a decode error (was a silent mis-decode under the
+    // ADR-033: a wrong discriminant value is a decode error (was a silent mis-decode under the
     // old KIND_STRING placeholder), with a path-located message.
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
@@ -10198,7 +10198,7 @@ match r
 
 #[test]
 fn test_from_json_plain_string_field_accepts_any() {
-    // ADR-049 (KIND_STRLIT) must NOT regress plain String fields: they still encode as KIND_STRING and accept
+    // ADR-033 (KIND_STRLIT) must NOT regress plain String fields: they still encode as KIND_STRING and accept
     // any string value (only StrLit fields are value-checked).
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
@@ -11235,7 +11235,7 @@ print(toString(r.reduce(0, (acc, x) => acc + x)))
 
 #[test]
 fn test_stdlib_generic_accessors_at_set_indexof() {
-    // ADR-067: stdlib `at`/`set`/`indexOf` carry generic `<T>(T[], …)` signatures. They must stay
+    // ADR-044: stdlib `at`/`set`/`indexOf` carry generic `<T>(T[], …)` signatures. They must stay
     // representation-consistent and correct on both a flat concrete-scalar `Int32[]` and a tagged
     // `String[]`, including negative-index wrap and the in-place `set` round-trip.
     let out = run(r#"import { print } from "std/io"
@@ -11276,7 +11276,7 @@ fn regex_lite_find_t_id(ir: &str) -> Option<String> {
 
 #[test]
 fn test_map_callback_returns_curried_closure_full_apply() {
-    // ADR-069: a `map` callback that RETURNS a closure (curried `i => () => i`) is a FULL
+    // ADR-044: a `map` callback that RETURNS a closure (curried `i => () => i`) is a FULL
     // application of the 1-arg callback, not under-application — the indirect-call path must CALL it
     // (returning the thunk), not bundle it into a partial-application closure. Before the arg-count
     // vs arity disambiguation it returned garbage (a pointer reinterpreted as the value).
@@ -11293,7 +11293,7 @@ print(toString(thunks[2]()))
 
 #[test]
 fn test_reduce_over_push_built_flat_typed_array_reads_correctly() {
-    // ADR-069: a `[]`+push builder typed `Int32[]` allocates a TAGGED array; `reduce` over it must
+    // ADR-044: a `[]`+push builder typed `Int32[]` allocates a TAGGED array; `reduce` over it must
     // read at the runtime representation (tagged), not flat — a flat read would misread garbage.
     // `combinator_read_elem_ty` only flat-reads provably-flat producers; a `[]`+push source falls
     // back to the tagged read.
@@ -11314,7 +11314,7 @@ print(toString(reduce(build(), 0, (a, x) => a + x)))
 
 #[test]
 fn test_filter_then_reduce_flat_pipeline_correct() {
-    // ADR-069: filter's keep/skip block split exercises the `emit_index_loop` phi back-edge patch
+    // ADR-044: filter's keep/skip block split exercises the `emit_index_loop` phi back-edge patch
     // (the back-edge predecessor is the skip block, not the nominal body block). A range→filter→
     // reduce flat pipeline must produce the right sum and valid IR.
     let out = run(r#"import { print } from "std/io"
@@ -11328,7 +11328,7 @@ print(toString(total))
 
 #[test]
 fn test_filter_object_array_no_double_free() {
-    // ADR-069 R2 regression: `filter` over an array of OBJECTS pushes each kept element (BORROWED
+    // ADR-044 R2 regression: `filter` over an array of OBJECTS pushes each kept element (BORROWED
     // from the source array) into the result array. The tagged push (`lin_array_push_tagged`) MOVES
     // the TaggedVal without bumping the inner refcount, so the kept element must be RETAINED first —
     // otherwise both the source and the filtered array reference the same object at refcount 1 and
@@ -11388,7 +11388,7 @@ print(toString(n))
     assert_eq!(out, vec!["0", "0", "0", "0"]);
 }
 
-// ADR-071: `replace` is a TEST-ONLY mock. In a normal `lin build` program (this harness writes a
+// ADR-046: `replace` is a TEST-ONLY mock. In a normal `lin build` program (this harness writes a
 // `.lin`, not a `.test.lin`) it must be a hard compile error — a shipped binary must never silently
 // swap a real import. The positive cases (mocking user modules + stdlib, internal call-sites seeing
 // the mock, spies, val mocks, type-drift rejection) are exercised end-to-end by `lin test` over
@@ -12066,7 +12066,7 @@ fn test_json_reporter_structured_expected_actual() {
     assert!(sat["message"].as_str().unwrap_or("").contains("predicate"), "satisfy message preserved");
 }
 
-// ── `Number` as a numerically-bounded generic parameter (ADR-018, reversed) ─────────────────────
+// ── `Number` as a numerically-bounded generic parameter (ADR-014, reversed) ─────────────────────
 // `(x: Number)` is sugar for `<T: numeric>(x: T)`: the body type-checks (the bound permits
 // arithmetic), and monomorphization specializes per call-site family to native unboxed ops.
 
@@ -12144,7 +12144,7 @@ print(toString(twice(1.25)))
 
 #[test]
 fn test_number_mixed_family_in_one_call_widens() {
-    // Mixed numeric families in ONE call of a `Number`-returning function are SUPPORTED (ADR-018,
+    // Mixed numeric families in ONE call of a `Number`-returning function are SUPPORTED (ADR-014,
     // reversed): `add$Int32_Float64` is monomorphized and the arithmetic re-widens to the same
     // family the concrete `(a:Int32,b:Float64)` equivalent produces. `add(10, 2.5)` ⇒ Float64
     // `12.5`; `add(10, 2)` stays Int (both Int32); `add(1.5, 2.5)` is Float64. Native widening
@@ -12162,7 +12162,7 @@ print(toString(add(2.5, 10)))
 
 #[test]
 fn test_number_nested_array_map_specializes() {
-    // Nested `Number` (ADR-018, reversed, bug #4): `Number[]` and a `Number` callback over it.
+    // Nested `Number` (ADR-014, reversed, bug #4): `Number[]` and a `Number` callback over it.
     // `resolve_type_with_number_in` recurses into the Array element; the callback's `Number` param
     // reuses the receiver element's bounded var (so its family is pinned by the argument) and its
     // body type is surfaced as the lambda return, letting the outer call infer. `f([1,2,3])` ⇒
@@ -12193,8 +12193,8 @@ print(toString(firstTwo([5, 6])))
 
 #[test]
 fn test_number_json_arg_accepted_direct_and_projected_consistent() {
-    // ADR-018 (reversed) §Json: a `Json` value is ACCEPTED at a `Number` parameter — consistent
-    // with the `Json → Int32` scalar coercion gap (ADR-048), monomorphizing to the default `Int32`
+    // ADR-014 (reversed) §Json: a `Json` value is ACCEPTED at a `Number` parameter — consistent
+    // with the `Json → Int32` scalar coercion gap (ADR-032), monomorphizing to the default `Int32`
     // family with an unchecked unbox. This was previously INCONSISTENT: a DIRECT `Json`
     // (`val x: Json = 42`, the bare `TypeVar(u32::MAX)` marker) was REJECTED while a `Json`
     // PROJECTION (`config["count"]`, a fresh inference var) slipped past the bound guard and ran.
@@ -12472,7 +12472,7 @@ print(describe(null))
 // is BEHAVIOR-INERT: a named-typed value and a structurally-equal anonymous literal still
 // inter-operate exactly as before — assign across in BOTH directions, pass into the named param
 // position, read fields, and compare equal (including a WIDER literal with an extra field, which
-// structural compatibility still permits). See ADR-082 (Stage 0.5: inert sealed marker).
+// structural compatibility still permits). See ADR-055 (Stage 0.5: inert sealed marker).
 #[test]
 fn test_sealed_marker_is_inert_named_vs_anonymous_interop() {
     let out = run(r#"
@@ -12505,7 +12505,7 @@ print("extra=${wide["extra"]}")
 
 // ───────────────────────── Sealed records — Stage 1 ─────────────────────────
 // Unboxed packed-struct layout + constant-offset field access for sealed all-scalar record
-// types. See ADR-082 + SPECIFICATION §5.9.1 (sealed records, Stage 1).
+// types. See ADR-055 + SPECIFICATION §5.9.1 (sealed records, Stage 1).
 
 #[test]
 fn test_sealed_scalar_construct_and_field_read() {

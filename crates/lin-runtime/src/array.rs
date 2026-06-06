@@ -155,7 +155,7 @@ pub unsafe extern "C" fn lin_array_release(arr: *mut LinArray) {
     }
     // Frozen (immortal) arrays carry a saturated refcount and must never be freed or
     // decremented — they are deep-frozen, shared read-only across threads, and program-lifetime
-    // (Frozen<T>, ADR-045). The read-only guard makes retain/release no-ops, so concurrent reads
+    // (Frozen<T>, ADR-030). The read-only guard makes retain/release no-ops, so concurrent reads
     // of a frozen graph from N threads never write the refcount → race-free with non-atomic RC.
     if (*arr).refcount >= crate::string::IMMORTAL_RC {
         return;
@@ -624,7 +624,7 @@ pub unsafe extern "C" fn lin_array_length(arr: *const LinArray) -> i64 {
 /// only when the box actually holds an Array (TAG_ARRAY); for any other runtime kind (Object,
 /// String, Null, scalar, …) it returns 0, so the combinator iterates ZERO times rather than
 /// misreading the non-array payload as a `LinArray` (a `LinObject`/`LinString` read through the
-/// flat/tagged array element path is undefined behaviour — the docs-builder crash, ADR-069 follow-up).
+/// flat/tagged array element path is undefined behaviour — the docs-builder crash, ADR-044 follow-up).
 ///
 /// This keeps `for`/`filter` over a statically-`Json` value SOUND when its runtime value isn't an
 /// array (e.g. an `ls()` error object that slipped past a misspelled `isFailure` guard): a no-op

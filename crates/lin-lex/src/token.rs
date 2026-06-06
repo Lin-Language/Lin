@@ -17,15 +17,15 @@ pub struct Token {
     pub span: Span,
     /// True when a source newline appears between the previous token and this one — even when
     /// that newline was suppressed for block purposes because it falls inside `()`/`[]`/`{}`
-    /// (ADR-004). The parser uses this to stop a postfix `[`/`(` on a fresh line from being
+    /// (ADR-003). The parser uses this to stop a postfix `[`/`(` on a fresh line from being
     /// glued to the previous expression as an index/call inside an inline lambda body, so a
     /// line-leading array literal reads as its own statement. Defaults to false.
     pub newline_before: bool,
     /// 1-based column of this token's first char on its source line (number of chars from the
     /// line start, +1). Computed in the same post-tokenize pass that sets `newline_before`.
     /// Used ONLY by the inline-block / control-flow-branch parsers to apply the offside rule
-    /// inside `()`/`[]`/`{}` where ADR-004 suppresses Indent/Dedent/Newline — it does not add
-    /// any tokens, so all ADR-004-dependent behaviour is unchanged. Defaults to 0.
+    /// inside `()`/`[]`/`{}` where ADR-003 suppresses Indent/Dedent/Newline — it does not add
+    /// any tokens, so all ADR-003-dependent behaviour is unchanged. Defaults to 0.
     pub column: u32,
 }
 

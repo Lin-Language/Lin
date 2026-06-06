@@ -3,7 +3,7 @@ import { runTask, runAll } from "./task"
 import { exec } from "std/process"
 import { length } from "std/array"
 
-// Unit tests for runTask/runAll. `exec` is mocked (ADR-071) so the classification
+// Unit tests for runTask/runAll. `exec` is mocked (ADR-046) so the classification
 // logic is tested deterministically — no real subprocesses, no dependence on which
 // binaries a machine has, and full control over the launch-failure path (an Error
 // return), which a real `exec` cannot reliably reproduce across systems. The mock

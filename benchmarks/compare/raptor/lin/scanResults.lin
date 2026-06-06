@@ -6,7 +6,7 @@
 // A connection is either a Transfer (object with "origin") or [trip, startIndex, endIndex].
 //
 // The arrival-time dictionaries (`bestArrivals`, `kArrivals`) are typed `{ String: T }`
-// index-signature maps (ADR-082 / spec §5.1.1) — hashed O(1) containers, the GROUP/RANGE-phase
+// index-signature maps (ADR-055 / spec §5.1.1) — hashed O(1) containers, the GROUP/RANGE-phase
 // perf lever (the index-build PREP lever was the RaptorIndex maps). `kConnections` STAYS `Json`
 // (typing the nested union-valued map triggers a codegen/RC fault in the multi-day / transfer-
 // pattern walks — see types.lin / NOTES.md "kConnections blocker"). Round keys are stored as

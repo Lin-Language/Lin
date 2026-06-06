@@ -1,4 +1,4 @@
-//! Transfer-by-deep-copy for crossing a thread boundary (ADR-042, Option C).
+//! Transfer-by-deep-copy for crossing a thread boundary (ADR-027, Option C).
 //!
 //! When a value or a thunk's captured environment crosses into another OS thread, Lin
 //! copies it so each thread owns a private, disjoint object graph — refcounts stay
@@ -13,7 +13,7 @@
 //!     mutated or freed). `Shared`/`Frozen` boxes (Phases 6-7) will be shared by
 //!     atomic-refcount bump, not copied through — handled when those types land.
 //!   * `transfer_clone_env(env_ptr, desc)` — deep-copies a closure's env allocation using the
-//!     codegen-emitted capture descriptor (passed in from the closure's offset-40 slot, ADR-060)
+//!     codegen-emitted capture descriptor (passed in from the closure's offset-40 slot, ADR-041)
 //!     recording each slot's kind.
 
 use crate::tagged::{TaggedVal, TAG_STR, TAG_ARRAY, TAG_OBJECT};
@@ -95,7 +95,7 @@ pub(crate) unsafe fn clone_array(src: *const LinArray) -> *mut LinArray {
         return std::ptr::null_mut();
     }
     // Frozen (immortal) arrays are immutable and shared read-only across threads — share by
-    // reference (zero-copy), never deep-copy through (Frozen<T>, ADR-045). Safe because their
+    // reference (zero-copy), never deep-copy through (Frozen<T>, ADR-030). Safe because their
     // contents and refcount are never written.
     if (*src).refcount >= IMMORTAL_RC {
         return src as *mut LinArray;
@@ -148,7 +148,7 @@ unsafe fn transfer_payload(tag: u8, payload: u64) -> u64 {
         TAG_ARRAY => clone_array(payload as *const LinArray) as u64,
         TAG_OBJECT => clone_object(payload as *const LinObject) as u64,
         TAG_SHARED => {
-            // Nesting/boundary rule (ADR-043 §2.3.1): a Shared box embedded in a transferred
+            // Nesting/boundary rule (ADR-028 §2.3.1): a Shared box embedded in a transferred
             // value is NOT deep-copied through — bump its atomic refcount and SHARE the box.
             crate::shared::lin_shared_retain_box(payload as *const u8);
             payload
@@ -178,7 +178,7 @@ pub unsafe extern "C" fn lin_transfer_clone(p: *const u8) -> *mut u8 {
 // Capture descriptor kind codes (one byte per captured env slot, env slot `i` at byte offset
 // `8 + i*8`). These mirror `lin_ir::ir::CaptureRelease::code()` — the SAME descriptor drives
 // both closure-release and this thread-transfer path. The descriptor pointer lives in the
-// CLOSURE at offset 40 (ADR-060); the async caller passes it in explicitly.
+// CLOSURE at offset 40 (ADR-041); the async caller passes it in explicitly.
 pub const CAP_NONE: u8 = 0; // scalar (copy verbatim) or a borrowed var-cell pointer
 pub const CAP_STR: u8 = 1; // *mut LinString
 pub const CAP_ARRAY: u8 = 2; // *mut LinArray

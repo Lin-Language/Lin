@@ -13,7 +13,7 @@ pub struct Lexer {
     brace_depth: usize,
     interp_depth: Vec<usize>,
     /// `//` line comments captured as they are skipped, on a side channel so the token
-    /// stream is byte-identical with or without comments (ADR-040 reversal). Consumed by
+    /// stream is byte-identical with or without comments (ADR-025 reversal). Consumed by
     /// the formatter to re-attach comments after a reformat. See `comments()`.
     comments: Vec<Comment>,
 }
@@ -55,7 +55,7 @@ impl Lexer {
         // Mark each token whose preceding gap (since the previous token ended) contains a
         // source newline. Explicit `Newline` tokens already signal line breaks at the top
         // level; this additionally surfaces breaks that were suppressed inside `()`/`[]`/`{}`
-        // (ADR-004), which the parser needs to keep a line-leading `[`/`(` from gluing onto the
+        // (ADR-003), which the parser needs to keep a line-leading `[`/`(` from gluing onto the
         // previous expression as an index/call. Spans are char offsets into `source`.
         let mut prev_end = 0usize;
         for tok in tokens.iter_mut() {
@@ -188,7 +188,7 @@ impl Lexer {
         }
         // A line beginning with `.method` is a dot-chain continuation of the previous
         // expression, not a new block (spec §2.2; mirrors the `&&`/`||` suppression above
-        // and ADR-006/013). Suppressing INDENT/DEDENT here keeps the enclosing block's
+        // and ADR-005/013). Suppressing INDENT/DEDENT here keeps the enclosing block's
         // indentation accounting balanced when the chain is bound to a `val` inside a
         // function body (the postfix loop still chains via skip_newlines_and_indent).
         // Restricted to `.` followed by an identifier char so the range/spread `...`

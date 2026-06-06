@@ -35,20 +35,20 @@ unsafe fn ok_string(out: &str) -> *mut u8 {
 
 /// Render a Jinja-style template **string** against a data object.
 ///
-/// Templating is delegated to the `minijinja` crate (ADR-073). Syntax is Jinja:
+/// Templating is delegated to the `minijinja` crate (ADR-048). Syntax is Jinja:
 /// `{{ var }}` substitutions, `{% for %}` / `{% if %}` control flow, and the
 /// standard filter set. Undefined / missing variables render as the empty string
 /// (minijinja's default `Undefined` behaviour — strict mode is NOT enabled).
 ///
 /// This entry point takes the template as an in-memory string and registers a single
 /// anonymous template, so `{% extends %}` / `{% include %}` have nothing to resolve
-/// against. For layout/inheritance, use `lin_template_render_path` (ADR-074), which
+/// against. For layout/inheritance, use `lin_template_render_path` (ADR-048), which
 /// loads from a directory.
 ///
 /// Signature (C-ABI): `(template: *const LinString, data: *const u8) -> *mut u8`
 /// where the result is a Lin tagged value (`Json`): a `TAG_STR` wrapping the
 /// rendered string on success, or an `Error` object `{type:error,message}` on a
-/// render/parse failure (faithful to Lin's `is Error` convention — see ADR-073).
+/// render/parse failure (faithful to Lin's `is Error` convention — see ADR-048).
 ///
 /// `data` may be a raw `LinObject*` or a `TaggedVal*(TAG_OBJECT)`; both are
 /// accepted and bridged to a `serde_json::Value::Object` via `tagged_to_json`.
@@ -76,7 +76,7 @@ pub unsafe extern "C" fn lin_template_render(
 }
 
 /// Render a Jinja-style template **file** against a data object, with full layout
-/// support (ADR-074).
+/// support (ADR-048).
 ///
 /// Unlike `lin_template_render`, this resolves the template through minijinja's
 /// `path_loader` rooted at the template file's own directory. That makes template

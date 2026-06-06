@@ -16,7 +16,7 @@ pub struct Parser {
     /// Used to detect whether an error occurred during a statement so we can synchronize.
     error_count_at_stmt_start: usize,
     /// When true, `parse_is_has_expr` will NOT consume a trailing `is`/`has` infix operator.
-    /// Set only while parsing an inline (inside-parens) match scrutinee, where ADR-004
+    /// Set only while parsing an inline (inside-parens) match scrutinee, where ADR-003
     /// suppresses the Newline that would otherwise terminate the scrutinee before the first
     /// `has`/`is` arm. Reset to false on entry to any delimited group (`(`/`[`/`{`) so a
     /// parenthesised `match (x is Foo) ...` scrutinee still parses the inner `is` test.
@@ -89,7 +89,7 @@ impl Parser {
     }
 
     /// True when the current token begins a new source line (a newline precedes it), even one
-    /// suppressed inside `()`/`[]`/`{}` (ADR-004). Used to stop a line-leading postfix `[`/`(`
+    /// suppressed inside `()`/`[]`/`{}` (ADR-003). Used to stop a line-leading postfix `[`/`(`
     /// from gluing onto the previous expression as an index/call inside an inline lambda body.
     pub(crate) fn at_line_start(&self) -> bool {
         self.pos < self.tokens.len() && self.tokens[self.pos].newline_before
@@ -140,7 +140,7 @@ impl Parser {
 
     /// 1-based source column of the current token (0 at end of stream). Used ONLY by the
     /// inline-block / control-flow-branch parsers to apply the offside rule inside `()`/`[]`/`{}`
-    /// where ADR-004 suppresses Indent/Dedent/Newline. Does not consult or alter the token
+    /// where ADR-003 suppresses Indent/Dedent/Newline. Does not consult or alter the token
     /// stream shape.
     pub(crate) fn current_column(&self) -> u32 {
         if self.pos < self.tokens.len() {
@@ -159,7 +159,7 @@ impl Parser {
     /// to the right, but its wrapped branches are indented relative to the enclosing statement
     /// (`val`), not the keyword. Anchoring on the keyword column would set an impossibly high
     /// floor and collapse the branch to empty (then orphan the `else`). Inside `()`/`[]`/`{}`
-    /// the lexer still records real columns (ADR-004 suppresses Indent/Dedent, not columns).
+    /// the lexer still records real columns (ADR-003 suppresses Indent/Dedent, not columns).
     pub(crate) fn line_start_column(&self) -> u32 {
         if self.pos >= self.tokens.len() {
             return 0;

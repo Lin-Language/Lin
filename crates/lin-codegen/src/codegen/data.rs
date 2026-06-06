@@ -305,7 +305,7 @@ impl<'ctx> Codegen<'ctx> {
             let res = phi.as_basic_value();
             return if Self::is_union_type(result_ty) { res } else { self.unbox_tagged_val_to_type(res, result_ty) };
         }
-        // Typed index-signature map `{ String: T }` (ADR-082): `m[k]` is an O(1) hashed lookup.
+        // Typed index-signature map `{ String: T }` (ADR-055): `m[k]` is an O(1) hashed lookup.
         // The key is a String (raw LinString*, or unbox a Json/union-boxed key); the result is
         // `T | Null` — `lin_map_get` returns null for a missing key, which `unbox_tagged_val_to_type`
         // maps to the language Null.
@@ -384,7 +384,7 @@ impl<'ctx> Codegen<'ctx> {
         if Self::is_union_type(obj_ty) {
             // A `{ String: T } | Null` index (e.g. the inner read of a NESTED typed map
             // `outer[a][b]`, where `outer[a]` is `{ String: T } | Null` and is NOT spellable as
-            // an `is`-pattern to narrow, ADR-082 §5.1.1) runs through this union path. Its runtime
+            // an `is`-pattern to narrow, ADR-055 §5.1.1) runs through this union path. Its runtime
             // value is a TAG_MAP, so dispatch on the tag: TAG_MAP → `lin_map_get` (O(1) hashed),
             // TAG_OBJECT → `lin_object_get` (the Json association-list path), otherwise Null. Both
             // getters return a borrowed `*const TaggedVal`, so the ownership contract is identical.
@@ -447,14 +447,14 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Store `value` into a typed index-signature map (`lin_map_set`, ADR-082).
+    /// Store `value` into a typed index-signature map (`lin_map_set`, ADR-055).
     ///
     /// `elem_ty` is the map's value type `T` (from `Type::Map(T)`); `val_ty` is the source
     /// expression's static type, which may be a NARROWER numeric (e.g. an `Int32` variable stored
     /// into a `{ String: Int64 }` map). The value is normalised to `T`'s representation before
-    /// storage so the slot reads back `T`-correct regardless of the source width (ADR-082).
+    /// storage so the slot reads back `T`-correct regardless of the source width (ADR-055).
     ///
-    /// FLAT-SCALAR UNBOXING (ADR-082 follow-up): when `T` is a flat scalar (`is_flat_scalar` —
+    /// FLAT-SCALAR UNBOXING (ADR-055 follow-up): when `T` is a flat scalar (`is_flat_scalar` —
     /// Int8/16/32/64, UInt8/16/32/64, Float32/64), the scalar is marshalled through a STACK
     /// `TaggedVal` (tag+payload = `T`'s boxed-scalar convention, identical to what an array slot
     /// stores) rather than `box_value`'s HEAP box. `lin_map_set` copies the 16 bytes INLINE into the
@@ -616,7 +616,7 @@ impl<'ctx> Codegen<'ctx> {
                     self.emit_object_set(obj, key_str, value, val_ty);
                 }
             }
-            // Typed index-signature map `{ String: T }` (ADR-082): O(1) hashed insert/overwrite.
+            // Typed index-signature map `{ String: T }` (ADR-055): O(1) hashed insert/overwrite.
             // Pass the map's value type `T` so a flat-scalar `T` is stored UNBOXED (inline in the
             // slot's TaggedVal, no heap box) and a narrower source value is widened to `T`.
             Type::Map(elem) => {
@@ -708,7 +708,7 @@ impl<'ctx> Codegen<'ctx> {
     /// (TAG_OBJECT) OR a typed index-signature map (TAG_MAP). This is the write analogue of the
     /// tag-dispatched read in `compile_ir_index`: a NESTED typed map's inner write
     /// (`outer[a][b] = v`, where `outer[a]` is `{ String: T } | Null` — not `is`-narrowable,
-    /// ADR-082 §5.1.1) reaches here with `obj_ty` a union containing a `Map(elem)` variant.
+    /// ADR-055 §5.1.1) reaches here with `obj_ty` a union containing a `Map(elem)` variant.
     /// When such a variant is present, dispatch on the runtime tag: TAG_MAP → `emit_map_set`
     /// (O(1) hashed insert), otherwise `emit_object_set`. Both helpers RETAIN the inner payload,
     /// so the ownership contract is identical on either branch. With no Map variant this is a
