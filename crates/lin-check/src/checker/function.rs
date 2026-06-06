@@ -589,13 +589,21 @@ impl Checker {
                 }
             }
         }
-        // INDEX-PARAM ANNOTATION VALIDATION: if the user explicitly annotated a parameter that lines
-        // up with an EXPECTED trailing `Int32` index slot, it must be annotated `Int32` (an
+        // INDEX-PARAM ANNOTATION VALIDATION: if the user explicitly annotated the parameter that
+        // lines up with the EXPECTED TRAILING `Int32` index slot, it must be annotated `Int32` (an
         // unannotated param already infers `Int32` via the `expected_params[i]` hint above). Any other
         // annotation (e.g. `(x, i: String) => …`) is a clear, dedicated error rather than the generic
         // "Argument has type …" mismatch surfaced later at the call site.
+        //
+        // Restricted to the LAST expected slot (`i == expected_params.len() - 1`): the index is
+        // always the final callback parameter (`map`/`filter`'s `(item, idx)`, `reduce`'s
+        // `(acc, item, idx)`). Without this guard a NON-index leading param whose substituted
+        // generic happens to resolve to `Int32` (e.g. `map`'s element `T = Int32` for an `Int32[]`)
+        // would be misreported as "the index parameter must be Int32" when annotated with a wrong
+        // type — masking the precise "expected Int32, got String" arg-mismatch the call site emits.
         for (i, param) in params.iter().enumerate() {
-            if i < expected_params.len()
+            if !expected_params.is_empty()
+                && i == expected_params.len() - 1
                 && matches!(expected_params[i], Type::Int32)
                 && param.type_ann.is_some()
                 && !matches!(typed_params[i].ty, Type::Int32)
