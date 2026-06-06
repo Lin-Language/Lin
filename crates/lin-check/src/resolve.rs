@@ -33,6 +33,40 @@ fn resolve_type_inner(
                 types.iter().map(|t| resolve_type_inner(t, env, visiting)).collect();
             Ok(Type::flatten_union(resolved?))
         }
+        TypeExpr::Intersection(operands, _span) => {
+            // Record intersection `A & B` (ADR-061): record-only. Each operand must resolve to an
+            // object/record type; the result is a plain `Type::Object` with the UNION of their
+            // fields. A field present in more than one operand must have the SAME type (dedup) or
+            // it is a hard error. The result is UNSEALED here exactly like an inline object literal
+            // — when this intersection is the body of `type T = A & B`, the `: T` annotation path
+            // (`expand_named_body`) seals it, so named=sealed is inherited automatically.
+            let mut merged: IndexMap<String, Type> = IndexMap::new();
+            for operand in operands {
+                let ty = resolve_type_inner(operand, env, visiting)?;
+                let fields = match &ty {
+                    Type::Object { fields, .. } => fields,
+                    other => {
+                        return Err(format!(
+                            "intersection `&` is only valid between record types; operand `{}` is not a record",
+                            other
+                        ));
+                    }
+                };
+                for (key, field_ty) in fields {
+                    if let Some(existing) = merged.get(key) {
+                        if existing != field_ty {
+                            return Err(format!(
+                                "intersection type has conflicting field \"{}\": {} vs {}",
+                                key, existing, field_ty
+                            ));
+                        }
+                    } else {
+                        merged.insert(key.clone(), field_ty.clone());
+                    }
+                }
+            }
+            Ok(Type::object(merged))
+        }
         TypeExpr::Function(params, ret, _span) => {
             let param_types: Result<Vec<Type>, String> =
                 params.iter().map(|p| resolve_type_inner(p, env, visiting)).collect();
@@ -363,6 +397,92 @@ mod sealed_marker_tests {
         let resolved = resolve_type(&TypeExpr::Named("Error".to_string(), Span::dummy()), &env)
             .expect("Error resolves");
         assert_eq!(sealed_of(&resolved), Some(false), "Error alias must be UNSEALED");
+    }
+
+    fn obj_te(fields: &[(&str, &str)]) -> TypeExpr {
+        TypeExpr::Object(
+            fields
+                .iter()
+                .map(|(k, v)| (k.to_string(), TypeExpr::Named(v.to_string(), Span::dummy())))
+                .collect(),
+            Span::dummy(),
+        )
+    }
+
+    #[test]
+    fn intersection_merges_record_fields_unsealed() {
+        // `{ "a": Int32 } & { "b": Int32 }` resolves to a Type::Object with BOTH fields, UNSEALED
+        // (sealing happens only on the named-annotation path via expand_named_body).
+        let te = TypeExpr::Intersection(
+            vec![obj_te(&[("a", "Int32")]), obj_te(&[("b", "Int32")])],
+            Span::dummy(),
+        );
+        let env = TypeEnv::new();
+        let resolved = resolve_type(&te, &env).expect("intersection resolves");
+        match &resolved {
+            Type::Object { fields, sealed } => {
+                assert!(fields.contains_key("a") && fields.contains_key("b"));
+                assert_eq!(*sealed, false, "inline intersection must be UNSEALED");
+            }
+            other => panic!("expected Object, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn intersection_same_field_same_type_dedups() {
+        let te = TypeExpr::Intersection(
+            vec![obj_te(&[("k", "Int32")]), obj_te(&[("k", "Int32")])],
+            Span::dummy(),
+        );
+        let env = TypeEnv::new();
+        let resolved = resolve_type(&te, &env).expect("dedup resolves");
+        match &resolved {
+            Type::Object { fields, .. } => assert_eq!(fields.len(), 1),
+            other => panic!("expected Object, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn intersection_field_conflict_errors() {
+        let te = TypeExpr::Intersection(
+            vec![obj_te(&[("k", "Int32")]), obj_te(&[("k", "String")])],
+            Span::dummy(),
+        );
+        let env = TypeEnv::new();
+        let err = resolve_type(&te, &env).unwrap_err();
+        assert!(err.contains("conflicting field \"k\""), "got: {}", err);
+    }
+
+    #[test]
+    fn intersection_non_record_operand_errors() {
+        let te = TypeExpr::Intersection(
+            vec![
+                TypeExpr::Named("Int32".to_string(), Span::dummy()),
+                TypeExpr::Named("String".to_string(), Span::dummy()),
+            ],
+            Span::dummy(),
+        );
+        let env = TypeEnv::new();
+        let err = resolve_type(&te, &env).unwrap_err();
+        assert!(err.contains("only valid between record types"), "got: {}", err);
+    }
+
+    #[test]
+    fn named_intersection_decl_inherits_sealed() {
+        // type T = A & B; resolving `: T` must seal the merged object (named=sealed inherited).
+        let mut env = TypeEnv::new();
+        let mut a = IndexMap::new();
+        a.insert("a".to_string(), Type::Int32);
+        let mut b = IndexMap::new();
+        b.insert("b".to_string(), Type::Int32);
+        // The decl body, as the checker stores it: the resolved (unsealed) merged object.
+        let mut merged = IndexMap::new();
+        merged.insert("a".to_string(), Type::Int32);
+        merged.insert("b".to_string(), Type::Int32);
+        env.define_type("T".to_string(), vec![], Type::object(merged));
+        let resolved = resolve_type(&TypeExpr::Named("T".to_string(), Span::dummy()), &env)
+            .expect("T resolves");
+        assert_eq!(sealed_of(&resolved), Some(true), "named intersection must resolve SEALED");
     }
 
     #[test]

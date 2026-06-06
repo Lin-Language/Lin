@@ -2049,3 +2049,39 @@ IR-proof `Command`s) set it via the shared `lin_cmd()` builder; the negative reg
 `lin_io_read_line`, `lin_string_trim`, …) are NOT in `intrinsic_slots` — they are declared via
 `import foreign "lin-runtime"` — so gating on `intrinsic_slots` membership leaves them alone. Stdlib
 modules check with `allow_intrinsics = true`, so their own intrinsic re-exports keep working.
+
+## ADR-061: Record intersection types (`&`)
+
+**Status**: Accepted.
+
+**Context**: Lin had union (`|`) but no way to say "this record plus these extra fields". The
+language author wanted `type OldPerson = Person & { "wisdom": Boolean }` to produce the record with
+all of `Person`'s fields plus `wisdom`, without re-typing the base.
+
+**Decision**: Add a **record-only** intersection operator `&` at the type level. `A & B` resolves to
+a plain `Type::Object` whose fields are the UNION of both operands' fields. There is NO new runtime
+or codegen representation — the result is an ordinary record type, so sealed-records (ADR-057) and
+all width-subtyping machinery apply to it unchanged.
+
+- **Grammar/precedence**: `&` binds tighter than `|` (TypeScript convention), so `A & B | C` parses
+  as `(A & B) | C`. It is left-associative; `A & B & C` merges all three. Implemented as a new
+  parser level `parse_type_intersection` sitting between `parse_type_expr` (`|`) and
+  `parse_type_primary` (the leaves), in `crates/lin-parse/src/parser/types.rs`. New AST node
+  `TypeExpr::Intersection(Vec<TypeExpr>, Span)` (`crates/lin-parse/src/ast.rs`). A single operand
+  passes straight through, so non-intersection types are unaffected.
+- **Resolution** (`crates/lin-check/src/resolve.rs`): resolve each operand; each must be a
+  `Type::Object` or it is an error. Merge the field IndexMaps left-to-right; a key seen twice must
+  have the SAME field type (de-dup) or it is an error.
+- **Field conflict** (same key, different types) → `intersection type has conflicting field "k": T1 vs T2`.
+- **Non-record operand** → `intersection \`&\` is only valid between record types; operand \`T\` is not a record`.
+- **`sealed` flag**: the merged object is produced UNSEALED, exactly like an inline object-literal
+  annotation. When the intersection is the body of `type T = A & B`, the named-annotation path
+  (`expand_named_body`) seals the unfolded `Type::Object`, so **named = sealed** is inherited
+  automatically — no special-casing needed.
+
+**Consequences**: No codegen/IR change — the result is a `Type::Object` like any other (verified:
+`cargo build --workspace` is clean, no exhaustiveness arm needed in codegen/IR, which never matched
+on `TypeExpr` directly). The formatter gained an `Intersection` arm (`A & B`) so `&` round-trips.
+Restriction is documented: intersection is record-only in this first cut (no field-type
+intersection, no `&` with unions/scalars). A richer "intersect the field types" semantics is left
+for later; the clean sound rule for records is "fields must agree or error".

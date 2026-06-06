@@ -1124,6 +1124,11 @@ fn fmt_type(ty: &TypeExpr) -> String {
             let ts: Vec<String> = types.iter().map(fmt_type).collect();
             ts.join(" | ")
         }
+        TypeExpr::Intersection(types, _) => {
+            // `&` binds tighter than `|` (ADR-061); operands are primaries, so no parens needed.
+            let ts: Vec<String> = types.iter().map(fmt_type).collect();
+            ts.join(" & ")
+        }
         TypeExpr::Function(params, ret, _) => {
             let ps: Vec<String> = params.iter().map(fmt_type).collect();
             format!("({}) => {}", ps.join(", "), fmt_type(ret))

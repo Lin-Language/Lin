@@ -292,6 +292,11 @@ pub enum TypeExpr {
     Array(Box<TypeExpr>, Span),
     FixedArray(Vec<TypeExpr>, Span),
     Union(Vec<TypeExpr>, Span),
+    /// Record intersection `A & B` (ADR-061). Record-only: each operand must resolve to an
+    /// object/record type; the result is the union of their fields (conflicting field types =
+    /// error). Binds tighter than `|`. Resolved into a plain `Type::Object` at resolution time —
+    /// no runtime/codegen representation of its own.
+    Intersection(Vec<TypeExpr>, Span),
     Function(Vec<TypeExpr>, Box<TypeExpr>, Span),
     Object(Vec<(String, TypeExpr)>, Span),
     /// A typed index-signature object type `{ String: T }` (ADR-055): a dictionary keyed by
