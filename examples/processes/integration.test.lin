@@ -5,7 +5,7 @@ import { exec } from "std/process"
 import { contains } from "std/string"
 
 // End-to-end: a mixed task list through the whole pipeline (run each → classify →
-// summarize → render). `exec` is mocked (ADR-071) so the run is deterministic and
+// summarize → render). `exec` is mocked (ADR-046) so the run is deterministic and
 // hermetic — no real subprocesses, no dependence on which binaries the host has or
 // on platform exit-code conventions, and the "command could not launch" case (an
 // Error return) is reproduced exactly, which a real `exec` cannot do portably.

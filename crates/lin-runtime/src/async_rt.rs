@@ -1,6 +1,6 @@
 //! Async / await / parallel / worker / threadPool runtime support.
 //!
-//! Real OS-thread concurrency (ADR-042). `async(thunk)` spawns a `std::thread` that runs the
+//! Real OS-thread concurrency (ADR-027). `async(thunk)` spawns a `std::thread` that runs the
 //! thunk inside a fault-isolation boundary (`fault::with_async_boundary`); a runtime fault
 //! becomes an `Error` value surfaced at `await` rather than aborting the process. The thunk's
 //! captured env is deep-copied (Option C) so the worker owns a private graph and the parent's
@@ -179,7 +179,7 @@ pub unsafe extern "C" fn lin_make_promise(value: *mut u8) -> *mut LinPromise {
 
 /// Spawn the thunk closure `thunk` (a `*LinClosure` { rc, _pad, fn_ptr, env_ptr, .. }) on a
 /// new OS thread and return a `LinPromise` for its result. The thunk's captured env is
-/// deep-copied (Option C, ADR-042) so the worker owns a private graph and the parent's
+/// deep-copied (Option C, ADR-027) so the worker owns a private graph and the parent's
 /// non-atomic refcounts are never touched concurrently.
 ///
 /// If the env is NOT transferable (no capture descriptor, or it captures a function/iterator —
@@ -225,7 +225,7 @@ pub unsafe extern "C" fn lin_async_spawn(thunk: *mut u8) -> *mut LinPromise {
     let inner_for_thread = Arc::clone(&inner);
     // Capture the pointers as usize (unconditionally Send) and recast inside; the safety
     // invariant — env_copy is a thread-private deep copy, fn_ptr is read-only code — is
-    // upheld manually (ADR-042 Option C).
+    // upheld manually (ADR-027 Option C).
     let fn_addr = fn_ptr as usize;
     let env_addr = env_copy as usize;
     let desc_addr = cap_desc as usize;
@@ -260,7 +260,7 @@ pub unsafe extern "C" fn lin_async_spawn(thunk: *mut u8) -> *mut LinPromise {
 /// handed off VERBATIM (the IR suppresses the caller's release via the move), so the worker owns
 /// the whole pipeline graph — disjoint from the parent's, keeping non-atomic RC sound. A fault
 /// inside a transform closure is caught at the async boundary (`with_async_boundary`) and surfaces
-/// as the awaited `Error` (ADR-070 / §32.2.2). The worker closes the fd exactly once.
+/// as the awaited `Error` (ADR-045 / §32.2.2). The worker closes the fd exactly once.
 ///
 /// A null stream resolves immediately to Null. Unlike `lin_async_spawn`, there is no closure env
 /// to deep-copy — the single moved resource pointer IS the whole transfer, so this always runs on

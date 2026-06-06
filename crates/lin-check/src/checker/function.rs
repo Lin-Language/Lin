@@ -134,14 +134,14 @@ impl Checker {
     }
 
     /// Resolve a parameter/return type annotation, lowering every `Number` occurrence to a FRESH
-    /// numerically-constrained quantified generic TypeVar (ADR-018, reversed). `Number` is sugar for
+    /// numerically-constrained quantified generic TypeVar (ADR-014, reversed). `Number` is sugar for
     /// an implicit `<T: numeric>`: the body type-checks because the bound guarantees a numeric family
     /// (arithmetic on the var is permitted in `infer_binary_op`), and monomorphization specializes the
     /// var per call site to the concrete family — native unboxed ops, zero runtime cost. Each `Number`
     /// (even nested, e.g. `Number[]` or `(Number) => Number`) mints its OWN id, so independent numeric
     /// params don't get tied together. A non-`Number` annotation resolves exactly as before.
     /// True for an annotation that is exactly the bare name `Number`. A `Number` RETURN annotation
-    /// is special-cased (ADR-018, reversed): unlike a `Number` PARAMETER (which mints a fresh bound
+    /// is special-cased (ADR-014, reversed): unlike a `Number` PARAMETER (which mints a fresh bound
     /// var the call site pins from the argument), a `Number` return can't be pinned from arguments,
     /// so it would be an un-inferrable free var. Instead the function's actual return is taken from
     /// the BODY's (already numeric, bound-guaranteed) type, and we only check the body is numeric.
@@ -323,7 +323,7 @@ impl Checker {
 
         // Resolve the declared return type up front so the body can be CHECKED against it
         // (bidirectional), pushing the expected type into the body. Needed for singleton
-        // string-literal refinement (ADR-051) — see infer_function_with_hints for the rationale.
+        // string-literal refinement (ADR-034) — see infer_function_with_hints for the rationale.
         // A bare `Number` RETURN is treated as un-annotated (the body's numeric type flows through);
         // we record `number_return` so the post-check can require the body to be numeric.
         let number_return = return_type.as_ref().is_some_and(|rt| Self::is_bare_number(rt));
@@ -336,7 +336,7 @@ impl Checker {
         // CHECK the body bidirectionally against the declared return type when that type is
         // structured (an object/named/union, or one mentioning a `StrLit` singleton). This pushes
         // the expected type into `if`/`match` arms (see `check_branch_against`), which:
-        //   - refines object/string literals against the declared shape (ADR-051), and
+        //   - refines object/string literals against the declared shape (ADR-034), and
         //   - lets one arm yield a `Json` value while another yields a concrete object literal,
         //     each checked against the declared return — fixing the match-arm-union-vs-declared-
         //     object bug (previously the arms were inferred independently, unioned into
@@ -413,7 +413,7 @@ impl Checker {
             }
             declared
         } else {
-            // A bare `Number` return (ADR-018, reversed): require the body to be numeric (or itself
+            // A bare `Number` return (ADR-014, reversed): require the body to be numeric (or itself
             // a numeric-bounded var that monomorphizes to a numeric family), then return the body's
             // type so the call site can pin it. A non-numeric body is rejected here.
             if number_return
@@ -466,7 +466,7 @@ impl Checker {
         for (i, param) in params.iter().enumerate() {
             // Use the declared annotation if present; otherwise use the hint from expected_params.
             let ty = if let Some(ref type_ann) = param.type_ann {
-                // NESTED-`Number` UNIFICATION (ADR-018, reversed): a bare `Number` lambda parameter
+                // NESTED-`Number` UNIFICATION (ADR-014, reversed): a bare `Number` lambda parameter
                 // whose EXPECTED type (from the enclosing combinator — e.g. `.map`'s callback param,
                 // which is the receiver's element type) is ALSO a numeric-bounded var should REUSE
                 // that var rather than mint a fresh independent one. This ties the inner callback's
@@ -573,7 +573,7 @@ impl Checker {
         // extra trailing expected param is `Int32`, PAD the typed function with synthetic, unused
         // `Int32` parameters (`__idx{n}`). This is the in-place "adapter": the runtime closure gains
         // the trailing index slot(s) the caller supplies, the body ignores them, and the inline fast
-        // path (ADR-069) is preserved (no captures added, no thunk). A non-`Int32` extra expected
+        // path (ADR-044) is preserved (no captures added, no thunk). A non-`Int32` extra expected
         // param is NOT padded (it would be a genuine arity mismatch, rejected at the call site).
         if params.len() < expected_params.len() {
             for (k, extra) in expected_params[params.len()..].iter().enumerate() {
@@ -623,7 +623,7 @@ impl Checker {
 
         // Resolve the declared return type up front so the body can be CHECKED against it
         // (bidirectional). This pushes the expected type into the body — needed for singleton
-        // string-literal refinement (ADR-051): a `{ "type": "success", .. }` literal in the
+        // string-literal refinement (ADR-034): a `{ "type": "success", .. }` literal in the
         // body narrows its discriminant to the expected `StrLit` variant. Falls back to plain
         // inference when there is no annotation. A bare `Number` return is treated as un-annotated
         // (see `infer_function`); the body's numeric type flows through.
@@ -689,7 +689,7 @@ impl Checker {
         let mut captures: Vec<Capture> = captures_map.into_values().collect();
         captures.sort_by_key(|c| c.outer_slot);
 
-        // A bare `Number` return (ADR-018, reversed): require the body to be numeric (or a
+        // A bare `Number` return (ADR-014, reversed): require the body to be numeric (or a
         // numeric-bounded var), then surface the body's type so the call site can pin it.
         if number_return {
             if !body_ty.is_numeric()
@@ -730,7 +730,7 @@ impl Checker {
             // `U[]` becomes `Int32[]`, so monomorphization can specialize. Forcing the bare
             // generic TypeVar here (as the polymorphic-slot case below does) would leave `U`
             // uninferrable and the call would fall back to a boxed copy.
-            // A body that is a numeric-bounded `Number` var (ADR-018, reversed) is ALSO surfaced
+            // A body that is a numeric-bounded `Number` var (ADR-014, reversed) is ALSO surfaced
             // here (not a free polymorphic slot): it pins the combinator's `U` to that var so a
             // nested `(xs: Number[]) => xs.map((v: Number) => v*2)` propagates the element family
             // (`v` reuses `xs`'s element var) into the return — otherwise `U` stays an independent

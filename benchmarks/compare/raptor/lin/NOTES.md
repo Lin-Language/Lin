@@ -41,7 +41,7 @@ deep journey equality).
 
 The fixed-shape data is expressed with **named record + union types**
 (`types.lin`), and the **createRaptor index dictionaries are now typed
-`{ String: T }` index-signature maps** (ADR-082 / spec §5.1.1) — a hashed
+`{ String: T }` index-signature maps** (ADR-055 / spec §5.1.1) — a hashed
 **O(1)** container, in place of the `Json` association-list object (O(n) per
 lookup) the port used before this type existed.
 
@@ -333,7 +333,7 @@ indexes by `routeId` (~16k distinct), so when those indexes were `Json` the per-
 path did O(16k) scans × 240k trips → the PREP phase took ~144 s.
 
 This is now fixed by the **map re-typing pass** above: `routeStopIndex`/`routePath`/
-`routesAtStop`/`tripsByRoute` are typed `{ String: T }` index-signature maps (ADR-082),
+`routesAtStop`/`tripsByRoute` are typed `{ String: T }` index-signature maps (ADR-055),
 backed by a hashed O(1) container (`crates/lin-runtime/src/map.rs`). PREP dropped to
 ~25.7 s (~5.6×). The scan-state arrival maps (`bestArrivals`/`kArrivals`) were later typed too
 (the ScanResults pass) but that was GROUP-neutral within noise — these are smaller stopId maps

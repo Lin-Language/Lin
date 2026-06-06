@@ -17,7 +17,7 @@ serde_json = { version = "1", default-features = false, features = ["std"] }
 # serde_json::Value as the render context directly. `multi_template` enables the
 # `{% extends %}`/`{% block %}`/`{% include %}` inheritance statements, and `loader`
 # enables path_loader to resolve referenced templates against a directory — together
-# the basis for the layout system used by `render(path, data)` (ADR-074).
+# the basis for the layout system used by `render(path, data)` (ADR-048).
 minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "multi_template", "loader"] }
 ureq = { workspace = true }
 libc = "0.2"

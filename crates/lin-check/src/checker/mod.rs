@@ -54,14 +54,14 @@ pub struct Checker {
     /// Dropping (never consuming) is FINE — the RC finalizer closes the fd; only double-use errors.
     consumed_streams: std::collections::HashSet<usize>,
     /// When true, a `Json` value is permitted to flow into a fully-concrete target without
-    /// an explicit `fromJson` decode (ADR-046). Set only for the trusted stdlib, whose
+    /// an explicit `fromJson` decode (ADR-045). Set only for the trusted stdlib, whose
     /// wrappers forward `Json` handles into concrete intrinsic/foreign params by design.
     /// User modules check with `false`, so `val p: Person = readJson(...)` is a type error.
     pub lenient_json: bool,
     /// When true, `lin_*` compiler intrinsics may be referenced by name (as call targets or
     /// values). True for trusted stdlib modules (which re-export them under clean names) and when
     /// the `LIN_ALLOW_INTRINSICS` test escape hatch is set; false for user code, which must use the
-    /// stdlib wrappers (ADR-002/ADR-009, ADR-086). Set by the compile pipeline from `is_stdlib`.
+    /// stdlib wrappers (ADR-002/ADR-008, ADR-060). Set by the compile pipeline from `is_stdlib`.
     pub allow_intrinsics: bool,
     /// Phase 0 monomorphized generics: maps a generic function's binding name to the
     /// (type-param name → quantified TypeVar id) assignment chosen during forward declaration.
@@ -72,7 +72,7 @@ pub struct Checker {
     generic_fn_params: std::collections::HashMap<String, Vec<(String, u32)>>,
     /// Next free quantified-generic TypeVar id (≥9000, above the intrinsic slot 9000).
     next_generic_tv: u32,
-    /// Quantified-generic TypeVar ids carrying a NUMERIC bound (ADR-018, reversed). A `Number`
+    /// Quantified-generic TypeVar ids carrying a NUMERIC bound (ADR-014, reversed). A `Number`
     /// parameter annotation resolves to a FRESH constrained generic TypeVar in this set: arithmetic
     /// is permitted on it (the bound guarantees a numeric family), and at each call site the binding
     /// concrete type must satisfy the bound (a `String`/`Bool`/… argument is rejected). Each `Number`
@@ -89,10 +89,10 @@ pub struct Checker {
     /// allocation intrinsic so no other binding's representation changes. See ADR for rationale.
     array_alloc_elem_hint: Option<(String, Type)>,
     /// Origin of each value-import binding, keyed by the LOCAL name it is bound under (honouring
-    /// `as` aliases). `(module_path, export_name)`. Used by `replace <name> = ...` (ADR-071) to
+    /// `as` aliases). `(module_path, export_name)`. Used by `replace <name> = ...` (ADR-046) to
     /// resolve which imported export a mock targets, so lowering can override its canonical symbol.
     import_origins: std::collections::HashMap<String, (String, String)>,
-    /// Collected `replace` overrides (ADR-071), threaded into `TypedModule::replacements`.
+    /// Collected `replace` overrides (ADR-046), threaded into `TypedModule::replacements`.
     replacements: Vec<crate::typed_ir::Replacement>,
 }
 
@@ -146,7 +146,7 @@ impl Checker {
         self.forward_declare_types(module);
 
         // Pre-scan: forward-declare all top-level val bindings whose RHS is a
-        // function literal so mutual recursion works (mirrors ADR-015).
+        // function literal so mutual recursion works (mirrors ADR-012).
         self.forward_declare_functions(module);
 
         let mut stmts = Vec::new();
@@ -280,7 +280,7 @@ impl Checker {
     }
 
     /// Forward-declare top-level `val name = (...) => ...` functions so that
-    /// they can call each other (mutual recursion, ADR-015 equivalent).
+    /// they can call each other (mutual recursion, ADR-012 equivalent).
     fn forward_declare_functions(&mut self, module: &Module) {
         for stmt in &module.statements {
             if let Stmt::Val { pattern, value, .. } = stmt {
@@ -312,7 +312,7 @@ impl Checker {
                             self.generic_fn_params.insert(name.clone(), param_assign);
                         }
 
-                        // Resolve param/return annotations with `Number` support (ADR-018,
+                        // Resolve param/return annotations with `Number` support (ADR-014,
                         // reversed): each `Number` becomes a fresh numerically-constrained generic
                         // TypeVar recorded in `numeric_tvs`. The forward-declared signature drives
                         // call-site inference + the numeric-bound check, so the ids minted here are

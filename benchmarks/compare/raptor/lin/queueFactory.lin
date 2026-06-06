@@ -9,7 +9,7 @@
 import { for } from "std/iter"
 import { get } from "std/object"
 
-// Narrow an `Int32 | Null` typed-map read to `Int32` (positive-arm idiom; ADR-082). Still needed
+// Narrow an `Int32 | Null` typed-map read to `Int32` (positive-arm idiom; ADR-055). Still needed
 // here: the boarding position is a NESTED double-index `routeStopIndex[routeId][stop]` (an inner
 // `{ String: Int32 } | Null` map, then a scalar read off it) — `object.get` is a single-level
 // `m[k] ?? default` and does not apply to a doubly-nested read, so this scalar coalescer stays.

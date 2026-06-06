@@ -70,7 +70,7 @@ changed.
 
 These map to the performance findings in the project's perf review (RC traffic,
 boxing at polymorphic boundaries, O(n) object field access, no SSO) plus the
-concurrency cost model (ADR-043/044/045: copy-by-default transfer, atomic
+concurrency cost model (ADR-028/044/045: copy-by-default transfer, atomic
 `Shared` box + lock, immortal `Frozen` reads). When adding an optimisation, add
 or extend a benchmark that targets it.
 

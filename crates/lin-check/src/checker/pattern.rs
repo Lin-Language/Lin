@@ -10,7 +10,7 @@ use crate::types::Type;
 
 impl Checker {
     /// Build the `Error` discriminant pattern `{ "type": "error", "message": _ }` used to
-    /// desugar `is Error` (ADR-047). Field presence is checked for both keys; `"type"` carries
+    /// desugar `is Error` (ADR-031). Field presence is checked for both keys; `"type"` carries
     /// the literal value constraint `"error"` so a decoded value (which never has
     /// `"type" == "error"`) does not match.
     fn error_discriminant_pattern(&self, span: lin_common::Span) -> TypedPattern {
@@ -61,7 +61,7 @@ impl Checker {
                 let tp = self.check_pattern(pat, scrutinee_ty)?;
                 // Narrow the scrutinee variable within this arm's scope.
                 // Reuse the same slot so LocalGet can unbox the TaggedVal pointer correctly.
-                // `TypeCheckDeep` (ADR-054) narrows to its object type exactly like `TypeCheck`.
+                // `TypeCheckDeep` (ADR-036) narrows to its object type exactly like `TypeCheck`.
                 let narrowed = match &tp {
                     TypedPattern::TypeCheck(ty, _) => Some(ty.clone()),
                     TypedPattern::TypeCheckDeep(ty, _, _) => Some(ty.clone()),
@@ -187,7 +187,7 @@ impl Checker {
                     &self.env,
                 )
                 .map_err(|e| Diagnostic::error(*span, e))?;
-                // `is Error` / `match | is Error` (ADR-047): `Error` is a structural object
+                // `is Error` / `match | is Error` (ADR-031): `Error` is a structural object
                 // alias `{ "type": String, "message": String }`. A bare tag check would match
                 // ANY object (e.g. a successfully-decoded `Person`), so `is Error` could not
                 // discriminate a decode failure from a decoded value. Desugar `is Error` into a
@@ -198,9 +198,9 @@ impl Checker {
                 if name == "Error" {
                     return Ok(self.error_discriminant_pattern(*span));
                 }
-                // `is <Name>` resolving to a non-empty object type (ADR-054): validate field
+                // `is <Name>` resolving to a non-empty object type (ADR-036): validate field
                 // TYPES recursively at runtime, not just the field presence the earlier rule
-                // (now folded into ADR-054) checked. A bare
+                // (now folded into ADR-036) checked. A bare
                 // presence check let `{ "name": 1, "age": "x" }` match `Person`, then the arm
                 // narrowed the binding and a subsequent `x["age"] + 1` operated on the wrong
                 // runtime type — unsound. Reuse the `fromJson` structural walker by carrying the

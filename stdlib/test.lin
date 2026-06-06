@@ -144,7 +144,7 @@ export val test = (name: String, body: () => Json[]): Json =>
   else
     { "type": "skip", "name": name }
 
-// `withFixture` is the per-test setup/teardown + dependency-injection combinator (ADR-071):
+// `withFixture` is the per-test setup/teardown + dependency-injection combinator (ADR-046):
 // it builds a fixture, injects it into the body, and tears it down — all within a single
 // `test`. Because assertion failures are VALUES (not exceptions), teardown always runs, even
 // when the body's assertions fail. This is the functional alternative to keyword

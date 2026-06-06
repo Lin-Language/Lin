@@ -108,7 +108,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.box_object, &[val.into()], "boxobj")
                     .try_as_basic_value().unwrap_basic()
             }
-            // Typed index-signature map (`{ String: T }`, ADR-082): box the LinMap* as TAG_MAP.
+            // Typed index-signature map (`{ String: T }`, ADR-055): box the LinMap* as TAG_MAP.
             Type::Map(_) => {
                 let box_map_fn = self.get_or_declare_fn("lin_box_map",
                     self.context.ptr_type(AddressSpace::default()).fn_type(&[self.context.ptr_type(AddressSpace::default()).into()], false));
@@ -364,7 +364,7 @@ impl<'ctx> Codegen<'ctx> {
                 // path: sealed_project_from unboxes a union source to the raw LinObject itself.
                 self.sealed_project_from(tagged, &Type::TypeVar(u32::MAX), &fields)
             }
-            // Typed index-signature map (`{ String: T }`, ADR-082): a `m[k]` whose value type is
+            // Typed index-signature map (`{ String: T }`, ADR-055): a `m[k]` whose value type is
             // itself a Map is boxed as TAG_MAP. Unbox the payload back to the raw `LinMap*` so a
             // nested store (`m[a][b] = v`) and a chained read both operate on the SHARED inner
             // container, not on the TaggedVal box (which a missing arm here would leak through,

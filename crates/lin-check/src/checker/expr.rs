@@ -74,7 +74,7 @@ impl Checker {
             });
         }
 
-        // Singleton string-literal refinement (ADR-051). A bare string literal infers to
+        // Singleton string-literal refinement (ADR-034). A bare string literal infers to
         // `String`, but when checked against an expected `StrLit("t")` it is accepted iff its
         // value equals `t`, and the resulting typed expression is narrowed to `StrLit("t")` so
         // it satisfies the literal target (e.g. a discriminant field).
@@ -101,7 +101,7 @@ impl Checker {
 
         // Propagate the expected type into the branches of an `if`/`else` (each branch is a
         // tail position whose value is the expression's value), so an object/string literal in
-        // a branch is refined against the same expected type (ADR-051). Only when both branches
+        // a branch is refined against the same expected type (ADR-034). Only when both branches
         // are present (a bare `if ... then x` has an implicit Null else and is handled below).
         //
         // Bidirectional-push fix for the match-arm-union-vs-declared-object bug: when the
@@ -330,8 +330,8 @@ impl Checker {
         let (var_scope_depth, info) = self.env.lookup_with_depth(name).unwrap();
         let slot = info.slot;
         // `lin_*` intrinsics are compiler-internal and must only be referenced from the trusted
-        // stdlib (which re-exports them under clean names) — never from user code (ADR-002/ADR-009,
-        // ADR-086). The `allow_intrinsics` flag is true for stdlib modules and when the
+        // stdlib (which re-exports them under clean names) — never from user code (ADR-002/ADR-008,
+        // ADR-060). The `allow_intrinsics` flag is true for stdlib modules and when the
         // LIN_ALLOW_INTRINSICS test escape hatch is set.
         if !self.allow_intrinsics {
             if let Some(intr) = self.intrinsic_slots.get(&slot) {
@@ -444,7 +444,7 @@ impl Checker {
                     Type::Union(vec![Type::Union(fields.values().cloned().collect()), Type::Null])
                 }
             }
-            // Typed index-signature map `{ String: T }` (ADR-082): a key access yields `T | Null`
+            // Typed index-signature map `{ String: T }` (ADR-055): a key access yields `T | Null`
             // (the missing-key → Null safe-bracket rule, §6.1). No per-key field tracking — the
             // key set is dynamic by construction.
             Type::Map(val_ty) => Type::flatten_union(vec![(**val_ty).clone(), Type::Null]),
@@ -660,7 +660,7 @@ impl Checker {
     /// expected: `Json` is accept-any in this checked-arm position, so a function declared to
     /// return `R` may yield a `Json` value from one arm and a concrete `R`-shaped object from
     /// another. This is the bidirectional-push counterpart to the union-vs-declared-object bug;
-    /// it deliberately does NOT relax `is_compatible_env` (ADR-046 still rejects a direct
+    /// it deliberately does NOT relax `is_compatible_env` (ADR-045 still rejects a direct
     /// `val p: Person = jsonValue` decode).
     pub(crate) fn check_branch_against(&mut self, body: &Expr, expected: &Type) -> Result<TypedExpr, Diagnostic> {
         // First try the bidirectional refinement path (object/string-literal/nested if/match).
@@ -883,7 +883,7 @@ impl Checker {
         Ok(TypedExpr::MakeObject { fields: typed_fields, spreads, ty: Type::object(obj_type), span })
     }
 
-    /// Bidirectional refinement for an object literal against an expected type (ADR-051).
+    /// Bidirectional refinement for an object literal against an expected type (ADR-034).
     ///
     /// Returns `Ok(Some(_))` when it produced a refined typed object; `Ok(None)` to defer to
     /// ordinary inference (e.g. the expected type is not object-shaped, or the literal contains
@@ -920,7 +920,7 @@ impl Checker {
                 Ok(Some(self.check_object_fields(fields, expected_fields, span)?))
             }
             // An object literal checked against a typed index-signature map `{ String: T }`
-            // (ADR-082): each literal value must be `T`; the result is typed `Map(T)` and lowered
+            // (ADR-055): each literal value must be `T`; the result is typed `Map(T)` and lowered
             // into a `LinMap`. The empty `{}` literal is the common case (`var m: { String: T } =
             // {}`), which produces an empty hashed map of the right type — this is how `{}` infers
             // a map from its assignment-target / return-type context.
@@ -1105,7 +1105,7 @@ impl Checker {
                     self.infer_expr(value)?
                 }
             }
-            // Typed index-signature map `{ String: T }` (ADR-082): the key must be a String and
+            // Typed index-signature map `{ String: T }` (ADR-055): the key must be a String and
             // the value must be `T`.
             Type::Map(val_ty) => {
                 let key_ty = typed_key.ty();
@@ -1154,11 +1154,11 @@ impl Checker {
 }
 
 /// True if `ty` contains a `StrLit` singleton anywhere in its structure. Used to scope the
-/// bidirectional literal refinement (ADR-051) so the if/block expected-type propagation only
+/// bidirectional literal refinement (ADR-034) so the if/block expected-type propagation only
 /// fires for literal-typed targets, leaving all other inference behaviour unchanged.
 /// True when the expected type is one we want pushed into `if`/`match` branch bodies for
 /// bidirectional checking: a structured object, a named (alias) type, a union, or anything that
-/// mentions a `StrLit` singleton (ADR-051). Plain scalars / arrays / iterators / `Json` keep the
+/// mentions a `StrLit` singleton (ADR-034). Plain scalars / arrays / iterators / `Json` keep the
 /// old inference-then-unify path (pushing into them buys nothing and risks behaviour changes).
 pub(crate) fn expected_pushes_into_branches(ty: &Type) -> bool {
     match ty {

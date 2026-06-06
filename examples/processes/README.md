@@ -19,7 +19,7 @@ of a "run my build & check steps" tool.
 - **`report.lin`** — pure `summarize` (tally pass/fail) and `render` (format the report).
 - **`main.lin`** — defines a few tasks, runs them, prints the report.
 - **`task.test.lin`** — unit tests for `runTask`/`runAll` with `std/process.exec`
-  mocked (ADR-071), so classification (pass / fail / could-not-launch) is tested
+  mocked (ADR-046), so classification (pass / fail / could-not-launch) is tested
   deterministically without spawning anything or depending on host binaries.
 - **`report.test.lin`** — pure unit tests for `summarize`/`render` over synthetic results.
 - **`integration.test.lin`** — end-to-end: a mixed task list through the whole

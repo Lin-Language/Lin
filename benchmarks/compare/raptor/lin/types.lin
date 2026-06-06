@@ -2,11 +2,11 @@
 //
 // These mirror the reference TypeScript types (planarnetwork/raptor:
 // src/gtfs/GTFS.ts, src/gtfs/Service.ts, src/results/Journey.ts). Lin type
-// aliases live in one module and are imported where needed (§22.3 ADR-053).
+// aliases live in one module and are imported where needed (§22.3 ADR-035).
 //
 // FIXED-SHAPE records are typed here. The createRaptor index dictionaries are now
 // TYPED `{ String: T }` index-signature maps via the `RaptorIndex` type below
-// (ADR-082 / spec §5.1.1) — routeStopIndex/routePath/routesAtStop/tripsByRoute became
+// (ADR-055 / spec §5.1.1) — routeStopIndex/routePath/routesAtStop/tripsByRoute became
 // hashed O(1) containers (the PREP-phase perf lever, see NOTES.md). The scan/query-side
 // maps (kConnections, kArrivals, bestArrivals) and the loader's intermediate maps stay
 // `Json` — their consumers union-narrow values that `{ String: T }` cannot express, or
@@ -62,7 +62,7 @@ export type Journey = { "legs": Leg[], "departureTime": Int32, "arrivalTime": In
 export type Conn = [Json, Int32, Int32] | Transfer
 
 // The per-scan ScanResults state (mirrors ScanResults). The arrival-time dictionaries it
-// threads are now typed `{ String: T }` index-signature maps (ADR-082 / spec §5.1.1) — a
+// threads are now typed `{ String: T }` index-signature maps (ADR-055 / spec §5.1.1) — a
 // hashed O(1) container in place of the O(n) association-list `Json` object — the scan/query
 // (GROUP/RANGE) perf lever:
 //   - bestArrivals  : StopID -> arrival time        { String: Int64 }
@@ -83,7 +83,7 @@ export type ScanResults = { "k": Int32, "bestArrivals": { String: Int64 }, "kArr
 
 // The createRaptor index struct (mirrors RaptorAlgorithm's constructor fields).
 // The dynamic-key dictionaries that createRaptor BUILDS from scratch are now typed
-// `{ String: T }` index-signature maps (ADR-082 / spec §5.1.1) — a hashed O(1)
+// `{ String: T }` index-signature maps (ADR-055 / spec §5.1.1) — a hashed O(1)
 // container, vs the O(n) association-list `Json` object the port used before this type
 // existed. This is the headline PERFORMANCE lever for the index build (PREP phase),
 // where the routeId-keyed indexes (~16k distinct keys) were the O(16k)-scan-per-trip hot

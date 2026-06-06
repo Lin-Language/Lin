@@ -7,7 +7,7 @@ import { join } from "std/string"
 
 // End-to-end over the real entry point: drive solve() — the same fs -> buildAdj ->
 // dijkstra -> reconstructPath -> writeJson flow main.lin runs — across the full graph
-// topology (the same edges as graph.json). std/fs is mocked (ADR-071) so the whole
+// topology (the same edges as graph.json). std/fs is mocked (ADR-046) so the whole
 // orchestration is covered without disk: the read feeds the graph, and the write is
 // captured by a spy. A final test checks the algorithm core directly, as a guard
 // that the two agree.

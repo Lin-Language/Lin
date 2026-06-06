@@ -1,7 +1,7 @@
 # wordcount
 
 A tiny example of the typed **index-signature map** `{ String: T }` (the dictionary type — see
-Specification §5.1.1 and ADR-082).
+Specification §5.1.1 and ADR-055).
 
 `count(words)` builds a `{ String: Int32 }` mapping each distinct word to its number of
 occurrences. The map is a String-keyed dictionary with **O(1) average** lookup/insert (backed by the
