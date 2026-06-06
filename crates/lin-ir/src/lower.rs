@@ -1141,25 +1141,37 @@ fn is_sealed_scalar_repr(ty: &Type) -> bool {
         if !fields.is_empty() && fields.values().all(is_sealed_field_ty))
 }
 
-/// True when `ty` is `Array(elem)` whose element is an ALL-SCALAR sealed record — the sealed-record
-/// ARRAY representation (sealed-records Stage 3): contiguous, unboxed, header-less elements. MUST
-/// mirror `Codegen::sealed_array_elem` EXACTLY. Heap-field element records (Stage 3b) are NOT
-/// accepted (they would need per-element per-field RC) — they keep the boxed `Object[]` path.
+/// True when `ty` is `Array(elem)` whose element is a sealed record laid out as a contiguous,
+/// unboxed, header-less element buffer — sealed-records Stage 3a (all-scalar fields) AND Stage 3b
+/// (packable HEAP fields: String / Array / nested-sealed). MUST mirror
+/// `Codegen::sealed_array_elem` / `sealed_array_elem_field_packable` EXACTLY: the two decide,
+/// independently, when the packed-element representation applies, so any disagreement makes the
+/// lowerer's Coerce/ownership insertion and codegen's representation diverge (a UAF / mis-read).
+/// Heap-field elements get per-element-per-field RC across construct/read/index-set/drop/transfer
+/// (runtime: `release_sealed_array_elems` / `retain_sealed_payload_fields` / `lin_sealed_array_set`).
+/// The function name is kept for call-site stability across the generalized gate.
 fn is_sealed_scalar_array(ty: &Type) -> bool {
     match ty {
+        // A field is packable into the contiguous element buffer iff scalar/Bool OR a STRING heap
+        // field. Array / nested-sealed element fields are NOT yet enabled (kept boxed) — see the
+        // gate note in `Codegen::sealed_array_elem_field_packable`. MUST mirror it EXACTLY.
         Type::Array(elem) => match elem.as_ref() {
-            // Stage 3a scope (mirrors codegen `sealed_array_elem`): scalar-field sealed records only.
-            // Heap-field records stay BOXED (the Stage 3b ungate was attempted and reverted — see the
-            // status note in `Codegen::sealed_array_elem`).
             Type::Object { fields, sealed: true } => {
-                !fields.is_empty()
-                    && fields.values().all(is_sealed_field_ty)
-                    && fields.values().all(|f| f.is_flat_scalar() || matches!(f, Type::Bool))
+                !fields.is_empty() && fields.values().all(is_sealed_array_elem_field_packable)
             }
             _ => false,
         },
         _ => false,
     }
+}
+
+/// Element-field eligibility — the lower.rs mirror of `Codegen::sealed_array_elem_field_packable`.
+/// Currently SCALARS ONLY (Stage 3a); heap-field kinds stay boxed (Stage 3b deferred — see the gate
+/// note in `Codegen::sealed_array_elem_field_packable`). Any disagreement with the codegen predicate
+/// makes the lowerer's ownership/Coerce insertion diverge from the physical layout (UAF / mis-read),
+/// so the two MUST be kept in lockstep.
+fn is_sealed_array_elem_field_packable(ty: &Type) -> bool {
+    ty.is_flat_scalar() || matches!(ty, Type::Bool)
 }
 
 /// True when `param_ty` is an array whose element is a BOXED runtime representation — a generic

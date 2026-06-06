@@ -13365,6 +13365,32 @@ print("${length(nums)} ${nums[0]} ${nums[5]}")
     assert_eq!(out, vec!["6 3 9"]);
 }
 
+#[test]
+fn test_sealed_array_index_set_in_callee() {
+    // REGRESSION: `arr[i] = { .. }` over a SCALAR sealed-record array, performed inside a CALLEE
+    // (recursive overwrite loop). In a callee context the RHS structural literal is typed as an
+    // UNSEALED `{x,y}` object and lowered to a BOXED `lin_object_alloc`, not a packed sealed struct.
+    // `compile_ir_index_set` passes the value straight to `lin_sealed_array_set`, which memcpy's
+    // `value + SEALED_HEADER` into the slot — reading garbage from a boxed object's header. The fix
+    // projects a representation-mismatched RHS into a fresh sealed struct first (and releases it after
+    // the set takes its retained copy). Without it this read garbage / crashed.
+    let out = run(r#"
+import { print } from "std/io"
+import { length } from "std/array"
+type Pt = { "x": Int32, "y": Int32 }
+val overwrite = (arr: Pt[], i: Int32): Int32 =>
+  if i == length(arr) then 0 else
+    val _ = arr[i] = { "x": i * 2, "y": i * 3 }
+    overwrite(arr, i + 1)
+val main = (): Null =>
+  val pts: Pt[] = [{ "x": 0, "y": 0 }, { "x": 1, "y": 1 }, { "x": 2, "y": 2 }]
+  val _ = overwrite(pts, 0)
+  print("${pts[0]["x"]} ${pts[1]["y"]} ${pts[2]["x"]}")
+val _ = main()
+"#);
+    assert_eq!(out, vec!["0 3 4"]);
+}
+
 /// Regression (LIN_ISSUES #2): a top-level mutable `var` in an IMPORTED module, mutated by an
 /// EXPORTED function, used to panic codegen ("Binary: undefined lhs temp Temp(0)") because the
 /// import lowering never set up the module global / its initialiser — the exported mutator
