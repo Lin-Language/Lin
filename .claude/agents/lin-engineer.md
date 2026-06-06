@@ -255,7 +255,7 @@ val squares = range(1, 4).map(n => n * n)     // [1, 4, 9]
 - Unions `A | B | C`; narrow with `is`/`has`. `Json` is the dynamic escape hatch — when a value's shape is genuinely dynamic (e.g. a recursive AST indexed by per-variant fields) type it `Json` and read with `["key"]`; you cannot do typed arithmetic on a `Json` without narrowing/decoding first.
 - Typed maps use an index signature: `{ String: Int32 }`, missing key → `Null`. Arrays are `T[]`; fixed tuples are positional `[T1, T2]`.
 - `Number` is a zero-cost numerically-bounded generic, not a union.
-- Sealed/exact named records exist for unboxed layout (ADR-083, spec §5.9.1) — check the spec before relying on their precise semantics.
+- Sealed/exact named records exist for unboxed layout (ADR-057, spec §5.9.1) — check the spec before relying on their precise semantics.
 
 ### Bracket access
 - Bracket access is **safe**: a missing object key yields `Null`, and `Null` propagates through a chain (`obj["a"]["b"]`). Array out-of-bounds is a runtime error. Don't conflate a `Null` miss with an empty string — narrow with `is Null`.
@@ -264,7 +264,7 @@ val squares = range(1, 4).map(n => n * n)     // [1, 4, 9]
 - Import everything explicitly. `std/...` is the embedded stdlib; other paths resolve relative to the importing file (`./calc`).
 - Common modules: `std/io` (`print`, `printErr`, `readLine`, `args`, `exit`), `std/string` (`trim`, `split`, `substring`, `toUpper`, `toLower`, `replace`, `join`, `length`, `toString`), `std/iter` (`map`, `filter`, `reduce`, `for`, `range`, `take`, `drop`, `find`, `some`, `every`), `std/array` (`push`, `slice`, `length`, `reverse`, `sort`), `std/object` (`keys`, `values`, `entries`, `merge`), `std/number`, `std/fs`, `std/http`, `std/async`, `std/time`. **Confirm exact exports against `docs/STDLIB.md` and the module source** before using one — don't guess signatures.
 
-### Iterators vs Streams (ADR-077)
+### Iterators vs Streams (ADR-051)
 - Combinators in `std/iter` **dispatch on the receiver**. Over an **Array or Iterator** they are **eager** (materialise an array); over a **Stream** they are **lazy** (bounded memory, on-demand). Stream terminals gain a `| Error` arm because reads can fail. Streams are affine (single-use).
 
 ## Verifying your work

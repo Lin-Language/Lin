@@ -214,7 +214,7 @@ pub unsafe extern "C" fn lin_box_function(p: *mut u8) -> *mut u8 {
     alloc_tagged(TAG_FUNCTION, p as u64)
 }
 
-/// Box a `LinMap*` (the typed index-signature container, ADR-082) as a TaggedVal(TAG_MAP).
+/// Box a `LinMap*` (the typed index-signature container, ADR-055) as a TaggedVal(TAG_MAP).
 #[no_mangle]
 pub unsafe extern "C" fn lin_box_map(p: *mut u8) -> *mut u8 {
     alloc_tagged(TAG_MAP, p as u64)

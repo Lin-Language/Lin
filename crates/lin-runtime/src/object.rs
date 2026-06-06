@@ -306,7 +306,7 @@ pub unsafe fn retain_tagged_payload_pub(tv: &TaggedVal) {
 }
 
 /// Public wrapper for release_tagged_payload, used by map.rs (the typed-map container reuses the
-/// exact object value RC discipline; see ADR-082).
+/// exact object value RC discipline; see ADR-055).
 pub unsafe fn release_tagged_payload_pub(tv: &TaggedVal) {
     release_tagged_payload(tv);
 }
@@ -563,7 +563,7 @@ pub unsafe extern "C" fn lin_object_get_or_insert_array(obj: *const u8, key: *co
     }
     // A typed index-signature map `{ String: T[] }` is backed by `LinMap` (TAG_MAP), not
     // `LinObject`. Dispatch on the tag and route map values through the map intrinsics — without
-    // this branch, treating a `LinMap*` as a `LinObject*` corrupts memory (ADR-082). `groupBy`'s
+    // this branch, treating a `LinMap*` as a `LinObject*` corrupts memory (ADR-055). `groupBy`'s
     // result is map-typed, so this is the path it actually takes.
     if *obj == TAG_MAP {
         let lin_map = (*(obj as *const TaggedVal)).payload as *mut crate::map::LinMap;
@@ -910,7 +910,7 @@ pub unsafe extern "C" fn lin_object_release(obj: *mut LinObject) {
         return;
     }
     // Frozen (immortal) objects: saturated refcount, never freed/decremented (Frozen<T>,
-    // ADR-045). Guard makes retain/release no-ops so concurrent reads are race-free.
+    // ADR-030). Guard makes retain/release no-ops so concurrent reads are race-free.
     if (*obj).refcount >= crate::string::IMMORTAL_RC {
         return;
     }
@@ -1142,7 +1142,7 @@ mod tests {
     }
 
     // Same get-or-insert-array contract, but over a TAG_MAP (`LinMap`) backing — the typed
-    // `{ String: T[] }` result that std/array.groupBy now produces (ADR-082). Without the TAG_MAP
+    // `{ String: T[] }` result that std/array.groupBy now produces (ADR-055). Without the TAG_MAP
     // branch in `lin_object_get_or_insert_array`, the map would be (mis)read as a `LinObject` and
     // corrupt memory; this guards that the map path inserts/looks-up/RC-balances correctly.
     #[test]

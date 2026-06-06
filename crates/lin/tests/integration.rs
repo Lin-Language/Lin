@@ -23,7 +23,7 @@ fn lin_bin() -> PathBuf {
     workspace_root().join("target/debug/lin")
 }
 
-/// A `lin` Command pre-armed with the `LIN_ALLOW_INTRINSICS` escape hatch (ADR-086) so the
+/// A `lin` Command pre-armed with the `LIN_ALLOW_INTRINSICS` escape hatch (ADR-060) so the
 /// compiler's own intrinsic-exercising fixtures (which write user-level `.lin` sources that call
 /// `lin_*` directly) keep type-checking. Tests that must exercise the gate REJECTING an intrinsic
 /// build a bare `Command::new(lin_bin())` instead, WITHOUT this env var.
@@ -1146,74 +1146,64 @@ print(toString(also))
 }
 
 #[test]
-fn test_logical_not_val_and_if() {
+fn test_logical_not_behaviours() {
+    // Consolidated logical-`!` behaviours (5 former one-build success tests → one program; each
+    // case keeps its own bindings and assertions in order). The non-bool `!5` type error keeps
+    // its own `run_expect_err` test below.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 
+// val_and_if
 val ready = true
 print(toString(!ready))
 val flag = false
 if !flag then print("taken") else print("not-taken")
-"#);
-    assert_eq!(output, vec!["false", "taken"]);
-}
 
-#[test]
-fn test_logical_not_in_match_guard() {
-    let output = run(r#"import { print } from "std/io"
-
+// in_match_guard: `!cond` in a `when` guard
 val cond = false
 val describe = (n: Int32): String =>
   match n
     has Int32 when !cond => "guard-true"
     else => "guard-false"
 print(describe(1))
-"#);
-    assert_eq!(output, vec!["guard-true"]);
-}
 
-#[test]
-fn test_logical_not_precedence() {
-    let output = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-
-// !a == b parses as (!a) == b
+// precedence: `!a == b` parses as `(!a) == b`; `!` over index/call/`&&`
 print(toString(!true == false))
 val obj = { "ok": false }
 print(toString(!obj["ok"]))
 val isZero = (n: Int32): Boolean => n == 0
 print(toString(!isZero(5)))
-val a = false
-val b = true
-print(toString(!a && b))
-"#);
-    assert_eq!(output, vec!["true", "true", "true", "true"]);
-}
+val pa = false
+val pb = true
+print(toString(!pa && pb))
 
-#[test]
-fn test_logical_double_negation() {
-    let output = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-
-val x = true
-print(toString(!!x == x))
+// double_negation
+val dx = true
+print(toString(!!dx == dx))
 print(toString(!!false))
-"#);
-    assert_eq!(output, vec!["true", "false"]);
-}
 
-#[test]
-fn test_logical_not_typevar_operand() {
-    // `!flag` where `flag` flows through a generic lambda parameter exercises
-    // the unbox-to-i1 path in IR lowering.
-    let output = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-
+// typevar_operand: `!flag` where `flag` flows through a generic lambda parameter exercises the
+// unbox-to-i1 path in IR lowering.
 val negate = (flag) => !flag
 print(toString(negate(true)))
 print(toString(negate(false)))
 "#);
-    assert_eq!(output, vec!["false", "true"]);
+    assert_eq!(
+        output,
+        vec![
+            "false",       // val_and_if: !ready
+            "taken",       // val_and_if: if !flag
+            "guard-true",  // in_match_guard
+            "true",        // precedence: !true == false
+            "true",        // precedence: !obj["ok"]
+            "true",        // precedence: !isZero(5)
+            "true",        // precedence: !pa && pb
+            "true",        // double_negation: !!dx == dx
+            "false",       // double_negation: !!false
+            "false",       // typevar: negate(true)
+            "true",        // typevar: negate(false)
+        ]
+    );
 }
 
 #[test]
@@ -2029,55 +2019,51 @@ print(toString(result))
 }
 
 #[test]
-fn test_default_args_basic() {
-    // Omitting a trailing optional argument fills it from its default.
-    let output = run(r#"import { print } from "std/io"
-
-val greet = (name: String, greeting: String = "Hello") => "${greeting}, ${name}"
-print(greet("World"))
-print(greet("World", "Hi"))
-"#);
-    assert_eq!(output, vec!["Hello, World", "Hi, World"]);
-}
-
-#[test]
-fn test_default_args_chained() {
-    // A default may reference earlier parameters, including earlier defaults.
+fn test_default_args_runtime_fill() {
+    // Consolidated default-argument runtime behaviours (4 former one-build tests → one program,
+    // distinct function names, every assertion preserved in order). The compile-error cases
+    // (`too_few_is_error`, `required_after_optional_is_error`) and the file-writing
+    // `cross_module` case keep their own tests below — they need `run_expect_err` / fixtures.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 
+// basic: omitting a trailing optional argument fills it from its default.
+val greet = (name: String, greeting: String = "Hello") => "${greeting}, ${name}"
+print(greet("World"))
+print(greet("World", "Hi"))
+
+// chained: a default may reference earlier parameters, including earlier defaults.
 val box = (w: Int32, h: Int32 = w, area: Int32 = w * h) => area
 print(toString(box(4)))
 print(toString(box(4, 3)))
 print(toString(box(4, 3, 99)))
-"#);
-    assert_eq!(output, vec!["16", "12", "99"]);
-}
 
-#[test]
-fn test_default_args_object() {
-    let output = run(r#"import { print } from "std/io"
-
+// object: an object-typed default literal.
 val config = (name: String, opts: Json = { "v": false }) => "${name}:${opts}"
 print(config("a"))
 print(config("b", { "v": true }))
-"#);
-    assert_eq!(output, vec!["a:{\"v\": false}", "b:{\"v\": true}"]);
-}
 
-#[test]
-fn test_default_args_indirect_value() {
-    // Default-fill works when the function is held as a first-class value
-    // (the closure carries a descriptor so the indirect call fills defaults).
-    let output = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-
+// indirect_value: default-fill works when the function is held as a first-class value
+// (the closure carries a descriptor so the indirect call fills defaults).
 val scale = (x: Int32, factor: Int32 = 2) => x * factor
 val g = scale
 print(toString(g(5)))
 print(toString(g(5, 3)))
 "#);
-    assert_eq!(output, vec!["10", "15"]);
+    assert_eq!(
+        output,
+        vec![
+            "Hello, World",        // basic
+            "Hi, World",           // basic (explicit)
+            "16",                  // chained box(4)
+            "12",                  // chained box(4, 3)
+            "99",                  // chained box(4, 3, 99)
+            "a:{\"v\": false}",    // object (default)
+            "b:{\"v\": true}",     // object (explicit)
+            "10",                  // indirect g(5)
+            "15",                  // indirect g(5, 3)
+        ]
+    );
 }
 
 #[test]
@@ -2403,7 +2389,7 @@ fn test_cache_invalidated_when_import_signature_changes() {
 
 #[test]
 fn test_cyclic_imports_peer_dependent_return_boundary_gap() {
-    // Documents the KNOWN boundary-soundness gap in cyclic-import inference (ADR-078).
+    // Documents the KNOWN boundary-soundness gap in cyclic-import inference (ADR-052).
     // A 3-module cycle a -> b -> c -> a where the only literal lives in `fromC`, and
     // `fromA`/`fromB` get their return type only by calling through a peer.
     //
@@ -2413,7 +2399,7 @@ fn test_cyclic_imports_peer_dependent_return_boundary_gap() {
     // bind the (actually-String) result to Int32 with NO type error. That missed error is
     // the gap. If a future change iterates Phase 2 to convergence (or fails closed by
     // requiring an annotation), the second half of this test should start failing — update
-    // ADR-078 and flip the assertion when it does.
+    // ADR-052 and flip the assertion when it does.
     let dir = std::env::temp_dir().join(format!("lin_cyc_peerret_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     std::fs::write(dir.join("a.lin"),
@@ -2452,14 +2438,14 @@ print(toString(k))
         String::from_utf8_lossy(&check.stderr), String::from_utf8_lossy(&check.stdout));
     let _ = std::fs::remove_dir_all(&dir);
     assert!(check.status.success(),
-        "ADR-078 boundary gap: binding a peer-dependent cyclic return to Int32 is currently \
-         accepted. If this now FAILS, the gap was closed — flip this assertion and update ADR-078. \
+        "ADR-052 boundary gap: binding a peer-dependent cyclic return to Int32 is currently \
+         accepted. If this now FAILS, the gap was closed — flip this assertion and update ADR-052. \
          got: {check_out}");
 }
 
 #[test]
 fn test_intrinsic_rejected_in_user_code() {
-    // ADR-086: `lin_*` compiler intrinsics must not be callable from user code; they are
+    // ADR-060: `lin_*` compiler intrinsics must not be callable from user code; they are
     // resolvable only when type-checking a trusted stdlib module (or with the LIN_ALLOW_INTRINSICS
     // test escape hatch). This test invokes `lin check` WITHOUT the escape hatch.
     let id = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -2663,6 +2649,81 @@ print(toString([1, 2, 3].map((x, i) => x + i)))
 }
 
 #[test]
+fn test_generic_callback_param_back_inference() {
+    // A generic function pins its type parameter `T` from a (type-pinning) argument and that
+    // concrete type must be BACK-INFERRED into an UNANNOTATED callback parameter's body. Closes the
+    // under-checking hole where `sort`'s `cmp` params stayed unconstrained when unannotated.
+
+    // HOLE A — `sort(xs, (a, b) => a["x"])` over `Int32[]`: `a` is now `Int32`, so indexing it is a
+    // genuine type error (previously type-checked because the param was left free).
+    let err = run_expect_err(r#"import { sort } from "std/array"
+val run = (): Null =>
+  val xs: Int32[] = [3, 1, 2]
+  val s = sort(xs, (a, b) => a["x"])
+  null
+run()
+"#);
+    assert!(
+        err.contains("Cannot index into type Int32"),
+        "case A should error: callback param `a` must be Int32, got: {}",
+        err
+    );
+
+    // HOLE B — proof the param is constrained: `val z: String = a` must reject `a` (Int32).
+    let err = run_expect_err(r#"import { sort } from "std/array"
+val run = (): Null =>
+  val xs: Int32[] = [3, 1, 2]
+  val s = sort(xs, (a, b) =>
+    val z: String = a
+    0)
+  null
+run()
+"#);
+    assert!(
+        err.contains("String") && err.contains("Int32"),
+        "case B should error: `a` (Int32) is not String, got: {}",
+        err
+    );
+
+    // map/filter over an `Int32[]` literal back-infer the element param identically (dot-call path).
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { map } from "std/iter"
+import { toString } from "std/string"
+print(toString([1, 2, 3].map(x => x["k"])))
+"#);
+    assert!(
+        err.contains("Cannot index into type Int32"),
+        "map callback param `x` must be Int32, got: {}",
+        err
+    );
+
+    // POSITIVE guards — all must STILL type-check and run:
+    //  * unannotated combinator callbacks over concrete element types,
+    //  * `sortBy` whose keyFn returns a DIFFERENT type than the element (the generic `U` is solved
+    //    from the body, not pinned — must not be forced into a strict mismatch),
+    //  * `reduce` whose accumulator `U` is pinned by `init`,
+    //  * `[].sort(cmp)` over an EMPTY literal (`T = Never`, no element to constrain — the body must
+    //    fall back to inference, not be rejected as "Sub to Never and Never").
+    let output = run(r#"import { print } from "std/io"
+import { map, filter, reduce } from "std/iter"
+import { sort, sortBy } from "std/array"
+import { toString } from "std/string"
+val xs: Int32[] = [3, 1, 2]
+print(toString(xs.map(x => x * 2)))
+print(toString(xs.filter(x => x % 2 == 1)))
+print(toString(xs.reduce(0, (acc, x) => acc + x)))
+print(toString(sortBy(xs, n => n % 3)))
+val empty: Int32[] = []
+print(toString(empty.sort((a, b) => a - b)))
+"#);
+    assert_eq!(
+        output,
+        vec!["[6, 2, 4]", "[3, 1]", "6", "[3, 1, 2]", "[]"],
+        "valid generic-callback programs must still type-check and run"
+    );
+}
+
+#[test]
 fn test_undefined_variable_error() {
     let err = run_expect_err(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -2701,7 +2762,7 @@ print(toString(length(obj)))
     assert_eq!(output, vec!["0", "0"]);
 }
 
-// ADR-084: an evidence-free empty array literal (no annotation, no contextual type, no contents)
+// ADR-058: an evidence-free empty array literal (no annotation, no contextual type, no contents)
 // cannot infer its element type and must be a compile error pointing the user at an annotation.
 #[test]
 fn test_context_free_empty_array_errors() {
@@ -2715,7 +2776,7 @@ print("unreachable")
     );
 }
 
-// ADR-084: same for an evidence-free empty map/object literal.
+// ADR-058: same for an evidence-free empty map/object literal.
 #[test]
 fn test_context_free_empty_object_errors() {
     let err = run_expect_err(r#"import { print } from "std/io"
@@ -2728,7 +2789,7 @@ print("unreachable")
     );
 }
 
-// ADR-084: a `var` (mutable) evidence-free empty literal must error the same way.
+// ADR-058: a `var` (mutable) evidence-free empty literal must error the same way.
 #[test]
 fn test_context_free_empty_var_errors() {
     let err = run_expect_err(r#"import { print } from "std/io"
@@ -2741,7 +2802,7 @@ print("unreachable")
     );
 }
 
-// ADR-084: an empty literal WITH contextual evidence still works — an annotation on the binding,
+// ADR-058: an empty literal WITH contextual evidence still works — an annotation on the binding,
 // a typed function parameter (argument position), and a typed function return are all evidence.
 #[test]
 fn test_empty_literal_with_context_still_works() {
@@ -2765,7 +2826,7 @@ print(toString(length(mkEmpty())))
     assert_eq!(output, vec!["0", "0", "0", "0"]);
 }
 
-// ADR-084 (deferred Phase 2): `push` stays `(Json, Json)`, so its element type is still NOT
+// ADR-058 (deferred Phase 2): `push` stays `(Json, Json)`, so its element type is still NOT
 // checked — `push(intArr, "str")` type-checks today. Making `push` generic (`<T>(arr: T[],
 // item: T)`) to close that hole is blocked on a separate monomorphized-body/`lin_push`-intrinsic
 // representation bug (see the comment on `push` in stdlib/array.lin). This test PINS the current
@@ -2782,7 +2843,7 @@ print(toString(length(xs)))
     assert_eq!(output, vec!["1"]);
 }
 
-// ADR-084: the untyped-accumulator idiom WITH an annotation works end to end — build an array via
+// ADR-058: the untyped-accumulator idiom WITH an annotation works end to end — build an array via
 // `push` in a loop and read it back, including a String[] accumulator (heap-element push).
 #[test]
 fn test_annotated_push_accumulator_end_to_end() {
@@ -3011,7 +3072,7 @@ print(toString(add5(10)))
 
 #[test]
 fn test_map_returns_capturing_closures() {
-    // Regression (ADR-060 owning captures): a `map` callback that RETURNS a closure capturing
+    // Regression (ADR-041 owning captures): a `map` callback that RETURNS a closure capturing
     // the callback parameter. The returned thunks ESCAPE into the result array; each must own
     // its captured value (the element box), not borrow a per-iteration box that is freed and
     // reused. Before the owning-capture fix, calling a thunk returned garbage (`[[object]…]`)
@@ -3192,7 +3253,7 @@ data.for(x =>
 }
 
 // Inside a parenthesised lambda body, a multi-statement `if`-then block must keep ALL its
-// statements (the ADR-004 newline-suppression bug used to drop all but the first, making the
+// statements (the ADR-003 newline-suppression bug used to drop all but the first, making the
 // rest run unconditionally). The offside rule (column > the `if` keyword) delimits the block.
 #[test]
 fn test_multi_statement_if_then_in_inline_lambda() {
@@ -3241,7 +3302,7 @@ print(toString(b))
     assert_eq!(output, vec!["11", "200"]);
 }
 
-// A `match` expression inside a parenthesised lambda body must parse: ADR-004 suppresses the
+// A `match` expression inside a parenthesised lambda body must parse: ADR-003 suppresses the
 // Indent/Dedent that the top-level arm-block relies on, so the parser falls back to the offside
 // rule (arms line up at one column). Single-expression arm bodies. Regression for the
 // "unexpected token Arrow" bug.
@@ -3325,7 +3386,7 @@ range(0, 2).for(i =>
 
 // A multiline JSON object literal passed as an argument is delimited by `{`/`}`/`,`, NOT by the
 // offside column. The column guard must not fire inside a literal (literals have their own
-// parser). Sanity that the offside change didn't disturb ADR-004 multiline literals in parens.
+// parser). Sanity that the offside change didn't disturb ADR-003 multiline literals in parens.
 #[test]
 fn test_multiline_json_literal_in_parens_unaffected() {
     let output = run(r#"import { print } from "std/io"
@@ -3342,7 +3403,7 @@ show({
 }
 
 // A dot-chain split across newlines inside a parenthesised lambda body must parse as ONE
-// expression (ADR-006). The offside guard only runs BETWEEN statements, never within a single
+// expression (ADR-005). The offside guard only runs BETWEEN statements, never within a single
 // `parse_expr()`, so continuation lines of one expression are never split.
 #[test]
 fn test_dot_chain_across_newlines_in_inline_lambda() {
@@ -3364,9 +3425,9 @@ run()
 
 // A line-leading `[` after a statement inside an inline lambda body starts a NEW array-literal
 // statement, not a postfix index on the previous expression. Inside `()` the line break is
-// suppressed as a token (ADR-004), so the parser relies on each token's `newline_before` flag.
+// suppressed as a token (ADR-003), so the parser relies on each token's `newline_before` flag.
 // Without this, `f` below parsed as `push(acc, 4)[ ... ]` and the body's value was the index
-// result (Null) instead of the array. Mirrors the post-Dedent `[` suppression of ADR-011.
+// result (Null) instead of the array. Mirrors the post-Dedent `[` suppression of ADR-010.
 #[test]
 fn test_line_leading_array_after_statement_in_inline_lambda() {
     let output = run(r#"import { print } from "std/io"
@@ -3670,64 +3731,57 @@ print("  hello  ".trim().toUpper())
 }
 
 #[test]
-fn test_object_spread_basic() {
+fn test_object_spread_behaviours() {
+    // Consolidated object-spread behaviours (5 former one-build tests → one program; each case
+    // keeps uniquely-named bindings and its assertions in order).
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { keys } from "std/object"
 
-val src = { "a": 1, "b": 2 }
-val merged = { ...src, "c": 3 }
-print(toString(merged["a"]))
-print(toString(merged["b"]))
-print(toString(merged["c"]))
-print(toString(keys(merged)))
+// basic: spread then add a new key.
+val basicSrc = { "a": 1, "b": 2 }
+val basic = { ...basicSrc, "c": 3 }
+print(toString(basic["a"]))
+print(toString(basic["b"]))
+print(toString(basic["c"]))
+print(toString(keys(basic)))
+
+// override: an explicit key after a spread overrides the spread value.
+val ovrSrc = { "a": 1, "b": 2 }
+val ovr = { ...ovrSrc, "a": 99 }
+print(toString(ovr["a"]))
+print(toString(ovr["b"]))
+print(toString(keys(ovr)))
+
+// multiple: a later spread overrides an earlier one on overlapping keys.
+val mulA = { "x": 1, "y": 2 }
+val mulB = { "y": 20, "z": 30 }
+val mul = { ...mulA, ...mulB }
+print(toString(mul["x"]))
+print(toString(mul["y"]))
+print(toString(mul["z"]))
+print(toString(keys(mul)))
+
+// empty_source: spreading `{}` contributes no fields.
+val emptySrc = { ...{}, "a": 1 }
+print(toString(emptySrc["a"]))
+print(toString(keys(emptySrc)))
+
+// null_noop: spreading null contributes no fields (not a runtime error).
+val nullSrc = { ...null, "a": 1 }
+print(toString(nullSrc["a"]))
+print(toString(keys(nullSrc)))
 "#);
-    assert_eq!(output, vec!["1", "2", "3", "[\"a\", \"b\", \"c\"]"]);
-}
-
-#[test]
-fn test_object_spread_override_explicit_after_spread() {
-    let output = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-import { keys } from "std/object"
-
-val src = { "a": 1, "b": 2 }
-val merged = { ...src, "a": 99 }
-print(toString(merged["a"]))
-print(toString(merged["b"]))
-print(toString(keys(merged)))
-"#);
-    assert_eq!(output, vec!["99", "2", "[\"a\", \"b\"]"]);
-}
-
-#[test]
-fn test_object_spread_multiple() {
-    let output = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-import { keys } from "std/object"
-
-val a = { "x": 1, "y": 2 }
-val b = { "y": 20, "z": 30 }
-val merged = { ...a, ...b }
-print(toString(merged["x"]))
-print(toString(merged["y"]))
-print(toString(merged["z"]))
-print(toString(keys(merged)))
-"#);
-    assert_eq!(output, vec!["1", "20", "30", "[\"x\", \"y\", \"z\"]"]);
-}
-
-#[test]
-fn test_object_spread_empty_source() {
-    let output = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-import { keys } from "std/object"
-
-val merged = { ...{}, "a": 1 }
-print(toString(merged["a"]))
-print(toString(keys(merged)))
-"#);
-    assert_eq!(output, vec!["1", "[\"a\"]"]);
+    assert_eq!(
+        output,
+        vec![
+            "1", "2", "3", "[\"a\", \"b\", \"c\"]", // basic
+            "99", "2", "[\"a\", \"b\"]",            // override
+            "1", "20", "30", "[\"x\", \"y\", \"z\"]", // multiple
+            "1", "[\"a\"]",                         // empty_source
+            "1", "[\"a\"]",                         // null_noop
+        ]
+    );
 }
 
 #[test]
@@ -3756,7 +3810,7 @@ print(toString(sum))
 
 #[test]
 fn test_typed_map_index_signature() {
-    // Typed index-signature map `{ String: T }` (ADR-082): the hashed `LinMap` backing.
+    // Typed index-signature map `{ String: T }` (ADR-055): the hashed `LinMap` backing.
     // Insert/lookup of distinct keys, overwrite (length stays put), missing key -> Null,
     // and keys()/values() over the map. The empty `{}` literal infers `{ String: Int32 }`
     // from its annotation context.
@@ -3781,7 +3835,7 @@ print(toString(length(values(m))))
 #[test]
 fn test_json_not_assignable_to_typed_map() {
     // Type-soundness: there is intentionally NO implicit `Json -> { String: T }` coercion
-    // (§5.1.1, §6.3, ADR-082). A `Json` value's runtime payload is a `LinObject` (or any tag),
+    // (§5.1.1, §6.3, ADR-055). A `Json` value's runtime payload is a `LinObject` (or any tag),
     // NOT a `LinMap`; relabelling it to the index-signature map type at the call boundary does
     // not convert the representation, so the callee would then read `LinObject` memory as a
     // `LinMap` and corrupt it. The value must be decoded via `fromJson` / narrowing instead.
@@ -4047,125 +4101,93 @@ print(toString(loop(20000i64, 0i64)))
 }
 
 #[test]
-fn test_typed_map_flat_scalar_unboxed() {
-    // ADR-082 follow-up: a flat-scalar value type `T` (Int64 here) stores the scalar UNBOXED
-    // inline in the slot (no per-value heap box). Exercises insert/overwrite/lookup, a missing
-    // key -> Null, and keys/values/entries over an unboxed-value map. The values must read back
-    // T-correct (the union `T|Null` carries the boxed-scalar tag for T).
-    let output = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-import { keys, values, entries } from "std/object"
-import { length } from "std/array"
-
-var m: { String: Int64 } = {}
-m["a"] = 100i64
-m["b"] = 200i64
-m["a"] = 111i64
-print(toString(m["a"]))
-print(toString(m["b"]))
-print(toString(m["nope"]))
-print(toString(length(keys(m))))
-print(toString(length(values(m))))
-print(toString(length(entries(m))))
-"#);
-    assert_eq!(output, vec!["111", "200", "null", "2", "2", "2"]);
-}
-
-#[test]
-fn test_typed_map_flat_scalar_numeric_width() {
-    // An Int32-typed source value stored into a `{ String: Int64 }` map must read back as a
-    // T(=Int64)-correct value — the store widens to T before storing, so `is Int64` matches and
-    // the value is byte-correct (ADR-082 follow-up width-normalisation). A plain Int32 literal
-    // (`i`) flows in; the slot must carry an Int64.
+fn test_typed_map_flat_scalar() {
+    // Consolidated ADR-055 flat-scalar typed-map behaviours (5 former one-build tests → one
+    // program; each case keeps a uniquely-named map/binding and its assertions, preserved in
+    // order). Flat-scalar value types store the scalar UNBOXED inline in the slot (no per-value
+    // heap box); the union `T|Null` carries the boxed-scalar tag for T on read-back.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { for, range } from "std/iter"
+import { keys, values, entries } from "std/object"
+import { length } from "std/array"
 
-var m: { String: Int64 } = {}
-range(0, 1000).for(i => m["k${toString(i)}"] = i)
-var sum = 0i64
+// unboxed: insert/overwrite/lookup, missing key -> Null, keys/values/entries.
+var mu: { String: Int64 } = {}
+mu["a"] = 100i64
+mu["b"] = 200i64
+mu["a"] = 111i64
+print(toString(mu["a"]))
+print(toString(mu["b"]))
+print(toString(mu["nope"]))
+print(toString(length(keys(mu))))
+print(toString(length(values(mu))))
+print(toString(length(entries(mu))))
+
+// numeric_width: an Int32 source value stored into a { String: Int64 } map widens to T before
+// storing, so `is Int64` matches and the value is byte-correct. A wrong tag (TAG_INT32) would
+// miss the arm and yield 0. sum_{i=0..999} i = 499500.
+var mw: { String: Int64 } = {}
+range(0, 1000).for(i => mw["k${toString(i)}"] = i)
+var sumw = 0i64
 range(0, 1000).for(i =>
-  val v = m["k${toString(i)}"]
+  val v = mw["k${toString(i)}"]
   match v
-    is Int64 => sum = sum + v
-    else => sum = sum
+    is Int64 => sumw = sumw + v
+    else => sumw = sumw
 )
-print(toString(sum))
-"#);
-    // sum_{i=0..999} i = 999*1000/2 = 499500. A wrong tag (TAG_INT32) would miss the `is Int64`
-    // arm and yield 0.
-    assert_eq!(output, vec!["499500"]);
-}
+print(toString(sumw))
 
-#[test]
-fn test_typed_map_flat_scalar_float() {
-    // Float64 flat-scalar values: stored unboxed (TAG_FLOAT64 payload = f64 bits), read back via
-    // the same boxed-scalar convention as a normally-boxed float.
-    let output = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-
-var m: { String: Float64 } = {}
-m["pi"] = 3.5
-m["e"] = 2.5
-m["pi"] = 1.25
-val a = m["pi"]
-val b = m["e"]
-val sum = match a
-  is Float64 => match b
-    is Float64 => a + b
+// float: Float64 flat-scalar values stored unboxed (TAG_FLOAT64 payload = f64 bits).
+var mf: { String: Float64 } = {}
+mf["pi"] = 3.5
+mf["e"] = 2.5
+mf["pi"] = 1.25
+val fa = mf["pi"]
+val fb = mf["e"]
+val sumf = match fa
+  is Float64 => match fb
+    is Float64 => fa + fb
     else => 0.0
   else => 0.0
-print(toString(sum))
-"#);
-    assert_eq!(output, vec!["3.75"]);
-}
+print(toString(sumf))
 
-#[test]
-fn test_typed_map_flat_scalar_rc_stress() {
-    // Build/free many flat-scalar-value maps in a tail-recursive loop. A scalar value carries NO
-    // heap payload, so set/overwrite/free must do NO retain/release on it — an erroneous RC op on
-    // an unboxed scalar (treating the raw payload as a heap pointer) would crash or corrupt long
-    // before the loop ends. A stable checksum across 30k build/free cycles confirms balance.
-    let output = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-
-val loop = (i: Int64, acc: Int64): Int64 =>
+// rc_stress: build/free many flat-scalar maps in a tail-recursive loop. A scalar value carries
+// NO heap payload, so set/overwrite/free must do NO retain/release on it — an erroneous RC op on
+// an unboxed scalar would crash or corrupt before the loop ends. sum_{i=1..30000}(i+2) =
+// 450015000 + 60000 = 450075000.
+val rcloop = (i: Int64, acc: Int64): Int64 =>
   if i == 0i64 then acc
   else
-    var m: { String: Int64 } = {}
-    m["x"] = i
-    m["y"] = i + 1i64
-    m["x"] = i + 2i64
-    val a = m["x"]
+    var ms: { String: Int64 } = {}
+    ms["x"] = i
+    ms["y"] = i + 1i64
+    ms["x"] = i + 2i64
+    val a = ms["x"]
     val n = match a
       is Int64 => a
       else => 0i64
-    loop(i - 1i64, acc + n)
+    rcloop(i - 1i64, acc + n)
+print(toString(rcloop(30000i64, 0i64)))
 
-print(toString(loop(30000i64, 0i64)))
+// literal: a non-empty flat-scalar map LITERAL checked against { String: Int64 } stores each
+// value unboxed (narrower literal widened to T) via the same path as `m[k]=v`.
+val ml: { String: Int64 } = { "a": 1, "b": 2, "c": 3 }
+print(toString(ml["a"]))
+print(toString(ml["c"]))
+print(toString(ml["z"]))
+print(toString(length(values(ml))))
 "#);
-    // Each iter contributes m["x"] = i + 2. sum_{i=1..30000}(i+2)
-    //   = (30000*30001/2) + 2*30000 = 450015000 + 60000 = 450075000
-    assert_eq!(output, vec!["450075000"]);
-}
-
-#[test]
-fn test_typed_map_flat_scalar_literal() {
-    // A non-empty flat-scalar map LITERAL `{ "a": 1, ... }` checked against a `{ String: Int64 }`
-    // context: each literal value is stored unboxed (and a narrower literal widened to T) via the
-    // same path as `m[k]=v`.
-    let output = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-import { values } from "std/object"
-import { length } from "std/array"
-
-val m: { String: Int64 } = { "a": 1, "b": 2, "c": 3 }
-print(toString(m["a"]))
-print(toString(m["c"]))
-print(toString(m["z"]))
-print(toString(length(values(m))))
-"#);
-    assert_eq!(output, vec!["1", "3", "null", "3"]);
+    assert_eq!(
+        output,
+        vec![
+            "111", "200", "null", "2", "2", "2", // unboxed
+            "499500",                             // numeric_width
+            "3.75",                               // float
+            "450075000",                          // rc_stress
+            "1", "3", "null", "3",                // literal
+        ]
+    );
 }
 
 #[test]
@@ -4173,7 +4195,7 @@ fn test_typed_map_nested() {
     // Regression: a NESTED typed map `{ String: { String: Int32 } }`. The inner write
     // `outer[k][k2] = v` and the chained read `outer[k][k2]` go through codegen's union/`T|Null`
     // string-key write + index paths (the inner `outer[k]` is `{ String: Int32 } | Null`, which is
-    // NOT spellable as an `is`-pattern to narrow — ADR-082 §5.1.1 — so it stays a union at the
+    // NOT spellable as an `is`-pattern to narrow — ADR-055 §5.1.1 — so it stays a union at the
     // store/read site). Before the fix those paths only dispatched TAG_OBJECT, so a TAG_MAP inner
     // container had its nested writes silently dropped (reads returned the default) — and at scale
     // the mistyped pointer became a misaligned-pointer crash. With the fix the writes land and read
@@ -4208,7 +4230,7 @@ run()
 
 #[test]
 fn test_typed_map_field_in_record() {
-    // Regression (ADR-082 §5.1.1): a `{ String: T }` typed map living as a FIELD of an enclosing
+    // Regression (ADR-055 §5.1.1): a `{ String: T }` typed map living as a FIELD of an enclosing
     // record. Before the fix, the directed object-checking path in `check_object_against` only
     // engaged when an expected field was a `StrLit` singleton, so a record like `Resp` with a
     // `headers: { String: String }` field (no StrLit field) fell back to undirected inference —
@@ -4286,20 +4308,6 @@ print(toString(loop(50000i64, 0i64)))
 "#);
     // sum_{i=1..50000} (i + 2) = (50000*50001/2) + 2*50000 = 1250025000 + 100000 = 1250125000
     assert_eq!(output, vec!["1250125000"]);
-}
-
-#[test]
-fn test_object_spread_null_noop() {
-    // Spreading null contributes no fields (it is not a runtime error).
-    let output = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-import { keys } from "std/object"
-
-val merged = { ...null, "a": 1 }
-print(toString(merged["a"]))
-print(toString(keys(merged)))
-"#);
-    assert_eq!(output, vec!["1", "[\"a\"]"]);
 }
 
 #[test]
@@ -4387,7 +4395,7 @@ print(toString(result))
 
 #[test]
 fn test_await_result_must_handle_error() {
-    // §24.2.2 enforcement (ADR-070): await yields `T | Error`, so assigning it to a bare
+    // §24.2.2 enforcement (ADR-045): await yields `T | Error`, so assigning it to a bare
     // binding that does not handle the Error case is a compile-time type error. The diagnostic
     // names the union vs. the bare target. (Goes through the full `build` pipeline because the
     // standalone `check` subcommand does not resolve imports.)
@@ -4818,7 +4826,7 @@ print(toString(length(get(box))))
 
 #[test]
 fn test_shared_rejects_non_accessor_op() {
-    // ADR-044: Shared<T> is accessor-only. Passing a Shared value to a non-accessor (here
+    // ADR-029: Shared<T> is accessor-only. Passing a Shared value to a non-accessor (here
     // `push`, which wants an array/Json) is a compile-time type error — the Shared box never
     // auto-unwraps to its inner type or to Json.
     let err = run_expect_err(r#"import { print } from "std/io"
@@ -5505,7 +5513,7 @@ print(readFile("{o2}"))
 }
 
 // Stage 8 (streams): a fault inside a transform on a `.promise()` worker is caught at the async
-// boundary and surfaces as an `Error` at `await` (ADR-070 / §32.2.2), NOT a crash.
+// boundary and surfaces as an `Error` at `await` (ADR-045 / §32.2.2), NOT a crash.
 #[test]
 fn test_stream_promise_fault_isolation() {
     let tmp = std::env::temp_dir().join(format!("lin_ctest_pf_{}.txt", std::process::id()));
@@ -6495,7 +6503,7 @@ val basePath =
 fn test_if_else_wrapped_inside_parens_parses_and_round_trips() {
     // Regression (LIN_ISSUES #7): a WRAPPED (multi-line) `if/else` as the RHS of a `val`
     // INSIDE a parenthesised closure body (`.for(... => …)`) used to fail with
-    // `unexpected token Else`. ADR-004 suppresses Indent/Dedent inside `()`, so the branch
+    // `unexpected token Else`. ADR-003 suppresses Indent/Dedent inside `()`, so the branch
     // offside floor must anchor on the indentation of the LINE the `if` sits on, not on the
     // `if` keyword's (far-right) column — else the then-branch collapses to empty and the
     // newline `else` is orphaned. The one-line form always parsed; only the wrapped form broke.
@@ -6605,7 +6613,7 @@ fn test_fmt_preserves_postfix_base_parens() {
     assert_eq!(fmt("val b = (x + y)[0]\n").trim(), "val b = (x + y)[0]");
     assert_eq!(fmt("val c = (f + g)(3)\n").trim(), "val c = (f + g)(3)");
     // Atomic / chain bases keep NO parens. (Lambda params are always parenthesised for
-    // round-trip safety — ADR-007 / d6e7bdb.)
+    // round-trip safety — ADR-006 / d6e7bdb.)
     assert_eq!(fmt("val d = arr.map(x => x).length()\n").trim(), "val d = arr.map(x => x).length()");
 }
 
@@ -7156,7 +7164,7 @@ fn test_fmt_rule3_parser_rejects_trailing_commas() {
     let obj = parse_diagnostics("val o = { \"a\": 1, }\n");
     assert!(obj.iter().any(|m| m.contains("trailing comma is not allowed in object")),
         "object trailing comma not rejected: {:?}", obj);
-    // A function call `f(x,)` (partial application, ADR-041) is STILL accepted.
+    // A function call `f(x,)` (partial application, ADR-026) is STILL accepted.
     let call = parse_diagnostics("val g = f(x,)\n");
     assert!(call.is_empty(), "f(x,) partial application must stay valid: {:?}", call);
     // Non-trailing commas are fine.
@@ -7946,7 +7954,7 @@ print(toString(hi["w"]))
 
 #[test]
 fn test_generic_combinator_pipeline_inlined() {
-    // ADR-069: generic map/filter/reduce + the capture-less-lambda inliner. The monomorphic scalar
+    // ADR-044: generic map/filter/reduce + the capture-less-lambda inliner. The monomorphic scalar
     // pipeline `range(0,n).map(x=>x*2).filter(x=>x%3==0).reduce(0,(a,x)=>a+x)` lowers to a fully
     // unboxed flat loop (verified separately: zero per-element box/unbox in `main`). Here we assert
     // the VALUE is correct over a small n so a representation/RC bug in the inliner shows up.
@@ -7962,7 +7970,7 @@ print(toString(total))
 
 #[test]
 fn test_generic_combinator_inline_vs_closure_paths() {
-    // ADR-069: the inliner fires ONLY for a capture-less literal lambda; a capturing lambda and a
+    // ADR-044: the inliner fires ONLY for a capture-less literal lambda; a capturing lambda and a
     // stored/passed `Function` value must keep the (correct, boxed) closure path. Also exercises the
     // tagged String element path and a non-scalar (array) reduce accumulator (the boxed Json-phi
     // path). All four must produce the right values.
@@ -8209,7 +8217,7 @@ print(prepend(ss, "z")[0])           // z
     );
 }
 
-// Generic push/append/prepend are `<T>(arr: T[], item: T)` (ADR-085), so the element type is
+// Generic push/append/prepend are `<T>(arr: T[], item: T)` (ADR-059), so the element type is
 // enforced — closing the prior soundness hole where a `Json` `push` accepted any item. Pushing a
 // String into an Int32[] is now a COMPILE ERROR.
 #[test]
@@ -8391,10 +8399,10 @@ print(toString(length(strs)))
 
 #[test]
 fn test_group_by_even_odd_and_empty() {
-    // groupBy now returns a typed index-signature map `{ String: T[] }` (ADR-082): ONE hash lookup
+    // groupBy now returns a typed index-signature map `{ String: T[] }` (ADR-055): ONE hash lookup
     // per item (lin_object_get_or_insert_array, tag-aware over LinMap) + push. Grouping by even/odd
     // splits correctly. The map itself stringifies as `[object]` (TAG_MAP has no structural
-    // toString yet — an ADR-082 follow-up); the per-key array values print normally.
+    // toString yet — an ADR-055 follow-up); the per-key array values print normally.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { groupBy } from "std/array"
@@ -9407,202 +9415,141 @@ val sch = { "host": { "type": "string" }, "port": { "type": "number" } }
 }
 
 // ---------------------------------------------------------------------------
-// fromJson type-directed decode (ADR-047)
+// fromJson type-directed decode (ADR-031)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_from_json_object_success() {
+fn test_from_json_decoding() {
+    // Consolidated `fromJson` decoder behaviours. These were 15 separate one-build tests; each
+    // compiles+links the whole stdlib, so they are merged into a single program — one build,
+    // every original assertion preserved in order (one labelled output line per former test).
+    // Shapes that were identical across the originals share the `Person = {name,age}` type;
+    // distinct shapes keep their own named type. The match/`is`-arm idiom keeps its own test
+    // below (different program shape + a non-deterministic message assertion).
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
 type Person = { "name": String, "age": Int32 }
-val p = Person.fromJson({ "name": "Bob", "age": 30 })
-print(if p["type"] == "error" then "ERR" else "${p["name"]} ${p["age"]}")
-"#);
-    assert_eq!(out, vec!["Bob 30"]);
-}
-
-#[test]
-fn test_from_json_direct_call_form() {
-    // fromJson(T, j) equals T.fromJson(j).
-    let out = run(r#"import { print } from "std/io"
-import { fromJson } from "std/json"
-type Person = { "name": String, "age": Int32 }
-val p = fromJson(Person, { "name": "Zoe", "age": 9 })
-print(if p["type"] == "error" then "ERR" else "${p["name"]} ${p["age"]}")
-"#);
-    assert_eq!(out, vec!["Zoe 9"]);
-}
-
-#[test]
-fn test_from_json_missing_required_field() {
-    let out = run(r#"import { print } from "std/io"
-import { fromJson } from "std/json"
-type Person = { "name": String, "age": Int32 }
-val p = Person.fromJson({ "name": "Bob" })
-print(if p["type"] == "error" then "ERR" else "OK")
-"#);
-    assert_eq!(out, vec!["ERR"]);
-}
-
-#[test]
-fn test_from_json_missing_nullable_field_ok() {
-    let out = run(r#"import { print } from "std/io"
-import { fromJson } from "std/json"
 type Opt = { "name": String, "nick": String | Null }
-val p = Opt.fromJson({ "name": "Bob" })
-print(if p["type"] == "error" then "ERR" else "OK ${p["name"]}")
-"#);
-    assert_eq!(out, vec!["OK Bob"]);
-}
-
-#[test]
-fn test_from_json_extra_field_ignored() {
-    let out = run(r#"import { print } from "std/io"
-import { fromJson } from "std/json"
-type Person = { "name": String, "age": Int32 }
-val p = Person.fromJson({ "name": "Bob", "age": 30, "extra": true })
-print(if p["type"] == "error" then "ERR" else "OK ${p["name"]}")
-"#);
-    assert_eq!(out, vec!["OK Bob"]);
-}
-
-#[test]
-fn test_from_json_wrong_type() {
-    let out = run(r#"import { print } from "std/io"
-import { fromJson } from "std/json"
-type Person = { "name": String, "age": Int32 }
-val p = Person.fromJson({ "name": "Bob", "age": "x" })
-print(if p["type"] == "error" then "ERR ${p["path"]}" else "OK")
-"#);
-    assert_eq!(out, vec!["ERR $.age"]);
-}
-
-#[test]
-fn test_from_json_int_range_reject() {
-    // `3.14` is non-integral; `5000000000.0` is integral but exceeds Int32's range. (A bare
-    // suffixless integer literal like 5000000000 is truncated to Int32 by the lexer before it
-    // ever reaches the decoder — spec §21 — so the overflow case is expressed as a float.)
-    let out = run(r#"import { print } from "std/io"
-import { fromJson } from "std/json"
-type T = { "n": Int32 }
-val a = T.fromJson({ "n": 3.14 })
-val b = T.fromJson({ "n": 5000000000.0 })
-print(if a["type"] == "error" then "a ERR" else "a OK")
-print(if b["type"] == "error" then "b ERR" else "b OK")
-"#);
-    assert_eq!(out, vec!["a ERR", "b ERR"]);
-}
-
-#[test]
-fn test_from_json_float_accepts_int() {
-    let out = run(r#"import { print } from "std/io"
-import { fromJson } from "std/json"
-type T = Float64
-val x = T.fromJson(5)
-print(if x["type"] == "error" then "ERR" else "OK ${x}")
-"#);
-    assert_eq!(out, vec!["OK 5"]);
-}
-
-#[test]
-fn test_from_json_nested_object() {
-    let out = run(r#"import { print } from "std/io"
-import { fromJson } from "std/json"
+type IntBox = { "n": Int32 }
+type FloatT = Float64
 type Addr = { "city": String }
-type Person = { "name": String, "address": Addr }
-val ok = Person.fromJson({ "name": "A", "address": { "city": "NYC" } })
-val bad = Person.fromJson({ "name": "A", "address": { "city": 5 } })
-print(if ok["type"] == "error" then "ERR" else "OK ${ok["address"]["city"]}")
-print(if bad["type"] == "error" then "ERR ${bad["path"]}" else "OK")
-"#);
-    assert_eq!(out, vec!["OK NYC", "ERR $.address.city"]);
-}
-
-#[test]
-fn test_from_json_array() {
-    let out = run(r#"import { print } from "std/io"
-import { fromJson } from "std/json"
-type T = Int32[]
-val bad = T.fromJson([1, 2, "x"])
-print(if bad["type"] == "error" then "ERR ${bad["path"]}" else "OK")
-"#);
-    assert_eq!(out, vec!["ERR $[2]"]);
-}
-
-#[test]
-fn test_from_json_fixed_array() {
-    let out = run(r#"import { print } from "std/io"
-import { fromJson } from "std/json"
+type NestedPerson = { "name": String, "address": Addr }
+type IntArr = Int32[]
 type Pair = [String, Int32]
-val ok = Pair.fromJson(["a", 7])
-val wrong_len = Pair.fromJson(["a", 7, 9])
-print(if ok["type"] == "error" then "ERR" else "OK ${ok[0]} ${ok[1]}")
-print(if wrong_len["type"] == "error" then "LEN_ERR" else "OK")
-"#);
-    assert_eq!(out, vec!["OK a 7", "LEN_ERR"]);
-}
-
-#[test]
-fn test_from_json_union_variant() {
-    // First structurally-matching variant wins (ADR-047).
-    let out = run(r#"import { print } from "std/io"
-import { fromJson } from "std/json"
 type Shape = { "k": String, "r": Float64 } | { "k": String, "w": Int32 }
-val ok = Shape.fromJson({ "k": "circle", "r": 1.5 })
-val none = Shape.fromJson({ "k": "x", "z": 9 })
-print(if ok["type"] == "error" then "ERR" else "OK ${ok["k"]}")
-print(if none["type"] == "error" then "NONE" else "OK")
-"#);
-    assert_eq!(out, vec!["OK circle", "NONE"]);
-}
-
-#[test]
-fn test_from_json_recursive_type() {
-    // Exercises the descriptor back-edge: a recursive type must terminate.
-    let out = run(r#"import { print } from "std/io"
-import { fromJson } from "std/json"
 type Tree = { "value": Int32, "children": Tree[] }
-val ok = Tree.fromJson({ "value": 1, "children": [{ "value": 2, "children": [] }] })
-val bad = Tree.fromJson({ "value": 1, "children": [{ "value": "x", "children": [] }] })
-print(if ok["type"] == "error" then "ERR" else "OK ${ok["children"][0]["value"]}")
-print(if bad["type"] == "error" then "ERR ${bad["path"]}" else "OK")
-"#);
-    assert_eq!(out, vec!["OK 2", "ERR $.children[0].value"]);
-}
 
-#[test]
-fn test_from_json_error_value_shape() {
-    // A decode Error carries type/message/path.
-    let out = run(r#"import { print } from "std/io"
-import { fromJson } from "std/json"
-type Person = { "name": String, "age": Int32 }
-val e = Person.fromJson({ "name": "Bob", "age": "x" })
-print("${e["type"]}")
-print(if e["message"] == null then "NO_MSG" else "HAS_MSG")
-print("${e["path"]}")
-"#);
-    assert_eq!(out, vec!["error", "HAS_MSG", "$.age"]);
-}
+// object_success
+val obj = Person.fromJson({ "name": "Bob", "age": 30 })
+print(if obj["type"] == "error" then "ERR" else "${obj["name"]} ${obj["age"]}")
 
-#[test]
-fn test_from_json_is_error_discriminates() {
-    // `is Error` (ADR-047) distinguishes a decode FAILURE from a successfully-decoded value:
-    // the Error object carries `"type": "error"`, a decoded Person does not. `is Error`
-    // desugars to the value-constrained object pattern `{ "type": "error", .. }`.
-    let out = run(r#"import { print } from "std/io"
-import { fromJson } from "std/json"
-type Person = { "name": String, "age": Int32 }
+// direct_call_form: fromJson(T, j) equals T.fromJson(j)
+val direct = fromJson(Person, { "name": "Zoe", "age": 9 })
+print(if direct["type"] == "error" then "ERR" else "${direct["name"]} ${direct["age"]}")
+
+// missing_required_field
+val missing = Person.fromJson({ "name": "Bob" })
+print(if missing["type"] == "error" then "ERR" else "OK")
+
+// missing_nullable_field_ok
+val nullable = Opt.fromJson({ "name": "Bob" })
+print(if nullable["type"] == "error" then "ERR" else "OK ${nullable["name"]}")
+
+// extra_field_ignored
+val extra = Person.fromJson({ "name": "Bob", "age": 30, "extra": true })
+print(if extra["type"] == "error" then "ERR" else "OK ${extra["name"]}")
+
+// wrong_type
+val wrong = Person.fromJson({ "name": "Bob", "age": "x" })
+print(if wrong["type"] == "error" then "ERR ${wrong["path"]}" else "OK")
+
+// int_range_reject: `3.14` is non-integral; `5000000000.0` is integral but exceeds Int32's
+// range. (A bare suffixless integer literal like 5000000000 is truncated to Int32 by the lexer
+// before it ever reaches the decoder — spec §21 — so the overflow case is expressed as a float.)
+val rangeA = IntBox.fromJson({ "n": 3.14 })
+val rangeB = IntBox.fromJson({ "n": 5000000000.0 })
+print(if rangeA["type"] == "error" then "a ERR" else "a OK")
+print(if rangeB["type"] == "error" then "b ERR" else "b OK")
+
+// float_accepts_int
+val flt = FloatT.fromJson(5)
+print(if flt["type"] == "error" then "ERR" else "OK ${flt}")
+
+// nested_object
+val nestedOk = NestedPerson.fromJson({ "name": "A", "address": { "city": "NYC" } })
+val nestedBad = NestedPerson.fromJson({ "name": "A", "address": { "city": 5 } })
+print(if nestedOk["type"] == "error" then "ERR" else "OK ${nestedOk["address"]["city"]}")
+print(if nestedBad["type"] == "error" then "ERR ${nestedBad["path"]}" else "OK")
+
+// array
+val arrBad = IntArr.fromJson([1, 2, "x"])
+print(if arrBad["type"] == "error" then "ERR ${arrBad["path"]}" else "OK")
+
+// fixed_array
+val pairOk = Pair.fromJson(["a", 7])
+val pairLen = Pair.fromJson(["a", 7, 9])
+print(if pairOk["type"] == "error" then "ERR" else "OK ${pairOk[0]} ${pairOk[1]}")
+print(if pairLen["type"] == "error" then "LEN_ERR" else "OK")
+
+// union_variant: first structurally-matching variant wins (ADR-031)
+val unionOk = Shape.fromJson({ "k": "circle", "r": 1.5 })
+val unionNone = Shape.fromJson({ "k": "x", "z": 9 })
+print(if unionOk["type"] == "error" then "ERR" else "OK ${unionOk["k"]}")
+print(if unionNone["type"] == "error" then "NONE" else "OK")
+
+// recursive_type: exercises the descriptor back-edge: a recursive type must terminate
+val treeOk = Tree.fromJson({ "value": 1, "children": [{ "value": 2, "children": [] }] })
+val treeBad = Tree.fromJson({ "value": 1, "children": [{ "value": "x", "children": [] }] })
+print(if treeOk["type"] == "error" then "ERR" else "OK ${treeOk["children"][0]["value"]}")
+print(if treeBad["type"] == "error" then "ERR ${treeBad["path"]}" else "OK")
+
+// error_value_shape: a decode Error carries type/message/path
+val errVal = Person.fromJson({ "name": "Bob", "age": "x" })
+print("${errVal["type"]}")
+print(if errVal["message"] == null then "NO_MSG" else "HAS_MSG")
+print("${errVal["path"]}")
+
+// is_error_discriminates: `is Error` (ADR-031) distinguishes a decode FAILURE from a
+// successfully-decoded value: the Error object carries `"type": "error"`, a decoded Person does
+// not. `is Error` desugars to the value-constrained object pattern `{ "type": "error", .. }`.
 val good = Person.fromJson({ "name": "Ada", "age": 36 })
 val bad = Person.fromJson({ "name": "Bob", "age": "old" })
 print(if good is Error then "good:ERR" else "good:OK")
 print(if bad is Error then "bad:ERR" else "bad:OK")
 "#);
-    assert_eq!(out, vec!["good:OK", "bad:ERR"]);
+    assert_eq!(
+        out,
+        vec![
+            "Bob 30",              // object_success
+            "Zoe 9",               // direct_call_form
+            "ERR",                 // missing_required_field
+            "OK Bob",              // missing_nullable_field_ok
+            "OK Bob",              // extra_field_ignored
+            "ERR $.age",           // wrong_type
+            "a ERR",               // int_range_reject (non-integral)
+            "b ERR",               // int_range_reject (overflow)
+            "OK 5",                // float_accepts_int
+            "OK NYC",              // nested_object (ok)
+            "ERR $.address.city",  // nested_object (bad)
+            "ERR $[2]",            // array
+            "OK a 7",              // fixed_array (ok)
+            "LEN_ERR",             // fixed_array (wrong length)
+            "OK circle",           // union_variant (ok)
+            "NONE",                // union_variant (no match)
+            "OK 2",                // recursive_type (ok)
+            "ERR $.children[0].value", // recursive_type (bad)
+            "error",               // error_value_shape (type)
+            "HAS_MSG",             // error_value_shape (message)
+            "$.age",               // error_value_shape (path)
+            "good:OK",             // is_error_discriminates (good)
+            "bad:ERR",             // is_error_discriminates (bad)
+        ]
+    );
 }
 
 #[test]
 fn test_from_json_match_is_error_idiom() {
-    // The idiom `match result | is Error => .. | is Person => ..`. As of ADR-054 the arm order
+    // The idiom `match result | is Error => .. | is Person => ..`. As of ADR-036 the arm order
     // is no longer load-bearing (`is Person` checks required fields, so it does not match the
     // Error object), but the Error-first form remains valid. Exhaustiveness accepts `is Error`
     // as covering the Error variant of `Person | Error`.
@@ -9623,12 +9570,12 @@ main()
     assert!(out[1].starts_with("err:"), "expected decode error, got {}", out[1]);
 }
 
-// Cast-hole closing (ADR-046): Json -> concrete structured object is now a type error.
+// Cast-hole closing (ADR-045): Json -> concrete structured object is now a type error.
 
 #[test]
 fn test_json_to_concrete_now_errors() {
     // The TWO-STEP form: a Json-typed identifier assigned to a structured concrete object is a
-    // type error (ADR-046). NOTE: this form already worked before the headline fix — see
+    // type error (ADR-045). NOTE: this form already worked before the headline fix — see
     // test_json_call_result_to_concrete_now_errors for the real call-result hazard.
     let err = run_expect_err(r#"type Person = { "name": String, "age": Int32 }
 val j: Json = { "name": "Bob", "age": 30 }
@@ -9643,7 +9590,7 @@ val p: Person = j
 
 #[test]
 fn test_json_call_result_to_concrete_now_errors() {
-    // HEADLINE case (ADR-046): the RHS is a *call* whose return type is Json (here the stdlib
+    // HEADLINE case (ADR-045): the RHS is a *call* whose return type is Json (here the stdlib
     // `readJson`), assigned to a structured concrete object. This must be a type error. Before
     // the fix this type-checked clean because the bidirectional `val` path propagated the
     // expected concrete type down and a zero/Json-param function was misclassified as opaque,
@@ -9677,7 +9624,7 @@ val p: Person = getJson()
 
 #[test]
 fn test_json_arg_to_concrete_param_errors() {
-    // Passing a Json value into a concrete structured-object parameter is rejected (ADR-046).
+    // Passing a Json value into a concrete structured-object parameter is rejected (ADR-045).
     let err = run_expect_err(r#"type Person = { "name": String, "age": Int32 }
 val greet = (p: Person): String => p["name"]
 val j: Json = { "name": "Bob", "age": 30 }
@@ -9719,64 +9666,41 @@ print(pick(42))
 // "Function body has type Int32 | Null, declared return type is Int32".
 
 #[test]
-fn test_null_narrow_if_eq_null_else() {
-    // (a) `if v == null then 0 else v` — Null excluded in ELSE → v narrows to Int32 there.
+fn test_null_narrow_guard_forms() {
+    // Consolidated `T | Null` complement narrowing on a null-test guard (4 former one-build tests
+    // → one program). Each form excludes Null in the branch a function declared `: Int32` returns
+    // from; before the change all four FAILED to type-check ("body has type Int32 | Null").
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
-val f = (v: Int32 | Null): Int32 =>
+// (a) `if v == null then 0 else v` — Null excluded in ELSE.
+val eqElse = (v: Int32 | Null): Int32 =>
   if v == null then 0 else v
-print(f(7).toString())
-print(f(null).toString())
-"#);
-    assert_eq!(out, vec!["7", "0"]);
-}
-
-#[test]
-fn test_null_narrow_if_is_null_else() {
-    // (b) `if v is Null then 0 else v` — Null excluded in ELSE → v narrows to Int32 there.
-    let out = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-val f = (v: Int32 | Null): Int32 =>
+// (b) `if v is Null then 0 else v` — Null excluded in ELSE.
+val isElse = (v: Int32 | Null): Int32 =>
   if v is Null then 0 else v
-print(f(7).toString())
-print(f(null).toString())
-"#);
-    assert_eq!(out, vec!["7", "0"]);
-}
-
-#[test]
-fn test_null_narrow_match_is_null_else() {
-    // (c) `match v / is Null => 0 / else => v` — the else arm (reached only when Null was already
-    // matched by the prior `is Null` arm) narrows v to Int32.
-    let out = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-val f = (v: Int32 | Null): Int32 =>
+// (c) `match v / is Null => 0 / else => v` — else arm narrows v to Int32.
+val matchElse = (v: Int32 | Null): Int32 =>
   match v
     is Null => 0
     else => v
-print(f(7).toString())
-print(f(null).toString())
-"#);
-    assert_eq!(out, vec!["7", "0"]);
-}
-
-#[test]
-fn test_null_narrow_if_neq_null_then() {
-    // (d) `if v != null then v else 0` — the POSITIVE guard: Null excluded in THEN → v narrows to
-    // Int32 in the then-branch.
-    let out = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-val f = (v: Int32 | Null): Int32 =>
+// (d) `if v != null then v else 0` — POSITIVE guard: Null excluded in THEN.
+val neqThen = (v: Int32 | Null): Int32 =>
   if v != null then v else 0
-print(f(7).toString())
-print(f(null).toString())
+print(eqElse(7).toString())
+print(eqElse(null).toString())
+print(isElse(7).toString())
+print(isElse(null).toString())
+print(matchElse(7).toString())
+print(matchElse(null).toString())
+print(neqThen(7).toString())
+print(neqThen(null).toString())
 "#);
-    assert_eq!(out, vec!["7", "0"]);
+    assert_eq!(out, vec!["7", "0", "7", "0", "7", "0", "7", "0"]);
 }
 
 #[test]
 fn test_null_narrow_json_map_read() {
-    // The motivating case (ADR-082): reading a `{ String: Int32 }` value yields `Int32 | Null`;
+    // The motivating case (ADR-055): reading a `{ String: Int32 }` value yields `Int32 | Null`;
     // binding it and null-testing narrows it to Int32 in the non-null branch. Covers all four
     // forms over a real index-signature map read (present key + missing key).
     let out = run(r#"import { print } from "std/io"
@@ -9825,55 +9749,37 @@ print(describe(null))
 // the branch that excluded it (not just `is Null`). The motivating category is `T | Error`. ──
 
 #[test]
-fn test_complement_narrow_match_error_else() {
-    // The motivating case (fails on master with
-    // "Function body has type String | { ... }, declared return type is String"):
-    // `match r / is Error => fallback / else => r` narrows the else arm to bare `String`,
-    // even though `Error` is the STRUCTURAL alias `{ "type": String, "message": String }`,
-    // not a named union member.
+fn test_complement_narrow_forms() {
+    // Consolidated generalized complement narrowing (5 former one-build tests → one program; each
+    // case keeps a uniquely-named function and its assertions in order). ANY guard-free `is X` arm
+    // subtracts `X` from the union in the branch that excluded it (not just `is Null`).
     let out = run(r#"import { print } from "std/io"
-val unwrap = (r: String | Error): String =>
+import { toString } from "std/string"
+
+// match_error_else: `match r / is Error => fallback / else => r` narrows the else arm to bare
+// `String`, even though `Error` is the STRUCTURAL alias { "type", "message" }, not a named member.
+val unwrapMatch = (r: String | Error): String =>
   match r
     is Error => "fallback"
     else => r
-print(unwrap("hello"))
-print(unwrap({ "type": "error", "message": "boom" }))
-"#);
-    assert_eq!(out, vec!["hello", "fallback"]);
-}
+print(unwrapMatch("hello"))
+print(unwrapMatch({ "type": "error", "message": "boom" }))
 
-#[test]
-fn test_complement_narrow_if_error_else() {
-    // If-form of the Error case: `if r is Error then fallback else r` narrows the else branch
-    // (Error excluded) to `String`.
-    let out = run(r#"import { print } from "std/io"
-val unwrap = (r: String | Error): String =>
+// if_error_else: if-form of the Error case narrows the else branch (Error excluded) to `String`.
+val unwrapIf = (r: String | Error): String =>
   if r is Error then "fallback" else r
-print(unwrap("hi"))
-print(unwrap({ "type": "error", "message": "bad" }))
-"#);
-    assert_eq!(out, vec!["hi", "fallback"]);
-}
+print(unwrapIf("hi"))
+print(unwrapIf({ "type": "error", "message": "bad" }))
 
-#[test]
-fn test_complement_narrow_match_nonerror_member() {
-    // Non-Error union: `Int32 | String` minus the `is Int32` arm = `String` in the else arm.
-    let out = run(r#"import { print } from "std/io"
+// match_nonerror_member: `Int32 | String` minus the `is Int32` arm = `String` in the else arm.
 val pickStr = (v: Int32 | String): String =>
   match v
     is Int32 => "was int"
     else => v
 print(pickStr(42))
 print(pickStr("plain"))
-"#);
-    assert_eq!(out, vec!["was int", "plain"]);
-}
 
-#[test]
-fn test_complement_narrow_three_member_minus_two() {
-    // `A | B | C` minus B (and minus C) = the remaining member. Two guard-free `is` arms before
-    // the `else` subtract BOTH their tested types, leaving the else arm typed `String`.
-    let out = run(r#"import { print } from "std/io"
+// three_member_minus_two: two guard-free `is` arms subtract BOTH tested types, leaving `String`.
 val classify = (v: Int32 | String | Boolean): String =>
   match v
     is Boolean => "bool"
@@ -9882,32 +9788,34 @@ val classify = (v: Int32 | String | Boolean): String =>
 print(classify(true))
 print(classify(7))
 print(classify("hi"))
-"#);
-    assert_eq!(out, vec!["bool", "int", "hi"]);
-}
 
-#[test]
-fn test_complement_narrow_guard_does_not_exclude() {
-    // SOUNDNESS: a `when`-guarded `is` arm does NOT guarantee exclusion, so it must NOT contribute
-    // to the complement. The ONLY arm testing `Int32` here is guarded, so the `else` arm can still
-    // be reached with an `Int32` (when the guard is false) — it must therefore STAY typed
-    // `Int32 | String`, NOT narrow to `String`. We prove this by declaring the function's return as
-    // `Int32 | String` and letting the unnarrowed `Int32` value flow straight through `else`.
-    let out = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-val f = (v: Int32 | String): Int32 | String =>
+// guard_does_not_exclude (SOUNDNESS): a `when`-guarded `is` arm does NOT guarantee exclusion, so
+// it must NOT contribute to the complement. The only Int32-testing arm here is guarded, so the
+// `else` can still be reached with an Int32 (guard false) — it must STAY `Int32 | String`, NOT
+// narrow to `String`. Proven by declaring the return `Int32 | String` and flowing an unnarrowed
+// Int32 through `else`.
+val guarded = (v: Int32 | String): Int32 | String =>
   match v
     is Int32 when v > 100 => "big"
     else => v
-print(f(5).toString())
-print(f("hi").toString())
+print(guarded(5).toString())
+print(guarded("hi").toString())
 "#);
-    assert_eq!(out, vec!["5", "hi"]);
+    assert_eq!(
+        out,
+        vec![
+            "hello", "fallback",  // match_error_else
+            "hi", "fallback",     // if_error_else
+            "was int", "plain",   // match_nonerror_member
+            "bool", "int", "hi",  // three_member_minus_two
+            "5", "hi",            // guard_does_not_exclude
+        ]
+    );
 }
 
 #[test]
 fn test_is_objecttype_expr_checks_required_fields() {
-    // Regression (ADR-054): the EXPRESSION form `x is Person` must check that the object has
+    // Regression (ADR-036): the EXPRESSION form `x is Person` must check that the object has
     // Person's required fields, not just that it is some object (bare TAG_OBJECT). Previously a
     // non-Person object matched, then the narrowed `x["name"]` faulted/returned null.
     let out = run(r#"import { print } from "std/io"
@@ -9924,8 +9832,8 @@ print(if other is Person then "other:yes" else "other:no")
 
 #[test]
 fn test_is_person_first_arm_no_longer_faults() {
-    // Regression (ADR-054): with required-field checking, `is Person` as the FIRST arm no longer
-    // swallows a decode-error object — the ADR-049 ordering footgun is gone. A decode failure
+    // Regression (ADR-036): with required-field checking, `is Person` as the FIRST arm no longer
+    // swallows a decode-error object — the ADR-033 ordering footgun is gone. A decode failure
     // (which lacks name/age) falls through to the Error arm instead of faulting on r["name"].
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
@@ -9942,11 +9850,11 @@ main()
     assert_eq!(out, vec!["ok:Ada", "err"]);
 }
 
-// ── `is <ObjectType>` deep type validation (ADR-054) ──────────────────────────
+// ── `is <ObjectType>` deep type validation (ADR-036) ──────────────────────────
 
 #[test]
 fn test_is_objecttype_deep_rejects_wrong_field_type() {
-    // ADR-054: `is Person` deep-validates field TYPES, not just presence. A Json value
+    // ADR-036: `is Person` deep-validates field TYPES, not just presence. A Json value
     // whose `age` is a string (both keys present, WRONG type) must NOT match Person, so the arm
     // falls through to `else` instead of narrowing and operating on the wrong runtime type.
     let out = run(r#"import { print } from "std/io"
@@ -9966,7 +9874,7 @@ main()
 
 #[test]
 fn test_is_objecttype_deep_nested() {
-    // ADR-053: deep validation recurses into NESTED object fields. A wrong type in a nested field
+    // ADR-035: deep validation recurses into NESTED object fields. A wrong type in a nested field
     // (zip as a string) is rejected; a correct nested value matches.
     let out = run(r#"import { print } from "std/io"
 type T = { "addr": { "zip": Int32 } }
@@ -9985,9 +9893,9 @@ main()
 
 #[test]
 fn test_is_objecttype_deep_accepts_valid_and_narrows() {
-    // ADR-053: a fully well-typed value matches AND the narrowed field access is sound — `v["age"]`
+    // ADR-035: a fully well-typed value matches AND the narrowed field access is sound — `v["age"]`
     // is a real Int32, so `v["age"] + 1` produces a correct number (the unsoundness the earlier
-    // presence-only rule left open, now folded into ADR-054, is closed).
+    // presence-only rule left open, now folded into ADR-036, is closed).
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 type Person = { "name": String, "age": Int32 }
@@ -10003,7 +9911,7 @@ main()
 
 #[test]
 fn test_is_objecttype_deep_number_policy() {
-    // ADR-053 inherits fromJson's number policy: a non-integral number fails an Int target;
+    // ADR-035 inherits fromJson's number policy: a non-integral number fails an Int target;
     // an integral float (5.0) satisfies it.
     let out = run(r#"import { print } from "std/io"
 type N = { "n": Int32 }
@@ -10022,7 +9930,7 @@ main()
 
 #[test]
 fn test_is_error_still_discriminates_after_deep() {
-    // ADR-053 regression: `is Error` (a value-constrained object pattern, NOT TypeCheckDeep) is
+    // ADR-035 regression: `is Error` (a value-constrained object pattern, NOT TypeCheckDeep) is
     // untouched and still discriminates a decode failure from a decoded value, in either arm order.
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
@@ -10039,7 +9947,7 @@ main()
     assert_eq!(out, vec!["ok:Ada", "err"]);
 }
 
-// ── singleton string-literal types (ADR-051) ──────────────────────────────────
+// ── singleton string-literal types (ADR-034) ──────────────────────────────────
 
 #[test]
 fn test_literal_type_good_assignment() {
@@ -10085,7 +9993,7 @@ print("x")
 
 #[test]
 fn test_literal_assignable_to_string() {
-    // A literal-typed value widens to String (ADR-053 rule 2).
+    // A literal-typed value widens to String (ADR-035 rule 2).
     let out = run(r#"import { print } from "std/io"
 type Tag = "ok"
 val t: Tag = "ok"
@@ -10241,7 +10149,7 @@ print("${b["value"]} ${o["x"]}")
 
 #[test]
 fn test_from_json_strlit_discriminates_union() {
-    // ADR-049: fromJson validates the exact literal value of a StrLit field, so a tagged-union
+    // ADR-033: fromJson validates the exact literal value of a StrLit field, so a tagged-union
     // decode discriminates by the discriminant tag. Correct tags decode to the right variant;
     // first-match-wins probes each variant's KIND_STRLIT check.
     let out = run(r#"import { print } from "std/io"
@@ -10262,7 +10170,7 @@ print(show({ "type": "failure", "error": "boom" }))
 
 #[test]
 fn test_from_json_strlit_rejects_wrong_tag() {
-    // ADR-049: a wrong discriminant value is a decode error (was a silent mis-decode under the
+    // ADR-033: a wrong discriminant value is a decode error (was a silent mis-decode under the
     // old KIND_STRING placeholder), with a path-located message.
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
@@ -10279,7 +10187,7 @@ match r
 
 #[test]
 fn test_from_json_plain_string_field_accepts_any() {
-    // ADR-049 (KIND_STRLIT) must NOT regress plain String fields: they still encode as KIND_STRING and accept
+    // ADR-033 (KIND_STRLIT) must NOT regress plain String fields: they still encode as KIND_STRING and accept
     // any string value (only StrLit fields are value-checked).
     let out = run(r#"import { print } from "std/io"
 import { fromJson } from "std/json"
@@ -11316,7 +11224,7 @@ print(toString(r.reduce(0, (acc, x) => acc + x)))
 
 #[test]
 fn test_stdlib_generic_accessors_at_set_indexof() {
-    // ADR-067: stdlib `at`/`set`/`indexOf` carry generic `<T>(T[], …)` signatures. They must stay
+    // ADR-044: stdlib `at`/`set`/`indexOf` carry generic `<T>(T[], …)` signatures. They must stay
     // representation-consistent and correct on both a flat concrete-scalar `Int32[]` and a tagged
     // `String[]`, including negative-index wrap and the in-place `set` round-trip.
     let out = run(r#"import { print } from "std/io"
@@ -11357,7 +11265,7 @@ fn regex_lite_find_t_id(ir: &str) -> Option<String> {
 
 #[test]
 fn test_map_callback_returns_curried_closure_full_apply() {
-    // ADR-069: a `map` callback that RETURNS a closure (curried `i => () => i`) is a FULL
+    // ADR-044: a `map` callback that RETURNS a closure (curried `i => () => i`) is a FULL
     // application of the 1-arg callback, not under-application — the indirect-call path must CALL it
     // (returning the thunk), not bundle it into a partial-application closure. Before the arg-count
     // vs arity disambiguation it returned garbage (a pointer reinterpreted as the value).
@@ -11374,7 +11282,7 @@ print(toString(thunks[2]()))
 
 #[test]
 fn test_reduce_over_push_built_flat_typed_array_reads_correctly() {
-    // ADR-069: a `[]`+push builder typed `Int32[]` allocates a TAGGED array; `reduce` over it must
+    // ADR-044: a `[]`+push builder typed `Int32[]` allocates a TAGGED array; `reduce` over it must
     // read at the runtime representation (tagged), not flat — a flat read would misread garbage.
     // `combinator_read_elem_ty` only flat-reads provably-flat producers; a `[]`+push source falls
     // back to the tagged read.
@@ -11395,7 +11303,7 @@ print(toString(reduce(build(), 0, (a, x) => a + x)))
 
 #[test]
 fn test_filter_then_reduce_flat_pipeline_correct() {
-    // ADR-069: filter's keep/skip block split exercises the `emit_index_loop` phi back-edge patch
+    // ADR-044: filter's keep/skip block split exercises the `emit_index_loop` phi back-edge patch
     // (the back-edge predecessor is the skip block, not the nominal body block). A range→filter→
     // reduce flat pipeline must produce the right sum and valid IR.
     let out = run(r#"import { print } from "std/io"
@@ -11409,7 +11317,7 @@ print(toString(total))
 
 #[test]
 fn test_filter_object_array_no_double_free() {
-    // ADR-069 R2 regression: `filter` over an array of OBJECTS pushes each kept element (BORROWED
+    // ADR-044 R2 regression: `filter` over an array of OBJECTS pushes each kept element (BORROWED
     // from the source array) into the result array. The tagged push (`lin_array_push_tagged`) MOVES
     // the TaggedVal without bumping the inner refcount, so the kept element must be RETAINED first —
     // otherwise both the source and the filtered array reference the same object at refcount 1 and
@@ -11469,7 +11377,7 @@ print(toString(n))
     assert_eq!(out, vec!["0", "0", "0", "0"]);
 }
 
-// ADR-071: `replace` is a TEST-ONLY mock. In a normal `lin build` program (this harness writes a
+// ADR-046: `replace` is a TEST-ONLY mock. In a normal `lin build` program (this harness writes a
 // `.lin`, not a `.test.lin`) it must be a hard compile error — a shipped binary must never silently
 // swap a real import. The positive cases (mocking user modules + stdlib, internal call-sites seeing
 // the mock, spies, val mocks, type-drift rejection) are exercised end-to-end by `lin test` over
@@ -12147,7 +12055,7 @@ fn test_json_reporter_structured_expected_actual() {
     assert!(sat["message"].as_str().unwrap_or("").contains("predicate"), "satisfy message preserved");
 }
 
-// ── `Number` as a numerically-bounded generic parameter (ADR-018, reversed) ─────────────────────
+// ── `Number` as a numerically-bounded generic parameter (ADR-014, reversed) ─────────────────────
 // `(x: Number)` is sugar for `<T: numeric>(x: T)`: the body type-checks (the bound permits
 // arithmetic), and monomorphization specializes per call-site family to native unboxed ops.
 
@@ -12225,7 +12133,7 @@ print(toString(twice(1.25)))
 
 #[test]
 fn test_number_mixed_family_in_one_call_widens() {
-    // Mixed numeric families in ONE call of a `Number`-returning function are SUPPORTED (ADR-018,
+    // Mixed numeric families in ONE call of a `Number`-returning function are SUPPORTED (ADR-014,
     // reversed): `add$Int32_Float64` is monomorphized and the arithmetic re-widens to the same
     // family the concrete `(a:Int32,b:Float64)` equivalent produces. `add(10, 2.5)` ⇒ Float64
     // `12.5`; `add(10, 2)` stays Int (both Int32); `add(1.5, 2.5)` is Float64. Native widening
@@ -12243,7 +12151,7 @@ print(toString(add(2.5, 10)))
 
 #[test]
 fn test_number_nested_array_map_specializes() {
-    // Nested `Number` (ADR-018, reversed, bug #4): `Number[]` and a `Number` callback over it.
+    // Nested `Number` (ADR-014, reversed, bug #4): `Number[]` and a `Number` callback over it.
     // `resolve_type_with_number_in` recurses into the Array element; the callback's `Number` param
     // reuses the receiver element's bounded var (so its family is pinned by the argument) and its
     // body type is surfaced as the lambda return, letting the outer call infer. `f([1,2,3])` ⇒
@@ -12274,8 +12182,8 @@ print(toString(firstTwo([5, 6])))
 
 #[test]
 fn test_number_json_arg_accepted_direct_and_projected_consistent() {
-    // ADR-018 (reversed) §Json: a `Json` value is ACCEPTED at a `Number` parameter — consistent
-    // with the `Json → Int32` scalar coercion gap (ADR-048), monomorphizing to the default `Int32`
+    // ADR-014 (reversed) §Json: a `Json` value is ACCEPTED at a `Number` parameter — consistent
+    // with the `Json → Int32` scalar coercion gap (ADR-032), monomorphizing to the default `Int32`
     // family with an unchecked unbox. This was previously INCONSISTENT: a DIRECT `Json`
     // (`val x: Json = 42`, the bare `TypeVar(u32::MAX)` marker) was REJECTED while a `Json`
     // PROJECTION (`config["count"]`, a fresh inference var) slipped past the bound guard and ran.
@@ -12553,7 +12461,7 @@ print(describe(null))
 // is BEHAVIOR-INERT: a named-typed value and a structurally-equal anonymous literal still
 // inter-operate exactly as before — assign across in BOTH directions, pass into the named param
 // position, read fields, and compare equal (including a WIDER literal with an extra field, which
-// structural compatibility still permits). See ADR-082 (Stage 0.5: inert sealed marker).
+// structural compatibility still permits). See ADR-055 (Stage 0.5: inert sealed marker).
 #[test]
 fn test_sealed_marker_is_inert_named_vs_anonymous_interop() {
     let out = run(r#"
@@ -12586,7 +12494,7 @@ print("extra=${wide["extra"]}")
 
 // ───────────────────────── Sealed records — Stage 1 ─────────────────────────
 // Unboxed packed-struct layout + constant-offset field access for sealed all-scalar record
-// types. See ADR-082 + SPECIFICATION §5.9.1 (sealed records, Stage 1).
+// types. See ADR-055 + SPECIFICATION §5.9.1 (sealed records, Stage 1).
 
 #[test]
 fn test_sealed_scalar_construct_and_field_read() {
@@ -13635,4 +13543,59 @@ main()
     let out = run(src);
     // Both paths mutate the shared array (length 3); the grow case stays safe and still shared.
     assert_eq!(out, vec!["fn=3".to_string(), "proj=3".to_string(), "grow=3/3".to_string()]);
+}
+
+#[test]
+fn test_typed_map_through_function_value() {
+    // Regression: a typed index-signature map (`{ String: T }`, `Type::Map`) passed through an
+    // opaque `Function`-value call must survive the closure-ABI wrapper. The wrapper calls
+    // `unbox_value`, which previously omitted `Type::Map` from its pointer-unboxing arm, so the
+    // callee received a TAG_MAP TaggedVal box instead of the raw `LinMap*` — flattening the map
+    // (flat read -> -1) or crashing on a null-pointer deref in lin-runtime/src/map.rs.
+    let src = r#"
+import { print } from "std/io"
+import { keys } from "std/object"
+import { length } from "std/array"
+
+val buildFlat = (): { String: Int32 } =>
+  var m: { String: Int32 } = {}
+  m["x"] = 7
+  m
+
+val readX = (m: { String: Int32 }): Int32 =>
+  val v = m["x"]
+  match v
+    is Null => -1
+    else => v
+
+val applyFlat = (fn: Function, m: { String: Int32 }): Int32 =>
+  fn(m)
+
+val buildNested = (): { String: { String: Int32 } } =>
+  var m: { String: { String: Int32 } } = {}
+  var inner: { String: Int32 } = {}
+  inner["a"] = 1
+  inner["b"] = 2
+  m["k"] = inner
+  m
+
+val countInner = (m: { String: { String: Int32 } }): Int32 =>
+  val inner = m["k"]
+  match inner
+    is Null => -1
+    else => length(keys(inner))
+
+val applyNested = (fn: Function, m: { String: { String: Int32 } }): Int32 =>
+  fn(m)
+
+val main = (): Null =>
+  val f = buildFlat()
+  print("flat=${applyFlat(readX, f)}")
+  val n = buildNested()
+  print("nested=${applyNested(countInner, n)}")
+
+main()
+"#;
+    let out = run(src);
+    assert_eq!(out, vec!["flat=7".to_string(), "nested=2".to_string()]);
 }

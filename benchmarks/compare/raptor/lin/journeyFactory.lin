@@ -6,40 +6,49 @@ import { for } from "std/iter"
 import { parseInt32 } from "std/number"
 import { length, push, slice, reverse } from "std/array"
 import { sortedRoundKeys } from "./roundKeys"
-
-val isTransfer = (connection: Json): Boolean =>
-  connection["origin"] != null
+import { Conn, Transfer } from "./types"
 
 val isTimetableLeg = (leg: Json): Boolean =>
   leg["stopTimes"] != null
 
 // Walk connections from finalDestination back to k=1, accumulating legs (in reverse), then reverse.
-val getJourneyLegs = (kConnections: Json, k: String, finalDestination: String): Json =>
+val getJourneyLegs = (kConnections: { String: { String: Conn } }, k: String, finalDestination: String): Json =>
   var legs: Json = []
   buildLegs(kConnections, parseInt32(k), finalDestination, legs)
   reverse(legs)
 
-val buildLegs = (kConnections: Json, i: Int32, destination: String, legs: Json): Null =>
+val buildLegs = (kConnections: { String: { String: Conn } }, i: Int32, destination: String, legs: Json): Null =>
   if i <= 0 then
     null
   else
-    val connection = kConnections[destination]["${i}"]
-    if isTransfer(connection) then
-      push(legs, connection)
-      buildLegs(kConnections, i - 1, connection["origin"], legs)
-    else
-      val trip = connection[0]
-      val start = connection[1]
-      val end = connection[2]
-      val stopTimes = slice(trip["stopTimes"], start, end + 1)
-      val origin = stopTimes[0]["stop"]
-      push(legs, {
-        "stopTimes": stopTimes,
-        "origin": origin,
-        "destination": destination,
-        "trip": trip
-      })
-      buildLegs(kConnections, i - 1, origin, legs)
+    // kConnections[destination] is `{ String: Conn } | Null`; the round always exists on the walk
+    // back, so narrow with a `match … is`. The inner `["${i}"]` is `Conn | Null`, narrowed the same
+    // way — a Transfer (footpath) vs the [trip, start, end] tuple.
+    val round = kConnections[destination]
+    match round
+      is Null =>
+        null
+      else =>
+        val connection = round["${i}"]
+        match connection
+          is Null =>
+            null
+          is Transfer =>
+            push(legs, connection)
+            buildLegs(kConnections, i - 1, connection["origin"], legs)
+          else =>
+            val trip = connection[0]
+            val start = connection[1]
+            val end = connection[2]
+            val stopTimes = slice(trip["stopTimes"], start, end + 1)
+            val origin = stopTimes[0]["stop"]
+            push(legs, {
+              "stopTimes": stopTimes,
+              "origin": origin,
+              "destination": destination,
+              "trip": trip
+            })
+            buildLegs(kConnections, i - 1, origin, legs)
 
 val getDepartureTime = (legs: Json): Json =>
   depAt(legs, 0, 0)
@@ -68,9 +77,9 @@ val arrAt = (legs: Json, i: Int32, transferDuration: Int32): Json =>
       val sts = leg["stopTimes"]
       sts[length(sts) - 1]["arrivalTime"] + transferDuration
 
-export val getResults = (kConnections: Json, destination: String): Json =>
+export val getResults = (kConnections: { String: { String: Conn } }, destination: String): Json =>
   var results: Json = []
-  val destMap = if kConnections[destination] != null then kConnections[destination] else {  }
+  val destMap = kConnections[destination]
   sortedRoundKeys(destMap).for(k =>
     val legs = getJourneyLegs(kConnections, k, destination)
     push(results, {

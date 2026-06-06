@@ -305,7 +305,7 @@ impl<'ctx> Codegen<'ctx> {
             let res = phi.as_basic_value();
             return if Self::is_union_type(result_ty) { res } else { self.unbox_tagged_val_to_type(res, result_ty) };
         }
-        // Typed index-signature map `{ String: T }` (ADR-082): `m[k]` is an O(1) hashed lookup.
+        // Typed index-signature map `{ String: T }` (ADR-055): `m[k]` is an O(1) hashed lookup.
         // The key is a String (raw LinString*, or unbox a Json/union-boxed key); the result is
         // `T | Null` — `lin_map_get` returns null for a missing key, which `unbox_tagged_val_to_type`
         // maps to the language Null.
@@ -384,7 +384,7 @@ impl<'ctx> Codegen<'ctx> {
         if Self::is_union_type(obj_ty) {
             // A `{ String: T } | Null` index (e.g. the inner read of a NESTED typed map
             // `outer[a][b]`, where `outer[a]` is `{ String: T } | Null` and is NOT spellable as
-            // an `is`-pattern to narrow, ADR-082 §5.1.1) runs through this union path. Its runtime
+            // an `is`-pattern to narrow, ADR-055 §5.1.1) runs through this union path. Its runtime
             // value is a TAG_MAP, so dispatch on the tag: TAG_MAP → `lin_map_get` (O(1) hashed),
             // TAG_OBJECT → `lin_object_get` (the Json association-list path), otherwise Null. Both
             // getters return a borrowed `*const TaggedVal`, so the ownership contract is identical.
@@ -447,14 +447,14 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Store `value` into a typed index-signature map (`lin_map_set`, ADR-082).
+    /// Store `value` into a typed index-signature map (`lin_map_set`, ADR-055).
     ///
     /// `elem_ty` is the map's value type `T` (from `Type::Map(T)`); `val_ty` is the source
     /// expression's static type, which may be a NARROWER numeric (e.g. an `Int32` variable stored
     /// into a `{ String: Int64 }` map). The value is normalised to `T`'s representation before
-    /// storage so the slot reads back `T`-correct regardless of the source width (ADR-082).
+    /// storage so the slot reads back `T`-correct regardless of the source width (ADR-055).
     ///
-    /// FLAT-SCALAR UNBOXING (ADR-082 follow-up): when `T` is a flat scalar (`is_flat_scalar` —
+    /// FLAT-SCALAR UNBOXING (ADR-055 follow-up): when `T` is a flat scalar (`is_flat_scalar` —
     /// Int8/16/32/64, UInt8/16/32/64, Float32/64), the scalar is marshalled through a STACK
     /// `TaggedVal` (tag+payload = `T`'s boxed-scalar convention, identical to what an array slot
     /// stores) rather than `box_value`'s HEAP box. `lin_map_set` copies the 16 bytes INLINE into the
@@ -616,7 +616,7 @@ impl<'ctx> Codegen<'ctx> {
                     self.emit_object_set(obj, key_str, value, val_ty);
                 }
             }
-            // Typed index-signature map `{ String: T }` (ADR-082): O(1) hashed insert/overwrite.
+            // Typed index-signature map `{ String: T }` (ADR-055): O(1) hashed insert/overwrite.
             // Pass the map's value type `T` so a flat-scalar `T` is stored UNBOXED (inline in the
             // slot's TaggedVal, no heap box) and a narrower source value is widened to `T`.
             Type::Map(elem) => {
@@ -708,7 +708,7 @@ impl<'ctx> Codegen<'ctx> {
     /// (TAG_OBJECT) OR a typed index-signature map (TAG_MAP). This is the write analogue of the
     /// tag-dispatched read in `compile_ir_index`: a NESTED typed map's inner write
     /// (`outer[a][b] = v`, where `outer[a]` is `{ String: T } | Null` — not `is`-narrowable,
-    /// ADR-082 §5.1.1) reaches here with `obj_ty` a union containing a `Map(elem)` variant.
+    /// ADR-055 §5.1.1) reaches here with `obj_ty` a union containing a `Map(elem)` variant.
     /// When such a variant is present, dispatch on the runtime tag: TAG_MAP → `emit_map_set`
     /// (O(1) hashed insert), otherwise `emit_object_set`. Both helpers RETAIN the inner payload,
     /// so the ownership contract is identical on either branch. With no Map variant this is a
@@ -921,6 +921,81 @@ impl<'ctx> Codegen<'ctx> {
     /// a new contiguous sealed array and, per element, reads the source element as a boxed value,
     /// projects it into the element record's struct layout, and copies the projected payload into the
     /// sealed slot. Non-mutating; `src` keeps its own ownership. Rare path; correctness over speed.
+    /// True when `ty` is (or transitively contains) a representation that needs a sealed projection
+    /// when crossing from the boxed `Json` view: a sealed scalar record, OR a sealed-record array, OR
+    /// a container/union holding one. Used to decide whether a NESTED-array Coerce must recurse
+    /// element-wise (vs. the one-level sealed-array arms or a plain pointer pass-through).
+    pub(crate) fn ty_contains_sealed(ty: &Type) -> bool {
+        if Self::sealed_array_elem(ty).is_some() || Self::sealed_scalar_fields(ty).is_some() {
+            return true;
+        }
+        match ty {
+            Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Map(t) => Self::ty_contains_sealed(t),
+            Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(Self::ty_contains_sealed),
+            _ => false,
+        }
+    }
+
+    /// Coerce a boxed/Json source ARRAY into `Array(inner_to)` element-wise, where `inner_to` itself
+    /// contains a sealed representation (so a verbatim pointer reuse would mis-type the elements). The
+    /// outer array is rebuilt as a TAGGED array (its elements are heap pointers — sealed arrays or
+    /// boxed records — not packed scalars), and each source element is recursively `compile_ir_coerce`d
+    /// from its boxed view (the Json wildcard) into `inner_to`, then pushed (materialized to its boxed/tagged
+    /// slot by `tagged_array_push_value`). The source elements are read via `lin_array_get_tagged`
+    /// (fresh +1 boxes), released after the coerce takes its own +1. Used for `partition`/`groupBy`/
+    /// `chunk`-shaped combinator results routed through the type-erased boxed fallback.
+    pub(crate) fn array_coerce_elementwise(
+        &mut self,
+        src: BasicValueEnum<'ctx>,
+        src_ty: &Type,
+        inner_to: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        // Unbox a boxed Json/union source to the raw LinArray*.
+        let src_raw = if Self::is_union_type(src_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[src.into()], "nestarr_unbox").try_as_basic_value().unwrap_basic()
+        } else { src };
+        let len_fn = self.get_or_declare_fn("lin_array_length", i64_ty.fn_type(&[ptr_ty.into()], false));
+        let len = self.builder.call(len_fn, &[src_raw.into()], "nestarr_len").try_as_basic_value().unwrap_basic().into_int_value();
+        let out = self.builder.call(self.rt.array_alloc, &[len.into()], "nestarr_out").try_as_basic_value().unwrap_basic();
+        let get_tagged = self.get_or_declare_fn("lin_array_get_tagged", ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let head = self.context.append_basic_block(llvm_fn, "nestarr_head");
+        let body = self.context.append_basic_block(llvm_fn, "nestarr_body");
+        let done = self.context.append_basic_block(llvm_fn, "nestarr_done");
+        let idx_slot = self.builder.alloca(i64_ty, "nestarr_i");
+        self.builder.store(idx_slot, i64_ty.const_zero());
+        self.builder.unconditional_branch(head);
+        self.builder.position_at_end(head);
+        let i = self.builder.load(i64_ty, idx_slot, "nestarr_iv").into_int_value();
+        let cond = self.builder.int_compare(IntPredicate::SLT, i, len, "nestarr_cond");
+        self.builder.conditional_branch(cond, body, done);
+        self.builder.position_at_end(body);
+        let elem_box = self.builder.call(get_tagged, &[src_raw.into(), i.into()], "nestarr_get").try_as_basic_value().unwrap_basic();
+        // `lin_array_get_tagged` ALWAYS returns a boxed `TaggedVal*` (the dynamic Json view of the
+        // element), regardless of the source array's static element type. So coerce FROM the Json
+        // wildcard — not `inner_from` (e.g. `Array(TypeVar)`, which the inner sealed-array projection
+        // would NOT recognize as boxed and so would read the box as a raw `LinArray*` → crash). The
+        // wildcard makes `sealed_array_project_from` / `sealed_project_from` unbox the element first.
+        let coerced = self.compile_ir_coerce(elem_box, &Type::TypeVar(u32::MAX), inner_to);
+        // `lin_array_push` (via `tagged_array_push_value`) does NOT retain — it copies the 8-byte
+        // payload and TAKES OWNERSHIP of the inner heap value. The `coerced` element is a fresh +1
+        // (a projected sealed array, a materialized boxed record, or an unboxed scalar), so its +1
+        // transfers into the output slot — do NOT release it here (that would double-free).
+        self.tagged_array_push_value(out, coerced, inner_to);
+        // The source element box from `lin_array_get_tagged` is a fresh +1 we own; release it (the
+        // coerce above took its own independent +1 into `coerced`).
+        if elem_box.is_pointer_value() {
+            self.builder.call(self.rt.tagged_release, &[elem_box.into()], "");
+        }
+        let next = self.builder.int_add(i, i64_ty.const_int(1, false), "nestarr_next");
+        self.builder.store(idx_slot, next);
+        self.builder.unconditional_branch(head);
+        self.builder.position_at_end(done);
+        out
+    }
+
     pub(crate) fn sealed_array_project_from(&mut self, src: BasicValueEnum<'ctx>, src_ty: &Type, arr_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();

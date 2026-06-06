@@ -1,4 +1,4 @@
-// streams — the worked CSV example from the Stream<T> design (streams brief, ADR-072).
+// streams — the worked CSV example from the Stream<T> design (streams brief, ADR-047).
 //
 // Reads a CSV file as a lazy byte Stream, splits it into lines, drops blank lines, quotes and
 // re-joins each field, then writes the transformed rows to an output file — driven on the

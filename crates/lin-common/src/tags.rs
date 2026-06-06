@@ -33,5 +33,5 @@ pub const TAG_PROMISE: u8 = 16;
 pub const TAG_HANDLE: u8 = 17;
 pub const TAG_SHARED: u8 = 18;
 pub const TAG_STREAM: u8 = 19;
-/// Typed index-signature map `{ String: T }` — the hashed `LinMap` container (ADR-082).
+/// Typed index-signature map `{ String: T }` — the hashed `LinMap` container (ADR-055).
 pub const TAG_MAP: u8 = 20;

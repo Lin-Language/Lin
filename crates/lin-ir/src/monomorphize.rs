@@ -67,6 +67,60 @@ fn mentions_generic_tv(ty: &Type) -> bool {
     }
 }
 
+/// A field type in a PACKED scalar-only sealed record (Stage 3a gate): a fixed-width scalar or Bool.
+/// Mirrors the scalar-only `Codegen::sealed_array_elem` / lower.rs `is_sealed_scalar_array` gate.
+fn field_packed_scalar(ty: &Type) -> bool {
+    ty.is_flat_scalar() || matches!(ty, Type::Bool)
+}
+
+/// True if `ty` is (or contains, transitively) a PACKED (scalar-field) SEALED record/array — the
+/// representation codegen lays out as a contiguous unboxed buffer (elem_tag 0xFE) / packed struct
+/// (not a `LinObject`). The unsound generic combinators (see `combinator_unsound_over_sealed`) read
+/// such elements through the boxed `Object[]`/`Json` machinery, a boxed-vs-packed mismatch. When a
+/// combinator substitution binds a type parameter to such a type we route the call through the
+/// type-erased `boxed_fallback_call`, whose boxed ABI materializes the sealed value to its boxed view
+/// at the argument boundary (`box_value` → `sealed_array_to_tagged`) and re-coerces the boxed result
+/// back to the sealed type. Heap-field sealed records stay boxed (Stage 3a gate) and are excluded.
+fn mentions_sealed(ty: &Type) -> bool {
+    match ty {
+        // A sealed record whose fields are ALL scalar (numeric/Bool) is the PACKED representation
+        // codegen lays out as a contiguous struct / unboxed array (elem_tag 0xFE) — the boxed-vs-packed
+        // mismatch source for the unsound combinators. Heap-field sealed records stay BOXED (Stage 3a
+        // gate), so they flow through the generic combinator's boxed body correctly and do NOT need the
+        // detour. MUST mirror the codegen packed gate (`Codegen::sealed_array_elem` / lower.rs
+        // `is_sealed_scalar_array`): scalar-field sealed records only.
+        Type::Object { fields, sealed: true } =>
+            !fields.is_empty() && fields.values().all(field_packed_scalar),
+        Type::Object { fields, sealed: false } => fields.values().any(mentions_sealed),
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Map(t) => mentions_sealed(t),
+        Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(mentions_sealed),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(mentions_sealed) || mentions_sealed(ret)
+        }
+        _ => false,
+    }
+}
+
+/// Generic stdlib combinators that are UNSOUND when native-specialized at a packed sealed element
+/// type and must be routed through the type-erased boxed fallback (§3 materialize-to-boxed). These
+/// build a `T`-typed buffer (`arrayAllocateFilled`) or store/return whole `T` elements that their
+/// body then reads/writes through the boxed `Object[]`/`Json` machinery — a boxed-vs-packed mismatch.
+/// Determined empirically against the native-spec output over a `type Pt = {…}` array on master
+/// (`sort`→`7 7 7 7`, `sortBy`→segfault, and `minBy`/`maxBy`/`partition`/`reverse`/`unique`/`take`/
+/// `drop`/`filter` returned garbage element fields). All return a `T`-containing type, so the boxed
+/// result re-coerces back to the sealed representation via the sealed-array / nested-array Coerce arms.
+/// (`slice`/`chunk` happened to read correctly on master but ALSO return whole `T` and are included
+/// for safety — the boxed path is correct, just unbenchmarked-faster.) Projection-style combinators
+/// (`map`/`reduce`/`scan`/`find`/`some`/`every`/`flatMap`/`groupBy`/`countBy`/`indexOf`/`zip`) are NOT
+/// listed: they read the packed element soundly natively and/or return a non-`T` result the boxed
+/// re-coerce cannot reconstruct.
+fn combinator_unsound_over_sealed(name: &str) -> bool {
+    matches!(name,
+        "sort" | "sortBy" | "minBy" | "maxBy" | "partition"
+        | "reverse" | "unique" | "take" | "drop" | "filter"
+        | "slice" | "chunk" | "zip")
+}
+
 /// A top-level generic function discovered in the module (or in an import).
 struct GenericFn {
     name: String,
@@ -1209,7 +1263,7 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
         None
     };
 
-    // CAPTURE-LESS-LAMBDA INLINE (the zero-box win, ADR-069): if the callee is a thin
+    // CAPTURE-LESS-LAMBDA INLINE (the zero-box win, ADR-044): if the callee is a thin
     // intrinsic-combinator wrapper (`map`/`filter`/`reduce` = `lin_map`/… forwarding its params) AND
     // the callback argument is a capture-less LITERAL lambda, inline the wrapper at THIS call site —
     // rewriting the call to a direct `lin_map(arr, <lambda>)` — so the literal lambda becomes visible
@@ -1312,7 +1366,36 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                         && all_quantified
                         && subs.values().all(|t| !mentions_generic_tv(t));
 
-                    if fully_concrete {
+                    // SEALED-RECORD BOUNDARY (Problem A / Stage 3b): some generic combinators are
+                    // UNSOUND when native-specialized at a packed sealed element type — their body
+                    // builds a `T`-typed merge/result buffer (`arrayAllocateFilled(n, arr[0])`) or
+                    // stores/returns whole `T` elements, then reads/writes them through the boxed
+                    // `Object[]`/`Json` machinery (`set`/`lin_array_get_tagged`/`_keyedPairs`/`_sortJ`),
+                    // a boxed-vs-packed mismatch → silent corruption / misaligned deref (verified on
+                    // master: `sort` → `7 7 7 7`, `sortBy` → segfault; also `minBy`/`maxBy`/`partition`/
+                    // `reverse`/`unique`/`take`/`drop`). Route THOSE through the type-erased boxed
+                    // fallback, which materializes the sealed array to its boxed view at the arg boundary
+                    // (`box_value`) and re-coerces the boxed `T`-containing result back to the sealed
+                    // representation (the sealed-array / nested-array Coerce arms). Combinators that only
+                    // PROJECT each element through a callback to a DIFFERENT-typed result (`map`→`U[]`,
+                    // `reduce`→`U`, `scan`→`U[]`, `find`, `some`, `every`, `flatMap`, `groupBy`/`countBy`)
+                    // read the packed element soundly in their native spec AND keep a result the boxed
+                    // re-coerce could not reconstruct (a flat-scalar `U[]`, a `{String: …}` map) — they
+                    // are NOT routed. The gate is conservative (correctness fallback); it only fires for
+                    // a genuinely-packed sealed arg AND a known-unsound combinator name.
+                    let sealed_arg = subs.values().any(mentions_sealed);
+                    let unsound_combinator = combinator_unsound_over_sealed(&g_name(state, gslot));
+
+                    if fully_concrete && sealed_arg && unsound_combinator {
+                        // Materialize-to-boxed boundary: keep the type-erased generic original and
+                        // route this call through it. `box_value` converts the sealed array/record
+                        // to its boxed view at the arg boundary; the wrapping Coerce re-seals the
+                        // result. (No specialization budget interaction — the boxed original is shared.)
+                        state.boxed_fallback_used.insert(gslot);
+                        boxed_fallback_call(expr, gslot, &params, &ret_type, state);
+                    } else if fully_concrete {
+                        // Sound to native-specialize (no sealed arg, or a sealed arg through a
+                        // projection-style combinator that reads the packed element correctly).
                         // Respect the per-generic native-specialization budget.
                         let key = instantiation_key(gslot, &subs);
                         let known = state.specs.contains_key(&key);
@@ -1387,7 +1470,7 @@ fn native_spec_slot(
     s
 }
 
-/// Intrinsic-combinator wrappers whose callback body the IR lowering can inline (ADR-069). Each is
+/// Intrinsic-combinator wrappers whose callback body the IR lowering can inline (ADR-044). Each is
 /// `lin_X(params…)` forwarding its parameters 1:1, so a call's existing args are already in the
 /// intrinsic's argument order and need no reordering when we repoint the callee.
 fn combinator_intrinsic(name: &str) -> bool {
@@ -1433,6 +1516,20 @@ fn try_inline_combinator_wrapper(
     // combinator dispatch happens at the call site (`lower_call`), redirecting to the lazy
     // `lin_stream_*` backend. Bail so the call stays a Named import call the lowerer intercepts.
     if args.first().map(|a| matches!(a.ty(), Type::Stream(_))).unwrap_or(false) {
+        return false;
+    }
+    // SEALED-RECORD ARRAY RECEIVER (Problem A / Stage 3b): `lin_filter` over a packed sealed-record
+    // array (elem_tag 0xFE) PUSHES whole elements through `emit_index_loop`/`push_output` — which
+    // read/store them via the boxed `Object[]` machinery (`lin_array_get_tagged`/per-element retain),
+    // a misaligned read + garbage push for a packed struct (observed: a filtered `Pt[]` element's
+    // fields came back as garbage). Bail `lin_filter` to the type-erased boxed-fallback path, which
+    // materializes the array to its boxed view first (§3). `lin_map`/`lin_reduce` PROJECT each element
+    // through the callback to a derived (typically scalar) value rather than passing the whole struct
+    // to the output, so their inline element-field reads are sound over the packed representation and
+    // keep the zero-box win; they are NOT bailed.
+    if intrinsic == "lin_filter"
+        && args.first().map(|a| mentions_sealed(&a.ty())).unwrap_or(false)
+    {
         return false;
     }
     // Exactly one capture-less literal-lambda argument qualifies.
@@ -1559,13 +1656,13 @@ fn repoint_call_native(
 ) {
     let concrete_params: Vec<Type> = params.iter().map(|p| subst_type(&p.ty, subs)).collect();
     let mut concrete_ret = subst_type(ret_type, subs);
-    // ADR-018 (reversed) mixed-family fix: a bare `Number` return whose value comes from arithmetic
+    // ADR-014 (reversed) mixed-family fix: a bare `Number` return whose value comes from arithmetic
     // over two DISTINCT bounded vars (`(a:Number,b:Number)=>a+b`) had `ret_type` recorded as ONE of
     // those vars, so `subst_type` freezes it to the first family. The materialized spec actually
     // returns the WIDENED family (`function_tail_type` over the substituted body — same as the spec
     // function's own re-synced `ret_type`). Re-derive it here so the Call's recorded result type and
     // the spec's signature agree (otherwise the caller reads an `i32` slot the spec fills with a
-    // `double`). Fires when the substituted return is numeric, OR (ADR-018 §Json) when it is the
+    // `double`). Fires when the substituted return is numeric, OR (ADR-014 §Json) when it is the
     // Json wildcard: a `Json` argument binds the `Number` var to `u32::MAX`, so `subst_type` makes
     // `concrete_ret = Json` (a `ptr`) while the spec body's arithmetic re-widens to a native scalar.
     // Mirrors the spec function's own ret-type re-sync in `subst_expr`; the `repr_differs` Coerce
@@ -1810,7 +1907,7 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
     // Recurse into children to substitute nested types.
     for_each_child_mut(expr, &mut |c| subst_expr(c, subs));
 
-    // ADR-018 (reversed) mixed-family fix: a `Number` arithmetic op's result type was recorded by
+    // ADR-014 (reversed) mixed-family fix: a `Number` arithmetic op's result type was recorded by
     // the checker as ONE of its bounded operand vars (e.g. `a + b` with `a: TypeVar(9001)`,
     // `b: TypeVar(9002)` stored `result_type = TypeVar(9001)`). Plain `subst_type` then freezes it
     // to the FIRST family (Int32) — but when the two vars bind to DIFFERENT families (`add(10,2.5)`
@@ -1832,7 +1929,7 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
                     *result_type = widened;
                 }
             } else if lt.is_numeric() && is_json(&rt) {
-                // ADR-018 (reversed) §Json: a `Number` operand bound to the Json wildcard. The IR
+                // ADR-014 (reversed) §Json: a `Number` operand bound to the Json wildcard. The IR
                 // (`lower_expr` BinaryOp) unboxes the wildcard side to the CONCRETE operand's family
                 // and emits a native scalar op — so the result is that concrete numeric family, not
                 // the boxed `result_type` the checker recorded (the bounded var → Json). Mirror that
@@ -1851,11 +1948,11 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
     // re-widened above), the function's actual return is the body's tail type — re-sync `ret_type`
     // to it so the emitted function signature matches the value the body returns (no `ret double`
     // vs declared-`i32` mismatch). Fires when `subst_type` left the return either numeric (the
-    // mixed-family case) OR as the Json wildcard (the ADR-018 §Json case below) AND the re-derived
+    // mixed-family case) OR as the Json wildcard (the ADR-014 §Json case below) AND the re-derived
     // body type is numeric — a structural or already-concrete-non-wildcard return is left exactly as
     // `subst_type` produced it.
     //
-    // ADR-018 (reversed) §Json: a `Json` argument binds the `Number` param's bounded var to the Json
+    // ADR-014 (reversed) §Json: a `Json` argument binds the `Number` param's bounded var to the Json
     // wildcard (`u32::MAX`), so `subst_type` makes the spec's `ret_type = Json` (a `ptr`). But the
     // body's arithmetic over the (Int32-unboxed) operand re-widens to a NATIVE scalar (e.g. `x*3` ⇒
     // `i32`) — so the function returns `i32` against a declared `ptr` (the `triple$Json` mismatch).
@@ -1880,7 +1977,7 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
 /// A Coerce normally reports its `to` type. But a `from == to` Coerce is a REPRESENTATION NO-OP that
 /// codegen elides — passing the inner value through unchanged. After substitution this arises for a
 /// `Number` body whose value flows through a `Coerce { from: numvar, to: numvar }` that both
-/// substituted to the SAME type (e.g. the Json wildcard, ADR-018 §Json): codegen returns the inner
+/// substituted to the SAME type (e.g. the Json wildcard, ADR-014 §Json): codegen returns the inner
 /// (re-widened) scalar, so the tail type must be the INNER expression's type, not the elided `to`.
 fn function_tail_type(body: &TypedExpr) -> Type {
     match body {

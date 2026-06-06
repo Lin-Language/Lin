@@ -1,4 +1,4 @@
-// std/json — type-directed JSON decoding (ADR-047).
+// std/json — type-directed JSON decoding (ADR-031).
 //
 // `fromJson` is a compiler special form: the type checker recognises the surface name
 // `fromJson` at the call site (in both the `Person.fromJson(json)` dot form and the

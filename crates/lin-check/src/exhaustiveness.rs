@@ -69,7 +69,7 @@ fn check_union_exhaustiveness(
 ) -> Vec<Diagnostic> {
     // Collect all types that are explicitly covered by `is T` arms.
     let covered: Vec<&Type> = arms.iter().filter_map(|a| {
-        // `TypeCheckDeep` (ADR-053, `is <ObjectType>`) covers its variant exactly like `TypeCheck`.
+        // `TypeCheckDeep` (ADR-035, `is <ObjectType>`) covers its variant exactly like `TypeCheck`.
         match &a.pattern {
             TypedMatchPattern::Is(TypedPattern::TypeCheck(ty, _)) => Some(ty),
             TypedMatchPattern::Is(TypedPattern::TypeCheckDeep(ty, _, _)) => Some(ty),
@@ -78,7 +78,7 @@ fn check_union_exhaustiveness(
     }).collect();
 
     // `is Error` desugars to a value-constrained object pattern `{ "type": "error", .. }`
-    // (ADR-047), so it is NOT a `TypeCheck` arm. Recognise it here so it counts as covering the
+    // (ADR-031), so it is NOT a `TypeCheck` arm. Recognise it here so it counts as covering the
     // `Error` object variant of a `T | Error` union; otherwise a `match | is T | is Error`
     // would be reported non-exhaustive.
     let covers_error = arms.iter().any(|a| {
@@ -143,7 +143,7 @@ fn check_bool_exhaustiveness(arms: &[TypedMatchArm], span: Span) -> Vec<Diagnost
 }
 
 /// True if `p` is the desugared `is Error` pattern: an object pattern that constrains the
-/// `"type"` field to the literal `"error"` (ADR-047).
+/// `"type"` field to the literal `"error"` (ADR-031).
 fn is_error_pattern(p: &TypedPattern) -> bool {
     if let TypedPattern::Object { fields, .. } = p {
         fields.iter().any(|f| {

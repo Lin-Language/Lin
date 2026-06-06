@@ -12,7 +12,7 @@ priority queue.
   (`{ dist, prev }`).
 - **Typed arrays** flowing through the algorithm: `Edge[]` in, `PqEntry[]` queue,
   `String[]` reconstructed path.
-- **Typed index-signature maps** (`{ String: T }`, ADR-082): the adjacency
+- **Typed index-signature maps** (`{ String: T }`, ADR-055): the adjacency
   (`{ String: Neighbor[] }`), distance (`{ String: Int32 }`), and predecessor
   (`{ String: String }`) structures are keyed by node name and written with plain
   index assignment (`dist[node] = ...`) — O(1) average lookup, no `Json` unwrapping.
@@ -28,7 +28,7 @@ priority queue.
 | `solver.lin` | `solve(graphPath, source, target, outputPath)` — the fs-driven orchestration (read graph → run → optionally write), returning a tagged outcome. Kept separate so it is testable by mocking `std/fs`. |
 | `main.lin` | Parses `argv` (graph path, source, target, output path), calls `solve`, and prints the outcome. |
 | `graph.json` | Sample 5-node graph. |
-| `solver.test.lin` | `solve` with `std/fs` mocked (ADR-071): happy path, read-error, no-path, and the output-write spy — no disk needed. |
+| `solver.test.lin` | `solve` with `std/fs` mocked (ADR-046): happy path, read-error, no-path, and the output-write spy — no disk needed. |
 | `*.test.lin` | `graph`, `algorithm`, `solver`, and integration tests. |
 
 ## Run / Test

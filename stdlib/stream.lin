@@ -1,4 +1,4 @@
-// std/stream — opaque, lazy, effectful byte/value streams (streams brief, ADR-072).
+// std/stream — opaque, lazy, effectful byte/value streams (streams brief, ADR-047).
 //
 // A `Stream<T>` is a lazy pull-source that owns an OS resource. Building a pipeline
 // (readStream → lines → map → filter → writeStream) allocates lazy adapter nodes but reads
@@ -75,7 +75,7 @@ export val close = (s: Stream): Null =>
 // `.promise()` — drive the pipeline on a WORKER thread → `Promise<Null | Error>` (brief §5).
 // The stream is MOVED onto the worker (legal via CAP_MOVE, Stage 7): the worker owns the whole
 // pipeline, drives it to EOF, and the result resolves to `Null` (success) or an `Error` (a
-// read/transform fault is caught at the async boundary — ADR-070 / §32.2.2 — and surfaces as the
+// read/transform fault is caught at the async boundary — ADR-045 / §32.2.2 — and surfaces as the
 // awaited `Error`). Real concurrency + fault isolation: run several with `parallel([...])`.
 export val promise = (s: Stream): Json =>
   lin_stream_promise(s)

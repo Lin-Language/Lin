@@ -13,26 +13,34 @@ import { keys } from "std/object"
 import { parseInt32 } from "std/number"
 import { length, push, slice } from "std/array"
 import { sortedRoundKeys } from "./roundKeys"
-
-val isTransfer = (connection: Json): Boolean =>
-  connection["origin"] != null
+import { Conn, Transfer } from "./types"
 
 // path = [finalDestination, origin1, origin2, ...] built by appending each origin
 // while walking k back to 1 (reference getPath uses push, so this order is correct).
-val getPath = (kConnections: Json, k: String, finalDestination: String): Json =>
+val getPath = (kConnections: { String: { String: Conn } }, k: String, finalDestination: String): Json =>
   walk(kConnections, parseInt32(k), finalDestination, [finalDestination])
 
-val walk = (kConnections: Json, i: Int32, destination: String, path: Json): Json =>
+val walk = (kConnections: { String: { String: Conn } }, i: Int32, destination: String, path: Json): Json =>
   if i <= 0 then
     path
   else
-    val connection = kConnections[destination]["${i}"]
-    val origin = if isTransfer(connection) then
-      connection["origin"]
-    else
-      connection[0]["stopTimes"][connection[1]]["stop"]
-    push(path, origin)
-    walk(kConnections, i - 1, origin, path)
+    val round = kConnections[destination]
+    match round
+      is Null =>
+        path
+      else =>
+        val connection = round["${i}"]
+        match connection
+          is Null =>
+            path
+          is Transfer =>
+            val origin = connection["origin"]
+            push(path, origin)
+            walk(kConnections, i - 1, origin, path)
+          else =>
+            val origin = connection[0]["stopTimes"][connection[1]]["stop"]
+            push(path, origin)
+            walk(kConnections, i - 1, origin, path)
 
 // isSame(path, node): does node's parent chain spell out path[0], path[1], ...?
 val isSame = (path: Json, node: Json): Boolean =>
@@ -68,7 +76,7 @@ val mergePathInto = (results: Json, path: Json): Json =>
 export val makeGraphResults = (): Json =>
   { "results": {  } }
 
-export val add = (gr: Json, kConnections: Json): Null =>
+export val add = (gr: Json, kConnections: { String: { String: Conn } }): Null =>
   val results = gr["results"]
   keys(kConnections).for(destination =>
     sortedRoundKeys(kConnections[destination]).for(k =>
