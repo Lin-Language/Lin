@@ -2634,6 +2634,81 @@ print(toString([1, 2, 3].map((x, i) => x + i)))
 }
 
 #[test]
+fn test_generic_callback_param_back_inference() {
+    // A generic function pins its type parameter `T` from a (type-pinning) argument and that
+    // concrete type must be BACK-INFERRED into an UNANNOTATED callback parameter's body. Closes the
+    // under-checking hole where `sort`'s `cmp` params stayed unconstrained when unannotated.
+
+    // HOLE A — `sort(xs, (a, b) => a["x"])` over `Int32[]`: `a` is now `Int32`, so indexing it is a
+    // genuine type error (previously type-checked because the param was left free).
+    let err = run_expect_err(r#"import { sort } from "std/array"
+val run = (): Null =>
+  val xs: Int32[] = [3, 1, 2]
+  val s = sort(xs, (a, b) => a["x"])
+  null
+run()
+"#);
+    assert!(
+        err.contains("Cannot index into type Int32"),
+        "case A should error: callback param `a` must be Int32, got: {}",
+        err
+    );
+
+    // HOLE B — proof the param is constrained: `val z: String = a` must reject `a` (Int32).
+    let err = run_expect_err(r#"import { sort } from "std/array"
+val run = (): Null =>
+  val xs: Int32[] = [3, 1, 2]
+  val s = sort(xs, (a, b) =>
+    val z: String = a
+    0)
+  null
+run()
+"#);
+    assert!(
+        err.contains("String") && err.contains("Int32"),
+        "case B should error: `a` (Int32) is not String, got: {}",
+        err
+    );
+
+    // map/filter over an `Int32[]` literal back-infer the element param identically (dot-call path).
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { map } from "std/iter"
+import { toString } from "std/string"
+print(toString([1, 2, 3].map(x => x["k"])))
+"#);
+    assert!(
+        err.contains("Cannot index into type Int32"),
+        "map callback param `x` must be Int32, got: {}",
+        err
+    );
+
+    // POSITIVE guards — all must STILL type-check and run:
+    //  * unannotated combinator callbacks over concrete element types,
+    //  * `sortBy` whose keyFn returns a DIFFERENT type than the element (the generic `U` is solved
+    //    from the body, not pinned — must not be forced into a strict mismatch),
+    //  * `reduce` whose accumulator `U` is pinned by `init`,
+    //  * `[].sort(cmp)` over an EMPTY literal (`T = Never`, no element to constrain — the body must
+    //    fall back to inference, not be rejected as "Sub to Never and Never").
+    let output = run(r#"import { print } from "std/io"
+import { map, filter, reduce } from "std/iter"
+import { sort, sortBy } from "std/array"
+import { toString } from "std/string"
+val xs: Int32[] = [3, 1, 2]
+print(toString(xs.map(x => x * 2)))
+print(toString(xs.filter(x => x % 2 == 1)))
+print(toString(xs.reduce(0, (acc, x) => acc + x)))
+print(toString(sortBy(xs, n => n % 3)))
+val empty: Int32[] = []
+print(toString(empty.sort((a, b) => a - b)))
+"#);
+    assert_eq!(
+        output,
+        vec!["[6, 2, 4]", "[3, 1]", "6", "[3, 1, 2]", "[]"],
+        "valid generic-callback programs must still type-check and run"
+    );
+}
+
+#[test]
 fn test_undefined_variable_error() {
     let err = run_expect_err(r#"import { print } from "std/io"
 import { toString } from "std/string"
