@@ -919,30 +919,19 @@ pub unsafe extern "C" fn lin_object_release(obj: *mut LinObject) {
     debug_assert!((*obj).refcount > 0, "lin_object_release: refcount underflow (double free)");
     (*obj).refcount -= 1;
     if (*obj).refcount == 0 {
-        use crate::tagged::*;
         let len = (*obj).len as usize;
         for i in 0..len {
             let entry = (*obj).entries.add(i);
             // Keys are always owned LinString*.
             crate::string::lin_string_release((*entry).key);
-            // Values: release heap-typed payloads.
-            let tag = (*entry).value.tag;
-            let payload = (*entry).value.payload;
-            match tag {
-                TAG_STR => {
-                    crate::string::lin_string_release(payload as *mut crate::string::LinString);
-                }
-                TAG_ARRAY => {
-                    crate::array::lin_array_release(payload as *mut crate::array::LinArray);
-                }
-                TAG_OBJECT => {
-                    lin_object_release(payload as *mut LinObject);
-                }
-                TAG_FUNCTION => {
-                    crate::memory::lin_closure_release(payload as *mut u8);
-                }
-                _ => {} // scalars: no heap payload
-            }
+            // Values: release heap-typed payloads. Route through the canonical
+            // `release_tagged_payload` so EVERY tag is handled — this loop was a hand-rolled
+            // copy that omitted TAG_MAP (and TAG_SHARED/TAG_STREAM), so a `{ String: T }` map
+            // stored as an OBJECT/record FIELD (e.g. `ScanResults.bestArrivals`) was never
+            // released when the record dropped, leaking the whole map + its nested contents
+            // every time the record was discarded (the dominant RAPTOR per-scan leak). Using the
+            // shared helper keeps this in lockstep with the map/array value-walks permanently.
+            release_tagged_payload(&(*entry).value);
         }
         // Free the hash side-index (if built) BEFORE freeing the object header. The table
         // holds only u32 slot indices — no refcounted pointers — so there is nothing to
