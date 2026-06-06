@@ -2435,14 +2435,43 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // integer op on a raw `TaggedVal*` pointer (a codegen-time type-mismatch crash).
             if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
                           | BinOp::BAnd | BinOp::BOr | BinOp::BXor | BinOp::Shl | BinOp::Shr) {
-                operand_ty = if !is_union_ty(&left_ty) { left_ty.clone() }
-                             else if !is_union_ty(&right_ty) { right_ty.clone() }
-                             else { left_ty.clone() };
-                if is_union_ty(&left_ty) && !is_union_ty(&operand_ty) {
-                    lhs = coerce_to_slot_type(lhs, &left_ty, &operand_ty, builder);
-                }
-                if is_union_ty(&right_ty) && !is_union_ty(&operand_ty) {
-                    rhs = coerce_to_slot_type(rhs, &right_ty, &operand_ty, builder);
+                // A DYNAMIC operand whose static type is still a bare `TypeVar` at lowering time —
+                // the `Json` wildcard (`TypeVar(u32::MAX)`) OR an unresolved/index-derived inference
+                // var (e.g. `obj["k"]`, which may be Int, Float, or a missing-key Null) — must STAY
+                // BOXED. Unboxing it to a concrete int would dereference a possibly-null payload and
+                // crash (RAPTOR #5). A GENUINE resolved generic (a reduce accumulator, `total + i`
+                // where `total` resolved to Int32, …) is a CONCRETE type by lowering time (post
+                // monomorphization), NOT a `TypeVar`, so it is coerced/unboxed natively as before.
+                // Box the concrete side to `Json` too so BOTH operands arrive as `TaggedVal*`
+                // pointers; codegen's tagged-arith gate then routes the op through the null-safe
+                // `lin_tagged_arith` runtime path (preserving the runtime numeric family and
+                // faulting cleanly on a non-numeric operand). Boxing the concrete side here — rather
+                // than only marking `operand_ty` — is what makes codegen's `lv.is_pointer_value()`
+                // gate fire for `10 + obj["k"]`, where the literal `10` would otherwise reach the op
+                // as a raw scalar.
+                let left_dyn = matches!(left_ty, Type::TypeVar(_));
+                let right_dyn = matches!(right_ty, Type::TypeVar(_));
+                if left_dyn || right_dyn {
+                    let json = Type::TypeVar(u32::MAX);
+                    // Box whichever side is concrete (NOT a TypeVar) into a Json `TaggedVal*`; a
+                    // side that is already a (possibly-boxed) TypeVar passes through unchanged.
+                    if !left_dyn {
+                        lhs = coerce_to_slot_type(lhs, &left_ty, &json, builder);
+                    }
+                    if !right_dyn {
+                        rhs = coerce_to_slot_type(rhs, &right_ty, &json, builder);
+                    }
+                    operand_ty = json;
+                } else {
+                    operand_ty = if !is_union_ty(&left_ty) { left_ty.clone() }
+                                 else if !is_union_ty(&right_ty) { right_ty.clone() }
+                                 else { left_ty.clone() };
+                    if is_union_ty(&left_ty) && !is_union_ty(&operand_ty) {
+                        lhs = coerce_to_slot_type(lhs, &left_ty, &operand_ty, builder);
+                    }
+                    if is_union_ty(&right_ty) && !is_union_ty(&operand_ty) {
+                        rhs = coerce_to_slot_type(rhs, &right_ty, &operand_ty, builder);
+                    }
                 }
             }
             let dst = builder.alloc_temp(result_type.clone());
@@ -4051,8 +4080,16 @@ fn box_to_json(val: Temp, val_ty: &Type, builder: &mut FuncBuilder) -> Temp {
 /// `range(start, end)` → a flat Int32 array [start, start+1, ..., end-1].
 /// Lowered as: alloc flat array, then a fill loop pushing each value.
 fn lower_range(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
-    let start = lower_expr(&args[0], builder, ctx);
-    let end = lower_expr(&args[1], builder, ctx);
+    let start_raw = lower_expr(&args[0], builder, ctx);
+    let end_raw = lower_expr(&args[1], builder, ctx);
+    // `lin_range` drives a NATIVE i32 loop counter, so its bounds must be concrete i32. A bound
+    // whose static type is the dynamic `Json` wildcard (e.g. `i * s` where `i` is a `Json`-typed
+    // `for`-lambda param, or arithmetic over a value read out of a Json array) arrives BOXED —
+    // unbox it to Int32 here, else the boxed `TaggedVal*` flows into the i32 counter phi (a
+    // representation mismatch the verifier rejects). `coerce_to_slot_type` is a no-op when the
+    // bound is already a concrete int.
+    let start = coerce_to_slot_type(start_raw, &args[0].ty(), &Type::Int32, builder);
+    let end = coerce_to_slot_type(end_raw, &args[1].ty(), &Type::Int32, builder);
 
     // arr = arrayAllocate-style empty flat i32 array (capacity grows via push).
     let arr_ty = Type::Array(Box::new(Type::Int32));

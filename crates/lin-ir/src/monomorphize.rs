@@ -1298,8 +1298,25 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                     // sibling generic on its own `Json` param) hits it routinely. Resolve EVERY
                     // non-concrete TypeVar (any id) to the Json wildcard, producing a tagged
                     // `$Json` monomorph that is representation-consistent and correct.
-                    for v in subs.values_mut() {
-                        *v = erase_nonconcrete_typevars(v);
+                    // A quantified param `U` whose return position is determined by a LAMBDA arg's
+                    // body — i.e. `U` appears as the RETURN of a function-typed param (`f: (T)=>U`)
+                    // — can be left self-bound (`U -> TypeVar(U)`) when that body's inferred type is
+                    // dynamic (the `Json` wildcard or an unresolved/index-derived TypeVar):
+                    // bidirectional checking records the lambda's return as the expected `U` rather
+                    // than the dynamic type, so the self-binding is a no-op that hides a `Json`
+                    // result (e.g. `map(arr, x => x + i)` where `i` is a `Json` `for`-lambda param
+                    // so `x + i` is `Json` — the RAPTOR #5 cascade). Resolve such ids to `Json` so
+                    // the call materialises a correct tagged `$Json` monomorph instead of erroring
+                    // as "cannot infer". A genuinely uninferrable param (e.g. `<T>(): T => 0` called
+                    // bare) is NOT a lambda-return param, so it still errors below.
+                    let lambda_return_ids = function_param_return_tv_ids(&params);
+                    for (id, v) in subs.iter_mut() {
+                        let is_self_bound = matches!(v, Type::TypeVar(vid) if *vid == *id);
+                        if is_self_bound && lambda_return_ids.contains(id) {
+                            *v = Type::TypeVar(u32::MAX);
+                        } else {
+                            *v = erase_nonconcrete_typevars(v);
+                        }
                     }
 
                     // Fully instantiated ⇔ every quantified id has a (now Json-erased) binding
@@ -1676,6 +1693,20 @@ fn mentions_unconstrained(
         None => true,
         Some(t) => mentions_generic_tv(t),
     })
+}
+
+/// Collect the quantified generic TypeVar ids (≥ base, excluding the Json wildcard) that appear in
+/// the RETURN position of any function-typed parameter — i.e. the `U` in an `f: (T) => U` param.
+/// Such an id is determined by the body of the LAMBDA passed for that param, so a `Json`-bodied
+/// lambda can legitimately leave it self-bound (see the call site for why).
+fn function_param_return_tv_ids(params: &[TypedParam]) -> std::collections::HashSet<u32> {
+    let mut out = std::collections::HashSet::new();
+    for p in params {
+        if let Type::Function { ret, .. } = &p.ty {
+            collect_quantified_ids(ret, &mut out);
+        }
+    }
+    out
 }
 
 /// Collect every quantified generic TypeVar id (≥ base, excluding the Json wildcard) in `ty`.

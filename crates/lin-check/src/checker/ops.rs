@@ -111,8 +111,15 @@ impl Checker {
                 } else if left_ty.is_numeric() && right_ty.is_numeric() {
                     widen_numeric(&left_ty, &right_ty).unwrap_or(Type::Int32)
                 } else if left_is_any || right_is_any {
-                    // Dynamic operand — use the known side's type, or Int32 as fallback
-                    if left_is_any { right_ty.clone() } else { left_ty.clone() }
+                    // A DYNAMIC operand — a `Json` wildcard or an unresolved/index-derived TypeVar
+                    // (e.g. `obj["k"]`, whose runtime value may be Int, Float, or a missing-key
+                    // Null). The result is dynamic `Json`, NOT the concrete side: the runtime
+                    // numeric family is unknown, and a missing-key Null must FAULT (not crash) at
+                    // the op. Typing it `Json` keeps the value boxed so IR lowering routes the op
+                    // through the null-safe `lin_tagged_arith` runtime path (RAPTOR #5). (The
+                    // genuine `Number`-bounded numeric TypeVar is handled by the `*_num_tv` arm
+                    // above and stays native.)
+                    Type::TypeVar(u32::MAX)
                 } else {
                     return Err(Diagnostic::error(
                         span,
