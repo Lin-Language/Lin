@@ -1403,24 +1403,35 @@ impl<'ctx> Codegen<'ctx> {
                             // copy each element struct's field payload into the buffer (scalar
                             // fields → no retain). `elem_ty` is the sealed Object type.
                             let arr = if let Some(fields) = Self::sealed_fields(elem_ty)
-                                .filter(|f| f.values().all(Self::is_sealed_scalar_field))
+                                .filter(|f| f.values().all(Self::sealed_array_elem_field_packable))
                             {
                                 let fields = fields.clone();
                                 let stride = Self::sealed_array_stride(&fields);
                                 let desc = self.sealed_descriptor(&fields); // NULL for scalar-only
+                                let has_heap = fields.values().any(|t| Self::sealed_field_kind(t).is_some());
                                 let alloc_fn = self.get_or_declare_fn(
                                     "lin_sealed_array_alloc",
                                     ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into()], false));
                                 let arr_v = self.builder.call(alloc_fn,
                                     &[cap.into(), i64_ty.const_int(stride, false).into(), desc.into()],
                                     "ir_sarr").try_as_basic_value().unwrap_basic();
+                                // Construct: each element struct `ev` is a BORROWED standalone struct
+                                // (owned by its own temp, released at this scope's exit). A heap-field
+                                // array must take its OWN +1 on every heap field as it copies the
+                                // payload into the slot (`..._retaining`) — else the array's
+                                // release-on-drop would double-free the still-borrowed inner. A
+                                // scalar-only record has no heap field, so the plain payload copy
+                                // (NULL desc → retaining push is a no-op for fields) is identical.
+                                let push_name = if has_heap {
+                                    "lin_sealed_array_push_struct_retaining"
+                                } else {
+                                    "lin_sealed_array_push_struct"
+                                };
                                 let push_fn = self.get_or_declare_fn(
-                                    "lin_sealed_array_push_struct",
+                                    push_name,
                                     self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                                 for e_temp in elements {
                                     if let Some(&ev) = temp_map.get(e_temp) {
-                                        // Copy the element struct's payload (skipping its header);
-                                        // scalar fields, so a verbatim byte copy is a full copy.
                                         self.builder.call(push_fn, &[arr_v.into(), ev.into()], "");
                                     }
                                 }
