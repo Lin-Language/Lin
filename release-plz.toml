@@ -1,0 +1,35 @@
+[workspace]
+# Act only through the release PR; merging it cuts the release.
+release_always = false
+# Nothing is published to crates.io (all deps are path-only).
+publish = false
+# Create the GitHub release and git tag.
+git_release_enable = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+
+[changelog]
+header = "# Changelog\n\nAll notable changes to Lin are documented here.\n"
+body = """
+## [{{ version }}]{%- if release_link %}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | upper_first }}
+{% for commit in commits %}
+- {% if commit.scope %}**{{ commit.scope }}**: {% endif %}{{ commit.message | upper_first }}
+{%- endfor %}
+{% endfor %}
+"""
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug Fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^refactor", group = "Refactor" },
+  { body = ".*BREAKING CHANGE.*", group = "Breaking Changes" },
+  { message = "^.*!:", group = "Breaking Changes" },
+  { message = "^chore", skip = true },
+  { message = "^ci", skip = true },
+  { message = "^test", skip = true },
+  { message = "^style", skip = true },
+  { message = ".*", group = "Other" },
+]

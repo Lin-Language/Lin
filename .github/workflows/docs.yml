@@ -44,6 +44,12 @@ jobs:
       - name: Build Lin compiler
         run: cargo build --workspace
 
+      # Mirror the release-plz-generated changelog onto the docs site. The
+      # `|| true` guards the pre-first-release case where CHANGELOG.md is absent
+      # (the committed placeholder page stays in place until then).
+      - name: Mirror changelog to docs site
+        run: cp CHANGELOG.md docs-site/content/changelog.md || true
+
       - name: Build the docs generator (written in Lin)
         run: ./target/debug/lin build docs-site/builder/main.lin -o docs-builder
 

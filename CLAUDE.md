@@ -33,6 +33,15 @@ CI runs on GitHub Actions (`.github/workflows/ci.yml`): `cargo build`, `cargo te
 
 A source formatter exists: `cargo run -p lin -- fmt <paths>` rewrites `.lin` files to canonical form in place; `lin fmt --check <paths>` verifies without writing (used by CI). It is comment-preserving and AST-faithful — it must never change program meaning, which is enforced by the corpus type-check + run-equivalence gate in the formatter tests (`crates/lin/tests/integration.rs`). See ADR-040 (reversed) for comment handling.
 
+## Releasing
+
+Releases are automated with [release-plz](https://release-plz.dev/) and driven by Conventional Commits (see ADR-087).
+
+- **Single source of truth for the version**: `[workspace.package].version` in the root `Cargo.toml`. Every crate inherits it via `version.workspace = true`; never bump a crate version by hand.
+- **Cutting a release**: every push to `master` updates an open "chore: release" PR (version bump + generated `CHANGELOG.md`). **Merging that PR cuts the release** — release-plz then creates the `vX.Y.Z` tag + GitHub release and attaches the platform binaries/VSIX. Commit prefixes matter: `feat` → minor, `fix`/`perf` → patch, `!`/`BREAKING CHANGE` → major; `chore`/`ci`/`test`/`style` are skipped.
+- **Bleeding edge**: `release.yml` still publishes a rolling `latest` *prerelease* on every push to `master`.
+- **Install**: `install.sh` installs the newest *stable* release by default (skips the rolling prerelease); `LIN_VERSION=vX.Y.Z` pins one.
+
 ## Workspace layout
 
 Cargo workspace with nine crates (`crates/`):
