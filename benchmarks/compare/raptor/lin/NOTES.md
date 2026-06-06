@@ -112,23 +112,20 @@ trigger — a `match`-narrowed connection read off the typed nested map projecte
 stable owned box). With that fix, the scan build (`setTrip`/`setTransfer`), the single-pass query
 path, `graphResults`, and `stringResults` all type and run cleanly.
 
-**One residual codegen bug surfaced (worked around at the Lin level, no `crates/` change):** a
-nested typed map (`{ String: { String: Conn } }`) passed through an **indirect `Function`-value
-call** loses its inner-map entries on the callee side — `keys(m[k])` reads empty. Minimal repro:
+**A second codegen bug surfaced during this work and is now FIXED on master:** a typed map
+(`{ String: T }`, flat or nested) passed through an **indirect `Function`-value call** was
+corrupted on the callee side — the boxed `TAG_MAP` `TaggedVal*` was passed through the closure-ABI
+wrapper unchanged instead of being unboxed to the raw `LinMap*`, so the callee read an empty map
+(`keys(m[k])` → empty) or null-dereferenced. Root cause: `unbox_value` in
+`crates/lin-codegen/src/codegen/boxing.rs` was missing the `Type::Map(_)` arm that its sibling
+`unbox_tagged_val_to_type` already had (the two drifted). Fixed by adding the arm; covered by the
+`test_typed_map_through_function_value` integration test.
 
-```lin
-// fn: Function holds completeJourneys; calling fn(prev[idx], journeys) where prev[idx] is a
-// { String: { String: Conn } } makes the callee's m[origin] read an EMPTY inner map (entries
-// lost), so the multi-day fold produced 0 journeys. A DIRECT call completeJourneys(prev[idx], …)
-// keeps the inner map intact.
-```
-
-`query.lin`'s `reduceReversed` previously folded `completeJourneys` via a `fn: Function` parameter.
-The fold is always `completeJourneys`, so the indirection was gratuitous; it now calls
-`completeJourneys` **directly**, which keeps the nested map intact and is faithful to the reference
-(a plain `reduce`). This is the only Lin-side change driven by the residual bug; it is worth a
-separate language fix (the `Function`-typed-call argument-coercion path does not preserve the
-precise nested-map type, so the inner container is not materialized on the callee side).
+`query.lin`'s `reduceReversed` calls `completeJourneys` **directly** rather than via a
+`fn: Function` parameter — the fold is always `completeJourneys`, so the indirection would be
+gratuitous, and a plain `reduce` is faithful to the reference. (This was originally a workaround for
+the bug above; it is kept because the direct call is genuinely cleaner, not because the indirection
+no longer works.)
 
 **Consumers converted from boolean `isTransfer`/`isTimetableLeg` guards to `match … is Transfer`:**
 `journeyFactory.lin` (`buildLegs`), `graphResults.lin` (`walk`), `stringResults.lin` (`walkPath`),

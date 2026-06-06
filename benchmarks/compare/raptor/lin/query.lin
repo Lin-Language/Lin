@@ -64,12 +64,9 @@ val getJourneysFromConnections = (kConnections: { String: { String: Conn } }, pr
   var idx = length(prevConnections) - 1
   reduceReversed(prevConnections, idx, journeys)
 
-// reduceReversed folds completeJourneys over prevConnections back-to-front. It calls
-// completeJourneys DIRECTLY rather than via a `fn: Function` parameter: a nested typed map
-// (`{ String: { String: Conn } }`) passed through an indirect `Function`-value call loses its
-// inner-map entries in codegen (the Function type erases the precise map type, so the inner
-// container is not materialized on the callee side). The direct call keeps the inner map intact;
-// the fold is fixed (always completeJourneys), so the indirection was gratuitous anyway.
+// reduceReversed folds completeJourneys over prevConnections back-to-front. The fold function is
+// fixed (always completeJourneys), so it is called directly rather than threaded through a
+// `fn: Function` parameter — the indirection would be gratuitous.
 val reduceReversed = (prevConnections: { String: { String: Conn } }[], idx: Int32, journeys: Json): Json =>
   if idx < 0 then
     journeys
