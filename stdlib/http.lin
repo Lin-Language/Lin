@@ -4,11 +4,11 @@ import foreign "lin-runtime"
   val lin_parse_json: (String) => Json
   val lin_server_path_match: (String, String) => Json
 
-export type HttpRequest = { "method": String, "path": String, "query": String, "headers": Json, "body": String }
+export type HttpRequest = { "method": String, "path": String, "query": String, "headers": { String: String }, "body": String }
 
-export type HttpResponse = { "status": Int32, "headers": Json, "body": String }
+export type HttpResponse = { "status": Int32, "headers": { String: String }, "body": String }
 
-export type HttpOptions = { "method": String, "headers": Json, "body": String }
+export type HttpOptions = { "method": String, "headers": { String: String }, "body": String }
 
 export val fetch = (url: String): Json =>
   lin_http_fetch(url)
