@@ -368,6 +368,36 @@ impl<'ctx> Codegen<'ctx> {
             let tagged = self.builder.call(self.rt.array_get, &[container.into(), idx.into()], "ir_aget").try_as_basic_value().unwrap_basic();
             return self.unbox_tagged_val_to_type(tagged, result_ty);
         }
+        // Sealed record indexed by a NON-LITERAL key (`p[k]`). A sealed record is a packed,
+        // header-prefixed struct with NO runtime key table, so a dynamic key can't resolve a slot
+        // by offset; reading it as a `LinObject` (the generic object path below) misinterprets the
+        // packed bytes and crashes the runtime. The literal-key case is fused upstream (IR
+        // lowering → constant-offset FieldGet / Null const); only a runtime key reaches here.
+        // Materialize the sealed record to a boxed `LinObject` (its EXACTLY-declared fields — extras
+        // already stripped) and do the normal dynamic `lin_object_get`, which returns the matching
+        // value or Null for an absent key (safe-access §6.1). Clone the (borrowed, interior) result
+        // into a fresh owned box and release the temporary object before returning, so nothing
+        // dangles once the materialized object is freed.
+        if let Some(fields) = Self::sealed_fields(obj_ty).cloned() {
+            if obj.is_pointer_value() {
+                let mat = self.sealed_materialize_to_object(obj, &fields).into_pointer_value();
+                let key_raw = if Self::is_union_type(key_ty) && key.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[key.into()], "sealed_dynk_unbox").try_as_basic_value().unwrap_basic()
+                } else {
+                    key
+                };
+                let entry = self.builder.call(self.rt.object_get, &[mat.into(), key_raw.into()], "sealed_dynk_get").try_as_basic_value().unwrap_basic();
+                // `entry` is a borrowed interior `*TaggedVal` (or null) into `mat`; clone it into an
+                // independent owned box, then free `mat` (the clone keeps the inner alive).
+                let clone_fn = self.get_or_declare_fn("lin_tagged_clone", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                let owned = self.builder.call(clone_fn, &[entry.into()], "sealed_dynk_clone").try_as_basic_value().unwrap_basic();
+                self.builder.call(self.rt.object_release, &[mat.into()], "");
+                // `owned` is a +1 box; the IR lowering's projection CloneBox (union result) clones it
+                // again into the binding's owned box — balanced. Match the surrounding repr.
+                return if Self::is_union_type(result_ty) { owned } else { self.unbox_tagged_val_to_type(owned, result_ty) };
+            }
+            return ptr_ty.const_null().into();
+        }
         // Object key access. lin_object_get expects a raw *LinString key; unbox a boxed key.
         let key_str = if key_ty.is_string_ish() {
             key
@@ -886,6 +916,11 @@ impl<'ctx> Codegen<'ctx> {
             return ptr_ty.const_null().into();
         };
         let fields = fields.clone();
+        // A field NOT in the sealed element's shape is statically absent — `sealed_field_layout`
+        // would assert. Follow safe-access (§6.1: missing key → Null) instead of panicking.
+        if !fields.contains_key(field) {
+            return self.null_value_for(result_ty);
+        }
         let (field_off, _total) = Self::sealed_field_layout(&fields, field);
         let payload_off = field_off - Self::SEALED_HEADER;
         let fld_ty = fields.get(field).cloned().unwrap_or(Type::Null);
@@ -1480,10 +1515,32 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.call(self.rt.sealed_release, &[val.into(), i64_ty.const_int(total, false).into()], "");
     }
 
+    /// The Null value in the representation `result_ty` expects. A union/Json slot holds a boxed
+    /// TaggedVal*, so emit a boxed null (`lin_box_null`); any other (concrete, incl. `Type::Null`)
+    /// slot is a raw null pointer — identical to how a `Const::Null` literal is materialized. Used
+    /// by the sealed-record field-access paths to yield the safe-access missing-key → Null result
+    /// without panicking, mirroring the boxed `lin_object_get` missing-key path.
+    fn null_value_for(&mut self, result_ty: &Type) -> BasicValueEnum<'ctx> {
+        if Self::is_union_type(result_ty) {
+            self.builder.call(self.rt.box_null, &[], "sealed_absent_null").try_as_basic_value().unwrap_basic()
+        } else {
+            self.context.ptr_type(AddressSpace::default()).const_null().into()
+        }
+    }
+
     pub(crate) fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, obj_ty: &Type, result_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         // Sealed scalar record: constant-offset load (the win).
         if let Some(fields) = Self::sealed_scalar_fields(obj_ty) {
+            // A sealed record has EXACTLY its declared fields. A field NOT in the shape is
+            // statically absent — `sealed_field_layout` would assert on it (compiler panic). Follow
+            // the safe-access rule (§6.1: missing object key → Null), mirroring the boxed
+            // `lin_object_get` missing-key → Null path: produce the Null result for `result_ty`.
+            // (The IR lowerer already routes a statically-absent literal key to a Null const; this is
+            // the codegen-side safety net for any other FieldGet that reaches here, e.g. destructure.)
+            if !fields.contains_key(field) {
+                return self.null_value_for(result_ty);
+            }
             if obj.is_pointer_value() {
                 return self.sealed_field_get(obj, field, fields, result_ty);
             }
