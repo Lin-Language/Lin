@@ -242,7 +242,11 @@ impl<'ctx> Codegen<'ctx> {
                 let fields = Self::sealed_scalar_fields(target_ty).unwrap().clone();
                 self.sealed_project_from(ptr, &Type::TypeVar(u32::MAX), &fields)
             }
-            Type::Object { .. } | Type::Array(_) | Type::FixedArray(_) | Type::Function { .. } => {
+            // Keep in sync with `unbox_tagged_val_to_type` below. A typed index-signature map
+            // (`{ String: T }`, `Type::Map`) is boxed as TAG_MAP whose payload is the raw
+            // `LinMap*`; unbox it back to that pointer here too, or it leaks through the
+            // closure-ABI wrapper as a TaggedVal box masquerading as a `LinMap*`.
+            Type::Object { .. } | Type::Array(_) | Type::FixedArray(_) | Type::Function { .. } | Type::Map(_) => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr_val.into()], "uptr")
                     .try_as_basic_value().unwrap_basic()
             }
