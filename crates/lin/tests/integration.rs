@@ -9853,79 +9853,58 @@ main()
 // ── `is <ObjectType>` deep type validation (ADR-036) ──────────────────────────
 
 #[test]
-fn test_is_objecttype_deep_rejects_wrong_field_type() {
-    // ADR-036: `is Person` deep-validates field TYPES, not just presence. A Json value
-    // whose `age` is a string (both keys present, WRONG type) must NOT match Person, so the arm
-    // falls through to `else` instead of narrowing and operating on the wrong runtime type.
-    let out = run(r#"import { print } from "std/io"
-type Person = { "name": String, "age": Int32 }
-type Box = { "data": Json }
-val main = (): Null =>
-  val bad: Box = { "data": { "name": "ok", "age": "not-an-int" } }
-  val v: Json = bad["data"]
-  print(if v is Person then "WRONG-MATCH" else "rejected")
-  val good: Box = { "data": { "name": "ok", "age": 5 } }
-  val w: Json = good["data"]
-  print(if w is Person then "matched" else "WRONG-NO-MATCH")
-main()
-"#);
-    assert_eq!(out, vec!["rejected", "matched"]);
-}
-
-#[test]
-fn test_is_objecttype_deep_nested() {
-    // ADR-035: deep validation recurses into NESTED object fields. A wrong type in a nested field
-    // (zip as a string) is rejected; a correct nested value matches.
-    let out = run(r#"import { print } from "std/io"
-type T = { "addr": { "zip": Int32 } }
-type Box = { "data": Json }
-val main = (): Null =>
-  val bad: Box = { "data": { "addr": { "zip": "oops" } } }
-  val v: Json = bad["data"]
-  print(if v is T then "WRONG" else "nested-rejected")
-  val good: Box = { "data": { "addr": { "zip": 90210 } } }
-  val w: Json = good["data"]
-  print(if w is T then "nested-matched" else "WRONG")
-main()
-"#);
-    assert_eq!(out, vec!["nested-rejected", "nested-matched"]);
-}
-
-#[test]
-fn test_is_objecttype_deep_accepts_valid_and_narrows() {
-    // ADR-035: a fully well-typed value matches AND the narrowed field access is sound — `v["age"]`
-    // is a real Int32, so `v["age"] + 1` produces a correct number (the unsoundness the earlier
-    // presence-only rule left open, now folded into ADR-036, is closed).
+fn test_is_objecttype_deep_validation() {
+    // Consolidated `is <ObjectType>` deep type validation (ADR-035/036; 4 former one-build tests →
+    // one program, uniquely-named types, assertions preserved in order). `is T` deep-validates
+    // field TYPES (not just presence), recurses into nested objects, narrows soundly on a match,
+    // and inherits fromJson's number policy.
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 type Person = { "name": String, "age": Int32 }
-type Box = { "data": Json }
-val main = (): Null =>
-  val b: Box = { "data": { "name": "Ada", "age": 36 } }
-  val v: Json = b["data"]
-  if v is Person then print("age+1=${toString(v["age"] + 1)}") else print("no")
-main()
-"#);
-    assert_eq!(out, vec!["age+1=37"]);
-}
+type Nested = { "addr": { "zip": Int32 } }
+type NumBox = { "n": Int32 }
+type DataBox = { "data": Json }
 
-#[test]
-fn test_is_objecttype_deep_number_policy() {
-    // ADR-035 inherits fromJson's number policy: a non-integral number fails an Int target;
-    // an integral float (5.0) satisfies it.
-    let out = run(r#"import { print } from "std/io"
-type N = { "n": Int32 }
-type Box = { "data": Json }
 val main = (): Null =>
-  val frac: Box = { "data": { "n": 3.14 } }
-  val v: Json = frac["data"]
-  print(if v is N then "WRONG-frac" else "frac-rejected")
-  val whole: Box = { "data": { "n": 5.0 } }
-  val w: Json = whole["data"]
-  print(if w is N then "integral-matched" else "WRONG-int")
+  // rejects_wrong_field_type: age as a string (keys present, WRONG type) must NOT match.
+  val badType: DataBox = { "data": { "name": "ok", "age": "not-an-int" } }
+  val v1: Json = badType["data"]
+  print(if v1 is Person then "WRONG-MATCH" else "rejected")
+  val goodType: DataBox = { "data": { "name": "ok", "age": 5 } }
+  val w1: Json = goodType["data"]
+  print(if w1 is Person then "matched" else "WRONG-NO-MATCH")
+
+  // deep_nested: validation recurses into NESTED object fields.
+  val badNest: DataBox = { "data": { "addr": { "zip": "oops" } } }
+  val v2: Json = badNest["data"]
+  print(if v2 is Nested then "WRONG" else "nested-rejected")
+  val goodNest: DataBox = { "data": { "addr": { "zip": 90210 } } }
+  val w2: Json = goodNest["data"]
+  print(if w2 is Nested then "nested-matched" else "WRONG")
+
+  // accepts_valid_and_narrows: a well-typed value matches AND the narrowed field access is sound.
+  val ok: DataBox = { "data": { "name": "Ada", "age": 36 } }
+  val v3: Json = ok["data"]
+  if v3 is Person then print("age+1=${toString(v3["age"] + 1)}") else print("no")
+
+  // number_policy: a non-integral number fails an Int target; an integral float (5.0) satisfies it.
+  val frac: DataBox = { "data": { "n": 3.14 } }
+  val v4: Json = frac["data"]
+  print(if v4 is NumBox then "WRONG-frac" else "frac-rejected")
+  val whole: DataBox = { "data": { "n": 5.0 } }
+  val w4: Json = whole["data"]
+  print(if w4 is NumBox then "integral-matched" else "WRONG-int")
 main()
 "#);
-    assert_eq!(out, vec!["frac-rejected", "integral-matched"]);
+    assert_eq!(
+        out,
+        vec![
+            "rejected", "matched",                  // rejects_wrong_field_type
+            "nested-rejected", "nested-matched",    // deep_nested
+            "age+1=37",                             // accepts_valid_and_narrows
+            "frac-rejected", "integral-matched",    // number_policy
+        ]
+    );
 }
 
 #[test]
@@ -10205,22 +10184,11 @@ match r
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_generic_identity_int_and_string() {
-    // The canonical Phase-0 slice: one generic `val` function instantiated at two types
-    // in the same module. T=Int32 must run native (no boxing — see the IR-proof test below).
-    let out = run(r#"import { print } from "std/io"
-import { toString } from "std/string"
-val identity = <T>(x: T): T => x
-print(toString(identity(5)))
-print(identity("hello"))
-"#);
-    assert_eq!(out, vec!["5", "hello"]);
-}
-
-#[test]
-fn test_generic_identity_three_types_and_reuse() {
-    // Generic over a third type (Bool), plus the SAME type used twice (Int32) to exercise
-    // specialization de-duplication.
+fn test_generic_identity_int_string_and_reuse() {
+    // The canonical Phase-0 slice: one generic `val` instantiated at several types in the same
+    // module — Int32 (which must run native, see the IR-proof test below), String, and Bool — with
+    // Int32 used TWICE to exercise specialization de-duplication. (Merged from the former
+    // `int_and_string` + `three_types_and_reuse` tests; the second already subsumed the first.)
     let out = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 val identity = <T>(x: T): T => x
@@ -12307,153 +12275,109 @@ fn libc_sigabrt() -> i32 {
 // -------------------------------------------------------------------------
 
 #[test]
-fn test_union_discrim_strlit_closed_concrete() {
-    // Closed concrete union discriminated by a StrLit field VALUE. Both arms must
-    // select the correct variant and the narrowed binding must read the right field.
+fn test_union_discrim_forms() {
+    // Consolidated union-discrimination behaviours (6 former one-build tests → one program; each
+    // case keeps uniquely-named types/functions and its assertions in order).
     let out = run(r#"
 import { print } from "std/io"
-type Ok = { "type": "ok", "value": Int32 }
-type Err = { "type": "err", "msg": String }
-type Res = Ok | Err
 
-val describe = (r: Res): String =>
+// strlit_closed_concrete: closed concrete union discriminated by a StrLit field VALUE; both arms
+// select the correct variant and the narrowed binding reads the right field.
+type COk = { "type": "ok", "value": Int32 }
+type CErr = { "type": "err", "msg": String }
+type CRes = COk | CErr
+val describeC = (r: CRes): String =>
   match r
-    is Ok => "ok=${r["value"]}"
-    is Err => "err=${r["msg"]}"
+    is COk => "ok=${r["value"]}"
+    is CErr => "err=${r["msg"]}"
+val ca: CRes = { "type": "ok", "value": 42 }
+val cb: CRes = { "type": "err", "msg": "boom" }
+print(describeC(ca))
+print(describeC(cb))
 
-val a: Res = { "type": "ok", "value": 42 }
-val b: Res = { "type": "err", "msg": "boom" }
-print(describe(a))
-print(describe(b))
-"#);
-    assert_eq!(out, vec!["ok=42", "err=boom"]);
-}
-
-#[test]
-fn test_union_discrim_strlit_three_variants() {
-    // Three-variant StrLit-discriminated closed concrete union: each `is` arm must
-    // be distinguished from BOTH siblings by its distinct StrLit discriminant.
-    let out = run(r#"
-import { print } from "std/io"
-type A = { "tag": "a", "x": Int32 }
-type B = { "tag": "b", "y": String }
-type C = { "tag": "c", "z": Boolean }
-type ABC = A | B | C
-
-val f = (v: ABC): String =>
+// strlit_three_variants: each `is` arm distinguished from BOTH siblings by its StrLit discriminant.
+type TA = { "tag": "a", "x": Int32 }
+type TB = { "tag": "b", "y": String }
+type TC = { "tag": "c", "z": Boolean }
+type ABC = TA | TB | TC
+val f3 = (v: ABC): String =>
   match v
-    is A => "A:${v["x"]}"
-    is B => "B:${v["y"]}"
-    is C => "C:${v["z"]}"
+    is TA => "A:${v["x"]}"
+    is TB => "B:${v["y"]}"
+    is TC => "C:${v["z"]}"
+val t3a: ABC = { "tag": "a", "x": 7 }
+val t3b: ABC = { "tag": "b", "y": "hi" }
+val t3c: ABC = { "tag": "c", "z": true }
+print(f3(t3a))
+print(f3(t3b))
+print(f3(t3c))
 
-val a: ABC = { "tag": "a", "x": 7 }
-val b: ABC = { "tag": "b", "y": "hi" }
-val c: ABC = { "tag": "c", "z": true }
-print(f(a))
-print(f(b))
-print(f(c))
-"#);
-    assert_eq!(out, vec!["A:7", "B:hi", "C:true"]);
-}
-
-#[test]
-fn test_union_discrim_presence_only_falls_back_but_correct() {
-    // Closed concrete union whose variants are disjoint ONLY by field PRESENCE
-    // (the base-String `kind`, the calc AST `Num | BinOp` shape). Field presence is
-    // UNSOUND under structural width-subtyping, so this case FALLS BACK to the full
-    // recursive `MatchesSchema` — it must still match correctly.
-    let out = run(r#"
-import { print } from "std/io"
+// presence_only_falls_back_but_correct: variants disjoint ONLY by field PRESENCE (unsound under
+// width-subtyping) FALL BACK to the full recursive MatchesSchema — must still match correctly.
 type Num = { "kind": String, "value": Int32 }
 type BinOp = { "kind": String, "op": String, "left": Int32, "right": Int32 }
 type Ast = Num | BinOp
-
-val eval = (n: Ast): Int32 =>
+val evalAst = (n: Ast): Int32 =>
   match n
     is Num => n["value"]
     is BinOp => n["left"] + n["right"]
+val pa: Ast = { "kind": "num", "value": 5 }
+val pb: Ast = { "kind": "binop", "op": "+", "left": 3, "right": 4 }
+print("${evalAst(pa)}")
+print("${evalAst(pb)}")
 
-val a: Ast = { "kind": "num", "value": 5 }
-val b: Ast = { "kind": "binop", "op": "+", "left": 3, "right": 4 }
-print(eval(a))
-print(eval(b))
-"#);
-    assert_eq!(out, vec!["5", "7"]);
-}
-
-#[test]
-fn test_union_discrim_json_scrutinee_full_validation() {
-    // A `:Json` scrutinee against the SAME variant types MUST keep full recursive
-    // validation: extra-field values still match, but a value with the right
-    // discriminant and a WRONG field TYPE must NOT match that variant (it is the
-    // recursive `MatchesSchema` that catches this — the fast path is not used here).
-    let out = run(r#"
-import { print } from "std/io"
-type Ok = { "type": "ok", "value": Int32 }
-type Err = { "type": "err", "msg": String }
-
+// json_scrutinee_full_validation: a :Json scrutinee keeps full recursive validation — extra-field
+// values match, but a right-discriminant/WRONG-field-type value must NOT match (recursive
+// MatchesSchema catches it; the fast path is not used here).
+type JOk = { "type": "ok", "value": Int32 }
+type JErr = { "type": "err", "msg": String }
 val classify = (r: Json): String =>
   match r
-    is Ok => "ok"
-    is Err => "err"
+    is JOk => "ok"
+    is JErr => "err"
     else => "neither"
-
-// well-formed
 print(classify({ "type": "ok", "value": 42 }))
-// well-formed with an EXTRA field — width subtyping, still an Ok
 print(classify({ "type": "ok", "value": 42, "extra": 1 }))
-// right discriminant, WRONG field type — full validation must reject -> neither
 print(classify({ "type": "ok", "value": "wrong" }))
-// missing required field -> neither
 print(classify({ "type": "ok" }))
-// completely wrong shape -> neither
 print(classify({ "random": 1 }))
 print(classify({ "type": "err", "msg": "boom" }))
-"#);
-    assert_eq!(out, vec!["ok", "ok", "neither", "neither", "neither", "err"]);
-}
 
-#[test]
-fn test_union_discrim_standalone_is_expr() {
-    // The fast path also applies to a standalone `is` boolean expression (not just
-    // match arms) over a closed concrete union scrutinee.
-    let out = run(r#"
-import { print } from "std/io"
-type Ok = { "type": "ok", "value": Int32 }
-type Err = { "type": "err", "msg": String }
-type Res = Ok | Err
+// standalone_is_expr: the fast path also applies to a standalone `is` boolean expression.
+type SOk = { "type": "ok", "value": Int32 }
+type SErr = { "type": "err", "msg": String }
+type SRes = SOk | SErr
+val label = (r: SRes): String => if r is SOk then "yes" else "no"
+val sa: SRes = { "type": "ok", "value": 1 }
+val sb: SRes = { "type": "err", "msg": "x" }
+print(label(sa))
+print(label(sb))
 
-val label = (r: Res): String => if r is Ok then "yes" else "no"
-
-val a: Res = { "type": "ok", "value": 1 }
-val b: Res = { "type": "err", "msg": "x" }
-print(label(a))
-print(label(b))
-"#);
-    assert_eq!(out, vec!["yes", "no"]);
-}
-
-#[test]
-fn test_union_discrim_nullable_union() {
-    // A closed concrete union WITH a Null member: the Null is stripped for the
-    // discriminator analysis, the object variants still discriminate by StrLit.
-    let out = run(r#"
-import { print } from "std/io"
-type Ok = { "type": "ok", "value": Int32 }
-type Err = { "type": "err", "msg": String }
-type MaybeRes = Ok | Err | Null
-
-val describe = (r: MaybeRes): String =>
+// nullable_union: a closed concrete union WITH a Null member — Null is stripped for the
+// discriminator analysis, the object variants still discriminate by StrLit.
+type MOk = { "type": "ok", "value": Int32 }
+type MErr = { "type": "err", "msg": String }
+type MaybeRes = MOk | MErr | Null
+val describeM = (r: MaybeRes): String =>
   match r
-    is Ok => "ok=${r["value"]}"
-    is Err => "err"
+    is MOk => "ok=${r["value"]}"
+    is MErr => "err"
     else => "null"
-
-val a: MaybeRes = { "type": "ok", "value": 9 }
-print(describe(a))
-print(describe(null))
+val ma: MaybeRes = { "type": "ok", "value": 9 }
+print(describeM(ma))
+print(describeM(null))
 "#);
-    assert_eq!(out, vec!["ok=9", "null"]);
+    assert_eq!(
+        out,
+        vec![
+            "ok=42", "err=boom",                          // strlit_closed_concrete
+            "A:7", "B:hi", "C:true",                      // strlit_three_variants
+            "5", "7",                                     // presence_only
+            "ok", "ok", "neither", "neither", "neither", "err", // json_scrutinee
+            "yes", "no",                                  // standalone_is_expr
+            "ok=9", "null",                               // nullable_union
+        ]
+    );
 }
 
 // Stage 0.5 sealed-records run-equivalence: a NAMED record type now carries an (inert) `sealed`
