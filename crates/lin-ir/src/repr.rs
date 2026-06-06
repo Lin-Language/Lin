@@ -112,6 +112,29 @@ impl Repr {
     pub fn boxed_opaque() -> Repr {
         Repr::Boxed(Inner::Opaque)
     }
+
+    /// `Some(fields)` iff this repr is a packed sealed RECORD (PackedStruct) — codegen's gate for
+    /// reading/writing a sealed record as a packed `[rc|size|desc|fields…]` struct.
+    pub fn packed_struct_fields(&self) -> Option<&IndexMap<String, Type>> {
+        match self {
+            Repr::Packed(Layout::PackedStruct { fields }) => Some(fields),
+            _ => None,
+        }
+    }
+
+    /// `Some(elem_layout)` iff this repr is a packed sealed ARRAY (`elem_tag == 0xFE`) — codegen's
+    /// gate for the contiguous packed-element buffer read/write/push fast path.
+    pub fn packed_sealed_array_layout(&self) -> Option<&IndexMap<String, Type>> {
+        match self {
+            Repr::Packed(Layout::PackedSealedArray { elem_layout, .. }) => Some(elem_layout),
+            _ => None,
+        }
+    }
+
+    /// True iff this repr is a packed value of EITHER kind (struct or sealed array).
+    pub fn is_packed(&self) -> bool {
+        matches!(self, Repr::Packed(_))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -537,30 +560,71 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                     }
                 }
                 // ASSUME: FieldGet — object is read as a packed struct iff sealed_scalar_fields.
+                // STAGE 3 swaps this site to read `func.repr`; the oracle now checks BOTH directions
+                // so the swap is provably byte identical: (forward) the old predicate ⇒ repr Packed,
+                // AND (reverse) repr Packed-struct ⇒ the old predicate fired (else codegen would take
+                // the packed path where it previously boxed).
                 Instruction::FieldGet { object, obj_ty, .. } => {
-                    if let Some(f) = sealed_fields(obj_ty) {
-                        let r = &repr[object.0 as usize];
-                        if !is_packed_struct(r, f) {
-                            report(&mut bad, "FieldGet(object packed)", *object, "Packed(struct)", r);
+                    let r = &repr[object.0 as usize];
+                    match sealed_fields(obj_ty) {
+                        Some(f) => {
+                            if !is_packed_struct(r, f) {
+                                report(&mut bad, "FieldGet(object packed)", *object, "Packed(struct)", r);
+                            }
+                        }
+                        None => {
+                            if r.packed_struct_fields().is_some() {
+                                report(&mut bad, "FieldGet(object NOT predicate-packed)", *object, "non-Packed-struct", r);
+                            }
                         }
                     }
                 }
-                // ASSUME: SealedArrayFieldGet — array is read as a packed sealed array.
+                // ASSUME: SealedArrayFieldGet — array is read as a packed sealed array (both directions).
                 Instruction::SealedArrayFieldGet { array, arr_ty, .. } => {
-                    if let Some(ef) = sealed_array_elem(arr_ty) {
-                        let r = &repr[array.0 as usize];
-                        if !is_packed_sealed_array(r, ef) {
-                            report(&mut bad, "SealedArrayFieldGet(array packed)", *array, "Packed(sealed array)", r);
+                    let r = &repr[array.0 as usize];
+                    match sealed_array_elem(arr_ty) {
+                        Some(ef) => {
+                            if !is_packed_sealed_array(r, ef) {
+                                report(&mut bad, "SealedArrayFieldGet(array packed)", *array, "Packed(sealed array)", r);
+                            }
+                        }
+                        None => {
+                            if r.packed_sealed_array_layout().is_some() {
+                                report(&mut bad, "SealedArrayFieldGet(array NOT predicate-packed)", *array, "non-Packed-array", r);
+                            }
                         }
                     }
                 }
-                // ASSUME: Index — object read as packed sealed array (whole-element materialize) or
-                // flat scalar array.
+                // ASSUME: Index — object read as packed sealed array (whole-element materialize).
+                // STAGE 3 swaps the sealed-array gate AND the sealed-record dynamic-key gate to repr;
+                // check both directions for each (packed-array and packed-struct).
                 Instruction::Index { object, obj_ty, .. } => {
-                    if let Some(ef) = sealed_array_elem(obj_ty) {
-                        let r = &repr[object.0 as usize];
-                        if !is_packed_sealed_array(r, ef) {
-                            report(&mut bad, "Index(object packed array)", *object, "Packed(sealed array)", r);
+                    let r = &repr[object.0 as usize];
+                    match sealed_array_elem(obj_ty) {
+                        Some(ef) => {
+                            if !is_packed_sealed_array(r, ef) {
+                                report(&mut bad, "Index(object packed array)", *object, "Packed(sealed array)", r);
+                            }
+                        }
+                        None => {
+                            if r.packed_sealed_array_layout().is_some() {
+                                report(&mut bad, "Index(object NOT predicate-packed-array)", *object, "non-Packed-array", r);
+                            }
+                        }
+                    }
+                    // The sealed-record (dynamic non-literal key) gate: codegen reads
+                    // `obj_repr.packed_struct_fields()`. Verify repr Packed-struct iff the type is a
+                    // sealed record. (A sealed-record obj reaching Index is the `p[k]` runtime-key case.)
+                    match sealed_fields(obj_ty) {
+                        Some(f) => {
+                            if !is_packed_struct(r, f) {
+                                report(&mut bad, "Index(object packed struct)", *object, "Packed(struct)", r);
+                            }
+                        }
+                        None => {
+                            if r.packed_struct_fields().is_some() {
+                                report(&mut bad, "Index(object NOT predicate-packed-struct)", *object, "non-Packed-struct", r);
+                            }
                         }
                     }
                 }
@@ -603,11 +667,16 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 /// DEBUG/TEST-only soundness gate (design soundness gate #1). Walks every instruction, computes the
-/// repr each opcode REQUIRES of each operand, and returns any mismatch with `repr[operand]`. In
-/// Stage 2 this documents the invariant; it becomes load-bearing in Stage 3+ once codegen trusts the
-/// table. Currently the REQUIRED reprs it checks are exactly the assume-site requirements the oracle
-/// also covers (a packed FieldGet/SealedArrayFieldGet/Index requires a Packed operand). Returns the
-/// list of violations (empty == sound).
+/// repr each opcode REQUIRES of each operand, and returns any mismatch with `repr[operand]`.
+///
+/// STAGE 3: this verifier is now LOAD-BEARING. Codegen reads `func.repr[operand]` (not the static
+/// `Type`) at exactly the ASSUME sites checked here — `FieldGet`, `SealedArrayFieldGet`, `Index` —
+/// to decide the packed constant-offset load. So a violation (an operand the opcode reads as packed
+/// whose `func.repr` is NOT the matching Packed layout) would mean codegen emits a packed load
+/// against a value that is not physically packed: a silent representation mismatch / UAF. The
+/// `debug_assert!` in [`run`] turns that into a compile-time panic. This is the formal statement of
+/// the design's "a mismatch is inexpressible" invariant for the swapped sites. Returns the list of
+/// violations (empty == sound).
 pub fn verify(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
     let mut bad = Vec::new();
     let fname = func.name.clone().unwrap_or_else(|| format!("fn#{}", func.id.0));
@@ -651,11 +720,16 @@ pub fn verify(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
     bad
 }
 
-/// Run the analysis + (debug-only) oracle + verifier for every function in a module. In Stage 2 this
-/// computes the table and validates the oracle/verifier; it does NOT mutate the module. Wired into
-/// the pipeline immediately before `rc_elide`.
-pub fn run(module: &LinModule) {
-    for func in &module.functions {
+/// Run the analysis for every function in a module and STORE the result on `func.repr`
+/// (Stage 3: codegen consumes this table at every packed-vs-boxed DECIDE / ASSUME site).
+///
+/// In debug builds this ALSO runs the Stage-2 oracle (repr == old type predicate at every site
+/// where the old predicates decide a representation) as a regression check that the swap changed
+/// no decisions, and the soundness verifier (no opcode reads an operand whose required physical
+/// repr differs from `func.repr[operand]`). Wired into the pipeline immediately before `rc_elide`,
+/// so RC sees representation-stable IR.
+pub fn run(module: &mut LinModule) {
+    for func in &mut module.functions {
         let repr = analyze(func);
         #[cfg(debug_assertions)]
         {
@@ -672,8 +746,8 @@ pub fn run(module: &LinModule) {
                 violations.join("\n")
             );
         }
-        // Stage 2: nothing consumes `repr` yet.
-        let _ = &repr;
+        // Stage 3: codegen now reads this table.
+        func.repr = repr;
     }
 }
 
@@ -715,6 +789,7 @@ mod tests {
             temp_types,
             temp_count,
             intrinsic_slots: HashMap::new(),
+            repr: Vec::new(),
         }
     }
 

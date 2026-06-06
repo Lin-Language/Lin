@@ -835,6 +835,7 @@ impl FuncBuilder {
             temp_types: self.temp_types,
             temp_count: self.temp_count,
             intrinsic_slots: self.intrinsic_slots.clone(),
+            repr: Vec::new(),
         }
     }
 

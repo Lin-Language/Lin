@@ -237,7 +237,7 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    pub(crate) fn compile_ir_index(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, result_ty: &Type) -> BasicValueEnum<'ctx> {
+    pub(crate) fn compile_ir_index(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, result_ty: &Type, obj_repr: &lin_ir::repr::Repr) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         if !obj.is_pointer_value() {
             return ptr_ty.const_null().into();
@@ -344,7 +344,9 @@ impl<'ctx> Codegen<'ctx> {
             // is an ownable +1 value the standard retain/release/field-read machinery handles. The
             // hot `arr[i].field` access never reaches here (it is fused upstream to a direct scalar
             // load); this path covers `val p = arr[i]` / passing an element as a whole value.
-            if Self::sealed_array_elem(obj_ty).is_some() {
+            // STAGE 3: packed-sealed-array ASSUME read from the object operand's repr (proven by the
+            // pass + verifier to match where the old `sealed_array_elem(obj_ty)` gate fired).
+            if obj_repr.packed_sealed_array_layout().is_some() {
                 if let Some(fields) = Self::sealed_fields(result_ty) {
                     let fields = fields.clone();
                     return self.sealed_array_materialize_elem(container, idx, &fields);
@@ -378,7 +380,8 @@ impl<'ctx> Codegen<'ctx> {
         // value or Null for an absent key (safe-access §6.1). Clone the (borrowed, interior) result
         // into a fresh owned box and release the temporary object before returning, so nothing
         // dangles once the materialized object is freed.
-        if let Some(fields) = Self::sealed_fields(obj_ty).cloned() {
+        // STAGE 3: a sealed record indexed by a non-literal key — packed-struct ASSUME from repr.
+        if let Some(fields) = obj_repr.packed_struct_fields().cloned() {
             if obj.is_pointer_value() {
                 let mat = self.sealed_materialize_to_object(obj, &fields).into_pointer_value();
                 let key_raw = if Self::is_union_type(key_ty) && key.is_pointer_value() {
@@ -909,10 +912,15 @@ impl<'ctx> Codegen<'ctx> {
         field: &str,
         arr_ty: &Type,
         result_ty: &Type,
+        arr_repr: &lin_ir::repr::Repr,
     ) -> BasicValueEnum<'ctx> {
+        let _ = arr_ty;
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
-        let Some(fields) = Self::sealed_array_elem(arr_ty) else {
+        // STAGE 3: the packed-sealed-array ASSUME is read from the array operand's repr (proven by
+        // the pass + verifier to carry a real `elem_tag==0xFE` packed buffer exactly where the old
+        // `sealed_array_elem(arr_ty)` gate fired). Oracle-proven byte identical.
+        let Some(fields) = arr_repr.packed_sealed_array_layout() else {
             return ptr_ty.const_null().into();
         };
         let fields = fields.clone();
@@ -1528,10 +1536,13 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    pub(crate) fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, obj_ty: &Type, result_ty: &Type) -> BasicValueEnum<'ctx> {
+    pub(crate) fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, obj_ty: &Type, result_ty: &Type, obj_repr: &lin_ir::repr::Repr) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        // Sealed scalar record: constant-offset load (the win).
-        if let Some(fields) = Self::sealed_scalar_fields(obj_ty) {
+        // STAGE 3: the packed-struct ASSUME is read from the object operand's repr (`func.repr`),
+        // not re-derived from `obj_ty`. The representation-inference pass + verifier prove this
+        // operand carries a real packed struct exactly where the old `sealed_scalar_fields(obj_ty)`
+        // gate fired (oracle-proven byte identical). Constant-offset load is the win.
+        if let Some(fields) = obj_repr.packed_struct_fields() {
             // A sealed record has EXACTLY its declared fields. A field NOT in the shape is
             // statically absent — `sealed_field_layout` would assert on it (compiler panic). Follow
             // the safe-access rule (§6.1: missing object key → Null), mirroring the boxed
