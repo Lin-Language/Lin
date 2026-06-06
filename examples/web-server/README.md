@@ -25,7 +25,7 @@ port, routes each incoming request to a handler by path, and returns a response.
 - **`views/footer.jinja`** — a partial pulled into the layout.
 - **`router.test.lin` / `handlers.test.lin`** — assert routed/handler responses
   (including that `getIndex` returns the rendered HTML body). These mock
-  `std/template.render` (ADR-071) with an inline template, so routing/handler logic
+  `std/template.render` (ADR-046) with an inline template, so routing/handler logic
   is tested without depending on the on-disk view path.
 - **`template.test.lin`** — renders the real `index.jinja` file and asserts every
   `{{ ... }}` hole is filled (the one suite that intentionally exercises the file).

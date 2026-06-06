@@ -81,7 +81,7 @@ pub struct Codegen<'ctx> {
     /// concurrency intrinsics). When set, user-emitted Lin functions are NOT marked
     /// `nounwind`: a runtime fault inside an async thunk unwinds through Lin frames to the
     /// thread boundary's `catch_unwind` (spec §24.2.2), so `nounwind` would be unsound on
-    /// any function reachable from a thunk — and any function can be (ADR-042, doc §2.4.3
+    /// any function reachable from a thunk — and any function can be (ADR-027, doc §2.4.3
     /// option a). Conservatively program-wide; the non-async hot path keeps `nounwind`.
     uses_async: bool,
 }
@@ -197,7 +197,7 @@ impl<'ctx> Codegen<'ctx> {
         module: &TypedModule,
         src: Option<&(String, String)>,
         imports: &HashMap<String, TypedModule>,
-        // ADR-071: export names of THIS module that a test `replace` overrides. Their bodies are
+        // ADR-046: export names of THIS module that a test `replace` overrides. Their bodies are
         // not emitted here; the main module supplies the canonical symbol instead.
         replaced_exports: &std::collections::HashSet<String>,
     ) {
@@ -242,7 +242,7 @@ impl<'ctx> Codegen<'ctx> {
         // `imported_val_wrappers[(path, name)]` zero-arg wrapper.
         for stmt in &module.statements {
             if let TypedStmt::Val { value, name: Some(name), .. } = stmt {
-                // ADR-071: a replaced export's symbol is defined by the main module, not here;
+                // ADR-046: a replaced export's symbol is defined by the main module, not here;
                 // it's registered when the main module compiles. Skip it.
                 if replaced_exports.contains(name) {
                     continue;
@@ -888,7 +888,7 @@ impl<'ctx> Codegen<'ctx> {
                                     }
                                 }
                                 CallTarget::Named(name) if name == "lin_string_byte_at" && arg_vals.len() == 2 => {
-                                    // INLINE the O(1) byte accessor (mirrors flat_array_get, ADR-069):
+                                    // INLINE the O(1) byte accessor (mirrors flat_array_get, ADR-044):
                                     // lin_string_byte_at is a hot per-byte call in Lin-side string
                                     // scanning. The runtime fn is a non-inlinable staticlib call; emit
                                     // the bounds-checked indexed load inline so LLVM keeps the string
@@ -1134,7 +1134,7 @@ impl<'ctx> Codegen<'ctx> {
                             temp_map.insert(*dst, result);
                         }
                         Instruction::MakeObject { dst, fields, spreads, ty, stack } => {
-                            // Typed index-signature map `{ String: T }` (ADR-082): allocate a hashed
+                            // Typed index-signature map `{ String: T }` (ADR-055): allocate a hashed
                             // `LinMap` and set each literal field via `lin_map_set` (key = interned
                             // LinString, value = boxed TaggedVal). The checker only produces a
                             // `Type::Map` MakeObject for spread-free string-keyed literals (incl. the
@@ -1148,7 +1148,7 @@ impl<'ctx> Codegen<'ctx> {
                                     if let Some(&val) = temp_map.get(val_temp) {
                                         let key_str = self.compile_string_lit(key).into_pointer_value();
                                         let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
-                                        // Flat-scalar `T` (ADR-082 follow-up): store the scalar UNBOXED
+                                        // Flat-scalar `T` (ADR-055 follow-up): store the scalar UNBOXED
                                         // via a stack TaggedVal carrying `T`'s tag/payload, widening a
                                         // narrower literal value to `T` first. No heap box, no RC.
                                         let tagged = if Self::is_flat_scalar(elem_ty.as_ref()) {
@@ -1494,7 +1494,7 @@ impl<'ctx> Codegen<'ctx> {
                                         .iter()
                                         .filter_map(|c| temp_map.get(c).copied())
                                         .collect();
-                                    // Per-capture release kinds (ADR-060 owning captures). The env
+                                    // Per-capture release kinds (ADR-041 owning captures). The env
                                     // OWNS one reference per owning capture, so the capture
                                     // descriptor is ALWAYS emitted: `lin_closure_release` walks it
                                     // to release heap captures on free, and the async transfer path

@@ -1,4 +1,4 @@
-//! `Shared<T>` — opt-in shared *mutable* state across threads (ADR-043 §2.3.1).
+//! `Shared<T>` — opt-in shared *mutable* state across threads (ADR-028 §2.3.1).
 //!
 //! Copy-by-default (Option C) handles most cases, but a large/mutable structure that many
 //! threads must read and update is better shared than copied into every thread. `Shared<T>` is
@@ -10,7 +10,7 @@
 //!   * `withLock(s, f)` — write lock held across `f`, which mutates the inner value in place;
 //!                        `f`'s result is deep-copied OUT.
 //!
-//! Safety model (ADR-043): every value entering is copied in, every value leaving is copied
+//! Safety model (ADR-028): every value entering is copied in, every value leaving is copied
 //! out, so no live reference into the inner graph escapes the lock. The box's own refcount is
 //! ATOMIC (it is the thing shared across threads); the inner object graph keeps ordinary
 //! non-atomic RC because it is only ever reachable while a lock is held (all access serialized;

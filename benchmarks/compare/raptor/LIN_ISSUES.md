@@ -206,11 +206,11 @@ All three of these BUILD fine, isolating the trigger to "wrapped + inside parens
 - the wrapped `if/else` in a plain function body (no enclosing parens);
 - the one-line `if/else` in a plain function body.
 
-**Root cause:** indentation lexing is suppressed inside `( ) [ ] { }` (ADR-004, so JSON
+**Root cause:** indentation lexing is suppressed inside `( ) [ ] { }` (ADR-003, so JSON
 literals can span lines), so inside a `.for(...)` there are no INDENT/DEDENT tokens. The
 `if`-expression parser relies on that layout to know the `then`-branch expression ended
 and a new-line `else` continues the same `if`; with layout suppressed it can't, and bails
-at the `else`. The fix is analogous to dot-chaining across newlines (ADR-006): the
+at the `else`. The fix is analogous to dot-chaining across newlines (ADR-005): the
 `then`/`else` continuation should use save/restore newline lookahead rather than depend on
 suppressed INDENT/DEDENT.
 

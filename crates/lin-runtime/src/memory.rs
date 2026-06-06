@@ -47,7 +47,7 @@ pub unsafe extern "C" fn lin_cell_free(ptr: *mut u8, size: usize) {
 ///   offset 40: ptr  capture_descriptor (static global, or null; never freed here)
 ///
 /// The env struct is `{ u64 size, cap0, cap1, ... }` — captures at byte offset `8 + i*8`.
-/// The capture descriptor (ADR-060) is `{ u32 count, u8 kinds[count] }`: when non-null, the
+/// The capture descriptor (ADR-041) is `{ u32 count, u8 kinds[count] }`: when non-null, the
 /// closure OWNS one reference per owning capture, so each is released here before the env is
 /// freed (mirroring `lin_array_release`/`lin_object_release` recursive element release). A null
 /// capture descriptor means borrow-only captures (partial applications) — nothing to release.

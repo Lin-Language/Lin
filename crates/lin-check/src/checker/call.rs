@@ -7,19 +7,67 @@ use crate::resolve::{error_type, json_type};
 use crate::typed_ir::*;
 use crate::types::Type;
 
-/// Whether an argument type may satisfy a `Number` (numeric-bounded) parameter (ADR-018, reversed).
+/// Whether an argument type may satisfy a `Number` (numeric-bounded) parameter (ADR-014, reversed).
 /// Accepts:
 ///   * a concrete numeric family (the monomorphizable case),
 ///   * a generic/unsolved type var (the bound flows on to the outer specialization, or is zonked to
 ///     a concrete family), AND
-///   * the `Json` wildcard (`TypeVar(u32::MAX)`) — a dynamic `Json` value (ADR-018 §Json policy).
-///     This matches the existing `Json → Int32` scalar coercion (ADR-048): a `Json` argument is
+///   * the `Json` wildcard (`TypeVar(u32::MAX)`) — a dynamic `Json` value (ADR-014 §Json policy).
+///     This matches the existing `Json → Int32` scalar coercion (ADR-032): a `Json` argument is
 ///     ACCEPTED at a `Number` parameter and monomorphizes to the default `Int32` family, unboxing
 ///     unchecked. Previously a DIRECT `Json` (the bare `u32::MAX` marker) was rejected here while a
 ///     `Json` PROJECTION (`config["k"]`, a fresh inference var) slipped past — an inconsistency now
 ///     removed. A `Json` holding a non-number unboxes as garbage, the SAME accepted, documented
 ///     unsoundness as `Json → Int32` today; `fromJson` is the validated extraction path.
 /// REJECTS only genuinely non-numeric concrete types (`String`/`Bool`/`Object`/array).
+/// Whether a callback's EXPECTED function type (after `apply_type_subs`) has every PARAMETER type
+/// resolved to a FULLY CONCRETE type — no `TypeVar` anywhere, INCLUDING the `Json` wildcard
+/// (`u32::MAX`). When so, the generic params that pin those slots have all been bound by an earlier
+/// (type-pinning) argument to concrete types (e.g. `(Int32, Int32) => U` for `sort(xs, cmp)` once
+/// `T = Int32` from `xs`), so the back-inferred lambda-param hints are EXACT and a body type error
+/// against them is GENUINE — propagate it, closing the inference hole.
+///
+/// Two deliberate exclusions keep this conservative (never reject legitimate code):
+///   * The RETURN type is IGNORED — `map`'s `(T, Int32) => U` legitimately leaves `U` unresolved
+///     until the body determines it (`U` is solved FROM the lambda return), so a free return must
+///     not force a strict check.
+///   * A parameter that is (or contains) the `Json` wildcard is a PERMISSIVE/dynamic hint, not an
+///     exact concrete type — e.g. `reduce`'s accumulator `U` resolving to `Json | Int32` when the
+///     receiver's element is itself a `Json`-tainted inference union. Body ops there (`acc + x`)
+///     are intentionally permissive under the dynamic-`Json` policy, so we keep the inference
+///     fallback rather than reject. Requiring `!contains_type_var()` (which counts the wildcard)
+///     excludes exactly these cases.
+///   * A parameter that is (or contains) `Never` is NOT a real pin either: it comes from an EMPTY
+///     collection (`[].sort((a, b) => a - b)` binds `T = Never` because there are no elements to
+///     constrain it). The callback body is legitimate — there is simply no concrete element type to
+///     check it against — so a `Never` param must fall back to inference rather than reject (`a - b`
+///     would be "Sub to Never and Never"). `contains_never` mirrors the `contains_type_var` shape.
+fn expected_fn_params_fully_pinned(expected: &Type) -> bool {
+    match expected {
+        Type::Function { params, .. } => {
+            params.iter().all(|p| !p.contains_type_var() && !type_contains_never(p))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `ty` is, or structurally contains, `Never`. Used to exclude degenerate empty-collection
+/// element pins (`T = Never`) from strict callback-body checking — see `expected_fn_params_fully_pinned`.
+fn type_contains_never(ty: &Type) -> bool {
+    match ty {
+        Type::Never => true,
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Map(t) => {
+            type_contains_never(t)
+        }
+        Type::Union(ts) | Type::FixedArray(ts) => ts.iter().any(type_contains_never),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(type_contains_never) || type_contains_never(ret)
+        }
+        Type::Object { fields, .. } => fields.values().any(type_contains_never),
+        _ => false,
+    }
+}
+
 fn arg_satisfies_numeric_bound(arg_ty: &Type) -> bool {
     match arg_ty {
         t if t.is_numeric() => true,
@@ -31,7 +79,7 @@ fn arg_satisfies_numeric_bound(arg_ty: &Type) -> bool {
 }
 
 impl Checker {
-    /// `fromJson` special form (ADR-047). `T.fromJson(value)` desugars to a DotCall and
+    /// `fromJson` special form (ADR-031). `T.fromJson(value)` desugars to a DotCall and
     /// `fromJson(T, value)` to a Call; both reach here BEFORE arg0/receiver is inferred as a
     /// value (a type name like `Person` is not a runtime value). Fires only when:
     ///   * the callee/method surface name is `fromJson`, AND
@@ -257,7 +305,7 @@ impl Checker {
         partial: bool,
         span: Span,
     ) -> Result<TypedExpr, Diagnostic> {
-        // fromJson special form: `fromJson(T, value)` (ADR-047). Intercept before the callee
+        // fromJson special form: `fromJson(T, value)` (ADR-031). Intercept before the callee
         // is inferred, since arg0 is a type name, not a value.
         if let Expr::Ident(name, _) = func {
             if name == "fromJson" && !partial && args.len() == 2 {
@@ -279,7 +327,7 @@ impl Checker {
                 // fresh inference var. This must NOT match a *concrete* signature that merely
                 // returns `Json` (`TypeVar(MAX)`), e.g. `(): Json` or `(path: String): Json`:
                 // those have a KNOWN return type (Json) that must flow through the Json→concrete
-                // cast-hole gate (ADR-046), not be freshened into a permissive inference var.
+                // cast-hole gate (ADR-045), not be freshened into a permissive inference var.
                 // The opaque annotation is uniquely identified by having ≥1 param that is the
                 // Json wildcard `TypeVar(MAX)` (a real signature never spells a param as Json's
                 // sentinel — Json params are written `Json`, which is also TypeVar(MAX), but
@@ -465,9 +513,23 @@ impl Checker {
                             // Re-apply subs each iteration so earlier lambdas inform later ones.
                             let expected = apply_type_subs(&params[i], &subs);
                             if matches!(expected, Type::Function { .. }) {
-                                match self.check_expr(arg, &expected) {
-                                    Ok(t) => t,
-                                    Err(_) => self.infer_expr(arg)?,
+                                // When every PARAMETER of the callback's signature has been PINNED
+                                // by an earlier (type-pinning) argument, the param hints are concrete
+                                // (e.g. `(Int32,Int32)=>R` for `sort(xs, cmp)` once `T=Int32` from
+                                // `xs`). The back-inferred param hints are then trustworthy, so a
+                                // body type error (`a["x"]` on an `Int32` param) is GENUINE and must
+                                // propagate — not be swallowed by a hint-free `infer_expr` retry (the
+                                // inference hole this closes). The return is ignored on purpose (an
+                                // unresolved `U` is solved FROM the body). When a param is still an
+                                // unresolved generic, fall back to plain inference so it stays free
+                                // for the call site to solve.
+                                if expected_fn_params_fully_pinned(&expected) {
+                                    self.check_expr(arg, &expected)?
+                                } else {
+                                    match self.check_expr(arg, &expected) {
+                                        Ok(t) => t,
+                                        Err(_) => self.infer_expr(arg)?,
+                                    }
                                 }
                             } else {
                                 self.infer_expr(arg)?
@@ -549,7 +611,7 @@ impl Checker {
                     }
                 }
 
-                // Enforce the NUMERIC bound (ADR-018, reversed). A `Number` parameter resolved to a
+                // Enforce the NUMERIC bound (ADR-014, reversed). A `Number` parameter resolved to a
                 // numerically-constrained generic TypeVar; at this call site it is being bound to the
                 // argument's concrete family. That family must be numeric (an `Int*`/`UInt*`/`Float*`),
                 // OR another numeric-constrained / unconstrained generic TypeVar (the bound flows on to
@@ -598,7 +660,7 @@ impl Checker {
                 }
 
                 // Mixed numeric families in ONE call of a `Number`-returning function (e.g.
-                // `(a:Number,b:Number)=>a+b` at `add(10, 2.5)`) ARE supported (ADR-018, reversed):
+                // `(a:Number,b:Number)=>a+b` at `add(10, 2.5)`) ARE supported (ADR-014, reversed):
                 // monomorphization specializes `add$Int32_Float64` and re-widens the arithmetic
                 // result to the same family the concrete `(a:Int32,b:Float64)` equivalent produces
                 // (Float64 here). No guard — the previous reject was a workaround for a codegen ABI
@@ -782,7 +844,7 @@ impl Checker {
             }
         }
 
-        // fromJson special form: `T.fromJson(value)` (ADR-047). Intercept before the receiver
+        // fromJson special form: `T.fromJson(value)` (ADR-031). Intercept before the receiver
         // is inferred as a value, since `T` is a type name, not a runtime value.
         if method == "fromJson" && !partial {
             if let Some(arg_exprs) = args {
@@ -904,9 +966,20 @@ impl Checker {
                                 .map(|p| apply_type_subs(p, &subs))
                                 .unwrap_or_else(|| self.env.fresh_type_var());
                             if matches!(expected, Type::Function { .. }) {
-                                match self.check_expr(arg_expr, &expected) {
-                                    Ok(t) => t,
-                                    Err(_) => self.infer_expr(arg_expr)?,
+                                // Fully-pinned callback PARAMS: the back-inferred param hints are
+                                // trustworthy, so a body type error must propagate (the dot-call
+                                // mirror of the `infer_call` fix — `xs.map(x => x["k"])` over an
+                                // `Int32[]`, where `map`'s `(T, Int32) => U` pins the param to
+                                // `Int32` via the receiver even though the return `U` is free).
+                                // When a param is still an unresolved generic, fall back to plain
+                                // inference. The Json wildcard does not count (see helper).
+                                if expected_fn_params_fully_pinned(&expected) {
+                                    self.check_expr(arg_expr, &expected)?
+                                } else {
+                                    match self.check_expr(arg_expr, &expected) {
+                                        Ok(t) => t,
+                                        Err(_) => self.infer_expr(arg_expr)?,
+                                    }
                                 }
                             } else {
                                 self.infer_expr(arg_expr)?
@@ -975,7 +1048,7 @@ impl Checker {
                     }
                 }
 
-                // Enforce the NUMERIC bound on a dot-call to a `Number`-parameter function (ADR-018,
+                // Enforce the NUMERIC bound on a dot-call to a `Number`-parameter function (ADR-014,
                 // reversed). Mirrors the direct-call check; the receiver is arg 0.
                 for (i, param_ty) in method_params.iter().enumerate() {
                     if i >= all_args.len() { break; }

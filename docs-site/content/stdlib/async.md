@@ -44,7 +44,7 @@ match result
   else     => print("${result}")
 ```
 
-`await` returns `T | Error` — a fault inside the thunk surfaces as an `Error` here. You must handle the `Error` case; assigning straight to the bare value type (`val n: Int32 = await(p)`) is a compile-time error (spec §32.2.2, ADR-070).
+`await` returns `T | Error` — a fault inside the thunk surfaces as an `Error` here. You must handle the `Error` case; assigning straight to the bare value type (`val n: Int32 = await(p)`) is a compile-time error (spec §32.2.2, ADR-045).
 
 The thunk may not capture `var` bindings (compile-time error where detectable).
 

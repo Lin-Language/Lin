@@ -43,7 +43,7 @@ impl Parser {
             && self.check_ahead(TokenKind::Eq, 2)
     }
 
-    /// Parse `replace <name> = <expr>` (a test-only mock — ADR-071).
+    /// Parse `replace <name> = <expr>` (a test-only mock — ADR-046).
     pub(crate) fn parse_replace(&mut self) -> Stmt {
         let span = self.current_span();
         self.advance(); // `replace`

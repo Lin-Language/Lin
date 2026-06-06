@@ -44,7 +44,7 @@ fn resolve_type_inner(
         TypeExpr::Object(fields, _span) => {
             // An object type spelled inline (anonymous structural shape, NOT a named record
             // declaration) is UNSEALED. Only the named-type unfold path (`expand_named_body` /
-            // generic `substitute`) seals. See ADR-083.
+            // generic `substitute`) seals. See ADR-057.
             let mut resolved = IndexMap::new();
             for (key, type_expr) in fields {
                 let ty = resolve_type_inner(type_expr, env, visiting)?;
@@ -53,7 +53,7 @@ fn resolve_type_inner(
             Ok(Type::object(resolved))
         }
         TypeExpr::IndexSig(value, _span) => {
-            // `{ String: T }` — a typed index-signature object type (ADR-082). Distinct from a
+            // `{ String: T }` — a typed index-signature object type (ADR-055). Distinct from a
             // fixed record; backed by the hashed `LinMap` at runtime.
             let val_ty = resolve_type_inner(value, env, visiting)?;
             Ok(Type::Map(Box::new(val_ty)))
@@ -95,11 +95,11 @@ fn resolve_named_cycle(
         "String" => Ok(Type::Str),
         "Json" => Ok(json_type()),
         // `Error` is the conventional error value (spec §20, §24.2.2) and a structural object
-        // alias (ADR-047): an object carrying a `type` discriminant and a `message`. Both the
+        // alias (ADR-031): an object carrying a `type` discriminant and a `message`. Both the
         // async runtime (on a caught thunk fault) and `fromJson` produce this shape — the
         // decode-error value additionally carries `"path"`, which width subtyping permits.
         // Modelled as an Object (not a new `Type` variant) so the ~20 exhaustive `Type` matches
-        // don't change (cf. ADR-044); `is Error` is a field-presence + `"type" == "error"` check.
+        // don't change (cf. ADR-029); `is Error` is a field-presence + `"type" == "error"` check.
         "Error" => Ok(error_type()),
         // Function is an opaque type annotation — any arity is acceptable.
         // Params and ret use TypeVar(u32::MAX) so compat check treats it as accepting any function.
@@ -110,7 +110,7 @@ fn resolve_named_cycle(
         // Iterator without type argument: use Json wildcard element type
         "Iterator" => Ok(Type::Iterator(Box::new(json_type()))),
         // Shared without a type argument: Shared<Json>. The opaque shared-mutable-state box
-        // (ADR-044); only the shared/get/set/withLock accessors operate on it.
+        // (ADR-029); only the shared/get/set/withLock accessors operate on it.
         "Shared" => Ok(Type::Shared(Box::new(json_type()))),
         // Stream without a type argument: Stream<Json>. The opaque pull-source (streams brief).
         // NOTE: the brief's locked decision was "not spellable in source"; we relaxed that to
@@ -140,7 +140,7 @@ fn resolve_named_cycle(
                 }
             } else if name == "Number" {
                 // `Number` is a parameter/return CONSTRAINT (a numerically-bounded generic,
-                // ADR-018), not a value type — it only lowers to a bounded var in a function
+                // ADR-014), not a value type — it only lowers to a bounded var in a function
                 // signature. Reaching here means it was used in a binding/other position (e.g.
                 // `val total: Number = 0`), where it has no concrete representation. Point the
                 // user at a concrete family rather than the misleading "Unknown type 'Number'".
@@ -294,7 +294,7 @@ fn substitute(
     }
 }
 
-/// The structural shape of a decode `Error` (ADR-047). An open object with the two stable
+/// The structural shape of a decode `Error` (ADR-031). An open object with the two stable
 /// fields user code can rely on; the runtime value also carries `"path"`, which width
 /// subtyping permits. Used as the second variant of `fromJson`'s `T | Error` result.
 pub fn error_type() -> Type {
@@ -315,7 +315,7 @@ pub fn json_type() -> Type {
 
 #[cfg(test)]
 mod sealed_marker_tests {
-    //! Stage 0.5 focused marker tests (ADR-083): prove the `sealed` flag is
+    //! Stage 0.5 focused marker tests (ADR-057): prove the `sealed` flag is
     //! SET correctly on resolution without affecting behavior. The bulk of run-equivalence is
     //! carried by the full corpus; these pin the marker's value at the seal point.
     use super::*;

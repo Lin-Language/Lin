@@ -5,7 +5,7 @@ import { contains } from "std/string"
 // Templating coverage (absorbed from the standalone template demo): render the
 // server's HTML view and assert the {{ ... }} holes are filled from the data object.
 // index.jinja `{% extends "base.jinja" %}` and the base `{% include "footer.jinja" %}`,
-// so this also exercises the layout/inheritance loader (ADR-074).
+// so this also exercises the layout/inheritance loader (ADR-048).
 val s = suite("template", [
   test("renders index.jinja filling all holes", () =>
     val out = render("examples/web-server/views/index.jinja", {

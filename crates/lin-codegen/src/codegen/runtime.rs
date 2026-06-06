@@ -65,7 +65,7 @@ pub(crate) struct RuntimeFns<'ctx> {
     /// refcount and, on zero, releases each HEAP field per the descriptor then frees the struct.
     pub sealed_alloc: FunctionValue<'ctx>,
     pub sealed_release: FunctionValue<'ctx>,
-    /// Typed index-signature map `{ String: T }` (ADR-082): the hashed `LinMap` container.
+    /// Typed index-signature map `{ String: T }` (ADR-055): the hashed `LinMap` container.
     pub map_alloc: FunctionValue<'ctx>,
     pub map_set: FunctionValue<'ctx>,
     pub map_get: FunctionValue<'ctx>,
@@ -200,7 +200,7 @@ impl<'ctx> RuntimeFns<'ctx> {
         let tagged_release = module.add_function("lin_tagged_release", void_type.fn_type(&[ptr_type.into()], false), None);
         let sealed_alloc = module.add_function("lin_sealed_alloc", ptr_type.fn_type(&[i64_type.into(), ptr_type.into()], false), None);
         let sealed_release = module.add_function("lin_sealed_release", void_type.fn_type(&[ptr_type.into(), i64_type.into()], false), None);
-        // Typed index-signature map (ADR-082).
+        // Typed index-signature map (ADR-055).
         let map_alloc = module.add_function("lin_map_alloc", ptr_type.fn_type(&[i32_type.into()], false), None);
         let map_set = module.add_function("lin_map_set", void_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false), None);
         let map_get = module.add_function("lin_map_get", ptr_type.fn_type(&[ptr_type.into(), ptr_type.into()], false), None);

@@ -52,7 +52,7 @@ val n: Int32 = await(p)   // compile error: Int32 | Error is not assignable to I
 val [a, b] = await([asyncA, asyncB])
 ```
 
-> The `T | Error` union is attached at `await` rather than at `async` (the promise handle in flight is opaque; only `await` materialises a result that can fault). There is no nominal `Promise<T>` type, so the checker enforces "handle the `Error`" but does not catch "forgot to `await`". See ADR-070.
+> The `T | Error` union is attached at `await` rather than at `async` (the promise handle in flight is opaque; only `await` materialises a result that can fault). There is no nominal `Promise<T>` type, so the checker enforces "handle the `Error`" but does not catch "forgot to `await`". See ADR-045.
 
 ## `parallel(thunks)`
 

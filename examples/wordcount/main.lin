@@ -1,4 +1,4 @@
-// wordcount — demonstrates the typed index-signature map `{ String: T }` (ADR-082): a String-keyed
+// wordcount — demonstrates the typed index-signature map `{ String: T }` (ADR-055): a String-keyed
 // dictionary with O(1) average lookup, T-typed values, and the safe missing-key -> Null rule.
 //
 // Run:   lin run examples/wordcount/main.lin
