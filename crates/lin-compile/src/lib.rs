@@ -262,10 +262,11 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
             return Err(CompileError::TypeCheck(errors));
         }
         // Representation-inference pass (repr.rs) — runs after monomorphize+lower, immediately
-        // before rc_elide so RC sees representation-stable IR. STAGE 2: pure side-table observer; it
-        // computes the per-temp repr and (in debug builds) asserts the Stage-2 oracle (new analysis
-        // == old type predicates) + the soundness verifier. Nothing consumes the table yet.
-        lin_ir::repr::run(&ir_module);
+        // before rc_elide so RC sees representation-stable IR. STAGE 3: stores the per-temp repr
+        // table on each `func.repr` for codegen to consume at every packed-vs-boxed DECIDE / ASSUME
+        // site; in debug builds also asserts the Stage-2 oracle (new analysis == old type
+        // predicates) + the soundness verifier.
+        lin_ir::repr::run(&mut ir_module);
         rc_elide::elide_rc(&mut ir_module);
         // Sealed-records Stage 4: mark non-escaping all-scalar sealed-record constructions for
         // stack allocation AND suppress their Retain/Release emission (see lin_ir::escape). Runs
