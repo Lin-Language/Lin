@@ -2855,11 +2855,24 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 }
             }
             // Sealed scalar record + a compile-time-known string key `x["f"]` → constant-offset
-            // FieldGet (same as `x.f`). The field is guaranteed present (a missing field on a
-            // concrete sealed type is already a compile error). Routes to the unboxed load path
-            // rather than the dynamic `lin_object_get` Index path.
+            // FieldGet (same as `x.f`). Routes to the unboxed load path rather than the dynamic
+            // `lin_object_get` Index path.
+            //
+            // A sealed record has EXACTLY its declared fields (extras are stripped on assignment),
+            // so a key that is NOT one of those fields is STATICALLY ABSENT. The checker only WARNS
+            // about it (typing the access as `Null`), so we must not assume presence: emitting an
+            // unboxed `FieldGet` for an absent field would assert in `sealed_field_layout` (codegen
+            // panic). Instead follow the safe-access rule (§6.1: missing object key → Null): produce
+            // a `Null` constant, lowering `object` first so any side effects still run. This mirrors
+            // the boxed-object missing-key → Null path that `lin_object_get` already takes.
             if is_sealed_scalar_repr(&obj_ty) {
                 if let TypedExpr::StringLit(name, _, _) = key.as_ref() {
+                    let present = matches!(&obj_ty,
+                        Type::Object { fields, .. } if fields.contains_key(name));
+                    if !present {
+                        let _ = lower_expr(object, builder, ctx);
+                        return builder.const_temp(Const::Null);
+                    }
                     let obj_temp = lower_expr(object, builder, ctx);
                     let dst = builder.alloc_temp(result_type.clone());
                     builder.emit(Instruction::FieldGet {
@@ -2901,6 +2914,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 }
             };
             let dst = builder.alloc_temp(result_type.clone());
+            let obj_ty_is_sealed = is_sealed_scalar_repr(&obj_ty);
             builder.emit(Instruction::Index {
                 dst,
                 object: obj_temp,
@@ -2909,6 +2923,15 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 key_ty,
                 result_ty: result_type.clone(),
             });
+            // A sealed record indexed by a NON-LITERAL key: codegen materializes the record to a
+            // boxed object, looks the key up, clones the (borrowed) result into a FRESH owned box and
+            // frees the temporary object — so `dst` is already an OWNED, container-independent value.
+            // Register it owned directly (the usual borrowed-interior CloneBox relocation does not
+            // apply: there is no live container to dangle off of).
+            if obj_ty_is_sealed && is_union_ty(result_type) {
+                builder.register_owned(dst, result_type.clone());
+                return dst;
+            }
             // A projection has VALUE (snapshot) semantics (ADR: projection is a value, not a
             // live view). It must materialize an OWNED, container-independent value so the
             // binding survives the container being mutated/grown/freed.
