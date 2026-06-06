@@ -401,6 +401,22 @@ fn load_cache(key: &str, base_dir: &Path) -> Option<TypedModule> {
     bincode::deserialize(payload).ok()
 }
 
+/// A process-wide monotonic counter used to make cache temp-file names unique PER WRITE — not just
+/// per process. `lin test` compiles many files concurrently on rayon threads (all sharing this
+/// pid), and files that share an import resolve to the SAME cache `key`; if two threads wrote to
+/// `{key}.tmp.{pid}` at once they would clobber each other's in-flight temp before the rename.
+/// Pid keeps distinct `lin` processes apart; this counter keeps concurrent writers within one
+/// process apart. Each writer renames its OWN temp onto the final path — rename is atomic, so the
+/// final cache file is always a complete, consistent image regardless of who wins the last rename
+/// (the content is identical: same key == same bytes).
+static CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Build a writer-unique temp path next to `final_path` for the write-to-temp-then-rename dance.
+fn unique_tmp_path(cache_dir: &Path, key: &str, ext: &str) -> PathBuf {
+    let seq = CACHE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    cache_dir.join(format!("{}.{}.tmp.{}.{}", key, ext, std::process::id(), seq))
+}
+
 /// Save a `TypedModule` to `.lin-cache/` keyed by `key`.
 /// Uses write-to-temp-then-rename for atomic, concurrent-safe cache writes.
 fn save_cache(key: &str, module: &TypedModule, base_dir: &Path) {
@@ -409,7 +425,7 @@ fn save_cache(key: &str, module: &TypedModule, base_dir: &Path) {
         return;
     }
     let final_path = cache_dir.join(format!("{}.typed", key));
-    let tmp_path = cache_dir.join(format!("{}.typed.tmp.{}", key, std::process::id()));
+    let tmp_path = unique_tmp_path(&cache_dir, key, "typed");
     if let Ok(bytes) = bincode::serialize(module) {
         let stamped = with_stamp(&bytes);
         if std::fs::write(&tmp_path, &stamped).is_ok() {
@@ -426,7 +442,7 @@ fn save_signature(key: &str, sig: &ModuleSignature, base_dir: &Path) {
         return;
     }
     let final_path = cache_dir.join(format!("{}.sig", key));
-    let tmp_path = cache_dir.join(format!("{}.sig.tmp.{}", key, std::process::id()));
+    let tmp_path = unique_tmp_path(&cache_dir, key, "sig");
     if let Some(bytes) = sig.to_bytes() {
         let stamped = with_stamp(&bytes);
         if std::fs::write(&tmp_path, &stamped).is_ok() {
