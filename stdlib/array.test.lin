@@ -20,7 +20,7 @@ val s = suite("std/array", [
     ]
   ),
 
-  // Generic push (`<T>(arr: T[], item: T)`, ADR-085): a concrete-OBJECT element pushed into a
+  // Generic push (`<T>(arr: T[], item: T)`, ADR-059): a concrete-OBJECT element pushed into a
   // record-typed array reads back correctly (the element is materialized into a boxed LinObject
   // for the tagged array; a sealed-projected struct stored raw under TAG_OBJECT used to crash).
   test("push a concrete record element reads back", () =>
@@ -90,7 +90,7 @@ val s = suite("std/array", [
     ]
   ),
 
-  // Regression (ADR-069 R2): filtering an array of OBJECTS pushes each kept element (BORROWED from
+  // Regression (ADR-044 R2): filtering an array of OBJECTS pushes each kept element (BORROWED from
   // the source) into the result; the result array must take its own reference, else releasing both
   // the source and the filtered array at teardown double-frees the shared objects (heap UAF).
   test("filter over object array does not double-free kept elements", () =>
@@ -179,7 +179,7 @@ val s = suite("std/array", [
     ]
   ),
 
-  // at/set/indexOf carry generic <T>(T[], ...) signatures (ADR-067): they
+  // at/set/indexOf carry generic <T>(T[], ...) signatures (ADR-044): they
   // preserve the element type so concrete Int32[]/String[] callers stay
   // representation-consistent. Cover both element representations and the
   // negative-index wrap.

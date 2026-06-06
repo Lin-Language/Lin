@@ -20,7 +20,7 @@ pub struct LinString {
 /// layout change (the `LinString` layout is pinned by codegen — refcount:u32, len:u32, data), we
 /// mark it immortal by setting its refcount into the top of the u32 range.
 ///
-/// SAFETY CONTRACT (sound under real OS-thread concurrency — async is genuine threading, ADR-042/043):
+/// SAFETY CONTRACT (sound under real OS-thread concurrency — async is genuine threading, ADR-027/043):
 ///   * `lin_string_release` returns early (before the underflow `debug_assert!` and before
 ///     decrementing) when `refcount >= IMMORTAL_RC`, so an interned literal is never freed even
 ///     when a container that holds it is dropped.
@@ -258,7 +258,7 @@ pub unsafe extern "C" fn lin_string_char_code(s: *const LinString, index: i32) -
 /// indexing `0..length(s)` with `byteAt` is O(n) total, whereas `charCode` (codepoint-indexed,
 /// O(n) per call) makes the same loop O(n²). For pure-ASCII text `byteAt(s,i) == charCode(s,i)`.
 /// Inlined in codegen (see codegen/intrinsics.rs) so the per-byte cost is a single load, not a
-/// non-inlinable staticlib call — the same lever as the flat-array-read inlining (ADR-069).
+/// non-inlinable staticlib call — the same lever as the flat-array-read inlining (ADR-044).
 #[no_mangle]
 pub unsafe extern "C" fn lin_string_byte_at(s: *const LinString, index: i32) -> i32 {
     if s.is_null() || index < 0 || index >= (*s).len as i32 {

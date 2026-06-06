@@ -10,7 +10,7 @@ use super::Codegen;
 
 impl<'ctx> Codegen<'ctx> {
     /// Byte size of every closure struct. Layout: rc@0, _pad@4, fn_ptr@8, env_ptr@16,
-    /// env_size@24, default-arg descriptor@32, capture descriptor@40 (ADR-060). All closures
+    /// env_size@24, default-arg descriptor@32, capture descriptor@40 (ADR-041). All closures
     /// are this fixed size so `lin_closure_release` frees them with one layout. MUST match the
     /// `CLOSURE_SIZE`/free size in `lin-runtime/src/memory.rs`.
     pub(crate) const CLOSURE_SIZE: u64 = 48;
@@ -371,7 +371,7 @@ impl<'ctx> Codegen<'ctx> {
     }
 
     /// Allocate one closure struct (`CLOSURE_SIZE` = 48 bytes). Layout: rc@0, _pad@4, fn@8,
-    /// env@16, env_size@24, default-arg descriptor@32, capture descriptor@40 (ADR-060). The
+    /// env@16, env_size@24, default-arg descriptor@32, capture descriptor@40 (ADR-041). The
     /// single allocator for every closure so the size stays in one place.
     pub(crate) fn alloc_closure(&mut self) -> PointerValue<'ctx> {
         let size = self.context.i64_type().const_int(Self::CLOSURE_SIZE, false);
@@ -404,7 +404,7 @@ impl<'ctx> Codegen<'ctx> {
     /// capture; a static capture descriptor `{u32 count, u8 kinds[count]}` is emitted and its
     /// pointer stored at the env's offset-0 word (otherwise a redundant size, read by no one).
     /// The async spawn path uses that descriptor to deep-copy the env across a thread boundary
-    /// (Option C, ADR-042). When `capture_kinds` is None the env offset-0 word stays the size
+    /// (Option C, ADR-027). When `capture_kinds` is None the env offset-0 word stays the size
     /// (legacy behaviour; such a closure simply isn't transferable and the spawn path runs it
     /// inline).
     pub(crate) fn make_closure_struct_desc_caps(
@@ -417,7 +417,7 @@ impl<'ctx> Codegen<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
         // 48-byte closure (CLOSURE_SIZE): 32-byte header + env_size@24 + default-arg
-        // descriptor@32 + CAPTURE descriptor@40 (ADR-060). The capture descriptor records each
+        // descriptor@32 + CAPTURE descriptor@40 (ADR-041). The capture descriptor records each
         // owning capture's release kind; `lin_closure_release` walks it to release captures.
         let cls_mem = self.alloc_closure();
         let cls_ty = self.closure_struct_type();

@@ -4,7 +4,7 @@ import { readJson, writeJson } from "std/fs"
 import { join } from "std/string"
 
 // Unit tests for solve — the fs-driven orchestration. `readJson`/`writeJson` are
-// mocked (ADR-071) so the whole flow is exercised without touching disk: the happy
+// mocked (ADR-046) so the whole flow is exercised without touching disk: the happy
 // path, the file-read-error branch, the unreachable-target branch, and the optional
 // JSON output write (captured via a var spy instead of hitting the filesystem).
 // A small fixed graph returned by the mocked readJson for the "good file" path.

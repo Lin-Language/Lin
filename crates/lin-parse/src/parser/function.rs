@@ -168,7 +168,7 @@ impl Parser {
     ///
     /// IMPORTANT: the column is only checked BETWEEN statements, never within a single
     /// `parse_expr()` call. Continuation lines of one expression (`x\n  + y`) and dot-chains
-    /// across newlines (`foo\n  .bar()`, ADR-006) are consumed whole by one `parse_expr()` and
+    /// across newlines (`foo\n  .bar()`, ADR-005) are consumed whole by one `parse_expr()` and
     /// are therefore never split by this guard.
     fn parse_inline_block_inner(&mut self, min_col: Option<u32>) -> Expr {
         let span = self.current_span();

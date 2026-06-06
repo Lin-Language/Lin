@@ -144,7 +144,7 @@ pub fn lower_module_with_imports(
     let main_fn = builder.finish();
     ctx.functions.push(main_fn);
 
-    // ADR-071: emit each test `replace` body under the import export's CANONICAL mangled symbol
+    // ADR-046: emit each test `replace` body under the import export's CANONICAL mangled symbol
     // (`{module_key}_{name}` for functions, `{sym}__val` for vals). The replaced export's own
     // module skipped emitting that symbol (see `lower_import_module_with_imports`'s
     // `replaced_exports` handling), so the single LLVM definition is the mock — every caller,
@@ -236,7 +236,7 @@ pub fn lower_import_module_with_imports(
             ..
         } = stmt
         {
-            // ADR-071: a `replace`d export is NOT emitted here. Route its slot through
+            // ADR-046: a `replace`d export is NOT emitted here. Route its slot through
             // `import_fn_slots` to the canonical symbol so even THIS module's internal sibling
             // calls become `Named` calls to the symbol the main (test) module will define. The
             // single LLVM symbol then resolves to the mock for every caller. No FuncId / body.
@@ -433,7 +433,7 @@ pub fn lower_import_module_with_imports(
     for stmt in &module.statements {
         if let TypedStmt::Val { value, ty, name: Some(name), .. } = stmt {
             if matches!(value, TypedExpr::Function { .. }) { continue; }
-            // ADR-071: a `replace`d val's wrapper is emitted by the main (test) module instead;
+            // ADR-046: a `replace`d val's wrapper is emitted by the main (test) module instead;
             // skip the original body so the single `__val` symbol resolves to the mock.
             if replaced_exports.contains(name) { continue; }
             let fid = ctx.alloc_func_id();
@@ -510,7 +510,7 @@ struct LowerCtx {
     import_val_slots: HashMap<usize, (String, Type)>,
     /// `var` slots that are mutably captured by an inner closure. These are stored as
     /// heap cells (MakeCell) shared by reference; reads/writes go through CellGet/CellSet
-    /// and closures capture the cell pointer (ADR-015).
+    /// and closures capture the cell pointer (ADR-012).
     mutable_cell_slots: std::collections::HashSet<usize>,
     /// `var` slots of an OWNING (rc/union) type that are REASSIGNED inside conditional control
     /// flow (an `if`/`match` branch). A plain SSA temp cannot model release-old-on-overwrite and
@@ -581,7 +581,7 @@ struct AdapterSpec {
 
 impl LowerCtx {
     /// True if `slot` should be lowered as a heap CELL rather than a plain SSA temp: either it is
-    /// mutably captured by a closure (ADR-015) or it is an owning-typed `var` reassigned inside a
+    /// mutably captured by a closure (ADR-012) or it is an owning-typed `var` reassigned inside a
     /// branch (release-old + post-join coherence). A top-level (module-global) var is excluded —
     /// it is handled through its module global slot, which is already join-coherent.
     fn slot_is_cell(&self, slot: usize) -> bool {
@@ -1148,6 +1148,9 @@ fn is_sealed_scalar_repr(ty: &Type) -> bool {
 fn is_sealed_scalar_array(ty: &Type) -> bool {
     match ty {
         Type::Array(elem) => match elem.as_ref() {
+            // Stage 3a scope (mirrors codegen `sealed_array_elem`): scalar-field sealed records only.
+            // Heap-field records stay BOXED (the Stage 3b ungate was attempted and reverted — see the
+            // status note in `Codegen::sealed_array_elem`).
             Type::Object { fields, sealed: true } => {
                 !fields.is_empty()
                     && fields.values().all(is_sealed_field_ty)
@@ -1157,6 +1160,66 @@ fn is_sealed_scalar_array(ty: &Type) -> bool {
         },
         _ => false,
     }
+}
+
+/// True when `param_ty` is an array whose element is a BOXED runtime representation — a generic
+/// TypeVar/Json wildcard, a union, a typed map, or an UNSEALED object. These are the params a sealed
+/// packed array must be materialized for. A `Named`-element array (an unexpanded self-recursive alias,
+/// which the callee reads as the SAME packed sealed struct) and a sealed-Object-element array are NOT
+/// boxed and must pass through unchanged.
+fn param_elem_is_boxed_repr(param_ty: &Type) -> bool {
+    match param_ty {
+        Type::Array(elem) => matches!(elem.as_ref(),
+            Type::TypeVar(_) | Type::Union(_) | Type::Map(_)
+            | Type::Object { sealed: false, .. }),
+        _ => false,
+    }
+}
+
+/// True when a sealed packed array argument flowing into `param_ty` is MATERIALIZED to a fresh boxed
+/// tagged `Object[]` at the call boundary (the §3 fix): either the param is a bare Json/union (the
+/// existing `length(sealedArr)` case) OR a boxed-element array (the type-erased boxed-fallback
+/// combinator's `T[]` param). The materialized box is FULLY OWNED and the callee BORROWS it (a
+/// TypeVar/Json-array param is not released by the owning model), so the caller must fully release it
+/// right after the call — else it leaks every call (ASan-confirmed in a sort-in-loop). MUST mirror the
+/// materialize trigger in `lower_coerce_arg`.
+fn sealed_array_arg_materialized(arg_ty: &Type, param_ty: &Type) -> bool {
+    is_sealed_scalar_array(arg_ty)
+        && !is_sealed_scalar_array(param_ty)
+        && (is_union_ty(param_ty) || param_elem_is_boxed_repr(param_ty))
+}
+
+/// True when `ty` is an array whose ELEMENTS (transitively) contain a sealed-record array or a sealed
+/// scalar record — i.e. a NESTED sealed structure (`Pt[][]`, `{String: Pt[]}` would be a Map). The
+/// one-level `is_sealed_scalar_array`/`is_sealed_scalar_repr` don't catch the outer container, but its
+/// Coerce result (built by codegen's `array_coerce_elementwise`) is still a fresh +1 owned value that
+/// must be released. Mirrors codegen's `Codegen::ty_contains_sealed`, restricted to the array-outer case.
+fn to_contains_sealed_array(ty: &Type) -> bool {
+    fn contains(ty: &Type) -> bool {
+        if is_sealed_scalar_array(ty) || is_sealed_scalar_repr(ty) {
+            return true;
+        }
+        match ty {
+            Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Map(t) => contains(t),
+            Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(contains),
+            _ => false,
+        }
+    }
+    matches!(ty, Type::Array(elem) if contains(elem))
+}
+
+/// True when a `Coerce { from, to }` is the NESTED sealed re-projection codegen's `compile_ir_coerce`
+/// rebuilds element-wise (`array_coerce_elementwise`): `to` is an array containing a sealed structure
+/// AND `from`'s inner element is a BOXED view (Json/union/TypeVar — the type-erased boxed-fallback
+/// result). MUST mirror the codegen gate exactly so the ownership registration matches what codegen
+/// actually emits (a same-representation array coerce is a pointer pass-through, NOT a fresh +1).
+fn nested_sealed_repr_change(from: &Type, to: &Type) -> bool {
+    let Type::Array(inner_to) = to else { return false };
+    let Type::Array(inner_from) = from else { return false };
+    // Mirror codegen's gate: a NESTED sealed re-projection fires only when `to`'s inner contains a
+    // sealed structure AND the source inner element is a DIFFERENT type (a boxed view), not a verbatim
+    // same-representation array. `Type` PartialEq ignores the `sealed` flag, so equal inners ⇒ no rebuild.
+    to_contains_sealed_array(to) && inner_from.as_ref() != inner_to.as_ref()
 }
 
 /// A field type permitted in a sealed record: a scalar (numeric or Bool) OR an eligible heap field
@@ -1687,6 +1750,35 @@ fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: 
             }
         }
     }
+    // SEALED-RECORD ARRAY BOUNDARY (Problem A / Stage 3b): a sealed-record array (packed/contiguous
+    // representation, elem_tag 0xFE) flowing into a param that is NOT itself that same sealed-array
+    // representation — a generic TypeVar/Json array (the type-erased combinator fallback's param),
+    // an unsealed `Object[]`, or any boxed array — must be MATERIALIZED to the boxed tagged `Object[]`
+    // view (`sealed_array_to_tagged`), else the callee reads the packed buffer through the boxed
+    // `lin_array_get_tagged`/`lin_object_get` machinery → misaligned deref / corruption. The reverse
+    // (boxed → sealed array) is the param's own sealed-scalar-array case, handled by `type_repr_differs`
+    // below / the result Coerce. The materialized tagged array is a fresh +1 the arg scope releases.
+    // Fire ONLY when the param element is a genuinely BOXED representation (a generic TypeVar/Json
+    // wildcard, a union, or an unsealed `Object` — i.e. the type-erased boxed-fallback combinator's
+    // `T[]` param). A param array whose element is a `Named` (an unexpanded self-referential alias,
+    // the SELF-RECURSIVE-call case — e.g. `sumX(arr: Point[], …)` calling itself) reads the SAME
+    // packed sealed struct consistently, so it must be passed THROUGH unchanged: materializing it
+    // would store a boxed Object[] back into a slot the loop body reads as a packed array (observed:
+    // recursive `arr[i].x` sum returned garbage after the first iteration). Mirrors the `Named`
+    // pass-through guards above.
+    if is_sealed_scalar_array(arg_ty)
+        && !is_sealed_scalar_array(param_ty)
+        && param_elem_is_boxed_repr(param_ty)
+    {
+        let dst = builder.alloc_temp(param_ty.clone());
+        builder.emit(Instruction::Coerce { dst, src: arg, from_ty: arg_ty.clone(), to_ty: param_ty.clone() });
+        // The materialized tagged `Object[]` is a FRESH fully-owned +1 the callee BORROWS (a TypeVar/
+        // Json-array param is not released by the owning model). It is released right after the call by
+        // the `sealed_array_arg_materialized` branch in the call-site arg loop (matching the existing
+        // sealed-array→Json-param `full_release_boxes` path) — NOT registered owned here. The source
+        // sealed array keeps its own ownership.
+        return dst;
+    }
     // Box/unbox across the union boundary.
     if is_union_ty(param_ty) != is_union_ty(arg_ty) {
         let dst = builder.alloc_temp(param_ty.clone());
@@ -2142,7 +2234,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             builder.const_temp(Const::Float(*v, ty.clone()))
         }
         TypedExpr::StringLit(s, _, _) => {
-            // StrLit is Str at runtime (ADR-051): always lower to an owned Str temp.
+            // StrLit is Str at runtime (ADR-034): always lower to an owned Str temp.
             let t = builder.const_temp(Const::Str(s.clone()));
             builder.register_owned(t, Type::Str);
             t
@@ -2521,6 +2613,15 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 // A Json/Object[] PROJECTED into a sealed-record array (the reverse boundary) is a
                 // fresh +1 sealed array — register it for scope-exit release.
                 builder.register_owned(dst, to.clone());
+            } else if nested_sealed_repr_change(from, to) && needs_owning(to) {
+                // A NESTED sealed structure projected from the boxed `Json` view (Problem A / Stage
+                // 3b): `partition`/`chunk` (`T[][]`) routed through the type-erased boxed fallback
+                // returns a boxed result whose Coerce → `array_coerce_elementwise` rebuilds a FRESH
+                // +1 outer tagged array (and fresh inner sealed arrays). Register it so the owning
+                // model releases the whole structure at scope exit (else it leaks, ASan-confirmed).
+                // Gated (matching codegen) on the SOURCE inner being a boxed view — a same-repr array
+                // (e.g. a `Neighbor[]` literal) is NOT rebuilt and must not be double-registered.
+                builder.register_owned(dst, to.clone());
             }
             dst
         }
@@ -2876,10 +2977,10 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             }
             // `is <Named>` resolving to a non-empty object shape (e.g. a user object-type alias
             // like `Person`): a bare tag check (or the mere field-presence the earlier rule folded
-            // into ADR-054 checked) matches objects
+            // into ADR-036 checked) matches objects
             // with the WRONG field types, which is unsound — the arm then narrows the binding and
             // a subsequent field access operates on the wrong runtime type. Deep-validate field
-            // types recursively via the `fromJson` structural walker (ADR-054). `MatchesSchema`
+            // types recursively via the `fromJson` structural walker (ADR-036). `MatchesSchema`
             // borrows the boxed value and reads a static descriptor — no ownership change, so the
             // `val_temp` boxing is the same one the former HasPattern path used.
             if let TypedPattern::TypeCheckDeep(target, named_defs, _) = pattern {
@@ -3154,8 +3255,7 @@ fn lower_call(
                     // + inner array + element objects), not at function scope exit — the call may be
                     // in a tail-recursive (loop) body where a scope-exit release would leak every
                     // iteration. Other heap args boxed to Json are shell-only (borrowed inner).
-                    if param_tys.get(i).map(|p| is_union_ty(p)).unwrap_or(false)
-                        && is_sealed_scalar_array(&a.ty())
+                    if param_tys.get(i).map(|p| sealed_array_arg_materialized(&a.ty(), p)).unwrap_or(false)
                     {
                         full_release_boxes.push((arg, param_tys[i].clone()));
                     } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
@@ -3215,8 +3315,7 @@ fn lower_call(
                     // + inner array + element objects), not at function scope exit — the call may be
                     // in a tail-recursive (loop) body where a scope-exit release would leak every
                     // iteration. Other heap args boxed to Json are shell-only (borrowed inner).
-                    if param_tys.get(i).map(|p| is_union_ty(p)).unwrap_or(false)
-                        && is_sealed_scalar_array(&a.ty())
+                    if param_tys.get(i).map(|p| sealed_array_arg_materialized(&a.ty(), p)).unwrap_or(false)
                     {
                         full_release_boxes.push((arg, param_tys[i].clone()));
                     } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
@@ -3653,7 +3752,7 @@ fn combinator_read_elem_ty(iterable: &TypedExpr, builder: &FuncBuilder, ctx: &Lo
 /// `lin_length_dyn` there reports an Object's key count / String's length, so the loop would run and
 /// misread the non-array payload as array memory (UB — the docs-builder crash). Routing the bound
 /// through `lin_iterable_length` (array length, else 0) makes a non-array iterable a no-op loop,
-/// keeping the combinator sound for any Json value. Concrete scalar-array pipelines (the ADR-069
+/// keeping the combinator sound for any Json value. Concrete scalar-array pipelines (the ADR-044
 /// fast path) are unaffected — they take the `Intrinsic::Length` branch.
 fn emit_iterable_len(iterable_temp: Temp, iterable_ty: &Type, builder: &mut FuncBuilder) -> Temp {
     let len = builder.alloc_temp(Type::Int64);
@@ -3720,7 +3819,7 @@ fn is_flat_producer_export(name: &str) -> bool {
 }
 
 
-/// A capture-less literal lambda usable for INLINING into a combinator loop (ADR-069): a
+/// A capture-less literal lambda usable for INLINING into a combinator loop (ADR-044): a
 /// `TypedExpr::Function` with no captures. Returns its params + body so the caller can bind each
 /// param to a loop temp and lower the body inline — no closure alloc, no boxed indirect call. A
 /// capturing lambda or a non-literal callback (a stored/passed `Function` value) returns `None` and
@@ -3909,7 +4008,7 @@ fn alloc_output_array(elem_ty: &Type, result_type: &Type, builder: &mut FuncBuil
 /// raw-copies the TaggedVal WITHOUT bumping the inner refcount (move semantics), so a borrowed
 /// concrete element must be `Retain`ed first — otherwise both the source array and the result array
 /// reference the same object at refcount 1, and releasing both double-frees it (the `filter` over an
-/// object array UAF; ADR-069 R2). A UNION element pushes via the retaining `lin_push_dyn`, and a
+/// object array UAF; ADR-044 R2). A UNION element pushes via the retaining `lin_push_dyn`, and a
 /// flat-scalar element carries no refcount, so neither needs the extra retain.
 fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp, val_ty: &Type, borrowed: bool, builder: &mut FuncBuilder) {
     let push_dst = builder.alloc_temp(Type::Null);
@@ -4005,7 +4104,7 @@ fn scalar_numeric_repr_differs(from: &Type, to: &Type) -> bool {
 }
 
 /// Box a value to Json (TaggedVal*) if it is a concrete (non-union) type.
-/// `fromJson` decode (ADR-047). Lower the Json value, box it to the tagged representation if
+/// `fromJson` decode (ADR-031). Lower the Json value, box it to the tagged representation if
 /// concrete, then emit `CallIntrinsic { FromJson(target) }`. The runtime borrows the input and
 /// returns either the SAME pointer retained (+1) on success or a fresh `Error` object — so the
 /// result is unconditionally +1 owned (register_owned), and the input keeps its own ownership
@@ -4266,7 +4365,7 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
     let (param_tys, _) = callback_signature(&args[1]);
     // Read elements at the source's PROVABLE runtime representation: flat-scalar only when the
     // source is a provably-flat producer, else the tagged Json read (sound for a `[]`+push array
-    // mistyped as flat). See `combinator_read_elem_ty` (ADR-069).
+    // mistyped as flat). See `combinator_read_elem_ty` (ADR-044).
     let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
     let iterable = lower_expr(&args[0], builder, ctx);
     let body = lower_callback_in_safe_ctx(&args[1], builder, ctx);
@@ -4308,7 +4407,7 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
 fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
     let (param_tys, _) = callback_signature(&args[1]);
-    // Read at the source's PROVABLE representation (ADR-069): tagged Json read unless provably flat,
+    // Read at the source's PROVABLE representation (ADR-044): tagged Json read unless provably flat,
     // so a `[]`+push array mistyped as a flat `T[]` is read correctly (not as raw flat scalars).
     let read_elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
     let iterable = lower_expr(&args[0], builder, ctx);
@@ -4381,12 +4480,12 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
     };
     // Read at the source's PROVABLE representation: a flat scalar only for a provably-flat producer
     // (range/map/filter result, flat literal), else the tagged Json read — sound for a `[]`+push
-    // array mistyped as a flat `T[]` (ADR-069).
+    // array mistyped as a flat `T[]` (ADR-044).
     let elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
 
     let iterable = lower_expr(&args[0], builder, ctx);
 
-    // INLINE FAST PATH (ADR-069): a capture-less literal lambda is spliced directly into the loop —
+    // INLINE FAST PATH (ADR-044): a capture-less literal lambda is spliced directly into the loop —
     // its param bound to the element temp, its body lowered inline — with no closure alloc and no
     // per-element box/unbox/indirect call.
     if let Some((lam_params, lam_body)) = inlinable_lambda(&args[1]) {
@@ -4427,13 +4526,13 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
         Type::Array(t) | Type::Iterator(t) => (**t).clone(),
         _ => Type::TypeVar(u32::MAX),
     };
-    // Read at the source's PROVABLE representation (ADR-069): flat scalar for a provably-flat
+    // Read at the source's PROVABLE representation (ADR-044): flat scalar for a provably-flat
     // producer, else tagged Json (sound for a `[]`+push array mistyped as flat).
     let elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
 
     let iterable = lower_expr(&args[0], builder, ctx);
 
-    // INLINE FAST PATH (ADR-069): a capture-less literal predicate lambda is spliced into the loop;
+    // INLINE FAST PATH (ADR-044): a capture-less literal predicate lambda is spliced into the loop;
     // its body's Bool result drives the keep/skip split directly — no closure, no boxed call.
     if let Some((lam_params, lam_body)) = inlinable_lambda(&args[1]) {
         let lam_params = lam_params.to_vec();
@@ -4491,14 +4590,14 @@ fn lower_reduce(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
     let json = Type::TypeVar(u32::MAX);
     let iterable_ty = args[0].ty();
     let (param_tys, _) = callback_signature(&args[2]);
-    // Read at the source's PROVABLE representation (ADR-069): a flat scalar for a provably-flat
+    // Read at the source's PROVABLE representation (ADR-044): a flat scalar for a provably-flat
     // producer, else the tagged Json read (sound for a `[]`+push array mistyped as flat).
     let elem_ty = combinator_read_elem_ty(&args[0], builder, ctx);
     let init_ty = args[1].ty();
 
     let iterable = lower_expr(&args[0], builder, ctx);
 
-    // INLINE FAST PATH (ADR-069): a capture-less literal reducer lambda with a CONCRETE SCALAR
+    // INLINE FAST PATH (ADR-044): a capture-less literal reducer lambda with a CONCRETE SCALAR
     // accumulator carries the accumulator UNBOXED through the loop phi and inlines the lambda body
     // each iteration — no per-element box/unbox/closure call. Gated to a scalar `result_type` (the
     // accumulator representation): a union/Json/heap accumulator keeps the boxed Json-phi path below
@@ -5222,7 +5321,7 @@ fn lower_short_circuit(
 //
 // SOUNDNESS: this is sound IFF the scrutinee really is such a closed concrete
 // union. For `Json`/`TypeVar`/any-typevar/open-or-non-object unions, the full
-// `MatchesSchema` is mandatory (ADR-054 narrowing depends on it). When in doubt
+// `MatchesSchema` is mandatory (ADR-036 narrowing depends on it). When in doubt
 // we return `None` and the caller emits the existing `MatchesSchema`.
 // -------------------------------------------------------------------------
 
@@ -5643,9 +5742,9 @@ fn lower_match_pattern(
         | TypedMatchPattern::Is(TypedPattern::Wildcard(..)) => PatternTest::Always,
         // `is <Named>` where the name resolves to a non-empty object shape (a user object-type
         // alias like `Person`): a bare tag check (or the mere field-presence the earlier rule
-        // folded into ADR-054 checked) matches
+        // folded into ADR-036 checked) matches
         // objects with the WRONG field types, which is unsound once the arm narrows the binding.
-        // Deep-validate field types recursively via the `fromJson` structural walker (ADR-054).
+        // Deep-validate field types recursively via the `fromJson` structural walker (ADR-036).
         // `scrut` is the already-boxed scrutinee; `MatchesSchema` borrows it (no ownership change).
         TypedMatchPattern::Is(TypedPattern::TypeCheckDeep(target, named_defs, _)) => {
             // FAST PATH: when the scrutinee's static type is a closed concrete union
@@ -6031,7 +6130,7 @@ fn lower_adapter(spec: &AdapterSpec, ctx: &mut LowerCtx) {
     host.discard_scope();
 }
 
-/// ADR-071: lower each test `replace` body to a top-level definition under the export's
+/// ADR-046: lower each test `replace` body to a top-level definition under the export's
 /// canonical mangled symbol. Function mocks become a `LinFunction` named exactly `{module_key}_
 /// {name}`; non-function (val) mocks become a zero-arg `{sym}__val` wrapper. The replaced
 /// export's own module skipped emitting that symbol, so this is the sole definition and every
@@ -6407,7 +6506,7 @@ fn lower_function_expr_with_id(
     // reference per heap/union capture, so the closure may safely OUTLIVE the scope that
     // produced the captured value (e.g. a closure returned from a `map` callback into the result
     // array). For each captured value temp:
-    //   - a mutably-captured `var` stores the CELL POINTER (shared by reference, ADR-015); the
+    //   - a mutably-captured `var` stores the CELL POINTER (shared by reference, ADR-012); the
     //     cell has its own MakeCell/FreeCell/escaping-cell lifecycle, so it stays borrow-only —
     //     do NOT retain it here, and do NOT release it on closure free.
     //   - a concrete-rc value (Str/Array/Object/Function) is retained in place (`Retain`), so the

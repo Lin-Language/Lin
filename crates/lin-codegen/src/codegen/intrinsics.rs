@@ -202,7 +202,7 @@ impl<'ctx> Codegen<'ctx> {
                             i64_ty.fn_type(&[ptr_ty.into()], false));
                         self.builder.call(obj_len_fn, &[arg.into()], "ir_olen").try_as_basic_value().unwrap_basic()
                     }
-                    // Typed index-signature map `{ String: T }` (ADR-082): entry count.
+                    // Typed index-signature map `{ String: T }` (ADR-055): entry count.
                     Type::Map(_) => {
                         let map_len_fn = self.get_or_declare_fn("lin_map_length",
                             i64_ty.fn_type(&[ptr_ty.into()], false));
@@ -230,7 +230,7 @@ impl<'ctx> Codegen<'ctx> {
                     // which reads the array's runtime `elem_tag` and coerces the boxed element into
                     // the flat slot. Scalars carry no refcount, so no RC balancing is needed (the
                     // boxed element shell is a fresh cached/heap box freed after the move). This is
-                    // the `[]`+push flat-representation consistency fix (ADR-069).
+                    // the `[]`+push flat-representation consistency fix (ADR-044).
                     //
                     // A SEALED-RECORD ARRAY (Stage 3): contiguous, header-less, unboxed element
                     // payloads (`lin_sealed_array_alloc`, elem_tag 0xFE, packed-scalar stride). The
@@ -1001,7 +1001,7 @@ impl<'ctx> Codegen<'ctx> {
                     arr
                 }
             }
-            // fromJson(value, descriptor) => T | Error (ADR-047). Emit the compile-time schema
+            // fromJson(value, descriptor) => T | Error (ADR-031). Emit the compile-time schema
             // descriptor as a static i8 global, then call the generic runtime walker. `args[0]`
             // is the (already boxed-to-Json) input value. The result is owned by the caller
             // (the input retained on success, or a fresh Error).
@@ -1116,7 +1116,7 @@ impl<'ctx> Codegen<'ctx> {
 }
 
 // ---------------------------------------------------------------------------
-// fromJson schema-descriptor encoding (ADR-047)
+// fromJson schema-descriptor encoding (ADR-031)
 //
 // The descriptor is a flat byte blob describing the target type tree. The runtime walker
 // `lin_from_json` interprets it in lockstep with the Json value. All multi-byte integers are
@@ -1225,7 +1225,7 @@ impl<'a> DescEncoder<'a> {
             Type::Str => self.put_u8(KIND_STRING),
             // A string-literal type validates the JSON value is a string AND equals the exact
             // literal — this is what makes `Result.fromJson(...)` reject a wrong discriminant
-            // tag at decode time, so union variants discriminate correctly (ADR-051).
+            // tag at decode time, so union variants discriminate correctly (ADR-034).
             Type::StrLit(s) => {
                 self.put_u8(KIND_STRLIT);
                 let lb = s.as_bytes();
@@ -1243,7 +1243,7 @@ impl<'a> DescEncoder<'a> {
             Type::Float32 => { self.put_u8(KIND_FLOAT); self.put_u8(4); }
             Type::Float64 => { self.put_u8(KIND_FLOAT); self.put_u8(8); }
             // Json / unconstrained TypeVar / opaque handles / functions / iterators / Shared:
-            // accept any. `Shared<T>` is an opaque mutable-state box (ADR-044), not a JSON shape,
+            // accept any. `Shared<T>` is an opaque mutable-state box (ADR-029), not a JSON shape,
             // so a `fromJson` target containing it imposes no structural check.
             Type::TypeVar(_)
             | Type::Iterator(_)
@@ -1253,10 +1253,10 @@ impl<'a> DescEncoder<'a> {
             // `Stream<T>` is opaque and never a `fromJson` target (not JSON-shaped, not
             // spellable in annotations); included only for match exhaustiveness — accept-any.
             | Type::Stream(_)
-            // A typed index-signature map `{ String: T }` (ADR-082) is NOT a v1 `fromJson` decode
+            // A typed index-signature map `{ String: T }` (ADR-055) is NOT a v1 `fromJson` decode
             // target — the decoder produces a `LinObject`, not a `LinMap`, so decoding INTO a map
             // would yield the wrong representation. Treated as accept-any here only for
-            // exhaustiveness; a `fromJson<{String:T}>` is not part of v1 (see ADR-082).
+            // exhaustiveness; a `fromJson<{String:T}>` is not part of v1 (see ADR-055).
             | Type::Map(_) => self.put_u8(KIND_JSON),
             Type::Array(inner) => {
                 self.put_u8(KIND_ARRAY);

@@ -293,7 +293,7 @@ impl<'ctx> Codegen<'ctx> {
         // where the literal stays Int32): widen the integer operand to float so both sides agree, and
         // dispatch on the float type. The checker permits these numeric combinations without inserting
         // explicit Coerce nodes on both operands. `Mod` is included so a `Number` body's `x % 2`
-        // lowers to a native `frem` at Float64 (ADR-018, reversed).
+        // lowers to a native `frem` at Float64 (ADR-014, reversed).
         if matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
             | BinOp::Lt | BinOp::LtEq | BinOp::Gt | BinOp::GtEq | BinOp::Eq | BinOp::NotEq)
             && lv.is_int_value() != rv.is_int_value()

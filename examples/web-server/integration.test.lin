@@ -8,7 +8,7 @@ import { router } from "./router"
 // the matching handler), and assert the final Response. Exercises every route the
 // server exposes plus the 404 fall-through.
 //
-// `render` is mocked (ADR-071) so routing/dispatch is tested without depending on
+// `render` is mocked (ADR-046) so routing/dispatch is tested without depending on
 // the on-disk view path (which only resolves from the repo root). The handler still
 // drives real templating via renderWith with an inline template, so the data it
 // passes is still interpolated and asserted. Rendering the real index.jinja file is

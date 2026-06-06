@@ -1,4 +1,4 @@
-// Benchmark: typed index-signature map `{ String: T }` with a FLAT-SCALAR value type (ADR-082
+// Benchmark: typed index-signature map `{ String: T }` with a FLAT-SCALAR value type (ADR-055
 // follow-up — unboxed scalar values). Relative to `map_index_signature.lin` (which scales the key
 // set and is dominated by key construction + table growth), this churns a SMALL fixed key set with
 // many rounds of overwrite + read-back, so the per-store / per-read VALUE cost dominates.

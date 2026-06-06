@@ -56,8 +56,8 @@ people.sortBy(p => p["name"])
 ### `push`
 
 Mutates the array in place. Generic (`<T>(arr: T[], item: T)`), so the element type is enforced —
-`push(intArr, "s")` is a compile error (ADR-085). An empty accumulator literal needs a type
-annotation so `T` is pinned — an evidence-free `[]` cannot infer its element type (ADR-084):
+`push(intArr, "s")` is a compile error (ADR-059). An empty accumulator literal needs a type
+annotation so `T` is pinned — an evidence-free `[]` cannot infer its element type (ADR-058):
 
 ```lin
 val xs: Int32[] = []
