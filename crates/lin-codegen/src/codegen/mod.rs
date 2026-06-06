@@ -1579,7 +1579,8 @@ impl<'ctx> Codegen<'ctx> {
                             if let (Some(&obj_v), Some(&key_v), Some(&val_v)) =
                                 (temp_map.get(object), temp_map.get(key), temp_map.get(value))
                             {
-                                self.compile_ir_index_set(obj_v, key_v, val_v, obj_ty, key_ty, val_ty);
+                                let val_repr = func.repr_of(*value);
+                                self.compile_ir_index_set(obj_v, key_v, val_v, obj_ty, key_ty, val_ty, &val_repr);
                             }
                         }
                         Instruction::FieldGet { dst, object, field, obj_ty, result_ty } => {
@@ -1816,6 +1817,18 @@ impl<'ctx> Codegen<'ctx> {
                         Instruction::Unbox { dst, val, result_ty } => {
                             if let Some(&v) = temp_map.get(val) {
                                 let result = self.compile_ir_unbox(v, result_ty);
+                                temp_map.insert(*dst, result);
+                            }
+                        }
+                        Instruction::BoxKeepPacked { dst, src, arr, .. } => {
+                            if let Some(&v) = temp_map.get(src) {
+                                let result = self.compile_ir_box_keep_packed(v, *arr);
+                                temp_map.insert(*dst, result);
+                            }
+                        }
+                        Instruction::UnboxKeepPacked { dst, src, arr, .. } => {
+                            if let Some(&v) = temp_map.get(src) {
+                                let result = self.compile_ir_unbox_keep_packed(v, *arr);
                                 temp_map.insert(*dst, result);
                             }
                         }
