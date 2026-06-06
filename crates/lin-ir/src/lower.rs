@@ -6666,6 +6666,19 @@ fn lower_string_interp(
         acc = new_acc;
     }
 
+    // KNOWN LEAK (string-interpolation, NOT yet fixed): both the per-part `ToString` result and the
+    // final `acc` interp string leak their +1 when the result is used transiently (an index-write
+    // KEY — `obj["${k}"] = v` — or a comparison operand). The obvious fixes are unsound as-is:
+    //   - releasing the per-part `ToString` temp double-frees when the part is ALREADY a String
+    //     (`value_to_string_simple` returns the input BORROWED for Type::Str, +0, not a fresh +1);
+    //   - `register_owned(acc)` double-frees when `acc` is moved into a consumer that already
+    //     accounts for the +1 (val binding / return / stored map VALUE).
+    // A correct fix needs `ToString` to UNIFORMLY return an owned string (retain in the Str arm of
+    // `value_to_string_simple`, mirroring lin_tagged_to_string's TAG_STR inc_ref) AND a transient-
+    // use release that the move/escape lowering doesn't already cover. Deferred — see
+    // project_raptor_slowness_leaks memory (leak #3). RAPTOR hits this on every `"${k}"` arrival-map
+    // key, so it is a real query-phase cost, but the fix must not reintroduce the double-frees the
+    // integration suite caught.
     acc
 }
 
