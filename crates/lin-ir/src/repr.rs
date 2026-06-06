@@ -223,8 +223,7 @@ fn sealed_fields(ty: &Type) -> Option<&IndexMap<String, Type>> {
     }
 }
 
-/// Mirror of `Codegen::sealed_array_elem_field_packable` (types.rs:333): SCALARS ONLY today (Stage
-/// 3a). Heap-field elements stay boxed.
+/// Mirror of `Codegen::sealed_array_elem_field_packable` (types.rs): SCALARS ONLY (Stage 3a).
 fn sealed_array_elem_field_packable(ty: &Type) -> bool {
     is_sealed_scalar_field(ty)
 }
@@ -466,6 +465,22 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
         // Box / Unbox: explicit representation changes. Box → Boxed; Unbox → the unboxed type repr.
         Instruction::Box { dst, .. } => set(seeds, *dst, Repr::boxed_opaque()),
         Instruction::Unbox { dst, result_ty, .. } => set(seeds, *dst, type_seed(result_ty)),
+        // Keep-packed coercions: BoxKeepPacked produces a Boxed(WrapsPacked(L)) handle; the inner
+        // layout comes from the source's type. UnboxKeepPacked produces a Packed(L) temp.
+        Instruction::BoxKeepPacked { dst, src, .. } => {
+            let inner = func.temp_types.get(src).cloned().unwrap_or(Type::Null);
+            let layout = match type_seed(&inner) {
+                Repr::Packed(l) => Some(l),
+                _ => None,
+            };
+            set(seeds, *dst, match layout {
+                Some(l) => Repr::Boxed(Inner::WrapsPacked(l)),
+                None => Repr::boxed_opaque(),
+            });
+        }
+        Instruction::UnboxKeepPacked { dst, ty, .. } => {
+            set(seeds, *dst, type_seed(ty));
+        }
         // PURE CARRY edges define a temp that is an ALIAS of its source: its repr comes from the
         // source's class fold (STEP 1 already unified them), NOT from a fresh seed. Seeding them by
         // their declared type would inject a spurious seed that, if it differed from the carried

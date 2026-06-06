@@ -318,6 +318,19 @@ impl<'ctx> Codegen<'ctx> {
                 key
             };
             let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget").try_as_basic_value().unwrap_basic();
+            // KEEP-PACKED read-back (repr pass, Stage 4 — THE dijkstra fix): when the map value type
+            // is a PACKED sealed array / sealed record, the slot holds a keep-packed handle
+            // (BoxKeepPacked stored a TaggedVal over the still-packed buffer). Unbox it as a packed
+            // pointer + retain (UnboxKeepPacked) — a fresh +1 owner matching what the old materialize
+            // path produced (so the projection's scheduled Release balances). Zero copy: the inner
+            // buffer never materializes. `lin_map_get` returns a BORROWED interior TaggedVal*, so the
+            // retain on the unboxed payload is what gives the result its own reference.
+            if Self::sealed_array_elem(result_ty).is_some() {
+                return self.compile_ir_unbox_keep_packed(tagged, /*arr=*/true);
+            }
+            if Self::sealed_fields(result_ty).is_some() {
+                return self.compile_ir_unbox_keep_packed(tagged, /*arr=*/false);
+            }
             return if Self::is_union_type(result_ty) {
                 tagged
             } else {
@@ -500,7 +513,39 @@ impl<'ctx> Codegen<'ctx> {
     /// `emit_object_set` — a concrete heap value is freshly heap-boxed and the box shell released
     /// after the set (net zero on the inner; the slot's reference comes from the IR
     /// `transfer_into_container`), a union value (already a `TaggedVal*`) passes straight through.
-    pub(crate) fn emit_map_set(&mut self, map_ptr: BasicValueEnum<'ctx>, key_ptr: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type, elem_ty: &Type) {
+    pub(crate) fn emit_map_set(&mut self, map_ptr: BasicValueEnum<'ctx>, key_ptr: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type, elem_ty: &Type, val_repr: &lin_ir::repr::Repr) {
+        // KEEP-PACKED (repr pass, Stage 4 — THE dijkstra fix): when the value is a PACKED sealed
+        // array / sealed record (proven by the pass: `val_repr` is `Packed(L)`), store it into the
+        // map slot by WRAPPING the still-packed pointer in a 16-byte TaggedVal (BoxKeepPacked,
+        // TAG_ARRAY / TAG_OBJECT) — O(1), NO `sealed_array_to_tagged` materialize (the O(n) copy that
+        // crashed on read-back). `lin_map_set` copies the 16 bytes inline and retains the inner; the
+        // shell is freed after. The read-back (`compile_ir_index` Map arm) unboxes it as a packed
+        // pointer (UnboxKeepPacked) feeding SealedArrayFieldGet zero-copy. Always sound: the runtime
+        // dispatches release/free on the buffer's `elem_tag` / sealed header, regardless of being
+        // wrapped in a TaggedVal slot.
+        if value.is_pointer_value() {
+            let packed_arr = val_repr.packed_sealed_array_layout().is_some();
+            let packed_rec = val_repr.packed_struct_fields().is_some();
+            if packed_arr || packed_rec {
+                // BoxKeepPacked: wrap the still-packed pointer (O(1) — `lin_box_array`/`box_object`
+                // store the pointer verbatim, NO inner retain, NO `sealed_array_to_tagged` copy).
+                // OWNERSHIP: the slot's single owning reference is supplied by the IR
+                // `transfer_into_container` retain emitted in `IndexSet` lowering (identical to the
+                // materialize path's contract). `lin_map_set` ALSO retains the inner into the slot, so
+                // that DUPLICATE retain is undone by releasing the inner when we free the shell
+                // (`lin_tagged_release` = drop inner + free shell). Net codegen effect on the inner is
+                // ZERO (retain then release), leaving exactly the IR transfer's +1 as the slot's
+                // reference — so the map drop's per-slot release frees it exactly once (ASan
+                // detect_leaks verified). Mirrors `emit_object_set`'s fresh-box contract.
+                let boxed = self.compile_ir_box_keep_packed(value, /*arr=*/packed_arr);
+                self.builder.call(self.rt.map_set,
+                    &[map_ptr.into(), key_ptr.into(), boxed.into()], "");
+                if boxed.is_pointer_value() {
+                    self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                }
+                return;
+            }
+        }
         // Flat-scalar value: store unboxed via a stack TaggedVal carrying T's tag/payload. Coerce
         // the (possibly narrower) source value to T's numeric representation first so the stored
         // payload is T-correct (e.g. a signed Int32 -1 sign-extends to Int64 -1, not 4294967295).
@@ -631,7 +676,7 @@ impl<'ctx> Codegen<'ctx> {
     /// `emit_array_set` helpers so the boxing/retain/release sequence is IDENTICAL to the
     /// `lin_object_set`/`lin_array_set` intrinsics; the matching IR-level ownership transfer
     /// is emitted in `IndexSet` lowering (`lin-ir`).
-    pub(crate) fn compile_ir_index_set(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, val_ty: &Type) {
+    pub(crate) fn compile_ir_index_set(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, val_ty: &Type, val_repr: &lin_ir::repr::Repr) {
         // Resolve an object key to a raw `LinString*`. A string key that is a callback param
         // arrives boxed (a `TaggedVal*`); unbox it, or `lin_object_set` reads the box as a
         // LinString and corrupts the key.
@@ -655,7 +700,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::Map(elem) => {
                 if obj.is_pointer_value() && key.is_pointer_value() {
                     let key_str = resolve_obj_key(self, key);
-                    self.emit_map_set(obj, key_str, value, val_ty, elem);
+                    self.emit_map_set(obj, key_str, value, val_ty, elem, val_repr);
                 }
             }
             Type::Array(elem) => {
@@ -797,7 +842,9 @@ impl<'ctx> Codegen<'ctx> {
         let mrg = self.context.append_basic_block(llvm_fn, "set_mrg");
         self.builder.conditional_branch(is_map, map_b, obj_b);
         self.builder.position_at_end(map_b);
-        self.emit_map_set(container, key_str, value, val_ty, &elem);
+        // In the union/nested-map dispatch the value arrives already boxed (a union TaggedVal*), so
+        // there is no packed buffer to keep-pack — pass the fail-safe boxed repr.
+        self.emit_map_set(container, key_str, value, val_ty, &elem, &lin_ir::repr::Repr::boxed_opaque());
         self.builder.unconditional_branch(mrg);
         self.builder.position_at_end(obj_b);
         self.emit_object_set(container, key_str, value, val_ty);
@@ -1062,16 +1109,66 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) fn sealed_array_project_from(&mut self, src: BasicValueEnum<'ctx>, src_ty: &Type, arr_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
+        if Self::sealed_array_elem(arr_ty).is_none() {
+            return ptr_ty.const_null().into();
+        }
+        // Unbox the source to a raw LinArray* if it is a boxed Json/union value.
+        let src_raw = if Self::is_union_type(src_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[src.into()], "sarrp_unbox").try_as_basic_value().unwrap_basic()
+        } else { src };
+        // KEEP-PACKED fast path (repr pass, Stage 4): if the unboxed source is ALREADY a packed
+        // 0xFE buffer (a boxed sealed array stored keep-packed, e.g. a Map slot read-back or a
+        // narrowing of `T[]|Null`), there is NO representation change — clone it BY POINTER (retain
+        // the existing 0xFE buffer, O(1)) instead of rebuilding element-wise through the boxed
+        // `Object[]` machinery (which would mis-read the inline scalar bytes → UAF). Dispatch on the
+        // runtime `elem_tag` (byte 4): 0xFE ⇒ keep-packed; otherwise (a genuinely-boxed `Object[]`,
+        // e.g. a `fromJson` result) fall through to the element rebuild below.
+        {
+            let i8_ty = self.context.i8_type();
+            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+            let tag_ptr = unsafe {
+                self.builder.gep(i8_ty, src_raw.into_pointer_value(), &[i64_ty.const_int(4, false)], "sarrp_tagp")
+            };
+            let etag = self.builder.load(i8_ty, tag_ptr, "sarrp_etag").into_int_value();
+            let is_packed = self.builder.int_compare(IntPredicate::EQ, etag, i8_ty.const_int(0xFE, false), "sarrp_ispk");
+            let kp_b = self.context.append_basic_block(llvm_fn, "sarrp_kp");
+            let rebuild_b = self.context.append_basic_block(llvm_fn, "sarrp_rebuild");
+            let merge_b = self.context.append_basic_block(llvm_fn, "sarrp_merge");
+            self.builder.conditional_branch(is_packed, kp_b, rebuild_b);
+            // Keep-packed: the unboxed 0xFE buffer is the SAME object the boxed source (`src`) holds a
+            // reference to. The projection here is a non-mutating BORROW that aliases the source's
+            // existing reference (the caller releases `src`/the cloned union box at the projection's
+            // scope, which drops the inner). So return the buffer VERBATIM with NO extra retain —
+            // adding one would out-balance the single source release and leak the buffer (the map
+            // value would never reach rc 0). This mirrors the union/Json `obj[k]` projection borrow.
+            self.builder.position_at_end(kp_b);
+            let kp_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(merge_b);
+            self.builder.position_at_end(rebuild_b);
+            // Fall through to the element-rebuild path; capture its result and join at merge.
+            let rebuilt = self.sealed_array_rebuild_from_boxed(src_raw, arr_ty);
+            let rebuild_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(merge_b);
+            self.builder.position_at_end(merge_b);
+            let phi = self.builder.phi(ptr_ty, "sarrp_phi");
+            phi.add_incoming(&[(&src_raw, kp_exit), (&rebuilt, rebuild_exit)]);
+            return phi.as_basic_value();
+        }
+    }
+
+    /// Element-by-element rebuild of a sealed-record array from a genuinely-boxed `Object[]` source
+    /// (each element a boxed `LinObject` projected into the packed element layout). The cold path of
+    /// `sealed_array_project_from` — used only when the source is NOT already a keep-packed 0xFE
+    /// buffer (e.g. a `fromJson` result). Split out so the keep-packed fast path is the common case.
+    pub(crate) fn sealed_array_rebuild_from_boxed(&mut self, src_raw: BasicValueEnum<'ctx>, arr_ty: &Type) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
         let fields = match Self::sealed_array_elem(arr_ty) {
             Some(f) => f.clone(),
             None => return ptr_ty.const_null().into(),
         };
         let stride = Self::sealed_array_stride(&fields);
         let desc = self.sealed_descriptor(&fields);
-        // Unbox the source to a raw LinArray* if it is a boxed Json/union value.
-        let src_raw = if Self::is_union_type(src_ty) {
-            self.builder.call(self.rt.unbox_ptr, &[src.into()], "sarrp_unbox").try_as_basic_value().unwrap_basic()
-        } else { src };
         // len = lin_array_length(src_raw)
         let len_fn = self.get_or_declare_fn("lin_array_length", i64_ty.fn_type(&[ptr_ty.into()], false));
         let len = self.builder.call(len_fn, &[src_raw.into()], "sarrp_len").try_as_basic_value().unwrap_basic().into_int_value();

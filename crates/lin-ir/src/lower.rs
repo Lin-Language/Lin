@@ -1175,6 +1175,9 @@ fn is_sealed_scalar_array(ty: &Type) -> bool {
 /// makes the lowerer's ownership/Coerce insertion diverge from the physical layout (UAF / mis-read),
 /// so the two MUST be kept in lockstep.
 fn is_sealed_array_elem_field_packable(ty: &Type) -> bool {
+    // SCALARS ONLY (Stage 3a) — MUST mirror `Codegen::sealed_array_elem_field_packable` /
+    // `monomorphize::field_packed_scalar` EXACTLY. Heap-field element arrays (Stage 3b) stay boxed
+    // pending the toString/Json/out-of-shape keep-packed boundary work (see the codegen gate note).
     ty.is_flat_scalar() || matches!(ty, Type::Bool)
 }
 

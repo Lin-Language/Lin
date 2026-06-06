@@ -331,6 +331,14 @@ impl<'ctx> Codegen<'ctx> {
     /// Re-enable by returning true here AND in the lower.rs / monomorphize.rs mirrors (all three MUST
     /// agree), then re-run corpus + ASan.
     pub(crate) fn sealed_array_elem_field_packable(ty: &Type) -> bool {
+        // SCALARS ONLY (Stage 3a). Stage 4 added the keep-packed Map/object round-trip
+        // (BoxKeepPacked/UnboxKeepPacked) which makes the CONTAINER boundary sound for packed sealed
+        // arrays, but shipping HEAP-FIELD element arrays (Stage 3b) additionally requires keep-packed
+        // wiring at the toString / Json-materialize / out-of-shape-read / filter boundaries — each of
+        // which still materializes element-wise and regresses the corpus (sealed_array_to_json,
+        // out_of_shape_field_read, filter double-free) when an element has a heap field. Kept
+        // scalar-only here pending that broader boundary work; the keep-packed Map round-trip applies
+        // to the existing SCALAR packed arrays. MUST mirror lower.rs / monomorphize.rs.
         Self::is_sealed_scalar_field(ty)
     }
 
