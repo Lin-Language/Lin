@@ -746,6 +746,52 @@ print(toString(total))
     assert_eq!(output, vec!["19000"]);
 }
 
+// Regression (box-shell of a fresh heap value coerced to Json — the dominant RAPTOR query-phase
+// leak, "leak B"): binding a FRESHLY-ALLOCATED concrete heap value (`{}`, `[..]`, a String/Array
+// call result) to a `val`/`var` of UNION (`Json`) type boxes it via `lin_box_object`/`box_array`/
+// `box_str` — a 16-byte `TaggedVal*` shell wrapping the raw inner without bumping its rc. The IR
+// owning model registered only the RAW INNER, so scope exit released the inner but ORPHANED the box
+// shell → 16 B leaked per binding (unbounded RSS in a hot loop). Fix: `lower_value_into_slot` / the
+// plain-`var` arm now route through `coerce_to_slot_type_owning_bind`, which transfers ownership of
+// the box into the scope (register the box owned, unregister the raw inner) so scope-exit releases
+// the box via `lin_tagged_release` (frees shell AND drops the inner) and the inner's single +1 flows
+// into the box — no leak, no double-free. A WRONG fix (releasing both, or failing to unregister the
+// inner) would double-free the inner and crash / corrupt; ASan (stdlib+examples leg) guards the
+// no-leak / no-double-free halves. This test guards that discarding fresh Json-typed bindings in a
+// hot loop — and a returned/moved one — stays CORRECT (an over-eager free would corrupt the result).
+#[test]
+fn test_fresh_json_binding_box_released_and_correct() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+import { keys } from "std/object"
+import { length } from "std/array"
+
+// Discarded fresh Json-typed `val`/`var` bindings (the box shell must be reclaimed).
+val churn = (): Int32 =>
+  val m: Json = {}
+  var a: Json = [1, 2, 3]
+  val s: Json = "hi"
+  0
+
+// A returned fresh Json binding MOVES its +1 box out — must NOT be freed at scope exit.
+val makeStored = (): Int32 =>
+  val o: Json = {}
+  o["k"] = 7
+  o["j"] = 11
+  length(keys(o))
+
+var total = 0
+range(0, 50).for(i =>
+  total = total + churn()
+  total = total + makeStored()
+)
+print(toString(total))
+"#);
+    // churn() = 0; makeStored() = 2 (two keys). 50 * (0 + 2) = 100.
+    assert_eq!(output, vec!["100"]);
+}
+
 // Regression (escape safety): a `var n` cell captured by a closure that is RETURNED from its
 // creating function ESCAPES — the closure (and thus the cell) outlives the call. The lowerer
 // must NOT free this cell at scope exit; doing so would be a use-after-free when the returned

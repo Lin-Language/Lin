@@ -1927,7 +1927,47 @@ fn lower_value_into_slot(
         return t;
     }
     let t = lower_expr(value, builder, ctx);
-    coerce_to_slot_type(t, &value.ty(), slot_ty, builder)
+    coerce_to_slot_type_owning_bind(t, &value.ty(), slot_ty, builder)
+}
+
+/// Coerce a value into a (plain, non-cell) local/global SLOT the binding will OWN, transferring
+/// ownership of any transient coercion box into the scope's owned set so scope-exit reclaims it.
+///
+/// This is the BINDING analogue of `coerce_and_own_store` (the CELL/global case, which clones the
+/// box and frees the transient shell). Here the binding does NOT clone — the box IS the value the
+/// slot holds — so the scope must OWN the box itself.
+///
+/// The leak this fixes: when `coerce_to_slot_type` boxes a CONCRETE heap value (`is_rc_type`
+/// true: Str/Array/FixedArray/Object/Iterator) into a UNION slot, it emits a `Coerce`
+/// (`lin_box_object`/`lin_box_array`/`lin_box_str`) producing a fresh 16-byte `TaggedVal*` shell
+/// `b` that wraps the raw inner WITHOUT bumping the inner's rc, and registers NOTHING for `b`.
+/// `lower_expr` already `register_owned`'d the raw inner (a fresh alloc, or a retained read).
+/// Scope-exit then releases the raw inner (rc 1→0, frees it) but orphans `b`'s shell → 16 B leak.
+///
+/// Fix: the box `b` becomes the owned union representation. `register_owned(b, slot_ty)` so
+/// scope-exit releases it via `lin_tagged_release` — which frees BOTH the shell AND drops the
+/// inner's rc — and `unregister_owned(raw)` so the inner's single +1 transfers INTO the box
+/// (otherwise scope-exit would also release the inner → double-free). Exactly mirrors the
+/// `coerce_if_branch` "concrete value boxed to union" case (the box owns its inner via the kept
+/// raw temp) and `transfer_into_container`'s fresh-alloc unregister.
+///
+/// No-op (delegates to `coerce_to_slot_type` only) when: representations match (no box made), the
+/// slot is not a union (e.g. sealed-scalar element coercion — the only other caller of
+/// `lower_value_into_slot`), or the value is already a union (the box is a clone/forward handled
+/// elsewhere) or non-rc (scalar→union boxing carries no inner heap payload to balance — the cached
+/// scalar box has nothing to release, and the raw scalar is not registered owned anyway).
+fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
+    let made_fresh_box = is_union_ty(slot_ty)
+        && !is_union_ty(value_ty)
+        && is_rc_type(value_ty)
+        && type_repr_differs(value_ty, slot_ty);
+    let coerced = coerce_to_slot_type(t, value_ty, slot_ty, builder);
+    if made_fresh_box {
+        // The box now owns the inner's +1; the scope releases the box (freeing shell + inner).
+        builder.unregister_owned(t);
+        builder.register_owned(coerced, slot_ty.clone());
+    }
+    coerced
 }
 
 /// Coerce a value temp to a slot's declared type when their runtime representations
@@ -2092,8 +2132,11 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 let create_block = builder.current_block;
                 builder.created_cells.push((cell, cell_ty, create_block));
             } else {
-                let t = lower_expr(value, builder, ctx);
-                let t = coerce_to_slot_type(t, &value.ty(), ty, builder);
+                let raw = lower_expr(value, builder, ctx);
+                // Transfer ownership of any transient coercion box (concrete heap value → union
+                // slot) into the scope's owned set, mirroring the `val`-binding path, so the box
+                // shell is reclaimed at scope exit rather than orphaned.
+                let t = coerce_to_slot_type_owning_bind(raw, &value.ty(), ty, builder);
                 // Plain mutable temp; tracked per var slot, updated on LocalSet.
                 builder.slots.insert(*slot, t);
                 // A top-level `var` is also published to its module global so closures (which
