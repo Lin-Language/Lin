@@ -2573,6 +2573,8 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             let mut lhs = lower_expr(left, builder, ctx);
             let mut rhs = lower_expr(right, builder, ctx);
             let mut operand_ty = left_ty.clone();
+            // TaggedVal* operand shells freshly boxed below (see the arith dyn-coerce branch).
+            let mut fresh_operand_boxes: Vec<Temp> = Vec::new();
 
             // ARITHMETIC ops need concrete (unboxed) operands. If a side's STATIC type is a
             // union (Json/TypeVar) while the other is concrete — e.g. a loop/closure param
@@ -2608,11 +2610,20 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                     let json = Type::TypeVar(u32::MAX);
                     // Box whichever side is concrete (NOT a TypeVar) into a Json `TaggedVal*`; a
                     // side that is already a (possibly-boxed) TypeVar passes through unchanged.
+                    // The fresh box is a TaggedVal* shell the tagged-arith op only READS and never
+                    // takes ownership of — track it and reclaim the SHELL after the op (below), or
+                    // it leaks per evaluation (the dominant RAPTOR query-phase arith leak, e.g.
+                    // `acc + 100000` boxing `100000` every loop iteration). The inner payload is a
+                    // scalar (no heap) or a String separately owned by its own scope.
                     if !left_dyn {
-                        lhs = coerce_to_slot_type(lhs, &left_ty, &json, builder);
+                        let boxed = coerce_to_slot_type(lhs, &left_ty, &json, builder);
+                        if boxed != lhs { fresh_operand_boxes.push(boxed); }
+                        lhs = boxed;
                     }
                     if !right_dyn {
-                        rhs = coerce_to_slot_type(rhs, &right_ty, &json, builder);
+                        let boxed = coerce_to_slot_type(rhs, &right_ty, &json, builder);
+                        if boxed != rhs { fresh_operand_boxes.push(boxed); }
+                        rhs = boxed;
                     }
                     operand_ty = json;
                 } else {
@@ -2636,6 +2647,12 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 operand_ty,
                 ty: result_type.clone(),
             });
+            // Reclaim any operand box shell freshly created to dispatch a tagged-arith op (the op
+            // only READ its operands). Shell-only (`FreeBoxShell`) — the inner is a scalar or a
+            // separately owned value. MUST come after the Binary so the operand is still live.
+            for shell in fresh_operand_boxes {
+                builder.emit(Instruction::FreeBoxShell { val: shell });
+            }
             dst
         }
 

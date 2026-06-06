@@ -8,6 +8,24 @@ use lin_ir::ir as lir;
 use super::Codegen;
 
 impl<'ctx> Codegen<'ctx> {
+    /// Reclaim a TaggedVal* operand shell that `box_rhs`/`box_lhs` FRESHLY allocated for a
+    /// concrete operand before passing it to a tagged runtime helper (`lin_tagged_eq` /
+    /// `lin_tagged_cmp` / `lin_tagged_arith`). Those helpers only READ their operands, so the
+    /// shell is otherwise leaked. Frees the 16-byte shell ONLY (`lin_tagged_free_box`), never the
+    /// inner payload — the inner is a scalar (no heap) or, for a string literal, a borrowed string
+    /// the box does not own. A no-op when the operand's static type was a union: `box_*` then
+    /// returned the value unchanged and it is owned elsewhere (must not be freed). Cached-box-safe.
+    fn free_fresh_operand_box(&mut self, operand: BasicValueEnum<'ctx>, operand_ty: &Type) {
+        if Self::is_union_type(operand_ty) || !operand.is_pointer_value() {
+            return;
+        }
+        let ptr_t = self.context.ptr_type(AddressSpace::default());
+        let free_fn = self.get_or_declare_fn(
+            "lin_tagged_free_box",
+            self.context.void_type().fn_type(&[ptr_t.into()], false));
+        self.builder.call(free_fn, &[operand.into()], "");
+    }
+
     pub(crate) fn compile_add(
         &mut self,
         lv: BasicValueEnum<'ctx>,
@@ -421,6 +439,12 @@ impl<'ctx> Codegen<'ctx> {
         {
             let lv_tagged = box_lhs(self, lv);
             let rv_tagged = box_rhs(self, rv);
+            // box_lhs/box_rhs FRESHLY allocate a 16-byte TaggedVal shell only when the static
+            // operand type is concrete (a union operand is passed through unchanged and is owned
+            // elsewhere — must NOT be freed). The tagged eq/cmp helpers only READ their operands,
+            // so each freshly created shell must be reclaimed (shell-only; the inner payload is a
+            // scalar with no heap, or — for a string literal — a borrowed string the shell does
+            // not own). `free_fresh_operand_box` is shell-only, union-aware, and cached-box-safe.
             match op {
                 BinOp::Eq | BinOp::NotEq => {
                     let i8_ty = self.context.i8_type();
@@ -430,6 +454,8 @@ impl<'ctx> Codegen<'ctx> {
                               self.context.ptr_type(AddressSpace::default()).into()], false));
                     let eq_u8 = self.builder.call(eq_fn, &[lv_tagged.into(), rv_tagged.into()], "ir_teq").try_as_basic_value().unwrap_basic().into_int_value();
                     let eq = self.builder.int_truncate(eq_u8, self.context.bool_type(), "ir_teq_b");
+                    self.free_fresh_operand_box(lv_tagged, lty);
+                    self.free_fresh_operand_box(rv_tagged, rty);
                     return if matches!(op, BinOp::NotEq) {
                         self.builder.not(eq, "ir_tne").into()
                     } else { eq.into() };
@@ -440,6 +466,8 @@ impl<'ctx> Codegen<'ctx> {
                     let cmp_fn = self.get_or_declare_fn("lin_tagged_cmp",
                         i32_ty.fn_type(&[ptr_t.into(), ptr_t.into()], false));
                     let ord = self.builder.call(cmp_fn, &[lv_tagged.into(), rv_tagged.into()], "ir_tcmp").try_as_basic_value().unwrap_basic().into_int_value();
+                    self.free_fresh_operand_box(lv_tagged, lty);
+                    self.free_fresh_operand_box(rv_tagged, rty);
                     let zero = i32_ty.const_zero();
                     let pred = match op {
                         BinOp::Lt => IntPredicate::SLT, BinOp::LtEq => IntPredicate::SLE,
@@ -469,6 +497,11 @@ impl<'ctx> Codegen<'ctx> {
                     let rv_tagged = box_rhs(self, rv);
                     let eq_u8 = self.builder.call(eq_fn, &[lv.into(), rv_tagged.into()], "ir_teq").try_as_basic_value().unwrap_basic().into_int_value();
                     let eq = self.builder.int_truncate(eq_u8, self.context.bool_type(), "ir_teq_b");
+                    // box_rhs FRESHLY boxed a concrete rhs into a shell that lin_tagged_eq only
+                    // read — reclaim the shell (shell-only; inner is a scalar or a borrowed string
+                    // the box does not own). A union rhs was passed through unchanged: do NOT free
+                    // it (owned elsewhere). `lv` is the incoming union operand — never freed here.
+                    self.free_fresh_operand_box(rv_tagged, rty);
                     return if matches!(op, BinOp::NotEq) {
                         self.builder.not(eq, "ir_tne").into()
                     } else { eq.into() };
@@ -482,6 +515,9 @@ impl<'ctx> Codegen<'ctx> {
                         i32_ty.fn_type(&[ptr_t.into(), ptr_t.into()], false));
                     let rv_tagged = box_rhs(self, rv);
                     let ord = self.builder.call(cmp_fn, &[lv.into(), rv_tagged.into()], "ir_tcmp").try_as_basic_value().unwrap_basic().into_int_value();
+                    // Reclaim the freshly boxed rhs shell (lin_tagged_cmp only reads it). `lv` is
+                    // the incoming union operand owned elsewhere — never freed here.
+                    self.free_fresh_operand_box(rv_tagged, rty);
                     let zero = i32_ty.const_zero();
                     let pred = match op {
                         BinOp::Lt => IntPredicate::SLT, BinOp::LtEq => IntPredicate::SLE,
@@ -509,6 +545,12 @@ impl<'ctx> Codegen<'ctx> {
                         &[lv.into(), rv_tagged.into(), i32_ty.const_int(op_code, false).into()],
                         "ir_tarith",
                     ).try_as_basic_value().unwrap_basic();
+                    // lin_tagged_arith only READS its operands; reclaim the freshly boxed rhs
+                    // OPERAND shell (distinct from the result box freed below). `lv` is the
+                    // incoming union operand owned elsewhere — never freed here. This is the
+                    // dominant RAPTOR query-phase leak: `acc = acc + stop` boxes a non-cached
+                    // (large) operand every iteration that was previously never reclaimed.
+                    self.free_fresh_operand_box(rv_tagged, rty);
                     // The helper hands back a freshly boxed (union) value. If the surrounding
                     // context wants a concrete scalar, unbox it and reclaim the box shell —
                     // the payload is a scalar (no inner heap), so freeing the 16-byte shell is

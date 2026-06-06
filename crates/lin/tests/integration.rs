@@ -1597,6 +1597,45 @@ run()
 }
 
 #[test]
+fn test_dynamic_json_arith_cmp_eq_operand_box_no_leak() {
+    // RAPTOR leak #4: the TaggedVal* OPERAND shell freshly boxed to dispatch a tagged
+    // arith/cmp/eq op (`lin_tagged_arith` / `lin_tagged_cmp` / `lin_tagged_eq`) — which only
+    // READ their operands — was never reclaimed, leaking one 16-byte shell per op in hot loops.
+    // The fix reclaims the shell (shell-only `lin_tagged_free_box` / IR `FreeBoxShell`); a WRONG
+    // free would double-free the operand's inner (e.g. the borrowed string literal `"pass"`) and
+    // crash. ASan (CI asan leg) is the leak/double-free guard; this asserts the arithmetic and
+    // comparison results stay correct under the new frees. Covers: union+concrete arith (acc +
+    // literal, grows past the small-int cache), dynamic float arith, union < concrete cmp, and
+    // union == string-literal eq (the borrowed-string operand-shell case).
+    let output = run(r#"import { print } from "std/io"
+import { for, range } from "std/iter"
+import { toString } from "std/string"
+val rec: Json = { "f": 2.5, "status": "pass" }
+val arith = (): Json =>
+  var acc: Json = 0
+  range(0, 50).for(_ => acc = acc + 100000)
+  acc
+val floats = (): Json =>
+  var f: Json = rec["f"]
+  range(0, 4).for(_ => f = f + 1.5)
+  f
+val cmp = (): Int32 =>
+  var hits: Int32 = 0
+  range(0, 50).for(_ => if rec["f"] < 999999 then hits = hits + 1 else hits = hits)
+  hits
+val eqstr = (): Int32 =>
+  var c: Int32 = 0
+  range(0, 50).for(_ => if rec["status"] == "pass" then c = c + 1 else c = c)
+  c
+print(toString(arith()))
+print(toString(floats()))
+print("${cmp()}")
+print("${eqstr()}")
+"#);
+    assert_eq!(output, vec!["5000000", "8.5", "50", "50"]);
+}
+
+#[test]
 fn test_dynamic_json_arith_fault_catchable_in_async() {
     // A Json-arithmetic fault raised inside an async thunk unwinds to the boundary and is
     // caught as an `Error` (proving lin_tagged_arith's `extern "C-unwind"` ABI), exactly like
