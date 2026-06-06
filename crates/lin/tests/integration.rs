@@ -13682,3 +13682,58 @@ main()
     // Both paths mutate the shared array (length 3); the grow case stays safe and still shared.
     assert_eq!(out, vec!["fn=3".to_string(), "proj=3".to_string(), "grow=3/3".to_string()]);
 }
+
+#[test]
+fn test_typed_map_through_function_value() {
+    // Regression: a typed index-signature map (`{ String: T }`, `Type::Map`) passed through an
+    // opaque `Function`-value call must survive the closure-ABI wrapper. The wrapper calls
+    // `unbox_value`, which previously omitted `Type::Map` from its pointer-unboxing arm, so the
+    // callee received a TAG_MAP TaggedVal box instead of the raw `LinMap*` — flattening the map
+    // (flat read -> -1) or crashing on a null-pointer deref in lin-runtime/src/map.rs.
+    let src = r#"
+import { print } from "std/io"
+import { keys } from "std/object"
+import { length } from "std/array"
+
+val buildFlat = (): { String: Int32 } =>
+  var m: { String: Int32 } = {}
+  m["x"] = 7
+  m
+
+val readX = (m: { String: Int32 }): Int32 =>
+  val v = m["x"]
+  match v
+    is Null => -1
+    else => v
+
+val applyFlat = (fn: Function, m: { String: Int32 }): Int32 =>
+  fn(m)
+
+val buildNested = (): { String: { String: Int32 } } =>
+  var m: { String: { String: Int32 } } = {}
+  var inner: { String: Int32 } = {}
+  inner["a"] = 1
+  inner["b"] = 2
+  m["k"] = inner
+  m
+
+val countInner = (m: { String: { String: Int32 } }): Int32 =>
+  val inner = m["k"]
+  match inner
+    is Null => -1
+    else => length(keys(inner))
+
+val applyNested = (fn: Function, m: { String: { String: Int32 } }): Int32 =>
+  fn(m)
+
+val main = (): Null =>
+  val f = buildFlat()
+  print("flat=${applyFlat(readX, f)}")
+  val n = buildNested()
+  print("nested=${applyNested(countInner, n)}")
+
+main()
+"#;
+    let out = run(src);
+    assert_eq!(out, vec!["flat=7".to_string(), "nested=2".to_string()]);
+}
