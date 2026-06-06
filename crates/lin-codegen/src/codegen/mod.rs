@@ -213,6 +213,10 @@ impl<'ctx> Codegen<'ctx> {
         // type-erased call that crashes a concrete use site.
         let mut ir_module =
             lin_ir::lower_import_module_with_imports(module, &module_key, imports, replaced_exports);
+        // Representation-inference pass (repr.rs) — STAGE 2 observer; runs before rc_elide on the
+        // same IR shape as the main module. Computes the per-temp repr table and (debug builds)
+        // asserts the Stage-2 oracle + verifier. Nothing consumes the table yet.
+        lin_ir::repr::run(&ir_module);
         lin_ir::rc_elide::elide_rc(&mut ir_module);
         // Sealed-records Stage 4: stack-allocate non-escaping all-scalar sealed records and suppress
         // their Retain/Release emission (imports get the same analysis as the main module).
