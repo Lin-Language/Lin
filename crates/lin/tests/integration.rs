@@ -12496,6 +12496,145 @@ print("extra=${wide["extra"]}")
     );
 }
 
+// ───────────────────────── Intersection types `&` (ADR-061) ─────────────────────────
+// Record-only intersection: `A & B` merges field maps into a plain Type::Object. `&` binds
+// tighter than `|`. Named `type T = A & B` inherits named=sealed via expand_named_body.
+
+#[test]
+fn test_intersection_authors_example_person_oldperson() {
+    // The author's motivating example: OldPerson = Person & { wisdom } has all 3 fields, and a
+    // `(person: Person)` function accepts an OldPerson via width subtyping.
+    let out = run(r#"
+import { print } from "std/io"
+type Person = { "age": UInt8, "name": String }
+type OldPerson = Person & { "wisdom": Boolean }
+val sayHello = (person: Person) => print("Hello ${person["name"]}")
+val elder: OldPerson = { "age": 99u8, "name": "Yoda", "wisdom": true }
+sayHello(elder)
+print("wise: ${elder["wisdom"]}")
+"#);
+    assert_eq!(out, vec!["Hello Yoda", "wise: true"]);
+}
+
+#[test]
+fn test_intersection_three_way_all_fields() {
+    // `A & B & C` (left-assoc) merges all three field maps.
+    let out = run(r#"
+import { print } from "std/io"
+type A = { "a": Int32 }
+type B = { "b": Int32 }
+type C = { "c": Int32 }
+type ABC = A & B & C
+val x: ABC = { "a": 1, "b": 2, "c": 3 }
+print("${x["a"] + x["b"] + x["c"]}")
+"#);
+    assert_eq!(out, vec!["6"]);
+}
+
+#[test]
+fn test_intersection_inline_param_annotation() {
+    // `&` works inline in a parameter annotation, not just a `type` decl.
+    let out = run(r#"
+import { print } from "std/io"
+type Named = { "name": String }
+val greet = (p: Named & { "id": Int32 }) => print("${p["name"]}#${p["id"]}")
+greet({ "name": "Zed", "id": 7 })
+"#);
+    assert_eq!(out, vec!["Zed#7"]);
+}
+
+#[test]
+fn test_intersection_field_conflict_is_error() {
+    // Same key, different types → clear type error at the type declaration.
+    let (ok, out) = check_source(r#"
+type X = { "k": Int32 } & { "k": String }
+"#);
+    assert!(!ok, "conflict must fail type check");
+    assert!(
+        out.contains("conflicting field \"k\""),
+        "expected conflict error, got: {}",
+        out
+    );
+}
+
+#[test]
+fn test_intersection_non_record_operand_is_error() {
+    // A non-record operand → clear record-only error at the type declaration.
+    let (ok, out) = check_source(r#"
+type X = Int32 & String
+"#);
+    assert!(!ok, "non-record intersection must fail type check");
+    assert!(
+        out.contains("only valid between record types"),
+        "expected record-only error, got: {}",
+        out
+    );
+}
+
+#[test]
+fn test_intersection_precedence_amp_tighter_than_pipe() {
+    // `A & B | C` parses as `(A & B) | C`: a value satisfying just `A & B` and a value satisfying
+    // just `C` are both valid; a value with only `A`'s field is NOT.
+    let out = run(r#"
+import { print } from "std/io"
+type A = { "a": Int32 }
+type B = { "b": Int32 }
+type C = { "c": Int32 }
+type T = A & B | C
+val x: T = { "a": 1, "b": 2 }
+val y: T = { "c": 3 }
+print("ok")
+"#);
+    assert_eq!(out, vec!["ok"]);
+}
+
+#[test]
+fn test_intersection_omission_rejected_named_sealed_inherited() {
+    // Omitting a merged field from an `&`-defined named type is rejected (named=sealed inherited).
+    let err = run_expect_err(r#"
+type Person = { "age": UInt8, "name": String }
+type OldPerson = Person & { "wisdom": Boolean }
+val bad: OldPerson = { "age": 1u8, "name": "x" }
+"#);
+    assert!(
+        err.contains("wisdom"),
+        "expected omission error mentioning wisdom, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_intersection_extras_projected_at_boundary() {
+    // A wider literal (extra field) binds to an `&`-defined type; extras are projected away.
+    let out = run(r#"
+import { print } from "std/io"
+type Person = { "age": UInt8, "name": String }
+type OldPerson = Person & { "wisdom": Boolean }
+val src = { "age": 1u8, "name": "x", "wisdom": true, "extra": 9 }
+val p: OldPerson = src
+print("${p["name"]}")
+"#);
+    assert_eq!(out, vec!["x"]);
+}
+
+#[test]
+fn test_fmt_intersection_roundtrips() {
+    // The formatter must reproduce `A & B` (and three-way) exactly.
+    assert_eq!(
+        fmt("type T = A & B\n").trim(),
+        "type T = A & B"
+    );
+    assert_eq!(
+        fmt("type T = A & B & C\n").trim(),
+        "type T = A & B & C"
+    );
+    // `&` binds tighter than `|`: `A & B | C` round-trips without spurious parens.
+    assert_eq!(
+        fmt("type T = A & B | C\n").trim(),
+        "type T = A & B | C"
+    );
+}
+
 // ───────────────────────── Sealed records — Stage 1 ─────────────────────────
 // Unboxed packed-struct layout + constant-offset field access for sealed all-scalar record
 // types. See ADR-055 + SPECIFICATION §5.9.1 (sealed records, Stage 1).

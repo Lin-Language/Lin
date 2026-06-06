@@ -5,7 +5,7 @@ use super::Parser;
 
 impl Parser {
     pub(crate) fn parse_type_expr(&mut self) -> TypeExpr {
-        let first = self.parse_type_primary();
+        let first = self.parse_type_intersection();
         // A `|` continuation may sit on the next (indented) line, e.g.
         // `type R =⏎  { .. }⏎  | { .. }` (first variant without a leading pipe). Peek past
         // newlines via save/restore: only treat them as a continuation when a `|` follows,
@@ -19,12 +19,30 @@ impl Parser {
                 }
                 self.advance();
                 self.skip_newlines();
-                types.push(self.parse_type_primary());
+                types.push(self.parse_type_intersection());
             }
             TypeExpr::Union(types, Span::dummy())
         } else {
             first
         }
+    }
+
+    /// Record intersection `A & B [& C …]` (ADR-061). Binds TIGHTER than union `|` (TS-style), so
+    /// `A & B | C` parses as `(A & B) | C`. Left-associative. Sits between `parse_type_expr` (which
+    /// handles `|`) and `parse_type_primary` (the leaves). A single operand passes straight through,
+    /// so non-intersection types are unaffected.
+    pub(crate) fn parse_type_intersection(&mut self) -> TypeExpr {
+        let first = self.parse_type_primary();
+        if !self.check(TokenKind::Amp) {
+            return first;
+        }
+        let mut types = vec![first];
+        while self.check(TokenKind::Amp) {
+            self.advance();
+            self.skip_newlines();
+            types.push(self.parse_type_primary());
+        }
+        TypeExpr::Intersection(types, Span::dummy())
     }
 
     pub(crate) fn parse_type_expr_with_leading_pipe(&mut self) -> TypeExpr {
@@ -33,7 +51,7 @@ impl Parser {
             while self.check(TokenKind::Pipe) {
                 self.advance();
                 self.skip_newlines();
-                types.push(self.parse_type_primary());
+                types.push(self.parse_type_intersection());
                 self.skip_newlines();
             }
             if types.len() == 1 {
