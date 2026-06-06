@@ -1,9 +1,11 @@
+pub mod carry;
 pub mod escape;
 pub mod ir;
 pub mod lower;
 pub mod liveness;
 pub mod monomorphize;
 pub mod rc_elide;
+pub mod repr;
 
 pub use ir::*;
 pub use lower::{

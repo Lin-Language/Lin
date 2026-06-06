@@ -70,6 +70,7 @@ use std::collections::HashMap;
 
 use lin_check::types::Type;
 
+use crate::carry::{self, UnionFind};
 use crate::ir::*;
 
 /// Run the escape-analysis pass on all functions in a module, mutating `MakeObject.stack` in place.
@@ -83,72 +84,11 @@ pub fn analyze(module: &mut LinModule) {
 /// This is the Stage-4 scope: heap-field sealed records are NEVER stack-allocated here (their stack
 /// drop would have to release heap fields — deferred). Mirrors codegen's `sealed_fields` gate plus
 /// an all-scalar restriction. Anonymous/unsealed objects, unions, Json, etc. → false.
+///
+/// Delegates to [`carry::is_stack_eligible_type`] so the all-scalar sealed-record gate has a single
+/// definition shared with the carry-edge classifier (Stage-1 extraction; behaviour unchanged).
 fn is_stack_eligible_type(ty: &Type) -> bool {
-    match ty {
-        Type::Object { fields, sealed: true } if !fields.is_empty() => {
-            fields.values().all(is_scalar_field)
-        }
-        _ => false,
-    }
-}
-
-/// A field that may appear inline in a stack-allocatable sealed record: a fixed-width scalar or Bool.
-/// (No String/Array/nested-sealed/heap field — those keep RC and are out of Stage-4 scope.)
-fn is_scalar_field(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::Bool
-            | Type::Int8 | Type::Int16 | Type::Int32 | Type::Int64
-            | Type::UInt8 | Type::UInt16 | Type::UInt32 | Type::UInt64
-            | Type::Float32 | Type::Float64
-    )
-}
-
-/// True when a `Coerce { from_ty, to_ty }` does NOT change the physical representation, i.e. both
-/// sides are the SAME stack-eligible sealed scalar record (so the coerce is a value-preserving
-/// alias — a carry edge). Any other coerce (projection that allocates, boxing to Json, a different
-/// field set) is representation-changing → NOT a carry edge (the chain breaks; the source's class
-/// is not unified with the dst).
-fn coerce_is_carry(from_ty: &Type, to_ty: &Type) -> bool {
-    is_stack_eligible_type(from_ty) && is_stack_eligible_type(to_ty) && from_ty == to_ty
-}
-
-// ---------------------------------------------------------------------------
-// Union-find over temps (carry classes)
-// ---------------------------------------------------------------------------
-
-struct UnionFind {
-    parent: Vec<u32>,
-}
-
-impl UnionFind {
-    fn new(n: u32) -> Self {
-        UnionFind { parent: (0..n).collect() }
-    }
-    fn find_raw(&mut self, x: u32) -> u32 {
-        let mut root = x;
-        while self.parent[root as usize] != root {
-            root = self.parent[root as usize];
-        }
-        // Path compression.
-        let mut cur = x;
-        while self.parent[cur as usize] != root {
-            let next = self.parent[cur as usize];
-            self.parent[cur as usize] = root;
-            cur = next;
-        }
-        root
-    }
-    fn find(&mut self, x: Temp) -> u32 {
-        self.find_raw(x.0)
-    }
-    fn union(&mut self, a: Temp, b: Temp) {
-        let ra = self.find(a);
-        let rb = self.find(b);
-        if ra != rb {
-            self.parent[ra as usize] = rb;
-        }
-    }
+    carry::is_stack_eligible_type(ty)
 }
 
 fn analyze_fn(func: &mut LinFunction) {
@@ -209,11 +149,9 @@ fn analyze_fn(func: &mut LinFunction) {
                 // arg's class are one. If the param's class escapes anywhere, the arg's class does
                 // too — exactly the soundness we need. If there is NO corresponding param (arity
                 // mismatch — shouldn't happen for a self-tail-call) we conservatively mark escape.
-                for (i, a) in args.iter().enumerate() {
-                    match func.params.get(i) {
-                        Some((p, _)) => uf.union(*a, *p),
-                        None => mark(&mut escaping, *a),
-                    }
+                let unmatched = carry::classify_tailcall_carry(args, &func.params, &mut uf);
+                for a in unmatched {
+                    mark(&mut escaping, a);
                 }
             }
             Terminator::Return(None) | Terminator::Jump(_) | Terminator::Unreachable => {}
@@ -272,44 +210,35 @@ fn analyze_fn(func: &mut LinFunction) {
         block.instructions.retain(|instr| match instr {
             Instruction::Retain { val, .. } | Instruction::Release { val, .. } => {
                 // Keep the instruction UNLESS its target is in a stack-resident class.
-                !stack_class_roots.contains(&uf_find_const(&uf, *val))
+                !stack_class_roots.contains(&uf.find_const(*val))
             }
             _ => true,
         });
     }
 }
 
-/// Read-only union-find root lookup (no path compression) so it can run inside `retain`'s `&uf`
-/// closure without a `&mut` borrow. The union-find is already fully built and path-compressed by the
-/// preceding `find`/`find_raw` calls, so the walk is short.
-fn uf_find_const(uf: &UnionFind, x: Temp) -> u32 {
-    let mut root = x.0;
-    while uf.parent[root as usize] != root {
-        root = uf.parent[root as usize];
-    }
-    root
-}
-
 /// Classify one instruction: add carry edges (union) and mark escaping uses. EVERY use of a temp
 /// that is not an explicit read-only / carry edge is marked ESCAPING (fail-safe).
+///
+/// The carry-edge UNIFICATION (Copy/Bind/Phi/Coerce-carry) is delegated to
+/// [`carry::classify_carry_edges`] — the same machinery the repr pass uses — so the carry classes
+/// here are byte-for-byte the historical ones. This function then layers the escape-specific marking
+/// on top.
 fn classify_instr(
     instr: &Instruction,
     uf: &mut UnionFind,
     escaping: &mut Vec<bool>,
     mark: &impl Fn(&mut Vec<bool>, Temp),
 ) {
+    // Carry edges first (Copy/Bind/Phi/Coerce-carry unify; everything else no-ops here).
+    carry::classify_carry_edges(instr, uf);
+
     match instr {
-        // ---- Representation-preserving carry edges (unify, do NOT mark escape) ----
-        Instruction::Copy { dst, src } => uf.union(*dst, *src),
-        Instruction::Bind { dst, src, .. } => uf.union(*dst, *src),
-        Instruction::Phi { dst, incomings, .. } => {
-            for (t, _) in incomings {
-                uf.union(*dst, *t);
-            }
-        }
+        // ---- Representation-preserving carry edges: unification already done above; do NOT mark. ----
+        Instruction::Copy { .. } | Instruction::Bind { .. } | Instruction::Phi { .. } => {}
         Instruction::Coerce { dst, src, from_ty, to_ty } => {
-            if coerce_is_carry(from_ty, to_ty) {
-                uf.union(*dst, *src);
+            if carry::coerce_is_carry(from_ty, to_ty) {
+                // Carry edge — unified above, no escape mark.
             } else if is_stack_eligible_type(from_ty) {
                 // A representation-changing coerce whose SOURCE is a sealed scalar record ALWAYS goes
                 // through `sealed_materialize_to_object` in codegen (verified: compile_ir_coerce's
