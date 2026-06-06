@@ -631,12 +631,32 @@ impl<'ctx> Codegen<'ctx> {
                 // slot (`lin_sealed_array_set` releases the old element's heap fields and retains the
                 // new ones; a scalar-only record is a straight overwrite). `value` is a sealed
                 // struct ptr; it stays owned by its caller (released at scope exit).
-                if Self::sealed_array_elem(obj_ty).is_some() {
+                if let Some(elem_fields) = Self::sealed_array_elem(obj_ty) {
+                    let elem_fields = elem_fields.clone();
                     let ptr_ty = self.context.ptr_type(AddressSpace::default());
                     let i64_ty = self.context.i64_type();
+                    // `lin_sealed_array_set` reads the RHS as a STANDALONE sealed struct (header +
+                    // packed payload, copying from `obj + SEALED_HEADER`). The RHS value is only in
+                    // that representation when its static type IS the same sealed record; a structural
+                    // `{...}` literal in a callee context is often typed as an UNSEALED `{...}` object
+                    // and built as a boxed `LinObject` (lin_object_alloc) — passing that to the set
+                    // would memcpy garbage from `box + 16` into the slot (the index-set crash). Project
+                    // a representation-mismatched RHS into a fresh sealed struct first; it is a +1 we
+                    // own here, so release it after the set takes its own retained copy. A
+                    // matching-repr value passes through verbatim (still owned by its temp).
+                    let elem_ty = match obj_ty { Type::Array(e) => (**e).clone(), _ => Type::Null };
+                    let needs_proj = Self::sealed_repr_differs(val_ty, &elem_ty);
+                    let (sealed_val, owned_here) = if needs_proj {
+                        (self.sealed_project_from(value, val_ty, &elem_fields), true)
+                    } else {
+                        (value, false)
+                    };
                     let set_fn = self.get_or_declare_fn("lin_sealed_array_set",
                         self.context.void_type().fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
-                    self.builder.call(set_fn, &[obj.into(), idx.into(), value.into()], "");
+                    self.builder.call(set_fn, &[obj.into(), idx.into(), sealed_val.into()], "");
+                    if owned_here {
+                        self.emit_sealed_release(sealed_val, &elem_fields);
+                    }
                 }
                 // Flat scalar element AND the value already has the matching scalar type ⇒ inline a
                 // bounds-checked raw store (no box + cross-staticlib `lin_array_set` round-trip).
@@ -1094,18 +1114,36 @@ impl<'ctx> Codegen<'ctx> {
         let payload = func.get_nth_param(0).unwrap().into_pointer_value();
         let new_obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(fields.len() as u64, false).into()], "smat_obj")
             .try_as_basic_value().unwrap_basic().into_pointer_value();
+        let free_box_shell = self.get_or_declare_fn("lin_tagged_free_box", self.context.void_type().fn_type(&[ptr_ty.into()], false));
         for (k, fty) in fields.iter() {
             let (off, _) = Self::sealed_field_layout(fields, k);
             let payload_off = off - Self::SEALED_HEADER;
+            let is_heap = Self::sealed_field_kind(fty).is_some();
             let llvm_fld = self.llvm_type(fty);
             let p = unsafe { self.builder.gep(self.context.i8_type(), payload, &[i64_ty.const_int(payload_off, false)], "smat_fld_p") };
             let loaded = self.builder.load(llvm_fld, p, "smat_fld");
+            // box_value(heap) wraps the BORROWED element pointer (no retain); box_value(scalar) wraps
+            // the scalar in a cached/heap box. Mirrors `sealed_materialize_to_object` exactly so the
+            // per-field RC across the Json-boundary materialize is balanced for heap fields.
             let boxed = self.box_value(loaded, fty);
             let key_str = self.compile_string_lit(k).into_pointer_value();
             self.builder.call(self.rt.object_set_fresh, &[new_obj.into(), key_str.into(), boxed.into()], "");
-            // Scalar field: reclaim the cache-safe box shell (no inner heap).
             if boxed.is_pointer_value() {
-                self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                if is_heap {
+                    // A nested SEALED field's box_value produced a FRESH boxed LinObject (+1 inner)
+                    // that object_set_fresh retained (+2); full tagged_release drops it back to the
+                    // object's +1 and frees the shell. A String/Array field's box wraps a BORROWED
+                    // element inner that object_set_fresh retained — free only the shell, leaving the
+                    // borrowed element inner untouched (the array still owns it).
+                    if matches!(fty, Type::Object { .. }) {
+                        self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                    } else {
+                        self.builder.call(free_box_shell, &[boxed.into()], "");
+                    }
+                } else {
+                    // Scalar field: reclaim the cache-safe box shell (no inner heap).
+                    self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                }
             }
         }
         self.builder.build_return(Some(&new_obj)).unwrap();
@@ -1146,6 +1184,18 @@ impl<'ctx> Codegen<'ctx> {
         };
         self.builder.build_memcpy(dst, 8, src, 8, i64_ty.const_int(stride, false))
             .expect("sealed_array_materialize_elem memcpy");
+        // HEAP-FIELD records (Stage 3b): the memcpy copied each heap-field POINTER verbatim, so the
+        // fresh struct now aliases the array's owned String/Array/nested-sealed payloads at +0. The
+        // fresh struct is a +1 owner the caller will release (which walks its descriptor and releases
+        // each heap field), so it must take its OWN +1 on each heap field — else the shared payload is
+        // double-freed (array drop + struct drop). `retain_sealed_payload_fields` walks the descriptor
+        // and bumps each non-null heap field's refcount. Scalar-only record (NULL desc) → skipped.
+        let has_heap = fields.values().any(|t| Self::sealed_field_kind(t).is_some());
+        if has_heap {
+            let retain_fn = self.get_or_declare_fn("retain_sealed_payload_fields",
+                self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+            self.builder.call(retain_fn, &[dst.into(), desc.into()], "");
+        }
         obj.into()
     }
 
