@@ -10,7 +10,7 @@ import { length, push, slice } from "std/array"
 import { getDateNumber, dayOfWeek, addDay } from "./dateUtil"
 import { scan } from "./raptor"
 import { getResults } from "./journeyFactory"
-import { Date, RaptorIndex } from "./types"
+import { Date, RaptorIndex, Conn } from "./types"
 
 val ONE_DAY = 86400
 
@@ -19,7 +19,7 @@ val ONE_DAY = 86400
 // widened to `Json`: a `Json m[k]` index uses the object path and would misread the TAG_MAP
 // rep). `bestArrivals[stop]` is therefore `Int64 | Null`; the `keys(kConnections[stop]) > 0`
 // guard means the stop always has an arrival, so the `!= null` guard narrows the read.
-val getFoundStations = (kConnections: Json, bestArrivals: { String: Int64 }): Json =>
+val getFoundStations = (kConnections: { String: { String: Conn } }, bestArrivals: { String: Int64 }): Json =>
   var origins: Json = {}
   keys(kConnections).for(stop =>
     if length(keys(kConnections[stop])) > 0 then
@@ -42,7 +42,7 @@ val mergeJourneys = (journeyA: Json, journeyB: Json): Json =>
 
 // completeJourneys: for every journey-so-far, find results to its origin in `connections`
 // and merge. (flatMap in the reference.)
-val completeJourneys = (resultsFactoryConnections: Json, journeys: Json): Json =>
+val completeJourneys = (resultsFactoryConnections: { String: { String: Conn } }, journeys: Json): Json =>
   var out: Json = []
   journeys.for(journeyB =>
     val origin = journeyB["legs"][0]["origin"]
@@ -53,7 +53,7 @@ val completeJourneys = (resultsFactoryConnections: Json, journeys: Json): Json =
   out
 
 // getJourneysFromConnections: initial results for destinations + stitch previous days.
-val getJourneysFromConnections = (kConnections: Json, prevConnections: Json, destinations: Json): Json =>
+val getJourneysFromConnections = (kConnections: { String: { String: Conn } }, prevConnections: { String: { String: Conn } }[], destinations: Json): Json =>
   var initial: Json = []
   destinations.for(d =>
     if length(keys(kConnections[d])) > 0 then
@@ -62,26 +62,33 @@ val getJourneysFromConnections = (kConnections: Json, prevConnections: Json, des
   // reduce over reversed prevConnections
   var journeys: Json = initial
   var idx = length(prevConnections) - 1
-  reduceReversed(prevConnections, idx, journeys, completeJourneys)
+  reduceReversed(prevConnections, idx, journeys)
 
-val reduceReversed = (prevConnections: Json, idx: Int32, journeys: Json, fn: Function): Json =>
+// reduceReversed folds completeJourneys over prevConnections back-to-front. It calls
+// completeJourneys DIRECTLY rather than via a `fn: Function` parameter: a nested typed map
+// (`{ String: { String: Conn } }`) passed through an indirect `Function`-value call loses its
+// inner-map entries in codegen (the Function type erases the precise map type, so the inner
+// container is not materialized on the callee side). The direct call keeps the inner map intact;
+// the fold is fixed (always completeJourneys), so the indirection was gratuitous anyway.
+val reduceReversed = (prevConnections: { String: { String: Conn } }[], idx: Int32, journeys: Json): Json =>
   if idx < 0 then
     journeys
   else
-    reduceReversed(prevConnections, idx - 1, fn(prevConnections[idx], journeys), fn)
+    reduceReversed(prevConnections, idx - 1, completeJourneys(prevConnections[idx], journeys))
 
 // getJourneys: search up to maxSearchDays advancing the calendar each day.
 val getJourneys = (raptor: RaptorIndex, origins: Json, destinations: Json, date: Date, maxSearchDays: Int32): Json =>
-  searchDay(raptor, origins, destinations, date, maxSearchDays, 0, [])
+  var seed: { String: { String: Conn } }[] = []
+  searchDay(raptor, origins, destinations, date, maxSearchDays, 0, seed)
 
-val searchDay = (raptor: RaptorIndex, origins: Json, destinations: Json, date: Date, maxSearchDays: Int32, i: Int32, connectionIndexes: Json): Json =>
+val searchDay = (raptor: RaptorIndex, origins: Json, destinations: Json, date: Date, maxSearchDays: Int32, i: Int32, connectionIndexes: { String: { String: Conn } }[]): Json =>
   if i >= maxSearchDays then
     []
   else
     val dateNumber = getDateNumber(date)
     val dow = dayOfWeek(date)
-    // scan now returns the typed `ScanResults` record (its kConnections stays `Json`; its
-    // bestArrivals is the typed `{ String: Int64 }` map, widened to `Json` for getFoundStations).
+    // scan returns the typed `ScanResults` record (its kConnections is now the typed
+    // `{ String: { String: Conn } }` map; bestArrivals is the typed `{ String: Int64 }` map).
     val scanned = scan(raptor, origins, dateNumber, dow)
     val kConnections = scanned["kConnections"]
     val bestArrivals = scanned["bestArrivals"]
@@ -90,7 +97,7 @@ val searchDay = (raptor: RaptorIndex, origins: Json, destinations: Json, date: D
       results
     else
       val nextOrigins = getFoundStations(kConnections, bestArrivals)
-      var nextIndexes: Json = []
+      var nextIndexes: { String: { String: Conn } }[] = []
       connectionIndexes.for(c => push(nextIndexes, c))
       push(nextIndexes, kConnections)
       searchDay(

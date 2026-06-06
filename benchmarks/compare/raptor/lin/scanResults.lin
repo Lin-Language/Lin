@@ -2,26 +2,25 @@
 //
 // State record (the typed `ScanResults` in types.lin):
 //   { "k": Int32, "bestArrivals": { String: Int64 }, "kArrivals": { String: { String: Int64 } },
-//     "kConnections": Json }
-// A connection is either a Transfer (object with "origin") or [trip, startIndex, endIndex].
+//     "kConnections": { String: { String: Conn } } }
+// A connection (Conn) is either a Transfer (object with "origin") or a [trip, startIndex, endIndex]
+// tuple (the trip element stays Json — composite Json does not flow into the named Trip record).
 //
-// The arrival-time dictionaries (`bestArrivals`, `kArrivals`) are typed `{ String: T }`
-// index-signature maps (ADR-055 / spec §5.1.1) — hashed O(1) containers, the GROUP/RANGE-phase
-// perf lever (the index-build PREP lever was the RaptorIndex maps). `kConnections` STAYS `Json`
-// (typing the nested union-valued map triggers a codegen/RC fault in the multi-day / transfer-
-// pattern walks — see types.lin / NOTES.md "kConnections blocker"). Round keys are stored as
-// strings ("${k}") because Lin object keys are strings. `k` starts at 0; addRound increments and
-// seeds an empty arrivals map.
+// All three dictionaries are typed `{ String: T }` index-signature maps (ADR-082 / spec §5.1.1) —
+// hashed O(1) containers. `kConnections` was the LAST `Json` dictionary; it is now typed
+// `{ String: { String: Conn } }` (the projection-aliasing UAF that blocked it is fixed on master,
+// see types.lin / NOTES.md). Round keys are stored as strings ("${k}") because Lin map keys are
+// strings. `k` starts at 0; addRound increments and seeds an empty arrivals map.
 import { for } from "std/iter"
 import { keys } from "std/object"
-import { ScanResults } from "./types"
+import { ScanResults, Conn } from "./types"
 
 val MAX = 9007199254740991i64
 
 export val createScanResults = (stops: Json, origins: Json): ScanResults =>
   var bestArrivals: { String: Int64 } = {}
   var kArrival0: { String: Int64 } = {}
-  var kConnections: Json = {}
+  var kConnections: { String: { String: Conn } } = {}
   stops.for(stop =>
     val t = if origins[stop] != null then origins[stop] else MAX
     bestArrivals[stop] = t

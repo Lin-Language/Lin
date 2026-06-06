@@ -10,6 +10,7 @@ import { parseDate } from "./dateUtil"
 import { createRaptor } from "./raptor"
 import { planDepartAfter } from "./query"
 import { loadGTFS } from "./gtfsLoader"
+import { Transfer } from "./types"
 
 val DATA_DIR = "/home/linus/Work/linusnorton/lin-lang/benchmarks/compare/raptor/data/"
 val ORIGIN = "TBW"
@@ -27,9 +28,6 @@ val fmt = (s: Int32): String =>
   val mm = (s % 3600) / 60
   val ss = s % 60
   "${pad2(hh)}:${pad2(mm)}:${pad2(ss)}"
-
-val isTimetableLeg = (leg: Json): Boolean =>
-  leg["stopTimes"] != null
 
 // Sort by departureTime asc, then arrivalTime asc.
 val sortJourneys = (journeys: Json): Json =>
@@ -55,17 +53,18 @@ val main = (): Null =>
       "JOURNEY dep=${fmt(journey["departureTime"])} arr=${fmt(journey["arrivalTime"])} legs=${length(journey["legs"])}"
     )
     journey["legs"].for(leg =>
-      if isTimetableLeg(leg) then
-        val sts = leg["stopTimes"]
-        val first = sts[0]
-        val last = sts[length(sts) - 1]
-        print(
-          "  ${first["stop"]} ${fmt(first["departureTime"])} -> ${last["stop"]} ${fmt(last["arrivalTime"])}"
-        )
-      else
-        print(
-          "  TRANSFER ${leg["origin"]} -> ${leg["destination"]} (${leg["duration"]}s)"
-        )
+      match leg
+        is Transfer =>
+          print(
+            "  TRANSFER ${leg["origin"]} -> ${leg["destination"]} (${leg["duration"]}s)"
+          )
+        else =>
+          val sts = leg["stopTimes"]
+          val first = sts[0]
+          val last = sts[length(sts) - 1]
+          print(
+            "  ${first["stop"]} ${fmt(first["departureTime"])} -> ${last["stop"]} ${fmt(last["arrivalTime"])}"
+          )
     )
   )
 
