@@ -654,6 +654,42 @@ print(toString(total))
     assert_eq!(output, vec!["225"]);
 }
 
+// Regression (object/record holding a typed-map FIELD is fully released): `lin_object_release`'s
+// value-release loop was a hand-rolled copy that omitted TAG_MAP — so a `{ String: T }` map stored
+// as a record/object FIELD (e.g. `ScanResults.bestArrivals`) was never released when the record
+// dropped, leaking the whole map + nested contents on every discard. The release loop now routes
+// through the canonical `release_tagged_payload` (which handles every tag). The record build/read
+// must still produce correct values; an over-eager release would be a use-after-free.
+#[test]
+fn test_record_with_map_field_released_and_correct() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for, range } from "std/iter"
+import { keys } from "std/object"
+import { length } from "std/array"
+
+type Rec = { "m": { String: Int64 }, "n": { String: { String: Int64 } } }
+val make = (): Rec =>
+  var m: { String: Int64 } = {}
+  var n: { String: { String: Int64 } } = {}
+  range(0, 20).for(i =>
+    m["S${i}"] = 5i64
+    n["S${i}"] = {}
+    n["S${i}"]["0"] = 7i64
+  )
+  { "m": m, "n": n }
+
+var total = 0
+range(0, 50).for(i =>
+  val r = make()
+  total = total + length(keys(r["m"]))
+)
+print(toString(total))
+"#);
+    // 20 keys × 50 iterations = 1000.
+    assert_eq!(output, vec!["1000"]);
+}
+
 // Regression (dynamic-arith union result released): a `Binary` op whose RESULT type is a union
 // (`Json`) — the dynamic `lin_tagged_arith` path, or bitwise-on-union — produces a FRESHLY boxed
 // `TaggedVal*` (+1). The lowerer now `register_owned`s it so scope exit (or the move/escape
