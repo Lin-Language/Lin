@@ -502,6 +502,32 @@ val maybeName: String | Null = null
 type Id = String | Int64
 ```
 
+#### Record intersection (`&`)
+
+Two **record** types may be combined with `&` to form the record containing **all** of both
+operands' fields:
+
+```txt
+type Person = { "age": UInt8, "name": String }
+type OldPerson = Person & { "wisdom": Boolean }
+// OldPerson is { "age": UInt8, "name": String, "wisdom": Boolean }
+```
+
+`&` is **record-only** in this first cut: every operand must be an object/record type. It is
+left-associative and composes — `A & B & C` merges all three. The result is an ordinary record
+type with no special runtime representation; when bound to a named type declaration it is **sealed**
+exactly as if the merged record had been written out in full (§5.9, named records are sealed).
+
+Rules:
+
+- A field present in more than one operand must have the **same** type in each (it is de-duplicated).
+  Conflicting field types are a compile-time error: `intersection type has conflicting field "k": T1 vs T2`.
+- A non-record operand (e.g. `Int32 & String`, or `&` with a union) is a compile-time error:
+  `intersection \`&\` is only valid between record types`.
+- `&` binds **tighter** than union `|` (matching TypeScript), so `A & B | C` parses as `(A & B) | C`.
+
+See ADR-061.
+
 ### 5.5 Function Types
 
 Function types use argument-list syntax followed by `=>`.
@@ -536,10 +562,11 @@ Type-expression operators bind in this order, tightest first:
 1. T[]                 (postfix array)
 2. Generic<T1, T2>     (postfix generic application)
 3. (T1, T2) => U       (function arrow)
-4. T | U               (union)
+4. T & U               (record intersection)
+5. T | U               (union)
 ```
 
-So `Int32 | String[]` parses as `Int32 | (String[])`, and `(Int32) => String[]` parses as `(Int32) => (String[])`. Parenthesise to disambiguate where the surface reading is unclear.
+So `Int32 | String[]` parses as `Int32 | (String[])`, `(Int32) => String[]` parses as `(Int32) => (String[])`, and `A & B | C` parses as `(A & B) | C` (`&` binds tighter than `|`). Parenthesise to disambiguate where the surface reading is unclear.
 
 ### 5.8 Variance
 
