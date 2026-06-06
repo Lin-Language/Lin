@@ -2855,11 +2855,24 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 }
             }
             // Sealed scalar record + a compile-time-known string key `x["f"]` → constant-offset
-            // FieldGet (same as `x.f`). The field is guaranteed present (a missing field on a
-            // concrete sealed type is already a compile error). Routes to the unboxed load path
-            // rather than the dynamic `lin_object_get` Index path.
+            // FieldGet (same as `x.f`). Routes to the unboxed load path rather than the dynamic
+            // `lin_object_get` Index path.
+            //
+            // A sealed record has EXACTLY its declared fields (extras are stripped on assignment),
+            // so a key that is NOT one of those fields is STATICALLY ABSENT. The checker only WARNS
+            // about it (typing the access as `Null`), so we must not assume presence: emitting an
+            // unboxed `FieldGet` for an absent field would assert in `sealed_field_layout` (codegen
+            // panic). Instead follow the safe-access rule (§6.1: missing object key → Null): produce
+            // a `Null` constant, lowering `object` first so any side effects still run. This mirrors
+            // the boxed-object missing-key → Null path that `lin_object_get` already takes.
             if is_sealed_scalar_repr(&obj_ty) {
                 if let TypedExpr::StringLit(name, _, _) = key.as_ref() {
+                    let present = matches!(&obj_ty,
+                        Type::Object { fields, .. } if fields.contains_key(name));
+                    if !present {
+                        let _ = lower_expr(object, builder, ctx);
+                        return builder.const_temp(Const::Null);
+                    }
                     let obj_temp = lower_expr(object, builder, ctx);
                     let dst = builder.alloc_temp(result_type.clone());
                     builder.emit(Instruction::FieldGet {
@@ -2901,6 +2914,7 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 }
             };
             let dst = builder.alloc_temp(result_type.clone());
+            let obj_ty_is_sealed = is_sealed_scalar_repr(&obj_ty);
             builder.emit(Instruction::Index {
                 dst,
                 object: obj_temp,
@@ -2909,6 +2923,15 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 key_ty,
                 result_ty: result_type.clone(),
             });
+            // A sealed record indexed by a NON-LITERAL key: codegen materializes the record to a
+            // boxed object, looks the key up, clones the (borrowed) result into a FRESH owned box and
+            // frees the temporary object — so `dst` is already an OWNED, container-independent value.
+            // Register it owned directly (the usual borrowed-interior CloneBox relocation does not
+            // apply: there is no live container to dangle off of).
+            if obj_ty_is_sealed && is_union_ty(result_type) {
+                builder.register_owned(dst, result_type.clone());
+                return dst;
+            }
             // A projection has VALUE (snapshot) semantics (ADR: projection is a value, not a
             // live view). It must materialize an OWNED, container-independent value so the
             // binding survives the container being mutated/grown/freed.
@@ -6633,13 +6656,19 @@ fn lower_string_interp(
 
     // Start with an empty accumulator.
     let mut acc = builder.const_temp(Const::Str(String::new()));
+    // True once `acc` holds a heap-allocated concat result (a +1 we own) rather than the initial
+    // empty-string literal. Only then must the final `acc` be registered owned (a bare literal is
+    // immortal — registering/releasing it is a harmless no-op, but we keep the bookkeeping honest).
+    let mut acc_is_owned = false;
 
     for part in parts {
-        let part_temp = match part {
-            TypedStringPart::Literal(s) => builder.const_temp(Const::Str(s.clone())),
+        let (part_temp, part_is_owned) = match part {
+            TypedStringPart::Literal(s) => (builder.const_temp(Const::Str(s.clone())), false),
             TypedStringPart::Expr(expr) => {
                 let val = lower_expr(expr, builder, ctx);
-                // Convert to string.
+                // Convert to string. `ToString` now returns an OWNED (+1) string for EVERY input
+                // type (the codegen Str arm retains; numeric/bool/json arms allocate fresh), so the
+                // per-part temp is always a +1 we must release after the concat below.
                 let dst = builder.alloc_temp(Type::Str);
                 builder.emit(Instruction::CallIntrinsic {
                     dst,
@@ -6647,10 +6676,11 @@ fn lower_string_interp(
                     args: vec![val],
                     ret_ty: Type::Str,
                 });
-                dst
+                (dst, true)
             }
         };
-        // Concatenate with accumulator.
+        // Concatenate with accumulator. `lin_string_concat` BORROWS both args (copies bytes,
+        // returns a fresh +1), so each owned operand must be released afterwards.
         let new_acc = builder.alloc_temp(Type::Str);
         builder.emit(Instruction::CallIntrinsic {
             dst: new_acc,
@@ -6658,27 +6688,32 @@ fn lower_string_interp(
             args: vec![acc, part_temp],
             ret_ty: Type::Str,
         });
-        // Release old accumulator (it was just consumed).
-        if acc != part_temp {
-            // Only release non-literal temps.
+        // Release the consumed per-part `ToString` temp (now uniformly +1; immortal-literal-safe).
+        if part_is_owned && acc != part_temp {
+            builder.emit(Instruction::Release { val: part_temp, ty: Type::Str });
+        }
+        // Release the consumed old accumulator (a prior concat result we owned).
+        if acc_is_owned && acc != part_temp {
             builder.emit(Instruction::Release { val: acc, ty: Type::Str });
         }
         acc = new_acc;
+        acc_is_owned = true;
     }
 
-    // KNOWN LEAK (string-interpolation, NOT yet fixed): both the per-part `ToString` result and the
-    // final `acc` interp string leak their +1 when the result is used transiently (an index-write
-    // KEY — `obj["${k}"] = v` — or a comparison operand). The obvious fixes are unsound as-is:
-    //   - releasing the per-part `ToString` temp double-frees when the part is ALREADY a String
-    //     (`value_to_string_simple` returns the input BORROWED for Type::Str, +0, not a fresh +1);
-    //   - `register_owned(acc)` double-frees when `acc` is moved into a consumer that already
-    //     accounts for the +1 (val binding / return / stored map VALUE).
-    // A correct fix needs `ToString` to UNIFORMLY return an owned string (retain in the Str arm of
-    // `value_to_string_simple`, mirroring lin_tagged_to_string's TAG_STR inc_ref) AND a transient-
-    // use release that the move/escape lowering doesn't already cover. Deferred — see
-    // project_raptor_slowness_leaks memory (leak #3). RAPTOR hits this on every `"${k}"` arrival-map
-    // key, so it is a real query-phase cost, but the fix must not reintroduce the double-frees the
-    // integration suite caught.
+    // The final interpolation result is a fresh +1 string. Register it owned so the surrounding
+    // lowering treats it exactly like any other fresh allocation (MakeArray / call result):
+    //   - TRANSIENT use (an index-write KEY `obj["${k}"] = v`, a comparison operand, an unused
+    //     `val`) → released at scope exit. This is the leak this fix closes (the runtime container
+    //     `set` RETAINS the key, so the interp string's original +1 was never reclaimed).
+    //   - MOVE into a consumer (val binding kept, `return`, stored map VALUE) → the existing
+    //     transfer/escape machinery (`transfer_into_container`, the function-return keep-set,
+    //     `expr_is_fresh_alloc(StringInterp) == true`) transfers this single +1 and unregisters it,
+    //     so scope exit does not double-release. Registering here was previously feared to
+    //     double-free, but interp results were in fact NEVER registered, so they leaked in EVERY
+    //     case (not just transient). Registering makes them uniform with all other owned temps.
+    if acc_is_owned {
+        builder.register_owned(acc, Type::Str);
+    }
     acc
 }
 

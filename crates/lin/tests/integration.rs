@@ -707,6 +707,45 @@ print(toString(total))
     assert_eq!(output, vec!["252500"]);
 }
 
+// Regression (string-interpolation transient-use RC, leak #3): a string interpolation
+// `"${expr}"` used TRANSIENTLY — the RAPTOR query-phase hot path `m["${k}"] = v`, where the
+// interp string is an index-write KEY — leaked its +1 on every write (~19 B / write; unbounded
+// RSS in a scan). Two distinct leaks: (a) the per-part `ToString` result, which `lin_string_concat`
+// only BORROWS; (b) the final accumulator, which the container `set` RETAINS internally (so the
+// interp string's own +1 was never reclaimed). The fix makes `ToString` UNIFORMLY return an owned
+// (+1) string (the codegen Str arm now retains, matching the fresh numeric/json arms), then
+// `lower_string_interp` releases each per-part temp after the concat and `register_owned`s the
+// final result — so transient uses release at scope exit while moves (val binding / return /
+// stored VALUE) transfer the single +1 through the existing escape machinery. A wrong (over-eager)
+// free of a key the map still holds would be a use-after-free corrupting the map / crashing; ASan
+// (the stdlib+examples leg) guards the no-leak / no-double-free halves. This test guards that
+// building interp-keyed maps in a hot loop and reading them back stays CORRECT.
+#[test]
+fn test_string_interp_key_in_loop_released_and_correct() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+val build = (n: Int32): Int32 =>
+  var m: Json = {}
+  range(0, n).for(k => m["${k}"] = k * 2)
+  // Read back through an interp key used as a transient lookup operand too.
+  var sum = 0
+  range(0, n).for(k =>
+    val v = m["${k}"]
+    if v is Int32 then sum = sum + v else sum = sum
+  )
+  sum
+
+var total = 0
+range(0, 50).for(i => total = total + build(20))
+print(toString(total))
+"#);
+    // build(20) writes m["0"]..m["19"] = 0,2,..,38; sum = 2*(0+..+19) = 2*190 = 380.
+    // Summed 50 times = 19000.
+    assert_eq!(output, vec!["19000"]);
+}
+
 // Regression (escape safety): a `var n` cell captured by a closure that is RETURNED from its
 // creating function ESCAPES — the closure (and thus the cell) outlives the call. The lowerer
 // must NOT free this cell at scope exit; doing so would be a use-after-free when the returned
@@ -12651,6 +12690,63 @@ print("${p["x"]} ${p["y"]} ${p["z"]}")
 print("${p["x"] + p["y"]}")
 "#);
     assert_eq!(out, vec!["10 20 1.5", "30"]);
+}
+
+#[test]
+fn test_sealed_out_of_shape_field_read_is_null_not_panic() {
+    // A sealed record has EXACTLY its declared fields. Reading a key NOT in the shape (here the
+    // extra "wisdom" that was stripped when the wider literal was assigned to a Person) used to
+    // PANIC in codegen (`sealed_field_layout: field "wisdom" not in record`). It must instead
+    // follow safe-access (§6.1: missing object key → Null), matching the checker's warning that
+    // the field does not exist. Also asserts in-shape reads still work and the extra was stripped.
+    let out = run(r#"
+import { print } from "std/io"
+import { keys } from "std/object"
+import { length } from "std/array"
+type Person = { "name": String, "age": Int32 }
+val wide = { "name": "Doris", "age": 70, "wisdom": true }
+val p: Person = wide
+print(if p["wisdom"] == null then "absent" else "present")
+print(p["name"])
+print("${p["age"]}")
+print("${keys(p).length()}")
+"#);
+    assert_eq!(out, vec!["absent", "Doris", "70", "2"]);
+}
+
+#[test]
+fn test_sealed_dynamic_key_index_no_panic() {
+    // Indexing a sealed record with a NON-LITERAL key (`p[k]`) can't resolve a packed-struct slot
+    // by offset; the old code read the packed struct as a LinObject and crashed the runtime.
+    // Codegen now materializes the sealed record to a boxed object and does the dynamic lookup:
+    // a present key returns its value, an absent key (a stripped extra) returns Null.
+    let out = run(r#"
+import { print } from "std/io"
+type Person = { "name": String, "age": Int32 }
+val wide = { "name": "Doris", "age": 70, "wisdom": true }
+val p: Person = wide
+val present = "name"
+val absent = "wisdom"
+print(p[present])
+print(if p[absent] == null then "dyn-absent" else "dyn-present")
+"#);
+    assert_eq!(out, vec!["Doris", "dyn-absent"]);
+}
+
+#[test]
+fn test_sealed_array_out_of_shape_field_read_is_null() {
+    // Out-of-shape field access on a SEALED-RECORD ARRAY element (`arr[i]["gone"]`) must also be
+    // Null, not a panic. The array is typed to Person[]; the source literals carry an extra field
+    // that the sealed element layout does not include.
+    let out = run(r#"
+import { print } from "std/io"
+type Person = { "name": String, "age": Int32 }
+val people: Person[] = [{ "name": "A", "age": 1, "gone": 9 }, { "name": "B", "age": 2, "gone": 8 }]
+print(people[0]["name"])
+print("${people[1]["age"]}")
+print(if people[0]["gone"] == null then "elem-absent" else "elem-present")
+"#);
+    assert_eq!(out, vec!["A", "2", "elem-absent"]);
 }
 
 #[test]
