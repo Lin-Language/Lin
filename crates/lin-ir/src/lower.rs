@@ -1148,6 +1148,9 @@ fn is_sealed_scalar_repr(ty: &Type) -> bool {
 fn is_sealed_scalar_array(ty: &Type) -> bool {
     match ty {
         Type::Array(elem) => match elem.as_ref() {
+            // Stage 3a scope (mirrors codegen `sealed_array_elem`): scalar-field sealed records only.
+            // Heap-field records stay BOXED (the Stage 3b ungate was attempted and reverted — see the
+            // status note in `Codegen::sealed_array_elem`).
             Type::Object { fields, sealed: true } => {
                 !fields.is_empty()
                     && fields.values().all(is_sealed_field_ty)
@@ -1157,6 +1160,66 @@ fn is_sealed_scalar_array(ty: &Type) -> bool {
         },
         _ => false,
     }
+}
+
+/// True when `param_ty` is an array whose element is a BOXED runtime representation — a generic
+/// TypeVar/Json wildcard, a union, a typed map, or an UNSEALED object. These are the params a sealed
+/// packed array must be materialized for. A `Named`-element array (an unexpanded self-recursive alias,
+/// which the callee reads as the SAME packed sealed struct) and a sealed-Object-element array are NOT
+/// boxed and must pass through unchanged.
+fn param_elem_is_boxed_repr(param_ty: &Type) -> bool {
+    match param_ty {
+        Type::Array(elem) => matches!(elem.as_ref(),
+            Type::TypeVar(_) | Type::Union(_) | Type::Map(_)
+            | Type::Object { sealed: false, .. }),
+        _ => false,
+    }
+}
+
+/// True when a sealed packed array argument flowing into `param_ty` is MATERIALIZED to a fresh boxed
+/// tagged `Object[]` at the call boundary (the §3 fix): either the param is a bare Json/union (the
+/// existing `length(sealedArr)` case) OR a boxed-element array (the type-erased boxed-fallback
+/// combinator's `T[]` param). The materialized box is FULLY OWNED and the callee BORROWS it (a
+/// TypeVar/Json-array param is not released by the owning model), so the caller must fully release it
+/// right after the call — else it leaks every call (ASan-confirmed in a sort-in-loop). MUST mirror the
+/// materialize trigger in `lower_coerce_arg`.
+fn sealed_array_arg_materialized(arg_ty: &Type, param_ty: &Type) -> bool {
+    is_sealed_scalar_array(arg_ty)
+        && !is_sealed_scalar_array(param_ty)
+        && (is_union_ty(param_ty) || param_elem_is_boxed_repr(param_ty))
+}
+
+/// True when `ty` is an array whose ELEMENTS (transitively) contain a sealed-record array or a sealed
+/// scalar record — i.e. a NESTED sealed structure (`Pt[][]`, `{String: Pt[]}` would be a Map). The
+/// one-level `is_sealed_scalar_array`/`is_sealed_scalar_repr` don't catch the outer container, but its
+/// Coerce result (built by codegen's `array_coerce_elementwise`) is still a fresh +1 owned value that
+/// must be released. Mirrors codegen's `Codegen::ty_contains_sealed`, restricted to the array-outer case.
+fn to_contains_sealed_array(ty: &Type) -> bool {
+    fn contains(ty: &Type) -> bool {
+        if is_sealed_scalar_array(ty) || is_sealed_scalar_repr(ty) {
+            return true;
+        }
+        match ty {
+            Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Map(t) => contains(t),
+            Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(contains),
+            _ => false,
+        }
+    }
+    matches!(ty, Type::Array(elem) if contains(elem))
+}
+
+/// True when a `Coerce { from, to }` is the NESTED sealed re-projection codegen's `compile_ir_coerce`
+/// rebuilds element-wise (`array_coerce_elementwise`): `to` is an array containing a sealed structure
+/// AND `from`'s inner element is a BOXED view (Json/union/TypeVar — the type-erased boxed-fallback
+/// result). MUST mirror the codegen gate exactly so the ownership registration matches what codegen
+/// actually emits (a same-representation array coerce is a pointer pass-through, NOT a fresh +1).
+fn nested_sealed_repr_change(from: &Type, to: &Type) -> bool {
+    let Type::Array(inner_to) = to else { return false };
+    let Type::Array(inner_from) = from else { return false };
+    // Mirror codegen's gate: a NESTED sealed re-projection fires only when `to`'s inner contains a
+    // sealed structure AND the source inner element is a DIFFERENT type (a boxed view), not a verbatim
+    // same-representation array. `Type` PartialEq ignores the `sealed` flag, so equal inners ⇒ no rebuild.
+    to_contains_sealed_array(to) && inner_from.as_ref() != inner_to.as_ref()
 }
 
 /// A field type permitted in a sealed record: a scalar (numeric or Bool) OR an eligible heap field
@@ -1686,6 +1749,35 @@ fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: 
                 return dst;
             }
         }
+    }
+    // SEALED-RECORD ARRAY BOUNDARY (Problem A / Stage 3b): a sealed-record array (packed/contiguous
+    // representation, elem_tag 0xFE) flowing into a param that is NOT itself that same sealed-array
+    // representation — a generic TypeVar/Json array (the type-erased combinator fallback's param),
+    // an unsealed `Object[]`, or any boxed array — must be MATERIALIZED to the boxed tagged `Object[]`
+    // view (`sealed_array_to_tagged`), else the callee reads the packed buffer through the boxed
+    // `lin_array_get_tagged`/`lin_object_get` machinery → misaligned deref / corruption. The reverse
+    // (boxed → sealed array) is the param's own sealed-scalar-array case, handled by `type_repr_differs`
+    // below / the result Coerce. The materialized tagged array is a fresh +1 the arg scope releases.
+    // Fire ONLY when the param element is a genuinely BOXED representation (a generic TypeVar/Json
+    // wildcard, a union, or an unsealed `Object` — i.e. the type-erased boxed-fallback combinator's
+    // `T[]` param). A param array whose element is a `Named` (an unexpanded self-referential alias,
+    // the SELF-RECURSIVE-call case — e.g. `sumX(arr: Point[], …)` calling itself) reads the SAME
+    // packed sealed struct consistently, so it must be passed THROUGH unchanged: materializing it
+    // would store a boxed Object[] back into a slot the loop body reads as a packed array (observed:
+    // recursive `arr[i].x` sum returned garbage after the first iteration). Mirrors the `Named`
+    // pass-through guards above.
+    if is_sealed_scalar_array(arg_ty)
+        && !is_sealed_scalar_array(param_ty)
+        && param_elem_is_boxed_repr(param_ty)
+    {
+        let dst = builder.alloc_temp(param_ty.clone());
+        builder.emit(Instruction::Coerce { dst, src: arg, from_ty: arg_ty.clone(), to_ty: param_ty.clone() });
+        // The materialized tagged `Object[]` is a FRESH fully-owned +1 the callee BORROWS (a TypeVar/
+        // Json-array param is not released by the owning model). It is released right after the call by
+        // the `sealed_array_arg_materialized` branch in the call-site arg loop (matching the existing
+        // sealed-array→Json-param `full_release_boxes` path) — NOT registered owned here. The source
+        // sealed array keeps its own ownership.
+        return dst;
     }
     // Box/unbox across the union boundary.
     if is_union_ty(param_ty) != is_union_ty(arg_ty) {
@@ -2521,6 +2613,15 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 // A Json/Object[] PROJECTED into a sealed-record array (the reverse boundary) is a
                 // fresh +1 sealed array — register it for scope-exit release.
                 builder.register_owned(dst, to.clone());
+            } else if nested_sealed_repr_change(from, to) && needs_owning(to) {
+                // A NESTED sealed structure projected from the boxed `Json` view (Problem A / Stage
+                // 3b): `partition`/`chunk` (`T[][]`) routed through the type-erased boxed fallback
+                // returns a boxed result whose Coerce → `array_coerce_elementwise` rebuilds a FRESH
+                // +1 outer tagged array (and fresh inner sealed arrays). Register it so the owning
+                // model releases the whole structure at scope exit (else it leaks, ASan-confirmed).
+                // Gated (matching codegen) on the SOURCE inner being a boxed view — a same-repr array
+                // (e.g. a `Neighbor[]` literal) is NOT rebuilt and must not be double-registered.
+                builder.register_owned(dst, to.clone());
             }
             dst
         }
@@ -3154,8 +3255,7 @@ fn lower_call(
                     // + inner array + element objects), not at function scope exit — the call may be
                     // in a tail-recursive (loop) body where a scope-exit release would leak every
                     // iteration. Other heap args boxed to Json are shell-only (borrowed inner).
-                    if param_tys.get(i).map(|p| is_union_ty(p)).unwrap_or(false)
-                        && is_sealed_scalar_array(&a.ty())
+                    if param_tys.get(i).map(|p| sealed_array_arg_materialized(&a.ty(), p)).unwrap_or(false)
                     {
                         full_release_boxes.push((arg, param_tys[i].clone()));
                     } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
@@ -3215,8 +3315,7 @@ fn lower_call(
                     // + inner array + element objects), not at function scope exit — the call may be
                     // in a tail-recursive (loop) body where a scope-exit release would leak every
                     // iteration. Other heap args boxed to Json are shell-only (borrowed inner).
-                    if param_tys.get(i).map(|p| is_union_ty(p)).unwrap_or(false)
-                        && is_sealed_scalar_array(&a.ty())
+                    if param_tys.get(i).map(|p| sealed_array_arg_materialized(&a.ty(), p)).unwrap_or(false)
                     {
                         full_release_boxes.push((arg, param_tys[i].clone()));
                     } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
