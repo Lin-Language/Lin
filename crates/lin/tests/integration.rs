@@ -943,6 +943,56 @@ print(toString(x))
 }
 
 #[test]
+fn test_dynamic_json_arith_missing_key_faults_cleanly() {
+    // RAPTOR #5: dynamic `Json` arithmetic on a missing object key (which reads as Null)
+    // must route through the null-safe tagged-arith runtime path and produce a CLEAN runtime
+    // fault, NOT a raw null-pointer-dereference panic from unboxing a null payload.
+    // Operand order must not matter, and a present key must still compute normally.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val run = (): Null =>
+  val obj: Json = { "a": 5 }
+  val sum = 10 + obj["b"]
+  print("sum=${toString(sum)}")
+run()
+"#);
+    assert!(
+        err.contains("cannot apply operator") && err.contains("Null"),
+        "expected clean tagged-arith fault, got: {}",
+        err
+    );
+    // CRUCIALLY: not a raw null-pointer-dereference panic.
+    assert!(!err.contains("null pointer dereference"), "got raw panic: {}", err);
+
+    // Operand-flipped form faults the same way.
+    let err2 = run_expect_err(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val run = (): Null =>
+  val obj: Json = { "a": 5 }
+  val sum = obj["b"] + 10
+  print("sum=${toString(sum)}")
+run()
+"#);
+    assert!(
+        err2.contains("cannot apply operator") && err2.contains("Null"),
+        "expected clean tagged-arith fault (flipped), got: {}",
+        err2
+    );
+    assert!(!err2.contains("null pointer dereference"), "got raw panic (flipped): {}", err2);
+
+    // A present key computes normally through the boxed tagged path.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val run = (): Null =>
+  val obj: Json = { "a": 5 }
+  val sum = 10 + obj["a"]
+  print("sum=${toString(sum)}")
+run()
+"#);
+    assert_eq!(out, vec!["sum=15"]);
+}
+
+#[test]
 fn test_division_by_zero_error() {
     let err = run_expect_err(r#"import { print } from "std/io"
 import { toString } from "std/string"
