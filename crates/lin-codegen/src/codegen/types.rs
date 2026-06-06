@@ -99,7 +99,10 @@ impl<'ctx> Codegen<'ctx> {
     /// This MUST stay in lockstep with `lin_ir::lower::is_rc_type`: codegen releases the old
     /// value on reassignment only for types the lowerer also retained on store. A type present
     /// here but absent there would be released without a matching retain — a refcount underflow.
-    /// (`Iterator` is deliberately omitted for that reason: the lowerer does not retain it.)
+    /// (`Iterator` IS included: an `Iterator<T>` value is a freshly-materialised heap `LinArray`
+    /// — `lin_range`/`lin_iter`/`iterOf` all allocate one with no borrowed alias — so it follows
+    /// the same owning model as `Array`. Omitting it leaked every `range(...)`/combinator-iterator
+    /// result, since the lowerer then never released it at scope exit.)
     pub(crate) fn ty_is_concrete_rc(ty: &Type) -> bool {
         matches!(
             ty,
@@ -109,6 +112,7 @@ impl<'ctx> Codegen<'ctx> {
                 | Type::FixedArray(_)
                 | Type::Object { .. }
                 | Type::Map(_)
+                | Type::Iterator(_)
                 | Type::Function { .. }
         )
     }

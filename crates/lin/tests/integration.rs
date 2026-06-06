@@ -678,6 +678,35 @@ print(toString(c))
     assert_eq!(output, vec!["5000"]);
 }
 
+// Regression (Iterator RC): an `Iterator<T>` value is a freshly-materialised heap `LinArray`
+// (`range`/`iter`/`iterOf`), but `is_rc_type`/`ty_is_concrete_rc` used to OMIT `Type::Iterator`,
+// so the lowerer never registered it owned and never released it at scope exit — every bound
+// `range(...)` / iterator-combinator result leaked its whole array (the RAPTOR LOAD/PREP-phase
+// leak; unbounded RSS in a hot loop). Both predicates now include `Iterator` (kept in lockstep:
+// an asymmetry would be a double-free). Iterators have no borrowed alias, so this is sound — the
+// ASan stdlib/example leg guards the no-double-free half. This test guards that binding + consuming
+// an iterator in a loop still computes correctly (an over-eager free would corrupt the sum / crash).
+#[test]
+fn test_iterator_bound_value_released_and_correct() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+import { length } from "std/array"
+
+val build = (): Int32 =>
+  val r = range(0, 100)
+  var s = 0
+  r.for(i => s = s + i)
+  s + length(r)
+
+var total = 0
+range(0, 50).for(i => total = total + build())
+print(toString(total))
+"#);
+    // build() = (0+..+99) + 100 = 4950 + 100 = 5050; summed 50 times = 252500.
+    assert_eq!(output, vec!["252500"]);
+}
+
 // Regression (escape safety): a `var n` cell captured by a closure that is RETURNED from its
 // creating function ESCAPES — the closure (and thus the cell) outlives the call. The lowerer
 // must NOT free this cell at scope exit; doing so would be a use-after-free when the returned
