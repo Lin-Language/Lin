@@ -12554,6 +12554,63 @@ print("${p["x"] + p["y"]}")
 }
 
 #[test]
+fn test_sealed_out_of_shape_field_read_is_null_not_panic() {
+    // A sealed record has EXACTLY its declared fields. Reading a key NOT in the shape (here the
+    // extra "wisdom" that was stripped when the wider literal was assigned to a Person) used to
+    // PANIC in codegen (`sealed_field_layout: field "wisdom" not in record`). It must instead
+    // follow safe-access (§6.1: missing object key → Null), matching the checker's warning that
+    // the field does not exist. Also asserts in-shape reads still work and the extra was stripped.
+    let out = run(r#"
+import { print } from "std/io"
+import { keys } from "std/object"
+import { length } from "std/array"
+type Person = { "name": String, "age": Int32 }
+val wide = { "name": "Doris", "age": 70, "wisdom": true }
+val p: Person = wide
+print(if p["wisdom"] == null then "absent" else "present")
+print(p["name"])
+print("${p["age"]}")
+print("${keys(p).length()}")
+"#);
+    assert_eq!(out, vec!["absent", "Doris", "70", "2"]);
+}
+
+#[test]
+fn test_sealed_dynamic_key_index_no_panic() {
+    // Indexing a sealed record with a NON-LITERAL key (`p[k]`) can't resolve a packed-struct slot
+    // by offset; the old code read the packed struct as a LinObject and crashed the runtime.
+    // Codegen now materializes the sealed record to a boxed object and does the dynamic lookup:
+    // a present key returns its value, an absent key (a stripped extra) returns Null.
+    let out = run(r#"
+import { print } from "std/io"
+type Person = { "name": String, "age": Int32 }
+val wide = { "name": "Doris", "age": 70, "wisdom": true }
+val p: Person = wide
+val present = "name"
+val absent = "wisdom"
+print(p[present])
+print(if p[absent] == null then "dyn-absent" else "dyn-present")
+"#);
+    assert_eq!(out, vec!["Doris", "dyn-absent"]);
+}
+
+#[test]
+fn test_sealed_array_out_of_shape_field_read_is_null() {
+    // Out-of-shape field access on a SEALED-RECORD ARRAY element (`arr[i]["gone"]`) must also be
+    // Null, not a panic. The array is typed to Person[]; the source literals carry an extra field
+    // that the sealed element layout does not include.
+    let out = run(r#"
+import { print } from "std/io"
+type Person = { "name": String, "age": Int32 }
+val people: Person[] = [{ "name": "A", "age": 1, "gone": 9 }, { "name": "B", "age": 2, "gone": 8 }]
+print(people[0]["name"])
+print("${people[1]["age"]}")
+print(if people[0]["gone"] == null then "elem-absent" else "elem-present")
+"#);
+    assert_eq!(out, vec!["A", "2", "elem-absent"]);
+}
+
+#[test]
 fn test_sealed_boundary_projection_drops_extras_source_untouched() {
     // (b) A wider Json/anonymous literal with an EXTRA field passed to a sealed-scalar param: the
     // param sees only its own fields (extras dropped in the projecting copy), and the ORIGINAL
