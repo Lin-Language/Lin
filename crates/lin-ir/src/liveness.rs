@@ -252,6 +252,8 @@ pub fn instr_use_def(instr: &Instruction) -> (Vec<Temp>, Vec<Temp>) {
         Instruction::MatchesSchema { dst, val, .. } => (vec![*val], vec![*dst]),
         Instruction::Box { dst, val, .. } => (vec![*val], vec![*dst]),
         Instruction::Unbox { dst, val, .. } => (vec![*val], vec![*dst]),
+        Instruction::BoxKeepPacked { dst, src, .. } => (vec![*src], vec![*dst]),
+        Instruction::UnboxKeepPacked { dst, src, .. } => (vec![*src], vec![*dst]),
         Instruction::Bind { dst, src, .. } => (vec![*src], vec![*dst]),
         Instruction::Panic { msg } => (vec![*msg], vec![]),
     }
