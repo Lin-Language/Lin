@@ -1,7 +1,7 @@
 //! `LinMap` — the runtime backing for the typed index-signature object type `{ String: T }`
-//! (ADR-082). A String-keyed hashed dictionary giving O(1) average lookup/insert, in contrast
+//! (ADR-055). A String-keyed hashed dictionary giving O(1) average lookup/insert, in contrast
 //! to `LinObject`'s O(n) association-list scan (which is optimal for record-shaped objects but
-//! catastrophic for dictionary-shaped ones — see ADR-082 / spec §5.1.1).
+//! catastrophic for dictionary-shaped ones — see ADR-055 / spec §5.1.1).
 //!
 //! Backing representation: a single open-addressing (linear-probing) hash table. Each occupied
 //! slot stores `(key: *mut LinString, value: TaggedVal)`. Values are boxed inside the 16-byte
@@ -328,7 +328,7 @@ pub unsafe extern "C" fn lin_map_retain(map: *mut LinMap) {
 }
 
 // ── Tag-aware bridges: keys/values/entries over a BOXED value (`TaggedVal*`) ──────────────
-// These back the `std/object` wrappers (ADR-082) so the SAME `keys`/`values`/`entries` work on
+// These back the `std/object` wrappers (ADR-055) so the SAME `keys`/`values`/`entries` work on
 // both a `Json`/`{}` record (TAG_OBJECT → `LinObject`) and a typed index-signature map (TAG_MAP →
 // `LinMap`). The arg is a boxed `TaggedVal*`; we dispatch on its tag. A null/other tag yields an
 // empty array. Each returns a freshly-owned `LinArray*` with its elements payload-retained.

@@ -1,6 +1,7 @@
 [
   { "title": "Home", "path": "/", "section": "" },
   { "title": "Getting Started", "path": "/getting-started", "section": "" },
+  { "title": "Changelog", "path": "/changelog", "section": "" },
   { "title": "Hello World & I/O", "path": "/tutorials/01-hello-world", "section": "Tutorials" },
   { "title": "Values & Types", "path": "/tutorials/02-values-and-types", "section": "Tutorials" },
   { "title": "Functions", "path": "/tutorials/03-functions", "section": "Tutorials" },

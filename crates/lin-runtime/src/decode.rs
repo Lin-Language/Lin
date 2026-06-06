@@ -1,4 +1,4 @@
-//! `fromJson` generic type-directed decoder (ADR-047).
+//! `fromJson` generic type-directed decoder (ADR-031).
 //!
 //! `lin_from_json(value, descriptor)` validates a Json value (`TaggedVal*`) against a
 //! compile-time schema descriptor emitted by codegen (see
@@ -261,7 +261,7 @@ unsafe fn validate(
         }
         KIND_UNION => {
             let nvariants = desc.u32_at(node + 1) as usize;
-            // First structurally-matching variant wins (ADR-047). Probe each in order against a
+            // First structurally-matching variant wins (ADR-031). Probe each in order against a
             // SCRATCH path so failed probes don't pollute the reported path.
             for i in 0..nvariants {
                 let off = desc.u32_at(node + 5 + i * 4) as usize;
@@ -277,7 +277,7 @@ unsafe fn validate(
 }
 
 /// Decode/validate `value` (a Json `TaggedVal*`) against the schema `desc`. Returns an owned
-/// clone of `value` on success, or a fresh `Error` object on the first mismatch (ADR-047). The
+/// clone of `value` on success, or a fresh `Error` object on the first mismatch (ADR-031). The
 /// input is borrowed (never consumed).
 #[no_mangle]
 pub unsafe extern "C" fn lin_from_json(value: *const u8, desc: *const u8) -> *mut u8 {
@@ -289,7 +289,7 @@ pub unsafe extern "C" fn lin_from_json(value: *const u8, desc: *const u8) -> *mu
     }
 }
 
-/// Deep structural type test for `is <ObjectType>` (ADR-054). Runs the SAME validator the
+/// Deep structural type test for `is <ObjectType>` (ADR-036). Runs the SAME validator the
 /// `fromJson` decoder uses (`validate`) against the schema descriptor `desc` and returns
 /// `1` when `value` fully conforms to the target type (recursively, with fromJson's number
 /// policy), `0` otherwise. The input is borrowed (never cloned/consumed); the descriptor is a

@@ -2,7 +2,7 @@
 ///
 /// Produces canonical, idempotent output from a parsed `Module`.
 ///
-/// Comments are preserved (reversing the original ADR-040 decision). Lin has only `//`
+/// Comments are preserved (reversing the original ADR-025 decision). Lin has only `//`
 /// line comments; the lexer no longer discards them but records each on a side channel
 /// (`Lexer::comments()`). `Formatter::with_comments` consumes that side channel, attaches
 /// each comment to an AST anchor (a statement, a block tail, or a single-expression
@@ -59,7 +59,7 @@ thread_local! {
     static HOIST_BODIES: RefCell<std::collections::HashSet<u32>> =
         RefCell::new(std::collections::HashSet::new());
     /// True while rendering a call/method ARGUMENT. A single-identifier, type-less lambda in
-    /// argument position renders bare (`i => …`, ADR-007); elsewhere (a `val` RHS etc.) it must
+    /// argument position renders bare (`i => …`, ADR-006); elsewhere (a `val` RHS etc.) it must
     /// be parenthesised (`(i) => …`) to re-parse. `fmt_function` reads this for its OWN params,
     /// then clears it while rendering the body so a nested non-argument lambda isn't affected.
     static IN_ARG_POSITION: RefCell<bool> = const { RefCell::new(false) };
@@ -1369,7 +1369,7 @@ fn fmt_inline(expr: &Expr) -> String {
                 .unwrap_or_default();
             let generics = fmt_type_params(type_params);
             // A single-ident, type-less, non-generic lambda renders BARE only in argument
-            // position (ADR-007); elsewhere it is parenthesised so the output re-parses. The
+            // position (ADR-006); elsewhere it is parenthesised so the output re-parses. The
             // body is the lambda's own scope, not argument position — render it with the flag
             // cleared so a nested non-argument lambda stays parenthesised.
             let bare_ok = in_arg_position()
@@ -1929,7 +1929,7 @@ fn fmt_function(
     let generics = fmt_type_params(type_params);
 
     // A single-identifier, type-less, non-generic lambda renders BARE (`x => …`) ONLY in
-    // argument position, where ADR-007 allows it (and idiomatic Lin prefers it: `.for(i => …)`).
+    // argument position, where ADR-006 allows it (and idiomatic Lin prefers it: `.for(i => …)`).
     // Anywhere else (a `val` RHS, a block tail, …) the bare form does not re-parse, so the
     // parameter list is parenthesised (`(x) => …`) to keep the formatter's output round-trip
     // safe. A generic function always uses the parenthesised form.
@@ -2489,7 +2489,7 @@ mod tests {
     }
 
     /// The core invariant: formatter output must always re-parse. A bare-identifier lambda
-    /// (`x => x`) is only legal in argument position (ADR-007), so the formatter must keep the
+    /// (`x => x`) is only legal in argument position (ADR-006), so the formatter must keep the
     /// parens on a lambda bound to a `val` RHS (or any non-argument position). Before the fix,
     /// `val h = (x) => x` was rewritten to the unparseable `val h = x => x`.
     #[test]

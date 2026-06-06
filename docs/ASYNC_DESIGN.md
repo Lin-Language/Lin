@@ -3,8 +3,8 @@
 Status: **implemented** (Phases 0–8). This document described turning Lin's
 concurrency primitives from their synchronous stub into real OS-thread
 concurrency (`SPECIFICATION.md` §24); that work has landed. As-built decisions:
-ADR-043 (model: copy-by-default RC + catchable faults), ADR-044 (`Shared<T>`),
-ADR-045 (`Frozen<T>`) in `docs/DECISIONS.md`; RC-under-threads model in
+ADR-028 (model: copy-by-default RC + catchable faults), ADR-029 (`Shared<T>`),
+ADR-030 (`Frozen<T>`) in `docs/DECISIONS.md`; RC-under-threads model in
 `MEMORY_MANAGEMENT.md`.
 
 Implemented: real `async`/`await` on OS threads, fault isolation at the thread
@@ -313,7 +313,7 @@ the one rule that must be specified precisely; everything else falls out of it.
 **Constraints.** `shared(v)` requires `v` transferable (JSON-shaped, acyclic) —
 same rule as crossing a thread boundary; `shared(aFunction)`/`shared(anIterator)`
 is a compile-time error. `Shared<T>` makes reference cycles reachable (two boxes
-referencing each other) and Lin's RC has no cycle collector (ADR-039) — document
+referencing each other) and Lin's RC has no cycle collector (ADR-024) — document
 the hazard. Any lock primitive reintroduces **deadlock** potential, and Lin has
 no cancellation (§24.4 `timeout` only "abandons"); scoped `withLock` plus a
 documented no-reentrancy / lock-ordering rule mitigates but does not remove it.

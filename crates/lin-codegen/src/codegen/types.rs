@@ -31,7 +31,7 @@ impl<'ctx> Codegen<'ctx> {
             // Stage 0.5: codegen IGNORES the `sealed` marker — every object, sealed or not, is the
             // boxed string-keyed `LinObject` pointer, exactly as before. Stage 1 will branch here.
             Type::Object { .. } => self.context.ptr_type(AddressSpace::default()).into(),
-            // A typed index-signature map (`{ String: T }`, ADR-082) is a `LinMap*` — an opaque
+            // A typed index-signature map (`{ String: T }`, ADR-055) is a `LinMap*` — an opaque
             // pointer to the hashed container.
             Type::Map(_) => self.context.ptr_type(AddressSpace::default()).into(),
             Type::Union(_) => {

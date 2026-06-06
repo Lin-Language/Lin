@@ -89,7 +89,7 @@ impl Checker {
         let left_ty = typed_left.ty();
         let right_ty = typed_right.ty();
 
-        // A `Number`-bounded generic TypeVar operand (ADR-018, reversed) drives an arithmetic op's
+        // A `Number`-bounded generic TypeVar operand (ADR-014, reversed) drives an arithmetic op's
         // result type so it FLOWS THROUGH monomorphization: `x % 2` where `x: <T:numeric>` must yield
         // `T`, not the literal's Int32 — so the `$Float64` specialization lowers the op to a native
         // `frem`. The OTHER (literal) operand stays its own type; codegen widens an `Int32` literal

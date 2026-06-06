@@ -1263,7 +1263,7 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
         None
     };
 
-    // CAPTURE-LESS-LAMBDA INLINE (the zero-box win, ADR-069): if the callee is a thin
+    // CAPTURE-LESS-LAMBDA INLINE (the zero-box win, ADR-044): if the callee is a thin
     // intrinsic-combinator wrapper (`map`/`filter`/`reduce` = `lin_map`/… forwarding its params) AND
     // the callback argument is a capture-less LITERAL lambda, inline the wrapper at THIS call site —
     // rewriting the call to a direct `lin_map(arr, <lambda>)` — so the literal lambda becomes visible
@@ -1470,7 +1470,7 @@ fn native_spec_slot(
     s
 }
 
-/// Intrinsic-combinator wrappers whose callback body the IR lowering can inline (ADR-069). Each is
+/// Intrinsic-combinator wrappers whose callback body the IR lowering can inline (ADR-044). Each is
 /// `lin_X(params…)` forwarding its parameters 1:1, so a call's existing args are already in the
 /// intrinsic's argument order and need no reordering when we repoint the callee.
 fn combinator_intrinsic(name: &str) -> bool {
@@ -1656,13 +1656,13 @@ fn repoint_call_native(
 ) {
     let concrete_params: Vec<Type> = params.iter().map(|p| subst_type(&p.ty, subs)).collect();
     let mut concrete_ret = subst_type(ret_type, subs);
-    // ADR-018 (reversed) mixed-family fix: a bare `Number` return whose value comes from arithmetic
+    // ADR-014 (reversed) mixed-family fix: a bare `Number` return whose value comes from arithmetic
     // over two DISTINCT bounded vars (`(a:Number,b:Number)=>a+b`) had `ret_type` recorded as ONE of
     // those vars, so `subst_type` freezes it to the first family. The materialized spec actually
     // returns the WIDENED family (`function_tail_type` over the substituted body — same as the spec
     // function's own re-synced `ret_type`). Re-derive it here so the Call's recorded result type and
     // the spec's signature agree (otherwise the caller reads an `i32` slot the spec fills with a
-    // `double`). Fires when the substituted return is numeric, OR (ADR-018 §Json) when it is the
+    // `double`). Fires when the substituted return is numeric, OR (ADR-014 §Json) when it is the
     // Json wildcard: a `Json` argument binds the `Number` var to `u32::MAX`, so `subst_type` makes
     // `concrete_ret = Json` (a `ptr`) while the spec body's arithmetic re-widens to a native scalar.
     // Mirrors the spec function's own ret-type re-sync in `subst_expr`; the `repr_differs` Coerce
@@ -1907,7 +1907,7 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
     // Recurse into children to substitute nested types.
     for_each_child_mut(expr, &mut |c| subst_expr(c, subs));
 
-    // ADR-018 (reversed) mixed-family fix: a `Number` arithmetic op's result type was recorded by
+    // ADR-014 (reversed) mixed-family fix: a `Number` arithmetic op's result type was recorded by
     // the checker as ONE of its bounded operand vars (e.g. `a + b` with `a: TypeVar(9001)`,
     // `b: TypeVar(9002)` stored `result_type = TypeVar(9001)`). Plain `subst_type` then freezes it
     // to the FIRST family (Int32) — but when the two vars bind to DIFFERENT families (`add(10,2.5)`
@@ -1929,7 +1929,7 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
                     *result_type = widened;
                 }
             } else if lt.is_numeric() && is_json(&rt) {
-                // ADR-018 (reversed) §Json: a `Number` operand bound to the Json wildcard. The IR
+                // ADR-014 (reversed) §Json: a `Number` operand bound to the Json wildcard. The IR
                 // (`lower_expr` BinaryOp) unboxes the wildcard side to the CONCRETE operand's family
                 // and emits a native scalar op — so the result is that concrete numeric family, not
                 // the boxed `result_type` the checker recorded (the bounded var → Json). Mirror that
@@ -1948,11 +1948,11 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
     // re-widened above), the function's actual return is the body's tail type — re-sync `ret_type`
     // to it so the emitted function signature matches the value the body returns (no `ret double`
     // vs declared-`i32` mismatch). Fires when `subst_type` left the return either numeric (the
-    // mixed-family case) OR as the Json wildcard (the ADR-018 §Json case below) AND the re-derived
+    // mixed-family case) OR as the Json wildcard (the ADR-014 §Json case below) AND the re-derived
     // body type is numeric — a structural or already-concrete-non-wildcard return is left exactly as
     // `subst_type` produced it.
     //
-    // ADR-018 (reversed) §Json: a `Json` argument binds the `Number` param's bounded var to the Json
+    // ADR-014 (reversed) §Json: a `Json` argument binds the `Number` param's bounded var to the Json
     // wildcard (`u32::MAX`), so `subst_type` makes the spec's `ret_type = Json` (a `ptr`). But the
     // body's arithmetic over the (Int32-unboxed) operand re-widens to a NATIVE scalar (e.g. `x*3` ⇒
     // `i32`) — so the function returns `i32` against a declared `ptr` (the `triple$Json` mismatch).
@@ -1977,7 +1977,7 @@ fn subst_expr(expr: &mut TypedExpr, subs: &HashMap<u32, Type>) {
 /// A Coerce normally reports its `to` type. But a `from == to` Coerce is a REPRESENTATION NO-OP that
 /// codegen elides — passing the inner value through unchanged. After substitution this arises for a
 /// `Number` body whose value flows through a `Coerce { from: numvar, to: numvar }` that both
-/// substituted to the SAME type (e.g. the Json wildcard, ADR-018 §Json): codegen returns the inner
+/// substituted to the SAME type (e.g. the Json wildcard, ADR-014 §Json): codegen returns the inner
 /// (re-widened) scalar, so the tail type must be the INNER expression's type, not the elided `to`.
 fn function_tail_type(body: &TypedExpr) -> Type {
     match body {

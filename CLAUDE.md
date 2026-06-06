@@ -31,7 +31,16 @@ Environment variables for `lin build`:
 
 CI runs on GitHub Actions (`.github/workflows/ci.yml`): `cargo build`, `cargo test --workspace`, `lin fmt --check` over `stdlib/`/`examples/`/`benchmarks/`, and all non-network `examples/*.lin` on every push. There is no `cargo` available at the system shell at the time of writing — assume the user runs commands themselves.
 
-A source formatter exists: `cargo run -p lin -- fmt <paths>` rewrites `.lin` files to canonical form in place; `lin fmt --check <paths>` verifies without writing (used by CI). It is comment-preserving and AST-faithful — it must never change program meaning, which is enforced by the corpus type-check + run-equivalence gate in the formatter tests (`crates/lin/tests/integration.rs`). See ADR-040 (reversed) for comment handling.
+A source formatter exists: `cargo run -p lin -- fmt <paths>` rewrites `.lin` files to canonical form in place; `lin fmt --check <paths>` verifies without writing (used by CI). It is comment-preserving and AST-faithful — it must never change program meaning, which is enforced by the corpus type-check + run-equivalence gate in the formatter tests (`crates/lin/tests/integration.rs`). See ADR-025 for comment handling.
+
+## Releasing
+
+Releases are automated with [release-plz](https://release-plz.dev/) and driven by Conventional Commits.
+
+- **Single source of truth for the version**: `[workspace.package].version` in the root `Cargo.toml`. Every crate inherits it via `version.workspace = true`; never bump a crate version by hand.
+- **Cutting a release**: every push to `master` updates an open "chore: release" PR (version bump + generated `CHANGELOG.md`). **Merging that PR cuts the release** — release-plz then creates the `vX.Y.Z` tag + GitHub release and attaches the platform binaries/VSIX. Commit prefixes matter: `feat` → minor, `fix`/`perf` → patch, `!`/`BREAKING CHANGE` → major; `chore`/`ci`/`test`/`style` are skipped.
+- **Bleeding edge**: `release.yml` still publishes a rolling `latest` *prerelease* on every push to `master`.
+- **Install**: `install.sh` installs the newest *stable* release by default (skips the rolling prerelease); `LIN_VERSION=vX.Y.Z` pins one.
 
 ## Workspace layout
 
@@ -70,19 +79,19 @@ Imports are resolved recursively before the main module is checked. Each importe
 
 These are non-obvious and easy to break. Full rationale lives in `docs/DECISIONS.md` — read it before making structural changes.
 
-- **Indentation lexing is suppressed inside `{ }`, `( )`, `[ ]`.** This lets JSON object literals span lines without triggering block parsing. Don't add INDENT/DEDENT logic inside delimiter-balanced spans (ADR-004).
-- **String interpolation is one compound token** (`InterpString(Vec<InterpPart>)`) whose `Expr` parts each carry their own sub-token-stream. The parser recurses into those sub-streams (ADR-005).
-- **Dot-chaining across newlines uses save/restore lookahead** in the parser's postfix loop. Don't aggressively skip newlines — it breaks block structure (ADR-006). After a `Dedent`, postfix `[` and `(` are suppressed but `.` is allowed (ADR-011).
-- **Bare-identifier lambdas (`x => x * 2`) are only recognised in argument position.** `is_bare_lambda()` looks ahead from inside argument parsing (ADR-007).
-- **`val` whose RHS is a function literal is forward-declared** before codegen via a pre-scan, so mutual recursion works between top-level functions (ADR-015). Non-function `val` cannot self-reference (spec §7.3).
-- **TCO uses an alloca/loop transform in codegen.** Direct self-recursive calls in tail position are emitted as jumps back to a `tco_loop` header. Mutual TCO is not implemented (ADR-021, spec §27.3).
-- **`var` is captured by reference** — a heap-allocated mutable slot shared by all closures over the same binding (spec §27.2, ADR-015).
+- **Indentation lexing is suppressed inside `{ }`, `( )`, `[ ]`.** This lets JSON object literals span lines without triggering block parsing. Don't add INDENT/DEDENT logic inside delimiter-balanced spans (ADR-003).
+- **String interpolation is one compound token** (`InterpString(Vec<InterpPart>)`) whose `Expr` parts each carry their own sub-token-stream. The parser recurses into those sub-streams (ADR-004).
+- **Dot-chaining across newlines uses save/restore lookahead** in the parser's postfix loop. Don't aggressively skip newlines — it breaks block structure (ADR-005). After a `Dedent`, postfix `[` and `(` are suppressed but `.` is allowed (ADR-010).
+- **Bare-identifier lambdas (`x => x * 2`) are only recognised in argument position.** `is_bare_lambda()` looks ahead from inside argument parsing (ADR-006).
+- **`val` whose RHS is a function literal is forward-declared** before codegen via a pre-scan, so mutual recursion works between top-level functions (ADR-012). Non-function `val` cannot self-reference (spec §7.3).
+- **TCO uses an alloca/loop transform in codegen.** Direct self-recursive calls in tail position are emitted as jumps back to a `tco_loop` header. Mutual TCO is not implemented (ADR-016, spec §27.3).
+- **`var` is captured by reference** — a heap-allocated mutable slot shared by all closures over the same binding (spec §27.2, ADR-012).
 - **Bracket access is safe by default.** Missing object key → `Null`; `Null` propagates through chains; array OOB is a runtime error (spec §6.1).
-- **Compiler builtins use `lin_*` names; user-facing names come from stdlib.** All polymorphic primitives (`lin_print`, `lin_for`, `lin_iter`, `lin_length`, `lin_to_string`, `lin_push`, `lin_keys`, and all concurrency: `lin_async` etc.) are dispatched specially in codegen. They are not visible to user code (now ENFORCED in the checker: `lin_*` names resolve only when type-checking a trusted stdlib module — ADR-086). Stdlib files re-export them under their clean names: `std/io` exports `print`, `std/iter` exports the iterable combinators `map`/`filter`/`reduce`/`for`/`range` (and dispatches them on the receiver's type — eager over Array/Iterator, lazy over `Stream`; ADR-077), `std/array` exports array-shaped ops `push`/`length`/`slice`/`sort`/…, `std/object` exports `keys`, `std/string` exports `toString`, `std/async` exports `async`/`await` etc. User code must import them explicitly (ADR-002, ADR-009).
-- **Inline blocks inside parentheses.** Lambdas like `x => val y = x*2; y` passed to `.for(...)` have no INDENT/DEDENT (suppressed by ADR-004). `parse_function_body` detects `val`/`var` as the multi-statement-body signal (ADR-014).
-- **Imports: `std/...` resolves into the embedded stdlib sources; everything else is resolved relative to the importing file's directory with `.lin` appended** (ADR-016). Module init is lazy; cycles within a single init chain are a compile-time error.
-- **`async(f)` thunks must not capture `var` bindings** and must not return `Function` or `Iterator` values. Both are compile-time errors in `lin-check`. The checker tracks mutable global slots separately (`mutable_global_slots`) because global vars are not recorded as captures (ADR-034).
-- **`import foreign "path"` declares external C symbols.** The compiler emits LLVM `declare` directives and passes library paths to the linker (ADR-033). Real FFI calls work only via `lin build`.
+- **Compiler builtins use `lin_*` names; user-facing names come from stdlib.** All polymorphic primitives (`lin_print`, `lin_for`, `lin_iter`, `lin_length`, `lin_to_string`, `lin_push`, `lin_keys`, and all concurrency: `lin_async` etc.) are dispatched specially in codegen. They are not visible to user code (now ENFORCED in the checker: `lin_*` names resolve only when type-checking a trusted stdlib module — ADR-060). Stdlib files re-export them under their clean names: `std/io` exports `print`, `std/iter` exports the iterable combinators `map`/`filter`/`reduce`/`for`/`range` (and dispatches them on the receiver's type — eager over Array/Iterator, lazy over `Stream`; ADR-051), `std/array` exports array-shaped ops `push`/`length`/`slice`/`sort`/…, `std/object` exports `keys`, `std/string` exports `toString`, `std/async` exports `async`/`await` etc. User code must import them explicitly (ADR-002, ADR-008).
+- **Inline blocks inside parentheses.** Lambdas like `x => val y = x*2; y` passed to `.for(...)` have no INDENT/DEDENT (suppressed by ADR-003). `parse_function_body` detects `val`/`var` as the multi-statement-body signal (ADR-011).
+- **Imports: `std/...` resolves into the embedded stdlib sources; everything else is resolved relative to the importing file's directory with `.lin` appended** (ADR-013). Module init is lazy; cycles within a single init chain are a compile-time error.
+- **`async(f)` thunks must not capture `var` bindings** and must not return `Function` or `Iterator` values. Both are compile-time errors in `lin-check`. The checker tracks mutable global slots separately (`mutable_global_slots`) because global vars are not recorded as captures (ADR-022).
+- **`import foreign "path"` declares external C symbols.** The compiler emits LLVM `declare` directives and passes library paths to the linker (ADR-021). Real FFI calls work only via `lin build`.
 - **`import foreign "lin-runtime"` is a reserved internal path** used by stdlib files to declare their FFI dependencies on `lin-runtime.a` symbols (e.g. `lin_string_trim`, `lin_fs_read`). The compiler recognises this path, skips normal FFI type validation (to allow Array/Object return types), and doesn't add it to `foreign_lib_paths` (it's always linked). User code cannot use this path meaningfully — the runtime symbols are only accessible through the stdlib wrappers.
 
 ## Adding a language feature
@@ -91,7 +100,7 @@ The typical path:
 
 1. **Tokens** — add `TokenKind` variants in `lin-lex/src/token.rs`, lex them in `lin-lex/src/lexer.rs`. Remember the indentation suppression invariants for new delimiters.
 2. **AST** — add `Expr`/`Stmt`/`Pattern`/`TypeExpr` variants in `lin-parse/src/ast.rs`. Each variant carries its own `Span`. Add a branch in `Expr::span()`.
-3. **Parser** — wire into the `lin-parse/src/parser/` module tree (expressions in `expr.rs`, statements in `stmt.rs`, etc.). For postfix operators, mind the DEDENT suppression rule (ADR-011). For continuation-line constructs, use the `skip_continuation_newline` pattern (ADR-006).
+3. **Parser** — wire into the `lin-parse/src/parser/` module tree (expressions in `expr.rs`, statements in `stmt.rs`, etc.). For postfix operators, mind the DEDENT suppression rule (ADR-010). For continuation-line constructs, use the `skip_continuation_newline` pattern (ADR-005).
 4. **Type checker** — add handling in the `lin-check/src/checker/` module tree (expression inference in `expr.rs`, statements in `stmt.rs`, etc.).
 5. **Codegen** — add handling in the `lin-codegen/src/codegen/` module tree (instruction dispatch in `mod.rs`; intrinsics in `intrinsics.rs`, etc.). If a new runtime intrinsic is needed, add it to `lin-runtime/src/` and declare it in `codegen/runtime.rs`'s `RuntimeFns`.
 6. **Tests** — add an end-to-end test in `crates/lin/tests/integration.rs` and a fixture in `examples/`.

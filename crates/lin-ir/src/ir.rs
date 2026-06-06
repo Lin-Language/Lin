@@ -111,19 +111,19 @@ pub enum Intrinsic {
     /// HTTP server (`serve`, spec §25.5). `serve(handler, port)` → `lin_serve(h_fn, h_env,
     /// h_has, port)`. Blocks forever; the handler is invoked once per request.
     Serve,
-    // Shared<T> — opt-in shared mutable state (ADR-043 §2.3.1). shared(v) boxes a private copy;
+    // Shared<T> — opt-in shared mutable state (ADR-028 §2.3.1). shared(v) boxes a private copy;
     // get/set/withLock are the only accessors (copy out / copy in / locked in-place mutate).
     SharedNew,
     SharedGet,
     SharedSet,
     SharedWithLock,
-    // Frozen<T> — opt-in shared read-only state (ADR-043 §2.3.2): deep immortal seal of a graph.
+    // Frozen<T> — opt-in shared read-only state (ADR-028 §2.3.2): deep immortal seal of a graph.
     Freeze,
     Request,
     Message,
     Close,
     // Stream<T> — opaque, effectful, fallible pull-source owning an OS resource (streams brief,
-    // ADR-072). `StreamOpen` opens a file source → `Stream<UInt8[]> | Error`; `StreamRead` pulls
+    // ADR-047). `StreamOpen` opens a file source → `Stream<UInt8[]> | Error`; `StreamRead` pulls
     // the next chunk → `UInt8[] | Null | Error` (Null = EOF); `StreamClose` closes the resource
     // (idempotent). Dispatch is modelled on the `Shared*` family.
     StreamOpen,
@@ -188,7 +188,7 @@ pub enum Intrinsic {
     // `.promise()` (Stage 8): MOVE the pipeline onto a worker thread that drives it to EOF →
     // Promise<Null | Error>. The stream arg is moved (caller release suppressed).
     StreamPromise,
-    /// `fromJson` type-directed decode (ADR-047). Carries the resolved target `Type` T and the
+    /// `fromJson` type-directed decode (ADR-031). Carries the resolved target `Type` T and the
     /// resolved bodies of every reachable `Named` type (so codegen can build a recursive schema
     /// descriptor with no type environment). Runtime: `lin_from_json(value, descriptor) -> ptr`
     /// returns the input value retained (+1) on success, or a fresh `Error` object on the first
@@ -199,7 +199,7 @@ pub enum Intrinsic {
     },
 }
 
-/// How a closure env releases one captured slot when the closure is freed (ADR-060: owning
+/// How a closure env releases one captured slot when the closure is freed (ADR-041: owning
 /// captures). The env owns one reference per owning capture; `lin_closure_release` walks the
 /// emitted capture descriptor and applies the matching release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,7 +222,7 @@ pub enum CaptureRelease {
     /// struct as object entries (a heap-buffer-overflow). Deep-copied across threads by a flat
     /// byte copy (`transfer::CAP_SEALED`).
     Sealed,
-    /// MOVED resource capture (streams brief §9, ADR-072): a `Stream` (or `Stream | Error`) crosses
+    /// MOVED resource capture (streams brief §9, ADR-047): a `Stream` (or `Stream | Error`) crosses
     /// the thread boundary by MOVE, not copy. The pointer is handed off verbatim — NO clone on
     /// capture, NO retain — and the SOURCE must not release it (the affine check guarantees it is
     /// never touched again). The WORKER owns it and releases it (`lin_tagged_release`, whose
@@ -396,7 +396,7 @@ pub enum Instruction {
     GlobalValGet { dst: Temp, slot: usize, ty: Type },
     /// dst = heap cell holding `init` (a `var` mutably captured by a closure). The cell
     /// pointer is shared by reference: closures capture it and read/write the live value
-    /// through CellGet/CellSet (ADR-015). `ty` is the stored value's type.
+    /// through CellGet/CellSet (ADR-012). `ty` is the stored value's type.
     MakeCell { dst: Temp, init: Temp, ty: Type },
     /// result = *cell  (load the current value of a captured `var` cell).
     CellGet { dst: Temp, cell: Temp, ty: Type },
@@ -437,7 +437,7 @@ pub enum Instruction {
     /// result = val has pattern? (returns bool)
     HasPattern { dst: Temp, val: Temp, pattern: HasDesc },
     /// result = `val` deeply conforms to `target`? (returns bool) — `is <ObjectType>` deep
-    /// type validation (ADR-054). Reuses the `fromJson` structural walker via
+    /// type validation (ADR-036). Reuses the `fromJson` structural walker via
     /// `lin_matches_schema(value, descriptor)`: codegen emits the same schema descriptor it
     /// builds for `Intrinsic::FromJson` (from `target` + the resolved `named_defs` bodies of
     /// reachable Named types) and calls the runtime to recursively validate field TYPES, not

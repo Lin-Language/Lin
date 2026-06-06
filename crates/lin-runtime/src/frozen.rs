@@ -1,4 +1,4 @@
-//! `Frozen<T>` — opt-in shared **read-only** state (ADR-043 §2.3.2, ADR-045).
+//! `Frozen<T>` — opt-in shared **read-only** state (ADR-028 §2.3.2, ADR-030).
 //!
 //! `frozen(v)` performs a deep, one-time **immortal seal** of a transferable graph: every heap
 //! node (string, array, object, recursively) has its refcount saturated to `IMMORTAL_RC`. After

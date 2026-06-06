@@ -62,7 +62,7 @@ must happen on the thread that called `SDL_Init`. You cannot legally render from
 thread. That is *why there is no render thread here* — all SDL calls stay on the main thread.
 
 Lin's `async` is **share-nothing**: a thunk's captured `val`s are **deep-copied** into the worker
-thread and its result is **deep-copied** back (ADR-043 §2.3). So the natural division of labour is
+thread and its result is **deep-copied** back (ADR-028 §2.3). So the natural division of labour is
 exactly what SDL wants: workers traffic in **values** (a `World` snapshot in, a planned point out),
 while **handles stay on the main thread**. In `ai_worker.lin` the `async` thunk captures only a
 `val world` of plain data and returns a plain record — no `Ptr` handle and no `var` ever crosses

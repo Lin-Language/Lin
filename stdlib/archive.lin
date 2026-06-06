@@ -1,4 +1,4 @@
-// std/archive — tar splitting over a `Stream<UInt8[]>` (ADR-072 streams).
+// std/archive — tar splitting over a `Stream<UInt8[]>` (ADR-047 streams).
 //
 // A tar archive is a flat sequence of 512-byte-aligned (header + body) records. These surfaces turn
 // a byte stream into archive entries WITHOUT buffering the whole archive: the parent stream is
@@ -17,7 +17,7 @@
 // paused while the body runs and resumes (skipping to the next entry) the moment the body returns.
 // `data` therefore MUST be consumed (drained / read) inside the callback; it cannot be handed to a
 // worker via `.promise()`, stored in a field/var/array, or otherwise outlive the callback. The
-// ADR-075 stream placement restriction enforces the lifetime bound; a `.promise()` on `data` would
+// ADR-049 stream placement restriction enforces the lifetime bound; a `.promise()` on `data` would
 // race the shared cursor and is UNSUPPORTED (a dedicated compile-time check for that is a known gap).
 // untar(s, body) — drive the whole archive on the calling thread, calling `body(meta, data)` per
 // entry. `meta` is `{ name, size, typeflag, isDir }`; `data` is a `Stream<UInt8[]>` sub-stream over

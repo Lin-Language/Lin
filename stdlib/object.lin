@@ -7,7 +7,7 @@ import { push, length } from "std/array"
 import { for, some } from "std/iter"
 
 // `keys`/`values`/`entries` are deliberately typed `Json`, NOT `<T>(obj: { String: T })`. They are
-// tag-aware at runtime (the `lin_*_any` bridges dispatch on the boxed value's tag, ADR-082), so the
+// tag-aware at runtime (the `lin_*_any` bridges dispatch on the boxed value's tag, ADR-055), so the
 // SAME function serves both a plain `Json`/`{}` record (TAG_OBJECT → insertion order) and a typed
 // index-signature map `{ String: T }` (TAG_MAP → hash order): a typed map flows in via the SOUND
 // `{ String: T } → Json` widening direction (a map read back through these tag-aware bridges is
@@ -31,7 +31,7 @@ export val entries = (obj: Json): Json[] =>
 // bind a type parameter that appears NESTED inside a tuple-in-array parameter shape — `<T>(pairs:
 // [String, T][])` fails inference at every call site (even with the result annotated), because the
 // inference engine does not decompose `[String, T][]` to recover `T`. That is a compiler/inference
-// gap, not laxity here; re-type this once nested-tuple inference lands. See ADR-082 follow-up.
+// gap, not laxity here; re-type this once nested-tuple inference lands. See ADR-055 follow-up.
 export val fromEntries = (pairs: Json): Json =>
   var result: {  } = {}
   pairs.for(pair =>
