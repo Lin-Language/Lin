@@ -419,16 +419,35 @@ impl Checker {
     /// TypeVar: e.g. `push(out: Field[], { … }: {tag:UInt8,…})` binds `T = Field` from the container
     /// arg, and the structurally-narrower item (whose `UInt8` fields WIDEN into `Field`'s `Int32`
     /// fields) must not overwrite it to the narrower object type — which would then reject the
-    /// container arg as "expected {tag:UInt8,…}[]". When the candidate is NOT compatible with the
-    /// existing binding (a genuine conflict), the normal last-wins behaviour is kept so existing
-    /// inference is unchanged.
+    /// container arg as "expected {tag:UInt8,…}[]".
+    ///
+    /// TYPE-SOUNDNESS GUARD (record field omission): the established binding is ALSO kept when the
+    /// fresh candidate is a record that OMITS a required (non-nullable) field the established record
+    /// binding has — clobbering to it would widen `T` to a structurally DEFICIENT object. This is the
+    /// omission hole: `push(toks, {kind})` where `toks: Token[]` binds `T = Token = {kind:String,
+    /// text:String}`, and the omitting item `{kind}` is NOT `arg_compatible` with `Token` (missing
+    /// `text`). Last-wins-clobber would silently rebind `T` to `{kind}`, after which the arg-compat
+    /// gate (`call.rs`) compares `{kind}` vs `{kind}` and trivially passes — letting a value missing a
+    /// required field flow into `Token[]` and segfault on read of the missing (NULL) field. Keeping
+    /// the canonical `T = Token` lets the arg-compat gate reject the omitting item with a clear
+    /// diagnostic ("expected { kind: String, text: String }").
+    ///
+    /// The guard is TIGHT — it fires ONLY for the record-omission shape — so the legitimate
+    /// last-wins-clobber cases are untouched: a narrower NUMERIC item widening into `T` (e.g.
+    /// `push(uint8Buf, int32Val)`, where the runtime coerces the Int32 down to a byte) still
+    /// clobbers `T` to the wider numeric type, and unrelated-type conflicts still last-wins.
     pub(crate) fn collect_and_save_subs_no_clobber(&mut self, pattern: &Type, actual: &Type, local: &mut std::collections::HashMap<u32, Type>) {
         let mut fresh = std::collections::HashMap::new();
         collect_type_subs(pattern, actual, &mut fresh);
         for (id, ty) in fresh {
             match local.get(&id) {
-                // Keep the established binding when the new candidate is assignable to it.
+                // Keep the established binding when the new candidate is assignable to it
+                // (the narrower-item-widens-into-T case, e.g. UInt8 fields into an Int32 record).
                 Some(existing) if self.arg_compatible(&ty, existing) => {}
+                // Keep the established record binding when the candidate record OMITS a required
+                // field it has (the soundness guard above) — so the arg-compat gate rejects the
+                // deficient argument instead of silently rebinding `T` past it.
+                Some(existing) if Self::omits_required_field(&ty, existing) => {}
                 _ => {
                     local.insert(id, ty.clone());
                     if id < 9000 && !self.protected_type_vars.contains(&id) {
@@ -436,6 +455,34 @@ impl Checker {
                     }
                 }
             }
+        }
+    }
+
+    /// True when `candidate` is an object that omits a required (non-nullable) field present in the
+    /// `existing` object binding — i.e. assigning `candidate` where `existing` is expected would be
+    /// the unsound width-OMISSION case (the value is missing a field the type requires). EXTRAS on
+    /// the candidate are fine (width subtyping); only a MISSING required field trips this. Non-object
+    /// pairs never trip it, so numeric/other conflicts keep their last-wins behaviour.
+    fn omits_required_field(candidate: &Type, existing: &Type) -> bool {
+        if let (
+            Type::Object { fields: cand_fields, .. },
+            Type::Object { fields: exist_fields, .. },
+        ) = (candidate, existing)
+        {
+            exist_fields.iter().any(|(key, exist_ty)| {
+                !cand_fields.contains_key(key) && !Self::type_includes_null(exist_ty)
+            })
+        } else {
+            false
+        }
+    }
+
+    /// True if `t` is `Null`, or a union that includes `Null` (an optional field type).
+    fn type_includes_null(t: &Type) -> bool {
+        match t {
+            Type::Null => true,
+            Type::Union(variants) => variants.iter().any(Self::type_includes_null),
+            _ => false,
         }
     }
 }
