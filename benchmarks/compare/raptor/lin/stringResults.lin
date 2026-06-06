@@ -17,33 +17,47 @@ import { join } from "std/string"
 import { parseInt32 } from "std/number"
 import { length, push, reverse, slice } from "std/array"
 import { sortedRoundKeys } from "./roundKeys"
-
-val isTransfer = (connection: Json): Boolean =>
-  connection["origin"] != null
+import { Conn, Transfer } from "./types"
 
 // Walk the connections from finalDestination back to k=1, PREPENDING each origin, so the
 // returned path is in journey order (reference getPath uses unshift). State is threaded by
 // tail recursion (Lin's loop form).
-val getPath = (kConnections: Json, k: String, finalDestination: String): Json =>
+val getPath = (kConnections: { String: { String: Conn } }, k: String, finalDestination: String): Json =>
   walkPath(kConnections, parseInt32(k), finalDestination, [])
 
-val walkPath = (kConnections: Json, i: Int32, destination: String, path: Json): Json =>
+val walkPath = (kConnections: { String: { String: Conn } }, i: Int32, destination: String, path: Json): Json =>
   if i <= 0 then
     path
   else
-    val connection = kConnections[destination]["${i}"]
-    val origin = if isTransfer(connection) then
-      connection["origin"]
-    else
-      connection[0]["stopTimes"][connection[1]]["stop"]
-    var next = [origin]
-    path.for(p => push(next, p))
-    walkPath(kConnections, i - 1, origin, next)
+    val round = kConnections[destination]
+    match round
+      is Null =>
+        path
+      else =>
+        val connection = round["${i}"]
+        match connection
+          is Null =>
+            path
+          is Transfer =>
+            stepPath(kConnections, i, destination, connection["origin"], path)
+          else =>
+            stepPath(
+              kConnections,
+              i,
+              destination,
+              connection[0]["stopTimes"][connection[1]]["stop"],
+              path
+            )
+
+val stepPath = (kConnections: { String: { String: Conn } }, i: Int32, destination: String, origin: String, path: Json): Json =>
+  var next = [origin]
+  path.for(p => push(next, p))
+  walkPath(kConnections, i - 1, origin, next)
 
 export val makeStringResults = (): Json =>
   { "results": {  } }
 
-export val add = (sr: Json, kConnections: Json): Null =>
+export val add = (sr: Json, kConnections: { String: { String: Conn } }): Null =>
   val results = sr["results"]
   keys(kConnections).for(destination =>
     sortedRoundKeys(kConnections[destination]).for(k =>
