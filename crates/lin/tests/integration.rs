@@ -4178,6 +4178,58 @@ run()
 }
 
 #[test]
+fn test_typed_map_field_in_record() {
+    // Regression (ADR-055 §5.1.1): a `{ String: T }` typed map living as a FIELD of an enclosing
+    // record. Before the fix, the directed object-checking path in `check_object_against` only
+    // engaged when an expected field was a `StrLit` singleton, so a record like `Resp` with a
+    // `headers: { String: String }` field (no StrLit field) fell back to undirected inference —
+    // the inner `headers` literal got its own fixed-record type `{ "Content-Type": String }` and
+    // the whole-record structural check failed. The gate now also engages on a `Map` field, so the
+    // inner literal key-widens to a real `LinMap` and the entry is retrievable at runtime.
+    //
+    // Case (a): a NON-EMPTY header literal; Case (b): an EMPTY `{}` header (the common http path).
+    let output = run(r#"import { print } from "std/io"
+
+type Resp = { "status": Int32, "headers": { String: String }, "body": String }
+
+val mk = (): Resp => { "status": 200, "headers": { "Content-Type": "application/json" }, "body": "x" }
+val mkEmpty = (): Resp => { "status": 204, "headers": {}, "body": "" }
+
+val r = mk()
+val h: { String: String } = r["headers"]
+print(h["Content-Type"])
+
+val e = mkEmpty()
+val eh: { String: String } = e["headers"]
+match eh["Content-Type"]
+  is String => print("present")
+  else => print("absent")
+"#);
+    // (a) non-empty header read back; (b) empty map → missing key narrows to the else branch.
+    assert_eq!(output, vec!["application/json", "absent"]);
+}
+
+#[test]
+fn test_typed_map_field_nested_record() {
+    // The directing gate is transitive: an outer record whose direct fields are themselves records
+    // (no direct StrLit/Map field) still engages directed checking because a nested field contains
+    // a `Map`. This confirms `{ inner: { meta: { String: String }, .. }, .. }` key-widens the
+    // deeply-nested `meta` literal to a `LinMap`.
+    let output = run(r#"import { print } from "std/io"
+
+type Inner = { "meta": { String: String }, "name": String }
+type Outer = { "inner": Inner, "count": Int32 }
+
+val mk = (): Outer => { "inner": { "meta": { "k": "v" }, "name": "n" }, "count": 1 }
+val o = mk()
+val i: Inner = o["inner"]
+val m: { String: String } = i["meta"]
+print(m["k"])
+"#);
+    assert_eq!(output, vec!["v"]);
+}
+
+#[test]
 fn test_inline_object_rc_field_construction() {
     // Phase 2 of the static-record optimization: a no-spread object literal whose fields are
     // all scalar OR concrete heap (Str/Array/Object) is constructed via INLINE entry stores
