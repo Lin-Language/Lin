@@ -46,7 +46,21 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
         match ty {
-            Type::Str | Type::StrLit(_) => val,
+            // Uniform-ownership contract (ADR: interp-string transient-use leak fix): `ToString`
+            // ALWAYS returns an OWNED (+1) string. The numeric/bool/null/Array/Object arms below
+            // allocate a FRESH string (already +1); the Str arm would otherwise hand back the input
+            // BORROWED (+0), so RETAIN it here to match. This lets the IR treat the `ToString`
+            // result uniformly (`lower_intrinsic_call` already `register_owned`s it, and
+            // `lower_string_interp` releases each per-part temp after the concat). Without the
+            // retain, the IR-level release of the (assumed-owned) result would over-decrement a
+            // borrowed string → use-after-free. `lin_rc_retain` is immortal-safe (interned literals
+            // saturate), so retaining a string literal is a no-op.
+            Type::Str | Type::StrLit(_) => {
+                if val.is_pointer_value() {
+                    self.builder.call(self.rt.rc_retain, &[val.into()], "");
+                }
+                val
+            }
             // UInt64 must stringify UNSIGNED: a value >= 2^63 read as a signed i64 prints a
             // negative number. UInt8/16/32 zero-extend into an always-positive i64, so the
             // signed lin_int_to_string is correct for them.
@@ -169,6 +183,14 @@ impl<'ctx> Codegen<'ctx> {
                     let in_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
                     let str_val = self.compile_to_string_value(arg, &in_ty);
                     self.builder.call(self.rt.print, &[str_val.into()], "");
+                    // `compile_to_string_value`/`ToString` now returns an OWNED (+1) string for
+                    // EVERY input type (the Str arm retains; numeric/bool/json arms allocate fresh).
+                    // `lin_print` only BORROWS its argument, so this transient string is otherwise
+                    // never released — release it here. (Previously the numeric/json fresh-string
+                    // case leaked one string per `print(nonStr)`; the Str case was +0 and balanced.
+                    // With uniform ownership both are +1, so a single unconditional release is now
+                    // correct for all input types.)
+                    self.builder.call(self.rt.string_release, &[str_val.into()], "");
                 }
                 ptr_ty.const_null().into()
             }
