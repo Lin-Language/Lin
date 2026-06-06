@@ -707,6 +707,45 @@ print(toString(total))
     assert_eq!(output, vec!["252500"]);
 }
 
+// Regression (string-interpolation transient-use RC, leak #3): a string interpolation
+// `"${expr}"` used TRANSIENTLY — the RAPTOR query-phase hot path `m["${k}"] = v`, where the
+// interp string is an index-write KEY — leaked its +1 on every write (~19 B / write; unbounded
+// RSS in a scan). Two distinct leaks: (a) the per-part `ToString` result, which `lin_string_concat`
+// only BORROWS; (b) the final accumulator, which the container `set` RETAINS internally (so the
+// interp string's own +1 was never reclaimed). The fix makes `ToString` UNIFORMLY return an owned
+// (+1) string (the codegen Str arm now retains, matching the fresh numeric/json arms), then
+// `lower_string_interp` releases each per-part temp after the concat and `register_owned`s the
+// final result — so transient uses release at scope exit while moves (val binding / return /
+// stored VALUE) transfer the single +1 through the existing escape machinery. A wrong (over-eager)
+// free of a key the map still holds would be a use-after-free corrupting the map / crashing; ASan
+// (the stdlib+examples leg) guards the no-leak / no-double-free halves. This test guards that
+// building interp-keyed maps in a hot loop and reading them back stays CORRECT.
+#[test]
+fn test_string_interp_key_in_loop_released_and_correct() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+val build = (n: Int32): Int32 =>
+  var m: Json = {}
+  range(0, n).for(k => m["${k}"] = k * 2)
+  // Read back through an interp key used as a transient lookup operand too.
+  var sum = 0
+  range(0, n).for(k =>
+    val v = m["${k}"]
+    if v is Int32 then sum = sum + v else sum = sum
+  )
+  sum
+
+var total = 0
+range(0, 50).for(i => total = total + build(20))
+print(toString(total))
+"#);
+    // build(20) writes m["0"]..m["19"] = 0,2,..,38; sum = 2*(0+..+19) = 2*190 = 380.
+    // Summed 50 times = 19000.
+    assert_eq!(output, vec!["19000"]);
+}
+
 // Regression (escape safety): a `var n` cell captured by a closure that is RETURNED from its
 // creating function ESCAPES — the closure (and thus the cell) outlives the call. The lowerer
 // must NOT free this cell at scope exit; doing so would be a use-after-free when the returned
