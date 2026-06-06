@@ -2653,6 +2653,18 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             for shell in fresh_operand_boxes {
                 builder.emit(Instruction::FreeBoxShell { val: shell });
             }
+            // A UNION-typed Binary result is a FRESHLY boxed `TaggedVal*` (+1): the dynamic-arith
+            // path (`lin_tagged_arith`) and the bitwise-on-union path (`box_value` of the concrete
+            // result) both ALLOCATE a new box; the eq/cmp paths return a concrete `Bool` and never
+            // reach here. Register it owned so scope exit releases it (or the move/escape machinery
+            // transfers it when it's stored/returned). Without this, a dynamic `acc = acc + x` whose
+            // result stays `Json` orphaned the arith result box every iteration — its consumers
+            // (cell store, return) each `CloneBox` a fresh +1 and never consumed the original (the
+            // residual after the leak-#4b operand-box fix). Concrete-result arithmetic returns an
+            // unboxed scalar (not rc) and is unaffected.
+            if is_union_ty(result_type) {
+                builder.register_owned(dst, result_type.clone());
+            }
             dst
         }
 
@@ -3416,8 +3428,21 @@ fn lower_call(
                 builder.emit(Instruction::Release { val: *b, ty: bty.clone() });
             }
             builder.register_owned(dst, result_type.clone());
-            for lit in escape_lits {
-                builder.record_escape_alias(dst, lit);
+            // Transfer-on-escape is only sound when the call RESULT can actually carry the boxed
+            // fresh literal back to the caller — i.e. `dst` may BE (alias) that literal's box, so if
+            // `dst` escapes the literal must be kept alive. That can only happen when the result is a
+            // boxed (union/Json) value the callee could return its borrowed Json param as (an
+            // identity / pass-through). When the result is a scalar/`Null`/concrete value (e.g.
+            // `for`/`while`, which RETURN `Null` and never hand the iterable back), the boxed arg is
+            // a pure BORROW: its shell was already freed by `free_arg_box_shells` and its inner is
+            // owned by the arg's own scope-exit release. Recording an escape-alias there wrongly keeps
+            // the inner alive whenever `dst` is the function's return expression (e.g. the inner
+            // `range(..).for(..)` of a nested combinator inside a closure body) — the array leaks
+            // every iteration. So only alias when the result is a union.
+            if is_union_ty(result_type) {
+                for lit in escape_lits {
+                    builder.record_escape_alias(dst, lit);
+                }
             }
             return dst;
         }
@@ -3493,8 +3518,21 @@ fn lower_call(
                 builder.emit(Instruction::Release { val: *b, ty: bty.clone() });
             }
             builder.register_owned(dst, result_type.clone());
-            for lit in escape_lits {
-                builder.record_escape_alias(dst, lit);
+            // Transfer-on-escape is only sound when the call RESULT can actually carry the boxed
+            // fresh literal back to the caller — i.e. `dst` may BE (alias) that literal's box, so if
+            // `dst` escapes the literal must be kept alive. That can only happen when the result is a
+            // boxed (union/Json) value the callee could return its borrowed Json param as (an
+            // identity / pass-through). When the result is a scalar/`Null`/concrete value (e.g.
+            // `for`/`while`, which RETURN `Null` and never hand the iterable back), the boxed arg is
+            // a pure BORROW: its shell was already freed by `free_arg_box_shells` and its inner is
+            // owned by the arg's own scope-exit release. Recording an escape-alias there wrongly keeps
+            // the inner alive whenever `dst` is the function's return expression (e.g. the inner
+            // `range(..).for(..)` of a nested combinator inside a closure body) — the array leaks
+            // every iteration. So only alias when the result is a union.
+            if is_union_ty(result_type) {
+                for lit in escape_lits {
+                    builder.record_escape_alias(dst, lit);
+                }
             }
             return dst;
         }
@@ -3550,12 +3588,17 @@ fn lower_call(
     if is_rc_type(result_type) {
         builder.register_owned(dst, result_type.clone());
     }
-    // Record transfer-on-escape aliasing regardless of whether the result was registered owned:
-    // when the result escapes (is kept in a scope's keep-set), the fresh literal args it aliases
-    // must be kept too (their scope-exit release would otherwise free the payload the escaping
-    // result still aliases — the arg-box use-after-free).
-    for lit in escape_lits {
-        builder.record_escape_alias(dst, lit);
+    // Record transfer-on-escape aliasing only when the result can actually carry the boxed fresh
+    // literal back (a union/Json result — the only thing a borrowed Json param can be returned as).
+    // A scalar/Null/concrete result (e.g. an indirect `for`/`while` closure call returning `Null`)
+    // never hands the iterable box back, so the boxed arg is a pure borrow already balanced by the
+    // shell free + the arg's own scope-exit release; aliasing it would wrongly keep the inner alive
+    // when `dst` is a return expression (the nested-combinator-in-closure leak). See the named/import
+    // paths above for the full rationale.
+    if is_union_ty(result_type) {
+        for lit in escape_lits {
+            builder.record_escape_alias(dst, lit);
+        }
     }
     dst
 }
