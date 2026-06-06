@@ -161,11 +161,22 @@ pub fn run(args: &TestArgs) {
         emit_record(&JsonRecord::Meta { schema: NDJSON_SCHEMA });
     }
 
-    // Compile phase (sequential — cache writes are atomic but keep it simple).
-    let compiled: Vec<Result<PathBuf, String>> = test_files
-        .iter()
-        .map(|src| compile_test(src, coverage, json))
-        .collect();
+    // Compile phase (parallel). Each file compiles in its own LLVM context (`Context::create()`
+    // per `compile()` call) and links its own binary, so the compiles are independent. The one
+    // shared mutable resource is the `.lin-cache/` written for shared imports (e.g. std/string):
+    // its writes are write-to-temp-then-rename with a per-WRITER unique temp name (lin-compile's
+    // `unique_tmp_path`), so concurrent writers don't clobber each other and the final file is
+    // always a complete image. This is the bulk of `lin test`'s wall time — each compile is a full
+    // LLVM build + `cc` link — so parallelising it is the main win. Rendering of human-mode
+    // compile diagnostics still happens inside `compile_test` (to stderr); interleaving across
+    // threads is acceptable (each diagnostic block is emitted by a single `eprintln!` sequence and
+    // failures are also surfaced per-file in the run phase below).
+    let compiled: Vec<Result<PathBuf, String>> = pool.install(|| {
+        test_files
+            .par_iter()
+            .map(|src| compile_test(src, coverage, json))
+            .collect()
+    });
 
     let stdout_lock = Arc::new(Mutex::new(()));
 
