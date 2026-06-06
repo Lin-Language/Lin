@@ -170,7 +170,7 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    pub(crate) fn compile_ir_intrinsic(&mut self, intrinsic: &lir::Intrinsic, args: &[BasicValueEnum<'ctx>], arg_tys: &[Type], ret_ty: &Type) -> BasicValueEnum<'ctx> {
+    pub(crate) fn compile_ir_intrinsic(&mut self, intrinsic: &lir::Intrinsic, args: &[BasicValueEnum<'ctx>], arg_tys: &[Type], arg_reprs: &[lin_ir::repr::Repr], ret_ty: &Type) -> BasicValueEnum<'ctx> {
         use lir::Intrinsic;
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         match intrinsic {
@@ -269,7 +269,11 @@ impl<'ctx> Codegen<'ctx> {
                     // lin_array_push). Stage-3 tests dodged this by using array LITERALS only. Scalar
                     // sealed arrays ONLY (`sealed_array_elem` gates on all-scalar fields); heap-field
                     // record arrays fail safe to the boxed `Object[]` path.
-                    if Self::sealed_array_elem(&arr_ty).is_some() {
+                    // STAGE 3: the packed-sealed-array decision is read from the array operand's
+                    // repr (`func.repr`, threaded in as `arg_reprs[0]`) — the pass already applied
+                    // the `sealed_array_elem` all-scalar gate. Oracle-proven equal to the former
+                    // `sealed_array_elem(&arr_ty).is_some()` decision.
+                    if arg_reprs.first().and_then(|r| r.packed_sealed_array_layout()).is_some() {
                         let push_fn = self.get_or_declare_fn(
                             "lin_sealed_array_push_struct_retaining",
                             self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));

@@ -530,6 +530,11 @@ pub struct LinFunction {
     pub temp_count: u32,
     /// Intrinsic slot index → intrinsic name (inherited from TypedModule).
     pub intrinsic_slots: HashMap<usize, String>,
+    /// Per-temp physical representation table, indexed by `Temp.0` (`repr[t.0]` is temp `t`'s repr).
+    /// Empty until the representation-inference pass (`repr::run`) populates it; codegen reads it at
+    /// every packed-vs-boxed DECIDE / ASSUME site instead of re-deriving from the static `Type`.
+    /// See `docs/REPR_PASS_DESIGN.md` (Stage 3).
+    pub repr: Vec<crate::repr::Repr>,
 }
 
 impl LinFunction {
@@ -539,6 +544,17 @@ impl LinFunction {
 
     pub fn block(&self, id: BlockId) -> Option<&BasicBlock> {
         self.blocks.iter().find(|b| b.id == id)
+    }
+
+    /// The physical representation of temp `t` (Stage 3: codegen's single source of truth at every
+    /// packed-vs-boxed DECIDE / ASSUME site). Fails safe to `Boxed(Opaque)` if the table is empty
+    /// (pass not run / synthetic function) or `t` is out of range, exactly mirroring the analysis's
+    /// own fail-safe so an un-analyzed temp is never mistakenly treated as packed.
+    pub fn repr_of(&self, t: Temp) -> crate::repr::Repr {
+        self.repr
+            .get(t.0 as usize)
+            .cloned()
+            .unwrap_or_else(crate::repr::Repr::boxed_opaque)
     }
 }
 
