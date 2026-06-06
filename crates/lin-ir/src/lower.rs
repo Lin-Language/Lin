@@ -254,8 +254,11 @@ pub fn lower_import_module_with_imports(
             fn_names.insert(fid, format!("{}_{}", module_key, name));
             // Stdlib-internal combinator call (e.g. `map`'s body calls the sibling `for`):
             // record the callback arg index so cells captured by the closure passed to it stay
-            // freeable. Restricted to `std/array` so only its trusted combinators qualify.
-            if module_key == "std_array" {
+            // freeable. Restricted to `std/iter`, which owns the combinator exports (ADR-077);
+            // a Stream receiver bypasses this path entirely (the stream redirect returns before
+            // the callback arg is lowered, so a lazily-retained stream callback never gets the
+            // safe context — see the stream-combinator dispatch in `lower_call`).
+            if module_key == "std_iter" {
                 if let Some(idx) = safe_combinator_callback_index(name) {
                     ctx.safe_combinator_slots.insert(*slot, idx);
                 }
@@ -2111,8 +2114,11 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                     // Imported stdlib combinator (map/for/filter/…): a closure passed as its
                     // callback argument is consumed synchronously and never escapes — record the
                     // callback arg index so captured cells stay freeable. Restricted to the
-                    // `std/array` module so a same-named export from elsewhere isn't trusted.
-                    if module_key == "std_array" {
+                    // `std/iter` module, which owns the combinator exports (ADR-077), so a
+                    // same-named export from elsewhere isn't trusted. A Stream receiver bypasses
+                    // this path (the stream redirect in `lower_call` returns before the callback
+                    // arg is lowered), so a lazily-retained stream callback never gets the context.
+                    if module_key == "std_iter" {
                         if let Some(idx) = safe_combinator_callback_index(&b.name) {
                             ctx.safe_combinator_slots.insert(b.slot, idx);
                         }
