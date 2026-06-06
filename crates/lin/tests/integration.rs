@@ -878,6 +878,60 @@ print(toString(k))
     assert_eq!(output, vec!["15000"]);
 }
 
+// Regression (nested-combinator-in-closure iterable leak): a FRESH combinator iterable
+// (`range`/`map`/…) consumed by `.for`/`.while` INSIDE A CLOSURE BODY — e.g. the inner
+// `range(0,50).for(...)` of `range(0,30).for(round => range(0,50).for(...))` — was never
+// released. The fresh inner array was registered owned in the closure body scope, but the
+// `for` result's transfer-on-escape alias (recorded for ANY boxed fresh-alloc arg) wrongly
+// added it to the body-scope keep-set whenever the inner `for` was the closure's return
+// expression — so the body-scope pop SKIPPED its release and the array leaked every outer
+// iteration (~456 KB / 50 scans in the RAPTOR repro). Fix: only record the transfer-on-escape
+// alias when the call RESULT is a union/Json (the only thing a borrowed Json param can be
+// returned as) — `for`/`while` return `Null` and never hand the iterable back, so its box is a
+// pure borrow already balanced by the shell free + arg-scope release. ASan is the leak guard
+// (this asserts the nested loop still computes correctly — no over-release / double-free).
+#[test]
+fn test_nested_combinator_iterable_in_closure_no_leak() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { for, while, map, range } from "std/iter"
+
+val scan = (): Int32 =>
+  var acc = 0
+  range(0, 30).for(round =>
+    range(0, 50).for(stop => acc = acc + stop)
+  )
+  acc
+
+// fresh `map` inner iterable
+val scanMap = (): Int32 =>
+  var acc = 0
+  range(0, 30).for(round =>
+    range(0, 50).map(x => x + 1).for(stop => acc = acc + stop)
+  )
+  acc
+
+// `.while` inner over a fresh range
+val scanWhile = (): Int32 =>
+  var acc = 0
+  range(0, 30).for(round =>
+    range(0, 50).while(stop =>
+      acc = acc + stop
+      true
+    )
+  )
+  acc
+
+print(toString(scan()))
+print(toString(scanMap()))
+print(toString(scanWhile()))
+"#);
+    // scan: 30 * sum(0..49) = 30 * 1225 = 36750
+    // scanMap: 30 * sum(1..50) = 30 * 1275 = 38250
+    // scanWhile: same as scan = 36750
+    assert_eq!(output, vec!["36750", "38250", "36750"]);
+}
+
 // Regression (call-arg-box leak): a concrete Object passed to a Json-typed param (`keys`)
 // repeatedly under churn. Each call boxes the object into a fresh shell; the shell free must
 // not touch the object's inner payload (which the object's own scope-exit release owns).
