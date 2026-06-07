@@ -14,6 +14,10 @@ pub struct BuildArgs {
     /// Disable optimisation passes
     #[arg(long)]
     pub no_opt: bool,
+    /// Emit DWARF debug info for source-level debugging (lldb/CodeLLDB). Implies -O0 and keeps the
+    /// object file's debug sections; sets `.lin` line-table breakpoints/stepping.
+    #[arg(long, short = 'g')]
+    pub debug: bool,
     /// Show build timing
     #[arg(long)]
     pub verbose: bool,
@@ -38,8 +42,10 @@ pub fn run(args: &BuildArgs) {
         source_path: args.file.clone(),
         output_path: output.clone(),
         emit_ir: args.emit_ir || std::env::var("LIN_EMIT_IR").is_ok(),
-        optimize: !(args.no_opt || std::env::var("LIN_NO_OPT").is_ok()),
+        // `--debug` forces O0 so the DWARF line mapping holds.
+        optimize: !(args.no_opt || args.debug || std::env::var("LIN_NO_OPT").is_ok()),
         coverage: false,
+        debug: args.debug,
     };
 
     let t = Instant::now();

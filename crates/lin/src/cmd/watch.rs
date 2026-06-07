@@ -122,6 +122,7 @@ fn execute_command(args: &WatchArgs) {
                 output: None,
                 emit_ir: false,
                 no_opt: false,
+                debug: false,
                 verbose: false,
             });
         }
@@ -130,6 +131,7 @@ fn execute_command(args: &WatchArgs) {
                 file: args.file.clone(),
                 emit_ir: false,
                 no_opt: false,
+                debug: false,
                 program_args: vec![],
             });
         }

@@ -280,6 +280,7 @@ fn compile_test(src: &PathBuf, coverage: bool, json: bool) -> Result<PathBuf, St
         emit_ir: false,
         optimize: false,
         coverage,
+        debug: false,
     };
 
     match compile(&opts) {
