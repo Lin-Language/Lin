@@ -2170,7 +2170,8 @@ impl<'ctx> Codegen<'ctx> {
                         for (i, (_t, ty)) in func.params.iter().enumerate() {
                             if let (Some(old), Some(Some(owns))) = (old_vals[i], tco_owns.get(i)) {
                                 if old.is_pointer_value() {
-                                    self.emit_tco_release_old(llvm_fn, *owns, old.into_pointer_value(), &new_ptrs, ty);
+                                    let repr = func.repr_of(*_t).clone();
+                                    self.emit_tco_release_old(llvm_fn, *owns, old.into_pointer_value(), &new_ptrs, ty, &repr);
                                 }
                             }
                         }
