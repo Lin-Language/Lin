@@ -43,9 +43,33 @@ Open the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`) and search for "Lin":
 
 A **Get Started with Lin** walkthrough (Help → Welcome) guides you through installing `lin`, writing a first program, and running it.
 
+## Debugging
+
+Lin supports source-level debugging of compiled programs (breakpoints and stepping in your `.lin` files) via DWARF line tables emitted by `lin build --debug`.
+
+Debugging delegates to **[CodeLLDB](https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb)** (`vadimcn.vscode-lldb`), which is declared as an extension dependency and installed automatically alongside this extension.
+
+To debug: open a `.lin` file, set a breakpoint in the gutter, and press **F5**. With no `launch.json` the extension auto-supplies a "Debug Lin file" configuration; it builds the active file with `lin build --debug` and launches it under CodeLLDB. To customise, add a configuration of `"type": "lin"` to `launch.json`:
+
+```json
+{
+  "type": "lin",
+  "request": "launch",
+  "name": "Debug Lin file",
+  "source": "${file}",
+  "program": "${fileDirname}/${fileBasenameNoExtension}",
+  "cwd": "${workspaceFolder}",
+  "args": []
+}
+```
+
+`source` is the `.lin` file built with `--debug`; `program` is the resulting binary that is debugged.
+
 ## Requirements
 
 A C linker (`cc`) must be on your `$PATH` to link compiled programs — on macOS this comes with the Xcode Command Line Tools; on Linux install `gcc` or `clang`. No LLVM installation is required; it is bundled inside `lin`.
+
+For debugging, the **CodeLLDB** extension (`vadimcn.vscode-lldb`) is required; it is installed automatically as a dependency of this extension.
 
 ## Learn more
 
