@@ -624,6 +624,16 @@ guarantee that lets the compiler lay sealed records out as unboxed structs with
 constant-offset field access (see ADR-057); it does **not** change the structural
 compatibility above.
 
+Whether a given occurrence is *physically* in the packed (unboxed) form or the
+boxed (`LinObject`/`TaggedVal`) form is a flow-sensitive fact decided by the
+representation-inference pass (ADR-062), not by the type alone — the same `T` is
+packed when freshly constructed and boxed-wrapping-the-packed-buffer when read back
+from a map/object slot. This is transparent to programs: it affects only speed.
+Currently sealed records with **all-scalar** fields (and arrays of them, `T[]`) are
+laid out packed/contiguous; records with heap fields (String/Array/nested-record)
+remain boxed pending a language feature that forbids field omission. Either way the
+observable semantics in this section are identical.
+
 The two are reconciled by a **non-mutating projection** at the boundary: when a
 wider value (one with extra fields, or a `Json` value) flows into a slot of named
 type `T` — a parameter, a `val`/`var` with a `T` annotation, a return typed `T`,
