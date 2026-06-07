@@ -256,6 +256,10 @@ unsafe fn release_tagged_payload(tv: &TaggedVal) {
         TAG_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
         TAG_OBJECT => lin_object_release(payload as *mut LinObject),
         TAG_MAP => crate::map::lin_map_release(payload as *mut crate::map::LinMap),
+        // KEEP-PACKED sum node in a record/object FIELD slot (keep-packed-through-record-fields):
+        // a `*SumNode` wrapped by-pointer. Release it via the SumNode self-release, NOT
+        // lin_object_release. This is hit when the OWNING record drops and walks its field payloads.
+        TAG_SUMNODE => crate::sumnode::lin_sumnode_release_self(payload as *mut u8),
         TAG_FUNCTION => crate::memory::lin_closure_release(payload as *mut u8),
         TAG_SHARED => crate::shared::lin_shared_release_box(payload as *const u8),
         TAG_STREAM => crate::stream::lin_stream_release_box(payload as *const u8),
@@ -287,6 +291,13 @@ unsafe fn retain_tagged_payload(tv: &TaggedVal) {
         TAG_MAP => {
             let m = payload as *mut crate::map::LinMap;
             if !m.is_null() && (*m).refcount < crate::string::IMMORTAL_RC { (*m).refcount += 1; }
+        }
+        TAG_SUMNODE => {
+            // KEEP-PACKED sum node: offset-0 u32 refcount, immortal-guarded — same shape as a
+            // sealed record header, so the generic rc bump applies. The matching release is the
+            // TAG_SUMNODE arm of release_tagged_payload.
+            let s = payload as *mut u32;
+            if !s.is_null() && *s < crate::string::IMMORTAL_RC { *s += 1; }
         }
         TAG_FUNCTION => {
             // Closure refcount lives at offset 0 (u32). Mirror of the TAG_FUNCTION arm in
@@ -858,6 +869,18 @@ unsafe fn tagged_val_eq(a: *const crate::tagged::TaggedVal, b: *const crate::tag
         let aa = ap as *const crate::array::LinArray;
         let ba = bp as *const crate::array::LinArray;
         return lin_array_eq_deep(aa, ba);
+    }
+    if at == crate::tagged::TAG_SUMNODE {
+        // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: both sides are kept-packed `*SumNode`s (a
+        // record field comparison). Materialize each to a real LinObject and compare structurally
+        // (order-independent), releasing the transient materializations. (`at == bt` holds here.)
+        let ao = crate::sumnode::lin_sumnode_materialize(ap as *mut u8);
+        let bo = crate::sumnode::lin_sumnode_materialize(bp as *mut u8);
+        let eq = !ao.is_null() && !bo.is_null()
+            && lin_object_eq(ao as *const LinObject, bo as *const LinObject) != 0;
+        if !ao.is_null() { lin_object_release(ao as *mut LinObject); }
+        if !bo.is_null() { lin_object_release(bo as *mut LinObject); }
+        return eq;
     }
     // For other types (closures, iterators): pointer equality.
     ap == bp

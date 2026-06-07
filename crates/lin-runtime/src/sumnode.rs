@@ -48,6 +48,38 @@ pub const SUMNODE_TAG_OFFSET: usize = 16;
 /// A recursive `*SumNode` child field → `lin_sumnode_release_self` on drop. (Stage 2.)
 pub const KIND_SUMNODE: u32 = 4;
 
+/// Byte offset of the heap-field drop table within a SumDesc. The descriptor begins with an 8-byte
+/// MATERIALIZER fn-ptr (`*SumNode -> *LinObject`, the keep-packed-through-record-fields boundary
+/// materializer); the `[u32 variant_count | VariantDesc*]` drop table follows. Kept in lockstep with
+/// `Codegen::sumnode_descriptor` (which emits `{ ptr matfn, [N x i32] table }`).
+pub const SUMDESC_TABLE_OFFSET: usize = 8;
+
+/// The materializer function pointer signature: `*SumNode -> *LinObject` (the per-type
+/// `lin_summat_<key>` codegen emits). Used to materialize a kept-packed `TAG_SUMNODE` slot that
+/// escaped a record field into the type-erased dynamic domain (toString/eq/json).
+type SumMatFn = unsafe extern "C" fn(*mut u8) -> *mut u8;
+
+/// Materialize an unboxed `*SumNode` to a real boxed `LinObject` (the universal Json representation),
+/// via the per-type materializer fn-ptr stored at the head of the node's SumDesc. Returns a +1
+/// `LinObject*` (NOT a TaggedVal box — the caller boxes it as TAG_OBJECT). Null/desc-less safe
+/// (returns null — a scalar-only sum type still carries a descriptor under this scheme, so the
+/// desc is non-null for every keep-packed-eligible node). Used by the runtime dynamic-boundary
+/// walkers (`lin_tagged_to_string` / `push_json_value` / `lin_tagged_eq`) for a TAG_SUMNODE payload.
+#[no_mangle]
+pub unsafe extern "C" fn lin_sumnode_materialize(node: *mut u8) -> *mut u8 {
+    if node.is_null() {
+        return std::ptr::null_mut();
+    }
+    let desc = desc_of(node);
+    if desc.is_null() {
+        return std::ptr::null_mut();
+    }
+    // The materializer fn-ptr is the first 8 bytes of the descriptor.
+    let matfn_slot = desc as *const SumMatFn;
+    let matfn = *matfn_slot;
+    matfn(node)
+}
+
 /// Read the descriptor pointer from a sum node's header (offset 8). Null = no heap fields anywhere.
 #[inline]
 unsafe fn desc_of(ptr: *const u8) -> *const u8 {
@@ -115,15 +147,19 @@ unsafe fn release_heap_fields(ptr: *mut u8) {
     if desc.is_null() {
         return;
     }
-    let variant_count = *(desc as *const u32);
+    // SumDesc layout (keep-packed-through-record-fields extension): an 8-byte materializer fn-ptr
+    // PRECEDES the heap-field drop table, so `variant_count` and the VariantDesc blocks start at byte
+    // offset 8 (`SUMDESC_TABLE_OFFSET`). The fn-ptr is read separately by `lin_sumnode_materialize`.
+    let table = desc.add(SUMDESC_TABLE_OFFSET);
+    let variant_count = *(table as *const u32);
     let tag = tag_of(ptr);
     if tag >= variant_count {
         return; // defensively: an out-of-range tag indexes nothing.
     }
-    // Locate this variant's VariantDesc. The SumDesc is a u32 count followed by `variant_count`
+    // Locate this variant's VariantDesc. The table is a u32 count followed by `variant_count`
     // VariantDescs; each VariantDesc is a variable-length `[u32 heap_count | {u32 off, u32 kind}*]`.
     // Walk forward to the target variant (variant blocks are not fixed-size, so we must skip).
-    let mut cur = desc.add(4);
+    let mut cur = table.add(4);
     for _ in 0..tag {
         let hc = *(cur as *const u32) as usize;
         cur = cur.add(4 + hc * 8);
@@ -231,11 +267,19 @@ mod tests {
         // unboxed-sumtype Stage 2: a parent node holds a recursive child at a KIND_SUMNODE slot. The
         // parent's drop walk must recurse into the child (releasing it) before freeing the parent.
         // Build a SumDesc with ONE variant (tag 0) whose single heap field is a KIND_SUMNODE child at
-        // payload offset 24 (the first payload slot). Lay it out exactly as codegen emits:
-        //   SumDesc = [ u32 variant_count=1 | VariantDesc ]
+        // payload offset 24 (the first payload slot). Lay it out exactly as codegen emits (keep-packed
+        // -through-record-fields extension): an 8-byte MATERIALIZER fn-ptr PRECEDES the drop table, so
+        // the table (variant_count + VariantDesc) starts at `SUMDESC_TABLE_OFFSET` (8). This test
+        // exercises only the drop walk, so the fn-ptr is null (never invoked here).
+        //   SumDesc = [ u64 matfn_ptr=0 | u32 variant_count=1 | VariantDesc ]
         //   VariantDesc = [ u32 heap_count=1 | { u32 offset=24, u32 kind=KIND_SUMNODE } ]
-        let desc: [u32; 4] = [1, 1, 24, KIND_SUMNODE];
-        let desc_ptr = desc.as_ptr() as *const u8;
+        #[repr(C)]
+        struct TestDesc {
+            matfn: *const u8,
+            table: [u32; 4],
+        }
+        let desc = TestDesc { matfn: std::ptr::null(), table: [1, 1, 24, KIND_SUMNODE] };
+        let desc_ptr = &desc as *const TestDesc as *const u8;
         let size = SUMNODE_HEADER + 8; // header + one pointer slot
         unsafe {
             let child = lin_sumnode_alloc(size, std::ptr::null()); // leaf: NULL desc, scalar-only

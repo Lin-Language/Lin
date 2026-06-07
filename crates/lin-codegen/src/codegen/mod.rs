@@ -1586,11 +1586,50 @@ impl<'ctx> Codegen<'ctx> {
                                     if Self::is_sum_type(&val_ty)
                                         || Self::sum_member_of_nullable_union(&val_ty).is_some()
                                     {
-                                        let boxed = self.box_value(val, &val_ty);
+                                        // KEEP-PACKED-THROUGH-RECORD-FIELDS store: a sum-typed field
+                                        // value is physically a `*SumNode`. Instead of materializing it
+                                        // to a boxed LinObject (`lin_summat` + `lin_box_object` — the
+                                        // O(n)-tree round-trip the interp cursor `{node,pos}` paid every
+                                        // parse step), wrap the still-packed node by-pointer in a
+                                        // `TaggedVal(TAG_SUMNODE)` (BoxKeepSumnode, O(1), zero copy). The
+                                        // DISTINCT tag is the soundness mechanism: the slot's release
+                                        // routes to `lin_sumnode_release_self`, retain to the offset-0 RC
+                                        // bump, and toString/eq/json/transfer MATERIALIZE on demand (the
+                                        // runtime walkers' TAG_SUMNODE arms). The read-back
+                                        // (`compile_ir_field_get_sumnode_readback`) tag-dispatches, so a
+                                        // slot stored EITHER keep-packed OR materialized reads correctly
+                                        // — no static store/read asymmetry. Ownership matches the
+                                        // materialize path: the IR `transfer_into_container` supplies the
+                                        // slot's owning +1; `object_set*` retains the inner; the shell
+                                        // release here undoes that duplicate, net-zero on the node.
+                                        // A null value (the `sum | Null` null case) tags as TAG_NULL.
+                                        let keep_packed = val.is_pointer_value();
+                                        let stored = if keep_packed {
+                                            self.compile_ir_box_keep_sumnode(val)
+                                        } else {
+                                            self.box_value(val, &val_ty)
+                                        };
                                         let set_fn = if use_fresh { self.rt.object_set_fresh } else { self.rt.object_set };
-                                        self.builder.call(set_fn, &[obj_ptr.into(), key_str.into(), boxed.into()], "");
-                                        if boxed.is_pointer_value() {
-                                            self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                                        self.builder.call(set_fn, &[obj_ptr.into(), key_str.into(), stored.into()], "");
+                                        if stored.is_pointer_value() {
+                                            if keep_packed {
+                                                // KEEP-PACKED: `object_set*` already retained the inner
+                                                // `*SumNode` into the slot (its OWN +1, independent of
+                                                // the source local). The source local keeps its own
+                                                // reference and is released at scope exit. So free ONLY
+                                                // the box SHELL here (lin_tagged_free_box) — a full
+                                                // `tagged_release` would `lin_sumnode_release_self` the
+                                                // shared node, dropping the slot's reference and freeing
+                                                // a node the cursor still points to (UAF). Mirrors the
+                                                // materializer's `free_box_shell` after a `set_fresh`.
+                                                let free_shell = self.get_or_declare_fn(
+                                                    "lin_tagged_free_box",
+                                                    self.context.void_type().fn_type(&[ptr_ty.into()], false),
+                                                );
+                                                self.builder.call(free_shell, &[stored.into()], "");
+                                            } else {
+                                                self.builder.call(self.rt.tagged_release, &[stored.into()], "");
+                                            }
                                         }
                                         continue;
                                     }

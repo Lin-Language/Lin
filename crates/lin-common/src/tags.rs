@@ -35,3 +35,11 @@ pub const TAG_SHARED: u8 = 18;
 pub const TAG_STREAM: u8 = 19;
 /// Typed index-signature map `{ String: T }` — the hashed `LinMap` container (ADR-055).
 pub const TAG_MAP: u8 = 20;
+/// KEEP-PACKED unboxed sum node (`*SumNode`, `crate::sumnode`) wrapped by-pointer in a 16-byte
+/// `TaggedVal` so an unboxed sum value can live in a BOXED record/object FIELD slot WITHOUT
+/// materializing to a `LinObject` (the keep-packed-through-record-fields optimization, ADR-062
+/// Stage 4 follow-up). A SumNode has the SEALED header shape (`[rc|size|desc|tag|pad|payload]`), NOT
+/// the `LinObject` shape, so the slot MUST carry this distinct tag — dispatching its release/retain
+/// to `lin_sumnode_*` and its display/equality/serialization/transfer to a MATERIALIZE-on-demand
+/// boundary. A `TAG_OBJECT` here would type-confuse `lin_object_release` (offset-4 size read as len).
+pub const TAG_SUMNODE: u8 = 21;
