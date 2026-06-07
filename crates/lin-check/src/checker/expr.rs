@@ -140,7 +140,31 @@ impl Checker {
                 let typed_else = self.check_branch_against(else_branch, expected);
                 self.env.pop_scope();
                 let typed_else = typed_else?;
-                let result_type = unify_types(&[typed_then.ty(), typed_else.ty()]);
+                // Both branches were CHECKED compatible against `expected` (the declared
+                // return / context type). Prefer `expected` itself as the result type when it
+                // is a structured (object / union / named) target rather than re-`unify`ing the
+                // branches' independently-inferred types. The re-unify loses information the
+                // declared type carries: for a recursive sum union (`Num | BinOp` where
+                // `BinOp.left/right : Expr`), each branch's inferred type EXPANDS the recursive
+                // child to its structural `Object {…}` shape, so `unify_types` produces a union
+                // whose children are `Object`, not `Named("Expr")`. lin-ir's
+                // `sum_recursive_self_name` then fails to see the recursive child and the whole
+                // value falls back to the BOXED representation — and an `if`/`else` tail-return
+                // sum literal mis-tags its children (the tail-return pushdown bug). Using
+                // `expected` keeps the `Named` recursive-child markers so the construction stays
+                // unboxed and consistent with the direct-literal-return path. Sound because the
+                // branches already passed the `types_compatible(&ty, expected)` gate in
+                // `check_branch_against`. SCOPED to a SUM type (`sum_type_eligible`): only there
+                // does the re-unify actually lose load-bearing structure (the `Named` recursive
+                // children). For plain objects / sealed records the unify path is equivalent and
+                // is what the sealed-stack RC-suppression analysis is tuned for — overriding it
+                // there regressed that optimisation (it keys off the unified result type), so we
+                // leave it untouched.
+                let result_type = if is_discriminated_sum_union(expected) {
+                    expected.clone()
+                } else {
+                    unify_types(&[typed_then.ty(), typed_else.ty()])
+                };
                 return Ok(TypedExpr::If {
                     cond: Box::new(typed_cond),
                     then_br: Box::new(typed_then),
@@ -966,7 +990,17 @@ impl Checker {
             arm_types.push(typed_arm.body.ty());
             typed_arms.push(typed_arm);
         }
-        let result_type = if arm_types.is_empty() { Type::Never } else { unify_types(&arm_types) };
+        // Prefer the (structured) `expected` as the result type — every arm was CHECKED
+        // compatible against it (see the `if` counterpart for the full rationale: re-`unify`ing
+        // the arm types expands a recursive sum union's `Named` children to structural `Object`,
+        // which defeats lin-ir's `sum_recursive_self_name` and forces the BOXED representation).
+        let result_type = if is_discriminated_sum_union(expected) && !arm_types.is_empty() {
+            expected.clone()
+        } else if arm_types.is_empty() {
+            Type::Never
+        } else {
+            unify_types(&arm_types)
+        };
 
         let exhaustiveness_diags =
             crate::exhaustiveness::check_exhaustiveness(&scrutinee_ty, &typed_arms, span);
@@ -1042,6 +1076,10 @@ impl Checker {
         let mut typed_fields = Vec::new();
         let mut spreads = Vec::new();
         let mut obj_type = IndexMap::new();
+        // An object literal's field values are not in tail position (see `check_object_fields`):
+        // clear the flag so a self-recursive call in a field isn't mis-marked a tail call.
+        let saved_tail = self.in_tail_position;
+        self.in_tail_position = false;
         for field in fields {
             match field {
                 ObjectField::Pair(key_expr, val_expr) => {
@@ -1071,6 +1109,7 @@ impl Checker {
                 }
             }
         }
+        self.in_tail_position = saved_tail;
         // Object literal → anonymous structural type → UNSEALED.
         Ok(TypedExpr::MakeObject { fields: typed_fields, spreads, ty: Type::object(obj_type), span })
     }
@@ -1214,6 +1253,15 @@ impl Checker {
     ) -> Result<TypedExpr, Diagnostic> {
         let mut typed_fields = Vec::new();
         let mut obj_type = IndexMap::new();
+        // An object LITERAL is never itself a tail call, and none of its field values are in
+        // tail position — even when the literal is the tail expression of a function (an
+        // `if`/`match` branch value). A self-recursive call in a field (`{ left: chain(n-1) }`,
+        // the canonical recursive-constructor shape) would otherwise inherit the enclosing tail
+        // flag and be mis-marked a tail call → codegen's TCO transform would loop it back,
+        // DISCARDING the surrounding node construction (the recursive child never materializes).
+        // Clear the flag for the field values and restore it after.
+        let saved_tail = self.in_tail_position;
+        self.in_tail_position = false;
         for field in fields {
             if let ObjectField::Pair(key_expr, val_expr) = field {
                 if let Expr::StringLit(key, _) = key_expr {
@@ -1226,6 +1274,7 @@ impl Checker {
                 }
             }
         }
+        self.in_tail_position = saved_tail;
         // The refined literal's own type stays UNSEALED (the seal lives on the expected named type;
         // Stage 1 inserts the projection at the boundary). Inert in Stage 0.5.
         Ok(TypedExpr::MakeObject { fields: typed_fields, spreads: Vec::new(), ty: Type::object(obj_type), span })
@@ -1395,6 +1444,25 @@ pub(crate) fn expected_field_needs_directing(ty: &Type) -> bool {
         Type::Object { fields, .. } => fields.values().any(expected_field_needs_directing),
         _ => false,
     }
+}
+
+/// True when `ty` is a DISCRIMINATED sum union: a `Union` of ≥2 record variants where every
+/// variant carries a `StrLit` discriminant field. This is the (checker-side, conservative)
+/// recognizer for the type shape lin-ir packs as an unboxed `SumNode` — used to decide when an
+/// `if`/`match` checked against this type should adopt it AS the result type (preserving any
+/// `Named` recursive-child markers the structural re-unify would erase, which lin-ir needs to
+/// keep the construction unboxed). Deliberately narrow: a plain object / sealed record does NOT
+/// match, so the existing structural-unify result type — and the optimisations keyed off it —
+/// stay unchanged for those.
+pub(crate) fn is_discriminated_sum_union(ty: &Type) -> bool {
+    let Type::Union(variants) = ty else { return false };
+    if variants.len() < 2 {
+        return false;
+    }
+    variants.iter().all(|v| match v {
+        Type::Object { fields, .. } => fields.values().any(|t| matches!(t, Type::StrLit(_))),
+        _ => false,
+    })
 }
 
 pub(crate) fn type_mentions_strlit(ty: &Type) -> bool {
