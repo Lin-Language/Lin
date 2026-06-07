@@ -2521,6 +2521,57 @@ print(toString(scale(5, 3)))
 }
 
 #[test]
+fn test_imported_generic_object_message_across_worker() {
+    // Regression: an IMPORTED generic function that builds an object literal with a scalar `T`
+    // field and sends it to a worker (`message`/`request`, which deep-copy the value for thread
+    // transfer) crashed — `lin_worker_message`'s argument was passed as the RAW `LinObject*` instead
+    // of a boxed `TaggedVal*`, because the codegen boxed on `is_pointer_value()` (true for a heap
+    // object) rather than the static type. The worker thread then read the object's first bytes as a
+    // TaggedVal tag → misaligned-pointer deref. The same code defined INLINE worked (it monomorphized
+    // in-module); only the cross-module instantiation tripped it. Fix: box `message`/`request`
+    // (and `shared`/`set`) arguments on the static type — a concrete heap value is boxed even though
+    // it is pointer-shaped; only an already-boxed `is_union_type` value passes through.
+    let dir = std::env::temp_dir().join(format!("lin_genmsg_xmod_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("emit.lin"),
+        "import { worker, message, request } from \"std/async\"\n\
+         type Msg<T> = { \"kind\": String, \"value\": T }\n\
+         export val mkSink = <T, S>(reduce: (T, S) => S, initial: S, sample: T): Json =>\n\
+        \x20 var state = initial\n\
+        \x20 worker(\n\
+        \x20   (m: Msg<T>): S =>\n\
+        \x20     match m[\"kind\"]\n\
+        \x20       is \"drain\" => state\n\
+        \x20       else =>\n\
+        \x20         state = reduce(m[\"value\"], state)\n\
+        \x20         state,\n\
+        \x20   (): Null => null\n\
+        \x20 )\n\
+         export val send = <T>(e: Json, value: T): Null =>\n\
+        \x20 message(e, { \"kind\": \"event\", \"value\": value })\n\
+         export val drainSink = <T, S>(e: Json, sample: T): S | Error =>\n\
+        \x20 request(e, { \"kind\": \"drain\", \"value\": sample })\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ close }} from "std/async"
+import {{ mkSink, send, drainSink }} from "{}/emit"
+val main = (): Null =>
+  val w = mkSink((x: Int32, sum: Int32): Int32 => sum + x, 0, 0)
+  send(w, 10)
+  send(w, 5)
+  val total: Int32 | Error = drainSink(w, 0)
+  close(w)
+  match total
+    is Error => print("err")
+    else => print("total=${{toString(total)}}")
+main()
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["total=15"]);
+}
+
+#[test]
 fn test_imported_fn_uses_module_level_val() {
     // Regression: a top-level non-function `val` referenced inside an EXPORTED function
     // mis-lowered in the import path (lower_import_module never registered the val, so the
