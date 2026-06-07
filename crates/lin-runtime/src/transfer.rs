@@ -196,6 +196,49 @@ pub const CAP_MOVE: u8 = 6;
 /// (reads the size from offset 4). Mirrors `ir::CaptureRelease::Sealed`.
 pub const CAP_SEALED: u8 = 7;
 
+/// Deep-copy a captured closure value (`CAP_CLOSURE`) for cross-thread transfer. A closure is a
+/// 48-byte struct (`lin_closure_release` documents the layout): rc @0, fn_ptr @8, env_ptr @16,
+/// env_size @24, default_descriptor @32, capture_descriptor @40. We allocate a fresh struct with
+/// refcount 1 (owned solely by the worker's env copy), copy the two code/descriptor pointers
+/// verbatim (they are static read-only globals / LLVM function pointers), and RECURSIVELY deep-copy
+/// the captured closure's own env via `transfer_clone_env` using ITS capture descriptor (offset 40)
+/// — so a function value that itself captures heap data still produces a fully private graph on the
+/// worker. A null source yields a null copy.
+///
+/// SAFETY: the caller must have established (via `closure_is_transferable`) that this closure's env
+/// contains no non-transferable capture; otherwise the recursive clone would alias an
+/// un-copyable resource.
+unsafe fn clone_closure(src: *const u8) -> *mut u8 {
+    if src.is_null() {
+        return std::ptr::null_mut();
+    }
+    const CLOSURE_SIZE: usize = 48;
+    let fresh = crate::memory::lin_alloc(CLOSURE_SIZE);
+    // Copy the whole struct verbatim first (gets fn_ptr, env_size, both descriptors right), then
+    // fix up the refcount and env pointer.
+    std::ptr::copy_nonoverlapping(src, fresh, CLOSURE_SIZE);
+    *(fresh as *mut u32) = 1; // sole owner = the worker's env copy
+    let src_env = *(src.add(16) as *const *const u8);
+    let inner_desc = *(src.add(40) as *const *const u8);
+    let env_copy = transfer_clone_env(src_env, inner_desc);
+    *(fresh.add(16) as *mut *mut u8) = env_copy;
+    fresh
+}
+
+/// True if a captured closure value can be safely deep-copied for cross-thread transfer: its env
+/// (offset 16) is either null, or every capture in it is itself transferable (recursing into nested
+/// `CAP_CLOSURE` captures). A captured `var`-cell (lowered as `CAP_NONE`, a borrowed pointer) is
+/// already banned from async thunks by the checker (ADR-022), so the recursion only ever sees
+/// owning, deep-copyable captures.
+unsafe fn closure_is_transferable(closure: *const u8) -> bool {
+    if closure.is_null() {
+        return true;
+    }
+    let env_ptr = *(closure.add(16) as *const *const u8);
+    let desc = *(closure.add(40) as *const *const u8);
+    env_is_transferable(env_ptr, desc)
+}
+
 /// Deep-copy a closure env allocation given its capture descriptor `desc` (a static read-only
 /// `{u32 count, u8 kinds[]}` global from the closure's offset-40 slot). `env_ptr` layout:
 /// `{ u64 size @0, cap0 @8, cap1 @16, ... }`. Returns a fresh env whose heap captures are
@@ -214,7 +257,12 @@ pub unsafe fn transfer_clone_env(env_ptr: *const u8, desc: *const u8) -> *mut u8
         let off = 8 + i * 8;
         let src_word = *(env_ptr.add(off) as *const u64);
         let new_word = match *kinds.add(i) {
-            CAP_NONE | CAP_CLOSURE => src_word,
+            CAP_NONE => src_word,
+            // A captured FUNCTION value: recursively deep-copy the whole closure (its own env
+            // included) so the worker owns a private graph. (Previously copied verbatim, which
+            // would have shared the parent's closure across threads — instead the spawn path ran
+            // such thunks inline, defeating `timeout`.)
+            CAP_CLOSURE => clone_closure(src_word as *const u8) as u64,
             CAP_STR => clone_string(src_word as *const LinString) as u64,
             CAP_ARRAY => clone_array(src_word as *const LinArray) as u64,
             CAP_OBJECT => clone_object(src_word as *const LinObject) as u64,
@@ -265,8 +313,9 @@ pub unsafe fn release_env_copy(env_ptr: *mut u8, desc: *const u8, env_size: u64)
 
 /// True if a closure with env `env_ptr` and capture descriptor `desc` can be safely deep-copied
 /// for transfer: a null env (no captures) is trivially transferable; otherwise `desc` must be
-/// present and contain no `CAP_CLOSURE` slot (a captured closure can't be deep-copied across a
-/// thread boundary). When false, the spawn path must run the thunk inline.
+/// present and every capture must be deep-copyable. A captured FUNCTION value (`CAP_CLOSURE`) is
+/// transferable as long as it is itself recursively transferable (its own env is deep-copyable) —
+/// `clone_closure` handles the deep copy. When false, the spawn path must run the thunk inline.
 pub unsafe fn env_is_transferable(env_ptr: *const u8, desc: *const u8) -> bool {
     if env_ptr.is_null() {
         return true;
@@ -278,7 +327,11 @@ pub unsafe fn env_is_transferable(env_ptr: *const u8, desc: *const u8) -> bool {
     let kinds = desc.add(std::mem::size_of::<u32>());
     for i in 0..count {
         if *kinds.add(i) == CAP_CLOSURE {
-            return false;
+            // Recurse into the captured closure: transferable iff its own env is.
+            let inner = *(env_ptr.add(8 + i * 8) as *const *const u8);
+            if !closure_is_transferable(inner) {
+                return false;
+            }
         }
     }
     true
