@@ -318,40 +318,40 @@ impl<'ctx> Codegen<'ctx> {
 
     /// THE Stage-3b heap-field eligibility predicate — the SINGLE source of truth for which sealed
     /// record fields may live inline in a contiguous element buffer. MUST be mirrored EXACTLY by
-    /// `lin_ir::lower::is_sealed_scalar_array` and `lin_ir::monomorphize` (the gate is multi-site).
+    /// `lin_ir::lower::is_sealed_array_elem_field_packable`, `lin_ir::monomorphize::field_packed_scalar`,
+    /// and `lin_ir::repr::sealed_array_elem_field_packable` (the gate is multi-site; any disagreement
+    /// makes the lowerer's ownership/Coerce insertion diverge from the physical layout → UAF / mis-read).
     ///
-    /// Currently enabled: SCALARS ONLY (Stage 3a). Heap-field element kinds (String / Array /
-    /// nested-sealed) are kept BOXED `Object[]` — fail-safe.
+    /// CURRENTLY: SCALARS ONLY (Stage 3a). The per-element-per-field RC machinery, the materializers
+    /// (`sealed_array_elem_materializer` / `sealed_array_materialize_elem`, both heap-field-aware), and
+    /// the dynamic-consumer boundaries are all COMPLETE and ASan-clean on hand-written heap-field
+    /// fixtures (construct / push / field-read / index-set / drop / transfer / `==` / toString /
+    /// filter / map / sortBy — single-module). Two of the three historical blockers are now CLOSED:
+    ///   1. FIELD OMISSION — structurally omitting a declared sealed field is a COMPILE error
+    ///      (`omits_required_field`), so a packed element can never store a NULL heap pointer.
+    ///   2. PRODUCER/CONSUMER LITERAL DRIFT — an inferred array literal (`[]`, `Array(Never)`) now
+    ///      ADOPTS the concrete param's resolved element representation in BOTH `infer_call` AND
+    ///      `infer_dot_call` (the latter previously bypassed it — the calc-lexer `scan(.., [])` UAF),
+    ///      so a producer and its consumer agree. `repr::verify` (now covering every repr-consuming
+    ///      opcode) makes any residual mismatch a debug-build compile panic, not a silent runtime UAF.
     ///
-    /// STAGE 3b STATUS (kept scalar-only after a measured attempt). The full per-element-per-field RC
-    /// machinery is present and ASan-error-clean on hand-written heap-field fixtures (construct /
-    /// whole-element-read / field-read / index-set-overwrite / push / drop / transfer / combinators /
-    /// equality / toString — see the harness). But enabling ANY heap-field kind regresses the corpus
-    /// (72 → 61/63: calc/dijkstra/report/codec/processes crash with a misaligned/`0x7` String deref)
-    /// for TWO corpus-pervasive reasons that need a LANGUAGE change, not codegen work:
-    ///   1. FIELD OMISSION. Structural typing lets a literal omit a declared field — calc's
-    ///      `{ "kind": "lparen" }` is a valid `Token{kind:String, text:String}`. A BOXED object reads
-    ///      the missing key as `Null`; a PACKED element stores a NULL pointer in the `text` String
-    ///      slot, and a later read derefs it (`string.rs:68`, the `0x7` crash). The packed
-    ///      representation is strictly less capable here, and field-omission is whole-program (the
-    ///      element TYPE can't tell the gate whether some construction site omits a field).
-    ///   2. CONTAINER ROUND-TRIPS. dijkstra (no field omission) still crashes: a `Neighbor[]` packed
-    ///      array stored into a boxed `{String: Neighbor[]}` map slot and read back, plus `push` of a
-    ///      packed struct into a boxed-read array — a boxed-vs-packed representation mismatch across
-    ///      the map/array container boundary that the one-level sealed-array Coerce gates don't cover.
-    /// Both are sound on the BOXED path. Until exact/sealed records forbid field omission AND
-    /// container-value representation is made consistent, heap-field element arrays stay boxed.
-    /// Re-enable by returning true here AND in the lower.rs / monomorphize.rs mirrors (all three MUST
-    /// agree), then re-run corpus + ASan.
+    /// THE REMAINING BLOCKER (why heap fields stay scalar-only): WHOLE-PROGRAM RECORD REPRESENTATION
+    /// CONSISTENCY for records that reach a `{ String: T[] }` MAP-VALUE position (the dijkstra
+    /// `{String: Neighbor[]}` shape). A `{String: T[]}` map is pervasively read into a `T[] | Null`
+    /// UNION (`match adj[u] is Null => [] else => …`) and then BOTH mutated in place (`push(it, x)`)
+    /// AND read by the generic boxed `for`. In-place mutation REQUIRES keep-packed-by-pointer (a
+    /// shared 0xFE buffer); the boxed `for`/`lin_array_get_tagged` reader REQUIRES a boxed `Object[]`
+    /// (it reads a 0xFE buffer's packed structs as TaggedVals → the `0x07` heap-field deref crash; for
+    /// SCALARS it silently misreads → garbage, a latent bug that exists on master but no corpus test
+    /// hits). The two are irreconcilable at one map-value representation UNLESS `lin_array_get_tagged`
+    /// materializes a packed element using a NAMED full-field descriptor (a runtime-layout change) OR
+    /// the record `Neighbor` is boxed CONSISTENTLY everywhere it is reachable from the map (a
+    /// cross-module record-taint pass — a record is packed everywhere or boxed everywhere, never
+    /// per-occurrence). Either is a larger change than a local gate; until then heap-field element
+    /// arrays stay boxed (fail-safe). Re-enable by returning `Self::is_sealed_field(ty)` here AND in
+    /// the three mirrors, AND landing one of those two whole-program mechanisms, then re-run corpus +
+    /// ASan (the `repr::verify` debug_assert is the structural guard that the swap is consistent).
     pub(crate) fn sealed_array_elem_field_packable(ty: &Type) -> bool {
-        // SCALARS ONLY (Stage 3a). Stage 4 added the keep-packed Map/object round-trip
-        // (BoxKeepPacked/UnboxKeepPacked) which makes the CONTAINER boundary sound for packed sealed
-        // arrays, but shipping HEAP-FIELD element arrays (Stage 3b) additionally requires keep-packed
-        // wiring at the toString / Json-materialize / out-of-shape-read / filter boundaries — each of
-        // which still materializes element-wise and regresses the corpus (sealed_array_to_json,
-        // out_of_shape_field_read, filter double-free) when an element has a heap field. Kept
-        // scalar-only here pending that broader boundary work; the keep-packed Map round-trip applies
-        // to the existing SCALAR packed arrays. MUST mirror lower.rs / monomorphize.rs.
         Self::is_sealed_scalar_field(ty)
     }
 

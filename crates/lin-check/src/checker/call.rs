@@ -858,7 +858,29 @@ impl Checker {
             }
         }
 
-        let typed_receiver = self.infer_expr(receiver)?;
+        let mut typed_receiver = self.infer_expr(receiver)?;
+
+        // An array/object literal RECEIVER (`[].fill()`, `{}.merge(…)`) flowing into a CONCRETE
+        // (TypeVar-free) array/map FIRST param must adopt that param's resolved element representation
+        // — the receiver mirror of the prefix-`infer_call` / dot-call-argument rule. Pure inference of
+        // an empty `[]` receiver yields `Array(Never)`, so it lowers a BOXED buffer while the callee's
+        // packed/flat-scalar `T[]` param does packed stride-N push/get → a representation DRIFT
+        // (latent scalar packed-array UAF: `[].fill()` over `Pt[]`). The generic-`T[]`-param case is
+        // handled separately below by `defer_empty_receiver` (it must bind `T` from the item first);
+        // this covers the CONCRETE-param case, which has a definite expected type to check against.
+        if matches!(receiver, Expr::Array(..) | Expr::Object(..)) {
+            if let Some(Type::Function { params, .. }) = self.env.effective_type(method) {
+                if let Some(p0) = params.first() {
+                    let p0_concrete_container = matches!(p0, Type::Array(_) | Type::FixedArray(_) | Type::Map(_))
+                        && !p0.contains_type_var();
+                    if p0_concrete_container {
+                        if let Ok(rechecked) = self.check_expr(receiver, p0) {
+                            typed_receiver = rechecked;
+                        }
+                    }
+                }
+            }
+        }
 
         // Affine consume for a dot-call routing to a stream op is applied per-argument AFTER all
         // arguments are inferred (so `concat`'s second stream arg is also covered) — see the
@@ -891,7 +913,28 @@ impl Checker {
                 if let Some(arg_exprs) = args.as_ref() {
                     for (i, (arg, param_ty)) in arg_exprs.iter().zip(method_params.iter().skip(1)).enumerate() {
                         if !matches!(arg, Expr::Function { .. }) {
-                            let typed = self.infer_expr(arg)?;
+                            // An array-literal argument must adopt the parameter's element
+                            // representation rather than its own bottom-up inference — the exact
+                            // mirror of the `infer_call` rule (which dot-calls bypassed). Pure
+                            // inference of an EMPTY literal `[]` yields `Array(Never)`, so the
+                            // producer lowers a BOXED buffer while a concrete packed/flat-scalar
+                            // `T[]` param's callee does packed stride-N push/get → a representation
+                            // DRIFT (the calc-lexer `scan(.., [])` boxed-vs-packed `Token[]` UAF this
+                            // change closes). Route array/object literals through expected-type-
+                            // directed checking when the param is a concrete (TypeVar-free) array or
+                            // typed-map type so the literal carries the param's resolved element repr
+                            // at codegen, identical to the prefix-call path.
+                            let array_lit_against_concrete_array = matches!(arg, Expr::Array(..))
+                                && matches!(param_ty, Type::Array(_) | Type::FixedArray(_))
+                                && !param_ty.contains_type_var();
+                            let object_lit_against_concrete_map = matches!(arg, Expr::Object(..))
+                                && matches!(param_ty, Type::Map(_))
+                                && !param_ty.contains_type_var();
+                            let typed = if array_lit_against_concrete_array || object_lit_against_concrete_map {
+                                self.check_expr(arg, param_ty)?
+                            } else {
+                                self.infer_expr(arg)?
+                            };
                             // Defer a bare integer literal's Int32-default substitution for a TypeVar
                             // param so it can't clobber a binding the receiver already pinned (the
                             // `uint8Arr.append(221)` literal-width split — mirror of `infer_call`).
