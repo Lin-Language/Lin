@@ -1065,6 +1065,53 @@ impl FuncBuilder {
         self.scope_owned.pop();
     }
 
+    /// Release every owned temp live in ANY scope frame, EXCEPT the temps passed as
+    /// tail-call arguments (which are consumed by the back-edge: they become the next
+    /// iteration's param-slot values, and codegen's TCO release-old machinery frees the
+    /// PREVIOUS slot value). This MUST run on the live block immediately before a `TailCall`
+    /// terminator is emitted.
+    ///
+    /// Why this exists: a self-tail-call diverges, so `lower_call` switches to a dead
+    /// `tco_post` block afterwards. Every enclosing scope-exit `Release` (block scopes, `if`
+    /// branch scopes, the function body scope) is then emitted into that unreachable block
+    /// (or a chain of dead blocks) and NEVER RUNS. For a tail-recursive function whose body
+    /// allocates fresh owned temps each iteration — e.g. the projections/`lin_tagged_clone`s
+    /// of `routeScanner.scanBack` (`scanner["tripsByRoute"][routeId]`, `routeTrips[i]`,
+    /// `trip["stopTimes"]`, the route-id/key string literals) — every one of those clones
+    /// leaks once per iteration (the dominant RAPTOR per-scan leak, ~190 MB/scan). Releasing
+    /// them here, on the live back-edge block, balances the per-iteration allocation.
+    ///
+    /// The frames are left in place (`discard_scope`/`pop_scope_releasing_keep` still pop them
+    /// afterwards, but into the dead post block where any further Release is unreachable and
+    /// harmless). A temp registered owned MORE THAN ONCE across frames is released ONCE here
+    /// (the runtime release decrements one reference per call; the redundant registrations are
+    /// read-retains the single-pop logic also collapses to one). A tail-call arg temp is
+    /// skipped even when it is also owned in scope (e.g. the `if cond then trip else lastFound`
+    /// merge value threaded as the next `lastFound`): its +1 transfers into the param slot.
+    fn release_owned_for_tail_call(&mut self, args: &[Temp]) {
+        // Skip the args AND any owned temp transitively kept by an arg through `escape_alias`:
+        // notably an owned union box whose UNBOXED inner is the arg (`concat(b,b)` → unboxed
+        // `UInt8[]` arg; the box stays registered owned). Fully releasing such a box would free
+        // the array now threaded into the param slot (a double-free) — its shell is left to the
+        // dead-block release (the pre-existing accepted per-tail-call shell leak).
+        let skip = self.expand_keep_for_escape(args);
+        let mut to_release: Vec<(Temp, Type)> = Vec::new();
+        for frame in &self.scope_owned {
+            for (t, ty) in frame {
+                if skip.contains(t) {
+                    continue;
+                }
+                if to_release.iter().any(|(seen, _)| seen == t) {
+                    continue;
+                }
+                to_release.push((*t, ty.clone()));
+            }
+        }
+        for (t, ty) in to_release {
+            self.emit(Instruction::Release { val: t, ty });
+        }
+    }
+
     /// Snapshot the plain SSA var-slot → (temp, type) bindings before lowering a branch. Excludes
     /// heap-cell slots (their `slots` entry is a stable cell pointer — reassignment goes through
     /// the cell, not by rebinding the slot) and global var slots (read/written through the module
@@ -1129,6 +1176,24 @@ fn is_rc_type(ty: &Type) -> bool {
         ty,
         Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Map(_) | Type::Iterator(_) | Type::Function { .. }
     )
+}
+
+/// Whether codegen's `Index` for `obj_ty[key_ty]` takes the ARRAY path (`lin_array_get_tagged`),
+/// which returns a FRESH, fully-owned `TaggedVal*` (+1) — as opposed to the object/map path
+/// (`lin_object_get` / `lin_map_get`), which returns a BORROWED interior pointer into the
+/// container. This MUST mirror codegen's dispatch in `compile_ir_index` (data.rs): the `Map`
+/// branch is checked FIRST, then `is_array_access = Array/FixedArray(obj_ty) || numeric key`.
+///
+/// The distinction matters for ownership: a union Index result is normally relocated off its
+/// (borrowed, movable) container slot via `CloneBox`. But when the source is ALREADY a fresh
+/// +1 box (the array path), that extra clone leaks the original box once per evaluation — the
+/// dominant per-scanned-stop leak in `routeScanner.scanBack`'s `routeTrips[i]`. Register the
+/// fresh box owned directly instead (mirrors the sealed-record-by-dynamic-key fresh-box case).
+fn index_result_is_fresh_owned_box(obj_ty: &Type, key_ty: &Type) -> bool {
+    if matches!(obj_ty, Type::Map(_)) {
+        return false;
+    }
+    matches!(obj_ty, Type::Array(_) | Type::FixedArray(_)) || key_ty.is_numeric()
 }
 
 /// True when `ty` is a SEALED RECORD — a `Type::Object { sealed: true }` all of whose fields are
@@ -1802,6 +1867,17 @@ fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: 
     if is_union_ty(param_ty) != is_union_ty(arg_ty) {
         let dst = builder.alloc_temp(param_ty.clone());
         builder.emit(Instruction::Coerce { dst, src: arg, from_ty: arg_ty.clone(), to_ty: param_ty.clone() });
+        // UNBOX (union arg → concrete param): `dst` aliases the SOURCE box's inner heap payload
+        // (e.g. `concat(b,b)` returns a boxed array, unboxed to the `UInt8[]` param). The source
+        // box `arg` stays registered owned in scope, so if this arg flows into a self-tail-call
+        // (`doubleUp(concat(b,b), n)`), `release_owned_for_tail_call` must NOT fully release the
+        // box — that would free the very array now living in the param slot (a double-free). Record
+        // the alias so the box is treated as kept (its shell is left to the dead-block release, the
+        // pre-existing accepted per-tail-call shell leak). The box shell still survives non-tail use
+        // normally. Only matters when arg is unboxed from an owned box (union → concrete).
+        if is_union_ty(arg_ty) && !is_union_ty(param_ty) {
+            builder.record_escape_alias(dst, arg);
+        }
         return dst;
     }
     // Numeric width/kind mismatch between two concrete numeric types.
@@ -3020,6 +3096,11 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             };
             let dst = builder.alloc_temp(result_type.clone());
             let obj_ty_is_sealed = is_sealed_scalar_repr(&obj_ty);
+            // Whether codegen's array path (`lin_array_get_tagged`) produces a FRESH +1 box for
+            // this index — if so, the union relocation below must NOT clone it again (that leaks
+            // the original box, once per evaluation). Computed before `obj_ty`/`key_ty` are moved
+            // into the `Index` instruction.
+            let result_is_fresh_owned = index_result_is_fresh_owned_box(&obj_ty, &key_ty);
             builder.emit(Instruction::Index {
                 dst,
                 object: obj_temp,
@@ -3054,6 +3135,16 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             //   is balanced (cached scalar boxes are returned as-is by lin_tagged_clone and
             //   no-op on release, so no needless alloc on the scalar fast path).
             if is_union_ty(result_type) {
+                // Array path: `dst` is ALREADY a fresh, fully-owned +1 box from
+                // `lin_array_get_tagged` (it allocated a standalone TaggedVal — for a flat array
+                // it boxes the scalar, for a tagged array it copies the element box). It is NOT a
+                // borrowed interior pointer, so cloning it again would leak the original box every
+                // evaluation. Register it owned directly (mirrors the sealed-by-dynamic-key fresh
+                // box above). The object/map path falls through to the borrowed-interior CloneBox.
+                if result_is_fresh_owned {
+                    builder.register_owned(dst, result_type.clone());
+                    return dst;
+                }
                 let owned = builder.alloc_temp(result_type.clone());
                 builder.emit(Instruction::CloneBox { dst: owned, src: dst, ty: result_type.clone() });
                 builder.register_owned(owned, result_type.clone());
@@ -3503,6 +3594,13 @@ fn lower_call(
                 // consumed by the jump. A boxed concrete-heap arg in tail position is rare
                 // (would require a self-recursive function taking a Json param a concrete heap
                 // value is passed to), and the small per-tail-call shell leak is left unfixed.
+                //
+                // Release every per-iteration owned temp the body allocated (projections, clones,
+                // string literals) on THIS live block before the diverging jump — otherwise their
+                // scope-exit releases land in the unreachable `tco_post` chain and leak once per
+                // iteration (the dominant RAPTOR scanBack leak). Args are skipped (consumed by the
+                // back-edge into the param slots).
+                builder.release_owned_for_tail_call(&lowered_args);
                 builder.terminate(Terminator::TailCall { args: lowered_args.clone() });
                 // Dead block to keep IR valid.
                 let post = builder.alloc_block("tco_post");
@@ -3569,6 +3667,10 @@ fn lower_call(
         .collect();
 
     if is_tail {
+        // Release per-iteration body-owned temps on the live block before the diverging jump
+        // (see release_owned_for_tail_call); their scope-exit releases would otherwise land in
+        // the unreachable post block and leak each iteration.
+        builder.release_owned_for_tail_call(&lowered_args);
         builder.terminate(Terminator::TailCall { args: lowered_args.clone() });
         let post = builder.alloc_block("tco_post");
         builder.diverged_blocks.insert(post);
