@@ -52,6 +52,8 @@ impl LanguageServer for Backend {
                 rename_provider: Some(OneOf::Left(true)),
                 // Inlay type hints on bindings whose type is inferred (no explicit annotation).
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                // Quick-fixes derived from existing diagnostics (unused imports, did-you-mean).
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 // Signature help inside a call's argument list, triggered by `(` and `,`.
                 signature_help_provider: Some(SignatureHelpOptions {
                     trigger_characters: Some(vec!["(".into(), ",".into()]),
@@ -480,6 +482,21 @@ impl LanguageServer for Backend {
         let offset = position_to_offset(&source, pos);
 
         Ok(signature_help(&source, &analysis, offset))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = &params.text_document.uri;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let actions = code_actions(&source, uri, &params);
+        if actions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(actions))
+        }
     }
 }
 
@@ -1332,6 +1349,100 @@ fn collect_type_spans_in_type(ty: &lin_parse::ast::TypeExpr, out: &mut Vec<lin_c
     }
 }
 
+// ── code actions ───────────────────────────────────────────────────────────────
+
+/// Turn the diagnostics the client supplied (in `params.context.diagnostics`) into quick-fixes:
+///   - "imported but never used" → "Remove unused import" (deletes the line span).
+///   - any diagnostic carrying a parsed did-you-mean `suggestion` (in its `data`) → "Change to `X`"
+///     replacing the offending range.
+///
+/// Only diagnostics that overlap the requested `params.range` produce an action. Pure over
+/// `(source, uri, params)` so it's unit-testable.
+fn code_actions(source: &str, uri: &Url, params: &CodeActionParams) -> Vec<CodeActionOrCommand> {
+    let mut actions = Vec::new();
+    let requested = params.range;
+    for diag in &params.context.diagnostics {
+        if !ranges_overlap(diag.range, requested) {
+            continue;
+        }
+
+        // Unused-import fix: delete the whole line the diagnostic sits on.
+        if diag.message.contains("imported but never used") {
+            let line_range = full_line_range(source, diag.range.start.line);
+            let edit = TextEdit { range: line_range, new_text: String::new() };
+            actions.push(CodeActionOrCommand::CodeAction(quick_fix(
+                "Remove unused import".to_string(),
+                uri.clone(),
+                vec![edit],
+                diag.clone(),
+            )));
+            continue;
+        }
+
+        // Did-you-mean fix: replace the offending span with the suggested identifier.
+        if let Some(suggestion) = diag
+            .data
+            .as_ref()
+            .and_then(|d| d.get("suggestion"))
+            .and_then(|s| s.as_str())
+        {
+            let edit = TextEdit { range: diag.range, new_text: suggestion.to_string() };
+            actions.push(CodeActionOrCommand::CodeAction(quick_fix(
+                format!("Change to `{}`", suggestion),
+                uri.clone(),
+                vec![edit],
+                diag.clone(),
+            )));
+        }
+    }
+    actions
+}
+
+/// Build a `QuickFix` code action with a single-document edit, attaching the source diagnostic.
+fn quick_fix(title: String, uri: Url, edits: Vec<TextEdit>, diagnostic: Diagnostic) -> CodeAction {
+    let mut changes = HashMap::new();
+    changes.insert(uri, edits);
+    CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diagnostic]),
+        edit: Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }),
+        command: None,
+        is_preferred: Some(true),
+        disabled: None,
+        data: None,
+    }
+}
+
+/// The full-line `Range` for `line`, including its trailing newline so deleting it removes the line
+/// entirely (collapsing to the start of the next line).
+fn full_line_range(source: &str, line: u32) -> Range {
+    let start = Position { line, character: 0 };
+    // End at the start of the next line so the newline is consumed by the deletion.
+    let end = Position { line: line + 1, character: 0 };
+    // Clamp the end to EOF when this is the last line (no trailing newline to span into).
+    let line_count = source.lines().count() as u32;
+    if line + 1 >= line_count && !source.ends_with('\n') {
+        let eof = offset_to_position(source, source.len());
+        return Range { start, end: eof };
+    }
+    Range { start, end }
+}
+
+/// True when two LSP ranges overlap (touching counts as overlap, matching client expectations for
+/// "diagnostic under the cursor").
+fn ranges_overlap(a: Range, b: Range) -> bool {
+    let a_start = (a.start.line, a.start.character);
+    let a_end = (a.end.line, a.end.character);
+    let b_start = (b.start.line, b.start.character);
+    let b_end = (b.end.line, b.end.character);
+    a_start <= b_end && b_start <= a_end
+}
+
 // ── signature help ─────────────────────────────────────────────────────────────
 
 /// Build signature help when `offset` sits inside a `f(…)` call's argument list. Returns `None`
@@ -1741,6 +1852,14 @@ fn lsp_diagnostic(source: &str, d: &lin_common::Diagnostic) -> Diagnostic {
     let start = offset_to_position(source, d.span.start as usize);
     let end_offset = (d.span.end as usize).max(d.span.start as usize + 1);
     let end = offset_to_position(source, end_offset);
+    // Stash a parsed "did you mean" suggestion into `data` so it round-trips back to the
+    // code-action handler (the LSP `message` stays human-readable; the structured suggestion lets
+    // us offer a one-click "Change to X" fix).
+    let data = d
+        .help
+        .as_deref()
+        .and_then(suggestion_from_help)
+        .map(|s| serde_json::json!({ "suggestion": s }));
     Diagnostic {
         range: Range { start, end },
         severity: Some(match d.severity {
@@ -1749,8 +1868,25 @@ fn lsp_diagnostic(source: &str, d: &lin_common::Diagnostic) -> Diagnostic {
         }),
         message: d.message.clone(),
         source: Some("lin".to_string()),
+        data,
         ..Default::default()
     }
+}
+
+/// Extract the suggested replacement identifier from a "did you mean 'X'?" / "did you mean \"X\"?"
+/// help string. Returns `None` when the help isn't a did-you-mean suggestion.
+fn suggestion_from_help(help: &str) -> Option<String> {
+    let lower = help.to_ascii_lowercase();
+    if !lower.contains("did you mean") {
+        return None;
+    }
+    // The suggestion is the text between the first pair of quotes (either ' or ").
+    let bytes = help.as_bytes();
+    let open = help.find(['\'', '"'])?;
+    let quote = bytes[open];
+    let rest = &help[open + 1..];
+    let close = rest.find(quote as char)?;
+    Some(rest[..close].to_string())
 }
 
 fn offset_to_position(source: &str, offset: usize) -> Position {
@@ -2210,6 +2346,100 @@ mod tests {
         let analysis = analyse(src, None);
         // Offset 0 (`v` of `val`) is not inside any call.
         assert!(signature_help(src, &analysis, 0).is_none());
+    }
+
+    // ── Tier-2: code actions ────────────────────────────────────────────────────
+
+    fn dummy_uri() -> Url {
+        Url::parse("file:///tmp/lsp_test.lin").unwrap()
+    }
+
+    /// Build `CodeActionParams` requesting actions over the whole document, with the freshly
+    /// analysed diagnostics supplied as context (what a real client would echo back).
+    fn code_action_params(src: &str, diags: Vec<Diagnostic>) -> CodeActionParams {
+        let end = offset_to_position(src, src.len());
+        CodeActionParams {
+            text_document: TextDocumentIdentifier { uri: dummy_uri() },
+            range: Range { start: Position { line: 0, character: 0 }, end },
+            context: CodeActionContext {
+                diagnostics: diags,
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        }
+    }
+
+    fn action_titles(actions: &[CodeActionOrCommand]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                CodeActionOrCommand::CodeAction(ca) => Some(ca.title.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn code_action_removes_unused_import() {
+        let src = "import { print } from \"std/io\"\nval x = 1\n";
+        let analysis = analyse(src, None);
+        // The unused-import warning must be present.
+        assert!(
+            analysis.diagnostics.iter().any(|d| d.message.contains("imported but never used")),
+            "expected an unused-import diagnostic, got {:?}",
+            analysis.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let params = code_action_params(src, analysis.diagnostics.clone());
+        let actions = code_actions(src, &dummy_uri(), &params);
+        let titles = action_titles(&actions);
+        assert!(
+            titles.iter().any(|t| t == "Remove unused import"),
+            "expected a remove-unused-import action, got {:?}",
+            titles
+        );
+        // The edit must delete the import line (line 0).
+        let ca = actions.iter().find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) if ca.title == "Remove unused import" => Some(ca),
+            _ => None,
+        }).unwrap();
+        let edits = ca.edit.as_ref().unwrap().changes.as_ref().unwrap().get(&dummy_uri()).unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].range.start.line, 0);
+        assert_eq!(edits[0].new_text, "");
+        assert_eq!(ca.kind, Some(CodeActionKind::QUICKFIX));
+    }
+
+    #[test]
+    fn code_action_offers_did_you_mean_change() {
+        // `lenght` is a typo for `length` — but use a local binding so the suggestion is stable.
+        let src = "val length = 1\nval y = lenght\n";
+        let analysis = analyse(src, None);
+        // Some diagnostic must carry a suggestion (did-you-mean).
+        let has_suggestion = analysis.diagnostics.iter().any(|d| {
+            d.data.as_ref().and_then(|j| j.get("suggestion")).is_some()
+        });
+        assert!(
+            has_suggestion,
+            "expected a did-you-mean suggestion in diagnostics: {:?}",
+            analysis.diagnostics.iter().map(|d| (&d.message, &d.data)).collect::<Vec<_>>()
+        );
+        let params = code_action_params(src, analysis.diagnostics.clone());
+        let actions = code_actions(src, &dummy_uri(), &params);
+        let titles = action_titles(&actions);
+        assert!(
+            titles.iter().any(|t| t == "Change to `length`"),
+            "expected a change-to-length action, got {:?}",
+            titles
+        );
+    }
+
+    #[test]
+    fn suggestion_from_help_parses_quoted_name() {
+        assert_eq!(suggestion_from_help("did you mean 'length'?").as_deref(), Some("length"));
+        assert_eq!(suggestion_from_help("did you mean \"foo\"?").as_deref(), Some("foo"));
+        assert_eq!(suggestion_from_help("type defined here"), None);
     }
 
     #[test]
