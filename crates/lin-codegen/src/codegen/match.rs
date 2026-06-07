@@ -106,6 +106,74 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.int_truncate_or_bit_cast(r_i8, bool_ty, "matches_b")
     }
 
+    /// Repr-aware Coerce entry (unboxed-sumtype Stage 1 — the CALL ABI boundary machinery). When the
+    /// SOURCE operand is physically an unboxed `SumNode` (its repr is `Packed(SumNode)`, proven by the
+    /// repr pass + verify), a Coerce out of the sum type must use the `sumnode_*` helpers, NOT the
+    /// type-driven `compile_ir_coerce` boxed path (which would read the SumNode pointer as a boxed
+    /// `TaggedVal` → UAF). Three directions:
+    ///   - sum → SAME sum type: a no-op carry (same SumNode pointer).
+    ///   - sum → a concrete VARIANT record (the `match`-arm narrowing): project to a sealed struct.
+    ///   - sum → Json / union / generic / anything else: materialize the node to a boxed `LinObject`,
+    ///     then box to a union/Json `TaggedVal` if the target is union/Json.
+    /// All other coercions (numeric, sealed-record, array, boxed sources) delegate to the existing
+    /// type-driven `compile_ir_coerce`.
+    pub(crate) fn compile_ir_coerce_with_repr(
+        &mut self,
+        val: BasicValueEnum<'ctx>,
+        from_ty: &Type,
+        to_ty: &Type,
+        src_repr: &lin_ir::repr::Repr,
+        llvm_fn: inkwell::values::FunctionValue<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        if let Some(sum_ty) = src_repr.sumnode_sum_ty() {
+            let sum_ty = sum_ty.clone();
+            // sum → SAME sum type (e.g. an identity widening, or a union-to-union no-op): carry the
+            // SumNode pointer verbatim. The repr pass keeps both sides Packed(SumNode), so codegen
+            // must not convert. (Identity by Type equality — Type ignores `sealed`.)
+            if to_ty == &sum_ty {
+                return val;
+            }
+            // sum → a concrete sealed VARIANT record (the match-arm narrowing Coerce, from_ty=sum,
+            // to_ty=Circle). Project the node's scalar payload into a fresh packed sealed struct.
+            if let Some(target_fields) = Self::sealed_scalar_fields(to_ty) {
+                let tf = target_fields.clone();
+                return self.sumnode_project_to_sealed(val, &sum_ty, &tf);
+            }
+            // sum → Json / union / generic / unsealed object: materialize to a boxed LinObject, then
+            // box as TAG_OBJECT if the target is a union/Json wildcard.
+            let obj = self.sumnode_materialize_to_object(val, &sum_ty, llvm_fn);
+            if Self::is_union_type(to_ty) || matches!(to_ty, Type::TypeVar(_)) {
+                return self.box_value(obj, &Self::sumnode_first_variant_obj_ty(&sum_ty));
+            }
+            return obj;
+        }
+        // REVERSE boundary: a BOXED / Json / unsealed-object / concrete-variant-record source coerced
+        // INTO a sum type (`to_ty` is Stage-1-eligible) must build a fresh `SumNode` — the source is
+        // NOT physically a SumNode (its repr is Boxed / a sealed variant struct). This is the
+        // construction edge for `val c: Shape = { "kind": "circle", … }` (the literal is built boxed
+        // then coerced to the sum slot) and for a Json value flowing into a sum-typed slot/param.
+        // Reconstruct by reading the discriminant + scalar payload fields from the source.
+        if Self::is_sum_type(to_ty) {
+            // A source that is a concrete sealed VARIANT record (a packed struct) materializes to a
+            // boxed object first so `sumnode_project_from_boxed` can read its fields uniformly.
+            if Self::sealed_scalar_fields(from_ty).is_some() {
+                if let Some(sf) = Self::sealed_scalar_fields(from_ty) {
+                    let sf = sf.clone();
+                    let obj = self.sealed_materialize_to_object(val, &sf);
+                    let boxed = self.box_value(obj, &Type::object(sf));
+                    let node = self.sumnode_project_from_boxed(boxed, &Type::TypeVar(u32::MAX), to_ty, llvm_fn);
+                    // Release the transient boxed materialization (its inner object + shell).
+                    if boxed.is_pointer_value() {
+                        self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                    }
+                    return node;
+                }
+            }
+            return self.sumnode_project_from_boxed(val, from_ty, to_ty, llvm_fn);
+        }
+        self.compile_ir_coerce(val, from_ty, to_ty)
+    }
+
     pub(crate) fn compile_ir_coerce(&mut self, val: BasicValueEnum<'ctx>, from_ty: &Type, to_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         // Numeric widening.
