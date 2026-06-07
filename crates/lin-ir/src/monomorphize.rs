@@ -67,31 +67,31 @@ fn mentions_generic_tv(ty: &Type) -> bool {
     }
 }
 
-/// A field type permitted in a PACKED sealed record element (Stage 3a scalar + Stage 3b heap):
-/// a fixed-width scalar / Bool, OR a packable heap field (String / Array / nested-sealed record).
-/// MUST mirror `Codegen::sealed_array_elem_field_packable` / lower.rs `is_sealed_scalar_array`
-/// EXACTLY — a combinator over a packed sealed element (whether scalar- or heap-field) must take the
-/// boxed-fallback detour, else the native specialization reads packed bytes through boxed machinery.
+/// A field type permitted in a PACKED sealed record element (Stage 3a scalar). MUST mirror
+/// `Codegen::sealed_array_elem_field_packable` / lower.rs `is_sealed_array_elem_field_packable`
+/// EXACTLY — a combinator over a packed sealed element must take the boxed-fallback detour, else the
+/// native specialization reads packed bytes through boxed machinery. Heap-field element arrays stay
+/// boxed (see the codegen gate note), so they flow through the generic combinator's boxed body.
 fn field_packed_scalar(ty: &Type) -> bool {
     ty.is_flat_scalar() || matches!(ty, Type::Bool)
 }
 
-/// True if `ty` is (or contains, transitively) a PACKED (scalar-field) SEALED record/array — the
-/// representation codegen lays out as a contiguous unboxed buffer (elem_tag 0xFE) / packed struct
-/// (not a `LinObject`). The unsound generic combinators (see `combinator_unsound_over_sealed`) read
-/// such elements through the boxed `Object[]`/`Json` machinery, a boxed-vs-packed mismatch. When a
+/// True if `ty` is (or contains, transitively) a PACKED SEALED record/array — the representation
+/// codegen lays out as a contiguous unboxed buffer (elem_tag 0xFE) / packed struct (not a
+/// `LinObject`). The unsound generic combinators (see `combinator_unsound_over_sealed`) read such
+/// elements through the boxed `Object[]`/`Json` machinery, a boxed-vs-packed mismatch. When a
 /// combinator substitution binds a type parameter to such a type we route the call through the
 /// type-erased `boxed_fallback_call`, whose boxed ABI materializes the sealed value to its boxed view
 /// at the argument boundary (`box_value` → `sealed_array_to_tagged`) and re-coerces the boxed result
-/// back to the sealed type. Heap-field sealed records stay boxed (Stage 3a gate) and are excluded.
+/// back to the sealed type. Heap-field sealed records stay boxed (Stage 3a gate), so they flow
+/// through the generic combinator's boxed body correctly and do NOT need the detour.
 fn mentions_sealed(ty: &Type) -> bool {
     match ty {
         // A sealed record whose fields are ALL scalar (numeric/Bool) is the PACKED representation
         // codegen lays out as a contiguous struct / unboxed array (elem_tag 0xFE) — the boxed-vs-packed
-        // mismatch source for the unsound combinators. Heap-field sealed records stay BOXED (Stage 3a
-        // gate), so they flow through the generic combinator's boxed body correctly and do NOT need the
-        // detour. MUST mirror the codegen packed gate (`Codegen::sealed_array_elem` / lower.rs
-        // `is_sealed_scalar_array`): scalar-field sealed records only.
+        // mismatch source for the unsound combinators. MUST mirror the codegen packed gate
+        // (`Codegen::sealed_array_elem` / lower.rs `is_sealed_array_elem_field_packable`) via the
+        // shared `field_packed_scalar` predicate (scalar-field sealed records only).
         Type::Object { fields, sealed: true } =>
             !fields.is_empty() && fields.values().all(field_packed_scalar),
         Type::Object { fields, sealed: false } => fields.values().any(mentions_sealed),
