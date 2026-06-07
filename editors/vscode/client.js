@@ -9,6 +9,7 @@ const {
   tests, TestRunRequest, TestRunProfileKind, TestMessage, Position,
   FileCoverage, StatementCoverage, CancellationTokenSource,
   tasks, Task, ShellExecution, ShellQuoting, TaskScope,
+  debug,
 } = require("vscode");
 const { LanguageClient, TransportKind } = require("vscode-languageclient/node");
 
@@ -733,6 +734,106 @@ function makeTaskProvider(linBin) {
   };
 }
 
+// --- Debug configuration provider --------------------------------------------
+//
+// Lin native debugging delegates to CodeLLDB (vadimcn.vscode-lldb): we compile the
+// `.lin` file with `lin build --debug` (emitting DWARF line tables) and then hand a
+// `type: "lldb"` launch config to CodeLLDB, which loads the binary and maps DWARF
+// back to `.lin` source lines for breakpoints/stepping.
+//
+// The provider accepts a `type: "lin"` launch config (authored in launch.json or the
+// auto-supplied initialConfiguration). It resolves `program` (the compiled binary,
+// defaulting to the source stem next to the file), builds it with --debug, then returns
+// the CodeLLDB config. Returning a config with a different `type` reroutes the session to
+// that adapter — the documented VS Code mechanism for a "delegating" debugger.
+function makeDebugConfigProvider(linBin) {
+  return {
+    // Run when launch.json has no Lin config yet (F5 with a .lin file open): synthesize one.
+    provideDebugConfigurations() {
+      return [
+        {
+          type: "lin",
+          request: "launch",
+          name: "Debug Lin file",
+          source: "${file}",
+          program: "${fileDirname}/${fileBasenameNoExtension}",
+          cwd: "${workspaceFolder}",
+          args: [],
+        },
+      ];
+    },
+    // Resolve after VS Code has substituted ${...} variables. We build here (async) and
+    // return the CodeLLDB config; returning undefined aborts the session.
+    async resolveDebugConfigurationWithSubstitutedVariables(folder, config) {
+      // Bare F5 with no config: fill from the active editor.
+      const editor = window.activeTextEditor;
+      let source = config.source;
+      if (!source && editor && editor.document.uri.fsPath.endsWith(".lin")) {
+        source = editor.document.uri.fsPath;
+      }
+      if (!source) {
+        window.showErrorMessage("Lin debug: no .lin source to build. Open a .lin file or set `source` in launch.json.");
+        return undefined;
+      }
+      const program =
+        config.program ||
+        path.join(path.dirname(source), path.basename(source, ".lin"));
+
+      // Build with --debug so the binary carries DWARF line tables. We run the build as a
+      // VS Code task (so the `lin` problem matcher surfaces compile errors) and await it.
+      const argv = ["build", source, "--debug", "-o", program];
+      const exec = new ShellExecution(
+        linBin,
+        argv.map((a) => ({ value: a, quoting: ShellQuoting.Strong }))
+      );
+      const buildTask = new Task(
+        { type: "lin", command: "build", file: source, debug: true },
+        folder || TaskScope.Workspace,
+        "lin build --debug",
+        "lin",
+        exec,
+        "$lin"
+      );
+      const ok = await new Promise((resolve) => {
+        let disposed = false;
+        const end = tasks.onDidEndTaskProcess((e) => {
+          if (e.execution.task === buildTask || e.execution.task.name === buildTask.name) {
+            if (!disposed) {
+              disposed = true;
+              end.dispose();
+              resolve(e.exitCode === 0);
+            }
+          }
+        });
+        tasks.executeTask(buildTask).then(undefined, () => {
+          if (!disposed) {
+            disposed = true;
+            end.dispose();
+            resolve(false);
+          }
+        });
+      });
+      if (!ok) {
+        window.showErrorMessage("Lin debug: `lin build --debug` failed; see the terminal/Problems panel.");
+        return undefined;
+      }
+
+      // Hand off to CodeLLDB. The session's effective type becomes "lldb".
+      return {
+        type: "lldb",
+        request: "launch",
+        name: config.name || `Debug ${path.basename(source)}`,
+        program,
+        args: Array.isArray(config.args) ? config.args : [],
+        cwd: config.cwd || (folder ? folder.uri.fsPath : path.dirname(source)),
+        stopOnEntry: !!config.stopOnEntry,
+        // Surface the source path so CodeLLDB resolves relative DWARF file names if needed.
+        sourceLanguages: ["lin"],
+      };
+    },
+  };
+}
+
 function activate(context) {
   const lspBin = resolveBin(context, "lin-lsp");
   const linBin = resolveBin(context, "lin");
@@ -741,6 +842,12 @@ function activate(context) {
   // can be authored in tasks.json with the `lin` problem matcher.
   context.subscriptions.push(
     tasks.registerTaskProvider("lin", makeTaskProvider(linBin))
+  );
+
+  // Register the Lin debug configuration provider: builds with `lin build --debug` and
+  // delegates the actual debug session to CodeLLDB (see makeDebugConfigProvider).
+  context.subscriptions.push(
+    debug.registerDebugConfigurationProvider("lin", makeDebugConfigProvider(linBin))
   );
 
   // `lin` is available in VS Code's integrated terminal out of the box.
