@@ -42,9 +42,9 @@ impl LanguageServer for Backend {
         }
 
         // Build the cross-file index: seed stdlib, then enumerate + index every
-        // `*.lin` file under the workspace root. A best-effort first cut — files
-        // are re-indexed on edit; we do NOT re-check dependents on edit (see the
-        // `update` handler note).
+        // `*.lin` file under the workspace root. Files are re-indexed on edit, and
+        // open DIRECT dependents are re-checked when an imported file changes (see
+        // the `update` / `recheck_open_dependents` handlers).
         {
             let mut index = WORKSPACE_INDEX.write().unwrap();
             *index = WorkspaceIndex::default();
@@ -767,12 +767,9 @@ impl Backend {
             .write()
             .unwrap()
             .insert(uri.clone(), source.to_string());
-        // Re-index just this file's symbol/import table. We deliberately do NOT
-        // re-check dependent files here: the cross-file references/symbols/rename
-        // features need only each file's export+import name tables, which a single
-        // re-parse refreshes. Inferred *types* in dependents can go stale until the
-        // dependent is itself re-opened/edited — an accepted limitation for this cut
-        // (it never affects name-based cross-file resolution).
+        // Re-index this file's symbol/import table so cross-file
+        // references/symbols/rename stay current. This also refreshes the export
+        // signatures dependents read through `analyse`'s `pre_resolve_imports`.
         if let Ok(path) = uri.to_file_path() {
             WORKSPACE_INDEX
                 .write()
@@ -784,6 +781,73 @@ impl Backend {
         self.client
             .publish_diagnostics(uri.clone(), analysis.diagnostics, None)
             .await;
+
+        // Dependent re-check: when F changes, any OPEN file B that imports from F
+        // can have stale inferred types (hover/inlay/diagnostics) for symbols it
+        // pulls from F, because B's analysis cached F's *old* exports. Re-analyse
+        // those dependents and re-publish their diagnostics so they reflect F's new
+        // exports.
+        //
+        // POLICY (documented per the task brief):
+        //   - DIRECT dependents only — files whose `ImportRef.module_id` is F. We do
+        //     NOT walk transitively: a transitive dependent only sees F's types via
+        //     an intermediate module's re-exported signature, which is rare, and a
+        //     full transitive sweep on every keystroke does not scale. Direct-only is
+        //     the sound, bounded default.
+        //   - OPEN documents only — the client renders diagnostics/hover only for
+        //     open docs, so re-checking closed files would be wasted work.
+        //   - Runs on every `update` (did_open / did_change / did_save). Re-analysing
+        //     a handful of direct open dependents is cheap (parse + check of small
+        //     files); bounding to direct + open keeps it so even on each keystroke,
+        //     which is the freshest behaviour without a workspace-wide sweep.
+        //
+        // No infinite-loop risk: `dependents_of` never returns F itself, we only
+        // re-analyse (we do NOT recursively call `update`, which would re-trigger),
+        // and we skip F's own URI defensively. A cyclic graph (A↔B) is therefore
+        // safe — editing A re-checks B once and stops.
+        self.recheck_open_dependents(uri).await;
+    }
+
+    /// Re-analyse and re-publish diagnostics for every currently-open document that
+    /// DIRECTLY imports from `changed_uri`. See the policy note in `update`.
+    async fn recheck_open_dependents(&self, changed_uri: &Url) {
+        let Ok(changed_path) = changed_uri.to_file_path() else { return };
+        let changed_id = canonical_id(&changed_path);
+
+        // Compute the direct dependents under the index read lock, then drop it
+        // before any await (we must not hold a std `RwLock` guard across `.await`).
+        let dependent_ids: Vec<String> = {
+            let index = WORKSPACE_INDEX.read().unwrap();
+            index.dependents_of(&changed_id)
+        };
+        if dependent_ids.is_empty() {
+            return;
+        }
+
+        // Snapshot the open docs (uri + source) for the dependents we care about,
+        // again releasing the lock before awaiting. A dependent that isn't currently
+        // open is skipped — the client only renders open documents.
+        let to_recheck: Vec<(Url, String)> = {
+            let docs = self.docs.read().unwrap();
+            docs.iter()
+                .filter(|(dep_uri, _)| *dep_uri != changed_uri)
+                .filter(|(dep_uri, _)| {
+                    dep_uri
+                        .to_file_path()
+                        .map(|p| dependent_ids.contains(&canonical_id(&p)))
+                        .unwrap_or(false)
+                })
+                .map(|(u, s)| (u.clone(), s.clone()))
+                .collect()
+        };
+
+        for (dep_uri, dep_source) in to_recheck {
+            let base_dir = file_dir(&dep_uri);
+            let analysis = analyse(&dep_source, base_dir.as_deref());
+            self.client
+                .publish_diagnostics(dep_uri, analysis.diagnostics, None)
+                .await;
+        }
     }
 }
 
@@ -3140,6 +3204,33 @@ impl WorkspaceIndex {
         out
     }
 
+    /// Every file that DIRECTLY imports from `module_id`, as a set of module ids.
+    /// A file B depends on `module_id` when B has an `ImportRef` whose resolved
+    /// `module_id` equals it (i.e. `import { ... } from "<module_id>"`). The owner
+    /// itself is never returned, so this is safe to drive a re-check loop with even
+    /// on a self/cyclic import graph (A→B, B→A): asking for A's dependents yields B
+    /// and asking for B's yields A, but neither result contains the queried module,
+    /// and the caller re-checks each dependent exactly once (no transitive chase) —
+    /// so there is no recursion to bound.
+    ///
+    /// DIRECT only by design: transitive dependents are intentionally NOT walked
+    /// here (see the `update` handler's re-check policy note for the rationale).
+    /// Pure over the index, so it's unit-testable without the async handler.
+    fn dependents_of(&self, module_id: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .files
+            .iter()
+            .filter(|(mid, file)| {
+                mid.as_str() != module_id
+                    && file.imports.iter().any(|imp| imp.module_id == module_id)
+            })
+            .map(|(mid, _)| mid.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Fuzzy-search every top-level declaration in the index for `query`,
     /// returning `(module_id, name, name_span, kind)` matches. An empty query
     /// matches everything (the client filters further). stdlib symbols are
@@ -3952,6 +4043,50 @@ mod tests {
             .resolve_symbol(&b_id, use_off)
             .expect("should resolve the imported symbol from its use");
         assert_eq!((owner2, name2), (owner, name));
+    }
+
+    /// Dependency computation for the on-edit re-check: when A changes, the set of
+    /// files to re-check is exactly the DIRECT importers of A. Here B imports a
+    /// symbol from A (so B is a dependent) and C is unrelated (so C is excluded).
+    /// A itself is never in its own dependent set, which is what makes driving a
+    /// re-check loop with this safe on cyclic graphs.
+    #[test]
+    fn dependents_of_includes_direct_importers_only() {
+        let a = "export val foo = 1\n";
+        let b = "import { foo } from \"a\"\nval x = foo\n";
+        let c = "val unrelated = 99\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b), ("/ws/c.lin", c)]);
+        let a_id = id_of("/ws/a.lin");
+        let b_id = id_of("/ws/b.lin");
+        let c_id = id_of("/ws/c.lin");
+
+        let deps = index.dependents_of(&a_id);
+        assert!(deps.contains(&b_id), "B imports from A → must be a dependent: {:?}", deps);
+        assert!(!deps.contains(&c_id), "C is unrelated → must be excluded: {:?}", deps);
+        assert!(!deps.contains(&a_id), "A is never its own dependent: {:?}", deps);
+
+        // C imports nothing → it has no dependents either.
+        assert!(index.dependents_of(&c_id).is_empty());
+    }
+
+    /// Cyclic import graphs are safe to drive the re-check loop with: A↔B each list
+    /// the OTHER as a dependent but never themselves, so editing A re-checks B once
+    /// (and vice-versa) with no transitive chase and no recursion to bound.
+    #[test]
+    fn dependents_of_cyclic_graph_excludes_self_no_recursion() {
+        let a = "import { b } from \"b\"\nexport val a = 1\n";
+        let b = "import { a } from \"a\"\nexport val b = 2\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b)]);
+        let a_id = id_of("/ws/a.lin");
+        let b_id = id_of("/ws/b.lin");
+
+        let a_deps = index.dependents_of(&a_id);
+        assert_eq!(a_deps, vec![b_id.clone()], "A's only dependent is B: {:?}", a_deps);
+        assert!(!a_deps.contains(&a_id), "A must not depend on itself");
+
+        let b_deps = index.dependents_of(&b_id);
+        assert_eq!(b_deps, vec![a_id.clone()], "B's only dependent is A: {:?}", b_deps);
+        assert!(!b_deps.contains(&b_id), "B must not depend on itself");
     }
 
     /// Cross-file rename emits a multi-file edit set keyed per file; stdlib is never edited.
