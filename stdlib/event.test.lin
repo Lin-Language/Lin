@@ -1,0 +1,186 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { toString, join } from "std/string"
+import { push, length } from "std/array"
+import { for } from "std/iter"
+import { keys } from "std/object"
+import { bus, on, once, off, emit, listenerCount, emitter, send, request, drain, stop, event } from "std/event"
+
+// Handlers can't return values into the assertions, so they append to a module-level log; tests
+// assert on the log contents. A fresh log per test via `reset`.
+var log: Json = []
+val reset = (): Null =>
+  log = []
+val record = (s: String): Null =>
+  push(log, s)
+val logStr = (): String =>
+  join(log, ",")
+
+val s = suite("std/event", [
+  // ── Layer 2: synchronous bus ──
+  test("event() builds the {type,data} shape", () =>
+    val e = event("leg", { "from": "A" })
+    [
+      expect(e["type"]).toBe("leg"),
+      expect(e["data"]["from"]).toBe("A")
+    ]
+  ),
+
+  test("on + emit invokes listeners in order, returns count", () =>
+    reset()
+    val b = bus()
+    on(b, "tick", (d: Json): Null => record("A${d}"))
+    on(b, "tick", (d: Json): Null => record("B${d}"))
+    val fired = emit(b, "tick", 1)
+    [
+      expect(fired).toBe(2),
+      expect(logStr()).toBe("A1,B1")
+    ]
+  ),
+
+  test("emit on an event with no listeners fires zero (no crash)", () =>
+    val b = bus()
+    [
+      expect(emit(b, "absent", 0)).toBe(0)
+    ]
+  ),
+
+  test("listenerCount reflects registrations", () =>
+    val b = bus()
+    on(b, "x", (d: Json): Null => null)
+    on(b, "x", (d: Json): Null => null)
+    on(b, "y", (d: Json): Null => null)
+    [
+      expect(listenerCount(b, "x")).toBe(2),
+      expect(listenerCount(b, "y")).toBe(1),
+      expect(listenerCount(b, "z")).toBe(0)
+    ]
+  ),
+
+  test("off removes a listener by its subscription handle", () =>
+    reset()
+    val b = bus()
+    val subA = on(b, "tick", (d: Json): Null => record("A"))
+    on(b, "tick", (d: Json): Null => record("B"))
+    val removed = off(b, subA)
+    val fired = emit(b, "tick", 0)
+    [
+      expect(removed).toBe(true),
+      expect(fired).toBe(1),
+      expect(logStr()).toBe("B"),
+      expect(listenerCount(b, "tick")).toBe(1)
+    ]
+  ),
+
+  test("off on an already-removed handle is a no-op returning false", () =>
+    val b = bus()
+    val sub = on(b, "tick", (d: Json): Null => null)
+    off(b, sub)
+    [
+      expect(off(b, sub)).toBe(false)
+    ]
+  ),
+
+  test("once fires exactly one time then is removed", () =>
+    reset()
+    val b = bus()
+    once(b, "tick", (d: Json): Null => record("once${d}"))
+    on(b, "tick", (d: Json): Null => record("on${d}"))
+    val first = emit(b, "tick", 1)
+    val second = emit(b, "tick", 2)
+    [
+      expect(first).toBe(2),
+      expect(second).toBe(1),
+      expect(logStr()).toBe("once1,on1,on2"),
+      expect(listenerCount(b, "tick")).toBe(1)
+    ]
+  ),
+
+  test("a handler subscribing during dispatch does not fire this round", () =>
+    reset()
+    val b = bus()
+    on(b, "tick", (d: Json): Null =>
+      record("first")
+      on(b, "tick", (d2: Json): Null => record("late"))
+    )
+    val firstRound = emit(b, "tick", 0)
+    val secondRound = emit(b, "tick", 0)
+    [
+      // First emit: only the original listener fires (snapshot taken before dispatch).
+      expect(firstRound).toBe(1),
+      // The late listener registered during the first emit fires on the second (plus the original,
+      // which also re-adds another late one — so the second round sees 2: original + first late).
+      expect(secondRound).toBe(2)
+    ]
+  ),
+
+  // ── Layer 1: async, worker-backed emitter ──
+  test("emitter folds sent events into worker-owned state, drain returns it", () =>
+    val sink = emitter(
+      (evt: Json, count: Json): Json =>
+        match evt["type"]
+          is "inc" => count + evt["data"]
+          else => count,
+      0
+    )
+    send(sink, "inc", 10)
+    send(sink, "inc", 5)
+    send(sink, "inc", 100)
+    val total = drain(sink)
+    stop(sink)
+    [
+      expect(total).toBe(115)
+    ]
+  ),
+
+  test("emitter built by a factory that RETURNS it keeps its var state (spec §24.6.4)", () =>
+    // The reducer closes over the emitter's internal `var state`, and `emitter` returns the worker
+    // out of its frame — the captured-var-escape path. Exercises that fix end to end.
+    val mkSink = (): Json =>
+      emitter((evt: Json, n: Json): Json => n + 1, 0)
+    val sink = mkSink()
+    send(sink, "x", null)
+    send(sink, "x", null)
+    val n = drain(sink)
+    stop(sink)
+    [
+      expect(n).toBe(2)
+    ]
+  ),
+
+  test("request delivers an event synchronously and returns the folded state", () =>
+    val sink = emitter((evt: Json, acc: Json): Json => acc + evt["data"], 0)
+    val afterFirst = request(sink, "add", 7)
+    val afterSecond = request(sink, "add", 3)
+    stop(sink)
+    [
+      expect(afterFirst).toBe(7),
+      expect(afterSecond).toBe(10)
+    ]
+  ),
+
+  test("emitter indexes records by a key (the RAPTOR transfer-index shape)", () =>
+    val sink = emitter(
+      (evt: Json, index: Json): Json =>
+        match evt["type"]
+          is "transfer" =>
+            val t = evt["data"]
+            if index[t["from"]] == null then index[t["from"]] = []
+            push(index[t["from"]], t)
+            index
+          else => index,
+      {}
+    )
+    send(sink, "transfer", { "from": "A", "to": "B" })
+    send(sink, "transfer", { "from": "A", "to": "C" })
+    send(sink, "transfer", { "from": "X", "to": "Y" })
+    val index = drain(sink)
+    stop(sink)
+    [
+      expect(length(keys(index))).toBe(2),
+      expect(length(index["A"])).toBe(2),
+      expect(length(index["X"])).toBe(1)
+    ]
+  )
+])
+
+run(s)

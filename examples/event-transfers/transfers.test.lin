@@ -1,0 +1,49 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { length } from "std/array"
+import { keys } from "std/object"
+import { makeTransfer, emitRow, transferIndexer, indexRows } from "./transfers"
+import { drain, stop } from "std/event"
+
+val s = suite("event-transfers", [
+  test("makeTransfer builds the transfer record", () =>
+    val t = makeTransfer("A", "B", 60)
+    [
+      expect(t["origin"]).toBe("A"),
+      expect(t["destination"]).toBe("B"),
+      expect(t["duration"]).toBe(60)
+    ]
+  ),
+
+  test("indexRows groups footpaths by origin", () =>
+    val index = indexRows([
+      "A,B,2,60",
+      "A,C,2,90",
+      "B,C,2,45",
+      "X,Y,2,30"
+    ])
+    [
+      expect(length(keys(index))).toBe(3),
+      expect(length(index["A"])).toBe(2),
+      expect(length(index["B"])).toBe(1),
+      expect(length(index["X"])).toBe(1),
+      expect(index["A"][0]["destination"]).toBe("B"),
+      expect(index["A"][1]["duration"]).toBe(90)
+    ]
+  ),
+
+  test("a same-stop row (interchange) is not emitted as a footpath", () =>
+    val sink = transferIndexer()
+    val emittedFootpath = emitRow(sink, "A,B,2,60")
+    val emittedSelf = emitRow(sink, "A,A,2,120")
+    val index = drain(sink)
+    stop(sink)
+    [
+      expect(emittedFootpath).toBe(true),
+      expect(emittedSelf).toBe(false),
+      expect(length(keys(index))).toBe(1),
+      expect(length(index["A"])).toBe(1)
+    ]
+  )
+])
+
+run(s)

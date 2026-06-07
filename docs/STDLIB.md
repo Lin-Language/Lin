@@ -4513,6 +4513,102 @@ close(w)
 
 ---
 
+## std/event
+
+Typed event emitters in two layers over one event shape. An **Event** is always
+`{ "type": String, "data": Json }` — a single transferable payload tagged by a string
+discriminant (not Node-style positional `(...args)`), so dispatch is a clean `match evt["type"]`
+and the payload satisfies the §24 thread-transfer rule (no `Function`/`Iterator`/`Stream` in
+`data`).
+
+Two layers, picked by whether you need concurrency:
+
+- **Layer 1 — `emitter` (async, worker-backed).** A long-lived worker (`std/async`, §24.6) owns
+  the subscriber state and folds each delivered event into it with a reducer. Use it when a
+  producer on one thread feeds a subscriber on another — e.g. stream a file and `send` processed
+  records to an indexer worker.
+- **Layer 2 — `bus` (synchronous, in-process).** A plain listener registry dispatched on the
+  calling thread. Use it for decoupled pub/sub within one thread.
+
+Design notes (learning from Node's `EventEmitter`): there is **no** magic `"error"` event that
+aborts the process when unhandled — errors are ordinary values and an async reducer fault is
+isolated at the worker boundary (§24.6.5); you **unsubscribe by handle**, not by fragile closure
+identity; each event carries **one** transferable payload; and listener counts are queryable
+rather than a silent leak.
+
+Because `type` is a Lin keyword, the event type is passed as a parameter named `name` and stored
+under the `"type"` key.
+
+### event
+
+```txt
+event: (name: String, data: Json) => Json
+```
+
+Build an Event value `{ "type": name, "data": data }`. A convenience so call sites read
+`event("leg", leg)` instead of spelling the literal.
+
+### Layer 1 — async emitter
+
+```txt
+emitter: ((Event, State) => State, State) => Emitter    // spawn a subscriber worker over `initial` state
+send:    (Emitter, name: String, data: Json) => Null    // fire-and-forget (no backpressure)
+request: (Emitter, name: String, data: Json) => Json    // synchronous: block until folded, return new state
+drain:   (Emitter) => Json                              // flush queue, return final accumulated state
+stop:    (Emitter) => Null                              // shut the worker down (after this, send is an error)
+```
+
+The reducer runs **on the worker thread**, one event at a time, so its state is thread-confined
+(it may hold a captured `var`, §24.6.4). `send` is fire-and-forget — a fast producer can outrun a
+slow reducer and grow the queue; use `request` to pace (the producer waits for the fold) or rely
+on the final `drain`. `Emitter` is an opaque worker handle (erased to `Json`).
+
+```txt
+// Stream a file, emit processed records to an indexer worker, drain the assembled index.
+val sink = emitter(
+  (evt, index) =>
+    match evt["type"]
+      is "transfer" =>
+        val t = evt["data"]
+        if index[t["from"]] == null then index[t["from"]] = []
+        push(index[t["from"]], t)
+        index
+      else => index,
+  {}
+)
+send(sink, "transfer", { "from": "A", "to": "B" })
+val index = drain(sink)
+stop(sink)
+```
+
+### Layer 2 — synchronous bus
+
+```txt
+bus:           () => Bus                                       // a fresh in-process event bus
+on:            (Bus, name: String, (Json) => Null) => Sub      // register; returns a subscription handle
+once:          (Bus, name: String, (Json) => Null) => Sub      // fires at most once, then auto-removed
+off:           (Bus, sub: Sub) => Boolean                      // remove by handle; true if one was removed
+emit:          (Bus, name: String, data: Json) => Int32        // invoke listeners synchronously; returns count
+listenerCount: (Bus, name: String) => Int32                    // how many listeners are registered for `name`
+```
+
+`on`/`once` return a subscription handle (`{ "type": name, "id": Int32 }`) — pass it to `off`.
+`emit` snapshots the listener list before firing, so a handler that subscribes or unsubscribes
+during dispatch does not perturb the current round (additions fire on the next `emit`). `emit` on
+an event with no listeners returns `0` and does nothing.
+
+```txt
+val b = bus()
+val sub = on(b, "tick", d => print("tick ${d}"))
+once(b, "tick", d => print("first only ${d}"))
+emit(b, "tick", 1)        // both fire; returns 2
+emit(b, "tick", 2)        // once-listener is gone; returns 1
+off(b, sub)               // unsubscribe by handle
+emit(b, "tick", 3)        // returns 0
+```
+
+---
+
 ## std/env
 
 Access to environment variables for the current process.
