@@ -13,7 +13,12 @@ The extension bundles the `lin` compiler and `lin-lsp` language server, so there
 - **Syntax highlighting** for `.lin` files.
 - **Diagnostics** — type errors and parse errors shown inline as you type.
 - **Hover types** — hover over any expression to see its inferred type.
+- **Inlay hints** — inferred type annotations shown inline on `val`/`var` bindings (on by default; hold `Ctrl`+`Alt` to toggle).
+- **Semantic highlighting** — type-aware token colouring (variables, parameters, functions, types, namespaces), on by default.
+- **Signature help** — parameter hints while typing a call.
+- **Code actions** — quick fixes and refactors offered inline.
 - **Go to definition** — jump to where a binding is declared.
+- **Find references, rename, and workspace symbols** — cross-file navigation across your project.
 - **Dot-completion with auto-import** — type `myArr.` and the completion list shows only functions that accept an array as their first argument (`map`, `filter`, `reduce`, …). Selecting one automatically inserts the `import` at the top of the file if it isn't already there.
 - **`lin` on your PATH, no install step** — when the extension is active, the bundled `lin` is automatically added to the PATH of VS Code's integrated terminal, so `lin run foo.lin` just works. To use `lin` in any shell, run **Lin: Install `lin` on PATH** from the Command Palette.
 
