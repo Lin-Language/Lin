@@ -79,6 +79,34 @@ fn arg_satisfies_numeric_bound(arg_ty: &Type) -> bool {
 }
 
 impl Checker {
+    /// Replace every `Type::Named(n)` whose alias resolves to a structural type with that resolved
+    /// type, recursing into containers. Repairs a forward-declared function's return type that
+    /// still carries an unresolved `Named` placeholder (mutual-recursion forward declaration). A
+    /// Named that resolves back to itself (a recursive-cycle point — `resolve_type` applies the
+    /// cycle guard) or to a base scalar is left untouched, so recursive types keep their cycle
+    /// points and nothing widens. Containers recurse; object FIELDS are left as-is (their member
+    /// types were already resolved structurally when the alias was defined, and re-walking a record
+    /// risks expanding a deliberate recursive `Named` field — changing the type's identity).
+    fn expand_named_aliases(&self, ty: &Type) -> Type {
+        match ty {
+            Type::Named(n) => match crate::resolve::resolve_type(
+                &lin_parse::ast::TypeExpr::Named(n.clone(), Span::dummy()),
+                &self.env,
+            ) {
+                Ok(resolved) if !matches!(&resolved, Type::Named(m) if m == n) => resolved,
+                _ => ty.clone(),
+            },
+            Type::Array(inner) => Type::Array(Box::new(self.expand_named_aliases(inner))),
+            Type::Iterator(inner) => Type::Iterator(Box::new(self.expand_named_aliases(inner))),
+            Type::Shared(inner) => Type::Shared(Box::new(self.expand_named_aliases(inner))),
+            Type::Stream(inner) => Type::Stream(Box::new(self.expand_named_aliases(inner))),
+            Type::Union(variants) => {
+                Type::flatten_union(variants.iter().map(|t| self.expand_named_aliases(t)).collect())
+            }
+            _ => ty.clone(),
+        }
+    }
+
     /// `fromJson` special form (ADR-031). `T.fromJson(value)` desugars to a DotCall and
     /// `fromJson(T, value)` to a Call; both reach here BEFORE arg0/receiver is inferred as a
     /// value (a type name like `Person` is not a runtime value). Fires only when:
@@ -680,7 +708,34 @@ impl Checker {
                 // (Float64 here). No guard — the previous reject was a workaround for a codegen ABI
                 // mismatch (frozen-result-type) now fixed in `lin-ir::monomorphize`.
 
-                let concrete_ret = apply_type_subs(ret, &subs);
+                // Expand any `Named` type-alias in the resolved return type against the (now
+                // fully-resolved) env. A forward-declared function signature can carry an
+                // UNRESOLVED `Named("R")` return when `R`'s alias body was still the placeholder at
+                // forward-declaration time (mutual recursion: `f`/`g` are forward-declared before
+                // either alias body is resolved). Leaving the call result as `Named("R")` while the
+                // sibling actually returns a structural SEALED `{…}` makes the `if`-merge box the
+                // packed sealed value as an opaque union and later read it back with `lin_unbox_ptr`
+                // → packed-pointer-as-box → segfault. Expanding yields the SAME structural shape the
+                // sibling's body produces, so every repr decision agrees.
+                //
+                // SCOPE: skip a DIRECT SELF-recursive call in TAIL position. Such a call is
+                // TAIL-call-optimized (CLAUDE.md / ADR-016: a direct self tail call becomes a
+                // back-edge), so its return value is never read cross-frame — the value flows
+                // straight into the next iteration's param slot, never through a record-shaped
+                // coercion. Keeping the `Named` result there preserves the Stage-4 escape analysis's
+                // stack-allocation of a TCO-loop accumulator record (`test_sealed_stack_tco_loop_*`):
+                // the representation boundary at the boxed-union `if`-merge is what lets the
+                // per-iteration fresh record stay stack-resident. EVERY other call — a self-call in
+                // NON-tail position (its result is read in-frame, e.g. `val p = f(n-1); p["v"]`) or
+                // any cross-function call (mutual recursion) — must expand, since the returned record
+                // IS read and must agree on the packed representation.
+                let is_self_tail_call = prev_tail
+                    && matches!(func, Expr::Ident(n, _) if Some(n.as_str()) == self.current_function.as_deref());
+                let concrete_ret = if is_self_tail_call {
+                    apply_type_subs(ret, &subs)
+                } else {
+                    self.expand_named_aliases(&apply_type_subs(ret, &subs))
+                };
                 let required = *required;
 
                 let result_type = if partial {
