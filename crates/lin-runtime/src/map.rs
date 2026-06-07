@@ -114,13 +114,20 @@ unsafe fn find_slot(map: *const LinMap, key: *const LinString) -> usize {
     let cap = (*map).cap as usize;
     let mask = cap - 1;
     let mut idx = (hash_key(key) as usize) & mask;
-    loop {
+    // Bound the probe to `cap` steps. `lin_map_set` keeps the load factor < 1 (`over_load`), so a
+    // well-formed map always has an empty slot and this terminates on the null-key check well
+    // before the bound. The bound is DEFENSIVE: a wrong-tag pointer reaching here (e.g. a LinObject
+    // misread as a LinMap before the codegen tag-dispatch was added) would otherwise spin forever
+    // on a table with no null slot. Returning the last probed index degrades to a miss/overwrite
+    // rather than an infinite loop — a contained failure, not a hang.
+    for _ in 0..cap {
         let slot = (*map).slots.add(idx);
         if (*slot).key.is_null() || key_eq((*slot).key, key) {
             return idx;
         }
         idx = (idx + 1) & mask;
     }
+    idx
 }
 
 /// Double the table size and re-insert all live entries (keys/values move by raw bytes — no RC
@@ -372,6 +379,62 @@ pub unsafe extern "C" fn lin_entries_any(p: *const u8) -> *mut crate::array::Lin
         TAG_MAP => lin_map_entries(tv.payload as *const LinMap),
         _ => crate::array::lin_array_alloc(0),
     }
+}
+
+/// Coerce a (possibly boxed) value to a raw `LinMap*` for the Json/Object → `{ String: T }`
+/// boundary, returning a value with ONE owned reference (rc +1 the caller owns).
+///
+/// `p` is a `*TaggedVal` (the boxed value at the coercion site). Dispatch on its tag:
+///   * TAG_MAP — the value is ALREADY a map (e.g. a real `{ String: T }` flowing through the Json
+///     supertype, or a nested map value): retain it and return the same pointer. NO copy — keeps
+///     identity so a later mutation is observed (the `test_typed_map_through_function_value`
+///     nested case) and avoids an O(n) rebuild.
+///   * TAG_OBJECT — the value is a `LinObject` (an empty object literal `{}`, a `Json` object
+///     field): MATERIALIZE a fresh `LinMap` from its entries, because the map accessors
+///     (`lin_map_get`/`_set`) would otherwise read a `LinObject`'s bytes as a hash table and
+///     corrupt the heap. `lin_map_set` retains each key/value, so the new map owns its references;
+///     the source object is untouched.
+///   * anything else (null / non-container) — an empty map.
+///
+/// Returning a +1-owned map in every arm matches the `register_owned` the lowerer applies to a
+/// Coerce result, so the scheduled release balances regardless of which arm ran.
+#[no_mangle]
+pub unsafe extern "C" fn lin_to_map(p: *const u8) -> *mut LinMap {
+    if p.is_null() {
+        return lin_map_alloc(0);
+    }
+    let tv = &*(p as *const TaggedVal);
+    match tv.tag {
+        crate::tagged::TAG_MAP => {
+            let m = tv.payload as *mut LinMap;
+            if !m.is_null() && (*m).refcount < IMMORTAL_RC {
+                (*m).refcount += 1;
+            }
+            m
+        }
+        crate::tagged::TAG_OBJECT => lin_object_to_map(tv.payload as *const crate::object::LinObject),
+        _ => lin_map_alloc(0),
+    }
+}
+
+/// Build a fresh `LinMap` (rc = 1) from a `LinObject`'s entries. The materialization half of
+/// `lin_to_map` (which dispatches the already-a-map case). Each value's inner payload is retained
+/// by `lin_map_set`; the source object is unchanged.
+#[no_mangle]
+pub unsafe extern "C" fn lin_object_to_map(obj: *const crate::object::LinObject) -> *mut LinMap {
+    let map = lin_map_alloc(0);
+    if obj.is_null() {
+        return map;
+    }
+    let len = (*obj).len;
+    for i in 0..len {
+        let entry = (*obj).entries.add(i as usize);
+        let key = (*entry).key;
+        if !key.is_null() {
+            lin_map_set(map, key, &(*entry).value as *const TaggedVal);
+        }
+    }
+    map
 }
 
 #[cfg(test)]
