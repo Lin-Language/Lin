@@ -22,12 +22,15 @@ impl Parser {
                 self.advance();
                 self.skip_newlines();
                 let body = self.parse_expr_or_block();
+                // opening `(` .. end of body.
+                let full_span = span.to(body.full_span());
                 return Expr::Function {
                     type_params: Vec::new(),
                     params: Vec::new(),
                     return_type: None,
                     body: Box::new(body),
                     span,
+                    full_span,
                 };
             }
             return Expr::TupleArgs(Vec::new(), span);
@@ -62,12 +65,15 @@ impl Parser {
                 } else {
                     (None, false)
                 };
+                // opening `(` of the tuple receiver .. last token of the dot-call.
+                let full_span = span.to(self.prev_span());
                 return Expr::DotCall {
                     receiver: Box::new(Expr::TupleArgs(args, span)),
                     method,
                     args: call_args,
                     partial,
                     span: dot_span,
+                    full_span,
                 };
             }
 
@@ -90,12 +96,15 @@ impl Parser {
             } else {
                 (None, false)
             };
+            // opening `(` of the grouped receiver .. last token of the dot-call.
+            let full_span = span.to(self.prev_span());
             return Expr::DotCall {
                 receiver: Box::new(first),
                 method,
                 args: call_args,
                 partial,
                 span: dot_span,
+                full_span,
             };
         }
         first
@@ -129,12 +138,15 @@ impl Parser {
         self.expect(TokenKind::Arrow);
         self.skip_newlines();
         let body = self.parse_function_body();
+        // Bare lambda `x => body`: param-ident start .. end of body (no closing delimiter).
+        let full_span = span.to(body.full_span());
         Expr::Function {
             type_params: Vec::new(),
             params: vec![param],
             return_type: None,
             body: Box::new(body),
             span,
+            full_span,
         }
     }
 
@@ -231,7 +243,9 @@ impl Parser {
         if stmts.is_empty() {
             final_expr
         } else {
-            Expr::Block(stmts, Box::new(final_expr), span)
+            // Block start .. end of the tail expr.
+            let full_span = span.to(final_expr.full_span());
+            Expr::Block(stmts, Box::new(final_expr), span, full_span)
         }
     }
 
@@ -355,7 +369,9 @@ impl Parser {
         self.expect(TokenKind::Arrow);
         self.skip_newlines();
         let body = self.parse_function_body();
-        Expr::Function { type_params, params, return_type, body: Box::new(body), span }
+        // opening `<`/`(` .. end of body.
+        let full_span = span.to(body.full_span());
+        Expr::Function { type_params, params, return_type, body: Box::new(body), span, full_span }
     }
 
     pub(crate) fn parse_param(&mut self) -> Param {

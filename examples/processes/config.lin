@@ -1,0 +1,35 @@
+// config.lin — read the runner's configuration from the environment (std/env).
+//
+// A real CI step-runner is tuned by env vars: how many steps to run at once, how many
+// times to retry a flaky step, and whether it is running under CI (which usually means
+// "be strict / non-interactive"). `getEnv` returns `String | Null`, so every read is
+// narrowed: an unset or non-numeric var falls back to a documented default rather than
+// failing. The result is a precise Config record — no Json anywhere.
+import { getEnv } from "std/env"
+import { isInt32, parseInt32 } from "std/number"
+
+export type Config = { "maxParallel": Int32, "retries": Int32, "ci": Boolean }
+
+// Read an integer env var, clamped to be at least `min`, falling back to `dflt` when the
+// var is unset or not a valid integer.
+val intEnv = (name: String, dflt: Int32, min: Int32): Int32 =>
+  val raw = getEnv(name)
+  match raw
+    is String => if isInt32(raw) && parseInt32(raw) >= min then parseInt32(raw) else dflt
+    else => dflt
+
+// An env var is "truthy" when set to "1" or "true" (case-sensitive, the usual CI shape).
+val boolEnv = (name: String): Boolean =>
+  val raw = getEnv(name)
+  match raw
+    is String => raw == "1" || raw == "true"
+    else => false
+
+// Build the runner config from the environment. Defaults suit a developer machine:
+// 4-way parallelism, 2 retries, not CI.
+export val loadConfig = (): Config =>
+  {
+    "maxParallel": intEnv("PROCESSES_MAX_PARALLEL", 4, 1),
+    "retries": intEnv("PROCESSES_RETRIES", 2, 0),
+    "ci": boolEnv("CI")
+  }

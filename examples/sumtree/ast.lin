@@ -1,0 +1,75 @@
+// sumtree — a recursive tagged sum type (`Expr`) evaluated as an unboxed tree.
+//
+// `Expr` is `Num | BinOp` where `BinOp` carries recursive `left`/`right : Expr`
+// children. With the unboxed-sum-type representation (design §1.4, Stage 2) each
+// node is a packed heap `SumNode`: the recursive children are 8-byte owned
+// `*SumNode` pointer slots, dispatch is an O(1) inline-tag switch, and a child
+// read is a constant-offset pointer load — no boxed `LinObject`, no `lin_object_get`.
+// A literal number.
+export type Num = { "kind": "num", "value": Int32 }
+
+// A binary operation over two sub-expressions. `op` is a small scalar code:
+// 0 = add, 1 = subtract, 2 = multiply.
+export type BinOp = { "kind": "op", "op": Int32, "left": Expr, "right": Expr }
+
+// The recursive expression tree.
+export type Expr = Num | BinOp
+
+// Constructor helpers. These build a node INSIDE a function and RETURN it — the
+// canonical "parser" shape (a tail-return sum literal). The nested recursive children
+// must construct as unboxed `SumNode`s too (the per-variant expected type is pushed
+// into them), exactly like a `val n: Expr = {…}` binding. A leaf number.
+export val num = (v: Int32): Expr =>
+  { "kind": "num", "value": v }
+
+// A binary node built from two already-constructed children (returned from the if-tail).
+export val binOp = (code: Int32, l: Expr, r: Expr): Expr =>
+  if code == 0 then
+    {
+      "kind": "op",
+      "op": 0,
+      "left": l,
+      "right": r
+    }
+  else if code == 1 then
+    {
+      "kind": "op",
+      "op": 1,
+      "left": l,
+      "right": r
+    }
+  else
+    {
+      "kind": "op",
+      "op": 2,
+      "left": l,
+      "right": r
+    }
+
+// Recursively build a left-leaning sum spine of `n` leaf 1's (returns a fresh sub-tree
+// at every level — exercises the tail-return pushdown at each recursion depth).
+export val chain = (n: Int32): Expr =>
+  if n <= 1 then
+    { "kind": "num", "value": 1 }
+  else
+    {
+      "kind": "op",
+      "op": 0,
+      "left": chain(n - 1),
+      "right": { "kind": "num", "value": 1 }
+    }
+
+// Evaluate an expression tree to an Int32. The recursive children are read by
+// constant offset and the recursion re-enters the tag switch.
+export val eval = (e: Expr): Int32 =>
+  match e
+    is Num => e["value"]
+    is BinOp =>
+      val l = eval(e["left"])
+      val r = eval(e["right"])
+      if e["op"] == 0 then
+        l + r
+      else if e["op"] == 1 then
+        l - r
+      else
+        l * r

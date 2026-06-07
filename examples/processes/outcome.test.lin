@@ -1,0 +1,80 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { Result, ok, err, isOk, andThen, mapOk, unwrapOr } from "./outcome"
+
+// Unit tests for the generic, Json-free Result combinators in isolation. Every receiver
+// is annotated `Result<Int32, String>` so each call's type parameters are determined.
+val dbl = (n: Int32): Int32 => n * 2
+
+// A fallible step over the SAME error type, so the chain composes.
+val checkPos = (n: Int32): Result<Int32, String> =>
+  if n > 0 then ok(n) else err("not positive")
+
+// `mapOk`'s result type parameter `U` is inferred from `dbl`'s return type. The compiler
+// fails to propagate that inference when the call sits inside an inline anonymous thunk
+// argument (see the BUG #4 note in README.md), so these two bodies are defined as named
+// top-level lambdas — where the inference happens in plain statement position and works.
+val mapOkSuccessBody = () =>
+  val r: Result<Int32, String> = ok(21)
+  [
+    expect(mapOk(r, dbl)["value"]).toBe(42)
+  ]
+
+val mapOkFailureBody = () =>
+  val r: Result<Int32, String> = err("e")
+  [
+    expect(mapOk(r, dbl)["error"]).toBe("e")
+  ]
+
+val s = suite("outcome combinators", [
+  test("ok / err construct the tagged shapes", () =>
+    val good: Result<Int32, String> = ok(1)
+    val bad: Result<Int32, String> = err("e")
+    [
+      expect(good.isOk()).toBe(true),
+      expect(bad.isOk()).toBe(false)
+    ]
+  ),
+
+  test("andThen runs f on success", () =>
+    val r: Result<Int32, String> = ok(5)
+    val out: Result<Int32, String> = andThen(r, checkPos)
+    [
+      expect(out["value"]).toBe(5)
+    ]
+  ),
+
+  test("andThen short-circuits on failure (f not run)", () =>
+    val r: Result<Int32, String> = err("boom")
+    val out: Result<Int32, String> = andThen(r, checkPos)
+    [
+      expect(out["error"]).toBe("boom")
+    ]
+  ),
+
+  test("andThen can turn success into failure", () =>
+    val r: Result<Int32, String> = ok(0 - 3)
+    val out: Result<Int32, String> = andThen(r, checkPos)
+    [
+      expect(out.isOk()).toBe(false)
+    ]
+  ),
+
+  test("mapOk transforms a success value", mapOkSuccessBody),
+
+  test("mapOk leaves a failure unchanged", mapOkFailureBody),
+
+  test("unwrapOr returns the value on success", () =>
+    val r: Result<Int32, String> = ok(7)
+    [
+      expect(unwrapOr(r, 0)).toBe(7)
+    ]
+  ),
+
+  test("unwrapOr returns the default on failure", () =>
+    val r: Result<Int32, String> = err("e")
+    [
+      expect(unwrapOr(r, 99)).toBe(99)
+    ]
+  )
+])
+run(s)

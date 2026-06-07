@@ -1,0 +1,60 @@
+// Unit suite for frequency.lin — the grade-band histogram over a typed
+// `{ String: Int32 }` map. Covers the band thresholds (including the boundaries),
+// tally counting (first-seen band starts at 0), empty input, and the rendered output.
+import { expect, toBe, test, suite, run } from "std/test"
+import { band, tally, renderTally } from "./frequency"
+import { contains } from "std/string"
+
+val sample = [
+  { "name": "Diana", "score": 100 },
+  { "name": "Bob", "score": 92 },
+  { "name": "Frank", "score": 88 },
+  { "name": "Alice", "score": 85 },
+  { "name": "Charlie", "score": 78 },
+  { "name": "Eve", "score": 55 }
+]
+
+val s = suite("frequency", [
+  // --- band thresholds, including the exact boundaries ---
+  test("maps scores onto letter-grade bands", () => [
+    expect(band(100)).toBe("A (90-100)"),
+    expect(band(90)).toBe("A (90-100)"),
+    expect(band(89)).toBe("B (80-89)"),
+    expect(band(80)).toBe("B (80-89)"),
+    expect(band(70)).toBe("C (70-79)"),
+    expect(band(60)).toBe("D (60-69)"),
+    expect(band(59)).toBe("F (<60)"),
+    expect(band(0)).toBe("F (<60)")
+  ]),
+
+  // --- tally: counts per band, first-seen band starts at 0 then increments ---
+  test("counts records per band", () =>
+    val t = tally(sample)
+    [
+      expect(t["A (90-100)"]).toBe(2),
+      expect(t["B (80-89)"]).toBe(2),
+      expect(t["C (70-79)"]).toBe(1),
+      expect(t["F (<60)"]).toBe(1)
+    ]
+  ),
+
+  // --- a band with no records is absent from the map (reads back Null) ---
+  test("omits bands with no records", () => [
+    expect(tally(sample)["D (60-69)"]).toBe(null)
+  ]),
+
+  // --- empty input yields an empty histogram ---
+  test("empty input renders nothing", () => [
+    expect(renderTally([])).toBe("")
+  ]),
+
+  // --- rendered output is sorted by label and includes the counts ---
+  test("renders sorted band lines with counts", () =>
+    val out = renderTally(sample)
+    [
+      expect(out.contains("A (90-100): 2")).toBe(true),
+      expect(out.contains("F (<60): 1")).toBe(true)
+    ]
+  )
+])
+run(s)

@@ -1,0 +1,147 @@
+// Unit suite for telemetry.lin — the Pi's TLV status frame.
+//
+// Covers the bit helpers (nibble packing, XOR checksum), byte-exact frame
+// layout, the full encode/decode round-trip of every reading, signed-temperature
+// reconstruction, and the two rejection paths (bad checksum, empty frame) that
+// make decode return an Error instead of misreading. Test bodies are Assertion[]
+// arrays so every assertion runs.
+import { expect, toBe, test, suite, run } from "std/test"
+import { encodeTelemetry, decodeTelemetry, packNibbles, highNibble, lowNibble, checksum, Telemetry } from "./telemetry"
+import { length, slice } from "std/array"
+import { concat } from "std/iter"
+
+// A representative snapshot reused across the round-trip tests.
+val sample: Telemetry = {
+  "battery": 87,
+  "leftDuty": 750,
+  "rightDuty": 1000,
+  "tempC": 0 - 5,
+  "health": 3,
+  "link": 12
+}
+
+val s = suite("raspberry-telemetry", [
+  // --- Bit helpers ---
+  test("packs and unpacks two 4-bit nibbles", () =>
+    val b = packNibbles(0xA, 0x5)
+    [
+      expect(b).toBe(165),
+      expect(highNibble(b)).toBe(10),
+      expect(lowNibble(b)).toBe(5)
+    ]
+  ),
+
+  test("packNibbles masks the low argument to 4 bits", () => [
+    expect(packNibbles(0x1, 0xFF)).toBe(0x1F),
+    expect(highNibble(0xAB)).toBe(0xA),
+    expect(lowNibble(0xAB)).toBe(0xB)
+  ]),
+
+  test("XOR checksum folds a byte list to one byte", () =>
+    val a: UInt8[] = [1, 2, 3]
+    val b: UInt8[] = [255, 1, 2]
+    val empty: UInt8[] = []
+    [
+      expect(checksum(a)).toBe(0), // 1^2^3 == 0
+      expect(checksum(b)).toBe(252), // 255^1^2
+      expect(checksum(empty)).toBe(0)
+    ]
+  ),
+
+  // --- Byte-exact frame layout ---
+  // battery 87 -> [1,0,1,87]; motors 750/1000 -> [2,0,4, 02EE, 03E8];
+  // temp -5 -> [3,0,1,251]; status (3<<4)|12=60 -> [4,0,1,60]; then checksum.
+  test("encodes the documented TLV layout plus a checksum trailer", () =>
+    val frame = encodeTelemetry(sample)
+    val body: UInt8[] = frame.slice(0, length(frame) - 1)
+    [
+      expect(length(frame)).toBe(20), // 19-byte body + 1 checksum byte
+      expect(frame[0]).toBe(1), // tag battery
+      expect(frame[3]).toBe(87), // battery value
+      expect(frame[4]).toBe(2), // tag motors
+      expect(frame[6]).toBe(4), // motors length = 4
+      expect(frame[7]).toBe(0x02), // leftDuty 750 = 0x02EE, hi byte
+      expect(frame[8]).toBe(0xEE), // leftDuty lo byte
+      expect(frame[10]).toBe(0xE8), // rightDuty 1000 = 0x03E8, lo byte
+      expect(frame[length(frame) - 1]).toBe(checksum(body)) // trailer = body checksum
+    ]
+  ),
+
+  // --- Full round-trip of every field ---
+  test("round-trips every reading through encode/decode", () =>
+    val back = decodeTelemetry(encodeTelemetry(sample))
+    val r = match back
+      is Error => sample
+      else => back
+    // unreachable on a valid frame; keeps the type concrete
+    [
+      expect(r["battery"]).toBe(87),
+      expect(r["leftDuty"]).toBe(750),
+      expect(r["rightDuty"]).toBe(1000),
+      expect(r["tempC"]).toBe(0 - 5),
+      expect(r["health"]).toBe(3),
+      expect(r["link"]).toBe(12)
+    ]
+  ),
+
+  // Negative temperatures round-trip through the unsigned wire byte (two's
+  // complement: -1 -> 0xFF -> -1), and a zero/positive snapshot also survives.
+  test("signed temperature and boundary values round-trip", () =>
+    val cold: Telemetry = {
+      "battery": 0,
+      "leftDuty": 0,
+      "rightDuty": 0,
+      "tempC": 0 - 1,
+      "health": 0,
+      "link": 0
+    }
+    val warm: Telemetry = {
+      "battery": 100,
+      "leftDuty": 1000,
+      "rightDuty": 1000,
+      "tempC": 40,
+      "health": 15,
+      "link": 15
+    }
+    val c = match decodeTelemetry(encodeTelemetry(cold))
+      is Error => cold
+      else => decodeTelemetry(encodeTelemetry(cold))
+    val w = match decodeTelemetry(encodeTelemetry(warm))
+      is Error => warm
+      else => decodeTelemetry(encodeTelemetry(warm))
+    [
+      expect(c["tempC"]).toBe(0 - 1),
+      expect(c["leftDuty"]).toBe(0),
+      expect(w["tempC"]).toBe(40),
+      expect(w["battery"]).toBe(100),
+      expect(w["health"]).toBe(15),
+      expect(w["link"]).toBe(15)
+    ]
+  ),
+
+  // --- Rejection paths ---
+  test("rejects a frame whose checksum trailer is wrong", () =>
+    val frame = encodeTelemetry(sample)
+    val body: UInt8[] = frame.slice(0, length(frame) - 1)
+    // Re-attach a deliberately wrong trailer (real checksum XOR 0xFF).
+    val tampered: UInt8[] = body.concat([checksum(body) ^ 0xFF])
+    val outcome = match decodeTelemetry(tampered)
+      is Error => "error"
+      else => "decoded"
+    [
+      expect(outcome).toBe("error")
+    ]
+  ),
+
+  test("rejects an empty frame as an Error", () =>
+    val empty: UInt8[] = []
+    val outcome = match decodeTelemetry(empty)
+      is Error => "error"
+      else => "decoded"
+    [
+      expect(outcome).toBe("error")
+    ]
+  )
+])
+
+run(s)

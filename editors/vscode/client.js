@@ -8,6 +8,7 @@ const {
   workspace, window, commands, Range, Uri,
   tests, TestRunRequest, TestRunProfileKind, TestMessage, Position,
   FileCoverage, StatementCoverage, CancellationTokenSource,
+  tasks, Task, ShellExecution, ShellQuoting, TaskScope,
 } = require("vscode");
 const { LanguageClient, TransportKind } = require("vscode-languageclient/node");
 
@@ -544,9 +545,58 @@ function setupTestController(context, linBin) {
   return { controller, runHandler };
 }
 
+// --- Task provider ------------------------------------------------------------
+//
+// Surfaces `lin build|run|test` as VS Code tasks. The `lin` problem matcher
+// (contributed in package.json) parses the Ariadne-style compiler diagnostics
+// (`[path:line:col]`) into the Problems panel. Tasks invoke the bundled `lin`
+// binary via a ShellExecution so output is visible in the terminal.
+function buildLinTask(linBin, def) {
+  const file = def.file && def.file.length > 0 ? def.file : "${file}";
+  const argv = [def.command, file, ...(Array.isArray(def.args) ? def.args : [])];
+  // Quote each argv element for the shell; ShellExecution handles the rest.
+  const exec = new ShellExecution(linBin, argv.map((a) => ({ value: a, quoting: ShellQuoting.Strong })));
+  const task = new Task(
+    def,
+    def.scope || TaskScope.Workspace,
+    `lin ${def.command}`,
+    "lin",
+    exec,
+    "$lin"
+  );
+  return task;
+}
+
+function makeTaskProvider(linBin) {
+  return {
+    // Default tasks offered in the "Run Task" picker. They use the ${file}
+    // predefined variable so they operate on whatever .lin file is active.
+    provideTasks() {
+      const defs = [
+        { type: "lin", command: "build" },
+        { type: "lin", command: "run" },
+        { type: "lin", command: "test" },
+      ];
+      return defs.map((d) => buildLinTask(linBin, d));
+    },
+    // Resolve a task authored in tasks.json (definition already known).
+    resolveTask(task) {
+      const def = task.definition;
+      if (!def || def.type !== "lin" || !def.command) return undefined;
+      return buildLinTask(linBin, { ...def, scope: task.scope });
+    },
+  };
+}
+
 function activate(context) {
   const lspBin = resolveBin(context, "lin-lsp");
   const linBin = resolveBin(context, "lin");
+
+  // Register the task provider so `lin build|run|test` appear in Run Task and
+  // can be authored in tasks.json with the `lin` problem matcher.
+  context.subscriptions.push(
+    tasks.registerTaskProvider("lin", makeTaskProvider(linBin))
+  );
 
   // `lin` is available in VS Code's integrated terminal out of the box.
   addToIntegratedTerminalPath(context);
@@ -674,6 +724,20 @@ function activate(context) {
     }),
     commands.registerCommand("lin.testProject", () => {
       runWithFreshToken("project", new TestRunRequest());
+    }),
+    // CodeLens-driven single-test run. The LSP emits CodeLenses with this fixed
+    // command id and argument order: [documentUri: string, testName: string].
+    // We run only that test by constructing a TestRunRequest for the matching
+    // child TestItem (created if it wasn't statically discovered), which the run
+    // handler narrows via `--filter-test "<name>"`.
+    commands.registerCommand("lin.runTest", (documentUri, testName) => {
+      if (typeof documentUri !== "string" || typeof testName !== "string") {
+        window.showWarningMessage("Lin: Run Test invoked without a document/test name.");
+        return;
+      }
+      const fsPath = Uri.parse(documentUri).fsPath;
+      const child = findOrCreateTestItem(testController, fsPath, testName);
+      runWithFreshToken(`runTest:${fsPath}::${testName}`, new TestRunRequest([child]));
     }),
   );
 }

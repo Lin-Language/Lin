@@ -10,24 +10,35 @@
     "type": "git",
     "url": "https://github.com/Lin-Language/Lin"
   },
-  "keywords": ["lin", "programming language", "compiler"],
+  "homepage": "https://github.com/Lin-Language/Lin#readme",
+  "bugs": {
+    "url": "https://github.com/Lin-Language/Lin/issues"
+  },
+  "keywords": ["lin", "programming language", "compiler", "json", "pattern matching"],
+  "galleryBanner": {
+    "color": "#2b6cb0",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.88.0"
   },
   "categories": [
-    "Programming Languages"
+    "Programming Languages",
+    "Linters",
+    "Formatters",
+    "Snippets",
+    "Testing"
   ],
   "activationEvents": [
     "onLanguage:lin",
-    "onCommand:lin.build",
-    "onCommand:lin.run",
-    "onCommand:lin.test",
-    "onCommand:lin.testFile",
-    "onCommand:lin.testProject",
-    "onCommand:lin.format",
-    "onCommand:lin.installOnPath"
+    "workspaceContains:**/*.lin"
   ],
-  "main": "./client.js",
+  "main": "./dist/extension.js",
+  "scripts": {
+    "vscode:prepublish": "npm run compile -- --production",
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch"
+  },
   "contributes": {
     "configurationDefaults": {
       "[lin]": {
@@ -41,7 +52,11 @@
         "id": "lin",
         "aliases": ["Lin", "lin"],
         "extensions": [".lin"],
-        "configuration": "./language-configuration.json"
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/lin-file.svg",
+          "dark": "./icons/lin-file-dark.svg"
+        }
       }
     ],
     "grammars": [
@@ -51,21 +66,30 @@
         "path": "./syntaxes/lin.tmLanguage.json"
       }
     ],
+    "snippets": [
+      {
+        "language": "lin",
+        "path": "./snippets/lin.json"
+      }
+    ],
     "commands": [
       {
         "command": "lin.build",
         "title": "Build",
-        "category": "Lin"
+        "category": "Lin",
+        "icon": "$(package)"
       },
       {
         "command": "lin.run",
         "title": "Run",
-        "category": "Lin"
+        "category": "Lin",
+        "icon": "$(play)"
       },
       {
         "command": "lin.test",
         "title": "Test",
-        "category": "Lin"
+        "category": "Lin",
+        "icon": "$(beaker)"
       },
       {
         "command": "lin.testFile",
@@ -78,6 +102,11 @@
         "category": "Lin"
       },
       {
+        "command": "lin.runTest",
+        "title": "Run Test",
+        "category": "Lin"
+      },
+      {
         "command": "lin.format",
         "title": "Format",
         "category": "Lin"
@@ -87,7 +116,153 @@
         "title": "Install `lin` on PATH (all terminals)",
         "category": "Lin"
       }
+    ],
+    "submenus": [
+      {
+        "id": "lin.submenu",
+        "label": "Lin"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "lin.runTest",
+          "when": "false"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "lin.run",
+          "when": "resourceLangId == lin",
+          "group": "navigation@1"
+        },
+        {
+          "command": "lin.build",
+          "when": "resourceLangId == lin",
+          "group": "navigation@2"
+        },
+        {
+          "command": "lin.test",
+          "when": "resourceLangId == lin",
+          "group": "navigation@3"
+        }
+      ],
+      "editor/context": [
+        {
+          "submenu": "lin.submenu",
+          "when": "resourceLangId == lin",
+          "group": "navigation"
+        }
+      ],
+      "explorer/context": [
+        {
+          "submenu": "lin.submenu",
+          "when": "resourceExtname == .lin",
+          "group": "navigation"
+        }
+      ],
+      "lin.submenu": [
+        {
+          "command": "lin.run",
+          "group": "1_run@1"
+        },
+        {
+          "command": "lin.build",
+          "group": "1_run@2"
+        },
+        {
+          "command": "lin.test",
+          "group": "1_run@3"
+        },
+        {
+          "command": "lin.format",
+          "group": "2_edit@1"
+        }
+      ]
+    },
+    "taskDefinitions": [
+      {
+        "type": "lin",
+        "required": ["command"],
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The lin subcommand to run.",
+            "enum": ["build", "run", "test"]
+          },
+          "file": {
+            "type": "string",
+            "description": "The .lin file or directory to operate on. Defaults to the active file."
+          },
+          "args": {
+            "type": "array",
+            "description": "Extra arguments passed to the lin CLI.",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    ],
+    "problemMatchers": [
+      {
+        "name": "lin",
+        "owner": "lin",
+        "source": "lin",
+        "fileLocation": ["autoDetect", "${workspaceFolder}"],
+        "pattern": [
+          {
+            "regexp": "^\\s*(?:\\u001b\\[[0-9;]*m)*(Error|Warning)(?:\\u001b\\[[0-9;]*m)*:(?:\\u001b\\[[0-9;]*m)*\\s+(.*?)(?:\\u001b\\[[0-9;]*m)*\\s*$",
+            "severity": 1,
+            "message": 2
+          },
+          {
+            "regexp": "[\\u2500-\\u257f](?:\\u001b\\[[0-9;]*m)*\\[(?:\\u001b\\[[0-9;]*m)*\\s*(.+?):(\\d+):(\\d+)(?:\\u001b\\[[0-9;]*m)*\\s*(?:\\u001b\\[[0-9;]*m)*\\]",
+            "file": 1,
+            "line": 2,
+            "column": 3
+          }
+        ]
+      }
+    ],
+    "walkthroughs": [
+      {
+        "id": "linGetStarted",
+        "title": "Get Started with Lin",
+        "description": "Install the compiler, write your first program, and run it.",
+        "steps": [
+          {
+            "id": "linInstall",
+            "title": "Put `lin` on your PATH",
+            "description": "The bundled compiler is on the integrated terminal's PATH already. To use it in any shell, run the install command.\n[Install `lin` on PATH](command:lin.installOnPath)",
+            "media": {
+              "markdown": "walkthroughs/install.md"
+            },
+            "completionEvents": ["onCommand:lin.installOnPath"]
+          },
+          {
+            "id": "linHello",
+            "title": "Write a Lin program",
+            "description": "Create a `.lin` file and start coding with full language support.",
+            "media": {
+              "markdown": "walkthroughs/hello.md"
+            }
+          },
+          {
+            "id": "linRun",
+            "title": "Run and test",
+            "description": "Compile and run your program, or run its `*.test.lin` suites.\n[Run the active file](command:lin.run)",
+            "media": {
+              "markdown": "walkthroughs/run.md"
+            },
+            "completionEvents": ["onCommand:lin.run"]
+          }
+        ]
+      }
     ]
+  },
+  "devDependencies": {
+    "esbuild": "^0.21.5"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"

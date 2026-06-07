@@ -1,14 +1,18 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { runAll } from "./task"
+import { runConcurrent, runWithTimeout } from "./scheduler"
 import { summarize, render } from "./report"
+import { isOk } from "./outcome"
+import { Task } from "./task"
 import { exec } from "std/process"
 import { contains } from "std/string"
+import { sleep } from "std/time"
 
-// End-to-end: a mixed task list through the whole pipeline (run each → classify →
-// summarize → render). `exec` is mocked (ADR-046) so the run is deterministic and
-// hermetic — no real subprocesses, no dependence on which binaries the host has or
-// on platform exit-code conventions, and the "command could not launch" case (an
-// Error return) is reproduced exactly, which a real `exec` cannot do portably.
+// End-to-end: a mixed task list driven through the WHOLE consolidated pipeline — the
+// concurrent scheduler (std/async) runs each task (std/process), classifies it, tracks
+// progress, summarizes (report.lin) and renders. A deadline'd step exercises the Result
+// path. `exec` is mocked (ADR-046) so the run is deterministic and hermetic: no real
+// subprocesses, no dependence on host binaries or platform exit codes, and the
+// "command could not launch" case (an Error return) is reproduced exactly.
 replace exec = (command: String, args: String[]): Json =>
   if command == "printf" then
     {
@@ -28,10 +32,17 @@ replace exec = (command: String, args: String[]): Json =>
       "stdout": "",
       "stderr": ""
     }
+  else if command == "slow" then
+    sleep(50)
+    {
+      "status": 0,
+      "stdout": "",
+      "stderr": ""
+    }
   else
     { "type": "error", "message": "command not found" }
 
-val tasks = [
+val tasks: Task[] = [
   {
     "name": "echo",
     "command": "printf",
@@ -55,24 +66,41 @@ val tasks = [
 ]
 
 val s = suite("processes integration", [
-  test("runs the whole task list and rolls up the summary", () =>
-    val results = runAll(tasks)
-    val sm = summarize(results)
+  test("runs the whole task list concurrently and rolls up the summary", () =>
+    val rep = runConcurrent(tasks)
+    val sm = summarize(rep["results"])
     [
+      expect(rep["completed"]).toBe(4),
       expect(sm["total"]).toBe(4),
       expect(sm["passed"]).toBe(2),
       expect(sm["failed"]).toBe(2),
+      expect(sm["errored"]).toBe(1),
       expect(sm["ok"]).toBe(false)
     ]
   ),
 
-  test("renders a report naming each task and the failure count", () =>
-    val out = render(runAll(tasks))
+  test("renders a report naming each task and the failure breakdown", () =>
+    val rep = runConcurrent(tasks)
+    val out = render(rep["results"])
     [
       expect(out.contains("[pass] echo")).toBe(true),
       expect(out.contains("[fail] bad (exit 1)")).toBe(true),
       expect(out.contains("[error] missing")).toBe(true),
-      expect(out.contains("2 of 4 task(s) failed")).toBe(true)
+      expect(out.contains("2 of 4 task(s) failed (1 could not launch)")).toBe(true)
+    ]
+  ),
+
+  test("a deadline'd slow step surfaces a Result failure", () =>
+    val r = runWithTimeout(
+      {
+        "name": "slow",
+        "command": "slow",
+        "args": []
+      },
+      5
+    )
+    [
+      expect(r.isOk()).toBe(false)
     ]
   )
 ])

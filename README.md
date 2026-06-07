@@ -416,7 +416,7 @@ import foreign "libmathlib.a"
 print(toString(sqrt(2.0)))   // 1.4142...
 ```
 
-The C header `crates/lin-runtime/lin.h` defines `LinString` and `LinArray` for passing non-primitive types across the boundary. See `examples/ffi/main.lin` for a complete example.
+The C header `crates/lin-runtime/lin.h` defines `LinString` and `LinArray` for passing non-primitive types across the boundary. See `examples/sdl/mathffi.lin` (calling a built-from-source C archive) and `examples/sdl/bounce.lin` (calling the vendored `libSDL3.so`) for complete examples.
 
 ---
 

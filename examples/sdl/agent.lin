@@ -1,0 +1,46 @@
+// agent — the PURE agent-planning core extracted from ai_worker.lin so it can be unit tested.
+// ai_worker.lin offloads `planStep` to an `async` worker each frame (plain data in, plain data out)
+// and only does the SDL draw on the main thread.
+//
+// This module is where the vector/matrix math and the hand-written C library all EARN their place:
+//   - `vector.heading` (atan2) gives the continuous heading from the agent to its goal.
+//   - a `matrix.rotation2D` rotation matrix rotates a unit "forward" vector by that heading, and we
+//     read back its sign per axis to take one grid step toward the goal — a real use of matMul/
+//     applyToVec rather than a token call.
+//   - `mathffi.cDistance` (C `magnitude2` -> libm `sqrt`) measures the remaining distance to the
+//     goal, so the agent stops once it has arrived. (Because mathffi's `import foreign` is
+//     file-local, any file importing this module must also declare the libmathlib foreign block;
+//     agent.test.lin and ai_worker.lin do.)
+import { Vec2, vec2, heading } from "./vector"
+import { rotation2D, applyToVec } from "./matrix"
+import { cDistance } from "./mathffi"
+
+// A snapshot the worker operates on: the agent's grid position and its goal, both Vec2.
+export type World = { "agent": Vec2, "goal": Vec2 }
+
+// -1 / 0 / +1 from a Float64, with a small dead-zone so tiny rotation round-off does not jitter.
+val sign = (x: Float64): Float64 =>
+  if x > 0.0001 then 1.0 else if x < 0.0 - 0.0001 then 0.0 - 1.0 else 0.0
+
+// Plan one grid step toward the goal. We compute the heading (atan2), rotate the canonical forward
+// unit vector (1, 0) by it with a rotation matrix, and snap each rotated component to a -1/0/+1 grid
+// move. If the agent is already on the goal (distance computed in C) it holds position.
+export val planStep = (world: World): Vec2 =>
+  val agent = world["agent"]
+  val goal = world["goal"]
+  val dist = cDistance(agent["x"], agent["y"], goal["x"], goal["y"])
+  if dist < 0.5 then
+    agent
+  else
+    val theta = heading(agent, goal)
+    val forward = applyToVec(rotation2D(theta), vec2(1.0, 0.0))
+    vec2(agent["x"] + sign(forward["x"]), agent["y"] + sign(forward["y"]))
+
+// Distance from the agent to its goal (C-computed) — exported so the demo can report arrival.
+export val distanceToGoal = (world: World): Float64 =>
+  cDistance(
+    world["agent"]["x"],
+    world["agent"]["y"],
+    world["goal"]["x"],
+    world["goal"]["y"]
+  )
