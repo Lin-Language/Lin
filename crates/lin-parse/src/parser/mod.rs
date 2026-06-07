@@ -189,6 +189,26 @@ impl Parser {
         self.expect(kind);
     }
 
+    /// Expect a contextual keyword: an ordinary identifier whose text equals `word`,
+    /// used in a grammatical position where it is unambiguous (e.g. `from` after an
+    /// import binding list). Advances past it on match; otherwise emits a diagnostic
+    /// and leaves the cursor in place. `from` is NOT a reserved word -- it lexes as an
+    /// `Ident`, so this is how the import parser recognises the separator.
+    pub(crate) fn expect_contextual_keyword(&mut self, word: &str) {
+        if let TokenKind::Ident(name) = self.peek_kind() {
+            if name == word {
+                self.advance();
+                return;
+            }
+        }
+        let span = self.current_span();
+        let got = self.peek_kind();
+        self.diagnostics.push(Diagnostic::error(
+            span,
+            format!("expected '{}', got {:?}", word, got),
+        ));
+    }
+
     pub(crate) fn expect_ident(&mut self) -> String {
         if let TokenKind::Ident(name) = self.peek_kind() {
             self.advance();

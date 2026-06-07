@@ -56,7 +56,6 @@ pub enum TokenKind {
     Has,
     When,
     Import,
-    From,
     As,
     Foreign,
 

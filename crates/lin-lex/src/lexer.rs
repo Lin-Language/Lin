@@ -583,7 +583,10 @@ impl Lexer {
             "has" => TokenKind::Has,
             "when" => TokenKind::When,
             "import" => TokenKind::Import,
-            "from" => TokenKind::From,
+            // `from` is a CONTEXTUAL keyword: it is only meaningful as the separator
+            // in an import statement (`import { ... } from "..."`), which the parser
+            // matches as the contextual identifier "from". Everywhere else it is an
+            // ordinary identifier (parameter/variable/field/function name).
             "as" => TokenKind::As,
             "foreign" => TokenKind::Foreign,
             "true" => TokenKind::True,
