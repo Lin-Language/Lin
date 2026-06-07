@@ -23,13 +23,39 @@ struct Backend {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
-        // Store the workspace root so we can resolve relative imports.
-        if let Some(root) = params
+        // Store the workspace root so we can resolve relative imports. Prefer the
+        // (deprecated but widely sent) `root_uri`; fall back to the first workspace
+        // folder when only the multi-root form is provided.
+        let root = params
             .root_uri
             .as_ref()
             .and_then(|u| u.to_file_path().ok())
+            .or_else(|| {
+                params
+                    .workspace_folders
+                    .as_ref()
+                    .and_then(|fs| fs.first())
+                    .and_then(|f| f.uri.to_file_path().ok())
+            });
+        if let Some(root) = &root {
+            *WORKSPACE_ROOT.write().unwrap() = Some(root.clone());
+        }
+
+        // Build the cross-file index: seed stdlib, then enumerate + index every
+        // `*.lin` file under the workspace root. A best-effort first cut — files
+        // are re-indexed on edit; we do NOT re-check dependents on edit (see the
+        // `update` handler note).
         {
-            *WORKSPACE_ROOT.write().unwrap() = Some(root);
+            let mut index = WORKSPACE_INDEX.write().unwrap();
+            *index = WorkspaceIndex::default();
+            seed_stdlib_index(&mut index);
+            if let Some(root) = &root {
+                for path in collect_lin_files(root) {
+                    if let Ok(src) = std::fs::read_to_string(&path) {
+                        index.insert_user_file(&path, &src);
+                    }
+                }
+            }
         }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -46,6 +72,10 @@ impl LanguageServer for Backend {
                 document_formatting_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                // Ctrl+T fuzzy search over every top-level declaration in the workspace.
+                workspace_symbol_provider: Some(OneOf::Left(true)),
+                // Jump from a value to the `type` declaration naming its type (cross-file).
+                type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
                 document_highlight_provider: Some(OneOf::Left(true)),
                 // Plain rename (no prepareRename) — the inverse-span lookup is reliable enough that
                 // a prepare step would add no value; the client just sends rename directly.
@@ -330,11 +360,35 @@ impl LanguageServer for Backend {
         let offset = position_to_offset(&source, pos);
 
         let include_decl = params.context.include_declaration;
+
+        // Cross-file first: if the cursor is on a top-level exported/imported symbol,
+        // gather occurrences across the whole workspace index.
+        if let Ok(path) = uri.to_file_path() {
+            let module_id = canonical_id(&path);
+            let index = WORKSPACE_INDEX.read().unwrap();
+            if let Some((owner, name)) = index.resolve_symbol(&module_id, offset) {
+                let occ = index.occurrences(&owner, &name);
+                if !occ.is_empty() {
+                    let decl = decl_span(&index, &owner, &name);
+                    let locations: Vec<Location> = occ
+                        .iter()
+                        .filter(|(mid, s)| include_decl || !(mid == &owner && Some(*s) == decl))
+                        .filter_map(|(mid, s)| {
+                            let f = index.files.get(mid)?;
+                            let u = module_id_to_uri(mid)?;
+                            Some(Location { uri: u, range: span_to_range(&f.source, *s) })
+                        })
+                        .collect();
+                    return Ok(Some(locations));
+                }
+            }
+        }
+
+        // Intra-file fallback (locals, parameters): the first span is the binding.
         let occ = occurrences_at(&analysis.span_type_map, offset);
         if occ.is_empty() {
             return Ok(None);
         }
-        // The first span returned by `occurrences_at` is the binding/definition itself.
         let def = occ.first().copied();
         let locations: Vec<Location> = occ
             .iter()
@@ -408,11 +462,45 @@ impl LanguageServer for Backend {
         let analysis = analyse(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
 
+        // Cross-file first: a top-level exported/imported symbol renames everywhere.
+        if let Ok(path) = uri.to_file_path() {
+            let module_id = canonical_id(&path);
+            let index = WORKSPACE_INDEX.read().unwrap();
+            if let Some((owner, name)) = index.resolve_symbol(&module_id, offset) {
+                // `rename_edits` returns None for stdlib-owned symbols (read-only) —
+                // decline the rename rather than emit an unsound/partial edit.
+                match index.rename_edits(&owner, &name) {
+                    Some(edits) if !edits.is_empty() => {
+                        // Group spans by file URI into per-document TextEdit lists.
+                        let mut changes: HashMap<Url, Vec<TextEdit>> = HashMap::new();
+                        for (mid, span) in edits {
+                            let Some(file) = index.files.get(&mid) else { continue };
+                            let Some(file_uri) = module_id_to_uri(&mid) else { continue };
+                            changes.entry(file_uri).or_default().push(TextEdit {
+                                range: span_to_range(&file.source, span),
+                                new_text: new_name.clone(),
+                            });
+                        }
+                        if !changes.is_empty() {
+                            return Ok(Some(WorkspaceEdit {
+                                changes: Some(changes),
+                                document_changes: None,
+                                change_annotations: None,
+                            }));
+                        }
+                    }
+                    // stdlib symbol or nothing renameable cross-file: fall through to
+                    // the intra-file path (which itself yields nothing for stdlib).
+                    _ => {}
+                }
+            }
+        }
+
+        // Intra-file fallback (locals, parameters): one TextEdit per occurrence.
         let occ = occurrences_at(&analysis.span_type_map, offset);
         if occ.is_empty() {
             return Ok(None);
         }
-        // Single-document rename: one TextEdit per occurrence in the open file.
         let edits: Vec<TextEdit> = occ
             .iter()
             .map(|s| TextEdit {
@@ -498,6 +586,87 @@ impl LanguageServer for Backend {
             Ok(Some(actions))
         }
     }
+
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let query = &params.query;
+        let index = WORKSPACE_INDEX.read().unwrap();
+        let mut symbols = Vec::new();
+        for (mod_id, name, span) in index.workspace_symbols(query) {
+            let Some(file) = index.files.get(&mod_id) else { continue };
+            // stdlib symbols have no on-disk URI; skip them in the symbol list (they
+            // aren't navigable as files and would confuse the client's open).
+            let Some(uri) = module_id_to_uri(&mod_id) else { continue };
+            #[allow(deprecated)]
+            symbols.push(SymbolInformation {
+                name,
+                kind: SymbolKind::VARIABLE,
+                tags: None,
+                deprecated: None,
+                location: Location {
+                    uri,
+                    range: span_to_range(&file.source, span),
+                },
+                container_name: None,
+            });
+        }
+        Ok(Some(symbols))
+    }
+
+    async fn goto_type_definition(
+        &self,
+        params: request::GotoTypeDefinitionParams,
+    ) -> Result<Option<request::GotoTypeDefinitionResponse>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let base_dir = file_dir(uri);
+        let analysis = analyse(&source, base_dir.as_deref());
+        let offset = position_to_offset(&source, pos);
+
+        // The value's rendered type at the cursor (e.g. `Point` or `Point[]`).
+        let ty_str = match tightest_span(&analysis.span_type_map, offset) {
+            Some((_, s, _)) => s.clone(),
+            None => return Ok(None),
+        };
+        // Extract the leading type *name* (strip array brackets / generic args). We
+        // only resolve a single named type — unions/objects have no single decl.
+        let type_name = match leading_type_name(&ty_str) {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+
+        // Find a `type <name>` declaration: same file first, then anywhere in the
+        // workspace index (cross-file type definitions).
+        let index = WORKSPACE_INDEX.read().unwrap();
+        if let Ok(path) = uri.to_file_path() {
+            let module_id = canonical_id(&path);
+            if let Some(file) = index.files.get(&module_id) {
+                if let Some((_, span)) = file.type_decls.iter().find(|(n, _)| n == &type_name) {
+                    return Ok(Some(request::GotoTypeDefinitionResponse::Scalar(Location {
+                        uri: uri.clone(),
+                        range: span_to_range(&source, *span),
+                    })));
+                }
+            }
+        }
+        for (mod_id, file) in &index.files {
+            if let Some((_, span)) = file.type_decls.iter().find(|(n, _)| n == &type_name) {
+                if let Some(file_uri) = module_id_to_uri(mod_id) {
+                    return Ok(Some(request::GotoTypeDefinitionResponse::Scalar(Location {
+                        uri: file_uri,
+                        range: span_to_range(&file.source, *span),
+                    })));
+                }
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl Backend {
@@ -506,6 +675,18 @@ impl Backend {
             .write()
             .unwrap()
             .insert(uri.clone(), source.to_string());
+        // Re-index just this file's symbol/import table. We deliberately do NOT
+        // re-check dependent files here: the cross-file references/symbols/rename
+        // features need only each file's export+import name tables, which a single
+        // re-parse refreshes. Inferred *types* in dependents can go stale until the
+        // dependent is itself re-opened/edited — an accepted limitation for this cut
+        // (it never affects name-based cross-file resolution).
+        if let Ok(path) = uri.to_file_path() {
+            WORKSPACE_INDEX
+                .write()
+                .unwrap()
+                .insert_user_file(&path, source);
+        }
         let base_dir = file_dir(uri);
         let analysis = analyse(source, base_dir.as_deref());
         self.client
@@ -1929,10 +2110,475 @@ fn file_dir(uri: &Url) -> Option<PathBuf> {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
 }
 
-// ── global workspace root (set once on initialize) ────────────────────────────
+// ── cross-file workspace index (Tier 3) ───────────────────────────────────────
+
+// Cross-file references / rename / workspace-symbols are built on a *name-based*
+// symbol index rather than the intra-file def_span machinery. The reason is
+// structural: imported names are bound in the checker with `env.define` (no
+// def_span — see lin-check `Stmt::Import` handling), so a use of an imported
+// symbol carries `def_span = None` in `span_type_map`. `occurrences_at` therefore
+// cannot link an import use back to its export across files. Instead we resolve a
+// click to `(owner_module, export_name)` via each file's export/import tables and
+// then collect occurrences of that name in every file that participates.
+//
+// The unit of cross-file resolution is the *top-level exported declaration*
+// (`export val|var|type`). Local (non-exported) bindings and function parameters
+// remain intra-file only — they're handled by the existing single-document
+// `references`/`rename` path and are never reached here.
+
+/// One file's contribution to the workspace index. Pure data derived from the
+/// file's source + parsed AST; no I/O. `module_id` keys this entry in the index.
+#[derive(Clone)]
+struct FileSymbols {
+    /// Full source text (used for text-scanning occurrences + position conversion).
+    source: String,
+    /// Top-level *exported* declarations: `(name, name_span)`. Only `export`-ed
+    /// `val`/`var`/`type` are cross-file-visible.
+    exports: Vec<(String, lin_common::Span)>,
+    /// Import bindings this file declares (one per `{ a, b as c }` entry).
+    imports: Vec<ImportRef>,
+    /// Every top-level `type` declaration (exported OR local), `(name, name_span)`.
+    /// Used only by go-to-type-definition, which must reach unexported type aliases.
+    type_decls: Vec<(String, lin_common::Span)>,
+    /// True for embedded stdlib modules — they are read-only and must NEVER receive
+    /// rename edits (they're not real files on disk).
+    is_stdlib: bool,
+}
+
+/// A single imported binding within a file.
+#[derive(Clone)]
+struct ImportRef {
+    /// Resolved module identity of the *source* module (a canonical file path for
+    /// user modules, or `std/...` for stdlib). Matches `module_identity`.
+    module_id: String,
+    /// The original exported name in the source module.
+    export_name: String,
+    /// The name bound in *this* file's scope (the alias when present, else `export_name`).
+    local_name: String,
+    /// Span of the whole `import` statement (used to locate the binding name in source).
+    stmt_span: lin_common::Span,
+}
+
+/// Build a `FileSymbols` from a file's source. `base_dir` is the directory the file
+/// lives in (used to resolve relative import paths to canonical module ids). Pure
+/// over its inputs so the whole index is unit-testable without touching the FS.
+fn file_symbols(source: &str, base_dir: &Path) -> FileSymbols {
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    let mut parser = lin_parse::Parser::new(tokens);
+    let module = parser.parse_module();
+
+    let mut exports = Vec::new();
+    let mut imports = Vec::new();
+    let mut type_decls = Vec::new();
+    for stmt in &module.statements {
+        match stmt {
+            Stmt::Val { pattern, exported: true, .. } => {
+                if let Some((name, name_span)) = pattern_ident(pattern) {
+                    exports.push((name, name_span));
+                }
+            }
+            Stmt::Var { name, name_span, exported: true, .. } => {
+                exports.push((name.clone(), *name_span));
+            }
+            Stmt::TypeDecl { name, exported, span, .. } => {
+                type_decls.push((name.clone(), *span));
+                if *exported {
+                    exports.push((name.clone(), *span));
+                }
+            }
+            Stmt::Import { bindings, path, span } => {
+                let module_id = module_identity(path, base_dir);
+                for binding in bindings {
+                    let local = binding.alias.as_ref().unwrap_or(&binding.name).clone();
+                    imports.push(ImportRef {
+                        module_id: module_id.clone(),
+                        export_name: binding.name.clone(),
+                        local_name: local,
+                        stmt_span: *span,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    FileSymbols {
+        source: source.to_string(),
+        exports,
+        imports,
+        type_decls,
+        is_stdlib: false,
+    }
+}
+
+/// The cross-file index: `module_id -> FileSymbols`. Built from an in-memory
+/// `path -> source` map (so the core logic is FS-independent and unit-testable);
+/// the handlers populate it from open buffers + on-disk `*.lin` files.
+#[derive(Default, Clone)]
+struct WorkspaceIndex {
+    files: HashMap<String, FileSymbols>,
+}
+
+impl WorkspaceIndex {
+    /// Insert/replace a user file's entry, keyed by its canonical path id.
+    fn insert_user_file(&mut self, path: &Path, source: &str) {
+        let id = canonical_id(path);
+        let base = path.parent().unwrap_or(path);
+        let mut syms = file_symbols(source, base);
+        syms.is_stdlib = false;
+        self.files.insert(id, syms);
+    }
+
+    /// Insert an embedded stdlib module's entry (read-only; never renamed).
+    fn insert_stdlib(&mut self, module_id: &str, source: &str) {
+        // stdlib modules import other `std/...` modules; resolve those relative to
+        // an arbitrary base (stdlib ids are absolute `std/...`, so base is unused).
+        let mut syms = file_symbols(source, Path::new("."));
+        syms.is_stdlib = true;
+        self.files.insert(module_id.to_string(), syms);
+    }
+
+    /// Resolve a click at `offset` in the file identified by `module_id` to the
+    /// symbol it refers to: `(owner_module_id, export_name)`. Returns `None` when
+    /// the cursor isn't on a cross-file-resolvable top-level symbol (e.g. a local
+    /// binding or parameter — those are handled intra-file by the caller).
+    fn resolve_symbol(&self, module_id: &str, offset: usize) -> Option<(String, String)> {
+        let file = self.files.get(module_id)?;
+        let word = word_at(&file.source, offset);
+        if word.is_empty() {
+            return None;
+        }
+        // 1. The cursor is on this file's own exported declaration (or a use of it):
+        //    owner is this file.
+        if file.exports.iter().any(|(n, _)| n == word) {
+            // Confirm the cursor actually sits on an occurrence of `word`, not some
+            // unrelated token that merely shares a prefix — `word_at` already gives
+            // the exact identifier under the cursor, so an equal name is sufficient.
+            return Some((module_id.to_string(), word.to_string()));
+        }
+        // 2. The cursor is on an imported binding (or a use of it): owner is the
+        //    source module + the original export name.
+        if let Some(imp) = file.imports.iter().find(|i| i.local_name == word) {
+            return Some((imp.module_id.clone(), imp.export_name.clone()));
+        }
+        None
+    }
+
+    /// All cross-file occurrences of the symbol `(owner_module, export_name)`, as
+    /// `(module_id, span)` pairs. Includes:
+    ///   (a) the export declaration site + every whole-word use in the owner file;
+    ///   (b) in each file importing the symbol: the import-binding name + every
+    ///       whole-word use of the *local* (possibly aliased) name.
+    ///
+    /// LIMITATION (alias-correct, conservative): occurrences are matched by whole
+    /// identifier text within the relevant file. A local binding that *shadows* an
+    /// imported/exported name in an inner scope would be over-matched; the language's
+    /// top-level-export model makes this rare, and we prefer over-reporting reads
+    /// (references) while gating *rename* on the same conservative set (below).
+    fn occurrences(&self, owner_module: &str, export_name: &str) -> Vec<(String, lin_common::Span)> {
+        let mut out: Vec<(String, lin_common::Span)> = Vec::new();
+
+        // (a) Owner file: declaration site + uses of the export name.
+        if let Some(owner) = self.files.get(owner_module) {
+            for span in whole_word_spans(&owner.source, export_name) {
+                out.push((owner_module.to_string(), span));
+            }
+        }
+
+        // (b) Importing files: the import binding + local uses of the bound name.
+        for (mod_id, file) in &self.files {
+            if mod_id == owner_module {
+                continue;
+            }
+            for imp in &file.imports {
+                if imp.module_id == owner_module && imp.export_name == export_name {
+                    // Local name occurrences (covers the import binding itself, which
+                    // appears in the `import { ... }` clause, plus every body use).
+                    for span in whole_word_spans(&file.source, &imp.local_name) {
+                        out.push((mod_id.clone(), span));
+                    }
+                }
+            }
+        }
+
+        out.sort_by(|a, b| (a.0.as_str(), a.1.start, a.1.end).cmp(&(b.0.as_str(), b.1.start, b.1.end)));
+        out.dedup();
+        out
+    }
+
+    /// Compute the SOUND set of rename edits for `(owner_module, export_name)` when
+    /// renaming it to `new_name`, as `(module_id, span)` pairs. Differs from
+    /// `occurrences` in two ways that matter for correctness:
+    ///   1. stdlib owner / stdlib import targets are REFUSED entirely (returns
+    ///      `None`) — stdlib is read-only and we must never emit edits into it.
+    ///   2. Import-alias handling: for `import { foo as bar }`, only the EXPORT-side
+    ///      token (`foo`) in the import clause is renamed; the alias `bar` and its
+    ///      body uses are a distinct local binding and are left untouched. For a
+    ///      non-aliased `import { foo }`, the clause token + all body uses rename
+    ///      (local name == export name).
+    ///
+    /// Returns `None` when the rename is unsound/unsupported (stdlib symbol), so the
+    /// handler can decline rather than produce a partial or wrong edit.
+    fn rename_edits(
+        &self,
+        owner_module: &str,
+        export_name: &str,
+    ) -> Option<Vec<(String, lin_common::Span)>> {
+        // Refuse to rename a symbol owned by a read-only stdlib module.
+        if self.files.get(owner_module).map(|f| f.is_stdlib).unwrap_or(true) {
+            return None;
+        }
+
+        let mut out: Vec<(String, lin_common::Span)> = Vec::new();
+
+        // Owner file: decl + every use of the export name.
+        if let Some(owner) = self.files.get(owner_module) {
+            for span in whole_word_spans(&owner.source, export_name) {
+                out.push((owner_module.to_string(), span));
+            }
+        }
+
+        // Importing files.
+        for (mod_id, file) in &self.files {
+            if mod_id == owner_module {
+                continue;
+            }
+            // A stdlib file can never import a user module, but guard anyway: never
+            // edit stdlib sources.
+            if file.is_stdlib {
+                continue;
+            }
+            for imp in &file.imports {
+                if imp.module_id != owner_module || imp.export_name != export_name {
+                    continue;
+                }
+                if imp.local_name == imp.export_name {
+                    // No alias: rename the clause token + every body use.
+                    for span in whole_word_spans(&file.source, &imp.local_name) {
+                        out.push((mod_id.clone(), span));
+                    }
+                } else {
+                    // Aliased: rename ONLY the export-side token inside the import
+                    // statement; leave the alias + its body uses alone.
+                    if let Some(off) =
+                        find_name_in_import(&file.source, imp.stmt_span.start as usize, &imp.export_name)
+                    {
+                        out.push((
+                            mod_id.clone(),
+                            lin_common::Span::new(0, off as u32, (off + imp.export_name.len()) as u32),
+                        ));
+                    }
+                }
+            }
+        }
+
+        out.sort_by(|a, b| (a.0.as_str(), a.1.start, a.1.end).cmp(&(b.0.as_str(), b.1.start, b.1.end)));
+        out.dedup();
+        Some(out)
+    }
+
+    /// Fuzzy-search every top-level declaration in the index for `query`,
+    /// returning `(module_id, name, name_span, kind)` matches. An empty query
+    /// matches everything (the client filters further). stdlib symbols are
+    /// included so the user can locate stdlib definitions.
+    fn workspace_symbols(&self, query: &str) -> Vec<(String, String, lin_common::Span)> {
+        let mut out = Vec::new();
+        for (mod_id, file) in &self.files {
+            for (name, span) in &file.exports {
+                if fuzzy_match(query, name) {
+                    out.push((mod_id.clone(), name.clone(), *span));
+                }
+            }
+        }
+        out.sort_by(|a, b| (a.1.as_str(), a.0.as_str()).cmp(&(b.1.as_str(), b.0.as_str())));
+        out
+    }
+}
+
+/// Case-insensitive subsequence fuzzy match (the classic Ctrl+T behaviour): every
+/// char of `query` appears in `name` in order. An empty query matches everything.
+fn fuzzy_match(query: &str, name: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    let mut q = query.chars().map(|c| c.to_ascii_lowercase()).peekable();
+    for nc in name.chars().map(|c| c.to_ascii_lowercase()) {
+        if let Some(&qc) = q.peek() {
+            if nc == qc {
+                q.next();
+            }
+        } else {
+            break;
+        }
+    }
+    q.peek().is_none()
+}
+
+/// The declaration name-span of `(owner_module, export_name)` when the owner file
+/// is indexed and declares that export, else `None` (e.g. resolving into a stdlib
+/// export whose decl we still want to *navigate* to but not rename).
+fn decl_span(index: &WorkspaceIndex, owner_module: &str, export_name: &str) -> Option<lin_common::Span> {
+    index
+        .files
+        .get(owner_module)?
+        .exports
+        .iter()
+        .find(|(n, _)| n == export_name)
+        .map(|(_, s)| *s)
+}
+
+/// Extract the leading named type from a rendered type string for go-to-type-def.
+/// `Point` → `Point`; `Point[]` → `Point`; `Foo<Bar>` → `Foo`. Returns `None` for
+/// anything that isn't a single leading identifier (unions, object literals,
+/// function types, builtins like `Int32`/`String` we don't navigate to).
+fn leading_type_name(ty: &str) -> Option<String> {
+    let ty = ty.trim();
+    // First identifier run at the start of the string.
+    let name: String = ty
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() {
+        return None;
+    }
+    // The remainder must be only array brackets / generic args — i.e. the leading
+    // name spans a single type, not e.g. `Int32 | String` where `Int32` is one
+    // alternative of a union (which has no single decl to jump to).
+    let rest = ty[name.len()..].trim_start();
+    let is_single = rest.is_empty() || rest.starts_with('[') || rest.starts_with('<');
+    if !is_single {
+        return None;
+    }
+    // Don't bother navigating builtin primitive names (no user `type` decl).
+    const BUILTINS: &[&str] = &[
+        "String", "Boolean", "Null", "Number", "Json", "Error", "Object",
+        "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64",
+        "Float32", "Float64", "Iterator", "Iterable", "Function",
+    ];
+    if BUILTINS.contains(&name.as_str()) {
+        return None;
+    }
+    Some(name)
+}
+
+/// Convert an index `module_id` back to a file `Url`. stdlib ids (`std/...`) have no
+/// on-disk file and return `None` — that's how stdlib is kept out of edit results.
+fn module_id_to_uri(module_id: &str) -> Option<Url> {
+    if module_id.starts_with("std/") {
+        return None;
+    }
+    Url::from_file_path(Path::new(module_id)).ok()
+}
+
+/// The exact identifier under `offset` (empty when the cursor is not on an
+/// identifier character). Expands left and right over `[A-Za-z0-9_]`.
+fn word_at(source: &str, offset: usize) -> &str {
+    let bytes = source.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut start = offset.min(source.len());
+    let mut end = offset.min(source.len());
+    while start > 0 && is_word(bytes[start - 1]) {
+        start -= 1;
+    }
+    while end < bytes.len() && is_word(bytes[end]) {
+        end += 1;
+    }
+    &source[start..end]
+}
+
+/// Every whole-identifier occurrence of `name` in `source`, as byte spans. A
+/// match is whole-word when neither neighbouring byte is `[A-Za-z0-9_]`. This is
+/// the cross-file occurrence primitive (the checker's def_span linkage is
+/// unavailable for imported names — see the module note above).
+fn whole_word_spans(source: &str, name: &str) -> Vec<lin_common::Span> {
+    let mut out = Vec::new();
+    if name.is_empty() {
+        return out;
+    }
+    let bytes = source.as_bytes();
+    let mut start = 0usize;
+    while let Some(pos) = source[start..].find(name) {
+        let abs = start + pos;
+        let before_ok = abs == 0 || !(bytes[abs - 1].is_ascii_alphanumeric() || bytes[abs - 1] == b'_');
+        let after_idx = abs + name.len();
+        let after_ok = after_idx >= bytes.len()
+            || !(bytes[after_idx].is_ascii_alphanumeric() || bytes[after_idx] == b'_');
+        if before_ok && after_ok {
+            out.push(lin_common::Span::new(0, abs as u32, after_idx as u32));
+        }
+        start = abs + 1;
+    }
+    out
+}
+
+/// Canonical id for a user file path: the canonicalised absolute path as a string
+/// (falls back to the lexical path when the file doesn't exist on disk yet, e.g.
+/// an unsaved in-memory buffer in tests). Matches `module_identity`'s user-module key.
+fn canonical_id(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Recursively collect `*.lin` files under `root`, skipping hidden directories,
+/// `target/`, `node_modules/`, and `.lin-cache/`. Bounded depth guards against
+/// pathological trees. Returns absolute paths.
+fn collect_lin_files(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+        if depth > 32 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if name.starts_with('.') || name == "target" || name == "node_modules" {
+                    continue;
+                }
+                walk(&path, depth + 1, out);
+            } else if name.ends_with(".lin") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, 0, &mut out);
+    out
+}
+
+// ── global workspace root + index (set on initialize, maintained on edits) ─────
 
 static WORKSPACE_ROOT: std::sync::LazyLock<RwLock<Option<PathBuf>>> =
     std::sync::LazyLock::new(|| RwLock::new(None));
+
+/// The live cross-file index. Built on `initialize`, refreshed per-file on
+/// `did_open`/`did_change`/`did_save`. stdlib modules are seeded once.
+static WORKSPACE_INDEX: std::sync::LazyLock<RwLock<WorkspaceIndex>> =
+    std::sync::LazyLock::new(|| RwLock::new(WorkspaceIndex::default()));
+
+/// Seed the index with every embedded stdlib module so go-to/references can see
+/// stdlib exports (they're flagged read-only so rename never edits them).
+fn seed_stdlib_index(index: &mut WorkspaceIndex) {
+    for module_id in STDLIB_MODULE_IDS {
+        if let Some(src) = stdlib_source(module_id) {
+            index.insert_stdlib(module_id, src);
+        }
+    }
+}
+
+/// The full set of stdlib module ids (kept in sync with `stdlib_source` by the
+/// `stdlib_modules_match_compiler` test, which enumerates the on-disk set).
+const STDLIB_MODULE_IDS: &[&str] = &[
+    "std/io", "std/json", "std/string", "std/number", "std/array", "std/iter",
+    "std/object", "std/fs", "std/ffi", "std/http", "std/template", "std/async",
+    "std/test", "std/time", "std/path", "std/math", "std/env", "std/hash",
+    "std/bytes", "std/net", "std/process", "std/tty", "std/signal", "std/yaml",
+    "std/jq", "std/stream", "std/compress", "std/archive", "std/event",
+];
 
 // ── entry point ───────────────────────────────────────────────────────────────
 
@@ -2440,6 +3086,203 @@ mod tests {
         assert_eq!(suggestion_from_help("did you mean 'length'?").as_deref(), Some("length"));
         assert_eq!(suggestion_from_help("did you mean \"foo\"?").as_deref(), Some("foo"));
         assert_eq!(suggestion_from_help("type defined here"), None);
+    }
+
+    // ── Tier-3: cross-file index ────────────────────────────────────────────────
+
+    /// Build a `WorkspaceIndex` from an in-memory `(absolute_path, source)` map. Uses
+    /// lexical (non-existent) paths so `canonical_id`/`module_identity` agree via their
+    /// fall-back-to-lexical-path branch — no FS access, so the core logic is fully
+    /// unit-testable. The same `WorkspaceIndex` is wired to the real FS in the handlers.
+    fn index_from(files: &[(&str, &str)]) -> WorkspaceIndex {
+        let mut index = WorkspaceIndex::default();
+        seed_stdlib_index(&mut index);
+        for (path, src) in files {
+            index.insert_user_file(Path::new(path), src);
+        }
+        index
+    }
+
+    /// The canonical module id the index uses for a (non-existent) absolute path —
+    /// matches what the handlers compute via `canonical_id` for a file URI.
+    fn id_of(path: &str) -> String {
+        canonical_id(Path::new(path))
+    }
+
+    /// Cross-file references: `foo` exported from a.lin and used in b.lin. A query
+    /// from EITHER file returns occurrences in BOTH files.
+    #[test]
+    fn cross_file_references_span_both_files() {
+        let a = "export val foo = 1\n";
+        let b = "import { foo } from \"a\"\nval x = foo + foo\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b)]);
+        let a_id = id_of("/ws/a.lin");
+        let b_id = id_of("/ws/b.lin");
+
+        // Resolve from the export decl site in a.lin.
+        let decl_off = a.find("foo").unwrap();
+        let (owner, name) = index
+            .resolve_symbol(&a_id, decl_off)
+            .expect("should resolve the exported symbol");
+        assert_eq!(owner, a_id);
+        assert_eq!(name, "foo");
+
+        let occ = index.occurrences(&owner, &name);
+        let in_a = occ.iter().filter(|(m, _)| m == &a_id).count();
+        let in_b = occ.iter().filter(|(m, _)| m == &b_id).count();
+        // a.lin: the `export val foo` decl (1). b.lin: import binding `foo` + two uses (3).
+        assert_eq!(in_a, 1, "expected 1 occurrence in a.lin, got {:?}", occ);
+        assert_eq!(in_b, 3, "expected 3 occurrences in b.lin, got {:?}", occ);
+
+        // Resolve from a USE site in b.lin → same symbol, same occurrence set.
+        let use_off = b.rfind("foo").unwrap();
+        let (owner2, name2) = index
+            .resolve_symbol(&b_id, use_off)
+            .expect("should resolve the imported symbol from its use");
+        assert_eq!((owner2, name2), (owner, name));
+    }
+
+    /// Cross-file rename emits a multi-file edit set keyed per file; stdlib is never edited.
+    #[test]
+    fn cross_file_rename_multi_file_and_never_stdlib() {
+        let a = "export val foo = 1\n";
+        let b = "import { foo } from \"a\"\nval x = foo\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b)]);
+        let a_id = id_of("/ws/a.lin");
+        let b_id = id_of("/ws/b.lin");
+
+        let edits = index
+            .rename_edits(&a_id, "foo")
+            .expect("renaming a user-owned export must be allowed");
+        let in_a = edits.iter().filter(|(m, _)| m == &a_id).count();
+        let in_b = edits.iter().filter(|(m, _)| m == &b_id).count();
+        assert_eq!(in_a, 1, "a.lin decl renamed once: {:?}", edits);
+        assert_eq!(in_b, 2, "b.lin import binding + 1 use renamed: {:?}", edits);
+        // Every edit span must cover the text `foo`.
+        for (m, s) in &edits {
+            let src = if m == &a_id { a } else { b };
+            assert_eq!(&src[s.start as usize..s.end as usize], "foo");
+        }
+
+        // Renaming a stdlib-owned export is refused (read-only) — no edits emitted.
+        assert!(
+            index.rename_edits("std/io", "print").is_none(),
+            "stdlib symbols must never be renamed"
+        );
+        // And no edit set produced by any user rename targets a stdlib file: the
+        // `std/...` ids have no on-disk URI.
+        assert!(
+            edits.iter().all(|(m, _)| module_id_to_uri(m).is_some()),
+            "rename edits must only target real files, never stdlib: {:?}",
+            edits
+        );
+    }
+
+    /// Import-alias rename is conservative + correct: renaming the export `foo`
+    /// rewrites the EXPORT-side token in `import { foo as bar }` but leaves the alias
+    /// `bar` (and its body uses) untouched.
+    #[test]
+    fn cross_file_rename_respects_import_alias() {
+        let a = "export val foo = 1\n";
+        let b = "import { foo as bar } from \"a\"\nval x = bar + bar\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b)]);
+        let a_id = id_of("/ws/a.lin");
+        let b_id = id_of("/ws/b.lin");
+
+        // `rename_edits` takes the EXISTING symbol name; the new name is applied by
+        // the handler when building TextEdits, so pass the current export name here.
+        let edits = index.rename_edits(&a_id, "foo").expect("user export renameable");
+        let a_edits: Vec<_> = edits.iter().filter(|(m, _)| m == &a_id).collect();
+        let b_edits: Vec<_> = edits.iter().filter(|(m, _)| m == &b_id).collect();
+        assert_eq!(a_edits.len(), 1);
+        assert_eq!(b_edits.len(), 1, "only the export-side token renames: {:?}", edits);
+        // The single b.lin edit must cover the `foo` in the import clause, NOT `bar`.
+        let (_, span) = b_edits[0];
+        assert_eq!(&b[span.start as usize..span.end as usize], "foo");
+        // It must sit inside the import statement (line 0), not the body.
+        assert!((span.start as usize) < b.find('\n').unwrap());
+    }
+
+    /// Workspace-symbol fuzzy filter aggregates top-level exports across files and
+    /// honours the query; unexported decls are never symbols.
+    #[test]
+    fn workspace_symbol_fuzzy_filter() {
+        let a = "export val parseHeader = 1\nexport val parseBody = 2\nval helper = 3\n";
+        let b = "export val render = 4\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b)]);
+
+        // Fuzzy "pb" matches parseBody (subsequence p..b) but not parseHeader/render.
+        let hits = index.workspace_symbols("pb");
+        let names: Vec<&str> = hits.iter().map(|(_, n, _)| n.as_str()).collect();
+        assert!(names.contains(&"parseBody"), "expected parseBody, got {:?}", names);
+        assert!(!names.contains(&"parseHeader"), "pb must not match parseHeader: {:?}", names);
+        assert!(!names.contains(&"render"), "pb must not match render: {:?}", names);
+
+        // Non-exported `helper` is never a workspace symbol.
+        let all = index.workspace_symbols("");
+        let all_names: Vec<&str> = all.iter().map(|(_, n, _)| n.as_str()).collect();
+        assert!(!all_names.contains(&"helper"), "unexported decls are not symbols: {:?}", all_names);
+        assert!(all_names.contains(&"parseHeader") && all_names.contains(&"render"));
+    }
+
+    /// `leading_type_name` strips array/generic suffixes and refuses builtins/unions.
+    #[test]
+    fn leading_type_name_extracts_navigable_name() {
+        assert_eq!(leading_type_name("Point").as_deref(), Some("Point"));
+        assert_eq!(leading_type_name("Point[]").as_deref(), Some("Point"));
+        assert_eq!(leading_type_name("Box<Int32>").as_deref(), Some("Box"));
+        // Builtins have no user `type` decl to jump to.
+        assert_eq!(leading_type_name("Int32"), None);
+        assert_eq!(leading_type_name("String"), None);
+        // A union's leading alternative is not a single navigable type.
+        assert_eq!(leading_type_name("Foo | Bar"), None);
+        // Object literal type — no single decl.
+        assert_eq!(leading_type_name("{ x: Int32 }"), None);
+    }
+
+    /// go-to-type-definition data source: a value's named type resolves to its
+    /// (local OR exported) `type` declaration via the index `type_decls` table.
+    #[test]
+    fn type_decls_capture_local_and_exported_types() {
+        let a = "type Point = { x: Int32, y: Int32 }\nexport val origin = { x: 0, y: 0 }\n";
+        let index = index_from(&[("/ws/a.lin", a)]);
+        let a_id = id_of("/ws/a.lin");
+        let file = index.files.get(&a_id).unwrap();
+        // Local (unexported) type decl is captured for type navigation.
+        assert!(
+            file.type_decls.iter().any(|(n, _)| n == "Point"),
+            "local type decl must be indexed for go-to-type-definition"
+        );
+        // It is NOT a workspace symbol (only exports are).
+        assert!(!file.exports.iter().any(|(n, _)| n == "Point"));
+    }
+
+    /// The hand-maintained `STDLIB_MODULE_IDS` seed list must cover exactly the
+    /// modules `stdlib_source` knows — drift would silently drop stdlib from the index.
+    #[test]
+    fn stdlib_module_ids_match_stdlib_source() {
+        for id in STDLIB_MODULE_IDS {
+            assert!(
+                stdlib_source(id).is_some(),
+                "STDLIB_MODULE_IDS has `{}` which stdlib_source doesn't know",
+                id
+            );
+        }
+        let stdlib_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../stdlib");
+        for entry in std::fs::read_dir(&stdlib_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Some(stem) = name.strip_suffix(".lin") else { continue };
+            if stem.ends_with(".test") {
+                continue;
+            }
+            let id = format!("std/{}", stem);
+            assert!(
+                STDLIB_MODULE_IDS.contains(&id.as_str()),
+                "stdlib module `{}` missing from STDLIB_MODULE_IDS seed list",
+                id
+            );
+        }
     }
 
     #[test]
