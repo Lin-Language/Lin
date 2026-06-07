@@ -39,6 +39,7 @@
   { "title": "std/http", "path": "/stdlib/http", "section": "Standard Library" },
   { "title": "std/net", "path": "/stdlib/net", "section": "Standard Library" },
   { "title": "std/async", "path": "/stdlib/async", "section": "Standard Library" },
+  { "title": "std/event", "path": "/stdlib/event", "section": "Standard Library" },
   { "title": "std/env", "path": "/stdlib/env", "section": "Standard Library" },
   { "title": "std/process", "path": "/stdlib/process", "section": "Standard Library" },
   { "title": "std/signal", "path": "/stdlib/signal", "section": "Standard Library" },

@@ -3135,6 +3135,65 @@ print(toString([1, 2, 3].map((x, i) => x + i)))
 }
 
 #[test]
+fn test_generic_phantom_union_param_and_record_field_pinned() {
+    // Regression (monomorphizer root cause): a generic function with a PHANTOM type parameter `E`
+    // that appears ONLY inside an un-constructed union arm of its return type
+    // (`{ "type": "failure", "error": E }` of `Result<T, E>`) must NOT be rejected as
+    // uninferrable. The innermost `ok(21)` pins `T = Int32` from its argument; `E` is bound to
+    // itself by union-arm matching (nothing at the call carries it), which previously tripped
+    // "cannot infer a concrete type". `E` is now recognised as a phantom return param and erased to
+    // the `$Json` wildcard (it never reaches a constructed value), so the call monomorphizes.
+    //
+    // It also exercises the field-substitution + per-variant union index fixes: `mapOk(ok(21), dbl)`
+    // infers `U = Int32`, giving `Result<Int32, E>`, and `["value"]` resolves PRECISELY to
+    // `Int32 | Null` (the `failure` arm has no `value` — §6.1 safe-bracket / ADR-044 R1), matching
+    // the `MaybeInt = Int32 | Null` annotation. The program compiles and runs.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+type MaybeInt = Int32 | Null
+val ok = <T, E>(v: T): Result<T, E> =>
+  { "type": "success", "value": v }
+val mapOk = <T, U, E>(r: Result<T, E>, f: (T) => U): Result<U, E> =>
+  match r
+    has { "type": "success", value } => ok(f(value))
+    else => r
+val dbl = (x: Int32): Int32 =>
+  x * 2
+val v: MaybeInt = mapOk(ok(21), dbl)["value"]
+val arr: MaybeInt[] = [mapOk(ok(21), dbl)["value"]]
+print("ok")
+"#);
+    assert_eq!(output, vec!["ok"]);
+
+    // DIAGNOSTIC: feeding the same union access into a strict (non-nullable) `Int32[]` context is
+    // correctly rejected — the union index is `Int32 | Null`, not `Int32`. The message must name the
+    // RESOLVED `Int32 | Null` (proving the field was pinned), with no unresolved `?T…` typevar.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { length } from "std/array"
+import { toString } from "std/string"
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+val ok = <T, E>(v: T): Result<T, E> =>
+  { "type": "success", "value": v }
+val mapOk = <T, U, E>(r: Result<T, E>, f: (T) => U): Result<U, E> =>
+  match r
+    has { "type": "success", value } => ok(f(value))
+    else => r
+val dbl = (x: Int32): Int32 =>
+  x * 2
+val runBody = (body: () => Int32[]): Int32[] =>
+  body()
+val out = runBody(() => [mapOk(ok(21), dbl)["value"]])
+print(toString(length(out)))
+"#);
+    assert!(
+        err.contains("Int32 | Null") && !err.contains("?T"),
+        "result type-param must be pinned to Int32 (no unresolved ?T typevar), got: {}",
+        err
+    );
+}
+
+#[test]
 fn test_generic_callback_param_back_inference() {
     // A generic function pins its type parameter `T` from a (type-pinning) argument and that
     // concrete type must be BACK-INFERRED into an UNANNOTATED callback parameter's body. Closes the
@@ -5581,6 +5640,62 @@ print(toString(r))
 }
 
 #[test]
+fn test_timeout_expires_when_thunk_captures_function_param() {
+    // Regression: a thunk whose body calls a captured FUNCTION-VALUED parameter (`runner`) must
+    // spawn a real worker just like a thunk calling a top-level function. Previously the captured
+    // closure made the env "non-transferable" and the runtime ran the thunk INLINE on the calling
+    // thread, so `timeout` never tripped (the 300ms work blocked the 30ms budget to completion).
+    // The fix recursively deep-copies the captured closure (transfer.rs::clone_closure), so BOTH
+    // forms below run on a worker and time out to `null`. 300ms-vs-30ms is a ~10x margin (matching
+    // the existing timeout tests CI already runs).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await, timeout } from "std/async"
+import { sleep } from "std/time"
+
+val slowFn = (): Int32 =>
+  sleep(300)
+  42
+
+val viaParam = (runner: () => Int32): Json =>
+  val p = async(() => runner())
+  await(timeout(p, 30))
+
+val viaTopLevel = (): Json =>
+  val p = async(() => slowFn())
+  await(timeout(p, 30))
+
+print(toString(viaParam(slowFn)))
+print(toString(viaTopLevel()))
+"#);
+    // Both forms wrap 300ms of work in a 30ms timeout; both must abandon the work and yield null.
+    assert_eq!(output, vec!["null", "null"],
+        "captured-function-param thunk must spawn a worker (like the top-level form) so timeout trips");
+}
+
+#[test]
+fn test_async_captured_function_param_correct_result() {
+    // Companion to the timeout regression: when NOT timed out, the worker that runs a thunk
+    // capturing a function-valued parameter must produce the CORRECT result — proving the
+    // recursive closure deep-copy (including a closure that itself captures heap data) is sound,
+    // not just that it spawns. `makeAdder(n)` returns a closure capturing the scalar `n`.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await } from "std/async"
+
+val makeAdder = (n: Int32): () => Int32 => () => n + 100
+
+val viaParam = (runner: () => Int32): Json =>
+  val p = async(() => runner())
+  await(p)
+
+print(toString(viaParam(makeAdder(5))))
+print(toString(viaParam(makeAdder(42))))
+"#);
+    assert_eq!(output, vec!["105", "142"]);
+}
+
+#[test]
 fn test_timeout_completes_in_time() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -5644,7 +5759,8 @@ print(toString(rs))
 
 #[test]
 fn test_async_captures_function_value_runs() {
-    // A thunk capturing a function value (CAP_OPAQUE env) runs inline as a sound fallback.
+    // A thunk capturing a function value is deep-copied (the captured closure is recursively
+    // cloned, transfer.rs::clone_closure) and run on a real worker thread; the result is correct.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { async, await } from "std/async"
@@ -6543,6 +6659,100 @@ print(toString(isEven(4)))
 print(toString(isOdd(3)))
 "#);
     assert_eq!(output, vec!["true", "true"]);
+}
+
+// Two MUTUALLY-recursive functions that RETURN A RECORD used to segfault: the first-checked
+// function's `if`-merge result inferred as a spurious `Union([{…}, Named("R")])` (boxed) because a
+// call to the not-yet-checked sibling carried the UNRESOLVED `Named("R")` alias from the forward
+// declaration, while the literal branch carried the structural sealed `{…}`. The function then
+// returned that boxed-union repr, but the sibling actually returns the SEALED PACKED struct → the
+// return-coerce read a packed-struct pointer as a boxed TaggedVal (`lin_unbox_ptr`) → garbage
+// pointer → SIGSEGV. Fix: expand `Named` aliases in a call's resolved return type against the
+// now-resolved env so both sides agree on the packed sealed representation. Self-recursion never
+// hit this (it TCO's — the recursive call is a back-edge, never a record-returning `call`).
+#[test]
+fn test_mutual_recursion_returning_sealed_record() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type R = { "v": Int32 }
+val f = (n: Int32): R =>
+  if n <= 0 then { "v": 0 } else g(n - 1)
+val g = (n: Int32): R =>
+  if n <= 0 then { "v": 1 } else f(n - 1)
+print(toString(f(5)["v"]))
+print(toString(g(5)["v"]))
+"#);
+    // f(5)→g(4)→f(3)→g(2)→f(1)→g(0)={v:1}; g(5)→f(4)→…→f(0)={v:0}.
+    assert_eq!(output, vec!["1", "0"]);
+}
+
+// Variants of the mutual-recursion-record-return fix: a multi-field sealed record, a boxed record
+// (a `Json` field forces the boxed `LinObject` repr), a `String` return, and a scalar return
+// (the non-record case that always worked — a regression guard). All must round-trip correctly.
+#[test]
+fn test_mutual_recursion_record_return_variants() {
+    // Multi-field sealed record (scalar fields of mixed width).
+    let sealed2 = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type P = { "x": Int32, "y": Float64 }
+val f = (n: Int32): P =>
+  if n <= 0 then { "x": 10, "y": 1.5 } else g(n - 1)
+val g = (n: Int32): P =>
+  if n <= 0 then { "x": 20, "y": 2.5 } else f(n - 1)
+val r = f(5)
+print(toString(r["x"]))
+print(toString(r["y"]))
+"#);
+    assert_eq!(sealed2, vec!["20", "2.5"]);
+
+    // Boxed record: a `Json`-typed field is not a sealed-scalar field, so the record is the
+    // boxed `LinObject` repr — the cross-function return must stay boxed on both sides.
+    let boxed = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type R = { "v": Json }
+val f = (n: Int32): R =>
+  if n <= 0 then { "v": 0 } else g(n - 1)
+val g = (n: Int32): R =>
+  if n <= 0 then { "v": 1 } else f(n - 1)
+print(toString(f(5)["v"]))
+"#);
+    assert_eq!(boxed, vec!["1"]);
+
+    // String return (heap value, not a record).
+    let s = run(r#"import { print } from "std/io"
+val f = (n: Int32): String =>
+  if n <= 0 then "even" else g(n - 1)
+val g = (n: Int32): String =>
+  if n <= 0 then "odd" else f(n - 1)
+print(f(5))
+"#);
+    assert_eq!(s, vec!["odd"]);
+
+    // Scalar return (the always-worked case — regression guard).
+    let scalar = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val f = (n: Int32): Int32 =>
+  if n <= 0 then 0 else g(n - 1)
+val g = (n: Int32): Int32 =>
+  if n <= 0 then 1 else f(n - 1)
+print(toString(f(5)))
+"#);
+    assert_eq!(scalar, vec!["1"]);
+}
+
+// Self-recursion returning a record must still work (it TCO's; this guards against the fix
+// perturbing the single-function path).
+#[test]
+fn test_self_recursion_returning_record_still_works() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type R = { "v": Int32 }
+val f = (n: Int32): R =>
+  if n <= 0 then { "v": 7 } else f(n - 1)
+print(toString(f(5)["v"]))
+"#);
+    assert_eq!(output, vec!["7"]);
 }
 
 #[test]
