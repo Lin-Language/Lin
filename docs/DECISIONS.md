@@ -2088,8 +2088,9 @@ for later; the clean sound rule for records is "fields must agree or error".
 
 ## ADR-062: Representation-inference pass (packed-vs-boxed as a dataflow fact, not a Type attribute)
 
-**Status**: Accepted (single-owner direction landed incrementally; heap-field array packing
-characterized as a sound partial — see Consequences).
+**Status**: Accepted (single-owner direction landed incrementally; `verify()` now covers every
+repr-consuming opcode; the producer/consumer literal-drift prerequisite is fixed; heap-field array
+packing characterized as a sound partial with one whole-program blocker — see Consequences).
 
 **Context**: Sealed records (ADR-057) and sealed-record arrays are laid out as a *packed* physical
 representation — a header-less `[rc|size|desc|fields…]` struct, and a contiguous `elem_tag == 0xFE`
@@ -2134,10 +2135,17 @@ instead of re-deriving from `Type`.
   cross-representation call args.
 - **Soundness gates**: a debug-only `verify(func)` walks every instruction and asserts the repr each
   opcode REQUIRES of each operand equals `func.repr[operand]` — a silent mismatch becomes a
-  compile-time panic, the formal statement of "representation mismatch is inexpressible". A Stage-2
-  `oracle_check` asserts the new analysis agrees with the old type predicate at every decide site, so
-  each swap is provably a conservative no-op before any code trusts it. Both run as `debug_assert!` in
-  `repr::run`, exercised by the full `cargo test` corpus.
+  compile-time panic, the formal statement of "representation mismatch is inexpressible". `verify`
+  covers EVERY repr-consuming site: the READ assume sites `FieldGet`/`SealedArrayFieldGet`/`Index`
+  (packed constant-offset load) AND the WRITE/CONSUME sites `Push` (array operand + the standalone
+  Packed-struct element from `push$T`) and the sealed-array `IndexSet` (array operand). The
+  RHS-value of an IndexSet/store and a map/object store are NOT asserted — they decide storage from
+  the container and COERCE the value at the slot (`sealed_project_from` projects a boxed
+  `arr[i] = { … }` literal in), so legitimately carry a Boxed repr. A Stage-2 `oracle_check` asserts
+  the new analysis agrees with the old type predicate at every decide site, so each swap is provably
+  a conservative no-op. Both run as `debug_assert!` in `repr::run`, exercised by the full `cargo
+  test` corpus — so the producer/consumer drift class (a boxed array reaching a packed Push/Index)
+  is now a debug-build compile panic, not an ASan-only-catchable runtime UAF.
 
 **Consequences / current boundary**:
 - Two representation-DECIDE sites are read from `func.repr` (single-owner): the sealed-array IndexSet
@@ -2147,17 +2155,38 @@ instead of re-deriving from `Type`.
 - Codegen's `sealed_repr_differs` is no longer a representation-decide predicate (only an internal
   `sealed_construct` field-coercion helper); equality (`emit_eq`) materializes both operands by design
   (the boundary catalogue's materialize-both dynamic consumer).
-- **Heap-field record arrays stay BOXED (fail-safe).** The per-element heap-field RC machinery and the
-  dynamic-consumer boundaries (materializer, whole-element read, out-of-shape→Null) are heap-field-
-  complete, and isolated fixtures (`Person[]` lifecycle; `{String: Neighbor[]}` map round-trip, the
-  exact dijkstra shape) are output-correct AND ASan-clean when packed. But a *blanket* heap-field
-  ungate regresses the corpus (72→64) because of **field omission**: Lin's structural typing lets a
-  literal omit a declared field (`{ "kind": "lparen" }` is a valid `Token{kind, text}`). A boxed object
-  reads a missing key as `Null`; a packed element would store a garbage pointer in the omitted slot and
-  deref it. Field omission is whole-program and NOT decidable from the element TYPE the gate sees, so it
-  cannot be worked around in codegen. Shipping packed heap-field arrays needs a language-level
-  exact/sealed-record feature that FORBIDS field omission. Until then the gate is scalar-only — sound,
-  not maximal. (`Codegen::sealed_array_elem_field_packable` + its lower.rs/monomorphize mirrors.)
+- **Producer/consumer LITERAL drift — FIXED (prerequisite for any heap-field ungate).** An inferred
+  empty array literal `[]` infers bottom-up to `Array(Never)` and lowers to a BOXED buffer; a concrete
+  packed/flat-scalar `T[]` param's callee does packed stride-N push/get → a representation DRIFT
+  (the calc-lexer `scan(.., [])` / `[].fill()` shape — a latent packed-array UAF, ASan-only). The
+  prefix `infer_call` already routed an array-literal ARGUMENT through expected-type checking against a
+  concrete array param; `infer_dot_call` did NOT — neither for its arguments NOR for the empty-literal
+  RECEIVER. Both now adopt the concrete param's RESOLVED element representation (a `Named` record alias
+  and its `Object{sealed}` body resolve identically — the alias is expanded at annotation time by
+  `resolve_named_cycle`/`expand_named_body` — so producer and consumer agree, no silent boundary). The
+  extended `verify()` makes any residual drift a debug panic. This fix stands alone (it corrects the
+  latent SCALAR packed-array UAF) and is the precondition the heap-field ungate needed.
+- **Heap-field record arrays stay BOXED (fail-safe), one remaining blocker.** The per-element
+  heap-field RC machinery and the dynamic-consumer boundaries (materializer, whole-element read,
+  out-of-shape→Null) are heap-field-complete and ASan-clean on single-module `Person[]`/`Line[]`
+  lifecycle fixtures. The two historically-cited blockers are now CLOSED: (a) FIELD OMISSION is a
+  compile error (`omits_required_field`), so a packed element can never store a NULL heap pointer; (b)
+  the LITERAL drift above is fixed. The ONE remaining blocker is **whole-program record
+  representation consistency for a record reachable as a `{String: T[]}` MAP-VALUE element** (the
+  dijkstra `{String: Neighbor[]}` shape). A `{String: T[]}` map is pervasively read into a `T[]|Null`
+  UNION (`match adj[u] is Null => [] else => …`) and then BOTH mutated in place (`push(it, x)`) AND
+  iterated by the generic boxed `for`. In-place mutation REQUIRES keep-packed-by-pointer (a shared
+  `0xFE` buffer); the boxed `for`/`lin_array_get_tagged` reader REQUIRES a boxed `Object[]` (it reads a
+  `0xFE` buffer's packed structs as `TaggedVal`s → garbage: the `0x07` heap-field deref crash, or — for
+  SCALARS — a silent misread that is LATENT on master since no scalar `{String: P[]}`-iterated test
+  exists). The two are irreconcilable at one map-value representation UNLESS either (i)
+  `lin_array_get_tagged` materializes a packed element to a keyed `LinObject` via a NAMED full-field
+  descriptor (a runtime LinArray-layout change — today's heap-only `elem_desc` lacks field names), OR
+  (ii) the record is boxed CONSISTENTLY everywhere it is reachable from the map (a CROSS-MODULE
+  record-taint pass — a record type is packed-everywhere or boxed-everywhere, never per-occurrence,
+  else the read-back drifts). Either is larger than a local gate. Until one lands, heap-field element
+  arrays stay scalar-only — sound, not maximal. (`Codegen::sealed_array_elem_field_packable` + its
+  lower.rs/monomorphize/repr mirrors; the gate note there has the re-enable recipe.)
 - The lower.rs/monomorphize coercion-insertion triggers (`lower_coerce_arg`, `type_repr_differs`,
   `mentions_sealed`, `combinator_unsound_over_sealed`) are NOT yet deleted: they remain the emitters of
   the boundary coercions until a repr.rs STEP-4 coercion-insertion pass relocates them. That relocation
