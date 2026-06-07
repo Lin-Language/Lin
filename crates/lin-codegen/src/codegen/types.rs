@@ -444,6 +444,21 @@ impl<'ctx> Codegen<'ctx> {
         Self::sum_type_discriminant(ty).is_some()
     }
 
+    /// The (unsealed) object Type of the FIRST variant of a sum type — used purely to give
+    /// `box_value` a TAG_OBJECT box tag when boxing a materialized SumNode for a dynamic edge. Any
+    /// variant's object type yields the same box tag (TAG_OBJECT); the first is a convenient
+    /// representative. `ty` must be a sum type.
+    pub(crate) fn sumnode_first_variant_obj_ty(ty: &Type) -> Type {
+        let fields = match ty {
+            Type::Union(vs) => match vs.first() {
+                Some(Type::Object { fields, .. }) => fields.clone(),
+                _ => Default::default(),
+            },
+            _ => Default::default(),
+        };
+        Type::object(fields)
+    }
+
     /// The PAYLOAD field map of one variant (the discriminant key removed — it is the inline tag).
     /// Only the scalar fields remain. Declaration order is preserved (the layout key).
     pub(crate) fn sumnode_variant_payload_fields(
