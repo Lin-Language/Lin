@@ -195,8 +195,8 @@ pub(crate) fn is_definitely_non_transferable(ty: &Type) -> bool {
 /// `check_expr`, not `infer_expr`).
 pub(crate) fn empty_literal_kind(expr: &Expr) -> Option<EmptyLiteralKind> {
     match expr {
-        Expr::Array(elements, _) if elements.is_empty() => Some(EmptyLiteralKind::Array),
-        Expr::Object(fields, _) if fields.is_empty() => Some(EmptyLiteralKind::Object),
+        Expr::Array(elements, _, _) if elements.is_empty() => Some(EmptyLiteralKind::Array),
+        Expr::Object(fields, _, _) if fields.is_empty() => Some(EmptyLiteralKind::Object),
         _ => None,
     }
 }

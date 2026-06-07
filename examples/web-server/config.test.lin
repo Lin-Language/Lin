@@ -1,0 +1,133 @@
+import { expect, toBe, toSucceed, toFail, test, suite, run } from "std/test"
+import { load, applyDefaults, validate, schema, Config } from "./config"
+import { length } from "std/array"
+
+// Unit suite for the startup-config loader: schema() shape, applyDefaults
+// (default-filling without inventing required fields), validate (missing /
+// wrong-typed fields), and load() (the tagged Success/Failure result main.lin
+// matches on before binding the port).
+// Pull the resolved config out of a successful load, typed as Config so the
+// assertions are against named-type fields rather than raw Json.
+val loaded = (raw: Json): Config =>
+  match load(raw)
+    has { "type": "success", value } => value
+    else =>
+      {
+        "host": "",
+        "port": 0,
+        "debug": false,
+        "name": ""
+      }
+
+val s = suite("config", [
+  // --- schema() shape ---
+  test("schema exposes type + default for known fields", () =>
+    val sch = schema()
+    [
+      expect(sch["host"]["type"]).toBe("string"),
+      expect(sch["host"]["default"]).toBe("0.0.0.0"),
+      expect(sch["port"]["default"]).toBe(3000),
+      expect(sch["name"]["default"]).toBe(null)
+    ]
+  ),
+
+  // --- applyDefaults ---
+  test("fills all defaults when only the required field is present", () =>
+    val cfg = applyDefaults({ "name": "svc" })
+    [
+      expect(cfg["host"]).toBe("0.0.0.0"),
+      expect(cfg["port"]).toBe(3000),
+      expect(cfg["debug"]).toBe(false)
+    ]
+  ),
+
+  test("keeps provided values over defaults", () =>
+    val cfg = applyDefaults({ "name": "svc", "port": 9090 })
+    [
+      expect(cfg["port"]).toBe(9090),
+      expect(cfg["host"]).toBe("0.0.0.0")
+    ]
+  ),
+
+  test("does not invent a value for a required field", () => [
+    expect(applyDefaults({ "port": 1 })["name"]).toBe(null)
+  ]),
+
+  // --- validate ---
+  test("a complete config validates with no errors", () => [
+    expect(length(validate(applyDefaults({ "name": "svc" })))).toBe(0)
+  ]),
+
+  test("flags a missing required field", () => [
+    expect(length(validate(applyDefaults({ "port": 1 })))).toBe(1)
+  ]),
+
+  test("flags a wrong-typed field", () =>
+    val cfg = applyDefaults({ "name": "svc", "port": "nope" })
+    [
+      expect(length(validate(cfg))).toBe(1)
+    ]
+  ),
+
+  // --- load() tagged result + end-to-end ---
+  test("loads a minimal config successfully", () => [
+    expect(load({ "name": "svc" })).toSucceed()
+  ]),
+
+  test("minimal input loads and gets every default filled", () =>
+    val cfg = loaded({ "name": "svc" })
+    [
+      expect(cfg["host"]).toBe("0.0.0.0"),
+      expect(cfg["port"]).toBe(3000),
+      expect(cfg["debug"]).toBe(false),
+      expect(cfg["name"]).toBe("svc")
+    ]
+  ),
+
+  test("success result carries the resolved config under value", () =>
+    val r = load({ "name": "svc" })
+    [
+      expect(r["type"]).toBe("success"),
+      expect(r["value"]["name"]).toBe("svc")
+    ]
+  ),
+
+  test("full override flows through unchanged", () =>
+    val cfg = loaded({
+      "host": "127.0.0.1",
+      "port": 9090,
+      "debug": true,
+      "name": "api"
+    })
+    [
+      expect(cfg["host"]).toBe("127.0.0.1"),
+      expect(cfg["port"]).toBe(9090),
+      expect(cfg["debug"]).toBe(true),
+      expect(cfg["name"]).toBe("api")
+    ]
+  ),
+
+  test("missing required field fails to load", () => [
+    expect(load({ "port": 3000 })).toFail()
+  ]),
+
+  test("failure result carries a non-empty error string", () =>
+    val r = load({ "port": 3000 })
+    [
+      expect(r["type"]).toBe("failure"),
+      expect(r["error"] != null).toBe(true)
+    ]
+  ),
+
+  test("wrong-typed field fails to load", () => [
+    expect(load({ "name": "svc", "port": "nope" })).toFail()
+  ]),
+
+  test("deep nested access returns null safely for missing keys", () =>
+    val r = load({ "name": "svc" })
+    [
+      expect(r["value"]["missing"]["deeper"]).toBe(null)
+    ]
+  )
+])
+run(s)

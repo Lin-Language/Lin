@@ -1,0 +1,58 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { vec2, add, sub, scale, dot, magnitude, angleBetween, heading } from "./vector"
+import { toFixed, PI } from "std/math"
+
+val s = suite("vector", [
+  test("add sums components", () =>
+    val r = add(vec2(1.0, 2.0), vec2(3.0, 4.0))
+    [
+      expect(r["x"]).toBe(4.0),
+      expect(r["y"]).toBe(6.0)
+    ]
+  ),
+
+  test("sub subtracts components", () =>
+    val r = sub(vec2(5.0, 7.0), vec2(2.0, 3.0))
+    [
+      expect(r["x"]).toBe(3.0),
+      expect(r["y"]).toBe(4.0)
+    ]
+  ),
+
+  test("scale multiplies both components", () =>
+    val r = scale(vec2(2.0, 3.0), 2.5)
+    [
+      expect(r["x"]).toBe(5.0),
+      expect(r["y"]).toBe(7.5)
+    ]
+  ),
+
+  test("dot of orthogonal vectors is 0", () => [
+    expect(dot(vec2(1.0, 0.0), vec2(0.0, 1.0))).toBe(0.0)
+  ]),
+
+  test("dot of [3,4] with itself is 25", () => [
+    expect(dot(vec2(3.0, 4.0), vec2(3.0, 4.0))).toBe(25.0)
+  ]),
+
+  test("magnitude of [3,4] is 5", () => [
+    expect(magnitude(vec2(3.0, 4.0))).toBe(5.0)
+  ]),
+
+  test("magnitude of a unit vector is 1", () => [
+    expect(magnitude(vec2(1.0, 0.0))).toBe(1.0)
+  ]),
+
+  test("angle between orthogonal unit vectors is PI/2", () => [
+    expect(toFixed(angleBetween(vec2(1.0, 0.0), vec2(0.0, 1.0)), 4)).toBe(toFixed(PI / 2.0, 4))
+  ]),
+
+  test("heading toward a point due east is 0", () => [
+    expect(toFixed(heading(vec2(0.0, 0.0), vec2(5.0, 0.0)), 4)).toBe("0.0000")
+  ]),
+
+  test("heading toward a point due north is PI/2", () => [
+    expect(toFixed(heading(vec2(0.0, 0.0), vec2(0.0, 5.0)), 4)).toBe(toFixed(PI / 2.0, 4))
+  ])
+])
+run(s)

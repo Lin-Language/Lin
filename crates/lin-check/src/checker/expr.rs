@@ -12,7 +12,7 @@ impl Checker {
     pub(crate) fn check_expr(&mut self, expr: &Expr, expected: &Type) -> Result<TypedExpr, Diagnostic> {
         // For function expressions with a known expected function type, use the expected
         // param types to guide inference (bidirectional type checking).
-        if let (Expr::Function { type_params, params, return_type, body, span }, Type::Function { params: expected_params, ret: expected_ret, .. }) = (expr, expected) {
+        if let (Expr::Function { type_params, params, return_type, body, span, full_span: _ }, Type::Function { params: expected_params, ret: expected_ret, .. }) = (expr, expected) {
             return self.infer_function_with_hints(type_params, params, return_type, body, *span, None, expected_params, expected_ret);
         }
 
@@ -44,7 +44,7 @@ impl Checker {
         // integer literals adopt the correct width (and so the produced MakeArray carries the
         // expected element representation, matching the slot type at codegen). Mirrors the
         // per-element literal-coercion above for nested literals.
-        if let (Expr::Array(elements, span), Type::Array(expected_elem)) = (expr, expected) {
+        if let (Expr::Array(elements, span, _), Type::Array(expected_elem)) = (expr, expected) {
             let typed_elements: Result<Vec<_>, _> =
                 elements.iter().map(|e| self.check_expr(e, expected_elem)).collect();
             let typed_elements = typed_elements?;
@@ -60,7 +60,7 @@ impl Checker {
         // for heterogeneous literals) and then fails the compatibility check against the
         // positional type. Check arity, then push each positional expected type into the
         // matching element so per-element literal coercion (e.g. integer width) applies.
-        if let (Expr::Array(elements, span), Type::FixedArray(expected_elems)) = (expr, expected) {
+        if let (Expr::Array(elements, span, _), Type::FixedArray(expected_elems)) = (expr, expected) {
             if elements.len() != expected_elems.len() {
                 return Err(Diagnostic::error(
                     *span,
@@ -105,7 +105,7 @@ impl Checker {
         // Object-literal refinement against an expected object/union/named type. Pushing the
         // expected field types down lets a discriminant string literal narrow to its `StrLit`
         // singleton, and (for a union) selects the matching variant by its discriminant tag.
-        if let Expr::Object(fields, span) = expr {
+        if let Expr::Object(fields, span, _) = expr {
             if let Some(result) = self.check_object_against(fields, expected, *span)? {
                 return Ok(result);
             }
@@ -122,7 +122,7 @@ impl Checker {
         // literals structurally AND lets a `Json`-typed branch be accepted against a structured
         // object return type (see `check_branch_against` / `branch_value_compatible`), instead of
         // forming `Json | {concrete}` and rejecting that union against the declared return.
-        if let Expr::If { condition, then_branch, else_branch, span } = expr {
+        if let Expr::If { condition, then_branch, else_branch, span, .. } = expr {
             if expected_pushes_into_branches(expected) && !matches!(else_branch.as_ref(), Expr::NullLit(_)) {
                 let in_tail = self.in_tail_position;
                 self.in_tail_position = false;
@@ -180,14 +180,14 @@ impl Checker {
         // cause of the match-arm-union-vs-declared-object bug (a `Json` arm + a concrete-object
         // arm declared `: R` was inferred independently, unioned into `Json | {concrete}`, and
         // that union rejected against `R`). Each arm is now checked against `R` directly.
-        if let Expr::Match { scrutinee, arms, span } = expr {
+        if let Expr::Match { scrutinee, arms, span, .. } = expr {
             if expected_pushes_into_branches(expected) {
                 return self.check_match(scrutinee, arms, expected, *span);
             }
         }
 
         // Propagate the expected type into the final expression of a block.
-        if let (Expr::Block(stmts, final_expr, span), true) = (expr, type_mentions_strlit(expected)) {
+        if let (Expr::Block(stmts, final_expr, span, _), true) = (expr, type_mentions_strlit(expected)) {
             self.env.push_scope();
             let mut typed_stmts = Vec::new();
             for stmt in stmts {
@@ -318,17 +318,17 @@ impl Checker {
             Expr::Ident(name, span)  => self.infer_ident(name, *span),
             Expr::BinaryOp { left, op, right, span } => self.infer_binary_op(left, *op, right, *span),
             Expr::UnaryOp { op, operand, span } => self.infer_unary_op(*op, operand, *span),
-            Expr::Call { func, args, partial, span }  => self.infer_call(func, args, *partial, *span),
-            Expr::DotCall { receiver, method, args, partial, span } => self.infer_dot_call(receiver, method, args, *partial, *span),
-            Expr::Index { object, key, span }         => self.infer_index(object, key, *span),
-            Expr::If { condition, then_branch, else_branch, span } => self.infer_if(condition, then_branch, else_branch, *span),
-            Expr::Match { scrutinee, arms, span }     => self.infer_match(scrutinee, arms, *span),
-            Expr::Block(stmts, final_expr, span)      => self.infer_block(stmts, final_expr, *span),
-            Expr::Function { type_params, params, return_type, body, span } => self.infer_function(type_params, params, return_type, body, *span, None),
-            Expr::Object(fields, span)                => self.infer_object(fields, *span),
-            Expr::Array(elements, span)               => self.infer_array(elements, *span),
+            Expr::Call { func, args, partial, span, .. }  => self.infer_call(func, args, *partial, *span),
+            Expr::DotCall { receiver, method, args, partial, span, .. } => self.infer_dot_call(receiver, method, args, *partial, *span),
+            Expr::Index { object, key, span, .. }         => self.infer_index(object, key, *span),
+            Expr::If { condition, then_branch, else_branch, span, .. } => self.infer_if(condition, then_branch, else_branch, *span),
+            Expr::Match { scrutinee, arms, span, .. }     => self.infer_match(scrutinee, arms, *span),
+            Expr::Block(stmts, final_expr, span, _)      => self.infer_block(stmts, final_expr, *span),
+            Expr::Function { type_params, params, return_type, body, span, .. } => self.infer_function(type_params, params, return_type, body, *span, None),
+            Expr::Object(fields, span, _)                => self.infer_object(fields, *span),
+            Expr::Array(elements, span, _)               => self.infer_array(elements, *span),
             Expr::Assign { target, value, span }      => self.infer_assign(target, value, *span),
-            Expr::IndexAssign { object, key, value, span } => self.infer_index_assign(object, key, value, *span),
+            Expr::IndexAssign { object, key, value, span, .. } => self.infer_index_assign(object, key, value, *span),
             Expr::StringInterp(parts, span)           => self.infer_string_interp(parts, *span),
             Expr::Is { expr, pattern, span } => {
                 let typed_expr = self.infer_expr(expr)?;

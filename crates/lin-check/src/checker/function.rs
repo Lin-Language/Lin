@@ -82,7 +82,7 @@ impl Checker {
         use lin_parse::ast::Expr;
         match body {
             Expr::Call { func, .. } => matches!(func.as_ref(), Expr::Ident(n, _) if n == "lin_array_allocate"),
-            Expr::Block(_, final_expr, _) => Self::body_is_fresh_array_allocate(final_expr),
+            Expr::Block(_, final_expr, _, _) => Self::body_is_fresh_array_allocate(final_expr),
             _ => false,
         }
     }
@@ -109,7 +109,7 @@ impl Checker {
     /// returns `None` and the binding stays `Array(MAX)` (tagged, correct).
     fn intermediate_array_allocate_binding(body: &lin_parse::ast::Expr) -> Option<String> {
         use lin_parse::ast::{Expr, Pattern, Stmt};
-        let Expr::Block(stmts, final_expr, _) = body else { return None };
+        let Expr::Block(stmts, final_expr, _, _) = body else { return None };
         // The block's value must be a bare identifier.
         let Expr::Ident(returned, _) = final_expr.as_ref() else { return None };
         // That identifier must be bound by a `val <returned> = lin_array_allocate(..)` in the block.

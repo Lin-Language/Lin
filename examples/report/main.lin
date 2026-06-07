@@ -7,9 +7,11 @@
 // Run:   lin run examples/report/main.lin
 // Test:  lin test examples/report/
 import { render } from "./report"
-import { rowsFromArchive, archiveMembers } from "./source"
+import { rowsFromArchive, archiveMembers, normalizeCsv, rowsFromFile } from "./source"
 import { print } from "std/io"
 import { join } from "std/string"
+import { length } from "std/array"
+import { writeFile } from "std/fs"
 
 // The input is a gzipped tar of CSV files (committed beside this example). It is
 // decompressed and split member-by-member with bounded memory — no step ever holds
@@ -23,3 +25,17 @@ print("input archive members: ${archiveMembers(archive).join(", ")}")
 // Then the real pass: stream every CSV row out of every member and render the report.
 val lines = rowsFromArchive(archive)
 print(render(lines))
+
+// Bonus pass: a plain (uncompressed) CSV file is also a valid input. Write a fixture,
+// then normalise it lazily file-to-file — read as a line Stream, trim, drop blanks,
+// write the cleaned copy — then read the cleaned rows back and render them. The whole
+// pipeline holds at most one line in memory at a time.
+val raw = "/tmp/lin_report_example.csv"
+writeFile(raw, "Frank, 88\n\n  Grace, 95 \nbad-row\nHeidi, 73\n")
+val cleaned = normalizeCsv(raw)
+val plainReport = if length(cleaned) == 0 then
+  "(stream fault normalising ${raw})"
+else
+  render(rowsFromFile(cleaned))
+print("\n=== plain CSV pass (${cleaned}) ===")
+print(plainReport)

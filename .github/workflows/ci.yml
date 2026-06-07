@@ -67,13 +67,14 @@ jobs:
       - name: Build FFI example archive (native object format)
         run: |
           # The committed libmathlib.a is a Linux archive; rebuild it from source with the
-          # runner's native cc so the ffi example links on every platform (macOS ld rejects
-          # a foreign-format archive: "archive member '/' not a mach-o file"). Remove the
-          # committed archive first — `ar rcs` onto the existing GNU-format file keeps its
-          # '/' symbol-table member, which macOS ld then rejects.
-          rm -f examples/ffi/libmathlib.a
-          cc -c examples/ffi/mathlib.c -o examples/ffi/mathlib.o
-          ar rcs examples/ffi/libmathlib.a examples/ffi/mathlib.o
+          # runner's native cc so the sdl example's your-own-C FFI binding links on every
+          # platform (macOS ld rejects a foreign-format archive: "archive member '/' not a
+          # mach-o file"). Remove the committed archive first — `ar rcs` onto the existing
+          # GNU-format file keeps its '/' symbol-table member, which macOS ld then rejects.
+          # (The C math lib was folded from the old examples/ffi into examples/sdl/clib.)
+          rm -f examples/sdl/clib/libmathlib.a
+          cc -c examples/sdl/clib/mathlib.c -o examples/sdl/clib/mathlib.o
+          ar rcs examples/sdl/clib/libmathlib.a examples/sdl/clib/mathlib.o
 
       - name: Run example projects through lin run
         run: |
@@ -82,14 +83,12 @@ jobs:
           for m in examples/*/main.lin; do
             dir="$(dirname "$m")"
             case "$dir" in
-              # web-server/main.lin calls serve(...), which blocks forever; the router and
-              # handlers are covered by *.test.lin and the Rust serve integration test.
+              # web-server/main.lin loads config, then calls serve(...) (which blocks forever)
+              # and waits for SIGTERM; the router, handlers, config and the /route Dijkstra
+              # endpoint are all covered by *.test.lin and the Rust serve integration test.
+              # (Dijkstra used to be a standalone example with an argv-driven main.lin; it is now
+              # the web-server's /route endpoint, so there is no separate dijkstra run step.)
               examples/web-server) echo "SKIP $m (serve blocks forever; covered by tests)"; continue ;;
-              # dijkstra/main.lin reads a graph + source/target/output from argv.
-              examples/dijkstra)
-                echo "==> $m (with argv)"
-                cargo run -p lin --quiet -- run "$m" -- examples/dijkstra/graph.json A E /tmp/dijkstra_out.json || exit 1
-                continue ;;
             esac
             echo "==> $m"
             cargo run -p lin --quiet -- run "$m" || exit 1
@@ -175,16 +174,17 @@ jobs:
           RT="$(find target/x86_64-unknown-linux-gnu/debug -name liblin_runtime.a | head -1)"
           fail=0
           # stdlib unit tests AND the example-project suites — the latter are realistic
-          # multi-module programs (calc/report/config/codec/…) whose map/filter/reduce,
-          # flat-array, projection, and closure usage is the strongest RC/UAF guard.
+          # multi-module programs (calc/report/config/raspberry-controller/…) whose map/filter/
+          # reduce, flat-array, projection, and closure usage is the strongest RC/UAF guard.
           # `lin build` bundles a test's relative-import modules into one linkable .ll.
           for f in stdlib/*.test.lin examples/*/*.test.lin; do
             echo "==> $f"
             cargo run -p lin --quiet -- build "$f" -o /tmp/asan_test || { echo "BUILD FAIL $f"; fail=1; continue; }
-            # The ffi suite calls into a committed C archive (libmathlib.a), which uses libm
-            # (sqrt). Link both for the ASan binary; every other test links only the runtime.
+            # The sdl FFI suites (mathffi/agent) call into a committed C archive (clib/libmathlib.a),
+            # which uses libm (sqrt). Link both for the ASan binary; every other test links only the
+            # runtime. (The C math lib was folded from the old examples/ffi into examples/sdl/clib.)
             extra=""
-            case "$f" in examples/ffi/*) extra="examples/ffi/libmathlib.a -lm" ;; esac
+            case "$f" in examples/sdl/*) extra="examples/sdl/clib/libmathlib.a -lm" ;; esac
             clang-22 -fsanitize=address -g /tmp/asan_test.ll "$RT" $extra -o /tmp/asan_test_bin
             # Leak detection off: the stdlib intentionally retains program-lifetime
             # globals (module init state) that are never released at exit.
