@@ -854,6 +854,126 @@ print(toString(total))
     assert_eq!(output, vec!["100"]);
 }
 
+// Regression (L2 — fresh heap literal passed to a Json param, result dropped): a fresh array/object
+// literal passed DIRECTLY as an argument to a function whose parameter is `Json` is boxed
+// (`lin_box_array`/`box_object`); the caller owns and must reclaim the box shell after the call.
+// Two bugs leaked it: (1) when the call result is a SCALAR (`f([1,2,3]): Int32`), codegen's
+// `FreeBoxShellIfDistinct` silently skipped the free because the result temp was not a pointer →
+// the shell leaked; fixed to free unconditionally when the result can't alias the box. (2) when the
+// result is `Json` (`firstOr([1,2,3], d)` / accumulator-threading), a now-obsolete transfer-on-escape
+// alias kept the literal alive on the assumption the callee returns its param BY REFERENCE — but
+// union returns CLONE (the function-return path takes an independent +1), so the literal's own +1
+// leaked every call; fixed by removing the escape-alias. A WRONG fix double-frees the returned value;
+// ASan (stdlib+examples leg) + the no-UAF escape test guard that. This guards correctness in a loop.
+#[test]
+fn test_fresh_literal_json_arg_released_and_correct() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { length } from "std/array"
+
+// Scalar-result callee (leak #1): the boxed array arg's shell must be reclaimed.
+val takesJson = (x: Json): Int32 => 0
+// Json-result pass-through (leak #2): the literal flows out via the cloned union return.
+val firstOr = (arr: Json, d: Json): Json => if arr == null then d else arr
+
+val build = (): Int32 =>
+  val a = takesJson([1, 2, 3])
+  val r = firstOr([4, 5, 6], 0)
+  a + length(r)
+
+var total = 0
+val loop = (i: Int32, n: Int32): Int32 =>
+  if i >= n then 0
+  else
+    total = total + build()
+    loop(i + 1, n)
+val _ = loop(0, 50)
+print(toString(total))
+"#);
+    // build() = 0 + length([4,5,6]) = 3; summed 50 times = 150.
+    assert_eq!(output, vec!["150"]);
+}
+
+// Regression (L3 — `map`/`filter` per-element box reclaim): when a combinator is NOT inlined (its
+// callback is a closure value, e.g. the compiled stdlib `map`/`filter` wrapper) it reads each source
+// element via `lin_array_get_tagged`, which allocates a fresh 16-byte `TaggedVal*` box (and retains
+// the inner). The loop body pushed the callback result but never reclaimed that per-element box → the
+// shell (always) and, for SKIPPED filter elements, the retained inner leaked every iteration. Fix:
+// free the box SHELL after a `map`/`filter` push (the inner was moved/retained into the result), and
+// FULLY release a filter-DROPPED element's box. A WRONG fix (full release on the keep/move path)
+// double-frees the moved inner (the `filter`-over-`split` UAF). ASan guards the leak/no-double-free;
+// this guards that the combinators still compute correctly through the non-inline wrapper.
+#[test]
+fn test_combinator_elem_box_released_and_correct() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { map, filter } from "std/iter"
+import { split } from "std/string"
+import { length } from "std/array"
+
+// Non-inline filter over a fresh string array (the `filter$String`-over-`split` shape): keeps one,
+// drops the rest — the dropped elements' inner strings must be released.
+val keep = (only: String, name: String): Int32 =>
+  val wanted = split(only, ",").filter(n => n == name)
+  length(wanted)
+
+// Non-inline map over a Json array, callback projects each element.
+val sizes = (src: Json): Int32 =>
+  val m = map(src, x => x)
+  length(m)
+
+val src: Json = ["aa", "bb", "cc", "dd"]
+var total = 0
+val loop = (i: Int32, n: Int32): Int32 =>
+  if i >= n then 0
+  else
+    total = total + keep("a,b,c,d,e", "c")
+    total = total + sizes(src)
+    loop(i + 1, n)
+val _ = loop(0, 50)
+print(toString(total))
+"#);
+    // keep(...) = 1 (one match "c"); sizes(src) = 4. 50 * (1 + 4) = 250.
+    assert_eq!(output, vec!["250"]);
+}
+
+// Regression (L4 — non-cached scalar boxed into a Json param): passing a SCALAR (a large int or any
+// float) to a function whose parameter is `Json` boxes it via `lin_box_int32`/`box_float64` into a
+// fresh 16-byte `TaggedVal*` shell the callee borrows and never releases. `arg_box_is_caller_owned_shell`
+// only covered HEAP args, so the scalar box shell leaked every call (cached small-int/bool boxes are
+// immortal statics, so only NON-cached scalars leak). Fix: a scalar→Json arg box is now reclaimed via
+// `FreeBoxShellIfDistinct` (cached-box safe: immortal boxes are never freed; result-alias safe: a
+// pass-through callee returning its Json param hands the same box back, skipped when shell == result).
+// This guards correctness in a loop over large-int, float, AND cached-small-int args, plus a scalar
+// returned as Json (the box must survive as the result).
+#[test]
+fn test_scalar_json_arg_box_released_and_correct() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val takesJson = (x: Json): Int32 => 0
+val identJson = (x: Json): Json => x
+
+val build = (): Int32 =>
+  val a = takesJson(1000000)   // large (non-cached) int box shell must be reclaimed
+  val b = takesJson(3.14159)   // float box shell must be reclaimed
+  val c = takesJson(5)         // cached small-int box is immortal — must NOT be double-freed
+  val r = identJson(2000000)   // scalar RETURNED as Json — box survives as the result
+  a + b + c + (if r is Int32 then r else 0)
+
+var total = 0
+val loop = (i: Int32, n: Int32): Int32 =>
+  if i >= n then 0
+  else
+    total = total + build()
+    loop(i + 1, n)
+val _ = loop(0, 50)
+print(toString(total))
+"#);
+    // build() = 0 + 0 + 0 + 2000000 = 2000000; summed 50 times = 100000000.
+    assert_eq!(output, vec!["100000000"]);
+}
+
 // Regression (escape safety): a `var n` cell captured by a closure that is RETURNED from its
 // creating function ESCAPES — the closure (and thus the cell) outlives the call. The lowerer
 // must NOT free this cell at scope exit; doing so would be a use-after-free when the returned
