@@ -15657,6 +15657,58 @@ main()
 }
 
 #[test]
+fn test_keeppacked_map_sumvalue_round_trip_no_uaf() {
+    // Regression (ADR-062 Stage 3, double-free): a `{ String: Expr }` map value read into a
+    // `val back`, then narrowed by `match back` and passed to `eval(back)`, double-freed the
+    // projected SumNode — the narrowed concrete variant flowing into `eval`'s sum param was BOTH
+    // released by the owning model (`lin_sumnode_release`) AND classified as a caller-owned box
+    // shell / sealed-record materialize (a second release + a mismatched-size box free). An ASan
+    // heap-use-after-free at `lin_sumnode_release` (run-correct only because the second free landed
+    // in free-list slop). Fixed in `lower.rs` by excluding `sum_arg_projected` from
+    // `arg_box_is_caller_owned_shell` / `arg_box_is_caller_owned_scalar_shell` /
+    // `sealed_{record,array}_arg_materialized`. Exercises BOTH variant arms (BinOp → 7, Num → 42)
+    // and the OVERWRITE case (the old value released exactly once → 99). The ASan gate is the real
+    // proof; this documents the shape + run-correctness.
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+val main = () =>
+  var m: {{ String: Expr }} = {{}}
+  m["root"] = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": 3 }}, "right": {{ "kind": "num", "value": 4 }} }}
+  val back = m["root"]
+  val r = match back
+    is Num => eval(back)
+    is BinOp => eval(back)
+    else => 0 - 1
+  print(r.toString())
+
+  // Num-variant arm (this was the arm whose `eval(back)` double-freed under ASan).
+  var n: {{ String: Expr }} = {{}}
+  n["leaf"] = {{ "kind": "num", "value": 42 }}
+  val nb = n["leaf"]
+  val nr = match nb
+    is Num => eval(nb)
+    is BinOp => eval(nb)
+    else => 0 - 1
+  print(nr.toString())
+
+  // Overwrite: the OLD stored value must be released exactly once on reassignment.
+  var o: {{ String: Expr }} = {{}}
+  o["k"] = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": 1 }}, "right": {{ "kind": "num", "value": 2 }} }}
+  o["k"] = {{ "kind": "num", "value": 99 }}
+  val ob = o["k"]
+  val or = match ob
+    is Num => eval(ob)
+    is BinOp => eval(ob)
+    else => 0 - 1
+  print(or.toString())
+main()
+"#
+    );
+    let out = run(&src);
+    assert_eq!(out, vec!["7", "42", "99"]);
+}
+
+#[test]
 fn test_st3_sum_value_through_nullable_param() {
     // A recursive sum value passed to a `sum | Null` parameter must materialize to a
     // real boxed object so the callee's `match` reads the correct discriminant. (3+4) = 7.

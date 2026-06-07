@@ -1412,6 +1412,9 @@ fn sealed_array_arg_materialized(arg_ty: &Type, param_ty: &Type) -> bool {
     is_sealed_scalar_array(arg_ty)
         && !is_sealed_scalar_array(param_ty)
         && (is_union_ty(param_ty) || param_elem_is_boxed_repr(param_ty))
+        // A sum-projected arg is handled by `lower_coerce_arg`'s sum arm (which runs BEFORE the
+        // union-boundary materialize), so it is NOT materialized to a boxed Object[] here.
+        && !sum_arg_projected(arg_ty, param_ty)
 }
 
 /// True when a SEALED SCALAR RECORD argument (packed struct, e.g. `cur: Trip`) flowing into a
@@ -1428,6 +1431,27 @@ fn sealed_array_arg_materialized(arg_ty: &Type, param_ty: &Type) -> bool {
 /// never reaches the union arm.)
 fn sealed_record_arg_materialized(arg_ty: &Type, param_ty: &Type) -> bool {
     is_sealed_scalar_repr(arg_ty) && is_union_ty(param_ty) && !is_union_ty(arg_ty)
+        // A sum-eligible param takes `lower_coerce_arg`'s sum arm (project to a fresh `*SumNode`,
+        // registered owned), NOT the sealed-record→Json materialize-to-boxed-object path. Without
+        // this exclusion the projected SumNode is BOTH full-released right after the call AND
+        // released at scope exit → double `lin_sumnode_release` (the `{String:Expr}` map → `match`
+        // Num-arm `eval(back)` heap-use-after-free, ADR-062 Stage 3).
+        && !sum_arg_projected(arg_ty, param_ty)
+}
+
+/// True when a concrete (non-sum, non-`Named`) argument flowing into a Stage-eligible SUM param is
+/// PROJECTED into a fresh `*SumNode` by `lower_coerce_arg`'s sum-coercion arm (which emits a `Coerce`
+/// boxed→sum and `register_owned`s the result). MUST mirror that trigger exactly. The projected node
+/// is a FULLY-OWNED +1 `*SumNode` released by the owning model's scope-exit `lin_sumnode_release` —
+/// it is NOT a borrowed-inner `TaggedVal*` shell, so it must be EXCLUDED from the
+/// `arg_box_is_caller_owned_shell` / `arg_box_is_caller_owned_scalar_shell` classification. Without
+/// this exclusion the arg is BOTH released (sum release) AND shell-freed (`lin_tagged_free_box`
+/// reading the SumNode's offset-0 RC as a 16-byte box → mismatched-size dealloc + double free; an
+/// ASan heap-use-after-free for a `{String:Expr}` map / sum-union arg read-back, ADR-062 Stage 3).
+fn sum_arg_projected(arg_ty: &Type, param_ty: &Type) -> bool {
+    crate::repr::sum_type_eligible(param_ty)
+        && !crate::repr::sum_type_eligible(arg_ty)
+        && !matches!(arg_ty, Type::Named(_))
 }
 
 /// True when `ty` is an array whose ELEMENTS (transitively) contain a sealed-record array or a sealed
@@ -1893,7 +1917,11 @@ fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool
         // instead (see the call-arg loop's `full_release_boxes`), so neither is a shell-only box.
         Some(p) => is_union_ty(p) && !is_union_ty(arg_ty) && is_heap_ty(arg_ty)
             && !is_sealed_scalar_array(arg_ty)
-            && !is_sealed_scalar_repr(arg_ty),
+            && !is_sealed_scalar_repr(arg_ty)
+            // A sum-projected arg is fully owned + released by the owning model (a fresh `*SumNode`),
+            // NOT a borrowed-inner box shell — freeing its "shell" would mismatched-size dealloc the
+            // SumNode and the owning release would then double-free it.
+            && !sum_arg_projected(arg_ty, p),
         None => false,
     }
 }
@@ -1909,7 +1937,8 @@ fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool
 fn arg_box_is_caller_owned_scalar_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool {
     match param_ty {
         Some(p) => is_union_ty(p) && !is_union_ty(arg_ty) && !is_heap_ty(arg_ty)
-            && !is_sealed_scalar_repr(arg_ty),
+            && !is_sealed_scalar_repr(arg_ty)
+            && !sum_arg_projected(arg_ty, p),
         None => false,
     }
 }
