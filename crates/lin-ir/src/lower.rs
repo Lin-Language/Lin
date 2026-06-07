@@ -666,6 +666,11 @@ struct FuncBuilder {
     ret_ty: Type,
     blocks: Vec<BasicBlock>,
     current_block: BlockId,
+    /// The source span attributed to instructions emitted right now. Threaded by the lowerer at
+    /// statement/expression boundaries (`with_span`) and stamped onto every instruction by `emit`,
+    /// so the codegen DWARF pass can attach statement-granularity `DILocation`s under `--debug`.
+    /// Purely debug metadata — does not affect IR semantics or non-debug codegen.
+    current_span: Option<lin_common::Span>,
     temp_count: u32,
     temp_types: HashMap<Temp, Type>,
     block_counter: u32,
@@ -724,6 +729,7 @@ impl FuncBuilder {
             instructions: Vec::new(),
             terminator: Terminator::Unreachable,
             span: None,
+            instr_spans: Vec::new(),
         };
         let mut temp_types = HashMap::new();
         let mut temp_count = 0u32;
@@ -741,6 +747,7 @@ impl FuncBuilder {
             ret_ty,
             blocks: vec![entry_block],
             current_block: entry_id,
+            current_span: None,
             temp_count,
             temp_types,
             block_counter: 1,
@@ -771,6 +778,7 @@ impl FuncBuilder {
             instructions: Vec::new(),
             terminator: Terminator::Unreachable,
             span: None,
+            instr_spans: Vec::new(),
         });
         id
     }
@@ -791,7 +799,22 @@ impl FuncBuilder {
     }
 
     fn emit(&mut self, instr: Instruction) {
-        self.current_block_mut().instructions.push(instr);
+        let span = self.current_span;
+        let block = self.current_block_mut();
+        block.instructions.push(instr);
+        // Keep the per-instruction debug-span side-table in lockstep with `instructions`.
+        // Backfill with `None` if some earlier `emit` somehow skipped (defensive; in practice
+        // every push goes through here so they stay 1:1).
+        while block.instr_spans.len() < block.instructions.len() - 1 {
+            block.instr_spans.push(None);
+        }
+        block.instr_spans.push(span);
+    }
+
+    /// Set the source span attributed to subsequently-emitted instructions. Called at
+    /// statement/expression lowering boundaries so DWARF gets statement-granularity locations.
+    fn set_span(&mut self, span: lin_common::Span) {
+        self.current_span = Some(span);
     }
 
     fn terminate(&mut self, term: Terminator) {
@@ -2710,6 +2733,18 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
 // -------------------------------------------------------------------------
 
 fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+    // Attribute instructions emitted while lowering this expression to its source span (debug-only
+    // metadata for DWARF line tables). Restore the enclosing span afterwards so instructions emitted
+    // by the PARENT after this child returns (e.g. a Binary after its operands) get the parent's span,
+    // not this child's. No effect on IR semantics or non-debug codegen.
+    let saved_span = builder.current_span;
+    builder.set_span(expr.span());
+    let result = lower_expr_inner(expr, builder, ctx);
+    builder.current_span = saved_span;
+    result
+}
+
+fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     match expr {
         TypedExpr::IntLit(v, ty, _) => {
             builder.const_temp(Const::Int(*v, ty.clone()))
@@ -7273,6 +7308,7 @@ fn lower_function_expr_with_id(
         ret_ty: ret_type.clone(),
         blocks: Vec::new(),
         current_block: BlockId(0),
+        current_span: None,
         temp_count: inner_param_count,
         temp_types: {
             let mut m = HashMap::new();
@@ -7304,6 +7340,7 @@ fn lower_function_expr_with_id(
         instructions: Vec::new(),
         terminator: Terminator::Unreachable,
         span: Some(body.span()),
+        instr_spans: Vec::new(),
     });
 
     // Add capture slots: captured variables become FieldGet on the env pointer.

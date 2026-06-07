@@ -547,6 +547,14 @@ pub struct BasicBlock {
     /// Only populated for blocks that map to a user-meaningful source region
     /// (function bodies, if/match arms, loop bodies); `None` for synthetic blocks.
     pub span: Option<lin_common::Span>,
+    /// Per-instruction source spans, PARALLEL to `instructions` (`instr_spans[i]` is the source
+    /// span of `instructions[i]`, or `None` for synthetic instructions with no source location).
+    /// Populated by the lowerer (`emit`) so the codegen DWARF pass can attach statement-granularity
+    /// `DILocation`s in `--debug` builds. Purely additive debug metadata: it MUST be kept in lockstep
+    /// with `instructions` whenever an instruction is inserted/removed (the lowerer's `emit` plus the
+    /// RC-elision `remove` and escape `retain` sites do this). It never affects IR semantics or
+    /// non-debug codegen; if it is out of sync or empty the DWARF pass simply emits fewer locations.
+    pub instr_spans: Vec<Option<lin_common::Span>>,
 }
 
 /// A compiled Lin function in flat IR form.

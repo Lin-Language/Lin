@@ -192,6 +192,10 @@ fn elide_rc_fn(func: &mut LinFunction) {
         remove_here.sort_unstable_by(|a, b| b.cmp(a)); // descending
         for idx in remove_here {
             func.blocks[block_idx].instructions.remove(idx);
+            // Keep the parallel debug-span side-table in lockstep (only populated in --debug builds).
+            if idx < func.blocks[block_idx].instr_spans.len() {
+                func.blocks[block_idx].instr_spans.remove(idx);
+            }
         }
     }
 }
@@ -582,6 +586,7 @@ mod tests {
             instructions: instrs,
             terminator: term,
             span: None,
+            instr_spans: Vec::new(),
         };
         let mut temp_types = std::collections::HashMap::new();
         temp_types.insert(Temp(0), Type::Str);
@@ -616,6 +621,7 @@ mod tests {
             instructions: instrs0,
             terminator: Terminator::Jump(BlockId(1)),
             span: None,
+            instr_spans: Vec::new(),
         };
         let block1 = BasicBlock {
             id: BlockId(1),
@@ -623,6 +629,7 @@ mod tests {
             instructions: instrs1,
             terminator: Terminator::Return(None),
             span: None,
+            instr_spans: Vec::new(),
         };
         let mut temp_types = std::collections::HashMap::new();
         temp_types.insert(Temp(0), Type::Str);
@@ -659,6 +666,7 @@ mod tests {
             instructions: instrs0,
             terminator: Terminator::Jump(BlockId(1)),
             span: None,
+            instr_spans: Vec::new(),
         };
         let block1 = BasicBlock {
             id: BlockId(1),
@@ -666,6 +674,7 @@ mod tests {
             instructions: instrs1,
             terminator: Terminator::Jump(BlockId(2)),
             span: None,
+            instr_spans: Vec::new(),
         };
         let block2 = BasicBlock {
             id: BlockId(2),
@@ -673,6 +682,7 @@ mod tests {
             instructions: instrs2,
             terminator: Terminator::Return(None),
             span: None,
+            instr_spans: Vec::new(),
         };
         let mut temp_types = std::collections::HashMap::new();
         temp_types.insert(Temp(0), Type::Str);
@@ -1010,6 +1020,7 @@ mod tests {
                 else_block: BlockId(2),
             },
             span: None,
+            instr_spans: Vec::new(),
         };
         let block1 = BasicBlock {
             id: BlockId(1),
@@ -1017,6 +1028,7 @@ mod tests {
             instructions: vec![Instruction::Release { val: Temp(0), ty: Type::Str }],
             terminator: Terminator::Return(None),
             span: None,
+            instr_spans: Vec::new(),
         };
         let block2 = BasicBlock {
             id: BlockId(2),
@@ -1024,6 +1036,7 @@ mod tests {
             instructions: vec![],
             terminator: Terminator::Return(None),
             span: None,
+            instr_spans: Vec::new(),
         };
         let mut temp_types = std::collections::HashMap::new();
         temp_types.insert(Temp(0), Type::Str);
