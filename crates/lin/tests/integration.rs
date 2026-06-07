@@ -4859,6 +4859,33 @@ close(acc)
 }
 
 #[test]
+fn test_worker_captured_var_factory_escape() {
+    // Regression (spec §24.6.4 makeCounter): a worker built inside a function that RETURNS the
+    // worker, whose handler closes over an outer `var`, must keep working after the building
+    // frame dies. Previously the factory frame's `lin_closure_release` freed the handler env
+    // (and the captured `count` cell) while the worker thread still used it → garbage reads
+    // (`-2147483647`). The fix has `lin_worker_new` take an OWNING reference to the handler /
+    // onClose closures, released only in `close` after the thread joins.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { worker, request, close } from "std/async"
+
+val makeCounter = (): Json =>
+  var count = 0
+  val onMsg = (msg: String): Int32 =>
+    count = count + 1
+    count
+  worker(onMsg, (): Null => null)
+
+val c = makeCounter()
+print(toString(request(c, "tick")))
+print(toString(request(c, "tick")))
+close(c)
+"#);
+    assert_eq!(output, vec!["1", "2"]);
+}
+
+#[test]
 fn test_worker_message_fire_and_forget() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
