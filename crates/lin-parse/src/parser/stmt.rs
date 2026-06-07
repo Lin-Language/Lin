@@ -170,7 +170,7 @@ impl Parser {
         }
         self.expect(TokenKind::RBrace);
         self.skip_newlines();
-        self.expect_keyword(TokenKind::From);
+        self.expect_contextual_keyword("from");
         let path = self.expect_string();
         Stmt::Import { bindings, path, span }
     }
