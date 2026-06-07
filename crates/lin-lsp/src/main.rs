@@ -65,7 +65,8 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![".".into(), " ".into()]),
+                    // `"` and `/` additionally trigger import-path completion inside a `from "…"`.
+                    trigger_characters: Some(vec![".".into(), " ".into(), "\"".into(), "/".into()]),
                     resolve_provider: Some(false),
                     ..Default::default()
                 }),
@@ -216,6 +217,14 @@ impl LanguageServer for Backend {
         let base_dir = file_dir(uri);
         let analysis = analyse(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
+
+        // Import-path completion: inside a `from "…"` / `import foreign "…"` string, complete
+        // module paths (stdlib ids + sibling `.lin` files) and short-circuit the rest.
+        if let Some(typed) = import_string_prefix(&source, offset) {
+            let base_dir = file_dir(uri);
+            let items = import_path_completions(&typed, base_dir.as_deref());
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
 
         let prefix = word_before(&source, offset);
 
@@ -592,7 +601,9 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let actions = code_actions(&source, uri, &params);
+        let base_dir = file_dir(uri);
+        let index = WORKSPACE_INDEX.read().unwrap();
+        let actions = code_actions(&source, uri, &params, &index, base_dir.as_deref());
         if actions.is_empty() {
             Ok(None)
         } else {
@@ -1180,6 +1191,79 @@ fn first_param_category(sig: &str) -> Option<String> {
     Some(type_to_category(first.trim()).to_string())
 }
 
+/// Detect whether `offset` sits inside the quoted path of an `import` statement and, if
+/// so, return the path text already typed up to the cursor. Conservative + line-scoped:
+/// matches `... from "<typed>` and `import foreign "<typed>` on the cursor's line, with
+/// the cursor positioned after the opening quote and before any closing quote.
+///
+/// LIMITATION: detection is single-line and textual (no multi-line import strings, which
+/// the grammar doesn't produce anyway). Returns `None` outside an import-string context.
+fn import_string_prefix(source: &str, offset: usize) -> Option<String> {
+    let offset = offset.min(source.len());
+    // Start of the current line.
+    let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &source[line_start..offset];
+    // Find the opening quote we're inside: the last `"` on the line before the cursor.
+    let quote = line.rfind('"')?;
+    let before_quote = line[..quote].trim_end();
+    // Only an import context: `... from` or `import foreign`.
+    let is_from = before_quote.ends_with("from");
+    let is_foreign = before_quote.ends_with("import foreign") || before_quote.ends_with("foreign");
+    if !(is_from || is_foreign) {
+        return None;
+    }
+    // The text between the opening quote and the cursor is what's been typed so far.
+    let typed = &line[quote + 1..];
+    // If the user already closed the string before the cursor, we're not inside it.
+    if typed.contains('"') {
+        return None;
+    }
+    Some(typed.to_string())
+}
+
+/// Build import-path completion items for a partially-typed module path `typed`:
+///   - every `std/*` stdlib module id (always offered);
+///   - sibling `.lin` files in the importing file's directory (path stems), when known.
+/// Items are filtered to those starting with `typed` so `/` retriggers narrow the list.
+fn import_path_completions(typed: &str, base_dir: Option<&Path>) -> Vec<CompletionItem> {
+    let mut items = Vec::new();
+    // stdlib modules.
+    for id in STDLIB_MODULE_IDS {
+        if id.starts_with(typed) {
+            items.push(CompletionItem {
+                label: id.to_string(),
+                kind: Some(CompletionItemKind::MODULE),
+                detail: Some("stdlib module".to_string()),
+                ..Default::default()
+            });
+        }
+    }
+    // Sibling `.lin` files (excluding `.test.lin`), as bare stems.
+    if let Some(dir) = base_dir {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let Some(stem) = name.strip_suffix(".lin") else { continue };
+                if stem.ends_with(".test") || stem.is_empty() {
+                    continue;
+                }
+                if stem.starts_with(typed) {
+                    items.push(CompletionItem {
+                        label: stem.to_string(),
+                        kind: Some(CompletionItemKind::FILE),
+                        detail: Some("local module".to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    items.dedup_by(|a, b| a.label == b.label);
+    items
+}
+
 fn word_before(source: &str, offset: usize) -> &str {
     let bytes = source.as_bytes();
     let start = (0..offset)
@@ -1620,12 +1704,33 @@ fn collect_type_spans_in_type(ty: &lin_parse::ast::TypeExpr, out: &mut Vec<lin_c
 ///
 /// Only diagnostics that overlap the requested `params.range` produce an action. Pure over
 /// `(source, uri, params)` so it's unit-testable.
-fn code_actions(source: &str, uri: &Url, params: &CodeActionParams) -> Vec<CodeActionOrCommand> {
+fn code_actions(
+    source: &str,
+    uri: &Url,
+    params: &CodeActionParams,
+    index: &WorkspaceIndex,
+    base_dir: Option<&Path>,
+) -> Vec<CodeActionOrCommand> {
     let mut actions = Vec::new();
     let requested = params.range;
     for diag in &params.context.diagnostics {
         if !ranges_overlap(diag.range, requested) {
             continue;
+        }
+
+        // Auto-import fix: an undefined name that some workspace/stdlib module exports
+        // can be imported with one click. Offers one action per exporting module.
+        if let Some(name) = undefined_name(&diag.message) {
+            for module in index.modules_exporting(&name, base_dir) {
+                if let Some(edit) = auto_import_edit(source, &name, &module) {
+                    actions.push(CodeActionOrCommand::CodeAction(quick_fix(
+                        format!("Import `{}` from \"{}\"", name, module),
+                        uri.clone(),
+                        vec![edit],
+                        diag.clone(),
+                    )));
+                }
+            }
         }
 
         // Unused-import fix: delete the whole line the diagnostic sits on.
@@ -1658,6 +1763,68 @@ fn code_actions(source: &str, uri: &Url, params: &CodeActionParams) -> Vec<CodeA
         }
     }
     actions
+}
+
+/// Extract the offending identifier from an "Undefined variable 'X'" / "Undefined
+/// function 'X'" diagnostic message. Returns `None` for any other diagnostic.
+fn undefined_name(message: &str) -> Option<String> {
+    for prefix in ["Undefined variable '", "Undefined function '"] {
+        if let Some(rest) = message.strip_prefix(prefix) {
+            if let Some(close) = rest.find('\'') {
+                return Some(rest[..close].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Build the `TextEdit` that imports `name` from `module`. If the file already imports
+/// from `module` via `import { ... } from "module"`, merge `name` into that brace list;
+/// otherwise insert a fresh `import { name } from "module"` line after the last existing
+/// import (or at the very top when there are none). Returns `None` when `name` is already
+/// imported from `module`.
+fn auto_import_edit(source: &str, name: &str, module: &str) -> Option<TextEdit> {
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    let mut parser = lin_parse::Parser::new(tokens);
+    let parsed = parser.parse_module();
+
+    let mut last_import_line: Option<u32> = None;
+    for stmt in &parsed.statements {
+        if let Stmt::Import { bindings, path, span } = stmt {
+            let line = offset_to_position(source, span.start as usize).line;
+            last_import_line = Some(line);
+            if path == module {
+                // Already importing from this module — merge into its brace list (unless
+                // the name is already present).
+                if bindings.iter().any(|b| b.name == name || b.alias.as_deref() == Some(name)) {
+                    return None;
+                }
+                // Insert `, name` just before the closing `}` of this import's brace list.
+                // The stmt span covers only the `import` keyword, so scan to the line end.
+                let start = span.start as usize;
+                let line_end = source[start..].find('\n').map(|i| start + i).unwrap_or(source.len());
+                let stmt_src = source.get(start..line_end)?;
+                let brace = stmt_src.find('}')?;
+                let insert_at = start + brace;
+                let pos = offset_to_position(source, insert_at);
+                return Some(TextEdit {
+                    range: Range { start: pos, end: pos },
+                    new_text: format!(", {}", name),
+                });
+            }
+        }
+    }
+
+    // No existing import from `module`: add a new line. Place it after the last import,
+    // else at the top of the file.
+    let new_line = format!("import {{ {} }} from \"{}\"\n", name, module);
+    let line = last_import_line.map(|l| l + 1).unwrap_or(0);
+    let pos = Position { line, character: 0 };
+    Some(TextEdit {
+        range: Range { start: pos, end: pos },
+        new_text: new_line,
+    })
 }
 
 /// Build a `QuickFix` code action with a single-document edit, attaching the source diagnostic.
@@ -2894,6 +3061,32 @@ impl WorkspaceIndex {
         Some(out)
     }
 
+    /// Every module that exports `name`, as an import-path string suitable for an
+    /// `import { name } from "<path>"` line. stdlib modules surface as their `std/...`
+    /// id; user modules are returned as a path relative to `from_dir` (so the inserted
+    /// import resolves the same way the import resolver would). The result is sorted
+    /// (stdlib first, then alphabetical) and de-duplicated.
+    fn modules_exporting(&self, name: &str, from_dir: Option<&Path>) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (mod_id, file) in &self.files {
+            if !file.exports.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            if mod_id.starts_with("std/") {
+                out.push(mod_id.clone());
+            } else if let Some(rel) = import_path_for(mod_id, from_dir) {
+                out.push(rel);
+            }
+        }
+        out.sort_by(|a, b| {
+            let a_std = a.starts_with("std/");
+            let b_std = b.starts_with("std/");
+            b_std.cmp(&a_std).then_with(|| a.cmp(b))
+        });
+        out.dedup();
+        out
+    }
+
     /// Fuzzy-search every top-level declaration in the index for `query`,
     /// returning `(module_id, name, name_span, kind)` matches. An empty query
     /// matches everything (the client filters further). stdlib symbols are
@@ -2976,6 +3169,56 @@ fn leading_type_name(ty: &str) -> Option<String> {
         return None;
     }
     Some(name)
+}
+
+/// Derive the `import`-statement path string that resolves to user module `module_id`
+/// (a canonical absolute `.lin` file path) from a file in `from_dir`. Returns the path
+/// relative to `from_dir` with the `.lin` extension stripped and forward-slash
+/// separators (matching the `base_dir.join("{path}.lin")` resolver). Falls back to the
+/// file stem when no relative base is available or the relative path can't be computed.
+fn import_path_for(module_id: &str, from_dir: Option<&Path>) -> Option<String> {
+    let target = Path::new(module_id);
+    let stem_path = target.with_extension("");
+    let rel = match from_dir {
+        Some(dir) => pathdiff_relative(&stem_path, dir).unwrap_or(stem_path.clone()),
+        None => stem_path.clone(),
+    };
+    let s = rel.to_string_lossy().replace('\\', "/");
+    if s.is_empty() {
+        return target.file_stem().map(|s| s.to_string_lossy().to_string());
+    }
+    Some(s)
+}
+
+/// Compute `target` relative to `base` (both absolute) without touching the FS, e.g.
+/// `("/a/b/leaf", "/a/c")` → `../b/leaf`. Returns `None` when either path isn't
+/// absolute (the relative form would be meaningless).
+fn pathdiff_relative(target: &Path, base: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    if !target.is_absolute() || !base.is_absolute() {
+        return None;
+    }
+    let mut ta = target.components().peekable();
+    let mut ba = base.components().peekable();
+    // Skip the shared prefix.
+    while let (Some(t), Some(b)) = (ta.peek(), ba.peek()) {
+        if t == b {
+            ta.next();
+            ba.next();
+        } else {
+            break;
+        }
+    }
+    let mut result = PathBuf::new();
+    for c in ba {
+        if let Component::Normal(_) = c {
+            result.push("..");
+        }
+    }
+    for c in ta {
+        result.push(c.as_os_str());
+    }
+    Some(result)
 }
 
 /// Convert an index `module_id` back to a file `Url`. stdlib ids (`std/...`) have no
@@ -3554,7 +3797,7 @@ mod tests {
             analysis.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
         let params = code_action_params(src, analysis.diagnostics.clone());
-        let actions = code_actions(src, &dummy_uri(), &params);
+        let actions = code_actions(src, &dummy_uri(), &params, &WorkspaceIndex::default(), None);
         let titles = action_titles(&actions);
         assert!(
             titles.iter().any(|t| t == "Remove unused import"),
@@ -3588,7 +3831,7 @@ mod tests {
             analysis.diagnostics.iter().map(|d| (&d.message, &d.data)).collect::<Vec<_>>()
         );
         let params = code_action_params(src, analysis.diagnostics.clone());
-        let actions = code_actions(src, &dummy_uri(), &params);
+        let actions = code_actions(src, &dummy_uri(), &params, &WorkspaceIndex::default(), None);
         let titles = action_titles(&actions);
         assert!(
             titles.iter().any(|t| t == "Change to `length`"),
@@ -3971,5 +4214,80 @@ mod tests {
         assert_eq!(span_text, "leaf", "link range should be just the path text");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── auto-import code action ───────────────────────────────────────────────────
+
+    /// An undefined name that a stdlib module exports offers an "Import ... from ..." quick fix
+    /// whose edit inserts the import line.
+    #[test]
+    fn auto_import_action_offers_stdlib_import() {
+        // `print` is undefined here (never imported) but exported by std/io.
+        let src = "val x = print(\"hi\")\n";
+        let analysis = analyse(src, None);
+        // There must be an undefined-name diagnostic for `print`.
+        assert!(
+            analysis.diagnostics.iter().any(|d| undefined_name(&d.message).as_deref() == Some("print")),
+            "expected an undefined `print` diagnostic, got {:?}",
+            analysis.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let index = index_from(&[]); // stdlib is seeded.
+        let params = code_action_params(src, analysis.diagnostics.clone());
+        let actions = code_actions(src, &dummy_uri(), &params, &index, None);
+        let titles = action_titles(&actions);
+        assert!(
+            titles.iter().any(|t| t == "Import `print` from \"std/io\""),
+            "expected an auto-import action for print, got {:?}",
+            titles
+        );
+        // The edit must insert an import line.
+        let ca = actions.iter().find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) if ca.title.contains("Import `print`") => Some(ca),
+            _ => None,
+        }).unwrap();
+        let edits = ca.edit.as_ref().unwrap().changes.as_ref().unwrap().get(&dummy_uri()).unwrap();
+        assert!(edits[0].new_text.contains("import { print } from \"std/io\""));
+    }
+
+    /// Auto-import merges into an existing import from the SAME module rather than adding a
+    /// second `import ... from "std/io"` line.
+    #[test]
+    fn auto_import_edit_merges_existing_module_import() {
+        let src = "import { print } from \"std/io\"\nval x = printErr(\"e\")\n";
+        let edit = auto_import_edit(src, "printErr", "std/io").expect("expected a merge edit");
+        // A merge inserts `, printErr` (not a whole new import line).
+        assert_eq!(edit.new_text, ", printErr");
+        // Inserted on line 0 (the existing import line).
+        assert_eq!(edit.range.start.line, 0);
+    }
+
+    /// Already-imported name from the module → no edit (nothing to add).
+    #[test]
+    fn auto_import_edit_none_when_already_imported() {
+        let src = "import { print } from \"std/io\"\nval x = 1\n";
+        assert!(auto_import_edit(src, "print", "std/io").is_none());
+    }
+
+    // ── import-path completion ────────────────────────────────────────────────────
+
+    /// Inside a `from "…"` string the prefix is detected and stdlib paths are completed.
+    #[test]
+    fn import_string_prefix_detects_from_context() {
+        let src = "import { x } from \"std/ar\n";
+        let off = src.find("std/ar").unwrap() + "std/ar".len();
+        assert_eq!(import_string_prefix(src, off).as_deref(), Some("std/ar"));
+        // Outside any import string → None.
+        let plain = "val x = \"hi\"\n";
+        let off2 = plain.find("hi").unwrap();
+        assert!(import_string_prefix(plain, off2).is_none());
+    }
+
+    #[test]
+    fn import_path_completions_offers_stdlib_modules() {
+        let items = import_path_completions("std/ar", None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"std/array"), "expected std/array in {:?}", labels);
+        // No non-matching modules.
+        assert!(labels.iter().all(|l| l.starts_with("std/ar")));
     }
 }
