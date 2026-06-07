@@ -3527,6 +3527,41 @@ print(toString(sum(100000, 0)))
 }
 
 #[test]
+fn test_from_contextual_keyword_as_identifier() {
+    // `from` is a contextual keyword: reserved only as the import separator, usable
+    // as an ordinary identifier (parameter, variable, field, function name) elsewhere.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val dist = (from: Int32, to: Int32): Int32 =>
+  to - from
+
+val from = 100
+val labelled = { "from": from, "to": 5 }
+
+print(dist(3, 10).toString())
+print(toString(from))
+print(toString(labelled["from"]))
+"#);
+    assert_eq!(output, vec!["7", "100", "100"]);
+}
+
+#[test]
+fn test_from_as_function_name_with_imports() {
+    // `from` usable as a function name in a file that still uses `from` as the import
+    // separator -- confirms imports remain unbroken alongside identifier use.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val from = (x: Int32): Int32 =>
+  x + 1
+
+print(toString(from(6)))
+"#);
+    assert_eq!(output, vec!["7"]);
+}
+
+#[test]
 fn test_tco_in_match() {
     let output = run(r#"import { print } from "std/io"
 
