@@ -1,19 +1,18 @@
-//! Representation-inference pass (Stages 1-2: PURE side-table observer).
+//! Representation-inference pass — the single owner of the packed-vs-boxed decision (ADR-062).
 //!
 //! This computes, per function, a side table `Vec<Repr>` indexed by `Temp.0` giving the *physical
 //! representation* each temp carries at runtime — packed sealed struct / packed sealed array / boxed
-//! TaggedVal / unboxed flat scalar. It is the foundation for centralizing the packed-vs-boxed
-//! decision that is today replicated across three type-driven predicate families
-//! (`Codegen::sealed_array_elem`/`sealed_fields`/`is_flat_scalar`, `lower::is_sealed_scalar_array`,
-//! `monomorphize::field_packed_scalar`). See `docs/REPR_PASS_DESIGN.md`.
+//! TaggedVal / unboxed flat scalar — stored on `LinFunction.repr`. Codegen reads `func.repr[t]` at
+//! the decide/assume sites instead of re-deriving from `Type`. See ADR-062 in `docs/DECISIONS.md`.
 //!
-//! # Stage 2 status — OBSERVER ONLY
+//! # Consumed by codegen
 //!
-//! In Stage 2 the pass ONLY computes the table; NOTHING consumes it. Codegen still uses the old
-//! predicates. The deliverable is the ORACLE ([`oracle_check`]): a debug-only assertion that the
-//! repr the new analysis computes at every site where the OLD predicates decide a representation
-//! AGREES with what those predicates decide today. This proves the analysis conservatively
-//! reproduces current behaviour before Stage 3 swaps the decision source.
+//! The DECIDE sites (MakeObject/MakeArray/Push) read the resolved repr of the produced temp; the
+//! ASSUME sites (FieldGet/SealedArrayFieldGet/Index, the IndexSet RHS, and `Release`) read
+//! `func.repr[operand]` to choose the packed-vs-boxed load/store/free. [`oracle_check`] (debug-only)
+//! asserts the analysis agrees with the old type predicate at every decide site (so each swap is a
+//! conservative no-op), and [`verify`] (debug-only) asserts the repr each opcode REQUIRES of an
+//! operand equals `func.repr[operand]` — making a silent representation mismatch a compile-time panic.
 //!
 //! # Why a side table, not a Type attribute
 //!
