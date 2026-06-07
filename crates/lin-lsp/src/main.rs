@@ -906,8 +906,8 @@ fn document_symbols(source: &str, module: &lin_parse::ast::Module) -> Vec<Docume
                 };
                 (name, name_span, kind)
             }
-            Stmt::Var { name, span, .. } => {
-                (name.clone(), *span, SymbolKind::VARIABLE)
+            Stmt::Var { name, name_span, .. } => {
+                (name.clone(), *name_span, SymbolKind::VARIABLE)
             }
             Stmt::TypeDecl { name, span, .. } => {
                 (name.clone(), *span, SymbolKind::CLASS)
@@ -1181,6 +1181,56 @@ mod tests {
             from_def.is_empty(),
             "param decl site has no recorded span; expected empty, got {:?}",
             from_def
+        );
+    }
+
+    /// A plain `val x = ...` binding (not a param) is now bound with a real def_span, so its uses
+    /// are grouped: placing the cursor on one use returns the binding plus every other use.
+    #[test]
+    fn occurrences_at_collects_plain_val_uses_from_a_use_site() {
+        // `x` is a top-level `val`, read twice in the body of `f`.
+        let src = "val x = 1\nval f = () => x + x\n";
+        let map = span_map(src);
+        let body = src.find("=>").unwrap() + 2;
+        // Cursor on the first use of `x` in `f`'s body.
+        let cursor = offset_after(src, body, "x");
+        let occ = occurrences_at(&map, cursor);
+        // 1 binding (the `val x` decl) + 2 uses, deduped.
+        assert_eq!(occ.len(), 3, "expected val binding + 2 uses, got {:?}", occ);
+        for s in &occ {
+            assert_eq!(&src[s.start as usize..s.end as usize], "x", "span {:?} not over `x`", s);
+        }
+        // The binding span must be the `val x` decl site (offset of `x` on line 1), proving the
+        // def_span flows from the `val` binding, not just the uses.
+        let decl = offset_after(src, src.find("val").unwrap(), "x");
+        assert!(
+            occ.iter().any(|s| s.start as usize == decl),
+            "occurrences must include the `val x` decl site at offset {}, got {:?}",
+            decl, occ
+        );
+    }
+
+    /// A `var` binding likewise records a def_span: cursor on a read of the var returns the binding
+    /// plus the read and the reassignment target site.
+    #[test]
+    fn occurrences_at_collects_var_uses_including_reassignment() {
+        let src = "var c = 0\nval f = () => { c = c + 1; c }\n";
+        let map = span_map(src);
+        let body = src.find("=>").unwrap() + 2;
+        // Cursor on the read `c + 1` (the `c` after `=`).
+        let eq = offset_after(src, body, "=");
+        let cursor = offset_after(src, eq + 1, "c");
+        let occ = occurrences_at(&map, cursor);
+        // binding (var c) + assignment-target `c` + read in `c + 1` + final `c`.
+        assert!(occ.len() >= 3, "expected var binding + uses, got {:?}", occ);
+        for s in &occ {
+            assert_eq!(&src[s.start as usize..s.end as usize], "c", "span {:?} not over `c`", s);
+        }
+        let decl = offset_after(src, src.find("var").unwrap(), "c");
+        assert!(
+            occ.iter().any(|s| s.start as usize == decl),
+            "occurrences must include the `var c` decl site at offset {}, got {:?}",
+            decl, occ
         );
     }
 
