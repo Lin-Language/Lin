@@ -1101,6 +1101,7 @@ mod tests {
                 instructions: instrs,
                 terminator: Terminator::Return(ret),
                 span: None,
+                instr_spans: Vec::new(),
             }],
             temp_types,
             temp_count,

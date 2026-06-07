@@ -207,13 +207,31 @@ fn analyze_fn(func: &mut LinFunction) {
     // Removing the Retain/Release on it cannot unbalance any other value's RC because the class is
     // closed under representation-preserving aliasing and is disjoint from every heap value's class.
     for block in &mut func.blocks {
-        block.instructions.retain(|instr| match instr {
-            Instruction::Retain { val, .. } | Instruction::Release { val, .. } => {
-                // Keep the instruction UNLESS its target is in a stack-resident class.
-                !stack_class_roots.contains(&uf.find_const(*val))
+        // Drop the stack-resident RC instructions while keeping the parallel debug-span side-table
+        // (--debug only) in lockstep. We rebuild both vectors in one index-aligned pass rather than
+        // `retain`, so an entry in `instr_spans` is removed iff its instruction is removed.
+        let have_spans = block.instr_spans.len() == block.instructions.len();
+        let mut kept_instrs = Vec::with_capacity(block.instructions.len());
+        let mut kept_spans = Vec::with_capacity(block.instr_spans.len());
+        for (i, instr) in block.instructions.drain(..).enumerate() {
+            let keep = match &instr {
+                Instruction::Retain { val, .. } | Instruction::Release { val, .. } => {
+                    // Keep the instruction UNLESS its target is in a stack-resident class.
+                    !stack_class_roots.contains(&uf.find_const(*val))
+                }
+                _ => true,
+            };
+            if keep {
+                if have_spans {
+                    kept_spans.push(block.instr_spans[i]);
+                }
+                kept_instrs.push(instr);
             }
-            _ => true,
-        });
+        }
+        block.instructions = kept_instrs;
+        if have_spans {
+            block.instr_spans = kept_spans;
+        }
     }
 }
 
