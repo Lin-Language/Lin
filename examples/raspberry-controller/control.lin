@@ -1,0 +1,43 @@
+// Control core — the pure keypress/speed/packet logic of the RC-car client.
+//
+// The original (Rust) `deathbot` client reads the keyboard in raw mode and sends
+// an 8-byte UDP control packet at 20 Hz: two big-endian IEEE-754 f32 motor speeds
+// in [-1, 1]:
+//
+//   q / a  →  left  +/-       w / s  →  right +/-
+//   space  →  stop            ESC    →  quit
+//
+// This module is the pure, unit-tested core: quantise a speed and apply a
+// keypress. Encoding the 8-byte packet is protocol.lin's job (`encodePacket`) —
+// callers import that from `./protocol`, so it is not duplicated here. The TTY +
+// UDP wiring that drives this logic lives in main.lin's `runController`, which is
+// not exercised by CI (it needs a live terminal and a peer).
+//
+// Stdlib used:
+//   std/math   — clamp / round
+import { clamp, round } from "std/math"
+
+// One key press nudges a motor speed by this much.
+export val STEP = 0.1
+
+// Quantise a motor speed to one decimal place and clamp to [-1.0, 1.0],
+// matching the Rust `clamp(v) = (v*10).round()/10` then `.clamp(-1,1)`.
+export val clampSpeed = (v: Float64): Float64 =>
+  clamp(round(v * 10.0) / 10.0, 0.0 - 1.0, 1.0)
+
+// Apply one keypress to the [left, right] speed pair, returning the new pair.
+// Keycodes are raw bytes from readKey: q=113 a=97 w=119 s=115 space=32 ESC=27.
+// Any other key leaves the speeds unchanged.
+export val applyKey = (key: Int32, left: Float64, right: Float64): Float64[] =>
+  if key == 113 then
+    [clampSpeed(left + STEP), right] // q: left +
+  else if key == 97 then
+    [clampSpeed(left - STEP), right] // a: left -
+  else if key == 119 then
+    [left, clampSpeed(right + STEP)] // w: right +
+  else if key == 115 then
+    [left, clampSpeed(right - STEP)] // s: right -
+  else if key == 32 then
+    [0.0, 0.0] // space: stop
+  else
+    [left, right]

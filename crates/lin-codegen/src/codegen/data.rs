@@ -1033,6 +1033,77 @@ impl<'ctx> Codegen<'ctx> {
         global.as_pointer_value()
     }
 
+    /// Emit (and cache) the static `SumDesc` global for a sum type and return a pointer to it (NULL
+    /// pointer constant when NO variant has a heap/recursive field — a Stage-1 scalar-only sum type,
+    /// whose drop is a pure refcount decrement + free). The descriptor is the variant-indexed
+    /// heap-field table the runtime drop walk (`lin_sumnode_release`) reads:
+    /// ```text
+    /// SumDesc     = [ u32 variant_count | VariantDesc * variant_count ]
+    /// VariantDesc = [ u32 heap_field_count | { u32 byte_offset, u32 kind } * heap_field_count ]
+    /// ```
+    /// Stage 2: the only heap fields are RECURSIVE children (`KIND_SUMNODE` = a `*SumNode` slot the
+    /// drop walk recurses into). Variant order matches the union's declaration order (the inline tag
+    /// indexes it). Cached by the sum type's `Debug` shape so identical sum types share one descriptor.
+    pub(crate) fn sumnode_descriptor(&mut self, sum_ty: &Type) -> inkwell::values::PointerValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i32_ty = self.context.i32_type();
+        let disc_key = match Self::sum_type_discriminant(sum_ty) {
+            Some(k) => k,
+            None => return ptr_ty.const_null(),
+        };
+        let self_name = Self::sum_recursive_self_name(sum_ty);
+        let variants = match sum_ty {
+            Type::Union(vs) => vs,
+            _ => return ptr_ty.const_null(),
+        };
+        // Per-variant heap-field lists, in declaration (tag) order.
+        let mut per_variant: Vec<Vec<(u64, u32)>> = Vec::with_capacity(variants.len());
+        let mut any_heap = false;
+        for v in variants {
+            let mut heap: Vec<(u64, u32)> = Vec::new();
+            if let Type::Object { fields, .. } = v {
+                let payload = Self::sumnode_variant_payload_fields(fields, &disc_key);
+                for (k, fty) in payload.iter() {
+                    let is_recursive = self_name
+                        .as_deref()
+                        .is_some_and(|n| Self::is_sum_recursive_child(fty, n));
+                    if is_recursive {
+                        let offset = Self::sumnode_field_offset(&payload, k);
+                        heap.push((offset, Self::KIND_SUMNODE));
+                        any_heap = true;
+                    }
+                }
+            }
+            per_variant.push(heap);
+        }
+        if !any_heap {
+            return ptr_ty.const_null(); // Stage-1 scalar-only: NULL desc, pure refcount drop.
+        }
+        // Flatten to a contiguous [N x i32] image matching the SumDesc byte layout exactly.
+        let mut words: Vec<inkwell::values::IntValue<'ctx>> = Vec::new();
+        words.push(i32_ty.const_int(per_variant.len() as u64, false)); // variant_count
+        for heap in &per_variant {
+            words.push(i32_ty.const_int(heap.len() as u64, false)); // heap_field_count
+            for (off, kind) in heap {
+                words.push(i32_ty.const_int(*off, false));
+                words.push(i32_ty.const_int(*kind as u64, false));
+            }
+        }
+        // Cache key: the full word sequence (so identical sum-type layouts share one global).
+        let key: String = format!(
+            "__sumdesc_{}",
+            words.iter().map(|w| w.get_zero_extended_constant().unwrap_or(0).to_string()).collect::<Vec<_>>().join("_")
+        );
+        if let Some(g) = self.module.get_global(&key) {
+            return g.as_pointer_value();
+        }
+        let arr = i32_ty.const_array(&words);
+        let global = self.module.add_global(arr.get_type(), None, &key);
+        global.set_initializer(&arr);
+        global.set_constant(true);
+        global.as_pointer_value()
+    }
+
     /// Load `field` from a sealed record at its constant byte offset — THE win: a single typed load,
     /// no `lin_object_get` call / hash lookup / unbox. `obj` is the struct ptr. For a HEAP field the
     /// loaded value is the BORROWED heap pointer (the struct owns it); the IR `FieldGet`/`Index`
@@ -1817,30 +1888,45 @@ impl<'ctx> Codegen<'ctx> {
         let payload_fields = Self::sumnode_variant_by_disc(sum_ty, disc)
             .expect("sumnode_construct: unknown variant payload");
         let disc_key = Self::sum_type_discriminant(sum_ty).expect("sumnode_construct: not a sum type");
+        let self_name = Self::sum_recursive_self_name(sum_ty);
         let i64_ty = self.context.i64_type();
         let i32_ty = self.context.i32_type();
         let i8_ty = self.context.i8_type();
-        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        // The SumDesc (NULL for a scalar-only sum type — the runtime drop is then a pure rc dec+free;
+        // non-NULL for a recursive sum type so the drop walk recurses into `*SumNode` children).
+        let desc = self.sumnode_descriptor(sum_ty);
         let node = self
             .builder
-            .call(self.rt.sumnode_alloc, &[i64_ty.const_int(total, false).into(), ptr_ty.const_null().into()], "sumnode")
+            .call(self.rt.sumnode_alloc, &[i64_ty.const_int(total, false).into(), desc.into()], "sumnode")
             .try_as_basic_value()
             .unwrap_basic()
             .into_pointer_value();
         // Inline tag @ 16.
         let tag_p = unsafe { self.builder.gep(i8_ty, node, &[i64_ty.const_int(Self::SUMNODE_TAG_OFFSET, false)], "sumnode_tag_p") };
         self.builder.store(tag_p, i32_ty.const_int(tag as u64, false));
-        // Scalar payload fields by offset (skip the discriminant).
+        // Payload fields by offset (skip the discriminant — carried by the tag).
         for (name, val, val_ty) in field_vals {
             if name == &disc_key {
                 continue;
             }
             let Some(fld_ty) = payload_fields.get(name).cloned() else { continue };
             let offset = Self::sumnode_field_offset(&payload_fields, name);
-            // Reconcile a wider/narrower numeric literal into the stored field width (no RC — scalar).
-            let stored = if val_ty == &fld_ty { *val } else { self.compile_ir_coerce(*val, val_ty, &fld_ty) };
             let p = unsafe { self.builder.gep(i8_ty, node, &[i64_ty.const_int(offset, false)], "sumnode_set_p") };
-            self.builder.store(p, stored);
+            let is_recursive = self_name
+                .as_deref()
+                .is_some_and(|n| Self::is_sum_recursive_child(&fld_ty, n));
+            if is_recursive {
+                // A recursive child is an owned `*SumNode` slot: the node owns +1 of the child. The
+                // lowerer TRANSFERS the child's existing +1 into the node (it `unregister_owned`s a
+                // fresh-alloc child literal, or `Retain`s a borrowed child) — exactly the
+                // `transfer_into_container` discipline — so codegen must NOT add another retain here
+                // (that would double-count the child, never balanced by the single drop-walk release).
+                self.builder.store(p, *val);
+            } else {
+                // Scalar field: reconcile a wider/narrower numeric literal into the stored width.
+                let stored = if val_ty == &fld_ty { *val } else { self.compile_ir_coerce(*val, val_ty, &fld_ty) };
+                self.builder.store(p, stored);
+            }
         }
         node.into()
     }
@@ -1853,6 +1939,105 @@ impl<'ctx> Codegen<'ctx> {
         let base = node.into_pointer_value();
         let p = unsafe { self.builder.gep(i8_ty, base, &[i64_ty.const_int(Self::SUMNODE_TAG_OFFSET, false)], "sumnode_tag_p") };
         self.builder.load(i32_ty, p, "sumnode_tag").into_int_value()
+    }
+
+    /// Read a RECURSIVE CHILD field of a `SumNode` by constant offset (unboxed-sumtype Stage 2),
+    /// yielding the BORROWED interior `*SumNode` (the parent still owns it). The offset is resolved by
+    /// field NAME: the recursive child field appears in exactly the variant(s) that declare it, all at
+    /// the same payload offset (the access is only reachable when the tag selects such a variant). The
+    /// field is loaded as a raw pointer; its repr is Packed(SumNode) of the child sum type, so a
+    /// chained `evalNode(node["left"])` re-enters the tag switch. The lowerer applies retain-on-escape.
+    /// Read a field of a `SumNode` by NAME, dispatching on whether the field is a recursive child
+    /// (`*SumNode` pointer slot → borrowed interior pointer) or a scalar payload (const-offset value
+    /// load). The variant carrying `field` is resolved by name (consistent offset across the
+    /// variant(s) declaring it). Used by `compile_ir_field_get` for a narrowed-variant SumNode whose
+    /// recursive children block the sealed-projection path, so EVERY field read goes direct to the
+    /// node. A field absent from every variant → the Null value for `result_ty` (safe-access rule).
+    pub(crate) fn sumnode_field_get_by_name(
+        &mut self,
+        node: BasicValueEnum<'ctx>,
+        field: &str,
+        sum_ty: &Type,
+        result_ty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let disc_key = match Self::sum_type_discriminant(sum_ty) {
+            Some(k) => k,
+            None => return self.null_value_for(result_ty),
+        };
+        let self_name = Self::sum_recursive_self_name(sum_ty);
+        let variants = match sum_ty {
+            Type::Union(vs) => vs,
+            _ => return self.null_value_for(result_ty),
+        };
+        // Find the variant payload that declares `field`, and whether it is a recursive child.
+        for v in variants {
+            if let Type::Object { fields, .. } = v {
+                let payload = Self::sumnode_variant_payload_fields(fields, &disc_key);
+                if let Some(fty) = payload.get(field) {
+                    let is_recursive = self_name
+                        .as_deref()
+                        .is_some_and(|n| Self::is_sum_recursive_child(fty, n));
+                    if is_recursive {
+                        return self.sumnode_recursive_child_get(node, field, sum_ty);
+                    }
+                    // Scalar payload field: const-offset value load via the variant payload layout.
+                    return self.sumnode_field_get(node, field, &payload, result_ty);
+                }
+            }
+        }
+        // Field not in any variant payload (e.g. the discriminant, or a statically-absent key) → Null.
+        self.null_value_for(result_ty)
+    }
+
+    pub(crate) fn sumnode_recursive_child_get(
+        &mut self,
+        node: BasicValueEnum<'ctx>,
+        field: &str,
+        sum_ty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let disc_key = match Self::sum_type_discriminant(sum_ty) {
+            Some(k) => k,
+            None => return ptr_ty.const_null().into(),
+        };
+        let self_name = Self::sum_recursive_self_name(sum_ty);
+        let variants = match sum_ty {
+            Type::Union(vs) => vs,
+            _ => return ptr_ty.const_null().into(),
+        };
+        // Find the (unique) offset of `field` as a recursive child across variants that declare it.
+        let mut offset: Option<u64> = None;
+        for v in variants {
+            if let Type::Object { fields, .. } = v {
+                let payload = Self::sumnode_variant_payload_fields(fields, &disc_key);
+                if let Some(fty) = payload.get(field) {
+                    let is_recursive = self_name
+                        .as_deref()
+                        .is_some_and(|n| Self::is_sum_recursive_child(fty, n));
+                    if is_recursive {
+                        let off = Self::sumnode_field_offset(&payload, field);
+                        match offset {
+                            Some(prev) if prev != off => {
+                                // Ambiguous (the field is a recursive child at DIFFERENT offsets in
+                                // different variants). Defensive: not reachable for the in-scope
+                                // direct-self-recursive sum types (children share a consistent layout
+                                // position). Return Null rather than read a wrong offset.
+                                return ptr_ty.const_null().into();
+                            }
+                            _ => offset = Some(off),
+                        }
+                    }
+                }
+            }
+        }
+        let Some(offset) = offset else {
+            return ptr_ty.const_null().into();
+        };
+        let i64_ty = self.context.i64_type();
+        let i8_ty = self.context.i8_type();
+        let base = node.into_pointer_value();
+        let p = unsafe { self.builder.gep(i8_ty, base, &[i64_ty.const_int(offset, false)], "sumnode_child_p") };
+        self.builder.load(ptr_ty, p, "sumnode_child")
     }
 
     /// Read a SCALAR payload field of a `SumNode` by constant offset (the value's variant is known —
@@ -1893,21 +2078,51 @@ impl<'ctx> Codegen<'ctx> {
         &mut self,
         node: BasicValueEnum<'ctx>,
         sum_ty: &Type,
-        llvm_fn: inkwell::values::FunctionValue<'ctx>,
+        _llvm_fn: inkwell::values::FunctionValue<'ctx>,
     ) -> BasicValueEnum<'ctx> {
-        let disc_key = Self::sum_type_discriminant(sum_ty).expect("sumnode_materialize: not a sum type");
+        // A recursive sum type can NOT be materialized by inlining the per-variant switch (a recursive
+        // child would inline another full switch → infinite codegen). Build (once) a memoized
+        // per-sum-type materializer FUNCTION that calls ITSELF for recursive children (runtime
+        // recursion, terminating), and call it. A non-recursive sum type uses the same function (no
+        // self-call) — uniform and still O(1)-ish per node.
+        let func = self.get_or_build_sumnode_materializer(sum_ty);
+        self.builder
+            .call(func, &[node.into()], "sumnode_mat")
+            .try_as_basic_value()
+            .unwrap_basic()
+    }
+
+    /// Build (and memoize) the per-sum-type materializer `lin_summat_<key>(node: ptr) -> ptr`: it
+    /// reads the node's inline tag, switches to the matching variant, and builds a fresh boxed
+    /// `LinObject` with the discriminant StrLit + each payload field. A SCALAR field is boxed
+    /// directly; a RECURSIVE CHILD (`*SumNode`) is materialized by a RECURSIVE CALL to this same
+    /// function (so the whole tree serialises). Returns a +1 `LinObject*`. Children are BORROWED
+    /// (read by const offset, never released here); the per-field box shells are reclaimed after
+    /// `object_set_fresh` retains. Memoized by the sum type's shape so it is emitted once.
+    fn get_or_build_sumnode_materializer(&mut self, sum_ty: &Type) -> inkwell::values::FunctionValue<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i32_ty = self.context.i32_type();
+        let disc_key = Self::sum_type_discriminant(sum_ty).expect("sumnode_materialize: not a sum type");
+        let self_name = Self::sum_recursive_self_name(sum_ty);
+        let key = format!("lin_summat_{:x}", {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            format!("{sum_ty:?}").hash(&mut h);
+            h.finish()
+        });
+        if let Some(f) = self.module.get_function(&key) {
+            return f;
+        }
         let variants = match sum_ty {
             Type::Union(vs) => vs.clone(),
             _ => unreachable!(),
         };
-        let tag = self.sumnode_tag_load(node);
-        let merge_bb = self.context.append_basic_block(llvm_fn, "sumnode_mat_merge");
-        let mut incoming: Vec<(inkwell::values::PointerValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
-        // Build the variant switch.
-        let default_bb = self.context.append_basic_block(llvm_fn, "sumnode_mat_default");
-        let mut cases: Vec<(inkwell::values::IntValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
-        let i32_ty = self.context.i32_type();
+        let saved_block = self.builder.get_insert_block();
+        let fn_ty = ptr_ty.fn_type(&[ptr_ty.into()], false);
+        let func = self.module.add_function(&key, fn_ty, None);
+        let entry = self.context.append_basic_block(func, "entry");
+        self.builder.position_at_end(entry);
+        let node: BasicValueEnum<'ctx> = func.get_nth_param(0).unwrap();
         let free_box_shell = self.get_or_declare_fn("lin_tagged_free_box", self.context.void_type().fn_type(&[ptr_ty.into()], false));
         let mut variant_bodies: Vec<(u32, indexmap::IndexMap<String, Type>, String)> = Vec::new();
         for (i, v) in variants.iter().enumerate() {
@@ -1920,44 +2135,59 @@ impl<'ctx> Codegen<'ctx> {
                 variant_bodies.push((i as u32, payload, disc_val));
             }
         }
-        // Allocate the per-variant blocks first.
+        let merge_bb = self.context.append_basic_block(func, "sumnode_mat_merge");
+        let default_bb = self.context.append_basic_block(func, "sumnode_mat_default");
         let blocks: Vec<inkwell::basic_block::BasicBlock<'ctx>> = variant_bodies
             .iter()
-            .map(|_| self.context.append_basic_block(llvm_fn, "sumnode_mat_arm"))
+            .map(|_| self.context.append_basic_block(func, "sumnode_mat_arm"))
             .collect();
-        for (idx, (tagv, _, _)) in variant_bodies.iter().enumerate() {
-            cases.push((i32_ty.const_int(*tagv as u64, false), blocks[idx]));
-        }
+        let tag = self.sumnode_tag_load(node);
+        let cases: Vec<(inkwell::values::IntValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = variant_bodies
+            .iter()
+            .enumerate()
+            .map(|(idx, (tagv, _, _))| (i32_ty.const_int(*tagv as u64, false), blocks[idx]))
+            .collect();
         self.builder.switch(tag, default_bb, &cases);
-        // Default: unreachable (the tag is always a valid variant). Emit an object with just the key
-        // to keep the block well-formed, then branch to merge (defensive — never taken).
+        let mut incoming: Vec<(inkwell::values::PointerValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
+        // Default arm: defensive empty object (the tag is always valid).
         self.builder.position_at_end(default_bb);
         let def_obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(0, false).into()], "sumnode_mat_def").try_as_basic_value().unwrap_basic().into_pointer_value();
         let def_pred = self.builder.get_insert_block().unwrap();
         self.builder.unconditional_branch(merge_bb);
         incoming.push((def_obj, def_pred));
-        // Each variant arm: build the concrete LinObject.
         for (idx, (_tagv, payload, disc_val)) in variant_bodies.iter().enumerate() {
             self.builder.position_at_end(blocks[idx]);
-            let nfields = (payload.len() + 1) as u64; // payload + discriminant
+            let nfields = (payload.len() + 1) as u64;
             let obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(nfields, false).into()], "sumnode_mat_obj").try_as_basic_value().unwrap_basic().into_pointer_value();
-            // discriminant field (a string literal).
             let dk = self.compile_string_lit(&disc_key).into_pointer_value();
             let dv_raw = self.compile_string_lit(disc_val);
             let dv_box = self.box_value(dv_raw, &Type::Str);
             self.builder.call(self.rt.object_set_fresh, &[obj.into(), dk.into(), dv_box.into()], "");
-            // The boxed StrLit wraps an immortal interned LinString; free only the box shell.
             if dv_box.is_pointer_value() {
                 self.builder.call(free_box_shell, &[dv_box.into()], "");
             }
-            // scalar payload fields.
             for (k, fty) in payload.iter() {
+                let key_str = self.compile_string_lit(k).into_pointer_value();
+                let is_recursive = self_name
+                    .as_deref()
+                    .is_some_and(|n| Self::is_sum_recursive_child(fty, n));
+                if is_recursive {
+                    // Recursive child: read the borrowed `*SumNode`, materialize it via a SELF-CALL,
+                    // box as TAG_OBJECT. Child is borrowed — not released; the materialized object is
+                    // a fresh +1 that `object_set_fresh` retains, so we release our copy after.
+                    let child = self.sumnode_recursive_child_get(node, k, sum_ty);
+                    let child_obj = self.builder.call(func, &[child.into()], "sumnode_mat_child").try_as_basic_value().unwrap_basic();
+                    let boxed = self.box_value(child_obj, &Self::sumnode_first_variant_obj_ty(sum_ty));
+                    self.builder.call(self.rt.object_set_fresh, &[obj.into(), key_str.into(), boxed.into()], "");
+                    if boxed.is_pointer_value() {
+                        self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                    }
+                    continue;
+                }
                 let v = self.sumnode_field_get(node, k, payload, fty);
                 let boxed = self.box_value(v, fty);
-                let key_str = self.compile_string_lit(k).into_pointer_value();
                 self.builder.call(self.rt.object_set_fresh, &[obj.into(), key_str.into(), boxed.into()], "");
                 if boxed.is_pointer_value() {
-                    // Scalar: no borrowed inner — full release reclaims the (cache-safe) box shell.
                     self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
                 }
             }
@@ -1970,7 +2200,12 @@ impl<'ctx> Codegen<'ctx> {
         let refs: Vec<(&dyn inkwell::values::BasicValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> =
             incoming.iter().map(|(v, b)| (v as &dyn inkwell::values::BasicValue<'ctx>, *b)).collect();
         phi.add_incoming(&refs);
-        phi.as_basic_value()
+        self.builder.r#return(Some(&phi.as_basic_value()));
+        // Restore the caller's insertion point.
+        if let Some(b) = saved_block {
+            self.builder.position_at_end(b);
+        }
+        func
     }
 
     /// Project a `SumNode` source into a FRESH sealed-record struct of `target_fields` (the matched
@@ -2105,6 +2340,22 @@ impl<'ctx> Codegen<'ctx> {
 
     pub(crate) fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, obj_ty: &Type, result_ty: &Type, obj_repr: &lin_ir::repr::Repr) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        // UNBOXED SUM TYPE (unboxed-sumtype Stage 2): a field read on a value that is physically a
+        // `SumNode` (repr Packed(SumNode)) — emitted by the lowerer for a narrowed-variant scrutinee
+        // whose variant carries a recursive child (so it cannot be projected to a sealed struct, and
+        // ALL its field reads must go directly to the node, never via materialize-to-boxed which would
+        // release the borrowed children). A RECURSIVE CHILD field is a const-offset `*SumNode` pointer
+        // load (borrowed interior); a SCALAR field is a const-offset value load. The variant is
+        // resolved by field NAME (each field appears in exactly the variant(s) declaring it, at a
+        // consistent offset — the access is only reachable when the tag selects such a variant). Guard
+        // on the repr so a mis-seeded boxed value can never read at a raw payload offset.
+        if let Some(sum_ty) = obj_repr.sumnode_sum_ty() {
+            if obj.is_pointer_value() {
+                let sum_ty = sum_ty.clone();
+                return self.sumnode_field_get_by_name(obj, field, &sum_ty, result_ty);
+            }
+            return ptr_ty.const_null().into();
+        }
         // STAGE 3: the packed-struct ASSUME is read from the object operand's repr (`func.repr`),
         // not re-derived from `obj_ty`. The representation-inference pass + verifier prove this
         // operand carries a real packed struct exactly where the old `sealed_scalar_fields(obj_ty)`

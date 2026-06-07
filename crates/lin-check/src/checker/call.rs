@@ -457,7 +457,7 @@ impl Checker {
                         // "expected Never". The deferred pass binds `T` from the sibling, then the
                         // empty literal is RE-CHECKED against the resolved `T[]` so its element type
                         // is concrete at codegen.
-                        let defer_empty_array_sub = matches!(arg, Expr::Array(elems, _) if elems.is_empty())
+                        let defer_empty_array_sub = matches!(arg, Expr::Array(elems, _, _) if elems.is_empty())
                             && matches!(param_ty, Type::Array(e) if matches!(**e, Type::TypeVar(id) if id != u32::MAX));
                         if !defer_literal_sub && !defer_empty_array_sub {
                             // First arg establishes the canonical TypeVar binding; later args must not
@@ -493,7 +493,7 @@ impl Checker {
                 // unbound (no concrete sibling), leave it as the bottom-up `Array(Never)` and let the
                 // later compatibility/empty-literal-annotation gate report it.
                 for (i, (arg, param_ty)) in args.iter().zip(params.iter()).enumerate() {
-                    let is_empty_array = matches!(arg, Expr::Array(elems, _) if elems.is_empty());
+                    let is_empty_array = matches!(arg, Expr::Array(elems, _, _) if elems.is_empty());
                     if is_empty_array {
                         let resolved = apply_type_subs(param_ty, &subs);
                         if let Type::Array(_) = &resolved {
@@ -917,6 +917,7 @@ impl Checker {
                     args: all_arg_exprs.into_iter().cloned().collect(),
                     partial,
                     span,
+                    full_span: span,
                 };
                 return self.infer_expr(&dummy_call);
             }
@@ -978,7 +979,7 @@ impl Checker {
                 // param: collecting its bottom-up `Array(Never)` would bind `T = Never`, then the
                 // concrete item fails as "expected Never". Bind `T` from the item first, then re-check
                 // the receiver against the resolved `T[]` (mirror of the `infer_call` empty-array fix).
-                let receiver_is_empty_array = matches!(receiver, Expr::Array(elems, _) if elems.is_empty());
+                let receiver_is_empty_array = matches!(receiver, Expr::Array(elems, _, _) if elems.is_empty());
                 let defer_empty_receiver = receiver_is_empty_array
                     && matches!(method_params.first(), Some(Type::Array(e)) if matches!(**e, Type::TypeVar(id) if id != u32::MAX));
                 if !defer_empty_receiver {

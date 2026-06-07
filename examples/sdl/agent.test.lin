@@ -1,0 +1,62 @@
+// Unit tests for the pure agent planner. `agent.lin` imports `mathffi` (C distance), so this test
+// declares its own libmathlib foreign block to satisfy the link — see mathffi.lin's note on the
+// file-local linkage rule.
+import { expect, toBe, test, suite, run } from "std/test"
+import { planStep, distanceToGoal } from "./agent"
+import { vec2 } from "./vector"
+
+import foreign "examples/sdl/clib/libmathlib.a"
+  val magnitude2: (Float64, Float64) => Float64
+
+val goal = vec2(3.0, 0.0)
+
+val s = suite("agent", [
+  test("steps east toward a goal on the +x axis", () =>
+    val next = planStep({ "agent": vec2(0.0, 0.0), "goal": goal })
+    [
+      expect(next["x"]).toBe(1.0),
+      expect(next["y"]).toBe(0.0)
+    ]
+  ),
+
+  test("steps diagonally toward a goal up and to the right", () =>
+    val next = planStep({ "agent": vec2(0.0, 0.0), "goal": vec2(5.0, 5.0) })
+    [
+      expect(next["x"]).toBe(1.0),
+      expect(next["y"]).toBe(1.0)
+    ]
+  ),
+
+  test("steps down-left toward a goal behind and below", () =>
+    val next = planStep({ "agent": vec2(5.0, 5.0), "goal": vec2(0.0, 0.0) })
+    [
+      expect(next["x"]).toBe(4.0),
+      expect(next["y"]).toBe(4.0)
+    ]
+  ),
+
+  test("holds position once it has arrived at the goal", () =>
+    val next = planStep({ "agent": vec2(3.0, 0.0), "goal": goal })
+    [
+      expect(next["x"]).toBe(3.0),
+      expect(next["y"]).toBe(0.0)
+    ]
+  ),
+
+  test("distanceToGoal uses the C magnitude (3,4 -> 5)", () => [
+    expect(distanceToGoal({ "agent": vec2(0.0, 0.0), "goal": vec2(3.0, 4.0) })).toBe(5.0)
+  ]),
+
+  // Drive the planner repeatedly to confirm it converges on the goal and then holds.
+  test("converges to the goal over several steps", () =>
+    val a1 = planStep({ "agent": vec2(0.0, 0.0), "goal": goal })
+    val a2 = planStep({ "agent": a1, "goal": goal })
+    val a3 = planStep({ "agent": a2, "goal": goal })
+    val a4 = planStep({ "agent": a3, "goal": goal })
+    [
+      expect(a3["x"]).toBe(3.0),
+      expect(a4["x"]).toBe(3.0)
+    ]
+  )
+])
+run(s)

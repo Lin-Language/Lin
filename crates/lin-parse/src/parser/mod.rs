@@ -138,6 +138,20 @@ impl Parser {
         }
     }
 
+    /// Span of the most-recently-consumed token (the one just before the cursor). Used to
+    /// recover the full extent of a delimiter-closed compound node after its closing token has
+    /// been consumed via `expect(...)`/`advance()`. Returns `Span::dummy()` at the start of the
+    /// stream. Does NOT alter the cursor — pure lookbehind. This feeds the additive
+    /// `Expr::full_span` only; the unchanged `span` is still snapshotted from `current_span()`
+    /// at the node's opening token.
+    pub(crate) fn prev_span(&self) -> Span {
+        if self.pos == 0 {
+            Span::dummy()
+        } else {
+            self.tokens[self.pos - 1].span
+        }
+    }
+
     /// 1-based source column of the current token (0 at end of stream). Used ONLY by the
     /// inline-block / control-flow-branch parsers to apply the offside rule inside `()`/`[]`/`{}`
     /// where ADR-003 suppresses Indent/Dedent/Newline. Does not consult or alter the token
@@ -187,6 +201,26 @@ impl Parser {
 
     pub(crate) fn expect_keyword(&mut self, kind: TokenKind) {
         self.expect(kind);
+    }
+
+    /// Expect a contextual keyword: an ordinary identifier whose text equals `word`,
+    /// used in a grammatical position where it is unambiguous (e.g. `from` after an
+    /// import binding list). Advances past it on match; otherwise emits a diagnostic
+    /// and leaves the cursor in place. `from` is NOT a reserved word -- it lexes as an
+    /// `Ident`, so this is how the import parser recognises the separator.
+    pub(crate) fn expect_contextual_keyword(&mut self, word: &str) {
+        if let TokenKind::Ident(name) = self.peek_kind() {
+            if name == word {
+                self.advance();
+                return;
+            }
+        }
+        let span = self.current_span();
+        let got = self.peek_kind();
+        self.diagnostics.push(Diagnostic::error(
+            span,
+            format!("expected '{}', got {:?}", word, got),
+        ));
     }
 
     pub(crate) fn expect_ident(&mut self) -> String {

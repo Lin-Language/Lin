@@ -42,9 +42,9 @@ impl LanguageServer for Backend {
         }
 
         // Build the cross-file index: seed stdlib, then enumerate + index every
-        // `*.lin` file under the workspace root. A best-effort first cut — files
-        // are re-indexed on edit; we do NOT re-check dependents on edit (see the
-        // `update` handler note).
+        // `*.lin` file under the workspace root. Files are re-indexed on edit, and
+        // open DIRECT dependents are re-checked when an imported file changes (see
+        // the `update` / `recheck_open_dependents` handlers).
         {
             let mut index = WORKSPACE_INDEX.write().unwrap();
             *index = WorkspaceIndex::default();
@@ -65,7 +65,8 @@ impl LanguageServer for Backend {
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![".".into(), " ".into()]),
+                    // `"` and `/` additionally trigger import-path completion inside a `from "…"`.
+                    trigger_characters: Some(vec![".".into(), " ".into(), "\"".into(), "/".into()]),
                     resolve_provider: Some(false),
                     ..Default::default()
                 }),
@@ -88,6 +89,19 @@ impl LanguageServer for Backend {
                 signature_help_provider: Some(SignatureHelpOptions {
                     trigger_characters: Some(vec!["(".into(), ",".into()]),
                     retrigger_characters: Some(vec![",".into()]),
+                    work_done_progress_options: Default::default(),
+                }),
+                // Run-test CodeLenses above each `test(...)`/`withFixture(...)` declaration.
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(false),
+                }),
+                // Fold function bodies, object/array literals, match expressions, import runs.
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                // Smart-expand selection (innermost span outward) from the AST span nesting.
+                selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                // Clickable import paths that resolve to the target `.lin` file.
+                document_link_provider: Some(DocumentLinkOptions {
+                    resolve_provider: Some(false),
                     work_done_progress_options: Default::default(),
                 }),
                 // Type-aware semantic highlighting (full-document only; the TextMate grammar stays
@@ -203,6 +217,14 @@ impl LanguageServer for Backend {
         let base_dir = file_dir(uri);
         let analysis = analyse(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
+
+        // Import-path completion: inside a `from "…"` / `import foreign "…"` string, complete
+        // module paths (stdlib ids + sibling `.lin` files) and short-circuit the rest.
+        if let Some(typed) = import_string_prefix(&source, offset) {
+            let base_dir = file_dir(uri);
+            let items = import_path_completions(&typed, base_dir.as_deref());
+            return Ok(Some(CompletionResponse::Array(items)));
+        }
 
         let prefix = word_before(&source, offset);
 
@@ -579,12 +601,82 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let actions = code_actions(&source, uri, &params);
+        let base_dir = file_dir(uri);
+        let index = WORKSPACE_INDEX.read().unwrap();
+        let actions = code_actions(&source, uri, &params, &index, base_dir.as_deref());
         if actions.is_empty() {
             Ok(None)
         } else {
             Ok(Some(actions))
         }
+    }
+
+    async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        let uri = &params.text_document.uri;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let mut lexer = lin_lex::Lexer::new(&source, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = lin_parse::Parser::new(tokens);
+        let module = parser.parse_module();
+        Ok(Some(test_code_lenses(&source, uri, &module)))
+    }
+
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> Result<Option<Vec<FoldingRange>>> {
+        let uri = &params.text_document.uri;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let mut lexer = lin_lex::Lexer::new(&source, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = lin_parse::Parser::new(tokens);
+        let module = parser.parse_module();
+        Ok(Some(folding_ranges(&source, &module)))
+    }
+
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        let uri = &params.text_document.uri;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let base_dir = file_dir(uri);
+        let analysis = analyse(&source, base_dir.as_deref());
+        let ranges = params
+            .positions
+            .iter()
+            .map(|pos| {
+                let offset = position_to_offset(&source, *pos);
+                selection_range_at(&source, &analysis.module, offset)
+            })
+            .collect();
+        Ok(Some(ranges))
+    }
+
+    async fn document_link(
+        &self,
+        params: DocumentLinkParams,
+    ) -> Result<Option<Vec<DocumentLink>>> {
+        let uri = &params.text_document.uri;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let base_dir = file_dir(uri);
+        let mut lexer = lin_lex::Lexer::new(&source, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = lin_parse::Parser::new(tokens);
+        let module = parser.parse_module();
+        Ok(Some(import_document_links(&source, &module, base_dir.as_deref())))
     }
 
     async fn symbol(
@@ -675,12 +767,9 @@ impl Backend {
             .write()
             .unwrap()
             .insert(uri.clone(), source.to_string());
-        // Re-index just this file's symbol/import table. We deliberately do NOT
-        // re-check dependent files here: the cross-file references/symbols/rename
-        // features need only each file's export+import name tables, which a single
-        // re-parse refreshes. Inferred *types* in dependents can go stale until the
-        // dependent is itself re-opened/edited — an accepted limitation for this cut
-        // (it never affects name-based cross-file resolution).
+        // Re-index this file's symbol/import table so cross-file
+        // references/symbols/rename stay current. This also refreshes the export
+        // signatures dependents read through `analyse`'s `pre_resolve_imports`.
         if let Ok(path) = uri.to_file_path() {
             WORKSPACE_INDEX
                 .write()
@@ -692,6 +781,73 @@ impl Backend {
         self.client
             .publish_diagnostics(uri.clone(), analysis.diagnostics, None)
             .await;
+
+        // Dependent re-check: when F changes, any OPEN file B that imports from F
+        // can have stale inferred types (hover/inlay/diagnostics) for symbols it
+        // pulls from F, because B's analysis cached F's *old* exports. Re-analyse
+        // those dependents and re-publish their diagnostics so they reflect F's new
+        // exports.
+        //
+        // POLICY (documented per the task brief):
+        //   - DIRECT dependents only — files whose `ImportRef.module_id` is F. We do
+        //     NOT walk transitively: a transitive dependent only sees F's types via
+        //     an intermediate module's re-exported signature, which is rare, and a
+        //     full transitive sweep on every keystroke does not scale. Direct-only is
+        //     the sound, bounded default.
+        //   - OPEN documents only — the client renders diagnostics/hover only for
+        //     open docs, so re-checking closed files would be wasted work.
+        //   - Runs on every `update` (did_open / did_change / did_save). Re-analysing
+        //     a handful of direct open dependents is cheap (parse + check of small
+        //     files); bounding to direct + open keeps it so even on each keystroke,
+        //     which is the freshest behaviour without a workspace-wide sweep.
+        //
+        // No infinite-loop risk: `dependents_of` never returns F itself, we only
+        // re-analyse (we do NOT recursively call `update`, which would re-trigger),
+        // and we skip F's own URI defensively. A cyclic graph (A↔B) is therefore
+        // safe — editing A re-checks B once and stops.
+        self.recheck_open_dependents(uri).await;
+    }
+
+    /// Re-analyse and re-publish diagnostics for every currently-open document that
+    /// DIRECTLY imports from `changed_uri`. See the policy note in `update`.
+    async fn recheck_open_dependents(&self, changed_uri: &Url) {
+        let Ok(changed_path) = changed_uri.to_file_path() else { return };
+        let changed_id = canonical_id(&changed_path);
+
+        // Compute the direct dependents under the index read lock, then drop it
+        // before any await (we must not hold a std `RwLock` guard across `.await`).
+        let dependent_ids: Vec<String> = {
+            let index = WORKSPACE_INDEX.read().unwrap();
+            index.dependents_of(&changed_id)
+        };
+        if dependent_ids.is_empty() {
+            return;
+        }
+
+        // Snapshot the open docs (uri + source) for the dependents we care about,
+        // again releasing the lock before awaiting. A dependent that isn't currently
+        // open is skipped — the client only renders open documents.
+        let to_recheck: Vec<(Url, String)> = {
+            let docs = self.docs.read().unwrap();
+            docs.iter()
+                .filter(|(dep_uri, _)| *dep_uri != changed_uri)
+                .filter(|(dep_uri, _)| {
+                    dep_uri
+                        .to_file_path()
+                        .map(|p| dependent_ids.contains(&canonical_id(&p)))
+                        .unwrap_or(false)
+                })
+                .map(|(u, s)| (u.clone(), s.clone()))
+                .collect()
+        };
+
+        for (dep_uri, dep_source) in to_recheck {
+            let base_dir = file_dir(&dep_uri);
+            let analysis = analyse(&dep_source, base_dir.as_deref());
+            self.client
+                .publish_diagnostics(dep_uri, analysis.diagnostics, None)
+                .await;
+        }
     }
 }
 
@@ -1099,6 +1255,79 @@ fn first_param_category(sig: &str) -> Option<String> {
     Some(type_to_category(first.trim()).to_string())
 }
 
+/// Detect whether `offset` sits inside the quoted path of an `import` statement and, if
+/// so, return the path text already typed up to the cursor. Conservative + line-scoped:
+/// matches `... from "<typed>` and `import foreign "<typed>` on the cursor's line, with
+/// the cursor positioned after the opening quote and before any closing quote.
+///
+/// LIMITATION: detection is single-line and textual (no multi-line import strings, which
+/// the grammar doesn't produce anyway). Returns `None` outside an import-string context.
+fn import_string_prefix(source: &str, offset: usize) -> Option<String> {
+    let offset = offset.min(source.len());
+    // Start of the current line.
+    let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &source[line_start..offset];
+    // Find the opening quote we're inside: the last `"` on the line before the cursor.
+    let quote = line.rfind('"')?;
+    let before_quote = line[..quote].trim_end();
+    // Only an import context: `... from` or `import foreign`.
+    let is_from = before_quote.ends_with("from");
+    let is_foreign = before_quote.ends_with("import foreign") || before_quote.ends_with("foreign");
+    if !(is_from || is_foreign) {
+        return None;
+    }
+    // The text between the opening quote and the cursor is what's been typed so far.
+    let typed = &line[quote + 1..];
+    // If the user already closed the string before the cursor, we're not inside it.
+    if typed.contains('"') {
+        return None;
+    }
+    Some(typed.to_string())
+}
+
+/// Build import-path completion items for a partially-typed module path `typed`:
+///   - every `std/*` stdlib module id (always offered);
+///   - sibling `.lin` files in the importing file's directory (path stems), when known.
+/// Items are filtered to those starting with `typed` so `/` retriggers narrow the list.
+fn import_path_completions(typed: &str, base_dir: Option<&Path>) -> Vec<CompletionItem> {
+    let mut items = Vec::new();
+    // stdlib modules.
+    for id in STDLIB_MODULE_IDS {
+        if id.starts_with(typed) {
+            items.push(CompletionItem {
+                label: id.to_string(),
+                kind: Some(CompletionItemKind::MODULE),
+                detail: Some("stdlib module".to_string()),
+                ..Default::default()
+            });
+        }
+    }
+    // Sibling `.lin` files (excluding `.test.lin`), as bare stems.
+    if let Some(dir) = base_dir {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                let Some(stem) = name.strip_suffix(".lin") else { continue };
+                if stem.ends_with(".test") || stem.is_empty() {
+                    continue;
+                }
+                if stem.starts_with(typed) {
+                    items.push(CompletionItem {
+                        label: stem.to_string(),
+                        kind: Some(CompletionItemKind::FILE),
+                        detail: Some("local module".to_string()),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+    items.sort_by(|a, b| a.label.cmp(&b.label));
+    items.dedup_by(|a, b| a.label == b.label);
+    items
+}
+
 fn word_before(source: &str, offset: usize) -> &str {
     let bytes = source.as_bytes();
     let start = (0..offset)
@@ -1386,7 +1615,7 @@ fn collect_param_spans_in_expr(expr: &lin_parse::ast::Expr, out: &mut HashSet<(u
             }
             collect_param_spans_in_expr(body, out);
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             collect_param_spans(stmts, out);
             collect_param_spans_in_expr(tail, out);
         }
@@ -1466,7 +1695,7 @@ fn collect_type_spans_in_expr(expr: &lin_parse::ast::Expr, out: &mut Vec<lin_com
             }
             collect_type_spans_in_expr(body, out);
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             collect_type_spans(stmts, out);
             collect_type_spans_in_expr(tail, out);
         }
@@ -1539,12 +1768,33 @@ fn collect_type_spans_in_type(ty: &lin_parse::ast::TypeExpr, out: &mut Vec<lin_c
 ///
 /// Only diagnostics that overlap the requested `params.range` produce an action. Pure over
 /// `(source, uri, params)` so it's unit-testable.
-fn code_actions(source: &str, uri: &Url, params: &CodeActionParams) -> Vec<CodeActionOrCommand> {
+fn code_actions(
+    source: &str,
+    uri: &Url,
+    params: &CodeActionParams,
+    index: &WorkspaceIndex,
+    base_dir: Option<&Path>,
+) -> Vec<CodeActionOrCommand> {
     let mut actions = Vec::new();
     let requested = params.range;
     for diag in &params.context.diagnostics {
         if !ranges_overlap(diag.range, requested) {
             continue;
+        }
+
+        // Auto-import fix: an undefined name that some workspace/stdlib module exports
+        // can be imported with one click. Offers one action per exporting module.
+        if let Some(name) = undefined_name(&diag.message) {
+            for module in index.modules_exporting(&name, base_dir) {
+                if let Some(edit) = auto_import_edit(source, &name, &module) {
+                    actions.push(CodeActionOrCommand::CodeAction(quick_fix(
+                        format!("Import `{}` from \"{}\"", name, module),
+                        uri.clone(),
+                        vec![edit],
+                        diag.clone(),
+                    )));
+                }
+            }
         }
 
         // Unused-import fix: delete the whole line the diagnostic sits on.
@@ -1577,6 +1827,68 @@ fn code_actions(source: &str, uri: &Url, params: &CodeActionParams) -> Vec<CodeA
         }
     }
     actions
+}
+
+/// Extract the offending identifier from an "Undefined variable 'X'" / "Undefined
+/// function 'X'" diagnostic message. Returns `None` for any other diagnostic.
+fn undefined_name(message: &str) -> Option<String> {
+    for prefix in ["Undefined variable '", "Undefined function '"] {
+        if let Some(rest) = message.strip_prefix(prefix) {
+            if let Some(close) = rest.find('\'') {
+                return Some(rest[..close].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Build the `TextEdit` that imports `name` from `module`. If the file already imports
+/// from `module` via `import { ... } from "module"`, merge `name` into that brace list;
+/// otherwise insert a fresh `import { name } from "module"` line after the last existing
+/// import (or at the very top when there are none). Returns `None` when `name` is already
+/// imported from `module`.
+fn auto_import_edit(source: &str, name: &str, module: &str) -> Option<TextEdit> {
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    let mut parser = lin_parse::Parser::new(tokens);
+    let parsed = parser.parse_module();
+
+    let mut last_import_line: Option<u32> = None;
+    for stmt in &parsed.statements {
+        if let Stmt::Import { bindings, path, span } = stmt {
+            let line = offset_to_position(source, span.start as usize).line;
+            last_import_line = Some(line);
+            if path == module {
+                // Already importing from this module — merge into its brace list (unless
+                // the name is already present).
+                if bindings.iter().any(|b| b.name == name || b.alias.as_deref() == Some(name)) {
+                    return None;
+                }
+                // Insert `, name` just before the closing `}` of this import's brace list.
+                // The stmt span covers only the `import` keyword, so scan to the line end.
+                let start = span.start as usize;
+                let line_end = source[start..].find('\n').map(|i| start + i).unwrap_or(source.len());
+                let stmt_src = source.get(start..line_end)?;
+                let brace = stmt_src.find('}')?;
+                let insert_at = start + brace;
+                let pos = offset_to_position(source, insert_at);
+                return Some(TextEdit {
+                    range: Range { start: pos, end: pos },
+                    new_text: format!(", {}", name),
+                });
+            }
+        }
+    }
+
+    // No existing import from `module`: add a new line. Place it after the last import,
+    // else at the top of the file.
+    let new_line = format!("import {{ {} }} from \"{}\"\n", name, module);
+    let line = last_import_line.map(|l| l + 1).unwrap_or(0);
+    let pos = Position { line, character: 0 };
+    Some(TextEdit {
+        range: Range { start: pos, end: pos },
+        new_text: new_line,
+    })
 }
 
 /// Build a `QuickFix` code action with a single-document edit, attaching the source diagnostic.
@@ -1624,6 +1936,540 @@ fn ranges_overlap(a: Range, b: Range) -> bool {
     a_start <= b_end && b_start <= a_end
 }
 
+// ── code lens (run-test) ───────────────────────────────────────────────────────
+
+/// Build the run-test CodeLenses for a file: one `▶ Run Test` lens above each
+/// `test("name", ...)` / `withFixture(..., "name", ...)` call (mirroring the VSCode
+/// Test Explorer's `TEST_DECL_RE` / `WITHFIXTURE_DECL_RE` discovery, but driven off
+/// the parsed AST), plus a single `▶ Run File Tests` lens at the top when any test
+/// exists. Lens commands use the fixed `lin.runTest(uri, name)` / `lin.testFile(uri)`
+/// contract the extension wires against.
+fn test_code_lenses(source: &str, uri: &Url, module: &lin_parse::ast::Module) -> Vec<CodeLens> {
+    let mut tests: Vec<(String, lin_common::Span)> = Vec::new();
+    for stmt in &module.statements {
+        collect_test_calls_in_stmt(stmt, &mut tests);
+    }
+    // De-duplicate by (name, anchor) so a test referenced once yields one lens.
+    tests.sort_by_key(|(_, s)| (s.start, s.end));
+    tests.dedup();
+
+    let mut lenses = Vec::new();
+    if !tests.is_empty() {
+        // `▶ Run File Tests` at the very top of the file.
+        lenses.push(CodeLens {
+            range: span_to_range(source, lin_common::Span::new(0, 0, 0)),
+            command: Some(Command {
+                title: "▶ Run File Tests".to_string(),
+                command: "lin.testFile".to_string(),
+                arguments: Some(vec![serde_json::json!(uri.to_string())]),
+            }),
+            data: None,
+        });
+    }
+    for (name, anchor) in tests {
+        lenses.push(CodeLens {
+            range: span_to_range(source, anchor),
+            command: Some(Command {
+                title: "▶ Run Test".to_string(),
+                command: "lin.runTest".to_string(),
+                arguments: Some(vec![
+                    serde_json::json!(uri.to_string()),
+                    serde_json::json!(name),
+                ]),
+            }),
+            data: None,
+        });
+    }
+    lenses
+}
+
+fn collect_test_calls_in_stmt(stmt: &Stmt, out: &mut Vec<(String, lin_common::Span)>) {
+    match stmt {
+        Stmt::Val { value, .. } | Stmt::Var { value, .. } => {
+            collect_test_calls_in_expr(value, out);
+        }
+        Stmt::Replace { value, .. } => collect_test_calls_in_expr(value, out),
+        Stmt::Expr(e) => collect_test_calls_in_expr(e, out),
+        _ => {}
+    }
+}
+
+/// Walk an expression for `test("name", ...)` / `withFixture(..., "name", ...)` calls,
+/// recording `(name, anchor_span)`. The anchor is the callee identifier span so the lens
+/// renders on the line of the `test(`/`withFixture(` token.
+fn collect_test_calls_in_expr(expr: &lin_parse::ast::Expr, out: &mut Vec<(String, lin_common::Span)>) {
+    use lin_parse::ast::Expr as E;
+    if let E::Call { func, args, .. } = expr {
+        if let E::Ident(name, ident_span) = func.as_ref() {
+            match name.as_str() {
+                // `test("name", ...)` — first string-literal arg is the name.
+                "test" => {
+                    if let Some(E::StringLit(s, _)) = args.first() {
+                        out.push((s.clone(), *ident_span));
+                    }
+                }
+                // `withFixture(setup, "name", ...)` — name is the SECOND string-literal arg
+                // (mirrors `WITHFIXTURE_DECL_RE`, which skips the first two `(`-args).
+                "withFixture" => {
+                    let name = args.iter().filter_map(|a| match a {
+                        E::StringLit(s, _) => Some(s.clone()),
+                        _ => None,
+                    }).next();
+                    if let Some(name) = name {
+                        out.push((name, *ident_span));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Recurse into every sub-expression so nested test() calls (e.g. inside a
+    // `suite("...", [ test(...), test(...) ])` array) are discovered.
+    walk_child_exprs(expr, &mut |child| collect_test_calls_in_expr(child, out));
+}
+
+/// Invoke `f` on every immediate child expression of `expr`. Centralises the AST
+/// structural recursion shared by code-lens discovery (and any future AST walkers).
+fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::ast::Expr)) {
+    use lin_parse::ast::{Expr as E, ObjectField, StringPart};
+    match expr {
+        E::BinaryOp { left, right, .. } => { f(left); f(right); }
+        E::UnaryOp { operand, .. } => f(operand),
+        E::Call { func, args, .. } => { f(func); for a in args { f(a); } }
+        E::DotCall { receiver, args, .. } => {
+            f(receiver);
+            if let Some(args) = args { for a in args { f(a); } }
+        }
+        E::Index { object, key, .. } => { f(object); f(key); }
+        E::If { condition, then_branch, else_branch, .. } => {
+            f(condition); f(then_branch); f(else_branch);
+        }
+        E::Match { scrutinee, arms, .. } => {
+            f(scrutinee);
+            for arm in arms { f(&arm.body); }
+        }
+        E::Block(stmts, tail, _, _) => {
+            for s in stmts {
+                match s {
+                    Stmt::Val { value, .. } | Stmt::Var { value, .. } => f(value),
+                    Stmt::Replace { value, .. } => f(value),
+                    Stmt::Expr(e) => f(e),
+                    _ => {}
+                }
+            }
+            f(tail);
+        }
+        E::Function { body, .. } => f(body),
+        E::Object(fields, _, _) => {
+            for field in fields {
+                match field {
+                    ObjectField::Pair(k, v) => { f(k); f(v); }
+                    ObjectField::Spread(e) => f(e),
+                }
+            }
+        }
+        E::Array(items, _, _) => { for it in items { f(it); } }
+        E::Assign { value, .. } => f(value),
+        E::IndexAssign { object, key, value, .. } => { f(object); f(key); f(value); }
+        E::Is { expr, .. } | E::Has { expr, .. } => f(expr),
+        E::StringInterp(parts, _) => {
+            for part in parts {
+                if let StringPart::Expr(e) = part { f(e); }
+            }
+        }
+        E::TupleArgs(items, _) => { for it in items { f(it); } }
+        _ => {}
+    }
+}
+
+// ── AST extent walkers (folding + selection) ─────────────────────────────────────
+
+/// Invoke `f` on `expr` and, recursively, on every sub-expression. Built on the shared
+/// `walk_child_exprs` immediate-child traversal so it stays in sync with the AST shape.
+fn walk_exprs_deep(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::ast::Expr)) {
+    f(expr);
+    walk_child_exprs(expr, &mut |child| walk_exprs_deep(child, f));
+}
+
+/// Invoke `f` on the root expression(s) carried by a statement (and, transitively, all of
+/// their sub-expressions). Covers `val`/`var`/`replace` initialisers and bare expression
+/// statements; declaration-only statements (imports, type decls) carry no expressions.
+fn walk_exprs_in_stmt(stmt: &Stmt, f: &mut dyn FnMut(&lin_parse::ast::Expr)) {
+    match stmt {
+        Stmt::Val { value, .. } | Stmt::Var { value, .. } | Stmt::Replace { value, .. } => {
+            walk_exprs_deep(value, f)
+        }
+        Stmt::Expr(e) => walk_exprs_deep(e, f),
+        _ => {}
+    }
+}
+
+/// True for the compound expression kinds whose `full_span()` covers a real multi-token
+/// extent worth offering as a fold / selection region. Leaf and operator nodes (whose
+/// `full_span()` is just `span()`) are excluded so we don't emit degenerate ranges.
+fn is_extent_node(expr: &lin_parse::ast::Expr) -> bool {
+    use lin_parse::ast::Expr as E;
+    matches!(
+        expr,
+        E::Call { .. }
+            | E::DotCall { .. }
+            | E::Index { .. }
+            | E::IndexAssign { .. }
+            | E::Object(..)
+            | E::Array(..)
+            | E::Block(..)
+            | E::If { .. }
+            | E::Match { .. }
+            | E::Function { .. }
+    )
+}
+
+// ── folding ranges ─────────────────────────────────────────────────────────────
+
+/// Emit folding ranges for multi-line constructs. Two sources:
+///   - consecutive `import` statement runs (collapse into one `Imports` region),
+///     driven off the parsed import statements' start lines;
+///   - every compound expression (function bodies, object/array literals, blocks,
+///     calls, `if`/`match`) whose AST `full_span()` covers more than one source line.
+///
+/// The compound-node extents come from the additive `Expr::full_span()` (opening token ..
+/// closing delimiter / last child), which is AST-precise — the opening-token `span()` stays
+/// unchanged for the formatter/coverage consumers. When the buffer fails to parse the AST is
+/// empty, so we fall back to a balanced-delimiter text scan (`delimiter_folds`).
+fn folding_ranges(source: &str, module: &lin_parse::ast::Module) -> Vec<FoldingRange> {
+    let mut out = Vec::new();
+
+    // Consecutive `import` statement runs collapse into one region. Each import's span
+    // covers only the `import` keyword, but its start line is all we need here.
+    let mut run_start_line: Option<u32> = None;
+    let mut run_end_line: Option<u32> = None;
+    let flush = |out: &mut Vec<FoldingRange>, s: Option<u32>, e: Option<u32>| {
+        if let (Some(sl), Some(el)) = (s, e) {
+            if el > sl {
+                out.push(FoldingRange {
+                    start_line: sl,
+                    start_character: None,
+                    end_line: el,
+                    end_character: None,
+                    kind: Some(FoldingRangeKind::Imports),
+                    collapsed_text: None,
+                });
+            }
+        }
+    };
+    for stmt in &module.statements {
+        match stmt {
+            Stmt::Import { span, .. } | Stmt::ForeignImport { span, .. } => {
+                let line = offset_to_position(source, span.start as usize).line;
+                if run_start_line.is_none() {
+                    run_start_line = Some(line);
+                }
+                run_end_line = Some(line);
+            }
+            _ => {
+                flush(&mut out, run_start_line.take(), run_end_line.take());
+                run_end_line = None;
+            }
+        }
+    }
+    flush(&mut out, run_start_line.take(), run_end_line.take());
+
+    // AST-precise region folds: one per compound node whose full extent spans >1 line.
+    // De-duplicated by (start_line, end_line) so co-terminating nodes (e.g. a call whose
+    // sole argument is the object literal it wraps) don't emit overlapping duplicates.
+    let mut seen: HashSet<(u32, u32)> = HashSet::new();
+    let mut push_region = |out: &mut Vec<FoldingRange>, sp: lin_common::Span| {
+        let sl = offset_to_position(source, sp.start as usize).line;
+        let el = offset_to_position(source, sp.end as usize).line;
+        if el > sl && seen.insert((sl, el)) {
+            out.push(FoldingRange {
+                start_line: sl,
+                start_character: None,
+                end_line: el,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: None,
+            });
+        }
+    };
+    let mut had_ast = false;
+    for stmt in &module.statements {
+        walk_exprs_in_stmt(stmt, &mut |e| {
+            had_ast = true;
+            if is_extent_node(e) {
+                push_region(&mut out, e.full_span());
+            }
+        });
+    }
+
+    // Fallback: if the buffer produced no expressions (parse failure / empty module), recover
+    // region folds from a balanced-delimiter text scan so folding still works on broken input.
+    if !had_ast {
+        out.extend(delimiter_folds(source));
+    }
+    out
+}
+
+/// Fold every balanced `{}` / `[]` / `(...)` region that spans more than one line.
+/// String literals are skipped so braces inside strings don't unbalance the scan. Used
+/// only as a fallback when the AST is empty (the buffer didn't parse).
+fn delimiter_folds(source: &str) -> Vec<FoldingRange> {
+    let bytes = source.as_bytes();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut out = Vec::new();
+    let mut in_str = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' | b'[' | b'(' => stack.push(i),
+            b'}' | b']' | b')' => {
+                if let Some(open) = stack.pop() {
+                    let sl = offset_to_position(source, open).line;
+                    let el = offset_to_position(source, i).line;
+                    if el > sl {
+                        out.push(FoldingRange {
+                            start_line: sl,
+                            start_character: None,
+                            end_line: el,
+                            end_character: None,
+                            kind: Some(FoldingRangeKind::Region),
+                            collapsed_text: None,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+// ── selection ranges ───────────────────────────────────────────────────────────
+
+/// Build the smart-expand selection hierarchy at `offset`, innermost → outermost:
+///   1. the identifier/word under the cursor (when on one);
+///   2. each enclosing AST expression, by its `full_span()` (innermost first) — so a
+///      cursor in `add(1, 2)` expands to the argument, then the whole call, etc.;
+///   3. the cursor's source line;
+///   4. the whole document.
+///
+/// The expression extents come from the additive `Expr::full_span()` (opening token ..
+/// closing delimiter / last child), making the expansion AST-precise. When the buffer
+/// fails to parse, the AST is empty, so we fall back to balanced-delimiter nesting
+/// (`enclosing_bracket_pairs`).
+fn selection_range_at(source: &str, module: &lin_parse::ast::Module, offset: usize) -> SelectionRange {
+    let offset = offset.min(source.len());
+    // Ordered innermost → outermost list of (start, end) byte ranges.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+
+    // 1. Word under the cursor.
+    let word = word_at(source, offset);
+    if !word.is_empty() {
+        // Recover the word's byte range (word_at expands around offset).
+        let bytes = source.as_bytes();
+        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut start = offset;
+        let mut end = offset;
+        while start > 0 && is_word(bytes[start - 1]) {
+            start -= 1;
+        }
+        while end < bytes.len() && is_word(bytes[end]) {
+            end += 1;
+        }
+        ranges.push((start, end));
+    }
+
+    // 2. Enclosing AST expression extents (full_span), from the AST. Every expression whose
+    //    full extent contains the cursor is a candidate; sorting by width yields the
+    //    innermost-first nesting. Falls back to balanced-delimiter pairs when the AST is empty
+    //    (parse failure) so selection still works on broken input.
+    let mut ast_spans: Vec<(usize, usize)> = Vec::new();
+    for stmt in &module.statements {
+        // Statement-level extent (e.g. a whole `val x = ...`) so expansion reaches the stmt.
+        let ss = stmt.span();
+        if (ss.start as usize) <= offset && offset <= (ss.end as usize) {
+            ast_spans.push((ss.start as usize, ss.end as usize));
+        }
+        walk_exprs_in_stmt(stmt, &mut |e| {
+            let fs = e.full_span();
+            let (s, en) = (fs.start as usize, fs.end as usize);
+            if s <= offset && offset <= en {
+                ast_spans.push((s, en));
+            }
+        });
+    }
+    if !ast_spans.is_empty() {
+        // Innermost (narrowest) first.
+        ast_spans.sort_by_key(|(s, e)| e - s);
+        ranges.extend(ast_spans);
+    } else {
+        for (open, close) in enclosing_bracket_pairs(source, offset) {
+            // Inner content (between the delimiters).
+            if close > open + 1 {
+                ranges.push((open + 1, close));
+            }
+            // The region including its delimiters.
+            ranges.push((open, close + 1));
+        }
+    }
+
+    // 3. The cursor's line.
+    let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = source[offset..].find('\n').map(|i| offset + i).unwrap_or(source.len());
+    ranges.push((line_start, line_end));
+
+    // 4. Whole document.
+    ranges.push((0, source.len()));
+
+    // De-duplicate while preserving order; keep only ranges that contain the cursor and
+    // strictly grow (so each parent properly contains its child).
+    let mut chain: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in ranges {
+        if s > offset || e < offset {
+            continue;
+        }
+        match chain.last() {
+            Some(&(ps, pe)) if ps == s && pe == e => continue, // duplicate
+            Some(&(ps, pe)) if s >= ps && e <= pe => continue,  // not strictly larger
+            _ => chain.push((s, e)),
+        }
+    }
+    if chain.is_empty() {
+        chain.push((offset, offset));
+    }
+
+    // Build the nested chain from outermost down so the head is innermost.
+    let mut current: Option<SelectionRange> = None;
+    for &(s, e) in chain.iter().rev() {
+        current = Some(SelectionRange {
+            range: Range {
+                start: offset_to_position(source, s),
+                end: offset_to_position(source, e),
+            },
+            parent: current.map(Box::new),
+        });
+    }
+    current.unwrap()
+}
+
+/// All balanced `{}`/`[]`/`()` pairs that enclose `offset`, as `(open_idx, close_idx)`
+/// byte indices, ordered innermost → outermost. String literals are skipped so braces
+/// inside strings don't unbalance the scan.
+fn enclosing_bracket_pairs(source: &str, offset: usize) -> Vec<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut enclosing: Vec<(usize, usize)> = Vec::new();
+    let mut in_str = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' | b'[' | b'(' => stack.push(i),
+            b'}' | b']' | b')' => {
+                if let Some(open) = stack.pop() {
+                    // This pair encloses the cursor when open < offset <= close.
+                    if open < offset && offset <= i {
+                        enclosing.push((open, i));
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // Sort innermost (smallest) → outermost.
+    enclosing.sort_by_key(|(o, c)| c - o);
+    enclosing
+}
+
+// ── document links (import paths) ──────────────────────────────────────────────
+
+/// Make each `import ... from "PATH"` (and `import foreign "PATH"`) path string a
+/// clickable `DocumentLink` to the resolved target file. `std/...` and any path that
+/// doesn't resolve to a real on-disk file are skipped (no navigable target). Reuses
+/// the same relative-path resolution as the import resolver (`base_dir/PATH.lin`).
+fn import_document_links(
+    source: &str,
+    module: &lin_parse::ast::Module,
+    base_dir: Option<&Path>,
+) -> Vec<DocumentLink> {
+    let mut out = Vec::new();
+    let base = match base_dir {
+        Some(b) => b,
+        None => return out,
+    };
+    for stmt in &module.statements {
+        let (path, stmt_span) = match stmt {
+            Stmt::Import { path, span, .. } => (path, span),
+            Stmt::ForeignImport { path, span, .. } => (path, span),
+            _ => continue,
+        };
+        // stdlib has no on-disk file; skip.
+        if stdlib_source(path).is_some() || path.starts_with("std/") {
+            continue;
+        }
+        let target = base.join(format!("{}.lin", path));
+        if !target.is_file() {
+            continue;
+        }
+        let Ok(target_uri) = Url::from_file_path(&target) else { continue };
+        // Locate the quoted PATH string within the statement source so only the path
+        // (not the whole `import` keyword) is the clickable link.
+        let Some(range) = quoted_path_range(source, *stmt_span, path) else { continue };
+        out.push(DocumentLink {
+            range,
+            target: Some(target_uri),
+            tooltip: None,
+            data: None,
+        });
+    }
+    out
+}
+
+/// Range of the quoted `"path"` token inside the import statement that begins at
+/// `stmt_span`. The parser records only the `import` keyword's span, so the search
+/// runs from the statement start to the end of its line. Returns the range covering
+/// just the path characters between the quotes.
+fn quoted_path_range(source: &str, stmt_span: lin_common::Span, path: &str) -> Option<Range> {
+    let start = stmt_span.start as usize;
+    // Scan to the end of the statement's line (import statements are single-line).
+    let line_end = source[start..].find('\n').map(|i| start + i).unwrap_or(source.len());
+    let hay = source.get(start..line_end)?;
+    let needle = format!("\"{}\"", path);
+    let rel = hay.find(&needle)?;
+    let abs = start + rel + 1; // +1 to skip the opening quote
+    Some(Range {
+        start: offset_to_position(source, abs),
+        end: offset_to_position(source, abs + path.len()),
+    })
+}
+
 // ── signature help ─────────────────────────────────────────────────────────────
 
 /// Build signature help when `offset` sits inside a `f(…)` call's argument list. Returns `None`
@@ -1638,17 +2484,38 @@ fn signature_help(source: &str, analysis: &Analysis, offset: usize) -> Option<Si
     let ty_str = tightest_span(&analysis.span_type_map, callee_span.start as usize)
         .map(|(_, s, _)| s.clone())?;
     // Only function-typed callees produce a signature.
-    let params = function_param_types(&ty_str)?;
+    let param_types = function_param_types(&ty_str)?;
 
     // Active parameter = number of top-level commas between the opening paren and the cursor.
     let active = top_level_commas(&source[paren_after..offset.min(source.len())]);
-    let active = (active as usize).min(params.len().saturating_sub(1)) as u32;
+    let active = (active as usize).min(param_types.len().saturating_sub(1)) as u32;
 
-    // Render `(P1, P2, …) => R` exactly as the type string, with one ParameterInformation per
-    // top-level parameter so the client can bold the active one. Param labels use the bare type
-    // text (the function type carries no parameter names).
-    let label = ty_str.clone();
-    let parameters: Vec<ParameterInformation> = params
+    // Recover parameter NAMES (non-invasively) from the callee's binding AST when the callee is a
+    // same-file `val`/`var` bound to a function literal. The function `Type` carries no names, so
+    // we read them from the surface params. Only used when the name count matches the type-derived
+    // param count (so positional bolding via `active` stays correct); otherwise fall back to
+    // types-only labels.
+    let callee_name = source.get(callee_span.start as usize..callee_span.end as usize).unwrap_or("");
+    let names = callee_param_names(&analysis.module, callee_name)
+        .filter(|n| n.len() == param_types.len());
+
+    // Render one ParameterInformation per parameter as `name: Type` when names are known, else the
+    // bare type. The overall signature label is rebuilt to match (so the client highlights the
+    // right slice of the label string for the active parameter).
+    let rendered: Vec<String> = param_types
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| match names.as_ref().and_then(|n| n.get(i)) {
+            Some(name) => format!("{}: {}", name, ty),
+            None => ty.clone(),
+        })
+        .collect();
+
+    // Reconstruct `(p0, p1, …) => R` from the rendered params + the return type tail of `ty_str`.
+    let return_tail = ty_str.find("=>").map(|i| &ty_str[i..]).unwrap_or("");
+    let label = format!("({}) {}", rendered.join(", "), return_tail).trim_end().to_string();
+
+    let parameters: Vec<ParameterInformation> = rendered
         .iter()
         .map(|p| ParameterInformation {
             label: ParameterLabel::Simple(p.clone()),
@@ -1666,6 +2533,38 @@ fn signature_help(source: &str, analysis: &Analysis, offset: usize) -> Option<Si
         active_signature: Some(0),
         active_parameter: Some(active),
     })
+}
+
+/// Recover the parameter names of `callee_name` when it's a top-level `val`/`var` in `module` bound
+/// to a function literal. Each name comes from the param's binding pattern (`Pattern::Ident`);
+/// destructured/wildcard params render as `_`. Returns `None` when no such function binding exists.
+/// Non-invasive: reads only the surface AST — the checker's function `Type` is unchanged.
+fn callee_param_names(module: &lin_parse::ast::Module, callee_name: &str) -> Option<Vec<String>> {
+    use lin_parse::ast::Expr as E;
+    if callee_name.is_empty() {
+        return None;
+    }
+    for stmt in &module.statements {
+        let (matches, value) = match stmt {
+            Stmt::Val { pattern, value, .. } => {
+                (pattern_ident(pattern).map(|(n, _)| n).as_deref() == Some(callee_name), value)
+            }
+            Stmt::Var { name, value, .. } => (name == callee_name, value),
+            _ => continue,
+        };
+        if !matches {
+            continue;
+        }
+        if let E::Function { params, .. } = value {
+            return Some(
+                params
+                    .iter()
+                    .map(|p| pattern_ident(&p.pattern).map(|(n, _)| n).unwrap_or_else(|| "_".to_string()))
+                    .collect(),
+            );
+        }
+    }
+    None
 }
 
 /// Walk the AST for the INNERMOST plain `Call` whose argument list contains `offset`. Returns the
@@ -1728,7 +2627,7 @@ fn find_enclosing_call_in_expr(
                 }
             }
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             if let Some(r) = find_enclosing_call(stmts, source, offset) {
                 *best = Some(r);
             }
@@ -1978,7 +2877,7 @@ fn collect_unannotated_bindings_in_expr(
 ) {
     use lin_parse::ast::Expr as E;
     match expr {
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             collect_unannotated_bindings(stmts, ty_by_stmt, out);
             collect_unannotated_bindings_in_expr(tail, ty_by_stmt, out);
         }
@@ -2378,6 +3277,59 @@ impl WorkspaceIndex {
         Some(out)
     }
 
+    /// Every module that exports `name`, as an import-path string suitable for an
+    /// `import { name } from "<path>"` line. stdlib modules surface as their `std/...`
+    /// id; user modules are returned as a path relative to `from_dir` (so the inserted
+    /// import resolves the same way the import resolver would). The result is sorted
+    /// (stdlib first, then alphabetical) and de-duplicated.
+    fn modules_exporting(&self, name: &str, from_dir: Option<&Path>) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for (mod_id, file) in &self.files {
+            if !file.exports.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            if mod_id.starts_with("std/") {
+                out.push(mod_id.clone());
+            } else if let Some(rel) = import_path_for(mod_id, from_dir) {
+                out.push(rel);
+            }
+        }
+        out.sort_by(|a, b| {
+            let a_std = a.starts_with("std/");
+            let b_std = b.starts_with("std/");
+            b_std.cmp(&a_std).then_with(|| a.cmp(b))
+        });
+        out.dedup();
+        out
+    }
+
+    /// Every file that DIRECTLY imports from `module_id`, as a set of module ids.
+    /// A file B depends on `module_id` when B has an `ImportRef` whose resolved
+    /// `module_id` equals it (i.e. `import { ... } from "<module_id>"`). The owner
+    /// itself is never returned, so this is safe to drive a re-check loop with even
+    /// on a self/cyclic import graph (A→B, B→A): asking for A's dependents yields B
+    /// and asking for B's yields A, but neither result contains the queried module,
+    /// and the caller re-checks each dependent exactly once (no transitive chase) —
+    /// so there is no recursion to bound.
+    ///
+    /// DIRECT only by design: transitive dependents are intentionally NOT walked
+    /// here (see the `update` handler's re-check policy note for the rationale).
+    /// Pure over the index, so it's unit-testable without the async handler.
+    fn dependents_of(&self, module_id: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .files
+            .iter()
+            .filter(|(mid, file)| {
+                mid.as_str() != module_id
+                    && file.imports.iter().any(|imp| imp.module_id == module_id)
+            })
+            .map(|(mid, _)| mid.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Fuzzy-search every top-level declaration in the index for `query`,
     /// returning `(module_id, name, name_span, kind)` matches. An empty query
     /// matches everything (the client filters further). stdlib symbols are
@@ -2460,6 +3412,56 @@ fn leading_type_name(ty: &str) -> Option<String> {
         return None;
     }
     Some(name)
+}
+
+/// Derive the `import`-statement path string that resolves to user module `module_id`
+/// (a canonical absolute `.lin` file path) from a file in `from_dir`. Returns the path
+/// relative to `from_dir` with the `.lin` extension stripped and forward-slash
+/// separators (matching the `base_dir.join("{path}.lin")` resolver). Falls back to the
+/// file stem when no relative base is available or the relative path can't be computed.
+fn import_path_for(module_id: &str, from_dir: Option<&Path>) -> Option<String> {
+    let target = Path::new(module_id);
+    let stem_path = target.with_extension("");
+    let rel = match from_dir {
+        Some(dir) => pathdiff_relative(&stem_path, dir).unwrap_or(stem_path.clone()),
+        None => stem_path.clone(),
+    };
+    let s = rel.to_string_lossy().replace('\\', "/");
+    if s.is_empty() {
+        return target.file_stem().map(|s| s.to_string_lossy().to_string());
+    }
+    Some(s)
+}
+
+/// Compute `target` relative to `base` (both absolute) without touching the FS, e.g.
+/// `("/a/b/leaf", "/a/c")` → `../b/leaf`. Returns `None` when either path isn't
+/// absolute (the relative form would be meaningless).
+fn pathdiff_relative(target: &Path, base: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    if !target.is_absolute() || !base.is_absolute() {
+        return None;
+    }
+    let mut ta = target.components().peekable();
+    let mut ba = base.components().peekable();
+    // Skip the shared prefix.
+    while let (Some(t), Some(b)) = (ta.peek(), ba.peek()) {
+        if t == b {
+            ta.next();
+            ba.next();
+        } else {
+            break;
+        }
+    }
+    let mut result = PathBuf::new();
+    for c in ba {
+        if let Component::Normal(_) = c {
+            result.push("..");
+        }
+    }
+    for c in ta {
+        result.push(c.as_os_str());
+    }
+    Some(result)
 }
 
 /// Convert an index `module_id` back to a file `Url`. stdlib ids (`std/...`) have no
@@ -3038,7 +4040,7 @@ mod tests {
             analysis.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
         let params = code_action_params(src, analysis.diagnostics.clone());
-        let actions = code_actions(src, &dummy_uri(), &params);
+        let actions = code_actions(src, &dummy_uri(), &params, &WorkspaceIndex::default(), None);
         let titles = action_titles(&actions);
         assert!(
             titles.iter().any(|t| t == "Remove unused import"),
@@ -3072,7 +4074,7 @@ mod tests {
             analysis.diagnostics.iter().map(|d| (&d.message, &d.data)).collect::<Vec<_>>()
         );
         let params = code_action_params(src, analysis.diagnostics.clone());
-        let actions = code_actions(src, &dummy_uri(), &params);
+        let actions = code_actions(src, &dummy_uri(), &params, &WorkspaceIndex::default(), None);
         let titles = action_titles(&actions);
         assert!(
             titles.iter().any(|t| t == "Change to `length`"),
@@ -3140,6 +4142,50 @@ mod tests {
             .resolve_symbol(&b_id, use_off)
             .expect("should resolve the imported symbol from its use");
         assert_eq!((owner2, name2), (owner, name));
+    }
+
+    /// Dependency computation for the on-edit re-check: when A changes, the set of
+    /// files to re-check is exactly the DIRECT importers of A. Here B imports a
+    /// symbol from A (so B is a dependent) and C is unrelated (so C is excluded).
+    /// A itself is never in its own dependent set, which is what makes driving a
+    /// re-check loop with this safe on cyclic graphs.
+    #[test]
+    fn dependents_of_includes_direct_importers_only() {
+        let a = "export val foo = 1\n";
+        let b = "import { foo } from \"a\"\nval x = foo\n";
+        let c = "val unrelated = 99\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b), ("/ws/c.lin", c)]);
+        let a_id = id_of("/ws/a.lin");
+        let b_id = id_of("/ws/b.lin");
+        let c_id = id_of("/ws/c.lin");
+
+        let deps = index.dependents_of(&a_id);
+        assert!(deps.contains(&b_id), "B imports from A → must be a dependent: {:?}", deps);
+        assert!(!deps.contains(&c_id), "C is unrelated → must be excluded: {:?}", deps);
+        assert!(!deps.contains(&a_id), "A is never its own dependent: {:?}", deps);
+
+        // C imports nothing → it has no dependents either.
+        assert!(index.dependents_of(&c_id).is_empty());
+    }
+
+    /// Cyclic import graphs are safe to drive the re-check loop with: A↔B each list
+    /// the OTHER as a dependent but never themselves, so editing A re-checks B once
+    /// (and vice-versa) with no transitive chase and no recursion to bound.
+    #[test]
+    fn dependents_of_cyclic_graph_excludes_self_no_recursion() {
+        let a = "import { b } from \"b\"\nexport val a = 1\n";
+        let b = "import { a } from \"a\"\nexport val b = 2\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b)]);
+        let a_id = id_of("/ws/a.lin");
+        let b_id = id_of("/ws/b.lin");
+
+        let a_deps = index.dependents_of(&a_id);
+        assert_eq!(a_deps, vec![b_id.clone()], "A's only dependent is B: {:?}", a_deps);
+        assert!(!a_deps.contains(&a_id), "A must not depend on itself");
+
+        let b_deps = index.dependents_of(&b_id);
+        assert_eq!(b_deps, vec![a_id.clone()], "B's only dependent is A: {:?}", b_deps);
+        assert!(!b_deps.contains(&b_id), "B must not depend on itself");
     }
 
     /// Cross-file rename emits a multi-file edit set keyed per file; stdlib is never edited.
@@ -3312,5 +4358,282 @@ mod tests {
                 s.name
             );
         }
+    }
+
+    // ── code lens (run-test) ────────────────────────────────────────────────────
+
+    /// CodeLens discovery finds both `test("name", ...)` and `withFixture(..., "name", ...)`
+    /// declarations (including ones nested inside a `suite(...)` array) and emits the fixed
+    /// `lin.runTest(uri, name)` command, plus a single `lin.testFile` lens at the top.
+    #[test]
+    fn code_lens_discovers_tests() {
+        let src = "import { suite, test, withFixture } from \"std/test\"\n\
+                   val s = suite(\"x\", [\n\
+                     test(\"alpha\", () => []),\n\
+                     test(\"beta\", () => []),\n\
+                   ])\n\
+                   val w = withFixture(setup, \"gamma\", (f) => [])\n";
+        let module = parse(src);
+        let uri = dummy_uri();
+        let lenses = test_code_lenses(src, &uri, &module);
+
+        // One file-level lens + three test lenses.
+        let run_tests: Vec<(&str, &str)> = lenses
+            .iter()
+            .filter_map(|l| {
+                let c = l.command.as_ref()?;
+                if c.command == "lin.runTest" {
+                    let args = c.arguments.as_ref()?;
+                    Some((args[1].as_str().unwrap(), c.title.as_str()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let names: Vec<&str> = run_tests.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"alpha"), "missing alpha: {:?}", names);
+        assert!(names.contains(&"beta"), "missing beta: {:?}", names);
+        assert!(names.contains(&"gamma"), "missing gamma (withFixture): {:?}", names);
+        // Title + command contract.
+        assert!(run_tests.iter().all(|(_, t)| *t == "▶ Run Test"));
+        // First arg is the document URI string.
+        let first = lenses.iter().find(|l| l.command.as_ref().map(|c| c.command == "lin.runTest").unwrap_or(false)).unwrap();
+        assert_eq!(
+            first.command.as_ref().unwrap().arguments.as_ref().unwrap()[0].as_str().unwrap(),
+            uri.to_string()
+        );
+        // Exactly one file-level "Run File Tests" lens.
+        let file_lenses = lenses.iter().filter(|l| l.command.as_ref().map(|c| c.command == "lin.testFile").unwrap_or(false)).count();
+        assert_eq!(file_lenses, 1, "expected one Run File Tests lens");
+    }
+
+    /// No tests in a file → no lenses (not even the file-level one).
+    #[test]
+    fn code_lens_empty_when_no_tests() {
+        let src = "val x = 1\n";
+        let module = parse(src);
+        let lenses = test_code_lenses(src, &dummy_uri(), &module);
+        assert!(lenses.is_empty(), "expected no lenses, got {:?}", lenses.len());
+    }
+
+    // ── folding ranges ──────────────────────────────────────────────────────────
+
+    /// Folding ranges are AST-precise: an import-run region for the consecutive imports,
+    /// plus one `Region` per multi-line compound node (the function body and the array
+    /// literal), each spanning its full source extent (opening token .. closing delimiter).
+    #[test]
+    fn folding_range_covers_multiline_blocks_and_imports() {
+        let src = "import { a } from \"std/io\"\n\
+                   import { b } from \"std/array\"\n\
+                   val f = (x: Int32) => {\n\
+                     val y = x + 1\n\
+                     y\n\
+                   }\n\
+                   val arr = [\n\
+                     1,\n\
+                     2,\n\
+                   ]\n";
+        let module = parse(src);
+        let folds = folding_ranges(src, &module);
+        // Import-run fold over the two import lines (0..1).
+        assert!(
+            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Imports)
+                && f.start_line == 0
+                && f.end_line == 1),
+            "expected an import-run fold 0..1, got {:?}",
+            folds
+        );
+        // The function literal's full extent: `(x: Int32) => {` (line 2) .. closing `}` (line 5).
+        assert!(
+            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Region)
+                && f.start_line == 2
+                && f.end_line == 5),
+            "expected a function-body region fold 2..5, got {:?}",
+            folds
+        );
+        // The array literal's full extent: opening `[` (line 6) .. closing `]` (line 9).
+        assert!(
+            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Region)
+                && f.start_line == 6
+                && f.end_line == 9),
+            "expected an array-literal region fold 6..9, got {:?}",
+            folds
+        );
+    }
+
+    // ── selection ranges ─────────────────────────────────────────────────────────
+
+    /// Smart-expand is AST-precise: a cursor on the inner `1` literal expands through the
+    /// enclosing call's full extent (`add(1, 2)`), then the whole `val` statement, then the
+    /// document — each range strictly containing the previous, driven by `Expr::full_span()`.
+    #[test]
+    fn selection_range_nests_innermost_to_outermost() {
+        let src = "val r = add(1, 2)\n";
+        let analysis = analyse(src, None);
+        let off = src.find('1').unwrap();
+        let sel = selection_range_at(src, &analysis.module, off);
+
+        // Collect the innermost→outermost chain as the source text each range covers.
+        let mut texts = Vec::new();
+        let mut node = &sel;
+        loop {
+            let s = position_to_offset(src, node.range.start);
+            let e = position_to_offset(src, node.range.end);
+            texts.push(src[s..e].to_string());
+            match &node.parent {
+                Some(p) => node = p,
+                None => break,
+            }
+        }
+        // AST-precise expansion: the `1` literal, the enclosing call's full extent, the whole
+        // statement, then the document.
+        assert_eq!(
+            texts,
+            vec![
+                "1".to_string(),
+                "add(1, 2)".to_string(),
+                "val r = add(1, 2)".to_string(),
+                "val r = add(1, 2)\n".to_string(),
+            ],
+            "AST-precise selection chain"
+        );
+
+        // Each parent must still strictly contain its child.
+        let mut node = &sel;
+        while let Some(parent) = &node.parent {
+            assert!(
+                parent.range.start <= node.range.start && node.range.end <= parent.range.end,
+                "child range escapes parent"
+            );
+            node = parent;
+        }
+    }
+
+    // ── document links (import paths) ─────────────────────────────────────────────
+
+    /// A relative `import ... from "PATH"` whose target file exists yields a DocumentLink
+    /// pointing at that file; `std/...` imports are skipped (no on-disk file).
+    #[test]
+    fn document_link_resolves_import() {
+        let dir = std::env::temp_dir().join(format!("lin_lsp_doclink_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("leaf.lin"), "export val leafVal = 1\n").unwrap();
+
+        let src = "import { print } from \"std/io\"\nimport { leafVal } from \"leaf\"\n";
+        let module = parse(src);
+        let links = import_document_links(src, &module, Some(&dir));
+
+        // Exactly one link (the relative `leaf` import); the stdlib one is skipped.
+        assert_eq!(links.len(), 1, "expected one link, got {:?}", links);
+        let link = &links[0];
+        let target = link.target.as_ref().unwrap();
+        assert!(target.to_string().ends_with("leaf.lin"), "link should target leaf.lin: {}", target);
+        // The range covers the `leaf` text between the quotes (not the whole statement).
+        let span_text = {
+            let start = position_to_offset(src, link.range.start);
+            let end = position_to_offset(src, link.range.end);
+            &src[start..end]
+        };
+        assert_eq!(span_text, "leaf", "link range should be just the path text");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── auto-import code action ───────────────────────────────────────────────────
+
+    /// An undefined name that a stdlib module exports offers an "Import ... from ..." quick fix
+    /// whose edit inserts the import line.
+    #[test]
+    fn auto_import_action_offers_stdlib_import() {
+        // `print` is undefined here (never imported) but exported by std/io.
+        let src = "val x = print(\"hi\")\n";
+        let analysis = analyse(src, None);
+        // There must be an undefined-name diagnostic for `print`.
+        assert!(
+            analysis.diagnostics.iter().any(|d| undefined_name(&d.message).as_deref() == Some("print")),
+            "expected an undefined `print` diagnostic, got {:?}",
+            analysis.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+        let index = index_from(&[]); // stdlib is seeded.
+        let params = code_action_params(src, analysis.diagnostics.clone());
+        let actions = code_actions(src, &dummy_uri(), &params, &index, None);
+        let titles = action_titles(&actions);
+        assert!(
+            titles.iter().any(|t| t == "Import `print` from \"std/io\""),
+            "expected an auto-import action for print, got {:?}",
+            titles
+        );
+        // The edit must insert an import line.
+        let ca = actions.iter().find_map(|a| match a {
+            CodeActionOrCommand::CodeAction(ca) if ca.title.contains("Import `print`") => Some(ca),
+            _ => None,
+        }).unwrap();
+        let edits = ca.edit.as_ref().unwrap().changes.as_ref().unwrap().get(&dummy_uri()).unwrap();
+        assert!(edits[0].new_text.contains("import { print } from \"std/io\""));
+    }
+
+    /// Auto-import merges into an existing import from the SAME module rather than adding a
+    /// second `import ... from "std/io"` line.
+    #[test]
+    fn auto_import_edit_merges_existing_module_import() {
+        let src = "import { print } from \"std/io\"\nval x = printErr(\"e\")\n";
+        let edit = auto_import_edit(src, "printErr", "std/io").expect("expected a merge edit");
+        // A merge inserts `, printErr` (not a whole new import line).
+        assert_eq!(edit.new_text, ", printErr");
+        // Inserted on line 0 (the existing import line).
+        assert_eq!(edit.range.start.line, 0);
+    }
+
+    /// Already-imported name from the module → no edit (nothing to add).
+    #[test]
+    fn auto_import_edit_none_when_already_imported() {
+        let src = "import { print } from \"std/io\"\nval x = 1\n";
+        assert!(auto_import_edit(src, "print", "std/io").is_none());
+    }
+
+    // ── import-path completion ────────────────────────────────────────────────────
+
+    /// Inside a `from "…"` string the prefix is detected and stdlib paths are completed.
+    #[test]
+    fn import_string_prefix_detects_from_context() {
+        let src = "import { x } from \"std/ar\n";
+        let off = src.find("std/ar").unwrap() + "std/ar".len();
+        assert_eq!(import_string_prefix(src, off).as_deref(), Some("std/ar"));
+        // Outside any import string → None.
+        let plain = "val x = \"hi\"\n";
+        let off2 = plain.find("hi").unwrap();
+        assert!(import_string_prefix(plain, off2).is_none());
+    }
+
+    #[test]
+    fn import_path_completions_offers_stdlib_modules() {
+        let items = import_path_completions("std/ar", None);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert!(labels.contains(&"std/array"), "expected std/array in {:?}", labels);
+        // No non-matching modules.
+        assert!(labels.iter().all(|l| l.starts_with("std/ar")));
+    }
+
+    // ── signature help with parameter names (feature 13) ──────────────────────────
+
+    /// Same-file callee bound to a function literal: signature help renders `name: Type`
+    /// for each parameter (names pulled from the binding AST, no checker change).
+    #[test]
+    fn signature_help_includes_param_names() {
+        let src = "val add = (a: Int32, b: Int32) => a + b\nval r = add(1, 2)\n";
+        let analysis = analyse(src, None);
+        let call_open = src.rfind('(').unwrap();
+        let cursor = call_open + 1;
+        let help = signature_help(src, &analysis, cursor).expect("expected signature help");
+        let sig = &help.signatures[0];
+        let params = sig.parameters.as_ref().unwrap();
+        // Labels carry the parameter names.
+        let labels: Vec<&str> = params.iter().filter_map(|p| match &p.label {
+            ParameterLabel::Simple(s) => Some(s.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(labels, vec!["a: Int32", "b: Int32"], "param labels should be name: Type");
+        // The signature label reflects names too.
+        assert!(sig.label.contains("a: Int32"), "label should include names: {}", sig.label);
     }
 }

@@ -1,0 +1,51 @@
+// Grade-band frequency histogram over the validated records.
+//
+// A real report doesn't just rank rows — it summarises the *distribution*. This
+// module tallies how many records fall in each letter-grade band using a typed
+// index-signature map `{ String: Int32 }` (the dictionary type, ADR-082): the band
+// label is an arbitrary String key, the tally an Int32 count, with O(1) average
+// lookup/insert. Reading a key yields `Int32 | Null`, so a first-seen band (Null)
+// starts at 0 — the canonical "count occurrences into a map" idiom.
+import { Record } from "./parse"
+import { for } from "std/iter"
+import { keys } from "std/object"
+import { sort, length } from "std/array"
+import { map, filter } from "std/iter"
+import { toString, join } from "std/string"
+
+// Map a numeric score onto a letter-grade band label.
+export val band = (score: Int32): String =>
+  if score >= 90 then
+    "A (90-100)"
+  else if score >= 80 then
+    "B (80-89)"
+  else if score >= 70 then
+    "C (70-79)"
+  else if score >= 60 then
+    "D (60-69)"
+  else
+    "F (<60)"
+
+// Count how many records fall in each grade band. Returns a String-keyed map of
+// band label -> count. A band not yet seen reads back as Null, which we treat as 0.
+export val tally = (records: Record[]): { String: Int32 } =>
+  var counts: { String: Int32 } = {}
+  records.for(r =>
+    val b = band(r["score"])
+    val prev = counts[b]
+    val n = match prev
+      is Int32 => prev
+      else => 0
+    counts[b] = n + 1
+  )
+  counts
+
+// Render the histogram as indented "label: count" lines, in sorted-label order so
+// the output is deterministic. Bands with no records are omitted (the map only holds
+// labels that occurred).
+export val renderTally = (records: Record[]): String =>
+  val counts = tally(records)
+  keys(counts)
+    .sort((a, b) => if a < b then -1 else 1)
+    .map(label => "  ${label}: ${toString(counts[label])}")
+    .join("\n")
