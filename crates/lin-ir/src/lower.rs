@@ -1734,6 +1734,22 @@ fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool
     }
 }
 
+/// Whether passing a SCALAR (Int/Float/Bool/Null) argument to a `Json`/union parameter boxes it
+/// into a fresh, caller-owned `TaggedVal*` shell (`lin_box_int32`/`box_float64`/…) that the callee
+/// borrows and never releases. A NON-cached scalar box (a large int / any float) is a fresh heap
+/// shell with NO heap inner payload, so reclaiming the SHELL after the call balances it. Freeing is
+/// done via `FreeBoxShellIfDistinct` → `lin_tagged_free_box_if_distinct`, which is CACHED-BOX SAFE
+/// (small-int/bool boxes are immortal statics and never freed) and result-alias safe (a callee that
+/// returns its Json param hands the same box back as the result — skipped when shell == result).
+/// Without this, `f(1_000_000)` / `f(3.14)` into a Json param leaked the 16-byte box shell per call.
+fn arg_box_is_caller_owned_scalar_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool {
+    match param_ty {
+        Some(p) => is_union_ty(p) && !is_union_ty(arg_ty) && !is_heap_ty(arg_ty)
+            && !is_sealed_scalar_repr(arg_ty),
+        None => false,
+    }
+}
+
 /// Retain a Function-typed argument that is NOT a freshly-made closure before passing it
 /// to a call. AST-compiled callees release their Function-typed parameters at return; a
 /// borrowed (non-fresh) closure must be retained to balance that, while a fresh closure's
@@ -3491,7 +3507,9 @@ fn lower_call(
                     if param_tys.get(i).map(|p| sealed_array_arg_materialized(&a.ty(), p)).unwrap_or(false)
                     {
                         full_release_boxes.push((arg, param_tys[i].clone()));
-                    } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
+                    } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i))
+                        || arg_box_is_caller_owned_scalar_shell(&a.ty(), param_tys.get(i))
+                    {
                         shell_boxes.push(arg);
                     }
                     if let Some(lit) = raw_lit {
@@ -3519,22 +3537,15 @@ fn lower_call(
                 builder.emit(Instruction::Release { val: *b, ty: bty.clone() });
             }
             builder.register_owned(dst, result_type.clone());
-            // Transfer-on-escape is only sound when the call RESULT can actually carry the boxed
-            // fresh literal back to the caller — i.e. `dst` may BE (alias) that literal's box, so if
-            // `dst` escapes the literal must be kept alive. That can only happen when the result is a
-            // boxed (union/Json) value the callee could return its borrowed Json param as (an
-            // identity / pass-through). When the result is a scalar/`Null`/concrete value (e.g.
-            // `for`/`while`, which RETURN `Null` and never hand the iterable back), the boxed arg is
-            // a pure BORROW: its shell was already freed by `free_arg_box_shells` and its inner is
-            // owned by the arg's own scope-exit release. Recording an escape-alias there wrongly keeps
-            // the inner alive whenever `dst` is the function's return expression (e.g. the inner
-            // `range(..).for(..)` of a nested combinator inside a closure body) — the array leaks
-            // every iteration. So only alias when the result is a union.
-            if is_union_ty(result_type) {
-                for lit in escape_lits {
-                    builder.record_escape_alias(dst, lit);
-                }
-            }
+            // No transfer-on-escape aliasing for the boxed fresh-literal args: a callee returning a
+            // borrowed Json/union param does so by CLONE (the function-return path clones a borrowed
+            // union body-result into a fresh +1 box — `lower_function_expr_with_id`'s `is_union_ty &&
+            // !is_owned_in_scope` clone, added in da9ec08, AFTER the original escape-alias of 2af264a
+            // assumed a by-REFERENCE return). The result therefore never aliases the arg literal's
+            // inner payload, so the literal's own +1 must be released normally at the arg scope exit
+            // (its shell was freed by `free_arg_box_shells`). Keeping it alive via escape-alias here
+            // leaked the literal every call (the `firstOr([1,2,3], d)` / accumulator-threading shape).
+            let _ = &escape_lits;
             return dst;
         }
         // Check global function slots.
@@ -3564,7 +3575,9 @@ fn lower_call(
                     if param_tys.get(i).map(|p| sealed_array_arg_materialized(&a.ty(), p)).unwrap_or(false)
                     {
                         full_release_boxes.push((arg, param_tys[i].clone()));
-                    } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
+                    } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i))
+                        || arg_box_is_caller_owned_scalar_shell(&a.ty(), param_tys.get(i))
+                    {
                         shell_boxes.push(arg);
                     }
                     if let Some(lit) = raw_lit {
@@ -3616,22 +3629,10 @@ fn lower_call(
                 builder.emit(Instruction::Release { val: *b, ty: bty.clone() });
             }
             builder.register_owned(dst, result_type.clone());
-            // Transfer-on-escape is only sound when the call RESULT can actually carry the boxed
-            // fresh literal back to the caller — i.e. `dst` may BE (alias) that literal's box, so if
-            // `dst` escapes the literal must be kept alive. That can only happen when the result is a
-            // boxed (union/Json) value the callee could return its borrowed Json param as (an
-            // identity / pass-through). When the result is a scalar/`Null`/concrete value (e.g.
-            // `for`/`while`, which RETURN `Null` and never hand the iterable back), the boxed arg is
-            // a pure BORROW: its shell was already freed by `free_arg_box_shells` and its inner is
-            // owned by the arg's own scope-exit release. Recording an escape-alias there wrongly keeps
-            // the inner alive whenever `dst` is the function's return expression (e.g. the inner
-            // `range(..).for(..)` of a nested combinator inside a closure body) — the array leaks
-            // every iteration. So only alias when the result is a union.
-            if is_union_ty(result_type) {
-                for lit in escape_lits {
-                    builder.record_escape_alias(dst, lit);
-                }
-            }
+            // No transfer-on-escape aliasing — see the imported-call path above: union param
+            // returns CLONE (da9ec08), so the result never aliases the arg literal's inner; the
+            // literal's +1 is released normally at the arg scope exit (shell already freed).
+            let _ = &escape_lits;
             return dst;
         }
     }
@@ -3647,6 +3648,7 @@ fn lower_call(
         _ => vec![],
     };
     let mut escape_lits: Vec<Temp> = Vec::new();
+    let mut shell_boxes: Vec<Temp> = Vec::new();
     let lowered_args: Vec<Temp> = args
         .iter()
         .enumerate()
@@ -3655,6 +3657,15 @@ fn lower_call(
             // combinator, so cb_idx is None (no safe captured-cell context — conservative).
             let (arg, raw_lit) = lower_call_arg_tracked(a, param_tys.get(i), i, None, builder, ctx);
             retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
+            // A concrete heap value (or a non-cached scalar) boxed into a Json/union closure param is
+            // a caller-owned SHELL the closure never releases. Free the shell after the call, like
+            // the named/imported paths. Without this, a fresh literal / large-int / float passed to a
+            // Json closure param leaked its 16-byte box shell every call.
+            if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i))
+                || arg_box_is_caller_owned_scalar_shell(&a.ty(), param_tys.get(i))
+            {
+                shell_boxes.push(arg);
+            }
             if let Some(lit) = raw_lit {
                 escape_lits.push(lit);
             }
@@ -3681,6 +3692,7 @@ fn lower_call(
         args: lowered_args,
         ret_ty: result_type.clone(),
     });
+    free_arg_box_shells(&shell_boxes, dst, builder);
     // Concrete rc results are owned (+1) here; a UNION result from an INDIRECT closure call is
     // NOT registered, because the closure return ABI does NOT guarantee +1 for a boxed-union
     // return: a closure whose body yields a borrowed param/local box (e.g. minBy's
@@ -3690,18 +3702,10 @@ fn lower_call(
     if is_rc_type(result_type) {
         builder.register_owned(dst, result_type.clone());
     }
-    // Record transfer-on-escape aliasing only when the result can actually carry the boxed fresh
-    // literal back (a union/Json result — the only thing a borrowed Json param can be returned as).
-    // A scalar/Null/concrete result (e.g. an indirect `for`/`while` closure call returning `Null`)
-    // never hands the iterable box back, so the boxed arg is a pure borrow already balanced by the
-    // shell free + the arg's own scope-exit release; aliasing it would wrongly keep the inner alive
-    // when `dst` is a return expression (the nested-combinator-in-closure leak). See the named/import
-    // paths above for the full rationale.
-    if is_union_ty(result_type) {
-        for lit in escape_lits {
-            builder.record_escape_alias(dst, lit);
-        }
-    }
+    // No transfer-on-escape aliasing — see the named/imported call paths above: union param
+    // returns CLONE (da9ec08), so the result never aliases the arg literal's inner payload; the
+    // literal's +1 is released normally at the arg scope exit (its shell already freed).
+    let _ = &escape_lits;
     dst
 }
 
@@ -4316,6 +4320,16 @@ fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp,
             builder.emit(Instruction::CallIntrinsic {
                 dst: push_dst, intrinsic: Intrinsic::Push, args: vec![out, boxed], ret_ty: Type::Null,
             });
+            // `Push` (`lin_array_push_tagged`) MOVES the box's inner into the result slot without
+            // retaining. When `box_to_json` made a FRESH box for a concrete `val` (val_ty not a
+            // union), its 16-byte shell is now orphaned — the inner lives on in the array. Reclaim
+            // the shell (the inner is NOT touched — that pointer belongs to the array). Skipped when
+            // `boxed == val` (val was already a union; that box is owned/freed elsewhere — e.g. the
+            // map elem box freed by `free_combinator_elem_box`). Without this a concrete-producing
+            // `map(src, x => {…})` leaked the per-element push box shell (~16 B/elem).
+            if boxed != val {
+                builder.emit(Instruction::FreeBoxShell { val: boxed });
+            }
         }
     }
 }
@@ -4751,6 +4765,43 @@ fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx
     builder.const_temp(Const::Null)
 }
 
+/// Reclaim the 16-byte SHELL of a `map`/`filter` per-element box after the loop body has consumed
+/// it (pushed it / built the mapped value from it).
+///
+/// When the source is a TAGGED (union/Json) array, `emit_index_loop`'s `Index` lowers to
+/// `lin_array_get_tagged`, which allocates a FRESH standalone `TaggedVal*` box per element. The
+/// result push (`Intrinsic::Push` → `lin_array_push_tagged`) MOVES the box's inner payload into the
+/// result slot WITHOUT bumping the inner refcount — so the inner's single +1 is now owned by the
+/// result array, and the per-element box's SHELL is orphaned (it leaked ~16 B/elem, ASan-confirmed
+/// in `map(src, x => x)` / `filter`).
+///
+/// We free ONLY the shell (`FreeBoxShell` → `lin_tagged_free_box`), never the inner — the inner
+/// pointer belongs to the result array (moved) or, for an identity map over interned/borrowed
+/// strings, to the source. A full `lin_tagged_release` here would DOUBLE-FREE the moved inner
+/// (the `filter$String`-over-`split` UAF: `lin_array_push_tagged` moves, then a full release of
+/// the elem box frees the very string the result array now owns). The shell is always a freshly
+/// allocated, unshared 16-byte `TaggedVal*`, so freeing it is sound; it is null/cached-box safe.
+///
+/// No-op for a flat-scalar element read (no box was allocated — the read produced a raw scalar).
+fn free_combinator_elem_box(elem: Temp, elem_ty: &Type, builder: &mut FuncBuilder) {
+    // Only a union/Json read allocates a standalone box; flat-scalar reads carry no shell.
+    if is_union_ty(elem_ty) {
+        builder.emit(Instruction::FreeBoxShell { val: elem });
+    }
+}
+
+/// FULLY reclaim a `filter` per-element box for an element that is DROPPED (predicate false):
+/// the shell AND the inner +1 that `lin_array_get_tagged` retained, since nothing else owns it.
+/// `lin_tagged_release` is tag-aware (releases the inner heap value then frees the shell) and
+/// null/cached-box safe. Only fires for a union/Json read (a box was allocated). NEVER used on the
+/// KEEP path — there the element's inner was moved/retained into the result (see
+/// `free_combinator_elem_box`, the shell-only counterpart).
+fn free_combinator_elem_box_full(elem: Temp, elem_ty: &Type, builder: &mut FuncBuilder) {
+    if is_union_ty(elem_ty) {
+        builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
+    }
+}
+
 /// `map(iterable, f)` → new array of `f(elem)` for each element.
 fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
@@ -4783,6 +4834,7 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
                 inline_lambda_body(&lam_params, &lam_body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], b, c);
             // `mapped` is the lambda's freshly-owned result (+1) — MOVE it into the result array.
             push_output(out, flat, &out_elem_ty, mapped, &mapped_ty, false, b);
+            free_combinator_elem_box(elem, &elem_ty, b);
         });
         return out;
     }
@@ -4795,6 +4847,7 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
         let mapped = call_body_closure(f, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &param_tys, &cb_ret, b);
         // `mapped` is the callback's freshly-owned result (+1) — MOVE it into the result array.
         push_output(out, flat, &out_elem_ty, mapped, &cb_ret, false, b);
+        free_combinator_elem_box(elem, &elem_ty, b);
     });
     out
 }
@@ -4837,14 +4890,23 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
                 d
             };
             let keep_block = b.alloc_block("filter_keep");
-            let skip_block = b.alloc_block("filter_skip");
-            b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: skip_block });
+            let drop_block = b.alloc_block("filter_drop");
+            let join_block = b.alloc_block("filter_skip");
+            b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: drop_block });
             b.switch_to(keep_block);
-            // `elem` is BORROWED from the source array — the result array must take its own
-            // reference (retain on a tagged concrete-rc push; see `push_output`).
+            // KEEP: `elem` is BORROWED from the source array — the result array must take its own
+            // reference (retain on a tagged concrete-rc push; see `push_output`). The push consumed
+            // the per-element box's inner; reclaim only the box SHELL (shell-only — see helper doc).
             push_output(out, flat, &out_elem_ty, elem, &elem_ty, true, b);
-            b.terminate(Terminator::Jump(skip_block));
-            b.switch_to(skip_block);
+            free_combinator_elem_box(elem, &elem_ty, b);
+            b.terminate(Terminator::Jump(join_block));
+            b.switch_to(drop_block);
+            // SKIP: the element is dropped, nothing owns it — FULLY release the per-element box
+            // (shell + the inner +1 that `lin_array_get_tagged` retained), else every skipped
+            // element's inner leaks (the `filter`-over-`split` residual).
+            free_combinator_elem_box_full(elem, &elem_ty, b);
+            b.terminate(Terminator::Jump(join_block));
+            b.switch_to(join_block);
         });
         return out;
     }
@@ -4855,13 +4917,19 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
         let idx = narrow_loop_index(i, b);
         let keep = call_body_closure(pred, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &param_tys, &Type::Bool, b);
         let keep_block = b.alloc_block("filter_keep");
-        let skip_block = b.alloc_block("filter_skip");
-        b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: skip_block });
+        let drop_block = b.alloc_block("filter_drop");
+        let join_block = b.alloc_block("filter_skip");
+        b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: drop_block });
         b.switch_to(keep_block);
-        // `elem` is BORROWED from the source array — retain on the tagged concrete-rc push.
+        // KEEP: retain on the tagged concrete-rc push, then reclaim the box shell.
         push_output(out, flat, &out_elem_ty, elem, &elem_ty, true, b);
-        b.terminate(Terminator::Jump(skip_block));
-        b.switch_to(skip_block);
+        free_combinator_elem_box(elem, &elem_ty, b);
+        b.terminate(Terminator::Jump(join_block));
+        b.switch_to(drop_block);
+        // SKIP: fully release the dropped element's box.
+        free_combinator_elem_box_full(elem, &elem_ty, b);
+        b.terminate(Terminator::Jump(join_block));
+        b.switch_to(join_block);
     });
     out
 }
