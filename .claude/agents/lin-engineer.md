@@ -189,7 +189,7 @@ truthy. `sortBy(keyFn)` sorts ascending by the key (negate for descending);
 `String[]`. The lambdas also receive an index as a third arg when you want it:
 `[10, 10, 10].reduce(0, (acc, n, i) => acc + n * i)`.
 
-### `for` and a typed map — side effects and accumulation (`wordcount/wordcount.lin`)
+### `for` and a typed map — side effects and accumulation (`report/frequency.lin`)
 
 `for` is the side-effecting terminal (returns `Null`); use it when you want to
 act on each element, not transform. Here it accumulates into a typed
