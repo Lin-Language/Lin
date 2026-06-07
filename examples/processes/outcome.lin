@@ -1,0 +1,40 @@
+// outcome.lin — a generic, Json-free `Result<T, E>` tagged union and the combinators
+// that make it composable. The task runner threads "this step produced a TaskResult"
+// (success) vs "this step could not be run — it timed out or gave up after N retries"
+// (failure) through these combinators, keeping a precise element type end-to-end.
+//
+// The discriminant `"type"` uses singleton string-literal types ("success" /
+// "failure"), so a wrongly-tagged object is a compile-time error. The combinators
+// match with a `has`-binding arm + an `else` that propagates the failure unchanged —
+// this codebase's standard Result idiom.
+export type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+
+export val ok = <T, E>(v: T): Result<T, E> =>
+  { "type": "success", "value": v }
+
+export val err = <T, E>(e: E): Result<T, E> =>
+  { "type": "failure", "error": e }
+
+// `isOk` only inspects the discriminant, which every Result carries regardless of T/E,
+// so it takes the structural supertype `{ "type": String }` (width-subtyping) rather
+// than being generic. Any `Result<T, E>` satisfies it, and it reads as `r.isOk()`.
+export val isOk = (r: { "type": String }): Boolean =>
+  r["type"] == "success"
+
+// Chain a fallible step: run `f(value)` only on success; propagate failure unchanged.
+export val andThen = <T, U, E>(r: Result<T, E>, f: (T) => Result<U, E>): Result<U, E> =>
+  match r
+    has { "type": "success", value } => f(value)
+    else => err(r["error"])
+
+// Transform the success value with a pure function; propagate failure unchanged.
+export val mapOk = <T, U, E>(r: Result<T, E>, f: (T) => U): Result<U, E> =>
+  match r
+    has { "type": "success", value } => ok(f(value))
+    else => err(r["error"])
+
+// Unwrap the success value or fall back to a default on failure.
+export val unwrapOr = <T, E>(r: Result<T, E>, dflt: T): T =>
+  match r
+    has { "type": "success", value } => value
+    else => dflt

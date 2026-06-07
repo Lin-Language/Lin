@@ -10,11 +10,14 @@ import { length } from "std/array"
 // A validated CSV record.
 export type Record = { "name": String, "score": Int32 }
 
-// A row parses to a tagged result. The discriminant field is a String (per the
-// type system: string-literal singleton types are not supported), so `Success`
-// and `Failure` are distinguished by pattern-matching on `"type"`.
-export type Success = { "type": String, "value": Record }
-export type Failure = { "type": String, "error": String }
+// A row parses to a tagged result. Every variant carries a `"type"` discriminant
+// (a String — string-literal singleton types are not supported), so the shared
+// shape factors out into `Tagged` and each variant EXTENDS it with `&` (record
+// intersection, ADR-061): `Success` adds the parsed `value`, `Failure` the error
+// message. The variants are then distinguished by pattern-matching on `"type"`.
+export type Tagged = { "type": String }
+export type Success = Tagged & { "value": Record }
+export type Failure = Tagged & { "error": String }
 export type Parsed = Success | Failure
 
 val fail = (msg: String): Failure =>

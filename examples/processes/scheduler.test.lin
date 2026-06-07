@@ -1,0 +1,137 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { runConcurrent, runWithTimeout, runWithRetry, runOnPool, runThen } from "./scheduler"
+import { isOk } from "./outcome"
+import { Task } from "./task"
+import { exec } from "std/process"
+import { sleep } from "std/time"
+import { length } from "std/array"
+
+// The scheduler's async thunks all call the top-level `runTask`, which calls `exec`; we
+// mock `exec` (ADR-046) so concurrency, timeouts and retries are driven deterministically
+// without spawning real subprocesses. The mock dispatches on the command name:
+//   "ok"    — succeeds immediately (exit 0)
+//   "slow"  — sleeps past any small deadline before succeeding (drives the timeout MISS)
+//   "flaky" — traps on the first two calls, then succeeds (drives retry recovery)
+//   "boom"  — always traps (drives retry give-up)
+// `flakyCalls` is module-level state the "flaky" branch counts up across attempts.
+var flakyCalls = 0
+
+replace exec = (command: String, args: String[]): Json =>
+  if command == "ok" then
+    {
+      "status": 0,
+      "stdout": "done\n",
+      "stderr": ""
+    }
+  else if command == "slow" then
+    sleep(50)
+    {
+      "status": 0,
+      "stdout": "eventually\n",
+      "stderr": ""
+    }
+  else if command == "flaky" then
+    flakyCalls = flakyCalls + 1
+    if flakyCalls < 3 then
+      val trap = 1 / 0
+      {
+        "status": trap,
+        "stdout": "",
+        "stderr": ""
+      }
+    else
+      {
+        "status": 0,
+        "stdout": "recovered\n",
+        "stderr": ""
+      }
+  else
+    val trap = 1 / 0
+    {
+      "status": trap,
+      "stdout": "",
+      "stderr": ""
+    }
+
+val task = (name: String, command: String): Task =>
+  {
+    "name": name,
+    "command": command,
+    "args": []
+  }
+
+val s = suite("scheduler", [
+  test("runConcurrent runs every task and reports completion", () =>
+    val rep = runConcurrent([
+      task("a", "ok"),
+      task("b", "ok"),
+      task("c", "ok")
+    ])
+    [
+      expect(length(rep["results"])).toBe(3),
+      expect(rep["completed"]).toBe(3),
+      expect(rep["results"][0]["outcome"]).toBe("pass")
+    ]
+  ),
+
+  test("runWithTimeout succeeds when the step beats its deadline", () =>
+    val r = runWithTimeout(task("fast", "ok"), 5000)
+    [
+      expect(r.isOk()).toBe(true)
+    ]
+  ),
+
+  test("runWithTimeout fails with a reason when the deadline is missed", () =>
+    val r = runWithTimeout(task("slow", "slow"), 5)
+    [
+      expect(r.isOk()).toBe(false),
+      expect(r["error"]).toBe("timed out after 5ms")
+    ]
+  ),
+
+  test("runWithRetry recovers a flaky step within the attempt budget", () =>
+    val r = runWithRetry(task("flaky", "flaky"), 5)
+    [
+      expect(r.isOk()).toBe(true)
+    ]
+  ),
+
+  test("runWithRetry gives up after exhausting its attempts", () =>
+    val r = runWithRetry(task("boom", "boom"), 3)
+    [
+      expect(r.isOk()).toBe(false),
+      expect(r["error"]).toBe("gave up after 3 attempt(s)")
+    ]
+  ),
+
+  test("runOnPool runs every task on a bounded pool, preserving order", () =>
+    val results = runOnPool(
+      [
+        task("a", "ok"),
+        task("b", "ok")
+      ],
+      2
+    )
+    [
+      expect(length(results)).toBe(2),
+      expect(results[0]["name"]).toBe("a"),
+      expect(results[1]["outcome"]).toBe("pass")
+    ]
+  ),
+
+  test("runThen runs the dependent step only after the first succeeds", () =>
+    val r = runThen(task("build", "ok"), task("deploy", "ok"), 5000)
+    [
+      expect(r.isOk()).toBe(true),
+      expect(r["value"]["name"]).toBe("deploy")
+    ]
+  ),
+
+  test("runThen short-circuits: a first-step timeout skips the second", () =>
+    val r = runThen(task("build", "slow"), task("deploy", "ok"), 5)
+    [
+      expect(r.isOk()).toBe(false)
+    ]
+  )
+])
+run(s)

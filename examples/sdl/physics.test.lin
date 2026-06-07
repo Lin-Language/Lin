@@ -1,0 +1,58 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { ball, reflect1d, stepBall } from "./physics"
+import { vec2 } from "./vector"
+
+val s = suite("physics", [
+  test("a step within the walls just advances by velocity", () =>
+    val r = reflect1d(10.0, 3.0, 100.0)
+    [
+      expect(r["x"]).toBe(13.0),
+      expect(r["y"]).toBe(3.0)
+    ]
+  ),
+
+  test("hitting the low wall folds back and flips velocity", () =>
+    val r = reflect1d(1.0, 0.0 - 3.0, 100.0)
+    [
+      expect(r["x"]).toBe(2.0),
+      expect(r["y"]).toBe(3.0)
+    ]
+  ),
+
+  test("hitting the high wall folds back and flips velocity", () =>
+    val r = reflect1d(99.0, 3.0, 100.0)
+    [
+      expect(r["x"]).toBe(98.0),
+      expect(r["y"]).toBe(0.0 - 3.0)
+    ]
+  ),
+
+  test("stepBall advances both axes inside the box", () =>
+    val b = stepBall(ball(vec2(10.0, 20.0), vec2(3.0, 2.0)), 100.0, 100.0)
+    [
+      expect(b["pos"]["x"]).toBe(13.0),
+      expect(b["pos"]["y"]).toBe(22.0),
+      expect(b["vel"]["x"]).toBe(3.0),
+      expect(b["vel"]["y"]).toBe(2.0)
+    ]
+  ),
+
+  test("stepBall bounces off the right wall, flipping vx only", () =>
+    val b = stepBall(ball(vec2(99.0, 20.0), vec2(3.0, 2.0)), 100.0, 100.0)
+    [
+      expect(b["pos"]["x"]).toBe(98.0),
+      expect(b["vel"]["x"]).toBe(0.0 - 3.0),
+      expect(b["vel"]["y"]).toBe(2.0)
+    ]
+  ),
+
+  test("stepBall bounces off the top wall, flipping vy only", () =>
+    val b = stepBall(ball(vec2(10.0, 1.0), vec2(3.0, 0.0 - 3.0)), 100.0, 100.0)
+    [
+      expect(b["pos"]["y"]).toBe(2.0),
+      expect(b["vel"]["y"]).toBe(3.0),
+      expect(b["vel"]["x"]).toBe(3.0)
+    ]
+  )
+])
+run(s)
