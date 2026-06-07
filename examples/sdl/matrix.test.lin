@@ -1,0 +1,63 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { matMul, rotation2D, applyToVec, mat3, mat3Get } from "./matrix"
+import { vec2, magnitude, dot, angleBetween } from "./vector"
+import { toFixed, PI } from "std/math"
+
+val identity: Float64[] = mat3(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+val m: Float64[] = mat3(2.0, 3.0, 0.0, 4.0, 5.0, 0.0, 0.0, 0.0, 1.0)
+
+val s = suite("matrix", [
+  test("identity * M preserves M (diagonal spot-checks)", () =>
+    val p = matMul(identity, m)
+    [
+      expect(mat3Get(p, 0, 0).toFixed(1)).toBe("2.0"),
+      expect(mat3Get(p, 1, 1).toFixed(1)).toBe("5.0"),
+      expect(mat3Get(p, 2, 2).toFixed(1)).toBe("1.0")
+    ]
+  ),
+
+  test("rotation 90 deg maps (1,0) to (0,1)", () =>
+    val rot = rotation2D(PI / 2.0)
+    val pt = applyToVec(rot, vec2(1.0, 0.0))
+    [
+      expect(pt["x"].toFixed(4)).toBe("0.0000"),
+      expect(pt["y"].toFixed(4)).toBe("1.0000")
+    ]
+  ),
+
+  test("rotation 0 deg is the identity on a point", () =>
+    val rot = rotation2D(0.0)
+    val pt = applyToVec(rot, vec2(3.0, 4.0))
+    [
+      expect(pt["x"].toFixed(4)).toBe("3.0000"),
+      expect(pt["y"].toFixed(4)).toBe("4.0000")
+    ]
+  ),
+
+  // matrix -> vector pipeline: rotating a vector by 90 deg preserves its magnitude,
+  // keeps it orthogonal to the original, and the angle between is PI/2.
+  test("rotation preserves magnitude", () =>
+    val rot = rotation2D(PI / 2.0)
+    val pt = applyToVec(rot, vec2(3.0, 4.0))
+    [
+      expect(magnitude(pt).toFixed(4)).toBe("5.0000")
+    ]
+  ),
+
+  test("rotated unit vector is orthogonal to the original", () =>
+    val rot = rotation2D(PI / 2.0)
+    val pt = applyToVec(rot, vec2(1.0, 0.0))
+    [
+      expect(dot(vec2(1.0, 0.0), pt).toFixed(4)).toBe("0.0000")
+    ]
+  ),
+
+  test("angle between a vector and its 90 deg rotation is PI/2", () =>
+    val rot = rotation2D(PI / 2.0)
+    val pt = applyToVec(rot, vec2(1.0, 0.0))
+    [
+      expect(angleBetween(vec2(1.0, 0.0), pt).toFixed(4)).toBe(toFixed(PI / 2.0, 4))
+    ]
+  )
+])
+run(s)

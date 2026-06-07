@@ -3,10 +3,9 @@
 /build
 .lin-cache/
 .claude/worktrees/
-examples/lib/*.a
-examples/lib/*.o
-examples/ffi/*.o
-# libmathlib.a is committed (the FFI example links against it; lin test needs it).
+examples/sdl/clib/*.o
+# libmathlib.a is committed (the sdl example's your-own-C FFI binding links against it;
+# `lin test`/the ASan leg need it). Only the intermediate .o is ignored.
 benchmarks/results/
 docs-site/output/
 /docs-builder

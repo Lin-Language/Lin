@@ -6914,21 +6914,34 @@ print(result["type"])
 
 #[test]
 fn test_ffi_end_to_end_c_library() {
+    // The "your-own-C" FFI mode (a built-from-source static archive) was folded from the old
+    // examples/ffi into the sdl project at examples/sdl/clib/. This test builds a small program
+    // against that archive and checks the C calls round-trip (int32_t<->Int32, double<->Float64,
+    // and libm `sqrt` via magnitude2). The richer vendored-.so FFI mode is covered by the
+    // SDL demo tests below; the per-function results are also asserted in examples/sdl/mathffi.test.lin.
     let ws = workspace_root();
     let lin_bin = lin_bin();
-    let mathlib_c = ws.join("examples/lib/mathlib.c");
-    let mathlib_a = ws.join("examples/lib/libmathlib.a");
-    let ffi_example = ws.join("examples/ffi-c.lin");
+    let mathlib_c = ws.join("examples/sdl/clib/mathlib.c");
+    // Everything this test produces lives under target/ — it never writes into the examples
+    // tree (so the committed examples/sdl/clib/libmathlib.a is untouched and the fmt-corpus
+    // test that scans examples/ can't race a transient file). The archive is rebuilt for the
+    // CURRENT platform (a committed Linux x86-64 .a won't link on macOS), and the foreign
+    // import references that freshly-built target/ archive.
+    let mathlib_a = ws.join("target/ffi_c_mathlib.a");
+    let obj = ws.join("target/ffi_c_mathlib.o");
     let output_bin = ws.join("target/ffi_c_test");
+    let ffi_example = ws.join("target/ffi_c_smoke.lin");
 
     if !lin_bin.exists() {
         eprintln!("SKIP: lin binary not built; run `cargo build -p lin` first");
         return;
     }
+    if !mathlib_c.exists() {
+        eprintln!("SKIP: examples/sdl/clib/mathlib.c not present");
+        return;
+    }
 
-    // Always rebuild the static library for the current platform — a pre-built .a from
-    // a different arch (e.g. Linux x86_64 checked in, running on macOS ARM64) will fail to link.
-    let obj = ws.join("examples/lib/mathlib.o");
+    // Build a platform-correct static archive from the example's C source, into target/.
     let cc_status = Command::new("cc")
         .args(["-c", mathlib_c.to_str().unwrap(), "-o", obj.to_str().unwrap()])
         .status();
@@ -6944,11 +6957,27 @@ fn test_ffi_end_to_end_c_library() {
         return;
     }
 
+    // A minimal program exercising the C ABI directly (mirrors examples/sdl/mathffi.lin's
+    // bindings), linking the freshly-built target/ archive. Built with cwd=ws so the
+    // workspace-relative foreign path resolves.
+    std::fs::write(&ffi_example, concat!(
+        "import { print } from \"std/io\"\n",
+        "import { toString } from \"std/string\"\n",
+        "import foreign \"target/ffi_c_mathlib.a\"\n",
+        "  val add: (Int32, Int32) => Int32\n",
+        "  val square: (Float64) => Float64\n",
+        "  val magnitude2: (Float64, Float64) => Float64\n",
+        "print(\"3 + 4 = ${toString(add(3, 4))}\")\n",
+        "print(\"2.5^2 = ${toString(square(2.5))}\")\n",
+        "print(\"|3,4| = ${toString(magnitude2(3.0, 4.0))}\")\n",
+    )).expect("failed to write ffi smoke source");
+
     let compile_out = Command::new(&lin_bin)
-        .args(["build", ffi_example.to_str().unwrap(), "-o", output_bin.to_str().unwrap()])
+        .args(["build", "target/ffi_c_smoke.lin", "-o", output_bin.to_str().unwrap()])
         .current_dir(&ws)
         .output()
         .expect("failed to run lin build");
+    let _ = std::fs::remove_file(&ffi_example);
     assert!(compile_out.status.success(),
         "lin build failed: {}", String::from_utf8_lossy(&compile_out.stderr));
 
@@ -6957,6 +6986,7 @@ fn test_ffi_end_to_end_c_library() {
     let stdout = String::from_utf8_lossy(&run_out.stdout);
     assert!(stdout.contains("3 + 4 = 7"), "Expected '3 + 4 = 7', got: {}", stdout);
     assert!(stdout.contains("2.5^2 = 6.25"), "Expected '2.5^2 = 6.25', got: {}", stdout);
+    assert!(stdout.contains("|3,4| = 5"), "Expected '|3,4| = 5', got: {}", stdout);
 }
 
 // End-to-end richer-FFI + concurrency keystone tests: the examples/sdl/ project drives the REAL
@@ -7031,9 +7061,15 @@ fn test_sdl_bounce_headless() {
     assert!(stdout.contains("renderer handle non-null: true"), "got: {}", stdout);
     // Fixed frame count — the demo self-terminates (real SDL3 emits no QUIT headless).
     assert!(stdout.contains("frames drawn: 60"), "got: {}", stdout);
-    // SDL_RenderReadPixels readback proves real software rendering happened.
-    assert!(stdout.contains("pixel[184,124] = 255,128,0"), "got: {}", stdout);
+    // SDL_RenderReadPixels readback proves real software rendering happened: the readback
+    // pixel inside the ball's final rect equals the fill colour (255,128,0) in XRGB8888
+    // B,G,R order. The ball now follows a vector-velocity path with a per-frame rotation
+    // (vector.lin/matrix.lin), so the final rect — and the sampled pixel — sit at [78,193].
+    assert!(stdout.contains("pixel[78,193] = 255,128,0"), "got: {}", stdout);
     assert!(stdout.contains("rendered pixel matches fill: true"), "got: {}", stdout);
+    // The your-own-C FFI binding (clib/libmathlib.a) is linked into the same binary as the
+    // vendored SDL .so: a `magnitude2` (libm sqrt) distance is computed from the final position.
+    assert!(stdout.contains("distance to centre (via C magnitude2):"), "got: {}", stdout);
     assert!(stdout.contains("done"), "got: {}", stdout);
 }
 
