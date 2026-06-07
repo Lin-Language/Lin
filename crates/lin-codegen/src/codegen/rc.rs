@@ -70,6 +70,18 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.array_release, &[val.into_pointer_value().into()], "");
                 return;
             }
+            // UNBOXED SUM TYPE (unboxed-sumtype Stage 1) → `lin_sumnode_release(ptr, total_size)`.
+            // Stage 1 is scalar-only so this is a refcount decrement + free (no per-field walk).
+            Repr::Packed(lin_ir::repr::Layout::SumNode { sum_ty }) => {
+                let total = Self::sumnode_total_size(sum_ty);
+                let i64_ty = self.context.i64_type();
+                self.builder.call(
+                    self.rt.sumnode_release,
+                    &[val.into_pointer_value().into(), i64_ty.const_int(total, false).into()],
+                    "",
+                );
+                return;
+            }
             // A boxed slot (Opaque OR WrapsPacked-by-pointer): the box is a TaggedVal/LinObject whose
             // release is the tag-dispatched one. WrapsPacked borrows its inner packed buffer; the box
             // shell's release (tagged_release) decrements the inner via the runtime's tag dispatch.
