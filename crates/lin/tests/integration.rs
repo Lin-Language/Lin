@@ -6545,6 +6545,100 @@ print(toString(isOdd(3)))
     assert_eq!(output, vec!["true", "true"]);
 }
 
+// Two MUTUALLY-recursive functions that RETURN A RECORD used to segfault: the first-checked
+// function's `if`-merge result inferred as a spurious `Union([{…}, Named("R")])` (boxed) because a
+// call to the not-yet-checked sibling carried the UNRESOLVED `Named("R")` alias from the forward
+// declaration, while the literal branch carried the structural sealed `{…}`. The function then
+// returned that boxed-union repr, but the sibling actually returns the SEALED PACKED struct → the
+// return-coerce read a packed-struct pointer as a boxed TaggedVal (`lin_unbox_ptr`) → garbage
+// pointer → SIGSEGV. Fix: expand `Named` aliases in a call's resolved return type against the
+// now-resolved env so both sides agree on the packed sealed representation. Self-recursion never
+// hit this (it TCO's — the recursive call is a back-edge, never a record-returning `call`).
+#[test]
+fn test_mutual_recursion_returning_sealed_record() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+type R = { "v": Int32 }
+val f = (n: Int32): R =>
+  if n <= 0 then { "v": 0 } else g(n - 1)
+val g = (n: Int32): R =>
+  if n <= 0 then { "v": 1 } else f(n - 1)
+print(toString(f(5)["v"]))
+print(toString(g(5)["v"]))
+"#);
+    // f(5)→g(4)→f(3)→g(2)→f(1)→g(0)={v:1}; g(5)→f(4)→…→f(0)={v:0}.
+    assert_eq!(output, vec!["1", "0"]);
+}
+
+// Variants of the mutual-recursion-record-return fix: a multi-field sealed record, a boxed record
+// (a `Json` field forces the boxed `LinObject` repr), a `String` return, and a scalar return
+// (the non-record case that always worked — a regression guard). All must round-trip correctly.
+#[test]
+fn test_mutual_recursion_record_return_variants() {
+    // Multi-field sealed record (scalar fields of mixed width).
+    let sealed2 = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type P = { "x": Int32, "y": Float64 }
+val f = (n: Int32): P =>
+  if n <= 0 then { "x": 10, "y": 1.5 } else g(n - 1)
+val g = (n: Int32): P =>
+  if n <= 0 then { "x": 20, "y": 2.5 } else f(n - 1)
+val r = f(5)
+print(toString(r["x"]))
+print(toString(r["y"]))
+"#);
+    assert_eq!(sealed2, vec!["20", "2.5"]);
+
+    // Boxed record: a `Json`-typed field is not a sealed-scalar field, so the record is the
+    // boxed `LinObject` repr — the cross-function return must stay boxed on both sides.
+    let boxed = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type R = { "v": Json }
+val f = (n: Int32): R =>
+  if n <= 0 then { "v": 0 } else g(n - 1)
+val g = (n: Int32): R =>
+  if n <= 0 then { "v": 1 } else f(n - 1)
+print(toString(f(5)["v"]))
+"#);
+    assert_eq!(boxed, vec!["1"]);
+
+    // String return (heap value, not a record).
+    let s = run(r#"import { print } from "std/io"
+val f = (n: Int32): String =>
+  if n <= 0 then "even" else g(n - 1)
+val g = (n: Int32): String =>
+  if n <= 0 then "odd" else f(n - 1)
+print(f(5))
+"#);
+    assert_eq!(s, vec!["odd"]);
+
+    // Scalar return (the always-worked case — regression guard).
+    let scalar = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val f = (n: Int32): Int32 =>
+  if n <= 0 then 0 else g(n - 1)
+val g = (n: Int32): Int32 =>
+  if n <= 0 then 1 else f(n - 1)
+print(toString(f(5)))
+"#);
+    assert_eq!(scalar, vec!["1"]);
+}
+
+// Self-recursion returning a record must still work (it TCO's; this guards against the fix
+// perturbing the single-function path).
+#[test]
+fn test_self_recursion_returning_record_still_works() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type R = { "v": Int32 }
+val f = (n: Int32): R =>
+  if n <= 0 then { "v": 7 } else f(n - 1)
+print(toString(f(5)["v"]))
+"#);
+    assert_eq!(output, vec!["7"]);
+}
+
 #[test]
 fn test_io_lines_reads_all_stdin_lines() {
     let output = run_with_stdin(r#"import { print } from "std/io"
