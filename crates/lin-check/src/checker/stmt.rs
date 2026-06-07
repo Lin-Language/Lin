@@ -103,8 +103,8 @@ impl Checker {
                                 obj_fields.get(&key).cloned().unwrap_or(Type::Null)
                             } else { Type::TypeVar(u32::MAX) };
                             let slot = match &f.pattern {
-                                lin_parse::ast::Pattern::Ident(name, _) => {
-                                    self.env.define(name.clone(), field_ty.clone(), false)
+                                lin_parse::ast::Pattern::Ident(name, name_span) => {
+                                    self.env.define_at(name.clone(), field_ty.clone(), false, Some(*name_span))
                                 }
                                 _ => self.env.define("_".to_string(), field_ty.clone(), false),
                             };
@@ -137,8 +137,8 @@ impl Checker {
                         let mut typed_elements = Vec::new();
                         for (i, elem) in elements.iter().enumerate() {
                             let slot = match elem {
-                                lin_parse::ast::Pattern::Ident(name, _) => {
-                                    self.env.define(name.clone(), elem_ty_inner.clone(), false)
+                                lin_parse::ast::Pattern::Ident(name, name_span) => {
+                                    self.env.define_at(name.clone(), elem_ty_inner.clone(), false, Some(*name_span))
                                 }
                                 _ => self.env.define("_".to_string(), elem_ty_inner.clone(), false),
                             };
@@ -180,6 +180,7 @@ impl Checker {
             }
             Stmt::Var {
                 name,
+                name_span,
                 type_ann,
                 value,
                 span,
@@ -214,7 +215,7 @@ impl Checker {
                          affine resource, used at most once; `var` reassignment would alias it)",
                     ));
                 }
-                let slot = self.env.define(name.clone(), ty.clone(), true);
+                let slot = self.env.define_at(name.clone(), ty.clone(), true, Some(*name_span));
                 // Track mutable globals for the async var-capture check.
                 if self.function_scope_depths.is_empty() {
                     self.mutable_global_slots.insert(slot, name.clone());

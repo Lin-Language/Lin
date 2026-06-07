@@ -2192,3 +2192,107 @@ instead of re-deriving from `Type`.
   the boundary coercions until a repr.rs STEP-4 coercion-insertion pass relocates them. That relocation
   is the remaining single-owner work; the lattice, side table, keep-packed ops, and the two swapped
   decide sites are the parts that landed.
+
+## ADR-063: Stage 3b — whole-program record-representation consistency (the heap-field-array packing unlock)
+
+**Status**: Proposed (design + verification harness; implementation gated on the harness landing first).
+
+**End goal (do not lose sight of this).** The point of Stage 3b is NOT "pack heap-field record
+arrays" for its own sake. It is to let real typed-record-heavy programs — the RAPTOR benchmark being
+the yardstick — keep their hot-path values (`Trip`, `StopTime`, `tripsByRoute: {String: Trip[]}`,
+`trip["stopTimes"][pi]["arrivalTime"]`) in the *packed* representation end-to-end, so field access is
+a constant-offset load and LLVM can optimise across it. Profiling (ADR-062 / [[project_raptor_perf_frontier]])
+measured the gap: a packed typed-record field read is ~70x a `Json` `lin_object_get`, AND the packed
+value is transparent to LLVM (hoist/fold/SROA/dead-elim) whereas `Json` is a total optimisation
+barrier. **Success metric: RAPTOR GROUP/RANGE wall-clock moves materially toward Go/Node (~16s query
+vs Lin's ~390s), with the cross-language digest gate (`group=26203913 range=773022892 journeys=139`)
+byte-identical.** Stage 3b is the enabling representational work; the conversion of the RAPTOR port to
+typed trips + the rebench is the deliverable that proves it.
+
+**Context — this is NOT a from-scratch design; it is the final materialisation of ADR-062.** The
+packed-vs-boxed machinery is already built and coherent: the `Repr` lattice (`crates/lin-ir/src/repr.rs`),
+the per-element-per-field RC primitives and descriptor-driven release (`lin-runtime/src/sealed.rs`,
+`release_sealed_array_elems`, `lin_sealed_array_set`/`_push_struct_retaining`, `sealed_array_materialize_elem`),
+the `BoxKeepPacked`/`UnboxKeepPacked` IR ops (zero-copy box/unbox of a still-packed pointer through a
+`TaggedVal`, already in `ir.rs` + codegen), and the debug-only `verify`/`oracle_check` soundness gates.
+The per-element heap-field RC is ALREADY heap-field-complete and ASan-clean on single-module
+`Person[]`/`Line[]` fixtures (construct/push/field-read/index-set/drop/transfer/`==`/toString/filter/
+map/sortBy). The two historically-cited blockers (field omission; producer/consumer literal drift) are
+CLOSED. So the gate `sealed_array_elem_field_packable` stays scalar-only for exactly ONE reason:
+
+**The remaining blocker (precisely).** WHOLE-PROGRAM record-representation consistency for a record
+reachable as a `{String: T[]}` MAP-VALUE element (the dijkstra `{String: Neighbor[]}` shape, and
+RAPTOR's `tripsByRoute: {String: Trip[]}`). Such a map value is pervasively read into a `T[]|Null`
+union (`match adj[u] is Null => [] else => …`) and then BOTH (a) mutated in place (`push(it, x)` —
+REQUIRES keep-packed-by-pointer, a shared `0xFE` buffer) AND (b) iterated by the generic boxed `for` /
+`lin_array_get_tagged` (REQUIRES a boxed `Object[]`; it reads a `0xFE` buffer's packed structs as
+`TaggedVal`s → heap-field deref crash, or for scalars a silent misread — latent on master). These are
+irreconcilable at ONE map-value representation. The session of 2026-06-07 confirmed the per-op RC is
+sound (8 surrounding RC/correctness bugs found+fixed by exhaustive ASan probing) — the blocker is
+genuinely this representation-consistency question, not RC discipline.
+
+**Decision.**
+1. **Resolve the blocker via mechanism (i): named-full-field-descriptor materialisation in the boxed
+   reader, NOT (ii) a cross-module record-taint pass.** When `lin_array_get_tagged` (and the generic
+   boxed `for`) reads an element out of a `0xFE` packed buffer whose element layout carries a NAMED
+   full-field descriptor, it materialises a keyed `LinObject` view on demand (the descriptor gains
+   field names; today's `elem_desc` is heap-only/nameless). This keeps the map value in ONE packed
+   representation that BOTH in-place mutation (keep-packed) and the boxed reader (materialise-on-read)
+   can consume. Rationale for (i) over (ii): (i) is LOCAL (a runtime LinArray-layout extension +
+   the boxed-reader materialise path — no new whole-program pass, no cross-module type-taint
+   inference, which would be a large new analysis with its own soundness surface and would pessimise
+   any record that touches a map anywhere); (i) composes with the existing `WrapsPacked`/`BoxKeepPacked`
+   machinery the lattice already has; (i) degrades gracefully (a boxed read just pays one materialise,
+   exactly as a `Json` read does today — never a crash). (ii) is reserved as a fallback only if (i)
+   proves to have an unfixable hot-path cost.
+2. **The gate stays a SINGLE source of truth, and Stage 3b lands by DIALING THE GATE, not by adding
+   implementation special-cases.** Consolidate the 4 lockstep mirrors
+   (`Codegen::sealed_array_elem_field_packable` + `lower::is_sealed_array_elem_field_packable` +
+   `monomorphize::field_packed_scalar` + `repr::sealed_array_elem_field_packable`) so three derive from
+   one (with a unit test asserting agreement). The per-shape staging (scalar → +String → +nested
+   record-array) is expressed PURELY as widening that one predicate as the harness proves each shape
+   clean — the descriptor-driven primitives handle every heap-field kind uniformly; there are NO
+   per-shape branches in the RC implementation. This is the line between "incremental landing of a
+   uniform design" and "a million patches".
+3. **The verification harness (below) is built and green BEFORE any representation change, and is the
+   merge gate for every gate-widening step.**
+
+**The verification harness (Phase 1 — build first, independent value).** A generated, exhaustive
+differential + ASan matrix over the cross-product that the hand-written 48 sealed tests only sampled:
+{operation} × {value position} × {field shape}.
+- OPERATIONS: build-literal, factory-return, field-read (scalar + heap), whole-element read (`arr[i]`),
+  index-set, push, array-drop, sort/sortBy/map/filter/reduce/find, pass-by-value arg, **tail-call
+  thread** (the scanRouteAt shape), store-as-map-value, read-from-map-value-then-iterate, nest.
+- POSITIONS: val-binding, call-arg, array-literal element, return expr, push-arg, map-value, union
+  member (`T|Null`), tail-recursive param.
+- FIELD SHAPES: all-scalar, +String, +scalar-array, +record-array (the `Trip{stopTimes:StopTime[]}`
+  shape), +nested-scalar-record, +nested-record-array.
+Each generated program runs in a build/drop LOOP and is checked under ASan **both** `detect_leaks=1`
+(a per-iteration leak SCALES with the loop count; a constant residual is the string-intern cache and
+is fine) **AND** `detect_leaks=0` (no UAF/double-free), PLUS a **run-equivalence** check that the
+packed result equals the boxed-fallback result (force-boxed via a sibling build with the gate off).
+This harness would have caught all 8 bugs fixed on 2026-06-07; it converts "probe and hope" into
+mechanical, terminating coverage and is the standing regression net for the ownership contract below.
+
+**The ownership contract (the invariant the whole representation maintains).** An element slot of a
+packed sealed-record array owns exactly +1 of each heap field. EVERY operation maintains it via ~5
+descriptor-driven primitives — element-construct (retain each heap field), element-read-into-owned
+(retain on materialise/escape; a pure in-place scalar/heap field READ takes none), element-overwrite
+(release-old-fields then retain-new), element-drop / array-drop (`release_sealed_array_elems` walks
+the descriptor), and the keep-packed box/unbox (`BoxKeepPacked`/`UnboxKeepPacked`, RC-neutral pointer
+wrap). No operation hand-codes per-field RC; they all route through these. The remaining
+scanRouteAt-projection TCO-release leak ([[project_raptor_perf_frontier]]) is subsumed here: it is the
+element-read-into-owned + tail-call-thread cell of the matrix, fixed by the same primitive, not a
+separate patch.
+
+**Consequences.**
+- Builds strictly on ADR-062 (the lattice, keep-packed ops, single-owner direction); does not
+  re-decide any of it. The new work is: the named-descriptor runtime extension (i), the boxed-reader
+  materialise-on-read path, the gate consolidation, and the harness.
+- Incremental + safe: the gate is widened one field-shape at a time, each gated on the harness being
+  green for that shape under full ASan + run-equivalence + the corpus staying ≥ its current count
+  (the 72→55 regression of the naive full ungate is structurally prevented — you cannot widen a shape
+  the harness hasn't cleared).
+- If (i)'s on-read materialise proves too costly on a measured hot path, fall back to (ii)
+  (cross-module record-taint) for the specific record, OR keep that record boxed (today's behaviour) —
+  never a correctness compromise.

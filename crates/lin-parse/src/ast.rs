@@ -17,6 +17,9 @@ pub enum Stmt {
     },
     Var {
         name: String,
+        /// Span of the bound identifier itself (not the `var` keyword). Used by the checker to
+        /// record a `def_span` so find-references/rename can group the binding's uses.
+        name_span: Span,
         type_ann: Option<TypeExpr>,
         value: Expr,
         exported: bool,
