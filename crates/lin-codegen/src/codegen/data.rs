@@ -1219,6 +1219,59 @@ impl<'ctx> Codegen<'ctx> {
         out
     }
 
+    /// Widen/convert a FLAT scalar array (`UInt8[]`, `Int32[]`, `Float32[]`, …) to a flat scalar
+    /// array of a DIFFERENT element type (`from_elem` → `to_elem`). A flat array stores its elements
+    /// at the element type's native stride (1 byte for `UInt8`, 4 for `Int32`, …) and tags the buffer
+    /// with that element kind (`elem_tag`). Binding a `UInt8[]` value to an `Int32[]` slot is therefore
+    /// a genuine representation change: reinterpreting the same buffer would read 4 source bytes as one
+    /// i32. Materialize a FRESH `to_elem`-strided buffer, reading each source element at the SOURCE
+    /// stride and storing it widened/converted (sext/zext/sitofp/fpext/… via `compile_ir_coerce`'s
+    /// numeric arm) at the DEST stride. The result is a +1-owned independent array; the source keeps
+    /// its own ownership (released by its own scope).
+    pub(crate) fn flat_array_widen(
+        &mut self,
+        src: BasicValueEnum<'ctx>,
+        from_elem: &Type,
+        to_elem: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        let src_raw = src;
+        let len_fn = self.get_or_declare_fn("lin_array_length", i64_ty.fn_type(&[ptr_ty.into()], false));
+        let len = self.builder.call(len_fn, &[src_raw.into()], "fwiden_len")
+            .try_as_basic_value().unwrap_basic().into_int_value();
+        // Allocate a fresh dest-strided flat buffer with capacity = len (so the fast push path is
+        // taken for every element; the cold grow path is never needed).
+        let to_suffix = Self::flat_suffix(to_elem);
+        let alloc_fn = self.get_or_declare_fn(
+            &format!("lin_flat_array_alloc_{}", to_suffix),
+            ptr_ty.fn_type(&[i64_ty.into()], false));
+        let out = self.builder.call(alloc_fn, &[len.into()], "fwiden_out")
+            .try_as_basic_value().unwrap_basic();
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let head = self.context.append_basic_block(llvm_fn, "fwiden_head");
+        let body = self.context.append_basic_block(llvm_fn, "fwiden_body");
+        let done = self.context.append_basic_block(llvm_fn, "fwiden_done");
+        let idx_slot = self.builder.alloca(i64_ty, "fwiden_i");
+        self.builder.store(idx_slot, i64_ty.const_zero());
+        self.builder.unconditional_branch(head);
+        self.builder.position_at_end(head);
+        let i = self.builder.load(i64_ty, idx_slot, "fwiden_iv").into_int_value();
+        let cond = self.builder.int_compare(IntPredicate::SLT, i, len, "fwiden_cond");
+        self.builder.conditional_branch(cond, body, done);
+        self.builder.position_at_end(body);
+        // Read the element at the SOURCE element type (its native stride), convert to the DEST
+        // scalar (numeric widen/convert), and push at the DEST stride.
+        let elem = self.flat_array_get(src_raw, i, from_elem);
+        let conv = self.compile_ir_coerce(elem, from_elem, to_elem);
+        self.flat_array_push(out, conv, to_elem);
+        let next = self.builder.int_add(i, i64_ty.const_int(1, false), "fwiden_next");
+        self.builder.store(idx_slot, next);
+        self.builder.unconditional_branch(head);
+        self.builder.position_at_end(done);
+        out
+    }
+
     pub(crate) fn sealed_array_project_from(&mut self, src: BasicValueEnum<'ctx>, src_ty: &Type, arr_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();

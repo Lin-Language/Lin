@@ -1925,6 +1925,39 @@ print(toString(c))                 // 0.5
 }
 
 #[test]
+fn test_float_literal_adopts_float32_context() {
+    // A suffixless float literal defaults to Float64, but when the expected/context type is
+    // precisely Float32 it must adopt Float32 — mirroring how a suffixless integer literal
+    // adapts to Int8/UInt8/etc. Previously the checker rejected `val x: Float32 = 0.5` with
+    // "Expected type Float32, got Float64", which then cascaded to "Undefined variable 'x'".
+    // Exercises val-binding, array-literal element, function arg, and function return contexts.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+// (1) val binding context.
+val x: Float32 = 0.5
+print(toString(x))                 // 0.5
+
+// (2) Array-literal element context (Float32[]).
+val xs: Float32[] = [0.5, 0.25]
+print(toString(xs))                // [0.5, 0.25]
+
+// (3) Function argument context: a bare float literal into a Float32 parameter.
+val takesF32 = (v: Float32): Float32 => v
+print(toString(takesF32(0.75)))    // 0.75
+
+// (4) Function return context: a bare float literal body declared Float32.
+val g = (): Float32 => 0.125
+print(toString(g()))               // 0.125
+
+// A bare literal with no Float32 context still defaults to Float64.
+val d = 0.5
+print(toString(d))                 // 0.5
+"#);
+    assert_eq!(output, vec!["0.5", "[0.5, 0.25]", "0.75", "0.125", "0.5"]);
+}
+
+#[test]
 fn test_mixed_int_float_array_literal_widens_elements() {
     // A `[int, ..., float, ...]` literal unifies its element type to Float64 (the checker
     // widens via unify_types), so the array is stored in the FLAT f64 scalar repr. The
@@ -1996,6 +2029,53 @@ print(toString(reduce(floatsB, 0.0, (a, x) => a + x)))  // 800.0
 print(toString(range(0, 1000).map(x => x * 2).filter(x => x % 3 == 0).reduce(0, (a, x) => a + x)))
 "#);
     assert_eq!(output, vec!["50", "1225", "40", "800.0", "333666"]);
+}
+
+#[test]
+fn test_flat_array_widening_bind() {
+    // Binding a flat scalar array to a slot/return of a WIDER scalar element type is a genuine
+    // representation change: a `UInt8[]` stores 1-byte elements, an `Int32[]` 4-byte elements.
+    // Reinterpreting the same buffer would read 4 source bytes as one i32 on every INDEXED access
+    // (the whole-array toString reads the runtime elem_tag and looked correct, but `arr[0]` used the
+    // static dest stride). The fix MATERIALIZES a fresh dest-strided buffer, widening each element
+    // (zext/sext/sitofp/fpext) at the coercion site — so indexed reads and the whole-array view AGREE.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val bytes: UInt8[] = [10, 20, 30, 40]
+val asInt: Int32[] = bytes
+print("whole: ${asInt.toString()}")   // [10, 20, 30, 40]
+print("idx0: ${asInt[0].toString()}") // 10 (was 673059850 — 4 bytes read as one i32)
+print("idx3: ${asInt[3].toString()}") // 40
+
+// Int32[] -> Float64[]: each element converted via sitofp at the bind, both views agree.
+val ints: Int32[] = [1, 2, 3]
+val flts: Float64[] = ints
+print("fidx: ${flts[1].toString()}")   // 2.0
+print("fwhole: ${flts.toString()}")    // [1.0, 2.0, 3.0]
+"#);
+    assert_eq!(
+        output,
+        vec!["whole: [10, 20, 30, 40]", "idx0: 10", "idx3: 40", "fidx: 2.0", "fwhole: [1.0, 2.0, 3.0]"]
+    );
+}
+
+#[test]
+fn test_scalar_float32_widening_return() {
+    // A `Float32` value (`f32FromBe` → LLVM `float`) returned where the function declares `Float64`
+    // (LLVM `double`) must be `fpext`'d at the return. Previously NO coercion was inserted on the
+    // scalar return path (`type_repr_differs` only covers the union/Json box boundary, not a scalar
+    // numeric width change), so codegen emitted invalid LLVM (a `float` operand where the signature
+    // declares `double`) and the verifier aborted. The fix checks `scalar_numeric_repr_differs` on
+    // the return path too, mirroring the binding/slot store — codegen's numeric arm emits the fpext.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { f32FromBe } from "std/bytes"
+val read = (b: UInt8[]): Float64 =>
+  f32FromBe(b, 0)
+val buf: UInt8[] = [63, 0, 0, 0]
+print(read(buf).toString())  // 0.5
+"#);
+    assert_eq!(output, vec!["0.5"]);
 }
 
 #[test]
