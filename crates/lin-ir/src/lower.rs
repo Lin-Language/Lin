@@ -6775,7 +6775,34 @@ fn lower_function_expr_with_id(
             ret_ty: Type::Null,
         });
     }
-    let raw_ret = lower_expr(body, &mut inner_builder, ctx);
+    // RETURN-position sealed-literal fast path (sealed-records Stage 1). When the body IS an object
+    // LITERAL whose declared return type is a sealed scalar record, construct the packed struct
+    // DIRECTLY (`try_lower_sealed_literal`) instead of lowering a boxed `lin_object_alloc` and then
+    // emitting a project-into-sealed `Coerce` at the return site (below). The boxed path left the
+    // boxed `LinObject` intermediate ORPHANED — `pop_scope_releasing_keep(&[ret_temp, raw_ret])`
+    // keeps `raw_ret` (the box) on the assumption it backs the return value, but the actual return
+    // value is the FRESH sealed struct the Coerce materialized, so the box (+ its String field[s])
+    // leaked on EVERY call. The fast path produces the sealed struct as `raw_ret` itself (already
+    // `register_owned`'d), so there is no box, no return-coercion, and no leak. Only fires when the
+    // effective return target IS the sealed record: anonymous closures use the boxed (TypeVar) ABI
+    // and so fall through to the boxed path (where the boxed-object result is correct). The
+    // `effective_ret` here MUST match the one recomputed below (same inputs, all known pre-body).
+    let void_ret_pre = matches!(ret_type, Type::Null | Type::Never);
+    let effective_ret_pre = if let Some(fr) = forced_ret {
+        fr.clone()
+    } else if forced_fid.is_none() && !void_ret_pre {
+        Type::TypeVar(u32::MAX)
+    } else {
+        ret_type.clone()
+    };
+    let raw_ret = if is_sealed_scalar_repr(&effective_ret_pre) {
+        match try_lower_sealed_literal(body, &effective_ret_pre, &mut inner_builder, ctx) {
+            Some(t) => t,
+            None => lower_expr(body, &mut inner_builder, ctx),
+        }
+    } else {
+        lower_expr(body, &mut inner_builder, ctx)
+    };
     // Use the lowered temp's ACTUAL type for the return coercion, not the surface
     // `body.ty()`. They can disagree when the body reads a mutably-captured `var` whose
     // declared type was widened by reassignment: e.g. `var found = null; ...; found` has
