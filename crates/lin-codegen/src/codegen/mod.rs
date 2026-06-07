@@ -32,6 +32,9 @@ mod data;
 mod intrinsics;
 mod rc;
 mod r#match;
+mod debug_info;
+
+use debug_info::DebugInfoState;
 
 pub struct Codegen<'ctx> {
     context: &'ctx Context,
@@ -89,10 +92,17 @@ pub struct Codegen<'ctx> {
     /// any function reachable from a thunk — and any function can be (ADR-027, doc §2.4.3
     /// option a). Conservatively program-wide; the non-async hot path keeps `nounwind`.
     uses_async: bool,
+    /// `--debug`: emit DWARF line tables for source-level debugging. When false (the default) no
+    /// debug metadata is produced and codegen output is byte-identical to a normal build.
+    debug: bool,
+    /// DWARF state for the module being compiled. `Some` only in `--debug` builds, once the main
+    /// module's source path is known (`init_debug_info`). Owns the `DebugInfoBuilder`/`DICompileUnit`
+    /// and the per-function `DISubprogram` scopes used to attach `DILocation`s.
+    debug_info: Option<DebugInfoState<'ctx>>,
 }
 
 impl<'ctx> Codegen<'ctx> {
-    pub fn new(context: &'ctx Context, module_name: &str, coverage_enabled: bool) -> Self {
+    pub fn new(context: &'ctx Context, module_name: &str, coverage_enabled: bool, debug: bool) -> Self {
         let module = context.create_module(module_name);
         let builder = context.create_builder();
 
@@ -127,6 +137,25 @@ impl<'ctx> Codegen<'ctx> {
             current_source: None,
             cls_descriptors: HashMap::new(),
             cov_import_file_idx: HashMap::new(),
+            debug,
+            debug_info: None,
+        }
+    }
+
+    /// Initialise DWARF debug info for the main module (no-op unless `--debug`). Must be called
+    /// before any function is compiled so subprograms can be declared. `abs_path` should be the
+    /// canonical absolute path of the `.lin` file and `text` its source (for line mapping).
+    pub fn init_debug_info(&mut self, abs_path: &str, text: &str) {
+        if self.debug {
+            self.debug_info = Some(DebugInfoState::new(self.context, &self.module, abs_path, text));
+        }
+    }
+
+    /// Finalise DWARF metadata (no-op unless `--debug`). Call after all modules are compiled and
+    /// before object emission.
+    pub fn finalize_debug_info(&mut self) {
+        if let Some(di) = &self.debug_info {
+            di.finalize();
         }
     }
 
@@ -535,10 +564,14 @@ impl<'ctx> Codegen<'ctx> {
         llvm_ty: inkwell::types::BasicTypeEnum<'ctx>,
         slot: usize,
         immutable: bool,
+        debug: bool,
     ) -> inkwell::values::GlobalValue<'ctx> {
         let g = module.add_global(llvm_ty, None, &format!("_ir_gv_{}", slot));
         g.set_initializer(&llvm_ty.const_zero());
-        if immutable {
+        // In `--debug` builds keep `val` globals at DEFAULT (external) linkage so they remain named,
+        // unfolded symbols the debugger can resolve and inspect. The Internal-linkage perf win
+        // (constant-folding a single-store immutable global) would otherwise erase the symbol.
+        if immutable && !debug {
             g.set_linkage(inkwell::module::Linkage::Internal);
         }
         g
@@ -602,6 +635,27 @@ impl<'ctx> Codegen<'ctx> {
             self.named_fns.insert(name.clone(), llvm_fn);
             ir_fn_to_llvm.insert(func.id, llvm_fn);
             ir_fn_symbol.insert(func.id, name.clone());
+
+            // DWARF (--debug): declare a DISubprogram for this function and attach it. Only for the
+            // MAIN module (empty anon prefix) — that is the source registered in `debug_info`. The
+            // function's declaration offset is the entry block's source span start (set by the
+            // lowerer), else the first span-carrying instruction, else 0.
+            if self.ir_anon_prefix.is_empty() {
+                if let Some(di) = &mut self.debug_info {
+                    let def_offset = func
+                        .blocks
+                        .first()
+                        .and_then(|b| b.span.map(|s| s.start))
+                        .or_else(|| {
+                            func.blocks
+                                .iter()
+                                .flat_map(|b| b.instr_spans.iter())
+                                .find_map(|s| s.map(|sp| sp.start))
+                        })
+                        .unwrap_or(0);
+                    di.declare_function(self.context, func.id, llvm_fn, &name, def_offset);
+                }
+            }
         }
 
         // ---- Pass 1b: build default-argument descriptor globals ----
@@ -832,7 +886,19 @@ impl<'ctx> Codegen<'ctx> {
                     self.builder.store(gep, inc);
                 }
 
-                for instr in &block.instructions {
+                for (instr_idx, instr) in block.instructions.iter().enumerate() {
+                    // DWARF (--debug): attach this instruction's source line. The lowerer stamped a
+                    // span per instruction in `instr_spans` (parallel to `instructions`); convert it
+                    // to a DILocation scoped to this function's subprogram and set it as current so
+                    // the machine instructions emitted below map back to the `.lin` line. No-op for
+                    // non-debug builds (debug_info is None) or instructions without a span.
+                    if let Some(di) = &self.debug_info {
+                        if let Some(Some(span)) = block.instr_spans.get(instr_idx) {
+                            if let Some(loc) = di.location_for(self.context, func.id, span.start) {
+                                self.builder.set_current_debug_location(loc);
+                            }
+                        }
+                    }
                     match instr {
                         Instruction::Const { dst, val } => {
                             let llvm_val = match val {
@@ -1897,8 +1963,9 @@ impl<'ctx> Codegen<'ctx> {
                         Instruction::GlobalValSet { slot, value, ty, immutable } => {
                             if let Some(&v) = temp_map.get(value) {
                                 let llvm_ty = self.llvm_type(ty);
+                                let debug = self.debug;
                                 let glob = *ir_global_vals.entry(*slot).or_insert_with(|| {
-                                    Self::add_module_global(&self.module, llvm_ty, *slot, *immutable)
+                                    Self::add_module_global(&self.module, llvm_ty, *slot, *immutable, debug)
                                 });
                                 // A top-level `var` global owns one reference to its current
                                 // value. On reassignment its previous reference must be dropped,
@@ -1920,8 +1987,9 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::GlobalValGet { dst, slot, ty, immutable } => {
                             let llvm_ty = self.llvm_type(ty);
+                            let debug = self.debug;
                             let glob = *ir_global_vals.entry(*slot).or_insert_with(|| {
-                                Self::add_module_global(&self.module, llvm_ty, *slot, *immutable)
+                                Self::add_module_global(&self.module, llvm_ty, *slot, *immutable, debug)
                             });
                             let v = self.builder.load(llvm_ty, glob.as_pointer_value(), "ir_gvget");
                             temp_map.insert(*dst, v);
