@@ -5602,6 +5602,17 @@ fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder,
             obj_ty: arr_ty.clone(), key_ty: Type::Int64, result_ty: read_elem_ty.clone(),
         });
         let elem = coerce_arg_to_param_repr(elem_raw, &read_elem_ty, &elem_ty, builder);
+        // When the source is read via the tagged path (`read_elem_ty` is the boxed wildcard —
+        // a `[]`+push array not provably flat), `Index` → `lin_array_get_tagged` returns a FRESH
+        // +1 box that the `Coerce` above unboxes to the flat scalar `elem`. That box is then dead;
+        // reclaim its shell (mirrors `lower_for`'s per-iteration element-box reclaim) or it leaks
+        // one box PER ELEMENT, PER SORT (the ~16 B/elem `sort` result leak). `lower_sort` is gated
+        // to flat-scalar elements, so the box has no heap inner — freeing the shell fully reclaims
+        // it and is a documented no-op on cached small-int/bool boxes. Guarded `IfDistinct` so a
+        // no-op coerce (already-flat read, `elem == elem_raw`) never double-frees a live value.
+        if is_union_ty(&read_elem_ty) {
+            builder.emit(Instruction::FreeBoxShellIfDistinct { val: elem_raw, other: elem });
+        }
         let pd1 = builder.alloc_temp(Type::Null);
         builder.emit(Instruction::CallIntrinsic { dst: pd1, intrinsic: Intrinsic::FlatArrayPush(flat), args: vec![out, elem], ret_ty: Type::Null });
         let pd2 = builder.alloc_temp(Type::Null);

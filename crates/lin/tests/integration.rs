@@ -1925,6 +1925,39 @@ print(toString(c))                 // 0.5
 }
 
 #[test]
+fn test_float_literal_adopts_float32_context() {
+    // A suffixless float literal defaults to Float64, but when the expected/context type is
+    // precisely Float32 it must adopt Float32 — mirroring how a suffixless integer literal
+    // adapts to Int8/UInt8/etc. Previously the checker rejected `val x: Float32 = 0.5` with
+    // "Expected type Float32, got Float64", which then cascaded to "Undefined variable 'x'".
+    // Exercises val-binding, array-literal element, function arg, and function return contexts.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+// (1) val binding context.
+val x: Float32 = 0.5
+print(toString(x))                 // 0.5
+
+// (2) Array-literal element context (Float32[]).
+val xs: Float32[] = [0.5, 0.25]
+print(toString(xs))                // [0.5, 0.25]
+
+// (3) Function argument context: a bare float literal into a Float32 parameter.
+val takesF32 = (v: Float32): Float32 => v
+print(toString(takesF32(0.75)))    // 0.75
+
+// (4) Function return context: a bare float literal body declared Float32.
+val g = (): Float32 => 0.125
+print(toString(g()))               // 0.125
+
+// A bare literal with no Float32 context still defaults to Float64.
+val d = 0.5
+print(toString(d))                 // 0.5
+"#);
+    assert_eq!(output, vec!["0.5", "[0.5, 0.25]", "0.75", "0.125", "0.5"]);
+}
+
+#[test]
 fn test_mixed_int_float_array_literal_widens_elements() {
     // A `[int, ..., float, ...]` literal unifies its element type to Float64 (the checker
     // widens via unify_types), so the array is stored in the FLAT f64 scalar repr. The
@@ -9062,6 +9095,30 @@ push(sorted, "s")
         err.contains("String") && err.contains("Int32"),
         "push(sortedIntArr, \"s\") must be an element-type error, got: {err}"
     );
+}
+
+// `sort` over a `[]`+push (tagged-read) array sorts correctly. The inline scalar-sort fast path
+// reads each source element via the representation-agnostic tagged path (`lin_array_get_tagged`),
+// which returns a fresh +1 box that the copy-in loop unboxes to the flat buffer; that box must be
+// reclaimed per element (it was leaked one box/element/sort — the ~16 B/elem `sort` result leak).
+// This asserts correctness of that path; the leak itself is gated by the ASan harness.
+#[test]
+fn test_sort_over_push_built_array_correct() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { sort, push, length } from "std/array"
+val xs: Int32[] = []
+push(xs, 5)
+push(xs, 2)
+push(xs, 8)
+push(xs, 1)
+push(xs, 9)
+push(xs, 3)
+val sorted = sort(xs, (a, b) => a - b)
+print(toString(sorted))
+print(toString(length(sorted)))
+"#);
+    assert_eq!(out, vec!["[1, 2, 3, 5, 8, 9]", "6"]);
 }
 
 // `minBy`/`maxBy`/`sortBy` over an OBJECT array still work as before (the genericization keeps the

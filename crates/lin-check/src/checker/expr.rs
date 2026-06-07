@@ -28,6 +28,18 @@ impl Checker {
             }
         }
 
+        // Float literal against an expected `Float32`. A suffixless float literal infers to
+        // `Float64` by default (spec §21), but when the context type is precisely `Float32`
+        // it adopts that width — mirroring the suffixless integer-literal rule above. A
+        // *suffixed* float literal pins its own type and falls through to `infer_expr`. The
+        // default (no expected type, or expected `Float64`/`Number`) is unchanged: only an
+        // exact `Float32` context re-types the literal.
+        if let Expr::FloatLit(v, None, span) = expr {
+            if matches!(expected, Type::Float32) {
+                return Ok(TypedExpr::FloatLit(*v, Type::Float32, *span));
+            }
+        }
+
         // Array literals: push the expected element type into each element so suffixless
         // integer literals adopt the correct width (and so the produced MakeArray carries the
         // expected element representation, matching the slot type at codegen). Mirrors the
