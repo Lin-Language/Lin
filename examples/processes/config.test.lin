@@ -1,0 +1,27 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { loadConfig } from "./config"
+import { getEnv } from "std/env"
+
+// Unit tests for environment-driven configuration. `getEnv` is mocked with `replace`
+// (ADR-046) so the tests are hermetic — they assert how the runner interprets a given
+// environment without touching the real process environment. The mock answers from a
+// fixed table; an unset var is `null`, exactly as the real `getEnv` would report it.
+replace getEnv = (name: String): String | Null =>
+  if name == "PROCESSES_MAX_PARALLEL" then
+    "8"
+  else if name == "PROCESSES_RETRIES" then
+    "5"
+  else if name == "CI" then
+    "1"
+
+val s = suite("config", [
+  test("reads max-parallel, retries and the CI flag from the environment", () =>
+    val c = loadConfig()
+    [
+      expect(c["maxParallel"]).toBe(8),
+      expect(c["retries"]).toBe(5),
+      expect(c["ci"]).toBe(true)
+    ]
+  )
+])
+run(s)

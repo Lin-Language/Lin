@@ -1,42 +1,51 @@
-// task.lin — define a build/check task and run it as a subprocess.
+// task.lin — define a build/check step and run it as a subprocess.
 //
 // A Task is a named external command. `runTask` executes it with std/process.exec,
-// waits for completion, and classifies the outcome into a TaskResult the report
-// module summarizes. A task that cannot even be launched (exec returns an Error) is
-// reported as a failure with the error message, not a crash.
-import { exec } from "std/process"
+// waits for completion, and classifies the outcome into a TaskResult the scheduler and
+// report modules consume. `exec` returns `ExecResult | Error` (an Error when the command
+// cannot even be launched); we narrow that union immediately — capturing the message on
+// the Error arm and the `ExecResult` on the success arm — so no dynamic value escapes
+// into this module's own types. A task that cannot be launched becomes an "error"
+// outcome, never a crash.
+import { exec, ExecResult } from "std/process"
 import { trim } from "std/string"
-import { length, push } from "std/array"
+import { push, length } from "std/array"
 
 export type Task = { "name": String, "command": String, "args": String[] }
 
 // outcome: "pass" (exit 0) | "fail" (non-zero exit) | "error" (could not launch).
 export type TaskResult = { "name": String, "outcome": String, "status": Int32, "output": String }
 
-val isError = (x: Json): Boolean =>
-  x["type"] == "error"
+// Classify a successfully-launched command by its exit status.
+val classify = (name: String, r: ExecResult): TaskResult =>
+  val status = r["status"]
+  {
+    "name": name,
+    "outcome": if status == 0 then "pass" else "fail",
+    "status": status,
+    "output": r["stdout"].trim()
+  }
 
-// Run one task to completion and classify it.
+// Build the "could not launch" result, carrying the launch error's message.
+val launchError = (name: String, message: String): TaskResult =>
+  {
+    "name": name,
+    "outcome": "error",
+    "status": 0 - 1,
+    "output": message
+  }
+
+// Run one task to completion and classify it. `exec` is called once and its
+// `ExecResult | Error` union narrowed in place.
 export val runTask = (t: Task): TaskResult =>
   val r = exec(t["command"], t["args"])
-  if isError(r) then
-    {
-      "name": t["name"],
-      "outcome": "error",
-      "status": -1,
-      "output": r["message"]
-    }
-  else
-    val status = r["status"]
-    val outcome = if status == 0 then "pass" else "fail"
-    {
-      "name": t["name"],
-      "outcome": outcome,
-      "status": status,
-      "output": r["stdout"].trim()
-    }
+  match r
+    has { "type": "error", message } => launchError(t["name"], message)
+    is ExecResult => classify(t["name"], r)
+    else => launchError(t["name"], "unknown error")
 
-// Run a list of tasks in order, collecting their results.
+// Run a list of tasks in order, collecting their results. Named-record arrays are built
+// with explicit push recursion here (see the compiler-bug note in README), not `.map`.
 val runFrom = (tasks: Task[], i: Int32, acc: TaskResult[]): TaskResult[] =>
   if i >= length(tasks) then
     acc
