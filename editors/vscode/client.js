@@ -746,7 +746,19 @@ function makeTaskProvider(linBin) {
 // defaulting to the source stem next to the file), builds it with --debug, then returns
 // the CodeLLDB config. Returning a config with a different `type` reroutes the session to
 // that adapter — the documented VS Code mechanism for a "delegating" debugger.
-function makeDebugConfigProvider(linBin) {
+// Absolute path to the lldb pretty-printer script shipped with the extension. Resolved
+// relative to the extension install dir so it works whether the extension is bundled
+// (production VSIX) or running from source (contributor workflow) -- the script lives at
+// `<extensionPath>/formatters/lin_formatters.py` in both layouts.
+function formattersScriptPath(context) {
+  return path.join(context.extensionPath, "formatters", "lin_formatters.py");
+}
+
+// Phase 2 (data formatters): the returned CodeLLDB config carries `initCommands` that import
+// the bundled lldb pretty-printer script. On import the script self-registers `type summary`/
+// `type synthetic` providers (via __lldb_init_module) that decode Lin's boxed runtime values,
+// so the Variables/Watch panels show logical Lin values instead of raw boxed structs.
+function makeDebugConfigProvider(linBin, context) {
   return {
     // Run when launch.json has no Lin config yet (F5 with a .lin file open): synthesize one.
     provideDebugConfigurations() {
@@ -829,6 +841,13 @@ function makeDebugConfigProvider(linBin) {
         stopOnEntry: !!config.stopOnEntry,
         // Surface the source path so CodeLLDB resolves relative DWARF file names if needed.
         sourceLanguages: ["lin"],
+        // Auto-load the Lin lldb pretty-printers so boxed runtime values render as logical Lin
+        // values in the Variables/Watch panels. The script self-registers its summary/synthetic
+        // providers on import (__lldb_init_module). Preserve any user-supplied initCommands.
+        initCommands: [
+          `command script import ${formattersScriptPath(context)}`,
+          ...(Array.isArray(config.initCommands) ? config.initCommands : []),
+        ],
       };
     },
   };
@@ -847,7 +866,7 @@ function activate(context) {
   // Register the Lin debug configuration provider: builds with `lin build --debug` and
   // delegates the actual debug session to CodeLLDB (see makeDebugConfigProvider).
   context.subscriptions.push(
-    debug.registerDebugConfigurationProvider("lin", makeDebugConfigProvider(linBin))
+    debug.registerDebugConfigurationProvider("lin", makeDebugConfigProvider(linBin, context))
   );
 
   // `lin` is available in VS Code's integrated terminal out of the box.

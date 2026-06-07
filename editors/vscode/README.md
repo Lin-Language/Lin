@@ -65,6 +65,19 @@ To debug: open a `.lin` file, set a breakpoint in the gutter, and press **F5**. 
 
 `source` is the `.lin` file built with `--debug`; `program` is the resulting binary that is debugged.
 
+### Inspecting values
+
+When stopped at a breakpoint, the **Variables** and **Watch** panels show *logical Lin values* rather than the raw boxed runtime structs: integers/floats/booleans/`null` inline, strings as quoted text, arrays as `[1, 2, 3]`, and objects as `{ "a": 1, "b": true }` (expandable in the tree). This is done by lldb data formatters (`formatters/lin_formatters.py`) that decode Lin's tagged-value representation; the extension auto-imports them into every debug session via the CodeLLDB `initCommands`. The decoding is read-only — it never calls into the debuggee or mutates refcounts.
+
+> Note: associating Lin *locals* with names/types in the panel automatically depends on richer DWARF (local-variable / type info) emitted by a later phase of the compiler. Until then the formatters are best driven from the **Watch** panel / Debug Console by casting a known address to the runtime value type, e.g. in the Debug Console:
+>
+> ```
+> p (lin_runtime::array::LinArray*)<addr>
+> p (lin_runtime::object::LinObject*)<addr>
+> ```
+>
+> These render through the same formatters that will light up the Variables panel automatically once that compiler phase lands.
+
 ## Requirements
 
 A C linker (`cc`) must be on your `$PATH` to link compiled programs — on macOS this comes with the Xcode Command Line Tools; on Linux install `gcc` or `clang`. No LLVM installation is required; it is bundled inside `lin`.
