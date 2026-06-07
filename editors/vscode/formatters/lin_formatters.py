@@ -781,10 +781,14 @@ class TaggedValSynth(object):
 #
 # We register against the runtime's Rust type names (what lldb actually sees in the
 # DWARF emitted by the linked lin-runtime static lib) AND the bare struct names, so
-# the formatters apply whether lldb reports a qualified or unqualified type. Once
-# Phase 3 emits DILocalVariable/DIType for Lin locals as TaggedVal, those locals pick
-# these up automatically; until then they are usable via expressions / casts (see the
-# Testing recipe in editors/vscode/README or the worktree report).
+# the formatters apply whether lldb reports a qualified or unqualified type. Phase 3
+# emits a `DILocalVariable` for every Lin `val`/`var`/param typed as a pointer to one
+# of these structs (`LinString *`, `LinArray *`, `LinObject *`, or the `TaggedVal *`
+# fallback), so in a `--debug` build `frame variable` / the VSCode Variables panel show
+# those locals by their Lin source name, auto-rendered by these formatters (lldb cascades
+# a summary registered on `T` through a single `T *` pointer level, which is exactly the
+# shape Phase 3 emits). The summary functions also accept a pointer SBValue directly
+# (see `taggedval_addr`), so the cascade and explicit `expr`/cast paths both work.
 
 _MODULE = "lin_formatters"
 
