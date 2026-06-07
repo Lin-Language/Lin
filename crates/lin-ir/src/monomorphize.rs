@@ -644,6 +644,8 @@ fn monomorphize_inner(
     //    substituting its quantified TypeVars, then re-running the call rewriter over the body
     //    (which may mint further specializations — pushed back onto the worklist). Fixpoint.
     let mut materialized: Vec<TypedStmt> = Vec::new();
+    // Coverage attribution for cross-module specializations: spec slot → origin module path.
+    let mut spec_origins: HashMap<usize, String> = HashMap::new();
     while let Some(key) = state.worklist.pop() {
         let (generic_slot, spec_slot, spec_name, subs) = {
             let info = &state.specs[&key];
@@ -669,6 +671,14 @@ fn monomorphize_inner(
         // Re-monomorphize calls inside the now-concrete body (worklist fixpoint).
         rewrite_expr(&mut func, &mut state);
         let ty = func.ty();
+        // Coverage: a CROSS-MODULE specialization's body was cloned from `origin`; its block spans
+        // index into the ORIGIN module's source, not the importer's. Record the origin path so
+        // lowering can stamp it on the spec's LinFunction and codegen attributes the spec's regions
+        // to the generic definition's file (otherwise the imported generic reports 0% coverage even
+        // though its instances run).
+        if let Some(origin_path) = &origin {
+            spec_origins.insert(spec_slot, origin_path.clone());
+        }
         materialized.push(TypedStmt::Val {
             slot: spec_slot,
             name: Some(spec_name),
@@ -746,6 +756,7 @@ fn monomorphize_inner(
     let mut final_stmts = rehomed;
     final_stmts.extend(stmts);
     module.statements = final_stmts;
+    module.spec_origins = spec_origins;
     state.diagnostics
 }
 

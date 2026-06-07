@@ -598,6 +598,7 @@ mod tests {
             temp_count: 3,
             intrinsic_slots: std::collections::HashMap::new(),
             repr: Vec::new(),
+            coverage_origin: None,
         }
     }
 
@@ -638,6 +639,7 @@ mod tests {
             temp_count: 3,
             intrinsic_slots: std::collections::HashMap::new(),
             repr: Vec::new(),
+            coverage_origin: None,
         }
     }
 
@@ -687,6 +689,7 @@ mod tests {
             temp_count: 3,
             intrinsic_slots: std::collections::HashMap::new(),
             repr: Vec::new(),
+            coverage_origin: None,
         }
     }
 
@@ -1036,6 +1039,7 @@ mod tests {
             temp_count: 2,
             intrinsic_slots: std::collections::HashMap::new(),
             repr: Vec::new(),
+            coverage_origin: None,
         };
         let mut module = make_module(func);
         elide_rc(&mut module);

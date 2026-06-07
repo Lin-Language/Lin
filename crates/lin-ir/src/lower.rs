@@ -164,6 +164,11 @@ pub fn lower_module_with_imports(
         ctx.functions.push(pending);
     }
 
+    // Coverage: stamp each cross-module specialization's origin module path onto its LinFunction so
+    // codegen attributes the spec's regions to the generic definition's source file. `spec_origins`
+    // is keyed by the spec's top-level slot; `global_fn_slots` maps that to its FuncId.
+    set_coverage_origins(&mut ctx.functions, &global_fn_slots, &module.spec_origins);
+
     let lin_module = LinModule {
         functions: ctx.functions,
         global_fn_slots,
@@ -171,6 +176,30 @@ pub fn lower_module_with_imports(
         default_descriptors: ctx.default_descriptors,
     };
     (lin_module, diagnostics)
+}
+
+/// Stamp `LinFunction.coverage_origin` for cross-module monomorphized specializations. `spec_origins`
+/// maps each specialization's top-level `val` slot to its origin module path; `global_fn_slots` maps
+/// that slot to the FuncId of the emitted function. Shared by the main and import lowering paths.
+fn set_coverage_origins(
+    functions: &mut [LinFunction],
+    global_fn_slots: &HashMap<usize, FuncId>,
+    spec_origins: &HashMap<usize, String>,
+) {
+    if spec_origins.is_empty() {
+        return;
+    }
+    let mut fid_origin: HashMap<FuncId, String> = HashMap::new();
+    for (slot, origin) in spec_origins {
+        if let Some(&fid) = global_fn_slots.get(slot) {
+            fid_origin.insert(fid, origin.clone());
+        }
+    }
+    for f in functions.iter_mut() {
+        if let Some(origin) = fid_origin.get(&f.id) {
+            f.coverage_origin = Some(origin.clone());
+        }
+    }
 }
 
 /// Lower an IMPORTED TypedModule to a LinModule for the IR pipeline.
@@ -482,6 +511,10 @@ pub fn lower_import_module_with_imports(
     while let Some(pending) = ctx.pending_functions.pop() {
         ctx.functions.push(pending);
     }
+
+    // Coverage: stamp cross-module specialization origins (this import may itself specialize a
+    // generic from a further module, e.g. `examples/report` → `std/array.reduce`).
+    set_coverage_origins(&mut ctx.functions, &global_fn_slots, &module.spec_origins);
 
     LinModule {
         functions: ctx.functions,
@@ -836,6 +869,7 @@ impl FuncBuilder {
             temp_count: self.temp_count,
             intrinsic_slots: self.intrinsic_slots.clone(),
             repr: Vec::new(),
+            coverage_origin: None,
         }
     }
 
@@ -1146,12 +1180,23 @@ impl FuncBuilder {
                 to_release.push((*t, ty.clone()));
             }
         }
-        // Release each scheduled temp. Non-arg owned temps are still released exactly once (dedup),
-        // preserving prior behavior; pass-through-param and redundant-keep registrations are
-        // released once PER registration (one per surplus read-retain).
+        // Release each scheduled temp. Non-arg owned temps are released ONCE (dedup), preserving
+        // prior behavior — EXCEPT a SEALED SCALAR RECORD temp, which is released once PER
+        // REGISTRATION. A fresh `val cur: Trip = {…}` / `= arr[i]` source struct threaded into a
+        // `Trip | Null` tail param accrues TWO genuine owned references — the alloc/projection (+1)
+        // AND `coerce_and_own_store`'s `own_for_store` RETAIN at the binding (+1) — each with its own
+        // scope registration. In straight-line code both are released at scope exit (balanced); on a
+        // TCO back-edge the dedup released only ONE, leaking the surplus packed struct (and its heap
+        // fields) every iteration — the `Trip | Null` sealed-record-union tail-param per-iteration
+        // leak. Both of a sealed record's retains are GENUINE (`own_for_store`/field retains, never a
+        // read-retain rc_elide pairs on the tail path), so releasing per registration is balanced.
+        // The gate is restricted to sealed-packed records precisely because BOXED (Json/union/object)
+        // temps DO accrue rc_elide-elided read-retain duplicates, where per-registration release
+        // over-releases (a use-after-free in calc's `parseTermLoop`) — those keep the dedup.
         let mut non_arg_seen: Vec<Temp> = Vec::new();
         for (t, ty) in to_release {
-            if !args.contains(&t) {
+            let per_registration = is_sealed_scalar_repr(&ty);
+            if !args.contains(&t) && !per_registration {
                 if non_arg_seen.contains(&t) {
                     continue;
                 }
@@ -1316,6 +1361,22 @@ fn sealed_array_arg_materialized(arg_ty: &Type, param_ty: &Type) -> bool {
     is_sealed_scalar_array(arg_ty)
         && !is_sealed_scalar_array(param_ty)
         && (is_union_ty(param_ty) || param_elem_is_boxed_repr(param_ty))
+}
+
+/// True when a SEALED SCALAR RECORD argument (packed struct, e.g. `cur: Trip`) flowing into a
+/// `Json`/union param is MATERIALIZED at the call boundary to a FRESH boxed `LinObject` wrapped in a
+/// `TaggedVal*` (`box_object(materialize(struct))`). Exactly the scalar analogue of
+/// `sealed_array_arg_materialized`: the materialized object is FULLY OWNED (its fields freshly
+/// retained out of the source struct) and the callee BORROWS the box, so the caller must FULLY
+/// release it right after the call (box shell + inner LinObject + its field references) — NOT just
+/// free the box shell. Freeing only the shell (the `arg_box_is_caller_owned_shell` path) leaks the
+/// materialized object every call — the `Trip | Null` (sealed-record-union) param leak, ASan-
+/// confirmed. This fires on the union-boundary Coerce in `lower_coerce_arg` (the `is_union_ty(param)
+/// != is_union_ty(arg)` arm), so it must mirror that trigger: arg is a sealed scalar record, param
+/// is a union and NOT itself a sealed record. (A sealed→`Named` pass-through is handled earlier and
+/// never reaches the union arm.)
+fn sealed_record_arg_materialized(arg_ty: &Type, param_ty: &Type) -> bool {
+    is_sealed_scalar_repr(arg_ty) && is_union_ty(param_ty) && !is_union_ty(arg_ty)
 }
 
 /// True when `ty` is an array whose ELEMENTS (transitively) contain a sealed-record array or a sealed
@@ -1774,12 +1835,14 @@ fn is_heap_ty(ty: &Type) -> bool {
 /// belongs to someone else) and scalar args (cached boxes).
 fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool {
     match param_ty {
-        // A SEALED-RECORD ARRAY boxed into a Json param MATERIALIZES a FRESH tagged Object[] (inner
-        // is NOT borrowed), so freeing only the shell would leak the fresh inner array + element
-        // objects. It is fully released via the owning model instead (see the call-arg loop), so it
-        // is NOT a shell-only box.
+        // A SEALED-RECORD ARRAY *or a SEALED SCALAR RECORD* boxed into a Json param MATERIALIZES a
+        // FRESH inner heap value (a tagged `Object[]` for the array; a `box_object(LinObject)` for the
+        // record) whose inner is NOT borrowed, so freeing only the shell would leak the fresh inner
+        // array/object + its element/field references. Both are FULLY released via the owning model
+        // instead (see the call-arg loop's `full_release_boxes`), so neither is a shell-only box.
         Some(p) => is_union_ty(p) && !is_union_ty(arg_ty) && is_heap_ty(arg_ty)
-            && !is_sealed_scalar_array(arg_ty),
+            && !is_sealed_scalar_array(arg_ty)
+            && !is_sealed_scalar_repr(arg_ty),
         None => false,
     }
 }
@@ -2559,7 +2622,18 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 // If the slot holds a boxed (Json/union) value but this use wants a concrete
                 // type — e.g. a Json param narrowed to String inside a match arm — unbox it.
                 let stored_ty = builder.temp_types.get(&t).cloned().unwrap_or_else(|| ty.clone());
-                let t = if is_union_ty(&stored_ty) && !is_union_ty(ty) {
+                let narrowed = is_union_ty(&stored_ty) && !is_union_ty(ty);
+                // A union narrowed to a SEALED scalar record is a PROJECTION (`sealed_project_from`):
+                // the Coerce ALLOCATES a FRESH +1 owned struct (retaining the source's heap fields),
+                // NOT a borrowed alias of the box's inner. So it must be registered owned but NOT
+                // additionally retained — the read-retain below is for the borrowed-unbox case (a
+                // union narrowed to String/Array aliases the box's inner heap payload, which the
+                // retain takes a reference to). Retaining a freshly-projected struct adds a +1 that
+                // never balances (only one scope-exit release runs), leaking the struct every read —
+                // the `match trip is Trip => trip["dep"]` arm-narrowing leak (ASan-confirmed, both
+                // recursive and non-recursive).
+                let narrowed_to_sealed = narrowed && is_sealed_scalar_repr(ty);
+                let t = if narrowed {
                     let dst = builder.alloc_temp(ty.clone());
                     builder.emit(Instruction::Coerce {
                         dst, src: t, from_ty: stored_ty, to_ty: ty.clone(),
@@ -2568,8 +2642,11 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 } else {
                     t
                 };
-                // Pessimistically retain heap values on every read — rc_elide removes redundant pairs.
-                if is_rc_type(ty) {
+                if narrowed_to_sealed {
+                    // Fresh +1 projection: register for scope-exit release, no retain.
+                    builder.register_owned(t, ty.clone());
+                } else if is_rc_type(ty) {
+                    // Pessimistically retain heap values on every read — rc_elide removes redundant pairs.
                     builder.emit(Instruction::Retain { val: t, ty: ty.clone() });
                     builder.register_owned(t, ty.clone());
                 }
@@ -3659,7 +3736,8 @@ fn lower_call(
                     // + inner array + element objects), not at function scope exit — the call may be
                     // in a tail-recursive (loop) body where a scope-exit release would leak every
                     // iteration. Other heap args boxed to Json are shell-only (borrowed inner).
-                    if param_tys.get(i).map(|p| sealed_array_arg_materialized(&a.ty(), p)).unwrap_or(false)
+                    if param_tys.get(i).map(|p| sealed_array_arg_materialized(&a.ty(), p)
+                        || sealed_record_arg_materialized(&a.ty(), p)).unwrap_or(false)
                     {
                         full_release_boxes.push((arg, param_tys[i].clone()));
                     } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i))
@@ -3727,7 +3805,8 @@ fn lower_call(
                     // + inner array + element objects), not at function scope exit — the call may be
                     // in a tail-recursive (loop) body where a scope-exit release would leak every
                     // iteration. Other heap args boxed to Json are shell-only (borrowed inner).
-                    if param_tys.get(i).map(|p| sealed_array_arg_materialized(&a.ty(), p)).unwrap_or(false)
+                    if param_tys.get(i).map(|p| sealed_array_arg_materialized(&a.ty(), p)
+                        || sealed_record_arg_materialized(&a.ty(), p)).unwrap_or(false)
                     {
                         full_release_boxes.push((arg, param_tys[i].clone()));
                     } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i))
@@ -3806,6 +3885,9 @@ fn lower_call(
     };
     let mut escape_lits: Vec<Temp> = Vec::new();
     let mut shell_boxes: Vec<Temp> = Vec::new();
+    // Fully-owned arg boxes (sealed-record array/scalar materialized to Json) released right after
+    // the call — matching the named/imported call paths above.
+    let mut full_release_boxes: Vec<(Temp, Type)> = Vec::new();
     let lowered_args: Vec<Temp> = args
         .iter()
         .enumerate()
@@ -3814,13 +3896,20 @@ fn lower_call(
             // combinator, so cb_idx is None (no safe captured-cell context — conservative).
             let (arg, raw_lit) = lower_call_arg_tracked(a, param_tys.get(i), i, None, builder, ctx);
             retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
-            // A concrete heap value (or a non-cached scalar) boxed into a Json/union closure param is
-            // a caller-owned SHELL the closure never releases. Free the shell after the call, like
-            // the named/imported paths. Without this, a fresh literal / large-int / float passed to a
-            // Json closure param leaked its 16-byte box shell every call.
-            if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i))
+            // A sealed-record array OR sealed scalar record boxed into a Json/union param MATERIALIZES
+            // a FRESH fully-owned inner heap value (not a borrowed-inner shell): FULLY release it
+            // (box + inner + element/field refs) right after the call, like the named/imported paths.
+            if param_tys.get(i).map(|p| sealed_array_arg_materialized(&a.ty(), p)
+                || sealed_record_arg_materialized(&a.ty(), p)).unwrap_or(false)
+            {
+                full_release_boxes.push((arg, param_tys[i].clone()));
+            } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i))
                 || arg_box_is_caller_owned_scalar_shell(&a.ty(), param_tys.get(i))
             {
+                // A concrete heap value (or a non-cached scalar) boxed into a Json/union closure param
+                // is a caller-owned SHELL the closure never releases. Free the shell after the call,
+                // like the named/imported paths. Without this, a fresh literal / large-int / float
+                // passed to a Json closure param leaked its 16-byte box shell every call.
                 shell_boxes.push(arg);
             }
             if let Some(lit) = raw_lit {
@@ -3851,6 +3940,9 @@ fn lower_call(
         ret_ty: result_type.clone(),
     });
     free_arg_box_shells(&shell_boxes, dst, builder);
+    for (b, bty) in &full_release_boxes {
+        builder.emit(Instruction::Release { val: *b, ty: bty.clone() });
+    }
     // Concrete rc results are owned (+1) here; a UNION result from an INDIRECT closure call is
     // NOT registered, because the closure return ABI does NOT guarantee +1 for a boxed-union
     // return: a closure whose body yields a borrowed param/local box (e.g. minBy's
