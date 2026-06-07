@@ -1,35 +1,102 @@
-// processes — a small task runner: run a sequence of named shell commands as
-// subprocesses, classify each (pass/fail/error), and print a summary report.
-// A realistic "run my build/check steps" tool exercising std/process (exec),
-// recursion over a task list, and tagged result classification.
+// processes — a realistic task / build-step runner.
+//
+// Reads its configuration from the environment (config.lin → std/env), then runs a list
+// of named external commands (task.lin → std/process) through a concurrent scheduler
+// (scheduler.lin → std/async: parallel + a lock-guarded progress log), giving slow and
+// flaky steps a deadline and retries whose outcome is a Json-free Result (outcome.lin),
+// and finally prints a rolled-up report (report.lin).
+//
+// Tune it from the shell, e.g.:
+//   PROCESSES_MAX_PARALLEL=2 PROCESSES_RETRIES=3 CI=1 lin run examples/processes/main.lin
 //
 // Run:   lin run examples/processes/main.lin
 // Test:  lin test examples/processes/
-import { runAll } from "./task"
+import { Task, TaskResult } from "./task"
+import { loadConfig } from "./config"
+import { runConcurrent, runWithTimeout, runWithRetry, runThen } from "./scheduler"
 import { render } from "./report"
+import { Result, mapOk, unwrapOr } from "./outcome"
 import { print } from "std/io"
+import { toString } from "std/string"
 
-val tasks = [
+// Turn a scheduler Result into a one-line human status: on success, map the TaskResult to
+// its outcome word; on failure, fall back to the failure reason. This is the Result
+// combinators (mapOk + unwrapOr) doing real work in the runner, not just in tests.
+val statusOf = (r: Result<TaskResult, String>): String =>
+  val described: Result<String, String> = mapOk(r, tr => "ok (${tr["outcome"]})")
+  unwrapOr(described, "skipped")
+
+// A typical build pipeline: a few checks plus one step that cannot launch (so the
+// "error" outcome shows up in the report).
+val tasks: Task[] = [
   {
-    "name": "echo",
-    "command": "printf",
-    "args": ["hello"]
-  },
-  {
-    "name": "true",
+    "name": "format",
     "command": "true",
     "args": []
   },
   {
-    "name": "false",
+    "name": "lint",
     "command": "false",
     "args": []
   },
   {
-    "name": "missing",
+    "name": "build",
+    "command": "printf",
+    "args": ["built\n"]
+  },
+  {
+    "name": "deploy",
     "command": "definitely-not-a-real-command-xyz",
     "args": []
   }
 ]
 
-print(render(runAll(tasks)))
+val config = loadConfig()
+print(
+  "config: maxParallel=${toString(config["maxParallel"])} retries=${toString(config["retries"])} ci=${toString(config["ci"])}"
+)
+
+// Run the whole list concurrently, tracking how many steps finished.
+val report = runConcurrent(tasks)
+print(render(report["results"]))
+print("(${toString(report["completed"])} step(s) completed)")
+
+// A deadline'd step: give "build" a generous budget; a Result reports timeout vs done.
+val deadlined = runWithTimeout(
+  {
+    "name": "build",
+    "command": "printf",
+    "args": ["ok\n"]
+  },
+  5000
+)
+print("deadlined build within budget: ${statusOf(deadlined)}")
+
+// A retried step: run a (here, reliable) check up to `config.retries` times.
+val retried = runWithRetry(
+  {
+    "name": "smoke",
+    "command": "true",
+    "args": []
+  },
+  config["retries"]
+)
+print(
+  "smoke test (retried up to ${toString(config["retries"])}x): ${statusOf(retried)}"
+)
+
+// A dependent step: "deploy" runs only if "build" met its deadline.
+val chained = runThen(
+  {
+    "name": "build",
+    "command": "true",
+    "args": []
+  },
+  {
+    "name": "deploy",
+    "command": "true",
+    "args": []
+  },
+  5000
+)
+print("build then deploy: ${statusOf(chained)}")
