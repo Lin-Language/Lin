@@ -870,13 +870,31 @@ impl<'ctx> Codegen<'ctx> {
                             }
                         }
                         Instruction::FreeBoxShellIfDistinct { val, other } => {
-                            if let (Some(&v), Some(&o)) = (temp_map.get(val), temp_map.get(other)) {
-                                if v.is_pointer_value() && o.is_pointer_value() {
-                                    let free_fn = self.get_or_declare_fn(
-                                        "lin_tagged_free_box_if_distinct",
-                                        self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
-                                    );
-                                    self.builder.call(free_fn, &[v.into(), o.into()], "");
+                            if let Some(&v) = temp_map.get(val) {
+                                if v.is_pointer_value() {
+                                    match temp_map.get(other) {
+                                        // `other` is also a pointer: the call result may ALIAS this
+                                        // shell (a callee returning its borrowed Json param), so guard.
+                                        Some(&o) if o.is_pointer_value() => {
+                                            let free_fn = self.get_or_declare_fn(
+                                                "lin_tagged_free_box_if_distinct",
+                                                self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+                                            );
+                                            self.builder.call(free_fn, &[v.into(), o.into()], "");
+                                        }
+                                        // `other` (the call result) is a SCALAR/Null/non-pointer: it
+                                        // can never alias the box shell, so free unconditionally.
+                                        // (Previously this silently skipped the free → shell leak when
+                                        // a fresh heap literal was boxed into a Json param of a function
+                                        // returning a scalar — e.g. `f([1,2,3]): Int32`.)
+                                        _ => {
+                                            let free_fn = self.get_or_declare_fn(
+                                                "lin_tagged_free_box",
+                                                self.context.void_type().fn_type(&[ptr_ty.into()], false),
+                                            );
+                                            self.builder.call(free_fn, &[v.into()], "");
+                                        }
+                                    }
                                 }
                             }
                         }
