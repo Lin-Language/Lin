@@ -1,7 +1,7 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString } from "std/string"
 import { range, for } from "std/iter"
-import { Expr, eval } from "./ast"
+import { Expr, eval, num, binOp, chain } from "./ast"
 
 val leaf3: Expr = { "kind": "num", "value": 3 }
 val leaf4: Expr = { "kind": "num", "value": 4 }
@@ -55,6 +55,34 @@ val s = suite("sumtree", [
       acc = acc + eval(t)
     )
     // sum of (i + 1) for i in 0..4 = 1+2+3+4+5 = 15
+    [expect(acc.toString()).toBe("15")]
+  ),
+
+  test("a tree built+returned from functions evaluates correctly", () =>
+    // The TAIL-RETURN pushdown shape: every node here is built INSIDE a function
+    // (`num`/`binOp`, the latter returning from an if-tail) and returned, then composed.
+    // ((3+4)*(10-6)) = 28 — same value as the inline-built tree above.
+    val t: Expr = binOp(2, binOp(0, num(3), num(4)), binOp(1, num(10), num(6)))
+    [expect(eval(t).toString()).toBe("28")]
+  ),
+
+  // `chain(n)` recursively builds and RETURNS a fresh sub-tree at every level;
+  // evaluating sums its `n` leaf 1's. Guards the tail-return pushdown at depth.
+  test("a recursively built+returned spine evaluates correctly", () =>
+    [
+      expect(eval(chain(1)).toString()).toBe("1"),
+      expect(eval(chain(7)).toString()).toBe("7")
+    ]
+  ),
+
+  test("repeated build-and-return + drop in a loop is leak-free", () =>
+    var acc = 0
+    range(0, 5).for(i =>
+      // Built and returned by `binOp` (if-tail) — the returned tree's children are
+      // unboxed SumNodes that the recursive drop must free exactly once each iteration.
+      val t: Expr = binOp(0, num(i), num(1))
+      acc = acc + eval(t)
+    )
     [expect(acc.toString()).toBe("15")]
   )
 ])
