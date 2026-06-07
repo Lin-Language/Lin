@@ -177,6 +177,7 @@ impl Checker {
                 intrinsics: self.intrinsic_slots.clone(),
                 exported_types,
                 replacements: self.replacements.clone(),
+                spec_origins: std::collections::HashMap::new(),
             };
             // Zonking pass: replace solved TypeVar nodes with their concrete types.
             let subs = self.solved_type_vars.clone();

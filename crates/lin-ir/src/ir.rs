@@ -565,6 +565,13 @@ pub struct LinFunction {
     /// every packed-vs-boxed DECIDE / ASSUME site instead of re-deriving from the static `Type`.
     /// See ADR-062 (`docs/DECISIONS.md`).
     pub repr: Vec<crate::repr::Repr>,
+    /// Coverage attribution origin. `Some(path)` for a CROSS-MODULE monomorphized specialization
+    /// (`name$Int32`) whose body was cloned from another module's generic definition: its block
+    /// spans index into THAT module's source, not the importer being compiled here. Codegen uses
+    /// this to attribute the specialization's coverage regions to the generic definition's file
+    /// (so an imported generic exercised by tests reports real coverage instead of 0%). `None` for
+    /// ordinary functions, whose spans belong to the module currently being compiled.
+    pub coverage_origin: Option<String>,
 }
 
 impl LinFunction {

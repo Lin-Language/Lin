@@ -1062,6 +1062,7 @@ mod tests {
             temp_count,
             intrinsic_slots: HashMap::new(),
             repr: Vec::new(),
+            coverage_origin: None,
         }
     }
 

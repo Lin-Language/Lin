@@ -164,6 +164,11 @@ pub fn lower_module_with_imports(
         ctx.functions.push(pending);
     }
 
+    // Coverage: stamp each cross-module specialization's origin module path onto its LinFunction so
+    // codegen attributes the spec's regions to the generic definition's source file. `spec_origins`
+    // is keyed by the spec's top-level slot; `global_fn_slots` maps that to its FuncId.
+    set_coverage_origins(&mut ctx.functions, &global_fn_slots, &module.spec_origins);
+
     let lin_module = LinModule {
         functions: ctx.functions,
         global_fn_slots,
@@ -171,6 +176,30 @@ pub fn lower_module_with_imports(
         default_descriptors: ctx.default_descriptors,
     };
     (lin_module, diagnostics)
+}
+
+/// Stamp `LinFunction.coverage_origin` for cross-module monomorphized specializations. `spec_origins`
+/// maps each specialization's top-level `val` slot to its origin module path; `global_fn_slots` maps
+/// that slot to the FuncId of the emitted function. Shared by the main and import lowering paths.
+fn set_coverage_origins(
+    functions: &mut [LinFunction],
+    global_fn_slots: &HashMap<usize, FuncId>,
+    spec_origins: &HashMap<usize, String>,
+) {
+    if spec_origins.is_empty() {
+        return;
+    }
+    let mut fid_origin: HashMap<FuncId, String> = HashMap::new();
+    for (slot, origin) in spec_origins {
+        if let Some(&fid) = global_fn_slots.get(slot) {
+            fid_origin.insert(fid, origin.clone());
+        }
+    }
+    for f in functions.iter_mut() {
+        if let Some(origin) = fid_origin.get(&f.id) {
+            f.coverage_origin = Some(origin.clone());
+        }
+    }
 }
 
 /// Lower an IMPORTED TypedModule to a LinModule for the IR pipeline.
@@ -482,6 +511,10 @@ pub fn lower_import_module_with_imports(
     while let Some(pending) = ctx.pending_functions.pop() {
         ctx.functions.push(pending);
     }
+
+    // Coverage: stamp cross-module specialization origins (this import may itself specialize a
+    // generic from a further module, e.g. `examples/report` → `std/array.reduce`).
+    set_coverage_origins(&mut ctx.functions, &global_fn_slots, &module.spec_origins);
 
     LinModule {
         functions: ctx.functions,
@@ -836,6 +869,7 @@ impl FuncBuilder {
             temp_count: self.temp_count,
             intrinsic_slots: self.intrinsic_slots.clone(),
             repr: Vec::new(),
+            coverage_origin: None,
         }
     }
 
@@ -2288,10 +2322,17 @@ fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty: &Type, bui
         && !is_union_ty(value_ty)
         && is_rc_type(value_ty)
         && type_repr_differs(value_ty, slot_ty);
+    // A flat scalar array kind/width change (e.g. UInt8[] → Int32[]) MATERIALIZES a fresh,
+    // independent +1-owned buffer (codegen's `flat_array_widen`) — the source array keeps its own
+    // reference (released by its own scope). Unlike the union-box case the source is NOT consumed,
+    // so leave `t` registered; just register the fresh result so the binding's scope releases it.
+    let made_fresh_array = flat_scalar_array_repr_differs(value_ty, slot_ty);
     let coerced = coerce_to_slot_type(t, value_ty, slot_ty, builder);
     if made_fresh_box {
         // The box now owns the inner's +1; the scope releases the box (freeing shell + inner).
         builder.unregister_owned(t);
+        builder.register_owned(coerced, slot_ty.clone());
+    } else if made_fresh_array && coerced != t {
         builder.register_owned(coerced, slot_ty.clone());
     }
     coerced
@@ -2301,7 +2342,10 @@ fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty: &Type, bui
 /// differ (box concrete → union, or unbox union → concrete). Returns the (possibly new)
 /// temp; a no-op when representations match.
 fn coerce_to_slot_type(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
-    if type_repr_differs(value_ty, slot_ty) || scalar_numeric_repr_differs(value_ty, slot_ty) {
+    if type_repr_differs(value_ty, slot_ty)
+        || scalar_numeric_repr_differs(value_ty, slot_ty)
+        || flat_scalar_array_repr_differs(value_ty, slot_ty)
+    {
         let dst = builder.alloc_temp(slot_ty.clone());
         builder.emit(Instruction::Coerce {
             dst, src: t, from_ty: value_ty.clone(), to_ty: slot_ty.clone(),
@@ -4766,6 +4810,22 @@ fn scalar_numeric_repr_differs(from: &Type, to: &Type) -> bool {
     from.is_float() != to.is_float() || (from.is_float() && to.is_float() && from != to)
 }
 
+/// True when `from` and `to` are FLAT scalar arrays with DIFFERENT element types, so a value of one
+/// must be CONVERTED (a fresh, dest-strided buffer with each element widened) to be used as the
+/// other — NOT a pointer reinterpret. A flat scalar array stores its elements at the element type's
+/// native stride and tags the buffer with that element kind, so binding e.g. a `UInt8[]` value to an
+/// `Int32[]` slot and reinterpreting the pointer would read 4 source bytes as one i32 on every
+/// indexed access (the whole-array `toString` reads the runtime `elem_tag` and so looked correct,
+/// but `arr[0]` uses the static dest stride and did not). Codegen's `compile_ir_coerce` materializes
+/// the converted buffer (`flat_array_widen`). This is the whole-array analogue of
+/// `scalar_numeric_repr_differs` (the mixed-numeric array LITERAL element case).
+fn flat_scalar_array_repr_differs(from: &Type, to: &Type) -> bool {
+    if let (Type::Array(fe), Type::Array(te)) = (from, to) {
+        return fe.is_flat_scalar() && te.is_flat_scalar() && fe != te;
+    }
+    false
+}
+
 /// Box a value to Json (TaggedVal*) if it is a concrete (non-union) type.
 /// `fromJson` decode (ADR-031). Lower the Json value, box it to the tagged representation if
 /// concrete, then emit `CallIntrinsic { FromJson(target) }`. The runtime borrows the input and
@@ -7223,8 +7283,17 @@ fn lower_function_expr_with_id(
     } else {
         ret_type.clone()
     };
+    // A scalar numeric width change on the return path (e.g. a `Float32` body value returned
+    // where the declaration says `Float64`, or a narrower int) is a representation change codegen
+    // must materialize via fpext/fptrunc/sext (`compile_ir_coerce`'s numeric-widening arm), just
+    // like at a binding/slot store (`coerce_to_slot_type`). Without it the raw (e.g. `float`) value
+    // flowed straight into the `Return`/box site and emitted invalid LLVM (a `float` operand where
+    // the signature declares `double`). `type_repr_differs` only covers the union/Json box boundary,
+    // so the scalar-numeric case is checked separately — mirroring `coerce_to_slot_type`.
     let ret_temp = if !inner_builder.is_current_block_terminated()
-        && type_repr_differs(&body_ty, &effective_ret)
+        && (type_repr_differs(&body_ty, &effective_ret)
+            || scalar_numeric_repr_differs(&body_ty, &effective_ret)
+            || flat_scalar_array_repr_differs(&body_ty, &effective_ret))
     {
         let dst = inner_builder.alloc_temp(effective_ret.clone());
         inner_builder.emit(Instruction::Coerce {
