@@ -94,6 +94,10 @@ impl LanguageServer for Backend {
                 code_lens_provider: Some(CodeLensOptions {
                     resolve_provider: Some(false),
                 }),
+                // Fold function bodies, object/array literals, match expressions, import runs.
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                // Smart-expand selection (innermost span outward) from the AST span nesting.
+                selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
                 // Type-aware semantic highlighting (full-document only; the TextMate grammar stays
                 // the fallback for incremental edits).
                 semantic_tokens_provider: Some(
@@ -602,6 +606,44 @@ impl LanguageServer for Backend {
         let mut parser = lin_parse::Parser::new(tokens);
         let module = parser.parse_module();
         Ok(Some(test_code_lenses(&source, uri, &module)))
+    }
+
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> Result<Option<Vec<FoldingRange>>> {
+        let uri = &params.text_document.uri;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let mut lexer = lin_lex::Lexer::new(&source, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = lin_parse::Parser::new(tokens);
+        let module = parser.parse_module();
+        Ok(Some(folding_ranges(&source, &module)))
+    }
+
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        let uri = &params.text_document.uri;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let base_dir = file_dir(uri);
+        let analysis = analyse(&source, base_dir.as_deref());
+        let ranges = params
+            .positions
+            .iter()
+            .map(|pos| {
+                let offset = position_to_offset(&source, *pos);
+                selection_range_at(&source, &analysis.module, offset)
+            })
+            .collect();
+        Ok(Some(ranges))
     }
 
     async fn symbol(
@@ -1785,6 +1827,233 @@ fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::a
         E::TupleArgs(items, _) => { for it in items { f(it); } }
         _ => {}
     }
+}
+
+// ── folding ranges ─────────────────────────────────────────────────────────────
+
+/// Emit folding ranges for multi-line constructs. Two sources:
+///   - consecutive `import` statement runs (collapse into one `Imports` region),
+///     driven off the parsed import statements' start lines;
+///   - every balanced `{}` / `[]` / `(...)` delimiter region (function bodies,
+///     object/array literals, match arms, call arg lists) that spans more than one
+///     line, found by a brace-balance text scan.
+///
+/// The AST spans are single-token markers (the parser records only the opening
+/// delimiter's span), so the delimiter extents are recovered by text scan rather
+/// than from spans — the task explicitly allows brace/indentation-based folding.
+fn folding_ranges(source: &str, module: &lin_parse::ast::Module) -> Vec<FoldingRange> {
+    let mut out = Vec::new();
+
+    // Consecutive `import` statement runs collapse into one region. Each import's span
+    // covers only the `import` keyword, but its start line is all we need here.
+    let mut run_start_line: Option<u32> = None;
+    let mut run_end_line: Option<u32> = None;
+    let flush = |out: &mut Vec<FoldingRange>, s: Option<u32>, e: Option<u32>| {
+        if let (Some(sl), Some(el)) = (s, e) {
+            if el > sl {
+                out.push(FoldingRange {
+                    start_line: sl,
+                    start_character: None,
+                    end_line: el,
+                    end_character: None,
+                    kind: Some(FoldingRangeKind::Imports),
+                    collapsed_text: None,
+                });
+            }
+        }
+    };
+    for stmt in &module.statements {
+        match stmt {
+            Stmt::Import { span, .. } | Stmt::ForeignImport { span, .. } => {
+                let line = offset_to_position(source, span.start as usize).line;
+                if run_start_line.is_none() {
+                    run_start_line = Some(line);
+                }
+                run_end_line = Some(line);
+            }
+            _ => {
+                flush(&mut out, run_start_line.take(), run_end_line.take());
+                run_end_line = None;
+            }
+        }
+    }
+    flush(&mut out, run_start_line.take(), run_end_line.take());
+
+    out.extend(delimiter_folds(source));
+    out
+}
+
+/// Fold every balanced `{}` / `[]` / `(...)` region that spans more than one line.
+/// String literals are skipped so braces inside strings don't unbalance the scan.
+fn delimiter_folds(source: &str) -> Vec<FoldingRange> {
+    let bytes = source.as_bytes();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut out = Vec::new();
+    let mut in_str = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' | b'[' | b'(' => stack.push(i),
+            b'}' | b']' | b')' => {
+                if let Some(open) = stack.pop() {
+                    let sl = offset_to_position(source, open).line;
+                    let el = offset_to_position(source, i).line;
+                    if el > sl {
+                        out.push(FoldingRange {
+                            start_line: sl,
+                            start_character: None,
+                            end_line: el,
+                            end_character: None,
+                            kind: Some(FoldingRangeKind::Region),
+                            collapsed_text: None,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out
+}
+
+// ── selection ranges ───────────────────────────────────────────────────────────
+
+/// Build the smart-expand selection hierarchy at `offset`, innermost → outermost:
+///   1. the identifier/word under the cursor (when on one);
+///   2. each enclosing balanced `{}` / `[]` / `(...)` delimiter region (inner content
+///      first, then the region including its delimiters);
+///   3. the cursor's source line;
+///   4. the whole document.
+///
+/// The parser records only single-token spans for compound expressions (no full
+/// extents), so the expansion is built from balanced-delimiter nesting + the word at
+/// the cursor rather than from AST spans. `module` is currently unused but kept on the
+/// signature so a future AST-span-precise version is a drop-in.
+fn selection_range_at(source: &str, _module: &lin_parse::ast::Module, offset: usize) -> SelectionRange {
+    let offset = offset.min(source.len());
+    // Ordered innermost → outermost list of (start, end) byte ranges.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+
+    // 1. Word under the cursor.
+    let word = word_at(source, offset);
+    if !word.is_empty() {
+        // Recover the word's byte range (word_at expands around offset).
+        let bytes = source.as_bytes();
+        let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+        let mut start = offset;
+        let mut end = offset;
+        while start > 0 && is_word(bytes[start - 1]) {
+            start -= 1;
+        }
+        while end < bytes.len() && is_word(bytes[end]) {
+            end += 1;
+        }
+        ranges.push((start, end));
+    }
+
+    // 2. Enclosing balanced delimiter regions (inner content + with-delimiters).
+    for (open, close) in enclosing_bracket_pairs(source, offset) {
+        // Inner content (between the delimiters).
+        if close > open + 1 {
+            ranges.push((open + 1, close));
+        }
+        // The region including its delimiters.
+        ranges.push((open, close + 1));
+    }
+
+    // 3. The cursor's line.
+    let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end = source[offset..].find('\n').map(|i| offset + i).unwrap_or(source.len());
+    ranges.push((line_start, line_end));
+
+    // 4. Whole document.
+    ranges.push((0, source.len()));
+
+    // De-duplicate while preserving order; keep only ranges that contain the cursor and
+    // strictly grow (so each parent properly contains its child).
+    let mut chain: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in ranges {
+        if s > offset || e < offset {
+            continue;
+        }
+        match chain.last() {
+            Some(&(ps, pe)) if ps == s && pe == e => continue, // duplicate
+            Some(&(ps, pe)) if s >= ps && e <= pe => continue,  // not strictly larger
+            _ => chain.push((s, e)),
+        }
+    }
+    if chain.is_empty() {
+        chain.push((offset, offset));
+    }
+
+    // Build the nested chain from outermost down so the head is innermost.
+    let mut current: Option<SelectionRange> = None;
+    for &(s, e) in chain.iter().rev() {
+        current = Some(SelectionRange {
+            range: Range {
+                start: offset_to_position(source, s),
+                end: offset_to_position(source, e),
+            },
+            parent: current.map(Box::new),
+        });
+    }
+    current.unwrap()
+}
+
+/// All balanced `{}`/`[]`/`()` pairs that enclose `offset`, as `(open_idx, close_idx)`
+/// byte indices, ordered innermost → outermost. String literals are skipped so braces
+/// inside strings don't unbalance the scan.
+fn enclosing_bracket_pairs(source: &str, offset: usize) -> Vec<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut enclosing: Vec<(usize, usize)> = Vec::new();
+    let mut in_str = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' | b'[' | b'(' => stack.push(i),
+            b'}' | b']' | b')' => {
+                if let Some(open) = stack.pop() {
+                    // This pair encloses the cursor when open < offset <= close.
+                    if open < offset && offset <= i {
+                        enclosing.push((open, i));
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // Sort innermost (smallest) → outermost.
+    enclosing.sort_by_key(|(o, c)| c - o);
+    enclosing
 }
 
 // ── signature help ─────────────────────────────────────────────────────────────
@@ -3531,5 +3800,62 @@ mod tests {
         let module = parse(src);
         let lenses = test_code_lenses(src, &dummy_uri(), &module);
         assert!(lenses.is_empty(), "expected no lenses, got {:?}", lenses.len());
+    }
+
+    // ── folding ranges ──────────────────────────────────────────────────────────
+
+    /// Folding ranges cover multi-line function bodies / array literals and a run of
+    /// consecutive imports; single-line constructs produce no fold.
+    #[test]
+    fn folding_range_covers_multiline_blocks_and_imports() {
+        let src = "import { a } from \"std/io\"\n\
+                   import { b } from \"std/array\"\n\
+                   val f = (x: Int32) => {\n\
+                     val y = x + 1\n\
+                     y\n\
+                   }\n\
+                   val arr = [\n\
+                     1,\n\
+                     2,\n\
+                   ]\n";
+        let module = parse(src);
+        let folds = folding_ranges(src, &module);
+        // An import-run fold spanning the two import lines (0..1).
+        assert!(
+            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Imports) && f.start_line == 0 && f.end_line >= 1),
+            "expected an import-run fold, got {:?}",
+            folds
+        );
+        // At least one region fold (function body and/or array literal) spanning >1 line.
+        assert!(
+            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Region) && f.end_line > f.start_line),
+            "expected a multi-line region fold, got {:?}",
+            folds
+        );
+    }
+
+    // ── selection ranges ─────────────────────────────────────────────────────────
+
+    /// Smart-expand: the cursor on an inner identifier yields a nested chain whose
+    /// innermost range is contained in each successive parent.
+    #[test]
+    fn selection_range_nests_innermost_to_outermost() {
+        let src = "val r = add(1, 2)\n";
+        let analysis = analyse(src, None);
+        let off = src.find('1').unwrap();
+        let sel = selection_range_at(src, &analysis.module, off);
+        // Walk the parent chain; each parent range must contain its child range.
+        let mut node = &sel;
+        let mut depth = 0;
+        while let Some(parent) = &node.parent {
+            assert!(
+                parent.range.start <= node.range.start && node.range.end <= parent.range.end,
+                "child range escapes parent at depth {}",
+                depth
+            );
+            node = parent;
+            depth += 1;
+        }
+        assert!(depth >= 1, "expected at least one expansion level");
     }
 }
