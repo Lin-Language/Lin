@@ -4,7 +4,7 @@
 // reduce/sort churn over heap records). Row-parsing lives in parse.test.lin and
 // the end-to-end render lives in integration.test.lin.
 import { expect, toBe, test, suite, run } from "std/test"
-import { validRecords, parseErrors, stats } from "./report"
+import { validRecords, parseErrors, stats, uniqueRecords } from "./report"
 import { length } from "std/array"
 
 val sample = [
@@ -28,6 +28,26 @@ val s = suite("report", [
 
   test("all-invalid input yields zero valid records", () => [
     expect(length(validRecords(["x", "y", "z"]))).toBe(0)
+  ]),
+
+  // --- Deduplication via std/hash structural key ---
+  test("drops exact-duplicate records, keeping first occurrence", () =>
+    val dupes = validRecords(["Alice, 85", "Bob, 92", "Alice, 85", "Bob, 92"])
+    [
+      expect(length(dupes)).toBe(4),
+      expect(length(uniqueRecords(dupes))).toBe(2)
+    ]
+  ),
+
+  test("keeps same-name records with different scores", () =>
+    val rs = validRecords(["Alice, 85", "Alice, 90"])
+    [
+      expect(length(uniqueRecords(rs))).toBe(2)
+    ]
+  ),
+
+  test("uniqueRecords over no duplicates is identity-length", () => [
+    expect(length(uniqueRecords(validRecords(sample)))).toBe(4)
   ]),
 
   // --- Statistics over the valid records ---
