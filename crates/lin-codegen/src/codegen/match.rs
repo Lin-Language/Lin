@@ -305,6 +305,39 @@ impl<'ctx> Codegen<'ctx> {
                 return self.array_coerce_elementwise(val, from_ty, inner_to);
             }
         }
+        // Json/Object → typed map `{ String: T }` (ADR-055). A value reaching a map-typed context
+        // through the Json supertype — an empty object literal `{}`, a `Json` field read, a `Json`
+        // parameter — is physically a `LinObject` (TAG_OBJECT), but the map accessors require a
+        // `LinMap`. Reinterpreting the pointer corrupts the heap (the `lin_map_get`/`_set` crash:
+        // `find_slot` probes a LinObject's bytes as a hash table → infinite-loop / invalid free).
+        // MATERIALIZE a real map from the object's entries instead. Skip when the source is already
+        // a map (`from_ty` is `Type::Map`): that is a verbatim pointer pass-through. The source may
+        // arrive boxed (union/Json TaggedVal*) — unbox to the raw `LinObject*` first. The fresh map
+        // is +1 owned (matching the `register_owned` the lowerer applies to a Coerce result).
+        if matches!(to_ty, Type::Map(_)) && !matches!(from_ty, Type::Map(_)) && val.is_pointer_value() {
+            // The runtime value may be EITHER a real `LinMap` (a `{ String: T }` value flowing
+            // through the Json supertype — e.g. a nested map read as `T|Null`) or a `LinObject` (an
+            // empty object literal, a Json object field). The two have incompatible layouts and the
+            // raw pointer carries no tag, so dispatch on the BOXED value's tag at runtime via
+            // `lin_to_map`: TAG_MAP → retain + return as-is (preserve identity, no copy); TAG_OBJECT
+            // → materialize a fresh `LinMap`. A union source is already a boxed `TaggedVal*`; box a
+            // concrete object source first so `lin_to_map` always has a tag to read.
+            let boxed = if Self::is_union_type(from_ty) {
+                val
+            } else {
+                self.box_value(val, from_ty)
+            };
+            let f = self.get_or_declare_fn("lin_to_map", ptr_ty.fn_type(&[ptr_ty.into()], false));
+            let m = self.builder.call(f, &[boxed.into()], "to_map").try_as_basic_value().unwrap_basic();
+            // If we boxed a concrete source just to read its tag, free that transient box shell
+            // (its inner was not consumed by lin_to_map — the map took its own retains).
+            if !Self::is_union_type(from_ty) && boxed.is_pointer_value() {
+                let free_box = self.get_or_declare_fn("lin_tagged_free_box_if_distinct",
+                    self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                self.builder.call(free_box, &[boxed.into(), m.into()], "");
+            }
+            return m;
+        }
         // Box to union. Use heap boxing (lin_box_*) rather than a stack alloca, because
         // a coerced value may escape its defining function (returned, stored in an array,
         // captured) — a stack TaggedVal would dangle.
