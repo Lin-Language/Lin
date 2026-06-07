@@ -349,20 +349,29 @@ impl<'ctx> Codegen<'ctx> {
             } else {
                 key
             };
-            let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget").try_as_basic_value().unwrap_basic();
             // KEEP-PACKED read-back (repr pass, Stage 4 — THE dijkstra fix): when the map value type
             // is a PACKED sealed array / sealed record, the slot holds a keep-packed handle
             // (BoxKeepPacked stored a TaggedVal over the still-packed buffer). Unbox it as a packed
             // pointer + retain (UnboxKeepPacked) — a fresh +1 owner matching what the old materialize
             // path produced (so the projection's scheduled Release balances). Zero copy: the inner
             // buffer never materializes. `lin_map_get` returns a BORROWED interior TaggedVal*, so the
-            // retain on the unboxed payload is what gives the result its own reference.
+            // retain on the unboxed payload is what gives the result its own reference. A packed
+            // sealed value can ONLY have been stored via `emit_map_set`'s BoxKeepPacked into a real
+            // `LinMap`, so the container is guaranteed TAG_MAP here — the direct `map_get` is sound.
             if Self::sealed_array_elem(result_ty).is_some() {
+                let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget").try_as_basic_value().unwrap_basic();
                 return self.compile_ir_unbox_keep_packed(tagged, /*arr=*/true);
             }
             if Self::sealed_fields(result_ty).is_some() {
+                let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget").try_as_basic_value().unwrap_basic();
                 return self.compile_ir_unbox_keep_packed(tagged, /*arr=*/false);
             }
+            // GENERAL read. `container` is a RAW pointer (the `{ String: T }` ABI passes the unboxed
+            // container, not a boxed TaggedVal), so its tag is NOT readable here — we rely on the
+            // Json→Map coercion boundary (`compile_ir_coerce`) having already materialized any
+            // object-shaped source into a real `LinMap`, so a `Type::Map` value is always a `LinMap`
+            // at runtime. `lin_map_get` returns null for a missing key.
+            let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget").try_as_basic_value().unwrap_basic();
             return if Self::is_union_type(result_ty) {
                 tagged
             } else {
