@@ -72,6 +72,13 @@ impl<'ctx> CoverageEmitter<'ctx> {
         idx
     }
 
+    /// Look up an already-tracked source file's index by absolute path. Used to attribute a
+    /// cross-module monomorphized specialization's regions to its generic-definition source file
+    /// (which was registered when that module was compiled as an import, before the importer).
+    pub fn file_idx_of(&self, path: &str) -> Option<u32> {
+        self.source_files.iter().position(|p| p == path).map(|i| i as u32)
+    }
+
     /// Convert a byte offset in the given source file to (line, col), both 1-indexed.
     pub fn offset_to_line_col_in(&self, file_idx: usize, offset: u32) -> (u32, u32) {
         let offset = offset as usize;

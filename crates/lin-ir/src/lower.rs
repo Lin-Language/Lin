@@ -164,6 +164,11 @@ pub fn lower_module_with_imports(
         ctx.functions.push(pending);
     }
 
+    // Coverage: stamp each cross-module specialization's origin module path onto its LinFunction so
+    // codegen attributes the spec's regions to the generic definition's source file. `spec_origins`
+    // is keyed by the spec's top-level slot; `global_fn_slots` maps that to its FuncId.
+    set_coverage_origins(&mut ctx.functions, &global_fn_slots, &module.spec_origins);
+
     let lin_module = LinModule {
         functions: ctx.functions,
         global_fn_slots,
@@ -171,6 +176,30 @@ pub fn lower_module_with_imports(
         default_descriptors: ctx.default_descriptors,
     };
     (lin_module, diagnostics)
+}
+
+/// Stamp `LinFunction.coverage_origin` for cross-module monomorphized specializations. `spec_origins`
+/// maps each specialization's top-level `val` slot to its origin module path; `global_fn_slots` maps
+/// that slot to the FuncId of the emitted function. Shared by the main and import lowering paths.
+fn set_coverage_origins(
+    functions: &mut [LinFunction],
+    global_fn_slots: &HashMap<usize, FuncId>,
+    spec_origins: &HashMap<usize, String>,
+) {
+    if spec_origins.is_empty() {
+        return;
+    }
+    let mut fid_origin: HashMap<FuncId, String> = HashMap::new();
+    for (slot, origin) in spec_origins {
+        if let Some(&fid) = global_fn_slots.get(slot) {
+            fid_origin.insert(fid, origin.clone());
+        }
+    }
+    for f in functions.iter_mut() {
+        if let Some(origin) = fid_origin.get(&f.id) {
+            f.coverage_origin = Some(origin.clone());
+        }
+    }
 }
 
 /// Lower an IMPORTED TypedModule to a LinModule for the IR pipeline.
@@ -482,6 +511,10 @@ pub fn lower_import_module_with_imports(
     while let Some(pending) = ctx.pending_functions.pop() {
         ctx.functions.push(pending);
     }
+
+    // Coverage: stamp cross-module specialization origins (this import may itself specialize a
+    // generic from a further module, e.g. `examples/report` → `std/array.reduce`).
+    set_coverage_origins(&mut ctx.functions, &global_fn_slots, &module.spec_origins);
 
     LinModule {
         functions: ctx.functions,
@@ -836,6 +869,7 @@ impl FuncBuilder {
             temp_count: self.temp_count,
             intrinsic_slots: self.intrinsic_slots.clone(),
             repr: Vec::new(),
+            coverage_origin: None,
         }
     }
 
