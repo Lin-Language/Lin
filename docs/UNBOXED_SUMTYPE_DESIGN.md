@@ -1,7 +1,23 @@
 # Unboxed Tagged Sum-Type Representation — Design + Scope Spike
 
-**Status**: Stage 0 + Stage 1 are now LIVE (non-recursive, scalar-only). The remaining stages
-(2 recursive, 3 keep-packed-across-containers, 4 interp port, 5 FBIP) are still future work.
+**Status**: Stage 0 + Stage 1 + Stage 2 are now LIVE. Stage 2 packs RECURSIVE sum types: a
+`type Ast = Num | BinOp` whose `BinOp` carries recursive `left`/`right : Ast` children compiles
+end-to-end as unboxed `SumNode`s with the recursive children stored as 8-byte owned `*SumNode`
+pointer slots (`KIND_SUMNODE` in the static `SumDesc`), a recursive drop walk, const-offset
+child-load (borrowed interior `*SumNode`), and nested-literal discriminant pushdown so a nested
+`{ "kind": … }` literal constructs a child `SumNode` directly. The recursive RC drop is ASan-clean
+(every node freed exactly once; only the immortal string-interner allocations "leak", identically
+to the boxed baseline). The remaining stages (3 keep-packed-across-containers, 4 interp port,
+5 FBIP) are still future work.
+
+Stage 2 self-recursion is detected ENV-FREE: a recursive child survives type resolution as
+`Type::Named(self_name)` (the checker leaves the cyclic back-reference unexpanded), and a sum
+union's unique self-name is the single `Named` appearing in its variant fields
+(`Codegen::sum_recursive_self_name` / `repr::sum_recursive_self_name`, kept byte-identical). A
+union with >1 distinct `Named` (mutual recursion) or any other heap/union field stays boxed
+(fail-safe) — mutual recursion is out of Stage-2 scope. A recursive sum value still MATERIALIZES to
+a boxed `LinObject` at a Json/union/generic/cross-module boundary (the Stage-1 boundary behavior);
+Stage 3 makes that keep-packed.
 
 ## Stage 1 — LIVE (the make-it-live milestone, branch `feat/sumtype-live`)
 
@@ -326,7 +342,7 @@ RC/ownership invariants).
 |---|---|---|---|---|
 | **0** | Checker warm-up: add `Type::Named` arm to `infer_index` (gap 3); accept StrLit-discriminant union members in match exhaustiveness (gap 2). No repr/codegen change. | S | Low | n/a (type-check only) |
 | **1** | **Non-recursive, 2-variant, scalar-only sum type packs.** `type T = A\|B`, each a sealed scalar record with a shared StrLit discriminant, NO recursive fields. Runtime `SumNode` alloc + `SumDesc`; repr `Layout::SumNode`; `MakeObject` decide site; `match is` → inline-tag switch; const-offset FieldGet; materialize-to-boxed at every dynamic edge. Oracle+verify arms. | L | Med | construct/drop/match/field-read/box-at-edge of a non-recursive sum value |
-| **2** | **Recursive sum type.** Add `KIND_SUMNODE` child slots + the recursive drop walk + child-field load returning an unboxed `SumNode*`. This is the interp `Ast`. Nested-literal discriminant pushdown (gap 1). | L | **High** | the tree drop walk (recursive release), child-load borrow/retain, no double-free on shared subtrees |
+| **2** — **LIVE** | **Recursive sum type.** Added `KIND_SUMNODE` child slots + the recursive drop walk + child-field load returning an unboxed `SumNode*` (borrowed interior). This is the interp `Ast`. Nested-literal discriminant pushdown (gap 1). Self-recursion detected env-free via the union's unique `Named` self-name. | L | **High** | the tree drop walk (recursive release), child-load borrow, no double-free on the subtree — ASan-clean (every node freed once; only immortal interner leaks) |
 | **3** | **Keep-packed across `Json`/`Map`/union slots** via `BoxKeepPacked`/`UnboxKeepPacked` reuse (so a parser returning `Ast` stored in a cursor object stays unboxed by-pointer). | M | Med | box-keep-packed round-trip; the keep-packed `TaggedVal` release path |
 | **4** | **Interp rewritten + measured.** Port `interp.lin` to `type Ast = Num\|BinOp`; confirm the eval AND parse phases unbox; measure vs Rust/Node. Add a corpus regression fixture + an ASan lifecycle test. | M | Low | full interp lifecycle under ASan |
 | **5** (opt) | **Arena/FBIP node reuse** (recycle fixed-size `SumNode`s) and/or per-variant exact sizing. Pure perf tuning. | M | Med | reuse-after-free correctness |
