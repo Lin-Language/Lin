@@ -1,178 +1,186 @@
-// std/event — typed event emitters, two layers over one event shape.
+// std/event — typed event emitters, two layers, fully generic over the event payload type.
 //
-// An Event is always `{ "type": String, "data": Json }`: a single TRANSFERABLE payload tagged by
-// a string discriminant. One payload (not Node-style varargs) keeps dispatch a clean
-// `match evt["type"]` and — crucially for the async layer — satisfies the §24.2 transferability
-// rule (the data crossing a thread boundary must be JSON-shaped: no Function/Iterator/Stream).
-// (`type` is a Lin keyword, so the event TYPE is passed as a parameter named `name` throughout and
-// stored under the `"type"` key.)
+// Unlike a dynamically-typed emitter, an event here carries a value of a STATIC type `T` — no
+// `Json`, no string-tagged `{ type, data }` envelope. Each emitter/bus is parameterised by its
+// payload type, so `emit`/`send` only accept a `T` and listeners receive a `T`. Distinct event
+// kinds are distinct types (use a tagged-union `T` if you want several shapes through one bus).
 //
 // Two layers, picked by whether you need concurrency:
 //
-//   LAYER 1 — `emitter` (ASYNC, worker-backed). A long-lived worker (§24.6) OWNS the subscriber
-//     state and folds each delivered event into it via a reducer. Use when a PRODUCER on one
-//     thread feeds a SUBSCRIBER on another — e.g. stream a file on the calling thread and `send`
-//     processed records to an indexer worker. `send` is fire-and-forget (no backpressure);
-//     `request` is synchronous (the producer waits for the fold — natural backpressure); `drain`
-//     flushes the queue and returns the assembled state; `stop` shuts the worker down.
+//   LAYER 1 — `emitter` (ASYNC, worker-backed). A long-lived worker (std/async, §24.6) OWNS the
+//     subscriber state `S` and folds each delivered `T` into it with a reducer `(T, S) => S` that
+//     runs on the worker thread. Use when a PRODUCER on one thread feeds a SUBSCRIBER on another —
+//     e.g. stream a file and `send` processed records to an indexer worker. `send` is
+//     fire-and-forget; `request` is synchronous (the producer waits for the fold — backpressure);
+//     `drain` flushes and returns the accumulated `S`; `stop` shuts the worker down.
 //
-//   LAYER 2 — `bus` (SYNCHRONOUS, in-process). A plain mutable registry of listeners, dispatched
-//     on the calling thread. Use for decoupled pub/sub WITHIN one thread (no concurrency). `on`
-//     registers a listener and returns a subscription handle; `off` removes it by that handle
-//     (NOT by closure identity — Node's fragile `removeListener(fn)`); `emit` invokes every
-//     listener for an event synchronously and returns how many fired.
+//   LAYER 2 — `bus` (SYNCHRONOUS, in-process). A listener registry dispatched on the calling
+//     thread. `on` registers a `(T) => Null` listener and returns a subscription handle; `off`
+//     removes it by that handle (NOT by closure identity); `emit` invokes every listener with a
+//     `T` synchronously and returns how many fired.
 //
-// Why two `emit`-like verbs (`emit` vs `send`)? They are genuinely different operations, not the
-// same one spelled twice: `emit` runs listeners SYNCHRONOUSLY on the caller's thread and returns a
-// count; `send` ENQUEUES to another thread and returns immediately. Distinct names keep the
-// semantics honest (and a module cannot export one name twice).
+// Generics note: Lin infers type parameters from ARGUMENTS, and a generic record type does not
+// propagate its parameter back to a generic consumer. So annotate the bus binding once —
+// `val b: Bus<Int32> = bus(firstListener)` — and every other call (`on`, `emit`, `off`,
+// `listenerCount`) resolves `T` from that binding or its value argument. The async handle is the
+// one opaque value (a Worker, erased to `Json` per §24.1 — that is the runtime handle, never your
+// payload).
 //
-// Learned from Node's EventEmitter mistakes:
-//   • No magic `"error"` event that crashes the process on no listener — errors are ordinary
-//     values (`{ "type": "error", … }`), and an async handler fault is isolated at the worker
-//     boundary (§24.6.5), never an abort.
-//   • Unsubscribe by HANDLE, not by function identity (closure equality is fragile/undefined).
-//   • One transferable payload per event, not positional `(...args)`.
-//   • Listener counts are queryable (`listenerCount`) instead of a silent leak + a warning.
-import { push, length, slice } from "std/array"
+// Why two `emit`-like verbs (`emit` vs `send`)? They are genuinely different operations: `emit`
+// runs listeners SYNCHRONOUSLY on the caller's thread and returns a count; `send` ENQUEUES to
+// another thread and returns immediately. Distinct names keep the semantics honest.
+//
+// Learned from Node's EventEmitter mistakes: no magic `"error"` event that aborts the process on
+// no listener (an async reducer fault is isolated at the worker boundary, §24.6.5); unsubscribe by
+// HANDLE, not by fragile closure identity; one typed payload per event, not positional varargs;
+// listener counts are queryable, not a silent leak.
+import { push, length } from "std/array"
 import { for } from "std/iter"
-import { get } from "std/object"
 import { worker, message, request as workerRequest, close } from "std/async"
 
-// ── Shared constructor ───────────────────────────────────────────────────────────────────────
-// An Event value. `data` is whatever the producer parsed/computed; for the async layer it must be
-// transferable (§24.2). Provided as a convenience so call sites read `event("leg", leg)` rather
-// than spelling the object literal each time.
-export val event = (name: String, data: Json): Json =>
-  { "type": name, "data": data }
+// A listener over a payload of type `T`.
+export type Listener<T> = (T) => Null
 
 // ══ LAYER 1 — async, worker-backed emitter ════════════════════════════════════════════════════
-// emitter(reduce, initial) — spawn a subscriber worker that owns `initial` state and folds each
-// delivered event into it. `reduce` is `(Event, State) => State`: it runs ON THE WORKER THREAD,
-// sequentially, one event at a time (so the state is thread-confined and needs no locks, §24.6.4).
-// A reducer that needs to keep state across events returns the updated state; the worker stores
-// the return as the new state.
-//
-// Internally the worker's `var state` is seeded from `initial` and updated per message; an
-// internal `{ "type": "__event_drain" }` request returns the current state without folding (see
-// `drain`). Returns an opaque emitter handle (a Worker, erased to Json).
-export val emitter = (reduce: (Json, Json) => Json, initial: Json): Json =>
+// Internal channel envelope. Every message to the worker carries the SAME object shape — a `kind`
+// discriminant plus the typed payload `value: T` — so the cross-thread transfer never mixes a
+// scalar `T` with a control sentinel (that mismatch corrupts the transfer). `kind` is "event" for a
+// real payload and "drain" for the flush request (whose `value` is ignored). This envelope is
+// MODULE-INTERNAL: callers only ever pass and receive a `T`.
+type Msg<T> = { "kind": String, "value": T }
+
+// emitter(reduce, initial, sample) — spawn a subscriber worker that owns state `S` (seeded
+// `initial`) and folds each delivered `T` into it. `reduce: (T, S) => S` runs ON THE WORKER
+// THREAD, sequentially, one event at a time, so the state is thread-confined and needs no locks
+// (§24.6.4). `sample: T` is a representative payload value: it pins `T` for the internal envelope
+// (a generic `worker` handler cannot otherwise recover `T`) and is never delivered to `reduce`.
+// `T`/`S` are inferred from `reduce`/`initial`/`sample`. Returns an opaque emitter handle (a
+// Worker; `Json` per §24.1 — the ONLY `Json`, and it is the runtime handle, never a payload).
+export val emitter = <T, S>(reduce: (T, S) => S, initial: S, sample: T): Json =>
   var state = initial
   worker(
-    (evt: Json): Json =>
-      match evt["type"]
-        is "__event_drain" =>
+    (m: Msg<T>): S =>
+      match m["kind"]
+        is "drain" =>
           state
         else =>
-          state = reduce(evt, state)
+          state = reduce(m["value"], state)
           state,
     (): Null => null
   )
 
-// send(e, name, data) — FIRE-AND-FORGET: enqueue an event and return immediately. No backpressure;
-// a fast producer can outpace a slow reducer and grow the queue. Use for light reducers, or pace
-// with `request` (below). This is the async analogue of `emit`.
-export val send = (e: Json, name: String, data: Json): Null =>
-  message(e, { "type": name, "data": data })
+// send(e, value) — FIRE-AND-FORGET: enqueue `value: T` and return immediately. No backpressure; a
+// fast producer can outpace a slow reducer and grow the queue. `T` is inferred from `value`.
+export val send = <T>(e: Json, value: T): Null =>
+  message(e, { "kind": "event", "value": value })
 
-// request(e, name, data) — SYNCHRONOUS: enqueue an event and BLOCK until the reducer has folded
-// it, returning the resulting state. Gives natural backpressure (the producer waits) and lets the
-// caller observe state mid-stream. `T | Error` is injected by the worker boundary on a reducer
-// fault (§24.6.5); handle the Error case.
-export val request = (e: Json, name: String, data: Json): Json =>
-  workerRequest(e, { "type": name, "data": data })
+// request(e, value) — SYNCHRONOUS: enqueue `value: T` and BLOCK until the reducer has folded it,
+// returning the resulting state `S`. Gives natural backpressure. The result is `S | Error` (the
+// worker boundary injects `Error` on a reducer fault, §24.6.5); annotate/handle accordingly.
+export val request = <T, S>(e: Json, value: T): S | Error =>
+  workerRequest(e, { "kind": "event", "value": value })
 
-// drain(e) — flush: BLOCK until the queue has fully processed and return the final accumulated
-// state. Because the worker processes messages sequentially, the drain request is served only
-// after every previously-`send`-ed event, so the returned state reflects them all.
-export val drain = (e: Json): Json =>
-  workerRequest(e, { "type": "__event_drain", "data": null })
+// drain(e, sample) — flush: BLOCK until the queue is fully processed and return the accumulated
+// state `S`. Because the worker processes messages sequentially, the drain is served only after
+// every prior `send`, so the returned `S` reflects them all. `sample: T` pins the envelope type
+// (the drain message's `value` is ignored). Annotate the result (`val s: Sum | Error = drain(e, 0)`).
+export val drain = <T, S>(e: Json, sample: T): S | Error =>
+  workerRequest(e, { "kind": "drain", "value": sample })
 
-// stop(e) — shut the emitter's worker down (drains in-flight, runs the no-op onClose, joins). After
-// `stop`, sending to the emitter is an error (§24.6.5). Call once you are done producing.
+// stop(e) — shut the emitter's worker down (drain in-flight, run the no-op onClose, join). After
+// `stop`, sending to the emitter is an error (§24.6.5).
 export val stop = (e: Json): Null =>
   close(e)
 
 // ══ LAYER 2 — synchronous in-process bus ══════════════════════════════════════════════════════
-// bus() — a fresh synchronous event bus. The registry is a PLAIN MUTABLE object threaded as the
-// first argument (no captured `var`, so no factory-escape hazard): `listeners` maps an event type
-// to an array of `{ id, handler, once }` records; `nextId` hands out unique subscription ids.
-export val bus = (): Json =>
-  { "listeners": {  }, "nextId": 0 }
+// A registered listener: its id (for `off`), the `(T) => Null` handler, and whether it is one-shot.
+type Entry<T> = { "id": Int32, "handler": Listener<T>, "once": Boolean }
 
-// on(b, name, handler) — register `handler` for event type `name`. Returns a SUBSCRIPTION HANDLE
-// (`{ "type": name, "id": Int32 }`) — pass it to `off` to unsubscribe. Returning a handle (not
-// requiring the caller to keep the closure for identity comparison) is what makes `off` reliable.
-export val on = (b: Json, name: String, handler: (Json) => Null): Json =>
+// A synchronous event bus over payload type `T`.
+export type Bus<T> = { "entries": Entry<T>[], "nextId": Int32 }
+
+// A subscription handle returned by `on`/`once`, consumed by `off`.
+export type Sub = { "id": Int32 }
+
+// bus(first) — a fresh bus seeded with its first listener (which pins `T`). Annotate the binding —
+// `val b: Bus<Int32> = bus(h)` — so later bus-only calls (`emit`/`off`/`listenerCount`) resolve
+// `T`. The seed listener avoids the zero-argument-inference gap (a generic `bus()` could not infer
+// `T`); to start empty, write the literal directly: `val b: Bus<Int32> = { "entries": [], "nextId": 0 }`.
+export val bus = <T>(first: Listener<T>): Bus<T> =>
+  {
+    "entries": [{ "id": 0, "handler": first, "once": false }],
+    "nextId": 1
+  }
+
+// on(b, handler) — register `handler` for the bus's payload type. Returns a subscription handle to
+// pass to `off`. (Returning a handle, not requiring closure-identity comparison, makes `off` reliable.)
+export val on = <T>(b: Bus<T>, handler: Listener<T>): Sub =>
   val id = b["nextId"]
   b["nextId"] = id + 1
-  register(b, name, handler, id, false)
-  { "type": name, "id": id }
-
-// once(b, name, handler) — like `on`, but the listener is removed automatically right after its
-// first invocation. Returns a subscription handle (usable with `off` to cancel before it fires).
-export val once = (b: Json, name: String, handler: (Json) => Null): Json =>
-  val id = b["nextId"]
-  b["nextId"] = id + 1
-  register(b, name, handler, id, true)
-  { "type": name, "id": id }
-
-// off(b, sub) — remove the listener identified by the subscription handle `sub` (from `on`/`once`).
-// No-op if it was already removed or never existed. Returns `true` if a listener was removed.
-export val off = (b: Json, sub: Json): Boolean =>
-  val name = sub["type"]
-  val cur = get(b["listeners"], name, [])
-  val kept = filterListeners(cur, sub["id"])
-  b["listeners"][name] = kept
-  length(kept) < length(cur)
-
-// emit(b, name, data) — SYNCHRONOUSLY invoke every listener registered for `name`, in registration
-// order, passing each the Event's `data`. `once` listeners are removed after firing. Returns the
-// number of listeners invoked (0 if none — no Node-style crash-on-unhandled-error).
-export val emit = (b: Json, name: String, data: Json): Int32 =>
-  val current = get(b["listeners"], name, [])
-  // Snapshot the listener list BEFORE firing: a handler that subscribes/unsubscribes during
-  // dispatch must not perturb THIS emission (a listener added now fires on the NEXT emit, and one
-  // removed now still completes this round — the standard "stable during dispatch" rule).
-  val snapshot = slice(current, 0, length(current))
-  var fired = 0
-  snapshot.for(e =>
-    e["handler"](data)
-    fired = fired + 1
-  )
-  // Drop the `once` listeners that just fired.
-  b["listeners"][name] = dropOnce(get(b["listeners"], name, []))
-  fired
-
-// listenerCount(b, name) — how many listeners are currently registered for event type `name`.
-export val listenerCount = (b: Json, name: String): Int32 =>
-  length(get(b["listeners"], name, []))
-
-// ── Layer-2 internals ─────────────────────────────────────────────────────────────────────────
-// Append a `{ id, handler, once }` listener record to `name`'s list, creating it on first use.
-val register = (b: Json, name: String, handler: (Json) => Null, id: Int32, isOnce: Boolean): Null =>
-  if b["listeners"][name] == null then
-    b["listeners"][name] = []
-  push(b["listeners"][name], {
+  push(b["entries"], {
     "id": id,
     "handler": handler,
-    "once": isOnce
+    "once": false
   })
+  { "id": id }
 
-// Keep every listener whose id differs from `id` (i.e. remove the one matching `id`).
-val filterListeners = (lst: Json, id: Int32): Json =>
-  var out: Json = []
-  lst.for(e =>
+// once(b, handler) — like `on`, but the listener is removed automatically after its first firing.
+export val once = <T>(b: Bus<T>, handler: Listener<T>): Sub =>
+  val id = b["nextId"]
+  b["nextId"] = id + 1
+  push(b["entries"], {
+    "id": id,
+    "handler": handler,
+    "once": true
+  })
+  { "id": id }
+
+// off(b, sub) — remove the listener identified by `sub`. Returns `true` if one was removed.
+export val off = <T>(b: Bus<T>, sub: Sub): Boolean =>
+  val before = length(b["entries"])
+  b["entries"] = keepOthers(b["entries"], sub["id"])
+  length(b["entries"]) < before
+
+// emit(b, value) — SYNCHRONOUSLY invoke every listener with `value: T`, in registration order.
+// `once` listeners are removed after firing. Returns the number of listeners invoked (0 if none —
+// no Node-style crash-on-unhandled-error).
+export val emit = <T>(b: Bus<T>, value: T): Int32 =>
+  // Snapshot before firing so a listener that subscribes/unsubscribes during dispatch does not
+  // perturb THIS emission (an added listener fires on the NEXT emit; a removed one still completes
+  // this round) — the standard "stable during dispatch" rule.
+  val snapshot = snapshotEntries(b["entries"])
+  var fired = 0
+  snapshot.for(e =>
+    e["handler"](value)
+    fired = fired + 1
+  )
+  b["entries"] = dropOnce(b["entries"])
+  fired
+
+// listenerCount(b) — how many listeners are currently registered.
+export val listenerCount = <T>(b: Bus<T>): Int32 =>
+  length(b["entries"])
+
+// ── Layer-2 internals ─────────────────────────────────────────────────────────────────────────
+// Every entry whose id differs from `id` (i.e. remove the matching one).
+val keepOthers = <T>(entries: Entry<T>[], id: Int32): Entry<T>[] =>
+  var out: Entry<T>[] = []
+  entries.for(e =>
     if e["id"] != id then push(out, e)
   )
   out
 
-// Keep every listener that is NOT a `once` (used after an emit to drop the one-shot listeners that
-// just fired). A `once` present at emit time has necessarily fired (emit fires every current
-// listener), so dropping all `once` here is correct.
-val dropOnce = (lst: Json): Json =>
-  var out: Json = []
-  lst.for(e =>
+// A shallow copy of the entry list (for the stable-during-dispatch snapshot).
+val snapshotEntries = <T>(entries: Entry<T>[]): Entry<T>[] =>
+  var out: Entry<T>[] = []
+  entries.for(e => push(out, e))
+  out
+
+// Every entry that is NOT a `once` (used after an emit to drop the one-shot listeners that fired;
+// a `once` present at emit time has necessarily fired, since emit fires every current listener).
+val dropOnce = <T>(entries: Entry<T>[]): Entry<T>[] =>
+  var out: Entry<T>[] = []
+  entries.for(e =>
     if e["once"] == false then push(out, e)
   )
   out

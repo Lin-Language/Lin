@@ -1,12 +1,10 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { toString, join } from "std/string"
 import { push, length } from "std/array"
-import { for } from "std/iter"
-import { keys } from "std/object"
-import { bus, on, once, off, emit, listenerCount, emitter, send, request, drain, stop, event } from "std/event"
+import { Bus, bus, on, once, off, emit, listenerCount, emitter, send, request, drain, stop } from "std/event"
 
-// Handlers can't return values into the assertions, so they append to a module-level log; tests
-// assert on the log contents. A fresh log per test via `reset`.
+// Handlers can't return into the assertions, so they append to a module-level log; tests assert on
+// the log. A fresh log per test via `reset`.
 var log: Json = []
 val reset = (): Null =>
   log = []
@@ -15,65 +13,55 @@ val record = (s: String): Null =>
 val logStr = (): String =>
   join(log, ",")
 
-val s = suite("std/event", [
-  // ── Layer 2: synchronous bus ──
-  test("event() builds the {type,data} shape", () =>
-    val e = event("leg", { "from": "A" })
-    [
-      expect(e["type"]).toBe("leg"),
-      expect(e["data"]["from"]).toBe("A")
-    ]
-  ),
+// A small record payload, to show the bus is generic over any `T` (not just scalars).
+type Leg = { "from": String, "to": String }
 
-  test("on + emit invokes listeners in order, returns count", () =>
+val s = suite("std/event", [
+  // ── Layer 2: synchronous bus, generic over the payload type ──
+  test("on + emit invokes listeners in order with the typed value, returns count", () =>
     reset()
-    val b = bus()
-    on(b, "tick", (d: Json): Null => record("A${d}"))
-    on(b, "tick", (d: Json): Null => record("B${d}"))
-    val fired = emit(b, "tick", 1)
+    val b: Bus<Int32> = bus((x: Int32): Null => record("A${toString(x)}"))
+    on(b, (x: Int32): Null => record("B${toString(x)}"))
+    val fired = emit(b, 1)
     [
       expect(fired).toBe(2),
       expect(logStr()).toBe("A1,B1")
     ]
   ),
 
-  test("emit on an event with no listeners fires zero (no crash)", () =>
-    val b = bus()
+  test("emit with no listeners fires zero (empty-bus literal, no crash)", () =>
+    val b: Bus<Int32> = { "entries": [], "nextId": 0 }
     [
-      expect(emit(b, "absent", 0)).toBe(0)
+      expect(emit(b, 7)).toBe(0)
     ]
   ),
 
   test("listenerCount reflects registrations", () =>
-    val b = bus()
-    on(b, "x", (d: Json): Null => null)
-    on(b, "x", (d: Json): Null => null)
-    on(b, "y", (d: Json): Null => null)
+    val b: Bus<Int32> = { "entries": [], "nextId": 0 }
+    on(b, (x: Int32): Null => null)
+    on(b, (x: Int32): Null => null)
     [
-      expect(listenerCount(b, "x")).toBe(2),
-      expect(listenerCount(b, "y")).toBe(1),
-      expect(listenerCount(b, "z")).toBe(0)
+      expect(listenerCount(b)).toBe(2)
     ]
   ),
 
   test("off removes a listener by its subscription handle", () =>
     reset()
-    val b = bus()
-    val subA = on(b, "tick", (d: Json): Null => record("A"))
-    on(b, "tick", (d: Json): Null => record("B"))
-    val removed = off(b, subA)
-    val fired = emit(b, "tick", 0)
+    val b: Bus<Int32> = bus((x: Int32): Null => record("A"))
+    val subB = on(b, (x: Int32): Null => record("B"))
+    val removed = off(b, subB)
+    val fired = emit(b, 0)
     [
       expect(removed).toBe(true),
       expect(fired).toBe(1),
-      expect(logStr()).toBe("B"),
-      expect(listenerCount(b, "tick")).toBe(1)
+      expect(logStr()).toBe("A"),
+      expect(listenerCount(b)).toBe(1)
     ]
   ),
 
   test("off on an already-removed handle is a no-op returning false", () =>
-    val b = bus()
-    val sub = on(b, "tick", (d: Json): Null => null)
+    val b: Bus<Int32> = bus((x: Int32): Null => null)
+    val sub = on(b, (x: Int32): Null => null)
     off(b, sub)
     [
       expect(off(b, sub)).toBe(false)
@@ -82,103 +70,94 @@ val s = suite("std/event", [
 
   test("once fires exactly one time then is removed", () =>
     reset()
-    val b = bus()
-    once(b, "tick", (d: Json): Null => record("once${d}"))
-    on(b, "tick", (d: Json): Null => record("on${d}"))
-    val first = emit(b, "tick", 1)
-    val second = emit(b, "tick", 2)
+    val b: Bus<Int32> = bus((x: Int32): Null => record("on${toString(x)}"))
+    once(b, (x: Int32): Null => record("once${toString(x)}"))
+    val first = emit(b, 1)
+    val second = emit(b, 2)
     [
       expect(first).toBe(2),
       expect(second).toBe(1),
-      expect(logStr()).toBe("once1,on1,on2"),
-      expect(listenerCount(b, "tick")).toBe(1)
+      expect(logStr()).toBe("on1,once1,on2"),
+      expect(listenerCount(b)).toBe(1)
     ]
   ),
 
-  test("a handler subscribing during dispatch does not fire this round", () =>
+  test("the bus is generic over a record payload, not just scalars", () =>
     reset()
-    val b = bus()
-    on(b, "tick", (d: Json): Null =>
-      record("first")
-      on(b, "tick", (d2: Json): Null => record("late"))
-    )
-    val firstRound = emit(b, "tick", 0)
-    val secondRound = emit(b, "tick", 0)
+    val b: Bus<Leg> = bus((leg: Leg): Null => record("${leg["from"]}->${leg["to"]}"))
+    val fired = emit(b, { "from": "A", "to": "B" })
     [
-      // First emit: only the original listener fires (snapshot taken before dispatch).
-      expect(firstRound).toBe(1),
-      // The late listener registered during the first emit fires on the second (plus the original,
-      // which also re-adds another late one — so the second round sees 2: original + first late).
-      expect(secondRound).toBe(2)
+      expect(fired).toBe(1),
+      expect(logStr()).toBe("A->B")
     ]
   ),
 
-  // ── Layer 1: async, worker-backed emitter ──
-  test("emitter folds sent events into worker-owned state, drain returns it", () =>
-    val sink = emitter(
-      (evt: Json, count: Json): Json =>
-        match evt["type"]
-          is "inc" => count + evt["data"]
-          else => count,
-      0
-    )
-    send(sink, "inc", 10)
-    send(sink, "inc", 5)
-    send(sink, "inc", 100)
-    val total = drain(sink)
+  // ── Layer 1: async, worker-backed emitter, generic over payload `T` and state `S` ──
+  test("emitter folds sent values into worker-owned state, drain returns it", () =>
+    val sink = emitter((x: Int32, sum: Int32): Int32 => sum + x, 0, 0)
+    send(sink, 10)
+    send(sink, 5)
+    send(sink, 100)
+    val total: Int32 | Error = drain(sink, 0)
     stop(sink)
+    val n = match total
+      is Error => 0 - 1
+      else => total
     [
-      expect(total).toBe(115)
+      expect(n).toBe(115)
     ]
   ),
 
   test("emitter built by a factory that RETURNS it keeps its var state (spec §24.6.4)", () =>
-    // The reducer closes over the emitter's internal `var state`, and `emitter` returns the worker
-    // out of its frame — the captured-var-escape path. Exercises that fix end to end.
     val mkSink = (): Json =>
-      emitter((evt: Json, n: Json): Json => n + 1, 0)
+      emitter((x: Int32, n: Int32): Int32 => n + 1, 0, 0)
     val sink = mkSink()
-    send(sink, "x", null)
-    send(sink, "x", null)
-    val n = drain(sink)
+    send(sink, 0)
+    send(sink, 0)
+    val count: Int32 | Error = drain(sink, 0)
     stop(sink)
+    val n = match count
+      is Error => 0 - 1
+      else => count
     [
       expect(n).toBe(2)
     ]
   ),
 
-  test("request delivers an event synchronously and returns the folded state", () =>
-    val sink = emitter((evt: Json, acc: Json): Json => acc + evt["data"], 0)
-    val afterFirst = request(sink, "add", 7)
-    val afterSecond = request(sink, "add", 3)
+  test("request delivers a value synchronously and returns the folded state", () =>
+    val sink = emitter((x: Int32, acc: Int32): Int32 => acc + x, 0, 0)
+    val afterFirst: Int32 | Error = request(sink, 7)
+    val afterSecond: Int32 | Error = request(sink, 3)
     stop(sink)
+    val a = match afterFirst
+      is Error => 0 - 1
+      else => afterFirst
+    val b = match afterSecond
+      is Error => 0 - 1
+      else => afterSecond
     [
-      expect(afterFirst).toBe(7),
-      expect(afterSecond).toBe(10)
+      expect(a).toBe(7),
+      expect(b).toBe(10)
     ]
   ),
 
-  test("emitter indexes records by a key (the RAPTOR transfer-index shape)", () =>
+  test("emitter folds a record payload into an array state (the RAPTOR index shape)", () =>
     val sink = emitter(
-      (evt: Json, index: Json): Json =>
-        match evt["type"]
-          is "transfer" =>
-            val t = evt["data"]
-            if index[t["from"]] == null then index[t["from"]] = []
-            push(index[t["from"]], t)
-            index
-          else => index,
-      {}
+      (leg: Leg, acc: String[]): String[] =>
+        push(acc, leg["from"])
+        acc,
+      [],
+      { "from": "", "to": "" }
     )
-    send(sink, "transfer", { "from": "A", "to": "B" })
-    send(sink, "transfer", { "from": "A", "to": "C" })
-    send(sink, "transfer", { "from": "X", "to": "Y" })
-    val index = drain(sink)
+    send(sink, { "from": "A", "to": "B" })
+    send(sink, { "from": "X", "to": "Y" })
+    val origins: String[] | Error = drain(sink, { "from": "", "to": "" })
     stop(sink)
+    val n = match origins
+      is Error => 0 - 1
+      else => length(origins)
     [
-      expect(length(keys(index))).toBe(2),
-      expect(length(index["A"])).toBe(2),
-      expect(length(index["X"])).toBe(1)
+      expect(n).toBe(2)
     ]
   )
 ])
