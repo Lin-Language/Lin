@@ -526,9 +526,23 @@ impl Checker {
                                 if expected_fn_params_fully_pinned(&expected) {
                                     self.check_expr(arg, &expected)?
                                 } else {
+                                    // SPECULATIVE check: if checking the callback against the
+                                    // (possibly-incomplete) hint fails, we DISCARD it and re-infer
+                                    // hint-free. A failed `infer_function`/`_with_hints` can `?`-out
+                                    // BETWEEN its push of `function_scope_depths`/`capture_stack`
+                                    // (+ env scope) and the matching pops, leaking an unbalanced
+                                    // frame that subsequent functions then pop — mis-attributing the
+                                    // discarded attempt's captures to an UNRELATED enclosing function
+                                    // (it would gain a phantom closure env, breaking its call ABI).
+                                    // Snapshot the transient stack/scope lengths and truncate them
+                                    // back on the discarded path so the retry starts clean.
+                                    let snap = self.checker_state_snapshot();
                                     match self.check_expr(arg, &expected) {
                                         Ok(t) => t,
-                                        Err(_) => self.infer_expr(arg)?,
+                                        Err(_) => {
+                                            self.restore_checker_state(snap);
+                                            self.infer_expr(arg)?
+                                        }
                                     }
                                 }
                             } else {
@@ -1019,9 +1033,15 @@ impl Checker {
                                 if expected_fn_params_fully_pinned(&expected) {
                                     self.check_expr(arg_expr, &expected)?
                                 } else {
+                                    // Speculative; roll back leaked nesting state on the discarded
+                                    // path (see `infer_call`'s sibling site + `restore_checker_state`).
+                                    let snap = self.checker_state_snapshot();
                                     match self.check_expr(arg_expr, &expected) {
                                         Ok(t) => t,
-                                        Err(_) => self.infer_expr(arg_expr)?,
+                                        Err(_) => {
+                                            self.restore_checker_state(snap);
+                                            self.infer_expr(arg_expr)?
+                                        }
                                     }
                                 }
                             } else {
