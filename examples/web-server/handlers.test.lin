@@ -2,19 +2,39 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { contains } from "std/string"
 import { HttpRequest as Request } from "std/http"
 import { render, renderWith } from "std/template"
-import { getIndex, getStatus, getUser } from "./handlers"
+import { solve } from "./routing"
+import { getIndex, getStatus, getRoute, getUser } from "./handlers"
+import { Config } from "./config"
 
-// Mock `render` (ADR-046): the handler calls `render(path, data)` with a hard-coded
-// view path that only resolves when run from the repo root. Replacing it with an
-// inline template via `renderWith` decouples the handler/routing logic under test
-// from a file on disk. (The real index.jinja file rendering is covered separately in
-// template.test.lin.) A mock may call a DIFFERENT symbol — just not itself.
+// Handler unit tests. `render` is mocked (ADR-046) with an inline template so the
+// index handler is tested without the on-disk view path (the real index.jinja
+// render is covered in template.test.lin). `solve` is mocked so the /route
+// handler's ok / no-path / error branches are deterministic and disk-free.
 replace render = (path: String, data: {  }): Json =>
   renderWith("<!DOCTYPE html><title>{{ title }}</title><h1>{{ heading }}</h1>", data)
 
-val makeReq = (method: String, path: String): Request =>
+replace solve = (graphPath: String, from: String, to: String): Json =>
+  if to == "Z" then
+    { "type": "no-path" }
+  else if to == "boom" then
+    { "type": "error", "message": "graph file unreadable" }
+  else
+    {
+      "type": "ok",
+      "path": [from, to],
+      "distance": 42
+    }
+
+val config: Config = {
+  "host": "0.0.0.0",
+  "port": 3000,
+  "debug": false,
+  "name": "Lin Maps"
+}
+
+val makeReq = (path: String): Request =>
   {
-    "method": method,
+    "method": "GET",
     "path": path,
     "query": "",
     "headers": {},
@@ -22,37 +42,65 @@ val makeReq = (method: String, path: String): Request =>
   }
 
 val s = suite("handlers", [
-  test("getIndex returns the rendered template HTML in the body", () =>
-    // Regression: getIndex used to discard the rendered template and return the
-    // literal string "index". The body must be the rendered HTML, with the data
-    // interpolated into the template (title "Lin Web Server", heading "Welcome").
-    val resp = getIndex(makeReq("GET", "/"))
+  test("getIndex renders the template with the config name in the body", () =>
+    val resp = getIndex(makeReq("/"), config)
     [
       expect(resp["status"]).toBe(200),
       expect(contains(resp["body"], "<!DOCTYPE html>")).toBe(true),
-      expect(contains(resp["body"], "Lin Web Server")).toBe(true),
-      expect(contains(resp["body"], "Welcome")).toBe(true),
-      // The old bug returned the literal "index"; a rendered body never equals it.
-      expect(resp["body"] == "index").toBe(false)
+      expect(contains(resp["body"], "Lin Maps")).toBe(true),
+      expect(contains(resp["body"], "Welcome to Lin Maps")).toBe(true)
     ]
   ),
 
-  test("getStatus returns 200", () =>
-    val resp = getStatus(makeReq("GET", "/api/status"))
+  test("getStatus returns 200 with the configured name", () =>
+    val resp = getStatus(makeReq("/api/status"), config)
+    [
+      expect(resp["status"]).toBe(200),
+      expect(contains(resp["body"], "Lin Maps")).toBe(true)
+    ]
+  ),
+
+  test("getRoute returns 200 with the resolved path + distance", () =>
+    val resp = getRoute(makeReq("/route/A/E"))
+    [
+      expect(resp["status"]).toBe(200),
+      expect(contains(resp["body"], "\"distance\": 42")).toBe(true),
+      expect(contains(resp["body"], "\"from\": \"A\"")).toBe(true)
+    ]
+  ),
+
+  test("getRoute returns 404 when the target is unreachable", () =>
+    val resp = getRoute(makeReq("/route/A/Z"))
+    [
+      expect(resp["status"]).toBe(404),
+      expect(contains(resp["body"], "no route")).toBe(true)
+    ]
+  ),
+
+  test("getRoute returns 500 when the graph cannot be read", () =>
+    val resp = getRoute(makeReq("/route/A/boom"))
+    [
+      expect(resp["status"]).toBe(500),
+      expect(contains(resp["body"], "routing unavailable")).toBe(true)
+    ]
+  ),
+
+  test("getRoute returns 404 for a non-matching path", () =>
+    val resp = getRoute(makeReq("/route/only-one"))
+    [
+      expect(resp["status"]).toBe(404)
+    ]
+  ),
+
+  test("getUser returns 200 for a valid path", () =>
+    val resp = getUser(makeReq("/users/42"))
     [
       expect(resp["status"]).toBe(200)
     ]
   ),
 
-  test("getUser returns 200 for valid path", () =>
-    val resp = getUser(makeReq("GET", "/users/42"))
-    [
-      expect(resp["status"]).toBe(200)
-    ]
-  ),
-
-  test("getUser returns 404 for non-matching path", () =>
-    val resp = getUser(makeReq("GET", "/other"))
+  test("getUser returns 404 for a non-matching path", () =>
+    val resp = getUser(makeReq("/other"))
     [
       expect(resp["status"]).toBe(404)
     ]

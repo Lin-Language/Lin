@@ -1,6 +1,50 @@
-import { router } from "./router"
+// main.lin — the service entry point: load + validate the startup config, bind the
+// port it specifies, and serve requests until a shutdown signal arrives.
+//
+// `serve` blocks its thread for the lifetime of the server, so to keep a graceful
+// shutdown path we run it on a background thread (`async`) and block the main
+// thread on `waitSignal` for SIGINT (2) / SIGTERM (15). When either is delivered
+// the main thread wakes, logs, and exits the process — the conventional
+// "wait for a termination signal, then shut down" server loop.
+//
+// Run:  lin build examples/web-server/main.lin -o web-server && ./web-server
+// (main.lin is not run by CI because it binds a port and blocks; the router,
+//  handlers, config and routing engine are covered by the *.test.lin suites.)
+import { load, Config } from "./config"
+import { makeRouter } from "./router"
 import { serve } from "std/http"
-import { print } from "std/io"
+import { waitSignal } from "std/signal"
+import { async } from "std/async"
+import { print, exit } from "std/io"
+import { toString } from "std/string"
 
-print("listening on http://localhost:3000")
-router.serve(3000)
+val SIGINT = 2
+val SIGTERM = 15
+
+// The service config. In a real deployment this would come from a file or the
+// environment; here it is an inline raw object run through the same defaults +
+// validation path, surfacing failures before we ever bind a port.
+val raw = { "name": "Lin Maps", "port": 3000 }
+
+match load(raw)
+  has { "type": "failure", error } =>
+    print("config error: ${error}")
+    exit(1)
+  has { "type": "success", value } =>
+    val config: Config = value
+    print(
+      "${config["name"]} listening on http://${config["host"]}:${toString(config["port"])}"
+    )
+    // Build the router and serve on a background thread; the closure captures only
+    // the `config` record (a val), never a mutable var, so it is a legal async thunk.
+    val server = async(() =>
+      val handler = makeRouter(config)
+      serve(handler, config["port"])
+    )
+    // Block until a termination signal, then shut down gracefully.
+    val sig = waitSignal(SIGTERM)
+    print("received signal ${toString(sig)}, shutting down")
+    exit(0)
+  else =>
+    print("config error: unexpected load result")
+    exit(1)

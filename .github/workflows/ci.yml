@@ -83,14 +83,12 @@ jobs:
           for m in examples/*/main.lin; do
             dir="$(dirname "$m")"
             case "$dir" in
-              # web-server/main.lin calls serve(...), which blocks forever; the router and
-              # handlers are covered by *.test.lin and the Rust serve integration test.
+              # web-server/main.lin loads config, then calls serve(...) (which blocks forever)
+              # and waits for SIGTERM; the router, handlers, config and the /route Dijkstra
+              # endpoint are all covered by *.test.lin and the Rust serve integration test.
+              # (Dijkstra used to be a standalone example with an argv-driven main.lin; it is now
+              # the web-server's /route endpoint, so there is no separate dijkstra run step.)
               examples/web-server) echo "SKIP $m (serve blocks forever; covered by tests)"; continue ;;
-              # dijkstra/main.lin reads a graph + source/target/output from argv.
-              examples/dijkstra)
-                echo "==> $m (with argv)"
-                cargo run -p lin --quiet -- run "$m" -- examples/dijkstra/graph.json A E /tmp/dijkstra_out.json || exit 1
-                continue ;;
             esac
             echo "==> $m"
             cargo run -p lin --quiet -- run "$m" || exit 1
