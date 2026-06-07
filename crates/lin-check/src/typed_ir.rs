@@ -70,6 +70,10 @@ pub enum TypedStmt {
     },
     Var {
         slot: usize,
+        /// Source binding name (for DWARF local-variable emission under `--debug`; Phase 3 of the
+        /// debugger). Carried purely as metadata — it does not affect type checking or codegen
+        /// semantics. Mirrors `Val.name` (always `Some` for a plain `var x = …`).
+        name: Option<String>,
         value: TypedExpr,
         ty: Type,
         span: Span,
