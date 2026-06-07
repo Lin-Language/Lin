@@ -72,6 +72,11 @@ pub struct Codegen<'ctx> {
     /// when coverage is off or the current module's source isn't tracked (suppresses
     /// instrumentation, e.g. for stdlib imports).
     current_source: Option<(u32, std::rc::Rc<str>)>,
+    /// Coverage: import module path (as the IR/monomorphizer names it, e.g. `./gen`) → its source
+    /// file index in the coverage emitter. Populated when an instrumented import is compiled. Used
+    /// to attribute a cross-module monomorphized specialization's regions (whose block spans index
+    /// into the generic-definition source) to that origin file via `LinFunction.coverage_origin`.
+    cov_import_file_idx: HashMap<String, u32>,
     /// Default-argument descriptor global per real FuncId, for the module currently being
     /// compiled. A closure value created from a default-bearing function points at this
     /// descriptor (closure offset 32) so an indirect under-arity call dispatches to the
@@ -121,6 +126,7 @@ impl<'ctx> Codegen<'ctx> {
             },
             current_source: None,
             cls_descriptors: HashMap::new(),
+            cov_import_file_idx: HashMap::new(),
         }
     }
 
@@ -232,6 +238,10 @@ impl<'ctx> Codegen<'ctx> {
             self.current_source = match src {
                 Some((p, text)) => {
                     let idx = self.coverage.as_mut().unwrap().add_source_file(p, text);
+                    // Record import-path → file index so a later cross-module specialization of THIS
+                    // module's generics (compiled in the importer's context) can attribute its
+                    // coverage regions back to this source file.
+                    self.cov_import_file_idx.insert(path.to_string(), idx);
                     Some((idx, std::rc::Rc::from(text.as_str())))
                 }
                 None => None,
@@ -749,7 +759,23 @@ impl<'ctx> Codegen<'ctx> {
             let mut block_counter: StdMap<lir::BlockId, u32> = StdMap::new();
             let mut profc: Option<inkwell::values::GlobalValue<'ctx>> = None;
             if self.coverage.is_some() {
-                if let Some((file_idx, _)) = self.current_source {
+                // A kept GENERIC ORIGINAL (`<T>(x:T):T`, signature still mentions a TypeVar) is a
+                // type-erased shadow of the same source lines its monomorphized specializations
+                // cover, and in the fully-specialized common case it is never called. Emitting its
+                // (always-zero) regions would double-count the generic definition's lines and force
+                // them to 0%. Skip it; the specialization (attributed via `coverage_origin`) carries
+                // the real, executed coverage for those lines.
+                let is_generic_original = func.coverage_origin.is_none()
+                    && (type_mentions_typevar(&func.ret_ty)
+                        || func.params.iter().any(|(_, t)| type_mentions_typevar(t)));
+                // A cross-module specialization's block spans index into its ORIGIN module's source,
+                // not the module currently being compiled. Attribute its regions to that file.
+                let origin_file_idx = func
+                    .coverage_origin
+                    .as_ref()
+                    .and_then(|p| self.cov_import_file_idx.get(p).copied());
+                let region_file = origin_file_idx.or_else(|| self.current_source.as_ref().map(|(i, _)| *i));
+                if let (false, Some(file_idx)) = (is_generic_original, region_file) {
                     let mut regions: Vec<coverage::Region> = Vec::new();
                     let mut next_counter = 0u32;
                     for block in &func.blocks {
@@ -2169,27 +2195,26 @@ impl<'ctx> Codegen<'ctx> {
             }
         }
     }
+}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+/// Whether a type mentions an unresolved generic `TypeVar` anywhere in its structure. Used by
+/// coverage to recognise a kept GENERIC ORIGINAL function (whose params/return still name a
+/// quantified type variable) and skip emitting its always-zero regions — its monomorphized
+/// specializations carry the real coverage for the same source lines (attributed via
+/// `LinFunction.coverage_origin`).
+fn type_mentions_typevar(ty: &Type) -> bool {
+    match ty {
+        // The Json wildcard `TypeVar(u32::MAX)` is a concrete dynamic type, NOT a quantified
+        // generic param — a function returning/taking Json is a real, callable function.
+        Type::TypeVar(id) => *id != u32::MAX,
+        Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Stream(t) | Type::Map(t) => {
+            type_mentions_typevar(t)
+        }
+        Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(type_mentions_typevar),
+        Type::Function { params, ret, .. } => {
+            params.iter().any(type_mentions_typevar) || type_mentions_typevar(ret)
+        }
+        Type::Object { fields, .. } => fields.values().any(type_mentions_typevar),
+        _ => false,
+    }
 }
