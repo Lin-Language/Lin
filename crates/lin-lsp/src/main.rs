@@ -52,6 +52,16 @@ impl LanguageServer for Backend {
                 rename_provider: Some(OneOf::Left(true)),
                 // Inlay type hints on bindings whose type is inferred (no explicit annotation).
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                // Type-aware semantic highlighting (full-document only; the TextMate grammar stays
+                // the fallback for incremental edits).
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                        legend: semantic_tokens_legend(),
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
+                        range: Some(false),
+                        work_done_progress_options: Default::default(),
+                    }),
+                ),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -428,6 +438,25 @@ impl LanguageServer for Backend {
             .filter(|h| position_in_range(h.position, range))
             .collect();
         Ok(Some(hints))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = &params.text_document.uri;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let base_dir = file_dir(uri);
+        let analysis = analyse(&source, base_dir.as_deref());
+
+        let data = semantic_tokens(&source, &analysis);
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
     }
 }
 
@@ -975,6 +1004,308 @@ fn pattern_ident(pattern: &lin_parse::ast::Pattern) -> Option<(String, lin_commo
     match pattern {
         lin_parse::ast::Pattern::Ident(name, span) => Some((name.clone(), *span)),
         _ => None,
+    }
+}
+
+// ── semantic tokens ────────────────────────────────────────────────────────────
+
+// Token-type indices into the legend below. Kept as `u32` constants so the encoder and the legend
+// can't drift out of step. The order here IS the legend order the client uses to decode.
+const ST_VARIABLE: u32 = 0;
+const ST_PARAMETER: u32 = 1;
+const ST_FUNCTION: u32 = 2;
+const ST_TYPE: u32 = 3;
+const ST_NAMESPACE: u32 = 4;
+
+/// The legend advertised in `initialize`. The index of each token type in this list is the number
+/// the delta-encoded token stream refers to (see `ST_*` constants).
+fn semantic_tokens_legend() -> SemanticTokensLegend {
+    SemanticTokensLegend {
+        token_types: vec![
+            SemanticTokenType::VARIABLE,
+            SemanticTokenType::PARAMETER,
+            SemanticTokenType::FUNCTION,
+            SemanticTokenType::TYPE,
+            // `namespace` highlights imported symbols (the editor can dim/colour them distinctly).
+            SemanticTokenType::NAMESPACE,
+        ],
+        token_modifiers: vec![],
+    }
+}
+
+/// Classify every identifier span in the document and emit LSP semantic tokens (delta-encoded).
+///
+/// Sources, in precedence order:
+///   1. AST function parameters → `parameter` (definition sites + every use that resolves to one).
+///   2. Type-annotation identifiers (`TypeExpr::Named`/`Generic`) → `type`.
+///   3. Import-binding module use-sites whose resolved type is a namespace-like value are not
+///      separable from functions here, so imported names are classified by their type like any use.
+///   4. Remaining `span_type_map` use-sites → `function` when the type renders as a function
+///      (`=>`), else `variable`.
+///
+/// Multi-line spans are skipped entirely (LSP forbids a token crossing a line). The result is
+/// sorted by (line, char) and delta-encoded per the spec.
+fn semantic_tokens(source: &str, analysis: &Analysis) -> Vec<SemanticToken> {
+    // (start -> (start, end, token_type)). A span may be produced by more than one source; the
+    // FIRST inserted for a given start offset wins (parameters/types take precedence over the
+    // generic use-site pass).
+    let mut by_start: HashMap<u32, (u32, u32, u32)> = HashMap::new();
+
+    // 1. Parameter definition sites, and the set of param def-spans (to classify their uses).
+    let mut param_defs: HashSet<(u32, u32)> = HashSet::new();
+    collect_param_spans(&analysis.module.statements, &mut param_defs);
+    for (start, end) in &param_defs {
+        by_start.entry(*start).or_insert((*start, *end, ST_PARAMETER));
+    }
+
+    // 2. Type-annotation identifiers.
+    let mut type_spans: Vec<lin_common::Span> = Vec::new();
+    collect_type_spans(&analysis.module.statements, &mut type_spans);
+    for span in &type_spans {
+        by_start.entry(span.start).or_insert((span.start, span.end, ST_TYPE));
+    }
+
+    // 3. Imported local names — used to flag a use-site as a `namespace` (an imported symbol).
+    let imported: HashSet<&str> = analysis
+        .imported_names
+        .iter()
+        .map(|i| i.name.as_str())
+        .collect();
+
+    // 4. Generic identifier use-sites from the type map. Precedence: a use whose def_span is a
+    // parameter is a `parameter`; an imported name is a `namespace`; a function-typed use is a
+    // `function`; everything else is a `variable`.
+    for (use_span, ty_str, def_span) in &analysis.span_type_map {
+        let text = source
+            .get(use_span.start as usize..use_span.end as usize)
+            .unwrap_or("");
+        let kind = if def_span
+            .map(|d| param_defs.contains(&(d.start, d.end)))
+            .unwrap_or(false)
+        {
+            ST_PARAMETER
+        } else if imported.contains(text) {
+            ST_NAMESPACE
+        } else if ty_str.contains("=>") {
+            ST_FUNCTION
+        } else {
+            ST_VARIABLE
+        };
+        by_start
+            .entry(use_span.start)
+            .or_insert((use_span.start, use_span.end, kind));
+    }
+
+    // Drop anything that crosses a line boundary, convert to positions, sort.
+    // Track the source end-offset alongside so we can drop overlapping tokens after sorting
+    // (a `Generic` head span, say `Foo<Bar>`, contains its argument spans — LSP tokens must not
+    // overlap, so the containing token is dropped in favour of the more specific inner ones).
+    let mut tokens: Vec<(u32, u32, u32, u32, u32, u32)> = Vec::new(); // (line, char, len, type, start_off, end_off)
+    for (start_off, end_off, kind) in by_start.values() {
+        let start = offset_to_position(source, *start_off as usize);
+        let end = offset_to_position(source, *end_off as usize);
+        if start.line != end.line {
+            continue; // LSP: a semantic token cannot span lines.
+        }
+        let len = end.character.saturating_sub(start.character);
+        if len == 0 {
+            continue;
+        }
+        tokens.push((start.line, start.character, len, *kind, *start_off, *end_off));
+    }
+    tokens.sort_by_key(|(line, ch, _, _, _, _)| (*line, *ch));
+
+    // Delta-encode per the LSP spec, skipping any token whose source range overlaps the previous
+    // emitted token (keeps the stream non-overlapping as LSP requires).
+    let mut data = Vec::with_capacity(tokens.len());
+    let mut prev_line = 0u32;
+    let mut prev_char = 0u32;
+    let mut prev_end_off = 0u32;
+    for (line, ch, len, kind, start_off, end_off) in tokens {
+        if start_off < prev_end_off {
+            continue; // overlaps the previously-emitted token; drop it.
+        }
+        let delta_line = line - prev_line;
+        let delta_start = if delta_line == 0 { ch - prev_char } else { ch };
+        data.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: len,
+            token_type: kind,
+            token_modifiers_bitset: 0,
+        });
+        prev_line = line;
+        prev_char = ch;
+        prev_end_off = end_off;
+    }
+    data
+}
+
+/// Collect parameter identifier spans from every function literal in the module (recursively).
+fn collect_param_spans(stmts: &[Stmt], out: &mut HashSet<(u32, u32)>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Val { value, .. } | Stmt::Var { value, .. } => {
+                collect_param_spans_in_expr(value, out);
+            }
+            Stmt::Expr(e) => collect_param_spans_in_expr(e, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_param_spans_in_expr(expr: &lin_parse::ast::Expr, out: &mut HashSet<(u32, u32)>) {
+    use lin_parse::ast::Expr as E;
+    match expr {
+        E::Function { params, body, .. } => {
+            for p in params {
+                if let Some((_, span)) = pattern_ident(&p.pattern) {
+                    out.insert((span.start, span.end));
+                }
+            }
+            collect_param_spans_in_expr(body, out);
+        }
+        E::Block(stmts, tail, _) => {
+            collect_param_spans(stmts, out);
+            collect_param_spans_in_expr(tail, out);
+        }
+        E::If { condition, then_branch, else_branch, .. } => {
+            collect_param_spans_in_expr(condition, out);
+            collect_param_spans_in_expr(then_branch, out);
+            collect_param_spans_in_expr(else_branch, out);
+        }
+        E::Match { scrutinee, arms, .. } => {
+            collect_param_spans_in_expr(scrutinee, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    collect_param_spans_in_expr(g, out);
+                }
+                collect_param_spans_in_expr(&arm.body, out);
+            }
+        }
+        E::Call { func, args, .. } => {
+            collect_param_spans_in_expr(func, out);
+            for a in args {
+                collect_param_spans_in_expr(a, out);
+            }
+        }
+        E::DotCall { receiver, args, .. } => {
+            collect_param_spans_in_expr(receiver, out);
+            if let Some(args) = args {
+                for a in args {
+                    collect_param_spans_in_expr(a, out);
+                }
+            }
+        }
+        E::BinaryOp { left, right, .. } => {
+            collect_param_spans_in_expr(left, out);
+            collect_param_spans_in_expr(right, out);
+        }
+        E::UnaryOp { operand, .. } => collect_param_spans_in_expr(operand, out),
+        E::Assign { value, .. } => collect_param_spans_in_expr(value, out),
+        _ => {}
+    }
+}
+
+/// Collect the spans of identifiers that appear in TYPE position (annotations, return types,
+/// generic arguments) so they can be highlighted as `type`.
+fn collect_type_spans(stmts: &[Stmt], out: &mut Vec<lin_common::Span>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Val { type_ann, value, .. } => {
+                if let Some(t) = type_ann {
+                    collect_type_spans_in_type(t, out);
+                }
+                collect_type_spans_in_expr(value, out);
+            }
+            Stmt::Var { type_ann, value, .. } => {
+                if let Some(t) = type_ann {
+                    collect_type_spans_in_type(t, out);
+                }
+                collect_type_spans_in_expr(value, out);
+            }
+            Stmt::TypeDecl { body, .. } => collect_type_spans_in_type(body, out),
+            Stmt::Expr(e) => collect_type_spans_in_expr(e, out),
+            _ => {}
+        }
+    }
+}
+
+fn collect_type_spans_in_expr(expr: &lin_parse::ast::Expr, out: &mut Vec<lin_common::Span>) {
+    use lin_parse::ast::Expr as E;
+    match expr {
+        E::Function { params, return_type, body, .. } => {
+            for p in params {
+                if let Some(t) = &p.type_ann {
+                    collect_type_spans_in_type(t, out);
+                }
+            }
+            if let Some(rt) = return_type {
+                collect_type_spans_in_type(rt, out);
+            }
+            collect_type_spans_in_expr(body, out);
+        }
+        E::Block(stmts, tail, _) => {
+            collect_type_spans(stmts, out);
+            collect_type_spans_in_expr(tail, out);
+        }
+        E::If { condition, then_branch, else_branch, .. } => {
+            collect_type_spans_in_expr(condition, out);
+            collect_type_spans_in_expr(then_branch, out);
+            collect_type_spans_in_expr(else_branch, out);
+        }
+        E::Match { scrutinee, arms, .. } => {
+            collect_type_spans_in_expr(scrutinee, out);
+            for arm in arms {
+                collect_type_spans_in_expr(&arm.body, out);
+            }
+        }
+        E::Call { func, args, .. } => {
+            collect_type_spans_in_expr(func, out);
+            for a in args {
+                collect_type_spans_in_expr(a, out);
+            }
+        }
+        E::DotCall { receiver, args, .. } => {
+            collect_type_spans_in_expr(receiver, out);
+            if let Some(args) = args {
+                for a in args {
+                    collect_type_spans_in_expr(a, out);
+                }
+            }
+        }
+        E::BinaryOp { left, right, .. } => {
+            collect_type_spans_in_expr(left, out);
+            collect_type_spans_in_expr(right, out);
+        }
+        E::UnaryOp { operand, .. } => collect_type_spans_in_expr(operand, out),
+        E::Assign { value, .. } => collect_type_spans_in_expr(value, out),
+        _ => {}
+    }
+}
+
+fn collect_type_spans_in_type(ty: &lin_parse::ast::TypeExpr, out: &mut Vec<lin_common::Span>) {
+    use lin_parse::ast::TypeExpr as T;
+    match ty {
+        T::Named(_, span) => out.push(*span),
+        T::Generic(_, args, span) => {
+            out.push(*span);
+            for a in args {
+                collect_type_spans_in_type(a, out);
+            }
+        }
+        T::Array(inner, _) => collect_type_spans_in_type(inner, out),
+        T::FixedArray(items, _) => items.iter().for_each(|t| collect_type_spans_in_type(t, out)),
+        T::Union(items, _)
+        | T::Intersection(items, _)
+        | T::TaggedUnion(items, _) => items.iter().for_each(|t| collect_type_spans_in_type(t, out)),
+        T::Function(params, ret, _) => {
+            params.iter().for_each(|t| collect_type_spans_in_type(t, out));
+            collect_type_spans_in_type(ret, out);
+        }
+        T::Object(fields, _) => fields.iter().for_each(|(_, t)| collect_type_spans_in_type(t, out)),
+        T::IndexSig(inner, _) => collect_type_spans_in_type(inner, out),
+        T::StringLit(_, _) => {}
     }
 }
 
@@ -1534,6 +1865,66 @@ mod tests {
             "expected a String hint for the nested binding, got {:?}",
             labels
         );
+    }
+
+    // ── Tier-2: semantic tokens ─────────────────────────────────────────────────
+
+    /// Decode the delta-encoded token stream back into absolute `(line, char, len, type)` tuples.
+    fn decode_semantic(tokens: &[SemanticToken]) -> Vec<(u32, u32, u32, u32)> {
+        let mut out = Vec::new();
+        let mut line = 0u32;
+        let mut ch = 0u32;
+        for t in tokens {
+            if t.delta_line == 0 {
+                ch += t.delta_start;
+            } else {
+                line += t.delta_line;
+                ch = t.delta_start;
+            }
+            out.push((line, ch, t.length, t.token_type));
+        }
+        out
+    }
+
+    /// A parameter use is classified `parameter`; a function-typed binding use is `function`; an
+    /// ordinary value use is `variable`.
+    #[test]
+    fn semantic_tokens_classify_identifiers_by_role() {
+        // `n` is a parameter, used in the body; `g` is a function-typed val, called in `h`.
+        let src = "val g = (n: Int32) => n + 1\nval h = () => g(2)\n";
+        let analysis = analyse(src, None);
+        let toks = decode_semantic(&semantic_tokens(src, &analysis));
+
+        // Locate the body use of `n` (after `=>`).
+        let arrow = src.find("=>").unwrap();
+        let n_use = arrow + src[arrow..].find('n').unwrap();
+        let n_pos = offset_to_position(src, n_use);
+        let n_tok = toks
+            .iter()
+            .find(|(l, c, _, _)| *l == n_pos.line && *c == n_pos.character)
+            .expect("expected a token at the body use of `n`");
+        assert_eq!(n_tok.3, ST_PARAMETER, "param use should be `parameter`: {:?}", n_tok);
+
+        // Locate the use of `g` inside `h` (line 1).
+        let line1 = src.find('\n').unwrap() + 1;
+        let g_use = line1 + src[line1..].find('g').unwrap();
+        let g_pos = offset_to_position(src, g_use);
+        let g_tok = toks
+            .iter()
+            .find(|(l, c, _, _)| *l == g_pos.line && *c == g_pos.character)
+            .expect("expected a token at the use of `g`");
+        assert_eq!(g_tok.3, ST_FUNCTION, "function-typed use should be `function`: {:?}", g_tok);
+
+        // No token may overlap the next (sorted, non-overlapping invariant).
+        let mut sorted = toks.clone();
+        sorted.sort_by_key(|(l, c, _, _)| (*l, *c));
+        for w in sorted.windows(2) {
+            let (l0, c0, len0, _) = w[0];
+            let (l1, c1, _, _) = w[1];
+            if l0 == l1 {
+                assert!(c0 + len0 <= c1, "tokens overlap: {:?} then {:?}", w[0], w[1]);
+            }
+        }
     }
 
     #[test]
