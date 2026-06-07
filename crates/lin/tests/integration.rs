@@ -9121,6 +9121,43 @@ print(toString(length(sorted)))
     assert_eq!(out, vec!["[1, 2, 3, 5, 8, 9]", "6"]);
 }
 
+// Regression (sealed-record combinator element leak): `map` over a sealed-record array whose
+// callback returns a SCALAR FIELD (`x => x["a"]`) reads each element via the `Index` op, which
+// materialises a FRESH +1 sealed struct per element (packed-array `sealed_array_materialize_elem`
+// or boxed-array `sealed_project_from`, both retaining their heap fields). The body extracts a copy
+// of one scalar field — the struct itself is NEVER moved into the (`Int32[]`) result — so the lowerer
+// must release it each iteration (the new `free_combinator_sealed_elem`) or it leaks one struct per
+// element, per `map` call (ASan-confirmed linear across all sealed field shapes; the same applies to
+// `for`/`while`/`reduce` over a sealed array). cargo test can't see the leak; this guards that the
+// per-element release is CORRECT — an over-eager release would free a still-referenced field and
+// corrupt the result or crash. Run in a loop so a per-iteration double-free would surface as a wrong
+// total / abort. The ASan stdlib+example leg + the sealed harness guard the no-double-free half.
+#[test]
+fn test_map_scalar_field_over_sealed_record_array_in_loop() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+import { map } from "std/iter"
+
+type T = { "a": Int32, "b": Int32 }
+
+val once = (i: Int32): Int32 =>
+  var ts: T[] = []
+  push(ts, { "a": i, "b": 0 })
+  push(ts, { "a": i + 10, "b": 0 })
+  val ds: Int32[] = map(ts, (x) => x["a"])
+  ds[0] + ds[1]
+
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc
+  else loop(i + 1, n, acc + once(i))
+
+print(toString(loop(0, 1000, 0)))
+"#);
+    // sum over i in 0..1000 of (i + (i+10)) = 2*sum(0..999) + 10*1000 = 999000 + 10000 = 1009000
+    assert_eq!(out, vec!["1009000"]);
+}
+
 // `minBy`/`maxBy`/`sortBy` over an OBJECT array still work as before (the genericization keeps the
 // heterogeneous `[key, item]` pair path sound — pairs built via the raw `lin_map` builtin on the
 // `T` ABI, the sorted result unpacked back into a `T[]` in the generic body).
