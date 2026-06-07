@@ -1,0 +1,185 @@
+// std/event — typed event emitters, two layers over one event shape.
+//
+// An Event is always `{ "type": String, "data": Json }`: a single TRANSFERABLE payload tagged by
+// a string discriminant. One payload (not Node-style varargs) keeps dispatch a clean
+// `match evt["type"]` and — crucially for the async layer — satisfies the §24.2 transferability
+// rule (the data crossing a thread boundary must be JSON-shaped: no Function/Iterator/Stream).
+// (`type` is a Lin keyword, so the event TYPE is passed as a parameter named `name` throughout and
+// stored under the `"type"` key.)
+//
+// Two layers, picked by whether you need concurrency:
+//
+//   LAYER 1 — `emitter` (ASYNC, worker-backed). A long-lived worker (§24.6) OWNS the subscriber
+//     state and folds each delivered event into it via a reducer. Use when a PRODUCER on one
+//     thread feeds a SUBSCRIBER on another — e.g. stream a file on the calling thread and `send`
+//     processed records to an indexer worker. `send` is fire-and-forget (no backpressure);
+//     `request` is synchronous (the producer waits for the fold — natural backpressure); `drain`
+//     flushes the queue and returns the assembled state; `stop` shuts the worker down.
+//
+//   LAYER 2 — `bus` (SYNCHRONOUS, in-process). A plain mutable registry of listeners, dispatched
+//     on the calling thread. Use for decoupled pub/sub WITHIN one thread (no concurrency). `on`
+//     registers a listener and returns a subscription handle; `off` removes it by that handle
+//     (NOT by closure identity — Node's fragile `removeListener(fn)`); `emit` invokes every
+//     listener for an event synchronously and returns how many fired.
+//
+// Why two `emit`-like verbs (`emit` vs `send`)? They are genuinely different operations, not the
+// same one spelled twice: `emit` runs listeners SYNCHRONOUSLY on the caller's thread and returns a
+// count; `send` ENQUEUES to another thread and returns immediately. Distinct names keep the
+// semantics honest (and a module cannot export one name twice).
+//
+// Learned from Node's EventEmitter mistakes:
+//   • No magic `"error"` event that crashes the process on no listener — errors are ordinary
+//     values (`{ "type": "error", … }`), and an async handler fault is isolated at the worker
+//     boundary (§24.6.5), never an abort.
+//   • Unsubscribe by HANDLE, not by function identity (closure equality is fragile/undefined).
+//   • One transferable payload per event, not positional `(...args)`.
+//   • Listener counts are queryable (`listenerCount`) instead of a silent leak + a warning.
+import { push, length, slice } from "std/array"
+import { for } from "std/iter"
+import { worker, message, request as workerRequest, close } from "std/async"
+
+// Local lookup-or-default. We deliberately do NOT use std/object's `get`: it infinite-loops at
+// runtime when its first argument is a Json-typed dynamic value (which `b["listeners"]` is) and the
+// key is ABSENT (a monomorphization quirk in `get`'s match body). Raw `m[key]` correctly yields
+// `null` for a missing key, so this null-check form is both correct and loop-free.
+val listenersFor = (b: Json, name: String): Json =>
+  val v = b["listeners"][name]
+  if v == null then [] else v
+
+// ── Shared constructor ───────────────────────────────────────────────────────────────────────
+// An Event value. `data` is whatever the producer parsed/computed; for the async layer it must be
+// transferable (§24.2). Provided as a convenience so call sites read `event("leg", leg)` rather
+// than spelling the object literal each time.
+export val event = (name: String, data: Json): Json =>
+  { "type": name, "data": data }
+
+// ══ LAYER 1 — async, worker-backed emitter ════════════════════════════════════════════════════
+// emitter(reduce, initial) — spawn a subscriber worker that owns `initial` state and folds each
+// delivered event into it. `reduce` is `(Event, State) => State`: it runs ON THE WORKER THREAD,
+// sequentially, one event at a time (so the state is thread-confined and needs no locks, §24.6.4).
+// A reducer that needs to keep state across events returns the updated state; the worker stores
+// the return as the new state.
+//
+// Internally the worker's `var state` is seeded from `initial` and updated per message; an
+// internal `{ "type": "__event_drain" }` request returns the current state without folding (see
+// `drain`). Returns an opaque emitter handle (a Worker, erased to Json).
+export val emitter = (reduce: (Json, Json) => Json, initial: Json): Json =>
+  var state = initial
+  worker(
+    (evt: Json): Json =>
+      match evt["type"]
+        is "__event_drain" =>
+          state
+        else =>
+          state = reduce(evt, state)
+          state,
+    (): Null => null
+  )
+
+// send(e, name, data) — FIRE-AND-FORGET: enqueue an event and return immediately. No backpressure;
+// a fast producer can outpace a slow reducer and grow the queue. Use for light reducers, or pace
+// with `request` (below). This is the async analogue of `emit`.
+export val send = (e: Json, name: String, data: Json): Null =>
+  message(e, { "type": name, "data": data })
+
+// request(e, name, data) — SYNCHRONOUS: enqueue an event and BLOCK until the reducer has folded
+// it, returning the resulting state. Gives natural backpressure (the producer waits) and lets the
+// caller observe state mid-stream. `T | Error` is injected by the worker boundary on a reducer
+// fault (§24.6.5); handle the Error case.
+export val request = (e: Json, name: String, data: Json): Json =>
+  workerRequest(e, { "type": name, "data": data })
+
+// drain(e) — flush: BLOCK until the queue has fully processed and return the final accumulated
+// state. Because the worker processes messages sequentially, the drain request is served only
+// after every previously-`send`-ed event, so the returned state reflects them all.
+export val drain = (e: Json): Json =>
+  workerRequest(e, { "type": "__event_drain", "data": null })
+
+// stop(e) — shut the emitter's worker down (drains in-flight, runs the no-op onClose, joins). After
+// `stop`, sending to the emitter is an error (§24.6.5). Call once you are done producing.
+export val stop = (e: Json): Null =>
+  close(e)
+
+// ══ LAYER 2 — synchronous in-process bus ══════════════════════════════════════════════════════
+// bus() — a fresh synchronous event bus. The registry is a PLAIN MUTABLE object threaded as the
+// first argument (no captured `var`, so no factory-escape hazard): `listeners` maps an event type
+// to an array of `{ id, handler, once }` records; `nextId` hands out unique subscription ids.
+export val bus = (): Json =>
+  { "listeners": {  }, "nextId": 0 }
+
+// on(b, name, handler) — register `handler` for event type `name`. Returns a SUBSCRIPTION HANDLE
+// (`{ "type": name, "id": Int32 }`) — pass it to `off` to unsubscribe. Returning a handle (not
+// requiring the caller to keep the closure for identity comparison) is what makes `off` reliable.
+export val on = (b: Json, name: String, handler: (Json) => Null): Json =>
+  val id = b["nextId"]
+  b["nextId"] = id + 1
+  register(b, name, handler, id, false)
+  { "type": name, "id": id }
+
+// once(b, name, handler) — like `on`, but the listener is removed automatically right after its
+// first invocation. Returns a subscription handle (usable with `off` to cancel before it fires).
+export val once = (b: Json, name: String, handler: (Json) => Null): Json =>
+  val id = b["nextId"]
+  b["nextId"] = id + 1
+  register(b, name, handler, id, true)
+  { "type": name, "id": id }
+
+// off(b, sub) — remove the listener identified by the subscription handle `sub` (from `on`/`once`).
+// No-op if it was already removed or never existed. Returns `true` if a listener was removed.
+export val off = (b: Json, sub: Json): Boolean =>
+  val name = sub["type"]
+  val cur = listenersFor(b, name)
+  val kept = filterListeners(cur, sub["id"])
+  b["listeners"][name] = kept
+  length(kept) < length(cur)
+
+// emit(b, name, data) — SYNCHRONOUSLY invoke every listener registered for `name`, in registration
+// order, passing each the Event's `data`. `once` listeners are removed after firing. Returns the
+// number of listeners invoked (0 if none — no Node-style crash-on-unhandled-error).
+export val emit = (b: Json, name: String, data: Json): Int32 =>
+  val current = listenersFor(b, name)
+  // Snapshot the listener list BEFORE firing: a handler that subscribes/unsubscribes during
+  // dispatch must not perturb THIS emission (a listener added now fires on the NEXT emit, and one
+  // removed now still completes this round — the standard "stable during dispatch" rule).
+  val snapshot = slice(current, 0, length(current))
+  var fired = 0
+  snapshot.for(e =>
+    e["handler"](data)
+    fired = fired + 1
+  )
+  // Drop the `once` listeners that just fired.
+  b["listeners"][name] = dropOnce(listenersFor(b, name))
+  fired
+
+// listenerCount(b, name) — how many listeners are currently registered for event type `name`.
+export val listenerCount = (b: Json, name: String): Int32 =>
+  length(listenersFor(b, name))
+
+// ── Layer-2 internals ─────────────────────────────────────────────────────────────────────────
+// Append a `{ id, handler, once }` listener record to `name`'s list, creating it on first use.
+val register = (b: Json, name: String, handler: (Json) => Null, id: Int32, isOnce: Boolean): Null =>
+  if b["listeners"][name] == null then
+    b["listeners"][name] = []
+  push(b["listeners"][name], {
+    "id": id,
+    "handler": handler,
+    "once": isOnce
+  })
+
+// Keep every listener whose id differs from `id` (i.e. remove the one matching `id`).
+val filterListeners = (lst: Json, id: Int32): Json =>
+  var out: Json = []
+  lst.for(e =>
+    if e["id"] != id then push(out, e)
+  )
+  out
+
+// Keep every listener that is NOT a `once` (used after an emit to drop the one-shot listeners that
+// just fired). A `once` present at emit time has necessarily fired (emit fires every current
+// listener), so dropping all `once` here is correct.
+val dropOnce = (lst: Json): Json =>
+  var out: Json = []
+  lst.for(e =>
+    if e["once"] == false then push(out, e)
+  )
+  out
