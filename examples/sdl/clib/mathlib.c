@@ -2,8 +2,8 @@
 //
 // Compiled to a committed static archive (libmathlib.a) that `lin build`/`lin test`
 // link against. To rebuild after editing:
-//   cc -c examples/ffi/mathlib.c -o examples/ffi/mathlib.o
-//   ar rcs examples/ffi/libmathlib.a examples/ffi/mathlib.o
+//   cc -c examples/sdl/clib/mathlib.c -o examples/sdl/clib/mathlib.o
+//   ar rcs examples/sdl/clib/libmathlib.a examples/sdl/clib/mathlib.o
 //
 // All signatures use the C ABI types Lin's FFI maps to (int32_t -> Int32,
 // double -> Float64). See crates/lin-runtime/lin.h for the interop header.
