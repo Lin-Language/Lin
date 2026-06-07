@@ -355,6 +355,197 @@ impl<'ctx> Codegen<'ctx> {
         Self::is_sealed_scalar_field(ty)
     }
 
+    // ── Unboxed tagged sum type (`SumNode`) — unboxed-sumtype Stage 1 ─────────────────────────────
+    //
+    // A sum type `type T = A | B | …` where every variant is a sealed record sharing a distinct
+    // StrLit discriminant and (Stage 1) every OTHER field is an unboxed scalar gets the `SumNode`
+    // representation (`lin_runtime::sumnode`). NON-RECURSIVE, SCALAR-ONLY this stage: any variant
+    // with a heap/Named/union/nested-record field → fall back to the BOXED union (fail-safe).
+
+    /// SumNode header bytes: `u32 rc | u32 size | u64 desc_ptr | u32 tag | u32 _pad`. Payload begins
+    /// at offset 24. Kept in lockstep with `lin_runtime::sumnode::SUMNODE_HEADER`.
+    pub(crate) const SUMNODE_HEADER: u64 = 24;
+    /// Byte offset of the inline discriminant tag. Lockstep with `sumnode::SUMNODE_TAG_OFFSET`.
+    pub(crate) const SUMNODE_TAG_OFFSET: u64 = 16;
+
+    /// True when `ty` is a permissible SCALAR field of a Stage-1 sum-type variant (a fixed-width
+    /// numeric or Bool — no per-field RC). The discriminant field is a StrLit; it is laid out as a
+    /// scalar slot is NOT — it is carried inline by the tag, never stored, so it is excluded from the
+    /// payload (see `sumnode_variant_payload_fields`).
+    pub(crate) fn is_sum_scalar_field(ty: &Type) -> bool {
+        Self::is_sealed_scalar_field(ty)
+    }
+
+    /// THE Stage-1 sum-type gate (SINGLE source of truth, mirrored in `lin_ir::repr::sum_type_eligible`).
+    /// Returns the discriminant key iff `ty` is a `Type::Union` of 2+ variants where:
+    ///   (1) every variant is a `Type::Object` (sealed or not — the union itself is the seal);
+    ///   (2) a SHARED key exists whose value is a distinct `StrLit` on every variant (the
+    ///       discriminant — same soundness rule as the shipped union-discrimination);
+    ///   (3) every OTHER field of every variant is an unboxed scalar (Stage 1: NO heap/Named/union/
+    ///       nested-record/recursive field). Any violation → `None` → fall back to the boxed union.
+    /// A `Null` member disqualifies (a nullable sum stays boxed — fail-safe, Stage 1 strict scope).
+    pub(crate) fn sum_type_discriminant(ty: &Type) -> Option<String> {
+        let variants = match ty {
+            Type::Union(vs) => vs,
+            _ => return None,
+        };
+        if variants.len() < 2 {
+            return None;
+        }
+        // All variants must be concrete records (no Null/Named/scalar member).
+        let mut recs: Vec<&indexmap::IndexMap<String, Type>> = Vec::with_capacity(variants.len());
+        for v in variants {
+            match v {
+                Type::Object { fields, .. } if !fields.is_empty() => recs.push(fields),
+                _ => return None,
+            }
+        }
+        // Find a shared key that is a distinct StrLit on every variant.
+        let first = recs[0];
+        'keys: for (key, kty) in first.iter() {
+            if !matches!(kty, Type::StrLit(_)) {
+                continue;
+            }
+            let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for rec in &recs {
+                match rec.get(key) {
+                    Some(Type::StrLit(s)) => {
+                        if !seen.insert(s.clone()) {
+                            continue 'keys; // not distinct
+                        }
+                    }
+                    _ => continue 'keys, // missing/non-StrLit on some variant
+                }
+            }
+            // Every OTHER field of every variant must be an unboxed scalar (Stage 1 strict scope).
+            for rec in &recs {
+                for (fk, fty) in rec.iter() {
+                    if fk == key {
+                        continue; // the discriminant (a StrLit) is carried by the tag, not stored
+                    }
+                    if matches!(fty, Type::StrLit(_)) {
+                        // A second StrLit field is not a scalar slot — out of Stage-1 scope.
+                        return None;
+                    }
+                    if !Self::is_sum_scalar_field(fty) {
+                        return None;
+                    }
+                }
+            }
+            return Some(key.clone());
+        }
+        None
+    }
+
+    /// `Some(())` shorthand: is `ty` a Stage-1-eligible unboxed sum type? (Foundation helper —
+    /// consumed once the repr seed + call ABI are wired; see `repr::type_seed`.)
+    #[allow(dead_code)]
+    pub(crate) fn is_sum_type(ty: &Type) -> bool {
+        Self::sum_type_discriminant(ty).is_some()
+    }
+
+    /// The PAYLOAD field map of one variant (the discriminant key removed — it is the inline tag).
+    /// Only the scalar fields remain. Declaration order is preserved (the layout key).
+    pub(crate) fn sumnode_variant_payload_fields(
+        variant: &indexmap::IndexMap<String, Type>,
+        disc_key: &str,
+    ) -> indexmap::IndexMap<String, Type> {
+        variant
+            .iter()
+            .filter(|(k, _)| k.as_str() != disc_key)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+
+    /// Byte offset (from the node base, INCLUDING the 24-byte header) of `field` within a variant's
+    /// payload, packed in declaration order with natural alignment. The header end (offset 24) is the
+    /// payload base. Returns the field offset. Panics if `field` is not in the payload.
+    pub(crate) fn sumnode_field_offset(
+        payload_fields: &indexmap::IndexMap<String, Type>,
+        field: &str,
+    ) -> u64 {
+        let mut offset = Self::SUMNODE_HEADER;
+        for (k, fty) in payload_fields.iter() {
+            let sz = fty.bit_width().map(|b| (b as u64) / 8).unwrap_or(1).max(1);
+            offset = (offset + sz - 1) / sz * sz;
+            if k == field {
+                return offset;
+            }
+            offset += sz;
+        }
+        panic!("sumnode_field_offset: field {field:?} not in variant payload")
+    }
+
+    /// Byte size of one variant's node (header + that variant's packed payload, padded to 8).
+    pub(crate) fn sumnode_variant_size(payload_fields: &indexmap::IndexMap<String, Type>) -> u64 {
+        let mut offset = Self::SUMNODE_HEADER;
+        for fty in payload_fields.values() {
+            let sz = fty.bit_width().map(|b| (b as u64) / 8).unwrap_or(1).max(1);
+            offset = (offset + sz - 1) / sz * sz;
+            offset += sz;
+        }
+        (offset + 7) / 8 * 8
+    }
+
+    /// The total (max-variant-sized) node byte size for a whole sum type. Every variant fits in one
+    /// fixed-size node. `ty` must be a sum type (`is_sum_type`).
+    pub(crate) fn sumnode_total_size(ty: &Type) -> u64 {
+        let key = Self::sum_type_discriminant(ty).expect("sumnode_total_size on non-sum type");
+        let variants = match ty {
+            Type::Union(vs) => vs,
+            _ => unreachable!(),
+        };
+        let mut max = Self::SUMNODE_HEADER;
+        for v in variants {
+            if let Type::Object { fields, .. } = v {
+                let payload = Self::sumnode_variant_payload_fields(fields, &key);
+                max = max.max(Self::sumnode_variant_size(&payload));
+            }
+        }
+        max
+    }
+
+    /// The dense variant tag (declaration order) for the variant whose discriminant value is `disc`.
+    pub(crate) fn sumnode_variant_tag(ty: &Type, disc: &str) -> Option<u32> {
+        let key = Self::sum_type_discriminant(ty)?;
+        let variants = match ty {
+            Type::Union(vs) => vs,
+            _ => return None,
+        };
+        for (i, v) in variants.iter().enumerate() {
+            if let Type::Object { fields, .. } = v {
+                if let Some(Type::StrLit(s)) = fields.get(&key) {
+                    if s == disc {
+                        return Some(i as u32);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The payload field map of the variant whose discriminant value is `disc`.
+    pub(crate) fn sumnode_variant_by_disc(
+        ty: &Type,
+        disc: &str,
+    ) -> Option<indexmap::IndexMap<String, Type>> {
+        let key = Self::sum_type_discriminant(ty)?;
+        let variants = match ty {
+            Type::Union(vs) => vs,
+            _ => return None,
+        };
+        for v in variants {
+            if let Type::Object { fields, .. } = v {
+                if let Some(Type::StrLit(s)) = fields.get(&key) {
+                    if s == disc {
+                        return Some(Self::sumnode_variant_payload_fields(fields, &key));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Returns true when the element type maps to a flat unboxed scalar array.
     /// Only concrete fixed-width numeric scalars qualify — not Bool (stored as i1,
     /// awkward to pack densely), not pointers, not unions.

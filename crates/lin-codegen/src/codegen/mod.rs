@@ -1274,6 +1274,48 @@ impl<'ctx> Codegen<'ctx> {
                             // otherwise fall through to the boxed `LinObject` path. (Oracle-proven byte
                             // identical to the former `sealed_scalar_fields(ty) && all_present` gate.)
                             let repr = func.repr_of(*dst);
+                            // UNBOXED SUM TYPE (unboxed-sumtype Stage 1): when the pass labelled this
+                            // temp `Packed(SumNode)`, construct a `SumNode` directly — store the
+                            // inline variant tag + each scalar payload field by offset (no string keys,
+                            // no box). The variant is identified by the literal's discriminant value,
+                            // which is the `StrLit` static type of the discriminant field's temp.
+                            //
+                            // NOTE: currently INERT — `repr::type_seed`/`make_object_repr` do not yet
+                            // emit `Packed(SumNode)` (the seed is gated off pending the call ABI), so
+                            // this branch is never taken on the present corpus. It is the wired
+                            // construct site the ABI follow-up flips on by enabling the seed.
+                            if let Some(sum_ty) = repr.sumnode_sum_ty() {
+                                let sum_ty = sum_ty.clone();
+                                if let Some(disc_key) = Self::sum_type_discriminant(&sum_ty) {
+                                    // Find the discriminant value from the literal field's StrLit type.
+                                    let disc_val = fields.iter().find_map(|(k, t)| {
+                                        if k == &disc_key {
+                                            match func.temp_types.get(t) {
+                                                Some(Type::StrLit(s)) => Some(s.clone()),
+                                                _ => None,
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    if let Some(disc_val) = disc_val {
+                                        let field_vals: Vec<(String, BasicValueEnum<'ctx>, Type)> = fields
+                                            .iter()
+                                            .filter_map(|(k, t)| {
+                                                temp_map.get(t).map(|v| {
+                                                    let vty = func.temp_types.get(t).cloned().unwrap_or(Type::Null);
+                                                    (k.clone(), *v, vty)
+                                                })
+                                            })
+                                            .collect();
+                                        let node = self.sumnode_construct(&sum_ty, &disc_val, &field_vals);
+                                        temp_map.insert(*dst, node);
+                                        continue;
+                                    }
+                                }
+                                // Fall through to the boxed path if the discriminant could not be
+                                // resolved statically (fail-safe — should not happen for a sum literal).
+                            }
                             if let Some(sf) = repr.packed_struct_fields() {
                                 {
                                     let field_vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> = fields.iter().filter_map(|(k, t)| {

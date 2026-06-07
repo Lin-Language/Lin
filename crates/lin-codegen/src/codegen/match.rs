@@ -156,6 +156,14 @@ impl<'ctx> Codegen<'ctx> {
             }
             return val;
         }
+        // NOTE (unboxed-sumtype Stage 1): the sum-type Coerce boundaries (sum→variant projection,
+        // sum→Json materialize, Json→sum reconstruction) are implemented as codegen helpers
+        // (`sumnode_project_to_sealed` / `sumnode_materialize_to_object` / `sumnode_project_from_boxed`)
+        // but are NOT yet wired in here, because they must dispatch on the operand's REPR (proof the
+        // value is physically a SumNode), not its TYPE — a tagged union's `Type` is `is_sum_type` true
+        // even while its runtime repr is still boxed (the seed is inert pending the ABI; see
+        // `repr::type_seed`). Gating on type here would route an existing boxed union through the
+        // SumNode reader → UAF. Re-enable together with the repr seed + call ABI.
         // ── Sealed scalar-record boundaries (sealed-records Stage 1) ──────────────────────
         // Order matters: handle sealed→X and X→sealed BEFORE the generic union arms, because a
         // sealed Object is not `is_union_type` but DOES need a representation conversion.
