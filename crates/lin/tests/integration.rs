@@ -13648,6 +13648,35 @@ print("${toString(final["a"] + final["b"] + final["c"])}")
     assert_eq!(out, vec!["50035001"]);
 }
 
+#[test]
+fn test_sealed_heap_field_factory_return_literal_released_and_correct() {
+    // REGRESSION (return-position sealed-literal leak): a factory function whose BODY is a sealed
+    // heap-field record LITERAL returned directly (`mk = (x): Trip => { "id": "t", "dep": x }`).
+    // The body-return lowering used to lower the literal as a BOXED `lin_object_alloc`, then emit a
+    // project-into-sealed `Coerce` at the return site; the boxed `LinObject` intermediate (+ its
+    // String field) was ORPHANED (kept by `pop_scope_releasing_keep(&[ret_temp, raw_ret])` but not
+    // the actual return value) → ~88 B leaked PER CALL. The fix routes the body literal through the
+    // packed-construction fast path (`try_lower_sealed_literal`) when the effective return target is
+    // a sealed scalar record, so no box is built. ASan (the asan CI job over a call-in-loop like
+    // this) is the leak guard — a real per-call leak SCALES with N; here we assert correctness
+    // (a reordered-field literal must still read by name, and an over-eager free would crash/garble).
+    let out = run(r#"
+import { print } from "std/io"
+type Trip = { "id": String, "dep": Int32, "arr": Int32 }
+val mk = (x: Int32): Trip => { "arr": x + 1, "id": "t", "dep": x }
+val build = (): Int32 =>
+  val t = mk(5)
+  t["dep"] * 100 + t["arr"]
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc else loop(i + 1, n, build())
+print("${loop(0, 5000, 0)}")
+"#);
+    // mk(5): dep=5, arr=6; build() = 5*100 + 6 = 506 (constant); loop returns the last build() = 506.
+    // The literal is written in REORDERED field order ({arr, id, dep}) to assert the packed
+    // construction normalizes to declaration order and reads correctly by name.
+    assert_eq!(out, vec!["506"]);
+}
+
 // ───────────────── Stack allocation of non-escaping sealed records (Stage 4) ─────────────────
 // The escape analysis (lin_ir::escape) marks an all-scalar sealed-record construction whose value
 // PROVABLY does not escape its frame for stack allocation (a reused function-entry-block alloca,
