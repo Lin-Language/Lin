@@ -3084,6 +3084,67 @@ print(toString([1, 2, 3].map((x, i) => x + i)))
 }
 
 #[test]
+fn test_generic_result_param_in_record_field_pinned() {
+    // Regression: a generic function whose RESULT type-parameter only appears INSIDE a record
+    // field (`value: U` of `mapOk(...): Result<U, E>`) must be pinned from the call's arguments.
+    // Previously `apply_type_subs` did not recurse into `Type::Object` fields, so the result stayed
+    // `{ value: ?U } | …` (an unsubstituted generic TypeVar), and indexing that multi-variant union
+    // produced an opaque fresh inference var (`?T … | Null`) instead of the resolved field type.
+    //
+    // POSITIVE: with `U` pinned to `Int32`, `mapOk(ok(21), dbl)["value"]` is the sound `Int32 | Null`
+    // (the `failure` arm has no `value` — §6.1 safe-bracket / ADR-044 R1), usable wherever a nullable
+    // Int is accepted. The program runs and prints the resolved value, proving the field was pinned.
+    let output = run(r#"import { print } from "std/io"
+import { length } from "std/array"
+import { toString } from "std/string"
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+type MaybeInt = Int32 | Null
+val ok = <T, E>(v: T): Result<T, E> =>
+  { "type": "success", "value": v }
+val mapOk = <T, U, E>(r: Result<T, E>, f: (T) => U): Result<U, E> =>
+  match r
+    has { "type": "success", value } => ok(f(value))
+    else => r
+val dbl = (x: Int32): Int32 =>
+  x * 2
+val v: MaybeInt = mapOk(ok(21), dbl)["value"]
+val n: Int32 = if v == null then 0 else v
+print(toString(n))
+val arr: MaybeInt[] = [mapOk(ok(21), dbl)["value"]]
+print(toString(length(arr)))
+"#);
+    // `dbl(21) = 42`; the single-element array has length 1.
+    assert_eq!(output, vec!["42", "1"]);
+
+    // DIAGNOSTIC: the same construct fed into a strict (non-nullable) `Int32[]` context is correctly
+    // rejected (the union access is `Int32 | Null`, not `Int32`) — but the message must now name the
+    // RESOLVED `Int32 | Null`, not the pre-fix unresolved inference var. Asserting the resolved type
+    // appears (and no `?T…` typevar leaks) is what locks in the inference fix.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { length } from "std/array"
+import { toString } from "std/string"
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+val ok = <T, E>(v: T): Result<T, E> =>
+  { "type": "success", "value": v }
+val mapOk = <T, U, E>(r: Result<T, E>, f: (T) => U): Result<U, E> =>
+  match r
+    has { "type": "success", value } => ok(f(value))
+    else => r
+val dbl = (x: Int32): Int32 =>
+  x * 2
+val runBody = (body: () => Int32[]): Int32[] =>
+  body()
+val out = runBody(() => [mapOk(ok(21), dbl)["value"]])
+print(toString(length(out)))
+"#);
+    assert!(
+        err.contains("Int32 | Null") && !err.contains("?T"),
+        "result type-param must be pinned to Int32 (no unresolved ?T typevar), got: {}",
+        err
+    );
+}
+
+#[test]
 fn test_generic_callback_param_back_inference() {
     // A generic function pins its type parameter `T` from a (type-pinning) argument and that
     // concrete type must be BACK-INFERRED into an UNANNOTATED callback parameter's body. Closes the
