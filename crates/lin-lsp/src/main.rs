@@ -1615,7 +1615,7 @@ fn collect_param_spans_in_expr(expr: &lin_parse::ast::Expr, out: &mut HashSet<(u
             }
             collect_param_spans_in_expr(body, out);
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             collect_param_spans(stmts, out);
             collect_param_spans_in_expr(tail, out);
         }
@@ -1695,7 +1695,7 @@ fn collect_type_spans_in_expr(expr: &lin_parse::ast::Expr, out: &mut Vec<lin_com
             }
             collect_type_spans_in_expr(body, out);
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             collect_type_spans(stmts, out);
             collect_type_spans_in_expr(tail, out);
         }
@@ -2048,7 +2048,7 @@ fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::a
             f(scrutinee);
             for arm in arms { f(&arm.body); }
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             for s in stmts {
                 match s {
                     Stmt::Val { value, .. } | Stmt::Var { value, .. } => f(value),
@@ -2060,7 +2060,7 @@ fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::a
             f(tail);
         }
         E::Function { body, .. } => f(body),
-        E::Object(fields, _) => {
+        E::Object(fields, _, _) => {
             for field in fields {
                 match field {
                     ObjectField::Pair(k, v) => { f(k); f(v); }
@@ -2068,7 +2068,7 @@ fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::a
                 }
             }
         }
-        E::Array(items, _) => { for it in items { f(it); } }
+        E::Array(items, _, _) => { for it in items { f(it); } }
         E::Assign { value, .. } => f(value),
         E::IndexAssign { object, key, value, .. } => { f(object); f(key); f(value); }
         E::Is { expr, .. } | E::Has { expr, .. } => f(expr),
@@ -2528,7 +2528,7 @@ fn find_enclosing_call_in_expr(
                 }
             }
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             if let Some(r) = find_enclosing_call(stmts, source, offset) {
                 *best = Some(r);
             }
@@ -2778,7 +2778,7 @@ fn collect_unannotated_bindings_in_expr(
 ) {
     use lin_parse::ast::Expr as E;
     match expr {
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             collect_unannotated_bindings(stmts, ty_by_stmt, out);
             collect_unannotated_bindings_in_expr(tail, ty_by_stmt, out);
         }
