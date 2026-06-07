@@ -3135,6 +3135,65 @@ print(toString([1, 2, 3].map((x, i) => x + i)))
 }
 
 #[test]
+fn test_generic_phantom_union_param_and_record_field_pinned() {
+    // Regression (monomorphizer root cause): a generic function with a PHANTOM type parameter `E`
+    // that appears ONLY inside an un-constructed union arm of its return type
+    // (`{ "type": "failure", "error": E }` of `Result<T, E>`) must NOT be rejected as
+    // uninferrable. The innermost `ok(21)` pins `T = Int32` from its argument; `E` is bound to
+    // itself by union-arm matching (nothing at the call carries it), which previously tripped
+    // "cannot infer a concrete type". `E` is now recognised as a phantom return param and erased to
+    // the `$Json` wildcard (it never reaches a constructed value), so the call monomorphizes.
+    //
+    // It also exercises the field-substitution + per-variant union index fixes: `mapOk(ok(21), dbl)`
+    // infers `U = Int32`, giving `Result<Int32, E>`, and `["value"]` resolves PRECISELY to
+    // `Int32 | Null` (the `failure` arm has no `value` — §6.1 safe-bracket / ADR-044 R1), matching
+    // the `MaybeInt = Int32 | Null` annotation. The program compiles and runs.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+type MaybeInt = Int32 | Null
+val ok = <T, E>(v: T): Result<T, E> =>
+  { "type": "success", "value": v }
+val mapOk = <T, U, E>(r: Result<T, E>, f: (T) => U): Result<U, E> =>
+  match r
+    has { "type": "success", value } => ok(f(value))
+    else => r
+val dbl = (x: Int32): Int32 =>
+  x * 2
+val v: MaybeInt = mapOk(ok(21), dbl)["value"]
+val arr: MaybeInt[] = [mapOk(ok(21), dbl)["value"]]
+print("ok")
+"#);
+    assert_eq!(output, vec!["ok"]);
+
+    // DIAGNOSTIC: feeding the same union access into a strict (non-nullable) `Int32[]` context is
+    // correctly rejected — the union index is `Int32 | Null`, not `Int32`. The message must name the
+    // RESOLVED `Int32 | Null` (proving the field was pinned), with no unresolved `?T…` typevar.
+    let err = run_expect_err(r#"import { print } from "std/io"
+import { length } from "std/array"
+import { toString } from "std/string"
+type Result<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+val ok = <T, E>(v: T): Result<T, E> =>
+  { "type": "success", "value": v }
+val mapOk = <T, U, E>(r: Result<T, E>, f: (T) => U): Result<U, E> =>
+  match r
+    has { "type": "success", value } => ok(f(value))
+    else => r
+val dbl = (x: Int32): Int32 =>
+  x * 2
+val runBody = (body: () => Int32[]): Int32[] =>
+  body()
+val out = runBody(() => [mapOk(ok(21), dbl)["value"]])
+print(toString(length(out)))
+"#);
+    assert!(
+        err.contains("Int32 | Null") && !err.contains("?T"),
+        "result type-param must be pinned to Int32 (no unresolved ?T typevar), got: {}",
+        err
+    );
+}
+
+#[test]
 fn test_generic_callback_param_back_inference() {
     // A generic function pins its type parameter `T` from a (type-pinning) argument and that
     // concrete type must be BACK-INFERRED into an UNANNOTATED callback parameter's body. Closes the
