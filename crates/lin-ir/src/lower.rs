@@ -2039,6 +2039,25 @@ fn lower_coerce_arg(arg: Temp, arg_ty: &Type, param_ty: Option<&Type>, builder: 
         // sealed array keeps its own ownership.
         return dst;
     }
+    // UNBOXED SUM TYPE (unboxed-sumtype Stage 3): a BOXED/Json arg flowing into a sum-typed PARAM
+    // (physically a `*SumNode` under the ABI) must be PROJECTED into a fresh `*SumNode` — codegen's
+    // call-arg coercion (`compile_ir_coerce_with_repr` / `box_value` reverse) lowers a boxed→sum edge
+    // via `sumnode_project_from_boxed`, which allocates a fresh +1 node. Emit an explicit `Coerce`
+    // here and REGISTER IT OWNED so the call-site scope releases that +1 after the call — else it
+    // leaks one SumNode subtree per call (ASan: a 48-byte/iteration leak that scales with the loop).
+    // Fires when the param IS a Stage-eligible sum type but the arg is NOT already physically a sum
+    // value (a boxed `sum|Null`, a partially-expanded recursive union from a container field read, or
+    // a Json source). When the arg IS already the eligible sum union, it is a verbatim SumNode
+    // pointer pass-through (no coercion) handled by the fall-through `arg` return below.
+    if crate::repr::sum_type_eligible(param_ty)
+        && !crate::repr::sum_type_eligible(arg_ty)
+        && !matches!(arg_ty, Type::Named(_))
+    {
+        let dst = builder.alloc_temp(param_ty.clone());
+        builder.emit(Instruction::Coerce { dst, src: arg, from_ty: arg_ty.clone(), to_ty: param_ty.clone() });
+        builder.register_owned(dst, param_ty.clone());
+        return dst;
+    }
     // Box/unbox across the union boundary.
     if is_union_ty(param_ty) != is_union_ty(arg_ty) {
         let dst = builder.alloc_temp(param_ty.clone());

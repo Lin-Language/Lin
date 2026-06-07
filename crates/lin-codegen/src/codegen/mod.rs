@@ -1558,6 +1558,42 @@ impl<'ctx> Codegen<'ctx> {
                                 if let Some(&val) = temp_map.get(val_temp) {
                                     let key_str = self.compile_string_lit(key).into_pointer_value();
                                     let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
+                                    // UNBOXED SUM TYPE (unboxed-sumtype Stage 3): a sum-typed field
+                                    // value is physically a `*SumNode`, NOT a boxed TaggedVal*. The
+                                    // generic union branch below would store the raw SumNode pointer as
+                                    // if it were already a box → the read-back `object_get` reads a
+                                    // SumNode header as a LinObject → garbage / crash.
+                                    //
+                                    // MATERIALIZE it to a real boxed LinObject — the safe, always-sound
+                                    // boundary for a record field (which may flow to toString / match /
+                                    // spread, and whose READ-back type partially expands the recursive
+                                    // children, so a keep-packed `TAG_SUMNODE` store could not be matched
+                                    // by a type-driven read decision — see the deferral note below).
+                                    // `box_value` heap-boxes the materialized object as TAG_OBJECT (and
+                                    // handles the `sum|Null` null case); the freshly materialized object
+                                    // is +1, `object_set_fresh` retains it into the slot, release the
+                                    // transient box after.
+                                    //
+                                    // KEEP-PACKED-BY-POINTER for a record/Json field slot is DEFERRED:
+                                    // the field's READ-back type and the stored VALUE's type are
+                                    // structurally different (the record field type expands the recursive
+                                    // sum children one level to `Union`, while the value carries them as
+                                    // `Named` — so `is_sum_type`/`sum_type_eligible` disagree between the
+                                    // store and the read). A keep-packed decision must therefore be
+                                    // REPR-driven (the repr pass carries a consistent label), which needs
+                                    // the lowering/repr STEP-4 — out of this change's scope. The
+                                    // TAG_SUMNODE runtime substrate + codegen helpers are in place.
+                                    if Self::is_sum_type(&val_ty)
+                                        || Self::sum_member_of_nullable_union(&val_ty).is_some()
+                                    {
+                                        let boxed = self.box_value(val, &val_ty);
+                                        let set_fn = if use_fresh { self.rt.object_set_fresh } else { self.rt.object_set };
+                                        self.builder.call(set_fn, &[obj_ptr.into(), key_str.into(), boxed.into()], "");
+                                        if boxed.is_pointer_value() {
+                                            self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                                        }
+                                        continue;
+                                    }
                                     // A union/Json-typed field value is ALREADY a boxed TaggedVal*
                                     // — pass it straight to lin_object_set. Re-wrapping it via
                                     // build_tagged_val_alloca would store the pointer under a
