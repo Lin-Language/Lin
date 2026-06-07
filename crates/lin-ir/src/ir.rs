@@ -442,6 +442,14 @@ pub enum Instruction {
     FreeBoxShellIfDistinct { val: Temp, other: Temp },
     /// result = val is type_tag? (returns bool)
     IsType { dst: Temp, val: Temp, ty: Type },
+    /// UNBOXED SUM TYPE (unboxed-sumtype Stage 1): `result = (val's inline tag == the tag of the
+    /// variant whose discriminant value is `disc_value`)` — the O(1) match/`is` dispatch over a
+    /// packed `SumNode` scrutinee. Emitted by `emit_discriminator` when the scrutinee's repr is
+    /// `Packed(SumNode)`, REPLACING the boxed `Index(scrut, disc) == StrLit` (materialize + object_get
+    /// + string-eq) with a single tag load + integer compare. `val` MUST be a SumNode (the lowerer
+    /// only emits this when the discriminator's scrutinee is sum-eligible; codegen reads `func.repr`
+    /// to confirm and falls back to the boxed compare otherwise — soundness).
+    SumTagEq { dst: Temp, val: Temp, sum_ty: Type, disc_value: String },
     /// result = val has pattern? (returns bool)
     HasPattern { dst: Temp, val: Temp, pattern: HasDesc },
     /// result = `val` deeply conforms to `target`? (returns bool) — `is <ObjectType>` deep

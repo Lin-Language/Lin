@@ -2094,11 +2094,73 @@ fn lower_value_into_slot(
     builder: &mut FuncBuilder,
     ctx: &mut LowerCtx,
 ) -> Temp {
+    if let Some(t) = try_lower_sum_literal(value, slot_ty, builder, ctx) {
+        return t;
+    }
     if let Some(t) = try_lower_sealed_literal(value, slot_ty, builder, ctx) {
         return t;
     }
     let t = lower_expr(value, builder, ctx);
     coerce_to_slot_type_owning_bind(t, &value.ty(), slot_ty, builder)
+}
+
+/// UNBOXED SUM TYPE (unboxed-sumtype Stage 1) — direct SumNode construction fast path. When `value`
+/// is an object literal (no spreads) flowing into a Stage-1-eligible sum-type slot, emit a
+/// `MakeObject` whose `ty` IS the sum type so the repr pass labels the temp `Packed(SumNode)` and
+/// codegen's MakeObject branch packs it DIRECTLY via `sumnode_construct` — skipping the
+/// build-a-boxed-`LinObject`-then-`sumnode_project_from_boxed` round-trip the generic coercion path
+/// would otherwise pay every construction (the dominant cost the sum-dispatch benchmark exposed).
+/// The discriminant field must be a `StrLit` (the variant tag); otherwise fall through (None).
+fn try_lower_sum_literal(
+    value: &TypedExpr,
+    slot_ty: &Type,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<Temp> {
+    if !crate::repr::sum_type_eligible(slot_ty) {
+        return None;
+    }
+    let (fields, spreads) = match value {
+        TypedExpr::MakeObject { fields, spreads, .. } => (fields, spreads),
+        _ => return None,
+    };
+    if !spreads.is_empty() {
+        return None;
+    }
+    // The discriminant field's value must be a string literal so codegen can statically pick the
+    // variant tag. Codegen reads the disc field TEMP's type as `StrLit` (a string const is otherwise
+    // typed plain `Str`), so force the disc temp's recorded type to `StrLit(value)`.
+    let disc_key = crate::repr::sum_type_discriminant_of(slot_ty)?;
+    let lowered_fields: Vec<(String, Temp)> = fields
+        .iter()
+        .map(|(k, v)| {
+            let t = lower_expr(v, builder, ctx);
+            if k == &disc_key {
+                if let TypedExpr::StringLit(s, _, _) = v {
+                    builder.temp_types.insert(t, Type::StrLit(s.clone()));
+                }
+            }
+            (k.clone(), t)
+        })
+        .collect();
+    // Bail if the discriminant didn't resolve to a StrLit temp (e.g. a computed key) — fall back to
+    // the boxed coercion path, which `sumnode_project_from_boxed` handles soundly.
+    let disc_ok = lowered_fields.iter().any(|(k, t)| {
+        k == &disc_key && matches!(builder.temp_types.get(t), Some(Type::StrLit(_)))
+    });
+    if !disc_ok {
+        return None;
+    }
+    let dst = builder.alloc_temp(slot_ty.clone());
+    builder.emit(Instruction::MakeObject {
+        dst,
+        fields: lowered_fields,
+        spreads: vec![],
+        ty: slot_ty.clone(),
+        stack: false,
+    });
+    builder.register_owned(dst, slot_ty.clone());
+    Some(dst)
 }
 
 /// Coerce a value into a (plain, non-cell) local/global SLOT the binding will OWN, transferring
@@ -3092,6 +3154,13 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                     Type::Object { fields, .. } => Type::object(fields.clone()),
                     _ => unreachable!(),
                 },
+                // UNBOXED SUM TYPE (unboxed-sumtype Stage 1): a `Shape[]` is a BOXED `Object[]` (the
+                // union element representation). Lower the element slot type to the dynamic Json
+                // wildcard so each element (a SumNode) is MATERIALIZED to a boxed `LinObject` by
+                // `coerce_to_slot_type` (the codegen Coerce reads the SumNode repr and materializes).
+                // The read-back (`compile_ir_index`, sum result) projects each boxed element back into
+                // a fresh SumNode, keeping the repr consistent end-to-end.
+                Type::Array(inner) if crate::repr::sum_type_eligible(inner) => Type::TypeVar(u32::MAX),
                 Type::Array(inner) => *inner.clone(),
                 // A fixed-length array (`[T1, T2, ...]`, §5.3) has heterogeneous positional
                 // types, so it is stored as a TAGGED (Json) array — each element boxes to a
@@ -4495,6 +4564,27 @@ fn type_repr_differs(from: &Type, to: &Type) -> bool {
     {
         return false;
     }
+    // UNBOXED SUM TYPE (unboxed-sumtype Stage 1): a value whose type is a Stage-1-eligible sum type
+    // is physically a `SumNode*` (the seed). Crossing into a NON-sum slot (Json wildcard, a
+    // differently-shaped union, an unsealed object, a concrete variant record) is a representation
+    // change — the codegen Coerce materializes/projects the node. The reverse (a Json/boxed/variant
+    // source into a sum slot) is likewise a change. When BOTH sides are the SAME sum type there is no
+    // change (the SumNode pointer carries verbatim — `from == to` short-circuits via the equal-type
+    // checks the callers already do; here we only fire on a genuine mismatch).
+    // A sum value flowing into (or out of) a `Named` type reference is the SELF-RECURSIVE-call case
+    // (the callee reads the SAME `Named` param consistently as a SumNode — its body's match/FieldGet
+    // resolve `Named` to the sum Union). Same physical representation (a SumNode pointer), no
+    // conversion — mirrors the sealed-scalar-record `Named` pass-through guard above. Without this,
+    // `eligible(sum)=true != eligible(Named)=false` would wrongly materialize the node at the
+    // recursive call (the recursive sum-param crash).
+    if (crate::repr::sum_type_eligible(from) && matches!(to, Type::Named(_)))
+        || (crate::repr::sum_type_eligible(to) && matches!(from, Type::Named(_)))
+    {
+        return false;
+    }
+    if crate::repr::sum_type_eligible(from) != crate::repr::sum_type_eligible(to) {
+        return true;
+    }
     // The union/Json box boundary.
     if is_union_ty(from) != is_union_ty(to) {
         return true;
@@ -5585,11 +5675,18 @@ fn lower_if(
     // --- then branch ---
     builder.switch_to(then_block);
     builder.push_scope();
-    let then_raw = lower_expr(then_br, builder, ctx);
+    // UNBOXED SUM TYPE: a sum-eligible object LITERAL branch flowing into a sum-typed `if` result
+    // is constructed DIRECTLY as a SumNode (skip the build-boxed-then-project round-trip). When it
+    // fires, the branch value already carries the sum type, so `coerce_if_branch` sees value_ty ==
+    // result_type and just transfers the owned +1 (no re-coercion).
+    let (then_raw, then_eff_ty) = match try_lower_sum_literal(then_br, result_type, builder, ctx) {
+        Some(t) => (t, result_type.clone()),
+        None => (lower_expr(then_br, builder, ctx), then_br.ty()),
+    };
     let mut then_reassigned: Vec<(usize, Temp)> = Vec::new();
     let mut then_pred = builder.current_block;
     let then_live = if !builder.is_current_block_terminated() {
-        let (then_val, mut keep, owned) = coerce_if_branch(then_raw, &then_br.ty(), result_type, builder);
+        let (then_val, mut keep, owned) = coerce_if_branch(then_raw, &then_eff_ty, result_type, builder);
         merge_owned = owned;
         // A slot the branch rebound holds a value registered owned in THIS branch scope (the
         // LocalSet's value temp). It must survive the branch pop so the join phi can forward it,
@@ -5615,11 +5712,14 @@ fn lower_if(
     // --- else branch ---
     builder.switch_to(else_block);
     builder.push_scope();
-    let else_raw = lower_expr(else_br, builder, ctx);
+    let (else_raw, else_eff_ty) = match try_lower_sum_literal(else_br, result_type, builder, ctx) {
+        Some(t) => (t, result_type.clone()),
+        None => (lower_expr(else_br, builder, ctx), else_br.ty()),
+    };
     let mut else_reassigned: Vec<(usize, Temp)> = Vec::new();
     let mut else_pred = builder.current_block;
     let else_live = if !builder.is_current_block_terminated() {
-        let (else_val, mut keep, owned) = coerce_if_branch(else_raw, &else_br.ty(), result_type, builder);
+        let (else_val, mut keep, owned) = coerce_if_branch(else_raw, &else_eff_ty, result_type, builder);
         merge_owned = owned;
         else_reassigned = builder.collect_reassigned_slots(&pre_slots, ctx);
         for (_, t) in &else_reassigned {
@@ -6016,6 +6116,27 @@ fn emit_discriminator(
 ) -> Temp {
     match disc {
         Discriminator::StrLit { key, value } => {
+            // UNBOXED SUM TYPE (unboxed-sumtype Stage 1): when the scrutinee's static type is a
+            // Stage-1-eligible sum type, it is physically a `SumNode` (the seed). Replace the boxed
+            // `scrut[disc] == "value"` (materialize + object_get + string-eq) with a single inline-tag
+            // compare (`SumTagEq`) — the O(1) dispatch the unboxed representation exists for. The
+            // resolved scrutinee type may be behind a `Named` alias; `crate::repr::sum_type_eligible`
+            // only matches a bare `Union`, so unfold one level via the discriminator's own key check.
+            let sum_view = if crate::repr::sum_type_eligible(scrut_ty) {
+                Some(scrut_ty.clone())
+            } else {
+                None
+            };
+            if let Some(sum_ty) = sum_view {
+                let dst = builder.alloc_temp(Type::Bool);
+                builder.emit(Instruction::SumTagEq {
+                    dst,
+                    val: scrut,
+                    sum_ty,
+                    disc_value: value.clone(),
+                });
+                return dst;
+            }
             builder.push_scope();
             // got = scrut[key]
             let key_temp = builder.const_temp(Const::Str(key.clone()));
