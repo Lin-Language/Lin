@@ -2296,3 +2296,52 @@ separate patch.
 - If (i)'s on-read materialise proves too costly on a measured hot path, fall back to (ii)
   (cross-module record-taint) for the specific record, OR keep that record boxed (today's behaviour) —
   never a correctness compromise.
+
+## ADR-064: Unboxed tagged sum types (`SumNode`) + keep-packed-through-containers via a runtime tag
+
+**Status**: Accepted (Stages 0–4 implemented + measured on `feat/sumtype-integration`; design +
+6-stage plan in `docs/UNBOXED_SUMTYPE_DESIGN.md`).
+
+**Problem.** A recursive tagged union typed as `Json` (the interpreter/parser/compiler workload class —
+`type Ast = Num | BinOp`) compiles to boxed string-keyed `LinObject`s reached by non-inlined
+`lin_object_get` per field, with `lin_matches_schema` dispatch. Measured ~77× Rust on the `interp`
+benchmark. Neither sealed records (monomorphic, one field-map) nor the shipped union-discrimination
+(still boxed) close it, because the value is intrinsically a *union* AND *recursive*. The only
+representation that does is an unboxed tagged sum type — an inline discriminant + max-variant packed
+payload, recursive children by `*SumNode` pointer, O(1) tag-switch dispatch, const-offset fields.
+
+**Decision.** A union of ≥2 sealed records sharing a distinct `StrLit` discriminant, every other field a
+scalar or a recursive self-reference, packs as a heap `SumNode` `[u32 rc | u32 size | u64 desc | u32 tag
+| u32 pad | payload]` (mirrors the sealed-record header so `lin_rc_retain` works verbatim). It is another
+`Repr::Packed(Layout::SumNode)` in the ADR-062 pass — same single-owner dataflow, same
+materialize-at-dynamic-edges discipline. Self-recursion is detected env-free (the unique `Named` in the
+variant fields). Recursive children are `KIND_SUMNODE` owned pointer slots with a recursive RC drop walk.
+
+**The hard part — keep-packed through boxed containers, and how the store/read asymmetry was solved.**
+For a `SumNode` to stay unboxed inside a boxed record field or `{String:_}` map value (essential: the
+`interp` parser cursor `{node, pos}` else round-trips boxed↔packed every parse step and the unboxed-eval
+win is *swamped* — measured 0.768 s, a regression vs the 0.526 s `Json` baseline), the store and the read
+must agree on representation. They CAN'T agree statically: the store sees the value's sum-union type, the
+read sees the field's declared type which the checker leaves as a partially-expanded `Named`/`Union`. The
+resolution is a **distinct runtime tag `TAG_SUMNODE`** that makes the slot self-describing — the read
+dispatches on the tag (`TAG_SUMNODE` → unwrap the still-packed `*SumNode` zero-copy + retain; `TAG_OBJECT`
+→ project), so no static agreement is needed and the general repr STEP-4 coercion pass was NOT required.
+The tag also routes the slot's RC to `lin_sumnode_release_self` (never `lin_object_release`, which would
+misread the SumNode's offset-4 size as a `LinObject` length — the type-confusion class). The
+genuinely-dynamic consumers (`toString`/`==`/json/spread/worker-transfer) MATERIALIZE to a real
+`LinObject` via a per-type materializer fn-ptr stored at the `SumDesc` head, so a kept-packed pointer
+never escapes its representation domain (a cross-thread one would be a UAF). **Result: `interp` 0.437 s,
+1.20× faster than the `Json` baseline and 1.76× faster than the materializing port; `evalNode` fully
+unboxed.** With the AST unboxed the next floor is tokenizer strings / `Token[]` alloc / closure ABI, not
+the AST — so Stage 5 (FBIP node reuse) is deferred as low-value until profiling says node alloc/RC
+dominates.
+
+**Soundness.** Every stage is ASan-gated (the recurring RC/UAF class; `cargo test` does not catch it).
+The repr `oracle_check`/`verify` debug-asserts gained `SumNode` arms making a packed/boxed mismatch a
+debug-build compile panic. Two classes of bug were found ONLY by behavioral + ASan testing of the
+canonical *build-in-a-function-and-return* and *store-in-a-container-and-read-back* shapes (NOT by
+`cargo test`, and NOT by the agents' inline-construct tests): a tail-return nested-child pushdown gap, an
+untyped-object store CloneBox-on-raw-SumNode overflow, and a map-round-trip double-release (four arg
+classifiers each claiming the one projected node). **Lesson: for representation changes, ASan-green ≠
+correct — a wrong-repr read is often an ASan-invisible logic error; verify the real workload shape
+behaviorally.**

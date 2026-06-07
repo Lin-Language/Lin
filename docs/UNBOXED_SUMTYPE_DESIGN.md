@@ -1,14 +1,33 @@
 # Unboxed Tagged Sum-Type Representation — Design + Scope Spike
 
-**Status**: Stage 0 + Stage 1 + Stage 2 are now LIVE. Stage 2 packs RECURSIVE sum types: a
-`type Ast = Num | BinOp` whose `BinOp` carries recursive `left`/`right : Ast` children compiles
-end-to-end as unboxed `SumNode`s with the recursive children stored as 8-byte owned `*SumNode`
-pointer slots (`KIND_SUMNODE` in the static `SumDesc`), a recursive drop walk, const-offset
-child-load (borrowed interior `*SumNode`), and nested-literal discriminant pushdown so a nested
-`{ "kind": … }` literal constructs a child `SumNode` directly. The recursive RC drop is ASan-clean
-(every node freed exactly once; only the immortal string-interner allocations "leak", identically
-to the boxed baseline). The remaining stages (3 keep-packed-across-containers, 4 interp port,
-5 FBIP) are still future work.
+**Status**: Stages 0–4 are now LIVE (on branch `feat/sumtype-integration`, pending merge). Stage 2
+packs RECURSIVE sum types: a `type Ast = Num | BinOp` whose `BinOp` carries recursive
+`left`/`right : Ast` children compiles end-to-end as unboxed `SumNode`s with the recursive children
+stored as 8-byte owned `*SumNode` pointer slots (`KIND_SUMNODE` in the static `SumDesc`), a
+recursive drop walk, const-offset child-load (borrowed interior `*SumNode`), and nested-literal
+discriminant pushdown so a nested `{ "kind": … }` literal constructs a child `SumNode` directly. The
+recursive RC drop is ASan-clean (every node freed exactly once; only the immortal string-interner
+allocations "leak", identically to the boxed baseline).
+
+**Stage 3 (keep-packed across containers) — DONE, via runtime-tag dispatch.** A `SumNode` stored into
+a boxed RECORD field or a `{String:_}` MAP value stays packed-by-pointer (no materialize): a distinct
+runtime tag `TAG_SUMNODE` (lin-common/tags.rs) marks the slot, so the read-back dispatches on the tag
+(`TAG_SUMNODE` → unwrap the packed node zero-copy + retain; `TAG_OBJECT` → project). This resolved the
+store-sees-sum-union vs read-sees-partial-`Named` repr ASYMMETRY *without* the general repr STEP-4
+coercion pass — the tag makes the slot self-describing. Reads into union/Json position, and the
+genuinely-dynamic consumers (`toString`/`==`/json/spread/worker-transfer), still MATERIALIZE to a real
+`LinObject` (a per-type materializer fn-ptr stored at the `SumDesc` head drives the runtime walkers and
+the thread-transfer deep-copy), so a kept-packed pointer never escapes its representation domain.
+
+**Stage 4 (interp port) — DONE, the payoff gate PASSED.** `benchmarks/compare/interp/interp.lin` AST
+ported to `type Ast = Num | BinOp` (operator as an `Int32` code). Measured (this machine, release,
+medians): Json-AST baseline **0.526 s** → unboxed-but-materializing-cursor **0.768 s (a regression —
+the cursor round-trip swamped the eval win, exactly the §8 prediction)** → **keep-packed 0.437 s
+(1.20× faster than Json, 1.76× faster than the materializing port)**. `evalNode` is fully unboxed (0
+`lin_object_get`, inline tag-switch). RESULT=10460000 unchanged. With the AST unboxed, the remaining
+floor is the tokenizer strings + `Token[]` allocation + the `range().for()` closure ABI (≈10× still to
+Node), NOT the AST — so Stage 5 (FBIP node reuse) is deferred as low-value for this workload until
+profiling says node alloc/RC dominates (it no longer does).
 
 Stage 2 self-recursion is detected ENV-FREE: a recursive child survives type resolution as
 `Type::Named(self_name)` (the checker leaves the cyclic back-reference unexpanded), and a sum
