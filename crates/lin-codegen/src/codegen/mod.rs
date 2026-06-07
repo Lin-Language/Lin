@@ -502,6 +502,38 @@ impl<'ctx> Codegen<'ctx> {
     // LinIR-consuming codegen (Phase 3)
     // =========================================================================
 
+    /// Create the `_ir_gv_{slot}` LLVM global backing a top-level `val`/`var` slot.
+    ///
+    /// These globals are inherently translation-unit-local: nothing references them by name
+    /// across modules. Cross-module reads of an exported `val` go through a `__val` wrapper
+    /// FUNCTION (lower.rs), and an imported `var` is only read inside its own module's exported
+    /// functions — never by the importer directly. Even though all modules share one LLVM module
+    /// (and `_ir_gv_{slot}` names aren't module-prefixed, so two modules can both define slot N),
+    /// each `compile_module_from_ir` call keeps its OWN `ir_global_vals` handle map and accesses
+    /// the global by handle; LLVM auto-disambiguates the colliding names. So the slots are private
+    /// to the defining TU regardless of linkage.
+    ///
+    /// `immutable` (a top-level `val`, single-store) → `Internal` linkage. Internal linkage lets
+    /// LLVM GlobalOpt prove a single-store-of-a-constant global is itself constant and propagate
+    /// it into readers (e.g. a literal divisor `val MOD = 2147483647i64` folds from a per-iteration
+    /// `idiv` to a magic multiply-shift). A non-`immutable` top-level `var` keeps the previous
+    /// (external/default) linkage: it is genuine mutable shared state, GlobalOpt would not fold a
+    /// multi-store global anyway, and (crucially) the once-guarded var-init flag must NOT be folded
+    /// to a constant or initialisers would never run. We therefore intern ONLY immutable vals.
+    fn add_module_global(
+        module: &inkwell::module::Module<'ctx>,
+        llvm_ty: inkwell::types::BasicTypeEnum<'ctx>,
+        slot: usize,
+        immutable: bool,
+    ) -> inkwell::values::GlobalValue<'ctx> {
+        let g = module.add_global(llvm_ty, None, &format!("_ir_gv_{}", slot));
+        g.set_initializer(&llvm_ty.const_zero());
+        if immutable {
+            g.set_linkage(inkwell::module::Linkage::Internal);
+        }
+        g
+    }
+
     /// Compile a `LinModule` (produced by `lin_ir::lower_module` + `elide_rc`) to LLVM IR.
     /// This is the sole compilation backend (the legacy TypedAST path has been removed).
     pub fn compile_module_from_ir(&mut self, module: &lir::LinModule) {
@@ -1679,13 +1711,11 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, result);
                             }
                         }
-                        Instruction::GlobalValSet { slot, value, ty } => {
+                        Instruction::GlobalValSet { slot, value, ty, immutable } => {
                             if let Some(&v) = temp_map.get(value) {
                                 let llvm_ty = self.llvm_type(ty);
                                 let glob = *ir_global_vals.entry(*slot).or_insert_with(|| {
-                                    let g = self.module.add_global(llvm_ty, None, &format!("_ir_gv_{}", slot));
-                                    g.set_initializer(&llvm_ty.const_zero());
-                                    g
+                                    Self::add_module_global(&self.module, llvm_ty, *slot, *immutable)
                                 });
                                 // A top-level `var` global owns one reference to its current
                                 // value. On reassignment its previous reference must be dropped,
@@ -1705,12 +1735,10 @@ impl<'ctx> Codegen<'ctx> {
                                 self.builder.store(glob.as_pointer_value(), v);
                             }
                         }
-                        Instruction::GlobalValGet { dst, slot, ty } => {
+                        Instruction::GlobalValGet { dst, slot, ty, immutable } => {
                             let llvm_ty = self.llvm_type(ty);
                             let glob = *ir_global_vals.entry(*slot).or_insert_with(|| {
-                                let g = self.module.add_global(llvm_ty, None, &format!("_ir_gv_{}", slot));
-                                g.set_initializer(&llvm_ty.const_zero());
-                                g
+                                Self::add_module_global(&self.module, llvm_ty, *slot, *immutable)
                             });
                             let v = self.builder.load(llvm_ty, glob.as_pointer_value(), "ir_gvget");
                             temp_map.insert(*dst, v);
