@@ -59,12 +59,19 @@ export val startCodeAt = (b: UInt8[], i: Int32): Int32 =>
   else
     0
 
-// Emit the NAL spanning [lo, hi) into acc (skipping empties), nal_type = data[0]
-// & 0x1F. Matches the Rust `if !nal_data.is_empty()` guard.
+// The NAL unit type: the low 5 bits of the unit's first (header) byte. This is
+// the single definition of "nal_type" for the project — the FU-A packetizer in
+// rtp.lin extracts the same field inline (`nal[0] & 0x1F`) when building a
+// fragment header.
+export val nalType = (header: Int32): Int32 =>
+  header & 0x1F
+
+// Emit the NAL spanning [lo, hi) into acc (skipping empties), nal_type =
+// nalType(data[0]). Matches the Rust `if !nal_data.is_empty()` guard.
 val emitNal = (b: UInt8[], lo: Int32, hi: Int32, acc: NalUnit[]): Null =>
   if hi > lo then
     val data: UInt8[] = slice(b, lo, hi)
-    push(acc, { "nalType": data[0] & 0x1F, "data": data })
+    push(acc, { "nalType": nalType(data[0]), "data": data })
   else
     null
 

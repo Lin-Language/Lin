@@ -1,14 +1,15 @@
 import { suite, test, expect, run, toBe } from "std/test"
-import { clampSpeed, encodePacket, applyKey } from "./main"
+import { clampSpeed, applyKey } from "./control"
+import { encodePacket } from "./protocol"
 import { length } from "std/array"
 import { f32FromBe } from "std/bytes"
 
-// Tests for the pure protocol/control core of the RC-car controller. The
-// interactive runController (TTY + UDP loop) isn't unit-tested here — its pieces
-// (encodePacket, applyKey, clampSpeed) are, and std/net/std/tty have their own
-// coverage in the runtime test suites. Test bodies are Assertion[] arrays so every
-// assertion runs.
-val s = suite("raspberry-controller", [
+// Tests for the pure control core of the RC-car client (control.lin). The
+// interactive runController (TTY + UDP loop, in main.lin) isn't unit-tested here
+// — its pieces (encodePacket, applyKey, clampSpeed) are, and std/net/std/tty have
+// their own coverage in the runtime test suites. Test bodies are Assertion[]
+// arrays so every assertion runs.
+val s = suite("raspberry-control", [
   test("clampSpeed quantises to one decimal and clamps to [-1, 1]", () => [
     expect(clampSpeed(0.5)).toBe(0.5),
     expect(clampSpeed(0.15)).toBe(0.2), // rounds to nearest 0.1
