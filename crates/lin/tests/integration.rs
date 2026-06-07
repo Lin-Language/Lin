@@ -13469,6 +13469,59 @@ print("${toString(final["a"] + final["b"] + final["c"])}")
     );
 }
 
+#[test]
+fn test_tco_loop_fresh_arg_releases_old_slot_value() {
+    // Per-iteration TCO param release (fixes the dominant TCO-loop leak class): a tail-recursive
+    // function whose recurring arg is a FRESH heap value each iteration must release the PRIOR
+    // slot value before the back-edge overwrites it, instead of leaking it (the lowerer's
+    // scope-exit release lands in the unreachable `tco_post` block). ASan is the actual leak/
+    // double-free guard (see the ci.yml `asan` job + the synthetic repros); this test pins the
+    // OBSERVABLE behavior: every aliasing shape computes the correct result and does not crash.
+    //
+    // Shapes exercised: (a) fresh array threaded as the recurring arg; (b) a SECOND param threaded
+    // UNCHANGED alongside the fresh one (must not be released — the alias guard); (c) fresh union/
+    // Json box; (d) an array mutated IN PLACE and passed back (new value == old slot — alias guard).
+    let out = run(r#"
+import { push, length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+
+// (a)+(b): `acc` threaded unchanged, `fresh` rebuilt every round.
+val sumFresh = (acc: Json, fresh: Json, k: Int32): Int32 =>
+  if k <= 0 then length(acc)
+  else
+    var f: Json = []
+    push(f, k)
+    push(f, k + 1)
+    sumFresh(acc, f, k - 1)
+
+// (c): fresh union/Json box every round.
+val unionLoop = (m: String | Int32, k: Int32): Int32 =>
+  if k <= 0 then k
+  else
+    val fresh: String | Int32 = "r${k}"
+    unionLoop(fresh, k - 1)
+
+// (d): same array mutated in place and passed back (new == old slot value).
+val growInPlace = (acc: Json, k: Int32): Int32 =>
+  if k <= 0 then length(acc)
+  else
+    push(acc, k)
+    growInPlace(acc, k - 1)
+
+val a: Json = [1, 2, 3]
+var f0: Json = []
+print(toString(sumFresh(a, f0, 50)))
+print(toString(unionLoop(0, 50)))
+var g: Json = []
+print(toString(growInPlace(g, 50)))
+"#);
+    // sumFresh returns length(acc) = 3 (acc threaded unchanged, never mutated).
+    // unionLoop returns k at the base case = 0.
+    // growInPlace pushes 50 elements into the same array → length 50.
+    assert_eq!(out, vec!["3", "0", "50"]);
+}
+
 /// Extract the body text of the LLVM function `define ... @<name>(...) { ... }` from emitted IR.
 /// Matches on `@<name>(` so it doesn't catch a prefixed/suffixed symbol.
 fn ir_function(ir: &str, name: &str) -> String {

@@ -639,6 +639,15 @@ impl<'ctx> Codegen<'ctx> {
             // function's first IR block (the loop header) instead of recursing on the stack.
             let has_tail_call = func.blocks.iter().any(|b| matches!(b.terminator, Terminator::TailCall { .. }));
             let mut param_allocs: Vec<PointerValue<'ctx>> = Vec::new();
+            // Per owned param: a bool slot tracking whether the CURRENT value in `param_allocs[i]`
+            // is owned by the TCO loop (i.e. it was produced and stored by a prior tail iteration)
+            // rather than borrowed from the caller. Params are BORROWED under Lin's calling
+            // convention (the lowerer never releases them — see lin_ir::lower `free_arg_box_shells`
+            // doc), so the original ENTRY value must NOT be released here (the caller owns and frees
+            // it; doing so is a use-after-free at the caller). Only values the loop itself stored on
+            // a back-edge are loop-owned and must be released before the next overwrite. We start
+            // each flag at 0 (entry value = borrowed) and set it to 1 after the first back-edge store.
+            let mut tco_owns: Vec<Option<PointerValue<'ctx>>> = Vec::new();
             if has_tail_call {
                 // Emit allocas + initial stores in a dedicated entry block that branches to
                 // the first IR block (which becomes the loop header).
@@ -648,6 +657,7 @@ impl<'ctx> Codegen<'ctx> {
                     tco_entry.move_before(*first_ir_bb).ok();
                 }
                 self.builder.position_at_end(tco_entry);
+                let bool_ty = self.context.bool_type();
                 for (i, (_temp, ty)) in func.params.iter().enumerate() {
                     let llvm_ty = self.llvm_type(ty);
                     let slot = self.builder.alloca(llvm_ty, "tco_param");
@@ -655,6 +665,14 @@ impl<'ctx> Codegen<'ctx> {
                         self.builder.store(slot, pv);
                     }
                     param_allocs.push(slot);
+                    // Only owned/refcounted (and non-sealed) params can leak / need release tracking.
+                    if Self::tco_param_needs_release(ty) {
+                        let owns = self.builder.alloca(bool_ty, "tco_owns");
+                        self.builder.store(owns, bool_ty.const_zero());
+                        tco_owns.push(Some(owns));
+                    } else {
+                        tco_owns.push(None);
+                    }
                 }
                 if let Some(first_ir_bb) = func.blocks.first().and_then(|b| ir_block_to_llvm.get(&b.id)) {
                     self.builder.unconditional_branch(*first_ir_bb);
@@ -1878,9 +1896,68 @@ impl<'ctx> Codegen<'ctx> {
                     Terminator::TailCall { args } => {
                         // TCO: store the new argument values into the param allocas and
                         // branch back to the loop header (the function's first IR block).
-                        for (i, arg_temp) in args.iter().enumerate() {
-                            if let (Some(&v), Some(slot)) = (temp_map.get(arg_temp), param_allocs.get(i)) {
+                        //
+                        // Per-iteration owned-value release (fixes the dominant TCO loop leak):
+                        // each owned (refcounted) param slot holds a reference that the function
+                        // owns under the calling convention. Storing the next iteration's value
+                        // OVER it without releasing the OLD value leaks one reference every
+                        // iteration — e.g. a tail-recursive function whose recurring arg is a
+                        // FRESH array/object/string/map/union built each round (RAPTOR's
+                        // `scanRounds`/`getMarkedStops`). The scope-exit release the lowerer emits
+                        // for these lands in the unreachable `tco_post` block (the back-edge means
+                        // scope exit is never reached), so it never runs. Release the old value
+                        // here instead.
+                        //
+                        // ALIAS HAZARD: the new value for a slot may BE the old value (a
+                        // pass-through param threaded unchanged, e.g. a large borrowed `raptor`
+                        // arg) or some OTHER new arg may alias this slot's old value. Releasing an
+                        // old pointer that any new arg still references is a use-after-free /
+                        // double-free. Guard with a runtime pointer compare: release `old_i` only
+                        // if it differs from EVERY new arg value being stored this iteration.
+                        //
+                        // Capture every new value FIRST (they are already computed in temp_map),
+                        // then load+conditionally-release each owned old value, then store. We do
+                        // the release before the store so the slot still holds the old value when
+                        // we load it; loads happen for all slots up front so a later store can't
+                        // clobber an earlier old-value load.
+                        let new_vals: Vec<Option<BasicValueEnum<'ctx>>> =
+                            args.iter().map(|t| temp_map.get(t).copied()).collect();
+                        // Pointer-typed new values that an old value could alias (skip non-pointers).
+                        let new_ptrs: Vec<inkwell::values::PointerValue<'ctx>> = new_vals
+                            .iter()
+                            .filter_map(|v| v.and_then(|v| if v.is_pointer_value() { Some(v.into_pointer_value()) } else { None }))
+                            .collect();
+                        // Load all old values before storing any new value (a later store must not
+                        // clobber an earlier old-value load when params share no slot, but be safe).
+                        let mut old_vals: Vec<Option<BasicValueEnum<'ctx>>> = Vec::with_capacity(param_allocs.len());
+                        for (i, (_t, ty)) in func.params.iter().enumerate() {
+                            if tco_owns.get(i).copied().flatten().is_some() && param_allocs.get(i).is_some() {
+                                let llvm_ty = self.llvm_type(ty);
+                                old_vals.push(Some(self.builder.load(llvm_ty, param_allocs[i], "tco_old")));
+                            } else {
+                                old_vals.push(None);
+                            }
+                        }
+                        // Conditionally release each LOOP-OWNED old value (guarded against aliasing).
+                        // Only release when this slot's value was stored by a prior tail iteration
+                        // (`tco_owns[i]` is true) — never the borrowed entry param — AND the old
+                        // pointer differs from every new arg value being stored this iteration.
+                        for (i, (_t, ty)) in func.params.iter().enumerate() {
+                            if let (Some(old), Some(Some(owns))) = (old_vals[i], tco_owns.get(i)) {
+                                if old.is_pointer_value() {
+                                    self.emit_tco_release_old(llvm_fn, *owns, old.into_pointer_value(), &new_ptrs, ty);
+                                }
+                            }
+                        }
+                        // Now store the new values, and mark every owned slot as loop-owned (the
+                        // value we just stored was produced by this iteration's body).
+                        let bool_ty = self.context.bool_type();
+                        for (i, &v) in new_vals.iter().enumerate() {
+                            if let (Some(v), Some(slot)) = (v, param_allocs.get(i)) {
                                 self.builder.store(*slot, v);
+                            }
+                            if let Some(Some(owns)) = tco_owns.get(i) {
+                                self.builder.store(*owns, bool_ty.const_int(1, false));
                             }
                         }
                         if let Some(first_ir_bb) = func.blocks.first().and_then(|b| ir_block_to_llvm.get(&b.id)) {

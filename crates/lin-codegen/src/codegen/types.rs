@@ -117,6 +117,19 @@ impl<'ctx> Codegen<'ctx> {
         )
     }
 
+    /// True if a TCO-loop param of type `ty` holds an owned, heap-refcounted value whose PRIOR
+    /// slot value must be released before a tail-call back-edge overwrites it (the per-iteration
+    /// TCO leak fix). This is the owning set (`ty_is_concrete_rc` ∪ `is_union_type`) MINUS sealed
+    /// records: a sealed scalar/heap record (`sealed_fields(ty).is_some()`) is RC-SUPPRESSED and
+    /// often stack-resident (an immortal-rc `sealed_stack` alloca), so emitting `lin_sealed_release`
+    /// on it is at best a no-op and at worst defeats SROA promotion of the stack value (the very
+    /// thing the sealed-records Stage-4 RC-suppression milestone enables) — keep it OUT. A sealed
+    /// record threaded through a TCO loop therefore keeps its pre-existing (no per-iteration
+    /// release) behavior; this fix neither helps nor regresses it.
+    pub(crate) fn tco_param_needs_release(ty: &Type) -> bool {
+        (Self::ty_is_concrete_rc(ty) || Self::is_union_type(ty)) && Self::sealed_fields(ty).is_none()
+    }
+
     /// Tag for how a value of `ty` is BOXED as a scalar TaggedVal — i.e. the byte stored in
     /// the tag field and matched by `is`-checks. This must EXACTLY mirror `box_value` /
     /// `tagged_payload_i64` so the runtime reads the payload back the same way it was written.
