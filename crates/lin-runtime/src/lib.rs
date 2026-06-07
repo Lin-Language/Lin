@@ -24,6 +24,7 @@ pub mod path;
 pub mod shared;
 pub mod process;
 pub mod sealed;
+pub mod sumnode;
 pub mod server;
 pub mod signal;
 pub mod stream;

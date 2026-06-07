@@ -242,6 +242,38 @@ impl<'ctx> Codegen<'ctx> {
         if !obj.is_pointer_value() {
             return ptr_ty.const_null().into();
         }
+        // UNBOXED SUM TYPE (unboxed-sumtype Stage 1): when the object operand's repr is a SumNode, an
+        // `obj[key]` index is served by materializing the node (the discriminant read the shipped
+        // match-dispatch `scrut["kind"] == "circle"` lowers to), NOT `lin_object_get` on a non-LinObject.
+        // NOTE: currently INERT — no temp carries `Packed(SumNode)` yet (the repr seed is gated off
+        // pending the call ABI; see `repr::type_seed`), so this branch is never taken on the present
+        // corpus. It is the wired index/dispatch site the ABI follow-up activates.
+        if let Some(sum_ty) = obj_repr.sumnode_sum_ty() {
+            let sum_ty = sum_ty.clone();
+            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+            // Materialize the whole node to a boxed LinObject once, then object_get the key. This is
+            // the universal (correct) dynamic-index path; the common discriminant read is a single
+            // key fetch from the freshly built object. RC: the materialized object is +1; we fetch a
+            // BORROWED interior TaggedVal* (object_get) and CLONE it so the result is independently
+            // owned, then release the temporary object so nothing leaks.
+            let obj_box = self.sumnode_materialize_to_object(obj, &sum_ty, llvm_fn).into_pointer_value();
+            let key_raw = if Self::is_union_type(key_ty) && key.is_pointer_value() {
+                self.builder.call(self.rt.unbox_ptr, &[key.into()], "sumnode_idx_kstr").try_as_basic_value().unwrap_basic()
+            } else {
+                key
+            };
+            let got = self.builder.call(self.rt.object_get, &[obj_box.into(), key_raw.into()], "sumnode_idx_get").try_as_basic_value().unwrap_basic();
+            // Clone the borrowed interior value to an independently-owned box (so releasing obj_box is
+            // safe), then release the temporary materialized object.
+            let cloned = if got.is_pointer_value() {
+                let clone_fn = self.get_or_declare_fn("lin_tagged_clone", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(clone_fn, &[got.into()], "sumnode_idx_clone").try_as_basic_value().unwrap_basic()
+            } else {
+                got
+            };
+            self.builder.call(self.rt.object_release, &[obj_box.into()], "");
+            return cloned;
+        }
         // When the object is statically Json/union, `obj` is a TaggedVal* wrapping the
         // real Array/Object pointer — unbox it to the raw container pointer before
         // calling the runtime accessors (which expect LinArray*/LinObject*).
@@ -1671,6 +1703,314 @@ impl<'ctx> Codegen<'ctx> {
         } else {
             self.context.ptr_type(AddressSpace::default()).const_null().into()
         }
+    }
+
+    // ── Unboxed tagged sum type (`SumNode`) — unboxed-sumtype Stage 1 ─────────────────────────────
+
+    /// Construct a `SumNode` for the variant whose discriminant value is `disc`. Allocates a
+    /// max-variant-sized node (`lin_sumnode_alloc`, desc NULL — Stage 1 scalar-only), stores the
+    /// dense variant tag inline at offset 16, then stores each scalar payload field by offset. The
+    /// discriminant field itself is NOT stored (it is the inline tag). `field_vals` are the literal's
+    /// (name, value, value_ty) — including the discriminant, which is skipped. Returns a +1 node.
+    pub(crate) fn sumnode_construct(
+        &mut self,
+        sum_ty: &Type,
+        disc: &str,
+        field_vals: &[(String, BasicValueEnum<'ctx>, Type)],
+    ) -> BasicValueEnum<'ctx> {
+        let total = Self::sumnode_total_size(sum_ty);
+        let tag = Self::sumnode_variant_tag(sum_ty, disc).expect("sumnode_construct: unknown variant");
+        let payload_fields = Self::sumnode_variant_by_disc(sum_ty, disc)
+            .expect("sumnode_construct: unknown variant payload");
+        let disc_key = Self::sum_type_discriminant(sum_ty).expect("sumnode_construct: not a sum type");
+        let i64_ty = self.context.i64_type();
+        let i32_ty = self.context.i32_type();
+        let i8_ty = self.context.i8_type();
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let node = self
+            .builder
+            .call(self.rt.sumnode_alloc, &[i64_ty.const_int(total, false).into(), ptr_ty.const_null().into()], "sumnode")
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_pointer_value();
+        // Inline tag @ 16.
+        let tag_p = unsafe { self.builder.gep(i8_ty, node, &[i64_ty.const_int(Self::SUMNODE_TAG_OFFSET, false)], "sumnode_tag_p") };
+        self.builder.store(tag_p, i32_ty.const_int(tag as u64, false));
+        // Scalar payload fields by offset (skip the discriminant).
+        for (name, val, val_ty) in field_vals {
+            if name == &disc_key {
+                continue;
+            }
+            let Some(fld_ty) = payload_fields.get(name).cloned() else { continue };
+            let offset = Self::sumnode_field_offset(&payload_fields, name);
+            // Reconcile a wider/narrower numeric literal into the stored field width (no RC — scalar).
+            let stored = if val_ty == &fld_ty { *val } else { self.compile_ir_coerce(*val, val_ty, &fld_ty) };
+            let p = unsafe { self.builder.gep(i8_ty, node, &[i64_ty.const_int(offset, false)], "sumnode_set_p") };
+            self.builder.store(p, stored);
+        }
+        node.into()
+    }
+
+    /// Load the inline discriminant tag (u32 @ offset 16) of a `SumNode`.
+    pub(crate) fn sumnode_tag_load(&mut self, node: BasicValueEnum<'ctx>) -> inkwell::values::IntValue<'ctx> {
+        let i64_ty = self.context.i64_type();
+        let i32_ty = self.context.i32_type();
+        let i8_ty = self.context.i8_type();
+        let base = node.into_pointer_value();
+        let p = unsafe { self.builder.gep(i8_ty, base, &[i64_ty.const_int(Self::SUMNODE_TAG_OFFSET, false)], "sumnode_tag_p") };
+        self.builder.load(i32_ty, p, "sumnode_tag").into_int_value()
+    }
+
+    /// Read a SCALAR payload field of a `SumNode` by constant offset (the value's variant is known —
+    /// from a narrowed match arm — so the payload field offset is statically resolvable). For the
+    /// discriminant field, materialize the variant's StrLit (the tag identifies it). `variant_payload`
+    /// is the narrowed variant's payload field map.
+    pub(crate) fn sumnode_field_get(
+        &mut self,
+        node: BasicValueEnum<'ctx>,
+        field: &str,
+        variant_payload: &indexmap::IndexMap<String, Type>,
+        result_ty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let Some(fld_ty) = variant_payload.get(field).cloned() else {
+            // Field not in this variant's payload (e.g. the discriminant, or an absent key) → Null.
+            return self.null_value_for(result_ty);
+        };
+        let offset = Self::sumnode_field_offset(variant_payload, field);
+        let i64_ty = self.context.i64_type();
+        let i8_ty = self.context.i8_type();
+        let base = node.into_pointer_value();
+        let llvm_fld = self.llvm_type(&fld_ty);
+        let p = unsafe { self.builder.gep(i8_ty, base, &[i64_ty.const_int(offset, false)], "sumnode_fld_p") };
+        let loaded = self.builder.load(llvm_fld, p, "sumnode_fld");
+        if &fld_ty == result_ty { loaded } else { self.compile_ir_coerce(loaded, &fld_ty, result_ty) }
+    }
+
+    /// Materialize a `SumNode` into a fresh boxed `LinObject` (the universal Json representation) for
+    /// a dynamic edge (toString / Json-serialize / keys / spread / `==` vs a non-sum value / FFI /
+    /// transfer). Reads the inline tag to pick the variant, then sets the discriminant StrLit + each
+    /// scalar payload field under its interned string key. Returns a +1 `LinObject*`. Scalar-only
+    /// (Stage 1): every boxed value is a scalar box whose shell `lin_tagged_release` reclaims after
+    /// `object_set_fresh` (no borrowed inner to keep, mirroring `sealed_materialize_to_object`).
+    ///
+    /// Emits a per-variant switch (each variant materialises its own concrete shape), merging the
+    /// resulting `LinObject*` at a phi. `sum_ty` is the static sum type.
+    pub(crate) fn sumnode_materialize_to_object(
+        &mut self,
+        node: BasicValueEnum<'ctx>,
+        sum_ty: &Type,
+        llvm_fn: inkwell::values::FunctionValue<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        let disc_key = Self::sum_type_discriminant(sum_ty).expect("sumnode_materialize: not a sum type");
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let variants = match sum_ty {
+            Type::Union(vs) => vs.clone(),
+            _ => unreachable!(),
+        };
+        let tag = self.sumnode_tag_load(node);
+        let merge_bb = self.context.append_basic_block(llvm_fn, "sumnode_mat_merge");
+        let mut incoming: Vec<(inkwell::values::PointerValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
+        // Build the variant switch.
+        let default_bb = self.context.append_basic_block(llvm_fn, "sumnode_mat_default");
+        let mut cases: Vec<(inkwell::values::IntValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
+        let i32_ty = self.context.i32_type();
+        let free_box_shell = self.get_or_declare_fn("lin_tagged_free_box", self.context.void_type().fn_type(&[ptr_ty.into()], false));
+        let mut variant_bodies: Vec<(u32, indexmap::IndexMap<String, Type>, String)> = Vec::new();
+        for (i, v) in variants.iter().enumerate() {
+            if let Type::Object { fields, .. } = v {
+                let disc_val = match fields.get(&disc_key) {
+                    Some(Type::StrLit(s)) => s.clone(),
+                    _ => continue,
+                };
+                let payload = Self::sumnode_variant_payload_fields(fields, &disc_key);
+                variant_bodies.push((i as u32, payload, disc_val));
+            }
+        }
+        // Allocate the per-variant blocks first.
+        let blocks: Vec<inkwell::basic_block::BasicBlock<'ctx>> = variant_bodies
+            .iter()
+            .map(|_| self.context.append_basic_block(llvm_fn, "sumnode_mat_arm"))
+            .collect();
+        for (idx, (tagv, _, _)) in variant_bodies.iter().enumerate() {
+            cases.push((i32_ty.const_int(*tagv as u64, false), blocks[idx]));
+        }
+        self.builder.switch(tag, default_bb, &cases);
+        // Default: unreachable (the tag is always a valid variant). Emit an object with just the key
+        // to keep the block well-formed, then branch to merge (defensive — never taken).
+        self.builder.position_at_end(default_bb);
+        let def_obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(0, false).into()], "sumnode_mat_def").try_as_basic_value().unwrap_basic().into_pointer_value();
+        let def_pred = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(merge_bb);
+        incoming.push((def_obj, def_pred));
+        // Each variant arm: build the concrete LinObject.
+        for (idx, (_tagv, payload, disc_val)) in variant_bodies.iter().enumerate() {
+            self.builder.position_at_end(blocks[idx]);
+            let nfields = (payload.len() + 1) as u64; // payload + discriminant
+            let obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(nfields, false).into()], "sumnode_mat_obj").try_as_basic_value().unwrap_basic().into_pointer_value();
+            // discriminant field (a string literal).
+            let dk = self.compile_string_lit(&disc_key).into_pointer_value();
+            let dv_raw = self.compile_string_lit(disc_val);
+            let dv_box = self.box_value(dv_raw, &Type::Str);
+            self.builder.call(self.rt.object_set_fresh, &[obj.into(), dk.into(), dv_box.into()], "");
+            // The boxed StrLit wraps an immortal interned LinString; free only the box shell.
+            if dv_box.is_pointer_value() {
+                self.builder.call(free_box_shell, &[dv_box.into()], "");
+            }
+            // scalar payload fields.
+            for (k, fty) in payload.iter() {
+                let v = self.sumnode_field_get(node, k, payload, fty);
+                let boxed = self.box_value(v, fty);
+                let key_str = self.compile_string_lit(k).into_pointer_value();
+                self.builder.call(self.rt.object_set_fresh, &[obj.into(), key_str.into(), boxed.into()], "");
+                if boxed.is_pointer_value() {
+                    // Scalar: no borrowed inner — full release reclaims the (cache-safe) box shell.
+                    self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                }
+            }
+            let pred = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(merge_bb);
+            incoming.push((obj, pred));
+        }
+        self.builder.position_at_end(merge_bb);
+        let phi = self.builder.phi(ptr_ty, "sumnode_mat_phi");
+        let refs: Vec<(&dyn inkwell::values::BasicValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> =
+            incoming.iter().map(|(v, b)| (v as &dyn inkwell::values::BasicValue<'ctx>, *b)).collect();
+        phi.add_incoming(&refs);
+        phi.as_basic_value()
+    }
+
+    /// Project a `SumNode` source into a FRESH sealed-record struct of `target_fields` (the matched
+    /// variant record, inside a narrowed `match` arm). The variant is known statically from
+    /// `target_fields`' discriminant value. Each scalar payload field is copied from the node by
+    /// const offset; the discriminant field (a StrLit) is materialized as the interned literal. Used
+    /// by `compile_ir_coerce` for a sum→variant-record Coerce (the arm-entry narrowing). Non-mutating:
+    /// the source SumNode keeps its own ownership. Returns a +1 sealed struct.
+    /// (Foundation helper — wired in `compile_ir_coerce` once the repr seed + ABI land.)
+    #[allow(dead_code)]
+    pub(crate) fn sumnode_project_to_sealed(
+        &mut self,
+        node: BasicValueEnum<'ctx>,
+        sum_ty: &Type,
+        target_fields: &indexmap::IndexMap<String, Type>,
+    ) -> BasicValueEnum<'ctx> {
+        let disc_key = Self::sum_type_discriminant(sum_ty).expect("sumnode_project: not a sum type");
+        // The target variant's discriminant value (its StrLit in target_fields).
+        let disc_val = match target_fields.get(&disc_key) {
+            Some(Type::StrLit(s)) => s.clone(),
+            _ => {
+                // Target is not a single concrete variant — cannot project; return null (defensive).
+                return self.context.ptr_type(AddressSpace::default()).const_null().into();
+            }
+        };
+        let payload = Self::sumnode_variant_by_disc(sum_ty, &disc_val).unwrap_or_default();
+        let vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> = target_fields
+            .iter()
+            .map(|(k, fty)| {
+                if k == &disc_key {
+                    // discriminant StrLit → interned immortal LinString (already-owned, no retain).
+                    let s = self.compile_string_lit(&disc_val);
+                    (k.clone(), s, fty.clone(), true)
+                } else {
+                    let v = self.sumnode_field_get(node, k, &payload, fty);
+                    (k.clone(), v, fty.clone(), false)
+                }
+            })
+            .collect();
+        self.sealed_construct(target_fields, &vals)
+    }
+
+    /// Reconstruct a fresh `SumNode` from a BOXED object / Json source (`src`, statically `src_ty`):
+    /// the reverse boundary (a Json value coerced into a sum type, e.g. `fromJson`). Reads the
+    /// discriminant key, switches on its string value to the matching variant, and builds that
+    /// variant's node by reading each scalar payload field with `lin_object_get`+unbox. Returns a +1
+    /// SumNode. Defensive default arm builds the first variant's node (the checker guarantees a valid
+    /// discriminant for a well-typed coercion).
+    /// (Foundation helper — wired in `compile_ir_coerce` once the repr seed + ABI land.)
+    #[allow(dead_code)]
+    pub(crate) fn sumnode_project_from_boxed(
+        &mut self,
+        src: BasicValueEnum<'ctx>,
+        src_ty: &Type,
+        sum_ty: &Type,
+        llvm_fn: inkwell::values::FunctionValue<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let disc_key = Self::sum_type_discriminant(sum_ty).expect("project_from_boxed: not a sum type");
+        // Unbox the source to a raw LinObject* if it is a union/Json box.
+        let container = if Self::is_union_type(src_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[src.into()], "sumnode_pfb_unbox").try_as_basic_value().unwrap_basic()
+        } else {
+            src
+        };
+        // Read the discriminant string value (boxed) for the switch.
+        let dk = self.compile_string_lit(&disc_key).into_pointer_value();
+        let disc_box = self.builder.call(self.rt.object_get, &[container.into(), dk.into()], "sumnode_pfb_disc").try_as_basic_value().unwrap_basic();
+        let variants = match sum_ty {
+            Type::Union(vs) => vs.clone(),
+            _ => unreachable!(),
+        };
+        let merge_bb = self.context.append_basic_block(llvm_fn, "sumnode_pfb_merge");
+        let mut incoming: Vec<(inkwell::values::PointerValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
+        // Chain of disc-string compares (the boxed source's discriminant is a string).
+        let mut variant_info: Vec<(String, indexmap::IndexMap<String, Type>)> = Vec::new();
+        for v in &variants {
+            if let Type::Object { fields, .. } = v {
+                if let Some(Type::StrLit(s)) = fields.get(&disc_key) {
+                    variant_info.push((s.clone(), Self::sumnode_variant_payload_fields(fields, &disc_key)));
+                }
+            }
+        }
+        let n = variant_info.len();
+        for (idx, (disc_val, payload)) in variant_info.iter().enumerate() {
+            // test: disc_box == box("disc_val")
+            let arm_bb = self.context.append_basic_block(llvm_fn, "sumnode_pfb_arm");
+            let next_bb = if idx + 1 < n {
+                self.context.append_basic_block(llvm_fn, "sumnode_pfb_next")
+            } else {
+                arm_bb // last variant: take it unconditionally as the default
+            };
+            if idx + 1 < n {
+                let lit_raw = self.compile_string_lit(disc_val);
+                let lit = self.box_value(lit_raw, &Type::Str);
+                let eq_fn = self.get_or_declare_fn("lin_tagged_eq", self.context.i8_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                let eq_i8 = self.builder.call(eq_fn, &[disc_box.into(), lit.into()], "sumnode_pfb_eq").try_as_basic_value().unwrap_basic().into_int_value();
+                let eq = self.builder.int_truncate_or_bit_cast(eq_i8, self.context.bool_type(), "sumnode_pfb_eqb");
+                if lit.is_pointer_value() {
+                    let free_box_shell = self.get_or_declare_fn("lin_tagged_free_box", self.context.void_type().fn_type(&[ptr_ty.into()], false));
+                    self.builder.call(free_box_shell, &[lit.into()], "");
+                }
+                self.builder.conditional_branch(eq, arm_bb, next_bb);
+            } else {
+                self.builder.unconditional_branch(arm_bb);
+            }
+            // arm: build the variant node, reading scalar payload fields from the boxed object.
+            self.builder.position_at_end(arm_bb);
+            let field_vals: Vec<(String, BasicValueEnum<'ctx>, Type)> = {
+                let mut v = Vec::new();
+                // discriminant: the StrLit value (interned).
+                v.push((disc_key.clone(), self.compile_string_lit(disc_val), Type::StrLit(disc_val.clone())));
+                for (k, fty) in payload.iter() {
+                    let key_str = self.compile_string_lit(k).into_pointer_value();
+                    let tagged = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "sumnode_pfb_get").try_as_basic_value().unwrap_basic();
+                    let val = self.unbox_tagged_val_to_type(tagged, fty);
+                    v.push((k.clone(), val, fty.clone()));
+                }
+                v
+            };
+            let node = self.sumnode_construct(sum_ty, disc_val, &field_vals);
+            let pred = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(merge_bb);
+            incoming.push((node.into_pointer_value(), pred));
+            if idx + 1 < n {
+                self.builder.position_at_end(next_bb);
+            }
+        }
+        self.builder.position_at_end(merge_bb);
+        let phi = self.builder.phi(ptr_ty, "sumnode_pfb_phi");
+        let refs: Vec<(&dyn inkwell::values::BasicValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> =
+            incoming.iter().map(|(v, b)| (v as &dyn inkwell::values::BasicValue<'ctx>, *b)).collect();
+        phi.add_incoming(&refs);
+        phi.as_basic_value()
     }
 
     pub(crate) fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, obj_ty: &Type, result_ty: &Type, obj_repr: &lin_ir::repr::Repr) -> BasicValueEnum<'ctx> {
