@@ -1,0 +1,77 @@
+{
+  "import": {
+    "prefix": "import",
+    "body": "import { ${2:name} } from \"${1:std/io}\"",
+    "description": "Import named bindings from a module"
+  },
+  "val binding": {
+    "prefix": "val",
+    "body": "val ${1:name} = ${2:value}",
+    "description": "Immutable value binding"
+  },
+  "var binding": {
+    "prefix": "var",
+    "body": "var ${1:name} = ${2:value}",
+    "description": "Mutable variable binding"
+  },
+  "function literal": {
+    "prefix": "fn",
+    "body": "val ${1:name} = (${2:arg}: ${3:Int32}): ${4:Int32} =>\n  ${5:body}",
+    "description": "Typed function literal bound to a val"
+  },
+  "exported function": {
+    "prefix": "exportfn",
+    "body": "export val ${1:name} = (${2:arg}: ${3:Int32}): ${4:Int32} =>\n  ${5:body}",
+    "description": "Exported typed function literal"
+  },
+  "type declaration": {
+    "prefix": "type",
+    "body": "type ${1:Name} = { \"${2:field}\": ${3:String} }",
+    "description": "Record type declaration"
+  },
+  "exported type": {
+    "prefix": "exporttype",
+    "body": "export type ${1:Name} = { \"${2:field}\": ${3:String} }",
+    "description": "Exported record type declaration"
+  },
+  "union type": {
+    "prefix": "union",
+    "body": "type ${1:Name} = ${2:VariantA} | ${3:VariantB}",
+    "description": "Tagged union type declaration"
+  },
+  "match expression": {
+    "prefix": "match",
+    "body": "match ${1:expr}\n  has ${2:{ \"type\": \"success\", value \\}} => ${3:value}\n  else => ${4:fallback}",
+    "description": "Pattern match with has-arms and an else fallback"
+  },
+  "match on type": {
+    "prefix": "matchis",
+    "body": "match ${1:expr}\n  is ${2:Error} => ${3:fallback}\n  else => ${1:expr}",
+    "description": "Match narrowing on a type with `is`"
+  },
+  "map chain": {
+    "prefix": "map",
+    "body": "${1:items}.map(${2:x} => ${3:$2})",
+    "description": "Dot-applied map over an iterable"
+  },
+  "filter chain": {
+    "prefix": "filter",
+    "body": "${1:items}.filter(${2:x} => ${3:$2 > 0})",
+    "description": "Dot-applied filter over an iterable"
+  },
+  "reduce chain": {
+    "prefix": "reduce",
+    "body": "${1:items}.reduce(${2:0}, (${3:acc}, ${4:x}) => ${5:$3 + $4})",
+    "description": "Dot-applied reduce over an iterable"
+  },
+  "test block": {
+    "prefix": "test",
+    "body": "test(\"${1:description}\", () => [\n  expect(${2:actual}).toBe(${3:expected})\n])",
+    "description": "A single test case with an expectation"
+  },
+  "suite": {
+    "prefix": "suite",
+    "body": "import { expect, toBe, test, suite, run } from \"std/test\"\n\nval s = suite(\"${1:suite name}\", [\n  test(\"${2:description}\", () => [\n    expect(${3:actual}).toBe(${4:expected})\n  ])\n])\n\nrun(s)",
+    "description": "A test suite scaffold with std/test imports and run"
+  }
+}

@@ -1,3 +1,9 @@
-*.ts
 .gitignore
+.vscodeignore
 package-lock.json
+node_modules/**
+client.js
+esbuild.js
+dist/**/*.map
+*.ts
+*.vsix
