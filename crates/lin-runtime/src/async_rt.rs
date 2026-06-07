@@ -98,6 +98,16 @@ pub struct LinWorker {
     handle: Option<JoinHandle<()>>,
     /// True once `close` has been called, so later sends are rejected (§24.6.5).
     closed: bool,
+    /// OWNING references to the handler / onClose closure structs (the heap allocations whose
+    /// refcount lives at offset 0). The worker thread runs these closures for its whole lifetime,
+    /// so the worker must hold a reference that outlives the frame that built it (the factory in
+    /// §24.6.4 returns the worker, then its frame releases the closures). Retained on the parent
+    /// thread in `lin_worker_new` BEFORE the worker thread is spawned, released in
+    /// `lin_worker_close` AFTER the thread is joined (no concurrent refcount access). Cleared to
+    /// null after release so a double `close` cannot double-release. Null when the corresponding
+    /// closure was absent (e.g. no onClose).
+    on_msg_cls: *mut u8,
+    on_close_cls: *mut u8,
 }
 
 /// Build an `Error` object `{ "type": "error", "message": <msg> }` as a boxed `TaggedVal*`.
@@ -711,8 +721,21 @@ pub unsafe extern "C" fn lin_worker_new(
     on_close_fn: *mut u8,
     on_close_env: *mut u8,
     on_close_has_env: u8,
+    on_msg_cls: *mut u8,
+    on_close_cls: *mut u8,
 ) -> *mut LinWorker {
     crate::fault::install_quiet_fault_hook();
+    // Take an OWNING reference to the handler / onClose closures (their fn_ptr + env live for the
+    // worker thread's whole lifetime, §24.6.4). The refcount is the u32 at offset 0 of the closure
+    // struct — exactly the same pointer codegen read fn_ptr/env_ptr from — so this bumps the live
+    // closure (NOT a derived/garbage pointer, which was the prior unsound attempt). Done HERE on
+    // the parent thread before `thread::spawn`, so there is no concurrent refcount write.
+    if !on_msg_cls.is_null() {
+        crate::memory::lin_rc_retain(on_msg_cls as *mut u32);
+    }
+    if !on_close_cls.is_null() {
+        crate::memory::lin_rc_retain(on_close_cls as *mut u32);
+    }
     let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
 
     // Capture handler/onClose pointers as addresses (Send); they are read-only code + a
@@ -759,7 +782,13 @@ pub unsafe extern "C" fn lin_worker_new(
     });
 
     let ptr = lin_alloc(std::mem::size_of::<LinWorker>()) as *mut LinWorker;
-    std::ptr::write(ptr, LinWorker { tx, handle: Some(handle), closed: false });
+    std::ptr::write(ptr, LinWorker {
+        tx,
+        handle: Some(handle),
+        closed: false,
+        on_msg_cls,
+        on_close_cls,
+    });
     ptr
 }
 
@@ -805,6 +834,17 @@ pub unsafe extern "C" fn lin_worker_close(worker: *mut LinWorker) {
     let _ = (*worker).tx.send(WorkerMsg::Close);
     if let Some(h) = (*worker).handle.take() {
         let _ = h.join();
+    }
+    // The worker thread has now exited and will never touch the handler/onClose closures again,
+    // so it is safe (and single-threaded) to drop the owning reference taken in `lin_worker_new`.
+    // Clear the slots so a second `close` (idempotent, §24.6.5) cannot double-release.
+    let on_msg_cls = std::mem::replace(&mut (*worker).on_msg_cls, std::ptr::null_mut());
+    if !on_msg_cls.is_null() {
+        crate::memory::lin_closure_release(on_msg_cls);
+    }
+    let on_close_cls = std::mem::replace(&mut (*worker).on_close_cls, std::ptr::null_mut());
+    if !on_close_cls.is_null() {
+        crate::memory::lin_closure_release(on_close_cls);
     }
 }
 

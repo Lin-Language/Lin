@@ -472,14 +472,22 @@ impl<'ctx> Codegen<'ctx> {
                 let i8_ty = self.context.i8_type();
                 let handler = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let handler_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
-                let (h_fn, h_env, h_has) = self.extract_closure_fields(handler, &handler_ty);
+                let (h_fn, h_env, h_has, h_cls) = self.extract_closure_fields_full(handler, &handler_ty);
                 let onclose = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let onclose_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
-                let (c_fn, c_env, c_has) = self.extract_closure_fields(onclose, &onclose_ty);
+                let (c_fn, c_env, c_has, c_cls) = self.extract_closure_fields_full(onclose, &onclose_ty);
+                // Hand the runtime the handler/onClose closure-struct pointers (offset-0 rc) so it
+                // can take an OWNING reference: the worker thread outlives the frame that built it
+                // (the factory in spec §24.6.4 RETURNS the worker), so without this owning ref the
+                // building frame's `lin_closure_release` would free the handler env + captured
+                // `var` cells while the worker thread still reads them (use-after-free / garbage).
+                // The retain happens inside `lin_worker_new` on THIS (parent) thread, before the
+                // worker thread is spawned — no concurrent refcount write — and the matching
+                // release happens in `lin_worker_close` after the thread is joined.
                 let worker_fn = self.get_or_declare_fn("lin_worker_new",
-                    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), i8_ty.into(), ptr_ty.into(), ptr_ty.into(), i8_ty.into()], false));
+                    ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into(), i8_ty.into(), ptr_ty.into(), ptr_ty.into(), i8_ty.into(), ptr_ty.into(), ptr_ty.into()], false));
                 let raw = self.builder.call(worker_fn,
-                    &[h_fn.into(), h_env.into(), h_has.into(), c_fn.into(), c_env.into(), c_has.into()],
+                    &[h_fn.into(), h_env.into(), h_has.into(), c_fn.into(), c_env.into(), c_has.into(), h_cls.into(), c_cls.into()],
                     "ir_worker").try_as_basic_value().unwrap_basic();
                 // Box the raw *LinWorker so it round-trips through TypeVar slots / Json params.
                 self.box_handle(raw)
@@ -1097,10 +1105,27 @@ impl<'ctx> Codegen<'ctx> {
         cls: BasicValueEnum<'ctx>,
         cls_ty: &Type,
     ) -> (BasicValueEnum<'ctx>, BasicValueEnum<'ctx>, BasicValueEnum<'ctx>) {
+        let (fp, ep, has, _cls_ptr) = self.extract_closure_fields_full(cls, cls_ty);
+        (fp, ep, has)
+    }
+
+    /// Like `extract_closure_fields`, but also returns the underlying closure-struct pointer
+    /// (`cls_ptr`) — the heap allocation whose refcount lives at offset 0 (layout
+    /// `{ i32 rc, i32 pad, ptr fn, ptr env }`). The Worker intrinsic needs this exact pointer so
+    /// it can hand the runtime an OWNING reference to the handler closure: a worker built in a
+    /// function that RETURNS the worker would otherwise dereference the freed handler env (and
+    /// captured `var` cells) once the building frame releases the closure (spec §24.6.4). The
+    /// returned `cls_ptr` is null when `cls` is not a pointer value.
+    fn extract_closure_fields_full(
+        &mut self,
+        cls: BasicValueEnum<'ctx>,
+        cls_ty: &Type,
+    ) -> (BasicValueEnum<'ctx>, BasicValueEnum<'ctx>, BasicValueEnum<'ctx>, BasicValueEnum<'ctx>) {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i8_ty = self.context.i8_type();
         if !cls.is_pointer_value() {
-            return (ptr_ty.const_null().into(), ptr_ty.const_null().into(), i8_ty.const_zero().into());
+            let null = ptr_ty.const_null().into();
+            return (null, null, i8_ty.const_zero().into(), ptr_ty.const_null().into());
         }
         let cls_ptr = if Self::is_union_type(cls_ty) {
             self.builder.call(self.rt.unbox_ptr, &[cls.into()], "ir_cls_unbox").try_as_basic_value().unwrap_basic().into_pointer_value()
@@ -1112,7 +1137,7 @@ impl<'ctx> Codegen<'ctx> {
         let fp = self.builder.load(ptr_ty, fn_f, "ir_cls_fn");
         let env_f = self.builder.struct_gep(cls_struct_ty, cls_ptr, 3, "ir_cls_env_f");
         let ep = self.builder.load(ptr_ty, env_f, "ir_cls_env");
-        (fp, ep, i8_ty.const_int(1, false).into())
+        (fp, ep, i8_ty.const_int(1, false).into(), cls_ptr.into())
     }
 
     /// Box an opaque runtime handle (ThreadPool/Worker) as TaggedVal*(TAG_HANDLE) so it
