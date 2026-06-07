@@ -9017,6 +9017,30 @@ push(sorted, "s")
     );
 }
 
+// `sort` over a `[]`+push (tagged-read) array sorts correctly. The inline scalar-sort fast path
+// reads each source element via the representation-agnostic tagged path (`lin_array_get_tagged`),
+// which returns a fresh +1 box that the copy-in loop unboxes to the flat buffer; that box must be
+// reclaimed per element (it was leaked one box/element/sort — the ~16 B/elem `sort` result leak).
+// This asserts correctness of that path; the leak itself is gated by the ASan harness.
+#[test]
+fn test_sort_over_push_built_array_correct() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { sort, push, length } from "std/array"
+val xs: Int32[] = []
+push(xs, 5)
+push(xs, 2)
+push(xs, 8)
+push(xs, 1)
+push(xs, 9)
+push(xs, 3)
+val sorted = sort(xs, (a, b) => a - b)
+print(toString(sorted))
+print(toString(length(sorted)))
+"#);
+    assert_eq!(out, vec!["[1, 2, 3, 5, 8, 9]", "6"]);
+}
+
 // `minBy`/`maxBy`/`sortBy` over an OBJECT array still work as before (the genericization keeps the
 // heterogeneous `[key, item]` pair path sound — pairs built via the raw `lin_map` builtin on the
 // `T` ABI, the sorted result unpacked back into a `T[]` in the generic body).
