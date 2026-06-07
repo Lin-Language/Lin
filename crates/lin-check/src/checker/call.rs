@@ -651,6 +651,15 @@ impl Checker {
                             }
                         }
                     }
+                    // Spec §21, float counterpart: a suffixless float literal infers to `Float64`
+                    // by default but takes its context type. When an argument is a bare float
+                    // literal and the parameter is `Float32`, re-type the literal at `Float32` so
+                    // it satisfies the parameter (mirrors the integer-literal re-typing above).
+                    if let TypedExpr::FloatLit(v, ty, lit_span) = &typed_args[i] {
+                        if matches!(param_ty, Type::Float32) && matches!(ty, Type::Float64) {
+                            typed_args[i] = TypedExpr::FloatLit(*v, Type::Float32, *lit_span);
+                        }
+                    }
                 }
 
                 // Enforce the NUMERIC bound (ADR-014, reversed). A `Number` parameter resolved to a
@@ -1162,6 +1171,13 @@ impl Checker {
                             if fits {
                                 all_args[i] = TypedExpr::IntLit(v, param_ty.clone(), lit_span);
                             }
+                        }
+                    }
+                    // Float counterpart (see direct-call site): a bare float literal argument into
+                    // a `Float32` parameter is re-typed at `Float32`.
+                    if let TypedExpr::FloatLit(v, ty, lit_span) = &all_args[i] {
+                        if matches!(param_ty, Type::Float32) && matches!(ty, Type::Float64) {
+                            all_args[i] = TypedExpr::FloatLit(*v, Type::Float32, *lit_span);
                         }
                     }
                 }

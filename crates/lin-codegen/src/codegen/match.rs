@@ -260,6 +260,23 @@ impl<'ctx> Codegen<'ctx> {
                 return obj;
             }
         }
+        // ── FLAT scalar ARRAY width/kind change (e.g. UInt8[] → Int32[]) ──────────────────
+        // Two flat scalar arrays with DIFFERENT element types are physically different buffers:
+        // each is stored at its element's native stride and tagged with that element kind. Binding
+        // a `UInt8[]` value to an `Int32[]` slot reinterpreting the same pointer would read 4 source
+        // bytes as one i32 on every indexed access. MATERIALIZE a fresh dest-strided buffer, widening
+        // each element (sext/zext/sitofp/fpext via the numeric arm above). Same precedent as the
+        // mixed-numeric array literal `[0, 3.14]` coercion (lower's `scalar_numeric_repr_differs`),
+        // extended to whole arrays. Handle BEFORE the sealed-array / generic arms.
+        if let (Type::Array(from_e), Type::Array(to_e)) = (from_ty, to_ty) {
+            if Self::is_flat_scalar(from_e)
+                && Self::is_flat_scalar(to_e)
+                && from_e != to_e
+                && val.is_pointer_value()
+            {
+                return self.flat_array_widen(val, from_e, to_e);
+            }
+        }
         // ── Sealed-record ARRAY boundaries (sealed-records Stage 3) ───────────────────────
         // A `MyType[]` is a contiguous unboxed buffer (elem_tag 0xFE); a Json/Object[] is a tagged
         // array of boxed LinObjects. Crossing between them is a per-element PROJECTION /

@@ -372,6 +372,25 @@ impl Checker {
             Some(declared @ Type::Array(_)) if Self::body_is_fresh_array_allocate(body) => {
                 self.check_expr(body, declared)?
             }
+            // A `Float32` declared return: route the body through `check_expr` so a bare float
+            // literal body (`(): Float32 => 0.25`) adopts `Float32` instead of inferring `Float64`
+            // and failing the post-pass compatibility check (spec §21, float counterpart of the
+            // integer-literal context rule). For any non-float-literal body `check_expr` falls
+            // through to `infer_expr` + the same compatibility check, so behaviour is unchanged.
+            Some(declared @ Type::Float32) => {
+                checked_against_declared = true;
+                let typed = self.check_expr(body, declared)?;
+                if !self.types_compatible(&typed.ty(), declared) {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!(
+                            "Function body has type {}, declared return type is {}",
+                            typed.ty(), declared
+                        ),
+                    ));
+                }
+                typed
+            }
             _ => self.infer_expr(body)?,
         };
         self.array_alloc_elem_hint = prev_alloc_hint;
@@ -669,6 +688,25 @@ impl Checker {
             // Gated to the allocation intrinsic so no other array-returning body changes behaviour.
             Some(declared @ Type::Array(_)) if Self::body_is_fresh_array_allocate(body) => {
                 self.check_expr(body, declared)?
+            }
+            // A `Float32` declared return: route the body through `check_expr` so a bare float
+            // literal body (`(): Float32 => 0.25`) adopts `Float32` instead of inferring `Float64`
+            // and failing the post-pass compatibility check (spec §21, float counterpart of the
+            // integer-literal context rule). For any non-float-literal body `check_expr` falls
+            // through to `infer_expr` + the same compatibility check, so behaviour is unchanged.
+            Some(declared @ Type::Float32) => {
+                checked_against_declared = true;
+                let typed = self.check_expr(body, declared)?;
+                if !self.types_compatible(&typed.ty(), declared) {
+                    return Err(Diagnostic::error(
+                        span,
+                        format!(
+                            "Function body has type {}, declared return type is {}",
+                            typed.ty(), declared
+                        ),
+                    ));
+                }
+                typed
             }
             _ => self.infer_expr(body)?,
         };
