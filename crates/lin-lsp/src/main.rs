@@ -90,6 +90,10 @@ impl LanguageServer for Backend {
                     retrigger_characters: Some(vec![",".into()]),
                     work_done_progress_options: Default::default(),
                 }),
+                // Run-test CodeLenses above each `test(...)`/`withFixture(...)` declaration.
+                code_lens_provider: Some(CodeLensOptions {
+                    resolve_provider: Some(false),
+                }),
                 // Type-aware semantic highlighting (full-document only; the TextMate grammar stays
                 // the fallback for incremental edits).
                 semantic_tokens_provider: Some(
@@ -585,6 +589,19 @@ impl LanguageServer for Backend {
         } else {
             Ok(Some(actions))
         }
+    }
+
+    async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        let uri = &params.text_document.uri;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let mut lexer = lin_lex::Lexer::new(&source, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = lin_parse::Parser::new(tokens);
+        let module = parser.parse_module();
+        Ok(Some(test_code_lenses(&source, uri, &module)))
     }
 
     async fn symbol(
@@ -1622,6 +1639,152 @@ fn ranges_overlap(a: Range, b: Range) -> bool {
     let b_start = (b.start.line, b.start.character);
     let b_end = (b.end.line, b.end.character);
     a_start <= b_end && b_start <= a_end
+}
+
+// ── code lens (run-test) ───────────────────────────────────────────────────────
+
+/// Build the run-test CodeLenses for a file: one `▶ Run Test` lens above each
+/// `test("name", ...)` / `withFixture(..., "name", ...)` call (mirroring the VSCode
+/// Test Explorer's `TEST_DECL_RE` / `WITHFIXTURE_DECL_RE` discovery, but driven off
+/// the parsed AST), plus a single `▶ Run File Tests` lens at the top when any test
+/// exists. Lens commands use the fixed `lin.runTest(uri, name)` / `lin.testFile(uri)`
+/// contract the extension wires against.
+fn test_code_lenses(source: &str, uri: &Url, module: &lin_parse::ast::Module) -> Vec<CodeLens> {
+    let mut tests: Vec<(String, lin_common::Span)> = Vec::new();
+    for stmt in &module.statements {
+        collect_test_calls_in_stmt(stmt, &mut tests);
+    }
+    // De-duplicate by (name, anchor) so a test referenced once yields one lens.
+    tests.sort_by_key(|(_, s)| (s.start, s.end));
+    tests.dedup();
+
+    let mut lenses = Vec::new();
+    if !tests.is_empty() {
+        // `▶ Run File Tests` at the very top of the file.
+        lenses.push(CodeLens {
+            range: span_to_range(source, lin_common::Span::new(0, 0, 0)),
+            command: Some(Command {
+                title: "▶ Run File Tests".to_string(),
+                command: "lin.testFile".to_string(),
+                arguments: Some(vec![serde_json::json!(uri.to_string())]),
+            }),
+            data: None,
+        });
+    }
+    for (name, anchor) in tests {
+        lenses.push(CodeLens {
+            range: span_to_range(source, anchor),
+            command: Some(Command {
+                title: "▶ Run Test".to_string(),
+                command: "lin.runTest".to_string(),
+                arguments: Some(vec![
+                    serde_json::json!(uri.to_string()),
+                    serde_json::json!(name),
+                ]),
+            }),
+            data: None,
+        });
+    }
+    lenses
+}
+
+fn collect_test_calls_in_stmt(stmt: &Stmt, out: &mut Vec<(String, lin_common::Span)>) {
+    match stmt {
+        Stmt::Val { value, .. } | Stmt::Var { value, .. } => {
+            collect_test_calls_in_expr(value, out);
+        }
+        Stmt::Replace { value, .. } => collect_test_calls_in_expr(value, out),
+        Stmt::Expr(e) => collect_test_calls_in_expr(e, out),
+        _ => {}
+    }
+}
+
+/// Walk an expression for `test("name", ...)` / `withFixture(..., "name", ...)` calls,
+/// recording `(name, anchor_span)`. The anchor is the callee identifier span so the lens
+/// renders on the line of the `test(`/`withFixture(` token.
+fn collect_test_calls_in_expr(expr: &lin_parse::ast::Expr, out: &mut Vec<(String, lin_common::Span)>) {
+    use lin_parse::ast::Expr as E;
+    if let E::Call { func, args, .. } = expr {
+        if let E::Ident(name, ident_span) = func.as_ref() {
+            match name.as_str() {
+                // `test("name", ...)` — first string-literal arg is the name.
+                "test" => {
+                    if let Some(E::StringLit(s, _)) = args.first() {
+                        out.push((s.clone(), *ident_span));
+                    }
+                }
+                // `withFixture(setup, "name", ...)` — name is the SECOND string-literal arg
+                // (mirrors `WITHFIXTURE_DECL_RE`, which skips the first two `(`-args).
+                "withFixture" => {
+                    let name = args.iter().filter_map(|a| match a {
+                        E::StringLit(s, _) => Some(s.clone()),
+                        _ => None,
+                    }).next();
+                    if let Some(name) = name {
+                        out.push((name, *ident_span));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Recurse into every sub-expression so nested test() calls (e.g. inside a
+    // `suite("...", [ test(...), test(...) ])` array) are discovered.
+    walk_child_exprs(expr, &mut |child| collect_test_calls_in_expr(child, out));
+}
+
+/// Invoke `f` on every immediate child expression of `expr`. Centralises the AST
+/// structural recursion shared by code-lens discovery (and any future AST walkers).
+fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::ast::Expr)) {
+    use lin_parse::ast::{Expr as E, ObjectField, StringPart};
+    match expr {
+        E::BinaryOp { left, right, .. } => { f(left); f(right); }
+        E::UnaryOp { operand, .. } => f(operand),
+        E::Call { func, args, .. } => { f(func); for a in args { f(a); } }
+        E::DotCall { receiver, args, .. } => {
+            f(receiver);
+            if let Some(args) = args { for a in args { f(a); } }
+        }
+        E::Index { object, key, .. } => { f(object); f(key); }
+        E::If { condition, then_branch, else_branch, .. } => {
+            f(condition); f(then_branch); f(else_branch);
+        }
+        E::Match { scrutinee, arms, .. } => {
+            f(scrutinee);
+            for arm in arms { f(&arm.body); }
+        }
+        E::Block(stmts, tail, _) => {
+            for s in stmts {
+                match s {
+                    Stmt::Val { value, .. } | Stmt::Var { value, .. } => f(value),
+                    Stmt::Replace { value, .. } => f(value),
+                    Stmt::Expr(e) => f(e),
+                    _ => {}
+                }
+            }
+            f(tail);
+        }
+        E::Function { body, .. } => f(body),
+        E::Object(fields, _) => {
+            for field in fields {
+                match field {
+                    ObjectField::Pair(k, v) => { f(k); f(v); }
+                    ObjectField::Spread(e) => f(e),
+                }
+            }
+        }
+        E::Array(items, _) => { for it in items { f(it); } }
+        E::Assign { value, .. } => f(value),
+        E::IndexAssign { object, key, value, .. } => { f(object); f(key); f(value); }
+        E::Is { expr, .. } | E::Has { expr, .. } => f(expr),
+        E::StringInterp(parts, _) => {
+            for part in parts {
+                if let StringPart::Expr(e) = part { f(e); }
+            }
+        }
+        E::TupleArgs(items, _) => { for it in items { f(it); } }
+        _ => {}
+    }
 }
 
 // ── signature help ─────────────────────────────────────────────────────────────
@@ -3312,5 +3475,61 @@ mod tests {
                 s.name
             );
         }
+    }
+
+    // ── code lens (run-test) ────────────────────────────────────────────────────
+
+    /// CodeLens discovery finds both `test("name", ...)` and `withFixture(..., "name", ...)`
+    /// declarations (including ones nested inside a `suite(...)` array) and emits the fixed
+    /// `lin.runTest(uri, name)` command, plus a single `lin.testFile` lens at the top.
+    #[test]
+    fn code_lens_discovers_tests() {
+        let src = "import { suite, test, withFixture } from \"std/test\"\n\
+                   val s = suite(\"x\", [\n\
+                     test(\"alpha\", () => []),\n\
+                     test(\"beta\", () => []),\n\
+                   ])\n\
+                   val w = withFixture(setup, \"gamma\", (f) => [])\n";
+        let module = parse(src);
+        let uri = dummy_uri();
+        let lenses = test_code_lenses(src, &uri, &module);
+
+        // One file-level lens + three test lenses.
+        let run_tests: Vec<(&str, &str)> = lenses
+            .iter()
+            .filter_map(|l| {
+                let c = l.command.as_ref()?;
+                if c.command == "lin.runTest" {
+                    let args = c.arguments.as_ref()?;
+                    Some((args[1].as_str().unwrap(), c.title.as_str()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let names: Vec<&str> = run_tests.iter().map(|(n, _)| *n).collect();
+        assert!(names.contains(&"alpha"), "missing alpha: {:?}", names);
+        assert!(names.contains(&"beta"), "missing beta: {:?}", names);
+        assert!(names.contains(&"gamma"), "missing gamma (withFixture): {:?}", names);
+        // Title + command contract.
+        assert!(run_tests.iter().all(|(_, t)| *t == "▶ Run Test"));
+        // First arg is the document URI string.
+        let first = lenses.iter().find(|l| l.command.as_ref().map(|c| c.command == "lin.runTest").unwrap_or(false)).unwrap();
+        assert_eq!(
+            first.command.as_ref().unwrap().arguments.as_ref().unwrap()[0].as_str().unwrap(),
+            uri.to_string()
+        );
+        // Exactly one file-level "Run File Tests" lens.
+        let file_lenses = lenses.iter().filter(|l| l.command.as_ref().map(|c| c.command == "lin.testFile").unwrap_or(false)).count();
+        assert_eq!(file_lenses, 1, "expected one Run File Tests lens");
+    }
+
+    /// No tests in a file → no lenses (not even the file-level one).
+    #[test]
+    fn code_lens_empty_when_no_tests() {
+        let src = "val x = 1\n";
+        let module = parse(src);
+        let lenses = test_code_lenses(src, &dummy_uri(), &module);
+        assert!(lenses.is_empty(), "expected no lenses, got {:?}", lenses.len());
     }
 }
