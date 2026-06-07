@@ -85,10 +85,34 @@ fn check_union_exhaustiveness(
         matches!(&a.pattern, TypedMatchPattern::Is(p) if is_error_pattern(p))
     });
 
+    // A *discriminated* union (`type Ast = Num | BinOp`, each variant a record sharing a `"kind"`
+    // field whose value is a distinct `StrLit`) is the sum-type shape (design §1.1, §2). Its
+    // variants' recursive fields survive resolution at DIFFERENT expansion depths on the two sides
+    // of the coverage comparison — the pattern-resolved `is BinOp` expands `left`/`right` one level
+    // (`Union([Num, BinOp{Named("Ast")}])`) while the scrutinee's variant keeps them as
+    // `Named("Ast")` — so structural `==` (`types_overlap`) spuriously misses them and the match is
+    // wrongly reported non-exhaustive. When the union has such a discriminant key, match an `is V`
+    // arm to the variant by its discriminant VALUE instead, which is depth-insensitive and the
+    // sound identity for a tagged sum. Only used when every variant carries a DISTINCT StrLit at a
+    // shared key (`union_discriminant_key`); otherwise we keep the conservative structural check.
+    let discriminant_key = union_discriminant_key(variants);
+
     // Find union members not covered by any arm.
     let missing: Vec<&Type> = variants.iter().filter(|v| {
         if covers_error && is_error_variant(v) {
             return false;
+        }
+        if let Some(ref key) = discriminant_key {
+            // Discriminant-keyed coverage: covered iff some `is V` arm's resolved type carries the
+            // SAME StrLit at the discriminant key. `variant_discriminant` returns None for a
+            // covered type that is NOT a single-StrLit record at that key (e.g. an `is Ast`
+            // supertype arm, or an `is String`) → such an arm does not count as covering this
+            // variant, so a partial/supertype cover still (correctly) requires `else`.
+            if let Some(v_disc) = variant_discriminant(v, key) {
+                return !covered.iter().any(|c| {
+                    variant_discriminant(c, key).as_deref() == Some(v_disc.as_str())
+                });
+            }
         }
         !covered.iter().any(|c| types_overlap(c, v))
     }).collect();
@@ -140,6 +164,66 @@ fn check_bool_exhaustiveness(arms: &[TypedMatchArm], span: Span) -> Vec<Diagnost
             .with_help("Add `is false => ...` or an `else` arm.")],
         (false, false) => vec![Diagnostic::warning(span, "match may be non-exhaustive: no `else` arm.")],
     }
+}
+
+/// If `variants` form a *discriminated* union — every variant is a record (`Type::Object`) and
+/// there is a field key present on ALL of them whose value is a `StrLit`, with the StrLit values
+/// PAIRWISE DISTINCT across variants — return that discriminant key. Otherwise `None`.
+///
+/// This is the StrLit-discriminant shape the sum-type design (§1.1) and the shipped
+/// union-discrimination work key on. Distinctness is required so the discriminant uniquely
+/// identifies the variant (it is the runtime switch key); a key shared with equal/overlapping
+/// StrLit values, or absent on some variant, does not qualify and we fall back to structural
+/// coverage. Conservative by construction: if no clean discriminant exists, returns `None` and
+/// the caller uses the exact-structural check.
+fn union_discriminant_key(variants: &[Type]) -> Option<String> {
+    // All variants must be records; collect their field maps.
+    let records: Vec<&indexmap::IndexMap<String, Type>> = variants
+        .iter()
+        .map(|v| match v {
+            Type::Object { fields, .. } => Some(fields),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    if records.len() < 2 {
+        return None;
+    }
+    // Candidate keys: those present on the first variant with a StrLit value.
+    let first = records[0];
+    'keys: for (key, ty) in first {
+        if !matches!(ty, Type::StrLit(_)) {
+            continue;
+        }
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for rec in &records {
+            match rec.get(key) {
+                Some(Type::StrLit(s)) => {
+                    // Distinct StrLit per variant.
+                    if !seen.insert(s.clone()) {
+                        continue 'keys;
+                    }
+                }
+                // Missing on some variant, or not a StrLit there → not a clean discriminant.
+                _ => continue 'keys,
+            }
+        }
+        return Some(key.clone());
+    }
+    None
+}
+
+/// The discriminant StrLit value of a record type `ty` at field `key`, if `ty` is a record whose
+/// `key` field is a single `StrLit`. Returns `None` for non-records, records missing the key, or a
+/// non-StrLit (e.g. a widened `String`, meaning the value was not pinned to one variant — an
+/// `is Ast` supertype arm has a `String`-typed `kind`, so it does not count as covering any single
+/// variant, preserving the soundness guard).
+fn variant_discriminant(ty: &Type, key: &str) -> Option<String> {
+    if let Type::Object { fields, .. } = ty {
+        if let Some(Type::StrLit(s)) = fields.get(key) {
+            return Some(s.clone());
+        }
+    }
+    None
 }
 
 /// True if `p` is the desugared `is Error` pattern: an object pattern that constrains the
