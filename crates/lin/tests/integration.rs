@@ -5530,6 +5530,62 @@ print(toString(r))
 }
 
 #[test]
+fn test_timeout_expires_when_thunk_captures_function_param() {
+    // Regression: a thunk whose body calls a captured FUNCTION-VALUED parameter (`runner`) must
+    // spawn a real worker just like a thunk calling a top-level function. Previously the captured
+    // closure made the env "non-transferable" and the runtime ran the thunk INLINE on the calling
+    // thread, so `timeout` never tripped (the 300ms work blocked the 30ms budget to completion).
+    // The fix recursively deep-copies the captured closure (transfer.rs::clone_closure), so BOTH
+    // forms below run on a worker and time out to `null`. 300ms-vs-30ms is a ~10x margin (matching
+    // the existing timeout tests CI already runs).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await, timeout } from "std/async"
+import { sleep } from "std/time"
+
+val slowFn = (): Int32 =>
+  sleep(300)
+  42
+
+val viaParam = (runner: () => Int32): Json =>
+  val p = async(() => runner())
+  await(timeout(p, 30))
+
+val viaTopLevel = (): Json =>
+  val p = async(() => slowFn())
+  await(timeout(p, 30))
+
+print(toString(viaParam(slowFn)))
+print(toString(viaTopLevel()))
+"#);
+    // Both forms wrap 300ms of work in a 30ms timeout; both must abandon the work and yield null.
+    assert_eq!(output, vec!["null", "null"],
+        "captured-function-param thunk must spawn a worker (like the top-level form) so timeout trips");
+}
+
+#[test]
+fn test_async_captured_function_param_correct_result() {
+    // Companion to the timeout regression: when NOT timed out, the worker that runs a thunk
+    // capturing a function-valued parameter must produce the CORRECT result — proving the
+    // recursive closure deep-copy (including a closure that itself captures heap data) is sound,
+    // not just that it spawns. `makeAdder(n)` returns a closure capturing the scalar `n`.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { async, await } from "std/async"
+
+val makeAdder = (n: Int32): () => Int32 => () => n + 100
+
+val viaParam = (runner: () => Int32): Json =>
+  val p = async(() => runner())
+  await(p)
+
+print(toString(viaParam(makeAdder(5))))
+print(toString(viaParam(makeAdder(42))))
+"#);
+    assert_eq!(output, vec!["105", "142"]);
+}
+
+#[test]
 fn test_timeout_completes_in_time() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
@@ -5593,7 +5649,8 @@ print(toString(rs))
 
 #[test]
 fn test_async_captures_function_value_runs() {
-    // A thunk capturing a function value (CAP_OPAQUE env) runs inline as a sound fallback.
+    // A thunk capturing a function value is deep-copied (the captured closure is recursively
+    // cloned, transfer.rs::clone_closure) and run on a real worker thread; the result is correct.
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { async, await } from "std/async"
