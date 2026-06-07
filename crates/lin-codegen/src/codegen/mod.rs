@@ -836,16 +836,40 @@ impl<'ctx> Codegen<'ctx> {
                             // A missing operand temp means malformed IR (an undefined SSA temp) —
                             // the old null-pointer fallback silently miscompiled to garbage
                             // arithmetic. Fail loudly with the offending temp instead.
-                            let lv = *temp_map.get(lhs).unwrap_or_else(|| panic!("Binary: undefined lhs temp {lhs:?}"));
-                            let rv = *temp_map.get(rhs).unwrap_or_else(|| panic!("Binary: undefined rhs temp {rhs:?}"));
+                            let mut lv = *temp_map.get(lhs).unwrap_or_else(|| panic!("Binary: undefined lhs temp {lhs:?}"));
+                            let mut rv = *temp_map.get(rhs).unwrap_or_else(|| panic!("Binary: undefined rhs temp {rhs:?}"));
                             let rty = func.temp_types.get(rhs).cloned().unwrap_or(Type::Null);
+                            // UNBOXED SUM TYPE (unboxed-sumtype Stage 1): `==`/`!=` over SumNode
+                            // operands MATERIALIZES each to a boxed `LinObject` (order-independent
+                            // structural object equality via `lin_tagged_eq`), matching the boxed
+                            // golden semantics. A raw SumNode-pointer compare would test identity, not
+                            // value. Other ops never apply to a whole sum value (checker-rejected).
+                            if matches!(op, lin_parse::ast::BinOp::Eq | lin_parse::ast::BinOp::NotEq) {
+                                let lrepr = func.repr_of(*lhs);
+                                let rrepr = func.repr_of(*rhs);
+                                if let Some(sum_ty) = lrepr.sumnode_sum_ty() {
+                                    let sum_ty = sum_ty.clone();
+                                    let obj = self.sumnode_materialize_to_object(lv, &sum_ty, llvm_fn);
+                                    lv = self.box_value(obj, &Self::sumnode_first_variant_obj_ty(&sum_ty));
+                                }
+                                if let Some(sum_ty) = rrepr.sumnode_sum_ty() {
+                                    let sum_ty = sum_ty.clone();
+                                    let obj = self.sumnode_materialize_to_object(rv, &sum_ty, llvm_fn);
+                                    rv = self.box_value(obj, &Self::sumnode_first_variant_obj_ty(&sum_ty));
+                                }
+                            }
                             let result = self.compile_binary_op_values(lv, rv, op, operand_ty, &rty, ty);
                             temp_map.insert(*dst, result);
                         }
                         Instruction::Retain { val, ty } => {
                             if let Some(&v) = temp_map.get(val) {
                                 if v.is_pointer_value() {
-                                    if Self::is_union_type(ty) {
+                                    // UNBOXED SUM TYPE: a SumNode's refcount is the offset-0 u32
+                                    // (lin_rc_retain) — NOT a tagged inner-payload retain (which would
+                                    // corrupt the header). Read the proven repr.
+                                    if func.repr_of(*val).sumnode_sum_ty().is_some() {
+                                        self.builder.call(self.rt.rc_retain, &[v.into()], "");
+                                    } else if Self::is_union_type(ty) {
                                         // A boxed TaggedVal*: bump the INNER payload's rc
                                         // (tag-aware). lin_rc_retain would hit the tag byte at
                                         // offset 0 and corrupt it.
@@ -867,6 +891,16 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::CloneBox { dst, src, ty } => {
                             if let Some(&v) = temp_map.get(src) {
+                                // UNBOXED SUM TYPE: a SumNode value (repr Packed(SumNode)) is NOT a
+                                // boxed TaggedVal — an "owning read" of one bumps the SumNode's own
+                                // refcount (offset-0 u32, via lin_rc_retain) and keeps the SAME
+                                // pointer. `lin_tagged_clone` would read offset 0 as a tag byte and
+                                // corrupt it (the recursive sum-param crash).
+                                if func.repr_of(*src).sumnode_sum_ty().is_some() && v.is_pointer_value() {
+                                    self.builder.call(self.rt.rc_retain, &[v.into()], "");
+                                    temp_map.insert(*dst, v);
+                                    continue;
+                                }
                                 let cloned = if Self::is_union_type(ty) && v.is_pointer_value() {
                                     // Allocate a fresh, independently-owned box copying the
                                     // tag+payload and retaining the inner heap payload. The
@@ -1882,6 +1916,40 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, result.into());
                             }
                         }
+                        Instruction::SumTagEq { dst, val, sum_ty, disc_value } => {
+                            if let Some(&v) = temp_map.get(val) {
+                                // The O(1) sum dispatch: load the inline tag and compare to the
+                                // variant's static tag. Read the proven repr — only emit the tag
+                                // compare when `val` is genuinely a SumNode (the lowerer guarantees
+                                // it, but fall back to a materialize+disc-string compare otherwise so
+                                // a mis-seeded boxed value can never read garbage).
+                                let result = if func.repr_of(*val).sumnode_sum_ty().is_some() {
+                                    let tag = self.sumnode_tag_load(v);
+                                    let want = Self::sumnode_variant_tag(sum_ty, disc_value)
+                                        .expect("SumTagEq: unknown variant");
+                                    self.builder.int_compare(
+                                        inkwell::IntPredicate::EQ,
+                                        tag,
+                                        self.context.i32_type().const_int(want as u64, false),
+                                        "sumtag_eq",
+                                    )
+                                } else {
+                                    // Defensive fallback: materialize + boxed disc-string compare.
+                                    let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                                    let obj = self.sumnode_materialize_to_object(v, sum_ty, llvm_fn);
+                                    let boxed = self.box_value(obj, &Self::sumnode_first_variant_obj_ty(sum_ty));
+                                    let disc_key = Self::sum_type_discriminant(sum_ty).unwrap_or_default();
+                                    let kp = self.compile_string_lit(&disc_key).into_pointer_value();
+                                    let got = self.builder.call(self.rt.object_get, &[boxed.into(), kp.into()], "").try_as_basic_value().unwrap_basic();
+                                    let litr = self.compile_string_lit(disc_value);
+                                    let lit = self.box_value(litr, &Type::Str);
+                                    let eqfn = self.get_or_declare_fn("lin_tagged_eq", self.context.i8_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                                    let e = self.builder.call(eqfn, &[got.into(), lit.into()], "").try_as_basic_value().unwrap_basic().into_int_value();
+                                    self.builder.int_truncate_or_bit_cast(e, self.context.bool_type(), "")
+                                };
+                                temp_map.insert(*dst, result.into());
+                            }
+                        }
                         Instruction::HasPattern { dst, val, pattern } => {
                             if let Some(&v) = temp_map.get(val) {
                                 let result = self.compile_ir_has_pattern(v, pattern);
@@ -1896,7 +1964,12 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::Coerce { dst, src, from_ty, to_ty } => {
                             if let Some(&sv) = temp_map.get(src) {
-                                let result = self.compile_ir_coerce(sv, from_ty, to_ty);
+                                // The SOURCE operand's repr decides the sum-type coercion direction:
+                                // a SumNode source materializes/projects via the `sumnode_*` helpers,
+                                // not the boxed `sealed_project_from`/`box` path (which would read a
+                                // SumNode pointer as a TaggedVal → UAF). Threaded for the call ABI.
+                                let src_repr = func.repr_of(*src);
+                                let result = self.compile_ir_coerce_with_repr(sv, from_ty, to_ty, &src_repr, llvm_fn);
                                 temp_map.insert(*dst, result);
                             }
                         }
