@@ -98,6 +98,11 @@ impl LanguageServer for Backend {
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 // Smart-expand selection (innermost span outward) from the AST span nesting.
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                // Clickable import paths that resolve to the target `.lin` file.
+                document_link_provider: Some(DocumentLinkOptions {
+                    resolve_provider: Some(false),
+                    work_done_progress_options: Default::default(),
+                }),
                 // Type-aware semantic highlighting (full-document only; the TextMate grammar stays
                 // the fallback for incremental edits).
                 semantic_tokens_provider: Some(
@@ -644,6 +649,23 @@ impl LanguageServer for Backend {
             })
             .collect();
         Ok(Some(ranges))
+    }
+
+    async fn document_link(
+        &self,
+        params: DocumentLinkParams,
+    ) -> Result<Option<Vec<DocumentLink>>> {
+        let uri = &params.text_document.uri;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let base_dir = file_dir(uri);
+        let mut lexer = lin_lex::Lexer::new(&source, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = lin_parse::Parser::new(tokens);
+        let module = parser.parse_module();
+        Ok(Some(import_document_links(&source, &module, base_dir.as_deref())))
     }
 
     async fn symbol(
@@ -2054,6 +2076,68 @@ fn enclosing_bracket_pairs(source: &str, offset: usize) -> Vec<(usize, usize)> {
     // Sort innermost (smallest) → outermost.
     enclosing.sort_by_key(|(o, c)| c - o);
     enclosing
+}
+
+// ── document links (import paths) ──────────────────────────────────────────────
+
+/// Make each `import ... from "PATH"` (and `import foreign "PATH"`) path string a
+/// clickable `DocumentLink` to the resolved target file. `std/...` and any path that
+/// doesn't resolve to a real on-disk file are skipped (no navigable target). Reuses
+/// the same relative-path resolution as the import resolver (`base_dir/PATH.lin`).
+fn import_document_links(
+    source: &str,
+    module: &lin_parse::ast::Module,
+    base_dir: Option<&Path>,
+) -> Vec<DocumentLink> {
+    let mut out = Vec::new();
+    let base = match base_dir {
+        Some(b) => b,
+        None => return out,
+    };
+    for stmt in &module.statements {
+        let (path, stmt_span) = match stmt {
+            Stmt::Import { path, span, .. } => (path, span),
+            Stmt::ForeignImport { path, span, .. } => (path, span),
+            _ => continue,
+        };
+        // stdlib has no on-disk file; skip.
+        if stdlib_source(path).is_some() || path.starts_with("std/") {
+            continue;
+        }
+        let target = base.join(format!("{}.lin", path));
+        if !target.is_file() {
+            continue;
+        }
+        let Ok(target_uri) = Url::from_file_path(&target) else { continue };
+        // Locate the quoted PATH string within the statement source so only the path
+        // (not the whole `import` keyword) is the clickable link.
+        let Some(range) = quoted_path_range(source, *stmt_span, path) else { continue };
+        out.push(DocumentLink {
+            range,
+            target: Some(target_uri),
+            tooltip: None,
+            data: None,
+        });
+    }
+    out
+}
+
+/// Range of the quoted `"path"` token inside the import statement that begins at
+/// `stmt_span`. The parser records only the `import` keyword's span, so the search
+/// runs from the statement start to the end of its line. Returns the range covering
+/// just the path characters between the quotes.
+fn quoted_path_range(source: &str, stmt_span: lin_common::Span, path: &str) -> Option<Range> {
+    let start = stmt_span.start as usize;
+    // Scan to the end of the statement's line (import statements are single-line).
+    let line_end = source[start..].find('\n').map(|i| start + i).unwrap_or(source.len());
+    let hay = source.get(start..line_end)?;
+    let needle = format!("\"{}\"", path);
+    let rel = hay.find(&needle)?;
+    let abs = start + rel + 1; // +1 to skip the opening quote
+    Some(Range {
+        start: offset_to_position(source, abs),
+        end: offset_to_position(source, abs + path.len()),
+    })
 }
 
 // ── signature help ─────────────────────────────────────────────────────────────
@@ -3857,5 +3941,35 @@ mod tests {
             depth += 1;
         }
         assert!(depth >= 1, "expected at least one expansion level");
+    }
+
+    // ── document links (import paths) ─────────────────────────────────────────────
+
+    /// A relative `import ... from "PATH"` whose target file exists yields a DocumentLink
+    /// pointing at that file; `std/...` imports are skipped (no on-disk file).
+    #[test]
+    fn document_link_resolves_import() {
+        let dir = std::env::temp_dir().join(format!("lin_lsp_doclink_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("leaf.lin"), "export val leafVal = 1\n").unwrap();
+
+        let src = "import { print } from \"std/io\"\nimport { leafVal } from \"leaf\"\n";
+        let module = parse(src);
+        let links = import_document_links(src, &module, Some(&dir));
+
+        // Exactly one link (the relative `leaf` import); the stdlib one is skipped.
+        assert_eq!(links.len(), 1, "expected one link, got {:?}", links);
+        let link = &links[0];
+        let target = link.target.as_ref().unwrap();
+        assert!(target.to_string().ends_with("leaf.lin"), "link should target leaf.lin: {}", target);
+        // The range covers the `leaf` text between the quotes (not the whole statement).
+        let span_text = {
+            let start = position_to_offset(src, link.range.start);
+            let end = position_to_offset(src, link.range.end);
+            &src[start..end]
+        };
+        assert_eq!(span_text, "leaf", "link range should be just the path text");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
