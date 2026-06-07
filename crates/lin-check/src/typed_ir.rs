@@ -26,6 +26,16 @@ pub struct TypedModule {
     /// Side-channel metadata like `intrinsics`/`exported_types`; statement lowering ignores it.
     #[serde(default)]
     pub replacements: Vec<Replacement>,
+    /// Coverage attribution for CROSS-MODULE monomorphized specializations (`name$Int32`): maps the
+    /// specialization's top-level `val` slot → the origin module path its generic body was cloned
+    /// from. Populated by the monomorphizer (`spec.origin.is_some()`). Lowering uses it to set each
+    /// specialization `LinFunction.coverage_origin`, so codegen attributes the spec's coverage
+    /// regions to the origin source file (the generic definition's lines) instead of the importing
+    /// module — otherwise a generic exported from another module reports 0% coverage even when its
+    /// monomorphized instances are exercised by tests. Side-channel metadata; lowering of the
+    /// statement values themselves ignores it.
+    #[serde(default)]
+    pub spec_origins: HashMap<usize, String>,
 }
 
 /// One `replace <name> = <expr>` override (ADR-046). See `TypedModule::replacements`.
