@@ -2321,17 +2321,38 @@ fn signature_help(source: &str, analysis: &Analysis, offset: usize) -> Option<Si
     let ty_str = tightest_span(&analysis.span_type_map, callee_span.start as usize)
         .map(|(_, s, _)| s.clone())?;
     // Only function-typed callees produce a signature.
-    let params = function_param_types(&ty_str)?;
+    let param_types = function_param_types(&ty_str)?;
 
     // Active parameter = number of top-level commas between the opening paren and the cursor.
     let active = top_level_commas(&source[paren_after..offset.min(source.len())]);
-    let active = (active as usize).min(params.len().saturating_sub(1)) as u32;
+    let active = (active as usize).min(param_types.len().saturating_sub(1)) as u32;
 
-    // Render `(P1, P2, …) => R` exactly as the type string, with one ParameterInformation per
-    // top-level parameter so the client can bold the active one. Param labels use the bare type
-    // text (the function type carries no parameter names).
-    let label = ty_str.clone();
-    let parameters: Vec<ParameterInformation> = params
+    // Recover parameter NAMES (non-invasively) from the callee's binding AST when the callee is a
+    // same-file `val`/`var` bound to a function literal. The function `Type` carries no names, so
+    // we read them from the surface params. Only used when the name count matches the type-derived
+    // param count (so positional bolding via `active` stays correct); otherwise fall back to
+    // types-only labels.
+    let callee_name = source.get(callee_span.start as usize..callee_span.end as usize).unwrap_or("");
+    let names = callee_param_names(&analysis.module, callee_name)
+        .filter(|n| n.len() == param_types.len());
+
+    // Render one ParameterInformation per parameter as `name: Type` when names are known, else the
+    // bare type. The overall signature label is rebuilt to match (so the client highlights the
+    // right slice of the label string for the active parameter).
+    let rendered: Vec<String> = param_types
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| match names.as_ref().and_then(|n| n.get(i)) {
+            Some(name) => format!("{}: {}", name, ty),
+            None => ty.clone(),
+        })
+        .collect();
+
+    // Reconstruct `(p0, p1, …) => R` from the rendered params + the return type tail of `ty_str`.
+    let return_tail = ty_str.find("=>").map(|i| &ty_str[i..]).unwrap_or("");
+    let label = format!("({}) {}", rendered.join(", "), return_tail).trim_end().to_string();
+
+    let parameters: Vec<ParameterInformation> = rendered
         .iter()
         .map(|p| ParameterInformation {
             label: ParameterLabel::Simple(p.clone()),
@@ -2349,6 +2370,38 @@ fn signature_help(source: &str, analysis: &Analysis, offset: usize) -> Option<Si
         active_signature: Some(0),
         active_parameter: Some(active),
     })
+}
+
+/// Recover the parameter names of `callee_name` when it's a top-level `val`/`var` in `module` bound
+/// to a function literal. Each name comes from the param's binding pattern (`Pattern::Ident`);
+/// destructured/wildcard params render as `_`. Returns `None` when no such function binding exists.
+/// Non-invasive: reads only the surface AST — the checker's function `Type` is unchanged.
+fn callee_param_names(module: &lin_parse::ast::Module, callee_name: &str) -> Option<Vec<String>> {
+    use lin_parse::ast::Expr as E;
+    if callee_name.is_empty() {
+        return None;
+    }
+    for stmt in &module.statements {
+        let (matches, value) = match stmt {
+            Stmt::Val { pattern, value, .. } => {
+                (pattern_ident(pattern).map(|(n, _)| n).as_deref() == Some(callee_name), value)
+            }
+            Stmt::Var { name, value, .. } => (name == callee_name, value),
+            _ => continue,
+        };
+        if !matches {
+            continue;
+        }
+        if let E::Function { params, .. } = value {
+            return Some(
+                params
+                    .iter()
+                    .map(|p| pattern_ident(&p.pattern).map(|(n, _)| n).unwrap_or_else(|| "_".to_string()))
+                    .collect(),
+            );
+        }
+    }
+    None
 }
 
 /// Walk the AST for the INNERMOST plain `Call` whose argument list contains `offset`. Returns the
@@ -4289,5 +4342,28 @@ mod tests {
         assert!(labels.contains(&"std/array"), "expected std/array in {:?}", labels);
         // No non-matching modules.
         assert!(labels.iter().all(|l| l.starts_with("std/ar")));
+    }
+
+    // ── signature help with parameter names (feature 13) ──────────────────────────
+
+    /// Same-file callee bound to a function literal: signature help renders `name: Type`
+    /// for each parameter (names pulled from the binding AST, no checker change).
+    #[test]
+    fn signature_help_includes_param_names() {
+        let src = "val add = (a: Int32, b: Int32) => a + b\nval r = add(1, 2)\n";
+        let analysis = analyse(src, None);
+        let call_open = src.rfind('(').unwrap();
+        let cursor = call_open + 1;
+        let help = signature_help(src, &analysis, cursor).expect("expected signature help");
+        let sig = &help.signatures[0];
+        let params = sig.parameters.as_ref().unwrap();
+        // Labels carry the parameter names.
+        let labels: Vec<&str> = params.iter().filter_map(|p| match &p.label {
+            ParameterLabel::Simple(s) => Some(s.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(labels, vec!["a: Int32", "b: Int32"], "param labels should be name: Type");
+        // The signature label reflects names too.
+        assert!(sig.label.contains("a: Int32"), "label should include names: {}", sig.label);
     }
 }
