@@ -251,11 +251,7 @@ impl<'ctx> Codegen<'ctx> {
         if let Some(sum_ty) = obj_repr.sumnode_sum_ty() {
             let sum_ty = sum_ty.clone();
             let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-            // Materialize the whole node to a boxed LinObject once, then object_get the key. This is
-            // the universal (correct) dynamic-index path; the common discriminant read is a single
-            // key fetch from the freshly built object. RC: the materialized object is +1; we fetch a
-            // BORROWED interior TaggedVal* (object_get) and CLONE it so the result is independently
-            // owned, then release the temporary object so nothing leaks.
+            // Runtime key: materialize the whole node to a boxed LinObject once, then object_get.
             let obj_box = self.sumnode_materialize_to_object(obj, &sum_ty, llvm_fn).into_pointer_value();
             let key_raw = if Self::is_union_type(key_ty) && key.is_pointer_value() {
                 self.builder.call(self.rt.unbox_ptr, &[key.into()], "sumnode_idx_kstr").try_as_basic_value().unwrap_basic()
@@ -263,8 +259,6 @@ impl<'ctx> Codegen<'ctx> {
                 key
             };
             let got = self.builder.call(self.rt.object_get, &[obj_box.into(), key_raw.into()], "sumnode_idx_get").try_as_basic_value().unwrap_basic();
-            // Clone the borrowed interior value to an independently-owned box (so releasing obj_box is
-            // safe), then release the temporary materialized object.
             let cloned = if got.is_pointer_value() {
                 let clone_fn = self.get_or_declare_fn("lin_tagged_clone", ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(clone_fn, &[got.into()], "sumnode_idx_clone").try_as_basic_value().unwrap_basic()
@@ -363,6 +357,14 @@ impl<'ctx> Codegen<'ctx> {
             if Self::sealed_fields(result_ty).is_some() {
                 return self.compile_ir_unbox_keep_packed(tagged, /*arr=*/false);
             }
+            // UNBOXED SUM TYPE: a sum-typed map value was stored MATERIALIZED (a boxed LinObject — see
+            // `emit_map_set`). Read it back and PROJECT into a fresh SumNode so the consumer (a
+            // SumNode param / match) sees the packed repr the type implies. Keeps the repr consistent
+            // (the result is genuinely a SumNode), which verify relies on.
+            if Self::is_sum_type(result_ty) {
+                let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                return self.sumnode_project_from_boxed(tagged, result_ty, result_ty, llvm_fn);
+            }
             return if Self::is_union_type(result_ty) {
                 tagged
             } else {
@@ -404,6 +406,16 @@ impl<'ctx> Codegen<'ctx> {
             // read + unbox path below; reading it as flat would return garbage.
             if Self::is_flat_scalar(result_ty) && !matches!(obj_ty, Type::FixedArray(_)) {
                 return self.flat_array_get(container, idx, result_ty);
+            }
+            // UNBOXED SUM TYPE: a `Shape[]` element was stored MATERIALIZED (a boxed LinObject). Read
+            // it back and PROJECT into a fresh SumNode so the consumer sees the packed repr the type
+            // implies (the result is genuinely a SumNode — repr-consistent for verify).
+            if Self::is_sum_type(result_ty) {
+                let get_tagged_fn = self.get_or_declare_fn("lin_array_get_tagged",
+                    ptr_ty.fn_type(&[ptr_ty.into(), self.context.i64_type().into()], false));
+                let tagged = self.builder.call(get_tagged_fn, &[container.into(), idx.into()], "ir_aget_sum").try_as_basic_value().unwrap_basic();
+                let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                return self.sumnode_project_from_boxed(tagged, result_ty, result_ty, llvm_fn);
             }
             // For TypeVar/Union result, use lin_array_get_tagged so the result is always
             // a valid TaggedVal* regardless of whether the array is flat or tagged.
@@ -555,6 +567,26 @@ impl<'ctx> Codegen<'ctx> {
         // pointer (UnboxKeepPacked) feeding SealedArrayFieldGet zero-copy. Always sound: the runtime
         // dispatches release/free on the buffer's `elem_tag` / sealed header, regardless of being
         // wrapped in a TaggedVal slot.
+        // UNBOXED SUM TYPE (unboxed-sumtype Stage 1): a SumNode value stored into a `{String: Shape}`
+        // map (a boxed/union value slot) is MATERIALIZED to a boxed `LinObject` first, then stored as
+        // a TAG_OBJECT TaggedVal — the universal Json representation the map slot and the boxed
+        // read-back (`mapArea` via `has`) expect. The materialized object is +1 owned; `lin_map_set`
+        // retains the inner into the slot, so we release the transient box after the set (net: the
+        // slot owns one reference, the temporary is reclaimed). Keep-packed-by-pointer is deferred to
+        // a later stage; materialize is the sound Stage-1 boundary.
+        if value.is_pointer_value() {
+            if let Some(sum_ty) = val_repr.sumnode_sum_ty() {
+                let sum_ty = sum_ty.clone();
+                let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+                let obj = self.sumnode_materialize_to_object(value, &sum_ty, llvm_fn);
+                let boxed = self.box_value(obj, &Self::sumnode_first_variant_obj_ty(&sum_ty));
+                self.builder.call(self.rt.map_set, &[map_ptr.into(), key_ptr.into(), boxed.into()], "");
+                if boxed.is_pointer_value() {
+                    self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                }
+                return;
+            }
+        }
         if value.is_pointer_value() {
             let packed_arr = val_repr.packed_sealed_array_layout().is_some();
             let packed_rec = val_repr.packed_struct_fields().is_some();
@@ -1885,8 +1917,6 @@ impl<'ctx> Codegen<'ctx> {
     /// const offset; the discriminant field (a StrLit) is materialized as the interned literal. Used
     /// by `compile_ir_coerce` for a sum→variant-record Coerce (the arm-entry narrowing). Non-mutating:
     /// the source SumNode keeps its own ownership. Returns a +1 sealed struct.
-    /// (Foundation helper — wired in `compile_ir_coerce` once the repr seed + ABI land.)
-    #[allow(dead_code)]
     pub(crate) fn sumnode_project_to_sealed(
         &mut self,
         node: BasicValueEnum<'ctx>,
@@ -1925,8 +1955,6 @@ impl<'ctx> Codegen<'ctx> {
     /// variant's node by reading each scalar payload field with `lin_object_get`+unbox. Returns a +1
     /// SumNode. Defensive default arm builds the first variant's node (the checker guarantees a valid
     /// discriminant for a well-typed coercion).
-    /// (Foundation helper — wired in `compile_ir_coerce` once the repr seed + ABI land.)
-    #[allow(dead_code)]
     pub(crate) fn sumnode_project_from_boxed(
         &mut self,
         src: BasicValueEnum<'ctx>,
