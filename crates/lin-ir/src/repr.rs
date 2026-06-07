@@ -56,6 +56,14 @@ pub enum Layout {
     /// deterministic function of `elem_layout` (`elem_layout_on_heap`), so it never independently
     /// affects the lattice join.
     PackedSealedArray { elem_layout: IndexMap<String, Type>, on_heap: bool },
+    /// An unboxed tagged sum-type value (`lin_runtime::sumnode` — unboxed-sumtype Stage 1): a pointer
+    /// to a heap `SumNode` `[u32 rc | u32 size | u64 desc | u32 tag | u32 pad | max-variant payload]`.
+    /// The layout key is the WHOLE sum type's field shape: the discriminant key plus the ordered
+    /// per-variant (discriminant-value → payload field map). Two SumNode values share a layout iff
+    /// their sum types are identical, so the canonical `Type::Union` itself is the key (its
+    /// `PartialEq` is field-order-sensitive on each variant Object, matching the physical layout).
+    /// Stage 1 is NON-RECURSIVE, SCALAR-ONLY — heap/recursive variants fall back to the boxed union.
+    SumNode { sum_ty: Type },
 }
 
 /// What a `Boxed` slot wraps.
@@ -136,6 +144,15 @@ impl Repr {
     /// True iff this repr is a packed value of EITHER kind (struct or sealed array).
     pub fn is_packed(&self) -> bool {
         matches!(self, Repr::Packed(_))
+    }
+
+    /// `Some(sum_ty)` iff this repr is an unboxed tagged sum-type value (`Layout::SumNode`) — the
+    /// codegen gate for the `lin_sumnode_*` construct / tag-switch / const-offset payload path.
+    pub fn sumnode_sum_ty(&self) -> Option<&Type> {
+        match self {
+            Repr::Packed(Layout::SumNode { sum_ty }) => Some(sum_ty),
+            _ => None,
+        }
     }
 }
 
@@ -225,6 +242,64 @@ fn sealed_fields(ty: &Type) -> Option<&IndexMap<String, Type>> {
     }
 }
 
+/// Mirror of `Codegen::sum_type_discriminant` (types.rs) — the SINGLE Stage-1 sum-type gate. Returns
+/// the discriminant key iff `ty` is a `Type::Union` of 2+ object variants sharing a distinct StrLit
+/// discriminant whose every OTHER field is an unboxed scalar (NON-RECURSIVE, SCALAR-ONLY). Any
+/// violation → `None` → the value stays a boxed union (fail-safe). Kept byte-identical to codegen.
+fn sum_type_discriminant(ty: &Type) -> Option<String> {
+    let variants = match ty {
+        Type::Union(vs) => vs,
+        _ => return None,
+    };
+    if variants.len() < 2 {
+        return None;
+    }
+    let mut recs: Vec<&IndexMap<String, Type>> = Vec::with_capacity(variants.len());
+    for v in variants {
+        match v {
+            Type::Object { fields, .. } if !fields.is_empty() => recs.push(fields),
+            _ => return None,
+        }
+    }
+    let first = recs[0];
+    'keys: for (key, kty) in first.iter() {
+        if !matches!(kty, Type::StrLit(_)) {
+            continue;
+        }
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for rec in &recs {
+            match rec.get(key) {
+                Some(Type::StrLit(s)) => {
+                    if !seen.insert(s.clone()) {
+                        continue 'keys;
+                    }
+                }
+                _ => continue 'keys,
+            }
+        }
+        for rec in &recs {
+            for (fk, fty) in rec.iter() {
+                if fk == key {
+                    continue;
+                }
+                if matches!(fty, Type::StrLit(_)) {
+                    return None;
+                }
+                if !(is_sealed_scalar_field(fty)) {
+                    return None;
+                }
+            }
+        }
+        return Some(key.clone());
+    }
+    None
+}
+
+/// True iff `ty` is a Stage-1-eligible unboxed sum type.
+fn sum_type_eligible(ty: &Type) -> bool {
+    sum_type_discriminant(ty).is_some()
+}
+
 /// Mirror of `Codegen::sealed_array_elem_field_packable` (types.rs): SCALARS ONLY (Stage 3a). Heap
 /// fields stay boxed pending the whole-program record-representation-consistency work — see the gate
 /// note in `Codegen::sealed_array_elem_field_packable`.
@@ -254,6 +329,18 @@ fn sealed_array_elem(ty: &Type) -> Option<&IndexMap<String, Type>> {
 /// dispatch order: sealed-scalar-array → Packed array; sealed record → Packed struct; flat scalar →
 /// FlatScalar; everything else → Boxed(Opaque) (fail safe).
 fn type_seed(ty: &Type) -> Repr {
+    // NOTE (unboxed-sumtype Stage 1): the SumNode SEED is intentionally NOT yet enabled here. The
+    // lattice variant, the strict `sum_type_eligible` gate, the oracle/verify SumNode arms, the
+    // runtime `SumNode`, and the codegen layout/construct/dispatch/materialize primitives are all in
+    // place and unit-tested, but the END-TO-END representation (call ABI: passing a sum value
+    // by-SumNode-pointer and reading a sum PARAM as a SumNode, plus global-init construction) is not
+    // yet wired. Seeding SumNode before codegen consumes it at EVERY site would create a boxed-vs-
+    // packed mismatch (the param is labelled SumNode but the body reads it boxed → UAF), which the
+    // oracle/verify correctly flag. Until the ABI is wired, sum values stay boxed (fail-safe, zero
+    // behavior change). Flip this on (return `Packed(SumNode)`) together with the ABI work.
+    if sum_type_eligible(ty) {
+        // Inert: fall through to the boxed-union seed below.
+    }
     if let Some(elem_fields) = sealed_array_elem(ty) {
         return Repr::Packed(Layout::PackedSealedArray {
             on_heap: elem_layout_on_heap(elem_fields),
@@ -273,6 +360,13 @@ fn type_seed(ty: &Type) -> Repr {
 /// when `sealed_scalar_fields(ty).is_some()` AND there are NO spreads AND every sealed field is
 /// present in the literal (`all_present`). Field omission or a spread → the boxed `LinObject` path.
 fn make_object_repr(ty: &Type, fields: &[(String, Temp)], spreads: &[Temp]) -> Repr {
+    // NOTE (unboxed-sumtype Stage 1): SumNode construction-seed intentionally NOT yet enabled — see
+    // the note in `type_seed`. The decision logic is preserved (commented) so the ABI follow-up only
+    // needs to flip it back on. A MakeObject whose `ty` is a Stage-1 sum type (no spreads) WOULD
+    // construct a `SumNode`:
+    //   if sum_type_eligible(ty) && spreads.is_empty() {
+    //       return Repr::Packed(Layout::SumNode { sum_ty: ty.clone() });
+    //   }
     if let Some(sf) = sealed_fields(ty) {
         let all_present =
             spreads.is_empty() && sf.keys().all(|k| fields.iter().any(|(fk, _)| fk == k));
@@ -530,6 +624,11 @@ fn is_packed_sealed_array(repr: &Repr, elem_fields: &IndexMap<String, Type>) -> 
     matches!(repr, Repr::Packed(Layout::PackedSealedArray { elem_layout, .. }) if elem_layout == elem_fields)
 }
 
+/// Is `repr` a SumNode for sum type `sum_ty`?
+fn is_sumnode(repr: &Repr, sum_ty: &Type) -> bool {
+    matches!(repr, Repr::Packed(Layout::SumNode { sum_ty: s }) if s == sum_ty)
+}
+
 /// The Stage-2 oracle: at every site where the OLD predicates decide a representation, assert the
 /// new analysis AGREES. Debug-only (callers gate with `cfg(debug_assertions)`). A disagreement is
 /// either a bug in the new analysis OR a latent bug in the old predicates — it must be reconciled
@@ -558,6 +657,11 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                         Repr::Packed(Layout::PackedStruct { fields: f }) => {
                             if !is_packed_struct(r, f) {
                                 report(&mut bad, "MakeObject(packed)", *dst, "Packed(struct)", r);
+                            }
+                        }
+                        Repr::Packed(Layout::SumNode { sum_ty }) => {
+                            if !is_sumnode(r, sum_ty) {
+                                report(&mut bad, "MakeObject(sumnode)", *dst, "Packed(SumNode)", r);
                             }
                         }
                         _ => {
@@ -721,7 +825,14 @@ pub fn verify(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
         for instr in &block.instructions {
             match instr {
                 Instruction::FieldGet { object, obj_ty, .. } => {
-                    if let Some(f) = sealed_fields(obj_ty) {
+                    if sum_type_eligible(obj_ty) {
+                        if !is_sumnode(&repr[object.0 as usize], obj_ty) {
+                            bad.push(format!(
+                                "{fname}: FieldGet requires Packed(SumNode) of t{}, has {:?}",
+                                object.0, repr[object.0 as usize]
+                            ));
+                        }
+                    } else if let Some(f) = sealed_fields(obj_ty) {
                         if !is_packed_struct(&repr[object.0 as usize], f) {
                             bad.push(format!(
                                 "{fname}: FieldGet requires Packed(struct) of t{}, has {:?}",
@@ -894,6 +1005,82 @@ mod tests {
         let f = func_of(instrs, Some(Temp(2)), 3, vec![]);
         let repr = analyze(&f);
         assert!(matches!(repr[2], Repr::Packed(Layout::PackedStruct { .. })));
+        assert!(oracle_check(&f, &repr).is_empty());
+        assert!(verify(&f, &repr).is_empty());
+    }
+
+    fn shape_union() -> Type {
+        // type Shape = { kind: "circle", r: Int32 } | { kind: "square", side: Int32 }
+        let mut circle = IndexMap::new();
+        circle.insert("kind".into(), Type::StrLit("circle".into()));
+        circle.insert("r".into(), Type::Int32);
+        let mut square = IndexMap::new();
+        square.insert("kind".into(), Type::StrLit("square".into()));
+        square.insert("side".into(), Type::Int32);
+        Type::Union(vec![
+            Type::Object { fields: circle, sealed: true },
+            Type::Object { fields: square, sealed: true },
+        ])
+    }
+
+    #[test]
+    fn sum_type_gate_accepts_scalar_variants() {
+        assert!(super::sum_type_eligible(&shape_union()));
+        assert_eq!(super::sum_type_discriminant(&shape_union()).as_deref(), Some("kind"));
+    }
+
+    #[test]
+    fn sum_type_gate_rejects_heap_field_variant() {
+        // A variant with a String (non-scalar) field is out of Stage-1 scope → fall back to boxed.
+        let mut a = IndexMap::new();
+        a.insert("kind".into(), Type::StrLit("a".into()));
+        a.insert("name".into(), Type::Str);
+        let mut b = IndexMap::new();
+        b.insert("kind".into(), Type::StrLit("b".into()));
+        b.insert("n".into(), Type::Int32);
+        let u = Type::Union(vec![
+            Type::Object { fields: a, sealed: true },
+            Type::Object { fields: b, sealed: true },
+        ]);
+        assert!(!super::sum_type_eligible(&u), "heap-field variant must be boxed");
+    }
+
+    #[test]
+    fn sum_type_gate_rejects_no_distinct_discriminant() {
+        // No shared distinct StrLit key → boxed.
+        let mut a = IndexMap::new();
+        a.insert("x".into(), Type::Int32);
+        let mut b = IndexMap::new();
+        b.insert("y".into(), Type::Int32);
+        let u = Type::Union(vec![
+            Type::Object { fields: a, sealed: true },
+            Type::Object { fields: b, sealed: true },
+        ]);
+        assert!(!super::sum_type_eligible(&u));
+    }
+
+    #[test]
+    fn sum_type_seed_currently_inert_boxed() {
+        // STAGE 1 (foundation): the SumNode SEED is intentionally not yet enabled (the ABI is not
+        // wired). A sum-type construction therefore stays boxed (fail-safe). When the ABI follow-up
+        // flips the seed on, this test flips to asserting `Packed(SumNode)`. The gate itself is proven
+        // live by `sum_type_gate_accepts_scalar_variants`.
+        let shape = shape_union();
+        let instrs = vec![
+            Instruction::Const { dst: Temp(0), val: Const::Int(5, Type::Int32) },
+            Instruction::Const { dst: Temp(1), val: Const::Str("circle".into()) },
+            Instruction::MakeObject {
+                dst: Temp(2),
+                fields: vec![("kind".into(), Temp(1)), ("r".into(), Temp(0))],
+                spreads: vec![],
+                ty: shape.clone(),
+                stack: false,
+            },
+        ];
+        let f = func_of(instrs, Some(Temp(2)), 3, vec![]);
+        let repr = analyze(&f);
+        assert!(!matches!(repr[2], Repr::Packed(Layout::SumNode { .. })), "seed inert: sum literal must stay boxed for now, got {:?}", repr[2]);
+        // Oracle + verify must remain clean with the inert seed (no SumNode label anywhere).
         assert!(oracle_check(&f, &repr).is_empty());
         assert!(verify(&f, &repr).is_empty());
     }
