@@ -154,10 +154,55 @@ unsafe fn unwrap_stream(p: *const u8) -> *const StreamBox {
     }
 }
 
+/// If `s` is NOT a stream but IS the canonical Error object (`{ "type": "error", "message": … }`),
+/// return its message. This is how a failed source (`readStream` of a missing file returns an
+/// Error, not a Stream — `lin_fs_open`) is recognised when it flows into a stream adapter or
+/// terminal: instead of dereferencing a null box (a process abort) or silently swallowing the
+/// fault (returning Null as if the stream were empty), the operation threads the Error in-band,
+/// exactly as a mid-pipeline read fault would. Returns `None` for a real stream or any non-error
+/// value (which the caller treats as an empty/EOF stream, the prior behaviour).
+unsafe fn stream_arg_error(s: *const u8) -> Option<String> {
+    use crate::object::LinObject;
+    use crate::string::LinString;
+    if s.is_null() {
+        return None;
+    }
+    let tv = &*(s as *const TaggedVal);
+    if tv.tag != crate::tagged::TAG_OBJECT {
+        return None;
+    }
+    let obj = tv.payload as *const LinObject;
+    if obj.is_null() {
+        return None;
+    }
+    // Read `type`; only an `"error"`-tagged object is treated as an in-band fault.
+    let get = |key: &str| -> Option<String> {
+        let k = crate::fs::make_string(key);
+        let v = crate::object::lin_object_get(obj, k);
+        crate::string::lin_string_release(k);
+        if v.is_null() || (*v).tag != crate::tagged::TAG_STR {
+            return None;
+        }
+        let sp = (*v).payload as *const LinString;
+        let slice = std::slice::from_raw_parts((*sp).data.as_ptr(), (*sp).len as usize);
+        std::str::from_utf8(slice).ok().map(|x| x.to_string())
+    };
+    match get("type") {
+        Some(ref t) if t == "error" => Some(get("message").unwrap_or_else(|| "stream error".to_string())),
+        _ => None,
+    }
+}
+
 /// Pull the next BYTE chunk from a `StreamBox` (given a boxed `Stream` value), as a `ReadOutcome`.
 /// Used by `lin_stream_read` (the low-level byte read). Closed/null → `Eof`.
 pub unsafe fn stream_read_outcome(s: *const u8) -> ReadOutcome {
-    match pull_tagged(unwrap_stream(s)) {
+    let b = unwrap_stream(s);
+    if b.is_null() {
+        if let Some(m) = stream_arg_error(s) {
+            return ReadOutcome::Err(m);
+        }
+    }
+    match pull_tagged(b) {
         TaggedOutcome::Eof => ReadOutcome::Eof,
         TaggedOutcome::Err(m) => ReadOutcome::Err(m),
         TaggedOutcome::Item(item) => {
@@ -214,6 +259,9 @@ pub unsafe fn stream_close(s: *const u8) {
 /// Close the backend behind a raw `StreamBox*` exactly once. Used by both `stream_close` and the
 /// finalizer; the `closed` flag guarantees the backend's `close` runs at most once.
 unsafe fn close_box(b: *const StreamBox) {
+    if b.is_null() {
+        return;
+    }
     let mut guard = (*b).state.lock().unwrap();
     if guard.closed {
         return;
@@ -499,10 +547,22 @@ struct Upstream {
     /// Raw `*const StreamBox` with one owned reference. Released (via `lin_stream_release_box`,
     /// which runs the upstream's own close+finalizer) when the adapter closes.
     boxptr: *const StreamBox,
+    /// A latched in-band error: set when the adapter was built over a non-stream Error value (a
+    /// failed source, e.g. `readStream` of a missing file). The first pull surfaces it as an
+    /// `Err`, so the fault propagates through the chain to the terminal instead of looking like an
+    /// empty stream. Cleared after it is yielded once (then the upstream reads as EOF).
+    pending_err: Option<String>,
 }
 unsafe impl Send for Upstream {}
 
 impl Upstream {
+    /// Pull the next item from upstream, surfacing a latched source error first (once).
+    unsafe fn pull(&mut self) -> TaggedOutcome {
+        if let Some(m) = self.pending_err.take() {
+            return TaggedOutcome::Err(m);
+        }
+        pull_tagged(self.boxptr)
+    }
     unsafe fn close(&mut self) {
         if !self.boxptr.is_null() {
             // Closing the adapter eagerly closes the upstream resource (deterministic), then
@@ -524,7 +584,7 @@ struct MapSource {
 }
 impl StreamSource for MapSource {
     unsafe fn read_tagged(&mut self) -> TaggedOutcome {
-        match pull_tagged(self.up.boxptr) {
+        match self.up.pull() {
             TaggedOutcome::Eof => TaggedOutcome::Eof,
             TaggedOutcome::Err(m) => TaggedOutcome::Err(m),
             TaggedOutcome::Item(item) => {
@@ -557,7 +617,7 @@ struct FilterSource {
 impl StreamSource for FilterSource {
     unsafe fn read_tagged(&mut self) -> TaggedOutcome {
         loop {
-            match pull_tagged(self.up.boxptr) {
+            match self.up.pull() {
                 TaggedOutcome::Eof => return TaggedOutcome::Eof,
                 TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
                 TaggedOutcome::Item(item) => {
@@ -597,7 +657,7 @@ impl StreamSource for TakeSource {
         if self.remaining <= 0 {
             return TaggedOutcome::Eof;
         }
-        match pull_tagged(self.up.boxptr) {
+        match self.up.pull() {
             TaggedOutcome::Eof => TaggedOutcome::Eof,
             TaggedOutcome::Err(m) => TaggedOutcome::Err(m),
             TaggedOutcome::Item(item) => {
@@ -652,7 +712,7 @@ impl StreamSource for LinesSource {
                 let line = std::mem::take(&mut self.buf);
                 return TaggedOutcome::Item(string_to_tagged(&line));
             }
-            match pull_tagged(self.up.boxptr) {
+            match self.up.pull() {
                 TaggedOutcome::Eof => self.upstream_done = true,
                 TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
                 TaggedOutcome::Item(item) => {
@@ -699,7 +759,7 @@ impl StreamSource for ChunksSource {
                 let piece = std::mem::take(&mut self.buf);
                 return TaggedOutcome::Item(bytes_to_u8_array(&piece));
             }
-            match pull_tagged(self.up.boxptr) {
+            match self.up.pull() {
                 TaggedOutcome::Eof => self.upstream_done = true,
                 TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
                 TaggedOutcome::Item(item) => {
@@ -742,7 +802,7 @@ struct DropSource {
 impl StreamSource for DropSource {
     unsafe fn read_tagged(&mut self) -> TaggedOutcome {
         while self.remaining > 0 {
-            match pull_tagged(self.up.boxptr) {
+            match self.up.pull() {
                 TaggedOutcome::Eof => return TaggedOutcome::Eof,
                 TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
                 TaggedOutcome::Item(item) => {
@@ -751,7 +811,7 @@ impl StreamSource for DropSource {
                 }
             }
         }
-        pull_tagged(self.up.boxptr)
+        self.up.pull()
     }
     fn close(&mut self) {
         unsafe { self.up.close(); }
@@ -772,7 +832,7 @@ impl StreamSource for TakeWhileSource {
         if self.done {
             return TaggedOutcome::Eof;
         }
-        match pull_tagged(self.up.boxptr) {
+        match self.up.pull() {
             TaggedOutcome::Eof => {
                 self.done = true;
                 TaggedOutcome::Eof
@@ -819,7 +879,7 @@ struct DropWhileSource {
 impl StreamSource for DropWhileSource {
     unsafe fn read_tagged(&mut self) -> TaggedOutcome {
         loop {
-            match pull_tagged(self.up.boxptr) {
+            match self.up.pull() {
                 TaggedOutcome::Eof => return TaggedOutcome::Eof,
                 TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
                 TaggedOutcome::Item(item) => {
@@ -920,7 +980,7 @@ impl StreamSource for FlatMapSource {
                 // Exhausted (next() released the held array): drop the cursor and pull next.
                 self.current = None;
             }
-            match pull_tagged(self.up.boxptr) {
+            match self.up.pull() {
                 TaggedOutcome::Eof => return TaggedOutcome::Eof,
                 TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
                 TaggedOutcome::Item(item) => {
@@ -966,7 +1026,7 @@ impl StreamSource for FlattenSource {
                 }
                 self.current = None;
             }
-            match pull_tagged(self.up.boxptr) {
+            match self.up.pull() {
                 TaggedOutcome::Eof => return TaggedOutcome::Eof,
                 TaggedOutcome::Err(m) => return TaggedOutcome::Err(m),
                 // The pulled item IS the inner collection; the cursor takes ownership of it.
@@ -998,7 +1058,7 @@ struct ConcatSource {
 impl StreamSource for ConcatSource {
     unsafe fn read_tagged(&mut self) -> TaggedOutcome {
         if !self.on_b {
-            match pull_tagged(self.a.boxptr) {
+            match self.a.pull() {
                 TaggedOutcome::Eof => {
                     // First stream exhausted: close it eagerly, switch to the second.
                     self.a.close();
@@ -1007,7 +1067,7 @@ impl StreamSource for ConcatSource {
                 other => return other,
             }
         }
-        pull_tagged(self.b.boxptr)
+        self.b.pull()
     }
     fn close(&mut self) {
         unsafe {
@@ -1112,7 +1172,7 @@ impl StreamSource for CodecSource {
                 }
                 return TaggedOutcome::Eof;
             }
-            match pull_tagged(self.up.boxptr) {
+            match self.up.pull() {
                 TaggedOutcome::Eof => {
                     self.upstream_done = true;
                     // Loop back to run the finish flush.
@@ -1306,8 +1366,12 @@ pub unsafe extern "C" fn lin_stream_close(s: *const u8) -> *mut u8 {
 /// makes the double-use a *compile-time* error, but the runtime RC stays balanced either way).
 unsafe fn own_upstream(s: *const u8) -> Upstream {
     let b = unwrap_stream(s);
+    // A non-stream Error argument (a failed source, e.g. `readStream` of a missing file) has a
+    // null box; latch its message so the first pull surfaces it in-band rather than reading as an
+    // empty stream. A real stream has `pending_err == None`.
+    let pending_err = if b.is_null() { stream_arg_error(s) } else { None };
     lin_stream_retain_box(b as *const u8);
-    Upstream { boxptr: b }
+    Upstream { boxptr: b, pending_err }
 }
 
 /// Unbox a stream/closure ARGUMENT that may arrive boxed (TaggedVal*) or raw. For a Function the
@@ -1487,6 +1551,11 @@ pub unsafe extern "C" fn lin_stream_write_lines(s: *const u8, path: *const u8) -
 pub unsafe extern "C" fn lin_stream_drain(s: *const u8) -> *mut u8 {
     let b = unwrap_stream(s);
     if b.is_null() {
+        // A failed source (non-stream Error arg) drained directly: surface the fault in-band
+        // instead of silently returning Null (as if an empty stream had drained successfully).
+        if let Some(m) = stream_arg_error(s) {
+            return crate::fs::make_error_tagged(&m);
+        }
         return std::ptr::null_mut();
     }
     let result = {
@@ -1513,6 +1582,11 @@ pub unsafe extern "C" fn lin_stream_drain(s: *const u8) -> *mut u8 {
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_for(s: *const u8, body: *mut u8) -> *mut u8 {
     let b = unwrap_stream(s);
+    if b.is_null() {
+        if let Some(m) = stream_arg_error(s) {
+            return crate::fs::make_error_tagged(&m);
+        }
+    }
     let f = LinFn::from_owned(retain_closure(as_closure(body)));
     let mut idx: i64 = 0;
     let result = loop {
@@ -1543,6 +1617,12 @@ pub unsafe extern "C" fn lin_stream_for(s: *const u8, body: *mut u8) -> *mut u8 
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_reduce(s: *const u8, init: *mut u8, f: *mut u8) -> *mut u8 {
     let b = unwrap_stream(s);
+    if b.is_null() {
+        if let Some(m) = stream_arg_error(s) {
+            crate::tagged::lin_tagged_release(init); // we own the +1 init; drop it before the Error
+            return crate::fs::make_error_tagged(&m);
+        }
+    }
     let func = LinFn::from_owned(retain_closure(as_closure(f)));
     // `init` arrives as an owned +1 reference (the caller suppressed its own release / it is a
     // fresh box); we own the running accumulator and release the previous on each replacement.
@@ -1583,6 +1663,11 @@ pub unsafe extern "C" fn lin_stream_reduce(s: *const u8, init: *mut u8, f: *mut 
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_find(s: *const u8, p: *mut u8) -> *mut u8 {
     let b = unwrap_stream(s);
+    if b.is_null() {
+        if let Some(m) = stream_arg_error(s) {
+            return crate::fs::make_error_tagged(&m);
+        }
+    }
     let pred = LinFn::from_owned(retain_closure(as_closure(p)));
     let mut idx: i64 = 0;
     let result = loop {
@@ -1617,6 +1702,11 @@ pub unsafe extern "C" fn lin_stream_find(s: *const u8, p: *mut u8) -> *mut u8 {
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_some(s: *const u8, p: *mut u8) -> *mut u8 {
     let b = unwrap_stream(s);
+    if b.is_null() {
+        if let Some(m) = stream_arg_error(s) {
+            return crate::fs::make_error_tagged(&m);
+        }
+    }
     let pred = LinFn::from_owned(retain_closure(as_closure(p)));
     let mut idx: i64 = 0;
     let result = loop {
@@ -1651,6 +1741,11 @@ pub unsafe extern "C" fn lin_stream_some(s: *const u8, p: *mut u8) -> *mut u8 {
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_every(s: *const u8, p: *mut u8) -> *mut u8 {
     let b = unwrap_stream(s);
+    if b.is_null() {
+        if let Some(m) = stream_arg_error(s) {
+            return crate::fs::make_error_tagged(&m);
+        }
+    }
     let pred = LinFn::from_owned(retain_closure(as_closure(p)));
     let mut idx: i64 = 0;
     let result = loop {
@@ -1686,6 +1781,11 @@ pub unsafe extern "C" fn lin_stream_every(s: *const u8, p: *mut u8) -> *mut u8 {
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_while(s: *const u8, f: *mut u8) -> *mut u8 {
     let b = unwrap_stream(s);
+    if b.is_null() {
+        if let Some(m) = stream_arg_error(s) {
+            return crate::fs::make_error_tagged(&m);
+        }
+    }
     let func = LinFn::from_owned(retain_closure(as_closure(f)));
     let mut idx: i64 = 0;
     let result = loop {
@@ -1733,6 +1833,11 @@ pub unsafe extern "C" fn lin_stream_drive_owned(s: *mut u8) -> *mut u8 {
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_collect(s: *const u8) -> *mut u8 {
     let b = unwrap_stream(s);
+    if b.is_null() {
+        if let Some(m) = stream_arg_error(s) {
+            return crate::fs::make_error_tagged(&m);
+        }
+    }
     let mut bytes: Vec<u8> = Vec::new();
     let result = loop {
         match pull_tagged(b) {
@@ -1754,6 +1859,11 @@ pub unsafe extern "C" fn lin_stream_collect(s: *const u8) -> *mut u8 {
 #[no_mangle]
 pub unsafe extern "C" fn lin_stream_read_text(s: *const u8) -> *mut u8 {
     let b = unwrap_stream(s);
+    if b.is_null() {
+        if let Some(m) = stream_arg_error(s) {
+            return crate::fs::make_error_tagged(&m);
+        }
+    }
     let mut bytes: Vec<u8> = Vec::new();
     let result = loop {
         match pull_tagged(b) {
@@ -1845,7 +1955,7 @@ impl TarReaderState {
     /// An in-band read Error sets `upstream_err` and stops. Returns true if `buf.len() >= n`.
     unsafe fn fill_at_least(&mut self, n: usize) -> bool {
         while self.buf.len() < n && !self.upstream_done {
-            match pull_tagged(self.up.boxptr) {
+            match self.up.pull() {
                 TaggedOutcome::Item(item) => {
                     append_u8_array_to(&mut self.buf, item);
                     crate::tagged::lin_tagged_release(item);
@@ -2085,7 +2195,7 @@ unsafe impl Send for ManifestSource {}
 impl ManifestSource {
     unsafe fn fill_at_least(&mut self, n: usize) -> Result<bool, String> {
         while self.buf.len() < n && !self.upstream_done {
-            match pull_tagged(self.up.boxptr) {
+            match self.up.pull() {
                 TaggedOutcome::Item(item) => {
                     append_u8_array_to(&mut self.buf, item);
                     crate::tagged::lin_tagged_release(item);
@@ -2147,7 +2257,7 @@ unsafe impl Send for FilesSource {}
 impl FilesSource {
     unsafe fn fill_at_least(&mut self, n: usize) -> Result<bool, String> {
         while self.buf.len() < n && !self.upstream_done {
-            match pull_tagged(self.up.boxptr) {
+            match self.up.pull() {
                 TaggedOutcome::Item(item) => {
                     append_u8_array_to(&mut self.buf, item);
                     crate::tagged::lin_tagged_release(item);
@@ -2258,6 +2368,50 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    /// Read the `message` field of a canonical Error object (`{ type:"error", message }`).
+    unsafe fn error_message_of(v: *const u8) -> Option<String> {
+        // `stream_arg_error` returns Some(msg) iff `v` is an error-shaped object.
+        stream_arg_error(v)
+    }
+
+    /// Regression: a failed source (`readStream` of a missing file) returns an Error OBJECT, not a
+    /// Stream. Flowing that Error into a stream adapter/terminal must thread it IN-BAND — neither
+    /// abort on a null-box deref (the old `readText`/`collect` crash) nor silently swallow it as an
+    /// empty stream (the old `drain`/`for` behaviour). We simulate the failed source with the same
+    /// error object `lin_fs_open` produces and drive each entry point.
+    #[test]
+    fn error_arg_threads_in_band_not_abort_or_swallow() {
+        unsafe {
+            // 1. A terminal called DIRECTLY on the error arg surfaces the error (no abort).
+            let err = || crate::fs::make_error_tagged("no such file");
+            let e = err();
+            let r = lin_stream_read_text(e);
+            assert_eq!(error_message_of(r), Some("no such file".to_string()),
+                "readText on a failed source must surface the Error, not abort");
+            crate::tagged::lin_tagged_release(r);
+            crate::tagged::lin_tagged_release(e);
+
+            // 2. drain() on the error arg surfaces the error (was: silent Null).
+            let e = err();
+            let r = lin_stream_drain(e);
+            assert_eq!(error_message_of(r), Some("no such file".to_string()),
+                "drain on a failed source must surface the Error, not return Null");
+            crate::tagged::lin_tagged_release(r);
+            crate::tagged::lin_tagged_release(e);
+
+            // 3. An ADAPTER over the error arg latches it; the downstream terminal surfaces it.
+            //    `lines(err).drain()` mirrors the report pipeline's `readStream(p).lines()...`.
+            let e = err();
+            let piped = lin_stream_lines(e, 0);
+            crate::tagged::lin_tagged_release(e); // the adapter took its own ref / latched the error
+            let r = lin_stream_drain(piped);
+            assert_eq!(error_message_of(r), Some("no such file".to_string()),
+                "an adapter over a failed source must propagate the Error to the terminal");
+            crate::tagged::lin_tagged_release(r);
+            crate::tagged::lin_tagged_release(piped);
+        }
+    }
 
     /// A fake backend that hands out a fixed sequence of chunks then EOF, and counts how many
     /// times `close` is invoked. The counter is shared (Arc) so the test can assert close-once
