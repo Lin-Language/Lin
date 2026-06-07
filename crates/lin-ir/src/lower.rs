@@ -2228,10 +2228,17 @@ fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty: &Type, bui
         && !is_union_ty(value_ty)
         && is_rc_type(value_ty)
         && type_repr_differs(value_ty, slot_ty);
+    // A flat scalar array kind/width change (e.g. UInt8[] → Int32[]) MATERIALIZES a fresh,
+    // independent +1-owned buffer (codegen's `flat_array_widen`) — the source array keeps its own
+    // reference (released by its own scope). Unlike the union-box case the source is NOT consumed,
+    // so leave `t` registered; just register the fresh result so the binding's scope releases it.
+    let made_fresh_array = flat_scalar_array_repr_differs(value_ty, slot_ty);
     let coerced = coerce_to_slot_type(t, value_ty, slot_ty, builder);
     if made_fresh_box {
         // The box now owns the inner's +1; the scope releases the box (freeing shell + inner).
         builder.unregister_owned(t);
+        builder.register_owned(coerced, slot_ty.clone());
+    } else if made_fresh_array && coerced != t {
         builder.register_owned(coerced, slot_ty.clone());
     }
     coerced
@@ -2241,7 +2248,10 @@ fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty: &Type, bui
 /// differ (box concrete → union, or unbox union → concrete). Returns the (possibly new)
 /// temp; a no-op when representations match.
 fn coerce_to_slot_type(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
-    if type_repr_differs(value_ty, slot_ty) || scalar_numeric_repr_differs(value_ty, slot_ty) {
+    if type_repr_differs(value_ty, slot_ty)
+        || scalar_numeric_repr_differs(value_ty, slot_ty)
+        || flat_scalar_array_repr_differs(value_ty, slot_ty)
+    {
         let dst = builder.alloc_temp(slot_ty.clone());
         builder.emit(Instruction::Coerce {
             dst, src: t, from_ty: value_ty.clone(), to_ty: slot_ty.clone(),
@@ -4663,6 +4673,22 @@ fn scalar_numeric_repr_differs(from: &Type, to: &Type) -> bool {
     from.is_float() != to.is_float() || (from.is_float() && to.is_float() && from != to)
 }
 
+/// True when `from` and `to` are FLAT scalar arrays with DIFFERENT element types, so a value of one
+/// must be CONVERTED (a fresh, dest-strided buffer with each element widened) to be used as the
+/// other — NOT a pointer reinterpret. A flat scalar array stores its elements at the element type's
+/// native stride and tags the buffer with that element kind, so binding e.g. a `UInt8[]` value to an
+/// `Int32[]` slot and reinterpreting the pointer would read 4 source bytes as one i32 on every
+/// indexed access (the whole-array `toString` reads the runtime `elem_tag` and so looked correct,
+/// but `arr[0]` uses the static dest stride and did not). Codegen's `compile_ir_coerce` materializes
+/// the converted buffer (`flat_array_widen`). This is the whole-array analogue of
+/// `scalar_numeric_repr_differs` (the mixed-numeric array LITERAL element case).
+fn flat_scalar_array_repr_differs(from: &Type, to: &Type) -> bool {
+    if let (Type::Array(fe), Type::Array(te)) = (from, to) {
+        return fe.is_flat_scalar() && te.is_flat_scalar() && fe != te;
+    }
+    false
+}
+
 /// Box a value to Json (TaggedVal*) if it is a concrete (non-union) type.
 /// `fromJson` decode (ADR-031). Lower the Json value, box it to the tagged representation if
 /// concrete, then emit `CallIntrinsic { FromJson(target) }`. The runtime borrows the input and
@@ -5439,6 +5465,17 @@ fn lower_sort(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder,
             obj_ty: arr_ty.clone(), key_ty: Type::Int64, result_ty: read_elem_ty.clone(),
         });
         let elem = coerce_arg_to_param_repr(elem_raw, &read_elem_ty, &elem_ty, builder);
+        // When the source is read via the tagged path (`read_elem_ty` is the boxed wildcard —
+        // a `[]`+push array not provably flat), `Index` → `lin_array_get_tagged` returns a FRESH
+        // +1 box that the `Coerce` above unboxes to the flat scalar `elem`. That box is then dead;
+        // reclaim its shell (mirrors `lower_for`'s per-iteration element-box reclaim) or it leaks
+        // one box PER ELEMENT, PER SORT (the ~16 B/elem `sort` result leak). `lower_sort` is gated
+        // to flat-scalar elements, so the box has no heap inner — freeing the shell fully reclaims
+        // it and is a documented no-op on cached small-int/bool boxes. Guarded `IfDistinct` so a
+        // no-op coerce (already-flat read, `elem == elem_raw`) never double-frees a live value.
+        if is_union_ty(&read_elem_ty) {
+            builder.emit(Instruction::FreeBoxShellIfDistinct { val: elem_raw, other: elem });
+        }
         let pd1 = builder.alloc_temp(Type::Null);
         builder.emit(Instruction::CallIntrinsic { dst: pd1, intrinsic: Intrinsic::FlatArrayPush(flat), args: vec![out, elem], ret_ty: Type::Null });
         let pd2 = builder.alloc_temp(Type::Null);
@@ -7120,8 +7157,17 @@ fn lower_function_expr_with_id(
     } else {
         ret_type.clone()
     };
+    // A scalar numeric width change on the return path (e.g. a `Float32` body value returned
+    // where the declaration says `Float64`, or a narrower int) is a representation change codegen
+    // must materialize via fpext/fptrunc/sext (`compile_ir_coerce`'s numeric-widening arm), just
+    // like at a binding/slot store (`coerce_to_slot_type`). Without it the raw (e.g. `float`) value
+    // flowed straight into the `Return`/box site and emitted invalid LLVM (a `float` operand where
+    // the signature declares `double`). `type_repr_differs` only covers the union/Json box boundary,
+    // so the scalar-numeric case is checked separately — mirroring `coerce_to_slot_type`.
     let ret_temp = if !inner_builder.is_current_block_terminated()
-        && type_repr_differs(&body_ty, &effective_ret)
+        && (type_repr_differs(&body_ty, &effective_ret)
+            || scalar_numeric_repr_differs(&body_ty, &effective_ret)
+            || flat_scalar_array_repr_differs(&body_ty, &effective_ret))
     {
         let dst = inner_builder.alloc_temp(effective_ret.clone());
         inner_builder.emit(Instruction::Coerce {
