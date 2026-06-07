@@ -3518,6 +3518,21 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             //   stable box. Register it owned so the matching scope-exit / reassignment release
             //   is balanced (cached scalar boxes are returned as-is by lin_tagged_clone and
             //   no-op on release, so no needless alloc on the scalar fast path).
+            // UNBOXED SUM TYPE (Stage 3): an `obj[k]` / `arr[i]` whose RESULT is a sum type is
+            // PROJECTED back into a FRESH +1 `*SumNode` by codegen — the object/Json arm
+            // (`unbox_tagged_val_to_type` → `sumnode_project_from_boxed`, boxing.rs:474) and the
+            // array arm (data.rs:422) both `lin_sumnode_alloc` a brand-new, container-independent
+            // node (a deep snapshot, NOT a borrowed interior pointer). So `dst` is ALREADY owned and
+            // stable. The generic union `CloneBox` below would emit `lin_tagged_clone` on the raw
+            // node (wrong op for a SumNode) OR — once the repr seed routes it to the SumNode guard —
+            // a spurious `lin_rc_retain` that, against the single scope-exit `lin_sumnode_release`,
+            // leaks one node per evaluation. Register it owned directly, skipping the clone — exactly
+            // like the `result_is_fresh_owned` array-box case below. (This is the same
+            // fresh-owned-projection class as the sealed-struct arm further down.)
+            if crate::repr::sum_type_eligible(result_type) {
+                builder.register_owned(dst, result_type.clone());
+                return dst;
+            }
             if is_union_ty(result_type) {
                 // Array path: `dst` is ALREADY a fresh, fully-owned +1 box from
                 // `lin_array_get_tagged` (it allocated a standalone TaggedVal — for a flat array

@@ -15722,3 +15722,73 @@ main()
     // sum over i in [0,200) of (i + 1) = (199*200/2) + 200 = 19900 + 200 = 20100
     assert_eq!(out, vec!["20100"]);
 }
+
+#[test]
+fn test_st3_untyped_object_store_read_eval() {
+    // SOUNDNESS HOLE (this fix): a statically-sum-typed value stored into an UNTYPED object
+    // literal (no type annotation on the binding → inferred `Object`, not a sealed/named record).
+    // The store materializes the SumNode to a boxed LinObject; the read-back PROJECTS it to a
+    // FRESH +1 SumNode. Before the fix the IR-lowering relocation `CloneBox` ran on the projected
+    // raw SumNode via `lin_tagged_clone` (reading offset 0/8 as a TaggedVal tag/payload) → garbage
+    // result + heap-buffer-overflow on the later `lin_sumnode_release`. The repr pass now seeds the
+    // Index dst `Packed(SumNode)` and the lowering registers the fresh projection owned directly.
+    // (3+4) = 7.
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+val main = () =>
+  val tree: Expr = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": 3 }}, "right": {{ "kind": "num", "value": 4 }} }}
+  val cursor = {{ "node": tree, "pos": 0 }}
+  val back: Expr = cursor["node"]
+  print(eval(back).toString())
+main()
+"#
+    );
+    let out = run(&src);
+    assert_eq!(out, vec!["7"]);
+}
+
+#[test]
+fn test_st3_untyped_object_sum_to_string() {
+    // Sibling case: a sum value stored into an UNTYPED object then read back and fed to a
+    // genuinely-dynamic consumer (`toString`). The read-back must materialize the REAL tree, not a
+    // raw SumNode pointer (which printed garbage `{"kind":"num","value":33}` before the fix).
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+val main = () =>
+  val tree: Expr = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": 3 }}, "right": {{ "kind": "num", "value": 4 }} }}
+  val cursor = {{ "node": tree, "pos": 0 }}
+  print(cursor["node"].toString())
+main()
+"#
+    );
+    let out = run(&src);
+    assert_eq!(
+        out,
+        vec![r#"{"kind": "op", "op": 0, "left": {"kind": "num", "value": 3}, "right": {"kind": "num", "value": 4}}"#]
+    );
+}
+
+#[test]
+fn test_st3_untyped_object_in_loop_repeated_store_read() {
+    // The untyped-object store/read round-trip in a loop: stresses the materialize/project RC across
+    // many iterations (no SumNode leak/UAF scaling — verified separately under ASan: the per-iter
+    // 48-byte projected node is freed, not retained-and-leaked). Each iteration evaluates (i + 1).
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+import {{ range, for }} from "std/iter"
+val main = () =>
+  var total: Int32 = 0
+  range(0, 200).for((i) =>
+    val tree: Expr = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": i }}, "right": {{ "kind": "num", "value": 1 }} }}
+    val cursor = {{ "node": tree, "pos": i }}
+    val back: Expr = cursor["node"]
+    total = total + eval(back)
+  )
+  print(total.toString())
+main()
+"#
+    );
+    let out = run(&src);
+    // sum over i in [0,200) of (i + 1) = (199*200/2) + 200 = 20100
+    assert_eq!(out, vec!["20100"]);
+}
