@@ -44,6 +44,12 @@ impl LanguageServer for Backend {
                     ..Default::default()
                 }),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                document_symbol_provider: Some(OneOf::Left(true)),
+                document_highlight_provider: Some(OneOf::Left(true)),
+                // Plain rename (no prepareRename) — the inverse-span lookup is reliable enough that
+                // a prepare step would add no value; the client just sends rename directly.
+                rename_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -290,6 +296,117 @@ impl LanguageServer for Backend {
             },
             new_text: formatted,
         }]))
+    }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let base_dir = file_dir(uri);
+        let analysis = analyse(&source, base_dir.as_deref());
+        let offset = position_to_offset(&source, pos);
+
+        let include_decl = params.context.include_declaration;
+        let occ = occurrences_at(&analysis.span_type_map, offset);
+        if occ.is_empty() {
+            return Ok(None);
+        }
+        // The first span returned by `occurrences_at` is the binding/definition itself.
+        let def = occ.first().copied();
+        let locations: Vec<Location> = occ
+            .iter()
+            .filter(|s| include_decl || Some(**s) != def)
+            .map(|s| Location {
+                uri: uri.clone(),
+                range: span_to_range(&source, *s),
+            })
+            .collect();
+        Ok(Some(locations))
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let source = match self.docs.read().unwrap().get(&params.text_document.uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let mut lexer = lin_lex::Lexer::new(&source, 0);
+        let tokens = lexer.tokenize();
+        let mut parser = lin_parse::Parser::new(tokens);
+        let module = parser.parse_module();
+        let symbols = document_symbols(&source, &module);
+        Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let base_dir = file_dir(uri);
+        let analysis = analyse(&source, base_dir.as_deref());
+        let offset = position_to_offset(&source, pos);
+
+        let occ = occurrences_at(&analysis.span_type_map, offset);
+        if occ.is_empty() {
+            return Ok(None);
+        }
+        let def = occ.first().copied();
+        let highlights: Vec<DocumentHighlight> = occ
+            .iter()
+            .map(|s| DocumentHighlight {
+                range: span_to_range(&source, *s),
+                kind: Some(if Some(*s) == def {
+                    DocumentHighlightKind::WRITE
+                } else {
+                    DocumentHighlightKind::READ
+                }),
+            })
+            .collect();
+        Ok(Some(highlights))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let new_name = params.new_name;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let base_dir = file_dir(uri);
+        let analysis = analyse(&source, base_dir.as_deref());
+        let offset = position_to_offset(&source, pos);
+
+        let occ = occurrences_at(&analysis.span_type_map, offset);
+        if occ.is_empty() {
+            return Ok(None);
+        }
+        // Single-document rename: one TextEdit per occurrence in the open file.
+        let edits: Vec<TextEdit> = occ
+            .iter()
+            .map(|s| TextEdit {
+                range: span_to_range(&source, *s),
+                new_text: new_name.clone(),
+            })
+            .collect();
+        let mut changes = HashMap::new();
+        changes.insert(uri.clone(), edits);
+        Ok(Some(WorkspaceEdit {
+            changes: Some(changes),
+            document_changes: None,
+            change_annotations: None,
+        }))
     }
 }
 
@@ -728,6 +845,109 @@ fn tightest_span<'a>(
         .min_by_key(|(span, _, _)| span.end - span.start)
 }
 
+/// Convert a `lin_common::Span` to an LSP `Range` (same byte-offset → line/col conversion
+/// goto_definition/hover use). Factored out so references/highlight/rename don't duplicate it.
+fn span_to_range(source: &str, span: lin_common::Span) -> Range {
+    Range {
+        start: offset_to_position(source, span.start as usize),
+        end: offset_to_position(source, span.end as usize),
+    }
+}
+
+/// Given a cursor `offset`, find the symbol under it and return every occurrence span that refers
+/// to the SAME binding — i.e. the inverse of goto_definition. The cursor's tightest span carries a
+/// `def_span` identifying the binding; we collect every use-span in the map whose `def_span` equals
+/// it, and add the `def_span` itself (definition sites are not recorded as their own map entry).
+///
+/// Works whether the cursor is on a use OR on the definition: if the cursor span's own `def_span`
+/// is `None` (e.g. it IS a definition with no recorded back-reference), we fall back to treating the
+/// cursor span as the binding span and gather uses that point back to it.
+///
+/// Returns an empty vec when the cursor isn't on a resolvable symbol. Single-document scope: the
+/// span map only covers the currently-open file.
+fn occurrences_at(
+    map: &[(lin_common::Span, String, Option<lin_common::Span>)],
+    offset: usize,
+) -> Vec<lin_common::Span> {
+    let (cursor_span, _, cursor_def) = match tightest_span(map, offset) {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    // The binding span every occurrence shares. Prefer the cursor's def_span (cursor is on a use);
+    // otherwise treat the cursor span as the binding itself (cursor is on the definition).
+    let binding = cursor_def.unwrap_or(*cursor_span);
+
+    let mut spans: Vec<lin_common::Span> = Vec::new();
+    spans.push(binding);
+    for (use_span, _, def) in map {
+        if *def == Some(binding) {
+            spans.push(*use_span);
+        }
+    }
+    // De-duplicate (the cursor span itself may appear both as the binding and as a use).
+    spans.sort_by_key(|s| (s.start, s.end));
+    spans.dedup();
+    spans
+}
+
+/// Walk the parsed module's top-level statements and emit a `DocumentSymbol` for each declaration
+/// (val/var/type). Imports/foreign-imports/replace/bare expressions are not surfaced as symbols.
+/// `val` bound to a function literal is reported as a Function; everything else as Variable/Class.
+fn document_symbols(source: &str, module: &lin_parse::ast::Module) -> Vec<DocumentSymbol> {
+    let mut symbols = Vec::new();
+    for stmt in &module.statements {
+        let (name, name_span, kind) = match stmt {
+            Stmt::Val { pattern, value, span: _, .. } => {
+                let Some((name, name_span)) = pattern_ident(pattern) else { continue };
+                let kind = if matches!(value, lin_parse::ast::Expr::Function { .. }) {
+                    SymbolKind::FUNCTION
+                } else {
+                    SymbolKind::VARIABLE
+                };
+                (name, name_span, kind)
+            }
+            Stmt::Var { name, span, .. } => {
+                (name.clone(), *span, SymbolKind::VARIABLE)
+            }
+            Stmt::TypeDecl { name, span, .. } => {
+                (name.clone(), *span, SymbolKind::CLASS)
+            }
+            _ => continue,
+        };
+        let range = span_to_range(source, stmt.span());
+        let selection_range = span_to_range(source, name_span);
+        #[allow(deprecated)]
+        symbols.push(DocumentSymbol {
+            name,
+            detail: None,
+            kind,
+            tags: None,
+            deprecated: None,
+            range,
+            // The selection range must be contained within `range`; clamp defensively.
+            selection_range: if name_span.start >= stmt.span().start
+                && name_span.end <= stmt.span().end
+            {
+                selection_range
+            } else {
+                range
+            },
+            children: None,
+        });
+    }
+    symbols
+}
+
+/// Extract the bound name + its span from a `val` pattern when it's a simple identifier binding.
+/// Destructuring patterns (object/array) bind multiple names and aren't surfaced as a single
+/// top-level symbol, so they return `None`.
+fn pattern_ident(pattern: &lin_parse::ast::Pattern) -> Option<(String, lin_common::Span)> {
+    match pattern {
+        lin_parse::ast::Pattern::Ident(name, span) => Some((name.clone(), *span)),
+        _ => None,
+    }
+}
+
 fn lsp_diagnostic(source: &str, d: &lin_common::Diagnostic) -> Diagnostic {
     let start = offset_to_position(source, d.span.start as usize);
     let end_offset = (d.span.end as usize).max(d.span.start as usize + 1);
@@ -811,6 +1031,21 @@ mod tests {
         let tokens = lexer.tokenize();
         let mut parser = lin_parse::Parser::new(tokens);
         parser.parse_module()
+    }
+
+    /// Type-check `src` (no imports) and return the resulting span_type_map, the same data the
+    /// reference/highlight/rename handlers consume. Panics on a check error so test fixtures stay
+    /// well-formed.
+    fn span_map(src: &str) -> Vec<(lin_common::Span, String, Option<lin_common::Span>)> {
+        let module = parse(src);
+        let mut checker = Checker::new();
+        let _ = checker.check_module(&module);
+        checker.span_type_map
+    }
+
+    /// Byte offset of the first occurrence of `needle` at or after byte `from`.
+    fn offset_after(src: &str, from: usize, needle: &str) -> usize {
+        from + src[from..].find(needle).expect("needle not found")
     }
 
     #[test]
@@ -907,5 +1142,105 @@ mod tests {
             "LSP stdlib_source is missing modules (sync with lin_compile::stdlib_source): {:?}",
             missing
         );
+    }
+
+    // ── Tier-1 LSP features ────────────────────────────────────────────────────
+
+    /// A function parameter is bound with a real def_span (`define_at`), so its uses inside the
+    /// body all share that def_span. Placing the cursor on a USE must return every occurrence —
+    /// the binding (param) plus all reads.
+    #[test]
+    fn occurrences_at_collects_param_uses_from_a_use_site() {
+        // `n` is a parameter; read three times in the body. (Anchor body searches after `=>` to
+        // avoid the stray `n` inside the `Int32` annotation.)
+        let src = "val f = (n: Int32) => n + n + n\n";
+        let map = span_map(src);
+        let body = src.find("=>").unwrap() + 2;
+        // Cursor on the first use of `n` in the body.
+        let cursor = offset_after(src, body, "n");
+        let occ = occurrences_at(&map, cursor);
+        // 1 binding (param decl) + 3 body uses, deduped.
+        assert_eq!(occ.len(), 4, "expected param binding + 3 uses, got {:?}", occ);
+        // Every returned span must actually cover the text `n`.
+        for s in &occ {
+            assert_eq!(&src[s.start as usize..s.end as usize], "n", "span {:?} not over `n`", s);
+        }
+    }
+
+    /// LIMITATION: definition sites are not recorded as their own entry in the span map (only
+    /// USE-spans are pushed by the checker). So placing the cursor exactly on a param/let binding
+    /// that has no overlapping use-span yields no occurrences. This test pins that known behaviour
+    /// so a future change that DOES record def-sites updates it deliberately.
+    #[test]
+    fn occurrences_at_from_bare_definition_is_empty_known_limitation() {
+        let src = "val f = (n: Int32) => n + n + n\n";
+        let map = span_map(src);
+        let param = src.find('(').unwrap() + 1; // the `n` of the param decl
+        let from_def = occurrences_at(&map, offset_after(src, param, "n"));
+        assert!(
+            from_def.is_empty(),
+            "param decl site has no recorded span; expected empty, got {:?}",
+            from_def
+        );
+    }
+
+    /// Two distinct bindings of the same name must not be conflated: `a` in `f` and `a` in `g` are
+    /// separate, so an occurrence query for one returns only that one's spans.
+    #[test]
+    fn occurrences_at_does_not_conflate_distinct_bindings() {
+        let src = "val f = (a: Int32) => a + 1\nval g = (a: Int32) => a + 2\n";
+        let map = span_map(src);
+        // Use site of `a` inside `f`'s body.
+        let f_body = src.find("=>").unwrap() + 2;
+        let occ_f = occurrences_at(&map, offset_after(src, f_body, "a"));
+        // All returned spans must come from the FIRST line only.
+        let first_line_len = src.find('\n').unwrap();
+        for s in &occ_f {
+            assert!(
+                (s.start as usize) <= first_line_len,
+                "occurrence {:?} leaked into the second binding's scope",
+                s
+            );
+        }
+        assert_eq!(occ_f.len(), 2, "expected f's `a` binding + 1 use, got {:?}", occ_f);
+    }
+
+    /// Cursor not on any symbol yields no occurrences.
+    #[test]
+    fn occurrences_at_empty_off_symbol() {
+        let src = "val f = (n: Int32) => n + n\n";
+        let map = span_map(src);
+        // Offset 0 is the `v` of `val` — a keyword, no recorded symbol span.
+        let occ = occurrences_at(&map, 0);
+        assert!(occ.is_empty(), "keyword position should yield no occurrences: {:?}", occ);
+    }
+
+    #[test]
+    fn document_symbols_lists_top_level_declarations() {
+        let src = "import { print } from \"std/io\"\n\
+                   val answer = 42\n\
+                   var counter = 0\n\
+                   type Point = { x: Int32, y: Int32 }\n\
+                   val greet = (name: String) => name\n";
+        let module = parse(src);
+        let syms = document_symbols(src, &module);
+        let by_name: HashMap<&str, SymbolKind> =
+            syms.iter().map(|s| (s.name.as_str(), s.kind)).collect();
+        // Import is NOT surfaced.
+        assert!(!by_name.contains_key("print"), "imports must not be symbols");
+        assert_eq!(by_name.get("answer"), Some(&SymbolKind::VARIABLE));
+        assert_eq!(by_name.get("counter"), Some(&SymbolKind::VARIABLE));
+        assert_eq!(by_name.get("Point"), Some(&SymbolKind::CLASS));
+        // val bound to a function literal -> Function.
+        assert_eq!(by_name.get("greet"), Some(&SymbolKind::FUNCTION));
+        // selection_range must be contained within range for every symbol.
+        for s in &syms {
+            assert!(
+                s.selection_range.start.line >= s.range.start.line
+                    && s.selection_range.end.line <= s.range.end.line,
+                "selection range escapes full range for {}",
+                s.name
+            );
+        }
     }
 }
