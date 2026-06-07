@@ -390,10 +390,18 @@ pub enum Instruction {
     ObjectRest { dst: Temp, src: Temp, src_ty: Type, exclude: Vec<String> },
     /// Store a top-level (module-level) non-function `val` into a per-slot LLVM global so
     /// closures can read it (they can't see `main`'s SSA temps). Emitted in `main`.
-    GlobalValSet { slot: usize, value: Temp, ty: Type },
+    ///
+    /// `immutable` is true for a top-level `val` (single static store) and false for a
+    /// top-level `var` (mutable, multiple stores). Codegen uses it to give an immutable
+    /// global's backing `_ir_gv_{slot}` LLVM `Internal` linkage, which lets LLVM GlobalOpt
+    /// prove a single-store-of-a-constant global is itself constant and fold reads of it
+    /// (e.g. a literal divisor `val MOD = …` becomes a magic multiply-shift instead of a
+    /// per-iteration `idiv`). See codegen `GlobalValSet`/`GlobalValGet`.
+    GlobalValSet { slot: usize, value: Temp, ty: Type, immutable: bool },
     /// dst = the module-global val for `slot` (load from its LLVM global). Used when a
     /// closure references a top-level val that is neither a parameter nor a capture.
-    GlobalValGet { dst: Temp, slot: usize, ty: Type },
+    /// `immutable`: see `GlobalValSet`.
+    GlobalValGet { dst: Temp, slot: usize, ty: Type, immutable: bool },
     /// dst = heap cell holding `init` (a `var` mutably captured by a closure). The cell
     /// pointer is shared by reference: closures capture it and read/write the live value
     /// through CellGet/CellSet (ADR-012). `ty` is the stored value's type.

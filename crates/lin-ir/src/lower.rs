@@ -374,12 +374,12 @@ pub fn lower_import_module_with_imports(
         let done = ib.alloc_block("var_init_done");
         // if flag { goto done } else { goto do_init }
         let flag = ib.alloc_temp(Type::Bool);
-        ib.emit(Instruction::GlobalValGet { dst: flag, slot: VAR_INIT_FLAG_SLOT, ty: Type::Bool });
+        ib.emit(Instruction::GlobalValGet { dst: flag, slot: VAR_INIT_FLAG_SLOT, ty: Type::Bool, immutable: false });
         ib.terminate(Terminator::CondJump { cond: flag, then_block: done, else_block: do_init });
         // do_init: set flag, run var initialisers, jump done.
         ib.switch_to(do_init);
         let t = ib.const_temp(Const::Bool(true));
-        ib.emit(Instruction::GlobalValSet { slot: VAR_INIT_FLAG_SLOT, value: t, ty: Type::Bool });
+        ib.emit(Instruction::GlobalValSet { slot: VAR_INIT_FLAG_SLOT, value: t, ty: Type::Bool, immutable: false });
         ib.push_scope();
         for stmt in &module.statements {
             if matches!(stmt, TypedStmt::Var { .. }) {
@@ -1426,7 +1426,8 @@ fn lower_container_base_borrowed(
             return None;
         }
         let dst = builder.alloc_temp(gty.clone());
-        builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty });
+        // Module-level `var` (mutable global): never foldable, so `immutable: false`.
+        builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty, immutable: false });
         return Some(dst);
     }
     // Mutably-captured `var` (heap cell): plain load through the cell, no owning clone.
@@ -2189,8 +2190,10 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 let t = lower_value_into_slot(value, ty, builder, ctx);
                 builder.slots.insert(*slot, t);
                 // Also publish top-level vals to their module global (for closure reads).
+                // A `val` binding is single-store and never reassigned, so the global is
+                // immutable: mark it foldable (`immutable: true`).
                 if ctx.global_val_slots.contains_key(slot) {
-                    builder.emit(Instruction::GlobalValSet { slot: *slot, value: t, ty: ty.clone() });
+                    builder.emit(Instruction::GlobalValSet { slot: *slot, value: t, ty: ty.clone(), immutable: true });
                 }
             }
         }
@@ -2243,7 +2246,9 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                     // the leak. `t` also stays live in the plain slot, though global_var reads
                     // always go through GlobalValGet.)
                     let gv = own_for_store(t, ty, builder);
-                    builder.emit(Instruction::GlobalValSet { slot: *slot, value: gv, ty: ty.clone() });
+                    // Top-level `var`: mutable shared state (reassigned via LocalSet), never
+                    // foldable — `immutable: false` keeps the global at external linkage.
+                    builder.emit(Instruction::GlobalValSet { slot: *slot, value: gv, ty: ty.clone(), immutable: false });
                 }
             }
         }
@@ -2406,7 +2411,8 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             if ctx.global_var_slots.contains(slot) {
                 let gty = ctx.global_val_slots.get(slot).cloned().unwrap_or_else(|| ty.clone());
                 let dst = builder.alloc_temp(gty.clone());
-                builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty.clone() });
+                // Top-level `var` read: mutable global, never foldable (`immutable: false`).
+                builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty.clone(), immutable: false });
                 // The global holds the var's declared representation; narrow to the requested
                 // concrete type if this use wants one (e.g. a Json global read as Int32).
                 let narrowed = is_union_ty(&gty) && !is_union_ty(ty);
@@ -2494,7 +2500,10 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 // independently-owned copy (concrete rc: retain; union: clone the box) and
                 // register for scope-exit release.
                 let dst = builder.alloc_temp(gty.clone());
-                builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty.clone() });
+                // Reached only when the slot is in global_val_slots but NOT global_var_slots
+                // (the var branch above returns first), i.e. a top-level immutable `val` read
+                // from inside a closure. Foldable: `immutable: true`.
+                builder.emit(Instruction::GlobalValGet { dst, slot: *slot, ty: gty.clone(), immutable: true });
                 own_for_read(dst, &gty, builder)
             } else if let Some(&fid) = ctx.global_fn_slots.get(slot) {
                 // A top-level NAMED function referenced as a VALUE (not in call position):
@@ -2593,7 +2602,9 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 // code used `Retain`, which shared the shell: a discarding caller releasing the
                 // assignment result then freed the global's shell → use-after-free.)
                 let stored = own_for_store(v, &gty, builder);
-                builder.emit(Instruction::GlobalValSet { slot: *slot, value: stored, ty: gty.clone() });
+                // A LocalSet to a module-global slot is a `var` REASSIGNMENT (an immutable
+                // `val` is single-store and never reaches LocalSet). Mutable → `immutable: false`.
+                builder.emit(Instruction::GlobalValSet { slot: *slot, value: stored, ty: gty.clone(), immutable: false });
                 builder.slots.insert(*slot, v);
                 // The assignment EXPRESSION result must itself be an independently-owned value so
                 // a discarding caller (e.g. the `for` callback-return release below) can release
