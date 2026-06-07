@@ -475,39 +475,15 @@ impl Checker {
                             }
                             _ => self.env.fresh_type_var(),
                         }
-                    } else if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
-                        // Multi-variant union indexed by a STRING-LITERAL key. When the key is
-                        // statically present in at least one record variant (e.g. `value` of
-                        // `{type:"success", value:U} | {type:"failure", error:E}`, a discriminated
-                        // `Result`), collect the field's type from EVERY variant that declares it
-                        // (and `Null` for variants that lack it — the §6.1 safe-bracket rule) and
-                        // union them. This makes a generic result like `mapOk(...): Result<U,E>`
-                        // index PRECISELY (to `U | Null` once `U` is pinned), instead of degrading
-                        // to an unrelated fresh inference var (the inference hole this closes).
-                        //
-                        // When NO variant declares the key, fall back to a fresh TypeVar so codegen
-                        // keeps a DYNAMIC lookup: union members are open objects that may carry
-                        // runtime fields beyond their static shape (the decode-`Error` value's
-                        // `"path"`, a width-subtyping extra) — narrowing such an access to a static
-                        // `Null` would wrongly suppress the runtime lookup.
-                        let mut found: Vec<Type> = Vec::new();
-                        let mut any_present = false;
-                        for v in &non_null {
-                            if let Type::Object { fields, .. } = v {
-                                if let Some(t) = fields.get(key_str) {
-                                    found.push(t.clone());
-                                    any_present = true;
-                                }
-                            }
-                        }
-                        if any_present {
-                            Type::flatten_union(found)
-                        } else {
-                            self.env.fresh_type_var()
-                        }
                     } else {
-                        // Non-literal key into a multi-variant union: keep a fresh TypeVar so codegen
-                        // performs a DYNAMIC field lookup (see the string-literal note above).
+                        // Multi-variant union (e.g. `Person | Error`, or a discriminated sum):
+                        // index to a fresh TypeVar so codegen keeps a DYNAMIC field lookup. This is
+                        // deliberately imprecise: union members are open objects that may carry
+                        // fields not in their static shape at runtime (e.g. the decode-`Error`
+                        // value's `"path"`, which `Error`'s declared `{ type, message }` omits — a
+                        // width-subtyping extra). A "precise" per-variant `fields.get(k)` would
+                        // wrongly resolve such an access to a static `Null` and suppress the runtime
+                        // lookup. So we do NOT narrow here. (Preserved from the original arm.)
                         self.env.fresh_type_var()
                     };
                     Type::flatten_union(vec![inner, Type::Null])
@@ -611,10 +587,10 @@ impl Checker {
             Type::Union(variants) => {
                 // A Named alias resolving to a union (e.g. `type Ast = Num | BinOp`). Mirror the
                 // inline multi-variant `Union` arm in `infer_index`: a single record variant is
-                // indexed precisely; a multi-variant union indexed by a string-literal key collects
-                // the field's type from every variant that declares it (precise per-variant lookup),
-                // falling back to a fresh TypeVar only when NO variant declares the key (a dynamic
-                // open-object lookup). The safe-bracket `Null` is re-added either way.
+                // indexed precisely; a multi-variant union falls back to a fresh TypeVar so the
+                // codegen keeps a DYNAMIC lookup (union members are open and may carry runtime
+                // fields beyond their static shape — see the note in `infer_index`). Either way the
+                // safe-bracket `Null` is re-added.
                 let non_null: Vec<Type> =
                     variants.iter().filter(|t| **t != Type::Null).cloned().collect();
                 let inner = if non_null.len() == 1 {
@@ -637,23 +613,6 @@ impl Checker {
                         result_type: Type::Null,
                         span,
                     });
-                } else if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
-                    let mut found: Vec<Type> = Vec::new();
-                    let mut any_present = false;
-                    for v in &non_null {
-                        let body = self.resolve_named_body(v).unwrap_or_else(|| v.clone());
-                        if let Type::Object { fields, .. } = &body {
-                            if let Some(t) = fields.get(key_str) {
-                                found.push(t.clone());
-                                any_present = true;
-                            }
-                        }
-                    }
-                    if any_present {
-                        Type::flatten_union(found)
-                    } else {
-                        self.env.fresh_type_var()
-                    }
                 } else {
                     self.env.fresh_type_var()
                 };
