@@ -31,7 +31,9 @@
   "contributes": {
     "configurationDefaults": {
       "[lin]": {
-        "editor.defaultFormatter": "LinusN.lin-lang"
+        "editor.defaultFormatter": "LinusN.lin-lang",
+        "editor.inlayHints.enabled": "onUnlessPressed",
+        "editor.semanticHighlighting.enabled": true
       }
     },
     "languages": [
