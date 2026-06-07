@@ -13620,6 +13620,40 @@ print("${loop(0, 200, 0)}")
 }
 
 #[test]
+fn test_sealed_record_array_field_in_outer_array_build_drop() {
+    // REGRESSION (monomorphization symbol collision → misaligned-pointer deref / abort): an outer
+    // `Route[]` whose element `Route = {id:String, legs: Leg[]}` has a field that is itself an
+    // ARRAY OF SEALED RECORDS (`Leg = {name:String, d:Int32}`). Pushing a `Route` and a `Leg` both
+    // go through the generic `push<T>(T[], T)`; the specialization name mangled `Type::Object` to a
+    // single literal `"Object"`, so `push$Route` and `push$Leg` COLLIDED on the symbol `push$Object`.
+    // The monomorphizer minted two distinct specializations but under one name, so codegen emitted
+    // both materialize bodies into one LLVM function — only the first (Route's) reachable. A
+    // `push(Leg)` call then ran the Route body, reading the Leg struct's scalar `d` field at the
+    // `legs`-pointer offset and boxing it as an array (`lin_box_array(0x1)`) → `retain_tagged_payload`
+    // dereferenced the bogus pointer (`object.rs:281`, misaligned 0x1) and aborted. Fixed by mangling
+    // `Type::Object` by field SHAPE so structurally-distinct records get distinct specialization
+    // names. ASan (CI job over a build/drop loop) is the corruption/leak guard; here we assert the
+    // length is correct across many iterations (the abort would otherwise crash the run).
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+type Leg = { "name": String, "d": Int32 }
+type Route = { "id": String, "legs": Leg[] }
+val build = (): Int32 =>
+  var rs: Route[] = []
+  var legs: Leg[] = []
+  push(legs, { "name": "x", "d": 1 })
+  push(rs, { "id": "r", "legs": legs })
+  length(rs)
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc else loop(i + 1, n, acc + build())
+print("${loop(0, 300, 0)}")
+"#);
+    // each build() pushes exactly one Route → length 1; 300 iterations = 300.
+    assert_eq!(out, vec!["300"]);
+}
+
+#[test]
 fn test_sealed_tail_recursive_self_call_record_literal_arg() {
     // REGRESSION (found adding the `records` cross-language benchmark): a TAIL-recursive function
     // taking a sealed-record param and passing a fresh record LITERAL as the self-call argument.
@@ -13646,6 +13680,35 @@ print("${toString(final["a"] + final["b"] + final["c"])}")
     // a: 1 + 10000 = 10001; b: sum of a over iters; c: 2*10000 = 20000. The exact total is not the
     // point — the point is it RUNS (no segfault) and is deterministic.
     assert_eq!(out, vec!["50035001"]);
+}
+
+#[test]
+fn test_sealed_heap_field_factory_return_literal_released_and_correct() {
+    // REGRESSION (return-position sealed-literal leak): a factory function whose BODY is a sealed
+    // heap-field record LITERAL returned directly (`mk = (x): Trip => { "id": "t", "dep": x }`).
+    // The body-return lowering used to lower the literal as a BOXED `lin_object_alloc`, then emit a
+    // project-into-sealed `Coerce` at the return site; the boxed `LinObject` intermediate (+ its
+    // String field) was ORPHANED (kept by `pop_scope_releasing_keep(&[ret_temp, raw_ret])` but not
+    // the actual return value) → ~88 B leaked PER CALL. The fix routes the body literal through the
+    // packed-construction fast path (`try_lower_sealed_literal`) when the effective return target is
+    // a sealed scalar record, so no box is built. ASan (the asan CI job over a call-in-loop like
+    // this) is the leak guard — a real per-call leak SCALES with N; here we assert correctness
+    // (a reordered-field literal must still read by name, and an over-eager free would crash/garble).
+    let out = run(r#"
+import { print } from "std/io"
+type Trip = { "id": String, "dep": Int32, "arr": Int32 }
+val mk = (x: Int32): Trip => { "arr": x + 1, "id": "t", "dep": x }
+val build = (): Int32 =>
+  val t = mk(5)
+  t["dep"] * 100 + t["arr"]
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc else loop(i + 1, n, build())
+print("${loop(0, 5000, 0)}")
+"#);
+    // mk(5): dep=5, arr=6; build() = 5*100 + 6 = 506 (constant); loop returns the last build() = 506.
+    // The literal is written in REORDERED field order ({arr, id, dep}) to assert the packed
+    // construction normalizes to declaration order and reads correctly by name.
+    assert_eq!(out, vec!["506"]);
 }
 
 // ───────────────── Stack allocation of non-escaping sealed records (Stage 4) ─────────────────
@@ -13809,6 +13872,44 @@ print(toString(growInPlace(g, 50)))
     // unionLoop returns k at the base case = 0.
     // growInPlace pushes 50 elements into the same array → length 50.
     assert_eq!(out, vec!["3", "0", "50"]);
+}
+
+#[test]
+fn test_tco_typed_record_array_param_no_per_iteration_leak() {
+    // A TYPED sealed-record array (`Transfer[]`, currently a boxed `Object[]` with heap fields)
+    // threaded UNCHANGED through a TAIL-recursive parameter and grown via `push` must not leak a
+    // reference per iteration. The concrete-rc param read takes a `Retain`-in-place on every use
+    // (the `push` receiver AND the tail-call arg), and the matching scope-exit releases land in the
+    // dead `tco_post` block — so without `release_owned_for_tail_call` releasing every read-retain
+    // of a PASS-THROUGH param, the array (header + element buffer + ~20 element records) leaked
+    // once per outer `build()` call (~2800 B/call; 8.4 MB at n=3000). A `Json[]` tail-param is fine
+    // (no read-retain) and a non-tail typed array is fine (scope-exit release runs) — the leak fired
+    // only at the intersection. ASan (ci.yml `asan` leg + the synthetic repro) is the actual leak/
+    // double-free guard; this test pins the OBSERVABLE behavior: correct length + value, no crash.
+    let out = run(r#"
+import { push, length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Transfer = { "origin": String, "destination": String, "dur": Int32 }
+val makeTransfer = (o: String, d: String, dur: Int32): Transfer =>
+  { "origin": o, "destination": d, "dur": dur }
+// `ts` threaded UNCHANGED through every tail call (same array, grown in place).
+val fill = (ts: Transfer[], i: Int32, n: Int32): Int32 =>
+  if i >= n then length(ts)
+  else
+    push(ts, makeTransfer("A", "B", i))
+    fill(ts, i + 1, n)
+val build = (): Int32 =>
+  var ts: Transfer[] = []
+  fill(ts, 0, 20)
+// Outer loop: every iteration builds a fresh 20-element Transfer[]. A per-iteration leak would
+// scale RSS with the outer count; the result is invariant.
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc else loop(i + 1, n, build())
+print(toString(loop(0, 50, 0)))
+"#);
+    // Every build() fills 20 elements; the loop returns the last build()'s length = 20.
+    assert_eq!(out, vec!["20"]);
 }
 
 /// Extract the body text of the LLVM function `define ... @<name>(...) { ... }` from emitted IR.
@@ -14489,6 +14590,38 @@ main()
 "#;
     let out = run(src);
     assert_eq!(out, vec!["flat=7".to_string(), "nested=2".to_string()]);
+}
+
+#[test]
+fn test_json_object_field_used_as_typed_map() {
+    // Regression: a `{}` that is a FIELD of a Json object literal is physically a `LinObject`, but
+    // reading it back and using it where a `{ String: T }` map is expected (e.g. passing it to
+    // `std/object.get`, or to a `{ String: Int32 }` parameter) used to call the map accessors
+    // (`lin_map_get`/`_set`) on a `LinObject*` — `find_slot` probed its bytes as a hash table and
+    // INFINITE-LOOPED on an absent key (and corrupted the heap on a present one). The fix: the
+    // Json/Object → Map coercion materializes a real `LinMap` (tag-dispatched: an already-map value
+    // is retained as-is, an object is rebuilt), plus a defensive probe bound in `find_slot`.
+    let src = r#"import { print } from "std/io"
+import { get } from "std/object"
+import { toString } from "std/string"
+
+val mk = (): Json => { "listeners": {  }, "n": 0 }
+
+val readVia = (m: { String: Int32 }, k: String): Int32 =>
+  get(m, k, -1)
+
+val main = (): Null =>
+  val b = mk()
+  b["listeners"]["tick"] = 1
+  // present key via the typed-map parameter (object → map materialize)
+  print("present=${toString(readVia(b["listeners"], "tick"))}")
+  // ABSENT key — this is the call that used to hang forever
+  print("absent=${toString(readVia(b["listeners"], "zzz"))}")
+
+main()
+"#;
+    let out = run(src);
+    assert_eq!(out, vec!["present=1".to_string(), "absent=-1".to_string()]);
 }
 
 // Regression (RAPTOR `routeScanner.scanBack` per-scan leak, ~227 MB/scan → ~6 MB/scan): a
