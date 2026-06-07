@@ -13543,6 +13543,83 @@ print("${total}")
 }
 
 #[test]
+fn test_sealed_heap_field_array_build_drop_loop_released_and_correct() {
+    // REGRESSION (boxed heap-field-record array leak): a `Trip[]` (sealed record WITH a String
+    // heap field — represented as a BOXED `Object[]`, the packed-array gate is scalar-only) built
+    // by `push` then read via `ts[i]["field"]` and dropped each iteration. The element-read path
+    // (`ts[i]` over the boxed array) PROJECTS the boxed element into a FRESH +1 sealed struct; the
+    // lowerer used to add a spurious second `Retain` that was never released → a per-iteration leak
+    // of the reconstructed struct (+ its heap fields). ASan is the leak guard (asan CI job over a
+    // build/drop loop like this); here we assert the values are correct across many iterations (an
+    // over-eager free would corrupt or crash). Covers BOTH the literal-in-push and the val-bound
+    // element-push shapes.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+type Trip = { "id": String, "dep": Int32, "arr": Int32 }
+val build = (): Int32 =>
+  var ts: Trip[] = []
+  push(ts, { "id": "a", "dep": 1, "arr": 2 })
+  val t: Trip = { "id": "b", "dep": 3, "arr": 4 }
+  push(ts, t)
+  ts[0]["dep"] + ts[1]["arr"] + length(ts)
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc else loop(i + 1, n, acc + build())
+print("${loop(0, 200, 0)}")
+"#);
+    // each build() = 1 (dep) + 4 (arr) + 2 (len) = 7; 200 iterations = 1400.
+    assert_eq!(out, vec!["1400"]);
+}
+
+#[test]
+fn test_sealed_heap_field_array_index_set_released_and_correct() {
+    // REGRESSION (boxed heap-field-record array `set`): `set(ts, i, {literal})` over a BOXED
+    // `Trip[]` used to CRASH (the monomorphized set stored the raw packed-struct pointer under
+    // TAG_OBJECT → the runtime read the packed bytes as a LinObject header → heap-buffer-overflow).
+    // Now `emit_array_set` MATERIALIZES the sealed value to a boxed LinObject (mirroring the push
+    // path), `lin_array_set` RELEASES the displaced old element, and the IndexSet lowerer skips the
+    // spurious source-retain for a sealed elem into a tagged array. ASan-gated for leak/double-free
+    // (asan CI job); here we assert correctness: the set must replace the element and read it back.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, set } from "std/array"
+type Trip = { "id": String, "dep": Int32, "arr": Int32 }
+val build = (): Int32 =>
+  var ts: Trip[] = []
+  push(ts, { "id": "a", "dep": 1, "arr": 2 })
+  set(ts, 0, { "id": "bb", "dep": 9, "arr": 8 })
+  ts[0]["dep"] + ts[0]["arr"]
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc else loop(i + 1, n, acc + build())
+print("${loop(0, 200, 0)}")
+"#);
+    // each build() = 9 (dep) + 8 (arr) = 17 after the set; 200 iterations = 3400.
+    assert_eq!(out, vec!["3400"]);
+}
+
+#[test]
+fn test_sealed_heap_field_array_nested_array_field_build_drop() {
+    // A heap-field sealed record whose field is itself a nested ARRAY (`Route = {name, legs:Int32[]}`)
+    // used as a boxed `Route[]`: build/read/drop in a loop. Exercises the element projection over a
+    // record with a heap (Array) field. ASan-gated for leaks; correctness asserted here.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+type Route = { "name": String, "legs": Int32[] }
+val build = (): Int32 =>
+  var rs: Route[] = []
+  push(rs, { "name": "r1", "legs": [1, 2, 3] })
+  push(rs, { "name": "r2", "legs": [4, 5] })
+  length(rs[0]["legs"]) + length(rs[1]["legs"])
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc else loop(i + 1, n, acc + build())
+print("${loop(0, 200, 0)}")
+"#);
+    // each build() = 3 + 2 = 5; 200 iterations = 1000.
+    assert_eq!(out, vec!["1000"]);
+}
+
+#[test]
 fn test_sealed_tail_recursive_self_call_record_literal_arg() {
     // REGRESSION (found adding the `records` cross-language benchmark): a TAIL-recursive function
     // taking a sealed-record param and passing a fresh record LITERAL as the self-call argument.

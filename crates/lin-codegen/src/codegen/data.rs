@@ -658,7 +658,41 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) fn emit_array_set(&mut self, arr_ptr: BasicValueEnum<'ctx>, idx_i64: inkwell::values::IntValue<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type) {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
+        let i8_ty = self.context.i8_type();
         let void_ty = self.context.void_type();
+        // A SEALED-repr record value (`{id:String, dep:Int32, …}`) being set into a TAGGED `Object[]`
+        // is a PACKED struct pointer, NOT a boxed LinObject. `build_tagged_val_alloca` would tag it
+        // TAG_OBJECT with the raw struct pointer as payload — the runtime then reads the packed bytes
+        // as a LinObject header on read-back (heap-buffer-overflow / misaligned deref). Materialize it
+        // to a fresh boxed LinObject first (its heap fields retained into the new object), then store
+        // that pointer under TAG_OBJECT — the SAME representation `tagged_array_push_value` stores for
+        // the `push$Object` case. The materialized object is a fresh +1 whose reference moves into the
+        // array slot (`lin_array_set` raw-copies the 16-byte TaggedVal without an inner retain for a
+        // tagged array), so it is NOT released here; the source struct keeps its own ownership (the IR
+        // `ArraySetDyn` transfer leaves it owned, released at scope exit, dropping its heap fields).
+        // Without this, `set(boxedSealedArr, i, {…})` crashed (ASan heap-buffer-overflow in
+        // `lin_object`); the boxed-array set is the index-set analogue of the boxed-array push fix.
+        if let Type::Object { .. } = val_ty {
+            if let Some(fields) = Self::sealed_fields(val_ty).cloned() {
+                let obj = self.sealed_materialize_to_object(value, &fields);
+                let tag = i8_ty.const_int(Self::type_tag(val_ty) as u64, false);
+                let cell = self.builder.alloca(self.context.struct_type(
+                    &[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false), "set_tv");
+                let tag_ptr = self.builder.struct_gep(
+                    self.context.struct_type(&[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false),
+                    cell, 0, "set_tv_tag");
+                self.builder.store(tag_ptr, tag);
+                let pay_ptr = self.builder.struct_gep(
+                    self.context.struct_type(&[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false),
+                    cell, 2, "set_tv_pay");
+                let pay = self.builder.ptr_to_int(obj.into_pointer_value(), i64_ty, "set_tv_payi");
+                self.builder.store(pay_ptr, pay);
+                let set_fn = self.get_or_declare_fn("lin_array_set",
+                    void_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
+                self.builder.call(set_fn, &[arr_ptr.into(), idx_i64.into(), cell.into()], "");
+                return;
+            }
+        }
         let elem_tagged: BasicValueEnum<'ctx> = if Self::is_union_type(val_ty) {
             value
         } else {
