@@ -1236,6 +1236,57 @@ fn is_rc_type(ty: &Type) -> bool {
         ty,
         Type::Str | Type::StrLit(_) | Type::Array(_) | Type::FixedArray(_) | Type::Object { .. } | Type::Map(_) | Type::Iterator(_) | Type::Function { .. }
     )
+    // NOTE (unboxed-sumtype Stage 2): a sum value is a refcounted `*SumNode`, but it is NOT added to
+    // `is_rc_type` — Stage 1 deliberately keeps sum types OUT of the generic owning-read path
+    // (`own_for_read` / read-retain). A sum local is owned by its CONSTRUCTION site
+    // (`try_lower_sum_literal` → `register_owned`, released at scope exit via the SumNode branch of
+    // `emit_release_repr`); every other read (match scrutinee, recursive child) is a BORROW. Adding
+    // sum to `is_rc_type` would make the match scrutinee read retain the param AND the call-arg read
+    // retain again — extra references whose scope-exit releases do not always balance under nested
+    // recursion, leaking the tree (under-release → reuse-corruption). The recursive-CHILD ownership
+    // (the node owns +1 of each child) is handled explicitly at the SumNode construction transfer
+    // (`transfer_into_container`) + the runtime KIND_SUMNODE drop walk, NOT via this predicate.
+}
+
+/// The CHILD SUM TYPE of a recursive-child field read (unboxed-sumtype Stage 2), or `None`.
+///
+/// A recursive child read `node["left"]` reaches the lowerer with `obj_ty` being the NARROWED variant
+/// record (a `Type::Object`, e.g. `BinOp = { kind:"op", left: <Ast>, right: <Ast> }`) — the match arm
+/// narrows the SumNode scrutinee to its concrete variant. The recursive child field's TYPE is the
+/// (one-level-inlined) sum union itself, which is `sum_type_eligible`. So a field is a recursive child
+/// iff it is present in `obj_ty` with a sum-eligible field type. We return that child sum type (used
+/// as the FieldGet's effective sum type so codegen reads it as a `*SumNode` and the result seeds
+/// Packed(SumNode)). Returns `None` for a non-recursive / non-sum field.
+fn sum_recursive_child_field_ty(obj_ty: &Type, field: &str) -> Option<Type> {
+    let Type::Object { fields, .. } = obj_ty else { return None };
+    let fty = fields.get(field)?;
+    if crate::repr::sum_type_eligible(fty) {
+        Some(fty.clone())
+    } else {
+        None
+    }
+}
+
+/// Read the RAW physical `SumNode` temp of a sum scrutinee `object` for a recursive-child FieldGet,
+/// bypassing the union→variant-object narrowing Coerce `lower_expr(LocalGet)` would otherwise emit
+/// (which materializes the SumNode to a boxed object). Only handles a bare `LocalGet`/`GlobalValGet`
+/// of a slot whose STORED temp is physically a SumNode (its stored type is sum-eligible) — exactly
+/// the `match node is BinOp => evalNode(node["left"])` shape. Returns `None` for anything else (the
+/// caller then falls back to the regular `lower_expr` path). Does NOT add a reference (the FieldGet
+/// site handles the borrowed-child retain-on-escape).
+fn lower_sum_scrutinee_raw(
+    object: &TypedExpr,
+    builder: &mut FuncBuilder,
+    _ctx: &mut LowerCtx,
+) -> Option<Temp> {
+    let TypedExpr::LocalGet { slot, .. } = object else { return None };
+    let t = *builder.slots.get(slot)?;
+    let stored_ty = builder.temp_types.get(&t).cloned().unwrap_or(Type::Null);
+    if crate::repr::sum_type_eligible(&stored_ty) {
+        Some(t)
+    } else {
+        None
+    }
 }
 
 /// Whether codegen's `Index` for `obj_ty[key_ty]` takes the ARRAY path (`lin_array_get_tagged`),
@@ -2131,10 +2182,45 @@ fn try_lower_sum_literal(
     // variant tag. Codegen reads the disc field TEMP's type as `StrLit` (a string const is otherwise
     // typed plain `Str`), so force the disc temp's recorded type to `StrLit(value)`.
     let disc_key = crate::repr::sum_type_discriminant_of(slot_ty)?;
+    // The variant this literal builds (selected by its discriminant StrLit value) — used to find the
+    // declared field types so a RECURSIVE CHILD field's nested literal is pushed into its child sum
+    // slot (so it constructs a `SumNode`, not a boxed object). NESTED-LITERAL DISCRIMINANT PUSHDOWN
+    // (design §6 gap 1).
+    let variant_fields: Option<indexmap::IndexMap<String, Type>> = fields
+        .iter()
+        .find(|(k, _)| k == &disc_key)
+        .and_then(|(_, v)| match v {
+            TypedExpr::StringLit(s, _, _) => crate::repr::sumnode_variant_by_disc(slot_ty, s),
+            _ => None,
+        });
+    // The unique recursive self-name: a variant field typed `Named(self_name)` is a recursive child
+    // whose CHILD SUM TYPE is `slot_ty` itself (direct self-recursion). Used to push a nested literal
+    // into the right child sum slot so it constructs a `SumNode`.
+    let self_name = crate::repr::sum_recursive_self_name(slot_ty);
+    // Recursive-child temps whose ownership TRANSFERS into the constructed SumNode (the node owns +1
+    // of each child; codegen does NOT retain at the store). Recorded with their source expr so we can
+    // apply `transfer_into_container` AFTER the MakeObject: a fresh child literal is unregistered (its
+    // +1 moves into the node), a borrowed child sub-expression is retained.
+    let mut recursive_children: Vec<(Temp, &TypedExpr)> = Vec::new();
     let lowered_fields: Vec<(String, Temp)> = fields
         .iter()
         .map(|(k, v)| {
-            let t = lower_expr(v, builder, ctx);
+            // RECURSIVE CHILD pushdown (design §6 gap 1): a field whose variant slot type is a
+            // recursive self-child (`Named(self_name)`) carries a nested literal that must be
+            // constructed AS a SumNode. Lower it into the child sum slot (== `slot_ty`, recursing
+            // through `try_lower_sum_literal`) instead of as a plain (boxed) object literal.
+            let is_recursive_child = self_name.as_deref().is_some_and(|n| {
+                matches!(variant_fields.as_ref().and_then(|vf| vf.get(k)),
+                    Some(Type::Named(fn_name)) if fn_name == n)
+            });
+            let t = if is_recursive_child {
+                lower_value_into_slot(v, slot_ty, builder, ctx)
+            } else {
+                lower_expr(v, builder, ctx)
+            };
+            if is_recursive_child {
+                recursive_children.push((t, v));
+            }
             if k == &disc_key {
                 if let TypedExpr::StringLit(s, _, _) = v {
                     builder.temp_types.insert(t, Type::StrLit(s.clone()));
@@ -2159,6 +2245,14 @@ fn try_lower_sum_literal(
         ty: slot_ty.clone(),
         stack: false,
     });
+    // Transfer each recursive child's ownership into the SumNode (the node owns +1 of each child,
+    // released by its KIND_SUMNODE drop walk). A fresh child literal's +1 MOVES into the node
+    // (unregister from this scope); a borrowed child sub-expr is retained. Mirrors the
+    // `transfer_into_container` rule for array/object element inserts — codegen does not retain at
+    // the store, so this is the sole balancing reference for the node's owned child slot.
+    for (t, src) in recursive_children {
+        builder.transfer_into_container(t, src, true);
+    }
     builder.register_owned(dst, slot_ty.clone());
     Some(dst)
 }
@@ -3251,6 +3345,49 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                         builder.emit(Instruction::Retain { val: dst, ty: result_type.clone() });
                         builder.register_owned(dst, result_type.clone());
                     }
+                    return dst;
+                }
+            }
+            // UNBOXED SUM TYPE (unboxed-sumtype Stage 2): a recursive child read `node["left"]` over a
+            // sum-typed value (`obj_ty` is sum-eligible) with a compile-time string key that names a
+            // RECURSIVE child field (`*SumNode` slot) in some variant → a direct const-offset pointer
+            // load yielding a BORROWED interior `*SumNode` (the parent still owns it), repr
+            // Packed(SumNode). This is the chained-`evalNode(node["left"])` fast path: no materialize,
+            // no `lin_object_get`. The result_type is the child sum type (so the FieldGet result seeds
+            // Packed(SumNode) and the recursion re-enters the tag switch). Borrow/retain-if-escapes is
+            // applied exactly like a nested-sealed-field load: retain only when the result is an
+            // RC type that escapes (the recursive-call arg path retains via the call-arg machinery; a
+            // bare return retains here).
+            if let TypedExpr::StringLit(name, _, _) = key.as_ref() {
+                // The object is physically a `SumNode` (a narrowed sum scrutinee whose variant carries
+                // a recursive child, so it canNOT be projected to a sealed struct — its field reads
+                // MUST go directly to the SumNode, never through a materialize-to-boxed). Read the RAW
+                // SumNode temp (bypassing the union→variant-object narrowing Coerce that
+                // `lower_expr(LocalGet)` emits, which would materialize the node and release its
+                // borrowed children). ALL fields read directly: a SCALAR field is a const-offset load
+                // (its result is a flat scalar); a RECURSIVE CHILD field is a const-offset `*SumNode`
+                // pointer load (borrowed, repr Packed(SumNode)).
+                if let Some(obj_temp) = lower_sum_scrutinee_raw(object, builder, ctx) {
+                    // Result type: the child sum type for a recursive child (so it seeds
+                    // Packed(SumNode) and the recursion re-enters the tag switch), else the field's
+                    // declared `result_type`.
+                    let child_sum_ty = sum_recursive_child_field_ty(&obj_ty, name);
+                    let res_ty = child_sum_ty.clone().unwrap_or_else(|| result_type.clone());
+                    let dst = builder.alloc_temp(res_ty.clone());
+                    builder.emit(Instruction::FieldGet {
+                        dst,
+                        object: obj_temp,
+                        field: name.clone(),
+                        obj_ty,
+                        result_ty: res_ty.clone(),
+                    });
+                    // A recursive-child result is a BORROWED interior `*SumNode` (the parent owns it,
+                    // releases it via its KIND_SUMNODE drop walk). A consumer that BORROWS it (the
+                    // recursive `evalNode(node["left"])` callee retains+releases its own scrutinee,
+                    // net 0) needs no owning reference here — return the borrow directly so it is never
+                    // double-released against the parent's owned slot (escape is handled by the
+                    // surrounding owning machinery). A SCALAR result is a value (no RC). So: no
+                    // retain/own here in either case. (Mirrors the borrowed sealed-array element read.)
                     return dst;
                 }
             }

@@ -368,6 +368,10 @@ impl<'ctx> Codegen<'ctx> {
     /// Byte offset of the inline discriminant tag. Lockstep with `sumnode::SUMNODE_TAG_OFFSET`.
     pub(crate) const SUMNODE_TAG_OFFSET: u64 = 16;
 
+    /// Descriptor kind code for a RECURSIVE child (`*SumNode`) slot of a sum-type variant
+    /// (unboxed-sumtype Stage 2). MUST stay in lockstep with `lin_runtime::sumnode::KIND_SUMNODE`.
+    pub(crate) const KIND_SUMNODE: u32 = 4;
+
     /// True when `ty` is a permissible SCALAR field of a Stage-1 sum-type variant (a fixed-width
     /// numeric or Bool — no per-field RC). The discriminant field is a StrLit; it is laid out as a
     /// scalar slot is NOT — it is carried inline by the tag, never stored, so it is excluded from the
@@ -376,14 +380,58 @@ impl<'ctx> Codegen<'ctx> {
         Self::is_sealed_scalar_field(ty)
     }
 
+    /// The UNIQUE recursive self-reference name of a candidate sum union (unboxed-sumtype Stage 2),
+    /// or `None` if the union has no recursive child or more than one distinct self-name.
+    ///
+    /// A self-recursive sum type (`type Ast = Num | BinOp` with `BinOp.left/right : Ast`) survives
+    /// type resolution with its recursive child fields as `Type::Named(n)` (the checker leaves the
+    /// cyclic back-reference unexpanded — `lin-check::resolve::resolve_named_cycle`). At every real
+    /// codegen/repr site the recursive child is `Type::Named(n)` for the SINGLE alias name `n` of the
+    /// sum type itself. We detect recursion ENV-FREE by collecting the set of `Named` names appearing
+    /// directly as a variant field value; a well-formed direct-self-recursive sum type has exactly one
+    /// such name. Mutual recursion (two distinct names) is OUT OF SCOPE this stage → `None` (the gate
+    /// then falls back to boxed, fail-safe). This is the SINGLE source of truth, mirrored in
+    /// `lin_ir::repr::sum_recursive_self_name`.
+    pub(crate) fn sum_recursive_self_name(ty: &Type) -> Option<String> {
+        let variants = match ty {
+            Type::Union(vs) => vs,
+            _ => return None,
+        };
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for v in variants {
+            if let Type::Object { fields, .. } = v {
+                for fty in fields.values() {
+                    if let Type::Named(n) = fty {
+                        names.insert(n.clone());
+                    }
+                }
+            }
+        }
+        if names.len() == 1 {
+            names.into_iter().next()
+        } else {
+            None
+        }
+    }
+
+    /// True when `fty` is a RECURSIVE child field of the sum type whose self-name is `self_name`
+    /// (unboxed-sumtype Stage 2): a `Type::Named(self_name)` slot, stored as an 8-byte owned
+    /// `*SumNode` pointer. (The inlined-`Union` form does not appear at real sites — see
+    /// `sum_recursive_self_name`.)
+    pub(crate) fn is_sum_recursive_child(fty: &Type, self_name: &str) -> bool {
+        matches!(fty, Type::Named(n) if n == self_name)
+    }
+
     /// THE Stage-1 sum-type gate (SINGLE source of truth, mirrored in `lin_ir::repr::sum_type_eligible`).
     /// Returns the discriminant key iff `ty` is a `Type::Union` of 2+ variants where:
     ///   (1) every variant is a `Type::Object` (sealed or not — the union itself is the seal);
     ///   (2) a SHARED key exists whose value is a distinct `StrLit` on every variant (the
     ///       discriminant — same soundness rule as the shipped union-discrimination);
-    ///   (3) every OTHER field of every variant is an unboxed scalar (Stage 1: NO heap/Named/union/
-    ///       nested-record/recursive field). Any violation → `None` → fall back to the boxed union.
-    /// A `Null` member disqualifies (a nullable sum stays boxed — fail-safe, Stage 1 strict scope).
+    ///   (3) every OTHER field of every variant is EITHER an unboxed scalar OR (Stage 2) a RECURSIVE
+    ///       self-child (`Type::Named(self_name)`, stored as an owned `*SumNode` pointer). NO heap
+    ///       (String/Array)/union/nested-non-recursive-record/foreign-Named field. Any violation →
+    ///       `None` → fall back to the boxed union (fail-safe).
+    /// A `Null` member disqualifies (a nullable sum stays boxed — fail-safe, strict scope).
     pub(crate) fn sum_type_discriminant(ty: &Type) -> Option<String> {
         let variants = match ty {
             Type::Union(vs) => vs,
@@ -392,6 +440,11 @@ impl<'ctx> Codegen<'ctx> {
         if variants.len() < 2 {
             return None;
         }
+        // Stage 2: the unique recursive self-name (if any). A field equal to `Named(self_name)` is a
+        // legal recursive child (`*SumNode` slot). `None` when the type is non-recursive (Stage 1) OR
+        // when it has >1 distinct Named name (mutual recursion — out of scope → those Named fields
+        // then fail `is_sum_scalar_field` → the gate rejects, fail-safe to boxed).
+        let self_name = Self::sum_recursive_self_name(ty);
         // All variants must be concrete records (no Null/Named/scalar member).
         let mut recs: Vec<&indexmap::IndexMap<String, Type>> = Vec::with_capacity(variants.len());
         for v in variants {
@@ -417,17 +470,22 @@ impl<'ctx> Codegen<'ctx> {
                     _ => continue 'keys, // missing/non-StrLit on some variant
                 }
             }
-            // Every OTHER field of every variant must be an unboxed scalar (Stage 1 strict scope).
+            // Every OTHER field of every variant must be an unboxed scalar OR a recursive self-child.
             for rec in &recs {
                 for (fk, fty) in rec.iter() {
                     if fk == key {
                         continue; // the discriminant (a StrLit) is carried by the tag, not stored
                     }
                     if matches!(fty, Type::StrLit(_)) {
-                        // A second StrLit field is not a scalar slot — out of Stage-1 scope.
+                        // A second StrLit field is not a scalar slot — out of scope.
                         return None;
                     }
-                    if !Self::is_sum_scalar_field(fty) {
+                    // Stage 2: a recursive self-child (`Named(self_name)`) is an 8-byte `*SumNode`
+                    // slot. Any OTHER `Named` (foreign type) / heap / union field → not packable.
+                    let is_recursive_child = self_name
+                        .as_deref()
+                        .is_some_and(|n| Self::is_sum_recursive_child(fty, n));
+                    if !Self::is_sum_scalar_field(fty) && !is_recursive_child {
                         return None;
                     }
                 }
@@ -472,6 +530,17 @@ impl<'ctx> Codegen<'ctx> {
             .collect()
     }
 
+    /// Byte width of one variant-payload field SLOT. A scalar occupies its natural width (1/2/4/8); a
+    /// RECURSIVE child (`Type::Named`, Stage 2) occupies an 8-byte `*SumNode` pointer slot. (Any other
+    /// non-scalar would never reach here — the gate rejects it.)
+    fn sumnode_slot_size(fty: &Type) -> u64 {
+        if matches!(fty, Type::Named(_)) {
+            8 // recursive child: owned *SumNode pointer slot
+        } else {
+            fty.bit_width().map(|b| (b as u64) / 8).unwrap_or(1).max(1)
+        }
+    }
+
     /// Byte offset (from the node base, INCLUDING the 24-byte header) of `field` within a variant's
     /// payload, packed in declaration order with natural alignment. The header end (offset 24) is the
     /// payload base. Returns the field offset. Panics if `field` is not in the payload.
@@ -481,7 +550,7 @@ impl<'ctx> Codegen<'ctx> {
     ) -> u64 {
         let mut offset = Self::SUMNODE_HEADER;
         for (k, fty) in payload_fields.iter() {
-            let sz = fty.bit_width().map(|b| (b as u64) / 8).unwrap_or(1).max(1);
+            let sz = Self::sumnode_slot_size(fty);
             offset = (offset + sz - 1) / sz * sz;
             if k == field {
                 return offset;
@@ -495,7 +564,7 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) fn sumnode_variant_size(payload_fields: &indexmap::IndexMap<String, Type>) -> u64 {
         let mut offset = Self::SUMNODE_HEADER;
         for fty in payload_fields.values() {
-            let sz = fty.bit_width().map(|b| (b as u64) / 8).unwrap_or(1).max(1);
+            let sz = Self::sumnode_slot_size(fty);
             offset = (offset + sz - 1) / sz * sz;
             offset += sz;
         }

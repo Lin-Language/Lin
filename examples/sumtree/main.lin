@@ -1,0 +1,29 @@
+// sumtree demo — build a small expression tree and evaluate it.
+//
+// Run:   lin run examples/sumtree/main.lin
+// Test:  lin test examples/sumtree/
+import { print } from "std/io"
+import { toString } from "std/string"
+import { Expr, eval } from "./ast"
+
+val main = () =>
+  // ((3 + 4) * (10 - 6)) = 28
+  val tree: Expr = {
+    "kind": "op",
+    "op": 2,
+    "left": {
+      "kind": "op",
+      "op": 0,
+      "left": { "kind": "num", "value": 3 },
+      "right": { "kind": "num", "value": 4 }
+    },
+    "right": {
+      "kind": "op",
+      "op": 1,
+      "left": { "kind": "num", "value": 10 },
+      "right": { "kind": "num", "value": 6 }
+    }
+  }
+  print(eval(tree).toString())
+
+main()

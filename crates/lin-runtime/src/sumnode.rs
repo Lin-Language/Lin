@@ -227,6 +227,33 @@ mod tests {
     }
 
     #[test]
+    fn recursive_child_drop_walks_and_frees_subtree() {
+        // unboxed-sumtype Stage 2: a parent node holds a recursive child at a KIND_SUMNODE slot. The
+        // parent's drop walk must recurse into the child (releasing it) before freeing the parent.
+        // Build a SumDesc with ONE variant (tag 0) whose single heap field is a KIND_SUMNODE child at
+        // payload offset 24 (the first payload slot). Lay it out exactly as codegen emits:
+        //   SumDesc = [ u32 variant_count=1 | VariantDesc ]
+        //   VariantDesc = [ u32 heap_count=1 | { u32 offset=24, u32 kind=KIND_SUMNODE } ]
+        let desc: [u32; 4] = [1, 1, 24, KIND_SUMNODE];
+        let desc_ptr = desc.as_ptr() as *const u8;
+        let size = SUMNODE_HEADER + 8; // header + one pointer slot
+        unsafe {
+            let child = lin_sumnode_alloc(size, std::ptr::null()); // leaf: NULL desc, scalar-only
+            let parent = lin_sumnode_alloc(size, desc_ptr);
+            // parent.tag = 0 (the only variant); store the OWNED child pointer at payload offset 24.
+            *((parent.add(SUMNODE_TAG_OFFSET)) as *mut u32) = 0;
+            *((parent.add(SUMNODE_HEADER)) as *mut *mut u8) = child;
+            // The child rc stays 1 (the parent owns it). Releasing the parent (rc 1 -> 0) must run the
+            // drop walk: read tag 0 -> variant 0 -> the KIND_SUMNODE field at offset 24 ->
+            // lin_sumnode_release_self(child) -> child rc 1 -> 0 -> free, THEN free the parent.
+            assert_eq!(*(child as *const u32), 1, "child rc starts at 1 (parent-owned)");
+            lin_sumnode_release(parent, size);
+            // If the walk did NOT recurse, the child would leak (caught by ASan/Miri). If it
+            // double-freed, this test would abort under the allocator. Reaching here = freed once.
+        }
+    }
+
+    #[test]
     fn null_and_immortal_are_inert() {
         unsafe {
             lin_sumnode_release(std::ptr::null_mut(), 32); // null-safe
