@@ -1479,9 +1479,22 @@ fn rewrite_expr(expr: &mut TypedExpr, state: &mut MonoState<'_>) {
                     // as "cannot infer". A genuinely uninferrable param (e.g. `<T>(): T => 0` called
                     // bare) is NOT a lambda-return param, so it still errors below.
                     let lambda_return_ids = function_param_return_tv_ids(&params);
+                    // PHANTOM RETURN PARAMS: a quantified id that appears ONLY nested inside the
+                    // return type (e.g. the `E` of `ok = <T,E>(v: T): Result<T,E>`, which lives
+                    // exclusively in the un-constructed `failure` arm `{ error: E }` of the result
+                    // union) is determined by nothing at the call — no argument carries it and the
+                    // value built never inhabits that arm. The union-arm matching binds it to ITSELF
+                    // (`E -> TypeVar(E)`), which would trip the "cannot infer" error. Such a param is
+                    // a representation-irrelevant phantom: erase it to the `$Json` wildcard exactly
+                    // like a `Json`-bodied lambda-return param. This is NOT the genuinely-uninferrable
+                    // `mk = <T>(): T => 0` case — there `T` IS the BARE return type (a top-level
+                    // occurrence), so it is excluded below and still errors.
+                    let phantom_return_ids = phantom_return_param_ids(&params, &ret_type);
                     for (id, v) in subs.iter_mut() {
                         let is_self_bound = matches!(v, Type::TypeVar(vid) if *vid == *id);
-                        if is_self_bound && lambda_return_ids.contains(id) {
+                        if is_self_bound
+                            && (lambda_return_ids.contains(id) || phantom_return_ids.contains(id))
+                        {
                             *v = Type::TypeVar(u32::MAX);
                         } else {
                             *v = erase_nonconcrete_typevars(v);
@@ -1919,6 +1932,44 @@ fn function_param_return_tv_ids(params: &[TypedParam]) -> std::collections::Hash
         }
     }
     out
+}
+
+/// Quantified generic ids that are PHANTOM return parameters: they appear EXCLUSIVELY nested inside
+/// the return type (inside a union member / object field / container element) and NEVER as a bare
+/// top-level return position NOR anywhere in a parameter type. Such an id is determined by nothing
+/// at a call — no argument carries it, and the constructed value does not inhabit the arm it lives
+/// in — so it can be soundly erased to the `$Json` wildcard rather than producing a spurious
+/// "cannot infer" error (e.g. the `E` of `ok = <T,E>(v: T): Result<T,E>`).
+///
+/// The exclusions are what keep the genuinely-uninferrable case erroring: `mk = <T>(): T => 0` has
+/// `T` as the BARE top-level return (caught by `ret_bare_top`), and `<T>(x: Int32): Int32 => …` with
+/// an unused `T` never reaches here because `T` would not be nested in the return at all.
+fn phantom_return_param_ids(
+    params: &[TypedParam],
+    ret_type: &Type,
+) -> std::collections::HashSet<u32> {
+    // Ids that appear ANYWHERE in a parameter type are determined by (or constrained against) an
+    // argument — never phantom.
+    let mut param_ids = std::collections::HashSet::new();
+    for p in params {
+        collect_quantified_ids(&p.ty, &mut param_ids);
+    }
+    // A bare top-level return TypeVar (the `T` of `(): T`) directly determines the result's runtime
+    // representation, so it is NOT a phantom — keep it erroring when unconstrained.
+    let mut ret_bare_top = std::collections::HashSet::new();
+    if let Type::TypeVar(id) = ret_type {
+        if *id >= GENERIC_TV_BASE && *id != u32::MAX {
+            ret_bare_top.insert(*id);
+        }
+    }
+    // Ids appearing nested anywhere in the return type.
+    let mut ret_ids = std::collections::HashSet::new();
+    collect_quantified_ids(ret_type, &mut ret_ids);
+
+    ret_ids
+        .into_iter()
+        .filter(|id| !param_ids.contains(id) && !ret_bare_top.contains(id))
+        .collect()
 }
 
 /// Collect every quantified generic TypeVar id (≥ base, excluding the Json wildcard) in `ty`.
