@@ -1,7 +1,7 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { getQueue } from "./queueFactory"
 
-// getQueue now takes typed index-signature maps (ADR-082). A NON-EMPTY object literal
+// getQueue now takes typed index-signature maps (ADR-055). A NON-EMPTY object literal
 // infers as a fixed record, not `{ String: T }` (only an empty `{}` infers a map from
 // context, spec §5.1.1), so the dictionary fixtures are built into typed-map `var`s.
 val routesAtStop1 = (): { String: String[] } =>

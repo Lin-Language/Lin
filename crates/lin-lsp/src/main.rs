@@ -589,7 +589,7 @@ fn pre_resolve_imports(
 
             let mut checker = Checker::new();
             checker.import_types = import_type_map;
-            // Trusted stdlib modules legitimately reference `lin_*` intrinsics (ADR-086); allow
+            // Trusted stdlib modules legitimately reference `lin_*` intrinsics (ADR-060); allow
             // them here so resolving an imported `std/...` dependency doesn't spuriously error.
             let is_stdlib = stdlib_source(path.as_str()).is_some();
             checker.lenient_json = is_stdlib;

@@ -381,6 +381,11 @@ fn instr_is_interference(temp: Temp, instr: &Instruction) -> bool {
         | Instruction::MakeCell { .. }
         | Instruction::CellSet { .. }
         | Instruction::IndexSet { .. }
+        // Keep-packed coercions create / extract an owner of a packed pointer (the shell wraps the
+        // borrowed inner, or the unbox retains it). Treat as interference so an elision span never
+        // straddles the representation boundary — same discipline as MakeArray / Index.
+        | Instruction::BoxKeepPacked { .. }
+        | Instruction::UnboxKeepPacked { .. }
         | Instruction::GlobalValSet { .. } => true,
         Instruction::Release { val, .. } if *val == temp => true,
         // An intervening SECOND Retain of the same temp disqualifies eliding ACROSS it:
@@ -592,6 +597,7 @@ mod tests {
             temp_types,
             temp_count: 3,
             intrinsic_slots: std::collections::HashMap::new(),
+            repr: Vec::new(),
         }
     }
 
@@ -631,6 +637,7 @@ mod tests {
             temp_types,
             temp_count: 3,
             intrinsic_slots: std::collections::HashMap::new(),
+            repr: Vec::new(),
         }
     }
 
@@ -679,6 +686,7 @@ mod tests {
             temp_types,
             temp_count: 3,
             intrinsic_slots: std::collections::HashMap::new(),
+            repr: Vec::new(),
         }
     }
 
@@ -1027,6 +1035,7 @@ mod tests {
             temp_types,
             temp_count: 2,
             intrinsic_slots: std::collections::HashMap::new(),
+            repr: Vec::new(),
         };
         let mut module = make_module(func);
         elide_rc(&mut module);

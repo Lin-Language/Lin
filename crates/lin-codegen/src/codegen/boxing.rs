@@ -108,7 +108,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.builder.call(self.rt.box_object, &[val.into()], "boxobj")
                     .try_as_basic_value().unwrap_basic()
             }
-            // Typed index-signature map (`{ String: T }`, ADR-082): box the LinMap* as TAG_MAP.
+            // Typed index-signature map (`{ String: T }`, ADR-055): box the LinMap* as TAG_MAP.
             Type::Map(_) => {
                 let box_map_fn = self.get_or_declare_fn("lin_box_map",
                     self.context.ptr_type(AddressSpace::default()).fn_type(&[self.context.ptr_type(AddressSpace::default()).into()], false));
@@ -117,9 +117,12 @@ impl<'ctx> Codegen<'ctx> {
             }
             // A SEALED-RECORD ARRAY (Stage 3) is a contiguous unboxed buffer (elem_tag 0xFE), NOT a
             // tagged/flat array the dynamic Json machinery (lin_array_get_tagged / lin_to_string /
-            // lin_tagged_eq / combinators) can read. At the Json boundary MATERIALIZE it to a tagged
-            // `Object[]` (each element → a boxed LinObject) via the per-type element materializer,
-            // then box the tagged array. This is the fail-safe boxed view (§3 boundary).
+            // lin_tagged_eq / combinators) can read directly. `box_value` is the GENERICALLY-DYNAMIC
+            // boxing entry (toString / keys / spread / heterogeneous element / closure arg), so it
+            // MATERIALIZES to a tagged `Object[]` here — the fail-safe boxed view. The keep-packed
+            // container-store path (the dijkstra fix) does NOT route through `box_value`; it emits
+            // `BoxKeepPacked` directly at `emit_map_set` so only the genuinely-dynamic consumers pay
+            // the materialize (repr pass, Stage 4 boundary catalogue).
             Type::Array(_) if val.is_pointer_value() && Self::sealed_array_elem(val_ty).is_some() => {
                 let tagged = self.sealed_array_to_tagged(val, val_ty);
                 self.builder.call(self.rt.box_array, &[tagged.into()], "boxsarr")
@@ -242,7 +245,11 @@ impl<'ctx> Codegen<'ctx> {
                 let fields = Self::sealed_scalar_fields(target_ty).unwrap().clone();
                 self.sealed_project_from(ptr, &Type::TypeVar(u32::MAX), &fields)
             }
-            Type::Object { .. } | Type::Array(_) | Type::FixedArray(_) | Type::Function { .. } => {
+            // Keep in sync with `unbox_tagged_val_to_type` below. A typed index-signature map
+            // (`{ String: T }`, `Type::Map`) is boxed as TAG_MAP whose payload is the raw
+            // `LinMap*`; unbox it back to that pointer here too, or it leaks through the
+            // closure-ABI wrapper as a TaggedVal box masquerading as a `LinMap*`.
+            Type::Object { .. } | Type::Array(_) | Type::FixedArray(_) | Type::Function { .. } | Type::Map(_) => {
                 self.builder.call(self.rt.unbox_ptr, &[ptr_val.into()], "uptr")
                     .try_as_basic_value().unwrap_basic()
             }
@@ -315,6 +322,46 @@ impl<'ctx> Codegen<'ctx> {
         alloca
     }
 
+    /// KEEP-PACKED box (repr pass Stage 4): wrap a still-packed `LinArray*` (elem_tag 0xFE) / packed
+    /// sealed struct* into a 16-byte `TaggedVal` WITHOUT materializing. O(1), borrows the inner. A
+    /// sealed ARRAY uses `lin_box_array` (TAG_ARRAY) and a sealed RECORD uses `lin_box_object`
+    /// (TAG_OBJECT) — both store the payload pointer verbatim; the runtime dispatches release/free on
+    /// the header (`elem_tag` for arrays, the sealed offset-4 size for structs). The box shell is a
+    /// fresh +1; the inner's owning reference is supplied by the surrounding container transfer.
+    pub(crate) fn compile_ir_box_keep_packed(&mut self, val: BasicValueEnum<'ctx>, arr: bool) -> BasicValueEnum<'ctx> {
+        if !val.is_pointer_value() {
+            return val;
+        }
+        if arr {
+            self.builder.call(self.rt.box_array, &[val.into()], "kp_boxarr")
+                .try_as_basic_value().unwrap_basic()
+        } else {
+            self.builder.call(self.rt.box_object, &[val.into()], "kp_boxobj")
+                .try_as_basic_value().unwrap_basic()
+        }
+    }
+
+    /// KEEP-PACKED unbox (repr pass Stage 4): tag-check + load the payload pointer as the still-packed
+    /// `LinArray*` / packed struct*, then retain it (one shell +1). O(1), zero copy. This is the
+    /// justified form of the historically-unguarded `unbox_ptr` assumption: the pass proves the slot
+    /// holds a keep-packed handle (`Boxed(WrapsPacked(L))`), so reading the payload as a packed
+    /// pointer is sound. The retain pairs with the `Release` the pass schedules at the use's last
+    /// drop (the read-back temp owns a +1 of the packed buffer).
+    pub(crate) fn compile_ir_unbox_keep_packed(&mut self, val: BasicValueEnum<'ctx>, _arr: bool) -> BasicValueEnum<'ctx> {
+        if !val.is_pointer_value() {
+            return val;
+        }
+        let raw = self.builder.call(self.rt.unbox_ptr, &[val.into()], "kp_unbox")
+            .try_as_basic_value().unwrap_basic();
+        // Retain the packed buffer: the read-back temp is a fresh owner (+1) whose Release the pass
+        // schedules. `lin_rc_retain` increments the offset-0 refcount shared by LinArray and packed
+        // sealed structs (both carry it at offset 0), so this is correct for either kind.
+        if raw.is_pointer_value() {
+            self.builder.call(self.rt.rc_retain, &[raw.into()], "");
+        }
+        raw
+    }
+
     pub(crate) fn compile_ir_box(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) -> BasicValueEnum<'ctx> {
         // Heap-box (see compile_ir_coerce) so the boxed value can safely escape.
         self.box_value(val, ty)
@@ -364,7 +411,7 @@ impl<'ctx> Codegen<'ctx> {
                 // path: sealed_project_from unboxes a union source to the raw LinObject itself.
                 self.sealed_project_from(tagged, &Type::TypeVar(u32::MAX), &fields)
             }
-            // Typed index-signature map (`{ String: T }`, ADR-082): a `m[k]` whose value type is
+            // Typed index-signature map (`{ String: T }`, ADR-055): a `m[k]` whose value type is
             // itself a Map is boxed as TAG_MAP. Unbox the payload back to the raw `LinMap*` so a
             // nested store (`m[a][b] = v`) and a chained read both operate on the SHARED inner
             // container, not on the TaggedVal box (which a missing arm here would leak through,

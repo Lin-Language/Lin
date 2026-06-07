@@ -1,4 +1,4 @@
-// Type-directed JSON decoding for config (ADR-047). `Person.fromJson(json)` validates a
+// Type-directed JSON decoding for config (ADR-031). `Person.fromJson(json)` validates a
 // Json value against the target type and returns either the decoded value (typed) or an
 // Error object `{ type, message, path }` describing the first structural mismatch.
 //

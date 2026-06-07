@@ -8,7 +8,7 @@ fn parse_and_check(source: &str) -> Result<lin_check::TypedModule, Vec<lin_commo
     let mut parser = Parser::new(tokens);
     let module = parser.parse_module();
     let mut checker = Checker::new();
-    // These compiler-internal unit tests legitimately drive `lin_*` intrinsics directly (ADR-086).
+    // These compiler-internal unit tests legitimately drive `lin_*` intrinsics directly (ADR-060).
     checker.allow_intrinsics = true;
     checker.check_module(&module)
 }
@@ -390,7 +390,7 @@ val handle = (b: Boolean): R =>
     assert!(result.is_err(), "wrong-shaped object arm must still error");
 }
 
-// Guard against over-broadening (ADR-046): a DIRECT `Json` body returned as a structured object
+// Guard against over-broadening (ADR-045): a DIRECT `Json` body returned as a structured object
 // (not via a match/if arm with a concrete-object companion) must still error — the relaxation is
 // scoped to checked match/if arms, not bare bodies.
 #[test]
@@ -401,5 +401,5 @@ val other = (): Json => { "status": 200, "headers": { "a": 1 }, "body": "ok" }
 val handle = (): R => other()
 "#;
     let result = parse_and_check(src);
-    assert!(result.is_err(), "bare Json body vs structured object return must still error (ADR-046)");
+    assert!(result.is_err(), "bare Json body vs structured object return must still error (ADR-045)");
 }

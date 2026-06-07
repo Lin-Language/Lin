@@ -19,12 +19,12 @@ pub enum Type {
     /// A singleton string-literal type, e.g. `"success"`. At runtime a `StrLit`
     /// value is represented identically to a `Str` (TAG_STR, same boxing/RC/toString);
     /// the literal only constrains type-checking (compat, bidirectional refinement,
-    /// exhaustiveness). See ADR-053.
+    /// exhaustiveness). See ADR-035.
     StrLit(String),
     Array(Box<Type>),
     FixedArray(Vec<Type>),
     /// A structural object type. `sealed` is an INERT representation marker (Stage 0.5 of the
-    /// sealed-records design, ADR-083): it is `true` ONLY when this
+    /// sealed-records design, ADR-057): it is `true` ONLY when this
     /// object originates from resolving a NAMED record-type declaration (`type T = { … }`) in
     /// `resolve.rs`, and `false` for every anonymous object literal type, inferred structural
     /// type, and built-in structural alias (e.g. `Error`).
@@ -39,7 +39,7 @@ pub enum Type {
         fields: IndexMap<String, Type>,
         sealed: bool,
     },
-    /// A typed index-signature object type `{ String: T }` (ADR-082): an object used as a
+    /// A typed index-signature object type `{ String: T }` (ADR-055): an object used as a
     /// dictionary — arbitrary string keys all mapping to value type `T`. Distinct from a fixed
     /// `Object` record. Backed at runtime by the hashed `LinMap` container (O(1) average lookup),
     /// NOT the assoc-list `LinObject`. `obj[k]` yields `T | Null`; `obj[k] = v` requires `v : T`.
@@ -55,7 +55,7 @@ pub enum Type {
         required: usize,
     },
     Iterator(Box<Type>),
-    /// `Shared<T>` — opt-in shared *mutable* state (ADR-044). An opaque box over `T`; the ONLY
+    /// `Shared<T>` — opt-in shared *mutable* state (ADR-029). An opaque box over `T`; the ONLY
     /// operations are the `shared`/`get`/`set`/`withLock` accessors. It is deliberately NOT
     /// structurally compatible with `T` or with `Json` (see `compat.rs`), so any other operation
     /// on a `Shared<T>` — `push`, indexing, auto-unwrap — is a compile-time type error. It is
@@ -63,7 +63,7 @@ pub enum Type {
     /// annotations (no `resolve.rs` case), so user code can never name it directly.
     Shared(Box<Type>),
     /// `Stream<T>` — an opaque, lazy, effectful pull-source that owns an OS resource (a file
-    /// descriptor, socket, …) (ADR-072, streams brief). A sibling to `Iterator` but distinct:
+    /// descriptor, socket, …) (ADR-047, streams brief). A sibling to `Iterator` but distinct:
     /// the iterator protocol's `cond`/`current` must be pure, whereas a stream is effectful and
     /// fallible. Like `Shared`, it is NOT structurally compatible with `T` or `Json` (see
     /// `compat.rs`), so any operation other than the stream API is a compile-time type error.
@@ -84,7 +84,7 @@ pub enum Type {
 /// adding the Stage-0.5 sealed flag cannot perturb any equality-driven behavior (union
 /// dedup/flatten via `Vec::contains`, narrowing/exhaustiveness comparisons, `temp_types`
 /// identity, zonk fixpoints, cache keys). The flag rides along structurally but is invisible to
-/// `==`. See ADR-083 (Stage 0.5) and ADR-051 (the `StrLit` precedent).
+/// `==`. See ADR-057 (Stage 0.5) and ADR-034 (the `StrLit` precedent).
 impl PartialEq for Type {
     fn eq(&self, other: &Self) -> bool {
         use Type::*;
@@ -192,7 +192,7 @@ impl Type {
 
     /// True for `Str` and for any string-literal singleton (`StrLit`). Used wherever
     /// a runtime-string representation is what matters (equality, comparison, boxing,
-    /// RC), since a `StrLit` is a `Str` at runtime. See ADR-053.
+    /// RC), since a `StrLit` is a `Str` at runtime. See ADR-035.
     pub fn is_string_ish(&self) -> bool {
         matches!(self, Type::Str | Type::StrLit(_))
     }
@@ -224,7 +224,7 @@ impl Type {
     /// True if this type contains any `TypeVar` anywhere in its structure
     /// (including the Json marker `TypeVar(u32::MAX)`, generic params, and fresh
     /// inference vars). A type with no TypeVar is "fully concrete" — the only
-    /// targets a `Json` value may NOT flow into without an explicit decode (ADR-046).
+    /// targets a `Json` value may NOT flow into without an explicit decode (ADR-045).
     pub fn contains_type_var(&self) -> bool {
         match self {
             Type::TypeVar(_) => true,

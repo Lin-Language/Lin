@@ -2,9 +2,10 @@ import { expect, toBe, test, suite, run } from "std/test"
 import { for, range } from "std/iter"
 import { length } from "std/array"
 import { makeGraphResults, add, finalize } from "./graphResults"
+import { Conn } from "./types"
 
 val mergePath = (tree: Json, path: Json): Null =>
-  var kConnections: Json = {}
+  var kConnections: { String: { String: Conn } } = {}
   range(1, length(path)).for(i =>
     val origin = path[i - 1]
     val destination = path[i]

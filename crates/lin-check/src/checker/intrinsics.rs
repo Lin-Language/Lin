@@ -194,8 +194,8 @@ impl Checker {
                 Type::TypeVar(9120),
                 Type::func(vec![], Type::TypeVar(9121)),
             ], Type::TypeVar(9121)));
-        // Shared<T> accessors (ADR-043 §2.3.1). The opaque Shared<T> type is modelled with a
-        // The opaque `Shared<T>` type (ADR-044): the four accessors below are the ONLY operations.
+        // Shared<T> accessors (ADR-028 §2.3.1). The opaque Shared<T> type is modelled with a
+        // The opaque `Shared<T>` type (ADR-029): the four accessors below are the ONLY operations.
         // `Shared<T>` is invariant and never auto-unwraps to `T`/`Json`, so any other op on it
         // (push, indexing, …) is a compile-time type error. Each accessor shares a single TypeVar
         // `T` between its `Shared<T>` and the bare `T`, so inference links the two.
@@ -215,7 +215,7 @@ impl Checker {
                 Type::func(vec![shared_t()], Type::TypeVar(9138)),
             ], Type::TypeVar(9138)));
         // frozen: <T>(T) => T  (deep immortal seal; the value keeps its plain type so readers use
-        // it transparently). Frozen<T> read-only coercion / mutation-inference is deferred (ADR-045).
+        // it transparently). Frozen<T> read-only coercion / mutation-inference is deferred (ADR-030).
         self.define_intrinsic("lin_freeze", Type::func(vec![Type::TypeVar(9140)], Type::TypeVar(9140)));
         // worker: ((Msg) => Reply, () => Null) => Worker
         self.define_intrinsic("lin_worker", Type::func(vec![
@@ -229,7 +229,7 @@ impl Checker {
         // worker.close(): (Worker) => Null
         self.define_intrinsic("lin_close", Type::func(vec![Type::TypeVar(9109)], Type::Null));
 
-        // Stream<T> — opaque, effectful, fallible pull-source (streams brief, ADR-072). These
+        // Stream<T> — opaque, effectful, fallible pull-source (streams brief, ADR-047). These
         // intrinsic signatures are the SOLE source of a `Stream<T>` type: `Stream` is not
         // spellable in source annotations (no `resolve.rs` case), so stdlib wrappers obtain it by
         // inference from these returns. Reading yields `T | Null | Error` (Null = EOF, the
@@ -293,7 +293,7 @@ impl Checker {
             Type::func(vec![any_stream()], any_stream()));
         // tar splitting (std/archive). `untar(s, body)` is a TERMINAL: it drives the whole archive on
         // the calling thread, calling `body(meta, data)` per entry where `meta` is an Object and
-        // `data` is a `Stream<UInt8[]>` SUB-STREAM (a legal stream PARAMETER position per ADR-075).
+        // `data` is a `Stream<UInt8[]>` SUB-STREAM (a legal stream PARAMETER position per ADR-049).
         // Returns `Null | Error`. The body's return is ignored, so it is typed `Json` (TypeVar(MAX)).
         // `manifest(s)`/`files(s)` are ADAPTERS returning a fresh `Stream` (of Objects). All three
         // CONSUME the parent stream (the affine move is type-based in the IR; the checker mirrors it

@@ -11,7 +11,7 @@ pub fn is_compatible(value_type: &Type, target_type: &Type) -> bool {
 /// Env-aware compatibility check that can unfold Named types one level.
 ///
 /// `lenient_json` controls the `Json` (`TypeVar(u32::MAX)`) → concrete-target direction
-/// (ADR-046). When `false` (user modules), a `Json` value is NOT assignable to a fully
+/// (ADR-045). When `false` (user modules), a `Json` value is NOT assignable to a fully
 /// concrete target — it must be decoded via `fromJson` or narrowed via `is`/`has`. When
 /// `true` (the trusted stdlib, whose wrappers forward `Json` handles into concrete
 /// intrinsic/foreign params by design), the old fully-permissive behaviour is kept.
@@ -71,7 +71,7 @@ pub fn is_compatible_env(
         // wildcard below, so a `Shared<T>` does NOT silently widen to `Json` (which would let it
         // flow into any `Json` parameter — e.g. `push(s, x)` — and defeat the accessor-only
         // guard). The only ops on a `Shared<T>` are the shared/get/set/withLock accessors, whose
-        // intrinsic signatures take `Shared<T>` explicitly (ADR-044). Inner `Json` (TypeVar MAX)
+        // intrinsic signatures take `Shared<T>` explicitly (ADR-029). Inner `Json` (TypeVar MAX)
         // still matches via the recursive call, so `shared`'s generic `T` binds normally.
         (Type::Shared(a), Type::Shared(b)) => is_compatible_env(a, b, env, lenient_json, depth),
         (Type::Shared(_), _) => false,
@@ -105,14 +105,14 @@ pub fn is_compatible_env(
         (Type::Stream(_), _) => false,
         (_, Type::Stream(_)) => false,
 
-        // Anything is assignable INTO Json (covariant sink): concrete T -> Json. (ADR-046)
+        // Anything is assignable INTO Json (covariant sink): concrete T -> Json. (ADR-045)
         // This INCLUDES a typed index-signature map `{ String: T }` -> Json: a `LinMap` widened to
         // `Json` is only ever read back through the tag-aware `lin_*_any` bridges (keys/values/
         // entries), which dispatch on the runtime tag, so the widening is representation-safe. This
         // arm must stay AHEAD of the `Json -> Map` rejection below so `keys(typedMap)` still works.
         (_, Type::TypeVar(n)) if *n == u32::MAX => true,
 
-        // `Json -> { String: T }` (index-signature map, ADR-082): REJECT in BOTH directions of
+        // `Json -> { String: T }` (index-signature map, ADR-055): REJECT in BOTH directions of
         // trust. A `Json` value's runtime payload is a `LinObject` (or any tag), NOT a `LinMap`;
         // relabelling it to the map type at the call boundary does not convert the representation,
         // so the callee then reads `LinObject` memory as a `LinMap` and corrupts it. There is
@@ -127,19 +127,19 @@ pub fn is_compatible_env(
         // Json -> a concrete structured Object (one with a required, non-nullable field):
         // this is the silent-unvalidated-decode hazard the cast-hole fix targets — e.g.
         // `val p: Person = readJson(...)`. Reject in user code; the value must be decoded
-        // via `fromJson` or narrowed via `is`/`has` (ADR-046). The trusted stdlib
+        // via `fromJson` or narrowed via `is`/`has` (ADR-045). The trusted stdlib
         // (lenient_json) keeps the old permissive behaviour. Json flowing into scalars,
         // arrays, opaque handles (`Int64`/`Int32`), buffers (`UInt8[]`), open objects (`{}`),
         // functions, iterators, or anything still containing a TypeVar stays permissive:
         // those are the language's pervasive handle/buffer/polymorphic-return patterns, not
-        // structured decodes (see ADR-046 for why the line is drawn at required-field objects).
+        // structured decodes (see ADR-045 for why the line is drawn at required-field objects).
         (Type::TypeVar(s), target) if *s == u32::MAX => {
             lenient_json || !requires_structured_decode(target, env, depth)
         }
         // Non-MAX inference / generic / intrinsic TypeVars stay bidirectionally permissive.
         (_, Type::TypeVar(_)) | (Type::TypeVar(_), _) => true,
 
-        // Singleton string-literal types (ADR-051). A `StrLit("x")` is a `String` at runtime;
+        // Singleton string-literal types (ADR-034). A `StrLit("x")` is a `String` at runtime;
         // these rules constrain only check-time assignability:
         //  1. two literals are compatible iff equal (unequal => reject; the equal case is also
         //     caught by the `value_type == target_type` fast path above, but the explicit arm
@@ -183,7 +183,7 @@ pub fn is_compatible_env(
         // INVARIANT (Stage 0.5): the `sealed` marker is IGNORED here — a sealed named-record type
         // and an unsealed anonymous type with the same fields remain mutually compatible, and a
         // wider Json is still assignable where a named type is expected. Compatibility is purely
-        // structural. See ADR-083 (sealed = representation-only; compat stays structural).
+        // structural. See ADR-057 (sealed = representation-only; compat stays structural).
         (Type::Object { fields: value_fields, .. }, Type::Object { fields: target_fields, .. }) => {
             target_fields.iter().all(|(key, target_ty)| {
                 match value_fields.get(key) {
@@ -249,7 +249,7 @@ pub fn is_compatible_env(
 
         // Index-signature map covariance (`{ String: U }` -> `{ String: T }` when U compat T).
         // A `Map` is its OWN thing — NOT structurally compatible with a fixed `Object` record in
-        // either direction (a value is one or the other; ADR-082). A non-`Map` value can only
+        // either direction (a value is one or the other; ADR-055). A non-`Map` value can only
         // flow into a `Map` target via the TypeVar/Json arms above (and `Json -> Map` is gated as a
         // structured decode in user code).
         (Type::Map(a), Type::Map(b)) => is_compatible_env(a, b, env, lenient_json, depth),
@@ -310,7 +310,7 @@ pub fn is_exact_match(value_type: &Type, target_type: &Type) -> bool {
 
 /// True when assigning a `Json` value into `target` would silently skip validation of a
 /// *structured object shape* — i.e. `target` is (or unfolds to) an `Object` with at least one
-/// required (non-nullable) field. This is the cast-hole hazard the ADR-046 fix targets:
+/// required (non-nullable) field. This is the cast-hole hazard the ADR-045 fix targets:
 /// `val p: Person = readJson(...)` where `Person = {name:String, age:Int32}`. An open object
 /// `{}` (the stdlib "any object" sink) and a fully-optional object impose no obligation, so
 /// they are NOT structured decodes. We deliberately do NOT treat scalar/array targets as
@@ -325,14 +325,14 @@ pub fn is_exact_match(value_type: &Type, target_type: &Type) -> bool {
 /// `is`-narrowing into a concrete branch (`if j is String then j else ""`, whose narrowed value
 /// is still statically `Json`). Those have no `fromJson` remedy and forcing one is hostile, so
 /// the gate is scoped to the genuine hazard — unchecked *structured object* decodes. See
-/// ADR-046 for the full empirical break list.
+/// ADR-045 for the full empirical break list.
 fn requires_structured_decode(target: &Type, env: Option<&TypeEnv>, depth: &mut usize) -> bool {
     if *depth > 32 {
         return false;
     }
     match target {
         Type::Object { fields, .. } => fields.values().any(|t| !includes_null(t)),
-        // A typed index-signature map (`{ String: T }`, ADR-082) is a structured decode target:
+        // A typed index-signature map (`{ String: T }`, ADR-055) is a structured decode target:
         // a raw `Json` must be decoded via `fromJson`/narrowing, never silently assigned (parity
         // with the §6.3 Json-conversion rule). NOTE: `Json -> Map` is now rejected unconditionally
         // by the dedicated `(TypeVar(MAX), Map) => false` arm in `is_compatible_env` (which fires

@@ -219,7 +219,7 @@ impl Parser {
 
     pub(crate) fn parse_is_has_expr(&mut self) -> Expr {
         let left = self.parse_shift_expr();
-        // Inside an inline match scrutinee (no Newline to bound it, ADR-004), a following
+        // Inside an inline match scrutinee (no Newline to bound it, ADR-003), a following
         // `is`/`has` begins the FIRST arm, not an infix type-test on the scrutinee — so skip it.
         if self.suppress_is_has {
             return left;
@@ -345,8 +345,8 @@ impl Parser {
                 // A `[`/`(` that opens a new source line is NOT a postfix index/call on the
                 // previous expression — it starts a new statement (e.g. a line-leading array
                 // literal returned from an inline lambda body). Inside `()`/`[]`/`{}` the line
-                // break is invisible as a token (ADR-004), so we rely on `at_line_start`. This
-                // mirrors the post-Dedent suppression for top-level blocks (ADR-011).
+                // break is invisible as a token (ADR-003), so we rely on `at_line_start`. This
+                // mirrors the post-Dedent suppression for top-level blocks (ADR-010).
                 TokenKind::LBracket if !after_block && !self.at_line_start() => {
                     let span = self.current_span();
                     self.advance(); // [
@@ -683,7 +683,7 @@ impl Parser {
     }
 
     /// Parse an `if` expression using `branch_col` as the exclusive offside floor for any
-    /// inline (no-Indent) then/else branch — i.e. inside `()`/`[]`/`{}` where ADR-004
+    /// inline (no-Indent) then/else branch — i.e. inside `()`/`[]`/`{}` where ADR-003
     /// suppresses Indent/Dedent. Statements indented past `branch_col` belong to the branch;
     /// the first statement at or before it ends the branch. An `else if` continuation is
     /// parsed with the SAME `branch_col` so the whole chain shares one offside anchor.
@@ -707,7 +707,7 @@ impl Parser {
             self.parse_block()   // consumes INDENT … DEDENT
         } else {
             // No Indent (inline / inside parens): collect the column-delimited then-block so a
-            // multi-statement then-branch isn't truncated to its first statement (the ADR-004
+            // multi-statement then-branch isn't truncated to its first statement (the ADR-003
             // newline-suppression bug). Single-line `if c then e` reads as a one-expr block.
             self.parse_branch_block(branch_col)
         };
@@ -751,7 +751,7 @@ impl Parser {
 
         let mut arms = Vec::new();
         if self.check(TokenKind::Indent) {
-            // Top-level / block-statement match: arms are an indented block (ADR-004 emits
+            // Top-level / block-statement match: arms are an indented block (ADR-003 emits
             // Indent/Dedent here). Unchanged from the original behaviour.
             self.advance();
             loop {
@@ -769,7 +769,7 @@ impl Parser {
                 self.advance();
             }
         } else {
-            // Inline / inside parens (ADR-004 suppresses Indent/Dedent/Newline). Use the
+            // Inline / inside parens (ADR-003 suppresses Indent/Dedent/Newline). Use the
             // offside rule: the arms all line up at one column (`arm_col`, taken from the first
             // arm's `is`/`has`/`else`/`when` keyword). An arm-starting keyword at exactly that
             // column is another arm; a token at a column < arm_col, or any non-arm token, ends

@@ -288,6 +288,19 @@ unsafe fn retain_tagged_payload(tv: &TaggedVal) {
             let m = payload as *mut crate::map::LinMap;
             if !m.is_null() && (*m).refcount < crate::string::IMMORTAL_RC { (*m).refcount += 1; }
         }
+        TAG_FUNCTION => {
+            // Closure refcount lives at offset 0 (u32). Mirror of the TAG_FUNCTION arm in
+            // release_tagged_payload (which calls lin_closure_release). Without this retain, a
+            // closure stored into an object/array field via the tagged-payload path was NOT
+            // refcounted by its new owner, so when the constructing frame released its own ref the
+            // closure (and its captured-var cell) was freed while the escaping object still held it
+            // — a use-after-free (segfault / garbage read on a captured var). See the object-literal
+            // -field closure-capture and worker-captured-var bugs.
+            let c = payload as *mut u32;
+            if !c.is_null() {
+                crate::memory::lin_rc_retain(c);
+            }
+        }
         TAG_SHARED => {
             // Atomic refcount on the Shared box (cross-thread-shared).
             crate::shared::lin_shared_retain_box(payload as *const u8);
@@ -306,7 +319,7 @@ pub unsafe fn retain_tagged_payload_pub(tv: &TaggedVal) {
 }
 
 /// Public wrapper for release_tagged_payload, used by map.rs (the typed-map container reuses the
-/// exact object value RC discipline; see ADR-082).
+/// exact object value RC discipline; see ADR-055).
 pub unsafe fn release_tagged_payload_pub(tv: &TaggedVal) {
     release_tagged_payload(tv);
 }
@@ -563,7 +576,7 @@ pub unsafe extern "C" fn lin_object_get_or_insert_array(obj: *const u8, key: *co
     }
     // A typed index-signature map `{ String: T[] }` is backed by `LinMap` (TAG_MAP), not
     // `LinObject`. Dispatch on the tag and route map values through the map intrinsics — without
-    // this branch, treating a `LinMap*` as a `LinObject*` corrupts memory (ADR-082). `groupBy`'s
+    // this branch, treating a `LinMap*` as a `LinObject*` corrupts memory (ADR-055). `groupBy`'s
     // result is map-typed, so this is the path it actually takes.
     if *obj == TAG_MAP {
         let lin_map = (*(obj as *const TaggedVal)).payload as *mut crate::map::LinMap;
@@ -910,7 +923,7 @@ pub unsafe extern "C" fn lin_object_release(obj: *mut LinObject) {
         return;
     }
     // Frozen (immortal) objects: saturated refcount, never freed/decremented (Frozen<T>,
-    // ADR-045). Guard makes retain/release no-ops so concurrent reads are race-free.
+    // ADR-030). Guard makes retain/release no-ops so concurrent reads are race-free.
     if (*obj).refcount >= crate::string::IMMORTAL_RC {
         return;
     }
@@ -919,30 +932,19 @@ pub unsafe extern "C" fn lin_object_release(obj: *mut LinObject) {
     debug_assert!((*obj).refcount > 0, "lin_object_release: refcount underflow (double free)");
     (*obj).refcount -= 1;
     if (*obj).refcount == 0 {
-        use crate::tagged::*;
         let len = (*obj).len as usize;
         for i in 0..len {
             let entry = (*obj).entries.add(i);
             // Keys are always owned LinString*.
             crate::string::lin_string_release((*entry).key);
-            // Values: release heap-typed payloads.
-            let tag = (*entry).value.tag;
-            let payload = (*entry).value.payload;
-            match tag {
-                TAG_STR => {
-                    crate::string::lin_string_release(payload as *mut crate::string::LinString);
-                }
-                TAG_ARRAY => {
-                    crate::array::lin_array_release(payload as *mut crate::array::LinArray);
-                }
-                TAG_OBJECT => {
-                    lin_object_release(payload as *mut LinObject);
-                }
-                TAG_FUNCTION => {
-                    crate::memory::lin_closure_release(payload as *mut u8);
-                }
-                _ => {} // scalars: no heap payload
-            }
+            // Values: release heap-typed payloads. Route through the canonical
+            // `release_tagged_payload` so EVERY tag is handled — this loop was a hand-rolled
+            // copy that omitted TAG_MAP (and TAG_SHARED/TAG_STREAM), so a `{ String: T }` map
+            // stored as an OBJECT/record FIELD (e.g. `ScanResults.bestArrivals`) was never
+            // released when the record dropped, leaking the whole map + its nested contents
+            // every time the record was discarded (the dominant RAPTOR per-scan leak). Using the
+            // shared helper keeps this in lockstep with the map/array value-walks permanently.
+            release_tagged_payload(&(*entry).value);
         }
         // Free the hash side-index (if built) BEFORE freeing the object header. The table
         // holds only u32 slot indices — no refcounted pointers — so there is nothing to
@@ -1142,7 +1144,7 @@ mod tests {
     }
 
     // Same get-or-insert-array contract, but over a TAG_MAP (`LinMap`) backing — the typed
-    // `{ String: T[] }` result that std/array.groupBy now produces (ADR-082). Without the TAG_MAP
+    // `{ String: T[] }` result that std/array.groupBy now produces (ADR-055). Without the TAG_MAP
     // branch in `lin_object_get_or_insert_array`, the map would be (mis)read as a `LinObject` and
     // corrupt memory; this guards that the map path inserts/looks-up/RC-balances correctly.
     #[test]

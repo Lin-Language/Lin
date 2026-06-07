@@ -46,11 +46,11 @@ val scan = (src: String, i: Int32, n: Int32, tokens: Token[]): Token[] =>
       scan(src, end, n, tokens)
     else if c == 40 then
       // '('
-      push(tokens, { "kind": "lparen" })
+      push(tokens, { "kind": "lparen", "text": "(" })
       scan(src, i + 1, n, tokens)
     else if c == 41 then
       // ')'
-      push(tokens, { "kind": "rparen" })
+      push(tokens, { "kind": "rparen", "text": ")" })
       scan(src, i + 1, n, tokens)
     else if c == 43 || c == 45 || c == 42 || c == 47 then
       // + - * /

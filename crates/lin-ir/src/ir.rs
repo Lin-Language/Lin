@@ -111,19 +111,19 @@ pub enum Intrinsic {
     /// HTTP server (`serve`, spec §25.5). `serve(handler, port)` → `lin_serve(h_fn, h_env,
     /// h_has, port)`. Blocks forever; the handler is invoked once per request.
     Serve,
-    // Shared<T> — opt-in shared mutable state (ADR-043 §2.3.1). shared(v) boxes a private copy;
+    // Shared<T> — opt-in shared mutable state (ADR-028 §2.3.1). shared(v) boxes a private copy;
     // get/set/withLock are the only accessors (copy out / copy in / locked in-place mutate).
     SharedNew,
     SharedGet,
     SharedSet,
     SharedWithLock,
-    // Frozen<T> — opt-in shared read-only state (ADR-043 §2.3.2): deep immortal seal of a graph.
+    // Frozen<T> — opt-in shared read-only state (ADR-028 §2.3.2): deep immortal seal of a graph.
     Freeze,
     Request,
     Message,
     Close,
     // Stream<T> — opaque, effectful, fallible pull-source owning an OS resource (streams brief,
-    // ADR-072). `StreamOpen` opens a file source → `Stream<UInt8[]> | Error`; `StreamRead` pulls
+    // ADR-047). `StreamOpen` opens a file source → `Stream<UInt8[]> | Error`; `StreamRead` pulls
     // the next chunk → `UInt8[] | Null | Error` (Null = EOF); `StreamClose` closes the resource
     // (idempotent). Dispatch is modelled on the `Shared*` family.
     StreamOpen,
@@ -188,7 +188,7 @@ pub enum Intrinsic {
     // `.promise()` (Stage 8): MOVE the pipeline onto a worker thread that drives it to EOF →
     // Promise<Null | Error>. The stream arg is moved (caller release suppressed).
     StreamPromise,
-    /// `fromJson` type-directed decode (ADR-047). Carries the resolved target `Type` T and the
+    /// `fromJson` type-directed decode (ADR-031). Carries the resolved target `Type` T and the
     /// resolved bodies of every reachable `Named` type (so codegen can build a recursive schema
     /// descriptor with no type environment). Runtime: `lin_from_json(value, descriptor) -> ptr`
     /// returns the input value retained (+1) on success, or a fresh `Error` object on the first
@@ -199,7 +199,7 @@ pub enum Intrinsic {
     },
 }
 
-/// How a closure env releases one captured slot when the closure is freed (ADR-060: owning
+/// How a closure env releases one captured slot when the closure is freed (ADR-041: owning
 /// captures). The env owns one reference per owning capture; `lin_closure_release` walks the
 /// emitted capture descriptor and applies the matching release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,7 +222,7 @@ pub enum CaptureRelease {
     /// struct as object entries (a heap-buffer-overflow). Deep-copied across threads by a flat
     /// byte copy (`transfer::CAP_SEALED`).
     Sealed,
-    /// MOVED resource capture (streams brief §9, ADR-072): a `Stream` (or `Stream | Error`) crosses
+    /// MOVED resource capture (streams brief §9, ADR-047): a `Stream` (or `Stream | Error`) crosses
     /// the thread boundary by MOVE, not copy. The pointer is handed off verbatim — NO clone on
     /// capture, NO retain — and the SOURCE must not release it (the affine check guarantees it is
     /// never touched again). The WORKER owns it and releases it (`lin_tagged_release`, whose
@@ -390,13 +390,21 @@ pub enum Instruction {
     ObjectRest { dst: Temp, src: Temp, src_ty: Type, exclude: Vec<String> },
     /// Store a top-level (module-level) non-function `val` into a per-slot LLVM global so
     /// closures can read it (they can't see `main`'s SSA temps). Emitted in `main`.
-    GlobalValSet { slot: usize, value: Temp, ty: Type },
+    ///
+    /// `immutable` is true for a top-level `val` (single static store) and false for a
+    /// top-level `var` (mutable, multiple stores). Codegen uses it to give an immutable
+    /// global's backing `_ir_gv_{slot}` LLVM `Internal` linkage, which lets LLVM GlobalOpt
+    /// prove a single-store-of-a-constant global is itself constant and fold reads of it
+    /// (e.g. a literal divisor `val MOD = …` becomes a magic multiply-shift instead of a
+    /// per-iteration `idiv`). See codegen `GlobalValSet`/`GlobalValGet`.
+    GlobalValSet { slot: usize, value: Temp, ty: Type, immutable: bool },
     /// dst = the module-global val for `slot` (load from its LLVM global). Used when a
     /// closure references a top-level val that is neither a parameter nor a capture.
-    GlobalValGet { dst: Temp, slot: usize, ty: Type },
+    /// `immutable`: see `GlobalValSet`.
+    GlobalValGet { dst: Temp, slot: usize, ty: Type, immutable: bool },
     /// dst = heap cell holding `init` (a `var` mutably captured by a closure). The cell
     /// pointer is shared by reference: closures capture it and read/write the live value
-    /// through CellGet/CellSet (ADR-015). `ty` is the stored value's type.
+    /// through CellGet/CellSet (ADR-012). `ty` is the stored value's type.
     MakeCell { dst: Temp, init: Temp, ty: Type },
     /// result = *cell  (load the current value of a captured `var` cell).
     CellGet { dst: Temp, cell: Temp, ty: Type },
@@ -437,7 +445,7 @@ pub enum Instruction {
     /// result = val has pattern? (returns bool)
     HasPattern { dst: Temp, val: Temp, pattern: HasDesc },
     /// result = `val` deeply conforms to `target`? (returns bool) — `is <ObjectType>` deep
-    /// type validation (ADR-054). Reuses the `fromJson` structural walker via
+    /// type validation (ADR-036). Reuses the `fromJson` structural walker via
     /// `lin_matches_schema(value, descriptor)`: codegen emits the same schema descriptor it
     /// builds for `Intrinsic::FromJson` (from `target` + the resolved `named_defs` bodies of
     /// reachable Named types) and calls the runtime to recursively validate field TYPES, not
@@ -452,6 +460,20 @@ pub enum Instruction {
     Box { dst: Temp, val: Temp, ty: Type },
     /// result = unbox(val, ty) — extract scalar from tagged union
     Unbox { dst: Temp, val: Temp, result_ty: Type },
+    /// KEEP-PACKED box (repr pass, Stage 4): wrap a STILL-PACKED `LinArray*` (elem_tag 0xFE) /
+    /// packed sealed struct* into a 16-byte `TaggedVal` (TAG_ARRAY / TAG_OBJECT) WITHOUT
+    /// materializing — O(1), no deep copy, no per-element retain. The box BORROWS the inner: only
+    /// the shell is a fresh +1; the inner's reference comes from the surrounding
+    /// `transfer_into_container`. `dst`'s repr is `Boxed(WrapsPacked(layout))`. Lowers to the
+    /// `box_array`-by-pointer path (boxing.rs) generalized to the 0xFE kind. `arr` is `true` for a
+    /// sealed ARRAY (TAG_ARRAY), `false` for a sealed RECORD (TAG_OBJECT). See ADR-062.
+    BoxKeepPacked { dst: Temp, src: Temp, ty: Type, arr: bool },
+    /// KEEP-PACKED unbox (repr pass, Stage 4): tag-check the `TaggedVal`, load the payload pointer as
+    /// the STILL-PACKED `LinArray*` / packed struct*, retain it (one shell +1). O(1), zero copy. The
+    /// dst is a `Packed(layout)` temp fed directly to `SealedArrayFieldGet` / packed `FieldGet` /
+    /// `Index`. Lowers to `unbox_ptr` + retain — now JUSTIFIED by the pass (the silent assumption
+    /// becomes a proven one). `ty` is the packed result type; `arr` distinguishes array vs record.
+    UnboxKeepPacked { dst: Temp, src: Temp, ty: Type, arr: bool },
     /// Bind a pattern variable: dst = source val.
     Bind { dst: Temp, src: Temp, ty: Type },
     /// Panic with a message string.
@@ -530,6 +552,11 @@ pub struct LinFunction {
     pub temp_count: u32,
     /// Intrinsic slot index → intrinsic name (inherited from TypedModule).
     pub intrinsic_slots: HashMap<usize, String>,
+    /// Per-temp physical representation table, indexed by `Temp.0` (`repr[t.0]` is temp `t`'s repr).
+    /// Empty until the representation-inference pass (`repr::run`) populates it; codegen reads it at
+    /// every packed-vs-boxed DECIDE / ASSUME site instead of re-deriving from the static `Type`.
+    /// See ADR-062 (`docs/DECISIONS.md`).
+    pub repr: Vec<crate::repr::Repr>,
 }
 
 impl LinFunction {
@@ -539,6 +566,17 @@ impl LinFunction {
 
     pub fn block(&self, id: BlockId) -> Option<&BasicBlock> {
         self.blocks.iter().find(|b| b.id == id)
+    }
+
+    /// The physical representation of temp `t` (Stage 3: codegen's single source of truth at every
+    /// packed-vs-boxed DECIDE / ASSUME site). Fails safe to `Boxed(Opaque)` if the table is empty
+    /// (pass not run / synthetic function) or `t` is out of range, exactly mirroring the analysis's
+    /// own fail-safe so an un-analyzed temp is never mistakenly treated as packed.
+    pub fn repr_of(&self, t: Temp) -> crate::repr::Repr {
+        self.repr
+            .get(t.0 as usize)
+            .cloned()
+            .unwrap_or_else(crate::repr::Repr::boxed_opaque)
     }
 }
 

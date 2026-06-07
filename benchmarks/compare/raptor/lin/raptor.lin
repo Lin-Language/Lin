@@ -17,7 +17,7 @@ import { createScanResults, addRound, previousArrival, setTrip, setTransfer, bes
 val DEFAULT_INTERCHANGE_TIME = 0
 val OVERTAKING_ROUTE_SUFFIX = "overtakes"
 
-// Scalar `Int32 | Null` coalescer (positive `is Int32` match-arm idiom; ADR-082 §5.1.1). The
+// Scalar `Int32 | Null` coalescer (positive `is Int32` match-arm idiom; ADR-055 §5.1.1). The
 // single-level `m[k] ?? default` reads that originate from a bare `{ String: T }` map now use
 // `std/object.get` directly. This helper is RETAINED for the two reads `object.get` cannot
 // express:

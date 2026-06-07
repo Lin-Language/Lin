@@ -81,7 +81,7 @@ pub struct Codegen<'ctx> {
     /// concurrency intrinsics). When set, user-emitted Lin functions are NOT marked
     /// `nounwind`: a runtime fault inside an async thunk unwinds through Lin frames to the
     /// thread boundary's `catch_unwind` (spec §24.2.2), so `nounwind` would be unsound on
-    /// any function reachable from a thunk — and any function can be (ADR-042, doc §2.4.3
+    /// any function reachable from a thunk — and any function can be (ADR-027, doc §2.4.3
     /// option a). Conservatively program-wide; the non-async hot path keeps `nounwind`.
     uses_async: bool,
 }
@@ -197,7 +197,7 @@ impl<'ctx> Codegen<'ctx> {
         module: &TypedModule,
         src: Option<&(String, String)>,
         imports: &HashMap<String, TypedModule>,
-        // ADR-071: export names of THIS module that a test `replace` overrides. Their bodies are
+        // ADR-046: export names of THIS module that a test `replace` overrides. Their bodies are
         // not emitted here; the main module supplies the canonical symbol instead.
         replaced_exports: &std::collections::HashSet<String>,
     ) {
@@ -213,6 +213,10 @@ impl<'ctx> Codegen<'ctx> {
         // type-erased call that crashes a concrete use site.
         let mut ir_module =
             lin_ir::lower_import_module_with_imports(module, &module_key, imports, replaced_exports);
+        // Representation-inference pass (repr.rs) — STAGE 3; runs before rc_elide on the same IR
+        // shape as the main module. Stores the per-temp repr table on each `func.repr` for codegen
+        // to consume at DECIDE / ASSUME sites, and (debug builds) asserts the oracle + verifier.
+        lin_ir::repr::run(&mut ir_module);
         lin_ir::rc_elide::elide_rc(&mut ir_module);
         // Sealed-records Stage 4: stack-allocate non-escaping all-scalar sealed records and suppress
         // their Retain/Release emission (imports get the same analysis as the main module).
@@ -242,7 +246,7 @@ impl<'ctx> Codegen<'ctx> {
         // `imported_val_wrappers[(path, name)]` zero-arg wrapper.
         for stmt in &module.statements {
             if let TypedStmt::Val { value, name: Some(name), .. } = stmt {
-                // ADR-071: a replaced export's symbol is defined by the main module, not here;
+                // ADR-046: a replaced export's symbol is defined by the main module, not here;
                 // it's registered when the main module compiles. Skip it.
                 if replaced_exports.contains(name) {
                     continue;
@@ -498,6 +502,38 @@ impl<'ctx> Codegen<'ctx> {
     // LinIR-consuming codegen (Phase 3)
     // =========================================================================
 
+    /// Create the `_ir_gv_{slot}` LLVM global backing a top-level `val`/`var` slot.
+    ///
+    /// These globals are inherently translation-unit-local: nothing references them by name
+    /// across modules. Cross-module reads of an exported `val` go through a `__val` wrapper
+    /// FUNCTION (lower.rs), and an imported `var` is only read inside its own module's exported
+    /// functions — never by the importer directly. Even though all modules share one LLVM module
+    /// (and `_ir_gv_{slot}` names aren't module-prefixed, so two modules can both define slot N),
+    /// each `compile_module_from_ir` call keeps its OWN `ir_global_vals` handle map and accesses
+    /// the global by handle; LLVM auto-disambiguates the colliding names. So the slots are private
+    /// to the defining TU regardless of linkage.
+    ///
+    /// `immutable` (a top-level `val`, single-store) → `Internal` linkage. Internal linkage lets
+    /// LLVM GlobalOpt prove a single-store-of-a-constant global is itself constant and propagate
+    /// it into readers (e.g. a literal divisor `val MOD = 2147483647i64` folds from a per-iteration
+    /// `idiv` to a magic multiply-shift). A non-`immutable` top-level `var` keeps the previous
+    /// (external/default) linkage: it is genuine mutable shared state, GlobalOpt would not fold a
+    /// multi-store global anyway, and (crucially) the once-guarded var-init flag must NOT be folded
+    /// to a constant or initialisers would never run. We therefore intern ONLY immutable vals.
+    fn add_module_global(
+        module: &inkwell::module::Module<'ctx>,
+        llvm_ty: inkwell::types::BasicTypeEnum<'ctx>,
+        slot: usize,
+        immutable: bool,
+    ) -> inkwell::values::GlobalValue<'ctx> {
+        let g = module.add_global(llvm_ty, None, &format!("_ir_gv_{}", slot));
+        g.set_initializer(&llvm_ty.const_zero());
+        if immutable {
+            g.set_linkage(inkwell::module::Linkage::Internal);
+        }
+        g
+    }
+
     /// Compile a `LinModule` (produced by `lin_ir::lower_module` + `elide_rc`) to LLVM IR.
     /// This is the sole compilation backend (the legacy TypedAST path has been removed).
     pub fn compile_module_from_ir(&mut self, module: &lir::LinModule) {
@@ -635,6 +671,15 @@ impl<'ctx> Codegen<'ctx> {
             // function's first IR block (the loop header) instead of recursing on the stack.
             let has_tail_call = func.blocks.iter().any(|b| matches!(b.terminator, Terminator::TailCall { .. }));
             let mut param_allocs: Vec<PointerValue<'ctx>> = Vec::new();
+            // Per owned param: a bool slot tracking whether the CURRENT value in `param_allocs[i]`
+            // is owned by the TCO loop (i.e. it was produced and stored by a prior tail iteration)
+            // rather than borrowed from the caller. Params are BORROWED under Lin's calling
+            // convention (the lowerer never releases them — see lin_ir::lower `free_arg_box_shells`
+            // doc), so the original ENTRY value must NOT be released here (the caller owns and frees
+            // it; doing so is a use-after-free at the caller). Only values the loop itself stored on
+            // a back-edge are loop-owned and must be released before the next overwrite. We start
+            // each flag at 0 (entry value = borrowed) and set it to 1 after the first back-edge store.
+            let mut tco_owns: Vec<Option<PointerValue<'ctx>>> = Vec::new();
             if has_tail_call {
                 // Emit allocas + initial stores in a dedicated entry block that branches to
                 // the first IR block (which becomes the loop header).
@@ -644,6 +689,7 @@ impl<'ctx> Codegen<'ctx> {
                     tco_entry.move_before(*first_ir_bb).ok();
                 }
                 self.builder.position_at_end(tco_entry);
+                let bool_ty = self.context.bool_type();
                 for (i, (_temp, ty)) in func.params.iter().enumerate() {
                     let llvm_ty = self.llvm_type(ty);
                     let slot = self.builder.alloca(llvm_ty, "tco_param");
@@ -651,6 +697,14 @@ impl<'ctx> Codegen<'ctx> {
                         self.builder.store(slot, pv);
                     }
                     param_allocs.push(slot);
+                    // Only owned/refcounted (and non-sealed) params can leak / need release tracking.
+                    if Self::tco_param_needs_release(ty) {
+                        let owns = self.builder.alloca(bool_ty, "tco_owns");
+                        self.builder.store(owns, bool_ty.const_zero());
+                        tco_owns.push(Some(owns));
+                    } else {
+                        tco_owns.push(None);
+                    }
                 }
                 if let Some(first_ir_bb) = func.blocks.first().and_then(|b| ir_block_to_llvm.get(&b.id)) {
                     self.builder.unconditional_branch(*first_ir_bb);
@@ -806,7 +860,9 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::Release { val, ty } => {
                             if let Some(&v) = temp_map.get(val) {
-                                self.emit_release(v, ty);
+                                // PART C: release shape from the pass-proven representation, not Type.
+                                let repr = func.repr_of(*val).clone();
+                                self.emit_release_repr(v, ty, &repr);
                             }
                         }
                         Instruction::CloneBox { dst, src, ty } => {
@@ -846,13 +902,31 @@ impl<'ctx> Codegen<'ctx> {
                             }
                         }
                         Instruction::FreeBoxShellIfDistinct { val, other } => {
-                            if let (Some(&v), Some(&o)) = (temp_map.get(val), temp_map.get(other)) {
-                                if v.is_pointer_value() && o.is_pointer_value() {
-                                    let free_fn = self.get_or_declare_fn(
-                                        "lin_tagged_free_box_if_distinct",
-                                        self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
-                                    );
-                                    self.builder.call(free_fn, &[v.into(), o.into()], "");
+                            if let Some(&v) = temp_map.get(val) {
+                                if v.is_pointer_value() {
+                                    match temp_map.get(other) {
+                                        // `other` is also a pointer: the call result may ALIAS this
+                                        // shell (a callee returning its borrowed Json param), so guard.
+                                        Some(&o) if o.is_pointer_value() => {
+                                            let free_fn = self.get_or_declare_fn(
+                                                "lin_tagged_free_box_if_distinct",
+                                                self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false),
+                                            );
+                                            self.builder.call(free_fn, &[v.into(), o.into()], "");
+                                        }
+                                        // `other` (the call result) is a SCALAR/Null/non-pointer: it
+                                        // can never alias the box shell, so free unconditionally.
+                                        // (Previously this silently skipped the free → shell leak when
+                                        // a fresh heap literal was boxed into a Json param of a function
+                                        // returning a scalar — e.g. `f([1,2,3]): Int32`.)
+                                        _ => {
+                                            let free_fn = self.get_or_declare_fn(
+                                                "lin_tagged_free_box",
+                                                self.context.void_type().fn_type(&[ptr_ty.into()], false),
+                                            );
+                                            self.builder.call(free_fn, &[v.into()], "");
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -888,7 +962,7 @@ impl<'ctx> Codegen<'ctx> {
                                     }
                                 }
                                 CallTarget::Named(name) if name == "lin_string_byte_at" && arg_vals.len() == 2 => {
-                                    // INLINE the O(1) byte accessor (mirrors flat_array_get, ADR-069):
+                                    // INLINE the O(1) byte accessor (mirrors flat_array_get, ADR-044):
                                     // lin_string_byte_at is a hot per-byte call in Lin-side string
                                     // scanning. The runtime fn is a non-inlinable staticlib call; emit
                                     // the bounds-checked indexed load inline so LLVM keeps the string
@@ -1130,11 +1204,16 @@ impl<'ctx> Codegen<'ctx> {
                                 .iter()
                                 .map(|a| func.temp_types.get(a).cloned().unwrap_or(Type::Null))
                                 .collect();
-                            let result = self.compile_ir_intrinsic(intrinsic, &arg_vals, &arg_tys, ret_ty);
+                            // STAGE 3: the per-operand physical representation (from `func.repr`) so
+                            // repr-deciding intrinsics (Push) dispatch on the proven repr instead of
+                            // re-deriving from the static type.
+                            let arg_reprs: Vec<lin_ir::repr::Repr> =
+                                args.iter().map(|a| func.repr_of(*a)).collect();
+                            let result = self.compile_ir_intrinsic(intrinsic, &arg_vals, &arg_tys, &arg_reprs, ret_ty);
                             temp_map.insert(*dst, result);
                         }
                         Instruction::MakeObject { dst, fields, spreads, ty, stack } => {
-                            // Typed index-signature map `{ String: T }` (ADR-082): allocate a hashed
+                            // Typed index-signature map `{ String: T }` (ADR-055): allocate a hashed
                             // `LinMap` and set each literal field via `lin_map_set` (key = interned
                             // LinString, value = boxed TaggedVal). The checker only produces a
                             // `Type::Map` MakeObject for spread-free string-keyed literals (incl. the
@@ -1148,7 +1227,7 @@ impl<'ctx> Codegen<'ctx> {
                                     if let Some(&val) = temp_map.get(val_temp) {
                                         let key_str = self.compile_string_lit(key).into_pointer_value();
                                         let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
-                                        // Flat-scalar `T` (ADR-082 follow-up): store the scalar UNBOXED
+                                        // Flat-scalar `T` (ADR-055 follow-up): store the scalar UNBOXED
                                         // via a stack TaggedVal carrying `T`'s tag/payload, widening a
                                         // narrower literal value to `T` first. No heap box, no RC.
                                         let tagged = if Self::is_flat_scalar(elem_ty.as_ref()) {
@@ -1188,10 +1267,57 @@ impl<'ctx> Codegen<'ctx> {
                             // retains heap fields it stores verbatim, and folds in any
                             // representation-changing coerce (e.g. an unsealed `{x,y}` literal into a
                             // nested sealed `Pt` field) as fresh-owned automatically.
-                            if let Some(sf) = Self::sealed_scalar_fields(ty) {
-                                let all_present = spreads.is_empty()
-                                    && sf.keys().all(|k| fields.iter().any(|(fk, _)| fk == k));
-                                if all_present {
+                            // STAGE 3: the packed-vs-boxed decision is read from `func.repr` (the
+                            // representation-inference pass already folded in the `sealed_scalar_fields`
+                            // gate AND the no-spread/all-present check via `make_object_repr`). When the
+                            // pass labelled this temp `Packed(PackedStruct)`, construct the packed struct;
+                            // otherwise fall through to the boxed `LinObject` path. (Oracle-proven byte
+                            // identical to the former `sealed_scalar_fields(ty) && all_present` gate.)
+                            let repr = func.repr_of(*dst);
+                            // UNBOXED SUM TYPE (unboxed-sumtype Stage 1): when the pass labelled this
+                            // temp `Packed(SumNode)`, construct a `SumNode` directly — store the
+                            // inline variant tag + each scalar payload field by offset (no string keys,
+                            // no box). The variant is identified by the literal's discriminant value,
+                            // which is the `StrLit` static type of the discriminant field's temp.
+                            //
+                            // NOTE: currently INERT — `repr::type_seed`/`make_object_repr` do not yet
+                            // emit `Packed(SumNode)` (the seed is gated off pending the call ABI), so
+                            // this branch is never taken on the present corpus. It is the wired
+                            // construct site the ABI follow-up flips on by enabling the seed.
+                            if let Some(sum_ty) = repr.sumnode_sum_ty() {
+                                let sum_ty = sum_ty.clone();
+                                if let Some(disc_key) = Self::sum_type_discriminant(&sum_ty) {
+                                    // Find the discriminant value from the literal field's StrLit type.
+                                    let disc_val = fields.iter().find_map(|(k, t)| {
+                                        if k == &disc_key {
+                                            match func.temp_types.get(t) {
+                                                Some(Type::StrLit(s)) => Some(s.clone()),
+                                                _ => None,
+                                            }
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    if let Some(disc_val) = disc_val {
+                                        let field_vals: Vec<(String, BasicValueEnum<'ctx>, Type)> = fields
+                                            .iter()
+                                            .filter_map(|(k, t)| {
+                                                temp_map.get(t).map(|v| {
+                                                    let vty = func.temp_types.get(t).cloned().unwrap_or(Type::Null);
+                                                    (k.clone(), *v, vty)
+                                                })
+                                            })
+                                            .collect();
+                                        let node = self.sumnode_construct(&sum_ty, &disc_val, &field_vals);
+                                        temp_map.insert(*dst, node);
+                                        continue;
+                                    }
+                                }
+                                // Fall through to the boxed path if the discriminant could not be
+                                // resolved statically (fail-safe — should not happen for a sum literal).
+                            }
+                            if let Some(sf) = repr.packed_struct_fields() {
+                                {
                                     let field_vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> = fields.iter().filter_map(|(k, t)| {
                                         temp_map.get(t).map(|v| {
                                             let vty = func.temp_types.get(t).cloned().unwrap_or(Type::Null);
@@ -1402,25 +1528,40 @@ impl<'ctx> Codegen<'ctx> {
                             // elements. Allocate via lin_sealed_array_alloc(cap, stride, desc) and
                             // copy each element struct's field payload into the buffer (scalar
                             // fields → no retain). `elem_ty` is the sealed Object type.
-                            let arr = if let Some(fields) = Self::sealed_fields(elem_ty)
-                                .filter(|f| f.values().all(Self::is_sealed_scalar_field))
-                            {
+                            // STAGE 3: the packed-sealed-array decision comes from `func.repr` (the
+                            // pass's `make_array_repr` already applied the `sealed_array_elem` gate —
+                            // sealed element with all-packable fields). The flat-scalar-vs-boxed split
+                            // below is the ORTHOGONAL pre-existing flat-array path (assume sites dispatch
+                            // on the array TYPE), which repr does not own, so it stays type-driven.
+                            let arr_repr = func.repr_of(*dst);
+                            let arr = if let Some(fields) = arr_repr.packed_sealed_array_layout() {
                                 let fields = fields.clone();
                                 let stride = Self::sealed_array_stride(&fields);
                                 let desc = self.sealed_descriptor(&fields); // NULL for scalar-only
+                                let has_heap = fields.values().any(|t| Self::sealed_field_kind(t).is_some());
                                 let alloc_fn = self.get_or_declare_fn(
                                     "lin_sealed_array_alloc",
                                     ptr_ty.fn_type(&[i64_ty.into(), i64_ty.into(), ptr_ty.into()], false));
                                 let arr_v = self.builder.call(alloc_fn,
                                     &[cap.into(), i64_ty.const_int(stride, false).into(), desc.into()],
                                     "ir_sarr").try_as_basic_value().unwrap_basic();
+                                // Construct: each element struct `ev` is a BORROWED standalone struct
+                                // (owned by its own temp, released at this scope's exit). A heap-field
+                                // array must take its OWN +1 on every heap field as it copies the
+                                // payload into the slot (`..._retaining`) — else the array's
+                                // release-on-drop would double-free the still-borrowed inner. A
+                                // scalar-only record has no heap field, so the plain payload copy
+                                // (NULL desc → retaining push is a no-op for fields) is identical.
+                                let push_name = if has_heap {
+                                    "lin_sealed_array_push_struct_retaining"
+                                } else {
+                                    "lin_sealed_array_push_struct"
+                                };
                                 let push_fn = self.get_or_declare_fn(
-                                    "lin_sealed_array_push_struct",
+                                    push_name,
                                     self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                                 for e_temp in elements {
                                     if let Some(&ev) = temp_map.get(e_temp) {
-                                        // Copy the element struct's payload (skipping its header);
-                                        // scalar fields, so a verbatim byte copy is a full copy.
                                         self.builder.call(push_fn, &[arr_v.into(), ev.into()], "");
                                     }
                                 }
@@ -1494,7 +1635,7 @@ impl<'ctx> Codegen<'ctx> {
                                         .iter()
                                         .filter_map(|c| temp_map.get(c).copied())
                                         .collect();
-                                    // Per-capture release kinds (ADR-060 owning captures). The env
+                                    // Per-capture release kinds (ADR-041 owning captures). The env
                                     // OWNS one reference per owning capture, so the capture
                                     // descriptor is ALWAYS emitted: `lin_closure_release` walks it
                                     // to release heap captures on free, and the async transfer path
@@ -1541,7 +1682,8 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::Index { dst, object, key, obj_ty, key_ty, result_ty } => {
                             if let (Some(&obj_v), Some(&key_v)) = (temp_map.get(object), temp_map.get(key)) {
-                                let result = self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty);
+                                let obj_repr = func.repr_of(*object);
+                                let result = self.compile_ir_index(obj_v, key_v, obj_ty, key_ty, result_ty, &obj_repr);
                                 temp_map.insert(*dst, result);
                             }
                         }
@@ -1549,18 +1691,21 @@ impl<'ctx> Codegen<'ctx> {
                             if let (Some(&obj_v), Some(&key_v), Some(&val_v)) =
                                 (temp_map.get(object), temp_map.get(key), temp_map.get(value))
                             {
-                                self.compile_ir_index_set(obj_v, key_v, val_v, obj_ty, key_ty, val_ty);
+                                let val_repr = func.repr_of(*value);
+                                self.compile_ir_index_set(obj_v, key_v, val_v, obj_ty, key_ty, val_ty, &val_repr);
                             }
                         }
                         Instruction::FieldGet { dst, object, field, obj_ty, result_ty } => {
                             if let Some(&obj_v) = temp_map.get(object) {
-                                let result = self.compile_ir_field_get(obj_v, field, obj_ty, result_ty);
+                                let obj_repr = func.repr_of(*object);
+                                let result = self.compile_ir_field_get(obj_v, field, obj_ty, result_ty, &obj_repr);
                                 temp_map.insert(*dst, result);
                             }
                         }
                         Instruction::SealedArrayFieldGet { dst, array, index, field, arr_ty, result_ty } => {
                             if let (Some(&arr_v), Some(&idx_v)) = (temp_map.get(array), temp_map.get(index)) {
-                                let result = self.compile_ir_sealed_array_field_get(arr_v, idx_v, field, arr_ty, result_ty);
+                                let arr_repr = func.repr_of(*array);
+                                let result = self.compile_ir_sealed_array_field_get(arr_v, idx_v, field, arr_ty, result_ty, &arr_repr);
                                 temp_map.insert(*dst, result);
                             }
                         }
@@ -1608,13 +1753,11 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, result);
                             }
                         }
-                        Instruction::GlobalValSet { slot, value, ty } => {
+                        Instruction::GlobalValSet { slot, value, ty, immutable } => {
                             if let Some(&v) = temp_map.get(value) {
                                 let llvm_ty = self.llvm_type(ty);
                                 let glob = *ir_global_vals.entry(*slot).or_insert_with(|| {
-                                    let g = self.module.add_global(llvm_ty, None, &format!("_ir_gv_{}", slot));
-                                    g.set_initializer(&llvm_ty.const_zero());
-                                    g
+                                    Self::add_module_global(&self.module, llvm_ty, *slot, *immutable)
                                 });
                                 // A top-level `var` global owns one reference to its current
                                 // value. On reassignment its previous reference must be dropped,
@@ -1634,12 +1777,10 @@ impl<'ctx> Codegen<'ctx> {
                                 self.builder.store(glob.as_pointer_value(), v);
                             }
                         }
-                        Instruction::GlobalValGet { dst, slot, ty } => {
+                        Instruction::GlobalValGet { dst, slot, ty, immutable } => {
                             let llvm_ty = self.llvm_type(ty);
                             let glob = *ir_global_vals.entry(*slot).or_insert_with(|| {
-                                let g = self.module.add_global(llvm_ty, None, &format!("_ir_gv_{}", slot));
-                                g.set_initializer(&llvm_ty.const_zero());
-                                g
+                                Self::add_module_global(&self.module, llvm_ty, *slot, *immutable)
                             });
                             let v = self.builder.load(llvm_ty, glob.as_pointer_value(), "ir_gvget");
                             temp_map.insert(*dst, v);
@@ -1787,6 +1928,18 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, result);
                             }
                         }
+                        Instruction::BoxKeepPacked { dst, src, arr, .. } => {
+                            if let Some(&v) = temp_map.get(src) {
+                                let result = self.compile_ir_box_keep_packed(v, *arr);
+                                temp_map.insert(*dst, result);
+                            }
+                        }
+                        Instruction::UnboxKeepPacked { dst, src, arr, .. } => {
+                            if let Some(&v) = temp_map.get(src) {
+                                let result = self.compile_ir_unbox_keep_packed(v, *arr);
+                                temp_map.insert(*dst, result);
+                            }
+                        }
                         Instruction::Unary { dst, op, operand, ty } => {
                             if let Some(&v) = temp_map.get(operand) {
                                 let result = self.compile_ir_unary(v, op, ty);
@@ -1833,9 +1986,68 @@ impl<'ctx> Codegen<'ctx> {
                     Terminator::TailCall { args } => {
                         // TCO: store the new argument values into the param allocas and
                         // branch back to the loop header (the function's first IR block).
-                        for (i, arg_temp) in args.iter().enumerate() {
-                            if let (Some(&v), Some(slot)) = (temp_map.get(arg_temp), param_allocs.get(i)) {
+                        //
+                        // Per-iteration owned-value release (fixes the dominant TCO loop leak):
+                        // each owned (refcounted) param slot holds a reference that the function
+                        // owns under the calling convention. Storing the next iteration's value
+                        // OVER it without releasing the OLD value leaks one reference every
+                        // iteration — e.g. a tail-recursive function whose recurring arg is a
+                        // FRESH array/object/string/map/union built each round (RAPTOR's
+                        // `scanRounds`/`getMarkedStops`). The scope-exit release the lowerer emits
+                        // for these lands in the unreachable `tco_post` block (the back-edge means
+                        // scope exit is never reached), so it never runs. Release the old value
+                        // here instead.
+                        //
+                        // ALIAS HAZARD: the new value for a slot may BE the old value (a
+                        // pass-through param threaded unchanged, e.g. a large borrowed `raptor`
+                        // arg) or some OTHER new arg may alias this slot's old value. Releasing an
+                        // old pointer that any new arg still references is a use-after-free /
+                        // double-free. Guard with a runtime pointer compare: release `old_i` only
+                        // if it differs from EVERY new arg value being stored this iteration.
+                        //
+                        // Capture every new value FIRST (they are already computed in temp_map),
+                        // then load+conditionally-release each owned old value, then store. We do
+                        // the release before the store so the slot still holds the old value when
+                        // we load it; loads happen for all slots up front so a later store can't
+                        // clobber an earlier old-value load.
+                        let new_vals: Vec<Option<BasicValueEnum<'ctx>>> =
+                            args.iter().map(|t| temp_map.get(t).copied()).collect();
+                        // Pointer-typed new values that an old value could alias (skip non-pointers).
+                        let new_ptrs: Vec<inkwell::values::PointerValue<'ctx>> = new_vals
+                            .iter()
+                            .filter_map(|v| v.and_then(|v| if v.is_pointer_value() { Some(v.into_pointer_value()) } else { None }))
+                            .collect();
+                        // Load all old values before storing any new value (a later store must not
+                        // clobber an earlier old-value load when params share no slot, but be safe).
+                        let mut old_vals: Vec<Option<BasicValueEnum<'ctx>>> = Vec::with_capacity(param_allocs.len());
+                        for (i, (_t, ty)) in func.params.iter().enumerate() {
+                            if tco_owns.get(i).copied().flatten().is_some() && param_allocs.get(i).is_some() {
+                                let llvm_ty = self.llvm_type(ty);
+                                old_vals.push(Some(self.builder.load(llvm_ty, param_allocs[i], "tco_old")));
+                            } else {
+                                old_vals.push(None);
+                            }
+                        }
+                        // Conditionally release each LOOP-OWNED old value (guarded against aliasing).
+                        // Only release when this slot's value was stored by a prior tail iteration
+                        // (`tco_owns[i]` is true) — never the borrowed entry param — AND the old
+                        // pointer differs from every new arg value being stored this iteration.
+                        for (i, (_t, ty)) in func.params.iter().enumerate() {
+                            if let (Some(old), Some(Some(owns))) = (old_vals[i], tco_owns.get(i)) {
+                                if old.is_pointer_value() {
+                                    self.emit_tco_release_old(llvm_fn, *owns, old.into_pointer_value(), &new_ptrs, ty);
+                                }
+                            }
+                        }
+                        // Now store the new values, and mark every owned slot as loop-owned (the
+                        // value we just stored was produced by this iteration's body).
+                        let bool_ty = self.context.bool_type();
+                        for (i, &v) in new_vals.iter().enumerate() {
+                            if let (Some(v), Some(slot)) = (v, param_allocs.get(i)) {
                                 self.builder.store(*slot, v);
+                            }
+                            if let Some(Some(owns)) = tco_owns.get(i) {
+                                self.builder.store(*owns, bool_ty.const_int(1, false));
                             }
                         }
                         if let Some(first_ir_bb) = func.blocks.first().and_then(|b| ir_block_to_llvm.get(&b.id)) {

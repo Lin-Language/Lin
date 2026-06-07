@@ -74,7 +74,7 @@ impl<'ctx> Codegen<'ctx> {
         all_present
     }
 
-    /// `is <ObjectType>` deep type validation (ADR-054). Emits the SAME schema descriptor the
+    /// `is <ObjectType>` deep type validation (ADR-036). Emits the SAME schema descriptor the
     /// `fromJson` path builds (`emit_from_json_descriptor`) and calls `lin_matches_schema(value,
     /// descriptor)`, which runs the `fromJson` structural walker and returns an `i8` bool (`1` iff
     /// `val` recursively conforms to `target`). `val` is a boxed `TaggedVal*`, borrowed (no
@@ -156,6 +156,14 @@ impl<'ctx> Codegen<'ctx> {
             }
             return val;
         }
+        // NOTE (unboxed-sumtype Stage 1): the sum-type Coerce boundaries (sum→variant projection,
+        // sum→Json materialize, Json→sum reconstruction) are implemented as codegen helpers
+        // (`sumnode_project_to_sealed` / `sumnode_materialize_to_object` / `sumnode_project_from_boxed`)
+        // but are NOT yet wired in here, because they must dispatch on the operand's REPR (proof the
+        // value is physically a SumNode), not its TYPE — a tagged union's `Type` is `is_sum_type` true
+        // even while its runtime repr is still boxed (the seed is inert pending the ABI; see
+        // `repr::type_seed`). Gating on type here would route an existing boxed union through the
+        // SumNode reader → UAF. Re-enable together with the repr seed + call ABI.
         // ── Sealed scalar-record boundaries (sealed-records Stage 1) ──────────────────────
         // Order matters: handle sealed→X and X→sealed BEFORE the generic union arms, because a
         // sealed Object is not `is_union_type` but DOES need a representation conversion.
@@ -201,6 +209,33 @@ impl<'ctx> Codegen<'ctx> {
                 return self.box_value(tagged, &Type::Array(Box::new(Type::object(Default::default()))));
             }
             return tagged;
+        }
+        // ── NESTED sealed-record array (Problem A / Stage 3b) ────────────────────────────────
+        // A combinator returning a NESTED sealed structure — `partition: T[][]`, `groupBy: {String:
+        // T[]}` (its map values), `chunk: T[][]` — routes through the type-erased boxed fallback,
+        // so the boxed `Json` result must be re-projected into the sealed `to_ty`. The one-level
+        // sealed-array arms above only fire when `to_ty` IS the sealed array; for an OUTER array
+        // whose ELEMENTS contain a sealed array (or sealed record), recurse element-wise: rebuild a
+        // tagged outer array, coercing each element from its boxed view into the inner sealed
+        // representation. Without this the boxed inner `Json[]` is read as a packed `Pt[]` →
+        // misaligned deref / double-free (the `partition`/`groupBy` crash).
+        // Gate strictly on a REPRESENTATION CHANGE: only when the source's inner element is a BOXED
+        // view (a Json/union/TypeVar — the type-erased boxed-fallback result) while `inner_to` is a
+        // concrete sealed-containing structure. A verbatim same-representation array (e.g. building a
+        // `Neighbor[]` literal, both sides boxed `Object[]`) must NOT be rebuilt — that would re-project
+        // every element through the Json view and corrupt counts (observed: dijkstra `buildAdj`).
+        if let (Type::Array(inner_to), Type::Array(inner_from)) = (to_ty, from_ty) {
+            // Fire only when `inner_to` contains a sealed (packed) structure AND `inner_from` is NOT
+            // that SAME packed representation — i.e. a genuine boxed→packed re-projection. A verbatim
+            // same-representation array (a `Neighbor[]` literal: `inner_from == inner_to`) is a pointer
+            // pass-through and must NOT be rebuilt (would corrupt counts — dijkstra `buildAdj`). The
+            // boxed-fallback result is `Array(Array(TypeVar))`-shaped, whose inner differs from `Pt[]`.
+            if Self::ty_contains_sealed(inner_to)
+                && inner_from.as_ref() != inner_to.as_ref()
+                && val.is_pointer_value()
+            {
+                return self.array_coerce_elementwise(val, from_ty, inner_to);
+            }
         }
         // Box to union. Use heap boxing (lin_box_*) rather than a stack alloca, because
         // a coerced value may escape its defining function (returned, stored in an array,

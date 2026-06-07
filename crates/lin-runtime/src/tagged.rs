@@ -214,7 +214,7 @@ pub unsafe extern "C" fn lin_box_function(p: *mut u8) -> *mut u8 {
     alloc_tagged(TAG_FUNCTION, p as u64)
 }
 
-/// Box a `LinMap*` (the typed index-signature container, ADR-082) as a TaggedVal(TAG_MAP).
+/// Box a `LinMap*` (the typed index-signature container, ADR-055) as a TaggedVal(TAG_MAP).
 #[no_mangle]
 pub unsafe extern "C" fn lin_box_map(p: *mut u8) -> *mut u8 {
     alloc_tagged(TAG_MAP, p as u64)
@@ -443,12 +443,21 @@ pub unsafe extern "C-unwind" fn lin_tagged_arith(a: *const u8, b: *const u8, op:
     // existing two's-complement wrap behaviour) and preserve the widest tag seen.
     let ai = ap as i64;
     let bi = bp as i64;
+    // Integer division/modulo by zero must FAULT, exactly like the native (statically-typed) int
+    // path (codegen's `emit_int_zero_check`). Routing dynamic-`Json` arithmetic through this helper
+    // (#5) must not silently turn `n / 0` into `0` — that would, e.g., swallow a worker-handler
+    // div-by-zero that the boundary is supposed to surface as an Error (§24.6.5). Float div-by-zero
+    // is left to IEEE (inf/NaN), matching the native float path which has no zero check.
+    if (op == 3 || op == 4) && bi == 0 {
+        let op_name = if op == 3 { "division" } else { "modulo" };
+        crate::fault::runtime_fault(&format!("Runtime error: {} by zero", op_name));
+    }
     let r = match op {
         0 => ai.wrapping_add(bi),
         1 => ai.wrapping_sub(bi),
         2 => ai.wrapping_mul(bi),
-        3 => if bi == 0 { 0 } else { ai.wrapping_div(bi) },
-        4 => if bi == 0 { 0 } else { ai.wrapping_rem(bi) },
+        3 => ai.wrapping_div(bi),
+        4 => ai.wrapping_rem(bi),
         _ => 0,
     };
     if at == TAG_UINT64 || bt == TAG_UINT64 {

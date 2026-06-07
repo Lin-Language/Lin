@@ -66,7 +66,7 @@ impl Checker {
                             // No annotation and no allocation hint: this is the genuinely
                             // evidence-free position. A bare `[]`/`{}` here has no element/value
                             // type to fix, so require an annotation rather than inferring the
-                            // degenerate `Array(Never)` / empty-record type (ADR-084).
+                            // degenerate `Array(Never)` / empty-record type (ADR-058).
                             if let Some(kind) = empty_literal_kind(value) {
                                 return Err(Diagnostic::error(value.span(), kind.message()));
                             }
@@ -195,7 +195,7 @@ impl Checker {
                     self.check_expr(value, expected_ty)?
                 } else {
                     // Evidence-free empty `[]`/`{}` with no annotation: require an annotation
-                    // rather than inferring the degenerate element/value type (ADR-084).
+                    // rather than inferring the degenerate element/value type (ADR-058).
                     if let Some(kind) = empty_literal_kind(value) {
                         return Err(Diagnostic::error(value.span(), kind.message()));
                     }
@@ -277,7 +277,7 @@ impl Checker {
                         .unwrap_or_else(|| self.env.fresh_type_var());
                     let slot = self.env.define(local_name.clone(), ty.clone(), false);
                     // Record this binding's origin so a later `replace <local_name> = ...`
-                    // (ADR-071) can resolve the imported export it targets.
+                    // (ADR-046) can resolve the imported export it targets.
                     self.import_origins.insert(
                         local_name.clone(),
                         (path.clone(), binding.name.clone()),
@@ -319,7 +319,7 @@ impl Checker {
                 })
             }
             Stmt::Replace { name, value, span } => {
-                // Test-only mock (ADR-071). Resolve which imported export this targets, check the
+                // Test-only mock (ADR-046). Resolve which imported export this targets, check the
                 // body against the export's real signature, and record it as a symbol override.
                 // Produces NO runtime statement itself — lowering reads `TypedModule::replacements`
                 // and emits the body under the export's canonical symbol (suppressing the original).
@@ -329,7 +329,7 @@ impl Checker {
                     return Err(Diagnostic::error(
                         *span,
                         format!(
-                            "`replace {0}` must target an imported binding; `{0}` is not imported in this file. Add `import {{ {0} }} from \"...\"` first (ADR-071).",
+                            "`replace {0}` must target an imported binding; `{0}` is not imported in this file. Add `import {{ {0} }} from \"...\"` first (ADR-046).",
                             name
                         ),
                     ));
@@ -345,7 +345,7 @@ impl Checker {
                         return Err(Diagnostic::error(
                             *span,
                             format!(
-                                "`replace {}` targets a compiler intrinsic, which cannot be mocked (it is not a linkable symbol). Mock the stdlib wrapper that calls it instead (ADR-071).",
+                                "`replace {}` targets a compiler intrinsic, which cannot be mocked (it is not a linkable symbol). Mock the stdlib wrapper that calls it instead (ADR-046).",
                                 name
                             ),
                         ));
@@ -371,7 +371,7 @@ impl Checker {
                             return Err(Diagnostic::error(
                                 *span,
                                 format!(
-                                    "`replace {}` body has type `{}`, which does not match the import's declared type `{}` (ADR-071).",
+                                    "`replace {}` body has type `{}`, which does not match the import's declared type `{}` (ADR-046).",
                                     name, actual, ty
                                 ),
                             ));

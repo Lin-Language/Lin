@@ -74,7 +74,7 @@ impl Checker {
             });
         }
 
-        // Singleton string-literal refinement (ADR-051). A bare string literal infers to
+        // Singleton string-literal refinement (ADR-034). A bare string literal infers to
         // `String`, but when checked against an expected `StrLit("t")` it is accepted iff its
         // value equals `t`, and the resulting typed expression is narrowed to `StrLit("t")` so
         // it satisfies the literal target (e.g. a discriminant field).
@@ -101,7 +101,7 @@ impl Checker {
 
         // Propagate the expected type into the branches of an `if`/`else` (each branch is a
         // tail position whose value is the expression's value), so an object/string literal in
-        // a branch is refined against the same expected type (ADR-051). Only when both branches
+        // a branch is refined against the same expected type (ADR-034). Only when both branches
         // are present (a bare `if ... then x` has an implicit Null else and is handled below).
         //
         // Bidirectional-push fix for the match-arm-union-vs-declared-object bug: when the
@@ -330,8 +330,8 @@ impl Checker {
         let (var_scope_depth, info) = self.env.lookup_with_depth(name).unwrap();
         let slot = info.slot;
         // `lin_*` intrinsics are compiler-internal and must only be referenced from the trusted
-        // stdlib (which re-exports them under clean names) — never from user code (ADR-002/ADR-009,
-        // ADR-086). The `allow_intrinsics` flag is true for stdlib modules and when the
+        // stdlib (which re-exports them under clean names) — never from user code (ADR-002/ADR-008,
+        // ADR-060). The `allow_intrinsics` flag is true for stdlib modules and when the
         // LIN_ALLOW_INTRINSICS test escape hatch is set.
         if !self.allow_intrinsics {
             if let Some(intr) = self.intrinsic_slots.get(&slot) {
@@ -444,7 +444,7 @@ impl Checker {
                     Type::Union(vec![Type::Union(fields.values().cloned().collect()), Type::Null])
                 }
             }
-            // Typed index-signature map `{ String: T }` (ADR-082): a key access yields `T | Null`
+            // Typed index-signature map `{ String: T }` (ADR-055): a key access yields `T | Null`
             // (the missing-key → Null safe-bracket rule, §6.1). No per-key field tracking — the
             // key set is dynamic by construction.
             Type::Map(val_ty) => Type::flatten_union(vec![(**val_ty).clone(), Type::Null]),
@@ -476,12 +476,151 @@ impl Checker {
                             _ => self.env.fresh_type_var(),
                         }
                     } else {
+                        // Multi-variant union (e.g. `Person | Error`, or a discriminated sum):
+                        // index to a fresh TypeVar so codegen keeps a DYNAMIC field lookup. This is
+                        // deliberately imprecise: union members are open objects that may carry
+                        // fields not in their static shape at runtime (e.g. the decode-`Error`
+                        // value's `"path"`, which `Error`'s declared `{ type, message }` omits — a
+                        // width-subtyping extra). A "precise" per-variant `fields.get(k)` would
+                        // wrongly resolve such an access to a static `Null` and suppress the runtime
+                        // lookup. So we do NOT narrow here. (Preserved from the original arm.)
                         self.env.fresh_type_var()
                     };
                     Type::flatten_union(vec![inner, Type::Null])
                 }
             }
+            // A value whose static type is a `Type::Named("X")` (e.g. the result of a
+            // mutually-recursive call whose return type survived forward-declaration as a Named
+            // alias, or an annotated named record). Resolve the alias to its concrete body and
+            // index into THAT. `resolve_named_body` peels Named aliases (with a cycle guard so a
+            // self-recursive `type T = … T …` does not loop) down to the first non-Named body; if
+            // that body is an indexable shape (`Object`/`Map`/`Array`/…) we re-run `infer_index`
+            // logic by recursing on the resolved type. If it bottoms out at a still-`Named` (true
+            // cycle with no indexable layer) or a non-indexable type, fall through to the existing
+            // "Cannot index" error — i.e. fail conservatively, never invent a result type.
+            Type::Named(_) => {
+                if let Some(resolved) = self.resolve_named_body(&obj_ty) {
+                    return self.infer_index_into(typed_obj, typed_key, &resolved, span);
+                }
+                return Err(Diagnostic::error(span, format!("Cannot index into type {}", obj_ty)));
+            }
             _ => return Err(Diagnostic::error(span, format!("Cannot index into type {}", obj_ty))),
+        };
+        Ok(TypedExpr::Index { object: Box::new(typed_obj), key: Box::new(typed_key), result_type, span })
+    }
+
+    /// Resolve a `Type::Named` to its underlying non-`Named` body via the type environment,
+    /// peeling chained aliases (`type A = B; type B = { … }`). Cycle-guarded: a self-referential
+    /// alias that never reaches a concrete body (`type T = T`, or a recursive union with no
+    /// indexable layer at the top) returns `None` rather than looping forever. Generic named types
+    /// (params non-empty) and unknown names also return `None`. Returns the resolved body for any
+    /// other (non-Named) starting type unchanged.
+    fn resolve_named_body(&self, ty: &Type) -> Option<Type> {
+        let mut current = ty.clone();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            match &current {
+                Type::Named(n) => {
+                    if !visited.insert(n.clone()) {
+                        // Cycle with no concrete body in between → give up (conservative).
+                        return None;
+                    }
+                    let decl = self.env.lookup_type(n)?;
+                    if !decl.params.is_empty() {
+                        return None;
+                    }
+                    current = decl.body.clone();
+                }
+                _ => return Some(current),
+            }
+        }
+    }
+
+    /// The body of `infer_index`'s result-type computation, factored out so the `Type::Named` arm
+    /// can recurse after resolving the alias. Re-runs `infer_index` on an already-typed object and
+    /// key against an explicitly-provided object type (`obj_ty`). This is only entered from the
+    /// `Named` arm with a freshly-resolved concrete body, so a `Named` arriving here again is a
+    /// genuine cycle and yields the "Cannot index" error.
+    fn infer_index_into(
+        &mut self,
+        typed_obj: TypedExpr,
+        typed_key: TypedExpr,
+        obj_ty: &Type,
+        span: Span,
+    ) -> Result<TypedExpr, Diagnostic> {
+        let result_type = match obj_ty {
+            Type::Array(elem) => *elem.clone(),
+            Type::FixedArray(elems) => {
+                if let TypedExpr::IntLit(idx, _, _) = typed_key {
+                    elems.get(idx as usize).cloned().unwrap_or(Type::Null)
+                } else {
+                    unify_types(elems)
+                }
+            }
+            Type::Object { fields, .. } => {
+                if fields.is_empty() {
+                    self.env.fresh_type_var()
+                } else if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
+                    if !fields.contains_key(key_str) {
+                        let suggestion = lin_common::closest_match(
+                            key_str,
+                            fields.keys().map(|s| s.as_str()),
+                            3,
+                        );
+                        let mut diag = lin_common::Diagnostic::warning(
+                            span,
+                            format!("field \"{}\" does not exist on this object type", key_str),
+                        );
+                        if let Some(s) = suggestion {
+                            diag = diag.with_help(format!("did you mean \"{}\"?", s));
+                        }
+                        self.diagnostics.push(diag);
+                    }
+                    fields.get(key_str).cloned().unwrap_or(Type::Null)
+                } else {
+                    Type::Union(vec![Type::Union(fields.values().cloned().collect()), Type::Null])
+                }
+            }
+            Type::Map(val_ty) => Type::flatten_union(vec![(**val_ty).clone(), Type::Null]),
+            Type::Null => Type::Null,
+            Type::TypeVar(_) => self.env.fresh_type_var(),
+            Type::Union(variants) => {
+                // A Named alias resolving to a union (e.g. `type Ast = Num | BinOp`). Mirror the
+                // inline multi-variant `Union` arm in `infer_index`: a single record variant is
+                // indexed precisely; a multi-variant union falls back to a fresh TypeVar so the
+                // codegen keeps a DYNAMIC lookup (union members are open and may carry runtime
+                // fields beyond their static shape — see the note in `infer_index`). Either way the
+                // safe-bracket `Null` is re-added.
+                let non_null: Vec<Type> =
+                    variants.iter().filter(|t| **t != Type::Null).cloned().collect();
+                let inner = if non_null.len() == 1 {
+                    let body = self.resolve_named_body(&non_null[0]).unwrap_or_else(|| non_null[0].clone());
+                    match &body {
+                        Type::Object { fields, .. } => {
+                            if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
+                                fields.get(key_str).cloned().unwrap_or(Type::Null)
+                            } else {
+                                Type::Union(fields.values().cloned().collect())
+                            }
+                        }
+                        Type::Array(elem) => *elem.clone(),
+                        _ => self.env.fresh_type_var(),
+                    }
+                } else if non_null.is_empty() {
+                    return Ok(TypedExpr::Index {
+                        object: Box::new(typed_obj),
+                        key: Box::new(typed_key),
+                        result_type: Type::Null,
+                        span,
+                    });
+                } else {
+                    self.env.fresh_type_var()
+                };
+                Type::flatten_union(vec![inner, Type::Null])
+            }
+            other => {
+                return Err(Diagnostic::error(span, format!("Cannot index into type {}", other)))
+            }
         };
         Ok(TypedExpr::Index { object: Box::new(typed_obj), key: Box::new(typed_key), result_type, span })
     }
@@ -660,7 +799,7 @@ impl Checker {
     /// expected: `Json` is accept-any in this checked-arm position, so a function declared to
     /// return `R` may yield a `Json` value from one arm and a concrete `R`-shaped object from
     /// another. This is the bidirectional-push counterpart to the union-vs-declared-object bug;
-    /// it deliberately does NOT relax `is_compatible_env` (ADR-046 still rejects a direct
+    /// it deliberately does NOT relax `is_compatible_env` (ADR-045 still rejects a direct
     /// `val p: Person = jsonValue` decode).
     pub(crate) fn check_branch_against(&mut self, body: &Expr, expected: &Type) -> Result<TypedExpr, Diagnostic> {
         // First try the bidirectional refinement path (object/string-literal/nested if/match).
@@ -883,7 +1022,7 @@ impl Checker {
         Ok(TypedExpr::MakeObject { fields: typed_fields, spreads, ty: Type::object(obj_type), span })
     }
 
-    /// Bidirectional refinement for an object literal against an expected type (ADR-051).
+    /// Bidirectional refinement for an object literal against an expected type (ADR-034).
     ///
     /// Returns `Ok(Some(_))` when it produced a refined typed object; `Ok(None)` to defer to
     /// ordinary inference (e.g. the expected type is not object-shaped, or the literal contains
@@ -912,15 +1051,20 @@ impl Checker {
                 Ok(None)
             }
             Type::Object { fields: expected_fields, .. } => {
-                // Only take over when at least one expected field is a literal singleton; this
-                // keeps plain structural objects on the existing inference path.
-                if !expected_fields.values().any(|t| matches!(t, Type::StrLit(_))) {
+                // Take over with directed field-by-field checking when it would actually change
+                // the outcome — otherwise stay on the existing undirected inference path so plain
+                // structural objects are unaffected. Two cases need directing:
+                //   (1) a `StrLit` field — so a discriminant literal narrows to its singleton;
+                //   (2) a `Map` field (possibly nested inside a further record field) — so an
+                //       object literal in that field position key-widens to `{ String: T }`
+                //       (a `LinMap`) instead of being inferred to its own fixed-record type.
+                if !expected_fields.values().any(|t| expected_field_needs_directing(t)) {
                     return Ok(None);
                 }
                 Ok(Some(self.check_object_fields(fields, expected_fields, span)?))
             }
             // An object literal checked against a typed index-signature map `{ String: T }`
-            // (ADR-082): each literal value must be `T`; the result is typed `Map(T)` and lowered
+            // (ADR-055): each literal value must be `T`; the result is typed `Map(T)` and lowered
             // into a `LinMap`. The empty `{}` literal is the common case (`var m: { String: T } =
             // {}`), which produces an empty hashed map of the right type — this is how `{}` infers
             // a map from its assignment-target / return-type context.
@@ -1105,7 +1249,7 @@ impl Checker {
                     self.infer_expr(value)?
                 }
             }
-            // Typed index-signature map `{ String: T }` (ADR-082): the key must be a String and
+            // Typed index-signature map `{ String: T }` (ADR-055): the key must be a String and
             // the value must be `T`.
             Type::Map(val_ty) => {
                 let key_ty = typed_key.ty();
@@ -1154,11 +1298,11 @@ impl Checker {
 }
 
 /// True if `ty` contains a `StrLit` singleton anywhere in its structure. Used to scope the
-/// bidirectional literal refinement (ADR-051) so the if/block expected-type propagation only
+/// bidirectional literal refinement (ADR-034) so the if/block expected-type propagation only
 /// fires for literal-typed targets, leaving all other inference behaviour unchanged.
 /// True when the expected type is one we want pushed into `if`/`match` branch bodies for
 /// bidirectional checking: a structured object, a named (alias) type, a union, or anything that
-/// mentions a `StrLit` singleton (ADR-051). Plain scalars / arrays / iterators / `Json` keep the
+/// mentions a `StrLit` singleton (ADR-034). Plain scalars / arrays / iterators / `Json` keep the
 /// old inference-then-unify path (pushing into them buys nothing and risks behaviour changes).
 pub(crate) fn expected_pushes_into_branches(ty: &Type) -> bool {
     match ty {
@@ -1181,6 +1325,21 @@ pub(crate) fn type_is_streamish(ty: &Type) -> bool {
     match ty {
         Type::Stream(_) => true,
         Type::Union(variants) => variants.iter().any(type_is_streamish),
+        _ => false,
+    }
+}
+
+/// True if an expected field type warrants the directed object-checking path (so an object
+/// literal in that field position is checked AGAINST the type rather than freely inferred).
+/// This is the gate for `check_object_against`'s `Type::Object` arm. It fires when the type is
+/// — or transitively (in a record-field position) contains — either a `StrLit` singleton (so a
+/// discriminant narrows) or a `Map` (so a record literal key-widens to `{ String: T }`). The
+/// transitive walk handles nested records like `{ headers: { String: String } }` where the
+/// outer record has no direct `StrLit`/`Map` field but a nested field does.
+pub(crate) fn expected_field_needs_directing(ty: &Type) -> bool {
+    match ty {
+        Type::StrLit(_) | Type::Map(_) => true,
+        Type::Object { fields, .. } => fields.values().any(expected_field_needs_directing),
         _ => false,
     }
 }
