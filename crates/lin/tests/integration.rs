@@ -14592,6 +14592,38 @@ main()
     assert_eq!(out, vec!["flat=7".to_string(), "nested=2".to_string()]);
 }
 
+#[test]
+fn test_json_object_field_used_as_typed_map() {
+    // Regression: a `{}` that is a FIELD of a Json object literal is physically a `LinObject`, but
+    // reading it back and using it where a `{ String: T }` map is expected (e.g. passing it to
+    // `std/object.get`, or to a `{ String: Int32 }` parameter) used to call the map accessors
+    // (`lin_map_get`/`_set`) on a `LinObject*` — `find_slot` probed its bytes as a hash table and
+    // INFINITE-LOOPED on an absent key (and corrupted the heap on a present one). The fix: the
+    // Json/Object → Map coercion materializes a real `LinMap` (tag-dispatched: an already-map value
+    // is retained as-is, an object is rebuilt), plus a defensive probe bound in `find_slot`.
+    let src = r#"import { print } from "std/io"
+import { get } from "std/object"
+import { toString } from "std/string"
+
+val mk = (): Json => { "listeners": {  }, "n": 0 }
+
+val readVia = (m: { String: Int32 }, k: String): Int32 =>
+  get(m, k, -1)
+
+val main = (): Null =>
+  val b = mk()
+  b["listeners"]["tick"] = 1
+  // present key via the typed-map parameter (object → map materialize)
+  print("present=${toString(readVia(b["listeners"], "tick"))}")
+  // ABSENT key — this is the call that used to hang forever
+  print("absent=${toString(readVia(b["listeners"], "zzz"))}")
+
+main()
+"#;
+    let out = run(src);
+    assert_eq!(out, vec!["present=1".to_string(), "absent=-1".to_string()]);
+}
+
 // Regression (RAPTOR `routeScanner.scanBack` per-scan leak, ~227 MB/scan → ~6 MB/scan): a
 // TAIL-RECURSIVE function that allocates fresh owned temps each iteration (the projections
 // `scanner["tripsByRoute"][routeId]`, `routeTrips[i]`, the route-id string literal) and threads

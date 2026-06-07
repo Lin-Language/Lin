@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-`lin-lang` is the reference implementation of **Lin**, a small expression-based language built around strict JSON data, structural typing, first-argument function application (dot syntax), destructuring, pattern matching, opaque iterator/runtime types, and value-based error handling. The full language design is in `docs/SPECIFICATION.md`.
+`lin-lang` is the reference implementation of **Lin**, a small expression-based language built around strictly typed JSON data, structural typing, first-argument function application (dot syntax), destructuring, pattern matching, opaque iterator/runtime types, and value-based error handling. The full language design is in `docs/SPECIFICATION.md`.
 
 The project has one backend:
 
@@ -15,6 +15,8 @@ The project has one backend:
 Do not work or make changes directly in the codebase. Create a subagent with a git worktree do the work there, ensure the workstree is up to date with the latest master, make sure the tests pass, then ask before merging back.
 
 Do not use git stash for no-op comparisons in worktrees — stashes are shared and keep tangling. Compare via git checkout HEAD~1 on the committed branch only.
+
+Expect master have moved on when you go to integrate your worktree back to master. There are multiple agents working at any one time, all with their own cadence. Pull master into your worktree, test and then merge. 
 
 ## Build / run / test
 
