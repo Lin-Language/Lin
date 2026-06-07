@@ -2,9 +2,45 @@ use super::builder_ext::BuilderExt;
 use inkwell::values::BasicValueEnum;
 
 use lin_check::types::Type;
+use lin_ir::repr::Repr;
 use super::Codegen;
 
 impl<'ctx> Codegen<'ctx> {
+    /// Emit a release dispatched on the value's PHYSICAL representation (`func.repr`). PART C
+    /// (single-owner): when the pass proved a temp `Packed`, the release SHAPE is chosen from that
+    /// fact, not re-derived from the static `Type`. A `Packed` temp is constructed packed, so today's
+    /// type-dispatch already routes it to the packed releaser — making this override BYTE-IDENTICAL on
+    /// the current corpus (no Packed-repr temp is ever a non-sealed type). For any non-Packed repr the
+    /// dispatch defers verbatim to the existing static-type [`emit_release`], so the boxed/scalar paths
+    /// are unchanged. (The fuller `Boxed`-with-sealed-type divergence fix — releasing a boxed value
+    /// typed sealed with the boxed shape — is a BEHAVIOR change, deferred per the Part C byte-identical
+    /// gate; it is unreachable on the current corpus because sealed-typed temps that reach Release are
+    /// Packed.)
+    pub(crate) fn emit_release_repr(&mut self, val: BasicValueEnum<'ctx>, ty: &Type, repr: &Repr) {
+        if !val.is_pointer_value() { return; }
+        match repr {
+            // PACKED sealed record → packed struct release (decrement rc, free on zero, per-heap-field
+            // release walked inside emit_sealed_release).
+            Repr::Packed(lin_ir::repr::Layout::PackedStruct { fields }) => {
+                let fields = fields.clone();
+                self.emit_sealed_release(val, &fields);
+                return;
+            }
+            // PACKED sealed array → the 0xFE-aware array release.
+            Repr::Packed(lin_ir::repr::Layout::PackedSealedArray { .. }) => {
+                self.builder.call(self.rt.array_release, &[val.into_pointer_value().into()], "");
+                return;
+            }
+            // A boxed slot (Opaque OR WrapsPacked-by-pointer): the box is a TaggedVal/LinObject whose
+            // release is the tag-dispatched one. WrapsPacked borrows its inner packed buffer; the box
+            // shell's release (tagged_release) decrements the inner via the runtime's tag dispatch.
+            // Fall through to the type-based dispatch which already picks the right boxed releaser for
+            // the static type (object/array/tagged/map/closure/stream).
+            Repr::Boxed(_) | Repr::FlatScalar(_) | Repr::Unknown | Repr::Bottom => {}
+        }
+        self.emit_release(val, ty);
+    }
+
     /// Emit a type-dispatched release call for a heap-allocated value.
     /// No-op for scalars (non-pointer LLVM values) and null pointers.
     pub(crate) fn emit_release(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) {
