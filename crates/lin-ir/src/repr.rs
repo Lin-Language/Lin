@@ -250,6 +250,36 @@ pub fn sum_type_discriminant_of(ty: &Type) -> Option<String> {
     sum_type_discriminant(ty)
 }
 
+/// Mirror of `Codegen::sum_recursive_self_name` (unboxed-sumtype Stage 2). The UNIQUE recursive
+/// self-reference name of a candidate sum union, or `None` if it has no recursive child or >1
+/// distinct self-name (mutual recursion — out of scope → boxed fail-safe). Kept byte-identical.
+pub fn sum_recursive_self_name(ty: &Type) -> Option<String> {
+    let variants = match ty {
+        Type::Union(vs) => vs,
+        _ => return None,
+    };
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for v in variants {
+        if let Type::Object { fields, .. } = v {
+            for fty in fields.values() {
+                if let Type::Named(n) = fty {
+                    names.insert(n.clone());
+                }
+            }
+        }
+    }
+    if names.len() == 1 {
+        names.into_iter().next()
+    } else {
+        None
+    }
+}
+
+/// Mirror of `Codegen::is_sum_recursive_child` (Stage 2): a `Type::Named(self_name)` recursive child.
+fn is_sum_recursive_child(fty: &Type, self_name: &str) -> bool {
+    matches!(fty, Type::Named(n) if n == self_name)
+}
+
 fn sum_type_discriminant(ty: &Type) -> Option<String> {
     let variants = match ty {
         Type::Union(vs) => vs,
@@ -258,6 +288,9 @@ fn sum_type_discriminant(ty: &Type) -> Option<String> {
     if variants.len() < 2 {
         return None;
     }
+    // Stage 2: the unique recursive self-name (if any). A `Named(self_name)` field is a legal
+    // recursive child (`*SumNode` slot); any other Named/heap/union field → boxed (fail-safe).
+    let self_name = sum_recursive_self_name(ty);
     let mut recs: Vec<&IndexMap<String, Type>> = Vec::with_capacity(variants.len());
     for v in variants {
         match v {
@@ -289,7 +322,10 @@ fn sum_type_discriminant(ty: &Type) -> Option<String> {
                 if matches!(fty, Type::StrLit(_)) {
                     return None;
                 }
-                if !(is_sealed_scalar_field(fty)) {
+                let is_recursive_child = self_name
+                    .as_deref()
+                    .is_some_and(|n| is_sum_recursive_child(fty, n));
+                if !is_sealed_scalar_field(fty) && !is_recursive_child {
                     return None;
                 }
             }
@@ -304,6 +340,28 @@ fn sum_type_discriminant(ty: &Type) -> Option<String> {
 /// single source of truth is `sum_type_discriminant`).
 pub fn sum_type_eligible(ty: &Type) -> bool {
     sum_type_discriminant(ty).is_some()
+}
+
+/// The FULL field map (including the discriminant + any recursive children) of the variant of sum
+/// type `ty` whose discriminant value is `disc`. Public so the lowerer can push a nested literal into
+/// the correct child-sum slot (NESTED-LITERAL DISCRIMINANT PUSHDOWN, design §6 gap 1). `None` when
+/// `ty` is not a sum type or no variant carries `disc`.
+pub fn sumnode_variant_by_disc(ty: &Type, disc: &str) -> Option<IndexMap<String, Type>> {
+    let key = sum_type_discriminant(ty)?;
+    let variants = match ty {
+        Type::Union(vs) => vs,
+        _ => return None,
+    };
+    for v in variants {
+        if let Type::Object { fields, .. } = v {
+            if let Some(Type::StrLit(s)) = fields.get(&key) {
+                if s == disc {
+                    return Some(fields.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Mirror of `Codegen::sealed_array_elem_field_packable` (types.rs): SCALARS ONLY (Stage 3a). Heap
@@ -535,6 +593,11 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
         Instruction::FieldGet { dst, result_ty, .. } => {
             if let Some(s) = ScalarTy::from_type(result_ty) {
                 set(seeds, *dst, Repr::FlatScalar(s));
+            } else if sum_type_eligible(result_ty) {
+                // UNBOXED SUM TYPE (unboxed-sumtype Stage 2): a RECURSIVE child read yields a borrowed
+                // interior `*SumNode` whose repr is the child sum type's SumNode layout — so a chained
+                // `evalNode(node["left"])` reads the child as Packed(SumNode) and re-enters the switch.
+                set(seeds, *dst, Repr::Packed(Layout::SumNode { sum_ty: result_ty.clone() }));
             } else if let Some(f) = sealed_fields(result_ty) {
                 set(seeds, *dst, Repr::Packed(Layout::PackedStruct { fields: f.clone() }));
             }
@@ -1072,6 +1135,75 @@ mod tests {
             Type::Object { fields: b, sealed: true },
         ]);
         assert!(!super::sum_type_eligible(&u));
+    }
+
+    /// The canonical recursive `Ast` union as it reaches the gate (the checker leaves the recursive
+    /// child as `Named("Ast")`): `Num | BinOp` with `BinOp.left/right : Named("Ast")`.
+    fn ast_union() -> Type {
+        let mut num = IndexMap::new();
+        num.insert("kind".into(), Type::StrLit("num".into()));
+        num.insert("value".into(), Type::Int32);
+        let mut binop = IndexMap::new();
+        binop.insert("kind".into(), Type::StrLit("op".into()));
+        binop.insert("left".into(), Type::Named("Ast".into()));
+        binop.insert("right".into(), Type::Named("Ast".into()));
+        Type::Union(vec![
+            Type::Object { fields: num, sealed: true },
+            Type::Object { fields: binop, sealed: true },
+        ])
+    }
+
+    #[test]
+    fn sum_type_gate_accepts_recursive_self_child() {
+        // Stage 2: a self-recursive sum type (recursive `Named` children) is eligible, with self-name
+        // `Ast` detected env-free as the unique `Named` appearing in a variant field.
+        let ast = ast_union();
+        assert!(super::sum_type_eligible(&ast), "recursive sum type must be eligible");
+        assert_eq!(super::sum_type_discriminant(&ast).as_deref(), Some("kind"));
+        assert_eq!(super::sum_recursive_self_name(&ast).as_deref(), Some("Ast"));
+    }
+
+    #[test]
+    fn sum_type_gate_rejects_two_distinct_named_children() {
+        // Mutual recursion / a foreign Named alongside the self-reference → >1 distinct Named name →
+        // `sum_recursive_self_name` is None → those Named fields fail the scalar check → boxed.
+        let mut a = IndexMap::new();
+        a.insert("kind".into(), Type::StrLit("a".into()));
+        a.insert("next".into(), Type::Named("A".into()));
+        let mut b = IndexMap::new();
+        b.insert("kind".into(), Type::StrLit("b".into()));
+        b.insert("other".into(), Type::Named("B".into())); // a SECOND distinct Named
+        let u = Type::Union(vec![
+            Type::Object { fields: a, sealed: true },
+            Type::Object { fields: b, sealed: true },
+        ]);
+        assert!(super::sum_recursive_self_name(&u).is_none(), "two distinct Names → no self-name");
+        assert!(!super::sum_type_eligible(&u), "ambiguous recursion must be boxed (fail-safe)");
+    }
+
+    #[test]
+    fn sum_type_recursive_param_is_sumnode() {
+        // A recursive sum-typed PARAM seeds Packed(SumNode); the recursive-child FieldGet result
+        // (typed as the child sum type) also seeds Packed(SumNode) so the recursion re-enters the
+        // SumNode path. (Layout key is the whole canonical recursive union.)
+        let ast = ast_union();
+        let instrs = vec![Instruction::FieldGet {
+            dst: Temp(1),
+            object: Temp(0),
+            field: "left".into(),
+            obj_ty: ast.clone(),
+            result_ty: ast.clone(),
+        }];
+        let f = func_of(instrs, Some(Temp(1)), 2, vec![(Temp(0), ast.clone())]);
+        let repr = analyze(&f);
+        assert!(
+            matches!(&repr[0], Repr::Packed(Layout::SumNode { sum_ty }) if sum_ty == &ast),
+            "recursive sum param must be Packed(SumNode), got {:?}", repr[0]
+        );
+        assert!(
+            matches!(&repr[1], Repr::Packed(Layout::SumNode { sum_ty }) if sum_ty == &ast),
+            "recursive child FieldGet result must be Packed(SumNode), got {:?}", repr[1]
+        );
     }
 
     #[test]
