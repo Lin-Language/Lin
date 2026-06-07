@@ -1089,25 +1089,74 @@ impl FuncBuilder {
     /// skipped even when it is also owned in scope (e.g. the `if cond then trip else lastFound`
     /// merge value threaded as the next `lastFound`): its +1 transfers into the param slot.
     fn release_owned_for_tail_call(&mut self, args: &[Temp]) {
-        // Skip the args AND any owned temp transitively kept by an arg through `escape_alias`:
-        // notably an owned union box whose UNBOXED inner is the arg (`concat(b,b)` → unboxed
-        // `UInt8[]` arg; the box stays registered owned). Fully releasing such a box would free
-        // the array now threaded into the param slot (a double-free) — its shell is left to the
-        // dead-block release (the pre-existing accepted per-tail-call shell leak).
-        let skip = self.expand_keep_for_escape(args);
+        // Tail-call arg temps fall into two ownership classes — distinguished by whether the arg
+        // temp is one of THIS function's PARAMETER temps (a borrowed value the caller owns) or a
+        // value the body freshly owns:
+        //
+        //  - TRANSFERRING args (a freshly-owned value: a literal/call/closure alloc, a `val`
+        //    local read, a union box clone — NOT a bare param temp): the body holds exactly one
+        //    transferable +1, which moves into the param slot (codegen's release-old frees the
+        //    PRIOR slot value on the next back-edge; the final value is freed at teardown / is the
+        //    accepted single residual). Keep the FIRST owned registration of such a temp and
+        //    release the rest, exactly like `pop_scope_releasing_keep` (a redundant extra
+        //    registration — e.g. a fresh value also read back via `LocalGet` — would otherwise
+        //    leak). Also keep any temp transitively kept through `escape_alias` (an owned union box
+        //    whose UNBOXED inner is the arg, e.g. `concat(b,b)`): fully releasing it would free the
+        //    array now threaded into the slot.
+        //
+        //  - PASS-THROUGH args (the arg temp IS one of this function's param temps — a bare
+        //    `LocalGet` of a parameter threaded UNCHANGED): NO +1 transfers. The value stored into
+        //    the slot is the same borrowed pointer the caller still owns, so codegen's release-old
+        //    correctly skips it (its alias guard sees old == new). The body's read-retains on such
+        //    a param (e.g. `is_rc_type` reads `Retain` in place for a concrete-rc Array/Object) are
+        //    pure borrows that must net to ZERO — exactly like the Json/union param path, which
+        //    takes no read-retain at all. RELEASE every registration. Otherwise each read leaks one
+        //    reference per iteration: the typed sealed-record array threaded through a tail param
+        //    (`Transfer[]` grown via `push`) leaked ~2 refs/iteration because both the `push`
+        //    receiver read and the tail-call-arg read retained the array and neither release ran on
+        //    the live back-edge (the scope-exit releases land in the dead `tco_post` block).
+        let keep = self.expand_keep_for_escape(args);
+        // The set of param temps the args alias as PASS-THROUGH (borrowed, no +1 transfers). A param
+        // threaded unchanged reads back as its own param temp; releasing all its registrations nets
+        // to zero against the caller's owned reference.
+        let param_temps: Vec<Temp> = self.params.iter().map(|(t, _)| *t).collect();
+        let mut kept_seen: Vec<Temp> = Vec::new();
         let mut to_release: Vec<(Temp, Type)> = Vec::new();
         for frame in &self.scope_owned {
             for (t, ty) in frame {
-                if skip.contains(t) {
+                // A pass-through param arg transfers no +1 — release every registration.
+                if args.contains(t) && param_temps.contains(t) {
+                    to_release.push((*t, ty.clone()));
                     continue;
                 }
-                if to_release.iter().any(|(seen, _)| seen == t) {
+                // A kept (transferring) arg, or a temp kept only through escape-aliasing: keep the
+                // FIRST registration (transfers into the slot / is the survivor) and release any
+                // redundant extra registration.
+                if keep.contains(t) {
+                    if kept_seen.contains(t) {
+                        // Redundant extra registration of a kept temp — release it (a leaked
+                        // read-retain), matching `pop_scope_releasing_keep`.
+                        to_release.push((*t, ty.clone()));
+                    } else {
+                        kept_seen.push(*t);
+                    }
                     continue;
                 }
+                // A non-arg owned temp (per-iteration body allocation) — release once (dedup below).
                 to_release.push((*t, ty.clone()));
             }
         }
+        // Release each scheduled temp. Non-arg owned temps are still released exactly once (dedup),
+        // preserving prior behavior; pass-through-param and redundant-keep registrations are
+        // released once PER registration (one per surplus read-retain).
+        let mut non_arg_seen: Vec<Temp> = Vec::new();
         for (t, ty) in to_release {
+            if !args.contains(&t) {
+                if non_arg_seen.contains(&t) {
+                    continue;
+                }
+                non_arg_seen.push(t);
+            }
             self.emit(Instruction::Release { val: t, ty });
         }
     }
@@ -3644,8 +3693,10 @@ fn lower_call(
                 // Release every per-iteration owned temp the body allocated (projections, clones,
                 // string literals) on THIS live block before the diverging jump — otherwise their
                 // scope-exit releases land in the unreachable `tco_post` chain and leak once per
-                // iteration (the dominant RAPTOR scanBack leak). Args are skipped (consumed by the
-                // back-edge into the param slots).
+                // iteration (the dominant RAPTOR scanBack leak). A transferring arg keeps its
+                // single +1 (it moves into the param slot); a PASS-THROUGH param arg (threaded
+                // unchanged) is fully released — its value is the same borrowed pointer the caller
+                // owns and codegen's release-old skips it.
                 builder.release_owned_for_tail_call(&lowered_args);
                 builder.terminate(Terminator::TailCall { args: lowered_args.clone() });
                 // Dead block to keep IR valid.
@@ -3713,7 +3764,8 @@ fn lower_call(
     if is_tail {
         // Release per-iteration body-owned temps on the live block before the diverging jump
         // (see release_owned_for_tail_call); their scope-exit releases would otherwise land in
-        // the unreachable post block and leak each iteration.
+        // the unreachable post block and leak each iteration. A transferring arg keeps its +1
+        // (moves into the param slot); a pass-through param arg is fully released.
         builder.release_owned_for_tail_call(&lowered_args);
         builder.terminate(Terminator::TailCall { args: lowered_args.clone() });
         let post = builder.alloc_block("tco_post");
