@@ -1,0 +1,31 @@
+// sumtree — a recursive tagged sum type (`Expr`) evaluated as an unboxed tree.
+//
+// `Expr` is `Num | BinOp` where `BinOp` carries recursive `left`/`right : Expr`
+// children. With the unboxed-sum-type representation (design §1.4, Stage 2) each
+// node is a packed heap `SumNode`: the recursive children are 8-byte owned
+// `*SumNode` pointer slots, dispatch is an O(1) inline-tag switch, and a child
+// read is a constant-offset pointer load — no boxed `LinObject`, no `lin_object_get`.
+// A literal number.
+export type Num = { "kind": "num", "value": Int32 }
+
+// A binary operation over two sub-expressions. `op` is a small scalar code:
+// 0 = add, 1 = subtract, 2 = multiply.
+export type BinOp = { "kind": "op", "op": Int32, "left": Expr, "right": Expr }
+
+// The recursive expression tree.
+export type Expr = Num | BinOp
+
+// Evaluate an expression tree to an Int32. The recursive children are read by
+// constant offset and the recursion re-enters the tag switch.
+export val eval = (e: Expr): Int32 =>
+  match e
+    is Num => e["value"]
+    is BinOp =>
+      val l = eval(e["left"])
+      val r = eval(e["right"])
+      if e["op"] == 0 then
+        l + r
+      else if e["op"] == 1 then
+        l - r
+      else
+        l * r
