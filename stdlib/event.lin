@@ -36,15 +36,8 @@
 //   • Listener counts are queryable (`listenerCount`) instead of a silent leak + a warning.
 import { push, length, slice } from "std/array"
 import { for } from "std/iter"
+import { get } from "std/object"
 import { worker, message, request as workerRequest, close } from "std/async"
-
-// Local lookup-or-default. We deliberately do NOT use std/object's `get`: it infinite-loops at
-// runtime when its first argument is a Json-typed dynamic value (which `b["listeners"]` is) and the
-// key is ABSENT (a monomorphization quirk in `get`'s match body). Raw `m[key]` correctly yields
-// `null` for a missing key, so this null-check form is both correct and loop-free.
-val listenersFor = (b: Json, name: String): Json =>
-  val v = b["listeners"][name]
-  if v == null then [] else v
 
 // ── Shared constructor ───────────────────────────────────────────────────────────────────────
 // An Event value. `data` is whatever the producer parsed/computed; for the async layer it must be
@@ -128,7 +121,7 @@ export val once = (b: Json, name: String, handler: (Json) => Null): Json =>
 // No-op if it was already removed or never existed. Returns `true` if a listener was removed.
 export val off = (b: Json, sub: Json): Boolean =>
   val name = sub["type"]
-  val cur = listenersFor(b, name)
+  val cur = get(b["listeners"], name, [])
   val kept = filterListeners(cur, sub["id"])
   b["listeners"][name] = kept
   length(kept) < length(cur)
@@ -137,7 +130,7 @@ export val off = (b: Json, sub: Json): Boolean =>
 // order, passing each the Event's `data`. `once` listeners are removed after firing. Returns the
 // number of listeners invoked (0 if none — no Node-style crash-on-unhandled-error).
 export val emit = (b: Json, name: String, data: Json): Int32 =>
-  val current = listenersFor(b, name)
+  val current = get(b["listeners"], name, [])
   // Snapshot the listener list BEFORE firing: a handler that subscribes/unsubscribes during
   // dispatch must not perturb THIS emission (a listener added now fires on the NEXT emit, and one
   // removed now still completes this round — the standard "stable during dispatch" rule).
@@ -148,12 +141,12 @@ export val emit = (b: Json, name: String, data: Json): Int32 =>
     fired = fired + 1
   )
   // Drop the `once` listeners that just fired.
-  b["listeners"][name] = dropOnce(listenersFor(b, name))
+  b["listeners"][name] = dropOnce(get(b["listeners"], name, []))
   fired
 
 // listenerCount(b, name) — how many listeners are currently registered for event type `name`.
 export val listenerCount = (b: Json, name: String): Int32 =>
-  length(listenersFor(b, name))
+  length(get(b["listeners"], name, []))
 
 // ── Layer-2 internals ─────────────────────────────────────────────────────────────────────────
 // Append a `{ id, handler, once }` listener record to `name`'s list, creating it on first use.
