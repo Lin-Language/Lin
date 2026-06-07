@@ -22,6 +22,11 @@ pub struct CompileOptions {
     pub emit_ir: bool,
     pub optimize: bool,
     pub coverage: bool,
+    /// `--debug`/`-g`: emit DWARF line tables and a source-mapped binary for stepping in a
+    /// debugger (lldb/CodeLLDB). Implies `optimize = false` (O0, so line mapping holds), keeps the
+    /// object file's debug sections, and keeps `val` globals at default linkage so the debugger can
+    /// resolve them. Default false — normal builds are byte-unaffected.
+    pub debug: bool,
 }
 
 #[derive(Debug)]
@@ -183,7 +188,17 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     // LLVM coverage-mapping globals; only the main module and user (non-stdlib) imports are
     // instrumented (stdlib import sources are not tracked, so they pass `None` below).
     let context = Context::create();
-    let mut cg = Codegen::new(&context, &module_name, opts.coverage);
+    let mut cg = Codegen::new(&context, &module_name, opts.coverage, opts.debug);
+
+    // DWARF (--debug): register the main module's source for line-table emission. Use the canonical
+    // absolute path so the debugger can locate the `.lin` file. No-op without `--debug`.
+    if opts.debug {
+        let abs = std::fs::canonicalize(&opts.source_path)
+            .unwrap_or_else(|_| opts.source_path.clone())
+            .to_string_lossy()
+            .to_string();
+        cg.init_debug_info(&abs, &source);
+    }
 
     // Determine, before any function is declared, whether the whole program may spawn an
     // async boundary — it references any concurrency intrinsic (the `lin_async`/`lin_parallel`/
@@ -280,13 +295,19 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         cg.finalize_coverage();
     }
 
+    // DWARF (--debug): finalise all debug metadata before any IR/object emission. No-op otherwise.
+    cg.finalize_debug_info();
+
     // 5. Emit LLVM IR if requested (before verify so we can inspect broken IR)
     if opts.emit_ir {
         let ir_path = opts.output_path.with_extension("ll");
         cg.emit_llvm_ir(&ir_path).map_err(CompileError::Codegen)?;
     }
 
-    if opts.optimize {
+    // Debug builds are O0: the LLVM optimisation pipeline would mangle/coalesce instructions and
+    // break the line-table mapping. `opts.optimize` is already false in `--debug` (set by the CLI),
+    // but guard here too so debug info is never run through the optimiser.
+    if opts.optimize && !opts.debug {
         cg.run_optimization_passes().map_err(CompileError::Codegen)?;
     }
 
@@ -309,10 +330,14 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     }
 
     // 8. Link with runtime and any foreign libraries
-    link(&obj_path, &opts.output_path, &foreign_libs, opts.coverage)?;
+    link(&obj_path, &opts.output_path, &foreign_libs, opts.coverage, opts.debug)?;
 
-    // Clean up the .o file.
-    let _ = std::fs::remove_file(&obj_path);
+    // Clean up the .o file — but KEEP it for debug builds. On Linux lldb reads DWARF from the linked
+    // binary, but on macOS the debug map points lldb at the individual .o, so removing it breaks
+    // source-line debugging there. Harmless to keep on Linux.
+    if !opts.debug {
+        let _ = std::fs::remove_file(&obj_path);
+    }
 
     Ok(())
 }
@@ -1113,7 +1138,7 @@ fn relative_path(from: &Path, to: &Path) -> Option<PathBuf> {
     Some(rel)
 }
 
-fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: bool) -> Result<(), CompileError> {
+fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: bool, debug: bool) -> Result<(), CompileError> {
     // Find the lin-runtime static library.
     let runtime_lib = find_runtime_lib();
 
@@ -1215,6 +1240,14 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
 
     // Link system libraries needed by lin-runtime (libc via cc, libm for math).
     cmd.arg("-lm");
+
+    // DWARF (--debug): pass `-g` so the link driver preserves the object's debug sections in the
+    // output binary (cc/clang default behaviour, but make it explicit). On Linux lldb then reads the
+    // `.debug_*` sections straight from the linked binary. `--gc-sections` (below) keeps the debug
+    // info of every section that survives, so it does not conflict.
+    if debug {
+        cmd.arg("-g");
+    }
 
     // Garbage-collect unreferenced sections at link time. `lin-runtime.a` is a single static
     // archive carrying the WHOLE runtime (every intrinsic, every flat-array variant, all the
