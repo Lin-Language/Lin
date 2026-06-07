@@ -2514,7 +2514,7 @@ fn const_type(c: &Const) -> Type {
 
 fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
     match stmt {
-        TypedStmt::Val { slot, value, ty, .. } => {
+        TypedStmt::Val { slot, value, ty, name, span } => {
             // A top-level function val was pre-assigned a FuncId in `global_fn_slots`
             // during the module pre-scan (so `CallTarget::Direct` references resolve).
             // Reuse that id when lowering the function body, otherwise a fresh id is
@@ -2538,6 +2538,13 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 // constructed directly as a packed struct (fast path inside lower_value_into_slot).
                 let t = lower_value_into_slot(value, ty, builder, ctx);
                 builder.slots.insert(*slot, t);
+                // DEBUG (Phase 3): declare this `val` as a named DWARF local so it shows by name
+                // in the debugger under `--debug`. Metadata-only (see `Instruction::DebugDeclare`).
+                if let Some(n) = name {
+                    builder.emit(Instruction::DebugDeclare {
+                        temp: t, name: n.clone(), ty: ty.clone(), param_no: None, span: *span,
+                    });
+                }
                 // Also publish top-level vals to their module global (for closure reads).
                 // A `val` binding is single-store and never reassigned, so the global is
                 // immutable: mark it foldable (`immutable: true`).
@@ -2546,7 +2553,7 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 }
             }
         }
-        TypedStmt::Var { slot, value, ty, .. } => {
+        TypedStmt::Var { slot, value, ty, name, span } => {
             if ctx.slot_is_cell(*slot) {
                 // Mutably captured by a closure, or an owning-typed var reassigned inside a branch:
                 // store in a heap cell shared by reference.
@@ -2583,6 +2590,15 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 let t = coerce_to_slot_type_owning_bind(raw, &value.ty(), ty, builder);
                 // Plain mutable temp; tracked per var slot, updated on LocalSet.
                 builder.slots.insert(*slot, t);
+                // DEBUG (Phase 3): declare this plain `var` as a named DWARF local. Cell-backed
+                // `var`s (mutably captured by a closure) are handled separately above and are NOT
+                // declared — their slot temp is a heap-cell POINTER whose logical value is behind a
+                // deref, which the current emission does not model. Metadata-only.
+                if let Some(n) = name {
+                    builder.emit(Instruction::DebugDeclare {
+                        temp: t, name: n.clone(), ty: ty.clone(), param_no: None, span: *span,
+                    });
+                }
                 // A top-level `var` is also published to its module global so closures (which
                 // can't see main's SSA temps) can read/write it. Writes inside closures go
                 // through GlobalValSet (see LocalSet); reads through GlobalValGet (LocalGet).
@@ -7384,6 +7400,24 @@ fn lower_function_expr_with_id(
         }
     }
     inner_builder.push_scope(); // body scope
+    // DEBUG (Phase 3): record each parameter's source name + type as a DWARF formal-parameter, so
+    // a `--debug` build shows function params by name in the debugger. Purely additive metadata
+    // (see `Instruction::DebugDeclare`): it emits no machine code and is ignored by non-debug
+    // codegen. Use the function body span for the declared line (params have no own span). Skip
+    // the implicit closure env pointer (it has no source name). Captured `var`s become cell
+    // pointers and are intentionally NOT declared (their logical value is behind a deref).
+    for (i, param) in params.iter().enumerate() {
+        if let Some(&t) = inner_builder.slots.get(&param.slot) {
+            inner_builder.emit(Instruction::DebugDeclare {
+                temp: t,
+                name: param.name.clone(),
+                ty: param.ty.clone(),
+                // 1-based parameter ordinal (DWARF `arg:` index). Each must be distinct.
+                param_no: Some((i + 1) as u32),
+                span: body.span(),
+            });
+        }
+    }
     // Imported-module top-level `var` init: if this is an exported entry point, run the
     // module's once-guarded var initialiser before the body so any `var` it reads/mutates is
     // already set up. `take()` ensures only this top-level body emits the call; nested
