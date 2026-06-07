@@ -13840,6 +13840,44 @@ print(toString(growInPlace(g, 50)))
     assert_eq!(out, vec!["3", "0", "50"]);
 }
 
+#[test]
+fn test_tco_typed_record_array_param_no_per_iteration_leak() {
+    // A TYPED sealed-record array (`Transfer[]`, currently a boxed `Object[]` with heap fields)
+    // threaded UNCHANGED through a TAIL-recursive parameter and grown via `push` must not leak a
+    // reference per iteration. The concrete-rc param read takes a `Retain`-in-place on every use
+    // (the `push` receiver AND the tail-call arg), and the matching scope-exit releases land in the
+    // dead `tco_post` block — so without `release_owned_for_tail_call` releasing every read-retain
+    // of a PASS-THROUGH param, the array (header + element buffer + ~20 element records) leaked
+    // once per outer `build()` call (~2800 B/call; 8.4 MB at n=3000). A `Json[]` tail-param is fine
+    // (no read-retain) and a non-tail typed array is fine (scope-exit release runs) — the leak fired
+    // only at the intersection. ASan (ci.yml `asan` leg + the synthetic repro) is the actual leak/
+    // double-free guard; this test pins the OBSERVABLE behavior: correct length + value, no crash.
+    let out = run(r#"
+import { push, length } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Transfer = { "origin": String, "destination": String, "dur": Int32 }
+val makeTransfer = (o: String, d: String, dur: Int32): Transfer =>
+  { "origin": o, "destination": d, "dur": dur }
+// `ts` threaded UNCHANGED through every tail call (same array, grown in place).
+val fill = (ts: Transfer[], i: Int32, n: Int32): Int32 =>
+  if i >= n then length(ts)
+  else
+    push(ts, makeTransfer("A", "B", i))
+    fill(ts, i + 1, n)
+val build = (): Int32 =>
+  var ts: Transfer[] = []
+  fill(ts, 0, 20)
+// Outer loop: every iteration builds a fresh 20-element Transfer[]. A per-iteration leak would
+// scale RSS with the outer count; the result is invariant.
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc else loop(i + 1, n, build())
+print(toString(loop(0, 50, 0)))
+"#);
+    // Every build() fills 20 elements; the loop returns the last build()'s length = 20.
+    assert_eq!(out, vec!["20"]);
+}
+
 /// Extract the body text of the LLVM function `define ... @<name>(...) { ... }` from emitted IR.
 /// Matches on `@<name>(` so it doesn't catch a prefixed/suffixed symbol.
 fn ir_function(ir: &str, name: &str) -> String {
