@@ -189,6 +189,33 @@ impl Checker {
         &self.diagnostics
     }
 
+    /// Snapshot the transient nesting state that a nested `infer_function` may grow. Paired with
+    /// `restore_checker_state` to roll back a DISCARDED speculative type-check (a callback checked
+    /// against an incomplete hint that fails and is re-inferred hint-free). A failed `infer_function`
+    /// can `?`-out between its pushes and matching pops, leaking an unbalanced frame; restoring the
+    /// lengths prevents an unrelated enclosing function from later popping it and inheriting a
+    /// phantom capture set (which would give a top-level function a spurious closure env and break
+    /// its call ABI). Restore only ever TRUNCATES (never grows) — a clean attempt leaves the lengths
+    /// unchanged, so this is a no-op on the success path.
+    pub(crate) fn checker_state_snapshot(&self) -> (usize, usize, usize, Option<String>, bool) {
+        (
+            self.function_scope_depths.len(),
+            self.capture_stack.len(),
+            self.env.scope_depth(),
+            self.current_function.clone(),
+            self.in_tail_position,
+        )
+    }
+
+    pub(crate) fn restore_checker_state(&mut self, snap: (usize, usize, usize, Option<String>, bool)) {
+        let (fsd_len, cap_len, scope_len, cur_fn, tail) = snap;
+        self.function_scope_depths.truncate(fsd_len);
+        self.capture_stack.truncate(cap_len);
+        self.env.truncate_scopes(scope_len);
+        self.current_function = cur_fn;
+        self.in_tail_position = tail;
+    }
+
     pub(crate) fn types_compatible(&self, value: &Type, target: &Type) -> bool {
         is_compatible_env(value, target, Some(&self.env), self.lenient_json, &mut 0)
     }

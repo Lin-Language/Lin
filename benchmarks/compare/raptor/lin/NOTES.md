@@ -219,14 +219,64 @@ its keys would suggest.
   `match … is Transfer` (see the consumer list). The `Leg`/`TimetableLeg`/`Journey` types remain
   in `types.lin` as the reference shapes for when those built-leg values can also be typed.
 
+### The §5.1.1 re-investigation — trips STAY `Json` on the scan path (the WHY, definitively)
+
+The "composite `Json` does not flow into a named `Trip`" rule (§5.1.1) was RE-INVESTIGATED to settle
+whether the hot-path `trip[...]`/`stopTime[...]` reads can be typed. Three things were established:
+
+1. **§5.1.1 is NOT the blocker it reads as.** Its rejection (`compat.rs` /
+   `requires_structured_decode`, ADR-045) fires ONLY for a *bare* `Json`-typed binding/param (its
+   static type is literally `TypeVar(u32::MAX)`). A `Json` **index** expression — `arr[i]`,
+   `obj["k"]`, `map[k]` — returns a FRESH inference TypeVar (`infer_index`, `checker/expr.rs`), which
+   is bidirectionally permissive and **flows into a named record freely**. So a value read out of a
+   `Json` container CAN be soundly relabelled `val trip: Trip = routeTrips[i]` with NO §5.1.1 change.
+
+2. **But the relabel buys nothing today — it adds overhead.** A `val trip: Trip = jsonElem`
+   does NOT reinterpret the boxed `LinObject` in place: because `Trip` is a sealed-eligible record,
+   codegen MATERIALIZES a fresh SEALED packed struct, copying each field OUT of the boxed source via
+   `lin_object_get` (verified in the `-O0` IR: `scanBack` gained `lin_sealed_alloc` +
+   `getelementptr`/`load` packed reads *on top of* the original 10 `lin_object_get` calls). So the
+   typed read is "all the old `lin_object_get`s PLUS a per-element pack" — strictly more work. A
+   measured GROUP run confirmed it was within noise of baseline (104.5s vs 107.5s) with the extra
+   materialization. The change was therefore REVERTED; the scan path stays `Json` (`routeScanner`/
+   `raptor`/loader unchanged). A real win needs trips built+stored+read as a sealed PACKED record
+   END-TO-END (no boxed source to copy from) — see the two blockers below.
+
+3. **Two REAL compiler bugs block the end-to-end packed route (NOT §5.1.1):**
+   - Typing the trip ARRAY `Trip[]` (not just the element) SEGFAULTS: a named-record `Trip[]`
+     triggers the PACKED named-record-array repr, but the monomorphized `sort$Object` comparator
+     reads its elements as boxed `Object[]` → garbage pointer (ASan: SEGV in `index_probe`). Same
+     packed-vs-boxed class as memory `project_sealed_combinator_sort_fix`.
+   - A `Trip | Null` value threaded through a tail-RECURSIVE param is a HEAP-USE-AFTER-FREE (ASan: UAF
+     in `lin_rc_retain` inside `scanRouteAt`) — the typed-union recursive-param RC contract differs
+     from the plain-`Json` one. A lowering/RC bug, out of scope here.
+
+**A CHECKER BUG was found and FIXED en route (the HIGHEST-VALUE outcome of this work).** While the
+scan was experimentally typed, `createRaptor`/`scanBack` called the generic `sort` with a concrete
+element type, triggering the importer's monomorphization of the raptor module. An imported function
+that (a) calls a generic AND (b) contains a nested closure capturing one of its OWN locals then
+mis-compiled with *"Incorrect number of arguments passed to called function!"*: the exported function
+gained a spurious closure-env parameter (5-ptr IR def with capture-env reads; the importer's direct
+call passes only 4 → arity mismatch). Root cause: a failed SPECULATIVE callback type-check (callback
+checked against an INCOMPLETE generic hint, then re-inferred hint-free via the `Err(_) =>
+self.infer_expr(arg)` fallback) `?`-ed out of `infer_function` BETWEEN its push and its matching pop
+of the `capture_stack` / `function_scope_depths` / env-scope stacks, leaking an unbalanced frame; an
+UNRELATED enclosing function later popped it and **inherited the discarded attempt's captures** (it
+captured its OWN locals). FIXED in `crates/lin-check/src/checker/` by snapshotting + rolling back the
+transient checker state on the discarded speculative-callback path (both `Err(_) => infer_expr`
+fallbacks in `call.rs` — the prefix-call and dot-call sites), via `Checker::checker_state_snapshot` /
+`restore_checker_state` (`checker/mod.rs`) + `TypeEnv::truncate_scopes` (`env.rs`). Covered by
+`test_cross_module_generic_call_with_capturing_closure`; full `cargo test --workspace` (597+) AND the
+ASan stdlib/example suite (72 files) stay green. This benefits ALL typed-record cross-module code that
+calls generics, and is a PREREQUISITE for any future end-to-end packed-`Trip` typing of the scan.
+
 **Type-system friction found (useful for the map-type / narrowing work):**
 
 1. A bare `Json`-typed binding does **not** flow into a named-record parameter
    (`getDateNumber(jsonVal)` is rejected `?T … expected Date`). Only a `Json`
-   *literal* or a `Json` *scalar-index* (`row[i]`) coerces on the spot into a
-   concrete `String`/`Int32` field/param — composite `Json` (`stopTimes`,
-   `service`) does not, which is exactly why trips/journeys built from `Json`-map
-   sources can't be typed today.
+   *literal* or a `Json` *index* (`row[i]`, `obj["k"]`) coerces — the latter via the fresh
+   inference var `infer_index` returns (see the "Typed-trip read" section above), which DOES flow into
+   a named record. A bare `Json` *binding/param* (static type `TypeVar(MAX)`) does not.
 2. The `if`-expression form does **not** narrow a `T | Null` named-record union to
    `T` — neither `if x != null`, `if x is Null then … else`, nor `if x is T`
    refines it. Only a `match … is Null / is T` narrows. `raptor.lin`'s optional
