@@ -251,11 +251,49 @@ val squares = range(1, 4).map(n => n * n)     // [1, 4, 9]
 - Async: `val p = async(() => work())` then `await(p)`, typed `(p: T) => T | Error` — faults surface as `Error`, not crashes. You must `await` before using the value. `async` thunks must not capture `var` and must not return a `Function` or `Iterator` (compile errors). `worker(handler, init)` confines `var` state to one thread; `request(w, msg)` / `close(w)` drive it.
 
 ### Types
-- Structural and width-subtyped: an object with extra fields satisfies a narrower object type.
-- Unions `A | B | C`; narrow with `is`/`has`. `Json` is the dynamic escape hatch — when a value's shape is genuinely dynamic (e.g. a recursive AST indexed by per-variant fields) type it `Json` and read with `["key"]`; you cannot do typed arithmetic on a `Json` without narrowing/decoding first.
+- **Avoid `Json`. It is an escape hatch, not a default.** Reach for it ONLY when a value's shape is genuinely dynamic and unknowable at compile time — parsing arbitrary external JSON, a recursive AST indexed by per-variant fields, untyped wire data. The rest of the time — which is almost always — use a **named record type, a generic, or a union**. `Json` defeats the type checker (no field checking, no arithmetic without narrowing/decoding), defeats width-subtyping, and is a real performance cliff: field access on `Json` is an optimisation barrier the backend can't hoist or fold, where typed records get inlined to a constant slot load. If you find yourself writing `(x: Json)` and then `x["field"]`, stop and write the record type instead.
+- Structural and width-subtyped: an object with extra fields satisfies a narrower object type. Prefer naming your shapes: `type Record = { "name": String, "score": Int32 }` and typing functions `(r: Record): ...`, not `(r: Json)`.
+- Unions `A | B | C`; narrow with `is`/`has`.
 - Typed maps use an index signature: `{ String: Int32 }`, missing key → `Null`. Arrays are `T[]`; fixed tuples are positional `[T1, T2]`.
 - `Number` is a zero-cost numerically-bounded generic, not a union.
 - Sealed/exact named records exist for unboxed layout (ADR-057, spec §5.9.1) — check the spec before relying on their precise semantics.
+
+#### Use generics instead of `Json` for shape-agnostic code
+
+When a function works over *any* element type — containers, wrappers, pipelines — make it **generic** with a type parameter `<T>` rather than smearing everything to `Json`. Generics are monomorphised (zero-cost) and keep the element type precise end-to-end:
+
+```lin
+// A generic, type-safe "first or fallback" — works for any T, no Json anywhere.
+val firstOr = <T>(xs: T[], fallback: T): T =>
+  if length(xs) == 0 then fallback else xs[0]
+
+val n: Int32 = firstOr([3, 4, 5], 0)          // T = Int32
+val s: String = firstOr(["a", "b"], "?")       // T = String
+
+// A generic wrapper type carries its payload type, instead of { "value": Json }.
+type Box<T> = { "value": T }
+
+val unwrap = <T>(b: Box<T>): T => b["value"]
+```
+
+Compare with the anti-pattern `val firstOr = (xs: Json, fallback: Json): Json => ...`, which loses the element type, forbids arithmetic on the result without narrowing, and is slower.
+
+#### Intersection types with `&` — composing record shapes
+
+Use `&` to build a record type that has **all** the fields of its parts, instead of retyping a wide shape as `Json`. This is the idiom for "X, plus some extra fields" (ADR-061):
+
+```lin
+type Entity = { "id": String, "createdAt": Int32 }
+type Named = { "name": String }
+
+// HasName has id, createdAt AND name — all three fields, fully typed.
+type NamedEntity = Entity & Named
+
+val describe = (e: NamedEntity): String =>
+  "${e["name"]} (#${e["id"]})"          // every field is checked and fast
+```
+
+`&` resolves to a single structural `Type::Object` with the merged fields, so the result is width-subtyped and field access stays inline-fast — none of the `Json` penalties.
 
 ### Bracket access
 - Bracket access is **safe**: a missing object key yields `Null`, and `Null` propagates through a chain (`obj["a"]["b"]`). Array out-of-bounds is a runtime error. Don't conflate a `Null` miss with an empty string — narrow with `is Null`.
