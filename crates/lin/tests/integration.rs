@@ -2521,6 +2521,57 @@ print(toString(scale(5, 3)))
 }
 
 #[test]
+fn test_imported_generic_object_message_across_worker() {
+    // Regression: an IMPORTED generic function that builds an object literal with a scalar `T`
+    // field and sends it to a worker (`message`/`request`, which deep-copy the value for thread
+    // transfer) crashed — `lin_worker_message`'s argument was passed as the RAW `LinObject*` instead
+    // of a boxed `TaggedVal*`, because the codegen boxed on `is_pointer_value()` (true for a heap
+    // object) rather than the static type. The worker thread then read the object's first bytes as a
+    // TaggedVal tag → misaligned-pointer deref. The same code defined INLINE worked (it monomorphized
+    // in-module); only the cross-module instantiation tripped it. Fix: box `message`/`request`
+    // (and `shared`/`set`) arguments on the static type — a concrete heap value is boxed even though
+    // it is pointer-shaped; only an already-boxed `is_union_type` value passes through.
+    let dir = std::env::temp_dir().join(format!("lin_genmsg_xmod_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("emit.lin"),
+        "import { worker, message, request } from \"std/async\"\n\
+         type Msg<T> = { \"kind\": String, \"value\": T }\n\
+         export val mkSink = <T, S>(reduce: (T, S) => S, initial: S, sample: T): Json =>\n\
+        \x20 var state = initial\n\
+        \x20 worker(\n\
+        \x20   (m: Msg<T>): S =>\n\
+        \x20     match m[\"kind\"]\n\
+        \x20       is \"drain\" => state\n\
+        \x20       else =>\n\
+        \x20         state = reduce(m[\"value\"], state)\n\
+        \x20         state,\n\
+        \x20   (): Null => null\n\
+        \x20 )\n\
+         export val send = <T>(e: Json, value: T): Null =>\n\
+        \x20 message(e, { \"kind\": \"event\", \"value\": value })\n\
+         export val drainSink = <T, S>(e: Json, sample: T): S | Error =>\n\
+        \x20 request(e, { \"kind\": \"drain\", \"value\": sample })\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ close }} from "std/async"
+import {{ mkSink, send, drainSink }} from "{}/emit"
+val main = (): Null =>
+  val w = mkSink((x: Int32, sum: Int32): Int32 => sum + x, 0, 0)
+  send(w, 10)
+  send(w, 5)
+  val total: Int32 | Error = drainSink(w, 0)
+  close(w)
+  match total
+    is Error => print("err")
+    else => print("total=${{toString(total)}}")
+main()
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["total=15"]);
+}
+
+#[test]
 fn test_imported_fn_uses_module_level_val() {
     // Regression: a top-level non-function `val` referenced inside an EXPORTED function
     // mis-lowered in the import path (lower_import_module never registered the val, so the
@@ -7113,6 +7164,13 @@ fn test_fmt_preserves_generic_type_params() {
     assert_eq!(
         fmt("val id = <T>(x: T): T => x\n").trim(),
         "val id = <T>(x: T): T => x"
+    );
+    // A generic type APPLICATION (`Name<Args>` referencing a generic type) must round-trip with
+    // angle brackets — NOT be rewritten to `Name[Args]` (array syntax), which changes meaning and
+    // no longer parses. Regression for the std/event `val b: Bus<Int32> = …` corruption.
+    assert_eq!(
+        fmt("type Bus<T> = { \"v\": T }\nval mk = <T>(x: T): Bus<T> => { \"v\": x }\n").trim(),
+        "type Bus<T> = { \"v\": T }\nval mk = <T>(x: T): Bus<T> => { \"v\": x }"
     );
 }
 
@@ -13617,6 +13675,40 @@ print("${loop(0, 200, 0)}")
 "#);
     // each build() = 3 + 2 = 5; 200 iterations = 1000.
     assert_eq!(out, vec!["1000"]);
+}
+
+#[test]
+fn test_sealed_record_array_field_in_outer_array_build_drop() {
+    // REGRESSION (monomorphization symbol collision → misaligned-pointer deref / abort): an outer
+    // `Route[]` whose element `Route = {id:String, legs: Leg[]}` has a field that is itself an
+    // ARRAY OF SEALED RECORDS (`Leg = {name:String, d:Int32}`). Pushing a `Route` and a `Leg` both
+    // go through the generic `push<T>(T[], T)`; the specialization name mangled `Type::Object` to a
+    // single literal `"Object"`, so `push$Route` and `push$Leg` COLLIDED on the symbol `push$Object`.
+    // The monomorphizer minted two distinct specializations but under one name, so codegen emitted
+    // both materialize bodies into one LLVM function — only the first (Route's) reachable. A
+    // `push(Leg)` call then ran the Route body, reading the Leg struct's scalar `d` field at the
+    // `legs`-pointer offset and boxing it as an array (`lin_box_array(0x1)`) → `retain_tagged_payload`
+    // dereferenced the bogus pointer (`object.rs:281`, misaligned 0x1) and aborted. Fixed by mangling
+    // `Type::Object` by field SHAPE so structurally-distinct records get distinct specialization
+    // names. ASan (CI job over a build/drop loop) is the corruption/leak guard; here we assert the
+    // length is correct across many iterations (the abort would otherwise crash the run).
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+type Leg = { "name": String, "d": Int32 }
+type Route = { "id": String, "legs": Leg[] }
+val build = (): Int32 =>
+  var rs: Route[] = []
+  var legs: Leg[] = []
+  push(legs, { "name": "x", "d": 1 })
+  push(rs, { "id": "r", "legs": legs })
+  length(rs)
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc else loop(i + 1, n, acc + build())
+print("${loop(0, 300, 0)}")
+"#);
+    // each build() pushes exactly one Route → length 1; 300 iterations = 300.
+    assert_eq!(out, vec!["300"]);
 }
 
 #[test]
