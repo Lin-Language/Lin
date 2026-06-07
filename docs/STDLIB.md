@@ -5100,9 +5100,9 @@ replace readFile = (path: String): Json => "mock contents of ${path}"
 - **Test-only.** `replace` is permitted only in a `*.test.lin` file; using it in a
   `lin build`/`lin run` program is a hard compile error.
 
-For worked examples see `examples/processes/` (mocking `std/process.exec`),
-`examples/dijkstra/` (mocking `std/fs` read/write), and `examples/web-server/`
-(mocking `std/template.render`); ADR-046 has the design.
+For worked examples see `examples/processes/` (mocking `std/process.exec`) and
+`examples/web-server/` (mocking `std/fs` read/write in the `/route` solver, and
+`std/template.render` in the handlers); ADR-046 has the design.
 
 ---
 
