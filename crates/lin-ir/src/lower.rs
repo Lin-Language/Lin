@@ -3173,6 +3173,21 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 builder.register_owned(owned, result_type.clone());
                 return owned;
             }
+            // Indexing a BOXED array (or any numeric-keyed container) whose ELEMENT is a sealed
+            // scalar record: codegen reads the boxed element and PROJECTS it into a FRESH +1 sealed
+            // struct (`unbox_tagged_val_to_type` → `sealed_project_from`, which retains the element's
+            // heap fields into the new struct). The result is therefore ALREADY owned and
+            // container-independent — exactly like the union `result_is_fresh_owned` box above.
+            // The generic `is_rc_type` retain below would treat it as a borrowed interior value and
+            // add a SECOND reference that is never released (only one scope-exit release is emitted),
+            // leaking the struct (and its heap fields) once per evaluation — the dominant per-`ts[i]`
+            // leak in a boxed `Trip[]` build/drop loop (ASan-confirmed). Register it owned directly,
+            // skipping the spurious retain. (Gated on `result_is_fresh_owned` so a sealed value read
+            // through a borrowed path — were one to reach here — still takes the retain.)
+            if result_is_fresh_owned && is_sealed_scalar_repr(result_type) {
+                builder.register_owned(dst, result_type.clone());
+                return dst;
+            }
             if is_rc_type(result_type) {
                 builder.emit(Instruction::Retain { val: dst, ty: result_type.clone() });
                 builder.register_owned(dst, result_type.clone());
@@ -3322,7 +3337,18 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // A sealed-record array store COPIES the element struct's payload (`lin_sealed_array_set`
             // retains heap fields per descriptor); the source struct stays OWNED and is released at
             // scope exit (dropping its heap fields, balancing the retains). Skip the transfer.
-            if !is_sealed_scalar_array(obj_ty) {
+            //
+            // A SEALED-repr element set into a BOXED (tagged `Object[]`) array is the index-set
+            // analogue of `push_sealed_elem_into_tagged`: codegen MATERIALIZES a fresh boxed
+            // LinObject from the sealed struct (retaining its heap fields into the new object) and
+            // stores THAT — it does NOT store the source struct pointer. So the source must STAY
+            // OWNED (released at scope exit, dropping its heap fields, balancing the materialization's
+            // per-field retains). A `transfer_into_container` Retain here would add a reference the
+            // array never holds → a per-set leak of the source struct (ASan-confirmed once the
+            // materialization crash was fixed). Skip the transfer for this case too.
+            let set_sealed_elem_into_tagged = is_sealed_scalar_repr(&val_ty)
+                && !is_sealed_scalar_array(obj_ty);
+            if !is_sealed_scalar_array(obj_ty) && !set_sealed_elem_into_tagged {
                 builder.transfer_into_container(val_temp, value, op_consumes_union);
             }
             let free_shell = op_consumes_union

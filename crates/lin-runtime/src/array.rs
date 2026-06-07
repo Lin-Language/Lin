@@ -580,6 +580,23 @@ pub unsafe extern "C" fn lin_array_set(arr: *mut LinArray, idx: i64, tagged: *co
     let elem_tag = (*arr).elem_tag;
     if elem_tag == 0xFF {
         let slot = (*arr).data.add(actual as usize);
+        // Release the OLD element's heap payload before overwriting it — the slot owns one reference
+        // to its element (the array's drop walk in `lin_array_release` releases each element), so an
+        // in-place overwrite must drop the displaced element's reference or it leaks. Mirrors
+        // `lin_object_set` (release-old-value) and `lin_sealed_array_set` (release-old-fields). The
+        // IR `IndexSet`/`ArraySetDyn` lowering supplies the NEW element's owning reference (transfer)
+        // but never reads the old value, so this release cannot double-free. Scalars (and interned
+        // string literals with a saturated refcount) are no-ops. Without this the boxed `Trip[]`
+        // `set(arr, i, {…})` leaked the displaced element (ASan-confirmed once the materialization
+        // crash was fixed).
+        let old = &*slot;
+        match old.tag {
+            TAG_STR => crate::string::lin_string_release(old.payload as *mut crate::string::LinString),
+            TAG_ARRAY => lin_array_release(old.payload as *mut LinArray),
+            TAG_OBJECT => crate::object::lin_object_release(old.payload as *mut crate::object::LinObject),
+            TAG_FUNCTION => crate::memory::lin_closure_release(old.payload as *mut u8),
+            _ => {}
+        }
         std::ptr::copy_nonoverlapping(tagged as *const u8, slot as *mut u8, std::mem::size_of::<TaggedVal>());
     } else {
         let tag = if tagged.is_null() { TAG_NULL } else { (*tagged).tag };
