@@ -2280,6 +2280,31 @@ print(toString(dec()))
 }
 
 #[test]
+fn test_objlit_field_closure_captures_var_escapes() {
+    // Regression: a closure that captures a `var` cell and is stored into an OBJECT-LITERAL
+    // FIELD, then escapes (the object is returned from the constructing fn). The object's
+    // tagged-payload retain did not handle TAG_FUNCTION, so the constructing frame's
+    // `lin_closure_release` freed the closure (and its captured-var cell) while the escaping
+    // object still held it — a use-after-free (SIGSEGV). The bare-return and array-element
+    // forms (see test_multiple_closures_share_var) already worked; only the object field was
+    // broken. Must increment correctly across calls (1, then 2).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val mk = (): Json =>
+  var n = 0
+  { "inc": (): Int32 =>
+             n = n + 1
+             n }
+
+val c = mk()
+print(toString(c["inc"]()))
+print(toString(c["inc"]()))
+"#);
+    assert_eq!(output, vec!["1", "2"]);
+}
+
+#[test]
 fn test_nested_function_calls() {
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
