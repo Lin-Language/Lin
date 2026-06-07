@@ -4320,6 +4320,16 @@ fn push_output(out: Temp, flat: Option<FlatElemKind>, elem_ty: &Type, val: Temp,
             builder.emit(Instruction::CallIntrinsic {
                 dst: push_dst, intrinsic: Intrinsic::Push, args: vec![out, boxed], ret_ty: Type::Null,
             });
+            // `Push` (`lin_array_push_tagged`) MOVES the box's inner into the result slot without
+            // retaining. When `box_to_json` made a FRESH box for a concrete `val` (val_ty not a
+            // union), its 16-byte shell is now orphaned — the inner lives on in the array. Reclaim
+            // the shell (the inner is NOT touched — that pointer belongs to the array). Skipped when
+            // `boxed == val` (val was already a union; that box is owned/freed elsewhere — e.g. the
+            // map elem box freed by `free_combinator_elem_box`). Without this a concrete-producing
+            // `map(src, x => {…})` leaked the per-element push box shell (~16 B/elem).
+            if boxed != val {
+                builder.emit(Instruction::FreeBoxShell { val: boxed });
+            }
         }
     }
 }
@@ -4755,6 +4765,43 @@ fn lower_while(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx
     builder.const_temp(Const::Null)
 }
 
+/// Reclaim the 16-byte SHELL of a `map`/`filter` per-element box after the loop body has consumed
+/// it (pushed it / built the mapped value from it).
+///
+/// When the source is a TAGGED (union/Json) array, `emit_index_loop`'s `Index` lowers to
+/// `lin_array_get_tagged`, which allocates a FRESH standalone `TaggedVal*` box per element. The
+/// result push (`Intrinsic::Push` → `lin_array_push_tagged`) MOVES the box's inner payload into the
+/// result slot WITHOUT bumping the inner refcount — so the inner's single +1 is now owned by the
+/// result array, and the per-element box's SHELL is orphaned (it leaked ~16 B/elem, ASan-confirmed
+/// in `map(src, x => x)` / `filter`).
+///
+/// We free ONLY the shell (`FreeBoxShell` → `lin_tagged_free_box`), never the inner — the inner
+/// pointer belongs to the result array (moved) or, for an identity map over interned/borrowed
+/// strings, to the source. A full `lin_tagged_release` here would DOUBLE-FREE the moved inner
+/// (the `filter$String`-over-`split` UAF: `lin_array_push_tagged` moves, then a full release of
+/// the elem box frees the very string the result array now owns). The shell is always a freshly
+/// allocated, unshared 16-byte `TaggedVal*`, so freeing it is sound; it is null/cached-box safe.
+///
+/// No-op for a flat-scalar element read (no box was allocated — the read produced a raw scalar).
+fn free_combinator_elem_box(elem: Temp, elem_ty: &Type, builder: &mut FuncBuilder) {
+    // Only a union/Json read allocates a standalone box; flat-scalar reads carry no shell.
+    if is_union_ty(elem_ty) {
+        builder.emit(Instruction::FreeBoxShell { val: elem });
+    }
+}
+
+/// FULLY reclaim a `filter` per-element box for an element that is DROPPED (predicate false):
+/// the shell AND the inner +1 that `lin_array_get_tagged` retained, since nothing else owns it.
+/// `lin_tagged_release` is tag-aware (releases the inner heap value then frees the shell) and
+/// null/cached-box safe. Only fires for a union/Json read (a box was allocated). NEVER used on the
+/// KEEP path — there the element's inner was moved/retained into the result (see
+/// `free_combinator_elem_box`, the shell-only counterpart).
+fn free_combinator_elem_box_full(elem: Temp, elem_ty: &Type, builder: &mut FuncBuilder) {
+    if is_union_ty(elem_ty) {
+        builder.emit(Instruction::Release { val: elem, ty: elem_ty.clone() });
+    }
+}
+
 /// `map(iterable, f)` → new array of `f(elem)` for each element.
 fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     let iterable_ty = args[0].ty();
@@ -4787,6 +4834,7 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
                 inline_lambda_body(&lam_params, &lam_body, &[(elem, elem_ty.clone()), (idx, Type::Int32)], b, c);
             // `mapped` is the lambda's freshly-owned result (+1) — MOVE it into the result array.
             push_output(out, flat, &out_elem_ty, mapped, &mapped_ty, false, b);
+            free_combinator_elem_box(elem, &elem_ty, b);
         });
         return out;
     }
@@ -4799,6 +4847,7 @@ fn lower_map(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilder, 
         let mapped = call_body_closure(f, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &param_tys, &cb_ret, b);
         // `mapped` is the callback's freshly-owned result (+1) — MOVE it into the result array.
         push_output(out, flat, &out_elem_ty, mapped, &cb_ret, false, b);
+        free_combinator_elem_box(elem, &elem_ty, b);
     });
     out
 }
@@ -4841,14 +4890,23 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
                 d
             };
             let keep_block = b.alloc_block("filter_keep");
-            let skip_block = b.alloc_block("filter_skip");
-            b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: skip_block });
+            let drop_block = b.alloc_block("filter_drop");
+            let join_block = b.alloc_block("filter_skip");
+            b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: drop_block });
             b.switch_to(keep_block);
-            // `elem` is BORROWED from the source array — the result array must take its own
-            // reference (retain on a tagged concrete-rc push; see `push_output`).
+            // KEEP: `elem` is BORROWED from the source array — the result array must take its own
+            // reference (retain on a tagged concrete-rc push; see `push_output`). The push consumed
+            // the per-element box's inner; reclaim only the box SHELL (shell-only — see helper doc).
             push_output(out, flat, &out_elem_ty, elem, &elem_ty, true, b);
-            b.terminate(Terminator::Jump(skip_block));
-            b.switch_to(skip_block);
+            free_combinator_elem_box(elem, &elem_ty, b);
+            b.terminate(Terminator::Jump(join_block));
+            b.switch_to(drop_block);
+            // SKIP: the element is dropped, nothing owns it — FULLY release the per-element box
+            // (shell + the inner +1 that `lin_array_get_tagged` retained), else every skipped
+            // element's inner leaks (the `filter`-over-`split` residual).
+            free_combinator_elem_box_full(elem, &elem_ty, b);
+            b.terminate(Terminator::Jump(join_block));
+            b.switch_to(join_block);
         });
         return out;
     }
@@ -4859,13 +4917,19 @@ fn lower_filter(args: &[TypedExpr], result_type: &Type, builder: &mut FuncBuilde
         let idx = narrow_loop_index(i, b);
         let keep = call_body_closure(pred, &[(elem, elem_ty.clone()), (idx, Type::Int32)], &param_tys, &Type::Bool, b);
         let keep_block = b.alloc_block("filter_keep");
-        let skip_block = b.alloc_block("filter_skip");
-        b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: skip_block });
+        let drop_block = b.alloc_block("filter_drop");
+        let join_block = b.alloc_block("filter_skip");
+        b.terminate(Terminator::CondJump { cond: keep, then_block: keep_block, else_block: drop_block });
         b.switch_to(keep_block);
-        // `elem` is BORROWED from the source array — retain on the tagged concrete-rc push.
+        // KEEP: retain on the tagged concrete-rc push, then reclaim the box shell.
         push_output(out, flat, &out_elem_ty, elem, &elem_ty, true, b);
-        b.terminate(Terminator::Jump(skip_block));
-        b.switch_to(skip_block);
+        free_combinator_elem_box(elem, &elem_ty, b);
+        b.terminate(Terminator::Jump(join_block));
+        b.switch_to(drop_block);
+        // SKIP: fully release the dropped element's box.
+        free_combinator_elem_box_full(elem, &elem_ty, b);
+        b.terminate(Terminator::Jump(join_block));
+        b.switch_to(join_block);
     });
     out
 }
