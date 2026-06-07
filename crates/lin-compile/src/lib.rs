@@ -1403,6 +1403,18 @@ fn coverage_link_driver() -> String {
 }
 
 fn find_runtime_lib() -> Option<PathBuf> {
+    // 0. Explicit override via LIN_RUNTIME_LIB. The integration-test harness sets this to a
+    //    debug-stripped COPY of liblin_runtime.a: the suite links hundreds of tiny programs and
+    //    each link is dominated by pulling the ~250MB DWARF-laden archive through the linker, so a
+    //    stripped (~95MB) copy roughly halves total suite wall-clock. The canonical archive is left
+    //    untouched, so local ASan/UAF-hunting (which relies on runtime symbolization) is unaffected.
+    if let Ok(p) = std::env::var("LIN_RUNTIME_LIB") {
+        let path = PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
     // 1. Next to the running executable (installed / bundled binary).
     if let Ok(exe) = std::env::current_exe() {
         let dir = exe.parent()?;

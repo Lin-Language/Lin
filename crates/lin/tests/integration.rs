@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 
 static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -23,6 +24,76 @@ fn lin_bin() -> PathBuf {
     workspace_root().join("target/debug/lin")
 }
 
+/// A debug-STRIPPED copy of `liblin_runtime.a`, built once per test process.
+///
+/// Every integration test compiles a tiny program with `lin build`, and each such build is
+/// dominated not by codegen but by the linker pulling the runtime static archive: in dev builds
+/// that archive carries ~250MB of DWARF across ~1000 codegen-unit objects, so the per-test link is
+/// hundreds of ms of archive I/O regardless of how small the test program is. Linking against a
+/// `strip --strip-debug`'d copy (~95MB) roughly halves total suite wall-clock.
+///
+/// We strip a COPY and point `lin build` at it via `LIN_RUNTIME_LIB` (see `find_runtime_lib`),
+/// deliberately leaving the canonical `target/debug/liblin_runtime.a` untouched — local
+/// ASan/UAF-hunting links against that and relies on its runtime symbolization. The string
+/// comparisons these tests make never need a symbolized backtrace, so stripping costs them nothing.
+///
+/// Best-effort: if the canonical archive or the `strip` tool is missing, returns `None` and tests
+/// fall back to the full-debug archive (correct, just slower). Built once via `OnceLock`.
+fn stripped_runtime_lib() -> Option<&'static Path> {
+    static STRIPPED: OnceLock<Option<PathBuf>> = OnceLock::new();
+    STRIPPED
+        .get_or_init(|| {
+            let canonical = workspace_root().join("target/debug/liblin_runtime.a");
+            if !canonical.exists() {
+                return None;
+            }
+            let stripped = workspace_root().join("target/debug/liblin_runtime.stripped.a");
+
+            // Rebuild the stripped copy if missing or older than the canonical archive (so a
+            // freshly rebuilt runtime is always reflected). Both checks are best-effort.
+            let needs_rebuild = match (fs::metadata(&stripped), fs::metadata(&canonical)) {
+                (Ok(s), Ok(c)) => match (s.modified(), c.modified()) {
+                    (Ok(sm), Ok(cm)) => sm < cm,
+                    _ => true,
+                },
+                _ => true,
+            };
+
+            if needs_rebuild {
+                // Build into a process-unique temp, then atomically rename into place. This keeps
+                // the rebuild safe when more than one test process runs at once (e.g. `cargo test
+                // --workspace` alongside another invocation): each writes its own temp and the
+                // rename is atomic, so no reader ever observes a half-written archive.
+                let pid = std::process::id();
+                let tmp = workspace_root()
+                    .join(format!("target/debug/.liblin_runtime.stripped.{}.a", pid));
+                if fs::copy(&canonical, &tmp).is_err() {
+                    return None;
+                }
+                // GNU strip (Linux) takes --strip-debug; Apple's strip (macOS) spells it -S. Pick
+                // via host cfg — the test process runs on its own host.
+                let strip_flag = if cfg!(target_os = "macos") { "-S" } else { "--strip-debug" };
+                let ok = Command::new("strip")
+                    .arg(strip_flag)
+                    .arg(&tmp)
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+                if !ok {
+                    // strip unavailable/failed: drop the temp and use the canonical archive.
+                    let _ = fs::remove_file(&tmp);
+                    return None;
+                }
+                if fs::rename(&tmp, &stripped).is_err() {
+                    let _ = fs::remove_file(&tmp);
+                    return None;
+                }
+            }
+            Some(stripped)
+        })
+        .as_deref()
+}
+
 /// A `lin` Command pre-armed with the `LIN_ALLOW_INTRINSICS` escape hatch (ADR-060) so the
 /// compiler's own intrinsic-exercising fixtures (which write user-level `.lin` sources that call
 /// `lin_*` directly) keep type-checking. Tests that must exercise the gate REJECTING an intrinsic
@@ -30,6 +101,11 @@ fn lin_bin() -> PathBuf {
 fn lin_cmd() -> Command {
     let mut cmd = Command::new(lin_bin());
     cmd.env("LIN_ALLOW_INTRINSICS", "1");
+    // Link against the debug-stripped runtime copy (see `stripped_runtime_lib`) to cut per-test
+    // link time. Best-effort: absent → `lin build` falls back to the canonical archive.
+    if let Some(rt) = stripped_runtime_lib() {
+        cmd.env("LIN_RUNTIME_LIB", rt);
+    }
     cmd
 }
 
@@ -5549,10 +5625,14 @@ print(toString(length(snap)))
 
 #[test]
 fn test_async_real_parallelism() {
-    // Two thunks that each sleep 150ms. With real OS threads the wall-clock should be
-    // ~150ms (overlap), not ~300ms (sequential). Assert it completed under the sequential
-    // bound — generous to avoid CI flakiness (slow/oversubscribed runners), but still
-    // proves overlap since the sequential floor is ~300ms.
+    // Two thunks that each sleep 150ms run on real OS threads should overlap (~150ms wall), not
+    // run sequentially (~300ms). Rather than assert against a fixed absolute bound (brittle on
+    // slow/oversubscribed CI runners — the old `elapsed < 290` could spuriously fail when the
+    // whole machine is loaded), we self-calibrate: measure the SEQUENTIAL cost of the same two
+    // sleeps in this same process, then the PARALLEL cost, and require the parallel run to be
+    // clearly faster. Both measurements inflate together under load, so the RELATIVE comparison is
+    // robust while still proving genuine overlap (if threads didn't overlap, par ≈ seq and the
+    // test correctly fails).
     let output = run(r#"import { print } from "std/io"
 import { toString } from "std/string"
 import { async, await } from "std/async"
@@ -5562,7 +5642,15 @@ val unwrap = (r: Json): Int32 =>
   match r
     is Error => 0
     else => r
-val start = now()
+
+// Sequential baseline: two 150ms sleeps back to back (~300ms).
+val seqStart = now()
+sleep(150)
+sleep(150)
+val seqElapsed = now() - seqStart
+
+// Parallel: the same two sleeps as concurrent thunks (~150ms if they really overlap).
+val parStart = now()
 val p1 = async(() =>
   sleep(150)
   1
@@ -5573,12 +5661,16 @@ val p2 = async(() =>
 )
 val r1 = unwrap(await(p1))
 val r2 = unwrap(await(p2))
-val elapsed = now() - start
+val parElapsed = now() - parStart
+
 print(toString(r1 + r2))
-if elapsed < 290 then print("PARALLEL") else print("SEQUENTIAL")
+// Require a clear margin: parallel must beat sequential by more than a quarter of the
+// sequential cost. Real overlap roughly halves it, so this has wide headroom yet still rejects
+// a non-overlapping (sequential) implementation.
+if parElapsed < seqElapsed - seqElapsed / 4 then print("PARALLEL") else print("SEQUENTIAL")
 "#);
     assert_eq!(output, vec!["3", "PARALLEL"],
-        "two 150ms thunks should overlap (real threads), completing well under the ~300ms sequential floor");
+        "two 150ms thunks should overlap (real threads), beating the sequential baseline by a clear margin");
 }
 
 #[test]
