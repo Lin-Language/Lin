@@ -52,6 +52,12 @@ impl LanguageServer for Backend {
                 rename_provider: Some(OneOf::Left(true)),
                 // Inlay type hints on bindings whose type is inferred (no explicit annotation).
                 inlay_hint_provider: Some(OneOf::Left(true)),
+                // Signature help inside a call's argument list, triggered by `(` and `,`.
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".into(), ",".into()]),
+                    retrigger_characters: Some(vec![",".into()]),
+                    work_done_progress_options: Default::default(),
+                }),
                 // Type-aware semantic highlighting (full-document only; the TextMate grammar stays
                 // the fallback for incremental edits).
                 semantic_tokens_provider: Some(
@@ -457,6 +463,23 @@ impl LanguageServer for Backend {
             result_id: None,
             data,
         })))
+    }
+
+    async fn signature_help(
+        &self,
+        params: SignatureHelpParams,
+    ) -> Result<Option<SignatureHelp>> {
+        let uri = &params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let base_dir = file_dir(uri);
+        let analysis = analyse(&source, base_dir.as_deref());
+        let offset = position_to_offset(&source, pos);
+
+        Ok(signature_help(&source, &analysis, offset))
     }
 }
 
@@ -1309,6 +1332,215 @@ fn collect_type_spans_in_type(ty: &lin_parse::ast::TypeExpr, out: &mut Vec<lin_c
     }
 }
 
+// ── signature help ─────────────────────────────────────────────────────────────
+
+/// Build signature help when `offset` sits inside a `f(…)` call's argument list. Returns `None`
+/// when the cursor is not inside a resolvable call (e.g. dot-calls, or callees whose function type
+/// can't be looked up) — per the no-guessing rule.
+fn signature_help(source: &str, analysis: &Analysis, offset: usize) -> Option<SignatureHelp> {
+    // Find the innermost plain `Call` whose argument region (between `(` and the closing `)`)
+    // contains the cursor, plus the byte offset just after its opening `(`.
+    let (callee_span, paren_after) = find_enclosing_call(&analysis.module.statements, source, offset)?;
+
+    // Resolve the callee's type via the type map (the callee is an identifier use-site).
+    let ty_str = tightest_span(&analysis.span_type_map, callee_span.start as usize)
+        .map(|(_, s, _)| s.clone())?;
+    // Only function-typed callees produce a signature.
+    let params = function_param_types(&ty_str)?;
+
+    // Active parameter = number of top-level commas between the opening paren and the cursor.
+    let active = top_level_commas(&source[paren_after..offset.min(source.len())]);
+    let active = (active as usize).min(params.len().saturating_sub(1)) as u32;
+
+    // Render `(P1, P2, …) => R` exactly as the type string, with one ParameterInformation per
+    // top-level parameter so the client can bold the active one. Param labels use the bare type
+    // text (the function type carries no parameter names).
+    let label = ty_str.clone();
+    let parameters: Vec<ParameterInformation> = params
+        .iter()
+        .map(|p| ParameterInformation {
+            label: ParameterLabel::Simple(p.clone()),
+            documentation: None,
+        })
+        .collect();
+
+    Some(SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label,
+            documentation: None,
+            parameters: Some(parameters),
+            active_parameter: Some(active),
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(active),
+    })
+}
+
+/// Walk the AST for the INNERMOST plain `Call` whose argument list contains `offset`. Returns the
+/// callee identifier span and the byte offset just after the call's opening `(`. `DotCall`s are
+/// intentionally not resolved (their method type isn't in the use-site map).
+fn find_enclosing_call(
+    stmts: &[Stmt],
+    source: &str,
+    offset: usize,
+) -> Option<(lin_common::Span, usize)> {
+    let mut best: Option<(lin_common::Span, usize)> = None;
+    for stmt in stmts {
+        match stmt {
+            Stmt::Val { value, .. } | Stmt::Var { value, .. } => {
+                find_enclosing_call_in_expr(value, source, offset, &mut best);
+            }
+            Stmt::Expr(e) => find_enclosing_call_in_expr(e, source, offset, &mut best),
+            _ => {}
+        }
+    }
+    best
+}
+
+fn find_enclosing_call_in_expr(
+    expr: &lin_parse::ast::Expr,
+    source: &str,
+    offset: usize,
+    best: &mut Option<(lin_common::Span, usize)>,
+) {
+    use lin_parse::ast::Expr as E;
+    // Recurse first so the innermost matching call wins (children update `best` last).
+    match expr {
+        E::Call { func, args, span, .. } => {
+            for a in args {
+                find_enclosing_call_in_expr(a, source, offset, best);
+            }
+            find_enclosing_call_in_expr(func, source, offset, best);
+            // Lin's `Call` span is just the `(` token, so the argument region is found by scanning
+            // from the opening paren to its matching close in source. `span.start` is the `(`.
+            let open = span.start as usize;
+            if source.as_bytes().get(open) == Some(&b'(') {
+                let close = matching_paren(&source[open..]).map(|c| open + c);
+                let paren_after = open + 1;
+                // Inside the parens: after `(` and at/before the `)` (or to EOF when unclosed,
+                // which is the common case while the user is still typing arguments).
+                let end_bound = close.unwrap_or(source.len());
+                if offset >= paren_after && offset <= end_bound {
+                    // Only resolvable when the callee is a bare identifier (its type is a use-site).
+                    if let E::Ident(_, ident_span) = func.as_ref() {
+                        *best = Some((*ident_span, paren_after));
+                    }
+                }
+            }
+        }
+        E::DotCall { receiver, args, .. } => {
+            find_enclosing_call_in_expr(receiver, source, offset, best);
+            if let Some(args) = args {
+                for a in args {
+                    find_enclosing_call_in_expr(a, source, offset, best);
+                }
+            }
+        }
+        E::Block(stmts, tail, _) => {
+            if let Some(r) = find_enclosing_call(stmts, source, offset) {
+                *best = Some(r);
+            }
+            find_enclosing_call_in_expr(tail, source, offset, best);
+        }
+        E::Function { body, .. } => find_enclosing_call_in_expr(body, source, offset, best),
+        E::If { condition, then_branch, else_branch, .. } => {
+            find_enclosing_call_in_expr(condition, source, offset, best);
+            find_enclosing_call_in_expr(then_branch, source, offset, best);
+            find_enclosing_call_in_expr(else_branch, source, offset, best);
+        }
+        E::Match { scrutinee, arms, .. } => {
+            find_enclosing_call_in_expr(scrutinee, source, offset, best);
+            for arm in arms {
+                find_enclosing_call_in_expr(&arm.body, source, offset, best);
+            }
+        }
+        E::BinaryOp { left, right, .. } => {
+            find_enclosing_call_in_expr(left, source, offset, best);
+            find_enclosing_call_in_expr(right, source, offset, best);
+        }
+        E::UnaryOp { operand, .. } => find_enclosing_call_in_expr(operand, source, offset, best),
+        E::Assign { value, .. } => find_enclosing_call_in_expr(value, source, offset, best),
+        E::Index { object, key, .. } => {
+            find_enclosing_call_in_expr(object, source, offset, best);
+            find_enclosing_call_in_expr(key, source, offset, best);
+        }
+        _ => {}
+    }
+}
+
+/// Split a rendered function-type string `(P1, P2, …) => R` into its top-level parameter type
+/// texts. Returns `None` when the string isn't a function type. Mirrors `first_param_category`'s
+/// top-level split but keeps every parameter.
+fn function_param_types(sig: &str) -> Option<Vec<String>> {
+    if !sig.starts_with('(') {
+        return None;
+    }
+    // The `(...) => R` form must contain `=>`; without it this isn't a function type.
+    if !sig.contains("=>") {
+        return None;
+    }
+    let close = matching_paren(sig)?;
+    let params = &sig[1..close];
+    if params.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    Some(split_top_level(params))
+}
+
+/// Index of the `)` that closes the `(` at byte 0 of `s` (depth-balanced over `()[]{}<>`).
+fn matching_paren(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' | ']' | '}' | '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split `s` on top-level commas (commas at bracket depth 0), trimming each piece.
+fn split_top_level(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' | ']' | '}' | '>' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim().to_string());
+    out
+}
+
+/// Count top-level commas (depth 0) in `s`. Used to pick the active parameter from the text between
+/// a call's `(` and the cursor.
+fn top_level_commas(s: &str) -> u32 {
+    let mut depth = 0i32;
+    let mut count = 0u32;
+    for c in s.chars() {
+        match c {
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' | ']' | '}' | '>' => depth -= 1,
+            ',' if depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+    count
+}
+
 // ── inlay hints ────────────────────────────────────────────────────────────────
 
 /// Build inline type-annotation hints for every `val`/`var` binding whose type was INFERRED
@@ -1925,6 +2157,59 @@ mod tests {
                 assert!(c0 + len0 <= c1, "tokens overlap: {:?} then {:?}", w[0], w[1]);
             }
         }
+    }
+
+    // ── Tier-2: signature help ──────────────────────────────────────────────────
+
+    /// The active parameter is the count of top-level commas before the cursor.
+    #[test]
+    fn signature_help_active_parameter_from_comma_count() {
+        assert_eq!(top_level_commas(""), 0);
+        assert_eq!(top_level_commas("1"), 0);
+        assert_eq!(top_level_commas("1, 2"), 1);
+        assert_eq!(top_level_commas("1, 2, 3"), 2);
+        // Commas nested inside brackets don't advance the active parameter.
+        assert_eq!(top_level_commas("[1, 2], 3"), 1);
+        assert_eq!(top_level_commas("f(a, b), "), 1);
+    }
+
+    #[test]
+    fn function_param_types_splits_signature() {
+        assert_eq!(
+            function_param_types("(Int32, String) => Boolean"),
+            Some(vec!["Int32".to_string(), "String".to_string()])
+        );
+        assert_eq!(function_param_types("() => Int32"), Some(vec![]));
+        // Not a function type.
+        assert_eq!(function_param_types("Int32"), None);
+        assert_eq!(function_param_types("(Int32)"), None);
+    }
+
+    /// End to end: cursor inside `add(1, │2)` resolves the callee's signature and marks the SECOND
+    /// parameter active.
+    #[test]
+    fn signature_help_resolves_call_and_active_param() {
+        let src = "val add = (a: Int32, b: Int32) => a + b\nval r = add(1, 2)\n";
+        let analysis = analyse(src, None);
+        // Cursor right before the `2`.
+        let call_open = src.rfind('(').unwrap();
+        let cursor = call_open + src[call_open..].find("2").unwrap();
+        let help = signature_help(src, &analysis, cursor).expect("expected signature help");
+        assert_eq!(help.signatures.len(), 1);
+        let sig = &help.signatures[0];
+        assert!(sig.label.contains("=>"), "label should be a function type: {}", sig.label);
+        assert_eq!(sig.parameters.as_ref().unwrap().len(), 2);
+        // Second parameter active (one comma before the cursor).
+        assert_eq!(sig.active_parameter, Some(1), "active param should be index 1");
+    }
+
+    /// Cursor outside any call → no signature help.
+    #[test]
+    fn signature_help_none_outside_call() {
+        let src = "val add = (a: Int32, b: Int32) => a + b\nval r = add(1, 2)\n";
+        let analysis = analyse(src, None);
+        // Offset 0 (`v` of `val`) is not inside any call.
+        assert!(signature_help(src, &analysis, 0).is_none());
     }
 
     #[test]
