@@ -6449,9 +6449,16 @@ fn lower_match(
             builder.switch_to(guard_then);
         }
 
-        let arm_raw = lower_expr(&arm.body, builder, ctx);
+        // UNBOXED SUM TYPE (unboxed-sumtype Stage 2): a sum-eligible object LITERAL arm body
+        // flowing into a sum-typed match result is constructed DIRECTLY as a SumNode (with the
+        // recursive-child pushdown), mirroring the `if`-branch path — skip the
+        // build-boxed-then-project round-trip that mis-tags recursive children.
+        let (arm_raw, arm_ty) = match try_lower_sum_literal(&arm.body, result_type, builder, ctx) {
+            Some(t) => (t, result_type.clone()),
+            None => (lower_expr(&arm.body, builder, ctx), arm.body.ty()),
+        };
         if !builder.is_current_block_terminated() {
-            let arm_val = coerce_to_slot_type(arm_raw, &arm.body.ty(), result_type, builder);
+            let arm_val = coerce_to_slot_type(arm_raw, &arm_ty, result_type, builder);
             // If an arm returns the scrutinee itself (e.g. `match x is {..} => x`), the match
             // result aliases the scrutinee temp. The scrutinee is owned by an ENCLOSING scope
             // (it's a val/expr lowered before the match); transferring it into the match result
@@ -7223,7 +7230,22 @@ fn lower_function_expr_with_id(
     } else {
         ret_type.clone()
     };
-    let raw_ret = if is_sealed_scalar_repr(&effective_ret_pre) {
+    // RETURN-position UNBOXED-SUM fast path (unboxed-sumtype Stage 2). When the body IS a sum-type
+    // construction LITERAL whose effective return type is a sum type, construct the packed `SumNode`
+    // DIRECTLY (`try_lower_sum_literal`, which also pushes the per-variant expected type into each
+    // RECURSIVE CHILD field so a nested child literal is built AS a `SumNode` too — design §6 gap 1)
+    // instead of lowering a boxed `LinObject` and projecting it at the return site. The boxed path
+    // boxed the nested children as plain objects, then stored those boxed-object pointers into the
+    // parent node's owned `*SumNode` child slots — reading a child's discriminant then read boxed
+    // memory → garbage tag → "non-exhaustive match". This makes a TAIL-RETURN sum literal lower
+    // identically to a `val n: <Sum> = {…}; n` binding (which already routes through
+    // `lower_value_into_slot` → `try_lower_sum_literal`), closing the tail-return pushdown gap.
+    let raw_ret = if crate::repr::sum_type_eligible(&effective_ret_pre) {
+        match try_lower_sum_literal(body, &effective_ret_pre, &mut inner_builder, ctx) {
+            Some(t) => t,
+            None => lower_expr(body, &mut inner_builder, ctx),
+        }
+    } else if is_sealed_scalar_repr(&effective_ret_pre) {
         match try_lower_sealed_literal(body, &effective_ret_pre, &mut inner_builder, ctx) {
             Some(t) => t,
             None => lower_expr(body, &mut inner_builder, ctx),

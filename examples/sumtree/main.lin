@@ -4,10 +4,10 @@
 // Test:  lin test examples/sumtree/
 import { print } from "std/io"
 import { toString } from "std/string"
-import { Expr, eval } from "./ast"
+import { Expr, eval, num, binOp } from "./ast"
 
 val main = () =>
-  // ((3 + 4) * (10 - 6)) = 28
+  // ((3 + 4) * (10 - 6)) = 28, built inline.
   val tree: Expr = {
     "kind": "op",
     "op": 2,
@@ -25,5 +25,9 @@ val main = () =>
     }
   }
   print(eval(tree).toString())
+  // The SAME tree, but every node is built INSIDE a function and RETURNED (the
+  // canonical parser shape — a tail-return sum literal). Prints 28 as well.
+  val built: Expr = binOp(2, binOp(0, num(3), num(4)), binOp(1, num(10), num(6)))
+  print(eval(built).toString())
 
 main()

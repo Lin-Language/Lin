@@ -15344,3 +15344,112 @@ print(eval(t).toString())
 "#);
     assert_eq!(out, vec!["7"]);
 }
+
+// ---------------------------------------------------------------------------
+// Unboxed-sum-type Stage 2 — TAIL-RETURN construction pushdown.
+//
+// Regression for the tail-return pushdown bug: a recursive sum literal built in a
+// function and RETURNED (the canonical parser shape) — directly, from an `if`/`else`
+// tail, or from a `match` arm — must construct its nested recursive children AS
+// `SumNode`s (the per-variant expected type is pushed into the children), exactly like
+// a `val n: <Sum> = {…}; n` binding. Before the fix the children were boxed as plain
+// `LinObject`s and stored into the parent's `*SumNode` child slots, so reading a
+// child's discriminant read boxed memory → garbage tag → "non-exhaustive match"
+// (ASan-clean, hence missed by the inline-construct-then-traverse Stage-2 tests).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_st2_sum_build_and_return_then_read_child() {
+    // (a) Build a recursive BinOp INSIDE a function, return it, then traverse a child.
+    // The returned tree's children must be unboxed SumNodes (the disc reads correctly).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op", "op": Int32, "left": Ast, "right": Ast }
+type Ast   = Num | BinOp
+val build = (): Ast =>
+  { "kind": "op", "op": 0, "left": { "kind": "num", "value": 3 }, "right": { "kind": "num", "value": 4 } }
+val t: Ast = build()
+val r = match t
+  is Num   => -1
+  is BinOp => match t["left"]
+    is Num   => t["left"]["value"]
+    is BinOp => -2
+print(r.toString())
+"#);
+    assert_eq!(out, vec!["3"]);
+}
+
+#[test]
+fn test_st2_sum_if_else_tail_return_then_eval() {
+    // (b) An if/else whose tail VALUE is a nested sum literal, returned from a function,
+    // then evaluated recursively. `mk(1)` → (3+4) = 7; `mk(0)` → the Num leaf 9.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op", "op": Int32, "left": Ast, "right": Ast }
+type Ast   = Num | BinOp
+val eval = (e: Ast): Int32 =>
+  match e
+    is Num   => e["value"]
+    is BinOp => eval(e["left"]) + eval(e["right"])
+val mk = (n: Int32): Ast =>
+  if n == 1 then
+    { "kind": "op", "op": 0, "left": { "kind": "num", "value": 3 }, "right": { "kind": "num", "value": 4 } }
+  else
+    { "kind": "num", "value": 9 }
+print(eval(mk(1)).toString())
+print(eval(mk(0)).toString())
+"#);
+    assert_eq!(out, vec!["7", "9"]);
+}
+
+#[test]
+fn test_st2_sum_match_arm_tail_return_then_eval() {
+    // A `match`-arm tail VALUE that is a nested sum literal, returned from a function.
+    // `mk(1)` → (3*4) = 12; `mk(0)` → the Num leaf 5.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op", "op": Int32, "left": Ast, "right": Ast }
+type Ast   = Num | BinOp
+val eval = (e: Ast): Int32 =>
+  match e
+    is Num   => e["value"]
+    is BinOp => eval(e["left"]) * eval(e["right"])
+val mk = (n: Int32): Ast =>
+  match n
+    is 0 => { "kind": "num", "value": 5 }
+    else => { "kind": "op", "op": 2, "left": { "kind": "num", "value": 3 }, "right": { "kind": "num", "value": 4 } }
+print(eval(mk(1)).toString())
+print(eval(mk(0)).toString())
+"#);
+    assert_eq!(out, vec!["12", "5"]);
+}
+
+#[test]
+fn test_st2_sum_parser_style_recursive_build_and_return() {
+    // (c) A small parser-style function that RECURSIVELY builds and returns a tree:
+    // `chain(n)` folds `n` additions of leaf `1` into a left-leaning BinOp spine,
+    // returning a fresh sub-tree at each level. Evaluating it sums to `n` (n leaves of 1).
+    // Exercises the tail-return pushdown at every recursion depth + the recursive drop.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op", "op": Int32, "left": Ast, "right": Ast }
+type Ast   = Num | BinOp
+val eval = (e: Ast): Int32 =>
+  match e
+    is Num   => e["value"]
+    is BinOp => eval(e["left"]) + eval(e["right"])
+val chain = (n: Int32): Ast =>
+  if n <= 1 then
+    { "kind": "num", "value": 1 }
+  else
+    { "kind": "op", "op": 0, "left": chain(n - 1), "right": { "kind": "num", "value": 1 } }
+print(eval(chain(1)).toString())
+print(eval(chain(4)).toString())
+print(eval(chain(10)).toString())
+"#);
+    assert_eq!(out, vec!["1", "4", "10"]);
+}
