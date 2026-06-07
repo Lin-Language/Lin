@@ -288,6 +288,19 @@ unsafe fn retain_tagged_payload(tv: &TaggedVal) {
             let m = payload as *mut crate::map::LinMap;
             if !m.is_null() && (*m).refcount < crate::string::IMMORTAL_RC { (*m).refcount += 1; }
         }
+        TAG_FUNCTION => {
+            // Closure refcount lives at offset 0 (u32). Mirror of the TAG_FUNCTION arm in
+            // release_tagged_payload (which calls lin_closure_release). Without this retain, a
+            // closure stored into an object/array field via the tagged-payload path was NOT
+            // refcounted by its new owner, so when the constructing frame released its own ref the
+            // closure (and its captured-var cell) was freed while the escaping object still held it
+            // — a use-after-free (segfault / garbage read on a captured var). See the object-literal
+            // -field closure-capture and worker-captured-var bugs.
+            let c = payload as *mut u32;
+            if !c.is_null() {
+                crate::memory::lin_rc_retain(c);
+            }
+        }
         TAG_SHARED => {
             // Atomic refcount on the Shared box (cross-thread-shared).
             crate::shared::lin_shared_retain_box(payload as *const u8);
