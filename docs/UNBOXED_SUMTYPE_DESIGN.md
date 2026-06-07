@@ -1,6 +1,47 @@
 # Unboxed Tagged Sum-Type Representation — Design + Scope Spike
 
-**Status**: SPIKE / design only. Nothing here is implemented. This document is the deliverable of a
+**Status**: Stage 0 + Stage 1 are now LIVE (non-recursive, scalar-only). The remaining stages
+(2 recursive, 3 keep-packed-across-containers, 4 interp port, 5 FBIP) are still future work.
+
+## Stage 1 — LIVE (the make-it-live milestone, branch `feat/sumtype-live`)
+
+The seed in `lin-ir::repr` is ON: a Stage-1-eligible sum type (`type T = A | B`, ≥2 sealed-record
+variants sharing a distinct `StrLit` discriminant, every OTHER field an unboxed scalar, NO
+recursive/heap/union fields) packs end-to-end as an unboxed `SumNode`. **The CALL ABI rule:**
+
+- A sum value's repr is `Packed(SumNode)` at every definite-packed site: a construction literal, a
+  sum-typed function PARAM, a sum-RETURNING call, a `match`-narrowed temp, a bare local read.
+- A sum-typed PARAM receives a `SumNode` pointer; a sum-RETURNING function returns a `SumNode`
+  pointer (we own the Lin calling convention). A same-type call/return is a verbatim pointer carry
+  (no coercion). The recursive self-call passes the pointer through (a `Named` param resolving to the
+  sum type is a pass-through, mirroring sealed records).
+- At every BOXED/dynamic boundary the node MATERIALIZES once to a boxed `LinObject`: a `Json`/union/
+  generic param or return, `toString`/`==`/spread, an array element store, a map value store. The
+  read-back out of a boxed container PROJECTS the boxed value into a fresh `SumNode`, so the repr
+  stays consistent (a `SumNode` everywhere the type says sum) — which the load-bearing `repr::verify`
+  proves across the whole corpus + test suite with the seed ON.
+- DISPATCH is O(1): `match s is Circle` over a `SumNode` lowers to `SumTagEq` (an inline-tag load +
+  integer compare), NOT `lin_matches_schema`/`object_get`. A narrowed scalar field read is a
+  constant-offset load. A construction packs directly via `sumnode_construct` (no boxed round-trip).
+
+**Mechanism**: the boundary coercions are threaded on the OPERAND's repr (`compile_ir_coerce_with_repr`,
+the container store/read paths, the `==` and RC ops in codegen all read `func.repr`), never the
+static `Type` — because a sum `Type` is `is_sum_type` true even while a particular occurrence is
+physically boxed.
+
+**Measured**: a dispatch-heavy microbench (construct-once + tight `match`+field-read loop, 8M iters)
+is **~4.5× faster packed** than the boxed `Json`/`has`-pattern equivalent (2.98s vs 13.46s, median of
+9 interleaved). ASan-clean (no UAF/double-free/overflow; every sum value freed exactly once; only the
+pre-existing immortal string-interner allocations leak, identically to the boxed baseline).
+`repr::verify` is load-bearing-green with the seed ON.
+
+**Falls back to boxed (still sound)**: any type outside the strict gate (recursive/heap/union/Named
+variant fields → a boxed union, Stage 2+); a sum value flowing through a `Json`/generic/cross-module
+boundary materializes (then is boxed thereafter unless re-read into a sum slot, which re-projects).
+
+---
+
+**Original spike status (below)**: SPIKE / design only. This document was the deliverable of a
 reconnaissance + design spike on branch `spike/unboxed-sumtype` (base master `19367a3`).
 
 **One-line verdict (full reasoning in §8): BUILD IT, but as a long multi-stage milestone, and only

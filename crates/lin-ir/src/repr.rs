@@ -246,6 +246,10 @@ fn sealed_fields(ty: &Type) -> Option<&IndexMap<String, Type>> {
 /// the discriminant key iff `ty` is a `Type::Union` of 2+ object variants sharing a distinct StrLit
 /// discriminant whose every OTHER field is an unboxed scalar (NON-RECURSIVE, SCALAR-ONLY). Any
 /// violation → `None` → the value stays a boxed union (fail-safe). Kept byte-identical to codegen.
+pub fn sum_type_discriminant_of(ty: &Type) -> Option<String> {
+    sum_type_discriminant(ty)
+}
+
 fn sum_type_discriminant(ty: &Type) -> Option<String> {
     let variants = match ty {
         Type::Union(vs) => vs,
@@ -295,8 +299,10 @@ fn sum_type_discriminant(ty: &Type) -> Option<String> {
     None
 }
 
-/// True iff `ty` is a Stage-1-eligible unboxed sum type.
-fn sum_type_eligible(ty: &Type) -> bool {
+/// True iff `ty` is a Stage-1-eligible unboxed sum type. Public so the lowerer (`lower.rs`) can
+/// gate its sum-type boundary insertions on the IDENTICAL gate the repr pass + codegen use (the
+/// single source of truth is `sum_type_discriminant`).
+pub fn sum_type_eligible(ty: &Type) -> bool {
     sum_type_discriminant(ty).is_some()
 }
 
@@ -338,8 +344,14 @@ fn type_seed(ty: &Type) -> Repr {
     // packed mismatch (the param is labelled SumNode but the body reads it boxed → UAF), which the
     // oracle/verify correctly flag. Until the ABI is wired, sum values stay boxed (fail-safe, zero
     // behavior change). Flip this on (return `Packed(SumNode)`) together with the ABI work.
+    // UNBOXED SUM TYPE (unboxed-sumtype Stage 1 — LIVE): a Stage-1-eligible sum type's values are
+    // physically a `SumNode*`. A param/temp whose static type is the sum type is read as a SumNode
+    // (the call ABI: a sum-typed param receives a SumNode pointer; the caller materializes at every
+    // Json/union/generic boundary — see `lower_coerce_arg` + `compile_ir_coerce`). Seeded BEFORE the
+    // sealed-record arms because a sum type is a `Type::Union`, which those arms do not match anyway,
+    // but kept first for clarity (the gate is mutually exclusive with sealed_fields/sealed_array_elem).
     if sum_type_eligible(ty) {
-        // Inert: fall through to the boxed-union seed below.
+        return Repr::Packed(Layout::SumNode { sum_ty: ty.clone() });
     }
     if let Some(elem_fields) = sealed_array_elem(ty) {
         return Repr::Packed(Layout::PackedSealedArray {
@@ -360,13 +372,15 @@ fn type_seed(ty: &Type) -> Repr {
 /// when `sealed_scalar_fields(ty).is_some()` AND there are NO spreads AND every sealed field is
 /// present in the literal (`all_present`). Field omission or a spread → the boxed `LinObject` path.
 fn make_object_repr(ty: &Type, fields: &[(String, Temp)], spreads: &[Temp]) -> Repr {
-    // NOTE (unboxed-sumtype Stage 1): SumNode construction-seed intentionally NOT yet enabled — see
-    // the note in `type_seed`. The decision logic is preserved (commented) so the ABI follow-up only
-    // needs to flip it back on. A MakeObject whose `ty` is a Stage-1 sum type (no spreads) WOULD
-    // construct a `SumNode`:
-    //   if sum_type_eligible(ty) && spreads.is_empty() {
-    //       return Repr::Packed(Layout::SumNode { sum_ty: ty.clone() });
-    //   }
+    // UNBOXED SUM TYPE (unboxed-sumtype Stage 1 — LIVE): a MakeObject whose `ty` IS a Stage-1
+    // eligible sum type and that has no spreads constructs a `SumNode` (codegen's MakeObject branch
+    // reads this repr and calls `sumnode_construct`). A spread cannot be packed (unknown extra
+    // fields) → fall through to the boxed object. Note: at a sum-construction site `ty` is the WHOLE
+    // sum type (a `Type::Union`); the codegen branch resolves the variant from the discriminant
+    // literal field's StrLit value.
+    if sum_type_eligible(ty) && spreads.is_empty() {
+        return Repr::Packed(Layout::SumNode { sum_ty: ty.clone() });
+    }
     if let Some(sf) = sealed_fields(ty) {
         let all_present =
             spreads.is_empty() && sf.keys().all(|k| fields.iter().any(|(fk, _)| fk == k));
@@ -1060,11 +1074,11 @@ mod tests {
     }
 
     #[test]
-    fn sum_type_seed_currently_inert_boxed() {
-        // STAGE 1 (foundation): the SumNode SEED is intentionally not yet enabled (the ABI is not
-        // wired). A sum-type construction therefore stays boxed (fail-safe). When the ABI follow-up
-        // flips the seed on, this test flips to asserting `Packed(SumNode)`. The gate itself is proven
-        // live by `sum_type_gate_accepts_scalar_variants`.
+    fn sum_type_seed_live_packs_construction() {
+        // STAGE 1 (LIVE): the SumNode seed is enabled and the call ABI wired. A sum-type construction
+        // (a sealed-variant literal of an eligible sum type, no spread) is labelled `Packed(SumNode)`
+        // so codegen emits `sumnode_construct`. The gate itself is proven by
+        // `sum_type_gate_accepts_scalar_variants`.
         let shape = shape_union();
         let instrs = vec![
             Instruction::Const { dst: Temp(0), val: Const::Int(5, Type::Int32) },
@@ -1079,10 +1093,37 @@ mod tests {
         ];
         let f = func_of(instrs, Some(Temp(2)), 3, vec![]);
         let repr = analyze(&f);
-        assert!(!matches!(repr[2], Repr::Packed(Layout::SumNode { .. })), "seed inert: sum literal must stay boxed for now, got {:?}", repr[2]);
-        // Oracle + verify must remain clean with the inert seed (no SumNode label anywhere).
+        assert!(
+            matches!(&repr[2], Repr::Packed(Layout::SumNode { sum_ty }) if sum_ty == &shape),
+            "seed live: sum literal must be Packed(SumNode), got {:?}",
+            repr[2]
+        );
+        // Oracle + verify must hold with the live seed.
         assert!(oracle_check(&f, &repr).is_empty());
         assert!(verify(&f, &repr).is_empty());
+    }
+
+    #[test]
+    fn sum_type_param_is_sumnode_and_fieldget_verifies() {
+        // A sum-typed PARAM is seeded Packed(SumNode) (the callee reads it as a SumNode pointer — the
+        // call ABI). A FieldGet on it (after narrowing, obj_ty is the sum type) requires SumNode of
+        // the same type, which verify proves.
+        let shape = shape_union();
+        let instrs = vec![Instruction::FieldGet {
+            dst: Temp(1),
+            object: Temp(0),
+            field: "r".into(),
+            obj_ty: shape.clone(),
+            result_ty: Type::Int32,
+        }];
+        let f = func_of(instrs, Some(Temp(1)), 2, vec![(Temp(0), shape.clone())]);
+        let repr = analyze(&f);
+        assert!(
+            matches!(&repr[0], Repr::Packed(Layout::SumNode { sum_ty }) if sum_ty == &shape),
+            "sum param must be Packed(SumNode), got {:?}",
+            repr[0]
+        );
+        assert!(verify(&f, &repr).is_empty(), "FieldGet on a SumNode param must verify");
     }
 
     #[test]
