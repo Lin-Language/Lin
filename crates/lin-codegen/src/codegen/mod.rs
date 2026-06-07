@@ -810,7 +810,9 @@ impl<'ctx> Codegen<'ctx> {
                         }
                         Instruction::Release { val, ty } => {
                             if let Some(&v) = temp_map.get(val) {
-                                self.emit_release(v, ty);
+                                // PART C: release shape from the pass-proven representation, not Type.
+                                let repr = func.repr_of(*val).clone();
+                                self.emit_release_repr(v, ty, &repr);
                             }
                         }
                         Instruction::CloneBox { dst, src, ty } => {
