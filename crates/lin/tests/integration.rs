@@ -11561,6 +11561,46 @@ print(toString(doubled.reduce(0, (acc, x) => acc + x)))
 }
 
 #[test]
+fn test_cross_module_generic_call_with_capturing_closure() {
+    // Regression: an IMPORTED function that (a) calls a generic with a CONCRETE element type — so
+    // the importer monomorphizes the import (e.g. `sort` → `sort$Object`) — AND (b) contains a
+    // nested closure capturing one of its OWN locals must NOT mis-attribute that closure's captures
+    // to itself. A failed speculative callback type-check (checking the callback against an
+    // incomplete generic hint, then re-inferring hint-free) used to `?`-out of `infer_function`
+    // between its push and its matching pop of the capture/scope stacks, leaking an unbalanced
+    // frame; the enclosing exported function then popped it and inherited a phantom capture set,
+    // gaining a spurious closure-env parameter. The importer's direct call (no env) then mismatched
+    // its arity → codegen "Incorrect number of arguments passed to called function!". Fixed by
+    // rolling back the transient checker state on the discarded speculative path.
+    let dir = std::env::temp_dir().join(format!("lin_xgen_capclo_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join("types.lin"),
+        "export type Item = { \"id\": String, \"rank\": Int32 }\n\
+         export type Bag = { \"n\": Int32, \"by\": { String: Item[] } }\n").unwrap();
+    std::fs::write(dir.join("lib.lin"),
+        "import { length, sort } from \"std/array\"\n\
+         import { for } from \"std/iter\"\n\
+         import { Item, Bag } from \"./types\"\n\
+         export val build = (items: Item[]): Bag =>\n  \
+           var by: { String: Item[] } = {}\n  \
+           val sorted: Item[] = sort(items, (a, b) => a[\"rank\"] - b[\"rank\"])\n  \
+           sorted.for(it => by[\"all\"] = [it])\n  \
+           { \"n\": length(sorted), \"by\": by }\n").unwrap();
+    let main = format!(r#"import {{ print }} from "std/io"
+import {{ toString }} from "std/string"
+import {{ build }} from "{}/lib"
+val main = (): Null =>
+  var items: Json = [{{ "id": "b", "rank": 2 }}, {{ "id": "a", "rank": 1 }}]
+  val bag = build(items)
+  print(toString(bag["n"]))
+main()
+"#, dir.to_str().unwrap());
+    let output = run(&main);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(output, vec!["2"]);
+}
+
+#[test]
 fn test_generic_cross_module_two_instantiations() {
     // Cache/specialization correctness: the SAME imported generic instantiated at two different
     // element types from one importer mints two distinct specializations, each correct.
