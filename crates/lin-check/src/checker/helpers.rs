@@ -133,20 +133,6 @@ pub(crate) fn apply_type_subs(ty: &Type, subs: &std::collections::HashMap<u32, T
             ret: Box::new(apply_type_subs(ret, subs)),
             required: *required,
         },
-        // Record/object fields can hold type parameters (`type Box<T> = { value: T }`,
-        // `type Result<T,E> = { value: T } | { error: E }`). Without recursing here, a
-        // generic call whose RESULT type-parameter only appears inside an object field
-        // (the `value: U` of `mapOk(...): Result<U,E>`) leaves that field's TypeVar
-        // unsubstituted even when `subs` binds it — so the call result stays
-        // `{ value: ?U } | …` and an index of it degrades to `?U | Null`. Substitute
-        // through the fields, preserving the sealed marker.
-        Type::Object { fields, sealed } => Type::Object {
-            fields: fields.iter().map(|(k, v)| (k.clone(), apply_type_subs(v, subs))).collect(),
-            sealed: *sealed,
-        },
-        Type::FixedArray(elems) => {
-            Type::FixedArray(elems.iter().map(|t| apply_type_subs(t, subs)).collect())
-        }
         _ => ty.clone(),
     }
 }
