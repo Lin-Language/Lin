@@ -299,6 +299,13 @@ pub unsafe extern "C" fn lin_tcp_accept(fd: i32) -> *mut u8 {
     match result {
         None => make_error_tagged("not a TCP listener"),
         Some(Ok((stream, peer))) => {
+            // Default the accepted stream to blocking on every platform. On Linux an
+            // accepted socket never inherits the listener's O_NONBLOCK, but on the BSD
+            // socket stack (macOS) it DOES — so without this, a recv() on a freshly
+            // accepted peer of a non-blocking listener would-blocks (returns Null)
+            // instead of waiting for the bytes. Resetting it makes accept() portable;
+            // callers that want a non-blocking peer can still tcpSetNonblocking(fd, true).
+            let _ = stream.set_nonblocking(false);
             let new_fd = stream.as_raw_fd();
             let ip = peer.ip().to_string();
             let port = peer.port() as i32;
