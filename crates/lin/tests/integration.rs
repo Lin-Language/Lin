@@ -13620,6 +13620,40 @@ print("${loop(0, 200, 0)}")
 }
 
 #[test]
+fn test_sealed_record_array_field_in_outer_array_build_drop() {
+    // REGRESSION (monomorphization symbol collision → misaligned-pointer deref / abort): an outer
+    // `Route[]` whose element `Route = {id:String, legs: Leg[]}` has a field that is itself an
+    // ARRAY OF SEALED RECORDS (`Leg = {name:String, d:Int32}`). Pushing a `Route` and a `Leg` both
+    // go through the generic `push<T>(T[], T)`; the specialization name mangled `Type::Object` to a
+    // single literal `"Object"`, so `push$Route` and `push$Leg` COLLIDED on the symbol `push$Object`.
+    // The monomorphizer minted two distinct specializations but under one name, so codegen emitted
+    // both materialize bodies into one LLVM function — only the first (Route's) reachable. A
+    // `push(Leg)` call then ran the Route body, reading the Leg struct's scalar `d` field at the
+    // `legs`-pointer offset and boxing it as an array (`lin_box_array(0x1)`) → `retain_tagged_payload`
+    // dereferenced the bogus pointer (`object.rs:281`, misaligned 0x1) and aborted. Fixed by mangling
+    // `Type::Object` by field SHAPE so structurally-distinct records get distinct specialization
+    // names. ASan (CI job over a build/drop loop) is the corruption/leak guard; here we assert the
+    // length is correct across many iterations (the abort would otherwise crash the run).
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+type Leg = { "name": String, "d": Int32 }
+type Route = { "id": String, "legs": Leg[] }
+val build = (): Int32 =>
+  var rs: Route[] = []
+  var legs: Leg[] = []
+  push(legs, { "name": "x", "d": 1 })
+  push(rs, { "id": "r", "legs": legs })
+  length(rs)
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc else loop(i + 1, n, acc + build())
+print("${loop(0, 300, 0)}")
+"#);
+    // each build() pushes exactly one Route → length 1; 300 iterations = 300.
+    assert_eq!(out, vec!["300"]);
+}
+
+#[test]
 fn test_sealed_tail_recursive_self_call_record_literal_arg() {
     // REGRESSION (found adding the `records` cross-language benchmark): a TAIL-recursive function
     // taking a sealed-record param and passing a fresh record LITERAL as the self-call argument.
