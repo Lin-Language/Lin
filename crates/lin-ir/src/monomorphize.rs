@@ -312,7 +312,27 @@ fn mangle_type(ty: &Type) -> String {
         Type::Array(t) => format!("Arr_{}", mangle_type(t)),
         Type::Iterator(t) => format!("Iter_{}", mangle_type(t)),
         Type::Stream(t) => format!("Stream_{}", mangle_type(t)),
-        Type::Object { .. } => "Object".into(),
+        // Object records must mangle by SHAPE, not collapse to a single `Object`. Two distinct
+        // record types instantiated at the same generic param (e.g. `push(Route[], route)` and
+        // `push(Leg[], leg)`) would otherwise both produce `push$Object` — a SYMBOL COLLISION:
+        // the monomorphizer mints two distinct specializations (keyed by `instantiation_key`,
+        // which distinguishes them) but assigns them the SAME name, so codegen emits two function
+        // bodies under one symbol and the second is unreachable. A `push(Leg)` call then runs the
+        // `push(Route)` body — for a record-array field (`legs: Leg[]`) the Route body reads the
+        // Leg struct's scalar `d` field as an array pointer and crashes (misaligned-pointer deref).
+        // Include each field's name and recursively-mangled type so structurally-distinct records
+        // get distinct names. Field order is the declaration `IndexMap` order (canonical, ADR Stage
+        // 0.5), so identical shapes still collapse to one specialization.
+        Type::Object { fields, .. } => {
+            let mut s = String::from("Obj");
+            for (k, fty) in fields.iter() {
+                s.push('_');
+                s.push_str(k);
+                s.push('_');
+                s.push_str(&mangle_type(fty));
+            }
+            s
+        }
         Type::Union(_) => "Union".into(),
         Type::Function { .. } => "Fn".into(),
         // The `u32::MAX` Json wildcard (an erased non-concrete type-arg) mangles to `Json`, so a
