@@ -14198,6 +14198,58 @@ print(toString(loop(0, 50, 0)))
     assert_eq!(out, vec!["20"]);
 }
 
+#[test]
+fn test_sealed_record_union_tail_param_no_per_iteration_leak() {
+    // A `Trip | Null` (sealed-record | Null union) threaded through a TAIL-recursive parameter —
+    // the exact shape of RAPTOR's `scanRouteAt` `trip: Trip | Null` forward-scan param. Each tail
+    // iteration binds a fresh `cur: Trip` (here a literal; the array-projection `arr[i]` form is
+    // exercised by the second function) and passes it as the union arg, which codegen MATERIALIZES
+    // into a boxed object. The per-iteration `cur` source packed struct must be released on the live
+    // back-edge — it accrues TWO genuine owned references (the alloc/projection +1 AND
+    // `coerce_and_own_store`'s `own_for_store` retain at the `val` binding +1), and the prior
+    // one-per-temp dedup in `release_owned_for_tail_call` released it ONCE, leaking the surplus
+    // packed struct (+ its heap "id" string) every tail iteration. Releasing sealed-record temps
+    // per registration balances it. (The `match trip is Trip => trip["dep"]` arm-narrowing
+    // projection — a fresh `sealed_project_from` struct — also leaked every base-case read until the
+    // narrowed-union→sealed read stopped double-retaining it.) ASan (the synthetic repro + ci.yml
+    // asan leg) is the actual leak/double-free guard; this test pins the observable result.
+    let out = run(r#"
+import { push } from "std/array"
+import { print } from "std/io"
+import { toString } from "std/string"
+type Trip = { "id": String, "dep": Int32 }
+// Fresh-literal form: each tail iteration threads a freshly-built sealed record into Trip | Null.
+val scanFresh = (i: Int32, n: Int32, trip: Trip | Null): Int32 =>
+  if i >= n then
+    match trip
+      is Trip => trip["dep"]
+      else => -1
+  else
+    val cur: Trip = { "id": "x", "dep": i }
+    scanFresh(i + 1, n, cur)
+// Array-projection form: each tail iteration threads arr[i] (a projected sealed record).
+val scanProj = (arr: Json, i: Int32, n: Int32, trip: Trip | Null): Int32 =>
+  if i >= n then
+    match trip
+      is Trip => trip["dep"]
+      else => -1
+  else
+    val cur: Trip = arr[i]
+    scanProj(arr, i + 1, n, cur)
+val build = (): Int32 =>
+  var arr: Json = []
+  arr.push({ "id": "a", "dep": 7 })
+  // scanFresh recurses 20 deep returning the last dep (19); scanProj reads the single element (7).
+  scanFresh(0, 20, null) + scanProj(arr, 0, 1, null)
+// Outer loop: a per-iteration leak inside scan would scale RSS with the outer count; result is
+// invariant (19 + 7 = 26 every time).
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc else loop(i + 1, n, build())
+print(toString(loop(0, 50, 0)))
+"#);
+    assert_eq!(out, vec!["26"]);
+}
+
 /// Extract the body text of the LLVM function `define ... @<name>(...) { ... }` from emitted IR.
 /// Matches on `@<name>(` so it doesn't catch a prefixed/suffixed symbol.
 fn ir_function(ir: &str, name: &str) -> String {
