@@ -560,6 +560,16 @@ pub unsafe fn tagged_to_json_string(tagged: *const TaggedVal) -> String {
         if obj.is_null() { return "{}".to_string(); }
         return object_to_json_string(obj);
     }
+    if tag == crate::tagged::TAG_SUMNODE {
+        // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: a kept-packed `*SumNode` field reached the
+        // (lossy display) object stringifier — materialize it to a real LinObject and serialize, then
+        // release the transient. This makes `toString(record_with_sum_field)` correct (NOT `[object]`).
+        let obj = crate::sumnode::lin_sumnode_materialize(payload as *mut u8);
+        if obj.is_null() { return "[object]".to_string(); }
+        let s = object_to_json_string(obj as *const crate::object::LinObject);
+        crate::object::lin_object_release(obj as *mut crate::object::LinObject);
+        return s;
+    }
     "[object]".to_string()
 }
 
@@ -861,6 +871,17 @@ pub unsafe extern "C" fn lin_tagged_to_string(tagged: *const TaggedVal) -> *mut 
     } else if tag == TAG_OBJECT {
         let obj = payload as *const crate::object::LinObject;
         lin_object_to_string(obj)
+    } else if tag == crate::tagged::TAG_SUMNODE {
+        // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: a kept-packed `*SumNode` that escaped a record
+        // field into the type-erased dynamic domain. Materialize it to a real LinObject (via the
+        // per-type materializer in its descriptor), stringify, and release the transient object.
+        let obj = crate::sumnode::lin_sumnode_materialize(payload as *mut u8);
+        if obj.is_null() {
+            return lin_string_from_bytes(b"[object]".as_ptr(), 8);
+        }
+        let s = lin_object_to_string(obj as *const crate::object::LinObject);
+        crate::object::lin_object_release(obj as *mut crate::object::LinObject);
+        s
     } else {
         lin_string_from_bytes(b"[object]".as_ptr(), 8)
     }
@@ -905,6 +926,17 @@ unsafe fn push_json_value(out: &mut String, tagged: *const TaggedVal) {
         TAG_OBJECT => {
             let obj = payload as *const crate::object::LinObject;
             push_json_object(out, obj);
+        }
+        crate::tagged::TAG_SUMNODE => {
+            // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: materialize the kept-packed `*SumNode` to a
+            // real LinObject, serialize, release the transient object.
+            let obj = crate::sumnode::lin_sumnode_materialize(payload as *mut u8);
+            if obj.is_null() {
+                out.push_str("null");
+            } else {
+                push_json_object(out, obj as *const crate::object::LinObject);
+                crate::object::lin_object_release(obj as *mut crate::object::LinObject);
+            }
         }
         // Functions/iterators and any unknown tag are not JSON values → null.
         _ => out.push_str("null"),
