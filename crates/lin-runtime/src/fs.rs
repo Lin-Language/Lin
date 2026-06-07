@@ -45,7 +45,7 @@ unsafe fn make_error_obj(msg: &str) -> *mut LinObject {
     obj
 }
 
-/// Build a `fromJson` decode error as an owned `TaggedVal*(Object)` (ADR-047). Shape:
+/// Build a `fromJson` decode error as an owned `TaggedVal*(Object)` (ADR-031). Shape:
 /// `{ "type": "error", "message": <msg>, "path": <path> }`. The `type`/`message` fields keep
 /// the existing error convention; `path` is a JSONPath-ish location (e.g. `$.address.city`).
 /// Returned value is independently owned by the caller (release with `lin_tagged_release`).

@@ -1,4 +1,4 @@
-// std/compress — streaming gzip/deflate byte-adapters over `Stream<UInt8[]>` (ADR-072 streams).
+// std/compress — streaming gzip/deflate byte-adapters over `Stream<UInt8[]>` (ADR-047 streams).
 //
 // Each adapter is LAZY: it wraps an upstream byte stream and (de)compresses incrementally — one
 // upstream chunk in, whatever output bytes were produced out — so a multi-gigabyte file flows

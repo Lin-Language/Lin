@@ -41,7 +41,7 @@ pub enum Stmt {
     },
     /// Test-only mock: `replace <name> = <expr>`. `name` must be a previously-imported
     /// export; `value` becomes the definition emitted for that export's symbol across the
-    /// whole test program (ADR-071). Only valid in a `.test.lin`.
+    /// whole test program (ADR-046). Only valid in a `.test.lin`.
     Replace {
         name: String,
         value: Expr,
@@ -292,9 +292,14 @@ pub enum TypeExpr {
     Array(Box<TypeExpr>, Span),
     FixedArray(Vec<TypeExpr>, Span),
     Union(Vec<TypeExpr>, Span),
+    /// Record intersection `A & B` (ADR-061). Record-only: each operand must resolve to an
+    /// object/record type; the result is the union of their fields (conflicting field types =
+    /// error). Binds tighter than `|`. Resolved into a plain `Type::Object` at resolution time —
+    /// no runtime/codegen representation of its own.
+    Intersection(Vec<TypeExpr>, Span),
     Function(Vec<TypeExpr>, Box<TypeExpr>, Span),
     Object(Vec<(String, TypeExpr)>, Span),
-    /// A typed index-signature object type `{ String: T }` (ADR-082): a dictionary keyed by
+    /// A typed index-signature object type `{ String: T }` (ADR-055): a dictionary keyed by
     /// arbitrary strings, each mapping to value type `T`. The key type is `String` only for v1.
     IndexSig(Box<TypeExpr>, Span),
     TaggedUnion(Vec<TypeExpr>, Span),

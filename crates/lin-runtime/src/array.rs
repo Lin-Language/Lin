@@ -155,7 +155,7 @@ pub unsafe extern "C" fn lin_array_release(arr: *mut LinArray) {
     }
     // Frozen (immortal) arrays carry a saturated refcount and must never be freed or
     // decremented — they are deep-frozen, shared read-only across threads, and program-lifetime
-    // (Frozen<T>, ADR-045). The read-only guard makes retain/release no-ops, so concurrent reads
+    // (Frozen<T>, ADR-030). The read-only guard makes retain/release no-ops, so concurrent reads
     // of a frozen graph from N threads never write the refcount → race-free with non-atomic RC.
     if (*arr).refcount >= crate::string::IMMORTAL_RC {
         return;
@@ -580,6 +580,23 @@ pub unsafe extern "C" fn lin_array_set(arr: *mut LinArray, idx: i64, tagged: *co
     let elem_tag = (*arr).elem_tag;
     if elem_tag == 0xFF {
         let slot = (*arr).data.add(actual as usize);
+        // Release the OLD element's heap payload before overwriting it — the slot owns one reference
+        // to its element (the array's drop walk in `lin_array_release` releases each element), so an
+        // in-place overwrite must drop the displaced element's reference or it leaks. Mirrors
+        // `lin_object_set` (release-old-value) and `lin_sealed_array_set` (release-old-fields). The
+        // IR `IndexSet`/`ArraySetDyn` lowering supplies the NEW element's owning reference (transfer)
+        // but never reads the old value, so this release cannot double-free. Scalars (and interned
+        // string literals with a saturated refcount) are no-ops. Without this the boxed `Trip[]`
+        // `set(arr, i, {…})` leaked the displaced element (ASan-confirmed once the materialization
+        // crash was fixed).
+        let old = &*slot;
+        match old.tag {
+            TAG_STR => crate::string::lin_string_release(old.payload as *mut crate::string::LinString),
+            TAG_ARRAY => lin_array_release(old.payload as *mut LinArray),
+            TAG_OBJECT => crate::object::lin_object_release(old.payload as *mut crate::object::LinObject),
+            TAG_FUNCTION => crate::memory::lin_closure_release(old.payload as *mut u8),
+            _ => {}
+        }
         std::ptr::copy_nonoverlapping(tagged as *const u8, slot as *mut u8, std::mem::size_of::<TaggedVal>());
     } else {
         let tag = if tagged.is_null() { TAG_NULL } else { (*tagged).tag };
@@ -624,7 +641,7 @@ pub unsafe extern "C" fn lin_array_length(arr: *const LinArray) -> i64 {
 /// only when the box actually holds an Array (TAG_ARRAY); for any other runtime kind (Object,
 /// String, Null, scalar, …) it returns 0, so the combinator iterates ZERO times rather than
 /// misreading the non-array payload as a `LinArray` (a `LinObject`/`LinString` read through the
-/// flat/tagged array element path is undefined behaviour — the docs-builder crash, ADR-069 follow-up).
+/// flat/tagged array element path is undefined behaviour — the docs-builder crash, ADR-044 follow-up).
 ///
 /// This keeps `for`/`filter` over a statically-`Json` value SOUND when its runtime value isn't an
 /// array (e.g. an `ls()` error object that slipped past a misspelled `isFailure` guard): a no-op

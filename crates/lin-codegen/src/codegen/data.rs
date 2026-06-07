@@ -237,10 +237,42 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    pub(crate) fn compile_ir_index(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, result_ty: &Type) -> BasicValueEnum<'ctx> {
+    pub(crate) fn compile_ir_index(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, result_ty: &Type, obj_repr: &lin_ir::repr::Repr) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         if !obj.is_pointer_value() {
             return ptr_ty.const_null().into();
+        }
+        // UNBOXED SUM TYPE (unboxed-sumtype Stage 1): when the object operand's repr is a SumNode, an
+        // `obj[key]` index is served by materializing the node (the discriminant read the shipped
+        // match-dispatch `scrut["kind"] == "circle"` lowers to), NOT `lin_object_get` on a non-LinObject.
+        // NOTE: currently INERT — no temp carries `Packed(SumNode)` yet (the repr seed is gated off
+        // pending the call ABI; see `repr::type_seed`), so this branch is never taken on the present
+        // corpus. It is the wired index/dispatch site the ABI follow-up activates.
+        if let Some(sum_ty) = obj_repr.sumnode_sum_ty() {
+            let sum_ty = sum_ty.clone();
+            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+            // Materialize the whole node to a boxed LinObject once, then object_get the key. This is
+            // the universal (correct) dynamic-index path; the common discriminant read is a single
+            // key fetch from the freshly built object. RC: the materialized object is +1; we fetch a
+            // BORROWED interior TaggedVal* (object_get) and CLONE it so the result is independently
+            // owned, then release the temporary object so nothing leaks.
+            let obj_box = self.sumnode_materialize_to_object(obj, &sum_ty, llvm_fn).into_pointer_value();
+            let key_raw = if Self::is_union_type(key_ty) && key.is_pointer_value() {
+                self.builder.call(self.rt.unbox_ptr, &[key.into()], "sumnode_idx_kstr").try_as_basic_value().unwrap_basic()
+            } else {
+                key
+            };
+            let got = self.builder.call(self.rt.object_get, &[obj_box.into(), key_raw.into()], "sumnode_idx_get").try_as_basic_value().unwrap_basic();
+            // Clone the borrowed interior value to an independently-owned box (so releasing obj_box is
+            // safe), then release the temporary materialized object.
+            let cloned = if got.is_pointer_value() {
+                let clone_fn = self.get_or_declare_fn("lin_tagged_clone", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                self.builder.call(clone_fn, &[got.into()], "sumnode_idx_clone").try_as_basic_value().unwrap_basic()
+            } else {
+                got
+            };
+            self.builder.call(self.rt.object_release, &[obj_box.into()], "");
+            return cloned;
         }
         // When the object is statically Json/union, `obj` is a TaggedVal* wrapping the
         // real Array/Object pointer — unbox it to the raw container pointer before
@@ -305,7 +337,7 @@ impl<'ctx> Codegen<'ctx> {
             let res = phi.as_basic_value();
             return if Self::is_union_type(result_ty) { res } else { self.unbox_tagged_val_to_type(res, result_ty) };
         }
-        // Typed index-signature map `{ String: T }` (ADR-082): `m[k]` is an O(1) hashed lookup.
+        // Typed index-signature map `{ String: T }` (ADR-055): `m[k]` is an O(1) hashed lookup.
         // The key is a String (raw LinString*, or unbox a Json/union-boxed key); the result is
         // `T | Null` — `lin_map_get` returns null for a missing key, which `unbox_tagged_val_to_type`
         // maps to the language Null.
@@ -318,6 +350,19 @@ impl<'ctx> Codegen<'ctx> {
                 key
             };
             let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget").try_as_basic_value().unwrap_basic();
+            // KEEP-PACKED read-back (repr pass, Stage 4 — THE dijkstra fix): when the map value type
+            // is a PACKED sealed array / sealed record, the slot holds a keep-packed handle
+            // (BoxKeepPacked stored a TaggedVal over the still-packed buffer). Unbox it as a packed
+            // pointer + retain (UnboxKeepPacked) — a fresh +1 owner matching what the old materialize
+            // path produced (so the projection's scheduled Release balances). Zero copy: the inner
+            // buffer never materializes. `lin_map_get` returns a BORROWED interior TaggedVal*, so the
+            // retain on the unboxed payload is what gives the result its own reference.
+            if Self::sealed_array_elem(result_ty).is_some() {
+                return self.compile_ir_unbox_keep_packed(tagged, /*arr=*/true);
+            }
+            if Self::sealed_fields(result_ty).is_some() {
+                return self.compile_ir_unbox_keep_packed(tagged, /*arr=*/false);
+            }
             return if Self::is_union_type(result_ty) {
                 tagged
             } else {
@@ -344,7 +389,9 @@ impl<'ctx> Codegen<'ctx> {
             // is an ownable +1 value the standard retain/release/field-read machinery handles. The
             // hot `arr[i].field` access never reaches here (it is fused upstream to a direct scalar
             // load); this path covers `val p = arr[i]` / passing an element as a whole value.
-            if Self::sealed_array_elem(obj_ty).is_some() {
+            // STAGE 3: packed-sealed-array ASSUME read from the object operand's repr (proven by the
+            // pass + verifier to match where the old `sealed_array_elem(obj_ty)` gate fired).
+            if obj_repr.packed_sealed_array_layout().is_some() {
                 if let Some(fields) = Self::sealed_fields(result_ty) {
                     let fields = fields.clone();
                     return self.sealed_array_materialize_elem(container, idx, &fields);
@@ -368,6 +415,37 @@ impl<'ctx> Codegen<'ctx> {
             let tagged = self.builder.call(self.rt.array_get, &[container.into(), idx.into()], "ir_aget").try_as_basic_value().unwrap_basic();
             return self.unbox_tagged_val_to_type(tagged, result_ty);
         }
+        // Sealed record indexed by a NON-LITERAL key (`p[k]`). A sealed record is a packed,
+        // header-prefixed struct with NO runtime key table, so a dynamic key can't resolve a slot
+        // by offset; reading it as a `LinObject` (the generic object path below) misinterprets the
+        // packed bytes and crashes the runtime. The literal-key case is fused upstream (IR
+        // lowering → constant-offset FieldGet / Null const); only a runtime key reaches here.
+        // Materialize the sealed record to a boxed `LinObject` (its EXACTLY-declared fields — extras
+        // already stripped) and do the normal dynamic `lin_object_get`, which returns the matching
+        // value or Null for an absent key (safe-access §6.1). Clone the (borrowed, interior) result
+        // into a fresh owned box and release the temporary object before returning, so nothing
+        // dangles once the materialized object is freed.
+        // STAGE 3: a sealed record indexed by a non-literal key — packed-struct ASSUME from repr.
+        if let Some(fields) = obj_repr.packed_struct_fields().cloned() {
+            if obj.is_pointer_value() {
+                let mat = self.sealed_materialize_to_object(obj, &fields).into_pointer_value();
+                let key_raw = if Self::is_union_type(key_ty) && key.is_pointer_value() {
+                    self.builder.call(self.rt.unbox_ptr, &[key.into()], "sealed_dynk_unbox").try_as_basic_value().unwrap_basic()
+                } else {
+                    key
+                };
+                let entry = self.builder.call(self.rt.object_get, &[mat.into(), key_raw.into()], "sealed_dynk_get").try_as_basic_value().unwrap_basic();
+                // `entry` is a borrowed interior `*TaggedVal` (or null) into `mat`; clone it into an
+                // independent owned box, then free `mat` (the clone keeps the inner alive).
+                let clone_fn = self.get_or_declare_fn("lin_tagged_clone", ptr_ty.fn_type(&[ptr_ty.into()], false));
+                let owned = self.builder.call(clone_fn, &[entry.into()], "sealed_dynk_clone").try_as_basic_value().unwrap_basic();
+                self.builder.call(self.rt.object_release, &[mat.into()], "");
+                // `owned` is a +1 box; the IR lowering's projection CloneBox (union result) clones it
+                // again into the binding's owned box — balanced. Match the surrounding repr.
+                return if Self::is_union_type(result_ty) { owned } else { self.unbox_tagged_val_to_type(owned, result_ty) };
+            }
+            return ptr_ty.const_null().into();
+        }
         // Object key access. lin_object_get expects a raw *LinString key; unbox a boxed key.
         let key_str = if key_ty.is_string_ish() {
             key
@@ -384,7 +462,7 @@ impl<'ctx> Codegen<'ctx> {
         if Self::is_union_type(obj_ty) {
             // A `{ String: T } | Null` index (e.g. the inner read of a NESTED typed map
             // `outer[a][b]`, where `outer[a]` is `{ String: T } | Null` and is NOT spellable as
-            // an `is`-pattern to narrow, ADR-082 §5.1.1) runs through this union path. Its runtime
+            // an `is`-pattern to narrow, ADR-055 §5.1.1) runs through this union path. Its runtime
             // value is a TAG_MAP, so dispatch on the tag: TAG_MAP → `lin_map_get` (O(1) hashed),
             // TAG_OBJECT → `lin_object_get` (the Json association-list path), otherwise Null. Both
             // getters return a borrowed `*const TaggedVal`, so the ownership contract is identical.
@@ -447,14 +525,14 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
-    /// Store `value` into a typed index-signature map (`lin_map_set`, ADR-082).
+    /// Store `value` into a typed index-signature map (`lin_map_set`, ADR-055).
     ///
     /// `elem_ty` is the map's value type `T` (from `Type::Map(T)`); `val_ty` is the source
     /// expression's static type, which may be a NARROWER numeric (e.g. an `Int32` variable stored
     /// into a `{ String: Int64 }` map). The value is normalised to `T`'s representation before
-    /// storage so the slot reads back `T`-correct regardless of the source width (ADR-082).
+    /// storage so the slot reads back `T`-correct regardless of the source width (ADR-055).
     ///
-    /// FLAT-SCALAR UNBOXING (ADR-082 follow-up): when `T` is a flat scalar (`is_flat_scalar` —
+    /// FLAT-SCALAR UNBOXING (ADR-055 follow-up): when `T` is a flat scalar (`is_flat_scalar` —
     /// Int8/16/32/64, UInt8/16/32/64, Float32/64), the scalar is marshalled through a STACK
     /// `TaggedVal` (tag+payload = `T`'s boxed-scalar convention, identical to what an array slot
     /// stores) rather than `box_value`'s HEAP box. `lin_map_set` copies the 16 bytes INLINE into the
@@ -467,7 +545,39 @@ impl<'ctx> Codegen<'ctx> {
     /// `emit_object_set` — a concrete heap value is freshly heap-boxed and the box shell released
     /// after the set (net zero on the inner; the slot's reference comes from the IR
     /// `transfer_into_container`), a union value (already a `TaggedVal*`) passes straight through.
-    pub(crate) fn emit_map_set(&mut self, map_ptr: BasicValueEnum<'ctx>, key_ptr: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type, elem_ty: &Type) {
+    pub(crate) fn emit_map_set(&mut self, map_ptr: BasicValueEnum<'ctx>, key_ptr: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type, elem_ty: &Type, val_repr: &lin_ir::repr::Repr) {
+        // KEEP-PACKED (repr pass, Stage 4 — THE dijkstra fix): when the value is a PACKED sealed
+        // array / sealed record (proven by the pass: `val_repr` is `Packed(L)`), store it into the
+        // map slot by WRAPPING the still-packed pointer in a 16-byte TaggedVal (BoxKeepPacked,
+        // TAG_ARRAY / TAG_OBJECT) — O(1), NO `sealed_array_to_tagged` materialize (the O(n) copy that
+        // crashed on read-back). `lin_map_set` copies the 16 bytes inline and retains the inner; the
+        // shell is freed after. The read-back (`compile_ir_index` Map arm) unboxes it as a packed
+        // pointer (UnboxKeepPacked) feeding SealedArrayFieldGet zero-copy. Always sound: the runtime
+        // dispatches release/free on the buffer's `elem_tag` / sealed header, regardless of being
+        // wrapped in a TaggedVal slot.
+        if value.is_pointer_value() {
+            let packed_arr = val_repr.packed_sealed_array_layout().is_some();
+            let packed_rec = val_repr.packed_struct_fields().is_some();
+            if packed_arr || packed_rec {
+                // BoxKeepPacked: wrap the still-packed pointer (O(1) — `lin_box_array`/`box_object`
+                // store the pointer verbatim, NO inner retain, NO `sealed_array_to_tagged` copy).
+                // OWNERSHIP: the slot's single owning reference is supplied by the IR
+                // `transfer_into_container` retain emitted in `IndexSet` lowering (identical to the
+                // materialize path's contract). `lin_map_set` ALSO retains the inner into the slot, so
+                // that DUPLICATE retain is undone by releasing the inner when we free the shell
+                // (`lin_tagged_release` = drop inner + free shell). Net codegen effect on the inner is
+                // ZERO (retain then release), leaving exactly the IR transfer's +1 as the slot's
+                // reference — so the map drop's per-slot release frees it exactly once (ASan
+                // detect_leaks verified). Mirrors `emit_object_set`'s fresh-box contract.
+                let boxed = self.compile_ir_box_keep_packed(value, /*arr=*/packed_arr);
+                self.builder.call(self.rt.map_set,
+                    &[map_ptr.into(), key_ptr.into(), boxed.into()], "");
+                if boxed.is_pointer_value() {
+                    self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                }
+                return;
+            }
+        }
         // Flat-scalar value: store unboxed via a stack TaggedVal carrying T's tag/payload. Coerce
         // the (possibly narrower) source value to T's numeric representation first so the stored
         // payload is T-correct (e.g. a signed Int32 -1 sign-extends to Int64 -1, not 4294967295).
@@ -580,7 +690,41 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) fn emit_array_set(&mut self, arr_ptr: BasicValueEnum<'ctx>, idx_i64: inkwell::values::IntValue<'ctx>, value: BasicValueEnum<'ctx>, val_ty: &Type) {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
+        let i8_ty = self.context.i8_type();
         let void_ty = self.context.void_type();
+        // A SEALED-repr record value (`{id:String, dep:Int32, …}`) being set into a TAGGED `Object[]`
+        // is a PACKED struct pointer, NOT a boxed LinObject. `build_tagged_val_alloca` would tag it
+        // TAG_OBJECT with the raw struct pointer as payload — the runtime then reads the packed bytes
+        // as a LinObject header on read-back (heap-buffer-overflow / misaligned deref). Materialize it
+        // to a fresh boxed LinObject first (its heap fields retained into the new object), then store
+        // that pointer under TAG_OBJECT — the SAME representation `tagged_array_push_value` stores for
+        // the `push$Object` case. The materialized object is a fresh +1 whose reference moves into the
+        // array slot (`lin_array_set` raw-copies the 16-byte TaggedVal without an inner retain for a
+        // tagged array), so it is NOT released here; the source struct keeps its own ownership (the IR
+        // `ArraySetDyn` transfer leaves it owned, released at scope exit, dropping its heap fields).
+        // Without this, `set(boxedSealedArr, i, {…})` crashed (ASan heap-buffer-overflow in
+        // `lin_object`); the boxed-array set is the index-set analogue of the boxed-array push fix.
+        if let Type::Object { .. } = val_ty {
+            if let Some(fields) = Self::sealed_fields(val_ty).cloned() {
+                let obj = self.sealed_materialize_to_object(value, &fields);
+                let tag = i8_ty.const_int(Self::type_tag(val_ty) as u64, false);
+                let cell = self.builder.alloca(self.context.struct_type(
+                    &[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false), "set_tv");
+                let tag_ptr = self.builder.struct_gep(
+                    self.context.struct_type(&[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false),
+                    cell, 0, "set_tv_tag");
+                self.builder.store(tag_ptr, tag);
+                let pay_ptr = self.builder.struct_gep(
+                    self.context.struct_type(&[i8_ty.into(), i8_ty.array_type(7).into(), i64_ty.into()], false),
+                    cell, 2, "set_tv_pay");
+                let pay = self.builder.ptr_to_int(obj.into_pointer_value(), i64_ty, "set_tv_payi");
+                self.builder.store(pay_ptr, pay);
+                let set_fn = self.get_or_declare_fn("lin_array_set",
+                    void_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
+                self.builder.call(set_fn, &[arr_ptr.into(), idx_i64.into(), cell.into()], "");
+                return;
+            }
+        }
         let elem_tagged: BasicValueEnum<'ctx> = if Self::is_union_type(val_ty) {
             value
         } else {
@@ -598,7 +742,7 @@ impl<'ctx> Codegen<'ctx> {
     /// `emit_array_set` helpers so the boxing/retain/release sequence is IDENTICAL to the
     /// `lin_object_set`/`lin_array_set` intrinsics; the matching IR-level ownership transfer
     /// is emitted in `IndexSet` lowering (`lin-ir`).
-    pub(crate) fn compile_ir_index_set(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, val_ty: &Type) {
+    pub(crate) fn compile_ir_index_set(&mut self, obj: BasicValueEnum<'ctx>, key: BasicValueEnum<'ctx>, value: BasicValueEnum<'ctx>, obj_ty: &Type, key_ty: &Type, val_ty: &Type, val_repr: &lin_ir::repr::Repr) {
         // Resolve an object key to a raw `LinString*`. A string key that is a callback param
         // arrives boxed (a `TaggedVal*`); unbox it, or `lin_object_set` reads the box as a
         // LinString and corrupts the key.
@@ -616,13 +760,13 @@ impl<'ctx> Codegen<'ctx> {
                     self.emit_object_set(obj, key_str, value, val_ty);
                 }
             }
-            // Typed index-signature map `{ String: T }` (ADR-082): O(1) hashed insert/overwrite.
+            // Typed index-signature map `{ String: T }` (ADR-055): O(1) hashed insert/overwrite.
             // Pass the map's value type `T` so a flat-scalar `T` is stored UNBOXED (inline in the
             // slot's TaggedVal, no heap box) and a narrower source value is widened to `T`.
             Type::Map(elem) => {
                 if obj.is_pointer_value() && key.is_pointer_value() {
                     let key_str = resolve_obj_key(self, key);
-                    self.emit_map_set(obj, key_str, value, val_ty, elem);
+                    self.emit_map_set(obj, key_str, value, val_ty, elem, val_repr);
                 }
             }
             Type::Array(elem) => {
@@ -631,12 +775,38 @@ impl<'ctx> Codegen<'ctx> {
                 // slot (`lin_sealed_array_set` releases the old element's heap fields and retains the
                 // new ones; a scalar-only record is a straight overwrite). `value` is a sealed
                 // struct ptr; it stays owned by its caller (released at scope exit).
-                if Self::sealed_array_elem(obj_ty).is_some() {
+                if let Some(elem_fields) = Self::sealed_array_elem(obj_ty) {
+                    let elem_fields = elem_fields.clone();
                     let ptr_ty = self.context.ptr_type(AddressSpace::default());
                     let i64_ty = self.context.i64_type();
+                    // `lin_sealed_array_set` reads the RHS as a STANDALONE sealed struct (header +
+                    // packed payload, copying from `obj + SEALED_HEADER`). The RHS value is only in
+                    // that representation when its static type IS the same sealed record; a structural
+                    // `{...}` literal in a callee context is often typed as an UNSEALED `{...}` object
+                    // and built as a boxed `LinObject` (lin_object_alloc) — passing that to the set
+                    // would memcpy garbage from `box + 16` into the slot (the index-set crash). Project
+                    // a representation-mismatched RHS into a fresh sealed struct first; it is a +1 we
+                    // own here, so release it after the set takes its own retained copy. A
+                    // matching-repr value passes through verbatim (still owned by its temp).
+                    let _ = val_ty;
+                    // PART C (single-owner): the projection decision is read from the pass-computed
+                    // representation of the RHS temp (`val_repr`), NOT a Type comparison. A verbatim
+                    // pointer store is sound iff the RHS is ALREADY a packed sealed struct of the
+                    // element's exact layout; anything else (boxed LinObject / unsealed `{...}` /
+                    // WrapsPacked handle) is projected into a fresh sealed struct first. This replaces
+                    // `sealed_repr_differs(val_ty, elem_ty)` with the dataflow fact.
+                    let needs_proj = val_repr.packed_struct_fields() != Some(&elem_fields);
+                    let (sealed_val, owned_here) = if needs_proj {
+                        (self.sealed_project_from(value, val_ty, &elem_fields), true)
+                    } else {
+                        (value, false)
+                    };
                     let set_fn = self.get_or_declare_fn("lin_sealed_array_set",
                         self.context.void_type().fn_type(&[ptr_ty.into(), i64_ty.into(), ptr_ty.into()], false));
-                    self.builder.call(set_fn, &[obj.into(), idx.into(), value.into()], "");
+                    self.builder.call(set_fn, &[obj.into(), idx.into(), sealed_val.into()], "");
+                    if owned_here {
+                        self.emit_sealed_release(sealed_val, &elem_fields);
+                    }
                 }
                 // Flat scalar element AND the value already has the matching scalar type ⇒ inline a
                 // bounds-checked raw store (no box + cross-staticlib `lin_array_set` round-trip).
@@ -708,7 +878,7 @@ impl<'ctx> Codegen<'ctx> {
     /// (TAG_OBJECT) OR a typed index-signature map (TAG_MAP). This is the write analogue of the
     /// tag-dispatched read in `compile_ir_index`: a NESTED typed map's inner write
     /// (`outer[a][b] = v`, where `outer[a]` is `{ String: T } | Null` — not `is`-narrowable,
-    /// ADR-082 §5.1.1) reaches here with `obj_ty` a union containing a `Map(elem)` variant.
+    /// ADR-055 §5.1.1) reaches here with `obj_ty` a union containing a `Map(elem)` variant.
     /// When such a variant is present, dispatch on the runtime tag: TAG_MAP → `emit_map_set`
     /// (O(1) hashed insert), otherwise `emit_object_set`. Both helpers RETAIN the inner payload,
     /// so the ownership contract is identical on either branch. With no Map variant this is a
@@ -744,7 +914,9 @@ impl<'ctx> Codegen<'ctx> {
         let mrg = self.context.append_basic_block(llvm_fn, "set_mrg");
         self.builder.conditional_branch(is_map, map_b, obj_b);
         self.builder.position_at_end(map_b);
-        self.emit_map_set(container, key_str, value, val_ty, &elem);
+        // In the union/nested-map dispatch the value arrives already boxed (a union TaggedVal*), so
+        // there is no packed buffer to keep-pack — pass the fail-safe boxed repr.
+        self.emit_map_set(container, key_str, value, val_ty, &elem, &lin_ir::repr::Repr::boxed_opaque());
         self.builder.unconditional_branch(mrg);
         self.builder.position_at_end(obj_b);
         self.emit_object_set(container, key_str, value, val_ty);
@@ -859,13 +1031,23 @@ impl<'ctx> Codegen<'ctx> {
         field: &str,
         arr_ty: &Type,
         result_ty: &Type,
+        arr_repr: &lin_ir::repr::Repr,
     ) -> BasicValueEnum<'ctx> {
+        let _ = arr_ty;
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
-        let Some(fields) = Self::sealed_array_elem(arr_ty) else {
+        // STAGE 3: the packed-sealed-array ASSUME is read from the array operand's repr (proven by
+        // the pass + verifier to carry a real `elem_tag==0xFE` packed buffer exactly where the old
+        // `sealed_array_elem(arr_ty)` gate fired). Oracle-proven byte identical.
+        let Some(fields) = arr_repr.packed_sealed_array_layout() else {
             return ptr_ty.const_null().into();
         };
         let fields = fields.clone();
+        // A field NOT in the sealed element's shape is statically absent — `sealed_field_layout`
+        // would assert. Follow safe-access (§6.1: missing key → Null) instead of panicking.
+        if !fields.contains_key(field) {
+            return self.null_value_for(result_ty);
+        }
         let (field_off, _total) = Self::sealed_field_layout(&fields, field);
         let payload_off = field_off - Self::SEALED_HEADER;
         let fld_ty = fields.get(field).cloned().unwrap_or(Type::Null);
@@ -921,7 +1103,136 @@ impl<'ctx> Codegen<'ctx> {
     /// a new contiguous sealed array and, per element, reads the source element as a boxed value,
     /// projects it into the element record's struct layout, and copies the projected payload into the
     /// sealed slot. Non-mutating; `src` keeps its own ownership. Rare path; correctness over speed.
+    /// True when `ty` is (or transitively contains) a representation that needs a sealed projection
+    /// when crossing from the boxed `Json` view: a sealed scalar record, OR a sealed-record array, OR
+    /// a container/union holding one. Used to decide whether a NESTED-array Coerce must recurse
+    /// element-wise (vs. the one-level sealed-array arms or a plain pointer pass-through).
+    pub(crate) fn ty_contains_sealed(ty: &Type) -> bool {
+        if Self::sealed_array_elem(ty).is_some() || Self::sealed_scalar_fields(ty).is_some() {
+            return true;
+        }
+        match ty {
+            Type::Array(t) | Type::Iterator(t) | Type::Shared(t) | Type::Map(t) => Self::ty_contains_sealed(t),
+            Type::FixedArray(ts) | Type::Union(ts) => ts.iter().any(Self::ty_contains_sealed),
+            _ => false,
+        }
+    }
+
+    /// Coerce a boxed/Json source ARRAY into `Array(inner_to)` element-wise, where `inner_to` itself
+    /// contains a sealed representation (so a verbatim pointer reuse would mis-type the elements). The
+    /// outer array is rebuilt as a TAGGED array (its elements are heap pointers — sealed arrays or
+    /// boxed records — not packed scalars), and each source element is recursively `compile_ir_coerce`d
+    /// from its boxed view (the Json wildcard) into `inner_to`, then pushed (materialized to its boxed/tagged
+    /// slot by `tagged_array_push_value`). The source elements are read via `lin_array_get_tagged`
+    /// (fresh +1 boxes), released after the coerce takes its own +1. Used for `partition`/`groupBy`/
+    /// `chunk`-shaped combinator results routed through the type-erased boxed fallback.
+    pub(crate) fn array_coerce_elementwise(
+        &mut self,
+        src: BasicValueEnum<'ctx>,
+        src_ty: &Type,
+        inner_to: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        // Unbox a boxed Json/union source to the raw LinArray*.
+        let src_raw = if Self::is_union_type(src_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[src.into()], "nestarr_unbox").try_as_basic_value().unwrap_basic()
+        } else { src };
+        let len_fn = self.get_or_declare_fn("lin_array_length", i64_ty.fn_type(&[ptr_ty.into()], false));
+        let len = self.builder.call(len_fn, &[src_raw.into()], "nestarr_len").try_as_basic_value().unwrap_basic().into_int_value();
+        let out = self.builder.call(self.rt.array_alloc, &[len.into()], "nestarr_out").try_as_basic_value().unwrap_basic();
+        let get_tagged = self.get_or_declare_fn("lin_array_get_tagged", ptr_ty.fn_type(&[ptr_ty.into(), i64_ty.into()], false));
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let head = self.context.append_basic_block(llvm_fn, "nestarr_head");
+        let body = self.context.append_basic_block(llvm_fn, "nestarr_body");
+        let done = self.context.append_basic_block(llvm_fn, "nestarr_done");
+        let idx_slot = self.builder.alloca(i64_ty, "nestarr_i");
+        self.builder.store(idx_slot, i64_ty.const_zero());
+        self.builder.unconditional_branch(head);
+        self.builder.position_at_end(head);
+        let i = self.builder.load(i64_ty, idx_slot, "nestarr_iv").into_int_value();
+        let cond = self.builder.int_compare(IntPredicate::SLT, i, len, "nestarr_cond");
+        self.builder.conditional_branch(cond, body, done);
+        self.builder.position_at_end(body);
+        let elem_box = self.builder.call(get_tagged, &[src_raw.into(), i.into()], "nestarr_get").try_as_basic_value().unwrap_basic();
+        // `lin_array_get_tagged` ALWAYS returns a boxed `TaggedVal*` (the dynamic Json view of the
+        // element), regardless of the source array's static element type. So coerce FROM the Json
+        // wildcard — not `inner_from` (e.g. `Array(TypeVar)`, which the inner sealed-array projection
+        // would NOT recognize as boxed and so would read the box as a raw `LinArray*` → crash). The
+        // wildcard makes `sealed_array_project_from` / `sealed_project_from` unbox the element first.
+        let coerced = self.compile_ir_coerce(elem_box, &Type::TypeVar(u32::MAX), inner_to);
+        // `lin_array_push` (via `tagged_array_push_value`) does NOT retain — it copies the 8-byte
+        // payload and TAKES OWNERSHIP of the inner heap value. The `coerced` element is a fresh +1
+        // (a projected sealed array, a materialized boxed record, or an unboxed scalar), so its +1
+        // transfers into the output slot — do NOT release it here (that would double-free).
+        self.tagged_array_push_value(out, coerced, inner_to);
+        // The source element box from `lin_array_get_tagged` is a fresh +1 we own; release it (the
+        // coerce above took its own independent +1 into `coerced`).
+        if elem_box.is_pointer_value() {
+            self.builder.call(self.rt.tagged_release, &[elem_box.into()], "");
+        }
+        let next = self.builder.int_add(i, i64_ty.const_int(1, false), "nestarr_next");
+        self.builder.store(idx_slot, next);
+        self.builder.unconditional_branch(head);
+        self.builder.position_at_end(done);
+        out
+    }
+
     pub(crate) fn sealed_array_project_from(&mut self, src: BasicValueEnum<'ctx>, src_ty: &Type, arr_ty: &Type) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        if Self::sealed_array_elem(arr_ty).is_none() {
+            return ptr_ty.const_null().into();
+        }
+        // Unbox the source to a raw LinArray* if it is a boxed Json/union value.
+        let src_raw = if Self::is_union_type(src_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[src.into()], "sarrp_unbox").try_as_basic_value().unwrap_basic()
+        } else { src };
+        // KEEP-PACKED fast path (repr pass, Stage 4): if the unboxed source is ALREADY a packed
+        // 0xFE buffer (a boxed sealed array stored keep-packed, e.g. a Map slot read-back or a
+        // narrowing of `T[]|Null`), there is NO representation change — clone it BY POINTER (retain
+        // the existing 0xFE buffer, O(1)) instead of rebuilding element-wise through the boxed
+        // `Object[]` machinery (which would mis-read the inline scalar bytes → UAF). Dispatch on the
+        // runtime `elem_tag` (byte 4): 0xFE ⇒ keep-packed; otherwise (a genuinely-boxed `Object[]`,
+        // e.g. a `fromJson` result) fall through to the element rebuild below.
+        {
+            let i8_ty = self.context.i8_type();
+            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+            let tag_ptr = unsafe {
+                self.builder.gep(i8_ty, src_raw.into_pointer_value(), &[i64_ty.const_int(4, false)], "sarrp_tagp")
+            };
+            let etag = self.builder.load(i8_ty, tag_ptr, "sarrp_etag").into_int_value();
+            let is_packed = self.builder.int_compare(IntPredicate::EQ, etag, i8_ty.const_int(0xFE, false), "sarrp_ispk");
+            let kp_b = self.context.append_basic_block(llvm_fn, "sarrp_kp");
+            let rebuild_b = self.context.append_basic_block(llvm_fn, "sarrp_rebuild");
+            let merge_b = self.context.append_basic_block(llvm_fn, "sarrp_merge");
+            self.builder.conditional_branch(is_packed, kp_b, rebuild_b);
+            // Keep-packed: the unboxed 0xFE buffer is the SAME object the boxed source (`src`) holds a
+            // reference to. The projection here is a non-mutating BORROW that aliases the source's
+            // existing reference (the caller releases `src`/the cloned union box at the projection's
+            // scope, which drops the inner). So return the buffer VERBATIM with NO extra retain —
+            // adding one would out-balance the single source release and leak the buffer (the map
+            // value would never reach rc 0). This mirrors the union/Json `obj[k]` projection borrow.
+            self.builder.position_at_end(kp_b);
+            let kp_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(merge_b);
+            self.builder.position_at_end(rebuild_b);
+            // Fall through to the element-rebuild path; capture its result and join at merge.
+            let rebuilt = self.sealed_array_rebuild_from_boxed(src_raw, arr_ty);
+            let rebuild_exit = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(merge_b);
+            self.builder.position_at_end(merge_b);
+            let phi = self.builder.phi(ptr_ty, "sarrp_phi");
+            phi.add_incoming(&[(&src_raw, kp_exit), (&rebuilt, rebuild_exit)]);
+            return phi.as_basic_value();
+        }
+    }
+
+    /// Element-by-element rebuild of a sealed-record array from a genuinely-boxed `Object[]` source
+    /// (each element a boxed `LinObject` projected into the packed element layout). The cold path of
+    /// `sealed_array_project_from` — used only when the source is NOT already a keep-packed 0xFE
+    /// buffer (e.g. a `fromJson` result). Split out so the keep-packed fast path is the common case.
+    pub(crate) fn sealed_array_rebuild_from_boxed(&mut self, src_raw: BasicValueEnum<'ctx>, arr_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let i64_ty = self.context.i64_type();
         let fields = match Self::sealed_array_elem(arr_ty) {
@@ -930,10 +1241,6 @@ impl<'ctx> Codegen<'ctx> {
         };
         let stride = Self::sealed_array_stride(&fields);
         let desc = self.sealed_descriptor(&fields);
-        // Unbox the source to a raw LinArray* if it is a boxed Json/union value.
-        let src_raw = if Self::is_union_type(src_ty) {
-            self.builder.call(self.rt.unbox_ptr, &[src.into()], "sarrp_unbox").try_as_basic_value().unwrap_basic()
-        } else { src };
         // len = lin_array_length(src_raw)
         let len_fn = self.get_or_declare_fn("lin_array_length", i64_ty.fn_type(&[ptr_ty.into()], false));
         let len = self.builder.call(len_fn, &[src_raw.into()], "sarrp_len").try_as_basic_value().unwrap_basic().into_int_value();
@@ -1019,18 +1326,36 @@ impl<'ctx> Codegen<'ctx> {
         let payload = func.get_nth_param(0).unwrap().into_pointer_value();
         let new_obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(fields.len() as u64, false).into()], "smat_obj")
             .try_as_basic_value().unwrap_basic().into_pointer_value();
+        let free_box_shell = self.get_or_declare_fn("lin_tagged_free_box", self.context.void_type().fn_type(&[ptr_ty.into()], false));
         for (k, fty) in fields.iter() {
             let (off, _) = Self::sealed_field_layout(fields, k);
             let payload_off = off - Self::SEALED_HEADER;
+            let is_heap = Self::sealed_field_kind(fty).is_some();
             let llvm_fld = self.llvm_type(fty);
             let p = unsafe { self.builder.gep(self.context.i8_type(), payload, &[i64_ty.const_int(payload_off, false)], "smat_fld_p") };
             let loaded = self.builder.load(llvm_fld, p, "smat_fld");
+            // box_value(heap) wraps the BORROWED element pointer (no retain); box_value(scalar) wraps
+            // the scalar in a cached/heap box. Mirrors `sealed_materialize_to_object` exactly so the
+            // per-field RC across the Json-boundary materialize is balanced for heap fields.
             let boxed = self.box_value(loaded, fty);
             let key_str = self.compile_string_lit(k).into_pointer_value();
             self.builder.call(self.rt.object_set_fresh, &[new_obj.into(), key_str.into(), boxed.into()], "");
-            // Scalar field: reclaim the cache-safe box shell (no inner heap).
             if boxed.is_pointer_value() {
-                self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                if is_heap {
+                    // A nested SEALED field's box_value produced a FRESH boxed LinObject (+1 inner)
+                    // that object_set_fresh retained (+2); full tagged_release drops it back to the
+                    // object's +1 and frees the shell. A String/Array field's box wraps a BORROWED
+                    // element inner that object_set_fresh retained — free only the shell, leaving the
+                    // borrowed element inner untouched (the array still owns it).
+                    if matches!(fty, Type::Object { .. }) {
+                        self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                    } else {
+                        self.builder.call(free_box_shell, &[boxed.into()], "");
+                    }
+                } else {
+                    // Scalar field: reclaim the cache-safe box shell (no inner heap).
+                    self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                }
             }
         }
         self.builder.build_return(Some(&new_obj)).unwrap();
@@ -1071,6 +1396,18 @@ impl<'ctx> Codegen<'ctx> {
         };
         self.builder.build_memcpy(dst, 8, src, 8, i64_ty.const_int(stride, false))
             .expect("sealed_array_materialize_elem memcpy");
+        // HEAP-FIELD records (Stage 3b): the memcpy copied each heap-field POINTER verbatim, so the
+        // fresh struct now aliases the array's owned String/Array/nested-sealed payloads at +0. The
+        // fresh struct is a +1 owner the caller will release (which walks its descriptor and releases
+        // each heap field), so it must take its OWN +1 on each heap field — else the shared payload is
+        // double-freed (array drop + struct drop). `retain_sealed_payload_fields` walks the descriptor
+        // and bumps each non-null heap field's refcount. Scalar-only record (NULL desc) → skipped.
+        let has_heap = fields.values().any(|t| Self::sealed_field_kind(t).is_some());
+        if has_heap {
+            let retain_fn = self.get_or_declare_fn("retain_sealed_payload_fields",
+                self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+            self.builder.call(retain_fn, &[dst.into(), desc.into()], "");
+        }
         obj.into()
     }
 
@@ -1355,10 +1692,343 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.call(self.rt.sealed_release, &[val.into(), i64_ty.const_int(total, false).into()], "");
     }
 
-    pub(crate) fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, obj_ty: &Type, result_ty: &Type) -> BasicValueEnum<'ctx> {
+    /// The Null value in the representation `result_ty` expects. A union/Json slot holds a boxed
+    /// TaggedVal*, so emit a boxed null (`lin_box_null`); any other (concrete, incl. `Type::Null`)
+    /// slot is a raw null pointer — identical to how a `Const::Null` literal is materialized. Used
+    /// by the sealed-record field-access paths to yield the safe-access missing-key → Null result
+    /// without panicking, mirroring the boxed `lin_object_get` missing-key path.
+    fn null_value_for(&mut self, result_ty: &Type) -> BasicValueEnum<'ctx> {
+        if Self::is_union_type(result_ty) {
+            self.builder.call(self.rt.box_null, &[], "sealed_absent_null").try_as_basic_value().unwrap_basic()
+        } else {
+            self.context.ptr_type(AddressSpace::default()).const_null().into()
+        }
+    }
+
+    // ── Unboxed tagged sum type (`SumNode`) — unboxed-sumtype Stage 1 ─────────────────────────────
+
+    /// Construct a `SumNode` for the variant whose discriminant value is `disc`. Allocates a
+    /// max-variant-sized node (`lin_sumnode_alloc`, desc NULL — Stage 1 scalar-only), stores the
+    /// dense variant tag inline at offset 16, then stores each scalar payload field by offset. The
+    /// discriminant field itself is NOT stored (it is the inline tag). `field_vals` are the literal's
+    /// (name, value, value_ty) — including the discriminant, which is skipped. Returns a +1 node.
+    pub(crate) fn sumnode_construct(
+        &mut self,
+        sum_ty: &Type,
+        disc: &str,
+        field_vals: &[(String, BasicValueEnum<'ctx>, Type)],
+    ) -> BasicValueEnum<'ctx> {
+        let total = Self::sumnode_total_size(sum_ty);
+        let tag = Self::sumnode_variant_tag(sum_ty, disc).expect("sumnode_construct: unknown variant");
+        let payload_fields = Self::sumnode_variant_by_disc(sum_ty, disc)
+            .expect("sumnode_construct: unknown variant payload");
+        let disc_key = Self::sum_type_discriminant(sum_ty).expect("sumnode_construct: not a sum type");
+        let i64_ty = self.context.i64_type();
+        let i32_ty = self.context.i32_type();
+        let i8_ty = self.context.i8_type();
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
-        // Sealed scalar record: constant-offset load (the win).
-        if let Some(fields) = Self::sealed_scalar_fields(obj_ty) {
+        let node = self
+            .builder
+            .call(self.rt.sumnode_alloc, &[i64_ty.const_int(total, false).into(), ptr_ty.const_null().into()], "sumnode")
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_pointer_value();
+        // Inline tag @ 16.
+        let tag_p = unsafe { self.builder.gep(i8_ty, node, &[i64_ty.const_int(Self::SUMNODE_TAG_OFFSET, false)], "sumnode_tag_p") };
+        self.builder.store(tag_p, i32_ty.const_int(tag as u64, false));
+        // Scalar payload fields by offset (skip the discriminant).
+        for (name, val, val_ty) in field_vals {
+            if name == &disc_key {
+                continue;
+            }
+            let Some(fld_ty) = payload_fields.get(name).cloned() else { continue };
+            let offset = Self::sumnode_field_offset(&payload_fields, name);
+            // Reconcile a wider/narrower numeric literal into the stored field width (no RC — scalar).
+            let stored = if val_ty == &fld_ty { *val } else { self.compile_ir_coerce(*val, val_ty, &fld_ty) };
+            let p = unsafe { self.builder.gep(i8_ty, node, &[i64_ty.const_int(offset, false)], "sumnode_set_p") };
+            self.builder.store(p, stored);
+        }
+        node.into()
+    }
+
+    /// Load the inline discriminant tag (u32 @ offset 16) of a `SumNode`.
+    pub(crate) fn sumnode_tag_load(&mut self, node: BasicValueEnum<'ctx>) -> inkwell::values::IntValue<'ctx> {
+        let i64_ty = self.context.i64_type();
+        let i32_ty = self.context.i32_type();
+        let i8_ty = self.context.i8_type();
+        let base = node.into_pointer_value();
+        let p = unsafe { self.builder.gep(i8_ty, base, &[i64_ty.const_int(Self::SUMNODE_TAG_OFFSET, false)], "sumnode_tag_p") };
+        self.builder.load(i32_ty, p, "sumnode_tag").into_int_value()
+    }
+
+    /// Read a SCALAR payload field of a `SumNode` by constant offset (the value's variant is known —
+    /// from a narrowed match arm — so the payload field offset is statically resolvable). For the
+    /// discriminant field, materialize the variant's StrLit (the tag identifies it). `variant_payload`
+    /// is the narrowed variant's payload field map.
+    pub(crate) fn sumnode_field_get(
+        &mut self,
+        node: BasicValueEnum<'ctx>,
+        field: &str,
+        variant_payload: &indexmap::IndexMap<String, Type>,
+        result_ty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let Some(fld_ty) = variant_payload.get(field).cloned() else {
+            // Field not in this variant's payload (e.g. the discriminant, or an absent key) → Null.
+            return self.null_value_for(result_ty);
+        };
+        let offset = Self::sumnode_field_offset(variant_payload, field);
+        let i64_ty = self.context.i64_type();
+        let i8_ty = self.context.i8_type();
+        let base = node.into_pointer_value();
+        let llvm_fld = self.llvm_type(&fld_ty);
+        let p = unsafe { self.builder.gep(i8_ty, base, &[i64_ty.const_int(offset, false)], "sumnode_fld_p") };
+        let loaded = self.builder.load(llvm_fld, p, "sumnode_fld");
+        if &fld_ty == result_ty { loaded } else { self.compile_ir_coerce(loaded, &fld_ty, result_ty) }
+    }
+
+    /// Materialize a `SumNode` into a fresh boxed `LinObject` (the universal Json representation) for
+    /// a dynamic edge (toString / Json-serialize / keys / spread / `==` vs a non-sum value / FFI /
+    /// transfer). Reads the inline tag to pick the variant, then sets the discriminant StrLit + each
+    /// scalar payload field under its interned string key. Returns a +1 `LinObject*`. Scalar-only
+    /// (Stage 1): every boxed value is a scalar box whose shell `lin_tagged_release` reclaims after
+    /// `object_set_fresh` (no borrowed inner to keep, mirroring `sealed_materialize_to_object`).
+    ///
+    /// Emits a per-variant switch (each variant materialises its own concrete shape), merging the
+    /// resulting `LinObject*` at a phi. `sum_ty` is the static sum type.
+    pub(crate) fn sumnode_materialize_to_object(
+        &mut self,
+        node: BasicValueEnum<'ctx>,
+        sum_ty: &Type,
+        llvm_fn: inkwell::values::FunctionValue<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        let disc_key = Self::sum_type_discriminant(sum_ty).expect("sumnode_materialize: not a sum type");
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let variants = match sum_ty {
+            Type::Union(vs) => vs.clone(),
+            _ => unreachable!(),
+        };
+        let tag = self.sumnode_tag_load(node);
+        let merge_bb = self.context.append_basic_block(llvm_fn, "sumnode_mat_merge");
+        let mut incoming: Vec<(inkwell::values::PointerValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
+        // Build the variant switch.
+        let default_bb = self.context.append_basic_block(llvm_fn, "sumnode_mat_default");
+        let mut cases: Vec<(inkwell::values::IntValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
+        let i32_ty = self.context.i32_type();
+        let free_box_shell = self.get_or_declare_fn("lin_tagged_free_box", self.context.void_type().fn_type(&[ptr_ty.into()], false));
+        let mut variant_bodies: Vec<(u32, indexmap::IndexMap<String, Type>, String)> = Vec::new();
+        for (i, v) in variants.iter().enumerate() {
+            if let Type::Object { fields, .. } = v {
+                let disc_val = match fields.get(&disc_key) {
+                    Some(Type::StrLit(s)) => s.clone(),
+                    _ => continue,
+                };
+                let payload = Self::sumnode_variant_payload_fields(fields, &disc_key);
+                variant_bodies.push((i as u32, payload, disc_val));
+            }
+        }
+        // Allocate the per-variant blocks first.
+        let blocks: Vec<inkwell::basic_block::BasicBlock<'ctx>> = variant_bodies
+            .iter()
+            .map(|_| self.context.append_basic_block(llvm_fn, "sumnode_mat_arm"))
+            .collect();
+        for (idx, (tagv, _, _)) in variant_bodies.iter().enumerate() {
+            cases.push((i32_ty.const_int(*tagv as u64, false), blocks[idx]));
+        }
+        self.builder.switch(tag, default_bb, &cases);
+        // Default: unreachable (the tag is always a valid variant). Emit an object with just the key
+        // to keep the block well-formed, then branch to merge (defensive — never taken).
+        self.builder.position_at_end(default_bb);
+        let def_obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(0, false).into()], "sumnode_mat_def").try_as_basic_value().unwrap_basic().into_pointer_value();
+        let def_pred = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(merge_bb);
+        incoming.push((def_obj, def_pred));
+        // Each variant arm: build the concrete LinObject.
+        for (idx, (_tagv, payload, disc_val)) in variant_bodies.iter().enumerate() {
+            self.builder.position_at_end(blocks[idx]);
+            let nfields = (payload.len() + 1) as u64; // payload + discriminant
+            let obj = self.builder.call(self.rt.object_alloc, &[i32_ty.const_int(nfields, false).into()], "sumnode_mat_obj").try_as_basic_value().unwrap_basic().into_pointer_value();
+            // discriminant field (a string literal).
+            let dk = self.compile_string_lit(&disc_key).into_pointer_value();
+            let dv_raw = self.compile_string_lit(disc_val);
+            let dv_box = self.box_value(dv_raw, &Type::Str);
+            self.builder.call(self.rt.object_set_fresh, &[obj.into(), dk.into(), dv_box.into()], "");
+            // The boxed StrLit wraps an immortal interned LinString; free only the box shell.
+            if dv_box.is_pointer_value() {
+                self.builder.call(free_box_shell, &[dv_box.into()], "");
+            }
+            // scalar payload fields.
+            for (k, fty) in payload.iter() {
+                let v = self.sumnode_field_get(node, k, payload, fty);
+                let boxed = self.box_value(v, fty);
+                let key_str = self.compile_string_lit(k).into_pointer_value();
+                self.builder.call(self.rt.object_set_fresh, &[obj.into(), key_str.into(), boxed.into()], "");
+                if boxed.is_pointer_value() {
+                    // Scalar: no borrowed inner — full release reclaims the (cache-safe) box shell.
+                    self.builder.call(self.rt.tagged_release, &[boxed.into()], "");
+                }
+            }
+            let pred = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(merge_bb);
+            incoming.push((obj, pred));
+        }
+        self.builder.position_at_end(merge_bb);
+        let phi = self.builder.phi(ptr_ty, "sumnode_mat_phi");
+        let refs: Vec<(&dyn inkwell::values::BasicValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> =
+            incoming.iter().map(|(v, b)| (v as &dyn inkwell::values::BasicValue<'ctx>, *b)).collect();
+        phi.add_incoming(&refs);
+        phi.as_basic_value()
+    }
+
+    /// Project a `SumNode` source into a FRESH sealed-record struct of `target_fields` (the matched
+    /// variant record, inside a narrowed `match` arm). The variant is known statically from
+    /// `target_fields`' discriminant value. Each scalar payload field is copied from the node by
+    /// const offset; the discriminant field (a StrLit) is materialized as the interned literal. Used
+    /// by `compile_ir_coerce` for a sum→variant-record Coerce (the arm-entry narrowing). Non-mutating:
+    /// the source SumNode keeps its own ownership. Returns a +1 sealed struct.
+    /// (Foundation helper — wired in `compile_ir_coerce` once the repr seed + ABI land.)
+    #[allow(dead_code)]
+    pub(crate) fn sumnode_project_to_sealed(
+        &mut self,
+        node: BasicValueEnum<'ctx>,
+        sum_ty: &Type,
+        target_fields: &indexmap::IndexMap<String, Type>,
+    ) -> BasicValueEnum<'ctx> {
+        let disc_key = Self::sum_type_discriminant(sum_ty).expect("sumnode_project: not a sum type");
+        // The target variant's discriminant value (its StrLit in target_fields).
+        let disc_val = match target_fields.get(&disc_key) {
+            Some(Type::StrLit(s)) => s.clone(),
+            _ => {
+                // Target is not a single concrete variant — cannot project; return null (defensive).
+                return self.context.ptr_type(AddressSpace::default()).const_null().into();
+            }
+        };
+        let payload = Self::sumnode_variant_by_disc(sum_ty, &disc_val).unwrap_or_default();
+        let vals: Vec<(String, BasicValueEnum<'ctx>, Type, bool)> = target_fields
+            .iter()
+            .map(|(k, fty)| {
+                if k == &disc_key {
+                    // discriminant StrLit → interned immortal LinString (already-owned, no retain).
+                    let s = self.compile_string_lit(&disc_val);
+                    (k.clone(), s, fty.clone(), true)
+                } else {
+                    let v = self.sumnode_field_get(node, k, &payload, fty);
+                    (k.clone(), v, fty.clone(), false)
+                }
+            })
+            .collect();
+        self.sealed_construct(target_fields, &vals)
+    }
+
+    /// Reconstruct a fresh `SumNode` from a BOXED object / Json source (`src`, statically `src_ty`):
+    /// the reverse boundary (a Json value coerced into a sum type, e.g. `fromJson`). Reads the
+    /// discriminant key, switches on its string value to the matching variant, and builds that
+    /// variant's node by reading each scalar payload field with `lin_object_get`+unbox. Returns a +1
+    /// SumNode. Defensive default arm builds the first variant's node (the checker guarantees a valid
+    /// discriminant for a well-typed coercion).
+    /// (Foundation helper — wired in `compile_ir_coerce` once the repr seed + ABI land.)
+    #[allow(dead_code)]
+    pub(crate) fn sumnode_project_from_boxed(
+        &mut self,
+        src: BasicValueEnum<'ctx>,
+        src_ty: &Type,
+        sum_ty: &Type,
+        llvm_fn: inkwell::values::FunctionValue<'ctx>,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let disc_key = Self::sum_type_discriminant(sum_ty).expect("project_from_boxed: not a sum type");
+        // Unbox the source to a raw LinObject* if it is a union/Json box.
+        let container = if Self::is_union_type(src_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[src.into()], "sumnode_pfb_unbox").try_as_basic_value().unwrap_basic()
+        } else {
+            src
+        };
+        // Read the discriminant string value (boxed) for the switch.
+        let dk = self.compile_string_lit(&disc_key).into_pointer_value();
+        let disc_box = self.builder.call(self.rt.object_get, &[container.into(), dk.into()], "sumnode_pfb_disc").try_as_basic_value().unwrap_basic();
+        let variants = match sum_ty {
+            Type::Union(vs) => vs.clone(),
+            _ => unreachable!(),
+        };
+        let merge_bb = self.context.append_basic_block(llvm_fn, "sumnode_pfb_merge");
+        let mut incoming: Vec<(inkwell::values::PointerValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
+        // Chain of disc-string compares (the boxed source's discriminant is a string).
+        let mut variant_info: Vec<(String, indexmap::IndexMap<String, Type>)> = Vec::new();
+        for v in &variants {
+            if let Type::Object { fields, .. } = v {
+                if let Some(Type::StrLit(s)) = fields.get(&disc_key) {
+                    variant_info.push((s.clone(), Self::sumnode_variant_payload_fields(fields, &disc_key)));
+                }
+            }
+        }
+        let n = variant_info.len();
+        for (idx, (disc_val, payload)) in variant_info.iter().enumerate() {
+            // test: disc_box == box("disc_val")
+            let arm_bb = self.context.append_basic_block(llvm_fn, "sumnode_pfb_arm");
+            let next_bb = if idx + 1 < n {
+                self.context.append_basic_block(llvm_fn, "sumnode_pfb_next")
+            } else {
+                arm_bb // last variant: take it unconditionally as the default
+            };
+            if idx + 1 < n {
+                let lit_raw = self.compile_string_lit(disc_val);
+                let lit = self.box_value(lit_raw, &Type::Str);
+                let eq_fn = self.get_or_declare_fn("lin_tagged_eq", self.context.i8_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
+                let eq_i8 = self.builder.call(eq_fn, &[disc_box.into(), lit.into()], "sumnode_pfb_eq").try_as_basic_value().unwrap_basic().into_int_value();
+                let eq = self.builder.int_truncate_or_bit_cast(eq_i8, self.context.bool_type(), "sumnode_pfb_eqb");
+                if lit.is_pointer_value() {
+                    let free_box_shell = self.get_or_declare_fn("lin_tagged_free_box", self.context.void_type().fn_type(&[ptr_ty.into()], false));
+                    self.builder.call(free_box_shell, &[lit.into()], "");
+                }
+                self.builder.conditional_branch(eq, arm_bb, next_bb);
+            } else {
+                self.builder.unconditional_branch(arm_bb);
+            }
+            // arm: build the variant node, reading scalar payload fields from the boxed object.
+            self.builder.position_at_end(arm_bb);
+            let field_vals: Vec<(String, BasicValueEnum<'ctx>, Type)> = {
+                let mut v = Vec::new();
+                // discriminant: the StrLit value (interned).
+                v.push((disc_key.clone(), self.compile_string_lit(disc_val), Type::StrLit(disc_val.clone())));
+                for (k, fty) in payload.iter() {
+                    let key_str = self.compile_string_lit(k).into_pointer_value();
+                    let tagged = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "sumnode_pfb_get").try_as_basic_value().unwrap_basic();
+                    let val = self.unbox_tagged_val_to_type(tagged, fty);
+                    v.push((k.clone(), val, fty.clone()));
+                }
+                v
+            };
+            let node = self.sumnode_construct(sum_ty, disc_val, &field_vals);
+            let pred = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(merge_bb);
+            incoming.push((node.into_pointer_value(), pred));
+            if idx + 1 < n {
+                self.builder.position_at_end(next_bb);
+            }
+        }
+        self.builder.position_at_end(merge_bb);
+        let phi = self.builder.phi(ptr_ty, "sumnode_pfb_phi");
+        let refs: Vec<(&dyn inkwell::values::BasicValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> =
+            incoming.iter().map(|(v, b)| (v as &dyn inkwell::values::BasicValue<'ctx>, *b)).collect();
+        phi.add_incoming(&refs);
+        phi.as_basic_value()
+    }
+
+    pub(crate) fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, obj_ty: &Type, result_ty: &Type, obj_repr: &lin_ir::repr::Repr) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        // STAGE 3: the packed-struct ASSUME is read from the object operand's repr (`func.repr`),
+        // not re-derived from `obj_ty`. The representation-inference pass + verifier prove this
+        // operand carries a real packed struct exactly where the old `sealed_scalar_fields(obj_ty)`
+        // gate fired (oracle-proven byte identical). Constant-offset load is the win.
+        if let Some(fields) = obj_repr.packed_struct_fields() {
+            // A sealed record has EXACTLY its declared fields. A field NOT in the shape is
+            // statically absent — `sealed_field_layout` would assert on it (compiler panic). Follow
+            // the safe-access rule (§6.1: missing object key → Null), mirroring the boxed
+            // `lin_object_get` missing-key → Null path: produce the Null result for `result_ty`.
+            // (The IR lowerer already routes a statically-absent literal key to a Null const; this is
+            // the codegen-side safety net for any other FieldGet that reaches here, e.g. destructure.)
+            if !fields.contains_key(field) {
+                return self.null_value_for(result_ty);
+            }
             if obj.is_pointer_value() {
                 return self.sealed_field_get(obj, field, fields, result_ty);
             }

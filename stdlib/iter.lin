@@ -82,7 +82,7 @@ export val concat = (a: Json, b: Json): Json =>
 // inline (lin-ir monomorphize) replaces the wrapper with `lin_map(arr, <lambda>)` so the literal
 // lambda is visible to the intrinsic's lowering, which then INLINES a capture-less lambda body
 // directly into the loop — binding the param to the flat element, no per-element box/unbox/closure
-// call, and carrying a scalar reduce accumulator unboxed through the loop phi (ADR-069).
+// call, and carrying a scalar reduce accumulator unboxed through the loop phi (ADR-044).
 // Heterogeneous/union/object call sites monomorphize at the `$Json` tagged representation, keeping
 // the boxed path correct.
 // The iterable param is the `Array | Iterator | Stream` union (a `Stream` is accepted; the opaque

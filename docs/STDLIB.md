@@ -72,7 +72,7 @@ This document specifies the standard library for the Lin language. All modules a
 **std/iter**
 
 Combinators dispatch on the receiver type: **eager** (`U[]`) over an array or iterator, **lazy**
-(`Stream<U>`) over a stream; terminals over a stream gain an `| Error` arm (ADR-077). The signatures
+(`Stream<U>`) over a stream; terminals over a stream gain an `| Error` arm (ADR-051). The signatures
 below show the array/iterator (eager) form; the per-function reference notes the stream form.
 
 | Function | Signature | Summary |
@@ -340,7 +340,7 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 
 Stream-specific sources, adapters, sinks, and terminals. The unified combinators
 (`map`/`filter`/`take`/`drop`/`reduce`/`for`/…) are **not** exported here — they come from
-[`std/iter`](#stditer) and dispatch to the lazy stream backend on a stream receiver (ADR-077).
+[`std/iter`](#stditer) and dispatch to the lazy stream backend on a stream receiver (ADR-051).
 
 | Function | Signature | Summary |
 | --- | --- | --- |
@@ -835,7 +835,7 @@ array, an `Iterator`, or a `Stream` — and **dispatches on the receiver's stati
 argument, in dot-application terms): the same name is **eager** over an array/iterator (returning a
 materialised `U[]`) and **lazy** over a stream (returning a `Stream<U>` adapter that reads nothing until
 a terminal drives it). Terminals over a stream gain an `| Error` arm, because a stream read can fail
-mid-traversal (ADR-077; stream semantics in spec §27.9). Eager combinators are non-mutating and return
+mid-traversal (ADR-051; stream semantics in spec §27.9). Eager combinators are non-mutating and return
 new values.
 
 Import:
@@ -911,7 +911,7 @@ val map: <T, U>(src: T[] | Iterator | Stream<T>, f: (T[, i: Int32]) -> U) -> U[]
 Applies `f` to each element in order. `f` optionally receives the 0-based source index as a second
 parameter (`(x, i) => …`); a 1-arg `f` is unchanged. **Array/Iterator** → eager `U[]`. **Stream** → lazy `Stream<U>`
 (a transform adapter; `f` runs once per item as the item is pulled). For a monomorphic scalar array with
-a capture-less literal lambda, the body is inlined into a flat loop with no per-element boxing (ADR-069).
+a capture-less literal lambda, the body is inlined into a flat loop with no per-element boxing (ADR-044).
 
 ```txt
 [1, 2, 3].map(x => x * 2)                 // [2, 4, 6]
@@ -948,7 +948,7 @@ Folds left-to-right from `init`. `f` receives the accumulator first and the curr
 optionally receives the 0-based source index as a **third** parameter (`(acc, x, i) => …`).
 **Array/Iterator** → eager `U`. **Stream** → **terminal** returning `U | Error` (it drives the stream to
 completion on the calling thread; a read fault surfaces as `Error`). For a monomorphic scalar
-accumulator with a capture-less literal reducer, the accumulator is carried unboxed (ADR-069).
+accumulator with a capture-less literal reducer, the accumulator is carried unboxed (ADR-044).
 
 ```txt
 [1, 2, 3, 4].reduce(0, (acc, x) => acc + x)   // 10
@@ -1358,7 +1358,7 @@ compact([1, 2, 3])               // [1, 2, 3]
 val countBy: <T>(arr: T[], f: (T) -> String) -> { String: Int32 }
 ```
 
-Returns a typed map (`{ String: Int32 }`, ADR-082) from each distinct key (produced by `f`) to the number of elements that produced that key.
+Returns a typed map (`{ String: Int32 }`, ADR-055) from each distinct key (produced by `f`) to the number of elements that produced that key.
 
 ```txt
 ["apple", "banana", "avocado", "blueberry"].countBy(s => s.at(0))
@@ -1376,7 +1376,7 @@ Returns a typed map (`{ String: Int32 }`, ADR-082) from each distinct key (produ
 val groupBy: <T>(arr: T[], f: (T) -> String) -> { String: T[] }
 ```
 
-Returns a typed map (`{ String: T[] }`, ADR-082) where each key is a value returned by `f`, and the corresponding value is an array of all elements that produced that key. Within each group, elements keep their encounter order. The map's keys are in **hash order** (the typed-map backing is hashed, not insertion-ordered).
+Returns a typed map (`{ String: T[] }`, ADR-055) where each key is a value returned by `f`, and the corresponding value is an array of all elements that produced that key. Within each group, elements keep their encounter order. The map's keys are in **hash order** (the typed-map backing is hashed, not insertion-ordered).
 
 ```txt
 ["one", "two", "three", "four"].groupBy(s => toString(length(s)))
@@ -1537,7 +1537,7 @@ product([])              // 1
 val push: <T>(arr: T[], item: T) -> Null
 ```
 
-Appends `item` to `arr` in place. This is one of the few mutating operations in Lin — it modifies the array that was passed in. Generic over the element type `T`, so the element type is enforced: `push(intArr, "s")` is a compile error (ADR-085). An empty accumulator literal must be annotated so `T` is pinned: an evidence-free `[]` cannot infer its element type (ADR-084) — `val xs: Int32[] = []`, not `val xs = []`.
+Appends `item` to `arr` in place. This is one of the few mutating operations in Lin — it modifies the array that was passed in. Generic over the element type `T`, so the element type is enforced: `push(intArr, "s")` is a compile error (ADR-059). An empty accumulator literal must be annotated so `T` is pinned: an evidence-free `[]` cannot infer its element type (ADR-058) — `val xs: Int32[] = []`, not `val xs = []`.
 
 ```txt
 val xs: Int32[] = []
@@ -2357,7 +2357,7 @@ import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, 
 ```
 
 > **Typed maps (`{ String: T }`).** Two groups of `std/object` ops relate to the typed
-> index-signature map (the dictionary type, ADR-082, backed by a hashed O(1) container — see
+> index-signature map (the dictionary type, ADR-055, backed by a hashed O(1) container — see
 > Specification §5.1.1):
 >
 > - **Tag-aware introspection** — `keys`, `values`, `entries`, `length`, and `isEmpty` keep a `Json`
@@ -2582,12 +2582,12 @@ object — it stops at the first error and does not collect all of them. The `Er
 `path` is a JSONPath-ish location of the mismatch, e.g. `$.address.city` or `$[2]`. Detect a
 decode failure with `is Error` or, equivalently, the discriminant `result["type"] == "error"`.
 `is Error` is special-cased to check the `"type": "error"` discriminant (not just the object
-tag), so it distinguishes a decode failure from a successfully-decoded value (see ADR-047).
+tag), so it distinguishes a decode failure from a successfully-decoded value (see ADR-031).
 
 ```txt
 // Idiomatic: match on `T | Error`. The `is Error` arm MUST come first — a structural object
 // type like `Person` is matched by a bare object tag check, so a later `is Person` arm would
-// also catch the Error object (union first-match-wins, ADR-047).
+// also catch the Error object (union first-match-wins, ADR-031).
 val describe = (r: Person | Error): Null =>
   match r
     is Error => print("decode failed at ${r["path"]}: ${r["message"]}")
@@ -2609,7 +2609,7 @@ else
 - **Arrays** (`T[]`): every element is validated against `T`. **Fixed arrays** (`[A, B]`): the
   length must match exactly and each position is validated.
 - **Unions**: the **first** structurally-matching variant wins. Prefer a discriminant field for
-  overlapping object variants (ADR-047).
+  overlapping object variants (ADR-031).
 - **Numbers** (target-driven): an **integer** target requires an integral, in-range number
   (`3.14` → error; out-of-range → error); a **float** target accepts any number; a
   `Json`/unconstrained target accepts any number as-is.
@@ -2619,7 +2619,7 @@ Array, fixed-array, and union targets must be named via a `type` alias (the rece
 bare type name): `type IntArr = Int32[]; IntArr.fromJson([1, 2, 3])`.
 
 A `Json` value cannot be assigned to a concrete structured object without decoding — `fromJson`
-(or `is`/`has` narrowing) is the sound conversion (ADR-046).
+(or `is`/`has` narrowing) is the sound conversion (ADR-045).
 
 ### toJsonString
 
@@ -3432,20 +3432,20 @@ import { fetch, fetchJson, serve, json, notFound } from "std/http"
 type HttpRequest = {
   "method":  String,
   "path":    String,
-  "query":   { ...String },
-  "headers": { ...String },
+  "query":   String,
+  "headers": { String: String },
   "body":    String
 }
 
 type HttpResponse = {
   "status":  Int32,
-  "headers": { ...String },
+  "headers": { String: String },
   "body":    String
 }
 
 type HttpOptions = {
   "method":  String,
-  "headers": { ...String },
+  "headers": { String: String },
   "body":    String
 }
 ```
@@ -3839,11 +3839,11 @@ print("exited ${code}")
 
 Lazy, fallible streams over OS resources — files, sockets, subprocess stdout, and stdin (spec §27.9). A `Stream<T>` is an opaque runtime value built as a **lazy pull graph**: a source node (`readStream`), zero or more adapters (`lines`/`linesMax`/`chunks`, plus the `std/iter` combinators `map`/`filter`/`take`/… which dispatch lazily on a stream receiver), and a terminal operation that drives the graph one item at a time with bounded memory. Errors are threaded **in-band** — the first read error poisons the upstream and short-circuits to the terminal op, so error handling lives only at the terminal, not at every adapter.
 
-**A stream can only be read once.** Reading consumes it, so each stream flows through a single pipeline — once you've called a combinator or terminal on it, using that stream again is a compile-time error. To make a second pass over the same data, open a fresh stream. You don't have to consume a stream (opening one and never reading it is fine — it cleans up after itself), and a stream lives in a local `val`, a function parameter, or a return value — not in an object field, array, or `var`. (The single-use rule is what lets `.promise()` safely hand the whole pipeline to a worker thread; design rationale in ADR-075.)
+**A stream can only be read once.** Reading consumes it, so each stream flows through a single pipeline — once you've called a combinator or terminal on it, using that stream again is a compile-time error. To make a second pass over the same data, open a fresh stream. You don't have to consume a stream (opening one and never reading it is fine — it cleans up after itself), and a stream lives in a local `val`, a function parameter, or a return value — not in an object field, array, or `var`. (The single-use rule is what lets `.promise()` safely hand the whole pipeline to a worker thread; design rationale in ADR-049.)
 
 The combinators (`map`/`filter`/`take`/`drop`/`reduce`/`for`/…) are **not** part of `std/stream` — they
 come from [`std/iter`](#stditer) and dispatch to the lazy stream backend automatically when the receiver
-is a `Stream` (ADR-077). A stream pipeline imports its **sources and sinks** from `std/stream` and its
+is a `Stream` (ADR-051). A stream pipeline imports its **sources and sinks** from `std/stream` and its
 **combinators** from `std/iter`:
 
 ```txt
@@ -4019,9 +4019,9 @@ match outcome
 val promise: <T>(Stream<T>) -> Json    // Promise<Null | Error>
 ```
 
-Terminal. Runs the whole pipeline on a **background thread** and returns a promise immediately, so your program can do other work while the stream is processed. `await` the promise for the result — `Null` on success, or an `Error` if anything went wrong while processing (a crash mid-stream is caught at the thread boundary and handed back as an `Error` rather than aborting the program; spec §24.2.2). Use `.drain()` when you simply want to run the pipeline and wait. (Design rationale — how the pipeline is safely handed to the worker — is in ADR-075.)
+Terminal. Runs the whole pipeline on a **background thread** and returns a promise immediately, so your program can do other work while the stream is processed. `await` the promise for the result — `Null` on success, or an `Error` if anything went wrong while processing (a crash mid-stream is caught at the thread boundary and handed back as an `Error` rather than aborting the program; spec §24.2.2). Use `.drain()` when you simply want to run the pipeline and wait. (Design rationale — how the pipeline is safely handed to the worker — is in ADR-049.)
 
-The promise type is conceptually `Promise<Null | Error>`; like all promise handles it is erased to `Json` in annotations (spec §24.1). `await` reattaches the `Null | Error` union, so the `Error` case must be handled (ADR-070).
+The promise type is conceptually `Promise<Null | Error>`; like all promise handles it is erased to `Json` in annotations (spec §24.1). `await` reattaches the `Null | Error` union, so the `Error` case must be handled (ADR-045).
 
 ```txt
 val p = readStream("big.log")
@@ -4159,7 +4159,7 @@ correctly (an undrained body is skipped automatically).
 > execution** — the driver is paused while the body runs and resumes (advancing to the next entry)
 > the moment the body returns. `data` must therefore be consumed (drained / read) **inside the
 > callback**; it shares a cursor with the paused driver. Handing it to a worker via `.promise()`
-> would race that cursor and is **unsupported**. The ADR-075 stream placement restriction bounds
+> would race that cursor and is **unsupported**. The ADR-049 stream placement restriction bounds
 > `data`'s lifetime to the callback (it cannot be stored in a field, `var`, or array); a dedicated
 > compile-time check specifically for `.promise()` on a sub-stream is a known gap.
 
@@ -4302,7 +4302,7 @@ val r: Int32 = await(p)   // type error: Int32 | Error is not assignable to Int3
 
 You must handle the `Error` (e.g. with the `match` above) before using the value as a plain `T`.
 
-> Limitation (ADR-070): there is no nominal `Promise<T>` type — a promise handle is erased to
+> Limitation (ADR-045): there is no nominal `Promise<T>` type — a promise handle is erased to
 > `Json` — so this enforces "you must handle the `Error` after awaiting" but does **not** catch
 > "you forgot to `await`" (using a promise as if it were the value). Error injection happens at
 > `await` (where the value materialises), not at `async`, because the other async primitives
@@ -4432,7 +4432,7 @@ val set:      <T>(Shared<T>, T) -> Null
 val withLock: <T, R>(Shared<T>, (T) -> R) -> R
 ```
 
-`Shared<T>` is opt-in **shared mutable state** for many threads (ADR-043 §2.3.1): an
+`Shared<T>` is opt-in **shared mutable state** for many threads (ADR-028 §2.3.1): an
 atomic-refcounted box wrapping a reader-writer lock over a private copy of the value.
 
 - `shared(v)` creates a `Shared<T>` boxing a deep copy of `v` (must be transferable).
@@ -4457,7 +4457,7 @@ gap (last-writer-wins); use `withLock` when the update must be atomic.
 
 > `Shared<T>` is **accessor-only**: `shared`/`get`/`set`/`withLock` are the only operations.
 > Passing a `Shared` value to anything else (e.g. `push(s, 7)`, indexing) is a compile-time type
-> error — the box never auto-unwraps to its inner type or to `Json` (ADR-044). The inner value
+> error — the box never auto-unwraps to its inner type or to `Json` (ADR-029). The inner value
 > is reachable only via `get`/`withLock`, which copy it out. (This check is enforced by
 > `lin build`/`lin run`, which resolve imports; a bare `lin check` does not resolve imports and
 > so won't show it.)
@@ -4474,7 +4474,7 @@ gap (last-writer-wins); use `withLock` when the update must be atomic.
 val frozen: <T>(T) -> T
 ```
 
-`frozen(v)` deep-freezes a transferable graph into shared **read-only** state (ADR-045 §2.3.2):
+`frozen(v)` deep-freezes a transferable graph into shared **read-only** state (ADR-030 §2.3.2):
 every heap node is sealed immortal+immutable, so many threads can read it concurrently with
 **zero copies, no lock, and no atomics**. The value keeps its plain type, so readers use it
 transparently:
@@ -4489,7 +4489,7 @@ val routes = parallel(
 > **Immortal ⇒ never freed.** Use `frozen` for load-once, program-lifetime reference data (a
 > timetable, routing table, config). A `frozen()` value created and discarded in a loop leaks.
 > The compile-time read-only coercion / mutation-inference (rejecting a frozen value passed to a
-> mutating parameter) is deferred (ADR-045): mutating a frozen value is currently a silent no-op
+> mutating parameter) is deferred (ADR-030): mutating a frozen value is currently a silent no-op
 > rather than a compile error. Concurrent reads are fully safe.
 
 ---
@@ -4921,7 +4921,7 @@ replace readFile = (path: String): Json => "mock contents of ${path}"
 
 For worked examples see `examples/processes/` (mocking `std/process.exec`),
 `examples/dijkstra/` (mocking `std/fs` read/write), and `examples/web-server/`
-(mocking `std/template.render`); ADR-071 has the design.
+(mocking `std/template.render`); ADR-046 has the design.
 
 ---
 

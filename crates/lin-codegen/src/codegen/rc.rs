@@ -1,10 +1,97 @@
 use super::builder_ext::BuilderExt;
-use inkwell::values::BasicValueEnum;
+use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue};
+use inkwell::IntPredicate;
 
 use lin_check::types::Type;
+use lin_ir::repr::Repr;
 use super::Codegen;
 
 impl<'ctx> Codegen<'ctx> {
+    /// Release a TCO param slot's OLD value before the back-edge store overwrites it, guarded by:
+    /// (1) `owns_flag` — a bool slot that is true only when the current slot value was produced by
+    /// a PRIOR tail iteration (loop-owned), false for the borrowed caller-passed entry param; and
+    /// (2) an alias check — `old` must differ from EVERY pointer in `new_ptrs` (the new argument
+    /// values being stored this iteration). (1) prevents releasing a borrowed param the caller
+    /// still owns (a use-after-free at the caller); (2) prevents a double-free when a param is
+    /// threaded UNCHANGED (`old == new` for its own slot) or when some OTHER new arg still
+    /// references this slot's old value. `ty` selects the per-type runtime release via
+    /// `emit_release`.
+    pub(crate) fn emit_tco_release_old(
+        &mut self,
+        llvm_fn: FunctionValue<'ctx>,
+        owns_flag: PointerValue<'ctx>,
+        old: PointerValue<'ctx>,
+        new_ptrs: &[PointerValue<'ctx>],
+        ty: &Type,
+    ) {
+        let i64_ty = self.context.i64_type();
+        let bool_ty = self.context.bool_type();
+        // owned = the current slot value was stored by a prior tail iteration (loop-owned).
+        let owned = self.builder.load(bool_ty, owns_flag, "tco_owned").into_int_value();
+        let old_int = self.builder.ptr_to_int(old, i64_ty, "tco_old_i");
+        // cond = owned AND (old != new_j for every j)
+        let mut differs = owned;
+        for np in new_ptrs {
+            let np_int = self.builder.ptr_to_int(*np, i64_ty, "tco_new_i");
+            let ne = self.builder.int_compare(IntPredicate::NE, old_int, np_int, "tco_ne");
+            differs = self.builder.and(differs, ne, "tco_diff");
+        }
+        let rel_bb = self.context.append_basic_block(llvm_fn, "tco_rel");
+        let cont_bb = self.context.append_basic_block(llvm_fn, "tco_relcont");
+        self.builder.conditional_branch(differs, rel_bb, cont_bb);
+        self.builder.position_at_end(rel_bb);
+        self.emit_release(old.into(), ty);
+        self.builder.unconditional_branch(cont_bb);
+        self.builder.position_at_end(cont_bb);
+    }
+
+    /// Emit a release dispatched on the value's PHYSICAL representation (`func.repr`). PART C
+    /// (single-owner): when the pass proved a temp `Packed`, the release SHAPE is chosen from that
+    /// fact, not re-derived from the static `Type`. A `Packed` temp is constructed packed, so today's
+    /// type-dispatch already routes it to the packed releaser — making this override BYTE-IDENTICAL on
+    /// the current corpus (no Packed-repr temp is ever a non-sealed type). For any non-Packed repr the
+    /// dispatch defers verbatim to the existing static-type [`emit_release`], so the boxed/scalar paths
+    /// are unchanged. (The fuller `Boxed`-with-sealed-type divergence fix — releasing a boxed value
+    /// typed sealed with the boxed shape — is a BEHAVIOR change, deferred per the Part C byte-identical
+    /// gate; it is unreachable on the current corpus because sealed-typed temps that reach Release are
+    /// Packed.)
+    pub(crate) fn emit_release_repr(&mut self, val: BasicValueEnum<'ctx>, ty: &Type, repr: &Repr) {
+        if !val.is_pointer_value() { return; }
+        match repr {
+            // PACKED sealed record → packed struct release (decrement rc, free on zero, per-heap-field
+            // release walked inside emit_sealed_release).
+            Repr::Packed(lin_ir::repr::Layout::PackedStruct { fields }) => {
+                let fields = fields.clone();
+                self.emit_sealed_release(val, &fields);
+                return;
+            }
+            // PACKED sealed array → the 0xFE-aware array release.
+            Repr::Packed(lin_ir::repr::Layout::PackedSealedArray { .. }) => {
+                self.builder.call(self.rt.array_release, &[val.into_pointer_value().into()], "");
+                return;
+            }
+            // UNBOXED SUM TYPE (unboxed-sumtype Stage 1) → `lin_sumnode_release(ptr, total_size)`.
+            // Stage 1 is scalar-only so this is a refcount decrement + free (no per-field walk).
+            Repr::Packed(lin_ir::repr::Layout::SumNode { sum_ty }) => {
+                let total = Self::sumnode_total_size(sum_ty);
+                let i64_ty = self.context.i64_type();
+                self.builder.call(
+                    self.rt.sumnode_release,
+                    &[val.into_pointer_value().into(), i64_ty.const_int(total, false).into()],
+                    "",
+                );
+                return;
+            }
+            // A boxed slot (Opaque OR WrapsPacked-by-pointer): the box is a TaggedVal/LinObject whose
+            // release is the tag-dispatched one. WrapsPacked borrows its inner packed buffer; the box
+            // shell's release (tagged_release) decrements the inner via the runtime's tag dispatch.
+            // Fall through to the type-based dispatch which already picks the right boxed releaser for
+            // the static type (object/array/tagged/map/closure/stream).
+            Repr::Boxed(_) | Repr::FlatScalar(_) | Repr::Unknown | Repr::Bottom => {}
+        }
+        self.emit_release(val, ty);
+    }
+
     /// Emit a type-dispatched release call for a heap-allocated value.
     /// No-op for scalars (non-pointer LLVM values) and null pointers.
     pub(crate) fn emit_release(&mut self, val: BasicValueEnum<'ctx>, ty: &Type) {
@@ -21,7 +108,7 @@ impl<'ctx> Codegen<'ctx> {
                 self.emit_sealed_release(val, &fields);
             }
             Type::Object { .. } => { self.builder.call(self.rt.object_release, &[ptr.into()], ""); }
-            // Typed index-signature map (`{ String: T }`, ADR-082): the hashed LinMap container.
+            // Typed index-signature map (`{ String: T }`, ADR-055): the hashed LinMap container.
             Type::Map(_) => { self.builder.call(self.rt.map_release, &[ptr.into()], ""); }
             Type::Function { .. } => { self.builder.call(self.rt.closure_release, &[ptr.into()], ""); }
             Type::TypeVar(_) | Type::Union(_) => { self.builder.call(self.rt.tagged_release, &[ptr.into()], ""); }

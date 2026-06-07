@@ -59,6 +59,15 @@ impl TypeEnv {
         self.scopes.pop();
     }
 
+    /// Drop scopes until `self.scopes.len() == len`. Used to roll back the scope stack after a
+    /// discarded SPECULATIVE type-check whose nested `infer_function` `?`-ed out mid-body and
+    /// left unbalanced pushed scopes (see `Checker::restore_checker_state`). Never grows.
+    pub fn truncate_scopes(&mut self, len: usize) {
+        if self.scopes.len() > len {
+            self.scopes.truncate(len);
+        }
+    }
+
     pub fn define(&mut self, name: String, ty: Type, mutable: bool) -> usize {
         self.define_at(name, ty, mutable, None)
     }

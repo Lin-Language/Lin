@@ -1,5 +1,5 @@
 //! `Stream<T>` — an opaque, lazy, effectful, fallible PULL-SOURCE that owns an OS resource
-//! (a file descriptor, socket, child-process pipe, …) (streams brief, ADR-072).
+//! (a file descriptor, socket, child-process pipe, …) (streams brief, ADR-047).
 //!
 //! A `Stream` is the resource-owning sibling of `Iterator`. The iterator protocol's
 //! `cond`/`current` must be PURE, but reading from a stream has side effects (it advances an
@@ -1909,7 +1909,7 @@ pub unsafe extern "C" fn lin_stream_release_box(b: *const u8) {
 }
 
 // =====================================================================================
-// `std/archive` — tar splitting over a `Stream<UInt8[]>` (ADR-072 streams; std/archive surface).
+// `std/archive` — tar splitting over a `Stream<UInt8[]>` (ADR-047 streams; std/archive surface).
 //
 // A tar archive is a flat concatenation of 512-byte-aligned (header + body) records. This module
 // turns a byte stream into archive entries WITHOUT buffering the whole archive — the parent stream
@@ -1931,7 +1931,7 @@ pub unsafe extern "C" fn lin_stream_release_box(b: *const u8) {
 // releases its OWN ref to the sub-stream box (rc→0; the no-op `close` leaves the parent untouched).
 // SYNC-ONLY: the sub-stream is valid only DURING the body's synchronous execution (the driver is
 // paused). Handing `data` to a worker (`.promise()`) would race the shared cursor and is UNSUPPORTED
-// (bounded by the ADR-075 placement restriction — `data` cannot be stored in a field/var/array).
+// (bounded by the ADR-049 placement restriction — `data` cannot be stored in a field/var/array).
 // =====================================================================================
 
 /// Shared cursor over the parent byte stream + the active entry's remaining body length. `untar`
@@ -2175,7 +2175,7 @@ pub unsafe extern "C" fn lin_stream_untar(s: *const u8, body: *mut u8) -> *mut u
     };
 
     // Close the parent exactly once. The `Arc` may still be alive in a leaked sub-stream box only if
-    // the body stored it (forbidden by ADR-075) — under the supported contract this is the last ref.
+    // the body stored it (forbidden by ADR-049) — under the supported contract this is the last ref.
     {
         let mut st = state.lock().unwrap();
         st.up.close();

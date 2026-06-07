@@ -127,14 +127,14 @@ fn check_front_end(source_path: &Path) -> Result<CheckedFrontEnd, CompileError> 
 pub fn check(opts: &CheckOptions) -> Result<Vec<lin_common::Diagnostic>, CompileError> {
     let front = check_front_end(&opts.source_path)?;
 
-    // Mirror `compile()`'s ADR-071 gate: `replace` is only valid in a `*.test.lin` file.
+    // Mirror `compile()`'s ADR-046 gate: `replace` is only valid in a `*.test.lin` file.
     let is_test_file = opts.source_path.to_string_lossy().ends_with(".test.lin");
     if !is_test_file && !front.typed_module.replacements.is_empty() {
         let span = front.typed_module.replacements[0].span;
         return Err(CompileError::TypeCheck(vec![lin_common::Diagnostic::error(
             span,
             "`replace` is only allowed in a `*.test.lin` file (it mocks an import for tests). \
-             Remove it from this program (ADR-071)."
+             Remove it from this program (ADR-046)."
                 .to_string(),
         )]));
     }
@@ -159,7 +159,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         w.render(&opts.source_path.to_string_lossy(), &source);
     }
 
-    // ADR-071: `replace` is a TEST-ONLY mock — valid only in a `*.test.lin`. Gating on the
+    // ADR-046: `replace` is a TEST-ONLY mock — valid only in a `*.test.lin`. Gating on the
     // FILENAME (not the subcommand) means it holds for every entry point: `lin run`/`lin build`
     // on a normal program reject it (a shipped binary must never silently swap an import like
     // stdlib `fs`), while `lin test` AND the ASan CI leg (which runs `lin build <f>.test.lin`)
@@ -173,7 +173,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         return Err(CompileError::TypeCheck(vec![lin_common::Diagnostic::error(
             span,
             "`replace` is only allowed in a `*.test.lin` file (it mocks an import for tests). \
-             Remove it from this program (ADR-071)."
+             Remove it from this program (ADR-046)."
                 .to_string(),
         )]));
     }
@@ -189,7 +189,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
     // async boundary — it references any concurrency intrinsic (the `lin_async`/`lin_parallel`/
     // `lin_worker`/… family, reachable only via `std/async`). When it does, codegen must NOT
     // mark user functions `nounwind`, because a runtime fault inside a thunk unwinds through
-    // Lin frames to the thread boundary (spec §24.2.2, ADR-042). Scan the main module and every
+    // Lin frames to the thread boundary (spec §24.2.2, ADR-027). Scan the main module and every
     // import's intrinsic map.
     let async_intrinsics = [
         "lin_async", "lin_await", "lin_parallel", "lin_race", "lin_timeout", "lin_retry",
@@ -214,7 +214,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         cg.set_main_source(&abs, &source);
     }
 
-    // ADR-071: group the main module's test `replace` overrides by the import path they target,
+    // ADR-046: group the main module's test `replace` overrides by the import path they target,
     // so each imported module is compiled WITHOUT emitting the replaced export's body — the main
     // module supplies the canonical symbol instead.
     let mut replaced_by_path: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
@@ -261,6 +261,12 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
         if !errors.is_empty() {
             return Err(CompileError::TypeCheck(errors));
         }
+        // Representation-inference pass (repr.rs) — runs after monomorphize+lower, immediately
+        // before rc_elide so RC sees representation-stable IR. STAGE 3: stores the per-temp repr
+        // table on each `func.repr` for codegen to consume at every packed-vs-boxed DECIDE / ASSUME
+        // site; in debug builds also asserts the Stage-2 oracle (new analysis == old type
+        // predicates) + the soundness verifier.
+        lin_ir::repr::run(&mut ir_module);
         rc_elide::elide_rc(&mut ir_module);
         // Sealed-records Stage 4: mark non-escaping all-scalar sealed-record constructions for
         // stack allocation AND suppress their Retain/Release emission (see lin_ir::escape). Runs
@@ -323,7 +329,7 @@ pub fn compile(opts: &CompileOptions) -> Result<(), CompileError> {
 // Bumped to 2: Stage 0.5 of sealed-records changed `Type::Object` from a tuple variant
 // `Object(IndexMap)` to a struct variant `Object { fields, sealed }`, altering the bincode
 // layout of every serialized `Type`. A `.typed`/`.sig` written by a v1 binary must be rejected
-// rather than mis-deserialized. See ADR-083 (Type serialization changed → cache version bump).
+// rather than mis-deserialized. See ADR-057 (Type serialization changed → cache version bump).
 const CACHE_FORMAT_VERSION: u32 = 2;
 
 /// Magic prefix written at the head of every `.typed`/`.sig` cache file. Combined with the
@@ -401,6 +407,22 @@ fn load_cache(key: &str, base_dir: &Path) -> Option<TypedModule> {
     bincode::deserialize(payload).ok()
 }
 
+/// A process-wide monotonic counter used to make cache temp-file names unique PER WRITE — not just
+/// per process. `lin test` compiles many files concurrently on rayon threads (all sharing this
+/// pid), and files that share an import resolve to the SAME cache `key`; if two threads wrote to
+/// `{key}.tmp.{pid}` at once they would clobber each other's in-flight temp before the rename.
+/// Pid keeps distinct `lin` processes apart; this counter keeps concurrent writers within one
+/// process apart. Each writer renames its OWN temp onto the final path — rename is atomic, so the
+/// final cache file is always a complete, consistent image regardless of who wins the last rename
+/// (the content is identical: same key == same bytes).
+static CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Build a writer-unique temp path next to `final_path` for the write-to-temp-then-rename dance.
+fn unique_tmp_path(cache_dir: &Path, key: &str, ext: &str) -> PathBuf {
+    let seq = CACHE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    cache_dir.join(format!("{}.{}.tmp.{}.{}", key, ext, std::process::id(), seq))
+}
+
 /// Save a `TypedModule` to `.lin-cache/` keyed by `key`.
 /// Uses write-to-temp-then-rename for atomic, concurrent-safe cache writes.
 fn save_cache(key: &str, module: &TypedModule, base_dir: &Path) {
@@ -409,7 +431,7 @@ fn save_cache(key: &str, module: &TypedModule, base_dir: &Path) {
         return;
     }
     let final_path = cache_dir.join(format!("{}.typed", key));
-    let tmp_path = cache_dir.join(format!("{}.typed.tmp.{}", key, std::process::id()));
+    let tmp_path = unique_tmp_path(&cache_dir, key, "typed");
     if let Ok(bytes) = bincode::serialize(module) {
         let stamped = with_stamp(&bytes);
         if std::fs::write(&tmp_path, &stamped).is_ok() {
@@ -426,7 +448,7 @@ fn save_signature(key: &str, sig: &ModuleSignature, base_dir: &Path) {
         return;
     }
     let final_path = cache_dir.join(format!("{}.sig", key));
-    let tmp_path = cache_dir.join(format!("{}.sig.tmp.{}", key, std::process::id()));
+    let tmp_path = unique_tmp_path(&cache_dir, key, "sig");
     if let Some(bytes) = sig.to_bytes() {
         let stamped = with_stamp(&bytes);
         if std::fs::write(&tmp_path, &stamped).is_ok() {
@@ -480,7 +502,7 @@ fn check_module_with_imports(
     checker.import_types = import_type_map;
     checker.import_type_decls = import_type_decls;
     // The trusted stdlib forwards Json handles into concrete intrinsic/foreign params by
-    // design, so it checks Json->concrete leniently (ADR-046). User code does not.
+    // design, so it checks Json->concrete leniently (ADR-045). User code does not.
     checker.lenient_json = lenient_json;
     // `lin_*` intrinsics are accessible only to trusted stdlib modules; the LIN_ALLOW_INTRINSICS
     // env var is a test-only escape hatch for the compiler's own intrinsic-exercising fixtures.
@@ -1192,6 +1214,25 @@ fn link(obj_path: &Path, output_path: &Path, foreign_libs: &[String], coverage: 
 
     // Link system libraries needed by lin-runtime (libc via cc, libm for math).
     cmd.arg("-lm");
+
+    // Garbage-collect unreferenced sections at link time. `lin-runtime.a` is a single static
+    // archive carrying the WHOLE runtime (every intrinsic, every flat-array variant, all the
+    // refcount/string/object machinery) plus, in dev builds, ~260MB of DWARF debug info across
+    // ~1000 codegen-unit objects. A given Lin program references only a fraction of those symbols,
+    // but the linker pulls in and emits every object that satisfies any reference and drags its
+    // debug info along — so the cold link of a trivial program is ~5s, dominated entirely by the
+    // archive, not the program. `--gc-sections` lets the linker drop sections (functions/data, and
+    // their attached debug sections) that are transitively unreachable from the entry point. rustc
+    // emits per-function/-data sections by default, so this is effective without recompiling the
+    // runtime. Measured: cold link 5.2s -> 1.8s on a minimal program; whole-program reachability is
+    // unchanged, so it never removes a symbol the program actually uses. We deliberately do NOT
+    // strip debug info (e.g. via a `debug=false` profile): the ASan UAF-hunting workflow relies on
+    // runtime symbolization, and `--gc-sections` keeps the debug info for sections that survive.
+    // The flag is linker-specific: GNU ld / lld (Linux) take `--gc-sections`; Apple ld64 (macOS)
+    // spells the same dead-code elimination `-dead_strip`. Pick via host cfg — `lin` always links
+    // for its own host, so host cfg is the target linker.
+    let dead_strip = if cfg!(target_os = "macos") { "-Wl,-dead_strip" } else { "-Wl,--gc-sections" };
+    cmd.arg(dead_strip);
 
     // Capture stderr so a link failure surfaces the real linker diagnostic (e.g. "cannot find
     // libclang_rt.profile...") instead of a bare exit status. A successful link normally writes

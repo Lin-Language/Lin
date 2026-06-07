@@ -17,7 +17,7 @@ pub struct TypedModule {
     /// type position (the value-import mechanism via `ModuleSignature::exports` is the analogue).
     #[serde(default)]
     pub exported_types: HashMap<String, (Vec<String>, Type)>,
-    /// Test-only mock overrides (`replace <name> = <expr>`, ADR-071). Each entry records the
+    /// Test-only mock overrides (`replace <name> = <expr>`, ADR-046). Each entry records the
     /// imported export's CANONICAL mangled symbol (`{module_key}_{name}` for functions, the same
     /// base for vals — the `__val` suffix is added at lowering) and the type-checked replacement
     /// body. Lowering emits each body under that symbol and suppresses the original module's
@@ -28,7 +28,7 @@ pub struct TypedModule {
     pub replacements: Vec<Replacement>,
 }
 
-/// One `replace <name> = <expr>` override (ADR-071). See `TypedModule::replacements`.
+/// One `replace <name> = <expr>` override (ADR-046). See `TypedModule::replacements`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Replacement {
     /// The export's canonical mangled symbol base, `{module_key}_{name}` (e.g. `std_fs_readFile`).
@@ -121,7 +121,7 @@ pub enum TypedExpr {
     IntLit(i64, Type, Span),
     FloatLit(f64, Type, Span),
     /// A string literal. The `Type` is normally `Str`, but bidirectional refinement
-    /// (ADR-051) may narrow it to a `StrLit` singleton when checked against an expected
+    /// (ADR-034) may narrow it to a `StrLit` singleton when checked against an expected
     /// literal type. The runtime representation is identical either way.
     StringLit(String, Type, Span),
     BoolLit(bool, Span),
@@ -174,7 +174,7 @@ pub enum TypedExpr {
         result_type: Type,
         span: Span,
     },
-    /// `T.fromJson(value)` / `fromJson(T, value)` — type-directed decode (ADR-047).
+    /// `T.fromJson(value)` / `fromJson(T, value)` — type-directed decode (ADR-031).
     /// `target` is the resolved concrete `Type` T (drives the runtime schema descriptor);
     /// `value` is the Json input; `result_type` is `T | Error` and flows to the surrounding
     /// assignment/return check.
@@ -184,7 +184,7 @@ pub enum TypedExpr {
         result_type: Type,
         /// Resolved bodies of every `Named` type reachable from `target`, so codegen can
         /// build the recursive schema descriptor without a type environment. Recursion points
-        /// in `target`/these bodies remain `Type::Named(n)` and are looked up here (ADR-047).
+        /// in `target`/these bodies remain `Type::Named(n)` and are looked up here (ADR-031).
         named_defs: Vec<(String, Type)>,
         span: Span,
     },
@@ -357,7 +357,7 @@ pub enum TypedMatchPattern {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum TypedPattern {
     TypeCheck(Type, Span),
-    /// `is <Name>` where the resolved type is a non-empty object (ADR-054). Behaves exactly
+    /// `is <Name>` where the resolved type is a non-empty object (ADR-036). Behaves exactly
     /// like `TypeCheck(ty, span)` for narrowing/zonking/exhaustiveness, but lowers to a
     /// `MatchesSchema` deep type-validation instead of a bare tag/presence check. Carries the
     /// resolved bodies of every reachable `Named` type (`named_defs`) so IR lowering — which

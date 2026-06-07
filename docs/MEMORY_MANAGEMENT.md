@@ -14,7 +14,7 @@ Five types live on the heap and carry a `u32` refcount as their first field:
 | `T[]` (tagged) | `LinArray` (elem_tag=0xFF) | `refcount:u32 \| elem_tag:u8 \| _pad \| len:u64 \| cap:u64 \| data:*LinArrayElem` |
 | `T[]` (flat scalar) | `LinArray` (elem_tag≠0xFF) | same header; `data` points to raw `T` elements |
 | `{…}` object | `LinObject` | `refcount:u32 \| len:u32 \| cap:u32 \| _pad \| entries:*LinObjectEntry` |
-| `(…) => …` closure | `LinClosure` | `refcount:u32 \| _pad:u32 \| fn_ptr:ptr \| env_ptr:ptr \| env_size:u64 \| default_desc:ptr \| capture_desc:ptr` (48 bytes; ADR-051) |
+| `(…) => …` closure | `LinClosure` | `refcount:u32 \| _pad:u32 \| fn_ptr:ptr \| env_ptr:ptr \| env_size:u64 \| default_desc:ptr \| capture_desc:ptr` (48 bytes; ADR-034) |
 
 Scalars (`Int32`, `Int64`, `Float32`, `Float64`, `Bool`, `Null`) are stored unboxed as LLVM primitives and carry no refcount.
 
@@ -34,7 +34,7 @@ Union-typed (`Json`, unresolved `TypeVar`) values are heap-boxed as `TaggedVal {
 | `lin_string_release(s)` | Decrements refcount; frees the single allocation when zero |
 | `lin_array_release(arr)` | Decrements refcount; when zero, **recursively releases** all heap-typed elements (TAG_STR, TAG_ARRAY, TAG_OBJECT, TAG_FUNCTION) then frees header + data buffer |
 | `lin_object_release(obj)` | Decrements refcount; when zero, **recursively releases** all keys (always `LinString*`) and heap-typed values, then frees entries + header |
-| `lin_closure_release(ptr)` | Decrements refcount; when zero, **recursively releases owning captures** via the closure's capture descriptor (offset 40), then frees the env allocation (size at offset 24) and the 48-byte closure struct (ADR-051) |
+| `lin_closure_release(ptr)` | Decrements refcount; when zero, **recursively releases owning captures** via the closure's capture descriptor (offset 40), then frees the env allocation (size at offset 24) and the 48-byte closure struct (ADR-034) |
 | `lin_tagged_release(p)` | Releases the inner heap value, then frees the `TaggedVal` box |
 
 The recursive release in `lin_array_release` and `lin_object_release` means **nested structures are freed correctly without compiler assistance**. Flat scalar arrays (int/float elements) have no pointer payloads and skip recursion.
@@ -93,7 +93,7 @@ The elision pass in `lin-ir/src/rc_elide.rs` implements a conservative approxima
 
 ## Cycle handling
 
-Lin uses **pure reference counting with no cycle detection**. Reference cycles between heap objects will leak memory. This is a documented design decision (ADR-039).
+Lin uses **pure reference counting with no cycle detection**. Reference cycles between heap objects will leak memory. This is a documented design decision (ADR-024).
 
 **Recommended practice**: Avoid creating long-lived reference cycles. If cycles are unavoidable (e.g., a graph algorithm), break them explicitly before the data becomes unreachable by setting a field to `Null`.
 
@@ -113,7 +113,7 @@ Lin uses **pure reference counting with no cycle detection**. Reference cycles b
 | 1.2 Recursive object release | ✅ Done | `lin-runtime/src/object.rs` |
 | 1.3 Closure refcount + `lin_closure_release` | ✅ Done | `lin-runtime/src/memory.rs`, `lin-codegen/src/codegen.rs` |
 | 1.4 Tactical TaggedVal box leak fix | ✅ Done | `lin-codegen/src/codegen.rs` |
-| Option A: Document cycle limitation | ✅ Done | `docs/DECISIONS.md` ADR-039 |
+| Option A: Document cycle limitation | ✅ Done | `docs/DECISIONS.md` ADR-024 |
 
 ### Phase 2 — Systematic RC emission in codegen (in progress)
 
@@ -174,7 +174,7 @@ When a uniquely-owned value is destroyed at the same point a same-shaped allocat
 ## Reference counting under threads (async / concurrency)
 
 Lin's RC is **non-atomic** on the single-threaded hot path. Real OS-thread concurrency (spec
-§24, ADR-043/044/045) keeps that hot path free by **never sharing ordinary mutable heap values
+§24, ADR-028/044/045) keeps that hot path free by **never sharing ordinary mutable heap values
 across threads** — three mechanisms cover every cross-thread case:
 
 1. **Transfer by deep copy (Option C) — the default.** When a value crosses a thread boundary
@@ -188,14 +188,14 @@ across threads** — three mechanisms cover every cross-thread case:
    function/iterator (`CAP_OPAQUE`) is not transferable, so that thunk runs inline as a sound
    fallback.
 
-2. **`Shared<T>` — opt-in shared *mutable* state (ADR-044).** An **atomic**-refcounted box
+2. **`Shared<T>` — opt-in shared *mutable* state (ADR-029).** An **atomic**-refcounted box
    (`SharedBox`, `shared.rs`) wrapping an `RwLock` over the inner value. Only the box's refcount
    is atomic; the inner graph keeps ordinary non-atomic RC because it is only ever reachable
    while a lock is held. Every value enters/leaves by deep copy, so no live reference escapes
    the lock. The transfer copy path *shares* a `Shared` box by an atomic bump (the nesting
    rule), never copies through it.
 
-3. **`Frozen<T>` — opt-in shared *read-only* state (ADR-045).** `frozen(v)` deep-seals the graph
+3. **`Frozen<T>` — opt-in shared *read-only* state (ADR-030).** `frozen(v)` deep-seals the graph
    **immortal** (saturated refcount), reusing the interned-string immortality trick generalized
    to a whole graph. The immortal guard on string/array/object retain/release makes RC a no-op
    on frozen nodes, so a read-only function's existing non-atomic RC runs correctly on a value
@@ -203,11 +203,11 @@ across threads** — three mechanisms cover every cross-thread case:
    data only). The transfer path shares frozen nodes by reference (zero-copy).
 
 Catchable faults: a runtime fault inside an async thunk unwinds to the thread boundary and
-becomes an `Error` (fault.rs / ADR-043); the faulting runtime functions and the thunk-call
+becomes an `Error` (fault.rs / ADR-028); the faulting runtime functions and the thunk-call
 transmutes are `extern "C-unwind"` and async-reachable Lin frames carry `uwtable`.
 
 Atomic-RC-everywhere (Option A), dynamic shared-flag RC (Option D), and copy-on-write were
-rejected (ADR-043 §2.3) — they tax the non-threaded hot path. **TSan** (ThreadSanitizer) is the
+rejected (ADR-028 §2.3) — they tax the non-threaded hot path. **TSan** (ThreadSanitizer) is the
 right tool for the RC-race class; ASan covers leaks/use-after-free across the transfer + box
 machinery and is wired in CI.
 
@@ -226,6 +226,6 @@ machinery and is wired in CI.
 
 - Reinking et al., "Perceus: Garbage Free Reference Counting with Reuse", PLDI 2021. — Foundation for the elision and reuse analysis passes.
 - Nim ARC/ORC documentation — Model for destructor injection and trial-deletion cycle collection.
-- `docs/DECISIONS.md` ADR-039 — Rationale for choosing RC over tracing GC.
+- `docs/DECISIONS.md` ADR-024 — Rationale for choosing RC over tracing GC.
 - `lin-ir/src/rc_elide.rs` — Current elision pass implementation and unit tests.
 - `lin-ir/src/liveness.rs` — Backward-dataflow liveness analysis used by the elision pass.

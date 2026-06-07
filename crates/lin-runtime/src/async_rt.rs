@@ -1,6 +1,6 @@
 //! Async / await / parallel / worker / threadPool runtime support.
 //!
-//! Real OS-thread concurrency (ADR-042). `async(thunk)` spawns a `std::thread` that runs the
+//! Real OS-thread concurrency (ADR-027). `async(thunk)` spawns a `std::thread` that runs the
 //! thunk inside a fault-isolation boundary (`fault::with_async_boundary`); a runtime fault
 //! becomes an `Error` value surfaced at `await` rather than aborting the process. The thunk's
 //! captured env is deep-copied (Option C) so the worker owns a private graph and the parent's
@@ -98,6 +98,16 @@ pub struct LinWorker {
     handle: Option<JoinHandle<()>>,
     /// True once `close` has been called, so later sends are rejected (§24.6.5).
     closed: bool,
+    /// OWNING references to the handler / onClose closure structs (the heap allocations whose
+    /// refcount lives at offset 0). The worker thread runs these closures for its whole lifetime,
+    /// so the worker must hold a reference that outlives the frame that built it (the factory in
+    /// §24.6.4 returns the worker, then its frame releases the closures). Retained on the parent
+    /// thread in `lin_worker_new` BEFORE the worker thread is spawned, released in
+    /// `lin_worker_close` AFTER the thread is joined (no concurrent refcount access). Cleared to
+    /// null after release so a double `close` cannot double-release. Null when the corresponding
+    /// closure was absent (e.g. no onClose).
+    on_msg_cls: *mut u8,
+    on_close_cls: *mut u8,
 }
 
 /// Build an `Error` object `{ "type": "error", "message": <msg> }` as a boxed `TaggedVal*`.
@@ -179,7 +189,7 @@ pub unsafe extern "C" fn lin_make_promise(value: *mut u8) -> *mut LinPromise {
 
 /// Spawn the thunk closure `thunk` (a `*LinClosure` { rc, _pad, fn_ptr, env_ptr, .. }) on a
 /// new OS thread and return a `LinPromise` for its result. The thunk's captured env is
-/// deep-copied (Option C, ADR-042) so the worker owns a private graph and the parent's
+/// deep-copied (Option C, ADR-027) so the worker owns a private graph and the parent's
 /// non-atomic refcounts are never touched concurrently.
 ///
 /// If the env is NOT transferable (no capture descriptor, or it captures a function/iterator —
@@ -225,7 +235,7 @@ pub unsafe extern "C" fn lin_async_spawn(thunk: *mut u8) -> *mut LinPromise {
     let inner_for_thread = Arc::clone(&inner);
     // Capture the pointers as usize (unconditionally Send) and recast inside; the safety
     // invariant — env_copy is a thread-private deep copy, fn_ptr is read-only code — is
-    // upheld manually (ADR-042 Option C).
+    // upheld manually (ADR-027 Option C).
     let fn_addr = fn_ptr as usize;
     let env_addr = env_copy as usize;
     let desc_addr = cap_desc as usize;
@@ -260,7 +270,7 @@ pub unsafe extern "C" fn lin_async_spawn(thunk: *mut u8) -> *mut LinPromise {
 /// handed off VERBATIM (the IR suppresses the caller's release via the move), so the worker owns
 /// the whole pipeline graph — disjoint from the parent's, keeping non-atomic RC sound. A fault
 /// inside a transform closure is caught at the async boundary (`with_async_boundary`) and surfaces
-/// as the awaited `Error` (ADR-070 / §32.2.2). The worker closes the fd exactly once.
+/// as the awaited `Error` (ADR-045 / §32.2.2). The worker closes the fd exactly once.
 ///
 /// A null stream resolves immediately to Null. Unlike `lin_async_spawn`, there is no closure env
 /// to deep-copy — the single moved resource pointer IS the whole transfer, so this always runs on
@@ -711,8 +721,21 @@ pub unsafe extern "C" fn lin_worker_new(
     on_close_fn: *mut u8,
     on_close_env: *mut u8,
     on_close_has_env: u8,
+    on_msg_cls: *mut u8,
+    on_close_cls: *mut u8,
 ) -> *mut LinWorker {
     crate::fault::install_quiet_fault_hook();
+    // Take an OWNING reference to the handler / onClose closures (their fn_ptr + env live for the
+    // worker thread's whole lifetime, §24.6.4). The refcount is the u32 at offset 0 of the closure
+    // struct — exactly the same pointer codegen read fn_ptr/env_ptr from — so this bumps the live
+    // closure (NOT a derived/garbage pointer, which was the prior unsound attempt). Done HERE on
+    // the parent thread before `thread::spawn`, so there is no concurrent refcount write.
+    if !on_msg_cls.is_null() {
+        crate::memory::lin_rc_retain(on_msg_cls as *mut u32);
+    }
+    if !on_close_cls.is_null() {
+        crate::memory::lin_rc_retain(on_close_cls as *mut u32);
+    }
     let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
 
     // Capture handler/onClose pointers as addresses (Send); they are read-only code + a
@@ -759,7 +782,13 @@ pub unsafe extern "C" fn lin_worker_new(
     });
 
     let ptr = lin_alloc(std::mem::size_of::<LinWorker>()) as *mut LinWorker;
-    std::ptr::write(ptr, LinWorker { tx, handle: Some(handle), closed: false });
+    std::ptr::write(ptr, LinWorker {
+        tx,
+        handle: Some(handle),
+        closed: false,
+        on_msg_cls,
+        on_close_cls,
+    });
     ptr
 }
 
@@ -805,6 +834,17 @@ pub unsafe extern "C" fn lin_worker_close(worker: *mut LinWorker) {
     let _ = (*worker).tx.send(WorkerMsg::Close);
     if let Some(h) = (*worker).handle.take() {
         let _ = h.join();
+    }
+    // The worker thread has now exited and will never touch the handler/onClose closures again,
+    // so it is safe (and single-threaded) to drop the owning reference taken in `lin_worker_new`.
+    // Clear the slots so a second `close` (idempotent, §24.6.5) cannot double-release.
+    let on_msg_cls = std::mem::replace(&mut (*worker).on_msg_cls, std::ptr::null_mut());
+    if !on_msg_cls.is_null() {
+        crate::memory::lin_closure_release(on_msg_cls);
+    }
+    let on_close_cls = std::mem::replace(&mut (*worker).on_close_cls, std::ptr::null_mut());
+    if !on_close_cls.is_null() {
+        crate::memory::lin_closure_release(on_close_cls);
     }
 }
 
