@@ -7165,6 +7165,13 @@ fn test_fmt_preserves_generic_type_params() {
         fmt("val id = <T>(x: T): T => x\n").trim(),
         "val id = <T>(x: T): T => x"
     );
+    // A generic type APPLICATION (`Name<Args>` referencing a generic type) must round-trip with
+    // angle brackets — NOT be rewritten to `Name[Args]` (array syntax), which changes meaning and
+    // no longer parses. Regression for the std/event `val b: Bus<Int32> = …` corruption.
+    assert_eq!(
+        fmt("type Bus<T> = { \"v\": T }\nval mk = <T>(x: T): Bus<T> => { \"v\": x }\n").trim(),
+        "type Bus<T> = { \"v\": T }\nval mk = <T>(x: T): Bus<T> => { \"v\": x }"
+    );
 }
 
 #[test]
