@@ -476,12 +476,151 @@ impl Checker {
                             _ => self.env.fresh_type_var(),
                         }
                     } else {
+                        // Multi-variant union (e.g. `Person | Error`, or a discriminated sum):
+                        // index to a fresh TypeVar so codegen keeps a DYNAMIC field lookup. This is
+                        // deliberately imprecise: union members are open objects that may carry
+                        // fields not in their static shape at runtime (e.g. the decode-`Error`
+                        // value's `"path"`, which `Error`'s declared `{ type, message }` omits — a
+                        // width-subtyping extra). A "precise" per-variant `fields.get(k)` would
+                        // wrongly resolve such an access to a static `Null` and suppress the runtime
+                        // lookup. So we do NOT narrow here. (Preserved from the original arm.)
                         self.env.fresh_type_var()
                     };
                     Type::flatten_union(vec![inner, Type::Null])
                 }
             }
+            // A value whose static type is a `Type::Named("X")` (e.g. the result of a
+            // mutually-recursive call whose return type survived forward-declaration as a Named
+            // alias, or an annotated named record). Resolve the alias to its concrete body and
+            // index into THAT. `resolve_named_body` peels Named aliases (with a cycle guard so a
+            // self-recursive `type T = … T …` does not loop) down to the first non-Named body; if
+            // that body is an indexable shape (`Object`/`Map`/`Array`/…) we re-run `infer_index`
+            // logic by recursing on the resolved type. If it bottoms out at a still-`Named` (true
+            // cycle with no indexable layer) or a non-indexable type, fall through to the existing
+            // "Cannot index" error — i.e. fail conservatively, never invent a result type.
+            Type::Named(_) => {
+                if let Some(resolved) = self.resolve_named_body(&obj_ty) {
+                    return self.infer_index_into(typed_obj, typed_key, &resolved, span);
+                }
+                return Err(Diagnostic::error(span, format!("Cannot index into type {}", obj_ty)));
+            }
             _ => return Err(Diagnostic::error(span, format!("Cannot index into type {}", obj_ty))),
+        };
+        Ok(TypedExpr::Index { object: Box::new(typed_obj), key: Box::new(typed_key), result_type, span })
+    }
+
+    /// Resolve a `Type::Named` to its underlying non-`Named` body via the type environment,
+    /// peeling chained aliases (`type A = B; type B = { … }`). Cycle-guarded: a self-referential
+    /// alias that never reaches a concrete body (`type T = T`, or a recursive union with no
+    /// indexable layer at the top) returns `None` rather than looping forever. Generic named types
+    /// (params non-empty) and unknown names also return `None`. Returns the resolved body for any
+    /// other (non-Named) starting type unchanged.
+    fn resolve_named_body(&self, ty: &Type) -> Option<Type> {
+        let mut current = ty.clone();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            match &current {
+                Type::Named(n) => {
+                    if !visited.insert(n.clone()) {
+                        // Cycle with no concrete body in between → give up (conservative).
+                        return None;
+                    }
+                    let decl = self.env.lookup_type(n)?;
+                    if !decl.params.is_empty() {
+                        return None;
+                    }
+                    current = decl.body.clone();
+                }
+                _ => return Some(current),
+            }
+        }
+    }
+
+    /// The body of `infer_index`'s result-type computation, factored out so the `Type::Named` arm
+    /// can recurse after resolving the alias. Re-runs `infer_index` on an already-typed object and
+    /// key against an explicitly-provided object type (`obj_ty`). This is only entered from the
+    /// `Named` arm with a freshly-resolved concrete body, so a `Named` arriving here again is a
+    /// genuine cycle and yields the "Cannot index" error.
+    fn infer_index_into(
+        &mut self,
+        typed_obj: TypedExpr,
+        typed_key: TypedExpr,
+        obj_ty: &Type,
+        span: Span,
+    ) -> Result<TypedExpr, Diagnostic> {
+        let result_type = match obj_ty {
+            Type::Array(elem) => *elem.clone(),
+            Type::FixedArray(elems) => {
+                if let TypedExpr::IntLit(idx, _, _) = typed_key {
+                    elems.get(idx as usize).cloned().unwrap_or(Type::Null)
+                } else {
+                    unify_types(elems)
+                }
+            }
+            Type::Object { fields, .. } => {
+                if fields.is_empty() {
+                    self.env.fresh_type_var()
+                } else if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
+                    if !fields.contains_key(key_str) {
+                        let suggestion = lin_common::closest_match(
+                            key_str,
+                            fields.keys().map(|s| s.as_str()),
+                            3,
+                        );
+                        let mut diag = lin_common::Diagnostic::warning(
+                            span,
+                            format!("field \"{}\" does not exist on this object type", key_str),
+                        );
+                        if let Some(s) = suggestion {
+                            diag = diag.with_help(format!("did you mean \"{}\"?", s));
+                        }
+                        self.diagnostics.push(diag);
+                    }
+                    fields.get(key_str).cloned().unwrap_or(Type::Null)
+                } else {
+                    Type::Union(vec![Type::Union(fields.values().cloned().collect()), Type::Null])
+                }
+            }
+            Type::Map(val_ty) => Type::flatten_union(vec![(**val_ty).clone(), Type::Null]),
+            Type::Null => Type::Null,
+            Type::TypeVar(_) => self.env.fresh_type_var(),
+            Type::Union(variants) => {
+                // A Named alias resolving to a union (e.g. `type Ast = Num | BinOp`). Mirror the
+                // inline multi-variant `Union` arm in `infer_index`: a single record variant is
+                // indexed precisely; a multi-variant union falls back to a fresh TypeVar so the
+                // codegen keeps a DYNAMIC lookup (union members are open and may carry runtime
+                // fields beyond their static shape — see the note in `infer_index`). Either way the
+                // safe-bracket `Null` is re-added.
+                let non_null: Vec<Type> =
+                    variants.iter().filter(|t| **t != Type::Null).cloned().collect();
+                let inner = if non_null.len() == 1 {
+                    let body = self.resolve_named_body(&non_null[0]).unwrap_or_else(|| non_null[0].clone());
+                    match &body {
+                        Type::Object { fields, .. } => {
+                            if let TypedExpr::StringLit(ref key_str, _, _) = typed_key {
+                                fields.get(key_str).cloned().unwrap_or(Type::Null)
+                            } else {
+                                Type::Union(fields.values().cloned().collect())
+                            }
+                        }
+                        Type::Array(elem) => *elem.clone(),
+                        _ => self.env.fresh_type_var(),
+                    }
+                } else if non_null.is_empty() {
+                    return Ok(TypedExpr::Index {
+                        object: Box::new(typed_obj),
+                        key: Box::new(typed_key),
+                        result_type: Type::Null,
+                        span,
+                    });
+                } else {
+                    self.env.fresh_type_var()
+                };
+                Type::flatten_union(vec![inner, Type::Null])
+            }
+            other => {
+                return Err(Diagnostic::error(span, format!("Cannot index into type {}", other)))
+            }
         };
         Ok(TypedExpr::Index { object: Box::new(typed_obj), key: Box::new(typed_key), result_type, span })
     }

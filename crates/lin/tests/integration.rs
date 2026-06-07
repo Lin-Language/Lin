@@ -14491,3 +14491,157 @@ main()
         ]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Unboxed-sum-type Stage 0 — checker warm-up (type-check-only) fixes.
+// Gap 3: `infer_index` now resolves a `Type::Named` (or a Named-aliased union)
+//        to its record/union body before indexing.
+// Gap 2: an `is V` arm per variant of a discriminated union counts as exhaustive
+//        coverage (matched by StrLit discriminant), so no redundant `else` is
+//        required — while a genuinely missing variant STILL errors.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_st0_index_named_record_value() {
+    // Gap 3: a value whose static type is a named record (`Node`) can be indexed.
+    // The `build` fn returns `Node` (a `Type::Named`/record); `r["node"]` previously
+    // hit the `_ => "Cannot index into type Node"` arm. Now it resolves + indexes.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Node = { "tag": String, "node": Int32 }
+val build = (n: Int32): Node =>
+  if n <= 0 then { "tag": "leaf", "node": 0 }
+  else { "tag": "branch", "node": n }
+val r: Node = build(7)
+print(r["node"].toString())
+"#);
+    assert_eq!(out, vec!["7"]);
+}
+
+#[test]
+fn test_st0_index_recursive_named_child_field() {
+    // Gap 3 (recursive shape, the interp `Ast`): `node["left"]` is typed `Ast`
+    // (a Named alias resolving to `Num | BinOp`); indexing `["value"]` over it
+    // resolves the alias + each variant. `value` is present on `Num` but not on
+    // `BinOp`, so the precise result is `Int32 | Null` (the safe-bracket Null) —
+    // the program guards the Null and runs.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op",  "op": String, "left": Ast, "right": Ast }
+type Ast   = Num | BinOp
+val leftVal = (node: BinOp): Int32 =>
+  val v = node["left"]["value"]
+  if v == null then -1 else v
+val n: BinOp = { "kind": "op", "op": "+", "left": { "kind": "num", "value": 3 }, "right": { "kind": "num", "value": 4 } }
+print(leftVal(n).toString())
+"#);
+    assert_eq!(out, vec!["3"]);
+}
+
+#[test]
+fn test_st0_match_union_variants_exhaustive_no_else_2variant() {
+    // Gap 2: `is Num / is BinOp` covers every variant of `Ast = Num | BinOp` →
+    // exhaustive WITHOUT an `else`. Previously flagged non-exhaustive.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op",  "value": Int32 }
+type Ast   = Num | BinOp
+val classify = (x: Ast): Int32 =>
+  match x
+    is Num => 1
+    is BinOp => 2
+val n: Ast = { "kind": "num", "value": 5 }
+print(classify(n).toString())
+"#);
+    assert_eq!(out, vec!["1"]);
+}
+
+#[test]
+fn test_st0_match_union_variants_exhaustive_no_else_3variant() {
+    // Gap 2, 3-variant discriminated union — all covered → exhaustive, no `else`.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type A = { "kind": "a", "x": Int32 }
+type B = { "kind": "b", "x": Int32 }
+type C = { "kind": "c", "x": Int32 }
+type T = A | B | C
+val f = (v: T): Int32 =>
+  match v
+    is A => 1
+    is B => 2
+    is C => 3
+val a: T = { "kind": "c", "x": 9 }
+print(f(a).toString())
+"#);
+    assert_eq!(out, vec!["3"]);
+}
+
+#[test]
+fn test_st0_match_recursive_union_variants_exhaustive_no_else() {
+    // Gap 2 on the recursive interp `Ast`: the variant `BinOp` has recursive
+    // `Ast` fields whose expansion depth differs between the pattern-resolved
+    // type and the scrutinee union variant. StrLit-discriminant coverage makes
+    // `is Num / is BinOp` exhaustive without an `else` regardless of depth.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op",  "op": String, "left": Ast, "right": Ast }
+type Ast   = Num | BinOp
+val tag = (node: Ast): Int32 =>
+  match node
+    is Num => 1
+    is BinOp => 2
+val n: Ast = { "kind": "num", "value": 5 }
+print(tag(n).toString())
+"#);
+    assert_eq!(out, vec!["1"]);
+}
+
+#[test]
+fn test_st0_match_union_missing_variant_still_errors() {
+    // SOUNDNESS GUARD: a genuinely non-exhaustive match (the `BinOp`/`C` variant
+    // is not covered and there is no `else`) must STILL be a hard error. The
+    // StrLit-discriminant coverage must not turn a partial cover exhaustive.
+    let (ok, output) = check_source(r#"import { print } from "std/io"
+type A = { "kind": "a", "x": Int32 }
+type B = { "kind": "b", "x": Int32 }
+type C = { "kind": "c", "x": Int32 }
+type T = A | B | C
+val f = (v: T): Int32 =>
+  match v
+    is A => 1
+    is B => 2
+val a: T = { "kind": "a", "x": 1 }
+print(f(a))
+"#);
+    assert!(!ok, "missing-variant match must fail to type-check");
+    assert!(
+        output.contains("non-exhaustive"),
+        "expected a non-exhaustive error, got:\n{}",
+        output
+    );
+}
+
+#[test]
+fn test_st0_match_recursive_union_missing_variant_still_errors() {
+    // SOUNDNESS GUARD on the recursive `Ast`: covering only `Num` (omitting
+    // `BinOp`) with no `else` must STILL error despite the discriminant logic.
+    let (ok, output) = check_source(r#"import { print } from "std/io"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op",  "op": String, "left": Ast, "right": Ast }
+type Ast   = Num | BinOp
+val ev = (node: Ast): Int32 =>
+  match node
+    is Num => node["value"]
+val n: Ast = { "kind": "num", "value": 5 }
+print(ev(n))
+"#);
+    assert!(!ok, "recursive missing-variant match must fail to type-check");
+    assert!(
+        output.contains("non-exhaustive"),
+        "expected a non-exhaustive error, got:\n{}",
+        output
+    );
+}
