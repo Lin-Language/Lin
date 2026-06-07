@@ -14201,3 +14201,81 @@ main()
     let out = run(src);
     assert_eq!(out, vec!["flat=7".to_string(), "nested=2".to_string()]);
 }
+
+// Regression (RAPTOR `routeScanner.scanBack` per-scan leak, ~227 MB/scan → ~6 MB/scan): a
+// TAIL-RECURSIVE function that allocates fresh owned temps each iteration (the projections
+// `scanner["tripsByRoute"][routeId]`, `routeTrips[i]`, the route-id string literal) and threads
+// `found: Json` set to either a BORROWED projection (`arr[i]`) or the passed-through param. The
+// body-scope-exit releases for those per-iteration temps landed in the unreachable `tco_post`
+// continuation block (the back-edge means scope exit is never reached) and leaked every iteration.
+// The array-index projection ALSO leaked: codegen's `lin_array_get_tagged` returns a FRESH +1 box,
+// but the IR cloned it again as if borrowed, leaking the original box once per scanned element.
+// Both are fixed in lin-ir lowering (release body-owned temps on the live block before the
+// TailCall; register the fresh array-index box owned directly instead of re-cloning). ASan is the
+// leak guard (CI asan job); this test pins CORRECTNESS — the threaded borrowed projection is
+// returned right, and the durable source array (whose elements the projection borrows) SURVIVES the
+// scan intact (no double-free of `tripsByRoute[routeId][i]`).
+#[test]
+fn test_tail_recursive_borrowed_projection_threading_durable_source_survives() {
+    let src = r#"
+import { print } from "std/io"
+import { length } from "std/array"
+
+// runsOn-style conditional choosing a borrowed projection (`trip`) or the passed-through param.
+val scanBack = (scanner: Json, routeId: String, stopIndex: Int32, time: Json, i: Int32, found: Json): Json =>
+  if i < 0 then
+    found
+  else
+    val routeTrips = scanner["tripsByRoute"][routeId]
+    val trip = routeTrips[i]
+    val stopTime = trip["stopTimes"][stopIndex]
+    if stopTime["departureTime"] < time then
+      found
+    else
+      val newFound = if trip["ok"] > 0 then trip else found
+      // stateful memo write under the documented condition (an object-set into a durable map)
+      if newFound == null || newFound["id"] == trip["id"] then
+        scanner["scanPos"][routeId] = i
+      scanBack(scanner, routeId, stopIndex, time, i - 1, newFound)
+
+val makeScanner = (): Json =>
+  {
+    "tripsByRoute": {
+      "R1": [
+        { "id": 10, "ok": 1, "stopTimes": [ { "departureTime": 100 } ] },
+        { "id": 20, "ok": 0, "stopTimes": [ { "departureTime": 110 } ] },
+        { "id": 30, "ok": 1, "stopTimes": [ { "departureTime": 120 } ] }
+      ]
+    },
+    "scanPos": {}
+  }
+
+// Drive the scan many times (the leak was per-iteration; the loop is itself tail recursive so it
+// exercises the same body-scope-release path for its own discarded result).
+val loop = (scanner: Json, n: Int32, acc: Int32): Int32 =>
+  if n <= 0 then acc
+  else
+    val r = scanBack(scanner, "R1", 0, 50, 2, null)
+    loop(scanner, n - 1, acc + r["id"])
+
+val main = (): Null =>
+  val scanner = makeScanner()
+  // departureTime (100..) is never < time (50), so every trip is scanned: found = first ok trip
+  // walking backward from i=2 → id 30 then 10 → ends at 10.
+  val total = loop(scanner, 1000, 0)
+  print("found=${total}")
+  // The durable source array's elements (borrowed by the projection) must survive intact.
+  val trips = scanner["tripsByRoute"]["R1"]
+  print("durable len=${length(trips)} first=${trips[0]["id"]} last=${trips[2]["id"]}")
+
+main()
+"#;
+    let out = run(src);
+    assert_eq!(
+        out,
+        vec![
+            "found=10000".to_string(),
+            "durable len=3 first=10 last=30".to_string(),
+        ]
+    );
+}
