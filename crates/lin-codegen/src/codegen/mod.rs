@@ -2194,6 +2194,57 @@ impl<'ctx> Codegen<'ctx> {
                                 temp_map.insert(*dst, result);
                             }
                         }
+                        Instruction::DebugDeclare { temp, name, ty, param_no, span } => {
+                            // DEBUG-ONLY (Phase 3): give this Lin binding a named DWARF local. NO-OP
+                            // unless this is a `--debug` build (`debug_info` is None otherwise). The
+                            // binding's value lives in an SSA register (`temp_map`); `llvm.dbg.declare`
+                            // needs a stable memory address, so we materialise a per-variable stack
+                            // "home" alloca, store the value into it once, and declare the variable
+                            // over that home. O0 (forced by `--debug`) keeps the home, so the value
+                            // shows reliably in `frame variable` / the Variables panel, rendered by the
+                            // Phase 2 lldb formatters via the home's pointer-to-runtime-struct DIType.
+                            // Read the enclosing function's DISubprogram from the physical LLVM
+                            // function (set in Pass 1) — this is the scope the variable MUST use so
+                            // it matches the function its alloca lives in. Skip if absent (e.g. a
+                            // function with no registered subprogram).
+                            if self.debug_info.is_some() {
+                                if let (Some(&v), Some(subprogram)) =
+                                    (temp_map.get(temp), llvm_fn.get_subprogram())
+                                {
+                                    let cur_block = self.builder.get_insert_block().unwrap();
+                                    // The alloca/store are pure storage plumbing — clear the current
+                                    // debug location so they don't inherit a stale `!dbg` scoped to a
+                                    // prior instruction (which the LLVM verifier rejects as pointing at
+                                    // the wrong subprogram). The dbg.declare carries its own location.
+                                    let saved_loc = self.builder.get_current_debug_location();
+                                    self.builder.unset_current_debug_location();
+                                    // Place the home alloca at the TOP of the function entry block (not
+                                    // in the current — possibly loop — block), so it is allocated once.
+                                    let entry_bb = llvm_fn.get_first_basic_block().unwrap();
+                                    match entry_bb.get_first_instruction() {
+                                        Some(first) => self.builder.position_before(&first),
+                                        None => self.builder.position_at_end(entry_bb),
+                                    }
+                                    let home = self.builder.alloca(v.get_type(), name);
+                                    // Store the binding's value into the home, in the binding block.
+                                    self.builder.position_at_end(cur_block);
+                                    self.builder.store(home, v);
+                                    if let Some(loc) = saved_loc {
+                                        self.builder.set_current_debug_location(loc);
+                                    }
+                                    self.debug_info.as_mut().unwrap().declare_local(
+                                        self.context,
+                                        subprogram,
+                                        name,
+                                        ty,
+                                        *param_no,
+                                        span.start,
+                                        home,
+                                        cur_block,
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
 

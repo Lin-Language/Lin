@@ -10,19 +10,41 @@
 //! The byte-offset → (line, col) conversion reuses [`crate::coverage::offset_to_line_col`] so the
 //! line mapping is identical to the coverage subsystem's.
 //!
-//! Scope (Phase 1): line tables only — no variable/type info (that is Phase 3). The compile unit is
-//! marked NOT optimized; `--debug` forces O0 so the mapping holds.
+//! Phase 3: named local variables. Each Lin `val`/`var`/parameter binding is emitted as a
+//! `DILocalVariable` (a `DW_TAG_variable` / `DW_TAG_formal_parameter`) typed so the Phase 2 lldb
+//! formatters apply automatically. The lowerer marks each binding with an `Instruction::DebugDeclare`
+//! (temp + source name + Lin type); codegen (under `--debug`) stores the binding's value into a
+//! per-variable stack "home" alloca and emits `llvm.dbg.declare` over it (O0 keeps the home, giving
+//! the variable a stable address so it reliably shows in `frame variable` / the Variables panel).
+//!
+//! Type-name linkage (the crux of "auto-render"): the Phase 2 formatters are registered against the
+//! linked runtime struct names (`TaggedVal`, `LinArray`, `LinString`, `LinObject`). We emit each
+//! pointer-shaped Lin local with a DWARF pointer-to-struct DIType whose pointee STRUCT NAME is
+//! exactly one of those names, and `lin_formatters.py` also registers the matching `<Name> *` forms,
+//! so lldb runs the same summary/synthetic provider on the Lin local. Scalar locals (Int/Float/Bool)
+//! get a primitive DIType and render as their raw (logical) value.
+//!
+//! The compile unit is marked NOT optimized; `--debug` forces O0 so the mapping holds.
 
 use inkwell::debug_info::{
-    AsDIScope, DICompileUnit, DIFile, DIFlagsConstants, DISubprogram, DWARFEmissionKind,
-    DWARFSourceLanguage, DebugInfoBuilder,
+    AsDIScope, DICompileUnit, DIFile, DIFlagsConstants, DIScope, DISubprogram, DIType,
+    DWARFEmissionKind, DWARFSourceLanguage, DebugInfoBuilder,
 };
+use inkwell::llvm_sys;
 use inkwell::module::{FlagBehavior, Module};
-use inkwell::values::FunctionValue;
+use inkwell::values::{AsValueRef, FunctionValue, PointerValue};
+use inkwell::AddressSpace;
 use std::collections::HashMap;
 
 use crate::coverage::offset_to_line_col;
+use lin_check::types::Type;
 use lin_ir::ir as lir;
+
+// DWARF base-type encodings (DW_ATE_*), for `create_basic_type`.
+const DW_ATE_BOOLEAN: u32 = 0x02;
+const DW_ATE_FLOAT: u32 = 0x04;
+const DW_ATE_SIGNED: u32 = 0x05;
+const DW_ATE_UNSIGNED: u32 = 0x07;
 
 /// All DWARF state for the module currently being compiled. Created once, when the main module's
 /// source path is known (`set_main_source` equivalent for debug). Lives in [`crate::codegen::Codegen`]
@@ -36,6 +58,10 @@ pub struct DebugInfoState<'ctx> {
     /// Per-IR-function `DISubprogram` scope, keyed by `FuncId`. Used as the scope of every
     /// `DILocation` emitted while compiling that function's body.
     pub subprograms: HashMap<lir::FuncId, DISubprogram<'ctx>>,
+    /// Cache of `DIType`s by a small key string, so identical types reuse one metadata node
+    /// (LLVM also dedups, but this avoids rebuilding the named runtime-struct pointer types per
+    /// variable). Phase 3 only.
+    ditype_cache: HashMap<String, DIType<'ctx>>,
 }
 
 impl<'ctx> DebugInfoState<'ctx> {
@@ -94,6 +120,149 @@ impl<'ctx> DebugInfoState<'ctx> {
             file,
             main_source: source_text.to_string(),
             subprograms: HashMap::new(),
+            ditype_cache: HashMap::new(),
+        }
+    }
+
+    /// A DWARF pointer-to-named-struct `DIType` whose pointee struct is named `struct_name`
+    /// (e.g. `"TaggedVal"`). The struct body is left empty (forward-declared / opaque): the Phase 2
+    /// formatters read the target's bytes by raw offset, so they only need lldb to RESOLVE the
+    /// pointer's type name to one the formatter is registered against (`<struct_name> *`). Cached.
+    fn runtime_ptr_type(
+        &mut self,
+        context: &'ctx inkwell::context::Context,
+        struct_name: &str,
+    ) -> DIType<'ctx> {
+        if let Some(t) = self.ditype_cache.get(struct_name) {
+            return *t;
+        }
+        let ptr_bits = 64;
+        // An opaque struct DIType named exactly `struct_name` so lldb reports the pointee as that
+        // type (matching the formatter registrations + the linked runtime's own DWARF copy).
+        let st = self.builder.create_struct_type(
+            self.file.as_debug_info_scope(),
+            struct_name,
+            self.file,
+            /* line */ 0,
+            /* size_in_bits */ 0,
+            /* align_in_bits */ 0,
+            inkwell::debug_info::DIFlags::ZERO,
+            /* derived_from */ None,
+            /* elements */ &[],
+            /* runtime_language */ 0,
+            /* vtable_holder */ None,
+            /* unique_id */ struct_name,
+        );
+        let pt = self
+            .builder
+            .create_pointer_type(
+                "",
+                st.as_type(),
+                ptr_bits,
+                ptr_bits as u32,
+                AddressSpace::default(),
+            )
+            .as_type();
+        self.ditype_cache.insert(struct_name.to_string(), pt);
+        let _ = context;
+        pt
+    }
+
+    /// A primitive DWARF base type (cached) for scalar Lin locals.
+    fn basic_type(&mut self, name: &str, size_bits: u64, encoding: u32) -> DIType<'ctx> {
+        if let Some(t) = self.ditype_cache.get(name) {
+            return *t;
+        }
+        let t = self
+            .builder
+            .create_basic_type(name, size_bits, encoding, inkwell::debug_info::DIFlags::ZERO)
+            .expect("non-empty basic-type name")
+            .as_type();
+        self.ditype_cache.insert(name.to_string(), t);
+        t
+    }
+
+    /// Map a Lin `Type` to the `DIType` to attach to a local of that type. Pointer-shaped Lin
+    /// values use a pointer-to-named-runtime-struct so the Phase 2 lldb formatters apply
+    /// (`TaggedVal`/`LinArray`/`LinString`/`LinObject`); scalars use a primitive base type and
+    /// render as their raw logical value.
+    fn ditype_for(&mut self, context: &'ctx inkwell::context::Context, ty: &Type) -> DIType<'ctx> {
+        match ty {
+            Type::Bool => self.basic_type("Boolean", 8, DW_ATE_BOOLEAN),
+            Type::Int8 => self.basic_type("Int8", 8, DW_ATE_SIGNED),
+            Type::Int16 => self.basic_type("Int16", 16, DW_ATE_SIGNED),
+            Type::Int32 => self.basic_type("Int32", 32, DW_ATE_SIGNED),
+            Type::Int64 => self.basic_type("Int64", 64, DW_ATE_SIGNED),
+            Type::UInt8 => self.basic_type("UInt8", 8, DW_ATE_UNSIGNED),
+            Type::UInt16 => self.basic_type("UInt16", 16, DW_ATE_UNSIGNED),
+            Type::UInt32 => self.basic_type("UInt32", 32, DW_ATE_UNSIGNED),
+            Type::UInt64 => self.basic_type("UInt64", 64, DW_ATE_UNSIGNED),
+            Type::Float32 => self.basic_type("Float32", 32, DW_ATE_FLOAT),
+            Type::Float64 => self.basic_type("Float64", 64, DW_ATE_FLOAT),
+            Type::Str | Type::StrLit(_) => self.runtime_ptr_type(context, "LinString"),
+            Type::Array(_) | Type::FixedArray(_) | Type::Iterator(_) => {
+                self.runtime_ptr_type(context, "LinArray")
+            }
+            // Concrete objects are a `LinObject*`. Maps are a `LinMap*` (no dedicated formatter;
+            // the TaggedVal renderer shows them minimally) — route through the TaggedVal type so a
+            // boxed map still gets the dispatcher.
+            Type::Object { .. } => self.runtime_ptr_type(context, "LinObject"),
+            // Everything else is a boxed `TaggedVal*` at runtime (union / Json / Null / Named /
+            // function / shared / stream / map): the TaggedVal summary+synthetic dispatcher decodes
+            // the tag and renders/expands whatever it holds.
+            _ => self.runtime_ptr_type(context, "TaggedVal"),
+        }
+    }
+
+    /// Emit a `DILocalVariable` (`DW_TAG_variable` / `DW_TAG_formal_parameter`) for a Lin binding and
+    /// an `llvm.dbg.declare` associating it with the stack `storage` slot. `arg_no` is `Some(n)`
+    /// (1-based) for a parameter, `None` for a `val`/`var`. `def_offset` is the binding-site byte
+    /// offset (for the declared line). `subprogram` is the enclosing function's `DISubprogram` (read
+    /// directly from the physical LLVM function via `get_subprogram`, so the variable's scope always
+    /// matches the function the `storage` alloca lives in — keying by `FuncId` is unreliable across
+    /// monomorphized specializations whose IR ids do not line up with the `subprograms` map).
+    pub fn declare_local(
+        &mut self,
+        context: &'ctx inkwell::context::Context,
+        subprogram: DISubprogram<'ctx>,
+        name: &str,
+        ty: &Type,
+        arg_no: Option<u32>,
+        def_offset: u32,
+        storage: PointerValue<'ctx>,
+        block: inkwell::basic_block::BasicBlock<'ctx>,
+    ) {
+        let (line, col) = offset_to_line_col(&self.main_source, def_offset);
+        let dity = self.ditype_for(context, ty);
+        let scope: DIScope<'ctx> = subprogram.as_debug_info_scope();
+        let var = match arg_no {
+            Some(n) => self.builder.create_parameter_variable(
+                scope, name, n, self.file, line, dity, /* always_preserve */ true,
+                inkwell::debug_info::DIFlags::ZERO,
+            ),
+            None => self.builder.create_auto_variable(
+                scope, name, self.file, line, dity, /* always_preserve */ true,
+                inkwell::debug_info::DIFlags::ZERO, /* align */ 0,
+            ),
+        };
+        let loc = self.builder.create_debug_location(
+            context, line, col, scope, /* inlined_at */ None,
+        );
+        // NB: we deliberately call the raw `LLVMDIBuilderInsertDeclareRecordAtEnd` rather than
+        // inkwell 0.9's `insert_declare_at_end`. On LLVM 19+ (we build against LLVM 22) the insert
+        // intrinsic returns a `DbgRecord`, not a `Value`; inkwell's wrapper unconditionally feeds
+        // that ref to `InstructionValue::new`, whose `assert!(value.is_instruction())` then panics.
+        // Going through the FFI directly (and discarding the returned record) sidesteps that bug.
+        let empty_expr = self.builder.create_expression(Vec::new());
+        unsafe {
+            llvm_sys::debuginfo::LLVMDIBuilderInsertDeclareRecordAtEnd(
+                self.builder.as_mut_ptr(),
+                storage.as_value_ref(),
+                var.as_mut_ptr(),
+                empty_expr.as_mut_ptr(),
+                loc.as_mut_ptr(),
+                block.as_mut_ptr(),
+            );
         }
     }
 
