@@ -518,7 +518,11 @@ impl<'ctx> Codegen<'ctx> {
             Intrinsic::SharedNew => {
                 let v = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let v_ty = arg_tys.first().cloned().unwrap_or(Type::Null);
-                let v_boxed = if Self::is_union_type(&v_ty) || v.is_pointer_value() { v } else { self.box_value(v, &v_ty) };
+                // Box on the static type, not `is_pointer_value()` (see the `Intrinsic::Message` note): a
+                // raw heap pointer (`LinObject*`/`LinArray*`/`LinString*`) is not a boxed TaggedVal, and
+                // `lin_shared_*` deep-copies a boxed value across the thread boundary. Only an already-boxed
+                // (`is_union_type`) value passes through unboxed.
+                let v_boxed = if Self::is_union_type(&v_ty) { v } else { self.box_value(v, &v_ty) };
                 let f = self.get_or_declare_fn("lin_shared_new", ptr_ty.fn_type(&[ptr_ty.into()], false));
                 self.builder.call(f, &[v_boxed.into()], "ir_shared_new").try_as_basic_value().unwrap_basic()
             }
@@ -536,7 +540,11 @@ impl<'ctx> Codegen<'ctx> {
                 let s = args.first().copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let v = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let v_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
-                let v_boxed = if Self::is_union_type(&v_ty) || v.is_pointer_value() { v } else { self.box_value(v, &v_ty) };
+                // Box on the static type, not `is_pointer_value()` (see the `Intrinsic::Message` note): a
+                // raw heap pointer (`LinObject*`/`LinArray*`/`LinString*`) is not a boxed TaggedVal, and
+                // `lin_shared_*` deep-copies a boxed value across the thread boundary. Only an already-boxed
+                // (`is_union_type`) value passes through unboxed.
+                let v_boxed = if Self::is_union_type(&v_ty) { v } else { self.box_value(v, &v_ty) };
                 let f = self.get_or_declare_fn("lin_shared_set", ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                 self.builder.call(f, &[s.into(), v_boxed.into()], "ir_shared_set").try_as_basic_value().unwrap_basic()
             }
@@ -586,7 +594,10 @@ impl<'ctx> Codegen<'ctx> {
                 let worker = self.unbox_handle(worker_boxed);
                 let msg = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let msg_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
-                let msg_ptr = if Self::is_union_type(&msg_ty) || msg.is_pointer_value() { msg } else { self.box_value(msg, &msg_ty) };
+                // Box on the static type, not `is_pointer_value()` — see the note on `Intrinsic::Message`:
+                // a raw `LinObject*`/`LinArray*`/`LinString*` message is a pointer but not a boxed
+                // TaggedVal, and `lin_worker_request` requires a boxed value to deep-copy for transfer.
+                let msg_ptr = if Self::is_union_type(&msg_ty) { msg } else { self.box_value(msg, &msg_ty) };
                 let req_fn = self.get_or_declare_fn("lin_worker_request",
                     ptr_ty.fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                 let tagged = self.builder.call(req_fn, &[worker.into(), msg_ptr.into()], "ir_w_reply").try_as_basic_value().unwrap_basic();
@@ -600,7 +611,17 @@ impl<'ctx> Codegen<'ctx> {
                 let worker = self.unbox_handle(worker_boxed);
                 let msg = args.get(1).copied().unwrap_or_else(|| ptr_ty.const_null().into());
                 let msg_ty = arg_tys.get(1).cloned().unwrap_or(Type::Null);
-                let msg_ptr = if Self::is_union_type(&msg_ty) || msg.is_pointer_value() { msg } else { self.box_value(msg, &msg_ty) };
+                // `lin_worker_message` transfers the message across the thread boundary by
+                // deep-copying it as a boxed `TaggedVal*` (`lin_transfer_clone` reads its tag), so
+                // the argument MUST be a boxed TaggedVal. Box on the static type, NOT on
+                // `is_pointer_value()`: a concrete heap value (a `LinObject*`/`LinArray*`/`LinString*`
+                // — which a monomorphic `send<T>` produces when `T`/the message is an object) is a
+                // pointer but is NOT a boxed TaggedVal. The old `|| msg.is_pointer_value()` short-
+                // circuit passed such a raw object straight through, and the worker thread then read
+                // its first bytes as a TaggedVal tag → misaligned-pointer deref (the cross-module
+                // generic-emitter crash). Only an already-boxed value (`is_union_type`: Json / union /
+                // TypeVar / Named / Shared / Stream) is passed through unboxed.
+                let msg_ptr = if Self::is_union_type(&msg_ty) { msg } else { self.box_value(msg, &msg_ty) };
                 let msg_fn = self.get_or_declare_fn("lin_worker_message",
                     self.context.void_type().fn_type(&[ptr_ty.into(), ptr_ty.into()], false));
                 self.builder.call(msg_fn, &[worker.into(), msg_ptr.into()], "");
