@@ -458,8 +458,7 @@ pub enum Instruction {
     /// the shell is a fresh +1; the inner's reference comes from the surrounding
     /// `transfer_into_container`. `dst`'s repr is `Boxed(WrapsPacked(layout))`. Lowers to the
     /// `box_array`-by-pointer path (boxing.rs) generalized to the 0xFE kind. `arr` is `true` for a
-    /// sealed ARRAY (TAG_ARRAY), `false` for a sealed RECORD (TAG_OBJECT). See
-    /// `docs/REPR_PASS_DESIGN.md` Part A.
+    /// sealed ARRAY (TAG_ARRAY), `false` for a sealed RECORD (TAG_OBJECT). See ADR-062.
     BoxKeepPacked { dst: Temp, src: Temp, ty: Type, arr: bool },
     /// KEEP-PACKED unbox (repr pass, Stage 4): tag-check the `TaggedVal`, load the payload pointer as
     /// the STILL-PACKED `LinArray*` / packed struct*, retain it (one shell +1). O(1), zero copy. The
@@ -548,7 +547,7 @@ pub struct LinFunction {
     /// Per-temp physical representation table, indexed by `Temp.0` (`repr[t.0]` is temp `t`'s repr).
     /// Empty until the representation-inference pass (`repr::run`) populates it; codegen reads it at
     /// every packed-vs-boxed DECIDE / ASSUME site instead of re-deriving from the static `Type`.
-    /// See `docs/REPR_PASS_DESIGN.md` (Stage 3).
+    /// See ADR-062 (`docs/DECISIONS.md`).
     pub repr: Vec<crate::repr::Repr>,
 }
 

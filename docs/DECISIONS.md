@@ -2085,3 +2085,81 @@ on `TypeExpr` directly). The formatter gained an `Intersection` arm (`A & B`) so
 Restriction is documented: intersection is record-only in this first cut (no field-type
 intersection, no `&` with unions/scalars). A richer "intersect the field types" semantics is left
 for later; the clean sound rule for records is "fields must agree or error".
+
+## ADR-062: Representation-inference pass (packed-vs-boxed as a dataflow fact, not a Type attribute)
+
+**Status**: Accepted (single-owner direction landed incrementally; heap-field array packing
+characterized as a sound partial — see Consequences).
+
+**Context**: Sealed records (ADR-057) and sealed-record arrays are laid out as a *packed* physical
+representation — a header-less `[rc|size|desc|fields…]` struct, and a contiguous `elem_tag == 0xFE`
+`LinArray` of such payloads — that the dynamic `LinObject`/`TaggedVal` machinery cannot read. Whether
+a given value is in the packed form or the boxed form is a *physical* fact, NOT something the static
+`Type` can express: the same static type (e.g. `Neighbor[]`) is *packed* in a just-constructed temp
+but *boxed-wrapping-a-still-packed-buffer* in a temp read back from a `{String: Neighbor[]}` map slot
+(map values are always `TaggedVal`). Historically the packed-vs-boxed decision was REPLICATED across
+three type-driven predicate families — `Codegen::sealed_array_elem`/`sealed_fields`/`is_flat_scalar`,
+`lin_ir::lower::is_sealed_scalar_array` (+ the `lower_coerce_arg` coercion triggers), and
+`lin_ir::monomorphize::field_packed_scalar`/`mentions_sealed` — that had to be kept byte-for-byte in
+lockstep. Any drift was a silent boxed-vs-packed mismatch: a UAF or a wrong-shaped release that
+`cargo test` does not catch (only ASan does).
+
+**Decision**: Introduce a per-function representation-inference pass (`crates/lin-ir/src/repr.rs`,
+run immediately before `rc_elide`) that computes a per-temp representation lattice and stores it on
+`LinFunction.repr`, indexed by `Temp.0`. Codegen reads `func.repr[t]` at the decide/assume sites
+instead of re-deriving from `Type`.
+
+- **Lattice** (per-temp, flow-sensitive): `Repr ::= Unknown(TOP) | Packed(Layout) | Boxed(Inner) |
+  FlatScalar(ScalarTy) | Bottom`, where `Layout` is `PackedStruct{fields}` or
+  `PackedSealedArray{elem_layout, on_heap}`, and `Inner` is `Opaque` or **`WrapsPacked(Layout)`** —
+  the key refinement: a boxed `TaggedVal`/`LinObject` slot whose payload pointer is a STILL-PACKED
+  buffer (keep-packed-by-pointer, zero-copy). `WrapsPacked` is **unspeakable in the type system**, which
+  is precisely why representation lives on a side table, not on `Type`. FAIL-SAFE: anything not proven
+  is `Boxed(Opaque)`; a `Packed` label is only ever assigned by proof from a definite packed producer
+  carried along representation-preserving edges (shared union-find carry classes, `carry.rs`).
+- **Single-owner principle**: representation is decided in ONE place. The layout computers
+  (`sealed_fields`/`sealed_array_elem`) survive only as repr.rs's seed-time oracle — the LAST place a
+  `Type` predicate runs — and the bridge helpers (`sealed_array_to_tagged`/`sealed_project_from`/
+  `sealed_array_materialize_elem`/`emit_sealed_release`) survive as the *lowered form* of pass-decided
+  coercions, no longer called from type-guessing arms.
+- **Keep-packed-by-pointer** (Stage 4): `BoxKeepPacked`/`UnboxKeepPacked` IR ops wrap/unwrap a packed
+  pointer into/out of a `TaggedVal` in O(1) without materializing. A `{String: Sealed[]}` map store is
+  one 16-byte tagged write over the existing `0xFE` buffer; the read-back is a tag-checked pointer load
+  feeding a packed reader directly — no per-access O(n) materialize (the dijkstra map hot-loop fix).
+- **Boundary catalogue**: an *island* (a carry class with no boxed seed and no conflict edge) stays
+  byte-for-byte the current packed codegen — so the constant-offset typed loads / contiguous pushes /
+  packed `sealed_eq` of a static loop kernel (the ~87x speedups) are preserved by construction. The
+  pass only acts at boundaries: container stores (keep-packed), genuinely-dynamic consumers
+  (toString/keys/spread/Json/FFI/equality → materialize once), union membership (box), and
+  cross-representation call args.
+- **Soundness gates**: a debug-only `verify(func)` walks every instruction and asserts the repr each
+  opcode REQUIRES of each operand equals `func.repr[operand]` — a silent mismatch becomes a
+  compile-time panic, the formal statement of "representation mismatch is inexpressible". A Stage-2
+  `oracle_check` asserts the new analysis agrees with the old type predicate at every decide site, so
+  each swap is provably a conservative no-op before any code trusts it. Both run as `debug_assert!` in
+  `repr::run`, exercised by the full `cargo test` corpus.
+
+**Consequences / current boundary**:
+- Two representation-DECIDE sites are read from `func.repr` (single-owner): the sealed-array IndexSet
+  RHS project-vs-verbatim decision (`val_repr.packed_struct_fields()`), and the `Release` instruction's
+  release SHAPE (`emit_release_repr` — the wrong-release-after-divergence fix). Both verified
+  byte-identical on the corpus and ASan-clean (incl. dijkstra).
+- Codegen's `sealed_repr_differs` is no longer a representation-decide predicate (only an internal
+  `sealed_construct` field-coercion helper); equality (`emit_eq`) materializes both operands by design
+  (the boundary catalogue's materialize-both dynamic consumer).
+- **Heap-field record arrays stay BOXED (fail-safe).** The per-element heap-field RC machinery and the
+  dynamic-consumer boundaries (materializer, whole-element read, out-of-shape→Null) are heap-field-
+  complete, and isolated fixtures (`Person[]` lifecycle; `{String: Neighbor[]}` map round-trip, the
+  exact dijkstra shape) are output-correct AND ASan-clean when packed. But a *blanket* heap-field
+  ungate regresses the corpus (72→64) because of **field omission**: Lin's structural typing lets a
+  literal omit a declared field (`{ "kind": "lparen" }` is a valid `Token{kind, text}`). A boxed object
+  reads a missing key as `Null`; a packed element would store a garbage pointer in the omitted slot and
+  deref it. Field omission is whole-program and NOT decidable from the element TYPE the gate sees, so it
+  cannot be worked around in codegen. Shipping packed heap-field arrays needs a language-level
+  exact/sealed-record feature that FORBIDS field omission. Until then the gate is scalar-only — sound,
+  not maximal. (`Codegen::sealed_array_elem_field_packable` + its lower.rs/monomorphize mirrors.)
+- The lower.rs/monomorphize coercion-insertion triggers (`lower_coerce_arg`, `type_repr_differs`,
+  `mentions_sealed`, `combinator_unsound_over_sealed`) are NOT yet deleted: they remain the emitters of
+  the boundary coercions until a repr.rs STEP-4 coercion-insertion pass relocates them. That relocation
+  is the remaining single-owner work; the lattice, side table, keep-packed ops, and the two swapped
+  decide sites are the parts that landed.
