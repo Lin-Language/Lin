@@ -84,6 +84,7 @@ impl Parser {
     pub(crate) fn parse_var(&mut self, exported: bool) -> Stmt {
         let span_start = self.current_span();
         self.advance(); // skip 'var'
+        let name_span = self.current_span();
         let name = self.expect_ident();
         let type_ann = if self.check(TokenKind::Colon) {
             self.advance();
@@ -94,7 +95,7 @@ impl Parser {
         self.expect(TokenKind::Eq);
         self.skip_newlines();
         let value = self.parse_expr_or_block();
-        Stmt::Var { name, type_ann, value, exported, span: span_start }
+        Stmt::Var { name, name_span, type_ann, value, exported, span: span_start }
     }
 
     pub(crate) fn parse_type_decl(&mut self, exported: bool) -> Stmt {
