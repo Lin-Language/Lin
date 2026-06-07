@@ -11414,6 +11414,24 @@ print(f("hi"))
 }
 
 #[test]
+fn test_generic_union_typed_arg_monomorphizes() {
+    // Regression: a generic fn whose only use of a type parameter is inside a generic UNION-typed
+    // argument type-checked fine but FAILED at monomorphization ("cannot infer a concrete type for
+    // the type parameter(s) ... 'isOk'"). The monomorphizer's `collect_subs` did not recurse into
+    // `Type::Union` members, so `T`/`E` (appearing only inside union arms) were left unbound. The
+    // generic-record control case worked because it recursed into object fields.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Res<T, E> = { "type": "success", "value": T } | { "type": "failure", "error": E }
+val isOk = <T, E>(r: Res<T, E>): Boolean =>
+  r["type"] == "success"
+val r: Res<Int32, String> = { "type": "success", "value": 5 }
+print(r.isOk().toString())
+"#);
+    assert_eq!(out, vec!["true"]);
+}
+
+#[test]
 fn test_generic_higher_order_passed_directly_still_works() {
     // Regression guard: a (non-generic) function passed directly as a callback argument and
     // applied inside the callee must keep working alongside the generic machinery.
