@@ -1112,8 +1112,12 @@ fn fmt_type(ty: &TypeExpr) -> String {
     match ty {
         TypeExpr::Named(name, _) => name.clone(),
         TypeExpr::Generic(name, params, _) => {
+            // A generic type APPLICATION is spelled `Name<Args>` (the parser reads it with
+            // `<`…`>` — types.rs), NOT `Name[Args]`. Emitting `[ ]` here produced code that no
+            // longer parsed (`val b: Bus<Int32>` round-tripped to `Bus[Int32]`), changing meaning —
+            // a formatter invariant violation. Use angle brackets to round-trip.
             let ps: Vec<String> = params.iter().map(fmt_type).collect();
-            format!("{}[{}]", name, ps.join(", "))
+            format!("{}<{}>", name, ps.join(", "))
         }
         TypeExpr::Array(inner, _) => format!("{}[]", fmt_type(inner)),
         TypeExpr::FixedArray(types, _) => {
