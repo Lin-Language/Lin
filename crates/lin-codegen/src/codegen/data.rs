@@ -722,8 +722,14 @@ impl<'ctx> Codegen<'ctx> {
                     // a representation-mismatched RHS into a fresh sealed struct first; it is a +1 we
                     // own here, so release it after the set takes its own retained copy. A
                     // matching-repr value passes through verbatim (still owned by its temp).
-                    let elem_ty = match obj_ty { Type::Array(e) => (**e).clone(), _ => Type::Null };
-                    let needs_proj = Self::sealed_repr_differs(val_ty, &elem_ty);
+                    let _ = val_ty;
+                    // PART C (single-owner): the projection decision is read from the pass-computed
+                    // representation of the RHS temp (`val_repr`), NOT a Type comparison. A verbatim
+                    // pointer store is sound iff the RHS is ALREADY a packed sealed struct of the
+                    // element's exact layout; anything else (boxed LinObject / unsealed `{...}` /
+                    // WrapsPacked handle) is projected into a fresh sealed struct first. This replaces
+                    // `sealed_repr_differs(val_ty, elem_ty)` with the dataflow fact.
+                    let needs_proj = val_repr.packed_struct_fields() != Some(&elem_fields);
                     let (sealed_val, owned_here) = if needs_proj {
                         (self.sealed_project_from(value, val_ty, &elem_fields), true)
                     } else {
