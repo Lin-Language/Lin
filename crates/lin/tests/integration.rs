@@ -13934,6 +13934,39 @@ val _ = main()
     assert_eq!(out, vec!["0 3 4"]);
 }
 
+#[test]
+fn test_empty_array_literal_adopts_dotcall_param_repr() {
+    // REGRESSION (ADR-062 representation drift): an inferred EMPTY array literal `[]` infers
+    // bottom-up to `Array(Never)` and lowers to a BOXED buffer; a concrete packed/flat-scalar `T[]`
+    // param's callee does packed stride-N push/get → a producer/consumer representation DRIFT (latent
+    // packed-array UAF). `infer_call` already routed an array-literal ARGUMENT through expected-type
+    // checking against a concrete array param; `infer_dot_call` did NOT (neither for the arg nor the
+    // RECEIVER), so `[].fill()` / `src.scan(.., [])` over a packed `Pt[]` stayed boxed → garbage
+    // stride. Both the dot-call ARG and the dot-call RECEIVER now adopt the param's resolved element
+    // representation. Exercises both: a `[]` argument AND a `[]` receiver into a packed `Pt[]` param.
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+type Pt = { "x": Int32, "y": Int32 }
+val fillArg = (acc: Pt[]): Pt[] =>
+  push(acc, { "x": 1, "y": 2 })
+  acc
+val fillRecv = (acc: Pt[]): Pt[] =>
+  push(acc, { "x": 3, "y": 4 })
+  acc
+val main = (): Null =>
+  // `[]` as a dot-call ARGUMENT (`x.fillArg(...)` desugars `fillArg(x, [])`? no — receiver is the
+  // array): drive the ARG path via a prefix-style dot with the empty literal as the receiver, and
+  // the RECEIVER path via `[].fillRecv()`.
+  val a = [].fillArg()
+  val b = [].fillRecv()
+  print("${toString(length(a))} ${toString(a[0]["x"])} ${toString(b[0]["y"])}")
+val _ = main()
+"#);
+    assert_eq!(out, vec!["1 1 4"]);
+}
+
 /// Regression (LIN_ISSUES #2): a top-level mutable `var` in an IMPORTED module, mutated by an
 /// EXPORTED function, used to panic codegen ("Binary: undefined lhs temp Temp(0)") because the
 /// import lowering never set up the module global / its initialiser — the exported mutator

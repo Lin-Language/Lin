@@ -51,7 +51,10 @@ pub enum Layout {
     PackedStruct { fields: IndexMap<String, Type> },
     /// A `LinArray` with `elem_tag == 0xFE`: a contiguous, header-less buffer of packed sealed-record
     /// elements (the `Codegen::sealed_array_elem` representation). `on_heap` records whether any
-    /// element field is a heap pointer (String/Array/nested-sealed) — false today (Stage 3a scalar).
+    /// element field is a heap pointer (String/Array/nested-sealed) — true for Stage-3b heap-field
+    /// arrays, meaning element drop runs per-field release (`release_sealed_array_elems`). It is a
+    /// deterministic function of `elem_layout` (`elem_layout_on_heap`), so it never independently
+    /// affects the lattice join.
     PackedSealedArray { elem_layout: IndexMap<String, Type>, on_heap: bool },
 }
 
@@ -222,7 +225,9 @@ fn sealed_fields(ty: &Type) -> Option<&IndexMap<String, Type>> {
     }
 }
 
-/// Mirror of `Codegen::sealed_array_elem_field_packable` (types.rs): SCALARS ONLY (Stage 3a).
+/// Mirror of `Codegen::sealed_array_elem_field_packable` (types.rs): SCALARS ONLY (Stage 3a). Heap
+/// fields stay boxed pending the whole-program record-representation-consistency work — see the gate
+/// note in `Codegen::sealed_array_elem_field_packable`.
 fn sealed_array_elem_field_packable(ty: &Type) -> bool {
     is_sealed_scalar_field(ty)
 }
@@ -251,8 +256,8 @@ fn sealed_array_elem(ty: &Type) -> Option<&IndexMap<String, Type>> {
 fn type_seed(ty: &Type) -> Repr {
     if let Some(elem_fields) = sealed_array_elem(ty) {
         return Repr::Packed(Layout::PackedSealedArray {
+            on_heap: elem_layout_on_heap(elem_fields),
             elem_layout: elem_fields.clone(),
-            on_heap: false,
         });
     }
     if let Some(fields) = sealed_fields(ty) {
@@ -294,11 +299,21 @@ fn make_array_repr(elem_ty: &Type) -> Repr {
     let arr_ty = Type::Array(Box::new(elem_ty.clone()));
     if let Some(elem_fields) = sealed_array_elem(&arr_ty) {
         return Repr::Packed(Layout::PackedSealedArray {
+            on_heap: elem_layout_on_heap(elem_fields),
             elem_layout: elem_fields.clone(),
-            on_heap: false,
         });
     }
     Repr::boxed_opaque()
+}
+
+/// True iff a packed-element layout has ANY heap field (String / Array / nested-sealed) — i.e. an
+/// element drop must release per-field owned pointers (`release_sealed_array_elems`), not just free
+/// the contiguous scalar buffer. Recorded on `Layout::PackedSealedArray` so two layouts with the same
+/// field map but a different heap-ness (which cannot actually occur for a given field map, but the
+/// flag must stay a deterministic function of `elem_layout` so the lattice join never spuriously
+/// demotes) compare equal. Mirrors `Codegen::sealed_field_kind` heap-ness.
+fn elem_layout_on_heap(fields: &IndexMap<String, Type>) -> bool {
+    fields.values().any(is_sealed_heap_field)
 }
 
 // ---------------------------------------------------------------------------
@@ -683,14 +698,22 @@ pub fn oracle_check(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
 /// DEBUG/TEST-only soundness gate (design soundness gate #1). Walks every instruction, computes the
 /// repr each opcode REQUIRES of each operand, and returns any mismatch with `repr[operand]`.
 ///
-/// STAGE 3: this verifier is now LOAD-BEARING. Codegen reads `func.repr[operand]` (not the static
-/// `Type`) at exactly the ASSUME sites checked here — `FieldGet`, `SealedArrayFieldGet`, `Index` —
-/// to decide the packed constant-offset load. So a violation (an operand the opcode reads as packed
-/// whose `func.repr` is NOT the matching Packed layout) would mean codegen emits a packed load
-/// against a value that is not physically packed: a silent representation mismatch / UAF. The
-/// `debug_assert!` in [`run`] turns that into a compile-time panic. This is the formal statement of
-/// the design's "a mismatch is inexpressible" invariant for the swapped sites. Returns the list of
-/// violations (empty == sound).
+/// LOAD-BEARING. Codegen reads `func.repr[operand]` (not the static `Type`) at every repr-consuming
+/// site checked here to decide the packed vs boxed load/store/free/push. A violation (an operand an
+/// opcode reads as packed whose `func.repr` is NOT the matching Packed layout) means codegen would
+/// emit a packed access against a value that is not physically packed: a silent representation
+/// mismatch / UAF. The `debug_assert!` in [`run`] turns that into a compile-time panic. This is the
+/// formal statement of the design's "a mismatch is inexpressible" invariant.
+///
+/// COVERED OPCODES (every repr-consuming site): the READ assume sites `FieldGet` /
+/// `SealedArrayFieldGet` / `Index` (packed constant-offset load), plus the WRITE/CONSUME sites
+/// `Push` (the array operand + pushed element — the exact opcode the producer/consumer DRIFT bug
+/// flowed through: a boxed array pushed where codegen reads packed → garbage stride → crash; its
+/// element arrives as a standalone Packed struct from the monomorphized `push$T` body, so it IS
+/// asserted) and the sealed-array `IndexSet` (array operand). The IndexSet RHS *value* and a
+/// map/object store decide storage from the CONTAINER and COERCE the value at the slot
+/// (`sealed_project_from` projects a boxed `arr[i] = { … }` literal in), so they carry their own
+/// (often Boxed) repr and are NOT asserted. Returns the violations (empty == sound).
 pub fn verify(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
     let mut bad = Vec::new();
     let fname = func.name.clone().unwrap_or_else(|| format!("fn#{}", func.id.0));
@@ -722,6 +745,53 @@ pub fn verify(func: &LinFunction, repr: &[Repr]) -> Vec<String> {
                         if !is_packed_sealed_array(&repr[object.0 as usize], ef) {
                             bad.push(format!(
                                 "{fname}: Index requires Packed(sealed array) of t{}, has {:?}",
+                                object.0, repr[object.0 as usize]
+                            ));
+                        }
+                    }
+                }
+                // PUSH — the opcode the producer/consumer drift bug flowed through (a BOXED array
+                // pushed at a site that codegen reads as PACKED → garbage `elem_stride` → crash). The
+                // codegen `Intrinsic::Push` reads `arg_reprs[0].packed_sealed_array_layout()` to choose
+                // the packed `lin_sealed_array_push_struct_retaining` fast path, so when the array
+                // operand's TYPE is a packed sealed array its repr MUST be the matching Packed(sealed
+                // array) — else the packed push writes a struct into a buffer that is not physically
+                // packed. The pushed ELEMENT must then be the matching Packed(struct). This arm is the
+                // structural proof the drift class is now inexpressible (a debug panic, not a UAF).
+                Instruction::CallIntrinsic { intrinsic: Intrinsic::Push, args, .. } if args.len() >= 2 => {
+                    let arr = args[0];
+                    let arr_ty = func.temp_types.get(&arr).cloned().unwrap_or(Type::Null);
+                    if let Some(ef) = sealed_array_elem(&arr_ty) {
+                        if !is_packed_sealed_array(&repr[arr.0 as usize], ef) {
+                            bad.push(format!(
+                                "{fname}: Push requires Packed(sealed array) of t{}, has {:?}",
+                                arr.0, repr[arr.0 as usize]
+                            ));
+                        }
+                        let elem = args[1];
+                        if !is_packed_struct(&repr[elem.0 as usize], ef) {
+                            bad.push(format!(
+                                "{fname}: Push element requires Packed(struct) of t{}, has {:?}",
+                                elem.0, repr[elem.0 as usize]
+                            ));
+                        }
+                    }
+                }
+                // INDEXSET — `arr[i] = v` over a packed sealed array. Codegen's sealed-array set path
+                // (`emit_sealed_array_set`, dispatched on the ARRAY operand's repr) reads the array as
+                // a packed buffer, so the array operand MUST be Packed(sealed array) when its type is
+                // one — the assertion that the destination buffer codegen writes packed bytes into is
+                // physically packed. The RHS VALUE is NOT asserted: like the map/object store,
+                // `emit_sealed_array_set` COERCES the value into the slot (`sealed_project_from`
+                // projects a boxed/Json RHS into the packed element), so the value operand legitimately
+                // carries its own (often Boxed) repr — `arr[i] = { … }` builds the literal via the
+                // boxed object path and projects it at the store (confirmed by the
+                // `sealed_array_index_set_in_callee` corpus test, whose RHS repr is Boxed).
+                Instruction::IndexSet { object, obj_ty, .. } => {
+                    if let Some(ef) = sealed_array_elem(obj_ty) {
+                        if !is_packed_sealed_array(&repr[object.0 as usize], ef) {
+                            bad.push(format!(
+                                "{fname}: IndexSet requires Packed(sealed array) of t{}, has {:?}",
                                 object.0, repr[object.0 as usize]
                             ));
                         }
@@ -905,5 +975,48 @@ mod tests {
         assert!(matches!(repr[1], Repr::Packed(Layout::PackedStruct { .. })), "nested sealed field read must be Packed");
         assert!(oracle_check(&f, &repr).is_empty());
         assert!(verify(&f, &repr).is_empty());
+    }
+
+    #[test]
+    fn verify_catches_push_repr_drift() {
+        // THE structural proof the producer/consumer DRIFT class is now a debug panic, not a silent
+        // UAF: a `Push` whose array operand's TYPE is a packed sealed array but whose actual repr is
+        // Boxed (the calc-lexer `scan(.., [])` shape — a boxed `[]` flowing into a packed `T[]` param)
+        // is flagged by `verify`. Construct that exact mismatch by HAND (a param typed `Pt[]` but
+        // seeded Boxed) and assert verify reports it. Before the verify extension this site was a
+        // blind spot — the bug was only catchable under ASan at runtime.
+        let pt = sealed(pt_fields());
+        let arr_ty = Type::Array(Box::new(pt.clone()));
+        let instrs = vec![
+            // t1 = a fresh packed Pt element to push.
+            Instruction::Const { dst: Temp(1), val: Const::Int(1, Type::Int32) },
+            Instruction::Const { dst: Temp(2), val: Const::Int(2, Type::Int32) },
+            Instruction::MakeObject {
+                dst: Temp(3),
+                fields: vec![("x".into(), Temp(1)), ("y".into(), Temp(2))],
+                spreads: vec![],
+                ty: pt.clone(),
+                stack: false,
+            },
+            Instruction::CallIntrinsic {
+                dst: Temp(4),
+                intrinsic: Intrinsic::Push,
+                args: vec![Temp(0), Temp(3)],
+                ret_ty: Type::Null,
+            },
+        ];
+        let f = func_of(instrs, None, 5, vec![(Temp(0), arr_ty.clone())]);
+        // Hand-build a repr table where the ARRAY operand t0 is wrongly Boxed (the drift) while the
+        // pushed element t3 is correctly Packed.
+        let mut repr = analyze(&f);
+        repr[0] = Repr::boxed_opaque();
+        let violations = verify(&f, &repr);
+        assert!(
+            violations.iter().any(|v| v.contains("Push requires Packed(sealed array) of t0")),
+            "verify must flag the boxed-array Push drift, got: {violations:?}"
+        );
+        // And the well-typed analysis result (t0 seeded Packed from its param type) is clean.
+        let clean = analyze(&f);
+        assert!(verify(&f, &clean).is_empty(), "well-typed Push must verify clean");
     }
 }
