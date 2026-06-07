@@ -212,12 +212,12 @@
         "fileLocation": ["autoDetect", "${workspaceFolder}"],
         "pattern": [
           {
-            "regexp": "^(Error|Warning):\\s+(.*)$",
+            "regexp": "^\\s*(?:\\u001b\\[[0-9;]*m)*(Error|Warning)(?:\\u001b\\[[0-9;]*m)*:(?:\\u001b\\[[0-9;]*m)*\\s+(.*?)(?:\\u001b\\[[0-9;]*m)*\\s*$",
             "severity": 1,
             "message": 2
           },
           {
-            "regexp": "\\[([^\\[\\]:]+):(\\d+):(\\d+)\\]",
+            "regexp": "[\\u2500-\\u257f](?:\\u001b\\[[0-9;]*m)*\\[(?:\\u001b\\[[0-9;]*m)*\\s*(.+?):(\\d+):(\\d+)(?:\\u001b\\[[0-9;]*m)*\\s*(?:\\u001b\\[[0-9;]*m)*\\]",
             "file": 1,
             "line": 2,
             "column": 3

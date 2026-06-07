@@ -1,9 +1,10 @@
 import { suite, test, expect, run, toBe } from "std/test"
-import { clampSpeed, applyKey } from "./main"
+import { clampSpeed, applyKey } from "./control"
 import { encodePacket, parsePacket } from "./protocol"
 import { motorCommand, MotorCommand } from "./motor"
 import { parseNals, NalUnit } from "./nal"
 import { packetize, nextSequence } from "./rtp"
+import { encodeTelemetry, decodeTelemetry, Telemetry } from "./telemetry"
 import { length } from "std/array"
 
 // End-to-end RC-car system test. Composes the four modules into the two real
@@ -100,6 +101,38 @@ val s = suite("raspberry-controller integration", [
       expect(pkt[8]).toBe(0x12), // SSRC big-endian
       expect(pkt[12]).toBe(0x67), // payload = NAL verbatim
       expect(seqAfter).toBe(1) // sequence advanced by 1
+    ]
+  ),
+
+  // Drive the telemetry path: take the PWM duties the server computes from the
+  // decoded control packet, frame them (with battery/temp/status) into a TLV
+  // telemetry packet, and decode it back as the client would — closing the
+  // reverse channel from motor.lin's MotorCommand through tlv.lin.
+  test("telemetry path: motor duties -> TLV frame -> decode", () =>
+    val fwd: Float64[] = applyKey(113, 0.5, 0.0) // q: left -> 0.6
+    val leftCmd: MotorCommand = motorCommand(parsePacket(encodePacket(fwd[0], fwd[1]))[0])
+    val rightCmd: MotorCommand = motorCommand(parsePacket(encodePacket(fwd[0], fwd[1]))[1])
+    val report: Telemetry = {
+      "battery": 64,
+      "leftDuty": leftCmd["duty"],
+      "rightDuty": rightCmd["duty"],
+      "tempC": 0 - 3,
+      "health": 2,
+      "link": 7
+    }
+    val frame = encodeTelemetry(report)
+    val decoded = match decodeTelemetry(frame)
+      is Error => report
+      else => decodeTelemetry(frame)
+    // unreachable on a valid frame; keeps the type concrete
+    [
+      expect(leftCmd["channel"]).toBe("rpwm"), // left drives forward
+      expect(decoded["leftDuty"]).toBe(leftCmd["duty"]), // duty survives the frame
+      expect(decoded["rightDuty"]).toBe(rightCmd["duty"]),
+      expect(decoded["battery"]).toBe(64),
+      expect(decoded["tempC"]).toBe(0 - 3), // signed temp round-trips
+      expect(decoded["health"]).toBe(2),
+      expect(decoded["link"]).toBe(7)
     ]
   )
 ])

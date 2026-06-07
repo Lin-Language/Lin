@@ -16,6 +16,17 @@ impl Span {
         Self { file_id: 0, start: 0, end: 0 }
     }
 
+    /// A span covering from this span's start to `other`'s end, in `self`'s file. Used to
+    /// recover the full source extent of a compound AST node (e.g. opening `(` .. closing `)`)
+    /// from the two delimiter spans the parser already holds. If `other` lies in a different
+    /// file (e.g. a dummy span), `self` is returned unchanged so the result stays well-formed.
+    pub fn to(self, other: Span) -> Self {
+        if other.file_id != self.file_id {
+            return self;
+        }
+        Self { file_id: self.file_id, start: self.start.min(other.start), end: self.end.max(other.end) }
+    }
+
     pub fn line_col(&self, source: &str) -> (usize, usize) {
         let offset = self.start as usize;
         let mut line = 1;

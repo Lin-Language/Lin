@@ -1,0 +1,204 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { buildAdj, reconstructPath, dijkstra, solve } from "./routing"
+import { readJson } from "std/fs"
+import { length } from "std/array"
+import { join, toString } from "std/string"
+
+// Unit suite for the routing engine: adjacency construction, path reconstruction,
+// Dijkstra's core, and the fs-driven `solve` entry point. `readJson` is mocked
+// (ADR-046) so solve's read -> dijkstra -> path flow — plus its no-path and
+// read-error branches — is exercised without touching disk.
+//
+// "F" is listed as a node but has no incoming edges, so it is unreachable from A —
+// it exercises solve's no-path branch (distance stays at the sentinel).
+val sampleGraph = {
+  "nodes": [
+    "A",
+    "B",
+    "C",
+    "D",
+    "E",
+    "F"
+  ],
+  "edges": [
+    {
+      "from": "A",
+      "to": "B",
+      "weight": 10
+    },
+    {
+      "from": "A",
+      "to": "C",
+      "weight": 3
+    },
+    {
+      "from": "C",
+      "to": "B",
+      "weight": 4
+    },
+    {
+      "from": "C",
+      "to": "D",
+      "weight": 8
+    },
+    {
+      "from": "B",
+      "to": "D",
+      "weight": 2
+    },
+    {
+      "from": "D",
+      "to": "E",
+      "weight": 5
+    },
+    {
+      "from": "B",
+      "to": "E",
+      "weight": 11
+    }
+  ]
+}
+
+// readJson dispatches on the path: a known file yields the graph, anything else an
+// error object (the "file missing / bad JSON" case solve must surface).
+replace readJson = (path: String): Json =>
+  if path == "graph.json" then
+    sampleGraph
+  else
+    { "type": "error", "message": "no such file: ${path}" }
+
+val s = suite("routing", [
+  // --- buildAdj ---
+  test("buildAdj groups edges by from-node", () =>
+    val adj = buildAdj([
+      {
+        "from": "A",
+        "to": "B",
+        "weight": 1
+      },
+      {
+        "from": "A",
+        "to": "C",
+        "weight": 2
+      }
+    ])
+    [
+      expect(adj["A"].length()).toBe(2)
+    ]
+  ),
+
+  test("buildAdj separates distinct from-nodes", () =>
+    val adj = buildAdj([
+      {
+        "from": "A",
+        "to": "B",
+        "weight": 1
+      },
+      {
+        "from": "B",
+        "to": "C",
+        "weight": 2
+      }
+    ])
+    [
+      expect(adj["A"].length()).toBe(1),
+      expect(adj["B"].length()).toBe(1)
+    ]
+  ),
+
+  // --- reconstructPath ---
+  test("reconstructPath source==target returns single node", () => [
+    expect(toString(reconstructPath({  }, "A", "A"))).toBe("[\"A\"]")
+  ]),
+
+  test("reconstructPath follows prev pointers", () =>
+    val prev: { String: String } = { "C": "B", "B": "A" }
+    val path = reconstructPath(prev, "A", "C")
+    [
+      expect(path.toString()).toBe("[\"A\", \"B\", \"C\"]")
+    ]
+  ),
+
+  // --- dijkstra core ---
+  test("distance from source to itself is 0", () =>
+    val adj = buildAdj([{ "from": "A", "to": "B", "weight": 5 }])
+    val result = dijkstra(adj, "A", ["A", "B"])
+    [
+      expect(result["dist"]["A"]).toBe(0)
+    ]
+  ),
+
+  test("finds the direct edge weight", () =>
+    val adj = buildAdj([{ "from": "A", "to": "B", "weight": 7 }])
+    val result = dijkstra(adj, "A", ["A", "B"])
+    [
+      expect(result["dist"]["B"]).toBe(7)
+    ]
+  ),
+
+  test("picks the shortest of two paths and records the prev pointer", () =>
+    val adj = buildAdj([
+      {
+        "from": "A",
+        "to": "C",
+        "weight": 1
+      },
+      {
+        "from": "C",
+        "to": "B",
+        "weight": 2
+      },
+      {
+        "from": "A",
+        "to": "B",
+        "weight": 10
+      }
+    ])
+    val result = dijkstra(adj, "A", ["A", "B", "C"])
+    [
+      expect(result["dist"]["B"]).toBe(3),
+      expect(result["prev"]["B"]).toBe("C")
+    ]
+  ),
+
+  test("an unreachable node stays at the initial sentinel distance", () =>
+    val adj = buildAdj([{ "from": "A", "to": "B", "weight": 1 }])
+    val result = dijkstra(adj, "A", ["A", "B", "C"])
+    [
+      expect(result["dist"]["C"]).toBe(999999999)
+    ]
+  ),
+
+  // --- solve (fs-driven) ---
+  test("reads the graph and solves the shortest A->E route", () =>
+    // Narrow the tagged union to the found-route arm so `path`/`distance` are the
+    // typed fields of RouteFound rather than `String[] | Null` / `Int32 | Null`.
+    match solve("graph.json", "A", "E")
+      has { "type": "ok", path, distance } =>
+        [
+          expect(path.join(" ")).toBe("A C B D E"),
+          expect(distance).toBe(14)
+        ]
+      else =>
+        [
+          expect("not-ok").toBe("ok")
+        ]
+  ),
+
+  test("surfaces a read error as a tagged error result", () =>
+    val r = solve("missing.json", "A", "E")
+    [
+      expect(r["type"]).toBe("error"),
+      expect(r["message"]).toBe("no such file: missing.json")
+    ]
+  ),
+
+  test("reports no-path when the target is unreachable", () =>
+    // "F" is in the graph but has no incoming edges, so it stays at the sentinel.
+    val r = solve("graph.json", "A", "F")
+    [
+      expect(r["type"]).toBe("no-path")
+    ]
+  )
+])
+run(s)

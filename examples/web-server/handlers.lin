@@ -1,10 +1,19 @@
 import { json, text, badRequest, matchPath, HttpRequest as Request, HttpResponse as Response } from "std/http"
 import { render } from "std/template"
+import { toString } from "std/string"
+import { Config } from "./config"
+import { solve } from "./routing"
 
-export val getIndex = (req: Request): Response =>
+// Where the road-network graph lives on disk (relative to the repo root, like the
+// view paths). Factored out so the /route handler and its tests agree on it.
+export val GRAPH_PATH = "examples/web-server/graph.json"
+
+// GET / — render the HTML index page, surfacing the service name + version from
+// the loaded config in the page data.
+export val getIndex = (req: Request, config: Config): Response =>
   val data = {
-    "title": "Lin Web Server",
-    "heading": "Welcome",
+    "title": config["name"],
+    "heading": "Welcome to ${config["name"]}",
     "status": "running",
     "version": "1.0"
   }
@@ -13,13 +22,38 @@ export val getIndex = (req: Request): Response =>
     has { "type": "error", message } => badRequest("template error: ${message}")
     else => text(200, html)
 
-export val getStatus = (req: Request): Response =>
+// GET /api/status — a JSON health/status payload including the service name.
+export val getStatus = (req: Request, config: Config): Response =>
   json(200, {
     "status": "ok",
     "uptime": 0,
+    "name": config["name"],
     "version": "1.0"
   })
 
+// GET /route/:from/:to — the shortest-path routing API. Resolve the route over the
+// road-network graph and return the path + distance, a 404 when unreachable, or a
+// 500 when the graph can't be read.
+export val getRoute = (req: Request): Response =>
+  val m = matchPath(req["path"], "/route/:from/:to")
+  if m == null then
+    json(404, { "error": "Not Found" })
+  else
+    match solve(GRAPH_PATH, m["from"], m["to"])
+      has { "type": "ok", path, distance } =>
+        json(200, {
+          "from": m["from"],
+          "to": m["to"],
+          "path": path,
+          "distance": distance
+        })
+      has { "type": "no-path" } =>
+        json(404, { "error": "no route from ${m["from"]} to ${m["to"]}" })
+      has { "type": "error", message } =>
+        json(500, { "error": "routing unavailable: ${message}" })
+      else => json(500, { "error": "unexpected routing result" })
+
+// GET /users/:id — a small example resource handler.
 export val getUser = (req: Request): Response =>
   val m = matchPath(req["path"], "/users/:id")
   if m == null then

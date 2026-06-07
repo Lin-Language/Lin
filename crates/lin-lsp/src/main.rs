@@ -42,9 +42,9 @@ impl LanguageServer for Backend {
         }
 
         // Build the cross-file index: seed stdlib, then enumerate + index every
-        // `*.lin` file under the workspace root. A best-effort first cut — files
-        // are re-indexed on edit; we do NOT re-check dependents on edit (see the
-        // `update` handler note).
+        // `*.lin` file under the workspace root. Files are re-indexed on edit, and
+        // open DIRECT dependents are re-checked when an imported file changes (see
+        // the `update` / `recheck_open_dependents` handlers).
         {
             let mut index = WORKSPACE_INDEX.write().unwrap();
             *index = WorkspaceIndex::default();
@@ -767,12 +767,9 @@ impl Backend {
             .write()
             .unwrap()
             .insert(uri.clone(), source.to_string());
-        // Re-index just this file's symbol/import table. We deliberately do NOT
-        // re-check dependent files here: the cross-file references/symbols/rename
-        // features need only each file's export+import name tables, which a single
-        // re-parse refreshes. Inferred *types* in dependents can go stale until the
-        // dependent is itself re-opened/edited — an accepted limitation for this cut
-        // (it never affects name-based cross-file resolution).
+        // Re-index this file's symbol/import table so cross-file
+        // references/symbols/rename stay current. This also refreshes the export
+        // signatures dependents read through `analyse`'s `pre_resolve_imports`.
         if let Ok(path) = uri.to_file_path() {
             WORKSPACE_INDEX
                 .write()
@@ -784,6 +781,73 @@ impl Backend {
         self.client
             .publish_diagnostics(uri.clone(), analysis.diagnostics, None)
             .await;
+
+        // Dependent re-check: when F changes, any OPEN file B that imports from F
+        // can have stale inferred types (hover/inlay/diagnostics) for symbols it
+        // pulls from F, because B's analysis cached F's *old* exports. Re-analyse
+        // those dependents and re-publish their diagnostics so they reflect F's new
+        // exports.
+        //
+        // POLICY (documented per the task brief):
+        //   - DIRECT dependents only — files whose `ImportRef.module_id` is F. We do
+        //     NOT walk transitively: a transitive dependent only sees F's types via
+        //     an intermediate module's re-exported signature, which is rare, and a
+        //     full transitive sweep on every keystroke does not scale. Direct-only is
+        //     the sound, bounded default.
+        //   - OPEN documents only — the client renders diagnostics/hover only for
+        //     open docs, so re-checking closed files would be wasted work.
+        //   - Runs on every `update` (did_open / did_change / did_save). Re-analysing
+        //     a handful of direct open dependents is cheap (parse + check of small
+        //     files); bounding to direct + open keeps it so even on each keystroke,
+        //     which is the freshest behaviour without a workspace-wide sweep.
+        //
+        // No infinite-loop risk: `dependents_of` never returns F itself, we only
+        // re-analyse (we do NOT recursively call `update`, which would re-trigger),
+        // and we skip F's own URI defensively. A cyclic graph (A↔B) is therefore
+        // safe — editing A re-checks B once and stops.
+        self.recheck_open_dependents(uri).await;
+    }
+
+    /// Re-analyse and re-publish diagnostics for every currently-open document that
+    /// DIRECTLY imports from `changed_uri`. See the policy note in `update`.
+    async fn recheck_open_dependents(&self, changed_uri: &Url) {
+        let Ok(changed_path) = changed_uri.to_file_path() else { return };
+        let changed_id = canonical_id(&changed_path);
+
+        // Compute the direct dependents under the index read lock, then drop it
+        // before any await (we must not hold a std `RwLock` guard across `.await`).
+        let dependent_ids: Vec<String> = {
+            let index = WORKSPACE_INDEX.read().unwrap();
+            index.dependents_of(&changed_id)
+        };
+        if dependent_ids.is_empty() {
+            return;
+        }
+
+        // Snapshot the open docs (uri + source) for the dependents we care about,
+        // again releasing the lock before awaiting. A dependent that isn't currently
+        // open is skipped — the client only renders open documents.
+        let to_recheck: Vec<(Url, String)> = {
+            let docs = self.docs.read().unwrap();
+            docs.iter()
+                .filter(|(dep_uri, _)| *dep_uri != changed_uri)
+                .filter(|(dep_uri, _)| {
+                    dep_uri
+                        .to_file_path()
+                        .map(|p| dependent_ids.contains(&canonical_id(&p)))
+                        .unwrap_or(false)
+                })
+                .map(|(u, s)| (u.clone(), s.clone()))
+                .collect()
+        };
+
+        for (dep_uri, dep_source) in to_recheck {
+            let base_dir = file_dir(&dep_uri);
+            let analysis = analyse(&dep_source, base_dir.as_deref());
+            self.client
+                .publish_diagnostics(dep_uri, analysis.diagnostics, None)
+                .await;
+        }
     }
 }
 
@@ -1551,7 +1615,7 @@ fn collect_param_spans_in_expr(expr: &lin_parse::ast::Expr, out: &mut HashSet<(u
             }
             collect_param_spans_in_expr(body, out);
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             collect_param_spans(stmts, out);
             collect_param_spans_in_expr(tail, out);
         }
@@ -1631,7 +1695,7 @@ fn collect_type_spans_in_expr(expr: &lin_parse::ast::Expr, out: &mut Vec<lin_com
             }
             collect_type_spans_in_expr(body, out);
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             collect_type_spans(stmts, out);
             collect_type_spans_in_expr(tail, out);
         }
@@ -1984,7 +2048,7 @@ fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::a
             f(scrutinee);
             for arm in arms { f(&arm.body); }
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             for s in stmts {
                 match s {
                     Stmt::Val { value, .. } | Stmt::Var { value, .. } => f(value),
@@ -1996,7 +2060,7 @@ fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::a
             f(tail);
         }
         E::Function { body, .. } => f(body),
-        E::Object(fields, _) => {
+        E::Object(fields, _, _) => {
             for field in fields {
                 match field {
                     ObjectField::Pair(k, v) => { f(k); f(v); }
@@ -2004,7 +2068,7 @@ fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::a
                 }
             }
         }
-        E::Array(items, _) => { for it in items { f(it); } }
+        E::Array(items, _, _) => { for it in items { f(it); } }
         E::Assign { value, .. } => f(value),
         E::IndexAssign { object, key, value, .. } => { f(object); f(key); f(value); }
         E::Is { expr, .. } | E::Has { expr, .. } => f(expr),
@@ -2018,18 +2082,60 @@ fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::a
     }
 }
 
+// ── AST extent walkers (folding + selection) ─────────────────────────────────────
+
+/// Invoke `f` on `expr` and, recursively, on every sub-expression. Built on the shared
+/// `walk_child_exprs` immediate-child traversal so it stays in sync with the AST shape.
+fn walk_exprs_deep(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::ast::Expr)) {
+    f(expr);
+    walk_child_exprs(expr, &mut |child| walk_exprs_deep(child, f));
+}
+
+/// Invoke `f` on the root expression(s) carried by a statement (and, transitively, all of
+/// their sub-expressions). Covers `val`/`var`/`replace` initialisers and bare expression
+/// statements; declaration-only statements (imports, type decls) carry no expressions.
+fn walk_exprs_in_stmt(stmt: &Stmt, f: &mut dyn FnMut(&lin_parse::ast::Expr)) {
+    match stmt {
+        Stmt::Val { value, .. } | Stmt::Var { value, .. } | Stmt::Replace { value, .. } => {
+            walk_exprs_deep(value, f)
+        }
+        Stmt::Expr(e) => walk_exprs_deep(e, f),
+        _ => {}
+    }
+}
+
+/// True for the compound expression kinds whose `full_span()` covers a real multi-token
+/// extent worth offering as a fold / selection region. Leaf and operator nodes (whose
+/// `full_span()` is just `span()`) are excluded so we don't emit degenerate ranges.
+fn is_extent_node(expr: &lin_parse::ast::Expr) -> bool {
+    use lin_parse::ast::Expr as E;
+    matches!(
+        expr,
+        E::Call { .. }
+            | E::DotCall { .. }
+            | E::Index { .. }
+            | E::IndexAssign { .. }
+            | E::Object(..)
+            | E::Array(..)
+            | E::Block(..)
+            | E::If { .. }
+            | E::Match { .. }
+            | E::Function { .. }
+    )
+}
+
 // ── folding ranges ─────────────────────────────────────────────────────────────
 
 /// Emit folding ranges for multi-line constructs. Two sources:
 ///   - consecutive `import` statement runs (collapse into one `Imports` region),
 ///     driven off the parsed import statements' start lines;
-///   - every balanced `{}` / `[]` / `(...)` delimiter region (function bodies,
-///     object/array literals, match arms, call arg lists) that spans more than one
-///     line, found by a brace-balance text scan.
+///   - every compound expression (function bodies, object/array literals, blocks,
+///     calls, `if`/`match`) whose AST `full_span()` covers more than one source line.
 ///
-/// The AST spans are single-token markers (the parser records only the opening
-/// delimiter's span), so the delimiter extents are recovered by text scan rather
-/// than from spans — the task explicitly allows brace/indentation-based folding.
+/// The compound-node extents come from the additive `Expr::full_span()` (opening token ..
+/// closing delimiter / last child), which is AST-precise — the opening-token `span()` stays
+/// unchanged for the formatter/coverage consumers. When the buffer fails to parse the AST is
+/// empty, so we fall back to a balanced-delimiter text scan (`delimiter_folds`).
 fn folding_ranges(source: &str, module: &lin_parse::ast::Module) -> Vec<FoldingRange> {
     let mut out = Vec::new();
 
@@ -2068,12 +2174,45 @@ fn folding_ranges(source: &str, module: &lin_parse::ast::Module) -> Vec<FoldingR
     }
     flush(&mut out, run_start_line.take(), run_end_line.take());
 
-    out.extend(delimiter_folds(source));
+    // AST-precise region folds: one per compound node whose full extent spans >1 line.
+    // De-duplicated by (start_line, end_line) so co-terminating nodes (e.g. a call whose
+    // sole argument is the object literal it wraps) don't emit overlapping duplicates.
+    let mut seen: HashSet<(u32, u32)> = HashSet::new();
+    let mut push_region = |out: &mut Vec<FoldingRange>, sp: lin_common::Span| {
+        let sl = offset_to_position(source, sp.start as usize).line;
+        let el = offset_to_position(source, sp.end as usize).line;
+        if el > sl && seen.insert((sl, el)) {
+            out.push(FoldingRange {
+                start_line: sl,
+                start_character: None,
+                end_line: el,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: None,
+            });
+        }
+    };
+    let mut had_ast = false;
+    for stmt in &module.statements {
+        walk_exprs_in_stmt(stmt, &mut |e| {
+            had_ast = true;
+            if is_extent_node(e) {
+                push_region(&mut out, e.full_span());
+            }
+        });
+    }
+
+    // Fallback: if the buffer produced no expressions (parse failure / empty module), recover
+    // region folds from a balanced-delimiter text scan so folding still works on broken input.
+    if !had_ast {
+        out.extend(delimiter_folds(source));
+    }
     out
 }
 
 /// Fold every balanced `{}` / `[]` / `(...)` region that spans more than one line.
-/// String literals are skipped so braces inside strings don't unbalance the scan.
+/// String literals are skipped so braces inside strings don't unbalance the scan. Used
+/// only as a fallback when the AST is empty (the buffer didn't parse).
 fn delimiter_folds(source: &str) -> Vec<FoldingRange> {
     let bytes = source.as_bytes();
     let mut stack: Vec<usize> = Vec::new();
@@ -2123,16 +2262,16 @@ fn delimiter_folds(source: &str) -> Vec<FoldingRange> {
 
 /// Build the smart-expand selection hierarchy at `offset`, innermost → outermost:
 ///   1. the identifier/word under the cursor (when on one);
-///   2. each enclosing balanced `{}` / `[]` / `(...)` delimiter region (inner content
-///      first, then the region including its delimiters);
+///   2. each enclosing AST expression, by its `full_span()` (innermost first) — so a
+///      cursor in `add(1, 2)` expands to the argument, then the whole call, etc.;
 ///   3. the cursor's source line;
 ///   4. the whole document.
 ///
-/// The parser records only single-token spans for compound expressions (no full
-/// extents), so the expansion is built from balanced-delimiter nesting + the word at
-/// the cursor rather than from AST spans. `module` is currently unused but kept on the
-/// signature so a future AST-span-precise version is a drop-in.
-fn selection_range_at(source: &str, _module: &lin_parse::ast::Module, offset: usize) -> SelectionRange {
+/// The expression extents come from the additive `Expr::full_span()` (opening token ..
+/// closing delimiter / last child), making the expansion AST-precise. When the buffer
+/// fails to parse, the AST is empty, so we fall back to balanced-delimiter nesting
+/// (`enclosing_bracket_pairs`).
+fn selection_range_at(source: &str, module: &lin_parse::ast::Module, offset: usize) -> SelectionRange {
     let offset = offset.min(source.len());
     // Ordered innermost → outermost list of (start, end) byte ranges.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -2154,14 +2293,38 @@ fn selection_range_at(source: &str, _module: &lin_parse::ast::Module, offset: us
         ranges.push((start, end));
     }
 
-    // 2. Enclosing balanced delimiter regions (inner content + with-delimiters).
-    for (open, close) in enclosing_bracket_pairs(source, offset) {
-        // Inner content (between the delimiters).
-        if close > open + 1 {
-            ranges.push((open + 1, close));
+    // 2. Enclosing AST expression extents (full_span), from the AST. Every expression whose
+    //    full extent contains the cursor is a candidate; sorting by width yields the
+    //    innermost-first nesting. Falls back to balanced-delimiter pairs when the AST is empty
+    //    (parse failure) so selection still works on broken input.
+    let mut ast_spans: Vec<(usize, usize)> = Vec::new();
+    for stmt in &module.statements {
+        // Statement-level extent (e.g. a whole `val x = ...`) so expansion reaches the stmt.
+        let ss = stmt.span();
+        if (ss.start as usize) <= offset && offset <= (ss.end as usize) {
+            ast_spans.push((ss.start as usize, ss.end as usize));
         }
-        // The region including its delimiters.
-        ranges.push((open, close + 1));
+        walk_exprs_in_stmt(stmt, &mut |e| {
+            let fs = e.full_span();
+            let (s, en) = (fs.start as usize, fs.end as usize);
+            if s <= offset && offset <= en {
+                ast_spans.push((s, en));
+            }
+        });
+    }
+    if !ast_spans.is_empty() {
+        // Innermost (narrowest) first.
+        ast_spans.sort_by_key(|(s, e)| e - s);
+        ranges.extend(ast_spans);
+    } else {
+        for (open, close) in enclosing_bracket_pairs(source, offset) {
+            // Inner content (between the delimiters).
+            if close > open + 1 {
+                ranges.push((open + 1, close));
+            }
+            // The region including its delimiters.
+            ranges.push((open, close + 1));
+        }
     }
 
     // 3. The cursor's line.
@@ -2464,7 +2627,7 @@ fn find_enclosing_call_in_expr(
                 }
             }
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             if let Some(r) = find_enclosing_call(stmts, source, offset) {
                 *best = Some(r);
             }
@@ -2714,7 +2877,7 @@ fn collect_unannotated_bindings_in_expr(
 ) {
     use lin_parse::ast::Expr as E;
     match expr {
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             collect_unannotated_bindings(stmts, ty_by_stmt, out);
             collect_unannotated_bindings_in_expr(tail, ty_by_stmt, out);
         }
@@ -3136,6 +3299,33 @@ impl WorkspaceIndex {
             let b_std = b.starts_with("std/");
             b_std.cmp(&a_std).then_with(|| a.cmp(b))
         });
+        out.dedup();
+        out
+    }
+
+    /// Every file that DIRECTLY imports from `module_id`, as a set of module ids.
+    /// A file B depends on `module_id` when B has an `ImportRef` whose resolved
+    /// `module_id` equals it (i.e. `import { ... } from "<module_id>"`). The owner
+    /// itself is never returned, so this is safe to drive a re-check loop with even
+    /// on a self/cyclic import graph (A→B, B→A): asking for A's dependents yields B
+    /// and asking for B's yields A, but neither result contains the queried module,
+    /// and the caller re-checks each dependent exactly once (no transitive chase) —
+    /// so there is no recursion to bound.
+    ///
+    /// DIRECT only by design: transitive dependents are intentionally NOT walked
+    /// here (see the `update` handler's re-check policy note for the rationale).
+    /// Pure over the index, so it's unit-testable without the async handler.
+    fn dependents_of(&self, module_id: &str) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .files
+            .iter()
+            .filter(|(mid, file)| {
+                mid.as_str() != module_id
+                    && file.imports.iter().any(|imp| imp.module_id == module_id)
+            })
+            .map(|(mid, _)| mid.clone())
+            .collect();
+        out.sort();
         out.dedup();
         out
     }
@@ -3954,6 +4144,50 @@ mod tests {
         assert_eq!((owner2, name2), (owner, name));
     }
 
+    /// Dependency computation for the on-edit re-check: when A changes, the set of
+    /// files to re-check is exactly the DIRECT importers of A. Here B imports a
+    /// symbol from A (so B is a dependent) and C is unrelated (so C is excluded).
+    /// A itself is never in its own dependent set, which is what makes driving a
+    /// re-check loop with this safe on cyclic graphs.
+    #[test]
+    fn dependents_of_includes_direct_importers_only() {
+        let a = "export val foo = 1\n";
+        let b = "import { foo } from \"a\"\nval x = foo\n";
+        let c = "val unrelated = 99\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b), ("/ws/c.lin", c)]);
+        let a_id = id_of("/ws/a.lin");
+        let b_id = id_of("/ws/b.lin");
+        let c_id = id_of("/ws/c.lin");
+
+        let deps = index.dependents_of(&a_id);
+        assert!(deps.contains(&b_id), "B imports from A → must be a dependent: {:?}", deps);
+        assert!(!deps.contains(&c_id), "C is unrelated → must be excluded: {:?}", deps);
+        assert!(!deps.contains(&a_id), "A is never its own dependent: {:?}", deps);
+
+        // C imports nothing → it has no dependents either.
+        assert!(index.dependents_of(&c_id).is_empty());
+    }
+
+    /// Cyclic import graphs are safe to drive the re-check loop with: A↔B each list
+    /// the OTHER as a dependent but never themselves, so editing A re-checks B once
+    /// (and vice-versa) with no transitive chase and no recursion to bound.
+    #[test]
+    fn dependents_of_cyclic_graph_excludes_self_no_recursion() {
+        let a = "import { b } from \"b\"\nexport val a = 1\n";
+        let b = "import { a } from \"a\"\nexport val b = 2\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b)]);
+        let a_id = id_of("/ws/a.lin");
+        let b_id = id_of("/ws/b.lin");
+
+        let a_deps = index.dependents_of(&a_id);
+        assert_eq!(a_deps, vec![b_id.clone()], "A's only dependent is B: {:?}", a_deps);
+        assert!(!a_deps.contains(&a_id), "A must not depend on itself");
+
+        let b_deps = index.dependents_of(&b_id);
+        assert_eq!(b_deps, vec![a_id.clone()], "B's only dependent is A: {:?}", b_deps);
+        assert!(!b_deps.contains(&b_id), "B must not depend on itself");
+    }
+
     /// Cross-file rename emits a multi-file edit set keyed per file; stdlib is never edited.
     #[test]
     fn cross_file_rename_multi_file_and_never_stdlib() {
@@ -4184,8 +4418,9 @@ mod tests {
 
     // ── folding ranges ──────────────────────────────────────────────────────────
 
-    /// Folding ranges cover multi-line function bodies / array literals and a run of
-    /// consecutive imports; single-line constructs produce no fold.
+    /// Folding ranges are AST-precise: an import-run region for the consecutive imports,
+    /// plus one `Region` per multi-line compound node (the function body and the array
+    /// literal), each spanning its full source extent (opening token .. closing delimiter).
     #[test]
     fn folding_range_covers_multiline_blocks_and_imports() {
         let src = "import { a } from \"std/io\"\n\
@@ -4200,43 +4435,78 @@ mod tests {
                    ]\n";
         let module = parse(src);
         let folds = folding_ranges(src, &module);
-        // An import-run fold spanning the two import lines (0..1).
+        // Import-run fold over the two import lines (0..1).
         assert!(
-            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Imports) && f.start_line == 0 && f.end_line >= 1),
-            "expected an import-run fold, got {:?}",
+            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Imports)
+                && f.start_line == 0
+                && f.end_line == 1),
+            "expected an import-run fold 0..1, got {:?}",
             folds
         );
-        // At least one region fold (function body and/or array literal) spanning >1 line.
+        // The function literal's full extent: `(x: Int32) => {` (line 2) .. closing `}` (line 5).
         assert!(
-            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Region) && f.end_line > f.start_line),
-            "expected a multi-line region fold, got {:?}",
+            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Region)
+                && f.start_line == 2
+                && f.end_line == 5),
+            "expected a function-body region fold 2..5, got {:?}",
+            folds
+        );
+        // The array literal's full extent: opening `[` (line 6) .. closing `]` (line 9).
+        assert!(
+            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Region)
+                && f.start_line == 6
+                && f.end_line == 9),
+            "expected an array-literal region fold 6..9, got {:?}",
             folds
         );
     }
 
     // ── selection ranges ─────────────────────────────────────────────────────────
 
-    /// Smart-expand: the cursor on an inner identifier yields a nested chain whose
-    /// innermost range is contained in each successive parent.
+    /// Smart-expand is AST-precise: a cursor on the inner `1` literal expands through the
+    /// enclosing call's full extent (`add(1, 2)`), then the whole `val` statement, then the
+    /// document — each range strictly containing the previous, driven by `Expr::full_span()`.
     #[test]
     fn selection_range_nests_innermost_to_outermost() {
         let src = "val r = add(1, 2)\n";
         let analysis = analyse(src, None);
         let off = src.find('1').unwrap();
         let sel = selection_range_at(src, &analysis.module, off);
-        // Walk the parent chain; each parent range must contain its child range.
+
+        // Collect the innermost→outermost chain as the source text each range covers.
+        let mut texts = Vec::new();
         let mut node = &sel;
-        let mut depth = 0;
+        loop {
+            let s = position_to_offset(src, node.range.start);
+            let e = position_to_offset(src, node.range.end);
+            texts.push(src[s..e].to_string());
+            match &node.parent {
+                Some(p) => node = p,
+                None => break,
+            }
+        }
+        // AST-precise expansion: the `1` literal, the enclosing call's full extent, the whole
+        // statement, then the document.
+        assert_eq!(
+            texts,
+            vec![
+                "1".to_string(),
+                "add(1, 2)".to_string(),
+                "val r = add(1, 2)".to_string(),
+                "val r = add(1, 2)\n".to_string(),
+            ],
+            "AST-precise selection chain"
+        );
+
+        // Each parent must still strictly contain its child.
+        let mut node = &sel;
         while let Some(parent) = &node.parent {
             assert!(
                 parent.range.start <= node.range.start && node.range.end <= parent.range.end,
-                "child range escapes parent at depth {}",
-                depth
+                "child range escapes parent"
             );
             node = parent;
-            depth += 1;
         }
-        assert!(depth >= 1, "expected at least one expansion level");
     }
 
     // ── document links (import paths) ─────────────────────────────────────────────
