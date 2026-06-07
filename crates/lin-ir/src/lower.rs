@@ -1734,6 +1734,22 @@ fn arg_box_is_caller_owned_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool
     }
 }
 
+/// Whether passing a SCALAR (Int/Float/Bool/Null) argument to a `Json`/union parameter boxes it
+/// into a fresh, caller-owned `TaggedVal*` shell (`lin_box_int32`/`box_float64`/…) that the callee
+/// borrows and never releases. A NON-cached scalar box (a large int / any float) is a fresh heap
+/// shell with NO heap inner payload, so reclaiming the SHELL after the call balances it. Freeing is
+/// done via `FreeBoxShellIfDistinct` → `lin_tagged_free_box_if_distinct`, which is CACHED-BOX SAFE
+/// (small-int/bool boxes are immortal statics and never freed) and result-alias safe (a callee that
+/// returns its Json param hands the same box back as the result — skipped when shell == result).
+/// Without this, `f(1_000_000)` / `f(3.14)` into a Json param leaked the 16-byte box shell per call.
+fn arg_box_is_caller_owned_scalar_shell(arg_ty: &Type, param_ty: Option<&Type>) -> bool {
+    match param_ty {
+        Some(p) => is_union_ty(p) && !is_union_ty(arg_ty) && !is_heap_ty(arg_ty)
+            && !is_sealed_scalar_repr(arg_ty),
+        None => false,
+    }
+}
+
 /// Retain a Function-typed argument that is NOT a freshly-made closure before passing it
 /// to a call. AST-compiled callees release their Function-typed parameters at return; a
 /// borrowed (non-fresh) closure must be retained to balance that, while a fresh closure's
@@ -3491,7 +3507,9 @@ fn lower_call(
                     if param_tys.get(i).map(|p| sealed_array_arg_materialized(&a.ty(), p)).unwrap_or(false)
                     {
                         full_release_boxes.push((arg, param_tys[i].clone()));
-                    } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
+                    } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i))
+                        || arg_box_is_caller_owned_scalar_shell(&a.ty(), param_tys.get(i))
+                    {
                         shell_boxes.push(arg);
                     }
                     if let Some(lit) = raw_lit {
@@ -3519,22 +3537,15 @@ fn lower_call(
                 builder.emit(Instruction::Release { val: *b, ty: bty.clone() });
             }
             builder.register_owned(dst, result_type.clone());
-            // Transfer-on-escape is only sound when the call RESULT can actually carry the boxed
-            // fresh literal back to the caller — i.e. `dst` may BE (alias) that literal's box, so if
-            // `dst` escapes the literal must be kept alive. That can only happen when the result is a
-            // boxed (union/Json) value the callee could return its borrowed Json param as (an
-            // identity / pass-through). When the result is a scalar/`Null`/concrete value (e.g.
-            // `for`/`while`, which RETURN `Null` and never hand the iterable back), the boxed arg is
-            // a pure BORROW: its shell was already freed by `free_arg_box_shells` and its inner is
-            // owned by the arg's own scope-exit release. Recording an escape-alias there wrongly keeps
-            // the inner alive whenever `dst` is the function's return expression (e.g. the inner
-            // `range(..).for(..)` of a nested combinator inside a closure body) — the array leaks
-            // every iteration. So only alias when the result is a union.
-            if is_union_ty(result_type) {
-                for lit in escape_lits {
-                    builder.record_escape_alias(dst, lit);
-                }
-            }
+            // No transfer-on-escape aliasing for the boxed fresh-literal args: a callee returning a
+            // borrowed Json/union param does so by CLONE (the function-return path clones a borrowed
+            // union body-result into a fresh +1 box — `lower_function_expr_with_id`'s `is_union_ty &&
+            // !is_owned_in_scope` clone, added in da9ec08, AFTER the original escape-alias of 2af264a
+            // assumed a by-REFERENCE return). The result therefore never aliases the arg literal's
+            // inner payload, so the literal's own +1 must be released normally at the arg scope exit
+            // (its shell was freed by `free_arg_box_shells`). Keeping it alive via escape-alias here
+            // leaked the literal every call (the `firstOr([1,2,3], d)` / accumulator-threading shape).
+            let _ = &escape_lits;
             return dst;
         }
         // Check global function slots.
@@ -3564,7 +3575,9 @@ fn lower_call(
                     if param_tys.get(i).map(|p| sealed_array_arg_materialized(&a.ty(), p)).unwrap_or(false)
                     {
                         full_release_boxes.push((arg, param_tys[i].clone()));
-                    } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i)) {
+                    } else if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i))
+                        || arg_box_is_caller_owned_scalar_shell(&a.ty(), param_tys.get(i))
+                    {
                         shell_boxes.push(arg);
                     }
                     if let Some(lit) = raw_lit {
@@ -3616,22 +3629,10 @@ fn lower_call(
                 builder.emit(Instruction::Release { val: *b, ty: bty.clone() });
             }
             builder.register_owned(dst, result_type.clone());
-            // Transfer-on-escape is only sound when the call RESULT can actually carry the boxed
-            // fresh literal back to the caller — i.e. `dst` may BE (alias) that literal's box, so if
-            // `dst` escapes the literal must be kept alive. That can only happen when the result is a
-            // boxed (union/Json) value the callee could return its borrowed Json param as (an
-            // identity / pass-through). When the result is a scalar/`Null`/concrete value (e.g.
-            // `for`/`while`, which RETURN `Null` and never hand the iterable back), the boxed arg is
-            // a pure BORROW: its shell was already freed by `free_arg_box_shells` and its inner is
-            // owned by the arg's own scope-exit release. Recording an escape-alias there wrongly keeps
-            // the inner alive whenever `dst` is the function's return expression (e.g. the inner
-            // `range(..).for(..)` of a nested combinator inside a closure body) — the array leaks
-            // every iteration. So only alias when the result is a union.
-            if is_union_ty(result_type) {
-                for lit in escape_lits {
-                    builder.record_escape_alias(dst, lit);
-                }
-            }
+            // No transfer-on-escape aliasing — see the imported-call path above: union param
+            // returns CLONE (da9ec08), so the result never aliases the arg literal's inner; the
+            // literal's +1 is released normally at the arg scope exit (shell already freed).
+            let _ = &escape_lits;
             return dst;
         }
     }
@@ -3647,6 +3648,7 @@ fn lower_call(
         _ => vec![],
     };
     let mut escape_lits: Vec<Temp> = Vec::new();
+    let mut shell_boxes: Vec<Temp> = Vec::new();
     let lowered_args: Vec<Temp> = args
         .iter()
         .enumerate()
@@ -3655,6 +3657,15 @@ fn lower_call(
             // combinator, so cb_idx is None (no safe captured-cell context — conservative).
             let (arg, raw_lit) = lower_call_arg_tracked(a, param_tys.get(i), i, None, builder, ctx);
             retain_call_arg(arg, &a.ty(), expr_is_fresh_alloc(a), builder);
+            // A concrete heap value (or a non-cached scalar) boxed into a Json/union closure param is
+            // a caller-owned SHELL the closure never releases. Free the shell after the call, like
+            // the named/imported paths. Without this, a fresh literal / large-int / float passed to a
+            // Json closure param leaked its 16-byte box shell every call.
+            if arg_box_is_caller_owned_shell(&a.ty(), param_tys.get(i))
+                || arg_box_is_caller_owned_scalar_shell(&a.ty(), param_tys.get(i))
+            {
+                shell_boxes.push(arg);
+            }
             if let Some(lit) = raw_lit {
                 escape_lits.push(lit);
             }
@@ -3681,6 +3692,7 @@ fn lower_call(
         args: lowered_args,
         ret_ty: result_type.clone(),
     });
+    free_arg_box_shells(&shell_boxes, dst, builder);
     // Concrete rc results are owned (+1) here; a UNION result from an INDIRECT closure call is
     // NOT registered, because the closure return ABI does NOT guarantee +1 for a boxed-union
     // return: a closure whose body yields a borrowed param/local box (e.g. minBy's
@@ -3690,18 +3702,10 @@ fn lower_call(
     if is_rc_type(result_type) {
         builder.register_owned(dst, result_type.clone());
     }
-    // Record transfer-on-escape aliasing only when the result can actually carry the boxed fresh
-    // literal back (a union/Json result — the only thing a borrowed Json param can be returned as).
-    // A scalar/Null/concrete result (e.g. an indirect `for`/`while` closure call returning `Null`)
-    // never hands the iterable box back, so the boxed arg is a pure borrow already balanced by the
-    // shell free + the arg's own scope-exit release; aliasing it would wrongly keep the inner alive
-    // when `dst` is a return expression (the nested-combinator-in-closure leak). See the named/import
-    // paths above for the full rationale.
-    if is_union_ty(result_type) {
-        for lit in escape_lits {
-            builder.record_escape_alias(dst, lit);
-        }
-    }
+    // No transfer-on-escape aliasing — see the named/imported call paths above: union param
+    // returns CLONE (da9ec08), so the result never aliases the arg literal's inner payload; the
+    // literal's +1 is released normally at the arg scope exit (its shell already freed).
+    let _ = &escape_lits;
     dst
 }
 
