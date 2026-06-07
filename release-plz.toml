@@ -12,6 +12,9 @@ git_only = true
 git_release_enable = true
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
+# Write ONE workspace-root changelog (instead of a per-crate CHANGELOG.md in each
+# crate dir). This is the file docs.yml mirrors to docs-site/content/changelog.md.
+changelog_path = "CHANGELOG.md"
 
 [changelog]
 header = "# Changelog\n\nAll notable changes to Lin are documented here.\n"

@@ -514,6 +514,7 @@ fn stdlib_source(path: &str) -> Option<&'static str> {
         "std/stream"   => Some(include_str!("../../../stdlib/stream.lin")),
         "std/compress" => Some(include_str!("../../../stdlib/compress.lin")),
         "std/archive"  => Some(include_str!("../../../stdlib/archive.lin")),
+        "std/event"    => Some(include_str!("../../../stdlib/event.lin")),
         _ => None,
     }
 }
