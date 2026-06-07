@@ -258,5 +258,10 @@ pub fn instr_use_def(instr: &Instruction) -> (Vec<Temp>, Vec<Temp>) {
         Instruction::UnboxKeepPacked { dst, src, .. } => (vec![*src], vec![*dst]),
         Instruction::Bind { dst, src, .. } => (vec![*src], vec![*dst]),
         Instruction::Panic { msg } => (vec![*msg], vec![]),
+        // DEBUG-ONLY metadata marker: it neither uses nor defines a temp for ownership/liveness
+        // purposes (`temp` is already defined by the preceding binding instruction; this only
+        // RECORDS its name for DWARF). Reporting no uses/defs keeps RC elision and liveness — and
+        // therefore non-debug semantics — completely unaffected. See `Instruction::DebugDeclare`.
+        Instruction::DebugDeclare { .. } => (vec![], vec![]),
     }
 }

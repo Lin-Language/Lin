@@ -492,6 +492,19 @@ pub enum Instruction {
     Bind { dst: Temp, src: Temp, ty: Type },
     /// Panic with a message string.
     Panic { msg: Temp },
+    /// DEBUG-ONLY metadata (Phase 3 of the Lin debugger): associate the SSA temp holding a Lin
+    /// `val`/`var`/parameter binding with its SOURCE name and type, so the codegen DWARF pass can
+    /// emit a `DILocalVariable` + `DIType` for it (and `llvm.dbg.declare` over a stack home) under
+    /// `--debug`. `param_no` is `Some(n)` (1-based) for a function parameter — emitted as a
+    /// `DW_TAG_formal_parameter` with that argument ordinal (each parameter MUST have a distinct
+    /// index or LLVM rejects the debug info) — and `None` for a `val`/`var` local (a
+    /// `DW_TAG_variable`). `span` is the binding-site source span (for the declared line/col).
+    /// Purely additive: it produces NO machine instructions and is IGNORED by non-debug codegen (the
+    /// debug_info state is `None`), so it never changes program semantics or non-debug output. The
+    /// lowerer emits it at binding sites; the liveness/RC passes treat it as a pure metadata marker
+    /// (it neither defines nor uses `temp` for ownership purposes — `temp` is already defined by the
+    /// preceding binding instruction). See `crates/lin-codegen/src/codegen/debug_info.rs`.
+    DebugDeclare { temp: Temp, name: String, ty: Type, param_no: Option<u32>, span: lin_common::Span },
 }
 
 /// Description of what a `has` pattern checks (for pattern-match compilation).
