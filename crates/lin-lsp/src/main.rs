@@ -6,7 +6,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
-use lin_check::typed_ir::{TypedModule, TypedStmt};
+use lin_check::typed_ir::{TypedExpr, TypedModule, TypedStmt};
 use lin_check::types::Type;
 use lin_check::Checker;
 use lin_common::Severity;
@@ -50,6 +50,8 @@ impl LanguageServer for Backend {
                 // Plain rename (no prepareRename) — the inverse-span lookup is reliable enough that
                 // a prepare step would add no value; the client just sends rename directly.
                 rename_provider: Some(OneOf::Left(true)),
+                // Inlay type hints on bindings whose type is inferred (no explicit annotation).
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -408,6 +410,25 @@ impl LanguageServer for Backend {
             change_annotations: None,
         }))
     }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = &params.text_document.uri;
+        let source = match self.docs.read().unwrap().get(uri).cloned() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let base_dir = file_dir(uri);
+        let analysis = analyse(&source, base_dir.as_deref());
+
+        // Only emit hints whose anchor falls inside the requested range — clients re-request as the
+        // viewport scrolls, so honouring the range keeps the response small.
+        let range = params.range;
+        let hints: Vec<InlayHint> = inlay_hints(&source, &analysis)
+            .into_iter()
+            .filter(|h| position_in_range(h.position, range))
+            .collect();
+        Ok(Some(hints))
+    }
 }
 
 impl Backend {
@@ -433,6 +454,12 @@ struct Analysis {
     /// path and resolved type signature when known. Derived from the file's `import` statements
     /// + the resolved exports of those modules — never a hardcoded list, so it can't go stale.
     imported_names: Vec<ImportedName>,
+    /// The parsed surface AST. Retained so inlay-hint/signature-help handlers can walk binding
+    /// patterns and call expressions without re-parsing.
+    module: lin_parse::ast::Module,
+    /// The type-checked module, when checking succeeded. `None` on a hard check error. Used by the
+    /// inlay-hint handler to look up inferred binding types and by semantic tokens.
+    typed: Option<TypedModule>,
 }
 
 /// One importable symbol surfaced for completion. `name` is the local (possibly aliased) name;
@@ -493,12 +520,13 @@ fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
     let mut checker = Checker::new();
     checker.import_types = import_type_map;
 
-    match checker.check_module(&module) {
-        Ok(_) => {}
+    let typed = match checker.check_module(&module) {
+        Ok(typed) => Some(typed),
         Err(check_diags) => {
             diags.extend(check_diags.iter().map(|d| lsp_diagnostic(source, d)));
+            None
         }
-    }
+    };
 
     // Warn on unused imports.
     diags.extend(unused_import_warnings(source, &module));
@@ -522,6 +550,8 @@ fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
         diagnostics: diags,
         span_type_map: checker.span_type_map,
         imported_names,
+        module,
+        typed,
     }
 }
 
@@ -948,6 +978,202 @@ fn pattern_ident(pattern: &lin_parse::ast::Pattern) -> Option<(String, lin_commo
     }
 }
 
+// ── inlay hints ────────────────────────────────────────────────────────────────
+
+/// Build inline type-annotation hints for every `val`/`var` binding whose type was INFERRED
+/// (no explicit annotation in source). Each hint is positioned at the end of the bound identifier
+/// and labelled `: <Type>`, where the type comes from the type-checked module.
+///
+/// Pure over `(source, analysis)` so it's unit-testable. Returns an empty vec when checking failed
+/// (no typed module) — we never guess a type from a broken parse.
+fn inlay_hints(source: &str, analysis: &Analysis) -> Vec<InlayHint> {
+    let Some(typed) = analysis.typed.as_ref() else {
+        return Vec::new();
+    };
+    // Map every `val`/`var` binding's STATEMENT span to its inferred type. The AST and typed
+    // statements share stmt spans (the checker copies them through), so we join on span.
+    let mut ty_by_stmt: HashMap<(u32, u32), String> = HashMap::new();
+    collect_binding_types(&typed.statements, &mut ty_by_stmt);
+
+    // Walk the AST for unannotated `val`/`var` bindings and pair each with the inferred type.
+    let mut anchors: Vec<(lin_common::Span, String)> = Vec::new();
+    collect_unannotated_bindings(&analysis.module.statements, &ty_by_stmt, &mut anchors);
+
+    let mut hints = Vec::new();
+    for (name_span, ty_str) in anchors {
+        // Don't emit a hint when the type couldn't be rendered usefully (unsolved inference var).
+        if ty_str.starts_with("?T") {
+            continue;
+        }
+        let position = offset_to_position(source, name_span.end as usize);
+        hints.push(InlayHint {
+            position,
+            label: InlayHintLabel::String(format!(": {}", ty_str)),
+            kind: Some(InlayHintKind::TYPE),
+            text_edits: None,
+            tooltip: None,
+            padding_left: Some(false),
+            padding_right: Some(false),
+            data: None,
+        });
+    }
+    hints
+}
+
+/// Recursively collect `(stmt_span_tuple -> type_string)` for every `val`/`var` in the typed
+/// module, descending into function bodies and blocks so nested bindings get hints too.
+fn collect_binding_types(stmts: &[TypedStmt], out: &mut HashMap<(u32, u32), String>) {
+    for stmt in stmts {
+        match stmt {
+            TypedStmt::Val { ty, span, value, .. } => {
+                out.insert((span.start, span.end), ty.to_string());
+                collect_binding_types_in_expr(value, out);
+            }
+            TypedStmt::Var { ty, span, value, .. } => {
+                out.insert((span.start, span.end), ty.to_string());
+                collect_binding_types_in_expr(value, out);
+            }
+            TypedStmt::Expr(e) => collect_binding_types_in_expr(e, out),
+            _ => {}
+        }
+    }
+}
+
+/// Descend a typed expression looking for nested `val`/`var` bindings (in blocks / function
+/// bodies / branches) so their inferred types are available to the inlay-hint join.
+fn collect_binding_types_in_expr(expr: &TypedExpr, out: &mut HashMap<(u32, u32), String>) {
+    use lin_check::typed_ir::TypedExpr as E;
+    match expr {
+        E::Block { stmts, expr, .. } => {
+            collect_binding_types(stmts, out);
+            collect_binding_types_in_expr(expr, out);
+        }
+        E::Function { body, .. } => collect_binding_types_in_expr(body, out),
+        E::If { cond, then_br, else_br, .. } => {
+            collect_binding_types_in_expr(cond, out);
+            collect_binding_types_in_expr(then_br, out);
+            collect_binding_types_in_expr(else_br, out);
+        }
+        E::Match { scrutinee, arms, .. } => {
+            collect_binding_types_in_expr(scrutinee, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    collect_binding_types_in_expr(g, out);
+                }
+                collect_binding_types_in_expr(&arm.body, out);
+            }
+        }
+        E::Call { func, args, .. } => {
+            collect_binding_types_in_expr(func, out);
+            for a in args {
+                collect_binding_types_in_expr(a, out);
+            }
+        }
+        E::BinaryOp { left, right, .. } => {
+            collect_binding_types_in_expr(left, out);
+            collect_binding_types_in_expr(right, out);
+        }
+        E::UnaryOp { operand, .. } => collect_binding_types_in_expr(operand, out),
+        E::Coerce { expr, .. } => collect_binding_types_in_expr(expr, out),
+        E::LocalSet { value, .. } => collect_binding_types_in_expr(value, out),
+        _ => {}
+    }
+}
+
+/// Walk the surface AST for `val`/`var` bindings that have NO explicit type annotation and bind a
+/// single identifier (destructuring patterns are skipped — they bind several names with no single
+/// anchor). For each, look up the inferred type by the binding's statement span and, when found,
+/// record `(identifier_span, type_string)`. Recurses into function bodies/blocks/branches.
+fn collect_unannotated_bindings(
+    stmts: &[Stmt],
+    ty_by_stmt: &HashMap<(u32, u32), String>,
+    out: &mut Vec<(lin_common::Span, String)>,
+) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Val { pattern, type_ann: None, value, span, .. } => {
+                if let Some((_, name_span)) = pattern_ident(pattern) {
+                    if let Some(ty) = ty_by_stmt.get(&(span.start, span.end)) {
+                        out.push((name_span, ty.clone()));
+                    }
+                }
+                collect_unannotated_bindings_in_expr(value, ty_by_stmt, out);
+            }
+            Stmt::Var { name_span, type_ann: None, value, span, .. } => {
+                if let Some(ty) = ty_by_stmt.get(&(span.start, span.end)) {
+                    out.push((*name_span, ty.clone()));
+                }
+                collect_unannotated_bindings_in_expr(value, ty_by_stmt, out);
+            }
+            Stmt::Val { value, .. } | Stmt::Var { value, .. } => {
+                collect_unannotated_bindings_in_expr(value, ty_by_stmt, out);
+            }
+            Stmt::Expr(e) => collect_unannotated_bindings_in_expr(e, ty_by_stmt, out),
+            _ => {}
+        }
+    }
+}
+
+/// Descend a surface expression mirroring `collect_binding_types_in_expr`, finding nested
+/// unannotated `val`/`var` bindings.
+fn collect_unannotated_bindings_in_expr(
+    expr: &lin_parse::ast::Expr,
+    ty_by_stmt: &HashMap<(u32, u32), String>,
+    out: &mut Vec<(lin_common::Span, String)>,
+) {
+    use lin_parse::ast::Expr as E;
+    match expr {
+        E::Block(stmts, tail, _) => {
+            collect_unannotated_bindings(stmts, ty_by_stmt, out);
+            collect_unannotated_bindings_in_expr(tail, ty_by_stmt, out);
+        }
+        E::Function { body, .. } => collect_unannotated_bindings_in_expr(body, ty_by_stmt, out),
+        E::If { condition, then_branch, else_branch, .. } => {
+            collect_unannotated_bindings_in_expr(condition, ty_by_stmt, out);
+            collect_unannotated_bindings_in_expr(then_branch, ty_by_stmt, out);
+            collect_unannotated_bindings_in_expr(else_branch, ty_by_stmt, out);
+        }
+        E::Match { scrutinee, arms, .. } => {
+            collect_unannotated_bindings_in_expr(scrutinee, ty_by_stmt, out);
+            for arm in arms {
+                if let Some(g) = &arm.guard {
+                    collect_unannotated_bindings_in_expr(g, ty_by_stmt, out);
+                }
+                collect_unannotated_bindings_in_expr(&arm.body, ty_by_stmt, out);
+            }
+        }
+        E::Call { func, args, .. } => {
+            collect_unannotated_bindings_in_expr(func, ty_by_stmt, out);
+            for a in args {
+                collect_unannotated_bindings_in_expr(a, ty_by_stmt, out);
+            }
+        }
+        E::DotCall { receiver, args, .. } => {
+            collect_unannotated_bindings_in_expr(receiver, ty_by_stmt, out);
+            if let Some(args) = args {
+                for a in args {
+                    collect_unannotated_bindings_in_expr(a, ty_by_stmt, out);
+                }
+            }
+        }
+        E::BinaryOp { left, right, .. } => {
+            collect_unannotated_bindings_in_expr(left, ty_by_stmt, out);
+            collect_unannotated_bindings_in_expr(right, ty_by_stmt, out);
+        }
+        E::UnaryOp { operand, .. } => collect_unannotated_bindings_in_expr(operand, ty_by_stmt, out),
+        E::Assign { value, .. } => collect_unannotated_bindings_in_expr(value, ty_by_stmt, out),
+        _ => {}
+    }
+}
+
+/// True when `pos` lies within the half-open LSP `range` (inclusive of both ends, which is fine for
+/// the inlay viewport filter — clients tolerate a hint exactly on the boundary).
+fn position_in_range(pos: Position, range: Range) -> bool {
+    let after_start = (pos.line, pos.character) >= (range.start.line, range.start.character);
+    let before_end = (pos.line, pos.character) <= (range.end.line, range.end.character);
+    after_start && before_end
+}
+
 fn lsp_diagnostic(source: &str, d: &lin_common::Diagnostic) -> Diagnostic {
     let start = offset_to_position(source, d.span.start as usize);
     let end_offset = (d.span.end as usize).max(d.span.start as usize + 1);
@@ -1263,6 +1489,51 @@ mod tests {
         // Offset 0 is the `v` of `val` — a keyword, no recorded symbol span.
         let occ = occurrences_at(&map, 0);
         assert!(occ.is_empty(), "keyword position should yield no occurrences: {:?}", occ);
+    }
+
+    // ── Tier-2: inlay hints ─────────────────────────────────────────────────────
+
+    /// A `val` binding with NO explicit annotation gets a type hint; a binding WITH an annotation
+    /// gets none.
+    #[test]
+    fn inlay_hints_only_for_inferred_bindings() {
+        let src = "val a = 1\nval b: Int32 = 2\n";
+        let analysis = analyse(src, None);
+        let hints = inlay_hints(src, &analysis);
+        let labels: Vec<String> = hints
+            .iter()
+            .map(|h| match &h.label {
+                InlayHintLabel::String(s) => s.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        // `a` is inferred -> one hint; `b` is annotated -> no hint.
+        assert_eq!(hints.len(), 1, "expected exactly one hint, got {:?}", labels);
+        assert_eq!(labels[0], ": Int32");
+        assert_eq!(hints[0].kind, Some(InlayHintKind::TYPE));
+        // The hint anchors at the end of the identifier `a` (line 0).
+        assert_eq!(hints[0].position.line, 0);
+        assert_eq!(hints[0].position.character, "val a".len() as u32);
+    }
+
+    /// Nested `val` bindings inside a function body also get inferred-type hints.
+    #[test]
+    fn inlay_hints_descend_into_function_bodies() {
+        let src = "val f = () =>\n  val inner = \"hi\"\n  inner\n";
+        let analysis = analyse(src, None);
+        let hints = inlay_hints(src, &analysis);
+        let labels: Vec<String> = hints
+            .iter()
+            .filter_map(|h| match &h.label {
+                InlayHintLabel::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            labels.iter().any(|l| l == ": String"),
+            "expected a String hint for the nested binding, got {:?}",
+            labels
+        );
     }
 
     #[test]
