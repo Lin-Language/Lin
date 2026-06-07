@@ -31,6 +31,7 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/tty`](#stdtty) | Raw terminal mode and key reads |
 | [`std/signal`](#stdsignal) | Blocking wait for OS signals |
 | [`std/async`](#stdasync) | Async, concurrency and workers |
+| [`std/event`](#stdevent) | Typed event emitters: async worker-backed emitter and synchronous in-process bus |
 | [`std/env`](#stdenv) | Environment variables |
 | [`std/template`](#stdtemplate) | String template rendering |
 | [`std/test`](#stdtest) | Test framework |
@@ -313,6 +314,24 @@ combinators (`map`/`filter`/`reduce`/`for`/`take`/…) and iterator constructors
 | [`timeout`](#timeout) | `(Promise, Int32) -> T` | Add a millisecond timeout to a promise |
 | [`withLock`](#shared--get--set--withlock) | `<T, R>(Shared<T>, (T) -> R) -> R` | Atomic read-modify-write on a `Shared` |
 | [`worker`](#worker) | `((Msg) -> Reply, () -> Null) -> Worker` | Create a background worker |
+
+**std/event**
+
+Generic over the event payload type `T`. Exported types: `Listener<T> = (T) -> Null`, `Bus<T>`, `Sub`.
+
+| Function | Signature | Summary |
+| --- | --- | --- |
+| [`emitter`](#emitter) | `<T, S>((T, S) -> S, S, T) -> Emitter` | Spawn an async worker that folds each `T` into state `S` |
+| [`send`](#send) | `<T>(Emitter, T) -> Null` | Fire-and-forget a value to the emitter |
+| [`request`](#request-event) | `<T, S>(Emitter, T) -> S \| Error` | Synchronously fold a value, returning the new state |
+| [`drain`](#drain-event) | `<T, S>(Emitter, T) -> S \| Error` | Flush the queue, returning the accumulated state |
+| [`stop`](#stop) | `(Emitter) -> Null` | Shut the emitter's worker down |
+| [`bus`](#bus) | `<T>(Listener<T>) -> Bus<T>` | A synchronous bus seeded with its first listener |
+| [`on`](#on) | `<T>(Bus<T>, Listener<T>) -> Sub` | Register a listener; returns a subscription handle |
+| [`once`](#once) | `<T>(Bus<T>, Listener<T>) -> Sub` | Register a listener that fires at most once |
+| [`off`](#off) | `<T>(Bus<T>, Sub) -> Boolean` | Remove a listener by its handle |
+| [`emit`](#emit) | `<T>(Bus<T>, T) -> Int32` | Synchronously invoke every listener; returns the count |
+| [`listenerCount`](#listenerCount) | `<T>(Bus<T>) -> Int32` | How many listeners are registered |
 
 **std/env**
 
@@ -4512,6 +4531,168 @@ close(w)
 ```
 
 ---
+
+## std/event
+
+Typed event emitters in two layers, **fully generic over the event payload type** — no `Json`
+envelope, no string-tagged `{ type, data }`. Each emitter/bus is parameterised by its payload type
+`T`, so `emit`/`send` accept a `T` and listeners receive a `T`. For several event shapes through
+one channel, make `T` a tagged union and `match` on it.
+
+- **Layer 1 — `emitter` (async, worker-backed).** A long-lived worker (`std/async`, §24.6) owns the
+  subscriber state `S` and folds each delivered `T` into it with a reducer `(T, S) => S` running on
+  the worker thread. Use it when a producer on one thread feeds a subscriber on another — e.g.
+  stream a file and `send` processed records to an indexer worker.
+- **Layer 2 — `bus` (synchronous, in-process).** A listener registry dispatched on the calling
+  thread, for decoupled pub/sub within one thread.
+
+Design notes (learning from Node's `EventEmitter`): no magic `"error"` event that aborts the
+process when unhandled — an async reducer fault is isolated at the worker boundary (§24.6.5); you
+**unsubscribe by handle**, not by fragile closure identity; each event is **one typed payload**, not
+positional varargs; listener counts are queryable.
+
+**Generics note.** Lin infers type parameters from *arguments*, and a generic record type does not
+propagate its parameter back to a generic consumer. So **annotate the bus binding once** —
+`val b: Bus<Int32> = bus(firstListener)` — and every other call resolves `T` from that binding or a
+value argument. The async layer takes a representative `sample: T` argument on `emitter`/`drain`
+purely to pin `T` (a worker handler cannot otherwise recover it); the worker handle itself is the
+one opaque value (a `Worker`, erased to `Json` per §24.1 — that is the runtime handle, never your
+payload).
+
+The module exports the types `Listener<T>` (`= (T) => Null`), `Bus<T>`, and `Sub`.
+
+The reducer (Layer 1) runs on the worker thread, one event at a time, so its state is thread-confined
+(it may hold a captured `var`, §24.6.4). `send` is fire-and-forget — a fast producer can outrun a slow
+reducer and grow the queue; use `request` to pace, or rely on the final `drain`. `request`/`drain`
+return `S | Error` (the worker boundary injects `Error` on a reducer fault); annotate the binding to
+recover `S`. For the synchronous bus (Layer 2), `bus(first)` is seeded with its first listener so its
+`T` is inferred (a zero-argument generic constructor could not infer `T`); to start empty, write the
+literal directly, `val b: Bus<Int32> = { "entries": [], "nextId": 0 }`.
+
+### emitter
+
+```txt
+val emitter: <T, S>(reduce: (T, S) -> S, initial: S, sample: T) -> Emitter
+```
+
+Spawns a subscriber worker that owns state `S` (seeded `initial`) and folds each delivered `T` into it
+via `reduce`, on the worker thread. `sample: T` is a representative payload that pins `T` for the
+internal transfer envelope; it is never delivered to `reduce`. The returned handle is opaque (a
+`Worker`, erased to `Json` — the runtime handle, never a payload).
+
+```txt
+val sink = emitter((x: Int32, sum: Int32) => sum + x, 0, 0)   // T=Int32, S=Int32
+```
+
+### send
+
+```txt
+val send: <T>(e: Emitter, value: T) -> Null
+```
+
+Fire-and-forget: enqueue `value` and return immediately. No backpressure.
+
+### request (event) {#request-event}
+
+```txt
+val request: <T, S>(e: Emitter, value: T) -> S | Error
+```
+
+Synchronous: enqueue `value`, block until the reducer folds it, and return the resulting state.
+Gives natural backpressure (the producer waits).
+
+### drain (event) {#drain-event}
+
+```txt
+val drain: <T, S>(e: Emitter, sample: T) -> S | Error
+```
+
+Flush: block until the queue is fully processed and return the accumulated state. Served only after
+every prior `send`, so the result reflects them all. `sample: T` pins the envelope type.
+
+```txt
+send(sink, 10)
+send(sink, 5)
+val total: Int32 | Error = drain(sink, 0)   // 15 (once the Error case is handled)
+stop(sink)
+```
+
+### stop
+
+```txt
+val stop: (e: Emitter) -> Null
+```
+
+Shut the emitter's worker down (drain in-flight, run onClose, join). After `stop`, sending to it is
+an error.
+
+### bus
+
+```txt
+val bus: <T>(first: Listener<T>) -> Bus<T>
+```
+
+A fresh synchronous bus seeded with its first listener (which pins `T`). Annotate the binding so later
+bus-only calls resolve `T`: `val b: Bus<Int32> = bus(h)`.
+
+```txt
+val b: Bus<Int32> = bus(d => print("tick ${d}"))
+```
+
+### on
+
+```txt
+val on: <T>(b: Bus<T>, handler: Listener<T>) -> Sub
+```
+
+Register `handler` for the bus's payload type. Returns a subscription handle to pass to `off`.
+
+### once
+
+```txt
+val once: <T>(b: Bus<T>, handler: Listener<T>) -> Sub
+```
+
+Like `on`, but the listener is removed automatically after its first firing.
+
+### off
+
+```txt
+val off: <T>(b: Bus<T>, sub: Sub) -> Boolean
+```
+
+Remove the listener identified by `sub`. Returns `true` if one was removed.
+
+### emit
+
+```txt
+val emit: <T>(b: Bus<T>, value: T) -> Int32
+```
+
+Synchronously invoke every listener with `value`, in registration order; returns how many fired
+(`0` if none — no Node-style crash on an unhandled event). `emit` snapshots the listener list before
+firing, so a handler that subscribes or unsubscribes during dispatch does not perturb the current
+round.
+
+```txt
+val sub = on(b, d => print("also ${d}"))
+once(b, d => print("first only ${d}"))
+emit(b, 1)        // all three fire; returns 3
+emit(b, 2)        // once-listener is gone; returns 2
+off(b, sub)       // unsubscribe by handle
+emit(b, 3)        // returns 1
+```
+
+### listenerCount
+
+```txt
+val listenerCount: <T>(b: Bus<T>) -> Int32
+```
+
+How many listeners are currently registered.
+
+---
+
 
 ## std/env
 

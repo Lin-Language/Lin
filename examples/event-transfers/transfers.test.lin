@@ -1,0 +1,57 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { length } from "std/array"
+import { makeTransfer, emitRow, transferSink, collectRows, Transfer } from "./transfers"
+import { drain, stop } from "std/event"
+
+val SAMPLE: Transfer = {
+  "origin": "",
+  "destination": "",
+  "duration": 0
+}
+
+val s = suite("event-transfers", [
+  test("makeTransfer builds the typed transfer record", () =>
+    val t = makeTransfer("A", "B", 60)
+    [
+      expect(t["origin"]).toBe("A"),
+      expect(t["destination"]).toBe("B"),
+      expect(t["duration"]).toBe(60)
+    ]
+  ),
+
+  test("collectRows folds parsed footpaths into a typed Transfer[]", () =>
+    val collected: Transfer[] | Error = collectRows([
+      "A,B,2,60",
+      "A,C,2,90",
+      "X,Y,2,30"
+    ])
+    val n = match collected
+      is Error => 0 - 1
+      else => length(collected)
+    val firstDest = match collected
+      is Error => "?"
+      else => collected[0]["destination"]
+    [
+      expect(n).toBe(3),
+      expect(firstDest).toBe("B")
+    ]
+  ),
+
+  test("a same-stop row (interchange) is not emitted as a footpath", () =>
+    val sink = transferSink()
+    val emittedFootpath = emitRow(sink, "A,B,2,60")
+    val emittedSelf = emitRow(sink, "A,A,2,120")
+    val collected: Transfer[] | Error = drain(sink, SAMPLE)
+    stop(sink)
+    val n = match collected
+      is Error => 0 - 1
+      else => length(collected)
+    [
+      expect(emittedFootpath).toBe(true),
+      expect(emittedSelf).toBe(false),
+      expect(n).toBe(1)
+    ]
+  )
+])
+
+run(s)

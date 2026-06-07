@@ -1,0 +1,81 @@
+// event-transfers — mixing a Stream with an event emitter (the RAPTOR transfer-collection case).
+//
+// A producer STREAMS a transfers file line by line on the calling thread, parses each row into a
+// typed `Transfer`, and EMITS it to a subscriber worker (std/event Layer 1) that owns the
+// collected `Transfer[]` and folds each emitted transfer in. The stream stays on the producer
+// thread; only the parsed, transferable `Transfer` crosses to the worker — so parsing and
+// collection overlap, and a large feed is processed in constant memory. The parse/emit/collect
+// logic lives in ./transfers (unit-tested in transfers.test.lin); this file is just the streaming
+// I/O around it. No `Json` payloads: the emitter is generic over the `Transfer` record type.
+//
+// This is how RAPTOR's gtfsLoader would collect transfers.txt out of a GTFS feed. A real GTFS feed
+// is a ZIP (no zip reader in std yet) or a tar.gz; the only change for an archive is the SOURCE of
+// the line stream — swap
+//     readStream(path).lines()
+// for
+//     readStream("gtfs.tar.gz").gunzip().untar((meta, data) =>
+//       if meta["name"] == "transfers.txt" then data.lines().for(...))
+// and the emitter half is identical. (untar's `data` sub-stream is sync-only and must be consumed
+// inside the callback — which is fine here: we parse + emit per line, and only the transferable
+// `Transfer` is handed to the worker, never the stream.)
+//
+// Run:   lin run examples/event-transfers/main.lin
+// Test:  lin test examples/event-transfers/
+import { print } from "std/io"
+import { readStream, lines } from "std/stream"
+import { writeFile } from "std/fs"
+import { for } from "std/iter"
+import { toString } from "std/string"
+import { length } from "std/array"
+import { Transfer, transferSink, emitRow } from "./transfers"
+import { drain, stop } from "std/event"
+
+val inPath = "/tmp/lin_event_transfers.csv"
+
+// transfers.txt columns: from_stop_id, to_stop_id, transfer_type, min_transfer_time
+val fixture = "from_stop_id,to_stop_id,transfer_type,min_transfer_time\nA,B,2,60\nA,C,2,90\nB,C,2,45\nA,A,2,120\nX,Y,2,30"
+
+// A representative Transfer to pin the drain payload type (mirrors transfers.lin's SAMPLE).
+val SAMPLE: Transfer = {
+  "origin": "",
+  "destination": "",
+  "duration": 0
+}
+
+val main = (): Null =>
+  writeFile(inPath, fixture)
+
+  // SUBSCRIBER: a worker that owns the collected Transfer[] (state confined to its thread).
+  val sink = transferSink()
+
+  // PRODUCER: stream the file, parse each row, emit Transfer values to the worker.
+  var header = true
+  val streamResult = readStream(inPath)
+    .lines()
+    .for(line =>
+      if length(line) > 0 then
+        if header then
+          header = false
+        else
+          emitRow(sink, line)
+    )
+
+  match streamResult
+    is Error =>
+      print("stream failed: ${streamResult["message"]}")
+      stop(sink)
+    else =>
+      // Block until the worker has folded every emitted transfer, then read the collected list.
+      val collected: Transfer[] | Error = drain(sink, SAMPLE)
+      stop(sink)
+      match collected
+        is Error => print("collection failed")
+        else =>
+          print("collected ${toString(length(collected))} footpath transfer(s):")
+          collected.for(t =>
+            print(
+              "  ${t["origin"]} -> ${t["destination"]} (${toString(t["duration"])}s)"
+            )
+          )
+
+main()

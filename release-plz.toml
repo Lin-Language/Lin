@@ -3,10 +3,18 @@
 release_always = false
 # Nothing is published to crates.io (all deps are path-only).
 publish = false
+# Use git tags (not crates.io) as the version baseline. Required because the
+# crates are never published, so the registry has nothing to compare against;
+# without this release-plz finds no baseline and opens no PR. With no vX.Y.Z tag
+# yet, this makes it treat the next run as the initial 1.0.0 release.
+git_only = true
 # Create the GitHub release and git tag.
 git_release_enable = true
 git_tag_enable = true
 git_tag_name = "v{{ version }}"
+# Write ONE workspace-root changelog (instead of a per-crate CHANGELOG.md in each
+# crate dir). This is the file docs.yml mirrors to docs-site/content/changelog.md.
+changelog_path = "CHANGELOG.md"
 
 [changelog]
 header = "# Changelog\n\nAll notable changes to Lin are documented here.\n"

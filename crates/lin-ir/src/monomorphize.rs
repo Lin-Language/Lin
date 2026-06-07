@@ -288,7 +288,99 @@ fn collect_subs(pattern: &Type, actual: &Type, subs: &mut HashMap<u32, Type>) {
             for (p, a) in pp.iter().zip(ap.iter()) { collect_subs(p, a, subs); }
             collect_subs(pr, ar, subs);
         }
+        // A generic union-typed param (e.g. `Res<T, E> = {..T} | {..E}`) unified against a
+        // concrete union argument. The type checker resolves the call, but the monomorphizer must
+        // also recover the type-args from the call site or it fails to specialize. Mirror the
+        // object/array recursion by walking INTO the union members. Without this, a type parameter
+        // that appears ONLY inside a union member is left unbound.
+        //
+        // Two distinct shapes share this arm:
+        //   1. STRUCTURAL members (objects/arrays/…), e.g. `Res<T,E>` = two record arms keyed by a
+        //      `"type"` discriminant — each pattern member must bind against the structurally
+        //      CORRESPONDING actual member, not an arbitrary one (`best_union_match`).
+        //   2. A bare quantified TypeVar member, e.g. `T | Null` — `T` should absorb the ENTIRE
+        //      remaining actual union (`Int32 | String`), not a single member of it.
+        (Type::Union(pts), Type::Union(ats)) => {
+            for pt in pts {
+                if matches!(pt, Type::TypeVar(id) if *id >= GENERIC_TV_BASE && *id != u32::MAX) {
+                    // Case 2: bind the bare var to the union of actual members that no concrete
+                    // (non-var) pattern member matches structurally — i.e. the "leftover" arms.
+                    let leftover: Vec<Type> = ats
+                        .iter()
+                        .filter(|at| {
+                            !pts.iter().any(|other| {
+                                !std::ptr::eq(other, pt)
+                                    && !matches!(other, Type::TypeVar(_))
+                                    && union_shape_score(other, at) > 0
+                            })
+                        })
+                        .cloned()
+                        .collect();
+                    let bound = match leftover.len() {
+                        0 => Type::Union(ats.clone()),
+                        1 => leftover.into_iter().next().unwrap(),
+                        _ => Type::Union(leftover),
+                    };
+                    // Only record a binding when it adds CONCRETE information. If the leftover is
+                    // (or still mentions) the same generic var — e.g. the return union `S | Error`
+                    // was passed unsubstituted as the call-site `result_type`, so `S` would bind to
+                    // itself — leave it unbound. A self-/generic-binding makes `fully_concrete`
+                    // false and spuriously trips the "cannot infer" error for a param whose value
+                    // is genuinely determined elsewhere (or legitimately erased to `$Json`).
+                    if !mentions_generic_tv(&bound) {
+                        collect_subs(pt, &bound, subs);
+                    }
+                } else if let Some(at) = best_union_match(pt, ats) {
+                    // Case 1: structural pattern member → best-matching actual member.
+                    collect_subs(pt, at, subs);
+                }
+            }
+        }
+        // A generic union param unified against a single concrete member (a narrowed value, or a
+        // record literal that only inhabits one arm). Recurse against each pattern member; only the
+        // structurally-matching one will bind anything, the rest are inert.
+        (Type::Union(pts), actual) => {
+            for pt in pts {
+                collect_subs(pt, actual, subs);
+            }
+        }
         _ => {}
+    }
+}
+
+/// Pick the actual union member that best matches a generic pattern member, so the type vars are
+/// bound against the structurally-corresponding arm rather than an arbitrary one. Prefers an exact
+/// `union_shape_score` winner (e.g. matching `StrLit` discriminants like `"type": "success"`).
+fn best_union_match<'a>(pattern: &Type, actuals: &'a [Type]) -> Option<&'a Type> {
+    actuals
+        .iter()
+        .max_by_key(|a| union_shape_score(pattern, a))
+}
+
+/// A heuristic structural-overlap score between a pattern member and a candidate actual member.
+/// Higher means a better match. Counts object fields present in both, with a strong bonus when a
+/// shared field's pattern type is a concrete `StrLit` that equals the actual's (the discriminant
+/// case, e.g. `"type": "success"` vs `"type": "failure"`).
+fn union_shape_score(pattern: &Type, actual: &Type) -> i64 {
+    match (pattern, actual) {
+        (Type::Object { fields: pf, .. }, Type::Object { fields: af, .. }) => {
+            let mut score = 0i64;
+            for (k, pv) in pf {
+                if let Some(av) = af.get(k) {
+                    score += 1;
+                    match (pv, av) {
+                        (Type::StrLit(a), Type::StrLit(b)) if a == b => score += 100,
+                        (Type::StrLit(_), Type::StrLit(_)) => score -= 100,
+                        _ => {}
+                    }
+                }
+            }
+            score
+        }
+        (Type::Array(p), Type::Array(a)) | (Type::Iterator(p), Type::Iterator(a)) => {
+            union_shape_score(p, a)
+        }
+        _ => 0,
     }
 }
 
