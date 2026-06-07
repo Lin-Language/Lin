@@ -1,11 +1,16 @@
 import { expect, toBe, test, suite, run } from "std/test"
 import { length } from "std/array"
-import { keys } from "std/object"
-import { makeTransfer, emitRow, transferIndexer, indexRows } from "./transfers"
+import { makeTransfer, emitRow, transferSink, collectRows, Transfer } from "./transfers"
 import { drain, stop } from "std/event"
 
+val SAMPLE: Transfer = {
+  "origin": "",
+  "destination": "",
+  "duration": 0
+}
+
 val s = suite("event-transfers", [
-  test("makeTransfer builds the transfer record", () =>
+  test("makeTransfer builds the typed transfer record", () =>
     val t = makeTransfer("A", "B", 60)
     [
       expect(t["origin"]).toBe("A"),
@@ -14,34 +19,37 @@ val s = suite("event-transfers", [
     ]
   ),
 
-  test("indexRows groups footpaths by origin", () =>
-    val index = indexRows([
+  test("collectRows folds parsed footpaths into a typed Transfer[]", () =>
+    val collected: Transfer[] | Error = collectRows([
       "A,B,2,60",
       "A,C,2,90",
-      "B,C,2,45",
       "X,Y,2,30"
     ])
+    val n = match collected
+      is Error => 0 - 1
+      else => length(collected)
+    val firstDest = match collected
+      is Error => "?"
+      else => collected[0]["destination"]
     [
-      expect(length(keys(index))).toBe(3),
-      expect(length(index["A"])).toBe(2),
-      expect(length(index["B"])).toBe(1),
-      expect(length(index["X"])).toBe(1),
-      expect(index["A"][0]["destination"]).toBe("B"),
-      expect(index["A"][1]["duration"]).toBe(90)
+      expect(n).toBe(3),
+      expect(firstDest).toBe("B")
     ]
   ),
 
   test("a same-stop row (interchange) is not emitted as a footpath", () =>
-    val sink = transferIndexer()
+    val sink = transferSink()
     val emittedFootpath = emitRow(sink, "A,B,2,60")
     val emittedSelf = emitRow(sink, "A,A,2,120")
-    val index = drain(sink)
+    val collected: Transfer[] | Error = drain(sink, SAMPLE)
     stop(sink)
+    val n = match collected
+      is Error => 0 - 1
+      else => length(collected)
     [
       expect(emittedFootpath).toBe(true),
       expect(emittedSelf).toBe(false),
-      expect(length(keys(index))).toBe(1),
-      expect(length(index["A"])).toBe(1)
+      expect(n).toBe(1)
     ]
   )
 ])
