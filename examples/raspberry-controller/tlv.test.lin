@@ -1,8 +1,10 @@
-// Unit suite for tlv.lin — `encode` / `decode` in isolation.
+// Unit suite for tlv.lin — `encode` / `decode` in isolation (ported from the
+// codec example folded into this project).
 //
-// Covers byte-exact wire framing (tag, big-endian 2-byte length, value),
-// empty and multi-field messages, and encode/decode round-trips. Object-literal
-// field args coerce to Field[] directly.
+// Covers byte-exact wire framing (tag, big-endian 2-byte length, value), empty
+// and multi-field messages, and encode/decode round-trips — including per-field
+// and per-element reads of the decoded values. Object-literal field args coerce
+// to Field[] directly.
 import { expect, toBe, test, suite, run } from "std/test"
 import { encode, decode } from "./tlv"
 import { length } from "std/array"
@@ -33,12 +35,15 @@ val s = suite("tlv", [
   ]),
 
   // --- Round-trips: decode(encode(x)) preserves structure ---
-  test("round-trips a single field", () =>
+  test("round-trips a single field, whole-value and per-element", () =>
     val back = decode(encode([{ "tag": 7, "bytes": [1, 2, 3, 4] }]))
     [
       expect(length(back)).toBe(1),
       expect(back[0]["tag"]).toBe(7),
-      expect(back[0]["bytes"]).toBe([1, 2, 3, 4])
+      expect(back[0]["bytes"]).toBe([1, 2, 3, 4]),
+      // decode rebuilds a genuine Int32[] value, so individual bytes read back:
+      expect(back[0]["bytes"][0]).toBe(1),
+      expect(back[0]["bytes"][3]).toBe(4)
     ]
   ),
 
@@ -47,7 +52,8 @@ val s = suite("tlv", [
     [
       expect(back[0]["bytes"]).toBe([255]),
       expect(back[1]["tag"]).toBe(2),
-      expect(back[1]["bytes"]).toBe([0, 128, 64])
+      expect(back[1]["bytes"]).toBe([0, 128, 64]),
+      expect(back[1]["bytes"][1]).toBe(128)
     ]
   ),
 
@@ -62,6 +68,28 @@ val s = suite("tlv", [
       expect(back[0]["tag"]).toBe(3),
       expect(back[0]["bytes"]).toBe([])
     ]
+  ),
+
+  // --- Churn: many fields encode/decode without flat-array corruption ---
+  test("round-trips a large multi-field message", () =>
+    val many = [
+      { "tag": 1, "bytes": [1] },
+      { "tag": 2, "bytes": [2, 2] },
+      { "tag": 3, "bytes": [3, 3, 3] },
+      { "tag": 4, "bytes": [4] },
+      { "tag": 5, "bytes": [5, 5] },
+      { "tag": 6, "bytes": [6, 6, 6] },
+      { "tag": 7, "bytes": [7] },
+      { "tag": 8, "bytes": [8, 8] },
+      { "tag": 9, "bytes": [9, 9, 9] }
+    ]
+    val back = decode(encode(many))
+    [
+      expect(length(back)).toBe(9),
+      expect(back[8]["bytes"]).toBe([9, 9, 9]),
+      expect(back[8]["bytes"][2]).toBe(9)
+    ]
   )
 ])
+
 run(s)
