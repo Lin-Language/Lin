@@ -1615,7 +1615,7 @@ fn collect_param_spans_in_expr(expr: &lin_parse::ast::Expr, out: &mut HashSet<(u
             }
             collect_param_spans_in_expr(body, out);
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             collect_param_spans(stmts, out);
             collect_param_spans_in_expr(tail, out);
         }
@@ -1695,7 +1695,7 @@ fn collect_type_spans_in_expr(expr: &lin_parse::ast::Expr, out: &mut Vec<lin_com
             }
             collect_type_spans_in_expr(body, out);
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             collect_type_spans(stmts, out);
             collect_type_spans_in_expr(tail, out);
         }
@@ -2048,7 +2048,7 @@ fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::a
             f(scrutinee);
             for arm in arms { f(&arm.body); }
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             for s in stmts {
                 match s {
                     Stmt::Val { value, .. } | Stmt::Var { value, .. } => f(value),
@@ -2060,7 +2060,7 @@ fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::a
             f(tail);
         }
         E::Function { body, .. } => f(body),
-        E::Object(fields, _) => {
+        E::Object(fields, _, _) => {
             for field in fields {
                 match field {
                     ObjectField::Pair(k, v) => { f(k); f(v); }
@@ -2068,7 +2068,7 @@ fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::a
                 }
             }
         }
-        E::Array(items, _) => { for it in items { f(it); } }
+        E::Array(items, _, _) => { for it in items { f(it); } }
         E::Assign { value, .. } => f(value),
         E::IndexAssign { object, key, value, .. } => { f(object); f(key); f(value); }
         E::Is { expr, .. } | E::Has { expr, .. } => f(expr),
@@ -2082,18 +2082,60 @@ fn walk_child_exprs(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::a
     }
 }
 
+// ── AST extent walkers (folding + selection) ─────────────────────────────────────
+
+/// Invoke `f` on `expr` and, recursively, on every sub-expression. Built on the shared
+/// `walk_child_exprs` immediate-child traversal so it stays in sync with the AST shape.
+fn walk_exprs_deep(expr: &lin_parse::ast::Expr, f: &mut dyn FnMut(&lin_parse::ast::Expr)) {
+    f(expr);
+    walk_child_exprs(expr, &mut |child| walk_exprs_deep(child, f));
+}
+
+/// Invoke `f` on the root expression(s) carried by a statement (and, transitively, all of
+/// their sub-expressions). Covers `val`/`var`/`replace` initialisers and bare expression
+/// statements; declaration-only statements (imports, type decls) carry no expressions.
+fn walk_exprs_in_stmt(stmt: &Stmt, f: &mut dyn FnMut(&lin_parse::ast::Expr)) {
+    match stmt {
+        Stmt::Val { value, .. } | Stmt::Var { value, .. } | Stmt::Replace { value, .. } => {
+            walk_exprs_deep(value, f)
+        }
+        Stmt::Expr(e) => walk_exprs_deep(e, f),
+        _ => {}
+    }
+}
+
+/// True for the compound expression kinds whose `full_span()` covers a real multi-token
+/// extent worth offering as a fold / selection region. Leaf and operator nodes (whose
+/// `full_span()` is just `span()`) are excluded so we don't emit degenerate ranges.
+fn is_extent_node(expr: &lin_parse::ast::Expr) -> bool {
+    use lin_parse::ast::Expr as E;
+    matches!(
+        expr,
+        E::Call { .. }
+            | E::DotCall { .. }
+            | E::Index { .. }
+            | E::IndexAssign { .. }
+            | E::Object(..)
+            | E::Array(..)
+            | E::Block(..)
+            | E::If { .. }
+            | E::Match { .. }
+            | E::Function { .. }
+    )
+}
+
 // ── folding ranges ─────────────────────────────────────────────────────────────
 
 /// Emit folding ranges for multi-line constructs. Two sources:
 ///   - consecutive `import` statement runs (collapse into one `Imports` region),
 ///     driven off the parsed import statements' start lines;
-///   - every balanced `{}` / `[]` / `(...)` delimiter region (function bodies,
-///     object/array literals, match arms, call arg lists) that spans more than one
-///     line, found by a brace-balance text scan.
+///   - every compound expression (function bodies, object/array literals, blocks,
+///     calls, `if`/`match`) whose AST `full_span()` covers more than one source line.
 ///
-/// The AST spans are single-token markers (the parser records only the opening
-/// delimiter's span), so the delimiter extents are recovered by text scan rather
-/// than from spans — the task explicitly allows brace/indentation-based folding.
+/// The compound-node extents come from the additive `Expr::full_span()` (opening token ..
+/// closing delimiter / last child), which is AST-precise — the opening-token `span()` stays
+/// unchanged for the formatter/coverage consumers. When the buffer fails to parse the AST is
+/// empty, so we fall back to a balanced-delimiter text scan (`delimiter_folds`).
 fn folding_ranges(source: &str, module: &lin_parse::ast::Module) -> Vec<FoldingRange> {
     let mut out = Vec::new();
 
@@ -2132,12 +2174,45 @@ fn folding_ranges(source: &str, module: &lin_parse::ast::Module) -> Vec<FoldingR
     }
     flush(&mut out, run_start_line.take(), run_end_line.take());
 
-    out.extend(delimiter_folds(source));
+    // AST-precise region folds: one per compound node whose full extent spans >1 line.
+    // De-duplicated by (start_line, end_line) so co-terminating nodes (e.g. a call whose
+    // sole argument is the object literal it wraps) don't emit overlapping duplicates.
+    let mut seen: HashSet<(u32, u32)> = HashSet::new();
+    let mut push_region = |out: &mut Vec<FoldingRange>, sp: lin_common::Span| {
+        let sl = offset_to_position(source, sp.start as usize).line;
+        let el = offset_to_position(source, sp.end as usize).line;
+        if el > sl && seen.insert((sl, el)) {
+            out.push(FoldingRange {
+                start_line: sl,
+                start_character: None,
+                end_line: el,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: None,
+            });
+        }
+    };
+    let mut had_ast = false;
+    for stmt in &module.statements {
+        walk_exprs_in_stmt(stmt, &mut |e| {
+            had_ast = true;
+            if is_extent_node(e) {
+                push_region(&mut out, e.full_span());
+            }
+        });
+    }
+
+    // Fallback: if the buffer produced no expressions (parse failure / empty module), recover
+    // region folds from a balanced-delimiter text scan so folding still works on broken input.
+    if !had_ast {
+        out.extend(delimiter_folds(source));
+    }
     out
 }
 
 /// Fold every balanced `{}` / `[]` / `(...)` region that spans more than one line.
-/// String literals are skipped so braces inside strings don't unbalance the scan.
+/// String literals are skipped so braces inside strings don't unbalance the scan. Used
+/// only as a fallback when the AST is empty (the buffer didn't parse).
 fn delimiter_folds(source: &str) -> Vec<FoldingRange> {
     let bytes = source.as_bytes();
     let mut stack: Vec<usize> = Vec::new();
@@ -2187,16 +2262,16 @@ fn delimiter_folds(source: &str) -> Vec<FoldingRange> {
 
 /// Build the smart-expand selection hierarchy at `offset`, innermost → outermost:
 ///   1. the identifier/word under the cursor (when on one);
-///   2. each enclosing balanced `{}` / `[]` / `(...)` delimiter region (inner content
-///      first, then the region including its delimiters);
+///   2. each enclosing AST expression, by its `full_span()` (innermost first) — so a
+///      cursor in `add(1, 2)` expands to the argument, then the whole call, etc.;
 ///   3. the cursor's source line;
 ///   4. the whole document.
 ///
-/// The parser records only single-token spans for compound expressions (no full
-/// extents), so the expansion is built from balanced-delimiter nesting + the word at
-/// the cursor rather than from AST spans. `module` is currently unused but kept on the
-/// signature so a future AST-span-precise version is a drop-in.
-fn selection_range_at(source: &str, _module: &lin_parse::ast::Module, offset: usize) -> SelectionRange {
+/// The expression extents come from the additive `Expr::full_span()` (opening token ..
+/// closing delimiter / last child), making the expansion AST-precise. When the buffer
+/// fails to parse, the AST is empty, so we fall back to balanced-delimiter nesting
+/// (`enclosing_bracket_pairs`).
+fn selection_range_at(source: &str, module: &lin_parse::ast::Module, offset: usize) -> SelectionRange {
     let offset = offset.min(source.len());
     // Ordered innermost → outermost list of (start, end) byte ranges.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
@@ -2218,14 +2293,38 @@ fn selection_range_at(source: &str, _module: &lin_parse::ast::Module, offset: us
         ranges.push((start, end));
     }
 
-    // 2. Enclosing balanced delimiter regions (inner content + with-delimiters).
-    for (open, close) in enclosing_bracket_pairs(source, offset) {
-        // Inner content (between the delimiters).
-        if close > open + 1 {
-            ranges.push((open + 1, close));
+    // 2. Enclosing AST expression extents (full_span), from the AST. Every expression whose
+    //    full extent contains the cursor is a candidate; sorting by width yields the
+    //    innermost-first nesting. Falls back to balanced-delimiter pairs when the AST is empty
+    //    (parse failure) so selection still works on broken input.
+    let mut ast_spans: Vec<(usize, usize)> = Vec::new();
+    for stmt in &module.statements {
+        // Statement-level extent (e.g. a whole `val x = ...`) so expansion reaches the stmt.
+        let ss = stmt.span();
+        if (ss.start as usize) <= offset && offset <= (ss.end as usize) {
+            ast_spans.push((ss.start as usize, ss.end as usize));
         }
-        // The region including its delimiters.
-        ranges.push((open, close + 1));
+        walk_exprs_in_stmt(stmt, &mut |e| {
+            let fs = e.full_span();
+            let (s, en) = (fs.start as usize, fs.end as usize);
+            if s <= offset && offset <= en {
+                ast_spans.push((s, en));
+            }
+        });
+    }
+    if !ast_spans.is_empty() {
+        // Innermost (narrowest) first.
+        ast_spans.sort_by_key(|(s, e)| e - s);
+        ranges.extend(ast_spans);
+    } else {
+        for (open, close) in enclosing_bracket_pairs(source, offset) {
+            // Inner content (between the delimiters).
+            if close > open + 1 {
+                ranges.push((open + 1, close));
+            }
+            // The region including its delimiters.
+            ranges.push((open, close + 1));
+        }
     }
 
     // 3. The cursor's line.
@@ -2528,7 +2627,7 @@ fn find_enclosing_call_in_expr(
                 }
             }
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             if let Some(r) = find_enclosing_call(stmts, source, offset) {
                 *best = Some(r);
             }
@@ -2778,7 +2877,7 @@ fn collect_unannotated_bindings_in_expr(
 ) {
     use lin_parse::ast::Expr as E;
     match expr {
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             collect_unannotated_bindings(stmts, ty_by_stmt, out);
             collect_unannotated_bindings_in_expr(tail, ty_by_stmt, out);
         }
@@ -4319,8 +4418,9 @@ mod tests {
 
     // ── folding ranges ──────────────────────────────────────────────────────────
 
-    /// Folding ranges cover multi-line function bodies / array literals and a run of
-    /// consecutive imports; single-line constructs produce no fold.
+    /// Folding ranges are AST-precise: an import-run region for the consecutive imports,
+    /// plus one `Region` per multi-line compound node (the function body and the array
+    /// literal), each spanning its full source extent (opening token .. closing delimiter).
     #[test]
     fn folding_range_covers_multiline_blocks_and_imports() {
         let src = "import { a } from \"std/io\"\n\
@@ -4335,43 +4435,78 @@ mod tests {
                    ]\n";
         let module = parse(src);
         let folds = folding_ranges(src, &module);
-        // An import-run fold spanning the two import lines (0..1).
+        // Import-run fold over the two import lines (0..1).
         assert!(
-            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Imports) && f.start_line == 0 && f.end_line >= 1),
-            "expected an import-run fold, got {:?}",
+            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Imports)
+                && f.start_line == 0
+                && f.end_line == 1),
+            "expected an import-run fold 0..1, got {:?}",
             folds
         );
-        // At least one region fold (function body and/or array literal) spanning >1 line.
+        // The function literal's full extent: `(x: Int32) => {` (line 2) .. closing `}` (line 5).
         assert!(
-            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Region) && f.end_line > f.start_line),
-            "expected a multi-line region fold, got {:?}",
+            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Region)
+                && f.start_line == 2
+                && f.end_line == 5),
+            "expected a function-body region fold 2..5, got {:?}",
+            folds
+        );
+        // The array literal's full extent: opening `[` (line 6) .. closing `]` (line 9).
+        assert!(
+            folds.iter().any(|f| f.kind == Some(FoldingRangeKind::Region)
+                && f.start_line == 6
+                && f.end_line == 9),
+            "expected an array-literal region fold 6..9, got {:?}",
             folds
         );
     }
 
     // ── selection ranges ─────────────────────────────────────────────────────────
 
-    /// Smart-expand: the cursor on an inner identifier yields a nested chain whose
-    /// innermost range is contained in each successive parent.
+    /// Smart-expand is AST-precise: a cursor on the inner `1` literal expands through the
+    /// enclosing call's full extent (`add(1, 2)`), then the whole `val` statement, then the
+    /// document — each range strictly containing the previous, driven by `Expr::full_span()`.
     #[test]
     fn selection_range_nests_innermost_to_outermost() {
         let src = "val r = add(1, 2)\n";
         let analysis = analyse(src, None);
         let off = src.find('1').unwrap();
         let sel = selection_range_at(src, &analysis.module, off);
-        // Walk the parent chain; each parent range must contain its child range.
+
+        // Collect the innermost→outermost chain as the source text each range covers.
+        let mut texts = Vec::new();
         let mut node = &sel;
-        let mut depth = 0;
+        loop {
+            let s = position_to_offset(src, node.range.start);
+            let e = position_to_offset(src, node.range.end);
+            texts.push(src[s..e].to_string());
+            match &node.parent {
+                Some(p) => node = p,
+                None => break,
+            }
+        }
+        // AST-precise expansion: the `1` literal, the enclosing call's full extent, the whole
+        // statement, then the document.
+        assert_eq!(
+            texts,
+            vec![
+                "1".to_string(),
+                "add(1, 2)".to_string(),
+                "val r = add(1, 2)".to_string(),
+                "val r = add(1, 2)\n".to_string(),
+            ],
+            "AST-precise selection chain"
+        );
+
+        // Each parent must still strictly contain its child.
+        let mut node = &sel;
         while let Some(parent) = &node.parent {
             assert!(
                 parent.range.start <= node.range.start && node.range.end <= parent.range.end,
-                "child range escapes parent at depth {}",
-                depth
+                "child range escapes parent"
             );
             node = parent;
-            depth += 1;
         }
-        assert!(depth >= 1, "expected at least one expansion level");
     }
 
     // ── document links (import paths) ─────────────────────────────────────────────
