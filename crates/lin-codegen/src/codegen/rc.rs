@@ -45,6 +45,60 @@ impl<'ctx> Codegen<'ctx> {
         self.builder.position_at_end(cont_bb);
     }
 
+    /// Release a SINGLE TCO param slot's value on the loop-EXIT (return) path, guarded by:
+    /// (1) `owns_flag` — true only after a tail back-edge has stored into this slot at least once;
+    /// (2) `entry_ptr` — the ORIGINAL caller-passed param value (the borrowed entry). The slot must
+    /// differ from it: the caller owns and frees the entry value, so releasing it here is a
+    /// use-after-free at the caller. CRITICAL: a param threaded UNCHANGED through the loop (e.g. the
+    /// `arr` in `scan(arr, j+1, n, nx)`) is re-stored on every back-edge — which sets `owns_flag`
+    /// true — yet the slot still holds the borrowed entry value at exit. The owns-flag alone is
+    /// therefore NOT sufficient; the entry-aliasing guard is what keeps a pass-through borrowed
+    /// param from being double-freed (the bug a naive owns-flag-only release would cause).
+    /// (3) when `ret_ptr` is a pointer, an alias check — the slot value must differ from the
+    /// returned value (a `scan` that returns its own `cur` param directly aliases the slot; the
+    /// caller takes ownership of the returned value, so releasing the slot too would double-free).
+    ///
+    /// This is the loop-exit counterpart to [`emit_tco_release_old`]. The back-edge release frees
+    /// INTERMEDIATE loop-produced values on each overwrite; this frees the FINAL slot value when the
+    /// loop returns. They are disjoint — a loop-produced value is either overwritten on a back-edge
+    /// OR is the final value at return, never both — so no double-free.
+    pub(crate) fn emit_tco_release_final(
+        &mut self,
+        llvm_fn: FunctionValue<'ctx>,
+        owns_flag: PointerValue<'ctx>,
+        slot_val: PointerValue<'ctx>,
+        entry_ptr: Option<PointerValue<'ctx>>,
+        ret_ptr: Option<PointerValue<'ctx>>,
+        ty: &Type,
+    ) {
+        let i64_ty = self.context.i64_type();
+        let bool_ty = self.context.bool_type();
+        // owned = a prior tail iteration stored into this slot.
+        let owned = self.builder.load(bool_ty, owns_flag, "tco_fowned").into_int_value();
+        let mut cond = owned;
+        let slot_int = self.builder.ptr_to_int(slot_val, i64_ty, "tco_fslot_i");
+        if let Some(ep) = entry_ptr {
+            // Don't release the borrowed entry value (the caller owns it) — a pass-through param
+            // ends the loop still holding it.
+            let ent_int = self.builder.ptr_to_int(ep, i64_ty, "tco_fent_i");
+            let ne = self.builder.int_compare(IntPredicate::NE, slot_int, ent_int, "tco_fentne");
+            cond = self.builder.and(cond, ne, "tco_fentdiff");
+        }
+        if let Some(rp) = ret_ptr {
+            // Don't release the slot if it IS the returned value — ownership transfers to caller.
+            let ret_int = self.builder.ptr_to_int(rp, i64_ty, "tco_fret_i");
+            let ne = self.builder.int_compare(IntPredicate::NE, slot_int, ret_int, "tco_fne");
+            cond = self.builder.and(cond, ne, "tco_fdiff");
+        }
+        let rel_bb = self.context.append_basic_block(llvm_fn, "tco_frel");
+        let cont_bb = self.context.append_basic_block(llvm_fn, "tco_frelcont");
+        self.builder.conditional_branch(cond, rel_bb, cont_bb);
+        self.builder.position_at_end(rel_bb);
+        self.emit_release(slot_val.into(), ty);
+        self.builder.unconditional_branch(cont_bb);
+        self.builder.position_at_end(cont_bb);
+    }
+
     /// Emit a release dispatched on the value's PHYSICAL representation (`func.repr`). PART C
     /// (single-owner): when the pass proved a temp `Packed`, the release SHAPE is chosen from that
     /// fact, not re-derived from the static `Type`. A `Packed` temp is constructed packed, so today's
