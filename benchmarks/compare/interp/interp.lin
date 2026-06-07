@@ -11,6 +11,13 @@
 //   term   = factor (('*' | '/') factor)*
 //   factor = number | '(' expr ')'
 //
+// The AST is an UNBOXED recursive tagged sum type (`Ast = Num | BinOp`): each
+// node is a packed heap SumNode whose recursive children are owned *SumNode
+// pointer slots, dispatch is an O(1) inline-tag switch, and a child read is a
+// constant-offset pointer load — no boxed LinObject / lin_object_get. The
+// operator is a small scalar Int32 code (0=+ 1=- 2=* 3=/), not a String, so the
+// node stays sum-eligible (every non-discriminant field is scalar or recursive).
+//
 // Every expression here evaluates successfully (no div-by-zero), so the result
 // is deterministic. RESULT = sum of all evaluated values across all REPS.
 // Prints exactly one stdout line "RESULT=<int>".
@@ -24,6 +31,14 @@ import { push, length } from "std/array"
 import { for, range } from "std/iter"
 
 type Token = { "kind": String, "text": String }
+
+// ---- AST (unboxed recursive sum type) -------------------------------------
+type Num = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "binop", "op": Int32, "left": Ast, "right": Ast }
+type Ast = Num | BinOp
+
+// The parser cursor: a parsed AST node plus the next token position.
+type Cursor = { "node": Ast, "pos": Int32 }
 
 // ---- Lexer ----------------------------------------------------------------
 val isDigit = (c: Int32): Boolean => c >= 48 && c <= 57
@@ -59,25 +74,34 @@ val scan = (src: String, i: Int32, n: Int32, tokens: Token[]): Token[] =>
 val tokenize = (src: String): Token[] =>
   src.scan(0, length(src), [])
 
-// ---- Parser (returns a cursor { node, pos } as dynamic Json) ---------------
+// ---- Parser (returns a typed cursor { node, pos }) -------------------------
+// Operator chars are mapped to small scalar Int32 codes: 0=+ 1=- 2=* 3=/.
+val opCode = (op: String): Int32 =>
+  if op == "+" then
+    0
+  else if op == "-" then
+    1
+  else if op == "*" then
+    2
+  else
+    3
+
 val kindAt = (tokens: Token[], pos: Int32): String =>
   if pos >= length(tokens) then
     "eof"
   else
     tokens[pos]["kind"]
 
-val parseFactor = (tokens: Token[], pos: Int32): Json =>
+val parseFactor = (tokens: Token[], pos: Int32): Cursor =>
   val k = kindAt(tokens, pos)
   if k == "num" then
-    {
-      "node": { "kind": "num", "value": tokens[pos]["text"].parseInt32() },
-      "pos": pos + 1
-    }
+    val node: Ast = { "kind": "num", "value": tokens[pos]["text"].parseInt32() }
+    { "node": node, "pos": pos + 1 }
   else
     val inner = parseExpr(tokens, pos + 1)
     { "node": inner["node"], "pos": inner["pos"] + 1 }
 
-val parseTermLoop = (tokens: Token[], left: Json, pos: Int32): Json =>
+val parseTermLoop = (tokens: Token[], left: Ast, pos: Int32): Cursor =>
   val k = kindAt(tokens, pos)
   if k != "op" then
     { "node": left, "pos": pos }
@@ -87,19 +111,19 @@ val parseTermLoop = (tokens: Token[], left: Json, pos: Int32): Json =>
       { "node": left, "pos": pos }
     else
       val right = parseFactor(tokens, pos + 1)
-      val node = {
+      val node: Ast = {
         "kind": "binop",
-        "op": op,
+        "op": opCode(op),
         "left": left,
         "right": right["node"]
       }
       parseTermLoop(tokens, node, right["pos"])
 
-val parseTerm = (tokens: Token[], pos: Int32): Json =>
+val parseTerm = (tokens: Token[], pos: Int32): Cursor =>
   val first = parseFactor(tokens, pos)
   parseTermLoop(tokens, first["node"], first["pos"])
 
-val parseExprLoop = (tokens: Token[], left: Json, pos: Int32): Json =>
+val parseExprLoop = (tokens: Token[], left: Ast, pos: Int32): Cursor =>
   val k = kindAt(tokens, pos)
   if k != "op" then
     { "node": left, "pos": pos }
@@ -109,34 +133,33 @@ val parseExprLoop = (tokens: Token[], left: Json, pos: Int32): Json =>
       { "node": left, "pos": pos }
     else
       val right = parseTerm(tokens, pos + 1)
-      val node = {
+      val node: Ast = {
         "kind": "binop",
-        "op": op,
+        "op": opCode(op),
         "left": left,
         "right": right["node"]
       }
       parseExprLoop(tokens, node, right["pos"])
 
-val parseExpr = (tokens: Token[], pos: Int32): Json =>
+val parseExpr = (tokens: Token[], pos: Int32): Cursor =>
   val first = parseTerm(tokens, pos)
   parseExprLoop(tokens, first["node"], first["pos"])
 
 // ---- Evaluator -------------------------------------------------------------
-val evalNode = (node: Json): Int32 =>
-  if node["kind"] == "num" then
-    node["value"]
-  else
-    val a = evalNode(node["left"])
-    val b = evalNode(node["right"])
-    val op = node["op"]
-    if op == "+" then
-      a + b
-    else if op == "-" then
-      a - b
-    else if op == "*" then
-      a * b
-    else
-      a / b
+val evalNode = (node: Ast): Int32 =>
+  match node
+    is Num => node["value"]
+    is BinOp =>
+      val a = evalNode(node["left"])
+      val b = evalNode(node["right"])
+      if node["op"] == 0 then
+        a + b
+      else if node["op"] == 1 then
+        a - b
+      else if node["op"] == 2 then
+        a * b
+      else
+        a / b
 
 val eval1 = (src: String): Int32 =>
   val parsed = parseExpr(tokenize(src), 0)
