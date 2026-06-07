@@ -1,5 +1,5 @@
 import { suite, test, expect, run, toBe } from "std/test"
-import { parseNals } from "./nal"
+import { parseNals, nalType, startCodeAt } from "./nal"
 import { length } from "std/array"
 
 // Ports the single-buffer tests from server/src/nal.rs. The stateful cross-call
@@ -19,6 +19,50 @@ import { length } from "std/array"
 // in lin_array_release) — see the report. Driving start-code detection through
 // parseNals exercises the same logic and is memory-clean under ASan.
 val s = suite("raspberry-nal", [
+  // nalType: the low 5 bits of a header byte. 0x67 (SPS) -> 7, 0x68 (PPS) -> 8,
+  // 0x65 (IDR) -> 5; the top 3 bits (nal_ref_idc) are masked off. This is the
+  // same field parseNals stores per unit and rtp.lin reads when fragmenting.
+  test("nalType extracts the low 5 bits of a header byte", () => [
+    expect(nalType(0x67)).toBe(7),
+    expect(nalType(0x68)).toBe(8),
+    expect(nalType(0x65)).toBe(5),
+    expect(nalType(0x1F)).toBe(31),
+    expect(nalType(0x41)).toBe(1)
+  ]),
+
+  // startCodeAt directly: 4-byte (00 00 00 01) -> 4, 3-byte (00 00 01) -> 3, and
+  // every non-start-code shape -> 0. Exercises the nested length/byte guards
+  // (the deepest branches in nal.lin) without going through parseNals.
+  test("startCodeAt detects 4- and 3-byte start codes", () =>
+    val sc4: UInt8[] = [
+      0,
+      0,
+      0,
+      1,
+      0x67
+    ]
+    val sc3: UInt8[] = [0, 0, 1, 0x67]
+    [
+      expect(startCodeAt(sc4, 0)).toBe(4),
+      expect(startCodeAt(sc3, 0)).toBe(3)
+    ]
+  ),
+
+  test("startCodeAt returns 0 for non-start-code and truncated inputs", () =>
+    val notZero: UInt8[] = [0x41, 0, 0, 1]
+    val zeroNotZero: UInt8[] = [0, 0x41, 0, 1]
+    val zerosThenJunk: UInt8[] = [0, 0, 0x41, 0x42]
+    val short: UInt8[] = [0, 0]
+    val threeZerosNoOne: UInt8[] = [0, 0, 0, 0x42]
+    [
+      expect(startCodeAt(notZero, 0)).toBe(0), // first byte != 0
+      expect(startCodeAt(zeroNotZero, 0)).toBe(0), // second byte != 0
+      expect(startCodeAt(zerosThenJunk, 0)).toBe(0), // third byte neither 0 nor 1
+      expect(startCodeAt(short, 0)).toBe(0), // fewer than 3 bytes left
+      expect(startCodeAt(threeZerosNoOne, 0)).toBe(0) // 00 00 00 not followed by 01
+    ]
+  ),
+
   // single_nal_unit: SC4 67 AA BB SC4 68  -> one NAL (type 7, data 67 AA BB),
   // trailing 68 not flushed (matches Rust).
   test("single_nal_unit: one complete NAL, trailing NAL not flushed", () =>

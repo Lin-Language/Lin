@@ -1,6 +1,33 @@
 import { expect, toBe, test, suite, run } from "std/test"
+import { contains } from "std/string"
 import { HttpRequest as Request } from "std/http"
-import { router } from "./router"
+import { render, renderWith } from "std/template"
+import { solve } from "./routing"
+import { route, makeRouter } from "./router"
+import { Config } from "./config"
+
+// Router dispatch tests. `render` is mocked (ADR-046) so the / route is tested
+// without the on-disk view path; `solve` is mocked so the /route endpoint's
+// success and no-path branches are exercised deterministically without disk.
+replace render = (path: String, data: {  }): Json =>
+  renderWith("<!DOCTYPE html><title>{{ title }}</title>", data)
+
+replace solve = (graphPath: String, from: String, to: String): Json =>
+  if to == "Z" then
+    { "type": "no-path" }
+  else
+    {
+      "type": "ok",
+      "path": [from, to],
+      "distance": 42
+    }
+
+val config: Config = {
+  "host": "0.0.0.0",
+  "port": 3000,
+  "debug": false,
+  "name": "Lin Maps"
+}
 
 val makeReq = (path: String): Request =>
   {
@@ -12,24 +39,57 @@ val makeReq = (path: String): Request =>
   }
 
 val s = suite("router", [
-  test("routes /api/status to 200", () =>
-    val resp = router(makeReq("/api/status"))
+  test("routes / to the index page", () =>
+    val resp = route(makeReq("/"), config)
     [
       expect(resp["status"]).toBe(200)
+    ]
+  ),
+
+  test("routes /api/status to 200", () =>
+    val resp = route(makeReq("/api/status"), config)
+    [
+      expect(resp["status"]).toBe(200)
+    ]
+  ),
+
+  test("routes /route/:from/:to to a 200 with the resolved route", () =>
+    val resp = route(makeReq("/route/A/E"), config)
+    [
+      expect(resp["status"]).toBe(200),
+      expect(contains(resp["body"], "\"distance\": 42")).toBe(true)
+    ]
+  ),
+
+  test("routes an unreachable /route to a 404 no-route", () =>
+    val resp = route(makeReq("/route/A/Z"), config)
+    [
+      expect(resp["status"]).toBe(404),
+      expect(contains(resp["body"], "no route")).toBe(true)
     ]
   ),
 
   test("routes /users/:id to 200", () =>
-    val resp = router(makeReq("/users/5"))
+    val resp = route(makeReq("/users/5"), config)
     [
       expect(resp["status"]).toBe(200)
     ]
   ),
 
-  test("unknown path returns 404", () =>
-    val resp = router(makeReq("/unknown/path"))
+  test("an unknown path returns 404", () =>
+    val resp = route(makeReq("/unknown/path"), config)
     [
       expect(resp["status"]).toBe(404)
+    ]
+  ),
+
+  test("makeRouter closes over the config and returns a working handler", () =>
+    // The handler `serve` is given: it captures `config` and dispatches by path.
+    val handler = makeRouter(config)
+    val resp = handler(makeReq("/api/status"))
+    [
+      expect(resp["status"]).toBe(200),
+      expect(contains(resp["body"], "Lin Maps")).toBe(true)
     ]
   )
 ])

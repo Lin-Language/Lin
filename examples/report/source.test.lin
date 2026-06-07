@@ -2,12 +2,18 @@
 // the streaming gunzip + untar path. Verifies the archive is listed, every member's
 // rows are pulled (blank lines dropped), and the rows feed render end to end.
 import { expect, toBe, test, suite, run } from "std/test"
-import { rowsFromArchive, archiveMembers } from "./source"
+import { rowsFromArchive, archiveMembers, rowsFromFile, normalizeCsv, cleanedPath } from "./source"
 import { render, validRecords } from "./report"
 import { length } from "std/array"
 import { contains, join } from "std/string"
+import { writeFile } from "std/fs"
 
 val archive = "examples/report/report-data.tar.gz"
+
+// A plain-CSV fixture written under /tmp for the streaming line-source tests. Includes
+// a blank line and surrounding whitespace, which the stream pipeline must drop/trim.
+val plainIn = "/tmp/lin_report_source_test.csv"
+writeFile(plainIn, "Alice, 85\n\n  Bob, 92 \nbad-row\n")
 
 val s = suite("report-source", [
   // --- manifest: lists both CSV members without extracting them ---
@@ -46,6 +52,40 @@ val s = suite("report-source", [
     [
       expect(length(rowsFromArchive("examples/report/does-not-exist.tar.gz"))).toBe(0)
     ]
-  )
+  ),
+
+  // --- plain-CSV line Stream: blanks dropped, rows trimmed ---
+  test("streams trimmed non-blank rows from a plain CSV file", () =>
+    val rows = rowsFromFile(plainIn)
+    [
+      expect(length(rows)).toBe(3),
+      expect(rows.join("|")).toBe("Alice, 85|Bob, 92|bad-row")
+    ]
+  ),
+
+  test("a missing plain CSV file yields no rows", () => [
+    expect(length(rowsFromFile("/tmp/lin_report_does_not_exist.csv"))).toBe(0)
+  ]),
+
+  // --- cleanedPath derives a sibling "<stem>.clean.csv" via std/path ---
+  test("derives the cleaned output path beside the input", () => [
+    expect(cleanedPath("/tmp/data/scores.csv")).toBe("/tmp/data/scores.clean.csv")
+  ]),
+
+  // --- normalizeCsv: lazy file-to-file copy; reread renders end to end ---
+  test("normalises a CSV file and the cleaned copy renders", () =>
+    val out = normalizeCsv(plainIn)
+    [
+      expect(out).toBe("/tmp/lin_report_source_test.clean.csv"),
+      // The cleaned file has the blank line stripped; rendering its 3 rows yields
+      // 2 valid records (Alice, Bob) and 1 skipped (bad-row).
+      expect(length(validRecords(rowsFromFile(out)))).toBe(2),
+      expect(render(rowsFromFile(out)).contains("skipped 1 bad row(s)")).toBe(true)
+    ]
+  ),
+
+  test("normalising a missing file degrades to an empty path", () => [
+    expect(normalizeCsv("/tmp/lin_report_missing_input.csv")).toBe("")
+  ])
 ])
 run(s)

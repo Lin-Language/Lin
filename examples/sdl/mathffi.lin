@@ -1,0 +1,43 @@
+// mathffi — calling a small hand-written C library (clib/mathlib.c, committed as
+// clib/libmathlib.a) from Lin via `import foreign`. This is the SECOND FFI mode the project
+// demonstrates: a static archive YOU compiled from C source, alongside the vendored real
+// libSDL3.so the demos link. The C ABI mapping is int32_t <-> Int32, double <-> Float64.
+//
+// These thin wrappers give the C functions clean Lin names and types. NOTE on the file-local
+// linkage rule (see README): `import foreign` links the archive only for the file that declares
+// the block, so a file that IMPORTS these wrappers must ALSO declare its own
+// `import foreign "examples/sdl/clib/libmathlib.a"` block — otherwise the C symbols are undefined
+// at link time. bounce.lin, ai_worker.lin and mathffi.test.lin each do exactly that. The wrappers
+// here keep the call sites honest (typed, named) while the foreign block does the linking.
+//
+// Rebuild the archive after editing mathlib.c:
+//   cc -c examples/sdl/clib/mathlib.c -o examples/sdl/clib/mathlib.o
+//   ar rcs examples/sdl/clib/libmathlib.a examples/sdl/clib/mathlib.o && rm examples/sdl/clib/mathlib.o
+import foreign "examples/sdl/clib/libmathlib.a"
+  val add: (Int32, Int32) => Int32
+  val square: (Float64) => Float64
+  val clampf: (Float64, Float64, Float64) => Float64
+  val magnitude2: (Float64, Float64) => Float64
+  val gcd: (Int32, Int32) => Int32
+
+// Euclidean distance from the origin to (x, y) — computed in C (mathlib's `magnitude2`, which calls
+// libm `sqrt`). The demos use this to measure how far the ball / agent is from a target.
+export val cMagnitude = (x: Float64, y: Float64): Float64 =>
+  magnitude2(x, y)
+
+// Distance between two points, via the C magnitude of their difference.
+export val cDistance = (ax: Float64, ay: Float64, bx: Float64, by: Float64): Float64 =>
+  magnitude2(bx - ax, by - ay)
+
+// Clamp x into [lo, hi] in C.
+export val cClamp = (x: Float64, lo: Float64, hi: Float64): Float64 =>
+  clampf(x, lo, hi)
+
+export val cSquare = (x: Float64): Float64 =>
+  square(x)
+
+export val cAdd = (a: Int32, b: Int32): Int32 =>
+  add(a, b)
+
+export val cGcd = (a: Int32, b: Int32): Int32 =>
+  gcd(a, b)

@@ -1,0 +1,61 @@
+// End-to-end FFI test against the committed C static archive (clib/libmathlib.a). It asserts each
+// wrapper's result AND each raw foreign function's result. Because `import foreign` is file-local,
+// this test declares its OWN foreign block (it cannot link via the one in mathffi.lin) — that
+// linkage also resolves the C symbols used inside the imported wrappers.
+import { expect, toBe, test, suite, run } from "std/test"
+import { cMagnitude, cDistance, cClamp, cSquare, cAdd, cGcd } from "./mathffi"
+
+import foreign "examples/sdl/clib/libmathlib.a"
+  val add: (Int32, Int32) => Int32
+  val square: (Float64) => Float64
+  val clampf: (Float64, Float64, Float64) => Float64
+  val magnitude2: (Float64, Float64) => Float64
+  val gcd: (Int32, Int32) => Int32
+
+val s = suite("mathffi", [
+  // Raw foreign calls — the C ABI round-trips (int32_t <-> Int32, double <-> Float64).
+  test("add: integer C ABI", () => [
+    expect(add(3, 4)).toBe(7),
+    expect(add(0 - 5, 5)).toBe(0)
+  ]),
+
+  test("square: double C ABI", () => [
+    expect(square(2.5)).toBe(6.25)
+  ]),
+
+  test("clampf: 3-arg double", () => [
+    expect(clampf(1.5, 0.0, 1.0)).toBe(1.0),
+    expect(clampf(0.0 - 0.5, 0.0, 1.0)).toBe(0.0),
+    expect(clampf(0.3, 0.0, 1.0)).toBe(0.3)
+  ]),
+
+  test("magnitude2: links libm (sqrt)", () => [
+    expect(magnitude2(3.0, 4.0)).toBe(5.0)
+  ]),
+
+  test("gcd: Euclid over the integer ABI", () => [
+    expect(gcd(48, 36)).toBe(12),
+    expect(gcd(17, 5)).toBe(1)
+  ]),
+
+  // The mathffi wrappers exercised through their clean Lin names.
+  test("cAdd / cGcd wrappers", () => [
+    expect(cAdd(3, 4)).toBe(7),
+    expect(cGcd(48, 36)).toBe(12)
+  ]),
+
+  test("cSquare / cClamp wrappers", () => [
+    expect(cSquare(2.5)).toBe(6.25),
+    expect(cClamp(1.5, 0.0, 1.0)).toBe(1.0)
+  ]),
+
+  test("cMagnitude is the distance from the origin", () => [
+    expect(cMagnitude(3.0, 4.0)).toBe(5.0)
+  ]),
+
+  test("cDistance measures between two points", () => [
+    expect(cDistance(0.0, 0.0, 3.0, 4.0)).toBe(5.0),
+    expect(cDistance(1.0, 1.0, 4.0, 5.0)).toBe(5.0)
+  ])
+])
+run(s)

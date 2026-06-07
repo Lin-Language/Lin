@@ -1,0 +1,145 @@
+// Telemetry frame — the Pi's status report back to the client.
+//
+// While the control packet (protocol.lin) flows client -> Pi as a fixed 8-byte
+// layout, the Pi reports its state back as a self-describing TLV frame
+// (tlv.lin): a set of named sensor readings followed by a one-byte XOR checksum
+// trailer that guards the frame over a lossy WiFi link. TLV lets the field set
+// grow without a wire-format bump, and lets the decoder reject a corrupt frame
+// (`Telemetry | Error`) instead of misreading it.
+//
+// Frame = encode([ battery, motors, temp, status ]) ++ [checksum].
+//
+//   tag 1  battery   : 1 byte   (0..100 %)
+//   tag 2  motors    : 4 bytes  (left duty hi/lo, right duty hi/lo — big-endian
+//                                UInt16 each, the PWM duty motor.lin produces)
+//   tag 3  tempC     : 1 byte   (Int8, signed °C, two's complement)
+//   tag 4  status    : 1 byte   (two packed 4-bit nibbles: health | link)
+//
+// Readings are integers (duty is the same Int32 microsecond value motor.lin's
+// MotorCommand carries), so the whole frame is byte-exact and integer-only —
+// the natural shape for a small embedded status report.
+//
+// `health` and `link` are 0..15 quality codes packed into one status byte with
+// nibble packing — a compact way to carry two small enums in a single TLV value.
+import { push, length, slice } from "std/array"
+import { concat } from "std/iter"
+import { encode, decode, Field } from "./tlv"
+
+// A telemetry snapshot. `leftDuty`/`rightDuty` are the PWM duty cycles
+// (0..PWM_PERIOD) that motor.lin's MotorCommand reports — the server's view of
+// how hard each motor is currently driven.
+export type Telemetry = { "battery": Int32, "leftDuty": Int32, "rightDuty": Int32, "tempC": Int32, "health": Int32, "link": Int32 }
+
+val TAG_BATTERY = 1
+val TAG_MOTORS = 2
+val TAG_TEMP = 3
+val TAG_STATUS = 4
+
+// --- Bit helpers (used by the status byte, the duty fields, and the checksum) ---
+// Pack two 4-bit nibbles into one byte: high in bits 7..4, low in bits 3..0.
+export val packNibbles = (high: Int32, low: Int32): Int32 =>
+  (high << 4) | (low & 0x0F)
+
+// The high nibble of a byte (bits 7..4).
+export val highNibble = (b: Int32): Int32 =>
+  b >> 4
+
+// The low nibble of a byte (bits 3..0).
+export val lowNibble = (b: Int32): Int32 =>
+  b & 0x0F
+
+// A one-byte XOR checksum over a byte list — the frame trailer. Both operands
+// are UInt8, so the running XOR stays a single byte (no wider widening).
+val checksumFrom = (bytes: UInt8[], i: Int32, acc: UInt8): UInt8 =>
+  if i >= length(bytes) then
+    acc
+  else
+    checksumFrom(bytes, i + 1, acc ^ bytes[i])
+
+export val checksum = (bytes: UInt8[]): UInt8 =>
+  checksumFrom(bytes, 0, 0)
+
+// --- Frame construction ---
+// The two motor duties packed as a big-endian UInt16 pair (4 bytes total),
+// matching the byte order the wire helpers use elsewhere.
+val motorBytes = (leftDuty: Int32, rightDuty: Int32): Int32[] =>
+  [
+    (leftDuty >> 8) & 0xFF,
+    leftDuty & 0xFF,
+    (rightDuty >> 8) & 0xFF,
+    rightDuty & 0xFF
+  ]
+
+// Serialize a snapshot into a TLV frame plus its checksum trailer byte.
+export val encodeTelemetry = (t: Telemetry): UInt8[] =>
+  val status = packNibbles(t["health"], t["link"])
+  val fields: Field[] = [
+    { "tag": TAG_BATTERY, "bytes": [t["battery"]] },
+    { "tag": TAG_MOTORS, "bytes": motorBytes(t["leftDuty"], t["rightDuty"]) },
+    { "tag": TAG_TEMP, "bytes": [t["tempC"]] },
+    { "tag": TAG_STATUS, "bytes": [status] }
+  ]
+  val body = encode(fields)
+  body.concat([checksum(body)])
+
+// --- Frame parsing ---
+// Look up a decoded field's value bytes by tag (Null if the field is absent).
+val fieldFor = (fields: Field[], tag: Int32, i: Int32): Int32[] | Null =>
+  if i >= length(fields) then
+    null
+  else if fields[i]["tag"] == tag then
+    fields[i]["bytes"]
+  else
+    fieldFor(fields, tag, i + 1)
+
+// Read a single-byte field's value (0 if the field is missing).
+val byteField = (fields: Field[], tag: Int32): Int32 =>
+  val bytes = fieldFor(fields, tag, 0)
+  match bytes
+    is Null => 0
+    else => bytes[0]
+
+// Read a single-byte field as a signed Int8 (two's complement: 128..255 ->
+// -128..-1), so a sub-zero temperature round-trips through the unsigned wire byte.
+val signedByteField = (fields: Field[], tag: Int32): Int32 =>
+  val raw = byteField(fields, tag)
+  if raw >= 128 then raw - 256 else raw
+
+// Reassemble a big-endian UInt16 from two value bytes at [off, off+1].
+val u16At = (bytes: Int32[], off: Int32): Int32 =>
+  (bytes[off] << 8) | bytes[off + 1]
+
+// Decode the [leftDuty, rightDuty] pair from tag-2's 4 value bytes.
+val motorsField = (fields: Field[]): Int32[] =>
+  val bytes = fieldFor(fields, TAG_MOTORS, 0)
+  match bytes
+    is Null => [0, 0]
+    else =>
+      [
+        u16At(bytes, 0),
+        u16At(bytes, 2)
+      ]
+
+// Parse a frame back into a Telemetry snapshot, verifying the checksum trailer.
+// A frame whose trailing byte does not match the body's XOR checksum is rejected
+// as an Error rather than silently misread.
+export val decodeTelemetry = (frame: UInt8[]): Telemetry | Error =>
+  if length(frame) == 0 then
+    { "type": "error", "message": "empty telemetry frame" }
+  else
+    val body: UInt8[] = frame.slice(0, length(frame) - 1)
+    val trailer = frame[length(frame) - 1]
+    if checksum(body) != trailer then
+      { "type": "error", "message": "telemetry checksum mismatch" }
+    else
+      val fields = decode(body)
+      val status = byteField(fields, TAG_STATUS)
+      val motors = motorsField(fields)
+      {
+        "battery": byteField(fields, TAG_BATTERY),
+        "leftDuty": motors[0],
+        "rightDuty": motors[1],
+        "tempC": signedByteField(fields, TAG_TEMP),
+        "health": highNibble(status),
+        "link": lowNibble(status)
+      }

@@ -2,9 +2,11 @@
 // valid records, and render a text report. Exercises map/filter/reduce churn over
 // heap (object) values — the pattern that historically broke RC.
 import { parseRow, Parsed } from "./parse"
-import { length, sortBy } from "std/array"
-import { map, filter, reduce } from "std/iter"
+import { renderTally } from "./frequency"
+import { length, sortBy, push } from "std/array"
+import { map, filter, reduce, for } from "std/iter"
 import { toString, join } from "std/string"
+import { hash } from "std/hash"
 
 // A validated CSV record (structurally identical to parse.lin's `Record`; Lin's
 // structural typing lets the parse result flow straight into the pipeline).
@@ -29,6 +31,24 @@ export val validRecords = (lines: String[]): Record[] =>
         has { "type": "success", value } => value
         else => { "name": "", "score": 0 }
     )
+
+// Drop duplicate records — two rows with the same name AND score are the same entry.
+// `std/hash.hash` produces a structural key (equal values -> equal keys, order-
+// independent), so a `{ String: Boolean }` "seen" set gives O(1) dedup without an
+// O(n²) pairwise scan. First occurrence wins; order is otherwise preserved.
+export val uniqueRecords = (records: Record[]): Record[] =>
+  var seen: { String: Boolean } = {}
+  var out: Record[] = []
+  records.for(r =>
+    val key = hash(r)
+    val isNew = match seen[key]
+      is Boolean => false
+      else => true
+    if isNew then
+      seen[key] = true
+      out.push(r)
+  )
+  out
 
 // The error messages from the rows that failed to parse, with the same union-narrowing
 // discipline applied inline in the `map` callback.
@@ -70,13 +90,18 @@ val errorNote = (errs: String[]): String =>
   else
     "\nskipped ${errs.length()} bad row(s)"
 
-// Render a multi-line text report from a batch of CSV lines.
+// Render a multi-line text report from a batch of CSV lines. Duplicate rows are
+// collapsed (uniqueRecords) before ranking, so a name+score that appears twice is
+// counted once. The ranked rows are numbered with the indexed `map` form — the
+// 2-arg callback `(item, i)` receives the 0-based source index as a trailing
+// parameter (opt-in by arity), giving "1." / "2." prefixes without a manual counter.
 export val render = (lines: String[]): String =>
-  val records = validRecords(lines)
+  val records = uniqueRecords(validRecords(lines))
   val st = stats(records)
-  val rows = records
-    .sortBy(r => 0 - r["score"])
-    .map(r => "  ${r["name"]}: ${toString(r["score"])}")
+  val ranked = records.sortBy(r => 0 - r["score"])
+  val rows = ranked
+    .map((r, i) => "  ${toString(i + 1)}. ${r["name"]}: ${toString(r["score"])}")
     .join("\n")
+  val histogram = renderTally(records)
   val errLines = errorNote(parseErrors(lines))
-  "=== Report ===\n${rows}\ncount=${toString(st["count"])} avg=${toString(st["average"])} top=${st["top"]}${errLines}"
+  "=== Report ===\n${rows}\n--- grade bands ---\n${histogram}\ncount=${toString(st["count"])} avg=${toString(st["average"])} top=${st["top"]}${errLines}"

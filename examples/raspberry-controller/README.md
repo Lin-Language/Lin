@@ -19,13 +19,27 @@ protocol code — the actual point of interest — is ported faithfully.
 | --- | --- | --- |
 | `protocol.lin` | `server/src/main.rs::parse_packet`, `client/src/main.rs::encode` | The 8-byte control packet: two big-endian f32 motor speeds, clamped to [-1, 1]. |
 | `motor.lin` | `server/src/motor.rs::Motor::set` | The pure speed→PWM mapping (channel + duty). GPIO is **stubbed**. |
-| `nal.lin` | `server/src/nal.rs` | H.264 Annex B NAL-unit parser (start-code scanning, nal_type). |
+| `nal.lin` | `server/src/nal.rs` | H.264 Annex B NAL-unit parser (start-code scanning, `nalType`). |
 | `rtp.lin` | `server/src/rtp.rs` | RTP packetizer (RFC 6184): header, Single-NAL mode, FU-A fragmentation. |
-| `main.lin` | `client/src/main.rs` | The **client**: keyboard → control packet (the original example, kept). |
+| `tlv.lin` | (new) | A generic TLV (tag–length–value) binary codec over flat `UInt8[]` buffers. |
+| `telemetry.lin` | (new) | The Pi's status frame: named sensor readings TLV-encoded with an XOR-checksum trailer. |
+| `control.lin` | `client/src/main.rs` | The pure control core: `clampSpeed` / `applyKey` (keypress → speed pair). |
+| `main.lin` | `client/src/main.rs` | The runnable **client**: TTY + UDP wiring (`runController`) plus a non-interactive `demo`. |
 
 Each library module `export`s its functions and has **no top-level side effects**,
-so it can be imported by its colocated `*.test.lin`. The tests port the Rust
-`#[cfg(test)]` cases as `expect(...).toBe(...)` assertions.
+so it can be imported by its colocated `*.test.lin`. `main.lin` is the only file
+with a top-level effect (`demo()`); the testable logic it used to hold now lives
+in `control.lin`. The tests port the Rust `#[cfg(test)]` cases as
+`expect(...).toBe(...)` assertions, plus the byte-exact TLV codec round-trips.
+
+`tlv.lin` and `telemetry.lin` were folded in from a former standalone TLV codec +
+bit-helpers example: the TLV codec is the same wire
+format, now given a domain role as the telemetry frame, and the bit helpers
+(`packNibbles` / `highNibble` / `lowNibble`, XOR `checksum`) live in
+`telemetry.lin` where they are used (the status byte and the frame trailer).
+codec's NAL-type helper duplicated `nal.lin`, so it was dropped in favour of a
+single exported `nalType` in `nal.lin` (which `parseNals` now calls and `rtp.lin`
+mirrors inline).
 
 Record shapes are given named type aliases where they exist: `motor.lin` exports
 `MotorCommand` (`{ channel, duty }`) and `nal.lin` exports `NalUnit`
@@ -46,6 +60,14 @@ heartbeat. `protocol.encodePacket` / `protocol.parsePacket`.
 NAL units (`nal.parseNals`) and each is packetized into RTP — Single-NAL mode for
 small NALs, FU-A fragmentation at 1200 bytes for large ones (`rtp.packetize`).
 
+**Telemetry** (server → client): the Pi's status report, a self-describing TLV
+frame (`telemetry.encodeTelemetry` / `decodeTelemetry`) carrying battery %, the
+two motor PWM duties, signed temperature, and a packed health/link status byte,
+followed by a one-byte XOR checksum trailer. TLV (tag–length–value) lets the
+field set grow without a wire-format bump; the checksum lets `decodeTelemetry`
+reject a corrupt frame as an `Error` (`Telemetry | Error`) rather than misread it.
+All readings are integers, so the frame is byte-exact.
+
 ## What is faithfully ported vs stubbed
 
 **Faithfully ported (pure logic):**
@@ -57,6 +79,8 @@ small NALs, FU-A fragmentation at 1200 bytes for large ones (`rtp.packetize`).
 - The NAL start-code scanner (3- and 4-byte start codes; `nal_type = data[0] & 0x1F`).
 - The RTP header layout, Single-NAL mode, and FU-A fragmentation bit logic
   (FU indicator `(nal[0] & 0x60) | 28`, FU header with start/end bits).
+- The TLV telemetry frame (tag/big-endian-length/value triples plus an XOR
+  checksum trailer), with byte-exact encode/decode round-trips.
 
 **Stubbed / omitted (hardware & OS edges):**
 
@@ -94,12 +118,16 @@ small NALs, FU-A fragmentation at 1200 bytes for large ones (`rtp.packetize`).
   current codegen, so the big NAL is grown by `concat` only (see `doubleUp` in
   `rtp.test.lin`). `packetize`'s own internal fragment slicing is correct on a clean
   buffer.
-- **`startCodeAt` is tested indirectly.** A standalone unit test that passes a flat
-  `UInt8[]` literal local directly into `startCodeAt` trips a pre-existing codegen
-  RC double-free (heap-use-after-free in `lin_array_release`, visible under
-  `LIN_NO_OPT` + AddressSanitizer; the O2 default build masks it). Start-code
-  detection is therefore exercised through `parseNals` (3-byte, 4-byte, mixed,
-  no-start-code, empty), which is memory-clean under ASan.
+- **TLV `decode` copies value bytes into a fresh `Int32[]`.** A decoded field's
+  value comes from a slice of the packed `UInt8[]` frame, but `Field.bytes` is an
+  `Int32[]` (so individual readings can be indexed out). `decode` widens the byte
+  window element by element into a new `Int32[]` (`copyValue` in `tlv.lin`) rather
+  than aliasing the `UInt8` slice behind the `Int32[]` type — the latter reads
+  back per-element garbage under the current codegen (it keeps the packed 1-byte
+  stride while index reads use the `Int32` 4-byte stride). The explicit copy is
+  the representation-honest conversion. Likewise `telemetry.lin` copies an
+  `Int32[]` field back into a `UInt8[]` (`bytesToInts` / `intsToBytes`) when it
+  needs byte-level reads.
 
 ## Run it
 
@@ -118,8 +146,11 @@ its `demo()`.
 
 | Module | stdlib |
 | --- | --- |
-| `protocol.lin` | `std/bytes` (`f32ToBe`/`f32FromBe`), `std/number` (`toFloat32`), `std/math` (`clamp`), `std/array` (`concat`) |
+| `protocol.lin` | `std/bytes` (`f32ToBe`/`f32FromBe`), `std/number` (`toFloat32`), `std/math` (`clamp`), `std/iter` (`concat`) |
 | `motor.lin` | `std/math` (`clamp`/`round`/`abs`), `std/number` (`toInt32`) |
 | `nal.lin` | `std/array` (`slice`/`length`/`push`) |
-| `rtp.lin` | `std/bytes` (`u16ToBe`/`u32ToBe`), `std/array` (`concat`/`slice`/`length`/`push`), `std/number` (`toUInt8`) |
-| `main.lin` | `std/bytes`, `std/number`, `std/math`, `std/net`, `std/tty`, `std/time`, `std/array`, `std/io`, `std/string` |
+| `rtp.lin` | `std/bytes` (`u16ToBe`/`u32ToBe`), `std/array` (`slice`/`length`/`push`), `std/iter` (`concat`), `std/number` (`toUInt8`) |
+| `tlv.lin` | `std/array` (`push`/`length`), `std/bytes` (`u16FromBe`), `std/number` (`toInt32`/`toFloat64`) |
+| `telemetry.lin` | `std/array` (`push`/`length`/`slice`), `std/iter` (`concat`), `./tlv` |
+| `control.lin` | `std/math` (`clamp`/`round`) |
+| `main.lin` | `std/io`, `std/string`, `std/array`, `std/iter`, `std/net`, `std/tty`, `std/time`, `./control`, `./protocol`, `./telemetry` |

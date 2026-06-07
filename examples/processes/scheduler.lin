@@ -1,0 +1,95 @@
+// scheduler.lin — the execution engine that decides HOW the runner's steps run:
+// concurrently, with a per-step deadline, and with retries for flaky steps. It composes
+// the std/async surface (parallel, timeout, retry, shared/withLock, threadPool) over the
+// pure `runTask` from task.lin, and reports per-step outcomes as a `Result<TaskResult,
+// String>` — success carries the classified result; failure carries a human reason
+// ("timed out after Nms" / "gave up after N attempts").
+//
+// Every async thunk here calls the top-level `runTask` (whose `exec` the tests mock with
+// `replace`), so the scheduler is exercised deterministically without spawning real
+// subprocesses.
+import { async, await, parallel, timeout, retry, shared, withLock, get, threadPool, poolAsync } from "std/async"
+import { runTask, Task, TaskResult } from "./task"
+import { ok, err, andThen, Result } from "./outcome"
+import { map, for } from "std/iter"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+
+// The aggregate outcome of a concurrent run: the per-task results, plus how many steps
+// actually completed (observed through a shared, lock-guarded progress log).
+export type RunReport = { "results": TaskResult[], "completed": Int32 }
+
+// Read back how many steps logged completion. `withLock` mutates the boxed value IN
+// PLACE (ADR-028), so progress is tracked by pushing each finished task's name into a
+// `shared` array; the count is the array length of the snapshot.
+val countOf = (progress: Shared): Int32 =>
+  length(get(progress))
+
+// Narrow a single parallel result (the stdlib hands back a dynamic value) into the
+// precise TaskResult, accumulating with explicit push (the named-record-array idiom).
+val collect = (raw: Json[]): TaskResult[] =>
+  var out: TaskResult[] = []
+  raw.for(x =>
+    match x
+      is TaskResult => push(out, x)
+      else => null
+  )
+  out
+
+// Run every task concurrently with `parallel`. As each task finishes, its thunk logs
+// completion into a `shared` array under `withLock`, so progress is tracked race-free
+// even though the thunks run on different threads. Results stay in submission order.
+export val runConcurrent = (tasks: Task[]): RunReport =>
+  val progress = shared([])
+  val raw = parallel(tasks.map(t =>
+    () =>
+      val res = runTask(t)
+      withLock(progress, a => push(a, t["name"]))
+      res
+  ))
+  {
+    "results": collect(raw),
+    "completed": countOf(progress)
+  }
+
+// Run one task on its own thread with a deadline. If it finishes in time, succeed with the
+// classified result; otherwise the slow thread is abandoned and we report a timeout.
+export val runWithTimeout = (t: Task, ms: Int32): Result<TaskResult, String> =>
+  val p = async(() => runTask(t))
+  val r = await(timeout(p, ms))
+  match r
+    is TaskResult => ok(r)
+    else => err("timed out after ${toString(ms)}ms")
+
+// Run a flaky task up to `times` attempts. `retry` re-spawns the thunk until one attempt
+// returns a non-Error; if every attempt faults, we report giving up. A faulting attempt
+// means the work itself trapped (e.g. a crash), not a non-zero exit — a non-zero exit is a
+// perfectly good TaskResult and stops the retries immediately.
+export val runWithRetry = (t: Task, times: Int32): Result<TaskResult, String> =>
+  val r = await(retry(() => runTask(t), times))
+  match r
+    is TaskResult => ok(r)
+    else => err("gave up after ${toString(times)} attempt(s)")
+
+// Drain one pooled promise into the accumulator, narrowing its awaited value.
+val drain = (out: TaskResult[], p: Json): Null =>
+  val r = await(p)
+  match r
+    is TaskResult => push(out, r)
+    else => null
+
+// Run `first` with a deadline and, only if it succeeds, run `second` with a deadline too —
+// a dependent step ("deploy" runs only if "build" met its budget). `andThen` threads the
+// success/failure: a timeout on `first` short-circuits and `second` never runs.
+export val runThen = (first: Task, second: Task, ms: Int32): Result<TaskResult, String> =>
+  andThen(runWithTimeout(first, ms), prev => runWithTimeout(second, ms))
+
+// Run every task through a bounded thread pool of `workers` threads, so at most `workers`
+// subprocesses are in flight at once. Returns the results in submission order.
+export val runOnPool = (tasks: Task[], workers: Int32): TaskResult[] =>
+  val pool = threadPool(workers)
+  var promises: Json[] = []
+  tasks.for(t => push(promises, pool.poolAsync(() => runTask(t))))
+  var out: TaskResult[] = []
+  promises.for(p => drain(out, p))
+  out

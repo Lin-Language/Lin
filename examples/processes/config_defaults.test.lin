@@ -1,0 +1,36 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { loadConfig } from "./config"
+import { getEnv } from "std/env"
+
+// Covers the fallback paths in config.lin: an unset var, a non-numeric value, and a value
+// below the allowed minimum all fall back to the documented defaults rather than failing.
+// `getEnv` is mocked (ADR-046) to return a malformed environment on purpose.
+replace getEnv = (name: String): String | Null =>
+  if name == "PROCESSES_MAX_PARALLEL" then
+    "0"
+  else if name == "PROCESSES_RETRIES" then
+    "not-a-number"
+
+val s = suite("config defaults", [
+  test("a below-minimum max-parallel falls back to the default", () =>
+    val c = loadConfig()
+    [
+      expect(c["maxParallel"]).toBe(4)
+    ]
+  ),
+
+  test("an unparseable retries value falls back to the default", () =>
+    val c = loadConfig()
+    [
+      expect(c["retries"]).toBe(2)
+    ]
+  ),
+
+  test("an unset CI flag is false", () =>
+    val c = loadConfig()
+    [
+      expect(c["ci"]).toBe(false)
+    ]
+  )
+])
+run(s)

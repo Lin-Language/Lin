@@ -1,9 +1,17 @@
-import { getIndex, getStatus, getUser } from "./handlers"
+import { getIndex, getStatus, getRoute, getUser } from "./handlers"
 import { json, matchPath, HttpRequest as Request, HttpResponse as Response } from "std/http"
+import { Config } from "./config"
 
-export val router = (req: Request): Response =>
+// Dispatch a request to a handler by path. The resolved service `config` is
+// threaded in so handlers can surface the configured name/version. `makeRouter`
+// closes over the config and returns the `(req) => Response` handler `serve` wants.
+export val route = (req: Request, config: Config): Response =>
   match req["path"]
-    is "/" => getIndex(req)
-    is "/api/status" => getStatus(req)
+    is "/" => getIndex(req, config)
+    is "/api/status" => getStatus(req, config)
+    is path when matchPath(path, "/route/:from/:to") != null => getRoute(req)
     is path when matchPath(path, "/users/:id") != null => getUser(req)
     else => json(404, { "error": "Not Found" })
+
+export val makeRouter = (config: Config): (Request) => Response =>
+  (req) => route(req, config)
