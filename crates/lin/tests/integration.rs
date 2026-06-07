@@ -15332,3 +15332,216 @@ print(ev(n))
         output
     );
 }
+
+// ---------------------------------------------------------------------------
+// Unboxed-sum-type Stage 2 — RECURSIVE sum types pack as unboxed SumNodes.
+//
+// A `type Ast = Num | BinOp` whose `BinOp` carries recursive `left`/`right : Ast`
+// children packs end-to-end: each node is an unboxed heap `SumNode` with the
+// recursive children stored as 8-byte owned `*SumNode` pointer slots (KIND_SUMNODE
+// in the static SumDesc). Construction packs nested literals directly (no boxed
+// round-trip), `match is` dispatches on the inline tag, a recursive-child read is
+// a const-offset pointer load (borrowed interior `*SumNode`), and the whole tree
+// is freed by the runtime's recursive drop walk. The RC drop (the dominant risk)
+// is ASan-verified separately; these assert end-to-end CORRECTNESS.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_st2_recursive_sum_tree_eval() {
+    // The interp `Ast`: construct a 2-level tree, dispatch with `match is`, read
+    // the recursive children, and recurse. `3 + 4 = 7`.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op",  "left": Ast, "right": Ast }
+type Ast   = Num | BinOp
+val evalNode = (node: Ast): Int32 =>
+  match node
+    is Num   => node["value"]
+    is BinOp => evalNode(node["left"]) + evalNode(node["right"])
+val tree: Ast = { "kind": "op", "left": { "kind": "num", "value": 3 }, "right": { "kind": "num", "value": 4 } }
+print(evalNode(tree).toString())
+"#);
+    assert_eq!(out, vec!["7"]);
+}
+
+#[test]
+fn test_st2_recursive_sum_deep_tree_with_scalar_field() {
+    // A deeper full binary tree whose `BinOp` ALSO carries a scalar `op` field
+    // (read directly from the SumNode, not via materialize): `((3+4)*(5+6)) = 77`.
+    // Exercises the recursive drop walk over a 7-node tree at scope exit.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op", "op": Int32, "left": Ast, "right": Ast }
+type Ast   = Num | BinOp
+val evalNode = (node: Ast): Int32 =>
+  match node
+    is Num   => node["value"]
+    is BinOp =>
+      val l = evalNode(node["left"])
+      val r = evalNode(node["right"])
+      if node["op"] == 0 then l + r
+      else l * r
+val tree: Ast = {
+  "kind": "op", "op": 1,
+  "left":  { "kind": "op", "op": 0, "left": { "kind": "num", "value": 3 }, "right": { "kind": "num", "value": 4 } },
+  "right": { "kind": "op", "op": 0, "left": { "kind": "num", "value": 5 }, "right": { "kind": "num", "value": 6 } }
+}
+print(evalNode(tree).toString())
+"#);
+    assert_eq!(out, vec!["77"]);
+}
+
+#[test]
+fn test_st2_recursive_sum_repeated_build_drop_in_loop() {
+    // Build + evaluate + drop a fresh recursive tree on every loop iteration — the
+    // strongest non-ASan guard that the recursive drop walk frees each tree exactly
+    // once (a leak or double-free corrupts the reused node slots and crashes/garbles
+    // a later iteration). Prints `i + 2` for i in 0..4 → 2 3 4 5.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op", "left": Ast, "right": Ast }
+type Ast   = Num | BinOp
+val evalNode = (node: Ast): Int32 =>
+  match node
+    is Num   => node["value"]
+    is BinOp => evalNode(node["left"]) + evalNode(node["right"])
+range(0, 4).for(i =>
+  val t: Ast = { "kind": "op", "left": { "kind": "num", "value": i }, "right": { "kind": "num", "value": 2 } }
+  print(evalNode(t).toString()))
+"#);
+    assert_eq!(out, vec!["2", "3", "4", "5"]);
+}
+
+#[test]
+fn test_st2_recursive_sum_three_variant() {
+    // A 3-variant recursive sum (`Num | Neg | Add`) with a unary recursive child
+    // (`Neg.operand`) and a binary one (`Add.left/right`): `10 - 3 = 7`.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num = { "kind": "num", "value": Int32 }
+type Neg = { "kind": "neg", "operand": Expr }
+type Add = { "kind": "add", "left": Expr, "right": Expr }
+type Expr = Num | Neg | Add
+val eval = (e: Expr): Int32 =>
+  match e
+    is Num => e["value"]
+    is Neg => 0 - eval(e["operand"])
+    is Add => eval(e["left"]) + eval(e["right"])
+val t: Expr = { "kind": "add", "left": { "kind": "num", "value": 10 }, "right": { "kind": "neg", "operand": { "kind": "num", "value": 3 } } }
+print(eval(t).toString())
+"#);
+    assert_eq!(out, vec!["7"]);
+}
+
+// ---------------------------------------------------------------------------
+// Unboxed-sum-type Stage 2 — TAIL-RETURN construction pushdown.
+//
+// Regression for the tail-return pushdown bug: a recursive sum literal built in a
+// function and RETURNED (the canonical parser shape) — directly, from an `if`/`else`
+// tail, or from a `match` arm — must construct its nested recursive children AS
+// `SumNode`s (the per-variant expected type is pushed into the children), exactly like
+// a `val n: <Sum> = {…}; n` binding. Before the fix the children were boxed as plain
+// `LinObject`s and stored into the parent's `*SumNode` child slots, so reading a
+// child's discriminant read boxed memory → garbage tag → "non-exhaustive match"
+// (ASan-clean, hence missed by the inline-construct-then-traverse Stage-2 tests).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_st2_sum_build_and_return_then_read_child() {
+    // (a) Build a recursive BinOp INSIDE a function, return it, then traverse a child.
+    // The returned tree's children must be unboxed SumNodes (the disc reads correctly).
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op", "op": Int32, "left": Ast, "right": Ast }
+type Ast   = Num | BinOp
+val build = (): Ast =>
+  { "kind": "op", "op": 0, "left": { "kind": "num", "value": 3 }, "right": { "kind": "num", "value": 4 } }
+val t: Ast = build()
+val r = match t
+  is Num   => -1
+  is BinOp => match t["left"]
+    is Num   => t["left"]["value"]
+    is BinOp => -2
+print(r.toString())
+"#);
+    assert_eq!(out, vec!["3"]);
+}
+
+#[test]
+fn test_st2_sum_if_else_tail_return_then_eval() {
+    // (b) An if/else whose tail VALUE is a nested sum literal, returned from a function,
+    // then evaluated recursively. `mk(1)` → (3+4) = 7; `mk(0)` → the Num leaf 9.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op", "op": Int32, "left": Ast, "right": Ast }
+type Ast   = Num | BinOp
+val eval = (e: Ast): Int32 =>
+  match e
+    is Num   => e["value"]
+    is BinOp => eval(e["left"]) + eval(e["right"])
+val mk = (n: Int32): Ast =>
+  if n == 1 then
+    { "kind": "op", "op": 0, "left": { "kind": "num", "value": 3 }, "right": { "kind": "num", "value": 4 } }
+  else
+    { "kind": "num", "value": 9 }
+print(eval(mk(1)).toString())
+print(eval(mk(0)).toString())
+"#);
+    assert_eq!(out, vec!["7", "9"]);
+}
+
+#[test]
+fn test_st2_sum_match_arm_tail_return_then_eval() {
+    // A `match`-arm tail VALUE that is a nested sum literal, returned from a function.
+    // `mk(1)` → (3*4) = 12; `mk(0)` → the Num leaf 5.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op", "op": Int32, "left": Ast, "right": Ast }
+type Ast   = Num | BinOp
+val eval = (e: Ast): Int32 =>
+  match e
+    is Num   => e["value"]
+    is BinOp => eval(e["left"]) * eval(e["right"])
+val mk = (n: Int32): Ast =>
+  match n
+    is 0 => { "kind": "num", "value": 5 }
+    else => { "kind": "op", "op": 2, "left": { "kind": "num", "value": 3 }, "right": { "kind": "num", "value": 4 } }
+print(eval(mk(1)).toString())
+print(eval(mk(0)).toString())
+"#);
+    assert_eq!(out, vec!["12", "5"]);
+}
+
+#[test]
+fn test_st2_sum_parser_style_recursive_build_and_return() {
+    // (c) A small parser-style function that RECURSIVELY builds and returns a tree:
+    // `chain(n)` folds `n` additions of leaf `1` into a left-leaning BinOp spine,
+    // returning a fresh sub-tree at each level. Evaluating it sums to `n` (n leaves of 1).
+    // Exercises the tail-return pushdown at every recursion depth + the recursive drop.
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op", "op": Int32, "left": Ast, "right": Ast }
+type Ast   = Num | BinOp
+val eval = (e: Ast): Int32 =>
+  match e
+    is Num   => e["value"]
+    is BinOp => eval(e["left"]) + eval(e["right"])
+val chain = (n: Int32): Ast =>
+  if n <= 1 then
+    { "kind": "num", "value": 1 }
+  else
+    { "kind": "op", "op": 0, "left": chain(n - 1), "right": { "kind": "num", "value": 1 } }
+print(eval(chain(1)).toString())
+print(eval(chain(4)).toString())
+print(eval(chain(10)).toString())
+"#);
+    assert_eq!(out, vec!["1", "4", "10"]);
+}
