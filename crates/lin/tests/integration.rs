@@ -14706,6 +14706,75 @@ print(toString(growInPlace(g, 50)))
 }
 
 #[test]
+fn test_tail_recursive_if_json_branch_vs_concrete_branch_not_mistyped() {
+    // A tail-recursive function whose body is an `if`/`else` where ONE terminal branch returns a
+    // freshly-built `Json` value (an error OBJECT) and the OTHER returns the owned ARRAY param.
+    // The checker's `infer_if` merge collapsed `Json | String[][]` onto the CONCRETE branch
+    // (`String[][]`) because `Json` (the dynamic top `TypeVar(u32::MAX)`) is `types_compatible`
+    // with everything — so the if-expression was mistyped as `String[][]`. lin-ir then boxed BOTH
+    // branches with the concrete array representation (`lin_box_array`), mis-tagging the Json error
+    // object as an array; reading the result (here, string-interpolating it) dereferenced the
+    // object as an array header → null-deref/corruption. Fix: when exactly one branch is the
+    // dynamic `Json` top type, the merged type IS `Json` (it subsumes the concrete branch), so each
+    // branch boxes into its own correct representation and the merge is a uniform Json box.
+    //
+    // Asserts BOTH terminal paths: state==0 returns the array unchanged; state==1 returns the
+    // error object. ASan (ci.yml `asan` leg over this exact shape) is the leak/double-free guard;
+    // this pins the OBSERVABLE result — the correct value comes back from BOTH branches.
+    let out = run(r#"
+import { print } from "std/io"
+
+val mkErr = (msg: String): Json => { "type": "error", "message": msg }
+
+val step = (rows: String[][], i: Int64, n: Int64, state: Int64): Json =>
+  if i >= n then
+    if state == 1 then mkErr("unterminated") else rows
+  else
+    step(rows, i + 1, n, state)
+
+val ok = step([["a"]], 0, 1, 0)
+val err = step([["a"]], 0, 1, 1)
+print("${ok}")
+print("${err}")
+"#);
+    // state==0: the owned `rows` param threads through and is returned as the array.
+    // state==1: the fresh error object is returned (correctly tagged as an object, not an array).
+    assert_eq!(
+        out,
+        vec![
+            r#"[["a"]]"#.to_string(),
+            r#"{"type": "error", "message": "unterminated"}"#.to_string(),
+        ]
+    );
+}
+
+#[test]
+fn test_if_json_branch_vs_concrete_branch_not_collapsed_to_concrete() {
+    // The non-tail-recursive minimal form of the same `infer_if` mistyping bug: a plain `if`
+    // whose then-branch is `Json` and else-branch is a concrete heap type. The merge must be
+    // `Json`, not the concrete type — otherwise lowering boxes the Json branch with the concrete
+    // representation and corrupts it on read.
+    let out = run(r#"
+import { print } from "std/io"
+
+val mkErr = (msg: String): Json => { "type": "error", "message": msg }
+
+val pick = (rows: String[][], state: Int64): Json =>
+  if state == 1 then mkErr("x") else rows
+
+print("${pick([["a"]], 1)}")
+print("${pick([["a"]], 0)}")
+"#);
+    assert_eq!(
+        out,
+        vec![
+            r#"{"type": "error", "message": "x"}"#.to_string(),
+            r#"[["a"]]"#.to_string(),
+        ]
+    );
+}
+
+#[test]
 fn test_tco_typed_record_array_param_no_per_iteration_leak() {
     // A TYPED sealed-record array (`Transfer[]`, currently a boxed `Object[]` with heap fields)
     // threaded UNCHANGED through a TAIL-recursive parameter and grown via `push` must not leak a
