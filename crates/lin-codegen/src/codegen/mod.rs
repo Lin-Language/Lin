@@ -2067,15 +2067,21 @@ impl<'ctx> Codegen<'ctx> {
                         // slot not aliasing the returned value (a function that returns its own
                         // owned param would otherwise double-free). Done BEFORE the `ret`.
                         let ret_ptr = ret_val.and_then(|v| if v.is_pointer_value() { Some(v.into_pointer_value()) } else { None });
+                        // ALL pointer-typed entry params (the borrowed caller-owned values). A TCO
+                        // loop may PERMUTE borrowed array params between slots (the merge-sort
+                        // ping-pong), so an exit slot must be guarded against EVERY entry, not just
+                        // its own — see emit_tco_release_final.
+                        let tco_entry_ptrs: Vec<inkwell::values::PointerValue<'ctx>> = (0..func.params.len())
+                            .filter_map(|i| llvm_fn.get_nth_param(i as u32))
+                            .filter_map(|p| if p.is_pointer_value() { Some(p.into_pointer_value()) } else { None })
+                            .collect();
                         for (i, (_t, ty)) in func.params.iter().enumerate() {
                             if let Some(Some(owns)) = tco_owns.get(i) {
                                 if let Some(slot) = param_allocs.get(i) {
                                     let llvm_ty = self.llvm_type(ty);
                                     let slot_val = self.builder.load(llvm_ty, *slot, "tco_fslot");
                                     if slot_val.is_pointer_value() {
-                                        let entry_ptr = llvm_fn.get_nth_param(i as u32)
-                                            .and_then(|p| if p.is_pointer_value() { Some(p.into_pointer_value()) } else { None });
-                                        self.emit_tco_release_final(llvm_fn, *owns, slot_val.into_pointer_value(), entry_ptr, ret_ptr, ty);
+                                        self.emit_tco_release_final(llvm_fn, *owns, slot_val.into_pointer_value(), &tco_entry_ptrs, ret_ptr, ty);
                                     }
                                 }
                             }
@@ -2088,16 +2094,18 @@ impl<'ctx> Codegen<'ctx> {
                     }
                     Terminator::Return(None) => {
                         // TCO LOOP-EXIT release (Leak B fix): see Return(Some) above. No return
-                        // value, so no alias guard needed.
+                        // value, so no return-alias guard needed.
+                        let tco_entry_ptrs: Vec<inkwell::values::PointerValue<'ctx>> = (0..func.params.len())
+                            .filter_map(|i| llvm_fn.get_nth_param(i as u32))
+                            .filter_map(|p| if p.is_pointer_value() { Some(p.into_pointer_value()) } else { None })
+                            .collect();
                         for (i, (_t, ty)) in func.params.iter().enumerate() {
                             if let Some(Some(owns)) = tco_owns.get(i) {
                                 if let Some(slot) = param_allocs.get(i) {
                                     let llvm_ty = self.llvm_type(ty);
                                     let slot_val = self.builder.load(llvm_ty, *slot, "tco_fslot");
                                     if slot_val.is_pointer_value() {
-                                        let entry_ptr = llvm_fn.get_nth_param(i as u32)
-                                            .and_then(|p| if p.is_pointer_value() { Some(p.into_pointer_value()) } else { None });
-                                        self.emit_tco_release_final(llvm_fn, *owns, slot_val.into_pointer_value(), entry_ptr, None, ty);
+                                        self.emit_tco_release_final(llvm_fn, *owns, slot_val.into_pointer_value(), &tco_entry_ptrs, None, ty);
                                     }
                                 }
                             }

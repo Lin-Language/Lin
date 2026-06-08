@@ -47,13 +47,14 @@ impl<'ctx> Codegen<'ctx> {
 
     /// Release a SINGLE TCO param slot's value on the loop-EXIT (return) path, guarded by:
     /// (1) `owns_flag` — true only after a tail back-edge has stored into this slot at least once;
-    /// (2) `entry_ptr` — the ORIGINAL caller-passed param value (the borrowed entry). The slot must
-    /// differ from it: the caller owns and frees the entry value, so releasing it here is a
-    /// use-after-free at the caller. CRITICAL: a param threaded UNCHANGED through the loop (e.g. the
-    /// `arr` in `scan(arr, j+1, n, nx)`) is re-stored on every back-edge — which sets `owns_flag`
-    /// true — yet the slot still holds the borrowed entry value at exit. The owns-flag alone is
-    /// therefore NOT sufficient; the entry-aliasing guard is what keeps a pass-through borrowed
-    /// param from being double-freed (the bug a naive owns-flag-only release would cause).
+    /// (2) `entry_ptrs` — EVERY original caller-passed param value (the borrowed entries). The slot
+    /// must differ from ALL of them: the caller owns and frees the entry values, so releasing one
+    /// here is a use-after-free at the caller. Comparing against ALL entries (not just this slot's
+    /// own) is REQUIRED because a TCO loop may PERMUTE its borrowed array params between slots — the
+    /// merge-sort ping-pong `_mergePass(buf, work, …) -> _mergePass(work, buf, …)` ends with `buf`'s
+    /// slot holding the `work` entry (and returns one of them). A per-slot-only guard would free a
+    /// borrowed buffer swapped in from another slot — a double-free. (A param threaded UNCHANGED,
+    /// e.g. `arr` in `scan`, is also caught here.)
     /// (3) when `ret_ptr` is a pointer, an alias check — the slot value must differ from the
     /// returned value (a `scan` that returns its own `cur` param directly aliases the slot; the
     /// caller takes ownership of the returned value, so releasing the slot too would double-free).
@@ -67,7 +68,7 @@ impl<'ctx> Codegen<'ctx> {
         llvm_fn: FunctionValue<'ctx>,
         owns_flag: PointerValue<'ctx>,
         slot_val: PointerValue<'ctx>,
-        entry_ptr: Option<PointerValue<'ctx>>,
+        entry_ptrs: &[PointerValue<'ctx>],
         ret_ptr: Option<PointerValue<'ctx>>,
         ty: &Type,
     ) {
@@ -77,10 +78,10 @@ impl<'ctx> Codegen<'ctx> {
         let owned = self.builder.load(bool_ty, owns_flag, "tco_fowned").into_int_value();
         let mut cond = owned;
         let slot_int = self.builder.ptr_to_int(slot_val, i64_ty, "tco_fslot_i");
-        if let Some(ep) = entry_ptr {
-            // Don't release the borrowed entry value (the caller owns it) — a pass-through param
-            // ends the loop still holding it.
-            let ent_int = self.builder.ptr_to_int(ep, i64_ty, "tco_fent_i");
+        // Don't release a value that is ANY borrowed entry param (the caller owns/frees them) — a
+        // pass-through OR permuted-between-slots param ends the loop still holding a borrowed value.
+        for ep in entry_ptrs {
+            let ent_int = self.builder.ptr_to_int(*ep, i64_ty, "tco_fent_i");
             let ne = self.builder.int_compare(IntPredicate::NE, slot_int, ent_int, "tco_fentne");
             cond = self.builder.and(cond, ne, "tco_fentdiff");
         }
