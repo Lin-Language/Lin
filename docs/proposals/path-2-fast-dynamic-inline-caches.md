@@ -1,6 +1,6 @@
 # Path 2 — Make the dynamic representation fast (inline caches / hidden classes)
 
-**Status:** Open proposal, one of five independent paths. Self-contained.
+**Status:** Open proposal, one of three independent paths. Self-contained.
 **Direction in one line:** instead of escaping `Json`/objects onto a packed type, make the *single
 existing* object representation fast via hidden classes + inline caches — the way V8/SpiderMonkey/LuaJIT
 give dynamic objects struct-speed field access — so there is no packed type, no gate, and no boxing
@@ -102,7 +102,7 @@ fights the consequences (a gate, a boxing boundary, a packed/boxed-mismatch bug 
 - **It removes the entire packed/boxed-mismatch bug class** — the one that consumed this session
   (§H4/H5: silent data loss, panics, crashes, UAFs all from packed-vs-boxed representation disagreement).
   There is no second representation, so there is no mismatch. That is a large risk *removed*, not added.
-- **No userland language change.** No semantics change (cf. Path 3's value semantics), no
+- **No userland language change.** No semantics change, no
   representation-default inversion (cf. Path 1's packed-by-default). Existing object/`Json` code just
   gets faster. (All three surviving paths are now no-surface-change; this one is also no-*representation*-
   change and no behavior change — it just makes the one existing dynamic representation fast.)
@@ -136,7 +136,7 @@ fights the consequences (a gate, a boxing boundary, a packed/boxed-mismatch bug 
   exclusive long-term: a mature system could have hidden classes *and* a packed-elements array (V8 has
   both). As a first move, Path 2 is attractive precisely because it needs no new type, no gate, and
   removes the dominant bug class.
-- **Composable with Path 3** (arenas/value semantics) for construction RC — Path 2 fixes reads, Path 3
+- **Composable with Path 3** (inferred arenas) for construction RC — Path 2 fixes reads, Path 3
   fixes construction.
 - **The no-*representation*-change alternative** to Path 1's packed-by-default (which adds a second
   representation and its boundary) — Path 2 makes the single existing representation fast instead.
