@@ -1192,6 +1192,17 @@ fn pre_resolve_imports(
     }
 }
 
+/// Export name→type map for an imported module, used to enrich completion detail / signature for
+/// imported symbols.
+///
+/// LIMITATION (FIX 5, intentionally not implemented): only `val` exports are surfaced. `var` and
+/// `type` exports are NOT, because they cannot be recovered from the typed IR here: `TypedStmt::Var`
+/// carries only a `slot` (no `name`), and `type` declarations are ERASED entirely (there is no
+/// `TypedStmt::TypeDecl`). So adding arms for them is not the trivial, obviously-correct change the
+/// task scoped FIX 5 to — surfacing them would require either a name on `TypedStmt::Var` or reading
+/// the surface AST and re-deriving types, neither of which is low-risk. The user-visible effect is
+/// minor: completion of an IMPORTED `var`/`type` shows no inferred-type detail (the name still
+/// completes via the cross-file index; hover/goto on the export site itself are unaffected).
 fn extract_exports(module: &TypedModule) -> Vec<(String, Type)> {
     module
         .statements
