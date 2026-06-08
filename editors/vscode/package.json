@@ -337,9 +337,6 @@
       }
     ]
   },
-  "extensionDependencies": [
-    "vadimcn.vscode-lldb"
-  ],
   "devDependencies": {
     "esbuild": "^0.21.5"
   },
