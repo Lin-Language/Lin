@@ -209,7 +209,14 @@ impl Type {
     /// that shape (the descriptor-driven RC primitives handle every heap-field kind uniformly; the
     /// staging is purely widening this predicate).
     pub fn is_sealed_array_field_packable(&self) -> bool {
-        self.is_flat_scalar() || matches!(self, Type::Bool) || self.is_string_ish()
+        self.is_flat_scalar()
+            || matches!(self, Type::Bool)
+            || self.is_string_ish()
+            // Stage 3b step 2 (2026-06-08): a scalar/heap ARRAY field packs as an owned `*LinArray`
+            // pointer slot (KIND_ARRAY), exactly like a String slot. The element type does not need
+            // to be packable — the field holds a pointer to a separately-allocated array, retained
+            // on construct / released on drop by the descriptor walk.
+            || matches!(self, Type::Array(_) | Type::FixedArray(_))
     }
 
     /// Returns true for the dynamic "any" JSON type (TypeVar(u32::MAX)).
