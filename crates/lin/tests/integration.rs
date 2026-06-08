@@ -9192,6 +9192,43 @@ print(toString(length(sorted)))
     assert_eq!(out, vec!["[1, 2, 3, 5, 8, 9]", "6"]);
 }
 
+// Regression (sealed-record combinator element leak): `map` over a sealed-record array whose
+// callback returns a SCALAR FIELD (`x => x["a"]`) reads each element via the `Index` op, which
+// materialises a FRESH +1 sealed struct per element (packed-array `sealed_array_materialize_elem`
+// or boxed-array `sealed_project_from`, both retaining their heap fields). The body extracts a copy
+// of one scalar field — the struct itself is NEVER moved into the (`Int32[]`) result — so the lowerer
+// must release it each iteration (the new `free_combinator_sealed_elem`) or it leaks one struct per
+// element, per `map` call (ASan-confirmed linear across all sealed field shapes; the same applies to
+// `for`/`while`/`reduce` over a sealed array). cargo test can't see the leak; this guards that the
+// per-element release is CORRECT — an over-eager release would free a still-referenced field and
+// corrupt the result or crash. Run in a loop so a per-iteration double-free would surface as a wrong
+// total / abort. The ASan stdlib+example leg + the sealed harness guard the no-double-free half.
+#[test]
+fn test_map_scalar_field_over_sealed_record_array_in_loop() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+import { map } from "std/iter"
+
+type T = { "a": Int32, "b": Int32 }
+
+val once = (i: Int32): Int32 =>
+  var ts: T[] = []
+  push(ts, { "a": i, "b": 0 })
+  push(ts, { "a": i + 10, "b": 0 })
+  val ds: Int32[] = map(ts, (x) => x["a"])
+  ds[0] + ds[1]
+
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc
+  else loop(i + 1, n, acc + once(i))
+
+print(toString(loop(0, 1000, 0)))
+"#);
+    // sum over i in 0..1000 of (i + (i+10)) = 2*sum(0..999) + 10*1000 = 999000 + 10000 = 1009000
+    assert_eq!(out, vec!["1009000"]);
+}
+
 // `minBy`/`maxBy`/`sortBy` over an OBJECT array still work as before (the genericization keeps the
 // heterogeneous `[key, item]` pair path sound — pairs built via the raw `lin_map` builtin on the
 // `T` ABI, the sorted result unpacked back into a `T[]` in the generic body).
@@ -10269,6 +10306,57 @@ val main = (): Null =>
 main()
 "#);
     assert_eq!(out, vec!["done"]);
+}
+
+#[test]
+fn test_tco_loop_union_param_thread_no_leak_or_uaf() {
+    // The "scanRouteAt" shape (TCO Leak B regression): a `T | Null` union (a record) threaded
+    // through a TAIL-RECURSIVE param fed by `arr[i]`. The loop's final `cur` box was never
+    // released (it leaked ~112B/call), and a naive loop-exit release double-freed either the
+    // borrowed pass-through `arr` param or a buffer permuted between slots (the merge-sort
+    // ping-pong). This asserts the CORRECT result; the ASan CI leg / sealed-harness verify the
+    // no-leak / no-double-free guarantees.
+    let out = run(r#"import { print } from "std/io"
+import { push } from "std/array"
+type T = { "a": Int32, "b": Int32 }
+val scan = (arr: Json, j: Int32, n: Int32, cur: T | Null): Int32 =>
+  if j >= n then
+    match cur
+      is T => cur["a"]
+      else => -1
+  else
+    val nx: T = arr[j]
+    scan(arr, j + 1, n, nx)
+val once = (i: Int32): Int32 =>
+  var arr: Json = []
+  push(arr, { "a": i, "b": 0 })
+  scan(arr, 0, 1, null)
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc
+  else loop(i + 1, n, acc + once(i))
+print(loop(0, 100, 0))
+"#);
+    // sum(0..99) = 4950
+    assert_eq!(out, vec!["4950"]);
+
+    // A TCO loop that PERMUTES borrowed array params between slots (the merge-sort ping-pong
+    // distilled): the loop-exit release must NOT free a buffer swapped in from another entry
+    // slot. `sort` over a record array exercises exactly this internally.
+    let out = run(r#"import { print } from "std/io"
+import { push, sort, length } from "std/array"
+type R = { "k": Int32 }
+val once = (i: Int32): Int32 =>
+  var rs: R[] = []
+  push(rs, { "k": i })
+  push(rs, { "k": 0 })
+  val s: R[] = sort(rs, (x, y) => x["k"] - y["k"])
+  s[length(s) - 1]["k"]
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc
+  else loop(i + 1, n, acc + once(i))
+print(loop(0, 100, 0))
+"#);
+    assert_eq!(out, vec!["4950"]);
 }
 
 #[test]
@@ -13889,6 +13977,47 @@ print("${b["tag"]} ${length(b["items"])}")
 print("${b["items"][0]} ${b["items"][2]}")
 "#);
     assert_eq!(out, vec!["1 3", "10 30"]);
+}
+
+// Regression (record-with-RECORD-ARRAY-field construction leak): a sealed record `T` whose field
+// is itself an array OF sealed records (`type Leg = {d}; type T = {legs: Leg[], a}`) — the RAPTOR
+// `Trip { stopTimes: StopTime[] }` shape. Building such a value into a `T[]` (push/index-set/map/
+// drop) routes the element through the sealed→boxed materializer (`sealed_materialize_to_object` /
+// `sealed_array_elem_materializer`), where `box_value` of the `legs` field MATERIALISES a FRESH +1
+// tagged `Object[]` (via `sealed_array_to_tagged`) — not a borrowed pointer. The materializer used
+// to free only the box SHELL (`lin_tagged_free_box`) for any non-Object heap field, leaking the
+// whole fresh `legs` array (header + every `Leg` element) at ~176 B/element on every operation
+// (ASan-confirmed linear; sealed harness `record_array` push_read/index_set/array_drop/map_field).
+// Fixed by `tagged_release`-ing the field when `box_value_yields_fresh_owned` (sealed Object OR
+// sealed-record array). The matching retain is object_set_fresh's, so the count stays balanced — an
+// over-release here would corrupt/crash the read-back. cargo test can't see the leak; this guards
+// the result is correct (no double-free) across a loop; the ASan harness guards the leak itself.
+#[test]
+fn test_sealed_record_array_field_build_push_drop_in_loop() {
+    let out = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+import { map } from "std/iter"
+
+type Leg = { "d": Int32 }
+type T = { "legs": Leg[], "a": Int32 }
+
+val once = (i: Int32): Int32 =>
+  var ts: T[] = []
+  push(ts, { "legs": [{ "d": i }], "a": i })
+  push(ts, { "legs": [{ "d": i + 1 }, { "d": i + 2 }], "a": i + 10 })
+  val ds: Int32[] = map(ts, (x) => x["a"])
+  ds[0] + ds[1] + length(ts[1]["legs"])
+
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc
+  else loop(i + 1, n, acc + once(i))
+
+print(toString(loop(0, 1000, 0)))
+"#);
+    // per i: ds[0]=i, ds[1]=i+10, legs(ts[1])=2  => 2*i + 12
+    // sum over i in 0..1000 = 2*sum(0..999) + 12*1000 = 999000 + 12000 = 1011000
+    assert_eq!(out, vec!["1011000"]);
 }
 
 #[test]
