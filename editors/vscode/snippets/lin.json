@@ -49,28 +49,13 @@
     "body": "match ${1:expr}\n  is ${2:Error} => ${3:fallback}\n  else => ${1:expr}",
     "description": "Match narrowing on a type with `is`"
   },
-  "map chain": {
-    "prefix": "map",
-    "body": "${1:items}.map(${2:x} => ${3:$2})",
-    "description": "Dot-applied map over an iterable"
-  },
-  "filter chain": {
-    "prefix": "filter",
-    "body": "${1:items}.filter(${2:x} => ${3:$2 > 0})",
-    "description": "Dot-applied filter over an iterable"
-  },
-  "reduce chain": {
-    "prefix": "reduce",
-    "body": "${1:items}.reduce(${2:0}, (${3:acc}, ${4:x}) => ${5:$3 + $4})",
-    "description": "Dot-applied reduce over an iterable"
-  },
   "test block": {
     "prefix": "test",
     "body": "test(\"${1:description}\", () => [\n  expect(${2:actual}).toBe(${3:expected})\n])",
     "description": "A single test case with an expectation"
   },
   "suite": {
-    "prefix": "suite",
+    "prefix": "testsuite",
     "body": "import { expect, toBe, test, suite, run } from \"std/test\"\n\nval s = suite(\"${1:suite name}\", [\n  test(\"${2:description}\", () => [\n    expect(${3:actual}).toBe(${4:expected})\n  ])\n])\n\nrun(s)",
     "description": "A test suite scaffold with std/test imports and run"
   }
