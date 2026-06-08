@@ -197,22 +197,19 @@ impl Type {
     /// SINGLE definition. Any disagreement between the lowerer's ownership/Coerce insertion and
     /// codegen's physical layout would be a UAF / mis-read, which is exactly why this is centralised.
     ///
-    /// CURRENTLY: scalars + Bool only (Stage 3a). Widening to `String` was ATTEMPTED (Stage 3b
-    /// step 1, 2026-06-08) and proved UNSAFE on the DYNAMIC-READ path, so it is held back:
-    ///   - The mechanism-(i) materialize-on-read (`materialize_sealed_elem_boxed`) AND the
-    ///     whole-array widen-to-`Json` (`sealed_array_to_tagged`/`__sealedarrmat`) paths LEAK the
-    ///     materialized `LinObject` per dynamic read (~100-180 B/call linear under ASan). This leak
-    ///     is PRE-EXISTING for scalar packed arrays read via `Json` too (verified on master
-    ///     f2ba971: `val j: Json = ts; j[i]` leaks identically) -- String widening only makes more
-    ///     programs hit it (and adds the retained `*LinString` to each leaked object).
-    ///   - With String packed, RAPTOR REGRESSES in CORRECTNESS: its digest changes from
-    ///     `dep=29400 arr=40680 legs=3 count=1` to `legs=4 count=2` (a wrong extra journey).
-    /// Re-enable by adding `|| self.is_string_ish()` here ONLY AFTER (a) the dynamic-read
-    /// materialize leak is fixed AND (b) the RAPTOR digest stays byte-identical. The descriptor-
-    /// driven RC primitives + `clone_sealed_array` thread-transfer are already String-complete and
-    /// harness-green for the LOCAL (non-dynamic-read) String cells; the blocker is the dynamic read.
+    /// CURRENTLY: scalars + Bool (Stage 3a) + String (Stage 3b step 1, shipped 2026-06-08). The
+    /// String widening was gated on four blockers, all now fixed: the push-into-Json-object-field
+    /// data loss (which caused a RAPTOR `legs=4` correctness regression), the dynamic-read
+    /// materialize-on-read leak, the `sealed_construct` width-subtyping extra-field panic, and the
+    /// boxed `for`/`while`/`reduce` per-element box-inner leak. Verified clean: full `cargo test`,
+    /// RAPTOR digest byte-identical (`dep=29400 arr=40680 legs=3 count=1`), the sealed harness
+    /// (String cells PASS + improved vs the boxed baseline), and ASan (String-pack `for` loop leak
+    /// constant, no UAF). NOT YET packable: scalar-array / nested-record / record-array fields — the
+    /// next Stage-3b widening steps, each landed only after the harness + RAPTOR + full ASan clear
+    /// that shape (the descriptor-driven RC primitives handle every heap-field kind uniformly; the
+    /// staging is purely widening this predicate).
     pub fn is_sealed_array_field_packable(&self) -> bool {
-        self.is_flat_scalar() || matches!(self, Type::Bool)
+        self.is_flat_scalar() || matches!(self, Type::Bool) || self.is_string_ish()
     }
 
     /// Returns true for the dynamic "any" JSON type (TypeVar(u32::MAX)).
