@@ -1614,6 +1614,53 @@ impl<'ctx> Codegen<'ctx> {
         }
     }
 
+    /// Like `sealed_array_project_from`, but ALWAYS returns a FRESH +1-OWNED packed buffer (the caller
+    /// transfers ownership, e.g. into a sealed struct slot it owns). The difference is the keep-packed
+    /// branch: `sealed_array_project_from` BORROWS the source's existing reference (no retain), which
+    /// is correct for a non-owning consumer (a match/coerce that releases the source itself). But when
+    /// a SEALED-RECORD field stores a nested packed `T[]` (`Trip { stopTimes: StopTime[] }`), the
+    /// struct OWNS its field and releases it on drop — so the value MUST be +1. Here the keep-packed
+    /// branch RETAINS the aliased buffer; the rebuild branch is already +1. Either way the result is a
+    /// fresh +1 the struct construction can store verbatim (`already_owned = true`).
+    pub(crate) fn sealed_array_project_owned(&mut self, src: BasicValueEnum<'ctx>, src_ty: &Type, arr_ty: &Type) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        if Self::sealed_array_elem(arr_ty).is_none() {
+            return ptr_ty.const_null().into();
+        }
+        let src_raw = if Self::is_union_type(src_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[src.into()], "sarrpo_unbox").try_as_basic_value().unwrap_basic()
+        } else { src };
+        let i8_ty = self.context.i8_type();
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let tag_ptr = unsafe {
+            self.builder.gep(i8_ty, src_raw.into_pointer_value(), &[i64_ty.const_int(4, false)], "sarrpo_tagp")
+        };
+        let etag = self.builder.load(i8_ty, tag_ptr, "sarrpo_etag").into_int_value();
+        let is_packed = self.builder.int_compare(IntPredicate::EQ, etag, i8_ty.const_int(0xFE, false), "sarrpo_ispk");
+        let kp_b = self.context.append_basic_block(llvm_fn, "sarrpo_kp");
+        let rebuild_b = self.context.append_basic_block(llvm_fn, "sarrpo_rebuild");
+        let merge_b = self.context.append_basic_block(llvm_fn, "sarrpo_merge");
+        self.builder.conditional_branch(is_packed, kp_b, rebuild_b);
+        // Keep-packed: the unboxed 0xFE buffer is shared with the source. To TRANSFER a +1 into the
+        // owning struct, RETAIN it (so the struct's later release is balanced against the source's own
+        // release). This is the ownership difference from `sealed_array_project_from`.
+        self.builder.position_at_end(kp_b);
+        self.builder.call(self.rt.rc_retain, &[src_raw.into_pointer_value().into()], "sarrpo_kp_retain");
+        let kp_exit = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(merge_b);
+        // Rebuild: a genuinely-boxed `Object[]` (e.g. a Json literal field) → element-wise rebuild into
+        // a fresh +1 packed buffer.
+        self.builder.position_at_end(rebuild_b);
+        let rebuilt = self.sealed_array_rebuild_from_boxed(src_raw, arr_ty);
+        let rebuild_exit = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(merge_b);
+        self.builder.position_at_end(merge_b);
+        let phi = self.builder.phi(ptr_ty, "sarrpo_phi");
+        phi.add_incoming(&[(&src_raw, kp_exit), (&rebuilt, rebuild_exit)]);
+        phi.as_basic_value()
+    }
+
     /// Element-by-element rebuild of a sealed-record array from a genuinely-boxed `Object[]` source
     /// (each element a boxed `LinObject` projected into the packed element layout). The cold path of
     /// `sealed_array_project_from` — used only when the source is NOT already a keep-packed 0xFE
@@ -2057,6 +2104,23 @@ impl<'ctx> Codegen<'ctx> {
             // into `sealed_project_from`, producing a FRESH +1 sealed struct → transfer ownership
             // (`already_owned = true`, no extra retain).
             let tagged = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "sealed_proj_get").try_as_basic_value().unwrap_basic();
+            // A PACKED-SEALED-ARRAY field (`StopTime[]` inside `Trip`): the Json source holds this as a
+            // boxed/tagged `Object[]`, but the target packed slot expects a contiguous packed `T[]`
+            // (0xFE) buffer — storing the boxed array verbatim would make the later materialize read
+            // the boxed `Object[]`'s element pointers as inline packed bytes (a misaligned heap-field
+            // deref). PROJECT the boxed array into a fresh +1 packed buffer (this rebuilds element-wise
+            // for a genuinely-boxed source, and clones-by-pointer for an already-packed one), then
+            // transfer that fresh +1 into the struct slot (`already_owned = true`). Mirrors the nested
+            // SEALED-RECORD field below (also a fresh +1 projection).
+            if Self::sealed_array_elem(&fty).is_some() {
+                // Pass the boxed TaggedVal* with a union src_ty so `sealed_array_project_owned` unboxes
+                // it to the raw `LinArray*` internally. `_owned` ALWAYS yields a fresh +1 (retains a
+                // keep-packed alias, rebuilds a boxed `Object[]`), which the struct stores verbatim and
+                // releases on drop (`already_owned = true`).
+                let packed = self.sealed_array_project_owned(tagged, &Type::TypeVar(u32::MAX), &fty);
+                vals.push((k.clone(), packed, fty, true));
+                continue;
+            }
             let v = self.unbox_tagged_val_to_type(tagged, &fty);
             let owned = matches!(fty, Type::Object { .. }) && Self::sealed_fields(&fty).is_some();
             vals.push((k.clone(), v, fty, owned));
