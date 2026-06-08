@@ -18,6 +18,7 @@
 // The only fault case in the module is an invalid pattern, which surfaces as the canonical
 // `Error` value from `compile`. Everything downstream of a successfully compiled `Regex` is
 // total (returns Null / Boolean / arrays, never Error).
+
 export type Regex = Json
 
 // A single match. NOTE (deviation from the proposal): `groups` is typed `Json` rather than

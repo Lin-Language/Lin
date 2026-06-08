@@ -13,15 +13,6 @@ Number policy is target-driven: an integer target requires an in-range integral 
 float target accepts any number; a Json/unconstrained target accepts any number as-is.
 Union targets pick the FIRST structurally-matching variant.
 
-Decode a Json value against a target type (compiler special form; see the module header).
-- **`_`** — the target TYPE (e.g. `Person`); use the `Person.fromJson(json)` or
-  `fromJson(Person, json)` form. No ordinary value-level wrapper can express a type argument.
-- **`value`** — the Json value to decode.
-- **Returns** the decoded `T`, or an `Error` `{ type, message, path }` at the first structural
-  mismatch. (The export exists so the import resolves and `lin check` does not flag `fromJson`;
-  its body is never evaluated — the checker rewrites real call sites into the decode special
-  form.)
-
 ## Reference
 
 #### `fromJson`
@@ -30,6 +21,14 @@ Decode a Json value against a target type (compiler special form; see the module
 val fromJson = (_: Json, value: Json): Json
 ```
 
+Decode a Json value against a target type (compiler special form; see the module header).
+- **`_`** — the target TYPE (e.g. `Person`); use the `Person.fromJson(json)` or
+  `fromJson(Person, json)` form. No ordinary value-level wrapper can express a type argument.
+- **`value`** — the Json value to decode.
+- **Returns** the decoded `T`, or an `Error` `{ type, message, path }` at the first structural
+  mismatch. (The export exists so the import resolves and `lin check` does not flag `fromJson`;
+  its body is never evaluated — the checker rewrites real call sites into the decode special
+  form.)
 
 #### `toJsonString`
 

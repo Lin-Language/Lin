@@ -36,11 +36,6 @@ Maintainer note: Stream is opaque — `compat.rs` forbids every non-stream opera
 `Stream` value. Transform closures operate on boxed `Json` items (a chunk is `UInt8[]`, a line
 is `String` — both JSON-compatible), so map/filter take `(Json) => Json` / `(Json) => Boolean`.
 
-`readStream(path)` opens a file as a lazy byte stream (`Stream<UInt8[]>`, or an `Error` if the
-file cannot be opened); no bytes are read until a terminal op drives it. Example:
-
-  readStream("notes.txt").readText()   // file contents as String | Error
-
 ## Reference
 
 #### `readStream`
@@ -49,6 +44,10 @@ file cannot be opened); no bytes are read until a terminal op drives it. Example
 val readStream = (path: String)
 ```
 
+`readStream(path)` opens a file as a lazy byte stream (`Stream<UInt8[]>`, or an `Error` if the
+file cannot be opened); no bytes are read until a terminal op drives it. Example:
+
+  readStream("notes.txt").readText()   // file contents as String | Error
 
 #### `lines`
 

@@ -7650,6 +7650,16 @@ fn test_fmt_preserves_blank_line_between_leading_comments() {
     // No blank between comments stays no blank (the common doc-comment-on-its-decl case).
     let glued = "// header\n// doc\nval y = (): Int32 =>\n  2\n";
     assert_eq!(fmt(glued), glued, "adjacent comments must stay adjacent");
+
+    // A blank between the LAST leading comment and the declaration itself is also preserved — this
+    // is the module-header-runs-straight-into-the-first-`export` case (no comment between). It lets
+    // the docs generator separate the page intro from the first declaration cleanly.
+    let hdr = "// module header\nval z = (): Int32 =>\n  3\n";
+    let hdr_sep = "// module header\n\nval z = (): Int32 =>\n  3\n";
+    assert_eq!(fmt(hdr_sep), hdr_sep, "blank between header and decl must be preserved");
+    assert_eq!(fmt(&fmt(hdr_sep)), hdr_sep, "header/decl blank must be idempotent");
+    // ...but a doc comment with NO blank still hugs its declaration (the overwhelmingly common case).
+    assert_eq!(fmt(hdr), hdr, "doc comment with no blank must stay glued to its declaration");
 }
 
 // ── Formatter must never change program meaning ───────────────────────────────
