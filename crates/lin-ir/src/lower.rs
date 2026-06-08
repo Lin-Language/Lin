@@ -1511,14 +1511,15 @@ fn nested_sealed_repr_change(from: &Type, to: &Type) -> bool {
 }
 
 /// A field type permitted in a sealed record: a scalar (numeric or Bool) OR an eligible heap field
-/// (String/Array/nested-sealed). Mirrors `Codegen::is_sealed_field`. A nested-sealed field recurses
-/// into `is_sealed_scalar_repr`; a self-recursive type survives resolution as `Type::Named` (not an
-/// inlined `Object`), so the recursion terminates and a cyclic record stays boxed (fail-safe).
+/// (String/Array/Map/nested-sealed). Mirrors `Codegen::is_sealed_field`. A nested-sealed field
+/// recurses into `is_sealed_scalar_repr`; a self-recursive type survives resolution as `Type::Named`
+/// (not an inlined `Object`), so the recursion terminates and a cyclic record stays boxed (fail-safe).
 fn is_sealed_field_ty(ty: &Type) -> bool {
     ty.is_flat_scalar()
         || matches!(ty, Type::Bool)
         || ty.is_string_ish()
         || matches!(ty, Type::Array(_) | Type::FixedArray(_))
+        || matches!(ty, Type::Map(_))
         || is_sealed_scalar_repr(ty)
 }
 

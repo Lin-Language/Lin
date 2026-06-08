@@ -61,6 +61,17 @@ pub const KIND_ARRAY: u32 = 2;
 /// Nested sealed-record `*struct` heap field → `lin_sealed_release_self` on drop (which recurses
 /// via the nested struct's OWN descriptor), deep-copied on transfer via `clone_sealed`.
 pub const KIND_SEALED: u32 = 3;
+/// `*LinMap` (a `{ String: T }` index-signature map) heap field → `lin_map_release` on drop,
+/// deep-copied on transfer via `clone_map`. A Map field lives inline in the packed struct as an
+/// owned (+1) `*LinMap` pointer slot, exactly like a String/Array heap field.
+///
+/// NOTE on the numeric value: this collides with `sumnode::KIND_SUMNODE = 4`, but the two live in
+/// SEPARATE descriptor namespaces — a SEALED-record field descriptor (walked by `sealed::release_field`)
+/// never carries `KIND_SUMNODE`, and a SUM-NODE variant descriptor (walked by `sumnode::release_field`)
+/// never carries `KIND_MAP` (a sum-node variant cannot have a Map field today). A Map field nested
+/// inside a sealed record reached from a sum node is released through THAT sealed record's own
+/// descriptor via `sealed::release_field`, so the value `4` is always interpreted in the right walk.
+pub const KIND_MAP: u32 = 4;
 
 /// Read the descriptor pointer from a sealed struct's header (offset 8). Null = no heap fields.
 #[inline]
@@ -104,6 +115,7 @@ unsafe fn release_field(payload: *mut u8, kind: u32) {
         KIND_STRING => crate::string::lin_string_release(payload as *mut crate::string::LinString),
         KIND_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
         KIND_SEALED => lin_sealed_release_self(payload),
+        KIND_MAP => crate::map::lin_map_release(payload as *mut crate::map::LinMap),
         // KIND_SCALAR / unknown: never recorded in a descriptor; defensively a no-op.
         _ => {}
     }
@@ -278,6 +290,7 @@ pub const NKIND_BOOL: u32 = 5; // Bool → lin_box_bool
 pub const NKIND_STRING: u32 = 6; // *LinString heap field → retain + lin_box_str
 pub const NKIND_ARRAY: u32 = 7; // *LinArray heap field → retain + lin_box_array
 pub const NKIND_SEALED: u32 = 8; // *sealed-struct heap field → recurse via nested NamedDesc
+pub const NKIND_MAP: u32 = 9; // *LinMap heap field → retain + lin_box_map
 
 /// Read a NamedField row at byte offset `cur` in the blob. Returns the parsed fields and the offset
 /// just past the row (so the caller can walk to the next field).
@@ -300,7 +313,7 @@ unsafe fn read_named_field(base: *const u8, cur: usize) -> (u32, u32, *const u8,
 /// its own +1. `nested` is the nested NamedDesc for `NKIND_SEALED` (else ignored). Returns a fresh
 /// heap `TaggedVal*` the caller owns (and must `lin_tagged_release`).
 unsafe fn box_named_heap_field(p: *mut u8, nkind: u32, nested: *const u8) -> *mut u8 {
-    use crate::tagged::{TAG_OBJECT, lin_box_str, lin_box_array, alloc_tagged};
+    use crate::tagged::{TAG_OBJECT, lin_box_str, lin_box_array, lin_box_map, alloc_tagged};
     match nkind {
         NKIND_STRING => {
             crate::memory::lin_rc_retain(p as *mut u32);
@@ -309,6 +322,10 @@ unsafe fn box_named_heap_field(p: *mut u8, nkind: u32, nested: *const u8) -> *mu
         NKIND_ARRAY => {
             crate::memory::lin_rc_retain(p as *mut u32);
             lin_box_array(p)
+        }
+        NKIND_MAP => {
+            crate::memory::lin_rc_retain(p as *mut u32);
+            lin_box_map(p)
         }
         NKIND_SEALED => {
             // A nested sealed record stored as a STANDALONE struct (with header). Recurse to a fresh
@@ -371,7 +388,7 @@ unsafe fn materialize_named_payload(payload: *const u8, named_desc: *const u8) -
                 let tv = TaggedVal { tag: TAG_BOOL, _pad: [0; 7], payload: (v != 0) as u64 };
                 crate::object::lin_object_set_fresh(obj, key, &tv);
             }
-            NKIND_STRING | NKIND_ARRAY | NKIND_SEALED => {
+            NKIND_STRING | NKIND_ARRAY | NKIND_SEALED | NKIND_MAP => {
                 // Heap field: the slot holds an 8-byte owned pointer.
                 let p = *(slot as *const *mut u8);
                 if p.is_null() {
