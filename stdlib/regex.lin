@@ -1,0 +1,82 @@
+// std/regex — RE2-style regular expressions (linear time, no backtracking, no ReDoS).
+//
+// Compile a pattern once into an opaque `Regex` handle, then match / search / replace / split
+// against any string. The matching engine is the Rust `regex` crate behind `lin_regex_*`
+// intrinsics. All offsets exposed here are CODEPOINT offsets (Lin strings are codepoint-aware).
+//
+// `Regex` is a program-lifetime IMMORTAL handle (like `Timer` from std/time): a compiled
+// pattern is never freed, which makes it freely shareable and removes a whole class of
+// use-after-free handle bugs. Under the hood the handle is a pointer to the leaked compiled
+// engine, boxed as an `Int64`; treat it as opaque.
+//
+// `Regex` is aliased to `Json` (not `Int64`) deliberately: an `X | Error` union with a
+// *scalar* member `X` hits an `is Error` narrowing/codegen gap (the else branch is not
+// narrowed, and an `Int64 | Error` PHI miscompiles) — see DEVIATIONS in docs/STDLIB.md. A
+// boxed `Json` member narrows correctly, so `if compile(p) is Error then ... else isMatch(re, ...)`
+// — the proposal's primary idiom — type-checks and runs.
+//
+// The only fault case in the module is an invalid pattern, which surfaces as the canonical
+// `Error` value from `compile`. Everything downstream of a successfully compiled `Regex` is
+// total (returns Null / Boolean / arrays, never Error).
+export type Regex = Json
+
+// A single match. NOTE (deviation from the proposal): `groups` is typed `Json` rather than
+// `(String | Null)[]`, because the parser does not accept a postfix `[]` on a parenthesized
+// union type (`(String | Null)[]`) — the same limitation `std/array.compact` documents. The
+// runtime value is still a heap array whose participating groups are `String` and whose
+// non-participating positional holes are genuine `Null`; `m["groups"][1]` indexes it exactly
+// as the proposal describes. `named` is a `Json` object (absent named groups read as `Null`).
+export type Match = { "text": String, "start": Int32, "end": Int32, "groups": Json, "named": Json }
+
+import foreign "lin-runtime"
+  val lin_regex_compile: (String) => Json
+  val lin_regex_is_match: (Json, String) => Boolean
+  val lin_regex_find: (Json, String) => Json
+  val lin_regex_find_all: (Json, String) => Json
+  val lin_regex_replace: (Json, String, String, Boolean) => String
+  val lin_regex_split: (Json, String) => Json
+// compile returns either a boxed Int64 handle or an Error object => declared Json.
+// The handle is passed back into the other intrinsics as a boxed Json value (Regex = Json);
+// the Rust side reads the leaked-engine pointer out of the boxed Int64 payload.
+// find / find_all return freshly-built Match objects => declared Json, re-annotated.
+// replace returns a bare LinString (the `=> String` foreign ABI contract).
+// Compile `pattern` into a reusable Regex handle. Returns an Error value (detect with
+// `is Error`) if the pattern is not valid RE2 syntax — an unbalanced group, an unterminated
+// class, or an unsupported backreference / lookaround construct.
+export val compile = (pattern: String): Regex | Error =>
+  lin_regex_compile(pattern)
+
+// True if `re` matches anywhere within `s`. Cheapest operation; allocates no Match.
+export val isMatch = (re: Regex, s: String): Boolean =>
+  lin_regex_is_match(re, s)
+
+// Leftmost match of `re` in `s`, or Null if there is no match.
+export val find = (re: Regex, s: String): Match | Null =>
+  lin_regex_find(re, s)
+
+// Every non-overlapping match of `re` in `s`, left to right. Empty array if none.
+export val findAll = (re: Regex, s: String): Match[] =>
+  lin_regex_find_all(re, s)
+
+// Replace the FIRST match of `re` in `s` with `replacement` ($1 / ${name} / $$ substitution).
+// If there is no match, `s` is returned unchanged.
+export val replace = (re: Regex, s: String, replacement: String): String =>
+  lin_regex_replace(re, s, replacement, false)
+
+// Replace EVERY non-overlapping match of `re` in `s` with `replacement`.
+export val replaceAll = (re: Regex, s: String, replacement: String): String =>
+  lin_regex_replace(re, s, replacement, true)
+
+// Split `s` around each non-overlapping match of `re`. If the pattern never matches, the
+// result is the single-element array `[s]`.
+export val split = (re: Regex, s: String): String[] =>
+  lin_regex_split(re, s)
+
+// Convenience: compile `pattern` then test it against `s` in one call, propagating the
+// compile Error. Prefer `compile` + `isMatch` when matching the same pattern many times.
+export val matches = (pattern: String, s: String): Boolean | Error =>
+  val re = compile(pattern)
+  if re is Error then
+    re
+  else
+    isMatch(re, s)

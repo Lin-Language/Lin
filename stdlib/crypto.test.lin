@@ -1,0 +1,280 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { length } from "std/array"
+import { substring } from "std/string"
+import { sha256, sha256Hex, sha512, sha512Hex, sha1, sha1Hex, md5, md5Hex, hashString, hmacSha256, hmacSha256Hex, randomBytes, uuidV4, uuidV7, constantTimeEqual, toBytes, toHex, fromHex, newHasher, update, digest, digestHex } from "std/crypto"
+
+// std/crypto — verified against published known-answer test vectors (NIST FIPS 180,
+// RFC 1321 for MD5, RFC 4231 for HMAC-SHA-256). ASan-green is not sufficient; every digest
+// below is byte-checked against the canonical reference value.
+val s = suite("std/crypto", [
+  // --- SHA-256 KATs --------------------------------------------------------
+  test("sha256Hex(\"abc\") matches FIPS 180", () => [
+    expect(sha256Hex(toBytes("abc"))).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+  ]),
+
+  test("sha256Hex(\"\") matches the empty-string digest", () => [
+    expect(sha256Hex(toBytes(""))).toBe("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+  ]),
+
+  test("sha256Hex(\"hello\") matches the proposal example", () => [
+    expect(sha256Hex(toBytes("hello"))).toBe("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+  ]),
+
+  test("sha256 raw digest is 32 bytes", () => [
+    expect(length(sha256(toBytes("hello")))).toBe(32)
+  ]),
+
+  // --- SHA-512 KATs --------------------------------------------------------
+  test("sha512Hex(\"abc\") matches FIPS 180", () => [
+    expect(sha512Hex(toBytes("abc"))).toBe(
+      "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+    )
+  ]),
+
+  test("sha512Hex(\"\") matches the empty-string digest", () => [
+    expect(sha512Hex(toBytes(""))).toBe(
+      "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
+    )
+  ]),
+
+  test("sha512 raw digest is 64 bytes", () => [
+    expect(length(sha512(toBytes("abc")))).toBe(64)
+  ]),
+
+  // --- SHA-1 (legacy) KATs -------------------------------------------------
+  test("sha1Hex(\"abc\") matches FIPS 180", () => [
+    expect(sha1Hex(toBytes("abc"))).toBe("a9993e364706816aba3e25717850c26c9cd0d89d")
+  ]),
+
+  test("sha1Hex(\"\") matches the empty-string digest", () => [
+    expect(sha1Hex(toBytes(""))).toBe("da39a3ee5e6b4b0d3255bfef95601890afd80709")
+  ]),
+
+  test("sha1 raw digest is 20 bytes", () => [
+    expect(length(sha1(toBytes("abc")))).toBe(20)
+  ]),
+
+  // --- MD5 (legacy) KATs ---------------------------------------------------
+  test("md5Hex(\"\") matches RFC 1321", () => [
+    expect(md5Hex(toBytes(""))).toBe("d41d8cd98f00b204e9800998ecf8427e")
+  ]),
+
+  test("md5Hex(\"abc\") matches RFC 1321", () => [
+    expect(md5Hex(toBytes("abc"))).toBe("900150983cd24fb0d6963f7d28e17f72")
+  ]),
+
+  test("md5 raw digest is 16 bytes", () => [
+    expect(length(md5(toBytes("abc")))).toBe(16)
+  ]),
+
+  // --- hashString (dynamic dispatch + case-insensitive + fallback) ---------
+  test("hashString dispatches sha256", () => [
+    expect(hashString("abc", "sha256")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+  ]),
+
+  test("hashString dispatches sha512 case-insensitively", () => [
+    expect(hashString("abc", "SHA512")).toBe(
+      "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+    )
+  ]),
+
+  test("hashString dispatches sha1", () => [
+    expect(hashString("abc", "sha1")).toBe("a9993e364706816aba3e25717850c26c9cd0d89d")
+  ]),
+
+  test("hashString dispatches md5", () => [
+    expect(hashString("abc", "md5")).toBe("900150983cd24fb0d6963f7d28e17f72")
+  ]),
+
+  test("hashString unknown algorithm falls back to sha256", () => [
+    expect(hashString("abc", "bogus")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+  ]),
+
+  // --- HMAC-SHA-256 KATs ---------------------------------------------------
+  test("hmacSha256Hex RFC 4231 test case 2 (Jefe)", () => [
+    expect(hmacSha256Hex(toBytes("Jefe"), toBytes("what do ya want for nothing?"))).toBe("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843")
+  ]),
+
+  test("hmacSha256Hex(\"key\", quick-brown-fox) matches proposal", () => [
+    expect(
+      hmacSha256Hex(toBytes("key"), toBytes("The quick brown fox jumps over the lazy dog"))
+    ).toBe("f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")
+  ]),
+
+  test("hmacSha256 raw tag is 32 bytes", () => [
+    expect(length(hmacSha256(toBytes("key"), toBytes("msg")))).toBe(32)
+  ]),
+
+  // --- toBytes / toHex / fromHex ------------------------------------------
+  test("toBytes ASCII", () => [
+    expect(length(toBytes("hi"))).toBe(2),
+    expect(toBytes("hi")[0]).toBe(0x68),
+    expect(toBytes("hi")[1]).toBe(0x69)
+  ]),
+
+  test("toBytes multibyte UTF-8 (é = 2 bytes)", () => [
+    expect(length(toBytes("é"))).toBe(2),
+    expect(toBytes("é")[0]).toBe(0xC3),
+    expect(toBytes("é")[1]).toBe(0xA9)
+  ]),
+
+  test("toHex of known bytes", () => [
+    expect(toHex([0xDE, 0xAD, 0xBE, 0xEF])).toBe("deadbeef")
+  ]),
+
+  test("toHex of empty buffer", () =>
+    val empty: UInt8[] = []
+    [expect(toHex(empty)).toBe("")]
+  ),
+
+  test("fromHex round-trips toHex", () => [
+    expect(toHex(fromHex("deadbeef"))).toBe("deadbeef")
+  ]),
+
+  test("fromHex accepts uppercase", () => [
+    expect(toHex(fromHex("DEADBEEF"))).toBe("deadbeef")
+  ]),
+
+  test("fromHex odd length is an Error", () => [
+    expect(fromHex("abc") is Error).toBe(true)
+  ]),
+
+  test("fromHex non-hex char is an Error", () => [
+    expect(fromHex("xyz") is Error).toBe(true)
+  ]),
+
+  test("fromHex of digest bytes matches the hex form", () => [
+    expect(toHex(sha256(toBytes("abc")))).toBe(sha256Hex(toBytes("abc")))
+  ]),
+
+  // --- constantTimeEqual ---------------------------------------------------
+  test("constantTimeEqual equal buffers", () => [
+    expect(constantTimeEqual(toBytes("secret"), toBytes("secret"))).toBe(true)
+  ]),
+
+  test("constantTimeEqual differing same-length buffers", () => [
+    expect(constantTimeEqual(toBytes("secret"), toBytes("secreT"))).toBe(false)
+  ]),
+
+  test("constantTimeEqual differing lengths", () => [
+    expect(constantTimeEqual(toBytes("ab"), toBytes("abc"))).toBe(false)
+  ]),
+
+  test("constantTimeEqual on HMAC tags (dot form)", () =>
+    val tag = hmacSha256(toBytes("k"), toBytes("m"))
+    val tag2 = hmacSha256(toBytes("k"), toBytes("m"))
+    [expect(tag.constantTimeEqual(tag2)).toBe(true)]
+  ),
+
+  test("constantTimeEqual empty buffers are equal", () =>
+    val a: UInt8[] = []
+    val b: UInt8[] = []
+    [expect(constantTimeEqual(a, b)).toBe(true)]
+  ),
+
+  // --- randomBytes ---------------------------------------------------------
+  test("randomBytes(32) returns 32 bytes", () => [
+    expect(length(randomBytes(32))).toBe(32)
+  ]),
+
+  test("randomBytes(0) returns empty", () => [
+    expect(length(randomBytes(0))).toBe(0)
+  ]),
+
+  test("randomBytes negative count clamps to empty", () => [
+    expect(length(randomBytes(-5))).toBe(0)
+  ]),
+
+  test("two randomBytes draws differ (overwhelmingly)", () => [
+    expect(constantTimeEqual(randomBytes(16), randomBytes(16))).toBe(false)
+  ]),
+
+  // --- UUID ----------------------------------------------------------------
+  test("uuidV4 is 36 chars with hyphens", () => [
+    expect(length(uuidV4())).toBe(36)
+  ]),
+
+  test("uuidV4 has version-4 nibble", () =>
+    val u = uuidV4()
+    [expect(substring(u, 14, 15)).toBe("4")]
+  ),
+
+  test("uuidV4 draws are distinct", () => [
+    expect(uuidV4() == uuidV4()).toBe(false)
+  ]),
+
+  test("uuidV7 is 36 chars", () => [
+    expect(length(uuidV7())).toBe(36)
+  ]),
+
+  test("uuidV7 has version-7 nibble", () =>
+    val u = uuidV7()
+    [expect(substring(u, 14, 15)).toBe("7")]
+  ),
+
+  test("uuidV7 is time-ordered (later sorts greater)", () =>
+    val a = uuidV7()
+    val b = uuidV7()
+    [expect(a < b).toBe(true)]
+  ),
+
+  // --- streaming Hasher ----------------------------------------------------
+  test("Hasher one chunk equals one-shot sha256", () =>
+    val h = newHasher("sha256")
+    val out = if h is Error then "err" else digestHex(update(h, toBytes("abc")))
+    [
+      expect(out).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    ]
+  ),
+
+  test("Hasher chained updates equal concatenated input", () =>
+    val h = newHasher("sha256")
+    val out = if h is Error then
+      "err"
+    else
+      digestHex(update(update(update(h, toBytes("a")), toBytes("b")), toBytes("c")))
+    [
+      expect(out).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    ]
+  ),
+
+  test("Hasher digest (raw) is 32 bytes for sha256", () =>
+    val h = newHasher("sha256")
+    val n = if h is Error then -1 else length(digest(update(h, toBytes("abc"))))
+    [expect(n).toBe(32)]
+  ),
+
+  test("Hasher sha512 chained matches one-shot", () =>
+    val h = newHasher("SHA512")
+    val out = if h is Error then
+      "err"
+    else
+      digestHex(update(update(h, toBytes("a")), toBytes("bc")))
+    [
+      expect(out).toBe(
+        "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+      )
+    ]
+  ),
+
+  test("Hasher md5 empty input matches RFC 1321", () =>
+    val h = newHasher("md5")
+    val empty: UInt8[] = []
+    val out = if h is Error then "err" else digestHex(update(h, empty))
+    [expect(out).toBe("d41d8cd98f00b204e9800998ecf8427e")]
+  ),
+
+  test("newHasher unknown algorithm is an Error", () => [
+    expect(newHasher("bogus") is Error).toBe(true)
+  ]),
+
+  test("Hasher update dot-application form", () =>
+    val h = newHasher("sha256")
+    val out = if h is Error then "err" else h.update(toBytes("abc")).digestHex()
+    [
+      expect(out).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+    ]
+  )
+])
+
+run([s])

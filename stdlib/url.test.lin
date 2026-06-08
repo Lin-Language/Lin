@@ -1,0 +1,240 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { parse, build, join, withQuery, withPath } from "std/url"
+
+// Helper: build directly from a parse result, narrowing the Url | Error union. On the Error arm
+// we return a sentinel so a failed round-trip is visibly wrong rather than silently skipped.
+val roundTrip = (s: String): String =>
+  val u = parse(s)
+  match u
+    is Error => "<<error: ${u["message"]}>>"
+    else => build(u)
+
+val s = suite("std/url", [
+  // ── parse: full URL with every component ──────────────────────────────────
+  test("parse splits a full URL into all components (raw, undecoded)", () =>
+    val u = parse("https://user@example.com:8443/api/v1?tag=a%20b#top")
+    match u
+      is Error => [expect(false).toBe(true)]
+      else =>
+        [
+          expect(u["scheme"]).toBe("https"),
+          expect(u["userinfo"]).toBe("user"),
+          expect(u["host"]).toBe("example.com"),
+          expect(u["port"]).toBe(8443),
+          expect(u["path"]).toBe("/api/v1"),
+          expect(u["query"]).toBe("tag=a%20b"),
+          expect(u["fragment"]).toBe("top")
+        ]
+  ),
+
+  // ── parse: scheme is lowercased ───────────────────────────────────────────
+  test("parse lowercases the scheme (RFC 3986 §3.1) but nothing else", () =>
+    val u = parse("HTTPS://Example.COM/Path")
+    match u
+      is Error => [expect(false).toBe(true)]
+      else =>
+        [
+          expect(u["scheme"]).toBe("https"),
+          expect(u["host"]).toBe("Example.COM"),
+          expect(u["path"]).toBe("/Path")
+        ]
+  ),
+
+  // ── parse: missing parts → Null, distinct from empty ──────────────────────
+  test("absent components are Null; present-but-empty are \"\"", () =>
+    val u = parse("http://h/?")
+    match u
+      is Error => [expect(false).toBe(true)]
+      else =>
+        [
+          expect(u["userinfo"]).toBe(null),
+          expect(u["port"]).toBe(null),
+          expect(u["query"]).toBe(""), // present, empty
+          expect(u["fragment"]).toBe(null) // absent
+        ]
+  ),
+
+  test("no query at all is Null, not empty string", () =>
+    val u = parse("http://h/")
+    match u
+      is Error => [expect(false).toBe(true)]
+      else =>
+        [
+          expect(u["query"]).toBe(null),
+          expect(u["fragment"]).toBe(null),
+          expect(u["path"]).toBe("/")
+        ]
+  ),
+
+  // ── parse: relative reference (no scheme, no authority) ───────────────────
+  test("relative reference has empty scheme and host", () =>
+    val u = parse("/just/a/path?x=1")
+    match u
+      is Error => [expect(false).toBe(true)]
+      else =>
+        [
+          expect(u["scheme"]).toBe(""),
+          expect(u["host"]).toBe(""),
+          expect(u["path"]).toBe("/just/a/path"),
+          expect(u["query"]).toBe("x=1")
+        ]
+  ),
+
+  // ── parse: scheme without authority (mailto) ──────────────────────────────
+  test("scheme without // has empty host and a rootless path", () =>
+    val u = parse("mailto:nin@example.com")
+    match u
+      is Error => [expect(false).toBe(true)]
+      else =>
+        [
+          expect(u["scheme"]).toBe("mailto"),
+          expect(u["host"]).toBe(""),
+          expect(u["userinfo"]).toBe(null),
+          expect(u["path"]).toBe("nin@example.com")
+        ]
+  ),
+
+  // ── parse: IPv6 host with port ────────────────────────────────────────────
+  test("IPv6 literal host keeps its brackets and parses the trailing port", () =>
+    val u = parse("http://[::1]:8080/x")
+    match u
+      is Error => [expect(false).toBe(true)]
+      else =>
+        [
+          expect(u["host"]).toBe("[::1]"),
+          expect(u["port"]).toBe(8080),
+          expect(u["path"]).toBe("/x")
+        ]
+  ),
+
+  // ── parse: Error arm ──────────────────────────────────────────────────────
+  test("non-numeric port is an Error", () =>
+    val u = parse("http://h:notaport/")
+    [
+      expect(u is Error).toBe(true),
+      expect(u["type"]).toBe("error")
+    ]
+  ),
+
+  test("a raw space in the path is an Error", () =>
+    [expect(parse("http://h/a b") is Error).toBe(true)]
+  ),
+
+  test("an unterminated IPv6 host is an Error", () =>
+    [expect(parse("http://[::1/x") is Error).toBe(true)]
+  ),
+
+  test("a malformed percent-escape is an Error", () =>
+    [expect(parse("http://h/a%2") is Error).toBe(true)]
+  ),
+
+  // ── build: round-trips parse for well-formed inputs ───────────────────────
+  test("build is the inverse of parse (round-trip fidelity)", () =>
+    [
+      expect(roundTrip("https://user@example.com:8443/api/v1?tag=a%20b#top")).toBe("https://user@example.com:8443/api/v1?tag=a%20b#top"),
+      expect(roundTrip("http://h/?")).toBe("http://h/?"),
+      expect(roundTrip("http://h/")).toBe("http://h/"),
+      expect(roundTrip("/just/a/path?x=1")).toBe("/just/a/path?x=1"),
+      expect(roundTrip("mailto:nin@example.com")).toBe("mailto:nin@example.com"),
+      expect(roundTrip("http://[::1]:8080/x")).toBe("http://[::1]:8080/x"),
+      expect(roundTrip("ftp://host")).toBe("ftp://host")
+    ]
+  ),
+
+  // ── build: from a hand-built record (dot-call form not applicable) ────────
+  test("build assembles a record literal with separators only for present parts", () =>
+    [
+      expect(build({
+        "scheme": "https",
+        "userinfo": null,
+        "host": "example.com",
+        "port": null,
+        "path": "/search",
+        "query": "q=lin",
+        "fragment": null
+      })).toBe("https://example.com/search?q=lin")
+    ]
+  ),
+
+  // ── join: RFC 3986 §5 reference resolution ────────────────────────────────
+  test("join resolves a relative ../ reference (RFC 3986 example)", () =>
+    [expect(join("http://a/b/c/d", "../g")).toBe("http://a/b/g")]
+  ),
+
+  test("join: absolute-path reference replaces the whole path", () =>
+    [
+      expect(join("https://example.com/a/b", "/x")).toBe("https://example.com/x")
+    ]
+  ),
+
+  test("join: scheme-relative reference swaps the authority", () =>
+    [
+      expect(join("https://example.com/a/b", "//cdn.example.com/x")).toBe("https://cdn.example.com/x")
+    ]
+  ),
+
+  test("join: query-only reference replaces the query", () =>
+    [
+      expect(join("https://example.com/a/b?q=1", "?q=2")).toBe("https://example.com/a/b?q=2")
+    ]
+  ),
+
+  test("join: fragment-only reference appends a fragment", () =>
+    [
+      expect(join("https://example.com/a/b", "#frag")).toBe("https://example.com/a/b#frag")
+    ]
+  ),
+
+  test("join: an absolute reference is returned as-is", () =>
+    [
+      expect(join("https://example.com/a/b", "https://other/")).toBe("https://other/")
+    ]
+  ),
+
+  test("join: dot-call form reads as resolve-against-base", () =>
+    [
+      expect("https://example.com/a/b/c".join("../d")).toBe("https://example.com/a/d")
+    ]
+  ),
+
+  test("join: a non-absolute base is an Error", () =>
+    [expect(join("/relative/base", "x") is Error).toBe(true)]
+  ),
+
+  // ── withQuery / withPath ──────────────────────────────────────────────────
+  test("withQuery replaces the query (function form)", () =>
+    val u = parse("https://api/items?page=1")
+    match u
+      is Error => [expect(false).toBe(true)]
+      else =>
+        [
+          expect(withQuery(u, "page=2")["query"]).toBe("page=2"),
+          expect(build(withQuery(u, "page=2"))).toBe("https://api/items?page=2")
+        ]
+  ),
+
+  test("withPath replaces the path, preserving the query (dot-call form)", () =>
+    val u = parse("https://api/v1/users?x=1")
+    match u
+      is Error => [expect(false).toBe(true)]
+      else =>
+        [
+          expect(build(u.withPath("/v2/users"))).toBe("https://api/v2/users?x=1")
+        ]
+  ),
+
+  // ── Unicode / percent-escapes preserved verbatim ──────────────────────────
+  test("percent-escapes are preserved verbatim (no decoding)", () =>
+    val u = parse("https://h/p%C3%A9?q=%E2%9C%93")
+    match u
+      is Error => [expect(false).toBe(true)]
+      else =>
+        [
+          expect(u["path"]).toBe("/p%C3%A9"),
+          expect(u["query"]).toBe("q=%E2%9C%93"),
+          expect(build(u)).toBe("https://h/p%C3%A9?q=%E2%9C%93")
+        ]
+  )
+])
+
+run(s)

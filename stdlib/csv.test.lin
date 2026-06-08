@@ -1,0 +1,271 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { parse, parseWithHeader, stringify, stringifyRecords, rows as csvRows, recordRows } from "std/csv"
+import { toString, contains } from "std/string"
+import { length } from "std/array"
+import { readStream } from "std/stream"
+import { writeFile } from "std/fs"
+import { reduce } from "std/iter"
+
+// ── eager-result unwrap helpers ───────────────────────────────────────────────
+// A `T | Error` result cannot be `match`ed inside a parenthesised test lambda (multi-line match is
+// suppressed in parens), so unwrap to a stable comparable shape at module scope. `parse`/`stringify`
+// are the surface; these turn the result into a `.toString()`-comparable form or an "ERR" marker.
+val rowsStr = (r: Json): String =>
+  match r
+    is Error => "ERR"
+    else => r.toString()
+
+val errMsg = (r: Json): String =>
+  match r
+    is Error => "${r["message"]}"
+    else => "NO-ERR"
+
+// A header record's field, or "MISSING" if the row is an Error / the key is absent.
+val recField = (r: Json, i: Int32, key: String): String =>
+  match r
+    is Error => "ERR"
+    else =>
+      val v = r[i][key]
+      if v == null then "MISSING" else "${v}"
+
+val recCount = (r: Json): Int32 =>
+  match r
+    is Error => 0 - 1
+    else => length(r)
+
+// ── streaming: fold a Stream<String[]> to a "row1|row2|..." String at the terminal ────────────
+val streamRowsStr = (path: String): String =>
+  val outcome = readStream(path)
+    .csvRows()
+    .reduce(
+      "",
+      (acc, row) => if acc == "" then row.toString() else "${acc} :: ${row.toString()}"
+    )
+  match outcome
+    is Error => "ERR: ${outcome["message"]}"
+    else => outcome
+
+val streamRecordsStr = (path: String): String =>
+  val outcome = readStream(path)
+    .recordRows()
+    .reduce(
+      "",
+      (acc, rec) => if acc == "" then rec["note"] else "${acc} :: ${rec["note"]}"
+    )
+  match outcome
+    is Error => "ERR: ${outcome["message"]}"
+    else => outcome
+
+val streamErr = (path: String): String =>
+  val outcome = readStream(path)
+    .csvRows()
+    .reduce(0, (acc, row) => acc + 1)
+  match outcome
+    is Error => "ERR"
+    else => "NO-ERR (${outcome})"
+
+val s = suite("std/csv", [
+  // ── parse ─────────────────────────────────────────────────────────────────
+  test("parse simple rows", () => [
+    expect(rowsStr(parse("a,b,c\n1,2,3\n"))).toBe("[[\"a\", \"b\", \"c\"], [\"1\", \"2\", \"3\"]]")
+  ]),
+
+  test("parse dot-application form", () => [
+    expect(rowsStr("a,b\n1,2\n".parse())).toBe("[[\"a\", \"b\"], [\"1\", \"2\"]]")
+  ]),
+
+  test("parse empty input is []", () => [
+    expect(rowsStr(parse(""))).toBe("[]")
+  ]),
+
+  test("parse no trailing newline", () => [
+    expect(rowsStr(parse("a,b\n1,2"))).toBe("[[\"a\", \"b\"], [\"1\", \"2\"]]")
+  ]),
+
+  test("parse trailing newline yields no spurious empty row", () => [
+    expect(recCount(parse("a,b\n1,2\n"))).toBe(2)
+  ]),
+
+  test("parse quoted field with embedded comma", () => [
+    expect(rowsStr(parse("a,\"b,c\"\n"))).toBe("[[\"a\", \"b,c\"]]")
+  ]),
+
+  test("parse quoted field with embedded newline", () => [
+    expect(rowsStr(parse("a,\"line one\nline two\"\n"))).toBe("[[\"a\", \"line one\nline two\"]]")
+  ]),
+
+  test("parse escaped quote inside quoted field", () => [
+    // name,quote / Ada,"she said ""hi"""  ->  field is: she said "hi"
+    expect(rowsStr(parse("name,quote\nAda,\"she said \"\"hi\"\"\"\n"))).toBe("[[\"name\", \"quote\"], [\"Ada\", \"she said \"hi\"\"]]")
+  ]),
+
+  test("parse CRLF line endings", () => [
+    expect(rowsStr(parse("a,b\r\n1,2\r\n"))).toBe("[[\"a\", \"b\"], [\"1\", \"2\"]]")
+  ]),
+
+  test("parse ragged rows are preserved, not padded", () => [
+    expect(rowsStr(parse("a,b,c\n1,2\n3,4,5,6\n"))).toBe("[[\"a\", \"b\", \"c\"], [\"1\", \"2\"], [\"3\", \"4\", \"5\", \"6\"]]")
+  ]),
+
+  test("parse multibyte/unicode field preserved", () => [
+    expect(rowsStr(parse("name,city\nAda,Zürich\n"))).toBe("[[\"name\", \"city\"], [\"Ada\", \"Zürich\"]]")
+  ]),
+
+  // ── delimiter / options ─────────────────────────────────────────────────────
+  test("parse TSV via delimiter option", () => [
+    expect(rowsStr(parse("a\tb\n1\t2\n", { "delimiter": "\t" }))).toBe("[[\"a\", \"b\"], [\"1\", \"2\"]]")
+  ]),
+
+  test("parse semicolon delimiter", () => [
+    expect(rowsStr(parse("a;b\n1;2\n", { "delimiter": ";" }))).toBe("[[\"a\", \"b\"], [\"1\", \"2\"]]")
+  ]),
+
+  test("parse trim unquoted fields", () => [
+    expect(rowsStr(parse("  a  ,  b  \n", { "trim": true }))).toBe("[[\"a\", \"b\"]]")
+  ]),
+
+  test("parse trim preserves quoted whitespace", () => [
+    expect(rowsStr(parse("\"  a  \",b\n", { "trim": true }))).toBe("[[\"  a  \", \"b\"]]")
+  ]),
+
+  // ── error arms ──────────────────────────────────────────────────────────────
+  test("parse unterminated quote is an Error", () => [
+    expect(errMsg(parse("a,\"oops\n")).contains("malformed")).toBe(true)
+  ]),
+
+  test("parse stray quote in unquoted field is an Error", () => [
+    expect(errMsg(parse("a,b\"c\n")).contains("malformed")).toBe(true)
+  ]),
+
+  test("parse invalid multi-char delimiter is an Error", () => [
+    expect(errMsg(parse("a,b\n", { "delimiter": ",," })).contains("delimiter")).toBe(true)
+  ]),
+
+  // ── parseWithHeader ───────────────────────────────────────────────────────
+  test("parseWithHeader keys by header", () => [
+    expect(recField(parseWithHeader("name,age\nAda,36\nBob,30\n"), 0, "name")).toBe("Ada"),
+    expect(recField(parseWithHeader("name,age\nAda,36\nBob,30\n"), 1, "age")).toBe("30")
+  ]),
+
+  test("parseWithHeader empty / header-only is []", () => [
+    expect(recCount(parseWithHeader(""))).toBe(0),
+    expect(recCount(parseWithHeader("name,age\n"))).toBe(0)
+  ]),
+
+  test("parseWithHeader duplicate header last-wins", () => [
+    expect(recField(parseWithHeader("a,b,a\n1,2,3\n"), 0, "a")).toBe("3")
+  ]),
+
+  test("parseWithHeader ragged short row omits trailing key", () => [
+    // header name,age,city ; row Ada,36 -> city missing
+    expect(recField(parseWithHeader("name,age,city\nAda,36\n"), 0, "city")).toBe("MISSING"),
+    expect(recField(parseWithHeader("name,age,city\nAda,36\n"), 0, "name")).toBe("Ada")
+  ]),
+
+  test("parseWithHeader propagates parse Error", () => [
+    expect(errMsg(parseWithHeader("a,\"oops\n")).contains("malformed")).toBe(true)
+  ]),
+
+  // ── stringify ─────────────────────────────────────────────────────────────
+  test("stringify plain rows", () => [
+    expect(stringify([["a", "b"], ["1", "2"]])).toBe("a,b\n1,2\n")
+  ]),
+
+  test("stringify quotes only special fields", () => [
+    expect(stringify([["plain", "has,comma", "has\"quote", "has\nnewline"]])).toBe("plain,\"has,comma\",\"has\"\"quote\",\"has\nnewline\"\n")
+  ]),
+
+  test("stringify dot-application form", () => [
+    expect([["x", "y"]].stringify()).toBe("x,y\n")
+  ]),
+
+  test("stringify empty rows is empty string", () => [
+    expect(stringify([])).toBe("")
+  ]),
+
+  test("stringify TSV delimiter", () => [
+    expect(stringify([["a", "b"]], { "delimiter": "\t" })).toBe("a\tb\n")
+  ]),
+
+  // ── stringifyRecords ────────────────────────────────────────────────────────
+  // Column order follows the map's key-iteration order. For Lin's typed `{ String: String }` maps
+  // that is the runtime's hash order, NOT first-seen insertion order (a deviation from the proposal
+  // — see csv.lin; typed maps do not preserve insertion order today). The values must still be
+  // correctly associated and the output must round-trip; we assert that via parseWithHeader rather
+  // than a fixed header string.
+  test("stringifyRecords emits a header and one row per record", () =>
+    val recs: { String: String }[] = [{ "name": "Ada", "age": "36" }, { "name": "Bob", "age": "30" }]
+    val out = stringifyRecords(recs)
+    [
+      expect(recField(parseWithHeader(out), 0, "name")).toBe("Ada"),
+      expect(recField(parseWithHeader(out), 0, "age")).toBe("36"),
+      expect(recField(parseWithHeader(out), 1, "name")).toBe("Bob"),
+      expect(recField(parseWithHeader(out), 1, "age")).toBe("30")
+    ]
+  ),
+
+  test("stringifyRecords union of keys, missing column -> empty field", () =>
+    val recs: { String: String }[] = [{ "a": "1" }, { "a": "2", "b": "y" }]
+    val out = stringifyRecords(recs)
+    [
+      // Record 0 has no "b": stringifyRecords emits an EMPTY field for it, which round-trips back
+      // to "" (present-but-empty), not absence. Record 1 has both.
+      expect(recField(parseWithHeader(out), 0, "a")).toBe("1"),
+      expect(recField(parseWithHeader(out), 0, "b")).toBe(""),
+      expect(recField(parseWithHeader(out), 1, "a")).toBe("2"),
+      expect(recField(parseWithHeader(out), 1, "b")).toBe("y")
+    ]
+  ),
+
+  test("stringifyRecords empty array is empty string", () =>
+    val recs: { String: String }[] = []
+    [
+      expect(stringifyRecords(recs)).toBe("")
+    ]
+  ),
+
+  // ── round-trip ────────────────────────────────────────────────────────────
+  test("parse . stringify round-trips arbitrary fields", () =>
+    val orig = [["a", "b"], ["x,y", "z\"q"], ["m\nn", "p"]]
+    [
+      expect(rowsStr(parse(stringify(orig)))).toBe(orig.toString())
+    ]
+  ),
+
+  test("parseWithHeader . stringifyRecords round-trips", () =>
+    val recs: { String: String }[] = [{ "name": "Ada", "age": "36" }, { "name": "Bob", "age": "30" }]
+    [
+      expect(recField(parseWithHeader(stringifyRecords(recs)), 0, "name")).toBe("Ada"),
+      expect(recField(parseWithHeader(stringifyRecords(recs)), 1, "age")).toBe("30")
+    ]
+  ),
+
+  // ── streaming ─────────────────────────────────────────────────────────────
+  test("rows streams a multi-line quoted field as one row", () =>
+    writeFile(
+      "/tmp/lin_csv_test_multiline.csv",
+      "id,note\n1,\"line one\nline two\"\n2,plain\n"
+    )
+    [
+      expect(streamRowsStr("/tmp/lin_csv_test_multiline.csv")).toBe(
+        "[\"id\", \"note\"] :: [\"1\", \"line one\nline two\"] :: [\"2\", \"plain\"]"
+      )
+    ]
+  ),
+
+  test("recordRows keys streamed rows by the header", () =>
+    writeFile("/tmp/lin_csv_test_rec.csv", "id,note\n1,\"line one\nline two\"\n2,plain\n")
+    [
+      expect(streamRecordsStr("/tmp/lin_csv_test_rec.csv")).toBe("line one\nline two :: plain")
+    ]
+  ),
+
+  test("rows surfaces an unterminated quote as a terminal Error", () =>
+    writeFile("/tmp/lin_csv_test_bad.csv", "a,\"oops\n")
+    [
+      expect(streamErr("/tmp/lin_csv_test_bad.csv")).toBe("ERR")
+    ]
+  )
+])
+
+run(s)

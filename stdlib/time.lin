@@ -1,3 +1,6 @@
+import { toString, join } from "std/string"
+import { push } from "std/array"
+
 import foreign "lin-runtime"
   val lin_time_now: () => Int64
   val lin_time_sleep: (Int64) => Null
@@ -8,6 +11,8 @@ import foreign "lin-runtime"
   val lin_time_format: (Int64, String) => String
   val lin_time_from_iso: (String) => Json
   val lin_time_parse: (String, String) => Json
+  val lin_time_components: (Int64) => Json
+  val lin_time_from_components: (Int64, Int64, Int64, Int64, Int64, Int64, Int64) => Json
 
 export val now = (): Int64 => lin_time_now()
 export val sleep = (ms: Int64): Null => lin_time_sleep(ms)
@@ -28,3 +33,150 @@ export val fromIso = (s: String): Int64 | Error =>
 // Parse a date string with a strftime-style pattern to a Unix ms timestamp (UTC), or an Error.
 export val parse = (s: String, pattern: String): Int64 | Error =>
   lin_time_parse(s, pattern)
+
+// ===========================================================================
+// Calendar layer (additive). The canonical value stays the Unix-millisecond
+// Int64; these are pure transforms over it. month is 1-12, weekday 0=Sunday,
+// day 1-31, hour 0-23, minute/second 0-59, millis 0-999, yearDay 1-366. All
+// UTC. Full IANA timezone support is out of scope (see componentsAt/formatAt).
+// ===========================================================================
+// Break a Unix-millisecond timestamp into its UTC calendar fields. The result is
+// a Json object with integer fields:
+//   year, month (1-12), day (1-31), hour (0-23), minute/second (0-59),
+//   millis (0-999), weekday (0=Sunday..6=Saturday), yearDay (1-366).
+// (It is typed `Json` because that is how the runtime hands back a built object;
+// the field names above are stable.) Never fails: every Int64 is a valid instant.
+// Pre-1970 (negative `ts`) and far-future years are handled by the proleptic
+// Gregorian calendar, so `year` may be negative.
+export val components = (ts: Int64): Json =>
+  lin_time_components(ts)
+
+// Build a Unix-millisecond timestamp (UTC) from calendar fields, or an Error
+// (`{type:error,message}`, discriminated `is Error`) when any field is out of
+// range. `weekday`/`yearDay` are derived outputs of `components` and are ignored
+// on input — only year/month/day/hour/minute/second/millis are read (so the full
+// record returned by `components` is accepted unchanged). Out-of-range fields are
+// rejected, not normalised, so calendar typos surface as errors.
+export val fromComponents = (c: Json): Int64 | Error =>
+  lin_time_from_components(
+    c["year"],
+    c["month"],
+    c["day"],
+    c["hour"],
+    c["minute"],
+    c["second"],
+    c["millis"]
+  )
+
+// Single-field UTC extractors. Each is `components(ts).<field>`; prefer
+// `components` when you need several at once (it decomposes only once).
+export val year = (ts: Int64): Int32 => components(ts)["year"]
+export val month = (ts: Int64): Int32 => components(ts)["month"]
+export val day = (ts: Int64): Int32 => components(ts)["day"]
+export val hour = (ts: Int64): Int32 => components(ts)["hour"]
+export val minute = (ts: Int64): Int32 => components(ts)["minute"]
+export val second = (ts: Int64): Int32 => components(ts)["second"]
+export val weekday = (ts: Int64): Int32 => components(ts)["weekday"]
+export val dayOfYear = (ts: Int64): Int32 => components(ts)["yearDay"]
+
+// Fixed exact-millisecond offsets (a UTC day is always 86_400_000 ms — no DST).
+// `n` may be negative to subtract. These never fail.
+export val addDays = (ts: Int64, n: Int64): Int64 => ts + n * 86400000
+export val addHours = (ts: Int64, n: Int64): Int64 => ts + n * 3600000
+export val addMinutes = (ts: Int64, n: Int64): Int64 => ts + n * 60000
+export val addSeconds = (ts: Int64, n: Int64): Int64 => ts + n * 1000
+
+// Leap-year-aware days in a (year, month). month is 1-12.
+val daysInMonth = (y: Int64, m: Int64): Int64 =>
+  if m == 2 then
+    if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 then 29 else 28
+  else if m == 4 || m == 6 || m == 9 || m == 11 then
+    30
+  else
+    31
+
+// Add whole calendar months, clamping `day` to the last valid day of the target
+// month (e.g. Jan 31 + 1mo -> Feb 28/29). Time-of-day fields are preserved. `n`
+// may be negative. Never fails — clamping replaces what would be an invalid date.
+export val addMonths = (ts: Int64, n: Int64): Int64 =>
+  val c = components(ts)
+  val cy: Int64 = c["year"]
+  val cm: Int64 = c["month"]
+  // 0-based month index from year 0, advanced by n, then floor-split back over 12.
+  val total = cy * 12 + (cm - 1) + n
+  var ny = total / 12
+  var nm = total % 12
+  // Floor-correct the truncating `/` and `%` for negative `total`.
+  if nm < 0 then
+    nm = nm + 12
+    ny = ny - 1
+  val targetMonth = nm + 1
+  val dim = daysInMonth(ny, targetMonth)
+  val cd: Int64 = c["day"]
+  val clampedDay = if cd > dim then dim else cd
+  val built = lin_time_from_components(ny, targetMonth, clampedDay, c["hour"], c["minute"], c["second"], c["millis"])
+  // Pre-clamped, so this cannot fail; the match keeps the signature non-fallible.
+  match built
+    is Error => ts
+    else => built
+
+// Add whole calendar years, with the same month-end clamping (Feb 29 + N years
+// landing on a non-leap year clamps to Feb 28). Defined as addMonths(ts, n*12).
+export val addYears = (ts: Int64, n: Int64): Int64 => addMonths(ts, n * 12)
+
+// Signed milliseconds from `a` to `b` (exactly `b - a`). Positive when `b` is later.
+export val diff = (a: Int64, b: Int64): Int64 => b - a
+
+// Floor division by a positive divisor (for the day-index split below).
+val floorDiv = (a: Int64, b: Int64): Int64 =>
+  val q = a / b
+  if a % b != 0 && a < 0 then q - 1 else q
+
+// Whole UTC calendar days from `a` to `b`: counts date boundaries crossed (the
+// difference of the two civil day indices), not elapsed 24h spans. Signed.
+export val diffDays = (a: Int64, b: Int64): Int64 =>
+  floorDiv(b, 86400000) - floorDiv(a, 86400000)
+
+// Duration constructors. A duration in std/time is just an Int64 of milliseconds
+// (the same representation as `elapsed`/`sleep`), so these scale a unit count and
+// compose with `+`/`-`. `n` may be negative.
+export val seconds = (n: Int64): Int64 => n * 1000
+export val minutes = (n: Int64): Int64 => n * 60000
+export val hours = (n: Int64): Int64 => n * 3600000
+export val days = (n: Int64): Int64 => n * 86400000
+
+// Render a millisecond duration as a compact human string using the largest
+// non-zero units (`d h m s ms`); leading/trailing zero units are dropped, a fully
+// zero duration is "0ms", negatives are prefixed "-". Display only (no parser).
+export val formatDuration = (ms: Int64): String =>
+  if ms == 0 then
+    "0ms"
+  else
+    val sign = if ms < 0 then "-" else ""
+    var rem = if ms < 0 then 0 - ms else ms
+    val d = rem / 86400000
+    rem = rem % 86400000
+    val h = rem / 3600000
+    rem = rem % 3600000
+    val m = rem / 60000
+    rem = rem % 60000
+    val s = rem / 1000
+    val millis = rem % 1000
+    var parts: String[] = []
+    if d != 0 then push(parts, "${toString(d)}d")
+    if h != 0 then push(parts, "${toString(h)}h")
+    if m != 0 then push(parts, "${toString(m)}m")
+    if s != 0 then push(parts, "${toString(s)}s")
+    if millis != 0 then push(parts, "${toString(millis)}ms")
+    "${sign}${join(parts, " ")}"
+
+// Fixed-offset variants of `components`/`format`: `offsetMinutes` is added to the
+// instant before decomposition, so the returned/rendered fields are the local
+// wall-clock an observer at that constant UTC offset would read (the instant
+// itself is unchanged). componentsAt(ts, -300) => UTC-5; formatAt(ts, p, 330) =>
+// UTC+5:30. Full IANA tz (DST, historical offsets) is out of scope — see proposal.
+export val componentsAt = (ts: Int64, offsetMinutes: Int32): Json =>
+  components(ts + minutes(offsetMinutes))
+
+export val formatAt = (ts: Int64, pattern: String, offsetMinutes: Int32): String =>
+  format(ts + minutes(offsetMinutes), pattern)

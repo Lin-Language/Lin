@@ -23,6 +23,7 @@ import foreign "lin-runtime"
   val lin_string_starts_with: (String, String) => Boolean
   val lin_string_ends_with: (String, String) => Boolean
   val lin_string_is_blank: (String) => Boolean
+  val lin_string_from_utf8: (UInt8[]) => Json
 
 export val trim = (s: String): String =>
   lin_string_trim(s)
@@ -133,6 +134,15 @@ export val padEnd = (s: String, width: Int32, pad: String = " "): String =>
     val padLen = _length(pad)
     val padded = lin_string_repeat(pad, (needed / padLen) + 1)
     "${s}${_substring(padded, 0, needed)}"
+
+// Decode a `UInt8[]` of UTF-8 bytes into a validated `String`. The inverse of `byteAt`: where
+// `byteAt` walks a `String`'s raw UTF-8 bytes, `fromUtf8` reassembles a byte buffer back into a
+// `String`, returning an `Error` ({type:"error",message}) if the bytes are not well-formed UTF-8.
+// Unlike `fromCodePoints` (which treats each Int as a codepoint and would mojibake multi-byte
+// sequences), this validates and decodes genuine UTF-8 — use it for bytes that came from a file,
+// socket, or a base64/percent decode.
+export val fromUtf8 = (bytes: UInt8[]): String | Error =>
+  lin_string_from_utf8(bytes)
 
 export val toString = (x: Json): String =>
   lin_to_string(x)

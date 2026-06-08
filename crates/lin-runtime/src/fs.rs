@@ -180,9 +180,82 @@ pub unsafe extern "C" fn lin_fs_is_dir(path: *const u8) -> u8 {
     std::path::Path::new(&path_str).is_dir() as u8
 }
 
-/// Return file metadata as a tagged object.
-/// On success returns TaggedVal*(Object) with fields: size, modified, created, isFile, isDir.
-/// On failure returns TaggedVal*(Object error).
+/// Build a FileStat object box from a std::fs::Metadata. `is_symlink` is supplied by the
+/// caller: a following `stat` reports `false` (it resolved the link and describes the target),
+/// while `lstat` (symlink_metadata) reports whether the path itself is a link. Returns an owned
+/// `TaggedVal*(Object)` with fields: size, modified, created, isFile, isDir, isSymlink, mode.
+unsafe fn make_filestat(meta: &std::fs::Metadata, is_symlink: bool) -> *mut u8 {
+    use std::time::UNIX_EPOCH;
+    let modified = meta.modified().ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let created = meta.created().ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let size = meta.len() as i64;
+    let is_file = meta.is_file();
+    let is_dir = meta.is_dir();
+
+    let obj = lin_object_alloc(8);
+
+    let k_size = make_string("size");
+    let mut tv_size: TaggedVal = std::mem::zeroed();
+    tv_size.tag = crate::tagged::TAG_INT64;
+    tv_size.payload = size as u64;
+    lin_object_set(obj, k_size, &tv_size);
+
+    let k_modified = make_string("modified");
+    let mut tv_modified: TaggedVal = std::mem::zeroed();
+    tv_modified.tag = crate::tagged::TAG_INT64;
+    tv_modified.payload = modified as u64;
+    lin_object_set(obj, k_modified, &tv_modified);
+
+    let k_created = make_string("created");
+    let mut tv_created: TaggedVal = std::mem::zeroed();
+    tv_created.tag = crate::tagged::TAG_INT64;
+    tv_created.payload = created as u64;
+    lin_object_set(obj, k_created, &tv_created);
+
+    let k_is_file = make_string("isFile");
+    let mut tv_is_file: TaggedVal = std::mem::zeroed();
+    tv_is_file.tag = crate::tagged::TAG_BOOL;
+    tv_is_file.payload = is_file as u64;
+    lin_object_set(obj, k_is_file, &tv_is_file);
+
+    let k_is_dir = make_string("isDir");
+    let mut tv_is_dir: TaggedVal = std::mem::zeroed();
+    tv_is_dir.tag = crate::tagged::TAG_BOOL;
+    tv_is_dir.payload = is_dir as u64;
+    lin_object_set(obj, k_is_dir, &tv_is_dir);
+
+    let k_is_symlink = make_string("isSymlink");
+    let mut tv_is_symlink: TaggedVal = std::mem::zeroed();
+    tv_is_symlink.tag = crate::tagged::TAG_BOOL;
+    tv_is_symlink.payload = is_symlink as u64;
+    lin_object_set(obj, k_is_symlink, &tv_is_symlink);
+
+    #[cfg(unix)]
+    let mode: i32 = {
+        use std::os::unix::fs::MetadataExt;
+        meta.mode() as i32
+    };
+    #[cfg(not(unix))]
+    let mode: i32 = 0i32;
+
+    let k_mode = make_string("mode");
+    let mut tv_mode: TaggedVal = std::mem::zeroed();
+    tv_mode.tag = crate::tagged::TAG_INT32;
+    tv_mode.payload = mode as i64 as u64;
+    lin_object_set(obj, k_mode, &tv_mode);
+
+    alloc_tagged(TAG_OBJECT, obj as u64)
+}
+
+/// Return file metadata as a tagged object, following symlinks (reports the target).
+/// On success returns TaggedVal*(Object) with fields: size, modified, created, isFile, isDir,
+/// isSymlink (always false here), mode. On failure returns TaggedVal*(Object error).
 #[no_mangle]
 pub unsafe extern "C" fn lin_fs_stat(path: *const u8) -> *mut u8 {
     let path_str = match resolve_lin_str(path) {
@@ -191,67 +264,24 @@ pub unsafe extern "C" fn lin_fs_stat(path: *const u8) -> *mut u8 {
     };
     match std::fs::metadata(&path_str) {
         Err(e) => make_error_tagged(&e.to_string()),
+        // A following stat resolved the link, so the result describes the target: isSymlink=false.
+        Ok(meta) => make_filestat(&meta, false),
+    }
+}
+
+/// Like `stat`, but does NOT follow a final symlink: reports metadata about the link itself
+/// (isSymlink=true when `path` is a symbolic link). On failure returns TaggedVal*(Object error).
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_lstat(path: *const u8) -> *mut u8 {
+    let path_str = match resolve_lin_str(path) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid path"),
+    };
+    match std::fs::symlink_metadata(&path_str) {
+        Err(e) => make_error_tagged(&e.to_string()),
         Ok(meta) => {
-            use std::time::UNIX_EPOCH;
-            let modified = meta.modified().ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let created = meta.created().ok()
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let size = meta.len() as i64;
-            let is_file = meta.is_file();
-            let is_dir = meta.is_dir();
-
-            let obj = lin_object_alloc(8);
-
-            let k_size = make_string("size");
-            let mut tv_size: TaggedVal = std::mem::zeroed();
-            tv_size.tag = crate::tagged::TAG_INT64;
-            tv_size.payload = size as u64;
-            lin_object_set(obj, k_size, &tv_size);
-
-            let k_modified = make_string("modified");
-            let mut tv_modified: TaggedVal = std::mem::zeroed();
-            tv_modified.tag = crate::tagged::TAG_INT64;
-            tv_modified.payload = modified as u64;
-            lin_object_set(obj, k_modified, &tv_modified);
-
-            let k_created = make_string("created");
-            let mut tv_created: TaggedVal = std::mem::zeroed();
-            tv_created.tag = crate::tagged::TAG_INT64;
-            tv_created.payload = created as u64;
-            lin_object_set(obj, k_created, &tv_created);
-
-            let k_is_file = make_string("isFile");
-            let mut tv_is_file: TaggedVal = std::mem::zeroed();
-            tv_is_file.tag = crate::tagged::TAG_BOOL;
-            tv_is_file.payload = is_file as u64;
-            lin_object_set(obj, k_is_file, &tv_is_file);
-
-            let k_is_dir = make_string("isDir");
-            let mut tv_is_dir: TaggedVal = std::mem::zeroed();
-            tv_is_dir.tag = crate::tagged::TAG_BOOL;
-            tv_is_dir.payload = is_dir as u64;
-            lin_object_set(obj, k_is_dir, &tv_is_dir);
-
-            #[cfg(unix)]
-            let mode: i32 = {
-                use std::os::unix::fs::MetadataExt;
-                meta.mode() as i32
-            };
-            #[cfg(not(unix))]
-            let mode: i32 = 0i32;
-
-            let k_mode = make_string("mode");
-            let mut tv_mode: TaggedVal = std::mem::zeroed();
-            tv_mode.tag = crate::tagged::TAG_INT32;
-            tv_mode.payload = mode as i64 as u64;
-            lin_object_set(obj, k_mode, &tv_mode);
-
-            alloc_tagged(TAG_OBJECT, obj as u64)
+            let is_symlink = meta.file_type().is_symlink();
+            make_filestat(&meta, is_symlink)
         }
     }
 }
@@ -563,6 +593,198 @@ pub unsafe extern "C" fn lin_fs_write_lines(path: *const u8, arr: *const u8) -> 
     let content = lines.join("\n") + "\n";
     match std::fs::write(&path_str, content.as_bytes()) {
         Ok(_) => std::ptr::null_mut(),
+        Err(e) => make_error_tagged(&e.to_string()),
+    }
+}
+
+/// Expand a shell-glob `pattern` to every matching path, sorted, as a TaggedVal*(Array of Str).
+/// No-match is an ordinary empty array (NOT an error); only a malformed pattern is an Error.
+/// I/O errors during iteration skip the offending entry, matching shell tolerance.
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_glob(pattern: *const u8) -> *mut u8 {
+    let pat = match resolve_lin_str(pattern) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid UTF-8 pattern"),
+    };
+    let paths = match glob::glob(&pat) {
+        Ok(p) => p,
+        // A malformed pattern (e.g. an unterminated `[`-class) is the only Error outcome.
+        Err(e) => return make_error_tagged(&e.to_string()),
+    };
+    let arr = lin_array_alloc(8);
+    for entry in paths {
+        // I/O errors mid-iteration skip the entry (shell tolerance); only collect matches.
+        if let Ok(path) = entry {
+            let name = path.to_string_lossy().to_string();
+            let s = make_string(&name);
+            let mut tv: TaggedVal = std::mem::zeroed();
+            tv.tag = TAG_STR;
+            tv.payload = s as u64;
+            crate::array::lin_array_push_tagged(arr, &tv as *const TaggedVal as *const u8);
+        }
+    }
+    alloc_tagged(TAG_ARRAY, arr as u64)
+}
+
+/// Create a unique, empty temp FILE with owner-only (0600) perms; return its absolute path as a
+/// TaggedVal*(Str). `prefix`/`suffix` shape the generated name (empty string = default). The Lin
+/// side owns the lifecycle: we `.keep()` the handle so the file outlives the Rust handle and is
+/// NOT auto-deleted on drop (raw tempFile is caller-deletes; withTempFile cleans up in pure Lin).
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_temp_file(prefix: *const u8, suffix: *const u8) -> *mut u8 {
+    let prefix_str = resolve_lin_str(prefix).unwrap_or_default();
+    let suffix_str = resolve_lin_str(suffix).unwrap_or_default();
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix_str).suffix(&suffix_str);
+    let named = match builder.tempfile() {
+        Ok(f) => f,
+        Err(e) => return make_error_tagged(&e.to_string()),
+    };
+    // keep() consumes the handle WITHOUT deleting the file, handing the path to Lin.
+    match named.keep() {
+        Ok((_file, path)) => {
+            let s = make_string(&path.to_string_lossy());
+            alloc_tagged(TAG_STR, s as u64)
+        }
+        Err(e) => make_error_tagged(&e.to_string()),
+    }
+}
+
+/// Create a unique temp DIRECTORY; return its absolute path as a TaggedVal*(Str). As with
+/// tempFile, we `.keep()` the handle so the directory is NOT auto-deleted on drop — the Lin
+/// side owns the lifecycle (caller deletes with `rm(dir, { recursive: true })`).
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_temp_dir() -> *mut u8 {
+    let dir = match tempfile::TempDir::new() {
+        Ok(d) => d,
+        Err(e) => return make_error_tagged(&e.to_string()),
+    };
+    // keep() consumes the handle WITHOUT removing the directory.
+    let path = dir.keep();
+    let s = make_string(&path.to_string_lossy());
+    alloc_tagged(TAG_STR, s as u64)
+}
+
+/// Set Unix permission bits of `path` to `mode`. Returns null on success, Error on failure.
+/// On non-Unix this is a no-op returning null (consistent with `mode: 0` in stat there).
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_chmod(path: *const u8, mode: i32) -> *mut u8 {
+    let path_str = match resolve_lin_str(path) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid UTF-8 path"),
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(mode as u32);
+        match std::fs::set_permissions(&path_str, perms) {
+            Ok(_) => std::ptr::null_mut(),
+            Err(e) => make_error_tagged(&e.to_string()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = mode;
+        std::ptr::null_mut()
+    }
+}
+
+/// Create a symbolic link at `link_path` pointing at `target` (stored verbatim, may be relative
+/// and need not exist). Returns null on success, Error if `link_path` already exists or on other
+/// failure. On non-Unix returns an Error (symlinks need elevated/typed handling there).
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_symlink(target: *const u8, link_path: *const u8) -> *mut u8 {
+    let target_str = match resolve_lin_str(target) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid UTF-8 target path"),
+    };
+    let link_str = match resolve_lin_str(link_path) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid UTF-8 link path"),
+    };
+    #[cfg(unix)]
+    {
+        match std::os::unix::fs::symlink(&target_str, &link_str) {
+            Ok(_) => std::ptr::null_mut(),
+            Err(e) => make_error_tagged(&e.to_string()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target_str, link_str);
+        make_error_tagged("symlink is not supported on this platform")
+    }
+}
+
+/// Read the target string stored in the symbolic link at `path` (verbatim, not resolved).
+/// Returns a TaggedVal*(Str), or Error if `path` is not a symlink or does not exist.
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_readlink(path: *const u8) -> *mut u8 {
+    let path_str = match resolve_lin_str(path) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid UTF-8 path"),
+    };
+    match std::fs::read_link(&path_str) {
+        Ok(target) => {
+            let s = make_string(&target.to_string_lossy());
+            alloc_tagged(TAG_STR, s as u64)
+        }
+        Err(e) => make_error_tagged(&e.to_string()),
+    }
+}
+
+/// True if `path` exists and is itself a symbolic link (does NOT follow the link). Total: false
+/// for regular files, directories, non-existent paths, or invalid input. Returns u8 bool.
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_is_symlink(path: *const u8) -> u8 {
+    let path_str = match resolve_lin_str(path) {
+        Some(s) => s,
+        None => return 0,
+    };
+    match std::fs::symlink_metadata(&path_str) {
+        Ok(meta) => meta.file_type().is_symlink() as u8,
+        Err(_) => 0,
+    }
+}
+
+/// Create `path` as an empty file if absent (no parent dirs created); otherwise bump its mtime
+/// to now without changing contents. Returns null on success, Error if a parent dir is missing.
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_touch(path: *const u8) -> *mut u8 {
+    let path_str = match resolve_lin_str(path) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid UTF-8 path"),
+    };
+    // create(true) makes the file if absent; opening an existing file for write does not
+    // truncate (no .truncate(true)), preserving contents. We then set mtime to now.
+    match std::fs::OpenOptions::new().create(true).write(true).open(&path_str) {
+        Ok(_) => {}
+        Err(e) => return make_error_tagged(&e.to_string()),
+    }
+    // Bump mtime to "now" so an existing file is freshened (matches touch(1)).
+    let now = std::time::SystemTime::now();
+    let ftime = std::fs::FileTimes::new().set_modified(now).set_accessed(now);
+    match std::fs::OpenOptions::new().write(true).open(&path_str)
+        .and_then(|f| f.set_times(ftime))
+    {
+        Ok(_) => std::ptr::null_mut(),
+        Err(e) => make_error_tagged(&e.to_string()),
+    }
+}
+
+/// Resolve `path` to its canonical, absolute, symlink-free form by touching the filesystem.
+/// Returns a TaggedVal*(Str), or Error if any component does not exist.
+#[no_mangle]
+pub unsafe extern "C" fn lin_fs_realpath(path: *const u8) -> *mut u8 {
+    let path_str = match resolve_lin_str(path) {
+        Some(s) => s,
+        None => return make_error_tagged("invalid UTF-8 path"),
+    };
+    match std::fs::canonicalize(&path_str) {
+        Ok(canon) => {
+            let s = make_string(&canon.to_string_lossy());
+            alloc_tagged(TAG_STR, s as u64)
+        }
         Err(e) => make_error_tagged(&e.to_string()),
     }
 }

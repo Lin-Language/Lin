@@ -2,6 +2,7 @@ import { expect, toBe, toSucceed, toFail, test, suite, run } from "std/test"
 import { toString } from "std/string"
 import { length } from "std/array"
 import { readFile, writeFile, appendFile, readLines, readJson, writeJson, exists, isFile, isDir, stat, ls, mkdir, rm, cp, mv, readFileBytes, writeFileBytes, writeLines } from "std/fs"
+import { glob, withTempFile, withTempDir, tempFile, tempDir, chmod, symlink, readlink, isSymlink, lstat, touch, realpath } from "std/fs"
 
 val tmpRead = "/tmp/lin_test_fs_read.txt"
 val tmpExists = "/tmp/lin_test_fs_exists.txt"
@@ -252,6 +253,272 @@ val s = suite("std/fs", [
     [
       expect(result.length()).toBe(3)
     ]
+  ),
+
+  // --- std/fs extras (fs-extras proposal) ---
+  // Sandbox tests create a unique scratch dir with tempDir() and `match` it to narrow the
+  // `String | Error` union to a plain String, doing all work + cleanup in the `else` arm.
+  test("glob matches *.txt in a sandbox dir", () =>
+    val dir = tempDir()
+    match dir
+      is Error => [expect(false).toBe(true)]
+      else =>
+        "${dir}/a.txt".writeFile("a")
+        "${dir}/b.txt".writeFile("b")
+        "${dir}/c.log".writeFile("c")
+        val matches = glob("${dir}/*.txt")
+        dir.rm({ "recursive": true })
+        [
+          expect(matches.length()).toBe(2)
+        ]
+  ),
+
+  test("glob ** matches recursively", () =>
+    val dir = tempDir()
+    match dir
+      is Error => [expect(false).toBe(true)]
+      else =>
+        "${dir}/sub".mkdir({ "parents": true })
+        "${dir}/top.lin".writeFile("x")
+        "${dir}/sub/deep.lin".writeFile("y")
+        val matches = glob("${dir}/**/*.lin")
+        dir.rm({ "recursive": true })
+        [
+          expect(matches.length() >= 1).toBe(true)
+        ]
+  ),
+
+  test("glob no-match returns empty array, not error", () =>
+    val matches = glob("/tmp/lin_test_fs_glob_nomatch_dir/*.zzz")
+    [
+      expect(matches.length()).toBe(0)
+    ]
+  ),
+
+  test("glob malformed pattern returns error", () =>
+    val result = glob("/tmp/[")
+    [
+      expect(result["type"]).toBe("error")
+    ]
+  ),
+
+  test("symlink + readlink + isSymlink round-trip", () =>
+    val dir = tempDir()
+    match dir
+      is Error => [expect(false).toBe(true)]
+      else =>
+        "${dir}/target.txt".writeFile("contents")
+        val link = "${dir}/link"
+        "target.txt".symlink(link)
+        val target = link.readlink()
+        val isLink = link.isSymlink()
+        val notLink = "${dir}/target.txt".isSymlink()
+        dir.rm({ "recursive": true })
+        [
+          expect(target).toBe("target.txt"),
+          expect(isLink).toBe(true),
+          expect(notLink).toBe(false)
+        ]
+  ),
+
+  test("isSymlink is false for a missing path", () =>
+    [
+      expect("/tmp/lin_test_fs_no_such_link".isSymlink()).toBe(false)
+    ]
+  ),
+
+  test("readlink on a non-symlink returns error", () =>
+    val dir = tempDir()
+    match dir
+      is Error => [expect(false).toBe(true)]
+      else =>
+        val f = "${dir}/regular.txt"
+        f.writeFile("x")
+        val result = f.readlink()
+        dir.rm({ "recursive": true })
+        [
+          expect(result["type"]).toBe("error")
+        ]
+  ),
+
+  test("chmod sets mode reported by stat", () =>
+    val dir = tempDir()
+    match dir
+      is Error => [expect(false).toBe(true)]
+      else =>
+        val f = "${dir}/run.sh"
+        f.writeFile("echo hi")
+        f.chmod(493)
+        val s = f.stat()
+        val mode = s["mode"]
+        dir.rm({ "recursive": true })
+        [
+          // mode includes the file-type bits; mask to the permission bits (0o777 == 511).
+          expect(mode - (mode / 512) * 512).toBe(493)
+        ]
+  ),
+
+  test("lstat reports isSymlink true for a link, stat reports false", () =>
+    val dir = tempDir()
+    match dir
+      is Error => [expect(false).toBe(true)]
+      else =>
+        "${dir}/real.txt".writeFile("x")
+        val link = "${dir}/lnk"
+        "real.txt".symlink(link)
+        val raw = link.lstat()
+        val followed = link.stat()
+        val viaOpts = link.stat({ "follow": false })
+        dir.rm({ "recursive": true })
+        [
+          expect(raw["isSymlink"]).toBe(true),
+          expect(followed["isSymlink"]).toBe(false),
+          expect(viaOpts["isSymlink"]).toBe(true)
+        ]
+  ),
+
+  test("touch creates an empty file when absent", () =>
+    val dir = tempDir()
+    match dir
+      is Error => [expect(false).toBe(true)]
+      else =>
+        val f = "${dir}/stamp"
+        val before = f.exists()
+        f.touch()
+        val after = f.exists()
+        val content = f.readFile()
+        dir.rm({ "recursive": true })
+        [
+          expect(before).toBe(false),
+          expect(after).toBe(true),
+          expect(content).toBe("")
+        ]
+  ),
+
+  test("touch returns error when parent dir is missing", () =>
+    val result = "/tmp/lin_test_fs_no_such_parent_dir/file.txt".touch()
+    [
+      expect(result["type"]).toBe("error")
+    ]
+  ),
+
+  test("realpath resolves .. and symlinks", () =>
+    val dir = tempDir()
+    match dir
+      is Error => [expect(false).toBe(true)]
+      else =>
+        "${dir}/sub".mkdir({ "parents": true })
+        "${dir}/sub/file.txt".writeFile("x")
+        val resolved = "${dir}/sub/../sub/file.txt".realpath()
+        val canon = "${dir}/sub/file.txt".realpath()
+        dir.rm({ "recursive": true })
+        [
+          expect(resolved).toBe(canon)
+        ]
+  ),
+
+  test("realpath returns error for a missing path", () =>
+    val result = "/nonexistent/path/that/does/not/exist.txt".realpath()
+    [
+      expect(result["type"]).toBe("error")
+    ]
+  ),
+
+  test("tempFile creates a unique 0600 file the caller deletes", () =>
+    val path = tempFile({})
+    match path
+      is Error => [expect(false).toBe(true)]
+      else =>
+        val created = path.isFile()
+        path.rm({  })
+        [
+          expect(created).toBe(true),
+          expect(path.exists()).toBe(false)
+        ]
+  ),
+
+  test("tempFile honours prefix and suffix", () =>
+    val path = tempFile({ "prefix": "report-", "suffix": ".csv" })
+    match path
+      is Error => [expect(false).toBe(true)]
+      else =>
+        val created = path.isFile()
+        path.rm({  })
+        [
+          expect(created).toBe(true)
+        ]
+  ),
+
+  test("tempDir creates a unique directory the caller deletes", () =>
+    val dir = tempDir()
+    match dir
+      is Error => [expect(false).toBe(true)]
+      else =>
+        val created = dir.isDir()
+        dir.rm({ "recursive": true })
+        [
+          expect(created).toBe(true),
+          expect(dir.exists()).toBe(false)
+        ]
+  ),
+
+  test("withTempFile runs fn and deletes the file after", () =>
+    // withTempFile returns the closure's result (here the path String) and deletes the file.
+    val captured = withTempFile((tmp: String): String =>
+      tmp.writeFile("scratch")
+      tmp
+    )
+    match captured
+      is Error => [expect(false).toBe(true)]
+      else =>
+        [
+          // captured is the path string; the file is gone now that withTempFile returned.
+          expect(captured.exists()).toBe(false)
+        ]
+  ),
+
+  test("withTempFile cleans up even when fn returns an Error", () =>
+    val pathCell = withTempFile((tmp: String): Json =>
+      tmp.writeFile("x")
+      {
+        "type": "error",
+        "message": "boom",
+        "path": tmp
+      }
+    )
+    val leftover = toString(pathCell["path"])
+    [
+      expect(pathCell["type"]).toBe("error"),
+      // cleanup runs before withTempFile returns, even on the Error path.
+      expect(leftover.exists()).toBe(false)
+    ]
+  ),
+
+  test("withTempDir runs fn and removes the tree after", () =>
+    val dirCell = withTempDir((dir: String): String =>
+      "${dir}/nested.txt".writeFile("x")
+      dir
+    )
+    match dirCell
+      is Error => [expect(false).toBe(true)]
+      else =>
+        [
+          expect(dirCell.exists()).toBe(false)
+        ]
+  ),
+
+  test("glob via dot-application and f(x) form agree", () =>
+    val dir = tempDir()
+    match dir
+      is Error => [expect(false).toBe(true)]
+      else =>
+        "${dir}/one.md".writeFile("1")
+        val viaDot = "${dir}/*.md".glob()
+        val viaCall = glob("${dir}/*.md")
+        dir.rm({ "recursive": true })
+        [
+          expect(viaDot.length()).toBe(viaCall.length())
+        ]
   )
 ])
 

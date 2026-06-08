@@ -21,6 +21,16 @@ import foreign "lin-runtime"
   val lin_fs_read_file_bytes: (String) => Json
   val lin_fs_write_file_bytes: (String, UInt8[]) => Json
   val lin_fs_write_lines: (String, String[]) => Json
+  val lin_fs_glob: (String) => Json
+  val lin_fs_temp_file: (String, String) => Json
+  val lin_fs_temp_dir: () => Json
+  val lin_fs_chmod: (String, Int32) => Json
+  val lin_fs_symlink: (String, String) => Json
+  val lin_fs_readlink: (String) => Json
+  val lin_fs_is_symlink: (String) => Boolean
+  val lin_fs_lstat: (String) => Json
+  val lin_fs_touch: (String) => Json
+  val lin_fs_realpath: (String) => Json
 
 export val readFile = (path: String): Json =>
   lin_fs_read_file(path)
@@ -54,8 +64,16 @@ export val isFile = (path: String): Boolean =>
 export val isDir = (path: String): Boolean =>
   lin_fs_is_dir(path)
 
-export val stat = (path: String): Json =>
-  lin_fs_stat(path)
+// stat follows symlinks by default (reports the target). Pass `{ "follow": false }` to report
+// metadata about a final symlink itself (equivalent to `lstat`). The `opts` arg is optional and
+// width-compatible: existing one-argument `stat(path)` calls keep following.
+export val stat = (path: String, opts: Json = null): Json =>
+  if opts == null then
+    lin_fs_stat(path)
+  else if opts["follow"] == false then
+    lin_fs_lstat(path)
+  else
+    lin_fs_stat(path)
 
 export val ls = (path: String, opts: Json): Json =>
   if opts == null then
@@ -95,6 +113,88 @@ export val writeFileBytes = (path: String, bytes: UInt8[]): Json =>
 
 export val writeLines = (path: String, lines: String[]): Json =>
   lin_fs_write_lines(path, lines)
+
+// --- std/fs extras (fs-extras proposal): glob, temp files/dirs, chmod, symlinks, touch, realpath.
+// glob expands a shell-glob pattern (`**`/`*`/`?`/`[…]`) to matching paths, sorted. A no-match is
+// an ordinary empty array (`[]`), not a fault; only a malformed pattern returns an Error.
+export val glob = (pattern: String): String[] | Error =>
+  lin_fs_glob(pattern)
+
+// tempFile creates a unique, empty 0600 temp file and returns its absolute path WITHOUT cleanup
+// (caller deletes with `rm`). `opts` may carry `{ "prefix": "...", "suffix": ".ext" }`.
+// Prefer withTempFile unless the file must outlive a single lexical scope.
+export val tempFile = (opts: Json): String | Error =>
+  if opts == null then
+    lin_fs_temp_file("", "")
+  else
+    val prefix = if opts["prefix"] == null then "" else opts["prefix"]
+    val suffix = if opts["suffix"] == null then "" else opts["suffix"]
+    lin_fs_temp_file(prefix, suffix)
+
+// tempDir creates a unique temp directory and returns its absolute path WITHOUT cleanup (caller
+// deletes with `rm(dir, { recursive: true })`). Prefer withTempDir for scoped use. NOTE: distinct
+// from `std/os.tempDir`, which reports the system temp LOCATION and creates nothing.
+export val tempDir = (): String | Error =>
+  lin_fs_temp_dir()
+
+// withTempFile creates a fresh temp file, runs `fn` with its path, and deletes the file when `fn`
+// returns — on BOTH the success and Error paths (cleanup runs before `result` is returned, never
+// short-circuited by an Error). Mirrors the withLock/withFixture scoped-resource idiom.
+export val withTempFile = <R>(fn: (String) => R): R | Error =>
+  val path = tempFile({})
+  match path
+    is Error => path
+    else =>
+      val result = fn(path)
+      val _ = rm(path, {})
+      result
+
+// withTempDir creates a fresh temp directory, runs `fn` with its path, and recursively deletes the
+// whole tree when `fn` returns — on both the success and Error paths.
+export val withTempDir = <R>(fn: (String) => R): R | Error =>
+  val path = tempDir()
+  match path
+    is Error => path
+    else =>
+      val result = fn(path)
+      val _ = rm(path, { "recursive": true })
+      result
+
+// chmod sets the Unix permission bits of `path` (decimal Int32; 0o755 == 493). Returns Null on
+// success, Error on failure. A no-op returning Null on non-Unix.
+export val chmod = (path: String, mode: Int32): Null | Error =>
+  lin_fs_chmod(path, mode)
+
+// symlink creates a symbolic link at `linkPath` pointing at `target` (stored verbatim, may be
+// relative and need not exist). Argument order matches `ln -s target linkPath`. Error if linkPath
+// already exists.
+export val symlink = (target: String, linkPath: String): Null | Error =>
+  lin_fs_symlink(target, linkPath)
+
+// readlink returns the target string stored in the link at `path` (verbatim, NOT resolved — use
+// realpath for that). Error if `path` is not a symlink or does not exist.
+export val readlink = (path: String): String | Error =>
+  lin_fs_readlink(path)
+
+// isSymlink is true iff `path` exists and is itself a symbolic link (does not follow it). Total:
+// false for regular files, directories, and non-existent paths.
+export val isSymlink = (path: String): Boolean =>
+  lin_fs_is_symlink(path)
+
+// lstat is like stat but does not follow a final symlink: it reports metadata about the link
+// itself (isSymlink: true). `lstat(p)` is exactly `stat(p, { "follow": false })`.
+export val lstat = (path: String): Json =>
+  lin_fs_lstat(path)
+
+// touch creates `path` as an empty file if absent (no parent dirs created), else bumps its mtime
+// to now without changing contents. Error if a parent directory is missing.
+export val touch = (path: String): Null | Error =>
+  lin_fs_touch(path)
+
+// realpath resolves `path` to its canonical, absolute, symlink-free form by touching the disk.
+// The effectful counterpart to the pure-string `std/path.resolve`. Error if any component is absent.
+export val realpath = (path: String): String | Error =>
+  lin_fs_realpath(path)
 
 // openRead(path) opens a file as a byte Stream (`Stream<UInt8[]> | Error`). The return type is
 // inferred from the `lin_fs_open` intrinsic; the opaque `Stream` annotation (= `Stream<Json>`)
