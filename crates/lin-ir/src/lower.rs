@@ -881,6 +881,19 @@ impl FuncBuilder {
     }
 
     fn finish(self) -> LinFunction {
+        if let Ok(want) = std::env::var("LIN_DUMP_IR") {
+            let nm = self.name.clone().unwrap_or_default();
+            if want.is_empty() || nm.contains(&want) {
+                eprintln!("=== IR fn {} ({:?}) ===", nm, self.params.iter().map(|(t, ty)| (t.0, ty)).collect::<Vec<_>>());
+                for b in &self.blocks {
+                    eprintln!("  block {} {:?}:", b.id.0, b.label);
+                    for inst in &b.instructions {
+                        eprintln!("    {:?}", inst);
+                    }
+                    eprintln!("    term: {:?}", b.terminator);
+                }
+            }
+        }
         LinFunction {
             id: self.id,
             name: self.name,
@@ -4278,9 +4291,26 @@ fn lower_call(
             // path (which jumps to the current function's entry expecting all parameters).
             if is_tail && !is_default_fill {
                 // A tail call has no "after" block in which to free arg-box shells; the box is
-                // consumed by the jump. A boxed concrete-heap arg in tail position is rare
-                // (would require a self-recursive function taking a Json param a concrete heap
-                // value is passed to), and the small per-tail-call shell leak is left unfixed.
+                // consumed by the jump and BECOMES the next iteration's param-slot value.
+                //
+                // OWNERSHIP FIX (the `Trip|Null` tail-recursive-param UAF): a CALLER-OWNED-SHELL
+                // box arg (`arg_box_is_caller_owned_shell`: a concrete heap value boxed into a
+                // union/Json param, e.g. a `match`-narrowed `Trip` threaded back into the `Trip |
+                // Null` param) wraps an inner heap pointer it does NOT own — the inner is owned by
+                // the SOURCE temp (the narrowed unbox+retain), which `release_owned_for_tail_call`
+                // releases below. In a NON-tail call the box shell is freed after the call and the
+                // source release balances it. But in a TAIL call the box LIVES ON in the param
+                // slot, so releasing the source frees the box's inner out from under the slot — the
+                // next iteration's read (and codegen's release-old) then touches freed memory
+                // (ASan: heap-use-after-free in `lin_rc_retain` inside the recursive callee). So
+                // the threaded box must take its OWN inner reference: retain it here so the +1 the
+                // source held TRANSFERS into the box (source release nets it to zero; the slot now
+                // owns a genuine +1, freed by the eventual release-old / teardown). For a union box
+                // `Retain` lowers to `lin_tagged_retain` (bumps the inner payload's rc, tag-aware).
+                for &shell in &shell_boxes {
+                    let sty = builder.temp_types.get(&shell).cloned().unwrap_or(Type::Null);
+                    builder.emit(Instruction::Retain { val: shell, ty: sty });
+                }
                 //
                 // Release every per-iteration owned temp the body allocated (projections, clones,
                 // string literals) on THIS live block before the diverging jump — otherwise their
