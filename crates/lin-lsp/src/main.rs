@@ -462,7 +462,9 @@ impl LanguageServer for Backend {
             Ok(formatted) => formatted,
             Err(_) => return Ok(None),
         };
-        let end_pos = offset_to_position(&source, source.len());
+        // `offset_to_position` takes a CHAR offset, so the end-of-document offset is the char
+        // count, not the byte length.
+        let end_pos = offset_to_position(&source, source.chars().count());
 
         Ok(Some(vec![TextEdit {
             range: Range {
@@ -1145,14 +1147,17 @@ fn contains_identifier(line: &str, name: &str) -> bool {
 
 /// Finds the byte offset of `name` within the import statement starting at `import_start`.
 fn find_name_in_import(source: &str, import_start: usize, name: &str) -> Option<usize> {
-    // `.get` so a stale/out-of-range span start can't panic the slice.
-    let search_area = source.get(import_start..)?;
+    // `import_start` is a CHAR offset (an import statement's `span.start`); convert to a byte index
+    // to slice/search the UTF-8 source. `.get` so a stale/out-of-range start can't panic the slice.
+    let import_byte = char_offset_to_byte(source, import_start);
+    let search_area = source.get(import_byte..)?;
     let pos = search_area.find(name)?;
-    let abs = import_start + pos;
-    // Make sure it's a whole identifier.
+    let abs = import_byte + pos; // byte index of the match
+    // Make sure it's a whole identifier (the neighbouring bytes aren't word characters).
     let before_ok = abs == 0 || !source.as_bytes()[abs - 1].is_ascii_alphanumeric() && source.as_bytes()[abs - 1] != b'_';
     let after_ok = abs + name.len() >= source.len() || !source.as_bytes()[abs + name.len()].is_ascii_alphanumeric() && source.as_bytes()[abs + name.len()] != b'_';
-    if before_ok && after_ok { Some(abs) } else { None }
+    // Return a CHAR offset (callers feed it to `offset_to_position`, which expects char offsets).
+    if before_ok && after_ok { Some(byte_offset_to_char(source, abs)) } else { None }
 }
 
 // ── import resolution (mirrors lin-compile logic) ────────────────────────────
@@ -1320,14 +1325,17 @@ fn dot_receiver_category(
     offset: usize,
     span_type_map: &[(lin_common::Span, String, Option<lin_common::Span>)],
 ) -> (bool, Option<String>) {
+    // `offset` and the offsets derived from it here are CHAR offsets. The prefix word is ASCII
+    // (`[A-Za-z0-9_]`), so its byte length equals its char count — usable directly in char space.
     let prefix_len = word_before(source, offset).len();
     let dot_offset = match offset.checked_sub(prefix_len + 1) {
         Some(o) => o,
         None => return (false, None),
     };
 
-    let src_bytes = source.as_bytes();
-    if src_bytes.get(dot_offset) != Some(&b'.') {
+    // Index the source BY BYTE to read the `.` char: convert the char offset to a byte index first.
+    let dot_byte = char_offset_to_byte(source, dot_offset);
+    if source.as_bytes().get(dot_byte) != Some(&b'.') {
         return (false, None);
     }
 
@@ -1433,7 +1441,8 @@ fn first_param_category(sig: &str) -> Option<String> {
 /// `${...}` interpolation: the cursor inside a `${ ... }` IS code position, so we treat an open `${`
 /// as leaving the string (completion stays enabled inside the interpolation hole).
 fn in_string_or_comment(source: &str, offset: usize) -> bool {
-    let offset = offset.min(source.len());
+    // `offset` is a char offset; convert to a byte index for the `&str` slices below.
+    let offset = char_offset_to_byte(source, offset);
     let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let line = &source[line_start..offset];
 
@@ -1486,7 +1495,8 @@ fn in_string_or_comment(source: &str, offset: usize) -> bool {
 /// LIMITATION: detection is single-line and textual (no multi-line import strings, which
 /// the grammar doesn't produce anyway). Returns `None` outside an import-string context.
 fn import_string_prefix(source: &str, offset: usize) -> Option<String> {
-    let offset = offset.min(source.len());
+    // `offset` is a char offset; convert to a byte index for the `&str` slices below.
+    let offset = char_offset_to_byte(source, offset);
     // Start of the current line.
     let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let line = &source[line_start..offset];
@@ -1552,16 +1562,20 @@ fn import_path_completions(typed: &str, base_dir: Option<&Path>) -> Vec<Completi
 }
 
 fn word_before(source: &str, offset: usize) -> &str {
+    // `offset` is a char offset; the word characters are ASCII (`[A-Za-z0-9_]`), so we scan bytes
+    // from the byte index of `offset` leftwards. Identifier bytes are all single-byte, so a byte
+    // walk back over them lands on a char boundary.
+    let byte_off = char_offset_to_byte(source, offset);
     let bytes = source.as_bytes();
-    let start = (0..offset)
+    let start = (0..byte_off)
         .rev()
         .take_while(|&i| {
             let b = bytes[i];
             b.is_ascii_alphanumeric() || b == b'_'
         })
         .last()
-        .unwrap_or(offset);
-    &source[start..offset]
+        .unwrap_or(byte_off);
+    &source[start..byte_off]
 }
 
 // ── span utilities ────────────────────────────────────────────────────────────
@@ -2089,12 +2103,14 @@ fn auto_import_edit(source: &str, name: &str, module: &str) -> Option<TextEdit> 
                 }
                 // Insert `, name` just before the closing `}` of this import's brace list.
                 // The stmt span covers only the `import` keyword, so scan to the line end.
-                let start = span.start as usize;
+                // `span.start` is a CHAR offset; convert to a byte index to slice the source, then
+                // lift the located `}` byte position back to a CHAR offset for `offset_to_position`.
+                let start = char_offset_to_byte(source, span.start as usize);
                 let line_end = source[start..].find('\n').map(|i| start + i).unwrap_or(source.len());
                 let stmt_src = source.get(start..line_end)?;
                 let brace = stmt_src.find('}')?;
-                let insert_at = start + brace;
-                let pos = offset_to_position(source, insert_at);
+                let insert_at = start + brace; // byte offset of `}`
+                let pos = offset_to_position(source, byte_offset_to_char(source, insert_at));
                 return Some(TextEdit {
                     range: Range { start: pos, end: pos },
                     new_text: format!(", {}", name),
@@ -2143,7 +2159,8 @@ fn full_line_range(source: &str, line: u32) -> Range {
     // Clamp the end to EOF when this is the last line (no trailing newline to span into).
     let line_count = source.lines().count() as u32;
     if line + 1 >= line_count && !source.ends_with('\n') {
-        let eof = offset_to_position(source, source.len());
+        // `offset_to_position` takes a CHAR offset → end-of-document is the char count.
+        let eof = offset_to_position(source, source.chars().count());
         return Range { start, end: eof };
     }
     Range { start, end }
@@ -2437,28 +2454,27 @@ fn folding_ranges(source: &str, module: &lin_parse::ast::Module) -> Vec<FoldingR
 /// String literals are skipped so braces inside strings don't unbalance the scan. Used
 /// only as a fallback when the AST is empty (the buffer didn't parse).
 fn delimiter_folds(source: &str) -> Vec<FoldingRange> {
-    let bytes = source.as_bytes();
+    // Scan by `char` tracking CHAR indices so the offsets fed to `offset_to_position` (which now
+    // expects char offsets) are correct even when the source contains multibyte characters.
     let mut stack: Vec<usize> = Vec::new();
     let mut out = Vec::new();
     let mut in_str = false;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
+    let mut chars = source.chars().enumerate().peekable();
+    while let Some((i, c)) = chars.next() {
         if in_str {
-            if b == b'\\' {
-                i += 2;
+            if c == '\\' {
+                chars.next(); // skip the escaped char
                 continue;
             }
-            if b == b'"' {
+            if c == '"' {
                 in_str = false;
             }
-            i += 1;
             continue;
         }
-        match b {
-            b'"' => in_str = true,
-            b'{' | b'[' | b'(' => stack.push(i),
-            b'}' | b']' | b')' => {
+        match c {
+            '"' => in_str = true,
+            '{' | '[' | '(' => stack.push(i),
+            '}' | ']' | ')' => {
                 if let Some(open) = stack.pop() {
                     let sl = offset_to_position(source, open).line;
                     let el = offset_to_position(source, i).line;
@@ -2476,7 +2492,6 @@ fn delimiter_folds(source: &str) -> Vec<FoldingRange> {
             }
             _ => {}
         }
-        i += 1;
     }
     out
 }
@@ -2495,25 +2510,29 @@ fn delimiter_folds(source: &str) -> Vec<FoldingRange> {
 /// fails to parse, the AST is empty, so we fall back to balanced-delimiter nesting
 /// (`enclosing_bracket_pairs`).
 fn selection_range_at(source: &str, module: &lin_parse::ast::Module, offset: usize) -> SelectionRange {
-    let offset = offset.min(source.len());
-    // Ordered innermost → outermost list of (start, end) byte ranges.
+    // All ranges here are CHAR offsets (to match the AST `full_span()` ranges and feed
+    // `offset_to_position`). `offset` is a char offset; clamp it to the total char count.
+    let total_chars = source.chars().count();
+    let offset = offset.min(total_chars);
+    // Ordered innermost → outermost list of (start, end) CHAR ranges.
     let mut ranges: Vec<(usize, usize)> = Vec::new();
 
-    // 1. Word under the cursor.
+    // 1. Word under the cursor. Expand over BYTES (word chars are ASCII) from the cursor's byte
+    //    index, then lift the byte range back to char offsets to stay in char space.
     let word = word_at(source, offset);
     if !word.is_empty() {
-        // Recover the word's byte range (word_at expands around offset).
         let bytes = source.as_bytes();
         let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-        let mut start = offset;
-        let mut end = offset;
+        let byte_off = char_offset_to_byte(source, offset);
+        let mut start = byte_off;
+        let mut end = byte_off;
         while start > 0 && is_word(bytes[start - 1]) {
             start -= 1;
         }
         while end < bytes.len() && is_word(bytes[end]) {
             end += 1;
         }
-        ranges.push((start, end));
+        ranges.push((byte_offset_to_char(source, start), byte_offset_to_char(source, end)));
     }
 
     // 2. Enclosing AST expression extents (full_span), from the AST. Every expression whose
@@ -2550,13 +2569,17 @@ fn selection_range_at(source: &str, module: &lin_parse::ast::Module, offset: usi
         }
     }
 
-    // 3. The cursor's line.
-    let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let line_end = source[offset..].find('\n').map(|i| offset + i).unwrap_or(source.len());
-    ranges.push((line_start, line_end));
+    // 3. The cursor's line. Compute the byte bounds, then lift to char offsets.
+    let byte_off = char_offset_to_byte(source, offset);
+    let line_start_byte = source[..byte_off].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line_end_byte = source[byte_off..].find('\n').map(|i| byte_off + i).unwrap_or(source.len());
+    ranges.push((
+        byte_offset_to_char(source, line_start_byte),
+        byte_offset_to_char(source, line_end_byte),
+    ));
 
-    // 4. Whole document.
-    ranges.push((0, source.len()));
+    // 4. Whole document (char-offset extent).
+    ranges.push((0, total_chars));
 
     // De-duplicate while preserving order; keep only ranges that contain the cursor and
     // strictly grow (so each parent properly contains its child).
@@ -2593,28 +2616,28 @@ fn selection_range_at(source: &str, module: &lin_parse::ast::Module, offset: usi
 /// byte indices, ordered innermost → outermost. String literals are skipped so braces
 /// inside strings don't unbalance the scan.
 fn enclosing_bracket_pairs(source: &str, offset: usize) -> Vec<(usize, usize)> {
-    let bytes = source.as_bytes();
+    // `offset` is a CHAR offset; we scan by `char` and track CHAR indices so the returned pairs
+    // and the cursor comparison stay in char space. ASCII brackets, but the string body between
+    // them may contain multibyte chars, so a byte scan would misplace the indices.
     let mut stack: Vec<usize> = Vec::new();
     let mut enclosing: Vec<(usize, usize)> = Vec::new();
     let mut in_str = false;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
+    let mut chars = source.chars().enumerate().peekable();
+    while let Some((i, c)) = chars.next() {
         if in_str {
-            if b == b'\\' {
-                i += 2;
+            if c == '\\' {
+                chars.next(); // skip the escaped char
                 continue;
             }
-            if b == b'"' {
+            if c == '"' {
                 in_str = false;
             }
-            i += 1;
             continue;
         }
-        match b {
-            b'"' => in_str = true,
-            b'{' | b'[' | b'(' => stack.push(i),
-            b'}' | b']' | b')' => {
+        match c {
+            '"' => in_str = true,
+            '{' | '[' | '(' => stack.push(i),
+            '}' | ']' | ')' => {
                 if let Some(open) = stack.pop() {
                     // This pair encloses the cursor when open < offset <= close.
                     if open < offset && offset <= i {
@@ -2624,7 +2647,6 @@ fn enclosing_bracket_pairs(source: &str, offset: usize) -> Vec<(usize, usize)> {
             }
             _ => {}
         }
-        i += 1;
     }
     // Sort innermost (smallest) → outermost.
     enclosing.sort_by_key(|(o, c)| c - o);
@@ -2680,16 +2702,21 @@ fn import_document_links(
 /// runs from the statement start to the end of its line. Returns the range covering
 /// just the path characters between the quotes.
 fn quoted_path_range(source: &str, stmt_span: lin_common::Span, path: &str) -> Option<Range> {
-    let start = stmt_span.start as usize;
+    // `stmt_span.start` is a CHAR offset; convert to a byte index to slice/search the source, then
+    // lift the located byte positions back to CHAR offsets for `offset_to_position`.
+    let start = char_offset_to_byte(source, stmt_span.start as usize);
     // Scan to the end of the statement's line (import statements are single-line).
     let line_end = source[start..].find('\n').map(|i| start + i).unwrap_or(source.len());
     let hay = source.get(start..line_end)?;
     let needle = format!("\"{}\"", path);
     let rel = hay.find(&needle)?;
-    let abs = start + rel + 1; // +1 to skip the opening quote
+    let abs = start + rel + 1; // byte offset, +1 to skip the opening quote
+    let abs_char = byte_offset_to_char(source, abs);
     Some(Range {
-        start: offset_to_position(source, abs),
-        end: offset_to_position(source, abs + path.len()),
+        start: offset_to_position(source, abs_char),
+        // `path` is the byte length of the path text; advance by its char count to reach the
+        // closing quote. (Path strings can contain multibyte chars.)
+        end: offset_to_position(source, abs_char + path.chars().count()),
     })
 }
 
@@ -3044,10 +3071,12 @@ fn signature_help(
     let param_types = function_param_types(&ty_str)?;
 
     // Active parameter = number of top-level commas between the opening paren and the cursor.
-    // `.get` with a normalised (non-reversed, in-bounds) range so a stale paren/cursor offset or a
-    // multi-byte boundary can't panic the slice.
-    let arg_hi = offset.min(source.len());
-    let arg_text = source.get(paren_after.min(arg_hi)..arg_hi).unwrap_or("");
+    // `offset` and `paren_after` are CHAR offsets; convert to byte indices to slice the source.
+    // `.get` with a normalised (non-reversed, in-bounds) range so a stale paren/cursor offset can't
+    // panic the slice.
+    let arg_hi = char_offset_to_byte(source, offset);
+    let arg_lo = char_offset_to_byte(source, paren_after).min(arg_hi);
+    let arg_text = source.get(arg_lo..arg_hi).unwrap_or("");
     let active = top_level_commas(arg_text);
     let active = (active as usize).min(param_types.len().saturating_sub(1)) as u32;
 
@@ -3056,7 +3085,10 @@ fn signature_help(
     // we read them from the surface params. Only used when the name count matches the type-derived
     // param count (so positional bolding via `active` stays correct); otherwise fall back to
     // types-only labels.
-    let callee_name = source.get(callee_span.start as usize..callee_span.end as usize).unwrap_or("");
+    // `callee_span` is in CHAR offsets; convert to byte indices to slice the source text.
+    let callee_lo = char_offset_to_byte(source, callee_span.start as usize);
+    let callee_hi = char_offset_to_byte(source, callee_span.end as usize);
+    let callee_name = source.get(callee_lo..callee_hi).unwrap_or("");
     let names = callee_param_names(&analysis.module, callee_name)
         .filter(|n| n.len() == param_types.len());
 
@@ -3207,20 +3239,24 @@ fn find_enclosing_call_in_expr(
             find_enclosing_call_in_expr(func, source, offset, best);
             // Lin's `Call` span is just the `(` token, so the argument region is found by scanning
             // from the opening paren to its matching close in source. `span.start` is the `(`.
+            // `open` is a CHAR offset (all span offsets are); convert to a byte index to read/slice
+            // the source, and lift the matching-close byte distance back to a CHAR offset so the
+            // `offset` comparison below stays in char space.
             let open = span.start as usize;
-            if source.as_bytes().get(open) == Some(&b'(') {
-                // `.get` so a stale span start can't panic; `(` is ASCII so `open` is a char boundary.
-                // Use the SOURCE matcher (not `matching_paren`, which treats `<>` as brackets) — in
-                // real source `<`/`>` are comparison operators and `=>` is a lambda arrow, so an
-                // argument like `f(1 > 0, 2)` must not unbalance the paren scan.
+            let open_byte = char_offset_to_byte(source, open);
+            if source.as_bytes().get(open_byte) == Some(&b'(') {
+                // `.get` so a stale span start can't panic. Use the SOURCE matcher (not
+                // `matching_paren`, which treats `<>` as brackets) — in real source `<`/`>` are
+                // comparison operators and `=>` is a lambda arrow, so an argument like
+                // `f(1 > 0, 2)` must not unbalance the paren scan.
                 let close = source
-                    .get(open..)
+                    .get(open_byte..)
                     .and_then(matching_paren_in_source)
-                    .map(|c| open + c);
-                let paren_after = open + 1;
+                    .map(|c| byte_offset_to_char(source, open_byte + c));
+                let paren_after = open + 1; // `(` is ASCII, so +1 char == +1 byte
                 // Inside the parens: after `(` and at/before the `)` (or to EOF when unclosed,
                 // which is the common case while the user is still typing arguments).
-                let end_bound = close.unwrap_or(source.len());
+                let end_bound = close.unwrap_or_else(|| source.chars().count());
                 if offset >= paren_after && offset <= end_bound {
                     // Only resolvable when the callee is a bare identifier (its type is a use-site).
                     if let E::Ident(_, ident_span) = func.as_ref() {
@@ -3650,16 +3686,61 @@ fn suggestion_from_help(help: &str) -> Option<String> {
     Some(rest[..close].to_string())
 }
 
-/// Convert a byte offset into the source to an LSP `Position`. The `character` field is a
-/// **UTF-16 code-unit** column (the LSP default `positionEncoding`), NOT a `char`/codepoint count:
-/// a character outside the BMP (e.g. an emoji) is two UTF-16 units, so columns after it must be
-/// advanced by `ch.len_utf16()`. Counting one-per-`char` (as a naive implementation does) misaligns
-/// every range a client decodes once an astral codepoint appears on the line.
+// ── offset spaces (READ THIS before touching the conversions below) ───────────────
+//
+// THREE offset spaces meet in this server; mixing them silently corrupts every range
+// once a multibyte character appears on a line:
+//
+//   1. CHAR offset  — a count of Unicode scalar values (`char`s). EVERY `lin_common::Span`
+//      the lexer/parser produces is in this space: the lexer scans a `Vec<char>` and
+//      `self.pos` indexes that char vector (`lin-lex/src/lexer.rs`). So `span.start`/
+//      `span.end` are char offsets, NOT byte offsets. This is the CANONICAL offset space
+//      on the Lin side — every `offset: usize` parameter in THIS file is a char offset.
+//   2. BYTE offset  — an index into the UTF-8 `&str`. Needed ONLY when slicing/indexing
+//      `source` (Rust strings slice by byte). Convert a char offset to a byte offset with
+//      `char_offset_to_byte` at the exact slice site, and convert a byte result back with
+//      `byte_offset_to_char` if it re-enters char space.
+//   3. UTF-16 col   — the `Position.character` field on the LSP wire (the default
+//      `positionEncoding`). An astral codepoint (e.g. an emoji) is TWO UTF-16 units.
+//
+// `offset_to_position` / `position_to_offset` are the ONLY bridges between (1) and (3).
+// Keep the Lin side uniformly in char offsets; touch bytes only at a slice, and UTF-16
+// only at the wire.
+
+/// Byte index of the char at char offset `char_off` (clamped to the end of the string when
+/// `char_off` is past the last char). Use this immediately before slicing/indexing `source`,
+/// since Rust `&str` slicing is by byte. Never panics and always returns a char boundary.
+fn char_offset_to_byte(source: &str, char_off: usize) -> usize {
+    source
+        .char_indices()
+        .nth(char_off)
+        .map(|(b, _)| b)
+        .unwrap_or(source.len())
+}
+
+/// Char offset of the char that begins at (or, for a non-boundary `byte_off`, contains) byte
+/// index `byte_off`. The inverse of `char_offset_to_byte`, used to lift a byte index produced
+/// by a `&str` search back into the canonical char-offset space. Clamps to the total char count
+/// when `byte_off` is at/after the end.
+fn byte_offset_to_char(source: &str, byte_off: usize) -> usize {
+    source
+        .char_indices()
+        .take_while(|(b, _)| *b < byte_off)
+        .count()
+}
+
+/// Convert a CHAR offset into the source to an LSP `Position`. The INPUT is a char offset (the
+/// space all `lin_common::Span` offsets live in — see the offset-spaces note above). The OUTPUT
+/// `character` field is a **UTF-16 code-unit** column (the LSP default `positionEncoding`), NOT a
+/// `char`/codepoint count: a character outside the BMP (e.g. an emoji) is two UTF-16 units, so
+/// columns after it advance by `ch.len_utf16()`. Loop over `chars().enumerate()` so the counter is
+/// the CHAR index, matching the input space; comparing a byte index against a char offset (as a
+/// naive implementation does) stops too early once a multibyte char precedes the target.
 fn offset_to_position(source: &str, offset: usize) -> Position {
     let mut line = 0u32;
     let mut character = 0u32;
-    for (i, ch) in source.char_indices() {
-        if i >= offset {
+    for (char_index, ch) in source.chars().enumerate() {
+        if char_index >= offset {
             break;
         }
         if ch == '\n' {
@@ -3672,24 +3753,26 @@ fn offset_to_position(source: &str, offset: usize) -> Position {
     Position { line, character }
 }
 
-/// Convert an LSP `Position` (line + UTF-16 code-unit column) back to a byte offset into the source.
-/// Mirrors `offset_to_position`: we accumulate UTF-16 code units per `char` (`ch.len_utf16()`) until
-/// the target column is reached. A malformed `pos.character` that lands in the MIDDLE of a surrogate
-/// pair (only possible if the client sends a bad position) is rounded to the nearest char boundary —
-/// we stop at the char whose UTF-16 span would cross the target, returning a valid byte offset and
-/// never panicking.
+/// Convert an LSP `Position` (line + UTF-16 code-unit column) back to a CHAR offset into the source
+/// (the canonical Lin offset space — see the offset-spaces note above; callers compare the result
+/// against `lin_common::Span` offsets or pass it to char-offset helpers). Mirrors
+/// `offset_to_position`: we accumulate UTF-16 code units per `char` (`ch.len_utf16()`) until the
+/// target column is reached, RETURNING the count of chars consumed (a char offset), NOT the byte
+/// index. A malformed `pos.character` that lands in the MIDDLE of a surrogate pair (only possible if
+/// the client sends a bad position) is rounded forward to the next char boundary. Position past EOF
+/// clamps to the total char count.
 fn position_to_offset(source: &str, pos: Position) -> usize {
     let mut line = 0u32;
     let mut character = 0u32;
-    for (i, ch) in source.char_indices() {
+    for (char_index, ch) in source.chars().enumerate() {
         if line == pos.line && character >= pos.character {
-            return i;
+            return char_index;
         }
         if ch == '\n' {
             // Reached the end of the requested line before the requested column: clamp to the
-            // newline's byte offset (the line is shorter than the client's column).
+            // newline's char offset (the line is shorter than the client's column).
             if line == pos.line {
-                return i;
+                return char_index;
             }
             line += 1;
             character = 0;
@@ -3697,7 +3780,7 @@ fn position_to_offset(source: &str, pos: Position) -> usize {
             character += ch.len_utf16() as u32;
         }
     }
-    source.len()
+    source.chars().count()
 }
 
 fn file_dir(uri: &Url) -> Option<PathBuf> {
@@ -4221,10 +4304,13 @@ fn module_id_to_uri(module_id: &str) -> Option<Url> {
 /// The exact identifier under `offset` (empty when the cursor is not on an
 /// identifier character). Expands left and right over `[A-Za-z0-9_]`.
 fn word_at(source: &str, offset: usize) -> &str {
+    // `offset` is a char offset; word characters are ASCII, so we expand over BYTES from its byte
+    // index (each word byte is single-byte, so the bounds stay on char boundaries).
     let bytes = source.as_bytes();
     let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-    let mut start = offset.min(source.len());
-    let mut end = offset.min(source.len());
+    let byte_off = char_offset_to_byte(source, offset);
+    let mut start = byte_off;
+    let mut end = byte_off;
     while start > 0 && is_word(bytes[start - 1]) {
         start -= 1;
     }
@@ -4234,10 +4320,12 @@ fn word_at(source: &str, offset: usize) -> &str {
     &source[start..end]
 }
 
-/// Every whole-identifier occurrence of `name` in `source`, as byte spans. A
-/// match is whole-word when neither neighbouring byte is `[A-Za-z0-9_]`. This is
-/// the cross-file occurrence primitive (the checker's def_span linkage is
-/// unavailable for imported names — see the module note above).
+/// Every whole-identifier occurrence of `name` in `source`, as CHAR-offset spans (the canonical
+/// Lin span space — these go to `span_to_range`, which expects char offsets). The text scan runs
+/// over BYTES (Rust `&str::find`), so the located byte positions are lifted to char offsets before
+/// being stored. A match is whole-word when neither neighbouring byte is `[A-Za-z0-9_]`. This is
+/// the cross-file occurrence primitive (the checker's def_span linkage is unavailable for imported
+/// names — see the module note above).
 fn whole_word_spans(source: &str, name: &str) -> Vec<lin_common::Span> {
     let mut out = Vec::new();
     if name.is_empty() {
@@ -4246,13 +4334,15 @@ fn whole_word_spans(source: &str, name: &str) -> Vec<lin_common::Span> {
     let bytes = source.as_bytes();
     let mut start = 0usize;
     while let Some(pos) = source[start..].find(name) {
-        let abs = start + pos;
+        let abs = start + pos; // byte offset of the match
         let before_ok = abs == 0 || !(bytes[abs - 1].is_ascii_alphanumeric() || bytes[abs - 1] == b'_');
         let after_idx = abs + name.len();
         let after_ok = after_idx >= bytes.len()
             || !(bytes[after_idx].is_ascii_alphanumeric() || bytes[after_idx] == b'_');
         if before_ok && after_ok {
-            out.push(lin_common::Span::new(0, abs as u32, after_idx as u32));
+            let start_char = byte_offset_to_char(source, abs) as u32;
+            let end_char = byte_offset_to_char(source, after_idx) as u32;
+            out.push(lin_common::Span::new(0, start_char, end_char));
         }
         start = abs + 1;
     }
@@ -5030,7 +5120,8 @@ mod tests {
     /// Build `CodeActionParams` requesting actions over the whole document, with the freshly
     /// analysed diagnostics supplied as context (what a real client would echo back).
     fn code_action_params(src: &str, diags: Vec<Diagnostic>) -> CodeActionParams {
-        let end = offset_to_position(src, src.len());
+        // `offset_to_position` takes a CHAR offset → end-of-document is the char count.
+        let end = offset_to_position(src, src.chars().count());
         CodeActionParams {
             text_document: TextDocumentIdentifier { uri: dummy_uri() },
             range: Range { start: Position { line: 0, character: 0 }, end },
@@ -5830,35 +5921,91 @@ mod tests {
 
     // ── UTF-16 position encoding (LSP default) ────────────────────────────────────
 
-    /// A non-BMP character (an emoji, 2 UTF-16 code units / 4 bytes / 1 `char`) must advance the LSP
-    /// column by 2, not 1. We assert offset↔position round-trips in UTF-16 units and that a position
-    /// just after the emoji maps back to the byte offset just after it.
+    /// An astral character (an emoji: 1 `char` / 2 UTF-16 code units / 4 bytes) pins BOTH axes of the
+    /// conversion contract simultaneously: the INPUT to `offset_to_position` is a CHAR offset (the
+    /// space all `lin_common::Span` offsets live in — 1 per emoji), while the OUTPUT column is in
+    /// UTF-16 units (2 per emoji). `position_to_offset` is the inverse and returns a CHAR offset.
+    /// FAILS ON OLD CODE: the old `offset_to_position` compared a byte index against the offset, so
+    /// the char-offset input (10 for `a`) stopped after the 4-byte emoji and reported the wrong
+    /// column; the old `position_to_offset` returned the byte offset of `a` (13), not its char
+    /// offset (10).
     #[test]
     fn position_encoding_is_utf16_for_astral_char() {
-        // `val x = "😀ab"` — the emoji is U+1F600 (4 bytes, 2 UTF-16 units).
+        // `val x = "😀ab"` — the emoji is U+1F600 (1 char, 4 bytes, 2 UTF-16 units).
         let src = "val x = \"😀ab\"\n";
-        let emoji_byte = src.find('😀').unwrap();
-        let emoji_len = '😀'.len_utf8(); // 4
         assert_eq!('😀'.len_utf16(), 2);
 
-        // Column at the emoji's start (it's preceded by `val x = "` = 9 bytes, all ASCII → col 9).
-        let pos_emoji = offset_to_position(src, emoji_byte);
+        // CHAR offsets: `val x = "` is 9 ASCII chars, so the emoji is at char 9 and `a` at char 10.
+        let emoji_char = 9usize;
+        let a_char = 10usize;
+
+        // Column at the emoji's start (char 9 → col 9, all preceding chars are 1 UTF-16 unit).
+        let pos_emoji = offset_to_position(src, emoji_char);
         assert_eq!(pos_emoji, Position { line: 0, character: 9 });
 
-        // The byte right after the emoji is `a`. Its UTF-16 column must be 9 + 2 = 11 (NOT 10).
-        let a_byte = emoji_byte + emoji_len;
-        let pos_a = offset_to_position(src, a_byte);
+        // `a` follows the emoji: its UTF-16 column must be 9 + 2 = 11 (NOT 10), since the emoji is
+        // 2 UTF-16 units. Its CHAR offset is only 10.
+        let pos_a = offset_to_position(src, a_char);
         assert_eq!(pos_a, Position { line: 0, character: 11 }, "emoji must count as 2 UTF-16 units");
 
-        // Round-trip: column 11 maps back to the byte offset of `a`.
-        assert_eq!(position_to_offset(src, pos_a), a_byte);
-        // And column 9 maps back to the emoji's byte start.
-        assert_eq!(position_to_offset(src, pos_emoji), emoji_byte);
+        // Round-trip in CHAR-offset space: col 11 → char 10 (`a`), col 9 → char 9 (emoji).
+        assert_eq!(position_to_offset(src, pos_a), a_char);
+        assert_eq!(position_to_offset(src, pos_emoji), emoji_char);
 
         // A position landing inside the surrogate pair (col 10, only sendable by a malformed client)
-        // must NOT panic and must round to a char boundary — here the emoji's start byte.
+        // must NOT panic and must round forward to the next char boundary — `a` at char 10.
         let mid = position_to_offset(src, Position { line: 0, character: 10 });
-        assert_eq!(mid, a_byte, "mid-surrogate column rounds forward to the next char boundary");
+        assert_eq!(mid, a_char, "mid-surrogate column rounds forward to the next char boundary");
+    }
+
+    /// A BMP multibyte char (`é`: 1 char / 1 UTF-16 unit / 2 bytes) BEFORE an identifier pins the
+    /// INPUT-space fix on its own (no astral/UTF-16 confound). FAILS ON OLD CODE: with `é` (2 bytes)
+    /// before `x`, the identifier's CHAR offset (e.g. 11) fed to the old byte-comparing
+    /// `offset_to_position` overshot by 1 byte and reported column 12; `position_to_offset` returned
+    /// the byte offset (12), not the char offset (11). Both now agree on char offset 11 / col 11.
+    #[test]
+    fn position_offset_round_trips_with_leading_bmp_multibyte() {
+        // `val s = "é"; xé` — the second line is `xé` (a real `xé` identifier doesn't matter; we
+        // only assert the conversion). The identifier `y` sits after a leading `é`.
+        let src = "val é = 1\nval y = é\n";
+        // The `é` on line 0 is at char offset 4 (`val ` = 4 chars). Its column is 4 (1 UTF-16 unit).
+        let e_char = 4usize;
+        assert_eq!(offset_to_position(src, e_char), Position { line: 0, character: 4 });
+        assert_eq!(position_to_offset(src, Position { line: 0, character: 4 }), e_char);
+
+        // The `é` use on line 1 follows `val y = ` (8 chars on that line). Its CHAR offset within the
+        // whole source: line 0 is "val é = 1\n" = 10 chars, then 8 chars on line 1 → char 18.
+        let line0_chars = "val é = 1\n".chars().count();
+        let use_char = line0_chars + "val y = ".chars().count();
+        // It's the 9th char (col 8) of line 1, all preceding chars on the line are 1 UTF-16 unit.
+        let pos = offset_to_position(src, use_char);
+        assert_eq!(pos, Position { line: 1, character: 8 });
+        assert_eq!(position_to_offset(src, pos), use_char, "char offset must round-trip through a leading multibyte char");
+    }
+
+    /// End-to-end through `span_to_range`: a span over an identifier on a line that begins with a
+    /// multibyte char must produce the correct UTF-16 Range. FAILS ON OLD CODE: the old byte-based
+    /// `offset_to_position` would shift the start/end columns by the extra bytes of the leading `é`.
+    #[test]
+    fn span_to_range_correct_after_leading_multibyte() {
+        // Line 0: `é = 1` — `é` is 1 char (2 bytes). The identifier `é` is the whole word at char 0.
+        // Build a span over the identifier `ab` that starts after a leading `é `.
+        let src = "// é\nval ab = 1\n";
+        // The identifier `ab` is on line 1. CHAR offsets: line 0 "// é\n" = 5 chars; "val " = 4 →
+        // `ab` starts at char 9 and ends at char 11.
+        let line0 = "// é\n".chars().count();
+        let ab_start = line0 + "val ".chars().count();
+        let ab_end = ab_start + 2;
+        // Sanity: that char range really is `ab` (slice by byte to confirm).
+        let bs = char_offset_to_byte(src, ab_start);
+        let be = char_offset_to_byte(src, ab_end);
+        assert_eq!(&src[bs..be], "ab");
+
+        let span = lin_common::Span::new(0, ab_start as u32, ab_end as u32);
+        let range = span_to_range(src, span);
+        // `ab` is on line 1 at columns 4..6 (the leading `é` on line 0 doesn't affect line 1).
+        assert_eq!(range.start, Position { line: 1, character: 4 });
+        assert_eq!(range.end, Position { line: 1, character: 6 });
     }
 
     /// Span-driven byte-offset slicing must never panic on multibyte input or stale/out-of-range
@@ -5883,10 +6030,11 @@ mod tests {
         let cursor = emoji + 1; // mid-surrogate / mid-utf8 byte offset
         let _ = signature_help(src, &analysis, cursor, |_| None);
 
-        // Completion at a multibyte offset must not panic either.
+        // Completion at a multibyte offset must not panic either. `position_to_offset` now returns a
+        // CHAR offset, so it's bounded by the char count (not the byte length).
         let _ = analyse(src, None);
         let off = position_to_offset(src, Position { line: 1, character: 8 });
-        assert!(off <= src.len());
+        assert!(off <= src.chars().count());
     }
 
     /// The poison-tolerant lock idiom (`unwrap_or_else(|e| e.into_inner())`) must recover access
@@ -6116,15 +6264,18 @@ mod tests {
     }
 
     /// CJK characters are in the BMP (1 UTF-16 unit, 3 bytes, 1 `char`): they advance the column by
-    /// 1, and a combining char likewise stays 1 unit. This pins that BMP-multibyte text is unaffected
-    /// by the UTF-16 fix (only astral codepoints differ from a naive char count).
+    /// 1. This pins that BMP-multibyte text is unaffected by the UTF-16 fix (only astral codepoints
+    /// differ from a naive char count). Offsets here are CHAR offsets (the canonical span space).
+    /// FAILS ON OLD CODE: the old byte-based `offset_to_position` shifted columns by the extra bytes
+    /// of each 3-byte CJK char.
     #[test]
     fn position_encoding_bmp_multibyte_is_one_unit() {
-        // `日本` — each is 3 bytes, 1 UTF-16 unit.
+        // `日本` — each is 3 bytes, 1 UTF-16 unit, 1 char.
         let src = "val s = \"日本\"\n";
-        let first = src.find('日').unwrap(); // col 9
+        // CHAR offsets: `val s = "` is 9 ASCII chars → `日` at char 9, `本` at char 10.
+        let first = 9usize;
         assert_eq!(offset_to_position(src, first), Position { line: 0, character: 9 });
-        let second = first + '日'.len_utf8();
+        let second = 10usize;
         // Second CJK char is at col 10 (one UTF-16 unit past the first).
         assert_eq!(offset_to_position(src, second), Position { line: 0, character: 10 });
         assert_eq!(position_to_offset(src, Position { line: 0, character: 10 }), second);
