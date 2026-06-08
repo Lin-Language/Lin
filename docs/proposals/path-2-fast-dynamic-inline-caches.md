@@ -102,9 +102,10 @@ fights the consequences (a gate, a boxing boundary, a packed/boxed-mismatch bug 
 - **It removes the entire packed/boxed-mismatch bug class** — the one that consumed this session
   (§H4/H5: silent data loss, panics, crashes, UAFs all from packed-vs-boxed representation disagreement).
   There is no second representation, so there is no mismatch. That is a large risk *removed*, not added.
-- **No userland language change.** No `struct` keyword (Path 4), no `packed` annotation, no
-  default-inversion (Path 1's risky sub-variant), no semantics change (Path 3). Existing object/`Json`
-  code just gets faster.
+- **No userland language change.** No semantics change (cf. Path 3's value semantics), no
+  representation-default inversion (cf. Path 1's packed-by-default). Existing object/`Json` code just
+  gets faster. (All three surviving paths are now no-surface-change; this one is also no-*representation*-
+  change and no behavior change — it just makes the one existing dynamic representation fast.)
 - **It is the proven answer** for "dynamic-shaped values with fast field access" — every major JS engine.
 - It makes the framing true *in practice* without changing the language: a known-shape object's field
   read *is* a const-offset load after the cache warms.
@@ -137,7 +138,8 @@ fights the consequences (a gate, a boxing boundary, a packed/boxed-mismatch bug 
   removes the dominant bug class.
 - **Composable with Path 3** (arenas/value semantics) for construction RC — Path 2 fixes reads, Path 3
   fixes construction.
-- **Strongest no-language-change alternative** to Path 1's packed-by-default and Path 4's `struct` kind.
+- **The no-*representation*-change alternative** to Path 1's packed-by-default (which adds a second
+  representation and its boundary) — Path 2 makes the single existing representation fast instead.
 
 ## Acceptance gates
 
