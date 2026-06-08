@@ -12,6 +12,7 @@
 //
 // NOTE: cross-worker transfer of a BigInt is NOT supported in v1 (the handle is a raw pointer that
 // cannot be shared across a thread boundary); bignum math is main-thread.
+
 export type BigInt = Json
 
 import foreign "lin-runtime"

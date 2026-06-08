@@ -10,7 +10,7 @@
 // Number policy is target-driven: an integer target requires an in-range integral number; a
 // float target accepts any number; a Json/unconstrained target accepts any number as-is.
 // Union targets pick the FIRST structurally-matching variant.
-//
+
 // Decode a Json value against a target type (compiler special form; see the module header).
 // @param _      the target TYPE (e.g. `Person`); use the `Person.fromJson(json)` or
 //   `fromJson(Person, json)` form. No ordinary value-level wrapper can express a type argument.
