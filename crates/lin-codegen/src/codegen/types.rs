@@ -531,6 +531,27 @@ impl<'ctx> Codegen<'ctx> {
         Self::sum_type_discriminant(ty).is_some()
     }
 
+    /// unboxed-sumtype Stage 3: if `ty` is a union of EXACTLY a Stage-eligible sum type plus `Null`
+    /// (e.g. `Expr | Null` — the static type of a `{ String: Expr }` map read, ADR-055 safe-access),
+    /// return that inner sum type. Such a value at runtime is either a `*SumNode` (a real node) or a
+    /// null pointer, so the dynamic-boundary boxing must materialize the SumNode when non-null. The
+    /// flattened union shape is the canonical sum union with a `Type::Null` member appended.
+    pub(crate) fn sum_member_of_nullable_union(ty: &Type) -> Option<Type> {
+        let Type::Union(members) = ty else { return None };
+        let mut sum: Option<Type> = None;
+        for m in members {
+            if matches!(m, Type::Null) {
+                continue;
+            }
+            if Self::is_sum_type(m) && sum.is_none() {
+                sum = Some(m.clone());
+            } else {
+                return None; // any other member → not a bare `sum | Null`
+            }
+        }
+        sum
+    }
+
     /// The (unsealed) object Type of the FIRST variant of a sum type — used purely to give
     /// `box_value` a TAG_OBJECT box tag when boxing a materialized SumNode for a dynamic edge. Any
     /// variant's object type yields the same box tag (TAG_OBJECT); the first is a convenient

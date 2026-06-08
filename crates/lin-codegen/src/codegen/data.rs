@@ -335,7 +335,15 @@ impl<'ctx> Codegen<'ctx> {
         // The key is a String (raw LinString*, or unbox a Json/union-boxed key); the result is
         // `T | Null` — `lin_map_get` returns null for a missing key, which `unbox_tagged_val_to_type`
         // maps to the language Null.
-        if let Type::Map(_) = obj_ty {
+        if let Type::Map(map_elem) = obj_ty {
+            // unboxed-sumtype Stage 3: a `{ String: Expr }` map slot holds a KEEP-PACKED `TAG_SUMNODE`
+            // (the `emit_map_set` keep-packed store). Decide the keep-packed read-back from the map's
+            // VALUE type (`obj_ty = Map(elem)`) — not `result_ty`, which is the wider `Expr | Null`
+            // safe-access view whose `Named`/`| Null` shape the codegen sum predicate may not match.
+            // When the value type is a sum type, unwrap the slot's TAG_SUMNODE to the still-packed
+            // `*SumNode` (+retain) — the read-back twin of the keep-packed store. A missing key unwraps
+            // to a null pointer (Null). The downstream `sum|Null` consumer materializes via `box_value`.
+            let _ = map_elem;
             let key_str = if key_ty.is_string_ish() {
                 key
             } else if Self::is_union_type(key_ty) && key.is_pointer_value() {
@@ -366,14 +374,13 @@ impl<'ctx> Codegen<'ctx> {
             // object-shaped source into a real `LinMap`, so a `Type::Map` value is always a `LinMap`
             // at runtime. `lin_map_get` returns null for a missing key.
             let tagged = self.builder.call(self.rt.map_get, &[container.into(), key_str.into()], "ir_mget").try_as_basic_value().unwrap_basic();
-            // UNBOXED SUM TYPE: a sum-typed map value was stored MATERIALIZED (a boxed LinObject — see
-            // `emit_map_set`). Read it back and PROJECT into a fresh SumNode so the consumer (a
-            // SumNode param / match) sees the packed repr the type implies. Keeps the repr consistent
-            // (the result is genuinely a SumNode), which verify relies on.
-            if Self::is_sum_type(result_ty) {
-                let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
-                return self.sumnode_project_from_boxed(tagged, result_ty, result_ty, llvm_fn);
-            }
+            // UNBOXED SUM TYPE: a `{ String: Expr }` map value is stored MATERIALIZED as a boxed
+            // `LinObject` (TAG_OBJECT — see `emit_map_set`); the read-back returns the borrowed box for
+            // the `Expr | Null` union result, which the consumer's `box_value`/match boundary handles.
+            // (Keep-packed-by-pointer for the Map value slot is DEFERRED: the IR lowering wraps a
+            // union-typed Index result in a `CloneBox` that assumes a `TaggedVal*`, so returning a raw
+            // `*SumNode` here would clone a non-box. The RECORD-field slot — read via `FieldGet`, no
+            // union CloneBox — IS keep-packed (see `compile_ir_field_get`).)
             return if Self::is_union_type(result_ty) {
                 tagged
             } else {
@@ -576,13 +583,18 @@ impl<'ctx> Codegen<'ctx> {
         // pointer (UnboxKeepPacked) feeding SealedArrayFieldGet zero-copy. Always sound: the runtime
         // dispatches release/free on the buffer's `elem_tag` / sealed header, regardless of being
         // wrapped in a TaggedVal slot.
-        // UNBOXED SUM TYPE (unboxed-sumtype Stage 1): a SumNode value stored into a `{String: Shape}`
-        // map (a boxed/union value slot) is MATERIALIZED to a boxed `LinObject` first, then stored as
-        // a TAG_OBJECT TaggedVal — the universal Json representation the map slot and the boxed
-        // read-back (`mapArea` via `has`) expect. The materialized object is +1 owned; `lin_map_set`
-        // retains the inner into the slot, so we release the transient box after the set (net: the
-        // slot owns one reference, the temporary is reclaimed). Keep-packed-by-pointer is deferred to
-        // a later stage; materialize is the sound Stage-1 boundary.
+        // UNBOXED SUM TYPE: a SumNode value stored into a `{ String: Expr }` map is MATERIALIZED to a
+        // boxed `LinObject` (TAG_OBJECT) — the universal Json representation the map slot and the boxed
+        // `Expr | Null` read-back expect. The materialized object is +1 owned; `lin_map_set` retains
+        // the inner into the slot, so we release the transient box after.
+        //
+        // KEEP-PACKED-BY-POINTER for the Map value slot is DEFERRED (the TAG_SUMNODE runtime substrate
+        // + codegen helpers are in place for it): the IR LOWERING `CloneBox`es the union-typed `m[k]`
+        // result and the consumer's match-discriminator reads the boxed value via `object_get` / `is`
+        // (`compile_ir_index` union arm) assuming a `LinObject` — a keep-packed `TAG_SUMNODE` slot read
+        // by that borrowed-interior discriminator path is a type-confusion deref. Enabling it needs the
+        // lowering/repr STEP-4 (suppress the project Coerce + teach the discriminator to materialize a
+        // TAG_SUMNODE scrutinee), out of this change's scope.
         if value.is_pointer_value() {
             if let Some(sum_ty) = val_repr.sumnode_sum_ty() {
                 let sum_ty = sum_ty.clone();
@@ -1076,10 +1088,18 @@ impl<'ctx> Codegen<'ctx> {
             }
             per_variant.push(heap);
         }
-        if !any_heap {
-            return ptr_ty.const_null(); // Stage-1 scalar-only: NULL desc, pure refcount drop.
-        }
-        // Flatten to a contiguous [N x i32] image matching the SumDesc byte layout exactly.
+        let _ = any_heap;
+        // SumDesc layout (keep-packed-through-record-fields extension): the descriptor now ALWAYS
+        // begins with an 8-byte MATERIALIZER fn-ptr (`*SumNode -> *LinObject`, the per-type
+        // `lin_summat_<key>`), so the runtime can materialize a kept-packed `TAG_SUMNODE` slot that
+        // escaped a record field into the type-erased dynamic domain (toString/eq/json — where codegen
+        // has lost the sum type). The heap-field drop table follows, its `variant_count` now read at
+        // BYTE OFFSET 8 (after the ptr). The descriptor is ALWAYS emitted (non-null) — even a
+        // scalar-only sum type needs the materializer ptr; its heap-field table is just all-empty
+        // (every per-variant heap_count = 0), so the drop walk is still a no-op for it.
+        //   SumDesc = [ u64 matfn_ptr | u32 variant_count | VariantDesc * variant_count ]
+        //   VariantDesc = [ u32 heap_field_count | { u32 byte_offset, u32 kind } * heap_field_count ]
+        // Build the trailing i32 table.
         let mut words: Vec<inkwell::values::IntValue<'ctx>> = Vec::new();
         words.push(i32_ty.const_int(per_variant.len() as u64, false)); // variant_count
         for heap in &per_variant {
@@ -1089,17 +1109,31 @@ impl<'ctx> Codegen<'ctx> {
                 words.push(i32_ty.const_int(*kind as u64, false));
             }
         }
-        // Cache key: the full word sequence (so identical sum-type layouts share one global).
+        // Cache key: the full word sequence + the sum type's shape (the matfn is a deterministic
+        // function of the shape, so two identical sum types share one descriptor + materializer).
         let key: String = format!(
-            "__sumdesc_{}",
+            "__sumdesc_{:x}_{}",
+            {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                format!("{sum_ty:?}").hash(&mut h);
+                h.finish()
+            },
             words.iter().map(|w| w.get_zero_extended_constant().unwrap_or(0).to_string()).collect::<Vec<_>>().join("_")
         );
         if let Some(g) = self.module.get_global(&key) {
             return g.as_pointer_value();
         }
+        // Build the materializer fn-ptr FIRST (it positions the builder elsewhere; the descriptor is a
+        // const global so insertion point does not matter, but the materializer must exist).
+        let matfn = self.get_or_build_sumnode_materializer(sum_ty);
+        let matfn_ptr = matfn.as_global_value().as_pointer_value();
+        let arr_ty = i32_ty.array_type(words.len() as u32);
+        let struct_ty = self.context.struct_type(&[ptr_ty.into(), arr_ty.into()], false);
         let arr = i32_ty.const_array(&words);
-        let global = self.module.add_global(arr.get_type(), None, &key);
-        global.set_initializer(&arr);
+        let init = struct_ty.const_named_struct(&[matfn_ptr.into(), arr.into()]);
+        let global = self.module.add_global(struct_ty, None, &key);
+        global.set_initializer(&init);
         global.set_constant(true);
         global.as_pointer_value()
     }
@@ -2317,26 +2351,88 @@ impl<'ctx> Codegen<'ctx> {
         src: BasicValueEnum<'ctx>,
         src_ty: &Type,
         sum_ty: &Type,
-        llvm_fn: inkwell::values::FunctionValue<'ctx>,
+        _llvm_fn: inkwell::values::FunctionValue<'ctx>,
     ) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        // KEEP-PACKED-THROUGH-RECORD-FIELDS fast path: when `src` is a BOXED union/Json value (so it
+        // is a `TaggedVal*`), its payload MAY be a keep-packed `*SumNode` (TAG_SUMNODE — the cursor
+        // zero-copy store) rather than a materialized `LinObject` (TAG_OBJECT). Tag-dispatch: a
+        // TAG_SUMNODE box's payload IS already the projected node, so just unwrap it + retain (zero
+        // copy); any other tag → unbox to the LinObject and run the per-type projector (rebuild). This
+        // centralizes the keep-packed read-back so EVERY caller (the arg/slot Coerce, `unbox_tagged_
+        // val_to_type`, Index) gets it. Only when `src_ty` is a union is `src` a box we may probe; a
+        // non-union `src` is a raw `LinObject*` (e.g. a match-narrowed, already-unboxed scrutinee) whose
+        // first bytes are NOT a tag — never probe it, project directly. The runtime-tag dispatch is the
+        // soundness mechanism: no static store/read agreement is required.
+        if Self::is_union_type(src_ty) && src.is_pointer_value() {
+            let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+            let i8_ty = self.context.i8_type();
+            let tag = self.builder.call(self.rt.get_tag, &[src.into()], "pfb_tag").try_as_basic_value().unwrap_basic().into_int_value();
+            let is_kp = self.builder.int_compare(
+                inkwell::IntPredicate::EQ, tag, i8_ty.const_int(lin_common::tags::TAG_SUMNODE as u64, false), "pfb_is_kp");
+            let kp_bb = self.context.append_basic_block(llvm_fn, "pfb_kp");
+            let proj_bb = self.context.append_basic_block(llvm_fn, "pfb_proj");
+            let merge_bb = self.context.append_basic_block(llvm_fn, "pfb_merge");
+            self.builder.conditional_branch(is_kp, kp_bb, proj_bb);
+            // KEEP-PACKED: payload IS the *SumNode — unwrap + retain (fresh +1 owner).
+            self.builder.position_at_end(kp_bb);
+            let node = self.builder.call(self.rt.unbox_ptr, &[src.into()], "pfb_kp_node").try_as_basic_value().unwrap_basic();
+            if node.is_pointer_value() {
+                self.builder.call(self.rt.rc_retain, &[node.into()], "");
+            }
+            let kp_pred = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(merge_bb);
+            // MATERIALIZED (TAG_OBJECT) box: unbox to the LinObject and run the projector.
+            self.builder.position_at_end(proj_bb);
+            let container = self.builder.call(self.rt.unbox_ptr, &[src.into()], "sumnode_pfb_unbox").try_as_basic_value().unwrap_basic();
+            let func = self.get_or_build_sumnode_projector(sum_ty);
+            let proj = self.builder.call(func, &[container.into()], "sumnode_pfb").try_as_basic_value().unwrap_basic();
+            let proj_pred = self.builder.get_insert_block().unwrap();
+            self.builder.unconditional_branch(merge_bb);
+            self.builder.position_at_end(merge_bb);
+            let phi = self.builder.phi(ptr_ty, "pfb_phi");
+            phi.add_incoming(&[(&node, kp_pred), (&proj, proj_pred)]);
+            return phi.as_basic_value();
+        }
+        // Non-union `src`: a raw `LinObject*` (or already-unboxed) — project directly, no tag probe.
+        let func = self.get_or_build_sumnode_projector(sum_ty);
+        self.builder
+            .call(func, &[src.into()], "sumnode_pfb")
+            .try_as_basic_value()
+            .unwrap_basic()
+    }
+
+    /// Build (and memoize) the per-sum-type projector `lin_sumproj_<key>(boxed_obj: ptr) -> *SumNode`:
+    /// reads the boxed `LinObject`'s discriminant string, switches to the matching variant, reads each
+    /// scalar payload field (+unbox) and each RECURSIVE child (via a SELF-CALL on the child's boxed
+    /// object), and `sumnode_construct`s the +1 node. The reverse of the materializer. Memoized by the
+    /// sum type's shape so it is emitted once and the recursion terminates at runtime.
+    fn get_or_build_sumnode_projector(&mut self, sum_ty: &Type) -> inkwell::values::FunctionValue<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
         let disc_key = Self::sum_type_discriminant(sum_ty).expect("project_from_boxed: not a sum type");
-        // Unbox the source to a raw LinObject* if it is a union/Json box.
-        let container = if Self::is_union_type(src_ty) {
-            self.builder.call(self.rt.unbox_ptr, &[src.into()], "sumnode_pfb_unbox").try_as_basic_value().unwrap_basic()
-        } else {
-            src
-        };
-        // Read the discriminant string value (boxed) for the switch.
-        let dk = self.compile_string_lit(&disc_key).into_pointer_value();
-        let disc_box = self.builder.call(self.rt.object_get, &[container.into(), dk.into()], "sumnode_pfb_disc").try_as_basic_value().unwrap_basic();
+        let self_name = Self::sum_recursive_self_name(sum_ty);
+        let key = format!("lin_sumproj_{:x}", {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            format!("{sum_ty:?}").hash(&mut h);
+            h.finish()
+        });
+        if let Some(f) = self.module.get_function(&key) {
+            return f;
+        }
         let variants = match sum_ty {
             Type::Union(vs) => vs.clone(),
             _ => unreachable!(),
         };
-        let merge_bb = self.context.append_basic_block(llvm_fn, "sumnode_pfb_merge");
-        let mut incoming: Vec<(inkwell::values::PointerValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
-        // Chain of disc-string compares (the boxed source's discriminant is a string).
+        let saved_block = self.builder.get_insert_block();
+        let fn_ty = ptr_ty.fn_type(&[ptr_ty.into()], false);
+        let func = self.module.add_function(&key, fn_ty, None);
+        let entry = self.context.append_basic_block(func, "entry");
+        self.builder.position_at_end(entry);
+        let container: BasicValueEnum<'ctx> = func.get_nth_param(0).unwrap();
+        // Read the discriminant string value (boxed) for the switch.
+        let dk = self.compile_string_lit(&disc_key).into_pointer_value();
+        let disc_box = self.builder.call(self.rt.object_get, &[container.into(), dk.into()], "sumnode_pfb_disc").try_as_basic_value().unwrap_basic();
         let mut variant_info: Vec<(String, indexmap::IndexMap<String, Type>)> = Vec::new();
         for v in &variants {
             if let Type::Object { fields, .. } = v {
@@ -2345,14 +2441,15 @@ impl<'ctx> Codegen<'ctx> {
                 }
             }
         }
+        let merge_bb = self.context.append_basic_block(func, "sumnode_pfb_merge");
+        let mut incoming: Vec<(inkwell::values::PointerValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> = Vec::new();
         let n = variant_info.len();
         for (idx, (disc_val, payload)) in variant_info.iter().enumerate() {
-            // test: disc_box == box("disc_val")
-            let arm_bb = self.context.append_basic_block(llvm_fn, "sumnode_pfb_arm");
+            let arm_bb = self.context.append_basic_block(func, "sumnode_pfb_arm");
             let next_bb = if idx + 1 < n {
-                self.context.append_basic_block(llvm_fn, "sumnode_pfb_next")
+                self.context.append_basic_block(func, "sumnode_pfb_next")
             } else {
-                arm_bb // last variant: take it unconditionally as the default
+                arm_bb
             };
             if idx + 1 < n {
                 let lit_raw = self.compile_string_lit(disc_val);
@@ -2368,16 +2465,26 @@ impl<'ctx> Codegen<'ctx> {
             } else {
                 self.builder.unconditional_branch(arm_bb);
             }
-            // arm: build the variant node, reading scalar payload fields from the boxed object.
             self.builder.position_at_end(arm_bb);
             let field_vals: Vec<(String, BasicValueEnum<'ctx>, Type)> = {
                 let mut v = Vec::new();
-                // discriminant: the StrLit value (interned).
                 v.push((disc_key.clone(), self.compile_string_lit(disc_val), Type::StrLit(disc_val.clone())));
                 for (k, fty) in payload.iter() {
                     let key_str = self.compile_string_lit(k).into_pointer_value();
                     let tagged = self.builder.call(self.rt.object_get, &[container.into(), key_str.into()], "sumnode_pfb_get").try_as_basic_value().unwrap_basic();
-                    let val = self.unbox_tagged_val_to_type(tagged, fty);
+                    // A RECURSIVE CHILD field (typed `Named(self)`) is projected into a fresh `*SumNode`
+                    // of the SAME sum type via a SELF-CALL on the child's boxed object; `sumnode_construct`
+                    // stores it as the owned recursive child pointer. A scalar field is unboxed.
+                    let is_recursive = self_name
+                        .as_deref()
+                        .is_some_and(|n| Self::is_sum_recursive_child(fty, n));
+                    let val = if is_recursive {
+                        // The child slot in the boxed object is a nested boxed LinObject (TAG_OBJECT).
+                        let child_obj = self.builder.call(self.rt.unbox_ptr, &[tagged.into()], "sumnode_pfb_child_unbox").try_as_basic_value().unwrap_basic();
+                        self.builder.call(func, &[child_obj.into()], "sumnode_pfb_child").try_as_basic_value().unwrap_basic()
+                    } else {
+                        self.unbox_tagged_val_to_type(tagged, fty)
+                    };
                     v.push((k.clone(), val, fty.clone()));
                 }
                 v
@@ -2395,7 +2502,11 @@ impl<'ctx> Codegen<'ctx> {
         let refs: Vec<(&dyn inkwell::values::BasicValue<'ctx>, inkwell::basic_block::BasicBlock<'ctx>)> =
             incoming.iter().map(|(v, b)| (v as &dyn inkwell::values::BasicValue<'ctx>, *b)).collect();
         phi.add_incoming(&refs);
-        phi.as_basic_value()
+        self.builder.r#return(Some(&phi.as_basic_value()));
+        if let Some(b) = saved_block {
+            self.builder.position_at_end(b);
+        }
+        func
     }
 
     pub(crate) fn compile_ir_field_get(&mut self, obj: BasicValueEnum<'ctx>, field: &str, obj_ty: &Type, result_ty: &Type, obj_repr: &lin_ir::repr::Repr) -> BasicValueEnum<'ctx> {
@@ -2447,8 +2558,64 @@ impl<'ctx> Codegen<'ctx> {
             // No string_release: `compile_string_lit` returns an interned, immortal
             // LinString (refcount == IMMORTAL_RC), so the release is a runtime no-op
             // — but still an emitted call, hit on every typed field read. Drop it.
+            //
+            // KEEP-PACKED-THROUGH-RECORD-FIELDS read-back: when the field's declared result type is a
+            // sum type, the slot MAY hold a keep-packed `TaggedVal(TAG_SUMNODE)` (the BoxKeepSumnode
+            // store — the interp cursor `{node,pos}["node"]` zero-copy path) OR a MATERIALIZED
+            // `TAG_OBJECT` (the cross-thread / boundary / fallback path). Dispatch on the RUNTIME TAG so
+            // both are correct WITHOUT a static store/read agreement: TAG_SUMNODE → unwrap the still-
+            // packed `*SumNode` (+retain), zero copy; otherwise → project the boxed object into a fresh
+            // node (the historical path). This runtime-tag dispatch is what makes the optimization sound
+            // (no asymmetric keep-packed/materialize decision). A `sum | Null` read is handled the same
+            // — a null payload tags as TAG_NULL → the project/unwrap both yield a null node.
             self.unbox_tagged_val_to_type(tagged, result_ty)
         } else { ptr_ty.const_null().into() }
+    }
+
+    /// Keep-packed read-back of a sum field into UNION/Json (type-erased) position: the result must
+    /// remain a BOXED `TaggedVal*` for the union ABI and be correct for every dynamic consumer
+    /// (toString/eq/json). If the slot holds a keep-packed `TAG_SUMNODE`, MATERIALIZE the still-packed
+    /// `*SumNode` to a real boxed `LinObject` (TAG_OBJECT) so the type-erased consumers see an object,
+    /// not a SumNode they cannot interpret. If it already holds a materialized box (or a null), pass it
+    /// through unchanged. Tag-dispatched (sound: zero static asymmetry). The boundary counterpart of
+    /// `sumnode_project_from_boxed`'s keep-packed fast path (which targets sum-CONSUMING position and
+    /// unwraps the node zero-copy); here the consumer is dynamic so the node is materialized. `sum_ty`
+    /// is the non-null sum member. Returns a borrowed-or-fresh `TaggedVal*` (the materialized box is a
+    /// fresh +1 the union owning model releases; the pass-through stays the borrowed interior box).
+    pub(crate) fn sumnode_box_readback_to_object_box(
+        &mut self,
+        tagged: BasicValueEnum<'ctx>,
+        sum_ty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i8_ty = self.context.i8_type();
+        if !tagged.is_pointer_value() {
+            return tagged;
+        }
+        let llvm_fn = self.builder.get_insert_block().unwrap().get_parent().unwrap();
+        let tag = self.builder.call(self.rt.get_tag, &[tagged.into()], "fgb_sum_tag")
+            .try_as_basic_value().unwrap_basic().into_int_value();
+        let is_kp = self.builder.int_compare(
+            inkwell::IntPredicate::EQ, tag,
+            i8_ty.const_int(lin_common::tags::TAG_SUMNODE as u64, false), "fgb_is_kp");
+        let kp_bb = self.context.append_basic_block(llvm_fn, "fgb_sum_kp");
+        let pass_bb = self.context.append_basic_block(llvm_fn, "fgb_sum_pass");
+        let merge_bb = self.context.append_basic_block(llvm_fn, "fgb_sum_merge");
+        self.builder.conditional_branch(is_kp, kp_bb, pass_bb);
+        // KEEP-PACKED: unwrap the raw *SumNode (borrowed), materialize to a boxed LinObject, box it.
+        self.builder.position_at_end(kp_bb);
+        let node = self.builder.call(self.rt.unbox_ptr, &[tagged.into()], "fgb_kp_node").try_as_basic_value().unwrap_basic();
+        let obj = self.sumnode_materialize_to_object(node, sum_ty, llvm_fn);
+        let kp_box = self.builder.call(self.rt.box_object, &[obj.into()], "fgb_kp_box").try_as_basic_value().unwrap_basic();
+        let kp_pred = self.builder.get_insert_block().unwrap();
+        self.builder.unconditional_branch(merge_bb);
+        // OTHER tag (materialized TAG_OBJECT box / null): pass through unchanged.
+        self.builder.position_at_end(pass_bb);
+        self.builder.unconditional_branch(merge_bb);
+        self.builder.position_at_end(merge_bb);
+        let phi = self.builder.phi(ptr_ty, "fgb_sum_phi");
+        phi.add_incoming(&[(&kp_box, kp_pred), (&tagged, pass_bb)]);
+        phi.as_basic_value()
     }
 
 }

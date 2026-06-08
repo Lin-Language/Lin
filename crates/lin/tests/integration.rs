@@ -15887,3 +15887,344 @@ print(toString(blockTail(10)))
 "#);
     assert_eq!(output, vec!["28", "29", "28", "31", "21"]);
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// unboxed-sumtype Stage 3 — sum values crossing container / `sum|Null` / dynamic
+// boundaries. These exercise the materialize-to-boxed boundary (a recursive sum
+// value stored into a record/Json field or `{String:sum}` map, passed to a
+// `sum|Null` param, or fed to toString) projecting back to a correct SumNode on
+// read — the canonical "build a tree, store it, read it back, traverse it, assert
+// the CORRECT numeric result" patterns. (Before this fix these crashed / mis-read
+// the discriminant: a SumNode pointer stored raw under TAG_OBJECT was read back as
+// a LinObject → null-deref / "non-exhaustive match".)
+// ───────────────────────────────────────────────────────────────────────────
+
+const ST3_AST_PRELUDE: &str = r#"import { print } from "std/io"
+import { toString } from "std/string"
+type Num   = { "kind": "num", "value": Int32 }
+type BinOp = { "kind": "op", "op": Int32, "left": Expr, "right": Expr }
+type Expr  = Num | BinOp
+val eval = (e: Expr): Int32 =>
+  match e
+    is Num => e["value"]
+    is BinOp =>
+      val l = eval(e["left"])
+      val r = eval(e["right"])
+      if e["op"] == 0 then l + r
+      else if e["op"] == 1 then l - r
+      else l * r
+"#;
+
+#[test]
+fn test_st3_cursor_record_store_read_eval() {
+    // (b) A parser-style cursor record `{ "node": Expr, "pos": Int32 }`: store a tree
+    // in the `node` field, read it back, traverse it, and read the scalar `pos` field.
+    // ((3+4)*(10-6)) = 28; pos = 7.
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+type Cursor = {{ "node": Expr, "pos": Int32 }}
+val main = () =>
+  val tree: Expr = {{
+    "kind": "op", "op": 2,
+    "left": {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": 3 }}, "right": {{ "kind": "num", "value": 4 }} }},
+    "right": {{ "kind": "op", "op": 1, "left": {{ "kind": "num", "value": 10 }}, "right": {{ "kind": "num", "value": 6 }} }}
+  }}
+  val cur: Cursor = {{ "node": tree, "pos": 7 }}
+  print(eval(cur["node"]).toString())
+  print(cur["pos"].toString())
+main()
+"#
+    );
+    let out = run(&src);
+    assert_eq!(out, vec!["28", "7"]);
+}
+
+#[test]
+fn test_st3_map_string_expr_round_trip_eval() {
+    // (a) A `{ String: Expr }` map: store a tree under a key, read it back (typed
+    // `Expr | Null`), narrow with `is`, and evaluate. (3+4) = 7.
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+val evalOpt = (e: Expr | Null): Int32 =>
+  match e
+    is Num => eval(e)
+    is BinOp => eval(e)
+    else => 0 - 1
+val main = () =>
+  val tree: Expr = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": 3 }}, "right": {{ "kind": "num", "value": 4 }} }}
+  var m: {{ String: Expr }} = {{}}
+  m["root"] = tree
+  print(evalOpt(m["root"]).toString())
+main()
+"#
+    );
+    let out = run(&src);
+    assert_eq!(out, vec!["7"]);
+}
+
+#[test]
+fn test_keeppacked_map_sumvalue_round_trip_no_uaf() {
+    // Regression (ADR-062 Stage 3, double-free): a `{ String: Expr }` map value read into a
+    // `val back`, then narrowed by `match back` and passed to `eval(back)`, double-freed the
+    // projected SumNode — the narrowed concrete variant flowing into `eval`'s sum param was BOTH
+    // released by the owning model (`lin_sumnode_release`) AND classified as a caller-owned box
+    // shell / sealed-record materialize (a second release + a mismatched-size box free). An ASan
+    // heap-use-after-free at `lin_sumnode_release` (run-correct only because the second free landed
+    // in free-list slop). Fixed in `lower.rs` by excluding `sum_arg_projected` from
+    // `arg_box_is_caller_owned_shell` / `arg_box_is_caller_owned_scalar_shell` /
+    // `sealed_{record,array}_arg_materialized`. Exercises BOTH variant arms (BinOp → 7, Num → 42)
+    // and the OVERWRITE case (the old value released exactly once → 99). The ASan gate is the real
+    // proof; this documents the shape + run-correctness.
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+val main = () =>
+  var m: {{ String: Expr }} = {{}}
+  m["root"] = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": 3 }}, "right": {{ "kind": "num", "value": 4 }} }}
+  val back = m["root"]
+  val r = match back
+    is Num => eval(back)
+    is BinOp => eval(back)
+    else => 0 - 1
+  print(r.toString())
+
+  // Num-variant arm (this was the arm whose `eval(back)` double-freed under ASan).
+  var n: {{ String: Expr }} = {{}}
+  n["leaf"] = {{ "kind": "num", "value": 42 }}
+  val nb = n["leaf"]
+  val nr = match nb
+    is Num => eval(nb)
+    is BinOp => eval(nb)
+    else => 0 - 1
+  print(nr.toString())
+
+  // Overwrite: the OLD stored value must be released exactly once on reassignment.
+  var o: {{ String: Expr }} = {{}}
+  o["k"] = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": 1 }}, "right": {{ "kind": "num", "value": 2 }} }}
+  o["k"] = {{ "kind": "num", "value": 99 }}
+  val ob = o["k"]
+  val or = match ob
+    is Num => eval(ob)
+    is BinOp => eval(ob)
+    else => 0 - 1
+  print(or.toString())
+main()
+"#
+    );
+    let out = run(&src);
+    assert_eq!(out, vec!["7", "42", "99"]);
+}
+
+#[test]
+fn test_st3_sum_value_through_nullable_param() {
+    // A recursive sum value passed to a `sum | Null` parameter must materialize to a
+    // real boxed object so the callee's `match` reads the correct discriminant. (3+4) = 7.
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+val evalOpt = (e: Expr | Null): Int32 =>
+  match e
+    is Num => eval(e)
+    is BinOp => eval(e)
+    else => 0 - 1
+val main = () =>
+  val tree: Expr = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": 3 }}, "right": {{ "kind": "num", "value": 4 }} }}
+  print(evalOpt(tree).toString())
+  val leaf: Expr = {{ "kind": "num", "value": 42 }}
+  print(evalOpt(leaf).toString())
+main()
+"#
+    );
+    let out = run(&src);
+    assert_eq!(out, vec!["7", "42"]);
+}
+
+#[test]
+fn test_st3_same_tree_to_string_materializes_correctly() {
+    // (c) The SAME tree fed to `toString` (a genuinely-dynamic consumer) must still
+    // MATERIALIZE to a real LinObject and print its fields correctly — not a raw
+    // SumNode pointer (which would print garbage). A field read still evaluates to 7.
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+val main = () =>
+  val tree: Expr = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": 3 }}, "right": {{ "kind": "num", "value": 4 }} }}
+  val j: Json = tree
+  print(j["kind"].toString())
+  print(eval(tree).toString())
+main()
+"#
+    );
+    let out = run(&src);
+    assert_eq!(out, vec!["op", "7"]);
+}
+
+#[test]
+fn test_st3_cursor_in_loop_repeated_store_read() {
+    // Repeated build → store-in-record → read → eval in a loop: stresses the
+    // materialize/project round-trip's RC across many iterations (no leak/UAF scaling,
+    // verified separately under ASan). Each iteration evaluates ((i)+(1)) and sums.
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+import {{ range, for }} from "std/iter"
+type Cursor = {{ "node": Expr, "pos": Int32 }}
+val main = () =>
+  var total: Int32 = 0
+  range(0, 200).for((i) =>
+    val tree: Expr = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": i }}, "right": {{ "kind": "num", "value": 1 }} }}
+    val cur: Cursor = {{ "node": tree, "pos": i }}
+    total = total + eval(cur["node"])
+  )
+  print(total.toString())
+main()
+"#
+    );
+    let out = run(&src);
+    // sum over i in [0,200) of (i + 1) = (199*200/2) + 200 = 19900 + 200 = 20100
+    assert_eq!(out, vec!["20100"]);
+}
+
+#[test]
+fn test_st3_untyped_object_store_read_eval() {
+    // SOUNDNESS HOLE (this fix): a statically-sum-typed value stored into an UNTYPED object
+    // literal (no type annotation on the binding → inferred `Object`, not a sealed/named record).
+    // The store materializes the SumNode to a boxed LinObject; the read-back PROJECTS it to a
+    // FRESH +1 SumNode. Before the fix the IR-lowering relocation `CloneBox` ran on the projected
+    // raw SumNode via `lin_tagged_clone` (reading offset 0/8 as a TaggedVal tag/payload) → garbage
+    // result + heap-buffer-overflow on the later `lin_sumnode_release`. The repr pass now seeds the
+    // Index dst `Packed(SumNode)` and the lowering registers the fresh projection owned directly.
+    // (3+4) = 7.
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+val main = () =>
+  val tree: Expr = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": 3 }}, "right": {{ "kind": "num", "value": 4 }} }}
+  val cursor = {{ "node": tree, "pos": 0 }}
+  val back: Expr = cursor["node"]
+  print(eval(back).toString())
+main()
+"#
+    );
+    let out = run(&src);
+    assert_eq!(out, vec!["7"]);
+}
+
+#[test]
+fn test_st3_untyped_object_sum_to_string() {
+    // Sibling case: a sum value stored into an UNTYPED object then read back and fed to a
+    // genuinely-dynamic consumer (`toString`). The read-back must materialize the REAL tree, not a
+    // raw SumNode pointer (which printed garbage `{"kind":"num","value":33}` before the fix).
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+val main = () =>
+  val tree: Expr = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": 3 }}, "right": {{ "kind": "num", "value": 4 }} }}
+  val cursor = {{ "node": tree, "pos": 0 }}
+  print(cursor["node"].toString())
+main()
+"#
+    );
+    let out = run(&src);
+    assert_eq!(
+        out,
+        vec![r#"{"kind": "op", "op": 0, "left": {"kind": "num", "value": 3}, "right": {"kind": "num", "value": 4}}"#]
+    );
+}
+
+#[test]
+fn test_st3_untyped_object_in_loop_repeated_store_read() {
+    // The untyped-object store/read round-trip in a loop: stresses the materialize/project RC across
+    // many iterations (no SumNode leak/UAF scaling — verified separately under ASan: the per-iter
+    // 48-byte projected node is freed, not retained-and-leaked). Each iteration evaluates (i + 1).
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+import {{ range, for }} from "std/iter"
+val main = () =>
+  var total: Int32 = 0
+  range(0, 200).for((i) =>
+    val tree: Expr = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": i }}, "right": {{ "kind": "num", "value": 1 }} }}
+    val cursor = {{ "node": tree, "pos": i }}
+    val back: Expr = cursor["node"]
+    total = total + eval(back)
+  )
+  print(total.toString())
+main()
+"#
+    );
+    let out = run(&src);
+    // sum over i in [0,200) of (i + 1) = (199*200/2) + 200 = 20100
+    assert_eq!(out, vec!["20100"]);
+}
+
+#[test]
+fn test_keeppacked_sumfield_cross_fn_cursor() {
+    // KEEP-PACKED-THROUGH-RECORD-FIELDS (the interp-cursor optimization): a sum value stored into a
+    // record FIELD is kept packed by-pointer (`TaggedVal(TAG_SUMNODE)` — no `lin_summat`/`lin_box_object`
+    // materialize) and read back via a runtime-tag-dispatched unwrap. Mirrors the interp `{ node, pos }`
+    // cursor: the record is BUILT in one function and the field READ in another (the keep-packed slot
+    // crosses a function/return boundary). Result must equal the materialize path. ((3+4)*(10-6)) = 28.
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+type Cursor = {{ "node": Expr, "pos": Int32 }}
+val mkCursor = (e: Expr, p: Int32): Cursor => {{ "node": e, "pos": p }}
+val readNode = (c: Cursor): Int32 => eval(c["node"])
+val main = () =>
+  val tree: Expr = {{
+    "kind": "op", "op": 2,
+    "left": {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": 3 }}, "right": {{ "kind": "num", "value": 4 }} }},
+    "right": {{ "kind": "op", "op": 1, "left": {{ "kind": "num", "value": 10 }}, "right": {{ "kind": "num", "value": 6 }} }}
+  }}
+  val cur = mkCursor(tree, 7)
+  print(readNode(cur).toString())
+main()
+"#
+    );
+    let out = run(&src);
+    assert_eq!(out, vec!["28"]);
+}
+
+#[test]
+fn test_keeppacked_sumfield_tostring_field_materializes() {
+    // SAFETY (keep-packed boundary correctness): a kept-packed sum FIELD fed to a genuinely-dynamic
+    // consumer (`toString`) must MATERIALIZE the real tree. The kept-packed `TAG_SUMNODE` that escapes
+    // the field into the type-erased `toString` boundary is materialized by the runtime walker
+    // (`lin_tagged_to_string` via the per-type materializer fn-ptr in the SumNode descriptor) — NOT
+    // printed as `[object]` / a raw SumNode pointer.
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+type Cursor = {{ "node": Expr, "pos": Int32 }}
+val main = () =>
+  val tree: Expr = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": 3 }}, "right": {{ "kind": "num", "value": 4 }} }}
+  val cur: Cursor = {{ "node": tree, "pos": 7 }}
+  print(cur["node"].toString())
+main()
+"#
+    );
+    let out = run(&src);
+    assert_eq!(
+        out,
+        vec![r#"{"kind": "op", "op": 0, "left": {"kind": "num", "value": 3}, "right": {"kind": "num", "value": 4}}"#]
+    );
+}
+
+#[test]
+fn test_keeppacked_sumfield_loop_leak_free() {
+    // Leak-scaling guard for the keep-packed cursor round-trip: build → store-in-record → read-back →
+    // eval in a 300-iteration loop. The keep-packed store's `object_set_fresh` retain + shell-only
+    // free, balanced against the read-back's tag-dispatched unwrap+retain and the cursor drop's
+    // TAG_SUMNODE release, nets zero per iteration (verified separately under ASan: the keep-packed
+    // path leaks strictly LESS than the materialize baseline). Each iteration evaluates (i + 1).
+    let src = format!(
+        r#"{ST3_AST_PRELUDE}
+import {{ range, for }} from "std/iter"
+type Cursor = {{ "node": Expr, "pos": Int32 }}
+val main = () =>
+  var total: Int32 = 0
+  range(0, 300).for((i) =>
+    val tree: Expr = {{ "kind": "op", "op": 0, "left": {{ "kind": "num", "value": i }}, "right": {{ "kind": "num", "value": 1 }} }}
+    val cur: Cursor = {{ "node": tree, "pos": i }}
+    total = total + eval(cur["node"])
+  )
+  print(total.toString())
+main()
+"#
+    );
+    let out = run(&src);
+    // sum over i in [0,300) of (i + 1) = (299*300/2) + 300 = 44850 + 300 = 45150
+    assert_eq!(out, vec!["45150"]);
+}
