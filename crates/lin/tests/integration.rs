@@ -15323,6 +15323,45 @@ print("${loop(1000, 0)}")
 }
 
 #[test]
+fn test_nested_string_record_array_push_iter() {
+    // REGRESSION (RAPTOR `Trip { stopTimes: StopTime[] }`): a packed record whose element has a
+    // NESTED record-array field (`StopTime[]`) where the nested element carries a HEAP (String) field
+    // — built via `push` of a Json object literal, then iterated with the outer/inner `.for(...)`.
+    // The push path projects the Json object into the packed Trip layout; for the `stopTimes` array
+    // field it must PROJECT the boxed `Object[]` into a packed `StopTime[]` buffer (not store the
+    // boxed array verbatim). Storing it verbatim made the later materialize-on-read interpret the
+    // boxed array's element pointers as inline packed bytes → a misaligned String deref crash
+    // (string.rs `address must be a multiple of 0x4 but is 0x7`). Both the String-field and the
+    // scalar-only nested element are exercised (the scalar push path was ALSO crashing on master).
+    let out = run(r#"
+import { print } from "std/io"
+import { push } from "std/array"
+import { for } from "std/iter"
+type StopTime = { "stop": String, "arr": Int32, "dep": Int32 }
+type Trip = { "id": Int32, "routeId": String, "stopTimes": StopTime[] }
+val tripsByRoute: Trip[] = []
+push(tripsByRoute, { "id": 1, "routeId": "R1", "stopTimes": [
+  { "stop": "A", "arr": 0, "dep": 100 },
+  { "stop": "B", "arr": 200, "dep": 250 },
+  { "stop": "C", "arr": 400, "dep": 0 }
+] })
+push(tripsByRoute, { "id": 2, "routeId": "R2", "stopTimes": [
+  { "stop": "A", "arr": 0, "dep": 500 },
+  { "stop": "D", "arr": 700, "dep": 0 }
+] })
+var totalArr = 0
+var totalDep = 0
+var stopCount = 0
+tripsByRoute.for((t) => t["stopTimes"].for((st) => totalArr = totalArr + st["arr"]))
+tripsByRoute.for((t) => t["stopTimes"].for((st) => totalDep = totalDep + st["dep"]))
+tripsByRoute.for((t) => t["stopTimes"].for((st) => stopCount = stopCount + 1))
+print("arr=${totalArr} dep=${totalDep} stops=${stopCount}")
+"#);
+    // arr = 0+200+400+0+700 = 1300; dep = 100+250+0+500+0 = 850; stops = 5.
+    assert_eq!(out, vec!["arr=1300 dep=850 stops=5"]);
+}
+
+#[test]
 fn test_sealed_array_regression_flat_scalar_array_unchanged() {
     // REGRESSION: a flat scalar Int32[] (NOT a sealed-record array) must keep its flat
     // representation and behavior — the new SEALED_ARRAY_TAG path must not perturb flat arrays.
