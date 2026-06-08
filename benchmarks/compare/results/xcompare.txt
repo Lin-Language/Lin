@@ -1,0 +1,18 @@
+# Lin cross-language comparison
+# label:    xcompare
+# runs:     2
+# runtime:  34e753d4edf11e87f6c0d08ed11ed9f1
+# versions: toolchains: lin=ok rust=1.95.0 go=1.26.4 python=3.11.2 node=v24.16.0 hyperfine=MISSING
+# skipped:  none
+# timer:    bash EPOCHREALTIME
+# cells:    min wall-clock ms (lower=faster); -- = skipped/absent, BUILD_FAIL, MISMATCH = wrong answer
+workload            lin       rust         go     python       node
+------------ ---------- ---------- ---------- ---------- ----------
+dijkstra             37          8         14        206         57
+interp              383         13         51        218         45
+parallel            168        104        174      19179       4272
+recursion           532        481        888      20086       2199
+pipeline             67         97        110       1416        505
+records             200        199        553      23361       1163
+async_io            203        202        203        232        218
+# correctness: all languages agreed ✓

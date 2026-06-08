@@ -1,4 +1,4 @@
-// std/csv — RFC 4180 CSV reader and writer (csv proposal, docs/proposals/stdlib/csv.md).
+// std/csv — RFC 4180 CSV reader and writer.
 //
 // A CSV document is a sequence of records, each a sequence of String fields. std/csv never
 // coerces field values — every field is a String (CSV has no types). Quoted fields, embedded
