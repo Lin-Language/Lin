@@ -1558,6 +1558,81 @@ impl<'ctx> Codegen<'ctx> {
                                 if let Some(&val) = temp_map.get(val_temp) {
                                     let key_str = self.compile_string_lit(key).into_pointer_value();
                                     let val_ty = func.temp_types.get(val_temp).cloned().unwrap_or(Type::Null);
+                                    // UNBOXED SUM TYPE (unboxed-sumtype Stage 3): a sum-typed field
+                                    // value is physically a `*SumNode`, NOT a boxed TaggedVal*. The
+                                    // generic union branch below would store the raw SumNode pointer as
+                                    // if it were already a box → the read-back `object_get` reads a
+                                    // SumNode header as a LinObject → garbage / crash.
+                                    //
+                                    // MATERIALIZE it to a real boxed LinObject — the safe, always-sound
+                                    // boundary for a record field (which may flow to toString / match /
+                                    // spread, and whose READ-back type partially expands the recursive
+                                    // children, so a keep-packed `TAG_SUMNODE` store could not be matched
+                                    // by a type-driven read decision — see the deferral note below).
+                                    // `box_value` heap-boxes the materialized object as TAG_OBJECT (and
+                                    // handles the `sum|Null` null case); the freshly materialized object
+                                    // is +1, `object_set_fresh` retains it into the slot, release the
+                                    // transient box after.
+                                    //
+                                    // KEEP-PACKED-BY-POINTER for a record/Json field slot is DEFERRED:
+                                    // the field's READ-back type and the stored VALUE's type are
+                                    // structurally different (the record field type expands the recursive
+                                    // sum children one level to `Union`, while the value carries them as
+                                    // `Named` — so `is_sum_type`/`sum_type_eligible` disagree between the
+                                    // store and the read). A keep-packed decision must therefore be
+                                    // REPR-driven (the repr pass carries a consistent label), which needs
+                                    // the lowering/repr STEP-4 — out of this change's scope. The
+                                    // TAG_SUMNODE runtime substrate + codegen helpers are in place.
+                                    if Self::is_sum_type(&val_ty)
+                                        || Self::sum_member_of_nullable_union(&val_ty).is_some()
+                                    {
+                                        // KEEP-PACKED-THROUGH-RECORD-FIELDS store: a sum-typed field
+                                        // value is physically a `*SumNode`. Instead of materializing it
+                                        // to a boxed LinObject (`lin_summat` + `lin_box_object` — the
+                                        // O(n)-tree round-trip the interp cursor `{node,pos}` paid every
+                                        // parse step), wrap the still-packed node by-pointer in a
+                                        // `TaggedVal(TAG_SUMNODE)` (BoxKeepSumnode, O(1), zero copy). The
+                                        // DISTINCT tag is the soundness mechanism: the slot's release
+                                        // routes to `lin_sumnode_release_self`, retain to the offset-0 RC
+                                        // bump, and toString/eq/json/transfer MATERIALIZE on demand (the
+                                        // runtime walkers' TAG_SUMNODE arms). The read-back
+                                        // (`compile_ir_field_get_sumnode_readback`) tag-dispatches, so a
+                                        // slot stored EITHER keep-packed OR materialized reads correctly
+                                        // — no static store/read asymmetry. Ownership matches the
+                                        // materialize path: the IR `transfer_into_container` supplies the
+                                        // slot's owning +1; `object_set*` retains the inner; the shell
+                                        // release here undoes that duplicate, net-zero on the node.
+                                        // A null value (the `sum | Null` null case) tags as TAG_NULL.
+                                        let keep_packed = val.is_pointer_value();
+                                        let stored = if keep_packed {
+                                            self.compile_ir_box_keep_sumnode(val)
+                                        } else {
+                                            self.box_value(val, &val_ty)
+                                        };
+                                        let set_fn = if use_fresh { self.rt.object_set_fresh } else { self.rt.object_set };
+                                        self.builder.call(set_fn, &[obj_ptr.into(), key_str.into(), stored.into()], "");
+                                        if stored.is_pointer_value() {
+                                            if keep_packed {
+                                                // KEEP-PACKED: `object_set*` already retained the inner
+                                                // `*SumNode` into the slot (its OWN +1, independent of
+                                                // the source local). The source local keeps its own
+                                                // reference and is released at scope exit. So free ONLY
+                                                // the box SHELL here (lin_tagged_free_box) — a full
+                                                // `tagged_release` would `lin_sumnode_release_self` the
+                                                // shared node, dropping the slot's reference and freeing
+                                                // a node the cursor still points to (UAF). Mirrors the
+                                                // materializer's `free_box_shell` after a `set_fresh`.
+                                                let free_shell = self.get_or_declare_fn(
+                                                    "lin_tagged_free_box",
+                                                    self.context.void_type().fn_type(&[ptr_ty.into()], false),
+                                                );
+                                                self.builder.call(free_shell, &[stored.into()], "");
+                                            } else {
+                                                self.builder.call(self.rt.tagged_release, &[stored.into()], "");
+                                            }
+                                        }
+                                        continue;
+                                    }
                                     // A union/Json-typed field value is ALREADY a boxed TaggedVal*
                                     // — pass it straight to lin_object_set. Re-wrapping it via
                                     // build_tagged_val_alloca would store the pointer under a
@@ -2087,7 +2162,8 @@ impl<'ctx> Codegen<'ctx> {
                                     let llvm_ty = self.llvm_type(ty);
                                     let slot_val = self.builder.load(llvm_ty, *slot, "tco_fslot");
                                     if slot_val.is_pointer_value() {
-                                        self.emit_tco_release_final(llvm_fn, *owns, slot_val.into_pointer_value(), &tco_entry_ptrs, ret_ptr, ty);
+                                        let repr = func.repr_of(*_t).clone();
+                                        self.emit_tco_release_final(llvm_fn, *owns, slot_val.into_pointer_value(), &tco_entry_ptrs, ret_ptr, ty, &repr);
                                     }
                                 }
                             }
@@ -2111,7 +2187,8 @@ impl<'ctx> Codegen<'ctx> {
                                     let llvm_ty = self.llvm_type(ty);
                                     let slot_val = self.builder.load(llvm_ty, *slot, "tco_fslot");
                                     if slot_val.is_pointer_value() {
-                                        self.emit_tco_release_final(llvm_fn, *owns, slot_val.into_pointer_value(), &tco_entry_ptrs, None, ty);
+                                        let repr = func.repr_of(*_t).clone();
+                                        self.emit_tco_release_final(llvm_fn, *owns, slot_val.into_pointer_value(), &tco_entry_ptrs, None, ty, &repr);
                                     }
                                 }
                             }
@@ -2187,7 +2264,8 @@ impl<'ctx> Codegen<'ctx> {
                         for (i, (_t, ty)) in func.params.iter().enumerate() {
                             if let (Some(old), Some(Some(owns))) = (old_vals[i], tco_owns.get(i)) {
                                 if old.is_pointer_value() {
-                                    self.emit_tco_release_old(llvm_fn, *owns, old.into_pointer_value(), &new_ptrs, ty);
+                                    let repr = func.repr_of(*_t).clone();
+                                    self.emit_tco_release_old(llvm_fn, *owns, old.into_pointer_value(), &new_ptrs, ty, &repr);
                                 }
                             }
                         }

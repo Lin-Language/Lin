@@ -33,7 +33,7 @@ use std::alloc::{Layout, alloc};
 pub use lin_common::tags::{
     TAG_NULL, TAG_BOOL, TAG_INT32, TAG_INT64, TAG_FLOAT32, TAG_FLOAT64, TAG_STR, TAG_OBJECT,
     TAG_ARRAY, TAG_FUNCTION, TAG_UINT8, TAG_INT8, TAG_UINT16, TAG_INT16, TAG_UINT64, TAG_UINT32,
-    TAG_PROMISE, TAG_HANDLE, TAG_SHARED, TAG_STREAM, TAG_MAP,
+    TAG_PROMISE, TAG_HANDLE, TAG_SHARED, TAG_STREAM, TAG_MAP, TAG_SUMNODE,
 };
 
 #[repr(C)]
@@ -220,6 +220,17 @@ pub unsafe extern "C" fn lin_box_map(p: *mut u8) -> *mut u8 {
     alloc_tagged(TAG_MAP, p as u64)
 }
 
+/// Box a `*SumNode` (unboxed sum value) by-pointer as a TaggedVal(TAG_SUMNODE) — the
+/// keep-packed-through-record-fields store. The SumNode is BORROWED here (the shell is the only
+/// fresh +1); the slot's owning reference is supplied by the surrounding container transfer
+/// (identical contract to `lin_box_object` for a sealed record). The distinct tag routes the slot's
+/// release to `lin_sumnode_release_self`, NOT `lin_object_release` (which would type-confuse the
+/// SumNode's offset-4 size as a LinObject len).
+#[no_mangle]
+pub unsafe extern "C" fn lin_box_sumnode(p: *mut u8) -> *mut u8 {
+    alloc_tagged(TAG_SUMNODE, p as u64)
+}
+
 /// Get the type tag of a boxed value. Returns TAG_NULL (0) for null pointer.
 #[no_mangle]
 pub unsafe extern "C" fn lin_get_tag(p: *const u8) -> u8 {
@@ -280,6 +291,28 @@ pub unsafe extern "C" fn lin_tagged_eq(a: *const u8, b: *const u8) -> u8 {
     let bt = if bv.is_null() { TAG_NULL } else { (*bv).tag };
     if at == TAG_NULL && bt == TAG_NULL { return 1; }
     if at == TAG_NULL || bt == TAG_NULL { return 0; }
+    // KEEP-PACKED-THROUGH-RECORD-FIELDS boundary: a kept-packed `*SumNode` (TAG_SUMNODE) escaped into
+    // a dynamic equality. Materialize either operand to a real LinObject and compare as objects
+    // (order-independent structural equality). Transient materializations released after.
+    if at == TAG_SUMNODE || bt == TAG_SUMNODE {
+        let mat = |tv: *const TaggedVal, t: u8| -> (*mut u8, bool) {
+            if t == TAG_SUMNODE {
+                (crate::sumnode::lin_sumnode_materialize((*tv).payload as *mut u8), true)
+            } else {
+                ((*tv).payload as *mut u8, false)
+            }
+        };
+        let (ao, a_owned) = mat(av, at);
+        let (bo, b_owned) = mat(bv, bt);
+        let eq = if (at == TAG_SUMNODE || at == TAG_OBJECT) && (bt == TAG_SUMNODE || bt == TAG_OBJECT) {
+            crate::object::lin_object_eq(ao as *const crate::object::LinObject, bo as *const crate::object::LinObject)
+        } else {
+            0
+        };
+        if a_owned { crate::object::lin_object_release(ao as *mut crate::object::LinObject); }
+        if b_owned { crate::object::lin_object_release(bo as *mut crate::object::LinObject); }
+        return eq;
+    }
     let ap = (*av).payload;
     let bp = (*bv).payload;
     // Cross-numeric equality: compare numeric types by value (Int32 == Int64 if same numeric value).
@@ -544,6 +577,10 @@ pub unsafe extern "C" fn lin_tagged_release(p: *mut u8) {
         TAG_ARRAY => crate::array::lin_array_release(payload as *mut crate::array::LinArray),
         TAG_OBJECT => crate::object::lin_object_release(payload as *mut crate::object::LinObject),
         TAG_MAP => crate::map::lin_map_release(payload as *mut crate::map::LinMap),
+        // KEEP-PACKED sum node in a record-field slot: dispatch to the SumNode self-release (reads
+        // its own size from the header), NOT lin_object_release (which would read the SumNode's
+        // offset-4 size as a LinObject len → type-confusion). The matching retain bumps offset-0 RC.
+        TAG_SUMNODE => crate::sumnode::lin_sumnode_release_self(payload as *mut u8),
         TAG_SHARED => crate::shared::lin_shared_release_box(payload as *const u8),
         TAG_STREAM => crate::stream::lin_stream_release_box(payload as *const u8),
         _ => {} // Scalars (null, bool, int, float) have no heap payload.

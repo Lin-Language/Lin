@@ -169,6 +169,12 @@ impl<'ctx> Codegen<'ctx> {
                     return node;
                 }
             }
+            // KEEP-PACKED-THROUGH-RECORD-FIELDS read-back is centralized in `sumnode_project_from_boxed`:
+            // for a BOXED union/Json source it tag-dispatches (TAG_SUMNODE → unwrap the kept-packed
+            // `*SumNode` zero-copy; TAG_OBJECT → project a fresh node), and for a raw `LinObject*` (a
+            // match-narrowed, already-unboxed scrutinee — `src_ty` not a union) it projects directly.
+            // So this single call is correct for BOTH the cursor read (`parsed["node"]` boxed, the
+            // interp keep-packed fast path) AND the match-arm narrowing alike — with no static asymmetry.
             return self.sumnode_project_from_boxed(val, from_ty, to_ty, llvm_fn);
         }
         self.compile_ir_coerce(val, from_ty, to_ty)
@@ -176,6 +182,13 @@ impl<'ctx> Codegen<'ctx> {
 
     pub(crate) fn compile_ir_coerce(&mut self, val: BasicValueEnum<'ctx>, from_ty: &Type, to_ty: &Type) -> BasicValueEnum<'ctx> {
         let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        // NOTE (keep-packed-through-record-fields): a kept-packed `TAG_SUMNODE` value that escapes a
+        // record field into the type-erased dynamic domain (toString/eq/json) is materialized in the
+        // RUNTIME boundary walkers (`lin_tagged_to_string`/`push_json_value`/`lin_tagged_eq`, via the
+        // per-type materializer in the SumNode's descriptor). No codegen-side guard is emitted here —
+        // a sum-typed `from_ty` value reaching `compile_ir_coerce` may be a RAW `*SumNode` (not a box),
+        // so a `get_tag` probe would misread it; the repr-aware `compile_ir_coerce_with_repr` already
+        // handles a Packed(SumNode) source's sum→Json materialize before delegating here.
         // Numeric widening.
         if from_ty.is_numeric() && to_ty.is_numeric() {
             if val.is_int_value() && to_ty.is_float() {

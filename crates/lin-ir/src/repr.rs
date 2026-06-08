@@ -576,7 +576,21 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
         // fresh packed struct (boxing.rs:365 -> sealed_project_from). So the discriminator is the
         // RESULT type, not the array repr. A flat element is FlatScalar.
         Instruction::Index { dst, obj_ty, result_ty, .. } => {
-            if let Some(f) = sealed_fields(result_ty) {
+            if sum_type_eligible(result_ty) {
+                // UNBOXED SUM TYPE (Stage 3): an `obj[k]` / `arr[i]` whose RESULT is a sum type is
+                // PROJECTED back into a fresh `*SumNode` by codegen — both the array arm
+                // (`sumnode_project_from_boxed`, data.rs:422) and the object/Json arm
+                // (`unbox_tagged_val_to_type`'s sum arm, boxing.rs:474) materialize a packed node.
+                // So the dst's repr is `Packed(SumNode)`, NOT the Boxed default the missing arm left
+                // it at. Without this seed the dst folds to Boxed, and the IR lowering's union-result
+                // `CloneBox` (lower.rs:3514) emits `lin_tagged_clone` on the raw `*SumNode` — reading
+                // offsets 0/8 (refcount/desc) as a TaggedVal tag/payload → heap-buffer-overflow on the
+                // later `lin_sumnode_release`. With the seed, the CloneBox codegen's SumNode guard
+                // (mod.rs:925) instead bumps the node's refcount via `lin_rc_retain`. Twin of the
+                // FieldGet sum arm below (the recursive-child read). The verify Index ASSUME site only
+                // constrains the OBJECT operand, never the dst, so this seed cannot trip the oracle.
+                set(seeds, *dst, Repr::Packed(Layout::SumNode { sum_ty: result_ty.clone() }));
+            } else if let Some(f) = sealed_fields(result_ty) {
                 set(seeds, *dst, Repr::Packed(Layout::PackedStruct { fields: f.clone() }));
             } else if let Some(s) = ScalarTy::from_type(result_ty) {
                 // Flat element read (only when the array is genuinely flat — but the result type
