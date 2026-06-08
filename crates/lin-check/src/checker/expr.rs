@@ -8,6 +8,15 @@ use crate::resolve::resolve_type;
 use crate::typed_ir::*;
 use crate::types::Type;
 
+/// A flow-narrowing derived from an `if`/`else` condition that is a type/null test on a simple
+/// identifier. Carries the binding's narrowed static type for each branch (or `None` when that
+/// branch does not tighten the type). See `Checker::null_test_narrowing`.
+struct NarrowTest {
+    name: String,
+    then_ty: Option<Type>,
+    else_ty: Option<Type>,
+}
+
 impl Checker {
     pub(crate) fn check_expr(&mut self, expr: &Expr, expected: &Type) -> Result<TypedExpr, Diagnostic> {
         // For function expressions with a known expected function type, use the expected
@@ -708,20 +717,25 @@ impl Checker {
     }
 
     /// Flow-narrowing for an `if`/`else` condition: when it is a type/null test on a simple
-    /// identifier whose static type is a union, narrow that binding to the COMPLEMENT (`union minus
-    /// X`) in the branch where `X` is EXCLUDED. Generalizes the old null-only form to any `is X`
-    /// test (incl. the structural `Error` member).
+    /// identifier whose static type is a union, narrow that binding in EACH branch where the static
+    /// type tightens. Generalizes the old null-only form to any `is X` test (incl. the structural
+    /// `Error` member).
     ///
-    /// Returns `Some((name, narrowed_ty, narrow_in_then))`:
-    ///   - `v == null` / `v is X`  → `X` excluded in the ELSE branch (`narrow_in_then = false`)
-    ///   - `v != null`             → `Null` excluded in the THEN branch (`narrow_in_then = true`)
+    /// Returns `Some(NarrowTest { name, then_ty, else_ty })`, where each `*_ty` is the binding's
+    /// narrowed type in that branch (or `None` if that branch does not tighten the type):
+    ///   - `v is X`     → THEN narrows to `X` (the matched member), ELSE to the complement
+    ///                    (`union minus X`).
+    ///   - `v == null`  → THEN narrows to `Null`, ELSE to the complement.
+    ///   - `v != null`  → THEN narrows to the complement, ELSE to `Null`.
     ///
     /// Only fires when the binding's static type is a union that contains the tested type as an
-    /// exact member (so the complement is well-defined and non-empty — see `without_variant`).
-    /// Composes with — and does not replace — the existing `match`/`is` narrowing.
-    fn null_test_narrowing(&self, condition: &Expr) -> Option<(String, Type, bool)> {
+    /// exact member (so the complement is well-defined and non-empty — see `without_variant`). The
+    /// matched-member (`then` for `is`) narrowing fires whenever `X` is an exact member, which is
+    /// the case the union/complement check already guarantees. Composes with — and does not replace
+    /// — the existing `match`/`is` narrowing.
+    fn null_test_narrowing(&self, condition: &Expr) -> Option<NarrowTest> {
         // `x == null` / `x != null` against the `null` literal (either operand order).
-        let (name, excluded, narrow_in_then) = match condition {
+        let (name, matched, then_gets_matched) = match condition {
             Expr::BinaryOp { left, op, right, .. }
                 if matches!(op, lin_parse::ast::BinOp::Eq | lin_parse::ast::BinOp::NotEq) =>
             {
@@ -730,19 +744,19 @@ impl Checker {
                     (Expr::NullLit(_), Expr::Ident(n, _)) => Some(n),
                     _ => None,
                 }?;
-                // `== null`: Null holds in THEN, excluded in ELSE → narrow in ELSE.
-                // `!= null`: Null excluded in THEN → narrow in THEN.
-                let narrow_in_then = matches!(op, lin_parse::ast::BinOp::NotEq);
-                (ident.clone(), Type::Null, narrow_in_then)
+                // `== null`: Null (the matched type) holds in THEN. `!= null`: Null holds in ELSE.
+                let then_gets_matched = matches!(op, lin_parse::ast::BinOp::Eq);
+                (ident.clone(), Type::Null, then_gets_matched)
             }
-            // `x is X`: `X` holds in THEN, excluded in ELSE → narrow in ELSE. `X` may be `Null`,
-            // a scalar (`Int32`), a named/structural type, or `Error` (the structural alias).
+            // `x is X`: `X` (the matched type) holds in THEN, the complement in ELSE. `X` may be
+            // `Null`, a scalar (`Int32`), a named/structural type, or `Error` (the structural
+            // alias).
             Expr::Is { expr, pattern, .. } => {
                 let ident = match expr.as_ref() {
                     Expr::Ident(n, _) => n,
                     _ => return None,
                 };
-                let excluded = match pattern.as_ref() {
+                let matched = match pattern.as_ref() {
                     lin_parse::ast::Pattern::TypeName(name, span) => resolve_type(
                         &lin_parse::ast::TypeExpr::Named(name.clone(), *span),
                         &self.env,
@@ -753,27 +767,36 @@ impl Checker {
                     }
                     _ => return None,
                 };
-                (ident.clone(), excluded, false)
+                (ident.clone(), matched, true)
             }
             _ => return None,
         };
         let info = self.env.lookup(&name)?;
-        let narrowed = info.ty.without_variant(&excluded)?;
-        Some((name, narrowed, narrow_in_then))
+        // The complement (union minus the matched member) — also confirms `matched` is an exact
+        // member of the union, the precondition for narrowing in either direction.
+        let complement = info.ty.without_variant(&matched)?;
+        // The matched branch narrows the binding to the matched member alone; the other branch to
+        // the complement.
+        let (then_ty, else_ty) = if then_gets_matched {
+            (Some(matched), Some(complement))
+        } else {
+            (Some(complement), Some(matched))
+        };
+        Some(NarrowTest { name, then_ty, else_ty })
     }
 
-    /// Apply a flow-narrowing (from `null_test_narrowing`) within the CURRENT scope if it targets
-    /// the branch being entered. `entering_then` says which branch we are about to check; the
-    /// narrowing's third element says which branch excludes the tested type. Reuses the original
-    /// slot via `define_narrowed` so `LocalGet` reads the same TaggedVal pointer (the value is
-    /// bit-identical — only the static type tightens). Must be called immediately after
+    /// Apply a flow-narrowing (from `null_test_narrowing`) within the CURRENT scope, using the
+    /// narrowed type for the branch being entered (if that branch tightens the type). Reuses the
+    /// original slot via `define_narrowed` so `LocalGet` reads the same TaggedVal pointer (the value
+    /// is bit-identical — only the static type tightens). Must be called immediately after
     /// `push_scope` for the branch and undone by the matching `pop_scope`.
-    fn apply_null_narrowing(&mut self, narrowing: &Option<(String, Type, bool)>, entering_then: bool) {
-        if let Some((name, narrowed_ty, narrow_in_then)) = narrowing {
-            if *narrow_in_then == entering_then {
-                if let Some(info) = self.env.lookup(name) {
+    fn apply_null_narrowing(&mut self, narrowing: &Option<NarrowTest>, entering_then: bool) {
+        if let Some(test) = narrowing {
+            let narrowed_ty = if entering_then { &test.then_ty } else { &test.else_ty };
+            if let Some(narrowed_ty) = narrowed_ty {
+                if let Some(info) = self.env.lookup(&test.name) {
                     let slot = info.slot;
-                    self.env.define_narrowed(name.clone(), narrowed_ty.clone(), slot);
+                    self.env.define_narrowed(test.name.clone(), narrowed_ty.clone(), slot);
                 }
             }
         }
@@ -790,9 +813,10 @@ impl Checker {
         // (conservative — prevents a use after a possible move). The condition runs before both
         // branches, so any consume there is shared by both.
         let consumed_before = self.consumed_streams.clone();
-        // Flow-narrow a `T | Null` binding in the branch that excludes Null (`== null`/`is Null`
-        // → else; `!= null` → then). The narrowing is scoped: pushed before the relevant branch
-        // and popped after, so it never leaks past the `if`.
+        // Flow-narrow a union binding on a type/null test (`x is X`, `x == null`, `x != null`):
+        // the matched branch narrows to the matched member, the other to the complement. The
+        // narrowing is scoped: pushed before the relevant branch and popped after, so it never
+        // leaks past the `if`.
         let narrowing = self.null_test_narrowing(condition);
         let typed_then = {
             self.env.push_scope();
@@ -859,6 +883,19 @@ impl Checker {
             } else {
                 Type::flatten_union(vec![then_ty, else_ty])
             }
+        } else if is_json_dynamic(&then_ty) != is_json_dynamic(&else_ty) {
+            // Exactly one branch is the dynamic top type `Json` (`TypeVar(u32::MAX)`) and the
+            // other is a CONCRETE non-Json type (e.g. `if c then mkErr() /*: Json*/ else rows
+            // /*: String[][]*/`). `Json` unifies with everything, so the `types_compatible`
+            // collapse below would otherwise pick the CONCRETE branch's type as the result —
+            // discarding the Json branch's representation. At runtime the Json branch yields a
+            // boxed Json value (e.g. an object), but the if-expression's static type would say
+            // `String[][]`, so lowering boxes BOTH branches as the concrete representation
+            // (`lin_box_array`) and the Json branch's object is mis-tagged as an array → a
+            // wrong-tagged box that crashes/corrupts on read. `Json` is the top type and
+            // genuinely subsumes the concrete branch, so the result IS `Json` — both branches
+            // box into the uniform Json representation, consistent with how each is produced.
+            Type::TypeVar(u32::MAX)
         } else if self.types_compatible(&then_ty, &else_ty) {
             else_ty
         } else if self.types_compatible(&else_ty, &then_ty) {
