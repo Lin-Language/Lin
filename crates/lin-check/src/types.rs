@@ -217,6 +217,19 @@ impl Type {
             // to be packable — the field holds a pointer to a separately-allocated array, retained
             // on construct / released on drop by the descriptor walk.
             || matches!(self, Type::Array(_) | Type::FixedArray(_))
+            // Stage 3b step 3 (2026-06-08): a NESTED SEALED-RECORD field packs as an owned pointer
+            // slot (KIND_SEALED); the descriptor walk recurses into the nested record's own fields.
+            || (matches!(self, Type::Object { sealed: true, .. }) && self.sealed_record_all_fields_packable())
+    }
+
+    /// Helper: a sealed `Type::Object` whose every field is itself packable (for the nested-record
+    /// gate). Non-empty + all fields pass `is_sealed_array_field_packable`.
+    fn sealed_record_all_fields_packable(&self) -> bool {
+        match self {
+            Type::Object { fields, sealed: true } =>
+                !fields.is_empty() && fields.values().all(|f| f.is_sealed_array_field_packable()),
+            _ => false,
+        }
     }
 
     /// Returns true for the dynamic "any" JSON type (TypeVar(u32::MAX)).
