@@ -2156,7 +2156,8 @@ impl<'ctx> Codegen<'ctx> {
                                     let llvm_ty = self.llvm_type(ty);
                                     let slot_val = self.builder.load(llvm_ty, *slot, "tco_fslot");
                                     if slot_val.is_pointer_value() {
-                                        self.emit_tco_release_final(llvm_fn, *owns, slot_val.into_pointer_value(), &tco_entry_ptrs, ret_ptr, ty);
+                                        let repr = func.repr_of(*_t).clone();
+                                        self.emit_tco_release_final(llvm_fn, *owns, slot_val.into_pointer_value(), &tco_entry_ptrs, ret_ptr, ty, &repr);
                                     }
                                 }
                             }
@@ -2180,7 +2181,8 @@ impl<'ctx> Codegen<'ctx> {
                                     let llvm_ty = self.llvm_type(ty);
                                     let slot_val = self.builder.load(llvm_ty, *slot, "tco_fslot");
                                     if slot_val.is_pointer_value() {
-                                        self.emit_tco_release_final(llvm_fn, *owns, slot_val.into_pointer_value(), &tco_entry_ptrs, None, ty);
+                                        let repr = func.repr_of(*_t).clone();
+                                        self.emit_tco_release_final(llvm_fn, *owns, slot_val.into_pointer_value(), &tco_entry_ptrs, None, ty, &repr);
                                     }
                                 }
                             }
