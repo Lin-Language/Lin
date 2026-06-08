@@ -38,7 +38,7 @@ impl LanguageServer for Backend {
                     .and_then(|f| f.uri.to_file_path().ok())
             });
         if let Some(root) = &root {
-            *WORKSPACE_ROOT.write().unwrap() = Some(root.clone());
+            *WORKSPACE_ROOT.write().unwrap_or_else(|e| e.into_inner()) = Some(root.clone());
         }
 
         // Build the cross-file index: seed stdlib, then enumerate + index every
@@ -46,7 +46,7 @@ impl LanguageServer for Backend {
         // open DIRECT dependents are re-checked when an imported file changes (see
         // the `update` / `recheck_open_dependents` handlers).
         {
-            let mut index = WORKSPACE_INDEX.write().unwrap();
+            let mut index = WORKSPACE_INDEX.write().unwrap_or_else(|e| e.into_inner());
             *index = WorkspaceIndex::default();
             seed_stdlib_index(&mut index);
             if let Some(root) = &root {
@@ -152,7 +152,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.docs.write().unwrap().remove(&params.text_document.uri);
+        self.docs.write().unwrap_or_else(|e| e.into_inner()).remove(&params.text_document.uri);
         self.client
             .publish_diagnostics(params.text_document.uri, vec![], None)
             .await;
@@ -161,7 +161,7 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -184,7 +184,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -210,7 +210,7 @@ impl LanguageServer for Backend {
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -239,7 +239,8 @@ impl LanguageServer for Backend {
             // 1. Bindings visible at the cursor (from span_type_map def_spans).
             for (_, ty_str, def_span) in &analysis.span_type_map {
                 if let Some(ds) = def_span {
-                    let name = &source[ds.start as usize..ds.end as usize];
+                    // `.get` (not raw index) so a stale/multi-byte-misaligned def_span can't panic.
+                    let name = source.get(ds.start as usize..ds.end as usize).unwrap_or("");
                     if !name.is_empty() && name.starts_with(|c: char| c.is_alphabetic() || c == '_') {
                         if name.starts_with(prefix) {
                             let kind = if ty_str.contains("=>") {
@@ -373,7 +374,7 @@ impl LanguageServer for Backend {
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -387,7 +388,7 @@ impl LanguageServer for Backend {
         // gather occurrences across the whole workspace index.
         if let Ok(path) = uri.to_file_path() {
             let module_id = canonical_id(&path);
-            let index = WORKSPACE_INDEX.read().unwrap();
+            let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
             if let Some((owner, name)) = index.resolve_symbol(&module_id, offset) {
                 let occ = index.occurrences(&owner, &name);
                 if !occ.is_empty() {
@@ -427,7 +428,7 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
-        let source = match self.docs.read().unwrap().get(&params.text_document.uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(&params.text_document.uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -445,7 +446,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<Vec<DocumentHighlight>>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -476,7 +477,7 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let new_name = params.new_name;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -487,7 +488,7 @@ impl LanguageServer for Backend {
         // Cross-file first: a top-level exported/imported symbol renames everywhere.
         if let Ok(path) = uri.to_file_path() {
             let module_id = canonical_id(&path);
-            let index = WORKSPACE_INDEX.read().unwrap();
+            let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
             if let Some((owner, name)) = index.resolve_symbol(&module_id, offset) {
                 // `rename_edits` returns None for stdlib-owned symbols (read-only) —
                 // decline the rename rather than emit an unsound/partial edit.
@@ -541,7 +542,7 @@ impl LanguageServer for Backend {
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = &params.text_document.uri;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -563,7 +564,7 @@ impl LanguageServer for Backend {
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = &params.text_document.uri;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -583,7 +584,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<SignatureHelp>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -596,13 +597,19 @@ impl LanguageServer for Backend {
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = &params.text_document.uri;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
 
         let base_dir = file_dir(uri);
-        let index = WORKSPACE_INDEX.read().unwrap();
+        // Snapshot the index under the read guard, then DROP it before the (re-lex/parse + loop)
+        // work in `code_actions` — mirroring `recheck_open_dependents`. Holding the guard across that
+        // work would let one panic-capable code path poison the lock for the rest of the session.
+        let index = {
+            let guard = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        };
         let actions = code_actions(&source, uri, &params, &index, base_dir.as_deref());
         if actions.is_empty() {
             Ok(None)
@@ -613,7 +620,7 @@ impl LanguageServer for Backend {
 
     async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
         let uri = &params.text_document.uri;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -629,7 +636,7 @@ impl LanguageServer for Backend {
         params: FoldingRangeParams,
     ) -> Result<Option<Vec<FoldingRange>>> {
         let uri = &params.text_document.uri;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -645,7 +652,7 @@ impl LanguageServer for Backend {
         params: SelectionRangeParams,
     ) -> Result<Option<Vec<SelectionRange>>> {
         let uri = &params.text_document.uri;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -667,7 +674,7 @@ impl LanguageServer for Backend {
         params: DocumentLinkParams,
     ) -> Result<Option<Vec<DocumentLink>>> {
         let uri = &params.text_document.uri;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -684,7 +691,7 @@ impl LanguageServer for Backend {
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
         let query = &params.query;
-        let index = WORKSPACE_INDEX.read().unwrap();
+        let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
         let mut symbols = Vec::new();
         for (mod_id, name, span) in index.workspace_symbols(query) {
             let Some(file) = index.files.get(&mod_id) else { continue };
@@ -713,7 +720,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<request::GotoTypeDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -735,7 +742,7 @@ impl LanguageServer for Backend {
 
         // Find a `type <name>` declaration: same file first, then anywhere in the
         // workspace index (cross-file type definitions).
-        let index = WORKSPACE_INDEX.read().unwrap();
+        let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
         if let Ok(path) = uri.to_file_path() {
             let module_id = canonical_id(&path);
             if let Some(file) = index.files.get(&module_id) {
@@ -817,7 +824,7 @@ impl Backend {
         // Compute the direct dependents under the index read lock, then drop it
         // before any await (we must not hold a std `RwLock` guard across `.await`).
         let dependent_ids: Vec<String> = {
-            let index = WORKSPACE_INDEX.read().unwrap();
+            let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
             index.dependents_of(&changed_id)
         };
         if dependent_ids.is_empty() {
@@ -828,7 +835,7 @@ impl Backend {
         // again releasing the lock before awaiting. A dependent that isn't currently
         // open is skipped — the client only renders open documents.
         let to_recheck: Vec<(Url, String)> = {
-            let docs = self.docs.read().unwrap();
+            let docs = self.docs.read().unwrap_or_else(|e| e.into_inner());
             docs.iter()
                 .filter(|(dep_uri, _)| *dep_uri != changed_uri)
                 .filter(|(dep_uri, _)| {
@@ -910,7 +917,7 @@ fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
     let mut imported: HashMap<String, TypedModule> = HashMap::new();
     let effective_base = base_dir
         .map(|p| p.to_path_buf())
-        .or_else(|| WORKSPACE_ROOT.read().unwrap().clone())
+        .or_else(|| WORKSPACE_ROOT.read().unwrap_or_else(|e| e.into_inner()).clone())
         .unwrap_or_else(|| PathBuf::from("."));
 
     let mut visiting: HashSet<String> = HashSet::new();
@@ -1020,7 +1027,8 @@ fn contains_identifier(line: &str, name: &str) -> bool {
 
 /// Finds the byte offset of `name` within the import statement starting at `import_start`.
 fn find_name_in_import(source: &str, import_start: usize, name: &str) -> Option<usize> {
-    let search_area = &source[import_start..];
+    // `.get` so a stale/out-of-range span start can't panic the slice.
+    let search_area = source.get(import_start..)?;
     let pos = search_area.find(name)?;
     let abs = import_start + pos;
     // Make sure it's a whole identifier.
@@ -2487,7 +2495,11 @@ fn signature_help(source: &str, analysis: &Analysis, offset: usize) -> Option<Si
     let param_types = function_param_types(&ty_str)?;
 
     // Active parameter = number of top-level commas between the opening paren and the cursor.
-    let active = top_level_commas(&source[paren_after..offset.min(source.len())]);
+    // `.get` with a normalised (non-reversed, in-bounds) range so a stale paren/cursor offset or a
+    // multi-byte boundary can't panic the slice.
+    let arg_hi = offset.min(source.len());
+    let arg_text = source.get(paren_after.min(arg_hi)..arg_hi).unwrap_or("");
+    let active = top_level_commas(arg_text);
     let active = (active as usize).min(param_types.len().saturating_sub(1)) as u32;
 
     // Recover parameter NAMES (non-invasively) from the callee's binding AST when the callee is a
@@ -2606,7 +2618,11 @@ fn find_enclosing_call_in_expr(
             // from the opening paren to its matching close in source. `span.start` is the `(`.
             let open = span.start as usize;
             if source.as_bytes().get(open) == Some(&b'(') {
-                let close = matching_paren(&source[open..]).map(|c| open + c);
+                // `.get` so a stale span start can't panic; `(` is ASCII so `open` is a char boundary.
+                let close = source
+                    .get(open..)
+                    .and_then(matching_paren)
+                    .map(|c| open + c);
                 let paren_after = open + 1;
                 // Inside the parens: after `(` and at/before the `)` (or to EOF when unclosed,
                 // which is the common case while the user is still typing arguments).
@@ -4973,6 +4989,55 @@ mod tests {
         // must NOT panic and must round to a char boundary — here the emoji's start byte.
         let mid = position_to_offset(src, Position { line: 0, character: 10 });
         assert_eq!(mid, a_byte, "mid-surrogate column rounds forward to the next char boundary");
+    }
+
+    /// Span-driven byte-offset slicing must never panic on multibyte input or stale/out-of-range
+    /// offsets — they now go through `.get(..)` rather than raw `source[a..b]` indexing. We feed
+    /// content with an emoji (4-byte char) through the slice sites and assert they return gracefully.
+    #[test]
+    fn span_slicing_is_panic_safe_on_multibyte_and_stale_offsets() {
+        let src = "import { foo } from \"😀\"\nval r = foo(😀, 2)\n";
+
+        // `find_name_in_import` with an out-of-range start must return None, not panic.
+        assert_eq!(find_name_in_import(src, src.len() + 100, "foo"), None);
+        // A start that lands mid-emoji (not a char boundary) must not panic.
+        let emoji = src.find('😀').unwrap();
+        let _ = find_name_in_import(src, emoji + 1, "foo"); // any result is fine; must not panic.
+
+        // `matching_paren` over a `.get` slice from a stale open index must not panic.
+        assert_eq!("(a, b)".get(0..).and_then(matching_paren), Some(5));
+
+        // Full signature_help pass over multibyte source at a cursor inside the emoji span: must
+        // produce some result (Some or None) without panicking.
+        let analysis = analyse(src, None);
+        let cursor = emoji + 1; // mid-surrogate / mid-utf8 byte offset
+        let _ = signature_help(src, &analysis, cursor);
+
+        // Completion at a multibyte offset must not panic either.
+        let _ = analyse(src, None);
+        let off = position_to_offset(src, Position { line: 1, character: 8 });
+        assert!(off <= src.len());
+    }
+
+    /// The poison-tolerant lock idiom (`unwrap_or_else(|e| e.into_inner())`) must recover access
+    /// after a thread panics while holding the guard, instead of cascading the poison to every later
+    /// acquisition (which a plain `.unwrap()` would do, bricking the server for the session).
+    #[test]
+    fn poisoned_lock_idiom_recovers_inner() {
+        use std::sync::{Arc, RwLock};
+        let lock = Arc::new(RwLock::new(7u32));
+        // Poison the lock by panicking while holding the write guard on another thread.
+        let l2 = Arc::clone(&lock);
+        let _ = std::thread::spawn(move || {
+            let mut g = l2.write().unwrap_or_else(|e| e.into_inner());
+            *g = 42;
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(lock.is_poisoned(), "lock should be poisoned after the panicking thread");
+        // The idiom still yields the (last-written) inner value — no cascade.
+        let v = *lock.read().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(v, 42, "poison-tolerant read recovers the inner value");
     }
 
     /// CJK characters are in the BMP (1 UTF-16 unit, 3 bytes, 1 `char`): they advance the column by
