@@ -1,3 +1,18 @@
+// std/object — object introspection and transformation, plus Result/Option ergonomics.
+//
+// import { keys, values, entries, fromEntries, get, merge, pick, omit, mapValues, isEmpty } from "std/object"
+//
+// `keys`/`values`/`entries` are tag-aware — they work on both a plain `{}`/`Json` record and a typed
+// index-signature map `{ String: T }` (ADR-055). `merge`/`pick`/`omit`/`mapValues` are generic over
+// `{ String: T }` and return a typed map; pass them a value annotated `{ String: T }` (there is no
+// implicit `Json -> { String: T }` coercion). Over a typed map, key order is hash order, not insertion
+// order. `get` is the idiomatic defaulted read (`m[k] ?? default`) — a bare `m[k]` already yields
+// `T | Null`, so the helper folds in a fallback whose type `D` is independent of the value type `T`.
+//
+// This module also carries the Result/Option ergonomics folded in from the former std/result
+// (error/isOk/isError/isNull/unwrapOr) — see the section lower in the file. Lin has NO
+// `Result`/`Option` wrapper ADT: a fallible call returns `T | Error`, an absence-y call returns
+// `T | Null`, and the success value IS the value with no unwrap ceremony on the happy path.
 import foreign "lin-runtime"
   val lin_keys_any: (Json) => String[]
   val lin_values_any: (Json) => Json[]
@@ -17,18 +32,21 @@ import { for, some } from "std/iter"
 // Return the keys of an object or map.
 // @param obj  any `Json`/`{}` record or `{ String: T }` map.
 // @returns a `String[]` of the keys (insertion order for a record, hash order for a map).
+// @example keys({ "a": 1, "b": 2 })   // ["a", "b"]
 export val keys = (obj: Json): String[] =>
   lin_keys_any(obj)
 
 // Return the values of an object or map.
 // @param obj  any `Json`/`{}` record or `{ String: T }` map.
 // @returns a `Json[]` of the values, in key order.
+// @example values({ "a": 1, "b": 2 })   // [1, 2]
 export val values = (obj: Json): Json[] =>
   lin_values_any(obj)
 
 // Return the key/value pairs of an object or map.
 // @param obj  any `Json`/`{}` record or `{ String: T }` map.
 // @returns a `Json[]` of `[key, value]` pairs, in key order.
+// @example entries({ "a": 1, "b": 2 })   // [["a", 1], ["b", 2]]
 export val entries = (obj: Json): Json[] =>
   lin_entries_any(obj)
 
@@ -36,6 +54,8 @@ export val entries = (obj: Json): Json[] =>
 // the same key overwrite earlier ones.
 // @param pairs  an array of `[String, value]` pairs (typed `Json`).
 // @returns a `Json` object mapping each key to its value.
+// @example fromEntries([["a", 1], ["b", 2]])   // { "a": 1, "b": 2 }
+// @example entries(obj).map(([k, v]) => [k, v * 2]).fromEntries()   // double every value
 export val fromEntries = (pairs: Json): Json =>
   // Kept `Json` (not `<T>(pairs: [String, T][]): { String: T }`): the monomorphizer cannot recover a
   // type parameter NESTED inside a tuple-in-array shape, so `<T>` would fail inference at every call
@@ -50,6 +70,7 @@ export val fromEntries = (pairs: Json): Json =>
 // @param a  the base map.
 // @param b  the overriding map; its entries take precedence on key collisions.
 // @returns a new `{ String: T }` with the entries of both.
+// @example a.merge(b)   // { "a": 1, "b": 99, "c": 3 }   (right-side values win on conflict)
 export val merge = <T>(a: { String: T }, b: { String: T }): { String: T } =>
   // Built imperatively because a `{ ...a, ...b }` spread literal infers a fixed record `{ }`, not the
   // index-signature map type.
@@ -66,6 +87,7 @@ export val merge = <T>(a: { String: T }, b: { String: T }): { String: T } =>
 // @param obj  the source map.
 // @param ks   the keys to keep; keys absent from `obj` are skipped.
 // @returns a new `{ String: T }` with just the selected present entries.
+// @example m.pick(["a", "c"])   // { "a": 1, "c": 3 }
 export val pick = <T>(obj: { String: T }, ks: String[]): { String: T } =>
   var result: { String: T } = {}
   ks.for(k =>
@@ -77,6 +99,7 @@ export val pick = <T>(obj: { String: T }, ks: String[]): { String: T } =>
 // @param obj  the source map.
 // @param ks   the keys to drop.
 // @returns a new `{ String: T }` with every entry of `obj` except those keyed in `ks`.
+// @example m.omit(["b"])   // { "a": 1, "c": 3 }
 export val omit = <T>(obj: { String: T }, ks: String[]): { String: T } =>
   val skip: { String: Boolean } = {}
   ks.for(k => skip[k] = true)
@@ -91,6 +114,7 @@ export val omit = <T>(obj: { String: T }, ks: String[]): { String: T } =>
 // @param obj  the source map (value type `V`).
 // @param f    `(value) => W` applied to each value.
 // @returns a new `{ String: W }` with the same keys and mapped values.
+// @example m.mapValues(v => v * 10)   // { "a": 10, "b": 20 } : { String: Int32 }
 export val mapValues = <V, W>(obj: { String: V }, f: (V) => W): { String: W } =>
   val ks = lin_keys_any(obj)
   var result: { String: W } = {}
@@ -108,6 +132,9 @@ export val mapValues = <V, W>(obj: { String: V }, f: (V) => W): { String: W } =>
 // @param key      the key to look up.
 // @param default  value returned when `key` is absent; defaults to `null`, pinning `D`.
 // @returns the value at `key`, or `default` (typed `T | D`) when the key is absent.
+// @example counts.get("a", 0)        // 7
+// @example counts.get("missing", 0)  // 0
+// @example counts.get("z", "n/a")    // "n/a"   (independent default type -> Int32 | String)
 export val get = <T, D>(m: { String: T }, key: String, default: D = null): T | D =>
   // `is Null => default; else => m[key]` arm order (NOT `is T => …; else => default`): a positive
   // `is T` arm on a monomorphized type parameter does not select the present-value branch today,
@@ -121,6 +148,9 @@ export val get = <T, D>(m: { String: T }, key: String, default: D = null): T | D
 // Test whether an object, map, array, or string is empty.
 // @param x  any object, map, array, or string.
 // @returns `true` iff `x` has zero entries/elements/characters.
+// @example isEmpty({})        // true
+// @example isEmpty([])        // true
+// @example isEmpty({ "a": 1 })   // false
 export val isEmpty = (x: Json): Boolean =>
   length(x) == 0
 
@@ -180,9 +210,8 @@ export val isNull = (x: Json): Boolean =>
 
 // Collapse the failure arm of a fallible value with a default. Handles BOTH conventions: the
 // success value is returned when `x` is neither an `Error` nor `Null`, otherwise `default`.
-// @example
-//   val port: Int32  = parsePort(input).unwrapOr(8080)    // T | Error -> T
-//   val name: String = config["name"].unwrapOr("anon")    // T | Null  -> T
+// @example val port: Int32 = parsePort(input).unwrapOr(8080)    // T | Error -> T
+// @example val name: String = config["name"].unwrapOr("anon")   // T | Null  -> T
 // @param x        any value (typed `Json`, so any `T | Error` / `T | Null` union flows in).
 // @param default  the fallback returned for the `Error`/`Null` arms; pins `D`.
 // @returns the success value, or `default`, typed `Json | D` (the static success type is recovered via `D`, as in `at`/`get`).

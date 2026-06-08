@@ -41,6 +41,7 @@ autoescaping off).
 ```bash
 cargo build --workspace                                  # build the lin compiler
 cp CHANGELOG.md docs-site/content/changelog.md           # only if CHANGELOG.md exists (post-first-release)
+./target/debug/lin run docs-site/builder/gen-stdlib.lin  # regen content/stdlib/*.md from stdlib/*.lin doc comments
 ./target/debug/lin build docs-site/builder/main.lin -o docs-builder
 ./docs-builder                                           # writes docs-site/output/
 # open docs-site/output/index.html

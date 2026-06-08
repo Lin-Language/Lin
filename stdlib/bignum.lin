@@ -43,6 +43,7 @@ export val bigInt = (n: Int64): BigInt => lin_bignum_from_int64(n)
 // Parse a base-10 integer string of any length into a `BigInt`.
 // @param s  the decimal string (optional leading `-`).
 // @returns the `BigInt`, or an `Error` if `s` is not a valid integer.
+// @example parseBigInt("2").pow(100).toString()  // "1267650600228229401496703205376"
 export val parseBigInt = (s: String): BigInt | Error => lin_bignum_parse(s)
 
 // The `BigInt` constant 0.

@@ -1,3 +1,13 @@
+// std/fs — filesystem read, write, and directory operations.
+//
+// All operations are synchronous and blocking. Fallible calls return their value or an Error shape
+// (`{ "type": "error", "message": ... }`) that you narrow with `is Error`; the predicates exists /
+// isFile / isDir / isSymlink are total and return a plain Boolean. The `opts` Json argument on
+// ls / mkdir / rm / writeJson selects a variant (`{ "recursive": true }`, `{ "parents": true }`,
+// `{ "compact": true }`). For incremental reads, openRead returns a lazy byte Stream that
+// std/stream builds its adapters on.
+//
+// import { readFile, writeFile, readJson, ls, mkdir, exists, isFile, isDir } from "std/fs"
 import foreign "lin-runtime"
   val lin_fs_read_file: (String) => Json
   val lin_fs_write_file: (String, String) => Json
@@ -35,6 +45,7 @@ import foreign "lin-runtime"
 // Read the entire contents of a file as a UTF-8 string.
 // @param path  the file to read.
 // @returns the file contents as a String, or an Error if it cannot be read.
+// @example val content = readFile("config.txt")   // String, or Error on failure
 export val readFile = (path: String): Json =>
   lin_fs_read_file(path)
 
@@ -61,6 +72,7 @@ export val readLines = (path: String): Json =>
 // Read a file and parse its contents as JSON.
 // @param path  the file to read.
 // @returns the parsed Json value, or an Error if the file cannot be read or is not valid JSON.
+// @example val data = readJson("config.json")   // then data["version"], or Error on failure
 export val readJson = (path: String): Json =>
   lin_fs_read_json(path)
 
@@ -69,6 +81,7 @@ export val readJson = (path: String): Json =>
 // @param value  the Json value to serialise.
 // @param opts  optional; pass `{ "compact": true }` for minified output (default is pretty-printed).
 // @returns Null on success, or an Error if the write fails.
+// @example writeJson("config.json", { "version": 2 }, { "compact": true })
 export val writeJson = (path: String, value: Json, opts: Json): Json =>
   if opts == null then
     lin_fs_write_json(path, value)
@@ -99,7 +112,9 @@ export val isDir = (path: String): Boolean =>
 // @param path  the path to stat.
 // @param opts  optional; `{ "follow": false }` reports the final symlink itself (equivalent to
 //   `lstat`). One-argument calls keep following.
-// @returns a Json metadata object, or an Error if the path cannot be read.
+// @returns a Json metadata object, or an Error if the path cannot be read. The object carries
+//   `size` (bytes), `modified`/`created` (Unix ms), `isFile`, `isDir`, and `mode` (Unix perm bits).
+// @example stat("main.lin")["size"]   // file size in bytes
 export val stat = (path: String, opts: Json = null): Json =>
   if opts == null then
     lin_fs_stat(path)
@@ -112,6 +127,8 @@ export val stat = (path: String, opts: Json = null): Json =>
 // @param path  the directory to list.
 // @param opts  optional; `{ "recursive": true }` walks the whole tree (default lists one level).
 // @returns an array of entry paths, or an Error if `path` cannot be read.
+// @example ls("src", {})                       // one level
+// @example ls("src", { "recursive": true })    // whole tree, relative paths
 export val ls = (path: String, opts: Json): Json =>
   if opts == null then
     lin_fs_list_dir(path)
@@ -125,6 +142,8 @@ export val ls = (path: String, opts: Json): Json =>
 // @param opts  optional; `{ "parents": true }` creates missing parent directories too (and
 //   succeeds if the directory already exists).
 // @returns Null on success, or an Error (e.g. a missing parent without `parents`).
+// @example mkdir("output", {})
+// @example mkdir("output/reports/2024", { "parents": true })
 export val mkdir = (path: String, opts: Json): Json =>
   if opts == null then
     lin_fs_mkdir(path)
@@ -138,6 +157,8 @@ export val mkdir = (path: String, opts: Json): Json =>
 // @param opts  optional; `{ "recursive": true }` removes a directory and its contents (a
 //   non-recursive call on a non-empty directory is an Error).
 // @returns Null on success, or an Error.
+// @example rm("temp.txt", {})
+// @example rm("build/", { "recursive": true })
 export val rm = (path: String, opts: Json): Json =>
   if opts == null then
     lin_fs_rm(path, 0)

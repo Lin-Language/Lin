@@ -1,59 +1,50 @@
 # std/env
 
-Environment variable access and modification.
+std/env — environment variable access and modification.
+
+Read, set, unset, and snapshot the process environment. `getEnv` returns `String | Null` so a
+missing variable narrows with a plain `== null` test. `setEnv`/`unsetEnv` affect the current
+process and any child processes spawned afterwards.
+
+  import { getEnv, setEnv, unsetEnv, environ } from "std/env"
+
+## Reference
+
+#### `getEnv`
 
 ```lin
-import { getEnv, setEnv, unsetEnv, environ } from "std/env"
+val getEnv = (name: String): String | Null
 ```
 
-## Function reference
+Read an environment variable.
+- **`name`** — the variable name.
+- **Returns** the value as a `String`, or `null` if it is unset. The narrow `String | Null` type lets
+  callers narrow with a plain `== null` test (the else branch narrows to a bare `String`).
 
-| Function | Signature | Description |
-| --- | --- | --- |
-| `environ` | `() -> { ...String }` | All environment variables as an object |
-| `getEnv` | `(String) -> String \| Null` | Value of a variable, or Null |
-| `setEnv` | `(String, String) -> Null` | Set a variable |
-| `unsetEnv` | `(String) -> Null` | Unset a variable |
-
----
-
-### `getEnv`
+#### `setEnv`
 
 ```lin
-val home = getEnv("HOME")    // e.g. "/home/alice" or null
-val port = getEnv("PORT")
-val p = match port
-  is Null => 3000
-  else    => parseInt32(port)
+val setEnv = (name: String, value: String): Null
 ```
 
----
+Set an environment variable for this process.
+- **`name`** — the variable name.
+- **`value`** — the value to set.
 
-### `environ`
+#### `unsetEnv`
 
 ```lin
-val env = environ()
-print(env["HOME"])
-print(env["PATH"])
+val unsetEnv = (name: String): Null
 ```
 
----
+Remove an environment variable from this process.
+- **`name`** — the variable name to unset.
 
-### `setEnv`
+#### `environ`
 
 ```lin
-setEnv("APP_ENV", "production")
-setEnv("LOG_LEVEL", "debug")
+val environ = (): Json
 ```
 
-Affects the current process and any child processes spawned after this call.
-
----
-
-### `unsetEnv`
-
-```lin
-unsetEnv("DEBUG")
-```
-
-No-op if the variable is not set.
+Snapshot all environment variables.
+- **Returns** a Json object mapping each variable name to its String value.

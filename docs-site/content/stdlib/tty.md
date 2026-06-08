@@ -1,63 +1,34 @@
 # std/tty
 
-Terminal control: raw mode and non-blocking key input on stdin. Use it to build interactive terminal programs that respond to individual keystrokes rather than full lines.
+std/tty — terminal control: raw mode and non-blocking key input on stdin.
+
+Use it to build interactive terminal programs that respond to individual keystrokes rather than
+full lines. `rawMode(true)` disables canonical line buffering + echo and makes reads
+non-blocking, saving the original settings so `rawMode(false)` restores them exactly. `readKey`
+reads one byte without blocking (null when nothing is ready), so a real app polls it in a loop,
+sleeping briefly between empty reads (e.g. via std/time's `sleepMicros`) to avoid busy-spinning.
+Multi-byte sequences (arrow/function keys) arrive one byte at a time.
+
+  import { rawMode, readKey } from "std/tty"
+
+## Reference
+
+#### `rawMode`
 
 ```lin
-import { rawMode, readKey } from "std/tty"
+val rawMode = (on: Boolean): Null | Error
 ```
 
-## Function reference
+Enable or disable terminal raw mode on stdin.
+- **`on`** — `true` to enable raw mode, `false` to restore cooked mode.
+- **Returns** `Null` on success, or an `Error` (e.g. when stdin is not a terminal), discriminated
+  with `is Error`.
 
-| Function | Signature | Description |
-| --- | --- | --- |
-| `rawMode` | `(Boolean) -> Null \| Error` | Enable (`true`) or disable (`false`) raw mode |
-| `readKey` | `() -> Int32 \| Null` | Read one byte from stdin, non-blocking |
-
----
-
-### `rawMode`
-
-`rawMode(true)` puts the terminal into raw mode: canonical line buffering and echo are disabled and reads become non-blocking. The original terminal settings are saved and restored exactly by `rawMode(false)`. If stdin is not a terminal (for example, a pipe), `rawMode` returns an `Error` object rather than failing.
+#### `readKey`
 
 ```lin
-rawMode(true)    // disable canonical mode + echo
-// ... read keys ...
-rawMode(false)   // restore original terminal settings
+val readKey = (): Int32 | Null
 ```
 
----
-
-### `readKey`
-
-Reads a single byte from stdin without blocking: returns the byte value (`0..255`) as an `Int32`, or `Null` if no key is currently available. Multi-byte sequences (arrow keys, function keys) arrive one byte at a time, so a reader reassembles escape sequences itself.
-
-```lin
-import { rawMode, readKey } from "std/tty"
-import { print } from "std/io"
-
-rawMode(true)
-val k = readKey()
-if k != null then print("key: ${k}") else print("no key ready")
-rawMode(false)
-```
-
----
-
-### Polling loop
-
-A real application polls `readKey` repeatedly, treating `Null` as "nothing yet" and sleeping briefly between polls (via `std/time`'s `sleepMicros`) to avoid busy-spinning.
-
-```lin
-import { rawMode, readKey } from "std/tty"
-import { sleepMicros } from "std/time"
-import { range, for } from "std/iter"
-import { print } from "std/io"
-
-rawMode(true)
-range(0, 1000000).for(i =>
-  val k = readKey()
-  if k != null then print("key: ${k}")
-  else sleepMicros(2000)
-)
-rawMode(false)
-```
+Read a single key (one byte) from stdin without blocking.
+- **Returns** the byte value as an `Int32`, or `null` if no key is available.

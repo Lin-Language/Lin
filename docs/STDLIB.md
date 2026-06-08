@@ -2,6 +2,12 @@
 
 This document specifies the standard library for the Lin language. All modules are importable via the `std/` prefix.
 
+> The per-function reference on the docs site is generated directly from the `//` doc comments in
+> `stdlib/*.lin` (via `docs-site/builder/gen-stdlib.lin`), so it always matches the source. This
+> document is the higher-level specification. Note the recent consolidation: `std/hash` now lives in
+> `std/encoding`, `std/url` in `std/http`, `std/os` in `std/process`, and `std/result` in
+> `std/object`.
+
 ## Index
 
 ### Modules
@@ -9,22 +15,26 @@ This document specifies the standard library for the Lin language. All modules a
 | Module | Description |
 | --- | --- |
 | [`std/string`](#stdstring) | String manipulation functions |
+| [`std/regex`](#stdregex) | Regular expressions (RE2-style, linear-time) |
 | [`std/iter`](#stditer) | Iterable combinators (over arrays, iterators, and streams) and iterator constructors |
-| [`std/array`](#stdarray) | Array-shaped functions (indexable, materialised, ordered) |
+| [`std/array`](#stdarray) | Array-shaped functions (indexable, materialised, ordered), incl. binary search |
 | [`std/number`](#stdnumber) | Numeric parsing and conversion functions |
+| [`std/bignum`](#stdbignum) | Arbitrary-precision integers |
+| [`std/decimal`](#stddecimal) | Exact base-10 fixed-point decimals (money math) |
 | [`std/bytes`](#stdbytes) | Byte-buffer slicing and endian (de)serialization |
+| [`std/encoding`](#stdencoding) | Base64 / hex / URL-percent / query-string codecs, plus structural `hash` |
 | [`std/math`](#stdmath) | Mathematical functions |
-| [`std/object`](#stdobject) | Object introspection functions |
+| [`std/object`](#stdobject) | Object introspection functions, plus `T \| Error`/`T \| Null` ergonomics (formerly std/result) |
 | [`std/json`](#stdjson) | Type-directed JSON decode |
 | [`std/yaml`](#stdyaml) | YAML parse and serialise |
 | [`std/jq`](#stdjq) | Query Json values with jq filters |
-| [`std/hash`](#stdhash) | Stable structural hash of any value |
+| [`std/csv`](#stdcsv) | RFC 4180 CSV parse/stringify (eager and streaming) |
 | [`std/io`](#stdio) | stdin/stdout and terminal input |
-| [`std/fs`](#stdfs) | Filesystem read and write |
+| [`std/fs`](#stdfs) | Filesystem read and write, glob, temp files, symlinks |
 | [`std/path`](#stdpath) | Path string manipulation |
-| [`std/http`](#stdhttp) | HTTP client and server |
+| [`std/http`](#stdhttp) | HTTP client and server, plus URL parsing/building (formerly std/url) |
 | [`std/net`](#stdnet) | UDP and TCP sockets |
-| [`std/process`](#stdprocess) | Run and manage external processes |
+| [`std/process`](#stdprocess) | Run/manage external processes, plus OS introspection (formerly std/os) |
 | [`std/stream`](#stdstream) | Lazy, fallible byte/value streams over OS resources |
 | [`std/compress`](#stdcompress) | Streaming gzip/DEFLATE byte-stream adapters |
 | [`std/archive`](#stdarchive) | Tar splitting over a byte stream (untar / manifest / files) |
@@ -32,10 +42,12 @@ This document specifies the standard library for the Lin language. All modules a
 | [`std/signal`](#stdsignal) | Blocking wait for OS signals |
 | [`std/async`](#stdasync) | Async, concurrency and workers |
 | [`std/event`](#stdevent) | Typed event emitters: async worker-backed emitter and synchronous in-process bus |
+| [`std/random`](#stdrandom) | Seedable PRNG: random ints/floats, shuffle, choice, sample |
+| [`std/crypto`](#stdcrypto) | Cryptographic hashes, HMAC, secure random, UUIDs |
 | [`std/env`](#stdenv) | Environment variables |
 | [`std/template`](#stdtemplate) | String template rendering |
 | [`std/test`](#stdtest) | Test framework |
-| [`std/time`](#stdtime) | Timestamps and timing |
+| [`std/time`](#stdtime) | Timestamps, timing, and calendar arithmetic |
 
 ### Functions by module
 

@@ -1,3 +1,15 @@
+// std/time — timestamps, timing, formatting, and UTC calendar arithmetic.
+//
+// The canonical value is a Unix timestamp in milliseconds (UTC), held as an Int64. `now` reads the
+// wall clock; for measuring durations prefer `startTimer`/`elapsed`, which use a monotonic clock
+// unaffected by wall-clock adjustments. toIso/fromIso convert to and from ISO 8601; format/parse use
+// strftime-style patterns. The calendar layer (components / fromComponents, the single-field
+// extractors, and the addDays/addMonths/diff family) is pure UTC arithmetic over the same Int64 —
+// durations are likewise just milliseconds (seconds/minutes/hours/days), so they compose with +/-.
+// Full IANA timezone support (DST, historical offsets) is out of scope; componentsAt/formatAt take a
+// fixed UTC offset.
+//
+// import { now, sleep, toIso, fromIso, format, parse, startTimer, elapsed } from "std/time"
 import { toString, join } from "std/string"
 import { push } from "std/array"
 
@@ -15,6 +27,7 @@ import foreign "lin-runtime"
   val lin_time_from_components: (Int64, Int64, Int64, Int64, Int64, Int64, Int64) => Json
 
 // The current wall-clock time as a Unix timestamp in milliseconds (UTC).
+// @example now()   // e.g. 1716825600000
 export val now = (): Int64 => lin_time_now()
 
 // Block the current thread for `ms` milliseconds.
@@ -28,6 +41,7 @@ export val sleepMicros = (us: Int64): Null => lin_time_sleep_micros(us)
 // Start a monotonic timer and return its opaque handle. Pair with `elapsed`; use this rather than
 // `now` for measuring durations, as it is unaffected by wall-clock adjustments.
 // @returns a timer handle to pass to `elapsed`.
+// @example val t = startTimer()   // ...work... print("took ${elapsed(t)}ms")
 export val startTimer = (): Int64 => lin_time_start_timer()
 
 // Read the time elapsed since a timer was started.
@@ -38,18 +52,21 @@ export val elapsed = (timer: Int64): Int64 => lin_time_elapsed(timer)
 // Render a Unix-millisecond timestamp as an ISO 8601 UTC string.
 // @param ms  the timestamp in Unix milliseconds.
 // @returns the ISO 8601 representation.
+// @example toIso(0)   // "1970-01-01T00:00:00.000Z"
 export val toIso = (ms: Int64): String => lin_time_to_iso(ms)
 
 // Render a Unix-millisecond timestamp (UTC) with a strftime-style pattern.
 // @param ms  the timestamp in Unix milliseconds.
 // @param pattern  a strftime-style format string (e.g. "%Y-%m-%d").
 // @returns the formatted string.
+// @example format(now(), "%Y-%m-%d")   // "2025-05-27"
 export val format = (ms: Int64, pattern: String): String =>
   lin_time_format(ms, pattern)
 
 // Parse an ISO 8601 date/datetime string to a Unix-millisecond timestamp.
 // @param s  the ISO 8601 string to parse.
 // @returns the timestamp in Unix milliseconds, or an Error if `s` is not valid ISO 8601.
+// @example fromIso("2024-01-15T10:30:00Z")   // 1705313400000
 export val fromIso = (s: String): Int64 | Error =>
   lin_time_from_iso(s)
 
@@ -57,6 +74,7 @@ export val fromIso = (s: String): Int64 | Error =>
 // @param s  the string to parse.
 // @param pattern  the strftime-style format the string is expected to match.
 // @returns the timestamp in Unix milliseconds, or an Error if `s` does not match `pattern`.
+// @example parse("2024-01-15", "%Y-%m-%d")   // 1705276800000
 export val parse = (s: String, pattern: String): Int64 | Error =>
   lin_time_parse(s, pattern)
 
@@ -94,7 +112,7 @@ export val fromComponents = (c: Json): Int64 | Error =>
   )
 
 // Single-field UTC extractors. Each is `components(ts).<field>`; prefer `components` when you need
-// several fields at once (it decomposes only once). `@param ts` is a Unix-millisecond timestamp.
+// several fields at once (it decomposes only once). In all of them `ts` is a Unix-millisecond timestamp.
 // The UTC year (may be negative for pre-1 BCE instants).
 export val year = (ts: Int64): Int32 => components(ts)["year"]
 

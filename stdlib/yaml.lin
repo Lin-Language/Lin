@@ -1,3 +1,17 @@
+// std/yaml — parse and serialise YAML.
+//
+// YAML maps onto the same data model as JSON, so a parsed document is an ordinary `Json` value
+// (object, array, string, number, boolean, or null). Because YAML decodes to plain `Json`, it
+// composes directly with std/json's `fromJson` and with std/jq filters — a "yq" query is just
+// `parse` followed by `jq`. Fallible functions return the canonical `Error` value
+// `{ "type": "error", "message": String }`, detectable with `is Error`.
+//
+//   import { parse, parseAll, stringify, stringifyAll } from "std/yaml"
+//
+// Data-model notes: non-string mapping keys (`42: x`) are coerced to their string form; the YAML
+// 1.2 core schema is followed (`yes`/`no`/`on`/`off` parse as strings, not booleans); anchors,
+// aliases, and merge keys (`<<`) are resolved on parse; comments are dropped (stringify
+// round-trips through the parsed value, not the original text).
 import foreign "lin-runtime"
   val lin_yaml_parse: (String) => Json
   val lin_yaml_parse_all: (String) => Json
@@ -13,6 +27,7 @@ export val parse = (src: String): Json =>
 // Parse a multi-document YAML stream (`---`-separated) into an array of values.
 // @param src  the YAML source text.
 // @returns a `Json[]` of the parsed documents, or an `Error` if `src` is not valid YAML.
+// @example parseAll("a: 1\n---\nb: 2\n").length()  // 2
 export val parseAll = (src: String): Json =>
   lin_yaml_parse_all(src)
 

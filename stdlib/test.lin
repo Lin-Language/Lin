@@ -1,3 +1,24 @@
+// std/test — a lightweight test framework. Tests are plain Lin values — no magic, no macros.
+//
+//   import { suite, test, run, expect } from "std/test"
+//
+// A test body RETURNS an array of assertions (`Assertion[]`) — even a single assertion is written
+// `[ expect(...).toBe(...) ]`. The array requirement is type-enforced, which is what guarantees
+// every assertion is actually evaluated. Build tests with `test(name, () => [...])`, group them
+// with `suite(name, tests)`, then run them: `run` prints a summary and `exit(1)`s if any test
+// fails (the CI default), while `report` returns the failure count instead of exiting — the
+// building block for guaranteed afterAll teardown.
+//
+// Assertions begin with `expect(value)` and chain a matcher: `.toBe(expected)` (deep equality),
+// `.toBeNull()`, `.toSatisfy(pred)`, `.toSucceed()` / `.toFail()` / `.toFailWith(msg)` (shape
+// checks on `{ "type": "success" | "failure" }` values).
+//
+// Lifecycle without keywords: a module-scope `val` above the suite is "beforeAll" (test bodies run
+// eagerly as the suite array is built); statements after `report(suite)` are "afterAll";
+// `withFixture(setup, teardown, name, body)` is per-test "beforeEach/afterEach" with dependency
+// injection — compose it via partial application, e.g. `val withDb = withFixture(openDb, closeDb,)`.
+// Mocking is the test-only `replace <name> = <expr>` statement (see std-level docs / the Testing
+// tutorial), permitted only in a `*.test.lin`.
 import { print } from "std/io"
 import { toString, join, split } from "std/string"
 import { length } from "std/array"
@@ -74,6 +95,8 @@ export val expect = (value: Json): Json =>
 // @param asserter  the asserter from `expect`.
 // @param expected  the value it should equal.
 // @returns a passing assertion, or a failing one carrying the expected/actual pair.
+// @example expect(1 + 2).toBe(3)
+// @example expect("hi".toUpper()).toBe("HI")
 export val toBe = (asserter: Json, expected: Json): Json =>
   val value = asserter["value"]
   if value == expected then

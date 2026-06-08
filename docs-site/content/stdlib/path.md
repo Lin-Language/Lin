@@ -1,118 +1,119 @@
 # std/path
 
-Pure path string manipulation. No filesystem access. Works with both POSIX and Windows paths.
+std/path — pure path-string manipulation. No filesystem access; works with POSIX-style paths.
+
+Every function here is a pure string transform — nothing is read from or written to disk.
+`resolve` is the one exception: it consults the current working directory to make a path
+absolute. Use std/fs for actual filesystem operations.
+
+  import { join, basename, dirname, extname, stem, normalize, resolve } from "std/path"
+
+## Reference
+
+#### `basename`
 
 ```lin
-import { join, basename, dirname, extname, stem, normalize, resolve, relative, isAbsolute, split } from "std/path"
+val basename = (p: String): String
 ```
 
-## Function reference
+The final component of a path (the file or last directory name).
+- **`p`** — the path.
+- **Returns** the basename, e.g. `basename("/a/b/c.txt")` is `"c.txt"`.
 
-| Function | Signature | Description |
-| --- | --- | --- |
-| `basename` | `(String) -> String` | Final component of path |
-| `dirname` | `(String) -> String` | All components except the last |
-| `extname` | `(String) -> String` | Extension including dot, or `""` |
-| `isAbsolute` | `(String) -> Boolean` | True if path is absolute |
-| `join` | `(String[]) -> String` | Join segments with OS separator |
-| `normalize` | `(String) -> String` | Resolve `..` and `.` |
-| `relative` | `(String, String) -> String` | Relative path from one location to another |
-| `resolve` | `(String) -> String` | Resolve to absolute path using cwd |
-| `split` | `(String) -> String[]` | Split path into components |
-| `stem` | `(String) -> String` | Basename without extension |
-
----
-
-### `join`
+#### `dirname`
 
 ```lin
-join(["usr", "local", "bin"])   // "usr/local/bin"
-join(["/usr", "local/bin"])     // "/usr/local/bin"
+val dirname = (p: String): String
 ```
 
-Takes an **array** of strings (not variadic).
+The parent-directory portion of a path.
+- **`p`** — the path.
+- **Returns** the dirname, e.g. `dirname("/a/b/c.txt")` is `"/a/b"`.
 
----
-
-### `basename`
+#### `extname`
 
 ```lin
-basename("/usr/local/bin/lin")   // "lin"
-basename("src/main.lin")         // "main.lin"
+val extname = (p: String): String
 ```
 
----
+The file extension of a path, including the leading dot.
+- **`p`** — the path.
+- **Returns** the extension, e.g. `extname("c.txt")` is `".txt"` (empty if none).
+- **Example:** extname("archive.tar.gz")  // ".gz"
+- **Example:** extname("README")          // ""
 
-### `dirname`
+#### `stem`
 
 ```lin
-dirname("/usr/local/bin/lin")   // "/usr/local/bin"
-dirname("src/main.lin")         // "src"
-dirname("main.lin")             // "."
+val stem = (p: String): String
 ```
 
----
+The basename of a path with its extension removed.
+- **`p`** — the path.
+- **Returns** the stem, e.g. `stem("/a/c.txt")` is `"c"`.
+- **Example:** stem("main.lin")        // "main"
+- **Example:** stem("archive.tar.gz")  // "archive.tar"
 
-### `extname`
+#### `isAbsolute`
 
 ```lin
-extname("main.lin")         // ".lin"
-extname("archive.tar.gz")   // ".gz"
-extname("README")           // ""
+val isAbsolute = (p: String): Boolean
 ```
 
----
+Whether a path is absolute.
+- **`p`** — the path.
+- **Returns** `true` if `p` is absolute, `false` if relative.
 
-### `stem`
+#### `normalize`
 
 ```lin
-stem("main.lin")         // "main"
-stem("archive.tar.gz")   // "archive.tar"
+val normalize = (p: String): String
 ```
 
----
+Collapse `.`/`..` segments and redundant separators in a path (lexical, no filesystem access).
+- **`p`** — the path.
+- **Returns** the normalized path.
+- **Example:** normalize("a/b/../c")  // "a/c"
+- **Example:** normalize("/a/./b/c")  // "/a/b/c"
 
-### `normalize`
+#### `resolve`
 
 ```lin
-normalize("a/b/../c")    // "a/c"
-normalize("/a/./b/c")    // "/a/b/c"
-normalize("a//b")        // "a/b"
+val resolve = (p: String): String
 ```
 
----
+Resolve a path to an absolute path against the current working directory.
+- **`p`** — the path.
+- **Returns** the absolute resolved path.
 
-### `resolve`
+#### `join`
 
 ```lin
-// assuming cwd = "/home/user/project"
-resolve("src/main.lin")   // "/home/user/project/src/main.lin"
-resolve("/etc/hosts")     // "/etc/hosts"
+val join = (parts: String[]): String
 ```
 
----
+Join path components with the platform separator and normalize the result.
+- **`parts`** — the path components, in order.
+- **Returns** the joined, normalized path (empty string if `parts` is empty).
+- **Example:** join(["usr", "local", "bin"])  // "usr/local/bin"
+- **Example:** join(["/usr", "local/bin"])    // "/usr/local/bin"
 
-### `relative`
+#### `split`
 
 ```lin
-relative("/usr/local", "/usr/local/bin/lin")   // "bin/lin"
-relative("/usr/local/bin", "/usr/share")       // "../../share"
+val split = (p: String): String[]
 ```
 
----
+Split a path into its `/`-separated components.
+- **`p`** — the path.
+- **Returns** an array of the path segments.
 
-### `isAbsolute`
+#### `relative`
 
 ```lin
-isAbsolute("/usr/local")    // true
-isAbsolute("src/main.lin")  // false
+val relative = (_: String, to: String): String
 ```
 
----
-
-### `split`
-
-```lin
-split("/usr/local/bin")   // ["", "usr", "local", "bin"]
-split("src/main.lin")     // ["src", "main.lin"]
-```
+The path of `to` relative to a base path.
+- **`to`** — the target path.
+- **Returns** the relative path (currently returns `to` unchanged).

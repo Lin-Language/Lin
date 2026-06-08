@@ -1,3 +1,10 @@
+// std/path — pure path-string manipulation. No filesystem access; works with POSIX-style paths.
+//
+// Every function here is a pure string transform — nothing is read from or written to disk.
+// `resolve` is the one exception: it consults the current working directory to make a path
+// absolute. Use std/fs for actual filesystem operations.
+//
+//   import { join, basename, dirname, extname, stem, normalize, resolve } from "std/path"
 import { for, range } from "std/iter"
 
 import foreign "lin-runtime"
@@ -26,12 +33,16 @@ export val dirname = (p: String): String =>
 // The file extension of a path, including the leading dot.
 // @param p  the path.
 // @returns the extension, e.g. `extname("c.txt")` is `".txt"` (empty if none).
+// @example extname("archive.tar.gz")  // ".gz"
+// @example extname("README")          // ""
 export val extname = (p: String): String =>
   lin_path_extname(p)
 
 // The basename of a path with its extension removed.
 // @param p  the path.
 // @returns the stem, e.g. `stem("/a/c.txt")` is `"c"`.
+// @example stem("main.lin")        // "main"
+// @example stem("archive.tar.gz")  // "archive.tar"
 export val stem = (p: String): String =>
   lin_path_stem(p)
 
@@ -44,6 +55,8 @@ export val isAbsolute = (p: String): Boolean =>
 // Collapse `.`/`..` segments and redundant separators in a path (lexical, no filesystem access).
 // @param p  the path.
 // @returns the normalized path.
+// @example normalize("a/b/../c")  // "a/c"
+// @example normalize("/a/./b/c")  // "/a/b/c"
 export val normalize = (p: String): String =>
   lin_path_normalize(p)
 
@@ -56,6 +69,8 @@ export val resolve = (p: String): String =>
 // Join path components with the platform separator and normalize the result.
 // @param parts  the path components, in order.
 // @returns the joined, normalized path (empty string if `parts` is empty).
+// @example join(["usr", "local", "bin"])  // "usr/local/bin"
+// @example join(["/usr", "local/bin"])    // "/usr/local/bin"
 export val join = (parts: String[]): String =>
   val n = lin_length(parts)
   if n == 0 then

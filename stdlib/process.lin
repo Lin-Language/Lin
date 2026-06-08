@@ -1,3 +1,14 @@
+// std/process — running and managing external processes, plus OS/system introspection.
+//
+// Two ways to run a command: `exec`/`shell` run to completion and hand back an ExecResult (exit
+// status + captured stdout/stderr); `spawn` starts a process without waiting and returns an opaque
+// ProcessHandle you drive with readStdout / wait / kill. Prefer `exec` over `shell` to avoid shell
+// injection. Fallible calls return an Error shape you narrow with `is Error`. The system layer
+// (hostname / platform / arch / cpuCount / pid / username / homeDir / memInfo …, folded in from the
+// former std/os) reports machine and process facts; the compile-time ones (platform / arch) and the
+// always-available ones (cpuCount / pid) are total, the rest can return an Error.
+//
+// import { exec, shell, cwd, chdir, spawn, wait, kill } from "std/process"
 import foreign "lin-runtime"
   val lin_process_exec: (String, String[]) => Json
   val lin_os_hostname: () => Json
@@ -33,6 +44,7 @@ export type ProcessHandle = Int64
 // @param args  the argument vector (each element is a separate argument, no shell splitting).
 // @returns an ExecResult with the exit status and captured stdout/stderr, or an Error if the
 //   process cannot be launched.
+// @example val r = exec("git", ["status", "--short"])   // then r["status"], r["stdout"]
 export val exec = (command: String, args: String[]): Json =>
   lin_process_exec(command, args)
 
@@ -40,10 +52,12 @@ export val exec = (command: String, args: String[]): Json =>
 // @param command  the shell command line.
 // @returns an ExecResult with the exit status and captured stdout/stderr, or an Error if it
 //   cannot be launched.
+// @example shell("ls -la | wc -l")["stdout"].trim()
 export val shell = (command: String): Json =>
   lin_process_shell(command)
 
 // The absolute path of the current working directory.
+// @example cwd()   // "/home/alice/project"
 export val cwd = (): String =>
   lin_process_cwd()
 
@@ -66,6 +80,7 @@ export val spawn = (command: String, args: String[]): Json =>
 // @param handle  the spawned process's handle.
 // @param buf  the buffer to fill; up to `buf.length` bytes are read.
 // @returns the number of bytes read (0 = EOF), or an Error.
+// @example val n = readStdout(h, buf)   // n bytes copied into buf; 0 means end-of-stream
 export val readStdout = (handle: ProcessHandle, buf: UInt8[]): Json =>
   lin_process_read_stdout(handle, buf)
 
@@ -78,7 +93,8 @@ export val kill = (handle: ProcessHandle): Json =>
 // Wait for a spawned process to exit. stdout that was streamed via readStdout is not re-collected
 // here — use `exec` for batch output.
 // @param handle  the process to wait on.
-// @returns the process's exit code, or an Error.
+// @returns the process's exit code, or an Error. After `wait` the handle is no longer valid.
+// @example val proc = spawn("server", ["--port", "8080"])   // ...later... val code = wait(proc)
 export val wait = (handle: ProcessHandle): Json =>
   lin_process_wait(handle)
 

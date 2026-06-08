@@ -1,3 +1,16 @@
+// std/array — array-shaped operations over a materialised, indexable, ordered array.
+//
+// All transformation functions are non-mutating and return new values, except `push` and `set`,
+// which mutate in place. This module also carries the sorted-array search layer (binarySearch,
+// lowerBound/upperBound, insertSorted, countInRange) and the keyed aggregators (sortBy, minBy,
+// maxBy, groupBy, countBy).
+//
+// import { sort, sortBy, length, push, slice, sum } from "std/array"
+//
+// The iterable combinators (map, filter, reduce, for, while, take, drop, find, some, every,
+// flatMap, takeWhile, dropWhile, flatten, concat) and the iterator constructors (range, rangeStep,
+// iter, iterOf) live in std/iter, where they dispatch on the receiver type (eager over
+// arrays/iterators, lazy over streams). Import those from std/iter, not std/array.
 import foreign "lin-runtime"
   val lin_array_slice_dyn: (Json, Int32, Int32) => Json
   val lin_array_append_dyn: (Json, Json) => Json
@@ -15,6 +28,7 @@ import { for, take, concat } from "std/iter"
 // @param arr   the array to mutate; its element type pins `T` for element checking.
 // @param item  the element to append; must be assignable to `T` (`push(intArr, "s")` is a compile error).
 // @returns `null`.
+// @example val xs: Int32[] = []; xs.push(1); xs.push(2)   // xs: [1, 2]
 export val push = <T>(arr: T[], item: T): Null =>
   // ADR-058: an empty-literal accumulator must be annotated so `acc` pins `T`; an unannotated `[]`
   // would be `Never[]` and mis-store elements as null (rejected at compile time). `lin_push` is a
@@ -29,6 +43,10 @@ export val push = <T>(arr: T[], item: T): Null =>
 // @param start  start index (inclusive); negative counts from the end; clamped to `[0, length]`.
 // @param end    end index (exclusive); defaults to `length(arr)`; negative counts from the end; clamped to `[0, length]`.
 // @returns a new `T[]` holding the selected elements.
+// @example [10, 20, 30, 40, 50].slice(1, 4)   // [20, 30, 40]
+// @example [1, 2, 3, 4, 5].slice(1)           // [2, 3, 4, 5]  (omitted end -> length)
+// @example [1, 2, 3, 4, 5].slice(1, -1)       // [2, 3, 4]
+// @example [1, 2, 3, 4, 5].slice(-2)          // [4, 5]
 export val slice = <T>(arr: T[], start: Int32, end: Int32 = length(arr)): T[] =>
   val n = length(arr)
   val s = if start < 0 then n + start else start
@@ -57,6 +75,9 @@ export val arrayAllocateFilled = <T>(n: Int32, fill: T): T[] =>
 // The number of elements in an array (or characters/entries in a string/object).
 // @param x  any array, string, or object.
 // @returns the element/character/entry count as an `Int32`.
+// @example length([1, 2, 3])     // 3
+// @example length("hello")       // 5
+// @example length({ "a": 1 })    // 1
 export val length = (x: Json): Int32 =>
   lin_length(x)
 
@@ -81,6 +102,9 @@ val _reduceJ = (arr: Json, init: Json, f: (Json, Json) => Json): Json =>
 // @param target     the value to look for; must be assignable to the element type `T`.
 // @param fromIndex  index to start from (default `0`); negative counts from the end.
 // @returns the index of the first match at or after `fromIndex`, or `-1` if none.
+// @example [10, 20, 30].indexOf(20)     // 1
+// @example [1, 2, 1, 2].indexOf(2, 2)   // 3
+// @example [1, 2, 1, 2].indexOf(1, -1)  // -1   (search starts at index 3)
 export val indexOf = <T>(arr: T[], target: T, fromIndex: Int32 = 0): Int32 =>
   val start = if fromIndex < 0 then length(arr) + fromIndex else fromIndex
   var result = -1
@@ -123,6 +147,11 @@ export val set = <T>(arr: T[], idx: Int32, item: T): Null =>
 // @param index    the index; negative counts from the end.
 // @param default  value returned when `index` is out of bounds; defaults to `null`, pinning `D`.
 // @returns the element at `index`, or `default` (typed `T | D`) when out of bounds.
+// @example [10, 20, 30].at(0)         // 10
+// @example [10, 20, 30].at(-1)        // 30   (negative wraps)
+// @example [].at(0)                   // null               (omitted default -> T | Null)
+// @example [10, 20, 30].at(5, -1)     // -1   (out of bounds -> default)
+// @example [10, 20, 30].at(9, "n/a")  // "n/a"              (independent default type -> Int32 | String)
 export val at = <T, D>(arr: T[], index: Int32, default: D = null): T | D =>
   val i = if index < 0 then length(arr) + index else index
   if i >= 0 && i < length(arr) then arr[i] else default
@@ -131,6 +160,7 @@ export val at = <T, D>(arr: T[], index: Int32, default: D = null): T | D =>
 // @param arr  the array to partition.
 // @param f    predicate `(item, index?) => Boolean`; the trailing 0-based `Int32` index is optional.
 // @returns a 2-element array `[pass, fail]`, each a `T[]` (`result[0]` = matches, `result[1]` = the rest).
+// @example val [evens, odds] = [1, 2, 3, 4, 5].partition(x => x % 2 == 0)   // evens: [2, 4], odds: [1, 3, 5]
 export val partition = <T>(arr: T[], f: (T, Int32) => Boolean): T[][] =>
   val pass: T[] = []
   val fail: T[] = []
@@ -244,6 +274,7 @@ val _mergePass = <T>(buf: T[], work: T[], n: Int32, width: Int32, cmp: (T, T) =>
 // @param arr  the array to sort.
 // @param cmp  comparator `(a, b) => Int32`: negative if `a` sorts before `b`, positive if after, 0 if equal.
 // @returns a new sorted `T[]`; ties retain their original relative order.
+// @example [3, 1, 4, 1, 5].sort((a, b) => a - b)   // [1, 1, 3, 4, 5]
 export val sort = <T>(arr: T[], cmp: (T, T) => Int32): T[] =>
   val n = length(arr)
   if n <= 1 then
@@ -298,6 +329,7 @@ val _keyedPairs = <T>(arr: T[], keyFn: (T) => Json): Json =>
 // @param arr    the array to sort.
 // @param keyFn  maps an element to its (comparable `Json`) sort key; must accept the element type `T`.
 // @returns a new `T[]` sorted ascending by key, ties in original order.
+// @example people.sortBy(p => p["name"])
 export val sortBy = <T>(arr: T[], keyFn: (T) => Json): T[] =>
   // The key stays `Json`: internally `sortBy` builds heterogeneous `[key, item]` pairs (which infer a
   // homogeneous `Json` element) and sorts those via `_sortJ`; a second `<K>` key param cannot flow into

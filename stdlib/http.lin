@@ -1,3 +1,15 @@
+// std/http — HTTP client and server, plus URL parsing/building.
+//
+// All client functions are synchronous and blocking. Requests return an HttpResponse or an Error
+// shape (`{ "type": "error", ... }`) that you narrow with `is Error`. On the server side, write a
+// handler `(HttpRequest) -> HttpResponse` and pass it to `serve`; build responses with json / text
+// / redirect / badRequest / notFound, route with matchPath, and read request bodies with parseBody.
+// The handler is the FIRST argument to serve, so the dot-call form `handler.serve(port)` reads
+// naturally. The URL layer (Url / parse / build / join / withQuery / withPath, folded in from the
+// former std/url) splits a string into RFC 3986 components verbatim — no percent-decoding.
+//
+// import { fetch, fetchJson, fetchWith, postJson } from "std/http"
+// import { serve, json, text, redirect, notFound, badRequest, matchPath, parseBody } from "std/http"
 import foreign "lin-runtime"
   val lin_http_fetch: (String) => Json
   val lin_url_parse: (String) => Json
@@ -20,6 +32,7 @@ export type HttpOptions = { "method": String, "headers": { String: String }, "bo
 // GET `url`.
 // @param url  the URL to fetch.
 // @returns the response object, or an `Error` (`{ "type":"error", ... }`) if the request fails.
+// @example val result = fetch("https://example.com/ping")   // then result["status"]
 export val fetch = (url: String): Json =>
   lin_http_fetch(url)
 
@@ -27,6 +40,7 @@ export val fetch = (url: String): Json =>
 // @param url  the URL to request.
 // @param options  an `HttpOptions`-shaped record (method, headers, body).
 // @returns the response object, or an `Error` if the request fails.
+// @example fetchWith("https://api.example.com/items", { "method": "DELETE", "headers": {}, "body": "" })
 export val fetchWith = (url: String, options: Json): Json =>
   lin_http_fetch_with(url, options)
 
@@ -34,6 +48,7 @@ export val fetchWith = (url: String, options: Json): Json =>
 // @param url  the URL to fetch.
 // @returns the parsed JSON value, or an `Error` if the request fails (the error is passed through
 //          unparsed).
+// @example val users = fetchJson("https://api.example.com/users")   // then users.for(u => ...)
 export val fetchJson = (url: String): Json =>
   val response = lin_http_fetch(url)
   if response["type"] == "error" then
@@ -45,6 +60,7 @@ export val fetchJson = (url: String): Json =>
 // @param url  the target URL.
 // @param body  any JSON-serialisable value; sent as the JSON request body.
 // @returns the response object, or an `Error` if the request fails.
+// @example postJson("https://api.example.com/users", { "name": "Alice" })
 export val postJson = (url: String, body: Json): Json =>
   lin_http_fetch_with(url, {
     "method": "POST",
@@ -111,6 +127,7 @@ export val parseBody = (req: Json): Json =>
 // @param path  the concrete request path.
 // @param pattern  the route pattern with `:name` capture segments.
 // @returns a map of captured params if the path matches, or a non-match result otherwise.
+// @example matchPath("/users/42", "/users/:id")   // { "id": "42" }
 export val matchPath = (path: String, pattern: String): Json =>
   lin_server_path_match(pattern, path)
 
@@ -118,6 +135,7 @@ export val matchPath = (path: String, pattern: String): Json =>
 // @param handler  a function `(HttpRequest) -> HttpResponse`.
 // @param port  the TCP port to listen on.
 // @returns never returns under normal operation (runs the accept loop).
+// @example handler.serve(3000)   // handler = req => match req["path"] is "/ping" => text(200, "pong") else => notFound
 export val serve = (handler: Json, port: Int32): Null =>
   lin_serve(handler, port)
 

@@ -1,20 +1,44 @@
 // std/iter — iterable combinators and iterator constructors.
 //
-// These were relocated verbatim out of std/array (Stage 1 of the std/iter unification). The
-// combinators are eager over Array/Iterator; their bodies are unchanged from their original
-// std/array implementations. std/iter is the LOWER-LEVEL module in the dependency graph: it does
-// NOT import from std/array (that would form an array->iter->array import cycle, which is a
-// compile-time error). The two array primitives these combinators need internally — `length` and
-// `push` — are duplicated here as PRIVATE helpers (byte-identical thin wrappers over the same
-// lin_length/lin_push intrinsics std/array wraps), so the moved bodies stay verbatim and std/iter
-// stays self-contained.
+// A combinator works over any iterable source — an array, an `Iterator`, or a `Stream` (see
+// std/stream) — and dispatches on the type of its receiver (its first argument, in dot-application
+// terms):
+//   - Eager over an array or iterator: it runs immediately and returns a materialised `U[]`.
+//   - Lazy over a stream: it returns a `Stream<U>` adapter that reads nothing until a terminal
+//     drives it, one item at a time, with bounded memory.
+//
+// A handful of combinators are terminals — `reduce`, `for`, `while`, `find`, `some`, `every`. Over
+// an array they return their plain result; over a stream they drive the pipeline to completion and
+// gain an `| Error` arm, because a stream read can fail mid-traversal. The same chain that runs
+// eagerly over an array runs lazily over a stream, just because the receiver is a `Stream`; over a
+// stream a combinator consumes its input, so using the same stream value twice is a compile error.
+//
+// Every combinator callback OPTIONALLY receives a trailing 0-based `Int32` source index (the JS
+// `forEach((item, idx) => …)` model); a 1-arg callback stays valid (opt-in by arity). For `reduce`
+// the index is the third parameter `(acc, item, i)`. The index is always the source position. The
+// key-extractor combinators (sortBy/minBy/maxBy/groupBy/countBy, in std/array) take no index.
+//
+// import { map, filter, reduce, take, drop } from "std/iter"
+// import { range, rangeStep, iter, iterOf } from "std/iter"
+//
+// Array-shaped operations (push, slice, sort, sum, …) live in std/array; stream sources and sinks
+// (readStream, writeStream, lines, drain, …) live in std/stream. The combinators here are the single
+// vocabulary that spans all three.
+//
+// v1 limitation: lazy dispatch fires at a concrete combinator call with a `Stream` receiver. A
+// stream passed through a user-defined generic `Iterable` parameter stays array-shaped (eager)
+// inside that function — the safe resolution.
 import foreign "lin-runtime"
   val lin_array_concat_dyn: (Json, Json) => Json
   val lin_stream_count: (Int32, Int32) => Stream
   val lin_stream_repeat: (Json, Int32) => Stream
   val lin_stream_cycle: (Json) => Stream
-// Private intrinsic wrappers (see header): NOT exported. Identical to std/array's `length`/`push`,
-// duplicated here so std/iter stays self-contained (it must not import from the higher-level std/array).
+// Maintainer note: the combinators here were relocated verbatim out of std/array (Stage 1 of the
+// std/iter unification); their eager Array/Iterator bodies are unchanged. std/iter is the
+// LOWER-LEVEL module: it must NOT import from std/array (that would form an array->iter->array import
+// cycle). The two array primitives these bodies need — `length` and `push` — are duplicated below as
+// PRIVATE helpers (byte-identical thin wrappers over the same lin_length/lin_push intrinsics
+// std/array wraps), so the moved bodies stay verbatim and std/iter stays self-contained.
 val length = (x: Json): Int32 =>
   lin_length(x)
 
@@ -25,6 +49,7 @@ val push = (arr: Json, item: Json): Null =>
 // @param iterable  any Array, Iterator, or Stream.
 // @param f          callback `(item, index?) => …`; the trailing 0-based `Int32` index is optional.
 // @returns `null`.
+// @example [1, 2, 3].for(x => print(x))
 export val for = (iterable: Json, f: (Json, Int32) => Json): Null =>
   // Deliberately NOT `<T>`: `for` drives `Json`-typed sources (e.g. a `Json[]` of promise handles),
   // where a generic element pin mis-monomorphizes the callback's closure ABI (seen in
@@ -36,6 +61,7 @@ export val for = (iterable: Json, f: (Json, Int32) => Json): Null =>
 // @param arr  an Array, Iterator, or Stream.
 // @param f    predicate `(item, index?) => Boolean`; iteration continues while it returns `true`.
 // @returns `null` for an Array/Iterator; `Null | Error` over a Stream, where a read fault surfaces in-band.
+// @example [1, 2, -3, 4].while(x => x >= 0)   // visits 1, 2, stops at -3
 export val while = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean) =>
   // The return annotation is DROPPED so the call-site result is `Null` for arrays and re-typed to
   // `Null | Error` for a stream receiver by `streamish_combinator_ret`. `Iterator`/`Stream` are
@@ -47,6 +73,8 @@ export val while = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean) =
 // @param start  the first value (inclusive).
 // @param end    the upper bound (exclusive).
 // @returns an `Int32[]` of the range.
+// @example range(0, 5).for(i => print(i))    // 0 1 2 3 4
+// @example range(1, 6).map(i => i * i)        // [1, 4, 9, 16, 25]
 export val range = (start: Int32, end: Int32) =>
   // Delegate to the lin_range builtin, which materialises a flat Int32 array directly with no
   // per-call closures (the general lin_iter form — 4 closures + envs per element — is needlessly
@@ -58,6 +86,8 @@ export val range = (start: Int32, end: Int32) =>
 // @param end    the bound (exclusive).
 // @param step   the increment; positive counts up, negative counts down, `0` yields an empty sequence.
 // @returns an iterator over the stepped range.
+// @example rangeStep(0, 10, 2).for(i => print(i))   // 0, 2, 4, 6, 8
+// @example rangeStep(5, 0, -1).map(i => i)           // [5, 4, 3, 2, 1]
 export val rangeStep = (start: Int32, end: Int32, step: Int32): Json =>
   if step > 0 then
     lin_iter(() => start, i => i < end, i => i + step, i => i)
@@ -69,6 +99,7 @@ export val rangeStep = (start: Int32, end: Int32, step: Int32): Json =>
 // Build an opaque Iterator that yields the elements of `arr` in order.
 // @param arr  the backing array (its element type is recovered at the consuming combinator, not pinned here).
 // @returns an Iterator over `arr`'s elements.
+// @example val it = iterOf([10, 20, 30]); it.for(x => print(x))   // prints 10, 20, 30
 export val iterOf = (arr: Json) =>
   lin_iter(() => 0, i => i < length(arr), i => i + 1, i => arr[i])
 
@@ -78,6 +109,7 @@ export val iterOf = (arr: Json) =>
 // @param next     `(state) => state'` advancing to the next state.
 // @param value    `(state) => item` projecting the current state to its yielded element.
 // @returns an Iterator driven by those closures.
+// @example iter(() => 0, s => s < 3, s => s + 1, s => s)   // yields 0, 1, 2
 export val iter = (init: Json, hasNext: Json, next: Json, value: Json) =>
   lin_iter(init, hasNext, next, value)
 
@@ -87,6 +119,7 @@ export val iter = (init: Json, hasNext: Json, next: Json, value: Json) =>
 // @param a  the first iterable (Array, Iterator, or Stream).
 // @param b  the second iterable, appended after `a`.
 // @returns the concatenation; flat when both inputs are the same flat type, tagged/`Json[]` otherwise.
+// @example concat([1, 2], [3, 4])   // [1, 2, 3, 4]
 export val concat = (a: Json, b: Json): Json =>
   // Stays `Json` (NOT `<T>`): `concat` legitimately MIXES element types (a single `<T>` over both
   // operands cannot express that), and a stream pipeline flows through this `Json` param while the
@@ -97,6 +130,8 @@ export val concat = (a: Json, b: Json): Json =>
 // @param arr  an Array, Iterator, or Stream of `T`.
 // @param f    mapping `(item, index?) => U`; the trailing 0-based `Int32` index is optional.
 // @returns a `U[]` over an Array/Iterator, or a lazy `Stream<U>` over a Stream receiver.
+// @example [1, 2, 3].map(x => x * 2)            // [2, 4, 6]
+// @example ["a", "b", "c"].map((x, i) => "${i}: ${x}")   // ["0: a", "1: b", "2: c"]
 export val map = <T, U>(arr: T[] | Iterator | Stream, f: (T, Int32) => U) =>
   // Monomorphic scalar call sites (e.g. `range(0,n).map(x => x*2)`) inline `lin_map(arr, <lambda>)`
   // so the intrinsic lowers a capture-less lambda directly into the loop with no per-element
@@ -109,6 +144,8 @@ export val map = <T, U>(arr: T[] | Iterator | Stream, f: (T, Int32) => U) =>
 // @param arr  an Array, Iterator, or Stream of `T`.
 // @param f    predicate `(item, index?) => Boolean`; the trailing 0-based `Int32` index is optional.
 // @returns a `T[]` of the kept items over an Array/Iterator, or a lazy `Stream<T>` over a Stream receiver.
+// @example [1, 2, 3, 4].filter(x => x % 2 == 0)        // [2, 4]
+// @example [10, 20, 30, 40].filter((x, i) => i % 2 == 0)   // [10, 30]  (source indices 0, 2)
 export val filter = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean) =>
   lin_filter(arr, f)
 
@@ -117,6 +154,8 @@ export val filter = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean) 
 // @param init  the initial accumulator; pins the accumulator type `U`.
 // @param f     folding step `(acc, item, index?) => acc'`; the trailing 0-based `Int32` index is optional.
 // @returns the final accumulator `U` over an Array/Iterator, or `U | Error` over a Stream receiver.
+// @example [1, 2, 3, 4].reduce(0, (acc, x) => acc + x)   // 10
+// @example [1, 1, 1].reduce(0, (acc, x, i) => acc + i)   // 3   (0 + 0 + 1 + 2)
 export val reduce = <T, U>(arr: T[] | Iterator | Stream, init: U, f: (U, T, Int32) => U) =>
   lin_reduce(arr, init, f)
 
@@ -130,6 +169,8 @@ export val reduce = <T, U>(arr: T[] | Iterator | Stream, init: U, f: (U, T, Int3
 // @param arr  an Array, Iterator, or Stream of `T`.
 // @param f    predicate `(item, index?) => Boolean`.
 // @returns the first matching item, or `null` if none match (typed `T | Null`).
+// @example [1, 3, 5, 6].find(x => x % 2 == 0)   // 6
+// @example [1, 3, 5].find(x => x % 2 == 0)      // null
 export val find = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): T | Null =>
   var found = null
   var idx = 0
@@ -144,6 +185,7 @@ export val find = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): T
 // @param arr  an Array, Iterator, or Stream of `T`.
 // @param f    predicate `(item, index?) => Boolean`.
 // @returns `true` if any item matches, `false` otherwise (`false` for an empty source).
+// @example [1, 2, 3].some(x => x > 2)    // true
 export val some = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): Boolean =>
   var result = false
   var idx = 0
@@ -158,6 +200,8 @@ export val some = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): B
 // @param arr  an Array, Iterator, or Stream of `T`.
 // @param f    predicate `(item, index?) => Boolean`.
 // @returns `true` if all items match, `false` otherwise (`true` for an empty source).
+// @example [1, 2, 3].every(x => x > 0)   // true
+// @example [1, 2, 3].every(x => x > 1)   // false
 export val every = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): Boolean =>
   var result = true
   var idx = 0
@@ -172,6 +216,7 @@ export val every = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): 
 // @param arr  any iterable.
 // @param f    `(item, index?) => iterable`; the trailing 0-based `Int32` index is optional.
 // @returns the concatenation of every produced inner iterable, in order.
+// @example [1, 2, 3].flatMap(x => [x, x * 2])   // [1, 2, 2, 4, 3, 6]
 export val flatMap = (arr: Json, f: (Json, Int32) => Json): Json =>
   // Stays `Json` (NOT `<T>`): input and flattened output element types genuinely differ, and a
   // concrete-`U` monomorphization corrupts heap (String/Array) elements through the per-element push.
@@ -189,6 +234,7 @@ export val flatMap = (arr: Json, f: (Json, Int32) => Json): Json =>
 // @param arr  an Array, Iterator, or Stream of `T`.
 // @param n    the maximum number of items to take; fewer if the source is shorter.
 // @returns a `T[]` of the first `n` items (a lazy `Stream<T>` over a Stream receiver).
+// @example take([1, 2, 3, 4], 2)   // [1, 2]
 export val take = <T>(arr: T[] | Iterator | Stream, n: Int32): T[] =>
   val result: T[] = []
   var i = 0
@@ -203,6 +249,7 @@ export val take = <T>(arr: T[] | Iterator | Stream, n: Int32): T[] =>
 // @param arr  an Array, Iterator, or Stream of `T`.
 // @param n    the number of leading items to skip; if `n >= length`, the result is empty.
 // @returns a `T[]` of the remaining items (a lazy `Stream<T>` over a Stream receiver).
+// @example drop([1, 2, 3, 4], 2)   // [3, 4]
 export val drop = <T>(arr: T[] | Iterator | Stream, n: Int32): T[] =>
   val result: T[] = []
   val start = if n < length(arr) then n else length(arr)
@@ -217,6 +264,7 @@ export val drop = <T>(arr: T[] | Iterator | Stream, n: Int32): T[] =>
 // @param arr  an Array, Iterator, or Stream of `T`.
 // @param f    predicate `(item, index?) => Boolean`; the trailing 0-based `Int32` index is optional.
 // @returns a `T[]` of the leading run that satisfies `f` (a lazy `Stream<T>` over a Stream receiver).
+// @example [1, 2, 3, 4, 1].takeWhile(x => x < 3)   // [1, 2]
 export val takeWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): T[] =>
   val result: T[] = []
   var idx = 0
@@ -232,6 +280,7 @@ export val takeWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolea
 // @param arr  an Array, Iterator, or Stream of `T`.
 // @param f    predicate `(item, index?) => Boolean`; the trailing 0-based `Int32` index is optional.
 // @returns a `T[]` starting at the first item that fails `f` (a lazy `Stream<T>` over a Stream receiver).
+// @example [1, 2, 3, 4, 1].dropWhile(x => x < 3)   // [3, 4, 1]
 export val dropWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): T[] =>
   val result: T[] = []
   var dropping = true
@@ -247,6 +296,7 @@ export val dropWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolea
 // Collapse one level of nesting, concatenating the sub-arrays in order.
 // @param arr  an array of arrays (`T[][]`).
 // @returns the concatenated `T[]`.
+// @example flatten([[1, 2], [3, 4]])   // [1, 2, 3, 4]
 export val flatten = <T>(arr: T[][]): T[] =>
   arr.flatMap(x => x)
 

@@ -1,193 +1,169 @@
 # std/test
 
-A lightweight test framework. Tests are plain Lin values — no magic, no macros.
+std/test — a lightweight test framework. Tests are plain Lin values — no magic, no macros.
+
+  import { suite, test, run, expect } from "std/test"
+
+A test body RETURNS an array of assertions (`Assertion[]`) — even a single assertion is written
+`[ expect(...).toBe(...) ]`. The array requirement is type-enforced, which is what guarantees
+every assertion is actually evaluated. Build tests with `test(name, () => [...])`, group them
+with `suite(name, tests)`, then run them: `run` prints a summary and `exit(1)`s if any test
+fails (the CI default), while `report` returns the failure count instead of exiting — the
+building block for guaranteed afterAll teardown.
+
+Assertions begin with `expect(value)` and chain a matcher: `.toBe(expected)` (deep equality),
+`.toBeNull()`, `.toSatisfy(pred)`, `.toSucceed()` / `.toFail()` / `.toFailWith(msg)` (shape
+checks on `{ "type": "success" | "failure" }` values).
+
+Lifecycle without keywords: a module-scope `val` above the suite is "beforeAll" (test bodies run
+eagerly as the suite array is built); statements after `report(suite)` are "afterAll";
+`withFixture(setup, teardown, name, body)` is per-test "beforeEach/afterEach" with dependency
+injection — compose it via partial application, e.g. `val withDb = withFixture(openDb, closeDb,)`.
+Mocking is the test-only `replace <name> = <expr>` statement (see std-level docs / the Testing
+tutorial), permitted only in a `*.test.lin`.
+
+## Reference
+
+#### `expect`
 
 ```lin
-import { suite, test, run, expect } from "std/test"
+val expect = (value: Json): Json
 ```
 
-## Types
+Begin an assertion by wrapping `value` in an asserter for a matcher to inspect.
+- **`value`** — the value under test.
+- **Returns** an asserter `{ "value": value }`; chain a matcher via dot-syntax, e.g.
+  `expect(x).toBe(42)`.
+
+#### `toBe`
 
 ```lin
-type Assertion =
-  | { "type": "pass" }
-  | { "type": "fail", "message": String }
-
-type Test = {
-  "name": String,
-  "run": () -> Assertion[]
-}
-
-type Suite = {
-  "name": String,
-  "tests": Test[]
-}
+val toBe = (asserter: Json, expected: Json): Json
 ```
 
-## Function reference
+Assert the asserter's value equals `expected` (structural `==`).
+- **`asserter`** — the asserter from `expect`.
+- **`expected`** — the value it should equal.
+- **Returns** a passing assertion, or a failing one carrying the expected/actual pair.
+- **Example:** expect(1 + 2).toBe(3)
+- **Example:** expect("hi".toUpper()).toBe("HI")
 
-| Function | Signature | Description |
-| --- | --- | --- |
-| `suite` | `(String, Test[]) -> Suite` | Group tests under a name |
-| `test` | `(String, () -> Assertion[]) -> Test` | Declare a test case |
-| `run` | `(Suite) -> Null` | Execute a suite, print results, exit non-zero on failure |
-| `report` | `(Suite) -> Int32` | Like `run`, but returns the failure count instead of exiting |
-| `withFixture` | `(() -> Json, (Json) -> Null, String, (Json) -> Assertion[]) -> Test` | Per-test setup/teardown + injection |
-| `expect` | `(Json) -> Asserter` | Begin an assertion chain |
-
----
-
-### Basic usage
+#### `toBeNull`
 
 ```lin
-import { suite, test, run, expect } from "std/test"
-
-val mathTests = suite("arithmetic", [
-  test("addition", () => [
-    expect(1 + 2).toBe(3)
-  ]),
-  test("subtraction", () => [
-    expect(10 - 3).toBe(7)
-  ])
-])
-
-run(mathTests)
+val toBeNull = (asserter: Json): Json
 ```
 
-Output:
+Assert the asserter's value is `null`.
+- **`asserter`** — the asserter from `expect`.
+- **Returns** a passing assertion, or a failing one carrying the actual value.
 
-```
-arithmetic
-  ok  addition
-  ok  subtraction
-
-2 passed
-```
-
-A test body **returns an array of assertions** (`Assertion[]`) — even a single
-assertion is written `[ expect(...).toBe(...) ]`. This is enforced by the type
-system, which is what guarantees every assertion is actually evaluated.
-
----
-
-### Multiple assertions per test
+#### `toSatisfy`
 
 ```lin
-test("string ops", () => [
-  expect("hello".length()).toBe(5),
-  expect("hello".toUpper()).toBe("HELLO"),
-  expect("  hi  ".trim()).toBe("hi")
-])
+val toSatisfy = (asserter: Json, pred: Function): Json
 ```
 
-All assertions are evaluated; the test fails if any fail. When a test needs setup,
-write the setup statements first and the assertion array as the final expression:
+Assert the asserter's value satisfies a predicate.
+- **`asserter`** — the asserter from `expect`.
+- **`pred`** — a `(Json) => Boolean` predicate the value must satisfy.
+- **Returns** a passing assertion if `pred(value)` is true, otherwise a failing one.
+
+#### `toSucceed`
 
 ```lin
-test("sorts ascending", () =>
-  val sorted = [3, 1, 2].sort((a, b) => a - b)
-  [ expect(sorted.toString()).toBe("[1, 2, 3]") ]
-)
+val toSucceed = (asserter: Json): Json
 ```
 
----
+Assert the asserter's value is a success result (`{ "type": "success" }`).
+- **`asserter`** — the asserter from `expect`.
+- **Returns** a passing assertion if it is a success, otherwise a failing one.
 
-### `expect` assertion methods
-
-| Method | Passes when |
-| --- | --- |
-| `.toBe(expected)` | Value is deeply equal to `expected` |
-| `.toBeNull()` | Value is `null` |
-| `.toSatisfy(pred)` | `pred(value)` returns `true` |
-| `.toSucceed()` | Value has shape `{ "type": "success", ... }` |
-| `.toFail()` | Value has shape `{ "type": "failure", ... }` |
-| `.toFailWith(msg)` | Value has `{ "type": "failure", "error": msg }` |
-
----
-
-### Testing error cases
+#### `toFail`
 
 ```lin
-test("parse failure", () => [
-  expect(tryParseInt32("bad")).toBeNull()
-])
-
-test("division result", () =>
-  val result = divide(10.0, 0.0)
-  [ expect(result).toFail() ]
-)
+val toFail = (asserter: Json): Json
 ```
 
----
+Assert the asserter's value is a failure result (`{ "type": "failure" }`).
+- **`asserter`** — the asserter from `expect`.
+- **Returns** a passing assertion if it is a failure, otherwise a failing one.
 
-### Running tests
-
-`run` executes a suite, prints a summary, and calls `exit(1)` if any tests fail:
+#### `toFailWith`
 
 ```lin
-run(suite("unit", tests))
+val toFailWith = (asserter: Json, message: String): Json
 ```
 
-Exit code `0` = all passed; non-zero = at least one failed.
+Assert the asserter's value is a failure result whose `error` equals `message`.
+- **`asserter`** — the asserter from `expect`.
+- **`message`** — the expected failure error message.
+- **Returns** a passing assertion if it is a failure with that message, otherwise a failing one
+  carrying the expected/actual pair.
 
----
-
-### Setup & teardown (lifecycle)
-
-Lin's eager model needs no dedicated lifecycle keywords:
-
-- **beforeAll** — a module-scope `val`/statement above the suite (test bodies run
-  eagerly as the suite array is built, so it runs once before them).
-- **afterAll** — statements after `report(suite)`. Unlike `run`, `report` returns
-  the failure count instead of exiting, so cleanup runs even when a test fails:
+#### `test`
 
 ```lin
-val failures = report(suite("db", tests))
-closeConnections()                    // always runs
-if failures > 0 then exit(1) else null
+val test = (name: String, body: ()
 ```
 
-- **beforeEach / afterEach** — `withFixture(setup, teardown, name, body)` builds a
-  fixture, injects it into the body, and tears it down (failures are values, so
-  teardown always runs). Compose it into a per-fixture helper with partial
-  application:
+Define a test: eagerly run its body and store the result alongside the name.
+- **`name`** — the test name (also used by `--filter-test` selection).
+- **`body`** — a thunk returning an `Assertion[]` (use the `[ expect(...).toBe(...), ... ]` form,
+  even for a single assertion); every assertion is evaluated and the test fails if any fails.
+- **Returns** a result record. When `--filter-test` (via LIN_TEST_ONLY) did not select this test, the
+  body is NOT evaluated (no side effects, no fixture setup/teardown) and a `{ "type": "skip" }`
+  sentinel is produced, which `report` counts as neither pass nor fail.
+
+#### `withFixture`
 
 ```lin
-val withDb = withFixture(openDb, closeDb,)
-
-val tests = [
-  withDb("inserts a row", (db) => [ expect(db.count()).toBe(1) ]),
-  withDb("reads it back", (db) => [ expect(db.first().name).toBe("ada") ])
-]
+val withFixture = (setup: ()
 ```
 
----
+Run a test with per-test setup/teardown and dependency injection (ADR-046): build a fixture,
+inject it into the body, and tear it down — all within a single `test`. The functional
+alternative to keyword beforeEach/afterEach; compose via partial application into a per-fixture
+helper, e.g. `val withDb = withFixture(openDb, closeDb,)`, then `withDb("name", db => [ ... ])`.
+- **`setup`** — builds the fixture value.
+- **`teardown`** — releases the fixture; always runs, even when the body's assertions fail (because
+  assertion failures are VALUES, not exceptions).
+- **`name`** — the test name.
+- **`body`** — receives the fixture and returns an `Assertion[]`.
+- **Returns** the test result record (same as `test`).
 
-### Mocking with `replace`
-
-A test-only `replace <name> = <expr>` statement overrides an imported export for
-the whole test program — for isolating the unit under test from a sibling module or
-a stdlib dependency:
+#### `suite`
 
 ```lin
-import { readFile } from "std/fs"
-
-replace readFile = (path: String): String | Error => "mock contents of ${path}"
+val suite = (name: String, tests: Json[]): Json
 ```
 
-The override applies to **every** caller of that export — the test file, the module
-under test, and any transitive importer — because it swaps the export's single
-compiled symbol. Highlights:
+Group test results into a named suite for `report`/`run`.
+- **`name`** — the suite name.
+- **`tests`** — the array of test result records (from `test`/`withFixture`).
+- **Returns** a suite record `{ "name", "tests" }`.
 
-- **Stdlib is mockable** at the Lin-API level (`std/fs.readFile`, `std/time.now`,
-  …). The polymorphic built-ins (`print`, `map`, `filter`, `reduce`, `for`,
-  `length`, `toString`, the async family) are not.
-- The mock body is **type-checked** against the export's real signature.
-- Non-function `val` exports can be replaced too (`replace maxRetries = 99`).
-- A **spy** is a mock closing over a module-level `var` cell to record calls,
-  asserted after the run.
-- `replace` is permitted **only in a `*.test.lin`** — a hard error elsewhere, so a
-  shipped binary can never silently swap an import.
+#### `report`
 
-For worked examples, see `examples/processes/` (mock `exec`) and
-`examples/web-server/` (mock `std/fs` in the `/route` solver, and `render`).
+```lin
+val report = (s: Json): Int32
+```
+
+Print a suite's results and return the failure count. Unlike `run`, does NOT call `exit`, so
+statements after it run regardless of outcome — the building block for guaranteed afterAll
+teardown: `val failures = report(s); cleanup(); if failures > 0 then exit(1)`.
+- **`s`** — the suite from `suite`.
+- **Returns** the number of failed tests (0 = all passed). Skipped tests (from `--filter-test`) are
+  excluded from both pass and fail counts. When LIN_TEST_JSON is set, the human-readable lines
+  are suppressed and one NDJSON record is emitted per test (for `lin test --reporter json`); the
+  return value is identical in both modes.
+
+#### `run`
+
+```lin
+val run = (s: Json): Null
+```
+
+Run a suite: print results and `exit(1)` if any test failed (the common case — a non-zero status
+fails CI). For guaranteed post-run teardown even on failure, use `report` instead.
+- **`s`** — the suite from `suite`.
