@@ -15362,6 +15362,36 @@ print("arr=${totalArr} dep=${totalDep} stops=${stopCount}")
 }
 
 #[test]
+fn test_nested_sealed_array_field_direct_index() {
+    // REGRESSION (RAPTOR `routeScanner` hot path): DIRECT INDEXED access of a nested packed
+    // sealed-record-array field — `t["stopTimes"][i]["departureTime"]` where `t: Trip` and
+    // `Trip = { …, stopTimes: StopTime[] }`. The repr pass's `FieldGet`/`SealedArrayFieldGet`
+    // analyze arms previously did NOT classify a nested sealed-ARRAY field (only scalar / sum /
+    // sealed-struct), so `t["stopTimes"]` folded to `Boxed(Opaque)` while the old gate predicate +
+    // codegen read it `Packed(sealed array)` — a `repr.rs` oracle disagreement (debug panic) and a
+    // release-build SEGFAULT (codegen reads packed, repr says boxed → garbage pointer). Distinct
+    // from the `.for()` iteration path: this is the indexed read the scanner uses.
+    let out = run(r#"
+import { print } from "std/io"
+import { toString } from "std/string"
+import { push } from "std/array"
+type StopTime = { "stop": String, "arrivalTime": Int32, "departureTime": Int32 }
+type Trip = { "tripId": String, "stopTimes": StopTime[] }
+val trips: Trip[] = []
+push(trips, { "tripId": "t1", "stopTimes": [
+  { "stop": "A", "arrivalTime": 5, "departureTime": 7 },
+  { "stop": "B", "arrivalTime": 20, "departureTime": 22 }
+] })
+val t: Trip = trips[0]
+val st0: StopTime = t["stopTimes"][0]
+val st1: StopTime = t["stopTimes"][1]
+print("${st0["departureTime"]} ${st1["arrivalTime"]} ${st0["stop"]} ${st1["stop"]}")
+print(toString(t["stopTimes"][1]["departureTime"]))
+"#);
+    assert_eq!(out, vec!["7 20 A B", "22"]);
+}
+
+#[test]
 fn test_sealed_array_regression_flat_scalar_array_unchanged() {
     // REGRESSION: a flat scalar Int32[] (NOT a sealed-record array) must keep its flat
     // representation and behavior — the new SEALED_ARRAY_TAG path must not perturb flat arrays.
