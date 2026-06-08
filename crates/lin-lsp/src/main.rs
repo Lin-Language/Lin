@@ -3698,7 +3698,7 @@ fn expr_binds_name(expr: &lin_parse::ast::Expr, name: &str) -> bool {
                 || p.default.as_ref().map(|d| expr_binds_name(d, name)).unwrap_or(false))
                 || expr_binds_name(body, name)
         }
-        E::Block(stmts, tail, _) => {
+        E::Block(stmts, tail, _, _) => {
             stmts.iter().any(|s| stmt_binds_name(s, name, false)) || expr_binds_name(tail, name)
         }
         E::If { condition, then_branch, else_branch, .. } => {
@@ -3735,8 +3735,8 @@ fn expr_binds_name(expr: &lin_parse::ast::Expr, name: &str) -> bool {
         E::Index { object, key, .. } => {
             expr_binds_name(object, name) || expr_binds_name(key, name)
         }
-        E::Array(items, _) => items.iter().any(|i| expr_binds_name(i, name)),
-        E::Object(fields, _) => fields.iter().any(|f| {
+        E::Array(items, _, _) => items.iter().any(|i| expr_binds_name(i, name)),
+        E::Object(fields, _, _) => fields.iter().any(|f| {
             use lin_parse::ast::ObjectField;
             match f {
                 ObjectField::Pair(k, v) => expr_binds_name(k, name) || expr_binds_name(v, name),
