@@ -185,6 +185,24 @@ impl Type {
         self.is_integer() || self.is_float()
     }
 
+    /// THE single source of truth for Stage-3b sealed-record-array field packability (ADR-063): a
+    /// field of a sealed record may live inline in a contiguous, header-less element buffer
+    /// (`elem_tag` 0xFE) iff this returns true. Stage 3b lands by WIDENING this ONE predicate as the
+    /// verification harness clears each field shape — never by adding per-shape branches in the RC
+    /// implementation (the descriptor-driven primitives handle every heap-field kind uniformly).
+    ///
+    /// The four historical mirror sites — `Codegen::sealed_array_elem_field_packable`,
+    /// `lin_ir::lower::is_sealed_array_elem_field_packable`, `lin_ir::monomorphize::field_packed_scalar`,
+    /// and `lin_ir::repr::sealed_array_elem_field_packable` — now all delegate here, so the gate is a
+    /// SINGLE definition. Any disagreement between the lowerer's ownership/Coerce insertion and
+    /// codegen's physical layout would be a UAF / mis-read, which is exactly why this is centralised.
+    ///
+    /// CURRENTLY: scalars only (Stage 3a). See the gate rationale at
+    /// `Codegen::sealed_array_elem_field_packable` for the remaining whole-program blocker.
+    pub fn is_sealed_array_field_packable(&self) -> bool {
+        self.is_flat_scalar() || matches!(self, Type::Bool)
+    }
+
     /// Returns true for the dynamic "any" JSON type (TypeVar(u32::MAX)).
     pub fn is_json(&self) -> bool {
         matches!(self, Type::TypeVar(u32::MAX))
