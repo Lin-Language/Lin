@@ -185,7 +185,8 @@ impl LanguageServer for Backend {
         let doc = hover_doc(&source, uri, def_span, offset);
 
         // Signature on top (```lin fence), docs below (Markdown) — rust-analyzer/TS style.
-        let mut value = format!("```lin\n{}\n```", ty_str);
+        // Clean raw solver type-var ids (`?T9004`) into readable generic names before display.
+        let mut value = format!("```lin\n{}\n```", clean_type_string(&ty_str));
         if let Some(doc) = doc {
             let rendered = render_doc_markdown(&doc);
             if !rendered.is_empty() {
@@ -307,7 +308,7 @@ impl LanguageServer for Backend {
                             items.push(CompletionItem {
                                 label: name.to_string(),
                                 kind: Some(kind),
-                                detail: Some(ty_str.clone()),
+                                detail: Some(clean_type_string(ty_str)),
                                 // Stash a resolve key so `completion_resolve` can fill the doc
                                 // (lazily, for the selected item only) from this file's own decl.
                                 data: completion_resolve_data(uri, name),
@@ -386,7 +387,7 @@ impl LanguageServer for Backend {
             items.push(CompletionItem {
                 label: imp.name.clone(),
                 kind: Some(kind),
-                detail: imp.ty.clone(),
+                detail: imp.ty.as_deref().map(clean_type_string),
                 // Fallback documentation (the source module) shown until — and if — `completion_resolve`
                 // upgrades it to the symbol's rendered doc comment. The resolve key is the importing
                 // file + the local name, so the resolver walks the SAME cross-file path as hover.
@@ -395,6 +396,25 @@ impl LanguageServer for Backend {
                 ..Default::default()
             });
         }
+
+        // 5. UNIMPORTED stdlib combinators/methods in dot-context (FIX B). In addition to the
+        // already-imported symbols above, offer applicable stdlib exports the file hasn't imported
+        // yet — so `xs.map`/`xs.for`/`xs.filter` complete and inserting one ALSO adds its import.
+        // Gated by `dot_item_applies` against the receiver category (so a `.` doesn't dump the whole
+        // stdlib), deduped against names already offered (imported symbols + earlier candidates), and
+        // resolved lazily: the import `additionalTextEdits` + doc are filled in `completion_resolve`
+        // from the `{ module, name }` stash, keeping the offered list cheap.
+        if in_dot_context {
+            let already: HashSet<String> = items.iter().map(|i| i.label.clone()).collect();
+            items.extend(stdlib_dot_completion_items(
+                STDLIB_DOT_CANDIDATES.iter(),
+                receiver_category.as_deref().unwrap_or("any"),
+                prefix,
+                &already,
+                uri,
+            ));
+        }
+
         items.dedup_by(|a, b| a.label == b.label && a.detail == b.detail);
 
         Ok(Some(CompletionResponse::Array(items)))
@@ -417,17 +437,31 @@ impl LanguageServer for Backend {
         let base_dir = file_dir(&uri);
         let analysis = analyse(&source, base_dir.as_deref());
 
-        // Local declaration in this file first; then imports / own exports via the index.
-        let mut doc = local_decl_name_span(&analysis.module, &name)
-            .and_then(|span| extract_doc(&source, span))
-            .filter(|d| !d.is_empty());
-        if doc.is_none() {
-            if let Ok(path) = uri.to_file_path() {
-                let module_id = canonical_id(&path);
-                let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
-                doc = resolve_doc_via_index(&index, &module_id, &name).filter(|d| !d.is_empty());
+        // Unimported stdlib candidate (FIX B): the item carries an owner `module`. Attach the
+        // import edit (computed by the SAME `auto_import_edit` the auto-import code action uses, so
+        // they produce identical edits — merge into an existing import from the module, else a new
+        // line) and resolve the doc from the OWNER module rather than this file.
+        let candidate_module = parse_completion_resolve_module(item.data.as_ref());
+        let doc = if let Some(module) = candidate_module.as_deref() {
+            if let Some(edit) = auto_import_edit(&source, &name, module) {
+                item.additional_text_edits = Some(vec![edit]);
             }
-        }
+            let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
+            resolve_doc_via_index(&index, module, &name).filter(|d| !d.is_empty())
+        } else {
+            // Local declaration in this file first; then imports / own exports via the index.
+            let mut doc = local_decl_name_span(&analysis.module, &name)
+                .and_then(|span| extract_doc(&source, span))
+                .filter(|d| !d.is_empty());
+            if doc.is_none() {
+                if let Ok(path) = uri.to_file_path() {
+                    let module_id = canonical_id(&path);
+                    let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
+                    doc = resolve_doc_via_index(&index, &module_id, &name).filter(|d| !d.is_empty());
+                }
+            }
+            doc
+        };
 
         if let Some(doc) = doc {
             let rendered = render_doc_markdown(&doc);
@@ -1314,6 +1348,82 @@ fn extract_exports(module: &TypedModule) -> Vec<(String, Type)> {
         .collect()
 }
 
+// ── type-string display cleaning ──────────────────────────────────────────────
+
+/// Decimal text of `u32::MAX`, the `TypeVar` id the checker uses as the `Json` marker
+/// (`Type::is_json`). It Displays as `?T4294967295`, which we surface as `Json`.
+const JSON_TYPEVAR_DECIMAL: &str = "4294967295";
+
+/// Turn a rendered type string into a clean, user-facing one for display surfaces (completion
+/// `detail`, hover, signature help). The checker's `Type::Display` renders an unsolved/generic
+/// `TypeVar(id)` as the raw solver token `?T<id>` (and the `Json` marker — `TypeVar(u32::MAX)` —
+/// as `?T4294967295`). Those leak ugly internal ids like `?T9004` into the UI.
+///
+/// This rewrites every `?T<id>` token in the string:
+///   - the `Json` marker (`?T4294967295`) → `Json`;
+///   - any other id → a stable generic NAME `T`, `U`, `V`, … assigned in order of FIRST appearance,
+///     so the SAME id always maps to the SAME letter within one string and DISTINCT ids get distinct
+///     letters. After `Z` it falls back to `T1`, `T2`, … so it never collides or panics.
+///
+/// The mapping is per-string and deterministic in the id's textual position, NOT in the solver's
+/// id values — so the same signature renders identically regardless of solver run-order, and the
+/// transform is idempotent (its own output contains no `?T` tokens to rewrite again).
+fn clean_type_string(s: &str) -> String {
+    // Fast path: nothing to do when there's no `?T` token at all.
+    if !s.contains("?T") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    // id-text → assigned display name, so repeats of the same var reuse the same letter.
+    let mut assigned: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut next_index: usize = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Recognise the `?T<digits>` token shape.
+        if bytes[i] == b'?' && i + 1 < bytes.len() && bytes[i + 1] == b'T' {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 2 {
+                // We matched at least one digit → it's a TypeVar token.
+                let id_text = &s[i + 2..j];
+                if id_text == JSON_TYPEVAR_DECIMAL {
+                    out.push_str("Json");
+                } else {
+                    let name = assigned.entry(id_text.to_string()).or_insert_with(|| {
+                        let n = generic_name(next_index);
+                        next_index += 1;
+                        n
+                    });
+                    out.push_str(name);
+                }
+                i = j;
+                continue;
+            }
+        }
+        // Not a TypeVar token — copy the byte through. `s` is valid UTF-8 and we only ever advance
+        // past whole tokens or single bytes that are not the start of a multi-byte sequence here
+        // (`?` is ASCII), so pushing the char at `i` is safe.
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// The `n`-th generic display name: `T, U, V, W, X, Y, Z`, then `T1, T2, …` past `Z`.
+fn generic_name(n: usize) -> String {
+    // Single letters T..Z (7 names) cover essentially every real signature.
+    const LETTERS: &[u8] = b"TUVWXYZ";
+    if n < LETTERS.len() {
+        (LETTERS[n] as char).to_string()
+    } else {
+        format!("T{}", n - LETTERS.len() + 1)
+    }
+}
+
 // ── dot-completion helpers ────────────────────────────────────────────────────
 
 /// Returns `(in_dot_context, category)`.
@@ -1428,6 +1538,129 @@ fn first_param_category(sig: &str) -> Option<String> {
         }
     }
     Some(type_to_category(first.trim()).to_string())
+}
+
+// ── unimported stdlib dot-completion candidates (FIX B) ───────────────────────
+
+/// One stdlib export offered in dot-completion even when NOT yet imported. The completion handler
+/// turns it into an item whose accept inserts the bare method NAME plus an `import { name } from
+/// "module"` edit (computed by the shared `auto_import_edit`).
+#[derive(Clone)]
+struct StdlibCandidate {
+    /// Bare export name (the completion label, e.g. `map`).
+    name: String,
+    /// Owner stdlib module id (e.g. `std/iter`) — used for the import edit and doc resolution.
+    module: String,
+    /// Rendered (raw) type signature; cleaned for `detail` at item-build time via `clean_type_string`.
+    ty: String,
+}
+
+/// The stdlib modules whose exports we offer as unimported dot-completion candidates. SCOPE
+/// (deliberately narrow so a dot doesn't dump the whole stdlib): the combinator/method-bearing
+/// modules a user reaches for via `xs.method(...)` — receiver-polymorphic iterable combinators
+/// (`std/iter`: map/filter/reduce/for/range…), array ops (`std/array`: push/length/slice/sort…),
+/// string ops (`std/string`), and object ops (`std/object`: keys). Each candidate is still gated by
+/// `dot_item_applies` against the receiver category at offer time, so only relevant ones appear.
+const DOT_CANDIDATE_MODULES: &[&str] =
+    &["std/iter", "std/array", "std/string", "std/object"];
+
+/// All offered stdlib dot-completion candidates, computed ONCE from the embedded stdlib sources
+/// (which are static, so this never goes stale) and memoised. Type-checks each candidate module via
+/// the same `pre_resolve_imports` + `extract_exports` path the import-type map uses, so the rendered
+/// signatures match what completion/hover show for the already-imported case.
+static STDLIB_DOT_CANDIDATES: std::sync::LazyLock<Vec<StdlibCandidate>> =
+    std::sync::LazyLock::new(build_stdlib_dot_candidates);
+
+fn build_stdlib_dot_candidates() -> Vec<StdlibCandidate> {
+    let mut out = Vec::new();
+    for &module in DOT_CANDIDATE_MODULES {
+        for (name, ty) in stdlib_module_exports(module) {
+            out.push(StdlibCandidate { name, module: module.to_string(), ty: ty.to_string() });
+        }
+    }
+    out
+}
+
+/// Build the unimported-stdlib dot-completion items (FIX B) for the given `receiver_cat` from a set
+/// of `candidates`. Pure over its inputs (no I/O), so the offer/gate/dedupe logic is unit-testable.
+///
+/// A candidate is offered when ALL hold:
+///   - its name starts with the typed `prefix`;
+///   - its name is NOT already offered (`already`, which the caller seeds with imported symbols +
+///     local bindings) — so an already-imported `map` isn't listed twice;
+///   - it is function-shaped (`=>` in the signature) — a bare value isn't a dot-method;
+///   - `dot_item_applies(receiver_cat, first_param_category)` — gating by receiver category so a
+///     `.` doesn't dump the whole stdlib (e.g. a `string`-first-param method is dropped on an array).
+///
+/// The label is the bare NAME (plain identifier insert, no arg snippet). The `detail` uses the FIX A
+/// clean renderer (no raw `?T` ids). The import edit + doc are attached lazily in `completion_resolve`
+/// from the `{ module, name }` stash, so building the list stays cheap.
+fn stdlib_dot_completion_items<'a>(
+    candidates: impl Iterator<Item = &'a StdlibCandidate>,
+    receiver_cat: &str,
+    prefix: &str,
+    already: &HashSet<String>,
+    uri: &Url,
+) -> Vec<CompletionItem> {
+    let mut out = Vec::new();
+    for cand in candidates {
+        if !cand.name.starts_with(prefix) || already.contains(&cand.name) {
+            continue;
+        }
+        if !cand.ty.contains("=>") {
+            continue;
+        }
+        let first_param_cat = first_param_category(&cand.ty);
+        if !dot_item_applies(receiver_cat, first_param_cat.as_deref()) {
+            continue;
+        }
+        out.push(CompletionItem {
+            label: cand.name.clone(),
+            kind: Some(CompletionItemKind::FUNCTION),
+            detail: Some(format!("{}  (from {})", clean_type_string(&cand.ty), cand.module)),
+            documentation: Some(Documentation::String(format!("from {}", cand.module))),
+            data: completion_resolve_data_stdlib(uri, &cand.name, &cand.module),
+            ..Default::default()
+        });
+    }
+    out
+}
+
+/// Type-check a single stdlib module (resolving its own imports first) and return its `val` exports
+/// as `(name, Type)`. Returns empty on a parse/check failure (degrades gracefully — the dot-
+/// completion just won't offer that module's symbols).
+fn stdlib_module_exports(module_id: &str) -> Vec<(String, Type)> {
+    let Some(src) = stdlib_source(module_id) else {
+        return Vec::new();
+    };
+    let mut lexer = lin_lex::Lexer::new(src, 0);
+    let tokens = lexer.tokenize();
+    let mut parser = lin_parse::Parser::new(tokens);
+    let ast = parser.parse_module();
+
+    // Resolve the module's own imports (e.g. std/iter -> intrinsics) so it type-checks. stdlib ids
+    // are absolute, so the base dir is unused for resolution.
+    let base = PathBuf::from(".");
+    let mut cache: HashMap<String, TypedModule> = HashMap::new();
+    let mut visiting: HashSet<String> = HashSet::new();
+    pre_resolve_imports(&ast, &base, &mut cache, &mut visiting);
+
+    let mut import_type_map: HashMap<(String, String), Type> = HashMap::new();
+    for (dep_path, dep_module) in cache.iter() {
+        for (name, ty) in extract_exports(dep_module) {
+            import_type_map.insert((dep_path.clone(), name), ty);
+        }
+    }
+
+    let mut checker = Checker::new();
+    checker.import_types = import_type_map;
+    // Trusted stdlib: it legitimately references `lin_*` intrinsics and forwards Json (ADR-060).
+    checker.lenient_json = true;
+    checker.allow_intrinsics = true;
+    match checker.check_module(&ast) {
+        Ok(typed) => extract_exports(&typed),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// True when `offset` sits inside a string literal or a `//` line comment, so identifier/keyword
@@ -3034,6 +3267,14 @@ fn completion_resolve_data(uri: &Url, name: &str) -> Option<serde_json::Value> {
     Some(serde_json::json!({ "uri": uri.to_string(), "name": name }))
 }
 
+/// `data` payload for an UNIMPORTED stdlib dot-completion candidate (FIX B): the originating file
+/// URI, the export name, and the owner module. `completion_resolve` uses `module` to (a) compute the
+/// `additionalTextEdits` import edit via the shared `auto_import_edit` and (b) resolve the doc from
+/// the owner module rather than this file.
+fn completion_resolve_data_stdlib(uri: &Url, name: &str, module: &str) -> Option<serde_json::Value> {
+    Some(serde_json::json!({ "uri": uri.to_string(), "name": name, "module": module }))
+}
+
 /// Parse the `{ uri, name }` key stashed by `completion_resolve_data` back into `(Url, name)`.
 /// Returns `None` for an absent/malformed payload (the item then resolves to itself unchanged).
 fn parse_completion_resolve_data(data: Option<&serde_json::Value>) -> Option<(Url, String)> {
@@ -3042,6 +3283,13 @@ fn parse_completion_resolve_data(data: Option<&serde_json::Value>) -> Option<(Ur
     let name = data.get("name")?.as_str()?;
     let uri = Url::parse(uri).ok()?;
     Some((uri, name.to_string()))
+}
+
+/// Read the owner `module` from a stdlib-candidate `data` payload (set by
+/// `completion_resolve_data_stdlib`). `None` for non-candidate items (the ordinary local/imported
+/// resolve path is taken instead).
+fn parse_completion_resolve_module(data: Option<&serde_json::Value>) -> Option<String> {
+    data?.get("module")?.as_str().map(|s| s.to_string())
 }
 
 // ── signature help ─────────────────────────────────────────────────────────────
@@ -3065,8 +3313,10 @@ fn signature_help(
     let (callee_span, paren_after) = find_enclosing_call(&analysis.module.statements, source, offset)?;
 
     // Resolve the callee's type via the type map (the callee is an identifier use-site).
+    // Clean the WHOLE signature once up front so raw solver type-var ids (`?T9004`) become readable
+    // generic names (`T`/`U`/…) consistently across both the params and the return tail below.
     let ty_str = tightest_span(&analysis.span_type_map, callee_span.start as usize)
-        .map(|(_, s, _)| s.clone())?;
+        .map(|(_, s, _)| clean_type_string(s))?;
     // Only function-typed callees produce a signature.
     let param_types = function_param_types(&ty_str)?;
 
@@ -3472,10 +3722,10 @@ fn inlay_hints(source: &str, analysis: &Analysis) -> Vec<InlayHint> {
 
     let mut hints = Vec::new();
     for (name_span, ty_str) in anchors {
-        // Don't emit a hint when the type couldn't be rendered usefully (unsolved inference var).
-        if ty_str.starts_with("?T") {
-            continue;
-        }
+        // Render raw solver type-var ids into readable generic names (`?T9004` → `T`, the `Json`
+        // marker → `Json`) so an inferred generic/Json binding shows a clean hint instead of being
+        // suppressed. `clean_type_string` is a no-op on already-concrete types.
+        let ty_str = clean_type_string(&ty_str);
         let position = offset_to_position(source, name_span.end as usize);
         hints.push(InlayHint {
             position,
@@ -4718,6 +4968,171 @@ mod tests {
         // String receiver: BOTH apply (poly always, upper because its first param is string).
         assert!(dot_item_applies("string", poly.ty.as_deref().and_then(first_param_category).as_deref()));
         assert!(dot_item_applies("string", stronly.ty.as_deref().and_then(first_param_category).as_deref()));
+    }
+
+    /// FIX A: raw solver type-var ids (`?T9004`) render as clean, stable generic names. The same
+    /// id repeated maps to the same letter; distinct ids get distinct letters in first-appearance
+    /// order; the `Json` marker (`?T4294967295`) renders as `Json`; and the transform is idempotent.
+    #[test]
+    fn clean_type_string_renders_generic_names() {
+        // Distinct vars → distinct letters in first-appearance order; same var → same letter.
+        let sig = "(?T9004[] | Iterator | Stream, (?T9004, Int32) => ?T9005) => ?T9005[]";
+        let cleaned = clean_type_string(sig);
+        assert_eq!(cleaned, "(T[] | Iterator | Stream, (T, Int32) => U) => U[]");
+        // No raw `?T` token or solver id digits survive.
+        assert!(!cleaned.contains("?T"), "raw type-var token leaked: {cleaned}");
+        assert!(!cleaned.contains("9004") && !cleaned.contains("9005"));
+        // Stable: the assignment is positional, not dependent on the (arbitrary) id VALUES, so a
+        // higher id appearing FIRST still becomes `T`.
+        assert_eq!(clean_type_string("(?T42, ?T7) => ?T7"), "(T, U) => U");
+        // Idempotent: re-cleaning the output is a no-op.
+        assert_eq!(clean_type_string(&cleaned), cleaned);
+        // The Json marker (`TypeVar(u32::MAX)`) renders as `Json`, not a giant letter index.
+        assert_eq!(clean_type_string("(?T4294967295) => String"), "(Json) => String");
+        // A concrete type is passed through untouched (fast path, no `?T`).
+        assert_eq!(clean_type_string("(String, Int32) => Boolean"), "(String, Int32) => Boolean");
+        // A real checker-rendered generic `Type` cleans to letters too (end-to-end via Display).
+        let ty = Type::Function {
+            params: vec![Type::TypeVar(9004), Type::TypeVar(9005)],
+            ret: Box::new(Type::Array(Box::new(Type::TypeVar(9004)))),
+            required: 2,
+        };
+        assert_eq!(clean_type_string(&ty.to_string()), "(T, U) => T[]");
+    }
+
+    // ── FIX B: unimported stdlib combinators in dot-completion ───────────────────
+
+    /// Test helpers: a tiny URI and a `StdlibCandidate` builder so the offer/gate/dedupe path can be
+    /// driven directly (the real list comes from `STDLIB_DOT_CANDIDATES`, exercised below).
+    fn fixb_uri() -> Url {
+        Url::parse("file:///tmp/fixb.lin").unwrap()
+    }
+    fn cand(name: &str, module: &str, ty: &str) -> StdlibCandidate {
+        StdlibCandidate { name: name.to_string(), module: module.to_string(), ty: ty.to_string() }
+    }
+    /// Find the candidate offered (by label) in a built item list, if any.
+    fn item_named<'a>(items: &'a [CompletionItem], name: &str) -> Option<&'a CompletionItem> {
+        items.iter().find(|i| i.label == name)
+    }
+
+    /// `map` IS offered on an array receiver, labelled with the bare NAME (a plain identifier insert,
+    /// no `insert_text`/snippet), with a clean `detail` (no raw `?T`) noting its source module, and a
+    /// `data` payload carrying the owner module so `completion_resolve` can attach the import edit.
+    #[test]
+    fn stdlib_dot_offers_map_on_array_receiver() {
+        // The real `map` signature (first param `?T[] | Iterator | Stream`) → category "array".
+        let cands = vec![cand(
+            "map",
+            "std/iter",
+            "(?T9002[] | Iterator<?T4294967295> | Stream<?T4294967295>, (?T9002, Int32) => ?T9003) => ?T9003[]",
+        )];
+        let already = HashSet::new();
+        let items = stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri());
+        let map = item_named(&items, "map").expect("`map` must be offered on an array receiver");
+        // Plain identifier insert — no snippet/insert_text.
+        assert!(map.insert_text.is_none(), "must insert the bare NAME, not a snippet");
+        assert_eq!(map.kind, Some(CompletionItemKind::FUNCTION));
+        // Clean detail (FIX A): no raw solver ids leak; the source module is shown.
+        let detail = map.detail.as_deref().unwrap();
+        assert!(!detail.contains("?T"), "raw type-var token leaked into detail: {detail}");
+        assert!(detail.contains("(from std/iter)"), "detail should note the source module: {detail}");
+        // The resolve payload carries the owner module (so the import edit can be attached lazily).
+        assert_eq!(parse_completion_resolve_module(map.data.as_ref()).as_deref(), Some("std/iter"));
+    }
+
+    /// Accepting an offered candidate yields the import edit via the SHARED `auto_import_edit` (the
+    /// same fn the auto-import code action uses). With no existing std/iter import, it adds a new line.
+    #[test]
+    fn stdlib_dot_import_edit_adds_new_line_when_module_unimported() {
+        let src = "val xs = [1, 2, 3]\n";
+        let edit = auto_import_edit(src, "map", "std/iter").expect("expected a new-import edit");
+        assert!(
+            edit.new_text.contains("import { map } from \"std/iter\""),
+            "expected a new std/iter import line, got: {:?}",
+            edit.new_text
+        );
+    }
+
+    /// The import edit MERGES into an existing `import { ... } from "std/iter"` rather than adding a
+    /// second line — `, map` is inserted into the existing brace list (shared `auto_import_edit`).
+    #[test]
+    fn stdlib_dot_import_edit_merges_into_existing_iter_import() {
+        let src = "import { filter } from \"std/iter\"\nval xs = [1, 2, 3]\n";
+        let edit = auto_import_edit(src, "map", "std/iter").expect("expected a merge edit");
+        // A merge inserts `, map` (an append into the existing brace list), NOT a whole new line.
+        assert_eq!(edit.new_text, ", map");
+        // …on the existing import's line (line 0), so no duplicate `import ... std/iter` line is added.
+        assert_eq!(edit.range.start.line, 0);
+        assert!(!edit.new_text.contains("import"), "merge must not emit a second import line");
+    }
+
+    /// Dedupe: a candidate whose name is ALREADY offered (imported symbol / earlier candidate, seeded
+    /// into `already`) is NOT listed a second time.
+    #[test]
+    fn stdlib_dot_dedupes_already_offered() {
+        let cands = vec![cand("map", "std/iter", "(?T9002[], (?T9002, Int32) => ?T9003) => ?T9003[]")];
+        let mut already = HashSet::new();
+        already.insert("map".to_string());
+        let items = stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri());
+        assert!(item_named(&items, "map").is_none(), "an already-offered `map` must not be re-offered");
+    }
+
+    /// Gating: a candidate whose first-param category doesn't match the receiver is NOT offered, so a
+    /// `.` doesn't dump the whole stdlib. `range` (`(Int32, Int32) => …`, category "number") is dropped
+    /// on an array receiver; `map` (first param category "array") is dropped on a string receiver.
+    #[test]
+    fn stdlib_dot_gates_by_receiver_category() {
+        let cands = vec![
+            cand("range", "std/iter", "(Int32, Int32) => Iterator<Int32>"),
+            cand("map", "std/iter", "(?T9002[] | Iterator<?T4294967295> | Stream<?T4294967295>, (?T9002, Int32) => ?T9003) => ?T9003[]"),
+        ];
+        let already = HashSet::new();
+        // Array receiver: `range` (number first param) is gated OUT; `map` (array) is kept.
+        let on_array = stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri());
+        assert!(item_named(&on_array, "range").is_none(), "`range` must be gated out on an array receiver");
+        assert!(item_named(&on_array, "map").is_some(), "`map` should be offered on an array receiver");
+        // String receiver: `map` (array first param) is gated OUT.
+        let on_string = stdlib_dot_completion_items(cands.iter(), "string", "", &already, &fixb_uri());
+        assert!(item_named(&on_string, "map").is_none(), "`map` (array first param) must be gated out on a string receiver");
+    }
+
+    /// The user's reported failure: `for` IS offered on an array receiver. `for`'s first param renders
+    /// as the `Json` marker → category "any" → applies to every receiver (the `xs.for(...)` idiom).
+    #[test]
+    fn stdlib_dot_offers_for_on_array_receiver() {
+        let cands = vec![cand(
+            "for",
+            "std/iter",
+            "(?T4294967295, (?T4294967295, Int32) => ?T4294967295) => Null",
+        )];
+        let already = HashSet::new();
+        let items = stdlib_dot_completion_items(cands.iter(), "array", "", &already, &fixb_uri());
+        let for_item = item_named(&items, "for").expect("`for` must be offered on an array receiver");
+        assert_eq!(parse_completion_resolve_module(for_item.data.as_ref()).as_deref(), Some("std/iter"));
+    }
+
+    /// End-to-end over the REAL embedded stdlib: the memoised candidate set built from the actual
+    /// stdlib sources offers `map`/`filter`/`for` on an array receiver (each owned by std/iter), proves
+    /// the build path type-checks the modules, and confirms the prefix filter narrows the list.
+    #[test]
+    fn stdlib_dot_real_candidates_offer_iter_combinators_on_array() {
+        let already = HashSet::new();
+        let items = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", "", &already, &fixb_uri());
+        for name in ["map", "filter", "for"] {
+            let it = item_named(&items, name)
+                .unwrap_or_else(|| panic!("`{name}` should be offered on an array receiver from the real stdlib"));
+            assert_eq!(
+                parse_completion_resolve_module(it.data.as_ref()).as_deref(),
+                Some("std/iter"),
+                "`{name}` should be owned by std/iter"
+            );
+        }
+        // `range` (number first param) is gated out even from the real set.
+        assert!(item_named(&items, "range").is_none(), "`range` must be gated out on an array receiver");
+        // Prefix filter: only `map` survives a "ma" prefix.
+        let only_ma = stdlib_dot_completion_items(STDLIB_DOT_CANDIDATES.iter(), "array", "ma", &already, &fixb_uri());
+        assert!(item_named(&only_ma, "map").is_some());
+        assert!(item_named(&only_ma, "filter").is_none(), "prefix `ma` must exclude `filter`");
     }
 
     /// Cyclic import graph (A imports B, B imports A) must terminate, not
