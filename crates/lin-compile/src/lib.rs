@@ -811,13 +811,13 @@ fn walk_expr(expr: &lin_parse::ast::Expr, f: &mut impl FnMut(&lin_parse::ast::Ex
                 go!(&arm.body);
             }
         }
-        Expr::Block(stmts, tail, _) => {
+        Expr::Block(stmts, tail, _, _) => {
             for s in stmts { walk_stmt_exprs(s, f); }
             go!(tail);
         }
         Expr::Function { body, .. } => go!(body),
-        Expr::Array(elems, _) => for e in elems { go!(e); },
-        Expr::Object(fields, _) => for field in fields {
+        Expr::Array(elems, _, _) => for e in elems { go!(e); },
+        Expr::Object(fields, _, _) => for field in fields {
             match field {
                 ObjectField::Pair(k, v) => { go!(k); go!(v); }
                 ObjectField::Spread(e) => go!(e),

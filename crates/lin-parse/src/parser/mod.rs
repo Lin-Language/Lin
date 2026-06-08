@@ -138,6 +138,20 @@ impl Parser {
         }
     }
 
+    /// Span of the most-recently-consumed token (the one just before the cursor). Used to
+    /// recover the full extent of a delimiter-closed compound node after its closing token has
+    /// been consumed via `expect(...)`/`advance()`. Returns `Span::dummy()` at the start of the
+    /// stream. Does NOT alter the cursor — pure lookbehind. This feeds the additive
+    /// `Expr::full_span` only; the unchanged `span` is still snapshotted from `current_span()`
+    /// at the node's opening token.
+    pub(crate) fn prev_span(&self) -> Span {
+        if self.pos == 0 {
+            Span::dummy()
+        } else {
+            self.tokens[self.pos - 1].span
+        }
+    }
+
     /// 1-based source column of the current token (0 at end of stream). Used ONLY by the
     /// inline-block / control-flow-branch parsers to apply the offside rule inside `()`/`[]`/`{}`
     /// where ADR-003 suppresses Indent/Dedent/Newline. Does not consult or alter the token
