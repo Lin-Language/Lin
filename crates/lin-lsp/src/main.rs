@@ -185,7 +185,8 @@ impl LanguageServer for Backend {
         let doc = hover_doc(&source, uri, def_span, offset);
 
         // Signature on top (```lin fence), docs below (Markdown) — rust-analyzer/TS style.
-        let mut value = format!("```lin\n{}\n```", ty_str);
+        // Clean raw solver type-var ids (`?T9004`) into readable generic names before display.
+        let mut value = format!("```lin\n{}\n```", clean_type_string(&ty_str));
         if let Some(doc) = doc {
             let rendered = render_doc_markdown(&doc);
             if !rendered.is_empty() {
@@ -307,7 +308,7 @@ impl LanguageServer for Backend {
                             items.push(CompletionItem {
                                 label: name.to_string(),
                                 kind: Some(kind),
-                                detail: Some(ty_str.clone()),
+                                detail: Some(clean_type_string(ty_str)),
                                 // Stash a resolve key so `completion_resolve` can fill the doc
                                 // (lazily, for the selected item only) from this file's own decl.
                                 data: completion_resolve_data(uri, name),
@@ -386,7 +387,7 @@ impl LanguageServer for Backend {
             items.push(CompletionItem {
                 label: imp.name.clone(),
                 kind: Some(kind),
-                detail: imp.ty.clone(),
+                detail: imp.ty.as_deref().map(clean_type_string),
                 // Fallback documentation (the source module) shown until — and if — `completion_resolve`
                 // upgrades it to the symbol's rendered doc comment. The resolve key is the importing
                 // file + the local name, so the resolver walks the SAME cross-file path as hover.
@@ -1312,6 +1313,82 @@ fn extract_exports(module: &TypedModule) -> Vec<(String, Type)> {
             _ => None,
         })
         .collect()
+}
+
+// ── type-string display cleaning ──────────────────────────────────────────────
+
+/// Decimal text of `u32::MAX`, the `TypeVar` id the checker uses as the `Json` marker
+/// (`Type::is_json`). It Displays as `?T4294967295`, which we surface as `Json`.
+const JSON_TYPEVAR_DECIMAL: &str = "4294967295";
+
+/// Turn a rendered type string into a clean, user-facing one for display surfaces (completion
+/// `detail`, hover, signature help). The checker's `Type::Display` renders an unsolved/generic
+/// `TypeVar(id)` as the raw solver token `?T<id>` (and the `Json` marker — `TypeVar(u32::MAX)` —
+/// as `?T4294967295`). Those leak ugly internal ids like `?T9004` into the UI.
+///
+/// This rewrites every `?T<id>` token in the string:
+///   - the `Json` marker (`?T4294967295`) → `Json`;
+///   - any other id → a stable generic NAME `T`, `U`, `V`, … assigned in order of FIRST appearance,
+///     so the SAME id always maps to the SAME letter within one string and DISTINCT ids get distinct
+///     letters. After `Z` it falls back to `T1`, `T2`, … so it never collides or panics.
+///
+/// The mapping is per-string and deterministic in the id's textual position, NOT in the solver's
+/// id values — so the same signature renders identically regardless of solver run-order, and the
+/// transform is idempotent (its own output contains no `?T` tokens to rewrite again).
+fn clean_type_string(s: &str) -> String {
+    // Fast path: nothing to do when there's no `?T` token at all.
+    if !s.contains("?T") {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    // id-text → assigned display name, so repeats of the same var reuse the same letter.
+    let mut assigned: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut next_index: usize = 0;
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Recognise the `?T<digits>` token shape.
+        if bytes[i] == b'?' && i + 1 < bytes.len() && bytes[i + 1] == b'T' {
+            let mut j = i + 2;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 2 {
+                // We matched at least one digit → it's a TypeVar token.
+                let id_text = &s[i + 2..j];
+                if id_text == JSON_TYPEVAR_DECIMAL {
+                    out.push_str("Json");
+                } else {
+                    let name = assigned.entry(id_text.to_string()).or_insert_with(|| {
+                        let n = generic_name(next_index);
+                        next_index += 1;
+                        n
+                    });
+                    out.push_str(name);
+                }
+                i = j;
+                continue;
+            }
+        }
+        // Not a TypeVar token — copy the byte through. `s` is valid UTF-8 and we only ever advance
+        // past whole tokens or single bytes that are not the start of a multi-byte sequence here
+        // (`?` is ASCII), so pushing the char at `i` is safe.
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// The `n`-th generic display name: `T, U, V, W, X, Y, Z`, then `T1, T2, …` past `Z`.
+fn generic_name(n: usize) -> String {
+    // Single letters T..Z (7 names) cover essentially every real signature.
+    const LETTERS: &[u8] = b"TUVWXYZ";
+    if n < LETTERS.len() {
+        (LETTERS[n] as char).to_string()
+    } else {
+        format!("T{}", n - LETTERS.len() + 1)
+    }
 }
 
 // ── dot-completion helpers ────────────────────────────────────────────────────
@@ -3065,8 +3142,10 @@ fn signature_help(
     let (callee_span, paren_after) = find_enclosing_call(&analysis.module.statements, source, offset)?;
 
     // Resolve the callee's type via the type map (the callee is an identifier use-site).
+    // Clean the WHOLE signature once up front so raw solver type-var ids (`?T9004`) become readable
+    // generic names (`T`/`U`/…) consistently across both the params and the return tail below.
     let ty_str = tightest_span(&analysis.span_type_map, callee_span.start as usize)
-        .map(|(_, s, _)| s.clone())?;
+        .map(|(_, s, _)| clean_type_string(s))?;
     // Only function-typed callees produce a signature.
     let param_types = function_param_types(&ty_str)?;
 
@@ -3472,10 +3551,10 @@ fn inlay_hints(source: &str, analysis: &Analysis) -> Vec<InlayHint> {
 
     let mut hints = Vec::new();
     for (name_span, ty_str) in anchors {
-        // Don't emit a hint when the type couldn't be rendered usefully (unsolved inference var).
-        if ty_str.starts_with("?T") {
-            continue;
-        }
+        // Render raw solver type-var ids into readable generic names (`?T9004` → `T`, the `Json`
+        // marker → `Json`) so an inferred generic/Json binding shows a clean hint instead of being
+        // suppressed. `clean_type_string` is a no-op on already-concrete types.
+        let ty_str = clean_type_string(&ty_str);
         let position = offset_to_position(source, name_span.end as usize);
         hints.push(InlayHint {
             position,
@@ -4718,6 +4797,36 @@ mod tests {
         // String receiver: BOTH apply (poly always, upper because its first param is string).
         assert!(dot_item_applies("string", poly.ty.as_deref().and_then(first_param_category).as_deref()));
         assert!(dot_item_applies("string", stronly.ty.as_deref().and_then(first_param_category).as_deref()));
+    }
+
+    /// FIX A: raw solver type-var ids (`?T9004`) render as clean, stable generic names. The same
+    /// id repeated maps to the same letter; distinct ids get distinct letters in first-appearance
+    /// order; the `Json` marker (`?T4294967295`) renders as `Json`; and the transform is idempotent.
+    #[test]
+    fn clean_type_string_renders_generic_names() {
+        // Distinct vars → distinct letters in first-appearance order; same var → same letter.
+        let sig = "(?T9004[] | Iterator | Stream, (?T9004, Int32) => ?T9005) => ?T9005[]";
+        let cleaned = clean_type_string(sig);
+        assert_eq!(cleaned, "(T[] | Iterator | Stream, (T, Int32) => U) => U[]");
+        // No raw `?T` token or solver id digits survive.
+        assert!(!cleaned.contains("?T"), "raw type-var token leaked: {cleaned}");
+        assert!(!cleaned.contains("9004") && !cleaned.contains("9005"));
+        // Stable: the assignment is positional, not dependent on the (arbitrary) id VALUES, so a
+        // higher id appearing FIRST still becomes `T`.
+        assert_eq!(clean_type_string("(?T42, ?T7) => ?T7"), "(T, U) => U");
+        // Idempotent: re-cleaning the output is a no-op.
+        assert_eq!(clean_type_string(&cleaned), cleaned);
+        // The Json marker (`TypeVar(u32::MAX)`) renders as `Json`, not a giant letter index.
+        assert_eq!(clean_type_string("(?T4294967295) => String"), "(Json) => String");
+        // A concrete type is passed through untouched (fast path, no `?T`).
+        assert_eq!(clean_type_string("(String, Int32) => Boolean"), "(String, Int32) => Boolean");
+        // A real checker-rendered generic `Type` cleans to letters too (end-to-end via Display).
+        let ty = Type::Function {
+            params: vec![Type::TypeVar(9004), Type::TypeVar(9005)],
+            ret: Box::new(Type::Array(Box::new(Type::TypeVar(9004)))),
+            required: 2,
+        };
+        assert_eq!(clean_type_string(&ty.to_string()), "(T, U) => T[]");
     }
 
     /// Cyclic import graph (A imports B, B imports A) must terminate, not
