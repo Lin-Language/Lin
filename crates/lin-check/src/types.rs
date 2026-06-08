@@ -197,8 +197,20 @@ impl Type {
     /// SINGLE definition. Any disagreement between the lowerer's ownership/Coerce insertion and
     /// codegen's physical layout would be a UAF / mis-read, which is exactly why this is centralised.
     ///
-    /// CURRENTLY: scalars only (Stage 3a). See the gate rationale at
-    /// `Codegen::sealed_array_elem_field_packable` for the remaining whole-program blocker.
+    /// CURRENTLY: scalars + Bool only (Stage 3a). Widening to `String` was ATTEMPTED (Stage 3b
+    /// step 1, 2026-06-08) and proved UNSAFE on the DYNAMIC-READ path, so it is held back:
+    ///   - The mechanism-(i) materialize-on-read (`materialize_sealed_elem_boxed`) AND the
+    ///     whole-array widen-to-`Json` (`sealed_array_to_tagged`/`__sealedarrmat`) paths LEAK the
+    ///     materialized `LinObject` per dynamic read (~100-180 B/call linear under ASan). This leak
+    ///     is PRE-EXISTING for scalar packed arrays read via `Json` too (verified on master
+    ///     f2ba971: `val j: Json = ts; j[i]` leaks identically) -- String widening only makes more
+    ///     programs hit it (and adds the retained `*LinString` to each leaked object).
+    ///   - With String packed, RAPTOR REGRESSES in CORRECTNESS: its digest changes from
+    ///     `dep=29400 arr=40680 legs=3 count=1` to `legs=4 count=2` (a wrong extra journey).
+    /// Re-enable by adding `|| self.is_string_ish()` here ONLY AFTER (a) the dynamic-read
+    /// materialize leak is fixed AND (b) the RAPTOR digest stays byte-identical. The descriptor-
+    /// driven RC primitives + `clone_sealed_array` thread-transfer are already String-complete and
+    /// harness-green for the LOCAL (non-dynamic-read) String cells; the blocker is the dynamic read.
     pub fn is_sealed_array_field_packable(&self) -> bool {
         self.is_flat_scalar() || matches!(self, Type::Bool)
     }

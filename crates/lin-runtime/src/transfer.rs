@@ -88,8 +88,67 @@ unsafe fn clone_sealed(src: *const u8) -> *mut u8 {
     fresh
 }
 
-/// Deep-copy a `LinArray`, flat or tagged. Flat scalar arrays copy their raw buffer; tagged
-/// arrays recursively transfer each element.
+/// Deep-copy a SEALED-RECORD packed array (`elem_tag == 0xFE`, ADR-063 Stage 3b) for cross-thread
+/// transfer. Share-nothing: allocate a fresh `0xFE` array with the SAME `elem_stride`, `elem_desc`
+/// (heap-only RC descriptor) and `elem_named_desc` (the boxed-reader materialise descriptor),
+/// byte-copy the contiguous packed element buffer (every SCALAR field correct in one move), then —
+/// for each element — DEEP-CLONE each heap field listed in the descriptor, overwriting the aliased
+/// pointer with a private +1 copy. This mirrors `clone_sealed` (a standalone struct) but over a
+/// header-LESS element payload, so field offsets are rebased by `-SEALED_HEADER` exactly like
+/// `release_sealed_array_elems` / `release_payload_fields`. A scalar-only record (NULL `elem_desc`)
+/// is a pure buffer copy (no inner heap to clone). The fresh array has refcount 1; each cloned heap
+/// field is +1 owned by its element slot — so the worker's later `lin_array_release` (which walks
+/// the same descriptor via `release_sealed_array_elems`) frees them exactly once, on the worker.
+unsafe fn clone_sealed_array(src: *const LinArray) -> *mut LinArray {
+    let len = (*src).len;
+    let stride = (*src).elem_stride;
+    let desc = (*src).elem_desc;
+    let named = (*src).elem_named_desc;
+    // Allocate a fresh 0xFE array of the same stride/desc, capacity >= len.
+    let dst = crate::array::lin_sealed_array_alloc(len.max(4), stride, desc, named);
+    (*dst).len = len;
+    // Byte-copy the packed element buffer verbatim. Scalars are now correct; heap-field pointer
+    // slots currently ALIAS the source's payloads — fixed per element below.
+    if len > 0 && stride > 0 {
+        std::ptr::copy_nonoverlapping(
+            (*src).data as *const u8,
+            (*dst).data as *mut u8,
+            (len * stride) as usize,
+        );
+    }
+    // Deep-clone each element's heap fields, replacing each aliased pointer with a private +1 copy.
+    // NULL desc (scalar-only) -> nothing to do.
+    if !desc.is_null() {
+        let count = *(desc as *const u32);
+        let entries = desc.add(4);
+        for ei in 0..len as usize {
+            let payload = ((*dst).data as *mut u8).add(ei * stride as usize);
+            for fi in 0..count as usize {
+                let ent = entries.add(fi * 8);
+                let offset = *(ent as *const u32) as usize;
+                let kind = *((ent.add(4)) as *const u32);
+                // Element offsets are payload-relative; the descriptor stores struct-relative ones.
+                let slot = payload.add(offset - crate::sealed::SEALED_HEADER) as *mut *mut u8;
+                let p = *slot;
+                if p.is_null() {
+                    continue;
+                }
+                let cloned: *mut u8 = match kind {
+                    crate::sealed::KIND_STRING => clone_string(p as *const LinString) as *mut u8,
+                    crate::sealed::KIND_ARRAY => clone_array(p as *const LinArray) as *mut u8,
+                    crate::sealed::KIND_SEALED => clone_sealed(p),
+                    _ => p,
+                };
+                *slot = cloned;
+            }
+        }
+    }
+    dst
+}
+
+/// Deep-copy a `LinArray`, flat, tagged, or sealed-packed. Flat scalar arrays copy their raw buffer;
+/// tagged arrays recursively transfer each element; sealed-packed (`0xFE`) arrays deep-copy the
+/// packed buffer + each element's heap fields (`clone_sealed_array`).
 pub(crate) unsafe fn clone_array(src: *const LinArray) -> *mut LinArray {
     if src.is_null() {
         return std::ptr::null_mut();
@@ -102,6 +161,13 @@ pub(crate) unsafe fn clone_array(src: *const LinArray) -> *mut LinArray {
     }
     let len = (*src).len;
     let elem_tag = (*src).elem_tag;
+    if elem_tag == crate::array::SEALED_ARRAY_TAG {
+        // Sealed-record packed array: deep-copy the packed buffer + each element's heap fields,
+        // preserving stride/desc/named_desc. `lin_array_clone_flat` (below) would MIS-SIZE the
+        // buffer (it assumes a flat scalar width, not `elem_stride`) and drop the descriptors,
+        // corrupting a packed record-array crossing a thread boundary (ADR-063 transfer bug).
+        return clone_sealed_array(src);
+    }
     if elem_tag != 0xFF {
         // Flat scalar array: copy the raw element buffer verbatim (no pointers inside).
         return crate::array::lin_array_clone_flat(src);
@@ -367,6 +433,70 @@ mod tests {
     fn transfer_null_is_null() {
         unsafe {
             assert!(lin_transfer_clone(std::ptr::null()).is_null());
+        }
+    }
+
+    // ADR-063: a SEALED-RECORD packed array (elem_tag 0xFE) with a STRING heap field, deep-copied
+    // for cross-thread transfer via `clone_array` -> `clone_sealed_array`. Asserts: (1) the clone is a
+    // distinct 0xFE array preserving stride/desc/named_desc, (2) its String field is a PRIVATE copy
+    // (a distinct pointer, share-nothing), (3) RC is balanced — dropping the source array does NOT
+    // free the clone's string, and dropping the clone frees only its own. The PRE-FIX path
+    // (`lin_array_clone_flat`) mis-sized the buffer (16 B/elem, not the real stride) and dropped the
+    // descriptors, so the clone aliased the source's String (a cross-thread share -> UAF) — this test
+    // would corrupt/UAF under ASan on the old path. Run under `cargo test`'s asan CI leg.
+    #[test]
+    fn clone_sealed_array_string_field_is_private_and_rc_balanced() {
+        use crate::sealed::{lin_sealed_alloc, lin_sealed_release_self, SEALED_HEADER, KIND_STRING};
+        unsafe {
+            // Record R { name: String @16, n: Int32 @24 }, stride 16.
+            let mut heap_desc = Vec::new();
+            heap_desc.extend_from_slice(&1u32.to_le_bytes()); // 1 heap field
+            heap_desc.extend_from_slice(&16u32.to_le_bytes()); // offset
+            heap_desc.extend_from_slice(&KIND_STRING.to_le_bytes());
+            let stride = 16u64;
+            let src = crate::array::lin_sealed_array_alloc(4, stride, heap_desc.as_ptr(), std::ptr::null());
+            // Push two elements, each owning a +1 (non-interned) String.
+            for txt in ["alpha", "beta"] {
+                let st = lin_sealed_alloc(SEALED_HEADER + stride as usize, heap_desc.as_ptr());
+                let s = crate::string::lin_string_from_bytes(txt.as_ptr(), txt.len() as u32);
+                *((st.add(16)) as *mut *mut u8) = s as *mut u8; // struct owns the +1
+                *((st.add(24)) as *mut i32) = txt.len() as i32;
+                // Borrowed-source push: array retains each heap field (string rc -> 2).
+                crate::array::lin_sealed_array_push_struct_retaining(src, st);
+                lin_sealed_release_self(st); // string rc -> 1, owned only by the array
+            }
+            assert_eq!((*src).len, 2);
+            // Deep-copy for transfer.
+            let dst = clone_array(src);
+            assert!(!dst.is_null() && dst != src);
+            assert_eq!((*dst).elem_tag, crate::array::SEALED_ARRAY_TAG);
+            assert_eq!((*dst).elem_stride, stride);
+            assert_eq!((*dst).len, 2);
+            assert_eq!((*dst).elem_desc, heap_desc.as_ptr()); // descriptor preserved
+            // Each element's String must be a PRIVATE copy (distinct pointer, same bytes, rc 1).
+            for i in 0..2u64 {
+                let sp = ((*src).data as *const u8).add((i * stride) as usize);
+                let dp = ((*dst).data as *const u8).add((i * stride) as usize);
+                let ss = *(sp as *const *const crate::string::LinString);
+                let ds = *(dp as *const *const crate::string::LinString);
+                assert_ne!(ss, ds, "elem {i} string must be a private copy, not aliased");
+                assert!(crate::string::lin_string_eq(ss, ds), "elem {i} bytes must match");
+                assert_eq!((*ds).refcount, 1, "clone owns the sole +1 of its string");
+            }
+            // Drop the SOURCE first: frees src's strings. The clone's strings are independent.
+            crate::array::lin_array_release(src);
+            // The clone's strings must still be readable (no UAF) and still rc 1.
+            for i in 0..2u64 {
+                let dp = ((*dst).data as *const u8).add((i * stride) as usize);
+                let ds = *(dp as *const *const crate::string::LinString);
+                assert_eq!((*ds).refcount, 1);
+                let want = if i == 0 { "alpha" } else { "beta" };
+                let wp = crate::string::lin_string_from_bytes(want.as_ptr(), want.len() as u32);
+                assert!(crate::string::lin_string_eq(ds, wp));
+                crate::string::lin_string_release(wp);
+            }
+            // Drop the clone: frees its private strings exactly once (ASan verifies no leak/double-free).
+            crate::array::lin_array_release(dst);
         }
     }
 }
