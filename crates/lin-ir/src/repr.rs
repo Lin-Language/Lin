@@ -214,11 +214,12 @@ fn is_sealed_scalar_field(ty: &Type) -> bool {
 }
 
 /// Mirror of `Codegen::sealed_field_kind(..).is_some()` (types.rs:177): an eligible HEAP field of a
-/// sealed record (String / Array / nested-sealed).
+/// sealed record (String / Array / Map / nested-sealed).
 fn is_sealed_heap_field(ty: &Type) -> bool {
     match ty {
         Type::Str | Type::StrLit(_) => true,
         Type::Array(_) | Type::FixedArray(_) => true,
+        Type::Map(_) => true,
         Type::Object { .. } => sealed_fields(ty).is_some(),
         _ => false,
     }
