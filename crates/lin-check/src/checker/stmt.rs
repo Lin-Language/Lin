@@ -37,10 +37,13 @@ impl Checker {
         }
 
         // WITHIN-MODULE: only if no cross-module match — suggest a near-miss export of `path`.
+        // Candidates are both value AND type exports of `path` (a typo'd `import { Vec2 }` should
+        // still find the `export type Vec2` it meant).
         if help_lines.is_empty() {
             let candidates: Vec<&str> = self
                 .import_types
                 .keys()
+                .chain(self.import_type_decls.keys())
                 .filter(|(p, _)| p == path)
                 .map(|(_, n)| n.as_str())
                 .collect();
@@ -322,17 +325,19 @@ impl Checker {
                 span,
             } => {
                 let mut import_slots = Vec::new();
-                // Is this module KNOWN to the checker? It is iff at least one export key carries
-                // its path. (Some isolated/standalone checking modes seed NO signatures at all; in
-                // that case we keep the fresh-TypeVar fallback and must NOT error — there's simply
-                // no information to validate against.)
-                let module_known = self.import_types.keys().any(|(p, _)| p == path);
+                // Only validate names against a module whose FULL signature is known — i.e. one
+                // resolved into a complete `TypedModule` (value AND type exports both present). We
+                // must NOT validate against a module known only through partial seeding: SCC
+                // Phase-2 seeds a cyclic peer's VALUE exports but not its type decls, so a type
+                // import across a cycle would be a false "no export". Isolated/standalone checks
+                // seed nothing at all. In both cases the fresh-TypeVar fallback is kept.
+                let module_known = self.fully_resolved_import_paths.contains(path);
                 for binding in bindings {
                     let local_name = binding.alias.as_ref().unwrap_or(&binding.name);
                     // Use pre-resolved type if available, else fall back to TypeVar.
-                    let has_export = self
-                        .import_types
-                        .contains_key(&(path.clone(), binding.name.clone()));
+                    let key = (path.clone(), binding.name.clone());
+                    let has_export = self.import_types.contains_key(&key)
+                        || self.import_type_decls.contains_key(&key);
                     if module_known && !has_export {
                         // The module exists and was resolved, but does not export this name.
                         // Reject it here (a clean type-check error) instead of letting it slip
