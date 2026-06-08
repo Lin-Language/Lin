@@ -377,6 +377,9 @@ impl Checker {
             // and failing the post-pass compatibility check (spec §21, float counterpart of the
             // integer-literal context rule). For any non-float-literal body `check_expr` falls
             // through to `infer_expr` + the same compatibility check, so behaviour is unchanged.
+            // (Non-default sized integers and `Float32` are now also handled by the first arm via
+            // `expected_pushes_scalar_width` inside `expected_pushes_into_branches`; this arm
+            // remains as a precise fallback for the bare-literal/compatibility-message path.)
             Some(declared @ Type::Float32) => {
                 checked_against_declared = true;
                 let typed = self.check_expr(body, declared)?;
@@ -694,6 +697,9 @@ impl Checker {
             // and failing the post-pass compatibility check (spec §21, float counterpart of the
             // integer-literal context rule). For any non-float-literal body `check_expr` falls
             // through to `infer_expr` + the same compatibility check, so behaviour is unchanged.
+            // (Non-default sized integers and `Float32` are now also handled by the first arm via
+            // `expected_pushes_scalar_width` inside `expected_pushes_into_branches`; this arm
+            // remains as a precise fallback for the bare-literal/compatibility-message path.)
             Some(declared @ Type::Float32) => {
                 checked_against_declared = true;
                 let typed = self.check_expr(body, declared)?;
