@@ -883,6 +883,19 @@ impl Checker {
             } else {
                 Type::flatten_union(vec![then_ty, else_ty])
             }
+        } else if is_json_dynamic(&then_ty) != is_json_dynamic(&else_ty) {
+            // Exactly one branch is the dynamic top type `Json` (`TypeVar(u32::MAX)`) and the
+            // other is a CONCRETE non-Json type (e.g. `if c then mkErr() /*: Json*/ else rows
+            // /*: String[][]*/`). `Json` unifies with everything, so the `types_compatible`
+            // collapse below would otherwise pick the CONCRETE branch's type as the result —
+            // discarding the Json branch's representation. At runtime the Json branch yields a
+            // boxed Json value (e.g. an object), but the if-expression's static type would say
+            // `String[][]`, so lowering boxes BOTH branches as the concrete representation
+            // (`lin_box_array`) and the Json branch's object is mis-tagged as an array → a
+            // wrong-tagged box that crashes/corrupts on read. `Json` is the top type and
+            // genuinely subsumes the concrete branch, so the result IS `Json` — both branches
+            // box into the uniform Json representation, consistent with how each is produced.
+            Type::TypeVar(u32::MAX)
         } else if self.types_compatible(&then_ty, &else_ty) {
             else_ty
         } else if self.types_compatible(&else_ty, &then_ty) {
