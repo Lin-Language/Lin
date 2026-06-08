@@ -5504,6 +5504,31 @@ match obj
 }
 
 #[test]
+fn test_if_is_error_narrows_then_branch_non_json_union() {
+    // ADR-031: the TRUE branch of `if x is Error` must narrow a NON-Json `T | Error` scrutinee to
+    // `Error` (the matched member), so returning `x` where `Error` is expected type-checks. The
+    // FALSE branch narrows to the value type `T`. Previously the then-branch was left as the full
+    // `T | Error` union and only happened to work for Json (which is universally assignable);
+    // `UInt8[] | Error` / `Int32[] | Error` spuriously errored.
+    let output = run(r#"import { print } from "std/io"
+import { length } from "std/array"
+
+val f = (b: UInt8[] | Error): String | Error =>
+  if b is Error then b else "ok"
+
+val g = (b: Int32[] | Error): Int32 | Error =>
+  if b is Error then b else length(b)
+
+val ok = f([1u8, 2u8, 3u8])
+if ok is Error then print("ok-was-error") else print(ok)
+
+val n = g([10, 20, 30])
+if n is Error then print("n-was-error") else print("len ${n}")
+"#);
+    assert_eq!(output, vec!["ok", "len 3"]);
+}
+
+#[test]
 fn test_frozen_concurrent_reads() {
     // A frozen array read concurrently by many threads — immortal RC makes non-atomic
     // retain/release no-ops, so reads are race-free without copying or locking.
