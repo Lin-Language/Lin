@@ -745,6 +745,13 @@ val s = suite("std/array", [
     ]
   ),
 
+  test("compact preserves heap (String) elements", () =>
+    val result = ["a", null, "bb", null, "ccc"].compact()
+    [
+      expect(result.toString()).toBe("[\"a\", \"bb\", \"ccc\"]")
+    ]
+  ),
+
   test("append adds item to end of array", () =>
     val result = [1, 2, 3].append(4)
     [

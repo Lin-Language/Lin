@@ -207,11 +207,12 @@ export val chunk = <T>(arr: T[], size: Int32): T[][] =>
   result
 
 // Return a new array with all `null` elements removed.
-// @param arr  any array (typed `Json` so it accepts any element type).
-// @returns a new array of the non-null elements, in source order.
-export val compact = (arr: Json): Json =>
-  // Stays `Json` so it is usable on any array; the element-narrowing form cannot yet be expressed.
-  _filterJ(arr, x => x != null)
+// @param arr  an array of `T | Null`.
+// @returns a new `T[]` of the non-null elements, in source order.
+export val compact = <T>(arr: (T | Null)[]): T[] =>
+  val result: T[] = []
+  arr.for(x => if x != null then push(result, x) else null)
+  result
 
 // The merge helpers below implement `sort`'s bottom-up merge sort. They are generic over the element
 // `T`, which threads through the chain. CRITICAL: the `src`/`dst`/`buf`/`work` ping-pong buffers must
@@ -461,27 +462,33 @@ export val countInRange = <T>(arr: T[], lo: T, hi: T, compare: (T, T) => Int32):
   if n < 0 then 0 else n
 
 // Sum the elements of `arr`.
-// @param arr  an array of numeric `Json` values.
+// @param arr  an array of numeric elements.
 // @returns the sum (`0` for an empty array).
 export val sum = (arr: Json[]): Json =>
+  // Not generic: the constant `0` init means a bare empty-literal call (`[].sum()`) leaves the
+  // element type unconstrained, so a `<T>` result would unbox to `null` instead of `0`.
   _reduceJ(arr, 0, (acc, x) => acc + x)
 
 // Multiply the elements of `arr` together.
-// @param arr  an array of numeric `Json` values.
+// @param arr  an array of numeric elements.
 // @returns the product (`1` for an empty array).
 export val product = (arr: Json[]): Json =>
+  // Not generic, for the same empty-literal reason as `sum`.
   _reduceJ(arr, 1, (acc, x) => acc * x)
 
 // Find the smallest element of `arr` by natural `<` ordering.
-// @param arr  a non-empty array of comparable `Json` values.
+// @param arr  a non-empty array of comparable elements.
 // @returns the minimum element.
 export val min = (arr: Json[]): Json =>
+  // Not generic: a concrete `T` monomorphization corrupts heap (String/Array) elements through the
+  // fold, returning a blank value instead of the real element.
   _reduceJ(arr, arr[0], (acc, x) => if x < acc then x else acc)
 
 // Find the largest element of `arr` by natural `>` ordering.
-// @param arr  a non-empty array of comparable `Json` values.
+// @param arr  a non-empty array of comparable elements.
 // @returns the maximum element.
 export val max = (arr: Json[]): Json =>
+  // Not generic, for the same heap-element reason as `min`.
   _reduceJ(arr, arr[0], (acc, x) => if x > acc then x else acc)
 
 // Find the element with the smallest key under `keyFn`.

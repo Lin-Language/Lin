@@ -204,7 +204,8 @@ export val every = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): 
 // @returns the concatenation of every produced inner iterable, in order.
 // @example [1, 2, 3].flatMap(x => [x, x * 2])   // [1, 2, 2, 4, 3, 6]
 export val flatMap = (arr: Json, f: (Json, Int32) => Json): Json =>
-  // Stays `Json` rather than generic because the input and flattened-output element types may differ.
+  // Stays `Json` rather than generic: a concrete `U` monomorphization corrupts freshly-built heap
+  // (String/Array) elements as they are pushed through the per-element flatten.
   val result: Json[] = []
   var idx = 0
   arr.for(item =>
