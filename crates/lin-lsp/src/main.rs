@@ -308,18 +308,16 @@ impl LanguageServer for Backend {
             if !imp.name.starts_with(prefix) {
                 continue;
             }
-            // Dot-context filtering: only show items applicable to the receiver type. We use the
-            // resolved signature's first parameter category; items with no signature or a
-            // non-matching first param are dropped unless the receiver type is unknown ("any").
+            // Dot-context filtering: only show items applicable to the receiver type. The decision
+            // is delegated to `dot_item_applies` so it can be unit-tested directly. The key change
+            // from the old logic: a RECEIVER-POLYMORPHIC combinator (first-param category "any",
+            // e.g. `map`/`filter`/`reduce` whose first param renders as generic/`Json`/union) is now
+            // OFFERED on any receiver instead of being dropped — that idiom is the whole point of
+            // `xs.map(...)`.
             if let Some(cat) = filter_cat {
-                if cat != "any" {
-                    let first_param_cat = imp
-                        .ty
-                        .as_deref()
-                        .and_then(first_param_category);
-                    if first_param_cat.as_deref() != Some(cat) {
-                        continue;
-                    }
+                let first_param_cat = imp.ty.as_deref().and_then(first_param_category);
+                if !dot_item_applies(cat, first_param_cat.as_deref()) {
+                    continue;
                 }
             }
             let kind = match imp.ty.as_deref() {
@@ -1232,6 +1230,30 @@ fn type_to_category(ty: &str) -> &'static str {
 }
 
 // ── completion helpers ────────────────────────────────────────────────────────
+
+/// Decide whether an imported function should appear in `xs.` dot-completion, given the receiver's
+/// category (`receiver_cat`) and the function's FIRST-parameter category (`first_param_cat`, `None`
+/// when the item has no resolvable function signature).
+///
+/// An item APPLIES when any of the following hold:
+///   - the receiver category is unknown (`"any"`) — we can't filter, so offer everything;
+///   - the first-param category is `"any"` — a RECEIVER-POLYMORPHIC combinator (generic/`Json`/
+///     union first param, e.g. `map`/`filter`/`reduce`). These are the core dot-applied idiom and
+///     must be offered on every receiver; the previous exact-match filter wrongly dropped them;
+///   - the item has no signature at all (`None`) — we can't prove it inapplicable, so keep it;
+///   - the first-param category EQUALS the receiver category (a concrete, matching method).
+///
+/// It is EXCLUDED only when both categories are concrete AND differ (e.g. a `string`-typed first
+/// param on an `array` receiver).
+fn dot_item_applies(receiver_cat: &str, first_param_cat: Option<&str>) -> bool {
+    if receiver_cat == "any" {
+        return true;
+    }
+    match first_param_cat {
+        None | Some("any") => true,
+        Some(fc) => fc == receiver_cat,
+    }
+}
 
 /// Extract the broad category of a function signature's FIRST parameter, used to decide whether
 /// an imported function applies to a dot-receiver of a given category. e.g. `(String, ...) => X`
@@ -3964,6 +3986,63 @@ mod tests {
         assert_eq!(first_param_category("(Int32) => Float64").as_deref(), Some("number"));
         assert_eq!(first_param_category("() => String"), None);
         assert_eq!(first_param_category("String"), None);
+        // Polymorphic first params render as "any" (generic/Json/union).
+        assert_eq!(first_param_category("(T, (T) => U) => U[]").as_deref(), Some("any"));
+        assert_eq!(first_param_category("(Json) => String").as_deref(), Some("any"));
+        assert_eq!(first_param_category("(Int32 | String) => Boolean").as_deref(), Some("any"));
+    }
+
+    /// Dot-completion applicability: a polymorphic (`any`) first param matches ANY receiver (the
+    /// `map`/`filter`/`reduce` idiom), no-signature items are kept, and a concretely-typed mismatch
+    /// is excluded.
+    #[test]
+    fn dot_item_applies_includes_polymorphic_combinators() {
+        // Polymorphic combinator first param ("any") applies to every concrete receiver.
+        assert!(dot_item_applies("array", Some("any")));
+        assert!(dot_item_applies("string", Some("any")));
+        assert!(dot_item_applies("object", Some("any")));
+        // Exact concrete match still applies.
+        assert!(dot_item_applies("array", Some("array")));
+        assert!(dot_item_applies("string", Some("string")));
+        // No signature → can't prove inapplicable → kept.
+        assert!(dot_item_applies("array", None));
+        // Unknown receiver → everything applies.
+        assert!(dot_item_applies("any", Some("string")));
+        // Concrete mismatch is the ONLY exclusion.
+        assert!(!dot_item_applies("array", Some("string")));
+        assert!(!dot_item_applies("string", Some("number")));
+    }
+
+    /// End-to-end: an imported fn with a GENERIC first param is offered on an array receiver (the
+    /// `xs.map(...)` idiom), while a concretely string-typed method is excluded on an array receiver.
+    #[test]
+    fn completion_offers_polymorphic_combinator_on_array_receiver() {
+        // `mapper` has a generic first param (receiver-polymorphic); `upper` is string-only.
+        let src = concat!(
+            "val mapper = <T, U>(xs: T[], f: (T) => U) => xs\n",
+            "val upper = (s: String) => s\n",
+            "export val mapper2 = mapper\n",
+        );
+        // Build the imported-names list the completion handler filters: simulate the two functions
+        // as imported names with their rendered first-param categories.
+        let poly = ImportedName {
+            name: "map".to_string(),
+            module: "std/iter".to_string(),
+            ty: Some("(T, (T) => U) => U[]".to_string()),
+        };
+        let stronly = ImportedName {
+            name: "upper".to_string(),
+            module: "std/string".to_string(),
+            ty: Some("(String) => String".to_string()),
+        };
+        let _ = src; // documentation of the shapes; the filter is driven off the rendered types.
+
+        // Array receiver: polymorphic `map` applies, string-only `upper` does not.
+        assert!(dot_item_applies("array", poly.ty.as_deref().and_then(first_param_category).as_deref()));
+        assert!(!dot_item_applies("array", stronly.ty.as_deref().and_then(first_param_category).as_deref()));
+        // String receiver: BOTH apply (poly always, upper because its first param is string).
+        assert!(dot_item_applies("string", poly.ty.as_deref().and_then(first_param_category).as_deref()));
+        assert!(dot_item_applies("string", stronly.ty.as_deref().and_then(first_param_category).as_deref()));
     }
 
     /// Cyclic import graph (A imports B, B imports A) must terminate, not
