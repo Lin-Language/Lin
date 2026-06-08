@@ -2969,6 +2969,11 @@ fn suggestion_from_help(help: &str) -> Option<String> {
     Some(rest[..close].to_string())
 }
 
+/// Convert a byte offset into the source to an LSP `Position`. The `character` field is a
+/// **UTF-16 code-unit** column (the LSP default `positionEncoding`), NOT a `char`/codepoint count:
+/// a character outside the BMP (e.g. an emoji) is two UTF-16 units, so columns after it must be
+/// advanced by `ch.len_utf16()`. Counting one-per-`char` (as a naive implementation does) misaligns
+/// every range a client decodes once an astral codepoint appears on the line.
 fn offset_to_position(source: &str, offset: usize) -> Position {
     let mut line = 0u32;
     let mut character = 0u32;
@@ -2980,24 +2985,35 @@ fn offset_to_position(source: &str, offset: usize) -> Position {
             line += 1;
             character = 0;
         } else {
-            character += 1;
+            character += ch.len_utf16() as u32;
         }
     }
     Position { line, character }
 }
 
+/// Convert an LSP `Position` (line + UTF-16 code-unit column) back to a byte offset into the source.
+/// Mirrors `offset_to_position`: we accumulate UTF-16 code units per `char` (`ch.len_utf16()`) until
+/// the target column is reached. A malformed `pos.character` that lands in the MIDDLE of a surrogate
+/// pair (only possible if the client sends a bad position) is rounded to the nearest char boundary —
+/// we stop at the char whose UTF-16 span would cross the target, returning a valid byte offset and
+/// never panicking.
 fn position_to_offset(source: &str, pos: Position) -> usize {
     let mut line = 0u32;
     let mut character = 0u32;
     for (i, ch) in source.char_indices() {
-        if line == pos.line && character == pos.character {
+        if line == pos.line && character >= pos.character {
             return i;
         }
         if ch == '\n' {
+            // Reached the end of the requested line before the requested column: clamp to the
+            // newline's byte offset (the line is shorter than the client's column).
+            if line == pos.line {
+                return i;
+            }
             line += 1;
             character = 0;
         } else {
-            character += 1;
+            character += ch.len_utf16() as u32;
         }
     }
     source.len()
@@ -4635,5 +4651,53 @@ mod tests {
         assert_eq!(labels, vec!["a: Int32", "b: Int32"], "param labels should be name: Type");
         // The signature label reflects names too.
         assert!(sig.label.contains("a: Int32"), "label should include names: {}", sig.label);
+    }
+
+    // ── UTF-16 position encoding (LSP default) ────────────────────────────────────
+
+    /// A non-BMP character (an emoji, 2 UTF-16 code units / 4 bytes / 1 `char`) must advance the LSP
+    /// column by 2, not 1. We assert offset↔position round-trips in UTF-16 units and that a position
+    /// just after the emoji maps back to the byte offset just after it.
+    #[test]
+    fn position_encoding_is_utf16_for_astral_char() {
+        // `val x = "😀ab"` — the emoji is U+1F600 (4 bytes, 2 UTF-16 units).
+        let src = "val x = \"😀ab\"\n";
+        let emoji_byte = src.find('😀').unwrap();
+        let emoji_len = '😀'.len_utf8(); // 4
+        assert_eq!('😀'.len_utf16(), 2);
+
+        // Column at the emoji's start (it's preceded by `val x = "` = 9 bytes, all ASCII → col 9).
+        let pos_emoji = offset_to_position(src, emoji_byte);
+        assert_eq!(pos_emoji, Position { line: 0, character: 9 });
+
+        // The byte right after the emoji is `a`. Its UTF-16 column must be 9 + 2 = 11 (NOT 10).
+        let a_byte = emoji_byte + emoji_len;
+        let pos_a = offset_to_position(src, a_byte);
+        assert_eq!(pos_a, Position { line: 0, character: 11 }, "emoji must count as 2 UTF-16 units");
+
+        // Round-trip: column 11 maps back to the byte offset of `a`.
+        assert_eq!(position_to_offset(src, pos_a), a_byte);
+        // And column 9 maps back to the emoji's byte start.
+        assert_eq!(position_to_offset(src, pos_emoji), emoji_byte);
+
+        // A position landing inside the surrogate pair (col 10, only sendable by a malformed client)
+        // must NOT panic and must round to a char boundary — here the emoji's start byte.
+        let mid = position_to_offset(src, Position { line: 0, character: 10 });
+        assert_eq!(mid, a_byte, "mid-surrogate column rounds forward to the next char boundary");
+    }
+
+    /// CJK characters are in the BMP (1 UTF-16 unit, 3 bytes, 1 `char`): they advance the column by
+    /// 1, and a combining char likewise stays 1 unit. This pins that BMP-multibyte text is unaffected
+    /// by the UTF-16 fix (only astral codepoints differ from a naive char count).
+    #[test]
+    fn position_encoding_bmp_multibyte_is_one_unit() {
+        // `日本` — each is 3 bytes, 1 UTF-16 unit.
+        let src = "val s = \"日本\"\n";
+        let first = src.find('日').unwrap(); // col 9
+        assert_eq!(offset_to_position(src, first), Position { line: 0, character: 9 });
+        let second = first + '日'.len_utf8();
+        // Second CJK char is at col 10 (one UTF-16 unit past the first).
+        assert_eq!(offset_to_position(src, second), Position { line: 0, character: 10 });
+        assert_eq!(position_to_offset(src, Position { line: 0, character: 10 }), second);
     }
 }
