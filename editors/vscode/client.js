@@ -26,6 +26,19 @@ function exeName(name) {
   return process.platform === "win32" ? `${name}.exe` : name;
 }
 
+// Quote a single argument for an interactive terminal's shell so paths containing
+// spaces or quotes survive intact. The Task provider uses ShellQuoting.Strong (VS
+// Code quotes per-shell), but terminal.sendText() takes a raw command line, so we
+// quote by hand here. POSIX shells: wrap in single quotes and escape any embedded
+// single quote as '\''. Windows: the integrated terminal is usually PowerShell,
+// where a literal " inside an arg is doubled ("") within a double-quoted string.
+function shellQuote(arg) {
+  if (process.platform === "win32") {
+    return `"${String(arg).replace(/"/g, '""')}"`;
+  }
+  return `'${String(arg).replace(/'/g, "'\\''")}'`;
+}
+
 // Directory holding the bundled, co-located binaries (lin, lin-lsp,
 // liblin_runtime.a). `lin build` finds liblin_runtime.a next to the `lin`
 // executable, so this directory is what we expose on PATH. Returns null when
@@ -131,21 +144,160 @@ async function installOnPath(context) {
 const SUPPORTED_SCHEMA = 2;
 
 const TEST_DECL_RE = /\btest\s*\(\s*"((?:[^"\\]|\\.)*)"/g;
-const WITHFIXTURE_DECL_RE = /\bwithFixture\s*\([^,]*,[^,]*,\s*"((?:[^"\\]|\\.)*)"/g;
+const WITHFIXTURE_DECL_RE = /\bwithFixture\s*\(/g;
+
+// Strip an unquoted `//` line-comment from a single source line. We walk the line
+// tracking whether we're inside a double-quoted string literal (respecting `\`
+// escapes) so a `//` *inside* a string is preserved, and only a genuine comment
+// is removed. Lin has no block comments (see the lexer), so this is sufficient.
+//
+// Residual limit: this is line-based, so it cannot see a string literal that opens
+// on one line and closes on another. The Lin lexer does allow a string to span
+// lines, so a `//` or `test(` on a *continuation* line of such a literal could be
+// mis-handled. Multi-line string literals that contain the literal text
+// `test("...")` are rare enough that a full lexer isn't worth it — discovery is
+// best-effort, and any miss is corrected at run time from the NDJSON `test` records.
+function stripLineComment(line) {
+  let inStr = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inStr) {
+      if (ch === "\\") { i++; continue; } // skip escaped char
+      if (ch === '"') inStr = false;
+    } else if (ch === '"') {
+      inStr = true;
+    } else if (ch === "/" && line[i + 1] === "/") {
+      return line.slice(0, i);
+    }
+  }
+  return line;
+}
+
+// True if character offset `idx` in `line` lies inside a double-quoted string
+// literal — i.e. a `test(`/`withFixture(` token there is text, not a declaration.
+function isInsideString(line, idx) {
+  let inStr = false;
+  for (let i = 0; i < idx && i < line.length; i++) {
+    const ch = line[i];
+    if (inStr) {
+      if (ch === "\\") { i++; continue; }
+      if (ch === '"') inStr = false;
+    } else if (ch === '"') {
+      inStr = true;
+    }
+  }
+  return inStr;
+}
+
+// Extract the first top-level double-quoted string-literal argument of a call,
+// scanning from `from` (the index just after the opening `(`). Used for
+// withFixture, whose test name is the first string-literal argument — robust to
+// earlier arguments that contain commas inside braces/brackets/quotes (e.g. a
+// `{ a, b }` fixture object). Skips balanced `{}`/`[]`/`()` groups so a `"name"`
+// nested inside an object isn't mistaken for the test name, and stops if the call
+// closes before any string is seen. Returns { raw, index } or null (raw is the
+// still-escaped literal body; index is the offset of its opening quote).
+function firstStringArg(line, from) {
+  let depth = 0;
+  for (let i = from; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === "{" || ch === "[" || ch === "(") {
+      depth++;
+    } else if (ch === "}" || ch === "]" || ch === ")") {
+      if (depth === 0) return null; // call closed before any string argument
+      depth--;
+    } else if (ch === '"' && depth === 0) {
+      let raw = "";
+      let j = i + 1;
+      for (; j < line.length; j++) {
+        if (line[j] === "\\") { raw += line[j] + (line[j + 1] || ""); j++; continue; }
+        if (line[j] === '"') break;
+        raw += line[j];
+      }
+      return { raw, index: i };
+    }
+  }
+  return null;
+}
 
 function unescapeLinString(s) {
-  // Best-effort inverse of the common Lin string escapes so the discovered id
-  // matches the runtime `name` (which is the decoded string).
-  return s
-    .replace(/\\n/g, "\n")
-    .replace(/\\t/g, "\t")
-    .replace(/\\r/g, "\r")
-    .replace(/\\"/g, '"')
-    .replace(/\\\\/g, "\\");
+  // Inverse of the Lin lexer's string escapes (crates/lin-lex/src/lexer.rs
+  // `lex_string`) so the discovered id matches the runtime `name` (the decoded
+  // string). The lexer supports: \n \r \t \0 \" \\ \$ \u{HEX}; any other \<c>
+  // decodes to the literal <c>. We mirror that exact set. Driven by a single
+  // left-to-right scan so an already-decoded backslash is never re-processed (a
+  // chain of .replace() would, e.g., turn the source "\\n" into a newline).
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== "\\") { out += s[i]; continue; }
+    const c = s[i + 1];
+    if (c === undefined) { out += "\\"; break; } // trailing backslash, leave as-is
+    switch (c) {
+      case "n": out += "\n"; i++; break;
+      case "r": out += "\r"; i++; break;
+      case "t": out += "\t"; i++; break;
+      case "0": out += "\0"; i++; break;
+      case '"': out += '"'; i++; break;
+      case "\\": out += "\\"; i++; break;
+      case "$": out += "$"; i++; break;
+      case "u": {
+        // \u{HEX} (1-6 hex digits). The lexer reads to the closing `}`; on a
+        // valid code point it pushes the char, on a malformed one it pushes
+        // nothing but still consumes the braces. Mirror both behaviours.
+        if (s[i + 2] === "{") {
+          const close = s.indexOf("}", i + 3);
+          if (close !== -1) {
+            const hex = s.slice(i + 3, close);
+            const code = parseInt(hex, 16);
+            if (/^[0-9a-fA-F]+$/.test(hex) && Number.isFinite(code) && code <= 0x10ffff) {
+              try { out += String.fromCodePoint(code); } catch (_) { /* invalid: drop */ }
+            }
+            i = close;
+            break;
+          }
+        }
+        // No `{...}` — lexer's `continue` leaves following chars in place; emit nothing.
+        i++;
+        break;
+      }
+      default: out += c; i++; break; // \<c> → <c>
+    }
+  }
+  return out;
 }
 
 function testItemId(filePath, name) {
   return `${filePath}::${name}`;
+}
+
+// Discover every `test(...)` / `withFixture(...)` declaration on a single source
+// line, returning [{ name, col }] (name decoded, col = the declaration's start).
+// Comments are stripped and matches that begin inside a string literal are skipped,
+// so `// test("x")` and a string containing `test("y")` don't produce phantom items.
+function discoverLine(line) {
+  const code = stripLineComment(line);
+  const found = [];
+
+  // `test("name"` — the captured group is the (still-escaped) literal name. We
+  // only accept the match if the `test` keyword itself is not inside a string.
+  TEST_DECL_RE.lastIndex = 0;
+  let m;
+  while ((m = TEST_DECL_RE.exec(code)) !== null) {
+    if (isInsideString(code, m.index)) continue;
+    found.push({ name: unescapeLinString(m[1]), col: m.index });
+  }
+
+  // `withFixture(...)` — the name is the FIRST top-level string-literal argument,
+  // which is robust to a fixture object/array containing commas. We anchor on the
+  // call keyword (not a fixed two-comma shape) and then scan its arguments.
+  WITHFIXTURE_DECL_RE.lastIndex = 0;
+  while ((m = WITHFIXTURE_DECL_RE.exec(code)) !== null) {
+    if (isInsideString(code, m.index)) continue;
+    const arg = firstStringArg(code, m.index + m[0].length);
+    if (arg) found.push({ name: unescapeLinString(arg.raw), col: m.index });
+  }
+
+  return found;
 }
 
 // (Re)build a file's child TestItems from its current text.
@@ -153,24 +305,17 @@ function refreshFileTests(controller, fileItem, text) {
   fileItem.children.replace([]);
   const seen = new Set();
   const lines = text.split("\n");
-  const addMatch = (re) => {
-    for (let i = 0; i < lines.length; i++) {
-      re.lastIndex = 0;
-      let m;
-      while ((m = re.exec(lines[i])) !== null) {
-        const name = unescapeLinString(m[1]);
-        const id = testItemId(fileItem.uri.fsPath, name);
-        if (seen.has(id)) continue;
-        seen.add(id);
-        const child = controller.createTestItem(id, name, fileItem.uri);
-        const col = m.index >= 0 ? m.index : 0;
-        child.range = new Range(new Position(i, col), new Position(i, col + name.length));
-        fileItem.children.add(child);
-      }
+  for (let i = 0; i < lines.length; i++) {
+    for (const { name, col } of discoverLine(lines[i])) {
+      const id = testItemId(fileItem.uri.fsPath, name);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const child = controller.createTestItem(id, name, fileItem.uri);
+      const startCol = col >= 0 ? col : 0;
+      child.range = new Range(new Position(i, startCol), new Position(i, startCol + name.length));
+      fileItem.children.add(child);
     }
-  };
-  addMatch(TEST_DECL_RE);
-  addMatch(WITHFIXTURE_DECL_RE);
+  }
 }
 
 function getOrCreateFileItem(controller, uri) {
@@ -637,7 +782,7 @@ function activate(context) {
     }
     const terminal = window.createTerminal("Lin");
     terminal.show(true);
-    terminal.sendText(`"${linBin}" ${subcommand} "${file}"`);
+    terminal.sendText(`${shellQuote(linBin)} ${subcommand} ${shellQuote(file)}`);
   };
 
   // "Format Document" (Shift+Alt+F), format-on-save, and the `lin.format` command
@@ -693,7 +838,7 @@ function activate(context) {
       const dir = path.dirname(editor.document.uri.fsPath);
       const terminal = window.createTerminal("Lin Test");
       terminal.show(true);
-      terminal.sendText(`"${linBin}" test "${dir}"`);
+      terminal.sendText(`${shellQuote(linBin)} test ${shellQuote(dir)}`);
     }),
     // Route through the provider above so it behaves identically to Format Document.
     commands.registerCommand("lin.format", () => {
@@ -748,4 +893,10 @@ function deactivate() {
   }
 }
 
-module.exports = { activate, deactivate };
+module.exports = {
+  activate,
+  deactivate,
+  // Exposed for the standalone discovery/unescape unit test (test/discovery.test.js).
+  // These are pure (no VS Code API) and safe to call directly.
+  _test: { discoverLine, unescapeLinString, stripLineComment, isInsideString, firstStringArg },
+};
