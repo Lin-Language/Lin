@@ -378,7 +378,10 @@ impl<'ctx> Codegen<'ctx> {
     /// the three mirrors, AND landing one of those two whole-program mechanisms, then re-run corpus +
     /// ASan (the `repr::verify` debug_assert is the structural guard that the swap is consistent).
     pub(crate) fn sealed_array_elem_field_packable(ty: &Type) -> bool {
-        Self::is_sealed_scalar_field(ty)
+        // Delegates to the SINGLE source of truth (ADR-063 gate consolidation). Stage 3b widens the
+        // gate by editing `Type::is_sealed_array_field_packable` alone; this and the three lin-ir
+        // mirrors all defer to it, so they cannot drift.
+        ty.is_sealed_array_field_packable()
     }
 
     // ── Unboxed tagged sum type (`SumNode`) — unboxed-sumtype Stage 1 ─────────────────────────────
