@@ -1,11 +1,38 @@
+// std/jq — query `Json` values with jq filter programs, backed by a pure-Rust jq engine.
+//
+// A filter is a stream: it can produce zero, one, or many output values. `jq` returns the full
+// result set as an array; `jqFirst` returns just the first (or null). Both compile errors
+// (invalid filter syntax) and runtime errors return the canonical `Error` value, detectable with
+// `is Error`. With dot-application a filter reads naturally as the tail of a pipeline, e.g.
+// `readFile("deploy.yaml").parse().jq(".spec.containers[].image")`.
+//
+//   import { jq, jqFirst } from "std/jq"
+//
+// The engine covers essentially the full jq language: path expressions (`.a.b`, `.[0]`, `.[1:3]`,
+// `.[]`, `..`, optional `?`), combinators (`|`, `,`, `//`), object/array construction, arithmetic
+// and logic, and the standard builtins (`select`, `map`, `keys`, `has`, `length`, `to_entries`,
+// `add`, `sort_by`, `group_by`, `unique`, `flatten`, `split`/`join`, `test`, `empty`, and more).
 import { length } from "std/array"
 
 import foreign "lin-runtime"
   val lin_jq_query: (Json, String) => Json
 
+// Run a jq filter over a Json value and collect all results.
+// @param input   the Json value to query.
+// @param filter  the jq filter expression.
+// @returns a `Json[]` of the filter's outputs, or an `Error` object if the filter is invalid or
+//   fails to evaluate.
+// @example jq({ "users": [{ "name": "Ada" }] }, ".users[] | .name")  // ["Ada"]
+// @example jq({ "xs": [1, 2, 3] }, ".xs | add")                      // [6]
 export val jq = (input: Json, filter: String): Json =>
   lin_jq_query(input, filter)
 
+// Run a jq filter and return only its first result.
+// @param input   the Json value to query.
+// @param filter  the jq filter expression.
+// @returns the first output value, `null` if the filter produced none, or the `Error` object if the
+//   query failed.
+// @example jqFirst({ "users": [{ "name": "Ada" }] }, ".users[0].name")  // "Ada"
 export val jqFirst = (input: Json, filter: String): Json =>
   val result = lin_jq_query(input, filter)
   if result["type"] == "error" then

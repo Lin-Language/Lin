@@ -1,0 +1,212 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+import { writeFile } from "std/fs"
+import { readStream, lines, for as sfor } from "std/stream"
+import { sliding, pairwise, zipWith, intersperse, dedup, count, repeat, cycle, take, map, for } from "std/iter"
+
+// Empty-literal sources need an annotation to pin the element type (ADR-058): an unannotated `[]`
+// is `Never[]`, which a `T`-element combinator rejects. These module-level empties stand in for the
+// boundary cases below.
+val emptyI: Int32[] = []
+val emptyS: String[] = []
+
+// Drive a (bounded) Stream into an `Int32[]` so its lazy items can be asserted. The terminal
+// `for` over a stream returns `Null | Error`; the closure captures + pushes into `acc`.
+val collectInts = (s: Stream): Int32[] =>
+  val acc: Int32[] = []
+  s.for(x => push(acc, x))
+  acc
+
+val collectStrs = (s: Stream): String[] =>
+  val acc: String[] = []
+  s.for(x => push(acc, x))
+  acc
+
+val s = suite("std/iter combinators", [
+  // ---- sliding (eager) ----
+  test("sliding overlapping windows of width 2", () => [
+    expect(sliding([1, 2, 3, 4], 2).toString()).toBe("[[1, 2], [2, 3], [3, 4]]")
+  ]),
+
+  test("sliding width 3", () => [
+    expect(sliding([1, 2, 3, 4, 5], 3).toString()).toBe("[[1, 2, 3], [2, 3, 4], [3, 4, 5]]")
+  ]),
+
+  test("sliding source shorter than size yields no windows", () => [
+    expect(sliding([1, 2], 3).toString()).toBe("[]")
+  ]),
+
+  test("sliding size 1 wraps each element", () => [
+    expect(sliding([5, 6], 1).toString()).toBe("[[5], [6]]")
+  ]),
+
+  test("sliding over empty input", () => [
+    expect(sliding(emptyI, 2).toString()).toBe("[]")
+  ]),
+
+  // dot-application form
+  test("sliding dot-application", () => [
+    expect([1, 2, 3].sliding(2).toString()).toBe("[[1, 2], [2, 3]]")
+  ]),
+
+  // ---- pairwise (eager) ----
+  test("pairwise adjacent pairs", () => [
+    expect(pairwise([1, 2, 3, 4]).toString()).toBe("[[1, 2], [2, 3], [3, 4]]")
+  ]),
+
+  test("pairwise of a single element yields nothing", () => [
+    expect(pairwise([7]).toString()).toBe("[]")
+  ]),
+
+  test("pairwise of empty yields nothing", () => [
+    expect(pairwise(emptyI).toString()).toBe("[]")
+  ]),
+
+  test("pairwise deltas via map", () => [
+    expect([10, 13, 9, 12].pairwise().map(p => p[1] - p[0]).toString()).toBe("[3, -4, 3]")
+  ]),
+
+  // ---- zipWith (eager) ----
+  test("zipWith fuses two columns", () => [
+    expect(zipWith([1, 2, 3], [10, 20, 30], (x, y) => x + y).toString()).toBe("[11, 22, 33]")
+  ]),
+
+  test("zipWith truncates to the shorter input", () => [
+    expect(zipWith([1, 2, 3], [10], (x, y) => x + y).toString()).toBe("[11]")
+  ]),
+
+  test("zipWith over empty", () => [
+    expect(zipWith(emptyI, [1, 2], (x, y) => x + y).toString()).toBe("[]")
+  ]),
+
+  test("zipWith builds strings", () => [
+    expect(zipWith(["alice", "bob"], [90, 80], (n, sc) => "${n}: ${sc}").toString()).toBe("[\"alice: 90\", \"bob: 80\"]")
+  ]),
+
+  // ---- intersperse (eager) ----
+  test("intersperse a separator between elements", () => [
+    expect(intersperse([1, 2, 3], 0).toString()).toBe("[1, 0, 2, 0, 3]")
+  ]),
+
+  test("intersperse of a single element is unchanged", () => [
+    expect(intersperse([9], 0).toString()).toBe("[9]")
+  ]),
+
+  test("intersperse of empty is unchanged", () => [
+    expect(intersperse(emptyI, 0).toString()).toBe("[]")
+  ]),
+
+  test("intersperse strings", () => [
+    expect(intersperse(["a", "b", "c"], "-").toString()).toBe("[\"a\", \"-\", \"b\", \"-\", \"c\"]")
+  ]),
+
+  // ---- dedup (eager) ----
+  test("dedup collapses consecutive runs", () => [
+    expect(dedup([1, 1, 2, 3, 3, 3, 1]).toString()).toBe("[1, 2, 3, 1]")
+  ]),
+
+  test("dedup of empty", () => [
+    expect(dedup(emptyI).toString()).toBe("[]")
+  ]),
+
+  test("dedup of a single element", () => [
+    expect(dedup([42]).toString()).toBe("[42]")
+  ]),
+
+  test("dedup leaves all-distinct unchanged", () => [
+    expect(dedup([1, 2, 3]).toString()).toBe("[1, 2, 3]")
+  ]),
+
+  // ---- count / repeat / cycle (infinite stream constructors, bounded by take) ----
+  test("count from 0 take 5", () => [
+    expect(collectInts(count(0).take(5)).toString()).toBe("[0, 1, 2, 3, 4]")
+  ]),
+
+  test("count with a negative step", () => [
+    expect(collectInts(count(10, -2).take(3)).toString()).toBe("[10, 8, 6]")
+  ]),
+
+  test("count mapped then bounded by take", () => [
+    expect(collectInts(count(0).map(i => i * i).take(5)).toString()).toBe("[0, 1, 4, 9, 16]")
+  ]),
+
+  test("bounded repeat take more than n stops at n", () => [
+    expect(collectInts(repeat(7, 4).take(10)).toString()).toBe("[7, 7, 7, 7]")
+  ]),
+
+  test("infinite repeat bounded by take", () => [
+    expect(collectInts(repeat(9).take(3)).toString()).toBe("[9, 9, 9]")
+  ]),
+
+  test("cycle take past the source length wraps", () => [
+    expect(collectInts(cycle([1, 2, 3]).take(7)).toString()).toBe("[1, 2, 3, 1, 2, 3, 1]")
+  ]),
+
+  test("cycle of an empty array yields an empty stream", () => [
+    expect(collectInts(cycle(emptyI).take(5)).toString()).toBe("[]")
+  ]),
+
+  test("repeat strings bounded", () => [
+    expect(collectStrs(repeat("x").take(3)).toString()).toBe("[\"x\", \"x\", \"x\"]")
+  ]),
+
+  // ---- lazy stream forms (read lines from a temp file, drive lazily) ----
+  test("dedup over a stream of lines", () =>
+    writeFile("/tmp/lin_iter_dedup.txt", "1\n1\n2\n3\n3\n3\n1\n")
+    val out = collectStrs(readStream("/tmp/lin_iter_dedup.txt").lines().dedup())
+    [
+      expect(out.toString()).toBe("[\"1\", \"2\", \"3\", \"1\"]")
+    ]
+  ),
+
+  test("sliding over a stream of lines", () =>
+    writeFile("/tmp/lin_iter_sliding.txt", "a\nb\nc\nd\n")
+    val acc: String[] = []
+    // each window `w` is a `String[]` (e.g. ["a", "b"]); record its joined contents per window.
+    readStream("/tmp/lin_iter_sliding.txt")
+      .lines()
+      .sliding(2)
+      .for(w => push(acc, "${w[0]}${w[1]}"))
+    [
+      expect(acc.length()).toBe(3),
+      expect(acc.toString()).toBe("[\"ab\", \"bc\", \"cd\"]")
+    ]
+  ),
+
+  test("pairwise over a stream of lines", () =>
+    writeFile("/tmp/lin_iter_pairwise.txt", "a\nb\nc\n")
+    val acc: String[] = []
+    readStream("/tmp/lin_iter_pairwise.txt")
+      .lines()
+      .pairwise()
+      .for(p => push(acc, "${p[0]}${p[1]}"))
+    [
+      expect(acc.length()).toBe(2),
+      expect(acc.toString()).toBe("[\"ab\", \"bc\"]")
+    ]
+  ),
+
+  test("intersperse over a stream of lines", () =>
+    writeFile("/tmp/lin_iter_intersperse.txt", "a\nb\nc\n")
+    val out = collectStrs(readStream("/tmp/lin_iter_intersperse.txt").lines().intersperse("-"))
+    [
+      expect(out.toString()).toBe("[\"a\", \"-\", \"b\", \"-\", \"c\"]")
+    ]
+  ),
+
+  test("zipWith a stream against an in-memory table", () =>
+    writeFile("/tmp/lin_iter_zipwith.txt", "x\ny\nz\n")
+    val tbl = [1, 2, 3, 4]
+    val out = collectStrs(zipWith(
+      readStream("/tmp/lin_iter_zipwith.txt").lines(),
+      tbl,
+      (line, n) => "${line}${n}"
+    ))
+    [
+      expect(out.toString()).toBe("[\"x1\", \"y2\", \"z3\"]")
+    ]
+  )
+])
+
+run(s)

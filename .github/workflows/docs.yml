@@ -50,6 +50,11 @@ jobs:
       - name: Mirror changelog to docs site
         run: cp CHANGELOG.md docs-site/content/changelog.md || true
 
+      # Regenerate content/stdlib/*.md from the doc comments in stdlib/*.lin (single source of
+      # truth) before the site build picks the Markdown up.
+      - name: Generate stdlib reference from doc comments
+        run: ./target/debug/lin run docs-site/builder/gen-stdlib.lin
+
       - name: Build the docs generator (written in Lin)
         run: ./target/debug/lin build docs-site/builder/main.lin -o docs-builder
 

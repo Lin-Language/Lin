@@ -10,12 +10,15 @@
 // Number policy is target-driven: an integer target requires an in-range integral number; a
 // float target accepts any number; a Json/unconstrained target accepts any number as-is.
 // Union targets pick the FIRST structurally-matching variant.
-//
-// The export below exists so `import { fromJson } from "std/json"` resolves and `lin check`
-// does not flag `fromJson` as undefined. Its body is never evaluated for real call sites: the
-// checker rewrites those into the decode special form before this signature is consulted. The
-// first argument is a TYPE (for example `Person`), which is why no ordinary value-level
-// wrapper can express it.
+
+// Decode a Json value against a target type (compiler special form; see the module header).
+// @param _      the target TYPE (e.g. `Person`); use the `Person.fromJson(json)` or
+//   `fromJson(Person, json)` form. No ordinary value-level wrapper can express a type argument.
+// @param value  the Json value to decode.
+// @returns the decoded `T`, or an `Error` `{ type, message, path }` at the first structural
+//   mismatch. (The export exists so the import resolves and `lin check` does not flag `fromJson`;
+//   its body is never evaluated — the checker rewrites real call sites into the decode special
+//   form.)
 export val fromJson = (_: Json, value: Json): Json =>
   value
 
@@ -23,14 +26,15 @@ import foreign "lin-runtime"
   val lin_json_escape: (String) => String
 
 // Escape a string and wrap it in double quotes, producing a valid JSON string literal.
-// Used by std/test to emit machine-readable NDJSON test records.
+// @param s  the string to escape.
+// @returns the quoted, escaped JSON string literal. Used by std/test to emit NDJSON records.
 export val toJsonString = (s: String): String =>
   lin_json_escape(s)
 
-// Recursively serialize ANY Lin value to a strict, valid JSON string. Strings (and object
-// keys) are escaped+quoted, numbers/bools/null become JSON literals (non-finite floats →
-// `null`, matching JSON.stringify), arrays and objects recurse arbitrarily deep. `lin_to_json`
-// is a compiler intrinsic (it walks the runtime tagged value), so the body below is the
-// surface wrapper the checker dispatches at the call site.
+// Recursively serialize ANY Lin value to a strict, valid JSON string.
+// @param value  the value to serialize; arrays and objects recurse arbitrarily deep.
+// @returns the JSON text. Strings (and object keys) are escaped+quoted; numbers/bools/null become
+//   JSON literals (non-finite floats become `null`, matching JSON.stringify).
+// @example toJson({ "a": 1, "b": [true, null] })  // {"a":1,"b":[true,null]}
 export val toJson = (value: Json): String =>
   lin_to_json(value)

@@ -1,148 +1,96 @@
 # std/io
 
-Standard input, standard output, and process control.
+std/io — standard input, standard output, and process control.
+
+Functions for reading from stdin, writing to stdout/stderr, accessing the command-line
+arguments, and exiting the process. `print` stringifies any value (strings unquoted, everything
+else as JSON); the read functions return `String | Null` so EOF narrows with a plain `== null`.
+
+  import { print, readLine, args, exit } from "std/io"
+
+## Reference
+
+#### `readLine`
 
 ```lin
-import { print, readLine, args, exit } from "std/io"
+val readLine = (): Json
 ```
 
-`std/io` provides functions for reading from stdin, writing to stdout and stderr, accessing command-line arguments, and exiting the process.
+Read one line from standard input (without the trailing newline).
+- **Returns** the line as a `String`, or `null` at end of input.
 
-## Function reference
-
-| Function | Signature | Description |
-| --- | --- | --- |
-| `print` | `(Json) -> Null` | Write a value to stdout followed by a newline |
-| `printErr` | `(Json) -> Null` | Write a value to stderr followed by a newline |
-| `readLine` | `() -> String \| Null` | Read one line from stdin; `Null` on EOF |
-| `readAll` | `() -> String` | Read all of stdin as one string |
-| `lines` | `() -> Iterator` | Iterator over stdin lines |
-| `prompt` | `(String) -> String \| Null` | Print message then read one line |
-| `args` | `() -> String[]` | Command-line arguments |
-| `exit` | `(Int32) -> Null` | Terminate process with exit code |
-
----
-
-### `print`
+#### `readAll`
 
 ```lin
-val print: (value: Json) -> Null
+val readAll = (): String
 ```
 
-Writes `value` to stdout, followed by a newline. Strings are printed without quotes; all other values are formatted as JSON.
+Read all of standard input to end of stream.
+- **Returns** the entire input as a single `String`.
+
+#### `lines`
 
 ```lin
-print("hello")        // hello
-print(42)             // 42
-print([1, 2, 3])      // [1, 2, 3]
-print({ "a": 1 })     // {"a":1}
+val lines = (): String[]
 ```
 
----
+Read all of standard input as lines.
+- **Returns** an array of the input lines (newlines stripped).
 
-### `printErr`
+#### `print`
 
 ```lin
-val printErr: (value: Json) -> Null
+val print = (x: Json): Null
 ```
 
-Same as `print` but writes to stderr.
+Print a value to standard output, followed by a newline.
+- **`x`** — the value to print (stringified).
+- **Example:** print("hello")     // hello
+- **Example:** print([1, 2, 3])   // [1, 2, 3]
+- **Example:** print({ "a": 1 })  // {"a":1}
+
+#### `printErr`
 
 ```lin
-printErr("error: file not found")
+val printErr = (x: Json): Null
 ```
 
----
+Print a value to standard error, followed by a newline.
+- **`x`** — the value to print (stringified).
 
-### `readLine`
+#### `args`
 
 ```lin
-val readLine: () -> String | Null
+val args = (): String[]
 ```
 
-Reads one line from stdin, stripping the trailing newline. Returns `Null` on EOF.
+The process command-line arguments.
+- **Returns** an array of the argument strings.
+
+#### `prompt`
 
 ```lin
-val line = readLine()
-match line
-  is Null => print("end of input")
-  else    => print("got: ${line}")
+val prompt = (message: String): Json
 ```
 
----
+Print a prompt and read one line of input.
+- **`message`** — the prompt to print before reading.
+- **Returns** the line read, or `null` at end of input.
 
-### `readAll`
+#### `exit`
 
 ```lin
-val readAll: () -> String
+val exit = (code: Int32): Null
 ```
 
-Reads all of stdin and returns it as one string (including embedded newlines).
+Terminate the process with the given exit code.
+- **`code`** — the process exit status (0 = success).
+
+#### `stdinStream`
 
 ```lin
-val raw = readAll()
+val stdinStream = (): Stream
 ```
 
----
-
-### `lines`
-
-```lin
-val lines: () -> Iterator
-```
-
-Returns an iterator yielding one `String` per line of stdin. Terminates at EOF.
-
-```lin
-import { print, lines } from "std/io"
-import { for } from "std/iter"
-import { trim } from "std/string"
-
-lines().for(line => print(line.trim()))
-```
-
----
-
-### `prompt`
-
-```lin
-val prompt: (message: String) -> String | Null
-```
-
-Prints `message` to stdout (without a trailing newline), then reads one line. Returns `Null` on EOF.
-
-```lin
-val name = prompt("Enter your name: ")
-match name
-  is Null => print("no input")
-  else    => print("Hello, ${name}!")
-```
-
----
-
-### `args`
-
-```lin
-val args: () -> String[]
-```
-
-Returns command-line arguments starting from the first user argument (after the program name).
-
-```lin
-val arguments = args()
-arguments.for(a => print(a))
-```
-
----
-
-### `exit`
-
-```lin
-val exit: (code: Int32) -> Null
-```
-
-Terminates the process immediately. `0` = success, non-zero = failure. Does not return.
-
-```lin
-exit(0)
-```
+Wrap the process's standard input as a lazy byte `Stream<UInt8[]>` (streams brief §4).
+- **Returns** a `Stream` that pulls from stdin until EOF; pair with `lines`/`map`/… from std/stream.

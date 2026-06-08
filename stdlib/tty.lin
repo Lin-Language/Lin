@@ -1,14 +1,25 @@
+// std/tty — terminal control: raw mode and non-blocking key input on stdin.
+//
+// Use it to build interactive terminal programs that respond to individual keystrokes rather than
+// full lines. `rawMode(true)` disables canonical line buffering + echo and makes reads
+// non-blocking, saving the original settings so `rawMode(false)` restores them exactly. `readKey`
+// reads one byte without blocking (null when nothing is ready), so a real app polls it in a loop,
+// sleeping briefly between empty reads (e.g. via std/time's `sleepMicros`) to avoid busy-spinning.
+// Multi-byte sequences (arrow/function keys) arrive one byte at a time.
+//
+//   import { rawMode, readKey } from "std/tty"
 import foreign "lin-runtime"
   val lin_tty_raw_mode: (Int32) => Json
   val lin_tty_read_key: () => Json
 
-// enable (on = true) or disable (on = false) terminal raw mode on stdin.
-// Returns Null on success, or an Error (e.g. when stdin is not a terminal),
-// discriminated with `is Error`.
+// Enable or disable terminal raw mode on stdin.
+// @param on  `true` to enable raw mode, `false` to restore cooked mode.
+// @returns `Null` on success, or an `Error` (e.g. when stdin is not a terminal), discriminated
+//   with `is Error`.
 export val rawMode = (on: Boolean): Null | Error =>
   if on then lin_tty_raw_mode(1) else lin_tty_raw_mode(0)
 
-// read a single key (one byte) from stdin without blocking.
-// Returns the byte value as an Int32, or Null if no key is available.
+// Read a single key (one byte) from stdin without blocking.
+// @returns the byte value as an `Int32`, or `null` if no key is available.
 export val readKey = (): Int32 | Null =>
   lin_tty_read_key()

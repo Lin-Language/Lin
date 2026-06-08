@@ -433,6 +433,44 @@ mod grouped_type_tests {
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
     }
 
+    /// A function-type return parses with FULL precedence so a `|` binds to the RETURN:
+    /// `(Json) => Int64 | Error` is `(Json) => (Int64 | Error)` (a callable returning a
+    /// union), NOT the non-callable `((Json) => Int64) | Error` that single-leaf return
+    /// precedence produced. Counterpart to the grouped-type tests: the discriminator is
+    /// whether `=>` follows the `)`.
+    #[test]
+    fn function_type_union_return_binds_to_return() {
+        use crate::ast::TypeExpr;
+        let (diags, m) = parse("type F = (Json) => Int64 | Error\n");
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        let body = match &m.statements[0] {
+            crate::ast::Stmt::TypeDecl { body, .. } => body,
+            other => panic!("expected TypeDecl, got {other:?}"),
+        };
+        match body {
+            TypeExpr::Function(params, ret, _) => {
+                assert_eq!(params.len(), 1, "expected single param, got {params:?}");
+                assert!(
+                    matches!(**ret, TypeExpr::Union(..)),
+                    "return must be a union bound to the function, got {ret:?}"
+                );
+            }
+            other => panic!(
+                "expected Function with a union return, got {other:?} (the union must bind to the return, not wrap the whole function type)"
+            ),
+        }
+    }
+
+    /// A grouped union/array can appear in both return and param position of a function type
+    /// without the grouped-type path being disturbed by the union-return fix.
+    #[test]
+    fn function_type_with_grouped_array_parts_parses() {
+        let (d1, _) = parse("type F = () => (String | Null)[]\n");
+        assert!(d1.is_empty(), "grouped-array return: {d1:?}");
+        let (d2, _) = parse("type F = ((String | Null)[]) => Int32\n");
+        assert!(d2.is_empty(), "grouped-array param: {d2:?}");
+    }
+
     /// Regression guard: ordinary function types must STILL parse (the branch we touched).
     #[test]
     fn function_types_still_parse() {

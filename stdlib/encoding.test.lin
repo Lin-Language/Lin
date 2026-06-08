@@ -1,0 +1,312 @@
+import { expect, toBe, test, suite, run } from "std/test"
+import { length, push } from "std/array"
+import { for } from "std/iter"
+import { fromUtf8 } from "std/string"
+import { keys } from "std/object"
+import { base64Encode, base64Decode, base64UrlEncode, base64UrlDecode, base64EncodeString, base64DecodeString, hexEncode, hexDecode, urlEncode, urlDecode, parseQuery, buildQuery, hash } from "std/encoding"
+
+// std/encoding: Base64 (standard + URL-safe), hex, URL/percent, and query-string codecs.
+// Encoders never fail; decoders return `T | Error`. These tests cover the RFC 4648 base64
+// vectors and padding edges, round-trips, the Error arm of every fallible func, and
+// multibyte UTF-8 through urlEncode/urlDecode and the query codec.
+// --- assertion helpers -----------------------------------------------------
+// True if a decode result is the Error value.
+val isErr = (r: Json): Boolean =>
+  match r
+    is Error => true
+    else => false
+
+// Render a UInt8[] | Error as a comma-joined byte list (or "ERR") for a stable toBe compare.
+val bytesStr = (r: Json): String =>
+  match r
+    is Error => "ERR"
+    else =>
+      joinBytes(r, length(r), 0, "")
+
+val joinBytes = (r: UInt8[], n: Int32, i: Int32, acc: String): String =>
+  if i >= n then
+    acc
+  else if i == 0 then
+    joinBytes(r, n, 1, "${r[0]}")
+  else
+    joinBytes(r, n, i + 1, "${acc},${r[i]}")
+
+// Unwrap a String | Error to the string, or "ERR" on the error arm.
+val str = (r: Json): String =>
+  match r
+    is Error => "ERR"
+    else => r
+
+val s = suite("std/encoding", [
+  // --- base64 encode (RFC 4648 §10 / §4 vectors) ---------------------------
+  test("base64Encode RFC 4648 vectors", () =>
+    [
+      expect(base64Encode([])).toBe(""),
+      expect(base64Encode([102])).toBe("Zg=="),
+      expect(base64Encode([102, 111])).toBe("Zm8="),
+      expect(base64Encode([102, 111, 111])).toBe("Zm9v"),
+      expect(base64Encode([102, 111, 111, 98])).toBe("Zm9vYg=="),
+      expect(base64Encode([102, 111, 111, 98, 97])).toBe("Zm9vYmE="),
+      expect(base64Encode([102, 111, 111, 98, 97, 114])).toBe("Zm9vYmFy")
+    ]
+  ),
+
+  test("base64Encode proposal examples + binary edge", () =>
+    [
+      expect(base64Encode([72, 105])).toBe("SGk="),
+      expect(base64Encode([255, 255, 255])).toBe("////"),
+      expect(base64Encode([0, 0, 0])).toBe("AAAA"),
+      expect([72, 105].base64Encode()).toBe("SGk=")
+    ]
+  ),
+
+  // --- base64 decode --------------------------------------------------------
+  test("base64Decode RFC 4648 vectors round-trip", () =>
+    [
+      expect(bytesStr(base64Decode(""))).toBe(""),
+      expect(str(fromUtf8(unwrapBytes(base64Decode("Zg=="))))).toBe("f"),
+      expect(str(fromUtf8(unwrapBytes(base64Decode("Zm8="))))).toBe("fo"),
+      expect(str(fromUtf8(unwrapBytes(base64Decode("Zm9v"))))).toBe("foo"),
+      expect(str(fromUtf8(unwrapBytes(base64Decode("Zm9vYmFy"))))).toBe("foobar")
+    ]
+  ),
+
+  test("base64Decode padding edges and no-padding", () =>
+    [
+      expect(bytesStr(base64Decode("SGk="))).toBe("72,105"),
+      // "SGk" (length 3, ≡ 3 mod 4) is a valid unpadded encoding
+      expect(bytesStr(base64Decode("SGk"))).toBe("72,105"),
+      expect(bytesStr(base64Decode("QQ=="))).toBe("65"), // single byte 'A'
+      // whitespace inside the input is ignored (wrapped / pretty-printed base64)
+      expect(bytesStr(base64Decode("SG\nk="))).toBe("72,105"),
+      expect(bytesStr(base64Decode("  ////  "))).toBe("255,255,255")
+    ]
+  ),
+
+  test("base64Decode rejects malformed input (Error arm)", () =>
+    [
+      // length ≡ 1 (mod 4): a stray '=' after a complete group is impossible padding
+      expect(isErr(base64Decode("SGkx="))).toBe(true),
+      // non-alphabet character
+      expect(isErr(base64Decode("@@@@"))).toBe(true),
+      // stray padding with no partial group
+      expect(isErr(base64Decode("=="))).toBe(true),
+      // data after padding
+      expect(isErr(base64Decode("SG=k"))).toBe(true)
+    ]
+  ),
+
+  // --- base64 url-safe ------------------------------------------------------
+  test("base64UrlEncode uses -_ and drops padding", () =>
+    [
+      expect(base64UrlEncode([255, 255, 255])).toBe("____"),
+      expect(base64UrlEncode([251, 255])).toBe("-_8"),
+      expect(base64UrlEncode([])).toBe(""),
+      expect(base64Encode([251, 255])).toBe("+/8=")
+    ]
+  ),
+
+  test("base64UrlDecode accepts optional padding, rejects standard chars", () =>
+    [
+      expect(bytesStr(base64UrlDecode("____"))).toBe("255,255,255"),
+      expect(bytesStr(base64UrlDecode("-_8"))).toBe("251,255"),
+      // padding is optional but tolerated
+      expect(bytesStr(base64UrlDecode("-_8="))).toBe("251,255"),
+      // standard-alphabet chars are rejected in url-safe mode
+      expect(isErr(base64UrlDecode("+/=="))).toBe(true)
+    ]
+  ),
+
+  // --- base64 string wrappers ----------------------------------------------
+  test("base64EncodeString / base64DecodeString round-trip text", () =>
+    [
+      expect(base64EncodeString("Hi")).toBe("SGk="),
+      expect(base64EncodeString("")).toBe(""),
+      expect(str(base64DecodeString("SGk="))).toBe("Hi"),
+      // multibyte UTF-8 text round-trips through bytes
+      expect(str(base64DecodeString(base64EncodeString("café")))).toBe("café"),
+      // malformed base64 surfaces an Error
+      expect(isErr(base64DecodeString("@@@@"))).toBe(true)
+    ]
+  ),
+
+  // --- hex ------------------------------------------------------------------
+  test("hexEncode lower-case, two chars per byte", () =>
+    [
+      expect(hexEncode([255, 0, 16])).toBe("ff0010"),
+      expect(hexEncode([])).toBe(""),
+      expect(hexEncode([0])).toBe("00"),
+      expect(hexEncode([171, 205])).toBe("abcd"),
+      expect([255, 0, 16].hexEncode()).toBe("ff0010")
+    ]
+  ),
+
+  test("hexDecode accepts both cases, round-trips", () =>
+    [
+      expect(bytesStr(hexDecode("ff0010"))).toBe("255,0,16"),
+      expect(bytesStr(hexDecode("FF0010"))).toBe("255,0,16"), // upper-case
+      expect(bytesStr(hexDecode("AbCd"))).toBe("171,205"), // mixed case
+      expect(bytesStr(hexDecode(""))).toBe("")
+    ]
+  ),
+
+  test("hexDecode rejects odd length and non-hex (Error arm)", () =>
+    [
+      expect(isErr(hexDecode("FFF"))).toBe(true), // odd length
+      expect(isErr(hexDecode("zz"))).toBe(true), // non-hex
+      expect(isErr(hexDecode("0x10"))).toBe(true), // no 0x prefix support ('x' is non-hex)
+      expect(isErr(hexDecode("ff 00"))).toBe(true) // whitespace not skipped
+    ]
+  ),
+
+  // --- urlEncode / urlDecode ------------------------------------------------
+  test("urlEncode escapes reserved, keeps unreserved", () =>
+    [
+      expect(urlEncode("a b/c")).toBe("a%20b%2Fc"), // space %20, '/' escaped
+      expect(urlEncode("safe-._~")).toBe("safe-._~"), // unreserved unchanged
+      expect(urlEncode("")).toBe(""),
+      // all reserved delimiters escaped
+      expect(urlEncode("?#&=+")).toBe("%3F%23%26%3D%2B"),
+      // multibyte UTF-8: é = C3 A9
+      expect(urlEncode("café")).toBe("caf%C3%A9"),
+      expect("a b/c".urlEncode()).toBe("a%20b%2Fc") // dot form
+    ]
+  ),
+
+  test("urlDecode reverses escapes incl + and multibyte", () =>
+    [
+      expect(str(urlDecode("a%20b%2Fc"))).toBe("a b/c"),
+      expect(str(urlDecode("caf%C3%A9"))).toBe("café"), // multibyte UTF-8 reassembled
+      expect(str(urlDecode("a+b"))).toBe("a b"), // + decodes to space
+      expect(str(urlDecode("safe-._~"))).toBe("safe-._~"),
+      expect(str(urlDecode(""))).toBe("")
+    ]
+  ),
+
+  test("urlDecode rejects malformed escapes (Error arm)", () =>
+    [
+      expect(isErr(urlDecode("%zz"))).toBe(true), // non-hex after %
+      expect(isErr(urlDecode("100%"))).toBe(true), // truncated escape
+      expect(isErr(urlDecode("ab%C3"))).toBe(true) // incomplete UTF-8 multibyte -> invalid
+    ]
+  ),
+
+  test("urlEncode/urlDecode round-trip arbitrary text", () =>
+    [
+      expect(str(urlDecode(urlEncode("hello world & friends = ?")))).toBe("hello world & friends = ?"),
+      expect(str(urlDecode(urlEncode("Grüße / 日本語")))).toBe("Grüße / 日本語")
+    ]
+  ),
+
+  // --- parseQuery -----------------------------------------------------------
+  test("parseQuery builds a multimap, repeated keys collected", () =>
+    val m = parseQuery("a=1&b=2&a=3")
+    [
+      expect(length(m["a"])).toBe(2),
+      expect(m["a"][0]).toBe("1"),
+      expect(m["a"][1]).toBe("3"),
+      expect(m["b"][0]).toBe("2"),
+      expect(length(m["b"])).toBe(1)
+    ]
+  ),
+
+  test("parseQuery handles ? prefix, + space, bare key, empty", () =>
+    val m1 = parseQuery("?q=hello+world")
+    val m2 = parseQuery("flag")
+    val m3 = parseQuery("")
+    [
+      expect(m1["q"][0]).toBe("hello world"), // leading ? stripped, + -> space
+      expect(m2["flag"][0]).toBe(""), // bare key -> single "" value
+      expect(length(keys(m3))).toBe(0) // empty query -> empty map
+    ]
+  ),
+
+  test("parseQuery percent-decodes keys and values (incl multibyte)", () =>
+    val m = parseQuery("name=caf%C3%A9&a%20b=x")
+    [
+      expect(m["name"][0]).toBe("café"),
+      expect(m["a b"][0]).toBe("x") // percent-decoded key
+    ]
+  ),
+
+  // --- buildQuery -----------------------------------------------------------
+  test("buildQuery serializes a multimap (inverse of parseQuery)", () =>
+    [
+      expect(buildQuery({ "a": ["1", "3"], "b": ["2"] })).toBe("a=1&a=3&b=2"),
+      expect(buildQuery({ "q": ["hello world"] })).toBe("q=hello+world"),
+      expect(buildQuery({  })).toBe(""),
+      expect(buildQuery({ "x": ["a/b=c"] })).toBe("x=a%2Fb%3Dc")
+    ]
+  ),
+
+  test("parseQuery then buildQuery round-trips", () =>
+    val q = "a=1&a=3&b=hello+world"
+    [
+      expect(buildQuery(parseQuery(q))).toBe("a=1&a=3&b=hello+world")
+    ]
+  )
+])
+
+// Unwrap a UInt8[] | Error to the bytes (empty UInt8[] on the error arm — only used in
+// tests that already assert success, so the error arm is unreachable there).
+val unwrapBytes = (r: Json): UInt8[] =>
+  match r
+    is Error =>
+      val empty: UInt8[] = []
+      empty
+    else => r
+
+// Structural hash (folded in from the former std/hash module). hash(x) returns a canonical,
+// type-tagged string key: equal values hash equal, different types never collide, objects
+// hash independent of key order (matching structural equality, spec §14).
+val hashSuite = suite("std/encoding hash", [
+  test("primitives carry a type tag", () => [
+    expect(hash(null)).toBe("N"),
+    expect(hash(true)).toBe("b:true"),
+    expect(hash(false)).toBe("b:false"),
+    expect(hash(42)).toBe("i:42"),
+    expect(hash("hello")).toBe("s:hello")
+  ]),
+
+  test("equal values hash equal", () => [
+    expect(hash(42) == hash(42)).toBe(true),
+    expect(hash("abc") == hash("abc")).toBe(true),
+    expect(hash([1, 2, 3]) == hash([1, 2, 3])).toBe(true)
+  ]),
+
+  test("different values hash differently", () => [
+    expect(hash(1) == hash(2)).toBe(false),
+    expect(hash("a") == hash("b")).toBe(false)
+  ]),
+
+  test("types do not collide: 42 vs \"42\"", () => [
+    expect(hash(42) == hash("42")).toBe(false),
+    expect(hash(true) == hash("true")).toBe(false),
+    expect(hash(null) == hash("null")).toBe(false)
+  ]),
+
+  test("arrays hash element-wise and order-sensitively", () => [
+    expect(hash([1, 2]) == hash([1, 2])).toBe(true),
+    expect(hash([1, 2]) == hash([2, 1])).toBe(false),
+    expect(hash([])).toBe("a:[]")
+  ]),
+
+  test("objects hash independent of key order", () =>
+    val a = { "x": 1, "y": 2 }
+    val b = { "y": 2, "x": 1 }
+    [
+      expect(hash(a) == hash(b)).toBe(true)
+    ]
+  ),
+
+  test("nested structures hash deeply", () =>
+    val a = { "items": [1, 2], "meta": { "n": 3 } }
+    val b = { "meta": { "n": 3 }, "items": [1, 2] }
+    [
+      expect(hash(a) == hash(b)).toBe(true),
+      expect(hash(a) == hash({ "items": [1, 2], "meta": { "n": 4 } })).toBe(false)
+    ]
+  )
+])
+
+run([s, hashSuite])

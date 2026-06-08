@@ -1,7 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH, Duration};
-use crate::string::{LinString, lin_string_from_bytes};
+use crate::string::{LinString, lin_string_from_bytes, lin_string_release};
 use crate::fs::{make_string, make_error_tagged, resolve_lin_str};
-use crate::tagged::lin_box_int64;
+use crate::object::{lin_object_alloc, lin_object_set, LinObject};
+use crate::tagged::{lin_box_int64, TaggedVal, TAG_INT32, TAG_OBJECT, alloc_tagged};
 
 /// Current Unix timestamp in milliseconds.
 #[no_mangle]
@@ -426,6 +427,101 @@ pub unsafe extern "C" fn lin_time_parse(s: *const u8, pattern: *const u8) -> *mu
     }
 }
 
+// ---------------------------------------------------------------------------
+// Civil-date FFI: components / from_components (pure, UTC).
+// ---------------------------------------------------------------------------
+
+/// Set an Int32 field (key -> value) on an object, balancing the key reference.
+/// Int32 is a scalar held inline in the TaggedVal payload (no value RC), so only
+/// the freshly-made key string needs releasing after `lin_object_set` retains it.
+unsafe fn set_int32(obj: *mut LinObject, key: &str, val: i32) {
+    let k = make_string(key);
+    let mut tv: TaggedVal = std::mem::zeroed();
+    tv.tag = TAG_INT32;
+    tv.payload = val as i64 as u64;
+    lin_object_set(obj, k, &tv); // retains k, copies the scalar tv
+    lin_string_release(k); // drop our local +1; object owns its own key ref
+}
+
+/// components: (ts_ms: Int64) => Json (object). Decompose a Unix-millisecond
+/// instant into its UTC calendar fields. Never fails: every Int64 is a valid
+/// instant. Uses floor division so negative (pre-1970) timestamps decompose
+/// correctly. month 1-12, day 1-31, hour 0-23, minute/second 0-59, millis 0-999,
+/// weekday 0=Sunday..6=Saturday, yearDay 1-366.
+#[no_mangle]
+pub unsafe extern "C" fn lin_time_components(ms: i64) -> *mut u8 {
+    let days = div_floor(ms, 86_400_000);
+    let mut rem = rem_floor(ms, 86_400_000); // [0, 86_400_000)
+    let (year, month, day) = civil_from_days(days);
+    let millis = rem % 1000;
+    rem /= 1000; // seconds within the day [0, 86400)
+    let hour = rem / 3600;
+    rem %= 3600;
+    let minute = rem / 60;
+    let second = rem % 60;
+    let weekday = weekday_from_days(days);
+    let year_day = days - days_from_civil(year, 1, 1) + 1;
+
+    let obj = lin_object_alloc(9);
+    set_int32(obj, "year", year as i32);
+    set_int32(obj, "month", month as i32);
+    set_int32(obj, "day", day as i32);
+    set_int32(obj, "hour", hour as i32);
+    set_int32(obj, "minute", minute as i32);
+    set_int32(obj, "second", second as i32);
+    set_int32(obj, "millis", millis as i32);
+    set_int32(obj, "weekday", weekday as i32);
+    set_int32(obj, "yearDay", year_day as i32);
+    alloc_tagged(TAG_OBJECT, obj as u64)
+}
+
+/// from_components: (year, month, day, hour, minute, second, millis: Int32)
+///   => Int64 (boxed) | Error. Inverse of `components`. Validates every field
+/// (rejecting rather than normalising) against leap-year-aware month lengths so
+/// calendar typos surface as errors. This is the single source of range-validation
+/// truth shared by `fromComponents` (and the pre-clamped `addMonths` path, which
+/// by construction cannot trip it).
+#[no_mangle]
+pub unsafe extern "C" fn lin_time_from_components(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    millis: i64,
+) -> *mut u8 {
+    let (y, mo, d) = (year, month, day);
+    let (h, mi, s, ml) = (hour, minute, second, millis);
+
+    if !(1..=12).contains(&mo) {
+        return make_error_tagged(&format!("month {} out of range", month));
+    }
+    let dim = days_in_month(y, mo);
+    if d < 1 || d > dim {
+        return make_error_tagged(&format!(
+            "day {} out of range for month {} of {}",
+            day, month, year
+        ));
+    }
+    if !(0..=23).contains(&h) {
+        return make_error_tagged(&format!("hour {} out of range", hour));
+    }
+    if !(0..=59).contains(&mi) {
+        return make_error_tagged(&format!("minute {} out of range", minute));
+    }
+    if !(0..=59).contains(&s) {
+        return make_error_tagged(&format!("second {} out of range", second));
+    }
+    if !(0..=999).contains(&ml) {
+        return make_error_tagged(&format!("millis {} out of range", millis));
+    }
+
+    let day_index = days_from_civil(y, mo, d);
+    let ts = day_index * 86_400_000 + h * 3_600_000 + mi * 60_000 + s * 1000 + ml;
+    lin_box_int64(ts)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +582,56 @@ mod tests {
         assert_eq!(strftime(&c, "%B"), "January");
         // literal '%' and unknown specifier emitted verbatim.
         assert_eq!(strftime(&c, "%H%%"), "10%");
+    }
+
+    // Pure civil-date round-trip: from_components(components(ts)) == ts, over the
+    // awkward corpus (epoch, pre-1970 negatives, leap-year Feb 29, year boundaries).
+    // Exercises the same math the FFI intrinsics use without the box ABI.
+    fn comps(ms: i64) -> (i64, i64, i64, i64, i64, i64, i64) {
+        let days = div_floor(ms, 86_400_000);
+        let mut rem = rem_floor(ms, 86_400_000);
+        let (y, mo, d) = civil_from_days(days);
+        let millis = rem % 1000;
+        rem /= 1000;
+        let h = rem / 3600;
+        rem %= 3600;
+        (y, mo, d, h, rem / 60, rem % 60, millis)
+    }
+    fn from_comps(c: (i64, i64, i64, i64, i64, i64, i64)) -> i64 {
+        days_from_civil(c.0, c.1, c.2) * 86_400_000
+            + c.3 * 3_600_000 + c.4 * 60_000 + c.5 * 1000 + c.6
+    }
+
+    #[test]
+    fn civil_components_roundtrip_corpus() {
+        let corpus: &[i64] = &[
+            0,                  // epoch
+            1_705_314_600_000,  // 2024-01-15T10:30:00Z
+            -1,                 // 1969-12-31T23:59:59.999Z
+            -86_400_000,        // 1969-12-31T00:00:00Z
+            -100_000_000_000,   // deep pre-1970
+            1_709_164_800_000,  // 2024-02-29T00:00:00Z (leap)
+            1_709_251_199_999,  // 2024-02-29T23:59:59.999Z
+            951_782_400_000,    // 2000-02-29 (leap, %400)
+            -62_135_596_800_000,// 0001-01-01 area
+            253_402_300_799_000,// year 9999 area
+            1_704_067_199_999,  // 2023-12-31T23:59:59.999Z (year boundary)
+            1_704_067_200_000,  // 2024-01-01T00:00:00Z
+        ];
+        for &ts in corpus {
+            assert_eq!(from_comps(comps(ts)), ts, "roundtrip failed for ts={}", ts);
+        }
+    }
+
+    #[test]
+    fn components_known_values() {
+        // 2024-01-15T10:30:00Z
+        let c = comps(1_705_314_600_000);
+        assert_eq!(c, (2024, 1, 15, 10, 30, 0, 0));
+        // epoch weekday is Thursday=4 (Sunday-origin)
+        assert_eq!(weekday_from_days(0), 4);
+        // 2024-01-15 was a Monday=1
+        assert_eq!(weekday_from_days(div_floor(1_705_314_600_000, 86_400_000)), 1);
     }
 
     #[test]

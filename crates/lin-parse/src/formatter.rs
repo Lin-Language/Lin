@@ -149,21 +149,68 @@ fn in_arg_position() -> bool {
 }
 
 /// Leading comments for `anchor_start`, rendered as `"{ind}{text}\n"` lines (joined), or empty.
+/// Blank lines the author left within the leading block are preserved as exactly one blank each
+/// (runs collapse to one) — the same single-blank policy Rule 2 applies between statements:
+///   * a blank BETWEEN two consecutive leading comments, and
+///   * a blank between the LAST leading comment and the declaration it precedes
+/// both survive. This lets a module-header comment block stay visually separated from the doc
+/// comment of the first declaration, and a doc comment stay separated from its `val`/`type` when
+/// the author wrote it that way (it still hugs the declaration when there's no blank).
 fn take_leading(anchor_start: u32, ind: &str) -> String {
     CTX.with(|c| {
         let c = c.borrow();
         match c.leading.get(&anchor_start) {
             Some(cs) if !cs.is_empty() => {
+                let line_of_pos = |pos: u32| -> usize {
+                    LINE_STARTS.with(|ls_c| {
+                        let ls = ls_c.borrow();
+                        if ls.is_empty() { 0 } else { line_of(&ls, pos as usize) }
+                    })
+                };
                 let mut out = String::new();
+                let mut prev_line: Option<usize> = None;
                 for cm in cs {
+                    let line = line_of_pos(cm.span.start);
+                    // A source gap of >1 line between this comment and the previous one means the
+                    // author left a blank line there; reproduce a single blank line.
+                    if let Some(p) = prev_line {
+                        if line > p + 1 {
+                            out.push('\n');
+                        }
+                    }
                     out.push_str(ind);
                     out.push_str(&cm.text);
                     out.push('\n');
+                    prev_line = Some(line);
                 }
                 out
             }
             _ => String::new(),
         }
+    })
+}
+
+/// True when the author left a blank line between the LAST leading comment of `anchor_start` and
+/// the declaration's code (the anchor sits >1 source line below that comment). Used by the
+/// statement emitter to keep a module-header block visually separated from the first declaration.
+/// False when no source info is installed (comment-free formatter) or the anchor has no leading.
+fn blank_between_last_leading_and(anchor_start: u32) -> bool {
+    LINE_STARTS.with(|ls_c| {
+        let ls = ls_c.borrow();
+        if ls.is_empty() {
+            return false;
+        }
+        CTX.with(|c| {
+            let c = c.borrow();
+            match c.leading.get(&anchor_start).and_then(|cs| cs.last()) {
+                Some(last) => {
+                    let last_line = line_of(&ls, last.span.start as usize);
+                    let anchor_line = line_of(&ls, anchor_start as usize);
+                    anchor_line > last_line + 1
+                }
+                None => false,
+            }
+        })
     })
 }
 
@@ -384,6 +431,11 @@ impl Formatter {
             if !leading.is_empty() {
                 flush_aligned_run(&mut run, &mut lines);
                 lines.push(leading.trim_end_matches('\n').to_string());
+                // Preserve a blank the author left between the last leading comment and the
+                // statement itself (e.g. a module-header block above the first declaration).
+                if blank_between_last_leading_and(anchor) {
+                    lines.push(String::new());
+                }
             }
             let s = fmt_stmt(stmt, "");
             let trailing = trailing_text(anchor);

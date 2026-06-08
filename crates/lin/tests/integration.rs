@@ -7630,6 +7630,38 @@ fn fmt(source: &str) -> String {
     lin_parse::Formatter::with_comments(source, comments).format_module(&module)
 }
 
+#[test]
+fn test_fmt_preserves_blank_line_between_leading_comments() {
+    // A blank line the author leaves BETWEEN two leading comment lines is preserved (one blank;
+    // runs collapse to one) — so a module-header comment block stays visually separated from the
+    // doc comment of the first declaration, instead of being glued into one block. This is what
+    // lets the docs generator tell the page intro apart from the first function's doc.
+    let src = "// module header line 1\n// module header line 2\n\n// doc for foo\nval foo = (n: Int32): Int32 =>\n  n + 1\n";
+    let out = fmt(src);
+    assert_eq!(out, src, "blank line between leading comments must be preserved");
+    // Idempotent.
+    assert_eq!(fmt(&out), out, "formatter not idempotent");
+
+    // A run of 2+ blank lines between comments collapses to exactly one.
+    let runs = "// a\n\n\n\n// b\nval x = (): Int32 =>\n  1\n";
+    let collapsed = "// a\n\n// b\nval x = (): Int32 =>\n  1\n";
+    assert_eq!(fmt(runs), collapsed, "blank-line run must collapse to one");
+
+    // No blank between comments stays no blank (the common doc-comment-on-its-decl case).
+    let glued = "// header\n// doc\nval y = (): Int32 =>\n  2\n";
+    assert_eq!(fmt(glued), glued, "adjacent comments must stay adjacent");
+
+    // A blank between the LAST leading comment and the declaration itself is also preserved — this
+    // is the module-header-runs-straight-into-the-first-`export` case (no comment between). It lets
+    // the docs generator separate the page intro from the first declaration cleanly.
+    let hdr = "// module header\nval z = (): Int32 =>\n  3\n";
+    let hdr_sep = "// module header\n\nval z = (): Int32 =>\n  3\n";
+    assert_eq!(fmt(hdr_sep), hdr_sep, "blank between header and decl must be preserved");
+    assert_eq!(fmt(&fmt(hdr_sep)), hdr_sep, "header/decl blank must be idempotent");
+    // ...but a doc comment with NO blank still hugs its declaration (the overwhelmingly common case).
+    assert_eq!(fmt(hdr), hdr, "doc comment with no blank must stay glued to its declaration");
+}
+
 // ── Formatter must never change program meaning ───────────────────────────────
 // The formatter rebuilds source from the AST, which discards parentheses and the
 // generic `<T>` list. If it doesn't re-emit them correctly the formatted code can
@@ -12940,6 +12972,57 @@ print(x)
         "expected success message, got:\n{}",
         output
     );
+}
+
+#[test]
+fn test_foreign_decl_scalar_union_return_is_callable() {
+    // Regression: a function TYPE with a union return (`(A) => B | C`) parsed the return with
+    // single-leaf precedence, so `(Json) => Int64 | Error` became `((Json) => Int64) | Error` —
+    // a non-callable union. The foreign val was then typed as that union and any call failed with
+    // "Cannot call non-function type (?T) => Int64 | { ... }". `=>` is the lowest-precedence type
+    // operator, so the return must bind the whole union. This blocked `std/bignum`/`std/decimal`
+    // whose `lin_*_to_int64` intrinsics are declared `(BigInt) => Int64 | Error`.
+    //
+    // Trigger confirmed: ANY function-type union return, scalar arm (`Int64 | Error`,
+    // `Int64 | Null`, `Float64 | Error`) or otherwise, in a `foreign` decl OR a normal `type`
+    // alias / function annotation. Foreign scalar-union was simply the only place it surfaced,
+    // since other stdlib intrinsics return `Json` (no union) and wrap to `T | Error` in Lin.
+    let (ok, output) = check_source(
+        r#"import foreign "lin-runtime"
+  val lin_demo_to_int: (Json) => Int64 | Error
+
+export val toIntDemo = (x: Json): Int64 | Error => lin_demo_to_int(x)
+
+val r = toIntDemo(5)
+val out = match (r)
+  is Error => 0
+  else => r + 1
+"#,
+    );
+    assert!(
+        ok,
+        "expected a foreign decl with a scalar-union return `(Json) => Int64 | Error` to type-check \
+         and be callable (result narrowing under `is Error`), got:\n{}",
+        output
+    );
+
+    // Other union-return shapes must also check (scalar | Null, float | Error, multi-arm, and a
+    // non-foreign `type` alias — same parse site).
+    for src in [
+        "import foreign \"lin-runtime\"\n  val f: (Json) => Int64 | Null\nexport val g = (x: Json): Int64 | Null => f(x)\n",
+        "import foreign \"lin-runtime\"\n  val f: (Json) => Float64 | Error\nexport val g = (x: Json): Float64 | Error => f(x)\n",
+        "import foreign \"lin-runtime\"\n  val f: (Json) => Int64 | Null | Error\nexport val g = (x: Json): Int64 | Null | Error => f(x)\n",
+        "type Fn = (Json) => Int64 | Error\nexport val g = (f: Fn, x: Json): Int64 | Error => f(x)\n",
+    ] {
+        let (ok, output) = check_source(src);
+        assert!(ok, "expected union-return decl to type-check:\n{}\n---\n{}", src, output);
+    }
+
+    // Regression guard: a plain (non-union) scalar foreign return must still check.
+    let (ok, output) = check_source(
+        "import foreign \"lin-runtime\"\n  val f: (Json) => Int64\nexport val g = (x: Json): Int64 => f(x)\n",
+    );
+    assert!(ok, "plain scalar foreign return regressed:\n{}", output);
 }
 
 #[test]

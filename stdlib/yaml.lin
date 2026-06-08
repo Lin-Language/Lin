@@ -1,17 +1,44 @@
+// std/yaml — parse and serialise YAML.
+//
+// YAML maps onto the same data model as JSON, so a parsed document is an ordinary `Json` value
+// (object, array, string, number, boolean, or null). Because YAML decodes to plain `Json`, it
+// composes directly with std/json's `fromJson` and with std/jq filters — a "yq" query is just
+// `parse` followed by `jq`. Fallible functions return the canonical `Error` value
+// `{ "type": "error", "message": String }`, detectable with `is Error`.
+//
+//   import { parse, parseAll, stringify, stringifyAll } from "std/yaml"
+//
+// Data-model notes: non-string mapping keys (`42: x`) are coerced to their string form; the YAML
+// 1.2 core schema is followed (`yes`/`no`/`on`/`off` parse as strings, not booleans); anchors,
+// aliases, and merge keys (`<<`) are resolved on parse; comments are dropped (stringify
+// round-trips through the parsed value, not the original text).
 import foreign "lin-runtime"
   val lin_yaml_parse: (String) => Json
   val lin_yaml_parse_all: (String) => Json
   val lin_yaml_stringify: (Json) => String
   val lin_yaml_stringify_all: (Json) => String
 
+// Parse a single YAML document into a Json value.
+// @param src  the YAML source text.
+// @returns the parsed value, or an `Error` if `src` is not valid YAML.
 export val parse = (src: String): Json =>
   lin_yaml_parse(src)
 
+// Parse a multi-document YAML stream (`---`-separated) into an array of values.
+// @param src  the YAML source text.
+// @returns a `Json[]` of the parsed documents, or an `Error` if `src` is not valid YAML.
+// @example parseAll("a: 1\n---\nb: 2\n").length()  // 2
 export val parseAll = (src: String): Json =>
   lin_yaml_parse_all(src)
 
+// Serialize a Json value to a single YAML document.
+// @param value  the value to serialize.
+// @returns the YAML text.
 export val stringify = (value: Json): String =>
   lin_yaml_stringify(value)
 
+// Serialize an array of values to a multi-document (`---`-separated) YAML stream.
+// @param values  the values to serialize, one document each.
+// @returns the multi-document YAML text.
 export val stringifyAll = (values: Json[]): String =>
   lin_yaml_stringify_all(values)
