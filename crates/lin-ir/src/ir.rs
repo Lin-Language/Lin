@@ -373,6 +373,12 @@ pub enum Instruction {
     IndexSet { object: Temp, key: Temp, value: Temp, obj_ty: Type, key_ty: Type, val_ty: Type },
     /// result = object.field  — known-shape field access
     FieldGet { dst: Temp, object: Temp, field: String, obj_ty: Type, result_ty: Type },
+    /// object.field = value  — known-shape (literal-key) field WRITE into a PACKED SEALED RECORD.
+    /// The write counterpart of `FieldGet`: codegen stores `value` at the field's constant struct
+    /// offset (a scalar field is a direct store; a heap field releases the old pointer and retains
+    /// the new). Only emitted when `object` is a sealed-scalar-record and `field` is a statically
+    /// present field; a runtime key, an absent field, or a boxed object stay as `IndexSet`.
+    FieldSet { object: Temp, field: String, value: Temp, obj_ty: Type, val_ty: Type },
     /// result = array[index].field — FUSED constant-offset read of a SCALAR field of element
     /// `index` of a sealed-record array (sealed-records Stage 3). Avoids materializing a standalone
     /// sealed struct for the element: codegen GEPs `data + index*stride + (field_off - HEADER)` and

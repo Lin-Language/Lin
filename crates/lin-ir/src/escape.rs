@@ -271,6 +271,14 @@ fn classify_instr(
         Instruction::SealedArrayFieldGet { array, index, .. } => {
             let _ = (array, index);
         }
+        // `object.field = value` stores `value` into the record's heap slot (it now outlives the
+        // local), so the VALUE escapes. The `object` is only written through — not aliased out —
+        // but a record that is mutated in place must stay heap-resident, so mark it escaping too
+        // (fail-safe; suppresses stack allocation of a mutated record).
+        Instruction::FieldSet { object, value, .. } => {
+            mark(escaping, *object);
+            mark(escaping, *value);
+        }
         // A Release is the value's death (scope-exit drop). For a stack/immortal record it's a
         // no-op; it never makes the value escape.
         Instruction::Release { .. } => {}
