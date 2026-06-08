@@ -1379,12 +1379,12 @@ fn is_sealed_scalar_array(ty: &Type) -> bool {
     }
 }
 
-/// Element-field eligibility — the lower.rs mirror of `Codegen::sealed_array_elem_field_packable`.
-/// SCALARS ONLY (Stage 3a) — MUST mirror `Codegen::sealed_array_elem_field_packable` /
-/// `monomorphize::field_packed_scalar` EXACTLY. Heap-field element arrays stay boxed pending the
-/// whole-program record-representation-consistency work (see the codegen gate note).
+/// Element-field eligibility — delegates to the SINGLE source of truth
+/// `Type::is_sealed_array_field_packable` (ADR-063 gate consolidation). The codegen gate
+/// (`Codegen::sealed_array_elem_field_packable`), `monomorphize::field_packed_scalar`, and
+/// `repr::sealed_array_elem_field_packable` all defer to the same predicate, so they cannot drift.
 fn is_sealed_array_elem_field_packable(ty: &Type) -> bool {
-    ty.is_flat_scalar() || matches!(ty, Type::Bool)
+    ty.is_sealed_array_field_packable()
 }
 
 /// True when `param_ty` is an array whose element is a BOXED runtime representation — a generic
