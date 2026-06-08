@@ -2494,6 +2494,7 @@ fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty: &Type, bui
 fn coerce_to_slot_type(t: Temp, value_ty: &Type, slot_ty: &Type, builder: &mut FuncBuilder) -> Temp {
     if type_repr_differs(value_ty, slot_ty)
         || scalar_numeric_repr_differs(value_ty, slot_ty)
+        || int_width_repr_differs(value_ty, slot_ty)
         || flat_scalar_array_repr_differs(value_ty, slot_ty)
     {
         let dst = builder.alloc_temp(slot_ty.clone());
@@ -5090,9 +5091,32 @@ fn scalar_numeric_repr_differs(from: &Type, to: &Type) -> bool {
         return false;
     }
     // Int vs float: representation differs. Float vs float: differs only across widths
-    // (Float32 vs Float64). Int vs int width changes are handled at their own use sites and a
-    // flat-int array's element type matches its members, so don't widen those here.
+    // (Float32 vs Float64). Int vs int width changes are handled separately by
+    // `int_width_repr_differs` (this predicate stays focused on the int↔float / float-width
+    // boundary, since a flat-int array's element type matches its members and must NOT be
+    // re-strided here).
     from.is_float() != to.is_float() || (from.is_float() && to.is_float() && from != to)
+}
+
+/// True when `from` and `to` are BOTH integers of DIFFERENT bit width, so a value of `from`
+/// must be physically widened/truncated (sext/zext/trunc) to occupy `to`'s LLVM integer type.
+///
+/// The motivating bug: a sub-Int32 flat element read inside a branch (`val b: Int32 = if c then
+/// uint8arr[i] else 0`) is loaded at its native width (i8) but flows into a PHI typed at the
+/// binding's declared width (i32). The PHI codegen does NOT coerce its incomings, so without a
+/// widening `Coerce` on the branch value LLVM sees a `phi i32 [ %i8val, … ]` (and a downstream
+/// `shl i32 %phi, 8` over an i8 operand) — rejected by the verifier. The same applies to any
+/// sub-Int32 element (UInt8/Int8/UInt16/Int16) consumed where a wider int is expected, in an `if`
+/// branch OR a `match` arm (both feed a typed PHI through `coerce_to_slot_type`). A direct binding
+/// (`val b: Int32 = uint8arr[i]`) reaches the same choke point, so this also makes that path emit
+/// the explicit widen rather than relying on a later use site.
+///
+/// `compile_ir_coerce` picks the extension by the SOURCE type's signedness (sext for signed,
+/// zext for unsigned) — so a `UInt8` 0xFF widens to 255, a signed `Int8` -1 to -1.
+fn int_width_repr_differs(from: &Type, to: &Type) -> bool {
+    from.is_integer()
+        && to.is_integer()
+        && from.bit_width() != to.bit_width()
 }
 
 /// True when `from` and `to` are FLAT scalar arrays with DIFFERENT element types, so a value of one

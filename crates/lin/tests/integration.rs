@@ -2189,6 +2189,39 @@ print(read(buf).toString())  // 0.5
 }
 
 #[test]
+fn test_subint32_flat_element_widened_into_branch_phi() {
+    // Regression: a sub-Int32 flat array element read inside an `if` branch must be WIDENED to the
+    // PHI's declared int width. `bytes[1]` (a `UInt8[]` element) loads at its native width (i8);
+    // the branch feeds an `if … then … else …` whose result is bound to `Int32`, so the merge PHI
+    // is typed i32. The PHI codegen does NOT coerce its incomings, so without a widening Coerce on
+    // the branch value LLVM saw `phi i32 [ %i8val, … ]` and a downstream `shl i32 %phi, 8` over an
+    // i8 operand — rejected by the verifier ("Both operands to a binary operator are not of the
+    // same type! %ir_shl = shl i8 %flat_get, i32 8"). Fix: `coerce_to_slot_type` now treats an
+    // int↔int width change (`int_width_repr_differs`) as a representation difference and emits the
+    // widening Coerce on the branch value, so both PHI incomings are i32. Unsigned source zext's
+    // (UInt8 0xFF → 255), signed source sext's (Int8 -1 → -1). Cover UInt8 (zext) and Int16 (zext
+    // of a value that does NOT fit in i8, proving the source width — not i8 — drives the extension).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val bytes: UInt8[] = [72, 105]
+val b1: Int32 = if true then bytes[1] else 0
+val r = b1 << 8
+print(toString(r))               // 105 << 8 == 26880
+
+val ws: Int16[] = [300, 1000]
+val w1: Int32 = if true then ws[1] else 0
+val rw = w1 << 4
+print(toString(rw))              // 1000 << 4 == 16000
+
+// Signed sub-Int32 element: the source's signedness drives sign-extension, NOT zext.
+val sb: Int8[] = [-1, -2]
+val sv: Int32 = if true then sb[0] else 0
+print(toString(sv))              // -1, sign-extended (not 255)
+"#);
+    assert_eq!(output, vec!["26880", "16000", "-1"]);
+}
+
+#[test]
 fn test_empty_array_literal_arg_flat_scalar_param() {
     // Regression: an EMPTY array literal `[]` passed as an argument to a flat-scalar `T[]`
     // parameter was mis-compiled. Pure bottom-up inference of `[]` yields `Array(Never)` (no
