@@ -102,7 +102,8 @@ val renderDocLine = (text: String): String =>
   else if startsWith(text, "@returns") then
     "- **Returns** ${trim(substring(text, 8, length(text)))}"
   else if startsWith(text, "@example") then
-    "- **Example:** ${trim(substring(text, 8, length(text)))}"
+    val code = trim(substring(text, 8, length(text)))
+    "\n**Example:**\n\n```lin\n${code}\n```"
   else if contains(text, "@returns ") then
     // A compact one-liner like "Sum of a and b. @returns a + b." — split the prose from the
     // mid-line @returns so the tag renders as its own Returns item instead of leaking verbatim.
@@ -113,12 +114,38 @@ val renderDocLine = (text: String): String =>
   else
     text
 
-// Render a buffered doc-comment block (array of bare text lines) into markdown lines, appending to
-// `out`. Plain prose lines are joined into a paragraph; @-tag lines render as their own list items.
-val renderDoc = (docLines: String[], out: String[]): Null =>
-  docLines.for(dl =>
-    push(out, renderDocLine(dl))
+// Render a buffered doc-comment block (array of bare, comment-stripped text lines) into markdown
+// lines, appending to `out`. Plain prose and @-tag lines go through `renderDocLine`; a run of
+// indented lines that follows a blank line is a code example and is wrapped in a ```lin fence
+// (dedented by the leading two spaces). The blank-line predecessor is what distinguishes a real
+// code block from a wrapped `@param`/`@returns` continuation or a `-` list item — both of which are
+// indented too, but never follow a blank line — so those keep rendering as prose.
+val emitDocLines = (textLines: String[], out: String[]): Null =>
+  var inCode = false
+  var prevBlank = true
+  textLines.for(line =>
+    val indented = startsWith(line, "  ")
+    val blank = trim(line) == ""
+    if inCode then
+      if indented then
+        push(out, substring(line, 2, length(line)))
+      else
+        push(out, "```")
+        push(out, "")
+        if !blank then push(out, renderDocLine(line))
+        inCode = false
+    else if indented && prevBlank && !blank then
+      push(out, "```lin")
+      push(out, substring(line, 2, length(line)))
+      inCode = true
+    else
+      push(out, renderDocLine(line))
+    prevBlank = blank
   )
+  if inCode then push(out, "```")
+
+val renderDoc = (docLines: String[], out: String[]): Null =>
+  emitDocLines(docLines, out)
 
 // Generate the markdown for one module from its source.
 val genModule = (modName: String, source: String): String =>
@@ -135,18 +162,20 @@ val genModule = (modName: String, source: String): String =>
   var inHeader = true
   var headerEnd = 0
   var idx = 0
+  val headerLines: String[] = []
   lines.for(line =>
     if inHeader then
       if isBlank(line) then
         inHeader = false
         headerEnd = idx
       else if isComment(line) then
-        push(out, renderDocLine(stripComment(line)))
+        push(headerLines, stripComment(line))
       else
         inHeader = false
         headerEnd = idx
     idx = idx + 1
   )
+  emitDocLines(headerLines, out)
   push(out, "")
   push(out, "## Reference")
   push(out, "")
