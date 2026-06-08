@@ -1,0 +1,285 @@
+# Path 1 — Finish the packed-record approach: integrate packing with the operations
+
+**Status:** Open proposal, one of five independent paths. Self-contained.
+**Direction in one line:** keep one record construct; make the packed/sealed representation we already
+built actually pay off by making the stdlib *operations* (`length`/`map`/`for`/index) work on packed
+data without re-boxing, and decide how packing is chosen (gate, default, or annotation).
+
+---
+
+## Background (shared context — the problem, the framing, the full history)
+
+### The problem
+Reading a field of a known record type — `point["x"]`, `trip["stopTimes"]`, `token["kind"]` — and
+operating over arrays of such records (`length`, `for`, `map`, `filter`) is dramatically slower in Lin
+than in Go/Rust/Zig/Nim, where these are constant-offset loads and const-stride walks.
+
+### The framing correction (the root misconception)
+**Lin's type system is not JSON.** It is syntactically JSON-like and shares JSON's primitives, but
+`type Point = { "x": Int32, "y": Int32 }` is a named, closed, statically-known record type — not a
+dynamic bag. The historical conflation of "looks like JSON" with "is represented like dynamic JSON" is
+the root of the performance problem. Slow field access on a *known* type is not excused by the JSON
+resemblance.
+
+### How Lin represents values today
+- **Boxed (default, dynamic):** a record is a heap `LinObject` — refcounted, string-keyed, hash-indexed
+  when large. `obj["k"]` is a non-inlinable `lin_object_get` call (intern-pointer compare + scan/probe +
+  box result as a 16-byte `TaggedVal`), and is **opaque to LLVM** (no hoist/fold/SROA/elim across it).
+  This is the representation of `Json`, anonymous/inferred literals, structurally-subtyped params, **and
+  every value flowing through a polymorphic stdlib op** (they are typed against this one dynamic ABI).
+- **Packed / "sealed" (fast, opt-in):** a named `type T` laid out as a packed struct
+  `[u32 rc | u32 size | u64 desc | fields...]`, fields at const offsets; an array of them is a
+  header-less contiguous `0xFE` buffer, `elem_stride` bytes/element, with a per-field RC descriptor. A
+  scalar field read of a packed element is `getelementptr + load` — verified, the Go/Rust-class behavior,
+  where it's reached.
+- **Flat scalar arrays:** `Int32[]` is already a contiguous unboxed buffer with specialized lowerings
+  (`lin_flat_array_*`) — precedent that "specialize the op per representation" already exists.
+- Supporting machinery (kept by every path): a `Repr` lattice + debug oracle/verifier
+  (`crates/lin-ir/src/repr.rs`, ADR-062); the single-source gate
+  `Type::is_sealed_array_field_packable` (`crates/lin-check/src/types.rs`), currently **scalar+Bool only**.
+
+### The three costs
+1. **Field reads through the dynamic ABI** — the original motivation, ~72× (typed vs `Json`, 50M reads).
+   **Now understood to be fixable / largely solved** (a spike made even heap-field packed reads a
+   const-offset load).
+2. **Operations at the boxing boundary** — the cost that dominates real programs and was *not*
+   anticipated. Verified at the IR level: `length(tokens)` on a packed `Token[]` emits
+   `lin_sealed_array_to_tagged` — it **materializes the entire array into a boxed `Object[]`** (full copy
+   of every element + field) just to read a `u64` length at offset 8. Same for `map`/`filter`/`for`/
+   `reduce`/`sort`. Every polymorphic op re-boxes a packed array **on entry**.
+3. **Construction refcounting** — per-element-per-field retain on build + a descriptor drop-walk on free.
+   A memory-model cost, not a representation one.
+
+### The full history (what was tried, learned, failed)
+- **H1 — Decisive profile (valid motivation):** typed-record vs `Json` field read ~72×; LLVM even
+  elided a dead typed object. Real, but measured reads of an *already-packed/in-register* value — which
+  is why it looked like reads were the whole story.
+- **H2 — Leak drain (succeeded, independent):** RAPTOR leaked ~190 MB/scan; a class of RC/ownership
+  bugs fixed → ~97% reduction (RSS 6 GB→2.2 GB), bench completes.
+- **H3 — Sealed machinery + harness (built, sound):** per-field RC, descriptor walks, keep-packed ops,
+  **mechanism (i)** (materialize-on-read via a named full-field descriptor), a 3-point ASan harness over
+  {op × position × field-shape}. The harness found a general `sort` leak manual probing had missed.
+- **H4 — Gate widenings (each found one bug; collectively net-negative):** widening
+  scalar→String→Array→Map→nested surfaced + fixed, one per step, real defects — push-into-Json-field
+  **silent data loss**, a `sealed_construct` width-subtyping **panic**, a for/while/reduce per-element
+  **leak**, a nested-record-array push **crash**, a repr-pass nested-array-field **crash**, a missing
+  **KIND_MAP** heap-field kind. But once heap fields packed: **interp ~3× regression**
+  (`Token={kind,text:String}`), **TLV codec crash** (`{tag:Int32,bytes:Int32[]}`), **zero RAPTOR
+  benefit**. Gate **narrowed back to scalar+Bool** (current merged state); plumbing kept dormant.
+- **H5 — RAPTOR retype (first attempt: correct, >5× regression — but the conclusion was refined, see
+  H5b):** typing trips end-to-end type-checked, passed units, correct digest — but `run.lin` regressed
+  >5× (killed ~45 min vs ~510 s). It clarified two real sub-blockers: `get<T,D>` monomorphization for
+  record-array `T` (a link error), and threading a packed `Trip` through the `Conn` tuple / `Trip|Null`
+  tail-recursive scan param without re-boxing (a UAF/repr-demotion).
+- **H5b — Reframing (the typed-RAPTOR-FIRST argument):** an exact-hot-read micro (the RAPTOR
+  `stopTime["arrivalTime"]` read, `Json` vs typed `StopTime[]`, 2M iters, hand-verified) measured
+  **566 ms → 148 ms (~3.8×)** with **object_get 6M→0, probe-steps 20M→0** — i.e. ~72% of RAPTOR's
+  hot-read cost is *just that it was left `Json`*. Projection: typing the trips moves RAPTOR's ~110 s
+  query toward ~30 s (**~3.5×**), digest byte-identical, **no language change** — just fixing the two
+  H5 crash/RC bugs + the `get<T,D>` monomorphization + retyping `.lin`. **So typed-RAPTOR is the
+  cheapest large win and a candidate FIRST move** — *with this caveat (the reconciliation with H5/H6):*
+  the micro measures the now-shipped **packed const-offset read**; the >5× full-retype regression was
+  the **`length`/combinator materialization** (cost #2) dominating. Whether typed-RAPTOR nets ~3.5× or
+  regresses is therefore **empirical and path-dependent**: it wins iff RAPTOR's hot path is dominated by
+  the (now cheap) field reads rather than by `length`/`for`/combinator calls that still materialize. The
+  honest sequencing: fix the two crash bugs + `get<T,D>`, type the trips, **measure**; if the
+  combinators dominate, Step 1's in-place ABI is the prerequisite that turns the regression into the
+  win. (This is the difference between H5's pessimism and H5b's optimism — both are right about
+  different sub-costs.)
+- **H6 — The cheap-packed-read spike:** made packed heap-field reads cheap (const-offset `load ptr` +
+  retain-if-escapes; sound, ASan-clean; 1.7× on a read-only microbench) — but recovered **only ~6%** of
+  interp's regression. IR showed why: `length`/combinators materialize the whole array on entry
+  (cost #2). **Necessary but not sufficient — reads were not interp's bottleneck.** (Reconciles with
+  H5b: interp is combinator/`length`-heavy so reads don't dominate; RAPTOR's scan may differ — measure.)
+- **H7 — Ruled out:** boxed inline-slot (unsound under structural subtyping); field-shape ratio gate
+  (proxy for the wrong variable, 3.6× blind spot); cheap-reads-alone (~6%); `"${k}"` round-key churn
+  (GROUP-neutral); NaN-box / slab / GC / box-pool (prior negatives).
+- **H8 — Inlining / fusion (a SEPARATE, orthogonal, already-merged lever — see "the orphaned axis"
+  below):** independent of representation, making the hot function-call boundaries *vanish* recovered
+  real time on loop-bound code. Merged: `range(a,b).for(f)` → a counted loop (`23c3e1f`); capturing
+  closures inlined at literal `.for`/combinator call sites (`e98a09a`/`3d3d425`, ~2× on loop-bound
+  code); flat-scalar array push/set inlined; the boxed-`Object[]` `arr[i].field` fusion (`71c89e3`).
+  This axis is **not** about packed vs boxed at all — it is about Lin being a functional language where
+  *everything is a call*, so eliminating call overhead at hot sites is a lever orthogonal to (and
+  composable with) every representation choice.
+
+### The central finding
+The bottleneck was never field reads (fixed). It is that **the packed representation is not integrated
+with the runtime's polymorphic operations** — the layout got fixed; the *verbs over the layout* still
+box. Go/Rust have no equivalent penalty because `len()`/iteration are defined on the contiguous
+representation; there is no second dynamic ABI to convert to. Plus the separate construction-RC cost (#3)
+that no dispatch-axis fix touches.
+
+---
+
+## This path's thesis
+
+The packed/sealed machinery (layout, repr lattice, per-field RC, mechanism (i)) is **built and sound** —
+it just doesn't pay off because cost #2 (the boxing boundary) was never addressed. So *finish the
+approach we started*: make the operations operate on packed data in place, then re-widen / re-default the
+packing decision behind a benchmark gate. No new type, no surface change, no new memory model — make the
+existing typed-record packing actually fast end-to-end.
+
+This is the **continuation** path. It contains three coupled decisions and one sub-choice.
+
+### Already on master (do NOT re-do — this path *continues* from here)
+A meaningful slice of this path is already merged; the work below builds on it:
+- **Scalar field-read fusion is shipped.** `arr[i]["scalarField"]` over a packed sealed-scalar array
+  already lowers to a single const-offset `SealedArrayFieldGet` (`lower.rs::try_lower_sealed_array_field`
+  + codegen `compile_ir_sealed_array_field_get`) — no element materialization. Verified Go/Rust-class.
+- **Fused boxed-Object[] field read is shipped** (`BoxedArrayFieldGet`) — `arr[i].field` over a boxed
+  record array is a single borrowed `lin_array_get` + `lin_object_get`, not a per-access materialize.
+- **The repr-pass nested-sealed-array-field-read classification is fixed** (`f378f2f`) — `t["stopTimes"]`
+  off a packed record is `Packed`, no oracle crash. (This was a live blocker earlier in the effort; it
+  is done.)
+- **The gate is consolidated to one predicate** (`Type::is_sealed_array_field_packable`), and the
+  runtime plumbing (per-field RC descriptors, KIND_MAP, `clone_sealed_array`, mechanism (i)
+  materialize-on-read) is all merged and dormant. The gate is currently **scalar+Bool**.
+So Step 1 below is **only the parts NOT yet done**: the *heap-field* read fusion (scalar is shipped;
+the String/Array/Map/nested extension is the spike on `spike/cheap-typed-reads`, unmerged), and —
+the actual unsolved core — making `length`/iteration/the combinators operate on a packed array **in
+place** instead of materializing it (cost #2, which nothing on master addresses).
+
+### Step 0 (the cheapest large win, do FIRST and MEASURE) — type RAPTOR's trips
+Before the multi-week in-place ABI, the single highest value-to-risk move is to **type RAPTOR's trips
+end-to-end and measure** (§H5b). It is *not* a new feature — it is three bug-fixes + a `.lin` retype:
+- fix the two H5 crash/RC blockers (packed `Trip[]` vs the monomorphized `sort` comparator reading
+  packed elements as boxed; the `Trip|Null` tail-recursive scan-param UAF/repr-demotion);
+- fix `get<T,D>` monomorphization for `T = record-array` (the link error);
+- then type `tripsByRoute: {String: Trip[]}` + the hot-path params as `Trip`/`StopTime`.
+The hot-read micro projects **~110 s → ~30 s (~3.5×)**, digest byte-identical, no language change — and
+the packed const-offset read it relies on **is already shipped**. **But this is exactly where H5
+(>5× regression) and H5b (~3.5× win) must be reconciled empirically:** the win materialises iff RAPTOR's
+hot path is dominated by the now-cheap field *reads* rather than by `length`/`for`/combinator calls that
+still materialize (cost #2). So Step 0 is: do the bug-fixes + retype, **measure**, and branch — if it
+wins, this is the cheapest large RAPTOR win available and needs none of Step 1; if the combinators
+dominate and it still regresses, that is the concrete proof that **Step 1 (the in-place ABI) is the
+prerequisite**, and Step 0 becomes "after Step 1." Either way the measurement is decisive and cheap to
+get. (The `get<T,D>` fix is also literally a down-payment on Step 2b's monomorphization.)
+
+### Step 1 (mandatory if Step 0 shows combinators dominate; the core) — an in-place packed-array ABI
+Make `length`/index/`for`/`map`/`filter`/`reduce`/`sort`/`push`/`set` operate on a `0xFE` packed array
+**in place**, dispatched on the operand's `Repr` (codegen already knows it — exactly as flat `Int32[]`
+is specialized):
+- `length` → load `u64` at offset 8 (no materialize).
+- `arr[i]` → const-offset interior pointer (borrowed; materialize-to-owned only on genuine escape).
+- `arr[i]["field"]` → const-offset load. **Scalar field: already shipped** (see "Already on master").
+  **Heap field** (String/Array/Map/nested): borrowed pointer + retain-if-escapes — the spike on
+  `spike/cheap-typed-reads`, built + ASan-clean, ready to re-land **on top of** the in-place iteration
+  ABI (re-landing it before the combinators are in-place reproduces the §H6 ~6% dead end).
+- iteration → const-stride loop, callback gets a borrowed element pointer; its typed-record param makes
+  field reads const-offset. No per-element box, no `sealed_array_to_tagged`. **This is the unsolved core**
+  — nothing on master makes `length`/`for`/`map`/`reduce` operate on a packed array in place; they all
+  materialize it (cost #2).
+This directly kills cost #2. It is the necessary, not-yet-done core of this entire path.
+
+### Step 2 (the dispatch sub-choice) — how is the in-place op generated?
+Two mechanisms, not exclusive:
+- **(a) Representation-dispatched lowering** (the "Option A" mechanism): one generic op, branches on
+  `Repr` at lowering — packed path or boxed path. Smaller to add, but a **dual lowering to maintain
+  forever**, and a field read is fast only if the value packed.
+- **(b) Monomorphize the stdlib** (the "Option F" mechanism): compile a separate instance per concrete
+  element type (`length$Token`, `for$Trip`) so there is **no shared dynamic ABI to box into** — the
+  boundary is *dissolved*, not special-cased. The Rust/C++/Zig approach; Lin already monomorphizes
+  generics partially (and §H5's `get<T,D>` sub-blocker is literally a missing monomorphization). Cost:
+  compile time + binary-size bloat + extending the monomorphization machinery (which has bitten us:
+  `mangle_type` collisions, `get<T,D>` failure). A pragmatic system does **both**: monomorphize hot
+  statically-typed sites (b), keep a repr-dispatched boxed instance (a) as the shared fallback.
+
+### Step 3 (the default sub-choice) — how is packing *chosen*?
+Once the ABI makes packing never-slower, the gate stops being a perf heuristic. Three sub-variants:
+- **Boxed-default + soundness gate (conservative):** keep boxed default, widen the gate to all
+  layout-eligible heap-field shapes (it's now a soundness predicate "can this pack", not "is it a win").
+  Lowest blast radius; a value is fast only where it provably packed.
+- **Packed-by-default (the "Option B" inversion):** a fully-known closed sealed shape packs by default;
+  boxed is the fallback for genuine dynamism (`Json`, undiscriminated unions, structurally-subtyped
+  params, FFI, transfer). Makes field reads fast **unconditionally** — but highest blast radius
+  (structural/width subtyping and `Json` round-trips must all route through the boxed fallback; this is
+  exactly the packed/boxed-mismatch bug class §H4/H5 produced). Only safe *after* Step 1 proves out and
+  the oracle/verifier + boxed-boundary set are hardened.
+- **Annotation (the "Option C" knob — disfavored):** a `packed` modifier opts a type in. Disfavored: it
+  asks the programmer to annotate what the type already encodes, adds permanent surface area, and still
+  needs Step 1 underneath. If a surface distinction is wanted at all, Path 4 (a distinct `struct` kind)
+  is the better-considered place to spend it. (A pure *usage-inferred* gate — count read vs construct
+  sites — is **rejected**: read-count ≠ read-frequency, the shape-ratio proxy had a measured 3.6× blind
+  spot, and it optimizes the wrong decision since cost #2 is the boundary, not read frequency.)
+
+### The orphaned axis — inlining / fusion (orthogonal to everything above; partly shipped)
+Distinct from representation entirely, and **composable with every path**, is the lever of making Lin's
+hot **function-call boundaries vanish**. Lin is functional — *everything is a call*, including `for`
+(`range().for(f)`) and every combinator — so call overhead is itself a major cost, independent of
+packed-vs-boxed. Already merged and proven (§H8): `range(a,b).for(f)` fused to a counted loop;
+capturing closures inlined at literal `.for`/combinator sites (~2× on loop-bound code); flat-scalar
+push/set inlined; the boxed-`Object[]` `arr[i].field` fusion. **Remaining reach** (the orphaned
+follow-on): extend closure inlining to `arr.for`/`map`/`filter`/`reduce`/`sortBy` with literal/capturing
+closures (the latch-relative-CFG back-edge wiring is the known hazard), and to indirect/cross-module
+callees. This is a separate, lower-risk, no-model-decision lever that helps *every* representation choice
+— it should be tracked as its own workstream, not folded into the packed-vs-boxed decision. (It is the
+core of the parallel `perf-1-inlining-fusion.md` proposal; named here so this path doesn't pretend
+representation is the only axis.)
+
+## What this path fixes
+
+- **Field reads:** yes — scalar shipped; heap via the spike re-land on Step 1.
+- **Combinator/`length` boundary (cost #2):** yes — Step 1, the core of this path.
+- **Construction RC (cost #3):** **no.** Build-heavy/read-once workloads are not helped; compose with
+  Path 3's arenas if that cost matters.
+- **Call-boundary overhead:** **not by this path** — that is the orthogonal inlining/fusion lever above,
+  partly shipped, composable with this path and all others.
+
+## Rationale / why pursue this path
+
+- It fixes the *measured* bottleneck (§H6) at its source, and is the minimum that turns the
+  interp/RAPTOR regressions into wins.
+- **It reuses everything already built and verified** — layout, repr lattice + oracle, per-field RC,
+  mechanism (i), the spike's read fusion. No surface language change, no new memory model. Lowest
+  conceptual disruption of the "make it fast" paths.
+- It is **incremental and each step is shippable + benchmarkable** (ABI on scalar shapes → spike re-land
+  → widen gate per shape → type RAPTOR), encoding the hard-won §H4 lesson: *never widen the
+  representation before the operations underneath are cheap.*
+- Step 1 is **decision-free and the necessary core of Paths 1, 3-composed, and 4** — so this path's first
+  move is valuable no matter which direction is ultimately chosen.
+
+## Cons / risks
+
+- **Doesn't fully answer the framing unless you take the packed-by-default sub-variant** — and that
+  sub-variant (Step 3 inversion) is the highest-risk move, living in the exact packed/boxed-mismatch bug
+  class that consumed this session (structural/width subtyping, `Json` round-trips). The conservative
+  sub-variant leaves field-read speed conditional on whether a value packed.
+- **Touches every eager combinator's lowering** (Step 1) — multi-week; the monomorphization mechanism (b)
+  adds compile-time/bloat costs and extends machinery that has bitten us.
+- **Construction RC untouched** — needs composition with Path 3 for build-heavy workloads.
+- **The boxed boundary is the risk surface.** Every genuine dynamic boundary (`Json` slot,
+  undiscriminated union, FFI, transfer, `toString`/serialize) must still materialize; a missed site is a
+  UAF/mis-read. The repr oracle/verifier is the structural guard and must cover every new in-place
+  lowering — and must be *hardened* before any packed-by-default inversion.
+
+## Relationship to the other paths
+
+- **Path 4 (distinct `struct` kind)** needs this path's Step 1 (the in-place ABI / monomorphization) to
+  make `struct` arrays' operations cheap — Path 4 is the *type*, this path's Step 1 is the *operations*.
+  The packed-by-default sub-variant here is the "no surface change" alternative to Path 4's "explicit new
+  kind" — both deliver fast-by-construction reads, this one by inverting a default (riskier), Path 4 by
+  adding a kind (additive).
+- **Path 2 (inline caches)** is the opposite philosophy — make the *dynamic* representation fast so no
+  packed type is needed. Mutually exclusive in spirit (though a mature system could have both layers).
+- **Path 3 (value semantics / arenas)** is orthogonal and composable — it fixes cost #3 (construction)
+  which this path leaves untouched.
+
+## Acceptance gates (apply to every step)
+
+Full `cargo test --workspace` green; the sealed harness green **plus a new IR-mechanism assertion** (no
+`sealed_array_to_tagged` / per-element box in a typed combinator/`length` hot path — because §H4 proved
+correctness-green is insufficient, the harness missed the perf regression by not benchmarking); RAPTOR
+digest byte-identical (`group=26203913 range=773022892 journeys=139`); ASan-clean (no UAF/double-free/
+scaling leak — the boxed-boundary contract is the risk); **cross-language benchmark non-regression**
+(interp, RAPTOR GROUP/RANGE, records, dijkstra) — prove the mechanism in IR **and** the wall-clock.
+
+## Verdict
+
+The lowest-disruption continuation: it makes the work already done pay off by fixing the one cost that
+was never addressed, reuses all existing machinery, and its first step (the in-place ABI) is the
+decision-free core of several paths. It does not, by itself, fully answer "a struct field read is cheap,
+full stop" (only the risky packed-by-default sub-variant does) and does not touch construction RC. Best
+if the goal is to ship the win without a language change and the appetite for the eventual default-
+inversion risk is there.
