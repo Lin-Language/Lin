@@ -19,10 +19,10 @@
 // var, or array, handed to a worker via `.promise()`, or otherwise outlive the call.
 
 // A single tar entry's header metadata.
-export type TarHeader = { name: String, size: Int64, typeflag: String, isDir: Boolean }
+export type TarHeader = { "name": String, "size": Int64, "typeflag": String, "isDir": Boolean }
 
 // A tar entry together with its fully buffered body (`data`).
-export type TarFile = { name: String, data: UInt8[], size: Int64, typeflag: String, isDir: Boolean }
+export type TarFile = { "name": String, "data": UInt8[], "size": Int64, "typeflag": String, "isDir": Boolean }
 
 // Drive the whole tar archive on the calling thread in constant memory, calling `body` once per entry.
 // @param s     the upstream byte stream (moved in; not reusable after the call).
