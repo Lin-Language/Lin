@@ -15,6 +15,27 @@ use inkwell::values::GlobalValue;
 use inkwell::AddressSpace;
 use std::io::Write as IoWrite;
 
+/// Convert a byte `offset` in `src` to a 1-indexed (line, col). Shared by the coverage region
+/// emitter and the `--debug` DWARF line-table emitter (so byte-offset → line mapping is identical
+/// in both). Column counts Unicode scalar values, matching the existing coverage behaviour.
+pub fn offset_to_line_col(src: &str, offset: u32) -> (u32, u32) {
+    let offset = offset as usize;
+    let mut line = 1u32;
+    let mut col = 1u32;
+    for (i, ch) in src.char_indices() {
+        if i >= offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
 /// A single coverage region: a source span mapped to one profile counter.
 pub struct Region {
     /// Index of the counter (in this function's `__profc` array) that backs this region.
@@ -81,22 +102,8 @@ impl<'ctx> CoverageEmitter<'ctx> {
 
     /// Convert a byte offset in the given source file to (line, col), both 1-indexed.
     pub fn offset_to_line_col_in(&self, file_idx: usize, offset: u32) -> (u32, u32) {
-        let offset = offset as usize;
         let src = self.source_texts.get(file_idx).map(|s| s.as_str()).unwrap_or("");
-        let mut line = 1u32;
-        let mut col = 1u32;
-        for (i, ch) in src.char_indices() {
-            if i >= offset {
-                break;
-            }
-            if ch == '\n' {
-                line += 1;
-                col = 1;
-            } else {
-                col += 1;
-            }
-        }
-        (line, col)
+        offset_to_line_col(src, offset)
     }
 
     /// Emit `__profc_<name>` and `__profd_<name>` globals for a function with N regions.

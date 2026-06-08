@@ -666,6 +666,11 @@ struct FuncBuilder {
     ret_ty: Type,
     blocks: Vec<BasicBlock>,
     current_block: BlockId,
+    /// The source span attributed to instructions emitted right now. Threaded by the lowerer at
+    /// statement/expression boundaries (`with_span`) and stamped onto every instruction by `emit`,
+    /// so the codegen DWARF pass can attach statement-granularity `DILocation`s under `--debug`.
+    /// Purely debug metadata — does not affect IR semantics or non-debug codegen.
+    current_span: Option<lin_common::Span>,
     temp_count: u32,
     temp_types: HashMap<Temp, Type>,
     block_counter: u32,
@@ -724,6 +729,7 @@ impl FuncBuilder {
             instructions: Vec::new(),
             terminator: Terminator::Unreachable,
             span: None,
+            instr_spans: Vec::new(),
         };
         let mut temp_types = HashMap::new();
         let mut temp_count = 0u32;
@@ -741,6 +747,7 @@ impl FuncBuilder {
             ret_ty,
             blocks: vec![entry_block],
             current_block: entry_id,
+            current_span: None,
             temp_count,
             temp_types,
             block_counter: 1,
@@ -771,6 +778,7 @@ impl FuncBuilder {
             instructions: Vec::new(),
             terminator: Terminator::Unreachable,
             span: None,
+            instr_spans: Vec::new(),
         });
         id
     }
@@ -791,7 +799,22 @@ impl FuncBuilder {
     }
 
     fn emit(&mut self, instr: Instruction) {
-        self.current_block_mut().instructions.push(instr);
+        let span = self.current_span;
+        let block = self.current_block_mut();
+        block.instructions.push(instr);
+        // Keep the per-instruction debug-span side-table in lockstep with `instructions`.
+        // Backfill with `None` if some earlier `emit` somehow skipped (defensive; in practice
+        // every push goes through here so they stay 1:1).
+        while block.instr_spans.len() < block.instructions.len() - 1 {
+            block.instr_spans.push(None);
+        }
+        block.instr_spans.push(span);
+    }
+
+    /// Set the source span attributed to subsequently-emitted instructions. Called at
+    /// statement/expression lowering boundaries so DWARF gets statement-granularity locations.
+    fn set_span(&mut self, span: lin_common::Span) {
+        self.current_span = Some(span);
     }
 
     fn terminate(&mut self, term: Terminator) {
@@ -2218,6 +2241,85 @@ fn try_lower_sealed_array_field(
     Some(dst)
 }
 
+/// FUSED `arr[i].field` / `arr[i]["field"]` over a BOXED `Object[]` whose element is a sealed/typed
+/// record stored as a heap `LinObject` (the boxed `Token[]` representation: a record with heap
+/// fields, which the packed-sealed-array gate REJECTS, so the array stays a boxed `Object[]`). When
+/// `object` is `Index{ array, key }` with `array` such an array and `field` is a declared field of
+/// the element record, emit a single `BoxedArrayFieldGet` (borrowed element box + one `lin_object_get`)
+/// instead of the generic `arr[i]` path that MATERIALIZES the whole element into a fresh sealed
+/// struct (alloc + read every field + per-field retain + reload + release) just to read one field.
+/// Returns `Some(dst)` on the fast path, `None` to fall through to the generic path.
+///
+/// Sound: `lin_array_get` returns a BORROWED interior `*TaggedVal` (no fresh box, no release owed),
+/// and `dst` is registered owned with a `Retain` for an RC `result_ty` — identical ownership to the
+/// materialize-then-read path it replaces, so the boxed element's lifetime is unchanged. Only fires
+/// for the SEALED-element case (so the element is a real `LinObject`, never a packed buffer): the
+/// `is_sealed_scalar_array` guard EXCLUDES packed sealed-scalar arrays (handled by the
+/// `SealedArrayFieldGet` fusion), and the element must be a sealed record (`is_sealed_scalar_repr`).
+fn try_lower_boxed_array_field(
+    object: &TypedExpr,
+    field: &str,
+    result_ty: &Type,
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Option<Temp> {
+    let TypedExpr::Index { object: array, key, .. } = object else { return None };
+    let arr_ty = array.ty();
+    // Must be an array of a SEALED record (the boxed `Object[]` shape) that is NOT a packed
+    // sealed-scalar array (which the `SealedArrayFieldGet` fusion already handles).
+    let elem = match &arr_ty {
+        Type::Array(e) => e.as_ref(),
+        _ => return None,
+    };
+    if !is_sealed_scalar_repr(elem) {
+        return None;
+    }
+    if is_sealed_scalar_array(&arr_ty) {
+        return None;
+    }
+    // The field must actually be a declared field of the element record (else the generic path's
+    // safe-access → Null handling applies; keep that conservative behavior).
+    let field_present = matches!(elem, Type::Object { fields, .. } if fields.contains_key(field));
+    if !field_present {
+        return None;
+    }
+    // Lower the index, then the (borrowed where possible) array base last — mirror the Index
+    // borrow-ordering rule (a key that reassigns the array global can't dangle a borrowed base).
+    let (array_temp, index_temp) = if lower_container_base_borrowed_check(array, ctx) {
+        let index_temp = lower_expr(key, builder, ctx);
+        let array_temp = lower_container_base_borrowed(array, builder, ctx)
+            .unwrap_or_else(|| lower_expr(array, builder, ctx));
+        (array_temp, index_temp)
+    } else {
+        let array_temp = lower_expr(array, builder, ctx);
+        let index_temp = lower_expr(key, builder, ctx);
+        (array_temp, index_temp)
+    };
+    let dst = builder.alloc_temp(result_ty.clone());
+    builder.emit(Instruction::BoxedArrayFieldGet {
+        dst,
+        array: array_temp,
+        index: index_temp,
+        field: field.to_string(),
+        arr_ty,
+        result_ty: result_ty.clone(),
+    });
+    // The borrowed field read becomes an owned value (snapshot semantics), exactly like the generic
+    // FieldGet/Index path: a union/Json field is relocated into a fresh owned box; a concrete heap
+    // field is retained; a scalar needs nothing.
+    if is_union_ty(result_ty) {
+        let owned = builder.alloc_temp(result_ty.clone());
+        builder.emit(Instruction::CloneBox { dst: owned, src: dst, ty: result_ty.clone() });
+        builder.register_owned(owned, result_ty.clone());
+        return Some(owned);
+    }
+    if is_rc_type(result_ty) {
+        builder.emit(Instruction::Retain { val: dst, ty: result_ty.clone() });
+        builder.register_owned(dst, result_ty.clone());
+    }
+    Some(dst)
+}
+
 /// Lower `value` into a slot of declared type `slot_ty`, producing a temp in the slot's
 /// representation. Uses the sealed-literal direct-construction fast path when applicable
 /// (`try_lower_sealed_literal`), otherwise `lower_expr` + `coerce_to_slot_type`.
@@ -2491,7 +2593,7 @@ fn const_type(c: &Const) -> Type {
 
 fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
     match stmt {
-        TypedStmt::Val { slot, value, ty, .. } => {
+        TypedStmt::Val { slot, value, ty, name, span } => {
             // A top-level function val was pre-assigned a FuncId in `global_fn_slots`
             // during the module pre-scan (so `CallTarget::Direct` references resolve).
             // Reuse that id when lowering the function body, otherwise a fresh id is
@@ -2515,6 +2617,13 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 // constructed directly as a packed struct (fast path inside lower_value_into_slot).
                 let t = lower_value_into_slot(value, ty, builder, ctx);
                 builder.slots.insert(*slot, t);
+                // DEBUG (Phase 3): declare this `val` as a named DWARF local so it shows by name
+                // in the debugger under `--debug`. Metadata-only (see `Instruction::DebugDeclare`).
+                if let Some(n) = name {
+                    builder.emit(Instruction::DebugDeclare {
+                        temp: t, name: n.clone(), ty: ty.clone(), param_no: None, span: *span,
+                    });
+                }
                 // Also publish top-level vals to their module global (for closure reads).
                 // A `val` binding is single-store and never reassigned, so the global is
                 // immutable: mark it foldable (`immutable: true`).
@@ -2523,7 +2632,7 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 }
             }
         }
-        TypedStmt::Var { slot, value, ty, .. } => {
+        TypedStmt::Var { slot, value, ty, name, span } => {
             if ctx.slot_is_cell(*slot) {
                 // Mutably captured by a closure, or an owning-typed var reassigned inside a branch:
                 // store in a heap cell shared by reference.
@@ -2560,6 +2669,15 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
                 let t = coerce_to_slot_type_owning_bind(raw, &value.ty(), ty, builder);
                 // Plain mutable temp; tracked per var slot, updated on LocalSet.
                 builder.slots.insert(*slot, t);
+                // DEBUG (Phase 3): declare this plain `var` as a named DWARF local. Cell-backed
+                // `var`s (mutably captured by a closure) are handled separately above and are NOT
+                // declared — their slot temp is a heap-cell POINTER whose logical value is behind a
+                // deref, which the current emission does not model. Metadata-only.
+                if let Some(n) = name {
+                    builder.emit(Instruction::DebugDeclare {
+                        temp: t, name: n.clone(), ty: ty.clone(), param_no: None, span: *span,
+                    });
+                }
                 // A top-level `var` is also published to its module global so closures (which
                 // can't see main's SSA temps) can read/write it. Writes inside closures go
                 // through GlobalValSet (see LocalSet); reads through GlobalValGet (LocalGet).
@@ -2710,6 +2828,18 @@ fn lower_stmt(stmt: &TypedStmt, builder: &mut FuncBuilder, ctx: &mut LowerCtx) {
 // -------------------------------------------------------------------------
 
 fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
+    // Attribute instructions emitted while lowering this expression to its source span (debug-only
+    // metadata for DWARF line tables). Restore the enclosing span afterwards so instructions emitted
+    // by the PARENT after this child returns (e.g. a Binary after its operands) get the parent's span,
+    // not this child's. No effect on IR semantics or non-debug codegen.
+    let saved_span = builder.current_span;
+    builder.set_span(expr.span());
+    let result = lower_expr_inner(expr, builder, ctx);
+    builder.current_span = saved_span;
+    result
+}
+
+fn lower_expr_inner(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -> Temp {
     match expr {
         TypedExpr::IntLit(v, ty, _) => {
             builder.const_temp(Const::Int(*v, ty.clone()))
@@ -3404,6 +3534,11 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
                 if let Some(t) = try_lower_sealed_array_field(object, name, result_type, builder, ctx) {
                     return t;
                 }
+                // FUSED `arr[i]["field"]` over a BOXED `Object[]` of a sealed record (the `Token[]`
+                // shape): one borrowed `lin_object_get` instead of materializing the whole element.
+                if let Some(t) = try_lower_boxed_array_field(object, name, result_type, builder, ctx) {
+                    return t;
+                }
             }
             // Sealed scalar record + a compile-time-known string key `x["f"]` → constant-offset
             // FieldGet (same as `x.f`). Routes to the unboxed load path rather than the dynamic
@@ -3605,6 +3740,11 @@ fn lower_expr(expr: &TypedExpr, builder: &mut FuncBuilder, ctx: &mut LowerCtx) -
             // load directly from the contiguous element, skipping the per-element struct
             // materialization the generic Index path would do.
             if let Some(t) = try_lower_sealed_array_field(object, field, result_type, builder, ctx) {
+                return t;
+            }
+            // FUSED `arr[i].field` over a BOXED `Object[]` of a sealed record (the `Token[]` shape):
+            // one borrowed `lin_object_get` instead of materializing the whole element.
+            if let Some(t) = try_lower_boxed_array_field(object, field, result_type, builder, ctx) {
                 return t;
             }
             let obj_ty = object.ty();
@@ -3962,6 +4102,19 @@ fn lower_call(
             // proven std/stream wrapper path exactly.
             if let Some(stream_intr) = stream_combinator_intrinsic_name(&sym, args) {
                 return lower_intrinsic_call(stream_intr, args, result_type, builder, ctx);
+            }
+            // FUSED `range(a, b).for(f)` across the module boundary: in the IMPORTING module `for`
+            // and `range` are calls to the compiled `std_iter_for` / `std_iter_range` symbols, so the
+            // intrinsic-level fusion in `lower_for` never sees them. When `std_iter_for`'s receiver is
+            // a direct `range(...)` call, redirect to the `lin_for` intrinsic lowering — which then
+            // recognises the range receiver (`range_for_bounds`) and emits the fused counted loop,
+            // skipping the materialized range array. Only fires for a literal range receiver; every
+            // other `.for` receiver (array / iterator / union / stream) keeps the Named-call path with
+            // unchanged semantics. (`for` is the only combinator redirected: it discards its result,
+            // so the fused loop is observably identical; map/filter/reduce would need their result
+            // arrays and are left alone.)
+            if sym == "std_iter_for" && range_for_bounds(&args[0], builder, ctx).is_some() {
+                return lower_intrinsic_call("lin_for", args, result_type, builder, ctx);
             }
             let mut shell_boxes: Vec<Temp> = Vec::new();
             // Fully-owned arg boxes (sealed-record array materialized to Json) released right after
@@ -4572,6 +4725,42 @@ fn is_provably_flat_producer(expr: &TypedExpr, builder: &FuncBuilder, ctx: &Lowe
         }
         _ => false,
     }
+}
+
+/// When `iterable` is a direct `range(start, end)` call (resolving to the `lin_range` intrinsic —
+/// either via an intrinsic slot or an imported `range` export), return its two bound expressions.
+/// Used to FUSE `range(a, b).for(f)` into a counted i32 loop that drives the callback directly,
+/// skipping the materialized range array entirely (no array alloc, no N pushes, no N index reads).
+///
+/// Conservatively requires EXACTLY the two `lin_range` args. `range` is always eager + array-shaped,
+/// so the fused loop preserves `for` semantics exactly (the only observable effect of a `for` body is
+/// its side effects, executed once per element in order — identical here).
+fn range_for_bounds<'a>(
+    iterable: &'a TypedExpr,
+    builder: &FuncBuilder,
+    ctx: &LowerCtx,
+) -> Option<(&'a TypedExpr, &'a TypedExpr)> {
+    if let TypedExpr::Call { func, args, .. } = iterable {
+        if args.len() != 2 {
+            return None;
+        }
+        if let TypedExpr::LocalGet { slot, .. } = func.as_ref() {
+            let is_range = builder
+                .intrinsic_slots
+                .get(slot)
+                .map(|intr| intr == "lin_range")
+                .unwrap_or(false)
+                || ctx
+                    .import_fn_slots
+                    .get(slot)
+                    .map(|(sym, _)| sym.rsplit('_').next() == Some("range"))
+                    .unwrap_or(false);
+            if is_range {
+                return Some((&args[0], &args[1]));
+            }
+        }
+    }
+    None
 }
 
 /// Intrinsic names whose IR lowering allocates a FLAT scalar buffer (so a flat read on the result
@@ -5190,6 +5379,16 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
         return dst;
     }
     let (param_tys, _) = callback_signature(&args[1]);
+    // FUSED `range(a, b).for(f)`: when the receiver is a direct `range` call, drive a native i32
+    // counter `i` in `[a, b)` and call the callback with `i` as the element — skipping the
+    // materialized range array entirely (no `lin_range` alloc, no N pushes, no N `Index` reads,
+    // and no iterator-handle leak). `range` is always eager + ordered, so this is observably
+    // identical to iterating the array. The callback ABI / box-release sequence is UNCHANGED from
+    // the generic path below (same boxed element, same return-box release, same shell reclaim), so
+    // captured-`var` mutation and any callback return value behave exactly as before.
+    if let Some((start_e, end_e)) = range_for_bounds(&args[0], builder, ctx) {
+        return lower_range_for(start_e, end_e, &args[1], &param_tys, builder, ctx);
+    }
     // Read elements at the source's PROVABLE runtime representation: flat-scalar only when the
     // source is a provably-flat producer, else the tagged Json read (sound for a `[]`+push array
     // mistyped as flat). See `combinator_read_elem_ty` (ADR-044).
@@ -5230,6 +5429,77 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
         // discards it (a side-effecting body never moves the struct out), so release it or it leaks.
         free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
     });
+    builder.const_temp(Const::Null)
+}
+
+/// Fused lowering for `range(start, end).for(body)`: an i32 counted loop
+/// `for (i = start; i < end; i++) body(i)` that calls the callback directly with the counter as the
+/// element — no materialized range array, no per-element `Index`/`lin_array_get_tagged`. The element
+/// is an unboxed `Int32` (the counter); `call_body_closure_with_elem_boxes` boxes it for the callback
+/// ABI exactly as the generic `for` does over a flat-i32 source, and the per-iteration release /
+/// shell-reclaim sequence is byte-for-byte the generic-path logic — so RC behaviour (captured-`var`
+/// mutation, callback-return discard) is identical.
+fn lower_range_for(
+    start_e: &TypedExpr,
+    end_e: &TypedExpr,
+    callback: &TypedExpr,
+    param_tys: &[Type],
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Temp {
+    // Bounds drive a native i32 counter, so they must be concrete i32 (mirrors `lower_range`).
+    let start_raw = lower_expr(start_e, builder, ctx);
+    let end_raw = lower_expr(end_e, builder, ctx);
+    let start = coerce_to_slot_type(start_raw, &start_e.ty(), &Type::Int32, builder);
+    let end = coerce_to_slot_type(end_raw, &end_e.ty(), &Type::Int32, builder);
+
+    let body = lower_callback_in_safe_ctx(callback, builder, ctx);
+    let elem_ty = Type::Int32;
+    let boxed = Type::TypeVar(u32::MAX);
+
+    let preheader = builder.current_block;
+    let header = builder.alloc_block("range_for_header");
+    let body_block = builder.alloc_block("range_for_body");
+    let exit = builder.alloc_block("range_for_exit");
+
+    let i = builder.alloc_temp(Type::Int32);
+    let i_next = builder.alloc_temp(Type::Int32);
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(header);
+    builder.emit(Instruction::Phi {
+        dst: i,
+        ty: Type::Int32,
+        incomings: vec![(start, preheader), (i_next, body_block)],
+    });
+    let cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary {
+        dst: cond, op: BinOp::Lt, lhs: i, rhs: end,
+        operand_ty: Type::Int32, ty: Type::Bool,
+    });
+    builder.terminate(Terminator::CondJump { cond, then_block: body_block, else_block: exit });
+
+    builder.switch_to(body_block);
+    // The callback receives `i` (Int32) as BOTH the element and the optional 0-based source index
+    // (for a range, element == index). `call_body_closure_with_elem_boxes` boxes `i` per the ABI and
+    // truncates the surplus index arg when the callback declares only `(item)`.
+    let (ret, elem_boxes) = call_body_closure_with_elem_boxes(
+        body, &[(i, elem_ty.clone()), (i, Type::Int32)], param_tys, &boxed, builder,
+    );
+    // Release the callback-RETURN box, then reclaim each element box SHELL if distinct — identical
+    // to the generic `for` path (see `lower_for` for the full rationale).
+    builder.emit(Instruction::Release { val: ret, ty: boxed.clone() });
+    for ebox in &elem_boxes {
+        builder.emit(Instruction::FreeBoxShellIfDistinct { val: *ebox, other: ret });
+    }
+    let one = builder.const_temp(Const::Int(1, Type::Int32));
+    builder.emit(Instruction::Binary {
+        dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
+        operand_ty: Type::Int32, ty: Type::Int32,
+    });
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(exit);
     builder.const_temp(Const::Null)
 }
 
@@ -7273,6 +7543,7 @@ fn lower_function_expr_with_id(
         ret_ty: ret_type.clone(),
         blocks: Vec::new(),
         current_block: BlockId(0),
+        current_span: None,
         temp_count: inner_param_count,
         temp_types: {
             let mut m = HashMap::new();
@@ -7304,6 +7575,7 @@ fn lower_function_expr_with_id(
         instructions: Vec::new(),
         terminator: Terminator::Unreachable,
         span: Some(body.span()),
+        instr_spans: Vec::new(),
     });
 
     // Add capture slots: captured variables become FieldGet on the env pointer.
@@ -7347,6 +7619,24 @@ fn lower_function_expr_with_id(
         }
     }
     inner_builder.push_scope(); // body scope
+    // DEBUG (Phase 3): record each parameter's source name + type as a DWARF formal-parameter, so
+    // a `--debug` build shows function params by name in the debugger. Purely additive metadata
+    // (see `Instruction::DebugDeclare`): it emits no machine code and is ignored by non-debug
+    // codegen. Use the function body span for the declared line (params have no own span). Skip
+    // the implicit closure env pointer (it has no source name). Captured `var`s become cell
+    // pointers and are intentionally NOT declared (their logical value is behind a deref).
+    for (i, param) in params.iter().enumerate() {
+        if let Some(&t) = inner_builder.slots.get(&param.slot) {
+            inner_builder.emit(Instruction::DebugDeclare {
+                temp: t,
+                name: param.name.clone(),
+                ty: param.ty.clone(),
+                // 1-based parameter ordinal (DWARF `arg:` index). Each must be distinct.
+                param_no: Some((i + 1) as u32),
+                span: body.span(),
+            });
+        }
+    }
     // Imported-module top-level `var` init: if this is an exported entry point, run the
     // module's once-guarded var initialiser before the body so any `var` it reads/mutates is
     // already set up. `take()` ensures only this top-level body emits the call; nested

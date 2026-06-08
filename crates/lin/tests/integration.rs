@@ -670,6 +670,40 @@ range(1, 4).for(i => print(toString(i)))
     assert_eq!(output, vec!["1", "2", "3"]);
 }
 
+// Regression for the fused `range(a, b).for(f)` lowering (perf/foreach-closure): the receiver is a
+// literal `range(...)` call, so `for` lowers to a counted i32 loop driving the callback directly —
+// no materialized range array. This MUST stay observably identical to iterating the array:
+//   1. captured-`var` mutation accumulates into the SAME heap cell (sum 0..1000 = 499500), with a
+//      bound large enough to exceed the small-int box cache (so the boxed-element path is exercised);
+//   2. an `arr.for(...)` over a NON-range array still iterates every element (fusion must not
+//      misfire on a non-range receiver);
+//   3. a `range(...)` bound to a `val` first (so the `.for` receiver is a LocalGet, not a literal
+//      range call) takes the generic array path and still produces the right sum.
+#[test]
+fn test_range_for_fusion_semantics() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+// 1. fused range-for with captured-var accumulation, past the small-int box cache.
+var total = 0i64
+range(0, 1000).for(i => total = total + i)
+print(toString(total))
+
+// 2. non-range array .for must still iterate every element.
+var seen = 0
+[10, 20, 30].for(x => seen = seen + x)
+print(toString(seen))
+
+// 3. range bound to a val first → generic path, same result.
+val r = range(0, 1000)
+var total2 = 0i64
+r.for(i => total2 = total2 + i)
+print(toString(total2))
+"#);
+    assert_eq!(output, vec!["499500", "60", "499500"]);
+}
+
 // Regression: elements of a `split()` (and `lines()`) result must iterate correctly under the
 // generic `for`/`map` path. `lin_string_split` previously pushed each element with tag 0
 // (TAG_NULL) instead of TAG_STR, so generic iteration read every element as `null` (index access
@@ -13906,6 +13940,41 @@ print("${people[1]["age"]}")
 print(if people[0]["gone"] == null then "elem-absent" else "elem-present")
 "#);
     assert_eq!(out, vec!["A", "2", "elem-absent"]);
+}
+
+#[test]
+fn test_boxed_record_array_fused_field_read() {
+    // BoxedArrayFieldGet fusion (perf/token-alloc): `arr[i].field` / `arr[i]["field"]` over a BOXED
+    // `Object[]` whose element is a sealed record WITH HEAP FIELDS (a `Token` = two Strings) — the
+    // calc/interp tokenizer shape. Such an array is NOT a packed sealed-scalar array (the gate rejects
+    // heap-field elements), so it stays a boxed `Object[]`. The lowerer fuses the index+field read to a
+    // single borrowed `lin_array_get` + `lin_object_get` instead of MATERIALIZING the whole element
+    // into a fresh sealed struct (alloc + read every field + per-field retain + reload + release) per
+    // access. This asserts the fused read is behaviorally correct: every field reads back its true
+    // value through both `["field"]` and the helper-typed path, push grows the array, length is right,
+    // and an out-of-bounds guard still returns the sentinel. (RC soundness — no UAF/leak — is verified
+    // separately under ASan; this is the behavioral gate.)
+    let out = run(r#"
+import { print } from "std/io"
+import { push, length } from "std/array"
+import { toString } from "std/string"
+type Token = { "kind": String, "text": String }
+val build = (): Token[] =>
+  var t: Token[] = []
+  push(t, { "kind": "num", "text": "42" })
+  push(t, { "kind": "op", "text": "+" })
+  push(t, { "kind": "num", "text": "7" })
+  t
+val kindAt = (toks: Token[], pos: Int32): String =>
+  if pos >= length(toks) then "eof" else toks[pos]["kind"]
+val toks = build()
+print("${length(toks)}")
+print("${kindAt(toks, 0)} ${toks[0]["text"]}")
+print("${kindAt(toks, 1)} ${toks[1]["text"]}")
+print("${kindAt(toks, 2)} ${toks[2]["text"]}")
+print(kindAt(toks, 9))
+"#);
+    assert_eq!(out, vec!["3", "num 42", "op +", "num 7", "eof"]);
 }
 
 #[test]

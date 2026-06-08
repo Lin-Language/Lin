@@ -223,6 +223,7 @@ impl Checker {
 
                 Ok(TypedStmt::Var {
                     slot,
+                    name: Some(name.clone()),
                     value: typed_value,
                     ty,
                     span: *span,
