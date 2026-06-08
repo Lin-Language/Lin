@@ -2792,14 +2792,23 @@ fn extract_doc(source: &str, decl_name_span: lin_common::Span) -> Option<DocComm
         return None;
     }
 
+    // IMPORTANT: lexer/parser `Span` offsets are CHAR offsets into the source (the lexer scans a
+    // `Vec<char>`), NOT byte offsets — so we must count lines in char-offset space here, not via the
+    // byte-based `offset_to_position`. Comment spans and the decl span are both char offsets, so they
+    // stay consistent with one another. (stdlib files carry multibyte chars in their banners/prose,
+    // where a byte/char mix-up would mis-locate the block.)
+    let line_of_char_offset = |char_off: usize| -> u32 {
+        source.chars().take(char_off).filter(|&c| c == '\n').count() as u32
+    };
+
     // The decl's source line (0-based). The leading block must end on the line directly above it.
-    let decl_line = offset_to_position(source, decl_name_span.start as usize).line;
+    let decl_line = line_of_char_offset(decl_name_span.start as usize);
 
     // Pair each own-line comment with its source line, in source order.
     let mut commented_lines: Vec<(u32, &str)> = comments
         .iter()
         .map(|c| {
-            let line = offset_to_position(source, c.span.start as usize).line;
+            let line = line_of_char_offset(c.span.start as usize);
             (line, c.text.as_str())
         })
         .collect();
@@ -5899,6 +5908,211 @@ mod tests {
         // The idiom still yields the (last-written) inner value — no cascade.
         let v = *lock.read().unwrap_or_else(|e| e.into_inner());
         assert_eq!(v, 42, "poison-tolerant read recovers the inner value");
+    }
+
+    // ── doc comments (extract / parse / render) ─────────────────────────────────
+
+    /// `extract_doc` collects the CONTIGUOUS leading own-line block above a decl, ignoring a comment
+    /// separated by a blank line and trailing (same-line) comments.
+    #[test]
+    fn extract_doc_takes_only_the_contiguous_leading_block() {
+        let src = concat!(
+            "// detached header line\n",
+            "\n",
+            "// first doc line\n",
+            "// @param x  the input\n",
+            "val f = (x: Int32) => x   // trailing not part of block\n",
+        );
+        let module = parse(src);
+        let span = local_decl_name_span(&module, "f").expect("f decl");
+        let doc = extract_doc(src, span).expect("doc block");
+        // The blank-separated header is NOT included; only the two contiguous lines are.
+        assert_eq!(doc.description, vec!["first doc line".to_string()]);
+        assert_eq!(doc.params, vec![("x".to_string(), "the input".to_string())]);
+        // Trailing same-line comment (own_line == false) is never collected.
+        assert!(doc.returns.is_none());
+        assert!(doc.examples.is_empty());
+    }
+
+    /// A `── … ──` section banner directly above a decl is NOT that decl's doc — it terminates the
+    /// leading block (so a banner-only run yields no doc).
+    #[test]
+    fn extract_doc_stops_at_section_banner() {
+        let src = concat!(
+            "// ── Arithmetic ──────────────\n",
+            "export val add = (a: Int32, b: Int32) => a + b\n",
+        );
+        let module = parse(src);
+        let span = local_decl_name_span(&module, "add").expect("add decl");
+        assert!(extract_doc(src, span).is_none(), "a banner is not the decl's doc");
+    }
+
+    /// Parsing splits prose / @param / @returns / @example into the structured `DocComment`, and a
+    /// doc with only prose carries an empty params/returns/examples.
+    #[test]
+    fn parse_doc_block_separates_tags_and_handles_prose_only() {
+        let lines: Vec<String> = vec![
+            "Build the ascending integer sequence.".to_string(),
+            "@param start  the first value (inclusive).".to_string(),
+            "@param end    the upper bound (exclusive).".to_string(),
+            "@returns an `Int32[]` of the range.".to_string(),
+            "@example range(0, 5)".to_string(),
+            "@example range(1, 6).map(i => i * i)".to_string(),
+        ];
+        let doc = parse_doc_block(&lines);
+        assert_eq!(doc.description, vec!["Build the ascending integer sequence.".to_string()]);
+        assert_eq!(doc.params.len(), 2);
+        assert_eq!(doc.params[0], ("start".to_string(), "the first value (inclusive).".to_string()));
+        assert_eq!(doc.params[1], ("end".to_string(), "the upper bound (exclusive).".to_string()));
+        assert_eq!(doc.returns.as_deref(), Some("an `Int32[]` of the range."));
+        assert_eq!(doc.examples.len(), 2);
+        assert_eq!(doc.examples[1], "range(1, 6).map(i => i * i)");
+
+        // Prose-only block: no tags.
+        let prose = parse_doc_block(&["Just a description.".to_string()]);
+        assert_eq!(prose.description, vec!["Just a description.".to_string()]);
+        assert!(prose.params.is_empty());
+        assert!(prose.returns.is_none());
+        assert!(prose.examples.is_empty());
+    }
+
+    /// A compact `@param name desc @returns x` line splits into a param entry AND a returns entry,
+    /// and a mid-line `@returns` on a prose line splits prose from the tag (mirrors gen-stdlib).
+    #[test]
+    fn parse_doc_block_splits_compact_returns() {
+        let doc = parse_doc_block(&["@param a  first @returns the sum".to_string()]);
+        assert_eq!(doc.params, vec![("a".to_string(), "first".to_string())]);
+        assert_eq!(doc.returns.as_deref(), Some("the sum"));
+
+        let doc2 = parse_doc_block(&["Sum of a and b. @returns a + b.".to_string()]);
+        assert_eq!(doc2.description, vec!["Sum of a and b.".to_string()]);
+        assert_eq!(doc2.returns.as_deref(), Some("a + b."));
+    }
+
+    /// `render_doc_markdown` produces the expected shape: prose paragraph, a **Parameters** bullet
+    /// list, a **Returns** line, and ```lin example fences.
+    #[test]
+    fn render_doc_markdown_shape() {
+        let doc = DocComment {
+            description: vec!["Run f over every item.".to_string()],
+            params: vec![
+                ("iterable".to_string(), "any Array, Iterator, or Stream.".to_string()),
+                ("f".to_string(), "callback `(item, index?) => …`.".to_string()),
+            ],
+            returns: Some("`null`.".to_string()),
+            examples: vec!["[1, 2, 3].for(x => print(x))".to_string()],
+        };
+        let md = render_doc_markdown(&doc);
+        assert!(md.contains("Run f over every item."), "prose: {md}");
+        assert!(md.contains("**Parameters**"), "params header: {md}");
+        assert!(md.contains("- `iterable` — any Array, Iterator, or Stream."), "param list: {md}");
+        assert!(md.contains("- `f` — callback `(item, index?) => …`."), "param list: {md}");
+        assert!(md.contains("**Returns** `null`."), "returns: {md}");
+        assert!(md.contains("**Example**\n```lin\n[1, 2, 3].for(x => print(x))\n```"), "example fence: {md}");
+        // An empty doc renders to nothing.
+        assert_eq!(render_doc_markdown(&DocComment::default()), "");
+    }
+
+    /// Cross-file/stdlib-style: module A exports a documented `foo`; resolving foo's doc from an
+    /// importing file B (via the index, mirroring hover/completion) returns A's doc text.
+    #[test]
+    fn resolve_doc_via_index_finds_imported_symbol_doc() {
+        let a = concat!(
+            "// Double the input.\n",
+            "// @param n  the number to double.\n",
+            "// @returns twice n.\n",
+            "export val foo = (n: Int32) => n * 2\n",
+        );
+        let b = "import { foo } from \"a\"\nval x = foo(21)\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b)]);
+        let b_id = id_of("/ws/b.lin");
+
+        // Resolve foo's doc as seen from the importing file B.
+        let doc = resolve_doc_via_index(&index, &b_id, "foo").expect("imported doc");
+        assert_eq!(doc.description, vec!["Double the input.".to_string()]);
+        assert_eq!(doc.params, vec![("n".to_string(), "the number to double.".to_string())]);
+        assert_eq!(doc.returns.as_deref(), Some("twice n."));
+
+        // And from A itself (its own export).
+        let a_id = id_of("/ws/a.lin");
+        let doc_self = resolve_doc_via_index(&index, &a_id, "foo").expect("own-export doc");
+        assert_eq!(doc_self.returns.as_deref(), Some("twice n."));
+    }
+
+    /// Regression: lexer/parser spans are CHAR offsets, not byte offsets. The stdlib `std/iter`
+    /// source has multibyte chars (box-drawing banners, ellipses) BEFORE the `range` declaration, so
+    /// a byte/char mix-up would mis-locate the leading block and drop the prose. Extract `range`'s
+    /// doc from the real stdlib source and assert the prose + tags are all captured.
+    #[test]
+    fn extract_doc_char_offset_correct_on_multibyte_stdlib_source() {
+        let src = stdlib_source("std/iter").expect("std/iter source");
+        let module = parse(src);
+        let span = local_decl_name_span(&module, "range").expect("range decl");
+        let doc = extract_doc(src, span).expect("range doc");
+        // Prose line (the multibyte-bearing description) must be present, not dropped.
+        assert!(
+            doc.description_text().contains("ascending integer sequence"),
+            "prose dropped (byte/char span mismatch?): {:?}",
+            doc.description
+        );
+        assert!(doc.params.iter().any(|(n, _)| n == "start"));
+        assert!(doc.params.iter().any(|(n, _)| n == "end"));
+        assert!(doc.returns.is_some());
+        assert_eq!(doc.examples.len(), 2, "both @example lines captured");
+    }
+
+    /// Signature-help param-doc matching: each `@param` description lands on the right parameter
+    /// (matched by name), and the function description annotates the whole signature.
+    #[test]
+    fn signature_help_attaches_param_docs_by_name() {
+        let src = concat!(
+            "// Add two numbers.\n",
+            "// @param a  the first addend.\n",
+            "// @param b  the second addend.\n",
+            "// @returns the sum.\n",
+            "val add = (a: Int32, b: Int32) => a + b\n",
+            "val r = add(1, 2)\n",
+        );
+        let analysis = analyse(src, None);
+        let call_open = src.rfind('(').unwrap();
+        let cursor = call_open + 1; // inside the args, on the first parameter.
+        // Resolve the doc from the same source (local decl).
+        let module = analysis.module.clone();
+        let resolve = |name: &str| -> Option<DocComment> {
+            local_decl_name_span(&module, name).and_then(|s| extract_doc(src, s))
+        };
+        let help = signature_help(src, &analysis, cursor, resolve).expect("signature help");
+        let sig = &help.signatures[0];
+        let params = sig.parameters.as_ref().expect("params");
+        assert_eq!(params.len(), 2);
+
+        let doc_text = |p: &ParameterInformation| match &p.documentation {
+            Some(Documentation::MarkupContent(m)) => m.value.clone(),
+            Some(Documentation::String(s)) => s.clone(),
+            None => String::new(),
+        };
+        assert_eq!(doc_text(&params[0]), "the first addend.");
+        assert_eq!(doc_text(&params[1]), "the second addend.");
+        // The signature itself carries the description + returns.
+        let sig_doc = match &sig.documentation {
+            Some(Documentation::MarkupContent(m)) => m.value.clone(),
+            _ => String::new(),
+        };
+        assert!(sig_doc.contains("Add two numbers."), "sig doc: {sig_doc}");
+        assert!(sig_doc.contains("**Returns** the sum."), "sig doc: {sig_doc}");
+    }
+
+    /// The completion-resolve `data` key round-trips losslessly through serialization.
+    #[test]
+    fn completion_resolve_data_round_trips() {
+        let uri = Url::parse("file:///ws/b.lin").unwrap();
+        let data = completion_resolve_data(&uri, "foo");
+        let (back_uri, back_name) = parse_completion_resolve_data(data.as_ref()).expect("round-trip");
+        assert_eq!(back_uri, uri);
+        assert_eq!(back_name, "foo");
+        // Absent/malformed payloads yield None (the item resolves to itself).
+        assert!(parse_completion_resolve_data(None).is_none());
+        assert!(parse_completion_resolve_data(Some(&serde_json::json!({ "uri": "file:///x" }))).is_none());
     }
 
     /// CJK characters are in the BMP (1 UTF-16 unit, 3 bytes, 1 `char`): they advance the column by
