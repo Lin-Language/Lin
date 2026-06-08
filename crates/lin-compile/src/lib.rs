@@ -571,6 +571,8 @@ fn check_module_with_imports(
     checker.import_types = import_type_map;
     checker.stdlib_export_index = build_stdlib_export_index();
     checker.import_type_decls = import_type_decls;
+    // Every import here is a fully-resolved `TypedModule`, so unknown-export validation is safe.
+    checker.fully_resolved_import_paths = imported_modules.keys().cloned().collect();
     // The trusted stdlib forwards Json handles into concrete intrinsic/foreign params by
     // design, so it checks Json->concrete leniently (ADR-045). User code does not.
     checker.lenient_json = lenient_json;
@@ -623,6 +625,10 @@ fn check_module_with_seeded_imports(
     checker.import_types = import_type_map;
     checker.stdlib_export_index = build_stdlib_export_index();
     checker.import_type_decls = import_type_decls;
+    // Only the acyclic deps (`imported_modules`) are fully resolved. The seeded SCC peers carry
+    // VALUE exports only, so they are deliberately NOT marked fully-resolved — a type import across
+    // the cycle must fall back to a TypeVar, not be rejected as "no export".
+    checker.fully_resolved_import_paths = imported_modules.keys().cloned().collect();
     checker.lenient_json = lenient_json;
     // `lin_*` intrinsics are accessible only to trusted stdlib modules; the LIN_ALLOW_INTRINSICS
     // env var is a test-only escape hatch for the compiler's own intrinsic-exercising fixtures.

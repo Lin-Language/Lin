@@ -5,7 +5,8 @@
 // are read at build time, HTML-escaped, and wrapped as <pre><code class="language-lin">
 // blocks so the client-side highlighter styles them. Tab switching is in theme.js.
 import { readFile } from "std/fs"
-import { replaceAll, length } from "std/string"
+import { replaceAll } from "std/string"
+import { length } from "std/array"
 import { for } from "std/iter"
 
 // Same escaping the Markdown renderer uses for code (& first, then < and >).

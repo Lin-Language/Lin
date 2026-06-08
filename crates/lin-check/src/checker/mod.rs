@@ -43,6 +43,11 @@ pub struct Checker {
     /// An `import { Foo } from "m"` whose `Foo` matches an entry here registers it into the
     /// type env so `Foo` resolves in type annotations (the type-level analogue of `import_types`).
     pub import_type_decls: std::collections::HashMap<(String, String), (Vec<String>, Type)>,
+    /// Import paths whose FULL signature (value + type exports) is loaded — i.e. resolved into a
+    /// complete `TypedModule`. An `import { x } from "p"` naming an `x` that path `p` does not
+    /// export is rejected ONLY when `p` is in this set, so partial-knowledge contexts (SCC Phase-2
+    /// value-only seeding, isolated checks) never produce a false "no export".
+    pub fully_resolved_import_paths: std::collections::HashSet<String>,
     /// Global accumulator of TypeVar solutions discovered during inference.
     /// Populated by every call to collect_type_subs. Used by the zonking pass.
     solved_type_vars: std::collections::HashMap<u32, Type>,
@@ -121,6 +126,7 @@ impl Checker {
             import_types: std::collections::HashMap::new(),
             stdlib_export_index: std::collections::HashMap::new(),
             import_type_decls: std::collections::HashMap::new(),
+            fully_resolved_import_paths: std::collections::HashSet::new(),
             solved_type_vars: std::collections::HashMap::new(),
             protected_type_vars: std::collections::HashSet::new(),
             mutable_global_slots: std::collections::HashMap::new(),
