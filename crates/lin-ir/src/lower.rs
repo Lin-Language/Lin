@@ -2477,8 +2477,21 @@ fn coerce_to_slot_type_owning_bind(t: Temp, value_ty: &Type, slot_ty: &Type, bui
     // reference (released by its own scope). Unlike the union-box case the source is NOT consumed,
     // so leave `t` registered; just register the fresh result so the binding's scope releases it.
     let made_fresh_array = flat_scalar_array_repr_differs(value_ty, slot_ty);
+    // A SEALED-RECORD ARRAY boxed into a Json/union slot does NOT consume the source: codegen's
+    // `box_value` MATERIALIZES a fresh tagged `Object[]` view (`sealed_array_to_tagged`) and boxes
+    // THAT, leaving the original packed `P[]` (`t`) fully owned and still live. So unlike the
+    // ordinary concrete-heap→union box (where the box wraps `t`'s inner and takes its +1), here the
+    // box owns ONLY the fresh materialized array. Both the box AND the source sealed array are
+    // independently owned and must each be released at scope exit — so DON'T `unregister_owned(t)`
+    // (that orphaned the packed source array, leaking its header + element buffer per binding).
+    let sealed_array_materialized = made_fresh_box && is_sealed_scalar_array(value_ty);
     let coerced = coerce_to_slot_type(t, value_ty, slot_ty, builder);
-    if made_fresh_box {
+    if sealed_array_materialized {
+        // Box owns the fresh materialized array; `t` keeps its own +1 (released by its own scope).
+        if coerced != t {
+            builder.register_owned(coerced, slot_ty.clone());
+        }
+    } else if made_fresh_box {
         // The box now owns the inner's +1; the scope releases the box (freeing shell + inner).
         builder.unregister_owned(t);
         builder.register_owned(coerced, slot_ty.clone());
@@ -7777,6 +7790,7 @@ fn lower_function_expr_with_id(
     // flowed straight into the `Return`/box site and emitted invalid LLVM (a `float` operand where
     // the signature declares `double`). `type_repr_differs` only covers the union/Json box boundary,
     // so the scalar-numeric case is checked separately — mirroring `coerce_to_slot_type`.
+    let ret_coerced;
     let ret_temp = if !inner_builder.is_current_block_terminated()
         && (type_repr_differs(&body_ty, &effective_ret)
             || scalar_numeric_repr_differs(&body_ty, &effective_ret)
@@ -7786,9 +7800,37 @@ fn lower_function_expr_with_id(
         inner_builder.emit(Instruction::Coerce {
             dst, src: raw_ret, from_ty: body_ty.clone(), to_ty: effective_ret.clone(),
         });
+        ret_coerced = true;
         dst
     } else {
+        ret_coerced = false;
         raw_ret
+    };
+    // `raw_ret` is normally KEPT alongside `ret_temp`: when the return coercion BOXES a concrete
+    // heap value into a union/Json (`lin_box_object`/`_array`/`_str`/…), the box borrows
+    // `raw_ret`'s pointer WITHOUT bumping its rc, so releasing `raw_ret` would free what the
+    // returned box wraps. The ONE case where keeping `raw_ret` is wrong is the REVERSE edge: an
+    // UNBOX of a union/Json body to a SCALAR (non-rc) result — e.g. a `Json` body `j[0]["x"]`
+    // returned as the declared `Int32`. There codegen reads the scalar value out of the box; the
+    // returned `ret_temp` is a plain scalar that owns NO heap pointer, so the box `raw_ret` is a
+    // fresh +1 `TaggedVal` that nothing else references. Keeping it ORPHANS it (a 16-byte per-call
+    // leak through the dynamic field/index read); releasing it frees only the box shell (plus its
+    // cached/scalar inner, which is a no-op) — safe, no double-free.
+    //
+    // CRUCIALLY this excludes unboxing to a CONCRETE HEAP type (Object/Array/String/Map): there
+    // `ret_temp` is the box's INNER pointer (the returned value), so releasing `raw_ret` would drop
+    // that pointer's rc and free the value being returned (a use-after-free / double-free). So the
+    // exclusion is gated on the result being NON-rc. Every other coercion (box, numeric width,
+    // flat-array widen, unbox-to-heap) keeps `raw_ret` exactly as before.
+    let unboxes_to_scalar = ret_coerced
+        && is_union_ty(&body_ty)
+        && !is_union_ty(&effective_ret)
+        && !is_rc_type(&effective_ret);
+    let return_keep: Vec<Temp> = if unboxes_to_scalar {
+        // The unboxed scalar owns no heap pointer: keep only the result; release the orphaned box.
+        vec![ret_temp]
+    } else {
+        vec![ret_temp, raw_ret]
     };
     // Captured-cell cleanup: free PROVABLY-non-escaping cells created in this function body.
     // A cell is freed here only if NO closure capturing it escaped (see the escape analysis at
@@ -7809,8 +7851,7 @@ fn lower_function_expr_with_id(
             .filter(|(c, _, blk)| {
                 *blk == BlockId(0)
                     && !inner_builder.escaping_cells.contains(c)
-                    && *c != ret_temp
-                    && *c != raw_ret
+                    && !return_keep.contains(c)
             })
             .map(|(c, ty, _)| (*c, ty.clone()))
             .collect();
@@ -7821,10 +7862,10 @@ fn lower_function_expr_with_id(
     // Release owned temps in body scope except the return value AND the raw pre-coercion
     // temp: a box (e.g. lin_box_object) shares the underlying pointer, so releasing the
     // original would free what the returned box wraps.
-    inner_builder.pop_scope_releasing_keep(&[ret_temp, raw_ret]); // body scope
+    inner_builder.pop_scope_releasing_keep(&return_keep); // body scope
     // Release Function-typed params that are not being returned. This balances the
     // retain_call_arg retain emitted by every caller for each Function argument.
-    inner_builder.pop_scope_releasing_keep(&[ret_temp, raw_ret]); // param scope
+    inner_builder.pop_scope_releasing_keep(&return_keep); // param scope
     if !inner_builder.is_current_block_terminated() {
         // Void-returning functions must Return(None) — codegen gives them a void LLVM
         // signature, so returning a value would be a type mismatch.
