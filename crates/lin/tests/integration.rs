@@ -2003,6 +2003,54 @@ run()
 }
 
 #[test]
+fn test_scalar_error_union_narrows_and_phi() {
+    // A union of a SCALAR with Error (`Int64 | Error`):
+    //   (a) NARROWING under `is Error` must refine the binding to the bare scalar in the
+    //       else/non-error branch, so it can flow into an `Int64`-parameter use.
+    //   (b) The if/match merge that consumes the narrowed scalar alongside an int LITERAL must
+    //       not MISCOMPILE its PHI. The literal `0`/`-1` defaults to Int32 while the merge result
+    //       is Int64; without a width coercion at the merge the emitted PHI mixed an i32 and an
+    //       i64 incoming and LLVM rejected the module ("PHI node operands are not the same type as
+    //       the result"). The fix coerces the narrower-int branch to the merge's result width.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val mk = (n: Int64): Int64 | Error => if n < 0 then { "type": "error", "message": "neg" } else n
+val use = (n: Int64): Int64 => n + 100
+val r1 = mk(5)
+val out1 = if r1 is Error then 0 else use(r1)
+print(toString(out1))
+val r2 = mk(0 - 3)
+val out2: Int64 = match r2
+  is Error => 0 - 1
+  else => use(r2)
+print(toString(out2))
+// bare narrowed scalar as the else-arm, merged with an int literal then used in arithmetic
+val r3 = mk(7)
+val out3 = if r3 is Error then 0 else r3
+print(toString(out3))
+"#);
+    assert_eq!(output, vec!["105", "-1", "7"]);
+}
+
+#[test]
+fn test_scalar_error_union_error_branch_not_narrowed() {
+    // The COMPLEMENT of the narrowing: in the `then` (Error) branch of `is Error` the binding is
+    // NOT refined to the scalar — it stays `Int64 | Error` — so passing it where an `Int64` is
+    // expected is a type error. Guards against the narrowing leaking into the wrong branch.
+    let err = run_expect_err(r#"import { print } from "std/io"
+val mk = (n: Int64): Int64 | Error => if n < 0 then { "type": "error", "message": "neg" } else n
+val use = (n: Int64): Int64 => n
+val r = mk(5)
+val out = if r is Error then use(r) else 0
+print(toString(out))
+"#);
+    assert!(
+        err.contains("expected Int64") || err.contains("Argument 1 has type"),
+        "expected a narrowing type error in the Error branch, got:\n{err}"
+    );
+}
+
+#[test]
 fn test_float32_widens_to_float64() {
     // A Float32 must widen to Float64 (fpext) across every numeric context, per spec §21
     // (widening is always to a type that represents both). Codegen's Coerce had no
@@ -2186,6 +2234,39 @@ val buf: UInt8[] = [63, 0, 0, 0]
 print(read(buf).toString())  // 0.5
 "#);
     assert_eq!(output, vec!["0.5"]);
+}
+
+#[test]
+fn test_subint32_flat_element_widened_into_branch_phi() {
+    // Regression: a sub-Int32 flat array element read inside an `if` branch must be WIDENED to the
+    // PHI's declared int width. `bytes[1]` (a `UInt8[]` element) loads at its native width (i8);
+    // the branch feeds an `if … then … else …` whose result is bound to `Int32`, so the merge PHI
+    // is typed i32. The PHI codegen does NOT coerce its incomings, so without a widening Coerce on
+    // the branch value LLVM saw `phi i32 [ %i8val, … ]` and a downstream `shl i32 %phi, 8` over an
+    // i8 operand — rejected by the verifier ("Both operands to a binary operator are not of the
+    // same type! %ir_shl = shl i8 %flat_get, i32 8"). Fix: `coerce_to_slot_type` now treats an
+    // int↔int width change (`int_width_repr_differs`) as a representation difference and emits the
+    // widening Coerce on the branch value, so both PHI incomings are i32. Unsigned source zext's
+    // (UInt8 0xFF → 255), signed source sext's (Int8 -1 → -1). Cover UInt8 (zext) and Int16 (zext
+    // of a value that does NOT fit in i8, proving the source width — not i8 — drives the extension).
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+val bytes: UInt8[] = [72, 105]
+val b1: Int32 = if true then bytes[1] else 0
+val r = b1 << 8
+print(toString(r))               // 105 << 8 == 26880
+
+val ws: Int16[] = [300, 1000]
+val w1: Int32 = if true then ws[1] else 0
+val rw = w1 << 4
+print(toString(rw))              // 1000 << 4 == 16000
+
+// Signed sub-Int32 element: the source's signedness drives sign-extension, NOT zext.
+val sb: Int8[] = [-1, -2]
+val sv: Int32 = if true then sb[0] else 0
+print(toString(sv))              // -1, sign-extended (not 255)
+"#);
+    assert_eq!(output, vec!["26880", "16000", "-1"]);
 }
 
 #[test]
@@ -5501,6 +5582,31 @@ match obj
   else => print("not error")
 "#);
     assert_eq!(output, vec!["not error"]);
+}
+
+#[test]
+fn test_if_is_error_narrows_then_branch_non_json_union() {
+    // ADR-031: the TRUE branch of `if x is Error` must narrow a NON-Json `T | Error` scrutinee to
+    // `Error` (the matched member), so returning `x` where `Error` is expected type-checks. The
+    // FALSE branch narrows to the value type `T`. Previously the then-branch was left as the full
+    // `T | Error` union and only happened to work for Json (which is universally assignable);
+    // `UInt8[] | Error` / `Int32[] | Error` spuriously errored.
+    let output = run(r#"import { print } from "std/io"
+import { length } from "std/array"
+
+val f = (b: UInt8[] | Error): String | Error =>
+  if b is Error then b else "ok"
+
+val g = (b: Int32[] | Error): Int32 | Error =>
+  if b is Error then b else length(b)
+
+val ok = f([1u8, 2u8, 3u8])
+if ok is Error then print("ok-was-error") else print(ok)
+
+val n = g([10, 20, 30])
+if n is Error then print("n-was-error") else print("len ${n}")
+"#);
+    assert_eq!(output, vec!["ok", "len 3"]);
 }
 
 #[test]
@@ -14678,6 +14784,75 @@ print(toString(growInPlace(g, 50)))
     // unionLoop returns k at the base case = 0.
     // growInPlace pushes 50 elements into the same array → length 50.
     assert_eq!(out, vec!["3", "0", "50"]);
+}
+
+#[test]
+fn test_tail_recursive_if_json_branch_vs_concrete_branch_not_mistyped() {
+    // A tail-recursive function whose body is an `if`/`else` where ONE terminal branch returns a
+    // freshly-built `Json` value (an error OBJECT) and the OTHER returns the owned ARRAY param.
+    // The checker's `infer_if` merge collapsed `Json | String[][]` onto the CONCRETE branch
+    // (`String[][]`) because `Json` (the dynamic top `TypeVar(u32::MAX)`) is `types_compatible`
+    // with everything — so the if-expression was mistyped as `String[][]`. lin-ir then boxed BOTH
+    // branches with the concrete array representation (`lin_box_array`), mis-tagging the Json error
+    // object as an array; reading the result (here, string-interpolating it) dereferenced the
+    // object as an array header → null-deref/corruption. Fix: when exactly one branch is the
+    // dynamic `Json` top type, the merged type IS `Json` (it subsumes the concrete branch), so each
+    // branch boxes into its own correct representation and the merge is a uniform Json box.
+    //
+    // Asserts BOTH terminal paths: state==0 returns the array unchanged; state==1 returns the
+    // error object. ASan (ci.yml `asan` leg over this exact shape) is the leak/double-free guard;
+    // this pins the OBSERVABLE result — the correct value comes back from BOTH branches.
+    let out = run(r#"
+import { print } from "std/io"
+
+val mkErr = (msg: String): Json => { "type": "error", "message": msg }
+
+val step = (rows: String[][], i: Int64, n: Int64, state: Int64): Json =>
+  if i >= n then
+    if state == 1 then mkErr("unterminated") else rows
+  else
+    step(rows, i + 1, n, state)
+
+val ok = step([["a"]], 0, 1, 0)
+val err = step([["a"]], 0, 1, 1)
+print("${ok}")
+print("${err}")
+"#);
+    // state==0: the owned `rows` param threads through and is returned as the array.
+    // state==1: the fresh error object is returned (correctly tagged as an object, not an array).
+    assert_eq!(
+        out,
+        vec![
+            r#"[["a"]]"#.to_string(),
+            r#"{"type": "error", "message": "unterminated"}"#.to_string(),
+        ]
+    );
+}
+
+#[test]
+fn test_if_json_branch_vs_concrete_branch_not_collapsed_to_concrete() {
+    // The non-tail-recursive minimal form of the same `infer_if` mistyping bug: a plain `if`
+    // whose then-branch is `Json` and else-branch is a concrete heap type. The merge must be
+    // `Json`, not the concrete type — otherwise lowering boxes the Json branch with the concrete
+    // representation and corrupts it on read.
+    let out = run(r#"
+import { print } from "std/io"
+
+val mkErr = (msg: String): Json => { "type": "error", "message": msg }
+
+val pick = (rows: String[][], state: Int64): Json =>
+  if state == 1 then mkErr("x") else rows
+
+print("${pick([["a"]], 1)}")
+print("${pick([["a"]], 0)}")
+"#);
+    assert_eq!(
+        out,
+        vec![
+            r#"{"type": "error", "message": "x"}"#.to_string(),
+            r#"[["a"]]"#.to_string(),
+        ]
+    );
 }
 
 #[test]
