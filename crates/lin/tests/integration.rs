@@ -15802,3 +15802,33 @@ print(eval(chain(10)).toString())
 "#);
     assert_eq!(out, vec!["1", "4", "10"]);
 }
+
+#[test]
+fn test_int64_return_width_literal() {
+    // Regression: a suffixless integer literal returned from an `Int64`-declared function — bare,
+    // or in an `if`/`match`/block tail — must adopt the declared width (Int64), not the Int32
+    // literal default. The checker accepted the widening but codegen emitted an `i32` value into
+    // an `i64`-returning function ("ret i32 … i64" / invalid IR). Covers the bare-literal, the
+    // nested-if (the std/time daysInMonth shape), and a block-tail form.
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+
+val bare = (): Int64 => 28
+
+val nestedIf = (y: Int64, m: Int64): Int64 =>
+  if m == 2 then
+    if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 then 29 else 28
+  else if m == 4 || m == 6 || m == 9 || m == 11 then 30 else 31
+
+val blockTail = (n: Int64): Int64 =>
+  val doubled = n * 2
+  doubled + 1
+
+print(toString(bare()))
+print(toString(nestedIf(2024, 2)))
+print(toString(nestedIf(2023, 2)))
+print(toString(nestedIf(2024, 1)))
+print(toString(blockTail(10)))
+"#);
+    assert_eq!(output, vec!["28", "29", "28", "31", "21"]);
+}
