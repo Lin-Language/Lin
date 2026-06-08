@@ -10309,6 +10309,57 @@ main()
 }
 
 #[test]
+fn test_tco_loop_union_param_thread_no_leak_or_uaf() {
+    // The "scanRouteAt" shape (TCO Leak B regression): a `T | Null` union (a record) threaded
+    // through a TAIL-RECURSIVE param fed by `arr[i]`. The loop's final `cur` box was never
+    // released (it leaked ~112B/call), and a naive loop-exit release double-freed either the
+    // borrowed pass-through `arr` param or a buffer permuted between slots (the merge-sort
+    // ping-pong). This asserts the CORRECT result; the ASan CI leg / sealed-harness verify the
+    // no-leak / no-double-free guarantees.
+    let out = run(r#"import { print } from "std/io"
+import { push } from "std/array"
+type T = { "a": Int32, "b": Int32 }
+val scan = (arr: Json, j: Int32, n: Int32, cur: T | Null): Int32 =>
+  if j >= n then
+    match cur
+      is T => cur["a"]
+      else => -1
+  else
+    val nx: T = arr[j]
+    scan(arr, j + 1, n, nx)
+val once = (i: Int32): Int32 =>
+  var arr: Json = []
+  push(arr, { "a": i, "b": 0 })
+  scan(arr, 0, 1, null)
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc
+  else loop(i + 1, n, acc + once(i))
+print(loop(0, 100, 0))
+"#);
+    // sum(0..99) = 4950
+    assert_eq!(out, vec!["4950"]);
+
+    // A TCO loop that PERMUTES borrowed array params between slots (the merge-sort ping-pong
+    // distilled): the loop-exit release must NOT free a buffer swapped in from another entry
+    // slot. `sort` over a record array exercises exactly this internally.
+    let out = run(r#"import { print } from "std/io"
+import { push, sort, length } from "std/array"
+type R = { "k": Int32 }
+val once = (i: Int32): Int32 =>
+  var rs: R[] = []
+  push(rs, { "k": i })
+  push(rs, { "k": 0 })
+  val s: R[] = sort(rs, (x, y) => x["k"] - y["k"])
+  s[length(s) - 1]["k"]
+val loop = (i: Int32, n: Int32, acc: Int32): Int32 =>
+  if i >= n then acc
+  else loop(i + 1, n, acc + once(i))
+print(loop(0, 100, 0))
+"#);
+    assert_eq!(out, vec!["4950"]);
+}
+
+#[test]
 fn object_index_assign_of_callback_param() {
     // Regression: `obj[key] = value` where `value` is a for/map callback PARAMETER used to
     // store NULL. Under the uniform closure ABI a callback param arrives BOXED (a TaggedVal*),
