@@ -670,6 +670,40 @@ range(1, 4).for(i => print(toString(i)))
     assert_eq!(output, vec!["1", "2", "3"]);
 }
 
+// Regression for the fused `range(a, b).for(f)` lowering (perf/foreach-closure): the receiver is a
+// literal `range(...)` call, so `for` lowers to a counted i32 loop driving the callback directly —
+// no materialized range array. This MUST stay observably identical to iterating the array:
+//   1. captured-`var` mutation accumulates into the SAME heap cell (sum 0..1000 = 499500), with a
+//      bound large enough to exceed the small-int box cache (so the boxed-element path is exercised);
+//   2. an `arr.for(...)` over a NON-range array still iterates every element (fusion must not
+//      misfire on a non-range receiver);
+//   3. a `range(...)` bound to a `val` first (so the `.for` receiver is a LocalGet, not a literal
+//      range call) takes the generic array path and still produces the right sum.
+#[test]
+fn test_range_for_fusion_semantics() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { range, for } from "std/iter"
+
+// 1. fused range-for with captured-var accumulation, past the small-int box cache.
+var total = 0i64
+range(0, 1000).for(i => total = total + i)
+print(toString(total))
+
+// 2. non-range array .for must still iterate every element.
+var seen = 0
+[10, 20, 30].for(x => seen = seen + x)
+print(toString(seen))
+
+// 3. range bound to a val first → generic path, same result.
+val r = range(0, 1000)
+var total2 = 0i64
+r.for(i => total2 = total2 + i)
+print(toString(total2))
+"#);
+    assert_eq!(output, vec!["499500", "60", "499500"]);
+}
+
 // Regression: elements of a `split()` (and `lines()`) result must iterate correctly under the
 // generic `for`/`map` path. `lin_string_split` previously pushed each element with tag 0
 // (TAG_NULL) instead of TAG_STR, so generic iteration read every element as `null` (index access

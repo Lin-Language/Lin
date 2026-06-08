@@ -4103,6 +4103,19 @@ fn lower_call(
             if let Some(stream_intr) = stream_combinator_intrinsic_name(&sym, args) {
                 return lower_intrinsic_call(stream_intr, args, result_type, builder, ctx);
             }
+            // FUSED `range(a, b).for(f)` across the module boundary: in the IMPORTING module `for`
+            // and `range` are calls to the compiled `std_iter_for` / `std_iter_range` symbols, so the
+            // intrinsic-level fusion in `lower_for` never sees them. When `std_iter_for`'s receiver is
+            // a direct `range(...)` call, redirect to the `lin_for` intrinsic lowering — which then
+            // recognises the range receiver (`range_for_bounds`) and emits the fused counted loop,
+            // skipping the materialized range array. Only fires for a literal range receiver; every
+            // other `.for` receiver (array / iterator / union / stream) keeps the Named-call path with
+            // unchanged semantics. (`for` is the only combinator redirected: it discards its result,
+            // so the fused loop is observably identical; map/filter/reduce would need their result
+            // arrays and are left alone.)
+            if sym == "std_iter_for" && range_for_bounds(&args[0], builder, ctx).is_some() {
+                return lower_intrinsic_call("lin_for", args, result_type, builder, ctx);
+            }
             let mut shell_boxes: Vec<Temp> = Vec::new();
             // Fully-owned arg boxes (sealed-record array materialized to Json) released right after
             // the call.
@@ -4712,6 +4725,42 @@ fn is_provably_flat_producer(expr: &TypedExpr, builder: &FuncBuilder, ctx: &Lowe
         }
         _ => false,
     }
+}
+
+/// When `iterable` is a direct `range(start, end)` call (resolving to the `lin_range` intrinsic —
+/// either via an intrinsic slot or an imported `range` export), return its two bound expressions.
+/// Used to FUSE `range(a, b).for(f)` into a counted i32 loop that drives the callback directly,
+/// skipping the materialized range array entirely (no array alloc, no N pushes, no N index reads).
+///
+/// Conservatively requires EXACTLY the two `lin_range` args. `range` is always eager + array-shaped,
+/// so the fused loop preserves `for` semantics exactly (the only observable effect of a `for` body is
+/// its side effects, executed once per element in order — identical here).
+fn range_for_bounds<'a>(
+    iterable: &'a TypedExpr,
+    builder: &FuncBuilder,
+    ctx: &LowerCtx,
+) -> Option<(&'a TypedExpr, &'a TypedExpr)> {
+    if let TypedExpr::Call { func, args, .. } = iterable {
+        if args.len() != 2 {
+            return None;
+        }
+        if let TypedExpr::LocalGet { slot, .. } = func.as_ref() {
+            let is_range = builder
+                .intrinsic_slots
+                .get(slot)
+                .map(|intr| intr == "lin_range")
+                .unwrap_or(false)
+                || ctx
+                    .import_fn_slots
+                    .get(slot)
+                    .map(|(sym, _)| sym.rsplit('_').next() == Some("range"))
+                    .unwrap_or(false);
+            if is_range {
+                return Some((&args[0], &args[1]));
+            }
+        }
+    }
+    None
 }
 
 /// Intrinsic names whose IR lowering allocates a FLAT scalar buffer (so a flat read on the result
@@ -5330,6 +5379,16 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
         return dst;
     }
     let (param_tys, _) = callback_signature(&args[1]);
+    // FUSED `range(a, b).for(f)`: when the receiver is a direct `range` call, drive a native i32
+    // counter `i` in `[a, b)` and call the callback with `i` as the element — skipping the
+    // materialized range array entirely (no `lin_range` alloc, no N pushes, no N `Index` reads,
+    // and no iterator-handle leak). `range` is always eager + ordered, so this is observably
+    // identical to iterating the array. The callback ABI / box-release sequence is UNCHANGED from
+    // the generic path below (same boxed element, same return-box release, same shell reclaim), so
+    // captured-`var` mutation and any callback return value behave exactly as before.
+    if let Some((start_e, end_e)) = range_for_bounds(&args[0], builder, ctx) {
+        return lower_range_for(start_e, end_e, &args[1], &param_tys, builder, ctx);
+    }
     // Read elements at the source's PROVABLE runtime representation: flat-scalar only when the
     // source is a provably-flat producer, else the tagged Json read (sound for a `[]`+push array
     // mistyped as flat). See `combinator_read_elem_ty` (ADR-044).
@@ -5370,6 +5429,77 @@ fn lower_for(args: &[TypedExpr], builder: &mut FuncBuilder, ctx: &mut LowerCtx) 
         // discards it (a side-effecting body never moves the struct out), so release it or it leaks.
         free_combinator_sealed_elem(elem, &iterable_ty, &elem_ty, b);
     });
+    builder.const_temp(Const::Null)
+}
+
+/// Fused lowering for `range(start, end).for(body)`: an i32 counted loop
+/// `for (i = start; i < end; i++) body(i)` that calls the callback directly with the counter as the
+/// element — no materialized range array, no per-element `Index`/`lin_array_get_tagged`. The element
+/// is an unboxed `Int32` (the counter); `call_body_closure_with_elem_boxes` boxes it for the callback
+/// ABI exactly as the generic `for` does over a flat-i32 source, and the per-iteration release /
+/// shell-reclaim sequence is byte-for-byte the generic-path logic — so RC behaviour (captured-`var`
+/// mutation, callback-return discard) is identical.
+fn lower_range_for(
+    start_e: &TypedExpr,
+    end_e: &TypedExpr,
+    callback: &TypedExpr,
+    param_tys: &[Type],
+    builder: &mut FuncBuilder,
+    ctx: &mut LowerCtx,
+) -> Temp {
+    // Bounds drive a native i32 counter, so they must be concrete i32 (mirrors `lower_range`).
+    let start_raw = lower_expr(start_e, builder, ctx);
+    let end_raw = lower_expr(end_e, builder, ctx);
+    let start = coerce_to_slot_type(start_raw, &start_e.ty(), &Type::Int32, builder);
+    let end = coerce_to_slot_type(end_raw, &end_e.ty(), &Type::Int32, builder);
+
+    let body = lower_callback_in_safe_ctx(callback, builder, ctx);
+    let elem_ty = Type::Int32;
+    let boxed = Type::TypeVar(u32::MAX);
+
+    let preheader = builder.current_block;
+    let header = builder.alloc_block("range_for_header");
+    let body_block = builder.alloc_block("range_for_body");
+    let exit = builder.alloc_block("range_for_exit");
+
+    let i = builder.alloc_temp(Type::Int32);
+    let i_next = builder.alloc_temp(Type::Int32);
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(header);
+    builder.emit(Instruction::Phi {
+        dst: i,
+        ty: Type::Int32,
+        incomings: vec![(start, preheader), (i_next, body_block)],
+    });
+    let cond = builder.alloc_temp(Type::Bool);
+    builder.emit(Instruction::Binary {
+        dst: cond, op: BinOp::Lt, lhs: i, rhs: end,
+        operand_ty: Type::Int32, ty: Type::Bool,
+    });
+    builder.terminate(Terminator::CondJump { cond, then_block: body_block, else_block: exit });
+
+    builder.switch_to(body_block);
+    // The callback receives `i` (Int32) as BOTH the element and the optional 0-based source index
+    // (for a range, element == index). `call_body_closure_with_elem_boxes` boxes `i` per the ABI and
+    // truncates the surplus index arg when the callback declares only `(item)`.
+    let (ret, elem_boxes) = call_body_closure_with_elem_boxes(
+        body, &[(i, elem_ty.clone()), (i, Type::Int32)], param_tys, &boxed, builder,
+    );
+    // Release the callback-RETURN box, then reclaim each element box SHELL if distinct — identical
+    // to the generic `for` path (see `lower_for` for the full rationale).
+    builder.emit(Instruction::Release { val: ret, ty: boxed.clone() });
+    for ebox in &elem_boxes {
+        builder.emit(Instruction::FreeBoxShellIfDistinct { val: *ebox, other: ret });
+    }
+    let one = builder.const_temp(Const::Int(1, Type::Int32));
+    builder.emit(Instruction::Binary {
+        dst: i_next, op: BinOp::Add, lhs: i, rhs: one,
+        operand_ty: Type::Int32, ty: Type::Int32,
+    });
+    builder.terminate(Terminator::Jump(header));
+
+    builder.switch_to(exit);
     builder.const_temp(Const::Null)
 }
 
