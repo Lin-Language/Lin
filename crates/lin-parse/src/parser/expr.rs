@@ -66,7 +66,9 @@ impl Parser {
         if stmts.is_empty() {
             final_expr
         } else {
-            Expr::Block(stmts, Box::new(final_expr), span)
+            // Full extent: opening Indent .. end of the tail expr (the last thing in the block).
+            let full_span = span.to(final_expr.full_span());
+            Expr::Block(stmts, Box::new(final_expr), span, full_span)
         }
     }
 
@@ -349,6 +351,7 @@ impl Parser {
                 // mirrors the post-Dedent suppression for top-level blocks (ADR-010).
                 TokenKind::LBracket if !after_block && !self.at_line_start() => {
                     let span = self.current_span();
+                    let obj_start = expr.full_span();
                     self.advance(); // [
                     let key = self.parse_expr();
                     self.expect(TokenKind::RBracket);
@@ -356,21 +359,29 @@ impl Parser {
                         self.advance(); // =
                         self.skip_newlines();
                         let value = self.parse_expr_or_block();
-                        expr = Expr::IndexAssign { object: Box::new(expr), key: Box::new(key), value: Box::new(value), span };
+                        // object start .. end of the assigned value.
+                        let full_span = obj_start.to(value.full_span());
+                        expr = Expr::IndexAssign { object: Box::new(expr), key: Box::new(key), value: Box::new(value), span, full_span };
                         break;
                     }
-                    expr = Expr::Index { object: Box::new(expr), key: Box::new(key), span };
+                    // object start .. closing `]` (just consumed).
+                    let full_span = obj_start.to(self.prev_span());
+                    expr = Expr::Index { object: Box::new(expr), key: Box::new(key), span, full_span };
                 }
                 TokenKind::LParen if !after_block && !self.at_line_start() => {
                     let span = self.current_span();
+                    let callee_start = expr.full_span();
                     self.advance(); // (
                     let (args, partial) = self.parse_call_args();
                     self.expect(TokenKind::RParen);
-                    expr = Expr::Call { func: Box::new(expr), args, partial, span };
+                    // callee start .. closing `)` (just consumed).
+                    let full_span = callee_start.to(self.prev_span());
+                    expr = Expr::Call { func: Box::new(expr), args, partial, span, full_span };
                 }
                 TokenKind::Dot => {
                     after_block = false;
                     let span = self.current_span();
+                    let recv_start = expr.full_span();
                     self.advance(); // .
                     self.skip_newlines();
                     let method = self.expect_ident();
@@ -382,7 +393,11 @@ impl Parser {
                     } else {
                         (None, false)
                     };
-                    expr = Expr::DotCall { receiver: Box::new(expr), method, args, partial, span };
+                    // receiver start .. closing `)` of the arg list, or the method ident when
+                    // there is no parenthesised call (`x.foo`). Either way `prev_span` is the
+                    // last token consumed for this dot-call.
+                    let full_span = recv_start.to(self.prev_span());
+                    expr = Expr::DotCall { receiver: Box::new(expr), method, args, partial, span, full_span };
                 }
                 TokenKind::Newline => {
                     // Look ahead past newlines/indent for dot-chaining
@@ -636,7 +651,9 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RBrace);
-        Expr::Object(fields, span)
+        // opening `{` .. closing `}` (just consumed).
+        let full_span = span.to(self.prev_span());
+        Expr::Object(fields, span, full_span)
     }
 
     pub(crate) fn parse_array_expr(&mut self) -> Expr {
@@ -666,7 +683,9 @@ impl Parser {
             }
         }
         self.expect(TokenKind::RBracket);
-        Expr::Array(elements, span)
+        // opening `[` .. closing `]` (just consumed).
+        let full_span = span.to(self.prev_span());
+        Expr::Array(elements, span, full_span)
     }
 
     pub(crate) fn parse_if_expr(&mut self) -> Expr {
@@ -728,11 +747,17 @@ impl Parser {
             Expr::NullLit(span)
         };
 
+        // `if` keyword .. end of the last branch. When there is no `else`, the synthesized
+        // NullLit sits at the `if` span, so fold to whichever branch ends later.
+        let full_span = span
+            .to(then_branch.full_span())
+            .to(else_branch.full_span());
         Expr::If {
             condition: Box::new(condition),
             then_branch: Box::new(then_branch),
             else_branch: Box::new(else_branch),
             span,
+            full_span,
         }
     }
 
@@ -807,7 +832,12 @@ impl Parser {
             }
         }
 
-        Expr::Match { scrutinee: Box::new(scrutinee), arms, span }
+        // `match` keyword .. end of the last arm's body (or the scrutinee if there are no arms).
+        let full_span = match arms.last() {
+            Some(arm) => span.to(arm.body.full_span()),
+            None => span.to(scrutinee.full_span()),
+        };
+        Expr::Match { scrutinee: Box::new(scrutinee), arms, span, full_span }
     }
 
     /// Run `f` with the `suppress_is_has` scrutinee guard cleared, restoring it afterwards.

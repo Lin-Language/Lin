@@ -54,7 +54,7 @@ impl Checker {
                 };
 
                 let mut typed_value = match (value, binding_name) {
-                    (Expr::Function { type_params, params, return_type, body, span }, Some(name)) => {
+                    (Expr::Function { type_params, params, return_type, body, span, .. }, Some(name)) => {
                         self.infer_function(type_params, params, return_type, body, *span, Some(name))?
                     }
                     _ => {

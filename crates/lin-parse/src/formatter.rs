@@ -472,7 +472,7 @@ fn collect_anchors_stmt(stmt: &Stmt, out: &mut Vec<Anchor>) {
 
 fn collect_anchors_expr(expr: &Expr, out: &mut Vec<Anchor>) {
     match expr {
-        Expr::Block(stmts, tail, _) => {
+        Expr::Block(stmts, tail, _, _) => {
             for s in stmts {
                 collect_anchors_stmt(s, out);
             }
@@ -549,7 +549,7 @@ fn collect_anchors_expr(expr: &Expr, out: &mut Vec<Anchor>) {
             collect_anchors_expr(value, out);
         }
         Expr::Assign { value, .. } => collect_anchors_expr(value, out),
-        Expr::Array(items, _) => {
+        Expr::Array(items, _, _) => {
             // Rule ii: each array element is a comment anchor, so an own-line comment before
             // an element renders above it at the element's indent. A trailing comment on a
             // SINGLE-LINE element is stable (kept trailing); a multi-line element's last line is
@@ -565,7 +565,7 @@ fn collect_anchors_expr(expr: &Expr, out: &mut Vec<Anchor>) {
                 collect_anchors_expr(it, out);
             }
         }
-        Expr::Object(fields, _) => {
+        Expr::Object(fields, _, _) => {
             for f in fields {
                 match f {
                     ObjectField::Pair(k, v) => {
@@ -655,7 +655,7 @@ fn collect_hoist_redirects(expr: &Expr, anchor_start: u32, collapse: bool, res: 
         // An array literal: each element is its own comment anchor (Rule ii). A call element
         // whose last-arg lambda body carries a between-`=>`-and-body comment hoists that comment
         // to the element (no collapse — Rule B keeps the author's own-line body layout).
-        Expr::Array(items, _) => {
+        Expr::Array(items, _, _) => {
             for it in items {
                 collect_hoist_redirects(it, it.span().start, false, res);
             }
@@ -1242,7 +1242,7 @@ fn renders_single_line(expr: &Expr) -> bool {
     if !is_atomic(expr) {
         return false;
     }
-    if let Expr::Array(items, _) = expr {
+    if let Expr::Array(items, _, _) = expr {
         // Matches the array inline rule: forced multi-line only when MORE THAN ONE element
         // contains a call. A single call among simple elements still renders single-line.
         if items.len() > 1 && items.iter().filter(|it| contains_call(it)).count() > 1 {
@@ -1276,8 +1276,8 @@ fn is_atomic(expr: &Expr) -> bool {
         }
         Expr::Is { expr, .. } | Expr::Has { expr, .. } => is_atomic(expr),
         Expr::TupleArgs(args, _) => args.iter().all(is_atomic),
-        Expr::Array(items, _) => items.iter().all(is_atomic),
-        Expr::Object(fields, _) => fields.iter().all(|f| match f {
+        Expr::Array(items, _, _) => items.iter().all(is_atomic),
+        Expr::Object(fields, _, _) => fields.iter().all(|f| match f {
             ObjectField::Pair(k, v) => is_atomic(k) && is_atomic(v),
             ObjectField::Spread(e) => is_atomic(e),
         }),
@@ -1334,11 +1334,11 @@ fn fmt_inline(expr: &Expr) -> String {
         Expr::Index { object, key, .. } => {
             format!("{}[{}]", fmt_postfix_base(object, fmt_inline), fmt_inline(key))
         }
-        Expr::Array(items, _) => {
+        Expr::Array(items, _, _) => {
             let ss: Vec<String> = items.iter().map(fmt_inline).collect();
             format!("[{}]", ss.join(", "))
         }
-        Expr::Object(fields, _) => {
+        Expr::Object(fields, _, _) => {
             let fs: Vec<String> = fields
                 .iter()
                 .map(|f| match f {
@@ -1394,7 +1394,7 @@ fn fmt_inline(expr: &Expr) -> String {
                 format!("{}({}){} => {}", generics, ps.join(", "), ret, body)
             }
         }
-        Expr::Block(stmts, tail, _) => {
+        Expr::Block(stmts, tail, _, _) => {
             // In Lin, there's no semicolon separator. An inline block with stmts
             // can't be represented on a single line; just show the tail.
             if stmts.is_empty() {
@@ -1559,7 +1559,7 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         Expr::DotCall { .. } => fmt_chain(expr, ind),
 
         // ── Array ─────────────────────────────────────────────────────────────
-        Expr::Array(items, span) => {
+        Expr::Array(items, span, _) => {
             // Inline fast-path — suppressed once an ancestor literal went multiline
             // (Rule 4): a nested literal must then also render multiline. A MULTI-element
             // array whose elements contain function calls (e.g. a list of `expect(...)`
@@ -1639,7 +1639,7 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         }
 
         // ── Object ────────────────────────────────────────────────────────────
-        Expr::Object(fields, span) => {
+        Expr::Object(fields, span, _) => {
             if fields.is_empty() {
                 return "{}".to_string();
             }
@@ -1682,7 +1682,7 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         }
 
         // ── Function ──────────────────────────────────────────────────────────
-        Expr::Function { type_params, params, return_type, body, span } => {
+        Expr::Function { type_params, params, return_type, body, span, full_span: _ } => {
             // A lambda body is a fresh layout scope: a multiline ancestor literal must NOT
             // force literals inside the lambda's body to be multiline (Rule 4 is about JSON
             // data nesting, not code buried in a lambda). Clearing FORCE_ML here also keeps
@@ -1694,7 +1694,7 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         }
 
         // ── If ────────────────────────────────────────────────────────────────
-        Expr::If { condition, then_branch, else_branch, span } => {
+        Expr::If { condition, then_branch, else_branch, span, full_span: _ } => {
             let cond = fmt_expr(condition, false, ind);
             let is_null_else = matches!(else_branch.as_ref(), Expr::NullLit(_));
             // A statement-position `if` with a NULL else: the `else null` is implicit and may
@@ -1887,7 +1887,7 @@ fn fmt_expr(expr: &Expr, is_stmt: bool, ind: &str) -> String {
         }
 
         // ── Block ─────────────────────────────────────────────────────────────
-        Expr::Block(stmts, tail, _) => fmt_block(stmts, tail, ind),
+        Expr::Block(stmts, tail, _, _) => fmt_block(stmts, tail, ind),
     }
 }
 
@@ -2004,7 +2004,7 @@ fn fmt_function(
         // body can't render element comments, so a single-element `() => [ //c elem ]` would
         // otherwise DROP the comment. Forcing multi-line lets the element's comment emit.
         let body_has_element_comment = match body {
-            Expr::Array(items, _) => items.iter().any(|it| anchor_has_comment(it.span().start)),
+            Expr::Array(items, _, _) => items.iter().any(|it| anchor_has_comment(it.span().start)),
             _ => false,
         };
         let do_force = forced || body_has_element_comment;

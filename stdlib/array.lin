@@ -216,6 +216,23 @@ val _mergePass = <T>(buf: T[], work: T[], n: Int32, width: Int32, cmp: (T, T) =>
     _mergeRuns(buf, work, n, width, 0, cmp)
     _mergePass(work, buf, n, width * 2, cmp)
 
+// Copy `src[0..n)` into `dst` via the SAME `set(dst, k, src[k])` element-move the merge helpers use.
+// This REPLACES the earlier `src.for(item => set(buf, i, item); i = i+1)` copy, whose `for` loop
+// leaked once per element for a heap `T` (object/string/Array): the for-loop reads each element via
+// `lin_array_get_tagged` (which RETAINS the inner heap payload) but only reclaims the per-iteration
+// box SHELL — never the retained inner +1 (a documented `for`-over-tagged-array residual; the body
+// `set` takes its OWN retain, so that inner +1 leaks). The recursive `set(dst, k, src[k])` form
+// routes the element read through the owning-Index path (registered owned + released, balanced
+// against `set`'s retain), exactly like `_mergeStep`, so no per-element reference leaks. It also
+// drops the captured `var i` heap cell (which, created in a conditional branch, was itself left
+// leaking by the cell-escape analysis's entry-block-only `FreeCell` rule).
+val _copyInto = <T>(src: T[], dst: T[], k: Int32, n: Int32): Null =>
+  if k >= n then
+    null
+  else
+    set(dst, k, src[k])
+    _copyInto(src, dst, k + 1, n)
+
 export val sort = <T>(arr: T[], cmp: (T, T) => Int32): T[] =>
   val n = length(arr)
   if n <= 1 then
@@ -226,11 +243,7 @@ export val sort = <T>(arr: T[], cmp: (T, T) => Int32): T[] =>
     // reads its args in `T`'s representation, sees the same layout it was monomorphized for.
     val buf: T[] = arrayAllocateFilled(n, arr[0])
     val work: T[] = arrayAllocateFilled(n, arr[0])
-    var i = 0
-    arr.for(item =>
-      set(buf, i, item)
-      i = i + 1
-    )
+    _copyInto(arr, buf, 0, n)
     _mergePass(buf, work, n, 1, cmp)
 
 // Json-internal sort used by `sortBy` (and any heterogeneous helper that sorts `Json` pair
@@ -246,12 +259,18 @@ val _sortJ = (arr: Json, cmp: (Json, Json) => Int32): Json =>
   else
     val buf: Json = arrayAllocateFilled(n, arr[0])
     val work: Json = arrayAllocateFilled(n, arr[0])
-    var i = 0
-    arr.for(item =>
-      set(buf, i, item)
-      i = i + 1
-    )
+    _copyIntoJ(arr, buf, 0, n)
     _mergePass(buf, work, n, 1, cmp)
+
+// `Json`-pinned counterpart of `_copyInto` (see its note): `_sortJ` pins `T = Json`, so the copy
+// must too (a bare-`Json` value left `T` unresolved in the generic `_copyInto`). Same balanced
+// `set(dst, k, src[k])` element move — no `for`-loop per-element retain leak, no captured `var i`.
+val _copyIntoJ = (src: Json, dst: Json, k: Int32, n: Int32): Null =>
+  if k >= n then
+    null
+  else
+    set(dst, k, src[k])
+    _copyIntoJ(src, dst, k + 1, n)
 
 // Build the heterogeneous `[key, item]` pair array for the keyed helpers (`sortBy`/`minBy`/
 // `maxBy`). Generic over `T` so `keyFn` is element-type-checked AND so `keyFn(item)`/the stored
