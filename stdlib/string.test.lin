@@ -1,5 +1,5 @@
 import { expect, toBe, test, suite, run } from "std/test"
-import { toString, trim, trimStart, trimEnd, toUpper, toLower, substring, indexOf, lastIndexOf, isBlank, contains, startsWith, endsWith, split, join, replace, replaceAll, repeat, at, lines, codePointAt, fromCodePoints, padStart, padEnd, byteAt, charCode } from "std/string"
+import { toString, trim, trimStart, trimEnd, toUpper, toLower, substring, indexOf, lastIndexOf, isBlank, contains, startsWith, endsWith, split, join, replace, replaceAll, repeat, at, lines, codePointAt, fromCodePoints, padStart, padEnd, byteAt, charCode, lengthBytes } from "std/string"
 import { map } from "std/iter"
 
 val s = suite("std/string", [
@@ -235,6 +235,22 @@ val s = suite("std/string", [
     expect("Hi9!".byteAt(0)).toBe("Hi9!".charCode(0)),
     expect("Hi9!".byteAt(3)).toBe("Hi9!".charCode(3))
   ]),
+
+  test("lengthBytes counts UTF-8 bytes (== codepoints for ASCII)", () => [
+    expect("ABC".lengthBytes()).toBe(3),
+    expect("".lengthBytes()).toBe(0)
+  ]),
+
+  test("lengthBytes exceeds codepoint length for multibyte text", () =>
+    // "café" is 4 codepoints but 5 UTF-8 bytes (é = 0xC3 0xA9). lengthBytes is the byte view;
+    // it must equal the index at which byteAt first returns -1.
+    val s = "café"
+    [
+      expect(s.lengthBytes()).toBe(5),
+      expect(s.byteAt(s.lengthBytes())).toBe(-1),
+      expect(s.byteAt(s.lengthBytes() - 1)).toBe(169)
+    ]
+  ),
 
   test("fromCodePoints builds string from code points", () => [
     expect([72, 101, 108, 108, 111].fromCodePoints()).toBe("Hello")
