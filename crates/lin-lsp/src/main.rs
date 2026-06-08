@@ -249,6 +249,14 @@ impl LanguageServer for Backend {
             return Ok(Some(CompletionResponse::Array(items)));
         }
 
+        // Suppress completion inside a NORMAL string literal or a line comment. Import strings were
+        // already handled above (they have their own path-completion), so any string we detect here
+        // is an ordinary string where identifier/keyword completion would be noise. We return an
+        // empty list rather than `None` so the client doesn't fall back to its own word-based list.
+        if in_string_or_comment(&source, offset) {
+            return Ok(Some(CompletionResponse::Array(Vec::new())));
+        }
+
         let prefix = word_before(&source, offset);
 
         // Detect whether cursor is in a dot-completion context and resolve
@@ -1306,6 +1314,62 @@ fn first_param_category(sig: &str) -> Option<String> {
         }
     }
     Some(type_to_category(first.trim()).to_string())
+}
+
+/// True when `offset` sits inside a string literal or a `//` line comment, so identifier/keyword
+/// completion should be suppressed there. Line-scoped + lightweight (no full lex): we scan the
+/// current line from its start up to the cursor, tracking string state (honouring `\"` escapes) and
+/// the `//` comment marker.
+///
+/// Lin string literals are single-line, so a line-local scan is sufficient and robust against a
+/// partial/unparseable buffer mid-edit. Import strings are handled separately (their own
+/// path-completion runs BEFORE this check), so a string detected here is always an ordinary string.
+/// `${...}` interpolation: the cursor inside a `${ ... }` IS code position, so we treat an open `${`
+/// as leaving the string (completion stays enabled inside the interpolation hole).
+fn in_string_or_comment(source: &str, offset: usize) -> bool {
+    let offset = offset.min(source.len());
+    let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &source[line_start..offset];
+
+    let mut in_str = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_str {
+            match c {
+                // `\X` escapes the next char (e.g. `\"` does not close the string).
+                '\\' => {
+                    chars.next();
+                }
+                // `${` opens an interpolation hole — code position resumes until the matching `}`.
+                '$' if chars.peek() == Some(&'{') => {
+                    chars.next(); // consume `{`
+                    // Skip to the closing `}` (interpolations don't nest deeply in practice); if it
+                    // isn't closed before the cursor, the cursor is inside the code hole → not a string.
+                    let mut closed = false;
+                    for ic in chars.by_ref() {
+                        if ic == '}' {
+                            closed = true;
+                            break;
+                        }
+                    }
+                    if !closed {
+                        return false; // cursor is inside the `${ … }` code hole.
+                    }
+                    // Otherwise we consumed the hole and are back in the string body.
+                }
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            // `//` begins a line comment — everything to the cursor (and EOL) is comment.
+            '/' if chars.peek() == Some(&'/') => return true,
+            _ => {}
+        }
+    }
+    in_str
 }
 
 /// Detect whether `offset` sits inside the quoted path of an `import` statement and, if
@@ -5204,6 +5268,44 @@ mod tests {
         // No non-matching modules.
         assert!(labels.iter().all(|l| l.starts_with("std/ar")));
     }
+
+    /// Completion suppression: the cursor inside a normal string literal or after `//` on a comment
+    /// line is NOT a code position, so completion must be suppressed there — but normal code
+    /// positions (and the `${ … }` interpolation hole) stay enabled.
+    #[test]
+    fn in_string_or_comment_detects_strings_and_comments() {
+        // Inside a normal string literal.
+        let src = "val s = \"hello wor";
+        assert!(in_string_or_comment(src, src.len()), "cursor inside a string");
+        // String closed before the cursor → code position again.
+        let src = "val s = \"hi\" + x";
+        assert!(!in_string_or_comment(src, src.len()), "after a closed string is code");
+        // `\"` escape does not close the string.
+        let src = "val s = \"a\\\" b ";
+        assert!(in_string_or_comment(src, src.len()), "escaped quote keeps us in the string");
+        // After `//` on a comment line.
+        let src = "val x = 1 // note he";
+        assert!(in_string_or_comment(src, src.len()), "after // is a comment");
+        // Plain code position.
+        let src = "val foo = ba";
+        assert!(!in_string_or_comment(src, src.len()), "bare code is not string/comment");
+        // Inside a `${ … }` interpolation hole IS code position (completion stays on).
+        let src = "val s = \"x ${ ba";
+        assert!(!in_string_or_comment(src, src.len()), "inside ${{}} hole is code");
+        // After a closed interpolation, back inside the string body.
+        let src = "val s = \"x ${y} mor";
+        assert!(in_string_or_comment(src, src.len()), "after a closed ${{}} we're back in the string");
+        // A `//` INSIDE a string is not a comment.
+        let src = "val s = \"http://ex";
+        assert!(in_string_or_comment(src, src.len()), "// inside a string is string, not comment");
+    }
+
+    // SCOPE-AWARENESS (FIX 4b) is intentionally NOT implemented: the completion handler still offers
+    // every binding in `span_type_map` regardless of lexical scope. Building a correct scope model
+    // off the flat span map risks DROPPING valid in-scope bindings (worse than over-offering), so per
+    // the task brief we leave the binding list as-is and document the limitation here rather than
+    // half-implement it. The clear correctness win — suppressing completion inside strings/comments
+    // (FIX 4a) — is implemented and tested above (`in_string_or_comment_detects_strings_and_comments`).
 
     // ── signature help with parameter names (feature 13) ──────────────────────────
 
