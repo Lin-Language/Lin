@@ -211,6 +211,17 @@ export val charCode = (s: String, index: Int32): Int32 =>
 export val byteAt = (s: String, index: Int32): Int32 =>
   lin_string_byte_at(s, index)
 
+// The number of raw UTF-8 BYTES in `s`, in O(1) (the runtime stores it). This is the byte-view
+// companion to `byteAt`: a `0..lengthBytes(s)` loop with `byteAt` is the canonical O(n) byte scan.
+// Contrast `length`, which counts Unicode codepoints. For ASCII the two agree; for multi-byte text
+// `lengthBytes` is larger.
+// @param s  the source string.
+// @returns the UTF-8 byte count.
+// @example lengthBytes("AB")    // 2
+// @example lengthBytes("café")  // 5  (é is two UTF-8 bytes; `length` is 4)
+export val lengthBytes = (s: String): Int32 =>
+  lin_string_length(s)
+
 // Build a single-character string from a Unicode code point.
 // @param code  the code point value.
 // @returns the one-character string for `code`.

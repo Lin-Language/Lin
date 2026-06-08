@@ -8,10 +8,10 @@
 //
 // SCANNING: the structural delimiters (`,` `"` `\r` `\n` and a single-codepoint custom delimiter)
 // are ASCII, and an ASCII byte (< 0x80) never collides with a UTF-8 continuation byte. So the
-// parser scans RAW BYTES with the O(1) `byteAt` and slices fields by byte offset (each slice then
-// decodes as valid UTF-8 as a whole). `lin_string_length` is a BYTE length, so the scan bound and
-// the slice offsets live in the same byte-index space — the parser is O(n), not the O(n²) trap a
-// `codePointAt`-driven scan would be (see std/string.byteAt).
+// parser scans RAW BYTES with the O(1) `byteAt` and slices fields by byte offset via `substring`
+// (each slice then decodes as valid UTF-8 as a whole). `std/string.lengthBytes` is the BYTE length
+// (also O(1)), so the scan bound and the slice offsets live in the same byte-index space — the
+// parser is O(n), not the O(n²) trap a `codePointAt`-driven scan would be (see std/string.byteAt).
 //
 // TCO-BUG WORKAROUND: a tail-recursive function that returns an owned array PARAM on one terminal
 // branch and an OBJECT on another corrupts its output (the TCO owned-param release bug, being fixed
@@ -20,15 +20,10 @@
 // field through the `ok` flag (a separate channel), never returning a bare array on one branch and
 // an Error object on another. The canonical `Error` value is built only in the NON-recursive outer
 // `parse` wrapper.
-import foreign "lin-runtime"
-  val lin_string_byte_at: (String, Int32) => Int32
-  val lin_string_length: (String) => Int32
-  val lin_string_slice: (String, Int32, Int32) => String
-
 import { push, length } from "std/array"
 import { for, range, map, while } from "std/iter"
 import { keys } from "std/object"
-import { join } from "std/string"
+import { join, byteAt, lengthBytes, substring } from "std/string"
 
 // ── byte constants ──────────────────────────────────────────────────────────
 val QUOTE = 34 // "
@@ -43,7 +38,7 @@ val optDelimByte = (opts: Json): Int32 =>
   if d == null then
     44 // ','
   else
-    lin_string_byte_at(d, 0)
+    byteAt(d, 0)
 
 // True if the delimiter option is invalid: not exactly one byte, or one of `"`/CR/LF. A single
 // ASCII codepoint is exactly one UTF-8 byte, so a 1-byte length is the single-ASCII-codepoint test.
@@ -52,8 +47,8 @@ val optDelimInvalid = (opts: Json): Boolean =>
   if d == null then
     false
   else
-    val n = lin_string_length(d)
-    val b0 = lin_string_byte_at(d, 0)
+    val n = lengthBytes(d)
+    val b0 = byteAt(d, 0)
     n != 1 || b0 == QUOTE || b0 == CR || b0 == LF
 
 val optTrim = (opts: Json): Boolean =>
@@ -61,13 +56,13 @@ val optTrim = (opts: Json): Boolean =>
 
 // Trim leading/trailing ASCII space (32) and tab (9) from an unquoted field. Byte-scanned.
 val trimAsciiWs = (s: String): String =>
-  val n = lin_string_length(s)
+  val n = lengthBytes(s)
   var start = 0
   var end = n
   // `while` stops at the first non-space (short-circuits; a `range(...).for` would scan the whole
   // field even after the trim boundary).
   range(0, n).while(_ =>
-    val b = lin_string_byte_at(s, start)
+    val b = byteAt(s, start)
     if (b == 32 || b == 9) && start < end then
       start = start + 1
       true
@@ -75,14 +70,14 @@ val trimAsciiWs = (s: String): String =>
       false
   )
   range(0, n).while(_ =>
-    val b = lin_string_byte_at(s, end - 1)
+    val b = byteAt(s, end - 1)
     if (b == 32 || b == 9) && end > start then
       end = end - 1
       true
     else
       false
   )
-  lin_string_slice(s, start, end)
+  substring(s, start, end)
 
 // ── the field scanner ────────────────────────────────────────────────────────
 // Parse ONE field starting at byte `pos`. Returns a cursor object (ALWAYS this one shape):
@@ -90,7 +85,7 @@ val trimAsciiWs = (s: String): String =>
 // `pos` on return points at the delimiter / CR / LF / EOF that terminates the field. `ok` is false
 // only for a malformed field (a stray `"` in an unquoted field, or EOF inside a quoted field).
 val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean): Json =>
-  val first = lin_string_byte_at(s, start)
+  val first = byteAt(s, start)
   if first == QUOTE then
     // Quoted field: scan to the matching close quote, doubling `""` -> `"`. We accumulate spans
     // between escaped quotes and join them, so the common (no-escape) case is a single slice.
@@ -103,23 +98,23 @@ val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean)
     // even after the field ends, making the parser O(n²)). The callback returns true to continue,
     // false to stop. Each step advances `i` by >= 1, so it terminates in O(field length).
     range(0, n).while(_ =>
-      val b = lin_string_byte_at(s, i)
+      val b = byteAt(s, i)
       if b == -1 then
         // EOF inside a quoted field -> unterminated quote.
         ok = false
         endPos = n
         false
       else if b == QUOTE then
-        val next = lin_string_byte_at(s, i + 1)
+        val next = byteAt(s, i + 1)
         if next == QUOTE then
           // Escaped quote: emit the span up to and including this quote's position, skip the pair.
-          push(parts, lin_string_slice(s, segStart, i + 1))
+          push(parts, substring(s, segStart, i + 1))
           i = i + 2
           segStart = i
           true
         else
           // Closing quote: emit the final span, terminate.
-          push(parts, lin_string_slice(s, segStart, i))
+          push(parts, substring(s, segStart, i))
           i = i + 1
           ok = true
           endPos = i
@@ -139,7 +134,7 @@ val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean)
     var i = start
     var ok = true
     range(0, n + 1).while(_ =>
-      val b = lin_string_byte_at(s, i)
+      val b = byteAt(s, i)
       if b == -1 || b == delim || b == CR || b == LF then
         false
       else if b == QUOTE then
@@ -149,7 +144,7 @@ val scanField = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean)
         i = i + 1
         true
     )
-    val raw = lin_string_slice(s, start, i)
+    val raw = substring(s, start, i)
     {
       "value": if trim then trimAsciiWs(raw) else raw,
       "pos": i,
@@ -175,13 +170,13 @@ val scanRecord = (s: String, n: Int32, start: Int32, delim: Int32, trim: Boolean
     else
       push(fields, cur["value"])
       pos = cur["pos"]
-      val b = lin_string_byte_at(s, pos)
+      val b = byteAt(s, pos)
       if b == delim then
         pos = pos + 1 // another field follows
         true
       else if b == CR then
         // CR or CRLF terminates the record.
-        val nb = lin_string_byte_at(s, pos + 1)
+        val nb = byteAt(s, pos + 1)
         pos = if nb == LF then pos + 2 else pos + 1
         false
       else if b == LF then
@@ -247,7 +242,7 @@ export val parse = (s: String, opts: Json = {  }): String[][] | Error =>
       "message": "csv: delimiter must be a single character that is not '\"', CR, or LF"
     }
   else
-    val n = lin_string_length(s)
+    val n = lengthBytes(s)
     val delim = optDelimByte(opts)
     val trim = optTrim(opts)
     // The accumulator is `Json[]`, NOT `String[][]`: each row is read out of `scanRecord`'s
@@ -315,10 +310,10 @@ export val parseWithHeader = (s: String, opts: Json = {  }): { String: String }[
 // ── stringify ──────────────────────────────────────────────────────────────
 // True if a field needs quoting: contains the delimiter, a `"`, a CR, or an LF.
 val needsQuote = (field: String, delim: Int32): Boolean =>
-  val n = lin_string_length(field)
+  val n = lengthBytes(field)
   var special = false
   range(0, n).for(i =>
-    val b = lin_string_byte_at(field, i)
+    val b = byteAt(field, i)
     if b == delim || b == QUOTE || b == CR || b == LF then special = true
   )
   special
@@ -326,17 +321,17 @@ val needsQuote = (field: String, delim: Int32): Boolean =>
 // Render one field: quote-iff-special, doubling any embedded `"`.
 val renderField = (field: String, delim: Int32): String =>
   if needsQuote(field, delim) then
-    val n = lin_string_length(field)
+    val n = lengthBytes(field)
     val parts: String[] = []
     push(parts, "\"")
     var segStart = 0
     range(0, n).for(i =>
-      if lin_string_byte_at(field, i) == QUOTE then
-        push(parts, lin_string_slice(field, segStart, i + 1))
+      if byteAt(field, i) == QUOTE then
+        push(parts, substring(field, segStart, i + 1))
         push(parts, "\"") // double it
         segStart = i + 1
     )
-    push(parts, lin_string_slice(field, segStart, n))
+    push(parts, substring(field, segStart, n))
     push(parts, "\"")
     join(parts, "")
   else
