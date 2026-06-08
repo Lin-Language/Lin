@@ -191,6 +191,8 @@ impl<'ctx> Codegen<'ctx> {
         match ty {
             Type::Str | Type::StrLit(_) => Some(Self::KIND_STRING),
             Type::Array(_) | Type::FixedArray(_) => Some(Self::KIND_ARRAY),
+            // A `{ String: T }` index-signature map is a `*LinMap` owned-pointer heap field.
+            Type::Map(_) => Some(Self::KIND_MAP),
             // A nested sealed record (a field whose type is itself sealed-eligible). The recursion
             // bottoms out: a field's eligibility is decided by `sealed_fields` on that field type.
             Type::Object { .. } if Self::sealed_fields(ty).is_some() => Some(Self::KIND_SEALED),
@@ -202,6 +204,10 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) const KIND_STRING: u32 = 1;
     pub(crate) const KIND_ARRAY: u32 = 2;
     pub(crate) const KIND_SEALED: u32 = 3;
+    /// `{ String: T }` index-signature map heap field (`*LinMap` owned pointer). MUST stay in
+    /// lockstep with `lin_runtime::sealed::KIND_MAP`. (Numerically equals `KIND_SUMNODE = 4`, but the
+    /// two are in DISJOINT descriptor namespaces — see the runtime const's doc comment.)
+    pub(crate) const KIND_MAP: u32 = 4;
 
     /// NAMED full-field descriptor kind codes (ADR-063 Stage 3b mechanism (i)). Unlike the heap-only
     /// `KIND_*`, these cover SCALARS too, since the named descriptor lists EVERY field for the boxed
@@ -216,6 +222,7 @@ impl<'ctx> Codegen<'ctx> {
     pub(crate) const NKIND_STRING: u32 = 6; // String/StrLit
     pub(crate) const NKIND_ARRAY: u32 = 7; // Array/FixedArray
     pub(crate) const NKIND_SEALED: u32 = 8; // nested sealed record
+    pub(crate) const NKIND_MAP: u32 = 9; // { String: T } index-signature map (*LinMap)
 
     /// The NAMED-descriptor kind for `ty` (a sealed-record field). Covers every permissible sealed
     /// field — scalar OR heap. Returns `None` only for a type that is not a valid sealed field (which
@@ -229,6 +236,7 @@ impl<'ctx> Codegen<'ctx> {
             Type::Float32 | Type::Float64 => Some(Self::NKIND_FLOAT64),
             Type::Str | Type::StrLit(_) => Some(Self::NKIND_STRING),
             Type::Array(_) | Type::FixedArray(_) => Some(Self::NKIND_ARRAY),
+            Type::Map(_) => Some(Self::NKIND_MAP),
             Type::Object { .. } if Self::sealed_fields(ty).is_some() => Some(Self::NKIND_SEALED),
             _ => None,
         }

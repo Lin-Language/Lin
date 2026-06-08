@@ -764,6 +764,62 @@ print(toString(total))
     assert_eq!(output, vec!["225"]);
 }
 
+// Sealed-record KIND_MAP heap field (ADR-063): a NAMED record whose fields include a typed
+// index-signature map `{ String: T }` now PACKS into a sealed struct — the Map lives inline as an
+// owned `*LinMap` pointer slot (descriptor kind KIND_MAP=4 / NKIND_MAP=9), exactly like a String/
+// Array heap field. This is the RAPTOR `Service { days, dates }` shape. The struct must construct
+// (retain the map +1), read a dynamic map key off the packed field, and drop (release the map via
+// the descriptor walk) with correct values. A standalone Service, a packed `Service[]` element, and
+// a nested `Outer { s: Service }` all exercise the inline-map slot at construct/read/drop.
+// (Storing a packed sealed record AS a `{String:Service}` map VALUE is a separate pre-existing
+// keep-packed-into-map-value bug that crashes for scalar records too — not covered here.)
+#[test]
+fn test_sealed_record_with_map_field_kind_map() {
+    let output = run(r#"import { print } from "std/io"
+import { toString } from "std/string"
+import { push, length } from "std/array"
+
+type Service = { "startDate": Int32, "endDate": Int32, "days": { String: Boolean }, "dates": { String: Boolean } }
+type Outer = { "s": Service }
+
+// Standalone packed Service with two map fields; dynamic-key reads off the packed slots.
+var days: { String: Boolean } = {}
+days["mon"] = true
+days["tue"] = false
+var dates: { String: Boolean } = {}
+dates["2026-01-01"] = true
+val svc: Service = { "startDate": 20260101, "endDate": 20261231, "days": days, "dates": dates }
+print(toString(svc["startDate"]))
+print(toString(svc["days"]["mon"]))
+print(toString(svc["days"]["tue"]))
+print(toString(svc["dates"]["2026-01-01"]))
+
+// Packed Service[] of map-field records; field read off contiguous elements.
+var arr: Service[] = []
+var d0: { String: Boolean } = {}
+d0["x"] = true
+push(arr, { "startDate": 1, "endDate": 2, "days": d0, "dates": d0 })
+var d1: { String: Boolean } = {}
+d1["x"] = false
+push(arr, { "startDate": 3, "endDate": 4, "days": d1, "dates": d1 })
+print(toString(length(arr)))
+print(toString(arr[0]["days"]["x"]))
+print(toString(arr[1]["days"]["x"]))
+
+// Nested: a map field inside a nested sealed record.
+val o: Outer = { "s": svc }
+print(toString(o["s"]["days"]["mon"]))
+"#);
+    assert_eq!(
+        output,
+        vec![
+            "20260101", "true", "false", "true", // standalone Service reads
+            "2", "true", "false",                // Service[] length + element map reads
+            "true",                              // nested Outer.s.days["mon"]
+        ]
+    );
+}
+
 // Regression (object/record holding a typed-map FIELD is fully released): `lin_object_release`'s
 // value-release loop was a hand-rolled copy that omitted TAG_MAP — so a `{ String: T }` map stored
 // as a record/object FIELD (e.g. `ScanResults.bestArrivals`) was never released when the record
