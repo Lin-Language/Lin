@@ -385,6 +385,17 @@ pub enum Instruction {
     /// loads the scalar directly. `arr_ty` is the `Array(elem)` type (so codegen recovers the
     /// element fields/stride); `result_ty` is the field's type. Sound only for SCALAR fields (no RC).
     SealedArrayFieldGet { dst: Temp, array: Temp, index: Temp, field: String, arr_ty: Type, result_ty: Type },
+    /// result = (BOXED `Object[]` array)[index][field] — a single field read of one element of a
+    /// BOXED array whose element is a sealed/typed record stored as a heap `LinObject` (the boxed
+    /// `Token[]` representation: a record with heap fields, NOT a packed sealed-scalar array).
+    /// Codegen reads the BORROWED element box via `lin_array_get` (no fresh box, no per-element
+    /// sealed materialization), unboxes to the raw `LinObject`, does the single `lin_object_get` for
+    /// `field`, then unboxes/coerces to `result_ty`. The lowerer registers `dst` owned (a `Retain`
+    /// follows for an RC `result_ty`), matching the materialize-then-read path it replaces. Avoids
+    /// the alloc + 2-field read + 2 retains + reload + release the generic `arr[i]` sealed projection
+    /// pays per access in a hot parser loop. `arr_ty` is the `Array(elem)` type; `result_ty` is the
+    /// field's type.
+    BoxedArrayFieldGet { dst: Temp, array: Temp, index: Temp, field: String, arr_ty: Type, result_ty: Type },
     /// result = env[index]  — load a captured value from a closure's environment struct
     /// (raw pointer load at byte offset 8 + index*8), NOT a Lin object field access.
     EnvCapture { dst: Temp, env: Temp, index: u32, ty: Type },
@@ -492,6 +503,19 @@ pub enum Instruction {
     Bind { dst: Temp, src: Temp, ty: Type },
     /// Panic with a message string.
     Panic { msg: Temp },
+    /// DEBUG-ONLY metadata (Phase 3 of the Lin debugger): associate the SSA temp holding a Lin
+    /// `val`/`var`/parameter binding with its SOURCE name and type, so the codegen DWARF pass can
+    /// emit a `DILocalVariable` + `DIType` for it (and `llvm.dbg.declare` over a stack home) under
+    /// `--debug`. `param_no` is `Some(n)` (1-based) for a function parameter — emitted as a
+    /// `DW_TAG_formal_parameter` with that argument ordinal (each parameter MUST have a distinct
+    /// index or LLVM rejects the debug info) — and `None` for a `val`/`var` local (a
+    /// `DW_TAG_variable`). `span` is the binding-site source span (for the declared line/col).
+    /// Purely additive: it produces NO machine instructions and is IGNORED by non-debug codegen (the
+    /// debug_info state is `None`), so it never changes program semantics or non-debug output. The
+    /// lowerer emits it at binding sites; the liveness/RC passes treat it as a pure metadata marker
+    /// (it neither defines nor uses `temp` for ownership purposes — `temp` is already defined by the
+    /// preceding binding instruction). See `crates/lin-codegen/src/codegen/debug_info.rs`.
+    DebugDeclare { temp: Temp, name: String, ty: Type, param_no: Option<u32>, span: lin_common::Span },
 }
 
 /// Description of what a `has` pattern checks (for pattern-match compilation).
@@ -547,6 +571,14 @@ pub struct BasicBlock {
     /// Only populated for blocks that map to a user-meaningful source region
     /// (function bodies, if/match arms, loop bodies); `None` for synthetic blocks.
     pub span: Option<lin_common::Span>,
+    /// Per-instruction source spans, PARALLEL to `instructions` (`instr_spans[i]` is the source
+    /// span of `instructions[i]`, or `None` for synthetic instructions with no source location).
+    /// Populated by the lowerer (`emit`) so the codegen DWARF pass can attach statement-granularity
+    /// `DILocation`s in `--debug` builds. Purely additive debug metadata: it MUST be kept in lockstep
+    /// with `instructions` whenever an instruction is inserted/removed (the lowerer's `emit` plus the
+    /// RC-elision `remove` and escape `retain` sites do this). It never affects IR semantics or
+    /// non-debug codegen; if it is out of sync or empty the DWARF pass simply emits fewer locations.
+    pub instr_spans: Vec<Option<lin_common::Span>>,
 }
 
 /// A compiled Lin function in flat IR form.

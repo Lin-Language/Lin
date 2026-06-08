@@ -1380,6 +1380,57 @@ impl<'ctx> Codegen<'ctx> {
         if &fld_ty == result_ty { loaded } else { self.compile_ir_coerce(loaded, &fld_ty, result_ty) }
     }
 
+    /// `arr[index][field]` for a BOXED `Object[]` whose element is a sealed/typed record stored as a
+    /// heap `LinObject` (the boxed `Token[]` representation — a record with heap fields, NOT a packed
+    /// sealed-scalar array). Reads the BORROWED element box via `lin_array_get` (a `*TaggedVal*`
+    /// interior pointer — no fresh box alloc, no element release), unboxes to the raw `LinObject`,
+    /// does the SINGLE `lin_object_get` for `field`, then unboxes/coerces to `result_ty`. The
+    /// returned value is BORROWED interior storage; the lowerer's `BoxedArrayFieldGet` registers `dst`
+    /// owned and emits the `Retain` for an RC `result_ty`, matching the materialize-then-read path
+    /// this replaces. This skips the generic `arr[i]` sealed PROJECTION (alloc + read every field +
+    /// per-field retain + reload + release) paid per access in a hot parser loop.
+    pub(crate) fn compile_ir_boxed_array_field_get(
+        &mut self,
+        arr: BasicValueEnum<'ctx>,
+        idx: BasicValueEnum<'ctx>,
+        field: &str,
+        arr_ty: &Type,
+        result_ty: &Type,
+    ) -> BasicValueEnum<'ctx> {
+        let ptr_ty = self.context.ptr_type(AddressSpace::default());
+        let i64_ty = self.context.i64_type();
+        let _ = arr_ty;
+        if !arr.is_pointer_value() {
+            return ptr_ty.const_null().into();
+        }
+        // The array operand is the boxed array. It may be a raw `LinArray*` (a typed array local) or
+        // a boxed `Json` (TaggedVal*); array_get expects the raw `LinArray*`, so unbox a boxed array
+        // first the same way the generic Index path does.
+        let arr_raw = if Self::is_union_type(arr_ty) {
+            self.builder.call(self.rt.unbox_ptr, &[arr.into()], "bafg_arr_unbox").try_as_basic_value().unwrap_basic()
+        } else {
+            arr
+        };
+        // idx → i64.
+        let idx_i64 = if idx.is_int_value() {
+            self.builder.int_s_extend_or_bit_cast(idx.into_int_value(), i64_ty, "bafg_idx")
+        } else {
+            self.unbox_value(idx, &Type::Int64).into_int_value()
+        };
+        // Borrowed element box (interior `*TaggedVal`); no fresh allocation, no release.
+        let elem_box = self.builder.call(self.rt.array_get, &[arr_raw.into(), idx_i64.into()], "bafg_elem")
+            .try_as_basic_value().unwrap_basic();
+        // Unbox the element box to the raw `LinObject*`, then a single `object_get` for the field.
+        let obj = self.builder.call(self.rt.unbox_ptr, &[elem_box.into()], "bafg_obj")
+            .try_as_basic_value().unwrap_basic();
+        let key_str = self.compile_string_lit(field).into_pointer_value();
+        let tagged = self.builder.call(self.rt.object_get, &[obj.into(), key_str.into()], "bafg_get")
+            .try_as_basic_value().unwrap_basic();
+        // Coerce the (borrowed interior) field value to the field's declared type. The lowerer
+        // registers `dst` owned and retains for an RC result, so this borrowed read is balanced.
+        self.unbox_tagged_val_to_type(tagged, result_ty)
+    }
+
     /// Project a wider/Json/`Object[]` source array (`src`, statically `src_ty`) into a FRESH
     /// SEALED-RECORD ARRAY of `arr_ty`'s element type (sealed-records Stage 3 boundary, §3.2). Builds
     /// a new contiguous sealed array and, per element, reads the source element as a boxed value,

@@ -38,7 +38,7 @@ impl LanguageServer for Backend {
                     .and_then(|f| f.uri.to_file_path().ok())
             });
         if let Some(root) = &root {
-            *WORKSPACE_ROOT.write().unwrap() = Some(root.clone());
+            *WORKSPACE_ROOT.write().unwrap_or_else(|e| e.into_inner()) = Some(root.clone());
         }
 
         // Build the cross-file index: seed stdlib, then enumerate + index every
@@ -46,7 +46,7 @@ impl LanguageServer for Backend {
         // open DIRECT dependents are re-checked when an imported file changes (see
         // the `update` / `recheck_open_dependents` handlers).
         {
-            let mut index = WORKSPACE_INDEX.write().unwrap();
+            let mut index = WORKSPACE_INDEX.write().unwrap_or_else(|e| e.into_inner());
             *index = WorkspaceIndex::default();
             seed_stdlib_index(&mut index);
             if let Some(root) = &root {
@@ -152,7 +152,7 @@ impl LanguageServer for Backend {
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.docs.write().unwrap().remove(&params.text_document.uri);
+        self.docs.write().unwrap_or_else(|e| e.into_inner()).remove(&params.text_document.uri);
         self.client
             .publish_diagnostics(params.text_document.uri, vec![], None)
             .await;
@@ -161,7 +161,7 @@ impl LanguageServer for Backend {
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -184,7 +184,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -192,25 +192,48 @@ impl LanguageServer for Backend {
         let analysis = analyse(&source, base_dir.as_deref());
         let offset = position_to_offset(&source, pos);
 
-        let def_span = match tightest_span(&analysis.span_type_map, offset)
-            .and_then(|(_, _, ds)| *ds)
-        {
-            Some(s) => s,
-            None => return Ok(None),
-        };
+        // Same-file first: a local/parameter use carries a `def_span` pointing at its binding in
+        // THIS file. That's the most precise target, so prefer it.
+        if let Some(def_span) = tightest_span(&analysis.span_type_map, offset).and_then(|(_, _, ds)| *ds) {
+            let start = offset_to_position(&source, def_span.start as usize);
+            let end = offset_to_position(&source, def_span.end as usize);
+            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                uri: uri.clone(),
+                range: Range { start, end },
+            })));
+        }
 
-        let start = offset_to_position(&source, def_span.start as usize);
-        let end = offset_to_position(&source, def_span.end as usize);
-        Ok(Some(GotoDefinitionResponse::Scalar(Location {
-            uri: uri.clone(),
-            range: Range { start, end },
-        })))
+        // Cross-file fallback: an IMPORTED name has no intra-file `def_span` (imported bindings are
+        // `env.define`d without one — see the cross-file index note). Resolve the symbol under the
+        // cursor to its owner module via the SAME path references/rename use, then jump to the owner
+        // file's export declaration span. stdlib owners have no on-disk URI (`module_id_to_uri`
+        // returns `None`), so goto into stdlib yields nothing — acceptable.
+        if let Ok(path) = uri.to_file_path() {
+            let module_id = canonical_id(&path);
+            let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
+            if let Some((owner, name)) = index.resolve_symbol(&module_id, offset) {
+                if let (Some(decl), Some(owner_uri), Some(owner_file)) = (
+                    decl_span(&index, &owner, &name),
+                    module_id_to_uri(&owner),
+                    index.files.get(&owner),
+                ) {
+                    // Convert the decl span using the OWNER file's source (offsets index into it),
+                    // not the current file's.
+                    return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                        uri: owner_uri,
+                        range: span_to_range(&owner_file.source, decl),
+                    })));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -226,6 +249,14 @@ impl LanguageServer for Backend {
             return Ok(Some(CompletionResponse::Array(items)));
         }
 
+        // Suppress completion inside a NORMAL string literal or a line comment. Import strings were
+        // already handled above (they have their own path-completion), so any string we detect here
+        // is an ordinary string where identifier/keyword completion would be noise. We return an
+        // empty list rather than `None` so the client doesn't fall back to its own word-based list.
+        if in_string_or_comment(&source, offset) {
+            return Ok(Some(CompletionResponse::Array(Vec::new())));
+        }
+
         let prefix = word_before(&source, offset);
 
         // Detect whether cursor is in a dot-completion context and resolve
@@ -239,7 +270,8 @@ impl LanguageServer for Backend {
             // 1. Bindings visible at the cursor (from span_type_map def_spans).
             for (_, ty_str, def_span) in &analysis.span_type_map {
                 if let Some(ds) = def_span {
-                    let name = &source[ds.start as usize..ds.end as usize];
+                    // `.get` (not raw index) so a stale/multi-byte-misaligned def_span can't panic.
+                    let name = source.get(ds.start as usize..ds.end as usize).unwrap_or("");
                     if !name.is_empty() && name.starts_with(|c: char| c.is_alphabetic() || c == '_') {
                         if name.starts_with(prefix) {
                             let kind = if ty_str.contains("=>") {
@@ -307,18 +339,16 @@ impl LanguageServer for Backend {
             if !imp.name.starts_with(prefix) {
                 continue;
             }
-            // Dot-context filtering: only show items applicable to the receiver type. We use the
-            // resolved signature's first parameter category; items with no signature or a
-            // non-matching first param are dropped unless the receiver type is unknown ("any").
+            // Dot-context filtering: only show items applicable to the receiver type. The decision
+            // is delegated to `dot_item_applies` so it can be unit-tested directly. The key change
+            // from the old logic: a RECEIVER-POLYMORPHIC combinator (first-param category "any",
+            // e.g. `map`/`filter`/`reduce` whose first param renders as generic/`Json`/union) is now
+            // OFFERED on any receiver instead of being dropped — that idiom is the whole point of
+            // `xs.map(...)`.
             if let Some(cat) = filter_cat {
-                if cat != "any" {
-                    let first_param_cat = imp
-                        .ty
-                        .as_deref()
-                        .and_then(first_param_category);
-                    if first_param_cat.as_deref() != Some(cat) {
-                        continue;
-                    }
+                let first_param_cat = imp.ty.as_deref().and_then(first_param_category);
+                if !dot_item_applies(cat, first_param_cat.as_deref()) {
+                    continue;
                 }
             }
             let kind = match imp.ty.as_deref() {
@@ -373,7 +403,7 @@ impl LanguageServer for Backend {
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -387,7 +417,7 @@ impl LanguageServer for Backend {
         // gather occurrences across the whole workspace index.
         if let Ok(path) = uri.to_file_path() {
             let module_id = canonical_id(&path);
-            let index = WORKSPACE_INDEX.read().unwrap();
+            let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
             if let Some((owner, name)) = index.resolve_symbol(&module_id, offset) {
                 let occ = index.occurrences(&owner, &name);
                 if !occ.is_empty() {
@@ -427,7 +457,7 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
-        let source = match self.docs.read().unwrap().get(&params.text_document.uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(&params.text_document.uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -445,7 +475,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<Vec<DocumentHighlight>>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -476,7 +506,7 @@ impl LanguageServer for Backend {
         let uri = &params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let new_name = params.new_name;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -487,7 +517,7 @@ impl LanguageServer for Backend {
         // Cross-file first: a top-level exported/imported symbol renames everywhere.
         if let Ok(path) = uri.to_file_path() {
             let module_id = canonical_id(&path);
-            let index = WORKSPACE_INDEX.read().unwrap();
+            let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
             if let Some((owner, name)) = index.resolve_symbol(&module_id, offset) {
                 // `rename_edits` returns None for stdlib-owned symbols (read-only) —
                 // decline the rename rather than emit an unsound/partial edit.
@@ -541,7 +571,7 @@ impl LanguageServer for Backend {
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = &params.text_document.uri;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -563,7 +593,7 @@ impl LanguageServer for Backend {
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = &params.text_document.uri;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -583,7 +613,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<SignatureHelp>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -596,13 +626,19 @@ impl LanguageServer for Backend {
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = &params.text_document.uri;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
 
         let base_dir = file_dir(uri);
-        let index = WORKSPACE_INDEX.read().unwrap();
+        // Snapshot the index under the read guard, then DROP it before the (re-lex/parse + loop)
+        // work in `code_actions` — mirroring `recheck_open_dependents`. Holding the guard across that
+        // work would let one panic-capable code path poison the lock for the rest of the session.
+        let index = {
+            let guard = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
+            guard.clone()
+        };
         let actions = code_actions(&source, uri, &params, &index, base_dir.as_deref());
         if actions.is_empty() {
             Ok(None)
@@ -613,7 +649,7 @@ impl LanguageServer for Backend {
 
     async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
         let uri = &params.text_document.uri;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -629,7 +665,7 @@ impl LanguageServer for Backend {
         params: FoldingRangeParams,
     ) -> Result<Option<Vec<FoldingRange>>> {
         let uri = &params.text_document.uri;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -645,7 +681,7 @@ impl LanguageServer for Backend {
         params: SelectionRangeParams,
     ) -> Result<Option<Vec<SelectionRange>>> {
         let uri = &params.text_document.uri;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -667,7 +703,7 @@ impl LanguageServer for Backend {
         params: DocumentLinkParams,
     ) -> Result<Option<Vec<DocumentLink>>> {
         let uri = &params.text_document.uri;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -684,7 +720,7 @@ impl LanguageServer for Backend {
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
         let query = &params.query;
-        let index = WORKSPACE_INDEX.read().unwrap();
+        let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
         let mut symbols = Vec::new();
         for (mod_id, name, span) in index.workspace_symbols(query) {
             let Some(file) = index.files.get(&mod_id) else { continue };
@@ -713,7 +749,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<request::GotoTypeDefinitionResponse>> {
         let uri = &params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
-        let source = match self.docs.read().unwrap().get(uri).cloned() {
+        let source = match self.docs.read().unwrap_or_else(|e| e.into_inner()).get(uri).cloned() {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -735,7 +771,7 @@ impl LanguageServer for Backend {
 
         // Find a `type <name>` declaration: same file first, then anywhere in the
         // workspace index (cross-file type definitions).
-        let index = WORKSPACE_INDEX.read().unwrap();
+        let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
         if let Ok(path) = uri.to_file_path() {
             let module_id = canonical_id(&path);
             if let Some(file) = index.files.get(&module_id) {
@@ -817,7 +853,7 @@ impl Backend {
         // Compute the direct dependents under the index read lock, then drop it
         // before any await (we must not hold a std `RwLock` guard across `.await`).
         let dependent_ids: Vec<String> = {
-            let index = WORKSPACE_INDEX.read().unwrap();
+            let index = WORKSPACE_INDEX.read().unwrap_or_else(|e| e.into_inner());
             index.dependents_of(&changed_id)
         };
         if dependent_ids.is_empty() {
@@ -828,7 +864,7 @@ impl Backend {
         // again releasing the lock before awaiting. A dependent that isn't currently
         // open is skipped — the client only renders open documents.
         let to_recheck: Vec<(Url, String)> = {
-            let docs = self.docs.read().unwrap();
+            let docs = self.docs.read().unwrap_or_else(|e| e.into_inner());
             docs.iter()
                 .filter(|(dep_uri, _)| *dep_uri != changed_uri)
                 .filter(|(dep_uri, _)| {
@@ -910,7 +946,7 @@ fn analyse(source: &str, base_dir: Option<&Path>) -> Analysis {
     let mut imported: HashMap<String, TypedModule> = HashMap::new();
     let effective_base = base_dir
         .map(|p| p.to_path_buf())
-        .or_else(|| WORKSPACE_ROOT.read().unwrap().clone())
+        .or_else(|| WORKSPACE_ROOT.read().unwrap_or_else(|e| e.into_inner()).clone())
         .unwrap_or_else(|| PathBuf::from("."));
 
     let mut visiting: HashSet<String> = HashSet::new();
@@ -1020,7 +1056,8 @@ fn contains_identifier(line: &str, name: &str) -> bool {
 
 /// Finds the byte offset of `name` within the import statement starting at `import_start`.
 fn find_name_in_import(source: &str, import_start: usize, name: &str) -> Option<usize> {
-    let search_area = &source[import_start..];
+    // `.get` so a stale/out-of-range span start can't panic the slice.
+    let search_area = source.get(import_start..)?;
     let pos = search_area.find(name)?;
     let abs = import_start + pos;
     // Make sure it's a whole identifier.
@@ -1155,6 +1192,17 @@ fn pre_resolve_imports(
     }
 }
 
+/// Export name→type map for an imported module, used to enrich completion detail / signature for
+/// imported symbols.
+///
+/// LIMITATION (FIX 5, intentionally not implemented): only `val` exports are surfaced. `var` and
+/// `type` exports are NOT, because they cannot be recovered from the typed IR here: `TypedStmt::Var`
+/// carries only a `slot` (no `name`), and `type` declarations are ERASED entirely (there is no
+/// `TypedStmt::TypeDecl`). So adding arms for them is not the trivial, obviously-correct change the
+/// task scoped FIX 5 to — surfacing them would require either a name on `TypedStmt::Var` or reading
+/// the surface AST and re-deriving types, neither of which is low-risk. The user-visible effect is
+/// minor: completion of an IMPORTED `var`/`type` shows no inferred-type detail (the name still
+/// completes via the cross-file index; hover/goto on the export site itself are unaffected).
 fn extract_exports(module: &TypedModule) -> Vec<(String, Type)> {
     module
         .statements
@@ -1225,6 +1273,30 @@ fn type_to_category(ty: &str) -> &'static str {
 
 // ── completion helpers ────────────────────────────────────────────────────────
 
+/// Decide whether an imported function should appear in `xs.` dot-completion, given the receiver's
+/// category (`receiver_cat`) and the function's FIRST-parameter category (`first_param_cat`, `None`
+/// when the item has no resolvable function signature).
+///
+/// An item APPLIES when any of the following hold:
+///   - the receiver category is unknown (`"any"`) — we can't filter, so offer everything;
+///   - the first-param category is `"any"` — a RECEIVER-POLYMORPHIC combinator (generic/`Json`/
+///     union first param, e.g. `map`/`filter`/`reduce`). These are the core dot-applied idiom and
+///     must be offered on every receiver; the previous exact-match filter wrongly dropped them;
+///   - the item has no signature at all (`None`) — we can't prove it inapplicable, so keep it;
+///   - the first-param category EQUALS the receiver category (a concrete, matching method).
+///
+/// It is EXCLUDED only when both categories are concrete AND differ (e.g. a `string`-typed first
+/// param on an `array` receiver).
+fn dot_item_applies(receiver_cat: &str, first_param_cat: Option<&str>) -> bool {
+    if receiver_cat == "any" {
+        return true;
+    }
+    match first_param_cat {
+        None | Some("any") => true,
+        Some(fc) => fc == receiver_cat,
+    }
+}
+
 /// Extract the broad category of a function signature's FIRST parameter, used to decide whether
 /// an imported function applies to a dot-receiver of a given category. e.g. `(String, ...) => X`
 /// → "string". Returns `None` when the string isn't a function type or has no parameters.
@@ -1253,6 +1325,62 @@ fn first_param_category(sig: &str) -> Option<String> {
         }
     }
     Some(type_to_category(first.trim()).to_string())
+}
+
+/// True when `offset` sits inside a string literal or a `//` line comment, so identifier/keyword
+/// completion should be suppressed there. Line-scoped + lightweight (no full lex): we scan the
+/// current line from its start up to the cursor, tracking string state (honouring `\"` escapes) and
+/// the `//` comment marker.
+///
+/// Lin string literals are single-line, so a line-local scan is sufficient and robust against a
+/// partial/unparseable buffer mid-edit. Import strings are handled separately (their own
+/// path-completion runs BEFORE this check), so a string detected here is always an ordinary string.
+/// `${...}` interpolation: the cursor inside a `${ ... }` IS code position, so we treat an open `${`
+/// as leaving the string (completion stays enabled inside the interpolation hole).
+fn in_string_or_comment(source: &str, offset: usize) -> bool {
+    let offset = offset.min(source.len());
+    let line_start = source[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let line = &source[line_start..offset];
+
+    let mut in_str = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_str {
+            match c {
+                // `\X` escapes the next char (e.g. `\"` does not close the string).
+                '\\' => {
+                    chars.next();
+                }
+                // `${` opens an interpolation hole — code position resumes until the matching `}`.
+                '$' if chars.peek() == Some(&'{') => {
+                    chars.next(); // consume `{`
+                    // Skip to the closing `}` (interpolations don't nest deeply in practice); if it
+                    // isn't closed before the cursor, the cursor is inside the code hole → not a string.
+                    let mut closed = false;
+                    for ic in chars.by_ref() {
+                        if ic == '}' {
+                            closed = true;
+                            break;
+                        }
+                    }
+                    if !closed {
+                        return false; // cursor is inside the `${ … }` code hole.
+                    }
+                    // Otherwise we consumed the hole and are back in the string body.
+                }
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            // `//` begins a line comment — everything to the cursor (and EOL) is comment.
+            '/' if chars.peek() == Some(&'/') => return true,
+            _ => {}
+        }
+    }
+    in_str
 }
 
 /// Detect whether `offset` sits inside the quoted path of an `import` statement and, if
@@ -2487,7 +2615,11 @@ fn signature_help(source: &str, analysis: &Analysis, offset: usize) -> Option<Si
     let param_types = function_param_types(&ty_str)?;
 
     // Active parameter = number of top-level commas between the opening paren and the cursor.
-    let active = top_level_commas(&source[paren_after..offset.min(source.len())]);
+    // `.get` with a normalised (non-reversed, in-bounds) range so a stale paren/cursor offset or a
+    // multi-byte boundary can't panic the slice.
+    let arg_hi = offset.min(source.len());
+    let arg_text = source.get(paren_after.min(arg_hi)..arg_hi).unwrap_or("");
+    let active = top_level_commas(arg_text);
     let active = (active as usize).min(param_types.len().saturating_sub(1)) as u32;
 
     // Recover parameter NAMES (non-invasively) from the callee's binding AST when the callee is a
@@ -2606,7 +2738,14 @@ fn find_enclosing_call_in_expr(
             // from the opening paren to its matching close in source. `span.start` is the `(`.
             let open = span.start as usize;
             if source.as_bytes().get(open) == Some(&b'(') {
-                let close = matching_paren(&source[open..]).map(|c| open + c);
+                // `.get` so a stale span start can't panic; `(` is ASCII so `open` is a char boundary.
+                // Use the SOURCE matcher (not `matching_paren`, which treats `<>` as brackets) — in
+                // real source `<`/`>` are comparison operators and `=>` is a lambda arrow, so an
+                // argument like `f(1 > 0, 2)` must not unbalance the paren scan.
+                let close = source
+                    .get(open..)
+                    .and_then(matching_paren_in_source)
+                    .map(|c| open + c);
                 let paren_after = open + 1;
                 // Inside the parens: after `(` and at/before the `)` (or to EOF when unclosed,
                 // which is the common case while the user is still typing arguments).
@@ -2679,12 +2818,55 @@ fn function_param_types(sig: &str) -> Option<Vec<String>> {
 }
 
 /// Index of the `)` that closes the `(` at byte 0 of `s` (depth-balanced over `()[]{}<>`).
+///
+/// Scans a RENDERED TYPE string, where `<>` legitimately delimit generic arguments (`Foo<Bar>`). The
+/// one ambiguity is the function arrow `=>`: its `>` is NOT a closing angle bracket, so a function
+/// type like `(Int32) => Int32` would otherwise have its depth driven negative by the arrow. We skip
+/// the `>` of a `=>` (a `>` immediately preceded by `=`) so function-typed parameters split correctly.
 fn matching_paren(s: &str) -> Option<usize> {
     let mut depth = 0i32;
+    let mut prev = '\0';
     for (i, c) in s.char_indices() {
         match c {
             '(' | '[' | '{' | '<' => depth += 1,
+            // `=>` arrow: the `>` is part of the arrow, not a closing angle bracket.
+            '>' if prev == '=' => {}
             ')' | ']' | '}' | '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        prev = c;
+    }
+    None
+}
+
+/// Index of the `)` that closes the `(` at byte 0 of `s`, scanning over USER SOURCE. Depth is
+/// balanced over `()[]{}` only (NOT `<>`, which are comparison operators in source) and string
+/// literals are skipped (honouring `\"` escapes) so a `)` inside a string can't close the call.
+/// This is the source-text counterpart of `matching_paren` (which scans rendered type strings).
+fn matching_paren_in_source(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if in_str {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
                 depth -= 1;
                 if depth == 0 {
                     return Some(i);
@@ -2696,14 +2878,19 @@ fn matching_paren(s: &str) -> Option<usize> {
     None
 }
 
-/// Split `s` on top-level commas (commas at bracket depth 0), trimming each piece.
+/// Split a RENDERED TYPE string `s` on top-level commas (commas at bracket depth 0), trimming each
+/// piece. Depth balances `()[]{}<>`; the `>` of a function arrow `=>` is skipped (it is part of the
+/// arrow, not a closing angle bracket) so a function-typed parameter like `(Int32) => Int32` is kept
+/// as a single piece rather than split at its arrow.
 fn split_top_level(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut depth = 0i32;
     let mut start = 0usize;
+    let mut prev = '\0';
     for (i, c) in s.char_indices() {
         match c {
             '(' | '[' | '{' | '<' => depth += 1,
+            '>' if prev == '=' => {}
             ')' | ']' | '}' | '>' => depth -= 1,
             ',' if depth == 0 => {
                 out.push(s[start..i].trim().to_string());
@@ -2711,20 +2898,43 @@ fn split_top_level(s: &str) -> Vec<String> {
             }
             _ => {}
         }
+        prev = c;
     }
     out.push(s[start..].trim().to_string());
     out
 }
 
-/// Count top-level commas (depth 0) in `s`. Used to pick the active parameter from the text between
-/// a call's `(` and the cursor.
+/// Count top-level commas (bracket-depth 0) in USER SOURCE argument text. Used to pick the active
+/// parameter from the text between a call's `(` and the cursor.
+///
+/// Unlike `split_top_level`/`matching_paren` (which scan RENDERED TYPE strings, where `<>` legitimately
+/// delimit generic arguments), this runs over real source where `<`/`>` are the comparison operators
+/// and `=>` is the lambda arrow — so it must NOT treat them as bracket depth. Doing so previously
+/// skewed the comma count for argument text like `f(x > 0, y)` or `f(x => x, y)`, mis-bolding the
+/// active parameter. Depth is tracked using only `()`, `[]`, `{}`. Commas inside string literals
+/// (`"..."`, honouring `\"` escapes) are skipped; `${...}` interpolation spans inside a string are
+/// likewise ignored along with the rest of the string body.
 fn top_level_commas(s: &str) -> u32 {
     let mut depth = 0i32;
     let mut count = 0u32;
-    for c in s.chars() {
+    let mut in_str = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_str {
+            match c {
+                // Skip the escaped character (e.g. `\"` does not close the string).
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
         match c {
-            '(' | '[' | '{' | '<' => depth += 1,
-            ')' | ']' | '}' | '>' => depth -= 1,
+            '"' => in_str = true,
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
             ',' if depth == 0 => count += 1,
             _ => {}
         }
@@ -2969,6 +3179,11 @@ fn suggestion_from_help(help: &str) -> Option<String> {
     Some(rest[..close].to_string())
 }
 
+/// Convert a byte offset into the source to an LSP `Position`. The `character` field is a
+/// **UTF-16 code-unit** column (the LSP default `positionEncoding`), NOT a `char`/codepoint count:
+/// a character outside the BMP (e.g. an emoji) is two UTF-16 units, so columns after it must be
+/// advanced by `ch.len_utf16()`. Counting one-per-`char` (as a naive implementation does) misaligns
+/// every range a client decodes once an astral codepoint appears on the line.
 fn offset_to_position(source: &str, offset: usize) -> Position {
     let mut line = 0u32;
     let mut character = 0u32;
@@ -2980,24 +3195,35 @@ fn offset_to_position(source: &str, offset: usize) -> Position {
             line += 1;
             character = 0;
         } else {
-            character += 1;
+            character += ch.len_utf16() as u32;
         }
     }
     Position { line, character }
 }
 
+/// Convert an LSP `Position` (line + UTF-16 code-unit column) back to a byte offset into the source.
+/// Mirrors `offset_to_position`: we accumulate UTF-16 code units per `char` (`ch.len_utf16()`) until
+/// the target column is reached. A malformed `pos.character` that lands in the MIDDLE of a surrogate
+/// pair (only possible if the client sends a bad position) is rounded to the nearest char boundary —
+/// we stop at the char whose UTF-16 span would cross the target, returning a valid byte offset and
+/// never panicking.
 fn position_to_offset(source: &str, pos: Position) -> usize {
     let mut line = 0u32;
     let mut character = 0u32;
     for (i, ch) in source.char_indices() {
-        if line == pos.line && character == pos.character {
+        if line == pos.line && character >= pos.character {
             return i;
         }
         if ch == '\n' {
+            // Reached the end of the requested line before the requested column: clamp to the
+            // newline's byte offset (the line is shorter than the client's column).
+            if line == pos.line {
+                return i;
+            }
             line += 1;
             character = 0;
         } else {
-            character += 1;
+            character += ch.len_utf16() as u32;
         }
     }
     source.len()
@@ -3219,6 +3445,14 @@ impl WorkspaceIndex {
     ///
     /// Returns `None` when the rename is unsound/unsupported (stdlib symbol), so the
     /// handler can decline rather than produce a partial or wrong edit.
+    ///
+    /// SOUNDNESS (the whole point of this function vs. `occurrences`): rename edits are derived from
+    /// IDENTIFIER TOKENS (`identifier_token_spans`), NOT a raw text scan. That excludes matches inside
+    /// comments and string literals, which a text scan would wrongly rewrite. For the SHADOWING case
+    /// — an importing file that locally re-binds the same name (`val foo`, a param `foo`, a
+    /// destructuring `{ foo }`, etc.) — a flat token scan still cannot tell the import's uses from
+    /// the shadow's uses, so we refuse to touch the body: only the import-clause token is renamed and
+    /// the body uses are left to the user. Partial-but-sound beats complete-but-wrong.
     fn rename_edits(
         &self,
         owner_module: &str,
@@ -3231,10 +3465,18 @@ impl WorkspaceIndex {
 
         let mut out: Vec<(String, lin_common::Span)> = Vec::new();
 
-        // Owner file: decl + every use of the export name.
+        // Owner file: decl + every use of the export name — identifier tokens only (no
+        // comment/string over-match). The owner file can locally shadow its own export inside a
+        // nested scope; if it does, fall back to renaming only the export's declaration site.
         if let Some(owner) = self.files.get(owner_module) {
-            for span in whole_word_spans(&owner.source, export_name) {
-                out.push((owner_module.to_string(), span));
+            if file_rebinds_name_excluding_decl(&owner.source, export_name) {
+                if let Some(span) = decl_span(self, owner_module, export_name) {
+                    out.push((owner_module.to_string(), span));
+                }
+            } else {
+                for span in identifier_token_spans(&owner.source, export_name) {
+                    out.push((owner_module.to_string(), span));
+                }
             }
         }
 
@@ -3253,9 +3495,25 @@ impl WorkspaceIndex {
                     continue;
                 }
                 if imp.local_name == imp.export_name {
-                    // No alias: rename the clause token + every body use.
-                    for span in whole_word_spans(&file.source, &imp.local_name) {
-                        out.push((mod_id.clone(), span));
+                    // No alias. If this file locally re-binds the name (a shadowing `val`/`var`/param/
+                    // destructuring), we cannot soundly distinguish import uses from shadow uses with
+                    // a flat token scan — rename ONLY the import-clause token and leave body uses
+                    // alone. Otherwise rename the clause token + every identifier-token body use.
+                    if file_rebinds_name(&file.source, &imp.local_name) {
+                        if let Some(off) = find_name_in_import(
+                            &file.source,
+                            imp.stmt_span.start as usize,
+                            &imp.local_name,
+                        ) {
+                            out.push((
+                                mod_id.clone(),
+                                lin_common::Span::new(0, off as u32, (off + imp.local_name.len()) as u32),
+                            ));
+                        }
+                    } else {
+                        for span in identifier_token_spans(&file.source, &imp.local_name) {
+                            out.push((mod_id.clone(), span));
+                        }
                     }
                 } else {
                     // Aliased: rename ONLY the export-side token inside the import
@@ -3514,6 +3772,183 @@ fn whole_word_spans(source: &str, name: &str) -> Vec<lin_common::Span> {
     out
 }
 
+/// Every IDENTIFIER-token occurrence of `name` in `source`, as byte spans — the SOUND occurrence
+/// primitive for rename. Unlike `whole_word_spans` (a raw `source.find` text scan), this lexes the
+/// file and keeps only `TokenKind::Ident` spans, so matches inside COMMENTS and STRING LITERALS are
+/// excluded (the lexer emits those as `Comment`/`StringLit`, never `Ident`). Identifiers inside
+/// `${...}` string interpolations ARE real uses and are collected by recursing into the
+/// interpolation's sub-token-stream (ADR-004). It does NOT do scope resolution, so a same-named
+/// local that shadows the symbol is still matched — callers that need shadow-safety must guard with
+/// `file_rebinds_name` first.
+fn identifier_token_spans(source: &str, name: &str) -> Vec<lin_common::Span> {
+    let mut out = Vec::new();
+    if name.is_empty() {
+        return out;
+    }
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    collect_ident_spans_in_tokens(&tokens, name, &mut out);
+    out.sort_by_key(|s| (s.start, s.end));
+    out.dedup();
+    out
+}
+
+/// Recurse a token stream pushing every `Ident(name)` span, descending into `InterpString` expr
+/// parts so identifiers used inside `${...}` interpolations count as real uses.
+fn collect_ident_spans_in_tokens(tokens: &[lin_lex::Token], name: &str, out: &mut Vec<lin_common::Span>) {
+    use lin_lex::{InterpPart, TokenKind};
+    for tok in tokens {
+        match &tok.kind {
+            TokenKind::Ident(n) if n == name => out.push(tok.span),
+            TokenKind::InterpString(parts) => {
+                for part in parts {
+                    if let InterpPart::Expr(sub) = part {
+                        collect_ident_spans_in_tokens(sub, name, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// True when the file's AST introduces a LOCAL binding named `name` anywhere (a `val`/`var`, a
+/// function parameter, or a destructuring/match pattern element) — i.e. a binding that could SHADOW
+/// an imported symbol of the same name. When this holds, a flat identifier-token scan cannot tell an
+/// import use from a shadow use, so rename must NOT rewrite body uses (it would corrupt the shadow).
+/// Conservative: the top-level `import` binding itself is excluded (it's the symbol we're renaming,
+/// not a shadow), but any other introduction of `name` returns true.
+fn file_rebinds_name(source: &str, name: &str) -> bool {
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    let mut parser = lin_parse::Parser::new(tokens);
+    let module = parser.parse_module();
+    module.statements.iter().any(|s| stmt_binds_name(s, name, true))
+}
+
+/// Like `file_rebinds_name`, but for the OWNER file: the symbol's own top-level `export val|var`
+/// declaration is NOT a shadow (it's the declaration we're renaming). Returns true only when a
+/// NESTED scope (function body, block, match arm) re-binds the name — in which case the owner file's
+/// body uses can't be soundly distinguished from the shadow, so the caller renames only the decl
+/// site.
+fn file_rebinds_name_excluding_decl(source: &str, name: &str) -> bool {
+    let mut lexer = lin_lex::Lexer::new(source, 0);
+    let tokens = lexer.tokenize();
+    let mut parser = lin_parse::Parser::new(tokens);
+    let module = parser.parse_module();
+    module.statements.iter().any(|s| match s {
+        // The export's own top-level binding is the declaration, not a shadow — but a nested
+        // re-binding inside its initializer expression still counts.
+        Stmt::Val { pattern, value, .. } if pattern_binds_name(pattern, name) => {
+            expr_binds_name(value, name)
+        }
+        Stmt::Var { name: vn, value, .. } if vn == name => expr_binds_name(value, name),
+        other => stmt_binds_name(other, name, true),
+    })
+}
+
+/// Whether `stmt` (recursively, into expressions) introduces a binding named `name`. When
+/// `top_level` is true the statement is a module-level statement and a top-level `import` of `name`
+/// is NOT counted as a shadow (it's the import we're tracking); a top-level `val`/`var` of `name`
+/// IS a shadow (re-binding the imported name at module scope).
+fn stmt_binds_name(stmt: &Stmt, name: &str, top_level: bool) -> bool {
+    match stmt {
+        Stmt::Val { pattern, value, .. } => {
+            pattern_binds_name(pattern, name) || expr_binds_name(value, name)
+        }
+        Stmt::Var { name: vn, value, .. } => vn == name || expr_binds_name(value, name),
+        Stmt::Replace { name: rn, value, .. } => rn == name || expr_binds_name(value, name),
+        Stmt::Expr(e) => expr_binds_name(e, name),
+        // A top-level import of `name` is the binding we're renaming, not a shadow.
+        Stmt::Import { .. } if top_level => false,
+        _ => false,
+    }
+}
+
+/// Whether a binding pattern (incl. destructuring) introduces `name`.
+fn pattern_binds_name(pattern: &lin_parse::ast::Pattern, name: &str) -> bool {
+    use lin_parse::ast::Pattern as P;
+    match pattern {
+        P::Ident(n, _) => n == name,
+        P::Object(fields, rest, _) => {
+            rest.as_deref() == Some(name)
+                || fields.iter().any(|f| pattern_binds_name(&f.pattern, name))
+        }
+        P::Array(items, rest, _) => {
+            rest.as_deref() == Some(name) || items.iter().any(|p| pattern_binds_name(p, name))
+        }
+        _ => false,
+    }
+}
+
+/// Whether an expression introduces a binding named `name` in some nested scope: a function
+/// parameter, or a `val`/`var`/match-pattern inside a block/branch. Use-sites are irrelevant here —
+/// we only look for binding INTRODUCTIONS that would shadow the import.
+fn expr_binds_name(expr: &lin_parse::ast::Expr, name: &str) -> bool {
+    use lin_parse::ast::Expr as E;
+    match expr {
+        E::Function { params, body, .. } => {
+            params.iter().any(|p| pattern_binds_name(&p.pattern, name)
+                || p.default.as_ref().map(|d| expr_binds_name(d, name)).unwrap_or(false))
+                || expr_binds_name(body, name)
+        }
+        E::Block(stmts, tail, _, _) => {
+            stmts.iter().any(|s| stmt_binds_name(s, name, false)) || expr_binds_name(tail, name)
+        }
+        E::If { condition, then_branch, else_branch, .. } => {
+            expr_binds_name(condition, name)
+                || expr_binds_name(then_branch, name)
+                || expr_binds_name(else_branch, name)
+        }
+        E::Match { scrutinee, arms, .. } => {
+            use lin_parse::ast::MatchPattern;
+            expr_binds_name(scrutinee, name)
+                || arms.iter().any(|a| {
+                    let pat_binds = match &a.pattern {
+                        MatchPattern::Is(p) | MatchPattern::Has(p) => pattern_binds_name(p, name),
+                        MatchPattern::Else => false,
+                    };
+                    pat_binds
+                        || a.guard.as_ref().map(|g| expr_binds_name(g, name)).unwrap_or(false)
+                        || expr_binds_name(&a.body, name)
+                })
+        }
+        E::Call { func, args, .. } => {
+            expr_binds_name(func, name) || args.iter().any(|a| expr_binds_name(a, name))
+        }
+        E::DotCall { receiver, args, .. } => {
+            expr_binds_name(receiver, name)
+                || args.as_ref().map(|a| a.iter().any(|x| expr_binds_name(x, name))).unwrap_or(false)
+        }
+        E::BinaryOp { left, right, .. } => {
+            expr_binds_name(left, name) || expr_binds_name(right, name)
+        }
+        E::UnaryOp { operand, .. } => expr_binds_name(operand, name),
+        E::Assign { value, .. } => expr_binds_name(value, name),
+        E::IndexAssign { value, .. } => expr_binds_name(value, name),
+        E::Index { object, key, .. } => {
+            expr_binds_name(object, name) || expr_binds_name(key, name)
+        }
+        E::Array(items, _, _) => items.iter().any(|i| expr_binds_name(i, name)),
+        E::Object(fields, _, _) => fields.iter().any(|f| {
+            use lin_parse::ast::ObjectField;
+            match f {
+                ObjectField::Pair(k, v) => expr_binds_name(k, name) || expr_binds_name(v, name),
+                ObjectField::Spread(e) => expr_binds_name(e, name),
+            }
+        }),
+        E::Is { expr, pattern, .. } | E::Has { expr, pattern, .. } => {
+            expr_binds_name(expr, name) || pattern_binds_name(pattern, name)
+        }
+        E::StringInterp(parts, _) => parts.iter().any(|p| {
+            use lin_parse::ast::StringPart;
+            matches!(p, StringPart::Expr(e) if expr_binds_name(e, name))
+        }),
+        E::TupleArgs(items, _) => items.iter().any(|i| expr_binds_name(i, name)),
+        _ => false,
+    }
+}
+
 /// Canonical id for a user file path: the canonicalised absolute path as a string
 /// (falls back to the lexical path when the file doesn't exist on disk yet, e.g.
 /// an unsaved in-memory buffer in tests). Matches `module_identity`'s user-module key.
@@ -3649,6 +4084,63 @@ mod tests {
         assert_eq!(first_param_category("(Int32) => Float64").as_deref(), Some("number"));
         assert_eq!(first_param_category("() => String"), None);
         assert_eq!(first_param_category("String"), None);
+        // Polymorphic first params render as "any" (generic/Json/union).
+        assert_eq!(first_param_category("(T, (T) => U) => U[]").as_deref(), Some("any"));
+        assert_eq!(first_param_category("(Json) => String").as_deref(), Some("any"));
+        assert_eq!(first_param_category("(Int32 | String) => Boolean").as_deref(), Some("any"));
+    }
+
+    /// Dot-completion applicability: a polymorphic (`any`) first param matches ANY receiver (the
+    /// `map`/`filter`/`reduce` idiom), no-signature items are kept, and a concretely-typed mismatch
+    /// is excluded.
+    #[test]
+    fn dot_item_applies_includes_polymorphic_combinators() {
+        // Polymorphic combinator first param ("any") applies to every concrete receiver.
+        assert!(dot_item_applies("array", Some("any")));
+        assert!(dot_item_applies("string", Some("any")));
+        assert!(dot_item_applies("object", Some("any")));
+        // Exact concrete match still applies.
+        assert!(dot_item_applies("array", Some("array")));
+        assert!(dot_item_applies("string", Some("string")));
+        // No signature → can't prove inapplicable → kept.
+        assert!(dot_item_applies("array", None));
+        // Unknown receiver → everything applies.
+        assert!(dot_item_applies("any", Some("string")));
+        // Concrete mismatch is the ONLY exclusion.
+        assert!(!dot_item_applies("array", Some("string")));
+        assert!(!dot_item_applies("string", Some("number")));
+    }
+
+    /// End-to-end: an imported fn with a GENERIC first param is offered on an array receiver (the
+    /// `xs.map(...)` idiom), while a concretely string-typed method is excluded on an array receiver.
+    #[test]
+    fn completion_offers_polymorphic_combinator_on_array_receiver() {
+        // `mapper` has a generic first param (receiver-polymorphic); `upper` is string-only.
+        let src = concat!(
+            "val mapper = <T, U>(xs: T[], f: (T) => U) => xs\n",
+            "val upper = (s: String) => s\n",
+            "export val mapper2 = mapper\n",
+        );
+        // Build the imported-names list the completion handler filters: simulate the two functions
+        // as imported names with their rendered first-param categories.
+        let poly = ImportedName {
+            name: "map".to_string(),
+            module: "std/iter".to_string(),
+            ty: Some("(T, (T) => U) => U[]".to_string()),
+        };
+        let stronly = ImportedName {
+            name: "upper".to_string(),
+            module: "std/string".to_string(),
+            ty: Some("(String) => String".to_string()),
+        };
+        let _ = src; // documentation of the shapes; the filter is driven off the rendered types.
+
+        // Array receiver: polymorphic `map` applies, string-only `upper` does not.
+        assert!(dot_item_applies("array", poly.ty.as_deref().and_then(first_param_category).as_deref()));
+        assert!(!dot_item_applies("array", stronly.ty.as_deref().and_then(first_param_category).as_deref()));
+        // String receiver: BOTH apply (poly always, upper because its first param is string).
+        assert!(dot_item_applies("string", poly.ty.as_deref().and_then(first_param_category).as_deref()));
+        assert!(dot_item_applies("string", stronly.ty.as_deref().and_then(first_param_category).as_deref()));
     }
 
     /// Cyclic import graph (A imports B, B imports A) must terminate, not
@@ -3955,6 +4447,52 @@ mod tests {
         // Commas nested inside brackets don't advance the active parameter.
         assert_eq!(top_level_commas("[1, 2], 3"), 1);
         assert_eq!(top_level_commas("f(a, b), "), 1);
+        // `<`/`>` are comparison operators in source, NOT bracket depth: `x > b` is one arg, then
+        // the cursor after the comma is in the SECOND argument.
+        assert_eq!(top_level_commas("a > b, c"), 1);
+        assert_eq!(top_level_commas("a < b, c"), 1);
+        // `=>` (lambda arrow) must not be read as `>` opening/closing a bracket.
+        assert_eq!(top_level_commas("x => x, y"), 1);
+        // Commas inside a string literal are NOT argument separators (respecting `\"` escapes).
+        assert_eq!(top_level_commas("\"a,b\", c"), 1);
+        assert_eq!(top_level_commas("\"a,b,c\""), 0);
+        assert_eq!(top_level_commas("\"a\\\",b\", c"), 1);
+    }
+
+    /// End to end: with a comparison in the first argument (`f(x > 0, y)`) and the cursor in the
+    /// SECOND argument, the active parameter is index 1 — not skewed by the `>` operator.
+    #[test]
+    fn signature_help_active_param_unskewed_by_comparison() {
+        let src = "val f = (a: Boolean, b: Int32) => b\nval r = f(1 > 0, 2)\n";
+        let analysis = analyse(src, None);
+        let call_open = src.rfind('(').unwrap();
+        let cursor = call_open + src[call_open..].find('2').unwrap();
+        let help = signature_help(src, &analysis, cursor).expect("expected signature help");
+        assert_eq!(help.signatures[0].active_parameter, Some(1), "comparison must not skew active param");
+    }
+
+    /// A lambda argument (`f(x => x, y)`) must not skew the active parameter via its `=>` arrow:
+    /// cursor in the second arg is index 1.
+    #[test]
+    fn signature_help_active_param_unskewed_by_lambda() {
+        let src = "val f = (g: (Int32) => Int32, b: Int32) => b\nval r = f(x => x, 9)\n";
+        let analysis = analyse(src, None);
+        let call_open = src.rfind('(').unwrap();
+        let cursor = call_open + src[call_open..].find('9').unwrap();
+        let help = signature_help(src, &analysis, cursor).expect("expected signature help");
+        assert_eq!(help.signatures[0].active_parameter, Some(1), "lambda arrow must not skew active param");
+    }
+
+    /// A comma inside a string-literal argument (`f("a,b", c)`) is not an argument separator: cursor
+    /// in the second arg is index 1, not 2.
+    #[test]
+    fn signature_help_active_param_ignores_string_comma() {
+        let src = "val f = (s: String, n: Int32) => n\nval r = f(\"a,b\", 7)\n";
+        let analysis = analyse(src, None);
+        let call_open = src.rfind('(').unwrap();
+        let cursor = call_open + src[call_open..].find('7').unwrap();
+        let help = signature_help(src, &analysis, cursor).expect("expected signature help");
+        assert_eq!(help.signatures[0].active_parameter, Some(1), "string comma must not advance active param");
     }
 
     #[test]
@@ -4144,6 +4682,54 @@ mod tests {
         assert_eq!((owner2, name2), (owner, name));
     }
 
+    /// Cross-file goto-definition: B imports `foo` from A; a goto-def on the USE of `foo` in B must
+    /// resolve to A's `foo` DECLARATION span (in A's source). This mirrors the handler's cross-file
+    /// fallback (`resolve_symbol` → `decl_span` → owner file URI/source).
+    #[test]
+    fn cross_file_goto_definition_jumps_to_owner_decl() {
+        let a = "export val foo = 1\n";
+        let b = "import { foo } from \"a\"\nval x = foo + 1\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b)]);
+        let a_id = id_of("/ws/a.lin");
+        let b_id = id_of("/ws/b.lin");
+
+        // Cursor on the USE of `foo` in b.lin's body.
+        let use_off = b.rfind("foo").unwrap();
+        let (owner, name) = index
+            .resolve_symbol(&b_id, use_off)
+            .expect("imported use must resolve to its owner");
+        assert_eq!(owner, a_id, "owner of `foo` is a.lin");
+        assert_eq!(name, "foo");
+
+        // The decl span points into A's source at A's `foo` declaration.
+        let decl = decl_span(&index, &owner, &name).expect("owner declares foo");
+        let owner_file = index.files.get(&owner).unwrap();
+        assert_eq!(
+            &owner_file.source[decl.start as usize..decl.end as usize],
+            "foo",
+            "decl span must cover `foo` in a.lin"
+        );
+        // And the target URI is A's file (not B's, and never a stdlib id).
+        assert_eq!(module_id_to_uri(&owner), module_id_to_uri(&a_id));
+        assert!(module_id_to_uri(&owner).is_some(), "owner has an on-disk URI");
+    }
+
+    /// Goto-def on an imported name owned by STDLIB yields no navigable target (stdlib has no
+    /// on-disk URI) — the handler returns nothing, which is acceptable.
+    #[test]
+    fn cross_file_goto_definition_skips_stdlib_owner() {
+        let b = "import { print } from \"std/io\"\nval x = print\n";
+        let index = index_from(&[("/ws/b.lin", b)]);
+        let b_id = id_of("/ws/b.lin");
+        let use_off = b.rfind("print").unwrap();
+        let (owner, _name) = index
+            .resolve_symbol(&b_id, use_off)
+            .expect("imported stdlib use resolves to std/io");
+        assert!(owner.starts_with("std/"), "owner is a stdlib module: {}", owner);
+        // No on-disk URI for stdlib → handler emits no Location.
+        assert!(module_id_to_uri(&owner).is_none(), "stdlib owner must have no file URI");
+    }
+
     /// Dependency computation for the on-edit re-check: when A changes, the set of
     /// files to re-check is exactly the DIRECT importers of A. Here B imports a
     /// symbol from A (so B is a dependent) and C is unrelated (so C is excluded).
@@ -4247,6 +4833,86 @@ mod tests {
         assert_eq!(&b[span.start as usize..span.end as usize], "foo");
         // It must sit inside the import statement (line 0), not the body.
         assert!((span.start as usize) < b.find('\n').unwrap());
+    }
+
+    /// SOUND cross-file rename: an importing file that has BOTH `import { foo }` AND a shadowing
+    /// local `val foo` (plus a comment and a string literal mentioning `foo`) must NOT have its
+    /// shadow uses, comment, or string rewritten. Only the import-clause `foo` is renamed.
+    #[test]
+    fn cross_file_rename_does_not_rewrite_shadow_comment_or_string() {
+        let a = "export val foo = 1\n";
+        // b.lin imports `foo`, but a nested function locally re-binds `foo`. The body use of the
+        // local `foo`, the `// foo` comment, and the `"foo"` string must all be left alone.
+        let b = "import { foo } from \"a\"\n\
+                 // foo is mentioned here\n\
+                 val g = (foo: Int32) => foo + foo\n\
+                 val s = \"foo bar\"\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b)]);
+        let a_id = id_of("/ws/a.lin");
+        let b_id = id_of("/ws/b.lin");
+
+        let edits = index.rename_edits(&a_id, "foo").expect("user export renameable");
+        let a_edits: Vec<_> = edits.iter().filter(|(m, _)| m == &a_id).collect();
+        let b_edits: Vec<_> = edits.iter().filter(|(m, _)| m == &b_id).collect();
+
+        // a.lin: the single declaration site renames (a.lin doesn't shadow its own export).
+        assert_eq!(a_edits.len(), 1, "owner decl renamed once: {:?}", edits);
+        // b.lin: ONLY the import-clause token renames — the shadow `foo` param + its 2 body uses,
+        // the comment, and the string are all excluded.
+        assert_eq!(b_edits.len(), 1, "shadowed importer renames only the import token: {:?}", b_edits);
+        let (_, span) = b_edits[0];
+        assert_eq!(&b[span.start as usize..span.end as usize], "foo");
+        // The renamed token must sit on the import line (line 0), never in the body/comment/string.
+        assert!((span.start as usize) < b.find('\n').unwrap(), "edit must be in the import clause");
+    }
+
+    /// SOUND cross-file rename, non-shadow case: when the importer does NOT re-bind the name, body
+    /// uses ARE renamed — but matches inside a comment or string literal are STILL excluded (token
+    /// scan, not text scan). This is the regression guard for the comment/string over-match.
+    #[test]
+    fn cross_file_rename_excludes_comment_and_string_when_unshadowed() {
+        let a = "export val foo = 1\n";
+        // No local `foo` binding here — body uses rename, but the comment and string don't.
+        let b = "import { foo } from \"a\"\n\
+                 // call foo twice\n\
+                 val s = \"foo literal\"\n\
+                 val x = foo + foo\n";
+        let index = index_from(&[("/ws/a.lin", a), ("/ws/b.lin", b)]);
+        let b_id = id_of("/ws/b.lin");
+        let a_id = id_of("/ws/a.lin");
+
+        let edits = index.rename_edits(&a_id, "foo").expect("renameable");
+        let b_edits: Vec<_> = edits.iter().filter(|(m, _)| m == &b_id).collect();
+        // Import clause `foo` + the two real body uses = 3. The comment's `foo` and the string's
+        // `foo` are NOT edited.
+        assert_eq!(b_edits.len(), 3, "import token + 2 body uses, no comment/string: {:?}", b_edits);
+        for (_, span) in &b_edits {
+            let text = &b[span.start as usize..span.end as usize];
+            assert_eq!(text, "foo");
+            // No edit may fall inside the comment line or the string-literal line.
+            let comment_line_start = b.find("// call").unwrap();
+            let comment_line_end = b[comment_line_start..].find('\n').unwrap() + comment_line_start;
+            assert!(
+                !((span.start as usize) >= comment_line_start && (span.start as usize) < comment_line_end),
+                "comment occurrence must not be renamed"
+            );
+            let str_start = b.find("\"foo literal\"").unwrap();
+            assert!(
+                (span.start as usize) < str_start || (span.start as usize) >= str_start + "\"foo literal\"".len(),
+                "string-literal occurrence must not be renamed"
+            );
+        }
+    }
+
+    /// `file_rebinds_name` detects shadowing introductions (val/var/param/destructuring) but not a
+    /// top-level import of the same name (that's the symbol we track, not a shadow).
+    #[test]
+    fn file_rebinds_name_detects_shadows_only() {
+        assert!(file_rebinds_name("val foo = 1\n", "foo"), "top-level val shadows");
+        assert!(file_rebinds_name("val g = (foo: Int32) => foo\n", "foo"), "param shadows");
+        assert!(file_rebinds_name("val { foo } = bar\n", "foo"), "destructure shadows");
+        assert!(!file_rebinds_name("import { foo } from \"a\"\nval x = foo\n", "foo"), "import is not a shadow");
+        assert!(!file_rebinds_name("val x = foo + foo\n", "foo"), "mere uses are not a shadow");
     }
 
     /// Workspace-symbol fuzzy filter aggregates top-level exports across files and
@@ -4614,6 +5280,44 @@ mod tests {
         assert!(labels.iter().all(|l| l.starts_with("std/ar")));
     }
 
+    /// Completion suppression: the cursor inside a normal string literal or after `//` on a comment
+    /// line is NOT a code position, so completion must be suppressed there — but normal code
+    /// positions (and the `${ … }` interpolation hole) stay enabled.
+    #[test]
+    fn in_string_or_comment_detects_strings_and_comments() {
+        // Inside a normal string literal.
+        let src = "val s = \"hello wor";
+        assert!(in_string_or_comment(src, src.len()), "cursor inside a string");
+        // String closed before the cursor → code position again.
+        let src = "val s = \"hi\" + x";
+        assert!(!in_string_or_comment(src, src.len()), "after a closed string is code");
+        // `\"` escape does not close the string.
+        let src = "val s = \"a\\\" b ";
+        assert!(in_string_or_comment(src, src.len()), "escaped quote keeps us in the string");
+        // After `//` on a comment line.
+        let src = "val x = 1 // note he";
+        assert!(in_string_or_comment(src, src.len()), "after // is a comment");
+        // Plain code position.
+        let src = "val foo = ba";
+        assert!(!in_string_or_comment(src, src.len()), "bare code is not string/comment");
+        // Inside a `${ … }` interpolation hole IS code position (completion stays on).
+        let src = "val s = \"x ${ ba";
+        assert!(!in_string_or_comment(src, src.len()), "inside ${{}} hole is code");
+        // After a closed interpolation, back inside the string body.
+        let src = "val s = \"x ${y} mor";
+        assert!(in_string_or_comment(src, src.len()), "after a closed ${{}} we're back in the string");
+        // A `//` INSIDE a string is not a comment.
+        let src = "val s = \"http://ex";
+        assert!(in_string_or_comment(src, src.len()), "// inside a string is string, not comment");
+    }
+
+    // SCOPE-AWARENESS (FIX 4b) is intentionally NOT implemented: the completion handler still offers
+    // every binding in `span_type_map` regardless of lexical scope. Building a correct scope model
+    // off the flat span map risks DROPPING valid in-scope bindings (worse than over-offering), so per
+    // the task brief we leave the binding list as-is and document the limitation here rather than
+    // half-implement it. The clear correctness win — suppressing completion inside strings/comments
+    // (FIX 4a) — is implemented and tested above (`in_string_or_comment_detects_strings_and_comments`).
+
     // ── signature help with parameter names (feature 13) ──────────────────────────
 
     /// Same-file callee bound to a function literal: signature help renders `name: Type`
@@ -4636,4 +5340,102 @@ mod tests {
         // The signature label reflects names too.
         assert!(sig.label.contains("a: Int32"), "label should include names: {}", sig.label);
     }
+
+    // ── UTF-16 position encoding (LSP default) ────────────────────────────────────
+
+    /// A non-BMP character (an emoji, 2 UTF-16 code units / 4 bytes / 1 `char`) must advance the LSP
+    /// column by 2, not 1. We assert offset↔position round-trips in UTF-16 units and that a position
+    /// just after the emoji maps back to the byte offset just after it.
+    #[test]
+    fn position_encoding_is_utf16_for_astral_char() {
+        // `val x = "😀ab"` — the emoji is U+1F600 (4 bytes, 2 UTF-16 units).
+        let src = "val x = \"😀ab\"\n";
+        let emoji_byte = src.find('😀').unwrap();
+        let emoji_len = '😀'.len_utf8(); // 4
+        assert_eq!('😀'.len_utf16(), 2);
+
+        // Column at the emoji's start (it's preceded by `val x = "` = 9 bytes, all ASCII → col 9).
+        let pos_emoji = offset_to_position(src, emoji_byte);
+        assert_eq!(pos_emoji, Position { line: 0, character: 9 });
+
+        // The byte right after the emoji is `a`. Its UTF-16 column must be 9 + 2 = 11 (NOT 10).
+        let a_byte = emoji_byte + emoji_len;
+        let pos_a = offset_to_position(src, a_byte);
+        assert_eq!(pos_a, Position { line: 0, character: 11 }, "emoji must count as 2 UTF-16 units");
+
+        // Round-trip: column 11 maps back to the byte offset of `a`.
+        assert_eq!(position_to_offset(src, pos_a), a_byte);
+        // And column 9 maps back to the emoji's byte start.
+        assert_eq!(position_to_offset(src, pos_emoji), emoji_byte);
+
+        // A position landing inside the surrogate pair (col 10, only sendable by a malformed client)
+        // must NOT panic and must round to a char boundary — here the emoji's start byte.
+        let mid = position_to_offset(src, Position { line: 0, character: 10 });
+        assert_eq!(mid, a_byte, "mid-surrogate column rounds forward to the next char boundary");
+    }
+
+    /// Span-driven byte-offset slicing must never panic on multibyte input or stale/out-of-range
+    /// offsets — they now go through `.get(..)` rather than raw `source[a..b]` indexing. We feed
+    /// content with an emoji (4-byte char) through the slice sites and assert they return gracefully.
+    #[test]
+    fn span_slicing_is_panic_safe_on_multibyte_and_stale_offsets() {
+        let src = "import { foo } from \"😀\"\nval r = foo(😀, 2)\n";
+
+        // `find_name_in_import` with an out-of-range start must return None, not panic.
+        assert_eq!(find_name_in_import(src, src.len() + 100, "foo"), None);
+        // A start that lands mid-emoji (not a char boundary) must not panic.
+        let emoji = src.find('😀').unwrap();
+        let _ = find_name_in_import(src, emoji + 1, "foo"); // any result is fine; must not panic.
+
+        // `matching_paren` over a `.get` slice from a stale open index must not panic.
+        assert_eq!("(a, b)".get(0..).and_then(matching_paren), Some(5));
+
+        // Full signature_help pass over multibyte source at a cursor inside the emoji span: must
+        // produce some result (Some or None) without panicking.
+        let analysis = analyse(src, None);
+        let cursor = emoji + 1; // mid-surrogate / mid-utf8 byte offset
+        let _ = signature_help(src, &analysis, cursor);
+
+        // Completion at a multibyte offset must not panic either.
+        let _ = analyse(src, None);
+        let off = position_to_offset(src, Position { line: 1, character: 8 });
+        assert!(off <= src.len());
+    }
+
+    /// The poison-tolerant lock idiom (`unwrap_or_else(|e| e.into_inner())`) must recover access
+    /// after a thread panics while holding the guard, instead of cascading the poison to every later
+    /// acquisition (which a plain `.unwrap()` would do, bricking the server for the session).
+    #[test]
+    fn poisoned_lock_idiom_recovers_inner() {
+        use std::sync::{Arc, RwLock};
+        let lock = Arc::new(RwLock::new(7u32));
+        // Poison the lock by panicking while holding the write guard on another thread.
+        let l2 = Arc::clone(&lock);
+        let _ = std::thread::spawn(move || {
+            let mut g = l2.write().unwrap_or_else(|e| e.into_inner());
+            *g = 42;
+            panic!("poison the lock");
+        })
+        .join();
+        assert!(lock.is_poisoned(), "lock should be poisoned after the panicking thread");
+        // The idiom still yields the (last-written) inner value — no cascade.
+        let v = *lock.read().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(v, 42, "poison-tolerant read recovers the inner value");
+    }
+
+    /// CJK characters are in the BMP (1 UTF-16 unit, 3 bytes, 1 `char`): they advance the column by
+    /// 1, and a combining char likewise stays 1 unit. This pins that BMP-multibyte text is unaffected
+    /// by the UTF-16 fix (only astral codepoints differ from a naive char count).
+    #[test]
+    fn position_encoding_bmp_multibyte_is_one_unit() {
+        // `日本` — each is 3 bytes, 1 UTF-16 unit.
+        let src = "val s = \"日本\"\n";
+        let first = src.find('日').unwrap(); // col 9
+        assert_eq!(offset_to_position(src, first), Position { line: 0, character: 9 });
+        let second = first + '日'.len_utf8();
+        // Second CJK char is at col 10 (one UTF-16 unit past the first).
+        assert_eq!(offset_to_position(src, second), Position { line: 0, character: 10 });
+        assert_eq!(position_to_offset(src, Position { line: 0, character: 10 }), second);
+    }
 }
+

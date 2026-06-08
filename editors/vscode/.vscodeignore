@@ -4,6 +4,19 @@ package-lock.json
 node_modules/**
 client.js
 esbuild.js
+test/**
 dist/**/*.map
 *.ts
 *.vsix
+
+# Runtime-required assets that MUST ship in the VSIX. They are not excluded above,
+# so vsce packages them by default — but we un-ignore them explicitly so a future
+# broad exclude can't silently drop them. In particular formatters/lin_formatters.py
+# is loaded at runtime by the debug config provider (CodeLLDB initCommands); if it's
+# missing from the package, debug value-formatting breaks.
+!formatters/**
+!bin/**
+!walkthroughs/**
+!icons/**
+!snippets/**
+!syntaxes/**

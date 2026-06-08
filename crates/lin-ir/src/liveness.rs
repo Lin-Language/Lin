@@ -234,6 +234,7 @@ pub fn instr_use_def(instr: &Instruction) -> (Vec<Temp>, Vec<Temp>) {
         Instruction::FieldGet { dst, object, .. } => (vec![*object], vec![*dst]),
         Instruction::FieldSet { object, value, .. } => (vec![*object, *value], vec![]),
         Instruction::SealedArrayFieldGet { dst, array, index, .. } => (vec![*array, *index], vec![*dst]),
+        Instruction::BoxedArrayFieldGet { dst, array, index, .. } => (vec![*array, *index], vec![*dst]),
         Instruction::EnvCapture { dst, env, .. } => (vec![*env], vec![*dst]),
         Instruction::ArrayLenCheck { dst, val, .. } => (vec![*val], vec![*dst]),
         Instruction::ObjectRest { dst, src, .. } => (vec![*src], vec![*dst]),
@@ -258,5 +259,10 @@ pub fn instr_use_def(instr: &Instruction) -> (Vec<Temp>, Vec<Temp>) {
         Instruction::UnboxKeepPacked { dst, src, .. } => (vec![*src], vec![*dst]),
         Instruction::Bind { dst, src, .. } => (vec![*src], vec![*dst]),
         Instruction::Panic { msg } => (vec![*msg], vec![]),
+        // DEBUG-ONLY metadata marker: it neither uses nor defines a temp for ownership/liveness
+        // purposes (`temp` is already defined by the preceding binding instruction; this only
+        // RECORDS its name for DWARF). Reporting no uses/defs keeps RC elision and liveness — and
+        // therefore non-debug semantics — completely unaffected. See `Instruction::DebugDeclare`.
+        Instruction::DebugDeclare { .. } => (vec![], vec![]),
     }
 }

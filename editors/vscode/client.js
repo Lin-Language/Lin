@@ -5,10 +5,11 @@ const path = require("path");
 const os = require("os");
 const cp = require("child_process");
 const {
-  workspace, window, commands, Range, Uri,
+  workspace, window, commands, Range, Uri, env,
   tests, TestRunRequest, TestRunProfileKind, TestMessage, Position,
   FileCoverage, StatementCoverage, CancellationTokenSource,
   tasks, Task, ShellExecution, ShellQuoting, TaskScope,
+  debug, extensions,
 } = require("vscode");
 const { LanguageClient, TransportKind } = require("vscode-languageclient/node");
 
@@ -24,6 +25,19 @@ function getPlatformDir() {
 
 function exeName(name) {
   return process.platform === "win32" ? `${name}.exe` : name;
+}
+
+// Quote a single argument for an interactive terminal's shell so paths containing
+// spaces or quotes survive intact. The Task provider uses ShellQuoting.Strong (VS
+// Code quotes per-shell), but terminal.sendText() takes a raw command line, so we
+// quote by hand here. POSIX shells: wrap in single quotes and escape any embedded
+// single quote as '\''. Windows: the integrated terminal is usually PowerShell,
+// where a literal " inside an arg is doubled ("") within a double-quoted string.
+function shellQuote(arg) {
+  if (process.platform === "win32") {
+    return `"${String(arg).replace(/"/g, '""')}"`;
+  }
+  return `'${String(arg).replace(/'/g, "'\\''")}'`;
 }
 
 // Directory holding the bundled, co-located binaries (lin, lin-lsp,
@@ -131,21 +145,160 @@ async function installOnPath(context) {
 const SUPPORTED_SCHEMA = 2;
 
 const TEST_DECL_RE = /\btest\s*\(\s*"((?:[^"\\]|\\.)*)"/g;
-const WITHFIXTURE_DECL_RE = /\bwithFixture\s*\([^,]*,[^,]*,\s*"((?:[^"\\]|\\.)*)"/g;
+const WITHFIXTURE_DECL_RE = /\bwithFixture\s*\(/g;
+
+// Strip an unquoted `//` line-comment from a single source line. We walk the line
+// tracking whether we're inside a double-quoted string literal (respecting `\`
+// escapes) so a `//` *inside* a string is preserved, and only a genuine comment
+// is removed. Lin has no block comments (see the lexer), so this is sufficient.
+//
+// Residual limit: this is line-based, so it cannot see a string literal that opens
+// on one line and closes on another. The Lin lexer does allow a string to span
+// lines, so a `//` or `test(` on a *continuation* line of such a literal could be
+// mis-handled. Multi-line string literals that contain the literal text
+// `test("...")` are rare enough that a full lexer isn't worth it — discovery is
+// best-effort, and any miss is corrected at run time from the NDJSON `test` records.
+function stripLineComment(line) {
+  let inStr = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inStr) {
+      if (ch === "\\") { i++; continue; } // skip escaped char
+      if (ch === '"') inStr = false;
+    } else if (ch === '"') {
+      inStr = true;
+    } else if (ch === "/" && line[i + 1] === "/") {
+      return line.slice(0, i);
+    }
+  }
+  return line;
+}
+
+// True if character offset `idx` in `line` lies inside a double-quoted string
+// literal — i.e. a `test(`/`withFixture(` token there is text, not a declaration.
+function isInsideString(line, idx) {
+  let inStr = false;
+  for (let i = 0; i < idx && i < line.length; i++) {
+    const ch = line[i];
+    if (inStr) {
+      if (ch === "\\") { i++; continue; }
+      if (ch === '"') inStr = false;
+    } else if (ch === '"') {
+      inStr = true;
+    }
+  }
+  return inStr;
+}
+
+// Extract the first top-level double-quoted string-literal argument of a call,
+// scanning from `from` (the index just after the opening `(`). Used for
+// withFixture, whose test name is the first string-literal argument — robust to
+// earlier arguments that contain commas inside braces/brackets/quotes (e.g. a
+// `{ a, b }` fixture object). Skips balanced `{}`/`[]`/`()` groups so a `"name"`
+// nested inside an object isn't mistaken for the test name, and stops if the call
+// closes before any string is seen. Returns { raw, index } or null (raw is the
+// still-escaped literal body; index is the offset of its opening quote).
+function firstStringArg(line, from) {
+  let depth = 0;
+  for (let i = from; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === "{" || ch === "[" || ch === "(") {
+      depth++;
+    } else if (ch === "}" || ch === "]" || ch === ")") {
+      if (depth === 0) return null; // call closed before any string argument
+      depth--;
+    } else if (ch === '"' && depth === 0) {
+      let raw = "";
+      let j = i + 1;
+      for (; j < line.length; j++) {
+        if (line[j] === "\\") { raw += line[j] + (line[j + 1] || ""); j++; continue; }
+        if (line[j] === '"') break;
+        raw += line[j];
+      }
+      return { raw, index: i };
+    }
+  }
+  return null;
+}
 
 function unescapeLinString(s) {
-  // Best-effort inverse of the common Lin string escapes so the discovered id
-  // matches the runtime `name` (which is the decoded string).
-  return s
-    .replace(/\\n/g, "\n")
-    .replace(/\\t/g, "\t")
-    .replace(/\\r/g, "\r")
-    .replace(/\\"/g, '"')
-    .replace(/\\\\/g, "\\");
+  // Inverse of the Lin lexer's string escapes (crates/lin-lex/src/lexer.rs
+  // `lex_string`) so the discovered id matches the runtime `name` (the decoded
+  // string). The lexer supports: \n \r \t \0 \" \\ \$ \u{HEX}; any other \<c>
+  // decodes to the literal <c>. We mirror that exact set. Driven by a single
+  // left-to-right scan so an already-decoded backslash is never re-processed (a
+  // chain of .replace() would, e.g., turn the source "\\n" into a newline).
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== "\\") { out += s[i]; continue; }
+    const c = s[i + 1];
+    if (c === undefined) { out += "\\"; break; } // trailing backslash, leave as-is
+    switch (c) {
+      case "n": out += "\n"; i++; break;
+      case "r": out += "\r"; i++; break;
+      case "t": out += "\t"; i++; break;
+      case "0": out += "\0"; i++; break;
+      case '"': out += '"'; i++; break;
+      case "\\": out += "\\"; i++; break;
+      case "$": out += "$"; i++; break;
+      case "u": {
+        // \u{HEX} (1-6 hex digits). The lexer reads to the closing `}`; on a
+        // valid code point it pushes the char, on a malformed one it pushes
+        // nothing but still consumes the braces. Mirror both behaviours.
+        if (s[i + 2] === "{") {
+          const close = s.indexOf("}", i + 3);
+          if (close !== -1) {
+            const hex = s.slice(i + 3, close);
+            const code = parseInt(hex, 16);
+            if (/^[0-9a-fA-F]+$/.test(hex) && Number.isFinite(code) && code <= 0x10ffff) {
+              try { out += String.fromCodePoint(code); } catch (_) { /* invalid: drop */ }
+            }
+            i = close;
+            break;
+          }
+        }
+        // No `{...}` — lexer's `continue` leaves following chars in place; emit nothing.
+        i++;
+        break;
+      }
+      default: out += c; i++; break; // \<c> → <c>
+    }
+  }
+  return out;
 }
 
 function testItemId(filePath, name) {
   return `${filePath}::${name}`;
+}
+
+// Discover every `test(...)` / `withFixture(...)` declaration on a single source
+// line, returning [{ name, col }] (name decoded, col = the declaration's start).
+// Comments are stripped and matches that begin inside a string literal are skipped,
+// so `// test("x")` and a string containing `test("y")` don't produce phantom items.
+function discoverLine(line) {
+  const code = stripLineComment(line);
+  const found = [];
+
+  // `test("name"` — the captured group is the (still-escaped) literal name. We
+  // only accept the match if the `test` keyword itself is not inside a string.
+  TEST_DECL_RE.lastIndex = 0;
+  let m;
+  while ((m = TEST_DECL_RE.exec(code)) !== null) {
+    if (isInsideString(code, m.index)) continue;
+    found.push({ name: unescapeLinString(m[1]), col: m.index });
+  }
+
+  // `withFixture(...)` — the name is the FIRST top-level string-literal argument,
+  // which is robust to a fixture object/array containing commas. We anchor on the
+  // call keyword (not a fixed two-comma shape) and then scan its arguments.
+  WITHFIXTURE_DECL_RE.lastIndex = 0;
+  while ((m = WITHFIXTURE_DECL_RE.exec(code)) !== null) {
+    if (isInsideString(code, m.index)) continue;
+    const arg = firstStringArg(code, m.index + m[0].length);
+    if (arg) found.push({ name: unescapeLinString(arg.raw), col: m.index });
+  }
+
+  return found;
 }
 
 // (Re)build a file's child TestItems from its current text.
@@ -153,24 +306,17 @@ function refreshFileTests(controller, fileItem, text) {
   fileItem.children.replace([]);
   const seen = new Set();
   const lines = text.split("\n");
-  const addMatch = (re) => {
-    for (let i = 0; i < lines.length; i++) {
-      re.lastIndex = 0;
-      let m;
-      while ((m = re.exec(lines[i])) !== null) {
-        const name = unescapeLinString(m[1]);
-        const id = testItemId(fileItem.uri.fsPath, name);
-        if (seen.has(id)) continue;
-        seen.add(id);
-        const child = controller.createTestItem(id, name, fileItem.uri);
-        const col = m.index >= 0 ? m.index : 0;
-        child.range = new Range(new Position(i, col), new Position(i, col + name.length));
-        fileItem.children.add(child);
-      }
+  for (let i = 0; i < lines.length; i++) {
+    for (const { name, col } of discoverLine(lines[i])) {
+      const id = testItemId(fileItem.uri.fsPath, name);
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const child = controller.createTestItem(id, name, fileItem.uri);
+      const startCol = col >= 0 ? col : 0;
+      child.range = new Range(new Position(i, startCol), new Position(i, startCol + name.length));
+      fileItem.children.add(child);
     }
-  };
-  addMatch(TEST_DECL_RE);
-  addMatch(WITHFIXTURE_DECL_RE);
+  }
 }
 
 function getOrCreateFileItem(controller, uri) {
@@ -588,6 +734,192 @@ function makeTaskProvider(linBin) {
   };
 }
 
+// --- Debug configuration provider --------------------------------------------
+//
+// Lin native debugging delegates to CodeLLDB (vadimcn.vscode-lldb): we compile the
+// `.lin` file with `lin build --debug` (emitting DWARF line tables) and then hand a
+// `type: "lldb"` launch config to CodeLLDB, which loads the binary and maps DWARF
+// back to `.lin` source lines for breakpoints/stepping.
+//
+// The provider accepts a `type: "lin"` launch config (authored in launch.json or the
+// auto-supplied initialConfiguration). It resolves `program` (the compiled binary,
+// defaulting to the source stem next to the file), builds it with --debug, then returns
+// the CodeLLDB config. Returning a config with a different `type` reroutes the session to
+// that adapter — the documented VS Code mechanism for a "delegating" debugger.
+// Absolute path to the lldb pretty-printer script shipped with the extension. Resolved
+// relative to the extension install dir so it works whether the extension is bundled
+// (production VSIX) or running from source (contributor workflow) -- the script lives at
+// `<extensionPath>/formatters/lin_formatters.py` in both layouts.
+function formattersScriptPath(context) {
+  return path.join(context.extensionPath, "formatters", "lin_formatters.py");
+}
+
+// CodeLLDB is a SOFT dependency: the core extension activates without it (syntax,
+// LSP, tasks, tests all work). Only the debugger needs it, so we check at debug-
+// resolve time rather than declaring it in `extensionDependencies` (which would
+// force-install it for everyone and block activation when it's unavailable).
+const CODELLDB_EXT_ID = "vadimcn.vscode-lldb";
+const CODELLDB_MARKETPLACE_URL =
+  "https://marketplace.visualstudio.com/items?itemName=vadimcn.vscode-lldb";
+
+// Maximum time to wait for `lin build --debug` to finish before aborting the launch.
+// Guards against onDidEndTaskProcess never firing (task merged/resolved oddly, or a
+// provider error), which would otherwise hang F5 forever.
+const BUILD_TIMEOUT_MS = 60000;
+
+// Verify CodeLLDB is installed before launching a Lin debug session. If absent, show an
+// actionable message (with a button to open the marketplace) and return false so the caller
+// can abort gracefully — never throw, so a missing debugger can't crash the extension.
+async function ensureCodeLldbInstalled() {
+  if (extensions.getExtension(CODELLDB_EXT_ID)) return true;
+  const open = "Install CodeLLDB";
+  const choice = await window.showErrorMessage(
+    "Lin debug: the CodeLLDB extension (vadimcn.vscode-lldb) is required for debugging " +
+    "but isn't installed. Install it, then press F5 again.",
+    open
+  );
+  if (choice === open) {
+    // Prefer opening the extension directly in the Extensions view; fall back to the
+    // marketplace URL if the command isn't available.
+    try {
+      await commands.executeCommand("workbench.extensions.installExtension", CODELLDB_EXT_ID);
+      window.showInformationMessage("Lin debug: CodeLLDB installed. Press F5 again to debug.");
+    } catch (_) {
+      try { await env.openExternal(Uri.parse(CODELLDB_MARKETPLACE_URL)); } catch (_) { /* best effort */ }
+    }
+  }
+  return false;
+}
+
+// Phase 2 (data formatters): the returned CodeLLDB config carries `initCommands` that import
+// the bundled lldb pretty-printer script. On import the script self-registers `type summary`/
+// `type synthetic` providers (via __lldb_init_module) that decode Lin's boxed runtime values,
+// so the Variables/Watch panels show logical Lin values instead of raw boxed structs.
+function makeDebugConfigProvider(linBin, context) {
+  return {
+    // Run when launch.json has no Lin config yet (F5 with a .lin file open): synthesize one.
+    provideDebugConfigurations() {
+      return [
+        {
+          type: "lin",
+          request: "launch",
+          name: "Debug Lin file",
+          source: "${file}",
+          program: "${fileDirname}/${fileBasenameNoExtension}",
+          cwd: "${workspaceFolder}",
+          args: [],
+        },
+      ];
+    },
+    // Resolve after VS Code has substituted ${...} variables. We build here (async) and
+    // return the CodeLLDB config; returning undefined aborts the session.
+    async resolveDebugConfigurationWithSubstitutedVariables(folder, config) {
+      // CodeLLDB is a soft dependency — verify it's present before doing any work, and
+      // abort gracefully (return undefined) if it isn't.
+      if (!(await ensureCodeLldbInstalled())) {
+        return undefined;
+      }
+
+      // Bare F5 with no config: fill from the active editor.
+      const editor = window.activeTextEditor;
+      let source = config.source;
+      if (!source && editor && editor.document.uri.fsPath.endsWith(".lin")) {
+        source = editor.document.uri.fsPath;
+      }
+      if (!source) {
+        window.showErrorMessage("Lin debug: no .lin source to build. Open a .lin file or set `source` in launch.json.");
+        return undefined;
+      }
+      const program =
+        config.program ||
+        path.join(path.dirname(source), path.basename(source, ".lin"));
+
+      // Build with --debug so the binary carries DWARF line tables. We run the build as a
+      // VS Code task (so the `lin` problem matcher surfaces compile errors) and await it.
+      const argv = ["build", source, "--debug", "-o", program];
+      const exec = new ShellExecution(
+        linBin,
+        argv.map((a) => ({ value: a, quoting: ShellQuoting.Strong }))
+      );
+      const buildTask = new Task(
+        { type: "lin", command: "build", file: source, debug: true },
+        folder || TaskScope.Workspace,
+        "lin build --debug",
+        "lin",
+        exec,
+        "$lin"
+      );
+      // Await the build. We resolve with a result string so the caller can give a precise
+      // message: "ok" (exit 0), "failed" (non-zero exit / launch error), or "timeout".
+      // Matching is by EXECUTION IDENTITY (the TaskExecution returned by executeTask), never
+      // by name, so a same-named task or a racing launch can't resolve us by mistake.
+      const buildResult = await new Promise((resolve) => {
+        let settled = false;
+        let timer;
+        let endSub;
+        const cleanup = () => {
+          if (endSub) endSub.dispose();
+          if (timer) clearTimeout(timer);
+        };
+        const settle = (result) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          resolve(result);
+        };
+
+        // executeTask resolves to the TaskExecution for THIS launch; we key the end-event
+        // match off it so only our build's completion settles the promise.
+        const execPromise = tasks.executeTask(buildTask);
+
+        endSub = tasks.onDidEndTaskProcess((e) => {
+          execPromise.then((exec) => {
+            if (e.execution === exec) {
+              settle(e.exitCode === 0 ? "ok" : "failed");
+            }
+          }, () => { /* execPromise rejection handled below */ });
+        });
+
+        execPromise.then(undefined, () => settle("failed"));
+
+        timer = setTimeout(() => settle("timeout"), BUILD_TIMEOUT_MS);
+      });
+
+      if (buildResult === "timeout") {
+        window.showErrorMessage(
+          `Lin debug: \`lin build --debug\` did not finish within ${Math.round(BUILD_TIMEOUT_MS / 1000)}s; ` +
+          "aborting the debug session. See the terminal for build progress."
+        );
+        return undefined;
+      }
+      if (buildResult !== "ok") {
+        window.showErrorMessage("Lin debug: `lin build --debug` failed; see the terminal/Problems panel.");
+        return undefined;
+      }
+
+      // Hand off to CodeLLDB. The session's effective type becomes "lldb".
+      return {
+        type: "lldb",
+        request: "launch",
+        name: config.name || `Debug ${path.basename(source)}`,
+        program,
+        args: Array.isArray(config.args) ? config.args : [],
+        cwd: config.cwd || (folder ? folder.uri.fsPath : path.dirname(source)),
+        stopOnEntry: !!config.stopOnEntry,
+        // Surface the source path so CodeLLDB resolves relative DWARF file names if needed.
+        sourceLanguages: ["lin"],
+        // Auto-load the Lin lldb pretty-printers so boxed runtime values render as logical Lin
+        // values in the Variables/Watch panels. The script self-registers its summary/synthetic
+        // providers on import (__lldb_init_module). Preserve any user-supplied initCommands.
+        initCommands: [
+          `command script import ${formattersScriptPath(context)}`,
+          ...(Array.isArray(config.initCommands) ? config.initCommands : []),
+        ],
+      };
+    },
+  };
+}
+
 function activate(context) {
   const lspBin = resolveBin(context, "lin-lsp");
   const linBin = resolveBin(context, "lin");
@@ -596,6 +928,12 @@ function activate(context) {
   // can be authored in tasks.json with the `lin` problem matcher.
   context.subscriptions.push(
     tasks.registerTaskProvider("lin", makeTaskProvider(linBin))
+  );
+
+  // Register the Lin debug configuration provider: builds with `lin build --debug` and
+  // delegates the actual debug session to CodeLLDB (see makeDebugConfigProvider).
+  context.subscriptions.push(
+    debug.registerDebugConfigurationProvider("lin", makeDebugConfigProvider(linBin, context))
   );
 
   // `lin` is available in VS Code's integrated terminal out of the box.
@@ -637,7 +975,7 @@ function activate(context) {
     }
     const terminal = window.createTerminal("Lin");
     terminal.show(true);
-    terminal.sendText(`"${linBin}" ${subcommand} "${file}"`);
+    terminal.sendText(`${shellQuote(linBin)} ${subcommand} ${shellQuote(file)}`);
   };
 
   // "Format Document" (Shift+Alt+F), format-on-save, and the `lin.format` command
@@ -693,7 +1031,7 @@ function activate(context) {
       const dir = path.dirname(editor.document.uri.fsPath);
       const terminal = window.createTerminal("Lin Test");
       terminal.show(true);
-      terminal.sendText(`"${linBin}" test "${dir}"`);
+      terminal.sendText(`${shellQuote(linBin)} test ${shellQuote(dir)}`);
     }),
     // Route through the provider above so it behaves identically to Format Document.
     commands.registerCommand("lin.format", () => {
@@ -748,4 +1086,10 @@ function deactivate() {
   }
 }
 
-module.exports = { activate, deactivate };
+module.exports = {
+  activate,
+  deactivate,
+  // Exposed for the standalone discovery/unescape unit test (test/discovery.test.js).
+  // These are pure (no VS Code API) and safe to call directly.
+  _test: { discoverLine, unescapeLinString, stripLineComment, isInsideString, firstStringArg },
+};

@@ -10,6 +10,9 @@ pub struct RunArgs {
     /// Disable optimisation passes
     #[arg(long)]
     pub no_opt: bool,
+    /// Emit DWARF debug info (implies -O0). Mostly useful with `lin build`; accepted here for parity.
+    #[arg(long, short = 'g')]
+    pub debug: bool,
     /// Arguments forwarded to the compiled binary
     #[arg(last = true)]
     pub program_args: Vec<String>,
@@ -33,8 +36,9 @@ pub fn run(args: &RunArgs) {
         source_path: args.file.clone(),
         output_path: bin.clone(),
         emit_ir: args.emit_ir,
-        optimize: !(args.no_opt || std::env::var("LIN_NO_OPT").is_ok()),
+        optimize: !(args.no_opt || args.debug || std::env::var("LIN_NO_OPT").is_ok()),
         coverage: false,
+        debug: args.debug,
     };
 
     let path = args.file.display().to_string();

@@ -31,13 +31,15 @@
   ],
   "activationEvents": [
     "onLanguage:lin",
-    "workspaceContains:**/*.lin"
+    "workspaceContains:**/*.lin",
+    "onDebugResolve:lin"
   ],
   "main": "./dist/extension.js",
   "scripts": {
     "vscode:prepublish": "npm run compile -- --production",
     "compile": "node esbuild.js",
-    "watch": "node esbuild.js --watch"
+    "watch": "node esbuild.js --watch",
+    "test": "node test/discovery.test.js"
   },
   "contributes": {
     "configurationDefaults": {
@@ -200,8 +202,82 @@
             "items": {
               "type": "string"
             }
+          },
+          "debug": {
+            "type": "boolean",
+            "description": "Build with DWARF debug info (lin build --debug)."
           }
         }
+      }
+    ],
+    "breakpoints": [
+      {
+        "language": "lin"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "lin",
+        "label": "Lin (native, via CodeLLDB)",
+        "languages": ["lin"],
+        "configurationAttributes": {
+          "launch": {
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Path to the compiled binary. Defaults to the active .lin file's stem next to the source.",
+                "default": "${fileDirname}/${fileBasenameNoExtension}"
+              },
+              "source": {
+                "type": "string",
+                "description": "The .lin source to build with `lin build --debug` before launching.",
+                "default": "${file}"
+              },
+              "args": {
+                "type": "array",
+                "description": "Arguments passed to the compiled program.",
+                "items": { "type": "string" },
+                "default": []
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Working directory for the debuggee.",
+                "default": "${workspaceFolder}"
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "description": "Stop at the program entry point.",
+                "default": false
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "lin",
+            "request": "launch",
+            "name": "Debug Lin file",
+            "source": "${file}",
+            "program": "${fileDirname}/${fileBasenameNoExtension}",
+            "cwd": "${workspaceFolder}",
+            "args": []
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "Lin: Debug active file (CodeLLDB)",
+            "description": "Build the active .lin file with --debug and debug it via CodeLLDB.",
+            "body": {
+              "type": "lin",
+              "request": "launch",
+              "name": "Debug Lin file",
+              "source": "^\"\\${file}\"",
+              "program": "^\"\\${fileDirname}/\\${fileBasenameNoExtension}\"",
+              "cwd": "^\"\\${workspaceFolder}\"",
+              "args": []
+            }
+          }
+        ]
       }
     ],
     "problemMatchers": [
