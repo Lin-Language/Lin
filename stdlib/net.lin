@@ -136,8 +136,8 @@ export val tcpSetNonblocking = (fd: Int32, on: Boolean): Json =>
 export val tcpClose = (fd: Int32): Json =>
   lin_tcp_close(fd)
 
-// Wrap a connected TCP socket as a lazy byte `Stream<UInt8[]>` (streams brief §4).
+// Wrap a connected TCP socket as a lazy byte stream.
 // @param fd  the connected socket descriptor.
-// @returns a `Stream` that pulls from the socket until EOF; closing the stream closes the socket.
-export val tcpStream = (fd: Int32): Stream =>
+// @returns a `Stream<UInt8[]>` that pulls from the socket until EOF; closing the stream closes the socket.
+export val tcpStream = (fd: Int32): Stream<UInt8[]> =>
   lin_net_tcp_stream(fd)

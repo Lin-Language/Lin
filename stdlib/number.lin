@@ -59,11 +59,10 @@ export val toFloat64 = (v: Int32): Float64 =>
 export val toFloat32 = (v: Float64): Float32 =>
   lin_to_float32(v)
 
-// Explicit narrowing integer casts (spec §26). Each truncates the input to the target width
-// using two's-complement / `as`-cast semantics. The input is taken as UInt64 (the widest
-// unsigned) so any narrower unsigned integer — or a value masked down to a byte/word — widens
-// into it at the call site without range loss; truncation to the target width is then well
-// defined.
+// Explicit narrowing integer casts. Each truncates its input to the target width using
+// two's-complement semantics. The input is taken as a UInt64 (the widest unsigned type) so any
+// narrower unsigned integer — or a value masked down to a byte or word — widens into it at the
+// call site without losing range; truncation to the target width is then well defined.
 // Truncate `v` to a UInt8.
 // @param v  the value to narrow (taken as UInt64).
 // @returns the low 8 bits of `v` as a UInt8.

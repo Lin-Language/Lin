@@ -10,13 +10,13 @@
 // A handful of combinators are terminals — `reduce`, `for`, `while`, `find`, `some`, `every`. Over
 // an array they return their plain result; over a stream they drive the pipeline to completion and
 // gain an `| Error` arm, because a stream read can fail mid-traversal. The same chain that runs
-// eagerly over an array runs lazily over a stream, just because the receiver is a `Stream`; over a
+// eagerly over an array runs lazily over a stream, just because the receiver is a `Stream`. Over a
 // stream a combinator consumes its input, so using the same stream value twice is a compile error.
 //
-// Every combinator callback OPTIONALLY receives a trailing 0-based `Int32` source index (the JS
-// `forEach((item, idx) => …)` model); a 1-arg callback stays valid (opt-in by arity). For `reduce`
-// the index is the third parameter `(acc, item, i)`. The index is always the source position. The
-// key-extractor combinators (sortBy/minBy/maxBy/groupBy/countBy, in std/array) take no index.
+// Every combinator callback optionally receives a trailing 0-based `Int32` source index (the JS
+// `forEach((item, idx) => …)` model); a 1-arg callback stays valid. For `reduce` the index is the
+// third parameter `(acc, item, i)`. The index is always the source position. The key-extractor
+// combinators (sortBy/minBy/maxBy/groupBy/countBy, in std/array) take no index.
 //
 // import { map, filter, reduce, take, drop } from "std/iter"
 // import { range, rangeStep, iter, iterOf } from "std/iter"
@@ -25,9 +25,9 @@
 // (readStream, writeStream, lines, drain, …) live in std/stream. The combinators here are the single
 // vocabulary that spans all three.
 //
-// v1 limitation: lazy dispatch fires at a concrete combinator call with a `Stream` receiver. A
-// stream passed through a user-defined generic `Iterable` parameter stays array-shaped (eager)
-// inside that function — the safe resolution.
+// Lazy dispatch fires at a concrete combinator call with a `Stream` receiver. A stream passed
+// through a user-defined generic `Iterable` parameter stays array-shaped (eager) inside that
+// function.
 import foreign "lin-runtime"
   val lin_array_concat_dyn: (Json, Json) => Json
   val lin_stream_count: (Int32, Int32) => Stream
@@ -51,9 +51,8 @@ val push = (arr: Json, item: Json): Null =>
 // @returns `null`.
 // @example [1, 2, 3].for(x => print(x))
 export val for = (iterable: Json, f: (Json, Int32) => Json): Null =>
-  // Deliberately NOT `<T>`: `for` drives `Json`-typed sources (e.g. a `Json[]` of promise handles),
-  // where a generic element pin mis-monomorphizes the callback's closure ABI (seen in
-  // examples/concurrency). The boxed `Json` element is the representation-stable path.
+  // Stays `Json` rather than generic so it can drive `Json`-typed sources (e.g. a `Json[]` of
+  // promise handles) directly.
   lin_for(iterable, f)
 
 // Pull items while `f` returns `true`, stopping at the first `false` (or at exhaustion). For side
@@ -121,9 +120,7 @@ export val iter = (init: Json, hasNext: Json, next: Json, value: Json) =>
 // @returns the concatenation; flat when both inputs are the same flat type, tagged/`Json[]` otherwise.
 // @example concat([1, 2], [3, 4])   // [1, 2, 3, 4]
 export val concat = (a: Json, b: Json): Json =>
-  // Stays `Json` (NOT `<T>`): `concat` legitimately MIXES element types (a single `<T>` over both
-  // operands cannot express that), and a stream pipeline flows through this `Json` param while the
-  // name-based streamish dispatch re-types the result to `Stream` and redirects to `lin_stream_concat`.
+  // Stays `Json` rather than generic because `concat` may mix element types across its two operands.
   lin_array_concat_dyn(a, b)
 
 // Apply `f` to every item, producing a new collection of the results.
@@ -133,11 +130,6 @@ export val concat = (a: Json, b: Json): Json =>
 // @example [1, 2, 3].map(x => x * 2)            // [2, 4, 6]
 // @example ["a", "b", "c"].map((x, i) => "${i}: ${x}")   // ["0: a", "1: b", "2: c"]
 export val map = <T, U>(arr: T[] | Iterator | Stream, f: (T, Int32) => U) =>
-  // Monomorphic scalar call sites (e.g. `range(0,n).map(x => x*2)`) inline `lin_map(arr, <lambda>)`
-  // so the intrinsic lowers a capture-less lambda directly into the loop with no per-element
-  // box/unbox/closure call (ADR-044); heterogeneous/union/object sites monomorphize at boxed `$Json`.
-  // The return annotation is DROPPED so the wrapper infers `U[]`; `streamish_combinator_ret` re-types
-  // a definite-Stream receiver to `Stream<U>`. `Iterator`/`Stream` are written without a type argument.
   lin_map(arr, f)
 
 // Keep only the items for which `f` returns `true`.
@@ -159,12 +151,6 @@ export val filter = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean) 
 export val reduce = <T, U>(arr: T[] | Iterator | Stream, init: U, f: (U, T, Int32) => U) =>
   lin_reduce(arr, init, f)
 
-// Tier B derived combinators (find/some/every). Each callback OPTIONALLY receives a trailing 0-based
-// `Int32` source index; a 1-arg callback stays valid (the checker pads it to 2 params). Each iterable
-// is the `T[] | Iterator | Stream` union (a Stream is accepted; its opaque type does not flow into a
-// bare `Json` param). `Iterator`/`Stream` are written without a type argument (the `T[]` arm carries
-// element-type inference; the formatter cannot round-trip a parametric `Iterator<T>`).
-//
 // Find the first item for which `f` returns `true`, short-circuiting the scan.
 // @param arr  an Array, Iterator, or Stream of `T`.
 // @param f    predicate `(item, index?) => Boolean`.
@@ -218,8 +204,8 @@ export val every = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolean): 
 // @returns the concatenation of every produced inner iterable, in order.
 // @example [1, 2, 3].flatMap(x => [x, x * 2])   // [1, 2, 2, 4, 3, 6]
 export val flatMap = (arr: Json, f: (Json, Int32) => Json): Json =>
-  // Stays `Json` (NOT `<T>`): input and flattened output element types genuinely differ, and a
-  // concrete-`U` monomorphization corrupts heap (String/Array) elements through the per-element push.
+  // Stays `Json` rather than generic: a concrete `U` monomorphization corrupts freshly-built heap
+  // (String/Array) elements as they are pushed through the per-element flatten.
   val result: Json[] = []
   var idx = 0
   arr.for(item =>
@@ -229,7 +215,7 @@ export val flatMap = (arr: Json, f: (Json, Int32) => Json): Json =>
   )
   result
 
-// Take the first `n` items. Safe over an INFINITE source (`count`/infinite-`repeat`/`cycle`): it
+// Take the first `n` items. Safe over an infinite source (`count`/infinite-`repeat`/`cycle`): it
 // stops pulling after `n` items rather than materialising the whole source.
 // @param arr  an Array, Iterator, or Stream of `T`.
 // @param n    the maximum number of items to take; fewer if the source is shorter.
@@ -300,17 +286,6 @@ export val dropWhile = <T>(arr: T[] | Iterator | Stream, f: (T, Int32) => Boolea
 export val flatten = <T>(arr: T[][]): T[] =>
   arr.flatMap(x => x)
 
-// ----------------------------------------------------------------------------
-// Enrichment combinators (iter-combinators proposal). Each that has a lazy
-// stream form follows the SAME receiver-dispatch shape as map/filter above: the
-// iterable param is the `T[] | Iterator | Stream` union (a Stream is accepted;
-// its opaque type does NOT flow into a bare Json param), the array-shaped RETURN
-// annotation is what `streamish_combinator_ret` reads to re-wrap a stream
-// receiver as the next Stream node, and the IR's `stream_combinator_intrinsic_name`
-// redirects a definite-stream arg0 to the lazy `lin_stream_*` backend instead of
-// running the eager array body. The eager bodies reuse the existing `for`/`push`/
-// `length` primitives (no new intrinsics), exactly like take/drop/takeWhile.
-// ----------------------------------------------------------------------------
 // Overlapping fixed-width windows advancing by one (window k is `src[k .. k+size]`).
 // @param src   an Array, Iterator, or Stream of `T`.
 // @param size  the window width; values below 1 are treated as 1.
@@ -393,17 +368,16 @@ export val dedup = <T>(src: T[] | Iterator | Stream): T[] =>
   )
   result
 
-// ----------------------------------------------------------------------------
-// Infinite stream constructors. These build a LAZY `Stream<T>` pull-source (the same backend that
-// powers file/socket streams) — NOT an eager `lin_iter` array (which would materialise an infinite
-// source and never return). They MUST be bounded downstream by a short-circuiting STREAM combinator
-// (`take`/`takeWhile`/`find`/`some`) before any exhaustive terminal (`for`/`reduce`/`collect`) — the
-// same non-termination footgun as a hand-written `while true` loop. Because they return a Stream,
-// the chained `.map`/`.take`/… dispatch to the lazy `lin_stream_*` backend (receiver-dispatch); to
-// MATERIALISE a bounded result, drive the bounded stream with a terminal, e.g.
+// Infinite stream constructors. These build a lazy `Stream<T>` pull-source (the same backend that
+// powers file/socket streams), rather than an eager array that would try to materialise an infinite
+// source and never return. Bound them downstream with a short-circuiting stream combinator
+// (`take`/`takeWhile`/`find`/`some`) before any exhaustive terminal (`for`/`reduce`/`collect`);
+// otherwise they loop forever, just like a hand-written `while true`. Because they return a Stream,
+// the chained `.map`/`.take`/… dispatch to the lazy stream backend. To materialise a bounded result,
+// drive the bounded stream with a terminal, e.g.
 // `count(0).take(5).reduce([], (acc, x) => acc.push(x); acc)` or `.for(...)`.
-// ----------------------------------------------------------------------------
-// Build an INFINITE counting stream: `start, start+step, start+2*step, …`. Must be bounded downstream.
+//
+// Build an infinite counting stream: `start, start+step, start+2*step, …`. Must be bounded downstream.
 // @param start  the first value.
 // @param step   the increment between successive values (default `1`).
 // @returns an infinite `Stream` of counted `Int32` values.
@@ -418,7 +392,7 @@ export val repeat = <T>(value: T, n: Int32 = -1): Stream =>
   lin_stream_repeat(value, n)
 
 // Repeat the elements of a finite, materialised array endlessly. Must be bounded downstream.
-// @param src  the source array; takes an ARRAY by design (cycling requires re-reading the source).
-// @returns an infinite `Stream` cycling through `src` (an EMPTY stream if `src` is empty, not an infinite loop).
+// @param src  the source array; it takes an array because cycling requires re-reading the source.
+// @returns an infinite `Stream` cycling through `src` (an empty stream if `src` is empty, not an infinite loop).
 export val cycle = <T>(src: T[]): Stream =>
   lin_stream_cycle(src)

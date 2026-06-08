@@ -1,15 +1,12 @@
 // std/crypto — security-grade hashing, HMAC, CSPRNG, UUID, and constant-time compare.
 //
-// Distinct from std/hash (a NON-cryptographic structural hash for map keys/equality, never for
-// security). Digests and MACs operate over UInt8[] byte buffers (§35.1); the *Hex variants return
-// lowercase hex strings. The cryptographic cores (block compression, the OS entropy pool) are Rust
-// runtime intrinsics — not expressible in Lin. The byte/hex plumbing AROUND them (hex encode/decode,
-// UTF-8 encode, and the lowercase-hex digest variants) is pure Lin, composed over std/encoding so it
-// is not duplicated in the runtime.
+// Distinct from std/hash (a non-cryptographic structural hash for map keys/equality, never for
+// security). Digests and MACs operate over UInt8[] byte buffers; the *Hex variants return lowercase
+// hex strings.
 //
-// SECURITY: sha1 and md5 are CRYPTOGRAPHICALLY BROKEN and present only for legacy interop (old Git
-// ids, S3 ETags, file checksums). Never use them for signatures or adversarial integrity; use
-// sha256/sha512. randomBytes is the OS CSPRNG — NOT std/math `random` (which is predictable).
+// Security: sha1 and md5 are cryptographically broken and present only for legacy interop (old Git
+// ids, S3 ETags, file checksums). Avoid them for signatures or adversarial integrity; use
+// sha256/sha512. randomBytes is the OS CSPRNG, not std/math `random` (which is predictable).
 import { toLower } from "std/string"
 import { hexEncode, hexDecode, utf8Bytes } from "std/encoding"
 
@@ -27,9 +24,8 @@ import foreign "lin-runtime"
   val lin_crypto_hasher_update: (Int64, UInt8[]) => Int64
   val lin_crypto_hasher_digest: (Int64) => Json
 
-// An opaque incremental-hash handle (like ProcessHandle / Timer — an Int64 id the runtime
-// interprets, not Json and not subscriptable). Created by newHasher, fed by update, finalised by
-// digest/digestHex.
+// An opaque incremental-hash handle: an Int64 id the runtime interprets, not subscriptable. Created
+// by newHasher, fed by update, finalised by digest/digestHex.
 export type Hasher = Int64
 
 // --- SHA-256 ---------------------------------------------------------------
@@ -59,8 +55,8 @@ export val sha512 = (data: UInt8[]): UInt8[] =>
 export val sha512Hex = (data: UInt8[]): String =>
   hexEncode(sha512(data))
 
-// --- SHA-1 (LEGACY / INSECURE) ---------------------------------------------
-// Hash bytes with SHA-1. Broken (practical collisions) — interop ONLY (e.g. Git object ids).
+// --- SHA-1 (legacy / insecure) ---------------------------------------------
+// Hash bytes with SHA-1. Broken (practical collisions) — interop only (e.g. Git object ids).
 // @param data  the bytes to hash.
 // @returns the 20-byte raw digest.
 export val sha1 = (data: UInt8[]): UInt8[] =>
@@ -72,7 +68,7 @@ export val sha1 = (data: UInt8[]): UInt8[] =>
 export val sha1Hex = (data: UInt8[]): String =>
   hexEncode(sha1(data))
 
-// --- MD5 (LEGACY / INSECURE) -----------------------------------------------
+// --- MD5 (legacy / insecure) -----------------------------------------------
 // Hash bytes with MD5. Thoroughly broken — legacy interop only (old checksums, some S3 ETags).
 // @param data  the bytes to hash.
 // @returns the 16-byte raw digest.
@@ -123,8 +119,8 @@ export val hmacSha256Hex = (key: UInt8[], message: UInt8[]): String =>
 
 // --- CSPRNG ----------------------------------------------------------------
 // Generate cryptographically-secure random bytes from the OS CSPRNG (getrandom/urandom). For
-// tokens, salts, nonces, key material. NOT std/math `random`.
-// @param n  the number of bytes; must be >= 0 (0 returns an empty buffer).
+// tokens, salts, nonces, key material. Not std/math `random`.
+// @param n  the number of bytes; should be >= 0 (0 returns an empty buffer).
 // @returns a fresh buffer of `n` random bytes.
 export val randomBytes = (n: Int32): UInt8[] =>
   lin_crypto_random_bytes(n)
