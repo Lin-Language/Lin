@@ -35,6 +35,10 @@ pub struct Checker {
     /// Pre-resolved import types: (module_path, export_name) -> Type.
     /// When set, used instead of fresh TypeVars for import bindings.
     pub import_types: std::collections::HashMap<(String, String), Type>,
+    /// Stdlib export index: export-name -> list of stdlib module paths that export it. Used to
+    /// suggest the RIGHT module when an `import { x } from "m"` names an `x` that `m` doesn't
+    /// export but some other stdlib module does (e.g. `gunzip` lives in `std/compress`).
+    pub stdlib_export_index: std::collections::HashMap<String, Vec<String>>,
     /// Exported `type` decls visible from imports: (module_path, type_name) -> (params, body).
     /// An `import { Foo } from "m"` whose `Foo` matches an entry here registers it into the
     /// type env so `Foo` resolves in type annotations (the type-level analogue of `import_types`).
@@ -115,6 +119,7 @@ impl Checker {
             function_scope_depths: Vec::new(),
             span_type_map: Vec::new(),
             import_types: std::collections::HashMap::new(),
+            stdlib_export_index: std::collections::HashMap::new(),
             import_type_decls: std::collections::HashMap::new(),
             solved_type_vars: std::collections::HashMap::new(),
             protected_type_vars: std::collections::HashSet::new(),

@@ -3122,6 +3122,181 @@ fn test_cyclic_imports_value_init_cycle_still_errors() {
 }
 
 #[test]
+fn test_missing_stdlib_import_gives_module_not_found_with_suggestion() {
+    // A doubled `std/` typo (`std/std/stream`) is not an embedded stdlib module and must not
+    // fall through to a raw io error. We want an actionable "module not found" diagnostic that
+    // names the import, the path we tried, and a did-you-mean for the real module `std/stream`.
+    let dir = std::env::temp_dir().join(format!("lin_missing_std_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("main.lin"),
+        "import { collect } from \"std/std/stream\"\nprint(\"hi\")\n",
+    )
+    .unwrap();
+
+    let bin_path = dir.join("a.out");
+    let compile = lin_cmd()
+        .args(["build", dir.join("main.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let stderr = String::from_utf8_lossy(&compile.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&compile.stdout).to_string();
+    let combined = format!("{stderr}{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!compile.status.success(), "expected failure, got success: {combined}");
+    assert!(combined.contains("module not found"), "expected 'module not found', got: {combined}");
+    assert!(combined.contains("std/std/stream"), "expected the import path, got: {combined}");
+    assert!(
+        combined.contains("not a built-in stdlib module"),
+        "expected the stdlib note, got: {combined}"
+    );
+    assert!(
+        combined.contains("did you mean \"std/stream\""),
+        "expected the did-you-mean suggestion 'std/stream', got: {combined}"
+    );
+}
+
+#[test]
+fn test_missing_relative_import_gives_module_not_found_with_tried_path() {
+    // A missing relative import should also produce a "module not found" with the path we tried,
+    // rather than a raw io error. No stdlib note / suggestion for non-`std/` imports.
+    let dir = std::env::temp_dir().join(format!("lin_missing_rel_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("main.lin"),
+        "import { x } from \"./nope\"\nprint(\"hi\")\n",
+    )
+    .unwrap();
+
+    let bin_path = dir.join("a.out");
+    let compile = lin_cmd()
+        .args(["build", dir.join("main.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let stderr = String::from_utf8_lossy(&compile.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&compile.stdout).to_string();
+    let combined = format!("{stderr}{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!compile.status.success(), "expected failure, got success: {combined}");
+    assert!(combined.contains("module not found"), "expected 'module not found', got: {combined}");
+    assert!(combined.contains("./nope"), "expected the import path, got: {combined}");
+    assert!(combined.contains("nope.lin"), "expected the tried path, got: {combined}");
+    assert!(
+        !combined.contains("not a built-in stdlib module"),
+        "non-std import should not get the stdlib note, got: {combined}"
+    );
+}
+
+#[test]
+fn test_import_unknown_export_is_compile_error_with_cross_module_hint() {
+    // `std/stream` exists and is resolved, but does NOT export `gunzip` (that lives in
+    // `std/compress`). The checker must reject this at TYPE-CHECK time with an actionable
+    // cross-module suggestion — NOT let it slip through to a mangled link-time
+    // `undefined reference to std_stream_gunzip__val`.
+    let dir = std::env::temp_dir().join(format!("lin_bad_export_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("main.lin"),
+        "import { print } from \"std/io\"\nimport { gunzip } from \"std/stream\"\nprint(\"hi\")\n",
+    )
+    .unwrap();
+
+    let bin_path = dir.join("a.out");
+    let compile = lin_cmd()
+        .args(["build", dir.join("main.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let stderr = String::from_utf8_lossy(&compile.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&compile.stdout).to_string();
+    let combined = format!("{stderr}{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!compile.status.success(), "expected failure, got success: {combined}");
+    assert!(combined.contains("has no export"), "expected 'has no export', got: {combined}");
+    assert!(combined.contains("gunzip"), "expected the export name, got: {combined}");
+    assert!(
+        combined.contains("exported by \"std/compress\""),
+        "expected the cross-module hint to std/compress, got: {combined}"
+    );
+    // Crucially: caught BEFORE the linker, so no mangled-symbol jargon should appear.
+    assert!(
+        !combined.contains("undefined reference"),
+        "should be caught at type-check, not link, got: {combined}"
+    );
+}
+
+#[test]
+fn test_import_typo_export_suggests_within_module() {
+    // `readStrea` is a typo of `std/stream`'s real export `readStream`. No OTHER module exports
+    // `readStrea`, so the diagnostic falls back to a within-module did-you-mean.
+    let dir = std::env::temp_dir().join(format!("lin_typo_export_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("main.lin"),
+        "import { print } from \"std/io\"\nimport { readStrea } from \"std/stream\"\nprint(\"hi\")\n",
+    )
+    .unwrap();
+
+    let bin_path = dir.join("a.out");
+    let compile = lin_cmd()
+        .args(["build", dir.join("main.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let stderr = String::from_utf8_lossy(&compile.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&compile.stdout).to_string();
+    let combined = format!("{stderr}{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!compile.status.success(), "expected failure, got success: {combined}");
+    assert!(combined.contains("has no export"), "expected 'has no export', got: {combined}");
+    assert!(
+        combined.contains("did you mean `readStream`?"),
+        "expected the within-module did-you-mean, got: {combined}"
+    );
+}
+
+#[test]
+fn test_missing_foreign_library_gives_jargon_free_build_error() {
+    // A foreign import of a library file that does not exist must fail with a clean, user-facing
+    // message that NAMES the missing library and contains NO linker/`ld:` jargon.
+    let dir = std::env::temp_dir().join(format!("lin_missing_foreign_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(
+        dir.join("main.lin"),
+        concat!(
+            "import { print } from \"std/io\"\n",
+            "import foreign \"./libnope_does_not_exist.so\"\n",
+            "  val nope: (Int32) => Int32\n",
+            "print(nope(1))\n",
+        ),
+    )
+    .unwrap();
+
+    let bin_path = dir.join("a.out");
+    let compile = lin_cmd()
+        .args(["build", dir.join("main.lin").to_str().unwrap(), "-o", bin_path.to_str().unwrap()])
+        .output()
+        .expect("failed to invoke lin binary — run `cargo build -p lin` first");
+    let stderr = String::from_utf8_lossy(&compile.stderr).to_string();
+    let stdout = String::from_utf8_lossy(&compile.stdout).to_string();
+    let combined = format!("{stderr}{stdout}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!compile.status.success(), "expected failure, got success: {combined}");
+    let lowered = combined.to_lowercase();
+    assert!(
+        !lowered.contains("linker") && !lowered.contains("ld:") && !lowered.contains("collect2"),
+        "build error must be free of linker jargon, got: {combined}"
+    );
+    assert!(
+        combined.contains("could not build your program"),
+        "expected the jargon-free top line, got: {combined}"
+    );
+}
+
+#[test]
 fn test_cache_invalidated_when_import_signature_changes() {
     // Regression for the stale-cache bug: a CACHED imported module's cache key MUST incorporate the
     // signatures of the modules IT imports, not just its own source bytes.
