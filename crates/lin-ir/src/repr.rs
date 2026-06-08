@@ -612,6 +612,18 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
                 // interior `*SumNode` whose repr is the child sum type's SumNode layout — so a chained
                 // `evalNode(node["left"])` reads the child as Packed(SumNode) and re-enters the switch.
                 set(seeds, *dst, Repr::Packed(Layout::SumNode { sum_ty: result_ty.clone() }));
+            } else if let Some(elem_fields) = sealed_array_elem(result_ty) {
+                // A nested sealed-record-ARRAY field (KIND_ARRAY) is stored as an 8-byte owned pointer
+                // to a packed `0xFE` element buffer; `sealed_field_get` loads that pointer and the
+                // result is itself a PackedSealedArray (e.g. `trip["stopTimes"]` : StopTime[]). Seed it
+                // so a chained `trip["stopTimes"][i]["arrivalTime"]` reads the array as Packed at the
+                // Index — without this the dst folded to Boxed while the old gate predicate + codegen
+                // read it packed (the repr.rs:1068 oracle disagreement → release-build segfault on the
+                // RAPTOR Trip{stopTimes:StopTime[]} shape). Mirrors `type_seed`'s array arm.
+                set(seeds, *dst, Repr::Packed(Layout::PackedSealedArray {
+                    on_heap: elem_layout_on_heap(elem_fields),
+                    elem_layout: elem_fields.clone(),
+                }));
             } else if let Some(f) = sealed_fields(result_ty) {
                 set(seeds, *dst, Repr::Packed(Layout::PackedStruct { fields: f.clone() }));
             }
@@ -619,6 +631,15 @@ fn seed_instr(instr: &Instruction, func: &LinFunction, seeds: &mut [Repr]) {
         Instruction::SealedArrayFieldGet { dst, result_ty, .. } => {
             if let Some(s) = ScalarTy::from_type(result_ty) {
                 set(seeds, *dst, Repr::FlatScalar(s));
+            } else if let Some(elem_fields) = sealed_array_elem(result_ty) {
+                // Same as FieldGet: a packed element's nested sealed-record-ARRAY field read yields a
+                // PackedSealedArray (the dedicated packed-element field-read op).
+                set(seeds, *dst, Repr::Packed(Layout::PackedSealedArray {
+                    on_heap: elem_layout_on_heap(elem_fields),
+                    elem_layout: elem_fields.clone(),
+                }));
+            } else if let Some(f) = sealed_fields(result_ty) {
+                set(seeds, *dst, Repr::Packed(Layout::PackedStruct { fields: f.clone() }));
             }
         }
         // A single field read of a BOXED `Object[]` element: the result repr is whatever its static
