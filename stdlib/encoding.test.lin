@@ -3,7 +3,7 @@ import { length, push } from "std/array"
 import { for } from "std/iter"
 import { fromUtf8 } from "std/string"
 import { keys } from "std/object"
-import { base64Encode, base64Decode, base64UrlEncode, base64UrlDecode, base64EncodeString, base64DecodeString, hexEncode, hexDecode, urlEncode, urlDecode, parseQuery, buildQuery } from "std/encoding"
+import { base64Encode, base64Decode, base64UrlEncode, base64UrlDecode, base64EncodeString, base64DecodeString, hexEncode, hexDecode, urlEncode, urlDecode, parseQuery, buildQuery, hash } from "std/encoding"
 
 // std/encoding: Base64 (standard + URL-safe), hex, URL/percent, and query-string codecs.
 // Encoders never fail; decoders return `T | Error`. These tests cover the RFC 4648 base64
@@ -256,4 +256,57 @@ val unwrapBytes = (r: Json): UInt8[] =>
       empty
     else => r
 
-run(s)
+// Structural hash (folded in from the former std/hash module). hash(x) returns a canonical,
+// type-tagged string key: equal values hash equal, different types never collide, objects
+// hash independent of key order (matching structural equality, spec §14).
+val hashSuite = suite("std/encoding hash", [
+  test("primitives carry a type tag", () => [
+    expect(hash(null)).toBe("N"),
+    expect(hash(true)).toBe("b:true"),
+    expect(hash(false)).toBe("b:false"),
+    expect(hash(42)).toBe("i:42"),
+    expect(hash("hello")).toBe("s:hello")
+  ]),
+
+  test("equal values hash equal", () => [
+    expect(hash(42) == hash(42)).toBe(true),
+    expect(hash("abc") == hash("abc")).toBe(true),
+    expect(hash([1, 2, 3]) == hash([1, 2, 3])).toBe(true)
+  ]),
+
+  test("different values hash differently", () => [
+    expect(hash(1) == hash(2)).toBe(false),
+    expect(hash("a") == hash("b")).toBe(false)
+  ]),
+
+  test("types do not collide: 42 vs \"42\"", () => [
+    expect(hash(42) == hash("42")).toBe(false),
+    expect(hash(true) == hash("true")).toBe(false),
+    expect(hash(null) == hash("null")).toBe(false)
+  ]),
+
+  test("arrays hash element-wise and order-sensitively", () => [
+    expect(hash([1, 2]) == hash([1, 2])).toBe(true),
+    expect(hash([1, 2]) == hash([2, 1])).toBe(false),
+    expect(hash([])).toBe("a:[]")
+  ]),
+
+  test("objects hash independent of key order", () =>
+    val a = { "x": 1, "y": 2 }
+    val b = { "y": 2, "x": 1 }
+    [
+      expect(hash(a) == hash(b)).toBe(true)
+    ]
+  ),
+
+  test("nested structures hash deeply", () =>
+    val a = { "items": [1, 2], "meta": { "n": 3 } }
+    val b = { "meta": { "n": 3 }, "items": [1, 2] }
+    [
+      expect(hash(a) == hash(b)).toBe(true),
+      expect(hash(a) == hash({ "items": [1, 2], "meta": { "n": 4 } })).toBe(false)
+    ]
+  )
+])
+
+run([s, hashSuite])

@@ -627,3 +627,11 @@ export val base64DecodeString = (s: String): String | Error =>
     mkError(toString(bytes["message"]))
   else
     fromUtf8(bytes)
+
+// --- structural hash -------------------------------------------------------
+// Stable structural hash key for any value: equal values produce equal keys (objects are
+// order-independent, arrays element-wise, type-tagged so 42 and "42" differ). Generic over
+// the input type — it walks the runtime value, so T can be anything. (Folded in from the
+// former std/hash module.)
+export val hash = <T>(x: T): String =>
+  lin_value_key(x)

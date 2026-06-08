@@ -1,6 +1,0 @@
-// Structural hash key for any value: equal values produce equal keys (objects order-
-// independent, arrays element-wise, type-tagged so 42 and "42" differ). Generic over the input
-// type — `hash` doesn't care what `T` is, it walks the runtime value. (`Json` would behave
-// identically since Json is the universal sink, but `<T>` states the intent: hash takes anything.)
-export val hash = <T>(x: T): String =>
-  lin_value_key(x)

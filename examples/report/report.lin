@@ -6,7 +6,7 @@ import { renderTally } from "./frequency"
 import { length, sortBy, push } from "std/array"
 import { map, filter, reduce, for } from "std/iter"
 import { toString, join } from "std/string"
-import { hash } from "std/hash"
+import { hash } from "std/encoding"
 
 // A validated CSV record (structurally identical to parse.lin's `Record`; Lin's
 // structural typing lets the parse result flow straight into the pipeline).

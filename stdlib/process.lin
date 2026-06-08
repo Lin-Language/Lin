@@ -1,5 +1,17 @@
 import foreign "lin-runtime"
   val lin_process_exec: (String, String[]) => Json
+  val lin_os_hostname: () => Json
+  val lin_os_platform: () => String
+  val lin_os_arch: () => String
+  val lin_os_cpu_count: () => Int32
+  val lin_os_pid: () => Int32
+  val lin_os_ppid: () => Int32
+  val lin_os_username: () => Json
+  val lin_os_home_dir: () => Json
+  val lin_os_temp_dir: () => String
+  val lin_os_uptime: () => Json
+  val lin_os_load_average: () => Json
+  val lin_os_mem_info: () => Json
   val lin_process_shell: (String) => Json
   val lin_process_cwd: () => String
   val lin_process_chdir: (String) => Json
@@ -58,3 +70,76 @@ export val wait = (handle: ProcessHandle): Json =>
 // (streams brief §4). Reading pulls from the pipe until EOF.
 export val stdoutStream = (handle: ProcessHandle): Stream =>
   lin_process_stdout_stream(handle)
+
+// ===== OS / system introspection (folded in from the former std/os module) =====
+// A snapshot of physical memory, in bytes. `free` is the OS's notion of *available* memory
+// and its exact meaning varies across platforms (a rough capacity gauge, not exact accounting).
+export type MemInfo = { "total": Int64, "free": Int64 }
+
+// The network hostname of the machine (the short name, e.g. "build-box-3", not an FQDN).
+// Returns an Error on the rare platform where the name cannot be read.
+export val hostname = (): String | Error =>
+  lin_os_hostname()
+
+// The operating-system family, as a lowercase string from a stable closed set:
+// "linux" | "macos" | "windows" | "freebsd" | "openbsd" | "netbsd" | "unknown".
+// Fixed at compile time (the build target) — total, never fails.
+export val platform = (): String =>
+  lin_os_platform()
+
+// The CPU architecture the binary targets, as a lowercase string from a closed set:
+// "x86_64" | "aarch64" | "arm" | "x86" | "riscv64" | "wasm32" | "unknown". Total.
+export val arch = (): String =>
+  lin_os_arch()
+
+// The number of logical CPUs available to the process (cores x SMT, honouring CPU-affinity
+// / cgroup limits where exposed). Always >= 1. Returns a bare Int32 (not Int32 | Error) so it
+// drops straight into `threadPool(cpuCount())` without a match.
+export val cpuCount = (): Int32 =>
+  lin_os_cpu_count()
+
+// The OS process id of the current process. Total. (Distinct from a std/process ProcessHandle,
+// which is an opaque id for a child the runtime spawned, not an OS pid.)
+export val pid = (): Int32 =>
+  lin_os_pid()
+
+// The OS process id of the parent process. On Unix this is getppid(); where the parent pid
+// cannot be determined the runtime returns 0 (rather than an Error) so callers can treat
+// "no parent" uniformly.
+export val ppid = (): Int32 =>
+  lin_os_ppid()
+
+// The login name of the user the process runs as ("alice", not a display name). Resolved from
+// the OS (Unix: the effective uid's passwd entry, with $USER / $LOGNAME as a fallback).
+// Returns an Error if no user can be resolved.
+export val username = (): String | Error =>
+  lin_os_username()
+
+// The current user's home directory as an absolute path (Unix: $HOME, falling back to the
+// passwd entry). Returns an Error when no home directory is defined for the process. For reading
+// $HOME directly use std/env getEnv; homeDir adds the OS-level fallback when the variable is unset.
+export val homeDir = (): String | Error =>
+  lin_os_home_dir()
+
+// The directory the OS designates for temporary files, as an absolute path (Unix: $TMPDIR if
+// set, else /tmp). Always returns *a* path (falls back rather than failing) — total.
+export val tempDir = (): String =>
+  lin_os_temp_dir()
+
+// How long the *system* has been running, in whole seconds since boot. Returns an Error on a
+// platform where boot time is not queryable. This is system uptime (since boot), not process
+// uptime — wall-clock time for the current program belongs to std/time.
+export val uptime = (): Int64 | Error =>
+  lin_os_uptime()
+
+// The system load average over the last 1, 5, and 15 minutes (a 3-element array). Unix-only:
+// on Windows there is no load-average concept and this returns an Error. Treat the Error as
+// "not available on this platform", not a transient failure.
+export val loadAverage = (): Float64[] | Error =>
+  lin_os_load_average()
+
+// A snapshot of physical memory, in bytes: `total` (installed RAM) and `free` (memory the OS
+// reports as available). Returns an Error if the platform's memory facility cannot be read.
+// Note: `free` semantics vary across operating systems — a rough capacity gauge, not exact.
+export val memInfo = (): MemInfo | Error =>
+  lin_os_mem_info()
